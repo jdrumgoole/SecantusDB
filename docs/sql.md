@@ -795,6 +795,18 @@ SELECT regexp_replace(path, '/+', '/', 'g'),   -- collapse runs of slashes (g = 
        regexp_matches(text, '(\w+)@(\w+)')     -- first match's capture groups -> text[]
 FROM t;
 
+-- More string functions: lpad/rpad pad (or truncate) to a length; left/right take
+-- a prefix/suffix (negative counts drop from the far end); position/strpos give a
+-- 1-based index (0 if absent); overlay replaces a span.
+SELECT lpad(code, 8, '0'),               -- '000abcde'  (rpad pads on the right)
+       left(name, 3), right(name, 2),    -- prefix / suffix (left(x,-2) drops last 2)
+       repeat('=', 10), reverse(name),
+       initcap(title),                   -- 'hello world' -> 'Hello World'
+       ascii(name), chr(65),             -- code point of 1st char / char from code
+       position('@' in email),           -- 1-based index (strpos(email,'@') is the same)
+       overlay(sku placing 'XY' from 2 for 3)
+FROM t;
+
 -- Math / numeric functions evaluate per row. trunc/sign/factorial stay exact
 -- numeric; sqrt/cbrt/ln/log/exp/pi/degrees/radians produce double precision.
 SELECT trunc(x),          -- truncate toward zero (trunc(x, n) keeps n decimals)

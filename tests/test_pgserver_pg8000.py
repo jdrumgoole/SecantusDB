@@ -1047,6 +1047,25 @@ def test_datetime_funcs_via_driver(server):
     conn.close()
 
 
+def test_string_funcs2_via_driver(server):
+    # lpad / left / ascii / position / overlay typed correctly on the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id int primary key, s text)")
+    cur.execute("INSERT INTO t VALUES (1, 'hello')")
+    cur.execute(
+        "SELECT lpad(s, 8, '*'), left(s, 3), ascii(s), position('l' IN s), "
+        "overlay(s placing 'XY' from 2 for 3) FROM t"
+    )
+    row = cur.fetchone()
+    assert row[0] == "***hello"
+    assert row[1] == "hel"
+    assert row[2] == 104  # ascii -> real int
+    assert row[3] == 3  # position -> real int
+    assert row[4] == "hXYo"
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

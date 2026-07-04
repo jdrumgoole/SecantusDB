@@ -1477,6 +1477,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `to_char` full weekday names (`Day`/`Dy`) mis-render because sqlglot greedily eats the leading `D`
   during normalisation; date/time functions in a `WHERE` predicate go through COLLSCAN + the scalar
   path (not lowered to a Mongo filter), same as other computed predicates.
+- [ ] **String round-out scalar functions landed** (b133): `lpad`/`rpad` (pad or truncate to a length,
+  default fill space), `left`/`right` (prefix/suffix; a negative count drops from the far end — `left`
+  via `s[:n]`, `right` via `s[-i:]` with an `i==0 → ''` guard), `repeat`, `reverse`, `initcap`
+  (`str.title()`), `ascii`/`chr`, `position(sub IN str)` / `strpos(str, sub)` (1-based, 0 if absent),
+  and `overlay(str placing rep from start [for len])` — all typed nodes in `scalar.py` registered via
+  the version-tolerant getattr loop. Typed in `planner._infer_scalar_tag` (pad/left/right/repeat/
+  reverse/initcap/chr/overlay → text; ascii/strpos/position → int4). **Limitation:** `initcap` uses
+  Python `str.title()`, which matches Postgres for ASCII words but can differ on apostrophes
+  (`"o'brien"` → `"O'Brien"` vs PG `"O'Brien"` — same here, but exotic Unicode word boundaries may drift).
 - [ ] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
   `string_agg(x, sep ORDER BY y)` order the aggregated values. sqlglot keeps the ORDER BY as an
   `exp.Order` wrapping the value (the old "sqlglot drops it" note was wrong). `planner._agg_order_spec`
