@@ -19,6 +19,24 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: refuses direct writes to synthetic read-only views
+
+The Rust server now rejects a direct `insert` / `update` / `delete` on
+`local.oplog.rs` or `admin.system.users` with `Unauthorized` (13), matching the
+Python server (and mongod's RBAC-denial code). These namespaces are synthetic
+read-only views — `local.oplog.rs` projects the oplog WT table (written only via
+oplog emission) and `admin.system.users` is fronted by `createUser` /
+`updateUser` / `dropUser` — so a direct write would land in the wrong table or
+break the view's invariants. Previously the Rust server silently accepted such
+writes. A regular collection write is unaffected.
+
+#### Fixed
+
+- **Rust server:** direct `insert` / `update` / `delete` on `local.oplog.rs` /
+  `admin.system.users` is now rejected with code 13 (matching the Python server),
+  instead of being silently accepted. Regression: `tests/test_rust_server_smoke.py::
+  test_synthetic_view_write_rejected_against_rust_server`.
+
 ### Rust server: rejects a malformed `writeConcern`
 
 The Rust server now validates a write command's `writeConcern` before running it,

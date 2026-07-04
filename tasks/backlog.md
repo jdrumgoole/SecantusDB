@@ -657,14 +657,17 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   matches on the Python server but not the Rust server. Rare; documented in
   `query.rs` module docs. Fuzz subjects are newline-free to avoid spurious parity
   failures from this gap.
-- [ ] **CRUD cross-cutting still deferred in the Rust handlers:**
-  `_reject_oplog_rs_write` (writes to `local.oplog.rs`); view-collection reads
-  (`find` / `aggregate` / `count` on a view resolve nothing — this is a *shared*
-  limitation: both servers return empty for reads on a view, needs the view
-  pipeline resolved into the read path). **Done:** `writeConcern` *value
-  validation* (malformed `w`/`j`/`wtimeout` rejected in `dispatch` with mongod's
-  codes 9/79/14 — 0.5.3-beta.124, matches Python) and `validator` on
-  update/replace (post-apply doc checked via `Storage::update_matching`).
+- [ ] **View-collection reads (both servers).** `find` / `aggregate` / `count` on
+  a view resolve nothing — a *shared* limitation: both the Python and Rust servers
+  return empty for reads on a view (`create ... viewOn/pipeline` stores the
+  metadata but the view pipeline isn't resolved into the read path). Fix the
+  Python server first (resolve the view: run `viewOn`'s pipeline, prepend it to
+  the user pipeline / filter), then mirror in Rust. **Rust CRUD cross-cutting now
+  done:** `writeConcern` value validation (codes 9/79/14 — 0.5.3-beta.124),
+  `validator` on update/replace (post-apply doc via `Storage::update_matching`),
+  and `_reject_oplog_rs_write` — direct writes to `local.oplog.rs` /
+  `admin.system.users` rejected with code 13 (0.5.3-beta.125), all matching the
+  Python server.
 
 - [x] **Engine selection** — `secantus.engine` is the single source of truth
   (`available()` / `selected()` / `set_engine()` / `enabled(component)`); all six

@@ -553,6 +553,34 @@ fn validate_write_concern(doc: &Document) -> Option<CommandError> {
     None
 }
 
+/// Refuse a direct `insert` / `update` / `delete` on a synthetic read-only view,
+/// mirroring `commands.py::_reject_oplog_rs_write`: `local.oplog.rs` (a view over
+/// the oplog WT table, written only via oplog emission) and `admin.system.users`
+/// (written only via `createUser` / `updateUser` / `dropUser`). A direct write
+/// would land in the wrong table or break the view's invariants, so it's rejected
+/// with code 13 (`Unauthorized`), the same code mongod returns for an RBAC denial.
+fn reject_synthetic_view_write(name: &str, doc: &Document, db: &str) -> Option<CommandError> {
+    let coll = match name {
+        "insert" | "update" | "delete" => doc.get_str(name).ok()?,
+        _ => return None,
+    };
+    let detail = match (db, coll) {
+        ("local", "oplog.rs") => {
+            "local.oplog.rs (synthetic read-only view of the SecantusDB oplog)"
+        }
+        ("admin", "system.users") => {
+            "admin.system.users (synthetic read-only view — use createUser / \
+             updateUser / dropUser instead)"
+        }
+        _ => return None,
+    };
+    Some(CommandError::new(
+        13,
+        "Unauthorized",
+        format!("not authorized for {name} on {detail}"),
+    ))
+}
+
 /// Reject a namespace component (database / collection / index name) that
 /// carries an embedded NUL byte.
 ///
@@ -669,6 +697,11 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                 if let Some(e) = validate_write_concern(doc) {
                     return e.into_reply();
                 }
+            }
+            // Refuse a direct insert/update/delete on a synthetic read-only view
+            // (local.oplog.rs / admin.system.users), mirroring commands.py.
+            if let Some(e) = reject_synthetic_view_write(name, doc, &ctx.db_name) {
+                return e.into_reply();
             }
             // Time profile-eligible commands so dispatch can record a
             // `system.profile` entry when the per-database level requires it.
