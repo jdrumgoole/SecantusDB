@@ -19,6 +19,29 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: `$lookup` drives the foreign index (and fixes its result order)
+
+The Rust server's simple-form `$lookup` now drives a per-outer-doc index probe
+when the foreign collection has a leading-field index on `foreignField`
+(single-field, compound-prefix, or multikey — all resolve to an IXSCAN via
+`Storage::find`), falling back to the full-scan hash-join only when no such index
+exists. This mirrors the Python server's `$lookup` path.
+
+Besides the performance win, this **fixes a two-server divergence**: the previous
+hash-join returned the joined `as` array in foreign-collection scan order, while
+the Python server (and the index probe) return it in index order. For an indexed
+`$lookup` the two servers now produce byte-for-byte identical results, including
+the order of documents within `as`. A regression test drives the Rust server and
+asserts the index-ordered output.
+
+#### Fixed
+
+- **Rust server:** simple-form `$lookup` over an indexed `foreignField` now returns
+  the `as` array in index order (matching the Python server) instead of
+  foreign-scan order, and rides the index instead of materialising the whole
+  foreign collection. Regression: `tests/test_rust_server_smoke.py::
+  test_lookup_index_order_against_rust_server`.
+
 ### `$geoNear` rides the geo index instead of scanning
 
 A bounded `$geoNear` — one with a `maxDistance` — no longer walks the whole

@@ -615,3 +615,44 @@ def test_geo_near_index_optimization_against_rust_server(tmp_path) -> None:
             assert opt == brute, f"center={(cx, cy)} maxDistance={max_d}"
     finally:
         srv.stop()
+
+
+def test_lookup_index_order_against_rust_server(tmp_path) -> None:
+    """A simple `$lookup` whose foreign collection has a leading-field index on
+    `foreignField` drives a per-outer-doc index probe on the Rust server, so the
+    `as` array comes back in index order (not foreign-scan order) — matching the
+    Python server. Foreign docs are inserted out of index order to make the
+    distinction observable."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        db.o.insert_one({"_id": 1, "k": 1})
+        # inserted in a NON-(fk,tag) order; the compound index reorders to a,b,c
+        db.f.insert_many(
+            [
+                {"_id": 10, "fk": 1, "tag": "c"},
+                {"_id": 11, "fk": 1, "tag": "a"},
+                {"_id": 12, "fk": 1, "tag": "b"},
+            ]
+        )
+        db.f.create_index([("fk", 1), ("tag", 1)])
+        res = list(
+            db.o.aggregate(
+                [{"$lookup": {"from": "f", "localField": "k", "foreignField": "fk", "as": "m"}}]
+            )
+        )
+        # Index order by (fk, tag): a, b, c — not the c, a, b insertion order.
+        assert [m["tag"] for m in res[0]["m"]] == ["a", "b", "c"]
+
+        # An array local value uses $in and still matches all elements.
+        db.o2.insert_one({"_id": 2, "k": [1]})
+        db.f2.insert_many([{"_id": 20, "fk": 1}, {"_id": 21, "fk": 2}])
+        db.f2.create_index([("fk", 1)])
+        res2 = list(
+            db.o2.aggregate(
+                [{"$lookup": {"from": "f2", "localField": "k", "foreignField": "fk", "as": "m"}}]
+            )
+        )
+        assert [m["_id"] for m in res2[0]["m"]] == [20]
+    finally:
+        srv.stop()

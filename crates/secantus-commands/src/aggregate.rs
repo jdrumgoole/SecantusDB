@@ -41,10 +41,11 @@
 //! `$changeStream` is handled separately (`changestream::open_change_stream`);
 //! the standalone-rejection (40573) is honoured here.
 //!
-//! **Perf follow-up (correctness is already there):** `$lookup` materialises the
-//! whole foreign collection and hash-joins in Rust rather than driving a
-//! per-outer-doc index probe the way the Python `Storage.find_matching` path does
-//! — same results, an index-acceleration opportunity (see `tasks/backlog.md`).
+//! `$lookup`'s simple form drives a per-outer-doc index probe (`Storage::find`)
+//! when the foreign collection has a leading-field index on `foreignField` —
+//! matching the Python server's result and `as`-array order (index order) — and
+//! otherwise materialises the foreign collection and hash-joins (also the
+//! `let`/`pipeline` form).
 //!
 //! **`collation`** is threaded through `$match` / `$sort` (the storage-free core)
 //! and the lifted-`$match` fetch (COLLSCAN-forced); a collation the engine can't
@@ -446,9 +447,11 @@ fn apply_storage_stage(
 /// `$lookup` — join a foreign collection in. Mirrors `aggregate._stage_lookup`:
 /// simple `localField`/`foreignField` equality join (array-aware), or the
 /// `let` + `pipeline` form (each outer doc binds `let` vars, then runs the
-/// sub-pipeline over the candidate foreign docs). We materialise the foreign
-/// collection and hash-join in Rust — correctness-identical to the Python
-/// index-driven path; index acceleration is a follow-up.
+/// sub-pipeline over the candidate foreign docs). The simple form drives a
+/// per-outer-doc index probe (`Storage::find`) when the foreign collection has a
+/// leading-field index on `foreignField` — matching the Python server's result
+/// *and order* — and otherwise materialises the foreign collection and hash-joins
+/// (also the pipeline-form path).
 fn apply_lookup(
     spec: Option<&Bson>,
     docs: Vec<Document>,
@@ -470,6 +473,33 @@ fn apply_lookup(
     let foreign_field = spec.get_str("foreignField").ok();
     let sub_pipeline = spec.get("pipeline").and_then(Bson::as_array);
     let let_spec = spec.get("let").and_then(Bson::as_document);
+
+    // Index-driven simple form: when there's no sub-pipeline, both fields are
+    // present, and the foreign collection has a leading-field index on
+    // `foreignField`, probe that index per outer doc via `Storage::find` (the
+    // picker lands it as an IXSCAN) instead of materialising the whole foreign
+    // collection and hash-joining. This mirrors the Python `_stage_lookup` path —
+    // and, crucially, makes the `as` array order match the Python server's (index
+    // order, not foreign-scan order), fixing a two-server divergence.
+    if sub_pipeline.is_none() {
+        if let (Some(lf), Some(ff)) = (local_field, foreign_field) {
+            if foreign_field_has_leading_index(storage, db, from, ff)? {
+                let mut out = Vec::with_capacity(docs.len());
+                for doc in docs {
+                    let lv = secantus_core::get_path(&doc, lf).cloned();
+                    let joined = index_join_lookup(storage, db, from, ff, lv.as_ref())?;
+                    let mut new = doc;
+                    set_field_path(
+                        &mut new,
+                        as_field,
+                        Bson::Array(joined.into_iter().map(Bson::Document).collect()),
+                    );
+                    out.push(new);
+                }
+                return Ok(out);
+            }
+        }
+    }
 
     // Materialise the foreign collection once (the whole join's candidate pool).
     let foreign: Vec<Document> = decode_docs(
@@ -533,6 +563,59 @@ fn apply_lookup(
         out.push(new);
     }
     Ok(out)
+}
+
+/// Whether the foreign collection has an index whose *leading* column is `field`
+/// and all columns are ASC/DESC (`1`/`-1`) — the shape `$lookup` can drive through
+/// `Storage::find` (single-field, compound-prefix, or multikey all light up at
+/// IXSCAN). Geo / hashed / text indexes are excluded (their direction values are
+/// strings). Mirrors `aggregate._foreign_field_has_simple_index`.
+fn foreign_field_has_leading_index(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    field: &str,
+) -> Result<bool, CommandError> {
+    let is_dir = |v: &Bson| matches!(v, Bson::Int32(1 | -1) | Bson::Int64(1 | -1));
+    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    for ix in &indexes {
+        if let Ok(key) = ix.get_document("key") {
+            let mut it = key.iter();
+            if let Some((first, _)) = it.next() {
+                if first == field && key.values().all(is_dir) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The foreign docs whose `foreign_field` matches `local_value`, via
+/// `Storage::find` (so the index picker decides IXSCAN vs COLLSCAN and returns
+/// them in index order — matching the Python `_index_join_lookup`). An array
+/// local value uses `$in` (empty array → no matches, short-circuited).
+fn index_join_lookup(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    foreign_field: &str,
+    local_value: Option<&Bson>,
+) -> Result<Vec<Document>, CommandError> {
+    let filter = match local_value {
+        Some(Bson::Array(a)) => {
+            if a.is_empty() {
+                return Ok(Vec::new());
+            }
+            doc! { foreign_field: { "$in": a.clone() } }
+        }
+        other => doc! { foreign_field: other.cloned().unwrap_or(Bson::Null) },
+    };
+    decode_docs(
+        storage
+            .find(db, coll, &filter, None, None)
+            .map_err(command_error)?,
+    )
 }
 
 /// `$graphLookup` — recursive graph traversal of a foreign collection. Mirrors
