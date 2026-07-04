@@ -717,3 +717,29 @@ def test_synthetic_view_write_rejected_against_rust_server(tmp_path) -> None:
         assert r["ok"] == 1.0
     finally:
         srv.stop()
+
+
+def test_view_reads_resolve_against_rust_server(tmp_path) -> None:
+    """find / aggregate / count on a view resolve the view's pipeline against its
+    base collection on the Rust server (previously they returned nothing) —
+    including filter/sort/skip/limit/projection and a view-on-a-view."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        db.src.insert_many([{"_id": i, "a": i % 3, "v": i} for i in range(9)])
+        db.command("create", "vw", viewOn="src", pipeline=[{"$match": {"a": 1}}])
+
+        assert sorted(d["_id"] for d in db.vw.find({})) == [1, 4, 7]
+        assert sorted(d["_id"] for d in db.vw.find({"v": {"$gt": 3}})) == [4, 7]
+        assert [d["_id"] for d in db.vw.find({}).sort("_id", -1).limit(2)] == [7, 4]
+        assert [d["_id"] for d in db.vw.find({}).sort("_id", 1).skip(1)] == [4, 7]
+        assert db.vw.find_one({"_id": 4}, {"v": 1, "_id": 0}) == {"v": 4}
+        assert [d["_id"] for d in db.vw.aggregate([{"$sort": {"_id": 1}}])] == [1, 4, 7]
+        assert db.vw.count_documents({}) == 3
+        assert db.vw.count_documents({"v": {"$gt": 3}}) == 2
+
+        db.command("create", "vw2", viewOn="vw", pipeline=[{"$match": {"v": {"$gt": 3}}}])
+        assert sorted(d["_id"] for d in db.vw2.find({})) == [4, 7]
+        assert db.vw2.count_documents({}) == 2
+    finally:
+        srv.stop()

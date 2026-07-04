@@ -160,6 +160,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
             let ns = format!("{}.{}", ctx.db_name, c);
+            // Resolve a view to its base collection + prepended view pipeline
+            // (recursively for a view-on-a-view). The reply ns keeps the queried
+            // (view) name; only the fetch reads the base collection. Mirrors
+            // commands._resolve_view.
+            let (base_coll, pipeline) = resolve_view(storage, &ctx.db_name, c, pipeline);
+            let c = base_coll.as_str();
             // Stages that generate / read their own input start from no docs.
             if first_stage_has_any(&pipeline, &["$collStats", "$indexStats", "$documents"]) {
                 (ns, Vec::new(), pipeline)
@@ -935,6 +941,38 @@ fn bson_f64(b: &Bson) -> Option<f64> {
         Bson::Int64(i) => Some(*i as f64),
         _ => None,
     }
+}
+
+/// Resolve a view namespace to its base collection + combined pipeline, following
+/// a `viewOn` chain (a view may be defined on another view) and prepending each
+/// view's stored `viewPipeline` ahead of the caller's pipeline until a base
+/// (non-view) collection is reached. A cycle is broken defensively. Returns the
+/// inputs unchanged when `coll` isn't a view. Mirrors `commands._resolve_view`.
+pub(crate) fn resolve_view(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    pipeline: Vec<Bson>,
+) -> (String, Vec<Bson>) {
+    let mut coll = coll.to_string();
+    let mut combined = pipeline;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while seen.insert(coll.clone()) {
+        let Ok(opts) = storage.get_collection_options(db, &coll) else {
+            break;
+        };
+        let Ok(view_on) = opts.get_str("viewOn") else {
+            break;
+        };
+        let mut prepended: Vec<Bson> = opts
+            .get_array("viewPipeline")
+            .map(|a| a.to_vec())
+            .unwrap_or_default();
+        prepended.extend(combined);
+        combined = prepended;
+        coll = view_on.to_string();
+    }
+    (coll, combined)
 }
 
 /// Conservative `$geoWithin` candidate filter for a leading bounded `$geoNear`
