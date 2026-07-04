@@ -1450,6 +1450,21 @@ def test_composite_primary_key_via_driver(server):
     engine.dispose()
 
 
+def test_array_functions_via_driver(server):
+    # Array manipulation functions round-trip through the real driver.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, tags text[], nums int[])")
+    cur.execute("INSERT INTO t (id, tags, nums) VALUES (1, ARRAY['a','b','c'], ARRAY[10,20,30])")
+    cur.execute("SELECT array_append(tags, 'd') FROM t")
+    assert cur.fetchall() == ([["a", "b", "c", "d"]],)
+    cur.execute("SELECT array_cat(nums, ARRAY[40,50]) FROM t")
+    assert cur.fetchall() == ([[10, 20, 30, 40, 50]],)
+    cur.execute("SELECT array_position(tags, 'b'), array_to_string(tags, '-') FROM t")
+    assert cur.fetchall() == ([2, "a-b-c"],)
+    conn.close()
+
+
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address

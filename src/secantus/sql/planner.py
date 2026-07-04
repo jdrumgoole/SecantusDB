@@ -3708,8 +3708,13 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return "numeric"
     if isinstance(node, (exp.DPipe, exp.Upper, exp.Lower, exp.Trim, exp.Substring, exp.Concat)):
         return "text"
-    if isinstance(node, (exp.Length, exp.ArraySize)):
+    if isinstance(node, (exp.Length, exp.ArraySize, exp.ArrayPosition)):
         return "int4"
+    if isinstance(node, exp.ArrayToString):
+        return "text"
+    if isinstance(node, (exp.ArrayAppend, exp.ArrayPrepend, exp.ArrayConcat, exp.ArrayRemove)):
+        # Array-valued result — infer the array type from the array operand.
+        return _infer_scalar_tag(node.this, resolve)
     if isinstance(node, (exp.Coalesce, exp.Greatest, exp.Least)):
         # Type from the first operand (its own tag, recursively).
         first = (

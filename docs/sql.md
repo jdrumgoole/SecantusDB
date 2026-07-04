@@ -420,6 +420,24 @@ inclusive slice (clamped to the array bounds). Both work in the SELECT list and 
 `WHERE` (`WHERE tags[1] = 'py'`). `unnest(array_col)` in the SELECT list expands
 the array; the FROM-clause table form (`FROM unnest(col)`) is not yet supported.
 
+The array manipulation functions are available too:
+
+```sql
+SELECT array_append(tags, 'rust');        -- {py,db,rust}
+SELECT array_prepend('rust', tags);       -- {rust,py,db}
+SELECT array_cat(scores, ARRAY[99]);      -- {10,20,99}
+SELECT array_position(tags, 'db');        -- 2   (1-based; NULL if absent)
+SELECT array_remove(tags, 'py');          -- {db}
+SELECT array_to_string(tags, ', ');       -- 'py, db'   (NULLs dropped)
+SELECT array_to_string(tags, ',', 'n/a'); -- NULL elements become 'n/a'
+```
+
+And `array_agg` can populate a declared array column via `INSERT … SELECT`:
+
+```sql
+INSERT INTO groups (grp, members) SELECT grp, array_agg(user_id) FROM m GROUP BY grp;
+```
+
 ### Foreign keys
 
 Column-level `REFERENCES` and table-level `FOREIGN KEY` — named or unnamed — are

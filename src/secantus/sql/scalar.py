@@ -120,6 +120,8 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return None if left is None or right is None else _as_text(left) + _as_text(right)
     if isinstance(node, exp.Bracket):
         return _eval_bracket(node, scope, ctx)
+    if isinstance(node, exp.Array):  # ARRAY[...] constructor -> a Python list
+        return [evaluate(e, scope, ctx) for e in node.expressions]
     typed = _SCALAR_FUNC_NODES.get(type(node))
     if typed is not None:
         return typed(node, scope, ctx)
@@ -259,6 +261,71 @@ def _eval_array_size(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> 
     return len(v)
 
 
+def _as_list(v: Any) -> list:
+    """Coerce an array operand to a list; a NULL array is the empty array (matches
+    Postgres, where ``array_append(NULL, x)`` -> ``{x}``)."""
+    if v is None:
+        return []
+    return list(v) if isinstance(v, (list, tuple)) else [v]
+
+
+def _eval_array_append(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    arr = evaluate(node.this, scope, ctx)
+    elem = evaluate(node.args.get("expression"), scope, ctx)
+    return _as_list(arr) + [elem]
+
+
+def _eval_array_prepend(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    # sqlglot normalizes both array_append(arr, e) and array_prepend(e, arr) to
+    # this=arr / expression=e; the node type is what distinguishes them.
+    arr = evaluate(node.this, scope, ctx)
+    elem = evaluate(node.args.get("expression"), scope, ctx)
+    return [elem] + _as_list(arr)
+
+
+def _eval_array_cat(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    out = _as_list(evaluate(node.this, scope, ctx))
+    for e in node.args.get("expressions") or []:
+        out = out + _as_list(evaluate(e, scope, ctx))
+    return out
+
+
+def _eval_array_position(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    arr = evaluate(node.this, scope, ctx)
+    if not isinstance(arr, (list, tuple)):
+        return None
+    elem = evaluate(node.args.get("expression"), scope, ctx)
+    for i, v in enumerate(arr, start=1):  # 1-based, first match
+        if v == elem:
+            return i
+    return None
+
+
+def _eval_array_remove(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    arr = evaluate(node.this, scope, ctx)
+    if arr is None:
+        return None
+    elem = evaluate(node.args.get("expression"), scope, ctx)
+    return [v for v in _as_list(arr) if v != elem]
+
+
+def _eval_array_to_string(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    arr = evaluate(node.this, scope, ctx)
+    if arr is None:
+        return None
+    delim = _as_text(evaluate(node.args.get("expression"), scope, ctx))
+    null_node = node.args.get("null")
+    null_str = None if null_node is None else _as_text(evaluate(null_node, scope, ctx))
+    parts = []
+    for v in _as_list(arr):
+        if v is None:
+            if null_str is not None:
+                parts.append(null_str)  # NULL elements omitted unless a null_string is given
+        else:
+            parts.append(_as_text(v))
+    return delim.join(parts)
+
+
 def _eval_nullif(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     a, b = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
     return None if a == b else a
@@ -307,6 +374,12 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     exp.Greatest: _extremum(max),
     exp.Least: _extremum(min),
     exp.ArraySize: _eval_array_size,
+    exp.ArrayAppend: _eval_array_append,
+    exp.ArrayPrepend: _eval_array_prepend,
+    exp.ArrayConcat: _eval_array_cat,
+    exp.ArrayPosition: _eval_array_position,
+    exp.ArrayRemove: _eval_array_remove,
+    exp.ArrayToString: _eval_array_to_string,
 }
 
 
