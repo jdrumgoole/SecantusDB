@@ -355,6 +355,78 @@ def _extremum(pick: Callable[[list[Any]], Any]) -> Callable[..., Any]:
     return handler
 
 
+def _re_compile(pattern: str, flags_str: str) -> Any:
+    """Compile a POSIX regex with Postgres flag letters (``i`` case-insensitive,
+    ``m``/``n`` newline-sensitive, ``s`` dot-all, ``x`` extended)."""
+    import re
+
+    fs = flags_str or ""
+    f = 0
+    if "i" in fs:
+        f |= re.IGNORECASE
+    if "m" in fs or "n" in fs:
+        f |= re.MULTILINE
+    if "s" in fs:
+        f |= re.DOTALL
+    if "x" in fs:
+        f |= re.VERBOSE
+    return re.compile(pattern, f)
+
+
+def _pg_replacement(repl: str) -> str:
+    """Translate a Postgres ``regexp_replace`` replacement into Python's ``re.sub``
+    syntax: ``\\&`` (whole match) becomes ``\\g<0>``; ``\\1``–``\\9`` pass through."""
+    return repl.replace(r"\&", r"\g<0>")
+
+
+def _eval_regexp_replace(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    src = evaluate(node.this, scope, ctx)
+    pattern = evaluate(node.expression, scope, ctx)
+    repl = evaluate(node.args.get("replacement"), scope, ctx)
+    if src is None or pattern is None or repl is None:
+        return None
+    mods = node.args.get("modifiers")
+    flags_str = _as_text(evaluate(mods, scope, ctx)) if mods is not None else ""
+    rx = _re_compile(_as_text(pattern), flags_str)
+    return rx.sub(
+        _pg_replacement(_as_text(repl)), _as_text(src), count=0 if "g" in flags_str else 1
+    )
+
+
+def _eval_split_part(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    src = evaluate(node.this, scope, ctx)
+    delim = evaluate(node.args.get("delimiter"), scope, ctx)
+    idx = evaluate(node.args.get("part_index"), scope, ctx)
+    if src is None or delim is None or idx is None:
+        return None
+    parts = _as_text(src).split(_as_text(delim))
+    n = int(idx)
+    if n < 0:  # Postgres 14+: count from the end
+        n = len(parts) + n + 1
+    return parts[n - 1] if 1 <= n <= len(parts) else ""
+
+
+def _eval_translate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    src = evaluate(node.this, scope, ctx)
+    frm = evaluate(node.args.get("from_"), scope, ctx)
+    to = evaluate(node.args.get("to"), scope, ctx)
+    if src is None or frm is None or to is None:
+        return None
+    frm, to = _as_text(frm), _as_text(to)
+    # Each char in `frm` maps to the same-position char in `to`; chars in `frm`
+    # beyond `to`'s length are deleted.
+    table = {ord(ch): (to[i] if i < len(to) else None) for i, ch in enumerate(frm)}
+    return _as_text(src).translate(table)
+
+
+def _eval_regexp_count(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    src = evaluate(node.this, scope, ctx)
+    pattern = evaluate(node.expression, scope, ctx)
+    if src is None or pattern is None:
+        return None
+    return len(_re_compile(_as_text(pattern), "").findall(_as_text(src)))
+
+
 # Typed scalar function nodes (sqlglot parses these to dedicated classes whose
 # operands live in ``this`` / named args, not ``expressions``).
 _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
@@ -384,7 +456,15 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     exp.ArrayPosition: _eval_array_position,
     exp.ArrayRemove: _eval_array_remove,
     exp.ArrayToString: _eval_array_to_string,
+    exp.RegexpReplace: _eval_regexp_replace,
+    exp.SplitPart: _eval_split_part,
 }
+# ``translate`` / ``regexp_count`` node names vary across sqlglot versions; look
+# them up by attribute so a missing class doesn't break import.
+for _cls_name, _handler in (("Translate", _eval_translate), ("RegexpCount", _eval_regexp_count)):
+    _cls = getattr(exp, _cls_name, None)
+    if _cls is not None:
+        _SCALAR_FUNC_NODES[_cls] = _handler
 
 
 def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
@@ -506,6 +586,19 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
     ):
         # No stored defaults; index defs not rendered.
         return None
+    if name == "regexp_matches":
+        # Postgres regexp_matches is set-returning; in a scalar context we return
+        # the first match's capture groups as a text[] (whole match if no groups),
+        # or NULL when there is no match. (One match is the common non-'g' case.)
+        src = args[0] if args else None
+        pattern = args[1] if len(args) > 1 else None
+        if src is None or pattern is None:
+            return None
+        flags = _as_text(args[2]) if len(args) > 2 else ""
+        m = _re_compile(_as_text(pattern), flags).search(_as_text(src))
+        if m is None:
+            return None
+        return list(m.groups()) if m.groups() else [m.group(0)]
     if name in ("json_build_object", "jsonb_build_object"):
         out: dict[str, Any] = {}
         for i in range(0, len(args) - 1, 2):
