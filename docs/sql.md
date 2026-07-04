@@ -765,6 +765,19 @@ SELECT regexp_replace(path, '/+', '/', 'g'),   -- collapse runs of slashes (g = 
        regexp_matches(text, '(\w+)@(\w+)')     -- first match's capture groups -> text[]
 FROM t;
 
+-- Math / numeric functions evaluate per row. trunc/sign/factorial stay exact
+-- numeric; sqrt/cbrt/ln/log/exp/pi/degrees/radians produce double precision.
+SELECT trunc(x),          -- truncate toward zero (trunc(x, n) keeps n decimals)
+       sqrt(x), cbrt(x),  -- square / (real) cube root
+       sign(x),           -- -1 / 0 / 1
+       ln(x), log(x),     -- natural log; log(x) is base-10 (log(b, x) is base b)
+       log10(x), exp(x),  -- base-10 log; e^x
+       pi(), degrees(x), radians(x),
+       factorial(n),      -- n!
+       gcd(a, b), lcm(a, b),
+       mod(a, b), power(a, b), abs(x), ceil(x), floor(x), round(x, 2)
+FROM t;
+
 -- Non-correlated subqueries in WHERE: IN / NOT IN over a single column, and a
 -- scalar `OP (SELECT ...)`. The inner query runs first (it may aggregate/filter).
 -- These work in every query shape — a plain SELECT, or one that also JOINs /

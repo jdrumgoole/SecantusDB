@@ -427,6 +427,54 @@ def _eval_regexp_count(node: exp.Expression, scope: Scope, ctx: ScalarContext) -
     return len(_re_compile(_as_text(pattern), "").findall(_as_text(src)))
 
 
+def _eval_trunc(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``trunc(x [, n])`` — truncate toward zero to ``n`` decimal places (0 default)."""
+    v = evaluate(node.this, scope, ctx)
+    if v is None:
+        return None
+    dec = node.args.get("decimals")
+    n = int(evaluate(dec, scope, ctx)) if dec is not None else 0
+    if n == 0:
+        return math.trunc(v)
+    factor = 10.0**n
+    return math.trunc(v * factor) / factor
+
+
+def _eval_log(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``log(x)`` is base-10 in Postgres; ``log(b, x)`` is log base ``b`` (this=b)."""
+    a = evaluate(node.this, scope, ctx)
+    if a is None:
+        return None
+    expr = node.args.get("expression")
+    if expr is not None:
+        x = evaluate(expr, scope, ctx)
+        if x is None:
+            return None
+        # Use the exact base-10 / base-2 routines when applicable so that, e.g.,
+        # log(10, 1000) is 3.0 rather than 2.9999999999999996.
+        if a == 10:
+            return math.log10(x)
+        if a == 2:
+            return math.log2(x)
+        return math.log(x, a)
+    return math.log10(a)
+
+
+def _eval_pi(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    return math.pi
+
+
+def _sign(v: Any) -> Any:
+    """-1 / 0 / 1 with the operand's numeric kind preserved (float stays float)."""
+    s = (v > 0) - (v < 0)
+    return float(s) if isinstance(v, float) else s
+
+
+def _cbrt(v: Any) -> float:
+    """Real cube root — Python's ``** (1/3)`` goes complex for negatives."""
+    return math.copysign(abs(v) ** (1.0 / 3.0), v)
+
+
 # Typed scalar function nodes (sqlglot parses these to dedicated classes whose
 # operands live in ``this`` / named args, not ``expressions``).
 _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
@@ -459,9 +507,23 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     exp.RegexpReplace: _eval_regexp_replace,
     exp.SplitPart: _eval_split_part,
 }
-# ``translate`` / ``regexp_count`` node names vary across sqlglot versions; look
-# them up by attribute so a missing class doesn't break import.
-for _cls_name, _handler in (("Translate", _eval_translate), ("RegexpCount", _eval_regexp_count)):
+# Node names vary across sqlglot versions; look them up by attribute so a missing
+# class doesn't break import.
+for _cls_name, _handler in (
+    ("Translate", _eval_translate),
+    ("RegexpCount", _eval_regexp_count),
+    ("Trunc", _eval_trunc),
+    ("Log", _eval_log),
+    ("Pi", _eval_pi),
+    ("Sqrt", _unary(math.sqrt)),
+    ("Cbrt", _unary(_cbrt)),
+    ("Sign", _unary(_sign)),
+    ("Ln", _unary(math.log)),
+    ("Exp", _unary(math.exp)),
+    ("Degrees", _unary(math.degrees)),
+    ("Radians", _unary(math.radians)),
+    ("Factorial", _unary(lambda v: math.factorial(int(v)))),
+):
     _cls = getattr(exp, _cls_name, None)
     if _cls is not None:
         _SCALAR_FUNC_NODES[_cls] = _handler
@@ -638,6 +700,15 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             if a is not None:
                 return a
         return None
+    if name in ("gcd", "lcm"):
+        a = args[0] if args else None
+        b = args[1] if len(args) > 1 else None
+        if a is None or b is None:
+            return None
+        return math.gcd(int(a), int(b)) if name == "gcd" else math.lcm(int(a), int(b))
+    if name == "log10":
+        v = args[0] if args else None
+        return None if v is None else math.log10(v)
     raise errors.feature_not_supported(f"function {name}() is not supported in this context")
 
 

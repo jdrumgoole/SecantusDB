@@ -4077,6 +4077,18 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         ),
     ):
         return "numeric"
+    # Transcendental / root functions produce double precision; ``trunc`` / ``sign``
+    # / ``factorial`` stay exact numeric. Classes are looked up by attribute because
+    # their availability varies across sqlglot versions.
+    _float_names = ("Sqrt", "Cbrt", "Ln", "Log", "Exp", "Pi", "Degrees", "Radians")
+    _float_math = tuple(c for c in (getattr(exp, n, None) for n in _float_names) if c is not None)
+    if _float_math and isinstance(node, _float_math):
+        return "float8"
+    _num_math = tuple(
+        c for c in (getattr(exp, n, None) for n in ("Trunc", "Sign", "Factorial")) if c is not None
+    )
+    if _num_math and isinstance(node, _num_math):
+        return "numeric"
     if isinstance(
         node,
         (
@@ -4138,6 +4150,10 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "json"
         if fname in ("jsonb_array_length", "json_array_length", "array_length", "cardinality"):
             return "int4"
+        if fname in ("gcd", "lcm"):
+            return "int8"
+        if fname == "log10":
+            return "float8"
     return "text"
 
 
