@@ -20,7 +20,7 @@ use pyo3::prelude::*;
 
 use secantus_commands::{CursorRegistry, Storage as CmdStorage};
 use secantus_server::{bind, RunningServer, ServerConfig};
-use secantus_storage::Storage;
+use secantus_storage::{wt_config, Storage};
 use secantus_storage_adapter::StorageAdapter;
 
 /// An in-process handle to a running Rust SecantusDB server. Constructing it
@@ -80,8 +80,12 @@ impl RustServer {
         std::fs::create_dir_all(storage_path).map_err(|e| {
             PyRuntimeError::new_err(format!("failed to create storage dir {storage_path}: {e}"))
         })?;
-        let mut storage = Storage::open(storage_path)
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
+        // Default to a 1G WiredTiger cache, matching `python -m secantus`, the
+        // Python `SecantusDBServer`, and the standalone `secantusdb` binary.
+        // (The engine's own `Storage::open` default stays 256M.)
+        let mut storage =
+            Storage::open_with_config(storage_path, &wt_config("1G", 1000, false))
+                .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
         storage.set_enable_oplog(enable_oplog);
 
         // TLS: cert + key both required to enable it (matching server.py).

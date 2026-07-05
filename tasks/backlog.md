@@ -1328,13 +1328,13 @@ setters; `--noop-heartbeat-seconds` and `[storage] ttl_sweep_seconds` drive
 background maintenance threads that observe a shutdown flag and are joined before
 teardown. Remaining, worth tracking:
 
-- [ ] **Embedded `RustServer` handle still hard-codes the WiredTiger cache at
-  256M**, while the standalone binary (and the Python daemon) default to 1G. The
-  embedded PyO3 lifecycle handle (`crates/secantus-server-py`) opens storage
-  without threading `cache_size` / `session_max` / `sync_on_commit` through, so a
-  test that wants a bigger cache via the embedded handle can't set it. Thread the
-  same `wt_config(...)` call into the embedded constructor when the handle grows a
-  config surface.
+- [ ] **Embedded `RustServer` handle doesn't expose the WiredTiger knobs.** The
+  default cache now matches the rest of the stack (1G, via `wt_config(...)` in the
+  embedded constructor — beta.130), but the PyO3 lifecycle handle
+  (`crates/secantus-server-py`) still doesn't thread `cache_size` / `session_max` /
+  `sync_on_commit` through as constructor parameters, so a test that wants a
+  non-default cache via the embedded handle can't set it. Add the params when the
+  handle grows a config surface.
 - [ ] **Rust write-path oplog pruning only happens via the noop-heartbeat
   thread** (which also calls `prune_oplog`). When `--noop-heartbeat-seconds` is 0
   (the default), nothing prunes the oplog on the standalone binary except an
