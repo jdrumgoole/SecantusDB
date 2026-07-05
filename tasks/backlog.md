@@ -1650,6 +1650,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   plus a pg8000 wire test. **Simplifications:** `time(p)` precision isn't rounded, `timetz` preserves the
   literal's offset without converting, and mixing a bare `timestamp` with a `date` in one arithmetic
   expression isn't supported (cast one side).
+- [ ] **money type + to_char numeric formatting landed** (b148): the `money` type (OID 790, stored as a
+  2-decimal `Decimal128`, rendered `$1,234.56`) with literals / casts (`'$1,234.56'::money`, `(1234.56)` →
+  negative) and arithmetic (`money ± money` / `money * n` → money, `money / money` → float8); plus numeric
+  `to_char(numeric, fmt)` supporting `9` / `0` / `.` / `,` / `$` / `L` / `S` / `MI` / `PR` / `FM`. New
+  self-contained `secantus/sql/numformat.py` (`parse_money` / `render_money` / `to_char_numeric`). Wired
+  through `typemap` (OID, `MONEY` in `_DATATYPE_TAGS`, `coerce` → `Decimal128`, `to_pg_text` → `render_money`),
+  `scalar` (`_eval_cast` money, `_eval_to_char` routes a numeric source to `to_char_numeric`), and `planner`
+  (`_infer_scalar_tag` money cast + money-arith typing). Also **fixed a pre-existing bug**: a stored
+  `numeric`/`money` value is a `Decimal128` with no Python arithmetic/comparison operators, so computed
+  `numeric_col + numeric_col` / comparisons in the scalar path raised `TypeError` — `scalar._unwrap_decimal`
+  now unwraps `Decimal128` → `Decimal` at the `_eval_arith` / `_eval_compare` boundary. Tests:
+  `tests/test_sql_money.py` (16: pure numformat + SQL surface) plus a pg8000 wire test. **Simplifications:**
+  `$`-only currency (no locale), `to_char` omits `EEEE` / `RN` / `V` / `TH` / non-ASCII locale patterns, and
+  `ORDER BY` on a money/decimal *column* relies on the storage engine's sort (the in-memory `FakeStorage`
+  can't compare raw `Decimal128`).
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

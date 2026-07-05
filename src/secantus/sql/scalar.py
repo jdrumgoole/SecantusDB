@@ -21,8 +21,10 @@ import json
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
+import bson
 from sqlglot import exp
 
 from secantus.paths import get_path
@@ -286,10 +288,18 @@ _ARITH: dict[type, Callable[[Any, Any], Any]] = {
 }
 
 
+def _unwrap_decimal(v: Any) -> Any:
+    """A stored ``numeric`` / ``money`` value is a BSON ``Decimal128``, which has no
+    Python arithmetic / comparison operators — unwrap it to a ``Decimal`` so the
+    scalar evaluator can compute with it."""
+    return v.to_decimal() if isinstance(v, bson.Decimal128) else v
+
+
 def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     left, right = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
     if left is None or right is None:  # NULL propagates through arithmetic
         return None
+    left, right = _unwrap_decimal(left), _unwrap_decimal(right)
     # ``*`` / ``+`` / ``-`` are overloaded for ranges (intersection / union /
     # difference) when both operands are range subdocuments.
     if _is_range_value(left) and _is_range_value(right):
@@ -861,17 +871,24 @@ _PG_WORD_TOKENS = [
 
 
 def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
-    """``to_char(ts, 'YYYY-MM-DD HH24:MI:SS')`` -> a formatted string."""
+    """``to_char(ts, 'YYYY-MM-DD HH24:MI:SS')`` (timestamps) or
+    ``to_char(1234.5, '999,999.99')`` (numbers) -> a formatted string."""
     src = evaluate(node.this, scope, ctx)
     fmt_node = node.args.get("format")
     if src is None or fmt_node is None:
         return None
-    ts = _as_datetime(src)
-    if not isinstance(ts, _dt.datetime):
-        ts = _dt.datetime(ts.year, ts.month, ts.day)
     fmt = _as_text(
         evaluate(fmt_node, scope, ctx) if isinstance(fmt_node, exp.Expression) else fmt_node
     )
+    # A numeric source with a numeric template -> the numeric formatter.
+    if isinstance(src, (int, float, Decimal, bson.Decimal128)) and not isinstance(src, bool):
+        from secantus.sql import numformat as _numformat
+
+        num = src.to_decimal() if isinstance(src, bson.Decimal128) else src
+        return _numformat.to_char_numeric(num, fmt)
+    ts = _as_datetime(src)
+    if not isinstance(ts, _dt.datetime):
+        ts = _dt.datetime(ts.year, ts.month, ts.day)
     out, i = [], 0
     up = fmt.upper()
     while i < len(fmt):
@@ -1013,6 +1030,7 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
     right = evaluate(node.expression, scope, ctx)
     if left is None or right is None:
         return None  # three-valued logic: comparison with NULL is unknown
+    left, right = _unwrap_decimal(left), _unwrap_decimal(right)
     if isinstance(node, exp.EQ):
         return left == right
     if isinstance(node, exp.NEQ):
@@ -1068,6 +1086,10 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import uuidtype as _uuidtype
 
         return _uuidtype.normalize(value)
+    if value is not None and to_tag_early == "money":
+        from secantus.sql import numformat as _numformat
+
+        return _numformat.parse_money(value)
     if value is not None and to_tag_early in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes
 
