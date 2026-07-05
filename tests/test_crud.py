@@ -3253,3 +3253,32 @@ def test_view_reads_resolve_the_pipeline(client: MongoClient) -> None:
     db.command("create", "vw2", viewOn="vw", pipeline=[{"$match": {"v": {"$gt": 3}}}])
     assert sorted(d["_id"] for d in db.vw2.find({})) == [4, 7]
     assert db.vw2.count_documents({}) == 2
+
+
+def test_push_addtoset_each_modifiers(coll) -> None:
+    """`$push` / `$addToSet` `$each` (with `$position` / `$slice` / `$sort`) append
+    multiple elements, previously the `$each` doc was stored as a single element."""
+    coll.insert_one({"_id": 1, "a": [3, 1, 2]})
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [5, 4]}}})
+    assert coll.find_one({"_id": 1})["a"] == [3, 1, 2, 5, 4]
+
+    coll.update_one({"_id": 1}, {"$set": {"a": [3, 1, 2]}})
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [5, 4], "$sort": 1}}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 2, 3, 4, 5]
+
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, 2, 3]}})
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [9], "$slice": -2}}})
+    assert coll.find_one({"_id": 1})["a"] == [3, 9]
+
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, 2, 3]}})
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [9, 8], "$position": 1}}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 9, 8, 2, 3]
+
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, 2]}})
+    coll.update_one({"_id": 1}, {"$addToSet": {"a": {"$each": [2, 3, 3, 4]}}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 2, 3, 4]
+
+    # plain (non-$each) push/addToSet unchanged
+    coll.update_one({"_id": 1}, {"$set": {"a": [1]}})
+    coll.update_one({"_id": 1}, {"$push": {"a": 7}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 7]

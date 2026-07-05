@@ -295,17 +295,19 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
-      - name: Cargo fmt / clippy / build (secantus-storage-adapter, R4b)
+      - name: Cargo fmt / clippy / test (secantus-storage-adapter, R4b)
         # The WiredTiger → command-`Storage` adapter (R4b). Like secantus-storage
         # it links WiredTiger and is excluded from the workspace, so it's built
         # here against the vendored WT resolved above. clippy/build also settle
         # whether `secantus_storage::Storage` is `Send + Sync` (the command
-        # `Storage` trait's supertrait). It has no tests of its own.
+        # `Storage` trait's supertrait). Its `tests/command_*_wt.rs` drive the
+        # command layer end-to-end through the real WT adapter — the layer that
+        # catches command-behaviour regressions — so run them here.
         working-directory: crates/secantus-storage-adapter
         run: |
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
-          cargo build
+          cargo test
 
   # Builds the main `secantus` wheel with the off-by-default storage-engine flag
   # flipped ON (SECANTUS_BUILD_STORAGE_ENGINE=ON): the Rust `_secantus_storage`
