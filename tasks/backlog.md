@@ -1558,6 +1558,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   fixed english config, **no stemming** (`cats` ≠ `cat`), `ts_rank` is a match-count not cover-density;
   weights (`:A` / `setweight`), prefix (`cat:*`), phrase (`<->`), `ts_headline`, and GIN/GiST FTS indexes
   are out of scope.
+- [ ] **Network address types landed** (b142): `inet` / `cidr` / `macaddr` types, the `<<` / `>>` / `&&`
+  subnet-containment/overlap operators, and the `host` / `masklen` / `network` / `netmask` / `broadcast` /
+  `abbrev` / `family` / `hostmask` accessor functions. New self-contained `secantus/sql/net.py` stores values
+  as canonical text (`inet`/`cidr` as `addr/masklen`, `macaddr` as `xx:xx:xx:xx:xx:xx`) and parses with
+  Python's `ipaddress` at operator time; `contains`/`overlaps` compare networks (different families never
+  match). Wired through `typemap` (OIDs inet 869 / cidr 650 / macaddr 829, `_NET_TAGS`, `coerce` → normalise,
+  `to_pg_text` → `render_inet` drops a full-host `/32`|`/128`, names in `type_tag_for_sql` / `SQL_TYPE_NAME` /
+  `PG_TYPENAME`); `scalar._eval_net_op` (`<<` → contains(right,left), `>>` → contains(left,right), `&&` →
+  overlaps; a `_NOT_NET` sentinel + `_is_net_value` defers non-net operands so `<<`/`>>` still act as the
+  integer bit-shift on ints and `&&` as array-overlap on arrays), an `exp.Host` branch, net funcs in
+  `_call_func`, `_NET_TAGS` in `_eval_cast`; `planner._where_has_net_predicate` routes a net-op WHERE to the
+  per-row scalar path, `_infer_scalar_tag` types the operators bool / `host`,`abbrev` text / `masklen`,`family`
+  int4 / `network` cidr / `netmask`,`broadcast`,`hostmask` inet / net casts to their tag. Tests:
+  `tests/test_sql_net.py` (29: pure net + SQL surface) plus a pg8000 wire test. **Simplifications:** the `<<=`
+  / `>>=` (contain-or-equal) operators aren't parsed by sqlglot, and `inet ± int` arithmetic, `macaddr8`, and
+  GiST network indexes are out of scope.
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

@@ -108,6 +108,13 @@ _SCALAR_EVAL_ANON = frozenset(
         "plainto_tsquery",
         "ts_rank",
         "ts_rank_cd",
+        "masklen",
+        "network",
+        "netmask",
+        "broadcast",
+        "family",
+        "abbrev",
+        "hostmask",
     }
 )
 

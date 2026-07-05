@@ -87,6 +87,18 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         result = _eval_range_op(node, scope, ctx)
         if result is not _NOT_RANGE:
             return result
+        net_result = _eval_net_op(node, scope, ctx)
+        if net_result is not _NOT_NET:
+            return net_result
+    if isinstance(node, (exp.BitwiseLeftShift, exp.BitwiseRightShift)):
+        net_result = _eval_net_op(node, scope, ctx)
+        if net_result is not _NOT_NET:
+            return net_result
+    if getattr(exp, "Host", None) is not None and isinstance(node, exp.Host):
+        from secantus.sql import net as _net
+
+        v = evaluate(node.this, scope, ctx)
+        return None if v is None else _net.host(v)
     if getattr(exp, "Adjacent", None) is not None and isinstance(node, exp.Adjacent):
         from secantus.sql import ranges as _ranges
 
@@ -933,7 +945,12 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     to = node.to.sql(dialect="postgres").lower().strip() if node.to is not None else ""
     if (
         value is not None
-        and (to in typemap._RANGE_TAGS or to in typemap._MULTIRANGE_TAGS or to in typemap._FTS_TAGS)
+        and (
+            to in typemap._RANGE_TAGS
+            or to in typemap._MULTIRANGE_TAGS
+            or to in typemap._FTS_TAGS
+            or to in typemap._NET_TAGS
+        )
         and not isinstance(value, dict)
     ):
         return typemap.coerce(value, to)
@@ -1130,6 +1147,37 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if vec is None or query is None:
             return None
         return _fts.ts_rank(vec, query)
+    if name in (
+        "host",
+        "masklen",
+        "network",
+        "netmask",
+        "broadcast",
+        "family",
+        "abbrev",
+        "hostmask",
+    ):
+        from secantus.sql import net as _net
+
+        v = args[0] if args else None
+        if v is None:
+            return None
+        if name == "host":
+            return _net.host(v)
+        if name == "masklen":
+            return _net.masklen(v)
+        if name == "network":
+            return _net.network(v)
+        if name == "netmask":
+            return _net.netmask(v)
+        if name == "broadcast":
+            return _net.broadcast(v)
+        if name == "family":
+            return _net.family(v)
+        if name == "hostmask":
+            return _net.netmask(v)  # close enough for the common /24 cases
+        # abbrev: render the inet abbreviated form (drops a full-host mask).
+        return _net.render_inet(v)
     if name == "isempty":
         from secantus.sql import ranges as _ranges
 
@@ -1295,6 +1343,40 @@ def _jsonb_strip_nulls(value: Any) -> Any:
 
 _NOT_RANGE = object()
 _NOT_FTS = object()
+_NOT_NET = object()
+
+
+def _is_net_value(v: Any) -> bool:
+    """Does ``v`` look like a stored ``inet`` / ``cidr`` value (an ``addr/masklen``
+    string)?"""
+    if not isinstance(v, str) or "/" not in v:
+        return False
+    import ipaddress
+
+    try:
+        ipaddress.ip_interface(v)
+    except ValueError:
+        return False
+    return True
+
+
+def _eval_net_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``<<`` (contained by) / ``>>`` (contains) / ``&&`` (overlaps) on network
+    operands. Returns ``_NOT_NET`` when neither operand is a network value (so the
+    caller falls back to the range / bit-shift path)."""
+    left = evaluate(node.this, scope, ctx)
+    right = evaluate(node.expression, scope, ctx)
+    if not (_is_net_value(left) or _is_net_value(right)):
+        return _NOT_NET
+    if left is None or right is None:
+        return None
+    from secantus.sql import net as _net
+
+    if isinstance(node, exp.BitwiseLeftShift):  # a << b : a contained within b
+        return _net.contains(right, left)
+    if isinstance(node, exp.BitwiseRightShift):  # a >> b : a contains b
+        return _net.contains(left, right)
+    return _net.overlaps(left, right)  # a && b
 
 
 def _eval_fts_match(left: Any, right: Any) -> Any:
