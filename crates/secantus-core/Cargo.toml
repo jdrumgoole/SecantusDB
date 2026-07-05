@@ -1,6 +1,6 @@
 [package]
 name = "secantus-core"
-version = "0.5.3-beta.131"
+version = "0.5.3-beta.132"
 edition = "2021"
 description = "Pure-Rust operator engines for SecantusDB (sort keys, query matcher, update operators, aggregation-expression evaluator, projection, change-stream diff, aggregation pipeline)."
 license = "GPL-2.0-only"
@@ -36,3 +36,14 @@ fancy-regex = "0.14"
 # it's NOT byte-pinned to the Python evaluator (no parity corpus case); both
 # engines independently produce a fresh value in range.
 rand = "0.9"
+# Named IANA timezones for the `$dateToString` `timezone` field (e.g.
+# "America/New_York"). `chrono-tz` bundles the IANA tz database so the standalone
+# Rust server — which has no Python `zoneinfo` to defer to — can resolve a named
+# zone's UTC offset *at a given instant* (DST-correct). Only the unambiguous
+# instant→wall-clock direction is used, so `chrono-tz` and Python `zoneinfo` agree
+# for any instant in a zone whose rules both tz databases share (the parity corpus
+# stays on post-2007 dates in decade-stable major zones to stay clear of tzdb
+# release skew). `chrono` is the trait provider; default features off — no
+# `clock` / `std::time::SystemTime` needed.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+chrono-tz = { version = "0.10", default-features = false }

@@ -403,7 +403,30 @@ CURATED = [
     ({"$dateToString": {"date": "$m"}}, {"m": _mkdate(1_749_000_000_234)}),  # %L = 234
     ({"$dateToString": {"date": 5}}, {}),  # non-datetime -> null
     ({"$dateToString": {"date": "$x"}}, {}),  # missing -> null
-    ({"$dateToString": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),  # tz -> defer
+    # Named IANA timezone: Rust resolves the DST-correct offset at the instant via
+    # chrono-tz (instant->wall-clock is unambiguous, so it matches Python zoneinfo).
+    # Curated to post-2007 dates in decade-stable major zones to stay clear of tzdb
+    # release skew between chrono-tz's bundled db and CI's Python tzdata.
+    ({"$dateToString": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),  # summer EDT
+    (
+        {
+            "$dateToString": {
+                "date": "$d",
+                "format": "%Y-%m-%d %H:%M",
+                "timezone": "America/New_York",
+            }
+        },
+        {"d": datetime.datetime(2023, 1, 15, 16, 30, tzinfo=datetime.timezone.utc)},  # winter EST
+    ),
+    (
+        {"$dateToString": {"date": "$d", "format": "%H:%M", "timezone": "Europe/Dublin"}},
+        {"d": datetime.datetime(2023, 7, 15, 16, 30, tzinfo=datetime.timezone.utc)},  # IST +01:00
+    ),
+    (
+        {"$dateToString": {"date": "$d", "format": "%Y-%m-%d %H:%M", "timezone": "Asia/Tokyo"}},
+        {"d": _DT},  # JST +09:00 (no DST)
+    ),
+    ({"$dateToString": {"date": "$d", "timezone": "Not/AZone"}}, {"d": _DT}),  # unknown -> defer
     # Fixed-offset timezone shifts the wall clock before rendering.
     ({"$dateToString": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),
     (

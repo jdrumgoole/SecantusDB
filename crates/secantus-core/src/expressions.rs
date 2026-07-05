@@ -27,7 +27,10 @@
 //! The remaining operators are *principled* defers — they can't be reproduced
 //! without a fidelity risk: regex (`$regexMatch`/…) needs Python's `re`;
 //! `$dateToString`/`$dateFromString` handle a numeric-directive `strftime`/
-//! `strptime` subset + fixed-offset timezones, deferring named IANA zones;
+//! `strptime` subset + fixed-offset timezones (`$dateToString` also resolves
+//! *named* IANA zones via `chrono-tz` — the unambiguous instant→wall-clock
+//! direction; `$dateFromString`'s named-zone form still defers, being
+//! DST-ambiguous local→instant);
 //! `$convert`/`$toDecimal` + float-`str()` / string-parse / Decimal128
 //! conversions; `$round`/`$pow`/`$trunc` (rounding mode) and transcendentals
 //! (`$exp`/`$ln`/`$log`/`$log10` — last-ULP) risk float divergence; `$sortArray`
@@ -1286,28 +1289,35 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
 /// date (UTC) per a strftime-style `format`, defaulting to
 /// `"%Y-%m-%dT%H:%M:%S.%LZ"`. A non-datetime `date` (incl. null) → null.
 ///
-/// A fixed-offset `timezone` (`±HHMM` / `±HH:MM` / `UTC` / `GMT`) shifts the wall
-/// clock before rendering (naive input is treated as UTC); a named IANA zone
-/// defers to Python.
+/// A `timezone` shifts the wall clock before rendering (naive input is treated as
+/// UTC): a fixed offset (`±HHMM` / `±HH:MM` / `UTC` / `GMT`) is constant, and a
+/// *named* IANA zone (`America/New_York`, …) resolves its DST-correct offset at the
+/// rendered instant via `chrono-tz`. An unknown zone name defers to Python.
 ///
 /// Renders the unambiguous directives — `%Y` (4-digit year), `%m`/`%d`/`%H`/`%M`/
 /// `%S` (2-digit), `%L` (3-digit millis), `%j` (3-digit day-of-year), `%w`
 /// (mongod Sunday=1..7), `%u` (ISO Monday=1..7), `%%` — and defers (`Fallback`)
-/// on a named/malformed `timezone`, any other directive (`%z`/`%Z`/`%G`/`%V`/`%U`/
-/// locale names — Python `strftime` handles those), a non-4-digit year (glibc
+/// on an unknown/malformed `timezone`, any other directive (`%z`/`%Z`/`%G`/`%V`/
+/// `%U`/locale names — Python `strftime` handles those), a non-4-digit year (glibc
 /// `%Y` padding differs), or a non-string `format`.
 fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback)?;
-    // A fixed-offset `timezone` shifts the wall clock (naive input is UTC, matching
-    // BSON Date semantics); a named zone / malformed offset defers to Python.
-    let tz_offset = match spec.get("timezone") {
-        None => 0,
-        Some(Bson::String(s)) => resolve_tz_offset(s).ok_or(Fallback)? * 60_000,
-        Some(_) => return Err(Fallback), // Python raises "timezone must be a string"
-    };
     let millis = match eval(spec.get("date").ok_or(Fallback)?, ctx)? {
         Bson::DateTime(dt) => dt.timestamp_millis(),
         _ => return Ok(Bson::Null), // `_ensure_datetime(non-datetime)` -> None -> null
+    };
+    // A `timezone` shifts the wall clock before rendering (naive input is UTC,
+    // matching BSON Date semantics). A fixed offset (`±HH:MM` / `UTC` / `GMT`) is a
+    // constant; a *named* IANA zone resolves its DST-correct offset at this instant
+    // via `chrono-tz`. An unknown name / malformed offset / non-string defers to
+    // Python (which resolves the zone or raises).
+    let tz_offset = match spec.get("timezone") {
+        None => 0,
+        Some(Bson::String(s)) => match resolve_tz_offset(s) {
+            Some(off_min) => off_min * 60_000,
+            None => named_tz_offset_ms(s, millis).ok_or(Fallback)?,
+        },
+        Some(_) => return Err(Fallback), // Python raises "timezone must be a string"
     };
     let fmt = match spec.get("format") {
         None => "%Y-%m-%dT%H:%M:%S.%LZ",
@@ -1486,6 +1496,31 @@ fn resolve_tz_offset(name: &str) -> Option<i64> {
         }
         _ => None, // named zone -> defer
     }
+}
+
+/// Resolve a *named* IANA zone (`"America/New_York"`, `"Europe/Dublin"`, …) to its
+/// signed UTC offset **in milliseconds at the given UTC instant** — DST-correct,
+/// since the offset of a zone depends on when you ask. Returns `None` for a name
+/// `chrono-tz` doesn't know (the caller defers to Python, which resolves it or
+/// raises "unknown timezone").
+///
+/// This is the *instant → wall-clock* direction, which is total and unambiguous:
+/// every UTC instant maps to exactly one local time in a zone (unlike the reverse,
+/// where a DST gap/overlap makes a naive local time ambiguous). So `chrono-tz` and
+/// Python `zoneinfo` return the identical offset for any instant whose governing
+/// rule both tz databases agree on — which is why `$dateToString` can compute
+/// natively here while `$dateFromString`'s named-zone form still defers.
+fn named_tz_offset_ms(name: &str, utc_millis: i64) -> Option<i64> {
+    use chrono::{DateTime, Offset, TimeZone, Utc};
+    let tz: chrono_tz::Tz = name.parse().ok()?;
+    let secs = utc_millis.div_euclid(1000);
+    let nanos = (utc_millis.rem_euclid(1000) * 1_000_000) as u32;
+    let instant: DateTime<Utc> = DateTime::from_timestamp(secs, nanos)?;
+    let offset_secs = tz
+        .offset_from_utc_datetime(&instant.naive_utc())
+        .fix()
+        .local_minus_utc();
+    Some(offset_secs as i64 * 1000)
 }
 
 /// A fixed `±HH:MM` UTC offset in signed minutes, or `None` if malformed.
@@ -2750,12 +2785,44 @@ mod tests {
     }
 
     #[test]
+    fn date_to_string_named_timezone() {
+        // Named IANA zone: DST-correct, instant→wall-clock (matches Python
+        // zoneinfo). 2023-07-15T16:30Z is EDT (-04:00) → 12:30; 2023-01-15T16:30Z
+        // is EST (-05:00) → 11:30. Same UTC hour-of-day, one hour apart locally.
+        let summer = bson::DateTime::from_millis(1_689_438_600_000);
+        let winter = bson::DateTime::from_millis(1_673_800_200_000);
+        assert_eq!(
+            ev(
+                doc! {"d": summer},
+                bson::bson!({"$dateToString": {"date": "$d", "format": "%Y-%m-%d %H:%M", "timezone": "America/New_York"}})
+            ),
+            Bson::String("2023-07-15 12:30".into())
+        );
+        assert_eq!(
+            ev(
+                doc! {"d": winter},
+                bson::bson!({"$dateToString": {"date": "$d", "format": "%Y-%m-%d %H:%M", "timezone": "America/New_York"}})
+            ),
+            Bson::String("2023-01-15 11:30".into())
+        );
+        // Europe/Dublin in summer is IST (+01:00) → 17:30.
+        assert_eq!(
+            ev(
+                doc! {"d": summer},
+                bson::bson!({"$dateToString": {"date": "$d", "format": "%H:%M", "timezone": "Europe/Dublin"}})
+            ),
+            Bson::String("17:30".into())
+        );
+    }
+
+    #[test]
     fn unsupported_falls_back() {
-        // A deferring shape ($dateToString with a named IANA timezone — offset
-        // zones now compute), non-ASCII $toUpper, and string $add all defer.
+        // An *unknown* zone name still defers (Python resolves it or raises), as do
+        // non-ASCII $toUpper and string $add.
+        let d = bson::DateTime::from_millis(1_689_438_600_000);
         assert!(evaluate(
-            &doc! {},
-            &bson::bson!({"$dateToString": {"date": "$d", "timezone": "America/New_York"}}),
+            &doc! {"d": d},
+            &bson::bson!({"$dateToString": {"date": "$d", "timezone": "Not/AZone"}}),
             &Document::new()
         )
         .is_err());
