@@ -349,7 +349,7 @@ fn sasl_start_x509(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let conversation_id = match &ctx.conn_auth {
         Some(a) => a
             .lock()
-            .expect("conn auth mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .new_conversation_id(),
         None => 1,
     };

@@ -1147,7 +1147,7 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
         .as_ref()
         .map(|a| {
             a.lock()
-                .expect("conn auth mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .is_authenticated()
         })
         .unwrap_or(false);
@@ -1168,7 +1168,7 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
                 .as_ref()
                 .map(|a| {
                     a.lock()
-                        .expect("conn auth mutex poisoned")
+                        .unwrap_or_else(|e| e.into_inner())
                         .effective_roles
                         .clone()
                 })
