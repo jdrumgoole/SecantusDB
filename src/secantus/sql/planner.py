@@ -137,6 +137,9 @@ class SelectPlan:
     # For an ORDER BY field that is an enum column: field_path -> the enum's
     # declared label list, so the executor sorts by declared order not lexically.
     enum_orders: dict[str, list[str]] = field(default_factory=dict)
+    # ORDER BY field paths that are citext columns: the executor folds their string
+    # values to lower case before comparing, so the sort is case-insensitive.
+    citext_orders: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -645,6 +648,15 @@ def _field_literal_pair(
     return None
 
 
+def _citext_cmp_filter(field: str, mongo_op: str, value: Any) -> dict[str, Any]:
+    """Lower a ``citext_col OP literal`` comparison to a case-insensitive Mongo
+    filter — both sides folded with ``$toLower`` inside ``$expr`` so equality,
+    inequality, and range all compare case-insensitively (citext's defining
+    behaviour). ``value`` is a plain Python string (or None)."""
+    folded = value.lower() if isinstance(value, str) else value
+    return {"$expr": {mongo_op: [{"$toLower": f"${field}"}, folded]}}
+
+
 # Comparison op -> the aggregation-expression operator used inside ``$expr`` when
 # neither side is a constant (column-to-column / arithmetic predicates).
 _EXPR_CMP: dict[type, str] = {
@@ -876,6 +888,8 @@ def _expr_to_filter(
         pair = _field_literal_pair(left, right)
         if pair is not None:
             field, tag = _field(pair[0], resolve)
+            if tag == "citext":
+                return _citext_cmp_filter(field, "$eq", _literal(pair[1]))
             return {field: typemap.coerce(_literal(pair[1]), tag)}
         return {"$expr": {"$eq": [_to_agg_expr(left, resolve), _to_agg_expr(right, resolve)]}}
 
@@ -884,6 +898,8 @@ def _expr_to_filter(
         pair = _field_literal_pair(left, right)
         if pair is not None:
             field, tag = _field(pair[0], resolve)
+            if tag == "citext":
+                return _citext_cmp_filter(field, "$ne", _literal(pair[1]))
             return {field: {"$ne": typemap.coerce(_literal(pair[1]), tag)}}
         return {"$expr": {"$ne": [_to_agg_expr(left, resolve), _to_agg_expr(right, resolve)]}}
 
@@ -892,9 +908,13 @@ def _expr_to_filter(
             left, right = node.this, node.expression
             if _is_field_node(left) and _is_literalish(right):
                 field, tag = _field(left, resolve)
+                if tag == "citext":
+                    return _citext_cmp_filter(field, op, _literal(right))
                 return {field: {op: typemap.coerce(_literal(right), tag)}}
             if _is_field_node(right) and _is_literalish(left):
                 field, tag = _field(right, resolve)
+                if tag == "citext":
+                    return _citext_cmp_filter(field, flipped, _literal(left))
                 return {field: {flipped: typemap.coerce(_literal(left), tag)}}
             return {
                 "$expr": {
@@ -908,20 +928,29 @@ def _expr_to_filter(
             if subctx is None:
                 raise errors.feature_not_supported("IN (subquery) is not supported")
             return {field: {"$in": _eval_in_subquery(node.args["query"], subctx, tag)}}
+        if tag == "citext":
+            # Case-insensitive membership: fold the field and every candidate.
+            folded = [str(_literal(e)).lower() for e in node.expressions]
+            return {"$expr": {"$in": [{"$toLower": f"${field}"}, folded]}}
         values = [typemap.coerce(_literal(e), tag) for e in node.expressions]
         return {field: {"$in": values}}
 
     if isinstance(node, exp.Between):
         field, tag = _field(node.this, resolve)
+        if tag == "citext":
+            low = _citext_cmp_filter(field, "$gte", _literal(node.args["low"]))
+            high = _citext_cmp_filter(field, "$lte", _literal(node.args["high"]))
+            return _merge_and([low, high])
         low = typemap.coerce(_literal(node.args["low"]), tag)
         high = typemap.coerce(_literal(node.args["high"]), tag)
         return {field: {"$gte": low, "$lte": high}}
 
     if isinstance(node, (exp.Like, exp.ILike)):
-        field, _ = _field(node.this, resolve)
+        field, tag = _field(node.this, resolve)
         pattern = _literal(node.expression)
         spec: dict[str, Any] = {"$regex": _like_to_regex(str(pattern))}
-        if isinstance(node, exp.ILike):
+        # ``citext LIKE`` is case-insensitive (equivalent to ILIKE).
+        if isinstance(node, exp.ILike) or tag == "citext":
             spec["$options"] = "i"
         return {field: spec}
 
@@ -1610,6 +1639,21 @@ def _order_terms(stmt: exp.Expression, table: TableDef) -> list[tuple[str, int, 
     return terms
 
 
+def _citext_order_set(stmt: exp.Expression, table: TableDef) -> set[str]:
+    """The ORDER BY field paths whose column is citext — the executor folds those
+    to lower case before comparing, so citext sorts case-insensitively."""
+    order = stmt.args.get("order")
+    if order is None:
+        return set()
+    out: set[str] = set()
+    for o in order.expressions:
+        if isinstance(o.this, exp.Column):
+            col = table.column(_column_name(o.this))
+            if col is not None and col.type_tag == "citext":
+                out.add(table.field_for(col.name))
+    return out
+
+
 def _enum_order_map(
     stmt: exp.Expression, table: TableDef, subctx: SubqueryCtx | None
 ) -> dict[str, list[str]]:
@@ -1820,6 +1864,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
         skip=skip,
         out_columns=_select_out_columns(stmt, table),
         enum_orders=_enum_order_map(stmt, table, subctx),
+        citext_orders=_citext_order_set(stmt, table),
     )
 
 
@@ -4908,6 +4953,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
                 "money",
                 "bytea",
                 "hstore",
+                "citext",
             )
             or _mapped in typemap._GEO_TAGS
         ):

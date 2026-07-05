@@ -878,6 +878,34 @@ the stored key path). Stored as a tagged subdocument so it stays distinct from a
 set-returning `each` / `skeys` / `svals` forms (use the `akeys` / `avals` arrays),
 GiST/GIN indexing, and the `#=` / `%%` record operators.
 
+### Case-insensitive text (`citext`)
+
+`citext` columns store text with its original case preserved (for storage and
+display) but compare and sort **case-insensitively**:
+
+```sql
+CREATE TABLE u (id int PRIMARY KEY, name citext);
+INSERT INTO u VALUES (1, 'Alice'), (2, 'BOB'), (3, 'carol');
+
+SELECT name FROM u WHERE id = 1;             -- Alice   (case preserved)
+SELECT id FROM u WHERE name = 'alice';       -- 1       (= folds case)
+SELECT id FROM u WHERE name IN ('ALICE','bob');  -- 1, 2
+SELECT id FROM u WHERE name < 'c';           -- 1, 2    (range folds case)
+SELECT id FROM u WHERE name LIKE 'a%';       -- 1       (LIKE folds case)
+SELECT id FROM u ORDER BY name;              -- 1, 2, 3 (a, b, c order)
+```
+
+The comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`), `IN`, `BETWEEN`, and
+`LIKE` all fold case (`LIKE` on citext is equivalent to `ILIKE`), and `ORDER BY`
+on a citext column sorts case-insensitively. The value is stored verbatim, so the
+case is preserved on read.
+
+**Simplification:** `GROUP BY` / `SELECT DISTINCT` on a citext column currently
+group case-*sensitively* (`Alice` and `alice` are distinct groups) — unlike real
+Postgres, which folds them. The dominant citext uses (case-insensitive lookups,
+uniqueness, and sorted listings) are faithful; case-folding aggregation grouping
+is a known limitation. citext indexing is also out of scope.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

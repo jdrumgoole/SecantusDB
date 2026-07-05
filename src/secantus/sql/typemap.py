@@ -88,6 +88,12 @@ PG_OID: dict[str, int] = {
     # PG_TYPENAME, so ``to_regtype('hstore')`` stays NULL and SQLAlchemy's psycopg
     # connect-time hstore probe is a no-op (it must not register a fictional type).
     "hstore": 16935,
+    # citext (contrib): case-insensitive text. Stored (and sent on the wire) as
+    # plain text — the case-folding is a query-planner behaviour, not a value shape.
+    # It intentionally has NO PG_OID entry: the wire layer's ``PG_OID.get(tag, 25)``
+    # already reports the text OID (25) for it, and adding an explicit ``citext: 25``
+    # would collide with ``text: 25`` in the inverted OID→typename map (making
+    # ``format_type(25)`` resolve to "citext" instead of "text").
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -142,6 +148,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "uuid": "uuid",
     "money": "money",
     "hstore": "hstore",
+    "citext": "citext",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -263,6 +270,8 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return "date"
     if base in _GEO_TAGS:
         return base
+    if base == "citext":
+        return "citext"
     return None
 
 
@@ -396,7 +405,9 @@ def coerce(value: Any, tag: str) -> Any:
         return float(value)
     if tag == "numeric":
         return bson.Decimal128(value if isinstance(value, Decimal) else Decimal(str(value)))
-    if tag == "text":
+    if tag in ("text", "citext"):
+        # citext stores the original text verbatim (case preserved for display);
+        # the case-insensitivity is applied by the query planner, not on write.
         return str(value)
     if tag == "bool":
         return bool(value)

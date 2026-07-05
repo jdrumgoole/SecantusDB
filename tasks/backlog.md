@@ -1722,6 +1722,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   filter). Tests: `tests/test_sql_hstore.py` (25: pure hstore + SQL surface) plus a pg8000 wire test. **Out of
   scope:** the set-returning `each`/`skeys`/`svals` forms (the `akeys`/`avals` arrays cover the need), GiST/GIN
   indexing, and the `#=`/`%%`/`%#` record operators.
+- [ ] **citext case-insensitive text landed** (b154): the `citext` contrib type — text stored verbatim (case
+  preserved for display) but compared / sorted case-insensitively. The case-folding is a **query-planner behaviour**,
+  not a value shape (a citext value is an ordinary string, so it can't be tagged like hstore without breaking text
+  rendering) — so it's driven off the column's `type_tag == "citext"`. Wired through `typemap` (OID 25 / the text OID
+  so drivers read it as text; `citext` in `SQL_TYPE_NAME`; name-match in `type_tag_for_sql`; `coerce` → `str`; **not**
+  in `PG_TYPENAME`), `planner` (`_citext_cmp_filter` lowers `=`/`<>`/`<`/`<=`/`>`/`>=` to `{$expr: {op: [{$toLower:
+  "$field"}, lower(value)]}}`; `IN` / `BETWEEN` fold likewise; `LIKE` on citext adds the `i` regex option
+  (= `ILIKE`); citext cast typing; `_citext_order_set` collects citext ORDER BY field paths onto `SelectPlan`), and
+  `executor` (`_order_key_fn` folds those fields' string values to lower case for a case-insensitive sort). Tests:
+  `tests/test_sql_citext.py` (11) plus a pg8000 wire test. **Simplification (documented divergence):** `GROUP BY` /
+  `SELECT DISTINCT` on a citext column group case-**sensitively** (`Alice` ≠ `alice`), unlike real Postgres — the
+  dominant citext uses (case-insensitive equality / uniqueness / range / sort) are faithful, but case-folding
+  aggregation grouping isn't wired yet. citext indexing is out of scope.
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same
