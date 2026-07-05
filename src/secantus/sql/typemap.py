@@ -66,6 +66,8 @@ PG_OID: dict[str, int] = {
     "varbit": 1562,
     # Interval type (rendered as the Postgres interval text form).
     "interval": 1186,
+    # UUID type (rendered as the canonical lower-case hyphenated string).
+    "uuid": 2950,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -111,6 +113,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "bit": "bit",
     "varbit": "bit varying",
     "interval": "interval",
+    "uuid": "uuid",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -132,6 +135,7 @@ PG_TYPENAME: dict[str, str] = {
     "bit": "bit",
     "varbit": "varbit",
     "interval": "interval",
+    "uuid": "uuid",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -166,6 +170,7 @@ _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.VARBINARY: "bytea",
     exp.DataType.Type.BIT: "bit",
     exp.DataType.Type.INTERVAL: "interval",
+    exp.DataType.Type.UUID: "uuid",
 }
 
 
@@ -319,6 +324,10 @@ def coerce(value: Any, tag: str) -> Any:
         from secantus.sql import intervals as _intervals
 
         return value if _intervals.is_interval(value) else _intervals.parse(str(value))
+    if tag == "uuid":
+        from secantus.sql import uuidtype as _uuidtype
+
+        return _uuidtype.normalize(value)
     if tag == "int4":
         return int(value)
     if tag == "int8":

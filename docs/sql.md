@@ -702,6 +702,28 @@ Simplifications vs real Postgres: days are treated as 24 hours (no DST-aware
 arithmetic), the `@` / verbose input grammar beyond a trailing `ago` isn't
 parsed, and interval indexes are out of scope.
 
+### UUID type (`uuid`)
+
+`uuid` columns store the canonical lower-case hyphenated string, and
+`gen_random_uuid()` / `uuid_generate_v4()` mint fresh values:
+
+```sql
+CREATE TABLE people (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text);
+INSERT INTO people (name) VALUES ('alice');
+INSERT INTO people VALUES ('550e8400-e29b-41d4-a716-446655440000', 'bob');
+
+-- casts normalise: uppercase, bare-hex, and {braced} forms all canonicalise
+SELECT '550E8400E29B41D4A716446655440000'::uuid;   -- 550e8400-e29b-41d4-a716-446655440000
+
+-- equality lowers to a Mongo filter (a non-canonical literal is normalised first)
+SELECT name FROM people WHERE id = '550E8400-E29B-41D4-A716-446655440000';
+```
+
+Because the value is stored as its canonical string, equality and `ORDER BY`
+work as ordinary comparisons and push down to the storage layer (no per-row
+evaluation). `gen_random_uuid` and `uuid_generate_v4` return version-4
+(random) UUIDs.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

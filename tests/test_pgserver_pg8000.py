@@ -1374,6 +1374,34 @@ def test_interval_type_via_driver(server):
     conn.close()
 
 
+def test_uuid_type_via_driver(server):
+    # uuid columns, gen_random_uuid, casts, and equality over the real wire
+    # (pg8000 parses the uuid OID into a Python uuid.UUID, so compare via str()).
+    import uuid as _uuid
+
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE people (id uuid primary key, name text)")
+    sample = "550e8400-e29b-41d4-a716-446655440000"
+    cur.execute(f"INSERT INTO people VALUES ('{sample}', 'alice')")
+    cur.execute("INSERT INTO people VALUES (gen_random_uuid(), 'bob')")
+
+    # The uuid column round-trips (pg8000 gives a uuid.UUID).
+    cur.execute("SELECT id FROM people WHERE name = 'alice'")
+    got = cur.fetchone()[0]
+    assert str(got) == sample
+
+    # gen_random_uuid produces a valid v4 uuid.
+    cur.execute("SELECT gen_random_uuid()")
+    v = cur.fetchone()[0]
+    assert _uuid.UUID(str(v)).version == 4
+
+    # equality in WHERE lowers to a Mongo filter.
+    cur.execute(f"SELECT name FROM people WHERE id = '{sample}'")
+    assert cur.fetchone()[0] == "alice"
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
