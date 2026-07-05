@@ -844,6 +844,40 @@ text formats; `get_byte` / `set_byte` read and replace a single 0-based byte;
 server setting (output is always hex) and the digest functions (`md5` / `sha256`,
 which belong to the crypto extensions rather than core `bytea`).
 
+### Key/value pairs (`hstore`)
+
+The `hstore` contrib type stores a flat string → string map (values may be NULL)
+and renders as the canonical `"a"=>"1", "b"=>"2"` text:
+
+```sql
+CREATE TABLE items (id int PRIMARY KEY, attrs hstore);
+INSERT INTO items VALUES (1, 'color=>red, size=>big');
+INSERT INTO items VALUES (2, 'color=>blue, size=>small');
+
+SELECT attrs -> 'color' FROM items WHERE id = 1;      -- red   (-> lookup, text)
+SELECT id FROM items WHERE attrs @> 'color=>red';     -- 1     (@> contains)
+SELECT id FROM items WHERE attrs ? 'size';            -- 1, 2  (? key exists)
+SELECT id FROM items WHERE attrs -> 'color' = 'blue'; -- 2     (pushes down)
+
+SELECT akeys('a=>1,b=>2'::hstore);        -- {a,b}
+SELECT avals('a=>1,b=>2'::hstore);        -- {1,2}
+SELECT hstore_to_json('a=>1'::hstore);    -- {"a": "1"}
+SELECT 'a=>1'::hstore || 'b=>2'::hstore;  -- "a"=>"1", "b"=>"2"   (merge)
+SELECT defined('a=>1,b=>NULL'::hstore, 'b');  -- f   (present but NULL)
+```
+
+Operators: `->` (value lookup → text, NULL if absent), `@>` / `<@` (contains /
+contained-by), `?` / `?&` / `?|` (key exists / all keys / any keys), `||` (merge,
+right wins). Functions: `akeys` / `avals` (→ `text[]`), `hstore_to_json`,
+`hstore(k, v)` / `hstore(keys[], vals[])`, `delete(h, key)`, `defined(h, key)`.
+
+The containment and key-exists operators route through the per-row scalar path
+(they can't lower to a Mongo `$match`); a `->` lookup *does* push down (it maps to
+the stored key path). Stored as a tagged subdocument so it stays distinct from a
+`jsonb` object even though the operators are spelled the same. Out of scope: the
+set-returning `each` / `skeys` / `svals` forms (use the `akeys` / `avals` arrays),
+GiST/GIN indexing, and the `#=` / `%%` record operators.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every
