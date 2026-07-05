@@ -1749,6 +1749,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
   functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
   out of scope.
+- [ ] **LISTEN / NOTIFY / UNLISTEN landed** (b156): cross-connection async pub/sub on the PG wire server. New
+  `secantus/sql/pgnotify.py` (`NotifyHub` — a server-wide channel → listening-session registry, keyed by
+  `id(session)` since `Session` is an unhashable dataclass). New `pgwire.notification_response` ('A'). `Session`
+  gains `notify_hub`, a thread-safe inbound `_notify_deliveries` deque (drained by the owning connection thread —
+  all socket writes stay on one thread) + `pending_notifies` (buffered in-txn). `engine._maybe_pubsub` handles the
+  commands *before* sqlglot (which mis-parses `LISTEN chan` and errors on `NOTIFY chan, 'p'`); `is_pubsub_statement`
+  lets the wire server skip the COPY probe. NOTIFY buffers inside a txn block and flushes at COMMIT (dropped on
+  ROLLBACK); `pg_notify(channel, payload)` function form in `scalar._call_func`. `pgserver` owns one `NotifyHub`,
+  attaches it to each session, drops listens on disconnect, and drives an idle-poll (`select` with
+  `NOTIFY_POLL_SECONDS = 0.25`) so a quiet listener still gets deliveries; `_flush_notifications` writes the queued
+  `NotificationResponse`s. Tests: `tests/test_sql_notify.py` (14: hub + engine) plus a two-connection pg8000 wire
+  test. **Simplifications:** duplicate `(channel, payload)` notifications in one txn aren't collapsed (Postgres
+  collapses them); LISTEN/UNLISTEN take effect immediately, not at commit; over TLS an idle listener may only pick
+  up notifications on its next round-trip (the poll watches the raw socket, not buffered TLS data).
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

@@ -19,6 +19,7 @@ import contextlib
 import logging
 import os
 import secrets
+import select
 import socket
 import ssl
 import threading
@@ -37,6 +38,7 @@ from secantus.sql.pgauth import (
     mock_credentials,
 )
 from secantus.sql.pgextended import ExtendedSession
+from secantus.sql.pgnotify import NotifyHub
 from secantus.sql.session import SERVER_VERSION, Session
 
 if TYPE_CHECKING:
@@ -50,6 +52,10 @@ DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
 #: ``DEFAULT_MAX_CONNECTIONS``). Bounds the fan-out of the per-connection cursor
 #: caps so total memory is bounded even under an unauthenticated flood. (#194)
 DEFAULT_MAX_CONNECTIONS = 1000
+
+#: How often an idle connection wakes to deliver pending LISTEN/NOTIFY
+#: notifications. Small enough to feel prompt, large enough to stay cheap.
+NOTIFY_POLL_SECONDS = 0.25
 
 #: Wire message for an unexpected internal error. The raw Python exception text
 #: is written to the server log (``logger.exception``) but never sent to the
@@ -85,6 +91,8 @@ class SecantusPGServer:
         self._stop_event = threading.Event()
         self._conns: set[socket.socket] = set()
         self._conns_lock = threading.Lock()
+        # Server-wide LISTEN / NOTIFY channel registry.
+        self._notify = NotifyHub()
         # SCRAM-SHA-256 auth: when require_auth is on, clients must authenticate
         # against a user from ``users`` (username -> plaintext, hashed into a
         # SCRAM verifier at startup; the plaintext is not retained).
@@ -222,6 +230,8 @@ class SecantusPGServer:
             if session is not None and session.txn_handle is not None:
                 with contextlib.suppress(Exception):
                     self.storage.abort_user_transaction(session.txn_handle)
+            if session is not None:
+                self._notify.unlisten_all(session)  # drop this conn's LISTENs
             with self._conns_lock:
                 self._conns.discard(conn)
 
@@ -258,6 +268,7 @@ class SecantusPGServer:
             return None
 
         session = Session(database=db, user=user, backend_pid=backend_pid)
+        session.notify_hub = self._notify
         if self._authz_active:
             session.authz_active = True
             session.roles = self._users.roles_for(user)
@@ -319,6 +330,15 @@ class SecantusPGServer:
         # Per-connection extended-protocol state (prepared statements + portals).
         ext = ExtendedSession(self.storage, session)
         while not self._stop_event.is_set():
+            # Deliver any pending LISTEN/NOTIFY notifications, then wait for client
+            # data with a short poll so an idle listener still gets them promptly.
+            self._flush_notifications(conn, session)
+            try:
+                ready, _, _ = select.select([conn], [], [], NOTIFY_POLL_SECONDS)
+            except (OSError, ValueError):
+                return
+            if not ready:
+                continue  # timeout — loop back to flush notifications
             try:
                 msg = pgwire.read_message(conn)
             except pgwire.PGProtocolError:
@@ -352,6 +372,12 @@ class SecantusPGServer:
             if reply:
                 conn.sendall(reply)
 
+    def _flush_notifications(self, conn: socket.socket, session: Session) -> None:
+        """Write any queued async LISTEN/NOTIFY deliveries to this connection. Runs
+        only on the owning connection thread, so socket writes stay serialized."""
+        for pid, channel, payload in session.drain_notifications():
+            conn.sendall(pgwire.notification_response(pid, channel, payload))
+
     def _handle_query(self, conn: socket.socket, session: Session, sql: str) -> None:
         # A COPY … FROM/TO STDIN/STDOUT statement drives its own sub-protocol
         # (CopyIn/CopyOut) mid-query, so it can't go through run_sql.
@@ -362,10 +388,13 @@ class SecantusPGServer:
             # planner.parse must run inside the try: a syntax error raises a
             # SQLError (42601), and if that escaped it would drop the connection
             # with no ErrorResponse rather than reporting the error. (§I16)
-            stmts = planner.parse(sql)
-            if len(stmts) == 1 and isinstance(stmts[0], exp.Copy):
-                self._handle_copy(conn, session, stmts[0])
-                return
+            # LISTEN/NOTIFY/UNLISTEN bypass the COPY probe — sqlglot mis-parses
+            # them (and errors on a NOTIFY payload), so run_sql handles them.
+            if not sql_engine.is_pubsub_statement(sql):
+                stmts = planner.parse(sql)
+                if len(stmts) == 1 and isinstance(stmts[0], exp.Copy):
+                    self._handle_copy(conn, session, stmts[0])
+                    return
             results = run_sql(self.storage, session.database, sql, session=session)
             if not results:
                 out += pgwire.empty_query_response()

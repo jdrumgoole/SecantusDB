@@ -1586,6 +1586,37 @@ def test_xml_type_via_driver(server):
     conn.close()
 
 
+def test_listen_notify_via_driver(server):
+    # A NOTIFY on one connection is delivered asynchronously to a LISTENer on
+    # another connection, over the real wire (NotificationResponse 'A').
+    import time
+
+    listener = connect(server)
+    notifier = connect(server)
+    try:
+        lcur = listener.cursor()
+        lcur.execute("LISTEN chan")
+        listener.commit()
+
+        ncur = notifier.cursor()
+        ncur.execute("NOTIFY chan, 'payload-1'")
+        notifier.commit()
+
+        # Give the server's poll loop time to push the async message to the
+        # listener's socket, then drive the listener to process its inbound bytes.
+        time.sleep(0.6)
+        lcur.execute("SELECT 1")
+        lcur.fetchall()
+
+        assert len(listener.notifications) >= 1
+        _pid, channel, payload = listener.notifications.popleft()
+        assert channel == "chan"
+        assert payload == "payload-1"
+    finally:
+        listener.close()
+        notifier.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

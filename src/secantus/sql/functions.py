@@ -134,6 +134,7 @@ _SCALAR_EVAL_ANON = frozenset(
         "xml_is_well_formed",
         "xml_is_well_formed_document",
         "xmlconcat",
+        "pg_notify",
         "make_interval",
         "justify_days",
         "justify_hours",

@@ -8,6 +8,8 @@ through ``run_sql`` so session functions (``current_database()``,
 
 from __future__ import annotations
 
+import threading
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -110,6 +112,31 @@ class Session:
     # ``last_seq_value`` is the most recent one (``lastval()``, sequence-agnostic).
     seq_values: dict[str, int] = field(default_factory=dict)
     last_seq_value: int | None = None
+    # LISTEN / NOTIFY. ``notify_hub`` is the server-wide channel registry (None for
+    # the embedded API, where NOTIFY is a no-op delivery). ``_notify_deliveries``
+    # is this connection's inbound queue of ``(pid, channel, payload)`` tuples,
+    # drained by the owning connection thread. ``pending_notifies`` buffers NOTIFYs
+    # issued inside an open transaction block (delivered at COMMIT).
+    notify_hub: Any = None
+    _notify_lock: Any = field(default_factory=threading.Lock)
+    _notify_deliveries: deque = field(default_factory=deque)
+    pending_notifies: list[tuple[str, str]] = field(default_factory=list)
+
+    def enqueue_notification(self, pid: int, channel: str, payload: str) -> None:
+        """Called by another connection's NOTIFY thread — thread-safe append."""
+        with self._notify_lock:
+            self._notify_deliveries.append((pid, channel, payload))
+
+    def drain_notifications(self) -> list[tuple[int, str, str]]:
+        """Pop all queued inbound notifications for this connection to deliver."""
+        with self._notify_lock:
+            out = list(self._notify_deliveries)
+            self._notify_deliveries.clear()
+        return out
+
+    def has_pending_notifications(self) -> bool:
+        with self._notify_lock:
+            return bool(self._notify_deliveries)
 
     def record_sequence_value(self, name: str, value: int) -> None:
         """Remember a ``nextval`` result for later ``currval(name)`` / ``lastval()``."""

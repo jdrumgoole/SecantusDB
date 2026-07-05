@@ -1578,6 +1578,18 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if len(args) < 2 or args[0] is None or args[1] is None:
             return None
         return _xmltype.xpath(_as_text(args[0]), args[1])
+    if name == "pg_notify":
+        # ``pg_notify(channel, payload)`` — the function form of NOTIFY.
+        if ctx is not None and args and args[0] is not None:
+            session = ctx.session
+            channel, payload = str(args[0]), (_as_text(args[1]) if len(args) > 1 else "")
+            hub = getattr(session, "notify_hub", None)
+            if hub is not None:
+                if session.txn_handle is not None:
+                    session.pending_notifies.append((channel, payload))
+                else:
+                    hub.notify(channel, payload, session.backend_pid)
+        return None
     if name in ("gen_random_uuid", "uuid_generate_v4", "uuid_generate_v1"):
         from secantus.sql import uuidtype as _uuidtype
 

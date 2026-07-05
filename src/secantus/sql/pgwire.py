@@ -306,6 +306,12 @@ def command_complete(tag: str) -> bytes:
     return _msg("C", _cstr(tag))
 
 
+def notification_response(pid: int, channel: str, payload: str = "") -> bytes:
+    """'A' NotificationResponse — an async LISTEN/NOTIFY delivery: the notifying
+    backend's pid, the channel name, and the (possibly empty) payload."""
+    return _msg("A", _INT32.pack(pid & 0x7FFFFFFF) + _cstr(channel) + _cstr(payload))
+
+
 def empty_query_response() -> bytes:
     return _msg("I", b"")
 
