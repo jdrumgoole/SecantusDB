@@ -60,7 +60,6 @@ def _render(
             "title": "Server",
             "active": "server",
             "current_uri_display": request.app.state.mongo_uri_display,
-            "current_uri_raw": request.app.state.mongo_uri,
             "targets": targets,
             "error": error,
             "flash": flash,
