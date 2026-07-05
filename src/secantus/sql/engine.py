@@ -1059,6 +1059,10 @@ def _run_statement(
             return _declare_cursor(stmt, storage, db, catalog, session)
         if verb in ("FETCH", "MOVE"):
             return _fetch_cursor(stmt, session, move=verb == "MOVE")
+        if verb == "PREPARE":
+            return _prepare_statement(stmt, session)
+        if verb == "EXECUTE":
+            return _execute_statement(stmt, storage, db, catalog, session)
         if verb == "REFRESH":
             return _refresh_matview(stmt, storage, db, catalog, session)
         if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("MATERIALIZED"):
@@ -1100,9 +1104,11 @@ def _run_statement(
 
     # DEALLOCATE / DISCARD parse as a bare Alias in sqlglot's pg dialect (e.g.
     # ``DEALLOCATE "x"`` → ``DEALLOCATE AS "x"``); libpq clients (psycopg) and
-    # SQLAlchemy emit them to manage prepared statements. Accept as a no-op — our
-    # prepared statements live for the connection. (SAVEPOINT / RELEASE are real
-    # commands, handled in ``_dispatch``.)
+    # SQLAlchemy emit them to manage prepared statements. (SAVEPOINT / RELEASE are
+    # real commands, handled in ``_dispatch``.)
+    dealloc = _deallocate_target(stmt)
+    if dealloc is not None:
+        return _deallocate_statement(dealloc, session)
     noop = _noop_command_word(stmt)
     if noop is not None:
         return SQLResult(command_tag=noop)
@@ -1110,16 +1116,129 @@ def _run_statement(
     raise errors.feature_not_supported(f"unsupported statement: {type(stmt).__name__}")
 
 
-_NOOP_WORDS = {"DEALLOCATE", "DISCARD"}
+_NOOP_WORDS = {"DISCARD"}
 
 
 def _noop_command_word(stmt: exp.Expression) -> str | None:
-    """Return the no-op command word (DEALLOCATE / DISCARD) or None."""
+    """Return the no-op command word (DISCARD) or None."""
     head = stmt.this if isinstance(stmt, exp.Alias) else stmt
     name = head.name if isinstance(head, exp.Column) else None
     if name is not None and name.upper() in _NOOP_WORDS:
         return name.upper()
     return None
+
+
+# ---------------------------------------------------------------------------
+# PREPARE / EXECUTE / DEALLOCATE — SQL-level prepared statements.
+#
+# ``PREPARE name [(argtypes)] AS <query>`` stores the parsed query (with its
+# ``$N`` placeholders) on the session; ``EXECUTE name [(args)]`` substitutes the
+# supplied argument literals for the placeholders and runs the query, returning
+# its result; ``DEALLOCATE name`` / ``DEALLOCATE ALL`` forgets the statement(s).
+# These are distinct from the extended wire protocol's Parse/Bind portals
+# (``pgextended.py``) — psql's ``PREPARE``/``EXECUTE`` and libpq's
+# ``PQprepare`` land here. sqlglot falls back to a ``Command`` for PREPARE/EXECUTE
+# (tail carried as a string Literal) and to a bare ``Alias`` for DEALLOCATE.
+# ---------------------------------------------------------------------------
+
+_PREPARE_TAIL = re.compile(
+    r'^\s*(?P<name>"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*'
+    r"(?:\([^)]*\))?\s+AS\s+(?P<query>.*?)\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXECUTE_TAIL = re.compile(
+    r'^\s*(?P<name>"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*'
+    r"(?:\((?P<args>.*)\))?\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _prepare_statement(stmt: exp.Command, session: Session) -> SQLResult:
+    """``PREPARE name [(types)] AS <query>`` — parse and store the query AST."""
+    tail = _command_tail(stmt)
+    m = _PREPARE_TAIL.match(tail)
+    if m is None:
+        raise errors.syntax_error(f"malformed PREPARE: {tail}")
+    name = _unquote_ident(m.group("name"))
+    parsed = planner.parse(m.group("query"))
+    if len(parsed) != 1:
+        raise errors.syntax_error("PREPARE expects a single statement")
+    query = parsed[0]
+    if name in session.prepared:
+        raise errors.SQLError("42P05", f'prepared statement "{name}" already exists')
+    session.prepared[name] = (query, planner.parameter_count(query))
+    return SQLResult(command_tag="PREPARE")
+
+
+def _execute_statement(
+    stmt: exp.Command, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """``EXECUTE name [(args)]`` — bind the args into the stored query and run it."""
+    tail = _command_tail(stmt)
+    m = _EXECUTE_TAIL.match(tail)
+    if m is None:
+        raise errors.syntax_error(f"malformed EXECUTE: {tail}")
+    name = _unquote_ident(m.group("name"))
+    entry = session.prepared.get(name)
+    if entry is None:
+        raise errors.SQLError("26000", f'prepared statement "{name}" does not exist')
+    query, param_count = entry
+    args = _execute_args(m.group("args"))
+    if len(args) != param_count:
+        raise errors.SQLError(
+            "08P01",
+            f"wrong number of parameters for prepared statement "
+            f'"{name}": expected {param_count}, got {len(args)}',
+        )
+    bound = _bind_parameter_nodes(query, args)
+    return _run_statement(bound, storage, db, catalog, session)
+
+
+def _execute_args(raw: str | None) -> list[exp.Expression]:
+    """Parse the ``(a, b, …)`` argument list of an EXECUTE into expression nodes."""
+    if raw is None or raw.strip() == "":
+        return []
+    try:
+        wrapper = sqlglot.parse_one(f"SELECT {raw}", read="postgres")
+    except Exception as exc:  # noqa: BLE001 — surface as a clean SQL syntax error
+        raise errors.syntax_error(f"malformed EXECUTE arguments: ({raw})") from exc
+    return list(wrapper.expressions)
+
+
+def _bind_parameter_nodes(query: exp.Expression, args: list[exp.Expression]) -> exp.Expression:
+    """Replace ``$N`` placeholders in ``query`` with the EXECUTE argument nodes."""
+    query = query.copy()
+    for param in list(query.find_all(exp.Parameter)):
+        try:
+            idx = int(param.name) - 1
+        except (TypeError, ValueError) as exc:
+            raise errors.syntax_error(f"invalid bind parameter ${param.name}") from exc
+        if idx < 0 or idx >= len(args):
+            raise errors.syntax_error(f"bind parameter ${param.name} has no value")
+        param.replace(args[idx].copy())
+    return query
+
+
+def _deallocate_target(stmt: exp.Expression) -> str | None:
+    """A bare ``DEALLOCATE name`` / ``DEALLOCATE ALL`` — parses as a top-level
+    ``Alias`` (``DEALLOCATE AS name``). Returns the target name / ``"ALL"`` or None."""
+    if not isinstance(stmt, exp.Alias):
+        return None
+    head = stmt.this
+    if isinstance(head, exp.Column) and head.name.upper() == "DEALLOCATE":
+        return stmt.alias
+    return None
+
+
+def _deallocate_statement(target: str, session: Session) -> SQLResult:
+    """``DEALLOCATE name`` forgets one prepared statement; ``DEALLOCATE ALL`` clears
+    them all. Unlike Postgres, deallocating an unknown name is a silent no-op here
+    (libpq/psycopg fire speculative DEALLOCATEs during connection cleanup)."""
+    if target.upper() == "ALL":
+        session.prepared.clear()
+    else:
+        session.prepared.pop(_unquote_ident(target), None)
+    return SQLResult(command_tag="DEALLOCATE")
 
 
 def _run_select(

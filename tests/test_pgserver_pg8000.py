@@ -1614,6 +1614,29 @@ def test_listen_notify_via_driver(server):
         notifier.close()
 
 
+def test_prepare_execute_deallocate_via_driver(server):
+    # SQL-level PREPARE / EXECUTE / DEALLOCATE over the real wire (#121). Distinct
+    # from pg8000's own %s-parameter binding, which uses the extended protocol.
+    conn = connect(server)
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int, name text)")
+        cur.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
+        conn.commit()
+
+        cur.execute("PREPARE byid (int) AS SELECT name FROM t WHERE id = $1")
+        cur.execute("EXECUTE byid (2)")
+        assert cur.fetchall() == (["bob"],)
+        cur.execute("EXECUTE byid (1)")
+        assert cur.fetchall() == (["alice"],)
+
+        cur.execute("DEALLOCATE byid")
+        with pytest.raises(pg8000.DatabaseError):
+            cur.execute("EXECUTE byid (1)")
+    finally:
+        conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

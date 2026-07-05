@@ -99,6 +99,11 @@ class Session:
     savepoints: list[Any] = field(default_factory=list)
     # Open server-side cursors by name (``DECLARE … CURSOR`` / ``FETCH`` / ``CLOSE``).
     cursors: dict[str, Any] = field(default_factory=dict)
+    # SQL-level prepared statements (``PREPARE name AS …`` / ``EXECUTE`` /
+    # ``DEALLOCATE``). Maps a statement name to ``(query_ast, param_count)``. These
+    # are the SQL command-level prepared statements — distinct from the extended
+    # wire protocol's Parse/Bind portals (``pgextended.py``), which don't touch this.
+    prepared: dict[str, Any] = field(default_factory=dict)
     # Deferred-constraint state (DEFERRABLE FK / UNIQUE). ``pending_deferred`` holds
     # re-check records collected while a deferred constraint would be violated
     # inside a transaction; they run at COMMIT (or SET CONSTRAINTS … IMMEDIATE).

@@ -2182,6 +2182,36 @@ take effect immediately rather than at commit; and there is no out-of-band push
 to a fully-idle connection (notifications are attached to the next query
 response, not delivered asynchronously mid-idle).
 
+## Prepared statements (`PREPARE` / `EXECUTE` / `DEALLOCATE`)
+
+The SQL-level prepared-statement commands parse a query once and rerun it with
+different argument values:
+
+```sql
+PREPARE by_id (int) AS SELECT name FROM users WHERE id = $1;
+EXECUTE by_id (42);
+EXECUTE by_id (99);
+DEALLOCATE by_id;      -- forget it; DEALLOCATE ALL forgets every one
+```
+
+The `$1`, `$2`, … placeholders in the prepared query are filled by the
+positional `EXECUTE` arguments. Any statement kind works — `SELECT`, `INSERT`,
+`UPDATE`, `DELETE` — and `EXECUTE` returns the underlying statement's result and
+command tag (an `EXECUTE` of a `SELECT` yields rows; of an `INSERT`, an
+`INSERT 0 N` tag). The optional `(argtypes)` list after the name is accepted and
+ignored — argument values are coerced by the target column's type, as with any
+literal.
+
+Prepared statements are **per-connection** and live until `DEALLOCATE` or the
+connection closes. `PREPARE` of an already-used name errors (`42P05`); `EXECUTE`
+of an unknown name errors (`26000`); an argument-count mismatch errors
+(`08P01`). `DEALLOCATE` of a name that was never prepared is tolerated as a
+no-op (libpq/psycopg fire speculative `DEALLOCATE`s during cleanup).
+
+This is distinct from the extended wire protocol's Parse/Bind portals — a
+driver's own client-side parameter binding (pg8000's `%s`, psycopg's `%s`) uses
+that path and never touches these commands.
+
 ## Authentication and TLS
 
 By default the server trusts every connection (matching the Mongo server's
@@ -2400,6 +2430,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), composite / range `CREATE TYPE`, `ALTER TYPE … ADD VALUE` |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
+| Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format, `COPY … FROM/TO STDIN/STDOUT` (text + CSV) | binary-format `COPY`, `COPY` from/to a server-side file |
 | Auth | trust, SCRAM-SHA-256, TLS, SQL `CREATE`/`ALTER`/`DROP ROLE`/`USER` (reflected via `pg_roles`), `GRANT`/`REVOKE` (accepted) | channel binding, mTLS, enforced privileges, SQL roles wired to SCRAM login |
 | Catalog | `information_schema`, `pg_catalog` (`pg_index`/`pg_constraint`/`pg_am`/...), catalog *joins*, full SQLAlchemy reflection (`get_table_names`/`has_table`/`get_columns`/`get_pk_constraint`/`get_indexes`/`get_foreign_keys`, `Table(autoload_with=...)`, `get_foreign_keys`, `get_table_comment` + column comments) | `get_check_constraints`, `get_unique_constraints` |
