@@ -49,17 +49,22 @@ def _pg_sort(items: list[Any], key_of: Any, specs: list[tuple[int, bool]]) -> No
 
 
 def _order_key_fn(
-    order: list[tuple[str, int, bool]], enum_orders: dict[str, list[str]] | None = None
+    order: list[tuple[str, int, bool]],
+    enum_orders: dict[str, list[str]] | None = None,
+    citext_orders: set[str] | None = None,
 ) -> Any:
     """Build the ``key_of(doc)`` used by ``_pg_sort`` for a list of ORDER BY field
     paths. An enum-typed order field maps its label value to the label's ordinal in
     the enum's declared order (``enum_orders[field]``) so sorting follows the
-    declared order, not lexical text order — a NULL stays NULL for placement."""
+    declared order, not lexical text order — a NULL stays NULL for placement. A
+    citext field (``citext_orders``) folds its string value to lower case so the
+    sort is case-insensitive."""
     ordinals: dict[str, dict[str, int]] = {}
     if enum_orders:
         ordinals = {
             f: {lbl: i for i, lbl in enumerate(labels)} for f, labels in enum_orders.items()
         }
+    citext_fields = citext_orders or set()
 
     def key_of(doc: Any) -> tuple:
         out = []
@@ -68,6 +73,8 @@ def _order_key_fn(
             omap = ordinals.get(field_path)
             if omap is not None and value is not None:
                 value = omap.get(value, len(omap))  # unknown label sorts last
+            elif field_path in citext_fields and isinstance(value, str):
+                value = value.lower()
             out.append(value)
         return tuple(out)
 
@@ -942,7 +949,7 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
         # NULL placement follows Postgres, not Mongo sort order, so order in
         # Python; that also pulls OFFSET/LIMIT off the storage fetch.
         docs = storage.find_matching(db, plan.table.collection, plan.filter)
-        key_of = _order_key_fn(plan.order, plan.enum_orders)
+        key_of = _order_key_fn(plan.order, plan.enum_orders, getattr(plan, "citext_orders", None))
         _pg_sort(docs, key_of, [(direction, nf) for _, direction, nf in plan.order])
         if plan.skip:
             docs = docs[plan.skip :]

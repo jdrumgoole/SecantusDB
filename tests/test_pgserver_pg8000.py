@@ -1535,6 +1535,32 @@ def test_hstore_type_via_driver(server):
     conn.close()
 
 
+def test_citext_type_via_driver(server):
+    # citext columns compare / sort case-insensitively while preserving case for
+    # display, over the real wire (sent as text).
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE u (id int primary key, name citext)")
+    cur.execute("INSERT INTO u VALUES (1, 'Alice')")
+    cur.execute("INSERT INTO u VALUES (2, 'BOB')")
+    cur.execute("INSERT INTO u VALUES (3, 'carol')")
+
+    # case preserved on read.
+    cur.execute("SELECT name FROM u WHERE id = 1")
+    assert cur.fetchone()[0] == "Alice"
+
+    # case-insensitive equality and IN.
+    cur.execute("SELECT id FROM u WHERE name = 'alice'")
+    assert [r[0] for r in cur.fetchall()] == [1]
+    cur.execute("SELECT id FROM u WHERE name IN ('ALICE', 'bob') ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [1, 2]
+
+    # case-insensitive ORDER BY (a, b, c regardless of stored case).
+    cur.execute("SELECT id FROM u ORDER BY name")
+    assert [r[0] for r in cur.fetchall()] == [1, 2, 3]
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
