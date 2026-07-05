@@ -71,9 +71,17 @@ jobs:
 
       - name: Resolve tag + assert it matches the crate version
         shell: bash
+        # Pass the workflow_dispatch input through the environment rather than
+        # expanding ${{ github.event.inputs.tag }} inline into the script — an
+        # env var is a value the shell reads, so a tag containing shell
+        # metacharacters can't be interpolated into the run block (Actions
+        # script-injection hygiene). github.event_name below is a GitHub-set
+        # enum, not user input, so it stays inline. (security review §I19)
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ github.event.inputs.tag }}"
+            tag="${INPUT_TAG}"
           else
             tag="${GITHUB_REF_NAME}"
           fi
