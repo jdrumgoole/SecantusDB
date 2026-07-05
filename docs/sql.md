@@ -782,6 +782,39 @@ symbol (no locale currency), `to_char` doesn't implement `EEEE` / `RN` / `V` /
 money/decimal *column* relies on the storage engine's sort (the in-memory test
 store can't sort raw `Decimal128`).
 
+### Geometric types (`point` / `box` / `circle` / `polygon` / `lseg`)
+
+The core Postgres geometric types are stored as their canonical text (`point`
+`(1,2)`, `box` `(2,2),(0,0)`, `circle` `<(0,0),5>`, `polygon`
+`((0,0),(1,0),(1,1))`, `lseg` `[(0,0),(1,1)]`) and support the distance and
+overlap operators:
+
+```sql
+CREATE TABLE shapes (id int PRIMARY KEY, loc point, area polygon);
+INSERT INTO shapes VALUES (1, '(1,1)', '((0,0),(4,0),(4,4),(0,4))');
+INSERT INTO shapes VALUES (2, '(9,9)', '((5,5),(6,5),(6,6),(5,6))');
+
+SELECT '(1, 2)'::point;                     -- (1,2)       (canonicalised)
+SELECT point '(0,0)' <-> point '(3,4)';     -- 5           (<-> distance, float8)
+SELECT '((0,0),(2,2))'::box @> point '(1,1)';   -- t        (@> contains)
+SELECT '<(0,0),5>'::circle @> point '(3,3)';    -- t        (circle contains)
+
+-- ORDER BY distance
+SELECT id FROM shapes ORDER BY loc <-> point '(0,0)';   -- 1, 2
+-- WHERE containment (per-row)
+SELECT id FROM shapes WHERE area @> point '(2,2)';      -- 1
+```
+
+Operators: `<->` (distance), `@>` (contains) / `<@` (contained by), `&&`
+(overlaps). Geometry math delegates to Shapely — a `circle` is modelled as its
+centre point buffered by the radius. `<->` yields `float8`; `@>` / `<@` / `&&`
+yield `bool`. The containment/overlap operators in a `WHERE` clause route through
+the per-row scalar path (they can't lower to a Mongo `$match`).
+
+Out of scope: the infinite `line` type and open/closed `path` distinction for the
+operators (both spellings are accepted and stored), the `#` / `##` / `?-` / `?|`
+positional operators, and geometric indexes.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

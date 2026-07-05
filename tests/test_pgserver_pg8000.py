@@ -1456,6 +1456,35 @@ def test_money_and_to_char_via_driver(server):
     conn.close()
 
 
+def test_geometric_types_via_driver(server):
+    # point / polygon columns, the <-> distance and @> containment operators, and
+    # canonical rendering over the real wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE shapes (id int primary key, loc point, area polygon)")
+    cur.execute("INSERT INTO shapes VALUES (1, '(1,1)', '((0,0),(4,0),(4,4),(0,4))')")
+    cur.execute("INSERT INTO shapes VALUES (2, '(9,9)', '((5,5),(6,5),(6,6),(5,6))')")
+
+    # A point column renders in canonical text; pg8000 parses the point OID into a
+    # tuple of floats.
+    cur.execute("SELECT loc FROM shapes WHERE id = 1")
+    got = cur.fetchone()[0]
+    assert tuple(float(x) for x in got) == (1.0, 1.0)
+
+    # <-> distance.
+    cur.execute("SELECT point '(0,0)' <-> point '(3,4)'")
+    assert cur.fetchone()[0] == 5
+
+    # @> containment routes through the per-row scalar path.
+    cur.execute("SELECT id FROM shapes WHERE area @> point '(2,2)' ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [1]
+
+    # distance ordering.
+    cur.execute("SELECT id FROM shapes ORDER BY loc <-> point '(0,0)'")
+    assert [r[0] for r in cur.fetchall()] == [1, 2]
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

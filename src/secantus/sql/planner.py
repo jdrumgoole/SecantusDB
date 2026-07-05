@@ -1928,6 +1928,8 @@ def where_needs_per_row(stmt: exp.Select, table: TableDef | None = None) -> bool
         return True
     if table is not None and _where_has_bit_predicate(node, table):
         return True
+    if table is not None and _where_has_geo_predicate(node, table):
+        return True
     # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
     if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
         return True
@@ -1976,6 +1978,27 @@ def _where_has_bit_predicate(node: exp.Expression, table: TableDef) -> bool:
                 col = table.column(_column_name(operand))
                 if col is not None and col.type_tag in typemap._BIT_TAGS:
                     return True
+    return False
+
+
+def _is_geo_operand(operand: exp.Expression, table: TableDef) -> bool:
+    if isinstance(operand, exp.Column):
+        col = table.column(_column_name(operand))
+        return col is not None and col.type_tag in typemap._GEO_TAGS
+    if isinstance(operand, exp.Cast) and operand.to is not None:
+        return typemap.type_tag_for_sql(operand.to) in typemap._GEO_TAGS
+    return False
+
+
+def _where_has_geo_predicate(node: exp.Expression, table: TableDef) -> bool:
+    """True if ``node`` contains a geometric distance (``<->``) or an ``@>`` / ``<@``
+    / ``&&`` whose operand is a geo-typed column or a geo cast — those need per-row
+    evaluation."""
+    if getattr(exp, "Distance", None) is not None and node.find(exp.Distance) is not None:
+        return True
+    for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps):
+        if _is_geo_operand(op.this, table) or _is_geo_operand(op.expression, table):
+            return True
     return False
 
 
@@ -4534,6 +4557,25 @@ def _has_net_operand(node: exp.Expression, resolve: Resolve) -> bool:
     return False
 
 
+def _has_geo_operand(node: exp.Expression, resolve: Resolve) -> bool:
+    """Does an operand of ``node`` resolve to a geometry — a geo-typed column or a
+    cast to a geometric type?"""
+    for operand in (node.this, node.expression):
+        if (
+            isinstance(operand, exp.Cast)
+            and operand.to is not None
+            and typemap.type_tag_for_sql(operand.to) in typemap._GEO_TAGS
+        ):
+            return True
+        if isinstance(operand, exp.Column):
+            try:
+                if resolve(operand)[1] in typemap._GEO_TAGS:
+                    return True
+            except errors.SQLError:
+                pass
+    return False
+
+
 def _has_bit_operand(node: exp.Expression, resolve: Resolve) -> bool:
     """Does an operand of ``node`` (a bitwise operator) resolve to a bit string —
     a ``B'…'`` literal, a bit/varbit-typed column, or a cast to ``bit`` /
@@ -4690,6 +4732,14 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         _it = _interval_arith_tag(node, resolve)
         if _it is not None:
             return _it
+    # Geometric operators: ``<->`` distance -> float8; ``@>`` / ``<@`` / ``&&``
+    # over a geometry operand -> bool.
+    if getattr(exp, "Distance", None) is not None and isinstance(node, exp.Distance):
+        return "float8"
+    if isinstance(
+        node, (exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps)
+    ) and _has_geo_operand(node, resolve):
+        return "bool"
     # Network operators: ``<<`` / ``>>`` (subnet containment) and ``&&`` (overlap)
     # over a net operand -> bool. ``exp.Host`` (the ``host()`` function) -> text.
     if isinstance(
@@ -4738,19 +4788,24 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         ):
             return _to
         _mapped = typemap.type_tag_for_sql(node.to)
-        if _mapped in typemap._BIT_TAGS or _mapped in (
-            "int4",
-            "int8",
-            "float8",
-            "numeric",
-            "bool",
-            "interval",
-            "timestamptz",
-            "uuid",
-            "date",
-            "time",
-            "timetz",
-            "money",
+        if (
+            _mapped in typemap._BIT_TAGS
+            or _mapped
+            in (
+                "int4",
+                "int8",
+                "float8",
+                "numeric",
+                "bool",
+                "interval",
+                "timestamptz",
+                "uuid",
+                "date",
+                "time",
+                "timetz",
+                "money",
+            )
+            or _mapped in typemap._GEO_TAGS
         ):
             return _mapped
     if isinstance(node, exp.Paren):

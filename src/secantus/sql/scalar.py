@@ -99,6 +99,17 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         net_result = _eval_net_op(node, scope, ctx)
         if net_result is not _NOT_NET:
             return net_result
+        geo_result = _eval_geo_op(node, scope, ctx)
+        if geo_result is not _NOT_GEO:
+            return geo_result
+    if getattr(exp, "Distance", None) is not None and isinstance(node, exp.Distance):
+        from secantus.sql import pggeo as _pggeo
+
+        left = evaluate(node.this, scope, ctx)
+        right = evaluate(node.expression, scope, ctx)
+        if left is None or right is None:
+            return None
+        return _pggeo.distance(left, right)
     if isinstance(node, (exp.BitwiseLeftShift, exp.BitwiseRightShift)):
         net_result = _eval_net_op(node, scope, ctx)
         if net_result is not _NOT_NET:
@@ -1090,6 +1101,10 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import numformat as _numformat
 
         return _numformat.parse_money(value)
+    if value is not None and to_tag_early in typemap._GEO_TAGS:
+        from secantus.sql import pggeo as _pggeo
+
+        return _pggeo.canonical(value, to_tag_early)
     if value is not None and to_tag_early in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes
 
@@ -1609,6 +1624,26 @@ _NOT_RANGE = object()
 _NOT_FTS = object()
 _NOT_NET = object()
 _NOT_BIT = object()
+_NOT_GEO = object()
+
+
+def _eval_geo_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``@>`` (contains) / ``<@`` (contained by) / ``&&`` (overlaps) on geometric
+    operands. Returns ``_NOT_GEO`` when neither operand looks like a geometry so the
+    caller can fall back to the jsonb / array handling of the same operator."""
+    from secantus.sql import pggeo as _pggeo
+
+    left = evaluate(node.this, scope, ctx)
+    right = evaluate(node.expression, scope, ctx)
+    if not (_pggeo.is_geo_text(left) or _pggeo.is_geo_text(right)):
+        return _NOT_GEO
+    if left is None or right is None:
+        return None
+    if isinstance(node, exp.ArrayContainsAll):  # a @> b
+        return _pggeo.contains(left, right)
+    if isinstance(node, exp.ArrayContainedBy):  # a <@ b
+        return _pggeo.contains(right, left)
+    return _pggeo.overlaps(left, right)  # a && b
 
 
 def _eval_bitwise(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
