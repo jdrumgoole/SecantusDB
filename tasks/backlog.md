@@ -922,12 +922,24 @@ manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
   faithful. **Done (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and
-  structural equality via `expressions::py_eq`); `$bit` was already native.
-  **Still deferred:** a `$min`/`$max` comparison Python's `<` raises on
-  (cross-type / Decimal128 / ObjectId / array operands), pipeline (array) updates,
-  positional operators / array filters, and Decimal128 / non-numeric arithmetic.
-  In the Rust server a defer surfaces as `BadValue`, so these are real capability
-  gaps (not silent fallbacks). Field-order on `$set` of an existing
+  structural equality via `expressions::py_eq`); `$bit`, `$each` (for `$push` /
+  `$addToSet`, incl. `$push` `$position` / `$slice`; `$sort` defers) were already
+  native. **Positional operators (`$` / `$[]` / `$[id]`) and `arrayFilters` work
+  on the Rust *server*** via the storage layer (`update_matching_array_filters`),
+  even though the pure `secantus-core` engine defers them. **Still deferred (real
+  Rust-server capability gaps — a defer surfaces as `BadValue` there):** pipeline
+  (array) updates, `$push` `$sort` (BSON-order array sort), and a `$min`/`$max`
+  comparison Python's `<` raises on. **`$inc` / `$mul` on a Decimal128 field**
+  (verified: Python computes `5.5 + 1.5 = 7.0`; the Rust server errors) is a
+  **parity-risk deferral, not a coverage oversight** — the Python oracle does the
+  arithmetic in `decimal.Decimal`'s 28-significant-digit `ROUND_HALF_EVEN`
+  context (`numerics._combine`), which no Rust decimal library reproduces exactly
+  (`rust_decimal` caps at ~28–29 digits with different rounding, native
+  decimal128 uses 34 digits). Since the Rust server has no runtime Python oracle,
+  shipping an approximation would be a silent divergence — same class as the
+  named-IANA-timezone deferral. Leave deferred unless a decimal path with proven
+  bit-for-bit parity to Python's `decimal` context appears. Field-order on `$set`
+  of an existing
   key is **verified correct** (0.5.3-beta.22+): `bson::Document::insert` preserves
   an existing field's position and appends new keys — matching mongod. (The
   retired "flip `update` default to Rust" framing is dropped — no in-process
