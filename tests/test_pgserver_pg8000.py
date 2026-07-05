@@ -1252,6 +1252,33 @@ def test_full_text_search_via_driver(server):
     conn.close()
 
 
+def test_fts_followups_via_driver(server):
+    # prefix (cat:*), phrase (<->), phraseto_tsquery, and ts_headline over the wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE docs (id int primary key, body tsvector)")
+    cur.execute("INSERT INTO docs VALUES (1, to_tsvector('the quick brown fox'))")
+    cur.execute("INSERT INTO docs VALUES (2, to_tsvector('brown quick fox'))")
+    cur.execute("INSERT INTO docs VALUES (3, to_tsvector('the categories are nice'))")
+
+    # phrase: only doc 1 has 'quick' immediately followed by 'brown'.
+    cur.execute("SELECT id FROM docs WHERE body @@ to_tsquery('quick <-> brown') ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [1]
+
+    # prefix: only doc 3 has a lexeme starting with 'cat'.
+    cur.execute("SELECT id FROM docs WHERE body @@ to_tsquery('cat:*') ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [3]
+
+    # phraseto_tsquery keeps word order.
+    cur.execute("SELECT id FROM docs WHERE body @@ phraseto_tsquery('quick brown') ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [1]
+
+    # ts_headline highlights matched terms.
+    cur.execute("SELECT ts_headline('The quick brown fox', to_tsquery('quick | fox'))")
+    assert cur.fetchone()[0] == "The <b>quick</b> brown <b>fox</b>"
+    conn.close()
+
+
 def test_network_types_via_driver(server):
     # inet / cidr / macaddr columns, the << / >> / && containment/overlap
     # operators, and the host / masklen / network accessors over the real wire.

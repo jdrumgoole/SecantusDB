@@ -1607,6 +1607,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   FROM-less interval funcs. Tests: `tests/test_sql_interval.py` (22: pure intervals + SQL surface) plus a
   pg8000 wire test. **Simplifications:** days are treated as 24h (no DST-aware arithmetic), the verbose `@`
   input grammar (beyond a trailing `ago`) isn't parsed, and interval indexes are out of scope.
+- [ ] **Full-text search follow-ups landed** (b145): prefix (`cat:*`), phrase (`foo <-> bar` / `foo <N> bar`),
+  `phraseto_tsquery`, and `ts_headline` added to `secantus/sql/fts.py`. The `_TSQueryParser` gained a
+  `_parse_phrase` level (phrase binds between `&` and factor) and a `:*` prefix suffix; `matches` / `ts_rank`
+  now walk token positions (`_end_positions` / `_phrase_positions` / `_count_hits`) so adjacency queries work
+  (positions were already stored by `to_tsvector`). `phraseto_tsquery` chains a text's non-stop-word lexemes
+  with `<->` (a dropped stop-word widens the distance). `ts_headline(document, query)` wraps matched
+  lexeme/prefix tokens in `<b>…</b>`. Wired through `scalar._call_func` (`phraseto_tsquery` + `ts_headline`),
+  `planner._literal` / `_infer_scalar_tag` (phraseto → tsquery, ts_headline → text), and
+  `functions._SCALAR_EVAL_ANON`. `@@` WHERE routing (per-row via `MatchAgainst`) already covers phrase/prefix
+  queries. Tests: `tests/test_sql_fts.py` (+14, now 33) plus a pg8000 wire test. **Simplifications:**
+  `ts_headline` returns the whole document (no fragment windowing), and lexeme weights (`:A` / `setweight` /
+  weighted `ts_rank`) remain out of scope (the tsvector stores no per-lexeme weight).
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

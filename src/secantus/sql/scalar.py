@@ -1225,7 +1225,7 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if a is None or b is None:
             return None
         return _ranges.merge(a, b)
-    if name in ("to_tsvector", "to_tsquery", "plainto_tsquery"):
+    if name in ("to_tsvector", "to_tsquery", "plainto_tsquery", "phraseto_tsquery"):
         from secantus.sql import fts as _fts
 
         # A two-argument form passes the text-search config first; we ignore it
@@ -1237,7 +1237,19 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             return _fts.to_tsvector(_as_text(text))
         if name == "plainto_tsquery":
             return _fts.plainto_tsquery(_as_text(text))
+        if name == "phraseto_tsquery":
+            return _fts.phraseto_tsquery(_as_text(text))
         return _fts.to_tsquery(_as_text(text))
+    if name == "ts_headline":
+        from secantus.sql import fts as _fts
+
+        # ts_headline([config,] document, query [, options]) — ignore config /
+        # options; the query is the tsquery arg and the document is the text arg
+        # immediately before it.
+        q_idx = next((i for i, a in enumerate(args) if _fts.is_tsquery(a)), None)
+        if q_idx is None or q_idx == 0:
+            return _as_text(args[0]) if args else None
+        return _fts.ts_headline(_as_text(args[q_idx - 1]), args[q_idx])
     if name in ("ts_rank", "ts_rank_cd"):
         from secantus.sql import fts as _fts
 

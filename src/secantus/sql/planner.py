@@ -244,6 +244,7 @@ def _literal(node: exp.Expression) -> Any:
         "to_tsvector",
         "to_tsquery",
         "plainto_tsquery",
+        "phraseto_tsquery",
     ):
         # Full-text constructors -> a tsvector / tsquery subdocument (a two-arg form
         # passes the fixed text-search config first, which we ignore).
@@ -257,6 +258,8 @@ def _literal(node: exp.Expression) -> Any:
             return _fts.to_tsvector(str(text))
         if fname == "plainto_tsquery":
             return _fts.plainto_tsquery(str(text))
+        if fname == "phraseto_tsquery":
+            return _fts.phraseto_tsquery(str(text))
         return _fts.to_tsquery(str(text))
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "to_regtype":
         # ``to_regtype('name')`` resolves a type name to its OID (NULL if unknown).
@@ -4878,10 +4881,12 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "bool"
         if fname == "to_tsvector":
             return "tsvector"
-        if fname in ("to_tsquery", "plainto_tsquery"):
+        if fname in ("to_tsquery", "plainto_tsquery", "phraseto_tsquery"):
             return "tsquery"
         if fname in ("ts_rank", "ts_rank_cd"):
             return "float8"
+        if fname == "ts_headline":
+            return "text"
         # Network functions: masklen/family -> int4; network -> cidr; netmask/
         # broadcast/hostmask -> inet; host/abbrev -> text.
         if fname in ("masklen", "family"):

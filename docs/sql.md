@@ -570,11 +570,30 @@ A `tsvector` renders as the Postgres text form `'brown':3 'fox':4 'quick':2`; a
 `tsquery` as `'quick' & 'dog'`. Both accept text-literal casts
 (`'a cat'::tsvector`, `'cat & dog'::tsquery`).
 
+Prefix, phrase, `phraseto_tsquery`, and `ts_headline` are supported too:
+
+```sql
+-- prefix: cat:* matches any lexeme starting with "cat"
+SELECT to_tsvector('a category') @@ to_tsquery('cat:*');       -- true
+
+-- phrase: <-> requires adjacency, <N> requires distance N
+SELECT to_tsvector('the quick brown fox') @@ to_tsquery('quick <-> brown');  -- true
+SELECT to_tsvector('brown quick fox') @@ to_tsquery('quick <-> brown');      -- false
+
+-- phraseto_tsquery keeps word order (chains the words with <->)
+SELECT to_tsvector('a quick brown fox') @@ phraseto_tsquery('quick brown');  -- true
+
+-- ts_headline highlights the matched terms
+SELECT ts_headline('The quick brown fox', to_tsquery('quick | fox'));
+--     The <b>quick</b> brown <b>fox</b>
+```
+
 Simplifications vs real Postgres: the text-search configuration is fixed
 (English stop-words, **no stemming** — `cats` and `cat` stay distinct), `ts_rank`
-is a monotonic match-count score rather than the cover-density algorithm, and
-weights (`:A`), prefix (`cat:*`) and phrase (`<->`) queries and GIN/GiST indexes
-are out of scope.
+is a monotonic match-count score rather than the cover-density algorithm,
+`ts_headline` returns the whole document (no fragment windowing), and lexeme
+weights (`:A` / `setweight` / weighted `ts_rank`) and GIN/GiST indexes are out
+of scope.
 
 ### Network address types (`inet` / `cidr` / `macaddr`)
 
