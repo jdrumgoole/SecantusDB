@@ -1692,6 +1692,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `tests/test_sql_geo.py` (19: pure pggeo + SQL surface) plus a pg8000 wire test. **Out of scope:** the infinite
   `line` type and open/closed `path` distinction for operators, the `#` / `##` / `?-` / `?|` positional operators,
   and geometric indexes.
+- [ ] **bytea functions + literal forms landed** (b150): the `bytea` binary type already round-tripped (OID 17,
+  `coerce` → `bson.Binary`, `to_py` → `bytes`, `to_pg_text` → the `\x…` hex form); this slice adds the literal
+  parsing and function surface. New self-contained `secantus/sql/bytea.py` (`parse` — hex `\x…` **and** escape form;
+  `encode` / `decode` for `hex` / `base64` / `escape`; `get_byte` / `set_byte`; `concat`). Wired through `typemap`
+  (`coerce` bytea → `bytea.parse`), `scalar` (`_eval_cast` bytea branch, `exp.Encode`/`exp.Decode` typed-node
+  handlers reading `charset`, `get_byte`/`set_byte` in `_call_func`, `bytea`-aware `octet_length`/`bit_length`/
+  `exp.Length`/`exp.BitLength`, and `bytea || bytea` byte concat in the `DPipe` handler), `functions` (`get_byte`/
+  `set_byte` added to `_SCALAR_EVAL_ANON` so a FROM-less `SELECT get_byte(…)` defers to the full evaluator rather
+  than the session-function literal path), and `planner` (`_infer_scalar_tag`: `encode`→text, `decode`→bytea,
+  `get_byte`→int4, `set_byte`→bytea, cast→bytea, `DPipe` over a bytea operand→bytea via `_has_bytea_operand`).
+  Tests: `tests/test_sql_bytea.py` (27: pure bytea + SQL surface) plus a pg8000 wire test. **Out of scope:** the
+  `bytea_output = escape` server setting (output is always hex) and the digest functions (`md5`/`sha256`, crypto
+  extensions).
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same
