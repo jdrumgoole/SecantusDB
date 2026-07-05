@@ -319,11 +319,32 @@ class SecantusPGServer:
         # Per-connection extended-protocol state (prepared statements + portals).
         ext = ExtendedSession(self.storage, session)
         while not self._stop_event.is_set():
-            msg = pgwire.read_message(conn)
+            try:
+                msg = pgwire.read_message(conn)
+            except pgwire.PGProtocolError:
+                # A framing error (implausible length) desyncs the byte stream —
+                # unrecoverable. Send a FATAL protocol-violation ErrorResponse
+                # so the client sees a reason, then close, rather than silently
+                # dropping the connection. (§I16)
+                logger.warning("malformed PG message framing from client; closing")
+                with contextlib.suppress(OSError):
+                    conn.sendall(pgwire.error_response("08P01", "protocol violation"))
+                return
             if msg.type == "X":  # Terminate
                 return
             if msg.type == "Q":  # simple Query
-                self._handle_query(conn, session, pgwire.parse_query(msg.payload))
+                try:
+                    sql = pgwire.parse_query(msg.payload)
+                except UnicodeDecodeError:
+                    # The message was fully length-framed and read, so the byte
+                    # stream stays in sync — report the bad message and keep
+                    # serving instead of dropping the connection. (§I16)
+                    conn.sendall(
+                        pgwire.error_response("08P01", "invalid UTF-8 in query message")
+                        + pgwire.ready_for_query(session.txn_status())
+                    )
+                    continue
+                self._handle_query(conn, session, sql)
                 continue
             # Everything else is the extended query protocol
             # (Parse/Bind/Describe/Execute/Close/Sync/Flush).
@@ -336,12 +357,15 @@ class SecantusPGServer:
         # (CopyIn/CopyOut) mid-query, so it can't go through run_sql.
         from sqlglot import exp
 
-        stmts = planner.parse(sql)
-        if len(stmts) == 1 and isinstance(stmts[0], exp.Copy):
-            self._handle_copy(conn, session, stmts[0])
-            return
         out = bytearray()
         try:
+            # planner.parse must run inside the try: a syntax error raises a
+            # SQLError (42601), and if that escaped it would drop the connection
+            # with no ErrorResponse rather than reporting the error. (§I16)
+            stmts = planner.parse(sql)
+            if len(stmts) == 1 and isinstance(stmts[0], exp.Copy):
+                self._handle_copy(conn, session, stmts[0])
+                return
             results = run_sql(self.storage, session.database, sql, session=session)
             if not results:
                 out += pgwire.empty_query_response()
