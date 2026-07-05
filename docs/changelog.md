@@ -19,6 +19,25 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: connection-auth mutex locks are poison-tolerant
+
+The three production sites that lock the per-connection auth mutex in
+`secantus-commands` used `.lock().expect("conn auth mutex poisoned")`, which
+would panic if the mutex had been poisoned by an earlier panic while the lock
+was held. They now use the same `.lock().unwrap_or_else(|e| e.into_inner())`
+pattern as the rest of the crate (`logbuf`, `transactions`), recovering the
+guard instead of panicking — so a poisoned auth mutex degrades to a caught
+error at the `catch_unwind` dispatch boundary rather than compounding into a
+second panic. No behaviour change on the healthy path. Found by the nightly
+security review (2026-07-04 §I14).
+
+#### Changed
+
+- `secantus-commands` (`lib.rs` ×2, `auth.rs` ×1): connection-auth mutex locks
+  are poison-tolerant. The two remaining `.lock().unwrap()` sites the review
+  flagged are in `#[cfg(test)]` mock stores and are intentionally left panicking
+  (a test that poisons its own mock lock should fail loudly).
+
 ### Projection inclusion/exclusion mix reports mongod's specific error code
 
 Mixing an inclusion and an exclusion in the same `find()` projection (e.g.
