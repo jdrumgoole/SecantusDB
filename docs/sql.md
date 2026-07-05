@@ -609,6 +609,45 @@ Simplifications vs real Postgres: the `<<=` / `>>=` (contain-or-equal)
 operators aren't parsed by sqlglot, `inet ± int` arithmetic, `macaddr8`, and
 GiST network indexes are out of scope.
 
+### Bit-string types (`bit(n)` / `varbit`)
+
+`bit(n)` (fixed-length) and `bit varying` / `varbit` columns store a canonical
+`'0'`/`'1'` string. `B'…'` literals, the bitwise operators, and the accessor
+functions all work:
+
+```sql
+CREATE TABLE t (id int PRIMARY KEY, flags bit(8), mask varbit);
+INSERT INTO t VALUES (1, '10101010', '111');
+
+SELECT b'1010' & b'0110';        -- 0010  (AND)
+SELECT b'1010' | b'0110';        -- 1110  (OR)
+SELECT b'1010' # b'0110';        -- 1100  (XOR)
+SELECT ~ b'1010';                -- 0101  (NOT)
+SELECT b'1010' << 1;             -- 0100  (shift, width preserved)
+SELECT b'1010' || b'11';         -- 101011  (concat)
+
+SELECT 10::bit(8);               -- 00001010  (int -> bit)
+SELECT b'1010'::int;             -- 10        (bit -> int)
+
+SELECT length(flags), get_bit(flags, 0) FROM t WHERE id = 1;   -- 8 | 1
+SELECT set_bit(flags, 0, 0) FROM t WHERE id = 1;               -- 00101010
+
+-- a bitmask test in WHERE routes through the per-row scalar path
+SELECT id FROM t WHERE flags & b'00001111' = b'00001010';
+```
+
+An explicit `::bit(n)` cast zero-pads or truncates on the right to exactly `n`
+bits; a `::varbit(n)` truncates but never pads. `get_bit` / `set_bit` count from
+the left (the most significant bit is index 0). The integer bitwise operators
+(`5 & 3`) keep working — the operand type selects bit-string vs integer
+semantics.
+
+Simplifications vs real Postgres: a `bit(n)` *column* isn't padded to `n` on
+insert (the declared length isn't tracked at the storage layer — only explicit
+casts pad); a stored bit column can't be re-read as an integer with `::int`
+(only a `B'…'` literal or a `::bit` cast is treated as a bit source); and bit
+indexes are out of scope.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every
