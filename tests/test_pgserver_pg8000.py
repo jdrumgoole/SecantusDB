@@ -1252,6 +1252,41 @@ def test_full_text_search_via_driver(server):
     conn.close()
 
 
+def test_network_types_via_driver(server):
+    # inet / cidr / macaddr columns, the << / >> / && containment/overlap
+    # operators, and the host / masklen / network accessors over the real wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE hosts (id int primary key, addr inet, mac macaddr)")
+    cur.execute("INSERT INTO hosts VALUES (1, '10.1.2.3/32', '08:00:2b:01:02:03')")
+    cur.execute("INSERT INTO hosts VALUES (2, '192.168.5.6', '08-00-2b-aa-bb-cc')")
+    cur.execute("INSERT INTO hosts VALUES (3, '172.16.0.1/16', 'aabb.ccdd.eeff')")
+
+    # An inet with a full-host mask renders without the /32; the macaddr renders
+    # in canonical colon form. (pg8000 parses the inet OID into an ipaddress
+    # object, so compare via str().)
+    cur.execute("SELECT addr, mac FROM hosts WHERE id = 1")
+    addr, mac = cur.fetchone()
+    assert str(addr) == "10.1.2.3"
+    assert str(mac) == "08:00:2b:01:02:03"
+
+    # Subnet containment in WHERE routes through the per-row scalar path.
+    cur.execute("SELECT id FROM hosts WHERE addr << '10.0.0.0/8'::cidr ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [1]
+
+    # Overlap operator.
+    cur.execute("SELECT id FROM hosts WHERE addr && '172.16.0.0/12'::cidr ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [3]
+
+    # host / masklen / network accessors.
+    cur.execute("SELECT host(addr), masklen(addr), network(addr) FROM hosts WHERE id = 3")
+    host_v, mask_v, net_v = cur.fetchone()
+    assert str(host_v) == "172.16.0.1"
+    assert mask_v == 16
+    assert str(net_v) == "172.16.0.0/16"
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

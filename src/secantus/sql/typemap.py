@@ -57,6 +57,10 @@ PG_OID: dict[str, int] = {
     # Full-text search types.
     "tsvector": 3614,
     "tsquery": 3615,
+    # Network address types.
+    "inet": 869,
+    "cidr": 650,
+    "macaddr": 829,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -66,6 +70,9 @@ PG_OID: dict[str, int] = {
 
 # Full-text search type tags — stored as subdocuments, rendered as their PG text.
 _FTS_TAGS = frozenset({"tsvector", "tsquery"})
+
+# Network address type tags — stored as canonical text.
+_NET_TAGS = frozenset({"inet", "cidr", "macaddr"})
 
 # Type tags whose value is a list rendered as a Postgres ``int2vector`` /
 # ``oidvector`` (space-separated, not array braces / JSON).
@@ -96,6 +103,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
+    **{t: t for t in _NET_TAGS},
 }
 
 # Internal type tag -> Postgres pg_type.typname (for pg_catalog.pg_type rows).
@@ -113,6 +121,7 @@ PG_TYPENAME: dict[str, str] = {
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
+    **{t: t for t in _NET_TAGS},
 }
 
 # sqlglot DataType.Type -> our type tag. Several SQL spellings collapse onto one
@@ -174,7 +183,7 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     # Range types — sqlglot's DataType.Type enum names vary across versions, so
     # match on the rendered type name (``int4range`` etc.).
     name = datatype.sql(dialect="postgres").lower().strip()
-    if name in _RANGE_TAGS or name in _MULTIRANGE_TAGS or name in _FTS_TAGS:
+    if name in _RANGE_TAGS or name in _MULTIRANGE_TAGS or name in _FTS_TAGS or name in _NET_TAGS:
         return name
     return None
 
@@ -266,6 +275,14 @@ def coerce(value: Any, tag: str) -> Any:
         from secantus.sql import fts as _fts
 
         return _fts.parse_tsvector(str(value)) if tag == "tsvector" else _fts.to_tsquery(str(value))
+    if tag in _NET_TAGS:
+        from secantus.sql import net as _net
+
+        if tag == "inet":
+            return _net.normalize_inet(value)
+        if tag == "cidr":
+            return _net.normalize_cidr(value)
+        return _net.normalize_macaddr(value)
     if tag == "int4":
         return int(value)
     if tag == "int8":
@@ -332,6 +349,12 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         from secantus.sql import fts as _fts
 
         return _fts.render_tsquery(value).encode("utf-8")
+    if tag in _NET_TAGS and isinstance(value, str):
+        from secantus.sql import net as _net
+
+        if tag == "inet":
+            return _net.render_inet(value).encode("utf-8")
+        return value.encode("utf-8")  # cidr / macaddr are stored canonical
     if tag == "composite" and isinstance(value, dict):
         return _render_pg_composite(value).encode("utf-8")
     if isinstance(value, (dict, list)):

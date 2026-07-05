@@ -1893,10 +1893,34 @@ def where_needs_per_row(stmt: exp.Select, table: TableDef | None = None) -> bool
         return True
     if table is not None and _where_has_range_predicate(node, table):
         return True
+    if table is not None and _where_has_net_predicate(node, table):
+        return True
     # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
     if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
         return True
     return any(_subquery_has_outer_ref(sub) for sub in node.find_all(exp.Select))
+
+
+def _is_net_operand(operand: exp.Expression, table: TableDef) -> bool:
+    """Whether ``operand`` resolves to a network-address value — a net-typed
+    column or a cast to ``inet`` / ``cidr`` / ``macaddr``."""
+    if isinstance(operand, exp.Column):
+        col = table.column(_column_name(operand))
+        return col is not None and col.type_tag in typemap._NET_TAGS
+    if isinstance(operand, exp.Cast) and operand.to is not None:
+        return operand.to.sql(dialect="postgres").lower().strip() in typemap._NET_TAGS
+    return False
+
+
+def _where_has_net_predicate(node: exp.Expression, table: TableDef) -> bool:
+    """True if ``node`` contains a network operator — ``<<`` / ``>>`` (subnet
+    containment) or ``&&`` (overlap) — whose operand is a net-typed column or a
+    net cast. Those don't lower to a Mongo filter and need per-row evaluation."""
+    net_ops = [exp.BitwiseLeftShift, exp.BitwiseRightShift, exp.ArrayOverlaps]
+    for op in node.find_all(*net_ops):
+        if _is_net_operand(op.this, table) or _is_net_operand(op.expression, table):
+            return True
+    return False
 
 
 def _where_has_range_predicate(node: exp.Expression, table: TableDef) -> bool:
@@ -4434,6 +4458,26 @@ def _has_range_operand(node: exp.Expression, resolve: Resolve) -> bool:
     return False
 
 
+def _has_net_operand(node: exp.Expression, resolve: Resolve) -> bool:
+    """Does an operand of ``node`` (a ``<<`` / ``>>`` / ``&&`` operator) resolve to
+    a network value — a net-typed column or a cast to ``inet`` / ``cidr`` /
+    ``macaddr``?"""
+    for operand in (node.this, node.expression):
+        if (
+            isinstance(operand, exp.Cast)
+            and operand.to is not None
+            and operand.to.sql(dialect="postgres").lower().strip() in typemap._NET_TAGS
+        ):
+            return True
+        if isinstance(operand, exp.Column):
+            try:
+                if resolve(operand)[1] in typemap._NET_TAGS:
+                    return True
+            except errors.SQLError:
+                pass
+    return False
+
+
 def _range_tag_of(operands: Any, resolve: Resolve) -> str | None:
     """The range type tag among ``operands`` — a range constructor / range-typed
     column — or None if none is a range."""
@@ -4489,12 +4533,21 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         operand_tag = _infer_scalar_tag(node.this, resolve)
         if operand_tag in typemap._RANGE_TAGS:
             return ranges.RANGE_TYPES[operand_tag][0]
+    # Network operators: ``<<`` / ``>>`` (subnet containment) and ``&&`` (overlap)
+    # over a net operand -> bool. ``exp.Host`` (the ``host()`` function) -> text.
+    if isinstance(
+        node, (exp.BitwiseLeftShift, exp.BitwiseRightShift, exp.ArrayOverlaps)
+    ) and _has_net_operand(node, resolve):
+        return "bool"
+    if getattr(exp, "Host", None) is not None and isinstance(node, exp.Host):
+        return "text"
     if isinstance(node, exp.Cast) and node.to is not None:
         _to = node.to.sql(dialect="postgres").lower().strip()
         if (
             _to in typemap._RANGE_TAGS
             or _to in typemap._MULTIRANGE_TAGS
             or _to in typemap._FTS_TAGS
+            or _to in typemap._NET_TAGS
         ):
             return _to
     if isinstance(node, exp.Paren):
@@ -4688,6 +4741,16 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "tsquery"
         if fname in ("ts_rank", "ts_rank_cd"):
             return "float8"
+        # Network functions: masklen/family -> int4; network -> cidr; netmask/
+        # broadcast/hostmask -> inet; host/abbrev -> text.
+        if fname in ("masklen", "family"):
+            return "int4"
+        if fname == "network":
+            return "cidr"
+        if fname in ("netmask", "broadcast", "hostmask"):
+            return "inet"
+        if fname in ("host", "abbrev"):
+            return "text"
         if fname in ("gcd", "lcm"):
             return "int8"
         if fname == "log10":

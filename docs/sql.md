@@ -576,6 +576,39 @@ is a monotonic match-count score rather than the cover-density algorithm, and
 weights (`:A`), prefix (`cat:*`) and phrase (`<->`) queries and GIN/GiST indexes
 are out of scope.
 
+### Network address types (`inet` / `cidr` / `macaddr`)
+
+`inet` (a host address with an optional netmask), `cidr` (a network, host bits
+zero), and `macaddr` columns store canonical text and support the subnet
+operators and accessor functions:
+
+```sql
+CREATE TABLE hosts (id int PRIMARY KEY, addr inet, mac macaddr);
+INSERT INTO hosts VALUES (1, '10.1.2.3', '08:00:2b:01:02:03');
+INSERT INTO hosts VALUES (2, '172.16.0.1/16', 'aabb.ccdd.eeff');
+
+-- subnet containment: << (is contained by), >> (contains), && (overlaps)
+SELECT id FROM hosts WHERE addr << '10.0.0.0/8'::cidr;    -- 1
+SELECT '10.0.0.0/8'::cidr >> '10.1.2.3'::inet;            -- true
+SELECT '10.0.0.0/8'::cidr && '10.1.0.0/16'::cidr;         -- true
+
+-- accessors
+SELECT host(addr), masklen(addr), family(addr) FROM hosts WHERE id = 2;
+--     172.16.0.1 |      16 |      4
+SELECT network(addr), netmask(addr), broadcast(addr) FROM hosts WHERE id = 2;
+--     172.16.0.0/16 | 255.255.0.0 | 172.16.255.255/16
+```
+
+An `inet` with a full-host mask renders without the redundant `/32` (or `/128`
+for IPv6); `macaddr` normalises to the lower-case colon form regardless of the
+input separator. `host` and `abbrev` return `text`; `masklen` and `family`
+return `int4`; `network` returns `cidr`; `netmask` / `broadcast` / `hostmask`
+return `inet`.
+
+Simplifications vs real Postgres: the `<<=` / `>>=` (contain-or-equal)
+operators aren't parsed by sqlglot, `inet ± int` arithmetic, `macaddr8`, and
+GiST network indexes are out of scope.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every
