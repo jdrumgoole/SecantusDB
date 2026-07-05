@@ -74,6 +74,14 @@ PG_OID: dict[str, int] = {
     "uuid": 2950,
     # Money type (a Decimal rendered as ``$1,234.56``).
     "money": 790,
+    # Geometric types (stored as canonical Postgres text).
+    "point": 600,
+    "lseg": 601,
+    "path": 602,
+    "box": 603,
+    "polygon": 604,
+    "line": 628,
+    "circle": 718,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -89,6 +97,9 @@ _NET_TAGS = frozenset({"inet", "cidr", "macaddr"})
 
 # Bit-string type tags — stored as a canonical '0'/'1' string.
 _BIT_TAGS = frozenset({"bit", "varbit"})
+
+# Geometric type tags — stored as canonical Postgres text.
+_GEO_TAGS = frozenset({"point", "lseg", "path", "box", "polygon", "line", "circle"})
 
 # Type tags whose value is a list rendered as a Postgres ``int2vector`` /
 # ``oidvector`` (space-separated, not array braces / JSON).
@@ -128,6 +139,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
     **{t: t for t in _NET_TAGS},
+    **{t: t for t in _GEO_TAGS},
 }
 
 # Internal type tag -> Postgres pg_type.typname (for pg_catalog.pg_type rows).
@@ -154,6 +166,7 @@ PG_TYPENAME: dict[str, str] = {
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
     **{t: t for t in _NET_TAGS},
+    **{t: t for t in _GEO_TAGS},
 }
 
 # sqlglot DataType.Type -> our type tag. Several SQL spellings collapse onto one
@@ -187,6 +200,7 @@ _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.INTERVAL: "interval",
     exp.DataType.Type.UUID: "uuid",
     exp.DataType.Type.MONEY: "money",
+    exp.DataType.Type.POINT: "point",
 }
 
 
@@ -239,6 +253,8 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return "time"
     if base == "date":
         return "date"
+    if base in _GEO_TAGS:
+        return base
     return None
 
 
@@ -356,6 +372,10 @@ def coerce(value: Any, tag: str) -> Any:
         from secantus.sql import numformat as _numformat
 
         return bson.Decimal128(_numformat.parse_money(value))
+    if tag in _GEO_TAGS:
+        from secantus.sql import pggeo as _pggeo
+
+        return _pggeo.canonical(value, tag)
     if tag == "int4":
         return int(value)
     if tag == "int8":

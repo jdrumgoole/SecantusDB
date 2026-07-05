@@ -1665,6 +1665,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `$`-only currency (no locale), `to_char` omits `EEEE` / `RN` / `V` / `TH` / non-ASCII locale patterns, and
   `ORDER BY` on a money/decimal *column* relies on the storage engine's sort (the in-memory `FakeStorage`
   can't compare raw `Decimal128`).
+- [ ] **Geometric types landed** (b149): the core Postgres geometric types `point` / `box` / `circle` /
+  `polygon` / `lseg` (and the `line` / `path` spellings — stored/canonicalised but not operated on), stored as
+  their canonical Postgres text (`(1,2)`, `(2,2),(0,0)`, `<(0,0),5>`, `((0,0),(1,0),(1,1))`, `[(0,0),(1,1)]`),
+  with the operators `<->` (distance → float8), `@>` (contains) / `<@` (contained by) / `&&` (overlaps) → bool.
+  New self-contained `secantus/sql/pggeo.py` (`canonical` / `to_shapely` / `distance` / `contains` / `overlaps` /
+  `is_geo_text`); geometry math delegates to Shapely (a `circle` = centre point buffered by radius). Wired through
+  `typemap` (geo OIDs 600/601/602/603/604/628/718, `_GEO_TAGS` frozenset, `POINT` in `_DATATYPE_TAGS`,
+  name-match `type_tag_for_sql`, `coerce` → `pggeo.canonical`), `scalar` (`_eval_cast` geo branch, `exp.Distance`
+  → `pggeo.distance`, `_eval_geo_op` for `@>` / `<@` / `&&` disambiguated by `is_geo_text` value-shape since the
+  shared `ArrayContains*` nodes carry no operand types), and `planner` (`_infer_scalar_tag` distance→float8 /
+  geo-op→bool, `_has_geo_operand`, and `where_needs_per_row` / `_where_has_geo_predicate` routing the containment/
+  overlap/distance predicates through the per-row scalar path since they can't lower to a Mongo `$match`). Tests:
+  `tests/test_sql_geo.py` (19: pure pggeo + SQL surface) plus a pg8000 wire test. **Out of scope:** the infinite
+  `line` type and open/closed `path` distinction for operators, the `#` / `##` / `?-` / `?|` positional operators,
+  and geometric indexes.
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same
