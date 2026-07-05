@@ -1485,6 +1485,31 @@ def test_geometric_types_via_driver(server):
     conn.close()
 
 
+def test_bytea_type_via_driver(server):
+    # bytea columns, encode/decode, and get_byte over the real wire. pg8000 maps
+    # the bytea OID to Python bytes.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE blobs (id int primary key, data bytea)")
+    cur.execute("INSERT INTO blobs VALUES (1, '\\xcafe')")
+
+    cur.execute("SELECT data FROM blobs WHERE id = 1")
+    assert cur.fetchone()[0] == b"\xca\xfe"
+
+    # encode(bytea, 'hex') -> text.
+    cur.execute("SELECT encode(data, 'hex') FROM blobs WHERE id = 1")
+    assert cur.fetchone()[0] == "cafe"
+
+    # decode(text, 'hex') -> bytea.
+    cur.execute("SELECT decode('deadbeef', 'hex')")
+    assert cur.fetchone()[0] == b"\xde\xad\xbe\xef"
+
+    # get_byte / length.
+    cur.execute("SELECT get_byte(data, 1), length(data) FROM blobs WHERE id = 1")
+    assert cur.fetchone() == [0xFE, 2]
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

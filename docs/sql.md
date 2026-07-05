@@ -815,6 +815,35 @@ Out of scope: the infinite `line` type and open/closed `path` distinction for th
 operators (both spellings are accepted and stored), the `#` / `##` / `?-` / `?|`
 positional operators, and geometric indexes.
 
+### Binary data (`bytea`)
+
+`bytea` columns store raw bytes (as a BSON Binary) and render as the `\x…` hex
+form Postgres emits under the default `bytea_output = hex`. Both input literal
+forms are accepted:
+
+```sql
+CREATE TABLE blobs (id int PRIMARY KEY, data bytea);
+INSERT INTO blobs VALUES (1, '\xcafe');       -- hex form
+INSERT INTO blobs VALUES (2, 'ab\001c');      -- escape form (a, b, 0x01, c)
+
+SELECT encode(data, 'hex')    FROM blobs WHERE id = 1;   -- cafe
+SELECT encode(data, 'base64') FROM blobs WHERE id = 1;   -- yv4=
+SELECT decode('deadbeef', 'hex');                        -- \xdeadbeef
+
+SELECT get_byte('\xdeadbeef'::bytea, 1);        -- 173
+SELECT set_byte('\xdeadbeef'::bytea, 0, 0);     -- \x00adbeef
+SELECT length('\xdeadbeef'::bytea);             -- 4  (byte count)
+SELECT bit_length('\xdeadbeef'::bytea);         -- 32
+SELECT '\xdead'::bytea || '\xbeef'::bytea;      -- \xdeadbeef
+```
+
+`encode` / `decode` convert between bytes and the `hex` / `base64` / `escape`
+text formats; `get_byte` / `set_byte` read and replace a single 0-based byte;
+`length` / `octet_length` return the byte count and `bit_length` returns 8× that;
+`||` concatenates two `bytea` values. Out of scope: the `bytea_output = escape`
+server setting (output is always hex) and the digest functions (`md5` / `sha256`,
+which belong to the crypto extensions rather than core `bytea`).
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

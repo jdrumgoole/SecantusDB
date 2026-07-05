@@ -4602,6 +4602,29 @@ def _has_bit_operand(node: exp.Expression, resolve: Resolve) -> bool:
     return False
 
 
+def _has_bytea_operand(node: exp.Expression, resolve: Resolve) -> bool:
+    """Does an operand of ``node`` resolve to a ``bytea`` — a bytea-typed column, a
+    cast to ``bytea``, or a ``decode(...)`` call?"""
+    for operand in (node.this, node.expression):
+        if isinstance(operand, exp.Paren):
+            operand = operand.this
+        if getattr(exp, "Decode", None) is not None and isinstance(operand, exp.Decode):
+            return True
+        if (
+            isinstance(operand, exp.Cast)
+            and operand.to is not None
+            and typemap.type_tag_for_sql(operand.to) == "bytea"
+        ):
+            return True
+        if isinstance(operand, exp.Column):
+            try:
+                if resolve(operand)[1] == "bytea":
+                    return True
+            except errors.SQLError:
+                pass
+    return False
+
+
 def _date_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
     """Result tag of a date / time ``Add`` / ``Sub``: ``date - date -> int4``,
     ``date ± int -> date``, ``date ± interval -> timestamptz``, and
@@ -4751,6 +4774,14 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     # ``gen_random_uuid()`` (the dedicated ``exp.Uuid`` node) -> uuid.
     if getattr(exp, "Uuid", None) is not None and isinstance(node, exp.Uuid):
         return "uuid"
+    # bytea: ``encode(bytea, fmt)`` -> text; ``decode(text, fmt)`` -> bytea; and
+    # ``bytea || bytea`` -> bytea (the dedicated Encode/Decode nodes).
+    if getattr(exp, "Encode", None) is not None and isinstance(node, exp.Encode):
+        return "text"
+    if getattr(exp, "Decode", None) is not None and isinstance(node, exp.Decode):
+        return "bytea"
+    if isinstance(node, exp.DPipe) and _has_bytea_operand(node, resolve):
+        return "bytea"
     # A bit-string literal (``B'1010'``) types as varbit.
     if isinstance(node, exp.BitString):
         return "varbit"
@@ -4804,6 +4835,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
                 "time",
                 "timetz",
                 "money",
+                "bytea",
             )
             or _mapped in typemap._GEO_TAGS
         ):
@@ -5021,6 +5053,11 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "int4"
         if fname == "set_bit":
             return "varbit"
+        # bytea byte accessors: get_byte -> int4; set_byte -> bytea.
+        if fname == "get_byte":
+            return "int4"
+        if fname == "set_byte":
+            return "bytea"
         # Interval functions.
         if fname in ("make_interval", "justify_days", "justify_hours", "justify_interval", "age"):
             return "interval"

@@ -405,9 +405,9 @@ def coerce(value: Any, tag: str) -> Any:
     if tag == "json":
         return _json.loads(value) if isinstance(value, str) else value
     if tag == "bytea":
-        if isinstance(value, (bytes, bytearray)):
-            return bson.Binary(bytes(value))
-        return bson.Binary(bytes.fromhex(str(value)))
+        from secantus.sql import bytea as _bytea
+
+        return bson.Binary(_bytea.parse(value))
     return value
 
 

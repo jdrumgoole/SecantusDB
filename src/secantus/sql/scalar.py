@@ -198,7 +198,12 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_arith(node, scope, ctx)
     if isinstance(node, exp.DPipe):  # || string concatenation
         left, right = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
-        return None if left is None or right is None else _as_text(left) + _as_text(right)
+        if left is None or right is None:
+            return None
+        # ``bytea || bytea`` concatenates the raw bytes; anything else is text.
+        if isinstance(left, (bytes, bytearray)) and isinstance(right, (bytes, bytearray)):
+            return bytes(left) + bytes(right)
+        return _as_text(left) + _as_text(right)
     if isinstance(node, exp.Bracket):
         return _eval_bracket(node, scope, ctx)
     if isinstance(node, exp.Array):  # ARRAY[...] constructor -> a Python list
@@ -959,12 +964,37 @@ def _eval_justify(fn: str) -> Callable[[exp.Expression, Scope, ScalarContext], A
 
 # Typed scalar function nodes (sqlglot parses these to dedicated classes whose
 # operands live in ``this`` / named args, not ``expressions``).
+def _eval_encode(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``encode(bytea, fmt)`` — the dedicated ``exp.Encode`` node carries the data
+    in ``this`` and the format in ``charset``."""
+    from secantus.sql import bytea as _bytea
+
+    data = evaluate(node.this, scope, ctx)
+    fmt = node.args.get("charset")
+    if data is None or fmt is None:
+        return None
+    return _bytea.encode(data, _as_text(evaluate(fmt, scope, ctx)))
+
+
+def _eval_decode(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``decode(text, fmt)`` — the dedicated ``exp.Decode`` node carries the text
+    in ``this`` and the format in ``charset``."""
+    from secantus.sql import bytea as _bytea
+
+    text = evaluate(node.this, scope, ctx)
+    fmt = node.args.get("charset")
+    if text is None or fmt is None:
+        return None
+    return _bytea.decode(text, _as_text(evaluate(fmt, scope, ctx)))
+
+
 _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
     # ``upper`` / ``lower`` are overloaded: a range operand yields its bound, any
     # other operand is the string case-shift.
     exp.Upper: _unary(lambda v: v.get("upper") if isinstance(v, dict) else _as_text(v).upper()),
     exp.Lower: _unary(lambda v: v.get("lower") if isinstance(v, dict) else _as_text(v).lower()),
-    exp.Length: _unary(lambda v: len(_as_text(v))),
+    # ``length()`` — a bytea's byte count, else the string's character length.
+    exp.Length: _unary(lambda v: len(v) if isinstance(v, (bytes, bytearray)) else len(_as_text(v))),
     exp.Trim: _unary(lambda v: _as_text(v).strip()),
     exp.Abs: _unary(abs),
     exp.Ceil: _unary(lambda v: math.ceil(v)),
@@ -1023,13 +1053,19 @@ for _cls_name, _handler in (
     ("Chr", _eval_chr),
     ("StrPosition", _eval_str_position),
     ("Overlay", _eval_overlay),
-    # ``bit_length`` — a bit string's bit count (its char length).
-    ("BitLength", _unary(lambda v: len(_as_text(v)))),
+    # ``bit_length`` — a bytea's byte count x8, else a bit string's bit count.
+    (
+        "BitLength",
+        _unary(lambda v: 8 * len(v) if isinstance(v, (bytes, bytearray)) else len(_as_text(v))),
+    ),
     # Interval functions with dedicated sqlglot nodes.
     ("MakeInterval", _eval_make_interval),
     ("JustifyDays", _eval_justify("justify_days")),
     ("JustifyHours", _eval_justify("justify_hours")),
     ("JustifyInterval", _eval_justify("justify_interval")),
+    # bytea encode / decode carry their format in ``charset``, not ``expressions``.
+    ("Encode", _eval_encode),
+    ("Decode", _eval_decode),
 ):
     _cls = getattr(exp, _cls_name, None)
     if _cls is not None:
@@ -1105,6 +1141,10 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import pggeo as _pggeo
 
         return _pggeo.canonical(value, to_tag_early)
+    if value is not None and to_tag_early == "bytea":
+        from secantus.sql import bytea as _bytea
+
+        return _bytea.parse(value)
     if value is not None and to_tag_early in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes
 
@@ -1407,6 +1447,18 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             return _net.netmask(v)  # close enough for the common /24 cases
         # abbrev: render the inet abbreviated form (drops a full-host mask).
         return _net.render_inet(v)
+    if name in ("get_byte", "set_byte"):
+        from secantus.sql import bytea as _bytea
+
+        v = args[0] if args else None
+        if v is None or args[1] is None:
+            return None
+        if name == "get_byte":
+            return _bytea.get_byte(v, int(args[1]))
+        return _bytea.set_byte(v, int(args[1]), int(args[2]))
+    if name in ("bit_length", "octet_length") and args and isinstance(args[0], (bytes, bytearray)):
+        # bytea overloads: octet_length -> byte count; bit_length -> 8x that.
+        return len(args[0]) if name == "octet_length" else 8 * len(args[0])
     if name in ("set_bit", "bit_length", "octet_length"):
         from secantus.sql import bitstr as _bitstr
 

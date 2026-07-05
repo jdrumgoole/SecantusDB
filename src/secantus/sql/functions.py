@@ -121,6 +121,8 @@ _SCALAR_EVAL_ANON = frozenset(
         "get_bit",
         "bit_length",
         "octet_length",
+        "get_byte",
+        "set_byte",
         "make_interval",
         "justify_days",
         "justify_hours",
