@@ -1,0 +1,173 @@
+"""date / time / timetz distinct types (#113): literals, casts, current_date /
+current_time, date-date / date+int / date+interval / time-time arithmetic, and
+column round-trips.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+
+import pytest
+
+from secantus.sql import datetimes, run_sql
+from secantus.sql.session import Session
+from sqlfake import FakeStorage
+
+DB = "testdb"
+
+
+# --------------------------------------------------------------------------- #
+# Pure datetimes.py
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_date():
+    assert datetimes.parse_date("2020-01-15") == "2020-01-15"
+    assert datetimes.parse_date(dt.date(2020, 1, 15)) == "2020-01-15"
+    assert datetimes.parse_date(dt.datetime(2020, 1, 15, 10, 30)) == "2020-01-15"
+    with pytest.raises(datetimes.DateTimeError):
+        datetimes.parse_date("nope")
+
+
+def test_parse_time():
+    assert datetimes.parse_time("14:30") == "14:30:00"
+    assert datetimes.parse_time("9:5:3") == "09:05:03"
+    assert datetimes.parse_time("14:30:00.500000") == "14:30:00.5"
+    with pytest.raises(datetimes.DateTimeError):
+        datetimes.parse_time("nope")
+
+
+def test_parse_timetz():
+    assert datetimes.parse_timetz("14:30") == "14:30:00+00:00"
+    assert datetimes.parse_timetz("14:30:00+02") == "14:30:00+02:00"
+    assert datetimes.parse_timetz("14:30:00-0530") == "14:30:00-05:30"
+
+
+def test_is_date_value():
+    assert datetimes.is_date_value("2020-01-15") is True
+    assert datetimes.is_date_value(dt.date(2020, 1, 1)) is True
+    assert datetimes.is_date_value(dt.datetime(2020, 1, 1)) is False  # a timestamp, not a date
+    assert datetimes.is_date_value("foo") is False
+
+
+def test_date_arithmetic_helpers():
+    assert datetimes.date_sub_date("2020-03-15", "2020-01-01") == 74
+    assert datetimes.date_add_days("2020-01-31", 1) == "2020-02-01"
+    assert datetimes.date_add_days("2020-03-01", -1) == "2020-02-29"
+
+
+# --------------------------------------------------------------------------- #
+# SQL surface
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def session():
+    return Session(database=DB, user="secantus")
+
+
+@pytest.fixture
+def storage():
+    return FakeStorage()
+
+
+def run(storage, session, sql):
+    return run_sql(storage, DB, sql, session=session)[-1]
+
+
+def val(storage, session, sql):
+    return run(storage, session, sql).rows[0][0]
+
+
+def col(storage, session, sql):
+    return run(storage, session, sql).columns[0]
+
+
+def test_date_literal_typed(storage, session):
+    assert col(storage, session, "SELECT date '2020-01-15'").type_tag == "date"
+
+
+def test_time_literal_typed(storage, session):
+    assert col(storage, session, "SELECT time '14:30:00'").type_tag == "time"
+
+
+def test_date_cast(storage, session):
+    assert val(storage, session, "SELECT '2020-01-15'::date") == "2020-01-15"
+    assert col(storage, session, "SELECT '2020-01-15'::date").type_tag == "date"
+
+
+def test_time_cast(storage, session):
+    assert val(storage, session, "SELECT '14:30'::time") == "14:30:00"
+
+
+def test_timetz_cast(storage, session):
+    assert val(storage, session, "SELECT '14:30:00+02'::timetz") == "14:30:00+02:00"
+    assert col(storage, session, "SELECT '14:30:00+02'::timetz").type_tag == "timetz"
+
+
+def test_current_date_typed_date(storage, session):
+    c = col(storage, session, "SELECT current_date")
+    assert c.type_tag == "date"
+    assert isinstance(val(storage, session, "SELECT current_date"), dt.date)
+
+
+def test_current_time_typed_timetz(storage, session):
+    assert col(storage, session, "SELECT current_time").type_tag == "timetz"
+
+
+def test_date_minus_date_is_int(storage, session):
+    c = col(storage, session, "SELECT date '2020-03-15' - date '2020-01-01'")
+    assert c.type_tag == "int4"
+    assert val(storage, session, "SELECT date '2020-03-15' - date '2020-01-01'") == 74
+
+
+def test_date_plus_int_is_date(storage, session):
+    c = col(storage, session, "SELECT date '2020-01-31' + 1")
+    assert c.type_tag == "date"
+    assert val(storage, session, "SELECT date '2020-01-31' + 1") == "2020-02-01"
+
+
+def test_date_plus_interval_is_timestamp(storage, session):
+    c = col(storage, session, "SELECT date '2020-01-15' + interval '1 day 2 hours'")
+    assert c.type_tag == "timestamptz"
+    assert val(storage, session, "SELECT date '2020-01-15' + interval '1 day 2 hours'") == (
+        dt.datetime(2020, 1, 16, 2, 0)
+    )
+
+
+def test_time_minus_time_is_interval(storage, session):
+    from secantus.sql import intervals
+
+    c = col(storage, session, "SELECT time '15:00' - time '13:30'")
+    assert c.type_tag == "interval"
+    assert val(storage, session, "SELECT time '15:00' - time '13:30'") == intervals.parse(
+        "1 hour 30 minutes"
+    )
+
+
+@pytest.fixture
+def events(storage, session):
+    run(storage, session, "CREATE TABLE ev (id int PRIMARY KEY, d date, t time, ttz timetz)")
+    run(storage, session, "INSERT INTO ev VALUES (1, '2020-06-15', '09:00', '09:00:00+02')")
+    run(storage, session, "INSERT INTO ev VALUES (2, '2019-12-25', '23:30', '23:30:00-05')")
+    return storage
+
+
+def test_date_column_roundtrip(events, session):
+    assert val(events, session, "SELECT d FROM ev WHERE id = 1") == "2020-06-15"
+    assert val(events, session, "SELECT t FROM ev WHERE id = 1") == "09:00:00"
+    assert val(events, session, "SELECT ttz FROM ev WHERE id = 1") == "09:00:00+02:00"
+
+
+def test_date_column_typed(events, session):
+    row = run(events, session, "SELECT d, t, ttz FROM ev WHERE id = 1")
+    assert [c.type_tag for c in row.columns] == ["date", "time", "timetz"]
+
+
+def test_date_where_equality(events, session):
+    assert val(events, session, "SELECT id FROM ev WHERE d = '2020-06-15'") == 1
+
+
+def test_date_order_by(events, session):
+    ids = [r[0] for r in run(events, session, "SELECT id FROM ev ORDER BY d").rows]
+    assert ids == [2, 1]  # 2019-12-25 before 2020-06-15

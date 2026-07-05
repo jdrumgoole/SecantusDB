@@ -4560,6 +4560,32 @@ def _has_bit_operand(node: exp.Expression, resolve: Resolve) -> bool:
     return False
 
 
+def _date_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
+    """Result tag of a date / time ``Add`` / ``Sub``: ``date - date -> int4``,
+    ``date ± int -> date``, ``date ± interval -> timestamptz``, and
+    ``time - time -> interval``. None when it's not a date/time operation."""
+    lt = _infer_scalar_tag(node.this, resolve)
+    rt = _infer_scalar_tag(node.expression, resolve)
+    ints = ("int4", "int8")
+    if isinstance(node, exp.Sub):
+        if lt == "date" and rt == "date":
+            return "int4"
+        if lt == "date" and rt in ints:
+            return "date"
+        if lt == "date" and rt == "interval":
+            return "timestamptz"
+        if lt == "time" and rt == "time":
+            return "interval"
+    elif isinstance(node, exp.Add):
+        if lt == "date" and rt in ints:
+            return "date"
+        if rt == "date" and lt in ints:
+            return "date"
+        if (lt == "date" and rt == "interval") or (rt == "date" and lt == "interval"):
+            return "timestamptz"
+    return None
+
+
 def _interval_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
     """Result tag of an ``Add`` / ``Sub`` / ``Mul`` / ``Div`` involving an interval
     or a timestamp difference, or None when neither applies."""
@@ -4646,6 +4672,11 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     )
     if _iv_nodes and isinstance(node, _iv_nodes):
         return "interval"
+    # Date / time arithmetic (checked before the interval / numeric fallbacks).
+    if isinstance(node, (exp.Add, exp.Sub)):
+        _dt_tag = _date_arith_tag(node, resolve)
+        if _dt_tag is not None:
+            return _dt_tag
     if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
         _it = _interval_arith_tag(node, resolve)
         if _it is not None:
@@ -4707,6 +4738,9 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "interval",
             "timestamptz",
             "uuid",
+            "date",
+            "time",
+            "timetz",
         ):
             return _mapped
     if isinstance(node, exp.Paren):
@@ -4757,9 +4791,14 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     if _jsonpath_bool and isinstance(node, _jsonpath_bool):
         return "bool"
     # Date/time: extract/date_part -> numeric field; date_trunc / now() /
-    # current_timestamp / current_date -> timestamptz; to_char -> text. Classes are
-    # looked up by attribute because their availability varies across sqlglot.
-    _ts_names = ("TimestampTrunc", "CurrentTimestamp", "CurrentDate", "CurrentTime")
+    # current_timestamp -> timestamptz; current_date -> date; current_time ->
+    # timetz; to_char -> text. Classes are looked up by attribute because their
+    # availability varies across sqlglot.
+    if getattr(exp, "CurrentDate", None) is not None and isinstance(node, exp.CurrentDate):
+        return "date"
+    if getattr(exp, "CurrentTime", None) is not None and isinstance(node, exp.CurrentTime):
+        return "timetz"
+    _ts_names = ("TimestampTrunc", "CurrentTimestamp")
     _ts_types = tuple(c for c in (getattr(exp, n, None) for n in _ts_names) if c is not None)
     if _ts_types and isinstance(node, _ts_types):
         return "timestamptz"
