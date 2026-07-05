@@ -408,6 +408,26 @@ def test_projection_exclusion(coll) -> None:
     assert doc == {"_id": 1, "a": 1, "c": 3}
 
 
+def test_projection_inclusion_exclusion_mix_is_31254(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"a": 1, "b": 2})
+    with pytest.raises(OperationFailure) as exc:
+        coll.find_one({}, {"a": 1, "b": 0})
+    assert exc.value.code == 31254
+    assert "Cannot do exclusion on field b in inclusion projection" in str(exc.value)
+
+
+def test_projection_exclusion_inclusion_mix_is_31253(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"a": 1, "b": 2})
+    with pytest.raises(OperationFailure) as exc:
+        coll.find_one({}, {"a": 0, "b": 1})
+    assert exc.value.code == 31253
+    assert "Cannot do inclusion on field b in exclusion projection" in str(exc.value)
+
+
 def test_projection_dotted_inclusion(coll) -> None:
     coll.insert_one({"_id": 1, "addr": {"city": "Dublin", "zip": "D02"}, "name": "Joe"})
     doc = coll.find_one({}, {"addr.city": 1, "_id": 0})
