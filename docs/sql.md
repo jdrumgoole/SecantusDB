@@ -906,6 +906,37 @@ Postgres, which folds them. The dominant citext uses (case-insensitive lookups,
 uniqueness, and sorted listings) are faithful; case-folding aggregation grouping
 is a known limitation. citext indexing is also out of scope.
 
+### XML (`xml`)
+
+`xml` columns store XML text (validated well-formed on write) and support the
+core constructor / extraction functions:
+
+```sql
+CREATE TABLE docs (id int PRIMARY KEY, body xml);
+INSERT INTO docs VALUES (1, '<doc><title>Hi</title></doc>');
+
+SELECT xmlelement(name foo, 'bar');                     -- <foo>bar</foo>
+SELECT xmlelement(name item, xmlattributes('7' as id), 'hi');  -- <item id="7">hi</item>
+SELECT xmlforest('x' as a, 'y' as b);                   -- <a>x</a><b>y</b>
+SELECT xml_is_well_formed('<a/>');                      -- t
+SELECT xpath('/doc/title/text()', body) FROM docs;      -- {Hi}
+SELECT xmlconcat('<a/>', '<b/>');                       -- <a/><b/>
+```
+
+`xmlelement(NAME tag [, xmlattributes(v AS k, …)], content…)` and
+`xmlforest(value AS name, …)` build elements (content and attribute values are
+XML-escaped); `xml_is_well_formed(text)` returns a boolean; `xpath(expr, xml)`
+returns a `text[]` of matched nodes; `xmlconcat(…)` concatenates fragments. A
+malformed `'<a>'::xml` cast is rejected.
+
+XML parsing goes through the stdlib `xml.etree.ElementTree` (no external
+dependency, and external entities are disabled — no XXE). **Simplifications:** the
+`xpath` support is a pragmatic subset — absolute child paths (`/a/b/c`), a
+trailing `text()` / `@attr` step, and a leading `//tag` descendant search — not
+full XPath 1.0 (no namespaces, predicates, or functions). The `xmltable` table
+function, the `xmlagg` aggregate, and the document/content-node distinction are
+out of scope.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

@@ -1561,6 +1561,31 @@ def test_citext_type_via_driver(server):
     conn.close()
 
 
+def test_xml_type_via_driver(server):
+    # xml columns, xmlelement / xpath / xml_is_well_formed over the real wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE docs (id int primary key, body xml)")
+    cur.execute("INSERT INTO docs VALUES (1, '<doc><title>Hi</title></doc>')")
+
+    # xml column renders as its text.
+    cur.execute("SELECT body FROM docs WHERE id = 1")
+    assert cur.fetchone()[0] == "<doc><title>Hi</title></doc>"
+
+    # xmlelement constructor.
+    cur.execute("SELECT xmlelement(name foo, 'bar')")
+    assert cur.fetchone()[0] == "<foo>bar</foo>"
+
+    # xml_is_well_formed.
+    cur.execute("SELECT xml_is_well_formed('<a/>'), xml_is_well_formed('<a>')")
+    assert cur.fetchone() == [True, False]
+
+    # xpath returns a text array.
+    cur.execute("SELECT xpath('/doc/title/text()', body) FROM docs WHERE id = 1")
+    assert cur.fetchone()[0] == ["Hi"]
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
