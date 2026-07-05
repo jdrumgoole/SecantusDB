@@ -32,11 +32,74 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
     """
     if session is None:
         session = Session(database=db)
+    # LISTEN / NOTIFY / UNLISTEN are handled before sqlglot: it mis-parses
+    # ``LISTEN chan`` (as an alias) and fails outright on ``NOTIFY chan, 'p'``.
+    pubsub = _maybe_pubsub(sql, session)
+    if pubsub is not None:
+        return [pubsub]
     catalog = Catalog(storage)
     results: list[SQLResult] = []
     for stmt in planner.parse(sql):
         results.append(_dispatch(stmt, storage, db, catalog, session))
     return results
+
+
+_PUBSUB_RE = re.compile(
+    r"""^\s*
+    (?P<verb>LISTEN|UNLISTEN|NOTIFY)\s+
+    (?P<chan>\*|"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)
+    (?:\s*,\s*(?P<payload>'(?:[^']|'')*'))?
+    \s*;?\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def is_pubsub_statement(sql: str) -> bool:
+    """Whether ``sql`` is a single LISTEN / UNLISTEN / NOTIFY command — used by the
+    wire server to skip the sqlglot-based COPY probe, which chokes on ``NOTIFY
+    chan, 'payload'``."""
+    return _PUBSUB_RE.match(sql) is not None
+
+
+def _pubsub_ident(token: str) -> str:
+    """Normalise a LISTEN/NOTIFY channel token: a quoted ``"Ch"`` keeps its case;
+    an unquoted name is lower-cased (Postgres identifier folding)."""
+    if token.startswith('"') and token.endswith('"'):
+        return token[1:-1]
+    return token.lower()
+
+
+def _maybe_pubsub(sql: str, session: Session) -> SQLResult | None:
+    """Handle a single ``LISTEN`` / ``UNLISTEN`` / ``NOTIFY`` statement, or None if
+    ``sql`` isn't one. Requires ``session.notify_hub`` (the wire server); with no
+    hub (embedded API) the commands are accepted as no-ops so scripts don't error."""
+    m = _PUBSUB_RE.match(sql)
+    if m is None:
+        return None
+    verb = m.group("verb").upper()
+    hub = session.notify_hub
+    if verb == "UNLISTEN":
+        if hub is not None:
+            if m.group("chan") == "*":
+                hub.unlisten_all(session)
+            else:
+                hub.unlisten(_pubsub_ident(m.group("chan")), session)
+        return SQLResult(command_tag="UNLISTEN")
+    channel = _pubsub_ident(m.group("chan"))
+    if verb == "LISTEN":
+        if hub is not None:
+            hub.listen(channel, session)
+        return SQLResult(command_tag="LISTEN")
+    # NOTIFY — the payload literal is single-quoted with '' escaping.
+    raw = m.group("payload")
+    payload = raw[1:-1].replace("''", "'") if raw else ""
+    if hub is not None:
+        if session.txn_handle is not None:
+            # Inside a transaction block: buffer, deliver at COMMIT.
+            session.pending_notifies.append((channel, payload))
+        else:
+            hub.notify(channel, payload, session.backend_pid)
+    return SQLResult(command_tag="NOTIFY")
 
 
 def _dispatch(
@@ -101,6 +164,9 @@ def _begin_txn(storage: Any, session: Session) -> SQLResult:
 
 def _commit_txn(storage: Any, db: str, catalog: Catalog, session: Session) -> SQLResult:
     handle, failed = session.txn_handle, session.txn_failed
+    # Notifications issued in the block deliver only if the commit lands; capture
+    # them before _end_txn_state clears the session's buffer.
+    buffered_notifies = list(session.pending_notifies)
     # Deferred constraints re-check against the in-transaction state before the
     # commit lands; a surviving violation aborts the block (and re-raises).
     if handle is not None and not failed and session.pending_deferred:
@@ -119,6 +185,9 @@ def _commit_txn(storage: Any, db: str, catalog: Catalog, session: Session) -> SQ
         storage.abort_user_transaction(handle)
         return SQLResult(command_tag="ROLLBACK")
     storage.commit_user_transaction(handle)
+    if session.notify_hub is not None:
+        for channel, payload in buffered_notifies:
+            session.notify_hub.notify(channel, payload, session.backend_pid)
     return SQLResult(command_tag="COMMIT")
 
 
@@ -127,6 +196,7 @@ def _end_txn_state(session: Session) -> None:
     session.txn_handle = None
     session.txn_failed = False
     session.savepoints = []
+    session.pending_notifies = []  # NOTIFYs in the block are flushed (commit) or dropped (rollback)
     session.reset_deferred()
     _close_non_hold_cursors(session)  # WITHOUT HOLD cursors close at end of txn
 

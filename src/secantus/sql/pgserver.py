@@ -37,6 +37,7 @@ from secantus.sql.pgauth import (
     mock_credentials,
 )
 from secantus.sql.pgextended import ExtendedSession
+from secantus.sql.pgnotify import NotifyHub
 from secantus.sql.session import SERVER_VERSION, Session
 
 if TYPE_CHECKING:
@@ -85,6 +86,8 @@ class SecantusPGServer:
         self._stop_event = threading.Event()
         self._conns: set[socket.socket] = set()
         self._conns_lock = threading.Lock()
+        # Server-wide LISTEN / NOTIFY channel registry.
+        self._notify = NotifyHub()
         # SCRAM-SHA-256 auth: when require_auth is on, clients must authenticate
         # against a user from ``users`` (username -> plaintext, hashed into a
         # SCRAM verifier at startup; the plaintext is not retained).
@@ -222,6 +225,8 @@ class SecantusPGServer:
             if session is not None and session.txn_handle is not None:
                 with contextlib.suppress(Exception):
                     self.storage.abort_user_transaction(session.txn_handle)
+            if session is not None:
+                self._notify.unlisten_all(session)  # drop this conn's LISTENs
             with self._conns_lock:
                 self._conns.discard(conn)
 
@@ -258,6 +263,7 @@ class SecantusPGServer:
             return None
 
         session = Session(database=db, user=user, backend_pid=backend_pid)
+        session.notify_hub = self._notify
         if self._authz_active:
             session.authz_active = True
             session.roles = self._users.roles_for(user)
@@ -347,10 +353,23 @@ class SecantusPGServer:
                 self._handle_query(conn, session, sql)
                 continue
             # Everything else is the extended query protocol
-            # (Parse/Bind/Describe/Execute/Close/Sync/Flush).
+            # (Parse/Bind/Describe/Execute/Close/Sync/Flush). Async LISTEN/NOTIFY
+            # deliveries ride out ahead of the reply (message boundaries).
             reply = ext.process(msg.type, msg.payload)
-            if reply:
-                conn.sendall(reply)
+            notifications = self._pending_notification_bytes(session)
+            if notifications or reply:
+                conn.sendall(notifications + (reply or b""))
+
+    def _pending_notification_bytes(self, session: Session) -> bytes:
+        """Serialize this connection's queued async LISTEN/NOTIFY deliveries into
+        ``NotificationResponse`` bytes to write on the owning thread (so socket
+        writes stay serialized). Delivered inline with the query cycle — right
+        before a ``ReadyForQuery`` — rather than via a background poll (which would
+        busy-wake every idle connection)."""
+        out = bytearray()
+        for pid, channel, payload in session.drain_notifications():
+            out += pgwire.notification_response(pid, channel, payload)
+        return bytes(out)
 
     def _handle_query(self, conn: socket.socket, session: Session, sql: str) -> None:
         # A COPY … FROM/TO STDIN/STDOUT statement drives its own sub-protocol
@@ -362,10 +381,13 @@ class SecantusPGServer:
             # planner.parse must run inside the try: a syntax error raises a
             # SQLError (42601), and if that escaped it would drop the connection
             # with no ErrorResponse rather than reporting the error. (§I16)
-            stmts = planner.parse(sql)
-            if len(stmts) == 1 and isinstance(stmts[0], exp.Copy):
-                self._handle_copy(conn, session, stmts[0])
-                return
+            # LISTEN/NOTIFY/UNLISTEN bypass the COPY probe — sqlglot mis-parses
+            # them (and errors on a NOTIFY payload), so run_sql handles them.
+            if not sql_engine.is_pubsub_statement(sql):
+                stmts = planner.parse(sql)
+                if len(stmts) == 1 and isinstance(stmts[0], exp.Copy):
+                    self._handle_copy(conn, session, stmts[0])
+                    return
             results = run_sql(self.storage, session.database, sql, session=session)
             if not results:
                 out += pgwire.empty_query_response()
@@ -380,6 +402,10 @@ class SecantusPGServer:
             # full detail is in the server log. Mirrors the Mongo dispatch's
             # generic-error discipline. (security review 2026-07-04 §I17)
             out += pgwire.error_response("XX000", _INTERNAL_ERROR_MSG)
+        # Deliver any async LISTEN/NOTIFY notifications (e.g. this query's own
+        # NOTIFY, or one from another connection) before ReadyForQuery, matching
+        # Postgres, so the client picks them up in this same query exchange.
+        out += self._pending_notification_bytes(session)
         # The ReadyForQuery status reflects the transaction block (I/T/E).
         out += pgwire.ready_for_query(session.txn_status())
         conn.sendall(bytes(out))

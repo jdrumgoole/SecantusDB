@@ -2146,6 +2146,42 @@ through it.
 are accepted but are no-ops: SecantusDB is single-node, so isolation level and
 read-only mode don't change behaviour.
 
+## LISTEN / NOTIFY
+
+Asynchronous pub/sub works across connections to the same server:
+
+```sql
+-- connection A
+LISTEN events;
+
+-- connection B
+NOTIFY events, 'something happened';
+SELECT pg_notify('events', 'or via the function');
+```
+
+Connection A receives a `NotificationResponse` carrying the notifying backend's
+pid, the channel, and the payload — surfaced by the driver's notification API
+(e.g. pg8000's `connection.notifications`). `UNLISTEN channel` stops listening on
+one channel; `UNLISTEN *` stops all. Channel names fold to lower case unless
+double-quoted (standard identifier rules).
+
+Semantics: a `NOTIFY` issued inside a transaction block is buffered and delivered
+at `COMMIT` (and discarded on `ROLLBACK`); an autocommit `NOTIFY` delivers
+immediately. A connection listening on a channel receives its own notifications.
+
+Notifications are delivered **inline with the listener's query cycle** — a queued
+notification rides back to the listener just before the `ReadyForQuery` of its
+next query (as Postgres does when a backend is idle-in-command). So a listener
+that keeps issuing queries (or a heartbeat `SELECT 1`) sees notifications
+promptly; a listener that goes completely silent won't observe them until its
+next round-trip.
+
+**Simplifications:** duplicate `(channel, payload)` notifications within one
+transaction are not collapsed (Postgres collapses them); `LISTEN` / `UNLISTEN`
+take effect immediately rather than at commit; and there is no out-of-band push
+to a fully-idle connection (notifications are attached to the next query
+response, not delivered asynchronously mid-idle).
+
 ## Authentication and TLS
 
 By default the server trusts every connection (matching the Mongo server's

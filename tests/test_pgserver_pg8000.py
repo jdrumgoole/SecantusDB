@@ -1586,6 +1586,34 @@ def test_xml_type_via_driver(server):
     conn.close()
 
 
+def test_listen_notify_via_driver(server):
+    # A NOTIFY on one connection is delivered to a LISTENer on another connection,
+    # over the real wire (NotificationResponse 'A'). Delivery is inline with the
+    # listener's query cycle: it arrives before the ReadyForQuery of its next query.
+    listener = connect(server)
+    notifier = connect(server)
+    try:
+        lcur = listener.cursor()
+        lcur.execute("LISTEN chan")
+        listener.commit()
+
+        ncur = notifier.cursor()
+        ncur.execute("NOTIFY chan, 'payload-1'")
+        notifier.commit()  # commit flushes the notification into the listener's queue
+
+        # The listener's next query carries the pending notification back with it.
+        lcur.execute("SELECT 1")
+        lcur.fetchall()
+
+        assert len(listener.notifications) >= 1
+        _pid, channel, payload = listener.notifications.popleft()
+        assert channel == "chan"
+        assert payload == "payload-1"
+    finally:
+        listener.close()
+        notifier.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
