@@ -301,10 +301,67 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             return _ranges.union(left, right)
         if isinstance(node, exp.Sub):
             return _ranges.difference(left, right)
+    date_result = _eval_date_arith(node, left, right)
+    if date_result is not _NOT_DATE:
+        return date_result
     interval_result = _eval_interval_arith(node, left, right)
     if interval_result is not _NOT_INTERVAL:
         return interval_result
     return _ARITH[type(node)](left, right)
+
+
+_NOT_DATE = object()
+
+
+def _eval_date_arith(node: exp.Expression, left: Any, right: Any) -> Any:
+    """Arithmetic on ``date`` / ``time`` values: ``date - date -> int`` (days),
+    ``date ± int -> date``, ``date ± interval -> timestamp``, and
+    ``time - time -> interval``. Returns ``_NOT_DATE`` when neither operand is a
+    date / time so the caller falls through to interval / numeric arithmetic."""
+    from secantus.sql import datetimes as _datetimes
+    from secantus.sql import intervals as _intervals
+
+    ld, rd = _datetimes.is_date_value(left), _datetimes.is_date_value(right)
+    lt_, rt_ = _datetimes.is_time_value(left), _datetimes.is_time_value(right)
+    li, ri = _intervals.is_interval(left), _intervals.is_interval(right)
+
+    def _is_int(v: Any) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    if isinstance(node, exp.Add):
+        if ld and _is_int(right):
+            return _datetimes.date_add_days(left, right)
+        if rd and _is_int(left):
+            return _datetimes.date_add_days(right, left)
+        if ld and ri:
+            base = _dt.datetime.combine(_datetimes.to_date_obj(left), _dt.time())
+            return _intervals.to_date(base, right, 1)
+        if rd and li:
+            base = _dt.datetime.combine(_datetimes.to_date_obj(right), _dt.time())
+            return _intervals.to_date(base, left, 1)
+    elif isinstance(node, exp.Sub):
+        if ld and rd:
+            return _datetimes.date_sub_date(left, right)
+        if ld and _is_int(right):
+            return _datetimes.date_add_days(left, -right)
+        if ld and ri:
+            base = _dt.datetime.combine(_datetimes.to_date_obj(left), _dt.time())
+            return _intervals.to_date(base, right, -1)
+        if lt_ and rt_:
+            return _time_sub_time(left, right)
+    return _NOT_DATE
+
+
+def _time_sub_time(a: Any, b: Any) -> dict:
+    from secantus.sql import datetimes as _datetimes
+    from secantus.sql import intervals as _intervals
+
+    ta, tb = _datetimes.to_time_obj(a), _datetimes.to_time_obj(b)
+
+    def _micros(t: _dt.time) -> int:
+        return ((t.hour * 3600 + t.minute * 60 + t.second) * 1_000_000) + t.microsecond
+
+    return _intervals.make(0, 0, _micros(ta) - _micros(tb))
 
 
 _NOT_INTERVAL = object()
@@ -837,6 +894,13 @@ def _utcnow(ctx: ScalarContext | None) -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
 
 
+def _fmt_current_time(ctx: ScalarContext | None) -> str:
+    """``current_time`` -> a ``timetz`` string at UTC."""
+    from secantus.sql import datetimes as _datetimes
+
+    return _datetimes.parse_timetz(_utcnow(ctx).strftime("%H:%M:%S") + "+00:00")
+
+
 def _eval_make_interval(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> dict:
     """``make_interval(years, months, weeks, days, hours, mins, secs)`` — parsed to
     a dedicated node whose components live in named args."""
@@ -920,6 +984,7 @@ for _cls_name, _handler in (
     ("TimeToStr", _eval_to_char),
     ("CurrentTimestamp", lambda n, s, c: _utcnow(c)),
     ("CurrentDate", lambda n, s, c: _utcnow(c).date()),
+    ("CurrentTime", lambda n, s, c: _fmt_current_time(c)),
     ("Pad", _eval_pad),
     ("Left", _eval_left),
     ("Right", _eval_right),
@@ -1003,6 +1068,14 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import uuidtype as _uuidtype
 
         return _uuidtype.normalize(value)
+    if value is not None and to_tag_early in ("date", "time", "timetz"):
+        from secantus.sql import datetimes as _datetimes
+
+        if to_tag_early == "date":
+            return _datetimes.parse_date(value)
+        if to_tag_early == "time":
+            return _datetimes.parse_time(value)
+        return _datetimes.parse_timetz(value)
     # ``timestamp '2020-01-31'`` / ``date '…'`` -> a real datetime so interval and
     # date arithmetic land on a temporal value rather than a bare string.
     if (

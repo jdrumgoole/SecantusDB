@@ -1402,6 +1402,35 @@ def test_uuid_type_via_driver(server):
     conn.close()
 
 
+def test_date_time_types_via_driver(server):
+    # date / time / timetz columns and literals over the real wire (pg8000 parses
+    # the date/time OIDs into Python date/time objects, so compare via str()).
+    import datetime as _dt
+
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE ev (id int primary key, d date, t time, ttz timetz)")
+    cur.execute("INSERT INTO ev VALUES (1, '2020-06-15', '09:00', '09:00:00+02')")
+
+    cur.execute("SELECT d, t FROM ev WHERE id = 1")
+    d, t = cur.fetchone()
+    assert isinstance(d, _dt.date) and str(d) == "2020-06-15"
+    assert str(t) == "09:00:00"
+
+    # date - date -> integer days.
+    cur.execute("SELECT date '2020-03-15' - date '2020-01-01'")
+    assert cur.fetchone()[0] == 74
+
+    # date + int -> date.
+    cur.execute("SELECT date '2020-01-31' + 1")
+    assert str(cur.fetchone()[0]) == "2020-02-01"
+
+    # equality lowers to a Mongo filter.
+    cur.execute("SELECT id FROM ev WHERE d = '2020-06-15'")
+    assert cur.fetchone()[0] == 1
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

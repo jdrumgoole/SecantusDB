@@ -724,6 +724,36 @@ work as ordinary comparisons and push down to the storage layer (no per-row
 evaluation). `gen_random_uuid` and `uuid_generate_v4` return version-4
 (random) UUIDs.
 
+### Date-only / time-only types (`date` / `time` / `timetz`)
+
+`date`, `time`, and `time with time zone` (`timetz`) are distinct types (a
+`timestamp` / `timestamptz` column still maps to a full timestamp). They store
+canonical text (`date` as `YYYY-MM-DD`, `time` as `HH:MM:SS`, `timetz` with an
+offset), so equality and `ORDER BY` push down to storage:
+
+```sql
+CREATE TABLE ev (id int PRIMARY KEY, d date, t time, ttz timetz);
+INSERT INTO ev VALUES (1, '2020-06-15', '09:00', '09:00:00+02');
+
+SELECT date '2020-01-15';                 -- 2020-01-15
+SELECT time '14:30';                      -- 14:30:00
+SELECT current_date, current_time;
+
+-- date arithmetic
+SELECT date '2020-03-15' - date '2020-01-01';   -- 74      (integer days)
+SELECT date '2020-01-31' + 1;                   -- 2020-02-01  (date)
+SELECT date '2020-01-15' + interval '2 hours';  -- 2020-01-15 02:00:00  (timestamp)
+SELECT time '15:00' - time '13:30';             -- 01:30:00  (interval)
+```
+
+These report the correct wire OIDs (`date` 1082, `time` 1083, `timetz` 1266), so
+driver / ORM reflection sees them as the right types rather than a timestamp.
+
+Simplifications vs real Postgres: `time(p)` precision isn't rounded to a
+declared scale, `timetz` preserves the literal's offset without converting, and
+mixing a bare `timestamp` with a `date` in one arithmetic expression isn't
+supported (cast one side explicitly).
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

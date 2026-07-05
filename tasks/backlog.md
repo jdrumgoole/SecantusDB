@@ -1633,6 +1633,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   SQL surface) plus a pg8000 wire test. **Simplifications:** only v4 (random) UUIDs are generated
   (`uuid_generate_v1` returns a v4, not a real time-based v1); no `uuid-ossp` namespace functions
   (`uuid_generate_v3` / `v5`).
+- [ ] **date / time / timetz distinct types landed** (b147): `date` / `time` / `timetz` are now distinct
+  types (previously `date` collapsed to `timestamptz`), reporting the correct wire OIDs (1082 / 1083 / 1266)
+  for driver/ORM reflection. New self-contained `secantus/sql/datetimes.py` stores them as canonical text
+  (`date` `YYYY-MM-DD`, `time` `HH:MM:SS[.ffffff]`, `timetz` with an offset) — BSON has no date-only /
+  time-only value, and ISO text orders/compares the same as the value (so equality / `ORDER BY` lower to a
+  Mongo filter) and is distinguishable at eval time from a `datetime` (`timestamptz`). Arithmetic:
+  `date - date -> int4` (days), `date ± int -> date`, `date ± interval -> timestamptz`, `time - time ->
+  interval` (`scalar._eval_date_arith` with a `_NOT_DATE` sentinel, run before the interval/numeric
+  fallbacks). Wired through `typemap` (OIDs, `DATE`/`TIME` in `_DATATYPE_TAGS` + `timetz` name-match,
+  `coerce` → parse; `to_pg_text` needs no branch — the canonical string / `datetime.date` fall through the
+  default encoder), `scalar` (`_eval_cast` date/time/timetz, `current_time` → `_fmt_current_time`,
+  `_eval_date_arith` + `_time_sub_time`), `planner` (`_infer_scalar_tag` types casts / `current_date` → date /
+  `current_time` → timetz / `_date_arith_tag`). `current_date` still returns a `datetime.date` (kept for the
+  existing `test_current_date`). Tests: `tests/test_sql_datetime_types.py` (20: pure datetimes + SQL surface)
+  plus a pg8000 wire test. **Simplifications:** `time(p)` precision isn't rounded, `timetz` preserves the
+  literal's offset without converting, and mixing a bare `timestamp` with a `date` in one arithmetic
+  expression isn't supported (cast one side).
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

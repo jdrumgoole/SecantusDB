@@ -37,6 +37,10 @@ PG_OID: dict[str, int] = {
     "text": 25,
     "float8": 701,
     "timestamptz": 1184,
+    # Date-only / time-only types (stored as canonical text).
+    "date": 1082,
+    "time": 1083,
+    "timetz": 1266,
     "numeric": 1700,
     "json": 3802,
     # A composite (row) value renders as the ``(f1,f2,…)`` record text literal. We
@@ -107,6 +111,9 @@ SQL_TYPE_NAME: dict[str, str] = {
     "text": "text",
     "bool": "boolean",
     "timestamptz": "timestamp with time zone",
+    "date": "date",
+    "time": "time without time zone",
+    "timetz": "time with time zone",
     "json": "jsonb",
     "bytea": "bytea",
     "composite": "record",
@@ -129,6 +136,9 @@ PG_TYPENAME: dict[str, str] = {
     "text": "text",
     "bool": "bool",
     "timestamptz": "timestamptz",
+    "date": "date",
+    "time": "time",
+    "timetz": "timetz",
     "json": "jsonb",
     "bytea": "bytea",
     "composite": "record",
@@ -160,7 +170,8 @@ _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.NCHAR: "text",
     exp.DataType.Type.NVARCHAR: "text",
     exp.DataType.Type.BOOLEAN: "bool",
-    exp.DataType.Type.DATE: "timestamptz",
+    exp.DataType.Type.DATE: "date",
+    exp.DataType.Type.TIME: "time",
     exp.DataType.Type.DATETIME: "timestamptz",
     exp.DataType.Type.TIMESTAMP: "timestamptz",
     exp.DataType.Type.TIMESTAMPTZ: "timestamptz",
@@ -215,6 +226,14 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return base
     if base == "interval" or base.startswith("interval "):
         return "interval"
+    # Date-only / time-only spellings (``timetz`` isn't always a dedicated enum;
+    # ``time(6)`` carries a precision).
+    if base in ("timetz", "time with time zone", "timez"):
+        return "timetz"
+    if base in ("time", "time without time zone"):
+        return "time"
+    if base == "date":
+        return "date"
     return None
 
 
@@ -346,6 +365,14 @@ def coerce(value: Any, tag: str) -> Any:
         # ISO-8601 string literal -> datetime. fromisoformat handles offsets
         # and a trailing 'Z' on 3.11+.
         return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if tag in ("date", "time", "timetz"):
+        from secantus.sql import datetimes as _datetimes
+
+        if tag == "date":
+            return _datetimes.parse_date(value)
+        if tag == "time":
+            return _datetimes.parse_time(value)
+        return _datetimes.parse_timetz(value)
     if tag == "json":
         return _json.loads(value) if isinstance(value, str) else value
     if tag == "bytea":
