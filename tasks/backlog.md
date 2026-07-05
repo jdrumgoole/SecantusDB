@@ -1312,6 +1312,21 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   document/array element — e.g. `[{a: 1}, {a: 1.0}]` — are treated as distinct on
   both servers, where mongod considers them equal. Top-level scalar arrays,
   including cross-type `[1, 1.0]`, are faithful.)
+- [ ] **Error-code nit — unrecognized expression operator (both servers diverge
+  from mongod).** For a genuinely nonexistent expression operator (e.g.
+  `{$project: {x: {$notreal: [...]}}}` or `find({$expr: {$notreal: [...]}})`),
+  mongod returns `168 InvalidPipelineOperator` "Unrecognized expression
+  '$notreal'". The **Python server** returns `14 TypeMismatch` ("unsupported
+  aggregation expression operator: $notreal"); the **Rust server** returns
+  `2 BadValue` (the generic Fallback→"construct not supported by the Rust server"
+  message). Both reject the query (no correctness/data issue) — only the code and
+  wording differ. A faithful fix is *not* a blanket "unknown op → 168": it needs
+  the **full catalog of real mongod expression operators** so we only emit
+  "Unrecognized" for operators mongod itself doesn't know — mislabeling a
+  real-but-unimplemented operator (e.g. one Python defers) as "Unrecognized" would
+  be a *new* divergence (mongod recognizes and evaluates it). Deferred until a
+  gauge/consumer actually asserts this code; confirmed by differential probing
+  2026-07-05.
 
 ### 7.6 Standalone `secantusdb` binary: CLI-flag conformance shipped (beta.96)
 
