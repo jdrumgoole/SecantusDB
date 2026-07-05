@@ -2216,6 +2216,21 @@ class Storage:
         with self._oplog_cv:
             self._oplog_cv.notify_all()
 
+    def __enter__(self) -> Storage:
+        """Support ``with Storage(path) as store:`` — the block's exit calls
+        ``close()`` so WiredTiger is torn down (threads joined, oplog meta
+        persisted, connection closed) even if the body raises. ``close()`` is
+        idempotent, so an explicit ``close()`` inside the block is still safe."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> None:
+        self.close()
+
     def close(self) -> None:
         # Stop background threads before tearing down WT — both the
         # TTL sweeper and the noop heartbeat acquire ``self._lock``,

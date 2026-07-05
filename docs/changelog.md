@@ -38,6 +38,20 @@ wording, so this closes a pymongo-gauge fidelity gap.
   (the offending field named); `ProjectionError` gained a `code`/`code_name`
   constructor so the dispatch layer surfaces the specific code instead of `14`.
 
+### `Storage` is now a context manager
+
+`Storage` gained the `__enter__` / `__exit__` protocol, so you can write
+`with Storage(path) as store:` and have WiredTiger torn down (background threads
+joined, oplog meta persisted, connection closed) on block exit — even if the
+body raises — instead of relying on the embedder to remember `close()`.
+`close()` remains idempotent, so an explicit close inside the block is still
+safe. Found by the nightly security review (2026-07-04 §I12).
+
+#### Added
+
+- `Storage.__enter__` / `Storage.__exit__` — context-manager support that calls
+  `close()` on exit. Tests in `tests/test_storage_ctxmgr.py`.
+
 ### The standalone Rust server now honours every Python-server CLI flag
 
 The pure-Rust `secantusdb` binary — the standalone server you run with
