@@ -64,6 +64,19 @@ default WiredTiger cache is now `1G`, matching `python -m secantus`
   `1G` (matching the Python server) instead of the engine's `256M`
   default.
 
+### Admin UI: stop passing the raw (credential-bearing) MongoDB URI into the server page
+
+The admin server page's render context included `current_uri_raw`, the raw
+`mongo_uri` (which can carry a username/password), even though no template ever
+referenced it — a latent credential-exposure surface with no live leak. Removed
+the dead context variable; the page continues to show the scrubbed
+`current_uri_display`. Found by the nightly security review (2026-07-04 §I13).
+
+#### Security
+
+- `admin/routers/server.py`: drop the unused `current_uri_raw` template context
+  variable so the unscrubbed connection URI is no longer handed to the renderer.
+
 ### PostgreSQL/SQL server: malformed messages get an error reply instead of a dropped connection
 
 The PG/SQL server's simple-query loop now answers a malformed message with a
