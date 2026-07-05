@@ -1637,6 +1637,30 @@ def test_prepare_execute_deallocate_via_driver(server):
         conn.close()
 
 
+def test_explain_via_driver(server):
+    # EXPLAIN returns a QUERY PLAN text column over the real wire (#122).
+    conn = connect(server)
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int, name text)")
+        cur.execute("INSERT INTO t VALUES (1,'a'),(2,'b')")
+        cur.execute("CREATE INDEX t_id_idx ON t (id)")
+        conn.commit()
+
+        cur.execute("EXPLAIN SELECT * FROM t WHERE id = 1")
+        assert [d[0] for d in cur.description] == ["QUERY PLAN"]
+        plan = "\n".join(row[0] for row in cur.fetchall())
+        assert "Index Scan using t_id_idx on t" in plan
+
+        cur.execute("EXPLAIN (FORMAT JSON) SELECT * FROM t WHERE id = 1")
+        import json as _json
+
+        doc = _json.loads(cur.fetchall()[0][0])
+        assert doc[0]["Plan"]["Node Type"] == "Index Scan"
+    finally:
+        conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

@@ -17,7 +17,17 @@ from typing import Any
 import sqlglot
 from sqlglot import exp
 
-from secantus.sql import authz, errors, executor, planner, reflect, scalar, typemap, virtual
+from secantus.sql import (
+    authz,
+    errors,
+    executor,
+    planner,
+    reflect,
+    scalar,
+    typemap,
+    virtual,
+)
+from secantus.sql import explain as explain_mod
 from secantus.sql.catalog import Catalog, Column, TableDef
 from secantus.sql.result import ColumnDesc, SQLResult
 from secantus.sql.session import REPORTABLE_GUCS, Session, _Cursor, _Savepoint
@@ -1063,6 +1073,8 @@ def _run_statement(
             return _prepare_statement(stmt, session)
         if verb == "EXECUTE":
             return _execute_statement(stmt, storage, db, catalog, session)
+        if verb == "EXPLAIN":
+            return _explain_statement(stmt, storage, db, catalog, session)
         if verb == "REFRESH":
             return _refresh_matview(stmt, storage, db, catalog, session)
         if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("MATERIALIZED"):
@@ -1217,6 +1229,19 @@ def _bind_parameter_nodes(query: exp.Expression, args: list[exp.Expression]) -> 
             raise errors.syntax_error(f"bind parameter ${param.name} has no value")
         param.replace(args[idx].copy())
     return query
+
+
+def _explain_statement(
+    stmt: exp.Command, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """``EXPLAIN [ANALYZE] [(options)] <statement>`` — render the query plan. The
+    inner statement is re-run (via ``_run_statement``) only under ANALYZE."""
+    tail = _command_tail(stmt)
+
+    def _run(inner: exp.Expression) -> SQLResult:
+        return _run_statement(inner, storage, db, catalog, session)
+
+    return explain_mod.explain(tail, storage, db, catalog, session, run_stmt=_run)
 
 
 def _deallocate_target(stmt: exp.Expression) -> str | None:
