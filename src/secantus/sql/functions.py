@@ -126,6 +126,8 @@ _SCALAR_EVAL_ANON = frozenset(
         "justify_hours",
         "justify_interval",
         "age",
+        "uuid_generate_v4",
+        "uuid_generate_v1",
     }
 )
 

@@ -1619,6 +1619,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   queries. Tests: `tests/test_sql_fts.py` (+14, now 33) plus a pg8000 wire test. **Simplifications:**
   `ts_headline` returns the whole document (no fragment windowing), and lexeme weights (`:A` / `setweight` /
   weighted `ts_rank`) remain out of scope (the tsvector stores no per-lexeme weight).
+- [ ] **UUID type landed** (b146): the `uuid` type + `gen_random_uuid()` / `uuid_generate_v4()` /
+  `uuid_generate_v1()` generators, uuid literals / casts (hyphenated, bare-hex, and `{braced}` forms all
+  canonicalise to the lower-case hyphenated string), and equality / ordering that lower to a Mongo filter (no
+  per-row eval — the value stores as its canonical string). New self-contained `secantus/sql/uuidtype.py`
+  (`normalize` / `generate` / `is_uuid_value`; named `uuidtype` so it doesn't shadow stdlib `uuid`). Wired
+  through `typemap` (OID 2950, `UUID` in `_DATATYPE_TAGS`, `coerce` → normalise, names in `SQL_TYPE_NAME` /
+  `PG_TYPENAME`; `to_pg_text` needs no branch — the canonical string falls through the default encoder);
+  `scalar` (`exp.Uuid` node → generate, `_eval_cast` uuid → normalise, `gen_random_uuid` / `uuid_generate_v4`
+  / `uuid_generate_v1` in `_call_func`); `planner` (`_literal` for `exp.Uuid` + the `uuid_generate_*`
+  anonymous, `_infer_scalar_tag` types `exp.Uuid` / uuid casts / the generators as uuid);
+  `functions._SCALAR_EVAL_ANON` for FROM-less generators. Tests: `tests/test_sql_uuid.py` (15: pure uuidtype +
+  SQL surface) plus a pg8000 wire test. **Simplifications:** only v4 (random) UUIDs are generated
+  (`uuid_generate_v1` returns a v4, not a real time-based v1); no `uuid-ossp` namespace functions
+  (`uuid_generate_v3` / `v5`).
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

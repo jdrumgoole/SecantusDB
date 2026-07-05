@@ -219,6 +219,17 @@ def _literal(node: exp.Expression) -> Any:
         if unit is not None:
             return _intervals.from_unit(float(raw), unit.name)
         return _intervals.parse(str(raw))
+    if getattr(exp, "Uuid", None) is not None and isinstance(node, exp.Uuid):
+        from secantus.sql import uuidtype as _uuidtype
+
+        return _uuidtype.generate()
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() in (
+        "uuid_generate_v4",
+        "uuid_generate_v1",
+    ):
+        from secantus.sql import uuidtype as _uuidtype
+
+        return _uuidtype.generate()
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "row":
         # ``ROW(a, b, …)`` composite constructor -> a positional list; the INSERT
         # path maps it onto a composite column's named fields.
@@ -4647,6 +4658,9 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return "bool"
     if getattr(exp, "Host", None) is not None and isinstance(node, exp.Host):
         return "text"
+    # ``gen_random_uuid()`` (the dedicated ``exp.Uuid`` node) -> uuid.
+    if getattr(exp, "Uuid", None) is not None and isinstance(node, exp.Uuid):
+        return "uuid"
     # A bit-string literal (``B'1010'``) types as varbit.
     if isinstance(node, exp.BitString):
         return "varbit"
@@ -4692,6 +4706,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "bool",
             "interval",
             "timestamptz",
+            "uuid",
         ):
             return _mapped
     if isinstance(node, exp.Paren):
@@ -4905,6 +4920,9 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         # Interval functions.
         if fname in ("make_interval", "justify_days", "justify_hours", "justify_interval", "age"):
             return "interval"
+        # UUID generators.
+        if fname in ("gen_random_uuid", "uuid_generate_v4", "uuid_generate_v1"):
+            return "uuid"
         if fname in ("gcd", "lcm"):
             return "int8"
         if fname == "log10":

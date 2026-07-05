@@ -119,6 +119,10 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
 
         v = evaluate(node.this, scope, ctx)
         return None if v is None else _net.host(v)
+    if getattr(exp, "Uuid", None) is not None and isinstance(node, exp.Uuid):
+        from secantus.sql import uuidtype as _uuidtype
+
+        return _uuidtype.generate()
     if getattr(exp, "Adjacent", None) is not None and isinstance(node, exp.Adjacent):
         from secantus.sql import ranges as _ranges
 
@@ -995,6 +999,10 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import intervals as _intervals
 
         return value if _intervals.is_interval(value) else _intervals.parse(str(value))
+    if value is not None and to_tag_early == "uuid":
+        from secantus.sql import uuidtype as _uuidtype
+
+        return _uuidtype.normalize(value)
     # ``timestamp '2020-01-31'`` / ``date '…'`` -> a real datetime so interval and
     # date arithmetic land on a temporal value rather than a bare string.
     if (
@@ -1307,6 +1315,10 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
 
         v = args[0] if args else None
         return None if v is None or args[1] is None else _bitstr.get_bit(str(v), int(args[1]))
+    if name in ("gen_random_uuid", "uuid_generate_v4", "uuid_generate_v1"):
+        from secantus.sql import uuidtype as _uuidtype
+
+        return _uuidtype.generate()
     if name in ("justify_days", "justify_hours", "justify_interval"):
         from secantus.sql import intervals as _intervals
 
