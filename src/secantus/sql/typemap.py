@@ -61,6 +61,9 @@ PG_OID: dict[str, int] = {
     "inet": 869,
     "cidr": 650,
     "macaddr": 829,
+    # Bit-string types (rendered as a '0'/'1' string).
+    "bit": 1560,
+    "varbit": 1562,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -73,6 +76,9 @@ _FTS_TAGS = frozenset({"tsvector", "tsquery"})
 
 # Network address type tags — stored as canonical text.
 _NET_TAGS = frozenset({"inet", "cidr", "macaddr"})
+
+# Bit-string type tags — stored as a canonical '0'/'1' string.
+_BIT_TAGS = frozenset({"bit", "varbit"})
 
 # Type tags whose value is a list rendered as a Postgres ``int2vector`` /
 # ``oidvector`` (space-separated, not array braces / JSON).
@@ -100,6 +106,8 @@ SQL_TYPE_NAME: dict[str, str] = {
     "json": "jsonb",
     "bytea": "bytea",
     "composite": "record",
+    "bit": "bit",
+    "varbit": "bit varying",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -118,6 +126,8 @@ PG_TYPENAME: dict[str, str] = {
     "json": "jsonb",
     "bytea": "bytea",
     "composite": "record",
+    "bit": "bit",
+    "varbit": "varbit",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -150,6 +160,7 @@ _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.JSONB: "json",
     exp.DataType.Type.BINARY: "bytea",
     exp.DataType.Type.VARBINARY: "bytea",
+    exp.DataType.Type.BIT: "bit",
 }
 
 
@@ -185,6 +196,13 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     name = datatype.sql(dialect="postgres").lower().strip()
     if name in _RANGE_TAGS or name in _MULTIRANGE_TAGS or name in _FTS_TAGS or name in _NET_TAGS:
         return name
+    # Bit strings carry an optional length (``bit(8)`` / ``varbit(16)``); match on
+    # the bare name. ``bit varying`` is the spelled-out ``varbit``.
+    base = name.split("(", 1)[0].strip()
+    if base == "bit varying":
+        return "varbit"
+    if base in _BIT_TAGS:
+        return base
     return None
 
 
@@ -283,6 +301,13 @@ def coerce(value: Any, tag: str) -> Any:
         if tag == "cidr":
             return _net.normalize_cidr(value)
         return _net.normalize_macaddr(value)
+    if tag in _BIT_TAGS:
+        from secantus.sql import bitstr as _bitstr
+
+        # Column-level coercion has no declared length here (an explicit
+        # ``::bit(n)`` cast pads/truncates in the scalar evaluator); validate and
+        # canonicalise the '0'/'1' string.
+        return _bitstr.normalize(value, varying=(tag == "varbit"))
     if tag == "int4":
         return int(value)
     if tag == "int8":
@@ -355,6 +380,8 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         if tag == "inet":
             return _net.render_inet(value).encode("utf-8")
         return value.encode("utf-8")  # cidr / macaddr are stored canonical
+    if tag in _BIT_TAGS and isinstance(value, str):
+        return value.encode("utf-8")  # already a canonical '0'/'1' string
     if tag == "composite" and isinstance(value, dict):
         return _render_pg_composite(value).encode("utf-8")
     if isinstance(value, (dict, list)):

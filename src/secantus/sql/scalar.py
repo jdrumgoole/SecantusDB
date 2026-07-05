@@ -72,6 +72,8 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             return node.this
         text = node.this
         return float(text) if ("." in text or "e" in text.lower()) else int(text)
+    if isinstance(node, exp.BitString):  # ``B'1010'`` -> the '0'/'1' string
+        return str(node.this)
     if isinstance(node, exp.Neg):
         v = evaluate(node.this, scope, ctx)
         return None if v is None else -v
@@ -94,6 +96,19 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         net_result = _eval_net_op(node, scope, ctx)
         if net_result is not _NOT_NET:
             return net_result
+        bit_result = _eval_bitwise(node, scope, ctx)
+        if bit_result is not _NOT_BIT:
+            return bit_result
+    if isinstance(node, (exp.BitwiseAnd, exp.BitwiseOr, exp.BitwiseXor, exp.BitwiseNot)):
+        bit_result = _eval_bitwise(node, scope, ctx)
+        if bit_result is not _NOT_BIT:
+            return bit_result
+    if getattr(exp, "Getbit", None) is not None and isinstance(node, exp.Getbit):
+        from secantus.sql import bitstr as _bitstr
+
+        bits = evaluate(node.this, scope, ctx)
+        idx = evaluate(node.expression, scope, ctx)
+        return None if bits is None or idx is None else _bitstr.get_bit(str(bits), int(idx))
     if getattr(exp, "Host", None) is not None and isinstance(node, exp.Host):
         from secantus.sql import net as _net
 
@@ -900,6 +915,8 @@ for _cls_name, _handler in (
     ("Chr", _eval_chr),
     ("StrPosition", _eval_str_position),
     ("Overlay", _eval_overlay),
+    # ``bit_length`` — a bit string's bit count (its char length).
+    ("BitLength", _unary(lambda v: len(_as_text(v)))),
 ):
     _cls = getattr(exp, _cls_name, None)
     if _cls is not None:
@@ -939,6 +956,19 @@ def _eval_case(node: exp.Case, scope: Scope, ctx: ScalarContext) -> Any:
     return evaluate(default, scope, ctx) if default is not None else None
 
 
+def _is_bit_expr(node: exp.Expression) -> bool:
+    """Whether ``node`` statically denotes a bit string — a ``B'…'`` literal or a
+    cast to ``bit`` / ``varbit`` (through parens). Used so ``b'1010'::int`` reads
+    the operand as a bit string while ``'1010'::int`` reads it as decimal text."""
+    if isinstance(node, exp.Paren):
+        return _is_bit_expr(node.this)
+    if isinstance(node, exp.BitString):
+        return True
+    if isinstance(node, exp.Cast) and node.to is not None:
+        return typemap.type_tag_for_sql(node.to) in typemap._BIT_TAGS
+    return False
+
+
 def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
     # ``'[1,10)'::int4range`` — parse a range text literal into its subdocument.
@@ -954,10 +984,46 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         and not isinstance(value, dict)
     ):
         return typemap.coerce(value, to)
+    # Bit-string casts: ``::bit(n)`` / ``::varbit`` (from a '0'/'1' string or an
+    # integer) and ``bit::int``.
+    to_tag = typemap.type_tag_for_sql(node.to) if node.to is not None else None
+    if value is not None and to_tag in typemap._BIT_TAGS:
+        from secantus.sql import bitstr as _bitstr
+
+        length = _bit_cast_length(node.to)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return _bitstr.from_int(
+                value, length if length is not None else max(int(value).bit_length(), 1)
+            )
+        return _bitstr.normalize(value, length=length, varying=(to_tag == "varbit"))
+    if (
+        value is not None
+        and _is_bit_expr(node.this)
+        and to_tag in ("int4", "int8", "numeric", "float8")
+    ):
+        from secantus.sql import bitstr as _bitstr
+
+        n = _bitstr.to_int(str(value))
+        return float(n) if to_tag == "float8" else n
     # Otherwise we don't model regclass/oid identity types; evaluating the inner
     # value is enough for the catalog queries that use casts (compared / discarded,
     # never round-tripped through a real type).
     return value
+
+
+def _bit_cast_length(datatype: exp.DataType | None) -> int | None:
+    """The declared length of a ``bit(n)`` / ``varbit(n)`` cast target, or None."""
+    if datatype is None:
+        return None
+    params = datatype.args.get("expressions") or []
+    for p in params:
+        lit = p.this if isinstance(p, exp.DataTypeParam) else p
+        if isinstance(lit, exp.Literal) and not lit.is_string:
+            try:
+                return int(lit.this)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def _func_name(node: exp.Anonymous) -> str:
@@ -1178,6 +1244,24 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             return _net.netmask(v)  # close enough for the common /24 cases
         # abbrev: render the inet abbreviated form (drops a full-host mask).
         return _net.render_inet(v)
+    if name in ("set_bit", "bit_length", "octet_length"):
+        from secantus.sql import bitstr as _bitstr
+
+        v = args[0] if args else None
+        if v is None:
+            return None
+        bits = str(v)
+        if name == "bit_length":
+            return _bitstr.bit_length(bits)
+        if name == "octet_length":
+            return _bitstr.octet_length(bits)
+        # set_bit(bits, n, newvalue)
+        return _bitstr.set_bit(bits, int(args[1]), int(args[2]))
+    if name == "get_bit":
+        from secantus.sql import bitstr as _bitstr
+
+        v = args[0] if args else None
+        return None if v is None or args[1] is None else _bitstr.get_bit(str(v), int(args[1]))
     if name == "isempty":
         from secantus.sql import ranges as _ranges
 
@@ -1344,6 +1428,58 @@ def _jsonb_strip_nulls(value: Any) -> Any:
 _NOT_RANGE = object()
 _NOT_FTS = object()
 _NOT_NET = object()
+_NOT_BIT = object()
+
+
+def _eval_bitwise(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """Bitwise operators overloaded across bit strings and integers: ``&`` / ``|`` /
+    ``#`` (xor) / ``~`` (not) / ``<<`` / ``>>``. Returns ``_NOT_BIT`` when the (net
+    check having already run) operands are neither bit strings nor integers, so a
+    ``<<`` / ``>>`` net value can still be handled upstream. NULL operands -> None."""
+    from secantus.sql import bitstr as _bitstr
+
+    left = evaluate(node.this, scope, ctx)
+    if isinstance(node, exp.BitwiseNot):  # unary ~
+        if left is None:
+            return None
+        if _bitstr.is_bit_value(left):
+            return _bitstr.bnot(left)
+        if isinstance(left, int) and not isinstance(left, bool):
+            return ~left
+        return _NOT_BIT
+    right = evaluate(node.expression, scope, ctx)
+    left_bit, right_bit = _bitstr.is_bit_value(left), _bitstr.is_bit_value(right)
+    if left_bit or right_bit:
+        if left is None or right is None:
+            return None
+        a, b = str(left), str(right)
+        if isinstance(node, exp.BitwiseAnd):
+            return _bitstr.band(a, b)
+        if isinstance(node, exp.BitwiseOr):
+            return _bitstr.bor(a, b)
+        if isinstance(node, exp.BitwiseXor):
+            return _bitstr.bxor(a, b)
+        if isinstance(node, exp.BitwiseLeftShift):
+            return _bitstr.shift_left(a, int(right))
+        if isinstance(node, exp.BitwiseRightShift):
+            return _bitstr.shift_right(a, int(right))
+        return _NOT_BIT
+    if isinstance(left, bool) or isinstance(right, bool):
+        return _NOT_BIT
+    if isinstance(left, int) and isinstance(right, int):
+        if left is None or right is None:
+            return None
+        if isinstance(node, exp.BitwiseAnd):
+            return left & right
+        if isinstance(node, exp.BitwiseOr):
+            return left | right
+        if isinstance(node, exp.BitwiseXor):
+            return left ^ right
+        if isinstance(node, exp.BitwiseLeftShift):
+            return left << right
+        if isinstance(node, exp.BitwiseRightShift):
+            return left >> right
+    return _NOT_BIT
 
 
 def _is_net_value(v: Any) -> bool:

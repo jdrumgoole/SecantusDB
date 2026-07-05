@@ -204,6 +204,8 @@ def _literal(node: exp.Expression) -> Any:
             return node.this
         text = node.this
         return float(text) if ("." in text or "e" in text.lower()) else int(text)
+    if isinstance(node, exp.BitString):  # ``B'1010'`` -> the canonical '0'/'1' string
+        return str(node.this)
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "row":
         # ``ROW(a, b, …)`` composite constructor -> a positional list; the INSERT
         # path maps it onto a composite column's named fields.
@@ -1895,6 +1897,8 @@ def where_needs_per_row(stmt: exp.Select, table: TableDef | None = None) -> bool
         return True
     if table is not None and _where_has_net_predicate(node, table):
         return True
+    if table is not None and _where_has_bit_predicate(node, table):
+        return True
     # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
     if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
         return True
@@ -1920,6 +1924,29 @@ def _where_has_net_predicate(node: exp.Expression, table: TableDef) -> bool:
     for op in node.find_all(*net_ops):
         if _is_net_operand(op.this, table) or _is_net_operand(op.expression, table):
             return True
+    return False
+
+
+def _where_has_bit_predicate(node: exp.Expression, table: TableDef) -> bool:
+    """True if ``node`` contains a bit-string literal (``B'…'``) or a bitwise
+    operator over a bit-typed column — those don't lower to a Mongo filter and
+    need per-row evaluation."""
+    if node.find(exp.BitString) is not None:
+        return True
+    bit_ops = [
+        exp.BitwiseAnd,
+        exp.BitwiseOr,
+        exp.BitwiseXor,
+        exp.BitwiseNot,
+        exp.BitwiseLeftShift,
+        exp.BitwiseRightShift,
+    ]
+    for op in node.find_all(*bit_ops):
+        for operand in (op.this, op.expression):
+            if isinstance(operand, exp.Column):
+                col = table.column(_column_name(operand))
+                if col is not None and col.type_tag in typemap._BIT_TAGS:
+                    return True
     return False
 
 
@@ -4478,6 +4505,32 @@ def _has_net_operand(node: exp.Expression, resolve: Resolve) -> bool:
     return False
 
 
+def _has_bit_operand(node: exp.Expression, resolve: Resolve) -> bool:
+    """Does an operand of ``node`` (a bitwise operator) resolve to a bit string —
+    a ``B'…'`` literal, a bit/varbit-typed column, or a cast to ``bit`` /
+    ``varbit``?"""
+    for operand in (node.this, node.expression):
+        if isinstance(operand, exp.BitString):
+            return True
+        if isinstance(operand, exp.Paren):
+            operand = operand.this
+        if isinstance(operand, exp.BitString):
+            return True
+        if (
+            isinstance(operand, exp.Cast)
+            and operand.to is not None
+            and typemap.type_tag_for_sql(operand.to) in typemap._BIT_TAGS
+        ):
+            return True
+        if isinstance(operand, exp.Column):
+            try:
+                if resolve(operand)[1] in typemap._BIT_TAGS:
+                    return True
+            except errors.SQLError:
+                pass
+    return False
+
+
 def _range_tag_of(operands: Any, resolve: Resolve) -> str | None:
     """The range type tag among ``operands`` — a range constructor / range-typed
     column — or None if none is a range."""
@@ -4541,6 +4594,33 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return "bool"
     if getattr(exp, "Host", None) is not None and isinstance(node, exp.Host):
         return "text"
+    # A bit-string literal (``B'1010'``) types as varbit.
+    if isinstance(node, exp.BitString):
+        return "varbit"
+    # Bit-string operators: ``&`` / ``|`` / ``#`` / ``~`` / ``<<`` / ``>>`` and
+    # ``||`` over a bit operand -> varbit. (``<<`` / ``>>`` fall through here only
+    # when the net check above didn't match.)
+    if isinstance(
+        node,
+        (
+            exp.BitwiseAnd,
+            exp.BitwiseOr,
+            exp.BitwiseXor,
+            exp.BitwiseNot,
+            exp.BitwiseLeftShift,
+            exp.BitwiseRightShift,
+            exp.DPipe,
+        ),
+    ) and _has_bit_operand(node, resolve):
+        return "varbit"
+    # Integer bitwise ``&`` / ``|`` / ``#`` / ``~`` (not the bit-string, net, or
+    # concat forms handled above) -> int4.
+    if isinstance(node, (exp.BitwiseAnd, exp.BitwiseOr, exp.BitwiseXor, exp.BitwiseNot)):
+        return "int4"
+    if getattr(exp, "Getbit", None) is not None and isinstance(node, exp.Getbit):
+        return "int4"
+    if getattr(exp, "BitLength", None) is not None and isinstance(node, exp.BitLength):
+        return "int4"
     if isinstance(node, exp.Cast) and node.to is not None:
         _to = node.to.sql(dialect="postgres").lower().strip()
         if (
@@ -4550,6 +4630,15 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             or _to in typemap._NET_TAGS
         ):
             return _to
+        _mapped = typemap.type_tag_for_sql(node.to)
+        if _mapped in typemap._BIT_TAGS or _mapped in (
+            "int4",
+            "int8",
+            "float8",
+            "numeric",
+            "bool",
+        ):
+            return _mapped
     if isinstance(node, exp.Paren):
         return _infer_scalar_tag(node.this, resolve)
     if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
@@ -4751,6 +4840,11 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "inet"
         if fname in ("host", "abbrev"):
             return "text"
+        # Bit-string functions.
+        if fname in ("bit_length", "octet_length", "get_bit"):
+            return "int4"
+        if fname == "set_bit":
+            return "varbit"
         if fname in ("gcd", "lcm"):
             return "int8"
         if fname == "log10":

@@ -115,6 +115,10 @@ _SCALAR_EVAL_ANON = frozenset(
         "family",
         "abbrev",
         "hostmask",
+        "set_bit",
+        "get_bit",
+        "bit_length",
+        "octet_length",
     }
 )
 

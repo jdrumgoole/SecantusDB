@@ -1574,6 +1574,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `tests/test_sql_net.py` (29: pure net + SQL surface) plus a pg8000 wire test. **Simplifications:** the `<<=`
   / `>>=` (contain-or-equal) operators aren't parsed by sqlglot, and `inet ± int` arithmetic, `macaddr8`, and
   GiST network indexes are out of scope.
+- [ ] **Bit-string types landed** (b143): `bit(n)` / `varbit` types, `B'…'` literals, the bitwise operators
+  `&` / `|` / `#` / `~` / `<<` / `>>`, `||` concat, and `length` / `bit_length` / `octet_length` / `get_bit` /
+  `set_bit` plus `int`↔`bit` casts. New self-contained `secantus/sql/bitstr.py` stores values as a canonical
+  '0'/'1' string; `normalize` pads/truncates, `from_int`/`to_int`, `band`/`bor`/`bxor`/`bnot`,
+  `shift_left`/`shift_right` (width-preserving), `get_bit`/`set_bit` (left-indexed), `is_bit_value` (operand
+  disambiguation). Wired through `typemap` (OIDs bit 1560 / varbit 1562, `_BIT_TAGS`, `BIT` in `_DATATYPE_TAGS`,
+  `varbit`/`bit varying` name-match, `coerce` → normalise, `to_pg_text` → the string, names in `SQL_TYPE_NAME`
+  / `PG_TYPENAME`); `scalar` (`exp.BitString` literal, `_eval_bitwise` with a `_NOT_BIT` sentinel — overloaded
+  across bit strings and integers, net-first for `<<`/`>>`; `exp.Getbit` + `exp.BitLength` nodes; `_eval_cast`
+  bit↔int with `_bit_cast_length` + `_is_bit_expr`; `set_bit`/`get_bit`/`bit_length`/`octet_length` in
+  `_call_func`); `planner` (`_literal` BitString, `_has_bit_operand`, `_infer_scalar_tag` types operators →
+  varbit / int bitwise → int4 / bit funcs / casts, `_where_has_bit_predicate` routes a bit-op WHERE per-row);
+  `functions._SCALAR_EVAL_ANON` for FROM-less bit funcs. Tests: `tests/test_sql_bitstr.py` (24: pure bitstr +
+  SQL surface) plus a pg8000 wire test. **Simplifications:** a `bit(n)` *column* isn't padded to `n` on insert
+  (declared length not tracked at storage — only explicit `::bit(n)` casts pad); a stored bit column can't be
+  re-read via `::int` (only a `B'…'` literal or `::bit` cast is treated as a bit source); bit indexes are out
+  of scope.
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

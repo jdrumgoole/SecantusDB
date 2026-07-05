@@ -1287,6 +1287,37 @@ def test_network_types_via_driver(server):
     conn.close()
 
 
+def test_bit_string_types_via_driver(server):
+    # bit(n) / varbit columns, B'…' literals, the &/|/#/~/<</>> operators, and
+    # length / get_bit accessors over the real wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id int primary key, flags bit(8), mask varbit)")
+    cur.execute("INSERT INTO t VALUES (1, '10101010', '111')")
+    cur.execute("INSERT INTO t VALUES (2, '00001111', '0')")
+
+    # A bit column renders as its '0'/'1' string.
+    cur.execute("SELECT flags, mask FROM t WHERE id = 1")
+    assert cur.fetchone() == ["10101010", "111"]
+
+    # Bitwise algebra.
+    cur.execute("SELECT b'1010' & b'0110', b'1010' | b'0110', ~ b'1010'")
+    assert cur.fetchone() == ["0010", "1110", "0101"]
+
+    # int -> bit and bit -> int casts.
+    cur.execute("SELECT 10::bit(8), b'1010'::int")
+    assert cur.fetchone() == ["00001010", 10]
+
+    # A masked WHERE routes through the per-row scalar path.
+    cur.execute("SELECT id FROM t WHERE flags & b'00001111' = b'00001010' ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [1]
+
+    # length / get_bit.
+    cur.execute("SELECT length(flags), get_bit(flags, 0) FROM t WHERE id = 1")
+    assert cur.fetchone() == [8, 1]
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
