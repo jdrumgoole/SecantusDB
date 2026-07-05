@@ -19,6 +19,51 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### The standalone Rust server now honours every Python-server CLI flag
+
+The pure-Rust `secantusdb` binary — the standalone server you run with
+no Python interpreter in the process — used to accept only a subset of
+the daemon flags the Python server understands. That gap meant a
+`secantusdb.toml` or flag set tuned for one server wouldn't drive the
+other. It's now closed: the Rust binary accepts the same eight
+configuration flags the Python launcher does, with real behaviour behind
+each, so a single configuration drives either server identically.
+
+`--config` loads a `secantusdb.toml` with the same discovery order
+(`./`, `~/.secantus/`, `/etc/secantus/`), the same `defaults < file <
+CLI flag` precedence, table renames, and strict unknown-key/table
+rejection as the Python loader. `--log-level` initialises a logger to
+the requested level; `--cache-size`, `--session-max`, and
+`--sync-on-commit` tune the WiredTiger connection; and
+`--oplog-retention-seconds`, `--oplog-max-entries`, and
+`--noop-heartbeat-seconds` control oplog retention plus a background
+heartbeat that keeps quiet change-stream cursors' resume tokens inside
+the retention window. The heartbeat thread and a TTL sweeper also give
+the standalone binary the periodic oplog-prune and expired-document
+maintenance the Python daemon has always run.
+
+One behavioural alignment worth calling out: the standalone daemon's
+default WiredTiger cache is now `1G`, matching `python -m secantus`
+(the embedded Rust handle's default is unchanged).
+
+#### Added
+- The `--config` / `--log-level` / `--cache-size` / `--session-max` /
+  `--sync-on-commit` / `--noop-heartbeat-seconds` /
+  `--oplog-retention-seconds` / `--oplog-max-entries` flags on the
+  standalone `secantusdb` binary, with a faithful TOML config loader
+  (`secantus-server`'s new `config` module) mirroring
+  `src/secantus/config.py`'s precedence and validation.
+- Background noop-heartbeat (with opportunistic `prune_oplog`) and
+  TTL-sweep threads in the `secantusdb` binary, sharing one
+  `Arc<Storage>` and joining on a shutdown flag before WiredTiger closes.
+- `secantus_storage::wt_config` builds the WiredTiger connection string
+  from the resolved cache-size / session-max / sync-on-commit knobs.
+
+#### Changed
+- The standalone `secantusdb` daemon defaults its WiredTiger cache to
+  `1G` (matching the Python server) instead of the engine's `256M`
+  default.
+
 ### PostgreSQL/SQL server: malformed messages get an error reply instead of a dropped connection
 
 The PG/SQL server's simple-query loop now answers a malformed message with a
