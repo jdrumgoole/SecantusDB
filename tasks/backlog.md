@@ -1749,6 +1749,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
   functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
   out of scope.
+- [ ] **PREPARE / EXECUTE / DEALLOCATE landed** (b157): SQL-level prepared statements on the session. `PREPARE name
+  [(argtypes)] AS <query>` parses the query (with its `$N` placeholders) and stashes `(query_ast, param_count)` on
+  the new `Session.prepared` dict; `EXECUTE name [(args)]` parses the args (`SELECT <args>` wrapper → expression
+  nodes), substitutes them for the `$N` `exp.Parameter` nodes (`_bind_parameter_nodes`, node-for-node so casts /
+  typed literals survive), and re-dispatches through `_run_statement`, returning the underlying statement's result +
+  command tag (any DML kind works — a prepared INSERT tags `INSERT 0 N`). `DEALLOCATE name` / `DEALLOCATE ALL`
+  removes from the dict (was previously a blanket no-op alongside DISCARD; DISCARD stays a no-op). sqlglot falls
+  back to a `Command` (tail as a string Literal) for PREPARE/EXECUTE and a bare `Alias` for DEALLOCATE, so the
+  handlers regex the tails. Errors: duplicate name `42P05`, unknown name `26000`, arg-count mismatch `08P01`;
+  DEALLOCATE of an unknown name is tolerated (libpq/psycopg fire speculative DEALLOCATEs on cleanup). Per-session
+  (not shared). The `(argtypes)` list is accepted and ignored — values are coerced by the target column's type.
+  Distinct from the extended wire protocol's Parse/Bind portals (`pgextended.py`) — a driver's own `%s` binding
+  never touches these. Tests: `tests/test_sql_prepare.py` (14) + a pg8000 wire test. **Simplification:** unquoted
+  statement names aren't folded to lower case (matches the existing DECLARE CURSOR name handling).
 - [ ] **LISTEN / NOTIFY / UNLISTEN landed** (b156): cross-connection async pub/sub on the PG wire server. New
   `secantus/sql/pgnotify.py` (`NotifyHub` — a server-wide channel → listening-session registry, keyed by
   `id(session)` since `Session` is an unhashable dataclass). New `pgwire.notification_response` ('A'). `Session`
@@ -2475,7 +2489,8 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   first-write-per-savepoint, not a WT-native savepoint); **DDL inside a savepoint is not undone**
   (`CREATE`/`DROP`/`CREATE INDEX` — only DML restores); and recovery after a storage-engine
   `WT_ROLLBACK`-class error (vs an ordinary constraint violation) may leave the WT txn unusable for
-  the restore writes. `DEALLOCATE`/`DISCARD` remain no-ops. **Server-side cursors landed** (b72):
+  the restore writes. `DISCARD` remains a no-op (`DEALLOCATE` is now a real prepared-statement command — see the
+  b157 entry above). **Server-side cursors landed** (b72):
   `DECLARE name [WITH HOLD] CURSOR FOR <query>` materializes the query at declaration
   (`engine._declare_cursor`, stored as a `session._Cursor`); `FETCH` / `MOVE` walk a scroll position
   (`_cursor_slice` — forward / backward / absolute / relative, so cursors are fully scrollable) and
