@@ -4896,6 +4896,9 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return "text"
     if getattr(exp, "Decode", None) is not None and isinstance(node, exp.Decode):
         return "bytea"
+    # xml: ``xmlelement(...)`` (dedicated node) -> xml.
+    if getattr(exp, "XMLElement", None) is not None and isinstance(node, exp.XMLElement):
+        return "xml"
     if isinstance(node, exp.DPipe) and _has_bytea_operand(node, resolve):
         return "bytea"
     # A bit-string literal (``B'1010'``) types as varbit.
@@ -4954,6 +4957,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
                 "bytea",
                 "hstore",
                 "citext",
+                "xml",
             )
             or _mapped in typemap._GEO_TAGS
         ):
@@ -5185,6 +5189,14 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         if fname in ("hstore", "delete"):
             return "hstore"
         if fname == "defined":
+            return "bool"
+        # xml functions: xmlforest/xmlconcat -> xml; xpath -> text[];
+        # xml_is_well_formed -> bool.
+        if fname in ("xmlforest", "xmlconcat"):
+            return "xml"
+        if fname == "xpath":
+            return "text[]"
+        if fname in ("xml_is_well_formed", "xml_is_well_formed_document"):
             return "bool"
         # Interval functions.
         if fname in ("make_interval", "justify_days", "justify_hours", "justify_interval", "age"):

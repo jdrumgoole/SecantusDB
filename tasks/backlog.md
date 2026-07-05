@@ -1735,6 +1735,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `SELECT DISTINCT` on a citext column group case-**sensitively** (`Alice` ≠ `alice`), unlike real Postgres — the
   dominant citext uses (case-insensitive equality / uniqueness / range / sort) are faithful, but case-folding
   aggregation grouping isn't wired yet. citext indexing is out of scope.
+- [ ] **xml type + basic functions landed** (b155): the `xml` type (real builtin, OID 142) stored as its text and
+  validated well-formed on cast / coerce, plus the constructor / extraction functions. New self-contained
+  `secantus/sql/xmltype.py` (`is_well_formed` / `parse` / `element` / `forest` / `concat` / `xpath`); XML parsing +
+  serialization go through the stdlib `xml.etree.ElementTree` (no external dep; external entities disabled → no XXE).
+  Wired through `typemap` (OID 142; `xml` in `SQL_TYPE_NAME` / `PG_TYPENAME` / `_DATATYPE_TAGS`; `coerce` →
+  `xmltype.parse`), `scalar` (`_eval_cast` xml branch; the dedicated `exp.XMLElement` node handler
+  `_eval_xmlelement` reading `xmlattributes(...)`; `xmlforest` special-cased in `_eval_func` because it needs the
+  per-arg `AS name` aliases; `xpath` / `xml_is_well_formed` / `xmlconcat` in `_call_func`), `functions` (the xml
+  function names in `_SCALAR_EVAL_ANON`), and `planner` (`_infer_scalar_tag`: `xmlelement`/`xmlforest`/`xmlconcat`
+  → xml, `xpath` → text[], `xml_is_well_formed` → bool, cast → xml). Tests: `tests/test_sql_xml.py` (25) plus a
+  pg8000 wire test. **Simplifications:** `xpath` is a pragmatic subset (absolute `/a/b/c` child paths, a trailing
+  `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
+  functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
+  out of scope.
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

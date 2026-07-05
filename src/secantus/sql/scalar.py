@@ -978,6 +978,26 @@ def _eval_justify(fn: str) -> Callable[[exp.Expression, Scope, ScalarContext], A
 
 # Typed scalar function nodes (sqlglot parses these to dedicated classes whose
 # operands live in ``this`` / named args, not ``expressions``).
+def _eval_xmlelement(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``xmlelement(NAME tag [, xmlattributes(v AS k, …)], content…)`` — build an
+    XML element. The name is in ``this``; the first ``xmlattributes(...)`` in
+    ``expressions`` supplies attributes and the rest are content."""
+    from secantus.sql import xmltype as _xmltype
+
+    name = node.this.name if isinstance(node.this, exp.Identifier) else _as_text(node.this)
+    attributes: list[tuple[str, Any]] = []
+    content: list[Any] = []
+    for e in node.expressions:
+        if isinstance(e, exp.Anonymous) and str(e.this).lower() == "xmlattributes":
+            for a in e.expressions:
+                key = a.alias if isinstance(a, exp.Alias) else _as_text(a)
+                inner = a.this if isinstance(a, exp.Alias) else a
+                attributes.append((key, evaluate(inner, scope, ctx)))
+        else:
+            content.append(evaluate(e, scope, ctx))
+    return _xmltype.element(name, attributes, content)
+
+
 def _eval_encode(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     """``encode(bytea, fmt)`` — the dedicated ``exp.Encode`` node carries the data
     in ``this`` and the format in ``charset``."""
@@ -1080,6 +1100,8 @@ for _cls_name, _handler in (
     # bytea encode / decode carry their format in ``charset``, not ``expressions``.
     ("Encode", _eval_encode),
     ("Decode", _eval_decode),
+    # ``xmlelement`` has a dedicated node (name in ``this``, args in ``expressions``).
+    ("XMLElement", _eval_xmlelement),
 ):
     _cls = getattr(exp, _cls_name, None)
     if _cls is not None:
@@ -1163,6 +1185,10 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import hstore as _hstore
 
         return _hstore.parse(value)
+    if value is not None and to_tag_early == "xml":
+        from secantus.sql import xmltype as _xmltype
+
+        return _xmltype.parse(value)
     if value is not None and to_tag_early in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes
 
@@ -1242,8 +1268,25 @@ def _func_name(node: exp.Anonymous) -> str:
 
 def _eval_func(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> Any:
     name = _func_name(node)
+    if name == "xmlforest":
+        # ``xmlforest(value AS name, …)`` needs the per-arg aliases, which are lost
+        # once the args are flattened to values.
+        from secantus.sql import xmltype as _xmltype
+
+        pairs: list[tuple[str, Any]] = []
+        for e in node.expressions:
+            label = e.alias if isinstance(e, exp.Alias) else _column_name_of(e)
+            inner = e.this if isinstance(e, exp.Alias) else e
+            pairs.append((label, evaluate(inner, scope, ctx)))
+        return _xmltype.forest(pairs)
     args = [evaluate(a, scope, ctx) for a in node.expressions]
     return _call_func(name, args, ctx)
+
+
+def _column_name_of(node: exp.Expression) -> str:
+    """The implicit element name for an unaliased ``xmlforest`` operand — its column
+    name (Postgres uses the column name when no ``AS`` is given)."""
+    return node.name if isinstance(node, exp.Column) else _as_text(node)
 
 
 def _eval_typed_func(node: exp.Func, scope: Scope, ctx: ScalarContext) -> Any:
@@ -1524,6 +1567,17 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             return _hstore.delete(v, args[1])
         if name == "defined":
             return _hstore.defined(v, args[1])
+    if name in ("xml_is_well_formed", "xml_is_well_formed_document", "xpath", "xmlconcat"):
+        from secantus.sql import xmltype as _xmltype
+
+        if name in ("xml_is_well_formed", "xml_is_well_formed_document"):
+            return None if not args else _xmltype.is_well_formed(args[0])
+        if name == "xmlconcat":
+            return _xmltype.concat(*args)
+        # xpath(expr, xml [, nsarray]) -> a text array of matched nodes.
+        if len(args) < 2 or args[0] is None or args[1] is None:
+            return None
+        return _xmltype.xpath(_as_text(args[0]), args[1])
     if name in ("gen_random_uuid", "uuid_generate_v4", "uuid_generate_v1"):
         from secantus.sql import uuidtype as _uuidtype
 

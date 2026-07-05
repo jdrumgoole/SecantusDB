@@ -94,6 +94,9 @@ PG_OID: dict[str, int] = {
     # already reports the text OID (25) for it, and adding an explicit ``citext: 25``
     # would collide with ``text: 25`` in the inverted OID→typename map (making
     # ``format_type(25)`` resolve to "citext" instead of "text").
+    # xml (a real built-in type, OID 142). Stored as its text; validated
+    # well-formed on cast / coerce.
+    "xml": 142,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -149,6 +152,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "money": "money",
     "hstore": "hstore",
     "citext": "citext",
+    "xml": "xml",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -176,6 +180,7 @@ PG_TYPENAME: dict[str, str] = {
     "interval": "interval",
     "uuid": "uuid",
     "money": "money",
+    "xml": "xml",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -216,6 +221,7 @@ _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.MONEY: "money",
     exp.DataType.Type.POINT: "point",
     exp.DataType.Type.HSTORE: "hstore",
+    exp.DataType.Type.XML: "xml",
 }
 
 
@@ -397,6 +403,10 @@ def coerce(value: Any, tag: str) -> Any:
         from secantus.sql import hstore as _hstore
 
         return _hstore.parse(value)
+    if tag == "xml":
+        from secantus.sql import xmltype as _xmltype
+
+        return _xmltype.parse(value)
     if tag == "int4":
         return int(value)
     if tag == "int8":
