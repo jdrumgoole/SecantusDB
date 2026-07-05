@@ -11,7 +11,16 @@ _MISSING = object()
 
 
 class ProjectionError(Exception):
-    pass
+    """Projection-validation error. ``code``/``code_name`` default to the generic
+    mapping (14 TypeMismatch) but raise sites may pin mongod's specific code (e.g.
+    31254 / 31253 for an inclusion/exclusion mix)."""
+
+    def __init__(
+        self, message: str, *, code: int | None = None, code_name: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.code_name = code_name
 
 
 def _is_elem_match_spec(value: Any) -> bool:
@@ -232,17 +241,30 @@ def _first_match(doc: dict[str, Any], path: str, sub_filter: Mapping[str, Any]) 
 
 
 def _detect_inclusion(spec: Mapping[str, Any]) -> bool:
-    truthy: list[bool] = []
-    for v in spec.values():
-        if _is_elem_match_spec(v):
-            truthy.append(True)
-        else:
-            truthy.append(bool(v))
-    if all(truthy):
-        return True
-    if not any(truthy):
-        return False
-    # Match mongod's literal error text — mongo-node-driver's
-    # ``server_errors.test.ts`` asserts on the exact string ("Cannot
-    # do exclusion on field ... in inclusion projection").
-    raise ProjectionError("Projection cannot have a mix of inclusion and exclusion.")
+    """Whether ``spec`` (already stripped of ``_id``) is an inclusion (vs
+    exclusion) projection. mongod validates field-by-field in order: the first
+    field sets the mode and a later field of the opposite mode is rejected with
+    mongod's *specific* per-field error — ``Location31254`` (exclusion in an
+    inclusion projection) or ``Location31253`` (inclusion in an exclusion
+    projection), naming the offending field. Mirrors the Rust server's
+    `projection_mix_error`; drivers' projection-error tests assert both the code
+    and the exact wording. An ``$elemMatch`` field counts as inclusion (as before);
+    an all-inclusion or empty spec is inclusion mode."""
+    mode: bool | None = None
+    for field, v in spec.items():
+        incl = True if _is_elem_match_spec(v) else bool(v)
+        if mode is None:
+            mode = incl
+        elif mode != incl:
+            if mode:
+                raise ProjectionError(
+                    f"Cannot do exclusion on field {field} in inclusion projection",
+                    code=31254,
+                    code_name="Location31254",
+                )
+            raise ProjectionError(
+                f"Cannot do inclusion on field {field} in exclusion projection",
+                code=31253,
+                code_name="Location31253",
+            )
+    return True if mode is None else mode

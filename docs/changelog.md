@@ -19,6 +19,25 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Projection inclusion/exclusion mix reports mongod's specific error code
+
+Mixing an inclusion and an exclusion in the same `find()` projection (e.g.
+`{a: 1, b: 0}`) now fails with mongod's *specific* per-field error instead of a
+generic `TypeMismatch`. An exclusion inside an inclusion projection returns
+`Location31254` ("Cannot do exclusion on field b in inclusion projection"); an
+inclusion inside an exclusion projection returns `Location31253` ("Cannot do
+inclusion on field b in exclusion projection"). The offending field is named in
+the message, matching real mongod and the Rust server (which already emitted
+these codes). Drivers' projection-error tests assert both the code and the exact
+wording, so this closes a pymongo-gauge fidelity gap.
+
+#### Fixed
+
+- `projection.py`: `_detect_inclusion` validates field-by-field in order and
+  raises `ProjectionError` with `code`/`code_name` pinned to `31254`/`31253`
+  (the offending field named); `ProjectionError` gained a `code`/`code_name`
+  constructor so the dispatch layer surfaces the specific code instead of `14`.
+
 ### The standalone Rust server now honours every Python-server CLI flag
 
 The pure-Rust `secantusdb` binary — the standalone server you run with
@@ -63,6 +82,24 @@ default WiredTiger cache is now `1G`, matching `python -m secantus`
 - The standalone `secantusdb` daemon defaults its WiredTiger cache to
   `1G` (matching the Python server) instead of the engine's `256M`
   default.
+### Projection inclusion/exclusion mix reports mongod's specific error code
+
+Mixing an inclusion and an exclusion in the same `find()` projection (e.g.
+`{a: 1, b: 0}`) now fails with mongod's *specific* per-field error instead of a
+generic `TypeMismatch`. An exclusion inside an inclusion projection returns
+`Location31254` ("Cannot do exclusion on field b in inclusion projection"); an
+inclusion inside an exclusion projection returns `Location31253` ("Cannot do
+inclusion on field b in exclusion projection"). The offending field is named in
+the message, matching real mongod and the Rust server (which already emitted
+these codes). Drivers' projection-error tests assert both the code and the exact
+wording, so this closes a pymongo-gauge fidelity gap.
+
+#### Fixed
+
+- `projection.py`: `_detect_inclusion` validates field-by-field in order and
+  raises `ProjectionError` with `code`/`code_name` pinned to `31254`/`31253`
+  (the offending field named); `ProjectionError` gained a `code`/`code_name`
+  constructor so the dispatch layer surfaces the specific code instead of `14`.
 
 ### PostgreSQL/SQL server: malformed messages get an error reply instead of a dropped connection
 
