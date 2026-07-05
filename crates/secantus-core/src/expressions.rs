@@ -216,7 +216,8 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$map" => op_map(arg, ctx),
         "$filter" => op_filter(arg, ctx),
         "$reduce" => op_reduce(arg, ctx),
-        // date component extractors (UTC; no timezone arg form)
+        // date component extractors — bare date expr or `{date, timezone}` object
+        // form (fixed-offset + named IANA zones via chrono-tz; instant→local)
         "$year" => date_part(arg, ctx, DatePart::Year),
         "$month" => date_part(arg, ctx, DatePart::Month),
         "$dayOfMonth" => date_part(arg, ctx, DatePart::Day),
@@ -1151,11 +1152,46 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (y + i64::from(m <= 2), m, d)
 }
 
+/// Resolve a date-extractor operand (`$year`/`$hour`/…) to epoch millis **already
+/// shifted into the requested timezone** (so a component read off it is local
+/// wall-clock), or `None` when the operand isn't a datetime (→ `Bson::Null`).
+///
+/// mongod accepts a bare date expression *or* a `{date, timezone}` object; the
+/// object form is a document with a `date` key that isn't itself an operator
+/// (`{$op: …}`). A `timezone` shifts the wall clock: fixed-offset (`±HH:MM` / `UTC`
+/// / `GMT`) is constant, a *named* IANA zone resolves its DST-correct offset at the
+/// instant via `chrono-tz` (the unambiguous instant→wall-clock direction, matching
+/// `$dateToString` and Python `zoneinfo`). An unknown zone / non-string timezone
+/// defers to Python.
+fn date_operand_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
+    if let Bson::Document(d) = arg {
+        let is_operator = d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$'));
+        if d.contains_key("date") && !is_operator {
+            let millis = match eval(d.get("date").unwrap(), ctx)? {
+                Bson::DateTime(dt) => dt.timestamp_millis(),
+                _ => return Ok(None), // non-datetime -> None (null)
+            };
+            let offset_ms = match d.get("timezone") {
+                None | Some(Bson::Null) => 0,
+                Some(Bson::String(s)) => match resolve_tz_offset(s) {
+                    Some(off_min) => off_min * 60_000,
+                    None => named_tz_offset_ms(s, millis).ok_or(Fallback)?,
+                },
+                Some(_) => return Err(Fallback), // Python raises "timezone must be a string"
+            };
+            return Ok(Some(millis + offset_ms));
+        }
+    }
+    match eval(arg, ctx)? {
+        Bson::DateTime(dt) => Ok(Some(dt.timestamp_millis())),
+        _ => Ok(None), // Python returns None for non-datetime
+    }
+}
+
 fn date_part(arg: &Bson, ctx: &Ctx, part: DatePart) -> R {
-    let Bson::DateTime(dt) = eval(arg, ctx)? else {
+    let Some(millis) = date_operand_millis(arg, ctx)? else {
         return Ok(Bson::Null); // Python returns None for non-datetime
     };
-    let millis = dt.timestamp_millis();
     let days = millis.div_euclid(86_400_000);
     let ms_of_day = millis.rem_euclid(86_400_000);
     let value = match part {
@@ -2812,6 +2848,50 @@ mod tests {
                 bson::bson!({"$dateToString": {"date": "$d", "format": "%H:%M", "timezone": "Europe/Dublin"}})
             ),
             Bson::String("17:30".into())
+        );
+    }
+
+    #[test]
+    fn date_extractors_timezone_object_form() {
+        // 2023-01-15T16:30Z is EST (-05:00) in New York → local hour 11, still the
+        // 15th. A bare date reads UTC (hour 16). Fixed-offset and named zones agree.
+        let winter = bson::DateTime::from_millis(1_673_800_200_000);
+        let d = doc! {"d": winter};
+        assert_eq!(ev(d.clone(), bson::bson!({"$hour": "$d"})), Bson::Int32(16));
+        assert_eq!(
+            ev(
+                d.clone(),
+                bson::bson!({"$hour": {"date": "$d", "timezone": "America/New_York"}})
+            ),
+            Bson::Int32(11)
+        );
+        assert_eq!(
+            ev(
+                d.clone(),
+                bson::bson!({"$dayOfMonth": {"date": "$d", "timezone": "America/New_York"}})
+            ),
+            Bson::Int32(15)
+        );
+        assert_eq!(
+            ev(
+                d.clone(),
+                bson::bson!({"$hour": {"date": "$d", "timezone": "-05:00"}})
+            ),
+            Bson::Int32(11)
+        );
+        // No timezone in the object form reads UTC.
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$hour": {"date": "$d"}})),
+            Bson::Int32(16)
+        );
+        // Summer: New York is EDT (-04:00) → hour 12 from 16:30Z.
+        let summer = bson::DateTime::from_millis(1_689_438_600_000);
+        assert_eq!(
+            ev(
+                doc! {"d": summer},
+                bson::bson!({"$hour": {"date": "$d", "timezone": "America/New_York"}})
+            ),
+            Bson::Int32(12)
         );
     }
 

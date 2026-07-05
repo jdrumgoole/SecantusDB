@@ -1298,20 +1298,24 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `$dateFromString` `format` directives *outside* the numeric subset
   (`%z`/`%Z`/`%a`/`%b`/`%p`/… — need locale/text/offset handling), a `%j` combined
   with `%m`/`%d`, and any input Python would reject; `$dateToString` `%z`/`%Z`/
-  ISO-week/locale directives; and the *named-timezone `{date, timezone}` object
-  form* of the date component extractors (`$year`/`$month`/`$hour`/…) and
-  `$dateToParts` / `$dateTrunc` / `$dateDiff` — these are all instant→local
-  (unambiguous), so they're a natural follow-on to the `$dateToString` work using
-  the same `chrono-tz` resolver. **Now native on the Rust server:** fixed-offset /
+  ISO-week/locale directives; and the `timezone` form of `$dateToParts` /
+  `$dateTrunc` / `$dateDiff` — these are all instant→local (unambiguous), so they're
+  a natural follow-on to the extractor work below using the same `chrono-tz`
+  resolver, and are a gap in **both** servers today (each ignores `timezone` on
+  these three). **Now native on the Rust server:** fixed-offset /
   `UTC` / `GMT` timezones on both ops (0.5.3-beta.116); `$dateFromString`
   `format` (strptime) for the numeric-directive subset `%Y`/`%y`/`%m`/`%d`/`%H`/
   `%M`/`%S`/`%j`/`%%` + literals + whitespace (0.5.3-beta.117, regex built from
-  CPython `_strptime` fragments); and **named IANA `timezone` zones on
+  CPython `_strptime` fragments); **named IANA `timezone` zones on
   `$dateToString`** (0.5.3-beta.131, via `chrono-tz` — DST-correct instant→
   wall-clock, matching Python `zoneinfo`; parity corpus curated to post-2007 dates
-  in decade-stable major zones to avoid tzdb release skew). Fractional seconds stay
-  deferred (BSON is millisecond-only). The Python server already supports all of
-  these.
+  in decade-stable major zones to avoid tzdb release skew); and the
+  **`{date, timezone}` object form of the seven date component extractors**
+  (`$year`/`$month`/`$dayOfMonth`/`$dayOfWeek`/`$hour`/`$minute`/`$second`) —
+  fixed-offset + named IANA zones, on **both** servers (0.5.3-beta.133 / 0.5.4b161;
+  previously both ignored `timezone` here and returned null for the object form).
+  Fractional seconds stay deferred (BSON is millisecond-only). The Python server
+  already supports the remaining `$dateFromString`/`$dateToString` directive edges.
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/

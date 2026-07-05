@@ -19,6 +19,31 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Date component extractors honour a `timezone` (both servers)
+
+The date component operators — `$year`, `$month`, `$dayOfMonth`, `$dayOfWeek`,
+`$hour`, `$minute`, `$second` — now accept mongod's `{date: <expr>, timezone:
+<expr>}` object form, reading the component off the wall clock in the requested
+zone rather than always in UTC. `{$hour: {date: "$d", timezone:
+"America/New_York"}}` on a `16:30Z` instant returns `11` in winter (EST) and `12`
+in summer (EDT); a shift that crosses midnight moves `$dayOfMonth` too. Both
+fixed-offset zones (`+05:30`, `UTC`) and named IANA zones resolve, and a bare date
+expression still reads UTC as before.
+
+This closes a conformance gap that was present in **both** servers — previously
+each ignored `timezone` on these operators and a `{date, timezone}` argument
+silently returned null. The Rust server resolves named zones via the same
+`chrono-tz` path as `$dateToString` (the unambiguous instant→wall-clock direction,
+matching Python `zoneinfo`); an unknown zone name defers to the Python oracle.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: a shared date-operand resolver
+  (`_date_operand` / `date_operand_millis`) that both the bare-date and
+  `{date, timezone}` object forms of the seven date component extractors route
+  through, shifting the instant into the requested zone before the component is
+  read. Fixed-offset and named IANA zones both supported on both servers.
+
 ### Rust server: `$dateToString` now formats dates in named IANA timezones
 
 The Rust server can now render `$dateToString` in a named IANA timezone —

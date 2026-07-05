@@ -593,6 +593,29 @@ def test_aggregate_project_with_computed_field(coll) -> None:
     assert out == [{"sum": 7}]
 
 
+def test_aggregate_date_extractor_timezone(coll) -> None:
+    # 2023-01-15T16:30Z: UTC hour 16; America/New_York is EST (-05:00) -> hour 11,
+    # still the 15th. The {date, timezone} object form is mongod's timezone-aware
+    # extractor spec; a bare "$d" reads UTC.
+    coll.insert_one({"_id": 1, "d": dt.datetime(2023, 1, 15, 16, 30, tzinfo=dt.timezone.utc)})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "utc_hour": {"$hour": "$d"},
+                        "ny_hour": {"$hour": {"date": "$d", "timezone": "America/New_York"}},
+                        "ny_day": {"$dayOfMonth": {"date": "$d", "timezone": "America/New_York"}},
+                        "off_hour": {"$hour": {"date": "$d", "timezone": "+05:30"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"utc_hour": 16, "ny_hour": 11, "ny_day": 15, "off_hour": 22}]
+
+
 def test_aggregate_unwind_stage(coll) -> None:
     coll.insert_one({"_id": 1, "tags": ["a", "b", "c"]})
     out = list(coll.aggregate([{"$unwind": "$tags"}]))

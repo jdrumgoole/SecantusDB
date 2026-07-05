@@ -204,6 +204,31 @@ CURATED = [
     ({"$hour": "$d"}, {"d": _DT}),
     ({"$dayOfWeek": "$d"}, {"d": _DT}),
     ({"$year": "$d"}, {"d": "not a date"}),  # non-date -> null
+    # Date extractors — {date, timezone} object form. Instant->wall-clock is
+    # unambiguous, so fixed-offset and named IANA zones (via chrono-tz) both match
+    # Python zoneinfo. Corpus curated to post-2007 dates in decade-stable zones.
+    ({"$hour": {"date": "$d"}}, {"d": _DT}),  # no tz -> UTC
+    ({"$hour": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),  # fixed offset
+    (
+        {"$hour": {"date": "$d", "timezone": "America/New_York"}},
+        {"d": datetime.datetime(2023, 1, 15, 16, 30, tzinfo=datetime.timezone.utc)},  # winter EST
+    ),
+    (
+        {"$dayOfMonth": {"date": "$d", "timezone": "America/New_York"}},
+        # 02:30Z on the 15th is 21:30 EST on the 14th — the tz shift crosses midnight.
+        {"d": datetime.datetime(2023, 1, 15, 2, 30, tzinfo=datetime.timezone.utc)},
+    ),
+    (
+        {"$hour": {"date": "$d", "timezone": "Asia/Tokyo"}},
+        {"d": _DT},  # JST +09:00
+    ),
+    (
+        {"$dayOfWeek": {"date": "$d", "timezone": "Australia/Sydney"}},
+        {"d": _DT},
+    ),
+    ({"$year": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),
+    ({"$hour": {"date": "$x", "timezone": "UTC"}}, {}),  # missing date -> null
+    ({"$hour": {"date": "$d", "timezone": "Not/AZone"}}, {"d": _DT}),  # unknown -> defer
     # Type conversions (safe subset).
     ({"$toInt": 3.9}, {}),
     ({"$toInt": "$n"}, {"n": -3.9}),

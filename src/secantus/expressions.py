@@ -1115,38 +1115,68 @@ def _ensure_datetime(value: Any) -> _dt.datetime | None:
     return None
 
 
+def _date_operand(arg: Any, ctx: _Ctx) -> _dt.datetime | None:
+    """Resolve a date-extractor operand (`$year`/`$hour`/…) to a `datetime` or
+    `None`. mongod accepts two forms:
+
+      * a bare date expression (`"$field"`, `{$dateFromParts: …}`, …), or
+      * a `{date: <expr>, timezone: <expr>}` object that shifts the instant into a
+        timezone before the component is read.
+
+    The object form is detected as a document carrying a ``date`` key that is not
+    itself an operator expression (`{$op: …}`). A `timezone` (fixed-offset or named
+    IANA zone) re-expresses the instant in that zone (naive input treated as UTC,
+    matching BSON Date semantics) so the returned `datetime`'s wall-clock fields are
+    local — exactly like `$dateToString`'s `timezone`. Absent/`None` timezone leaves
+    the instant in UTC."""
+    if (
+        isinstance(arg, Mapping)
+        and "date" in arg
+        and not (len(arg) == 1 and next(iter(arg)).startswith("$"))
+    ):
+        d = _ensure_datetime(_eval(arg["date"], ctx))
+        if d is None:
+            return None
+        tz = _resolve_timezone(arg.get("timezone"))
+        if tz is not None:
+            d_aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
+            d = d_aware.astimezone(tz)
+        return d
+    return _ensure_datetime(_eval(arg, ctx))
+
+
 def _op_year(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.year if d is not None else None
 
 
 def _op_month(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.month if d is not None else None
 
 
 def _op_day_of_month(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.day if d is not None else None
 
 
 def _op_day_of_week(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return (d.isoweekday() % 7) + 1 if d is not None else None
 
 
 def _op_hour(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.hour if d is not None else None
 
 
 def _op_minute(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.minute if d is not None else None
 
 
 def _op_second(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.second if d is not None else None
 
 
