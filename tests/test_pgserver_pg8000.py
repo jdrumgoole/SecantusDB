@@ -1510,6 +1510,31 @@ def test_bytea_type_via_driver(server):
     conn.close()
 
 
+def test_hstore_type_via_driver(server):
+    # hstore columns, the -> lookup / @> containment / ? key-exists operators over
+    # the real wire (rendered as canonical hstore text).
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE items (id int primary key, attrs hstore)")
+    cur.execute("INSERT INTO items VALUES (1, 'color=>red, size=>big')")
+    cur.execute("INSERT INTO items VALUES (2, 'color=>blue, size=>small')")
+
+    # -> lookup returns text.
+    cur.execute("SELECT attrs -> 'color' FROM items WHERE id = 1")
+    assert cur.fetchone()[0] == "red"
+
+    # @> containment (per-row) and ? key-exists.
+    cur.execute("SELECT id FROM items WHERE attrs @> 'color=>blue'")
+    assert [r[0] for r in cur.fetchall()] == [2]
+    cur.execute("SELECT id FROM items WHERE attrs ? 'size' ORDER BY id")
+    assert [r[0] for r in cur.fetchall()] == [1, 2]
+
+    # akeys returns a text array.
+    cur.execute("SELECT akeys('a=>1,b=>2'::hstore)")
+    assert sorted(cur.fetchone()[0]) == ["a", "b"]
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

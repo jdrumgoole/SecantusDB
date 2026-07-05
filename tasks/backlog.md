@@ -1705,6 +1705,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   Tests: `tests/test_sql_bytea.py` (27: pure bytea + SQL surface) plus a pg8000 wire test. **Out of scope:** the
   `bytea_output = escape` server setting (output is always hex) and the digest functions (`md5`/`sha256`, crypto
   extensions).
+- [ ] **hstore key/value type landed** (b153): the `hstore` contrib type — a flat string→string map (NULL values
+  allowed), stored as a **tagged** subdocument `{"hstore": {…}}` so it stays distinct from a plain `jsonb` object
+  (the `->` / `@>` / `<@` / `?` / `?&` / `?|` / `||` operators are all spelled the same as jsonb's). New
+  self-contained `secantus/sql/hstore.py` (`parse` / `render` / `is_hstore` / `as_map`; the operators
+  `contains` / `contained_by` / `exists` / `exists_all` / `exists_any` / `lookup` / `merge` / `delete` / `defined`;
+  `akeys` / `avals` / `to_json` / `from_pair` / `from_arrays`). Wired through `typemap` (placeholder OID 16935 —
+  **deliberately not in PG_TYPENAME** so `to_regtype('hstore')` stays NULL and SQLAlchemy's psycopg connect-probe is
+  a no-op; `HSTORE` in `_DATATYPE_TAGS`; `coerce` → `hstore.parse`; `to_pg_text` → `hstore.render`), `scalar`
+  (`_eval_cast` hstore branch; `_eval_hstore_op` for `@>`/`<@` and `_eval_hstore_exists` for `?`/`?&`/`?|`
+  disambiguated on the hstore tag, chained after the geo check; hstore lookup in `_eval_jsonb_nav` for `->`; hstore
+  merge in the `DPipe` handler; the functions in `_call_func`), `functions` (hstore function names in
+  `_SCALAR_EVAL_ANON`), and `planner` (`_infer_scalar_tag` hstore-op typing via `_has_hstore_operand`;
+  `where_needs_per_row` + `_where_has_hstore_predicate` routing `@>`/`<@`/`?`/`?&`/`?|` per-row; **`_field` maps an
+  `hstore -> key` to the dotted `<col>.hstore.<key>` path so the `->` lookup pushes down** as a plain projection /
+  filter). Tests: `tests/test_sql_hstore.py` (25: pure hstore + SQL surface) plus a pg8000 wire test. **Out of
+  scope:** the set-returning `each`/`skeys`/`svals` forms (the `akeys`/`avals` arrays cover the need), GiST/GIN
+  indexing, and the `#=`/`%%`/`%#` record operators.
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

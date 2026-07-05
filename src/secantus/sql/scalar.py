@@ -102,6 +102,15 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         geo_result = _eval_geo_op(node, scope, ctx)
         if geo_result is not _NOT_GEO:
             return geo_result
+        hstore_result = _eval_hstore_op(node, scope, ctx)
+        if hstore_result is not _NOT_HSTORE:
+            return hstore_result
+    if isinstance(
+        node, (exp.JSONBContains, exp.JSONBContainsAllTopKeys, exp.JSONBContainsAnyTopKeys)
+    ):
+        hstore_result = _eval_hstore_exists(node, scope, ctx)
+        if hstore_result is not _NOT_HSTORE:
+            return hstore_result
     if getattr(exp, "Distance", None) is not None and isinstance(node, exp.Distance):
         from secantus.sql import pggeo as _pggeo
 
@@ -203,6 +212,11 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         # ``bytea || bytea`` concatenates the raw bytes; anything else is text.
         if isinstance(left, (bytes, bytearray)) and isinstance(right, (bytes, bytearray)):
             return bytes(left) + bytes(right)
+        # ``hstore || hstore`` merges (right wins).
+        from secantus.sql import hstore as _hstore
+
+        if _hstore.is_hstore(left) or _hstore.is_hstore(right):
+            return _hstore.merge(_hstore.parse(left), _hstore.parse(right))
         return _as_text(left) + _as_text(right)
     if isinstance(node, exp.Bracket):
         return _eval_bracket(node, scope, ctx)
@@ -1145,6 +1159,10 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import bytea as _bytea
 
         return _bytea.parse(value)
+    if value is not None and to_tag_early == "hstore":
+        from secantus.sql import hstore as _hstore
+
+        return _hstore.parse(value)
     if value is not None and to_tag_early in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes
 
@@ -1477,6 +1495,35 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
 
         v = args[0] if args else None
         return None if v is None or args[1] is None else _bitstr.get_bit(str(v), int(args[1]))
+    if name in (
+        "hstore",
+        "akeys",
+        "avals",
+        "hstore_to_json",
+        "hstore_to_jsonb",
+        "delete",
+        "defined",
+    ):
+        from secantus.sql import hstore as _hstore
+
+        if name == "hstore":
+            if len(args) == 2 and isinstance(args[0], (list, tuple)):
+                return _hstore.from_arrays(args[0], args[1])
+            if len(args) == 2:
+                return _hstore.from_pair(args[0], args[1])
+        v = args[0] if args else None
+        if v is None:
+            return None
+        if name == "akeys":
+            return _hstore.akeys(v)
+        if name == "avals":
+            return _hstore.avals(v)
+        if name in ("hstore_to_json", "hstore_to_jsonb"):
+            return _hstore.to_json(v)
+        if name == "delete":
+            return _hstore.delete(v, args[1])
+        if name == "defined":
+            return _hstore.defined(v, args[1])
     if name in ("gen_random_uuid", "uuid_generate_v4", "uuid_generate_v1"):
         from secantus.sql import uuidtype as _uuidtype
 
@@ -1553,7 +1600,14 @@ def _eval_jsonb_nav(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> A
     from secantus.sql.planner import _json_keys
 
     val = evaluate(node.this, scope, ctx)
-    for key in _json_keys(node.expression):
+    keys = _json_keys(node.expression)
+    # ``hstore -> key`` is a flat string lookup (returns text / NULL), not a JSON
+    # descent — disambiguated on the hstore tag.
+    from secantus.sql import hstore as _hstore
+
+    if _hstore.is_hstore(val):
+        return _hstore.lookup(val, keys[0]) if keys else None
+    for key in keys:
         if isinstance(val, dict):
             val = val.get(key)
         elif isinstance(val, list):
@@ -1677,6 +1731,47 @@ _NOT_FTS = object()
 _NOT_NET = object()
 _NOT_BIT = object()
 _NOT_GEO = object()
+_NOT_HSTORE = object()
+
+
+def _eval_hstore_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``@>`` (contains) / ``<@`` (contained by) on hstore operands. Returns
+    ``_NOT_HSTORE`` when neither operand is an hstore so the caller can fall back to
+    the range / geo / jsonb handling of the same operator."""
+    from secantus.sql import hstore as _hstore
+
+    left = evaluate(node.this, scope, ctx)
+    right = evaluate(node.expression, scope, ctx)
+    if not (_hstore.is_hstore(left) or _hstore.is_hstore(right)):
+        return _NOT_HSTORE
+    if left is None or right is None:
+        return None
+    # The non-hstore side of @>/<@ is a text literal hstore (``'a=>1'``) — parse it.
+    left = _hstore.parse(left) if isinstance(left, str) else left
+    right = _hstore.parse(right) if isinstance(right, str) else right
+    if isinstance(node, exp.ArrayContainsAll):  # a @> b
+        return _hstore.contains(left, right)
+    return _hstore.contained_by(left, right)  # a <@ b
+
+
+def _eval_hstore_exists(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``?`` (key exists) / ``?&`` (all keys) / ``?|`` (any keys) on an hstore.
+    Returns ``_NOT_HSTORE`` when the left operand is not an hstore (so jsonb's own
+    key-exists handling applies)."""
+    from secantus.sql import hstore as _hstore
+
+    left = evaluate(node.this, scope, ctx)
+    if not _hstore.is_hstore(left):
+        return _NOT_HSTORE
+    right = evaluate(node.expression, scope, ctx)
+    if right is None:
+        return None
+    if isinstance(node, exp.JSONBContains):  # ? single key
+        return _hstore.exists(left, right)
+    keys = right if isinstance(right, (list, tuple)) else [right]
+    if isinstance(node, exp.JSONBContainsAllTopKeys):  # ?&
+        return _hstore.exists_all(left, keys)
+    return _hstore.exists_any(left, keys)  # ?|
 
 
 def _eval_geo_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:

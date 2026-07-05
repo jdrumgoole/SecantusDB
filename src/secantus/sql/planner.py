@@ -591,8 +591,13 @@ def _field(node: exp.Expression, resolve: Resolve) -> tuple[str, str]:
     if isinstance(node, exp.Column):
         return resolve(node)
     if isinstance(node, _JSONB_CLASSES):
-        base_path, _ = _field(node.this, resolve)
+        base_path, base_tag = _field(node.this, resolve)
         keys = _json_keys(node.expression)
+        # ``hstore -> key`` is a flat text lookup: the value lives one level below
+        # the ``hstore`` tag wrapper (``{"hstore": {...}}``), and the result is text.
+        if base_tag == "hstore":
+            path = base_path + ".hstore" + ("." + ".".join(keys) if keys else "")
+            return path, "text"
         path = base_path + ("." + ".".join(keys) if keys else "")
         return path, ("text" if isinstance(node, _JSONB_SCALAR) else "json")
     walked = _composite_walk(node, resolve)
@@ -1930,6 +1935,8 @@ def where_needs_per_row(stmt: exp.Select, table: TableDef | None = None) -> bool
         return True
     if table is not None and _where_has_geo_predicate(node, table):
         return True
+    if table is not None and _where_has_hstore_predicate(node, table):
+        return True
     # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
     if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
         return True
@@ -2000,6 +2007,30 @@ def _where_has_geo_predicate(node: exp.Expression, table: TableDef) -> bool:
         if _is_geo_operand(op.this, table) or _is_geo_operand(op.expression, table):
             return True
     return False
+
+
+def _is_hstore_operand(operand: exp.Expression, table: TableDef) -> bool:
+    """Whether ``operand`` resolves to an hstore — an hstore-typed column or a cast
+    to ``hstore``."""
+    if isinstance(operand, exp.Column):
+        col = table.column(_column_name(operand))
+        return col is not None and col.type_tag == "hstore"
+    if isinstance(operand, exp.Cast) and operand.to is not None:
+        return typemap.type_tag_for_sql(operand.to) == "hstore"
+    return False
+
+
+def _where_has_hstore_predicate(node: exp.Expression, table: TableDef) -> bool:
+    """True if ``node`` has an hstore ``@>`` / ``<@`` containment or a ``?`` / ``?&``
+    / ``?|`` key-exists op over an hstore column / cast — those don't lower to a
+    Mongo filter and need per-row evaluation. (A ``->`` lookup *does* push down: it
+    resolves to the dotted ``<col>.hstore.<key>`` field path in ``_field``.)"""
+    contain_ops = (exp.ArrayContainsAll, exp.ArrayContainedBy)
+    exists_ops = (exp.JSONBContains, exp.JSONBContainsAllTopKeys, exp.JSONBContainsAnyTopKeys)
+    for op in node.find_all(*contain_ops):
+        if _is_hstore_operand(op.this, table) or _is_hstore_operand(op.expression, table):
+            return True
+    return any(_is_hstore_operand(op.this, table) for op in node.find_all(*exists_ops))
 
 
 def _where_has_range_predicate(node: exp.Expression, table: TableDef) -> bool:
@@ -4625,6 +4656,29 @@ def _has_bytea_operand(node: exp.Expression, resolve: Resolve) -> bool:
     return False
 
 
+def _has_hstore_operand(node: exp.Expression, resolve: Resolve) -> bool:
+    """Does an operand of ``node`` resolve to an hstore — an hstore-typed column, a
+    cast to ``hstore``, or an hstore-returning function (``hstore`` / ``delete``)?"""
+    for operand in (node.this, node.expression):
+        if isinstance(operand, exp.Paren):
+            operand = operand.this
+        if (
+            isinstance(operand, exp.Cast)
+            and operand.to is not None
+            and typemap.type_tag_for_sql(operand.to) == "hstore"
+        ):
+            return True
+        if isinstance(operand, exp.Anonymous) and str(operand.this).lower() in ("hstore", "delete"):
+            return True
+        if isinstance(operand, exp.Column):
+            try:
+                if resolve(operand)[1] == "hstore":
+                    return True
+            except errors.SQLError:
+                pass
+    return False
+
+
 def _date_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
     """Result tag of a date / time ``Add`` / ``Sub``: ``date - date -> int4``,
     ``date ± int -> date``, ``date ± interval -> timestamptz``, and
@@ -4763,6 +4817,23 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         node, (exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps)
     ) and _has_geo_operand(node, resolve):
         return "bool"
+    # hstore operators: ``@>`` / ``<@`` containment and ``?`` / ``?&`` / ``?|``
+    # key-exists over an hstore operand -> bool; ``->`` lookup -> text; ``||``
+    # merge -> hstore.
+    if isinstance(node, (exp.ArrayContainsAll, exp.ArrayContainedBy)) and _has_hstore_operand(
+        node, resolve
+    ):
+        return "bool"
+    if isinstance(
+        node, (exp.JSONBContains, exp.JSONBContainsAllTopKeys, exp.JSONBContainsAnyTopKeys)
+    ) and _has_hstore_operand(node, resolve):
+        return "bool"
+    if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)) and _has_hstore_operand(
+        node, resolve
+    ):
+        return "text"
+    if isinstance(node, exp.DPipe) and _has_hstore_operand(node, resolve):
+        return "hstore"
     # Network operators: ``<<`` / ``>>`` (subnet containment) and ``&&`` (overlap)
     # over a net operand -> bool. ``exp.Host`` (the ``host()`` function) -> text.
     if isinstance(
@@ -4836,6 +4907,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
                 "timetz",
                 "money",
                 "bytea",
+                "hstore",
             )
             or _mapped in typemap._GEO_TAGS
         ):
@@ -5058,6 +5130,16 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "int4"
         if fname == "set_byte":
             return "bytea"
+        # hstore functions: akeys/avals -> text[]; hstore_to_json -> json;
+        # hstore/delete -> hstore; defined -> bool.
+        if fname in ("akeys", "avals"):
+            return "text[]"
+        if fname in ("hstore_to_json", "hstore_to_jsonb"):
+            return "json"
+        if fname in ("hstore", "delete"):
+            return "hstore"
+        if fname == "defined":
+            return "bool"
         # Interval functions.
         if fname in ("make_interval", "justify_days", "justify_hours", "justify_interval", "age"):
             return "interval"

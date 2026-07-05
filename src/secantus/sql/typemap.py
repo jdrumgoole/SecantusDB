@@ -82,6 +82,12 @@ PG_OID: dict[str, int] = {
     "polygon": 604,
     "line": 628,
     "circle": 718,
+    # hstore (contrib extension). No fixed catalog OID — extension-assigned — so we
+    # use a stable placeholder; drivers treat an unknown OID as text, which is what
+    # the canonical hstore text form renders as. Deliberately NOT added to
+    # PG_TYPENAME, so ``to_regtype('hstore')`` stays NULL and SQLAlchemy's psycopg
+    # connect-time hstore probe is a no-op (it must not register a fictional type).
+    "hstore": 16935,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -135,6 +141,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "interval": "interval",
     "uuid": "uuid",
     "money": "money",
+    "hstore": "hstore",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -201,6 +208,7 @@ _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.UUID: "uuid",
     exp.DataType.Type.MONEY: "money",
     exp.DataType.Type.POINT: "point",
+    exp.DataType.Type.HSTORE: "hstore",
 }
 
 
@@ -376,6 +384,10 @@ def coerce(value: Any, tag: str) -> Any:
         from secantus.sql import pggeo as _pggeo
 
         return _pggeo.canonical(value, tag)
+    if tag == "hstore":
+        from secantus.sql import hstore as _hstore
+
+        return _hstore.parse(value)
     if tag == "int4":
         return int(value)
     if tag == "int8":
@@ -462,6 +474,10 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         from secantus.sql import numformat as _numformat
 
         return _numformat.render_money(value).encode("utf-8")
+    if tag == "hstore" and isinstance(value, dict):
+        from secantus.sql import hstore as _hstore
+
+        return _hstore.render(value).encode("utf-8")
     if tag == "interval" and isinstance(value, dict) and "interval" in value:
         from secantus.sql import intervals as _intervals
 
