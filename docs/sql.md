@@ -2057,6 +2057,49 @@ Expression indexes (`CREATE INDEX … ((a + b))`) are **not** supported — the
 storage layer indexes stored fields, not computed values. Add a
 `GENERATED ALWAYS AS (…) STORED` column and index that instead.
 
+### `EXPLAIN`
+
+`EXPLAIN <statement>` returns a `QUERY PLAN` text column describing how the query
+runs. Because SecantusDB executes SQL against the Mongo storage, the plan mirrors
+the storage's own routing decision — a query that lands on a covering index shows
+an **Index Scan**, everything else a **Seq Scan**:
+
+```sql
+EXPLAIN SELECT * FROM users WHERE age = 30;
+--                       QUERY PLAN
+-- ----------------------------------------------------------
+--  Seq Scan on users  (cost=0.00..0.00 rows=100 width=0)
+--    Filter: (age = 30)
+
+CREATE INDEX ix_age ON users (age);
+EXPLAIN SELECT * FROM users WHERE age = 30;
+--  Index Scan using ix_age on users  (cost=0.00..0.00 rows=100 width=0)
+--    Index Cond: (age = 30)
+```
+
+The Index Scan / Seq Scan call is the authoritative one from the same planner
+`find_matching` uses, so `EXPLAIN` never claims an index the real query wouldn't
+touch. `UPDATE` / `DELETE` show a modify node over the scan; `INSERT` an *Insert*
+node; JOIN / GROUP BY / aggregate queries a coarser node tree (the top operation
+over the base-collection scans, since Mongo runs them as an aggregation pipeline).
+
+Options:
+
+```sql
+EXPLAIN ANALYZE SELECT ...;              -- runs the statement, reports actual rows
+EXPLAIN (FORMAT JSON) SELECT ...;        -- Postgres' JSON plan shape
+EXPLAIN (ANALYZE, VERBOSE) SELECT ...;   -- parenthesised option list
+```
+
+`ANALYZE` actually executes the statement (as Postgres does — an `EXPLAIN ANALYZE`
+of a write performs the write) and annotates the top node with `actual rows`.
+`FORMAT JSON` / `FORMAT TEXT` are supported; other formats raise `0A000`.
+
+**Simplifications:** cost figures are placeholders (`cost=0.00..0.00`) — there is
+no statistics engine; `ANALYZE` reports actual rows but no per-node timing; and
+pipeline-query plans name the top operation coarsely rather than reproducing
+Postgres' full plan-node tree.
+
 ## Transactions
 
 `BEGIN` / `COMMIT` / `ROLLBACK` open a real storage transaction: statements in
@@ -2430,7 +2473,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), composite / range `CREATE TYPE`, `ALTER TYPE … ADD VALUE` |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
-| Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows |
+| Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors), `EXPLAIN [ANALYZE]` (`FORMAT TEXT`/`JSON`, faithful Index/Seq Scan) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows, per-node `EXPLAIN` costs / timing |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format, `COPY … FROM/TO STDIN/STDOUT` (text + CSV) | binary-format `COPY`, `COPY` from/to a server-side file |
 | Auth | trust, SCRAM-SHA-256, TLS, SQL `CREATE`/`ALTER`/`DROP ROLE`/`USER` (reflected via `pg_roles`), `GRANT`/`REVOKE` (accepted) | channel binding, mTLS, enforced privileges, SQL roles wired to SCRAM login |
 | Catalog | `information_schema`, `pg_catalog` (`pg_index`/`pg_constraint`/`pg_am`/...), catalog *joins*, full SQLAlchemy reflection (`get_table_names`/`has_table`/`get_columns`/`get_pk_constraint`/`get_indexes`/`get_foreign_keys`, `Table(autoload_with=...)`, `get_foreign_keys`, `get_table_comment` + column comments) | `get_check_constraints`, `get_unique_constraints` |

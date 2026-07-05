@@ -1764,6 +1764,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
   functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
   out of scope.
+- [ ] **EXPLAIN for the SQL layer landed** (b158): `EXPLAIN [ANALYZE] [(options)] <statement>` returns a `QUERY
+  PLAN` text column. New `secantus/sql/explain.py`: `parse_options` splits the tail (both the bare `EXPLAIN ANALYZE
+  VERBOSE <stmt>` word form and the parenthesised `(ANALYZE, FORMAT JSON)` form); `_build_node` walks the parsed
+  statement into a plan-node dict; `_text_lines` / `_json_node` render the indented tree or Postgres' single-row
+  JSON plan. The scan node's Index Scan vs Seq Scan call is the **authoritative** one from `Storage.explain_plan`
+  (the same router `find_matching` uses; a `list_indexes` leading-field heuristic is the fallback for storages
+  without `explain_plan`, e.g. the test double), so EXPLAIN never claims an index the real query wouldn't use.
+  Single-relation SELECT/UPDATE/DELETE get a faithful scan node with `Index Cond:` / `Filter:`; INSERT an *Insert*
+  node; JOIN/GROUP BY/aggregate queries a coarse top node over the base-collection Seq Scan. `ANALYZE` runs the
+  statement via a `run_stmt` callback (avoids a circular import back to `engine`; an `EXPLAIN ANALYZE` of a write
+  performs the write, as Postgres does) and annotates the top node with `actual rows`. sqlglot falls back to a
+  `Command` (verb EXPLAIN, tail as a string Literal). Tests: `tests/test_sql_explain.py` (19) + a pg8000 wire test.
+  **Simplifications:** cost figures are placeholders (`cost=0.00..0.00` — no statistics engine); `ANALYZE` reports
+  actual rows but no per-node timing; `BUFFERS`/`SETTINGS`/`COSTS`/`TIMING` accepted-and-ignored; only `FORMAT
+  TEXT`/`JSON` (others → `0A000`); pipeline-query plans name the top operation coarsely rather than reproducing
+  Postgres' full plan-node tree.
 - [ ] **PREPARE / EXECUTE / DEALLOCATE landed** (b157): SQL-level prepared statements on the session. `PREPARE name
   [(argtypes)] AS <query>` parses the query (with its `$N` placeholders) and stashes `(query_ast, param_count)` on
   the new `Session.prepared` dict; `EXECUTE name [(args)]` parses the args (`SELECT <args>` wrapper → expression
