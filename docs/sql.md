@@ -648,6 +648,41 @@ casts pad); a stored bit column can't be re-read as an integer with `::int`
 (only a `B'…'` literal or a `::bit` cast is treated as a bit source); and bit
 indexes are out of scope.
 
+### Interval type (`interval`)
+
+`interval` columns store a `{months, days, micros}` value and render in the
+Postgres output style. Interval literals, arithmetic, and the standard functions
+all work:
+
+```sql
+SELECT interval '1 year 2 months 3 days';     -- 1 year 2 mons 3 days
+SELECT interval '90 minutes';                 -- 01:30:00
+
+SELECT interval '1 day' + interval '2 hours'; -- 1 day 02:00:00
+SELECT interval '1 hour' * 3;                 -- 03:00:00
+SELECT - interval '1 day';                    -- -1 day
+
+-- date/time arithmetic
+SELECT timestamp '2020-01-31' + interval '1 month';        -- 2020-02-29 00:00:00
+SELECT timestamp '2020-03-15' - timestamp '2020-01-01';    -- 74 days  (an interval)
+
+-- functions
+SELECT make_interval(1, 2, 0, 3, 4, 5, 6);    -- 1 year 2 mons 3 days 04:05:06
+SELECT justify_hours(interval '25 hours');    -- 1 day 01:00:00
+SELECT justify_days(interval '35 days');      -- 1 mon 5 days
+SELECT age(timestamp '2021-03-15', timestamp '2020-01-20');  -- 1 year 1 mon 23 days
+SELECT extract(day from interval '3 days 4 hours');          -- 3
+```
+
+`months`, `days`, and `micros` stay independent (a month is not a fixed number
+of days), so `interval '1 month'` added to Jan 31 clamps to Feb 29 in a leap
+year. `justify_hours` / `justify_days` / `justify_interval` roll the
+fixed-duration parts up into larger units.
+
+Simplifications vs real Postgres: days are treated as 24 hours (no DST-aware
+arithmetic), the `@` / verbose input grammar beyond a trailing `ago` isn't
+parsed, and interval indexes are out of scope.
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

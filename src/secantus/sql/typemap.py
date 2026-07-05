@@ -64,6 +64,8 @@ PG_OID: dict[str, int] = {
     # Bit-string types (rendered as a '0'/'1' string).
     "bit": 1560,
     "varbit": 1562,
+    # Interval type (rendered as the Postgres interval text form).
+    "interval": 1186,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -108,6 +110,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "composite": "record",
     "bit": "bit",
     "varbit": "bit varying",
+    "interval": "interval",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -128,6 +131,7 @@ PG_TYPENAME: dict[str, str] = {
     "composite": "record",
     "bit": "bit",
     "varbit": "varbit",
+    "interval": "interval",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -161,6 +165,7 @@ _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.BINARY: "bytea",
     exp.DataType.Type.VARBINARY: "bytea",
     exp.DataType.Type.BIT: "bit",
+    exp.DataType.Type.INTERVAL: "interval",
 }
 
 
@@ -203,6 +208,8 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return "varbit"
     if base in _BIT_TAGS:
         return base
+    if base == "interval" or base.startswith("interval "):
+        return "interval"
     return None
 
 
@@ -308,6 +315,10 @@ def coerce(value: Any, tag: str) -> Any:
         # ``::bit(n)`` cast pads/truncates in the scalar evaluator); validate and
         # canonicalise the '0'/'1' string.
         return _bitstr.normalize(value, varying=(tag == "varbit"))
+    if tag == "interval":
+        from secantus.sql import intervals as _intervals
+
+        return value if _intervals.is_interval(value) else _intervals.parse(str(value))
     if tag == "int4":
         return int(value)
     if tag == "int8":
@@ -382,6 +393,10 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         return value.encode("utf-8")  # cidr / macaddr are stored canonical
     if tag in _BIT_TAGS and isinstance(value, str):
         return value.encode("utf-8")  # already a canonical '0'/'1' string
+    if tag == "interval" and isinstance(value, dict) and "interval" in value:
+        from secantus.sql import intervals as _intervals
+
+        return _intervals.render(value).encode("utf-8")
     if tag == "composite" and isinstance(value, dict):
         return _render_pg_composite(value).encode("utf-8")
     if isinstance(value, (dict, list)):

@@ -1318,6 +1318,35 @@ def test_bit_string_types_via_driver(server):
     conn.close()
 
 
+def test_interval_type_via_driver(server):
+    # interval columns, literals, arithmetic, and functions over the real wire
+    # (pg8000 parses the interval OID into its own Interval/timedelta object, so
+    # compare via str()).
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id int primary key, dur interval)")
+    cur.execute("INSERT INTO t VALUES (1, interval '2 hours 30 minutes')")
+
+    cur.execute("SELECT interval '1 year 2 months 3 days'")
+    # pg8000 parses the interval OID into a PGInterval ("1 years 2 months 3 days").
+    got_year = str(cur.fetchone()[0])
+    assert "1 year" in got_year and "2 month" in got_year and "3 day" in got_year
+
+    # interval + interval.
+    cur.execute("SELECT interval '1 day' + interval '2 hours'")
+    got = cur.fetchone()[0]
+    assert "1 day" in str(got) and ("02:00:00" in str(got) or "2:00:00" in str(got))
+
+    # timestamp - timestamp -> interval (74 days).
+    cur.execute("SELECT timestamp '2020-03-15' - timestamp '2020-01-01'")
+    assert "74 days" in str(cur.fetchone()[0])
+
+    # a stored interval column round-trips.
+    cur.execute("SELECT dur FROM t WHERE id = 1")
+    assert "2:30:00" in str(cur.fetchone()[0])
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
