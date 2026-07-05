@@ -7,11 +7,15 @@ lexemes (lower-cased, stop-words dropped) with 1-based token positions. A
 ``tsquery`` is a small boolean tree of ``{"lexeme": w}`` / ``{"and": [..]}`` /
 ``{"or": [..]}`` / ``{"not": q}`` nodes under ``{"tsquery": <node>}``.
 
+Prefix (``cat:*``) and phrase (``foo <-> bar`` / ``foo <N> bar``) queries are
+supported (positions are tracked in the tsvector), as are ``phraseto_tsquery``
+and ``ts_headline``.
+
 Simplifications vs real Postgres: the text-search configuration is fixed
 (English stop-words, **no stemming** — ``cats`` and ``cat`` stay distinct), and
 ``ts_rank`` is a simple normalised match count rather than the cover-density
-algorithm. Weights (``:A`` / ``setweight``), prefix (``cat:*``) and phrase
-(``<->``) queries are out of scope.
+algorithm. Lexeme weights (``:A`` / ``setweight`` / weighted ``ts_rank``) are out
+of scope (the tsvector stores no per-lexeme weight).
 """
 
 from __future__ import annotations
@@ -111,6 +115,27 @@ def plainto_tsquery(text: str) -> dict[str, Any]:
     return {"tsquery": node}
 
 
+def phraseto_tsquery(text: str) -> dict[str, Any]:
+    """``phraseto_tsquery`` — chain the text's non-stop-word lexemes with the phrase
+    operator ``<->`` (adjacency), so word order matters. A dropped stop-word widens
+    the distance between its neighbours (``<2>``), matching Postgres."""
+    tokens = _lexemes(text)
+    terms: list[tuple[str, int]] = []  # (lexeme, gap-since-previous-kept-term)
+    gap = 1
+    for lex in tokens:
+        if lex in _STOPWORDS:
+            gap += 1
+            continue
+        terms.append((lex, gap))
+        gap = 1
+    if not terms:
+        return {"tsquery": None}
+    node: Any = {"lexeme": terms[0][0]}
+    for lex, distance in terms[1:]:
+        node = {"phrase": {"left": node, "right": {"lexeme": lex}, "distance": distance}}
+    return {"tsquery": node}
+
+
 def to_tsquery(text: str) -> dict[str, Any]:
     """``to_tsquery`` — parse a boolean query over ``& | !`` and parentheses."""
     parser = _TSQueryParser(text)
@@ -118,12 +143,14 @@ def to_tsquery(text: str) -> dict[str, Any]:
     return {"tsquery": node}
 
 
-_QUERY_TOKEN_RE = re.compile(r"\s*(&|\||!|\(|\)|[0-9A-Za-z]+)")
+_QUERY_TOKEN_RE = re.compile(r"\s*(<->|<\d+>|&|\||!|\(|\)|[0-9A-Za-z]+(?::\*)?)")
+_PHRASE_OP_RE = re.compile(r"^<(-|\d+)>$")
 
 
 class _TSQueryParser:
-    """A tiny recursive-descent parser: ``expr := term (('|') term)*`` where a term
-    is an AND-chain and a factor is ``!factor`` / ``(expr)`` / a lexeme."""
+    """A tiny recursive-descent parser: ``or := and ('|' and)*``; ``and := phrase
+    ('&' phrase)*``; ``phrase := factor (('<->' | '<N>') factor)*``; a factor is
+    ``!factor`` / ``(or)`` / a lexeme (optionally ``lex:*`` for a prefix match)."""
 
     def __init__(self, text: str) -> None:
         self._tokens = self._tokenize(text)
@@ -166,10 +193,19 @@ class _TSQueryParser:
         return node
 
     def _parse_and(self) -> Any:
-        node = self._parse_factor()
+        node = self._parse_phrase()
         while self._peek() == "&":
             self._next()
-            node = {"and": [node, self._parse_factor()]}
+            node = {"and": [node, self._parse_phrase()]}
+        return node
+
+    def _parse_phrase(self) -> Any:
+        node = self._parse_factor()
+        while (tok := self._peek()) is not None and _PHRASE_OP_RE.match(tok):
+            self._next()
+            distance = 1 if tok == "<->" else int(tok[1:-1])
+            right = self._parse_factor()
+            node = {"phrase": {"left": node, "right": right, "distance": distance}}
         return node
 
     def _parse_factor(self) -> Any:
@@ -183,8 +219,10 @@ class _TSQueryParser:
             if self._next() != ")":
                 raise TSQueryError("unbalanced parentheses in tsquery")
             return node
-        if tok in ("&", "|", ")"):
+        if tok in ("&", "|", ")") or _PHRASE_OP_RE.match(tok):
             raise TSQueryError(f"unexpected token {tok!r} in tsquery")
+        if tok.endswith(":*"):
+            return {"prefix": tok[:-2].lower()}
         return {"lexeme": tok.lower()}
 
 
@@ -198,6 +236,12 @@ def _render_query_node(node: Any) -> str:
         return ""
     if "lexeme" in node:
         return f"'{node['lexeme']}'"
+    if "prefix" in node:
+        return f"'{node['prefix']}':*"
+    if "phrase" in node:
+        ph = node["phrase"]
+        op = "<->" if ph["distance"] == 1 else f"<{ph['distance']}>"
+        return f"{_wrap(ph['left'])} {op} {_wrap(ph['right'])}"
     if "not" in node:
         return "!" + _render_query_node(node["not"])
     if "and" in node:
@@ -209,7 +253,7 @@ def _render_query_node(node: Any) -> str:
 
 def _wrap(node: Any) -> str:
     inner = _render_query_node(node)
-    return f"( {inner} )" if ("and" in node or "or" in node) else inner
+    return f"( {inner} )" if ("and" in node or "or" in node or "phrase" in node) else inner
 
 
 # --------------------------------------------------------------------------- #
@@ -219,39 +263,71 @@ def _wrap(node: Any) -> str:
 
 def matches(tsvector: Any, tsquery: Any) -> bool:
     """Does the ``tsvector`` satisfy the ``tsquery``? The ``@@`` operator."""
-    lexemes = set(tsvector_lexemes(tsvector))
+    posmap = tsvector_lexemes(tsvector)
     node = tsquery.get("tsquery") if isinstance(tsquery, dict) else None
-    return _eval_query(node, lexemes)
+    return _eval_query(node, posmap)
 
 
-def _eval_query(node: Any, lexemes: set[str]) -> bool:
+def _eval_query(node: Any, posmap: dict[str, list[int]]) -> bool:
     if node is None:
         return False
     if "lexeme" in node:
-        return node["lexeme"] in lexemes
+        return node["lexeme"] in posmap
+    if "prefix" in node:
+        return any(k.startswith(node["prefix"]) for k in posmap)
+    if "phrase" in node:
+        return bool(_phrase_positions(node["phrase"], posmap))
     if "not" in node:
-        return not _eval_query(node["not"], lexemes)
+        return not _eval_query(node["not"], posmap)
     if "and" in node:
-        return all(_eval_query(a, lexemes) for a in node["and"])
+        return all(_eval_query(a, posmap) for a in node["and"])
     if "or" in node:
-        return any(_eval_query(a, lexemes) for a in node["or"])
+        return any(_eval_query(a, posmap) for a in node["or"])
     return False
 
 
-def _query_terms(node: Any) -> list[str]:
-    """Every positive (non-negated) lexeme mentioned in a tsquery, for ranking."""
+def _end_positions(node: Any, posmap: dict[str, list[int]]) -> set[int]:
+    """The set of token positions at which ``node`` (a lexeme / prefix / phrase)
+    matches — the phrase operator uses these to check adjacency."""
     if node is None:
-        return []
+        return set()
     if "lexeme" in node:
-        return [node["lexeme"]]
-    if "not" in node:
-        return []
-    if "and" in node or "or" in node:
-        out: list[str] = []
-        for a in node.get("and", node.get("or", [])):
-            out.extend(_query_terms(a))
+        return set(posmap.get(node["lexeme"], []))
+    if "prefix" in node:
+        out: set[int] = set()
+        for k, ps in posmap.items():
+            if k.startswith(node["prefix"]):
+                out.update(ps)
         return out
-    return []
+    if "phrase" in node:
+        return _phrase_positions(node["phrase"], posmap)
+    return set()
+
+
+def _phrase_positions(ph: dict[str, Any], posmap: dict[str, list[int]]) -> set[int]:
+    """End positions where ``left <distance> right`` is satisfied — ``right`` sits
+    exactly ``distance`` tokens after ``left``."""
+    left = _end_positions(ph["left"], posmap)
+    right = _end_positions(ph["right"], posmap)
+    d = ph["distance"]
+    return {pb for pa in left for pb in right if pb == pa + d}
+
+
+def _count_hits(node: Any, posmap: dict[str, list[int]]) -> int:
+    """Total positive-term occurrences a query contributes, for ranking."""
+    if node is None:
+        return 0
+    if "lexeme" in node:
+        return len(posmap.get(node["lexeme"], []))
+    if "prefix" in node:
+        return sum(len(ps) for k, ps in posmap.items() if k.startswith(node["prefix"]))
+    if "phrase" in node:
+        return len(_phrase_positions(node["phrase"], posmap))
+    if "not" in node:
+        return 0
+    if "and" in node or "or" in node:
+        return sum(_count_hits(a, posmap) for a in node.get("and", node.get("or", [])))
+    return 0
 
 
 def ts_rank(tsvector: Any, tsquery: Any) -> float:
@@ -261,11 +337,52 @@ def ts_rank(tsvector: Any, tsquery: Any) -> float:
     higher' behaviour that ``ORDER BY ts_rank(...) DESC`` relies on.)"""
     if not matches(tsvector, tsquery):
         return 0.0
-    lexemes = tsvector_lexemes(tsvector)
+    posmap = tsvector_lexemes(tsvector)
     node = tsquery.get("tsquery") if isinstance(tsquery, dict) else None
-    hits = 0
-    for term in set(_query_terms(node)):
-        hits += len(lexemes.get(term, []))
+    hits = _count_hits(node, posmap)
     if hits == 0:
         return 0.0
     return round(1.0 - 1.0 / (1.0 + math.log1p(hits)), 6)
+
+
+def _query_lexemes_and_prefixes(node: Any) -> tuple[set[str], set[str]]:
+    """The positive lexemes and prefixes in a query, for ``ts_headline``."""
+    lexemes: set[str] = set()
+    prefixes: set[str] = set()
+    if node is None:
+        return lexemes, prefixes
+    if "lexeme" in node:
+        lexemes.add(node["lexeme"])
+    elif "prefix" in node:
+        prefixes.add(node["prefix"])
+    elif "phrase" in node:
+        for side in (node["phrase"]["left"], node["phrase"]["right"]):
+            l2, p2 = _query_lexemes_and_prefixes(side)
+            lexemes |= l2
+            prefixes |= p2
+    elif "and" in node or "or" in node:
+        for a in node.get("and", node.get("or", [])):
+            l2, p2 = _query_lexemes_and_prefixes(a)
+            lexemes |= l2
+            prefixes |= p2
+    return lexemes, prefixes
+
+
+def ts_headline(
+    document: str, tsquery: Any, *, start_sel: str = "<b>", stop_sel: str = "</b>"
+) -> str:
+    """``ts_headline(document, query)`` — return the document with every token that
+    matches a query lexeme / prefix wrapped in ``StartSel`` / ``StopSel`` (default
+    ``<b>`` / ``</b>``). Simplified: the whole document is returned (no fragment
+    selection / MaxWords windowing)."""
+    node = tsquery.get("tsquery") if isinstance(tsquery, dict) else None
+    lexemes, prefixes = _query_lexemes_and_prefixes(node)
+    out: list[str] = []
+    for part in re.split(r"([0-9A-Za-z]+)", document or ""):
+        low = part.lower()
+        is_word = bool(part) and _TOKEN_RE.fullmatch(part)
+        if is_word and (low in lexemes or any(low.startswith(p) for p in prefixes)):
+            out.append(f"{start_sel}{part}{stop_sel}")
+        else:
+            out.append(part)
+    return "".join(out)

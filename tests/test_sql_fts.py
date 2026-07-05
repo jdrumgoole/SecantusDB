@@ -176,3 +176,95 @@ def test_tsvector_cast(storage, session):
 
 def test_tsquery_cast(storage, session):
     assert val(storage, session, "SELECT 'cat & dog'::tsquery") == fts.to_tsquery("cat & dog")
+
+
+# --------------------------------------------------------------------------- #
+# Follow-ups (#111): prefix, phrase, phraseto_tsquery, ts_headline
+# --------------------------------------------------------------------------- #
+
+
+def test_prefix_query_parse_render():
+    assert fts.render_tsquery(fts.to_tsquery("cat:*")) == "'cat':*"
+
+
+def test_prefix_match():
+    v = fts.to_tsvector("the category is nice")
+    assert fts.matches(v, fts.to_tsquery("cat:*")) is True
+    assert fts.matches(fts.to_tsvector("the dog runs"), fts.to_tsquery("cat:*")) is False
+
+
+def test_phrase_adjacency():
+    v = fts.to_tsvector("the quick brown fox")
+    assert fts.matches(v, fts.to_tsquery("quick <-> brown")) is True
+    assert fts.matches(fts.to_tsvector("brown quick fox"), fts.to_tsquery("quick <-> brown")) is (
+        False
+    )
+
+
+def test_phrase_distance():
+    # quick@1 fox@3 -> distance 2 (a stop-word 'the' widens the gap in the doc).
+    assert fts.matches(fts.to_tsvector("quick brown fox"), fts.to_tsquery("quick <2> fox")) is True
+    assert fts.matches(fts.to_tsvector("quick brown fox"), fts.to_tsquery("quick <-> fox")) is False
+
+
+def test_phrase_render():
+    assert fts.render_tsquery(fts.to_tsquery("a <-> b")) == "'a' <-> 'b'"
+    assert fts.render_tsquery(fts.to_tsquery("a <3> b")) == "'a' <3> 'b'"
+
+
+def test_phraseto_tsquery():
+    q = fts.phraseto_tsquery("quick brown fox")
+    assert fts.matches(fts.to_tsvector("a quick brown fox jumps"), q) is True
+    assert fts.matches(fts.to_tsvector("quick fox brown"), q) is False
+
+
+def test_ts_headline():
+    out = fts.ts_headline("The quick brown fox", fts.to_tsquery("quick | fox"))
+    assert out == "The <b>quick</b> brown <b>fox</b>"
+
+
+def test_ts_headline_prefix():
+    out = fts.ts_headline("categories and cats", fts.to_tsquery("cat:*"))
+    assert out == "<b>categories</b> and <b>cats</b>"
+
+
+def test_prefix_query_typed(storage, session):
+    assert col(storage, session, "SELECT to_tsquery('cat:*')").type_tag == "tsquery"
+
+
+def test_phraseto_tsquery_typed(storage, session):
+    assert col(storage, session, "SELECT phraseto_tsquery('quick brown')").type_tag == "tsquery"
+
+
+def test_ts_headline_typed(storage, session):
+    c = col(storage, session, "SELECT ts_headline('the quick fox', to_tsquery('quick'))")
+    assert c.type_tag == "text"
+
+
+def test_ts_headline_value(storage, session):
+    assert val(storage, session, "SELECT ts_headline('the quick fox', to_tsquery('quick'))") == (
+        "the <b>quick</b> fox"
+    )
+
+
+def test_where_phrase(docs, session):
+    ids = [
+        r[0]
+        for r in run(
+            docs, session, "SELECT id FROM docs WHERE body @@ to_tsquery('quick & dog') ORDER BY id"
+        ).rows
+    ]
+    assert ids == [3]
+
+
+def test_where_prefix(storage, session):
+    run(storage, session, "CREATE TABLE d (id int PRIMARY KEY, body tsvector)")
+    run(storage, session, "INSERT INTO d VALUES (1, to_tsvector('running quickly'))")
+    run(storage, session, "INSERT INTO d VALUES (2, to_tsvector('a slow walk'))")
+    ids = [
+        r[0]
+        for r in run(
+            storage, session, "SELECT id FROM d WHERE body @@ to_tsquery('run:*') ORDER BY id"
+        ).rows
+    ]
+    assert ids == [1]
