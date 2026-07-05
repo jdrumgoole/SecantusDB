@@ -1350,16 +1350,6 @@ teardown. Remaining, worth tracking:
   `sync_on_commit` through as constructor parameters, so a test that wants a
   non-default cache via the embedded handle can't set it. Add the params when the
   handle grows a config surface.
-- [ ] **Rust write-path oplog pruning only happens via the noop-heartbeat
-  thread** (which also calls `prune_oplog`). When `--noop-heartbeat-seconds` is 0
-  (the default), nothing prunes the oplog on the standalone binary except an
-  explicit `restore`/PITR path — a long-lived busy server can grow the oplog past
-  its retention window / entry cap until a heartbeat is enabled. The Python server
-  prunes opportunistically every ~1000 emits from inside the write path; the Rust
-  `Storage` does not yet self-prune on emit. Either add an emit-counter prune hook
-  in `secantus_storage::emit_oplog` (mirrors Python) or always run a low-frequency
-  prune thread regardless of the heartbeat interval.
-
 ## SQL / PostgreSQL interface — P0 spike limitations
 
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
