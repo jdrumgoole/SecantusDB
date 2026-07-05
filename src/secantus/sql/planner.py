@@ -4677,6 +4677,15 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         _dt_tag = _date_arith_tag(node, resolve)
         if _dt_tag is not None:
             return _dt_tag
+    # Money arithmetic: money ± money / money * number -> money; money / money ->
+    # float8 (a ratio).
+    if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
+        lt_m = _infer_scalar_tag(node.this, resolve)
+        rt_m = _infer_scalar_tag(node.expression, resolve)
+        if "money" in (lt_m, rt_m):
+            if isinstance(node, exp.Div) and lt_m == "money" and rt_m == "money":
+                return "float8"
+            return "money"
     if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
         _it = _interval_arith_tag(node, resolve)
         if _it is not None:
@@ -4741,6 +4750,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "date",
             "time",
             "timetz",
+            "money",
         ):
             return _mapped
     if isinstance(node, exp.Paren):

@@ -1431,6 +1431,31 @@ def test_date_time_types_via_driver(server):
     conn.close()
 
 
+def test_money_and_to_char_via_driver(server):
+    # money columns render as $-formatted currency; numeric to_char formats over
+    # the real wire.
+    conn = connect(server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE items (id int primary key, price money)")
+    cur.execute("INSERT INTO items VALUES (1, '19.99'), (2, '$1,250.00')")
+
+    cur.execute("SELECT price FROM items WHERE id = 2")
+    assert cur.fetchone()[0] == "$1,250.00"
+
+    # money arithmetic keeps the currency rendering.
+    cur.execute("SELECT price + price FROM items WHERE id = 1")
+    assert cur.fetchone()[0] == "$39.98"
+
+    # numeric to_char.
+    cur.execute("SELECT to_char(1234.5, 'FM$9,999.99')")
+    assert cur.fetchone()[0] == "$1,234.50"
+
+    # equality lowers to a Mongo filter.
+    cur.execute("SELECT id FROM items WHERE price = '19.99'")
+    assert cur.fetchone()[0] == 1
+    conn.close()
+
+
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 

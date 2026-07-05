@@ -754,6 +754,34 @@ declared scale, `timetz` preserves the literal's offset without converting, and
 mixing a bare `timestamp` with a `date` in one arithmetic expression isn't
 supported (cast one side explicitly).
 
+### Money type + `to_char` numeric formatting
+
+`money` columns store a `Decimal` and render as `$1,234.56`. `to_char(numeric,
+fmt)` formats a number with the common Postgres template patterns:
+
+```sql
+CREATE TABLE items (id int PRIMARY KEY, price money);
+INSERT INTO items VALUES (1, '19.99'), (2, '$1,250.00');
+
+SELECT price FROM items WHERE id = 2;      -- $1,250.00
+SELECT price + price FROM items WHERE id = 1;   -- $39.98   (money arithmetic)
+
+SELECT to_char(1234.5, 'FM999,999.99');    -- 1,234.50
+SELECT to_char(1234, 'FM$9,999.99');       -- $1,234.00
+SELECT to_char(-1234.5, 'FM9999.99PR');    -- <1234.50>
+SELECT to_char(1234.56, '999999.99');      --    1234.56   (padded, non-FM)
+```
+
+Supported `to_char` patterns: `9` / `0` (digit positions), `.` (decimal point),
+`,` (group separator), `$` / `L` (currency), `S` (anchored sign), `MI` (trailing
+minus), `PR` (angle-bracket negatives), and the `FM` prefix (suppress padding).
+
+Simplifications vs real Postgres: money is stored with 2-decimal scale and a `$`
+symbol (no locale currency), `to_char` doesn't implement `EEEE` / `RN` / `V` /
+`TH` or non-ASCII locale patterns, and — as for `numeric` — `ORDER BY` on a
+money/decimal *column* relies on the storage engine's sort (the in-memory test
+store can't sort raw `Decimal128`).
+
 ### Generated columns (`GENERATED ALWAYS AS (…) STORED`)
 
 A generated column's value is computed from the row's other columns on every

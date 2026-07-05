@@ -72,6 +72,8 @@ PG_OID: dict[str, int] = {
     "interval": 1186,
     # UUID type (rendered as the canonical lower-case hyphenated string).
     "uuid": 2950,
+    # Money type (a Decimal rendered as ``$1,234.56``).
+    "money": 790,
     # System vector types: a space-separated list of ints in text format. Used by
     # pg_index.indkey/indclass/indoption so a libpq client's catalog reflection
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
@@ -121,6 +123,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "varbit": "bit varying",
     "interval": "interval",
     "uuid": "uuid",
+    "money": "money",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -146,6 +149,7 @@ PG_TYPENAME: dict[str, str] = {
     "varbit": "varbit",
     "interval": "interval",
     "uuid": "uuid",
+    "money": "money",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
     **{t: t for t in _FTS_TAGS},
@@ -182,6 +186,7 @@ _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.BIT: "bit",
     exp.DataType.Type.INTERVAL: "interval",
     exp.DataType.Type.UUID: "uuid",
+    exp.DataType.Type.MONEY: "money",
 }
 
 
@@ -347,6 +352,10 @@ def coerce(value: Any, tag: str) -> Any:
         from secantus.sql import uuidtype as _uuidtype
 
         return _uuidtype.normalize(value)
+    if tag == "money":
+        from secantus.sql import numformat as _numformat
+
+        return bson.Decimal128(_numformat.parse_money(value))
     if tag == "int4":
         return int(value)
     if tag == "int8":
@@ -429,6 +438,10 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         return value.encode("utf-8")  # cidr / macaddr are stored canonical
     if tag in _BIT_TAGS and isinstance(value, str):
         return value.encode("utf-8")  # already a canonical '0'/'1' string
+    if tag == "money":
+        from secantus.sql import numformat as _numformat
+
+        return _numformat.render_money(value).encode("utf-8")
     if tag == "interval" and isinstance(value, dict) and "interval" in value:
         from secantus.sql import intervals as _intervals
 
