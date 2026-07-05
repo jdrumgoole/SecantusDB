@@ -19,6 +19,27 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### PostgreSQL/SQL server: malformed messages get an error reply instead of a dropped connection
+
+The PG/SQL server's simple-query loop now answers a malformed message with a
+proper `ErrorResponse` rather than letting the exception escape to the outer
+handler and silently drop the connection. Most notably, a **SQL syntax error**
+over the simple-query protocol previously escaped (the parse ran outside the
+handler's `try`) and dropped the connection with no reply; it now returns
+`42601` and the connection stays alive. Invalid UTF-8 in a query message returns
+`08P01` and the connection survives (the message was length-framed, so the byte
+stream is still in sync), and a genuine framing error (an implausible length
+prefix) sends a FATAL `08P01` before closing instead of dropping silently.
+
+Found by the nightly security review (2026-07-04 §I16).
+
+#### Fixed
+
+- `sql/pgserver.py`: `planner.parse` moved inside `_handle_query`'s try so a
+  syntax error returns `42601` instead of dropping the connection; `_query_loop`
+  now catches `PGProtocolError` (framing) and `UnicodeDecodeError` (query text)
+  and replies with `08P01`. Regression: `tests/test_pgserver_framing.py`.
+
 ### PostgreSQL/SQL server: a malformed SCRAM client-first is a typed auth error
 
 A truncated SCRAM gs2 header (e.g. a client-first message of just `"n,"`, with no
