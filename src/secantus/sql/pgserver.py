@@ -19,7 +19,6 @@ import contextlib
 import logging
 import os
 import secrets
-import select
 import socket
 import ssl
 import threading
@@ -52,10 +51,6 @@ DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
 #: ``DEFAULT_MAX_CONNECTIONS``). Bounds the fan-out of the per-connection cursor
 #: caps so total memory is bounded even under an unauthenticated flood. (#194)
 DEFAULT_MAX_CONNECTIONS = 1000
-
-#: How often an idle connection wakes to deliver pending LISTEN/NOTIFY
-#: notifications. Small enough to feel prompt, large enough to stay cheap.
-NOTIFY_POLL_SECONDS = 0.25
 
 #: Wire message for an unexpected internal error. The raw Python exception text
 #: is written to the server log (``logger.exception``) but never sent to the
@@ -330,15 +325,6 @@ class SecantusPGServer:
         # Per-connection extended-protocol state (prepared statements + portals).
         ext = ExtendedSession(self.storage, session)
         while not self._stop_event.is_set():
-            # Deliver any pending LISTEN/NOTIFY notifications, then wait for client
-            # data with a short poll so an idle listener still gets them promptly.
-            self._flush_notifications(conn, session)
-            try:
-                ready, _, _ = select.select([conn], [], [], NOTIFY_POLL_SECONDS)
-            except (OSError, ValueError):
-                return
-            if not ready:
-                continue  # timeout — loop back to flush notifications
             try:
                 msg = pgwire.read_message(conn)
             except pgwire.PGProtocolError:
@@ -367,16 +353,23 @@ class SecantusPGServer:
                 self._handle_query(conn, session, sql)
                 continue
             # Everything else is the extended query protocol
-            # (Parse/Bind/Describe/Execute/Close/Sync/Flush).
+            # (Parse/Bind/Describe/Execute/Close/Sync/Flush). Async LISTEN/NOTIFY
+            # deliveries ride out ahead of the reply (message boundaries).
             reply = ext.process(msg.type, msg.payload)
-            if reply:
-                conn.sendall(reply)
+            notifications = self._pending_notification_bytes(session)
+            if notifications or reply:
+                conn.sendall(notifications + (reply or b""))
 
-    def _flush_notifications(self, conn: socket.socket, session: Session) -> None:
-        """Write any queued async LISTEN/NOTIFY deliveries to this connection. Runs
-        only on the owning connection thread, so socket writes stay serialized."""
+    def _pending_notification_bytes(self, session: Session) -> bytes:
+        """Serialize this connection's queued async LISTEN/NOTIFY deliveries into
+        ``NotificationResponse`` bytes to write on the owning thread (so socket
+        writes stay serialized). Delivered inline with the query cycle — right
+        before a ``ReadyForQuery`` — rather than via a background poll (which would
+        busy-wake every idle connection)."""
+        out = bytearray()
         for pid, channel, payload in session.drain_notifications():
-            conn.sendall(pgwire.notification_response(pid, channel, payload))
+            out += pgwire.notification_response(pid, channel, payload)
+        return bytes(out)
 
     def _handle_query(self, conn: socket.socket, session: Session, sql: str) -> None:
         # A COPY … FROM/TO STDIN/STDOUT statement drives its own sub-protocol
@@ -409,6 +402,10 @@ class SecantusPGServer:
             # full detail is in the server log. Mirrors the Mongo dispatch's
             # generic-error discipline. (security review 2026-07-04 §I17)
             out += pgwire.error_response("XX000", _INTERNAL_ERROR_MSG)
+        # Deliver any async LISTEN/NOTIFY notifications (e.g. this query's own
+        # NOTIFY, or one from another connection) before ReadyForQuery, matching
+        # Postgres, so the client picks them up in this same query exchange.
+        out += self._pending_notification_bytes(session)
         # The ReadyForQuery status reflects the transaction block (I/T/E).
         out += pgwire.ready_for_query(session.txn_status())
         conn.sendall(bytes(out))

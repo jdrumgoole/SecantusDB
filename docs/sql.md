@@ -2168,14 +2168,19 @@ double-quoted (standard identifier rules).
 Semantics: a `NOTIFY` issued inside a transaction block is buffered and delivered
 at `COMMIT` (and discarded on `ROLLBACK`); an autocommit `NOTIFY` delivers
 immediately. A connection listening on a channel receives its own notifications.
-An idle listener is delivered notifications by a short server-side poll, so
-there's a sub-second latency floor when the listener is otherwise quiet.
+
+Notifications are delivered **inline with the listener's query cycle** — a queued
+notification rides back to the listener just before the `ReadyForQuery` of its
+next query (as Postgres does when a backend is idle-in-command). So a listener
+that keeps issuing queries (or a heartbeat `SELECT 1`) sees notifications
+promptly; a listener that goes completely silent won't observe them until its
+next round-trip.
 
 **Simplifications:** duplicate `(channel, payload)` notifications within one
-transaction are not collapsed (Postgres collapses them), and `LISTEN` / `UNLISTEN`
-take effect immediately rather than at commit. Over a TLS connection, an idle
-listener may only pick up notifications on its next round-trip (the poll watches
-the raw socket, not buffered TLS data).
+transaction are not collapsed (Postgres collapses them); `LISTEN` / `UNLISTEN`
+take effect immediately rather than at commit; and there is no out-of-band push
+to a fully-idle connection (notifications are attached to the next query
+response, not delivered asynchronously mid-idle).
 
 ## Authentication and TLS
 

@@ -1587,10 +1587,9 @@ def test_xml_type_via_driver(server):
 
 
 def test_listen_notify_via_driver(server):
-    # A NOTIFY on one connection is delivered asynchronously to a LISTENer on
-    # another connection, over the real wire (NotificationResponse 'A').
-    import time
-
+    # A NOTIFY on one connection is delivered to a LISTENer on another connection,
+    # over the real wire (NotificationResponse 'A'). Delivery is inline with the
+    # listener's query cycle: it arrives before the ReadyForQuery of its next query.
     listener = connect(server)
     notifier = connect(server)
     try:
@@ -1600,11 +1599,9 @@ def test_listen_notify_via_driver(server):
 
         ncur = notifier.cursor()
         ncur.execute("NOTIFY chan, 'payload-1'")
-        notifier.commit()
+        notifier.commit()  # commit flushes the notification into the listener's queue
 
-        # Give the server's poll loop time to push the async message to the
-        # listener's socket, then drive the listener to process its inbound bytes.
-        time.sleep(0.6)
+        # The listener's next query carries the pending notification back with it.
         lcur.execute("SELECT 1")
         lcur.fetchall()
 

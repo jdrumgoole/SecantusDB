@@ -1757,12 +1757,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   commands *before* sqlglot (which mis-parses `LISTEN chan` and errors on `NOTIFY chan, 'p'`); `is_pubsub_statement`
   lets the wire server skip the COPY probe. NOTIFY buffers inside a txn block and flushes at COMMIT (dropped on
   ROLLBACK); `pg_notify(channel, payload)` function form in `scalar._call_func`. `pgserver` owns one `NotifyHub`,
-  attaches it to each session, drops listens on disconnect, and drives an idle-poll (`select` with
-  `NOTIFY_POLL_SECONDS = 0.25`) so a quiet listener still gets deliveries; `_flush_notifications` writes the queued
-  `NotificationResponse`s. Tests: `tests/test_sql_notify.py` (14: hub + engine) plus a two-connection pg8000 wire
-  test. **Simplifications:** duplicate `(channel, payload)` notifications in one txn aren't collapsed (Postgres
-  collapses them); LISTEN/UNLISTEN take effect immediately, not at commit; over TLS an idle listener may only pick
-  up notifications on its next round-trip (the poll watches the raw socket, not buffered TLS data).
+  attaches it to each session, and drops listens on disconnect. **Delivery is inline with the query cycle**:
+  `_pending_notification_bytes` serializes the queued `NotificationResponse`s and they're written on the owning
+  connection thread just before each `ReadyForQuery` (both the simple-`Q` and extended paths). An earlier
+  `select`-based idle poll was reverted — it busy-woke every idle connection every 0.25s and, under CI's 2-core
+  load with the whole suite's connections, starved the request-handling threads enough that clients hit their own
+  timeouts (mass `network error` connection drops on the Linux/py3.10 job; green locally + on Windows). The
+  inline design leaves the blocking read loop untouched. Tests: `tests/test_sql_notify.py` (14: hub + engine) plus
+  a two-connection pg8000 wire test. **Simplifications:** duplicate `(channel, payload)` notifications in one txn
+  aren't collapsed (Postgres collapses them); LISTEN/UNLISTEN take effect immediately, not at commit; and there is
+  no out-of-band async push to a fully-idle connection (notifications ride the next query response).
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same
