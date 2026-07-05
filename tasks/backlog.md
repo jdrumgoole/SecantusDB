@@ -1591,6 +1591,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (declared length not tracked at storage — only explicit `::bit(n)` casts pad); a stored bit column can't be
   re-read via `::int` (only a `B'…'` literal or `::bit` cast is treated as a bit source); bit indexes are out
   of scope.
+- [ ] **Interval type landed** (b144): the `interval` type (stored as `{"interval": {"months", "days",
+  "micros"}}`), interval literals (`interval '1 day'` / `'1 year 2 mons 3 days 04:05:06'` / `interval '1'
+  day`), interval/date arithmetic (`interval ± interval`, `interval * n`, `date ± interval`, `timestamp -
+  timestamp -> interval`, unary `-`), and the functions `make_interval` / `justify_days` / `justify_hours` /
+  `justify_interval` / `age` plus `extract(field from interval)`. New self-contained `secantus/sql/intervals.py`
+  (parse / render in the Postgres output style / add / sub / neg / mul / justify* / to_date / diff / age /
+  extract_field). The old scalar `_Interval` class was retired in favour of the subdoc. Wired through `typemap`
+  (OID 1186, `INTERVAL` in `_DATATYPE_TAGS`, name-match, `coerce` → parse, `to_pg_text` → render, names in
+  `SQL_TYPE_NAME` / `PG_TYPENAME`); `scalar` (`_eval_interval` → subdoc, `_eval_interval_arith` with a
+  `_NOT_INTERVAL` sentinel, Neg-of-interval, `exp.MakeInterval` / `exp.Justify*` typed nodes, interval funcs in
+  `_call_func`, `extract` on an interval, and a `timestamp '…'` cast now coerces to a real `datetime` so date
+  arithmetic lands); `planner` (`_literal` Interval, `_infer_value_tag` / `_infer_scalar_tag` typing incl.
+  `_interval_arith_tag`, a `::timestamp` cast now types `timestamptz`); `functions._SCALAR_EVAL_ANON` for
+  FROM-less interval funcs. Tests: `tests/test_sql_interval.py` (22: pure intervals + SQL surface) plus a
+  pg8000 wire test. **Simplifications:** days are treated as 24h (no DST-aware arithmetic), the verbose `@`
+  input grammar (beyond a trailing `ago`) isn't parsed, and interval indexes are out of scope.
 - [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same

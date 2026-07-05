@@ -192,7 +192,12 @@ def _literal(node: exp.Expression) -> Any:
         # before strings, so ``attnum > '0'`` would be wrongly false).
         return _coerce_cast(_literal(node.this), node.to)
     if isinstance(node, exp.Neg):
-        return -_literal(node.this)
+        inner = _literal(node.this)
+        if isinstance(inner, dict) and "interval" in inner:
+            from secantus.sql import intervals as _intervals
+
+            return _intervals.neg(inner)
+        return -inner
     if isinstance(node, exp.Null):
         return None
     if isinstance(node, exp.Boolean):
@@ -206,6 +211,14 @@ def _literal(node: exp.Expression) -> Any:
         return float(text) if ("." in text or "e" in text.lower()) else int(text)
     if isinstance(node, exp.BitString):  # ``B'1010'`` -> the canonical '0'/'1' string
         return str(node.this)
+    if isinstance(node, exp.Interval):  # ``interval '1 day'`` -> an interval subdoc
+        from secantus.sql import intervals as _intervals
+
+        raw = _literal(node.this) if node.this is not None else ""
+        unit = node.args.get("unit")
+        if unit is not None:
+            return _intervals.from_unit(float(raw), unit.name)
+        return _intervals.parse(str(raw))
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "row":
         # ``ROW(a, b, …)`` composite constructor -> a positional list; the INSERT
         # path maps it onto a composite column's named fields.
@@ -1688,6 +1701,8 @@ def _infer_value_tag(value: Any) -> str:
         return "int4" if -(2**31) <= value < 2**31 else "int8"
     if isinstance(value, float):
         return "float8"
+    if isinstance(value, dict) and "interval" in value:
+        return "interval"
     return "text"
 
 
@@ -4531,6 +4546,20 @@ def _has_bit_operand(node: exp.Expression, resolve: Resolve) -> bool:
     return False
 
 
+def _interval_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
+    """Result tag of an ``Add`` / ``Sub`` / ``Mul`` / ``Div`` involving an interval
+    or a timestamp difference, or None when neither applies."""
+    lt = _infer_scalar_tag(node.this, resolve)
+    rt = _infer_scalar_tag(node.expression, resolve)
+    if isinstance(node, exp.Sub) and lt == "timestamptz" and rt == "timestamptz":
+        return "interval"
+    if "interval" in (lt, rt):
+        if isinstance(node, (exp.Add, exp.Sub)) and (lt == "timestamptz" or rt == "timestamptz"):
+            return "timestamptz"
+        return "interval"
+    return None
+
+
 def _range_tag_of(operands: Any, resolve: Resolve) -> str | None:
     """The range type tag among ``operands`` — a range constructor / range-typed
     column — or None if none is a range."""
@@ -4586,6 +4615,27 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         operand_tag = _infer_scalar_tag(node.this, resolve)
         if operand_tag in typemap._RANGE_TAGS:
             return ranges.RANGE_TYPES[operand_tag][0]
+    # Interval literal / negation / arithmetic. ``interval ± interval`` and
+    # ``interval * n`` -> interval; ``date ± interval`` -> the date type; and
+    # ``timestamp - timestamp`` -> interval.
+    if isinstance(node, exp.Interval):
+        return "interval"
+    if isinstance(node, exp.Neg) and isinstance(node.this, exp.Interval):
+        return "interval"
+    _iv_nodes = tuple(
+        c
+        for c in (
+            getattr(exp, n, None)
+            for n in ("MakeInterval", "JustifyDays", "JustifyHours", "JustifyInterval")
+        )
+        if c is not None
+    )
+    if _iv_nodes and isinstance(node, _iv_nodes):
+        return "interval"
+    if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
+        _it = _interval_arith_tag(node, resolve)
+        if _it is not None:
+            return _it
     # Network operators: ``<<`` / ``>>`` (subnet containment) and ``&&`` (overlap)
     # over a net operand -> bool. ``exp.Host`` (the ``host()`` function) -> text.
     if isinstance(
@@ -4637,6 +4687,8 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "float8",
             "numeric",
             "bool",
+            "interval",
+            "timestamptz",
         ):
             return _mapped
     if isinstance(node, exp.Paren):
@@ -4845,6 +4897,9 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "int4"
         if fname == "set_bit":
             return "varbit"
+        # Interval functions.
+        if fname in ("make_interval", "justify_days", "justify_hours", "justify_interval", "age"):
+            return "interval"
         if fname in ("gcd", "lcm"):
             return "int8"
         if fname == "log10":

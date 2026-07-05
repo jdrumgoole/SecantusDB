@@ -16,7 +16,6 @@ current row (with outer-row fallthrough for correlation).
 
 from __future__ import annotations
 
-import calendar
 import datetime as _dt
 import json
 import math
@@ -76,7 +75,13 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return str(node.this)
     if isinstance(node, exp.Neg):
         v = evaluate(node.this, scope, ctx)
-        return None if v is None else -v
+        if v is None:
+            return None
+        if isinstance(v, dict) and "interval" in v:
+            from secantus.sql import intervals as _intervals
+
+            return _intervals.neg(v)
+        return -v
     if isinstance(node, exp.Cast):
         return _eval_cast(node, scope, ctx)
     if isinstance(node, exp.Column):
@@ -292,7 +297,49 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             return _ranges.union(left, right)
         if isinstance(node, exp.Sub):
             return _ranges.difference(left, right)
+    interval_result = _eval_interval_arith(node, left, right)
+    if interval_result is not _NOT_INTERVAL:
+        return interval_result
     return _ARITH[type(node)](left, right)
+
+
+_NOT_INTERVAL = object()
+
+
+def _eval_interval_arith(node: exp.Expression, left: Any, right: Any) -> Any:
+    """Arithmetic overloaded for intervals: ``date ± interval``, ``interval ±
+    interval``, ``interval * number`` (either order), ``interval / number``, and
+    ``timestamp - timestamp -> interval``. Returns ``_NOT_INTERVAL`` when neither
+    operand is an interval / date pair so the caller falls back to numeric arith."""
+    from secantus.sql import intervals as _intervals
+
+    li, ri = _intervals.is_interval(left), _intervals.is_interval(right)
+    if isinstance(node, exp.Add):
+        if li and ri:
+            return _intervals.add(left, right)
+        if ri and isinstance(left, (_dt.date, _dt.datetime)):
+            return _intervals.to_date(left, right, 1)
+        if li and isinstance(right, (_dt.date, _dt.datetime)):
+            return _intervals.to_date(right, left, 1)
+    elif isinstance(node, exp.Sub):
+        if li and ri:
+            return _intervals.sub(left, right)
+        if li and isinstance(right, (_dt.date, _dt.datetime)):
+            return _NOT_INTERVAL  # interval - timestamp is undefined
+        if ri and isinstance(left, (_dt.date, _dt.datetime)):
+            return _intervals.to_date(left, right, -1)
+        if isinstance(left, (_dt.date, _dt.datetime)) and isinstance(
+            right, (_dt.date, _dt.datetime)
+        ):
+            return _intervals.diff(left, right)
+    elif isinstance(node, exp.Mul):
+        if li and isinstance(right, (int, float)):
+            return _intervals.mul(left, right)
+        if ri and isinstance(left, (int, float)):
+            return _intervals.mul(right, left)
+    elif isinstance(node, exp.Div) and li and isinstance(right, (int, float)) and right != 0:
+        return _intervals.mul(left, 1.0 / right)
+    return _NOT_INTERVAL
 
 
 def _is_range_value(v: Any) -> bool:
@@ -642,86 +689,18 @@ def _cbrt(v: Any) -> float:
 # -- date / time ------------------------------------------------------------- #
 
 
-class _Interval:
-    """A Postgres ``interval`` value split into a calendar part (``months``) and a
-    fixed-duration part (``delta``). ``months`` needs calendar-aware arithmetic
-    (a month is not a fixed number of days) applied via ``__radd__`` / ``__rsub__``
-    onto a ``date`` / ``datetime`` so ``ts + interval '1 month'`` lands correctly."""
-
-    __slots__ = ("months", "delta")
-
-    def __init__(self, months: int = 0, delta: _dt.timedelta | None = None) -> None:
-        self.months = months
-        self.delta = delta or _dt.timedelta(0)
-
-    def __neg__(self) -> _Interval:
-        return _Interval(-self.months, -self.delta)
-
-    def _apply(self, base: Any, sign: int) -> Any:
-        months = sign * self.months
-        result = _add_months(base, months) if months else base
-        return result + (sign * self.delta)
-
-    def __radd__(self, base: Any) -> Any:  # base + interval
-        return self._apply(base, 1)
-
-    def __rsub__(self, base: Any) -> Any:  # base - interval
-        return self._apply(base, -1)
-
-
-def _add_months(base: Any, months: int) -> Any:
-    """Add ``months`` (may be negative) to a date/datetime, clamping the day to the
-    target month's length (Jan 31 + 1 month -> Feb 28)."""
-    total = base.year * 12 + (base.month - 1) + months
-    year, month = divmod(total, 12)
-    month += 1
-    day = min(base.day, calendar.monthrange(year, month)[1])
-    return base.replace(year=year, month=month, day=day)
-
-
-# interval unit -> either a ``timedelta`` factory (fixed) or a month count.
-_INTERVAL_FIXED = {
-    "week": lambda n: _dt.timedelta(weeks=n),
-    "day": lambda n: _dt.timedelta(days=n),
-    "hour": lambda n: _dt.timedelta(hours=n),
-    "minute": lambda n: _dt.timedelta(minutes=n),
-    "second": lambda n: _dt.timedelta(seconds=n),
-    "millisecond": lambda n: _dt.timedelta(milliseconds=n),
-    "microsecond": lambda n: _dt.timedelta(microseconds=n),
-}
-_INTERVAL_MONTHS = {"year": 12, "quarter": 3, "month": 1, "decade": 120, "century": 1200}
-
-
-def _interval_singular(unit: str) -> str:
-    return unit.lower().rstrip("s") if unit.lower() not in ("s",) else unit.lower()
-
-
-def _accumulate_interval(iv: _Interval, value: float, unit: str) -> None:
-    u = _interval_singular(unit)
-    if u in _INTERVAL_MONTHS:
-        iv.months += int(value * _INTERVAL_MONTHS[u])
-    elif u in _INTERVAL_FIXED:
-        iv.delta += _INTERVAL_FIXED[u](value)
-    else:
-        raise errors.feature_not_supported(f"unsupported interval unit: {unit}")
-
-
-def _eval_interval(node: exp.Interval, scope: Scope, ctx: ScalarContext) -> _Interval:
+def _eval_interval(node: exp.Interval, scope: Scope, ctx: ScalarContext) -> dict:
     """``interval '<n> <unit>'`` / ``interval '<n>' <unit>`` / a compound literal
-    (``'1 year 2 months'``) -> an ``_Interval``."""
-    iv = _Interval()
+    (``'1 year 2 months'``) -> an interval subdocument (see ``secantus.sql.intervals``)."""
+    from secantus.sql import intervals as _intervals
+
     raw = evaluate(node.this, scope, ctx) if node.this is not None else None
     text = _as_text(raw).strip() if raw is not None else ""
     unit = node.args.get("unit")
     unit_name = unit.name if unit is not None else None
     if unit_name:
-        _accumulate_interval(iv, float(text), unit_name)
-    else:
-        # Compound string: "1 year 2 months 3 days".
-        tokens = text.split()
-        for i in range(0, len(tokens) - 1, 2):
-            _accumulate_interval(iv, float(tokens[i]), tokens[i + 1])
-    return iv
+        return _intervals.from_unit(float(text), unit_name)
+    return _intervals.parse(text)
 
 
 def _as_datetime(v: Any) -> _dt.datetime | _dt.date:
@@ -736,8 +715,12 @@ def _eval_extract(node: exp.Extract, scope: Scope, ctx: ScalarContext) -> Any:
     src = evaluate(node.expression, scope, ctx)
     if src is None:
         return None
-    ts = _as_datetime(src)
     field = node.this.name.lower()
+    if isinstance(src, dict) and "interval" in src:
+        from secantus.sql import intervals as _intervals
+
+        return _intervals.extract_field(field, src)
+    ts = _as_datetime(src)
     if field in ("year", "years"):
         return ts.year
     if field in ("month", "months"):
@@ -850,6 +833,34 @@ def _utcnow(ctx: ScalarContext | None) -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
 
 
+def _eval_make_interval(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> dict:
+    """``make_interval(years, months, weeks, days, hours, mins, secs)`` — parsed to
+    a dedicated node whose components live in named args."""
+    from secantus.sql import intervals as _intervals
+
+    def arg(name: str) -> float:
+        a = node.args.get(name)
+        v = evaluate(a, scope, ctx) if a is not None else None
+        return float(v) if v is not None else 0.0
+
+    months = int(arg("year")) * 12 + int(arg("month"))
+    days = int(arg("week")) * 7 + int(arg("day"))
+    micros = round(
+        (arg("hour") * 3600 + arg("minute") * 60 + arg("second")) * _intervals.MICROS_PER_SECOND
+    )
+    return _intervals.make(months, days, micros)
+
+
+def _eval_justify(fn: str) -> Callable[[exp.Expression, Scope, ScalarContext], Any]:
+    def handler(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+        from secantus.sql import intervals as _intervals
+
+        v = evaluate(node.this, scope, ctx)
+        return None if v is None else getattr(_intervals, fn)(v)
+
+    return handler
+
+
 # Typed scalar function nodes (sqlglot parses these to dedicated classes whose
 # operands live in ``this`` / named args, not ``expressions``).
 _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
@@ -917,6 +928,11 @@ for _cls_name, _handler in (
     ("Overlay", _eval_overlay),
     # ``bit_length`` — a bit string's bit count (its char length).
     ("BitLength", _unary(lambda v: len(_as_text(v)))),
+    # Interval functions with dedicated sqlglot nodes.
+    ("MakeInterval", _eval_make_interval),
+    ("JustifyDays", _eval_justify("justify_days")),
+    ("JustifyHours", _eval_justify("justify_hours")),
+    ("JustifyInterval", _eval_justify("justify_interval")),
 ):
     _cls = getattr(exp, _cls_name, None)
     if _cls is not None:
@@ -973,6 +989,23 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
     # ``'[1,10)'::int4range`` — parse a range text literal into its subdocument.
     to = node.to.sql(dialect="postgres").lower().strip() if node.to is not None else ""
+    # ``'1 day'::interval`` — parse an interval literal (a subdoc passes through).
+    to_tag_early = typemap.type_tag_for_sql(node.to) if node.to is not None else None
+    if value is not None and to_tag_early == "interval":
+        from secantus.sql import intervals as _intervals
+
+        return value if _intervals.is_interval(value) else _intervals.parse(str(value))
+    # ``timestamp '2020-01-31'`` / ``date '…'`` -> a real datetime so interval and
+    # date arithmetic land on a temporal value rather than a bare string.
+    if (
+        value is not None
+        and to_tag_early == "timestamptz"
+        and not isinstance(value, (_dt.datetime, _dt.date))
+    ):
+        try:
+            return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return value
     if (
         value is not None
         and (
@@ -1262,6 +1295,34 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
 
         v = args[0] if args else None
         return None if v is None or args[1] is None else _bitstr.get_bit(str(v), int(args[1]))
+    if name in ("justify_days", "justify_hours", "justify_interval"):
+        from secantus.sql import intervals as _intervals
+
+        v = args[0] if args else None
+        if v is None:
+            return None
+        return getattr(_intervals, name)(v)
+    if name == "make_interval":
+        from secantus.sql import intervals as _intervals
+
+        # Positional: (years, months, weeks, days, hours, mins, secs).
+        vals = [int(a) if a is not None else 0 for a in args[:6]] + [
+            float(args[6]) if len(args) > 6 and args[6] is not None else 0.0
+        ]
+        years, months, weeks, days, hours, mins, secs = (vals + [0] * 7)[:7]
+        return _intervals.make(
+            years * 12 + months,
+            weeks * 7 + days,
+            round(((hours * 3600) + (mins * 60) + secs) * _intervals.MICROS_PER_SECOND),
+        )
+    if name == "age":
+        from secantus.sql import intervals as _intervals
+
+        if not args or args[0] is None:
+            return None
+        if len(args) >= 2 and args[1] is not None:
+            return _intervals.age(args[0], args[1])
+        return _intervals.age(_dt.datetime.now(_dt.timezone.utc).date(), args[0])
     if name == "isempty":
         from secantus.sql import ranges as _ranges
 
