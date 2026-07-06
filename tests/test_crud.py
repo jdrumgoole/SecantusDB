@@ -643,6 +643,25 @@ def test_aggregate_date_to_parts_timezone(coll) -> None:
     }
 
 
+def test_aggregate_first_n_last_n(coll) -> None:
+    coll.insert_one({"_id": 1, "a": [10, 20, 30, 40, 50]})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "f": {"$firstN": {"n": 2, "input": "$a"}},
+                        "l": {"$lastN": {"n": 2, "input": "$a"}},
+                        "all_": {"$firstN": {"n": 99, "input": "$a"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"f": [10, 20], "l": [40, 50], "all_": [10, 20, 30, 40, 50]}]
+
+
 def test_aggregate_bitwise_operators(coll) -> None:
     from bson import Int64
 
