@@ -80,11 +80,9 @@ _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
     # constraints.
     "com.mongodb.client.unified.CommandLoggingTest",
     "com.mongodb.client.unified.CommandMonitoringTest",
-    "com.mongodb.client.unified.ConnectionPoolLoggingTest",
     # More candidates being widened (safer: no change-streams /
     # sessions / retryable in this batch — those have known
     # tailable-getMore hang risk).
-    "com.mongodb.client.ClientMetadataTest",
     "com.mongodb.client.ClusterEventPublishingTest",
     "com.mongodb.client.unified.UnifiedCrudTest",
     # Wave 2 widening — each is a unified spec runner that drives
@@ -122,6 +120,16 @@ _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
     # - CrudProseTest — depends on writeErrors[].errInfo (rich
     #   validation-error details, MongoDB 5.0+); accept-on-the-wire
     #   only today.
+    # - ClientMetadataTest / ConnectionPoolLoggingTest — driver-internal
+    #   SDAM / CMAP tests that assert the EXACT sequence and count of
+    #   command-monitoring + connection-pool-log events. Those counts are
+    #   perturbed by the driver's own background hello *heartbeats* landing
+    #   (or not) in the observed window — timing the driver controls, not
+    #   SecantusDB wire behaviour — so they fail non-deterministically run
+    #   to run (a serial-vs-parallel diagnosis confirmed the failure set
+    #   shifts). They test driver event-emission machinery, not our
+    #   conformance. (Stabilising `hello`'s topologyVersion.processId —
+    #   which removed one real churn source — didn't make them deterministic.)
 ]
 
 
