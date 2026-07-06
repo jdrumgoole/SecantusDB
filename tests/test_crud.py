@@ -643,6 +643,31 @@ def test_aggregate_date_to_parts_timezone(coll) -> None:
     }
 
 
+def test_aggregate_bitwise_operators(coll) -> None:
+    from bson import Int64
+
+    coll.insert_one({"_id": 1, "a": 12, "b": 10, "big": Int64(0xFF00)})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "and_": {"$bitAnd": ["$a", "$b"]},
+                        "or_": {"$bitOr": ["$a", "$b", 1]},
+                        "xor_": {"$bitXor": ["$a", "$b"]},
+                        "not_": {"$bitNot": "$a"},
+                        "long_": {"$bitAnd": ["$big", 255]},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"and_": 8, "or_": 15, "xor_": 6, "not_": -13, "long_": 0}]
+    # An all-long operand keeps the long (int64) type over the wire.
+    assert isinstance(out[0]["long_"], Int64)
+
+
 def test_aggregate_group_stddev(coll) -> None:
     # Values 2,4,6: population variance (4+0+4)/3 -> stdDevPop sqrt(8/3);
     # sample variance 8/2 = 4 -> stdDevSamp 2.0.

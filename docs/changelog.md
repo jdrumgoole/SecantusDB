@@ -19,6 +19,23 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Bitwise aggregation operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot` (both servers)
+
+Both servers now support MongoDB 6.3's bitwise aggregation expressions.
+`$bitAnd` / `$bitOr` / `$bitXor` fold a list of int/long operands with the
+corresponding bitwise operator; `$bitNot` complements a single operand. The
+result is a long when any operand is a long and an int otherwise; a null or
+missing operand makes the whole result null; an empty operand list yields the
+operator's identity (all-ones for `$bitAnd`, `0` for `$bitOr` / `$bitXor`). A
+non-integer operand (double, bool, decimal, …) raises, matching mongod. Neither
+server recognised these before.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
+  aggregation expressions, with int32/int64 result-width tracking. (The `$group`
+  accumulator forms remain a follow-on — see `tasks/backlog.md` §7.5.)
+
 ### Rust server: `$stdDevPop` / `$stdDevSamp` group accumulators
 
 The Rust server now supports the `$stdDevPop` and `$stdDevSamp` accumulators in

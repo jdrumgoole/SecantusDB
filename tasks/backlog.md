@@ -1328,13 +1328,17 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `$top` / `$bottom` / `$topN` / `$bottomN` / `$firstN` / `$lastN` / `$maxN` /
   `$minN` (the sort-/n-bounded accumulators), and `$median` / `$percentile`
   (t-digest). Their **expression** forms (`$maxN`/`$firstN`/`$median`/`$percentile`
-  over an array, `$dateFromParts`, `$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot`,
-  `$tsSecond`/`$tsIncrement`) are likewise absent from both. Each would need porting
-  on **both** servers (Python module + Rust `secantus-core`) with a parity corpus.
-  **Now native on the Rust server:** `$stdDevPop` / `$stdDevSamp` accumulators
-  (0.5.3-beta.135 / 0.5.4b163 — Python already had them; both engines aligned to a
-  naive-fold + multiply + `sqrt` computation so they agree bit-for-bit despite
-  CPython 3.12's compensated `sum()`).
+  over an array, `$dateFromParts`, `$tsSecond`/`$tsIncrement`) are likewise absent
+  from both. Each would need porting on **both** servers (Python module + Rust
+  `secantus-core`) with a parity corpus. **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot`
+  as `$group` accumulators** remain a follow-on (the *expression* forms shipped —
+  see below). **Now native on both servers:** the bitwise **expression** operators
+  `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot` (0.5.3-beta.136 / 0.5.4b164 — int/long
+  operands, int32/int64 result width, empty-list identity, null propagation; a
+  non-integer operand raises). **Now native on the Rust server:** `$stdDevPop` /
+  `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
+  both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
+  bit-for-bit despite CPython 3.12's compensated `sum()`).
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/

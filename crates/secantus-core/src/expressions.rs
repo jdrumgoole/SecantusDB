@@ -254,6 +254,12 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$pow" => op_pow(arg, ctx),
         "$round" => op_round(arg, ctx),
         "$trunc" => op_trunc(arg, ctx),
+        // bitwise (int / long operands; a bool / double / other defers to Python,
+        // whose exact type-error message is the oracle)
+        "$bitAnd" => op_bit_fold(arg, ctx, BitOp::And),
+        "$bitOr" => op_bit_fold(arg, ctx, BitOp::Or),
+        "$bitXor" => op_bit_fold(arg, ctx, BitOp::Xor),
+        "$bitNot" => op_bit_not(arg, ctx),
         "$dateFromString" => op_date_from_string(arg, ctx),
         "$dateToString" => op_date_to_string(arg, ctx),
         // misc structural / deterministic
@@ -277,6 +283,73 @@ fn op_rand(arg: &Bson) -> R {
         Bson::Document(d) if d.is_empty() => Ok(Bson::Double(rand::random::<f64>())),
         _ => Err(Fallback), // non-empty / wrong-typed arg -> Python raises
     }
+}
+
+#[derive(Clone, Copy)]
+enum BitOp {
+    And,
+    Or,
+    Xor,
+}
+
+/// A `$bit*` operand as `(value, is_long)` — int (32) or long (64) only. Bool /
+/// double / anything else returns `None` so the caller defers to Python (whose
+/// exact "only supports int and long operands" error is the oracle). Values are
+/// held in `i64`; an `Int32` sign-extends, and the caller narrows back with
+/// `as i32` when no long operand was seen.
+fn bit_operand(v: &Bson) -> Option<(i64, bool)> {
+    match v {
+        Bson::Int32(n) => Some((*n as i64, false)),
+        Bson::Int64(n) => Some((*n, true)),
+        _ => None, // bool / double / string / ... -> Python raises
+    }
+}
+
+/// Wrap a bitwise result: `Int64` when any operand was long, else `Int32`
+/// (the low 32 bits — correct two's-complement for int operands, matching the
+/// pure `_bit_result`).
+fn bit_result(value: i64, is_long: bool) -> Bson {
+    if is_long {
+        Bson::Int64(value)
+    } else {
+        Bson::Int32(value as i32)
+    }
+}
+
+/// `$bitAnd` / `$bitOr` / `$bitXor`: fold int/long operands. A null operand makes
+/// the result null; the result is long iff any operand was long; an empty list is
+/// the operator's identity (all-ones for and, 0 for or/xor). Mirrors the pure
+/// `_op_bit_fold`.
+fn op_bit_fold(arg: &Bson, ctx: &Ctx, op: BitOp) -> R {
+    let vals = eval_args(arg, ctx)?;
+    if vals.iter().any(is_null) {
+        return Ok(Bson::Null);
+    }
+    let mut acc: i64 = match op {
+        BitOp::And => -1,
+        BitOp::Or | BitOp::Xor => 0,
+    };
+    let mut is_long = false;
+    for v in &vals {
+        let (n, lng) = bit_operand(v).ok_or(Fallback)?;
+        is_long |= lng;
+        acc = match op {
+            BitOp::And => acc & n,
+            BitOp::Or => acc | n,
+            BitOp::Xor => acc ^ n,
+        };
+    }
+    Ok(bit_result(acc, is_long))
+}
+
+/// `$bitNot`: bitwise complement of a single int/long operand (null → null).
+fn op_bit_not(arg: &Bson, ctx: &Ctx) -> R {
+    let v = eval(arg, ctx)?;
+    if is_null(&v) {
+        return Ok(Bson::Null);
+    }
+    let (n, is_long) = bit_operand(&v).ok_or(Fallback)?;
+    Ok(bit_result(!n, is_long))
 }
 
 // --- comparison ---------------------------------------------------------
@@ -2948,6 +3021,46 @@ mod tests {
             &Document::new()
         )
         .is_err());
+    }
+
+    #[test]
+    fn bitwise_ops() {
+        let d = doc! {"a": 12i32, "b": 10i32, "big": 65280i64, "neg": -5i32};
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$bitAnd": ["$a", "$b"]})),
+            Bson::Int32(8)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$bitOr": ["$a", "$b", 1]})),
+            Bson::Int32(15)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$bitXor": ["$a", "$b"]})),
+            Bson::Int32(6)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$bitNot": "$a"})),
+            Bson::Int32(-13)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$bitNot": "$neg"})),
+            Bson::Int32(4)
+        );
+        // Any long operand -> long result.
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$bitAnd": ["$big", 255i32]})),
+            Bson::Int64(0)
+        );
+        // Empty list -> identity (all-ones for and, 0 for or/xor); null -> null.
+        assert_eq!(ev(d.clone(), bson::bson!({"$bitAnd": []})), Bson::Int32(-1));
+        assert_eq!(ev(d.clone(), bson::bson!({"$bitOr": []})), Bson::Int32(0));
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$bitAnd": ["$a", "$missing"]})),
+            Bson::Null
+        );
+        // Non-integer operand defers (Python raises the type error).
+        assert!(evaluate(&d, &bson::bson!({"$bitAnd": ["$a", 1.5]}), &Document::new()).is_err());
+        assert!(evaluate(&d, &bson::bson!({"$bitNot": true}), &Document::new()).is_err());
     }
 
     #[test]
