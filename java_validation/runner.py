@@ -322,9 +322,23 @@ def main() -> int:
         # (vendored tree stays unmodified). Worker count is the runner's
         # CPU count by default; ``SECANTUS_GAUGE_PARALLEL_FORKS`` overrides.
         init_script = REPO_ROOT / "java_validation" / "init.gradle.kts"
-        forks = os.environ.get("SECANTUS_GAUGE_PARALLEL_FORKS")
-        if forks is None:
-            env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(os.cpu_count() or 1)
+        # Base parallel-fork count: the user-supplied override if set, else
+        # the runner's CPU count. This is the CEILING — the per-module fork
+        # count (computed inside the loop below) is capped at the number of
+        # test classes that module actually runs. Do NOT export it globally
+        # here: ``init.gradle.kts`` reads ``SECANTUS_GAUGE_PARALLEL_FORKS``
+        # for EVERY ``Test`` task, and a module that runs fewer test classes
+        # than forks makes Gradle spawn empty test-worker forks. An empty
+        # fork never writes its ``build/test-results/test/binary/output.bin.idx``,
+        # and Gradle's result aggregator then dies with
+        # ``FileNotFoundException: .../binary/output.bin.idx`` — no JUnit XML
+        # is produced and the whole module is marked failed. ``:driver-sync``
+        # (22 classes) has enough work to fill 12 forks and survives, but
+        # ``:driver-core`` (only 2 geo specs) races into the crash. Capping
+        # forks at the class count per module keeps driver-sync fully parallel
+        # while driver-core drops to 2 forks with no empty forks.
+        _forks_override = os.environ.get("SECANTUS_GAUGE_PARALLEL_FORKS")
+        base_forks = int(_forks_override) if _forks_override else (os.cpu_count() or 1)
 
         # Wipe stale JUnit XML before running so a failed build can't
         # masquerade as a passing run. If Gradle aborts (unsupported JDK,
@@ -383,6 +397,20 @@ def main() -> int:
                 f"java_validation: running {spec.task}{filter_msg} in {VENDOR} (URI={uri})",
                 file=sys.stderr,
             )
+
+            # Cap the parallel-fork count at the number of test classes this
+            # module runs, so Gradle never spawns an empty test-worker fork
+            # (an empty fork leaves ``output.bin.idx`` unwritten → the result
+            # aggregator crashes with FileNotFoundException; see the base_forks
+            # comment above). An unfiltered module (no ``--tests`` filters,
+            # ``test_classes == []``) runs its whole suite, so it keeps the
+            # full ``base_forks`` — there's plenty of work to fill every fork.
+            module_forks = (
+                base_forks
+                if len(spec.test_classes) == 0
+                else min(base_forks, max(1, len(spec.test_classes)))
+            )
+            env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(module_forks)
 
             proc = subprocess.Popen(
                 cmd,
