@@ -48,6 +48,27 @@ divergence before it shipped.
 - `aggregate.py` (`_std_dev`): compute with a naive float fold + multiply + `sqrt`
   (no `sum()` / `** 2` / `** 0.5`) so the Python and Rust engines agree bit-for-bit.
 
+### Stable `hello` topologyVersion — no more spurious connection-pool churn (both servers)
+
+`hello`'s `topologyVersion.processId` was minted fresh on every call
+(`ObjectId` from `now()` on the Python server, `ObjectId::new()` on the Rust
+server). The SDAM spec treats a *changed* `processId` as "the server restarted",
+so drivers reacted to nearly every monitoring heartbeat by invalidating and
+clearing the connection pool — closing the live connection and reconnecting.
+Both servers now pin `processId` once per process, so a driver sees a stable
+topology and keeps its connections. This was surfaced by the Java driver's
+connection-pool-logging and client-metadata event-count tests (which observed
+the extra `connectionClosed` / "Connection pool cleared" events), but the churn
+affected every driver's SDAM.
+
+#### Fixed
+
+- **Python server** (`commands.py`) and **Rust server** (`secantus-commands`
+  `handshake.rs`): `hello` returns a process-stable `topologyVersion.processId`
+  instead of a fresh ObjectId per call. Regressions:
+  `tests/test_hello_topology.py` (pymongo, both processId stability and
+  cross-connection identity) and a `secantus-commands` unit test.
+
 ### `$dateToParts` honours a `timezone` (both servers)
 
 `$dateToParts` now accepts a `timezone` and returns the year/month/day/hour/…
