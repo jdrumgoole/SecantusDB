@@ -1448,7 +1448,13 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if a is None or b is None:
             return None
         return _ranges.merge(a, b)
-    if name in ("to_tsvector", "to_tsquery", "plainto_tsquery", "phraseto_tsquery"):
+    if name in (
+        "to_tsvector",
+        "to_tsquery",
+        "plainto_tsquery",
+        "phraseto_tsquery",
+        "websearch_to_tsquery",
+    ):
         from secantus.sql import fts as _fts
 
         # A two-argument form passes the text-search config first; we ignore it
@@ -1462,6 +1468,8 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             return _fts.plainto_tsquery(_as_text(text))
         if name == "phraseto_tsquery":
             return _fts.phraseto_tsquery(_as_text(text))
+        if name == "websearch_to_tsquery":
+            return _fts.websearch_to_tsquery(_as_text(text))
         return _fts.to_tsquery(_as_text(text))
     if name == "ts_headline":
         from secantus.sql import fts as _fts

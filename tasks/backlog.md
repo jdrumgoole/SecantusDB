@@ -1794,6 +1794,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
   functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
   out of scope.
+- [ ] **Full-text search ranking landed** (b166): two parts. (1) **`websearch_to_tsquery`** (`secantus/sql/fts.py`)
+  — parses a web-search-style query (bare words AND'd, `"quoted phrases"` → adjacency via `phraseto_tsquery`, the
+  bare word `or` → OR, leading `-` → NOT); registered in the four FTS dispatch sites (scalar `_call_func`, planner
+  value-expr + `_infer_scalar_tag` → tsquery, `functions._SCALAR_EVAL_ANON`). (2) **ORDER BY output-alias
+  resolution** in the single-table evaluated path (`planner._build_evaluated_single`) — mirrors the pipeline path:
+  an unqualified `ORDER BY <name>` that matches a SELECT-list alias now resolves to that output expression, so a
+  *ranked search* `SELECT …, ts_rank(…) AS rank … ORDER BY rank DESC` works (general, not FTS-specific — also fixes
+  `ORDER BY <computed alias>` for arithmetic etc.). Tests: `tests/test_sql_fts_ranking.py` (7) + a pg8000 wire test.
+  The rest of the FTS ranking surface already existed: `ts_rank` / `ts_rank_cd`, `ts_headline`, `phraseto_tsquery`,
+  and `ORDER BY ts_rank(…)` (repeated expression). **Simplifications (unchanged):** `ts_rank_cd` == `ts_rank` (a
+  monotonic match-count, not cover-density); fixed config; no stemming; no lexeme weights.
 - [ ] **generate_series + base-less FROM-clause SRFs landed** (b163): a set-returning function as the *whole* row
   source. New `secantus/sql/srf.py`: `from_source` (a base-less `FROM generate_series(…)` / `FROM unnest(…)` /
   `jsonb_array_elements` / `jsonb_object_keys` / `regexp_split_to_table`, incl. `WITH ORDINALITY` and `AS t(cols)`)

@@ -1614,6 +1614,31 @@ def test_listen_notify_via_driver(server):
         notifier.close()
 
 
+def test_fts_ranking_via_driver(server):
+    # websearch_to_tsquery + ranked search (ORDER BY rank alias) over the wire (#126).
+    conn = connect(server)
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE doc (id int, body text)")
+        cur.execute(
+            "INSERT INTO doc VALUES (1, 'the quick brown fox'), (2, 'quick quick fox runs')"
+        )
+        conn.commit()
+
+        cur.execute(
+            "SELECT id FROM doc WHERE to_tsvector(body) @@ websearch_to_tsquery('quick -runs')"
+        )
+        assert [r[0] for r in cur.fetchall()] == [1]
+
+        cur.execute(
+            "SELECT id, ts_rank(to_tsvector(body), to_tsquery('quick')) AS rank "
+            "FROM doc WHERE to_tsvector(body) @@ to_tsquery('quick') ORDER BY rank DESC"
+        )
+        assert [r[0] for r in cur.fetchall()] == [2, 1]
+    finally:
+        conn.close()
+
+
 def test_generate_series_via_driver(server):
     # generate_series + FROM-clause SRF over the real wire (#125).
     conn = connect(server)

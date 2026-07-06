@@ -259,6 +259,7 @@ def _literal(node: exp.Expression) -> Any:
         "to_tsquery",
         "plainto_tsquery",
         "phraseto_tsquery",
+        "websearch_to_tsquery",
     ):
         # Full-text constructors -> a tsvector / tsquery subdocument (a two-arg form
         # passes the fixed text-search config first, which we ignore).
@@ -274,6 +275,8 @@ def _literal(node: exp.Expression) -> Any:
             return _fts.plainto_tsquery(str(text))
         if fname == "phraseto_tsquery":
             return _fts.phraseto_tsquery(str(text))
+        if fname == "websearch_to_tsquery":
+            return _fts.websearch_to_tsquery(str(text))
         return _fts.to_tsquery(str(text))
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "to_regtype":
         # ``to_regtype('name')`` resolves a type name to its OID (NULL if unknown).
@@ -2963,6 +2966,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         base_filter = _where_filter(stmt, table)
     out_columns: list[tuple[str, str]] = []
     out_exprs: list[exp.Expression] = []
+    alias_exprs: dict[str, exp.Expression] = {}
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -2975,11 +2979,19 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         name = alias or (_column_name(inner) if isinstance(inner, exp.Column) else "?column?")
         out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
+        if alias is not None:
+            alias_exprs[alias] = inner
     order: list[tuple[exp.Expression, int, bool]] = []
     order_node = stmt.args.get("order")
     if order_node is not None:
         for o in order_node.expressions:
-            order.append((o.this, -1 if o.args.get("desc") else 1, _nulls_first(o)))
+            # ORDER BY may name a SELECT output alias (``ORDER BY rank``) — Postgres
+            # resolves it to that output expression, so sorting a computed column
+            # (a ``ts_rank`` score, arithmetic, …) by its alias works.
+            term = o.this
+            if isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
+                term = alias_exprs[term.name]
+            order.append((term, -1 if o.args.get("desc") else 1, _nulls_first(o)))
     limit, skip = _limit_skip(stmt)
     don = _distinct_on(stmt)
     enum_orders = _evaluated_enum_orders(
@@ -5259,7 +5271,12 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "bool"
         if fname == "to_tsvector":
             return "tsvector"
-        if fname in ("to_tsquery", "plainto_tsquery", "phraseto_tsquery"):
+        if fname in (
+            "to_tsquery",
+            "plainto_tsquery",
+            "phraseto_tsquery",
+            "websearch_to_tsquery",
+        ):
             return "tsquery"
         if fname in ("ts_rank", "ts_rank_cd"):
             return "float8"

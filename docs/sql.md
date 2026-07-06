@@ -588,6 +588,20 @@ SELECT ts_headline('The quick brown fox', to_tsquery('quick | fox'));
 --     The <b>quick</b> brown <b>fox</b>
 ```
 
+`websearch_to_tsquery` parses a web-search-style string — bare words are AND'd,
+`"quoted phrases"` become adjacency queries, the bare word `or` is an OR, and a
+leading `-` negates — and a *ranked search* orders by the `ts_rank` score, which
+can be referenced by its output alias (`ORDER BY rank`):
+
+```sql
+SELECT id FROM docs WHERE body @@ websearch_to_tsquery('quick -dog');   -- quick, not dog
+SELECT id FROM docs WHERE body @@ websearch_to_tsquery('fox or "brown dog"');
+
+SELECT id, ts_rank(body, websearch_to_tsquery('quick')) AS rank
+FROM docs WHERE body @@ websearch_to_tsquery('quick')
+ORDER BY rank DESC;                    -- ORDER BY resolves the SELECT-list alias
+```
+
 Simplifications vs real Postgres: the text-search configuration is fixed
 (English stop-words, **no stemming** — `cats` and `cat` stay distinct), `ts_rank`
 is a monotonic match-count score rather than the cover-density algorithm,
