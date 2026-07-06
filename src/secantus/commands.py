@@ -129,6 +129,14 @@ SERVER_VERSION = "7.0.0"
 SERVER_VERSION_ARRAY = [7, 0, 0, 0]
 DEFAULT_BATCH_SIZE = 101
 
+# ``topologyVersion.processId`` identifies the *server process* and is fixed for
+# its lifetime — the SDAM spec compares it across heartbeats, and a *changed*
+# processId is read as "the server restarted", which makes drivers invalidate
+# and clear the connection pool (close + reconnect). Minting a fresh ObjectId per
+# hello (the old behaviour) therefore triggered a spurious pool-clear on nearly
+# every monitoring heartbeat. Pin it once per process. (Java-gauge finding)
+_HELLO_PROCESS_ID = bson.ObjectId()
+
 
 def _coerce_command_int(value: Any) -> int:
     """Coerce a numeric command argument (e.g. ``batchSize``) to ``int``.
@@ -550,7 +558,7 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "isWritablePrimary": True,
         "ismaster": True,
         "topologyVersion": {
-            "processId": bson.ObjectId.from_datetime(_dt.datetime.now(_dt.timezone.utc)),
+            "processId": _HELLO_PROCESS_ID,
             "counter": bson.Int64(0),
         },
         "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,

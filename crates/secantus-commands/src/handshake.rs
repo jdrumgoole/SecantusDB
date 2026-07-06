@@ -10,12 +10,25 @@
 //! `currentOp`. The non-auth handshake path — the default, and what most
 //! conformance suites exercise — is complete here.
 
+use std::sync::OnceLock;
+
 use bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 
 use crate::{
     CommandContext, HandlerResult, MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE, SERVER_VERSION,
     SERVER_VERSION_ARRAY, WIRE_VERSION,
 };
+
+/// `topologyVersion.processId` identifies the server *process* and is fixed for
+/// its lifetime. The SDAM spec compares it across heartbeats; a *changed*
+/// processId is read as "the server restarted", making drivers invalidate and
+/// clear the connection pool (close + reconnect). Minting a fresh `ObjectId` per
+/// hello therefore triggered a spurious pool-clear on nearly every monitoring
+/// heartbeat — so pin it once per process. (Java-gauge finding)
+fn hello_process_id() -> ObjectId {
+    static PROCESS_ID: OnceLock<ObjectId> = OnceLock::new();
+    *PROCESS_ID.get_or_init(ObjectId::new)
+}
 
 /// `hello` / `isMaster` / `ismaster`. Advertises a single-node `secantus`
 /// replica-set primary when a set name is configured (so pymongo's topology
@@ -40,7 +53,7 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "isWritablePrimary": true,
         "ismaster": true,
         "topologyVersion": {
-            "processId": ObjectId::new(),
+            "processId": hello_process_id(),
             "counter": Bson::Int64(0),
         },
         "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
@@ -145,4 +158,16 @@ pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
         "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
         "ok": 1.0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The topologyVersion processId must be identical across calls — a changing
+    /// value makes drivers read a server "restart" and clear the connection pool.
+    #[test]
+    fn hello_process_id_is_stable_across_calls() {
+        assert_eq!(hello_process_id(), hello_process_id());
+    }
 }
