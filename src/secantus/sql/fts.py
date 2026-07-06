@@ -143,6 +143,56 @@ def to_tsquery(text: str) -> dict[str, Any]:
     return {"tsquery": node}
 
 
+# The web-search grammar: bare words AND together, ``"quoted phrases"`` become
+# phrase (``<->``) queries, the bare word ``or`` is an OR, and a leading ``-``
+# negates the following word/phrase. Any other punctuation is ignored.
+_WEBSEARCH_TOKEN_RE = re.compile(r'\s*(-?"[^"]*"|-?[^\s"]+)')
+
+
+def websearch_to_tsquery(text: str) -> dict[str, Any]:
+    """``websearch_to_tsquery`` — parse a web-search-style query."""
+    items: list[Any] = []  # a mix of query-nodes and the sentinel "or"
+    for m in _WEBSEARCH_TOKEN_RE.finditer(text):
+        tok = m.group(1)
+        negate = tok.startswith("-")
+        if negate:
+            tok = tok[1:]
+        if not tok:
+            continue
+        if tok.startswith('"') and tok.endswith('"'):
+            node = phraseto_tsquery(tok[1:-1])["tsquery"]
+        elif tok.lower() == "or" and not negate:
+            items.append("or")
+            continue
+        else:
+            lexemes = [lex for lex in _lexemes(tok) if lex not in _STOPWORDS]
+            node = (
+                {"and": [{"lexeme": x} for x in lexemes]}
+                if len(lexemes) > 1
+                else ({"lexeme": lexemes[0]} if lexemes else None)
+            )
+        if node is None:
+            continue
+        items.append({"not": node} if negate else node)
+
+    # Split on the ``or`` sentinels into AND-groups, then OR the groups together.
+    groups: list[list[Any]] = [[]]
+    for it in items:
+        if it == "or":
+            groups.append([])
+        else:
+            groups[-1].append(it)
+    or_terms: list[Any] = []
+    for grp in groups:
+        if not grp:
+            continue
+        or_terms.append(grp[0] if len(grp) == 1 else {"and": grp})
+    if not or_terms:
+        return {"tsquery": None}
+    node = or_terms[0] if len(or_terms) == 1 else {"or": or_terms}
+    return {"tsquery": node}
+
+
 _QUERY_TOKEN_RE = re.compile(r"\s*(<->|<\d+>|&|\||!|\(|\)|[0-9A-Za-z]+(?::\*)?)")
 _PHRASE_OP_RE = re.compile(r"^<(-|\d+)>$")
 

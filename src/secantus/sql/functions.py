@@ -107,6 +107,7 @@ _SCALAR_EVAL_ANON = frozenset(
         "to_tsquery",
         "plainto_tsquery",
         "phraseto_tsquery",
+        "websearch_to_tsquery",
         "ts_rank",
         "ts_rank_cd",
         "ts_headline",
