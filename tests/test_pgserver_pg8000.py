@@ -2455,3 +2455,26 @@ def test_set_role_and_session_authorization_via_driver(real_server):
     cur.execute("SELECT session_user")
     assert cur.fetchall() == ([login],)
     conn.close()
+
+
+def test_row_level_security_reflection_via_driver(real_server):
+    # RLS DDL round-trips over the wire and pg_policies reflects it. (Enforcement
+    # is unit-tested with gated sessions in test_sql_rls.py; the trust-mode wire
+    # connection records but doesn't enforce.)
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE doc (id bigint primary key, owner text)")
+    cur.execute("INSERT INTO doc VALUES (1,'alice'),(2,'bob')")
+    cur.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")
+    cur.execute("CREATE POLICY p_owner ON doc FOR ALL TO public USING (owner = current_user)")
+    cur.execute(
+        "SELECT tablename, policyname, cmd, qual FROM pg_catalog.pg_policies ORDER BY policyname"
+    )
+    assert cur.fetchall() == (["doc", "p_owner", "ALL", "owner = current_user"],)
+    # Trust-mode connection is unrestricted: both rows visible.
+    cur.execute("SELECT id FROM doc ORDER BY id")
+    assert cur.fetchall() == ([1], [2])
+    cur.execute("DROP POLICY p_owner ON doc")
+    cur.execute("SELECT count(*) FROM pg_catalog.pg_policies")
+    assert cur.fetchall() == ([0],)
+    conn.close()

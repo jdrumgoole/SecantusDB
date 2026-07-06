@@ -872,6 +872,29 @@ def _pg_roles(db: str, session: Session, storage: Any, catalog: Catalog) -> list
     return rows
 
 
+def _pg_policies(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_policies`` — one row per RLS policy (#129)."""
+    lister = getattr(catalog, "list_policies", None)
+    if lister is None:
+        return []
+    rows = []
+    for p in lister(db):
+        roles = p.get("roles") or ["public"]
+        rows.append(
+            {
+                "schemaname": "public",
+                "tablename": p["table"],
+                "policyname": p["name"],
+                "permissive": "PERMISSIVE" if p.get("permissive", True) else "RESTRICTIVE",
+                "roles": "{" + ",".join(str(r) for r in roles) + "}",
+                "cmd": str(p.get("command") or "ALL").upper(),
+                "qual": p.get("using"),
+                "with_check": p.get("check"),
+            }
+        )
+    return rows
+
+
 def _role_row(oid: int, name: str, role: dict) -> dict:
     return {
         "oid": oid,
@@ -1409,6 +1432,21 @@ _register(
         ("rolbypassrls", "bool"),
     ],
     _pg_roles,
+)
+_register(
+    "pg_catalog",
+    "pg_policies",
+    [
+        ("schemaname", "text"),
+        ("tablename", "text"),
+        ("policyname", "text"),
+        ("permissive", "text"),
+        ("roles", "text"),
+        ("cmd", "text"),
+        ("qual", "text"),
+        ("with_check", "text"),
+    ],
+    _pg_policies,
 )
 _register(
     "pg_catalog",

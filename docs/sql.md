@@ -2520,6 +2520,38 @@ holds — its own login, a role in its bindings, or anything if it is a superuse
 *membership* is not otherwise tracked, so `SET ROLE` doesn't consult a membership
 graph beyond the session's own role bindings.
 
+### Row-level security (`CREATE POLICY`)
+
+Enable RLS on a table and attach policies to restrict which rows a role can see
+or write:
+
+```sql
+ALTER TABLE doc ENABLE ROW LEVEL SECURITY;
+CREATE POLICY owner_rows ON doc
+    FOR ALL TO public
+    USING (owner = current_user)         -- rows this role may read / target
+    WITH CHECK (owner = current_user);   -- rows this role may write
+```
+
+A policy's `USING` predicate is AND'd into the `WHERE` of a `SELECT` / `UPDATE` /
+`DELETE`, so only permitted rows are returned or affected; its `WITH CHECK`
+predicate is validated against each row an `INSERT` / `UPDATE` writes (a violation
+raises SQLSTATE `42501`). Identity functions (`current_user` / `session_user`) in
+a policy resolve to the session's identity — combined with `SET ROLE`, one
+connection can switch which rows it sees. `AS RESTRICTIVE` policies are AND'd with
+the OR of the permissive ones; a `FOR` clause scopes a policy to one command and
+`TO` scopes it to roles (default `public`). With RLS enabled and no applicable
+permissive policy, the table is default-deny (no rows).
+
+Enforcement follows the same opt-in as the rest of the RBAC surface: it bites
+only when authorization is active and a superuser (`root`) bypasses it, so trust
+mode and the embedded `run_sql` API record policies (visible in
+`pg_catalog.pg_policies`) but don't enforce them. **Limitations:** `USING`
+injection covers single-table `SELECT` / `UPDATE` / `DELETE` (a join doesn't get
+the base table's policy applied); there's no table-owner concept (RLS applies to
+every non-`root` role under active authorization, not "everyone except the
+owner"); and `FORCE ROW LEVEL SECURITY` is recorded but behaves like `ENABLE`.
+
 ## Session and catalog introspection
 
 Common session functions and settings resolve against the connection:
