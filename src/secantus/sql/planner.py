@@ -826,6 +826,12 @@ def _expr_to_filter(
     if isinstance(node, exp.Paren):
         return _expr_to_filter(node.this, resolve, subctx)
 
+    # Boolean literals — ``WHERE TRUE`` matches all, ``WHERE FALSE`` matches none
+    # (the latter is how a default-deny RLS policy renders). ``$nor`` of match-all
+    # is the empty-result filter.
+    if isinstance(node, exp.Boolean):
+        return {} if node.this else {"$nor": [{}]}
+
     # A schema-qualified function predicate (``pg_catalog.pg_table_is_visible(...)``)
     # parses as Dot(Identifier, Anonymous); unwrap to the function call.
     if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):

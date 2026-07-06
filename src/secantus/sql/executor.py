@@ -693,20 +693,31 @@ def _apply_generated_columns(docs: list[dict[str, Any]], table: Any, ctx: Any) -
             doc[col.field] = typemap.coerce(value, col.type_tag)
 
 
+def _validate_rls_check(docs: list[dict[str, Any]], table: Any, command: str, ctx: Any) -> None:
+    """Enforce each row's RLS ``WITH CHECK`` predicate (#129). No-op unless the
+    session enforces RLS and the table has policies enabled."""
+    if getattr(table, "reflected", False):
+        return
+    from secantus.sql import rls
+
+    for doc in docs:
+        rls.check_write_row(doc, table, command, ctx)
+
+
 def enforce_insert_rows(
     docs: list[dict[str, Any]], table: Any, storage: Any, db: str, catalog: Any, session: Any
 ) -> None:
     """Enforce every declared constraint against rows about to be inserted."""
     from secantus.sql import scalar
 
-    _apply_generated_columns(
-        docs, table, scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
-    )
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    _apply_generated_columns(docs, table, ctx)
     _validate_rows(docs, table, storage, db, session, catalog)
     _validate_enum_columns(docs, table, catalog, db)
     _validate_domain_columns(docs, table, storage, db, session, catalog)
     _validate_unique_rows(docs, table, storage, db, session=session)
     _validate_fk_child_rows(docs, table, storage, db, catalog, session)
+    _validate_rls_check(docs, table, "INSERT", ctx)
 
 
 def enforce_update_images(
@@ -728,6 +739,7 @@ def enforce_update_images(
     _apply_generated_columns(post_images, table, ctx)
     for post in post_images:
         _validate_write_row(post, table, ctx)
+    _validate_rls_check(post_images, table, "UPDATE", ctx)
     _validate_enum_columns(post_images, table, catalog, db)
     _validate_domain_columns(post_images, table, storage, db, session, catalog)
     _validate_unique_rows(

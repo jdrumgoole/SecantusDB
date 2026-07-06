@@ -29,6 +29,8 @@ ENUM_COLLECTION = "__sql_enums__"
 DOMAIN_COLLECTION = "__sql_domains__"
 COMPOSITE_COLLECTION = "__sql_composites__"
 FUNCTION_COLLECTION = "__sql_functions__"
+POLICY_COLLECTION = "__sql_policies__"
+RLS_COLLECTION = "__sql_rls__"
 
 
 def _ser_composite_fields(fields: Any) -> list | None:
@@ -604,6 +606,48 @@ class Catalog:
             if doc["grantee"] in grantees and want in doc.get("privileges", ()):
                 return True
         return False
+
+    # -- Row-level security (RLS) ------------------------------------------- #
+    # ``ALTER TABLE t ENABLE ROW LEVEL SECURITY`` records a per-table flag in
+    # ``__sql_rls__``; ``CREATE POLICY`` records a per-``(table, name)`` policy in
+    # ``__sql_policies__``. The authz gate (``rls.py``) injects a policy's USING
+    # predicate into the query WHERE and validates its WITH CHECK on writes.
+
+    def set_rls(self, db: str, table: str, *, enabled: bool, forced: bool = False) -> None:
+        self._storage.delete_matching(db, RLS_COLLECTION, {"_id": table})
+        self._storage.insert(
+            db,
+            RLS_COLLECTION,
+            [{"_id": table, "table": table, "enabled": bool(enabled), "forced": bool(forced)}],
+        )
+
+    def get_rls(self, db: str, table: str) -> dict[str, Any]:
+        docs = self._storage.find_matching(db, RLS_COLLECTION, {"_id": table}, limit=1)
+        if docs:
+            return {"enabled": bool(docs[0].get("enabled")), "forced": bool(docs[0].get("forced"))}
+        return {"enabled": False, "forced": False}
+
+    def create_policy(self, db: str, doc: dict[str, Any]) -> None:
+        """Persist a policy. ``doc`` carries ``name`` / ``table`` / ``command`` /
+        ``roles`` / ``permissive`` / ``using`` / ``check``. Errors 42710 on a
+        duplicate ``(table, name)``."""
+        key = f"{doc['table']}\x00{doc['name']}"
+        if self._storage.find_matching(db, POLICY_COLLECTION, {"_id": key}, limit=1):
+            raise errors.SQLError(
+                "42710", f'policy "{doc["name"]}" for table "{doc["table"]}" already exists'
+            )
+        self._storage.insert(db, POLICY_COLLECTION, [{"_id": key, **doc}])
+
+    def drop_policy(self, db: str, table: str, name: str) -> bool:
+        return (
+            self._storage.delete_matching(db, POLICY_COLLECTION, {"_id": f"{table}\x00{name}"}) > 0
+        )
+
+    def get_policies(self, db: str, table: str) -> list[dict[str, Any]]:
+        return self._storage.find_matching(db, POLICY_COLLECTION, {"table": table})
+
+    def list_policies(self, db: str) -> list[dict[str, Any]]:
+        return self._storage.find_matching(db, POLICY_COLLECTION, {})
 
     # -- SQL functions ------------------------------------------------------ #
     # ``CREATE FUNCTION name(params) RETURNS t AS $$ body $$ LANGUAGE sql`` —

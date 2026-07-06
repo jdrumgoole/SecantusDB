@@ -23,6 +23,7 @@ from secantus.sql import (
     executor,
     planner,
     reflect,
+    rls,
     scalar,
     srf,
     typemap,
@@ -1041,6 +1042,10 @@ def _run_statement(
     if _own_with(stmt) is not None:
         return _run_with(stmt, storage, db, catalog, session)
 
+    # Row-level security (#129): inject each applicable policy's USING predicate
+    # into a single-table SELECT / UPDATE / DELETE WHERE before planning.
+    _apply_rls_read(stmt, catalog, db, session)
+
     if isinstance(stmt, exp.SetOperation):
         return _run_set_operation(stmt, storage, db, catalog, session)
 
@@ -1096,6 +1101,12 @@ def _run_statement(
             return _create_domain_command(stmt, db, catalog)
         if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
             return _drop_domain_command(stmt, db, catalog)
+        if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("POLICY"):
+            return _create_policy_command(stmt, storage, db, catalog)
+        if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("POLICY"):
+            return _drop_policy_command(stmt, db, catalog)
+        if verb == "ALTER" and _RLS_ALTER_RE.match(_command_text(stmt)):
+            return _alter_rls_command(stmt, storage, db, catalog)
         if verb == "SET" and _command_text(stmt).lstrip().upper().startswith("CONSTRAINTS"):
             return _set_constraints_command(stmt, storage, db, catalog, session)
         if verb in ("CREATE", "DROP", "ALTER") and _command_text(stmt).lstrip().upper().startswith(
@@ -1606,6 +1617,125 @@ def _run_grant(
                 grant_option=bool(stmt.args.get("grant_option")),
             )
     return SQLResult(command_tag=tag)
+
+
+def _apply_rls_read(stmt: exp.Expression, catalog: Catalog, db: str, session: Session) -> None:
+    """Inject the RLS USING predicate into a single-table SELECT / UPDATE / DELETE
+    WHERE. Multi-table SELECTs (joins) are left untouched (documented limitation)."""
+    if not rls.enforced(session):
+        return
+    if isinstance(stmt, exp.Select):
+        if stmt.args.get("joins"):
+            return
+        frm = stmt.args.get("from_") or stmt.args.get("from")
+        tbl = frm.this if frm is not None else None
+    elif isinstance(stmt, (exp.Update, exp.Delete)):
+        tbl = stmt.find(exp.Table)
+    else:
+        return
+    if isinstance(tbl, exp.Table):
+        rls.apply_read(stmt, tbl.name, catalog, db, session)
+
+
+# -- Row-level security (RLS) DDL: ALTER TABLE … ROW LEVEL SECURITY, CREATE /
+#    DROP POLICY. All arrive as an ``exp.Command`` (sqlglot has no dedicated node),
+#    so the tail is regex-parsed. #129
+_RLS_ALTER_RE = re.compile(
+    r'(?is)^\s*TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?("[^"]+"|[\w.]+)\s+'
+    r"(ENABLE|DISABLE|NO\s+FORCE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\s*;?\s*$"
+)
+_CREATE_POLICY_RE = re.compile(
+    r'(?is)^\s*POLICY\s+(?P<name>"[^"]+"|\w+)\s+ON\s+(?P<table>"[^"]+"|[\w.]+)\s*(?P<rest>.*)$'
+)
+_DROP_POLICY_RE = re.compile(
+    r'(?is)^\s*POLICY\s+(?:IF\s+EXISTS\s+)?(?P<name>"[^"]+"|\w+)\s+ON\s+'
+    r'(?P<table>"[^"]+"|[\w.]+)\s*;?\s*$'
+)
+
+
+def _unquote_name(text: str) -> str:
+    text = text.strip().strip('"')
+    return text.rsplit(".", 1)[-1]  # drop any schema qualifier
+
+
+def _paren_after(text: str, keyword: str) -> str | None:
+    """The balanced-parenthesis substring following ``keyword`` (e.g. ``USING`` /
+    ``WITH CHECK``) in ``text``, or None if the keyword isn't present."""
+    m = re.search(r"(?i)\b" + keyword + r"\s*\(", text)
+    if m is None:
+        return None
+    start = m.end() - 1  # index of the opening '('
+    depth = 0
+    for j in range(start, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : j].strip()
+    return None
+
+
+def _alter_rls_command(stmt: exp.Command, storage: Any, db: str, catalog: Catalog) -> SQLResult:
+    m = _RLS_ALTER_RE.match(_command_text(stmt))
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported RLS command: {stmt.sql()}")
+    table = _unquote_name(m.group(1))
+    if catalog.get(db, table) is None and reflect.reflect(storage, db, table) is None:
+        raise errors.undefined_table(table)
+    action = re.sub(r"\s+", " ", m.group(2).upper())
+    state = catalog.get_rls(db, table)
+    if action == "ENABLE":
+        state["enabled"] = True
+    elif action == "DISABLE":
+        state["enabled"] = False
+    elif action == "FORCE":
+        state["forced"] = True
+    elif action == "NO FORCE":
+        state["forced"] = False
+    catalog.set_rls(db, table, enabled=state["enabled"], forced=state["forced"])
+    return SQLResult(command_tag="ALTER TABLE")
+
+
+def _create_policy_command(stmt: exp.Command, storage: Any, db: str, catalog: Catalog) -> SQLResult:
+    text = _command_text(stmt)
+    m = _CREATE_POLICY_RE.match(text)
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported CREATE POLICY: {stmt.sql()}")
+    name, table = _unquote_name(m.group("name")), _unquote_name(m.group("table"))
+    if catalog.get(db, table) is None and reflect.reflect(storage, db, table) is None:
+        raise errors.undefined_table(table)
+    rest = m.group("rest")
+    permissive = re.search(r"(?i)\bAS\s+RESTRICTIVE\b", rest) is None
+    cmd_m = re.search(r"(?i)\bFOR\s+(ALL|SELECT|INSERT|UPDATE|DELETE)\b", rest)
+    command = cmd_m.group(1).upper() if cmd_m else "ALL"
+    roles_m = re.search(r"(?i)\bTO\s+(.+?)(?=\s+USING\b|\s+WITH\s+CHECK\b|$)", rest)
+    if roles_m:
+        roles = [r.strip().strip('"') for r in roles_m.group(1).split(",") if r.strip()]
+    else:
+        roles = ["public"]
+    doc = {
+        "name": name,
+        "table": table,
+        "command": command,
+        "roles": roles,
+        "permissive": permissive,
+        "using": _paren_after(rest, "USING"),
+        "check": _paren_after(rest, r"WITH\s+CHECK"),
+    }
+    catalog.create_policy(db, doc)
+    return SQLResult(command_tag="CREATE POLICY")
+
+
+def _drop_policy_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    text = _command_text(stmt)
+    m = _DROP_POLICY_RE.match(text)
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported DROP POLICY: {stmt.sql()}")
+    name, table = _unquote_name(m.group("name")), _unquote_name(m.group("table"))
+    if not catalog.drop_policy(db, table, name) and "IF EXISTS" not in text.upper():
+        raise errors.SQLError("42704", f'policy "{name}" for table "{table}" does not exist')
+    return SQLResult(command_tag="DROP POLICY")
 
 
 def _run_role_command(verb: str, stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:

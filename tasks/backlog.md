@@ -2495,6 +2495,27 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   transaction (behaves like `SET`); the Mongo RBAC db-level gate still uses the login's `session.roles`
   (SET ROLE changes the table-grant identity + `current_user`, not the underlying db-wide Mongo role
   bindings). Not ported to the Rust server.
+- [ ] **Row-level security (RLS) landed** (#129, b169): `ALTER TABLE t {ENABLE|DISABLE|FORCE|NO FORCE}
+  ROW LEVEL SECURITY` + `CREATE POLICY name ON t [AS PERMISSIVE|RESTRICTIVE] [FOR cmd] [TO roles]
+  [USING (expr)] [WITH CHECK (expr)]` + `DROP POLICY [IF EXISTS] name ON t` (all `exp.Command`;
+  regex-parsed in `engine._alter_rls_command` / `_create_policy_command` / `_drop_policy_command`,
+  balanced-paren extraction via `_paren_after`). Persisted in `__sql_rls__` (per-table enabled/forced)
+  and `__sql_policies__` (per-`(table, name)`: command / roles / permissive / using / check) via
+  `Catalog.set_rls` / `get_rls` / `create_policy` / `drop_policy` / `get_policies` / `list_policies`.
+  Enforcement in `secantus.sql.rls`: `apply_read` AND-injects the combined USING predicate (permissive
+  OR'd, restrictive AND'd, `current_user`/`session_user` substituted to string literals) into a
+  single-table SELECT/UPDATE/DELETE WHERE (via `engine._apply_rls_read` before dispatch);
+  `check_write_row` validates the combined WITH CHECK (falling back to USING) per new row on
+  INSERT/UPDATE (wired into `executor._validate_rls_check` at the two write chokepoints), raising `42501`.
+  Default-deny (RLS on, no applicable permissive policy) renders as `WHERE FALSE` — `planner._expr_to_filter`
+  now lowers `exp.Boolean` (`TRUE`→`{}`, `FALSE`→`{"$nor":[{}]}`). Gated on `session.authz_active`, `root`
+  bypasses; trust mode / embedded record but don't enforce. Reflected via `pg_catalog.pg_policies`
+  (`virtual._pg_policies`). Tests: `tests/test_sql_rls.py` + `test_pgserver_pg8000.py::test_row_level_security_reflection_via_driver`.
+  **Limitations:** USING injection is single-table only (a join doesn't get the base table's policy — COLLSCAN-safe but unfiltered on joined reads);
+  no table-owner concept (RLS applies to every non-root role under active authz, not "all but the owner"); `FORCE` is
+  recorded but behaves like `ENABLE` (no owner to force against); RLS DDL itself needs no privilege (any authenticated
+  user can add/alter policies — no ownership check); policies over the pipeline/set-operation/CTE paths aren't injected
+  (only the direct single-table SELECT/UPDATE/DELETE dispatch). Not ported to the Rust server.
 - [ ] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
   IDENTITY [(START WITH n INCREMENT BY n)]` columns (`planner._identity_spec`) reuse the SERIAL sequence
   machinery — an owned `<table>_<col>_seq`, NOT NULL, auto-filled on omit. `Column.identity` is
