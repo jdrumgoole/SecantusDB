@@ -105,6 +105,9 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         hstore_result = _eval_hstore_op(node, scope, ctx)
         if hstore_result is not _NOT_HSTORE:
             return hstore_result
+        array_result = _eval_array_op(node, scope, ctx)
+        if array_result is not _NOT_ARRAY:
+            return array_result
     if isinstance(
         node, (exp.JSONBContains, exp.JSONBContainsAllTopKeys, exp.JSONBContainsAnyTopKeys)
     ):
@@ -1798,6 +1801,7 @@ _NOT_NET = object()
 _NOT_BIT = object()
 _NOT_GEO = object()
 _NOT_HSTORE = object()
+_NOT_ARRAY = object()
 
 
 def _eval_hstore_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
@@ -1984,6 +1988,36 @@ def _eval_range_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> An
         )
     # ArrayContainsAll -> @> : left contains right (element or range)
     return _ranges.contains_range(left, right) if right_r else _ranges.contains_value(left, right)
+
+
+def _array_membership(needle: Any, haystack: list) -> bool:
+    """Postgres array element equality — a plain ``in`` test, but tolerant of the
+    ``value in [..]`` raising on unhashable / mismatched element types."""
+    for item in haystack:
+        try:
+            if item == needle:
+                return True
+        except Exception:  # noqa: BLE001 — heterogeneous element types compare unequal
+            continue
+    return False
+
+
+def _eval_array_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``@>`` (contains) / ``<@`` (contained by) / ``&&`` (overlaps) on Postgres
+    *array* operands (both sides are lists). Returns ``_NOT_ARRAY`` when either
+    operand isn't a list, so the caller falls back to the jsonb handling of the
+    same operator token."""
+    left = evaluate(node.this, scope, ctx)
+    right = evaluate(node.expression, scope, ctx)
+    if not (isinstance(left, (list, tuple)) and isinstance(right, (list, tuple))):
+        return _NOT_ARRAY
+    left, right = list(left), list(right)
+    if isinstance(node, exp.ArrayOverlaps):  # && : share at least one element
+        return any(_array_membership(x, right) for x in left)
+    if isinstance(node, exp.ArrayContainedBy):  # <@ : every left element is in right
+        return all(_array_membership(x, right) for x in left)
+    # ArrayContainsAll -> @> : every right element is in left
+    return all(_array_membership(x, left) for x in right)
 
 
 def _eval_jsonb_path_op(

@@ -980,12 +980,37 @@ SELECT id FROM post WHERE scores @> ARRAY[5]; -- containment -> 2
 SELECT id, array_length(tags, 1) FROM post;   -- 1 -> 2, 2 -> 1
 ```
 
-`= ANY(col)` is array membership (the value is contained in the array),
-`col @> ARRAY[…]` is containment (every listed element is present), and
+`= ANY(col)` is array membership (the value is contained in the array); the three
+array containment / overlap operators are all supported:
+
+```sql
+SELECT id FROM post WHERE scores @> ARRAY[5];       -- contains: every RHS elem in LHS
+SELECT id FROM post WHERE scores <@ ARRAY[5,10,20]; -- contained by: every LHS elem in RHS
+SELECT id FROM post WHERE scores && ARRAY[20,99];   -- overlaps: share ≥1 element
+```
+
 `array_length(col, 1)` / `cardinality(col)` give the element count (only
 dimension 1 exists — arrays are one level deep, so any other dimension is NULL).
 Array columns reflect as `information_schema.columns.data_type = 'ARRAY'` with the
 Postgres array type OID in `pg_attribute`.
+
+Arrays of the richer element types work the same way, and each reports its proper
+Postgres array-type OID so a driver decodes the elements natively (a `uuid[]`
+column comes back as a list of `UUID` objects, an `inet[]` as network objects,
+etc.):
+
+```sql
+CREATE TABLE ev (id int, ids uuid[], hosts inet[], days date[], spans interval[]);
+INSERT INTO ev VALUES (1,
+  ARRAY['11111111-1111-1111-1111-111111111111'::uuid],
+  ARRAY['10.0.0.1'::inet], ARRAY['2026-01-01'::date], ARRAY['1 day'::interval]);
+SELECT id FROM ev WHERE ids @> ARRAY['11111111-1111-1111-1111-111111111111'::uuid];
+```
+
+`uuid[]`, `inet[]`/`cidr[]`/`macaddr[]`, `date[]`/`time[]`/`timetz[]`,
+`interval[]`, `bit[]`/`varbit[]`, `money[]`, `xml[]`, `json[]`, the geometric
+array types (`point[]`, `box[]`, …), and the range array types all carry their
+real array OID.
 
 Subscripting is 1-based, and `unnest(col)` expands an array to one row per element:
 
