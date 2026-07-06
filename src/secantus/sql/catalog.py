@@ -24,6 +24,7 @@ VIEW_COLLECTION = "__sql_views__"
 MATVIEW_COLLECTION = "__sql_matviews__"
 SEQUENCE_COLLECTION = "__sql_sequences__"
 ROLE_COLLECTION = "__sql_roles__"
+GRANT_COLLECTION = "__sql_grants__"
 ENUM_COLLECTION = "__sql_enums__"
 DOMAIN_COLLECTION = "__sql_domains__"
 COMPOSITE_COLLECTION = "__sql_composites__"
@@ -516,6 +517,93 @@ class Catalog:
     def list_roles(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, ROLE_COLLECTION, {})
         return sorted(d["role"] for d in docs)
+
+    # -- Table-level privileges (GRANT / REVOKE) ---------------------------- #
+    # ``GRANT SELECT ON t TO alice`` / ``REVOKE INSERT ON t FROM bob`` — persisted
+    # here, one document per ``(table, grantee)`` carrying the set of privileges
+    # that grantee holds on that table. The authz gate (``authz.py``) reads these
+    # to allow a data operation a user's Mongo role wouldn't otherwise cover, and
+    # ``information_schema.role_table_grants`` / ``has_table_privilege()`` reflect
+    # them. The four enforced privileges are SELECT / INSERT / UPDATE / DELETE;
+    # PG's other table privileges (TRUNCATE / REFERENCES / TRIGGER) are recorded
+    # for reflection fidelity but not enforced (the operations don't exist here).
+
+    # The order PG lists them for ``GRANT ALL`` / ``has_table_privilege`` fidelity.
+    TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
+
+    @staticmethod
+    def _grant_key(table: str, grantee: str) -> str:
+        # NUL-joined so a table or grantee containing a delimiter can't collide.
+        return f"{table}\x00{grantee}"
+
+    def grant_table_privileges(
+        self,
+        db: str,
+        table: str,
+        grantee: str,
+        privileges: list[str],
+        *,
+        grant_option: bool = False,
+    ) -> None:
+        """Add ``privileges`` to what ``grantee`` holds on ``table`` (union with any
+        existing grant). ``grant_option`` marks the grant as re-grantable."""
+        key = self._grant_key(table, grantee)
+        existing = self._storage.find_matching(db, GRANT_COLLECTION, {"_id": key}, limit=1)
+        held = set(existing[0]["privileges"]) if existing else set()
+        held.update(p.upper() for p in privileges)
+        option = bool(grant_option) or (bool(existing) and existing[0].get("grant_option", False))
+        doc = {
+            "_id": key,
+            "table": table,
+            "grantee": grantee,
+            "privileges": [p for p in self.TABLE_PRIVILEGES if p in held],
+            "grant_option": option,
+        }
+        self._storage.delete_matching(db, GRANT_COLLECTION, {"_id": key})
+        self._storage.insert(db, GRANT_COLLECTION, [doc])
+
+    def revoke_table_privileges(
+        self, db: str, table: str, grantee: str, privileges: list[str]
+    ) -> None:
+        """Remove ``privileges`` from what ``grantee`` holds on ``table``; the
+        grant document is deleted once no privileges remain."""
+        key = self._grant_key(table, grantee)
+        existing = self._storage.find_matching(db, GRANT_COLLECTION, {"_id": key}, limit=1)
+        if not existing:
+            return
+        held = set(existing[0]["privileges"]) - {p.upper() for p in privileges}
+        self._storage.delete_matching(db, GRANT_COLLECTION, {"_id": key})
+        if held:
+            self._storage.insert(
+                db,
+                GRANT_COLLECTION,
+                [
+                    {
+                        "_id": key,
+                        "table": table,
+                        "grantee": grantee,
+                        "privileges": [p for p in self.TABLE_PRIVILEGES if p in held],
+                        "grant_option": existing[0].get("grant_option", False),
+                    }
+                ],
+            )
+
+    def get_table_grants(self, db: str, table: str) -> list[dict[str, Any]]:
+        """Every grant recorded on ``table`` (one dict per grantee)."""
+        return self._storage.find_matching(db, GRANT_COLLECTION, {"table": table})
+
+    def list_table_grants(self, db: str) -> list[dict[str, Any]]:
+        """Every table grant in ``db`` (for ``information_schema`` reflection)."""
+        return self._storage.find_matching(db, GRANT_COLLECTION, {})
+
+    def has_table_privilege(self, db: str, table: str, grantees: set[str], privilege: str) -> bool:
+        """Whether any identity in ``grantees`` (a user + its role names, plus
+        ``PUBLIC``) holds ``privilege`` on ``table`` via a recorded grant."""
+        want = privilege.upper()
+        for doc in self.get_table_grants(db, table):
+            if doc["grantee"] in grantees and want in doc.get("privileges", ()):
+                return True
+        return False
 
     # -- SQL functions ------------------------------------------------------ #
     # ``CREATE FUNCTION name(params) RETURNS t AS $$ body $$ LANGUAGE sql`` —

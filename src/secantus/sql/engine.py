@@ -150,7 +150,7 @@ def _dispatch(
     # Per-statement RBAC gate (#193). No-op unless the session marked
     # authorization active (wire server with require_auth + per-user roles);
     # transaction control and savepoints above are exempt and already returned.
-    authz.authorize(stmt, session, storage)
+    authz.authorize(stmt, session, storage, catalog)
 
     if session.txn_handle is not None:
         try:
@@ -1108,11 +1108,10 @@ def _run_statement(
         return _run_command(stmt, session)
 
     if isinstance(stmt, exp.Grant):
-        # Privileges aren't enforced (single-node dev surface) — accept as a no-op.
-        return SQLResult(command_tag="GRANT")
+        return _run_grant(stmt, storage, db, catalog, revoke=False)
 
     if isinstance(stmt, exp.Revoke):
-        return SQLResult(command_tag="REVOKE")
+        return _run_grant(stmt, storage, db, catalog, revoke=True)
 
     # CLOSE cursor / CLOSE ALL parses as a bare Alias (``CLOSE AS name``).
     close = _close_cursor_target(stmt)
@@ -1549,6 +1548,64 @@ def _parse_role_attrs(rest: str) -> dict[str, Any]:
                     pass
         i += 1
     return attrs
+
+
+def _grant_privilege_names(stmt: exp.Expression) -> list[str] | None:
+    """The privilege keywords of a ``GRANT``/``REVOKE`` (``ALL`` expands to every
+    table privilege), or None when they aren't recognised table privileges."""
+    privs = stmt.args.get("privileges") or []
+    out: list[str] = []
+    for gp in privs:
+        this = gp.this if isinstance(gp, exp.GrantPrivilege) else gp
+        name = str(getattr(this, "name", this)).upper()
+        if name in ("ALL", "ALL PRIVILEGES"):
+            return list(Catalog.TABLE_PRIVILEGES)
+        if name not in Catalog.TABLE_PRIVILEGES:
+            return None
+        out.append(name)
+    return out
+
+
+def _grant_principals(stmt: exp.Expression) -> list[str]:
+    """The grantee role names of a ``GRANT``/``REVOKE`` (``PUBLIC`` kept as-is)."""
+    out: list[str] = []
+    for gp in stmt.args.get("principals") or []:
+        ident = gp.this if isinstance(gp, exp.GrantPrincipal) else gp
+        out.append(str(getattr(ident, "name", ident)))
+    return out
+
+
+def _run_grant(
+    stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, *, revoke: bool
+) -> SQLResult:
+    """``GRANT``/``REVOKE`` <privs> ``ON`` <table> ``TO``/``FROM`` <role> ... —
+    persist per-``(table, grantee)`` table privileges the authz gate enforces.
+
+    Only object grants on a *table* for the SELECT/INSERT/UPDATE/DELETE (or ALL)
+    privileges are recorded; anything else (schema/database grants, role
+    membership, unsupported privileges) is accepted as a no-op, matching the
+    prior permissive behaviour."""
+    tag = "REVOKE" if revoke else "GRANT"
+    securable = stmt.args.get("securable")
+    privileges = _grant_privilege_names(stmt)
+    if not isinstance(securable, exp.Table) or privileges is None:
+        return SQLResult(command_tag=tag)  # not a recorded table privilege — no-op
+    table_name = securable.name
+    # The table must exist (declared or reflectable) — mirrors CREATE INDEX.
+    if catalog.get(db, table_name) is None and reflect.reflect(storage, db, table_name) is None:
+        raise errors.undefined_table(table_name)
+    for grantee in _grant_principals(stmt):
+        if revoke:
+            catalog.revoke_table_privileges(db, table_name, grantee, privileges)
+        else:
+            catalog.grant_table_privileges(
+                db,
+                table_name,
+                grantee,
+                privileges,
+                grant_option=bool(stmt.args.get("grant_option")),
+            )
+    return SQLResult(command_tag=tag)
 
 
 def _run_role_command(verb: str, stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:

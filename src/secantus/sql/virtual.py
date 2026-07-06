@@ -225,6 +225,31 @@ def _info_schemata(db: str, session: Session, storage: Any, catalog: Catalog) ->
     ]
 
 
+def _info_table_grants(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``information_schema.role_table_grants`` / ``.table_privileges`` — one row per
+    ``(grantee, table, privilege)`` recorded by GRANT. The grantor isn't tracked
+    (single-node dev surface), so it's reported as the connected user."""
+    lister = getattr(catalog, "list_table_grants", None)
+    if lister is None:
+        return []
+    rows: list[dict] = []
+    for doc in lister(db):
+        for priv in doc.get("privileges", ()):
+            rows.append(
+                {
+                    "grantor": session.user,
+                    "grantee": doc["grantee"],
+                    "table_catalog": db,
+                    "table_schema": "public",
+                    "table_name": doc["table"],
+                    "privilege_type": priv,
+                    "is_grantable": "YES" if doc.get("grant_option") else "NO",
+                    "with_hierarchy": "YES" if priv == "SELECT" else "NO",
+                }
+            )
+    return rows
+
+
 def _pk_constraints(db: str, catalog: Catalog) -> list[tuple[TableDef, str, list[str]]]:
     """Each table's PRIMARY KEY constraint as ``(table, constraint_name, [cols])``.
     The PK is the only real constraint in our model (a ``CREATE UNIQUE INDEX`` is
@@ -1193,6 +1218,18 @@ _register(
     [("catalog_name", "text"), ("schema_name", "text")],
     _info_schemata,
 )
+_TABLE_GRANT_COLUMNS: ColumnsSpec = [
+    ("grantor", "text"),
+    ("grantee", "text"),
+    ("table_catalog", "text"),
+    ("table_schema", "text"),
+    ("table_name", "text"),
+    ("privilege_type", "text"),
+    ("is_grantable", "text"),
+    ("with_hierarchy", "text"),
+]
+_register("information_schema", "role_table_grants", _TABLE_GRANT_COLUMNS, _info_table_grants)
+_register("information_schema", "table_privileges", _TABLE_GRANT_COLUMNS, _info_table_grants)
 _register(
     "information_schema",
     "table_constraints",

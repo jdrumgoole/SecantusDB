@@ -2453,12 +2453,31 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `CONNECTION LIMIT`; `USER` implies LOGIN). Stored in a per-db `__sql_roles__` collection
   (`Catalog.put_role` / `get_role` / `drop_role` / `list_roles`), reflected via `pg_catalog.pg_roles`
   (`_pg_roles`), which also surfaces the connecting `session.user` as a superuser login role (Postgres
-  bootstrap-superuser analogue). `GRANT` / `REVOKE` (privileges via `exp.Grant` / `exp.Revoke`, role
-  membership via `Command`) are accepted as no-ops. Tests: `tests/test_sql_roles.py`. **Limitations:**
+  bootstrap-superuser analogue). Role-membership `GRANT`/`REVOKE` (via `Command`, e.g. `GRANT admin TO
+  alice`) and grants on schemas/databases/sequences are accepted as no-ops; table-privilege
+  `GRANT`/`REVOKE` is enforced (next entry). Tests: `tests/test_sql_roles.py`. **Limitations:**
   roles are a reflection / DDL-acceptance record only — **distinct from the wire server's SCRAM auth
-  users** (constructor `users={}`), no privilege enforcement, no `pg_authid` / `pg_auth_members` /
-  role-membership graph, password not stored (only a `password_set` flag), and roles live in the
-  connection's db rather than being cluster-wide.
+  users** (constructor `users={}`), no `pg_authid` / `pg_auth_members` / role-membership graph, password
+  not stored (only a `password_set` flag), and roles live in the connection's db rather than being
+  cluster-wide.
+- [ ] **Enforced table-level GRANT/REVOKE landed** (#127, b167): `GRANT`/`REVOKE` of
+  `SELECT`/`INSERT`/`UPDATE`/`DELETE` (or `ALL`) `ON <table> TO/FROM <role>` (`exp.Grant`/`exp.Revoke`
+  with a `Table` securable) persist per-`(table, grantee)` in `__sql_grants__`
+  (`Catalog.grant_table_privileges` / `revoke_table_privileges` / `get_table_grants` /
+  `list_table_grants` / `has_table_privilege`; `engine._run_grant`). Enforced as an **additive** layer
+  over the Mongo RBAC gate in `authz.authorize`: a data op is allowed when the Mongo role covers it *or*
+  a table grant does (grantee = the session user, one of its role names, or `PUBLIC`), gated on
+  `session.authz_active` like the rest of the SQL RBAC (trust mode / embedded `run_sql` record but don't
+  enforce). Surfaced via `information_schema.role_table_grants` / `.table_privileges`
+  (`virtual._info_table_grants`) and `has_table_privilege([user,] table, privilege)`
+  (`scalar._has_table_privilege`). Tests: `tests/test_sql_grants.py` +
+  `test_pgserver_pg8000.py::test_grant_revoke_reflection_via_driver`. **Limitations:** additive only —
+  a table grant never *restricts* a broader Mongo role (`readWrite` still writes any table regardless of
+  table grants); no per-column / `WITH GRANT OPTION` enforcement (the flag is stored + reflected but
+  re-grant chains aren't checked); `TRUNCATE`/`REFERENCES`/`TRIGGER` recorded for `ALL` fidelity but not
+  enforced (no such ops); no table-owner tracking (owners aren't auto-granted — the seeding/trust-mode
+  session is unrestricted anyway); grant target must be a single identifiable table (multi-table /
+  subquery statements get no table-grant fallback). Not ported to the Rust server.
 - [ ] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
   IDENTITY [(START WITH n INCREMENT BY n)]` columns (`planner._identity_spec`) reuse the SERIAL sequence
   machinery — an owned `<table>_<col>_seq`, NOT NULL, auto-filled on omit. `Column.identity` is
