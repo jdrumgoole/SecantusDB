@@ -1293,6 +1293,35 @@ def _op_last(arg: Any, ctx: _Ctx) -> Any:
     return arr[-1] if isinstance(arr, list) and arr else None
 
 
+def _first_last_n(arg: Any, ctx: _Ctx, *, first: bool) -> Any:
+    """``$firstN`` / ``$lastN`` (expression form): the first / last ``n`` elements
+    of an array. ``n`` must resolve to a positive integer; a null / missing
+    ``input`` yields null; a non-array ``input`` raises. When the array has fewer
+    than ``n`` elements the whole array is returned."""
+    op = "$firstN" if first else "$lastN"
+    if not isinstance(arg, Mapping) or "n" not in arg or "input" not in arg:
+        raise ExpressionError(f"{op} requires {{n, input}}")
+    n = _eval(arg["n"], ctx)
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise ExpressionError(f"{op} 'n' must be an integer")
+    if n <= 0:
+        raise ExpressionError(f"{op} 'n' must be greater than 0")
+    arr = _eval(arg["input"], ctx)
+    if arr is None:
+        return None
+    if not isinstance(arr, list):
+        raise ExpressionError(f"{op} 'input' must be an array")
+    return arr[:n] if first else arr[-n:]
+
+
+def _op_first_n(arg: Any, ctx: _Ctx) -> Any:
+    return _first_last_n(arg, ctx, first=True)
+
+
+def _op_last_n(arg: Any, ctx: _Ctx) -> Any:
+    return _first_last_n(arg, ctx, first=False)
+
+
 def _op_slice(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, list) or len(arg) not in (2, 3):
         raise ExpressionError("$slice requires [array, n] or [array, position, n]")
@@ -1679,6 +1708,8 @@ _OPS = {
     "$bitOr": _op_bit_or,
     "$bitXor": _op_bit_xor,
     "$bitNot": _op_bit_not,
+    "$firstN": _op_first_n,
+    "$lastN": _op_last_n,
     "$mergeObjects": _op_merge_objects,
     "$objectToArray": _op_object_to_array,
     "$setField": _op_set_field,

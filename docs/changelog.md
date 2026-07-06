@@ -19,6 +19,21 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$firstN` / `$lastN` array expressions (both servers)
+
+Both servers now support MongoDB 5.2's `$firstN` and `$lastN` aggregation
+expressions: `{$firstN: {n: <int>, input: <array>}}` returns the first `n`
+elements of an array, `$lastN` the last `n`. When the array is shorter than `n`
+the whole array is returned; a null or missing `input` yields null; a non-array
+`input` or an `n` that isn't a positive integer raises, matching mongod. Neither
+server recognised these before.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$firstN` / `$lastN` expression operators.
+  (The `$group` accumulator forms — and the sort-based `$maxN` / `$minN` — remain
+  follow-ons, see `tasks/backlog.md` §7.5.)
+
 ### Bitwise aggregation operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot` (both servers)
 
 Both servers now support MongoDB 6.3's bitwise aggregation expressions.

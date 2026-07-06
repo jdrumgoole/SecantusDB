@@ -93,6 +93,18 @@ CURATED = [
     ({"$bitAnd": ["$a", "$missing"]}, {"a": 12}),  # null propagation
     ({"$bitAnd": ["$a", 1.5]}, {"a": 12}),  # double operand -> defer (Python raises)
     ({"$bitOr": ["$a", True]}, {"a": 12}),  # bool operand -> defer
+    # $firstN / $lastN (expression form) — slice first/last n; n>len -> all;
+    # null/missing input -> null; invalid n / non-array defer (Python raises).
+    ({"$firstN": {"n": 2, "input": "$a"}}, {"a": [10, 20, 30, 40]}),
+    ({"$lastN": {"n": 2, "input": "$a"}}, {"a": [10, 20, 30, 40]}),
+    ({"$firstN": {"n": 10, "input": "$a"}}, {"a": [10, 20]}),
+    ({"$lastN": {"n": 10, "input": "$a"}}, {"a": [10, 20]}),
+    ({"$firstN": {"n": 1, "input": "$a"}}, {"a": []}),
+    ({"$firstN": {"n": 2, "input": "$missing"}}, {}),
+    ({"$firstN": {"n": 0, "input": "$a"}}, {"a": [1, 2]}),  # n<=0 -> defer
+    ({"$lastN": {"n": 1.5, "input": "$a"}}, {"a": [1, 2]}),  # non-int n -> defer
+    ({"$firstN": {"n": 2, "input": 5}}, {}),  # non-array -> defer
+    ({"$firstN": {"n": Int64(2), "input": "$a"}}, {"a": [7, 8, 9]}),  # long n ok
     ("$a", {"a": 5}),
     ("hi", {}),
     ("$missing", {}),

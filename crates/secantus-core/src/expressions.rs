@@ -186,6 +186,8 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$arrayElemAt" => op_array_elem_at(arg, ctx),
         "$first" => op_first_last(arg, ctx, true),
         "$last" => op_first_last(arg, ctx, false),
+        "$firstN" => op_first_last_n(arg, ctx, true),
+        "$lastN" => op_first_last_n(arg, ctx, false),
         "$concatArrays" => op_concat_arrays(arg, ctx),
         "$reverseArray" => op_reverse_array(arg, ctx),
         "$sortArray" => op_sort_array(arg, ctx),
@@ -673,6 +675,36 @@ fn op_first_last(arg: &Bson, ctx: &Ctx, first: bool) -> R {
         }),
         _ => Ok(Bson::Null),
     }
+}
+
+/// `$firstN` / `$lastN` (expression form): the first / last `n` elements of an
+/// array. `n` must be a positive int/long; a null / missing `input` yields null.
+/// Invalid `n` (non-int, ≤ 0) or a non-array `input` defers to Python (which
+/// raises the exact error). Mirrors the pure `_first_last_n`.
+fn op_first_last_n(arg: &Bson, ctx: &Ctx, first: bool) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let n = match eval(d.get("n").ok_or(Fallback)?, ctx)? {
+        Bson::Int32(x) => x as i64,
+        Bson::Int64(x) => x,
+        _ => return Err(Fallback), // bool / double / ... -> Python raises
+    };
+    if n <= 0 {
+        return Err(Fallback); // Python raises "must be greater than 0"
+    }
+    let arr = match eval(d.get("input").ok_or(Fallback)?, ctx)? {
+        Bson::Null => return Ok(Bson::Null),
+        Bson::Array(a) => a,
+        _ => return Err(Fallback), // Python raises "input must be an array"
+    };
+    let n = (n as usize).min(arr.len());
+    let out: Vec<Bson> = if first {
+        arr[..n].to_vec()
+    } else {
+        arr[arr.len() - n..].to_vec()
+    };
+    Ok(Bson::Array(out))
 }
 
 fn op_concat_arrays(arg: &Bson, ctx: &Ctx) -> R {
@@ -3018,6 +3050,60 @@ mod tests {
         assert!(evaluate(
             &doc! {},
             &bson::bson!({"$add": ["a", "b"]}),
+            &Document::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn first_n_last_n() {
+        let d = doc! {"a": [10i32, 20i32, 30i32, 40i32, 50i32]};
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$firstN": {"n": 2, "input": "$a"}})),
+            Bson::Array(vec![Bson::Int32(10), Bson::Int32(20)])
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$lastN": {"n": 2, "input": "$a"}})),
+            Bson::Array(vec![Bson::Int32(40), Bson::Int32(50)])
+        );
+        // n larger than the array -> whole array.
+        assert_eq!(
+            ev(
+                d.clone(),
+                bson::bson!({"$firstN": {"n": 10, "input": "$a"}})
+            ),
+            Bson::Array(vec![
+                Bson::Int32(10),
+                Bson::Int32(20),
+                Bson::Int32(30),
+                Bson::Int32(40),
+                Bson::Int32(50)
+            ])
+        );
+        // null / missing input -> null.
+        assert_eq!(
+            ev(
+                d.clone(),
+                bson::bson!({"$firstN": {"n": 2, "input": "$missing"}})
+            ),
+            Bson::Null
+        );
+        // Invalid n / non-array input defer (Python raises).
+        assert!(evaluate(
+            &d,
+            &bson::bson!({"$firstN": {"n": 0, "input": "$a"}}),
+            &Document::new()
+        )
+        .is_err());
+        assert!(evaluate(
+            &d,
+            &bson::bson!({"$lastN": {"n": 1.5, "input": "$a"}}),
+            &Document::new()
+        )
+        .is_err());
+        assert!(evaluate(
+            &d,
+            &bson::bson!({"$firstN": {"n": 2, "input": 5}}),
             &Document::new()
         )
         .is_err());
