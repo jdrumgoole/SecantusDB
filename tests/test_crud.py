@@ -643,6 +643,27 @@ def test_aggregate_date_to_parts_timezone(coll) -> None:
     }
 
 
+def test_aggregate_group_stddev(coll) -> None:
+    # Values 2,4,6: population variance (4+0+4)/3 -> stdDevPop sqrt(8/3);
+    # sample variance 8/2 = 4 -> stdDevSamp 2.0.
+    coll.insert_many([{"g": "x", "v": 2}, {"g": "x", "v": 4}, {"g": "x", "v": 6}])
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$g",
+                        "pop": {"$stdDevPop": "$v"},
+                        "samp": {"$stdDevSamp": "$v"},
+                    }
+                }
+            ]
+        )
+    )
+    assert out[0]["pop"] == (8.0 / 3.0) ** 0.5
+    assert out[0]["samp"] == 2.0
+
+
 def test_aggregate_unwind_stage(coll) -> None:
     coll.insert_one({"_id": 1, "tags": ["a", "b", "c"]})
     out = list(coll.aggregate([{"$unwind": "$tags"}]))

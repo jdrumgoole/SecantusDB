@@ -19,6 +19,35 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: `$stdDevPop` / `$stdDevSamp` group accumulators
+
+The Rust server now supports the `$stdDevPop` and `$stdDevSamp` accumulators in
+`$group` (and `$setWindowFields`), matching the Python server — population
+standard deviation (÷n, `0` for a single value) and sample standard deviation
+(÷n-1, `null` for fewer than two values). Previously the Rust server rejected
+these accumulators; the Python server already had them.
+
+To keep the two engines bit-for-bit identical, both now compute the deviation with
+the same fixed sequence of correctly-rounded IEEE operations — a naive left-fold
+float sum, multiply-based squaring, and hardware `sqrt`. CPython 3.12's `sum()`
+builtin switched to Neumaier *compensated* summation for floats, which is more
+accurate but would diverge from the Rust engine's naive fold by a last ULP, so the
+Python `_std_dev` now sums with an explicit loop instead of `sum()`. (mongod uses
+an online Welford-style algorithm, so neither server matches it to the last ULP;
+aligning the two SecantusDB engines is the goal.) A parity fuzz seed caught the
+divergence before it shipped.
+
+#### Added
+
+- `secantus-core` (`group.rs`): `$stdDevPop` / `$stdDevSamp` accumulators (numeric
+  values folded to `f64`, non-numeric defers to Python), shared by `$group` and
+  `$setWindowFields`.
+
+#### Changed
+
+- `aggregate.py` (`_std_dev`): compute with a naive float fold + multiply + `sqrt`
+  (no `sum()` / `** 2` / `** 0.5`) so the Python and Rust engines agree bit-for-bit.
+
 ### `$dateToParts` honours a `timezone` (both servers)
 
 `$dateToParts` now accepts a `timezone` and returns the year/month/day/hour/…

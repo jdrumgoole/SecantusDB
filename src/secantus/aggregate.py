@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
@@ -775,13 +776,31 @@ def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
 def _std_dev(values: list[Any], *, pop: bool) -> float | None:
     """Population / sample standard deviation, matching Mongo's ``$stdDevPop`` /
     ``$stdDevSamp``: pop is null for an empty set (0 for a single value); samp is
-    null for fewer than two values."""
+    null for fewer than two values.
+
+    Deliberately uses **naive left-fold float summation** (an explicit loop, not
+    the ``sum()`` builtin) plus multiply-based squaring and ``math.sqrt`` — all
+    correctly-rounded IEEE operations in a fixed order — so the result is bit-for-bit
+    reproducible by the Rust engine (whose ``Iterator::sum`` is the same naive fold).
+    CPython 3.12's ``sum()`` switched to Neumaier *compensated* summation for
+    floats, which is more accurate but would round a last ULP differently from
+    Rust's naive fold; ``** 2`` / ``** 0.5`` go through ``pow`` and can likewise
+    diverge from multiply / hardware sqrt. (mongod computes stddev with an online
+    Welford-style algorithm, so neither server matches it to the last ULP anyway —
+    aligning the two SecantusDB engines is what matters here.)"""
     n = len(values)
     if n == 0 or (not pop and n < 2):
         return None
-    mean = sum(values) / n
+    total = 0.0
+    for x in values:
+        total += x  # bool folds to 0.0/1.0, matching the Rust engine
+    mean = total / n
     denom = n if pop else n - 1
-    return (sum((x - mean) ** 2 for x in values) / denom) ** 0.5
+    acc = 0.0
+    for x in values:
+        d = x - mean
+        acc += d * d
+    return math.sqrt(acc / denom)
 
 
 _AccHandler = Callable[[dict[str, Any], str, Any, Mapping[str, Any], dict[str, Any]], None]
