@@ -79,6 +79,20 @@ def _mkdate(ms):
 
 # (expr, doc) pairs over the ported operator core.
 CURATED = [
+    # Bitwise ($bitAnd/$bitOr/$bitXor/$bitNot) — int/long, empty-list identity,
+    # null propagation, mixed int/long result width. Non-int operands defer.
+    ({"$bitAnd": ["$a", "$b"]}, {"a": 12, "b": 10}),
+    ({"$bitOr": ["$a", "$b", 1]}, {"a": 12, "b": 10}),
+    ({"$bitXor": ["$a", "$b"]}, {"a": 12, "b": 10}),
+    ({"$bitNot": "$a"}, {"a": 12}),
+    ({"$bitNot": "$a"}, {"a": -5}),
+    ({"$bitAnd": ["$a", 255]}, {"a": Int64(0xFF00FF00)}),  # long -> long result
+    ({"$bitXor": ["$a", Int64(3)]}, {"a": 12}),  # mixed int/long -> long
+    ({"$bitAnd": []}, {}),  # identity -1
+    ({"$bitOr": []}, {}),  # identity 0
+    ({"$bitAnd": ["$a", "$missing"]}, {"a": 12}),  # null propagation
+    ({"$bitAnd": ["$a", 1.5]}, {"a": 12}),  # double operand -> defer (Python raises)
+    ({"$bitOr": ["$a", True]}, {"a": 12}),  # bool operand -> defer
     ("$a", {"a": 5}),
     ("hi", {}),
     ("$missing", {}),

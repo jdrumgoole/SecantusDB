@@ -1578,6 +1578,69 @@ def _op_reduce(arg: Any, ctx: _Ctx) -> Any:
     return accumulator
 
 
+def _bit_operand(op: str, v: Any) -> tuple[int, bool]:
+    """Coerce a ``$bit*`` operand to ``(value, is_long)``. mongod's bitwise
+    operators accept only int (32-bit) and long (64-bit) — a bool, double,
+    decimal, or anything else raises. ``bson.Int64`` marks a long; a plain ``int``
+    is a 32-bit int (``bson`` widens on encode only when out of int32 range)."""
+    if isinstance(v, bool):
+        raise ExpressionError(f"{op} only supports int and long operands, not bool")
+    if isinstance(v, Int64):
+        return int(v), True
+    if isinstance(v, int):
+        return v, False
+    raise ExpressionError(f"{op} only supports int and long operands, not {_bson_type_name(v)}")
+
+
+def _bit_result(value: int, is_long: bool) -> Any:
+    """Wrap a bitwise result: ``Int64`` when any operand was long, else a plain
+    ``int`` (encoded as int32 when in range, matching mongod's int result)."""
+    return Int64(value) if is_long else value
+
+
+def _op_bit_fold(op: str, identity: int, arg: Any, ctx: _Ctx) -> Any:
+    """``$bitAnd`` / ``$bitOr`` / ``$bitXor``: fold the (int/long) operands with a
+    bitwise operator. A null / missing operand makes the whole result null; the
+    result is long iff any operand was long; an empty operand list yields the
+    operator's identity (all-ones for and, 0 for or / xor)."""
+    vals = _eval_args(arg, ctx)
+    if any(v is None for v in vals):
+        return None
+    acc = identity
+    is_long = False
+    for v in vals:
+        n, lng = _bit_operand(op, v)
+        is_long = is_long or lng
+        if op == "$bitAnd":
+            acc &= n
+        elif op == "$bitOr":
+            acc |= n
+        else:  # $bitXor
+            acc ^= n
+    return _bit_result(acc, is_long)
+
+
+def _op_bit_and(arg: Any, ctx: _Ctx) -> Any:
+    return _op_bit_fold("$bitAnd", -1, arg, ctx)
+
+
+def _op_bit_or(arg: Any, ctx: _Ctx) -> Any:
+    return _op_bit_fold("$bitOr", 0, arg, ctx)
+
+
+def _op_bit_xor(arg: Any, ctx: _Ctx) -> Any:
+    return _op_bit_fold("$bitXor", 0, arg, ctx)
+
+
+def _op_bit_not(arg: Any, ctx: _Ctx) -> Any:
+    """``$bitNot``: bitwise complement of a single int/long operand (null → null)."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    n, is_long = _bit_operand("$bitNot", v)
+    return _bit_result(~n, is_long)
+
+
 _OPS = {
     "$concat": _op_concat,
     "$add": _op_add,
@@ -1612,6 +1675,10 @@ _OPS = {
     "$log10": _op_log10,
     "$rand": _op_rand,
     "$trunc": _op_trunc,
+    "$bitAnd": _op_bit_and,
+    "$bitOr": _op_bit_or,
+    "$bitXor": _op_bit_xor,
+    "$bitNot": _op_bit_not,
     "$mergeObjects": _op_merge_objects,
     "$objectToArray": _op_object_to_array,
     "$setField": _op_set_field,
