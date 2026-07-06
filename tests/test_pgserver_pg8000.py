@@ -1614,6 +1614,30 @@ def test_listen_notify_via_driver(server):
         notifier.close()
 
 
+def test_create_function_via_driver(server):
+    # CREATE FUNCTION ... LANGUAGE sql + call over the real wire (#124).
+    conn = connect(server)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE FUNCTION add(a int, b int) RETURNS int AS $$ SELECT a + b $$ LANGUAGE sql"
+        )
+        cur.execute("SELECT add(40, 2)")
+        assert cur.fetchall() == ([42],)
+
+        cur.execute("CREATE TABLE t (id int, v int)")
+        cur.execute("INSERT INTO t VALUES (1, 5), (2, 10)")
+        conn.commit()
+        cur.execute("SELECT id, add(v, 100) FROM t ORDER BY id")
+        assert cur.fetchall() == ([1, 105], [2, 110])
+
+        cur.execute("DROP FUNCTION add(int, int)")
+        with pytest.raises(pg8000.DatabaseError):
+            cur.execute("SELECT add(1, 2)")
+    finally:
+        conn.close()
+
+
 def test_array_operators_via_driver(server):
     # Array @> / <@ / && and a uuid[] roundtrip over the real wire (#123).
     conn = connect(server)

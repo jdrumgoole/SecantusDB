@@ -27,6 +27,7 @@ ROLE_COLLECTION = "__sql_roles__"
 ENUM_COLLECTION = "__sql_enums__"
 DOMAIN_COLLECTION = "__sql_domains__"
 COMPOSITE_COLLECTION = "__sql_composites__"
+FUNCTION_COLLECTION = "__sql_functions__"
 
 
 def _ser_composite_fields(fields: Any) -> list | None:
@@ -515,6 +516,35 @@ class Catalog:
     def list_roles(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, ROLE_COLLECTION, {})
         return sorted(d["role"] for d in docs)
+
+    # -- SQL functions ------------------------------------------------------ #
+    # ``CREATE FUNCTION name(params) RETURNS t AS $$ body $$ LANGUAGE sql`` —
+    # persisted here (keyed ``name/nargs`` so overloads by arity coexist) and
+    # invoked by the scalar evaluator when a call resolves no builtin.
+
+    @staticmethod
+    def _function_key(name: str, nargs: int) -> str:
+        return f"{name.lower()}/{nargs}"
+
+    def put_function(self, db: str, doc: dict[str, Any]) -> None:
+        key = self._function_key(doc["name"], doc["nargs"])
+        self._storage.delete_matching(db, FUNCTION_COLLECTION, {"_id": key})
+        self._storage.insert(db, FUNCTION_COLLECTION, [{"_id": key, **doc}])
+
+    def get_function(self, db: str, name: str, nargs: int) -> dict[str, Any] | None:
+        key = self._function_key(name, nargs)
+        docs = self._storage.find_matching(db, FUNCTION_COLLECTION, {"_id": key}, limit=1)
+        return docs[0] if docs else None
+
+    def function_exists(self, db: str, name: str, nargs: int) -> bool:
+        return self.get_function(db, name, nargs) is not None
+
+    def drop_function(self, db: str, name: str, nargs: int) -> bool:
+        key = self._function_key(name, nargs)
+        return self._storage.delete_matching(db, FUNCTION_COLLECTION, {"_id": key}) > 0
+
+    def list_functions(self, db: str) -> list[dict[str, Any]]:
+        return self._storage.find_matching(db, FUNCTION_COLLECTION, {})
 
     def sequence_setval(self, db: str, name: str, value: int, is_called: bool = True) -> int:
         """Set ``name``'s current value. With ``is_called`` (default) the next

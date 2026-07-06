@@ -16,6 +16,7 @@ current row (with outer-row fallthrough for correlation).
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import math
@@ -1661,7 +1662,52 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         # jsonb_path_query is set-returning; in a scalar context return the first
         # match (NULL when the path matches nothing).
         return matches[0] if matches else None
+    if ctx is not None and getattr(ctx, "catalog", None) is not None:
+        udf = ctx.catalog.get_function(ctx.db, name, len(args))
+        if udf is not None:
+            return _invoke_udf(udf, args, ctx)
     raise errors.feature_not_supported(f"function {name}() is not supported in this context")
+
+
+_UDF_MISSING = object()
+
+
+def _invoke_udf(func: dict, args: list[Any], ctx: ScalarContext) -> Any:
+    """Evaluate a ``LANGUAGE sql`` user-defined function: bind the call arguments
+    to the body's parameters (named columns and/or positional ``$N``) and reduce
+    the single-statement body to its scalar result via the subquery machinery."""
+    from secantus.sql import planner as _planner
+
+    body = _planner.parse(func["body"])[0]
+    if not isinstance(body, exp.Select):
+        raise errors.feature_not_supported("a SQL function body must be a SELECT")
+    body = body.copy()
+    # Positional $1..$N placeholders -> literal argument nodes.
+    for p in list(body.find_all(exp.Parameter)):
+        try:
+            idx = int(p.name) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(args):
+            p.replace(_planner._value_to_node(args[idx]))
+    # Named parameters resolve as columns in the body's scope.
+    params = func.get("params") or []
+    name_to_val = {
+        str(n).lower(): args[i] for i, n in enumerate(params) if n is not None and i < len(args)
+    }
+
+    def _param_scope(col: exp.Column) -> Any:
+        val = name_to_val.get(col.name.lower(), _UDF_MISSING)
+        if val is _UDF_MISSING:
+            raise errors.SQLError("42703", f'column "{col.name}" does not exist')
+        return val
+
+    result = _eval_subquery(body, _param_scope, ctx)
+    return_tag = func.get("return_tag")
+    if return_tag and result is not None:
+        with contextlib.suppress(errors.SQLError, ValueError, TypeError):
+            result = typemap.coerce(result, return_tag)
+    return result
 
 
 def _eval_jsonb_nav(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
