@@ -110,8 +110,9 @@ _ACTION_TO_PRIVILEGE = {
 
 def _grantee_identities(session: Session) -> set[str]:
     """Every identity a table grant can be recorded against for this session: the
-    connected user, each of its role names, and the implicit ``PUBLIC`` role."""
-    ids = {session.user, "PUBLIC", "public"}
+    current role (``effective_user`` — the SET ROLE override or the session user),
+    each of the login's role names, and the implicit ``PUBLIC`` role."""
+    ids = {session.effective_user, session.user, "PUBLIC", "public"}
     for r in session.roles:
         name = r.get("role") if isinstance(r, dict) else getattr(r, "role", None)
         if name:

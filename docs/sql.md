@@ -2492,6 +2492,34 @@ only `SELECT` / `INSERT` / `UPDATE` / `DELETE` are enforced (the other operation
 don't exist in SecantusDB). Role-membership grants and grants on schemas /
 databases / sequences remain accepted no-ops.
 
+### Switching identity (`SET ROLE` / `SET SESSION AUTHORIZATION`)
+
+A session can change its **current role** with `SET ROLE`, leaving the **session
+user** (the login identity) unchanged, and change both with `SET SESSION
+AUTHORIZATION`:
+
+```sql
+SET ROLE analyst;                 -- current_user is now analyst; session_user unchanged
+SELECT current_user, session_user;  -- ('analyst', 'joe')
+RESET ROLE;                       -- back to the login role (SET ROLE NONE is equivalent)
+
+SET SESSION AUTHORIZATION alice;  -- both current_user and session_user become alice
+RESET SESSION AUTHORIZATION;      -- back to the login identity
+```
+
+The current role (`current_user` / `current_role` / `user`) is what the table
+grants above are matched against, so a session that holds the `analyst` role can
+`SET ROLE analyst` to pick up whatever was granted to `analyst`. `session_user`
+always reports the login identity. `SHOW role` / `current_setting('role')` report
+the current role (`none` when it tracks the session user).
+
+When authorization is active, a session may only assume an identity it already
+holds — its own login, a role in its bindings, or anything if it is a superuser
+(`root`); assuming another identity to borrow its grants is denied with SQLSTATE
+`42501`. In trust mode (and the embedded API) the switch is unrestricted. Role
+*membership* is not otherwise tracked, so `SET ROLE` doesn't consult a membership
+graph beyond the session's own role bindings.
+
 ## Session and catalog introspection
 
 Common session functions and settings resolve against the connection:

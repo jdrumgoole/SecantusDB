@@ -2732,6 +2732,86 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
     return SQLResult(command_tag="SET", parameter_status=reported)
 
 
+# SET [SESSION | LOCAL] ROLE { name | NONE | DEFAULT }  /
+# SET [SESSION | LOCAL] SESSION AUTHORIZATION { name | DEFAULT } — the target after
+# stripping the optional SESSION/LOCAL scope keyword.
+_SET_ROLE_RE = re.compile(r"(?is)^\s*(?:SESSION\s+|LOCAL\s+)?ROLE\s+(.+?)\s*;?\s*$")
+_SET_AUTHZ_RE = re.compile(
+    r"(?is)^\s*(?:SESSION\s+|LOCAL\s+)?SESSION\s+AUTHORIZATION\s+(.+?)\s*;?\s*$"
+)
+
+
+def _unquote_ident(text: str) -> str:
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def _can_assume_identity(session: Session, target: str) -> bool:
+    """Whether this session may SET ROLE / SET SESSION AUTHORIZATION to ``target``.
+    With authorization off (trust mode / embedded API) anything goes. When active,
+    the login may assume its own identity, a role it holds, or anything if it is a
+    superuser (``root``) — otherwise it can't borrow another identity's grants."""
+    if not session.authz_active:
+        return True
+    if target == session.login_user or target == session.user:
+        return True
+    role_names = {
+        (r.get("role") if isinstance(r, dict) else getattr(r, "role", None)) for r in session.roles
+    }
+    return target in role_names or "root" in role_names
+
+
+def _run_authorization_command(verb: str, tail: str, session: Session) -> SQLResult | None:
+    """``SET ROLE`` / ``SET SESSION AUTHORIZATION`` and their ``RESET`` forms, which
+    change the session's current role / session user (#128). Returns None if the
+    command isn't one of these (the caller handles the generic SET/RESET)."""
+    if verb == "RESET":
+        key = tail.strip().upper()
+        if key == "ROLE":
+            session.role = None
+            session.settings.pop("role", None)
+            return SQLResult(command_tag="RESET")
+        if key == "SESSION AUTHORIZATION":
+            session.user = session.login_user or session.user
+            session.role = None
+            session.settings.pop("role", None)
+            return SQLResult(command_tag="RESET")
+        return None
+    if verb != "SET":
+        return None
+    m = _SET_AUTHZ_RE.match(tail)
+    if m is not None:
+        target = m.group(1).strip()
+        if target.upper() == "DEFAULT":
+            session.user = session.login_user or session.user
+        else:
+            ident = _unquote_ident(target)
+            if not _can_assume_identity(session, ident):
+                raise errors.SQLError(
+                    "42501", f'permission denied to set session authorization to "{ident}"'
+                )
+            session.user = ident
+        session.role = None  # a new session user resets the current role
+        session.settings.pop("role", None)
+        return SQLResult(command_tag="SET")
+    m = _SET_ROLE_RE.match(tail)
+    if m is not None:
+        target = m.group(1).strip()
+        if target.upper() in ("NONE", "DEFAULT"):
+            session.role = None
+            session.settings.pop("role", None)
+        else:
+            ident = _unquote_ident(target)
+            if not _can_assume_identity(session, ident):
+                raise errors.SQLError("42501", f'permission denied to set role "{ident}"')
+            session.role = ident
+            session.settings["role"] = ident
+        return SQLResult(command_tag="SET")
+    return None
+
+
 def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
     verb = str(stmt.this).upper()
     arg = stmt.expression
@@ -2744,6 +2824,13 @@ def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
     else:
         name = ""
     name = str(name).strip()
+    # SET ROLE / SET SESSION AUTHORIZATION (and their RESET forms) change the
+    # session's current role / session user before the generic SET/RESET below.
+    # These use the full command tail (``_command_text``) since ``SET``'s tail
+    # ("ROLE analyst") isn't a bare Literal.
+    authz_cmd = _run_authorization_command(verb, _command_text(stmt), session)
+    if authz_cmd is not None:
+        return authz_cmd
     if verb == "SHOW":
         value = session.get_setting(name)
         return SQLResult(

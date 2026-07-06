@@ -2433,3 +2433,25 @@ def test_grant_revoke_reflection_via_driver(real_server):
     )
     assert cur.fetchall() == (["SELECT"],)
     conn.close()
+
+
+def test_set_role_and_session_authorization_via_driver(real_server):
+    # SET ROLE changes current_user (not session_user); SET SESSION AUTHORIZATION
+    # changes both; RESET restores the login — all over the wire.
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("SELECT session_user")
+    login = cur.fetchall()[0][0]
+    cur.execute("SET ROLE analyst")
+    cur.execute("SELECT current_user, session_user")
+    assert cur.fetchall() == (["analyst", login],)
+    cur.execute("RESET ROLE")
+    cur.execute("SELECT current_user")
+    assert cur.fetchall() == ([login],)
+    cur.execute("SET SESSION AUTHORIZATION alice")
+    cur.execute("SELECT current_user, session_user")
+    assert cur.fetchall() == (["alice", "alice"],)
+    cur.execute("RESET SESSION AUTHORIZATION")
+    cur.execute("SELECT session_user")
+    assert cur.fetchall() == ([login],)
+    conn.close()
