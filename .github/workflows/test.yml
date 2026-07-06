@@ -175,6 +175,18 @@ jobs:
         # ``--timeout`` above regardless, so the restart budget is safe.
         run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
 
+      - name: Slow tests
+        # Long-running stress / scaling tests carry ``@pytest.mark.slow`` and are
+        # excluded from the default suite (addopts ``-m 'not ... slow'``) to keep
+        # the inner loop fast. Run them here — once, on Linux, reusing the env the
+        # matrix already built — so the races they guard (the xdist-worker-crash
+        # teardown drain in test_server_shutdown; the WT concurrency-ceiling
+        # benchmark in test_concurrency) stay covered instead of running nowhere.
+        # A command-line ``-m slow`` overrides the addopts marker filter while
+        # ``-n auto``/``--dist=loadgroup`` from addopts are retained.
+        if: matrix.os == 'ubuntu-latest'
+        run: uv run python -m pytest -m slow --timeout=120 --timeout-method=thread --max-worker-restart=3
+
   # The matrix above runs the pure-Python server. This job builds the Rust core
   # (``_secantus_core``) and pins each Rust engine byte-for-byte against its
   # pure-Python counterpart via the engine-parity suites (the operator oracle).

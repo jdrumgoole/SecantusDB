@@ -50,6 +50,7 @@ def test_stop_drains_in_flight_change_stream_before_close(tmp_path) -> None:
             mc.close()
 
 
+@pytest.mark.slow
 @pytest.mark.filterwarnings(
     # Stopping the server under the client mid-flight makes pymongo's own
     # background monitor thread raise as it loses the connection — benign
@@ -57,6 +58,11 @@ def test_stop_drains_in_flight_change_stream_before_close(tmp_path) -> None:
     "ignore::pytest.PytestUnhandledThreadExceptionWarning"
 )
 def test_rapid_teardown_under_read_load_drains_cleanly(tmp_path) -> None:
+    # `slow`: ~43s in isolation (12 teardown iterations x 3 hammer threads).
+    # Excluded from the default inner-loop suite via `-m 'not slow'`; the CI
+    # `slow` lane (.github/workflows/test.yml) runs it every push so the
+    # xdist-worker-crash race it guards stays covered. Do NOT cut the
+    # iteration count to speed it up — intermittent races need the reps.
     """Stress: repeatedly tear a server down while connection threads hammer it
     with reads. Each ``stop()`` must drain to zero active connections without
     hanging or a use-after-close — the mechanism behind the xdist worker crash.
