@@ -1614,6 +1614,36 @@ def test_listen_notify_via_driver(server):
         notifier.close()
 
 
+def test_array_operators_via_driver(server):
+    # Array @> / <@ / && and a uuid[] roundtrip over the real wire (#123).
+    conn = connect(server)
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE a (id int, nums int[])")
+        cur.execute("INSERT INTO a VALUES (1, ARRAY[1,2,3]), (2, ARRAY[4,5])")
+        conn.commit()
+
+        cur.execute("SELECT id FROM a WHERE nums @> ARRAY[1,2] ORDER BY id")
+        assert cur.fetchall() == ([1],)
+        cur.execute("SELECT id FROM a WHERE nums && ARRAY[3,4] ORDER BY id")
+        assert [r[0] for r in cur.fetchall()] == [1, 2]
+
+        # int[] decodes back to a Python list through the driver.
+        cur.execute("SELECT nums FROM a WHERE id = 1")
+        assert cur.fetchall() == ([[1, 2, 3]],)
+
+        cur.execute("CREATE TABLE u (id int, tags uuid[])")
+        cur.execute("INSERT INTO u VALUES (1, ARRAY['11111111-1111-1111-1111-111111111111'::uuid])")
+        conn.commit()
+        # The uuid[] OID (2951) lets the driver decode elements as UUID objects.
+        import uuid as _uuid
+
+        cur.execute("SELECT tags FROM u WHERE id = 1")
+        assert cur.fetchall() == ([[_uuid.UUID("11111111-1111-1111-1111-111111111111")]],)
+    finally:
+        conn.close()
+
+
 def test_prepare_execute_deallocate_via_driver(server):
     # SQL-level PREPARE / EXECUTE / DEALLOCATE over the real wire (#121). Distinct
     # from pg8000's own %s-parameter binding, which uses the extended protocol.

@@ -1982,6 +1982,8 @@ def where_needs_per_row(stmt: exp.Select, table: TableDef | None = None) -> bool
         return True
     if table is not None and _where_has_hstore_predicate(node, table):
         return True
+    if table is not None and _where_has_array_predicate(node, table):
+        return True
     # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
     if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
         return True
@@ -2076,6 +2078,33 @@ def _where_has_hstore_predicate(node: exp.Expression, table: TableDef) -> bool:
         if _is_hstore_operand(op.this, table) or _is_hstore_operand(op.expression, table):
             return True
     return any(_is_hstore_operand(op.this, table) for op in node.find_all(*exists_ops))
+
+
+def _is_array_operand(operand: exp.Expression, table: TableDef) -> bool:
+    """Whether ``operand`` resolves to a Postgres array — an array-typed column, an
+    ``ARRAY[...]`` constructor, or a cast to an ``<type>[]`` array type."""
+    if isinstance(operand, exp.Paren):
+        operand = operand.this
+    if isinstance(operand, exp.Array):
+        return True
+    if isinstance(operand, exp.Column):
+        col = table.column(_column_name(operand))
+        return col is not None and typemap.is_array_tag(col.type_tag)
+    if isinstance(operand, exp.Cast) and operand.to is not None:
+        return typemap.is_array_tag(typemap.type_tag_for_sql(operand.to))
+    return False
+
+
+def _where_has_array_predicate(node: exp.Expression, table: TableDef) -> bool:
+    """True if ``node`` contains an ``@>`` / ``<@`` / ``&&`` whose operand is a
+    Postgres array (array-typed column, ``ARRAY[...]`` literal, or array cast). PG
+    array containment / overlap has different semantics from jsonb containment, so
+    the scalar evaluator handles it per-row rather than lowering to a Mongo
+    filter."""
+    for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps):
+        if _is_array_operand(op.this, table) or _is_array_operand(op.expression, table):
+            return True
+    return False
 
 
 def _where_has_range_predicate(node: exp.Expression, table: TableDef) -> bool:
@@ -4724,6 +4753,29 @@ def _has_hstore_operand(node: exp.Expression, resolve: Resolve) -> bool:
     return False
 
 
+def _has_array_operand(node: exp.Expression, resolve: Resolve) -> bool:
+    """Does an operand of ``node`` resolve to a Postgres array — an array-typed
+    column, an ``ARRAY[...]`` constructor, or a cast to an ``<type>[]`` array?"""
+    for operand in (node.this, node.expression):
+        if isinstance(operand, exp.Paren):
+            operand = operand.this
+        if isinstance(operand, exp.Array):
+            return True
+        if (
+            isinstance(operand, exp.Cast)
+            and operand.to is not None
+            and typemap.is_array_tag(typemap.type_tag_for_sql(operand.to))
+        ):
+            return True
+        if isinstance(operand, exp.Column):
+            try:
+                if typemap.is_array_tag(resolve(operand)[1]):
+                    return True
+            except errors.SQLError:
+                pass
+    return False
+
+
 def _date_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
     """Result tag of a date / time ``Add`` / ``Sub``: ``date - date -> int4``,
     ``date ± int -> date``, ``date ± interval -> timestamptz``, and
@@ -4879,6 +4931,11 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return "text"
     if isinstance(node, exp.DPipe) and _has_hstore_operand(node, resolve):
         return "hstore"
+    # Postgres array operators: ``@>`` / ``<@`` / ``&&`` over an array operand -> bool.
+    if isinstance(
+        node, (exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps)
+    ) and _has_array_operand(node, resolve):
+        return "bool"
     # Network operators: ``<<`` / ``>>`` (subnet containment) and ``&&`` (overlap)
     # over a net operand -> bool. ``exp.Host`` (the ``host()`` function) -> text.
     if isinstance(

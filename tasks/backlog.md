@@ -1764,6 +1764,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
   functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
   out of scope.
+- [ ] **Arrays of the new types + array ops landed** (b161): two parts. (1) **Array type OIDs** — `typemap._ARRAY_PG_OID`
+  gains the real Postgres array-type OIDs for the newer element types (`uuid[]` 2951, `inet[]`/`cidr[]`/`macaddr[]`,
+  `date[]`/`time[]`/`timetz[]`, `interval[]`, `bit[]`/`varbit[]`, `money[]`, `xml[]`, `json[]`→jsonb 3807, the
+  geometric arrays, and the range arrays), so a driver decodes the elements natively (pg8000 gives a `uuid[]` back as
+  a list of `UUID`). (2) **Array containment/overlap operators** `@>` / `<@` / `&&` on Postgres *array* operands.
+  `scalar._eval_array_op` (new `_NOT_ARRAY` sentinel) handles the list-vs-list case, inserted into the
+  `@>`/`<@`/`&&` chain *after* range/net/geo/hstore so those keep priority. Array-operator WHEREs route to the
+  per-row path via `planner._where_has_array_predicate` + `_is_array_operand` (array-typed column, `ARRAY[...]`
+  literal, or array cast); `_has_array_operand` (resolve-based) drives the `_infer_scalar_tag` → bool typing for a
+  SELECT-list array op. jsonb (non-array) `@>`/`<@` keep the jsonb pushdown path untouched — array detection requires
+  an array-typed operand. Tests: `tests/test_sql_array_ops.py` (10) + a pg8000 wire test. **Simplifications:** array
+  element equality is Python `==` (no cross-type array coercion beyond the element coerce); `citext[]` / `hstore[]`
+  fall back to the text array OID (those element types have no fixed catalog OID); arrays stay one level deep.
 - [ ] **EXPLAIN for the SQL layer landed** (b158): `EXPLAIN [ANALYZE] [(options)] <statement>` returns a `QUERY
   PLAN` text column. New `secantus/sql/explain.py`: `parse_options` splits the tail (both the bare `EXPLAIN ANALYZE
   VERBOSE <stmt>` word form and the parenthesised `(ANALYZE, FORMAT JSON)` form); `_build_node` walks the parsed

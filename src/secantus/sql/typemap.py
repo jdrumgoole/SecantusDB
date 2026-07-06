@@ -226,6 +226,8 @@ _DATATYPE_TAGS: dict[Any, str] = {
 
 
 # Element tag -> Postgres array type OID (pg_type of the ``_elem`` array type).
+# The values are Postgres' own array-type OIDs so a driver's array decoder picks
+# the right element parser for a column of ``<type>[]``.
 _ARRAY_PG_OID: dict[str, int] = {
     "bool": 1000,
     "int8": 1016,
@@ -235,6 +237,44 @@ _ARRAY_PG_OID: dict[str, int] = {
     "numeric": 1231,
     "timestamptz": 1185,
     "bytea": 1001,
+    # Date / time distinct types.
+    "date": 1182,
+    "time": 1183,
+    "timetz": 1270,
+    # jsonb (our ``json`` tag maps to jsonb).
+    "json": 3807,
+    # Network address types.
+    "inet": 1041,
+    "cidr": 651,
+    "macaddr": 1040,
+    # Bit-string types.
+    "bit": 1561,
+    "varbit": 1563,
+    # Interval.
+    "interval": 1187,
+    # UUID.
+    "uuid": 2951,
+    # Money.
+    "money": 791,
+    # XML.
+    "xml": 143,
+    # Geometric types.
+    "point": 1017,
+    "lseg": 1018,
+    "path": 1019,
+    "box": 1020,
+    "polygon": 1027,
+    "line": 629,
+    "circle": 719,
+    # Full-text search types.
+    "tsvector": 3643,
+    "tsquery": 3645,
+    # Range types.
+    "int4range": 3905,
+    "numrange": 3907,
+    "tsrange": 3909,
+    "int8range": 3927,
+    "daterange": 3913,
 }
 
 # Register the array tags (``text[]`` -> 1009, ...) in PG_OID so the wire layer's
