@@ -188,6 +188,8 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$last" => op_first_last(arg, ctx, false),
         "$firstN" => op_first_last_n(arg, ctx, true),
         "$lastN" => op_first_last_n(arg, ctx, false),
+        "$maxN" => op_max_min_n(arg, ctx, true),
+        "$minN" => op_max_min_n(arg, ctx, false),
         "$concatArrays" => op_concat_arrays(arg, ctx),
         "$reverseArray" => op_reverse_array(arg, ctx),
         "$sortArray" => op_sort_array(arg, ctx),
@@ -677,34 +679,71 @@ fn op_first_last(arg: &Bson, ctx: &Ctx, first: bool) -> R {
     }
 }
 
-/// `$firstN` / `$lastN` (expression form): the first / last `n` elements of an
-/// array. `n` must be a positive int/long; a null / missing `input` yields null.
-/// Invalid `n` (non-int, ≤ 0) or a non-array `input` defers to Python (which
-/// raises the exact error). Mirrors the pure `_first_last_n`.
-fn op_first_last_n(arg: &Bson, ctx: &Ctx, first: bool) -> R {
+/// Shared `{n, input}` validation for `$firstN` / `$lastN` / `$maxN` / `$minN`.
+/// Returns `(n, array)` for a valid spec, else `Fallback` so Python raises the
+/// exact mongod error (5788200 / 5787902-8, verified against mongod 6.0). Accepts
+/// an integral double `n` (mongod does). A null / missing / non-array `input` is
+/// an **error** (defer), not null. Mirrors the pure `_nelem_n_and_input`.
+fn nelem_n_and_input(arg: &Bson, ctx: &Ctx) -> Result<(usize, Vec<Bson>), Fallback> {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
     let n = match eval(d.get("n").ok_or(Fallback)?, ctx)? {
         Bson::Int32(x) => x as i64,
         Bson::Int64(x) => x,
-        _ => return Err(Fallback), // bool / double / ... -> Python raises
+        Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => x as i64,
+        _ => return Err(Fallback), // non-integral / non-numeric -> Python raises
     };
     if n <= 0 {
-        return Err(Fallback); // Python raises "must be greater than 0"
+        return Err(Fallback); // Python raises 5787908
     }
     let arr = match eval(d.get("input").ok_or(Fallback)?, ctx)? {
-        Bson::Null => return Ok(Bson::Null),
         Bson::Array(a) => a,
-        _ => return Err(Fallback), // Python raises "input must be an array"
+        _ => return Err(Fallback), // null / missing / non-array -> Python raises 5788200
     };
-    let n = (n as usize).min(arr.len());
+    Ok((n as usize, arr))
+}
+
+/// `$firstN` / `$lastN` (expression form): the first / last `n` elements of an
+/// array (whole array when it has fewer than `n`). See `nelem_n_and_input` for the
+/// mongod-faithful `{n, input}` validation. Mirrors the pure `_first_last_n`.
+fn op_first_last_n(arg: &Bson, ctx: &Ctx, first: bool) -> R {
+    let (n, arr) = nelem_n_and_input(arg, ctx)?;
+    let n = n.min(arr.len());
     let out: Vec<Bson> = if first {
         arr[..n].to_vec()
     } else {
         arr[arr.len() - n..].to_vec()
     };
     Ok(Bson::Array(out))
+}
+
+/// `$maxN` / `$minN` (expression form): the `n` largest / smallest elements of an
+/// array by BSON order — null *elements* ignored, `$maxN` descending, `$minN`
+/// ascending. `{n, input}` validation matches mongod (`nelem_n_and_input` — a null
+/// / non-array input raises, unlike the elements). A non-null element outside the
+/// sortable subset (bool / Decimal128 / NaN / …) defers to Python, whose `_SortKey`
+/// handles the wider set — the same `order::cmp` / `is_sortable` contract
+/// `$sortArray` relies on. Mirrors the pure `_max_min_n`.
+fn op_max_min_n(arg: &Bson, ctx: &Ctx, largest: bool) -> R {
+    let (n, arr) = nelem_n_and_input(arg, ctx)?;
+    // mongod ignores null elements; the rest must be in the sortable subset so
+    // `order::cmp` reproduces Python's `_SortKey` order (else defer).
+    let mut vals: Vec<Bson> = arr.into_iter().filter(|x| !is_null(x)).collect();
+    if !vals.iter().all(crate::order::is_sortable) {
+        return Err(Fallback);
+    }
+    // Descending via `cmp(b, a)` keeps equal elements in original order (stable),
+    // matching Python's `sorted(reverse=True)`.
+    vals.sort_by(|a, b| {
+        if largest {
+            crate::order::cmp(b, a)
+        } else {
+            crate::order::cmp(a, b)
+        }
+    });
+    let n = n.min(vals.len());
+    Ok(Bson::Array(vals[..n].to_vec()))
 }
 
 fn op_concat_arrays(arg: &Bson, ctx: &Ctx) -> R {
@@ -3056,6 +3095,56 @@ mod tests {
     }
 
     #[test]
+    fn max_n_min_n() {
+        let d = doc! {"a": [3i32, 1i32, 4i32, 1i32, 5i32, 9i32, 2i32, 6i32]};
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$maxN": {"n": 3, "input": "$a"}})),
+            Bson::Array(vec![Bson::Int32(9), Bson::Int32(6), Bson::Int32(5)])
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$minN": {"n": 3, "input": "$a"}})),
+            Bson::Array(vec![Bson::Int32(1), Bson::Int32(1), Bson::Int32(2)])
+        );
+        // Null elements are ignored.
+        let dn =
+            doc! {"a": [Bson::Int32(3), Bson::Null, Bson::Int32(1), Bson::Null, Bson::Int32(5)]};
+        assert_eq!(
+            ev(dn.clone(), bson::bson!({"$maxN": {"n": 2, "input": "$a"}})),
+            Bson::Array(vec![Bson::Int32(5), Bson::Int32(3)])
+        );
+        assert_eq!(
+            ev(dn, bson::bson!({"$minN": {"n": 2, "input": "$a"}})),
+            Bson::Array(vec![Bson::Int32(1), Bson::Int32(3)])
+        );
+        // null / missing / non-array input, invalid n, bool element -> error (defer).
+        assert!(evaluate(
+            &d,
+            &bson::bson!({"$maxN": {"n": 2, "input": "$missing"}}),
+            &Document::new()
+        )
+        .is_err());
+        assert!(evaluate(
+            &d,
+            &bson::bson!({"$maxN": {"n": 2, "input": Bson::Null}}),
+            &Document::new()
+        )
+        .is_err());
+        assert!(evaluate(
+            &d,
+            &bson::bson!({"$maxN": {"n": 0, "input": "$a"}}),
+            &Document::new()
+        )
+        .is_err());
+        let db = doc! {"a": [Bson::Boolean(true), Bson::Int32(1)]};
+        assert!(evaluate(
+            &db,
+            &bson::bson!({"$maxN": {"n": 1, "input": "$a"}}),
+            &Document::new()
+        )
+        .is_err());
+    }
+
+    #[test]
     fn first_n_last_n() {
         let d = doc! {"a": [10i32, 20i32, 30i32, 40i32, 50i32]};
         assert_eq!(
@@ -3080,15 +3169,27 @@ mod tests {
                 Bson::Int32(50)
             ])
         );
-        // null / missing input -> null.
+        // An integral double n is accepted (mongod does).
         assert_eq!(
             ev(
                 d.clone(),
-                bson::bson!({"$firstN": {"n": 2, "input": "$missing"}})
+                bson::bson!({"$firstN": {"n": 2.0, "input": "$a"}})
             ),
-            Bson::Null
+            Bson::Array(vec![Bson::Int32(10), Bson::Int32(20)])
         );
-        // Invalid n / non-array input defer (Python raises).
+        // null / missing / non-array input, invalid n -> error (defer; mongod raises).
+        assert!(evaluate(
+            &d,
+            &bson::bson!({"$firstN": {"n": 2, "input": "$missing"}}),
+            &Document::new()
+        )
+        .is_err());
+        assert!(evaluate(
+            &d,
+            &bson::bson!({"$firstN": {"n": 2, "input": Bson::Null}}),
+            &Document::new()
+        )
+        .is_err());
         assert!(evaluate(
             &d,
             &bson::bson!({"$firstN": {"n": 0, "input": "$a"}}),

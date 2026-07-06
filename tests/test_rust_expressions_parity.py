@@ -93,18 +93,37 @@ CURATED = [
     ({"$bitAnd": ["$a", "$missing"]}, {"a": 12}),  # null propagation
     ({"$bitAnd": ["$a", 1.5]}, {"a": 12}),  # double operand -> defer (Python raises)
     ({"$bitOr": ["$a", True]}, {"a": 12}),  # bool operand -> defer
-    # $firstN / $lastN (expression form) — slice first/last n; n>len -> all;
-    # null/missing input -> null; invalid n / non-array defer (Python raises).
+    # $firstN / $lastN (expression form) — slice first/last n; n>len -> all.
+    # Validation matches mongod: null/missing/non-array input errors (5788200),
+    # non-integral / n<=0 errors — all defer (Rust None, Python raises). An
+    # integral double n is accepted.
     ({"$firstN": {"n": 2, "input": "$a"}}, {"a": [10, 20, 30, 40]}),
     ({"$lastN": {"n": 2, "input": "$a"}}, {"a": [10, 20, 30, 40]}),
     ({"$firstN": {"n": 10, "input": "$a"}}, {"a": [10, 20]}),
     ({"$lastN": {"n": 10, "input": "$a"}}, {"a": [10, 20]}),
     ({"$firstN": {"n": 1, "input": "$a"}}, {"a": []}),
-    ({"$firstN": {"n": 2, "input": "$missing"}}, {}),
-    ({"$firstN": {"n": 0, "input": "$a"}}, {"a": [1, 2]}),  # n<=0 -> defer
-    ({"$lastN": {"n": 1.5, "input": "$a"}}, {"a": [1, 2]}),  # non-int n -> defer
-    ({"$firstN": {"n": 2, "input": 5}}, {}),  # non-array -> defer
+    ({"$firstN": {"n": 2.0, "input": "$a"}}, {"a": [10, 20, 30]}),  # integral double n
     ({"$firstN": {"n": Int64(2), "input": "$a"}}, {"a": [7, 8, 9]}),  # long n ok
+    ({"$firstN": {"n": 2, "input": "$missing"}}, {}),  # missing input -> error (defer)
+    ({"$firstN": {"n": 2, "input": None}}, {}),  # null input -> error (defer)
+    ({"$firstN": {"n": 0, "input": "$a"}}, {"a": [1, 2]}),  # n<=0 -> defer
+    ({"$lastN": {"n": 1.5, "input": "$a"}}, {"a": [1, 2]}),  # non-integral n -> defer
+    ({"$firstN": {"n": 2, "input": 5}}, {}),  # non-array -> defer
+    # $maxN / $minN (expression form) — n largest/smallest by BSON order; null
+    # elements ignored; cross-type sortable subset compares, bool/Decimal128 defers;
+    # null/non-array input errors like $firstN (defer).
+    ({"$maxN": {"n": 3, "input": "$a"}}, {"a": [3, 1, 4, 1, 5, 9, 2, 6]}),
+    ({"$minN": {"n": 3, "input": "$a"}}, {"a": [3, 1, 4, 1, 5, 9, 2, 6]}),
+    ({"$maxN": {"n": 2, "input": "$a"}}, {"a": [3, None, 1, None, 5]}),  # nulls ignored
+    ({"$minN": {"n": 2, "input": "$a"}}, {"a": [3, None, 1, None, 5]}),
+    ({"$maxN": {"n": 99, "input": "$a"}}, {"a": [3, 1, 2]}),  # n>len -> all sorted
+    ({"$minN": {"n": 2, "input": [None, None]}}, {}),  # all-null array -> []
+    ({"$maxN": {"n": 2, "input": "$missing"}}, {}),  # missing input -> error (defer)
+    ({"$maxN": {"n": 2, "input": ["b", "a", "c"]}}, {}),  # strings
+    ({"$maxN": {"n": 2, "input": [1, "a", 2.5, "b"]}}, {}),  # cross-type BSON order
+    ({"$maxN": {"n": 1, "input": [True, 1]}}, {}),  # bool element -> defer
+    ({"$maxN": {"n": 0, "input": "$a"}}, {"a": [1, 2]}),  # n<=0 -> defer
+    ({"$minN": {"n": 2, "input": 5}}, {}),  # non-array -> defer
     ("$a", {"a": 5}),
     ("hi", {}),
     ("$missing", {}),

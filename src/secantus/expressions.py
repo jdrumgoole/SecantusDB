@@ -1293,24 +1293,61 @@ def _op_last(arg: Any, ctx: _Ctx) -> Any:
     return arr[-1] if isinstance(arr, list) and arr else None
 
 
+def _nelem_render(v: Any) -> str:
+    """Render a value the way mongod does in the "found <v>" tail of an ``n``
+    type error — strings are quoted, other scalars stringified."""
+    if isinstance(v, str):
+        return f'"{v}"'
+    return str(v)
+
+
+def _nelem_n_and_input(arg: Any, ctx: _Ctx) -> tuple[int, list[Any]]:
+    """Validate and evaluate the ``{n, input}`` spec shared by ``$firstN`` /
+    ``$lastN`` / ``$maxN`` / ``$minN``, matching mongod's error codes exactly
+    (verified against mongod 6.0): a missing ``n`` / ``input`` is
+    ``Location5787906`` / ``Location5787907``; an ``n`` that isn't an integral
+    number is ``Location5787903`` (non-integral numeric) or ``Location5787902``
+    (non-numeric); ``n <= 0`` is ``Location5787908``; and a null / missing /
+    non-array ``input`` is ``Location5788200`` — mongod does **not** treat a null
+    input as null here, it raises. An integral double (``2.0``) is accepted."""
+    if not isinstance(arg, Mapping) or "n" not in arg:
+        raise ExpressionError("Missing value for 'n'", code=5787906)
+    if "input" not in arg:
+        raise ExpressionError("Missing value for 'input'", code=5787907)
+    n_val = _eval(arg["n"], ctx)
+    if isinstance(n_val, bool):
+        raise ExpressionError(
+            f"Value for 'n' must be of integral type, but found {_nelem_render(n_val)}",
+            code=5787902,
+        )
+    if isinstance(n_val, int) or (isinstance(n_val, float) and n_val.is_integer()):
+        n = int(n_val)
+    elif isinstance(n_val, Decimal128) and ((dec := n_val.to_decimal()) == dec.to_integral_value()):
+        n = int(dec)
+    elif isinstance(n_val, (float, Decimal128)):
+        raise ExpressionError(
+            f"Value for 'n' must be of integral type, but found {_nelem_render(n_val)}",
+            code=5787903,
+        )
+    else:
+        raise ExpressionError(
+            f"Value for 'n' must be of integral type, but found {_nelem_render(n_val)}",
+            code=5787902,
+        )
+    if n <= 0:
+        raise ExpressionError(f"'n' must be greater than 0, found {n}", code=5787908)
+    arr = _eval(arg["input"], ctx)
+    if not isinstance(arr, list):
+        raise ExpressionError("Input must be an array", code=5788200)
+    return n, arr
+
+
 def _first_last_n(arg: Any, ctx: _Ctx, *, first: bool) -> Any:
     """``$firstN`` / ``$lastN`` (expression form): the first / last ``n`` elements
-    of an array. ``n`` must resolve to a positive integer; a null / missing
-    ``input`` yields null; a non-array ``input`` raises. When the array has fewer
-    than ``n`` elements the whole array is returned."""
-    op = "$firstN" if first else "$lastN"
-    if not isinstance(arg, Mapping) or "n" not in arg or "input" not in arg:
-        raise ExpressionError(f"{op} requires {{n, input}}")
-    n = _eval(arg["n"], ctx)
-    if isinstance(n, bool) or not isinstance(n, int):
-        raise ExpressionError(f"{op} 'n' must be an integer")
-    if n <= 0:
-        raise ExpressionError(f"{op} 'n' must be greater than 0")
-    arr = _eval(arg["input"], ctx)
-    if arr is None:
-        return None
-    if not isinstance(arr, list):
-        raise ExpressionError(f"{op} 'input' must be an array")
+    of an array. When the array has fewer than ``n`` elements the whole array is
+    returned. Validation (``n`` / ``input``) matches mongod — see
+    ``_nelem_n_and_input``."""
+    n, arr = _nelem_n_and_input(arg, ctx)
     return arr[:n] if first else arr[-n:]
 
 
@@ -1320,6 +1357,30 @@ def _op_first_n(arg: Any, ctx: _Ctx) -> Any:
 
 def _op_last_n(arg: Any, ctx: _Ctx) -> Any:
     return _first_last_n(arg, ctx, first=False)
+
+
+def _max_min_n(arg: Any, ctx: _Ctx, *, largest: bool) -> Any:
+    """``$maxN`` / ``$minN`` (expression form): the ``n`` largest / smallest
+    elements of an array, by MongoDB's cross-type BSON order. Null (and missing)
+    *elements* are ignored (mongod does not consider them); the result is in
+    descending order for ``$maxN`` and ascending for ``$minN``. Fewer than ``n``
+    non-null values returns all of them. Validation matches mongod — see
+    ``_nelem_n_and_input`` (a null / non-array ``input`` raises, unlike the
+    elements)."""
+    n, arr = _nelem_n_and_input(arg, ctx)
+    from secantus.ordering import _SortKey
+
+    non_null = [x for x in arr if x is not None]
+    non_null.sort(key=_SortKey, reverse=largest)
+    return non_null[:n]
+
+
+def _op_max_n(arg: Any, ctx: _Ctx) -> Any:
+    return _max_min_n(arg, ctx, largest=True)
+
+
+def _op_min_n(arg: Any, ctx: _Ctx) -> Any:
+    return _max_min_n(arg, ctx, largest=False)
 
 
 def _op_slice(arg: Any, ctx: _Ctx) -> Any:
@@ -1710,6 +1771,8 @@ _OPS = {
     "$bitNot": _op_bit_not,
     "$firstN": _op_first_n,
     "$lastN": _op_last_n,
+    "$maxN": _op_max_n,
+    "$minN": _op_min_n,
     "$mergeObjects": _op_merge_objects,
     "$objectToArray": _op_object_to_array,
     "$setField": _op_set_field,

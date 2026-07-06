@@ -1327,19 +1327,29 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   2026-07-06 found these error on *both* — a dual-server gap, not Rust-only):
   `$top` / `$bottom` / `$topN` / `$bottomN` / `$firstN` / `$lastN` / `$maxN` /
   `$minN` (the sort-/n-bounded accumulators), and `$median` / `$percentile`
-  (t-digest). Remaining **expression** forms still absent from both: `$maxN` /
-  `$minN` (sort-based — reuse the `$sortArray` sort infra, filter nulls, take n),
-  `$median` / `$percentile` over an array, `$dateFromParts`, `$tsSecond` /
-  `$tsIncrement`. Each would need porting on **both** servers (Python module + Rust
-  `secantus-core`) with a parity corpus. **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot`
-  and `$firstN`/`$lastN` as `$group` accumulators** remain a follow-on (their
-  *expression* forms shipped — see below). **Now native on both servers:** the
+  (t-digest). Remaining **expression** forms still absent from both:
+  `$median` / `$percentile` over an array (t-digest / approximate — parity-risky),
+  `$dateFromParts`, `$tsSecond` / `$tsIncrement`. Each would need porting on
+  **both** servers (Python module + Rust `secantus-core`) with a parity corpus.
+  **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot`, `$firstN`/`$lastN`, and `$maxN`/`$minN`
+  as `$group` accumulators** remain a follow-on (their *expression* forms shipped —
+  see below). **Now native on both servers:** the
   bitwise **expression** operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
   (0.5.3-beta.136 / 0.5.4b164 — int/long operands, int32/int64 result width,
   empty-list identity, null propagation; a non-integer operand raises), and the
-  **`$firstN` / `$lastN` expression** forms (0.5.3-beta.137 / 0.5.4b165 — first/last
-  n array elements; n>len returns all; null input → null; invalid n / non-array
-  raises). **Now native on the Rust server:** `$stdDevPop` /
+  **N-element array expressions** `$firstN` / `$lastN` / `$maxN` / `$minN`
+  (0.5.3-beta.13{7,8} / 0.5.4b16{5,6}; the `{n,input}` validation is matched to
+  **real mongod 6.0** via a three-way probe — integral-double `n` accepted, and a
+  null/missing/non-array `input` **raises** `Location5788200`, not null; `$maxN`/
+  `$minN` sort via the `$sortArray` `order::cmp`/`is_sortable` contract, deferring
+  bool/Decimal128 elements to Python's `_SortKey`). **Error-code gap (both these
+  operator families and, generally, any operator whose error path defers):** the
+  Python server reproduces mongod's exact Location codes, but the **Rust server**
+  raises a generic `BadValue` (2) on these error paths because the Rust core signals
+  `Fallback` rather than a coded error — same class as the unrecognized-operator
+  nit. A faithful fix needs the `Fallback` type to carry an optional mongod code (or
+  per-operator error emission in the command layer). **Now native on the Rust
+  server:** `$stdDevPop` /
   `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
   both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
   bit-for-bit despite CPython 3.12's compensated `sum()`).
