@@ -1298,11 +1298,15 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `$dateFromString` `format` directives *outside* the numeric subset
   (`%z`/`%Z`/`%a`/`%b`/`%p`/… — need locale/text/offset handling), a `%j` combined
   with `%m`/`%d`, and any input Python would reject; `$dateToString` `%z`/`%Z`/
-  ISO-week/locale directives; and the `timezone` form of `$dateToParts` /
-  `$dateTrunc` / `$dateDiff` — these are all instant→local (unambiguous), so they're
-  a natural follow-on to the extractor work below using the same `chrono-tz`
-  resolver, and are a gap in **both** servers today (each ignores `timezone` on
-  these three). **Now native on the Rust server:** fixed-offset /
+  ISO-week/locale directives; and the `timezone` form of **`$dateTrunc` /
+  `$dateDiff`** — a gap in *both* servers, but **deliberately deferred** (not a
+  clean instant→local like the extractors / `$dateToParts`): `$dateTrunc` truncates
+  to a *local* boundary that must convert back to a UTC instant (local→instant,
+  DST-ambiguous across a gap/overlap — same class as `$dateFromString`), and
+  `$dateDiff`'s `day`/`week` already count elapsed 24h/7d periods rather than
+  local-calendar boundaries (a pre-existing mongod divergence, independent of
+  timezone), so honouring `timezone` there would first require fixing that calendar
+  semantics. **Now native on the Rust server:** fixed-offset /
   `UTC` / `GMT` timezones on both ops (0.5.3-beta.116); `$dateFromString`
   `format` (strptime) for the numeric-directive subset `%Y`/`%y`/`%m`/`%d`/`%H`/
   `%M`/`%S`/`%j`/`%%` + literals + whitespace (0.5.3-beta.117, regex built from
@@ -1313,9 +1317,12 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   **`{date, timezone}` object form of the seven date component extractors**
   (`$year`/`$month`/`$dayOfMonth`/`$dayOfWeek`/`$hour`/`$minute`/`$second`) —
   fixed-offset + named IANA zones, on **both** servers (0.5.3-beta.133 / 0.5.4b161;
-  previously both ignored `timezone` here and returned null for the object form).
-  Fractional seconds stay deferred (BSON is millisecond-only). The Python server
-  already supports the remaining `$dateFromString`/`$dateToString` directive edges.
+  previously both ignored `timezone` here and returned null for the object form);
+  and **`$dateToParts` `timezone`** (fixed-offset + named IANA, both servers,
+  0.5.3-beta.134 / 0.5.4b162 — instant→wall-clock via the shared
+  `timezone_offset_ms` helper; previously both ignored it). Fractional seconds stay
+  deferred (BSON is millisecond-only). The Python server already supports the
+  remaining `$dateFromString`/`$dateToString` directive edges.
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/

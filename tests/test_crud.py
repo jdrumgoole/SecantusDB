@@ -616,6 +616,33 @@ def test_aggregate_date_extractor_timezone(coll) -> None:
     assert out == [{"utc_hour": 16, "ny_hour": 11, "ny_day": 15, "off_hour": 22}]
 
 
+def test_aggregate_date_to_parts_timezone(coll) -> None:
+    # $dateToParts reads local wall-clock in the given zone. 16:30:45Z is EST
+    # (-05:00) in New York -> hour 11, still the 15th.
+    coll.insert_one({"_id": 1, "d": dt.datetime(2023, 1, 15, 16, 30, 45, tzinfo=dt.timezone.utc)})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "parts": {"$dateToParts": {"date": "$d", "timezone": "America/New_York"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out[0]["parts"] == {
+        "year": 2023,
+        "month": 1,
+        "day": 15,
+        "hour": 11,
+        "minute": 30,
+        "second": 45,
+        "millisecond": 0,
+    }
+
+
 def test_aggregate_unwind_stage(coll) -> None:
     coll.insert_one({"_id": 1, "tags": ["a", "b", "c"]})
     out = list(coll.aggregate([{"$unwind": "$tags"}]))

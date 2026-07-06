@@ -759,6 +759,12 @@ def _op_date_to_parts(arg: Any, ctx: _Ctx) -> Any:
         return None
     if not isinstance(date, _dt.datetime):
         raise ExpressionError("$dateToParts date must be a datetime")
+    tz = _resolve_timezone(arg.get("timezone"))
+    if tz is not None:
+        # Naive input is treated as UTC (BSON Date semantics); shift into the zone
+        # so the parts read local wall-clock — instant->wall-clock, unambiguous.
+        date_aware = date if date.tzinfo is not None else date.replace(tzinfo=_dt.timezone.utc)
+        date = date_aware.astimezone(tz)
     return {
         "year": date.year,
         "month": date.month,
