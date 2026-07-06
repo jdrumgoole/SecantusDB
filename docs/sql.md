@@ -2399,22 +2399,22 @@ so `psql`'s `\du` and role-aware tooling see them:
 CREATE ROLE analyst;
 CREATE USER app WITH PASSWORD 'secret' CREATEDB;   -- USER implies LOGIN
 ALTER ROLE analyst WITH LOGIN;
-GRANT SELECT ON orders TO analyst;                 -- accepted, not enforced
+GRANT SELECT ON orders TO analyst;                 -- recorded + enforced (see below)
 DROP ROLE analyst;
 ```
 
 `CREATE ROLE` / `CREATE USER` (with `LOGIN` / `SUPERUSER` / `CREATEDB` / `CREATEROLE` /
 `INHERIT` / `REPLICATION` and their `NO…` negations, `PASSWORD`, `CONNECTION LIMIT`),
-`ALTER ROLE`, and `DROP ROLE` are stored and reflected. `GRANT` / `REVOKE` (privileges
-and role membership) are **accepted but not enforced** — SecantusDB does no
-privilege checking. The connecting user always appears in `pg_roles` as a superuser
-login role, like Postgres' bootstrap superuser.
+`ALTER ROLE`, and `DROP ROLE` are stored and reflected. Role-membership `GRANT` /
+`REVOKE` (`GRANT admin TO alice`) is accepted but not enforced. Table-privilege
+`GRANT` / `REVOKE` (`GRANT SELECT ON t TO alice`) **is** recorded and enforced — see
+[Table privileges](#table-privileges-grant--revoke) below. The connecting user
+always appears in `pg_roles` as a superuser login role, like Postgres' bootstrap
+superuser.
 
 These SQL roles are a schema-shape / reflection record, **distinct from the wire
 server's SCRAM auth users** (the `users={...}` constructor argument above): creating
-a SQL role does not by itself add a login credential, and vice versa. SQL-level
-`GRANT` / `REVOKE` of *table privileges* is still not enforced — per-statement
-authorization is driven by the role bindings below, not by SQL `GRANT`.
+a SQL role does not by itself add a login credential, and vice versa.
 
 ### Authorization (RBAC)
 
@@ -2455,10 +2455,42 @@ role defined once governs both protocols. An authenticated user with no role
 binding can connect and run session-only statements but touches no data.
 
 Without `user_roles`, authorization stays off — pass it only when you want the
-per-database gate. `GRANT` / `REVOKE` **statements** are gated (they need a
-user-admin action when authorization is active), but they still do not *change*
-stored privileges; adjust access by changing `user_roles` (or the shared
-users/roles tables), not by SQL grants.
+per-database gate.
+
+### Table privileges (`GRANT` / `REVOKE`)
+
+`GRANT`/`REVOKE` of `SELECT` / `INSERT` / `UPDATE` / `DELETE` (or `ALL`) on a table
+are persisted and enforced as an **additive** layer over the Mongo RBAC roles
+above:
+
+```sql
+GRANT SELECT, INSERT ON orders TO analyst;   -- analyst can now read + insert orders
+GRANT SELECT ON orders TO PUBLIC;            -- everyone can read orders
+REVOKE INSERT ON orders FROM analyst;        -- take the insert back
+```
+
+A data operation is authorized when the connection's Mongo role covers it **or**
+a table grant does — so a grant *extends* access to a user whose role wouldn't
+otherwise allow the operation (including a user with no role at all, or via a
+`PUBLIC` grant), and a `REVOKE` takes that granted access back. Because the two
+axes are additive, a table grant never *shrinks* what a broader Mongo role
+(e.g. `readWrite`) already permits; use the role bindings for that. Enforcement
+follows the same opt-in as the RBAC gate: with authorization off (trust mode /
+embedded `run_sql`) grants are recorded and reflected but not enforced.
+
+Grants surface through `information_schema.role_table_grants` /
+`information_schema.table_privileges` and the `has_table_privilege([user,] table,
+privilege)` function:
+
+```sql
+SELECT grantee, privilege_type FROM information_schema.role_table_grants;
+SELECT has_table_privilege('analyst', 'orders', 'SELECT');   -- t
+```
+
+`ALL` expands to Postgres' seven table privileges for reflection fidelity, but
+only `SELECT` / `INSERT` / `UPDATE` / `DELETE` are enforced (the other operations
+don't exist in SecantusDB). Role-membership grants and grants on schemas /
+databases / sequences remain accepted no-ops.
 
 ## Session and catalog introspection
 

@@ -143,6 +143,7 @@ _SCALAR_EVAL_ANON = frozenset(
         "age",
         "uuid_generate_v4",
         "uuid_generate_v1",
+        "has_table_privilege",
     }
 )
 

@@ -2388,3 +2388,48 @@ def test_ssl_request_declined_without_tls(server):
     s.sendall(struct.pack("!ii", 8, pgwire.SSL_REQUEST_CODE))
     assert s.recv(1) == b"N"
     s.close()
+
+
+@pytest.fixture
+def real_server(tmp_path):
+    # A pg server over the real Storage (per the no-FakeStorage rule for new
+    # tests) — used by the GRANT/REVOKE reflection test below.
+    from secantus.storage import Storage
+
+    srv = SecantusPGServer(port=0, storage=Storage(str(tmp_path / "wt")))
+    srv.start()
+    try:
+        yield srv
+    finally:
+        srv.stop()
+
+
+def test_grant_revoke_reflection_via_driver(real_server):
+    # GRANT/REVOKE ON <table> persist and surface through
+    # information_schema.role_table_grants + has_table_privilege() over the wire
+    # (trust mode: recorded and reflected, not enforced).
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, n int)")
+    cur.execute("GRANT SELECT, INSERT ON t TO alice")
+    cur.execute("GRANT SELECT ON t TO PUBLIC")
+    cur.execute(
+        "SELECT grantee, privilege_type FROM information_schema.role_table_grants "
+        "ORDER BY grantee, privilege_type"
+    )
+    assert cur.fetchall() == (
+        ["PUBLIC", "SELECT"],
+        ["alice", "INSERT"],
+        ["alice", "SELECT"],
+    )
+    cur.execute("SELECT has_table_privilege('alice', 't', 'SELECT')")
+    assert cur.fetchall() == ([True],)
+    cur.execute("SELECT has_table_privilege('alice', 't', 'UPDATE')")
+    assert cur.fetchall() == ([False],)
+    cur.execute("REVOKE INSERT ON t FROM alice")
+    cur.execute(
+        "SELECT privilege_type FROM information_schema.table_privileges "
+        "WHERE grantee = 'alice' ORDER BY privilege_type"
+    )
+    assert cur.fetchall() == (["SELECT"],)
+    conn.close()

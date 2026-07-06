@@ -96,7 +96,67 @@ def required_privilege(stmt: exp.Expression) -> tuple[str, bool] | None:
     return None
 
 
-def authorize(stmt: exp.Expression, session: Session, storage: Any) -> None:
+# Data actions that a table-level GRANT can authorize, and the SQL privilege
+# keyword each maps to. A table grant is an *additive* path: it lets a user run
+# an operation their Mongo role wouldn't otherwise cover (it never restricts a
+# role that already grants the action db-wide — see docs/sql.md).
+_ACTION_TO_PRIVILEGE = {
+    rbac.A_FIND: "SELECT",
+    rbac.A_INSERT: "INSERT",
+    rbac.A_UPDATE: "UPDATE",
+    rbac.A_REMOVE: "DELETE",
+}
+
+
+def _grantee_identities(session: Session) -> set[str]:
+    """Every identity a table grant can be recorded against for this session: the
+    connected user, each of its role names, and the implicit ``PUBLIC`` role."""
+    ids = {session.user, "PUBLIC", "public"}
+    for r in session.roles:
+        name = r.get("role") if isinstance(r, dict) else getattr(r, "role", None)
+        if name:
+            ids.add(name)
+    return ids
+
+
+def _target_table(stmt: exp.Expression) -> str | None:
+    """The single user table an INSERT/UPDATE/DELETE/simple-SELECT reads or writes,
+    or None when the target isn't a single identifiable table (multi-table /
+    subquery / data-modifying CTE) — those get no table-grant fallback."""
+    if isinstance(stmt, exp.Insert):
+        tbl = stmt.this
+        if isinstance(tbl, exp.Schema):  # INSERT INTO t (cols) — table is Schema.this
+            tbl = tbl.this
+        return tbl.name if isinstance(tbl, exp.Table) else None
+    if isinstance(stmt, (exp.Update, exp.Delete)):
+        tbl = stmt.this if isinstance(stmt, exp.Delete) else stmt.args.get("this")
+        return tbl.name if isinstance(tbl, exp.Table) else None
+    if isinstance(stmt, exp.Select):
+        if stmt.args.get("joins") or stmt.find(exp.Subquery) is not None:
+            return None
+        # The pg dialect exposes the FROM under the ``from_`` arg (falling back to
+        # ``from`` on parses that use the older key).
+        frm = stmt.args.get("from_") or stmt.args.get("from")
+        tbl = frm.this if frm is not None else None
+        return tbl.name if isinstance(tbl, exp.Table) else None
+    return None
+
+
+def _table_grant_allows(stmt: exp.Expression, action: str, session: Session, catalog: Any) -> bool:
+    """Whether a recorded table-level grant covers ``action`` on ``stmt``'s target
+    table for this session (the additive GRANT/REVOKE enforcement path)."""
+    privilege = _ACTION_TO_PRIVILEGE.get(action)
+    if privilege is None or catalog is None:
+        return False
+    table = _target_table(stmt)
+    if table is None:
+        return False
+    return catalog.has_table_privilege(
+        session.database, table, _grantee_identities(session), privilege
+    )
+
+
+def authorize(stmt: exp.Expression, session: Session, storage: Any, catalog: Any = None) -> None:
     """Raise ``42501 insufficient_privilege`` if ``session``'s roles don't grant
     what ``stmt`` needs. No-op unless authorization is active on the session."""
     if not session.authz_active:
@@ -108,11 +168,15 @@ def authorize(stmt: exp.Expression, session: Session, storage: Any) -> None:
     # Custom (non-built-in) roles resolve through Storage.get_role; a mock store
     # without it still authorizes the built-in roles.
     resolver = getattr(storage, "get_role", None)
-    if not rbac.check_privilege(
+    if rbac.check_privilege(
         session.roles,
         action,
         target_db=None if cluster else session.database,
         cluster=cluster,
         role_resolver=resolver,
     ):
-        raise errors.insufficient_privilege(session.database, action)
+        return
+    # The Mongo role doesn't cover it — a table-level GRANT still might.
+    if not cluster and _table_grant_allows(stmt, action, session, catalog):
+        return
+    raise errors.insufficient_privilege(session.database, action)

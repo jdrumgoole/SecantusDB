@@ -1332,6 +1332,26 @@ def _sequence_func(name: str, args: list[Any], ctx: ScalarContext | None) -> Any
     return value
 
 
+def _has_table_privilege(args: list[Any], ctx: ScalarContext | None) -> Any:
+    """``has_table_privilege([user,] table, privilege)`` — reflects the table-level
+    grants recorded by GRANT/REVOKE. Two-arg form checks the session user; the
+    three-arg form checks a named user. The privilege may carry a trailing
+    ``WITH GRANT OPTION`` (ignored). Returns a bool, or NULL on a NULL argument."""
+    if ctx is None or ctx.catalog is None:
+        raise errors.feature_not_supported("has_table_privilege() requires an execution context")
+    if len(args) >= 3:
+        user, table, privilege = args[0], args[1], args[2]
+    elif len(args) == 2:
+        user, table, privilege = ctx.session.user, args[0], args[1]
+    else:
+        raise errors.SQLError("42883", "has_table_privilege() requires (table, privilege)")
+    if table is None or privilege is None or user is None:
+        return None
+    priv = _as_text(privilege).split("WITH")[0].strip().upper()
+    grantees = {_as_text(user), "PUBLIC", "public"}
+    return ctx.catalog.has_table_privilege(ctx.db, _as_text(table), grantees, priv)
+
+
 def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> Any:
     if name == "format_type":
         return _format_type(args[0] if args else None, args[1] if len(args) > 1 else None)
@@ -1352,6 +1372,8 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
 
             return virtual.viewdef_for_oid(ctx.db, ctx.catalog, args[0])
         return None
+    if name == "has_table_privilege":
+        return _has_table_privilege(args, ctx)
     if name in ("nextval", "currval", "setval", "lastval"):
         return _sequence_func(name, args, ctx)
     if name in (
