@@ -24,6 +24,7 @@ from secantus.sql import (
     planner,
     reflect,
     scalar,
+    srf,
     typemap,
     virtual,
 )
@@ -1273,6 +1274,12 @@ def _deallocate_statement(target: str, session: Session) -> SQLResult:
 def _run_select(
     stmt: exp.Select, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
+    # A base-less set-returning function as the row source: ``FROM generate_series(…)``
+    # / ``FROM unnest(…)`` / … or a bare ``SELECT generate_series(…)``.
+    srf_source = srf.from_source(stmt) or srf.fromless_projection(stmt)
+    if srf_source is not None:
+        return _run_srf_select(srf_source, stmt, storage, db, catalog, session)
+
     table_node = stmt.find(exp.Table)
     if table_node is None:
         return executor.execute_constant_select(
@@ -1325,6 +1332,31 @@ def _run_select(
     # pre-evaluated by the planner, which runs the inner SELECT through the engine.
     subctx = planner.SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session)
     return executor.execute_select(planner.plan_select(stmt, table, subctx), storage, db)
+
+
+def _run_srf_select(
+    source: srf.SrfSource,
+    stmt: exp.Select,
+    storage: Any,
+    db: str,
+    catalog: Catalog,
+    session: Session,
+) -> SQLResult:
+    """Materialize a base-less SRF's rows into an in-memory table and run the rest
+    of the query (projection / WHERE / ORDER BY / LIMIT) over it via the normal
+    select planner + executor."""
+    sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    rows, tdef = srf.build(source, sctx)
+    query = stmt
+    if stmt.args.get("from_") is None:
+        # ``SELECT generate_series(…)`` — retarget the projection at the value
+        # column so the standard column-projection path handles it.
+        query = stmt.copy()
+        query.set("from", exp.From(this=exp.Table(this=exp.to_identifier(tdef.name))))
+        query.set("expressions", [exp.column(tdef.columns[0].name)])
+    return executor.execute_select(
+        planner.plan_select(query, tdef), virtual.MemoryBackend(rows), db
+    )
 
 
 def _run_insert(
