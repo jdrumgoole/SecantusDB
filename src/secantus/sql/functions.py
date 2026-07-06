@@ -50,7 +50,17 @@ def evaluate_scalar(node: exp.Expression, session: Session) -> tuple[str, Any, s
     if isinstance(node, exp.CurrentSchema):
         return ("current_schema", session.current_schema, "text")
     if isinstance(node, exp.CurrentUser):
-        return ("current_user", session.user, "text")
+        return ("current_user", session.effective_user, "text")
+    if getattr(exp, "SessionUser", None) is not None and isinstance(node, exp.SessionUser):
+        return ("session_user", session.user, "text")
+    if isinstance(node, exp.Column) and not node.table:
+        # ``current_role`` / ``user`` / ``session_user`` are keyword synonyms that
+        # sqlglot leaves as bare column references in a FROM-less SELECT.
+        low = node.name.lower()
+        if low in ("current_user", "current_role", "user"):
+            return (low, session.effective_user, "text")
+        if low == "session_user":
+            return (low, session.user, "text")
 
     if isinstance(node, exp.Anonymous):
         name = (node.this if isinstance(node.this, str) else node.name).lower()
@@ -69,8 +79,12 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
         return (name, session.database, "text")
     if name == "current_schema":
         return ("current_schema", session.current_schema, "text")
-    if name in ("current_user", "current_role", "session_user", "user"):
+    if name == "session_user":
+        # The login identity — changed only by SET SESSION AUTHORIZATION.
         return (name, session.user, "text")
+    if name in ("current_user", "current_role", "user"):
+        # The current role — the SET ROLE override, else the session user.
+        return (name, session.effective_user, "text")
     if name == "current_setting":
         if not args:
             raise errors.syntax_error("current_setting() requires a setting name")
@@ -167,6 +181,12 @@ def is_scalar_function(node: exp.Expression) -> bool:
             or name in _SCALAR_EVAL_ANON
         ):
             return False
+    # ``session_user`` (exp.SessionUser) and the keyword synonyms ``current_role`` /
+    # ``user`` (bare columns in a FROM-less SELECT) resolve to the session identity.
+    if getattr(exp, "SessionUser", None) is not None and isinstance(node, exp.SessionUser):
+        return True
+    if isinstance(node, exp.Column) and not node.table:
+        return node.name.lower() in ("current_user", "current_role", "user", "session_user")
     return isinstance(
         node,
         exp.CurrentVersion

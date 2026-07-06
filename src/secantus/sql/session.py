@@ -87,6 +87,15 @@ class Session:
     # ``secantus.rbac.check_privilege`` — the same model the Mongo server uses.
     authz_active: bool = False
     roles: list[Any] = field(default_factory=list)
+    # SET ROLE / SET SESSION AUTHORIZATION (#128). ``user`` is the *session user*
+    # — the login identity, changed only by SET SESSION AUTHORIZATION. ``role`` is
+    # the *current role* override set by SET ROLE (None = current role tracks the
+    # session user). ``login_user`` is the original authenticated login, captured
+    # once so RESET SESSION AUTHORIZATION can restore it. ``effective_user``
+    # (``role or user``) is what ``current_user`` reports and what the table-grant
+    # gate (#127) matches against; ``user`` is what ``session_user`` reports.
+    role: str | None = None
+    login_user: str | None = None
     # Multi-statement transaction state. ``txn_handle`` is the open
     # ``Storage`` user-transaction (None outside a BEGIN block); ``txn_failed``
     # marks an aborted block (every command except COMMIT/ROLLBACK errors with
@@ -126,6 +135,16 @@ class Session:
     _notify_lock: Any = field(default_factory=threading.Lock)
     _notify_deliveries: deque = field(default_factory=deque)
     pending_notifies: list[tuple[str, str]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.login_user is None:
+            self.login_user = self.user
+
+    @property
+    def effective_user(self) -> str:
+        """The current role (``current_user``) — the SET ROLE override, else the
+        session user."""
+        return self.role or self.user
 
     def enqueue_notification(self, pid: int, channel: str, payload: str) -> None:
         """Called by another connection's NOTIFY thread — thread-safe append."""

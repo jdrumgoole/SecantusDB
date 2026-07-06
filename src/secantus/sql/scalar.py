@@ -1334,15 +1334,16 @@ def _sequence_func(name: str, args: list[Any], ctx: ScalarContext | None) -> Any
 
 def _has_table_privilege(args: list[Any], ctx: ScalarContext | None) -> Any:
     """``has_table_privilege([user,] table, privilege)`` — reflects the table-level
-    grants recorded by GRANT/REVOKE. Two-arg form checks the session user; the
-    three-arg form checks a named user. The privilege may carry a trailing
-    ``WITH GRANT OPTION`` (ignored). Returns a bool, or NULL on a NULL argument."""
+    grants recorded by GRANT/REVOKE. Two-arg form checks the current user (the
+    SET ROLE override, else the session user); the three-arg form checks a named
+    user. The privilege may carry a trailing ``WITH GRANT OPTION`` (ignored).
+    Returns a bool, or NULL on a NULL argument."""
     if ctx is None or ctx.catalog is None:
         raise errors.feature_not_supported("has_table_privilege() requires an execution context")
     if len(args) >= 3:
         user, table, privilege = args[0], args[1], args[2]
     elif len(args) == 2:
-        user, table, privilege = ctx.session.user, args[0], args[1]
+        user, table, privilege = ctx.session.effective_user, args[0], args[1]
     else:
         raise errors.SQLError("42883", "has_table_privilege() requires (table, privilege)")
     if table is None or privilege is None or user is None:

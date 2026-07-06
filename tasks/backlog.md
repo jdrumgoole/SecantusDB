@@ -2478,6 +2478,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   enforced (no such ops); no table-owner tracking (owners aren't auto-granted — the seeding/trust-mode
   session is unrestricted anyway); grant target must be a single identifiable table (multi-table /
   subquery statements get no table-grant fallback). Not ported to the Rust server.
+- [ ] **SET ROLE / SET SESSION AUTHORIZATION landed** (#128, b168): `SET [SESSION|LOCAL] ROLE { name |
+  NONE | DEFAULT }`, `SET [SESSION|LOCAL] SESSION AUTHORIZATION { name | DEFAULT }`, and their `RESET`
+  forms (all arrive as `exp.Command`; handled by `engine._run_authorization_command`). `Session.role` is
+  the current-role override (SET ROLE), `Session.user` the session user (SET SESSION AUTHORIZATION),
+  `Session.login_user` the immutable login (captured in `__post_init__`) for RESET; `effective_user`
+  (`role or user`) drives `current_user` / `current_role` / `user` and the #127 table-grant identity,
+  while `session_user` reports `Session.user`. `session_user` (`exp.SessionUser`) and the keyword
+  synonyms `current_role` / `user` (bare `exp.Column` in a FROM-less SELECT) now resolve via
+  `functions.evaluate_scalar` / `is_scalar_function`. `SHOW role` / `current_setting('role')` track the
+  current role. Escalation guard (`_can_assume_identity`): with `authz_active`, a session may assume only
+  its login, a role in its bindings, or anything as `root` — else `42501`; trust mode is unrestricted.
+  Tests: `tests/test_sql_set_role.py` + `test_pgserver_pg8000.py::test_set_role_and_session_authorization_via_driver`.
+  **Limitations:** no role-membership graph beyond the session's own bindings (SET ROLE to an arbitrary
+  granted-but-unbound role isn't validated against `pg_auth_members`); `SET LOCAL` isn't scoped to the
+  transaction (behaves like `SET`); the Mongo RBAC db-level gate still uses the login's `session.roles`
+  (SET ROLE changes the table-grant identity + `current_user`, not the underlying db-wide Mongo role
+  bindings). Not ported to the Rust server.
 - [ ] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
   IDENTITY [(START WITH n INCREMENT BY n)]` columns (`planner._identity_spec`) reuse the SERIAL sequence
   machinery — an owned `<table>_<col>_seq`, NOT NULL, auto-filled on omit. `Column.identity` is
