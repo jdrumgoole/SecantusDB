@@ -56,6 +56,26 @@ wording, so this closes a pymongo-gauge fidelity gap.
   raises `ProjectionError` with `code`/`code_name` pinned to `31254`/`31253`
   (the offending field named); `ProjectionError` gained a `code`/`code_name`
   constructor so the dispatch layer surfaces the specific code instead of `14`.
+### The Rust server prunes its oplog from write volume alone
+
+The standalone Rust `secantusdb` server used to prune its oplog only from
+the noop-heartbeat thread — and that thread is off by default
+(`--noop-heartbeat-seconds 0`). A long-lived, busy server with the
+default configuration could therefore grow its oplog past the retention
+window and entry cap without bound, since nothing was trimming it. The
+Rust storage engine now self-prunes on the write path, exactly as the
+Python server has always done: every 1000 emitted oplog entries it runs
+an opportunistic `prune_oplog`, so the oplog stays bounded from writes
+alone, with or without a heartbeat. Document data is never touched by a
+prune.
+
+#### Fixed
+- `secantus_storage::emit_oplog` bumps an in-memory emit counter and runs
+  an opportunistic `prune_oplog` every `OPLOG_PRUNE_INTERVAL` (1000)
+  entries — mirroring the Python server's `_emit_oplog`. The prune reuses
+  the write path's already-held storage lock (`prune_oplog_inner(...,
+  take_lock: false)`) and is best-effort, so it never fails an otherwise
+  successful write.
 
 ### `Storage` is now a context manager
 

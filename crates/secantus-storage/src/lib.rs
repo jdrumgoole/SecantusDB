@@ -1253,7 +1253,16 @@ struct OplogState {
     /// Next monotonic insertion `seq` for the natural-order index (independent of
     /// the oplog `seq`; advances on every doc insert even when the oplog is off).
     next_nat_seq: i64,
+    /// Oplog rows emitted since the last opportunistic prune. In-memory only
+    /// (resets on open, like `storage._oplog_emit_count`); never persisted.
+    emit_count: i64,
 }
+
+/// Emit this many oplog rows between opportunistic `prune_oplog` sweeps on the
+/// write path (mirrors `storage._OPLOG_PRUNE_INTERVAL`). This keeps the oplog
+/// bounded from writes alone, even when the noop-heartbeat sweeper is disabled
+/// (`noop_heartbeat_seconds == 0`, the default), which is the only other pruner.
+const OPLOG_PRUNE_INTERVAL: i64 = 1000;
 
 /// Milliseconds since the Unix epoch (UTC), for oplog `wall` times.
 fn now_millis() -> i64 {
@@ -1292,6 +1301,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                     // the natural index so minted seqs stay strictly greater.
                     next_nat_seq: g("next_nat_seq")
                         .unwrap_or_else(|| scan_max_nat_seq(session) + 1),
+                    emit_count: 0,
                 });
             }
         }
@@ -1323,6 +1333,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         last_ts_secs: last_secs,
         last_ts_ord: last_ord,
         next_nat_seq: scan_max_nat_seq(session) + 1,
+        emit_count: 0,
     })
 }
 
@@ -1568,6 +1579,7 @@ impl Storage {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
+        let n = entries.len() as i64;
         let (start, ts) = self.mint_seq_and_ts(entries.len());
         let cur = session.open_cursor(OPLOG_TABLE, None)?;
         let mut pre_cur: Option<Cursor> = None;
@@ -1597,9 +1609,28 @@ impl Storage {
         // Wake any tailable change-stream getMore blocked in `wait_for_oplog`:
         // the rows are committed (autocommit per insert) and the tail (next_seq)
         // has advanced, so a woken waiter's producer re-read sees the new events.
-        {
-            let _g = self.oplog.lock().unwrap();
+        // Also bump the opportunistic-prune counter under the same lock.
+        let do_prune = {
+            let mut g = self.oplog.lock().unwrap();
             self.oplog_cv.notify_all();
+            g.emit_count += n;
+            if g.emit_count >= OPLOG_PRUNE_INTERVAL {
+                g.emit_count = 0;
+                true
+            } else {
+                false
+            }
+        };
+        // Opportunistically bound the oplog from write volume alone (mirrors
+        // `storage._emit_oplog`'s every-1000-emits prune). Every `emit_oplog`
+        // caller already holds `self.lock`, so the prune runs with `take_lock =
+        // false` to avoid re-locking the non-reentrant mutex. Best-effort: the
+        // write already committed, so a prune failure must not fail the write —
+        // the next sweep retries.
+        if do_prune {
+            if let Err(e) = self.prune_oplog_inner(None, false) {
+                debug_assert!(false, "opportunistic prune_oplog failed: {e:?}");
+            }
         }
         Ok(last)
     }
@@ -2113,6 +2144,15 @@ impl Storage {
     /// the wall clock). Returns the number of rows pruned. No background sweeper —
     /// the caller drives it. Mirrors `storage.prune_oplog` / `_prune_oplog_locked`.
     pub fn prune_oplog(&self, now: Option<i64>) -> Result<usize> {
+        self.prune_oplog_inner(now, true)
+    }
+
+    /// `prune_oplog`, parameterised on whether to acquire the global `self.lock`
+    /// for the delete phase. The public entry point passes `take_lock = true`;
+    /// the opportunistic write-path caller (`emit_oplog`) already holds the lock
+    /// and passes `false` (`std::Mutex` is not reentrant). The scan phase is
+    /// always lock-free on a fresh MVCC session either way.
+    fn prune_oplog_inner(&self, now: Option<i64>, take_lock: bool) -> Result<usize> {
         let session = self.conn.open_session()?;
         let when = now.unwrap_or_else(now_secs);
         let cutoff = when - self.oplog_retention_seconds;
@@ -2170,8 +2210,13 @@ impl Storage {
         }
 
         // Phase 2: take the global lock only for the mutation (the deletes),
-        // not the scan above.
-        let _g = self.lock.lock().unwrap();
+        // not the scan above — unless the caller (the write path) already holds
+        // it (`take_lock == false`), since `self.lock` is not reentrant.
+        let _g = if take_lock {
+            Some(self.lock.lock().unwrap())
+        } else {
+            None
+        };
         let op_del = session.open_cursor(OPLOG_TABLE, None)?;
         let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
         for &seq in &doomed {
@@ -7189,6 +7234,33 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec![1, 2, 3]); // base (1,2) + archived seq 3
+    }
+
+    #[test]
+    fn opportunistic_prune_bounds_oplog_from_writes() {
+        // The write path prunes the oplog every OPLOG_PRUNE_INTERVAL emits, so a
+        // long-running server bounds its oplog from writes alone — with NO
+        // explicit prune_oplog call and NO noop-heartbeat sweeper (the default).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        s.set_oplog_max_entries(10);
+        let enc = |id: i32| encode_doc(&doc! {"_id": id}).unwrap();
+        let total = OPLOG_PRUNE_INTERVAL as i32 + 1; // cross the threshold once
+        for i in 0..total {
+            s.insert("app", "c", vec![enc(i)], true).unwrap();
+        }
+        // The opportunistic prune at the OPLOG_PRUNE_INTERVAL-th emit trimmed the
+        // oplog to the 10-entry cap; only the handful of writes after it remain.
+        let live = s.read_oplog(1, 1_000_000).unwrap().len();
+        assert!(
+            live <= 50,
+            "oplog not opportunistically pruned: {live} live rows after {total} writes"
+        );
+        // Pruning the oplog never touches document data.
+        assert_eq!(
+            s.find_matching("app", "c", &doc! {}).unwrap().len() as i32,
+            total
+        );
     }
 
     #[test]
