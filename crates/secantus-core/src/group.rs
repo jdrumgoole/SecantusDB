@@ -141,6 +141,10 @@ pub(crate) enum Acc {
     Last(Option<Bson>),
     Push(Vec<Bson>),
     AddToSet(Vec<Bson>),
+    // `$stdDevPop` / `$stdDevSamp`: collect the numeric values, compute at
+    // finalize. `pop` selects population (÷n, 0 for a single value) vs sample
+    // (÷n-1, null for <2 values). Field stays absent when no numeric value seen.
+    StdDev { values: Vec<f64>, pop: bool },
 }
 
 struct Compiled<'a> {
@@ -160,6 +164,14 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
         "$last" => Acc::Last(None),
         "$push" => Acc::Push(Vec::new()),
         "$addToSet" => Acc::AddToSet(Vec::new()),
+        "$stdDevPop" => Acc::StdDev {
+            values: Vec::new(),
+            pop: true,
+        },
+        "$stdDevSamp" => Acc::StdDev {
+            values: Vec::new(),
+            pop: false,
+        },
         _ => return Err(()), // unsupported accumulator -> Python (raises or handles)
     })
 }
@@ -222,8 +234,56 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
                 list.push(v);
             }
         }
+        Acc::StdDev { values, .. } => {
+            // Python appends every non-null value; a non-numeric would then blow
+            // up `sum(values)` at finalize, so we defer such a group to Python
+            // (which raises). `null` is skipped. Bool counts as 0/1 (Python sums
+            // bools as ints) — matches the pure evaluator.
+            let v = eval(arg, doc, vars)?;
+            if !is_null(&v) {
+                values.push(numeric_f64(&v).ok_or(())?);
+            }
+        }
     }
     Ok(())
+}
+
+/// A numeric value as `f64` for `$stdDev*`: int / long / double, plus bool as
+/// `0.0`/`1.0` (Python folds bools into the numeric sum). Anything else → `None`,
+/// so the caller defers the group to Python (whose `sum()` would raise).
+fn numeric_f64(b: &Bson) -> Option<f64> {
+    match b {
+        Bson::Int32(n) => Some(*n as f64),
+        Bson::Int64(n) => Some(*n as f64),
+        Bson::Double(d) => Some(*d),
+        Bson::Boolean(x) => Some(if *x { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+/// Population / sample standard deviation, mirroring the pure `_std_dev`: `None`
+/// for an empty set, and additionally for a sample (`pop == false`) with < 2
+/// values (population of a single value is `0.0`). Squares with plain
+/// multiplication (`d * d`) and roots with `sqrt` — both correctly-rounded IEEE
+/// operations that reproduce CPython's `(x - mean) ** 2` / `... ** 0.5` bit-for-bit
+/// (a fuzz seed exposed that `f64::powf(2.0)` can round differently from
+/// multiplication). Sums in document order to match `sum(...)`.
+fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
+    let n = values.len();
+    if n == 0 || (!pop && n < 2) {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let denom = if pop { n } else { n - 1 } as f64;
+    let var = values
+        .iter()
+        .map(|x| {
+            let d = x - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / denom;
+    Some(var.sqrt())
 }
 
 /// `$min` / `$max`: `cur is None or (v is not None and v <cmp> cur)`. Uses
@@ -283,6 +343,15 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
             Acc::AddToSet(list) => {
                 out.insert(field.to_string(), Bson::Array(list));
             }
+            Acc::StdDev { values, pop } => {
+                // No numeric value seen -> the pure code never creates the bucket
+                // key, so the field is absent. Otherwise `_std_dev` may still be
+                // null (sample of a single value), which the pure code writes.
+                if !values.is_empty() {
+                    let v = std_dev(&values, pop).map_or(Bson::Null, Bson::Double);
+                    out.insert(field.to_string(), v);
+                }
+            }
         }
     }
     Ok(out)
@@ -318,6 +387,8 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
         Acc::Min(v) | Acc::Max(v) => v.unwrap_or(Bson::Null),
         Acc::First(v) | Acc::Last(v) => v.unwrap_or(Bson::Null),
         Acc::Push(list) | Acc::AddToSet(list) => Bson::Array(list),
+        // A window writes a value into every row: empty / degenerate -> null.
+        Acc::StdDev { values, pop } => std_dev(&values, pop).map_or(Bson::Null, Bson::Double),
     })
 }
 
@@ -672,6 +743,31 @@ mod tests {
                 Bson::Int32(2)
             ]))
         );
+    }
+
+    #[test]
+    fn std_dev_pop_and_samp() {
+        // Values 2, 4, 6: mean 4, pop var (4+0+4)/3 = 8/3 -> sqrt ~1.63299;
+        // sample var 8/2 = 4 -> 2.0.
+        let docs = vec![doc! {"v": 2i32}, doc! {"v": 4i32}, doc! {"v": 6i32}];
+        let out = g(
+            bson::bson!({"_id": Bson::Null, "p": {"$stdDevPop": "$v"}, "s": {"$stdDevSamp": "$v"}}),
+            docs,
+        );
+        assert_eq!(out[0].get("p"), Some(&Bson::Double((8.0f64 / 3.0).sqrt())));
+        assert_eq!(out[0].get("s"), Some(&Bson::Double(2.0)));
+        // Single value: pop -> 0.0, samp -> null. All-missing -> field absent.
+        let out2 = g(
+            bson::bson!({
+                "_id": Bson::Null,
+                "p": {"$stdDevPop": "$v"}, "s": {"$stdDevSamp": "$v"},
+                "m": {"$stdDevPop": "$missing"},
+            }),
+            vec![doc! {"v": 5i32}],
+        );
+        assert_eq!(out2[0].get("p"), Some(&Bson::Double(0.0)));
+        assert_eq!(out2[0].get("s"), Some(&Bson::Null));
+        assert!(out2[0].get("m").is_none());
     }
 
     #[test]

@@ -119,6 +119,10 @@ CURATED = [
     [{"$group": {"_id": "$b", "f": {"$first": "$a"}, "l": {"$last": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "all": {"$push": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "set": {"$addToSet": "$a"}}}, {"$sort": {"_id": 1}}],
+    # $stdDevPop / $stdDevSamp — pop is 0 for a single value, samp is null for <2.
+    [{"$group": {"_id": "$b", "sd": {"$stdDevPop": "$a"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "sd": {"$stdDevSamp": "$a"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": None, "p": {"$stdDevPop": "$a"}, "s": {"$stdDevSamp": "$a"}}}],
     [{"$group": {"_id": "$nested.k", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
     [{"$sortByCount": "$b"}],
     [{"$unwind": "$tags"}, {"$group": {"_id": "$tags", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
@@ -787,6 +791,7 @@ def _rand_stage(rng):
             "group_minmax",
             "group_push",
             "group_set",
+            "group_std",
             "sortbycount",
             "bucket",
             "bucket_default",
@@ -839,6 +844,9 @@ def _rand_stage(rng):
         return {"$group": {"_id": "$" + field, "p": {"$push": "$" + f2}, "av": {"$avg": "$" + f2}}}
     if kind == "group_set":
         return {"$group": {"_id": "$" + field, "set": {"$addToSet": "$" + f2}}}
+    if kind == "group_std":
+        op = rng.choice(["$stdDevPop", "$stdDevSamp"])
+        return {"$group": {"_id": "$" + field, "sd": {op: "$" + f2}}}
     if kind == "sortbycount":
         return {"$sortByCount": "$" + field}
     if kind in ("bucket", "bucket_default"):
