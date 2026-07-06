@@ -1171,14 +1171,7 @@ fn date_operand_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
                 Bson::DateTime(dt) => dt.timestamp_millis(),
                 _ => return Ok(None), // non-datetime -> None (null)
             };
-            let offset_ms = match d.get("timezone") {
-                None | Some(Bson::Null) => 0,
-                Some(Bson::String(s)) => match resolve_tz_offset(s) {
-                    Some(off_min) => off_min * 60_000,
-                    None => named_tz_offset_ms(s, millis).ok_or(Fallback)?,
-                },
-                Some(_) => return Err(Fallback), // Python raises "timezone must be a string"
-            };
+            let offset_ms = timezone_offset_ms(d.get("timezone"), millis)?;
             return Ok(Some(millis + offset_ms));
         }
     }
@@ -1343,18 +1336,9 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
         _ => return Ok(Bson::Null), // `_ensure_datetime(non-datetime)` -> None -> null
     };
     // A `timezone` shifts the wall clock before rendering (naive input is UTC,
-    // matching BSON Date semantics). A fixed offset (`±HH:MM` / `UTC` / `GMT`) is a
-    // constant; a *named* IANA zone resolves its DST-correct offset at this instant
-    // via `chrono-tz`. An unknown name / malformed offset / non-string defers to
-    // Python (which resolves the zone or raises).
-    let tz_offset = match spec.get("timezone") {
-        None => 0,
-        Some(Bson::String(s)) => match resolve_tz_offset(s) {
-            Some(off_min) => off_min * 60_000,
-            None => named_tz_offset_ms(s, millis).ok_or(Fallback)?,
-        },
-        Some(_) => return Err(Fallback), // Python raises "timezone must be a string"
-    };
+    // matching BSON Date semantics); see `timezone_offset_ms` for the fixed-offset
+    // vs named-zone resolution.
+    let tz_offset = timezone_offset_ms(spec.get("timezone"), millis)?;
     let fmt = match spec.get("format") {
         None => "%Y-%m-%dT%H:%M:%S.%LZ",
         Some(Bson::String(s)) => s.as_str(),
@@ -1557,6 +1541,26 @@ fn named_tz_offset_ms(name: &str, utc_millis: i64) -> Option<i64> {
         .fix()
         .local_minus_utc();
     Some(offset_secs as i64 * 1000)
+}
+
+/// Resolve a `timezone` spec field to a signed wall-clock offset in **milliseconds
+/// at the given UTC instant**, for the instant→wall-clock date operators
+/// (`$dateToString`, the `{date, timezone}` extractors, `$dateToParts`). Absent /
+/// `null` timezone → 0 (UTC), matching Python's `_resolve_timezone(None)`; a
+/// fixed-offset (`±HH:MM` / `UTC` / `GMT`) is constant; a named IANA zone resolves
+/// its DST-correct offset at the instant via `chrono-tz`. An unknown zone name or a
+/// non-string timezone → `Fallback` (defer to the Python oracle, which resolves it
+/// or raises). This is *not* used by `$dateFromString`, whose named-zone
+/// (local→instant) direction is DST-ambiguous and deliberately defers.
+fn timezone_offset_ms(tz: Option<&Bson>, utc_millis: i64) -> Result<i64, Fallback> {
+    match tz {
+        None | Some(Bson::Null) => Ok(0),
+        Some(Bson::String(s)) => match resolve_tz_offset(s) {
+            Some(off_min) => Ok(off_min * 60_000),
+            None => named_tz_offset_ms(s, utc_millis).ok_or(Fallback),
+        },
+        Some(_) => Err(Fallback), // Python raises "timezone must be a string"
+    }
 }
 
 /// A fixed `±HH:MM` UTC offset in signed minutes, or `None` if malformed.
@@ -2399,7 +2403,10 @@ fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
     match eval_opt(d.get("date"), ctx)? {
         Bson::Null => Ok(Bson::Null),
         Bson::DateTime(dt) => {
-            let millis = dt.timestamp_millis();
+            // A `timezone` shifts the instant into that zone before the parts are
+            // read (instant→wall-clock, unambiguous); absent/UTC leaves it in UTC.
+            let base = dt.timestamp_millis();
+            let millis = base + timezone_offset_ms(d.get("timezone"), base)?;
             let days = millis.div_euclid(86_400_000);
             let ms = millis.rem_euclid(86_400_000);
             let (y, m, dy) = civil_from_days(days);
@@ -2849,6 +2856,29 @@ mod tests {
             ),
             Bson::String("17:30".into())
         );
+    }
+
+    #[test]
+    fn date_to_parts_timezone() {
+        // 2023-01-15T16:30:45Z is EST (-05:00) in New York → local hour 11, still
+        // the 15th. Bare (no tz) reads UTC hour 16. Fixed offset shifts too.
+        let winter = bson::DateTime::from_millis(1_673_800_245_000);
+        let d = doc! {"d": winter};
+        let utc = ev(d.clone(), bson::bson!({"$dateToParts": {"date": "$d"}}));
+        assert_eq!(utc.as_document().unwrap().get_i32("hour").unwrap(), 16);
+        let ny = ev(
+            d.clone(),
+            bson::bson!({"$dateToParts": {"date": "$d", "timezone": "America/New_York"}}),
+        );
+        let nyd = ny.as_document().unwrap();
+        assert_eq!(nyd.get_i32("hour").unwrap(), 11);
+        assert_eq!(nyd.get_i32("day").unwrap(), 15);
+        assert_eq!(nyd.get_i32("second").unwrap(), 45);
+        let off = ev(
+            d,
+            bson::bson!({"$dateToParts": {"date": "$d", "timezone": "+05:30"}}),
+        );
+        assert_eq!(off.as_document().unwrap().get_i32("hour").unwrap(), 22);
     }
 
     #[test]

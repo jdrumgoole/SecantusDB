@@ -19,6 +19,32 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$dateToParts` honours a `timezone` (both servers)
+
+`$dateToParts` now accepts a `timezone` and returns the year/month/day/hour/…
+parts read off the wall clock in that zone, instead of always in UTC.
+`{$dateToParts: {date: "$d", timezone: "America/New_York"}}` on a `16:30Z` instant
+returns hour `11` in winter (EST); `Asia/Tokyo` rolls the day forward. Fixed-offset
+zones (`+05:30`, `UTC`) and named IANA zones both resolve; no `timezone` still
+reads UTC. Like the date extractors, this was a gap in **both** servers — each
+previously ignored `timezone` on `$dateToParts`.
+
+The Rust server resolves named zones via the shared `timezone_offset_ms` helper
+(the unambiguous instant→wall-clock direction, matching Python `zoneinfo`); an
+unknown zone name defers to the Python oracle. `$dateTrunc` / `$dateDiff` timezone
+remain deferred — `$dateTrunc` truncates to a *local* boundary that must convert
+back to an instant (local→instant, DST-ambiguous), and `$dateDiff`'s `day`/`week`
+already count elapsed duration rather than local-calendar boundaries, so timezone
+there would compound an existing divergence (see `tasks/backlog.md` §7.5).
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$dateToParts` reads `timezone` (fixed-offset
+  + named IANA), shifting the instant into the zone before splitting into parts.
+  The Rust side factors the fixed-offset/named-zone resolution into a shared
+  `timezone_offset_ms` helper now used by `$dateToString`, the `{date, timezone}`
+  extractors, and `$dateToParts`.
+
 ### Date component extractors honour a `timezone` (both servers)
 
 The date component operators — `$year`, `$month`, `$dayOfMonth`, `$dayOfWeek`,

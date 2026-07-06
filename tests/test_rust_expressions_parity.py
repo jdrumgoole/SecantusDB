@@ -353,9 +353,17 @@ CURATED = [
     ({"$trunc": [3.789, 2]}, {}),
     ({"$trunc": 5}, {}),  # -> 5.0 (double)
     ({"$trunc": [-3.789, 1]}, {}),
-    # $dateToParts (UTC).
+    # $dateToParts — UTC and timezone (instant->wall-clock; fixed-offset + named
+    # IANA zones both compute, curated to post-2007 dates in decade-stable zones).
     ({"$dateToParts": {"date": "$d"}}, {"d": _DT}),
     ({"$dateToParts": {"date": "$x"}}, {}),  # missing -> null
+    ({"$dateToParts": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),
+    (
+        {"$dateToParts": {"date": "$d", "timezone": "America/New_York"}},
+        {"d": datetime.datetime(2023, 1, 15, 16, 30, 45, tzinfo=datetime.timezone.utc)},
+    ),
+    ({"$dateToParts": {"date": "$d", "timezone": "Asia/Tokyo"}}, {"d": _DT}),
+    ({"$dateToParts": {"date": "$d", "timezone": "Not/AZone"}}, {"d": _DT}),  # unknown -> defer
     # $dateFromString — parity-safe slice: naive canonical ISO (date-only /
     # whole-second), no format/timezone. Fractional / Z / offset / format /
     # timezone / invalid all defer.
