@@ -1790,6 +1790,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
   functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
   out of scope.
+- [ ] **generate_series + base-less FROM-clause SRFs landed** (b163): a set-returning function as the *whole* row
+  source. New `secantus/sql/srf.py`: `from_source` (a base-less `FROM generate_series(…)` / `FROM unnest(…)` /
+  `jsonb_array_elements` / `jsonb_object_keys` / `regexp_split_to_table`, incl. `WITH ORDINALITY` and `AS t(cols)`)
+  and `fromless_projection` (a bare `SELECT generate_series(…)`). `engine._run_srf_select` materializes the generated
+  rows into a synthetic `TableDef` + `virtual.MemoryBackend` and runs the normal `plan_select` + `execute_select`, so
+  projection / WHERE / ORDER BY / LIMIT / `count(*)` all work for free. A single-column SRF's column takes the table
+  alias (`generate_series(1,5) AS g` → column `g`), else an explicit column alias, else the function name; WITH
+  ORDINALITY appends a 1-based ordinal column. sqlglot parses `generate_series` as `ExplodingGenerateSeries` and
+  base-less `unnest` as a `From(this=Unnest)`; the FROM arg key is `from_` (not `from`). Tests:
+  `tests/test_sql_srf.py` (17) + a pg8000 wire test. **Simplifications:** `generate_series` is integer/numeric only (a
+  date/timestamp series with an `interval` step raises `0A000`); a non-`count(*)` aggregate / `GROUP BY` directly over
+  a base-less SRF isn't supported yet (the SRF path uses `plan_select`, not the pipeline planner) — wrap in a
+  subquery/CTE or generate into a table first. The `FROM t, <srf>(…)` *join* form is unchanged (pipeline planner's
+  `_unnest_join_stage`).
 - [ ] **SQL functions (CREATE FUNCTION) landed** (b162): `CREATE [OR REPLACE] FUNCTION name(params) RETURNS t AS $$
   body $$ LANGUAGE sql` + `DROP FUNCTION`. sqlglot parses these as `exp.Create`/`exp.Drop` with `kind=FUNCTION`
   (body = a `Heredoc` for `$$…$$` or a string `Literal`). `catalog.put_function`/`get_function`/`drop_function`

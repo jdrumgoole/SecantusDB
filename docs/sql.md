@@ -1055,9 +1055,39 @@ SELECT id, count(*) FROM post, unnest(tags) AS t GROUP BY id;
 
 An inner (comma / `CROSS JOIN`) form drops a row whose array is empty; a
 `LEFT JOIN unnest(tags) AS t ON true` keeps it with a NULL element. The
-column-alias form (`unnest(tags) AS x(v)`) names the element column. The base-less
-form (`FROM unnest(ARRAY[…])` with no other table) and `WITH ORDINALITY` are not
-yet supported — use the SELECT-list form (`SELECT unnest(ARRAY[…])`) for the former.
+column-alias form (`unnest(tags) AS x(v)`) names the element column.
+
+### `generate_series` and base-less table functions
+
+A set-returning function can be the *whole* row source — no other table:
+
+```sql
+SELECT * FROM generate_series(1, 5);              -- 1,2,3,4,5 (one per row)
+SELECT generate_series(1, 5);                     -- same, SELECT-list form
+SELECT * FROM generate_series(1, 10, 2);          -- with a step -> 1,3,5,7,9
+SELECT n FROM generate_series(1, 100) AS g(n) WHERE n % 7 = 0;
+SELECT * FROM generate_series(1, 3) WITH ORDINALITY;   -- adds a 1-based ordinal column
+```
+
+The base-less `FROM` form also covers `unnest(ARRAY[…])`, `jsonb_array_elements`,
+`jsonb_object_keys`, and `regexp_split_to_table`:
+
+```sql
+SELECT * FROM unnest(ARRAY[10, 20, 30]) AS x;         -- 10,20,30
+SELECT * FROM regexp_split_to_table('a,b,c', ',') AS p;
+SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb) AS e;
+```
+
+A single-column function's column takes the table alias — `generate_series(1,5) AS g`
+names the column `g` — or an explicit column alias (`AS g(n)`), or the function
+name by default. `WITH ORDINALITY [AS t(v, ord)]` appends the ordinal column.
+Projection, `WHERE`, `ORDER BY`, `LIMIT`, and `count(*)` all work over the
+generated rows.
+
+**Simplifications:** `generate_series` covers integer / numeric ranges only (a
+date / timestamp series with an `interval` step raises `0A000`); a non-`count(*)`
+aggregate or `GROUP BY` directly over a base-less SRF isn't supported yet — wrap
+it in a subquery / CTE, or generate into a table first.
 
 ### Foreign keys
 

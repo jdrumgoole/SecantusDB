@@ -1614,6 +1614,24 @@ def test_listen_notify_via_driver(server):
         notifier.close()
 
 
+def test_generate_series_via_driver(server):
+    # generate_series + FROM-clause SRF over the real wire (#125).
+    conn = connect(server)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM generate_series(1, 5)")
+        assert [r[0] for r in cur.fetchall()] == [1, 2, 3, 4, 5]
+
+        cur.execute("SELECT n FROM generate_series(1, 6, 2) AS g(n) ORDER BY n DESC")
+        assert [r[0] for r in cur.fetchall()] == [5, 3, 1]
+
+        cur.execute("SELECT * FROM generate_series(10, 30, 10) WITH ORDINALITY")
+        assert [d[0] for d in cur.description] == ["generate_series", "ordinality"]
+        assert cur.fetchall() == ([10, 1], [20, 2], [30, 3])
+    finally:
+        conn.close()
+
+
 def test_create_function_via_driver(server):
     # CREATE FUNCTION ... LANGUAGE sql + call over the real wire (#124).
     conn = connect(server)
