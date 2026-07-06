@@ -19,6 +19,28 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Rust server: `$dateToString` now formats dates in named IANA timezones
+
+The Rust server can now render `$dateToString` in a named IANA timezone —
+`{$dateToString: {date: "$d", timezone: "America/New_York"}}` — with the correct
+daylight-saving offset for the instant being formatted, exactly as the Python
+server (and real mongod) do. A summer date shifts by `-04:00` (EDT), a winter one
+by `-05:00` (EST); `Europe/Dublin`, `Asia/Tokyo`, and every other zone resolve the
+same way. Previously the Rust server accepted only fixed-offset zones (`+05:30`,
+`UTC`) and errored on a named zone, since it has no Python `zoneinfo` to defer to.
+
+This is the unambiguous instant-to-wall-clock direction: a UTC instant maps to
+exactly one local time in any zone, so the bundled `chrono-tz` database and Python
+`zoneinfo` agree. (`$dateFromString`'s named-zone form — naive-local-to-instant,
+which is ambiguous across a DST gap/overlap — still defers to the Python oracle.)
+
+#### Added
+
+- `secantus-core`: `chrono-tz` dependency and a named-zone offset resolver
+  (`named_tz_offset_ms`) wired into `$dateToString`. A named zone resolves its
+  DST-correct UTC offset at the rendered instant; an unknown zone name still
+  defers. Both servers now agree on named-timezone `$dateToString`.
+
 ### Rust server: connection-auth mutex locks are poison-tolerant
 
 The three production sites that lock the per-connection auth mutex in
@@ -37,6 +59,27 @@ security review (2026-07-04 §I14).
   are poison-tolerant. The two remaining `.lock().unwrap()` sites the review
   flagged are in `#[cfg(test)]` mock stores and are intentionally left panicking
   (a test that poisons its own mock lock should fail loudly).
+### Rust server: `$dateToString` now formats dates in named IANA timezones
+
+The Rust server can now render `$dateToString` in a named IANA timezone —
+`{$dateToString: {date: "$d", timezone: "America/New_York"}}` — with the correct
+daylight-saving offset for the instant being formatted, exactly as the Python
+server (and real mongod) do. A summer date shifts by `-04:00` (EDT), a winter one
+by `-05:00` (EST); `Europe/Dublin`, `Asia/Tokyo`, and every other zone resolve the
+same way. Previously the Rust server accepted only fixed-offset zones (`+05:30`,
+`UTC`) and errored on a named zone, since it has no Python `zoneinfo` to defer to.
+
+This is the unambiguous instant-to-wall-clock direction: a UTC instant maps to
+exactly one local time in any zone, so the bundled `chrono-tz` database and Python
+`zoneinfo` agree. (`$dateFromString`'s named-zone form — naive-local-to-instant,
+which is ambiguous across a DST gap/overlap — still defers to the Python oracle.)
+
+#### Added
+
+- `secantus-core`: `chrono-tz` dependency and a named-zone offset resolver
+  (`named_tz_offset_ms`) wired into `$dateToString`. A named zone resolves its
+  DST-correct UTC offset at the rendered instant; an unknown zone name still
+  defers. Both servers now agree on named-timezone `$dateToString`.
 
 ### Projection inclusion/exclusion mix reports mongod's specific error code
 

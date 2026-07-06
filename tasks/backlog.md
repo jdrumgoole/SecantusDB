@@ -1293,16 +1293,25 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
 
 - [ ] **Expression operators (Rust server):** the remaining date-op defers to the
   Python oracle (the Rust server errors on them): *named IANA* `timezone` zones on
-  `$dateFromString` / `$dateToString` (need a bundled tz database — `chrono-tz` or
-  similar); `$dateFromString` `format` directives *outside* the numeric subset
+  `$dateFromString` (naive-local→instant is DST-ambiguous across a gap/overlap, so
+  it stays deferred — unlike `$dateToString`'s unambiguous instant→wall-clock);
+  `$dateFromString` `format` directives *outside* the numeric subset
   (`%z`/`%Z`/`%a`/`%b`/`%p`/… — need locale/text/offset handling), a `%j` combined
   with `%m`/`%d`, and any input Python would reject; `$dateToString` `%z`/`%Z`/
-  ISO-week/locale directives. **Now native on the Rust server:** fixed-offset /
-  `UTC` / `GMT` timezones on both ops (0.5.3-beta.116), and `$dateFromString`
+  ISO-week/locale directives; and the *named-timezone `{date, timezone}` object
+  form* of the date component extractors (`$year`/`$month`/`$hour`/…) and
+  `$dateToParts` / `$dateTrunc` / `$dateDiff` — these are all instant→local
+  (unambiguous), so they're a natural follow-on to the `$dateToString` work using
+  the same `chrono-tz` resolver. **Now native on the Rust server:** fixed-offset /
+  `UTC` / `GMT` timezones on both ops (0.5.3-beta.116); `$dateFromString`
   `format` (strptime) for the numeric-directive subset `%Y`/`%y`/`%m`/`%d`/`%H`/
   `%M`/`%S`/`%j`/`%%` + literals + whitespace (0.5.3-beta.117, regex built from
-  CPython `_strptime` fragments). Fractional seconds stay deferred (BSON is
-  millisecond-only). The Python server already supports all of these.
+  CPython `_strptime` fragments); and **named IANA `timezone` zones on
+  `$dateToString`** (0.5.3-beta.131, via `chrono-tz` — DST-correct instant→
+  wall-clock, matching Python `zoneinfo`; parity corpus curated to post-2007 dates
+  in decade-stable major zones to avoid tzdb release skew). Fractional seconds stay
+  deferred (BSON is millisecond-only). The Python server already supports all of
+  these.
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
