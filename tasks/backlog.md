@@ -1763,6 +1763,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
   functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
   out of scope.
+- [ ] **SQL functions (CREATE FUNCTION) landed** (b162): `CREATE [OR REPLACE] FUNCTION name(params) RETURNS t AS $$
+  body $$ LANGUAGE sql` + `DROP FUNCTION`. sqlglot parses these as `exp.Create`/`exp.Drop` with `kind=FUNCTION`
+  (body = a `Heredoc` for `$$…$$` or a string `Literal`). `catalog.put_function`/`get_function`/`drop_function`
+  persist to a new `__sql_functions__` collection keyed `name/nargs` (overload by arity). `engine._create_function`
+  extracts params (named `ColumnDef` and/or bare-type → `None`), the `ReturnsProperty` type, and the `LanguageProperty`
+  (non-`sql` → 0A000). Invocation: `scalar._invoke_udf` (hooked at the end of `_call_func`, after all builtins) binds
+  args to named-param columns + positional `$N` and reduces the single-statement body via the existing
+  `_eval_subquery` machinery (handles FROM-less scalar bodies *and* aggregate/table bodies). FROM-less calls route
+  through `planner._udf_lookup` in `plan_constant_select`; WHERE-clause calls route to the per-row path via
+  `where_needs_per_row(..., catalog, db)` + `_where_has_udf`; the evaluated-select column type comes from the UDF's
+  `return_tag` (read off the planning `_pipeline_subctx` in `_infer_scalar_tag`). Nesting (a function calling another)
+  works. Errors: duplicate `(name, arity)` without OR REPLACE → 42723; DROP of unknown → 42883 (IF EXISTS silences).
+  Tests: `tests/test_sql_functions.py` (17) + a pg8000 wire test. **Simplifications:** `LANGUAGE sql` only, single-
+  statement body; a set-returning (`SETOF`/`TABLE`) function yields only its first row in a scalar context; and
+  functions aren't surfaced through `pg_proc` yet (so `\df` / SQLAlchemy function reflection don't list them).
 - [ ] **Arrays of the new types + array ops landed** (b161): two parts. (1) **Array type OIDs** — `typemap._ARRAY_PG_OID`
   gains the real Postgres array-type OIDs for the newer element types (`uuid[]` 2951, `inet[]`/`cidr[]`/`macaddr[]`,
   `date[]`/`time[]`/`timetz[]`, `interval[]`, `bit[]`/`varbit[]`, `money[]`, `xml[]`, `json[]`→jsonb 3807, the

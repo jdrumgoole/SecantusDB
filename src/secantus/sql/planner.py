@@ -1824,6 +1824,12 @@ def plan_constant_select(
             fname = str(getattr(target, "this", target.sql_name())).lower()
             value = scalar.evaluate(target, _const_scope, ctx)
             columns.append((alias or fname, "int8", value))
+        elif (udf := _udf_lookup(target, catalog, db)) is not None:
+            # A user-defined function (CREATE FUNCTION) needs storage/catalog, so
+            # it goes through the scalar evaluator, not the session-function path.
+            value = scalar.evaluate(target, _const_scope, ctx)
+            tag = udf.get("return_tag") or _infer_scalar_tag(target, _const_scope)
+            columns.append((alias or _udf_call_name(target), tag, value))
         elif functions.is_scalar_function(target):
             fname, value, tag = functions.evaluate_scalar(target, session)
             columns.append((alias or fname, tag, value))
@@ -1831,6 +1837,33 @@ def plan_constant_select(
             value = scalar.evaluate(target, _const_scope, ctx)
             columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
     return ConstantSelectPlan(columns=columns, emit=emit)
+
+
+def _where_has_udf(node: exp.Expression, catalog: Any, db: str | None) -> bool:
+    """True if the WHERE tree calls a user-defined function — those don't lower to
+    a Mongo filter, so the whole predicate is evaluated per-row."""
+    return any(_udf_lookup(call, catalog, db) is not None for call in node.find_all(exp.Anonymous))
+
+
+def _udf_call_name(node: exp.Expression) -> str:
+    inner = node.expression if isinstance(node, exp.Dot) else node
+    return str(inner.this).lower().rsplit(".", 1)[-1]
+
+
+def _udf_lookup(node: exp.Expression, catalog: Any, db: str | None) -> dict[str, Any] | None:
+    """A stored user-defined function matching ``node`` (an ``Anonymous`` call), or
+    None — used to route ``CREATE FUNCTION`` calls through the scalar evaluator."""
+    inner = node.expression if isinstance(node, exp.Dot) else node
+    if not isinstance(inner, exp.Anonymous) or catalog is None or db is None:
+        return None
+    name = str(inner.this).lower().rsplit(".", 1)[-1]
+    getter = getattr(catalog, "get_function", None)
+    if getter is None:
+        return None
+    try:
+        return getter(db, name, len(inner.expressions))
+    except Exception:  # noqa: BLE001 — a lookup failure just means "not a UDF"
+        return None
 
 
 def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = None) -> SelectPlan:
@@ -1959,7 +1992,12 @@ def _returning_columns(
     return items
 
 
-def where_needs_per_row(stmt: exp.Select, table: TableDef | None = None) -> bool:
+def where_needs_per_row(
+    stmt: exp.Select,
+    table: TableDef | None = None,
+    catalog: Any = None,
+    db: str | None = None,
+) -> bool:
     """Whether the WHERE clause must be evaluated per-row in Python rather than
     pushed down as a Mongo filter: it contains an ``EXISTS`` predicate, a
     correlated subquery (one that references the outer row), or a range operator
@@ -1971,6 +2009,8 @@ def where_needs_per_row(stmt: exp.Select, table: TableDef | None = None) -> bool
         return False
     node = where.this
     if node.find(exp.Exists) is not None:
+        return True
+    if catalog is not None and _where_has_udf(node, catalog, db):
         return True
     if table is not None and _where_has_range_predicate(node, table):
         return True
@@ -4840,6 +4880,14 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     composite_tag = _composite_field_tag(node, resolve)
     if composite_tag is not None:
         return composite_tag
+    # A user-defined function call (CREATE FUNCTION) types as its RETURNS type; the
+    # catalog rides the planning ``_pipeline_subctx`` in the evaluated-select path.
+    if isinstance(node, (exp.Anonymous, exp.Dot)):
+        _sub = _pipeline_subctx.get()
+        if _sub is not None and getattr(_sub, "catalog", None) is not None:
+            _udf = _udf_lookup(node, _sub.catalog, _sub.db)
+            if _udf is not None and _udf.get("return_tag"):
+                return _udf["return_tag"]
     # Range operators (@> / <@ / &&) over a range operand are boolean; a range
     # constructor / cast is the range type. (Non-range @> / <@ fall through to the
     # jsonb typing below.)

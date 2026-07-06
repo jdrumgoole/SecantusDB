@@ -1266,6 +1266,42 @@ they are excluded from `get_table_names()` / `information_schema.tables` (matchi
 Postgres). Refreshing is always a full recompute; `CONCURRENTLY` doesn't require a
 unique index here, and there are no indexes on the snapshot.
 
+## User-defined functions (`CREATE FUNCTION`)
+
+Define a `LANGUAGE sql` function and call it anywhere an expression is allowed:
+
+```sql
+CREATE FUNCTION add(a int, b int) RETURNS int AS $$ SELECT a + b $$ LANGUAGE sql;
+SELECT add(2, 3);                          -- 5
+SELECT id, add(v, 100) FROM t;             -- called per row
+SELECT id FROM t WHERE add(v, 0) > 10;     -- in WHERE
+
+-- positional $1/$2 params and a single-quoted body work too
+CREATE FUNCTION mul(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 * $2';
+
+-- the body may query tables / aggregate
+CREATE FUNCTION total() RETURNS int AS $$ SELECT sum(v) FROM t $$ LANGUAGE sql;
+
+CREATE OR REPLACE FUNCTION add(a int, b int) RETURNS int AS $$ SELECT a + b + 1 $$ LANGUAGE sql;
+DROP FUNCTION add(int, int);               -- or DROP FUNCTION add / DROP FUNCTION IF EXISTS
+```
+
+The body is a single SQL statement whose result is the return value. Parameters
+resolve by name (the `a`, `b` columns in the body) and/or by position (`$1`,
+`$2`). Functions may call other functions (nesting), and `EXECUTE`/prepared
+statements can call them. Overloading by arity is supported — `f(int)` and
+`f(int, int)` coexist. Calls are resolved when no built-in function matches, so a
+built-in name always wins.
+
+Errors mirror Postgres: redefining the same `(name, arity)` without `OR REPLACE`
+raises `42723`; `DROP FUNCTION` of an unknown function raises `42883` (silenced by
+`IF EXISTS`). A non-`sql` language (`plpgsql`, …) raises `0A000`.
+
+**Simplifications:** only `LANGUAGE sql` with a single-statement body; a
+set-returning (`RETURNS SETOF` / `TABLE`) function returns only its first row in a
+scalar context (use it as a scalar); and functions are not yet surfaced through
+`pg_proc` (so `\df` and SQLAlchemy function reflection don't list them).
+
 ## Querying
 
 `WHERE` supports the common operators; they lower to the same match engine the
@@ -2496,7 +2532,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
-| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), composite / range `CREATE TYPE`, `ALTER TYPE … ADD VALUE` |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql`, single-statement body), `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), composite / range `CREATE TYPE`, `ALTER TYPE … ADD VALUE`, `LANGUAGE plpgsql` / multi-statement functions, `pg_proc` function reflection |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
 | Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors), `EXPLAIN [ANALYZE]` (`FORMAT TEXT`/`JSON`, faithful Index/Seq Scan) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows, per-node `EXPLAIN` costs / timing |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format, `COPY … FROM/TO STDIN/STDOUT` (text + CSV) | binary-format `COPY`, `COPY` from/to a server-side file |

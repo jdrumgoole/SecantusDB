@@ -998,6 +998,8 @@ def _run_statement(
             return _create_sequence(stmt, db, catalog)
         if kind == "TYPE":
             return _create_type(stmt, db, catalog)
+        if kind == "FUNCTION":
+            return _create_function(stmt, db, catalog)
         raise errors.feature_not_supported(f"CREATE {kind} is not supported")
 
     if isinstance(stmt, exp.Drop):
@@ -1014,6 +1016,8 @@ def _run_statement(
             return _drop_sequence(stmt, db, catalog)
         if kind == "TYPE":
             return _drop_type(stmt, db, catalog)
+        if kind == "FUNCTION":
+            return _drop_function(stmt, db, catalog)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
 
     if isinstance(stmt, exp.Alter):
@@ -1314,7 +1318,7 @@ def _run_select(
     # A WHERE with EXISTS or a correlated subquery can't lower to a pushdown
     # filter — evaluate it per row (the inner query reads through the same
     # storage view, with outer-row references resolved by the scalar evaluator).
-    if planner.where_needs_per_row(stmt, table):
+    if planner.where_needs_per_row(stmt, table, catalog, db):
         plan = planner.plan_correlated_select(stmt, table)
         return executor.execute_correlated_select(plan, storage, db, catalog, session)
     # A non-correlated WHERE subquery (`x IN (SELECT ...)`, `x = (SELECT ...)`) is
@@ -1757,6 +1761,90 @@ def _drop_type(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     if not dropped and not stmt.args.get("exists"):
         raise errors.SQLError("42704", f'type "{name}" does not exist')
     return SQLResult(command_tag="DROP TYPE")
+
+
+def _function_body_text(node: exp.Expression | None) -> str:
+    """The SQL text of a function body — a dollar-quoted ``$$…$$`` (parses as a
+    ``Heredoc``) or a single-quoted string ``Literal``."""
+    if node is None:
+        return ""
+    if isinstance(node, exp.Literal):
+        return str(node.this)
+    inner = node.this if isinstance(node, exp.Heredoc) else node
+    return inner if isinstance(inner, str) else str(inner)
+
+
+def _function_params(udf: exp.Expression) -> list[str | None]:
+    """Parameter names of a ``CREATE FUNCTION`` signature; an unnamed
+    (type-only) parameter contributes ``None`` so positional ``$N`` still lines up."""
+    names: list[str | None] = []
+    for p in udf.expressions or []:
+        if isinstance(p, exp.ColumnDef):
+            names.append(p.this.name)  # named param: name + type
+        else:
+            names.append(None)  # bare type (unnamed) — referenced only as $N
+    return names
+
+
+def _create_function(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
+    """``CREATE [OR REPLACE] FUNCTION name(params) RETURNS t AS $$ body $$
+    LANGUAGE sql`` — store the parsed body for the scalar evaluator to invoke."""
+    udf = stmt.this
+    name = udf.this.name
+    params = _function_params(udf)
+    nargs = len(params)
+
+    language = "sql"
+    return_tag = None
+    is_table = False
+    for prop in stmt.args.get("properties").expressions if stmt.args.get("properties") else []:
+        if isinstance(prop, exp.LanguageProperty):
+            language = str(prop.this.name if hasattr(prop.this, "name") else prop.this).lower()
+        elif isinstance(prop, exp.ReturnsProperty):
+            is_table = bool(prop.args.get("is_table"))
+            if isinstance(prop.this, exp.DataType):
+                return_tag = typemap.type_tag_for_sql(prop.this)
+
+    if language not in ("sql",):
+        raise errors.feature_not_supported(
+            f"CREATE FUNCTION LANGUAGE {language} is not supported (only LANGUAGE sql)"
+        )
+
+    body = _function_body_text(stmt.expression).strip()
+    parsed = planner.parse(body)
+    if len(parsed) != 1:
+        raise errors.feature_not_supported("a SQL function body must be a single statement")
+
+    if not stmt.args.get("replace") and catalog.function_exists(db, name, nargs):
+        raise errors.SQLError("42723", f'function "{name}" already exists with same argument types')
+    catalog.put_function(
+        db,
+        {
+            "name": name,
+            "nargs": nargs,
+            "params": params,
+            "return_tag": return_tag,
+            "is_table": is_table,
+            "body": body,
+            "language": language,
+        },
+    )
+    return SQLResult(command_tag="CREATE FUNCTION")
+
+
+def _drop_function(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
+    name = stmt.this.name
+    nargs = len(stmt.args.get("expressions") or [])
+    dropped = catalog.drop_function(db, name, nargs)
+    # No arg list given (``DROP FUNCTION name``): drop any single overload.
+    if not dropped and not stmt.args.get("expressions"):
+        for fn in catalog.list_functions(db):
+            if fn.get("name", "").lower() == name.lower():
+                dropped = catalog.drop_function(db, name, fn["nargs"])
+                break
+    if not dropped and not stmt.args.get("exists"):
+        raise errors.SQLError("42883", f'function "{name}" does not exist')
+    return SQLResult(command_tag="DROP FUNCTION")
 
 
 # ``CREATE DOMAIN name [AS] base_type [DEFAULT expr] [ [CONSTRAINT c] { NOT NULL |
