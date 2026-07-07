@@ -2631,6 +2631,27 @@ def test_show_all_and_pg_settings_via_driver(real_server):
     conn.close()
 
 
+def test_role_membership_via_driver(real_server):
+    # GRANT <role> TO <member> round-trips over the wire and pg_auth_members
+    # reflects it (joined to pg_roles by oid). (#138)
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("CREATE ROLE readers")
+    cur.execute("CREATE ROLE alice LOGIN")
+    cur.execute("GRANT readers TO alice WITH ADMIN OPTION")
+    cur.execute(
+        "SELECT r.rolname, m.rolname, am.admin_option "
+        "FROM pg_catalog.pg_auth_members am "
+        "JOIN pg_catalog.pg_roles r ON r.oid = am.roleid "
+        "JOIN pg_catalog.pg_roles m ON m.oid = am.member"
+    )
+    assert cur.fetchall() == (["readers", "alice", True],)
+    cur.execute("REVOKE readers FROM alice")
+    cur.execute("SELECT count(*) FROM pg_catalog.pg_auth_members")
+    assert cur.fetchall() == ([0],)
+    conn.close()
+
+
 def test_pg_stat_activity_via_driver(real_server):
     # pg_stat_activity reflects the live backend: a client running the query sees
     # its own row as state='active' with a distinct pid and this query. (#137)

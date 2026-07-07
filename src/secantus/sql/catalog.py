@@ -24,6 +24,7 @@ VIEW_COLLECTION = "__sql_views__"
 MATVIEW_COLLECTION = "__sql_matviews__"
 SEQUENCE_COLLECTION = "__sql_sequences__"
 ROLE_COLLECTION = "__sql_roles__"
+ROLE_MEMBER_COLLECTION = "__sql_role_members__"
 GRANT_COLLECTION = "__sql_grants__"
 ENUM_COLLECTION = "__sql_enums__"
 DOMAIN_COLLECTION = "__sql_domains__"
@@ -520,6 +521,66 @@ class Catalog:
     def list_roles(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, ROLE_COLLECTION, {})
         return sorted(d["role"] for d in docs)
+
+    # -- Role membership (GRANT <role> TO <member>) ------------------------- #
+    # ``GRANT readers TO alice`` records that ``alice`` is a member of ``readers``.
+    # One document per ``(role, member)``; ``admin_option`` marks WITH ADMIN OPTION
+    # (the member may grant the role onward). Reflected via ``pg_auth_members``.
+
+    @staticmethod
+    def _member_key(role: str, member: str) -> str:
+        return f"{role}\x00{member}"
+
+    def grant_role_membership(
+        self, db: str, role: str, member: str, *, admin_option: bool = False
+    ) -> None:
+        """Record that ``member`` is a member of ``role`` (idempotent). Once set, the
+        admin option is only cleared by REVOKE ADMIN OPTION FOR — a re-grant without
+        WITH ADMIN OPTION keeps an existing one (Postgres semantics)."""
+        key = self._member_key(role, member)
+        existing = self._storage.find_matching(db, ROLE_MEMBER_COLLECTION, {"_id": key}, limit=1)
+        admin = bool(admin_option) or (bool(existing) and existing[0].get("admin_option", False))
+        self._storage.delete_matching(db, ROLE_MEMBER_COLLECTION, {"_id": key})
+        self._storage.insert(
+            db,
+            ROLE_MEMBER_COLLECTION,
+            [{"_id": key, "role": role, "member": member, "admin_option": admin}],
+        )
+
+    def revoke_role_membership(self, db: str, role: str, member: str) -> bool:
+        """Remove ``member`` from ``role``. Returns whether a membership existed."""
+        key = self._member_key(role, member)
+        return self._storage.delete_matching(db, ROLE_MEMBER_COLLECTION, {"_id": key}) > 0
+
+    def revoke_role_admin_option(self, db: str, role: str, member: str) -> bool:
+        """REVOKE ADMIN OPTION FOR — clear the admin option but keep the membership.
+        Returns whether a membership existed."""
+        key = self._member_key(role, member)
+        existing = self._storage.find_matching(db, ROLE_MEMBER_COLLECTION, {"_id": key}, limit=1)
+        if not existing:
+            return False
+        self._storage.delete_matching(db, ROLE_MEMBER_COLLECTION, {"_id": key})
+        self._storage.insert(
+            db,
+            ROLE_MEMBER_COLLECTION,
+            [{"_id": key, "role": role, "member": member, "admin_option": False}],
+        )
+        return True
+
+    def list_role_memberships(self, db: str) -> list[dict[str, Any]]:
+        """Every ``(role, member, admin_option)`` membership, sorted."""
+        docs = self._storage.find_matching(db, ROLE_MEMBER_COLLECTION, {})
+        return sorted(
+            (
+                {
+                    "role": d["role"],
+                    "member": d["member"],
+                    "admin_option": bool(d.get("admin_option", False)),
+                }
+                for d in docs
+            ),
+            key=lambda m: (m["role"], m["member"]),
+        )
 
     # -- Table-level privileges (GRANT / REVOKE) ---------------------------- #
     # ``GRANT SELECT ON t TO alice`` / ``REVOKE INSERT ON t FROM bob`` — persisted

@@ -2809,6 +2809,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `pg_stat_activity` omits live `xact_start` / `state_change` / `wait_event*` / `leader_pid` /
   `backend_xid` (NULL); `client_port` is NULL and `client_addr` is text (not `inet`); COPY sub-protocol and
   the initial handshake don't update `state`. Not ported to the Rust server.
+- [ ] **Role membership (GRANT role TO role) landed** (#138, b178): `GRANT <roles> TO <members> [WITH
+  ADMIN OPTION]` / `REVOKE [ADMIN OPTION FOR] <roles> FROM <members> [CASCADE|RESTRICT]` — role-membership
+  grants parse as `exp.Command` (no `ON` target, unlike privilege grants which are `exp.Grant`), routed by
+  `engine._run_role_membership` (regex-split the tail; a Command carrying `ON` is a privilege grant → no-op
+  as before). Persisted per `(role, member)` in `__sql_role_members__`
+  (`Catalog.grant_role_membership` / `revoke_role_membership` / `revoke_role_admin_option` /
+  `list_role_memberships`); `WITH ADMIN OPTION` is tracked and a plain re-grant keeps an existing one
+  (union), `REVOKE ADMIN OPTION FOR` clears just the admin flag and keeps the membership. Reflected via
+  `pg_catalog.pg_auth_members` (`virtual._pg_auth_members`: roleid / member / grantor / admin_option) whose
+  oids come from a new shared `virtual._role_oid_map` (refactored out of `_pg_roles`) so they join to
+  `pg_roles.oid`; grantor = the connecting user's oid. Command tags `GRANT ROLE` / `REVOKE ROLE`. Tests:
+  `tests/test_sql_role_membership.py` + `test_pgserver_pg8000.py::test_role_membership_via_driver`.
+  **Limitations:** membership is recorded/reflected but **not enforced** (a member doesn't inherit the group
+  role's table grants — the additive authz gate keys off direct grants only); `CASCADE`/`RESTRICT` on
+  REVOKE are accepted but ignored (no dependency tracking); a membership referencing a name that isn't a
+  declared role or the connecting user reflects with `oid 0` (won't join to `pg_roles`); no cycle detection.
+  Not ported to the Rust server.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
