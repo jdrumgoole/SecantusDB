@@ -48,10 +48,18 @@ class ModuleSpec:
     non-empty, the runner adds one `--tests <FQN>` per entry to that
     module's gradle invocation. When empty, the module's full test set
     runs unfiltered.
+
+    `serial` forces this invocation to `maxParallelForks = 1`. Used for the
+    SDAM / command-monitoring tests, which assert exact event sequences and
+    flake under parallel CPU contention against the single-GIL Python daemon
+    (they pass at full parallelism on the truly-multithreaded Rust server). The
+    same task may appear twice — once parallel, once serial — with disjoint
+    `test_classes`; the runner harvests each invocation's XML separately.
     """
 
     task: str
     test_classes: list[str] = field(default_factory=list)
+    serial: bool = False
 
 
 # Curated whitelist of driver-sync functional test classes verified
@@ -61,6 +69,30 @@ class ModuleSpec:
 # so each class is added only after the runner's wall-clock guard
 # confirms it completes. Add new candidates by FQN as they prove
 # good citizens.
+# SDAM / event-monitoring tests — run SERIALLY (one gradle fork). They assert
+# the *exact* sequence and count of command-monitoring / CMAP / cluster events,
+# which the Java driver's background hello heartbeats perturb when the
+# single-GIL Python daemon is starved under the gauge's parallel CPU contention
+# (marks the server Unknown → pauses/clears the pool → the in-flight op fails).
+# At one fork the contention is gone and they pass; on the truly-multithreaded
+# Rust server they pass at full parallelism (verified). These stay in the gauge
+# — they're valid conformance tests — just isolated from the parallel group.
+_DRIVER_SYNC_MONITORING_INCLUDES: list[str] = [
+    "com.mongodb.client.unified.CommandLoggingTest",
+    "com.mongodb.client.unified.CommandMonitoringTest",
+    "com.mongodb.client.unified.ConnectionPoolLoggingTest",
+    "com.mongodb.client.ClientMetadataTest",
+    "com.mongodb.client.ClusterEventPublishingTest",
+    # ContextProviderTest.contextShouldBeAvailableInCommandEvents asserts a
+    # command *event* is delivered — it fails with NoSuchElementException (no
+    # event) when a parallel pool-clear drops it, so it's the same category.
+    "com.mongodb.client.ContextProviderTest",
+    # VersionedApiTest asserts command-started events (find/getMore append the
+    # API version), so it's timing-sensitive in the same way.
+    "com.mongodb.client.unified.VersionedApiTest",
+]
+
+
 _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
     # Initial verified-good set.
     "com.mongodb.client.MongoCollectionTest",
@@ -70,22 +102,8 @@ _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
     "com.mongodb.client.MongoWriteConcernWithResponseExceptionTest",
     # Widen — basic CRUD / connectivity / index surface.
     "com.mongodb.client.ConnectivityTest",
-    "com.mongodb.client.ContextProviderTest",
     "com.mongodb.client.InContextMqlValuesFunctionalTest",
     "com.mongodb.client.unified.IndexManagementTest",
-    # Unified spec runners — driver-level event / logging / monitoring
-    # protocols. Tests that need features SecantusDB intentionally
-    # doesn't implement (transactions, retryable-writes write-errors,
-    # log-id propagation hooks) self-skip via the YAML run-on
-    # constraints.
-    "com.mongodb.client.unified.CommandLoggingTest",
-    "com.mongodb.client.unified.CommandMonitoringTest",
-    "com.mongodb.client.unified.ConnectionPoolLoggingTest",
-    # More candidates being widened (safer: no change-streams /
-    # sessions / retryable in this batch — those have known
-    # tailable-getMore hang risk).
-    "com.mongodb.client.ClientMetadataTest",
-    "com.mongodb.client.ClusterEventPublishingTest",
     "com.mongodb.client.unified.UnifiedCrudTest",
     # Wave 2 widening — each is a unified spec runner that drives
     # YAML test files. The runner's ``runOnRequirements`` blocks
@@ -94,7 +112,8 @@ _DRIVER_SYNC_FUNCTIONAL_INCLUDES: list[str] = [
     # individual misses surface as `skipped` rather than hangs.
     "com.mongodb.client.unified.ChangeStreamsTest",
     "com.mongodb.client.unified.UnifiedWriteConcernTest",
-    "com.mongodb.client.unified.VersionedApiTest",
+    # (Event-monitoring / SDAM classes moved to _DRIVER_SYNC_MONITORING_INCLUDES
+    # above — they run serially.)
     # Wave 3 widening — features SecantusDB ships at the wire level:
     # SCRAM-SHA-256 auth (UnifiedAuthTest), GridFS-as-CRUD on the
     # ``.files``/``.chunks`` pair (UnifiedGridFSTest), and logical
@@ -143,9 +162,18 @@ _DRIVER_CORE_FUNCTIONAL_INCLUDES: list[str] = [
 
 
 INCLUDE: list[ModuleSpec] = [
+    # driver-sync functional set — full parallelism.
     ModuleSpec(
         task=":driver-sync:test",
         test_classes=list(_DRIVER_SYNC_FUNCTIONAL_INCLUDES),
+    ),
+    # driver-sync SDAM / event-monitoring set — same task, run serially so the
+    # exact-event assertions don't flake under parallel contention. Harvested
+    # into its own results dir (see runner.py).
+    ModuleSpec(
+        task=":driver-sync:test",
+        test_classes=list(_DRIVER_SYNC_MONITORING_INCLUDES),
+        serial=True,
     ),
     ModuleSpec(
         task=":driver-core:test",

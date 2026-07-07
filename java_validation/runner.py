@@ -355,7 +355,16 @@ def main() -> int:
                 shutil.rmtree(stale_results, ignore_errors=True)
 
         gradle_rcs: list[int] = []
-        for spec in INCLUDE:
+        # Harvest JUnit XML *per invocation*, not once at the end: two specs can
+        # target the same gradle task (e.g. ``:driver-sync:test`` split into a
+        # parallel functional group and a serial monitoring group), and Gradle's
+        # ``--rerun-tasks`` clears the task's ``build/test-results/test/`` dir
+        # before each run — so the second invocation would wipe the first's XML.
+        # Copy each invocation's XML into its own ``RESULTS_DIR`` subdir right
+        # after it finishes; ``generate_report`` rglobs, so the split is
+        # transparent to the report.
+        copied = 0
+        for spec_idx, spec in enumerate(INCLUDE):
             cmd = [
                 "./gradlew",
                 "--no-daemon",
@@ -398,18 +407,23 @@ def main() -> int:
                 file=sys.stderr,
             )
 
-            # Cap the parallel-fork count at the number of test classes this
-            # module runs, so Gradle never spawns an empty test-worker fork
-            # (an empty fork leaves ``output.bin.idx`` unwritten → the result
-            # aggregator crashes with FileNotFoundException; see the base_forks
-            # comment above). An unfiltered module (no ``--tests`` filters,
-            # ``test_classes == []``) runs its whole suite, so it keeps the
-            # full ``base_forks`` — there's plenty of work to fill every fork.
-            module_forks = (
-                base_forks
-                if len(spec.test_classes) == 0
-                else min(base_forks, max(1, len(spec.test_classes)))
-            )
+            # Fork count for this invocation. ``serial`` specs run at 1 fork —
+            # they hold the timing-sensitive SDAM / command-monitoring tests,
+            # which assert exact event sequences and flake under parallel CPU
+            # contention against the single-GIL Python daemon (the Rust server,
+            # being truly multithreaded, passes them at full parallelism). Other
+            # specs cap the fork count at the number of test classes they run so
+            # Gradle never spawns an empty test-worker fork (an empty fork leaves
+            # ``output.bin.idx`` unwritten → the result aggregator crashes with
+            # FileNotFoundException; see the base_forks comment above). An
+            # unfiltered module (``test_classes == []``) runs its whole suite, so
+            # it keeps the full ``base_forks`` — plenty of work to fill every fork.
+            if spec.serial:
+                module_forks = 1
+            elif len(spec.test_classes) == 0:
+                module_forks = base_forks
+            else:
+                module_forks = min(base_forks, max(1, len(spec.test_classes)))
             env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(module_forks)
 
             proc = subprocess.Popen(
@@ -476,20 +490,20 @@ def main() -> int:
             forward_done.wait(timeout=2)
             gradle_rcs.append(gradle_rc)
 
-        gradle_rc = max(gradle_rcs) if gradle_rcs else 0
+            # Harvest this invocation's JUnit XML immediately (before the next
+            # ``--rerun-tasks`` on the same module can clear it). ``spec.task``
+            # is ``:<module>:test`` → module dir ``<module>``; the per-spec
+            # index keeps two invocations of the same task in separate dirs.
+            module_name = spec.task.strip(":").split(":")[0]
+            results = VENDOR / module_name / "build" / "test-results" / "test"
+            if results.is_dir():
+                dest = RESULTS_DIR / f"{module_name}__{spec_idx}"
+                dest.mkdir(parents=True, exist_ok=True)
+                for xml in results.glob("TEST-*.xml"):
+                    shutil.copy(xml, dest / xml.name)
+                    copied += 1
 
-        # Copy JUnit XML out of the source tree to keep our parser simple
-        # and avoid touching the submodule.
-        copied = 0
-        for module_dir in VENDOR.iterdir():
-            results = module_dir / "build" / "test-results" / "test"
-            if not results.is_dir():
-                continue
-            dest = RESULTS_DIR / module_dir.name
-            dest.mkdir(parents=True, exist_ok=True)
-            for xml in results.glob("TEST-*.xml"):
-                shutil.copy(xml, dest / xml.name)
-                copied += 1
+        gradle_rc = max(gradle_rcs) if gradle_rcs else 0
 
         if copied == 0:
             print(
