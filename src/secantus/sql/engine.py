@@ -2005,6 +2005,16 @@ def _function_params(udf: exp.Expression) -> list[str | None]:
     return names
 
 
+def _function_param_types(udf: exp.Expression) -> list[str | None]:
+    """Parameter type tags of a ``CREATE FUNCTION`` signature (positional), for
+    ``pg_proc`` / ``information_schema.parameters`` reflection. Unknown → None."""
+    types: list[str | None] = []
+    for p in udf.expressions or []:
+        dt = p.args.get("kind") if isinstance(p, exp.ColumnDef) else p
+        types.append(typemap.type_tag_for_sql(dt) if isinstance(dt, exp.DataType) else None)
+    return types
+
+
 def _create_function(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
     """``CREATE [OR REPLACE] FUNCTION name(params) RETURNS t AS $$ body $$
     LANGUAGE sql`` — store the parsed body for the scalar evaluator to invoke."""
@@ -2042,6 +2052,7 @@ def _create_function(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
             "name": name,
             "nargs": nargs,
             "params": params,
+            "param_types": _function_param_types(udf),
             "return_tag": return_tag,
             "is_table": is_table,
             "body": body,

@@ -2516,6 +2516,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   recorded but behaves like `ENABLE` (no owner to force against); RLS DDL itself needs no privilege (any authenticated
   user can add/alter policies — no ownership check); policies over the pipeline/set-operation/CTE paths aren't injected
   (only the direct single-table SELECT/UPDATE/DELETE dispatch). Not ported to the Rust server.
+- [ ] **UDF reflection landed** (#130, b170): `CREATE FUNCTION` (#124) definitions now surface through
+  `pg_catalog.pg_proc` (`virtual._pg_proc`: oid / proname / pronamespace / prolang=14 / prorettype /
+  pronargs / proargtypes / proargnames / prosrc / prokind='f' / proretset), `information_schema.routines`
+  + `.parameters` (`_info_routines` / `_info_parameters`), and `pg_get_functiondef` /
+  `pg_get_function_arguments` / `pg_get_function_result` (`virtual.functiondef_for_oid` /
+  `function_arguments_for_oid` / `function_result_for_oid`, wired in `scalar._call_func` + registered in
+  `functions._SCALAR_EVAL_ANON` so FROM-less calls defer to the scalar evaluator). `CREATE FUNCTION` now
+  also stores `param_types` (via `engine._function_param_types`) so arg types reflect. Stable oids from
+  `_FUNCTION_OID_BASE = 65000`. Tests: `tests/test_sql_udf_reflection.py` +
+  `test_pgserver_pg8000.py::test_udf_reflection_via_driver`. **Limitations:** `pg_proc` lists only
+  user-defined functions (built-ins aren't enumerated — a `\df` of a builtin shows nothing); no
+  `proargmodes` / `proargdefaults` (all params reflect as `IN`, no defaults); `is_deterministic` is a
+  fixed `NO`; overloads share a `proname` but get distinct oids/`specific_name`. Not ported to the Rust
+  server.
 - [ ] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
   IDENTITY [(START WITH n INCREMENT BY n)]` columns (`planner._identity_spec`) reuse the SERIAL sequence
   machinery — an owned `<table>_<col>_seq`, NOT NULL, auto-filled on omit. `Column.identity` is

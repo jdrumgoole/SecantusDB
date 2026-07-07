@@ -1341,10 +1341,24 @@ Errors mirror Postgres: redefining the same `(name, arity)` without `OR REPLACE`
 raises `42723`; `DROP FUNCTION` of an unknown function raises `42883` (silenced by
 `IF EXISTS`). A non-`sql` language (`plpgsql`, …) raises `0A000`.
 
+User functions are reflected like Postgres', so `psql`'s `\df` and SQLAlchemy see
+them: they appear in `pg_catalog.pg_proc` (with `proname` / `pronargs` /
+`proargtypes` / `proargnames` / `prorettype` / `prosrc`),
+`information_schema.routines` (one row per function) and
+`information_schema.parameters` (one row per argument), and
+`pg_get_functiondef(oid)` / `pg_get_function_arguments(oid)` /
+`pg_get_function_result(oid)` reconstruct the definition, argument list, and
+return type.
+
+```sql
+SELECT proname, pg_get_function_arguments(oid), pg_get_function_result(oid)
+FROM pg_catalog.pg_proc WHERE proname = 'add';   -- add | a integer, b integer | integer
+```
+
 **Simplifications:** only `LANGUAGE sql` with a single-statement body; a
 set-returning (`RETURNS SETOF` / `TABLE`) function returns only its first row in a
-scalar context (use it as a scalar); and functions are not yet surfaced through
-`pg_proc` (so `\df` and SQLAlchemy function reflection don't list them).
+scalar context (use it as a scalar); and `pg_proc` lists only user-defined
+functions (built-ins aren't enumerated there).
 
 ## Querying
 

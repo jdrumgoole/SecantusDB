@@ -68,6 +68,8 @@ def _table_oids(db: str, catalog: Catalog) -> dict[str, int]:
 _VIEW_OID_BASE = 50000
 _SEQUENCE_OID_BASE = 55000
 _ROLE_OID_BASE = 60000
+_FUNCTION_OID_BASE = 65000
+_SQL_LANG_OID = 14  # pg_language oid for LANGUAGE sql
 
 
 def _view_names(db: str, catalog: Catalog) -> list[str]:
@@ -720,6 +722,46 @@ def viewdef_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
     return None
 
 
+def _function_by_oid(db: str, catalog: Catalog, oid: int) -> dict | None:
+    oids = _function_oids(db, catalog)
+    for fn in _functions(db, catalog):
+        if oids.get(f"{fn['name']}/{fn['nargs']}") == oid:
+            return fn
+    return None
+
+
+def function_arguments_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
+    """``pg_get_function_arguments(oid)`` — the ``(name type, …)`` list for \\df."""
+    fn = _function_by_oid(db, catalog, oid)
+    return _function_signature(fn) if fn is not None else None
+
+
+def function_result_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
+    """``pg_get_function_result(oid)`` — the return type name."""
+    fn = _function_by_oid(db, catalog, oid)
+    if fn is None:
+        return None
+    result = _type_name(fn.get("return_tag"))
+    return f"SETOF {result}" if fn.get("is_table") else result
+
+
+def functiondef_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
+    """``pg_get_functiondef(oid)`` — a CREATE FUNCTION reconstruction."""
+    fn = _function_by_oid(db, catalog, oid)
+    if fn is None:
+        return None
+    args = _function_signature(fn)
+    result = function_result_for_oid(db, catalog, oid)
+    lang = str(fn.get("language", "sql")).upper()
+    body = fn.get("body") or ""
+    return (
+        f"CREATE OR REPLACE FUNCTION public.{fn['name']}({args})\n"
+        f" RETURNS {result}\n"
+        f" LANGUAGE {lang.lower()}\n"
+        f"AS $function$\n{body}\n$function$\n"
+    )
+
+
 def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     """One row per column of every declared table — the pg_catalog column surface
     tools (and ``\\d``-style queries) read. attrelid lines up with pg_class.oid."""
@@ -869,6 +911,127 @@ def _pg_roles(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 {"login": True, "superuser": True, "createdb": True, "createrole": True},
             )
         )
+    return rows
+
+
+def _functions(db: str, catalog: Catalog) -> list[dict]:
+    lister = getattr(catalog, "list_functions", None)
+    return sorted(lister(db), key=lambda f: (f["name"], f["nargs"])) if lister is not None else []
+
+
+def _function_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    """Stable pg_proc oid per function key (``name/nargs``)."""
+    return {
+        f"{f['name']}/{f['nargs']}": _FUNCTION_OID_BASE + i
+        for i, f in enumerate(_functions(db, catalog))
+    }
+
+
+def _type_oid(tag: str | None) -> int:
+    if tag is None:
+        return 2278  # void
+    return typemap.PG_OID.get(tag, typemap.PG_OID.get("text", 25))
+
+
+def _type_name(tag: str | None) -> str:
+    if tag is None:
+        return "void"
+    return typemap.SQL_TYPE_NAME.get(tag, tag)
+
+
+def _function_signature(fn: dict) -> str:
+    """The ``(argname argtype, …)`` argument list for pg_get_function_arguments /
+    a CREATE FUNCTION reconstruction."""
+    names = fn.get("params") or []
+    types = fn.get("param_types") or []
+    parts = []
+    for i in range(fn.get("nargs", 0)):
+        nm = names[i] if i < len(names) else None
+        tt = types[i] if i < len(types) else None
+        typ = _type_name(tt)
+        parts.append(f"{nm} {typ}" if nm else typ)
+    return ", ".join(parts)
+
+
+def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_proc`` — one row per user-defined ``CREATE FUNCTION`` (#130)."""
+    oids = _function_oids(db, catalog)
+    rows = []
+    for fn in _functions(db, catalog):
+        key = f"{fn['name']}/{fn['nargs']}"
+        argtypes = " ".join(str(_type_oid(t)) for t in (fn.get("param_types") or []))
+        names = [n for n in (fn.get("params") or []) if n is not None]
+        rows.append(
+            {
+                "oid": oids[key],
+                "proname": fn["name"],
+                "pronamespace": _NS_OIDS["public"],
+                "proowner": 10,
+                "prolang": _SQL_LANG_OID,
+                "prorettype": _type_oid(fn.get("return_tag")),
+                "pronargs": fn.get("nargs", 0),
+                "pronargdefaults": 0,
+                "proargtypes": argtypes,
+                "proargnames": names or None,
+                "prosrc": fn.get("body"),
+                "prokind": "f",
+                "proretset": bool(fn.get("is_table")),
+                "provariadic": 0,
+            }
+        )
+    return rows
+
+
+def _specific_name(fn: dict, oids: dict[str, int]) -> str:
+    """The information_schema ``specific_name`` for a function (name + its oid)."""
+    key = "{}/{}".format(fn["name"], fn["nargs"])
+    return "{}_{}".format(fn["name"], oids[key])
+
+
+def _info_routines(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``information_schema.routines`` — one row per user function."""
+    oids = _function_oids(db, catalog)
+    rows = []
+    for fn in _functions(db, catalog):
+        rows.append(
+            {
+                "specific_catalog": db,
+                "specific_schema": "public",
+                "specific_name": _specific_name(fn, oids),
+                "routine_catalog": db,
+                "routine_schema": "public",
+                "routine_name": fn["name"],
+                "routine_type": "FUNCTION",
+                "data_type": _type_name(fn.get("return_tag")),
+                "routine_body": "EXTERNAL",
+                "routine_definition": fn.get("body"),
+                "external_language": str(fn.get("language", "sql")).upper(),
+                "is_deterministic": "NO",
+            }
+        )
+    return rows
+
+
+def _info_parameters(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``information_schema.parameters`` — one row per function parameter."""
+    oids = _function_oids(db, catalog)
+    rows = []
+    for fn in _functions(db, catalog):
+        specific = _specific_name(fn, oids)
+        names = fn.get("params") or []
+        types = fn.get("param_types") or []
+        for i in range(fn.get("nargs", 0)):
+            rows.append(
+                {
+                    "specific_catalog": db,
+                    "specific_schema": "public",
+                    "specific_name": specific,
+                    "ordinal_position": i + 1,
+                    "parameter_mode": "IN",
+                    "parameter_name": names[i] if i < len(names) else None,
+                    "data_type": _type_name(types[i] if i < len(types) else None),
+                }
+            )
     return rows
 
 
@@ -1447,6 +1610,60 @@ _register(
         ("with_check", "text"),
     ],
     _pg_policies,
+)
+_register(
+    "pg_catalog",
+    "pg_proc",
+    [
+        ("oid", "int4"),
+        ("proname", "text"),
+        ("pronamespace", "int4"),
+        ("proowner", "int4"),
+        ("prolang", "int4"),
+        ("prorettype", "int4"),
+        ("pronargs", "int4"),
+        ("pronargdefaults", "int4"),
+        ("proargtypes", "text"),
+        ("proargnames", "text[]"),
+        ("prosrc", "text"),
+        ("prokind", "text"),
+        ("proretset", "bool"),
+        ("provariadic", "int4"),
+    ],
+    _pg_proc,
+)
+_register(
+    "information_schema",
+    "routines",
+    [
+        ("specific_catalog", "text"),
+        ("specific_schema", "text"),
+        ("specific_name", "text"),
+        ("routine_catalog", "text"),
+        ("routine_schema", "text"),
+        ("routine_name", "text"),
+        ("routine_type", "text"),
+        ("data_type", "text"),
+        ("routine_body", "text"),
+        ("routine_definition", "text"),
+        ("external_language", "text"),
+        ("is_deterministic", "text"),
+    ],
+    _info_routines,
+)
+_register(
+    "information_schema",
+    "parameters",
+    [
+        ("specific_catalog", "text"),
+        ("specific_schema", "text"),
+        ("specific_name", "text"),
+        ("ordinal_position", "int4"),
+        ("parameter_mode", "text"),
+        ("parameter_name", "text"),
+        ("data_type", "text"),
+    ],
+    _info_parameters,
 )
 _register(
     "pg_catalog",

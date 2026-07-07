@@ -1373,6 +1373,19 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
 
             return virtual.viewdef_for_oid(ctx.db, ctx.catalog, args[0])
         return None
+    if name in ("pg_get_functiondef", "pg_get_function_arguments", "pg_get_function_result"):
+        # Reconstruct a user function's definition / argument list / result type
+        # (by pg_proc oid) so psql's \df and SQLAlchemy reflect it. (#130)
+        if ctx is not None and args and isinstance(args[0], int):
+            from secantus.sql import virtual
+
+            fn = {
+                "pg_get_functiondef": virtual.functiondef_for_oid,
+                "pg_get_function_arguments": virtual.function_arguments_for_oid,
+                "pg_get_function_result": virtual.function_result_for_oid,
+            }[name]
+            return fn(ctx.db, ctx.catalog, args[0])
+        return None
     if name == "has_table_privilege":
         return _has_table_privilege(args, ctx)
     if name in ("nextval", "currval", "setval", "lastval"):
