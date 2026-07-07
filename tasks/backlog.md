@@ -2778,6 +2778,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   *this* connection's advisory locks (no cross-backend visibility) and no non-advisory lock types
   (relation/tuple/transactionid rows); `objsubid`/`tuple` reflect as `int4` (no `int2` type tag). Not ported
   to the Rust server.
+- [ ] **SET LOCAL + SHOW ALL / pg_settings landed** (#136, b176): `SET LOCAL name = value`
+  (sqlglot `exp.SetItem(kind=LOCAL)`) applies a GUC only for the rest of the current transaction and
+  reverts at COMMIT/ROLLBACK (`Session.set_local` / `restore_local_gucs`, hooked in
+  `engine._end_txn_state`); outside a transaction it has no lasting effect (Postgres warns and drops it).
+  `SHOW ALL` (an `exp.Command` fallback) now returns every GUC as a three-column `(name, setting,
+  description)` table (`engine._run_command` + the `describe_statement` SHOW path both special-case it).
+  `pg_catalog.pg_settings` (`virtual._pg_settings`, backed by `Session.all_settings` = defaults overlaid
+  with SET overrides) exposes `name`/`setting`/`vartype`/`source`/`boot_val`/`reset_val`/... — the subset
+  psql's `\dconfig` and ORMs read; `vartype` is inferred from the value, `source` is `session` for an
+  override else `default`. Tests: `tests/test_sql_set_local.py` +
+  `test_pgserver_pg8000.py::{test_show_all_and_pg_settings_via_driver,test_set_local_reverts_at_commit_via_driver}`.
+  **Limitations:** a plain (non-LOCAL) `SET` inside a transaction is session-scoped and does *not* revert on
+  ROLLBACK (real Postgres reverts transactional GUCs); the txn-end revert of a *reportable* GUC (search_path
+  etc.) doesn't emit a compensating `ParameterStatus`; `pg_settings` metadata is coarse (generic category,
+  empty short_desc, NULL unit/min/max/enumvals, no per-GUC context). Not ported to the Rust server.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by

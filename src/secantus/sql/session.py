@@ -135,6 +135,10 @@ class Session:
     _notify_lock: Any = field(default_factory=threading.Lock)
     _notify_deliveries: deque = field(default_factory=deque)
     pending_notifies: list[tuple[str, str]] = field(default_factory=list)
+    # SET LOCAL (#136): GUCs set with ``SET LOCAL`` inside a transaction, mapped to
+    # the value to restore at transaction end (the pre-``SET LOCAL`` session value,
+    # or None if it wasn't set). Reverted in ``engine._end_txn_state``.
+    local_gucs: dict = field(default_factory=dict)
     # Advisory locks (``pg_advisory_lock`` family, #135). Single-node: a lock is
     # always granted immediately, so we only *track* what this session holds so
     # ``pg_advisory_unlock`` reports truthfully and ``pg_catalog.pg_locks``
@@ -246,6 +250,31 @@ class Session:
             if n > 0:
                 out[(classid, objid, objsubid, mode)] = True
         return list(out.keys())
+
+    def set_local(self, name: str, value: str) -> None:
+        """``SET LOCAL name = value`` (#136) — applies for the rest of the current
+        transaction only. Records the value to restore at transaction end (captured
+        once per GUC: the pre-``SET LOCAL`` session value, or ``None`` if unset)."""
+        if name not in self.local_gucs:
+            self.local_gucs[name] = self.settings.get(name)
+        self.settings[name] = value
+
+    def restore_local_gucs(self) -> None:
+        """Revert every ``SET LOCAL`` made in the just-ended transaction (called at
+        COMMIT / ROLLBACK) — restoring each GUC to its pre-``SET LOCAL`` value."""
+        for name, prior in self.local_gucs.items():
+            if prior is None:
+                self.settings.pop(name, None)
+            else:
+                self.settings[name] = prior
+        self.local_gucs = {}
+
+    def all_settings(self) -> dict[str, str]:
+        """Every GUC's current value — the built-in defaults overlaid with the
+        session's ``SET`` overrides. Used by ``SHOW ALL`` and ``pg_settings``."""
+        merged = dict(GUC_DEFAULTS)
+        merged.update(self.settings)
+        return merged
 
     def get_setting(self, name: str) -> str:
         return self.settings.get(name, GUC_DEFAULTS.get(name, ""))
