@@ -2793,6 +2793,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   ROLLBACK (real Postgres reverts transactional GUCs); the txn-end revert of a *reportable* GUC (search_path
   etc.) doesn't emit a compensating `ParameterStatus`; `pg_settings` metadata is coarse (generic category,
   empty short_desc, NULL unit/min/max/enumvals, no per-GUC context). Not ported to the Rust server.
+- [ ] **Monitoring views (pg_stat_activity) landed** (#137, b177): `pg_catalog.pg_stat_activity` (one row
+  per live backend) + `pg_catalog.pg_stat_database` (per-db backend count) reflect a new server-level
+  `session.ActivityRegistry` — `SecantusPGServer` registers each connection's `Session` on connect and
+  unregisters on disconnect (parallel to the `_notify`/`_conns` pattern), assigns a unique per-connection
+  `backend_pid` via an `itertools.count` (real Postgres gives each backend a distinct pid; in-process we'd
+  otherwise share `os.getpid()`), and stamps `backend_start` / `client_addr`. The wire query paths
+  (`pgserver._handle_query` simple + `pgextended._execute` extended) set `session.state`='active' + the
+  `current_query` text for the duration of a query (idle with last-query afterwards), so a client running
+  the `pg_stat_activity` SELECT sees its own row `active`. Builders `virtual._pg_stat_activity` /
+  `_pg_stat_database` read `session.activity_registry.snapshot()` (falling back to just the calling session
+  for the embedded `run_sql` API). Tests: `tests/test_sql_stat_activity.py` +
+  `test_pgserver_pg8000.py::test_pg_stat_activity_via_driver`. **Limitations:** `pg_stat_database`
+  cumulative counters (`xact_commit`/`blks_hit`/`tup_*`/...) are fixed `0` (no stats collector);
+  `pg_stat_activity` omits live `xact_start` / `state_change` / `wait_event*` / `leader_pid` /
+  `backend_xid` (NULL); `client_port` is NULL and `client_addr` is text (not `inet`); COPY sub-protocol and
+  the initial handshake don't update `state`. Not ported to the Rust server.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
