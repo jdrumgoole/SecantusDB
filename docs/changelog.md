@@ -19,6 +19,22 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Date-operator timezone errors now report mongod's exact codes (Python server)
+
+A three-way conformance probe (real `mongod` 6.0 vs the Rust server vs the Python
+server) found that the date operators' `timezone` errors used a generic code. The
+Python server now reports mongod's exact codes: an **unrecognized time zone**
+(`{$dateToString: {…, timezone: "Not/AZone"}}`, and likewise for the `$hour`/…
+extractors and `$dateToParts`) is `Location40485` "unrecognized time zone
+identifier: \"…\"", and a **non-string timezone** is `Location40517` "timezone must
+evaluate to a string, found …". (The Rust server raises on the same inputs but with
+a generic code — its core defers error-raising to Python.)
+
+#### Fixed
+
+- `expressions.py` (`_resolve_timezone`): pin the unknown-zone / non-string-timezone
+  errors to mongod's `40485` / `40517`, shared by every timezone-aware date operator.
+
 ### N-element array expressions `$firstN` / `$lastN` / `$maxN` / `$minN` (both servers)
 
 Both servers now support MongoDB 5.2's N-element array aggregation expressions:

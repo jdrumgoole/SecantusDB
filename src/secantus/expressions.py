@@ -1196,7 +1196,12 @@ def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
     if name is None:
         return None
     if not isinstance(name, str):
-        raise ExpressionError(f"timezone must be a string, got {type(name).__name__}")
+        # mongod: Location40517 "timezone must evaluate to a string, found <type>"
+        # (verified via a three-way probe against mongod 6.0).
+        raise ExpressionError(
+            f"timezone must evaluate to a string, found {_bson_type_name(name)}",
+            code=40517,
+        )
     if name in ("UTC", "GMT", "Etc/UTC", "Etc/GMT"):
         return _dt.timezone.utc
     if name and name[0] in ("+", "-"):
@@ -1206,11 +1211,12 @@ def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
             hours = int(digits[:2])
             minutes = int(digits[2:])
             return _dt.timezone(sign * _dt.timedelta(hours=hours, minutes=minutes))
-        raise ExpressionError(f"unknown timezone: {name!r}")
+        raise ExpressionError(f'unrecognized time zone identifier: "{name}"', code=40485)
     try:
         return zoneinfo.ZoneInfo(name)
     except zoneinfo.ZoneInfoNotFoundError as exc:
-        raise ExpressionError(f"unknown timezone: {name!r}") from exc
+        # mongod: Location40485 "unrecognized time zone identifier: \"<name>\""
+        raise ExpressionError(f'unrecognized time zone identifier: "{name}"', code=40485) from exc
 
 
 def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
