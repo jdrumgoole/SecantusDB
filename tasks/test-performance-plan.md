@@ -101,16 +101,23 @@ nightly so coverage is preserved. Audit other >5 s tests for the same.
   pending the `n12_no_stress` measurement (§5).
 - Effort: trivial. Risk: low (must wire a CI `slow` lane).
 
-**I2a — Test-mode WT config: no journal, no close-checkpoint.**  *[medium / high]*
+**I2a — Test-mode WT config: no journal, no close-checkpoint.**  *[medium / high]* — 🔬 **MEASURED (validated)**
 Add `Storage(..., durable=False)` opening with `log=(enabled=false)` and
 skipping the checkpoint on `close()`. Keeps on-disk schema / tables / B-tree /
-reopen fidelity (guardrail satisfied) while cutting start/stop toward the 4 ms
-floor. Persistence / reopen / PITR fixtures keep `durable=True`.
-- Impact (est): server start/stop 266 ms → ~20–50 ms; aggregate fixture wall
-  ~59 s → ~10 s.
+reopen fidelity (guardrail satisfied) while cutting start/stop hard.
+- **Measured** (raw-WT prototype, main venv, `scratchpad/wt_floor.py`, replicating
+  the real 12-table open + close): durable open+close **~245 ms** (median;
+  **spikes to >2 s under parallel disk load** — the journal + checkpoint fsync
+  serialise under contention) vs nodurable **~52 ms, stable** (journal off, no
+  checkpoint, all 12 tables still created on disk). **~79 % faster per instance;
+  aggregate ~79 s → ~17 s** over ~3848 tests @ -n12 — and *more* than that under
+  real -n12 fsync contention, since nodurable removes the fsync entirely.
 - Effort: thread one flag `SecantusDBServer → Storage`; audit which fixtures
-  need durability. Risk: medium — must not weaken persistence tests; opt-in.
-- **Prototype + measure with `floor.py` before committing to it.**
+  need durability. Risk: medium — persistence / reopen / PITR fixtures MUST keep
+  `durable=True` (they assert journal-replay / checkpoint recovery). Opt-in;
+  default stays durable so the guardrail holds.
+- The current tip already dropped journal `prealloc` (`prealloc=false`), so the
+  245 ms is post that win; the remaining cost is journal writes + close fsync.
 
 **I2b — Module-scoped server fixtures with per-test namespaces.**  *[med-high / high]*
 Convert the ~30 function-scoped `server(tmp_path)` fixtures to module scope,
@@ -203,10 +210,15 @@ before and after, or run in a dedicated worktree pinned to a commit.
 - **Clean `invoke test` baseline** at -n12 on the current tip — the §1 number is
   provisional.
 - **xdist scaling curve** (`-n4/-n8/-n12`) + **stress-test tail isolation**
-  (`-n12` minus the 43.5 s test) — decides parallelism-bound vs serial-tail-bound,
-  which sets the I1-vs-I2 payoff. (Invalidated attempt this session; redo.)
-- **Prototype I2a** (`durable=False`) and re-run `floor.py` to confirm the
-  start/stop drop before threading the flag through.
+  (now automatic — the stress test is `slow`, excluded by default) — decides
+  parallelism-bound vs serial-tail-bound, which sets the I1-vs-I2 payoff.
+  ⏳ **STILL PENDING** — two attempts this session failed: (1) `main` moved
+  mid-run; (2) the pinned worktree's copied-WT venv threw `Session__freecb`
+  close errors that inflated timing, and disk load was variable. Redo in a
+  worktree with a **properly built** WT (submodule + `uv sync`) on a quiet
+  machine, or accept a rebuild.
+- **Prototype I2a** (`durable=False`) — ✅ **DONE** (see I2a above:
+  ~245 ms → ~52 ms, validated via `scratchpad/wt_floor.py`).
 - **Gauge parallel-safety spike** (`--dist=loadfile -n4`) — diff failures vs the
   `-n1` baseline; adopt only if zero new flakes.
 
