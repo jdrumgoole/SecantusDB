@@ -1374,6 +1374,48 @@ def _has_column_privilege(args: list[Any], ctx: ScalarContext | None) -> Any:
     )
 
 
+def _advisory_key(args: list[Any]) -> tuple[int, int, int]:
+    """Split advisory-lock arguments into the ``(classid, objid, objsubid)``
+    triple ``pg_locks`` reports. A single ``bigint`` key splits into two signed
+    32-bit halves (objsubid 1); a ``(int4, int4)`` pair maps straight through
+    (objsubid 2) — matching real Postgres."""
+    if len(args) >= 2 and args[1] is not None:
+        return (int(args[0]), int(args[1]), 2)
+    k = int(args[0])
+    hi = (k >> 32) & 0xFFFFFFFF
+    lo = k & 0xFFFFFFFF
+    classid = hi - 0x100000000 if hi >= 0x80000000 else hi
+    objid = lo - 0x100000000 if lo >= 0x80000000 else lo
+    return (classid, objid, 1)
+
+
+def _advisory_lock(name: str, args: list[Any], ctx: ScalarContext | None) -> Any:
+    """The ``pg_advisory_lock`` family (#135). Single-node: a lock is always
+    granted immediately, so acquisition is a no-op that just records what the
+    session holds (for ``pg_advisory_unlock`` truthfulness + ``pg_locks``
+    reflection). ``pg_try_*`` always succeed (``True``); ``pg_advisory_unlock*``
+    return whether a matching session-level lock was held; the void-returning
+    forms return ``None``."""
+    if ctx is None:
+        return None  # embedded / no session — nothing to track
+    session = ctx.session
+    if name == "pg_advisory_unlock_all":
+        session.advisory_unlock_all()
+        return None
+    if not args or args[0] is None:
+        return None
+    key = _advisory_key(args)
+    shared = name.endswith("_shared")
+    base = name[: -len("_shared")] if shared else name
+    if base == "pg_advisory_unlock":
+        return session.advisory_lock_release(key, shared=shared)
+    xact = "xact" in base
+    session.advisory_lock_acquire(key, shared=shared, xact=xact)
+    if base.startswith("pg_try_"):
+        return True  # single-node: always acquirable
+    return None  # pg_advisory_lock* return void
+
+
 def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> Any:
     if name == "has_column_privilege":
         return _has_column_privilege(args, ctx)
@@ -1653,6 +1695,8 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if len(args) < 2 or args[0] is None or args[1] is None:
             return None
         return _xmltype.xpath(_as_text(args[0]), args[1])
+    if name.startswith("pg_advisory_") or name.startswith("pg_try_advisory_"):
+        return _advisory_lock(name, args, ctx)
     if name == "pg_notify":
         # ``pg_notify(channel, payload)`` — the function form of NOTIFY.
         if ctx is not None and args and args[0] is not None:

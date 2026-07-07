@@ -2584,3 +2584,31 @@ def test_index_constraint_reflection_via_driver(real_server):
     assert defs["t_b_key"] == "UNIQUE (b)"
     assert defs["t_check"] == "CHECK ((a > 0))"
     conn.close()
+
+
+def test_advisory_locks_via_driver(real_server):
+    # pg_advisory_lock family round-trips over the wire and pg_locks reflects the
+    # held locks; single-node no-op that always grants (#135).
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("SELECT pg_advisory_lock(1)")
+    cur.execute("SELECT pg_try_advisory_lock(1, 2)")
+    assert cur.fetchall() == ([True],)
+    cur.execute("SELECT pg_advisory_lock_shared(5)")
+    cur.execute(
+        "SELECT locktype, classid, objid, objsubid, mode, granted "
+        "FROM pg_catalog.pg_locks ORDER BY objid"
+    )
+    assert cur.fetchall() == (
+        ["advisory", 0, 1, 1, "ExclusiveLock", True],
+        ["advisory", 1, 2, 2, "ExclusiveLock", True],
+        ["advisory", 0, 5, 1, "ShareLock", True],
+    )
+    cur.execute("SELECT pg_advisory_unlock(1)")
+    assert cur.fetchall() == ([True],)
+    cur.execute("SELECT pg_advisory_unlock(1)")  # not held any more
+    assert cur.fetchall() == ([False],)
+    cur.execute("SELECT pg_advisory_unlock_all()")
+    cur.execute("SELECT count(*) FROM pg_catalog.pg_locks")
+    assert cur.fetchall() == ([0],)
+    conn.close()

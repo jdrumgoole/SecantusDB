@@ -1152,6 +1152,39 @@ def _pg_policies(db: str, session: Session, storage: Any, catalog: Catalog) -> l
     return rows
 
 
+def _pg_locks(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_locks`` — the advisory locks (#135) the connection holds.
+    Single-node dev surface: reflects *this* session's held advisory locks (one
+    row per key+mode, always ``granted``). Non-advisory lock types and other
+    backends aren't tracked."""
+    held = getattr(session, "held_advisory_locks", None)
+    if held is None:
+        return []
+    pid = getattr(session, "backend_pid", 0)
+    rows = []
+    for classid, objid, objsubid, mode in held():
+        rows.append(
+            {
+                "locktype": "advisory",
+                "database": None,
+                "relation": None,
+                "page": None,
+                "tuple": None,
+                "virtualxid": None,
+                "transactionid": None,
+                "classid": classid,
+                "objid": objid,
+                "objsubid": objsubid,
+                "virtualtransaction": f"{pid}/0",
+                "pid": pid,
+                "mode": mode,
+                "granted": True,
+                "fastpath": False,
+            }
+        )
+    return rows
+
+
 def _role_row(oid: int, name: str, role: dict) -> dict:
     return {
         "oid": oid,
@@ -1719,6 +1752,28 @@ _register(
         ("with_check", "text"),
     ],
     _pg_policies,
+)
+_register(
+    "pg_catalog",
+    "pg_locks",
+    [
+        ("locktype", "text"),
+        ("database", "int4"),
+        ("relation", "int4"),
+        ("page", "int4"),
+        ("tuple", "int4"),
+        ("virtualxid", "text"),
+        ("transactionid", "int4"),
+        ("classid", "int4"),
+        ("objid", "int4"),
+        ("objsubid", "int4"),
+        ("virtualtransaction", "text"),
+        ("pid", "int4"),
+        ("mode", "text"),
+        ("granted", "bool"),
+        ("fastpath", "bool"),
+    ],
+    _pg_locks,
 )
 _register(
     "pg_catalog",

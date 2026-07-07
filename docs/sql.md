@@ -2373,6 +2373,46 @@ SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint;
 -- orders_check | CHECK ((total > 0))
 ```
 
+### Advisory locks
+
+The `pg_advisory_lock` family is accepted so application-level locking works:
+
+```sql
+SELECT pg_advisory_lock(42);              -- session-level exclusive lock
+SELECT pg_try_advisory_lock(1, 2);        -- two-key form; returns true
+SELECT pg_advisory_lock_shared(42);       -- shared mode
+SELECT pg_advisory_xact_lock(42);         -- transaction-scoped
+SELECT pg_advisory_unlock(42);            -- true if a session lock was held
+SELECT pg_advisory_unlock_all();          -- release all session locks
+```
+
+All eleven functions are supported — `pg_advisory_lock` / `pg_advisory_unlock` /
+`pg_advisory_unlock_all` and the `_shared`, `_xact_`, and `pg_try_*` variants.
+SecantusDB is single-node, so a lock is **always granted immediately** — the
+functions never block. What SecantusDB does track is *which* locks the
+connection holds, so:
+
+- `pg_try_advisory_lock*` always return `true` (nothing to contend with);
+- `pg_advisory_unlock*` return `true` only if a matching session-level lock was
+  held (and `false` otherwise, as Postgres does);
+- advisory locks are **re-entrant** — locking the same key twice needs two
+  unlocks;
+- `pg_advisory_xact_lock*` locks are released automatically at `COMMIT` /
+  `ROLLBACK` (and can't be released manually);
+- the held locks are reflected through **`pg_catalog.pg_locks`** (`locktype =
+  'advisory'`, one row per key+mode, always `granted`).
+
+```sql
+SELECT locktype, classid, objid, objsubid, mode, granted
+FROM pg_locks WHERE locktype = 'advisory';
+```
+
+A single `bigint` key splits into `(classid, objid)` signed 32-bit halves with
+`objsubid = 1`; a two-`int4` key maps straight through with `objsubid = 2` —
+matching Postgres. `pg_locks` reflects **this connection's** locks (single-node
+dev surface); cross-backend visibility and non-advisory lock types aren't
+modelled.
+
 ## LISTEN / NOTIFY
 
 Asynchronous pub/sub works across connections to the same server:

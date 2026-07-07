@@ -2758,6 +2758,26 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   but the expression text isn't rendered); expression/functional index columns reflect only when every
   key field maps to a declared column (index over a raw field is skipped); no `INCLUDE`/opclass/collation
   detail in `indexdef`. Not ported to the Rust server.
+- [ ] **Advisory locks landed** (#135, b175): the `pg_advisory_lock` family — `pg_advisory_lock` /
+  `pg_advisory_unlock` / `pg_advisory_unlock_all` plus the `_shared`, `_xact_`, and `pg_try_*` variants
+  (eleven functions total) — as **session-tracked single-node no-op locking**. All parse as `exp.Anonymous`;
+  registered in `functions._SCALAR_EVAL_ANON` so FROM-less `SELECT pg_advisory_*(…)` routes to
+  `scalar._advisory_lock` (which has the session via `ScalarContext`). Single-node → a lock is always
+  granted immediately, so we only *track* what the session holds: `Session.advisory_locks` keyed by
+  `(classid, objid, objsubid, mode, xact)` → re-entrant stack count, with `advisory_lock_acquire` /
+  `advisory_lock_release` / `advisory_unlock_all` / `release_xact_advisory_locks` / `held_advisory_locks`.
+  `pg_try_*` always return `true`; `pg_advisory_unlock*` return whether a session-level lock was held
+  (`false` otherwise, as Postgres); locks are re-entrant (N locks need N unlocks); `pg_advisory_xact_lock*`
+  release at COMMIT/ROLLBACK (hooked in `engine._end_txn_state`) and aren't manually unlockable. A single
+  `bigint` key splits into signed 32-bit `(classid, objid)` halves (objsubid 1); a `(int4, int4)` pair maps
+  through (objsubid 2). Reflected via `pg_catalog.pg_locks` (`virtual._pg_locks`: `locktype='advisory'`, one
+  row per key+mode, always `granted`). Return-type tags in `planner._infer_scalar_tag` (`pg_try_*` /
+  `pg_advisory_unlock*` → bool; void forms → text NULL). Tests: `tests/test_sql_advisory_locks.py` +
+  `test_pgserver_pg8000.py::test_advisory_locks_via_driver`. **Limitations:** no actual cross-session
+  locking (single-node, storage `RLock` serializes) — `pg_try_*` can't ever fail; `pg_locks` reflects only
+  *this* connection's advisory locks (no cross-backend visibility) and no non-advisory lock types
+  (relation/tuple/transactionid rows); `objsubid`/`tuple` reflect as `int4` (no `int2` type tag). Not ported
+  to the Rust server.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
