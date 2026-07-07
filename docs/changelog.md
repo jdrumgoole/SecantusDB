@@ -19,20 +19,51 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-### `$firstN` / `$lastN` array expressions (both servers)
+### Date-operator timezone errors now report mongod's exact codes (Python server)
 
-Both servers now support MongoDB 5.2's `$firstN` and `$lastN` aggregation
-expressions: `{$firstN: {n: <int>, input: <array>}}` returns the first `n`
-elements of an array, `$lastN` the last `n`. When the array is shorter than `n`
-the whole array is returned; a null or missing `input` yields null; a non-array
-`input` or an `n` that isn't a positive integer raises, matching mongod. Neither
-server recognised these before.
+A three-way conformance probe (real `mongod` 6.0 vs the Rust server vs the Python
+server) found that the date operators' `timezone` errors used a generic code. The
+Python server now reports mongod's exact codes: an **unrecognized time zone**
+(`{$dateToString: {…, timezone: "Not/AZone"}}`, and likewise for the `$hour`/…
+extractors and `$dateToParts`) is `Location40485` "unrecognized time zone
+identifier: \"…\"", and a **non-string timezone** is `Location40517` "timezone must
+evaluate to a string, found …". (The Rust server raises on the same inputs but with
+a generic code — its core defers error-raising to Python.)
+
+#### Fixed
+
+- `expressions.py` (`_resolve_timezone`): pin the unknown-zone / non-string-timezone
+  errors to mongod's `40485` / `40517`, shared by every timezone-aware date operator.
+
+### N-element array expressions `$firstN` / `$lastN` / `$maxN` / `$minN` (both servers)
+
+Both servers now support MongoDB 5.2's N-element array aggregation expressions:
+`$firstN` / `$lastN` return the first / last `n` elements of an array, and `$maxN`
+/ `$minN` the `n` largest / smallest by MongoDB's cross-type BSON sort order
+(descending for `$maxN`, ascending for `$minN`, with null elements ignored). When
+the array has fewer than `n` elements all are returned. Neither server recognised
+these before.
+
+The `{n, input}` validation is **matched to real mongod 6.0** (via a three-way
+probe against `mongod`): `n` may be any positive integral number — an integral
+double like `2.0` is accepted — and a missing `n` / `input`, a non-integral or
+non-positive `n`, or a **null / missing / non-array `input`** each raises mongod's
+exact error code (`Location5787902`-`5787908` / `Location5788200`). In particular a
+null or missing `input` is an *error*, not null — an earlier draft (and the
+`$firstN`/`$lastN` that first shipped under this Unreleased section) returned null
+there, which diverged from mongod; this is now corrected.
 
 #### Added
 
-- `expressions.py` / `secantus-core`: `$firstN` / `$lastN` expression operators.
-  (The `$group` accumulator forms — and the sort-based `$maxN` / `$minN` — remain
-  follow-ons, see `tasks/backlog.md` §7.5.)
+- `expressions.py` / `secantus-core`: `$firstN` / `$lastN` / `$maxN` / `$minN`
+  expression operators over a shared, mongod-faithful `{n, input}` validator
+  (`_nelem_n_and_input` / `nelem_n_and_input`). `$maxN` / `$minN` sort via the same
+  `order::cmp` / `is_sortable` contract `$sortArray` uses (an element outside the
+  sortable subset — bool, Decimal128, … — defers to the Python `_SortKey` oracle),
+  so the two engines agree on cross-type order. The Python server reproduces
+  mongod's error codes exactly; the Rust server raises on the same inputs but with
+  a generic code (its core defers error-raising to Python). The `$group`
+  accumulator forms remain a follow-on (`tasks/backlog.md` §7.5).
 
 ### Bitwise aggregation operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot` (both servers)
 

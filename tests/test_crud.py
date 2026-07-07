@@ -643,6 +643,25 @@ def test_aggregate_date_to_parts_timezone(coll) -> None:
     }
 
 
+def test_aggregate_max_n_min_n(coll) -> None:
+    coll.insert_one({"_id": 1, "a": [3, 1, 4, 1, 5, 9, 2, 6], "with_nulls": [3, None, 1, None, 5]})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "top3": {"$maxN": {"n": 3, "input": "$a"}},
+                        "bot3": {"$minN": {"n": 3, "input": "$a"}},
+                        "max_nn": {"$maxN": {"n": 2, "input": "$with_nulls"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"top3": [9, 6, 5], "bot3": [1, 1, 2], "max_nn": [5, 3]}]
+
+
 def test_aggregate_first_n_last_n(coll) -> None:
     coll.insert_one({"_id": 1, "a": [10, 20, 30, 40, 50]})
     out = list(
