@@ -123,6 +123,14 @@ CURATED = [
     [{"$group": {"_id": "$b", "sd": {"$stdDevPop": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "sd": {"$stdDevSamp": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": None, "p": {"$stdDevPop": "$a"}, "s": {"$stdDevSamp": "$a"}}}],
+    # $firstN / $lastN / $maxN / $minN accumulators — firstN/lastN keep nulls,
+    # maxN/minN drop them; integral-double n accepted.
+    [{"$group": {"_id": "$b", "r": {"$firstN": {"n": 2, "input": "$a"}}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "r": {"$lastN": {"n": 2, "input": "$a"}}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "r": {"$maxN": {"n": 2, "input": "$a"}}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "r": {"$minN": {"n": 2, "input": "$a"}}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": None, "r": {"$firstN": {"n": 3, "input": "$a"}}}}],
+    [{"$group": {"_id": None, "r": {"$maxN": {"n": 2.0, "input": "$a"}}}}],
     [{"$group": {"_id": "$nested.k", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
     [{"$sortByCount": "$b"}],
     [{"$unwind": "$tags"}, {"$group": {"_id": "$tags", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
@@ -792,6 +800,7 @@ def _rand_stage(rng):
             "group_push",
             "group_set",
             "group_std",
+            "group_nelem",
             "sortbycount",
             "bucket",
             "bucket_default",
@@ -847,6 +856,10 @@ def _rand_stage(rng):
     if kind == "group_std":
         op = rng.choice(["$stdDevPop", "$stdDevSamp"])
         return {"$group": {"_id": "$" + field, "sd": {op: "$" + f2}}}
+    if kind == "group_nelem":
+        op = rng.choice(["$firstN", "$lastN", "$maxN", "$minN"])
+        spec = {"n": rng.randint(1, 3), "input": "$" + f2}
+        return {"$group": {"_id": "$" + field, "r": {op: spec}}}
     if kind == "sortbycount":
         return {"$sortByCount": "$" + field}
     if kind in ("bucket", "bucket_default"):

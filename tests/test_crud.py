@@ -706,6 +706,38 @@ def test_aggregate_bitwise_operators(coll) -> None:
     assert isinstance(out[0]["long_"], Int64)
 
 
+def test_aggregate_group_nelem_accumulators(coll) -> None:
+    # Group values in doc order: 3, 1, null, 5, 2. $firstN/$lastN keep the null;
+    # $maxN/$minN drop it (matched to mongod).
+    coll.insert_many(
+        [
+            {"g": "a", "v": 3},
+            {"g": "a", "v": 1},
+            {"g": "a", "v": None},
+            {"g": "a", "v": 5},
+            {"g": "a", "v": 2},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$g",
+                        "first3": {"$firstN": {"n": 3, "input": "$v"}},
+                        "last2": {"$lastN": {"n": 2, "input": "$v"}},
+                        "max2": {"$maxN": {"n": 2, "input": "$v"}},
+                        "min2": {"$minN": {"n": 2, "input": "$v"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [
+        {"_id": "a", "first3": [3, 1, None], "last2": [5, 2], "max2": [5, 3], "min2": [1, 2]}
+    ]
+
+
 def test_aggregate_group_stddev(coll) -> None:
     # Values 2,4,6: population variance (4+0+4)/3 -> stdDevPop sqrt(8/3);
     # sample variance 8/2 = 4 -> stdDevSamp 2.0.

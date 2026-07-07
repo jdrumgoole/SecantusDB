@@ -1325,15 +1325,14 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   remaining `$dateFromString`/`$dateToString` directive edges.
 - [ ] **`$group` accumulators absent from both servers** (a differential probe
   2026-07-06 found these error on *both* — a dual-server gap, not Rust-only):
-  `$top` / `$bottom` / `$topN` / `$bottomN` / `$firstN` / `$lastN` / `$maxN` /
-  `$minN` (the sort-/n-bounded accumulators), and `$median` / `$percentile`
-  (t-digest). Remaining **expression** forms still absent from both:
-  `$median` / `$percentile` over an array (t-digest / approximate — parity-risky),
-  `$dateFromParts`, `$tsSecond` / `$tsIncrement`. Each would need porting on
-  **both** servers (Python module + Rust `secantus-core`) with a parity corpus.
-  **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot`, `$firstN`/`$lastN`, and `$maxN`/`$minN`
-  as `$group` accumulators** remain a follow-on (their *expression* forms shipped —
-  see below). **Now native on both servers:** the
+  `$top` / `$bottom` / `$topN` / `$bottomN` (sort-key accumulators with a `sortBy`),
+  and `$median` / `$percentile` (t-digest). Remaining **expression** forms still
+  absent from both: `$median` / `$percentile` over an array (t-digest / approximate
+  — parity-risky), `$dateFromParts`, `$tsSecond` / `$tsIncrement`. Each would need
+  porting on **both** servers (Python module + Rust `secantus-core`) with a parity
+  corpus. **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot` as `$group` accumulators** remain
+  a follow-on (their *expression* forms shipped — see below). **Now native on both
+  servers:** the
   bitwise **expression** operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
   (0.5.3-beta.136 / 0.5.4b164 — int/long operands, int32/int64 result width,
   empty-list identity, null propagation; a non-integer operand raises), and the
@@ -1342,7 +1341,10 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   **real mongod 6.0** via a three-way probe — integral-double `n` accepted, and a
   null/missing/non-array `input` **raises** `Location5788200`, not null; `$maxN`/
   `$minN` sort via the `$sortArray` `order::cmp`/`is_sortable` contract, deferring
-  bool/Decimal128 elements to Python's `_SortKey`). **Error-code gap (both these
+  bool/Decimal128 elements to Python's `_SortKey`), **plus their `$group` /
+  `$setWindowFields` accumulator forms** (0.5.3-beta.139 / 0.5.4b173 — three-way
+  verified: `$firstN`/`$lastN` keep null values, `$maxN`/`$minN` drop them; shared
+  `nelem_parse_n` validation). **Error-code gap (both these
   operator families and, generally, any operator whose error path defers):** the
   Python server reproduces mongod's exact Location codes, but the **Rust server**
   raises a generic `BadValue` (2) on these error paths because the Rust core signals

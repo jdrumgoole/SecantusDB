@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
-from secantus.expressions import evaluate
+from secantus.expressions import ExpressionError, evaluate
 from secantus.numerics import bson_add
 from secantus.paths import get_path, set_path, unset_path
 from secantus.query import QueryError, matches
@@ -770,6 +770,8 @@ def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
             bucket[k] = v["_avg_total"] / v["_avg_n"] if v["_avg_n"] else None
         elif isinstance(v, dict) and "_std_vals" in v:
             bucket[k] = _std_dev(v["_std_vals"], pop=v["_std_pop"])
+        elif isinstance(v, dict) and "_nelem_vals" in v:
+            bucket[k] = _nelem_finalize(v)
     return bucket
 
 
@@ -915,6 +917,78 @@ def _acc_std_samp(
     _acc_std(bucket, field, arg, doc, vars, pop=False)
 
 
+def _acc_nelem(
+    bucket: dict[str, Any],
+    field: str,
+    arg: Any,
+    doc: Mapping[str, Any],
+    vars: dict[str, Any],
+    *,
+    kind: str,
+) -> None:
+    """``$firstN`` / ``$lastN`` / ``$maxN`` / ``$minN`` (accumulator form): collect
+    the per-doc ``input`` value across the group; the result (``n`` first/last in
+    doc order, or ``n`` largest/smallest) is computed at finalize. ``$firstN`` /
+    ``$lastN`` **include null** values (they're the first/last values seen);
+    ``$maxN`` / ``$minN`` ignore them (matched to mongod 6.0 via a three-way probe).
+    ``{n, input}`` validation matches the expression forms."""
+    from secantus.expressions import nelem_parse_n
+
+    if not isinstance(arg, Mapping) or "n" not in arg:
+        raise ExpressionError("Missing value for 'n'", code=5787906)
+    if "input" not in arg:
+        raise ExpressionError("Missing value for 'input'", code=5787907)
+    n = nelem_parse_n(evaluate(arg["n"], doc, vars))
+    value = evaluate(arg["input"], doc, vars)
+    state = bucket.get(field)
+    if not isinstance(state, dict) or "_nelem_vals" not in state:
+        state = {"_nelem_vals": [], "_nelem_n": n, "_nelem_kind": kind}
+        bucket[field] = state
+    else:
+        state["_nelem_n"] = n  # n is constant across the group; last write wins
+    state["_nelem_vals"].append(value)
+
+
+def _acc_first_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_nelem(bucket, field, arg, doc, vars, kind="firstN")
+
+
+def _acc_last_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_nelem(bucket, field, arg, doc, vars, kind="lastN")
+
+
+def _acc_max_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_nelem(bucket, field, arg, doc, vars, kind="maxN")
+
+
+def _acc_min_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_nelem(bucket, field, arg, doc, vars, kind="minN")
+
+
+def _nelem_finalize(state: dict[str, Any]) -> list[Any]:
+    """Finalize an N-element accumulator state to its result list."""
+    vals = state["_nelem_vals"]
+    n = state["_nelem_n"]
+    kind = state["_nelem_kind"]
+    if kind == "firstN":
+        return vals[:n]
+    if kind == "lastN":
+        return vals[-n:]
+    from secantus.ordering import _SortKey
+
+    non_null = [x for x in vals if x is not None]
+    non_null.sort(key=_SortKey, reverse=(kind == "maxN"))
+    return non_null[:n]
+
+
 _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$sum": _acc_sum,
     "$count": _acc_count,
@@ -927,6 +1001,10 @@ _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$addToSet": _acc_add_to_set,
     "$stdDevPop": _acc_std_pop,
     "$stdDevSamp": _acc_std_samp,
+    "$firstN": _acc_first_n,
+    "$lastN": _acc_last_n,
+    "$maxN": _acc_max_n,
+    "$minN": _acc_min_n,
 }
 
 
