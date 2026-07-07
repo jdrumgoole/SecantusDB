@@ -177,6 +177,20 @@ def main() -> int:
     JUNIT_OUT.parent.mkdir(parents=True, exist_ok=True)
     JUNIT_OUT.unlink(missing_ok=True)
 
+    # run-tests.php writes a scratch file (``run-test-info.php``) into its OWN
+    # directory (``__DIR__``). A system PHP install's build dir — e.g. Debian /
+    # CI's ``/usr/lib/php/<api>/build/`` — is root-owned and not writable by the
+    # runner user, so that write fails ("Permission denied") and run-tests.php
+    # bails BEFORE emitting any JUnit (empty file → ``generate_report``
+    # ``ParseError``, an opaque CI-only failure). A user-owned Homebrew prefix is
+    # writable, which is why this only bit in CI. Copy the script into a writable
+    # temp dir and run the copy so ``__DIR__`` is always writable. Defined before
+    # the daemon ``try`` so the ``finally`` cleanup can always reference it.
+    runtests_dir = tempfile.mkdtemp(prefix="secantus-php-runtests-")
+    run_tests_local = Path(runtests_dir) / "run-tests.php"
+    shutil.copy(run_tests, run_tests_local)
+    run_tests = run_tests_local
+
     host = "127.0.0.1"
     storage_dir = tempfile.mkdtemp(prefix="secantus-php-ext-gauge-")
     # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
@@ -254,6 +268,7 @@ def main() -> int:
             daemon.kill()
             daemon.wait()
         shutil.rmtree(storage_dir, ignore_errors=True)
+        shutil.rmtree(runtests_dir, ignore_errors=True)
 
     return 0
 
