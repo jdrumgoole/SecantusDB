@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-06-20 — SecantusDB 0.5.4b9 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-07-07 — SecantusDB 0.5.4b177 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -32,13 +32,13 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
-| `test_transactions_unified.py` | 92 | 3 | 0 | 172 | 267 | 96.8% |
+| `test_transactions_unified.py` | 92 | 0 | 0 | 172 | 264 | 100.0% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1020** | **8** | **0** | **475** | **1503** | **99.2%** |
+| **Overall** | **1020** | **5** | **0** | **475** | **1500** | **99.5%** |
 
-## Failures (8)
+## Failures (5)
 
 First 30 failure node-ids for manual triage:
 
@@ -48,9 +48,6 @@ vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_maxtime_ms_message
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_csot_applied
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedReadPref::test_secondary_readPreference
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_explicit_secondary_read_preference
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_secondary_read_preference_from_transaction_options
 ```
 
 ## How this is generated
