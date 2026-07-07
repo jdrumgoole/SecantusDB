@@ -106,17 +106,28 @@ _DEFAULT_OPCLASS_OID = 1978
 _INDEX_OID_BASE = 24576
 
 
-def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
-    """Enumerate every index relation (the implicit primary-key index plus each
-    user ``CREATE INDEX``) with the fields pg_index / pg_class / pg_constraint
-    reflection needs: a stable ``indexrelid``, its table ``indrelid``, the
-    ``indkey`` attnum array, and unique/primary flags."""
+def _index_coldef(field: str, direction: Any, field_to_name: dict[str, str]) -> str:
+    """Render one indexed column for ``pg_get_indexdef`` — its SQL name plus
+    ``DESC`` when the index stores it descending."""
+    name = field_to_name.get(field, field)
+    desc = str(direction).upper() in ("-1", "DESC")
+    return f"{name} DESC" if desc else name
+
+
+def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
+    """Every index relation (implicit PK index + each ``CREATE INDEX`` + the index
+    backing each UNIQUE constraint) with everything reflection needs: a stable
+    ``indexrelid`` / ``indrelid``, ``indkey`` attnums, unique/primary flags, and —
+    for ``pg_get_indexdef`` / ``pg_indexes`` — the owning ``table`` name and the
+    rendered ``columns`` (with ``DESC``). ``partial`` flags a partial index (its
+    predicate isn't reversed back to SQL)."""
     table_oids = _table_oids(db, catalog)
     out: list[dict[str, Any]] = []
     oid = _INDEX_OID_BASE
     for t in _user_tables(db, catalog):
         relid = table_oids[t.name]
         field_to_attnum = {col.field: i for i, col in enumerate(t.columns, start=1)}
+        field_to_name = {col.field: col.name for col in t.columns}
         pk_cols = t.pk_columns
         if pk_cols:
             out.append(
@@ -128,10 +139,15 @@ def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, 
                     "unique": True,
                     "primary": True,
                     "conname": f"{t.name}_pkey",
+                    "table": t.name,
+                    "columns": [c.name for c in pk_cols],
+                    "partial": False,
                 }
             )
             oid += 1
         for ix in storage.list_indexes(db, t.collection):
+            if ix.get("name") == "_id_":
+                continue  # WiredTiger's physical _id index — the PK is shown as <t>_pkey
             key = ix.get("key") or {}
             indkey = [field_to_attnum.get(f) for f in key]
             if not indkey or any(a is None for a in indkey):
@@ -145,12 +161,60 @@ def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, 
                     "unique": bool(ix.get("unique")),
                     "primary": False,
                     "conname": None,
+                    "table": t.name,
+                    "columns": [_index_coldef(f, d, field_to_name) for f, d in key.items()],
+                    "partial": bool(ix.get("partialFilterExpression")),
                 }
             )
             oid += 1
     # The implicit unique index backing each declared UNIQUE constraint.
-    out.extend(_unique_constraint_index_relations(db, catalog))
+    for uq in _unique_constraints(db, catalog):
+        out.append(
+            {
+                "indexrelid": uq["conindid"],
+                "indrelid": uq["conrelid"],
+                "relname": uq["conname"],
+                "indkey": uq["conkey"],
+                "unique": True,
+                "primary": False,
+                "conname": uq["conname"],
+                "table": uq["table"].name,
+                "columns": list(uq["columns"]),
+                "partial": False,
+            }
+        )
     return out
+
+
+_INDEX_RELATION_KEYS = (
+    "indexrelid",
+    "indrelid",
+    "relname",
+    "indkey",
+    "unique",
+    "primary",
+    "conname",
+)
+
+
+def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
+    """The pg_index / pg_class / pg_constraint projection of :func:`_indexes` — a
+    stable ``indexrelid``, its table ``indrelid``, the ``indkey`` attnum array, and
+    unique/primary flags. (Kept as the historical shape those builders consume.)"""
+    return [{k: ix[k] for k in _INDEX_RELATION_KEYS} for ix in _indexes(db, storage, catalog)]
+
+
+def indexdef_for_oid(db: str, storage: Any, catalog: Catalog, oid: int) -> str | None:
+    """``pg_get_indexdef(oid)`` — reconstruct the ``CREATE INDEX`` statement for an
+    index relation oid, or None when the oid isn't a known index."""
+    for ix in _indexes(db, storage, catalog):
+        if ix["indexrelid"] == oid:
+            unique = "UNIQUE " if ix["unique"] else ""
+            cols = ", ".join(ix["columns"])
+            return (
+                f"CREATE {unique}INDEX {ix['relname']} ON public.{ix['table']} USING btree ({cols})"
+            )
+    return None
 
 
 def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -288,6 +352,7 @@ def _pk_constraints(db: str, catalog: Catalog) -> list[tuple[TableDef, str, list
     return out
 
 
+_PK_CON_OID_BASE = 30000
 _FK_OID_BASE = 40000
 
 
@@ -377,21 +442,21 @@ def _unique_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
     return out
 
 
-def _unique_constraint_index_relations(db: str, catalog: Catalog) -> list[dict[str, Any]]:
-    """The implicit unique index backing each UNIQUE constraint — a pg_index /
-    pg_class relation whose ``indexrelid`` matches the constraint's ``conindid``."""
-    return [
-        {
-            "indexrelid": uq["conindid"],
-            "indrelid": uq["conrelid"],
-            "relname": uq["conname"],
-            "indkey": uq["conkey"],
-            "unique": True,
-            "primary": False,
-            "conname": uq["conname"],
-        }
-        for uq in _unique_constraints(db, catalog)
-    ]
+def _pg_indexes(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_indexes`` — one row per index with its rendered ``indexdef``
+    (what psql's ``\\d`` and SQLAlchemy read to list a table's indexes). (#134)"""
+    rows = []
+    for ix in _indexes(db, storage, catalog):
+        rows.append(
+            {
+                "schemaname": "public",
+                "tablename": ix["table"],
+                "indexname": ix["relname"],
+                "tablespace": None,
+                "indexdef": indexdef_for_oid(db, storage, catalog, ix["indexrelid"]),
+            }
+        )
+    return rows
 
 
 def _check_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
@@ -419,7 +484,12 @@ def _check_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
 
 def constraint_def_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
     """``pg_get_constraintdef(oid)`` — the rendered constraint definition for a
-    foreign-key, UNIQUE, or CHECK constraint OID, or ``None`` when unknown."""
+    primary-key, foreign-key, UNIQUE, or CHECK constraint OID, or ``None`` when
+    unknown. The PK oids mirror :func:`_pg_constraint` — ``_PK_CON_OID_BASE`` plus
+    the table's position among tables-with-a-PK (both walk ``_user_tables``)."""
+    for i, (_t, _conname, cols) in enumerate(_pk_constraints(db, catalog)):
+        if _PK_CON_OID_BASE + i == oid:
+            return f"PRIMARY KEY ({', '.join(cols)})"
     for fk in _foreign_keys(db, catalog):
         if fk["oid"] == oid:
             return fk["condef"]
@@ -1222,7 +1292,7 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
     # 'f'). No check / unique *constraints* in our model (a CREATE UNIQUE INDEX
     # is an index, not a constraint), so contype 'u'/'c' rows are absent.
     rows: list[dict] = []
-    oid = 30000
+    oid = _PK_CON_OID_BASE
     for ix in _index_relations(db, storage, catalog):
         if not ix["primary"]:
             continue
@@ -1649,6 +1719,18 @@ _register(
         ("with_check", "text"),
     ],
     _pg_policies,
+)
+_register(
+    "pg_catalog",
+    "pg_indexes",
+    [
+        ("schemaname", "text"),
+        ("tablename", "text"),
+        ("indexname", "text"),
+        ("tablespace", "text"),
+        ("indexdef", "text"),
+    ],
+    _pg_indexes,
 )
 _register(
     "pg_catalog",

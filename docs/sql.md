@@ -2346,6 +2346,33 @@ storage). One real check is applied: an `OF <table>` target that isn't a relatio
 in the query's `FROM` errors with SQLSTATE `42P01`, exactly as Postgres reports
 it (and, as in Postgres, a table's alias masks its real name in `OF`).
 
+### Index / constraint reflection for `\d`
+
+`pg_catalog.pg_indexes` lists one row per index with a rendered `indexdef`, and
+`pg_get_indexdef(oid)` reconstructs the same `CREATE INDEX` text — what psql's
+`\d` and SQLAlchemy read to list a table's indexes:
+
+```sql
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'orders';
+-- orders_pkey  | CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id)
+-- idx_created  | CREATE INDEX idx_created ON public.orders USING btree (created_at DESC)
+```
+
+The primary key surfaces as `<table>_pkey` (never WiredTiger's internal `_id_`
+index), a descending index column renders with `DESC`, and a `CREATE UNIQUE
+INDEX` / unique-constraint index renders `UNIQUE`.
+
+`pg_get_constraintdef(oid)` renders every constraint the way Postgres does, so
+SQLAlchemy's inspector can reflect it:
+
+```sql
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint;
+-- orders_pkey  | PRIMARY KEY (id)
+-- orders_c_fkey| FOREIGN KEY (customer) REFERENCES customers(id)
+-- orders_n_key | UNIQUE (n)
+-- orders_check | CHECK ((total > 0))
+```
+
 ## LISTEN / NOTIFY
 
 Asynchronous pub/sub works across connections to the same server:

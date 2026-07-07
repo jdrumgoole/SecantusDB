@@ -2549,3 +2549,38 @@ def test_truncate_via_driver(real_server):
     cur.execute("SELECT id FROM t")
     assert cur.fetchall() == ([1],)
     conn.close()
+
+
+def test_index_constraint_reflection_via_driver(real_server):
+    # pg_indexes renders CREATE [UNIQUE] INDEX (with DESC), and
+    # pg_get_constraintdef renders PRIMARY KEY / FOREIGN KEY / UNIQUE / CHECK —
+    # exactly what psql's \d and SQLAlchemy read. (#134)
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE parent (id bigint primary key)")
+    cur.execute("CREATE TABLE t (id bigint primary key, a int, b int, p bigint)")
+    cur.execute("ALTER TABLE t ADD CONSTRAINT t_p_fkey FOREIGN KEY (p) REFERENCES parent(id)")
+    cur.execute("ALTER TABLE t ADD CONSTRAINT t_b_key UNIQUE (b)")
+    cur.execute("ALTER TABLE t ADD CONSTRAINT t_check CHECK (a > 0)")
+    cur.execute("CREATE INDEX idx_desc ON t (a DESC, b)")
+    cur.execute(
+        "SELECT indexname, indexdef FROM pg_catalog.pg_indexes "
+        "WHERE tablename = 't' ORDER BY indexname"
+    )
+    assert cur.fetchall() == (
+        ["idx_desc", "CREATE INDEX idx_desc ON public.t USING btree (a DESC, b)"],
+        ["t_b_key", "CREATE UNIQUE INDEX t_b_key ON public.t USING btree (b)"],
+        ["t_pkey", "CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)"],
+    )
+    # No WiredTiger physical _id_ index leaks into the SQL surface.
+    cur.execute("SELECT count(*) FROM pg_catalog.pg_indexes WHERE indexname = '_id_'")
+    assert cur.fetchall() == ([0],)
+    cur.execute(
+        "SELECT conname, pg_get_constraintdef(oid) FROM pg_catalog.pg_constraint ORDER BY conname"
+    )
+    defs = dict(tuple(r) for r in cur.fetchall())
+    assert defs["t_pkey"] == "PRIMARY KEY (id)"
+    assert defs["t_p_fkey"] == "FOREIGN KEY (p) REFERENCES parent(id)"
+    assert defs["t_b_key"] == "UNIQUE (b)"
+    assert defs["t_check"] == "CHECK ((a > 0))"
+    conn.close()
