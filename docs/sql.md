@@ -2308,6 +2308,24 @@ through it.
 are accepted but are no-ops: SecantusDB is single-node, so isolation level and
 read-only mode don't change behaviour.
 
+### Row-locking clauses (`FOR UPDATE` / `FOR SHARE`)
+
+`SELECT … FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE` — with
+the `NOWAIT`, `SKIP LOCKED`, and `OF <table>` modifiers — are accepted so ORM
+locking (SQLAlchemy's `with_for_update()`) works:
+
+```sql
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE;
+SELECT * FROM jobs WHERE done = false FOR UPDATE SKIP LOCKED;
+SELECT a.* FROM accounts a JOIN owners o ON o.id = a.owner FOR SHARE OF a NOWAIT;
+```
+
+SecantusDB is single-node, so the lock itself is a **no-op** — the statement
+just returns its rows (a connection already serializes against the shared
+storage). One real check is applied: an `OF <table>` target that isn't a relation
+in the query's `FROM` errors with SQLSTATE `42P01`, exactly as Postgres reports
+it (and, as in Postgres, a table's alias masks its real name in `OF`).
+
 ## LISTEN / NOTIFY
 
 Asynchronous pub/sub works across connections to the same server:

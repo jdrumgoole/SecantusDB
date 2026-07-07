@@ -1281,9 +1281,40 @@ def _deallocate_statement(target: str, session: Session) -> SQLResult:
     return SQLResult(command_tag="DEALLOCATE")
 
 
+def _validate_locks(stmt: exp.Select) -> None:
+    """Validate ``FOR UPDATE`` / ``FOR SHARE`` (and NO KEY / KEY variants, with
+    SKIP LOCKED / NOWAIT) row-locking clauses (#132). SecantusDB is single-node so
+    the lock itself is a no-op — but an ``OF <table>`` target that isn't a relation
+    in the query's FROM is a hard error, exactly as Postgres reports it."""
+    locks = stmt.args.get("locks")
+    if not locks:
+        return
+    # Scope is the FROM + JOIN relations only (not tables nested inside the lock's
+    # own ``OF`` list, which are part of the same AST).
+    sources: list[exp.Expression] = []
+    frm = stmt.args.get("from_") or stmt.args.get("from")
+    if frm is not None:
+        sources.append(frm)
+    sources.extend(stmt.args.get("joins") or [])
+    in_scope: set[str] = set()
+    for src in sources:
+        for t in src.find_all(exp.Table):
+            # An alias masks the base name for FOR UPDATE OF purposes (Postgres).
+            in_scope.add(t.alias if t.alias else t.name)
+    for lock in locks:
+        for tgt in lock.args.get("expressions") or []:
+            name = tgt.name if isinstance(tgt, exp.Table) else str(getattr(tgt, "name", tgt))
+            if name and name not in in_scope:
+                raise errors.SQLError(
+                    "42P01",
+                    f'relation "{name}" in FOR UPDATE/SHARE clause not found in FROM clause',
+                )
+
+
 def _run_select(
     stmt: exp.Select, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
+    _validate_locks(stmt)  # FOR UPDATE / SHARE: single-node no-op, but OF-targets validated.
     # A base-less set-returning function as the row source: ``FROM generate_series(…)``
     # / ``FROM unnest(…)`` / … or a bare ``SELECT generate_series(…)``.
     srf_source = srf.from_source(stmt) or srf.fromless_projection(stmt)
