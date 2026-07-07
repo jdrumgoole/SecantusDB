@@ -2373,6 +2373,31 @@ SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint;
 -- orders_check | CHECK ((total > 0))
 ```
 
+### Session settings (`SET LOCAL` / `SHOW ALL` / `pg_settings`)
+
+`SET LOCAL name = value` applies a GUC only for the rest of the current
+transaction — it reverts to the prior value at `COMMIT` or `ROLLBACK`:
+
+```sql
+BEGIN;
+SET LOCAL statement_timeout = '5s';   -- active only in this transaction
+-- ...
+COMMIT;                               -- statement_timeout reverts
+```
+
+Outside a transaction block, `SET LOCAL` has no lasting effect (as in Postgres).
+A plain `SET` is session-scoped and persists past `COMMIT`.
+
+`SHOW ALL` lists every GUC as a three-column table (`name`, `setting`,
+`description`), and `pg_catalog.pg_settings` exposes the same values with the
+metadata psql's `\dconfig` and ORMs read:
+
+```sql
+SHOW ALL;
+SELECT name, setting, vartype, source FROM pg_settings WHERE name = 'TimeZone';
+-- TimeZone | UTC | string | default        (source becomes 'session' after a SET)
+```
+
 ### Advisory locks
 
 The `pg_advisory_lock` family is accepted so application-level locking works:

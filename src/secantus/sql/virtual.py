@@ -1185,6 +1185,55 @@ def _pg_locks(db: str, session: Session, storage: Any, catalog: Catalog) -> list
     return rows
 
 
+def _guc_vartype(value: str) -> str:
+    """The ``pg_settings.vartype`` for a GUC value, inferred from its text."""
+    if value.lower() in ("on", "off", "true", "false", "yes", "no"):
+        return "bool"
+    try:
+        int(value)
+        return "integer"
+    except ValueError:
+        pass
+    try:
+        float(value)
+        return "real"
+    except ValueError:
+        return "string"
+
+
+def _pg_settings(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_settings`` — one row per GUC (defaults overlaid with the
+    session's ``SET`` overrides), the subset psql's ``\\dconfig`` and ORMs read.
+    (#136)"""
+    from secantus.sql.session import GUC_DEFAULTS
+
+    overrides = getattr(session, "settings", {}) or {}
+    merged = session.all_settings()
+    rows = []
+    for name in sorted(merged):
+        setting = merged[name]
+        boot = GUC_DEFAULTS.get(name, setting)
+        rows.append(
+            {
+                "name": name,
+                "setting": setting,
+                "unit": None,
+                "category": "Client Connection Defaults",
+                "short_desc": "",
+                "context": "user",
+                "vartype": _guc_vartype(setting),
+                "source": "session" if name in overrides else "default",
+                "min_val": None,
+                "max_val": None,
+                "enumvals": None,
+                "boot_val": boot,
+                "reset_val": boot,
+                "pending_restart": False,
+            }
+        )
+    return rows
+
+
 def _role_row(oid: int, name: str, role: dict) -> dict:
     return {
         "oid": oid,
@@ -1752,6 +1801,27 @@ _register(
         ("with_check", "text"),
     ],
     _pg_policies,
+)
+_register(
+    "pg_catalog",
+    "pg_settings",
+    [
+        ("name", "text"),
+        ("setting", "text"),
+        ("unit", "text"),
+        ("category", "text"),
+        ("short_desc", "text"),
+        ("context", "text"),
+        ("vartype", "text"),
+        ("source", "text"),
+        ("min_val", "text"),
+        ("max_val", "text"),
+        ("enumvals", "text"),
+        ("boot_val", "text"),
+        ("reset_val", "text"),
+        ("pending_restart", "bool"),
+    ],
+    _pg_settings,
 )
 _register(
     "pg_catalog",

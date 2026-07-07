@@ -210,6 +210,7 @@ def _end_txn_state(session: Session) -> None:
     session.savepoints = []
     session.pending_notifies = []  # NOTIFYs in the block are flushed (commit) or dropped (rollback)
     session.reset_deferred()
+    session.restore_local_gucs()  # SET LOCAL reverts at end of transaction
     session.release_xact_advisory_locks()  # pg_advisory_xact_lock* release at txn end
     _close_non_hold_cursors(session)  # WITHOUT HOLD cursors close at end of txn
 
@@ -750,7 +751,14 @@ def describe_statement(
     statement (SELECT / SHOW), or None for everything else (→ NoData).
     """
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "SHOW":
-        return [ColumnDesc(_show_name(stmt), "text", typemap.PG_OID["text"])]
+        oid = typemap.PG_OID["text"]
+        if _show_name(stmt).upper() == "ALL":
+            return [
+                ColumnDesc("name", "text", oid),
+                ColumnDesc("setting", "text", oid),
+                ColumnDesc("description", "text", oid),
+            ]
+        return [ColumnDesc(_show_name(stmt), "text", oid)]
     if _own_with(stmt) is not None:
         # Resolving a CTE query's columns would require materializing the CTEs
         # (execution), which Describe must not do — defer to Execute's
@@ -2965,7 +2973,18 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
             value = value_node.this
         else:
             value = value_node.name or value_node.sql()
-        session.settings[name] = str(value)
+        # SET LOCAL applies only until the end of the current transaction. Outside
+        # a transaction block it has no lasting effect (Postgres warns and drops it).
+        is_local = isinstance(item, exp.SetItem) and str(item.args.get("kind") or "").upper() == (
+            "LOCAL"
+        )
+        if is_local:
+            if session.txn_handle is not None:
+                session.set_local(name, str(value))
+            else:
+                continue  # SET LOCAL outside a transaction — no lasting effect
+        else:
+            session.settings[name] = str(value)
         if name in REPORTABLE_GUCS:
             reported.append((name, str(value)))
     return SQLResult(command_tag="SET", parameter_status=reported)
@@ -3071,6 +3090,21 @@ def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
     if authz_cmd is not None:
         return authz_cmd
     if verb == "SHOW":
+        if name.upper() == "ALL":
+            # SHOW ALL — every GUC as (name, setting, description). psql renders
+            # this as a three-column table.
+            oid = typemap.PG_OID["text"]
+            rows = [(k, v, "") for k, v in sorted(session.all_settings().items())]
+            return SQLResult(
+                command_tag="SHOW",
+                columns=[
+                    ColumnDesc("name", "text", oid),
+                    ColumnDesc("setting", "text", oid),
+                    ColumnDesc("description", "text", oid),
+                ],
+                rows=rows,
+                rowcount=len(rows),
+            )
         value = session.get_setting(name)
         return SQLResult(
             command_tag="SHOW",

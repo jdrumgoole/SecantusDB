@@ -2612,3 +2612,36 @@ def test_advisory_locks_via_driver(real_server):
     cur.execute("SELECT count(*) FROM pg_catalog.pg_locks")
     assert cur.fetchall() == ([0],)
     conn.close()
+
+
+def test_show_all_and_pg_settings_via_driver(real_server):
+    # SHOW ALL returns (name, setting, description); pg_settings reflects a SET. (#136)
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("SET TimeZone = 'America/New_York'")
+    cur.execute("SHOW ALL")
+    assert [d[0] for d in cur.description] == ["name", "setting", "description"]
+    by_name = {r[0]: r[1] for r in cur.fetchall()}
+    assert by_name["TimeZone"] == "America/New_York"
+    assert by_name["client_encoding"] == "UTF8"
+    cur.execute(
+        "SELECT setting, vartype, source FROM pg_catalog.pg_settings WHERE name = 'TimeZone'"
+    )
+    assert cur.fetchall() == (["America/New_York", "string", "session"],)
+    conn.close()
+
+
+def test_set_local_reverts_at_commit_via_driver(real_server):
+    # SET LOCAL applies inside the transaction and reverts when it commits. (#136)
+    conn = connect(real_server)
+    conn.autocommit = False
+    cur = conn.cursor()
+    cur.execute("SET statement_timeout = '10s'")  # session value
+    conn.commit()
+    cur.execute("SET LOCAL statement_timeout = '99s'")  # opens a txn implicitly
+    cur.execute("SHOW statement_timeout")
+    assert cur.fetchall() == (["99s"],)
+    conn.commit()
+    cur.execute("SHOW statement_timeout")
+    assert cur.fetchall() == (["10s"],)  # reverted to the session value
+    conn.close()
