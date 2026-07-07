@@ -72,6 +72,8 @@ def required_privilege(stmt: exp.Expression) -> tuple[str, bool] | None:
         return (rbac.A_UPDATE, False)
     if isinstance(stmt, exp.Delete):
         return (rbac.A_REMOVE, False)
+    if isinstance(stmt, exp.TruncateTable):  # empties a table — a write.
+        return (rbac.A_REMOVE, False)
     if isinstance(stmt, exp.Merge):  # a write (readWrite grants it).
         return (rbac.A_UPDATE, False)
     if isinstance(stmt, exp.Create):

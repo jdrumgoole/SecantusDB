@@ -2532,3 +2532,20 @@ def test_select_for_update_via_driver(real_server):
     cur.execute("SELECT id FROM t ORDER BY id FOR SHARE OF t")
     assert cur.fetchall() == ([1], [2])
     conn.close()
+
+
+def test_truncate_via_driver(real_server):
+    # TRUNCATE empties a table and RESTART IDENTITY resets its serial, over the wire.
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id serial primary key, v int)")
+    cur.execute("INSERT INTO t (v) VALUES (1), (2), (3)")
+    cur.execute("SELECT count(*) FROM t")
+    assert cur.fetchall() == ([3],)
+    cur.execute("TRUNCATE TABLE t RESTART IDENTITY")
+    cur.execute("SELECT count(*) FROM t")
+    assert cur.fetchall() == ([0],)
+    cur.execute("INSERT INTO t (v) VALUES (9)")
+    cur.execute("SELECT id FROM t")
+    assert cur.fetchall() == ([1],)
+    conn.close()
