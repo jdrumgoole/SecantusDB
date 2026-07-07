@@ -5273,7 +5273,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "int4"
         if fname in ("jsonb_path_exists", "jsonb_path_match"):
             return "bool"
-        if fname == "has_table_privilege":
+        if fname in ("has_table_privilege", "has_column_privilege"):
             return "bool"
         if fname == "isempty":
             return "bool"

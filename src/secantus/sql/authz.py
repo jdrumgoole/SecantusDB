@@ -143,17 +143,61 @@ def _target_table(stmt: exp.Expression) -> str | None:
     return None
 
 
+def _touched_columns(stmt: exp.Expression, table: str, catalog: Any, db: str) -> set[str] | None:
+    """The columns ``stmt`` reads / writes on its single target table — for
+    column-grant enforcement. None means "can't tell" (a ``count(*)`` with no
+    column refs, an unresolvable shape) so the caller falls back to table-level.
+    A ``SELECT *`` / ``INSERT`` with no column list expands to the table's columns."""
+
+    def _all_columns() -> set[str] | None:
+        tdef = catalog.get(db, table) if catalog is not None else None
+        return {c.name for c in tdef.columns} if tdef is not None else None
+
+    if isinstance(stmt, exp.Insert):
+        target = stmt.this
+        if isinstance(target, exp.Schema) and target.expressions:  # INSERT INTO t (cols)
+            return {c.name for c in target.expressions if isinstance(c, exp.Column)} or {
+                str(getattr(c, "name", c)) for c in target.expressions
+            }
+        return _all_columns()  # no column list — every column
+    if isinstance(stmt, exp.Update):
+        cols = set()
+        for setter in stmt.args.get("expressions") or []:
+            tgt = setter.this if isinstance(setter, exp.EQ) else None
+            if isinstance(tgt, exp.Column):
+                cols.add(tgt.name)
+        return cols or None
+    if isinstance(stmt, exp.Select):
+        if any(isinstance(e, exp.Star) for e in stmt.expressions):
+            return _all_columns()
+        cols = {c.name for c in stmt.find_all(exp.Column) if not c.table or c.table == table}
+        return cols or None
+    return None
+
+
 def _table_grant_allows(stmt: exp.Expression, action: str, session: Session, catalog: Any) -> bool:
-    """Whether a recorded table-level grant covers ``action`` on ``stmt``'s target
-    table for this session (the additive GRANT/REVOKE enforcement path)."""
+    """Whether recorded grants cover ``action`` on ``stmt``'s target table for this
+    session — a whole-table grant, or (finer) a column grant on *every* column the
+    statement touches (the additive GRANT/REVOKE enforcement path, #127 + #131)."""
     privilege = _ACTION_TO_PRIVILEGE.get(action)
     if privilege is None or catalog is None:
         return False
     table = _target_table(stmt)
     if table is None:
         return False
-    return catalog.has_table_privilege(
-        session.database, table, _grantee_identities(session), privilege
+    grantees = _grantee_identities(session)
+    if catalog.has_table_privilege(session.database, table, grantees, privilege):
+        return True
+    # Column-level: allow only when every touched column is granted (DELETE has no
+    # column granularity, so it never reaches here with a column grant).
+    if not hasattr(catalog, "has_column_privilege"):
+        return False
+    columns = _touched_columns(stmt, table, catalog, session.database)
+    if not columns:
+        return False
+    return all(
+        catalog.has_column_privilege(session.database, table, grantees, col, privilege)
+        for col in columns
     )
 
 

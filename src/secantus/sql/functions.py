@@ -158,6 +158,7 @@ _SCALAR_EVAL_ANON = frozenset(
         "uuid_generate_v4",
         "uuid_generate_v1",
         "has_table_privilege",
+        "has_column_privilege",
         "pg_get_functiondef",
         "pg_get_function_arguments",
         "pg_get_function_result",

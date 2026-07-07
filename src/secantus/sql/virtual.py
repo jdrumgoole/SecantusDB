@@ -227,6 +227,30 @@ def _info_schemata(db: str, session: Session, storage: Any, catalog: Catalog) ->
     ]
 
 
+def _info_column_grants(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``information_schema.column_privileges`` — one row per (grantee, table,
+    column, privilege) recorded by a column-scoped GRANT (#131)."""
+    lister = getattr(catalog, "list_column_grants", None)
+    if lister is None:
+        return []
+    rows: list[dict] = []
+    for doc in lister(db):
+        for priv in doc.get("privileges", ()):
+            rows.append(
+                {
+                    "grantor": session.user,
+                    "grantee": doc["grantee"],
+                    "table_catalog": db,
+                    "table_schema": "public",
+                    "table_name": doc["table"],
+                    "column_name": doc["column"],
+                    "privilege_type": priv,
+                    "is_grantable": "NO",
+                }
+            )
+    return rows
+
+
 def _info_table_grants(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     """``information_schema.role_table_grants`` / ``.table_privileges`` — one row per
     ``(grantee, table, privilege)`` recorded by GRANT. The grantor isn't tracked
@@ -1416,6 +1440,21 @@ _TABLE_GRANT_COLUMNS: ColumnsSpec = [
 ]
 _register("information_schema", "role_table_grants", _TABLE_GRANT_COLUMNS, _info_table_grants)
 _register("information_schema", "table_privileges", _TABLE_GRANT_COLUMNS, _info_table_grants)
+_register(
+    "information_schema",
+    "column_privileges",
+    [
+        ("grantor", "text"),
+        ("grantee", "text"),
+        ("table_catalog", "text"),
+        ("table_schema", "text"),
+        ("table_name", "text"),
+        ("column_name", "text"),
+        ("privilege_type", "text"),
+        ("is_grantable", "text"),
+    ],
+    _info_column_grants,
+)
 _register(
     "information_schema",
     "table_constraints",

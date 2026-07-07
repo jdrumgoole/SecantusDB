@@ -2506,6 +2506,22 @@ only `SELECT` / `INSERT` / `UPDATE` / `DELETE` are enforced (the other operation
 don't exist in SecantusDB). Role-membership grants and grants on schemas /
 databases / sequences remain accepted no-ops.
 
+Grants can also be **column-scoped** for a finer grain than the whole table:
+
+```sql
+GRANT SELECT (id, title) ON articles TO editor;  -- editor reads only these columns
+GRANT UPDATE (title) ON articles TO editor;      -- and updates only this one
+```
+
+A column grant authorizes exactly the named columns. A statement is allowed on
+the column-grant path only when **every** column it touches is granted — a
+`SELECT` of an ungranted column (including a `SELECT *`, or a column referenced
+only in the `WHERE`) or an `UPDATE`/`INSERT` of an ungranted column is denied with
+`42501`. A whole-table grant (or a broader Mongo role) still covers every column,
+so column grants only *add* access — they never shrink it. Column grants surface
+through `information_schema.column_privileges` and
+`has_column_privilege([user,] table, column, privilege)`.
+
 ### Switching identity (`SET ROLE` / `SET SESSION AUTHORIZATION`)
 
 A session can change its **current role** with `SET ROLE`, leaving the **session
