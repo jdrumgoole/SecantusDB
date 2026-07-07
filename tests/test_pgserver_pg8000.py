@@ -2478,3 +2478,23 @@ def test_row_level_security_reflection_via_driver(real_server):
     cur.execute("SELECT count(*) FROM pg_catalog.pg_policies")
     assert cur.fetchall() == ([0],)
     conn.close()
+
+
+def test_udf_reflection_via_driver(real_server):
+    # CREATE FUNCTION surfaces through pg_proc + pg_get_functiondef over the wire.
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE FUNCTION addup(a int, b int) RETURNS int AS $$ SELECT a + b $$ LANGUAGE sql"
+    )
+    cur.execute(
+        "SELECT proname, pg_get_function_arguments(oid), pg_get_function_result(oid) "
+        "FROM pg_catalog.pg_proc WHERE proname = 'addup'"
+    )
+    assert cur.fetchall() == (["addup", "a integer, b integer", "integer"],)
+    cur.execute(
+        "SELECT routine_name, data_type FROM information_schema.routines "
+        "WHERE routine_name = 'addup'"
+    )
+    assert cur.fetchall() == (["addup", "integer"],)
+    conn.close()
