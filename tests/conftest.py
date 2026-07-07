@@ -28,6 +28,23 @@ import pytest
 # regardless of pytest's rootdir/import-mode.
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Fast test-mode storage (I2a): default every on-disk ``Storage`` /
+# ``SecantusDBServer`` that doesn't ask otherwise to ``durable=False`` — journal
+# off, no close-checkpoint. Cuts per-instance open+close ~5x and removes the
+# fsync that serialises across xdist workers (the ~177 s serial floor measured
+# in tasks/test-performance-plan.md). Storage still creates every table on disk,
+# so schema / B-tree / within-session behaviour is exercised for real; only
+# crash- / reopen-durability is dropped — which is why persistence / reopen /
+# PITR / backup fixtures pass ``durable=True`` explicitly.
+#
+# ``SECANTUS_FORCE_DURABLE=1`` is honoured *inside* ``Storage`` and wins over
+# this default, so ``SECANTUS_FORCE_DURABLE=1 <pytest>`` (and the CI durable
+# lane) runs the WHOLE suite against real journal + checkpoint durability. Only
+# set the fast default when force-durable is NOT requested, so an explicit
+# durable run reads cleanly.
+if os.environ.get("SECANTUS_FORCE_DURABLE") != "1":
+    os.environ.setdefault("SECANTUS_TEST_FAST_STORAGE", "1")
+
 if "wiredtiger" not in sys.modules and importlib.util.find_spec("wiredtiger") is None:
     _stub = types.ModuleType("wiredtiger")
     # A real ModuleSpec (rather than None) so later importlib.find_spec calls

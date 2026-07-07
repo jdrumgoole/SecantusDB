@@ -822,3 +822,42 @@ def test_close_logs_teardown_errors_instead_of_swallowing(tmp_path, caplog) -> N
     assert any("simulated checkpoint failure" in (r.exc_text or "") for r in matching) or any(
         "oplog meta" in r.getMessage() for r in matching
     )
+
+
+def test_durable_resolution(tmp_path, monkeypatch) -> None:
+    """`durable` precedence: FORCE_DURABLE > explicit arg > FAST-default > durable."""
+    monkeypatch.delenv("SECANTUS_FORCE_DURABLE", raising=False)
+    monkeypatch.setenv("SECANTUS_TEST_FAST_STORAGE", "1")
+    # Explicit args win over the fast-test default.
+    s = Storage(str(tmp_path / "a"), durable=True)
+    assert s._durable is True
+    s.close()
+    s = Storage(str(tmp_path / "b"), durable=False)
+    assert s._durable is False
+    s.close()
+    # Unset arg + FAST env -> fast (non-durable).
+    s = Storage(str(tmp_path / "c"))
+    assert s._durable is False
+    s.close()
+    # No env at all -> the shipped/production default is durable.
+    monkeypatch.delenv("SECANTUS_TEST_FAST_STORAGE", raising=False)
+    s = Storage(str(tmp_path / "d"))
+    assert s._durable is True
+    s.close()
+    # FORCE_DURABLE wins over everything, even an explicit durable=False.
+    monkeypatch.setenv("SECANTUS_FORCE_DURABLE", "1")
+    monkeypatch.setenv("SECANTUS_TEST_FAST_STORAGE", "1")
+    s = Storage(str(tmp_path / "e"), durable=False)
+    assert s._durable is True
+    s.close()
+
+
+def test_fast_storage_round_trips(tmp_path) -> None:
+    """durable=False (journal on, close-checkpoint skipped) still creates tables
+    on disk and round-trips a document within the session."""
+    s = Storage(str(tmp_path / "fast"), durable=False)
+    try:
+        s.insert("db", "c", [{"_id": 1, "x": "hi"}])
+        assert s.find_matching("db", "c", {"_id": 1}) == [{"_id": 1, "x": "hi"}]
+    finally:
+        s.close()

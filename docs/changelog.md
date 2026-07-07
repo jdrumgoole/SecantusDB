@@ -19,6 +19,45 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Storage close-path race fixed; opt-in fast test storage
+
+The WiredTiger-backed storage close path carried a latent use-after-free race.
+A connection thread opening or resetting its per-thread session
+(`_session` / `_reset_thread_session`) and the cross-thread oplog readers
+touched the WiredTiger connection *outside* the storage lock, so under rapid
+concurrent teardown they could race `close()`'s own session/connection teardown
+— a double-close or an open-on-a-closed-connection that segfaults. Every one of
+those paths is now fenced against the closed flag under the storage lock. The
+shipped server always checkpoints on close, whose timing masked the race in
+practice, and the pure-Rust server already drains its connection threads to
+zero before closing the connection — so neither production server was exposed —
+but the race was real and is now closed.
+
+Separately, `Storage` and `SecantusDBServer` gained a `durable` parameter so the
+test suite can run against a faster non-durable storage mode (journal on,
+close-checkpoint skipped — every table is still created on disk, so schema,
+persistence and within-session behaviour stay real). It is **opt-in and defaults
+to durable**, so the shipped server is unchanged. `SECANTUS_FORCE_DURABLE=1`
+forces full journal + checkpoint durability everywhere and overrides the fast
+default; a CI lane runs the whole suite that way on every push, so the
+checkpoint-durability path (schema, close-and-reopen, PITR / backup) stays
+continuously exercised even though the default local suite now runs fast.
+
+#### Added
+
+- `Storage` / `SecantusDBServer`: a `durable` parameter (defaults to durable),
+  with `SECANTUS_FORCE_DURABLE` (force durable, wins over everything) and the
+  conftest-set `SECANTUS_TEST_FAST_STORAGE` (fast default for the test suite)
+  environment overrides.
+- CI: a `SECANTUS_FORCE_DURABLE=1` full-suite lane so durability paths run every push.
+
+#### Fixed
+
+- Storage close-path use-after-free / double-close race: `_session`,
+  `_reset_thread_session`, and the oplog readers (`read_oplog`, `read_preimage`,
+  `oplog_floor_seq`, `find_seq_for_ts`, scan helpers) now open/close WiredTiger
+  sessions only under the storage lock and only while the store is open.
+
 ### Date-operator timezone errors now report mongod's exact codes (Python server)
 
 A three-way conformance probe (real `mongod` 6.0 vs the Rust server vs the Python
