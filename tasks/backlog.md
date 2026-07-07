@@ -2714,6 +2714,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   and it isn't wired into the extended protocol's Portal machinery (it's a SQL-level cursor, like
   psycopg's named server-side cursors). DDL is transactional via BEGIN/COMMIT/ROLLBACK. Cross-connection
   isolation is the WT engine's job (the test double only models atomicity).
+- [ ] **Row-locking clauses landed** (#132, b172): `SELECT … FOR UPDATE | FOR SHARE | FOR NO KEY UPDATE
+  | FOR KEY SHARE` with `NOWAIT` / `SKIP LOCKED` / `OF <table>` (sqlglot `stmt.args["locks"]` =
+  `[exp.Lock]`) are **accepted as single-node no-ops** that return the rows — so SQLAlchemy's
+  `with_for_update()` works. Honored across every SELECT shape (plain / join / group / distinct / CTE /
+  limit) since the planner never consulted `locks`. `engine._validate_locks` (called at the top of
+  `_run_select`) adds one real check: an `OF <table>` target that isn't a FROM/JOIN relation errors
+  `42P01` (scope gathered from `from_`/`joins` only, so the lock's own OF-table doesn't self-satisfy; a
+  table alias masks its base name, matching Postgres). Tests: `tests/test_sql_row_locking.py` +
+  `test_pgserver_pg8000.py::test_select_for_update_via_driver`. **Limitations:** no actual locking (no
+  concurrency to lock against within a connection — the storage `RLock` serializes); `FOR UPDATE` on an
+  aggregate / `DISTINCT` / set-op / group is accepted rather than rejected as Postgres would; OF-target
+  validation is only applied on the direct single-table/JOIN `_run_select` path (set-op/pipeline locks
+  aren't re-validated). Not ported to the Rust server.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by

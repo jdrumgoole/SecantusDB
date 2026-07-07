@@ -2518,3 +2518,17 @@ def test_column_privileges_reflection_via_driver(real_server):
     cur.execute("SELECT has_column_privilege('alice', 't', 'secret', 'SELECT')")
     assert cur.fetchall() == ([False],)
     conn.close()
+
+
+def test_select_for_update_via_driver(real_server):
+    # SELECT … FOR UPDATE / FOR SHARE round-trip over the wire (SQLAlchemy's
+    # with_for_update emits these); single-node no-op that returns the rows.
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, a int)")
+    cur.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+    cur.execute("SELECT id FROM t WHERE a = 20 FOR UPDATE")
+    assert cur.fetchall() == ([2],)
+    cur.execute("SELECT id FROM t ORDER BY id FOR SHARE OF t")
+    assert cur.fetchall() == ([1], [2])
+    conn.close()
