@@ -2727,6 +2727,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   aggregate / `DISTINCT` / set-op / group is accepted rather than rejected as Postgres would; OF-target
   validation is only applied on the direct single-table/JOIN `_run_select` path (set-op/pipeline locks
   aren't re-validated). Not ported to the Rust server.
+- [ ] **TRUNCATE TABLE landed** (#133, b173): `TRUNCATE [TABLE] t [, …] [RESTART | CONTINUE IDENTITY]
+  [CASCADE | RESTRICT] [IF EXISTS]` (sqlglot `exp.TruncateTable`: `expressions` = tables, `identity` =
+  RESTART/CONTINUE, `option` = CASCADE/RESTRICT) → `engine._run_truncate`. Empties each table via
+  `storage.delete_matching(db, coll, {})` (index entries maintained). `RESTART IDENTITY` resets each
+  table's owned `SERIAL`/`IDENTITY` sequences (`col.sequence` → `catalog.alter_sequence(…, {"restart":
+  None})`); `CONTINUE` (default) leaves them. FK handling reuses `executor._referencing_fks`: `CASCADE`
+  adds the transitive closure of referencing tables to the truncate set; `RESTRICT` (default) errors
+  `0A000` if a table is referenced from outside the set (allowed when the referencer is truncated in the
+  same statement). `IF EXISTS` skips missing tables; otherwise unknown → `42P01`. Gated as `A_REMOVE` in
+  `authz.required_privilege` (a `read` role is denied `42501`, `readWrite` allowed). Tests:
+  `tests/test_sql_truncate.py` + `test_pgserver_pg8000.py::test_truncate_via_driver`. **Limitations:**
+  no `ONLY` / partition semantics; `CASCADE` empties referencing tables but doesn't reset *their*
+  identities unless they're also named; runs within the session transaction (rolls back with it) but
+  isn't the O(1) file-truncate a real engine does — it's a bulk `delete_matching`. Not ported to the
+  Rust server.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by

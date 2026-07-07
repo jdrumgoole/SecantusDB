@@ -2041,6 +2041,26 @@ INSERT INTO items (id, price, qty) VALUES (1, 10, 3)
 DELETE FROM t WHERE n > 100 RETURNING *;
 ```
 
+### TRUNCATE
+
+`TRUNCATE [TABLE] t [, …]` empties one or more tables in one statement — faster
+than `DELETE` and the usual way test suites reset state between cases:
+
+```sql
+TRUNCATE orders;
+TRUNCATE TABLE orders, order_items;
+TRUNCATE orders RESTART IDENTITY;        -- also reset the serial / IDENTITY sequence
+TRUNCATE orders CASCADE;                 -- also empty tables that reference orders
+```
+
+`RESTART IDENTITY` resets each truncated table's owned `SERIAL` / `IDENTITY`
+sequences (so the next insert starts over); `CONTINUE IDENTITY` (the default)
+leaves them. By default (`RESTRICT`), truncating a table that a **foreign key
+from another table** points at is an error (SQLSTATE `0A000`) unless that
+referencing table is truncated in the same statement; `CASCADE` instead empties
+the referencing tables too (transitively). `TRUNCATE IF EXISTS` skips a missing
+table; an unknown table otherwise errors `42P01`.
+
 ### INSERT … ON CONFLICT (upsert)
 
 `INSERT` accepts an `ON CONFLICT` clause to make a colliding row an upsert

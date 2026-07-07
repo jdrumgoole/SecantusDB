@@ -1025,6 +1025,9 @@ def _run_statement(
     if isinstance(stmt, exp.Alter):
         return executor.execute_alter_table(planner.plan_alter_table(stmt), catalog, storage, db)
 
+    if isinstance(stmt, exp.TruncateTable):
+        return _run_truncate(stmt, storage, db, catalog)
+
     if isinstance(stmt, exp.Comment):
         return executor.execute_comment(stmt, catalog, storage, db)
 
@@ -1784,6 +1787,52 @@ def _drop_policy_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLRes
     if not catalog.drop_policy(db, table, name) and "IF EXISTS" not in text.upper():
         raise errors.SQLError("42704", f'policy "{name}" for table "{table}" does not exist')
     return SQLResult(command_tag="DROP POLICY")
+
+
+def _run_truncate(stmt: exp.TruncateTable, storage: Any, db: str, catalog: Catalog) -> SQLResult:
+    """``TRUNCATE [TABLE] t [, …] [RESTART | CONTINUE IDENTITY] [CASCADE | RESTRICT]``
+    (#133) — empty each table fast. ``RESTART IDENTITY`` resets owned sequences;
+    ``CASCADE`` also truncates referencing tables (transitive), while the default
+    ``RESTRICT`` errors if a table is referenced from outside the truncate set."""
+    exists = bool(stmt.args.get("exists"))  # TRUNCATE … IF EXISTS
+    named: list[str] = []
+    for t in stmt.args.get("expressions") or []:
+        name = t.name
+        if catalog.get(db, name) is None and reflect.reflect(storage, db, name) is None:
+            if exists:
+                continue
+            raise errors.undefined_table(name)
+        named.append(name)
+
+    restart = str(stmt.args.get("identity") or "").upper() == "RESTART"
+    cascade = str(stmt.args.get("option") or "").upper() == "CASCADE"
+    to_truncate: set[str] = set(named)
+    if cascade:
+        queue = list(named)
+        while queue:
+            parent = queue.pop()
+            for child, _fk in executor._referencing_fks(catalog, db, parent):
+                if child.name not in to_truncate:
+                    to_truncate.add(child.name)
+                    queue.append(child.name)
+    else:  # RESTRICT (default): a reference from outside the set is an error.
+        for parent in named:
+            for child, _fk in executor._referencing_fks(catalog, db, parent):
+                if child.name not in to_truncate:
+                    raise errors.SQLError(
+                        "0A000",
+                        f"cannot truncate a table referenced in a foreign key constraint\n"
+                        f'DETAIL: Table "{child.name}" references "{parent}".',
+                    )
+
+    for name in to_truncate:
+        tdef = catalog.get(db, name) or reflect.reflect(storage, db, name)
+        storage.delete_matching(db, tdef.collection, {})
+        if restart:
+            for col in tdef.columns:
+                if col.sequence and catalog.sequence_exists(db, col.sequence):
+                    catalog.alter_sequence(db, col.sequence, {"restart": None})
+    return SQLResult(command_tag="TRUNCATE TABLE")
 
 
 def _run_role_command(verb: str, stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
