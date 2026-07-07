@@ -731,9 +731,7 @@ def test_aggregate_group_topn_accumulators(coll) -> None:
             ]
         )
     )
-    assert out == [
-        {"_id": "a", "top2": ["x2", "x1"], "bot2": ["x1", "x2"], "hi": "x2", "lo": "x3"}
-    ]
+    assert out == [{"_id": "a", "top2": ["x2", "x1"], "bot2": ["x1", "x2"], "hi": "x2", "lo": "x3"}]
 
 
 def test_aggregate_group_nelem_accumulators(coll) -> None:
