@@ -19,6 +19,25 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$top` / `$bottom` / `$topN` / `$bottomN` accumulators (both servers)
+
+Both servers now support MongoDB 5.2's sort-key `$group` (and `$setWindowFields`)
+accumulators: `{$topN: {n, sortBy, output}}` sorts the group's documents by
+`sortBy` and returns the top `n` documents' `output`, `$bottomN` the bottom `n`;
+`$top` / `$bottom` are the single-value forms and take no `n`. The `sortBy` is a
+multi-key spec with per-field directions, matching `$sort`'s cross-type BSON order.
+Matched to real `mongod` 6.0 via a three-way probe (mongod vs Rust vs Python
+server) — values, multi-key sort, array `output`, integral-double `n`, and the
+validation error codes (`5788002`-`5788005`, `5787908`, `10065`) all confirmed.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$top` / `$bottom` / `$topN` /
+  `$bottomN` accumulators — collect `(sortBy-values, output)` per doc, stable-sort
+  by the `sortBy` directions at finalize (via the same `_SortKey` / `order::cmp`
+  contract as `$sort`, deferring an unsortable sort key to the Python oracle), and
+  take the top/bottom output(s). Usable in `$group` and `$setWindowFields`.
+
 ### Server stop names the connection thread when a shutdown drain wedges
 
 `SecantusDBServer.stop()` already drains its per-connection handler threads to
@@ -36,6 +55,24 @@ shutdown wedge names its own culprit instead of surfacing as an opaque number.
 - `server.py`: per-connection handler threads are named `secantus-conn-<addr>`;
   the stop-drain timeout warning now includes each stuck thread's stack
   (`_format_stuck_conn_stacks`).
+### `$top` / `$bottom` / `$topN` / `$bottomN` accumulators (both servers)
+
+Both servers now support MongoDB 5.2's sort-key `$group` (and `$setWindowFields`)
+accumulators: `{$topN: {n, sortBy, output}}` sorts the group's documents by
+`sortBy` and returns the top `n` documents' `output`, `$bottomN` the bottom `n`;
+`$top` / `$bottom` are the single-value forms and take no `n`. The `sortBy` is a
+multi-key spec with per-field directions, matching `$sort`'s cross-type BSON order.
+Matched to real `mongod` 6.0 via a three-way probe (mongod vs Rust vs Python
+server) — values, multi-key sort, array `output`, integral-double `n`, and the
+validation error codes (`5788002`-`5788005`, `5787908`, `10065`) all confirmed.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$top` / `$bottom` / `$topN` /
+  `$bottomN` accumulators — collect `(sortBy-values, output)` per doc, stable-sort
+  by the `sortBy` directions at finalize (via the same `_SortKey` / `order::cmp`
+  contract as `$sort`, deferring an unsortable sort key to the Python oracle), and
+  take the top/bottom output(s). Usable in `$group` and `$setWindowFields`.
 
 ### `$firstN` / `$lastN` / `$maxN` / `$minN` as `$group` accumulators (both servers)
 

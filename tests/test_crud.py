@@ -706,6 +706,36 @@ def test_aggregate_bitwise_operators(coll) -> None:
     assert isinstance(out[0]["long_"], Int64)
 
 
+def test_aggregate_group_topn_accumulators(coll) -> None:
+    # Sort by score: x2(9) > x1(3) > x3(1). $topN/$top take the highest, $bottomN
+    # the lowest end of the sort order; $top/$bottom are single values.
+    coll.insert_many(
+        [
+            {"t": "a", "s": "x1", "score": 3},
+            {"t": "a", "s": "x2", "score": 9},
+            {"t": "a", "s": "x3", "score": 1},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$t",
+                        "top2": {"$topN": {"n": 2, "sortBy": {"score": -1}, "output": "$s"}},
+                        "bot2": {"$bottomN": {"n": 2, "sortBy": {"score": 1}, "output": "$s"}},
+                        "hi": {"$top": {"sortBy": {"score": -1}, "output": "$s"}},
+                        "lo": {"$bottom": {"sortBy": {"score": -1}, "output": "$s"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [
+        {"_id": "a", "top2": ["x2", "x1"], "bot2": ["x1", "x2"], "hi": "x2", "lo": "x3"}
+    ]
+
+
 def test_aggregate_group_nelem_accumulators(coll) -> None:
     # Group values in doc order: 3, 1, null, 5, 2. $firstN/$lastN keep the null;
     # $maxN/$minN drop it (matched to mongod).

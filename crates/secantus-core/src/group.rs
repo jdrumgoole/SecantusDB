@@ -157,6 +157,15 @@ pub(crate) enum Acc {
         n: Option<usize>,
         vals: Vec<Bson>,
     },
+    // `$top` / `$bottom` / `$topN` / `$bottomN`: collect `(sortBy-values, output)`
+    // per doc; at finalize stable-sort by the `sortBy` directions and take the
+    // top/bottom output(s). `n` and the sort directions are parsed on first apply.
+    TopN {
+        kind: TopNKind,
+        n: Option<usize>,
+        dirs: Vec<bool>, // true == descending
+        items: Vec<(Vec<Bson>, Bson)>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -165,6 +174,14 @@ pub(crate) enum NElemKind {
     Last,
     Max,
     Min,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TopNKind {
+    Top,
+    Bottom,
+    TopN,
+    BottomN,
 }
 
 struct Compiled<'a> {
@@ -211,6 +228,30 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
             kind: NElemKind::Min,
             n: None,
             vals: Vec::new(),
+        },
+        "$top" => Acc::TopN {
+            kind: TopNKind::Top,
+            n: None,
+            dirs: Vec::new(),
+            items: Vec::new(),
+        },
+        "$bottom" => Acc::TopN {
+            kind: TopNKind::Bottom,
+            n: None,
+            dirs: Vec::new(),
+            items: Vec::new(),
+        },
+        "$topN" => Acc::TopN {
+            kind: TopNKind::TopN,
+            n: None,
+            dirs: Vec::new(),
+            items: Vec::new(),
+        },
+        "$bottomN" => Acc::TopN {
+            kind: TopNKind::BottomN,
+            n: None,
+            dirs: Vec::new(),
+            items: Vec::new(),
         },
         _ => return Err(()), // unsupported accumulator -> Python (raises or handles)
     })
@@ -304,8 +345,105 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             *n = Some(nn as usize);
             vals.push(eval(d.get("input").ok_or(())?, doc, vars)?);
         }
+        Acc::TopN {
+            kind,
+            n,
+            dirs,
+            items,
+        } => {
+            // `arg` is `{n?, sortBy, output}`. Any invalid shape defers to Python,
+            // which raises the exact mongod code (5788002-5, 10065, 5787908).
+            let Bson::Document(d) = arg else {
+                return Err(());
+            };
+            let has_n = matches!(kind, TopNKind::TopN | TopNKind::BottomN);
+            if has_n != d.contains_key("n") {
+                return Err(()); // topN/bottomN need n; top/bottom reject it
+            }
+            let Some(Bson::Document(sortby)) = d.get("sortBy") else {
+                return Err(()); // missing / non-object sortBy
+            };
+            if !d.contains_key("output") {
+                return Err(());
+            }
+            let nn = if has_n {
+                match eval(d.get("n").unwrap(), doc, vars)? {
+                    Bson::Int32(x) => x as i64,
+                    Bson::Int64(x) => x,
+                    Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => x as i64,
+                    _ => return Err(()),
+                }
+            } else {
+                1
+            };
+            if nn <= 0 {
+                return Err(());
+            }
+            *n = Some(nn as usize);
+            if dirs.is_empty() {
+                *dirs = sortby
+                    .values()
+                    .map(|v| as_int_like(v) == Some(-1))
+                    .collect();
+            }
+            let sort_vals: Vec<Bson> = sortby
+                .keys()
+                .map(|f| {
+                    crate::paths::get_path(doc, f)
+                        .cloned()
+                        .unwrap_or(Bson::Null)
+                })
+                .collect();
+            let output = eval(d.get("output").unwrap(), doc, vars)?;
+            items.push((sort_vals, output));
+        }
     }
     Ok(())
+}
+
+/// Stable-sort the `(sort_values, output)` items by the `sortBy` directions and
+/// return the top/bottom output(s). `$top`/`$bottom` return a single value;
+/// `$topN`/`$bottomN` return an array. A sort value outside the sortable subset
+/// defers to Python (its `_SortKey` handles the wider set). Mirrors the pure
+/// `_topn_finalize`.
+fn topn_result(
+    kind: TopNKind,
+    n: usize,
+    dirs: &[bool],
+    mut items: Vec<(Vec<Bson>, Bson)>,
+) -> R<Bson> {
+    for (sv, _) in &items {
+        if !sv.iter().all(crate::order::is_sortable) {
+            return Err(());
+        }
+    }
+    items.sort_by(|a, b| {
+        for (i, desc) in dirs.iter().enumerate() {
+            let (av, bv) = (a.0.get(i), b.0.get(i));
+            let ord = match (av, bv) {
+                (Some(x), Some(y)) => crate::order::cmp(x, y),
+                _ => Ordering::Equal,
+            };
+            let ord = if *desc { ord.reverse() } else { ord };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+    let outputs: Vec<Bson> = items.into_iter().map(|(_, o)| o).collect();
+    Ok(match kind {
+        TopNKind::Top => outputs.into_iter().next().unwrap_or(Bson::Null),
+        TopNKind::Bottom => outputs.into_iter().last().unwrap_or(Bson::Null),
+        TopNKind::TopN => {
+            let k = n.min(outputs.len());
+            Bson::Array(outputs[..k].to_vec())
+        }
+        TopNKind::BottomN => {
+            let k = n.min(outputs.len());
+            Bson::Array(outputs[outputs.len() - k..].to_vec())
+        }
+    })
 }
 
 /// Finalize an N-element accumulator to its result list. `$firstN`/`$lastN` keep
@@ -451,6 +589,17 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                     Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
                 );
             }
+            Acc::TopN {
+                kind,
+                n,
+                dirs,
+                items,
+            } => {
+                out.insert(
+                    field.to_string(),
+                    topn_result(kind, n.unwrap_or(1), &dirs, items)?,
+                );
+            }
         }
     }
     Ok(out)
@@ -489,6 +638,12 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
         // A window writes a value into every row: empty / degenerate -> null.
         Acc::StdDev { values, pop } => std_dev(&values, pop).map_or(Bson::Null, Bson::Double),
         Acc::NElem { kind, n, vals } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
+        Acc::TopN {
+            kind,
+            n,
+            dirs,
+            items,
+        } => topn_result(kind, n.unwrap_or(1), &dirs, items)?,
     })
 }
 
@@ -843,6 +998,45 @@ mod tests {
                 Bson::Int32(2)
             ]))
         );
+    }
+
+    #[test]
+    fn topn_bottomn_accumulators() {
+        // docs: (s, score) — sort by score desc: x2(9), x1(3), x3(1).
+        let docs = vec![
+            doc! {"s": "x1", "score": 3i32},
+            doc! {"s": "x2", "score": 9i32},
+            doc! {"s": "x3", "score": 1i32},
+        ];
+        let out = g(
+            bson::bson!({
+                "_id": Bson::Null,
+                "tn": {"$topN": {"n": 2, "sortBy": {"score": -1}, "output": "$s"}},
+                "bn": {"$bottomN": {"n": 2, "sortBy": {"score": 1}, "output": "$s"}},
+                "t": {"$top": {"sortBy": {"score": -1}, "output": "$s"}},
+                "b": {"$bottom": {"sortBy": {"score": -1}, "output": "$s"}},
+            }),
+            docs,
+        );
+        let s = |v: &str| Bson::String(v.into());
+        // topN score desc: top 2 = x2, x1.
+        assert_eq!(out[0].get("tn"), Some(&Bson::Array(vec![s("x2"), s("x1")])));
+        // bottomN score asc [x3,x1,x2] -> last 2 = x1, x2.
+        assert_eq!(out[0].get("bn"), Some(&Bson::Array(vec![s("x1"), s("x2")])));
+        // $top / $bottom are single values.
+        assert_eq!(out[0].get("t"), Some(&s("x2")));
+        assert_eq!(out[0].get("b"), Some(&s("x3")));
+        // Validation: $top with n, missing sortBy/output, n<=0 -> defer (Python raises).
+        let d = vec![doc! {"s": "a", "score": 1i32}];
+        for bad in [
+            bson::bson!({"$top": {"n": 2, "sortBy": {"score": -1}, "output": "$s"}}),
+            bson::bson!({"$topN": {"n": 2, "output": "$s"}}),
+            bson::bson!({"$topN": {"n": 2, "sortBy": {"score": -1}}}),
+            bson::bson!({"$topN": {"n": 0, "sortBy": {"score": -1}, "output": "$s"}}),
+        ] {
+            let spec = bson::bson!({"_id": Bson::Null, "r": bad});
+            assert!(group_stage(&spec, &d, &Document::new()).is_err());
+        }
     }
 
     #[test]
