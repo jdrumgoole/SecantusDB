@@ -304,9 +304,19 @@ class ExtendedSession:
         if portal.prepared.stmt is None:
             return pgwire.empty_query_response()
         if not portal.executed:
-            portal.result = engine.run_statement(
-                self.storage, self.session.database, self._bound(portal), self.session, self.catalog
-            )
+            bound = self._bound(portal)
+            # pg_stat_activity (#137): mark this backend active with its query for
+            # the duration of execution; it stays as the last query when idle.
+            sess = self.session
+            sess.state = "active"
+            sess.current_query = bound.sql(dialect="postgres") if bound is not None else ""
+            sess.query_start = _dt.datetime.now(_dt.timezone.utc)
+            try:
+                portal.result = engine.run_statement(
+                    self.storage, self.session.database, bound, self.session, self.catalog
+                )
+            finally:
+                sess.state = "idle"
             portal.executed = True
             portal.offset = 0
         res = portal.result

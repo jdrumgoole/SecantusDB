@@ -16,6 +16,8 @@ dual-protocol view.
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
+import itertools
 import logging
 import os
 import secrets
@@ -38,7 +40,7 @@ from secantus.sql.pgauth import (
 )
 from secantus.sql.pgextended import ExtendedSession
 from secantus.sql.pgnotify import NotifyHub
-from secantus.sql.session import SERVER_VERSION, Session
+from secantus.sql.session import SERVER_VERSION, ActivityRegistry, Session
 
 if TYPE_CHECKING:
     from typing import Self
@@ -88,6 +90,12 @@ class SecantusPGServer:
         self._conns_lock = threading.Lock()
         # Server-wide LISTEN / NOTIFY channel registry.
         self._notify = NotifyHub()
+        # Server-wide live-session registry for pg_stat_activity (#137), plus a
+        # monotonic per-connection backend pid (real Postgres gives each backend a
+        # distinct pid; in-process we'd otherwise share os.getpid()).
+        self._activity = ActivityRegistry()
+        # itertools.count.__next__ is atomic under the GIL, so no extra lock.
+        self._backend_pid_seq = itertools.count((os.getpid() & 0x7FFFFF) << 8 | 1)
         # SCRAM-SHA-256 auth: when require_auth is on, clients must authenticate
         # against a user from ``users`` (username -> plaintext, hashed into a
         # SCRAM verifier at startup; the plaintext is not retained).
@@ -214,6 +222,8 @@ class SecantusPGServer:
                 if result is None:
                     return
                 io, session = result
+                session.client_addr = addr[0] if addr else None
+                self._activity.register(session)  # pg_stat_activity (#137)
                 self._query_loop(io, session)
         except (pgwire.PGConnectionClosed, ConnectionError, TimeoutError, ssl.SSLError, OSError):
             return
@@ -227,6 +237,7 @@ class SecantusPGServer:
                     self.storage.abort_user_transaction(session.txn_handle)
             if session is not None:
                 self._notify.unlisten_all(session)  # drop this conn's LISTENs
+                self._activity.unregister(session)  # drop from pg_stat_activity (#137)
             with self._conns_lock:
                 self._conns.discard(conn)
 
@@ -257,13 +268,15 @@ class SecantusPGServer:
         db = startup.params.get("database") or startup.params.get("user") or self.default_database
         user = startup.params.get("user", "secantus")
         application_name = startup.params.get("application_name", "")
-        backend_pid = os.getpid() & 0x7FFFFFFF
+        backend_pid = next(self._backend_pid_seq) & 0x7FFFFFFF
 
         if self.require_auth and not self._authenticate(io, user):
             return None
 
         session = Session(database=db, user=user, backend_pid=backend_pid)
         session.notify_hub = self._notify
+        session.activity_registry = self._activity
+        session.backend_start = _dt.datetime.now(_dt.timezone.utc)
         if self._authz_active:
             session.authz_active = True
             session.roles = self._users.roles_for(user)
@@ -376,6 +389,11 @@ class SecantusPGServer:
         # (CopyIn/CopyOut) mid-query, so it can't go through run_sql.
         from sqlglot import exp
 
+        # pg_stat_activity (#137): this backend is 'active' with ``sql`` while the
+        # query runs; it stays as the last query (state 'idle') afterwards.
+        session.state = "active"
+        session.current_query = sql
+        session.query_start = _dt.datetime.now(_dt.timezone.utc)
         out = bytearray()
         try:
             # planner.parse must run inside the try: a syntax error raises a
@@ -408,6 +426,7 @@ class SecantusPGServer:
         out += self._pending_notification_bytes(session)
         # The ReadyForQuery status reflects the transaction block (I/T/E).
         out += pgwire.ready_for_query(session.txn_status())
+        session.state = "idle"  # query done; pg_stat_activity shows it idle (#137)
         conn.sendall(bytes(out))
 
     def _handle_copy(self, conn: socket.socket, session: Session, stmt: Any) -> None:

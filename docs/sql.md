@@ -2398,6 +2398,24 @@ SELECT name, setting, vartype, source FROM pg_settings WHERE name = 'TimeZone';
 -- TimeZone | UTC | string | default        (source becomes 'session' after a SET)
 ```
 
+### Monitoring views (`pg_stat_activity`)
+
+`pg_catalog.pg_stat_activity` reflects the server's live backends — one row per
+open connection — so admin UIs and monitoring tools can introspect the server:
+
+```sql
+SELECT pid, datname, usename, application_name, state, query
+FROM pg_stat_activity;
+-- 12881 | app | alice | myapp | active | SELECT ... FROM pg_stat_activity
+```
+
+Each connection gets a distinct `pid`, a `backend_start` timestamp, its
+`client_addr` / `application_name`, and a live `state` — `active` while a query
+runs (a client sees its own row as `active` with that query), else `idle` with
+its last query. `pg_stat_database` gives a per-database live backend count
+(`numbackends`); its cumulative counters (`xact_commit`, `blks_hit`, …) are
+single-node dev stubs reporting `0`.
+
 ### Advisory locks
 
 The `pg_advisory_lock` family is accepted so application-level locking works:

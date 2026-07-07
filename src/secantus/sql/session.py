@@ -73,6 +73,28 @@ class _Cursor:
     hold: bool = False
 
 
+class ActivityRegistry:
+    """Server-wide registry of live connection ``Session``s, for
+    ``pg_catalog.pg_stat_activity`` (#137). Keyed by ``backend_pid`` (the wire
+    server assigns a unique one per connection). Thread-safe."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sessions: dict[int, Session] = {}
+
+    def register(self, session: Session) -> None:
+        with self._lock:
+            self._sessions[session.backend_pid] = session
+
+    def unregister(self, session: Session) -> None:
+        with self._lock:
+            self._sessions.pop(session.backend_pid, None)
+
+    def snapshot(self) -> list[Session]:
+        with self._lock:
+            return list(self._sessions.values())
+
+
 @dataclass
 class Session:
     database: str = "postgres"
@@ -135,6 +157,17 @@ class Session:
     _notify_lock: Any = field(default_factory=threading.Lock)
     _notify_deliveries: deque = field(default_factory=deque)
     pending_notifies: list[tuple[str, str]] = field(default_factory=list)
+    # pg_stat_activity (#137). Populated by the wire server: when the connection
+    # was established (``backend_start``), the client host (``client_addr``), the
+    # activity ``state`` ('active' while a query runs, else 'idle'), the current /
+    # last ``current_query`` text and its ``query_start``, and a back-reference to
+    # the server-wide ``ActivityRegistry`` (None for the embedded ``run_sql`` API).
+    backend_start: Any = None
+    client_addr: str | None = None
+    state: str = "idle"
+    current_query: str = ""
+    query_start: Any = None
+    activity_registry: Any = None
     # SET LOCAL (#136): GUCs set with ``SET LOCAL`` inside a transaction, mapped to
     # the value to restore at transaction end (the pre-``SET LOCAL`` session value,
     # or None if it wasn't set). Reverted in ``engine._end_txn_state``.

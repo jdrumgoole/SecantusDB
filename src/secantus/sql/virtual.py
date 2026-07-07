@@ -1234,6 +1234,71 @@ def _pg_settings(db: str, session: Session, storage: Any, catalog: Catalog) -> l
     return rows
 
 
+def _live_sessions(session: Session) -> list:
+    """The live connection sessions to reflect — the server's ``ActivityRegistry``
+    snapshot when connected over the wire, else just this (embedded) session."""
+    reg = getattr(session, "activity_registry", None)
+    return reg.snapshot() if reg is not None else [session]
+
+
+def _pg_stat_activity(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_stat_activity`` — one row per live backend (#137). Reflects
+    the wire server's live-session registry; a client running this query sees its
+    own row as ``state = 'active'`` with this query text."""
+    rows = []
+    for s in _live_sessions(session):
+        app = s.get_setting("application_name") if hasattr(s, "get_setting") else ""
+        rows.append(
+            {
+                "datid": None,
+                "datname": s.database,
+                "pid": s.backend_pid,
+                "usesysid": None,
+                "usename": s.user,  # session user (the authenticated login)
+                "application_name": app,
+                "client_addr": getattr(s, "client_addr", None),
+                "client_port": None,
+                "backend_start": getattr(s, "backend_start", None),
+                "xact_start": None,
+                "query_start": getattr(s, "query_start", None),
+                "state_change": None,
+                "wait_event_type": None,
+                "wait_event": None,
+                "state": getattr(s, "state", "idle"),
+                "query": getattr(s, "current_query", "") or "",
+                "backend_type": "client backend",
+            }
+        )
+    return rows
+
+
+def _pg_stat_database(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_stat_database`` — one row per database with a live backend
+    count (#137). Cumulative counters are single-node dev stubs (zero)."""
+    counts: dict[str, int] = {}
+    for s in _live_sessions(session):
+        counts[s.database] = counts.get(s.database, 0) + 1
+    rows = []
+    for name, n in sorted(counts.items()):
+        rows.append(
+            {
+                "datid": None,
+                "datname": name,
+                "numbackends": n,
+                "xact_commit": 0,
+                "xact_rollback": 0,
+                "blks_read": 0,
+                "blks_hit": 0,
+                "tup_returned": 0,
+                "tup_fetched": 0,
+                "tup_inserted": 0,
+                "tup_updated": 0,
+                "tup_deleted": 0,
+            }
+        )
+    return rows
+
+
 def _role_row(oid: int, name: str, role: dict) -> dict:
     return {
         "oid": oid,
@@ -1801,6 +1866,49 @@ _register(
         ("with_check", "text"),
     ],
     _pg_policies,
+)
+_register(
+    "pg_catalog",
+    "pg_stat_activity",
+    [
+        ("datid", "int4"),
+        ("datname", "text"),
+        ("pid", "int4"),
+        ("usesysid", "int4"),
+        ("usename", "text"),
+        ("application_name", "text"),
+        ("client_addr", "text"),
+        ("client_port", "int4"),
+        ("backend_start", "timestamptz"),
+        ("xact_start", "timestamptz"),
+        ("query_start", "timestamptz"),
+        ("state_change", "timestamptz"),
+        ("wait_event_type", "text"),
+        ("wait_event", "text"),
+        ("state", "text"),
+        ("query", "text"),
+        ("backend_type", "text"),
+    ],
+    _pg_stat_activity,
+)
+_register(
+    "pg_catalog",
+    "pg_stat_database",
+    [
+        ("datid", "int4"),
+        ("datname", "text"),
+        ("numbackends", "int4"),
+        ("xact_commit", "int8"),
+        ("xact_rollback", "int8"),
+        ("blks_read", "int8"),
+        ("blks_hit", "int8"),
+        ("tup_returned", "int8"),
+        ("tup_fetched", "int8"),
+        ("tup_inserted", "int8"),
+        ("tup_updated", "int8"),
+        ("tup_deleted", "int8"),
+    ],
+    _pg_stat_database,
 )
 _register(
     "pg_catalog",

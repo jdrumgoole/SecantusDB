@@ -2631,6 +2631,32 @@ def test_show_all_and_pg_settings_via_driver(real_server):
     conn.close()
 
 
+def test_pg_stat_activity_via_driver(real_server):
+    # pg_stat_activity reflects the live backend: a client running the query sees
+    # its own row as state='active' with a distinct pid and this query. (#137)
+    conn = connect(real_server, application_name="probe")
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT pid, datname, usename, application_name, state, query, backend_type "
+        "FROM pg_catalog.pg_stat_activity"
+    )
+    rows = cur.fetchall()
+    assert len(rows) == 1
+    pid, datname, usename, app, state, query, backend_type = rows[0]
+    assert isinstance(pid, int) and pid > 0
+    assert app == "probe"
+    assert state == "active"
+    assert "pg_stat_activity" in query
+    assert backend_type == "client backend"
+    # backend_start / query_start are real timestamps.
+    cur.execute("SELECT backend_start IS NOT NULL, query_start IS NOT NULL FROM pg_stat_activity")
+    assert cur.fetchall() == ([True, True],)
+    # pg_stat_database counts this one backend (only this connection is live).
+    cur.execute("SELECT numbackends FROM pg_catalog.pg_stat_database")
+    assert cur.fetchall() == ([1],)
+    conn.close()
+
+
 def test_set_local_reverts_at_commit_via_driver(real_server):
     # SET LOCAL applies inside the transaction and reverts when it commits. (#136)
     conn = connect(real_server)
