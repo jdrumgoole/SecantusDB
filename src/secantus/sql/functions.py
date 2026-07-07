@@ -163,6 +163,18 @@ _SCALAR_EVAL_ANON = frozenset(
         "pg_get_function_arguments",
         "pg_get_function_result",
         "pg_get_indexdef",
+        # Advisory locks (#135) — session-tracked single-node no-op locking.
+        "pg_advisory_lock",
+        "pg_advisory_lock_shared",
+        "pg_advisory_xact_lock",
+        "pg_advisory_xact_lock_shared",
+        "pg_try_advisory_lock",
+        "pg_try_advisory_lock_shared",
+        "pg_try_advisory_xact_lock",
+        "pg_try_advisory_xact_lock_shared",
+        "pg_advisory_unlock",
+        "pg_advisory_unlock_shared",
+        "pg_advisory_unlock_all",
     }
 )
 

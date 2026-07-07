@@ -5275,6 +5275,17 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return "bool"
         if fname in ("has_table_privilege", "has_column_privilege"):
             return "bool"
+        # Advisory locks (#135): pg_try_* / pg_advisory_unlock* -> bool; the
+        # void-returning pg_advisory_lock* fall through to the "text" default.
+        if fname in (
+            "pg_try_advisory_lock",
+            "pg_try_advisory_lock_shared",
+            "pg_try_advisory_xact_lock",
+            "pg_try_advisory_xact_lock_shared",
+            "pg_advisory_unlock",
+            "pg_advisory_unlock_shared",
+        ):
+            return "bool"
         if fname == "isempty":
             return "bool"
         if fname == "to_tsvector":

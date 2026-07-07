@@ -135,6 +135,13 @@ class Session:
     _notify_lock: Any = field(default_factory=threading.Lock)
     _notify_deliveries: deque = field(default_factory=deque)
     pending_notifies: list[tuple[str, str]] = field(default_factory=list)
+    # Advisory locks (``pg_advisory_lock`` family, #135). Single-node: a lock is
+    # always granted immediately, so we only *track* what this session holds so
+    # ``pg_advisory_unlock`` reports truthfully and ``pg_catalog.pg_locks``
+    # reflects it. Keyed by ``(classid, objid, objsubid, mode, xact)`` → stack
+    # ``count`` (advisory locks are re-entrant); ``xact`` locks release at
+    # COMMIT/ROLLBACK, session locks at ``pg_advisory_unlock[_all]``.
+    advisory_locks: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.login_user is None:
@@ -199,6 +206,46 @@ class Session:
         self.pending_deferred = []
         self.deferred_all = None
         self.deferred_names = {}
+
+    def advisory_lock_acquire(self, key: tuple, *, shared: bool, xact: bool) -> None:
+        """Acquire an advisory lock (re-entrant). Single-node — always granted."""
+        mode = "ShareLock" if shared else "ExclusiveLock"
+        k = (key[0], key[1], key[2], mode, xact)
+        self.advisory_locks[k] = self.advisory_locks.get(k, 0) + 1
+
+    def advisory_lock_release(self, key: tuple, *, shared: bool) -> bool:
+        """Release one *session-level* advisory lock. Returns True if one was
+        held (and decremented), False otherwise (Postgres warns and returns
+        false). Transaction-level locks aren't manually releasable."""
+        mode = "ShareLock" if shared else "ExclusiveLock"
+        k = (key[0], key[1], key[2], mode, False)
+        n = self.advisory_locks.get(k, 0)
+        if n <= 0:
+            return False
+        if n == 1:
+            del self.advisory_locks[k]
+        else:
+            self.advisory_locks[k] = n - 1
+        return True
+
+    def advisory_unlock_all(self) -> None:
+        """Release every *session-level* advisory lock (``pg_advisory_unlock_all``);
+        transaction-level locks are left to the transaction's end."""
+        self.advisory_locks = {k: v for k, v in self.advisory_locks.items() if k[4]}
+
+    def release_xact_advisory_locks(self) -> None:
+        """Drop all transaction-level advisory locks (called at COMMIT/ROLLBACK)."""
+        self.advisory_locks = {k: v for k, v in self.advisory_locks.items() if not k[4]}
+
+    def held_advisory_locks(self) -> list[tuple]:
+        """The distinct advisory locks currently held, as ``(classid, objid,
+        objsubid, mode)`` — for ``pg_catalog.pg_locks`` reflection (session- and
+        transaction-level collapse to one row per key+mode, as pg_locks shows)."""
+        out: dict[tuple, bool] = {}
+        for (classid, objid, objsubid, mode, _xact), n in self.advisory_locks.items():
+            if n > 0:
+                out[(classid, objid, objsubid, mode)] = True
+        return list(out.keys())
 
     def get_setting(self, name: str) -> str:
         return self.settings.get(name, GUC_DEFAULTS.get(name, ""))

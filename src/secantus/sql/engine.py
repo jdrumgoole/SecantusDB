@@ -210,6 +210,7 @@ def _end_txn_state(session: Session) -> None:
     session.savepoints = []
     session.pending_notifies = []  # NOTIFYs in the block are flushed (commit) or dropped (rollback)
     session.reset_deferred()
+    session.release_xact_advisory_locks()  # pg_advisory_xact_lock* release at txn end
     _close_non_hold_cursors(session)  # WITHOUT HOLD cursors close at end of txn
 
 
