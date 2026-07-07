@@ -1561,20 +1561,30 @@ def _parse_role_attrs(rest: str) -> dict[str, Any]:
     return attrs
 
 
-def _grant_privilege_names(stmt: exp.Expression) -> list[str] | None:
-    """The privilege keywords of a ``GRANT``/``REVOKE`` (``ALL`` expands to every
-    table privilege), or None when they aren't recognised table privileges."""
-    privs = stmt.args.get("privileges") or []
-    out: list[str] = []
-    for gp in privs:
+def _grant_privileges(stmt: exp.Expression) -> tuple[list[str], dict[str, list[str]]] | None:
+    """Split a ``GRANT``/``REVOKE``'s privileges into whole-table privileges and a
+    per-column map (``GRANT SELECT (a, b)`` → ``{"a": ["SELECT"], ...}``). Returns
+    None when any privilege isn't a recognised table privilege (schema/database
+    grants etc. stay no-ops). ``ALL`` expands to every table privilege."""
+    table_privs: list[str] = []
+    column_privs: dict[str, list[str]] = {}
+    for gp in stmt.args.get("privileges") or []:
         this = gp.this if isinstance(gp, exp.GrantPrivilege) else gp
         name = str(getattr(this, "name", this)).upper()
         if name in ("ALL", "ALL PRIVILEGES"):
-            return list(Catalog.TABLE_PRIVILEGES)
-        if name not in Catalog.TABLE_PRIVILEGES:
+            names = list(Catalog.TABLE_PRIVILEGES)
+        elif name in Catalog.TABLE_PRIVILEGES:
+            names = [name]
+        else:
             return None
-        out.append(name)
-    return out
+        cols = gp.args.get("expressions") if isinstance(gp, exp.GrantPrivilege) else None
+        if cols:
+            for c in cols:
+                col = c.name if isinstance(c, exp.Column) else str(getattr(c, "name", c))
+                column_privs.setdefault(col, []).extend(names)
+        else:
+            table_privs.extend(names)
+    return table_privs, column_privs
 
 
 def _grant_principals(stmt: exp.Expression) -> list[str]:
@@ -1598,24 +1608,31 @@ def _run_grant(
     prior permissive behaviour."""
     tag = "REVOKE" if revoke else "GRANT"
     securable = stmt.args.get("securable")
-    privileges = _grant_privilege_names(stmt)
-    if not isinstance(securable, exp.Table) or privileges is None:
+    parsed = _grant_privileges(stmt)
+    if not isinstance(securable, exp.Table) or parsed is None:
         return SQLResult(command_tag=tag)  # not a recorded table privilege — no-op
+    table_privs, column_privs = parsed
     table_name = securable.name
     # The table must exist (declared or reflectable) — mirrors CREATE INDEX.
     if catalog.get(db, table_name) is None and reflect.reflect(storage, db, table_name) is None:
         raise errors.undefined_table(table_name)
     for grantee in _grant_principals(stmt):
-        if revoke:
-            catalog.revoke_table_privileges(db, table_name, grantee, privileges)
-        else:
-            catalog.grant_table_privileges(
-                db,
-                table_name,
-                grantee,
-                privileges,
-                grant_option=bool(stmt.args.get("grant_option")),
-            )
+        if table_privs:
+            if revoke:
+                catalog.revoke_table_privileges(db, table_name, grantee, table_privs)
+            else:
+                catalog.grant_table_privileges(
+                    db,
+                    table_name,
+                    grantee,
+                    table_privs,
+                    grant_option=bool(stmt.args.get("grant_option")),
+                )
+        for column, privs in column_privs.items():
+            if revoke:
+                catalog.revoke_column_privileges(db, table_name, grantee, column, privs)
+            else:
+                catalog.grant_column_privileges(db, table_name, grantee, column, privs)
     return SQLResult(command_tag=tag)
 
 

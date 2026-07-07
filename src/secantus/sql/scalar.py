@@ -1353,7 +1353,30 @@ def _has_table_privilege(args: list[Any], ctx: ScalarContext | None) -> Any:
     return ctx.catalog.has_table_privilege(ctx.db, _as_text(table), grantees, priv)
 
 
+def _has_column_privilege(args: list[Any], ctx: ScalarContext | None) -> Any:
+    """``has_column_privilege([user,] table, column, privilege)`` — reflects the
+    column-level grants recorded by GRANT (a whole-table grant satisfies it too).
+    Two-arg-less forms mirror ``has_table_privilege``; NULL argument → NULL."""
+    if ctx is None or ctx.catalog is None:
+        raise errors.feature_not_supported("has_column_privilege() requires an execution context")
+    if len(args) >= 4:
+        user, table, column, privilege = args[0], args[1], args[2], args[3]
+    elif len(args) == 3:
+        user, table, column, privilege = ctx.session.effective_user, args[0], args[1], args[2]
+    else:
+        raise errors.SQLError("42883", "has_column_privilege() requires (table, column, privilege)")
+    if user is None or table is None or column is None or privilege is None:
+        return None
+    priv = _as_text(privilege).split("WITH")[0].strip().upper()
+    grantees = {_as_text(user), "PUBLIC", "public"}
+    return ctx.catalog.has_column_privilege(
+        ctx.db, _as_text(table), grantees, _as_text(column), priv
+    )
+
+
 def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> Any:
+    if name == "has_column_privilege":
+        return _has_column_privilege(args, ctx)
     if name == "format_type":
         return _format_type(args[0] if args else None, args[1] if len(args) > 1 else None)
     if name == "pg_get_constraintdef":

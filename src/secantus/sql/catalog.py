@@ -31,6 +31,7 @@ COMPOSITE_COLLECTION = "__sql_composites__"
 FUNCTION_COLLECTION = "__sql_functions__"
 POLICY_COLLECTION = "__sql_policies__"
 RLS_COLLECTION = "__sql_rls__"
+COLUMN_GRANT_COLLECTION = "__sql_column_grants__"
 
 
 def _ser_composite_fields(fields: Any) -> list | None:
@@ -604,6 +605,85 @@ class Catalog:
         want = privilege.upper()
         for doc in self.get_table_grants(db, table):
             if doc["grantee"] in grantees and want in doc.get("privileges", ()):
+                return True
+        return False
+
+    # -- Column-level privileges (GRANT SELECT (col) …) --------------------- #
+    # Finer-grained than table grants: ``GRANT SELECT (a, b) ON t TO alice``
+    # authorizes alice for exactly columns a / b. Persisted per-
+    # ``(table, grantee, column)``; the authz gate reads them when a table grant
+    # or Mongo role doesn't already cover the statement's columns.
+
+    @staticmethod
+    def _col_grant_key(table: str, grantee: str, column: str) -> str:
+        return f"{table}\x00{grantee}\x00{column}"
+
+    def grant_column_privileges(
+        self, db: str, table: str, grantee: str, column: str, privileges: list[str]
+    ) -> None:
+        key = self._col_grant_key(table, grantee, column)
+        existing = self._storage.find_matching(db, COLUMN_GRANT_COLLECTION, {"_id": key}, limit=1)
+        held = set(existing[0]["privileges"]) if existing else set()
+        held.update(p.upper() for p in privileges)
+        self._storage.delete_matching(db, COLUMN_GRANT_COLLECTION, {"_id": key})
+        self._storage.insert(
+            db,
+            COLUMN_GRANT_COLLECTION,
+            [
+                {
+                    "_id": key,
+                    "table": table,
+                    "grantee": grantee,
+                    "column": column,
+                    "privileges": [p for p in self.TABLE_PRIVILEGES if p in held],
+                }
+            ],
+        )
+
+    def revoke_column_privileges(
+        self, db: str, table: str, grantee: str, column: str, privileges: list[str]
+    ) -> None:
+        key = self._col_grant_key(table, grantee, column)
+        existing = self._storage.find_matching(db, COLUMN_GRANT_COLLECTION, {"_id": key}, limit=1)
+        if not existing:
+            return
+        held = set(existing[0]["privileges"]) - {p.upper() for p in privileges}
+        self._storage.delete_matching(db, COLUMN_GRANT_COLLECTION, {"_id": key})
+        if held:
+            self._storage.insert(
+                db,
+                COLUMN_GRANT_COLLECTION,
+                [
+                    {
+                        "_id": key,
+                        "table": table,
+                        "grantee": grantee,
+                        "column": existing[0]["column"],
+                        "privileges": [p for p in self.TABLE_PRIVILEGES if p in held],
+                    }
+                ],
+            )
+
+    def get_column_grants(self, db: str, table: str) -> list[dict[str, Any]]:
+        return self._storage.find_matching(db, COLUMN_GRANT_COLLECTION, {"table": table})
+
+    def list_column_grants(self, db: str) -> list[dict[str, Any]]:
+        return self._storage.find_matching(db, COLUMN_GRANT_COLLECTION, {})
+
+    def has_column_privilege(
+        self, db: str, table: str, grantees: set[str], column: str, privilege: str
+    ) -> bool:
+        """Whether any identity in ``grantees`` holds ``privilege`` on
+        ``table.column`` — via a column grant *or* a whole-table grant."""
+        want = privilege.upper()
+        if self.has_table_privilege(db, table, grantees, want):
+            return True
+        for doc in self.get_column_grants(db, table):
+            if (
+                doc["column"] == column
+                and doc["grantee"] in grantees
+                and want in doc.get("privileges", ())
+            ):
                 return True
         return False
 

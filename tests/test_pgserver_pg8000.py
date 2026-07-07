@@ -2498,3 +2498,23 @@ def test_udf_reflection_via_driver(real_server):
     )
     assert cur.fetchall() == (["addup", "integer"],)
     conn.close()
+
+
+def test_column_privileges_reflection_via_driver(real_server):
+    # Column-scoped GRANT round-trips over the wire; column_privileges +
+    # has_column_privilege reflect it. (Enforcement is unit-tested with gated
+    # sessions in test_sql_column_grants.py.)
+    conn = connect(real_server)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id bigint primary key, a int, secret text)")
+    cur.execute("GRANT SELECT (id, a) ON t TO alice")
+    cur.execute(
+        "SELECT grantee, column_name, privilege_type FROM information_schema.column_privileges "
+        "ORDER BY column_name"
+    )
+    assert cur.fetchall() == (["alice", "a", "SELECT"], ["alice", "id", "SELECT"])
+    cur.execute("SELECT has_column_privilege('alice', 't', 'a', 'SELECT')")
+    assert cur.fetchall() == ([True],)
+    cur.execute("SELECT has_column_privilege('alice', 't', 'secret', 'SELECT')")
+    assert cur.fetchall() == ([False],)
+    conn.close()

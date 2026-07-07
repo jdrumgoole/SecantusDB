@@ -2530,6 +2530,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `proargmodes` / `proargdefaults` (all params reflect as `IN`, no defaults); `is_deterministic` is a
   fixed `NO`; overloads share a `proname` but get distinct oids/`specific_name`. Not ported to the Rust
   server.
+- [ ] **Column-level privileges landed** (#131, b171): `GRANT`/`REVOKE` `SELECT`/`INSERT`/`UPDATE (col,
+  …)` `ON t` (the `GrantPrivilege.expressions` column list) persist per-`(table, grantee, column)` in
+  `__sql_column_grants__` (`Catalog.grant_column_privileges` / `revoke_column_privileges` /
+  `get_column_grants` / `list_column_grants` / `has_column_privilege`; `engine._grant_privileges` now
+  splits table- vs column-scoped grants, `_run_grant` routes both). Enforced additively in
+  `authz._table_grant_allows`: when the Mongo role and whole-table grant don't cover the op, allow only
+  when *every* column the statement touches is column-granted (`_touched_columns`: SELECT projection +
+  WHERE `exp.Column`s, `SELECT *`/list-less INSERT expand to the table's columns, UPDATE `SET` targets).
+  Reflected via `information_schema.column_privileges` (`virtual._info_column_grants`) and
+  `has_column_privilege([user,] table, column, privilege)` (`scalar._has_column_privilege`; a whole-table
+  grant satisfies it). Tests: `tests/test_sql_column_grants.py` +
+  `test_pgserver_pg8000.py::test_column_privileges_reflection_via_driver`. **Limitations:** column-grant
+  enforcement is single-table only (multi-table/join SELECTs get no column-grant fallback — they need a
+  role or table grant); `count(*)`/no-column-ref SELECTs fall back to table-level (can't be authorized by
+  a column grant alone); `REFERENCES`/`TRIGGER` column privileges aren't enforced; `is_grantable` always
+  `NO`. Not ported to the Rust server.
 - [ ] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
   IDENTITY [(START WITH n INCREMENT BY n)]` columns (`planner._identity_spec`) reuse the SERIAL sequence
   machinery — an owned `<table>_<col>_seq`, NOT NULL, auto-filled on omit. `Column.identity` is
