@@ -1307,20 +1307,13 @@ def _nelem_render(v: Any) -> str:
     return str(v)
 
 
-def _nelem_n_and_input(arg: Any, ctx: _Ctx) -> tuple[int, list[Any]]:
-    """Validate and evaluate the ``{n, input}`` spec shared by ``$firstN`` /
-    ``$lastN`` / ``$maxN`` / ``$minN``, matching mongod's error codes exactly
-    (verified against mongod 6.0): a missing ``n`` / ``input`` is
-    ``Location5787906`` / ``Location5787907``; an ``n`` that isn't an integral
-    number is ``Location5787903`` (non-integral numeric) or ``Location5787902``
-    (non-numeric); ``n <= 0`` is ``Location5787908``; and a null / missing /
-    non-array ``input`` is ``Location5788200`` — mongod does **not** treat a null
-    input as null here, it raises. An integral double (``2.0``) is accepted."""
-    if not isinstance(arg, Mapping) or "n" not in arg:
-        raise ExpressionError("Missing value for 'n'", code=5787906)
-    if "input" not in arg:
-        raise ExpressionError("Missing value for 'input'", code=5787907)
-    n_val = _eval(arg["n"], ctx)
+def nelem_parse_n(n_val: Any) -> int:
+    """Validate an already-evaluated ``n`` for the N-element operators, matching
+    mongod's error codes (verified against mongod 6.0): a non-integral number is
+    ``Location5787903``, a non-numeric is ``Location5787902``, and ``n <= 0`` is
+    ``Location5787908``. An integral double (``2.0``) is accepted. Shared by the
+    expression forms (``_nelem_n_and_input``) and the ``$group`` accumulator forms
+    (``aggregate._acc_nelem``)."""
     if isinstance(n_val, bool):
         raise ExpressionError(
             f"Value for 'n' must be of integral type, but found {_nelem_render(n_val)}",
@@ -1342,6 +1335,22 @@ def _nelem_n_and_input(arg: Any, ctx: _Ctx) -> tuple[int, list[Any]]:
         )
     if n <= 0:
         raise ExpressionError(f"'n' must be greater than 0, found {n}", code=5787908)
+    return n
+
+
+def _nelem_n_and_input(arg: Any, ctx: _Ctx) -> tuple[int, list[Any]]:
+    """Validate and evaluate the ``{n, input}`` spec shared by ``$firstN`` /
+    ``$lastN`` / ``$maxN`` / ``$minN`` (expression form), matching mongod's error
+    codes exactly (verified against mongod 6.0): a missing ``n`` / ``input`` is
+    ``Location5787906`` / ``Location5787907``; ``n`` validation is
+    ``nelem_parse_n``; and a null / missing / non-array ``input`` is
+    ``Location5788200`` — mongod does **not** treat a null input as null here, it
+    raises."""
+    if not isinstance(arg, Mapping) or "n" not in arg:
+        raise ExpressionError("Missing value for 'n'", code=5787906)
+    if "input" not in arg:
+        raise ExpressionError("Missing value for 'input'", code=5787907)
+    n = nelem_parse_n(_eval(arg["n"], ctx))
     arr = _eval(arg["input"], ctx)
     if not isinstance(arr, list):
         raise ExpressionError("Input must be an array", code=5788200)

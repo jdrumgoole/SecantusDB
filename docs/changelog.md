@@ -19,6 +19,25 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$firstN` / `$lastN` / `$maxN` / `$minN` as `$group` accumulators (both servers)
+
+Both servers now support the N-element operators as `$group` (and
+`$setWindowFields`) accumulators, completing the family whose expression forms
+shipped earlier: `{$firstN: {n, input}}` collects the first `n` per-doc `input`
+values across the group, `$lastN` the last `n`, and `$maxN` / `$minN` the `n`
+largest / smallest by BSON order. Matched to real `mongod` 6.0 via a three-way
+probe (mongod vs Rust server vs Python server): **`$firstN` / `$lastN` keep null
+values** (they're the first/last values seen), while **`$maxN` / `$minN` drop
+them**; `{n, input}` validation (integral-double `n` accepted, mongod error codes)
+is shared with the expression forms.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$firstN` / `$lastN` / `$maxN` /
+  `$minN` accumulators (shared `nelem_parse_n` validator; `$maxN`/`$minN` sort via
+  the `order::cmp`/`is_sortable` contract, deferring bool/Decimal128 elements to
+  Python's `_SortKey`). Usable in `$group` and `$setWindowFields`.
+
 ### Storage close-path race fixed; opt-in fast test storage
 
 The WiredTiger-backed storage close path carried a latent use-after-free race.
@@ -57,6 +76,24 @@ continuously exercised even though the default local suite now runs fast.
   `_reset_thread_session`, and the oplog readers (`read_oplog`, `read_preimage`,
   `oplog_floor_seq`, `find_seq_for_ts`, scan helpers) now open/close WiredTiger
   sessions only under the storage lock and only while the store is open.
+### `$firstN` / `$lastN` / `$maxN` / `$minN` as `$group` accumulators (both servers)
+
+Both servers now support the N-element operators as `$group` (and
+`$setWindowFields`) accumulators, completing the family whose expression forms
+shipped earlier: `{$firstN: {n, input}}` collects the first `n` per-doc `input`
+values across the group, `$lastN` the last `n`, and `$maxN` / `$minN` the `n`
+largest / smallest by BSON order. Matched to real `mongod` 6.0 via a three-way
+probe (mongod vs Rust server vs Python server): **`$firstN` / `$lastN` keep null
+values** (they're the first/last values seen), while **`$maxN` / `$minN` drop
+them**; `{n, input}` validation (integral-double `n` accepted, mongod error codes)
+is shared with the expression forms.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$firstN` / `$lastN` / `$maxN` /
+  `$minN` accumulators (shared `nelem_parse_n` validator; `$maxN`/`$minN` sort via
+  the `order::cmp`/`is_sortable` contract, deferring bool/Decimal128 elements to
+  Python's `_SortKey`). Usable in `$group` and `$setWindowFields`.
 
 ### Date-operator timezone errors now report mongod's exact codes (Python server)
 

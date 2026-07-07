@@ -144,7 +144,27 @@ pub(crate) enum Acc {
     // `$stdDevPop` / `$stdDevSamp`: collect the numeric values, compute at
     // finalize. `pop` selects population (÷n, 0 for a single value) vs sample
     // (÷n-1, null for <2 values). Field stays absent when no numeric value seen.
-    StdDev { values: Vec<f64>, pop: bool },
+    StdDev {
+        values: Vec<f64>,
+        pop: bool,
+    },
+    // `$firstN` / `$lastN` / `$maxN` / `$minN` accumulators: collect the per-doc
+    // `input` value; result computed at finalize. `n` is parsed from the spec on
+    // the first `apply` (constant across the group). `$firstN`/`$lastN` keep null
+    // values; `$maxN`/`$minN` drop them (mongod-faithful, three-way verified).
+    NElem {
+        kind: NElemKind,
+        n: Option<usize>,
+        vals: Vec<Bson>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NElemKind {
+    First,
+    Last,
+    Max,
+    Min,
 }
 
 struct Compiled<'a> {
@@ -171,6 +191,26 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
         "$stdDevSamp" => Acc::StdDev {
             values: Vec::new(),
             pop: false,
+        },
+        "$firstN" => Acc::NElem {
+            kind: NElemKind::First,
+            n: None,
+            vals: Vec::new(),
+        },
+        "$lastN" => Acc::NElem {
+            kind: NElemKind::Last,
+            n: None,
+            vals: Vec::new(),
+        },
+        "$maxN" => Acc::NElem {
+            kind: NElemKind::Max,
+            n: None,
+            vals: Vec::new(),
+        },
+        "$minN" => Acc::NElem {
+            kind: NElemKind::Min,
+            n: None,
+            vals: Vec::new(),
         },
         _ => return Err(()), // unsupported accumulator -> Python (raises or handles)
     })
@@ -244,8 +284,61 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
                 values.push(numeric_f64(&v).ok_or(())?);
             }
         }
+        Acc::NElem { n, vals, .. } => {
+            // `arg` is `{n, input}`. Validate n (positive integral; integral double
+            // accepted) and require `input`; anything invalid defers to Python,
+            // which raises the exact mongod code. `input` is collected per doc,
+            // null included (finalize drops nulls for max/min only).
+            let Bson::Document(d) = arg else {
+                return Err(());
+            };
+            let nn = match eval(d.get("n").ok_or(())?, doc, vars)? {
+                Bson::Int32(x) => x as i64,
+                Bson::Int64(x) => x,
+                Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => x as i64,
+                _ => return Err(()),
+            };
+            if nn <= 0 {
+                return Err(());
+            }
+            *n = Some(nn as usize);
+            vals.push(eval(d.get("input").ok_or(())?, doc, vars)?);
+        }
     }
     Ok(())
+}
+
+/// Finalize an N-element accumulator to its result list. `$firstN`/`$lastN` keep
+/// nulls (first/last `n` in insertion order); `$maxN`/`$minN` drop nulls, then sort
+/// via the `order::cmp`/`is_sortable` contract (`$maxN` descending, `$minN`
+/// ascending) — an element outside the sortable subset defers the group to Python.
+fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
+    match kind {
+        NElemKind::First => {
+            let k = n.min(vals.len());
+            Ok(vals[..k].to_vec())
+        }
+        NElemKind::Last => {
+            let k = n.min(vals.len());
+            Ok(vals[vals.len() - k..].to_vec())
+        }
+        NElemKind::Max | NElemKind::Min => {
+            let mut nn: Vec<Bson> = vals.into_iter().filter(|x| !is_null(x)).collect();
+            if !nn.iter().all(crate::order::is_sortable) {
+                return Err(());
+            }
+            let largest = matches!(kind, NElemKind::Max);
+            nn.sort_by(|a, b| {
+                if largest {
+                    crate::order::cmp(b, a)
+                } else {
+                    crate::order::cmp(a, b)
+                }
+            });
+            let k = n.min(nn.len());
+            Ok(nn[..k].to_vec())
+        }
+    }
 }
 
 /// A numeric value as `f64` for `$stdDev*`: int / long / double, plus bool as
@@ -352,6 +445,12 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                     out.insert(field.to_string(), v);
                 }
             }
+            Acc::NElem { kind, n, vals } => {
+                out.insert(
+                    field.to_string(),
+                    Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
+                );
+            }
         }
     }
     Ok(out)
@@ -389,6 +488,7 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
         Acc::Push(list) | Acc::AddToSet(list) => Bson::Array(list),
         // A window writes a value into every row: empty / degenerate -> null.
         Acc::StdDev { values, pop } => std_dev(&values, pop).map_or(Bson::Null, Bson::Double),
+        Acc::NElem { kind, n, vals } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
     })
 }
 
@@ -743,6 +843,45 @@ mod tests {
                 Bson::Int32(2)
             ]))
         );
+    }
+
+    #[test]
+    fn nelem_accumulators() {
+        // Group values in doc order: 3, 1, null, 5, 2.
+        let docs = vec![
+            doc! {"v": 3i32},
+            doc! {"v": 1i32},
+            doc! {"v": Bson::Null},
+            doc! {"v": 5i32},
+            doc! {"v": 2i32},
+        ];
+        let out = g(
+            bson::bson!({
+                "_id": Bson::Null,
+                "f": {"$firstN": {"n": 2, "input": "$v"}},
+                "l": {"$lastN": {"n": 2, "input": "$v"}},
+                "mx": {"$maxN": {"n": 2, "input": "$v"}},
+                "mn": {"$minN": {"n": 2, "input": "$v"}},
+                "f3": {"$firstN": {"n": 3, "input": "$v"}},
+                "mx3": {"$maxN": {"n": 3, "input": "$v"}},
+            }),
+            docs,
+        );
+        let arr = |xs: &[i32]| Bson::Array(xs.iter().map(|x| Bson::Int32(*x)).collect());
+        assert_eq!(out[0].get("f"), Some(&arr(&[3, 1])));
+        assert_eq!(out[0].get("l"), Some(&arr(&[5, 2])));
+        assert_eq!(out[0].get("mx"), Some(&arr(&[5, 3])));
+        assert_eq!(out[0].get("mn"), Some(&arr(&[1, 2])));
+        // firstN keeps null; maxN drops it.
+        assert_eq!(
+            out[0].get("f3"),
+            Some(&Bson::Array(vec![
+                Bson::Int32(3),
+                Bson::Int32(1),
+                Bson::Null
+            ]))
+        );
+        assert_eq!(out[0].get("mx3"), Some(&arr(&[5, 3, 2])));
     }
 
     #[test]
