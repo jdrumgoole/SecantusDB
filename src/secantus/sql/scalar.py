@@ -1413,12 +1413,16 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         return _has_table_privilege(args, ctx)
     if name in ("nextval", "currval", "setval", "lastval"):
         return _sequence_func(name, args, ctx)
-    if name in (
-        "pg_get_expr",
-        "pg_get_serial_sequence",
-        "pg_get_indexdef",
-    ):
-        # No stored defaults; index defs not rendered.
+    if name == "pg_get_indexdef":
+        # Render an index's CREATE INDEX text (by pg_index/pg_class oid) so psql's
+        # \d and SQLAlchemy reflect it; unknown oid / no ctx → NULL. (#134)
+        if ctx is not None and args and isinstance(args[0], int):
+            from secantus.sql import virtual
+
+            return virtual.indexdef_for_oid(ctx.db, ctx.storage, ctx.catalog, args[0])
+        return None
+    if name in ("pg_get_expr", "pg_get_serial_sequence"):
+        # No stored defaults / serial-sequence resolution.
         return None
     if name == "regexp_matches":
         # Postgres regexp_matches is set-returning; in a scalar context we return

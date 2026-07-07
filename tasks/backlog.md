@@ -2742,6 +2742,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   identities unless they're also named; runs within the session transaction (rolls back with it) but
   isn't the O(1) file-truncate a real engine does — it's a bulk `delete_matching`. Not ported to the
   Rust server.
+- [ ] **Index / constraint reflection for `\d` landed** (#134, b174): `pg_catalog.pg_indexes`
+  (`virtual._pg_indexes`) lists one row per index (`schemaname`/`tablename`/`indexname`/`tablespace`=NULL/
+  `indexdef`) and `pg_get_indexdef(oid)` (`virtual.indexdef_for_oid`, wired in `scalar._call_func` +
+  registered in `functions._SCALAR_EVAL_ANON`) both render `CREATE [UNIQUE] INDEX <name> ON public.<table>
+  USING btree (<cols>)` with `DESC` on descending columns. Backed by a new rich `virtual._indexes` (PK
+  index as `<t>_pkey`, each user `CREATE INDEX`, and each UNIQUE-constraint index) that also carries the
+  owning table + rendered column list; `_index_relations` is now its projection to the historical
+  pg_index/pg_class shape. WiredTiger's physical `_id_` index is skipped so it never leaks into the SQL
+  surface. `pg_get_constraintdef(oid)` now also renders **PRIMARY KEY (…)** (`virtual.constraint_def_for_oid`
+  gained a PK branch keyed to `_PK_CON_OID_BASE` = 30000, mirroring `_pg_constraint`'s PK-oid assignment)
+  alongside the existing FOREIGN KEY / UNIQUE / CHECK rendering. Tests: `tests/test_sql_index_reflection.py`
+  + `test_pgserver_pg8000.py::test_index_constraint_reflection_via_driver`. **Limitations:** a partial
+  index's predicate isn't reversed back to a `WHERE` clause in `indexdef` (the `partial` flag is tracked
+  but the expression text isn't rendered); expression/functional index columns reflect only when every
+  key field maps to a declared column (index over a raw field is skipped); no `INCLUDE`/opclass/collation
+  detail in `indexdef`. Not ported to the Rust server.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by

@@ -162,6 +162,7 @@ _SCALAR_EVAL_ANON = frozenset(
         "pg_get_functiondef",
         "pg_get_function_arguments",
         "pg_get_function_result",
+        "pg_get_indexdef",
     }
 )
 
