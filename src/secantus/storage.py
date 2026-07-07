@@ -795,6 +795,7 @@ class Storage:
         session_max: int = 1000,
         sync_on_commit: bool = False,
         oplog_archive_dir: str | None = None,
+        durable: bool | None = None,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -834,6 +835,32 @@ class Storage:
         self.cache_size = cache_size
         self.session_max = session_max
         self.sync_on_commit = sync_on_commit
+        # ``durable`` (I2a test-mode fast storage). Resolution precedence:
+        #   1. ``SECANTUS_FORCE_DURABLE=1`` — always durable, overriding any
+        #      caller/default. This is the switch that runs the WHOLE test suite
+        #      against real journal + close-checkpoint durability (the "real
+        #      durable disk testing" path): `SECANTUS_FORCE_DURABLE=1 invoke
+        #      test`, and a dedicated CI lane.
+        #   2. explicit ``durable=`` argument (persistence / reopen / PITR /
+        #      backup fixtures pass ``durable=True`` so they always exercise the
+        #      journal + checkpoint, regardless of the test-fast default).
+        #   3. ``durable=None`` (unset) — durable UNLESS
+        #      ``SECANTUS_TEST_FAST_STORAGE=1`` is set (the test conftest sets it
+        #      so the default suite runs fast). Production never sets it, so the
+        #      shipped ``SecantusDBServer`` defaults to fully durable.
+        # ``durable=False`` opens the on-disk engine with the journal disabled
+        # and skips the checkpoint on ``close()``. All 12 tables are still
+        # created on disk (schema / B-tree / within-session persistence stay
+        # real), but the instance is NOT crash- or reopen-durable — correct only
+        # for ephemeral test instances whose storage dir is discarded. It cuts
+        # open+close from ~245 ms to ~52 ms and, more importantly, removes the
+        # fsync that serialises across parallel test workers (see
+        # tasks/test-performance-plan.md §I2a and the scaling curve).
+        if os.environ.get("SECANTUS_FORCE_DURABLE") == "1":
+            durable = True
+        elif durable is None:
+            durable = os.environ.get("SECANTUS_TEST_FAST_STORAGE") != "1"
+        self._durable = durable
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
@@ -889,16 +916,33 @@ class Storage:
             # footprint from ~30 MB to ~10 MB with no durability change
             # (recovery still replays the same log records); WT just
             # allocates each segment on demand instead of ahead of time.
-            sync_part = (
-                "transaction_sync=(enabled=true,method=fsync)"
-                if sync_on_commit
-                else "transaction_sync=(enabled=false,method=fsync)"
-            )
-            config = (
-                f"create,session_max={session_max},cache_size={cache_size},"
-                f"log=(enabled=true,file_max=10MB,prealloc=false),"
-                f"{sync_part}"
-            )
+            if durable:
+                sync_part = (
+                    "transaction_sync=(enabled=true,method=fsync)"
+                    if sync_on_commit
+                    else "transaction_sync=(enabled=false,method=fsync)"
+                )
+                config = (
+                    f"create,session_max={session_max},cache_size={cache_size},"
+                    f"log=(enabled=true,file_max=10MB,prealloc=false),"
+                    f"{sync_part}"
+                )
+            else:
+                # Fast test mode. Keep the journal ENABLED but skip the explicit
+                # close-checkpoint (see ``close``). Counter-intuitively, keeping
+                # logging on is the fast path: ``WT_CONNECTION->close`` only
+                # implicit-checkpoints (an fsync) when logging is *off*, so
+                # ``log=off`` is actually SLOWER on close once real data has been
+                # written. With logging on and no explicit checkpoint, close does
+                # no fsync — that removed fsync is what avoids the per-worker disk
+                # serialisation under xdist. (Data stays recoverable via log
+                # replay on reopen; the checkpoint the durable path adds bounds
+                # recovery time and truncates the log — see FORCE_DURABLE.)
+                config = (
+                    f"create,session_max={session_max},cache_size={cache_size},"
+                    f"log=(enabled=true,file_max=10MB,prealloc=false),"
+                    f"transaction_sync=(enabled=false,method=fsync)"
+                )
         # The on-disk WT home is stashed so ``create_archive`` can tar
         # it after a checkpoint without re-deriving the path.
         self.home_path = home
@@ -1344,6 +1388,8 @@ class Storage:
         """
         rows: list[dict[str, Any]] = []
         with self._lock:
+            if self._closed:
+                return rows
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_OPLOG_TABLE, None)
@@ -1714,6 +1760,8 @@ class Storage:
         """
         out: list[tuple[int, dict[str, Any]]] = []
         with self._lock:
+            if self._closed:
+                return out
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_OPLOG_TABLE, None)
@@ -1749,6 +1797,8 @@ class Storage:
         Uses a private session for cross-thread visibility (see ``read_oplog``).
         """
         with self._lock:
+            if self._closed:
+                return None
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_PREIMAGE_TABLE, None)
@@ -1851,6 +1901,8 @@ class Storage:
         Uses a private session for cross-thread visibility.
         """
         with self._lock:
+            if self._closed:
+                return 0
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_OPLOG_TABLE, None)
@@ -1872,6 +1924,8 @@ class Storage:
         Uses a private session for cross-thread visibility.
         """
         with self._lock:
+            if self._closed:
+                return 0
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_OPLOG_TABLE, None)
@@ -2277,10 +2331,20 @@ class Storage:
             # behaviour callers reasonably expect from ``close()``.
             # Skip for in-memory backends: WT's in_memory engine
             # rejects checkpoint() with a noisy stderr log
-            # (``__wt_inmem_unsupported_op``) on every call.
-            if not self._in_memory:
+            # (``__wt_inmem_unsupported_op``) on every call. Also skip when
+            # ``durable=False`` (fast test mode): the journal is off and the
+            # storage dir is discarded, so there is nothing to make durable —
+            # this is where the ~5x open/close saving comes from (no fsync).
+            if not self._in_memory and self._durable:
+                # Use a dedicated session opened directly on the connection —
+                # NOT ``self._session()`` — because ``_closed`` is already True
+                # and ``_session()`` now refuses to open on a closed store.
                 try:
-                    self._session().checkpoint()
+                    ck = self._conn.open_session()
+                    try:
+                        ck.checkpoint()
+                    finally:
+                        ck.close()
                 except Exception:
                     log.exception("final checkpoint failed during close")
             for s in self._all_sessions:
@@ -2442,13 +2506,21 @@ class Storage:
         if s is None:
             return
         cursors = getattr(self._tls, "cursors", {}) or {}
-        for c in cursors.values():
-            with contextlib.suppress(Exception):
-                c.close()
-        with contextlib.suppress(Exception):
-            s.close()
-        with self._lock, contextlib.suppress(ValueError):
-            self._all_sessions.remove(s)
+        # Close the cursors + session UNDER THE LOCK and only while the store is
+        # open. Without the lock this races Storage.close()'s ``_all_sessions``
+        # teardown → double-close of the same WT session → use-after-free
+        # segfault. When ``_closed`` is set, close() has already closed every
+        # session in ``_all_sessions`` (including this one), so we must not touch
+        # WT — just drop the thread-local references.
+        with self._lock:
+            if not self._closed:
+                for c in cursors.values():
+                    with contextlib.suppress(Exception):
+                        c.close()
+                with contextlib.suppress(Exception):
+                    s.close()
+                with contextlib.suppress(ValueError):
+                    self._all_sessions.remove(s)
         self._tls.session = None
         self._tls.cursors = {}
 
@@ -2651,10 +2723,18 @@ class Storage:
     def _session(self) -> Any:
         s = getattr(self._tls, "session", None)
         if s is None:
-            s = self._conn.open_session()
-            self._tls.session = s
-            self._tls.cursors = {}
+            # Open the session UNDER THE LOCK, and refuse if the store is
+            # closed. Without this fence, a connection thread opening its first
+            # session races Storage.close()'s ``conn.close()`` — ``open_session``
+            # on a torn-down connection is a use-after-free (segfault). ``_lock``
+            # is an RLock, so callers that already hold it (public methods) are
+            # unaffected.
             with self._lock:
+                if self._closed:
+                    raise RuntimeError("Storage is closed")
+                s = self._conn.open_session()
+                self._tls.session = s
+                self._tls.cursors = {}
                 self._all_sessions.append(s)
         return s
 

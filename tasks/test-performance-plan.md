@@ -101,23 +101,32 @@ nightly so coverage is preserved. Audit other >5 s tests for the same.
   pending the `n12_no_stress` measurement (§5).
 - Effort: trivial. Risk: low (must wire a CI `slow` lane).
 
-**I2a — Test-mode WT config: no journal, no close-checkpoint.**  *[medium / high]* — 🔬 **MEASURED (validated)**
-Add `Storage(..., durable=False)` opening with `log=(enabled=false)` and
-skipping the checkpoint on `close()`. Keeps on-disk schema / tables / B-tree /
-reopen fidelity (guardrail satisfied) while cutting start/stop hard.
-- **Measured** (raw-WT prototype, main venv, `scratchpad/wt_floor.py`, replicating
-  the real 12-table open + close): durable open+close **~245 ms** (median;
-  **spikes to >2 s under parallel disk load** — the journal + checkpoint fsync
-  serialise under contention) vs nodurable **~52 ms, stable** (journal off, no
-  checkpoint, all 12 tables still created on disk). **~79 % faster per instance;
-  aggregate ~79 s → ~17 s** over ~3848 tests @ -n12 — and *more* than that under
-  real -n12 fsync contention, since nodurable removes the fsync entirely.
-- Effort: thread one flag `SecantusDBServer → Storage`; audit which fixtures
-  need durability. Risk: medium — persistence / reopen / PITR fixtures MUST keep
-  `durable=True` (they assert journal-replay / checkpoint recovery). Opt-in;
-  default stays durable so the guardrail holds.
-- The current tip already dropped journal `prealloc` (`prealloc=false`), so the
-  245 ms is post that win; the remaining cost is journal writes + close fsync.
+**I2a — Fast test-storage mode (`durable=False`).**  *[medium / modest]* — ✅ **SHIPPED (b171)**, but the win is ~9 %, not 79 %.
+`Storage` / `SecantusDBServer` gained a `durable` parameter; the test conftest
+sets `SECANTUS_TEST_FAST_STORAGE=1` so the default suite runs `durable=False`
+(journal **on**, close-checkpoint **skipped**). `SECANTUS_FORCE_DURABLE=1`
+overrides back to durable (CI lane + local durable runs). Persistence / reopen /
+PITR fixtures pass `durable=True`.
+- **The 79 % projection was wrong — a no-data measurement artifact.** The raw
+  `wt_floor` "245 ms → 52 ms" compared open+close with *no rows written*. With
+  real data the picture changes: (1) `log=off` is *slower* on close, because
+  `WT_CONNECTION->close` does an implicit checkpoint when logging is off — so the
+  fast path is **log on, skip the explicit checkpoint** (empirical probe: 253 ms
+  durable vs 233 ms, ~8 % in isolation); (2) real tests write data whose close
+  cost dwarfs the empty-table case.
+- **Measured on the real suite (-n12, worktree, pinned):** FAST **202 s** vs
+  FORCE_DURABLE **223 s** — **~9 % (21 s)**, both 3847 passed. Consistent with
+  the isolated ~8 %. This matches the scaling analysis (the suite is near its
+  floor); do not expect more.
+- **Landing it surfaced a real storage bug — the actual value of this work.**
+  Skipping the close-checkpoint removed the timing that masked a use-after-free
+  race: `_session` / `_reset_thread_session` / the oplog readers touched WT
+  *outside* the storage lock and raced `close()`'s teardown → **segfault** under
+  parallel teardown (crashed 3 workers, aborted at 439/3847). Fixed by fencing
+  all of them against `_closed` under the lock. Shipped alongside I2a; it is the
+  robustness headline, the 9 % is the footnote. (The pure-Rust server already
+  drains connection threads to zero before closing + uses per-op RAII sessions —
+  unaffected.)
 
 **I2b — Module-scoped server fixtures with per-test namespaces.**  *[med-high / high]*
 Convert the ~30 function-scoped `server(tmp_path)` fixtures to module scope,
@@ -136,10 +145,17 @@ cluster in a balanced `xdist_group` so it doesn't pile on one worker; mark
 redundant archive-format variants `slow`.
 - Impact (est): ~20–40 s. Effort: medium. Risk: low-med (keep each scenario).
 
-**I4 — xdist balancing.**  *[cheap / pending]*
-Decide `loadgroup` vs `loadscope` and worker count from the §5 scaling curve.
-If wall is flat 12→8, we're serial-tail-bound (fix via I1/I3); if it scales,
-spread the heavy tests so they don't serialise on one worker.
+**I4 — xdist balancing.**  *[cheap]* — ❌ **WON'T DO (measured)**
+The scaling curve (clean, HEAD-pinned): **-n4 302.8 s → -n8 237.9 s → -n12
+218.8 s** — 3× the workers buys only **1.38×**. Amdahl fit: **serial floor
+S ≈ 177 s, parallel P ≈ 504 s** (n8 predicted 240 s vs measured 238 s ✓). So
+~177 s of the ~219 s wall at n12 is a **fixed floor more workers can't touch**,
+and it lines up with the WT close-checkpoint fsync serialising on one disk — the
+suite is I/O-bound, not CPU-bound. **You can't rebalance out of a disk-fsync
+floor.** Reducing total work (I2a) is the only lever, and even that is ~9 %
+because keeping the journal on retains most of the cost. The 43 s stress test
+contributes ~0 at n12 (fully absorbed) — I1's value is the low-worker local loop,
+not CI wall.
 
 ### pymongo gauges
 

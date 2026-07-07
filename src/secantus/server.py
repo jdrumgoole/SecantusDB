@@ -85,6 +85,7 @@ class SecantusDBServer:
         cache_size: str = "1G",
         session_max: int = 1000,
         sync_on_commit: bool = False,
+        durable: bool | None = None,
         transaction_lifetime_seconds: float = 60.0,
         tls_cert_file: str | None = None,
         tls_key_file: str | None = None,
@@ -168,6 +169,7 @@ class SecantusDBServer:
             cache_size=cache_size,
             session_max=session_max,
             sync_on_commit=sync_on_commit,
+            durable=durable,
         )
         # Replica-set initiation: seed the bootstrap oplog noop so
         # ``local.oplog.rs`` is never empty (mongod parity). No-op when the

@@ -187,6 +187,20 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: uv run python -m pytest -m slow --timeout=120 --timeout-method=thread --max-worker-restart=3
 
+      - name: Durable-storage tests
+        # The default suite above runs FAST (the test conftest sets
+        # ``SECANTUS_TEST_FAST_STORAGE=1``: journal on, close-checkpoint skipped),
+        # so it does NOT exercise the checkpoint-durability path. Re-run the whole
+        # suite here with ``SECANTUS_FORCE_DURABLE=1`` — which overrides the fast
+        # default inside ``Storage`` — so the real journal + close-checkpoint
+        # durability behaviour (schema, persistence, close-and-reopen, PITR /
+        # backup) is exercised on every push. Once, on Linux, reusing the env the
+        # matrix already built. This is the "real durable disk testing" path.
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          SECANTUS_FORCE_DURABLE: "1"
+        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
+
   # The matrix above runs the pure-Python server. This job builds the Rust core
   # (``_secantus_core``) and pins each Rust engine byte-for-byte against its
   # pure-Python counterpart via the engine-parity suites (the operator oracle).
