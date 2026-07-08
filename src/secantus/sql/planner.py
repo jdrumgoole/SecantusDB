@@ -4836,8 +4836,8 @@ def _has_array_operand(node: exp.Expression, resolve: Resolve) -> bool:
 
 def _date_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
     """Result tag of a date / time ``Add`` / ``Sub``: ``date - date -> int4``,
-    ``date ± int -> date``, ``date ± interval -> timestamptz``, and
-    ``time - time -> interval``. None when it's not a date/time operation."""
+    ``date ± int -> date``, ``date ± interval -> timestamp`` (naive, per Postgres),
+    and ``time - time -> interval``. None when it's not a date/time operation."""
     lt = _infer_scalar_tag(node.this, resolve)
     rt = _infer_scalar_tag(node.expression, resolve)
     ints = ("int4", "int8")
@@ -4847,7 +4847,7 @@ def _date_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
         if lt == "date" and rt in ints:
             return "date"
         if lt == "date" and rt == "interval":
-            return "timestamptz"
+            return "timestamp"
         if lt == "time" and rt == "time":
             return "interval"
     elif isinstance(node, exp.Add):
@@ -4856,20 +4856,30 @@ def _date_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
         if rt == "date" and lt in ints:
             return "date"
         if (lt == "date" and rt == "interval") or (rt == "date" and lt == "interval"):
-            return "timestamptz"
+            return "timestamp"
     return None
+
+
+_TS_TAGS = ("timestamp", "timestamptz")
 
 
 def _interval_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
     """Result tag of an ``Add`` / ``Sub`` / ``Mul`` / ``Div`` involving an interval
-    or a timestamp difference, or None when neither applies."""
+    or a timestamp difference, or None when neither applies.
+
+    ``timestamp(tz) - timestamp(tz) -> interval``; ``timestamp ± interval`` keeps
+    the timestamp's tz-ness (``timestamptz ± interval -> timestamptz``,
+    ``timestamp ± interval -> timestamp``)."""
     lt = _infer_scalar_tag(node.this, resolve)
     rt = _infer_scalar_tag(node.expression, resolve)
-    if isinstance(node, exp.Sub) and lt == "timestamptz" and rt == "timestamptz":
+    if isinstance(node, exp.Sub) and lt in _TS_TAGS and rt in _TS_TAGS:
         return "interval"
     if "interval" in (lt, rt):
-        if isinstance(node, (exp.Add, exp.Sub)) and (lt == "timestamptz" or rt == "timestamptz"):
-            return "timestamptz"
+        if isinstance(node, (exp.Add, exp.Sub)):
+            if lt == "timestamptz" or rt == "timestamptz":
+                return "timestamptz"
+            if lt == "timestamp" or rt == "timestamp":
+                return "timestamp"
         return "interval"
     return None
 
@@ -5072,6 +5082,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
                 "bool",
                 "interval",
                 "timestamptz",
+                "timestamp",
                 "uuid",
                 "date",
                 "time",

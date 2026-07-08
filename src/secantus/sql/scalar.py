@@ -1201,17 +1201,20 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         if to_tag_early == "time":
             return _datetimes.parse_time(value)
         return _datetimes.parse_timetz(value)
-    # ``timestamp '2020-01-31'`` / ``date '…'`` -> a real datetime so interval and
-    # date arithmetic land on a temporal value rather than a bare string.
-    if (
-        value is not None
-        and to_tag_early == "timestamptz"
-        and not isinstance(value, (_dt.datetime, _dt.date))
-    ):
-        try:
-            return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except ValueError:
+    # ``timestamp '2020-01-31'`` / ``timestamptz '…'`` -> a real datetime so
+    # interval and date arithmetic land on a temporal value rather than a bare
+    # string. ``timestamp`` is naive (any offset dropped); ``timestamptz`` keeps
+    # the parsed instant. Casting an existing datetime to ``timestamp`` strips tz.
+    if value is not None and to_tag_early in ("timestamp", "timestamptz"):
+        if isinstance(value, _dt.datetime):
+            if to_tag_early == "timestamp" and value.tzinfo is not None:
+                return value.replace(tzinfo=None)
             return value
+        if not isinstance(value, _dt.date):
+            try:
+                return typemap.coerce(value, to_tag_early)
+            except ValueError:
+                return value
     if (
         value is not None
         and (

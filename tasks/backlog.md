@@ -2877,8 +2877,8 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `timestamp + interval` (PG: naive `timestamp`) come back tz-aware UTC here (both embedded and wire).
   `test_date_plus_interval_is_timestamp` / `test_timestamp_plus_interval` assert the tz-aware value and note
   the divergence. A real naive-`timestamp` type (tag + OID 1114 + render/coerce/round-trip) is a larger
-  slice, deferred. (The related WHERE `timestamptz_col = '…+00:00'` / `::timestamptz` filter-coercion quirk
-  is **fixed in #142, b182** — see below.)
+  slice — **now landed in #143, b183 (see below).** (The related WHERE `timestamptz_col = '…+00:00'` /
+  `::timestamptz` filter-coercion quirk is **fixed in #142, b182** — see below.)
 - [ ] **timestamptz WHERE-equality bridges naive/aware (#142, b182):** `WHERE ts = '…+00:00'` /
   `= '…'::timestamptz` used to match **nothing** — the equality path (`query._eq_numeric_aware`, shared by
   bare equality / `$eq` / `$in` / `$ne`) did numeric coercion but not the tz-aware/naive datetime alignment
@@ -2892,6 +2892,24 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   from the Rust `eq_scalar` (which compares `Bson::DateTime` millis). Tests: `test_query.py`
   ::test_datetime_naive_aware_equality_same_instant + `test_sql_datetime_types.py`
   ::test_timestamptz_where_equality_matches_offset_literal / _uses_index.
+- [ ] **Distinct naive `timestamp` type (#143, b183):** `TIMESTAMP` / `DATETIME` (and `::timestamp` casts,
+  `timestamp '…'` literals, `date + interval` / `timestamp + interval` arithmetic) now type as a distinct
+  **`timestamp`** tag (OID 1114, `timestamp without time zone`) instead of collapsing to `timestamptz`
+  (1184) — matching Postgres, which types those naive. Only explicit `TIMESTAMPTZ` /
+  `TIMESTAMP WITH TIME ZONE` (and `now()` / `current_timestamp`) stay tz-aware. Wiring: `typemap.PG_OID` /
+  `SQL_TYPE_NAME` / `PG_TYPENAME` / `_DATATYPE_TAGS` / `_ARRAY_PG_OID` (1115) gain a `timestamp` entry;
+  `coerce` drops any offset (keeps wall-clock fields, PG semantics); `to_pg_text` renders naive (no offset);
+  `scalar._eval_cast` produces a naive datetime for a `timestamp` cast and strips tz when casting an aware
+  value to `timestamp`; `planner._date_arith_tag` / `_interval_arith_tag` return `timestamp` (naive) for
+  `date/timestamp ± interval` and `timestamp - timestamp -> interval`. `engine._normalize_result` (from #141)
+  only UTC-tags `timestamptz`, so a `timestamp` result stays naive end-to-end (embedded + wire; pg8000
+  decodes OID 1114 as a naive datetime). Reflected as `timestamp without time zone` in
+  `information_schema.columns`. The #141 arithmetic tests are reverted to assert naive; new regression tests:
+  `test_sql_datetime_types.py::test_timestamp_column_is_naive / _oid_and_typename / _literal_drops_offset /
+  test_cast_timestamptz_to_timestamp_strips_tz / test_timestamp_array_naive`. SQL-layer change only — no Rust
+  parity impact (the Rust engines cover query/update/expr/aggregate, not the SQL type mapping). **Remaining
+  limitation:** function returns (`date_trunc`, etc.) still type `timestamptz` regardless of argument tz-ness
+  (would need argument-type threading through function typing) — low priority.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
