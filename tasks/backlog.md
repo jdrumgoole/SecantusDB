@@ -2698,9 +2698,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `ALTER TABLE IF EXISTS` on a missing table is a no-op; dropping the PK column is rejected
   (`0A000`). `execute_alter_table` / `_apply_alter_action` in `executor.py`; catalog rewrite via
   `Catalog.replace`. `ALTER COLUMN … TYPE t` (retype in catalog) and `SET`/`DROP DEFAULT` landed in
-  b84 (see below). **Limitation:** **multiple actions in one statement** are unsupported — sqlglot
-  parses a comma-separated action list (`ADD …, DROP …`) as an opaque `Command`, so each action must
-  be its own statement.
+  b84 (see below). **Multiple actions in one statement landed (#145, b185):** a *mixed-kind* action list
+  (`ADD …, DROP …`) exceeds sqlglot's ALTER parser and falls back to an opaque `Command`, so
+  `engine._run_mixed_alter_table` splits the list at top-level commas (`_split_top_level_commas`,
+  paren/quote-aware), re-parses each action as its own single-action `ALTER TABLE` (sqlglot handles any
+  single action → `exp.Alter`), and merges the actions into one `exp.Alter` routed through the normal
+  single-ALTER path. Homogeneous lists (all-ADD / all-DROP) already parsed natively and were unaffected.
+  Handles `IF EXISTS` and preserves data through a mid-list `RENAME COLUMN`. Tests: `test_sql_alter.py`
+  (`test_multi_action_*`).
 - [ ] **Literal column DEFAULTs + `ALTER COLUMN TYPE` / `SET`/`DROP DEFAULT` landed** (b84). `Column`
   gained `has_default` / `default`; a literal DEFAULT (number / string / bool / NULL) from `CREATE
   TABLE` (`planner._column_default`) or `ALTER COLUMN SET DEFAULT` is filled in for an omitted column

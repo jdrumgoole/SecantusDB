@@ -185,3 +185,45 @@ def test_alter_missing_table_errors(storage, session):
 def test_alter_if_exists_missing_table_is_noop(storage, session):
     res = q(storage, session, "ALTER TABLE IF EXISTS nope ADD COLUMN x int")
     assert res.command_tag == "ALTER TABLE"
+
+
+# -- multi-action (mixed-kind) ALTER TABLE (#145) --------------------------- #
+
+
+def test_multi_action_mixed_add_drop(storage, session):
+    q(storage, session, "ALTER TABLE t ADD COLUMN c int, DROP COLUMN b")
+    names = [col.name for col in q(storage, session, "SELECT * FROM t").columns]
+    assert names == ["id", "a", "c"]
+    # existing rows keep their data; the new column reads NULL.
+    assert rows(storage, session, "SELECT id, a, c FROM t ORDER BY id") == [
+        (1, "x", None),
+        (2, "y", None),
+    ]
+
+
+def test_multi_action_rename_add_drop(storage, session):
+    q(storage, session, "ALTER TABLE t RENAME COLUMN a TO aa, ADD COLUMN c text, DROP COLUMN b")
+    names = [col.name for col in q(storage, session, "SELECT * FROM t").columns]
+    assert names == ["id", "aa", "c"]
+    # the renamed column keeps its values.
+    assert rows(storage, session, "SELECT id, aa FROM t ORDER BY id") == [(1, "x"), (2, "y")]
+
+
+def test_multi_action_add_column_and_constraint(storage, session):
+    q(storage, session, "ALTER TABLE t ADD COLUMN c int, ADD CONSTRAINT ck CHECK (c >= 0)")
+    names = [col.name for col in q(storage, session, "SELECT * FROM t").columns]
+    assert names == ["id", "a", "b", "c"]
+    # the CHECK is enforced on write.
+    with pytest.raises(errors.SQLError):
+        q(storage, session, "INSERT INTO t (id, c) VALUES (3, -1)")
+
+
+def test_multi_action_if_exists(storage, session):
+    q(storage, session, "ALTER TABLE IF EXISTS t ADD COLUMN c int, DROP COLUMN a")
+    names = [col.name for col in q(storage, session, "SELECT * FROM t").columns]
+    assert names == ["id", "b", "c"]
+
+
+def test_multi_action_if_exists_missing_table_is_noop(storage, session):
+    # IF EXISTS on a missing table is a silent no-op even with multiple actions.
+    q(storage, session, "ALTER TABLE IF EXISTS nope ADD COLUMN c int, DROP COLUMN d")
