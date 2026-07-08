@@ -174,6 +174,38 @@ options carry, and `set_index_expiry`. Cross-server restore is byte-faithful bot
 ways (`tests/test_rust_pitr_cross_server.py`, `tests/test_rust_binary_pitr.py`).
 Plan/history: `tasks/rust-pitr-phase-r-plan.md`.
 
+### 3.6 Test-cycle performance (deferred levers)
+
+Full analysis + the measured scaling curve live in
+`tasks/test-performance-plan.md`. **Shipped** from that plan: I1 (stress test →
+`@pytest.mark.slow` + a CI `slow` lane), I2a (opt-in fast test storage
+`durable=False`, ~9% off the inner-loop wall, with a `SECANTUS_FORCE_DURABLE`
+full-suite CI lane so checkpoint-durability stays covered), the storage
+close-path use-after-free / double-close fix (`_session` /
+`_reset_thread_session` / oplog readers now fenced against `_closed` under the
+lock), and the `secantus-conn-*` stop-drain stack-dump diagnostic.
+**Won't-do:** I4 (xdist balancing) — measured: the suite is I/O-bound with a
+~177 s serial floor (fsync-bound) that no rebalancing can touch. **Already
+done:** V1 (gauge build caching) — `validate.yml` already caches every
+from-source build via `actions/cache`.
+
+Deferred, low value / risk — revisit only if inner-loop wall becomes a real
+pain point again:
+
+- **I2b — module-scoped server fixtures.** Convert the ~30 function-scoped
+  `server(tmp_path)` fixtures to module scope (unique db/collection per test) to
+  cut the *number* of WT open/close cycles. Modest upside (scaling curve shows
+  the suite near its floor) and real risk: shared oplog / cluster-time across a
+  module, so oplog / change-stream / reopen / capped / TTL-clock tests must stay
+  function-scoped. Not worth it now.
+- **V3 — `run-tests.php -j N` for the PHP-ext gauge.** Parallelise the ~712
+  process-spawn `.phpt` runs. Blocked on flake risk: all `.phpt` hit one shared
+  SecantusDB daemon — the contention CLAUDE.md flags at high concurrency. Needs
+  a local PHP toolchain + a flake-diff-vs-serial run before adopting.
+- **V2 — toolchain-daemon reuse in `validate-all`** (shared Gradle daemon across
+  Java+Kotlin; dotnet incremental build; skip the gpg libmongocrypt re-verify
+  when unchanged). Modest, and only affects the weekly CI wall.
+
 ## 4. Out of scope (intentional, with reasoning)
 
 These are explicit non-goals. Don't add them without a reason.
