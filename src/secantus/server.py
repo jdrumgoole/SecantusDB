@@ -6,8 +6,10 @@ import logging
 import select
 import socket
 import ssl
+import sys
 import threading
 import time
+import traceback
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -297,10 +299,33 @@ class SecantusDBServer:
         if remaining:
             logger.warning(
                 "server stop: %d connection thread(s) still active after %.1fs; "
-                "closing storage anyway",
+                "closing storage anyway. Storage's per-op `_closed` fences keep "
+                "this safe (all WT access is lock-serialised against close), but a "
+                "persistently stuck connection thread is a bug — its stack(s):\n%s",
                 remaining,
                 timeout,
+                self._format_stuck_conn_stacks(),
             )
+
+    @staticmethod
+    def _format_stuck_conn_stacks() -> str:
+        """Render the stacks of any still-live per-connection handler threads,
+        for the stop-drain timeout warning. The thread names set in
+        ``_serve_forever`` (``secantus-conn-<host>:<port>``) identify each one,
+        so a shutdown wedge — historically the source of intermittent xdist
+        worker deaths in this area — names its own culprit instead of surfacing
+        as an opaque active-connection count."""
+        frames = sys._current_frames()
+        chunks: list[str] = []
+        for thread in threading.enumerate():
+            if not thread.name.startswith("secantus-conn-"):
+                continue
+            frame = frames.get(thread.ident)
+            if frame is None:
+                continue
+            stack = "".join(traceback.format_stack(frame))
+            chunks.append(f"--- {thread.name} ---\n{stack}")
+        return "\n".join(chunks) if chunks else "(no connection-thread frames captured)"
 
     def wait(self) -> None:
         self._stop_event.wait()
@@ -355,6 +380,10 @@ class SecantusDBServer:
             handler = threading.Thread(
                 target=self._handle_client,
                 args=(conn, addr),
+                # Named so a stop-drain timeout can dump exactly which
+                # connection threads are still live (see
+                # ``_format_stuck_conn_stacks``).
+                name=f"secantus-conn-{addr[0]}:{addr[1]}",
                 daemon=True,
             )
             handler.start()
