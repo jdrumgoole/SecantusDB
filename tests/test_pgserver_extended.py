@@ -13,7 +13,7 @@ import pytest
 
 from secantus.sql import pgwire
 from secantus.sql.pgserver import SecantusPGServer
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 
 class ExtClient:
@@ -71,13 +71,15 @@ def command_tag(msgs: list[pgwire.Message]) -> str | None:
 
 
 @pytest.fixture
-def server():
-    srv = SecantusPGServer(port=0, storage=FakeStorage())
+def server(tmp_path):
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st)
     srv.start()
     try:
         yield srv
     finally:
         srv.stop()
+        st.close()
 
 
 @pytest.fixture

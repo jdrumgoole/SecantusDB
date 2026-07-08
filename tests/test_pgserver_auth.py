@@ -22,7 +22,7 @@ import trustme
 from secantus.auth import saslprep
 from secantus.sql import pgwire
 from secantus.sql.pgserver import SecantusPGServer
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 
 def _read_until_ready(sock) -> list[pgwire.Message]:
@@ -69,15 +69,15 @@ def _startup(sock, user="joe", database="db"):
 
 
 @pytest.fixture
-def auth_server():
-    srv = SecantusPGServer(
-        port=0, storage=FakeStorage(), require_auth=True, users={"joe": "s3cret"}
-    )
+def auth_server(tmp_path):
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st, require_auth=True, users={"joe": "s3cret"})
     srv.start()
     try:
         yield srv
     finally:
         srv.stop()
+        st.close()
 
 
 def test_scram_auth_success_then_query(auth_server):
@@ -125,8 +125,9 @@ def test_scram_unknown_user_rejected(auth_server):
         s.close()
 
 
-def test_no_auth_required_stays_trust():
-    srv = SecantusPGServer(port=0, storage=FakeStorage())  # require_auth defaults False
+def test_no_auth_required_stays_trust(tmp_path):
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st)  # require_auth defaults False
     srv.start()
     try:
         host, port = srv.address
@@ -138,6 +139,7 @@ def test_no_auth_required_stays_trust():
         s.close()
     finally:
         srv.stop()
+        st.close()
 
 
 @pytest.fixture
@@ -148,9 +150,10 @@ def tls_server(tmp_path):
     key_file = tmp_path / "server.key"
     cert.cert_chain_pems[0].write_to_path(cert_file)
     cert.private_key_pem.write_to_path(key_file)
+    st = Storage(str(tmp_path / "wt"))
     srv = SecantusPGServer(
         port=0,
-        storage=FakeStorage(),
+        storage=st,
         tls_cert_file=str(cert_file),
         tls_key_file=str(key_file),
     )
@@ -159,6 +162,7 @@ def tls_server(tmp_path):
         yield srv, ca
     finally:
         srv.stop()
+        st.close()
 
 
 def test_tls_request_accepted_and_query_over_tls(tls_server):
@@ -185,8 +189,9 @@ def test_tls_request_accepted_and_query_over_tls(tls_server):
         raw.close()
 
 
-def test_tls_declined_when_not_configured():
-    srv = SecantusPGServer(port=0, storage=FakeStorage())
+def test_tls_declined_when_not_configured(tmp_path):
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st)
     srv.start()
     try:
         host, port = srv.address
@@ -196,6 +201,7 @@ def test_tls_declined_when_not_configured():
         s.close()
     finally:
         srv.stop()
+        st.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -223,7 +229,6 @@ def authz_server(tmp_path):
     # API before the server starts; the wire clients are then gated by roles.
     from secantus.sql import run_sql
     from secantus.sql.session import Session
-    from secantus.storage import Storage
 
     storage = Storage(str(tmp_path))
     seed = Session(database="db")

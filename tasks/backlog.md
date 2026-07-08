@@ -2828,6 +2828,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   REVOKE are accepted but ignored (no dependency tracking); a membership referencing a name that isn't a
   declared role or the connecting user reflects with `oid 0` (won't join to `pg_roles`); no cycle detection.
   Not ported to the Rust server.
+- [ ] **FakeStorage removed — all SQL/PG tests on real Storage** (#140, b179): the legacy `tests/sqlfake.py`
+  mock is deleted; every SQL / pg-server test now drives the real WiredTiger `Storage(str(tmp_path))` with a
+  `try: yield finally: s.close()` fixture. The migration surfaced (and this slice fixed) four real bugs the
+  mock had masked: (1) `query._coerce_datetime` — a tz-aware SQL literal vs a tz-naive-UTC stored datetime
+  raised a `TypeError` that was swallowed → silently-empty WHERE result; now naive is treated as UTC; (2)
+  `typemap` `bytea` equality (`Binary(x, 0)` vs `bytes`) fixed in the batch migration; (3)
+  `engine.describe_statement` now runs its planning reads inside the session's open transaction, so the
+  extended-protocol Describe sees the connection's own uncommitted `CREATE TABLE` — previously it returned
+  `NoData` while Execute (which runs in the txn) emitted `DataRow`s, a protocol violation that crashed
+  pg8000 on `CREATE + INSERT + parameterised SELECT` in one txn; (4) `typemap.to_pg_text` tags a tz-naive
+  `timestamptz` as UTC before rendering so the wire text format carries the offset (client parses tz-aware).
+  **Remaining (task #141):** the *embedded* `run_sql` result still surfaces a stored `timestamptz` tz-naive
+  (BSON decodes naive); the wire path is now tz-aware. `tests/test_sql_datetime_funcs.py` +
+  `test_sql_spike.py` carry a small UTC-normalising shim (commented, referencing #141) so they assert the
+  PG-correct tz-aware instant; remove the shim when #141 lands.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by

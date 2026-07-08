@@ -10,15 +10,20 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "d"
 
 
 def _run(sql, sess=None, st=None):
-    st = st or FakeStorage()
     sess = sess or Session(database=DB)
-    return run_sql(st, DB, sql, session=sess)[-1]
+    if st is not None:
+        return run_sql(st, DB, sql, session=sess)[-1]
+    st = Storage(":memory:")
+    try:
+        return run_sql(st, DB, sql, session=sess)[-1]
+    finally:
+        st.close()
 
 
 def _rows(sql):

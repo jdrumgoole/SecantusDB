@@ -12,7 +12,7 @@ import pytest
 
 from secantus.sql import SQLError, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -23,8 +23,8 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     s.insert(
         DB,
         "a",
@@ -44,7 +44,10 @@ def storage():
             {"_id": bson.Int64(3), "n": bson.Int64(4)},
         ],
     )
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def rows(storage, session, sql):
@@ -113,24 +116,30 @@ def test_union_order_by_ordinal(storage, session):
     assert res == [(1,), (2,), (3,), (4,)]
 
 
-def test_chained_union(storage, session):
-    s = FakeStorage()
-    s.insert(DB, "x", [{"_id": bson.Int64(1), "n": bson.Int64(1)}])
-    s.insert(DB, "y", [{"_id": bson.Int64(1), "n": bson.Int64(2)}])
-    s.insert(DB, "z", [{"_id": bson.Int64(1), "n": bson.Int64(3)}])
-    assert vals(s, session, "SELECT n FROM x UNION SELECT n FROM y UNION SELECT n FROM z") == [
-        1,
-        2,
-        3,
-    ]
+def test_chained_union(session, tmp_path):
+    s = Storage(str(tmp_path / "chain"))
+    try:
+        s.insert(DB, "x", [{"_id": bson.Int64(1), "n": bson.Int64(1)}])
+        s.insert(DB, "y", [{"_id": bson.Int64(1), "n": bson.Int64(2)}])
+        s.insert(DB, "z", [{"_id": bson.Int64(1), "n": bson.Int64(3)}])
+        assert vals(s, session, "SELECT n FROM x UNION SELECT n FROM y UNION SELECT n FROM z") == [
+            1,
+            2,
+            3,
+        ]
+    finally:
+        s.close()
 
 
-def test_union_multi_column(storage, session):
-    s = FakeStorage()
-    s.insert(DB, "p", [{"_id": bson.Int64(1), "g": "x", "n": bson.Int64(1)}])
-    s.insert(DB, "q", [{"_id": bson.Int64(1), "g": "x", "n": bson.Int64(1)}])
-    # Identical (g, n) rows collapse under UNION.
-    assert rows(s, session, "SELECT g, n FROM p UNION SELECT g, n FROM q") == [("x", 1)]
+def test_union_multi_column(session, tmp_path):
+    s = Storage(str(tmp_path / "multi"))
+    try:
+        s.insert(DB, "p", [{"_id": bson.Int64(1), "g": "x", "n": bson.Int64(1)}])
+        s.insert(DB, "q", [{"_id": bson.Int64(1), "g": "x", "n": bson.Int64(1)}])
+        # Identical (g, n) rows collapse under UNION.
+        assert rows(s, session, "SELECT g, n FROM p UNION SELECT g, n FROM q") == [("x", 1)]
+    finally:
+        s.close()
 
 
 def test_arity_mismatch_rejected(storage, session):

@@ -22,19 +22,21 @@ import trustme
 
 from secantus.sql import pgwire
 from secantus.sql.pgserver import SecantusPGServer
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 pg8000 = pytest.importorskip("pg8000.dbapi")
 
 
 @pytest.fixture
-def server():
-    srv = SecantusPGServer(port=0, storage=FakeStorage())
+def server(tmp_path):
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st)
     srv.start()
     try:
         yield srv
     finally:
         srv.stop()
+        st.close()
 
 
 def connect(srv, **kw):
@@ -1761,10 +1763,9 @@ def test_explain_via_driver(server):
 # -- auth / TLS via the real driver ------------------------------------------ #
 
 
-def test_scram_auth_success_and_failure():
-    srv = SecantusPGServer(
-        port=0, storage=FakeStorage(), require_auth=True, users={"joe": "s3cret"}
-    )
+def test_scram_auth_success_and_failure(tmp_path):
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st, require_auth=True, users={"joe": "s3cret"})
     srv.start()
     try:
         host, port = srv.address
@@ -1777,6 +1778,7 @@ def test_scram_auth_success_and_failure():
             pg8000.connect(user="joe", password="wrong", host=host, port=port, database="db")
     finally:
         srv.stop()
+        st.close()
 
 
 def test_tls_connection(tmp_path):
@@ -1785,8 +1787,9 @@ def test_tls_connection(tmp_path):
     cert_file, key_file = tmp_path / "c.pem", tmp_path / "c.key"
     cert.cert_chain_pems[0].write_to_path(cert_file)
     cert.private_key_pem.write_to_path(key_file)
+    st = Storage(str(tmp_path / "wt"))
     srv = SecantusPGServer(
-        port=0, storage=FakeStorage(), tls_cert_file=str(cert_file), tls_key_file=str(key_file)
+        port=0, storage=st, tls_cert_file=str(cert_file), tls_key_file=str(key_file)
     )
     srv.start()
     try:
@@ -1800,6 +1803,7 @@ def test_tls_connection(tmp_path):
         conn.close()
     finally:
         srv.stop()
+        st.close()
 
 
 # -- SQLAlchemy (uses pg8000 as its driver) ---------------------------------- #
@@ -2061,9 +2065,16 @@ def test_create_index_and_isolation_via_driver(server):
     cur.execute("CREATE TABLE t (id bigint primary key, label text, n int)")
     cur.execute("CREATE INDEX ix_n ON t (n)")
     cur.execute("CREATE UNIQUE INDEX ux_label ON t (label)")
-    assert {ix["name"] for ix in server.storage.list_indexes("db", "t")} == {"ix_n", "ux_label"}
+    # Real (WT-backed) Storage isolates uncommitted writes from the separate
+    # white-box read below, so commit before inspecting the index list; and it
+    # auto-creates the ``_id_`` index (like mongod), so exclude it from the set.
+    conn.commit()
+    names = {ix["name"] for ix in server.storage.list_indexes("db", "t")} - {"_id_"}
+    assert names == {"ix_n", "ux_label"}
     cur.execute("DROP INDEX ix_n")
-    assert {ix["name"] for ix in server.storage.list_indexes("db", "t")} == {"ux_label"}
+    conn.commit()
+    names = {ix["name"] for ix in server.storage.list_indexes("db", "t")} - {"_id_"}
+    assert names == {"ux_label"}
     # Isolation / read-only characteristics are accepted (single-node no-op).
     cur.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
     cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")

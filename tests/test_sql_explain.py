@@ -12,13 +12,35 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "d"
 
+_STORAGES: list = []
+
+
+def _new_storage():
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    st = Storage(d)
+    _STORAGES.append((st, d))
+    return st
+
+
+@pytest.fixture(autouse=True)
+def _close_storages():
+    import shutil
+
+    yield
+    while _STORAGES:
+        st, d = _STORAGES.pop()
+        st.close()
+        shutil.rmtree(d, ignore_errors=True)
+
 
 def _fresh(with_index=False):
-    st = FakeStorage()
+    st = _new_storage()
     sess = Session(database=DB)
     run_sql(st, DB, "CREATE TABLE t (id int, name text)", session=sess)
     run_sql(st, DB, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')", session=sess)

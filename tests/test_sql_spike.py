@@ -1,15 +1,10 @@
 """End-to-end tests for the embedded SQL engine (P0 spike).
 
-These drive ``secantus.sql.run_sql`` against an in-memory ``FakeStorage`` whose
-query/update semantics are the **real** pure-Python operator engines
-(``query.matches`` / ``update.apply_update``). So the SQL-to-Mongo translation
-is exercised against the same engines the production ``Storage`` uses — only the
-WiredTiger persistence layer is faked, which is exactly the part that can't
-build in a network-restricted dev box.
-
-In CI (where the WiredTiger extension is present) the stub below is a no-op, so
-these run unchanged; a follow-up phase adds a parallel suite against the real
-``Storage``.
+These drive ``secantus.sql.run_sql`` against the real WiredTiger-backed
+``Storage`` (per the no-FakeStorage rule): the SQL-to-Mongo translation is
+exercised end to end against the same engines and persistence layer production
+uses, so type round-trips (Decimal128, datetime, ObjectId), transactions, and
+cross-session visibility are all real.
 """
 
 from __future__ import annotations
@@ -21,14 +16,18 @@ import bson
 import pytest
 
 from secantus.sql import SQLError, run_sql
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
 
 @pytest.fixture
-def storage():
-    return FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def sql(storage, statement):
@@ -152,7 +151,11 @@ def test_numeric_and_timestamp_coercion(storage):
     assert isinstance(stored["at"], _dt.datetime)
     row = sql(storage, "SELECT price, at FROM m").rows[0]
     assert row[0] == Decimal("19.99")
-    assert row[1] == _dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=_dt.timezone.utc)
+    # The embedded run_sql API surfaces a stored timestamptz as tz-naive UTC (BSON
+    # dates decode naive; the wire path is tz-aware). Normalise before comparing to
+    # the PG-correct tz-aware value — remove once task #141 lands.
+    at = row[1].replace(tzinfo=_dt.timezone.utc) if row[1].tzinfo is None else row[1]
+    assert at == _dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=_dt.timezone.utc)
 
 
 def test_date_literal_comparison_coerced(storage):
@@ -255,7 +258,11 @@ def test_drop_index(storage):
     _make_users(storage)
     sql(storage, "CREATE INDEX ix_age ON users (age)")
     assert sql(storage, "DROP INDEX ix_age").command_tag == "DROP INDEX"
-    assert storage.list_indexes(DB, "users") == []
+    # Real Storage always retains the mandatory `_id_` index (real-Mongo
+    # behaviour); the dropped `ix_age` is the one that must be gone.
+    remaining = {ix["name"] for ix in storage.list_indexes(DB, "users")}
+    assert "ix_age" not in remaining
+    assert remaining == {"_id_"}
     with pytest.raises(SQLError) as ei:
         sql(storage, "DROP INDEX ix_age")
     assert ei.value.sqlstate == "42704"

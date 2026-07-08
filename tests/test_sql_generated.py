@@ -11,7 +11,7 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -22,15 +22,18 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run(
         s,
         session,
         "CREATE TABLE t (id int PRIMARY KEY, w int, h int, "
         "area int GENERATED ALWAYS AS (w * h) STORED)",
     )
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def run(storage, session, sql):
@@ -76,8 +79,8 @@ def test_returning_includes_generated_value(storage, session):
     assert res.rows == [(30,)]
 
 
-def test_string_generated_column(session):
-    s = FakeStorage()
+def test_string_generated_column(session, tmp_path):
+    s = Storage(str(tmp_path))
     run(
         s,
         session,

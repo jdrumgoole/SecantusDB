@@ -13,7 +13,7 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -24,11 +24,14 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run_sql(s, DB, "CREATE TABLE users (id bigint primary key, name text)", session=session)
     run_sql(s, DB, "INSERT INTO users (id, name) VALUES (1, 'a'), (2, 'b')", session=session)
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def run(storage, session, sql):

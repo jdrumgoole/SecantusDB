@@ -3,7 +3,7 @@
 The query is materialized at DECLARE; FETCH / MOVE walk a scroll position over
 the stored rows (forward / backward / absolute / relative), so a cursor is fully
 scrollable. WITHOUT HOLD cursors close at COMMIT / ROLLBACK; WITH HOLD survive.
-Driven through ``run_sql`` over ``FakeStorage``.
+Driven through ``run_sql`` over the real ``Storage``.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import pytest
 
 from secantus.sql import SQLError, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -23,13 +23,16 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     sess = Session(database=DB)
     run_sql(s, DB, "CREATE TABLE t (id bigint primary key, n int)", session=sess)
     for i in range(1, 6):
         run_sql(s, DB, f"INSERT INTO t (id, n) VALUES ({i}, {i * 10})", session=sess)
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def q(storage, session, sql):

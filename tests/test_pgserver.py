@@ -16,7 +16,7 @@ import pytest
 
 from secantus.sql import pgwire
 from secantus.sql.pgserver import SecantusPGServer
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 
 class PGClient:
@@ -77,13 +77,15 @@ def parse_results(msgs: list[pgwire.Message]) -> dict:
 
 
 @pytest.fixture
-def server():
-    srv = SecantusPGServer(port=0, storage=FakeStorage())
+def server(tmp_path):
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st)
     srv.start()
     try:
         yield srv
     finally:
         srv.stop()
+        st.close()
 
 
 @pytest.fixture
@@ -225,10 +227,11 @@ def test_information_schema_over_wire(client):
     assert res["rows"] == [[b"widgets"]]
 
 
-def test_connection_cap_rejects_over_limit():
+def test_connection_cap_rejects_over_limit(tmp_path):
     """Over the max_connections cap, an accepted socket is closed immediately
     rather than served (issue #194)."""
-    srv = SecantusPGServer(port=0, storage=FakeStorage(), max_connections=1)
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st, max_connections=1)
     srv.start()
     try:
         host, port = srv.address
@@ -251,3 +254,4 @@ def test_connection_cap_rejects_over_limit():
         c1.close()
     finally:
         srv.stop()
+        st.close()

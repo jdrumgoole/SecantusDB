@@ -16,7 +16,7 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -27,8 +27,8 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
 
     def q(sql):
         run_sql(s, DB, sql, session=session)
@@ -42,7 +42,10 @@ def storage(session):
         q(f"INSERT INTO t (id, name) VALUES ({i}, '{n}')")
     for i, (tid, v) in enumerate([(1, 10), (1, 40), (2, 30), (2, 5), (2, 20)], 1):
         q(f"INSERT INTO u (id, tid, val) VALUES ({i}, {tid}, {v})")
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def rows(storage, session, sql):

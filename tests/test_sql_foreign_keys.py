@@ -13,7 +13,7 @@ import sqlglot
 
 from secantus.sql import planner, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -24,8 +24,8 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run_sql(s, DB, "CREATE TABLE users (id bigint primary key, name text)", session=session)
     run_sql(
         s,
@@ -34,7 +34,10 @@ def storage(session):
         "user_id bigint REFERENCES users(id) ON DELETE CASCADE, total int)",
         session=session,
     )
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def q(storage, session, sql):
@@ -127,10 +130,10 @@ def test_foreign_key_persists_in_catalog(storage, session):
     assert fk.on_delete == "CASCADE"
 
 
-def test_table_level_named_fk_enforces_and_reflects(session):
+def test_table_level_named_fk_enforces_and_reflects(session, tmp_path):
     """A table-level ``CONSTRAINT n FOREIGN KEY`` enforces on write under its
     explicit name and reflects through ``pg_constraint``."""
-    s = FakeStorage()
+    s = Storage(str(tmp_path))
     run_sql(s, DB, "CREATE TABLE users (id bigint primary key, name text)", session=session)
     run_sql(s, DB, "INSERT INTO users (id, name) VALUES (1, 'a')", session=session)
     run_sql(

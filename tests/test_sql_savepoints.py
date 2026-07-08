@@ -4,9 +4,8 @@ A savepoint captures each touched collection's pre-image the first time it's
 written after the savepoint is established; ROLLBACK TO restores those
 pre-images (undoing every later write), keeps the savepoint open, and un-poisons
 an aborted block. RELEASE forgets the savepoint but keeps its writes, merging its
-undo state into the enclosing savepoint. Driven through ``run_sql`` over
-``FakeStorage`` (BEGIN snapshots, abort restores — the same atomicity the
-WT-backed ``Storage`` gives).
+undo state into the enclosing savepoint. Driven through ``run_sql`` over the
+real WT-backed ``Storage`` (BEGIN snapshots, abort restores).
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import pytest
 
 from secantus.sql import SQLError, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -26,10 +25,13 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     run_sql(s, DB, "CREATE TABLE t (id bigint primary key, n int)", session=Session(database=DB))
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def q(storage, session, sql):

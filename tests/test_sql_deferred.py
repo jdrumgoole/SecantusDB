@@ -14,7 +14,7 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -35,11 +35,14 @@ def sqlstate(storage, session, sql):
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run(s, session, "CREATE TABLE parent (id bigint primary key, name text)")
     run(s, session, "INSERT INTO parent (id, name) VALUES (1, 'a')")
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 # -- deferred FK --------------------------------------------------------------- #
@@ -102,8 +105,8 @@ def test_deferrable_initially_immediate_checks_on_write(storage, session):
 
 
 @pytest.fixture
-def uq_storage(session):
-    s = FakeStorage()
+def uq_storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run(
         s,
         session,
@@ -111,7 +114,10 @@ def uq_storage(session):
         "CONSTRAINT t_n_key UNIQUE (n) DEFERRABLE INITIALLY DEFERRED)",
     )
     run(s, session, "INSERT INTO t (id, n) VALUES (1, 10), (2, 20)")
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def test_deferred_unique_swap_commits(uq_storage, session):

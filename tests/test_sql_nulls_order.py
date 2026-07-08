@@ -14,7 +14,7 @@ import pytest
 
 from secantus.sql import run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -25,8 +25,8 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     s.q = lambda sql: run_sql(s, DB, sql, session=Session(database=DB))[0]
     s.q("CREATE TABLE t (id bigint primary key, n int)")
     # n values 5, NULL, 3, NULL, 8
@@ -36,7 +36,10 @@ def storage():
             if n is None
             else f"INSERT INTO t (id, n) VALUES ({i}, {n})"
         )
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def col(storage, session, sql):
@@ -88,15 +91,18 @@ def test_nulls_last_with_limit(storage, session):
 
 
 @pytest.fixture
-def joined(session):
-    s = FakeStorage()
+def joined(session, tmp_path):
+    s = Storage(str(tmp_path))
     s.q = lambda sql: run_sql(s, DB, sql, session=Session(database=DB))[0]
     s.q("CREATE TABLE c (id bigint primary key, region text)")
     s.q("CREATE TABLE o (id bigint primary key, cid int, amt int)")
     s.q("INSERT INTO c (id, region) VALUES (1, 'e'), (2, 'w')")
     # o11 references a missing customer -> region is NULL after the LEFT join.
     s.q("INSERT INTO o (id, cid, amt) VALUES (10, 1, 5), (11, 99, 7)")
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def test_join_order_nulls_last_default(joined, session):
@@ -134,34 +140,44 @@ def test_evaluated_order_nulls_first(joined, session):
 # -- GROUP BY pipeline path ------------------------------------------------- #
 
 
-def test_group_by_order_nulls(session):
-    s = FakeStorage()
-    s.q = lambda sql: run_sql(s, DB, sql, session=Session(database=DB))[0]
-    s.q("CREATE TABLE g (id bigint primary key, k text, v int)")
-    s.q("INSERT INTO g (id, v) VALUES (1, 10)")  # k NULL
-    s.q("INSERT INTO g (id, k, v) VALUES (2, 'x', 20), (3, 'x', 5)")
-    default = run_sql(s, DB, "SELECT k, SUM(v) AS s FROM g GROUP BY k ORDER BY k", session=session)[
-        0
-    ]
-    assert default.rows == [("x", 25), (None, 10)]
-    first = run_sql(
-        s, DB, "SELECT k, SUM(v) AS s FROM g GROUP BY k ORDER BY k NULLS FIRST", session=session
-    )[0]
-    assert first.rows == [(None, 10), ("x", 25)]
+def test_group_by_order_nulls(session, tmp_path):
+    s = Storage(str(tmp_path))
+    try:
+        s.q = lambda sql: run_sql(s, DB, sql, session=Session(database=DB))[0]
+        s.q("CREATE TABLE g (id bigint primary key, k text, v int)")
+        s.q("INSERT INTO g (id, v) VALUES (1, 10)")  # k NULL
+        s.q("INSERT INTO g (id, k, v) VALUES (2, 'x', 20), (3, 'x', 5)")
+        default = run_sql(
+            s, DB, "SELECT k, SUM(v) AS s FROM g GROUP BY k ORDER BY k", session=session
+        )[0]
+        assert default.rows == [("x", 25), (None, 10)]
+        first = run_sql(
+            s, DB, "SELECT k, SUM(v) AS s FROM g GROUP BY k ORDER BY k NULLS FIRST", session=session
+        )[0]
+        assert first.rows == [(None, 10), ("x", 25)]
+    finally:
+        s.close()
 
 
 # -- set-operation path ----------------------------------------------------- #
 
 
-def test_setop_order_nulls(session):
-    s = FakeStorage()
-    s.q = lambda sql: run_sql(s, DB, sql, session=Session(database=DB))[0]
-    s.q("CREATE TABLE g (id bigint primary key, v int)")
-    s.q("INSERT INTO g (id, v) VALUES (1, 10), (2, 20)")
-    assert col(s, session, "SELECT v FROM g UNION SELECT NULL ORDER BY v") == [10, 20, None]
-    assert col(s, session, "SELECT v FROM g UNION SELECT NULL ORDER BY v NULLS FIRST") == [
-        None,
-        10,
-        20,
-    ]
-    assert col(s, session, "SELECT v FROM g UNION SELECT NULL ORDER BY v DESC") == [None, 20, 10]
+def test_setop_order_nulls(session, tmp_path):
+    s = Storage(str(tmp_path))
+    try:
+        s.q = lambda sql: run_sql(s, DB, sql, session=Session(database=DB))[0]
+        s.q("CREATE TABLE g (id bigint primary key, v int)")
+        s.q("INSERT INTO g (id, v) VALUES (1, 10), (2, 20)")
+        assert col(s, session, "SELECT v FROM g UNION SELECT NULL ORDER BY v") == [10, 20, None]
+        assert col(s, session, "SELECT v FROM g UNION SELECT NULL ORDER BY v NULLS FIRST") == [
+            None,
+            10,
+            20,
+        ]
+        assert col(s, session, "SELECT v FROM g UNION SELECT NULL ORDER BY v DESC") == [
+            None,
+            20,
+            10,
+        ]
+    finally:
+        s.close()

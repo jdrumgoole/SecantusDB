@@ -6,15 +6,39 @@ tests/test_sql_fts.py.
 
 from __future__ import annotations
 
+import pytest
+
 from secantus.sql import run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "d"
 
+_STORAGES: list = []
+
+
+def _new_storage():
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    st = Storage(d)
+    _STORAGES.append((st, d))
+    return st
+
+
+@pytest.fixture(autouse=True)
+def _close_storages():
+    import shutil
+
+    yield
+    while _STORAGES:
+        st, d = _STORAGES.pop()
+        st.close()
+        shutil.rmtree(d, ignore_errors=True)
+
 
 def _fresh():
-    st = FakeStorage()
+    st = _new_storage()
     sess = Session(database=DB)
     run_sql(st, DB, "CREATE TABLE doc (id int, body text)", session=sess)
     run_sql(
@@ -94,7 +118,7 @@ def test_ranked_search_orders_by_rank_alias():
 
 def test_order_by_computed_alias_general():
     # The ORDER-BY-output-alias fix is general, not FTS-specific.
-    st = FakeStorage()
+    st = _new_storage()
     sess = Session(database=DB)
     run_sql(st, DB, "CREATE TABLE t (id int, v int)", session=sess)
     run_sql(st, DB, "INSERT INTO t VALUES (1, 10), (2, 30), (3, 20)", session=sess)

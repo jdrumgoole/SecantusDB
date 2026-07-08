@@ -13,7 +13,7 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -24,11 +24,14 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run_sql(s, DB, "CREATE TABLE t (id int primary key, a text, b int)", session=session)
     run_sql(s, DB, "INSERT INTO t (id, a, b) VALUES (1, 'x', 10), (2, 'y', 20)", session=session)
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def q(storage, session, sql):
@@ -90,7 +93,7 @@ def test_drop_column_removes_field(storage, session):
     with pytest.raises(errors.SQLError):
         q(storage, session, "SELECT b FROM t")
     # The underlying field is gone, not just hidden.
-    assert all("b" not in d for d in storage.data[(DB, "t")])
+    assert all("b" not in d for d in storage.find_matching(DB, "t"))
 
 
 def test_drop_column_unknown_errors(storage, session):
@@ -125,7 +128,7 @@ def test_rename_pk_column_keeps_id_field(storage, session):
     q(storage, session, "ALTER TABLE t RENAME COLUMN id TO pk")
     assert rows(storage, session, "SELECT pk, a FROM t ORDER BY pk") == [(1, "x"), (2, "y")]
     # The PK is still stored under _id.
-    assert all("_id" in d for d in storage.data[(DB, "t")])
+    assert all("_id" in d for d in storage.find_matching(DB, "t"))
 
 
 def test_rename_column_conflict_errors(storage, session):

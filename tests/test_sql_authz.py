@@ -6,7 +6,7 @@ maps to one action on the connection's database and is gated by
 — a session only enforces it when ``authz_active`` is set (the wire server does
 that when started with ``require_auth`` + per-user roles). The embedded
 ``run_sql`` API and trust mode leave it off, so the surface stays unrestricted
-there. These tests drive ``run_sql`` over ``FakeStorage`` with hand-built
+there. These tests drive ``run_sql`` over a real ``Storage`` with hand-built
 sessions; the over-the-wire path is covered in ``test_pgserver_auth.py``.
 """
 

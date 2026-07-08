@@ -13,7 +13,7 @@ import pytest
 
 from secantus.sql import run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -24,8 +24,8 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     s.insert(
         DB,
         "items",
@@ -34,7 +34,10 @@ def storage():
             {"_id": bson.Int64(2), "name": "pear", "price": bson.Int64(7), "qty": bson.Int64(0)},
         ],
     )
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def run(storage, session, sql):
