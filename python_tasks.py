@@ -21,6 +21,15 @@ import shlex
 from invoke.context import Context
 from invoke.tasks import task
 
+# Ruff is a pure-Python static check that needs neither the compiled `secantus`
+# extension nor a synced project env, so `lint` / `fmt` run it through `uvx`
+# (an ephemeral, cached tool env) instead of `uv run` — the latter would try to
+# sync/build the project (a multi-minute WiredTiger compile) and fails outright
+# in a fresh git worktree where `vendor/wiredtiger` isn't populated. Pin the
+# version so local output matches CI's `ruff format --check`; keep this in sync
+# with the `ruff==` pin in pyproject.toml's [project.optional-dependencies] dev.
+_RUFF = "ruff@0.15.20"
+
 # The known local-only failing test: a feature worktree's Rust crates link the
 # /tmp WiredTiger build while the project wheel links its own, so this
 # cross-server restore isn't byte-compatible locally (green in CI). Deselected
@@ -83,14 +92,14 @@ def perf_task(c: Context) -> None:
 
 @task
 def lint(c: Context) -> None:
-    c.run("uv run ruff check src tests", pty=True)
-    c.run("uv run ruff format --check src tests", pty=True)
+    c.run(f"uvx {_RUFF} check src tests", pty=True)
+    c.run(f"uvx {_RUFF} format --check src tests", pty=True)
 
 
 @task
 def fmt(c: Context) -> None:
-    c.run("uv run ruff format src tests", pty=True)
-    c.run("uv run ruff check --fix src tests", pty=True)
+    c.run(f"uvx {_RUFF} format src tests", pty=True)
+    c.run(f"uvx {_RUFF} check --fix src tests", pty=True)
 
 
 @task
