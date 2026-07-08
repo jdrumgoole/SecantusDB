@@ -1277,6 +1277,12 @@ def _run_statement(
             return _drop_policy_command(stmt, db, catalog)
         if verb == "ALTER" and _RLS_ALTER_RE.match(_command_text(stmt)):
             return _alter_rls_command(stmt, storage, db, catalog)
+        if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("TABLE"):
+            # A *mixed-kind* multi-action ALTER TABLE (e.g. ``ADD COLUMN a, DROP
+            # COLUMN b``) exceeds sqlglot's ALTER parser and falls back to a
+            # Command. Split the action list and re-parse each action on its own
+            # (sqlglot handles any single action), then run the combined ALTER.
+            return _run_mixed_alter_table(stmt, storage, db, catalog, session)
         if verb == "SET" and _command_text(stmt).lstrip().upper().startswith("CONSTRAINTS"):
             return _set_constraints_command(stmt, storage, db, catalog, session)
         if verb in ("CREATE", "DROP", "ALTER") and _command_text(stmt).lstrip().upper().startswith(
@@ -1712,6 +1718,74 @@ _MATVIEW_ALTER_RE = re.compile(
 def _command_text(stmt: exp.Command) -> str:
     arg = stmt.expression
     return arg.this if isinstance(arg, exp.Literal) else str(arg or "")
+
+
+_ALTER_TABLE_MULTI_RE = re.compile(
+    r"(?is)^\s*ALTER\s+TABLE\s+(?P<ifexists>IF\s+EXISTS\s+)?"
+    r'(?P<name>"[^"]+"|[A-Za-z_][\w$]*)\s+(?P<rest>.+?)\s*;?\s*$'
+)
+
+
+def _split_top_level_commas(s: str) -> list[str]:
+    """Split ``s`` on commas that are outside any parentheses/brackets and outside
+    single/double quotes — the ALTER TABLE action separator."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_sq = in_dq = False
+    for ch in s:
+        if in_sq:
+            buf.append(ch)
+            in_sq = ch != "'"
+            continue
+        if in_dq:
+            buf.append(ch)
+            in_dq = ch != '"'
+            continue
+        if ch == "'":
+            in_sq = True
+        elif ch == '"':
+            in_dq = True
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _run_mixed_alter_table(
+    stmt: exp.Command, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """Handle a mixed-kind multi-action ``ALTER TABLE`` (which sqlglot mis-parses as
+    a Command) by splitting the action list, re-parsing each action as its own
+    single-action ``ALTER TABLE`` (sqlglot handles any single action), then routing
+    the combined ``exp.Alter`` through the normal single-ALTER path (#145)."""
+    text = ("ALTER " + _command_text(stmt)).strip()
+    m = _ALTER_TABLE_MULTI_RE.match(text)
+    if m is None:
+        raise errors.feature_not_supported(f"ALTER TABLE not supported: {text}")
+    prefix = "ALTER TABLE " + ("IF EXISTS " if m.group("ifexists") else "") + m.group("name") + " "
+    segments = _split_top_level_commas(m.group("rest"))
+    combined: exp.Alter | None = None
+    for seg in segments:
+        parsed = planner.parse(prefix + seg)
+        node = parsed[0] if parsed else None
+        if not isinstance(node, exp.Alter):
+            raise errors.feature_not_supported(f"ALTER TABLE action not supported: {seg}")
+        if combined is None:
+            combined = node
+        else:
+            combined.args.setdefault("actions", []).extend(node.args.get("actions") or [])
+    if combined is None:
+        raise errors.feature_not_supported(f"ALTER TABLE not supported: {text}")
+    return _run_statement(combined, storage, db, catalog, session)
 
 
 # CREATE/DROP/ALTER ROLE | USER | GROUP arrive as a Command; the tail carries the
