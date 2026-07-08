@@ -1273,9 +1273,16 @@ DROP VIEW IF EXISTS active_users;                  -- no error if absent
 
 Views reflect through `pg_class` (`relkind = 'v'`), `pg_get_viewdef()`, and
 `information_schema.views`, so SQLAlchemy's `get_view_names()` and
-`get_view_definition()` see them. Views are read-only (no `INSERT`/`UPDATE`
-through a view) and are not materialized — each query re-reads the underlying
-tables.
+`get_view_definition()` see them. Views are not materialized — each query
+re-reads the underlying tables.
+
+`INSERT` / `UPDATE` / `DELETE` work through an **automatically-updatable** view —
+one over a single base table (no join / set-op), with no `DISTINCT` / `GROUP BY` /
+`HAVING` / window / `LIMIT`, whose output columns are plain base columns (or `*`).
+The DML rewrites onto the base table, and the view's `WHERE` bounds which rows a
+statement may touch. A view that isn't automatically-updatable (aggregate, join,
+aliased/computed columns) raises `0A000` — Postgres would require an `INSTEAD OF`
+trigger, which isn't modeled. `WITH CHECK OPTION` isn't enforced.
 
 ### Materialized views
 

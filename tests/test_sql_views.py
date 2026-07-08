@@ -218,3 +218,64 @@ def test_sqlalchemy_reflects_views(session, tmp_path):
     finally:
         srv.stop()
         st.close()
+
+
+# -- writable views (#146) -------------------------------------------------- #
+
+
+def _run(storage, session, sql):
+    return run_sql(storage, DB, sql, session=session)[-1]
+
+
+def test_insert_through_star_view(storage, session):
+    _run(storage, session, "CREATE VIEW v AS SELECT * FROM t")
+    _run(storage, session, "INSERT INTO v (id, n, grp) VALUES (4, 40, 'c')")
+    assert rows(storage, session, "SELECT id, n, grp FROM t WHERE id = 4") == [(4, 40, "c")]
+
+
+def test_update_delete_through_star_view(storage, session):
+    _run(storage, session, "CREATE VIEW v AS SELECT * FROM t")
+    _run(storage, session, "UPDATE v SET n = 99 WHERE id = 1")
+    assert rows(storage, session, "SELECT n FROM t WHERE id = 1") == [(99,)]
+    _run(storage, session, "DELETE FROM v WHERE id = 3")
+    assert rows(storage, session, "SELECT id FROM t ORDER BY id") == [(1,), (2,)]
+
+
+def test_filtered_view_update_restricted_by_view_where(storage, session):
+    # The view's WHERE bounds which base rows the DML may touch.
+    _run(storage, session, "CREATE VIEW va AS SELECT id, n FROM t WHERE grp = 'a'")
+    _run(storage, session, "UPDATE va SET n = 100")  # only grp='a' rows (1,2)
+    assert rows(storage, session, "SELECT id, n FROM t ORDER BY id") == [(1, 100), (2, 100), (3, 5)]
+
+
+def test_filtered_view_delete_excludes_nonmatching(storage, session):
+    _run(storage, session, "CREATE VIEW va AS SELECT id, n FROM t WHERE grp = 'a'")
+    # id=3 is grp='b' -> excluded by the view -> not deleted.
+    _run(storage, session, "DELETE FROM va WHERE id = 3")
+    assert rows(storage, session, "SELECT id FROM t ORDER BY id") == [(1,), (2,), (3,)]
+    # id=1 is grp='a' -> deletable through the view.
+    _run(storage, session, "DELETE FROM va WHERE id = 1")
+    assert rows(storage, session, "SELECT id FROM t ORDER BY id") == [(2,), (3,)]
+
+
+def test_insert_through_filtered_view(storage, session):
+    _run(storage, session, "CREATE VIEW va AS SELECT id, n FROM t WHERE grp = 'a'")
+    _run(storage, session, "INSERT INTO va (id, n) VALUES (5, 50)")
+    assert rows(storage, session, "SELECT id, n FROM t WHERE id = 5") == [(5, 50)]
+
+
+def test_non_updatable_view_rejected(storage, session):
+    _run(storage, session, "CREATE VIEW vagg AS SELECT grp, count(*) AS c FROM t GROUP BY grp")
+    with pytest.raises(errors.SQLError) as exc:
+        _run(storage, session, "INSERT INTO vagg (grp, c) VALUES ('z', 1)")
+    assert exc.value.sqlstate == "0A000"
+
+
+def test_join_view_not_updatable(storage, session):
+    _run(storage, session, "CREATE TABLE u (id bigint primary key, label text)")
+    _run(
+        storage, session, "CREATE VIEW vj AS SELECT t.id, t.n, u.label FROM t JOIN u ON t.id = u.id"
+    )
+    with pytest.raises(errors.SQLError) as exc:
+        _run(storage, session, "DELETE FROM vj WHERE id = 1")
+    assert exc.value.sqlstate == "0A000"
