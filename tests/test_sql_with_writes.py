@@ -101,3 +101,91 @@ def test_with_multiple_ctes_on_insert(storage, session):
     assert q(storage, session, "SELECT id, region, amount FROM dst ORDER BY id").rows == [
         (2, "x", 20)
     ]
+
+
+# --- Data-modifying CTEs (#147) -------------------------------------------
+# A CTE body that is itself INSERT/UPDATE/DELETE (optionally … RETURNING). The
+# write executes for its side effects; its RETURNING rows feed the rest of the
+# statement — the classic "move rows between tables in one statement" idiom.
+
+
+def test_datamod_cte_delete_returning_feeds_insert(storage, session):
+    res = q(
+        storage,
+        session,
+        "WITH moved AS (DELETE FROM src WHERE amount >= 20 RETURNING id, region, amount) "
+        "INSERT INTO dst (id, region, amount) SELECT id, region, amount FROM moved",
+    )
+    assert res.command_tag == "INSERT 0 2"
+    # The rows really left src and landed in dst.
+    assert q(storage, session, "SELECT id FROM src ORDER BY id").rows == [(1,)]
+    assert q(storage, session, "SELECT id, amount FROM dst ORDER BY id").rows == [
+        (2, 20),
+        (3, 30),
+    ]
+
+
+def test_datamod_cte_insert_returning_feeds_select(storage, session):
+    res = q(
+        storage,
+        session,
+        "WITH ins AS "
+        "(INSERT INTO dst (id, region, amount) VALUES (7, 'z', 70) RETURNING id, amount) "
+        "SELECT id, amount FROM ins",
+    )
+    assert res.rows == [(7, 70)]
+    assert q(storage, session, "SELECT id FROM dst").rows == [(7,)]
+
+
+def test_datamod_cte_update_returning_feeds_aggregate(storage, session):
+    res = q(
+        storage,
+        session,
+        "WITH upd AS (UPDATE src SET amount = 0 WHERE region = 'e' RETURNING id, amount) "
+        "SELECT count(*) AS c, sum(amount) AS s FROM upd",
+    )
+    assert res.rows == [(2, 0)]
+    assert q(storage, session, "SELECT id, amount FROM src ORDER BY id").rows == [
+        (1, 0),
+        (2, 0),
+        (3, 30),
+    ]
+
+
+def test_datamod_cte_without_returning_still_runs(storage, session):
+    # No RETURNING: the DELETE still executes; the outer query just doesn't read it.
+    res = q(
+        storage,
+        session,
+        "WITH d AS (DELETE FROM src WHERE region = 'e') SELECT count(*) AS remaining FROM src",
+    )
+    assert res.rows == [(1,)]
+
+
+def test_recursive_before_write_body(storage, session):
+    # WITH RECURSIVE feeding an INSERT body (the recursive CTE materializes first).
+    res = q(
+        storage,
+        session,
+        "WITH RECURSIVE nums(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM nums WHERE x < 4) "
+        "INSERT INTO dst (id, region, amount) SELECT x, 'n', x * 10 FROM nums",
+    )
+    assert res.command_tag == "INSERT 0 4"
+    assert q(storage, session, "SELECT id, amount FROM dst ORDER BY id").rows == [
+        (1, 10),
+        (2, 20),
+        (3, 30),
+        (4, 40),
+    ]
+
+
+def test_recursive_and_datamod_cte_combined(storage, session):
+    res = q(
+        storage,
+        session,
+        "WITH RECURSIVE nums(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM nums WHERE x < 3), "
+        "ins AS (INSERT INTO dst (id, region, amount) SELECT x, 'r', x FROM nums RETURNING id) "
+        "SELECT count(*) AS c FROM ins",
+    )
+    assert res.rows == [(3,)]
+    assert q(storage, session, "SELECT id FROM dst ORDER BY id").rows == [(1,), (2,), (3,)]

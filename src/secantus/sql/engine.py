@@ -3034,6 +3034,12 @@ def _run_with(
             result = _run_recursive_cte(
                 cte, name, col_aliases, backend, db, cte_catalog, cte_defs, session
             )
+        elif isinstance(cte.this, (exp.Insert, exp.Update, exp.Delete)):
+            # Data-modifying CTE (``WITH x AS (INSERT/UPDATE/DELETE … RETURNING …)``).
+            # The write executes for its side effects against the backend (which
+            # forwards to real storage); its RETURNING rows materialize as the CTE.
+            # A body with no RETURNING still runs and registers an empty relation.
+            result = _dispatch_cte_write(cte.this, backend, db, cte_catalog, session)
         else:
             result = _run_query(cte.this, backend, db, cte_catalog, session)
         _register_cte(backend, cte_defs, name, result.columns, result.rows, col_aliases)
@@ -3044,14 +3050,24 @@ def _run_with(
         # or a WHERE subquery over one. Publish the CTE-aware context so an UPDATE
         # / DELETE WHERE subquery resolves the CTE, and dispatch the write against
         # the backend (its writes forward to real storage) + overlay catalog.
-        token = planner._pipeline_subctx.set(
-            planner.SubqueryCtx(storage=backend, db=db, catalog=cte_catalog, session=session)
-        )
-        try:
-            return _run_statement(stmt, backend, db, cte_catalog, session)
-        finally:
-            planner._pipeline_subctx.reset(token)
+        return _dispatch_cte_write(stmt, backend, db, cte_catalog, session)
     return _run_query(stmt, backend, db, cte_catalog, session)
+
+
+def _dispatch_cte_write(
+    stmt: exp.Expression, backend: Any, db: str, cte_catalog: Catalog, session: Session
+) -> SQLResult:
+    """Dispatch a write statement (an outer WITH … <write> body, or a
+    data-modifying CTE's own INSERT/UPDATE/DELETE) against the CTE-aware backend +
+    overlay catalog, with the CTE-aware ``SubqueryCtx`` published so any WHERE /
+    source subquery over a CTE resolves."""
+    token = planner._pipeline_subctx.set(
+        planner.SubqueryCtx(storage=backend, db=db, catalog=cte_catalog, session=session)
+    )
+    try:
+        return _run_statement(stmt, backend, db, cte_catalog, session)
+    finally:
+        planner._pipeline_subctx.reset(token)
 
 
 # Guard against a runaway recursive CTE (a cyclic graph under UNION ALL recurses

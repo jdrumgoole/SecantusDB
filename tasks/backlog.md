@@ -2094,7 +2094,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   forward to real storage) + `_CTECatalog` overlay, with the CTE-aware `SubqueryCtx` published on
   `planner._pipeline_subctx` so an `UPDATE`/`DELETE` WHERE subquery over a CTE resolves. So
   `WITH cte AS (…) INSERT INTO t SELECT … FROM cte` and `… UPDATE/DELETE … WHERE id IN (SELECT … FROM
-  cte)` work. **Still `0A000`:** `WITH RECURSIVE` on a write body (only on `SELECT` / set-op).
+  cte)` work. **Data-modifying CTEs + `WITH RECURSIVE` before a write landed (#147, b187):**
+  a CTE body may itself be `INSERT`/`UPDATE`/`DELETE` (optionally `… RETURNING`) — `_run_with`
+  routes it through `_dispatch_cte_write` (execute for side effects against the backend, materialize
+  its RETURNING rows as the CTE), so `WITH moved AS (DELETE … RETURNING …) INSERT … SELECT FROM moved`
+  moves rows between tables in one statement; a body with no `RETURNING` still runs. `WITH RECURSIVE`
+  before an `INSERT`/`UPDATE`/`DELETE` also works (the recursive CTE materializes first, then the write
+  body dispatches). Not modeled: statement-level snapshot semantics (each data-modifying CTE sees the
+  effects of earlier ones rather than a single pre-statement snapshot) and `WITH CHECK OPTION`.
 - [ ] **`INSERT … SELECT` landed** (b50). `INSERT INTO t [(cols)] SELECT …` routes through
   `engine._run_insert`: the source query (a SELECT / set operation; may join / aggregate / CTE) runs
   via `_run_query`, and its result rows map positionally onto the target columns through the shared
