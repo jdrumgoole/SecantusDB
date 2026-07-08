@@ -2843,6 +2843,26 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (BSON decodes naive); the wire path is now tz-aware. `tests/test_sql_datetime_funcs.py` +
   `test_sql_spike.py` carry a small UTC-normalising shim (commented, referencing #141) so they assert the
   PG-correct tz-aware instant; remove the shim when #141 lands.
+- [ ] **Two-phase commit (PREPARE TRANSACTION) landed** (#139, b180): `PREPARE TRANSACTION 'gid'` /
+  `COMMIT PREPARED 'gid'` / `ROLLBACK PREPARED 'gid'`. Handled *before* sqlglot in `run_sql`
+  (`engine._maybe_two_phase` / `_TWO_PHASE_RE`) because sqlglot can't parse `COMMIT`/`ROLLBACK PREPARED` at
+  all and `PREPARE TRANSACTION` collides with the SQL-level `PREPARE name AS` (#121). `PREPARE` detaches the
+  block's open `Storage` user-transaction handle into a server-wide `session.PreparedXactRegistry` (keyed by
+  gid; shared across connections by the wire server, lazily per-session for embedded `run_sql`), leaving the
+  session with no active txn; the WT session/snapshot stays open holding the uncommitted writes. `COMMIT
+  PREPARED` / `ROLLBACK PREPARED` — possibly on a *different* backend — pop the gid and call
+  `storage.commit_user_transaction` / `abort_user_transaction` on the stashed handle (WT-safe cross-thread:
+  the handle owns its session and commits under the storage `RLock`). Deferred constraints are re-checked at
+  PREPARE time (like COMMIT); buffered NOTIFYs travel with the prepared xact and deliver at COMMIT PREPARED.
+  Reflected via `pg_catalog.pg_prepared_xacts` (`virtual._pg_prepared_xacts`: transaction / gid / prepared /
+  owner / database). Errors match PG: PREPARE outside a block → `25P01`; duplicate gid → `42710` (block left
+  intact); unknown gid on COMMIT/ROLLBACK PREPARED → `42704`; COMMIT/ROLLBACK PREPARED inside a block →
+  `25001`. Wire server skips the COPY probe for these via `engine.is_two_phase_statement` (mirrors the
+  pubsub guard). Tests: `tests/test_sql_two_phase.py` + `test_pgserver_pg8000.py` cross-connection.
+  **Limitations:** prepared xacts are **in-memory only** — they do NOT survive a server restart (real PG
+  persists to `pg_twophase`); the statements work only over the **simple query protocol** (the extended
+  Parse/Bind path routes a bound AST through `run_statement`, bypassing the pre-parse interceptor — same
+  constraint as LISTEN/NOTIFY). Not ported to the Rust server.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
