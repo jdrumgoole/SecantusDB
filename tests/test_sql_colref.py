@@ -17,7 +17,7 @@ from secantus.sql import SQLError, run_sql
 from secantus.sql.catalog import Column, TableDef
 from secantus.sql.planner import plan_select
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -28,8 +28,8 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     s.insert(
         DB,
         "orders",
@@ -57,7 +57,10 @@ def storage():
             },
         ],
     )
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def q(storage, session, sql):

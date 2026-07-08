@@ -480,7 +480,14 @@ def coerce(value: Any, tag: str) -> Any:
     if tag == "bytea":
         from secantus.sql import bytea as _bytea
 
-        return bson.Binary(_bytea.parse(value))
+        # Return plain ``bytes`` (not ``bson.Binary``): BSON encodes both as a
+        # subtype-0 Binary, so storage is identical, but the value round-trips
+        # back out of WiredTiger as plain ``bytes`` (pymongo decodes subtype-0
+        # to ``bytes``). A ``bson.Binary`` filter constant does NOT compare equal
+        # to a stored ``bytes`` value, so a ``WHERE data = '\x..'::bytea`` would
+        # match nothing. Keeping the coerced value as ``bytes`` makes the filter
+        # constant and the stored value compare equal.
+        return _bytea.parse(value)
     return value
 
 
@@ -505,7 +512,12 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     if isinstance(value, (bytes, bytearray)):
         return b"\\x" + bytes(value).hex().encode("ascii")
     if isinstance(value, _dt.datetime):
-        # Postgres renders timestamptz space-separated with a UTC offset.
+        # Postgres renders timestamptz space-separated with a UTC offset. A stored
+        # timestamptz decodes tz-naive UTC from BSON, so tag it UTC before
+        # rendering; otherwise the offset is dropped and the client parses a
+        # tz-naive datetime for a timestamptz column.
+        if tag == "timestamptz" and value.tzinfo is None:
+            value = value.replace(tzinfo=_dt.timezone.utc)
         return value.isoformat(sep=" ").encode("utf-8")
     if tag in _RANGE_TAGS and isinstance(value, dict):
         from secantus.sql import ranges as _ranges

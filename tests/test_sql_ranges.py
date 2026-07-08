@@ -15,7 +15,7 @@ import pytest
 
 from secantus.sql import ranges, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -137,8 +137,12 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    return FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def run(storage, session, sql):

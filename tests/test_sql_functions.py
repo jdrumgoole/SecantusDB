@@ -9,13 +9,35 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "d"
 
+_STORAGES: list = []
+
+
+def _new_storage():
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    st = Storage(d)
+    _STORAGES.append((st, d))
+    return st
+
+
+@pytest.fixture(autouse=True)
+def _close_storages():
+    import shutil
+
+    yield
+    while _STORAGES:
+        st, d = _STORAGES.pop()
+        st.close()
+        shutil.rmtree(d, ignore_errors=True)
+
 
 def _sess():
-    return FakeStorage(), Session(database=DB)
+    return _new_storage(), Session(database=DB)
 
 
 def _run(st, sess, sql):

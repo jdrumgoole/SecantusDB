@@ -13,7 +13,7 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -24,11 +24,14 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run_sql(s, DB, "CREATE TABLE t (id bigint primary key, n int)", session=session)
     run_sql(s, DB, "INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 5)", session=session)
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def run(storage, session, sql):
@@ -144,11 +147,12 @@ def test_matview_over_aggregate(storage, session):
     assert rows(storage, session, "SELECT c, total FROM mv") == [(3, 35)]
 
 
-def test_sqlalchemy_reflects_matview(storage, session):
+def test_sqlalchemy_reflects_matview(tmp_path):
     sa = pytest.importorskip("sqlalchemy")
     from secantus.sql.pgserver import SecantusPGServer
 
-    srv = SecantusPGServer(port=0, storage=FakeStorage())
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st)
     srv.start()
     try:
         host, port = srv.address
@@ -166,3 +170,4 @@ def test_sqlalchemy_reflects_matview(storage, session):
         engine.dispose()
     finally:
         srv.stop()
+        st.close()

@@ -12,7 +12,7 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -23,10 +23,13 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run_sql(s, DB, "CREATE TABLE t (id bigint primary key, n int)", session=session)
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def rows(storage, session, sql):
@@ -86,11 +89,12 @@ def test_comments_persist_in_catalog(storage, session):
     assert tbl.column("n").comment == "nc"
 
 
-def test_sqlalchemy_reflects_comments(storage, session):
+def test_sqlalchemy_reflects_comments(storage, session, tmp_path):
     sa = pytest.importorskip("sqlalchemy")
     from secantus.sql.pgserver import SecantusPGServer
 
-    srv = SecantusPGServer(port=0, storage=FakeStorage())
+    st = Storage(str(tmp_path / "srv"))
+    srv = SecantusPGServer(port=0, storage=st)
     srv.start()
     try:
         host, port = srv.address
@@ -106,3 +110,4 @@ def test_sqlalchemy_reflects_comments(storage, session):
         engine.dispose()
     finally:
         srv.stop()
+        st.close()

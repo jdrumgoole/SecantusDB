@@ -15,7 +15,7 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -26,8 +26,8 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run_sql(s, DB, "CREATE TABLE t (id bigint primary key, n int, grp text)", session=session)
     run_sql(
         s,
@@ -35,7 +35,10 @@ def storage(session):
         "INSERT INTO t (id, n, grp) VALUES (1, 10, 'a'), (2, 20, 'a'), (3, 5, 'b')",
         session=session,
     )
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def rows(storage, session, sql):
@@ -191,11 +194,12 @@ def test_views_persist_in_catalog(storage, session):
     assert cat.get_view(DB, "v") == "SELECT id FROM t"
 
 
-def test_sqlalchemy_reflects_views(storage, session):
+def test_sqlalchemy_reflects_views(session, tmp_path):
     sa = pytest.importorskip("sqlalchemy")
     from secantus.sql.pgserver import SecantusPGServer
 
-    srv = SecantusPGServer(port=0, storage=FakeStorage())
+    st = Storage(str(tmp_path / "srv"))
+    srv = SecantusPGServer(port=0, storage=st)
     srv.start()
     try:
         host, port = srv.address
@@ -213,3 +217,4 @@ def test_sqlalchemy_reflects_views(storage, session):
         engine.dispose()
     finally:
         srv.stop()
+        st.close()

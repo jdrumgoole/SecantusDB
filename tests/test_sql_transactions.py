@@ -1,8 +1,8 @@
 """Real transaction semantics: BEGIN / COMMIT / ROLLBACK.
 
-Driven through ``run_sql`` over ``FakeStorage`` (which snapshots at BEGIN and
-restores on abort, the same all-or-nothing guarantee the real WT-backed
-``Storage`` gives). The wire-level transaction-status byte is covered in
+Driven through ``run_sql`` over the real WT-backed ``Storage``, which snapshots
+at BEGIN and restores on abort (all-or-nothing via WiredTiger user
+transactions). The wire-level transaction-status byte is covered in
 ``test_pgserver_pg8000.py``.
 """
 
@@ -12,7 +12,7 @@ import pytest
 
 from secantus.sql import SQLError, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -23,8 +23,12 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    return FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def run(storage, session, sql):

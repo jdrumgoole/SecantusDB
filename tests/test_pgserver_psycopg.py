@@ -18,19 +18,21 @@ import bson
 import pytest
 
 from secantus.sql.pgserver import SecantusPGServer
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 psycopg = pytest.importorskip("psycopg")
 
 
 @pytest.fixture
-def server():
-    srv = SecantusPGServer(port=0, storage=FakeStorage())
+def server(tmp_path):
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st)
     srv.start()
     try:
         yield srv
     finally:
         srv.stop()
+        st.close()
 
 
 def connect(srv, **kw):

@@ -13,7 +13,7 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -24,8 +24,8 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
 
     def q(sql):
         run_sql(s, DB, sql, session=session)
@@ -35,7 +35,10 @@ def storage(session):
         [("e", "ny", 10), ("e", "ny", 20), ("e", "bos", 5), ("w", "sf", 30), ("w", "sf", 15)], 1
     ):
         q(f"INSERT INTO t (id, region, city, amt) VALUES ({i}, '{r}', '{c}', {a})")
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def rows(storage, session, sql):

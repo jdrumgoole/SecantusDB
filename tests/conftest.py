@@ -24,8 +24,8 @@ import types
 
 import pytest
 
-# Make sibling test-helper modules (e.g. ``sqlfake``) importable by bare name
-# regardless of pytest's rootdir/import-mode.
+# Make sibling test-helper modules importable by bare name regardless of
+# pytest's rootdir/import-mode.
 sys.path.insert(0, os.path.dirname(__file__))
 
 # Fast test-mode storage (I2a): default every on-disk ``Storage`` /

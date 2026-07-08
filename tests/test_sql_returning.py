@@ -13,7 +13,7 @@ import pytest
 
 from secantus.sql import SQLError, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -24,8 +24,8 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     res = run_sql(
         s,
         DB,
@@ -33,7 +33,10 @@ def storage():
         session=Session(database=DB),
     )
     assert res[0].command_tag == "CREATE TABLE"
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def run(storage, session, sql):
@@ -111,24 +114,32 @@ def test_no_returning_is_plain_command(storage, session):
     assert res.rows == []
 
 
-def test_insert_returning_on_reflected(session):
+def test_insert_returning_on_reflected(session, tmp_path):
     # A reflected collection (no CREATE TABLE): INSERT ... RETURNING surfaces the
     # inserted row, projecting the Mongo field names.
-    s = FakeStorage()
-    s.insert(DB, "people", [{"_id": bson.Int64(1), "name": "alice"}])
-    res = run(s, session, "INSERT INTO people (_id, name) VALUES (2, 'bob') RETURNING _id, name")
-    assert [c.name for c in res.columns] == ["_id", "name"]
-    assert res.rows == [(2, "bob")]
-    # The row is really stored.
-    stored = s.find_matching(DB, "people", {"name": "bob"})
-    assert stored[0]["_id"] == 2
+    s = Storage(str(tmp_path))
+    try:
+        s.insert(DB, "people", [{"_id": bson.Int64(1), "name": "alice"}])
+        res = run(
+            s, session, "INSERT INTO people (_id, name) VALUES (2, 'bob') RETURNING _id, name"
+        )
+        assert [c.name for c in res.columns] == ["_id", "name"]
+        assert res.rows == [(2, "bob")]
+        # The row is really stored.
+        stored = s.find_matching(DB, "people", {"name": "bob"})
+        assert stored[0]["_id"] == 2
+    finally:
+        s.close()
 
 
-def test_update_returning_on_reflected(session):
-    s = FakeStorage()
-    s.insert(DB, "people", [{"_id": bson.Int64(1), "name": "x", "age": bson.Int64(40)}])
-    res = run(s, session, "UPDATE people SET age = 41 WHERE name = 'x' RETURNING _id, age")
-    assert res.rows == [(1, 41)]
+def test_update_returning_on_reflected(session, tmp_path):
+    s = Storage(str(tmp_path))
+    try:
+        s.insert(DB, "people", [{"_id": bson.Int64(1), "name": "x", "age": bson.Int64(40)}])
+        res = run(s, session, "UPDATE people SET age = 41 WHERE name = 'x' RETURNING _id, age")
+        assert res.rows == [(1, 41)]
+    finally:
+        s.close()
 
 
 def test_returning_unknown_column_rejected(storage, session):

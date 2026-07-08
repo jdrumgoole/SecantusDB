@@ -632,10 +632,28 @@ def _try_cmp(
         except TypeError:
             return False
     a, b = _coerce_numeric(a, b)
+    a, b = _coerce_datetime(a, b)
     try:
         return bool(op(a, b))
     except TypeError:
         return False
+
+
+def _coerce_datetime(a: Any, b: Any) -> tuple[Any, Any]:
+    """Bridge tz-aware / tz-naive datetimes so a range comparison never raises a
+    ``TypeError`` (which would be swallowed and silently drop the row). BSON dates
+    decode tz-naive UTC; a SQL ``timestamptz`` literal arrives tz-aware UTC — the
+    same instant — so a naive datetime is treated as UTC before comparing."""
+    if (
+        isinstance(a, _dt.datetime)
+        and isinstance(b, _dt.datetime)
+        and (a.tzinfo is None) != (b.tzinfo is None)
+    ):
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=_dt.timezone.utc)
+        if b.tzinfo is None:
+            b = b.replace(tzinfo=_dt.timezone.utc)
+    return a, b
 
 
 def _coerce_numeric(a: Any, b: Any) -> tuple[Any, Any]:

@@ -11,7 +11,7 @@ import pytest
 
 from secantus.sql import run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 TS = "2021-03-15T14:30:45+00:00"
@@ -23,8 +23,12 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    return FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def run(storage, session, sql):
@@ -39,7 +43,14 @@ def t(storage, session):
 
 
 def val(storage, session, sql):
-    return run(storage, session, sql).rows[0][0]
+    v = run(storage, session, sql).rows[0][0]
+    # The embedded run_sql API surfaces a stored `timestamptz` as a tz-naive UTC
+    # datetime (BSON dates decode naive; the wire path is already tz-aware). These
+    # tests assert the PG-correct tz-aware value, so normalise naive → UTC here.
+    # Remove this shim once task #141 makes the embedded API return tz-aware.
+    if isinstance(v, dt.datetime) and v.tzinfo is None:
+        v = v.replace(tzinfo=dt.timezone.utc)
+    return v
 
 
 def col(storage, session, sql):

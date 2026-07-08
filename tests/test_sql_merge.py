@@ -3,8 +3,8 @@
 For each source row, MERGE finds the target rows the ON condition matches, then
 applies the first WHEN clause of the right kind (matched / not-matched) whose
 optional ``AND`` condition holds: UPDATE / DELETE / DO NOTHING for a match,
-INSERT / DO NOTHING for a non-match. Driven through ``run_sql`` over
-``FakeStorage``.
+INSERT / DO NOTHING for a non-match. Driven through ``run_sql`` over the real
+WiredTiger-backed ``Storage``.
 """
 
 from __future__ import annotations
@@ -13,20 +13,23 @@ import pytest
 
 from secantus.sql import run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     s.q = lambda sql: run_sql(s, DB, sql, session=Session(database=DB))[0]
     s.q("CREATE TABLE tgt (id bigint primary key, region text, amt int)")
     s.q("CREATE TABLE src (id bigint primary key, region text, amt int)")
     for i, r, a in [(1, "e", 10), (2, "e", 20), (3, "w", 30)]:
         s.q(f"INSERT INTO tgt (id, region, amt) VALUES ({i}, '{r}', {a})")
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def tgt(storage):

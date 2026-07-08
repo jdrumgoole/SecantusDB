@@ -13,7 +13,7 @@ import sqlglot
 from secantus.paths import get_path
 from secantus.sql import scalar
 from secantus.sql.catalog import Catalog
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 
 def _expr(sql: str):
@@ -21,9 +21,12 @@ def _expr(sql: str):
 
 
 @pytest.fixture
-def ctx():
-    st = FakeStorage()
-    return scalar.ScalarContext(storage=st, catalog=Catalog(st), db="db", session=None)
+def ctx(tmp_path):
+    st = Storage(str(tmp_path))
+    try:
+        yield scalar.ScalarContext(storage=st, catalog=Catalog(st), db="db", session=None)
+    finally:
+        st.close()
 
 
 def _scope(row: dict):

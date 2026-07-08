@@ -11,7 +11,7 @@ import pytest
 
 from secantus.sql import run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -22,15 +22,18 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
 
     def q(sql):
         run_sql(s, DB, sql, session=session)
 
     q("CREATE TABLE users (id bigint primary key, name text)")
     q("CREATE TABLE orders (id bigint primary key, user_id bigint, total int)")
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def rows(storage, session, sql):

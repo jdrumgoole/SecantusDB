@@ -11,7 +11,7 @@ import pytest
 
 from secantus.sql import SQLError, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -22,8 +22,8 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     # Heterogeneous, nested, Mongo-written docs — no SQL DDL.
     s.insert(
         DB,
@@ -39,7 +39,10 @@ def storage():
             {"_id": bson.Int64(3), "name": "carol"},  # missing age / profile
         ],
     )
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def q(storage, session, sql):
@@ -178,8 +181,8 @@ def test_declared_table_takes_precedence(storage, session):
 
 
 @pytest.fixture
-def sales_storage():
-    s = FakeStorage()
+def sales_storage(tmp_path):
+    s = Storage(str(tmp_path))
     s.insert(
         DB,
         "sales",
@@ -203,7 +206,10 @@ def sales_storage():
             {"_id": bson.Int64(12), "cust_id": bson.Int64(1), "total": bson.Int64(50)},
         ],
     )
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def test_aggregate_over_reflected(sales_storage, session):
@@ -251,7 +257,11 @@ def test_join_over_reflected_with_where(sales_storage, session):
     assert res.rows == [(50,), (100,)]
 
 
-def test_aggregate_over_unknown_collection(session):
-    with pytest.raises(SQLError) as ei:
-        q(FakeStorage(), session, "SELECT COUNT(*) AS n, region FROM ghost GROUP BY region")
-    assert ei.value.sqlstate == "42P01"
+def test_aggregate_over_unknown_collection(session, tmp_path):
+    s = Storage(str(tmp_path))
+    try:
+        with pytest.raises(SQLError) as ei:
+            q(s, session, "SELECT COUNT(*) AS n, region FROM ghost GROUP BY region")
+        assert ei.value.sqlstate == "42P01"
+    finally:
+        s.close()

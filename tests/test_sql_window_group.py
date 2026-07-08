@@ -13,14 +13,14 @@ import pytest
 
 from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     s.q = lambda sql: run_sql(s, DB, sql, session=Session(database=DB))[0]
     s.q("CREATE TABLE emp (id bigint primary key, dept text, region text, sal int)")
     rows = [
@@ -33,7 +33,10 @@ def storage():
     ]
     for i, d, rg, sa in rows:
         s.q(f"INSERT INTO emp (id, dept, region, sal) VALUES ({i}, '{d}', '{rg}', {sa})")
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def test_rank_over_group_aggregate(storage):

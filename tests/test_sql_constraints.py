@@ -13,7 +13,7 @@ import pytest
 
 from secantus.sql import run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -34,10 +34,13 @@ def session():
 
 
 @pytest.fixture
-def storage(session):
-    s = FakeStorage()
+def storage(session, tmp_path):
+    s = Storage(str(tmp_path))
     run_sql(s, DB, DDL, session=session)
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def rows(storage, session, sql):
@@ -146,11 +149,12 @@ def test_no_constraints_is_empty(storage, session):
     ) == [("p",)]
 
 
-def test_sqlalchemy_reflects_check_and_unique(storage, session):
+def test_sqlalchemy_reflects_check_and_unique(storage, session, tmp_path):
     sa = pytest.importorskip("sqlalchemy")
     from secantus.sql.pgserver import SecantusPGServer
 
-    srv = SecantusPGServer(port=0, storage=FakeStorage())
+    st = Storage(str(tmp_path / "pg"))
+    srv = SecantusPGServer(port=0, storage=st)
     srv.start()
     try:
         host, port = srv.address
@@ -171,3 +175,4 @@ def test_sqlalchemy_reflects_check_and_unique(storage, session):
         engine.dispose()
     finally:
         srv.stop()
+        st.close()

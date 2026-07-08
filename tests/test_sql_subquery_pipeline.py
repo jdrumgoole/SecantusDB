@@ -13,7 +13,7 @@ import pytest
 
 from secantus.sql import run_sql
 from secantus.sql.session import Session
-from sqlfake import FakeStorage
+from secantus.storage import Storage
 
 DB = "testdb"
 
@@ -24,8 +24,8 @@ def session():
 
 
 @pytest.fixture
-def storage():
-    s = FakeStorage()
+def storage(tmp_path):
+    s = Storage(str(tmp_path))
     s.q = lambda sql: run_sql(s, DB, sql, session=Session(database=DB))[0]
     s.q("CREATE TABLE o (id bigint primary key, cid int, amt int)")
     s.q("CREATE TABLE c (id bigint primary key, region text)")
@@ -34,7 +34,10 @@ def storage():
         s.q(f"INSERT INTO o (id, cid, amt) VALUES ({i}, {cid}, {amt})")
     s.q("INSERT INTO c (id, region) VALUES (1, 'e'), (2, 'w')")
     s.q("INSERT INTO lim (id, cap) VALUES (1, 40)")
-    return s
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def rows(storage, session, sql):

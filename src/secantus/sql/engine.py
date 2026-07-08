@@ -743,13 +743,22 @@ def run_statement(
 def describe_statement(
     storage: Any, db: str, stmt: exp.Expression, session: Session, catalog: Catalog
 ) -> list[ColumnDesc] | None:
-    """Resolve a statement's result columns WITHOUT executing it.
+    """Resolve a statement's result columns WITHOUT executing it (extended-protocol
+    Describe). When a transaction is open the planning reads must run *inside* it,
+    so Describe sees the connection's own uncommitted DDL — otherwise a
+    parameterised SELECT against a table CREATEd in the same uncommitted
+    transaction describes as NoData while Execute (which runs in the transaction)
+    emits DataRows, a protocol violation that crashes the client. Read-only:
+    Describe never writes."""
+    if session.txn_handle is not None:
+        with storage.use_user_transaction(session.txn_handle):
+            return _describe_statement(storage, db, stmt, session, catalog)
+    return _describe_statement(storage, db, stmt, session, catalog)
 
-    Used by the extended protocol's Describe: planning is side-effect-free, so
-    this never reads or writes storage (important — Describe must not run an
-    INSERT/UPDATE/DELETE). Returns the column descriptors for a row-returning
-    statement (SELECT / SHOW), or None for everything else (→ NoData).
-    """
+
+def _describe_statement(
+    storage: Any, db: str, stmt: exp.Expression, session: Session, catalog: Catalog
+) -> list[ColumnDesc] | None:
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "SHOW":
         oid = typemap.PG_OID["text"]
         if _show_name(stmt).upper() == "ALL":
@@ -769,7 +778,7 @@ def describe_statement(
         arm = stmt
         while isinstance(arm, exp.SetOperation):
             arm = arm.left
-        return describe_statement(storage, db, arm, session, catalog)
+        return _describe_statement(storage, db, arm, session, catalog)
     if not isinstance(stmt, exp.Select):
         return None
     table_node = stmt.find(exp.Table)
