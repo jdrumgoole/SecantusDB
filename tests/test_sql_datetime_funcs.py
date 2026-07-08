@@ -113,6 +113,54 @@ def test_date_trunc_types_timestamptz(t, session):
     assert col(t, session, "SELECT date_trunc('day', at) FROM ev").type_tag == "timestamptz"
 
 
+# -- date_trunc over an interval (#148) --------------------------------------- #
+
+
+def _iv(months=0, days=0, micros=0):
+    return {"interval": {"months": months, "days": days, "micros": micros}}
+
+
+def test_date_trunc_interval_hour(storage, session):
+    r = run(storage, session, "SELECT date_trunc('hour', interval '2 days 3 hours 40 minutes')")
+    assert r.rows[0][0] == _iv(days=2, micros=3 * 3600 * 1_000_000)
+
+
+def test_date_trunc_interval_day_zeroes_time(storage, session):
+    r = run(storage, session, "SELECT date_trunc('day', interval '2 days 3 hours')")
+    assert r.rows[0][0] == _iv(days=2)
+
+
+def test_date_trunc_interval_month_zeroes_days_and_time(storage, session):
+    r = run(
+        storage, session, "SELECT date_trunc('month', interval '2 years 5 months 10 days 4 hours')"
+    )
+    assert r.rows[0][0] == _iv(months=29)
+
+
+def test_date_trunc_interval_year_floors_to_whole_years(storage, session):
+    r = run(storage, session, "SELECT date_trunc('year', interval '2 years 5 months 10 days')")
+    assert r.rows[0][0] == _iv(months=24)
+
+
+def test_date_trunc_interval_minute(storage, session):
+    r = run(
+        storage, session, "SELECT date_trunc('minute', interval '1 hour 30 minutes 45 seconds')"
+    )
+    assert r.rows[0][0] == _iv(micros=90 * 60 * 1_000_000)
+
+
+def test_date_trunc_interval_type_is_interval(storage, session):
+    assert (
+        col(storage, session, "SELECT date_trunc('hour', interval '3 hours 20 minutes')").type_tag
+        == "interval"
+    )
+
+
+def test_date_trunc_interval_week_unsupported(storage, session):
+    with pytest.raises(Exception):  # noqa: B017 - feature_not_supported (0A000)
+        run(storage, session, "SELECT date_trunc('week', interval '10 days')")
+
+
 # -- to_char ------------------------------------------------------------------ #
 
 
