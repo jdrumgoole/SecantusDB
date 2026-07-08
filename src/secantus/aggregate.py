@@ -772,6 +772,8 @@ def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
             bucket[k] = _std_dev(v["_std_vals"], pop=v["_std_pop"])
         elif isinstance(v, dict) and "_nelem_vals" in v:
             bucket[k] = _nelem_finalize(v)
+        elif isinstance(v, dict) and "_topn_items" in v:
+            bucket[k] = _topn_finalize(v)
     return bucket
 
 
@@ -989,6 +991,104 @@ def _nelem_finalize(state: dict[str, Any]) -> list[Any]:
     return non_null[:n]
 
 
+def _acc_topn(
+    bucket: dict[str, Any],
+    field: str,
+    arg: Any,
+    doc: Mapping[str, Any],
+    vars: dict[str, Any],
+    *,
+    kind: str,
+) -> None:
+    """``$top`` / ``$bottom`` / ``$topN`` / ``$bottomN`` accumulators: sort the
+    group's docs by ``sortBy`` (multi-key BSON order; null / missing sort low and
+    are **not** filtered) and take the top / bottom entries' ``output``. ``$topN`` /
+    ``$bottomN`` take ``n`` (first / last ``n`` of the sort) and return a list;
+    ``$top`` / ``$bottom`` take no ``n`` and return a single value. Validation
+    matches mongod 6.0 (three-way verified)."""
+    from secantus.expressions import nelem_parse_n
+
+    op = "$" + kind
+    has_n = kind in ("topN", "bottomN")
+    if not isinstance(arg, Mapping):
+        raise ExpressionError(f"{op} requires an object", code=5788001)
+    if not has_n and "n" in arg:
+        raise ExpressionError(f"Unknown argument to {op} 'n'", code=5788002)
+    if has_n and "n" not in arg:
+        raise ExpressionError("Missing value for 'n'", code=5788003)
+    if "output" not in arg:
+        raise ExpressionError("Missing value for 'output'", code=5788004)
+    if "sortBy" not in arg:
+        raise ExpressionError("Missing value for 'sortBy'", code=5788005)
+    sortby = arg["sortBy"]
+    if not isinstance(sortby, Mapping):
+        raise ExpressionError("invalid parameter: expected an object (sortBy)", code=10065)
+    n = nelem_parse_n(evaluate(arg["n"], doc, vars)) if has_n else 1
+    sort_vals = tuple(get_path(dict(doc), f) for f in sortby)
+    output_val = evaluate(arg["output"], doc, vars)
+    state = bucket.get(field)
+    if not isinstance(state, dict) or "_topn_items" not in state:
+        state = {
+            "_topn_items": [],
+            "_topn_n": n,
+            "_topn_dirs": [int(d) == -1 for d in sortby.values()],
+            "_topn_kind": kind,
+        }
+        bucket[field] = state
+    else:
+        state["_topn_n"] = n  # n is constant across the group
+    state["_topn_items"].append((sort_vals, output_val))
+
+
+def _acc_top(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_topn(bucket, field, arg, doc, vars, kind="top")
+
+
+def _acc_bottom(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_topn(bucket, field, arg, doc, vars, kind="bottom")
+
+
+def _acc_top_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_topn(bucket, field, arg, doc, vars, kind="topN")
+
+
+def _acc_bottom_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_topn(bucket, field, arg, doc, vars, kind="bottomN")
+
+
+def _topn_finalize(state: dict[str, Any]) -> Any:
+    """Finalize a ``$top``/``$bottom``/``$topN``/``$bottomN`` state: stable-sort the
+    collected ``(sort_values, output)`` items by the ``sortBy`` directions, then
+    return the top/bottom ``output`` value(s). ``$top``/``$bottom`` return a single
+    value; ``$topN``/``$bottomN`` return a list."""
+    from secantus.ordering import _SortKey
+
+    items = state["_topn_items"]
+    n = state["_topn_n"]
+    dirs = state["_topn_dirs"]
+    kind = state["_topn_kind"]
+    items = sorted(
+        items,
+        key=lambda it: tuple(_SortKey(v, reverse=rev) for v, rev in zip(it[0], dirs, strict=False)),
+    )
+    outputs = [out for _, out in items]
+    if kind == "top":
+        return outputs[0]
+    if kind == "bottom":
+        return outputs[-1]
+    if kind == "topN":
+        return outputs[:n]
+    return outputs[-n:]  # bottomN
+
+
 _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$sum": _acc_sum,
     "$count": _acc_count,
@@ -1005,6 +1105,10 @@ _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$lastN": _acc_last_n,
     "$maxN": _acc_max_n,
     "$minN": _acc_min_n,
+    "$top": _acc_top,
+    "$bottom": _acc_bottom,
+    "$topN": _acc_top_n,
+    "$bottomN": _acc_bottom_n,
 }
 
 
