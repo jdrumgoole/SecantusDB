@@ -330,6 +330,28 @@ def array_element_tag(tag: str) -> str:
     return tag[:-2]
 
 
+def normalize_result_value(value: Any, tag: str | None) -> Any:
+    """Make an embedded result value present the way the wire encoders render it.
+
+    A stored ``timestamptz`` decodes **tz-naive** UTC from BSON, but Postgres
+    presents it tz-aware — the wire text (``to_pg_text``) and binary
+    (``_encode_timestamptz``) paths already tag naive timestamptz values UTC, so
+    ``run_sql`` should hand back the same tz-aware instant rather than a naive
+    datetime that silently mis-compares against a tz-aware literal (#141).
+
+    Only ``timestamptz`` (and arrays of it, at any nesting depth) are touched;
+    ``timestamp`` / ``date`` / ``time`` stay correctly tz-naive."""
+    if isinstance(value, (list, tuple)) and is_array_tag(tag):
+        elem = array_element_tag(tag)
+        return [
+            normalize_result_value(v, elem + "[]" if isinstance(v, (list, tuple)) else elem)
+            for v in value
+        ]
+    if tag == "timestamptz" and isinstance(value, _dt.datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=_dt.timezone.utc)
+    return value
+
+
 def _parse_pg_array_literal(text: str) -> list:
     """Parse a Postgres array *string* literal (``{1,2,3}`` / ``{a,"b,c",NULL}``)
     into a Python list (a bare ``NULL`` element is None). One level deep."""

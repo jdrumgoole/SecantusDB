@@ -151,9 +151,12 @@ def test_interval_arithmetic_typed(storage, session):
 
 def test_timestamp_plus_interval(storage, session):
     c = col(storage, session, "SELECT timestamp '2020-01-31' + interval '1 month'")
+    # SecantusDB collapses every datetime tag to ``timestamptz`` (no distinct naive
+    # ``timestamp`` type — tasks/backlog.md), so the embedded result is tz-aware UTC,
+    # matching the wire render (real PG would keep ``timestamp`` naive here).
     assert c.type_tag == "timestamptz"
     assert val(storage, session, "SELECT timestamp '2020-01-31' + interval '1 month'") == (
-        dt.datetime(2020, 2, 29)
+        dt.datetime(2020, 2, 29, tzinfo=dt.timezone.utc)
     )
 
 
