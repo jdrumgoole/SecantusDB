@@ -151,11 +151,9 @@ def test_numeric_and_timestamp_coercion(storage):
     assert isinstance(stored["at"], _dt.datetime)
     row = sql(storage, "SELECT price, at FROM m").rows[0]
     assert row[0] == Decimal("19.99")
-    # The embedded run_sql API surfaces a stored timestamptz as tz-naive UTC (BSON
-    # dates decode naive; the wire path is tz-aware). Normalise before comparing to
-    # the PG-correct tz-aware value — remove once task #141 lands.
-    at = row[1].replace(tzinfo=_dt.timezone.utc) if row[1].tzinfo is None else row[1]
-    assert at == _dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=_dt.timezone.utc)
+    # The embedded run_sql API returns a stored timestamptz as tz-aware UTC (#141),
+    # matching the PG-correct instant.
+    assert row[1] == _dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=_dt.timezone.utc)
 
 
 def test_date_literal_comparison_coerced(storage):

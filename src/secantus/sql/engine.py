@@ -66,8 +66,31 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
         return [two_phase]
     results: list[SQLResult] = []
     for stmt in planner.parse(sql):
-        results.append(_dispatch(stmt, storage, db, catalog, session))
+        results.append(_normalize_result(_dispatch(stmt, storage, db, catalog, session)))
     return results
+
+
+def _normalize_result(result: SQLResult) -> SQLResult:
+    """Tag naive ``timestamptz`` result values UTC-aware (#141), so the embedded
+    ``run_sql`` return matches the tz-aware instant the wire path renders. No-op
+    unless a column is ``timestamptz`` / ``timestamptz[]``."""
+    if not result.rows or not result.columns:
+        return result
+    idxs = [
+        i
+        for i, c in enumerate(result.columns)
+        if c.type_tag == "timestamptz" or c.type_tag == "timestamptz[]"
+    ]
+    if not idxs:
+        return result
+    rows = []
+    for row in result.rows:
+        r = list(row)
+        for i in idxs:
+            r[i] = typemap.normalize_result_value(r[i], result.columns[i].type_tag)
+        rows.append(tuple(r))
+    result.rows = rows
+    return result
 
 
 _PUBSUB_RE = re.compile(
@@ -863,7 +886,7 @@ def run_statement(
     """
     if catalog is None:
         catalog = Catalog(storage)
-    return _dispatch(stmt, storage, db, catalog, session)
+    return _normalize_result(_dispatch(stmt, storage, db, catalog, session))
 
 
 def describe_statement(

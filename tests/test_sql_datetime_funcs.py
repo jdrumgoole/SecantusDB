@@ -43,14 +43,9 @@ def t(storage, session):
 
 
 def val(storage, session, sql):
-    v = run(storage, session, sql).rows[0][0]
-    # The embedded run_sql API surfaces a stored `timestamptz` as a tz-naive UTC
-    # datetime (BSON dates decode naive; the wire path is already tz-aware). These
-    # tests assert the PG-correct tz-aware value, so normalise naive → UTC here.
-    # Remove this shim once task #141 makes the embedded API return tz-aware.
-    if isinstance(v, dt.datetime) and v.tzinfo is None:
-        v = v.replace(tzinfo=dt.timezone.utc)
-    return v
+    # The embedded run_sql API returns a stored `timestamptz` as tz-aware UTC
+    # (#141), matching the PG-correct instant, so no normalisation is needed here.
+    return run(storage, session, sql).rows[0][0]
 
 
 def col(storage, session, sql):

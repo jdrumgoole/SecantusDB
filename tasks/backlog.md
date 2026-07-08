@@ -2842,7 +2842,7 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   **Remaining (task #141):** the *embedded* `run_sql` result still surfaces a stored `timestamptz` tz-naive
   (BSON decodes naive); the wire path is now tz-aware. `tests/test_sql_datetime_funcs.py` +
   `test_sql_spike.py` carry a small UTC-normalising shim (commented, referencing #141) so they assert the
-  PG-correct tz-aware instant; remove the shim when #141 lands.
+  PG-correct tz-aware instant; remove the shim when #141 lands. **(Resolved in b181 — see below.)**
 - [ ] **Two-phase commit (PREPARE TRANSACTION) landed** (#139, b180): `PREPARE TRANSACTION 'gid'` /
   `COMMIT PREPARED 'gid'` / `ROLLBACK PREPARED 'gid'`. Handled *before* sqlglot in `run_sql`
   (`engine._maybe_two_phase` / `_TWO_PHASE_RE`) because sqlglot can't parse `COMMIT`/`ROLLBACK PREPARED` at
@@ -2863,6 +2863,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   persists to `pg_twophase`); the statements work only over the **simple query protocol** (the extended
   Parse/Bind path routes a bound AST through `run_statement`, bypassing the pre-parse interceptor — same
   constraint as LISTEN/NOTIFY). Not ported to the Rust server.
+- [ ] **Embedded run_sql returns tz-aware `timestamptz` (#141, b181):** a stored `timestamptz` decodes
+  tz-naive UTC from BSON, so the embedded `run_sql` result used to hand back a naive datetime while the wire
+  path already rendered it tz-aware — an embedded/wire inconsistency, and the naive value silently
+  mis-compared against a tz-aware literal. `engine._normalize_result` now tags naive `timestamptz` /
+  `timestamptz[]` result values UTC (`typemap.normalize_result_value`, recursing into arrays) at the
+  `run_sql` / `run_statement` boundary, so embedded results match the wire instant. `timestamp` / `date` /
+  `time` stay naive. The two shims in `test_sql_datetime_funcs.py` + `test_sql_spike.py` are removed; direct
+  regression tests live in `test_sql_datetime_types.py` (`test_stored_timestamptz_is_tzaware`,
+  `test_timestamptz_array_elements_tzaware`). **Known limitation (unchanged, separate from #141):**
+  SecantusDB has **no distinct naive `timestamp` type** — `type_tag_for_sql` collapses `DATETIME` /
+  `TIMESTAMP` / `TIMESTAMPTZ` all to the single `timestamptz` tag — so `date + interval` /
+  `timestamp + interval` (PG: naive `timestamp`) come back tz-aware UTC here (both embedded and wire).
+  `test_date_plus_interval_is_timestamp` / `test_timestamp_plus_interval` assert the tz-aware value and note
+  the divergence. A real naive-`timestamp` type (tag + OID 1114 + render/coerce/round-trip) is a larger
+  slice, deferred. Also deferred: a WHERE `timestamptz_col = '…+00:00'` / `::timestamptz` literal doesn't
+  match a stored value (the `matches()` filter engine coerces the literal differently than the value) — a
+  separate filter-coercion quirk, not the result-rendering path #141 fixes.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by

@@ -133,9 +133,12 @@ def test_date_plus_int_is_date(storage, session):
 
 def test_date_plus_interval_is_timestamp(storage, session):
     c = col(storage, session, "SELECT date '2020-01-15' + interval '1 day 2 hours'")
+    # Real PG types ``date + interval`` as ``timestamp`` (naive); SecantusDB has no
+    # distinct naive-timestamp type — every datetime tag collapses to ``timestamptz``
+    # (tasks/backlog.md) — so the result is tz-aware UTC, matching the wire render.
     assert c.type_tag == "timestamptz"
     assert val(storage, session, "SELECT date '2020-01-15' + interval '1 day 2 hours'") == (
-        dt.datetime(2020, 1, 16, 2, 0)
+        dt.datetime(2020, 1, 16, 2, 0, tzinfo=dt.timezone.utc)
     )
 
 
@@ -175,3 +178,32 @@ def test_date_where_equality(events, session):
 def test_date_order_by(events, session):
     ids = [r[0] for r in run(events, session, "SELECT id FROM ev ORDER BY d").rows]
     assert ids == [2, 1]  # 2019-12-25 before 2020-06-15
+
+
+# --------------------------------------------------------------------------- #
+# #141: embedded run_sql returns tz-aware UTC for stored timestamptz columns
+# --------------------------------------------------------------------------- #
+
+
+def test_stored_timestamptz_is_tzaware(storage, session):
+    run(storage, session, "CREATE TABLE tsz (id int PRIMARY KEY, at timestamptz)")
+    run(storage, session, "INSERT INTO tsz VALUES (1, '2020-01-02T03:04:05+00:00')")
+    v = val(storage, session, "SELECT at FROM tsz WHERE id = 1")
+    assert v == dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+    assert v.tzinfo is not None  # tz-aware, matching the wire render (not naive)
+
+
+def test_timestamptz_array_elements_tzaware(storage, session):
+    run(storage, session, "CREATE TABLE tsa (id int PRIMARY KEY, ats timestamptz[])")
+    run(
+        storage,
+        session,
+        "INSERT INTO tsa VALUES (1, ARRAY['2020-01-02T03:04:05+00:00'::timestamptz, "
+        "'2021-06-07T08:09:10+00:00'::timestamptz])",
+    )
+    v = val(storage, session, "SELECT ats FROM tsa WHERE id = 1")
+    assert list(v) == [
+        dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc),
+        dt.datetime(2021, 6, 7, 8, 9, 10, tzinfo=dt.timezone.utc),
+    ]
+    assert all(x.tzinfo is not None for x in v)
