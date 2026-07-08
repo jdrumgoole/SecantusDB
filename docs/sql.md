@@ -1799,6 +1799,21 @@ WITH totals AS (SELECT cust_id, sum(total) AS spent FROM orders GROUP BY cust_id
 INSERT INTO summary (cust_id, spent) SELECT cust_id, spent FROM totals;
 ```
 
+A CTE body may itself be a **data-modifying** statement — `INSERT` / `UPDATE` /
+`DELETE`, optionally with `RETURNING`. The write executes for its side effects,
+and its `RETURNING` rows materialize as the CTE, so you can move rows between
+tables in a single statement:
+
+```sql
+WITH moved AS (DELETE FROM events WHERE ts < '2024-01-01' RETURNING *)
+INSERT INTO events_archive SELECT * FROM moved;
+```
+
+`WITH RECURSIVE` may also precede a write body (the recursive CTE materializes
+first, then the `INSERT` / `UPDATE` / `DELETE` runs). Two things aren't modeled:
+statement-level snapshot semantics — each data-modifying CTE observes the effects
+of earlier ones rather than one pre-statement snapshot — and `WITH CHECK OPTION`.
+
 ## Window functions
 
 `func(...) OVER (PARTITION BY … ORDER BY …)` computes a value per row from its
@@ -2914,7 +2929,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 |---|---|---|
 | DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | `MERGE`, `ON CONFLICT ON CONSTRAINT` |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
-| CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE` | `WITH RECURSIVE` on a write body |
+| CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE` (incl. `WITH RECURSIVE` before a write); data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE … RETURNING …)`) | statement-level snapshot semantics; `WITH CHECK OPTION` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (`const <@ field`)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, `field <@ const` |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
