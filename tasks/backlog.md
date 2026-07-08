@@ -2421,9 +2421,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   gains `relkind='v'` rows (`virtual._view_oids`, base 50000), `pg_get_viewdef(oid)`
   (`scalar._call_func` → `virtual.viewdef_for_oid`), `information_schema.views`, and a `table_type='VIEW'`
   row in `information_schema.tables` — SQLAlchemy's `get_view_names()` / `get_view_definition()` reflect
-  end to end. **Limitations:** views are read-only (no INSERT/UPDATE through a view) and not
-  materialized (each query re-reads the base tables); no `CASCADE`/`RESTRICT` on `DROP`; no column-list
-  aliasing (`CREATE VIEW v (a, b) AS …`); `WITH CHECK OPTION` not modeled.
+  end to end. **Writable views landed (#146, b186):** INSERT / UPDATE / DELETE through an
+  *automatically-updatable* view rewrite onto the base table (`engine._rewrite_write_through_view` /
+  `_updatable_view_base`, run before the write branches). Updatable = the PG auto-updatable subset: one base
+  table (no join / set-op), no DISTINCT / GROUP BY / HAVING / window / LIMIT / WITH, and every output column
+  a plain **unaliased** base column (or `*`) — so view names equal base names and no column remap is needed.
+  A view's `WHERE` is AND-ed into UPDATE/DELETE (rows outside the view can't be touched). Anything else raises
+  `0A000` ("not an automatically-updatable view" — PG would need an INSTEAD OF trigger). Tests:
+  `test_sql_views.py` (writable-view section). **Still:** not materialized (each query re-reads the base
+  tables); no `CASCADE`/`RESTRICT` on `DROP`; no column-list aliasing (`CREATE VIEW v (a, b) AS …`);
+  `WITH CHECK OPTION` not modeled (an INSERT/UPDATE may create a row invisible to the view); aliased /
+  expression projections aren't updatable.
 - [ ] **`COMMENT ON TABLE` / `COLUMN` landed** (b86): the comment is stored on `TableDef.comment` /
   `Column.comment` (persisted in the catalog doc) by `executor.execute_comment` (dispatched on
   `exp.Comment`), surfaced through `virtual._pg_description` (table comment → `objsubid 0`, column

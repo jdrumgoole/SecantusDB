@@ -1222,6 +1222,11 @@ def _run_statement(
     if isinstance(stmt, exp.Select):
         return _run_select(stmt, storage, db, catalog, session)
 
+    if isinstance(stmt, (exp.Insert, exp.Update, exp.Delete)):
+        # DML through an (automatically-updatable) view rewrites onto its base
+        # table before planning (#146).
+        stmt = _rewrite_write_through_view(stmt, catalog, db)
+
     if isinstance(stmt, exp.Insert):
         return _run_insert(stmt, storage, db, catalog, session)
 
@@ -2877,6 +2882,74 @@ def _expand_views(
             "this",
             exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias))),
         )
+    return stmt
+
+
+def _updatable_view_base(vdef_sql: str) -> tuple[str, exp.Expression | None] | None:
+    """For an *automatically-updatable* view, return ``(base_table, where_cond)``;
+    None if the view isn't simple enough to write through.
+
+    Postgres auto-updatable rules (the subset we support): exactly one base table
+    (no join / set-op), no DISTINCT / GROUP BY / HAVING / window / LIMIT / OFFSET /
+    WITH, and every output column is a **plain, unaliased** base column (or ``*``).
+    That keeps view column names identical to base column names, so DML needs no
+    column remapping — only a table retarget and (for UPDATE/DELETE) AND-ing the
+    view's WHERE. Anything else raises (PG would require an INSTEAD OF trigger)."""
+    sel = sqlglot.parse_one(vdef_sql, read="postgres")
+    if not isinstance(sel, exp.Select):
+        return None
+    if any(
+        sel.args.get(k)
+        for k in ("group", "having", "distinct", "qualify", "windows", "laterals", "limit", "with")
+    ):
+        return None
+    if sel.args.get("joins"):
+        return None
+    # The FROM arg key varies across sqlglot versions ("from" / "from_").
+    from_ = sel.args.get("from") or sel.args.get("from_")
+    if from_ is None or not isinstance(from_.this, exp.Table) or from_.this.args.get("db"):
+        return None
+    projs = sel.expressions
+    if not (len(projs) == 1 and isinstance(projs[0], exp.Star)):
+        for proj in projs:
+            # A plain column with no alias keeps view name == base name.
+            if not isinstance(proj, exp.Column):
+                return None
+    where = sel.args.get("where")
+    return from_.this.name, (where.this if isinstance(where, exp.Where) else None)
+
+
+def _rewrite_write_through_view(stmt: exp.Expression, catalog: Catalog, db: str) -> exp.Expression:
+    """If an INSERT/UPDATE/DELETE targets a view, rewrite it onto the view's base
+    table (#146). Non-updatable views raise a faithful ``0A000``."""
+    if isinstance(stmt, exp.Insert):
+        tgt = stmt.this
+        table_node = tgt.this if isinstance(tgt, exp.Schema) else tgt
+    else:
+        table_node = stmt.find(exp.Table)
+    if not isinstance(table_node, exp.Table):
+        return stmt
+    name = table_node.name
+    vdef = catalog.get_view(db, name)
+    if vdef is None:
+        return stmt  # a real table (or reflected collection) — unchanged
+    spec = _updatable_view_base(vdef)
+    if spec is None:
+        verb = {exp.Insert: "INSERT into", exp.Update: "UPDATE", exp.Delete: "DELETE from"}[
+            type(stmt)
+        ]
+        raise errors.feature_not_supported(
+            f'cannot {verb} view "{name}": it is not an automatically-updatable view'
+        )
+    base, view_cond = spec
+    table_node.set("this", exp.to_identifier(base, quoted=table_node.this.quoted))
+    if view_cond is not None and isinstance(stmt, (exp.Update, exp.Delete)):
+        # The view's WHERE restricts which base rows the DML may touch. AND it in.
+        existing = stmt.args.get("where")
+        merged = view_cond.copy()
+        if isinstance(existing, exp.Where) and existing.this is not None:
+            merged = exp.and_(existing.this, merged)
+        stmt.set("where", exp.Where(this=merged))
     return stmt
 
 
