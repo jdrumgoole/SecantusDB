@@ -5143,17 +5143,26 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     _jsonpath_bool = tuple(c for c in (getattr(exp, n, None) for n in _jp_names) if c is not None)
     if _jsonpath_bool and isinstance(node, _jsonpath_bool):
         return "bool"
-    # Date/time: extract/date_part -> numeric field; date_trunc / now() /
-    # current_timestamp -> timestamptz; current_date -> date; current_time ->
-    # timetz; to_char -> text. Classes are looked up by attribute because their
-    # availability varies across sqlglot.
+    # Date/time: extract/date_part -> numeric field; now() / current_timestamp ->
+    # timestamptz; current_date -> date; current_time -> timetz; to_char -> text.
+    # date_trunc preserves its argument's tz-ness (see below). Classes are looked
+    # up by attribute because their availability varies across sqlglot.
     if getattr(exp, "CurrentDate", None) is not None and isinstance(node, exp.CurrentDate):
         return "date"
     if getattr(exp, "CurrentTime", None) is not None and isinstance(node, exp.CurrentTime):
         return "timetz"
-    _ts_names = ("TimestampTrunc", "CurrentTimestamp")
-    _ts_types = tuple(c for c in (getattr(exp, n, None) for n in _ts_names) if c is not None)
-    if _ts_types and isinstance(node, _ts_types):
+    # ``date_trunc(unit, src)`` keeps the tz-ness of ``src`` (Postgres:
+    # ``date_trunc(text, timestamptz) -> timestamptz``, ``… timestamp) -> timestamp``;
+    # a ``date`` argument is cast to naive timestamp). An argument whose type we
+    # can't prove naive defaults to ``timestamptz`` (the historical behaviour).
+    # (``date_trunc`` over an ``interval`` isn't evaluated — see tasks/backlog.md.)
+    if getattr(exp, "TimestampTrunc", None) is not None and isinstance(node, exp.TimestampTrunc):
+        arg_tag = _infer_scalar_tag(node.this, resolve) if node.this is not None else None
+        if arg_tag in ("timestamp", "date"):
+            return "timestamp"
+        return "timestamptz"
+    _ct = getattr(exp, "CurrentTimestamp", None)
+    if _ct is not None and isinstance(node, _ct):
         return "timestamptz"
     if getattr(exp, "Extract", None) is not None and isinstance(node, exp.Extract):
         return "numeric"
