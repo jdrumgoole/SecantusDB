@@ -2398,6 +2398,29 @@ SELECT name, setting, vartype, source FROM pg_settings WHERE name = 'TimeZone';
 -- TimeZone | UTC | string | default        (source becomes 'session' after a SET)
 ```
 
+### Role membership (`GRANT <role> TO <member>`)
+
+Roles can be granted to other roles/users, building a membership hierarchy that
+`pg_catalog.pg_auth_members` reflects (psql's `\du` and SQLAlchemy read it):
+
+```sql
+CREATE ROLE readers;
+GRANT readers TO alice;                 -- alice is now a member of readers
+GRANT readers TO bob WITH ADMIN OPTION; -- bob may grant readers onward
+REVOKE readers FROM alice;
+
+SELECT r.rolname AS role, m.rolname AS member, am.admin_option
+FROM pg_auth_members am
+JOIN pg_roles r ON r.oid = am.roleid
+JOIN pg_roles m ON m.oid = am.member;
+-- readers | bob | t
+```
+
+`WITH ADMIN OPTION` is tracked (and a plain re-grant keeps an existing one, as in
+Postgres); `REVOKE ADMIN OPTION FOR <role> FROM <member>` clears just the admin
+option and keeps the membership. Membership is recorded and reflected but not
+enforced (a member doesn't automatically inherit the group role's table grants).
+
 ### Monitoring views (`pg_stat_activity`)
 
 `pg_catalog.pg_stat_activity` reflects the server's live backends — one row per

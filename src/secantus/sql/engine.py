@@ -1126,8 +1126,10 @@ def _run_statement(
         ):
             return _run_role_command(verb, stmt, db, catalog)
         if verb in ("GRANT", "REVOKE"):
-            # Role-membership / privilege grants aren't enforced — accept no-op.
-            return SQLResult(command_tag=verb)
+            # Role membership (``GRANT <role> TO <member>``) is recorded + reflected
+            # via pg_auth_members (#138); other privilege grants that fell back to a
+            # Command (e.g. ``GRANT USAGE ON SCHEMA``) aren't enforced — accept no-op.
+            return _run_role_membership(verb, stmt, db, catalog, session)
         return _run_command(stmt, session)
 
     if isinstance(stmt, exp.Grant):
@@ -1876,6 +1878,55 @@ def _run_role_command(verb: str, stmt: exp.Command, db: str, catalog: Catalog) -
         raise errors.SQLError("42710", f'role "{name}" already exists')
     catalog.put_role(db, name, attrs)
     return SQLResult(command_tag=tag)
+
+
+# Role membership: ``GRANT <roles> TO <members> [WITH ADMIN OPTION]`` /
+# ``REVOKE [ADMIN OPTION FOR] <roles> FROM <members> [CASCADE|RESTRICT]`` (#138).
+_GRANT_MEMBER_RE = re.compile(
+    r"(?is)^\s*(?P<roles>.+?)\s+TO\s+(?P<members>.+?)"
+    r"(?:\s+WITH\s+ADMIN\s+OPTION)?\s*;?\s*$"
+)
+_REVOKE_MEMBER_RE = re.compile(
+    r"(?is)^\s*(?:ADMIN\s+OPTION\s+FOR\s+)?(?P<roles>.+?)\s+FROM\s+(?P<members>.+?)"
+    r"(?:\s+(?:CASCADE|RESTRICT))?\s*;?\s*$"
+)
+
+
+def _split_role_names(text: str) -> list[str]:
+    return [_unquote_ident(n.strip()) for n in text.split(",") if n.strip()]
+
+
+def _run_role_membership(
+    verb: str, stmt: exp.Command, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """``GRANT``/``REVOKE`` <role> ``TO``/``FROM`` <member> — role membership (#138).
+    A privilege grant that fell back to a Command (it carries an ``ON`` target) is
+    accepted as a no-op, preserving prior behaviour."""
+    tail = _command_text(stmt)
+    if re.search(r"(?is)\bON\b", tail):
+        return SQLResult(command_tag=verb)  # privilege grant (not membership) — no-op
+    if verb == "GRANT":
+        m = _GRANT_MEMBER_RE.match(tail)
+        if m is None:
+            return SQLResult(command_tag=verb)
+        admin = re.search(r"(?is)\bWITH\s+ADMIN\s+OPTION\s*;?\s*$", tail) is not None
+        for role in _split_role_names(m.group("roles")):
+            for member in _split_role_names(m.group("members")):
+                catalog.grant_role_membership(db, role, member, admin_option=admin)
+        return SQLResult(command_tag="GRANT ROLE")
+    m = _REVOKE_MEMBER_RE.match(tail)
+    if m is None:
+        return SQLResult(command_tag=verb)
+    # REVOKE ADMIN OPTION FOR clears just the admin option; a plain REVOKE removes
+    # the membership.
+    admin_only = re.match(r"(?is)^\s*ADMIN\s+OPTION\s+FOR\b", tail) is not None
+    for role in _split_role_names(m.group("roles")):
+        for member in _split_role_names(m.group("members")):
+            if admin_only:
+                catalog.revoke_role_admin_option(db, role, member)
+            else:
+                catalog.revoke_role_membership(db, role, member)
+    return SQLResult(command_tag="REVOKE ROLE")
 
 
 _SET_CONSTRAINTS_RE = re.compile(r"(?is)^\s*CONSTRAINTS\s+(.+?)\s+(DEFERRED|IMMEDIATE)\s*;?\s*$")

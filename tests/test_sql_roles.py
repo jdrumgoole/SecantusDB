@@ -125,9 +125,13 @@ def test_revoke_privilege_accepted(storage, session):
 
 
 def test_grant_role_membership_accepted(storage, session):
+    # Role membership (GRANT <role> TO <member>) is recorded and tagged GRANT
+    # ROLE / REVOKE ROLE (#138); see test_sql_role_membership.py for the
+    # pg_auth_members reflection over the real Storage.
     run(storage, session, "CREATE ROLE alice")
     run(storage, session, "CREATE ROLE bob")
-    assert run(storage, session, "GRANT alice TO bob").command_tag == "GRANT"
+    assert run(storage, session, "GRANT alice TO bob").command_tag == "GRANT ROLE"
+    assert run(storage, session, "REVOKE alice FROM bob").command_tag == "REVOKE ROLE"
 
 
 # -- reflection ---------------------------------------------------------------- #

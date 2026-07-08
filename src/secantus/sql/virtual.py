@@ -985,25 +985,56 @@ def _pg_sequence(db: str, session: Session, storage: Any, catalog: Catalog) -> l
     return rows
 
 
+def _role_oid_map(db: str, session: Session, catalog: Catalog) -> dict[str, int]:
+    """Canonical ``role name -> oid`` used by both ``pg_roles`` and
+    ``pg_auth_members`` so their oids join consistently. Declared roles (sorted)
+    get ``_ROLE_OID_BASE + i``; the connecting user gets ``_ROLE_OID_BASE - 1``."""
+    lister = getattr(catalog, "list_roles", None)
+    names = lister(db) if lister is not None else []
+    out = {name: _ROLE_OID_BASE + i for i, name in enumerate(names)}
+    if session.user and session.user not in out:
+        out[session.user] = _ROLE_OID_BASE - 1
+    return out
+
+
 def _pg_roles(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     """``pg_catalog.pg_roles`` — SQL-declared roles plus the connection's own user
     (a superuser login, like Postgres' bootstrap role) when it isn't one already."""
-    lister = getattr(catalog, "list_roles", None)
-    names = lister(db) if lister is not None else []
+    oids = _role_oid_map(db, session, catalog)
     rows = []
-    seen = set()
-    for i, name in enumerate(names):
-        role = catalog.get_role(db, name) or {}
-        seen.add(name)
-        rows.append(_role_row(_ROLE_OID_BASE + i, name, role))
-    # The connecting user is always a role (superuser login).
-    if session.user and session.user not in seen:
-        rows.append(
-            _role_row(
-                _ROLE_OID_BASE - 1,
-                session.user,
-                {"login": True, "superuser": True, "createdb": True, "createrole": True},
+    for name, oid in oids.items():
+        if oid == _ROLE_OID_BASE - 1:
+            # The connecting user — a superuser login not declared via CREATE ROLE.
+            rows.append(
+                _role_row(
+                    oid,
+                    name,
+                    {"login": True, "superuser": True, "createdb": True, "createrole": True},
+                )
             )
+        else:
+            rows.append(_role_row(oid, name, catalog.get_role(db, name) or {}))
+    return rows
+
+
+def _pg_auth_members(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_auth_members`` — one row per role membership (#138):
+    ``roleid`` (the group role), ``member``, ``grantor``, ``admin_option``. Oids
+    come from the shared :func:`_role_oid_map` so they join to ``pg_roles.oid``."""
+    lister = getattr(catalog, "list_role_memberships", None)
+    if lister is None:
+        return []
+    oids = _role_oid_map(db, session, catalog)
+    grantor = oids.get(session.user, _ROLE_OID_BASE - 1)
+    rows = []
+    for m in lister(db):
+        rows.append(
+            {
+                "roleid": oids.get(m["role"], 0),
+                "member": oids.get(m["member"], 0),
+                "grantor": grantor,
+                "admin_option": bool(m.get("admin_option", False)),
+            }
         )
     return rows
 
@@ -1851,6 +1882,17 @@ _register(
         ("rolbypassrls", "bool"),
     ],
     _pg_roles,
+)
+_register(
+    "pg_catalog",
+    "pg_auth_members",
+    [
+        ("roleid", "int4"),
+        ("member", "int4"),
+        ("grantor", "int4"),
+        ("admin_option", "bool"),
+    ],
+    _pg_auth_members,
 )
 _register(
     "pg_catalog",
