@@ -345,6 +345,14 @@ def _eq_numeric_aware(a: Any, b: Any, collation: Collation | None = None) -> boo
         return _coll_equal(a, b, collation)
     if a == b:
         return True
+    # tz-aware / tz-naive datetimes of the same instant compare equal: a BSON date
+    # decodes tz-naive UTC while a SQL ``timestamptz`` literal arrives tz-aware UTC,
+    # and ``naive == aware`` is always False in Python. Treat naive as UTC (the same
+    # convention pymongo's BSON encoder uses), so ``WHERE ts = '...+00:00'`` matches
+    # the stored value — mirroring the range operators' ``_coerce_datetime``.
+    if isinstance(a, _dt.datetime) and isinstance(b, _dt.datetime):
+        a2, b2 = _coerce_datetime(a, b)
+        return a2 == b2
     a2, b2 = _coerce_numeric(a, b)
     if a2 is a:
         return False
