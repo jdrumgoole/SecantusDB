@@ -157,8 +157,7 @@ def test_datamod_cte_without_returning_still_runs(storage, session):
     res = q(
         storage,
         session,
-        "WITH d AS (DELETE FROM src WHERE region = 'e') "
-        "SELECT count(*) AS remaining FROM src",
+        "WITH d AS (DELETE FROM src WHERE region = 'e') SELECT count(*) AS remaining FROM src",
     )
     assert res.rows == [(1,)]
 
