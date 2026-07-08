@@ -129,7 +129,8 @@ def test_datamod_cte_insert_returning_feeds_select(storage, session):
     res = q(
         storage,
         session,
-        "WITH ins AS (INSERT INTO dst (id, region, amount) VALUES (7, 'z', 70) RETURNING id, amount) "
+        "WITH ins AS "
+        "(INSERT INTO dst (id, region, amount) VALUES (7, 'z', 70) RETURNING id, amount) "
         "SELECT id, amount FROM ins",
     )
     assert res.rows == [(7, 70)]
