@@ -40,7 +40,12 @@ from secantus.sql.pgauth import (
 )
 from secantus.sql.pgextended import ExtendedSession
 from secantus.sql.pgnotify import NotifyHub
-from secantus.sql.session import SERVER_VERSION, ActivityRegistry, Session
+from secantus.sql.session import (
+    SERVER_VERSION,
+    ActivityRegistry,
+    PreparedXactRegistry,
+    Session,
+)
 
 if TYPE_CHECKING:
     from typing import Self
@@ -94,6 +99,10 @@ class SecantusPGServer:
         # monotonic per-connection backend pid (real Postgres gives each backend a
         # distinct pid; in-process we'd otherwise share os.getpid()).
         self._activity = ActivityRegistry()
+        # Server-wide prepared two-phase transactions (#139), shared by all
+        # connections so COMMIT PREPARED / ROLLBACK PREPARED can resolve a gid
+        # prepared on a different connection.
+        self._prepared_xacts = PreparedXactRegistry()
         # itertools.count.__next__ is atomic under the GIL, so no extra lock.
         self._backend_pid_seq = itertools.count((os.getpid() & 0x7FFFFF) << 8 | 1)
         # SCRAM-SHA-256 auth: when require_auth is on, clients must authenticate
@@ -276,6 +285,7 @@ class SecantusPGServer:
         session = Session(database=db, user=user, backend_pid=backend_pid)
         session.notify_hub = self._notify
         session.activity_registry = self._activity
+        session.prepared_xacts = self._prepared_xacts
         session.backend_start = _dt.datetime.now(_dt.timezone.utc)
         if self._authz_active:
             session.authz_active = True
@@ -401,7 +411,11 @@ class SecantusPGServer:
             # with no ErrorResponse rather than reporting the error. (§I16)
             # LISTEN/NOTIFY/UNLISTEN bypass the COPY probe — sqlglot mis-parses
             # them (and errors on a NOTIFY payload), so run_sql handles them.
-            if not sql_engine.is_pubsub_statement(sql):
+            # Two-phase commit (#139) also bypasses the probe: sqlglot can't parse
+            # COMMIT/ROLLBACK PREPARED, so run_sql intercepts them pre-parse.
+            if not sql_engine.is_pubsub_statement(sql) and not sql_engine.is_two_phase_statement(
+                sql
+            ):
                 stmts = planner.parse(sql)
                 if len(stmts) == 1 and isinstance(stmts[0], exp.Copy):
                     self._handle_copy(conn, session, stmts[0])

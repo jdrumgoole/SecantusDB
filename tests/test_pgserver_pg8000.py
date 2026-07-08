@@ -2703,3 +2703,52 @@ def test_set_local_reverts_at_commit_via_driver(real_server):
     cur.execute("SHOW statement_timeout")
     assert cur.fetchall() == (["10s"],)  # reverted to the session value
     conn.close()
+
+
+def test_two_phase_commit_cross_connection_via_driver(real_server):
+    # PREPARE TRANSACTION on one connection, COMMIT PREPARED on another (#139).
+    # The prepared xact lives in the server-wide registry, so a second backend
+    # both sees it in pg_prepared_xacts and can commit it.
+    setup = connect(real_server)
+    setup.autocommit = True
+    setup.cursor().execute("CREATE TABLE t2p (id int primary key, v text)")
+    setup.close()
+
+    a = connect(real_server)
+    a.autocommit = True
+    cura = a.cursor()
+    cura.execute("BEGIN")
+    cura.execute("INSERT INTO t2p VALUES (1, 'from-A')")
+    cura.execute("PREPARE TRANSACTION 'wgtx'")
+
+    b = connect(real_server)
+    b.autocommit = True
+    curb = b.cursor()
+    # Uncommitted: B sees no rows yet.
+    curb.execute("SELECT count(*) FROM t2p")
+    assert curb.fetchall() == ([0],)
+    # B sees the prepared xact in the shared registry.
+    curb.execute("SELECT gid, database FROM pg_catalog.pg_prepared_xacts")
+    assert curb.fetchall() == (["wgtx", "db"],)
+    # B commits the xact A prepared.
+    curb.execute("COMMIT PREPARED 'wgtx'")
+    curb.execute("SELECT * FROM t2p")
+    assert curb.fetchall() == ([1, "from-A"],)
+    curb.execute("SELECT count(*) FROM pg_catalog.pg_prepared_xacts")
+    assert curb.fetchall() == ([0],)
+    a.close()
+    b.close()
+
+
+def test_two_phase_rollback_prepared_via_driver(real_server):
+    setup = connect(real_server)
+    setup.autocommit = True
+    cur = setup.cursor()
+    cur.execute("CREATE TABLE t2pr (id int primary key)")
+    cur.execute("BEGIN")
+    cur.execute("INSERT INTO t2pr VALUES (5)")
+    cur.execute("PREPARE TRANSACTION 'rbk'")
+    cur.execute("ROLLBACK PREPARED 'rbk'")
+    cur.execute("SELECT count(*) FROM t2pr")
+    assert cur.fetchall() == ([0],)
+    setup.close()

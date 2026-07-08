@@ -1330,6 +1330,28 @@ def _pg_stat_database(db: str, session: Session, storage: Any, catalog: Catalog)
     return rows
 
 
+def _pg_prepared_xacts(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_prepared_xacts`` — one row per prepared two-phase
+    transaction (#139), from the server-wide ``PreparedXactRegistry``. ``transaction``
+    is a synthetic xid (Postgres shows the real prepared xid; single-node we hand out
+    a stable small integer per gid ordinal)."""
+    reg = getattr(session, "prepared_xacts", None)
+    if reg is None:
+        return []
+    rows = []
+    for i, x in enumerate(sorted(reg.snapshot(), key=lambda x: x.gid), start=1):
+        rows.append(
+            {
+                "transaction": i,
+                "gid": x.gid,
+                "prepared": x.prepared_at,
+                "owner": x.owner,
+                "database": x.database,
+            }
+        )
+    return rows
+
+
 def _role_row(oid: int, name: str, role: dict) -> dict:
     return {
         "oid": oid,
@@ -1951,6 +1973,18 @@ _register(
         ("tup_deleted", "int8"),
     ],
     _pg_stat_database,
+)
+_register(
+    "pg_catalog",
+    "pg_prepared_xacts",
+    [
+        ("transaction", "int8"),
+        ("gid", "text"),
+        ("prepared", "timestamptz"),
+        ("owner", "text"),
+        ("database", "text"),
+    ],
+    _pg_prepared_xacts,
 )
 _register(
     "pg_catalog",

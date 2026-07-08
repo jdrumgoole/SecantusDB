@@ -2479,6 +2479,50 @@ matching Postgres. `pg_locks` reflects **this connection's** locks (single-node
 dev surface); cross-backend visibility and non-advisory lock types aren't
 modelled.
 
+### Two-phase commit (`PREPARE TRANSACTION`)
+
+The two-phase-commit statements are supported so a client (or a transaction
+manager) can prepare a transaction on one connection and resolve it later,
+possibly from another:
+
+```sql
+BEGIN;
+INSERT INTO accounts VALUES (1, 100);
+PREPARE TRANSACTION 'txn-42';   -- the block's writes are now staged, uncommitted
+
+-- ... later, on this or any other connection:
+COMMIT PREPARED 'txn-42';       -- make the staged writes durable
+-- or:
+ROLLBACK PREPARED 'txn-42';     -- discard them
+```
+
+`PREPARE TRANSACTION 'gid'` detaches the open block's storage transaction into a
+**server-wide registry** keyed by the global transaction id (`gid`), leaving the
+issuing session with no active transaction. The writes stay staged (invisible to
+other transactions) until a matching `COMMIT PREPARED 'gid'` commits them or
+`ROLLBACK PREPARED 'gid'` aborts them — and because the registry is shared across
+connections, the commit/rollback can run on a **different** backend from the one
+that prepared it. Any deferred constraints are re-checked at `PREPARE` time (as
+they would be at `COMMIT`), so a violation fails the `PREPARE`.
+
+Open prepared transactions are reflected through **`pg_catalog.pg_prepared_xacts`**:
+
+```sql
+SELECT gid, prepared, owner, database FROM pg_prepared_xacts;
+-- txn-42 | 2026-07-08 12:00:00+00 | alice | mydb
+```
+
+Error handling matches Postgres: `PREPARE TRANSACTION` outside a transaction
+block raises `25P01`; a duplicate `gid` raises `42710`; `COMMIT PREPARED` /
+`ROLLBACK PREPARED` for an unknown `gid` raises `42704`, and running either
+inside a transaction block raises `25001`.
+
+Two limitations: prepared transactions are held **in memory only**, so — unlike
+real Postgres, which persists them to `pg_twophase` — they do **not** survive a
+server restart; and the statements must be sent over the **simple query
+protocol** (the wire server can't route them through the extended Parse/Bind
+path). Both are fine for the single-node test-surrogate use case.
+
 ## LISTEN / NOTIFY
 
 Asynchronous pub/sub works across connections to the same server:
@@ -2870,7 +2914,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql`, single-statement body), `COMMENT ON TABLE`/`COLUMN` | multi-action `ALTER`, non-literal / expression column `DEFAULT` (other than `nextval`), composite / range `CREATE TYPE`, `ALTER TYPE … ADD VALUE`, `LANGUAGE plpgsql` / multi-statement functions, `pg_proc` function reflection |
-| Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (accepted, single-node no-op) | true nested savepoint rollback, `DECLARE CURSOR` |
+| Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (real nested rollback), two-phase commit `PREPARE TRANSACTION` / `COMMIT`/`ROLLBACK PREPARED` (cross-connection, `pg_prepared_xacts`) | prepared xacts surviving a restart, two-phase over the extended protocol |
 | Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors), `EXPLAIN [ANALYZE]` (`FORMAT TEXT`/`JSON`, faithful Index/Seq Scan) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows, per-node `EXPLAIN` costs / timing |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format, `COPY … FROM/TO STDIN/STDOUT` (text + CSV) | binary-format `COPY`, `COPY` from/to a server-side file |
 | Auth | trust, SCRAM-SHA-256, TLS, SQL `CREATE`/`ALTER`/`DROP ROLE`/`USER` (reflected via `pg_roles`), `GRANT`/`REVOKE` (accepted) | channel binding, mTLS, enforced privileges, SQL roles wired to SCRAM login |

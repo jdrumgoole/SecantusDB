@@ -96,6 +96,67 @@ class ActivityRegistry:
 
 
 @dataclass
+class PreparedXact:
+    """One prepared (two-phase) transaction (#139). ``handle`` is the open
+    ``Storage`` user-transaction detached from its originating session at
+    ``PREPARE TRANSACTION`` time — its WT session stays open (holding the
+    uncommitted writes and its snapshot) until ``COMMIT PREPARED`` /
+    ``ROLLBACK PREPARED`` commits or aborts it, possibly from a different
+    connection. ``notifies`` are the ``(channel, payload)`` NOTIFYs buffered in
+    the block, delivered only if the prepared xact commits."""
+
+    gid: str
+    handle: Any
+    owner: str
+    database: str
+    prepared_at: Any
+    notifies: list = field(default_factory=list)
+
+
+class PreparedXactRegistry:
+    """Server-wide registry of prepared two-phase transactions (#139), keyed by
+    global transaction id (``gid``). A ``PREPARE TRANSACTION 'gid'`` stashes the
+    open ``Storage`` user-transaction handle here (disassociating it from the
+    session); ``COMMIT PREPARED`` / ``ROLLBACK PREPARED`` — possibly on another
+    connection — look it up by gid and commit / abort. Thread-safe.
+
+    In-memory only: prepared transactions do NOT survive a server restart (real
+    Postgres persists them to ``pg_twophase`` so they outlive a crash). This is a
+    documented surrogate limitation — see ``tasks/backlog.md``."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._xacts: dict[str, PreparedXact] = {}
+
+    def add(self, xact: PreparedXact) -> None:
+        """Register a freshly prepared xact; error 42710 if the gid is in use."""
+        with self._lock:
+            if xact.gid in self._xacts:
+                from secantus.sql import errors
+
+                raise errors.SQLError(
+                    "42710", f'transaction identifier "{xact.gid}" is already in use'
+                )
+            self._xacts[xact.gid] = xact
+
+    def pop(self, gid: str) -> PreparedXact:
+        """Remove and return the prepared xact for ``gid``; error 42704 if none."""
+        with self._lock:
+            xact = self._xacts.pop(gid, None)
+        if xact is None:
+            from secantus.sql import errors
+
+            raise errors.SQLError(
+                "42704", f'prepared transaction with identifier "{gid}" does not exist'
+            )
+        return xact
+
+    def snapshot(self) -> list[PreparedXact]:
+        with self._lock:
+            return list(self._xacts.values())
+
+
+@dataclass
 class Session:
     database: str = "postgres"
     user: str = "secantus"
@@ -179,6 +240,11 @@ class Session:
     # ``count`` (advisory locks are re-entrant); ``xact`` locks release at
     # COMMIT/ROLLBACK, session locks at ``pg_advisory_unlock[_all]``.
     advisory_locks: dict = field(default_factory=dict)
+    # Two-phase commit (#139). Server-wide ``PreparedXactRegistry`` shared by all
+    # connections (set by the wire server; the embedded ``run_sql`` lazily makes a
+    # per-session one). ``PREPARE TRANSACTION`` moves this session's ``txn_handle``
+    # into it; ``COMMIT PREPARED`` / ``ROLLBACK PREPARED`` resolve a gid against it.
+    prepared_xacts: Any = None
 
     def __post_init__(self) -> None:
         if self.login_user is None:

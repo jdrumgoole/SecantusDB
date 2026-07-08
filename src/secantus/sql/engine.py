@@ -10,6 +10,7 @@ and ``SHOW`` / ``SET`` resolve against real state.
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -32,7 +33,14 @@ from secantus.sql import (
 from secantus.sql import explain as explain_mod
 from secantus.sql.catalog import Catalog, Column, TableDef
 from secantus.sql.result import ColumnDesc, SQLResult
-from secantus.sql.session import REPORTABLE_GUCS, Session, _Cursor, _Savepoint
+from secantus.sql.session import (
+    REPORTABLE_GUCS,
+    PreparedXact,
+    PreparedXactRegistry,
+    Session,
+    _Cursor,
+    _Savepoint,
+)
 
 
 def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) -> list[SQLResult]:
@@ -50,6 +58,12 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
     if pubsub is not None:
         return [pubsub]
     catalog = Catalog(storage)
+    # Two-phase commit (#139) is handled before sqlglot: it cannot parse
+    # ``COMMIT PREPARED`` / ``ROLLBACK PREPARED`` at all, and ``PREPARE
+    # TRANSACTION`` collides with the SQL-level ``PREPARE name AS`` (#121).
+    two_phase = _maybe_two_phase(sql, storage, db, catalog, session)
+    if two_phase is not None:
+        return [two_phase]
     results: list[SQLResult] = []
     for stmt in planner.parse(sql):
         results.append(_dispatch(stmt, storage, db, catalog, session))
@@ -112,6 +126,118 @@ def _maybe_pubsub(sql: str, session: Session) -> SQLResult | None:
         else:
             hub.notify(channel, payload, session.backend_pid)
     return SQLResult(command_tag="NOTIFY")
+
+
+_TWO_PHASE_RE = re.compile(
+    r"""^\s*
+    (?:
+        (?P<prepare>PREPARE)\s+TRANSACTION
+      | (?P<commit>COMMIT)\s+PREPARED
+      | (?P<rollback>ROLLBACK)\s+PREPARED
+    )\s+
+    (?P<gid>'(?:[^']|'')*')
+    \s*;?\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def is_two_phase_statement(sql: str) -> bool:
+    """Whether ``sql`` is a single ``PREPARE TRANSACTION`` / ``COMMIT PREPARED`` /
+    ``ROLLBACK PREPARED`` — used by the wire server to skip the sqlglot COPY probe,
+    which can't parse ``COMMIT``/``ROLLBACK PREPARED`` at all (#139)."""
+    return _TWO_PHASE_RE.match(sql) is not None
+
+
+def _ensure_prepared_registry(session: Session) -> PreparedXactRegistry:
+    """The session's shared ``PreparedXactRegistry`` (set by the wire server), or
+    a lazily-created per-session one for the embedded ``run_sql`` API — so a
+    ``PREPARE`` / ``COMMIT PREPARED`` pair on one session works standalone."""
+    if session.prepared_xacts is None:
+        session.prepared_xacts = PreparedXactRegistry()
+    return session.prepared_xacts
+
+
+def _maybe_two_phase(
+    sql: str, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult | None:
+    """Handle a single ``PREPARE TRANSACTION`` / ``COMMIT PREPARED`` / ``ROLLBACK
+    PREPARED`` statement (#139), or None if ``sql`` isn't one."""
+    m = _TWO_PHASE_RE.match(sql)
+    if m is None:
+        return None
+    gid = m.group("gid")[1:-1].replace("''", "'")
+    if m.group("prepare"):
+        return _prepare_transaction(gid, storage, db, catalog, session)
+    if m.group("commit"):
+        return _commit_prepared(gid, storage, session)
+    return _rollback_prepared(gid, storage, session)
+
+
+def _prepare_transaction(
+    gid: str, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """``PREPARE TRANSACTION 'gid'`` — detach the open block's ``Storage``
+    user-transaction into the prepared-xact registry (uncommitted), leaving the
+    session with no active transaction. The writes commit only at a later
+    ``COMMIT PREPARED 'gid'`` (which may run on a different connection)."""
+    handle = session.txn_handle
+    if handle is None:
+        raise errors.SQLError("25P01", "PREPARE TRANSACTION can only be used in transaction blocks")
+    if session.txn_failed:
+        # An aborted block can't be prepared; Postgres rolls it back and errors.
+        storage.abort_user_transaction(handle)
+        _end_txn_state(session)
+        raise errors.SQLError(
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )
+    registry = _ensure_prepared_registry(session)
+    # Deferred constraints are checked at PREPARE time (as at COMMIT); a surviving
+    # violation aborts the block and re-raises, exactly like _commit_txn.
+    if session.pending_deferred:
+        try:
+            with storage.use_user_transaction(handle):
+                executor.flush_deferred(session, storage, db, catalog)
+        except Exception:
+            storage.abort_user_transaction(handle)
+            _end_txn_state(session)
+            raise
+    xact = PreparedXact(
+        gid=gid,
+        handle=handle,
+        owner=session.effective_user,
+        database=session.database,
+        prepared_at=_dt.datetime.now(_dt.timezone.utc),
+        notifies=list(session.pending_notifies),
+    )
+    # add() raises 42710 on a duplicate gid *before* we clear the session, so the
+    # block stays open (the handle isn't lost) and the client can ROLLBACK it.
+    registry.add(xact)
+    _end_txn_state(session)
+    return SQLResult(command_tag="PREPARE TRANSACTION")
+
+
+def _commit_prepared(gid: str, storage: Any, session: Session) -> SQLResult:
+    """``COMMIT PREPARED 'gid'`` — commit a previously prepared transaction. Must
+    run outside any transaction block; delivers the block's buffered NOTIFYs."""
+    if session.txn_handle is not None:
+        raise errors.SQLError("25001", "COMMIT PREPARED cannot run inside a transaction block")
+    xact = _ensure_prepared_registry(session).pop(gid)
+    storage.commit_user_transaction(xact.handle)
+    if session.notify_hub is not None:
+        for channel, payload in xact.notifies:
+            session.notify_hub.notify(channel, payload, session.backend_pid)
+    return SQLResult(command_tag="COMMIT PREPARED")
+
+
+def _rollback_prepared(gid: str, storage: Any, session: Session) -> SQLResult:
+    """``ROLLBACK PREPARED 'gid'`` — abort a previously prepared transaction. Must
+    run outside any transaction block."""
+    if session.txn_handle is not None:
+        raise errors.SQLError("25001", "ROLLBACK PREPARED cannot run inside a transaction block")
+    xact = _ensure_prepared_registry(session).pop(gid)
+    storage.abort_user_transaction(xact.handle)
+    return SQLResult(command_tag="ROLLBACK PREPARED")
 
 
 def _dispatch(
