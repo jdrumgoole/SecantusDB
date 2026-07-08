@@ -98,3 +98,20 @@ def test_rapid_teardown_under_read_load_drains_cleanly(tmp_path) -> None:
             t.join(timeout=1.0)
         with contextlib.suppress(Exception):
             mc.close()
+
+
+def test_stuck_conn_stacks_names_threads() -> None:
+    """The stop-drain timeout diagnostic renders each still-live connection
+    thread by its ``secantus-conn-*`` name (so a shutdown wedge names itself)."""
+    from secantus.server import SecantusDBServer
+
+    stop = threading.Event()
+    t = threading.Thread(target=stop.wait, name="secantus-conn-1.2.3.4:5678", daemon=True)
+    t.start()
+    try:
+        time.sleep(0.02)  # let it enter wait()
+        dump = SecantusDBServer._format_stuck_conn_stacks()
+        assert "secantus-conn-1.2.3.4:5678" in dump
+    finally:
+        stop.set()
+        t.join(timeout=1.0)

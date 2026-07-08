@@ -19,6 +19,24 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Server stop names the connection thread when a shutdown drain wedges
+
+`SecantusDBServer.stop()` already drains its per-connection handler threads to
+zero before closing WiredTiger (polling the active-connection count, re-closing
+sockets each poll), and storage's per-op `_closed` fences make that teardown
+safe even if the drain times out. What it lacked was *observability*: on a drain
+timeout it logged only a count ("N connection thread(s) still active"), which is
+exactly what made the intermittent xdist-worker-death race in this area hard to
+pin down. Connection threads are now named `secantus-conn-<host>:<port>`, and the
+timeout warning dumps the live stack of each still-active one — so a genuine
+shutdown wedge names its own culprit instead of surfacing as an opaque number.
+
+#### Changed
+
+- `server.py`: per-connection handler threads are named `secantus-conn-<addr>`;
+  the stop-drain timeout warning now includes each stuck thread's stack
+  (`_format_stuck_conn_stacks`).
+
 ### `$firstN` / `$lastN` / `$maxN` / `$minN` as `$group` accumulators (both servers)
 
 Both servers now support the N-element operators as `$group` (and
