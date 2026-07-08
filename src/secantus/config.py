@@ -1,10 +1,10 @@
-"""TOML-based configuration loader for the ``secantusdb`` daemon.
+"""TOML-based configuration loader for the ``secantusd-py`` daemon.
 
 The config file is a thin convenience over the CLI flag surface plus
 a handful of previously-hard-coded WiredTiger / oplog knobs that
 production-shaped deployments want to tune. The CLI itself still
 works exactly as before — passing **no** ``--config`` and **no**
-``secantusdb.toml`` in the auto-discovery path leaves you with the
+``secantusd.toml`` in the auto-discovery path leaves you with the
 original behaviour.
 
 Precedence (low → high):
@@ -18,9 +18,14 @@ one-off run.
 Auto-discovery path order (first hit wins):
 
     1. Explicit ``--config PATH`` if passed (no auto-discovery).
-    2. ``./secantusdb.toml``                 (cwd — per-checkout)
-    3. ``~/.secantus/secantusdb.toml``       (per-user)
-    4. ``/etc/secantus/secantusdb.toml``     (system-wide)
+    2. ``./secantusd.toml``                  (cwd — per-checkout)
+    3. ``~/.secantus/secantusd.toml``        (per-user)
+    4. ``/etc/secantus/secantusd.toml``      (system-wide)
+
+The legacy ``secantusdb.toml`` name is still discovered at each
+location (immediately after the new name) so configs written for the
+old daemon name keep working; the new ``secantusd.toml`` wins when
+both are present.
 """
 
 from __future__ import annotations
@@ -32,11 +37,16 @@ from typing import Any
 import tomllib
 
 # Auto-discovery candidates, in order. The launcher walks this list
-# only when ``--config`` was not passed.
-_AUTO_DISCOVERY_PATHS: tuple[Path, ...] = (
-    Path("secantusdb.toml"),
-    Path.home() / ".secantus" / "secantusdb.toml",
-    Path("/etc/secantus/secantusdb.toml"),
+# only when ``--config`` was not passed. Each location is probed for
+# the new ``secantusd.toml`` first, then the legacy ``secantusdb.toml``.
+_CONFIG_NAMES: tuple[str, ...] = ("secantusd.toml", "secantusdb.toml")
+_CONFIG_DIRS: tuple[Path, ...] = (
+    Path("."),
+    Path.home() / ".secantus",
+    Path("/etc/secantus"),
+)
+_AUTO_DISCOVERY_PATHS: tuple[Path, ...] = tuple(
+    (d / name if d != Path(".") else Path(name)) for d in _CONFIG_DIRS for name in _CONFIG_NAMES
 )
 
 
@@ -46,7 +56,7 @@ class SecantusConfig:
 
     Field defaults match the CLI's defaults so a server constructed
     from ``SecantusConfig()`` (no file, no flags) behaves identically
-    to what ``secantusdb`` with zero arguments used to do.
+    to what ``secantusd-py`` with zero arguments used to do.
     """
 
     # ---- [server] ---------------------------------------------------

@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run a SecantusDB standalone single-node MongoDB server "
             "speaking the pymongo wire protocol. Flags override values "
-            "in secantusdb.toml; secantusdb.toml overrides built-in "
+            "in secantusd.toml; secantusd.toml overrides built-in "
             "defaults."
         ),
     )
@@ -42,10 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "Path to a secantusdb.toml configuration file. When omitted, "
-            "the launcher auto-discovers ./secantusdb.toml, "
-            "~/.secantus/secantusdb.toml, /etc/secantus/secantusdb.toml "
-            "(first hit wins). Passing this flag disables auto-discovery."
+            "Path to a secantusd.toml configuration file. When omitted, "
+            "the launcher auto-discovers ./secantusd.toml, "
+            "~/.secantus/secantusd.toml, /etc/secantus/secantusd.toml "
+            "(and the legacy secantusdb.toml at each location) — first "
+            "hit wins. Passing this flag disables auto-discovery."
         ),
     )
     parser.add_argument("--host", default=None)

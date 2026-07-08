@@ -1,4 +1,4 @@
-//! CLI argument parsing for the standalone `secantusdb` binary (R7).
+//! CLI argument parsing for the standalone `secantusd-rs` binary (R7).
 //!
 //! Lives here — not in the bin crate — so it is WT-free and unit-testable in
 //! the clean workspace (`cargo test -p secantus-server`). The WT-linked
@@ -213,7 +213,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--help" | "-h" => return Ok(Parsed::Help(usage())),
             "--version" => {
                 return Ok(Parsed::Version(format!(
-                    "secantusdb {}",
+                    "secantusd-rs {}",
                     env!("CARGO_PKG_VERSION")
                 )))
             }
@@ -229,7 +229,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--storage-path" => o.storage_path = Some(take_value("--storage-path")?),
             "--log-level" => {
                 let lvl = take_value("--log-level")?;
-                validate_log_level(&lvl, "secantusdb").map_err(|_| {
+                validate_log_level(&lvl, "secantusd-rs").map_err(|_| {
                     format!("--log-level must be one of DEBUG/INFO/WARNING/ERROR, got {lvl:?}")
                 })?;
                 o.log_level = Some(lvl);
@@ -313,20 +313,21 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
 pub fn usage() -> String {
     format!(
         "\
-secantusdb {} — standalone single-node MongoDB-compatible server (Rust)
+secantusd-rs {} — standalone single-node MongoDB-compatible server (Rust)
 
-Flags override values in secantusdb.toml; secantusdb.toml overrides built-in
+Flags override values in secantusd.toml; secantusd.toml overrides built-in
 defaults.
 
 USAGE:
-    secantusdb [OPTIONS]
+    secantusd-rs [OPTIONS]
 
 OPTIONS:
-    --config PATH                Path to a secantusdb.toml config file. When
-                                 omitted, auto-discovers ./secantusdb.toml,
-                                 ~/.secantus/secantusdb.toml,
-                                 /etc/secantus/secantusdb.toml (first hit wins).
-                                 Passing this flag disables auto-discovery.
+    --config PATH                Path to a secantusd.toml config file. When
+                                 omitted, auto-discovers ./secantusd.toml,
+                                 ~/.secantus/secantusd.toml,
+                                 /etc/secantus/secantusd.toml (and the legacy
+                                 secantusdb.toml at each). Passing this flag
+                                 disables auto-discovery.
     --host HOST                  Bind address (default: 127.0.0.1)
     --port PORT                  Bind port; 0 picks an ephemeral port and
                                  prints it on startup (default: 27017)
@@ -552,7 +553,7 @@ mod tests {
         assert!(matches!(parse(&["--help"]).unwrap(), Parsed::Help(_)));
         assert!(matches!(parse(&["-h"]).unwrap(), Parsed::Help(_)));
         match parse(&["--version"]).unwrap() {
-            Parsed::Version(v) => assert!(v.starts_with("secantusdb ")),
+            Parsed::Version(v) => assert!(v.starts_with("secantusd-rs ")),
             other => panic!("expected Version, got {other:?}"),
         }
     }

@@ -17,8 +17,11 @@ publish = false
 # into the parent `crates` workspace, matching secantus-storage-adapter.
 [workspace]
 
+# Binary name follows the `secantusd-<engine>` daemon scheme so the compiled
+# Rust server is distinguishable from the Python one (`secantusd-py`). The Cargo
+# package stays `secantusdb`; only the emitted binary is `secantusd-rs`.
 [[bin]]
-name = "secantusdb"
+name = "secantusd-rs"
 path = "src/main.rs"
 
 [dependencies]

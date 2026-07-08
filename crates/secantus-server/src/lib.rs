@@ -232,7 +232,7 @@ impl Drop for ConnEntryGuard {
 /// version (`crates/*/Cargo.toml`, bumped in lockstep). This is the canonical
 /// "Rust server version" — distinct from the Python server's `0.5.2bN` PyPI
 /// version (the two diverged at `0.5.2`; see the project `CLAUDE.md`). The
-/// `secantusdb` binary's `--version`, the embedded Python handle's `.version`,
+/// `secantusd-rs` binary's `--version`, the embedded Python handle's `.version`,
 /// and `buildInfo.secantusVersion` all surface this value.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

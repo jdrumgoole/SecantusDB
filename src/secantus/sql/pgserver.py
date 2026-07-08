@@ -15,16 +15,19 @@ dual-protocol view.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import datetime as _dt
 import itertools
 import logging
 import os
 import secrets
+import signal
 import socket
 import ssl
+import sys
 import threading
-from types import TracebackType
+from types import FrameType, TracebackType
 from typing import TYPE_CHECKING, Any
 
 from secantus.sql import copyfmt, errors, pgwire, planner, typemap
@@ -537,3 +540,89 @@ def _render_result(res: Any) -> bytes:
             )
     out += pgwire.command_complete(res.command_tag)
     return bytes(out)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Argparse parser for the ``secantusd-py-pg`` daemon."""
+    parser = argparse.ArgumentParser(
+        prog="secantusd-py-pg",
+        description=(
+            "Run a SecantusDB standalone single-node server speaking the "
+            "PostgreSQL wire protocol over the shared document store."
+        ),
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=5432)
+    parser.add_argument(
+        "--storage-path",
+        default="./secantus-pg-data",
+        metavar="PATH",
+        help=(
+            "WiredTiger home directory (default: './secantus-pg-data'). Created "
+            "if missing; reopened intact across restarts."
+        ),
+    )
+    parser.add_argument(
+        "--default-database",
+        default="postgres",
+        metavar="NAME",
+        help="Database reported to clients that don't request one (default: postgres).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    parser.add_argument(
+        "--tls-cert-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "PEM-format server certificate chain. When this and --tls-key-file "
+            "are both set, an SSLRequest is answered and the socket is TLS-"
+            "wrapped before the startup flow; without them the server stays "
+            "plaintext."
+        ),
+    )
+    parser.add_argument(
+        "--tls-key-file",
+        default=None,
+        metavar="PATH",
+        help="PEM-format private key matching --tls-cert-file.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    server = SecantusPGServer(
+        host=args.host,
+        port=args.port,
+        storage_path=args.storage_path,
+        default_database=args.default_database,
+        tls_cert_file=args.tls_cert_file,
+        tls_key_file=args.tls_key_file,
+    )
+
+    stopped = threading.Event()
+
+    def handle_signal(signum: int, frame: FrameType | None) -> None:
+        server.stop()
+        stopped.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    server.start()
+    stopped.wait()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

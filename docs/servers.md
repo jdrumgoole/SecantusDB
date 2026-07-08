@@ -49,7 +49,7 @@ they diverged at `0.5.2` and advance independently:
   in `pyproject.toml` / `secantus.__version__`.
 - **Rust server** — `0.5.3-beta.N` (SemVer pre-release), carried in lockstep
   across the `crates/*` workspace and surfaced over the wire as
-  `buildInfo.secantusVersion`, by the `secantusdb-rs --version` flag, and by
+  `buildInfo.secantusVersion`, by the `secantusd-rs --version` flag, and by
   the embedded handle's `RustServer.version`.
 
 A change that touches only one server bumps only that server's version.
@@ -67,10 +67,11 @@ with SecantusDBServer(port=27017) as server:
     client["mydb"]["users"].insert_one({"_id": 1, "name": "Joe"})
 ```
 
-Or as a daemon — `pip install` puts a `secantusdb` script on `PATH`:
+Or as a daemon — `pip install` puts a `secantusd-py` script on `PATH` (the
+legacy `secantusdb` / `secantus` names are kept as aliases):
 
 ```bash
-secantusdb --host 127.0.0.1 --port 27017
+secantusd-py --host 127.0.0.1 --port 27017
 ```
 
 See [Quickstart](quickstart.md) and [Installation](installation.md).
@@ -84,8 +85,8 @@ flag on:
 SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev
 ```
 
-A flag-on build exposes the embedded handle and a `secantusdb-rs` daemon on
-`PATH` (distinct from the pure-Python `secantusdb` console script):
+A flag-on build exposes the embedded handle and a `secantusd-rs` daemon on
+`PATH` (distinct from the pure-Python `secantusd-py` console script):
 
 ```python
 import _secantus_server
@@ -99,8 +100,22 @@ srv.stop()
 ```
 
 ```bash
-secantusdb-rs --host 127.0.0.1 --port 27017
+secantusd-rs --host 127.0.0.1 --port 27017
 ```
+
+Both Mongo daemons read the same `secantusd.toml` config (see
+[Configuration](configuration.md)).
+
+### SQL / PostgreSQL server
+
+The optional PostgreSQL-wire server (`pip install "secantus[sql]"`) runs as
+`secantusd-py-pg`:
+
+```bash
+secantusd-py-pg --host 127.0.0.1 --port 5432 --storage-path ./secantus-data
+```
+
+See the [SQL / PostgreSQL interface](sql.md).
 
 ## What each server does **not** support
 

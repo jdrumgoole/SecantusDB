@@ -35,7 +35,7 @@ tool — [`pymongo`](https://pymongo.readthedocs.io/en/stable/),
 `MongoClient` at it and your application code doesn't know the
 difference, as long as the application only needs single-node behaviour.
 No `mongod` to install, no port conflicts, parallel-test friendly,
-embedded or as a standalone daemon (`secantusdb`).
+embedded or as a standalone daemon (`secantusd-py`).
 
 Single-node only by design: replica sets, sharding, and anything that
 depends on real cluster topology are out of scope. Within that
@@ -92,7 +92,7 @@ compound, mixed-direction, partial, TTL, sort — proper `explain` output
 **Authentication**: SCRAM-SHA-256 — MongoDB's default since 4.0 — is
 implemented end-to-end on the wire, alongside **native TLS / mTLS** and
 the **MONGODB-X509** cert-as-username mechanism. Off by default; flip
-SCRAM on with `secantusdb --auth` (or `SecantusDBServer(...,
+SCRAM on with `secantusd-py --auth` (or `SecantusDBServer(...,
 require_auth=True)`), provision users with `createUser`, then connect
 with the standard `MongoClient(uri, username=, password=)` shape. See
 [Authentication](https://secantusdb.readthedocs.io/en/latest/authentication.html). Authorization
@@ -121,6 +121,13 @@ from secantus.sql import SecantusPGServer
 
 with SecantusPGServer(port=5432) as server:
     ...  # SELECT / INSERT / UPDATE / DELETE, JOIN, GROUP BY, transactions, ...
+```
+
+Or run it as a standalone daemon — `pip install "secantus[sql]"` puts a
+`secantusd-py-pg` script on your `PATH`:
+
+```bash
+secantusd-py-pg --host 127.0.0.1 --port 5432 --storage-path ./secantus-data
 ```
 
 SQL is compiled down to the same query / aggregation engines the MongoDB side
@@ -182,7 +189,7 @@ pure-Python; the Rust engines live only in the Rust server.
 
 The Rust side is a Cargo workspace under `crates/`: a pure-Rust engine crate
 (`secantus-core`, no PyO3) reused by the Rust server and the standalone
-`secantusdb-rs` binary, plus a thin PyO3 bindings crate (`secantus-core-py`)
+`secantusd-rs` binary, plus a thin PyO3 bindings crate (`secantus-core-py`)
 that builds the `secantus-core` wheel — the vehicle that pins each Rust engine
 byte-for-byte against its pure-Python counterpart.
 
@@ -202,17 +209,18 @@ of when to pick each server are spelled out in
 
 ## Standalone daemon (drop-in `mongod` replacement)
 
-`pip install` puts a `secantusdb` script on your `PATH`. Run it like
+`pip install` puts a `secantusd-py` script on your `PATH` (the legacy
+`secantusdb` / `secantus` names still work as aliases). Run it like
 you'd run `mongod`:
 
 ```bash
-secantusdb --host 127.0.0.1 --port 27017
+secantusd-py --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default; pass --storage-path :memory:
 # for an ephemeral temp dir cleaned up on shutdown.
 ```
 
 The same `pip install secantus` also puts the standalone **Rust** server on your
-`PATH` as `secantusdb-rs` (same flags, same wire protocol; see
+`PATH` as `secantusd-rs` (same flags, same wire protocol; see
 [The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html)) —
 on Linux, macOS (Apple Silicon), and Windows. Intel-Mac wheels are pure-Python.
 

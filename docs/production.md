@@ -48,7 +48,7 @@ failover** (a process crash without a hot standby is downtime), and
 **beta maturity** (the project has not yet been through a public
 production incident — the existence of unknown sharp edges has not
 been ruled out). Native TLS used to be on this list; it now isn't —
-`[tls] cert_file` / `key_file` in `secantusdb.toml` wraps every
+`[tls] cert_file` / `key_file` in `secantusd.toml` wraps every
 accepted socket in TLS before the wire protocol starts, so a reverse
 proxy is no longer required to put SecantusDB behind a stable
 hostname.
@@ -65,7 +65,7 @@ and lets the daemon bind on the public interface (TLS terminates
 in-process — see [TLS](#tls) below):
 
 ```ini
-# /etc/systemd/system/secantusdb.service
+# /etc/systemd/system/secantusd-py.service
 [Unit]
 Description=SecantusDB
 After=network.target
@@ -74,7 +74,7 @@ After=network.target
 Type=simple
 User=secantus
 Group=secantus
-ExecStart=/usr/local/bin/secantusdb
+ExecStart=/usr/local/bin/secantusd-py
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
@@ -89,7 +89,7 @@ WantedBy=multi-user.target
 ```
 
 Notice the absence of CLI flags on `ExecStart`. Configuration lives
-in `/etc/secantus/secantusdb.toml` instead so ops can edit a file
+in `/etc/secantus/secantusd.toml` instead so ops can edit a file
 rather than re-deploy the unit.
 
 ### Configuration file
@@ -99,7 +99,7 @@ TOML schema; the production-shaped version of that file looks
 roughly like this:
 
 ```toml
-# /etc/secantus/secantusdb.toml
+# /etc/secantus/secantusd.toml
 [server]
 host = "0.0.0.0"                     # public bind; TLS terminates inside the daemon
 port = 27017
@@ -148,7 +148,7 @@ enforced, or you'll lock yourself out. The bootstrap sequence:
 
 ```bash
 # 1. Start once without auth.
-secantusdb --storage-path /var/lib/secantus/data --no-auth
+secantusd-py --storage-path /var/lib/secantus/data --no-auth
 
 # 2. Create an admin in a separate shell.
 mongosh mongodb://127.0.0.1:27017/ --eval '
@@ -160,7 +160,7 @@ mongosh mongodb://127.0.0.1:27017/ --eval '
 '
 
 # 3. Stop the daemon, then start it via systemd with auth on.
-sudo systemctl start secantusdb
+sudo systemctl start secantusd-py
 ```
 
 From there, application users get provisioned over the wire with
@@ -196,7 +196,7 @@ PEM-format chain.
 Cert rotation is hot-swap-friendly *only* across a restart — the
 SSLContext is built once at startup and cached for the lifetime
 of the daemon. Bake `certbot renew --post-hook 'systemctl reload
-secantusdb'` (a full restart, despite the name) into your renewal
+secantusd-py'` (a full restart, despite the name) into your renewal
 cron so renewed certs take effect.
 
 For deployments that want stronger client-identity guarantees, add
@@ -234,7 +234,7 @@ Two backup paths ship; pick one and stick with it.
 For the native path, a simple hourly cron + off-host sync:
 
 ```bash
-# /etc/cron.d/secantusdb-backup
+# /etc/cron.d/secantusd-backup
 0 * * * * secantus mongosh mongodb://admin:<pwd>@127.0.0.1:27017/ \
     --quiet --eval 'db.adminCommand({"secantusAdmin.backupArchive": 1, \
     outputPath: "/var/lib/secantus/backups/archive-$(date -u +\%FT\%H).tar.gz"})'
@@ -248,10 +248,10 @@ For the native path, a simple hourly cron + off-host sync:
 secantusdb-restore-archive \
     --archive /srv/secantus-backups/archive-2026-05-18T03.tar.gz \
     --target-dir /var/lib/secantus/data-restored
-sudo systemctl stop secantusdb
+sudo systemctl stop secantusd-py
 sudo mv /var/lib/secantus/data /var/lib/secantus/data-old
 sudo mv /var/lib/secantus/data-restored /var/lib/secantus/data
-sudo systemctl start secantusdb
+sudo systemctl start secantusd-py
 ```
 
 This is also reachable from the admin UI's `/backup` page (per-row
@@ -340,7 +340,7 @@ deployment (managed or self-hosted) rather than a workaround.
 SecantusDB *can* run as a single-node production document store for
 small or internal-scale applications, with the same shape of
 deployment a single-node Postgres would take. The deployment story
-is straightforward: a `systemd` unit, a `secantusdb.toml` with
+is straightforward: a `systemd` unit, a `secantusd.toml` with
 `sync_on_commit = true` and a right-sized cache, SCRAM auth,
 periodic native backups synced off-host, a TLS-terminating reverse
 proxy, and a quarterly restore drill.

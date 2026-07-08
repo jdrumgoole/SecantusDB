@@ -30,7 +30,7 @@ There are two ways to use it:
   application or test process. No subprocess, no port collision (use
   `port=0`), no separate daemon to manage. Also ideal for tests under
   `pytest-xdist`.
-- **Standalone daemon** — `pip install` puts a `secantusdb` script on
+- **Standalone daemon** — `pip install` puts a `secantusd-py` script on
   `PATH` that runs the server like a `mongod`. Drop-in replacement for a
   single-node `mongod` in dev / CI / small production-shaped workloads
   where the beta caveats are acceptable.
@@ -67,8 +67,9 @@ ephemeral WiredTiger home — suites then run cleanly under `pytest-xdist`.
 ## Standalone daemon
 
 ```bash
-secantusdb --host 127.0.0.1 --port 27017
+secantusd-py --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default
+# legacy aliases: `secantusdb`, `secantus`
 ```
 
 Then connect with **any** MongoDB driver or tool, unchanged:

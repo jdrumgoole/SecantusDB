@@ -1,4 +1,4 @@
-//! `secantusdb` — the standalone Rust server binary (R7).
+//! `secantusd-rs` — the standalone Rust server binary (R7).
 //!
 //! The non-Python entry point over the same crates the embedded
 //! `_secantus_server` handle (R6) uses: parse args → open the WiredTiger
@@ -23,7 +23,7 @@ use secantus_storage::{wt_config, Storage};
 use secantus_storage_adapter::StorageAdapter;
 
 const RESTORE_HELP: &str = "\
-Usage: secantusdb restore --source PATH --target-dir PATH [--to-timestamp SECS[,ORD]]
+Usage: secantusd-rs restore --source PATH --target-dir PATH [--to-timestamp SECS[,ORD]]
 
 Point-in-time recovery: rebuild a fresh data directory as the database was at a
 target time by replaying a stopped server's oplog forward. The source must be a
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
         return match run_restore(&argv[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
-                eprintln!("secantusdb restore: {msg}");
+                eprintln!("secantusd-rs restore: {msg}");
                 ExitCode::from(2)
             }
         };
@@ -59,8 +59,8 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("secantusdb: {msg}");
-            eprintln!("Try 'secantusdb --help' for usage.");
+            eprintln!("secantusd-rs: {msg}");
+            eprintln!("Try 'secantusd-rs --help' for usage.");
             // argparse's exit code for bad arguments, matching the Python CLI.
             return ExitCode::from(2);
         }
@@ -73,14 +73,14 @@ fn main() -> ExitCode {
     let (cfg, source) = match resolve(parsed.config_path.as_deref(), &parsed.overrides) {
         Ok(pair) => pair,
         Err(msg) => {
-            eprintln!("secantusdb: {msg}");
+            eprintln!("secantusd-rs: {msg}");
             return ExitCode::from(2);
         }
     };
     let cli = match CliArgs::from_resolved(&cfg) {
         Ok(cli) => cli,
         Err(msg) => {
-            eprintln!("secantusdb: {msg}");
+            eprintln!("secantusd-rs: {msg}");
             return ExitCode::from(2);
         }
     };
@@ -96,7 +96,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("secantusdb: {msg}");
+            eprintln!("secantusd-rs: {msg}");
             ExitCode::FAILURE
         }
     }
@@ -194,7 +194,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
 
     // The smoke test (and any wrapping launcher) reads this line to learn the
     // bound address, so it must hit stdout before we block.
-    println!("secantusdb listening on {}", running.address());
+    println!("secantusd-rs listening on {}", running.address());
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
 
@@ -275,7 +275,7 @@ fn flag_value(
         .ok_or_else(|| format!("{key} requires a value"))
 }
 
-/// `secantusdb restore` — replay a stopped source's oplog into a fresh target.
+/// `secantusd-rs restore` — replay a stopped source's oplog into a fresh target.
 /// Hand-rolled arg parsing (like the server), accepting both `--flag value` and
 /// `--flag=value`.
 fn run_restore(args: &[String]) -> Result<(), String> {
@@ -326,7 +326,7 @@ fn run_restore(args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("{e:?}"))?;
     println!(
         "Restored {} operations (through oplog seq {}) into {}.\n\
-         Start a server on it: secantusdb --storage-path {}",
+         Start a server on it: secantusd-rs --storage-path {}",
         stats.ops_applied, stats.last_seq, target_dir, target_dir
     );
     Ok(())

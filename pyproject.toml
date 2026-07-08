@@ -102,9 +102,18 @@ sql = [
 ]
 
 [project.scripts]
-# `secantusdb` is the primary console script, matching the PyPI distribution
-# name. `secantus` is kept as a shorter legacy alias — both invoke the same
-# entry point and start a standalone single-node server.
+# Daemon naming: `secantusd-<engine>[-<protocol>]`. `-d` signals a daemon
+# (like `mongod`); the engine tag (`-py` / `-rs`) disambiguates the Python and
+# Rust builds that would otherwise both be `secantusd`; a protocol tag (`-pg`)
+# names the wire protocol when it isn't the default MongoDB wire.
+#   secantusd-py     — Python MongoDB-wire server (this package)
+#   secantusd-py-pg  — Python PostgreSQL-wire server (secantus.sql.pgserver)
+#   secantusd-rs     — Rust MongoDB-wire server (crates/secantusdb [[bin]])
+secantusd-py = "secantus.cli:main"
+secantusd-py-pg = "secantus.sql.pgserver:main"
+# `secantusdb` is the name published to PyPI; `secantus` is a shorter form.
+# Both are kept as legacy aliases of `secantusd-py` so existing installs and
+# docs keep working — drop them only on a deliberate major bump.
 secantusdb = "secantus.cli:main"
 secantus = "secantus.cli:main"
 secantusdb-admin = "secantus.admin.cli:main"

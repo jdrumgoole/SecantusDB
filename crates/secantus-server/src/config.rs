@@ -1,9 +1,9 @@
-//! TOML-based configuration loader for the `secantusdb` daemon.
+//! TOML-based configuration loader for the `secantusd-rs` daemon.
 //!
 //! A faithful Rust port of `src/secantus/config.py` (the oracle). The config
 //! file is a thin convenience over the CLI flag surface plus a handful of
 //! previously-hard-coded WiredTiger / oplog knobs. Passing **no** `--config`
-//! and having **no** `secantusdb.toml` on the auto-discovery path leaves the
+//! and having **no** `secantusd.toml` on the auto-discovery path leaves the
 //! original behaviour untouched.
 //!
 //! Precedence (low → high):
@@ -13,11 +13,12 @@
 //! ```
 //!
 //! Auto-discovery path order (first hit wins), walked only when `--config`
-//! was not passed:
+//! was not passed. The legacy `secantusdb.toml` is probed at each location
+//! immediately after the new name, so old-named configs keep working:
 //!
-//! 1. `./secantusdb.toml`               (cwd — per-checkout)
-//! 2. `~/.secantus/secantusdb.toml`     (per-user)
-//! 3. `/etc/secantus/secantusdb.toml`   (system-wide)
+//! 1. `./secantusd.toml`                (cwd — per-checkout)
+//! 2. `~/.secantus/secantusd.toml`      (per-user)
+//! 3. `/etc/secantus/secantusd.toml`    (system-wide)
 //!
 //! This module is WiredTiger-free (it only parses text and resolves values),
 //! so it lives in the clean-workspace `secantus-server` crate next to the arg
@@ -30,7 +31,7 @@ pub const LOG_LEVELS: [&str; 4] = ["DEBUG", "INFO", "WARNING", "ERROR"];
 
 /// A fully-resolved daemon configuration. Field defaults match
 /// `SecantusConfig` in `config.py` exactly, so a `ResolvedConfig::default()`
-/// (no file, no flags) behaves identically to what `secantusdb` with zero
+/// (no file, no flags) behaves identically to what `secantusd-rs` with zero
 /// arguments used to do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedConfig {
@@ -163,13 +164,23 @@ impl ConfigOverrides {
 }
 
 /// Auto-discovery candidates, in order. The launcher walks this list only when
-/// `--config` was not passed.
+/// `--config` was not passed. Each location is probed for the new
+/// `secantusd.toml` first, then the legacy `secantusdb.toml`, so configs written
+/// for the old daemon name keep working while the new name wins on a tie.
 fn auto_discovery_paths() -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from("secantusdb.toml")];
-    if let Some(home) = home_dir() {
-        paths.push(home.join(".secantus").join("secantusdb.toml"));
+    const NAMES: [&str; 2] = ["secantusd.toml", "secantusdb.toml"];
+    let mut paths = Vec::new();
+    for name in NAMES {
+        paths.push(PathBuf::from(name));
     }
-    paths.push(PathBuf::from("/etc/secantus/secantusdb.toml"));
+    if let Some(home) = home_dir() {
+        for name in NAMES {
+            paths.push(home.join(".secantus").join(name));
+        }
+    }
+    for name in NAMES {
+        paths.push(PathBuf::from(format!("/etc/secantus/{name}")));
+    }
     paths
 }
 
@@ -432,7 +443,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("secantus-cfg-{nanos}-{n}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("secantusdb.toml");
+        let path = dir.join("secantusd.toml");
         std::fs::write(&path, text).unwrap();
         path
     }

@@ -261,7 +261,7 @@ def rust_binary_build(c: Context, release: bool = False) -> None:
     flag = " --release" if release else ""
     c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=True, env=_rust_env())
     sub = "release" if release else "debug"
-    print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusdb")
+    print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusd-rs")
 
 
 @task(name="rust-server-build")
@@ -444,7 +444,7 @@ def rust_repro(c: Context, script: str, release: bool = True) -> None:
     sub = "release" if release else "debug"
     flag = " --release" if release else ""
     c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=True, env=_rust_env())
-    binpath = f"{_RUST_BINARY_DIR}/target/{sub}/secantusdb"
+    binpath = f"{_RUST_BINARY_DIR}/target/{sub}/secantusd-rs"
     c.run(f"uv run python {shlex.quote(script)} --binary {binpath}", pty=True, env=_rust_env())
 
 
