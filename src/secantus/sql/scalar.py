@@ -860,14 +860,22 @@ _DATE_TRUNC_UNITS = ("year", "quarter", "month", "week", "day", "hour", "minute"
 
 
 def _eval_date_trunc(node: exp.TimestampTrunc, scope: Scope, ctx: ScalarContext) -> Any:
-    """``date_trunc('unit', ts)`` -> ts zeroed below ``unit`` (week -> Monday)."""
+    """``date_trunc('unit', ts)`` -> ts zeroed below ``unit`` (week -> Monday).
+
+    ``date_trunc('unit', interval)`` truncates an interval value instead, zeroing
+    every component finer than ``unit`` (matching Postgres)."""
+    from secantus.sql import intervals as _intervals
+
     src = evaluate(node.this, scope, ctx)
     if src is None:
         return None
+    unit0 = node.args["unit"].name.lower().rstrip("s")
+    if _intervals.is_interval(src):
+        return _date_trunc_interval(unit0, src, _intervals)
     ts = _as_datetime(src)
     if not isinstance(ts, _dt.datetime):
         ts = _dt.datetime(ts.year, ts.month, ts.day, tzinfo=_dt.timezone.utc)
-    unit = node.args["unit"].name.lower().rstrip("s")
+    unit = unit0
     y, mo, d, h, mi, s = ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second
     tz = ts.tzinfo
     if unit == "year":
@@ -888,6 +896,38 @@ def _eval_date_trunc(node: exp.TimestampTrunc, scope: Scope, ctx: ScalarContext)
     if unit == "second":
         return _dt.datetime(y, mo, d, h, mi, s, tzinfo=tz)
     raise errors.feature_not_supported(f"unsupported date_trunc unit: {unit}")
+
+
+_MICROS_PER = {
+    "microsecond": 1,
+    "millisecond": 1_000,
+    "second": 1_000_000,
+    "minute": 60 * 1_000_000,
+    "hour": 3600 * 1_000_000,
+}
+
+
+def _date_trunc_interval(unit: str, src: Any, _intervals: Any) -> Any:
+    """``date_trunc(unit, interval)`` — zero every interval component finer than
+    ``unit``. Postgres orders components years > months > days > time; ``week``
+    is not a valid unit for an interval."""
+    iv = src["interval"]
+    months = int(iv.get("months", 0))
+    days = int(iv.get("days", 0))
+    micros = int(iv.get("micros", 0))
+    if unit in ("millennium", "century", "decade", "year"):
+        step = {"millennium": 12000, "century": 1200, "decade": 120, "year": 12}[unit]
+        return _intervals.make((months // step) * step, 0, 0)
+    if unit == "quarter":
+        return _intervals.make((months // 3) * 3, 0, 0)
+    if unit == "month":
+        return _intervals.make(months, 0, 0)
+    if unit == "day":
+        return _intervals.make(months, days, 0)
+    if unit in _MICROS_PER:
+        per = _MICROS_PER[unit]
+        return _intervals.make(months, days, (micros // per) * per)
+    raise errors.feature_not_supported(f'unit "{unit}" not supported for interval date_trunc')
 
 
 # sqlglot's Postgres dialect already normalises the standard ``to_char`` tokens

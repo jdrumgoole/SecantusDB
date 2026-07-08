@@ -1081,6 +1081,10 @@ SELECT generate_series(1, 5);                     -- same, SELECT-list form
 SELECT * FROM generate_series(1, 10, 2);          -- with a step -> 1,3,5,7,9
 SELECT n FROM generate_series(1, 100) AS g(n) WHERE n % 7 = 0;
 SELECT * FROM generate_series(1, 3) WITH ORDINALITY;   -- adds a 1-based ordinal column
+
+-- date / timestamp ranges with an interval step
+SELECT * FROM generate_series(timestamp '2024-01-01', timestamp '2024-01-03', interval '1 day');
+SELECT generate_series(timestamp '2024-01-01', timestamp '2024-01-02', interval '12 hours');
 ```
 
 The base-less `FROM` form also covers `unnest(ARRAY[…])`, `jsonb_array_elements`,
@@ -1098,10 +1102,14 @@ name by default. `WITH ORDINALITY [AS t(v, ord)]` appends the ordinal column.
 Projection, `WHERE`, `ORDER BY`, `LIMIT`, and `count(*)` all work over the
 generated rows.
 
-**Simplifications:** `generate_series` covers integer / numeric ranges only (a
-date / timestamp series with an `interval` step raises `0A000`); a non-`count(*)`
-aggregate or `GROUP BY` directly over a base-less SRF isn't supported yet — wrap
-it in a subquery / CTE, or generate into a table first.
+`generate_series` covers both integer / numeric ranges and date / timestamp
+ranges with an `interval` step (the step's sign chooses the walk direction; a
+zero step errors; month stepping is calendar-aware). The result column types as
+`timestamp` or `timestamptz` by the bound's tz-ness.
+
+**Simplifications:** a non-`count(*)` aggregate or `GROUP BY` directly over a
+base-less SRF isn't supported yet — wrap it in a subquery / CTE, or generate into
+a table first.
 
 ### Foreign keys
 
@@ -1438,7 +1446,8 @@ FROM t;
 SELECT extract(year FROM at),        -- also month/day/hour/minute/second/quarter/
        extract(dow FROM at),         --   dow (Sun=0)/isodow (Mon=1)/doy/week/epoch
        date_part('hour', at),        -- date_part is the function-call spelling
-       date_trunc('month', at),      -- zero everything below the unit (week -> Monday)
+       date_trunc('month', at),      -- zero everything below the unit (week -> Monday);
+                                     --   also truncates an interval (returns an interval)
        to_char(at, 'YYYY-MM-DD HH24:MI:SS'),   -- Mon/Day month/weekday names too
        at + interval '1 day',        -- interval arithmetic (fixed + month/year units)
        at - interval '2 months 3 days',

@@ -5153,11 +5153,13 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return "timetz"
     # ``date_trunc(unit, src)`` keeps the tz-ness of ``src`` (Postgres:
     # ``date_trunc(text, timestamptz) -> timestamptz``, ``… timestamp) -> timestamp``;
-    # a ``date`` argument is cast to naive timestamp). An argument whose type we
+    # a ``date`` argument is cast to naive timestamp). An ``interval`` argument
+    # truncates the interval and yields ``interval``. An argument whose type we
     # can't prove naive defaults to ``timestamptz`` (the historical behaviour).
-    # (``date_trunc`` over an ``interval`` isn't evaluated — see tasks/backlog.md.)
     if getattr(exp, "TimestampTrunc", None) is not None and isinstance(node, exp.TimestampTrunc):
         arg_tag = _infer_scalar_tag(node.this, resolve) if node.this is not None else None
+        if arg_tag == "interval":
+            return "interval"
         if arg_tag in ("timestamp", "date"):
             return "timestamp"
         return "timestamptz"

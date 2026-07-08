@@ -16,12 +16,13 @@ outer row × element) stays in the pipeline planner's ``_unnest_join_stage``.
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
 from typing import Any
 
 from sqlglot import exp
 
-from . import errors
+from . import errors, intervals
 from .catalog import Column, TableDef
 
 # Named SRFs (as an ``Anonymous`` call). ``generate_series`` parses to its own
@@ -180,13 +181,17 @@ def _as_json_list(val: Any) -> list[Any]:
 
 
 def _generate_series(start: Any, stop: Any, step: Any) -> tuple[list[Any], str]:
-    """``generate_series(start, stop[, step])`` over numbers — inclusive of both
-    ends. (Date / timestamp series with an ``interval`` step aren't supported yet.)"""
+    """``generate_series(start, stop[, step])`` — inclusive of both ends. Numeric
+    ranges (int / numeric step) and date / timestamp ranges (an ``interval``
+    step) are both supported."""
     if start is None or stop is None:
         return [], "int8"
+    if _is_temporal(start) or intervals.is_interval(step):
+        return _generate_series_temporal(start, stop, step)
     if not isinstance(start, (int, float)) or not isinstance(stop, (int, float)):
         raise errors.feature_not_supported(
-            "generate_series is supported for integer / numeric ranges only"
+            "generate_series is supported for integer / numeric or "
+            "date / timestamp (with interval step) ranges only"
         )
     step = 1 if step is None else step
     if step == 0:
@@ -203,6 +208,49 @@ def _generate_series(start: Any, stop: Any, step: Any) -> tuple[list[Any], str]:
             cur += step
     tag = "int8" if all(isinstance(v, int) for v in out) else "numeric"
     return out, tag
+
+
+# A generous backstop against a runaway series (e.g. an interval step that never
+# advances). Postgres relies on memory limits; a surrogate fails loudly instead.
+_MAX_SERIES_ROWS = 10_000_000
+
+
+def _is_temporal(v: Any) -> bool:
+    return isinstance(v, _dt.date)  # datetime is a subclass of date
+
+
+def _generate_series_temporal(start: Any, stop: Any, step: Any) -> tuple[list[Any], str]:
+    """``generate_series(ts_start, ts_stop, interval)`` — walk from ``start`` to
+    ``stop`` (inclusive) by ``interval``. The interval carries its own sign; the
+    walk direction is taken from whether one step moves forward or backward."""
+    if not (_is_temporal(start) and _is_temporal(stop)):
+        raise errors.SQLError(
+            "42883",
+            "generate_series with an interval step requires date / timestamp bounds",
+        )
+    if not intervals.is_interval(step):
+        raise errors.SQLError("42883", "generate_series over timestamps requires an interval step")
+    start_dt, stop_dt = _to_datetime(start), _to_datetime(stop)
+    nxt = intervals.to_date(start_dt, step, 1)
+    if nxt == start_dt:
+        raise errors.SQLError("22023", "step size cannot equal zero")
+    ascending = nxt > start_dt
+    out: list[Any] = []
+    cur = start_dt
+    while (cur <= stop_dt) if ascending else (cur >= stop_dt):
+        out.append(cur)
+        if len(out) > _MAX_SERIES_ROWS:
+            raise errors.SQLError("54000", "generate_series produced too many rows")
+        cur = intervals.to_date(cur, step, 1)
+    tag = "timestamptz" if start_dt.tzinfo is not None else "timestamp"
+    return out, tag
+
+
+def _to_datetime(v: Any) -> _dt.datetime:
+    if isinstance(v, _dt.datetime):
+        return v
+    # a bare date -> midnight
+    return _dt.datetime(v.year, v.month, v.day)
 
 
 def _empty_scope(col: exp.Column) -> Any:

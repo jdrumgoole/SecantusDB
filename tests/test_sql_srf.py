@@ -141,8 +141,81 @@ def test_from_jsonb_object_keys():
 # --------------------------------------------------------------------------- #
 
 
-def test_date_generate_series_not_supported():
-    sql = "SELECT * FROM generate_series('2026-01-01'::date, '2026-01-03'::date, '1 day'::interval)"
+def test_generate_series_timestamp_step_zero_rejected():
+    sql = (
+        "SELECT * FROM generate_series(timestamp '2026-01-01', "
+        "timestamp '2026-01-03', interval '0 day')"
+    )
     with pytest.raises(errors.SQLError) as exc:
         _rows(sql)
-    assert exc.value.sqlstate == "0A000"
+    assert exc.value.sqlstate == "22023"
+
+
+# --------------------------------------------------------------------------- #
+# generate_series over timestamps + interval step (#150)
+# --------------------------------------------------------------------------- #
+
+import datetime as _dt  # noqa: E402
+
+
+def test_generate_series_timestamp_day_step():
+    rows = _rows(
+        "SELECT * FROM generate_series(timestamp '2024-01-01', "
+        "timestamp '2024-01-03', interval '1 day')"
+    )
+    assert rows == [
+        (_dt.datetime(2024, 1, 1),),
+        (_dt.datetime(2024, 1, 2),),
+        (_dt.datetime(2024, 1, 3),),
+    ]
+
+
+def test_generate_series_timestamp_sub_day_step():
+    rows = _rows(
+        "SELECT generate_series(timestamp '2024-01-01 00:00', "
+        "timestamp '2024-01-02 00:00', interval '12 hours')"
+    )
+    assert rows == [
+        (_dt.datetime(2024, 1, 1, 0, 0),),
+        (_dt.datetime(2024, 1, 1, 12, 0),),
+        (_dt.datetime(2024, 1, 2, 0, 0),),
+    ]
+
+
+def test_generate_series_timestamp_month_step_clamps():
+    # month stepping is calendar-aware; day clamps to month length (Jan 31 -> Feb 29)
+    rows = _rows(
+        "SELECT generate_series(timestamp '2024-01-31', timestamp '2024-03-31', interval '1 month')"
+    )
+    assert rows == [
+        (_dt.datetime(2024, 1, 31),),
+        (_dt.datetime(2024, 2, 29),),
+        (_dt.datetime(2024, 3, 29),),
+    ]
+
+
+def test_generate_series_timestamp_descending():
+    rows = _rows(
+        "SELECT generate_series(timestamp '2024-01-03', timestamp '2024-01-01', interval '-1 day')"
+    )
+    assert rows == [
+        (_dt.datetime(2024, 1, 3),),
+        (_dt.datetime(2024, 1, 2),),
+        (_dt.datetime(2024, 1, 1),),
+    ]
+
+
+def test_generate_series_timestamp_empty_when_wrong_direction():
+    # positive step but start > stop -> no rows (Postgres)
+    rows = _rows(
+        "SELECT generate_series(timestamp '2024-01-03', timestamp '2024-01-01', interval '1 day')"
+    )
+    assert rows == []
+
+
+def test_generate_series_timestamp_column_type():
+    r = _run(
+        "SELECT * FROM generate_series(timestamp '2024-01-01', "
+        "timestamp '2024-01-02', interval '1 day')"
+    )
+    assert [c.type_tag for c in r.columns] == ["timestamp"]

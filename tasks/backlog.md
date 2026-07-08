@@ -1858,8 +1858,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   alias (`generate_series(1,5) AS g` → column `g`), else an explicit column alias, else the function name; WITH
   ORDINALITY appends a 1-based ordinal column. sqlglot parses `generate_series` as `ExplodingGenerateSeries` and
   base-less `unnest` as a `From(this=Unnest)`; the FROM arg key is `from_` (not `from`). Tests:
-  `tests/test_sql_srf.py` (17) + a pg8000 wire test. **Simplifications:** `generate_series` is integer/numeric only (a
-  date/timestamp series with an `interval` step raises `0A000`); a non-`count(*)` aggregate / `GROUP BY` directly over
+  `tests/test_sql_srf.py` (17) + a pg8000 wire test. **date/timestamp `generate_series` landed (#150, b187):**
+  `generate_series(ts_start, ts_stop, interval)` walks by the interval (`_generate_series_temporal` in `srf.py`,
+  applying `intervals.to_date` per step; direction taken from whether one step moves forward/backward; zero step →
+  `22023`; a 10M-row backstop → `54000`). Result column types as `timestamp` / `timestamptz` by the bound's tz-ness.
+  Numeric ranges unchanged. **Simplifications:** a non-`count(*)` aggregate / `GROUP BY` directly over
   a base-less SRF isn't supported yet (the SRF path uses `plan_select`, not the pipeline planner) — wrap in a
   subquery/CTE or generate into a table first. The `FROM t, <srf>(…)` *join* form is unchanged (pipeline planner's
   `_unnest_join_stage`).
@@ -2970,8 +2973,10 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   UTC-tags only `timestamptz`, so a `timestamp`-typed truncation stays naive end to end. Tests:
   `test_sql_datetime_funcs.py::test_date_trunc_timestamp_arg_is_naive / _timestamptz_arg_stays_tzaware /
   _timestamp_literal_is_naive / _timestamptz_literal_is_tzaware`. SQL-layer only — no Rust parity impact.
-  **Still unsupported (pre-existing, separate):** `date_trunc(field, interval)` isn't evaluated (the scalar
-  evaluator's `_as_datetime` only handles datetimes) — it raises rather than returning a truncated interval.
+  **`date_trunc(unit, interval)` landed (#148, b187):** `_eval_date_trunc` now detects an interval-valued
+  argument and truncates the interval, zeroing every component finer than `unit` (years > months > days > time;
+  `_date_trunc_interval` in `scalar.py`). Result types as `interval` (`_infer_scalar_tag`). `week` is not a valid
+  unit for an interval (→ `0A000`, matching Postgres). SQL-layer only — no Rust parity impact.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
