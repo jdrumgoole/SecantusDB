@@ -2939,9 +2939,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `information_schema.columns`. The #141 arithmetic tests are reverted to assert naive; new regression tests:
   `test_sql_datetime_types.py::test_timestamp_column_is_naive / _oid_and_typename / _literal_drops_offset /
   test_cast_timestamptz_to_timestamp_strips_tz / test_timestamp_array_naive`. SQL-layer change only — no Rust
-  parity impact (the Rust engines cover query/update/expr/aggregate, not the SQL type mapping). **Remaining
-  limitation:** function returns (`date_trunc`, etc.) still type `timestamptz` regardless of argument tz-ness
-  (would need argument-type threading through function typing) — low priority.
+  parity impact (the Rust engines cover query/update/expr/aggregate, not the SQL type mapping). **Follow-up
+  (`date_trunc` argument typing) landed in #144, b184 — see below.**
+- [ ] **date_trunc preserves argument tz-ness (#144, b184):** `date_trunc(unit, src)` now types as the
+  tz-ness of `src` — `date_trunc(text, timestamptz) -> timestamptz`, `date_trunc(text, timestamp) -> timestamp`
+  (a `date` argument casts to naive timestamp) — instead of always `timestamptz`. `planner._infer_scalar_tag`
+  threads the argument tag through the `TimestampTrunc` node (`CurrentTimestamp` / `now()` stay `timestamptz`);
+  an argument whose type can't be proven naive defaults to `timestamptz` (historical behaviour). The evaluated
+  value's tz-ness already followed the input (truncation preserves tzinfo) and `engine._normalize_result`
+  UTC-tags only `timestamptz`, so a `timestamp`-typed truncation stays naive end to end. Tests:
+  `test_sql_datetime_funcs.py::test_date_trunc_timestamp_arg_is_naive / _timestamptz_arg_stays_tzaware /
+  _timestamp_literal_is_naive / _timestamptz_literal_is_tzaware`. SQL-layer only — no Rust parity impact.
+  **Still unsupported (pre-existing, separate):** `date_trunc(field, interval)` isn't evaluated (the scalar
+  evaluator's `_as_datetime` only handles datetimes) — it raises rather than returning a truncated interval.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by

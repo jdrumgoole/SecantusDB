@@ -198,3 +198,37 @@ def test_null_propagation(storage, session):
     assert val(storage, session, "SELECT extract(year FROM at) FROM e3") is None
     assert val(storage, session, "SELECT date_trunc('day', at) FROM e3") is None
     assert val(storage, session, "SELECT to_char(at, 'YYYY') FROM e3") is None
+
+
+# -- date_trunc preserves argument tz-ness (#144) ----------------------------- #
+
+
+def test_date_trunc_timestamp_arg_is_naive(storage, session):
+    run(storage, session, "CREATE TABLE tsn (id int PRIMARY KEY, ts timestamp)")
+    run(storage, session, "INSERT INTO tsn VALUES (1, '2021-03-15T14:30:45')")
+    c = col(storage, session, "SELECT date_trunc('day', ts) FROM tsn")
+    assert c.type_tag == "timestamp"
+    v = val(storage, session, "SELECT date_trunc('day', ts) FROM tsn")
+    assert v == dt.datetime(2021, 3, 15) and v.tzinfo is None
+
+
+def test_date_trunc_timestamptz_arg_stays_tzaware(t, session):
+    # The `at` column is timestamptz -> date_trunc stays timestamptz + tz-aware.
+    c = col(t, session, "SELECT date_trunc('day', at) FROM ev")
+    assert c.type_tag == "timestamptz"
+    v = val(t, session, "SELECT date_trunc('day', at) FROM ev")
+    assert v == dt.datetime(2021, 3, 15, tzinfo=dt.timezone.utc) and v.tzinfo is not None
+
+
+def test_date_trunc_timestamp_literal_is_naive(storage, session):
+    c = col(storage, session, "SELECT date_trunc('month', timestamp '2020-03-15 01:02:03')")
+    assert c.type_tag == "timestamp"
+    v = val(storage, session, "SELECT date_trunc('month', timestamp '2020-03-15 01:02:03')")
+    assert v == dt.datetime(2020, 3, 1) and v.tzinfo is None
+
+
+def test_date_trunc_timestamptz_literal_is_tzaware(storage, session):
+    c = col(storage, session, "SELECT date_trunc('month', timestamptz '2020-03-15 01:02:03+00')")
+    assert c.type_tag == "timestamptz"
+    v = val(storage, session, "SELECT date_trunc('month', timestamptz '2020-03-15 01:02:03+00')")
+    assert v.tzinfo is not None
