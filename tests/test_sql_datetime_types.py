@@ -207,3 +207,44 @@ def test_timestamptz_array_elements_tzaware(storage, session):
         dt.datetime(2021, 6, 7, 8, 9, 10, tzinfo=dt.timezone.utc),
     ]
     assert all(x.tzinfo is not None for x in v)
+
+
+def test_timestamptz_where_equality_matches_offset_literal(storage, session):
+    # #142: WHERE ts = '...+00:00' / ::timestamptz used to match nothing because
+    # the equality path didn't bridge the tz-aware literal against the tz-naive
+    # stored value. Now it matches by instant.
+    run(storage, session, "CREATE TABLE ev2 (id int PRIMARY KEY, at timestamptz)")
+    run(storage, session, "INSERT INTO ev2 VALUES (1, '2020-01-02T03:04:05+00:00')")
+    run(storage, session, "INSERT INTO ev2 VALUES (2, '2021-06-07T08:09:10+00:00')")
+    for pred in (
+        "at = '2020-01-02T03:04:05+00:00'",
+        "at = '2020-01-02T03:04:05+00:00'::timestamptz",
+        "at = timestamptz '2020-01-02T03:04:05+00:00'",
+        "at = '2020-01-02T05:04:05+02:00'",  # same instant, different offset
+    ):
+        assert run(storage, session, f"SELECT id FROM ev2 WHERE {pred}").rows == [(1,)], pred
+    # A different instant must not match.
+    assert (
+        run(storage, session, "SELECT id FROM ev2 WHERE at = '2020-01-02T03:04:05+02:00'").rows
+        == []
+    )
+    # IN and <> also bridge the boundary.
+    assert run(
+        storage,
+        session,
+        "SELECT id FROM ev2 WHERE at IN ('2020-01-02T03:04:05+00:00', "
+        "'2021-06-07T08:09:10+00:00') ORDER BY id",
+    ).rows == [(1,), (2,)]
+    assert run(
+        storage, session, "SELECT id FROM ev2 WHERE at <> '2020-01-02T03:04:05+00:00'"
+    ).rows == [(2,)]
+
+
+def test_timestamptz_where_equality_uses_index(storage, session):
+    # The indexed equality path (sortkey-encoded) must also bridge naive/aware. #142
+    run(storage, session, "CREATE TABLE ev3 (id int PRIMARY KEY, at timestamptz)")
+    run(storage, session, "CREATE INDEX ix_ev3_at ON ev3 (at)")
+    run(storage, session, "INSERT INTO ev3 VALUES (1, '2020-01-02T03:04:05+00:00')")
+    assert run(
+        storage, session, "SELECT id FROM ev3 WHERE at = '2020-01-02T03:04:05+00:00'"
+    ).rows == [(1,)]

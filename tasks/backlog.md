@@ -2877,9 +2877,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `timestamp + interval` (PG: naive `timestamp`) come back tz-aware UTC here (both embedded and wire).
   `test_date_plus_interval_is_timestamp` / `test_timestamp_plus_interval` assert the tz-aware value and note
   the divergence. A real naive-`timestamp` type (tag + OID 1114 + render/coerce/round-trip) is a larger
-  slice, deferred. Also deferred: a WHERE `timestamptz_col = '…+00:00'` / `::timestamptz` literal doesn't
-  match a stored value (the `matches()` filter engine coerces the literal differently than the value) — a
-  separate filter-coercion quirk, not the result-rendering path #141 fixes.
+  slice, deferred. (The related WHERE `timestamptz_col = '…+00:00'` / `::timestamptz` filter-coercion quirk
+  is **fixed in #142, b182** — see below.)
+- [ ] **timestamptz WHERE-equality bridges naive/aware (#142, b182):** `WHERE ts = '…+00:00'` /
+  `= '…'::timestamptz` used to match **nothing** — the equality path (`query._eq_numeric_aware`, shared by
+  bare equality / `$eq` / `$in` / `$ne`) did numeric coercion but not the tz-aware/naive datetime alignment
+  the range operators already had (`_try_cmp` → `_coerce_datetime`), so a tz-aware SQL literal never equalled
+  the tz-naive-UTC stored value (`naive == aware` is always False in Python). `_eq_numeric_aware` now bridges
+  two datetimes of the same instant by treating naive as UTC (the convention pymongo's BSON encoder uses), so
+  equality matches by instant across the boundary — an offset-shifted literal for the same instant matches, a
+  genuinely different instant does not. Indexed equality already worked (`sortkey.encode_value` normalises to
+  UTC). Mongo-path/Rust-parity safe: in pure-Mongo usage and the parity harness both operands round-trip
+  through BSON (always UTC millis, tzinfo states match), so the new branch is a no-op there and never drifts
+  from the Rust `eq_scalar` (which compares `Bson::DateTime` millis). Tests: `test_query.py`
+  ::test_datetime_naive_aware_equality_same_instant + `test_sql_datetime_types.py`
+  ::test_timestamptz_where_equality_matches_offset_literal / _uses_index.
 - [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by

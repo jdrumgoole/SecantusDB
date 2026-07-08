@@ -428,3 +428,21 @@ def test_embedded_document_equality_is_ordered_and_exact() -> None:
     arr = {"s": {"a": [1, 2], "b": 3}}
     assert matches(arr, {"s": {"a": [1, 2], "b": 3}})
     assert not matches(arr, {"s": {"a": [2, 1], "b": 3}})
+
+
+def test_datetime_naive_aware_equality_same_instant():
+    # A BSON date decodes tz-naive UTC; a SQL timestamptz literal arrives tz-aware
+    # UTC. Bare equality must match the same instant across the naive/aware boundary
+    # (naive is treated as UTC, matching pymongo's BSON encoding). #142
+    import datetime as dt
+
+    naive = dt.datetime(2020, 1, 2, 3, 4, 5)
+    aware = dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+    assert matches({"at": naive}, {"at": aware})
+    assert matches({"at": aware}, {"at": naive})
+    assert matches({"at": naive}, {"at": {"$eq": aware}})
+    assert matches({"at": naive}, {"at": {"$in": [aware]}})
+    assert not matches({"at": naive}, {"at": {"$ne": aware}})
+    # A different instant (offset shifts it) must NOT match.
+    other = dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone(dt.timedelta(hours=2)))
+    assert not matches({"at": naive}, {"at": other})
