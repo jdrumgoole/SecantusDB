@@ -146,14 +146,54 @@ def test_do_nothing_returning_skips_conflict_row(storage, session):
     assert res.rows == [(2, 9)]
 
 
-def test_on_constraint_rejected(storage, session):
+def test_on_constraint_pkey_do_nothing(storage, session):
+    # The primary key's default constraint name is <table>_pkey.
+    res = q(
+        storage,
+        session,
+        "INSERT INTO t (id, n) VALUES (1, 9) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING",
+    )
+    assert res.command_tag == "INSERT 0 0"
+    assert q(storage, session, "SELECT id, n FROM t ORDER BY id").rows == [(1, 5)]
+
+
+def test_on_constraint_pkey_do_update(storage, session):
+    res = q(
+        storage,
+        session,
+        "INSERT INTO t (id, n) VALUES (1, 9) "
+        "ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET n = EXCLUDED.n",
+    )
+    assert res.command_tag == "INSERT 0 1"
+    assert q(storage, session, "SELECT id, n FROM t ORDER BY id").rows == [(1, 9)]
+
+
+def test_on_constraint_named_unique(storage, session):
+    q(
+        storage,
+        session,
+        "CREATE TABLE u (id bigint PRIMARY KEY, email text, CONSTRAINT u_email_uq UNIQUE (email))",
+    )
+    q(storage, session, "INSERT INTO u (id, email) VALUES (1, 'a@x.com')")
+    res = q(
+        storage,
+        session,
+        "INSERT INTO u (id, email) VALUES (2, 'a@x.com') "
+        "ON CONFLICT ON CONSTRAINT u_email_uq DO UPDATE SET email = 'b@x.com'",
+    )
+    assert res.command_tag == "INSERT 0 1"
+    # The conflicting row (id=1) was updated; no new row inserted.
+    assert q(storage, session, "SELECT id, email FROM u ORDER BY id").rows == [(1, "b@x.com")]
+
+
+def test_on_constraint_unknown_name_rejected(storage, session):
     with pytest.raises(SQLError) as ei:
         q(
             storage,
             session,
-            "INSERT INTO t (id, n) VALUES (1, 9) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING",
+            "INSERT INTO t (id, n) VALUES (1, 9) ON CONFLICT ON CONSTRAINT nope DO NOTHING",
         )
-    assert ei.value.sqlstate == "0A000"
+    assert ei.value.sqlstate == "42704"
 
 
 def test_do_update_without_target_rejected(storage, session):

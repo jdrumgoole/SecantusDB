@@ -2118,9 +2118,10 @@ target-qualified columns (`n`, `t.n`) resolve to the existing row, and
 `EXCLUDED.<col>` to the value that would have been inserted; an optional `WHERE`
 gates the update. The command tag counts rows inserted *or* updated — skipped
 rows don't count — and a `RETURNING` clause projects the inserted and updated
-rows (not the skipped ones). `ON CONFLICT ON CONSTRAINT <name>` is not supported
-(SecantusDB has no named-constraint registry — name the column(s) instead), and
-`DO UPDATE` requires an explicit conflict target.
+rows (not the skipped ones). `ON CONFLICT ON CONSTRAINT <name>` names the arbiter
+by a declared `UNIQUE` constraint or the primary key (default name
+`<table>_pkey`); an unknown name errors. `DO UPDATE` requires an explicit conflict
+target (a column list or a constraint name).
 
 ### MERGE
 
@@ -2936,7 +2937,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 
 | Area | Supported | Not yet |
 |---|---|---|
-| DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | `MERGE`, `ON CONFLICT ON CONSTRAINT` |
+| DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`; target by column list or `ON CONSTRAINT <name>`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | — |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE` (incl. `WITH RECURSIVE` before a write); data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE … RETURNING …)`) | statement-level snapshot semantics; `WITH CHECK OPTION` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (`const <@ field`)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, `field <@ const` |

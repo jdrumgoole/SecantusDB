@@ -1579,26 +1579,39 @@ def _ordered_target(node: exp.Expression) -> exp.Expression:
     return node.this if isinstance(node, exp.Ordered) else node
 
 
+def _fields_for_constraint(name: str, table: TableDef) -> list[str]:
+    """The storage fields of the named UNIQUE / PRIMARY KEY constraint, for an
+    ``ON CONFLICT ON CONSTRAINT <name>`` arbiter. Matches a declared UNIQUE
+    constraint by name, else the primary key (by its Postgres default name
+    ``<table>_pkey``). An unknown name raises ``42704``."""
+    for uq in table.unique_constraints:
+        if uq.name == name:
+            return [table.field_for(col) for col in uq.columns]
+    if table.pk_columns and name == f"{table.name}_pkey":
+        return [c.field for c in table.pk_columns]
+    raise errors.SQLError("42704", f'constraint "{name}" for table "{table.name}" does not exist')
+
+
 def _plan_on_conflict(stmt: exp.Insert, table: TableDef) -> OnConflict | None:
     """Lower an ``ON CONFLICT`` clause to an :class:`OnConflict`, or None.
 
-    Supports ``DO NOTHING`` (with or without a conflict target) and
-    ``DO UPDATE SET … [WHERE …]`` with a column conflict target. ``ON CONSTRAINT
-    <name>`` is rejected — we have no named-constraint registry, so the user must
-    name the conflicting column(s)."""
+    Supports ``DO NOTHING`` (with or without a conflict target),
+    ``DO UPDATE SET … [WHERE …]`` with a column conflict target, and
+    ``ON CONSTRAINT <name>`` — resolved to the named UNIQUE / PRIMARY KEY
+    constraint's columns via the table's constraint registry."""
     clause = stmt.args.get("conflict")
     if clause is None:
         return None
-    if clause.args.get("constraint") is not None:
-        raise errors.feature_not_supported(
-            "ON CONFLICT ON CONSTRAINT is not supported; name the conflict column(s) instead"
-        )
     action = clause.args.get("action")
     action_text = (action.name if action is not None else "").upper()
-    conflict_fields = [
-        table.field_for(_column_name(_ordered_target(k)))
-        for k in (clause.args.get("conflict_keys") or [])
-    ]
+    constraint = clause.args.get("constraint")
+    if constraint is not None:
+        conflict_fields = _fields_for_constraint(constraint.name, table)
+    else:
+        conflict_fields = [
+            table.field_for(_column_name(_ordered_target(k)))
+            for k in (clause.args.get("conflict_keys") or [])
+        ]
     if "NOTHING" in action_text:
         return OnConflict(action="nothing", conflict_fields=conflict_fields)
     if "UPDATE" not in action_text:

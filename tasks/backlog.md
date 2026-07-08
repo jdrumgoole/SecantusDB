@@ -2146,8 +2146,10 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   proposed row and bare/target-qualified columns to the existing row (so `n = t.n + EXCLUDED.n` works);
   an optional `WHERE` gates the update. A bare `ON CONFLICT DO NOTHING` (no target) inserts and swallows
   any `11000` duplicate. Command tag counts rows inserted *or* updated (skipped don't count); `RETURNING`
-  projects the inserted + updated rows. **Still unsupported:** `ON CONFLICT ON CONSTRAINT <name>` (→
-  `0A000`; no named-constraint registry), `DO UPDATE` with no conflict target (→ `42601`).
+  projects the inserted + updated rows. **`ON CONFLICT ON CONSTRAINT <name>` landed (#151, b189):**
+  `_fields_for_constraint` resolves the name against the table's `unique_constraints` (by name) or the
+  primary key (by its Postgres default name `<table>_pkey`) to the arbiter's storage fields; an unknown
+  name raises `42704`. **Still unsupported:** `DO UPDATE` with no conflict target (→ `42601`).
 - [ ] **`MERGE` landed** (b74). `MERGE INTO target [alias] USING source [alias] ON <cond> WHEN [NOT]
   MATCHED [AND <cond>] THEN UPDATE SET … | DELETE | INSERT [(cols)] VALUES (…) | DO NOTHING` via
   `engine._run_merge`. Per source row it scans the target snapshot (loaded once at MERGE start) for rows
