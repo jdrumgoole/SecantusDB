@@ -37,6 +37,7 @@ PG_OID: dict[str, int] = {
     "text": 25,
     "float8": 701,
     "timestamptz": 1184,
+    "timestamp": 1114,  # naive "timestamp without time zone"
     # Date-only / time-only types (stored as canonical text).
     "date": 1082,
     "time": 1083,
@@ -139,6 +140,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "text": "text",
     "bool": "boolean",
     "timestamptz": "timestamp with time zone",
+    "timestamp": "timestamp without time zone",
     "date": "date",
     "time": "time without time zone",
     "timetz": "time with time zone",
@@ -169,6 +171,7 @@ PG_TYPENAME: dict[str, str] = {
     "text": "text",
     "bool": "bool",
     "timestamptz": "timestamptz",
+    "timestamp": "timestamp",
     "date": "date",
     "time": "time",
     "timetz": "timetz",
@@ -208,8 +211,10 @@ _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.BOOLEAN: "bool",
     exp.DataType.Type.DATE: "date",
     exp.DataType.Type.TIME: "time",
-    exp.DataType.Type.DATETIME: "timestamptz",
-    exp.DataType.Type.TIMESTAMP: "timestamptz",
+    # ``TIMESTAMP`` / ``DATETIME`` are the naive "without time zone" type; only the
+    # explicit ``TIMESTAMPTZ`` (``TIMESTAMP WITH TIME ZONE``) is tz-aware.
+    exp.DataType.Type.DATETIME: "timestamp",
+    exp.DataType.Type.TIMESTAMP: "timestamp",
     exp.DataType.Type.TIMESTAMPTZ: "timestamptz",
     exp.DataType.Type.JSON: "json",
     exp.DataType.Type.JSONB: "json",
@@ -236,6 +241,7 @@ _ARRAY_PG_OID: dict[str, int] = {
     "float8": 1022,
     "numeric": 1231,
     "timestamptz": 1185,
+    "timestamp": 1115,
     "bytea": 1001,
     # Date / time distinct types.
     "date": 1182,
@@ -489,6 +495,16 @@ def coerce(value: Any, tag: str) -> Any:
         # ISO-8601 string literal -> datetime. fromisoformat handles offsets
         # and a trailing 'Z' on 3.11+.
         return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if tag == "timestamp":
+        # Naive "without time zone": an offset in the input is dropped and the
+        # wall-clock fields kept (Postgres timestamp semantics), so the stored /
+        # compared value is always tz-naive.
+        dt = (
+            value
+            if isinstance(value, _dt.datetime)
+            else _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        )
+        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
     if tag in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes
 
@@ -540,6 +556,10 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         # tz-naive datetime for a timestamptz column.
         if tag == "timestamptz" and value.tzinfo is None:
             value = value.replace(tzinfo=_dt.timezone.utc)
+        # ``timestamp`` (without time zone) never carries an offset — strip any
+        # stray tzinfo so the wire text is naive wall-clock.
+        elif tag == "timestamp" and value.tzinfo is not None:
+            value = value.replace(tzinfo=None)
         return value.isoformat(sep=" ").encode("utf-8")
     if tag in _RANGE_TAGS and isinstance(value, dict):
         from secantus.sql import ranges as _ranges

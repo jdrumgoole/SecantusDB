@@ -133,12 +133,13 @@ def test_date_plus_int_is_date(storage, session):
 
 def test_date_plus_interval_is_timestamp(storage, session):
     c = col(storage, session, "SELECT date '2020-01-15' + interval '1 day 2 hours'")
-    # Real PG types ``date + interval`` as ``timestamp`` (naive); SecantusDB has no
-    # distinct naive-timestamp type — every datetime tag collapses to ``timestamptz``
-    # (tasks/backlog.md) — so the result is tz-aware UTC, matching the wire render.
-    assert c.type_tag == "timestamptz"
+    # ``date + interval`` -> naive ``timestamp`` (without time zone), per Postgres (#143).
+    assert c.type_tag == "timestamp"
     assert val(storage, session, "SELECT date '2020-01-15' + interval '1 day 2 hours'") == (
-        dt.datetime(2020, 1, 16, 2, 0, tzinfo=dt.timezone.utc)
+        dt.datetime(2020, 1, 16, 2, 0)
+    )
+    assert (
+        val(storage, session, "SELECT date '2020-01-15' + interval '1 day 2 hours'").tzinfo is None
     )
 
 
@@ -248,3 +249,64 @@ def test_timestamptz_where_equality_uses_index(storage, session):
     assert run(
         storage, session, "SELECT id FROM ev3 WHERE at = '2020-01-02T03:04:05+00:00'"
     ).rows == [(1,)]
+
+
+# --------------------------------------------------------------------------- #
+# #143: distinct naive `timestamp` (without time zone) type, OID 1114
+# --------------------------------------------------------------------------- #
+
+
+def test_timestamp_column_is_naive(storage, session):
+    run(storage, session, "CREATE TABLE tsn (id int PRIMARY KEY, ts timestamp, tstz timestamptz)")
+    run(
+        storage,
+        session,
+        "INSERT INTO tsn VALUES (1, '2020-01-02T03:04:05', '2020-01-02T03:04:05+00:00')",
+    )
+    r = run(storage, session, "SELECT ts, tstz FROM tsn WHERE id = 1")
+    assert [c.type_tag for c in r.columns] == ["timestamp", "timestamptz"]
+    ts, tstz = r.rows[0]
+    assert ts == dt.datetime(2020, 1, 2, 3, 4, 5) and ts.tzinfo is None  # naive
+    assert tstz == dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)  # aware
+
+
+def test_timestamp_column_oid_and_typename(storage, session):
+    run(storage, session, "CREATE TABLE tso (id int PRIMARY KEY, ts timestamp)")
+    r = run(
+        storage,
+        session,
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'tso' AND column_name = 'ts'",
+    )
+    assert r.rows == [("timestamp without time zone",)]
+    # RowDescription OID for the timestamp column is 1114 (not 1184).
+    from secantus.sql import typemap
+
+    assert typemap.PG_OID["timestamp"] == 1114
+    assert r.columns  # column present
+
+
+def test_timestamp_literal_drops_offset(storage, session):
+    # `timestamp '…+offset'` keeps the wall-clock fields and drops the offset.
+    v = val(storage, session, "SELECT timestamp '2020-06-15 12:00:00+05:00'")
+    assert v == dt.datetime(2020, 6, 15, 12, 0, 0)
+    assert v.tzinfo is None
+
+
+def test_cast_timestamptz_to_timestamp_strips_tz(storage, session):
+    v = val(storage, session, "SELECT (timestamptz '2020-06-15 12:00:00+00')::timestamp")
+    assert v == dt.datetime(2020, 6, 15, 12, 0, 0)
+    assert v.tzinfo is None
+
+
+def test_timestamp_array_naive(storage, session):
+    run(storage, session, "CREATE TABLE tsarr (id int PRIMARY KEY, ts timestamp[])")
+    run(
+        storage,
+        session,
+        "INSERT INTO tsarr VALUES (1, ARRAY['2020-01-02T03:04:05'::timestamp, "
+        "'2021-06-07T08:09:10'::timestamp])",
+    )
+    v = val(storage, session, "SELECT ts FROM tsarr WHERE id = 1")
+    assert list(v) == [dt.datetime(2020, 1, 2, 3, 4, 5), dt.datetime(2021, 6, 7, 8, 9, 10)]
+    assert all(x.tzinfo is None for x in v)
