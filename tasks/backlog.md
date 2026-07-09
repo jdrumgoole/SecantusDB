@@ -1546,8 +1546,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   **Function-in-WHERE-vs-const also works** (b204): `WHERE upper(name) = 'X'` / `abs(x) = 3` lower
   through the same `_to_agg_expr` function branch into `$expr` (the field/const pair-check falls
   through for a function operand). Keys using a function the aggregation engine can't evaluate
-  (e.g. `substr`) stay `0A000`; **computed keys over GROUPING SETS / ROLLUP / CUBE are not yet
-  rewritten** (they'd need a per-union-branch `$addFields`). Still `0A000`:
+  (e.g. `substr`) stay `0A000`. **Computed keys over GROUPING SETS / ROLLUP / CUBE also work**
+  (b205, #170): `_computed_group_keys` collects keys across the rollup/cube/grouping-sets wrappers
+  and `_plan_grouping_sets_select` injects the synthetic-key `$addFields` into the base pipeline
+  *and* every `$unionWith` branch (each reads the collection fresh); `GROUPING(lower(x))` works via
+  the same rewrite. Still `0A000`:
   `RIGHT`/`FULL` in a 3+ table chain, subqueries. SUM/MIN/MAX
   result typing is approximate (uses the column's tag; AVG → float8; arithmetic → numeric).
   **`DISTINCT` aggregates landed** (b48): `COUNT`/`SUM`/`AVG(DISTINCT col)` compile to a
@@ -2056,8 +2059,9 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `{v, k}` pairs, and the executor (`_sorted_agg_value`) sorts the pairs by the key list via the existing
   `_pg_sort` (per-key direction + Postgres NULL placement) before building the array / joining the string
   (NULL values skipped, NULL when all-NULL). Recorded as a `PipelineSelectPlan.post_aggregates` entry
-  (`sorted_array` / `sorted_string`). Single-table + whole-table; **not** over a JOIN (the join array_agg /
-  string_agg branch gets the `exp.Order` node and raises `0A000`) or in GROUPING SETS. The finalization
+  (`sorted_array` / `sorted_string`). Single-table + whole-table, **and over a JOIN** (b205, #170:
+  `_sorted_agg_push_resolve` lowers the value / sort-key expressions through the join resolver, and the
+  join planner records the same `post_aggregates` entry) — not yet in GROUPING SETS. The finalization
   (`executor._apply_post_aggregates`) runs in **both** the top-level pipeline executor and derived-table
   materialization (`_run_subplan_to_docs`) so the `{v, k}` push pairs never leak — this also closed a
   latent b127 gap where an ordered-set agg inside a derived table (e.g. SQLAlchemy's index reflection,
@@ -2259,7 +2263,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`_pipeline_subctx`, reset in a finally) that `_where_filter` / the join `$match` pick up — one
   set-point, no signature churn. So `WHERE x OP (SELECT …)` / `x IN (SELECT …)` work in JOIN / GROUP BY /
   scalar-expr queries and in a recursive-CTE term's WHERE (session is None on that path — data
-  subqueries don't need it). Correlated subqueries in a pipeline are still `0A000` (single-table only).
+  subqueries don't need it). **Correlated subqueries in a pipeline work** (verified & pinned b205,
+  #170 — the note was stale): a correlated WHERE / EXISTS / IN over a GROUP BY or JOIN rides the
+  residual per-row path, and a correlated scalar subquery in the SELECT list works single-table and
+  over a join. The one remaining gap is a correlated subquery in **HAVING** (`HAVING agg > (SELECT …
+  WHERE t.k = outer.k)`) → `0A000`, since HAVING lowers to a post-`$group` `$match` with no per-group
+  subquery evaluation.
 - [ ] **`ORDER BY` NULL placement landed** (b54). Postgres orders NULL as the largest value (ASC →
   NULLs last, DESC → NULLs first) with `NULLS FIRST`/`NULLS LAST` overriding; Mongo sort treats
   NULL/missing as the *smallest*, so the SQL layer no longer delegates NULL placement to storage.
@@ -2767,9 +2776,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `$indexOfArray` ordinal companion; `_append_sort_limit` / `_append_join_tail` thread the enum labels via
   `_enum_labels_for_column` + `_column_for_order_node`; the evaluated planners carry
   `EvaluatedSelectPlan.enum_orders`, applied in `executor._evaluated_value_rows`) — so GROUP BY, DISTINCT,
-  JOIN, JOIN+GROUP BY, and computed-column ORDER BY all sort an enum by declared order. Tests:
-  `tests/test_sql_enum_order.py`. **Limitations:** `ALTER TYPE RENAME VALUE` / composite-type alters →
-  `0A000`; a correlated single-table SELECT (`plan_correlated_select`) still sorts an enum lexically.
+  JOIN, JOIN+GROUP BY, and computed-column ORDER BY all sort an enum by declared order. The
+  **correlated single-table SELECT** path also sorts an enum by declared order now (b205, #170:
+  `plan_correlated_select` populates `CorrelatedSelectPlan.enum_orders` via `_enum_order_map`, applied
+  by `_order_key_fn` in `executor.execute_correlated_select`). Tests: `tests/test_sql_enum_order.py`,
+  `tests/test_sql_correlated_extras.py`. **Limitations:** `ALTER TYPE RENAME VALUE` / composite-type
+  alters → `0A000`.
 - [ ] **Generated columns landed** (b108): `GENERATED ALWAYS AS (expr) STORED` columns
   (`planner._generated_expr` stores the rendered SQL on `Column.generated`). Computed from the row's
   other columns on every write by `executor._apply_generated_columns` (evaluates the expr via

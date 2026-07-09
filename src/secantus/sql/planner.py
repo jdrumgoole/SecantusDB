@@ -2397,7 +2397,9 @@ def _where_has_range_predicate(node: exp.Expression, table: TableDef) -> bool:
     return False
 
 
-def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelectPlan:
+def plan_correlated_select(
+    stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = None
+) -> CorrelatedSelectPlan:
     """Plan a single-table SELECT whose WHERE needs per-row evaluation (EXISTS /
     correlated subquery). The whole WHERE is carried verbatim and evaluated by
     the executor against each candidate row via the scalar evaluator."""
@@ -2422,6 +2424,7 @@ def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelec
         count_star=count_alias is not None,
         count_alias=count_alias or "count",
         outer_alias=outer_alias,
+        enum_orders=_enum_order_map(stmt, table, subctx),
     )
 
 
@@ -2825,6 +2828,21 @@ def _sorted_agg_push(
     }
 
 
+def _sorted_agg_push_resolve(
+    value_node: exp.Expression,
+    terms: list[tuple[exp.Expression, int, bool]],
+    resolve: Resolve,
+) -> dict[str, Any]:
+    """``_sorted_agg_push`` for the join path — the value / sort-key expressions
+    lower through the join ``resolve`` (via ``_to_agg_expr``) instead of a table."""
+    return {
+        "$push": {
+            "v": _to_agg_expr(value_node, resolve),
+            "k": [_to_agg_expr(key, resolve) for key, _dir, _nf in terms],
+        }
+    }
+
+
 def _string_agg_project(fname: str, sep: str) -> dict[str, Any]:
     """The ``$project`` expression that turns a ``string_agg`` field's pushed
     array (``[v1, v2, …]``) into the delimited string, skipping NULL elements and
@@ -3136,15 +3154,14 @@ def _plan_pipeline_select(
     derived: list[DerivedTable] = []
     _alias, table = _resolve_source(from_node.this, db, catalog, storage, derived)
 
-    # Computed GROUP BY keys (``GROUP BY lower(name)`` / ``x + 1``) — rewrite each
-    # into a synthetic column materialised by a pre-``$group`` ``$addFields`` so the
-    # bare-column group machinery handles SELECT / HAVING / ORDER BY. Grouping sets
-    # keep their own (column-only) path.
+    # Computed GROUP BY keys (``GROUP BY lower(name)`` / ``x + 1`` / ``ROLLUP(lower(x))``)
+    # — rewrite each into a synthetic column materialised by a pre-``$group``
+    # ``$addFields`` so the bare-column group machinery handles SELECT / HAVING /
+    # ORDER BY. Works for plain GROUP BY and GROUPING SETS / ROLLUP / CUBE alike.
     group_addfields: dict[str, Any] | None = None
-    if not _has_grouping_sets(stmt):
-        rewrite = _rewrite_computed_group_keys(stmt, table)
-        if rewrite is not None:
-            stmt, table, group_addfields = rewrite
+    rewrite = _rewrite_computed_group_keys(stmt, table)
+    if rewrite is not None:
+        stmt, table, group_addfields = rewrite
 
     has_aggregate = any(
         _aggregate_of(e) is not None
@@ -3161,7 +3178,10 @@ def _plan_pipeline_select(
             raise errors.feature_not_supported(
                 "window functions over GROUPING SETS are not supported"
             )
-        plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_grouping_sets_select(stmt, table)
+        plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_grouping_sets_select(
+            stmt, table, group_addfields
+        )
+        group_addfields = None  # injected per union-branch by the grouping-sets planner
     elif (_select_has_window(stmt) or _select_has_computed_aggregate(stmt)) and (
         grouped or _group_agg_nodes(stmt)
     ):
@@ -3493,13 +3513,41 @@ def _apply_group_key_rewrite(stmt: exp.Select, targets: dict[str, str]) -> exp.S
     return new_stmt
 
 
+def _flatten_group_set_element(node: exp.Expression) -> list[exp.Expression]:
+    """The leaf key expressions of one grouping-set element — a ``(a, b)`` Tuple, a
+    ``(a)`` Paren, or a bare key — flattened to a list (empty ``()`` → ``[]``)."""
+    if isinstance(node, exp.Tuple):
+        out: list[exp.Expression] = []
+        for x in node.expressions:
+            out.extend(_flatten_group_set_element(x))
+        return out
+    if isinstance(node, exp.Paren):
+        return _flatten_group_set_element(node.this)
+    return [node]
+
+
+def _all_group_key_nodes(group_node: exp.Group) -> list[exp.Expression]:
+    """Every leaf key expression across the whole GROUP BY clause — the leading
+    plain keys plus the elements of each ``ROLLUP`` / ``CUBE`` / ``GROUPING SETS``
+    wrapper. Used to find computed keys anywhere in the clause."""
+    nodes = list(group_node.expressions)
+    for arg in ("rollup", "cube", "grouping_sets"):
+        for wrapper in group_node.args.get(arg) or []:
+            for e in wrapper.expressions:
+                nodes.extend(_flatten_group_set_element(e))
+    return nodes
+
+
 def _computed_group_keys(group_node: exp.Group | None) -> list[exp.Expression]:
     """The non-column, non-ordinal GROUP BY keys (``lower(name)``, ``x + 1``) — the
-    ones that need lowering into a synthetic column. Bare columns and positional
-    ordinals (``GROUP BY 1``) are left to their existing handling."""
+    ones that need lowering into a synthetic column, collected across the whole
+    clause (leading keys + ROLLUP / CUBE / GROUPING SETS elements). Bare columns and
+    positional ordinals (``GROUP BY 1``) are left to their existing handling."""
     if group_node is None:
         return []
-    return [k for k in group_node.expressions if not isinstance(k, (exp.Column, exp.Literal))]
+    return [
+        k for k in _all_group_key_nodes(group_node) if not isinstance(k, (exp.Column, exp.Literal))
+    ]
 
 
 def _rewrite_computed_group_keys(
@@ -3667,9 +3715,16 @@ def _grouping_set_branch(
     return [{"$group": {"_id": group_id, **accumulators}}, {"$project": project}], out_columns
 
 
-def _plan_grouping_sets_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
+def _plan_grouping_sets_select(
+    stmt: exp.Select, table: TableDef, gkey_addfields: dict[str, Any] | None = None
+) -> PipelineSelectPlan:
     """GROUP BY ROLLUP / CUBE / GROUPING SETS → the UNION (via ``$unionWith``) of a
-    plain GROUP BY per enumerated grouping set."""
+    plain GROUP BY per enumerated grouping set.
+
+    ``gkey_addfields`` materialises any computed GROUP BY keys (``ROLLUP(lower(x))``)
+    into synthetic ``__gkeyN`` fields; it runs before each branch's ``$group`` — in
+    the base pipeline *and* every ``$unionWith`` sub-pipeline (which reads the
+    collection fresh, so the fields must be recomputed there too)."""
     if stmt.args.get("having") is not None:
         raise errors.feature_not_supported("HAVING with GROUPING SETS is not supported")
     if _residual_where(stmt, table) is not None:
@@ -3677,13 +3732,16 @@ def _plan_grouping_sets_select(stmt: exp.Select, table: TableDef) -> PipelineSel
     if any(a[2] for e in stmt.expressions if (a := _aggregate_of(e)) is not None):
         raise errors.feature_not_supported("DISTINCT aggregate with GROUPING SETS is not supported")
     base_filter = _where_filter(stmt, table)
+    add_stage = [{"$addFields": gkey_addfields}] if gkey_addfields else []
     sets = _grouping_sets(stmt.args["group"])
     branches = [_grouping_set_branch(stmt, table, gs) for gs in sets]
-    pipeline = list(branches[0][0])
+    pipeline = add_stage + list(branches[0][0])
     out_columns = branches[0][1]
     prefix = [{"$match": base_filter}] if base_filter else []
     for sub, _cols in branches[1:]:
-        pipeline.append({"$unionWith": {"coll": table.collection, "pipeline": prefix + sub}})
+        pipeline.append(
+            {"$unionWith": {"coll": table.collection, "pipeline": prefix + add_stage + sub}}
+        )
     _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, table)
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
@@ -4913,8 +4971,13 @@ def _plan_join_group_select(
         fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
         if arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
-            path, _ = resolve(arr_arg)
-            accumulators[fname] = {"$push": f"${path}"}
+            value_node, terms = _agg_order_spec(arr_arg)
+            if terms:  # array_agg(x ORDER BY …): push {v, k}, executor sorts
+                accumulators[fname] = _sorted_agg_push_resolve(value_node, terms, resolve)
+                post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+            else:
+                path, _ = resolve(arr_arg)
+                accumulators[fname] = {"$push": f"${path}"}
             project[fname] = f"${fname}"
             out_columns.append((fname, "json"))
         elif oagg is not None:
@@ -4926,9 +4989,17 @@ def _plan_join_group_select(
             out_columns.append((fname, "json"))
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
-            path, _ = resolve(sagg[0])
-            accumulators[fname] = {"$push": f"${path}"}
-            project[fname] = _string_agg_project(fname, sagg[1])
+            value_node, terms = _agg_order_spec(sagg[0])
+            if terms:  # string_agg(x, sep ORDER BY …): push {v, k}, executor sorts+joins
+                accumulators[fname] = _sorted_agg_push_resolve(value_node, terms, resolve)
+                project[fname] = f"${fname}"
+                post_aggregates.append(
+                    (fname, "sorted_string", ([(d, nf) for _k, d, nf in terms], sagg[1]))
+                )
+            else:
+                path, _ = resolve(sagg[0])
+                accumulators[fname] = {"$push": f"${path}"}
+                project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
             # variance / var_pop (square of stdDev) and bit_and/or/xor (push +

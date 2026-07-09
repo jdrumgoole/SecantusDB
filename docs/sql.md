@@ -1661,8 +1661,8 @@ SELECT string_agg(name, ', ' ORDER BY name DESC) FROM emp;
 ```
 
 The value + sort-key pair is collected per row and sorted in Python before the
-array is built / the string joined. Supported grouped and whole-table (not yet
-over a JOIN — there the in-call `ORDER BY` raises `0A000`).
+array is built / the string joined. Supported grouped, whole-table, and **over a
+`JOIN`** (the value / sort-key expressions lower through the join resolver).
 
 The **ordered-set aggregates** `percentile_cont(f)` / `percentile_disc(f)` /
 `mode()` are supported via `WITHIN GROUP (ORDER BY expr)`:
@@ -1773,10 +1773,11 @@ FROM t GROUP BY city, lower(name) HAVING SUM(x) > 5;
 
 Each computed key is lowered to an equivalent aggregation expression and
 materialised into a synthetic field before the group, so the grouping runs on the
-derived value exactly as Postgres would. This works over a **`JOIN`** too
+derived value exactly as Postgres would. This works over a **`JOIN`**
 (`GROUP BY lower(c.region)` across joined tables — the key lowers through the join
-resolver). A key using a function the engine can't evaluate (e.g. `substr`), or a
-computed key over `GROUPING SETS` / `ROLLUP` / `CUBE`, raises `0A000`.
+resolver) and over **`GROUPING SETS` / `ROLLUP` / `CUBE`** (`GROUP BY
+ROLLUP(lower(region))`; `GROUPING(lower(region))` reports the rollup bitmask). A
+key using a function the engine can't evaluate (e.g. `substr`) raises `0A000`.
 
 The same function lowering applies inside a `WHERE` comparison against a constant —
 `WHERE upper(name) = 'X'`, `WHERE abs(x) = 3`, `WHERE length(name) > 3` all
