@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from secantus.sql import errors, run_sql
+from secantus.sql import run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -63,12 +63,15 @@ def test_default_null(storage, session):
     assert rows(storage, session, "SELECT id, n FROM t") == [(1, None)]
 
 
-def test_function_default_not_modeled(storage, session):
-    # A non-literal default (now()) is accepted at CREATE but not applied — the
-    # column behaves as if it had no static default (NULL when omitted).
+def test_function_default_applied(storage, session):
+    # A non-literal default (now()) is evaluated per omitted row at INSERT (#166).
+    import datetime
+
     q(storage, session, "CREATE TABLE t (id bigint primary key, at timestamptz DEFAULT now())")
     q(storage, session, "INSERT INTO t (id) VALUES (1)")
-    assert rows(storage, session, "SELECT id, at FROM t") == [(1, None)]
+    r = rows(storage, session, "SELECT id, at FROM t")
+    assert r[0][0] == 1
+    assert isinstance(r[0][1], datetime.datetime)
 
 
 # -- ALTER COLUMN SET / DROP DEFAULT ---------------------------------------- #
@@ -102,10 +105,15 @@ def test_drop_default_does_not_change_nullability(storage, session):
     assert res.rows == [("YES",)]
 
 
-def test_alter_set_default_non_literal_rejected(storage, session):
+def test_alter_set_default_expression(storage, session):
+    # A non-literal ALTER … SET DEFAULT (now()) is applied per omitted row (#166).
+    import datetime
+
     q(storage, session, "CREATE TABLE t (id bigint primary key, at timestamptz)")
-    with pytest.raises(errors.SQLError):
-        q(storage, session, "ALTER TABLE t ALTER COLUMN at SET DEFAULT now()")
+    q(storage, session, "ALTER TABLE t ALTER COLUMN at SET DEFAULT now()")
+    q(storage, session, "INSERT INTO t (id) VALUES (1)")
+    r = rows(storage, session, "SELECT at FROM t")
+    assert isinstance(r[0][0], datetime.datetime)
 
 
 # -- ALTER COLUMN TYPE ------------------------------------------------------ #

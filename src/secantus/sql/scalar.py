@@ -2202,20 +2202,18 @@ def _eval_range_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> An
 
     left = evaluate(node.this, scope, ctx)
     right = evaluate(node.expression, scope, ctx)
-    left_r = isinstance(left, dict) and ("lower" in left or "empty" in left)
-    right_r = isinstance(right, dict) and ("lower" in right or "empty" in right)
+    left_r = _ranges._is_range(left) or _ranges.is_multirange(left)
+    right_r = _ranges._is_range(right) or _ranges.is_multirange(right)
     if not (left_r or right_r):
         return _NOT_RANGE
     if left is None or right is None:
         return None
     if isinstance(node, exp.ArrayOverlaps):  # &&
-        return _ranges.overlaps(left, right)
+        return _ranges.overlaps_any(left, right)
     if isinstance(node, exp.ArrayContainedBy):  # <@ : left contained by right
-        return (
-            _ranges.contains_range(right, left) if left_r else _ranges.contains_value(right, left)
-        )
-    # ArrayContainsAll -> @> : left contains right (element or range)
-    return _ranges.contains_range(left, right) if right_r else _ranges.contains_value(left, right)
+        return _ranges.contains_any(right, left)
+    # ArrayContainsAll -> @> : left contains right (element / range / multirange)
+    return _ranges.contains_any(left, right)
 
 
 def _array_membership(needle: Any, haystack: list) -> bool:

@@ -351,17 +351,24 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
                     f"unsupported column type: {action.args['dtype'].sql()}"
                 )
             new_col = dataclasses.replace(col, type_tag=tag)
-        elif action.args.get("default") is not None:  # SET DEFAULT <literal>
-            has_def, value = planner._literal_default(action.args["default"], col.type_tag)
-            if not has_def:
-                raise errors.feature_not_supported(
-                    f"only a literal DEFAULT is supported: {action.args['default'].sql()}"
+        elif action.args.get("default") is not None:  # SET DEFAULT <literal | expr>
+            node = action.args["default"]
+            has_def, value = planner._literal_default(node, col.type_tag)
+            if has_def:
+                new_col = dataclasses.replace(
+                    col, has_default=True, default=value, default_expr=None
                 )
-            new_col = dataclasses.replace(col, has_default=True, default=value)
+            else:  # expression default — now() / gen_random_uuid() / arithmetic (#166)
+                new_col = dataclasses.replace(
+                    col,
+                    has_default=False,
+                    default=None,
+                    default_expr=node.sql(dialect="postgres"),
+                )
         elif action.args.get("allow_null") is not None:  # SET/DROP NOT NULL
             new_col = dataclasses.replace(col, nullable=bool(action.args["allow_null"]))
         elif action.args.get("drop"):  # DROP DEFAULT
-            new_col = dataclasses.replace(col, has_default=False, default=None)
+            new_col = dataclasses.replace(col, has_default=False, default=None, default_expr=None)
         else:
             raise errors.feature_not_supported(f"unsupported ALTER COLUMN action: {action.sql()}")
         table.columns = [new_col if c.name == name else c for c in table.columns]

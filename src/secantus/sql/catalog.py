@@ -86,6 +86,10 @@ class Column:
     # ``has_default`` disambiguates "DEFAULT NULL" from "no default".
     has_default: bool = False
     default: Any = None
+    # A non-literal column DEFAULT — the rendered SQL of an expression default
+    # (``now()``, ``gen_random_uuid()``, arithmetic, …). Evaluated per omitted row
+    # at INSERT via ``scalar.evaluate``. None for a literal / no / sequence default.
+    default_expr: str | None = None
     comment: str | None = None  # COMMENT ON COLUMN (reflected via pg_description)
     # The sequence this column draws its default from (SERIAL columns and
     # ``DEFAULT nextval('seq')``). When set and the column is omitted at INSERT,
@@ -223,6 +227,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "nullable": c.nullable,
                 "has_default": c.has_default,
                 "default": c.default,
+                "default_expr": c.default_expr,
                 "comment": c.comment,
                 "sequence": c.sequence,
                 "identity": c.identity,
@@ -276,6 +281,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 nullable=bool(c["nullable"]),
                 has_default=bool(c.get("has_default", False)),
                 default=c.get("default"),
+                default_expr=c.get("default_expr"),
                 comment=c.get("comment"),
                 sequence=c.get("sequence"),
                 identity=c.get("identity"),

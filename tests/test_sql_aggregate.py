@@ -303,3 +303,45 @@ def test_distinct_over_join(storage, session):
         "SELECT DISTINCT c.name FROM orders o JOIN customers c ON o.cust_id = c.id ORDER BY c.name",
     )
     assert res.rows == [("alice",), ("bob",)]
+
+
+# -- DISTINCT aggregate inside HAVING (#166) --------------------------------- #
+
+
+def _grp(storage, session):
+    q(storage, session, "CREATE TABLE t (id int primary key, g text, x int)")
+    for i, (g, x) in enumerate([("a", 1), ("a", 1), ("a", 2), ("b", 5), ("b", 5), ("c", 9)]):
+        q(storage, session, f"INSERT INTO t VALUES ({i}, '{g}', {x})")
+
+
+def test_having_count_distinct(storage, session):
+    _grp(storage, session)
+    # a has distinct {1,2}=2; b {5}=1; c {9}=1 → only a qualifies.
+    res = q(
+        storage,
+        session,
+        "SELECT g FROM t GROUP BY g HAVING count(DISTINCT x) > 1 ORDER BY g",
+    )
+    assert res.rows == [("a",)]
+
+
+def test_having_sum_distinct(storage, session):
+    _grp(storage, session)
+    # distinct sums: a=1+2=3, b=5, c=9 → all >= 3.
+    res = q(
+        storage,
+        session,
+        "SELECT g FROM t GROUP BY g HAVING sum(DISTINCT x) >= 3 ORDER BY g",
+    )
+    assert res.rows == [("a",), ("b",), ("c",)]
+
+
+def test_having_distinct_reuses_select_aggregate(storage, session):
+    _grp(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT g, count(DISTINCT x) AS c FROM t GROUP BY g "
+        "HAVING count(DISTINCT x) > 1 ORDER BY g",
+    )
+    assert res.rows == [("a", 2)]

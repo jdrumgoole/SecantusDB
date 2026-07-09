@@ -1538,8 +1538,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   for avg; NULLs filtered to match SQL). `MIN`/`MAX(DISTINCT)` run the ordinary accumulator (a set's
   extremum equals the raw extremum). Wired in both the single-table (`_plan_group_select`) and
   join (`_plan_join_group_select`) paths via the shared `_register_distinct_agg`; `_aggregate_of` /
-  `_join_aggregate_of` now return `(func, col, distinct)`. **Still `0A000`:** a `DISTINCT` aggregate
-  inside `HAVING` (the SELECT-list reduction stage isn't shared with the HAVING `$match`).
+  `_join_aggregate_of` now return `(func, col, distinct)`. **DISTINCT in HAVING landed (single-table,
+  #166, b201):** `_having_to_match` takes the `names` / `reductions` allocators and, for a `count`/`sum`/
+  `avg(DISTINCT …)` term, calls `_register_distinct_agg` (reusing the SELECT-list registration when the
+  same aggregate already appears there) — the reduction `$addFields` runs before the HAVING `$match`, so
+  the match references the reduced field. **Still `0A000`:** DISTINCT aggregate inside `HAVING` over a
+  JOIN (`_join_having_to_match` doesn't yet thread the reduction allocators).
   `string_agg` + the boolean aggregates landed in b121: `bool_and`/`bool_or` (registered in
   `_AGG_CLASSES`) lower to `$min`/`$max` over booleans, `every(x)` is recognised as `bool_and` in
   `_aggregate_of`; `string_agg(expr, sep)` (`exp.GroupConcat`) lowers to a `$push` accumulator plus a
@@ -1657,9 +1661,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   the group's ranges then a `range_agg` post-aggregate (`executor._apply_post_aggregates`) coalesces them
   into a multirange (typed via `_multirange_tag_for_arg`); wired into the detection sites + the primary
   single-table group path. `functions.is_scalar_function` excludes multirange constructors + `range_merge`.
-  Tests: `tests/test_sql_range_agg.py` (27: pure algebra + SQL surface) and a pg8000 wire test. **Not yet:**
-  multirange containment/overlap operators (`@>`/`&&` on multiranges), `range_intersect_agg`, multirange
-  extraction functions, range_agg over a JOIN or GROUPING SETS, and range GiST indexes.
+  Tests: `tests/test_sql_range_agg.py` (27: pure algebra + SQL surface) and a pg8000 wire test.
+  **Multirange containment/overlap operators landed (#166, b201):** `@>` / `<@` / `&&` now accept
+  multirange operands (any mix of range / multirange / scalar element) via `ranges.contains_any` /
+  `overlaps_any` (fold over `multirange_members`; a range is contained iff a single member covers it,
+  members being disjoint + non-adjacent), dispatched from the generalised `scalar._eval_range_op`. The
+  WHERE path forces a COLLSCAN + residual for multirange predicates too (`planner._where_has_range_predicate`
+  now unions `_RANGE_TAGS | _MULTIRANGE_TAGS`). Tests: `tests/test_sql_multirange_ops.py`. **Not yet:**
+  `range_intersect_agg`, multirange extraction functions, range_agg over a JOIN or GROUPING SETS, and
+  range GiST indexes.
 - [ ] **Full-text search landed** (b141): `tsvector` / `tsquery` types + `to_tsvector` / `to_tsquery` /
   `plainto_tsquery`, the `@@` match operator, and `ts_rank`. New self-contained `secantus/sql/fts.py`:
   `to_tsvector` → `{"tsvector": {lexeme: [pos, …]}}` (lower-cased tokens, English stop-words dropped, 1-based
@@ -2823,9 +2833,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   in `_insert_doc`. `ALTER COLUMN … TYPE t` updates the catalog `type_tag` (new inserts/reads use it;
   already-stored BSON values are **not** rewritten). Fixed a latent bug: `DROP DEFAULT` and `DROP NOT
   NULL` both parse with `drop=True`, and the old AlterColumn handler conflated them, wrongly setting
-  the column NOT NULL on `DROP DEFAULT`. **Limitations:** only *literal* defaults are stored — an
-  expression/function default (`now()`) is accepted but never applied (reads NULL when omitted); a
-  `TYPE` change doesn't recast existing rows.
+  the column NOT NULL on `DROP DEFAULT`. **Expression defaults landed (#166, b201):** a non-literal
+  DEFAULT (`now()` / `CURRENT_TIMESTAMP` / `gen_random_uuid()` / arithmetic / function) is now stored as
+  its rendered SQL on `Column.default_expr` (`planner._default_expr`, from `CREATE TABLE` and `ALTER
+  COLUMN SET DEFAULT`) and evaluated **per omitted row** at INSERT via `scalar.evaluate`
+  (`_parse_default_expr`, lru-cached) — so `gen_random_uuid()` yields a fresh value per row. Reflected in
+  `information_schema.columns.column_default` (`virtual._column_default_text`). A default referencing
+  another column raises `0A000`. **Limitations:** a `TYPE` change doesn't recast existing rows;
+  `pg_attrdef` still returns `[]` (the `information_schema` view is the reflection surface).
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
