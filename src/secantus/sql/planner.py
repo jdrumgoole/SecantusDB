@@ -3182,12 +3182,15 @@ def _plan_pipeline_select(
             stmt, table, group_addfields
         )
         group_addfields = None  # injected per union-branch by the grouping-sets planner
-    elif (_select_has_window(stmt) or _select_has_computed_aggregate(stmt)) and (
-        grouped or _group_agg_nodes(stmt)
-    ):
-        # Window functions computed over GROUP BY aggregates, or an expression that
-        # *wraps* an aggregate (``sum(x) + 1``) — both run the wrapping / window
-        # phase over the grouped rows via the evaluated executor.
+    elif (
+        _select_has_window(stmt)
+        or _select_has_computed_aggregate(stmt)
+        or _having_has_subquery(stmt)
+    ) and (grouped or _group_agg_nodes(stmt)):
+        # Window functions computed over GROUP BY aggregates, an expression that
+        # *wraps* an aggregate (``sum(x) + 1``), or a subquery in HAVING — all run the
+        # wrapping / window / residual-HAVING phase over the grouped rows via the
+        # evaluated executor.
         plan = _plan_group_window_select(stmt, table)
     elif grouped:
         plan = _plan_group_select(stmt, table)
@@ -3981,6 +3984,33 @@ def _select_has_computed_aggregate(stmt: exp.Select) -> bool:
     return False
 
 
+def _having_has_subquery(stmt: exp.Select) -> bool:
+    """Whether the HAVING clause contains a subquery (``HAVING sum(x) > (SELECT …)``).
+    Such a predicate can't lower to a post-``$group`` ``$match`` — it is carried as a
+    per-grouped-row residual and evaluated by the executor (which can run a
+    correlated inner query against the group key)."""
+    having = stmt.args.get("having")
+    return having is not None and having.this.find(exp.Select) is not None
+
+
+def _outer_agg_nodes(node: exp.Expression) -> list[exp.AggFunc]:
+    """The aggregates directly in ``node`` (e.g. a HAVING predicate) that are *not*
+    nested inside a subquery — those belong to this query's GROUP BY, whereas an
+    aggregate inside a ``(SELECT …)`` belongs to that inner query."""
+    out: list[exp.AggFunc] = []
+    for n in node.find_all(exp.AggFunc):
+        p = n.parent
+        nested = False
+        while p is not None and p is not node:
+            if isinstance(p, (exp.Subquery, exp.Select)):
+                nested = True
+                break
+            p = p.parent
+        if not nested:
+            out.append(n)
+    return out
+
+
 def _group_agg_nodes(stmt: exp.Select) -> list[exp.AggFunc]:
     """Every aggregate (``SUM``/``COUNT``/… / ``array_agg``) in the SELECT list and
     ORDER BY that is *not* itself a window function — i.e. not the direct operand
@@ -4092,13 +4122,21 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
         node.replace(exp.column(register_agg(node)))
 
     having = stmt.args.get("having")
-    having_match = (
-        _having_to_match(
-            having.this, table, accumulators, agg_fields, group_cols, names, reductions
-        )
-        if having is not None
-        else None
-    )
+    having_match = None
+    residual_having: exp.Expression | None = None
+    if having is not None:
+        if having.this.find(exp.Select) is not None:
+            # A subquery in HAVING (`HAVING sum(x) > (SELECT … WHERE t.k = g.k)`) can't
+            # lower to a `$match` — rewrite its aggregates to their computed fields
+            # and carry it as a per-grouped-row residual the evaluated executor runs
+            # (the correlated inner query resolves the group key through the scope).
+            for node in _outer_agg_nodes(having.this):
+                node.replace(exp.column(register_agg(node)))
+            residual_having = having.this
+        else:
+            having_match = _having_to_match(
+                having.this, table, accumulators, agg_fields, group_cols, names, reductions
+            )
 
     pipeline: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
     if reductions:
@@ -4111,7 +4149,9 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
     for fname in agg_field_names:
         project[fname] = f"${fname}"
     pipeline.append({"$project": project})
-    return _finish_group_window(stmt, table.collection, base_filter, pipeline, field_tags)
+    return _finish_group_window(
+        stmt, table.collection, base_filter, pipeline, field_tags, where=residual_having
+    )
 
 
 def _finish_group_window(
@@ -4121,6 +4161,7 @@ def _finish_group_window(
     pipeline: list[dict[str, Any]],
     field_tags: dict[str, str],
     derived: list[DerivedTable] | None = None,
+    where: exp.Expression | None = None,
 ) -> EvaluatedSelectPlan:
     """Shared tail of the group-then-window planners: with the grouped rows'
     field→tag map in hand, build the per-row output expressions, the window-alias
@@ -4166,6 +4207,7 @@ def _finish_group_window(
         limit=limit,
         skip=skip,
         derived=derived or [],
+        where=where,
     )
 
 

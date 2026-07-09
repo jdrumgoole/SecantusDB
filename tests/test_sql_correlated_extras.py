@@ -2,17 +2,18 @@
 (#170).
 
 Pins the behaviour that a correlated WHERE / EXISTS / scalar subquery works over a
-GROUP BY or JOIN pipeline (not only a single-table SELECT), and that a correlated
+GROUP BY or JOIN pipeline (not only a single-table SELECT), that a correlated
 single-table SELECT sorts an enum column by its declared label order (not
-lexically). The one remaining gap — a correlated subquery in HAVING — stays
-``0A000``. Driven through ``run_sql`` over the real WiredTiger-backed ``Storage``.
+lexically), and — since #171 — that a correlated subquery in HAVING is evaluated
+per grouped row. Driven through ``run_sql`` over the real WiredTiger-backed
+``Storage``.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from secantus.sql import SQLError, run_sql
+from secantus.sql import run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -101,16 +102,29 @@ def test_correlated_scalar_in_select_over_join(storage, session):
     ) == [("a", 20), ("a", 20), ("b", 3)]
 
 
-def test_correlated_in_having_still_unsupported(storage, session):
+def test_correlated_subquery_in_having(storage, session):
+    # #171: a correlated subquery in HAVING is evaluated per grouped row (the group
+    # key resolves through the residual scope). e: sum 40 > thresh 20 → kept;
+    # w: sum 45 > thresh 3 → kept.
     _seed(storage, session)
-    with pytest.raises(SQLError) as ei:
-        run(
-            storage,
-            session,
-            "SELECT region, sum(amt) FROM sales s GROUP BY region "
-            "HAVING sum(amt) > (SELECT minamt FROM thresh t WHERE t.region = s.region)",
-        )
-    assert ei.value.sqlstate == "0A000"
+    assert rows(
+        storage,
+        session,
+        "SELECT region, sum(amt) AS s FROM sales s GROUP BY region "
+        "HAVING sum(amt) > (SELECT minamt FROM thresh t WHERE t.region = s.region) ORDER BY region",
+    ) == [("e", 40), ("w", 45)]
+
+
+def test_correlated_subquery_in_having_filters(storage, session):
+    # A group whose aggregate fails the per-group threshold is dropped.
+    _seed(storage, session)
+    run(storage, session, "UPDATE thresh SET minamt = 100 WHERE region = 'e'")
+    assert rows(
+        storage,
+        session,
+        "SELECT region, sum(amt) AS s FROM sales s GROUP BY region "
+        "HAVING sum(amt) > (SELECT minamt FROM thresh t WHERE t.region = s.region) ORDER BY region",
+    ) == [("w", 45)]
 
 
 # -- enum ORDER BY in a correlated single-table SELECT ----------------------- #
