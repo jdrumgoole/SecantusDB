@@ -183,6 +183,25 @@ UPDATE t SET total = price * qty;         -- from other columns
 UPDATE t SET tag = upper(tag);            -- function call
 ```
 
+Both `UPDATE` and `DELETE` accept **join forms** that bring in other tables.
+`UPDATE t SET … FROM src … WHERE <join>` lets a `SET` right-hand side read the
+joined source, and `DELETE FROM t USING src … WHERE <join>` is a semi-join —
+each target row matched by *any* source combination is deleted exactly once (a
+target matched by many source rows is still deleted a single time). The source
+list may name several tables or a sub-`SELECT`, and either form takes a
+`RETURNING` clause:
+
+```sql
+-- copy a per-id bonus from another table onto the target
+UPDATE accounts a SET balance = a.balance + d.amount FROM deltas d WHERE a.id = d.id;
+
+-- delete every account that has a matching row in closed
+DELETE FROM accounts a USING closed c WHERE a.id = c.id RETURNING a.id;
+
+-- a sub-SELECT is a valid source
+UPDATE a SET n = s.v FROM (SELECT 1 AS id, 99 AS v) s WHERE a.id = s.id;
+```
+
 `INSERT` also accepts a query as its source — `INSERT INTO target [(cols)]
 SELECT …`. The source runs first (it may filter, join, aggregate, or be a set
 operation / CTE) and its result columns map positionally onto the target
