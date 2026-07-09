@@ -758,8 +758,53 @@ def _to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any:
             if any(True for _ in idx_node.find_all(exp.Column)):
                 idx_expr = {"$subtract": [idx_expr, 1]}
             return {"$arrayElemAt": [_to_agg_expr(node.this, resolve), idx_expr]}
+    func = _func_to_agg_expr(node, resolve)
+    if func is not None:
+        return func
     val = _literal(node)
     return {"$literal": val} if isinstance(val, str) else val
+
+
+# Scalar functions that lower 1:1 to a single-argument Mongo aggregation operator.
+_UNARY_FUNC_AGG: dict[type, str] = {
+    exp.Lower: "$toLower",
+    exp.Upper: "$toUpper",
+    exp.Abs: "$abs",
+    exp.Floor: "$floor",
+    exp.Ceil: "$ceil",
+    exp.Length: "$strLenCP",
+}
+
+
+def _func_to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any | None:
+    """Lower a scalar *function call* to a Mongo aggregation expression, or ``None``
+    when the node isn't a supported function. Used for computed GROUP BY keys (and
+    any other place that lowers a scalar to ``$expr``). Only functions the Python
+    aggregation engine can evaluate are mapped; anything else returns ``None`` so
+    the caller falls through (ultimately a ``feature_not_supported`` for a group key)."""
+    op = _UNARY_FUNC_AGG.get(type(node))
+    if op is not None:
+        return {op: _to_agg_expr(node.this, resolve)}
+    if isinstance(node, exp.Round):
+        place = _to_agg_expr(node.expression, resolve) if node.expression is not None else 0
+        return {"$round": [_to_agg_expr(node.this, resolve), place]}
+    if isinstance(node, exp.Mod):
+        return {"$mod": [_to_agg_expr(node.this, resolve), _to_agg_expr(node.expression, resolve)]}
+    if isinstance(node, exp.Coalesce):
+        args = [_to_agg_expr(node.this, resolve)]
+        args.extend(_to_agg_expr(a, resolve) for a in (node.expressions or []))
+        if len(args) >= 2:
+            return {"$ifNull": args}
+        return args[0]
+    if isinstance(node, exp.DPipe):
+        # Postgres ``||`` string concatenation — coerce each side to text.
+        return {
+            "$concat": [
+                {"$toString": _to_agg_expr(node.this, resolve)},
+                {"$toString": _to_agg_expr(node.expression, resolve)},
+            ]
+        }
+    return None
 
 
 # Catalog predicates that are functions of visibility/scope which, on a
@@ -3091,6 +3136,16 @@ def _plan_pipeline_select(
     derived: list[DerivedTable] = []
     _alias, table = _resolve_source(from_node.this, db, catalog, storage, derived)
 
+    # Computed GROUP BY keys (``GROUP BY lower(name)`` / ``x + 1``) — rewrite each
+    # into a synthetic column materialised by a pre-``$group`` ``$addFields`` so the
+    # bare-column group machinery handles SELECT / HAVING / ORDER BY. Grouping sets
+    # keep their own (column-only) path.
+    group_addfields: dict[str, Any] | None = None
+    if not _has_grouping_sets(stmt):
+        rewrite = _rewrite_computed_group_keys(stmt, table)
+        if rewrite is not None:
+            stmt, table, group_addfields = rewrite
+
     has_aggregate = any(
         _aggregate_of(e) is not None
         or _array_agg_arg(e) is not None
@@ -3123,6 +3178,9 @@ def _plan_pipeline_select(
         plan = _plan_distinct_select(stmt, table)
     else:
         plan = _plan_plain_select(stmt, table)
+    if group_addfields:
+        # Compute the synthetic GROUP BY key fields before the $group stage reads them.
+        plan.pipeline.insert(0, {"$addFields": group_addfields})
     plan.derived = derived
     return plan
 
@@ -3373,6 +3431,78 @@ class _NameAllocator:
 def _has_grouping_sets(stmt: exp.Select) -> bool:
     g = stmt.args.get("group")
     return bool(g and (g.args.get("rollup") or g.args.get("cube") or g.args.get("grouping_sets")))
+
+
+def _rewrite_computed_group_keys(
+    stmt: exp.Select, table: TableDef
+) -> tuple[exp.Select, TableDef, dict[str, Any]] | None:
+    """Rewrite non-column GROUP BY keys (``GROUP BY lower(name)``, ``GROUP BY x + 1``)
+    into synthetic bare columns.
+
+    Each computed key is lowered to a Mongo aggregation expression, materialised
+    into a fresh ``__gkeyN`` field by a pre-``$group`` ``$addFields``, and every
+    SQL-equal occurrence of the key (in GROUP BY / SELECT / HAVING / ORDER BY) is
+    replaced with a reference to that synthetic column. The existing bare-column
+    group machinery then handles the rest transparently.
+
+    Returns ``(rewritten_stmt, augmented_table, addfields)`` or ``None`` when no
+    GROUP BY key is computed. Raises ``feature_not_supported`` when a key uses a
+    function the aggregation engine can't evaluate (→ ``0A000``)."""
+    group_node = stmt.args.get("group")
+    if group_node is None:
+        return None
+    # Bare columns need no rewrite; a positional ordinal (``GROUP BY 1``) is left
+    # to the existing ordinal handling rather than grouped by a constant.
+    computed = [k for k in group_node.expressions if not isinstance(k, (exp.Column, exp.Literal))]
+    if not computed:
+        return None
+    resolve = table_resolver(table)
+    existing = {c.name for c in table.columns}
+    targets: dict[str, str] = {}  # normalised key SQL -> synthetic column name
+    addfields: dict[str, Any] = {}
+    synth: list[Column] = []
+    counter = 0
+    for key in computed:
+        srepr = key.sql()
+        if srepr in targets:
+            continue
+        try:
+            mongo = _to_agg_expr(key, resolve)
+        except Exception as exc:  # noqa: BLE001 — any lowering failure → clean 0A000
+            raise errors.feature_not_supported(
+                f"unsupported computed GROUP BY key: {srepr}"
+            ) from exc
+        while (fname := f"__gkey{counter}") in existing:
+            counter += 1
+        counter += 1
+        addfields[fname] = mongo
+        targets[srepr] = fname
+        synth.append(Column(name=fname, type_tag="any", field=fname, pk=False, nullable=True))
+
+    # A computed key selected under an alias projects to that alias, so an ORDER BY
+    # naming the same expression must sort on the alias (the synthetic ``__gkeyN``
+    # field is gone by the post-$group $project). Map synthetic name -> output alias.
+    key_alias: dict[str, str] = {}
+    for e in stmt.expressions:
+        if isinstance(e, exp.Alias) and (repl := targets.get(e.this.sql())) is not None:
+            key_alias[repl] = e.alias
+
+    def xf(node: exp.Expression) -> exp.Expression:
+        if not isinstance(node, exp.Column):
+            repl = targets.get(node.sql())
+            if repl is not None:
+                return exp.column(repl)
+        return node
+
+    new_stmt = stmt.transform(xf)
+    order = new_stmt.args.get("order")
+    if order is not None and key_alias:
+        for o in order.expressions:
+            term = o.this
+            if isinstance(term, exp.Column) and not term.table and term.name in key_alias:
+                o.set("this", exp.column(key_alias[term.name]))
+    new_table = replace(table, columns=[*table.columns, *synth])
+    return new_stmt, new_table, addfields
 
 
 def _grouping_args(e: exp.Expression) -> list[str] | None:

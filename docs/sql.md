@@ -1749,7 +1749,30 @@ SELECT region, GROUPING(region) AS g, SUM(amount)
 FROM sales GROUP BY ROLLUP(region);   -- g = 1 on the grand-total row
 ```
 
-A **computed GROUP BY key** (`GROUP BY lower(name)`) is not yet supported.
+### Computed GROUP BY keys
+
+`GROUP BY` accepts an *expression* in place of a bare column — arithmetic, `%`,
+`||`, and the common functions (`lower` / `upper` / `length` / `abs` / `round` /
+`floor` / `ceil` / `coalesce`). The same expression may also appear in the
+`SELECT` list, `HAVING`, and `ORDER BY`:
+
+```sql
+-- fold case, then group
+SELECT lower(name) AS g, SUM(x) FROM t GROUP BY lower(name) ORDER BY g;
+
+-- bucket by a derived value
+SELECT x % 2 AS parity, COUNT(*) FROM t GROUP BY x % 2;
+
+-- a computed key alongside a bare column and a HAVING on the aggregate
+SELECT city, lower(name) AS g, SUM(x)
+FROM t GROUP BY city, lower(name) HAVING SUM(x) > 5;
+```
+
+Each computed key is lowered to an equivalent aggregation expression and
+materialised into a synthetic field before the group, so the grouping runs on the
+derived value exactly as Postgres would. A key using a function the engine can't
+evaluate (e.g. `substr`), or a computed key over a `JOIN` / `GROUPING SETS`,
+raises `0A000`.
 
 ## Joins
 
