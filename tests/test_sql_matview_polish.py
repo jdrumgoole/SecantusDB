@@ -2,9 +2,10 @@
 ``ALTER MATERIALIZED VIEW … RENAME TO``.
 
 ``WITH NO DATA`` registers the matview unpopulated (not scannable — querying it
-errors ``55000``) until the first ``REFRESH``. ``CONCURRENTLY`` is accepted as a
-modifier (our refresh is already a full recompute). ``RENAME TO`` moves the
-matview, its catalog shape, and its backing collection.
+errors ``55000``) until the first ``REFRESH``. ``CONCURRENTLY`` recomputes the
+snapshot but, like Postgres, requires the matview to be populated and to carry a
+unique index (else ``0A000``). ``RENAME TO`` moves the matview, its catalog shape,
+and its backing collection.
 """
 
 from __future__ import annotations
@@ -74,12 +75,32 @@ def test_with_data_explicit_is_populated(storage, session):
 
 
 def test_refresh_concurrently(storage, session):
+    # Postgres requires a unique index for a CONCURRENTLY refresh.
     run(storage, session, "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE n > 8")
+    run(storage, session, "CREATE UNIQUE INDEX mv_id ON mv (id)")
     run(storage, session, "INSERT INTO t (id, n) VALUES (4, 99)")
     assert run(storage, session, "REFRESH MATERIALIZED VIEW CONCURRENTLY mv").command_tag == (
         "REFRESH MATERIALIZED VIEW"
     )
     assert sorted(rows(storage, session, "SELECT id FROM mv ORDER BY id")) == [(1,), (2,), (4,)]
+
+
+def test_refresh_concurrently_without_unique_index_rejected(storage, session):
+    run(storage, session, "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE n > 8")
+    with pytest.raises(errors.SQLError) as ei:
+        run(storage, session, "REFRESH MATERIALIZED VIEW CONCURRENTLY mv")
+    assert ei.value.sqlstate == "0A000"
+    assert "concurrently" in str(ei.value).lower()
+
+
+def test_refresh_concurrently_before_populated_rejected(storage, session):
+    run(
+        storage, session, "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE n > 8 WITH NO DATA"
+    )
+    run(storage, session, "CREATE UNIQUE INDEX mv_id ON mv (id)")
+    with pytest.raises(errors.SQLError) as ei:
+        run(storage, session, "REFRESH MATERIALIZED VIEW CONCURRENTLY mv")
+    assert ei.value.sqlstate == "0A000"
 
 
 def test_alter_rename(storage, session):

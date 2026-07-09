@@ -109,6 +109,9 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         array_result = _eval_array_op(node, scope, ctx)
         if array_result is not _NOT_ARRAY:
             return array_result
+        jsonb_result = _eval_jsonb_op(node, scope, ctx)
+        if jsonb_result is not _NOT_JSONB:
+            return jsonb_result
     if isinstance(
         node, (exp.JSONBContains, exp.JSONBContainsAllTopKeys, exp.JSONBContainsAnyTopKeys)
     ):
@@ -487,16 +490,18 @@ def _eval_substring(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> A
 
 
 def _eval_array_size(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
-    # array_length(arr, dim) / cardinality(arr). Arrays are stored as native BSON
-    # lists (one level deep here), so only dimension 1 has a length; any other
-    # dimension is NULL, matching Postgres for a 1-D array.
+    # ``array_length(arr, dim)`` — the length along ``dim`` (1-based). A
+    # multi-dimensional array reports each dimension's length; a dimension beyond
+    # the array's rank is NULL, matching Postgres.
     v = evaluate(node.this, scope, ctx)
     if not isinstance(v, (list, tuple)):
         return None
+    dims = _array_dim_lengths(v)
     dim_node = node.args.get("expression")
-    if dim_node is not None and int(evaluate(dim_node, scope, ctx)) != 1:
+    dim = int(evaluate(dim_node, scope, ctx)) if dim_node is not None else 1
+    if dim < 1 or dim > len(dims):
         return None
-    return len(v)
+    return dims[dim - 1]
 
 
 def _as_list(v: Any) -> list:
@@ -1539,13 +1544,31 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if not isinstance(v, list):
             raise errors.SQLError("22023", "cannot get array length of a non-array")
         return len(v)
-    if name in ("array_length", "cardinality"):
+    if name in ("array_length", "cardinality", "array_ndims", "array_upper", "array_lower"):
         v = args[0] if args else None
         if not isinstance(v, (list, tuple)):
             return None
-        if name == "array_length" and len(args) > 1 and args[1] != 1:
+        dims = _array_dim_lengths(v)
+        if name == "cardinality":
+            n = 1
+            for d in dims:
+                n *= d
+            return n if dims else 0
+        if name == "array_ndims":
+            return len(dims) or None
+        # array_length / array_upper / array_lower take a 1-based dimension.
+        dim = int(args[1]) if len(args) > 1 and args[1] is not None else 1
+        if dim < 1 or dim > len(dims):
             return None
-        return len(v)
+        if name == "array_lower":
+            return 1  # Postgres arrays are 1-based by default
+        return dims[dim - 1]  # array_length == array_upper (lower is 1)
+    if name == "array_dims":
+        v = args[0] if args else None
+        if not isinstance(v, (list, tuple)):
+            return None
+        dims = _array_dim_lengths(v)
+        return "".join(f"[1:{d}]" for d in dims) if dims else None
     if name in ("jsonb_typeof", "json_typeof"):
         return _json_typeof(args[0] if args else None)
     if name in ("jsonb_set", "jsonb_set_lax"):
@@ -2006,6 +2029,7 @@ _NOT_BIT = object()
 _NOT_GEO = object()
 _NOT_HSTORE = object()
 _NOT_ARRAY = object()
+_NOT_JSONB = object()
 
 
 def _eval_hstore_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
@@ -2206,6 +2230,18 @@ def _array_membership(needle: Any, haystack: list) -> bool:
     return False
 
 
+def _array_dim_lengths(v: Any) -> list[int]:
+    """The per-dimension lengths of a (rectangular) Postgres array — ``[2, 3]`` for
+    a 2×3 array — walking the first element of each level. An empty array has no
+    dimensions (``[]``), matching Postgres' ``array_ndims('{}') IS NULL``."""
+    dims: list[int] = []
+    cur = v
+    while isinstance(cur, (list, tuple)) and len(cur) > 0:
+        dims.append(len(cur))
+        cur = cur[0]
+    return dims
+
+
 def _eval_array_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     """``@>`` (contains) / ``<@`` (contained by) / ``&&`` (overlaps) on Postgres
     *array* operands (both sides are lists). Returns ``_NOT_ARRAY`` when either
@@ -2222,6 +2258,54 @@ def _eval_array_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> An
         return all(_array_membership(x, right) for x in left)
     # ArrayContainsAll -> @> : every right element is in left
     return all(_array_membership(x, left) for x in right)
+
+
+def _jsonb_containment(a: Any, b: Any) -> bool:
+    """Postgres ``a @> b`` on jsonb: does ``a`` contain ``b``? Objects match
+    key-by-key (recursively); arrays require every element of ``b`` to be contained
+    by some element of ``a``; a scalar ``b`` is contained by an array ``a`` when it
+    is one of its elements; scalars match by equality. Mismatched container kinds
+    (object vs array) don't contain each other."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return all(k in a and _jsonb_containment(a[k], b[k]) for k in b)
+    if isinstance(a, list) and isinstance(b, list):
+        return all(any(_jsonb_containment(ae, be) for ae in a) for be in b)
+    if isinstance(a, list):  # scalar / object b contained in array a
+        return any(_jsonb_containment(ae, b) for ae in a)
+    if isinstance(b, (dict, list)):  # non-container a can't contain a container b
+        return False
+    return a == b
+
+
+def _eval_jsonb_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``@>`` (contains) / ``<@`` (contained by) on jsonb operands (at least one is
+    an object / array). Returns ``_NOT_JSONB`` when neither side is a jsonb
+    container, so the caller can surface an unsupported-operator error. jsonb has no
+    ``&&``, so overlap is never a jsonb op."""
+    if isinstance(node, exp.ArrayOverlaps):
+        return _NOT_JSONB
+    # A jsonb cast of a literal (``'{...}'::jsonb``) evaluates to the raw JSON
+    # text; decode it so both a stored column (already a dict/list) and a literal
+    # cast compare as structured values.
+    left = _coerce_jsonb(evaluate(node.this, scope, ctx))
+    right = _coerce_jsonb(evaluate(node.expression, scope, ctx))
+    if not (isinstance(left, (dict, list)) or isinstance(right, (dict, list))):
+        return _NOT_JSONB
+    if left is None or right is None:
+        return None
+    if isinstance(node, exp.ArrayContainedBy):  # a <@ b : b contains a
+        return _jsonb_containment(right, left)
+    return _jsonb_containment(left, right)  # a @> b : a contains b
+
+
+def _coerce_jsonb(v: Any) -> Any:
+    """Decode a JSON-text operand to a Python structure; leave non-strings as is."""
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except (ValueError, TypeError):
+            return v
+    return v
 
 
 def _eval_jsonb_path_op(

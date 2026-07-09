@@ -1579,26 +1579,39 @@ def _ordered_target(node: exp.Expression) -> exp.Expression:
     return node.this if isinstance(node, exp.Ordered) else node
 
 
+def _fields_for_constraint(name: str, table: TableDef) -> list[str]:
+    """The storage fields of the named UNIQUE / PRIMARY KEY constraint, for an
+    ``ON CONFLICT ON CONSTRAINT <name>`` arbiter. Matches a declared UNIQUE
+    constraint by name, else the primary key (by its Postgres default name
+    ``<table>_pkey``). An unknown name raises ``42704``."""
+    for uq in table.unique_constraints:
+        if uq.name == name:
+            return [table.field_for(col) for col in uq.columns]
+    if table.pk_columns and name == f"{table.name}_pkey":
+        return [c.field for c in table.pk_columns]
+    raise errors.SQLError("42704", f'constraint "{name}" for table "{table.name}" does not exist')
+
+
 def _plan_on_conflict(stmt: exp.Insert, table: TableDef) -> OnConflict | None:
     """Lower an ``ON CONFLICT`` clause to an :class:`OnConflict`, or None.
 
-    Supports ``DO NOTHING`` (with or without a conflict target) and
-    ``DO UPDATE SET … [WHERE …]`` with a column conflict target. ``ON CONSTRAINT
-    <name>`` is rejected — we have no named-constraint registry, so the user must
-    name the conflicting column(s)."""
+    Supports ``DO NOTHING`` (with or without a conflict target),
+    ``DO UPDATE SET … [WHERE …]`` with a column conflict target, and
+    ``ON CONSTRAINT <name>`` — resolved to the named UNIQUE / PRIMARY KEY
+    constraint's columns via the table's constraint registry."""
     clause = stmt.args.get("conflict")
     if clause is None:
         return None
-    if clause.args.get("constraint") is not None:
-        raise errors.feature_not_supported(
-            "ON CONFLICT ON CONSTRAINT is not supported; name the conflict column(s) instead"
-        )
     action = clause.args.get("action")
     action_text = (action.name if action is not None else "").upper()
-    conflict_fields = [
-        table.field_for(_column_name(_ordered_target(k)))
-        for k in (clause.args.get("conflict_keys") or [])
-    ]
+    constraint = clause.args.get("constraint")
+    if constraint is not None:
+        conflict_fields = _fields_for_constraint(constraint.name, table)
+    else:
+        conflict_fields = [
+            table.field_for(_column_name(_ordered_target(k)))
+            for k in (clause.args.get("conflict_keys") or [])
+        ]
     if "NOTHING" in action_text:
         return OnConflict(action="nothing", conflict_fields=conflict_fields)
     if "UPDATE" not in action_text:
@@ -2033,6 +2046,8 @@ def where_needs_per_row(
         return True
     if table is not None and _where_has_array_predicate(node, table):
         return True
+    if table is not None and _where_has_jsonb_contained_predicate(node, table):
+        return True
     # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
     if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
         return True
@@ -2153,6 +2168,26 @@ def _where_has_array_predicate(node: exp.Expression, table: TableDef) -> bool:
     for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps):
         if _is_array_operand(op.this, table) or _is_array_operand(op.expression, table):
             return True
+    return False
+
+
+def _where_has_jsonb_contained_predicate(node: exp.Expression, table: TableDef) -> bool:
+    """True if ``node`` contains an ``@>`` / ``<@`` in a shape that can't lower to a
+    Mongo filter and so needs per-row evaluation. Only two shapes push down —
+    ``field @> const`` and ``const <@ field`` (both a subset-of-the-stored-value
+    lookup handled by ``_jsonb_contains_filter``); the reverse shapes
+    (``field <@ const``, ``const @> field``) and field-vs-field comparisons fall
+    through to a COLLSCAN + residual predicate evaluated by the scalar pass (which
+    handles jsonb / array / range / hstore / geo containment). Typed range / array /
+    net / hstore / geo operators are already routed to the residual by their own
+    ``_where_has_*`` checks, so this generic shape test is only additive."""
+    for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy):
+        if isinstance(op, exp.ArrayContainsAll):  # @>
+            if _is_field_node(op.this) and _is_literalish(op.expression):
+                continue  # field @> const — pushes down
+        elif _is_literalish(op.this) and _is_field_node(op.expression):
+            continue  # const <@ field — pushes down (== field @> const)
+        return True
     return False
 
 
@@ -5291,8 +5326,18 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "json_object_agg",
         ):
             return "json"
-        if fname in ("jsonb_array_length", "json_array_length", "array_length", "cardinality"):
+        if fname in (
+            "jsonb_array_length",
+            "json_array_length",
+            "array_length",
+            "cardinality",
+            "array_ndims",
+            "array_upper",
+            "array_lower",
+        ):
             return "int4"
+        if fname == "array_dims":
+            return "text"
         if fname in ("jsonb_path_exists", "jsonb_path_match"):
             return "bool"
         if fname in ("has_table_privilege", "has_column_privilege"):

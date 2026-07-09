@@ -38,6 +38,7 @@ _NAMED_SRFS = frozenset(
         "jsonb_object_keys",
         "json_object_keys",
         "regexp_split_to_table",
+        "regexp_matches",
     }
 )
 
@@ -160,6 +161,21 @@ def _values_and_tag(node: exp.Expression, ctx: Any) -> tuple[list[Any], str]:
             pattern = ev(args[1]) if len(args) > 1 else ""
             text = "" if val is None else str(val)
             return re.split(str(pattern), text), "text"
+        if name == "regexp_matches":
+            # Set-returning: one row per match, each a text[] of the capture groups
+            # (or the whole match when the pattern has none). The `g` flag yields
+            # every match; without it, at most the first. NULL input -> no rows.
+            pattern = ev(args[1]) if len(args) > 1 else None
+            if val is None or pattern is None:
+                return [], "text[]"
+            flags = scalar._as_text(ev(args[2])) if len(args) > 2 else ""
+            rx = scalar._re_compile(scalar._as_text(pattern), flags)
+            rows: list[Any] = []
+            for m in rx.finditer(scalar._as_text(val)):
+                rows.append(list(m.groups()) if m.groups() else [m.group(0)])
+                if "g" not in flags:
+                    break
+            return rows, "text[]"
     raise errors.feature_not_supported(f"unsupported set-returning function: {node.sql()}")
 
 

@@ -113,6 +113,14 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
 _SCALAR_EVAL_ANON = frozenset(
     {
         "isempty",
+        # Array introspection (multi-dimensional aware) is done by the full scalar
+        # evaluator, which can evaluate an ``ARRAY[...]`` / nested-array argument.
+        "cardinality",
+        "array_length",
+        "array_ndims",
+        "array_dims",
+        "array_upper",
+        "array_lower",
         "to_jsonb",
         "to_json",
         "row_to_json",

@@ -1489,9 +1489,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   JSON-parsed via `_as_json_value`; `create_missing` / `insert_after` honoured; a copy is returned so the
   stored row is untouched), `jsonb_strip_nulls` / `json_strip_nulls`, `jsonb_pretty`, and the `#-`
   delete-at-path operator (`exp.JSONBDeleteAtPath`). Type inference: the modifiers → `json`, `jsonb_pretty`
-  → `text`. Tests: `tests/test_sql_jsonb_funcs.py`. **Gaps:** `<@` (contained-by) is `0A000` — "field is a
-  subset of a constant" isn't expressible as a pushed-down filter (rewrite as `<const> @> field`);
-  `jsonb_each` (key+value record SRF) and the `jsonb_*_text` family aren't modeled. **Parser quirk:** sqlglot reads
+  → `text`. Tests: `tests/test_sql_jsonb_funcs.py`. **`<@` (contained-by) landed as a residual (#149, b191):**
+  `field <@ const` / `const @> field` (and field-vs-field, and scalar-context `<@`/`@>`) now evaluate per-row
+  via a COLLSCAN + residual predicate — `_where_has_jsonb_contained_predicate` (shape-based: only `field @> const`
+  and `const <@ field` keep the `_jsonb_contains_filter` pushdown) routes them through `where_needs_per_row`, and
+  `scalar._eval_jsonb_op` / `_jsonb_containment` implement Postgres object/array/scalar containment (JSON-text
+  operands are `json.loads`-decoded first). **Gaps:** `jsonb_each` (key+value record SRF) and the `jsonb_*_text`
+  family aren't modeled. **Parser quirk:** sqlglot reads
   a bare `f(a->'k')` arrow as a lambda, so a navigated *function argument* must be parenthesised
   (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
 - [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
@@ -1542,9 +1546,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `regexp_count(str, pat)`, and `regexp_matches(str, pat [,flags])` — all in `scalar.py`
   (`_SCALAR_FUNC_NODES` for the dedicated nodes `RegexpReplace`/`SplitPart`/`Translate`/`RegexpCount`;
   `regexp_matches` is `Anonymous` → `_call_func`). Output types wired in `planner._infer_scalar_tag`
-  (text / int4). **Limitation:** `regexp_matches` is genuinely set-returning in Postgres (one row per
-  match); in our scalar context it returns only the **first** match's capture groups as a `text[]` (whole
-  match if no groups), NULL when there is no match — sufficient for the common non-`g` use.
+  (text / int4). **`regexp_matches` as a true SRF landed (#152, b190):** it's registered in `srf.py`'s
+  `_NAMED_SRFS`, so `SELECT regexp_matches(…)` and `FROM regexp_matches(…) AS m` emit **one row per
+  match** (each a `text[]` of the capture groups, or the whole match when there are none); the `g` flag
+  yields every match, without it at most the first, and no match / NULL input yields no rows. The scalar
+  path (`scalar.py`) is retained for a `regexp_matches` nested inside a larger expression or appearing
+  alongside other projections (multi-target-list), where it still returns the first match's `text[]`.
 - [ ] **Math / numeric scalar functions landed** (b130): `trunc(x [,n])` (truncate toward zero;
   numeric), `sqrt` / `cbrt` (real cube root via `copysign` so negatives work), `sign` (−1/0/1,
   operand kind preserved), `ln`, `log(x)` (base-10 in PG) / `log(b, x)` / `log10` (base-10/2 use the
@@ -2152,8 +2159,10 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   proposed row and bare/target-qualified columns to the existing row (so `n = t.n + EXCLUDED.n` works);
   an optional `WHERE` gates the update. A bare `ON CONFLICT DO NOTHING` (no target) inserts and swallows
   any `11000` duplicate. Command tag counts rows inserted *or* updated (skipped don't count); `RETURNING`
-  projects the inserted + updated rows. **Still unsupported:** `ON CONFLICT ON CONSTRAINT <name>` (→
-  `0A000`; no named-constraint registry), `DO UPDATE` with no conflict target (→ `42601`).
+  projects the inserted + updated rows. **`ON CONFLICT ON CONSTRAINT <name>` landed (#151, b189):**
+  `_fields_for_constraint` resolves the name against the table's `unique_constraints` (by name) or the
+  primary key (by its Postgres default name `<table>_pkey`) to the arbiter's storage fields; an unknown
+  name raises `42704`. **Still unsupported:** `DO UPDATE` with no conflict target (→ `42601`).
 - [ ] **`MERGE` landed** (b74). `MERGE INTO target [alias] USING source [alias] ON <cond> WHEN [NOT]
   MATCHED [AND <cond>] THEN UPDATE SET … | DELETE | INSERT [(cols)] VALUES (…) | DO NOTHING` via
   `engine._run_merge`. Per source row it scans the target snapshot (loaded once at MERGE start) for rows
@@ -2179,7 +2188,8 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   is honoured — a false predicate yields zero rows (`ConstantSelectPlan.emit`), so a recursive-CTE
   anchor like `SELECT 1 WHERE 1=0` works; a column reference with no FROM → `42703`. (3) The jsonb `<@`
   (contained-by) operator lands in its pushable `const <@ field` form (== `field @> const`,
-  `_jsonb_contains_filter`); `field <@ const` (subset-of-a-constant) stays `0A000`.
+  `_jsonb_contains_filter`); the reverse `field <@ const` (subset-of-a-constant) form now runs as a
+  COLLSCAN + residual — **landed in #149, b191 (see the jsonb-functions entry above).**
 - [ ] **WHERE subqueries in the pipeline paths landed** (b59). The single-table pushdown always threaded
   a `SubqueryCtx`, but the pipeline planners (JOIN / GROUP BY / evaluated / DISTINCT) called
   `_where_filter` from many places without one, so a WHERE scalar/`IN` subquery there was `0A000`.
@@ -2213,8 +2223,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `array_append` / `array_prepend` / `array_cat` (NULL array treated as empty, per Postgres),
   `array_position` (1-based, NULL if absent), `array_remove`, `array_to_string` (optional null-string
   arg; NULL elements dropped otherwise). `array_agg` populates a declared array column via `INSERT …
-  SELECT`. **Limitations:** one level deep only (no multi-dimensional arrays — `array_length(col, 2)` is
-  NULL); array functions are evaluated in Python (SELECT-list / INSERT-SELECT), not pushed into a Mongo
+  SELECT`. **Multi-dimensional array introspection landed (#153, b192):** nested-array literals /
+  columns (`int[][]`) round-trip and subscript (`g[2][3]`), and `array_ndims`, `array_dims`,
+  `array_length(arr, dim)`, `array_upper` / `array_lower` (per dimension), and `cardinality` (total
+  element count across all dimensions) are all dimension-aware — `scalar._array_dim_lengths` walks the
+  rectangular shape, `array_length` (`exp.ArraySize`) and the Anonymous funcs share it, and the funcs are
+  routed to the full scalar evaluator (added to `functions._SCALAR_EVAL_ANON`) so an `ARRAY[[…]]` argument
+  evaluates. (A jagged / non-rectangular array reports lengths off its first element, as Postgres rejects
+  those at build time anyway.) **Limitations:** array functions are evaluated in Python (SELECT-list /
+  INSERT-SELECT), not pushed into a Mongo
   `$match` when used in WHERE; no element-type coercion beyond the scalar tags. The FROM-clause table form
   `SELECT … FROM t, unnest(t.tags) AS tag` landed in b119 (`planner._unnest_join_stage`: an `$addFields`
   exposing the array under the alias column + `$unwind`; a synthetic one-column `TableDef` registered at
@@ -2398,8 +2415,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `set_matview_populated`); querying an unpopulated matview errors `55000`
   (`object_not_in_prerequisite_state`, checked in `engine._run_select`), and its first `REFRESH` marks
   it populated. `WITH DATA` is the default (returns `SELECT N`; `WITH NO DATA` returns `CREATE
-  MATERIALIZED VIEW`). `REFRESH … CONCURRENTLY` is accepted (the existing `_MATVIEW_NAME_RE` already
-  skips the keyword; no unique index required since refresh is a full recompute). `ALTER MATERIALIZED
+  MATERIALIZED VIEW`). **`REFRESH … CONCURRENTLY` now enforces its Postgres prerequisites (#154, b193):**
+  `_refresh_matview` detects the `CONCURRENTLY` keyword and rejects it (`0A000` + the PG unique-index
+  hint) unless the matview is already populated *and* carries a unique index (`storage.list_indexes` →
+  any `unique`); otherwise it recomputes the snapshot exactly as a plain refresh (there is no true
+  diff-based concurrent apply, and Postgres has no *incremental* matview refresh to model). `ALTER MATERIALIZED
   VIEW name RENAME TO new` moves the registry entry, the catalog `TableDef`, and the backing collection
   (`storage.rename_collection`), preserving the populated flag. All three (`CREATE … WITH [NO] DATA`,
   `REFRESH … CONCURRENTLY`, `ALTER … RENAME`) parse as `exp.Command` — sqlglot can't parse them as DDL —

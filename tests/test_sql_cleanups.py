@@ -2,8 +2,9 @@
 
 - FROM-less ``SELECT`` of a constant *expression* (arithmetic, ``||``, function
   calls) and a constant ``WHERE`` (false → zero rows).
-- The jsonb ``<@`` (contained-by) operator in its pushable ``<constant> <@ field``
-  form (equivalently ``field @> <constant>``).
+- The jsonb ``<@`` (contained-by) operator: the pushable ``<constant> <@ field``
+  form (equivalently ``field @> <constant>``) and, since #149, the residual
+  ``field <@ <constant>`` form (a COLLSCAN + per-row containment check).
 """
 
 from __future__ import annotations
@@ -94,8 +95,10 @@ def test_jsonb_contained_by_constant_lhs(docs, session):
     assert sorted(r[0] for r in res.rows) == [1, 2]
 
 
-def test_jsonb_contained_by_field_lhs_unsupported(docs, session):
-    # tags <@ '[...]' is a subset constraint on the stored shape — not pushable.
-    with pytest.raises(SQLError) as ei:
-        run_sql(docs, DB, "SELECT _id FROM docs WHERE tags <@ '[\"py\"]'::jsonb", session=session)
-    assert ei.value.sqlstate == "0A000"
+def test_jsonb_contained_by_field_lhs(docs, session):
+    # ``tags <@ '[...]'`` (the stored value is a subset of the constant) can't lower
+    # to a Mongo filter, so since #149 it runs as a COLLSCAN + per-row residual.
+    res = run_sql(
+        docs, DB, "SELECT _id FROM docs WHERE tags <@ '[\"py\"]'::jsonb", session=session
+    )[0]
+    assert sorted(r[0] for r in res.rows) == [2]  # only ["py"] is a subset of ["py"]

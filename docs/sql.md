@@ -1003,10 +1003,14 @@ SELECT id FROM post WHERE scores <@ ARRAY[5,10,20]; -- contained by: every LHS e
 SELECT id FROM post WHERE scores && ARRAY[20,99];   -- overlaps: share ≥1 element
 ```
 
-`array_length(col, 1)` / `cardinality(col)` give the element count (only
-dimension 1 exists — arrays are one level deep, so any other dimension is NULL).
-Array columns reflect as `information_schema.columns.data_type = 'ARRAY'` with the
-Postgres array type OID in `pg_attribute`.
+`array_length(col, dim)` gives the length along a dimension, `cardinality(col)`
+the total element count, and `array_ndims` / `array_dims` / `array_upper` /
+`array_lower` round out the introspection. **Multi-dimensional arrays** work:
+`ARRAY[[1,2,3],[4,5,6]]` (or an `int[][]` column) stores, subscripts (`g[2][3]`),
+and reports per-dimension lengths (`array_length(g, 2)` → `3`, `array_ndims(g)` →
+`2`, `array_dims(g)` → `[1:2][1:3]`, `cardinality(g)` → `6`). Array columns reflect
+as `information_schema.columns.data_type = 'ARRAY'` with the Postgres array type
+OID in `pg_attribute`.
 
 Arrays of the richer element types work the same way, and each reports its proper
 Postgres array-type OID so a driver decodes the elements natively (a `uuid[]`
@@ -1088,12 +1092,18 @@ SELECT generate_series(timestamp '2024-01-01', timestamp '2024-01-02', interval 
 ```
 
 The base-less `FROM` form also covers `unnest(ARRAY[…])`, `jsonb_array_elements`,
-`jsonb_object_keys`, and `regexp_split_to_table`:
+`jsonb_object_keys`, `regexp_split_to_table`, and `regexp_matches`:
 
 ```sql
 SELECT * FROM unnest(ARRAY[10, 20, 30]) AS x;         -- 10,20,30
 SELECT * FROM regexp_split_to_table('a,b,c', ',') AS p;
 SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb) AS e;
+
+-- regexp_matches is set-returning: one row per match, each a text[] of the
+-- capture groups (or the whole match when there are none). The 'g' flag emits
+-- every match; without it, at most the first.
+SELECT * FROM regexp_matches('foobarbaz', 'ba.', 'g') AS m;   -- {bar}, {baz}
+SELECT regexp_matches('a1b2', '([a-z])([0-9])', 'g');         -- {a,1}, {b,2}
 ```
 
 A single-column function's column takes the table alias — `generate_series(1,5) AS g`
@@ -1308,9 +1318,11 @@ DROP MATERIALIZED VIEW IF EXISTS active;
 
 `CREATE MATERIALIZED VIEW … WITH NO DATA` registers the view **unpopulated** — it
 is not scannable (querying it errors `55000`) until its first `REFRESH`. `WITH
-DATA` is the default. `REFRESH MATERIALIZED VIEW CONCURRENTLY` is accepted (our
-refresh is already a full recompute). `ALTER MATERIALIZED VIEW … RENAME TO` moves
-the view, its catalog shape, and its backing collection:
+DATA` is the default. `REFRESH MATERIALIZED VIEW CONCURRENTLY` recomputes the
+snapshot but, like Postgres, requires the view to be populated and to carry a
+unique index — otherwise it errors `0A000` with the "create a unique index" hint.
+`ALTER MATERIALIZED VIEW … RENAME TO` moves the view, its catalog shape, and its
+backing collection:
 
 ```sql
 CREATE MATERIALIZED VIEW active AS SELECT id FROM users WHERE age >= 18 WITH NO DATA;
@@ -1322,8 +1334,10 @@ ALTER MATERIALIZED VIEW active RENAME TO adults;
 Materialized views reflect through `pg_class` (`relkind = 'm'`) and
 `pg_get_viewdef()` — SQLAlchemy's `get_materialized_view_names()` sees them, and
 they are excluded from `get_table_names()` / `information_schema.tables` (matching
-Postgres). Refreshing is always a full recompute; `CONCURRENTLY` doesn't require a
-unique index here, and there are no indexes on the snapshot.
+Postgres). Refreshing is always a full recompute (there is no incremental
+refresh — Postgres has none either); `CONCURRENTLY` enforces the unique-index +
+populated prerequisites but applies the same full recompute rather than a true
+diff-based concurrent swap.
 
 ## User-defined functions (`CREATE FUNCTION`)
 
@@ -2002,10 +2016,12 @@ faithful "not supported" error). `jsonb_path_query` is set-returning in Postgres
 here it yields the **first** match in a scalar `SELECT` (use `jsonb_path_query_array`
 for the full set).
 
-Two caveats. `<@` (contained-by) is supported only as `'<const>' <@ field`
-(equivalently `field @> '<const>'`) — the `field <@ '<const>'` direction ("this
-field is a subset of a constant") is a constraint on the stored shape and can't
-be pushed down as a filter. And because sqlglot reads a bare `->` inside a function
+One caveat. Both `<@` directions work: `'<const>' <@ field` (equivalently
+`field @> '<const>'`) pushes down to a Mongo filter, while `field <@ '<const>'`
+("this stored value is a subset of the constant") and `'<const>' @> field` run as
+a collection scan with a per-row containment check (they can't lower to a filter).
+`<@` / `@>` also work in a scalar `SELECT` (`'{"a":1}'::jsonb <@ '{"a":1,"b":2}'::jsonb`
+→ `t`). And because sqlglot reads a bare `->` inside a function
 call as a lambda arrow, a *navigated function argument* must be parenthesised
 (`jsonb_array_length((data->'tags'))`) or use the `#>` form
 (`jsonb_array_length(data #> '{tags}')`); bare `->` in `WHERE`/projection is
@@ -2118,9 +2134,10 @@ target-qualified columns (`n`, `t.n`) resolve to the existing row, and
 `EXCLUDED.<col>` to the value that would have been inserted; an optional `WHERE`
 gates the update. The command tag counts rows inserted *or* updated — skipped
 rows don't count — and a `RETURNING` clause projects the inserted and updated
-rows (not the skipped ones). `ON CONFLICT ON CONSTRAINT <name>` is not supported
-(SecantusDB has no named-constraint registry — name the column(s) instead), and
-`DO UPDATE` requires an explicit conflict target.
+rows (not the skipped ones). `ON CONFLICT ON CONSTRAINT <name>` names the arbiter
+by a declared `UNIQUE` constraint or the primary key (default name
+`<table>_pkey`); an unknown name errors. `DO UPDATE` requires an explicit conflict
+target (a column list or a constraint name).
 
 ### MERGE
 
@@ -2936,10 +2953,10 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 
 | Area | Supported | Not yet |
 |---|---|---|
-| DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | `MERGE`, `ON CONFLICT ON CONSTRAINT` |
+| DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`; target by column list or `ON CONSTRAINT <name>`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | — |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE` (incl. `WITH RECURSIVE` before a write); data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE … RETURNING …)`) | statement-level snapshot semantics; `WITH CHECK OPTION` |
-| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (`const <@ field`)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison, `field <@ const` |
+| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (both directions; `field <@ const` runs residual)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) | `GROUPING SETS` over a JOIN / with HAVING, the `GROUPING()` helper, `DISTINCT` aggregate in `HAVING` |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |

@@ -15,7 +15,7 @@ from __future__ import annotations
 import bson
 import pytest
 
-from secantus.sql import SQLError, run_sql
+from secantus.sql import run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -98,10 +98,46 @@ def test_all_keys_exist(storage, session):
     assert ids(res) == [1]
 
 
-def test_contained_by_is_not_supported(storage, session):
-    with pytest.raises(SQLError) as ei:
-        q(storage, session, "SELECT _id FROM docs WHERE data <@ '{\"a\":1}'")
-    assert ei.value.sqlstate == "0A000"
+def test_contained_by_field_lhs(storage, session):
+    # ``field <@ const`` — the stored doc is a subset of the constant. Runs as a
+    # COLLSCAN + per-row residual (it can't lower to a Mongo filter).
+    res = q(storage, session, "SELECT _id FROM docs WHERE data <@ '{\"a\":1}' ORDER BY _id")
+    assert ids(res) == [3]  # only {"a":1} is a subset of {"a":1}
+
+
+def test_contained_by_field_lhs_wider_constant(storage, session):
+    res = q(
+        storage,
+        session,
+        'SELECT _id FROM docs WHERE data <@ \'{"a":1,"b":2,"tags":["x","y"]}\' ORDER BY _id',
+    )
+    assert ids(res) == [1, 3]
+
+
+def test_contains_const_lhs_field_rhs_residual(storage, session):
+    # ``const @> field`` is the mirror of ``field <@ const`` and also runs residual.
+    res = q(
+        storage,
+        session,
+        'SELECT _id FROM docs WHERE \'{"a":1,"b":2,"tags":["x","y"]}\' @> data ORDER BY _id',
+    )
+    assert ids(res) == [1, 3]
+
+
+def test_contained_by_scalar_object(storage, session):
+    assert q(storage, session, 'SELECT \'{"a":1}\'::jsonb <@ \'{"a":1,"b":2}\'::jsonb').rows == [
+        (True,)
+    ]
+    assert q(storage, session, 'SELECT \'{"a":1}\'::jsonb @> \'{"a":1,"b":2}\'::jsonb').rows == [
+        (False,)
+    ]
+
+
+def test_contained_by_scalar_nested_and_array(storage, session):
+    assert q(
+        storage, session, 'SELECT \'{"a":{"b":1}}\'::jsonb <@ \'{"a":{"b":1,"c":2}}\'::jsonb'
+    ).rows == [(True,)]
+    assert q(storage, session, "SELECT '[1,2]'::jsonb <@ '[1,2,3]'::jsonb").rows == [(True,)]
 
 
 def test_contains_combines_with_and(storage, session):
