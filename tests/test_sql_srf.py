@@ -219,3 +219,47 @@ def test_generate_series_timestamp_column_type():
         "timestamp '2024-01-02', interval '1 day')"
     )
     assert [c.type_tag for c in r.columns] == ["timestamp"]
+
+
+# --------------------------------------------------------------------------- #
+# regexp_matches as a set-returning function (#152)
+# --------------------------------------------------------------------------- #
+
+
+def test_regexp_matches_global_one_row_per_match():
+    assert _rows("SELECT * FROM regexp_matches('foobarbaz', 'ba.', 'g') AS m") == [
+        (["bar"],),
+        (["baz"],),
+    ]
+
+
+def test_regexp_matches_capture_groups():
+    assert _rows("SELECT * FROM regexp_matches('a1b2', '([a-z])([0-9])', 'g') AS m") == [
+        (["a", "1"],),
+        (["b", "2"],),
+    ]
+
+
+def test_regexp_matches_no_global_first_match_only():
+    assert _rows("SELECT regexp_matches('a1b2c3', '([a-z])([0-9])')") == [(["a", "1"],)]
+
+
+def test_regexp_matches_select_list_form():
+    assert _rows("SELECT regexp_matches('xxaxxbxx', 'x(a|b)x', 'g')") == [(["a"],), (["b"],)]
+
+
+def test_regexp_matches_no_match_no_rows():
+    assert _rows("SELECT * FROM regexp_matches('abc', 'z', 'g') AS m") == []
+
+
+def test_regexp_matches_case_insensitive_flag():
+    assert _rows("SELECT * FROM regexp_matches('AbaBA', 'a', 'gi') AS m") == [
+        (["A"],),
+        (["a"],),
+        (["A"],),
+    ]
+
+
+def test_regexp_matches_column_type_is_text_array():
+    r = _run("SELECT * FROM regexp_matches('ab', '(a)(b)') AS m")
+    assert [c.type_tag for c in r.columns] == ["text[]"]

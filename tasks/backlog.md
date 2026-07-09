@@ -1536,9 +1536,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `regexp_count(str, pat)`, and `regexp_matches(str, pat [,flags])` — all in `scalar.py`
   (`_SCALAR_FUNC_NODES` for the dedicated nodes `RegexpReplace`/`SplitPart`/`Translate`/`RegexpCount`;
   `regexp_matches` is `Anonymous` → `_call_func`). Output types wired in `planner._infer_scalar_tag`
-  (text / int4). **Limitation:** `regexp_matches` is genuinely set-returning in Postgres (one row per
-  match); in our scalar context it returns only the **first** match's capture groups as a `text[]` (whole
-  match if no groups), NULL when there is no match — sufficient for the common non-`g` use.
+  (text / int4). **`regexp_matches` as a true SRF landed (#152, b190):** it's registered in `srf.py`'s
+  `_NAMED_SRFS`, so `SELECT regexp_matches(…)` and `FROM regexp_matches(…) AS m` emit **one row per
+  match** (each a `text[]` of the capture groups, or the whole match when there are none); the `g` flag
+  yields every match, without it at most the first, and no match / NULL input yields no rows. The scalar
+  path (`scalar.py`) is retained for a `regexp_matches` nested inside a larger expression or appearing
+  alongside other projections (multi-target-list), where it still returns the first match's `text[]`.
 - [ ] **Math / numeric scalar functions landed** (b130): `trunc(x [,n])` (truncate toward zero;
   numeric), `sqrt` / `cbrt` (real cube root via `copysign` so negatives work), `sign` (−1/0/1,
   operand kind preserved), `ln`, `log(x)` (base-10 in PG) / `log(b, x)` / `log10` (base-10/2 use the

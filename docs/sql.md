@@ -1088,12 +1088,18 @@ SELECT generate_series(timestamp '2024-01-01', timestamp '2024-01-02', interval 
 ```
 
 The base-less `FROM` form also covers `unnest(ARRAY[…])`, `jsonb_array_elements`,
-`jsonb_object_keys`, and `regexp_split_to_table`:
+`jsonb_object_keys`, `regexp_split_to_table`, and `regexp_matches`:
 
 ```sql
 SELECT * FROM unnest(ARRAY[10, 20, 30]) AS x;         -- 10,20,30
 SELECT * FROM regexp_split_to_table('a,b,c', ',') AS p;
 SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb) AS e;
+
+-- regexp_matches is set-returning: one row per match, each a text[] of the
+-- capture groups (or the whole match when there are none). The 'g' flag emits
+-- every match; without it, at most the first.
+SELECT * FROM regexp_matches('foobarbaz', 'ba.', 'g') AS m;   -- {bar}, {baz}
+SELECT regexp_matches('a1b2', '([a-z])([0-9])', 'g');         -- {a,1}, {b,2}
 ```
 
 A single-column function's column takes the table alias — `generate_series(1,5) AS g`
