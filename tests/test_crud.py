@@ -593,6 +593,40 @@ def test_aggregate_project_with_computed_field(coll) -> None:
     assert out == [{"sum": 7}]
 
 
+def test_aggregate_date_from_parts(coll) -> None:
+    coll.insert_one({"_id": 1})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "basic": {"$dateFromParts": {"year": 2023, "month": 6, "day": 15}},
+                        "rollover": {"$dateFromParts": {"year": 2023, "month": 13, "day": 1}},
+                        "tz": {
+                            "$dateFromParts": {
+                                "year": 2023,
+                                "month": 6,
+                                "day": 15,
+                                "hour": 12,
+                                "timezone": "+05:00",
+                            }
+                        },
+                    }
+                }
+            ]
+        )
+    )
+    # pymongo returns naive UTC datetimes by default.
+    assert out == [
+        {
+            "basic": dt.datetime(2023, 6, 15),
+            "rollover": dt.datetime(2024, 1, 1),
+            "tz": dt.datetime(2023, 6, 15, 7, 0),  # 12:00 +05:00 -> 07:00 UTC
+        }
+    ]
+
+
 def test_aggregate_date_extractor_timezone(coll) -> None:
     # 2023-01-15T16:30Z: UTC hour 16; America/New_York is EST (-05:00) -> hour 11,
     # still the 15th. The {date, timezone} object form is mongod's timezone-aware

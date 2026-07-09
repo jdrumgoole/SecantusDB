@@ -19,6 +19,28 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$dateFromParts` expression (both servers)
+
+Both servers now build dates from calendar components with `$dateFromParts`:
+`{$dateFromParts: {year, month, day, hour, minute, second, millisecond, timezone}}`.
+Components default to month/day = 1 and time = 0, and out-of-range values **roll
+over** exactly as mongod does — month 13 → next January, month 0 → previous
+December, day 0 → last day of the previous month, hour 25 → next day, millisecond
+1500 → +1.5 s. `year` is required and must be 1–9999. A `timezone` interprets the
+components as local time in that zone (local→instant). Any null component yields
+null. Matched to real `mongod` 6.0 via a three-way probe (mongod vs Rust vs Python
+server): all values, rollovers, and the validation error codes (`40515` non-integral
+component, `40516` missing year, `40523` year out of range) confirmed.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$dateFromParts` — month-carry + day/time
+  `timedelta` arithmetic for the rollover. The Python server also resolves *named*
+  IANA timezones (via `zoneinfo`); the Rust server computes fixed-offset zones
+  natively and defers named zones to the Python oracle (the local→instant direction
+  is DST-ambiguous, as with `$dateFromString`). The ISO-week form
+  (`isoWeekYear` / `isoWeek` / `isoDayOfWeek`) is not yet supported.
+
 ### `$top` / `$bottom` / `$topN` / `$bottomN` accumulators (both servers)
 
 Both servers now support MongoDB 5.2's sort-key `$group` (and `$setWindowFields`)
