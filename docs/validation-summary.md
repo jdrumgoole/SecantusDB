@@ -69,7 +69,9 @@ These tests fail for documented reasons that have no SecantusDB-side fix (driver
 Each gauge ships its own detailed report — per-category breakdown, named failures for triage, and the gauge's own setup notes. Open the one whose pass / fail counts you want to dig into:
 
 - [pymongo](./validation-report.md)
+- [pymongo async](./validation-report-pymongo-async.md)
 - [mongo-java-driver](./validation-report-java.md)
+- [mongo-kotlin-driver](./validation-report-kotlin.md)
 - [mongo-go-driver](./validation-report-go.md)
 - [mongo-node-driver](./validation-report-node.md)
 - [mongo-ruby-driver](./validation-report-ruby.md)

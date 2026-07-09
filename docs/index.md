@@ -88,9 +88,12 @@ The conformance evidence: the official test suites for **pymongo**,
 **mongo-ruby-driver**, **mongo-rust-driver**, and the **PHP**
 library + extension all run against
 SecantusDB **unmodified** — see the
-[pymongo](validation-report.md), [Go-driver](validation-report-go.md),
+[pymongo](validation-report.md),
+[pymongo-async](validation-report-pymongo-async.md),
+[Go-driver](validation-report-go.md),
 [Node-driver](validation-report-node.md),
 [Java-driver](validation-report-java.md),
+[Kotlin-driver](validation-report-kotlin.md),
 [Ruby-driver](validation-report-ruby.md),
 [Rust-driver](validation-report-rust.md),
 [PHP-library](validation-report-php-lib.md),
@@ -219,9 +222,11 @@ compatibility
 benchmark
 validation-summary
 validation-report
+validation-report-pymongo-async
 validation-report-go
 validation-report-node
 validation-report-java
+validation-report-kotlin
 validation-report-ruby
 validation-report-rust
 validation-report-php-lib
