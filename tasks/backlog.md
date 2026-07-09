@@ -1548,8 +1548,10 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   #166, b201):** `_having_to_match` takes the `names` / `reductions` allocators and, for a `count`/`sum`/
   `avg(DISTINCT …)` term, calls `_register_distinct_agg` (reusing the SELECT-list registration when the
   same aggregate already appears there) — the reduction `$addFields` runs before the HAVING `$match`, so
-  the match references the reduced field. **Still `0A000`:** DISTINCT aggregate inside `HAVING` over a
-  JOIN (`_join_having_to_match` doesn't yet thread the reduction allocators).
+  the match references the reduced field. **JOIN DISTINCT-in-HAVING landed (#167, b202):**
+  `_join_having_to_match` now takes the same `names` / `reductions` allocators (in scope at both join
+  call sites) and registers a distinct set the same way, so `count(DISTINCT b.col)` in a JOIN+GROUP
+  HAVING works too.
   `string_agg` + the boolean aggregates landed in b121: `bool_and`/`bool_or` (registered in
   `_AGG_CLASSES`) lower to `$min`/`$max` over booleans, `every(x)` is recognised as `bool_and` in
   `_aggregate_of`; `string_agg(expr, sep)` (`exp.GroupConcat`) lowers to a `$push` accumulator plus a
@@ -2813,10 +2815,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   written, a leading plain `GROUP BY a, …` as a prefix in every set) are each compiled to a
   `$group`+`$project` branch (`_grouping_set_branch`; group columns absent from a set project as
   `{$literal: None}` so every branch shares one output shape) and combined with `$unionWith`
-  (`_plan_grouping_sets_select`, routed in `_plan_pipeline_select`). **Limitations:** single-table only
-  (GROUPING SETS over a JOIN → `feature_not_supported`); no `HAVING`, correlated WHERE, or DISTINCT
-  aggregate with GROUPING SETS; no window over GROUPING SETS; the `GROUPING()` helper function isn't
-  modeled.
+  (`_plan_grouping_sets_select`, routed in `_plan_pipeline_select`). **`GROUPING()` helper landed (#167,
+  b202):** `GROUPING(a, …)` (parsed as `exp.Grouping`) projects a per-branch bitmask — 1 for each
+  argument rolled up (absent from that branch's grouping set), 0 otherwise, MSB first
+  (`_grouping_args` / `_grouping_bitmask`, emitted in `_grouping_set_branch` and, always 0, in the plain
+  `_plan_group_select`). **Limitations:** single-table only (GROUPING SETS over a JOIN →
+  `feature_not_supported`); no `HAVING`, correlated WHERE, or DISTINCT aggregate with GROUPING SETS; no
+  window over GROUPING SETS.
+- [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
+  (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
+  routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`
+  output field and evaluates the wrapping expression per grouped row via the evaluated executor (the same
+  machinery window functions use). A bare aggregate stays on the fast `$group` path. **Still `0A000`:** a
+  computed GROUP BY key (`GROUP BY lower(name)`) — the group `_id` and SELECT resolution key off bare
+  column names.
 - [ ] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
   (`$unset`s the field on every doc), `RENAME COLUMN` (`$rename`s a non-PK field; a PK rename keeps
   the `_id` field and only changes the SQL name), `RENAME TO` (renames the table *and* moves the
