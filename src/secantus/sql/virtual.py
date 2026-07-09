@@ -246,15 +246,17 @@ def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> l
 
 def _info_views(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     getter = getattr(catalog, "get_view", None)
+    co_getter = getattr(catalog, "get_view_check_option", None)
     rows: list[dict] = []
     for name in _view_names(db, catalog):
+        check = co_getter(db, name) if co_getter is not None else None
         rows.append(
             {
                 "table_catalog": db,
                 "table_schema": "public",
                 "table_name": name,
                 "view_definition": getter(db, name) if getter is not None else None,
-                "check_option": "NONE",
+                "check_option": check or "NONE",
                 "is_updatable": "NO",
                 "is_insertable_into": "NO",
             }

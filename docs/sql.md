@@ -1356,7 +1356,25 @@ one over a single base table (no join / set-op), with no `DISTINCT` / `GROUP BY`
 The DML rewrites onto the base table, and the view's `WHERE` bounds which rows a
 statement may touch. A view that isn't automatically-updatable (aggregate, join,
 aliased/computed columns) raises `0A000` — Postgres would require an `INSTEAD OF`
-trigger, which isn't modeled. `WITH CHECK OPTION` isn't enforced.
+trigger, which isn't modeled.
+
+`WITH [LOCAL | CASCADED] CHECK OPTION` **is** enforced: an `INSERT` or `UPDATE`
+through the view whose resulting row would not satisfy the view's `WHERE` (i.e.
+would be invisible through the view) is rejected with SQLSTATE `44000`. As with
+row visibility, a predicate that is not TRUE — FALSE *or* NULL — violates. A
+`DELETE` is unaffected (it can't create a row). The option is reflected in
+`information_schema.views.check_option` (`LOCAL` / `CASCADED` / `NONE`).
+
+```sql
+CREATE VIEW active_pos AS SELECT * FROM t WHERE n > 0 WITH CHECK OPTION;
+INSERT INTO active_pos VALUES (1, -5);   -- ERROR: 44000 (would be invisible)
+UPDATE active_pos SET n = -1 WHERE id = 2;  -- ERROR: 44000
+```
+
+The check is enforced one level deep — a `CASCADED` option over a view that is
+itself defined over another `CHECK OPTION` view doesn't cascade the inner view's
+condition (rare; auto-updatable views over a plain base table are the common
+case).
 
 ### Materialized views
 

@@ -210,6 +210,47 @@ def test_merge_returning_action_for_delete(storage):
     assert sorted(res.rows) == [("DELETE", 1), ("INSERT", 4)]
 
 
+def test_merge_update_primary_key_rekeys(storage):
+    # A MERGE UPDATE that changes the PK column re-keys the row (delete +
+    # re-insert) rather than leaking an immutable-_id error (#164).
+    load_src(storage, [(2, "e", 20)])
+    storage.q("MERGE INTO tgt t USING src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 99")
+    assert tgt(storage) == [(1, "e", 10), (3, "w", 30), (99, "e", 20)]
+
+
+def test_merge_update_primary_key_collision_raises(storage):
+    load_src(storage, [(2, "e", 20)])
+    with pytest.raises(SQLError) as ei:
+        storage.q(
+            "MERGE INTO tgt t USING src s ON t.id = s.id "
+            "WHEN MATCHED THEN UPDATE SET id = 1"  # collides with existing id 1
+        )
+    assert ei.value.sqlstate == "23505"
+
+
+def test_merge_update_referenced_pk_restrict(storage):
+    # A child row referencing the target's PK blocks a re-key (RESTRICT, 23503).
+    storage.q("CREATE TABLE chld (cid bigint primary key, ref bigint references tgt(id))")
+    storage.q("INSERT INTO chld (cid, ref) VALUES (100, 2)")
+    load_src(storage, [(2, "e", 20)])
+    with pytest.raises(SQLError) as ei:
+        storage.q(
+            "MERGE INTO tgt t USING src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 99"
+        )
+    assert ei.value.sqlstate == "23503"
+
+
+def test_merge_update_referenced_pk_cascade(storage):
+    storage.q(
+        "CREATE TABLE chld (cid bigint primary key, "
+        "ref bigint references tgt(id) ON UPDATE CASCADE)"
+    )
+    storage.q("INSERT INTO chld (cid, ref) VALUES (100, 2)")
+    load_src(storage, [(2, "e", 20)])
+    storage.q("MERGE INTO tgt t USING src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = 99")
+    assert storage.q("SELECT ref FROM chld").rows == [(99,)]
+
+
 def test_merge_returning_source_column(storage):
     load_src(storage, [(2, "e", 200), (4, "n", 40)])
     res = storage.q(
