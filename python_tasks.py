@@ -30,6 +30,17 @@ from invoke.tasks import task
 # with the `ruff==` pin in pyproject.toml's [project.optional-dependencies] dev.
 _RUFF = "ruff@0.15.20"
 
+# `docs` builds WT-free via `uv run --no-project` (autodoc imports `secantus`
+# from src/ with `wiredtiger` mocked — see docs/conf.py), so it needs no project
+# build and works in a bare git worktree. This overlay provides the Sphinx
+# toolchain plus secantus's pure-Python runtime deps that autodoc must import;
+# keep it in sync with pyproject's [project] dependencies (minus the compiled
+# wiredtiger) and the docs entries of the dev extra.
+_DOCS_DEPS = (
+    "--with sphinx --with myst-parser --with furo "
+    "--with pymongo --with shapely --with s2sphere --with python-dateutil"
+)
+
 # The known local-only failing test: a feature worktree's Rust crates link the
 # /tmp WiredTiger build while the project wheel links its own, so this
 # cross-server restore isn't byte-compatible locally (green in CI). Deselected
@@ -112,16 +123,18 @@ def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
 
 @task
 def docs(c: Context, builder: str = "html", clean: bool = False) -> None:
-    # --no-sync skips uv's project rebuild check: docs only need the Python
-    # source for autodoc, never a fresh WiredTiger C-extension build. Falling
-    # through to `uv sync` here would invoke scikit-build-core's isolated
-    # build env, which is sensitive to host cmake/swig setup and unnecessary
-    # for a docs build.
+    # Build WT-free with `--no-project`: autodoc imports `secantus` from src/
+    # (conf.py adds it to sys.path) with the compiled `wiredtiger` mocked
+    # (conf.py autodoc_mock_imports), so no scikit-build-core / WiredTiger
+    # compile runs. This is what lets `invoke docs` work in a bare git worktree
+    # that never ran a project build. `_DOCS_DEPS` overlays the doc toolchain
+    # plus secantus's pure-Python runtime deps.
     if clean:
         c.run("rm -rf docs/_build", pty=True)
     qb = shlex.quote(builder)
     c.run(
-        f"uv run --no-sync sphinx-build -W --keep-going -b {qb} docs docs/_build/{qb}",
+        f"uv run --no-project {_DOCS_DEPS} "
+        f"sphinx-build -W --keep-going -b {qb} docs docs/_build/{qb}",
         pty=True,
     )
 
