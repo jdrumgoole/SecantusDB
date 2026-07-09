@@ -795,6 +795,228 @@ def _dfp_int(name: str, v: Any) -> int:
     )
 
 
+def _dfp_components(
+    arg: Mapping[str, Any], ctx: _Ctx, spec: tuple[tuple[str, int | None], ...]
+) -> dict[str, int] | None:
+    """Evaluate the named `$dateFromParts` components, applying defaults and
+    mongod's null-propagation (any null component → ``None``) and integral
+    validation (``_dfp_int``)."""
+    parts: dict[str, int] = {}
+    for name, default in spec:
+        if name in arg:
+            v = _eval(arg[name], ctx)
+            if v is None:
+                return None  # null component -> null result
+            parts[name] = _dfp_int(name, v)
+        else:
+            parts[name] = default  # type: ignore[assignment]
+    return parts
+
+
+def _dfp_calendar(arg: Mapping[str, Any], ctx: _Ctx) -> _dt.datetime | None:
+    """Calendar (year/month/day) form of ``$dateFromParts`` — month carry, then
+    day/time as a `timedelta` so out-of-range components roll over."""
+    parts = _dfp_components(
+        arg,
+        ctx,
+        (
+            ("year", None),
+            ("month", 1),
+            ("day", 1),
+            ("hour", 0),
+            ("minute", 0),
+            ("second", 0),
+            ("millisecond", 0),
+        ),
+    )
+    if parts is None:
+        return None
+    year = parts["year"]
+    if not (1 <= year <= 9999):
+        raise ExpressionError(f"'year' must be in the range 1 to 9999, found {year}", code=40523)
+    total_months = year * 12 + (parts["month"] - 1)
+    base_year, base_month0 = divmod(total_months, 12)
+    if not (1 <= base_year <= 9999):
+        raise ExpressionError(
+            f"'year' must be in the range 1 to 9999, found {base_year}", code=40523
+        )
+    return _dt.datetime(base_year, base_month0 + 1, 1) + _dt.timedelta(
+        days=parts["day"] - 1,
+        hours=parts["hour"],
+        minutes=parts["minute"],
+        seconds=parts["second"],
+        milliseconds=parts["millisecond"],
+    )
+
+
+def _dfp_iso(arg: Mapping[str, Any], ctx: _Ctx) -> _dt.datetime | None:
+    """ISO-week (isoWeekYear/isoWeek/isoDayOfWeek) form of ``$dateFromParts``:
+    start at the Monday of ISO week 1, then add (week-1) weeks + (day-1) days +
+    the time components as a `timedelta` (so `isoWeek` 53 rolls into the next
+    ISO year, exactly as mongod does)."""
+    if "isoWeekYear" not in arg:
+        raise ExpressionError(
+            "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
+            code=40516,
+        )
+    parts = _dfp_components(
+        arg,
+        ctx,
+        (
+            ("isoWeekYear", None),
+            ("isoWeek", 1),
+            ("isoDayOfWeek", 1),
+            ("hour", 0),
+            ("minute", 0),
+            ("second", 0),
+            ("millisecond", 0),
+        ),
+    )
+    if parts is None:
+        return None
+    try:
+        base = _dt.datetime.fromisocalendar(parts["isoWeekYear"], 1, 1)
+    except ValueError as exc:
+        raise ExpressionError(
+            f"'isoWeekYear' must be in the range 1 to 9999, found {parts['isoWeekYear']}",
+            code=40523,
+        ) from exc
+    return base + _dt.timedelta(
+        weeks=parts["isoWeek"] - 1,
+        days=parts["isoDayOfWeek"] - 1,
+        hours=parts["hour"],
+        minutes=parts["minute"],
+        seconds=parts["second"],
+        milliseconds=parts["millisecond"],
+    )
+
+
+def _op_ts_second(arg: Any, ctx: _Ctx) -> Any:
+    """``$tsSecond``: the seconds field of a BSON Timestamp (as a long). Null /
+    missing → null; a non-timestamp raises ``Location5687301``."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if not isinstance(v, bson.Timestamp):
+        raise ExpressionError("Argument to $tsSecond must be a timestamp", code=5687301)
+    return Int64(v.time)
+
+
+def _op_ts_increment(arg: Any, ctx: _Ctx) -> Any:
+    """``$tsIncrement``: the increment (ordinal) field of a BSON Timestamp (as a
+    long). Null / missing → null; a non-timestamp raises ``Location5687302``."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if not isinstance(v, bson.Timestamp):
+        raise ExpressionError("Argument to $tsIncrement must be a timestamp", code=5687302)
+    return Int64(v.inc)
+
+
+def _type_name(v: Any) -> str:
+    """The BSON type string mongod's ``$type`` reports."""
+    from bson import Binary, MaxKey, MinKey, ObjectId, Regex, Timestamp
+
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, Int64):
+        return "long"
+    if isinstance(v, int):
+        return "int" if -(2**31) <= v < 2**31 else "long"
+    if isinstance(v, float):
+        return "double"
+    if isinstance(v, Decimal128):
+        return "decimal"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, (bytes, Binary)):
+        return "binData"
+    if isinstance(v, ObjectId):
+        return "objectId"
+    if isinstance(v, _dt.datetime):
+        return "date"
+    if isinstance(v, Timestamp):
+        return "timestamp"
+    if isinstance(v, Regex):
+        return "regex"
+    if isinstance(v, MinKey):
+        return "minKey"
+    if isinstance(v, MaxKey):
+        return "maxKey"
+    if isinstance(v, list):
+        return "array"
+    return "object"
+
+
+_TYPE_MISSING = object()
+
+
+def _op_type(arg: Any, ctx: _Ctx) -> Any:
+    """``$type``: the BSON type string of the argument. A field path that doesn't
+    exist yields ``"missing"`` (mongod distinguishes an absent field from an
+    explicit null)."""
+    if (
+        isinstance(arg, str)
+        and arg.startswith("$")
+        and not arg.startswith("$$")
+        and get_path(dict(ctx.doc), arg[1:], default=_TYPE_MISSING) is _TYPE_MISSING
+    ):
+        return "missing"
+    return _type_name(_eval(arg, ctx))
+
+
+def _op_is_number(arg: Any, ctx: _Ctx) -> bool:
+    """``$isNumber``: true for int / long / double / decimal (not bool)."""
+    v = _eval(arg, ctx)
+    return isinstance(v, (int, float, Decimal128)) and not isinstance(v, bool)
+
+
+def _op_is_array(arg: Any, ctx: _Ctx) -> bool:
+    """``$isArray``: true iff the argument is an array."""
+    return isinstance(_eval(arg, ctx), list)
+
+
+def _op_strcasecmp(arg: Any, ctx: _Ctx) -> int:
+    """``$strcasecmp``: case-insensitive comparison of two strings → -1 / 0 / 1.
+    A null / missing operand is treated as the empty string."""
+    vals = _eval_args(arg, ctx)
+    if len(vals) != 2:
+        raise ExpressionError("$strcasecmp requires two arguments")
+    a, b = ("" if vals[0] is None else vals[0]), ("" if vals[1] is None else vals[1])
+    if not isinstance(a, str) or not isinstance(b, str):
+        raise ExpressionError("$strcasecmp requires string operands")
+    au, bu = a.upper(), b.upper()
+    return -1 if au < bu else (1 if au > bu else 0)
+
+
+def _op_replace(arg: Any, ctx: _Ctx, *, count: int) -> Any:
+    """``$replaceOne`` (count 1) / ``$replaceAll`` (count -1): replace occurrence(s)
+    of ``find`` in ``input`` with ``replacement``. Any null input/find/replacement
+    → null; a non-string one raises ``Location51745``."""
+    op = "$replaceOne" if count == 1 else "$replaceAll"
+    if not isinstance(arg, Mapping) or not {"input", "find", "replacement"} <= set(arg):
+        raise ExpressionError(f"{op} requires 'input', 'find' and 'replacement'")
+    inp = _eval(arg["input"], ctx)
+    find = _eval(arg["find"], ctx)
+    rep = _eval(arg["replacement"], ctx)
+    if inp is None or find is None or rep is None:
+        return None
+    for v, name in ((inp, "input"), (find, "find"), (rep, "replacement")):
+        if not isinstance(v, str):
+            raise ExpressionError(f"{op} requires that '{name}' be a string", code=51745)
+    return inp.replace(find, rep) if count == -1 else inp.replace(find, rep, 1)
+
+
+def _op_replace_one(arg: Any, ctx: _Ctx) -> Any:
+    return _op_replace(arg, ctx, count=1)
+
+
+def _op_replace_all(arg: Any, ctx: _Ctx) -> Any:
+    return _op_replace(arg, ctx, count=-1)
+
+
 def _op_date_from_parts(arg: Any, ctx: _Ctx) -> Any:
     """``$dateFromParts``: build a date from calendar components. Components default
     to month/day = 1 and hour/minute/second/millisecond = 0; out-of-range values
@@ -803,53 +1025,25 @@ def _op_date_from_parts(arg: Any, ctx: _Ctx) -> Any:
     required (1-9999); a non-integral component is ``Location40515``, a missing
     ``year`` is ``Location40516``, an out-of-range ``year`` is ``Location40523``.
     A ``timezone`` interprets the components as local time in that zone
-    (local->instant). Verified against mongod 6.0 via a three-way probe. The
-    ISO-week form (``isoWeekYear`` / ``isoWeek`` / ``isoDayOfWeek``) is not yet
-    supported."""
+    (local->instant). Two forms: the calendar form above and the **ISO-week** form
+    (``isoWeekYear`` + optional ``isoWeek`` / ``isoDayOfWeek``, both defaulting to
+    1). Verified against mongod 6.0 via a three-way probe."""
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateFromParts requires a document spec")
-    if "isoWeekYear" in arg or "isoWeek" in arg or "isoDayOfWeek" in arg:
-        raise ExpressionError("$dateFromParts isoWeekYear form is not supported")
-    if "year" not in arg:
-        raise ExpressionError(
-            "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
-            code=40516,
-        )
-    parts: dict[str, int] = {}
-    for name, default in (
-        ("year", None),
-        ("month", 1),
-        ("day", 1),
-        ("hour", 0),
-        ("minute", 0),
-        ("second", 0),
-        ("millisecond", 0),
-    ):
-        if name in arg:
-            v = _eval(arg[name], ctx)
-            if v is None:
-                return None  # a null component -> null result
-            parts[name] = _dfp_int(name, v)
-        else:
-            parts[name] = default  # type: ignore[assignment]
-    year = parts["year"]
-    if not (1 <= year <= 9999):
-        raise ExpressionError(f"'year' must be in the range 1 to 9999, found {year}", code=40523)
-    # Month carry, then day/time as a timedelta from the first of the month — so
-    # out-of-range components roll over across month / year boundaries.
-    total_months = year * 12 + (parts["month"] - 1)
-    base_year, base_month0 = divmod(total_months, 12)
-    if not (1 <= base_year <= 9999):
-        raise ExpressionError(
-            f"'year' must be in the range 1 to 9999, found {base_year}", code=40523
-        )
-    result = _dt.datetime(base_year, base_month0 + 1, 1) + _dt.timedelta(
-        days=parts["day"] - 1,
-        hours=parts["hour"],
-        minutes=parts["minute"],
-        seconds=parts["second"],
-        milliseconds=parts["millisecond"],
-    )
+    is_iso = "isoWeekYear" in arg or "isoWeek" in arg or "isoDayOfWeek" in arg
+    if is_iso:
+        result = _dfp_iso(arg, ctx)
+        if result is None:
+            return None
+    else:
+        if "year" not in arg:
+            raise ExpressionError(
+                "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
+                code=40516,
+            )
+        result = _dfp_calendar(arg, ctx)
+        if result is None:
+            return None
     tz = _resolve_timezone(arg.get("timezone"))
     if tz is not None:
         # The components are local time in `tz`; convert to the UTC instant.
@@ -1884,6 +2078,14 @@ _OPS = {
     "$dateTrunc": _op_date_trunc,
     "$dateToParts": _op_date_to_parts,
     "$dateFromParts": _op_date_from_parts,
+    "$tsSecond": _op_ts_second,
+    "$tsIncrement": _op_ts_increment,
+    "$type": _op_type,
+    "$isNumber": _op_is_number,
+    "$isArray": _op_is_array,
+    "$strcasecmp": _op_strcasecmp,
+    "$replaceOne": _op_replace_one,
+    "$replaceAll": _op_replace_all,
     "$split": _op_split,
     "$trim": _op_trim,
     "$ltrim": _op_ltrim,

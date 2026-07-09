@@ -19,6 +19,34 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Batch of aggregation expression operators (both servers)
+
+Nine more aggregation expression operators land on both servers, all matched to
+real `mongod` 6.0 via a three-way probe (mongod vs Rust vs Python server):
+
+- **`$tsSecond` / `$tsIncrement`** — the seconds / increment fields of a BSON
+  Timestamp (as longs); null/missing → null, non-timestamp → error.
+- **`$dateFromParts` ISO-week form** — `{isoWeekYear, isoWeek, isoDayOfWeek}` (the
+  calendar form shipped earlier); starts at the Monday of ISO week 1 and rolls over
+  (`isoWeek` 53 → next ISO year).
+- **`$type`** — the BSON type string of a value, with `"missing"` for an absent
+  field (distinct from `"null"`).
+- **`$isNumber`** (int/long/double/decimal, not bool) and **`$isArray`**.
+- **`$strcasecmp`** — case-insensitive string comparison (-1/0/1; null → empty
+  string).
+- **`$replaceOne` / `$replaceAll`** — substring replacement; any null
+  input/find/replacement → null, a non-string one → error.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: the operators above. `$strcasecmp` and
+  `$replaceOne`/`$replaceAll` follow the existing string-op contract (Rust computes
+  ASCII and defers non-ASCII case mapping to the Python oracle); the ISO-week form
+  uses `chrono`'s ISO calendar. The Python server reproduces mongod's error codes
+  exactly (`5687301`/`5687302`, `40515`/`40516`/`40523`, `51745`); the Rust server
+  errors on the same inputs but with a generic code (its core defers error-raising —
+  documented gap, `tasks/backlog.md` §7.5).
+
 ### `$dateFromParts` expression (both servers)
 
 Both servers now build dates from calendar components with `$dateFromParts`:

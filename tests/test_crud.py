@@ -593,6 +593,49 @@ def test_aggregate_project_with_computed_field(coll) -> None:
     assert out == [{"sum": 7}]
 
 
+def test_aggregate_new_expression_operators(coll) -> None:
+    from bson import Timestamp
+
+    coll.insert_one({"_id": 1, "ts": Timestamp(1700000000, 7), "n": 5, "arr": [1], "s": "Hello"})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "tsSec": {"$tsSecond": "$ts"},
+                        "tsInc": {"$tsIncrement": "$ts"},
+                        "type_n": {"$type": "$n"},
+                        "type_miss": {"$type": "$nope"},
+                        "isNum": {"$isNumber": "$n"},
+                        "isArr": {"$isArray": "$arr"},
+                        "scc": {"$strcasecmp": ["$s", "HELLO"]},
+                        "rep": {
+                            "$replaceAll": {"input": "abcabc", "find": "bc", "replacement": "X"}
+                        },
+                        "iso": {
+                            "$dateFromParts": {"isoWeekYear": 2023, "isoWeek": 5, "isoDayOfWeek": 3}
+                        },
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [
+        {
+            "tsSec": 1700000000,
+            "tsInc": 7,
+            "type_n": "int",
+            "type_miss": "missing",
+            "isNum": True,
+            "isArr": True,
+            "scc": 0,
+            "rep": "aXaX",
+            "iso": dt.datetime(2023, 2, 1),
+        }
+    ]
+
+
 def test_aggregate_date_from_parts(coll) -> None:
     coll.insert_one({"_id": 1})
     out = list(
