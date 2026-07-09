@@ -1494,8 +1494,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   via a COLLSCAN + residual predicate — `_where_has_jsonb_contained_predicate` (shape-based: only `field @> const`
   and `const <@ field` keep the `_jsonb_contains_filter` pushdown) routes them through `where_needs_per_row`, and
   `scalar._eval_jsonb_op` / `_jsonb_containment` implement Postgres object/array/scalar containment (JSON-text
-  operands are `json.loads`-decoded first). **Gaps:** `jsonb_each` (key+value record SRF) and the `jsonb_*_text`
-  family aren't modeled. **Parser quirk:** sqlglot reads
+  operands are `json.loads`-decoded first). **`jsonb_each` record SRFs landed (#155, b194):** `jsonb_each` /
+  `json_each` (→ `(key text, value json)`) and `jsonb_each_text` / `json_each_text` (→ `(key text, value
+  text)`, values rendered like `->>`) work in the base-less `FROM` form — two columns, `AS t(k, v)` renaming,
+  `WITH ORDINALITY`, WHERE / ORDER BY (`srf._build_record` / `_record_values`). **Still not modeled:** the
+  lateral-join form `FROM t, jsonb_each(t.doc)` (needs a `$objectToArray` + `$unwind` stage in the join
+  planner — `_unnest_join_stage` only handles array unnest) and the base-less `SELECT jsonb_each(x)` composite
+  form. **Parser quirk:** sqlglot reads
   a bare `f(a->'k')` arrow as a lambda, so a navigated *function argument* must be parenthesised
   (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
 - [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
@@ -2178,9 +2183,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   matched (`source_matched` id-set). The apply helpers return `(count, image)` — an updated row's
   post-image, an inserted row, or a deleted row's pre-image — and `RETURNING` projects them via
   `planner._returning_columns` + `executor._returning_result` (plain + computed target-column items).
-  **Limitations:** no multi-target-match cardinality error (Postgres raises 21000 when a source row matches
-  >1 target; SecantusDB applies to all matched, once each), an unqualified column ambiguous between target
-  and source resolves to the target, and `RETURNING` doesn't support `merge_action()` or source-column
+  **Cardinality violation enforced (#156, b195):** when a target row is matched by more than one source row
+  Postgres raises `21000` ("MERGE command cannot affect row a second time"); `_run_merge` now tracks the set
+  of source-matched target docs and raises on the second match (a single source row matching many target rows
+  is still allowed — each acted on once). **Limitations:** an unqualified column ambiguous between target and
+  source resolves to the target, and `RETURNING` doesn't support `merge_action()` or source-column
   references.
 - [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
   (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope
@@ -2230,9 +2237,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   rectangular shape, `array_length` (`exp.ArraySize`) and the Anonymous funcs share it, and the funcs are
   routed to the full scalar evaluator (added to `functions._SCALAR_EVAL_ANON`) so an `ARRAY[[…]]` argument
   evaluates. (A jagged / non-rectangular array reports lengths off its first element, as Postgres rejects
-  those at build time anyway.) **Limitations:** array functions are evaluated in Python (SELECT-list /
+  those at build time anyway.) **Array `@>` / `&&` WHERE acceleration landed (#158, b197):** `field @>
+  ARRAY[...]` and `field && ARRAY[...]` (`&&` symmetric) now lower to an *exact*, index-eligible Mongo filter
+  instead of a COLLSCAN residual — `planner._array_index_filter`: `@>` → an `$and` of multikey equalities
+  (`{$and: [{field: a}, {field: b}]}`, a lone element collapsing to `{field: a}`), `&&` → `{field: {$in:
+  [...]}}`. `_where_has_array_predicate` / `_where_has_jsonb_contained_predicate` skip these shapes so they
+  ride the pushdown (IXSCAN) path; a single-element `@>` and any `&&` light up a multikey index (`explain`
+  reports IXSCAN). **Still per-row (residual COLLSCAN):** `<@` (subset — no exact filter), a *multi*-element
+  `@>` (the planner doesn't index an `$and`-of-equalities, so it's correct but scans), `field @> ARRAY[]`
+  (empty — true for all rows, which `$all: []` can't express), field-vs-field, and jsonb / range `@>`/`<@`/
+  `&&` (unchanged). Other array functions are evaluated in Python (SELECT-list /
   INSERT-SELECT), not pushed into a Mongo
-  `$match` when used in WHERE; no element-type coercion beyond the scalar tags. The FROM-clause table form
+  `$match`; no element-type coercion beyond the scalar tags. The FROM-clause table form
   `SELECT … FROM t, unnest(t.tags) AS tag` landed in b119 (`planner._unnest_join_stage`: an `$addFields`
   exposing the array under the alias column + `$unwind`; a synthetic one-column `TableDef` registered at
   top level in the join `amap`; inner/comma/CROSS drops empty arrays, `LEFT JOIN … ON true` keeps them with
@@ -2251,10 +2267,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   UNIQUE-exclusion set uses `_hashable_id` since a subdoc `_id` is unhashable; `engine._merge_apply_not_
   matched` uses `set_path`). Reflection lists all PK columns (`virtual._index_relations` / `_pk_constraints`
   / `_foreign_keys` iterate `TableDef.pk_columns`) → SQLAlchemy `get_pk_constraint` returns both. Tests:
-  `tests/test_sql_composite_pk.py` + a pg8000/SQLAlchemy wire test. **Limitations:** updating any PK
-  column is still rejected (`0A000` — `_id` is immutable); renaming a composite-PK column via `ALTER TABLE`
-  doesn't rewrite the `_id.<name>` subdoc key (edge case); a SERIAL/identity column inside a composite PK
-  is untested.
+  `tests/test_sql_composite_pk.py` + a pg8000/SQLAlchemy wire test. **PK-column UPDATE landed (#157, b196):**
+  updating a PK column (single or a composite subfield) now re-keys the row — `plan_update` flags
+  `UpdatePlan.rekey`, and `executor._execute_update_rekey` computes each post-image (non-PK sets via
+  `apply_update`, PK sets via `set_path` since `apply_update` refuses to touch `_id`), runs the shared
+  post-image validation, checks the new `_id` is free (else `23505`), then deletes the old row and inserts
+  the re-keyed one (all deletes before any insert, so a PK swap between rows doesn't collide). Statement-atomic.
+  **Limitations:** a reflected collection's `_id` still can't be updated (`0A000` — it's the real Mongo key);
+  a PK swap needs literal targets (`SET id = <expr>` referencing the row isn't supported — a general
+  UPDATE-SET-to-expression gap); renaming a composite-PK column via `ALTER TABLE` doesn't rewrite the
+  `_id.<name>` subdoc key (edge case); a SERIAL/identity column inside a composite PK is untested.
 - [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
   passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
   in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.

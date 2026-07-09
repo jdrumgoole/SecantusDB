@@ -142,8 +142,11 @@ SELECT role FROM membership WHERE org_id = 1 AND user_id = 100;
 ```
 
 Both PK columns reflect through `pg_index` / `pg_constraint` / SQLAlchemy's
-`get_pk_constraint`. Updating any PK column is rejected (`0A000`) — the `_id` a
-row maps to is immutable, as in a real MongoDB deployment.
+`get_pk_constraint`. Updating a PK column (single or a composite subfield) re-keys
+the row — the old `_id` is deleted and the row re-inserted under the new one, with
+the same statement-atomic uniqueness check (a collision with an existing key errors
+`23505` and leaves the table unchanged). A *reflected* collection's `_id` is still
+immutable and can't be updated (`0A000`), as in a real MongoDB deployment.
 
 ```sql
 CREATE TABLE users (
@@ -1003,6 +1006,11 @@ SELECT id FROM post WHERE scores <@ ARRAY[5,10,20]; -- contained by: every LHS e
 SELECT id FROM post WHERE scores && ARRAY[20,99];   -- overlaps: share ≥1 element
 ```
 
+`field @> ARRAY[…]` and `field && ARRAY[…]` against an array **column** with an
+index use that index (a single-element `@>` and any `&&` report `IXSCAN` in
+`EXPLAIN`); a multi-element `@>`, the `<@` (subset) form, and `field @> '{}'`
+(empty, true for every row) are evaluated per row.
+
 `array_length(col, dim)` gives the length along a dimension, `cardinality(col)`
 the total element count, and `array_ndims` / `array_dims` / `array_upper` /
 `array_lower` round out the introspection. **Multi-dimensional arrays** work:
@@ -1092,7 +1100,8 @@ SELECT generate_series(timestamp '2024-01-01', timestamp '2024-01-02', interval 
 ```
 
 The base-less `FROM` form also covers `unnest(ARRAY[…])`, `jsonb_array_elements`,
-`jsonb_object_keys`, `regexp_split_to_table`, and `regexp_matches`:
+`jsonb_object_keys`, `regexp_split_to_table`, `regexp_matches`, and the two-column
+record SRFs `jsonb_each` / `jsonb_each_text`:
 
 ```sql
 SELECT * FROM unnest(ARRAY[10, 20, 30]) AS x;         -- 10,20,30
@@ -1104,7 +1113,16 @@ SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb) AS e;
 -- every match; without it, at most the first.
 SELECT * FROM regexp_matches('foobarbaz', 'ba.', 'g') AS m;   -- {bar}, {baz}
 SELECT regexp_matches('a1b2', '([a-z])([0-9])', 'g');         -- {a,1}, {b,2}
+
+-- jsonb_each / jsonb_each_text expand an object into (key, value) rows.
+-- jsonb_each's value is jsonb; jsonb_each_text renders each value as text.
+SELECT * FROM jsonb_each('{"a":1,"b":"x"}'::jsonb);            -- (a,1), (b,x)
+SELECT * FROM jsonb_each_text('{"a":1}'::jsonb) AS t(k, v);   -- (a,'1')
 ```
+
+The `jsonb_each` family is supported in this base-less `FROM` form; the
+lateral-join form (`FROM t, jsonb_each(t.doc)`) and the base-less
+`SELECT jsonb_each(x)` composite form are not yet modeled.
 
 A single-column function's column takes the table alias — `generate_series(1,5) AS g`
 names the column `g` — or an explicit column alias (`AS g(n)`), or the function
@@ -2158,7 +2176,10 @@ and the `WHEN` conditions, target and source columns resolve by their alias
 (`a.id` / `d.id`); an `UPDATE`'s right-hand sides and an `INSERT`'s `VALUES` may
 reference either side. The command tag counts every row inserted, updated, or
 deleted (`MERGE n`). Matching is evaluated against the target snapshot at the
-statement's start and each target row is affected at most once.
+statement's start and each target row is affected at most once — if a target row
+is matched by more than one source row, the statement errors `21000` ("MERGE
+command cannot affect row a second time"), matching Postgres. (A single source
+row matching several target rows is fine — each is acted on once.)
 
 `WHEN NOT MATCHED BY SOURCE` acts on **target** rows that no source row matched
 (`UPDATE` / `DELETE` / `DO NOTHING`), and a `RETURNING` clause projects the

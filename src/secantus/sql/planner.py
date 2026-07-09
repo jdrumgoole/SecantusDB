@@ -166,6 +166,9 @@ class UpdatePlan:
     filter: dict[str, Any]
     update: dict[str, Any]
     returning: list[tuple[str, Column, Any]] | None = None
+    # True when the SET changes a primary-key column, so the executor must re-key
+    # (delete + re-insert under the new ``_id``) rather than update in place.
+    rekey: bool = False
 
 
 @dataclass
@@ -975,7 +978,16 @@ def _expr_to_filter(
             spec["$options"] = "i"
         return {field: spec}
 
-    if isinstance(node, exp.ArrayContainsAll):  # jsonb @> (contains)
+    if isinstance(node, exp.ArrayOverlaps):  # array && (overlaps) → {field: {$in: …}}
+        arr = _array_index_filter(node, resolve)
+        if arr is not None:
+            return arr
+        raise errors.feature_not_supported(f"unsupported operator: {node.sql()}")
+
+    if isinstance(node, exp.ArrayContainsAll):  # array @> → {field: {$all: …}}, else jsonb @>
+        arr = _array_index_filter(node, resolve)
+        if arr is not None:
+            return arr
         field, _ = _field(node.this, resolve)
         return _jsonb_contains_filter(field, _json_value(node.expression))
 
@@ -2159,15 +2171,81 @@ def _is_array_operand(operand: exp.Expression, table: TableDef) -> bool:
     return False
 
 
+def _is_array_field(operand: exp.Expression, table: TableDef) -> bool:
+    """Whether ``operand`` is an array-typed stored column."""
+    if isinstance(operand, exp.Column):
+        col = table.column(_column_name(operand))
+        return col is not None and typemap.is_array_tag(col.type_tag)
+    return False
+
+
+def _is_nonempty_array_literal(operand: exp.Expression) -> bool:
+    """Whether ``operand`` is a non-empty ``ARRAY[...]`` literal. (An *empty* array
+    literal is excluded: ``arr @> '{}'`` is true for every row, which ``$all: []``
+    would not express — those stay on the per-row path.)"""
+    if isinstance(operand, exp.Paren):
+        operand = operand.this
+    return isinstance(operand, exp.Array) and len(operand.expressions) > 0
+
+
+def _array_index_operands(op: exp.Expression, table: TableDef) -> bool:
+    """Whether ``op`` is an array ``@>`` / ``&&`` in the index-eligible shape
+    ``field @> ARRAY[...]`` / ``field && ARRAY[...]`` (``&&`` is symmetric) — i.e. a
+    stored array column against a non-empty array literal, which lowers to a Mongo
+    ``$all`` / ``$in`` filter."""
+    if isinstance(op, exp.ArrayContainsAll):
+        cands = [(op.this, op.expression)]
+    elif isinstance(op, exp.ArrayOverlaps):
+        cands = [(op.this, op.expression), (op.expression, op.this)]
+    else:
+        return False
+    return any(_is_array_field(f, table) and _is_nonempty_array_literal(lit) for f, lit in cands)
+
+
+def _array_index_filter(op: exp.Expression, resolve: Resolve) -> dict[str, Any] | None:
+    """The Mongo filter for an index-eligible array ``@>`` / ``&&``: ``field &&
+    ARRAY[a, b]`` (overlaps) → ``{field: {$in: [a, b]}}`` and ``field @> ARRAY[a,
+    b]`` (contains all) → ``{$and: [{field: a}, {field: b}]}``. Each bare-equality
+    on a multikey array field is an "array contains element" test, so both forms
+    are exact for Postgres array semantics *and* light up a multikey index (a plain
+    ``$all`` does not, in this storage planner). Returns None when the operator
+    isn't this shape (jsonb / range / field-vs-field / empty literal)."""
+    is_overlap = isinstance(op, exp.ArrayOverlaps)
+    cands = [(op.this, op.expression)]
+    if is_overlap:
+        cands.append((op.expression, op.this))
+    for fnode, lit in cands:
+        if not (_is_field_node(fnode) and _is_nonempty_array_literal(lit)):
+            continue
+        field, tag = _field(fnode, resolve)
+        if not typemap.is_array_tag(tag):
+            continue
+        elem_tag = typemap.array_element_tag(tag)
+        elems = [typemap.coerce(_literal(e), elem_tag) for e in _array_elements(lit)]
+        if is_overlap:  # && : share ≥1 element
+            return {field: {"$in": elems}}
+        # @> : contains every element — an $and of multikey equalities (a lone
+        # element collapses to a bare equality).
+        if len(elems) == 1:
+            return {field: elems[0]}
+        return {"$and": [{field: e} for e in elems]}
+    return None
+
+
 def _where_has_array_predicate(node: exp.Expression, table: TableDef) -> bool:
     """True if ``node`` contains an ``@>`` / ``<@`` / ``&&`` whose operand is a
-    Postgres array (array-typed column, ``ARRAY[...]`` literal, or array cast). PG
-    array containment / overlap has different semantics from jsonb containment, so
-    the scalar evaluator handles it per-row rather than lowering to a Mongo
-    filter."""
+    Postgres array that must be evaluated per-row. The index-eligible shapes
+    ``field @> ARRAY[...]`` and ``field && ARRAY[...]`` are excluded — they lower to
+    a Mongo ``$all`` / ``$in`` filter (see ``_array_index_filter``); everything else
+    (``<@``, field-vs-field, empty literal, ``const @> field``) has different
+    semantics from jsonb containment and is handled per-row by the scalar
+    evaluator."""
     for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps):
-        if _is_array_operand(op.this, table) or _is_array_operand(op.expression, table):
-            return True
+        if not (_is_array_operand(op.this, table) or _is_array_operand(op.expression, table)):
+            continue
+        if _array_index_operands(op, table):
+            continue  # lowers to $all / $in
+        return True
     return False
 
 
@@ -2182,6 +2260,8 @@ def _where_has_jsonb_contained_predicate(node: exp.Expression, table: TableDef) 
     net / hstore / geo operators are already routed to the residual by their own
     ``_where_has_*`` checks, so this generic shape test is only additive."""
     for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy):
+        if _array_index_operands(op, table):
+            continue  # an array @> that lowers to $all — not a jsonb residual
         if isinstance(op, exp.ArrayContainsAll):  # @>
             if _is_field_node(op.this) and _is_literalish(op.expression):
                 continue  # field @> const — pushes down
@@ -2260,6 +2340,7 @@ def _composite_subfield_target(target: exp.Expression, table: TableDef):
 
 def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
     set_doc: dict[str, Any] = {}
+    rekey = False
     for assign in stmt.expressions:
         if not isinstance(assign, exp.EQ):
             raise errors.feature_not_supported(f"unsupported SET item: {assign.sql()}")
@@ -2268,7 +2349,8 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         if subfield_target is not None:
             comp_col, subfield, tag, subfields = subfield_target
             if comp_col.pk:
-                raise errors.feature_not_supported("updating the primary key is not supported")
+                # Changing a composite-PK subfield re-keys the row (rewrites ``_id``).
+                rekey = True
             raw = _literal(assign.expression)
             if subfields is not None and raw is not None:
                 value = _build_composite(raw, subfields, tag)
@@ -2286,7 +2368,11 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
             else:
                 raise errors.undefined_column(col_name)
         if col.pk:
-            raise errors.feature_not_supported("updating the primary key is not supported")
+            if table.reflected:
+                # A reflected collection's ``_id`` is the real Mongo key — re-keying
+                # a schema-on-read doc isn't modelled.
+                raise errors.feature_not_supported("updating the primary key is not supported")
+            rekey = True  # changing a declared PK column re-keys the row
         if col.generated is not None:
             # A generated column can only be set to DEFAULT (which recomputes it);
             # any other value is rejected. The executor recomputes it either way.
@@ -2307,6 +2393,7 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         filter=_where_filter(stmt, table),
         update={"$set": set_doc},
         returning=_returning_columns(stmt, table),
+        rekey=rekey,
     )
 
 

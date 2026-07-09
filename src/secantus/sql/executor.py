@@ -1400,6 +1400,8 @@ def execute_evaluated_select(
 def execute_update(
     plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:
+    if getattr(plan, "rekey", False):
+        return _execute_update_rekey(plan, storage, db, catalog, session)
     coll = plan.table.collection
     _validate_update_post_images(plan, storage, db, session, catalog)
     gen_cols = (
@@ -1430,14 +1432,88 @@ def execute_update(
     return SQLResult(command_tag=f"UPDATE {matched}", rowcount=matched)
 
 
+def _execute_update_rekey(
+    plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any, session: Any
+) -> SQLResult:
+    """An UPDATE that changes a primary-key column: Mongo's ``_id`` is immutable, so
+    each matched row is re-keyed — its post-image is computed, validated (including
+    a duplicate-``_id`` check for the new key), then the old row is deleted and the
+    new one inserted. Statement-atomic: all rows are validated before any write."""
+    import copy
+
+    from secantus.paths import set_path
+    from secantus.update import apply_update
+
+    coll = plan.table.collection
+    set_doc = plan.update.get("$set", {})
+    id_sets = {k: v for k, v in set_doc.items() if k == "_id" or k.startswith("_id.")}
+    other_sets = {k: v for k, v in set_doc.items() if k not in id_sets}
+
+    def post_image(doc: dict[str, Any]) -> dict[str, Any]:
+        # ``apply_update`` refuses to touch ``_id`` (it is immutable in Mongo), so
+        # the non-PK sets go through it and the PK sets are written by path.
+        new = copy.deepcopy(doc)
+        if other_sets:
+            new = apply_update(new, {"$set": other_sets})
+        for k, v in id_sets.items():
+            set_path(new, k, v)
+        return new
+
+    matched = storage.find_matching(db, coll, plan.filter)
+    posts = [post_image(doc) for doc in matched]
+    # Reuse the shared post-image validation (NOT NULL / CHECK / UNIQUE / FK / enum
+    # / domain / generated) with the images we already computed.
+    _validate_update_post_images(
+        plan, storage, db, session, catalog, matched=matched, post_images=posts
+    )
+
+    # New ``_id`` values must be free: not held by an unmatched row, and not
+    # duplicated within this statement's own re-keyed set.
+    old_ids = {_hashable_id(d["_id"]) for d in matched}
+    seen: set[Any] = set()
+    for old, new in zip(matched, posts, strict=True):
+        new_h = _hashable_id(new["_id"])
+        if new_h == _hashable_id(old["_id"]):
+            continue  # PK unchanged for this row
+        collides = new_h in seen or (
+            new_h not in old_ids and bool(storage.find_matching(db, coll, {"_id": new["_id"]}))
+        )
+        if collides:
+            raise errors.SQLError(
+                "23505",
+                f'duplicate key value violates unique constraint "{plan.table.name}_pkey"',
+            )
+        seen.add(new_h)
+
+    # Validated — now delete every matched row, then insert the re-keyed rows. (A
+    # PK swap needs all deletes before any insert so the two rows don't collide.)
+    for doc in matched:
+        storage.delete_matching(db, coll, {"_id": doc["_id"]})
+    if posts:
+        storage.insert(db, coll, posts)
+    n = len(matched)
+    if plan.returning is not None:
+        return _returning_result(posts, plan.returning, f"UPDATE {n}", n, plan.table, storage, db)
+    return SQLResult(command_tag=f"UPDATE {n}", rowcount=n)
+
+
 def _validate_update_post_images(
-    plan: planner.UpdatePlan, storage: Any, db: str, session: Any, catalog: Any
+    plan: planner.UpdatePlan,
+    storage: Any,
+    db: str,
+    session: Any,
+    catalog: Any,
+    *,
+    matched: list[dict[str, Any]] | None = None,
+    post_images: list[dict[str, Any]] | None = None,
 ) -> None:
     """Enforce NOT NULL / CHECK / UNIQUE on an UPDATE's post-image: apply the
     update in memory to each matched row and validate the result before touching
     storage, so a violating UPDATE leaves the table unchanged (Postgres
     statement-atomic). UNIQUE probes exclude every row the statement is rewriting
-    (so unchanged rows and value swaps across the matched set don't self-conflict)."""
+    (so unchanged rows and value swaps across the matched set don't self-conflict).
+    The re-key path passes ``matched`` / ``post_images`` it already computed (the
+    ``_id`` can't go through ``apply_update``)."""
     from secantus.sql import scalar
     from secantus.update import apply_update
 
@@ -1455,8 +1531,10 @@ def _validate_update_post_images(
     if getattr(table, "reflected", False) or not needs:
         return
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
-    matched = storage.find_matching(db, table.collection, plan.filter)
-    post_images = [apply_update(doc, plan.update) for doc in matched]
+    if matched is None:
+        matched = storage.find_matching(db, table.collection, plan.filter)
+    if post_images is None:
+        post_images = [apply_update(doc, plan.update) for doc in matched]
     _apply_generated_columns(post_images, table, ctx)
     for post in post_images:
         _validate_write_row(post, table, ctx)
