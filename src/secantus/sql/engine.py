@@ -3316,10 +3316,10 @@ def _run_with(
     order, so a later CTE may reference an earlier one."""
     with_node = _own_with(stmt)
     recursive = bool(with_node.args.get("recursive"))
-    is_write = isinstance(stmt, (exp.Insert, exp.Update, exp.Delete))
+    is_write = isinstance(stmt, (exp.Insert, exp.Update, exp.Delete, exp.Merge))
     if not isinstance(stmt, (exp.Select, exp.SetOperation)) and not is_write:
         raise errors.feature_not_supported(
-            "WITH is supported only with SELECT / set-operation / INSERT / UPDATE / DELETE"
+            "WITH is supported only with SELECT / set-operation / INSERT / UPDATE / DELETE / MERGE"
         )
 
     backend = virtual.CatalogBackend(storage, catalog, session, db)

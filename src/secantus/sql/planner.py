@@ -3433,34 +3433,18 @@ def _has_grouping_sets(stmt: exp.Select) -> bool:
     return bool(g and (g.args.get("rollup") or g.args.get("cube") or g.args.get("grouping_sets")))
 
 
-def _rewrite_computed_group_keys(
-    stmt: exp.Select, table: TableDef
-) -> tuple[exp.Select, TableDef, dict[str, Any]] | None:
-    """Rewrite non-column GROUP BY keys (``GROUP BY lower(name)``, ``GROUP BY x + 1``)
-    into synthetic bare columns.
+def _lower_computed_group_keys(
+    computed: list[exp.Expression], resolve: Resolve, taken: set[str]
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Lower each computed GROUP BY key to a Mongo aggregation expression and mint a
+    synthetic ``__gkeyN`` field name for it (avoiding names in ``taken``).
 
-    Each computed key is lowered to a Mongo aggregation expression, materialised
-    into a fresh ``__gkeyN`` field by a pre-``$group`` ``$addFields``, and every
-    SQL-equal occurrence of the key (in GROUP BY / SELECT / HAVING / ORDER BY) is
-    replaced with a reference to that synthetic column. The existing bare-column
-    group machinery then handles the rest transparently.
-
-    Returns ``(rewritten_stmt, augmented_table, addfields)`` or ``None`` when no
-    GROUP BY key is computed. Raises ``feature_not_supported`` when a key uses a
-    function the aggregation engine can't evaluate (→ ``0A000``)."""
-    group_node = stmt.args.get("group")
-    if group_node is None:
-        return None
-    # Bare columns need no rewrite; a positional ordinal (``GROUP BY 1``) is left
-    # to the existing ordinal handling rather than grouped by a constant.
-    computed = [k for k in group_node.expressions if not isinstance(k, (exp.Column, exp.Literal))]
-    if not computed:
-        return None
-    resolve = table_resolver(table)
-    existing = {c.name for c in table.columns}
-    targets: dict[str, str] = {}  # normalised key SQL -> synthetic column name
+    Returns ``(targets, addfields)`` — ``targets`` maps each key's normalised SQL to
+    its synthetic name, ``addfields`` maps each synthetic name to its Mongo expr (the
+    body of a pre-``$group`` ``$addFields``). Raises ``feature_not_supported`` when a
+    key uses a function the aggregation engine can't evaluate (→ ``0A000``)."""
+    targets: dict[str, str] = {}
     addfields: dict[str, Any] = {}
-    synth: list[Column] = []
     counter = 0
     for key in computed:
         srepr = key.sql()
@@ -3472,16 +3456,21 @@ def _rewrite_computed_group_keys(
             raise errors.feature_not_supported(
                 f"unsupported computed GROUP BY key: {srepr}"
             ) from exc
-        while (fname := f"__gkey{counter}") in existing:
+        while (fname := f"__gkey{counter}") in taken:
             counter += 1
         counter += 1
+        taken.add(fname)
         addfields[fname] = mongo
         targets[srepr] = fname
-        synth.append(Column(name=fname, type_tag="any", field=fname, pk=False, nullable=True))
+    return targets, addfields
 
-    # A computed key selected under an alias projects to that alias, so an ORDER BY
-    # naming the same expression must sort on the alias (the synthetic ``__gkeyN``
-    # field is gone by the post-$group $project). Map synthetic name -> output alias.
+
+def _apply_group_key_rewrite(stmt: exp.Select, targets: dict[str, str]) -> exp.Select:
+    """Rewrite every SQL-equal occurrence of a computed GROUP BY key (``targets``
+    maps normalised key SQL → synthetic column name) into a bare column reference,
+    across GROUP BY / SELECT / HAVING / ORDER BY. An ORDER BY term that names a key
+    projected under an output alias is redirected to that alias (the synthetic
+    ``__gkeyN`` field is gone by the post-``$group`` ``$project``)."""
     key_alias: dict[str, str] = {}
     for e in stmt.expressions:
         if isinstance(e, exp.Alias) and (repl := targets.get(e.this.sql())) is not None:
@@ -3501,6 +3490,44 @@ def _rewrite_computed_group_keys(
             term = o.this
             if isinstance(term, exp.Column) and not term.table and term.name in key_alias:
                 o.set("this", exp.column(key_alias[term.name]))
+    return new_stmt
+
+
+def _computed_group_keys(group_node: exp.Group | None) -> list[exp.Expression]:
+    """The non-column, non-ordinal GROUP BY keys (``lower(name)``, ``x + 1``) — the
+    ones that need lowering into a synthetic column. Bare columns and positional
+    ordinals (``GROUP BY 1``) are left to their existing handling."""
+    if group_node is None:
+        return []
+    return [k for k in group_node.expressions if not isinstance(k, (exp.Column, exp.Literal))]
+
+
+def _rewrite_computed_group_keys(
+    stmt: exp.Select, table: TableDef
+) -> tuple[exp.Select, TableDef, dict[str, Any]] | None:
+    """Rewrite non-column GROUP BY keys (``GROUP BY lower(name)``, ``GROUP BY x + 1``)
+    into synthetic bare columns.
+
+    Each computed key is lowered to a Mongo aggregation expression, materialised
+    into a fresh ``__gkeyN`` field by a pre-``$group`` ``$addFields``, and every
+    SQL-equal occurrence of the key (in GROUP BY / SELECT / HAVING / ORDER BY) is
+    replaced with a reference to that synthetic column. The existing bare-column
+    group machinery then handles the rest transparently.
+
+    Returns ``(rewritten_stmt, augmented_table, addfields)`` or ``None`` when no
+    GROUP BY key is computed. Raises ``feature_not_supported`` when a key uses a
+    function the aggregation engine can't evaluate (→ ``0A000``)."""
+    computed = _computed_group_keys(stmt.args.get("group"))
+    if not computed:
+        return None
+    resolve = table_resolver(table)
+    existing = {c.name for c in table.columns}
+    targets, addfields = _lower_computed_group_keys(computed, resolve, existing)
+    synth = [
+        Column(name=fname, type_tag="any", field=fname, pk=False, nullable=True)
+        for fname in addfields
+    ]
+    new_stmt = _apply_group_key_rewrite(stmt, targets)
     new_table = replace(table, columns=[*table.columns, *synth])
     return new_stmt, new_table, addfields
 
@@ -4798,6 +4825,12 @@ def _join_aggregate_of(
                 exprs = arg.expressions
                 arg = exprs[0] if exprs else None
             return name, (None if arg is None or isinstance(arg, exp.Star) else arg), distinct
+    # ``every(x)`` is the standard-SQL spelling of ``bool_and(x)`` (parses as an
+    # Anonymous call rather than a dedicated node).
+    if isinstance(inner, exp.Anonymous):
+        fname = (inner.this if isinstance(inner.this, str) else inner.name).lower()
+        if fname == "every" and inner.expressions:
+            return "bool_and", inner.expressions[0], False
     return None
 
 
@@ -4831,6 +4864,16 @@ def _plan_join_group_select(
     residual = where_node.this if (where_node is not None and where_needs_per_row(stmt)) else None
     residual_split = len(pipeline)
 
+    # Computed GROUP BY keys (``GROUP BY lower(c.name)`` / ``o.qty + 1``) — lower each
+    # through the join resolver into a synthetic ``__gkeyN`` field materialised by a
+    # post-join ``$addFields``, then rewrite SELECT / HAVING / ORDER references to it.
+    gkey_fields: dict[str, Any] = {}
+    computed = _computed_group_keys(stmt.args.get("group"))
+    if computed:
+        targets, gkey_fields = _lower_computed_group_keys(computed, resolve, set())
+        stmt = _apply_group_key_rewrite(stmt, targets)
+        pipeline.append({"$addFields": gkey_fields})
+
     group_node = stmt.args.get("group")
     group_keys: dict[str, str] = {}  # _id key name -> resolved "$path"
     key_tag: dict[str, str] = {}
@@ -4839,6 +4882,10 @@ def _plan_join_group_select(
             if not isinstance(c, exp.Column):
                 raise errors.feature_not_supported(f"GROUP BY expression not supported: {c.sql()}")
             keyname = _column_name(c)
+            if keyname in gkey_fields:  # synthetic computed key (materialised above)
+                group_keys[keyname] = f"${keyname}"
+                key_tag[keyname] = "any"
+                continue
             path, tag = resolve(c)
             group_keys[keyname] = f"${path}"
             key_tag[keyname] = tag
@@ -4848,6 +4895,7 @@ def _plan_join_group_select(
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
+    post_aggregates: list[tuple[str, str, float | None]] = []
     names = _NameAllocator()
     agg_fields: dict[str, str] = {}
 
@@ -4882,6 +4930,30 @@ def _plan_join_group_select(
             accumulators[fname] = {"$push": f"${path}"}
             project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
+        elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
+            # variance / var_pop (square of stdDev) and bit_and/or/xor (push +
+            # Python fold) — same post-aggregate finish as the single-table path,
+            # resolved through the join resolver.
+            func, arg_node, _distinct = agg
+            if arg_node is None:
+                raise errors.feature_not_supported(f"{func}(*) is not supported")
+            if fcond is not None:
+                raise errors.feature_not_supported(
+                    f"FILTER (WHERE ...) on {func}() is not supported"
+                )
+            fname = names.fresh(alias or func)
+            path, coltag = resolve(arg_node)
+            val = f"${path}"
+            if func in _BIT_AGG_FUNCS:
+                accumulators[fname] = {"$push": val}
+                tag = coltag if coltag in ("int4", "int8") else "int8"
+                post_aggregates.append((fname, func, None))
+            else:
+                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                tag = "numeric"
+                post_aggregates.append((fname, "variance", None))
+            project[fname] = f"${fname}"
+            out_columns.append((fname, tag))
         elif agg is not None:
             func, arg, distinct = agg
             if distinct and func in _DISTINCT_FUNCS:
@@ -4945,6 +5017,7 @@ def _plan_join_group_select(
         residual_where=residual,
         residual_resolve=resolve if residual is not None else None,
         residual_split=residual_split,
+        post_aggregates=post_aggregates,
     )
 
 

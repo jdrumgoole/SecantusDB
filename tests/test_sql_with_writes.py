@@ -189,3 +189,23 @@ def test_recursive_and_datamod_cte_combined(storage, session):
     )
     assert res.rows == [(3,)]
     assert q(storage, session, "SELECT id FROM dst ORDER BY id").rows == [(1,), (2,), (3,)]
+
+
+def test_with_merge(storage, session):
+    # WITH before a MERGE (#169): the CTE materialises, then the MERGE runs against
+    # the CTE-aware backend. big = src rows with amount >= 20 → ids 2, 3.
+    q(storage, session, "INSERT INTO dst (id, region, amount) VALUES (2, 'x', 0)")
+    res = q(
+        storage,
+        session,
+        "WITH big AS (SELECT id, region, amount FROM src WHERE amount >= 20) "
+        "MERGE INTO dst d USING big b ON d.id = b.id "
+        "WHEN MATCHED THEN UPDATE SET amount = b.amount "
+        "WHEN NOT MATCHED THEN INSERT (id, region, amount) VALUES (b.id, b.region, b.amount)",
+    )
+    assert res.command_tag == "MERGE 2"
+    # id 2 matched → amount updated to 20; id 3 not matched → inserted.
+    assert q(storage, session, "SELECT id, amount FROM dst ORDER BY id").rows == [
+        (2, 20),
+        (3, 30),
+    ]

@@ -185,3 +185,57 @@ def test_group_by_unsupported_function_rejected(storage, session):
             "SELECT substr(name, 1, 1) AS g, count(*) FROM t GROUP BY substr(name, 1, 1)",
         )
     assert ei.value.sqlstate == "0A000"
+
+
+# -- computed keys over a JOIN (#169) ---------------------------------------- #
+
+
+def _join(storage, session):
+    run(storage, session, "CREATE TABLE cust (name text primary key, region text)")
+    run(storage, session, "CREATE TABLE ord (id int primary key, cust text, amt int)")
+    run(storage, session, "INSERT INTO cust VALUES ('a', 'East'), ('b', 'EAST'), ('c', 'west')")
+    for i, (c, a) in enumerate([("a", 4), ("b", 8), ("c", 30)]):
+        run(storage, session, f"INSERT INTO ord VALUES ({i}, '{c}', {a})")
+
+
+def test_join_group_by_lower(storage, session):
+    _join(storage, session)
+    # East + EAST fold to 'east' (4 + 8); west stays 30.
+    assert rows(
+        storage,
+        session,
+        "SELECT lower(c.region) AS r, sum(o.amt) AS s FROM ord o "
+        "JOIN cust c ON o.cust = c.name GROUP BY lower(c.region) ORDER BY r",
+    ) == [("east", 12), ("west", 30)]
+
+
+def test_join_group_by_arithmetic(storage, session):
+    _join(storage, session)
+    assert rows(
+        storage,
+        session,
+        "SELECT o.amt + 1 AS k, count(*) FROM ord o "
+        "JOIN cust c ON o.cust = c.name GROUP BY o.amt + 1 ORDER BY k",
+    ) == [(5, 1), (9, 1), (31, 1)]
+
+
+def test_join_group_by_computed_with_having(storage, session):
+    _join(storage, session)
+    assert rows(
+        storage,
+        session,
+        "SELECT lower(c.region) AS r, sum(o.amt) AS s FROM ord o "
+        "JOIN cust c ON o.cust = c.name GROUP BY lower(c.region) HAVING sum(o.amt) > 5 ORDER BY r",
+    ) == [("east", 12), ("west", 30)]
+
+
+def test_join_group_by_unsupported_function_rejected(storage, session):
+    _join(storage, session)
+    with pytest.raises(SQLError) as ei:
+        run(
+            storage,
+            session,
+            "SELECT substr(c.region, 1, 1) AS r, count(*) FROM ord o "
+            "JOIN cust c ON o.cust = c.name GROUP BY substr(c.region, 1, 1)",
+        )
+    assert ei.value.sqlstate == "0A000"

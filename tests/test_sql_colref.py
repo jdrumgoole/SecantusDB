@@ -177,3 +177,28 @@ def test_field_literal_keeps_fast_path():
     # Unchanged: a field/const comparison stays the indexable shorthand.
     assert _filter_for("qty > 3") == {"qty": {"$gt": 3}}
     assert _filter_for("qty = 3") == {"qty": 3}
+
+
+# -- function on the field side vs a constant (#169) ------------------------- #
+
+
+def _text_table(storage, session):
+    run_sql(storage, DB, "CREATE TABLE p (id int primary key, name text, x int)", session=session)
+    for i, (n, x) in enumerate([("Alice", 1), ("BOB", -3), ("bob", 5)]):
+        run_sql(storage, DB, f"INSERT INTO p VALUES ({i}, '{n}', {x})", session=session)
+
+
+def test_upper_eq_const(storage, session):
+    _text_table(storage, session)
+    # upper(name) = 'BOB' matches BOB and bob.
+    assert q(storage, session, "SELECT id FROM p WHERE upper(name) = 'BOB' ORDER BY id") == [1, 2]
+
+
+def test_abs_eq_const(storage, session):
+    _text_table(storage, session)
+    assert q(storage, session, "SELECT id FROM p WHERE abs(x) = 3 ORDER BY id") == [1]
+
+
+def test_length_gt_const(storage, session):
+    _text_table(storage, session)
+    assert q(storage, session, "SELECT id FROM p WHERE length(name) > 3 ORDER BY id") == [0]

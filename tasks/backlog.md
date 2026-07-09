@@ -1539,12 +1539,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   aggregation expression, materialised into a synthetic `__gkeyN` field by a pre-`$group`
   `$addFields`, and every SQL-equal occurrence in SELECT / HAVING / ORDER BY is rewritten to that
   synthetic column — so the existing bare-column group machinery handles the rest
-  (`_rewrite_computed_group_keys` + `_func_to_agg_expr` in the planner; single-table path). Keys
-  using a function the aggregation engine can't evaluate (e.g. `substr`) stay `0A000`; computed
-  keys over a JOIN / GROUPING SETS are not yet rewritten. Still `0A000`:
-  `RIGHT`/`FULL` in a 3+ table chain, subqueries, and **function calls inside a
-  WHERE comparison** (the `$expr` path lowers columns + arithmetic + the same common functions,
-  but the single-table pushdown routes `WHERE upper(name) = 'X'` through the field-path form). SUM/MIN/MAX
+  (`_rewrite_computed_group_keys` + `_func_to_agg_expr` in the planner). **Extended to JOINs**
+  (b204, #169): `GROUP BY lower(c.region)` / `o.amt + 1` across a join lower through the join
+  resolver into a synthetic `__gkeyN` field (the rewrite core is factored into
+  `_lower_computed_group_keys` / `_apply_group_key_rewrite`, shared with the single-table path).
+  **Function-in-WHERE-vs-const also works** (b204): `WHERE upper(name) = 'X'` / `abs(x) = 3` lower
+  through the same `_to_agg_expr` function branch into `$expr` (the field/const pair-check falls
+  through for a function operand). Keys using a function the aggregation engine can't evaluate
+  (e.g. `substr`) stay `0A000`; **computed keys over GROUPING SETS / ROLLUP / CUBE are not yet
+  rewritten** (they'd need a per-union-branch `$addFields`). Still `0A000`:
+  `RIGHT`/`FULL` in a 3+ table chain, subqueries. SUM/MIN/MAX
   result typing is approximate (uses the column's tag; AVG → float8; arithmetic → numeric).
   **`DISTINCT` aggregates landed** (b48): `COUNT`/`SUM`/`AVG(DISTINCT col)` compile to a
   `$addToSet` accumulator plus a post-`$group` `$addFields` that reduces the set
@@ -1639,10 +1643,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`executor._stat_bit_value`, kind `variance`); `bit_*` `$push` the values and fold with
   `operator.and_`/`or_`/`xor_` (NULLs skipped, NULL for an empty group). Typed float8 (stddev) / numeric
   (variance) / int (bit). Routed through `_plan_group_select` for both grouped and whole-table single-table
-  aggregates. **Limitations:** not wired into the JOIN group path (`_join_accumulator` → the stddev
-  natives work, but variance/bit raise `feature_not_supported` over a JOIN); `every()`/`bool_and` still
-  require a boolean **column** argument, not a boolean expression; a whole-table aggregate over an
-  **empty** table returns no row (pre-existing, except `count`).
+  aggregates. **Now wired into the JOIN group path too** (b204, #169): `variance` / `var_pop` / `bit_and`
+  / `bit_or` / `bit_xor` over a JOIN build the same `post_aggregates` finish (resolved through the join
+  resolver), and `every()` is recognised as `bool_and` in `_join_aggregate_of`. **Limitations:**
+  `every()`/`bool_and` still require a boolean **column** argument, not a boolean expression; a
+  whole-table aggregate over an **empty** table returns no row (pre-existing, except `count`).
 - [ ] **Range types landed** (b137): `int4range`/`int8range`/`numrange`/`tsrange`/`daterange`. A new
   self-contained `secantus/sql/ranges.py` (build/parse/render/compare) stores a range as a subdocument
   `{"lower","upper","lower_inc","upper_inc"}` (or `{"empty": true}`); discrete types canonicalise to the
@@ -2157,7 +2162,8 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `planner._insert_doc` (same coercion / NOT NULL / PK→`_id` path as VALUES, factored out alongside
   `insert_target_columns` / `plan_insert_rows`). Column-count mismatch (target vs query) → `42601`;
   `RETURNING` works (the source is materialized first, so a self-insert reads a stable snapshot).
-  **Still `0A000`:** `WITH` before an `INSERT` (the source SELECT's own `WITH` is fine), `MERGE`.
+  A leading `WITH` before an `INSERT` / `UPDATE` / `DELETE` / **`MERGE`** (b204, #169 added MERGE) all
+  work — the CTEs materialise, then the write runs against the CTE-aware backend + catalog overlay.
 - [ ] **Window functions landed** (b51). `func(...) OVER (PARTITION BY … ORDER BY …)` routes through
   the evaluated-select path (a window expr already trips `_stmt_needs_evaluation`). `secantus.sql.window`
   computes each window over the fetched rows — partition (repr-keyed groups), order within partition
