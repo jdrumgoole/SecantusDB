@@ -3107,9 +3107,12 @@ def _plan_pipeline_select(
                 "window functions over GROUPING SETS are not supported"
             )
         plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_grouping_sets_select(stmt, table)
-    elif _select_has_window(stmt) and (grouped or _group_agg_nodes(stmt)):
-        # Window functions computed over GROUP BY aggregates (or an implicit
-        # whole-table aggregation) — a two-phase group-then-window plan.
+    elif (_select_has_window(stmt) or _select_has_computed_aggregate(stmt)) and (
+        grouped or _group_agg_nodes(stmt)
+    ):
+        # Window functions computed over GROUP BY aggregates, or an expression that
+        # *wraps* an aggregate (``sum(x) + 1``) — both run the wrapping / window
+        # phase over the grouped rows via the evaluated executor.
         plan = _plan_group_window_select(stmt, table)
     elif grouped:
         plan = _plan_group_select(stmt, table)
@@ -3372,6 +3375,24 @@ def _has_grouping_sets(stmt: exp.Select) -> bool:
     return bool(g and (g.args.get("rollup") or g.args.get("cube") or g.args.get("grouping_sets")))
 
 
+def _grouping_args(e: exp.Expression) -> list[str] | None:
+    """If ``e`` is a ``GROUPING(col, …)`` call (possibly aliased), the list of its
+    column-name arguments; else None. ``GROUPING`` returns a bitmask that is 1 for
+    each argument rolled up (absent from the row's grouping set), 0 otherwise, most
+    significant bit first."""
+    inner = e.this if isinstance(e, exp.Alias) else e
+    if isinstance(inner, exp.Grouping):
+        return [_column_name(a) for a in inner.expressions]
+    return None
+
+
+def _grouping_bitmask(cols: list[str], in_set: set[str]) -> int:
+    bits = 0
+    for c in cols:
+        bits = (bits << 1) | (0 if c in in_set else 1)
+    return bits
+
+
 def _grouping_set_cols(node: exp.Expression) -> list[str]:
     """Column names in one grouping-set element — a ``(a, b)`` Tuple, a ``(a)``
     Paren, a bare column, or the empty set ``()`` (→ ``[]``)."""
@@ -3433,6 +3454,7 @@ def _grouping_set_branch(
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
+        grp = _grouping_args(e)
         arr_arg = _array_agg_arg(e)
         oagg = _jsonb_object_agg_args(e)
         sagg = _string_agg_arg(e)
@@ -3443,7 +3465,13 @@ def _grouping_set_branch(
                 "FILTER (WHERE ...) is not supported on array_agg / string_agg / jsonb_object_agg"
             )
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
-        if arr_arg is not None:
+        if grp is not None:
+            for c in grp:
+                table.field_for(c)  # validate
+            fname = names.fresh(alias or "grouping")
+            project[fname] = {"$literal": _grouping_bitmask(grp, in_set)}
+            out_columns.append((fname, "int4"))
+        elif arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
             accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             project[fname] = f"${fname}"
@@ -3524,6 +3552,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
 
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
+        grp = _grouping_args(e)
         arr_arg = _array_agg_arg(e)
         oagg = _jsonb_object_agg_args(e)
         ragg = _range_agg_arg(e)
@@ -3536,7 +3565,14 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                 "FILTER (WHERE ...) is not supported on array_agg / string_agg / jsonb_object_agg"
             )
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
-        if oagg is not None:
+        if grp is not None:
+            # Plain GROUP BY: every argument is grouped, so GROUPING() is always 0.
+            for c in grp:
+                table.field_for(c)  # validate
+            fname = names.fresh(alias or "grouping")
+            project[fname] = {"$literal": _grouping_bitmask(grp, set(group_cols))}
+            out_columns.append((fname, "int4"))
+        elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
             accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table)
             project[fname] = {"$arrayToObject": f"${fname}"}
@@ -3692,6 +3728,42 @@ def _select_has_window(stmt: exp.Select) -> bool:
     if order is not None:
         roots.extend(o.this for o in order.expressions)
     return any(next(r.find_all(exp.Window), None) is not None for r in roots)
+
+
+def _is_bare_aggregate(e: exp.Expression) -> bool:
+    """Whether ``e`` *is* an aggregate call (any recognised family), rather than an
+    expression that merely contains one."""
+    return (
+        _aggregate_of(e) is not None
+        or _array_agg_arg(e) is not None
+        or _jsonb_object_agg_args(e) is not None
+        or _range_agg_arg(e) is not None
+        or _string_agg_arg(e) is not None
+        or _ordered_set_agg(e) is not None
+    )
+
+
+def _select_has_computed_aggregate(stmt: exp.Select) -> bool:
+    """Whether any SELECT item or ORDER BY term is an *expression over* an aggregate
+    (e.g. ``sum(x) + 1``, ``round(avg(x), 2)``) rather than a bare aggregate — those
+    are projected by the evaluated group path (which runs the wrapping expression
+    over the grouped rows). A bare aggregate stays on the fast ``$group`` path."""
+    roots: list[exp.Expression] = list(stmt.expressions)
+    order = stmt.args.get("order")
+    if order is not None:
+        roots.extend(o.this for o in order.expressions)
+    for e in roots:
+        inner = e.this if isinstance(e, exp.Alias) else e
+        if _is_bare_aggregate(inner) or _grouping_args(e) is not None:
+            continue
+        # ``GROUPING()`` subclasses AggFunc but is a super-aggregate helper handled
+        # by the group / grouping-sets planner, not a real aggregate.
+        agg = next(
+            (a for a in inner.find_all(exp.AggFunc) if not isinstance(a, exp.Grouping)), None
+        )
+        if agg is not None:
+            return True
+    return False
 
 
 def _group_agg_nodes(stmt: exp.Select) -> list[exp.AggFunc]:
@@ -4721,7 +4793,9 @@ def _plan_join_group_select(
 
     having = stmt.args.get("having")
     having_match = (
-        _join_having_to_match(having.this, resolve, accumulators, agg_fields, group_keys, key_tag)
+        _join_having_to_match(
+            having.this, resolve, accumulators, agg_fields, group_keys, key_tag, names, reductions
+        )
         if having is not None
         else None
     )
@@ -4822,7 +4896,9 @@ def _plan_join_group_window_select(
 
     having = stmt.args.get("having")
     having_match = (
-        _join_having_to_match(having.this, resolve, accumulators, agg_fields, group_keys, key_tag)
+        _join_having_to_match(
+            having.this, resolve, accumulators, agg_fields, group_keys, key_tag, names, reductions
+        )
         if having is not None
         else None
     )
@@ -4847,26 +4923,23 @@ def _join_having_to_match(
     agg_fields: dict[str, str],
     group_keys: dict[str, str],
     key_tag: dict[str, str],
+    names: Any = None,
+    reductions: Any = None,
 ) -> dict[str, Any]:
     """HAVING for the JOIN+GROUP path — mirrors ``_having_to_match`` but resolves
     columns / aggregate args through the join resolver."""
-    rec = _join_having_to_match
-    if isinstance(node, exp.Paren):
-        return rec(node.this, resolve, accumulators, agg_fields, group_keys, key_tag)
-    if isinstance(node, exp.And):
-        return _merge_and(
-            [
-                rec(node.this, resolve, accumulators, agg_fields, group_keys, key_tag),
-                rec(node.expression, resolve, accumulators, agg_fields, group_keys, key_tag),
-            ]
+
+    def rec(n: exp.Expression) -> dict[str, Any]:
+        return _join_having_to_match(
+            n, resolve, accumulators, agg_fields, group_keys, key_tag, names, reductions
         )
+
+    if isinstance(node, exp.Paren):
+        return rec(node.this)
+    if isinstance(node, exp.And):
+        return _merge_and([rec(node.this), rec(node.expression)])
     if isinstance(node, exp.Or):
-        return {
-            "$or": [
-                rec(node.this, resolve, accumulators, agg_fields, group_keys, key_tag),
-                rec(node.expression, resolve, accumulators, agg_fields, group_keys, key_tag),
-            ]
-        }
+        return {"$or": [rec(node.this), rec(node.expression)]}
 
     def field_tag(term: exp.Expression) -> tuple[str, str]:
         if isinstance(term, exp.Column):
@@ -4882,14 +4955,24 @@ def _join_having_to_match(
         if agg is None:
             raise errors.feature_not_supported(f"unsupported HAVING term: {term.sql()}")
         func, arg, distinct = agg
+        key = _agg_key(func, arg, resolve, distinct)
         if distinct and func in _DISTINCT_FUNCS:
-            raise errors.feature_not_supported(
-                f"DISTINCT inside {func}() is not supported in HAVING"
+            if key in agg_fields:  # already registered by the SELECT list — reuse
+                path, tag = resolve(arg)
+                return agg_fields[key], _agg_out_tag(func, tag)
+            if names is None or reductions is None or arg is None:
+                raise errors.feature_not_supported(
+                    f"DISTINCT inside {func}() is not supported in HAVING"
+                )
+            path, tag = resolve(arg)
+            fname, tag = _register_distinct_agg(
+                func, path, tag, None, names, accumulators, reductions
             )
+            agg_fields[key] = fname
+            return fname, tag
         where = _agg_filter_where(term)
         fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
         acc, tag = _join_accumulator(func, arg, resolve, fcond)
-        key = _agg_key(func, arg, resolve, distinct)
         if key not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
             accumulators[fname] = acc
