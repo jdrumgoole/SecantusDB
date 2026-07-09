@@ -4,7 +4,9 @@ A comparison where neither side is a constant — ``qty > shipped``,
 ``price < cost * 1.5`` — lowers to a Mongo ``$expr`` (the field/literal fast
 path, which the storage index planner can use, is unchanged). Arithmetic
 (``+``/``-``/``*``/``/``) over columns and literals is supported inside the
-comparison; arbitrary function calls in such a predicate are not (yet).
+comparison, as are the common scalar functions (``abs``/``lower``/``upper``/…,
+lowered by the same ``_func_to_agg_expr`` the computed GROUP BY keys use); a
+function the aggregation engine can't lower (e.g. ``substr``) is still ``0A000``.
 """
 
 from __future__ import annotations
@@ -127,10 +129,18 @@ def test_col_col_through_group_by(storage, session):
     assert rows == [("e", 10), ("w", 30)]
 
 
-def test_function_in_colref_predicate_unsupported(storage, session):
-    # A function call inside a column-to-column predicate isn't lowered yet.
+def test_function_in_colref_predicate(storage, session):
+    # A common function inside a column-to-column predicate now lowers to $expr
+    # (the same _func_to_agg_expr the computed GROUP BY keys use). abs(5)=5 ⇒ _id 1,
+    # abs(4)=4 ⇒ _id 3; _id 2 (qty 8 ≠ abs(3)) is excluded.
+    ids = q(storage, session, "SELECT _id FROM orders WHERE qty = abs(shipped) ORDER BY _id")
+    assert ids == [1, 3]
+
+
+def test_unsupported_function_in_colref_predicate(storage, session):
+    # A function the aggregation engine can't lower (substr) is still 0A000.
     with pytest.raises(SQLError) as ei:
-        q(storage, session, "SELECT _id FROM orders WHERE qty = abs(shipped)")
+        q(storage, session, "SELECT _id FROM orders WHERE qty = substr(shipped, 1, 1)")
     assert ei.value.sqlstate == "0A000"
 
 

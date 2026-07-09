@@ -1532,11 +1532,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `FROM a, b` form) compiles to the cartesian product — an empty `$lookup` pipeline returns every
   foreign doc, then `$unwind` (no preserve) pairs each with the outer row; an outer join without `ON`
   is a `42601`. Non-equi (`a.x < b.y`) and `OR` join conditions already rode the `$lookup` `let`/
-  `pipeline` form via `_OnTranslator` (the backlog was stale). Still `0A000`:
-  `RIGHT`/`FULL` in a 3+ table chain, subqueries, **computed GROUP BY *keys*** and
-  **scalar expressions *over* an aggregate** (e.g. `SUM(x) * 2`), and **function calls inside a
-  WHERE comparison** (the `$expr` path lowers columns + arithmetic, not function nodes —
-  `WHERE upper(name) = 'X'` is `0A000`). SUM/MIN/MAX
+  `pipeline` form via `_OnTranslator` (the backlog was stale). **Scalar expressions *over* an
+  aggregate** (`SUM(x) + 1`, `round(avg(x), 2)`) landed (b201, #167) via the evaluated group
+  path. **Computed GROUP BY *keys*** landed (b203, #168): a non-column GROUP BY key
+  (`GROUP BY lower(name)`, `x + 1`, `x % 2`, `coalesce(c, '?')`, `a || b`) is lowered to a Mongo
+  aggregation expression, materialised into a synthetic `__gkeyN` field by a pre-`$group`
+  `$addFields`, and every SQL-equal occurrence in SELECT / HAVING / ORDER BY is rewritten to that
+  synthetic column — so the existing bare-column group machinery handles the rest
+  (`_rewrite_computed_group_keys` + `_func_to_agg_expr` in the planner; single-table path). Keys
+  using a function the aggregation engine can't evaluate (e.g. `substr`) stay `0A000`; computed
+  keys over a JOIN / GROUPING SETS are not yet rewritten. Still `0A000`:
+  `RIGHT`/`FULL` in a 3+ table chain, subqueries, and **function calls inside a
+  WHERE comparison** (the `$expr` path lowers columns + arithmetic + the same common functions,
+  but the single-table pushdown routes `WHERE upper(name) = 'X'` through the field-path form). SUM/MIN/MAX
   result typing is approximate (uses the column's tag; AVG → float8; arithmetic → numeric).
   **`DISTINCT` aggregates landed** (b48): `COUNT`/`SUM`/`AVG(DISTINCT col)` compile to a
   `$addToSet` accumulator plus a post-`$group` `$addFields` that reduces the set
