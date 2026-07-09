@@ -2409,8 +2409,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `set_matview_populated`); querying an unpopulated matview errors `55000`
   (`object_not_in_prerequisite_state`, checked in `engine._run_select`), and its first `REFRESH` marks
   it populated. `WITH DATA` is the default (returns `SELECT N`; `WITH NO DATA` returns `CREATE
-  MATERIALIZED VIEW`). `REFRESH … CONCURRENTLY` is accepted (the existing `_MATVIEW_NAME_RE` already
-  skips the keyword; no unique index required since refresh is a full recompute). `ALTER MATERIALIZED
+  MATERIALIZED VIEW`). **`REFRESH … CONCURRENTLY` now enforces its Postgres prerequisites (#154, b193):**
+  `_refresh_matview` detects the `CONCURRENTLY` keyword and rejects it (`0A000` + the PG unique-index
+  hint) unless the matview is already populated *and* carries a unique index (`storage.list_indexes` →
+  any `unique`); otherwise it recomputes the snapshot exactly as a plain refresh (there is no true
+  diff-based concurrent apply, and Postgres has no *incremental* matview refresh to model). `ALTER MATERIALIZED
   VIEW name RENAME TO new` moves the registry entry, the catalog `TableDef`, and the backing collection
   (`storage.rename_collection`), preserving the populated flag. All three (`CREATE … WITH [NO] DATA`,
   `REFRESH … CONCURRENTLY`, `ALTER … RENAME`) parse as `exp.Command` — sqlglot can't parse them as DDL —

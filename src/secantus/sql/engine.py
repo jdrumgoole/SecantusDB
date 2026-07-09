@@ -1699,14 +1699,30 @@ def _refresh_matview(stmt: exp.Command, storage: Any, db: str, catalog, session)
     # The Command's argument is the raw tail text (e.g. "MATERIALIZED VIEW mv" or
     # "MATERIALIZED VIEW CONCURRENTLY mv"); a Literal carries it verbatim.
     arg = stmt.expression
-    text = arg.this if isinstance(arg, exp.Literal) else str(arg)
-    m = _MATVIEW_NAME_RE.match(str(text))
+    text = str(arg.this if isinstance(arg, exp.Literal) else arg)
+    m = _MATVIEW_NAME_RE.match(text)
     if m is None:
         raise errors.feature_not_supported(f"unsupported REFRESH: {stmt.sql()}")
     name = m.group(1).strip().strip('"')
+    concurrently = re.search(r"(?i)\bCONCURRENTLY\b", text) is not None
     definition = catalog.get_matview(db, name)
     if definition is None:
         raise errors.SQLError("42P01", f'materialized view "{name}" does not exist')
+    if concurrently:
+        # Postgres requires CONCURRENTLY to diff against an existing snapshot keyed
+        # by a unique index, so it rejects an unpopulated view and one with no
+        # unique index (same 0A000 + hint mongod-side clients would see).
+        if not catalog.matview_populated(db, name):
+            raise errors.feature_not_supported(
+                f'CONCURRENTLY cannot be used on materialized view "{name}" '
+                "before it has been populated by a non-concurrent REFRESH"
+            )
+        if not any(ix.get("unique") for ix in storage.list_indexes(db, name)):
+            raise errors.feature_not_supported(
+                f'cannot refresh materialized view "{name}" concurrently\n'
+                "HINT: Create a unique index with no WHERE clause on one or more "
+                "columns of the materialized view."
+            )
     _materialize(name, definition, storage, db, catalog, session)
     catalog.set_matview_populated(db, name, True)  # a WITH NO DATA matview is now scannable
     return SQLResult(command_tag="REFRESH MATERIALIZED VIEW")
