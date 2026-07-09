@@ -172,6 +172,17 @@ DELETE FROM users WHERE age < 18;
 SELECT COUNT(*) FROM users;        -- 2
 ```
 
+An `UPDATE`'s `SET col = …` right-hand side may be a literal or a **per-row
+expression** — arithmetic, a column reference, `||`, or a function call — and every
+assignment sees the row's *old* values (so a two-column swap `SET a = b, b = a`
+works). A computed primary-key target (`SET id = id + 1`) re-keys the row:
+
+```sql
+UPDATE t SET n = n + 1 WHERE id = 1;      -- increment
+UPDATE t SET total = price * qty;         -- from other columns
+UPDATE t SET tag = upper(tag);            -- function call
+```
+
 `INSERT` also accepts a query as its source — `INSERT INTO target [(cols)]
 SELECT …`. The source runs first (it may filter, join, aggregate, or be a set
 operation / CTE) and its result columns map positionally onto the target

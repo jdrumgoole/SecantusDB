@@ -169,6 +169,11 @@ class UpdatePlan:
     # True when the SET changes a primary-key column, so the executor must re-key
     # (delete + re-insert under the new ``_id``) rather than update in place.
     rekey: bool = False
+    # ``SET col = <expr>`` targets whose RHS is a per-row expression (arithmetic, a
+    # column reference, ``||``, a function …) rather than a literal — each a
+    # ``(storage_field, type_tag, expr_node)`` evaluated against the old row by the
+    # executor. Empty for a pure-literal UPDATE (the fast bulk ``$set`` path).
+    computed: list[tuple[str, str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -2341,6 +2346,7 @@ def _composite_subfield_target(target: exp.Expression, table: TableDef):
 def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
     set_doc: dict[str, Any] = {}
     rekey = False
+    computed: list[tuple[str, str, Any]] = []
     for assign in stmt.expressions:
         if not isinstance(assign, exp.EQ):
             raise errors.feature_not_supported(f"unsupported SET item: {assign.sql()}")
@@ -2351,7 +2357,10 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
             if comp_col.pk:
                 # Changing a composite-PK subfield re-keys the row (rewrites ``_id``).
                 rekey = True
-            raw = _literal(assign.expression)
+            raw = _try_literal(assign.expression)
+            if raw is _LITERAL_SENTINEL:  # a per-row expression, not a literal
+                computed.append((f"{comp_col.field}.{subfield}", tag, assign.expression))
+                continue
             if subfields is not None and raw is not None:
                 value = _build_composite(raw, subfields, tag)
             else:
@@ -2381,7 +2390,10 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
                     "428C9", f'column "{col_name}" can only be updated to DEFAULT'
                 )
             continue
-        raw = _literal(assign.expression)
+        raw = _try_literal(assign.expression)
+        if raw is _LITERAL_SENTINEL:  # ``SET col = <expr>`` — evaluated per row
+            computed.append((col.field, col.type_tag, assign.expression))
+            continue
         if raw is None and not col.nullable:
             raise errors.not_null_violation(col_name)
         if col.composite_type is not None and raw is not None:
@@ -2394,6 +2406,7 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         update={"$set": set_doc},
         returning=_returning_columns(stmt, table),
         rekey=rekey,
+        computed=computed,
     )
 
 

@@ -2274,9 +2274,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   post-image validation, checks the new `_id` is free (else `23505`), then deletes the old row and inserts
   the re-keyed one (all deletes before any insert, so a PK swap between rows doesn't collide). Statement-atomic.
   **Limitations:** a reflected collection's `_id` still can't be updated (`0A000` — it's the real Mongo key);
-  a PK swap needs literal targets (`SET id = <expr>` referencing the row isn't supported — a general
-  UPDATE-SET-to-expression gap); renaming a composite-PK column via `ALTER TABLE` doesn't rewrite the
-  `_id.<name>` subdoc key (edge case); a SERIAL/identity column inside a composite PK is untested.
+  renaming a composite-PK column via `ALTER TABLE` doesn't rewrite the `_id.<name>` subdoc key (edge case);
+  a SERIAL/identity column inside a composite PK is untested. (A computed PK — `SET id = <expr>` — now works,
+  including a PK swap; see the UPDATE-SET-expression entry below.)
+- [ ] **`UPDATE ... SET col = <expr>` — per-row computed assignment landed (#159, b198).** A SET RHS that isn't
+  a literal (arithmetic, a column reference, `||`, a function call — `SET n = n + 1`, `SET a = b`, `SET s =
+  upper(s)`) is collected into `UpdatePlan.computed` (`(field, type_tag, expr)`) by `plan_update` (via
+  `_try_literal`), and `executor._execute_update_materialized` evaluates each against the **old** row (a
+  `scope` over the pre-image, so a two-column swap `SET a=b, b=a` is correct), coerces to the column type,
+  validates the post-image (NOT NULL `23502` / CHECK / UNIQUE / FK / generated — statement-atomic), and writes
+  it back per row (or delete+insert when the computed target is the PK). The pure-literal UPDATE keeps the
+  fast bulk `$set` path. Tests: `tests/test_sql_update_expr.py`. **Limitations:** a computed *composite-type*
+  subfield is coerced as a scalar (nested composite value not rebuilt); a SET RHS that is a correlated
+  subquery over another table isn't modelled.
 - [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
   passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
   in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.
