@@ -2237,9 +2237,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   rectangular shape, `array_length` (`exp.ArraySize`) and the Anonymous funcs share it, and the funcs are
   routed to the full scalar evaluator (added to `functions._SCALAR_EVAL_ANON`) so an `ARRAY[[…]]` argument
   evaluates. (A jagged / non-rectangular array reports lengths off its first element, as Postgres rejects
-  those at build time anyway.) **Limitations:** array functions are evaluated in Python (SELECT-list /
+  those at build time anyway.) **Array `@>` / `&&` WHERE acceleration landed (#158, b197):** `field @>
+  ARRAY[...]` and `field && ARRAY[...]` (`&&` symmetric) now lower to an *exact*, index-eligible Mongo filter
+  instead of a COLLSCAN residual — `planner._array_index_filter`: `@>` → an `$and` of multikey equalities
+  (`{$and: [{field: a}, {field: b}]}`, a lone element collapsing to `{field: a}`), `&&` → `{field: {$in:
+  [...]}}`. `_where_has_array_predicate` / `_where_has_jsonb_contained_predicate` skip these shapes so they
+  ride the pushdown (IXSCAN) path; a single-element `@>` and any `&&` light up a multikey index (`explain`
+  reports IXSCAN). **Still per-row (residual COLLSCAN):** `<@` (subset — no exact filter), a *multi*-element
+  `@>` (the planner doesn't index an `$and`-of-equalities, so it's correct but scans), `field @> ARRAY[]`
+  (empty — true for all rows, which `$all: []` can't express), field-vs-field, and jsonb / range `@>`/`<@`/
+  `&&` (unchanged). Other array functions are evaluated in Python (SELECT-list /
   INSERT-SELECT), not pushed into a Mongo
-  `$match` when used in WHERE; no element-type coercion beyond the scalar tags. The FROM-clause table form
+  `$match`; no element-type coercion beyond the scalar tags. The FROM-clause table form
   `SELECT … FROM t, unnest(t.tags) AS tag` landed in b119 (`planner._unnest_join_stage`: an `$addFields`
   exposing the array under the alias column + `$unwind`; a synthetic one-column `TableDef` registered at
   top level in the join `amap`; inner/comma/CROSS drops empty arrays, `LEFT JOIN … ON true` keeps them with

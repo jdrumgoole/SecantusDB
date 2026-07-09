@@ -1006,6 +1006,11 @@ SELECT id FROM post WHERE scores <@ ARRAY[5,10,20]; -- contained by: every LHS e
 SELECT id FROM post WHERE scores && ARRAY[20,99];   -- overlaps: share ≥1 element
 ```
 
+`field @> ARRAY[…]` and `field && ARRAY[…]` against an array **column** with an
+index use that index (a single-element `@>` and any `&&` report `IXSCAN` in
+`EXPLAIN`); a multi-element `@>`, the `<@` (subset) form, and `field @> '{}'`
+(empty, true for every row) are evaluated per row.
+
 `array_length(col, dim)` gives the length along a dimension, `cardinality(col)`
 the total element count, and `array_ndims` / `array_dims` / `array_upper` /
 `array_lower` round out the introspection. **Multi-dimensional arrays** work:
