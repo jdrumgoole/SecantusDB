@@ -5326,8 +5326,18 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             "json_object_agg",
         ):
             return "json"
-        if fname in ("jsonb_array_length", "json_array_length", "array_length", "cardinality"):
+        if fname in (
+            "jsonb_array_length",
+            "json_array_length",
+            "array_length",
+            "cardinality",
+            "array_ndims",
+            "array_upper",
+            "array_lower",
+        ):
             return "int4"
+        if fname == "array_dims":
+            return "text"
         if fname in ("jsonb_path_exists", "jsonb_path_match"):
             return "bool"
         if fname in ("has_table_privilege", "has_column_privilege"):

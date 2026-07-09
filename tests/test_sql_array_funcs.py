@@ -117,3 +117,52 @@ def test_array_agg_into_declared_array_column(storage, session):
         (1, [10, 20]),
         (2, [30]),
     ]
+
+
+# --- multi-dimensional array introspection (#153) -------------------------- #
+
+_M = "ARRAY[[1,2,3],[4,5,6]]"  # a 2x3 array
+
+
+def test_array_ndims_multidim(storage, session):
+    assert run(storage, session, f"SELECT array_ndims({_M})").rows == [(2,)]
+    assert run(storage, session, "SELECT array_ndims(ARRAY[1,2,3])").rows == [(1,)]
+
+
+def test_array_length_per_dimension(storage, session):
+    assert run(storage, session, f"SELECT array_length({_M}, 1)").rows == [(2,)]
+    assert run(storage, session, f"SELECT array_length({_M}, 2)").rows == [(3,)]
+    assert run(storage, session, f"SELECT array_length({_M}, 3)").rows == [(None,)]
+
+
+def test_array_upper_lower_multidim(storage, session):
+    assert run(storage, session, f"SELECT array_upper({_M}, 2)").rows == [(3,)]
+    assert run(storage, session, f"SELECT array_lower({_M}, 2)").rows == [(1,)]
+    assert run(storage, session, f"SELECT array_upper({_M}, 3)").rows == [(None,)]
+
+
+def test_cardinality_counts_all_elements(storage, session):
+    assert run(storage, session, f"SELECT cardinality({_M})").rows == [(6,)]
+    assert run(storage, session, "SELECT cardinality(ARRAY[1,2,3])").rows == [(3,)]
+
+
+def test_array_dims_text(storage, session):
+    res = run(storage, session, f"SELECT array_dims({_M})")
+    assert res.rows == [("[1:2][1:3]",)]
+    assert res.columns[0].type_tag == "text"
+
+
+def test_multidim_introspection_types(storage, session):
+    for fn, tag in [("array_ndims", "int4"), ("cardinality", "int4")]:
+        assert run(storage, session, f"SELECT {fn}({_M})").columns[0].type_tag == tag
+
+
+def test_multidim_array_column_roundtrip_and_funcs(storage, session):
+    run(storage, session, "CREATE TABLE grids (id int PRIMARY KEY, g int[][])")
+    run(storage, session, f"INSERT INTO grids VALUES (1, {_M})")
+    assert run(storage, session, "SELECT g FROM grids").rows == [([[1, 2, 3], [4, 5, 6]],)]
+    assert run(storage, session, "SELECT g[2][3] FROM grids").rows == [(6,)]
+    assert run(storage, session, "SELECT array_ndims(g), cardinality(g) FROM grids").rows == [
+        (2, 6)
+    ]
+    assert run(storage, session, "SELECT array_length(g, 2) FROM grids").rows == [(3,)]

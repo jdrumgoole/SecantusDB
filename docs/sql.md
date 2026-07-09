@@ -1003,10 +1003,14 @@ SELECT id FROM post WHERE scores <@ ARRAY[5,10,20]; -- contained by: every LHS e
 SELECT id FROM post WHERE scores && ARRAY[20,99];   -- overlaps: share ≥1 element
 ```
 
-`array_length(col, 1)` / `cardinality(col)` give the element count (only
-dimension 1 exists — arrays are one level deep, so any other dimension is NULL).
-Array columns reflect as `information_schema.columns.data_type = 'ARRAY'` with the
-Postgres array type OID in `pg_attribute`.
+`array_length(col, dim)` gives the length along a dimension, `cardinality(col)`
+the total element count, and `array_ndims` / `array_dims` / `array_upper` /
+`array_lower` round out the introspection. **Multi-dimensional arrays** work:
+`ARRAY[[1,2,3],[4,5,6]]` (or an `int[][]` column) stores, subscripts (`g[2][3]`),
+and reports per-dimension lengths (`array_length(g, 2)` → `3`, `array_ndims(g)` →
+`2`, `array_dims(g)` → `[1:2][1:3]`, `cardinality(g)` → `6`). Array columns reflect
+as `information_schema.columns.data_type = 'ARRAY'` with the Postgres array type
+OID in `pg_attribute`.
 
 Arrays of the richer element types work the same way, and each reports its proper
 Postgres array-type OID so a driver decodes the elements natively (a `uuid[]`

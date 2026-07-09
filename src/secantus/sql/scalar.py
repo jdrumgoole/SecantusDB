@@ -490,16 +490,18 @@ def _eval_substring(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> A
 
 
 def _eval_array_size(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
-    # array_length(arr, dim) / cardinality(arr). Arrays are stored as native BSON
-    # lists (one level deep here), so only dimension 1 has a length; any other
-    # dimension is NULL, matching Postgres for a 1-D array.
+    # ``array_length(arr, dim)`` — the length along ``dim`` (1-based). A
+    # multi-dimensional array reports each dimension's length; a dimension beyond
+    # the array's rank is NULL, matching Postgres.
     v = evaluate(node.this, scope, ctx)
     if not isinstance(v, (list, tuple)):
         return None
+    dims = _array_dim_lengths(v)
     dim_node = node.args.get("expression")
-    if dim_node is not None and int(evaluate(dim_node, scope, ctx)) != 1:
+    dim = int(evaluate(dim_node, scope, ctx)) if dim_node is not None else 1
+    if dim < 1 or dim > len(dims):
         return None
-    return len(v)
+    return dims[dim - 1]
 
 
 def _as_list(v: Any) -> list:
@@ -1542,13 +1544,31 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if not isinstance(v, list):
             raise errors.SQLError("22023", "cannot get array length of a non-array")
         return len(v)
-    if name in ("array_length", "cardinality"):
+    if name in ("array_length", "cardinality", "array_ndims", "array_upper", "array_lower"):
         v = args[0] if args else None
         if not isinstance(v, (list, tuple)):
             return None
-        if name == "array_length" and len(args) > 1 and args[1] != 1:
+        dims = _array_dim_lengths(v)
+        if name == "cardinality":
+            n = 1
+            for d in dims:
+                n *= d
+            return n if dims else 0
+        if name == "array_ndims":
+            return len(dims) or None
+        # array_length / array_upper / array_lower take a 1-based dimension.
+        dim = int(args[1]) if len(args) > 1 and args[1] is not None else 1
+        if dim < 1 or dim > len(dims):
             return None
-        return len(v)
+        if name == "array_lower":
+            return 1  # Postgres arrays are 1-based by default
+        return dims[dim - 1]  # array_length == array_upper (lower is 1)
+    if name == "array_dims":
+        v = args[0] if args else None
+        if not isinstance(v, (list, tuple)):
+            return None
+        dims = _array_dim_lengths(v)
+        return "".join(f"[1:{d}]" for d in dims) if dims else None
     if name in ("jsonb_typeof", "json_typeof"):
         return _json_typeof(args[0] if args else None)
     if name in ("jsonb_set", "jsonb_set_lax"):
@@ -2208,6 +2228,18 @@ def _array_membership(needle: Any, haystack: list) -> bool:
         except Exception:  # noqa: BLE001 — heterogeneous element types compare unequal
             continue
     return False
+
+
+def _array_dim_lengths(v: Any) -> list[int]:
+    """The per-dimension lengths of a (rectangular) Postgres array — ``[2, 3]`` for
+    a 2×3 array — walking the first element of each level. An empty array has no
+    dimensions (``[]``), matching Postgres' ``array_ndims('{}') IS NULL``."""
+    dims: list[int] = []
+    cur = v
+    while isinstance(cur, (list, tuple)) and len(cur) > 0:
+        dims.append(len(cur))
+        cur = cur[0]
+    return dims
 
 
 def _eval_array_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:

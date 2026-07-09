@@ -2217,8 +2217,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `array_append` / `array_prepend` / `array_cat` (NULL array treated as empty, per Postgres),
   `array_position` (1-based, NULL if absent), `array_remove`, `array_to_string` (optional null-string
   arg; NULL elements dropped otherwise). `array_agg` populates a declared array column via `INSERT …
-  SELECT`. **Limitations:** one level deep only (no multi-dimensional arrays — `array_length(col, 2)` is
-  NULL); array functions are evaluated in Python (SELECT-list / INSERT-SELECT), not pushed into a Mongo
+  SELECT`. **Multi-dimensional array introspection landed (#153, b192):** nested-array literals /
+  columns (`int[][]`) round-trip and subscript (`g[2][3]`), and `array_ndims`, `array_dims`,
+  `array_length(arr, dim)`, `array_upper` / `array_lower` (per dimension), and `cardinality` (total
+  element count across all dimensions) are all dimension-aware — `scalar._array_dim_lengths` walks the
+  rectangular shape, `array_length` (`exp.ArraySize`) and the Anonymous funcs share it, and the funcs are
+  routed to the full scalar evaluator (added to `functions._SCALAR_EVAL_ANON`) so an `ARRAY[[…]]` argument
+  evaluates. (A jagged / non-rectangular array reports lengths off its first element, as Postgres rejects
+  those at build time anyway.) **Limitations:** array functions are evaluated in Python (SELECT-list /
+  INSERT-SELECT), not pushed into a Mongo
   `$match` when used in WHERE; no element-type coercion beyond the scalar tags. The FROM-clause table form
   `SELECT … FROM t, unnest(t.tags) AS tag` landed in b119 (`planner._unnest_join_stage`: an `$addFields`
   exposing the array under the alias column + `$unwind`; a synthetic one-column `TableDef` registered at
