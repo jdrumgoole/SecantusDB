@@ -946,9 +946,27 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
 
 
 def _pg_attrdef(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    # No column DEFAULTs in our model — the relation exists (so joins resolve)
-    # but is always empty.
-    return []
+    # One row per column that carries a DEFAULT. ``adbin`` holds the default's SQL
+    # text (Postgres stores a nodeToString there and tools call pg_get_expr; we
+    # store the rendered text directly, which is what our pg_get_expr passes
+    # through). ``adnum`` is the column's attnum; ``oid`` is synthesised per row.
+    oids = _table_oids(db, catalog)
+    rows: list[dict] = []
+    for t in _user_tables(db, catalog):
+        relid = oids[t.name]
+        for attnum, col in enumerate(t.columns, start=1):
+            adbin = _column_default_text(col)
+            if adbin is None:
+                continue
+            rows.append(
+                {
+                    "oid": relid * 1000 + attnum,
+                    "adrelid": relid,
+                    "adnum": attnum,
+                    "adbin": adbin,
+                }
+            )
+    return rows
 
 
 _PG_CLASS_OID = 1259  # the OID of the pg_class catalog itself (classoid for relations)
