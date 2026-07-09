@@ -1382,6 +1382,13 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   expression operators (0.5.3-beta.142 / 0.5.4b202 — three-way verified: values +
   mongod error codes 5687301/2, 51745; `$type` reports `"missing"` for an absent
   field; `$strcasecmp`/`$replace*` defer non-ASCII case to the Python oracle); the
+  **set-expression family** `$setUnion` / `$setIntersection` / `$setDifference` /
+  `$setEquals` / `$setIsSubset` / `$allElementsTrue` / `$anyElementTrue` plus the
+  utilities `$cmp`, `$binarySize`, `$bsonSize`, `$degreesToRadians` /
+  `$radiansToDegrees` (0.5.3-beta.143 / 0.5.4b206 — three-way verified, zero value
+  divergences: union/intersection return BSON-sorted, difference preserves
+  first-array order, all set ops dedup by BSON-order equality; a non-array arg or a
+  cross-type-unsortable element defers to the Python oracle on the Rust side); the
   bitwise **expression** operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
   (0.5.3-beta.136 / 0.5.4b164 — int/long operands, int32/int64 result width,
   empty-list identity, null propagation; a non-integer operand raises), and the

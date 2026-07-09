@@ -636,6 +636,41 @@ def test_aggregate_new_expression_operators(coll) -> None:
     ]
 
 
+def test_aggregate_set_operators(coll) -> None:
+    coll.insert_one({"_id": 1, "a": 5, "b": "x"})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "union": {"$setUnion": [[3, 1, 2], [5, 4]]},
+                        "inter": {"$setIntersection": [[3, 1, 2, 5], [2, 5, 1]]},
+                        "diff": {"$setDifference": [[5, 3, 1, 2], [3]]},
+                        "eq": {"$setEquals": [[1, 2], [2, 1]]},
+                        "sub": {"$setIsSubset": [[1, 2], [1, 2, 3]]},
+                        "allt": {"$allElementsTrue": [[1, True]]},
+                        "cmp": {"$cmp": [1, 2]},
+                        "bsz": {"$bsonSize": "$$ROOT"},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [
+        {
+            "union": [1, 2, 3, 4, 5],
+            "inter": [1, 2, 5],
+            "diff": [5, 1, 2],
+            "eq": True,
+            "sub": True,
+            "allt": True,
+            "cmp": -1,
+            "bsz": 30,
+        }
+    ]
+
+
 def test_aggregate_date_from_parts(coll) -> None:
     coll.insert_one({"_id": 1})
     out = list(

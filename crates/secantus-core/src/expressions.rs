@@ -220,6 +220,19 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$map" => op_map(arg, ctx),
         "$filter" => op_filter(arg, ctx),
         "$reduce" => op_reduce(arg, ctx),
+        // set operators (BSON-order sort/equality; unsortable elements defer)
+        "$setUnion" => op_set_union(arg, ctx),
+        "$setIntersection" => op_set_intersection(arg, ctx),
+        "$setDifference" => op_set_difference(arg, ctx),
+        "$setEquals" => op_set_equals(arg, ctx),
+        "$setIsSubset" => op_set_is_subset(arg, ctx),
+        "$allElementsTrue" => op_elements_true(arg, ctx, true),
+        "$anyElementTrue" => op_elements_true(arg, ctx, false),
+        "$cmp" => op_cmp(arg, ctx),
+        "$binarySize" => op_binary_size(arg, ctx),
+        "$bsonSize" => op_bson_size(arg, ctx),
+        "$degreesToRadians" => op_deg_rad(arg, ctx, true),
+        "$radiansToDegrees" => op_deg_rad(arg, ctx, false),
         // date component extractors — bare date expr or `{date, timezone}` object
         // form (fixed-offset + named IANA zones via chrono-tz; instant→local)
         "$year" => date_part(arg, ctx, DatePart::Year),
@@ -1266,6 +1279,157 @@ fn op_reduce(arg: &Bson, ctx: &Ctx) -> R {
         acc = eval_with_vars(in_expr, ctx, &[("value", acc), ("this", elem)])?;
     }
     Ok(acc)
+}
+
+// --- set operators ------------------------------------------------------
+
+/// Evaluate a set operator's array arguments, requiring every one to be an array
+/// and every element to be in the sortable subset (else defer — Python's
+/// `_SortKey` / `_bson_lt` handles the wider set, matching `$sortArray`/`$maxN`).
+fn set_arrays(arg: &Bson, ctx: &Ctx, n: Option<usize>) -> Result<Vec<Vec<Bson>>, Fallback> {
+    let vals = eval_args(arg, ctx)?;
+    if n.is_some_and(|k| vals.len() != k) {
+        return Err(Fallback);
+    }
+    let mut out = Vec::with_capacity(vals.len());
+    for v in vals {
+        let Bson::Array(a) = v else {
+            return Err(Fallback); // non-array -> Python raises
+        };
+        if !a.iter().all(crate::order::is_sortable) {
+            return Err(Fallback);
+        }
+        out.push(a);
+    }
+    Ok(out)
+}
+
+fn set_eq(a: &Bson, b: &Bson) -> bool {
+    crate::order::cmp(a, b) == Ordering::Equal
+}
+
+fn set_dedup_sorted(mut items: Vec<Bson>) -> Bson {
+    items.sort_by(crate::order::cmp);
+    items.dedup_by(|a, b| crate::order::cmp(a, b) == Ordering::Equal);
+    Bson::Array(items)
+}
+
+fn op_set_union(arg: &Bson, ctx: &Ctx) -> R {
+    let arrays = set_arrays(arg, ctx, None)?;
+    Ok(set_dedup_sorted(arrays.into_iter().flatten().collect()))
+}
+
+fn op_set_intersection(arg: &Bson, ctx: &Ctx) -> R {
+    let arrays = set_arrays(arg, ctx, None)?;
+    let Some(first) = arrays.first() else {
+        return Ok(Bson::Array(Vec::new()));
+    };
+    let result: Vec<Bson> = first
+        .iter()
+        .filter(|x| arrays[1..].iter().all(|o| o.iter().any(|y| set_eq(x, y))))
+        .cloned()
+        .collect();
+    Ok(set_dedup_sorted(result))
+}
+
+fn op_set_difference(arg: &Bson, ctx: &Ctx) -> R {
+    let arrays = set_arrays(arg, ctx, Some(2))?;
+    let (a, b) = (&arrays[0], &arrays[1]);
+    let mut out: Vec<Bson> = Vec::new();
+    for x in a {
+        if !b.iter().any(|y| set_eq(x, y)) && !out.iter().any(|y| set_eq(x, y)) {
+            out.push(x.clone());
+        }
+    }
+    Ok(Bson::Array(out))
+}
+
+fn op_set_equals(arg: &Bson, ctx: &Ctx) -> R {
+    let arrays = set_arrays(arg, ctx, None)?;
+    let base = match arrays.first() {
+        Some(a) => set_dedup_sorted(a.clone()),
+        None => Bson::Array(Vec::new()),
+    };
+    for other in &arrays[1..] {
+        if set_dedup_sorted(other.clone()) != base {
+            return Ok(Bson::Boolean(false));
+        }
+    }
+    Ok(Bson::Boolean(true))
+}
+
+fn op_set_is_subset(arg: &Bson, ctx: &Ctx) -> R {
+    let arrays = set_arrays(arg, ctx, Some(2))?;
+    let (a, b) = (&arrays[0], &arrays[1]);
+    Ok(Bson::Boolean(
+        a.iter().all(|x| b.iter().any(|y| set_eq(x, y))),
+    ))
+}
+
+fn op_elements_true(arg: &Bson, ctx: &Ctx, all: bool) -> R {
+    let arr = eval_args(arg, ctx)?;
+    let Some(Bson::Array(a)) = arr.into_iter().next() else {
+        return Err(Fallback);
+    };
+    Ok(Bson::Boolean(if all {
+        a.iter().all(truthy)
+    } else {
+        a.iter().any(truthy)
+    }))
+}
+
+/// `$cmp`: three-way BSON-order comparison of two values → -1 / 0 / 1. Operands
+/// outside the sortable subset defer (Python's `_bson_lt` handles them).
+fn op_cmp(arg: &Bson, ctx: &Ctx) -> R {
+    let vals = eval_args(arg, ctx)?;
+    if vals.len() != 2 || !vals.iter().all(crate::order::is_sortable) {
+        return Err(Fallback);
+    }
+    Ok(Bson::Int32(match crate::order::cmp(&vals[0], &vals[1]) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }))
+}
+
+/// `$binarySize`: byte length of a string (UTF-8) or binary. Null → null.
+fn op_binary_size(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        Bson::String(s) => Ok(Bson::Int32(s.len() as i32)),
+        Bson::Binary(b) => Ok(Bson::Int32(b.bytes.len() as i32)),
+        _ => Err(Fallback),
+    }
+}
+
+/// `$bsonSize`: the BSON-encoded byte size of a document. Null → null.
+fn op_bson_size(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        Bson::Document(d) => {
+            let mut buf = Vec::new();
+            d.to_writer(&mut buf).map_err(|_| Fallback)?;
+            Ok(Bson::Int32(buf.len() as i32))
+        }
+        _ => Err(Fallback),
+    }
+}
+
+/// `$degreesToRadians` (`to_rad`) / `$radiansToDegrees`. Non-numeric / bool
+/// defers (Python raises). Decimal128 defers to the pure oracle.
+fn op_deg_rad(arg: &Bson, ctx: &Ctx, to_rad: bool) -> R {
+    let x = match eval(arg, ctx)? {
+        Bson::Null => return Ok(Bson::Null),
+        Bson::Int32(n) => n as f64,
+        Bson::Int64(n) => n as f64,
+        Bson::Double(d) => d,
+        _ => return Err(Fallback),
+    };
+    Ok(Bson::Double(if to_rad {
+        x * std::f64::consts::PI / 180.0
+    } else {
+        x * 180.0 / std::f64::consts::PI
+    }))
 }
 
 /// Evaluate an optional sub-expression; a missing key behaves like Python's
@@ -3286,6 +3450,76 @@ mod tests {
         assert!(evaluate(
             &doc! {},
             &bson::bson!({"$replaceOne": {"input": "a", "find": 5, "replacement": "b"}}),
+            &Document::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn set_operators() {
+        let arr = |xs: &[i32]| Bson::Array(xs.iter().map(|x| Bson::Int32(*x)).collect());
+        // setUnion / setIntersection sorted; setDifference first-array order.
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$setUnion": [[3, 1, 2], [5, 4]]})),
+            arr(&[1, 2, 3, 4, 5])
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$setUnion": [[3, 3, 1], [1, 2]]})),
+            arr(&[1, 2, 3])
+        );
+        assert_eq!(
+            ev(
+                doc! {},
+                bson::bson!({"$setIntersection": [[3, 1, 2, 5], [2, 5, 1]]})
+            ),
+            arr(&[1, 2, 5])
+        );
+        assert_eq!(
+            ev(
+                doc! {},
+                bson::bson!({"$setDifference": [[5, 3, 1, 2], [3]]})
+            ),
+            arr(&[5, 1, 2])
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$setEquals": [[1, 2], [2, 1]]})),
+            Bson::Boolean(true)
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$setIsSubset": [[1, 2], [1, 2, 3]]})),
+            Bson::Boolean(true)
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$allElementsTrue": [[1, true]]})),
+            Bson::Boolean(true)
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$allElementsTrue": [[1, 0]]})),
+            Bson::Boolean(false)
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$anyElementTrue": [[0, false, 1]]})),
+            Bson::Boolean(true)
+        );
+        // $cmp / sizes / degrees.
+        assert_eq!(ev(doc! {}, bson::bson!({"$cmp": [1, 2]})), Bson::Int32(-1));
+        assert_eq!(ev(doc! {}, bson::bson!({"$cmp": [5, 5]})), Bson::Int32(0));
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$binarySize": "héllo"})),
+            Bson::Int32(6)
+        );
+        assert_eq!(
+            ev(doc! {"a": 5i32}, bson::bson!({"$bsonSize": "$$ROOT"})),
+            Bson::Int32(12)
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$degreesToRadians": 180})),
+            Bson::Double(std::f64::consts::PI)
+        );
+        // A non-array set arg / cross-type-sortless element defers.
+        assert!(evaluate(
+            &doc! {},
+            &bson::bson!({"$setUnion": [[1], 5]}),
             &Document::new()
         )
         .is_err());

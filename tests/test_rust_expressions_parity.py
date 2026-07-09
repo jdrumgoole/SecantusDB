@@ -240,6 +240,36 @@ CURATED = [
         {"xs": ["a", "b", "c"]},
     ),
     ({"$let": {"vars": {"d": {"$add": ["$x", 1]}}, "in": {"$multiply": ["$$d", 2]}}}, {"x": 5}),
+    # Set operators — union/intersection BSON-sorted, difference first-array order;
+    # dedup by BSON equality; a non-array arg or unsortable element defers.
+    ({"$setUnion": [[3, 1, 2], [5, 4]]}, {}),
+    ({"$setUnion": [[3, 3, 1], [1, 2]]}, {}),
+    ({"$setUnion": [["b", 1, "a"], [2, "a"]]}, {}),  # cross-type order
+    ({"$setUnion": [[1], [1.0]]}, {}),  # 1 == 1.0 dedup
+    ({"$setIntersection": [[3, 1, 2, 5], [2, 5, 1]]}, {}),
+    ({"$setIntersection": [[1, 2], [3, 4]]}, {}),  # empty
+    ({"$setDifference": [[5, 3, 1, 2], [3]]}, {}),
+    ({"$setEquals": [[1, 2], [2, 1]]}, {}),
+    ({"$setEquals": [[1, 2], [1, 3]]}, {}),
+    ({"$setIsSubset": [[1, 2], [1, 2, 3]]}, {}),
+    ({"$setIsSubset": [[1, 4], [1, 2, 3]]}, {}),
+    ({"$allElementsTrue": [[1, True]]}, {}),
+    ({"$allElementsTrue": [[1, 0]]}, {}),
+    ({"$anyElementTrue": [[0, False, 1]]}, {}),
+    ({"$setUnion": [[1], 5]}, {}),  # non-array -> defer
+    ({"$setUnion": [[True, 1]]}, {}),  # bool element -> defer (unsortable)
+    # $cmp / $binarySize / $bsonSize / degrees.
+    ({"$cmp": [1, 2]}, {}),
+    ({"$cmp": [5, 5]}, {}),
+    ({"$cmp": ["b", "a"]}, {}),
+    ({"$cmp": [1, "x"]}, {}),  # cross-type BSON order
+    ({"$binarySize": "$s"}, {"s": "héllo"}),
+    ({"$binarySize": "$x"}, {}),  # missing -> null
+    ({"$bsonSize": "$$ROOT"}, {"a": 5, "b": "x"}),
+    ({"$degreesToRadians": 180}, {}),
+    ({"$degreesToRadians": 45}, {}),
+    ({"$radiansToDegrees": 1}, {}),
+    ({"$radiansToDegrees": "$x"}, {}),  # missing -> null
     # $map referencing a ROOT field path inside `in` ($$CURRENT stays ROOT).
     ({"$map": {"input": [1, 2], "in": {"$add": ["$$this", "$base"]}}}, {"base": 100}),
     # Date component extractors.
