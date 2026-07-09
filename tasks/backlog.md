@@ -410,15 +410,15 @@ adapter → bind → print address → SIGINT/SIGTERM → clean stop), smoked by
 **Distribution:** the binary ships two ways. (1) Prebuilt static-WiredTiger
 archives on a GitHub Release via `.github/workflows/release-binaries.yml`
 (tag `secantusdb-v<crate-version>`; x86_64-linux-gnu + aarch64-apple-darwin;
-the file inside each tarball is named `secantusdb-rs`). (2) Bundled INTO the
-`secantus` wheel as the `secantusdb-rs` command (non-Windows): `CMakeLists.txt`
+the file inside each tarball is named `secantusd-rs`). (2) Bundled INTO the
+`secantus` wheel as the `secantusd-rs` command (non-Windows): `CMakeLists.txt`
 installs it into `SKBUILD_SCRIPTS_DIR` under the `SECANTUS_BUILD_STORAGE_ENGINE`
-flag, so a flag-on wheel puts `secantusdb-rs` on PATH (distinct from the
-pure-Python `secantus.cli:main` `secantusdb` console script). The
-`storage-engine` CI job asserts the bundled `secantusdb-rs` runs.
+flag, so a flag-on wheel puts `secantusd-rs` on PATH (distinct from the
+pure-Python `secantus.cli:main` `secantusd-py` console script). The
+`storage-engine` CI job asserts the bundled `secantusd-rs` runs.
 **Shipping wheels now flag-ON (0.5.4b1):** `wheels.yml` + `publish.yml` build
 with `SECANTUS_BUILD_STORAGE_ENGINE=ON`, so `pip install secantus` bundles the
-`_secantus_storage` / `_secantus_server` extensions **and** `secantusdb-rs` on
+`_secantus_storage` / `_secantus_server` extensions **and** `secantusd-rs` on
 **Linux (manylinux_2_28 + musllinux_1_2, x86_64 + aarch64), macOS arm64, and
 Windows AMD64** — every shipped wheel except Intel macOS (no wheel target).
 Toolchain in `[tool.cibuildwheel].before-build`: Linux swig+clang-libs+rustup
@@ -429,7 +429,7 @@ for musl cdylibs. Build perf: `SECANTUS_CARGO_TARGET` shares one cargo target di
 across all wheels in a job (and rides the ccache mount/cache on Linux/macOS) so
 the Rust deps compile once, not per-wheel — cut wall-clock ~72min → ~35min.
 Windows paths are forward-slashed so CMake doesn't eat the `\c`. Verified: built
-manylinux + Windows wheels contain `secantusdb-rs`(`.exe`) under
+manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
 `*.data/scripts/` plus the two extensions. **Remaining:**
 - [ ] **macOS x86_64 / Intel** stays pure-Python (no wheel target — runner-pool
   scarcity), so Intel-Mac pip users don't get the Rust bits.

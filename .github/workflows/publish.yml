@@ -113,7 +113,7 @@ jobs:
             fi
           CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
           # SECANTUS_BUILD_STORAGE_ENGINE=ON bundles the Rust extensions +
-          # secantusdb-rs into the published wheel (kept in sync with
+          # secantusd-rs into the published wheel (kept in sync with
           # wheels.yml + pyproject's [tool.cibuildwheel] toolchain installs).
           CIBW_ENVIRONMENT_LINUX: >-
             CCACHE_DIR=/host_ccache

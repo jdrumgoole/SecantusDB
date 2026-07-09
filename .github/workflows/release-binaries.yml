@@ -140,7 +140,7 @@ jobs:
           export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
           cargo build --release --locked --target ${{ matrix.target }} \
             --manifest-path crates/secantusdb/Cargo.toml
-          bin="crates/secantusdb/target/${{ matrix.target }}/release/secantusdb"
+          bin="crates/secantusdb/target/${{ matrix.target }}/release/secantusd-rs"
           strip "$bin" || true
           echo "BIN=$bin" >> "$GITHUB_ENV"
           "$bin" --version
@@ -161,9 +161,9 @@ jobs:
         run: |
           stem="secantusdb-${VERSION}-${{ matrix.target }}"
           mkdir -p "$stem"
-          # Ship the binary as `secantusdb-rs`, matching the command name the
-          # wheel installs (the pure-Python `secantusdb` is a different program).
-          cp "$BIN" "$stem/secantusdb-rs"
+          # Ship the binary as `secantusd-rs`, matching the command name the
+          # wheel installs (the pure-Python `secantusd-py` is a different program).
+          cp "$BIN" "$stem/secantusd-rs"
           cp LICENSE README.md "$stem/"
           tar -czf "$stem.tar.gz" "$stem"
           shasum -a 256 "$stem.tar.gz" > "$stem.tar.gz.sha256"

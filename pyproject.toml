@@ -266,7 +266,7 @@ archs = ["AMD64"]
 # env serialization on Windows; a no-space LIBCLANG_PATH sidesteps that.
 before-build = 'choco install -y swig llvm && (if not exist C:\libclang mkdir C:\libclang) && copy /Y "C:\Program Files\LLVM\bin\libclang.dll" C:\libclang'
 # Flag + libclang + shared cargo target for the storage-engine bundle
-# (_secantus_storage / _secantus_server extensions + secantusdb-rs.exe). Set here,
+# (_secantus_storage / _secantus_server extensions + secantusd-rs.exe). Set here,
 # not in a workflow CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't
 # overridden). Raw values — cibuildwheel quotes table values itself, so our own
 # quotes once produced a doubled-quote "Malformed environment option".
