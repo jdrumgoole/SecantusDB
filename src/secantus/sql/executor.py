@@ -1159,7 +1159,23 @@ def _evaluated_value_rows(
     _materialize_derived(plan, storage, db, sctx)
     docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
-    docs = apply_pipeline(docs, plan.pipeline, ctx)
+    # A correlated / EXISTS WHERE that couldn't push into ``base_filter`` filters
+    # *before* the pipeline's ``$group`` (WHERE precedes grouping). ``pre_where_split``
+    # leading stages (a JOIN's $lookup/$unwind prefix) run first so the residual sees
+    # the joined rows; then the rest of the pipeline runs over the survivors.
+    if plan.pre_where is not None:
+        split = plan.pre_where_split
+        if split:
+            docs = apply_pipeline(docs, plan.pipeline[:split], ctx)
+        presolve = plan.pre_where_resolve
+
+        def keep_base(doc: dict[str, Any]) -> bool:
+            r = scalar.evaluate(plan.pre_where, lambda n: get_path(doc, presolve(n)[0]), sctx)
+            return bool(r) if r is not None else False
+
+        docs = apply_pipeline([d for d in docs if keep_base(d)], plan.pipeline[split:], ctx)
+    else:
+        docs = apply_pipeline(docs, plan.pipeline, ctx)
     # A correlated / EXISTS WHERE that couldn't push into the pipeline is applied
     # per joined row here (before windows / projection see the survivors); the
     # scope resolves outer columns via the join resolver, and the subquery reads

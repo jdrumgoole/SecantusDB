@@ -119,3 +119,17 @@ def test_expr_default_survives_reopen(tmp_path, session):
         assert rows(s2, session, "SELECT n FROM t") == [(10,)]
     finally:
         s2.close()
+
+
+def test_pg_attrdef_reflects_defaults(storage, session):
+    # #171: pg_catalog.pg_attrdef emits one row per column with a DEFAULT (adbin =
+    # the rendered default text), matching information_schema.columns.column_default.
+    run(
+        storage,
+        session,
+        "CREATE TABLE t (id int primary key, n int DEFAULT 5, s text DEFAULT 'hi', "
+        "ts timestamptz DEFAULT now())",
+    )
+    ad = rows(storage, session, "SELECT adnum, adbin FROM pg_catalog.pg_attrdef ORDER BY adnum")
+    # id (attnum 1) has no default; n/s/ts do.
+    assert ad == [(2, "5"), (3, "'hi'::text"), (4, "CURRENT_TIMESTAMP")]
