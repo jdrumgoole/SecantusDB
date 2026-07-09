@@ -2183,9 +2183,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   matched (`source_matched` id-set). The apply helpers return `(count, image)` — an updated row's
   post-image, an inserted row, or a deleted row's pre-image — and `RETURNING` projects them via
   `planner._returning_columns` + `executor._returning_result` (plain + computed target-column items).
-  **Limitations:** no multi-target-match cardinality error (Postgres raises 21000 when a source row matches
-  >1 target; SecantusDB applies to all matched, once each), an unqualified column ambiguous between target
-  and source resolves to the target, and `RETURNING` doesn't support `merge_action()` or source-column
+  **Cardinality violation enforced (#156, b195):** when a target row is matched by more than one source row
+  Postgres raises `21000` ("MERGE command cannot affect row a second time"); `_run_merge` now tracks the set
+  of source-matched target docs and raises on the second match (a single source row matching many target rows
+  is still allowed — each acted on once). **Limitations:** an unqualified column ambiguous between target and
+  source resolves to the target, and `RETURNING` doesn't support `merge_action()` or source-column
   references.
 - [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
   (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope

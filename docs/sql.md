@@ -2168,7 +2168,10 @@ and the `WHEN` conditions, target and source columns resolve by their alias
 (`a.id` / `d.id`); an `UPDATE`'s right-hand sides and an `INSERT`'s `VALUES` may
 reference either side. The command tag counts every row inserted, updated, or
 deleted (`MERGE n`). Matching is evaluated against the target snapshot at the
-statement's start and each target row is affected at most once.
+statement's start and each target row is affected at most once — if a target row
+is matched by more than one source row, the statement errors `21000` ("MERGE
+command cannot affect row a second time"), matching Postgres. (A single source
+row matching several target rows is fine — each is acted on once.)
 
 `WHEN NOT MATCHED BY SOURCE` acts on **target** rows that no source row matched
 (`UPDATE` / `DELETE` / `DO NOTHING`), and a `RETURNING` clause projects the

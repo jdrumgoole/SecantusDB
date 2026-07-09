@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from secantus.sql import run_sql
+from secantus.sql import SQLError, run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -164,3 +164,24 @@ def test_by_source_returning(storage):
     )
     assert sorted(res.rows) == [(2, "e"), (3, "w")]  # the deleted rows' pre-images
     assert tgt(storage) == [(1, "e", 10)]
+
+
+def test_merge_cardinality_violation_on_multiple_source_matches(storage):
+    # Two source rows both match target id=1 -> Postgres 21000 (a target row would
+    # be affected twice).
+    with pytest.raises(SQLError) as ei:
+        storage.q(
+            "MERGE INTO tgt t USING (SELECT 1 AS id UNION ALL SELECT 1) s "
+            "ON t.id = s.id WHEN MATCHED THEN UPDATE SET amt = 999"
+        )
+    assert ei.value.sqlstate == "21000"
+
+
+def test_merge_one_source_matching_many_targets_is_allowed(storage):
+    # A single source row matching several target rows updates each once (not a
+    # cardinality violation).
+    storage.q(
+        "MERGE INTO tgt t USING (SELECT 'e' AS region) s "
+        "ON t.region = s.region WHEN MATCHED THEN UPDATE SET amt = 0"
+    )
+    assert tgt(storage) == [(1, "e", 0), (2, "e", 0), (3, "w", 30)]

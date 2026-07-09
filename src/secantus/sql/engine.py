@@ -726,9 +726,16 @@ def _run_merge(
         matched = [
             td
             for td in target_docs
-            if id(td) not in done and scalar._truthy(scalar.evaluate(on, scope_for(td, srow), sctx))
+            if scalar._truthy(scalar.evaluate(on, scope_for(td, srow), sctx))
         ]
         for td in matched:
+            # Postgres raises cardinality_violation when a target row is matched by
+            # more than one source row (it would be affected twice).
+            if id(td) in source_matched:
+                raise errors.SQLError(
+                    "21000",
+                    "MERGE command cannot affect row a second time",
+                )
             source_matched.add(id(td))
         if matched:
             when = _merge_pick_when(whens, True, False, scope_for(matched[0], srow), sctx)
