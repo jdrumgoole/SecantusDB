@@ -142,8 +142,11 @@ SELECT role FROM membership WHERE org_id = 1 AND user_id = 100;
 ```
 
 Both PK columns reflect through `pg_index` / `pg_constraint` / SQLAlchemy's
-`get_pk_constraint`. Updating any PK column is rejected (`0A000`) — the `_id` a
-row maps to is immutable, as in a real MongoDB deployment.
+`get_pk_constraint`. Updating a PK column (single or a composite subfield) re-keys
+the row — the old `_id` is deleted and the row re-inserted under the new one, with
+the same statement-atomic uniqueness check (a collision with an existing key errors
+`23505` and leaves the table unchanged). A *reflected* collection's `_id` is still
+immutable and can't be updated (`0A000`), as in a real MongoDB deployment.
 
 ```sql
 CREATE TABLE users (

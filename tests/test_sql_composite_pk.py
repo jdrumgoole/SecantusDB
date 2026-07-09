@@ -106,8 +106,39 @@ def test_update_non_pk_column(t, session):
     assert run(t, session, "SELECT n FROM t WHERE a=1 AND b='x'").rows == [(99,)]
 
 
-def test_update_pk_column_rejected(t, session):
-    assert sqlstate(t, session, "UPDATE t SET a=5 WHERE b='y'") == "0A000"
+def test_update_pk_column_rekeys(t, session):
+    # Updating a PK column re-keys the row (delete + re-insert under the new _id).
+    assert run(t, session, "UPDATE t SET a=5 WHERE a=1 AND b='y'").command_tag == "UPDATE 1"
+    assert run(t, session, "SELECT a, b, n FROM t ORDER BY a, b").rows == [
+        (1, "x", 10),
+        (2, "z", 30),
+        (5, "y", 20),
+    ]
+
+
+def test_update_pk_and_non_pk_together(t, session):
+    run(t, session, "UPDATE t SET b='q', n=99 WHERE a=1 AND b='x'")
+    assert run(t, session, "SELECT a, b, n FROM t WHERE a=1 ORDER BY b").rows == [
+        (1, "q", 99),
+        (1, "y", 20),
+    ]
+
+
+def test_update_pk_collision_is_rejected_and_atomic(t, session):
+    # Re-keying (2,'z') to the existing (1,'x') violates the PK.
+    assert sqlstate(t, session, "UPDATE t SET a=1, b='x' WHERE a=2 AND b='z'") == "23505"
+    # The table is unchanged (statement-atomic).
+    assert run(t, session, "SELECT a, b, n FROM t ORDER BY a, b").rows == [
+        (1, "x", 10),
+        (1, "y", 20),
+        (2, "z", 30),
+    ]
+
+
+def test_update_pk_returning(t, session):
+    assert run(t, session, "UPDATE t SET a=9 WHERE a=2 AND b='z' RETURNING a, b, n").rows == [
+        (9, "z", 30)
+    ]
 
 
 def test_delete_by_full_key(t, session):
@@ -187,3 +218,12 @@ def test_single_pk_unaffected(storage, session):
     assert run(storage, session, "SELECT id, v FROM s").rows == [(1, "a")]
     assert storage.find_matching(DB, "s", {})[0]["_id"] == 1  # scalar _id, not a subdoc
     assert sqlstate(storage, session, "INSERT INTO s VALUES (1,'b')") == "23505"
+
+
+def test_single_column_pk_rekey(storage, session):
+    run(storage, session, "CREATE TABLE s (id int PRIMARY KEY, v int)")
+    run(storage, session, "INSERT INTO s VALUES (1, 10), (2, 20)")
+    assert run(storage, session, "UPDATE s SET id = 5 WHERE id = 1").command_tag == "UPDATE 1"
+    assert run(storage, session, "SELECT id, v FROM s ORDER BY id").rows == [(2, 20), (5, 10)]
+    # collision with an existing key
+    assert sqlstate(storage, session, "UPDATE s SET id = 2 WHERE id = 5") == "23505"

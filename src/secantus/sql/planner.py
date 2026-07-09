@@ -166,6 +166,9 @@ class UpdatePlan:
     filter: dict[str, Any]
     update: dict[str, Any]
     returning: list[tuple[str, Column, Any]] | None = None
+    # True when the SET changes a primary-key column, so the executor must re-key
+    # (delete + re-insert under the new ``_id``) rather than update in place.
+    rekey: bool = False
 
 
 @dataclass
@@ -2260,6 +2263,7 @@ def _composite_subfield_target(target: exp.Expression, table: TableDef):
 
 def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
     set_doc: dict[str, Any] = {}
+    rekey = False
     for assign in stmt.expressions:
         if not isinstance(assign, exp.EQ):
             raise errors.feature_not_supported(f"unsupported SET item: {assign.sql()}")
@@ -2268,7 +2272,8 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         if subfield_target is not None:
             comp_col, subfield, tag, subfields = subfield_target
             if comp_col.pk:
-                raise errors.feature_not_supported("updating the primary key is not supported")
+                # Changing a composite-PK subfield re-keys the row (rewrites ``_id``).
+                rekey = True
             raw = _literal(assign.expression)
             if subfields is not None and raw is not None:
                 value = _build_composite(raw, subfields, tag)
@@ -2286,7 +2291,11 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
             else:
                 raise errors.undefined_column(col_name)
         if col.pk:
-            raise errors.feature_not_supported("updating the primary key is not supported")
+            if table.reflected:
+                # A reflected collection's ``_id`` is the real Mongo key — re-keying
+                # a schema-on-read doc isn't modelled.
+                raise errors.feature_not_supported("updating the primary key is not supported")
+            rekey = True  # changing a declared PK column re-keys the row
         if col.generated is not None:
             # A generated column can only be set to DEFAULT (which recomputes it);
             # any other value is rejected. The executor recomputes it either way.
@@ -2307,6 +2316,7 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         filter=_where_filter(stmt, table),
         update={"$set": set_doc},
         returning=_returning_columns(stmt, table),
+        rekey=rekey,
     )
 
 

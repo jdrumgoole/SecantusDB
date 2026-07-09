@@ -2258,10 +2258,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   UNIQUE-exclusion set uses `_hashable_id` since a subdoc `_id` is unhashable; `engine._merge_apply_not_
   matched` uses `set_path`). Reflection lists all PK columns (`virtual._index_relations` / `_pk_constraints`
   / `_foreign_keys` iterate `TableDef.pk_columns`) → SQLAlchemy `get_pk_constraint` returns both. Tests:
-  `tests/test_sql_composite_pk.py` + a pg8000/SQLAlchemy wire test. **Limitations:** updating any PK
-  column is still rejected (`0A000` — `_id` is immutable); renaming a composite-PK column via `ALTER TABLE`
-  doesn't rewrite the `_id.<name>` subdoc key (edge case); a SERIAL/identity column inside a composite PK
-  is untested.
+  `tests/test_sql_composite_pk.py` + a pg8000/SQLAlchemy wire test. **PK-column UPDATE landed (#157, b196):**
+  updating a PK column (single or a composite subfield) now re-keys the row — `plan_update` flags
+  `UpdatePlan.rekey`, and `executor._execute_update_rekey` computes each post-image (non-PK sets via
+  `apply_update`, PK sets via `set_path` since `apply_update` refuses to touch `_id`), runs the shared
+  post-image validation, checks the new `_id` is free (else `23505`), then deletes the old row and inserts
+  the re-keyed one (all deletes before any insert, so a PK swap between rows doesn't collide). Statement-atomic.
+  **Limitations:** a reflected collection's `_id` still can't be updated (`0A000` — it's the real Mongo key);
+  a PK swap needs literal targets (`SET id = <expr>` referencing the row isn't supported — a general
+  UPDATE-SET-to-expression gap); renaming a composite-PK column via `ALTER TABLE` doesn't rewrite the
+  `_id.<name>` subdoc key (edge case); a SERIAL/identity column inside a composite PK is untested.
 - [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
   passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
   in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.
