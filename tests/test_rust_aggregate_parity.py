@@ -131,6 +131,31 @@ CURATED = [
     [{"$group": {"_id": "$b", "r": {"$minN": {"n": 2, "input": "$a"}}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": None, "r": {"$firstN": {"n": 3, "input": "$a"}}}}],
     [{"$group": {"_id": None, "r": {"$maxN": {"n": 2.0, "input": "$a"}}}}],
+    # $top / $bottom / $topN / $bottomN — sort by sortBy, take top/bottom output(s).
+    [
+        {"$group": {"_id": "$b", "r": {"$topN": {"n": 2, "sortBy": {"a": -1}, "output": "$a"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {"$group": {"_id": "$b", "r": {"$bottomN": {"n": 2, "sortBy": {"a": 1}, "output": "$a"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {"$group": {"_id": "$b", "r": {"$top": {"sortBy": {"a": -1}, "output": "$a"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {"$group": {"_id": "$b", "r": {"$bottom": {"sortBy": {"a": 1}, "output": "$a"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {
+            "$group": {
+                "_id": None,
+                "r": {"$topN": {"n": 2, "sortBy": {"a": -1}, "output": ["$a", "$b"]}},
+            }
+        }
+    ],
     [{"$group": {"_id": "$nested.k", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
     [{"$sortByCount": "$b"}],
     [{"$unwind": "$tags"}, {"$group": {"_id": "$tags", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
@@ -801,6 +826,7 @@ def _rand_stage(rng):
             "group_set",
             "group_std",
             "group_nelem",
+            "group_topn",
             "sortbycount",
             "bucket",
             "bucket_default",
@@ -859,6 +885,14 @@ def _rand_stage(rng):
     if kind == "group_nelem":
         op = rng.choice(["$firstN", "$lastN", "$maxN", "$minN"])
         spec = {"n": rng.randint(1, 3), "input": "$" + f2}
+        return {"$group": {"_id": "$" + field, "r": {op: spec}}}
+    if kind == "group_topn":
+        sort_field = rng.choice(["a", "b", "c"])
+        sort_by = {sort_field: rng.choice([1, -1])}
+        op = rng.choice(["$top", "$bottom", "$topN", "$bottomN"])
+        spec = {"sortBy": sort_by, "output": "$" + f2}
+        if op in ("$topN", "$bottomN"):
+            spec["n"] = rng.randint(1, 3)
         return {"$group": {"_id": "$" + field, "r": {op: spec}}}
     if kind == "sortbycount":
         return {"$sortByCount": "$" + field}
