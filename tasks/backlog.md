@@ -1483,9 +1483,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   JSON-parsed via `_as_json_value`; `create_missing` / `insert_after` honoured; a copy is returned so the
   stored row is untouched), `jsonb_strip_nulls` / `json_strip_nulls`, `jsonb_pretty`, and the `#-`
   delete-at-path operator (`exp.JSONBDeleteAtPath`). Type inference: the modifiers → `json`, `jsonb_pretty`
-  → `text`. Tests: `tests/test_sql_jsonb_funcs.py`. **Gaps:** `<@` (contained-by) is `0A000` — "field is a
-  subset of a constant" isn't expressible as a pushed-down filter (rewrite as `<const> @> field`);
-  `jsonb_each` (key+value record SRF) and the `jsonb_*_text` family aren't modeled. **Parser quirk:** sqlglot reads
+  → `text`. Tests: `tests/test_sql_jsonb_funcs.py`. **`<@` (contained-by) landed as a residual (#149, b191):**
+  `field <@ const` / `const @> field` (and field-vs-field, and scalar-context `<@`/`@>`) now evaluate per-row
+  via a COLLSCAN + residual predicate — `_where_has_jsonb_contained_predicate` (shape-based: only `field @> const`
+  and `const <@ field` keep the `_jsonb_contains_filter` pushdown) routes them through `where_needs_per_row`, and
+  `scalar._eval_jsonb_op` / `_jsonb_containment` implement Postgres object/array/scalar containment (JSON-text
+  operands are `json.loads`-decoded first). **Gaps:** `jsonb_each` (key+value record SRF) and the `jsonb_*_text`
+  family aren't modeled. **Parser quirk:** sqlglot reads
   a bare `f(a->'k')` arrow as a lambda, so a navigated *function argument* must be parenthesised
   (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
 - [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
@@ -2178,7 +2182,8 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   is honoured — a false predicate yields zero rows (`ConstantSelectPlan.emit`), so a recursive-CTE
   anchor like `SELECT 1 WHERE 1=0` works; a column reference with no FROM → `42703`. (3) The jsonb `<@`
   (contained-by) operator lands in its pushable `const <@ field` form (== `field @> const`,
-  `_jsonb_contains_filter`); `field <@ const` (subset-of-a-constant) stays `0A000`.
+  `_jsonb_contains_filter`); the reverse `field <@ const` (subset-of-a-constant) form now runs as a
+  COLLSCAN + residual — **landed in #149, b191 (see the jsonb-functions entry above).**
 - [ ] **WHERE subqueries in the pipeline paths landed** (b59). The single-table pushdown always threaded
   a `SubqueryCtx`, but the pipeline planners (JOIN / GROUP BY / evaluated / DISTINCT) called
   `_where_filter` from many places without one, so a WHERE scalar/`IN` subquery there was `0A000`.

@@ -2046,6 +2046,8 @@ def where_needs_per_row(
         return True
     if table is not None and _where_has_array_predicate(node, table):
         return True
+    if table is not None and _where_has_jsonb_contained_predicate(node, table):
+        return True
     # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
     if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
         return True
@@ -2166,6 +2168,26 @@ def _where_has_array_predicate(node: exp.Expression, table: TableDef) -> bool:
     for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps):
         if _is_array_operand(op.this, table) or _is_array_operand(op.expression, table):
             return True
+    return False
+
+
+def _where_has_jsonb_contained_predicate(node: exp.Expression, table: TableDef) -> bool:
+    """True if ``node`` contains an ``@>`` / ``<@`` in a shape that can't lower to a
+    Mongo filter and so needs per-row evaluation. Only two shapes push down —
+    ``field @> const`` and ``const <@ field`` (both a subset-of-the-stored-value
+    lookup handled by ``_jsonb_contains_filter``); the reverse shapes
+    (``field <@ const``, ``const @> field``) and field-vs-field comparisons fall
+    through to a COLLSCAN + residual predicate evaluated by the scalar pass (which
+    handles jsonb / array / range / hstore / geo containment). Typed range / array /
+    net / hstore / geo operators are already routed to the residual by their own
+    ``_where_has_*`` checks, so this generic shape test is only additive."""
+    for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy):
+        if isinstance(op, exp.ArrayContainsAll):  # @>
+            if _is_field_node(op.this) and _is_literalish(op.expression):
+                continue  # field @> const — pushes down
+        elif _is_literalish(op.this) and _is_field_node(op.expression):
+            continue  # const <@ field — pushes down (== field @> const)
+        return True
     return False
 
 
