@@ -5,7 +5,8 @@ Two shapes are handled here:
 * a base-less ``FROM`` table function —
   ``SELECT * FROM generate_series(1, 5) [WITH ORDINALITY] [AS t(a, ord)]`` and
   the same for ``unnest`` / ``jsonb_array_elements`` / ``jsonb_object_keys`` /
-  ``regexp_split_to_table``; and
+  ``regexp_split_to_table``, plus the two-column record SRFs ``jsonb_each`` /
+  ``jsonb_each_text`` (``key`` / ``value``); and
 * a base-less SELECT-list SRF — ``SELECT generate_series(1, 5)``.
 
 Both materialize the generated rows and run the rest of the query (projection /
@@ -39,8 +40,23 @@ _NAMED_SRFS = frozenset(
         "json_object_keys",
         "regexp_split_to_table",
         "regexp_matches",
+        "jsonb_each",
+        "json_each",
+        "jsonb_each_text",
+        "json_each_text",
     }
 )
+
+# Record-returning SRFs: each row is a ``(key, value)`` pair, so the source has
+# two columns (default-named ``key`` / ``value``) rather than one.
+_RECORD_SRFS = frozenset({"jsonb_each", "json_each", "jsonb_each_text", "json_each_text"})
+
+
+def _is_record_srf(node: exp.Expression) -> bool:
+    return (
+        isinstance(node, exp.Anonymous)
+        and str(node.this).rsplit(".", 1)[-1].lower() in _RECORD_SRFS
+    )
 
 
 class SrfSource:
@@ -102,7 +118,10 @@ def fromless_projection(stmt: exp.Select) -> SrfSource | None:
     e = stmt.expressions[0]
     alias = e.alias if isinstance(e, exp.Alias) else None
     target = e.this if isinstance(e, exp.Alias) else e
-    if not _is_srf_node(target):
+    # Record SRFs (``jsonb_each`` …) return a two-column set; a base-less
+    # ``SELECT jsonb_each(x)`` would yield a single *composite* column in Postgres,
+    # which we don't model — only the ``FROM jsonb_each(x)`` table form is supported.
+    if not _is_srf_node(target) or _is_record_srf(target):
         return None
     return SrfSource(target, False, None, [alias] if alias else [])
 
@@ -177,6 +196,38 @@ def _values_and_tag(node: exp.Expression, ctx: Any) -> tuple[list[Any], str]:
                     break
             return rows, "text[]"
     raise errors.feature_not_supported(f"unsupported set-returning function: {node.sql()}")
+
+
+def _record_values(node: exp.Expression, ctx: Any) -> tuple[list[tuple[Any, Any]], list[str]]:
+    """Rows and per-column type tags for a record SRF (``jsonb_each`` family) —
+    one ``(key, value)`` tuple per object member, key ``text`` and value ``json``
+    (``jsonb_each``) or ``text`` (``jsonb_each_text``)."""
+    from secantus.sql import scalar
+
+    name = str(node.this).rsplit(".", 1)[-1].lower()
+    arg = node.expressions[0] if node.expressions else None
+    doc = _as_json(scalar.evaluate(arg, _empty_scope, ctx) if arg is not None else None)
+    items = list(doc.items()) if isinstance(doc, dict) else []
+    if name in ("jsonb_each_text", "json_each_text"):
+        return [(k, _jsonb_to_text(v)) for k, v in items], ["text", "text"]
+    return [(k, v) for k, v in items], ["text", "json"]
+
+
+def _jsonb_to_text(v: Any) -> Any:
+    """A jsonb value rendered as text, the way ``jsonb_each_text`` / ``->>`` do:
+    strings stay verbatim, booleans lower-case, containers as compact JSON, NULL
+    stays SQL NULL."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (dict, list)):
+        import json
+
+        return json.dumps(v)
+    return str(v)
 
 
 def _as_json(val: Any) -> Any:
@@ -273,9 +324,41 @@ def _empty_scope(col: exp.Column) -> Any:
     raise errors.SQLError("42703", f'column "{col.name}" does not exist')
 
 
+def _build_record(source: SrfSource, ctx: Any) -> tuple[list[dict[str, Any]], TableDef]:
+    """Materialize a record SRF (``jsonb_each`` family): two columns, default-named
+    ``key`` / ``value``, optionally renamed by ``AS t(k, v)`` and extended by
+    ``WITH ORDINALITY``."""
+    pairs, tags = _record_values(source.node, ctx)
+    default_names = ["key", "value"]
+    # ``AS t(k, v)`` renames the columns; the bare table alias does not (unlike a
+    # single-column SRF, where ``AS g`` names the lone column).
+    names = list(source.column_aliases) if source.column_aliases else list(default_names)
+    names += default_names[len(names) :]  # pad if fewer aliases than columns
+    columns = [
+        Column(name=names[i], type_tag=tags[i], field=names[i], pk=False, nullable=True)
+        for i in range(2)
+    ]
+    ord_col = None
+    if source.ordinality:
+        ord_col = source.column_aliases[2] if len(source.column_aliases) > 2 else "ordinality"
+        columns.append(
+            Column(name=ord_col, type_tag="int8", field=ord_col, pk=False, nullable=True)
+        )
+    rows: list[dict[str, Any]] = []
+    for i, (k, v) in enumerate(pairs, start=1):
+        row = {names[0]: k, names[1]: v}
+        if ord_col is not None:
+            row[ord_col] = i
+        rows.append(row)
+    table_name = source.table_alias or _default_name(source.node)
+    return rows, TableDef(name=table_name, collection=table_name, columns=columns)
+
+
 def build(source: SrfSource, ctx: Any) -> tuple[list[dict[str, Any]], TableDef]:
     """Materialize the SRF's rows as documents and a synthetic single-source
     ``TableDef`` describing the value (and optional ``WITH ORDINALITY``) columns."""
+    if _is_record_srf(source.node):
+        return _build_record(source, ctx)
     values, tag = _values_and_tag(source.node, ctx)
     default = _default_name(source.node)
     # A single-column SRF's column takes the explicit column alias, else the table

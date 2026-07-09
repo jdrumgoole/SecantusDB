@@ -1092,7 +1092,8 @@ SELECT generate_series(timestamp '2024-01-01', timestamp '2024-01-02', interval 
 ```
 
 The base-less `FROM` form also covers `unnest(ARRAY[…])`, `jsonb_array_elements`,
-`jsonb_object_keys`, `regexp_split_to_table`, and `regexp_matches`:
+`jsonb_object_keys`, `regexp_split_to_table`, `regexp_matches`, and the two-column
+record SRFs `jsonb_each` / `jsonb_each_text`:
 
 ```sql
 SELECT * FROM unnest(ARRAY[10, 20, 30]) AS x;         -- 10,20,30
@@ -1104,7 +1105,16 @@ SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb) AS e;
 -- every match; without it, at most the first.
 SELECT * FROM regexp_matches('foobarbaz', 'ba.', 'g') AS m;   -- {bar}, {baz}
 SELECT regexp_matches('a1b2', '([a-z])([0-9])', 'g');         -- {a,1}, {b,2}
+
+-- jsonb_each / jsonb_each_text expand an object into (key, value) rows.
+-- jsonb_each's value is jsonb; jsonb_each_text renders each value as text.
+SELECT * FROM jsonb_each('{"a":1,"b":"x"}'::jsonb);            -- (a,1), (b,x)
+SELECT * FROM jsonb_each_text('{"a":1}'::jsonb) AS t(k, v);   -- (a,'1')
 ```
+
+The `jsonb_each` family is supported in this base-less `FROM` form; the
+lateral-join form (`FROM t, jsonb_each(t.doc)`) and the base-less
+`SELECT jsonb_each(x)` composite form are not yet modeled.
 
 A single-column function's column takes the table alias — `generate_series(1,5) AS g`
 names the column `g` — or an explicit column alias (`AS g(n)`), or the function

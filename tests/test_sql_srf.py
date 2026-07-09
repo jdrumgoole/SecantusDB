@@ -263,3 +263,58 @@ def test_regexp_matches_case_insensitive_flag():
 def test_regexp_matches_column_type_is_text_array():
     r = _run("SELECT * FROM regexp_matches('ab', '(a)(b)') AS m")
     assert [c.type_tag for c in r.columns] == ["text[]"]
+
+
+# --------------------------------------------------------------------------- #
+# jsonb_each / jsonb_each_text record SRFs (#155)
+# --------------------------------------------------------------------------- #
+
+
+def test_jsonb_each_from():
+    rows = _rows('SELECT * FROM jsonb_each(\'{"a":1,"b":"x"}\'::jsonb) ORDER BY key')
+    assert rows == [("a", 1), ("b", "x")]
+
+
+def test_jsonb_each_columns():
+    r = _run("SELECT * FROM jsonb_each('{\"a\":1}'::jsonb)")
+    assert [(c.name, c.type_tag) for c in r.columns] == [("key", "text"), ("value", "json")]
+
+
+def test_jsonb_each_text_stringifies_values():
+    rows = _rows(
+        'SELECT * FROM jsonb_each_text(\'{"a":1,"b":"x","c":{"d":2}}\'::jsonb) ORDER BY key'
+    )
+    assert rows == [("a", "1"), ("b", "x"), ("c", '{"d": 2}')]
+
+
+def test_jsonb_each_text_columns_are_text():
+    r = _run("SELECT * FROM jsonb_each_text('{\"a\":1}'::jsonb)")
+    assert [(c.name, c.type_tag) for c in r.columns] == [("key", "text"), ("value", "text")]
+
+
+def test_jsonb_each_column_aliases():
+    assert _cols("SELECT * FROM jsonb_each('{\"a\":1}'::jsonb) AS t(k, v)") == ["k", "v"]
+    assert _rows("SELECT k, v FROM jsonb_each('{\"a\":1}'::jsonb) AS t(k, v)") == [("a", 1)]
+
+
+def test_jsonb_each_where_and_order():
+    rows = _rows(
+        'SELECT key FROM jsonb_each(\'{"a":1,"b":2,"c":3}\'::jsonb) '
+        "WHERE value::int > 1 ORDER BY key"
+    )
+    assert rows == [("b",), ("c",)]
+
+
+def test_jsonb_each_with_ordinality():
+    r = _run("SELECT * FROM jsonb_each('{\"x\":9}'::jsonb) WITH ORDINALITY")
+    assert [c.name for c in r.columns] == ["key", "value", "ordinality"]
+    assert r.rows == [("x", 9, 1)]
+
+
+def test_jsonb_each_empty_object():
+    assert _rows("SELECT * FROM jsonb_each('{}'::jsonb)") == []
+
+
+def test_json_each_text_bool_and_null():
+    rows = _rows('SELECT * FROM json_each_text(\'{"a":true,"b":null}\'::json) ORDER BY key')
+    assert rows == [("a", "true"), ("b", None)]

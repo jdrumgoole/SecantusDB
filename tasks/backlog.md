@@ -1494,8 +1494,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   via a COLLSCAN + residual predicate — `_where_has_jsonb_contained_predicate` (shape-based: only `field @> const`
   and `const <@ field` keep the `_jsonb_contains_filter` pushdown) routes them through `where_needs_per_row`, and
   `scalar._eval_jsonb_op` / `_jsonb_containment` implement Postgres object/array/scalar containment (JSON-text
-  operands are `json.loads`-decoded first). **Gaps:** `jsonb_each` (key+value record SRF) and the `jsonb_*_text`
-  family aren't modeled. **Parser quirk:** sqlglot reads
+  operands are `json.loads`-decoded first). **`jsonb_each` record SRFs landed (#155, b194):** `jsonb_each` /
+  `json_each` (→ `(key text, value json)`) and `jsonb_each_text` / `json_each_text` (→ `(key text, value
+  text)`, values rendered like `->>`) work in the base-less `FROM` form — two columns, `AS t(k, v)` renaming,
+  `WITH ORDINALITY`, WHERE / ORDER BY (`srf._build_record` / `_record_values`). **Still not modeled:** the
+  lateral-join form `FROM t, jsonb_each(t.doc)` (needs a `$objectToArray` + `$unwind` stage in the join
+  planner — `_unnest_join_stage` only handles array unnest) and the base-less `SELECT jsonb_each(x)` composite
+  form. **Parser quirk:** sqlglot reads
   a bare `f(a->'k')` arrow as a lambda, so a navigated *function argument* must be parenthesised
   (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
 - [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
