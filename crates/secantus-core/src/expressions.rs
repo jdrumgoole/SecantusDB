@@ -268,6 +268,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$dateToString" => op_date_to_string(arg, ctx),
         // misc structural / deterministic
         "$dateToParts" => op_date_to_parts(arg, ctx),
+        "$dateFromParts" => op_date_from_parts(arg, ctx),
         "$range" => op_range(arg, ctx),
         "$strLenBytes" => op_str_len_bytes(arg, ctx),
         "$arrayToObject" => op_array_to_object(arg, ctx),
@@ -2571,6 +2572,85 @@ fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
+/// A `$dateFromParts` component as an `i64`, or `None` (defer — Python raises
+/// `Location40515`) for a non-integral / non-numeric value. Integral doubles are
+/// accepted; bool is not.
+fn dfp_int(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Int32(x) => Some(*x as i64),
+        Bson::Int64(x) => Some(*x),
+        Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => Some(*x as i64),
+        _ => None,
+    }
+}
+
+/// `$dateFromParts`: build a date from calendar components with mongod's rollover
+/// (month 13 → next January, day 0 → last of previous month, …). Components default
+/// to month/day = 1 and time = 0; any null component → null. `year` is required and
+/// in 1-9999. A fixed-offset `timezone` interprets the components as local time
+/// (local→instant, `utc = local - offset`). Everything Python raises on — a missing
+/// / out-of-range `year`, a non-integral component, the ISO-week form — and a
+/// *named* `timezone` (DST-ambiguous local→instant) defers to Python. Mirrors the
+/// pure `_op_date_from_parts`.
+fn op_date_from_parts(arg: &Bson, ctx: &Ctx) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    if d.contains_key("isoWeekYear") || d.contains_key("isoWeek") || d.contains_key("isoDayOfWeek")
+    {
+        return Err(Fallback); // ISO-week form -> Python
+    }
+    if !d.contains_key("year") {
+        return Err(Fallback); // Python raises 40516
+    }
+    let names = [
+        "year",
+        "month",
+        "day",
+        "hour",
+        "minute",
+        "second",
+        "millisecond",
+    ];
+    let defaults = [0i64, 1, 1, 0, 0, 0, 0];
+    let mut vals = [0i64; 7];
+    for (i, name) in names.iter().enumerate() {
+        match d.get(*name) {
+            None => vals[i] = defaults[i],
+            Some(expr) => match eval(expr, ctx)? {
+                Bson::Null => return Ok(Bson::Null), // null component -> null
+                v => vals[i] = dfp_int(&v).ok_or(Fallback)?,
+            },
+        }
+    }
+    let year = vals[0];
+    if !(1..=9999).contains(&year) {
+        return Err(Fallback); // Python raises 40523
+    }
+    let total_months = year * 12 + (vals[1] - 1);
+    let base_year = total_months.div_euclid(12);
+    let base_month = total_months.rem_euclid(12) + 1;
+    if !(1..=9999).contains(&base_year) {
+        return Err(Fallback); // rollover pushed the year out of range -> Python
+    }
+    let base_days = days_from_civil(base_year, base_month, 1);
+    let mut millis = base_days * 86_400_000
+        + (vals[2] - 1) * 86_400_000
+        + vals[3] * 3_600_000
+        + vals[4] * 60_000
+        + vals[5] * 1_000
+        + vals[6];
+    match d.get("timezone") {
+        None | Some(Bson::Null) => {}
+        Some(Bson::String(s)) => match resolve_tz_offset(s) {
+            Some(off_min) => millis -= off_min * 60_000, // local -> utc
+            None => return Err(Fallback),                // named zone -> Python
+        },
+        Some(_) => return Err(Fallback),
+    }
+    Ok(Bson::DateTime(bson::DateTime::from_millis(millis)))
+}
+
 // --- $range -------------------------------------------------------------
 
 const MAX_RANGE_SIZE: i128 = 100_000;
@@ -2969,6 +3049,56 @@ mod tests {
             ev(doc! {}, bson::bson!({"$in": [2, [1, 2, 3]]})),
             Bson::Boolean(true)
         );
+    }
+
+    #[test]
+    fn date_from_parts() {
+        let ms = |v: &Bson| v.as_datetime().unwrap().timestamp_millis();
+        // 2023-06-15T00:00Z
+        let basic = ev(
+            doc! {},
+            bson::bson!({"$dateFromParts": {"year": 2023, "month": 6, "day": 15}}),
+        );
+        assert_eq!(ms(&basic), 1_686_787_200_000);
+        // month 13 rolls to 2024-01-01.
+        let roll = ev(
+            doc! {},
+            bson::bson!({"$dateFromParts": {"year": 2023, "month": 13, "day": 1}}),
+        );
+        assert_eq!(ms(&roll), 1_704_067_200_000);
+        // day 0 -> last of previous month (2023-05-31); ms 1500 -> +1.5s.
+        let d0 = ev(
+            doc! {},
+            bson::bson!({"$dateFromParts": {"year": 2023, "month": 6, "day": 0}}),
+        );
+        assert_eq!(ms(&d0), 1_685_491_200_000);
+        // integral double accepted; defaults month/day=1.
+        let dflt = ev(doc! {}, bson::bson!({"$dateFromParts": {"year": 2023.0}}));
+        assert_eq!(ms(&dflt), 1_672_531_200_000); // 2023-01-01
+                                                  // fixed-offset timezone: local 12:00 +05:00 -> 07:00 UTC.
+        let tz = ev(
+            doc! {},
+            bson::bson!({"$dateFromParts": {"year": 2023, "month": 6, "day": 15, "hour": 12, "timezone": "+05:00"}}),
+        );
+        assert_eq!(ms(&tz), 1_686_787_200_000 + 7 * 3_600_000);
+        // null component -> null.
+        assert_eq!(
+            ev(
+                doc! {},
+                bson::bson!({"$dateFromParts": {"year": Bson::Null}})
+            ),
+            Bson::Null
+        );
+        // Non-integral, missing year, out-of-range year, iso form, named tz -> defer.
+        for bad in [
+            bson::bson!({"$dateFromParts": {"year": 2023, "month": 6.5}}),
+            bson::bson!({"$dateFromParts": {"month": 6}}),
+            bson::bson!({"$dateFromParts": {"year": 10000}}),
+            bson::bson!({"$dateFromParts": {"isoWeekYear": 2023}}),
+            bson::bson!({"$dateFromParts": {"year": 2023, "timezone": "America/New_York"}}),
+        ] {
+            assert!(evaluate(&doc! {}, &bad, &Document::new()).is_err());
+        }
     }
 
     #[test]

@@ -1359,10 +1359,12 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   2026-07-06 found these error on *both* — a dual-server gap, not Rust-only):
   `$median` / `$percentile` (t-digest accumulators). Remaining **expression** forms
   still absent from both: `$median` / `$percentile` over an array (t-digest /
-  approximate — parity-risky), `$dateFromParts`, `$tsSecond` / `$tsIncrement`. Each
-  would need porting on **both** servers (Python module + Rust `secantus-core`) with
-  a parity corpus. **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot` as `$group`
-  accumulators** remain a follow-on (their *expression* forms shipped — see below).
+  approximate — parity-risky), `$tsSecond` / `$tsIncrement`. Each would need porting
+  on **both** servers (Python module + Rust `secantus-core`) with a parity corpus.
+  **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot` as `$group` accumulators** remain a
+  follow-on (their *expression* forms shipped — see below). **`$dateFromParts`
+  ISO-week form** (`isoWeekYear`/`isoWeek`/`isoDayOfWeek`) is not yet supported on
+  either server (the calendar-component form shipped — see below).
   **Sort-layer edge (pre-existing, not $topN-specific):** SecantusDB's sort treats a
   *missing* field as equal to explicit `null`, whereas mongod sorts missing just
   *above* null — so `$top`/`$bottom`/`$topN`/`$bottomN` (and `$sort`) can order docs
@@ -1371,6 +1373,10 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   both servers:** the sort-key accumulators **`$top` / `$bottom` / `$topN` /
   `$bottomN`** (0.5.3-beta.140 / 0.5.4b178 — three-way verified: multi-key `sortBy`,
   array `output`, integral-double `n`, mongod validation codes); the
+  **`$dateFromParts`** expression (0.5.3-beta.141 / 0.5.4b201 — three-way verified:
+  calendar rollover, defaults, null-propagation, fixed-offset tz, mongod codes
+  40515/40516/40523; Python also resolves named zones via `zoneinfo`, Rust defers
+  them; ISO-week form deferred); the
   bitwise **expression** operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
   (0.5.3-beta.136 / 0.5.4b164 — int/long operands, int32/int64 result width,
   empty-list identity, null propagation; a non-integer operand raises), and the

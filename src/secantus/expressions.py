@@ -776,6 +776,87 @@ def _op_date_to_parts(arg: Any, ctx: _Ctx) -> Any:
     }
 
 
+def _dfp_int(name: str, v: Any) -> int:
+    """Coerce a `$dateFromParts` component to an int, matching mongod's
+    `Location40515` for a non-integral value (an integral double like `6.0` is
+    accepted; `6.5` / a string is not)."""
+    if isinstance(v, bool):
+        raise ExpressionError(
+            f"'{name}' must evaluate to an integer, found {_nelem_render(v)}", code=40515
+        )
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, Decimal128) and ((dec := v.to_decimal()) == dec.to_integral_value()):
+        return int(dec)
+    raise ExpressionError(
+        f"'{name}' must evaluate to an integer, found {_nelem_render(v)}", code=40515
+    )
+
+
+def _op_date_from_parts(arg: Any, ctx: _Ctx) -> Any:
+    """``$dateFromParts``: build a date from calendar components. Components default
+    to month/day = 1 and hour/minute/second/millisecond = 0; out-of-range values
+    roll over (month 13 -> next January, day 0 -> last day of the previous month,
+    etc.) exactly as mongod does. Any null component yields null. ``year`` is
+    required (1-9999); a non-integral component is ``Location40515``, a missing
+    ``year`` is ``Location40516``, an out-of-range ``year`` is ``Location40523``.
+    A ``timezone`` interprets the components as local time in that zone
+    (local->instant). Verified against mongod 6.0 via a three-way probe. The
+    ISO-week form (``isoWeekYear`` / ``isoWeek`` / ``isoDayOfWeek``) is not yet
+    supported."""
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateFromParts requires a document spec")
+    if "isoWeekYear" in arg or "isoWeek" in arg or "isoDayOfWeek" in arg:
+        raise ExpressionError("$dateFromParts isoWeekYear form is not supported")
+    if "year" not in arg:
+        raise ExpressionError(
+            "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
+            code=40516,
+        )
+    parts: dict[str, int] = {}
+    for name, default in (
+        ("year", None),
+        ("month", 1),
+        ("day", 1),
+        ("hour", 0),
+        ("minute", 0),
+        ("second", 0),
+        ("millisecond", 0),
+    ):
+        if name in arg:
+            v = _eval(arg[name], ctx)
+            if v is None:
+                return None  # a null component -> null result
+            parts[name] = _dfp_int(name, v)
+        else:
+            parts[name] = default  # type: ignore[assignment]
+    year = parts["year"]
+    if not (1 <= year <= 9999):
+        raise ExpressionError(f"'year' must be in the range 1 to 9999, found {year}", code=40523)
+    # Month carry, then day/time as a timedelta from the first of the month — so
+    # out-of-range components roll over across month / year boundaries.
+    total_months = year * 12 + (parts["month"] - 1)
+    base_year, base_month0 = divmod(total_months, 12)
+    if not (1 <= base_year <= 9999):
+        raise ExpressionError(
+            f"'year' must be in the range 1 to 9999, found {base_year}", code=40523
+        )
+    result = _dt.datetime(base_year, base_month0 + 1, 1) + _dt.timedelta(
+        days=parts["day"] - 1,
+        hours=parts["hour"],
+        minutes=parts["minute"],
+        seconds=parts["second"],
+        milliseconds=parts["millisecond"],
+    )
+    tz = _resolve_timezone(arg.get("timezone"))
+    if tz is not None:
+        # The components are local time in `tz`; convert to the UTC instant.
+        result = result.replace(tzinfo=tz).astimezone(_dt.timezone.utc).replace(tzinfo=None)
+    return result
+
+
 def _op_date_diff(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateDiff requires a document spec")
@@ -1802,6 +1883,7 @@ _OPS = {
     "$dateDiff": _op_date_diff,
     "$dateTrunc": _op_date_trunc,
     "$dateToParts": _op_date_to_parts,
+    "$dateFromParts": _op_date_from_parts,
     "$split": _op_split,
     "$trim": _op_trim,
     "$ltrim": _op_ltrim,

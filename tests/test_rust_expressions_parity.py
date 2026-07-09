@@ -409,6 +409,30 @@ CURATED = [
     ),
     ({"$dateToParts": {"date": "$d", "timezone": "Asia/Tokyo"}}, {"d": _DT}),
     ({"$dateToParts": {"date": "$d", "timezone": "Not/AZone"}}, {"d": _DT}),  # unknown -> defer
+    # $dateFromParts — calendar build with rollover; defaults month/day=1, time=0;
+    # any null component -> null; fixed-offset tz is local->instant. Non-integral,
+    # missing/out-of-range year, ISO-week form, named tz all defer (Python raises
+    # or computes via zoneinfo).
+    ({"$dateFromParts": {"year": 2023, "month": 6, "day": 15}}, {}),
+    ({"$dateFromParts": {"year": 2023, "month": 13, "day": 1}}, {}),  # rollover
+    ({"$dateFromParts": {"year": 2023, "month": 0, "day": 1}}, {}),
+    ({"$dateFromParts": {"year": 2023, "month": 6, "day": 0}}, {}),
+    ({"$dateFromParts": {"year": 2023, "month": 6, "day": 15, "hour": 25}}, {}),
+    ({"$dateFromParts": {"year": 2023, "month": -1}}, {}),
+    ({"$dateFromParts": {"year": 2023.0, "month": 6.0, "day": 15.0}}, {}),  # integral doubles
+    ({"$dateFromParts": {"year": 2023, "millisecond": 1500}}, {}),
+    ({"$dateFromParts": {"year": "$y", "month": 3, "day": 15}}, {"y": 2024}),  # expr year
+    (
+        {"$dateFromParts": {"year": 2023, "month": 6, "day": 15, "hour": 12, "timezone": "+05:00"}},
+        {},
+    ),
+    ({"$dateFromParts": {"year": 2023, "timezone": "-08:00"}}, {}),
+    ({"$dateFromParts": {"year": None, "month": 6}}, {}),  # null -> null
+    ({"$dateFromParts": {"year": 2023, "month": 6.5}}, {}),  # non-integral -> defer
+    ({"$dateFromParts": {"month": 6}}, {}),  # missing year -> defer
+    ({"$dateFromParts": {"year": 10000}}, {}),  # year range -> defer
+    ({"$dateFromParts": {"isoWeekYear": 2023}}, {}),  # iso form -> defer
+    ({"$dateFromParts": {"year": 2023, "timezone": "America/New_York"}}, {}),  # named tz -> defer
     # $dateFromString — parity-safe slice: naive canonical ISO (date-only /
     # whole-second), no format/timezone. Fractional / Z / offset / format /
     # timezone / invalid all defer.
