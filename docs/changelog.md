@@ -196,6 +196,41 @@ there, which diverged from mongod; this is now corrected.
   a generic code (its core defers error-raising to Python). The `$group`
   accumulator forms remain a follow-on (`tasks/backlog.md` §7.5).
 
+### Distinguishable daemon names: `secantusd-py`, `secantusd-rs`, `secantusd-py-pg`
+
+The two servers used to collide on the command name `secantusdb`, and the Rust
+binary went by the confusable `secantusdb-rs`. Each daemon now has a clear name
+under a shared `secantusd-<engine>[-<protocol>]` scheme: the Python MongoDB
+server is `secantusd-py`, the Rust MongoDB server is `secantusd-rs`, and the
+PostgreSQL-wire server gets its first console script, `secantusd-py-pg`. The
+old `secantusdb` and `secantus` names remain as aliases for the Python server,
+so existing installs and scripts keep working.
+
+The shared configuration file is renamed to match: both Mongo daemons read
+`secantusd.toml` (auto-discovered in the cwd, `~/.secantus/`, and
+`/etc/secantus/`). The legacy `secantusdb.toml` name is still discovered at each
+location — the new name wins on a tie — so no existing deployment silently
+loses its config.
+
+#### Added
+
+- `secantusd-py` / `secantusd-py-pg` console scripts; `secantusd-py-pg` is a new
+  CLI entry point (`main()` / `build_parser()`) for `SecantusPGServer`.
+- Config auto-discovery now probes `secantusd.toml` ahead of the legacy
+  `secantusdb.toml` at every location, in both the Python and Rust loaders.
+
+#### Changed
+
+- The standalone Rust binary is now emitted as `secantusd-rs` (was `secantusdb`);
+  its `--version` / `--help` / startup banner and the `secantusd-rs restore`
+  usage text follow suit.
+- `secantusdb.toml.example` renamed to `secantusd.toml.example`.
+
+#### Deprecated
+
+- The `secantusdb` and `secantus` console scripts are retained only as aliases
+  of `secantusd-py`; prefer the new names.
+
 ### Bitwise aggregation operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot` (both servers)
 
 Both servers now support MongoDB 6.3's bitwise aggregation expressions.

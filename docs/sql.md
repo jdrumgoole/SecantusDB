@@ -44,6 +44,14 @@ server.start()
 server.stop()
 ```
 
+Or run it straight from the command line — `pip install "secantus[sql]"` puts a
+`secantusd-py-pg` script on your `PATH` (the SQL sibling of the Mongo
+`secantusd-py` daemon):
+
+```console
+$ secantusd-py-pg --host 127.0.0.1 --port 5432 --storage-path ./secantus-data
+```
+
 The connection's **database** selects the SecantusDB storage database; a SQL
 **table** is a collection; a **row** is a document.
 

@@ -408,10 +408,10 @@ jobs:
           python -c "import _secantus_storage, _secantus_server;
           print('bundled OK:', _secantus_storage.__file__, _secantus_server.__file__)"
 
-      - name: Assert the wheel bundles secantusdb-rs on PATH + it runs (non-Windows)
+      - name: Assert the wheel bundles secantusd-rs on PATH + it runs (non-Windows)
         # CMake installs the standalone binary into the wheel's scripts dir
-        # (SKBUILD_SCRIPTS_DIR), so installing the wheel puts `secantusdb-rs` on
-        # PATH — distinct from the pure-Python `secantus.cli:main` `secantusdb`
+        # (SKBUILD_SCRIPTS_DIR), so installing the wheel puts `secantusd-rs` on
+        # PATH — distinct from the pure-Python `secantus.cli:main` `secantusd-py`
         # console script. Drive the bundled binary through the same smoke test
         # via SECANTUSDB_BIN. Windows is skipped (the bin isn't built there; see
         # CMakeLists.txt / tasks/backlog.md §7).
@@ -421,8 +421,8 @@ jobs:
           whl=$(ls dist-storage/*.whl)
           uv run --no-project --with pymongo --with pytest --with "$whl" bash -c '
             set -e
-            bin=$(command -v secantusdb-rs) || { echo "secantusdb-rs not on PATH after install" >&2; exit 1; }
-            echo "secantusdb-rs -> $bin"
+            bin=$(command -v secantusd-rs) || { echo "secantusd-rs not on PATH after install" >&2; exit 1; }
+            echo "secantusd-rs -> $bin"
             "$bin" --version
             SECANTUSDB_BIN="$bin" python -m pytest tests/test_rust_binary_smoke.py \
               -o addopts= -p no:cacheprovider -q
@@ -439,7 +439,7 @@ jobs:
           python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
           -o addopts= -p no:cacheprovider -q
 
-      - name: Build + smoke the standalone secantusdb binary (R7)
+      - name: Build + smoke the standalone secantusd-rs binary (R7)
         # The bin crate links the SAME vendored WiredTiger the wheel build above
         # produced under build/*/wt-build (scikit-build-core's build-dir), via
         # build.rs's SECANTUS_WT_INCLUDE / SECANTUS_WT_LIB override. Windows is

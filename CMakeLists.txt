@@ -249,26 +249,26 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
     install(FILES ${SERVER_EXT_STAGED} DESTINATION . OPTIONAL)
 
     # -------------------------------------------------------------------------
-    # The standalone `secantusdb` server binary (R7), bundled into the wheel as
-    # the `secantusdb-rs` command. It statically links the SAME vendored
-    # WiredTiger as the extensions above (via secantus-wt's build.rs). Installed
-    # into the wheel's scripts dir, so a wheel built with this flag puts
-    # `secantusdb-rs` on PATH after `pip install` — deliberately distinct from
-    # the pure-Python `secantusdb` console script (`secantus.cli:main`,
-    # `[project.scripts]`), which remains the default and is unaffected.
+    # The standalone Rust server binary (R7), bundled into the wheel as the
+    # `secantusd-rs` command. It statically links the SAME vendored WiredTiger
+    # as the extensions above (via secantus-wt's build.rs). Installed into the
+    # wheel's scripts dir, so a wheel built with this flag puts `secantusd-rs`
+    # on PATH after `pip install` — deliberately distinct from the pure-Python
+    # `secantusd-py` console script (`secantus.cli:main`, `[project.scripts]`),
+    # which remains the default and is unaffected.
     #
     # Built on every platform: the bin links `static=wiredtiger` the same way the
-    # extensions above do, which link WT successfully under MSVC too. On Windows
-    # cargo emits `secantusdb.exe`, staged as `secantusdb-rs.exe`.
+    # extensions above do, which link WT successfully under MSVC too. The crate's
+    # `[[bin]]` is named `secantusd-rs`, so cargo emits `secantusd-rs[.exe]`.
     # -------------------------------------------------------------------------
     set(SECANTUSDB_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantusdb)
     set(SECANTUSDB_TARGET_DIR ${CARGO_TARGET_ROOT}/secantusdb-target)
     if(WIN32)
-        set(SECANTUSDB_BIN_BUILT  ${SECANTUSDB_TARGET_DIR}/release/secantusdb.exe)
-        set(SECANTUSDB_BIN_STAGED ${CMAKE_CURRENT_BINARY_DIR}/secantusdb-rs.exe)
+        set(SECANTUSDB_BIN_BUILT  ${SECANTUSDB_TARGET_DIR}/release/secantusd-rs.exe)
+        set(SECANTUSDB_BIN_STAGED ${CMAKE_CURRENT_BINARY_DIR}/secantusd-rs.exe)
     else()
-        set(SECANTUSDB_BIN_BUILT  ${SECANTUSDB_TARGET_DIR}/release/secantusdb)
-        set(SECANTUSDB_BIN_STAGED ${CMAKE_CURRENT_BINARY_DIR}/secantusdb-rs)
+        set(SECANTUSDB_BIN_BUILT  ${SECANTUSDB_TARGET_DIR}/release/secantusd-rs)
+        set(SECANTUSDB_BIN_STAGED ${CMAKE_CURRENT_BINARY_DIR}/secantusd-rs)
     endif()
 
     # Same always-run custom-target shape as the extensions above (cargo owns
@@ -282,7 +282,7 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
                 --manifest-path ${SECANTUSDB_CRATE_DIR}/Cargo.toml
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SECANTUSDB_BIN_BUILT} ${SECANTUSDB_BIN_STAGED}
         DEPENDS wiredtiger_ext
-        COMMENT "Building standalone secantusdb binary (-> secantusdb-rs) against bundled WiredTiger"
+        COMMENT "Building standalone secantusd-rs binary against bundled WiredTiger"
         VERBATIM
     )
 

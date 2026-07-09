@@ -92,7 +92,7 @@ jobs:
             fi
           CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
           # SECANTUS_BUILD_STORAGE_ENGINE=ON bundles the Rust extensions +
-          # secantusdb-rs into the wheel. $HOME/.cargo/bin is on PATH so the
+          # secantusd-rs into the wheel. $HOME/.cargo/bin is on PATH so the
           # build sees the rustup-installed cargo; LIBCLANG_PATH=/opt/libclang
           # is where before-build symlinks the container's libclang for bindgen.
           CIBW_ENVIRONMENT_LINUX: >-

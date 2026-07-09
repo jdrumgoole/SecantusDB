@@ -14,20 +14,20 @@ remaining gaps.
 
 ## Off by default
 
-Auth is opt-in. A vanilla `secantusdb` daemon and the embedded
+Auth is opt-in. A vanilla `secantusd-py` daemon and the embedded
 `SecantusDBServer(...)` accept commands from any connection — same as
 running `mongod` without `--auth`. This keeps the test-harness use case
 zero-friction.
 
 ```bash
-secantusdb --port 27117          # no auth required
+secantusd-py --port 27117          # no auth required
 ```
 
 ## Turning auth on
 
 Two equivalent switches:
 
-- CLI flag: `secantusdb --auth`
+- CLI flag: `secantusd-py --auth`
 - Constructor: `SecantusDBServer(..., require_auth=True)`
 
 With auth on, only the handshake and the SCRAM exchange run on an
@@ -36,7 +36,7 @@ unauthenticated connection. Everything else (`find`, `insert`,
 completes a `saslStart` / `saslContinue` round-trip.
 
 ```bash
-secantusdb --auth --port 27117
+secantusd-py --auth --port 27117
 ```
 
 ## Provisioning users

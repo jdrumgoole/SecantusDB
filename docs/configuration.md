@@ -1,21 +1,21 @@
 # Configuration
 
-The `secantusdb` daemon reads a TOML configuration file for
-deployment-shaped knobs that would otherwise have to be passed on
-every invocation. CLI flags still work and **override** any value
+Both Mongo daemons (`secantusd-py` and `secantusd-rs`) read the same
+`secantusd.toml` configuration file for deployment-shaped knobs that
+would otherwise have to be passed on every invocation. CLI flags still work and **override** any value
 set in the file, so the file is a per-deployment baseline rather
 than a lock-in.
 
 ## Precedence
 
 ```
-SecantusConfig defaults  <  secantusdb.toml  <  explicit CLI flag
+SecantusConfig defaults  <  secantusd.toml  <  explicit CLI flag
 ```
 
 Concretely:
 
 * If you pass nothing, the daemon behaves exactly as it always has.
-* If a `secantusdb.toml` is on the auto-discovery path, its values
+* If a `secantusd.toml` is on the auto-discovery path, its values
   replace the built-in defaults — but each key in the file is
   optional, so anything you don't set keeps the default.
 * If you pass `--port 27018` on the command line, that wins over
@@ -25,19 +25,19 @@ Concretely:
 
 When you don't pass `--config`, the launcher searches:
 
-1. `./secantusdb.toml` — same directory you ran `secantusdb` from
-2. `~/.secantus/secantusdb.toml` — per-user
-3. `/etc/secantus/secantusdb.toml` — system-wide
+1. `./secantusd.toml` — same directory you ran `secantusd-py` from
+2. `~/.secantus/secantusd.toml` — per-user
+3. `/etc/secantus/secantusd.toml` — system-wide
 
 First hit wins; if no file is found, all defaults apply. Pass
-`--config /path/to/secantusdb.toml` to load a specific file
+`--config /path/to/secantusd.toml` to load a specific file
 (disables auto-discovery).
 
 The launcher logs the resolved path at INFO level on startup so
 ops staff can confirm which file got picked up:
 
 ```
-2026-05-18 19:14:02 INFO secantus.cli: loaded config from /etc/secantus/secantusdb.toml
+2026-05-18 19:14:02 INFO secantus.cli: loaded config from /etc/secantus/secantusd.toml
 ```
 
 ## Schema
@@ -140,7 +140,7 @@ follow-on slice if your deployment needs a custom suite.
 Hot cert rotation isn't supported: the `SSLContext` is built once
 at startup and cached. Restart the daemon after renewing the cert
 (e.g. wire `certbot renew --post-hook 'systemctl reload
-secantusdb'` into your renewal cron — a "reload" is a restart
+secantusd-py'` into your renewal cron — a "reload" is a restart
 despite the name).
 
 ### mTLS — verify client certs
@@ -189,7 +189,7 @@ for the worked example.
 A minimal production-shaped config:
 
 ```toml
-# /etc/secantus/secantusdb.toml
+# /etc/secantus/secantusd.toml
 [server]
 host = "127.0.0.1"        # behind nginx for TLS termination
 port = 27017
@@ -206,7 +206,7 @@ noop_heartbeat_seconds = 10.0
 ```
 
 The full example file ships in the repo at
-[`secantusdb.toml.example`](https://github.com/jdrumgoole/SecantusDB/blob/main/secantusdb.toml.example).
+[`secantusd.toml.example`](https://github.com/jdrumgoole/SecantusDB/blob/main/secantusd.toml.example).
 
 ## CLI flag equivalents
 

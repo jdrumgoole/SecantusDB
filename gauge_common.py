@@ -7,8 +7,8 @@ This module lets each gauge runner target either server, selected by the
 ``rust``), mirroring the pymongo gauge's ``invoke validate --server rust``.
 
 - **Python server**: ``python -m secantus <args>`` (unchanged).
-- **Rust server**: the standalone ``secantusdb`` binary
-  (``crates/secantusdb/target/{release,debug}/secantusdb`` or ``$SECANTUSDB_BIN``).
+- **Rust server**: the standalone ``secantusd-rs`` binary
+  (``crates/secantusdb/target/{release,debug}/secantusd-rs`` or ``$SECANTUSDB_BIN``).
   The binary doesn't yet accept the Python server's tuning flags (``--log-level``
   / ``--noop-heartbeat-seconds`` / ``--cache-size`` / ``--session-max`` /
   ``--sync-on-commit`` — R7 tail), so [`for_server`] strips them.
@@ -34,7 +34,7 @@ import time
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent
 
 # Both servers print "listening on <host>:<port>" once bound:
-#   rust:   "secantusdb listening on 127.0.0.1:59091"   (stdout)
+#   rust:   "secantusd-rs listening on 127.0.0.1:59091"   (stdout)
 #   python: "... secantus.server: secantus listening on 127.0.0.1:59092"  (stderr)
 _LISTENING_RE = re.compile(r"listening on (\d{1,3}(?:\.\d{1,3}){3}):(\d+)")
 
@@ -69,7 +69,7 @@ def rust_binary() -> str:
     if env and pathlib.Path(env).exists():
         return env
     for profile in ("release", "debug"):
-        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusdb"
+        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
         if p.exists():
             return str(p)
     raise SystemExit(

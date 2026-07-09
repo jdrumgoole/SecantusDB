@@ -98,9 +98,9 @@ def _rust_binary() -> str | None:
         return override if _is_native_binary(Path(override)) else None
 
     candidates = [
-        REPO_ROOT / "crates" / "secantusdb" / "target" / "release" / "secantusdb",
-        *sorted(REPO_ROOT.glob("build/*/secantusdb-target/release/secantusdb")),
-        REPO_ROOT / "crates" / "secantusdb" / "target" / "debug" / "secantusdb",
+        REPO_ROOT / "crates" / "secantusdb" / "target" / "release" / "secantusd-rs",
+        *sorted(REPO_ROOT.glob("build/*/secantusdb-target/release/secantusd-rs")),
+        REPO_ROOT / "crates" / "secantusdb" / "target" / "debug" / "secantusd-rs",
     ]
     for candidate in candidates:
         if candidate.exists() and _is_native_binary(candidate):

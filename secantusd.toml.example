@@ -1,11 +1,14 @@
-# Example secantusdb.toml.
+# Example secantusd.toml.
+#
+# Read by both Mongo-wire daemons (secantusd-py and secantusd-rs); the
+# legacy secantusdb.toml name is still discovered at each location.
 #
 # Copy to one of the auto-discovery paths and edit:
-#   ./secantusdb.toml                  (per-checkout / per-cwd)
-#   ~/.secantus/secantusdb.toml        (per-user)
-#   /etc/secantus/secantusdb.toml      (system-wide)
+#   ./secantusd.toml                   (per-checkout / per-cwd)
+#   ~/.secantus/secantusd.toml         (per-user)
+#   /etc/secantus/secantusd.toml       (system-wide)
 #
-# Or pass it explicitly: secantusdb --config /path/to/secantusdb.toml
+# Or pass it explicitly: secantusd-py --config /path/to/secantusd.toml
 #
 # Every key is optional. Missing keys use the SecantusConfig default
 # (printed in the comment after each line). Explicit CLI flags

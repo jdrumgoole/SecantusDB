@@ -22,6 +22,7 @@ import os
 import pathlib
 import re
 import shlex
+import subprocess
 
 from invoke.context import Context
 from invoke.tasks import task
@@ -42,20 +43,64 @@ _RUST_BINARY_DIR = "crates/secantusdb"
 # carry a standing deselect — pass --deselect explicitly if you ever need one.)
 
 
+def _find_wt_build() -> pathlib.Path | None:
+    """Locate a *complete* vendored WiredTiger build dir — one holding BOTH
+    ``include/wiredtiger.h`` and a ``libwiredtiger.{a,dylib,so}``.
+
+    ``secantus-wt``'s build.rs needs both; a dir with only the archive (as a bare
+    ``/tmp/wt-build`` sometimes is) fails its header probe. We check, in order:
+    the dev-sandbox ``/tmp/wt-build``; this checkout's CMake output
+    (``build/*/wt-build``); and — crucially for a git worktree, which never has
+    its own ``build/`` — the *main* worktree's output (found via
+    ``--git-common-dir``), so ``./inv rust-*`` works in a worktree by reusing the
+    WiredTiger the primary checkout already compiled.
+    """
+    roots = ["/tmp/wt-build"]
+    here = pathlib.Path.cwd()
+    roots += sorted(glob.glob(str(here / "build" / "*" / "wt-build")))
+    # The main worktree's checkout root is the parent of the common git dir
+    # (``<main>/.git``); a linked worktree's ``.git`` is a file, so this resolves
+    # to the primary checkout even when we're running inside a worktree.
+    common = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if common:
+        main_root = pathlib.Path(common).parent
+        if main_root != here:
+            roots += sorted(glob.glob(str(main_root / "build" / "*" / "wt-build")))
+    for root in roots:
+        d = pathlib.Path(root)
+        header = d / "include" / "wiredtiger.h"
+        lib = any((d / f"libwiredtiger{ext}").exists() for ext in (".a", ".dylib", ".so"))
+        if header.exists() and lib:
+            return d
+    return None
+
+
 def _rust_env() -> dict[str, str]:
     """Build-environment defaults for the WiredTiger-linking Rust crates.
 
     The WT-linked crates (``secantus-wt`` / ``-storage`` / ``-storage-adapter`` /
     ``secantusdb`` / the embedded ``_secantus_server``) need a vendored
-    WiredTiger build dir and libclang for bindgen. CI exports these explicitly;
-    locally they're easy to forget, so this fills in the conventional values
-    (``/tmp/wt-build`` + Xcode's libclang) **only** when the caller hasn't
-    already set them. Returns a dict to hand to ``c.run(..., env=...)`` (invoke
-    merges it over the inherited environment).
+    WiredTiger build and libclang for bindgen. CI exports these explicitly;
+    locally they're easy to forget, so this fills in conventional values **only**
+    when the caller hasn't already set them. Returns a dict to hand to
+    ``c.run(..., env=...)`` (invoke merges it over the inherited environment).
+
+    build.rs honours ``SECANTUS_WT_INCLUDE`` / ``SECANTUS_WT_LIB`` (a bare
+    ``WT_BUILD_DIR`` is *not* read by it), so we resolve a complete WT build via
+    ``_find_wt_build`` and export those two — which is what makes ``./inv
+    rust-*`` build inside a git worktree (it reuses the main checkout's WT).
     """
     env: dict[str, str] = {}
-    if not os.environ.get("WT_BUILD_DIR") and pathlib.Path("/tmp/wt-build").exists():
-        env["WT_BUILD_DIR"] = "/tmp/wt-build"
+    if not (os.environ.get("SECANTUS_WT_INCLUDE") and os.environ.get("SECANTUS_WT_LIB")):
+        wt = _find_wt_build()
+        if wt is not None:
+            env["SECANTUS_WT_INCLUDE"] = str(wt / "include")
+            env["SECANTUS_WT_LIB"] = str(wt)
     if not os.environ.get("LIBCLANG_PATH"):
         for cand in (
             "/Library/Developer/CommandLineTools/usr/lib",  # macOS / Xcode CLT
@@ -261,7 +306,7 @@ def rust_binary_build(c: Context, release: bool = False) -> None:
     flag = " --release" if release else ""
     c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=True, env=_rust_env())
     sub = "release" if release else "debug"
-    print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusdb")
+    print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusd-rs")
 
 
 @task(name="rust-server-build")
@@ -444,7 +489,7 @@ def rust_repro(c: Context, script: str, release: bool = True) -> None:
     sub = "release" if release else "debug"
     flag = " --release" if release else ""
     c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=True, env=_rust_env())
-    binpath = f"{_RUST_BINARY_DIR}/target/{sub}/secantusdb"
+    binpath = f"{_RUST_BINARY_DIR}/target/{sub}/secantusd-rs"
     c.run(f"uv run python {shlex.quote(script)} --binary {binpath}", pty=True, env=_rust_env())
 
 

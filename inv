@@ -29,8 +29,18 @@ def main() -> None:
     if prefix:
         os.environ["PATH"] = os.pathsep.join(prefix + parts)
     # --no-sync: don't trigger a multi-minute CMake/WiredTiger rebuild just to
-    # run a task. exec so signals (Ctrl-C) reach uv/invoke directly.
-    os.execvp("uv", ["uv", "run", "--no-sync", "python", "-m", "invoke", *sys.argv[1:]])
+    #   run a task.
+    # --with invoke: layer invoke into the run env so this works even in a fresh
+    #   git worktree whose `.venv` was never synced (it has no `invoke` yet, and
+    #   installing one would kick off the WiredTiger build). Pure-Python tasks
+    #   (lint / fmt) then run with zero project build; tasks that genuinely need
+    #   the compiled `secantus` (test / rust / validate) still require a built
+    #   `.venv` and fail with a clear ImportError if run before one exists.
+    # exec so signals (Ctrl-C) reach uv/invoke directly.
+    os.execvp(
+        "uv",
+        ["uv", "run", "--no-sync", "--with", "invoke", "python", "-m", "invoke", *sys.argv[1:]],
+    )
 
 
 if __name__ == "__main__":
