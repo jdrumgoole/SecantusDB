@@ -67,8 +67,7 @@ with SecantusDBServer(port=27017) as server:
     client["mydb"]["users"].insert_one({"_id": 1, "name": "Joe"})
 ```
 
-Or as a daemon — `pip install` puts a `secantusd-py` script on `PATH` (the
-legacy `secantusdb` / `secantus` names are kept as aliases):
+Or as a daemon — `pip install` puts a `secantusd-py` script on `PATH`:
 
 ```bash
 secantusd-py --host 127.0.0.1 --port 27017

@@ -368,7 +368,7 @@ def admin(
         "run",
         "--extra",
         "admin",
-        "secantusdb-admin",
+        "secantus-admin",
         "--uri",
         uri,
         "--port",

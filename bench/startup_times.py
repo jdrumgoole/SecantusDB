@@ -6,9 +6,9 @@ on-disk WiredTiger data directory:
 
 - **mongod**            — real MongoDB, run as a standalone ``mongod``.
 - **SecantusDB (py)**   — the pure-Python server (``python -m secantus``).
-- **SecantusDB (rust)** — the pure-Rust server: the compiled ``secantusdb``
+- **SecantusDB (rust)** — the pure-Rust server: the compiled ``secantusd-rs``
   binary from ``crates/secantusdb`` (no libpython, no Python interpreter in
-  the process). The ``.venv/bin/secantusdb`` console-script is NOT used — it
+  the process). The ``.venv/bin/secantusd-py`` console-script is NOT used — it
   is a Python wrapper that launches the Python server.
 
 All three are launched the same way — a throwaway process on a free port
@@ -74,7 +74,7 @@ def _free_port() -> int:
 def _is_native_binary(path: Path) -> bool:
     """True if ``path`` is a compiled executable, not a ``#!`` shebang script.
 
-    Critical guard: ``.venv/bin/secantusdb`` is a Python console-script that
+    Critical guard: ``.venv/bin/secantusd-py`` is a Python console-script that
     launches the *Python* server, so it must never be picked for the Rust
     row — that would benchmark the Python server twice.
     """
@@ -86,10 +86,10 @@ def _is_native_binary(path: Path) -> bool:
 
 
 def _rust_binary() -> str | None:
-    """Locate the pure-Rust standalone ``secantusdb`` binary (no libpython).
+    """Locate the pure-Rust standalone ``secantusd-rs`` binary (no libpython).
 
     Prefers a release build, falls back to the debug build. Override with
-    the ``SECANTUSDB_BIN`` environment variable. The ``.venv/bin/secantusdb``
+    the ``SECANTUSDB_BIN`` environment variable. The ``.venv/bin/secantusd-py``
     console-script is deliberately excluded — it is a Python wrapper around
     the Python server, not the Rust binary.
     """

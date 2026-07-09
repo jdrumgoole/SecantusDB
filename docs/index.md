@@ -69,7 +69,6 @@ ephemeral WiredTiger home — suites then run cleanly under `pytest-xdist`.
 ```bash
 secantusd-py --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default
-# legacy aliases: `secantusdb`, `secantus`
 ```
 
 Then connect with **any** MongoDB driver or tool, unchanged:
@@ -168,7 +167,7 @@ clustering and infrastructure that `mongod` brings.
   resume tokens, pre-images, retention.
 - [Authentication](authentication.md) — SCRAM-SHA-256, `--auth`,
   `createUser` / `dropUser` / `usersInfo`.
-- [Admin web UI](admin.md) — `secantusdb-admin` console, page tour,
+- [Admin web UI](admin.md) — `secantus-admin` console, page tour,
   security model, programmatic use.
 - [Backup & point-in-time recovery](recovery.md) — how PITR works
   (oplog model, the applier, manifests), snapshot backups, restoring to

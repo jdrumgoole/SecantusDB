@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.4b201"
+version = "0.5.4b202"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -111,15 +111,12 @@ sql = [
 #   secantusd-rs     — Rust MongoDB-wire server (crates/secantusdb [[bin]])
 secantusd-py = "secantus.cli:main"
 secantusd-py-pg = "secantus.sql.pgserver:main"
-# `secantusdb` is the name published to PyPI; `secantus` is a shorter form.
-# Both are kept as legacy aliases of `secantusd-py` so existing installs and
-# docs keep working — drop them only on a deliberate major bump.
-secantusdb = "secantus.cli:main"
-secantus = "secantus.cli:main"
-secantusdb-admin = "secantus.admin.cli:main"
+# Utility commands carry the bare `secantus` import-name prefix (they aren't
+# daemons, so the `secantusd-` prefix doesn't apply).
+secantus-admin = "secantus.admin.cli:main"
 # Offline restore tool: extract a SecantusDB backup archive into a
-# fresh directory the user then points a new `secantusdb` at.
-secantusdb-restore-archive = "secantus.restore_cli:main"
+# fresh directory the user then points a new `secantusd-py` at.
+secantus-restore-archive = "secantus.restore_cli:main"
 
 [build-system]
 # SWIG is required at build time but pulled from the host (Homebrew /

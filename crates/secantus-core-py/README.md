@@ -31,7 +31,7 @@ servers — the pure-Python `secantus` server and a self-contained Rust server.
 The `secantus` Python package never imports this extension.
 
 `secantus-core` exists as (1) the reusable Rust engine library behind the Rust
-server and the standalone `secantusdb` binary, and (2) the **parity-test oracle**:
+server and the standalone `secantusd-rs` binary, and (2) the **parity-test oracle**:
 the `tests/test_rust_*_parity.py` suites import `_secantus_core` directly and
 assert each Rust engine matches its pure-Python counterpart byte-for-byte.
 

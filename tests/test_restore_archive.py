@@ -144,7 +144,7 @@ def test_wire_restore_archive_round_trip(tmp_path) -> None:
 
 
 def test_cli_extracts_into_target(tmp_path, capsys) -> None:
-    """``secantusdb-restore-archive --archive X --target-dir Y`` extracts."""
+    """``secantus-restore-archive --archive X --target-dir Y`` extracts."""
     from secantus.restore_cli import main as restore_main
 
     archive = _make_archive(tmp_path)

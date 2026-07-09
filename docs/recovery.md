@@ -101,7 +101,7 @@ admin.command({"secantusAdmin.backupArchive": 1, "outputPath": "/backups/db.tar.
 ```
 
 Restore the snapshot by extracting it into a fresh directory — with the
-`secantusdb-restore-archive` tool (Python) or the `secantusAdmin.restoreArchive`
+`secantus-restore-archive` tool (Python) or the `secantusAdmin.restoreArchive`
 command — then start a new server on it. A plain snapshot restore lands you at the
 backup's checkpoint; for an arbitrary target time, use PITR below.
 
@@ -246,7 +246,7 @@ present.
 | Task | CLI | Wire command | Python API |
 |------|-----|--------------|------------|
 | Snapshot backup | — | `secantusAdmin.backupArchive` | `Storage.create_archive` |
-| Extract a snapshot | `secantusdb-restore-archive` | `secantusAdmin.restoreArchive` | `extract_backup_archive` |
+| Extract a snapshot | `secantus-restore-archive` | `secantusAdmin.restoreArchive` | `extract_backup_archive` |
 | Restore to a time | `secantusd-py restore --to-time/--to-timestamp` | `secantusAdmin.restoreToTimestamp` | `oplog_replay.restore_to_timestamp` |
 | Restore "latest" | `secantusd-py restore` (no bound) | `restoreToTimestamp` (no bound) | `restore_to_timestamp()` |
 | Carry oplog for resume | `--preserve-oplog` | `preserveOplog: true` | `carry_oplog=True` |
