@@ -1647,7 +1647,10 @@ FROM t GROUP BY g;
 (NULL for a single row); `stddev_pop` / `var_pop` are the **population** forms.
 They lower to Mongo's native `$stdDevPop` / `$stdDevSamp` accumulators (variance
 is the square). `bit_and` / `bit_or` / `bit_xor` fold the non-NULL integer values
-of a group (NULL for an all-NULL / empty group). All ignore NULL inputs.
+of a group (NULL for an all-NULL / empty group). All ignore NULL inputs. These —
+`variance` / `var_pop` / `bit_and` / `bit_or` / `bit_xor` and `bool_and` /
+`bool_or` / `every` — also work **over a `JOIN`**, resolving the aggregate's
+argument through the join resolver.
 
 `array_agg` and `string_agg` accept an **in-call `ORDER BY`** that orders the
 aggregated values (multiple keys, `ASC`/`DESC`, and Postgres NULL placement):
@@ -1770,9 +1773,14 @@ FROM t GROUP BY city, lower(name) HAVING SUM(x) > 5;
 
 Each computed key is lowered to an equivalent aggregation expression and
 materialised into a synthetic field before the group, so the grouping runs on the
-derived value exactly as Postgres would. A key using a function the engine can't
-evaluate (e.g. `substr`), or a computed key over a `JOIN` / `GROUPING SETS`,
-raises `0A000`.
+derived value exactly as Postgres would. This works over a **`JOIN`** too
+(`GROUP BY lower(c.region)` across joined tables — the key lowers through the join
+resolver). A key using a function the engine can't evaluate (e.g. `substr`), or a
+computed key over `GROUPING SETS` / `ROLLUP` / `CUBE`, raises `0A000`.
+
+The same function lowering applies inside a `WHERE` comparison against a constant —
+`WHERE upper(name) = 'X'`, `WHERE abs(x) = 3`, `WHERE length(name) > 3` all
+evaluate via `$expr`.
 
 ## Joins
 
@@ -1952,7 +1960,8 @@ SELECT id, name, lvl FROM chain ORDER BY id;
 ```
 
 A `WITH` prefix also works on a write: `WITH cte AS (…) INSERT INTO t SELECT …
-FROM cte`, and an `UPDATE` / `DELETE` whose `WHERE` has a subquery over a CTE.
+FROM cte`, an `UPDATE` / `DELETE` whose `WHERE` has a subquery over a CTE, and a
+`MERGE` whose `USING` source is a CTE (`WITH c AS (…) MERGE INTO t USING c …`).
 
 ```sql
 WITH recent AS (SELECT id FROM events WHERE ts > '2024-01-01')
@@ -3105,7 +3114,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 |---|---|---|
 | DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`; target by column list or `ON CONSTRAINT <name>`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | — |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
-| CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE` (incl. `WITH RECURSIVE` before a write); data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE … RETURNING …)`) | statement-level snapshot semantics; `WITH CHECK OPTION` |
+| CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE`/`MERGE` (incl. `WITH RECURSIVE` before a write); data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE … RETURNING …)`) | statement-level snapshot semantics; `WITH CHECK OPTION` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (both directions; `field <@ const` runs residual)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) (select list *and* `HAVING`, single-table + JOIN), an **expression over an aggregate** (`sum(x)+1`, `round(avg(x),2)`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) + the `GROUPING()` super-aggregate helper | `GROUPING SETS` over a JOIN / with HAVING, a **computed GROUP BY key** (`GROUP BY lower(name)`) |
