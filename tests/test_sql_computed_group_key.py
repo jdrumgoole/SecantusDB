@@ -239,3 +239,65 @@ def test_join_group_by_unsupported_function_rejected(storage, session):
             "JOIN cust c ON o.cust = c.name GROUP BY substr(c.region, 1, 1)",
         )
     assert ei.value.sqlstate == "0A000"
+
+
+# -- computed keys over GROUPING SETS / ROLLUP / CUBE (#170) ------------------ #
+
+
+def _sales(storage, session):
+    run(
+        storage, session, "CREATE TABLE sales (id int primary key, region text, dept text, amt int)"
+    )
+    for i, (r, dp, a) in enumerate([("E", "x", 10), ("e", "y", 20), ("W", "x", 30)]):
+        run(storage, session, f"INSERT INTO sales VALUES ({i}, '{r}', '{dp}', {a})")
+
+
+def test_rollup_computed_key(storage, session):
+    _sales(storage, session)
+    # E + e fold to 'e' (10 + 20); W → 'w' (30); grand-total row (NULL) = 60.
+    assert rows(
+        storage,
+        session,
+        "SELECT lower(region) AS r, sum(amt) AS s FROM sales "
+        "GROUP BY ROLLUP(lower(region)) ORDER BY r NULLS LAST",
+    ) == [("e", 30), ("w", 30), (None, 60)]
+
+
+def test_cube_computed_key(storage, session):
+    _sales(storage, session)
+    assert rows(
+        storage,
+        session,
+        "SELECT lower(region) AS r, dept, sum(amt) AS s FROM sales "
+        "GROUP BY CUBE(lower(region), dept) ORDER BY r NULLS LAST, dept NULLS LAST",
+    ) == [
+        ("e", "x", 10),
+        ("e", "y", 20),
+        ("e", None, 30),
+        ("w", "x", 30),
+        ("w", None, 30),
+        (None, "x", 40),
+        (None, "y", 20),
+        (None, None, 60),
+    ]
+
+
+def test_grouping_sets_computed_key(storage, session):
+    _sales(storage, session)
+    assert rows(
+        storage,
+        session,
+        "SELECT lower(region) AS r, sum(amt) AS s FROM sales "
+        "GROUP BY GROUPING SETS ((lower(region)), ()) ORDER BY r NULLS LAST",
+    ) == [("e", 30), ("w", 30), (None, 60)]
+
+
+def test_grouping_bitmask_on_computed_key(storage, session):
+    _sales(storage, session)
+    # GROUPING(lower(region)) is 0 on a real group, 1 on the rolled-up total.
+    assert rows(
+        storage,
+        session,
+        "SELECT lower(region) AS r, GROUPING(lower(region)) AS g, sum(amt) AS s "
+        "FROM sales GROUP BY ROLLUP(lower(region)) ORDER BY g, r",
+    ) == [("e", 0, 30), ("w", 0, 30), (None, 1, 60)]

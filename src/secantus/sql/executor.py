@@ -1083,11 +1083,12 @@ def execute_correlated_select(
             rowcount=1,
         )
 
-    # Order the survivors (Postgres NULL placement), then slice OFFSET/LIMIT.
+    # Order the survivors (Postgres NULL placement), then slice OFFSET/LIMIT. An
+    # enum-typed ORDER BY key sorts by declared label order (``plan.enum_orders``).
     if plan.order:
         _pg_sort(
             matched,
-            lambda d: tuple(get_path(d, f) for f, _, _ in plan.order),
+            _order_key_fn(plan.order, plan.enum_orders),
             [(direction, nf) for _, direction, nf in plan.order],
         )
     if plan.skip:

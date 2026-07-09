@@ -2397,7 +2397,9 @@ def _where_has_range_predicate(node: exp.Expression, table: TableDef) -> bool:
     return False
 
 
-def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelectPlan:
+def plan_correlated_select(
+    stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = None
+) -> CorrelatedSelectPlan:
     """Plan a single-table SELECT whose WHERE needs per-row evaluation (EXISTS /
     correlated subquery). The whole WHERE is carried verbatim and evaluated by
     the executor against each candidate row via the scalar evaluator."""
@@ -2422,6 +2424,7 @@ def plan_correlated_select(stmt: exp.Select, table: TableDef) -> CorrelatedSelec
         count_star=count_alias is not None,
         count_alias=count_alias or "count",
         outer_alias=outer_alias,
+        enum_orders=_enum_order_map(stmt, table, subctx),
     )
 
 
