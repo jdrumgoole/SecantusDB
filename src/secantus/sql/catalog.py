@@ -350,15 +350,32 @@ class Catalog:
     # A view is just a stored SELECT definition; querying one expands it as a
     # subquery. Kept in a separate collection so it never shadows a real table.
 
-    def put_view(self, db: str, name: str, definition: str) -> None:
+    def put_view(
+        self, db: str, name: str, definition: str, check_option: str | None = None
+    ) -> None:
         self._storage.delete_matching(db, VIEW_COLLECTION, {"_id": name})
         self._storage.insert(
-            db, VIEW_COLLECTION, [{"_id": name, "view": name, "definition": definition}]
+            db,
+            VIEW_COLLECTION,
+            [
+                {
+                    "_id": name,
+                    "view": name,
+                    "definition": definition,
+                    "check_option": check_option,
+                }
+            ],
         )
 
     def get_view(self, db: str, name: str) -> str | None:
         docs = self._storage.find_matching(db, VIEW_COLLECTION, {"_id": name}, limit=1)
         return docs[0]["definition"] if docs else None
+
+    def get_view_check_option(self, db: str, name: str) -> str | None:
+        """A view's ``WITH CHECK OPTION`` mode (``"LOCAL"`` / ``"CASCADED"``), or
+        None if the view has no check option (or doesn't exist)."""
+        docs = self._storage.find_matching(db, VIEW_COLLECTION, {"_id": name}, limit=1)
+        return docs[0].get("check_option") if docs else None
 
     def drop_view(self, db: str, name: str) -> bool:
         return self._storage.delete_matching(db, VIEW_COLLECTION, {"_id": name}) > 0

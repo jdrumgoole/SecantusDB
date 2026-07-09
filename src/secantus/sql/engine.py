@@ -1012,19 +1012,46 @@ def _merge_apply_matched(
     row changed)."""
     then = when.args["then"]
     if isinstance(then, exp.Update):
+        import copy
+
+        from secantus.paths import set_path
+
         set_doc: dict[str, Any] = {}
         for eq in then.expressions:
             col = eq.this.name
             set_doc[target.field_for(col)] = typemap.coerce(
                 scalar.evaluate(eq.expression, scope, sctx), target.type_for(col)
             )
-        if set_doc:
-            post = {**td, **set_doc}
-            executor.enforce_update_images(
-                [post], [td["_id"]], target, storage, db, sctx.catalog, sctx.session
-            )
-            storage.update_matching(db, target.collection, {"_id": td["_id"]}, {"$set": set_doc})
-        return 1, {**td, **set_doc}
+        if not set_doc:
+            return 1, td
+        # A SET that touches a primary-key column (``_id`` / ``_id.<name>``) can't
+        # go through ``$set`` — ``_id`` is immutable — so the row is re-keyed
+        # (delete + re-insert), mirroring the plain UPDATE path (#157). Non-PK sets
+        # take the in-place ``$set`` fast path.
+        id_sets = {k: v for k, v in set_doc.items() if k == "_id" or k.startswith("_id.")}
+        other_sets = {k: v for k, v in set_doc.items() if k not in id_sets}
+        post = copy.deepcopy(td)
+        for k, v in {**other_sets, **id_sets}.items():
+            set_path(post, k, v)
+        executor.enforce_update_images(
+            [post], [td["_id"]], target, storage, db, sctx.catalog, sctx.session
+        )
+        # Parent-side FK actions (RESTRICT / CASCADE / SET NULL) when a referenced
+        # column changed — enforce_update_images leaves these to the caller.
+        executor._enforce_fk_on_parent_update([td], [post], target, storage, db, sctx.catalog)
+        if id_sets:
+            if post["_id"] != td["_id"] and storage.find_matching(
+                db, target.collection, {"_id": post["_id"]}
+            ):
+                raise errors.SQLError(
+                    "23505",
+                    f'duplicate key value violates unique constraint "{target.name}_pkey"',
+                )
+            storage.delete_matching(db, target.collection, {"_id": td["_id"]})
+            storage.insert(db, target.collection, [post])
+        else:
+            storage.update_matching(db, target.collection, {"_id": td["_id"]}, {"$set": other_sets})
+        return 1, post
     action = then.sql().strip().upper()
     if action == "DELETE":
         executor.enforce_parent_delete([td], target, storage, db, sctx.catalog)
@@ -1421,21 +1448,23 @@ def _run_statement(
     if isinstance(stmt, exp.Select):
         return _run_select(stmt, storage, db, catalog, session)
 
+    check_pred = None
     if isinstance(stmt, (exp.Insert, exp.Update, exp.Delete)):
         # DML through an (automatically-updatable) view rewrites onto its base
-        # table before planning (#146).
-        stmt = _rewrite_write_through_view(stmt, catalog, db)
+        # table before planning (#146). ``check_pred`` is the view's WITH CHECK
+        # OPTION predicate, enforced against each written row.
+        stmt, check_pred = _rewrite_write_through_view(stmt, catalog, db)
 
     if isinstance(stmt, exp.Insert):
-        return _run_insert(stmt, storage, db, catalog, session)
+        return _run_insert(stmt, storage, db, catalog, session, check_option=check_pred)
 
     if isinstance(stmt, exp.Update):
         if stmt.args.get("from_") is not None:
             return _run_update_from(stmt, storage, db, catalog, session)
         table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
-        return executor.execute_update(
-            planner.plan_update(stmt, table), storage, db, catalog, session
-        )
+        plan = planner.plan_update(stmt, table)
+        plan.check_option = check_pred
+        return executor.execute_update(plan, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Delete):
         if stmt.args.get("using"):
@@ -1465,6 +1494,8 @@ def _run_statement(
             return _explain_statement(stmt, storage, db, catalog, session)
         if verb == "REFRESH":
             return _refresh_matview(stmt, storage, db, catalog, session)
+        if verb == "CREATE" and _VIEW_CHECK_OPTION_RE.search(stmt.sql(dialect="postgres")):
+            return _create_view_check_option_command(stmt, storage, db, catalog)
         if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("MATERIALIZED"):
             return _create_matview_command(stmt, storage, db, catalog, session)
         if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("MATERIALIZED"):
@@ -1787,11 +1818,17 @@ def _run_srf_select(
 
 
 def _run_insert(
-    stmt: exp.Insert, storage: Any, db: str, catalog: Catalog, session: Session
+    stmt: exp.Insert,
+    storage: Any,
+    db: str,
+    catalog: Catalog,
+    session: Session,
+    check_option: Any = None,
 ) -> SQLResult:
     """Dispatch an INSERT: ``VALUES`` plans directly; ``INSERT … SELECT`` runs the
     source query first (it may join / aggregate / be a set operation), then maps
-    its result rows positionally onto the target columns."""
+    its result rows positionally onto the target columns. ``check_option`` is an
+    auto-updatable view's WITH CHECK OPTION predicate, enforced per inserted row."""
     target = stmt.this
     name = target.this.name if isinstance(target, exp.Schema) else target.name
     table = _require_table(catalog, db, name, storage)
@@ -1806,8 +1843,10 @@ def _run_insert(
                 f"returns {len(result.columns)}",
             )
         plan = planner.plan_insert_rows(stmt, table, result.rows)
-        return executor.execute_insert(plan, storage, db, catalog, session)
-    return executor.execute_insert(planner.plan_insert(stmt, table), storage, db, catalog, session)
+    else:
+        plan = planner.plan_insert(stmt, table)
+    plan.check_option = check_option
+    return executor.execute_insert(plan, storage, db, catalog, session)
 
 
 def run_inner_select(
@@ -3104,6 +3143,30 @@ def _expand_views(
     return stmt
 
 
+# ``CREATE VIEW … WITH [LOCAL|CASCADED] CHECK OPTION`` exceeds sqlglot's parser
+# (it falls back to a Command), so match + strip the trailing clause and re-parse
+# the inner ``CREATE VIEW … AS SELECT …`` on its own.
+_VIEW_CHECK_OPTION_RE = re.compile(
+    r"(?is)\bVIEW\b.*?(?P<clause>\bWITH\s+(?:(?P<mode>LOCAL|CASCADED)\s+)?CHECK\s+OPTION)\s*$"
+)
+
+
+def _create_view_check_option_command(
+    stmt: exp.Command, storage: Any, db: str, catalog: Catalog
+) -> SQLResult:
+    """``CREATE [OR REPLACE] VIEW v AS SELECT … WITH [LOCAL|CASCADED] CHECK
+    OPTION`` — strip the check-option suffix, re-parse the inner CREATE VIEW, and
+    store it with its check-option mode so write-through enforces the predicate."""
+    full = stmt.sql(dialect="postgres")
+    m = _VIEW_CHECK_OPTION_RE.search(full)
+    mode = (m.group("mode") or "CASCADED").upper()
+    inner_sql = full[: m.start("clause")].rstrip()
+    inner = sqlglot.parse_one(inner_sql, read="postgres")
+    if not isinstance(inner, exp.Create) or (inner.args.get("kind") or "").upper() != "VIEW":
+        raise errors.feature_not_supported("unsupported CREATE VIEW … WITH CHECK OPTION form")
+    return executor.execute_create_view(inner, catalog, storage, db, check_option=mode)
+
+
 def _updatable_view_base(vdef_sql: str) -> tuple[str, exp.Expression | None] | None:
     """For an *automatically-updatable* view, return ``(base_table, where_cond)``;
     None if the view isn't simple enough to write through.
@@ -3138,20 +3201,25 @@ def _updatable_view_base(vdef_sql: str) -> tuple[str, exp.Expression | None] | N
     return from_.this.name, (where.this if isinstance(where, exp.Where) else None)
 
 
-def _rewrite_write_through_view(stmt: exp.Expression, catalog: Catalog, db: str) -> exp.Expression:
+def _rewrite_write_through_view(
+    stmt: exp.Expression, catalog: Catalog, db: str
+) -> tuple[exp.Expression, tuple[exp.Expression, str] | None]:
     """If an INSERT/UPDATE/DELETE targets a view, rewrite it onto the view's base
-    table (#146). Non-updatable views raise a faithful ``0A000``."""
+    table (#146). Non-updatable views raise a faithful ``0A000``. Returns
+    ``(stmt, check_option_predicate)`` — the predicate (the view's WHERE) is
+    non-None when the view carries ``WITH CHECK OPTION`` and the statement is an
+    INSERT / UPDATE, so the executor validates each written row against it."""
     if isinstance(stmt, exp.Insert):
         tgt = stmt.this
         table_node = tgt.this if isinstance(tgt, exp.Schema) else tgt
     else:
         table_node = stmt.find(exp.Table)
     if not isinstance(table_node, exp.Table):
-        return stmt
+        return stmt, None
     name = table_node.name
     vdef = catalog.get_view(db, name)
     if vdef is None:
-        return stmt  # a real table (or reflected collection) — unchanged
+        return stmt, None  # a real table (or reflected collection) — unchanged
     spec = _updatable_view_base(vdef)
     if spec is None:
         verb = {exp.Insert: "INSERT into", exp.Update: "UPDATE", exp.Delete: "DELETE from"}[
@@ -3169,7 +3237,17 @@ def _rewrite_write_through_view(stmt: exp.Expression, catalog: Catalog, db: str)
         if isinstance(existing, exp.Where) and existing.this is not None:
             merged = exp.and_(existing.this, merged)
         stmt.set("where", exp.Where(this=merged))
-    return stmt
+    # WITH CHECK OPTION: the written row must remain visible through the view, i.e.
+    # satisfy its WHERE. Applies to INSERT / UPDATE (a DELETE removes rows, so it
+    # can't create a row that violates the view predicate).
+    check_pred = None
+    if (
+        view_cond is not None
+        and isinstance(stmt, (exp.Insert, exp.Update))
+        and catalog.get_view_check_option(db, name) is not None
+    ):
+        check_pred = (view_cond, name)
+    return stmt, check_pred
 
 
 def _own_with(stmt: exp.Expression) -> exp.With | None:
@@ -3210,6 +3288,9 @@ class _CTECatalog(Catalog):
 
     def get_view(self, db: str, name: str) -> str | None:
         return self._base.get_view(db, name)
+
+    def get_view_check_option(self, db: str, name: str) -> str | None:
+        return self._base.get_view_check_option(db, name)
 
     def list_views(self, db: str) -> list[str]:
         return self._base.list_views(db)

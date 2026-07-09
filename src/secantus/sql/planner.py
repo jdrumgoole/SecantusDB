@@ -110,6 +110,11 @@ class InsertPlan:
     docs: list[dict[str, Any]]
     returning: list[tuple[str, Column, Any]] | None = None
     on_conflict: OnConflict | None = None
+    # An auto-updatable view's ``WITH CHECK OPTION`` predicate (an sqlglot
+    # expression over base columns): every inserted row must satisfy it or the
+    # write raises ``44000``. None for a direct table write / a view without the
+    # option.
+    check_option: Any = None
 
 
 @dataclass
@@ -174,6 +179,10 @@ class UpdatePlan:
     # ``(storage_field, type_tag, expr_node)`` evaluated against the old row by the
     # executor. Empty for a pure-literal UPDATE (the fast bulk ``$set`` path).
     computed: list[tuple[str, str, Any]] = field(default_factory=list)
+    # An auto-updatable view's ``WITH CHECK OPTION`` predicate (an sqlglot
+    # expression over base columns): every updated row's post-image must satisfy it
+    # or the write raises ``44000``. None for a direct table write.
+    check_option: Any = None
 
 
 @dataclass

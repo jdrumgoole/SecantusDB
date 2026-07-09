@@ -219,16 +219,20 @@ def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLRe
     raise errors.feature_not_supported(f"COMMENT ON {kind} is not supported")
 
 
-def execute_create_view(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
-    """``CREATE [OR REPLACE] VIEW v AS SELECT …`` — store the SELECT definition.
-    Querying the view expands it as a subquery (see ``engine._expand_views``)."""
+def execute_create_view(
+    stmt: Any, catalog: Catalog, storage: Any, db: str, check_option: str | None = None
+) -> SQLResult:
+    """``CREATE [OR REPLACE] VIEW v AS SELECT … [WITH [LOCAL|CASCADED] CHECK
+    OPTION]`` — store the SELECT definition. Querying the view expands it as a
+    subquery (see ``engine._expand_views``); ``check_option`` (``"LOCAL"`` /
+    ``"CASCADED"``) is enforced on write-through against each written row."""
     name = stmt.this.name
     replace = bool(stmt.args.get("replace"))
     if catalog.exists(db, name):
         raise errors.SQLError("42P07", f'relation "{name}" already exists')
     if not replace and catalog.get_view(db, name) is not None:
         raise errors.SQLError("42P07", f'relation "{name}" already exists')
-    catalog.put_view(db, name, stmt.expression.sql(dialect="postgres"))
+    catalog.put_view(db, name, stmt.expression.sql(dialect="postgres"), check_option=check_option)
     return SQLResult(command_tag="CREATE VIEW")
 
 
@@ -481,6 +485,15 @@ def execute_insert(
     if plan.on_conflict is not None:
         return _execute_insert_on_conflict(plan, storage, db, catalog, session)
     _assign_sequences(plan.docs, plan.table, db, catalog, session)
+    if plan.check_option is not None:
+        from secantus.sql import scalar
+
+        _validate_check_option(
+            plan.docs,
+            plan.check_option,
+            plan.table,
+            scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session),
+        )
     if plan.returning is not None:
         # Pin an ``_id`` on every doc up front so the in-hand list is the
         # authoritative inserted set to project from (storage may deep-copy on
@@ -554,6 +567,38 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
             raise errors.SQLError(
                 "23514",
                 f'new row for relation "{table.name}" violates check constraint "{ck.name}"',
+            )
+
+
+def _validate_check_option(
+    docs: list[dict[str, Any]], check_option: Any, table: Any, ctx: Any
+) -> None:
+    """Enforce an auto-updatable view's ``WITH CHECK OPTION`` — every written row
+    (an INSERT row or an UPDATE post-image) must satisfy the view's WHERE
+    predicate, else raise ``44000`` (``WITH CHECK OPTION`` violation). Unlike a
+    CHECK constraint, a predicate that is not TRUE (FALSE *or* NULL) violates:
+    the row would not be visible through the view. ``check_option`` is a
+    ``(predicate, view_name)`` pair; ``predicate`` is an sqlglot expression over
+    base columns (view columns == base columns for an auto-updatable view)."""
+    from secantus.sql import scalar
+
+    if check_option is None:
+        return
+    predicate, view_name = check_option
+
+    def scope_for(row: dict[str, Any]):
+        def scope(node: Any) -> Any:
+            col = table.column(node.name)
+            return get_path(row, col.field if col is not None else node.name)
+
+        return scope
+
+    for doc in docs:
+        value = scalar.evaluate(predicate, scope_for(doc), ctx)
+        if not scalar._truthy(value):
+            raise errors.SQLError(
+                "44000",
+                f'new row violates check option for view "{view_name}"',
             )
 
 
@@ -856,6 +901,8 @@ def _execute_insert_on_conflict(
         if existing is None:
             # Full enforcement — including any UNIQUE / CHECK / FK other than the
             # arbiter target (which _find_conflict already cleared).
+            if plan.check_option is not None:
+                _validate_check_option([doc], plan.check_option, plan.table, sctx)
             enforce_insert_rows([doc], plan.table, storage, db, catalog, session)
             inserted, write_errors = storage.insert(db, coll, [doc])
             if write_errors:
@@ -873,6 +920,9 @@ def _execute_insert_on_conflict(
             continue
         updated = _apply_conflict_update(plan.table, storage, db, oc, existing, doc, sctx)
         if updated is not None:
+            # DO UPDATE post-image must also satisfy a view's CHECK OPTION.
+            if plan.check_option is not None:
+                _validate_check_option([updated], plan.check_option, plan.table, sctx)
             affected += 1
             result_docs.append(updated)
     tag = f"INSERT 0 {affected}"
@@ -1404,6 +1454,17 @@ def execute_update(
         return _execute_update_materialized(plan, storage, db, catalog, session)
     coll = plan.table.collection
     _validate_update_post_images(plan, storage, db, session, catalog)
+    if plan.check_option is not None:
+        from secantus.sql import scalar
+        from secantus.update import apply_update
+
+        matched_rows = storage.find_matching(db, coll, plan.filter)
+        _validate_check_option(
+            [apply_update(d, plan.update) for d in matched_rows],
+            plan.check_option,
+            plan.table,
+            scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session),
+        )
     gen_cols = (
         [c for c in plan.table.columns if c.generated is not None]
         if not getattr(plan.table, "reflected", False)
@@ -1492,6 +1553,13 @@ def _execute_update_materialized(
     _validate_update_post_images(
         plan, storage, db, session, catalog, matched=matched, post_images=posts
     )
+    if plan.check_option is not None:
+        _validate_check_option(
+            posts,
+            plan.check_option,
+            table,
+            ctx or scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session),
+        )
 
     if plan.rekey:
         # New ``_id`` values must be free: not held by an unmatched row, and not

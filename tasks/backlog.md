@@ -2191,7 +2191,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   is still allowed — each acted on once). **`RETURNING merge_action()` + source columns landed (#161, b198):**
   `_run_merge` tracks `(image, action, source_row)` per affected row and `_merge_returning_result` evaluates
   the projection against the MERGE scope (target image + source row), so `merge_action()` → `'INSERT'` /
-  `'UPDATE'` / `'DELETE'` and `RETURNING s.col` reads the source. **Limitations:** an unqualified column
+  `'UPDATE'` / `'DELETE'` and `RETURNING s.col` reads the source. **MERGE UPDATE of a PK column landed
+  (#164, b199):** a `WHEN MATCHED THEN UPDATE SET <pk> = …` now re-keys the row (delete + re-insert under
+  the new `_id` / composite `_id.<name>`, via `set_path`) instead of leaking the immutable-`_id`
+  `UpdateError`; a re-key that collides with an existing key raises `23505`, and parent-side FK actions
+  (RESTRICT / CASCADE / SET NULL) fire via `executor._enforce_fk_on_parent_update` when the referenced
+  column changes — mirroring the plain UPDATE re-key path (#157). **Limitations:** an unqualified column
   ambiguous between target and source resolves to the target.
 - [ ] **Join DML landed (#162/#163, b199).** `DELETE FROM t USING src[, …] WHERE <join>` and
   `UPDATE t SET … FROM src[, …] WHERE <join>` bring in other tables. `engine._run_statement` routes an
@@ -2406,9 +2411,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   clear the child FK columns (`_fk_clear_value` uses the column default for SET DEFAULT). Reverse-FK
   lookup (`_referencing_fks`) scans the catalog. `execute_delete` / `execute_update` now take
   `catalog` + `session`; reflected tables have no FKs → ungated. **Limitations:** deferred constraints
-  aren't modeled (checks are immediate); `MERGE` writes bypass enforcement (`_run_merge`); parent-side
+  aren't modeled (checks are immediate — but see #69); parent-side
   UPDATE only fires when a referenced column actually changes (references usually target the immutable
-  PK/`_id`); no cross-database FKs.
+  PK/`_id`); no cross-database FKs. (Historical note, now closed: `MERGE` writes *do* enforce — child-side
+  via `enforce_insert_rows` / `enforce_update_images`, parent-side FK on a MERGE UPDATE via
+  `_enforce_fk_on_parent_update`, and parent-side on a MERGE DELETE via `enforce_parent_delete` — see the
+  MERGE bullet.)
 - [ ] **UNIQUE enforcement on write landed** (b95): `INSERT` / `UPDATE` on a **declared** table now
   reject a write that would create two rows sharing a value for a declared UNIQUE constraint (`23505`,
   `executor._validate_unique_rows`). NULLs are distinct — a row with any NULL in a constraint's columns
@@ -2417,10 +2425,10 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   rewriting (`exclude_ids` = matched `_id`s) so unchanged rows and value-swaps across the matched set
   don't self-conflict. Wired into `execute_insert` and `execute_update` (via
   `_validate_update_post_images`, which now also does UNIQUE). The PK is still enforced separately by
-  storage's `_id` index (code 11000 → 23505 in `_raise_write_error`). **Limitations:** `INSERT … ON
-  CONFLICT` only handles its arbiter target — a secondary UNIQUE violated by the insert / DO UPDATE
-  isn't caught (TODO); `MERGE` writes bypass enforcement (go through `_run_merge`, not
-  `execute_update`); no `NULLS NOT DISTINCT`.
+  storage's `_id` index (code 11000 → 23505 in `_raise_write_error`). **Limitations:** no `NULLS NOT
+  DISTINCT`. (Historical note, now closed by #67: `INSERT … ON CONFLICT` catches a secondary UNIQUE — the
+  clean-insert branch runs `enforce_insert_rows` over every UNIQUE constraint, not just the arbiter — and
+  `MERGE` writes enforce through the same shared helpers.)
 - [ ] **CHECK + NOT NULL enforcement on write landed** (b94): `INSERT` / `UPDATE` on a **declared**
   table now enforce NOT NULL (`23502`) and CHECK (`23514`) against the post-image — a violating write is
   rejected and the table left unchanged (`executor._validate_write_row` / `_validate_rows` /
@@ -2431,10 +2439,10 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `execute_insert`, both `INSERT … ON CONFLICT` branches (insert + DO UPDATE post-image), INSERT…SELECT
   (rows flow through `execute_insert`), and `execute_update` (post-image computed with
   `secantus.update.apply_update` before the storage write). Reflected (schema-on-read) tables carry no
-  declared constraints, so their writes are never gated. **Limitations:** UNIQUE / FOREIGN KEY still
-  aren't enforced (separate slices); `MERGE` writes go through `_run_merge`, not `execute_update`, so
-  they bypass enforcement (TODO); a multi-statement failure isn't rolled back unless inside an explicit
-  transaction block (per-statement atomicity only for the failing statement).
+  declared constraints, so their writes are never gated. **Limitations:** a multi-statement failure isn't
+  rolled back unless inside an explicit transaction block (per-statement atomicity only for the failing
+  statement). (Historical note, now closed: UNIQUE (#64) / FOREIGN KEY (#65) are enforced, and `MERGE`
+  writes go through the shared enforcement helpers (#67), not a bypass.)
 - [ ] **CHECK / UNIQUE constraints — declared, reflected, NOT enforced** (b91): column-level (`col int
   CHECK (col > 0)` / `col text UNIQUE`), table-level named (`CONSTRAINT c CHECK (...)` / `... UNIQUE (a,
   b)`), and table-level unnamed CHECK/UNIQUE are parsed by `planner._extract_constraints`, stored on
@@ -2491,9 +2499,10 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   names (`virtual._matview_names`), `pg_get_viewdef(oid)` returns the definition (`viewdef_for_oid`
   extended), and matviews are **excluded** from `information_schema.tables` (matching Postgres).
   SQLAlchemy's `get_materialized_view_names()` reflects them; they don't appear in `get_table_names()`.
-  **Limitations:** full recompute only (no `REFRESH … CONCURRENTLY`, no incremental refresh); no indexes
-  on the snapshot; `WITH NO DATA` / `WITH DATA` not modeled (always populated); `ALTER MATERIALIZED
-  VIEW` unsupported.
+  **Limitations:** no incremental refresh (full recompute only). (Historical note, now closed by #68:
+  `WITH NO DATA` / `WITH DATA` *are* modeled — an unpopulated matview raises `55000` on scan until its
+  first `REFRESH` — and `REFRESH … CONCURRENTLY` + a unique index on the snapshot + `ALTER MATERIALIZED
+  VIEW … RENAME TO` are supported; other `ALTER MATERIALIZED VIEW` subcommands remain `0A000`.)
 - [ ] **`CREATE VIEW` / `DROP VIEW` landed** (b87): a view is a stored `SELECT` persisted as its query
   text in a per-db `__sql_views__` collection (`catalog.put_view` / `get_view` / `drop_view` /
   `list_views`). `CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]` dispatch on `exp.Create` /
@@ -2514,10 +2523,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   a plain **unaliased** base column (or `*`) — so view names equal base names and no column remap is needed.
   A view's `WHERE` is AND-ed into UPDATE/DELETE (rows outside the view can't be touched). Anything else raises
   `0A000` ("not an automatically-updatable view" — PG would need an INSTEAD OF trigger). Tests:
-  `test_sql_views.py` (writable-view section). **Still:** not materialized (each query re-reads the base
-  tables); no `CASCADE`/`RESTRICT` on `DROP`; no column-list aliasing (`CREATE VIEW v (a, b) AS …`);
-  `WITH CHECK OPTION` not modeled (an INSERT/UPDATE may create a row invisible to the view); aliased /
-  expression projections aren't updatable.
+  `test_sql_views.py` (writable-view section). **`WITH CHECK OPTION` landed (#164, b199):**
+  `CREATE VIEW … WITH [LOCAL|CASCADED] CHECK OPTION` exceeds sqlglot (→ Command), so
+  `_create_view_check_option_command` strips the clause, re-parses the inner CREATE VIEW, and stores the
+  mode on the view doc (`catalog.put_view(..., check_option=)` / `get_view_check_option`). On write-through
+  `_rewrite_write_through_view` returns the view's WHERE as a `(predicate, view_name)` pair threaded onto
+  `InsertPlan.check_option` / `UpdatePlan.check_option`; `executor._validate_check_option` rejects any
+  INSERT / UPDATE post-image (incl. the ON CONFLICT insert + DO UPDATE branches and the computed /
+  materialized UPDATE path) whose row is not visible through the view — the predicate not TRUE (FALSE *or*
+  NULL) → `44000`. Reflected in `information_schema.views.check_option`. **Still:** not materialized (each
+  query re-reads the base tables); no `CASCADE`/`RESTRICT` on `DROP`; no column-list aliasing (`CREATE VIEW
+  v (a, b) AS …`); CHECK OPTION cascades only one level (a CASCADED view over another CHECK OPTION view
+  doesn't re-check the inner condition); aliased / expression projections aren't updatable.
 - [ ] **`COMMENT ON TABLE` / `COLUMN` landed** (b86): the comment is stored on `TableDef.comment` /
   `Column.comment` (persisted in the catalog doc) by `executor.execute_comment` (dispatched on
   `exp.Comment`), surfaced through `virtual._pg_description` (table comment → `objsubid 0`, column
