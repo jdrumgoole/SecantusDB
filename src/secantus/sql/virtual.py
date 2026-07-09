@@ -281,9 +281,30 @@ def _info_columns(db: str, session: Session, storage: Any, catalog: Catalog) -> 
                         else typemap.SQL_TYPE_NAME.get(col.type_tag, "text")
                     ),
                     "is_nullable": "NO" if not col.nullable else "YES",
+                    "column_default": _column_default_text(col),
                 }
             )
     return rows
+
+
+def _column_default_text(col: Any) -> str | None:
+    """The ``information_schema.columns.column_default`` text for a column: the
+    expression default's SQL, a ``nextval`` for a sequence-backed column, or the
+    rendered literal. None for a column with no default."""
+    if getattr(col, "default_expr", None) is not None:
+        return col.default_expr
+    if col.sequence is not None:
+        return f"nextval('{col.sequence}'::regclass)"
+    if not col.has_default:
+        return None
+    v = col.default
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return "'" + v.replace("'", "''") + "'::text"
+    return str(v)
 
 
 def _info_schemata(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -1677,6 +1698,7 @@ _register(
         ("ordinal_position", "int4"),
         ("data_type", "text"),
         ("is_nullable", "text"),
+        ("column_default", "text"),
     ],
     _info_columns,
 )

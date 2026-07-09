@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from secantus.sql import SQLError, run_sql
+from secantus.sql import run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -137,12 +137,14 @@ def test_count_distinct_over_join(storage, session):
     assert res.rows == [("east", 2), ("west", 1)]
 
 
-def test_distinct_in_having_rejected(storage, session):
+def test_distinct_in_having(storage, session):
+    # DISTINCT aggregate inside HAVING is supported single-table (#166): east has
+    # distinct amounts {10, 20} = 2, west has {30} = 1 → only east qualifies.
     _sales(storage, session)
-    with pytest.raises(SQLError) as ei:
-        q(
-            storage,
-            session,
-            "SELECT region FROM sales GROUP BY region HAVING COUNT(DISTINCT amount) > 1",
-        )
-    assert ei.value.sqlstate == "0A000"
+    res = q(
+        storage,
+        session,
+        "SELECT region FROM sales GROUP BY region "
+        "HAVING COUNT(DISTINCT amount) > 1 ORDER BY region",
+    )
+    assert res.rows == [("east",)]

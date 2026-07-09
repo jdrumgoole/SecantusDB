@@ -14,6 +14,7 @@ Only the P0 subset is handled; anything outside it raises a
 from __future__ import annotations
 
 import contextvars
+import functools
 import json
 import logging
 import re
@@ -456,6 +457,39 @@ def _default_sequence(coldef: exp.ColumnDef) -> str | None:
                     target = target.this
                 return str(_literal(target))
     return None
+
+
+def _default_expr(coldef: exp.ColumnDef) -> str | None:
+    """The rendered SQL of a *non-literal, non-nextval* column DEFAULT (``now()``,
+    ``gen_random_uuid()``, ``CURRENT_TIMESTAMP``, an arithmetic expression, …),
+    evaluated per omitted row at INSERT. None when the default is a static literal
+    (handled by ``_literal_default``), a ``nextval`` sequence (``_default_sequence``),
+    or absent."""
+    for c in coldef.args.get("constraints") or []:
+        if type(c.kind).__name__ != "DefaultColumnConstraint":
+            continue
+        node = c.kind.this
+        if isinstance(node, (exp.Null, exp.Literal, exp.Boolean, exp.Neg)):
+            return None  # static literal — handled by _literal_default
+        probe = node.this if isinstance(node, exp.Cast) else node
+        if isinstance(probe, exp.Anonymous) and str(probe.this).lower() == "nextval":
+            return None  # sequence default — handled by _default_sequence
+        return node.sql(dialect="postgres")
+    return None
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_default_expr(text: str) -> Any:
+    import sqlglot
+
+    return sqlglot.parse_one(text, read="postgres")
+
+
+def _default_col_scope(node: Any) -> Any:
+    # A column DEFAULT can't reference table columns (Postgres rejects it at
+    # CREATE TABLE); a stray reference surfaces faithfully rather than silently
+    # evaluating to NULL.
+    raise errors.SQLError("0A000", "column references in a DEFAULT expression are not supported")
 
 
 # ---------------------------------------------------------------------------
@@ -1158,6 +1192,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
             pk_seen = True
         has_default, default = _column_default(coldef, tag)
         sequence = _default_sequence(coldef)
+        default_expr = None if (has_default or sequence) else _default_expr(coldef)
         if auto:
             sequence = f"{table_name}_{coldef.name}_seq"
             start = identity["start"] if identity else 1
@@ -1174,6 +1209,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 nullable=nullable,
                 has_default=has_default,
                 default=default,
+                default_expr=default_expr,
                 sequence=sequence,
                 identity=(identity["mode"] if identity else None),
                 enum_type=enum_name,
@@ -1490,6 +1526,12 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             continue  # filled by the executor (sequence draw / computed expr)
         if col.has_default:
             _set_doc_field(doc, col.field, typemap.coerce(col.default, col.type_tag))
+        elif col.default_expr is not None:
+            from secantus.sql import scalar
+
+            ctx = scalar.ScalarContext(storage=None, catalog=None, db="", session=None)
+            val = scalar.evaluate(_parse_default_expr(col.default_expr), _default_col_scope, ctx)
+            _set_doc_field(doc, col.field, typemap.coerce(val, col.type_tag))
         elif not col.nullable:
             raise errors.not_null_violation(col.name)
     _canonicalize_composite_id(doc, table)
@@ -2292,19 +2334,20 @@ def _where_has_jsonb_contained_predicate(node: exp.Expression, table: TableDef) 
     return False
 
 
+_RANGE_LIKE_TAGS = typemap._RANGE_TAGS | typemap._MULTIRANGE_TAGS
+
+
 def _where_has_range_predicate(node: exp.Expression, table: TableDef) -> bool:
     """True if ``node`` contains an ``@>`` / ``<@`` / ``&&`` whose operand is a
-    range-typed column or a range constructor — those need per-row evaluation."""
+    range- / multirange-typed column or constructor — those need per-row
+    evaluation (COLLSCAN + residual), not a jsonb-containment pushdown."""
     for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps):
         for operand in (op.this, op.expression):
             if isinstance(operand, exp.Column):
                 col = table.column(_column_name(operand))
-                if col is not None and col.type_tag in typemap._RANGE_TAGS:
+                if col is not None and col.type_tag in _RANGE_LIKE_TAGS:
                     return True
-            if (
-                isinstance(operand, exp.Anonymous)
-                and str(operand.this).lower() in typemap._RANGE_TAGS
-            ):
+            if isinstance(operand, exp.Anonymous) and str(operand.this).lower() in _RANGE_LIKE_TAGS:
                 return True
     return False
 
@@ -3607,7 +3650,9 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     # present in the $group stage built below.
     having = stmt.args.get("having")
     having_match = (
-        _having_to_match(having.this, table, accumulators, agg_fields, group_cols)
+        _having_to_match(
+            having.this, table, accumulators, agg_fields, group_cols, names, reductions
+        )
         if having is not None
         else None
     )
@@ -3761,7 +3806,9 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
 
     having = stmt.args.get("having")
     having_match = (
-        _having_to_match(having.this, table, accumulators, agg_fields, group_cols)
+        _having_to_match(
+            having.this, table, accumulators, agg_fields, group_cols, names, reductions
+        )
         if having is not None
         else None
     )
@@ -3841,20 +3888,18 @@ def _having_to_match(
     accumulators: dict[str, Any],
     agg_fields: dict[tuple[str, str | None], str],
     group_cols: list[str],
+    names: Any = None,
+    reductions: Any = None,
 ) -> dict[str, Any]:
+    def rec(n: exp.Expression) -> dict[str, Any]:
+        return _having_to_match(n, table, accumulators, agg_fields, group_cols, names, reductions)
+
     if isinstance(node, exp.Paren):
-        return _having_to_match(node.this, table, accumulators, agg_fields, group_cols)
+        return rec(node.this)
     if isinstance(node, exp.And):
-        left = _having_to_match(node.this, table, accumulators, agg_fields, group_cols)
-        right = _having_to_match(node.expression, table, accumulators, agg_fields, group_cols)
-        return _merge_and([left, right])
+        return _merge_and([rec(node.this), rec(node.expression)])
     if isinstance(node, exp.Or):
-        return {
-            "$or": [
-                _having_to_match(node.this, table, accumulators, agg_fields, group_cols),
-                _having_to_match(node.expression, table, accumulators, agg_fields, group_cols),
-            ]
-        }
+        return {"$or": [rec(node.this), rec(node.expression)]}
 
     def field_tag(term: exp.Expression) -> tuple[str, str]:
         if isinstance(term, exp.Column):
@@ -3871,9 +3916,23 @@ def _having_to_match(
             raise errors.feature_not_supported(f"unsupported HAVING term: {term.sql()}")
         func, col, distinct = agg
         if distinct and func in _DISTINCT_FUNCS:
-            raise errors.feature_not_supported(
-                f"DISTINCT inside {func}() is not supported in HAVING"
+            if agg in agg_fields:  # already registered by the SELECT list — reuse
+                return agg_fields[agg], _agg_out_tag(func, table.type_for(col) if col else None)
+            if names is None or reductions is None or col is None:
+                raise errors.feature_not_supported(
+                    f"DISTINCT inside {func}() is not supported in HAVING"
+                )
+            fname, tag = _register_distinct_agg(
+                func,
+                table.field_for(col),
+                table.type_for(col),
+                None,
+                names,
+                accumulators,
+                reductions,
             )
+            agg_fields[agg] = fname
+            return fname, tag
         where = _agg_filter_where(term)
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         acc, tag = _accumulator(func, col, table, fcond)

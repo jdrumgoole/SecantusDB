@@ -292,6 +292,45 @@ def multirange_members(mr: Any) -> list:
     return mr.get("multirange", []) if isinstance(mr, dict) else []
 
 
+def is_multirange(x: Any) -> bool:
+    return isinstance(x, dict) and "multirange" in x
+
+
+def _is_range(x: Any) -> bool:
+    return isinstance(x, dict) and ("lower" in x or "empty" in x)
+
+
+def contains_any(a: Any, b: Any) -> bool:
+    """``a @> b`` where either side may be a range, a multirange, or (for ``b``) a
+    scalar element. A multirange's members are disjoint and non-adjacent
+    (normalised by ``make_multirange``), so a range is contained in a multirange
+    iff a *single* member contains it."""
+    if is_multirange(a):
+        if is_multirange(b):
+            return all(_mr_contains_range(a, m) for m in multirange_members(b))
+        if _is_range(b):
+            return _mr_contains_range(a, b)
+        return any(contains_value(m, b) for m in multirange_members(a))  # element
+    if is_multirange(b):
+        # A single range contains a multirange iff it contains every member (an
+        # empty multirange has no members → vacuously contained).
+        return all(contains_range(a, m) for m in multirange_members(b))
+    if _is_range(b):
+        return contains_range(a, b)
+    return contains_value(a, b)  # element
+
+
+def _mr_contains_range(mr: Any, r: Any) -> bool:
+    return any(contains_range(m, r) for m in multirange_members(mr))
+
+
+def overlaps_any(a: Any, b: Any) -> bool:
+    """``a && b`` where either side may be a range or a multirange."""
+    am = multirange_members(a) if is_multirange(a) else [a]
+    bm = multirange_members(b) if is_multirange(b) else [b]
+    return any(overlaps(x, y) for x in am for y in bm)
+
+
 def render_multirange(mr: Any) -> str:
     """Render a multirange as the Postgres text form ``{[1,5), [10,20)}``."""
     return "{" + ", ".join(render(r) for r in multirange_members(mr)) + "}"
