@@ -24,7 +24,7 @@ import types
 
 import bson
 import pytest
-from bson import Decimal128, Int64, ObjectId
+from bson import Decimal128, Int64, ObjectId, Timestamp
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -433,6 +433,53 @@ CURATED = [
     ({"$dateFromParts": {"year": 10000}}, {}),  # year range -> defer
     ({"$dateFromParts": {"isoWeekYear": 2023}}, {}),  # iso form -> defer
     ({"$dateFromParts": {"year": 2023, "timezone": "America/New_York"}}, {}),  # named tz -> defer
+    # $dateFromParts ISO-week form — Monday of ISO week 1 + (week-1)/(day-1) rollover.
+    ({"$dateFromParts": {"isoWeekYear": 2023, "isoWeek": 5, "isoDayOfWeek": 3}}, {}),
+    ({"$dateFromParts": {"isoWeekYear": 2023}}, {}),  # defaults isoWeek/day = 1
+    ({"$dateFromParts": {"isoWeekYear": 2023, "isoWeek": 53, "isoDayOfWeek": 1}}, {}),  # rollover
+    ({"$dateFromParts": {"isoWeekYear": 2023, "isoWeek": 5, "timezone": "+05:00"}}, {}),
+    ({"$dateFromParts": {"isoWeek": 5}}, {}),  # missing isoWeekYear -> defer
+    # $tsSecond / $tsIncrement — Timestamp fields; null -> null; non-ts -> defer.
+    ({"$tsSecond": "$t"}, {"t": Timestamp(1700000000, 7)}),
+    ({"$tsIncrement": "$t"}, {"t": Timestamp(1700000000, 7)}),
+    ({"$tsSecond": "$x"}, {}),  # missing -> null
+    ({"$tsSecond": 5}, {}),  # non-timestamp -> defer
+    # $type — full type coverage incl. missing.
+    ({"$type": "$a"}, {"a": 5}),
+    ({"$type": "$a"}, {"a": Int64(9)}),
+    ({"$type": "$a"}, {"a": 3.5}),
+    ({"$type": "$a"}, {"a": Decimal128("1.5")}),
+    ({"$type": "$a"}, {"a": True}),
+    ({"$type": "$a"}, {"a": "s"}),
+    ({"$type": "$a"}, {"a": [1]}),
+    ({"$type": "$a"}, {"a": None}),  # explicit null
+    ({"$type": "$a"}, {"a": ObjectId()}),
+    ({"$type": "$a"}, {"a": Timestamp(1, 2)}),
+    ({"$type": "$missing"}, {}),  # missing field -> "missing"
+    ({"$type": {"$literal": 5}}, {}),
+    # $isNumber / $isArray.
+    ({"$isNumber": "$a"}, {"a": 5}),
+    ({"$isNumber": "$a"}, {"a": Decimal128("1.5")}),
+    ({"$isNumber": "$a"}, {"a": True}),
+    ({"$isNumber": "$a"}, {"a": "s"}),
+    ({"$isNumber": "$x"}, {}),  # missing -> False
+    ({"$isArray": "$a"}, {"a": [1, 2]}),
+    ({"$isArray": "$a"}, {"a": "s"}),
+    # $strcasecmp — case-insensitive; null -> "".
+    ({"$strcasecmp": ["abc", "ABC"]}, {}),
+    ({"$strcasecmp": ["a", "b"]}, {}),
+    ({"$strcasecmp": ["b", "a"]}, {}),
+    ({"$strcasecmp": ["$n", "a"]}, {"n": None}),
+    ({"$strcasecmp": ["café", "CAFÉ"]}, {}),  # non-ASCII -> defer
+    # $replaceOne / $replaceAll.
+    ({"$replaceOne": {"input": "abcabc", "find": "bc", "replacement": "X"}}, {}),
+    ({"$replaceAll": {"input": "abcabc", "find": "bc", "replacement": "X"}}, {}),
+    ({"$replaceOne": {"input": "xyz", "find": "a", "replacement": "b"}}, {}),  # no match
+    (
+        {"$replaceAll": {"input": "$n", "find": "a", "replacement": "b"}},
+        {"n": None},
+    ),  # null -> null
+    ({"$replaceOne": {"input": "abc", "find": 5, "replacement": "b"}}, {}),  # non-string -> defer
     # $dateFromString — parity-safe slice: naive canonical ISO (date-only /
     # whole-second), no format/timezone. Fractional / Z / offset / format /
     # timezone / invalid all defer.

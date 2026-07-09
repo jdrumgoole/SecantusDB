@@ -269,6 +269,14 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         // misc structural / deterministic
         "$dateToParts" => op_date_to_parts(arg, ctx),
         "$dateFromParts" => op_date_from_parts(arg, ctx),
+        "$tsSecond" => op_ts_field(arg, ctx, true),
+        "$tsIncrement" => op_ts_field(arg, ctx, false),
+        "$type" => op_type(arg, ctx),
+        "$isNumber" => op_is_number(arg, ctx),
+        "$isArray" => op_is_array(arg, ctx),
+        "$strcasecmp" => op_strcasecmp(arg, ctx),
+        "$replaceOne" => op_replace(arg, ctx, false),
+        "$replaceAll" => op_replace(arg, ctx, true),
         "$range" => op_range(arg, ctx),
         "$strLenBytes" => op_str_len_bytes(arg, ctx),
         "$arrayToObject" => op_array_to_object(arg, ctx),
@@ -2592,54 +2600,81 @@ fn dfp_int(v: &Bson) -> Option<i64> {
 /// / out-of-range `year`, a non-integral component, the ISO-week form — and a
 /// *named* `timezone` (DST-ambiguous local→instant) defers to Python. Mirrors the
 /// pure `_op_date_from_parts`.
+/// Read a `$dateFromParts` component: absent → `default`; null → `Ok(None)` (the
+/// caller returns null); non-integral → `Fallback` (Python raises 40515). Integral
+/// doubles accepted.
+fn dfp_comp(d: &Document, name: &str, default: i64, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
+    match d.get(name) {
+        None => Ok(Some(default)),
+        Some(e) => match eval(e, ctx)? {
+            Bson::Null => Ok(None),
+            v => Ok(Some(dfp_int(&v).ok_or(Fallback)?)),
+        },
+    }
+}
+
+/// Days since 1970-01-01 of the Monday of ISO week 1 of `iso_year`, via `chrono`.
+fn iso_week1_monday_days(iso_year: i64) -> Option<i64> {
+    use chrono::{Datelike, NaiveDate, Weekday};
+    let d = NaiveDate::from_isoywd_opt(i32::try_from(iso_year).ok()?, 1, Weekday::Mon)?;
+    Some(days_from_civil(
+        d.year() as i64,
+        d.month() as i64,
+        d.day() as i64,
+    ))
+}
+
 fn op_date_from_parts(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
-    if d.contains_key("isoWeekYear") || d.contains_key("isoWeek") || d.contains_key("isoDayOfWeek")
-    {
-        return Err(Fallback); // ISO-week form -> Python
+    // Shared time components (any null -> null).
+    macro_rules! comp {
+        ($name:literal, $default:literal) => {
+            match dfp_comp(d, $name, $default, ctx)? {
+                Some(v) => v,
+                None => return Ok(Bson::Null),
+            }
+        };
     }
-    if !d.contains_key("year") {
-        return Err(Fallback); // Python raises 40516
-    }
-    let names = [
-        "year",
-        "month",
-        "day",
-        "hour",
-        "minute",
-        "second",
-        "millisecond",
-    ];
-    let defaults = [0i64, 1, 1, 0, 0, 0, 0];
-    let mut vals = [0i64; 7];
-    for (i, name) in names.iter().enumerate() {
-        match d.get(*name) {
-            None => vals[i] = defaults[i],
-            Some(expr) => match eval(expr, ctx)? {
-                Bson::Null => return Ok(Bson::Null), // null component -> null
-                v => vals[i] = dfp_int(&v).ok_or(Fallback)?,
-            },
+    let hour = comp!("hour", 0);
+    let minute = comp!("minute", 0);
+    let second = comp!("second", 0);
+    let ms = comp!("millisecond", 0);
+    let is_iso = d.contains_key("isoWeekYear")
+        || d.contains_key("isoWeek")
+        || d.contains_key("isoDayOfWeek");
+    let total_days = if is_iso {
+        if !d.contains_key("isoWeekYear") {
+            return Err(Fallback); // Python raises 40516
         }
-    }
-    let year = vals[0];
-    if !(1..=9999).contains(&year) {
-        return Err(Fallback); // Python raises 40523
-    }
-    let total_months = year * 12 + (vals[1] - 1);
-    let base_year = total_months.div_euclid(12);
-    let base_month = total_months.rem_euclid(12) + 1;
-    if !(1..=9999).contains(&base_year) {
-        return Err(Fallback); // rollover pushed the year out of range -> Python
-    }
-    let base_days = days_from_civil(base_year, base_month, 1);
-    let mut millis = base_days * 86_400_000
-        + (vals[2] - 1) * 86_400_000
-        + vals[3] * 3_600_000
-        + vals[4] * 60_000
-        + vals[5] * 1_000
-        + vals[6];
+        let iso_year = comp!("isoWeekYear", 0);
+        let iso_week = comp!("isoWeek", 1);
+        let iso_dow = comp!("isoDayOfWeek", 1);
+        if !(1..=9999).contains(&iso_year) {
+            return Err(Fallback);
+        }
+        iso_week1_monday_days(iso_year).ok_or(Fallback)? + (iso_week - 1) * 7 + (iso_dow - 1)
+    } else {
+        if !d.contains_key("year") {
+            return Err(Fallback); // Python raises 40516
+        }
+        let year = comp!("year", 0);
+        let month = comp!("month", 1);
+        let day = comp!("day", 1);
+        if !(1..=9999).contains(&year) {
+            return Err(Fallback); // Python raises 40523
+        }
+        let total_months = year * 12 + (month - 1);
+        let base_year = total_months.div_euclid(12);
+        let base_month = total_months.rem_euclid(12) + 1;
+        if !(1..=9999).contains(&base_year) {
+            return Err(Fallback); // rollover pushed the year out of range -> Python
+        }
+        days_from_civil(base_year, base_month, 1) + (day - 1)
+    };
+    let mut millis =
+        total_days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1_000 + ms;
     match d.get("timezone") {
         None | Some(Bson::Null) => {}
         Some(Bson::String(s)) => match resolve_tz_offset(s) {
@@ -2649,6 +2684,122 @@ fn op_date_from_parts(arg: &Bson, ctx: &Ctx) -> R {
         Some(_) => return Err(Fallback),
     }
     Ok(Bson::DateTime(bson::DateTime::from_millis(millis)))
+}
+
+/// `$tsSecond` (seconds) / `$tsIncrement` (increment) of a BSON Timestamp, as a
+/// long. Null / missing → null; a non-timestamp defers (Python raises 5687301/2).
+fn op_ts_field(arg: &Bson, ctx: &Ctx, seconds: bool) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        Bson::Timestamp(ts) => Ok(Bson::Int64(if seconds {
+            ts.time as i64
+        } else {
+            ts.increment as i64
+        })),
+        _ => Err(Fallback),
+    }
+}
+
+/// The BSON type string mongod's `$type` reports for a value.
+fn type_name(v: &Bson) -> &'static str {
+    match v {
+        Bson::Null => "null",
+        Bson::Boolean(_) => "bool",
+        Bson::Int32(_) => "int",
+        Bson::Int64(_) => "long",
+        Bson::Double(_) => "double",
+        Bson::Decimal128(_) => "decimal",
+        Bson::String(_) => "string",
+        Bson::Binary(_) => "binData",
+        Bson::ObjectId(_) => "objectId",
+        Bson::DateTime(_) => "date",
+        Bson::Timestamp(_) => "timestamp",
+        Bson::RegularExpression(_) => "regex",
+        Bson::MinKey => "minKey",
+        Bson::MaxKey => "maxKey",
+        Bson::Array(_) => "array",
+        Bson::Document(_) => "object",
+        Bson::Undefined => "undefined",
+        Bson::Symbol(_) => "symbol",
+        Bson::JavaScriptCode(_) => "javascript",
+        Bson::JavaScriptCodeWithScope(_) => "javascriptWithScope",
+        Bson::DbPointer(_) => "dbPointer",
+    }
+}
+
+/// `$type`: the BSON type string. A field path that doesn't resolve yields
+/// `"missing"` (mongod distinguishes an absent field from an explicit null).
+fn op_type(arg: &Bson, ctx: &Ctx) -> R {
+    if let Bson::String(s) = arg {
+        if let Some(path) = s.strip_prefix('$') {
+            if !path.starts_with('$') && crate::paths::get_path(ctx.doc, path).is_none() {
+                return Ok(Bson::String("missing".into()));
+            }
+        }
+    }
+    Ok(Bson::String(type_name(&eval(arg, ctx)?).into()))
+}
+
+/// `$isNumber`: true for int / long / double / decimal (not bool).
+fn op_is_number(arg: &Bson, ctx: &Ctx) -> R {
+    Ok(Bson::Boolean(matches!(
+        eval(arg, ctx)?,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    )))
+}
+
+/// `$isArray`: true iff the argument is an array.
+fn op_is_array(arg: &Bson, ctx: &Ctx) -> R {
+    Ok(Bson::Boolean(matches!(eval(arg, ctx)?, Bson::Array(_))))
+}
+
+/// `$strcasecmp`: case-insensitive compare of two strings → -1 / 0 / 1. A null
+/// operand is the empty string; non-ASCII defers (case mapping may differ from
+/// Python — same contract as `$toUpper`); a non-string operand defers.
+fn op_strcasecmp(arg: &Bson, ctx: &Ctx) -> R {
+    let vals = eval_args(arg, ctx)?;
+    if vals.len() != 2 {
+        return Err(Fallback);
+    }
+    let to_str = |v: &Bson| -> Result<String, Fallback> {
+        match v {
+            Bson::Null => Ok(String::new()),
+            Bson::String(s) if s.is_ascii() => Ok(s.to_ascii_uppercase()),
+            _ => Err(Fallback),
+        }
+    };
+    let (a, b) = (to_str(&vals[0])?, to_str(&vals[1])?);
+    Ok(Bson::Int32(match a.cmp(&b) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }))
+}
+
+/// `$replaceOne` / `$replaceAll`: replace occurrence(s) of `find` in `input` with
+/// `replacement`. Any null input/find/replacement → null; a non-string one defers
+/// (Python raises 51745). Mirrors the pure `_op_replace`.
+fn op_replace(arg: &Bson, ctx: &Ctx, all: bool) -> R {
+    let Bson::Document(d) = arg else {
+        return Err(Fallback);
+    };
+    let (Some(ie), Some(fe), Some(re)) = (d.get("input"), d.get("find"), d.get("replacement"))
+    else {
+        return Err(Fallback);
+    };
+    let (iv, fv, rv) = (eval(ie, ctx)?, eval(fe, ctx)?, eval(re, ctx)?);
+    if matches!(iv, Bson::Null) || matches!(fv, Bson::Null) || matches!(rv, Bson::Null) {
+        return Ok(Bson::Null);
+    }
+    let (Bson::String(input), Bson::String(find), Bson::String(rep)) = (iv, fv, rv) else {
+        return Err(Fallback); // non-string -> Python raises
+    };
+    let out = if all {
+        input.replace(&find, &rep)
+    } else {
+        input.replacen(&find, &rep, 1)
+    };
+    Ok(Bson::String(out))
 }
 
 // --- $range -------------------------------------------------------------
@@ -3052,6 +3203,95 @@ mod tests {
     }
 
     #[test]
+    fn new_expression_ops() {
+        let ts = doc! {"t": Bson::Timestamp(bson::Timestamp { time: 1700000000, increment: 7 })};
+        assert_eq!(
+            ev(ts.clone(), bson::bson!({"$tsSecond": "$t"})),
+            Bson::Int64(1700000000)
+        );
+        assert_eq!(
+            ev(ts.clone(), bson::bson!({"$tsIncrement": "$t"})),
+            Bson::Int64(7)
+        );
+        assert_eq!(ev(ts, bson::bson!({"$tsSecond": "$x"})), Bson::Null); // missing -> null
+                                                                          // $type incl. missing.
+        assert_eq!(
+            ev(doc! {"a": 5i32}, bson::bson!({"$type": "$a"})),
+            Bson::String("int".into())
+        );
+        assert_eq!(
+            ev(doc! {"a": [1]}, bson::bson!({"$type": "$a"})),
+            Bson::String("array".into())
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$type": "$zzz"})),
+            Bson::String("missing".into())
+        );
+        // $isNumber / $isArray.
+        assert_eq!(
+            ev(doc! {"a": 5i32}, bson::bson!({"$isNumber": "$a"})),
+            Bson::Boolean(true)
+        );
+        assert_eq!(
+            ev(doc! {"a": true}, bson::bson!({"$isNumber": "$a"})),
+            Bson::Boolean(false)
+        );
+        assert_eq!(
+            ev(doc! {"a": [1]}, bson::bson!({"$isArray": "$a"})),
+            Bson::Boolean(true)
+        );
+        // $strcasecmp (null -> "").
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$strcasecmp": ["abc", "ABC"]})),
+            Bson::Int32(0)
+        );
+        assert_eq!(
+            ev(
+                doc! {"n": Bson::Null},
+                bson::bson!({"$strcasecmp": ["$n", "a"]})
+            ),
+            Bson::Int32(-1)
+        );
+        // $replaceOne / $replaceAll.
+        assert_eq!(
+            ev(
+                doc! {},
+                bson::bson!({"$replaceOne": {"input": "abcabc", "find": "bc", "replacement": "X"}})
+            ),
+            Bson::String("aXabc".into())
+        );
+        assert_eq!(
+            ev(
+                doc! {},
+                bson::bson!({"$replaceAll": {"input": "abcabc", "find": "bc", "replacement": "X"}})
+            ),
+            Bson::String("aXaX".into())
+        );
+        // ISO-week $dateFromParts.
+        let iso = ev(
+            doc! {},
+            bson::bson!({"$dateFromParts": {"isoWeekYear": 2023, "isoWeek": 5, "isoDayOfWeek": 3}}),
+        );
+        assert_eq!(
+            iso.as_datetime().unwrap().timestamp_millis(),
+            1_675_209_600_000
+        ); // 2023-02-01
+           // Error paths defer.
+        assert!(evaluate(
+            &doc! {"a": 5i32},
+            &bson::bson!({"$tsSecond": "$a"}),
+            &Document::new()
+        )
+        .is_err());
+        assert!(evaluate(
+            &doc! {},
+            &bson::bson!({"$replaceOne": {"input": "a", "find": 5, "replacement": "b"}}),
+            &Document::new()
+        )
+        .is_err());
+    }
+
+    #[test]
     fn date_from_parts() {
         let ms = |v: &Bson| v.as_datetime().unwrap().timestamp_millis();
         // 2023-06-15T00:00Z
@@ -3089,12 +3329,11 @@ mod tests {
             ),
             Bson::Null
         );
-        // Non-integral, missing year, out-of-range year, iso form, named tz -> defer.
+        // Non-integral, missing year, out-of-range year, named tz -> defer.
         for bad in [
             bson::bson!({"$dateFromParts": {"year": 2023, "month": 6.5}}),
             bson::bson!({"$dateFromParts": {"month": 6}}),
             bson::bson!({"$dateFromParts": {"year": 10000}}),
-            bson::bson!({"$dateFromParts": {"isoWeekYear": 2023}}),
             bson::bson!({"$dateFromParts": {"year": 2023, "timezone": "America/New_York"}}),
         ] {
             assert!(evaluate(&doc! {}, &bad, &Document::new()).is_err());
