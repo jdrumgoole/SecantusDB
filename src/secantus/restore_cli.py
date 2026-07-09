@@ -1,4 +1,4 @@
-"""Offline ``secantusdb-restore-archive`` CLI.
+"""Offline ``secantus-restore-archive`` CLI.
 
 Extracts a SecantusDB backup archive (``.tar.gz`` produced by the
 ``secantusAdmin.backupArchive`` wire command, or by the admin UI's
@@ -21,7 +21,7 @@ from secantus.storage import extract_backup_archive
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="secantusdb-restore-archive",
+        prog="secantus-restore-archive",
         description=(
             "Extract a SecantusDB backup archive into a target "
             "directory. Then start a SecantusDB server pointed at "

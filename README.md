@@ -209,8 +209,7 @@ of when to pick each server are spelled out in
 
 ## Standalone daemon (drop-in `mongod` replacement)
 
-`pip install` puts a `secantusd-py` script on your `PATH` (the legacy
-`secantusdb` / `secantus` names still work as aliases). Run it like
+`pip install` puts a `secantusd-py` script on your `PATH`. Run it like
 you'd run `mongod`:
 
 ```bash

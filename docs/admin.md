@@ -33,7 +33,7 @@ the same `secantus.admin.cli:main` entry point.
 ### Console script
 
 ```bash
-secantusdb-admin --uri mongodb://127.0.0.1:27017
+secantus-admin --uri mongodb://127.0.0.1:27017
 ```
 
 ### Module
@@ -69,7 +69,7 @@ holds the process open until you close the window (or hit `Ctrl-C`).
 remote dev boxes:
 
 ```bash
-secantusdb-admin --uri mongodb://127.0.0.1:27017 --port 8765 --no-window
+secantus-admin --uri mongodb://127.0.0.1:27017 --port 8765 --no-window
 # open http://127.0.0.1:8765/?t=<token>  in a browser
 ```
 
@@ -405,7 +405,7 @@ For offline restore (when the source SecantusDB isn't running),
 use the bundled CLI:
 
 ```bash
-secantusdb-restore-archive --archive PATH.tar.gz --target-dir PATH
+secantus-restore-archive --archive PATH.tar.gz --target-dir PATH
 ```
 
 Same validation, no wire-protocol round-trip. Pass

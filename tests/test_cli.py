@@ -66,9 +66,17 @@ def test_all_flags_together() -> None:
 
 
 def test_console_scripts_declared() -> None:
-    # Both `secantusdb` (primary, matches PyPI dist) and `secantus`
-    # (legacy alias) must be wired to the same entry point.
+    # The daemons use the `secantusd-<engine>` scheme; the utilities carry the
+    # bare `secantus-` import-name prefix. The old `secantusdb` / `secantus`
+    # daemon aliases were removed (clean break — no backwards compatibility).
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     text = pyproject.read_text()
-    assert 'secantusdb = "secantus.cli:main"' in text
-    assert 'secantus = "secantus.cli:main"' in text
+    assert 'secantusd-py = "secantus.cli:main"' in text
+    assert 'secantusd-py-pg = "secantus.sql.pgserver:main"' in text
+    assert 'secantus-admin = "secantus.admin.cli:main"' in text
+    assert 'secantus-restore-archive = "secantus.restore_cli:main"' in text
+    # The removed aliases must not reappear.
+    assert 'secantusdb = "secantus.cli:main"' not in text
+    assert 'secantus = "secantus.cli:main"' not in text
+    assert "secantusdb-admin" not in text
+    assert "secantusdb-restore-archive" not in text

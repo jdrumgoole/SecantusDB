@@ -7,7 +7,7 @@ MongoDB-wire-compatible server) over pymongo via the URI passed to
 
 Entry points:
 
-* ``secantusdb-admin`` console script — argparse → ``cli.main``.
+* ``secantus-admin`` console script — argparse → ``cli.main``.
 * ``python -m secantus.admin`` — equivalent.
 * ``secantus.admin.app.create_app(mongo_uri=..., token=...)`` — the
   FastAPI app factory; tests construct it directly.

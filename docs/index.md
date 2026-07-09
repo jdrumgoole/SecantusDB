@@ -69,7 +69,6 @@ ephemeral WiredTiger home — suites then run cleanly under `pytest-xdist`.
 ```bash
 secantusd-py --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default
-# legacy aliases: `secantusdb`, `secantus`
 ```
 
 Then connect with **any** MongoDB driver or tool, unchanged:
@@ -89,9 +88,12 @@ The conformance evidence: the official test suites for **pymongo**,
 **mongo-ruby-driver**, **mongo-rust-driver**, and the **PHP**
 library + extension all run against
 SecantusDB **unmodified** — see the
-[pymongo](validation-report.md), [Go-driver](validation-report-go.md),
+[pymongo](validation-report.md),
+[pymongo-async](validation-report-pymongo-async.md),
+[Go-driver](validation-report-go.md),
 [Node-driver](validation-report-node.md),
 [Java-driver](validation-report-java.md),
+[Kotlin-driver](validation-report-kotlin.md),
 [Ruby-driver](validation-report-ruby.md),
 [Rust-driver](validation-report-rust.md),
 [PHP-library](validation-report-php-lib.md),
@@ -168,7 +170,7 @@ clustering and infrastructure that `mongod` brings.
   resume tokens, pre-images, retention.
 - [Authentication](authentication.md) — SCRAM-SHA-256, `--auth`,
   `createUser` / `dropUser` / `usersInfo`.
-- [Admin web UI](admin.md) — `secantusdb-admin` console, page tour,
+- [Admin web UI](admin.md) — `secantus-admin` console, page tour,
   security model, programmatic use.
 - [Backup & point-in-time recovery](recovery.md) — how PITR works
   (oplog model, the applier, manifests), snapshot backups, restoring to
@@ -220,9 +222,11 @@ compatibility
 benchmark
 validation-summary
 validation-report
+validation-report-pymongo-async
 validation-report-go
 validation-report-node
 validation-report-java
+validation-report-kotlin
 validation-report-ruby
 validation-report-rust
 validation-report-php-lib

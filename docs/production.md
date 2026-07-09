@@ -32,7 +32,7 @@ doesn't pretend to compete in that space.
 | Crash recovery from journal | WAL replay on start | WT log replay on `wiredtiger_open` |
 | Per-commit durability | `synchronous_commit=on` default | `sync_on_commit=true` opt-in (see [Configuration](configuration.md)) |
 | Full snapshot backup | `pg_basebackup` | `secantusAdmin.backupArchive` (`.tar.gz`) |
-| Restore | swap dbpath + start | `secantusdb-restore-archive` → start fresh server |
+| Restore | swap dbpath + start | `secantus-restore-archive` → start fresh server |
 | Point-in-time recovery | WAL archiving + `recovery_target_time` | not supported |
 | Native TLS | `ssl=on` | server-side TLS via `[tls] cert_file` / `key_file` |
 | Auth methods | md5 / scram / cert / peer / ldap / gss / pam | SCRAM-SHA-256 only |
@@ -245,7 +245,7 @@ For the native path, a simple hourly cron + off-host sync:
 **Restore lives in the offline CLI**:
 
 ```bash
-secantusdb-restore-archive \
+secantus-restore-archive \
     --archive /srv/secantus-backups/archive-2026-05-18T03.tar.gz \
     --target-dir /var/lib/secantus/data-restored
 sudo systemctl stop secantusd-py
@@ -265,7 +265,7 @@ to work.
 
 ### Monitoring
 
-The admin UI (`secantusdb-admin --no-window --uri mongodb://...`)
+The admin UI (`secantus-admin --no-window --uri mongodb://...`)
 runs headless behind the same TLS proxy and gives you a dashboard
 with insert / query / update / delete rate sparklines, the live
 connection list, slow-query profiler, and oplog window inspector.

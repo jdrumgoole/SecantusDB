@@ -224,15 +224,19 @@ The two servers used to collide on the command name `secantusdb`, and the Rust
 binary went by the confusable `secantusdb-rs`. Each daemon now has a clear name
 under a shared `secantusd-<engine>[-<protocol>]` scheme: the Python MongoDB
 server is `secantusd-py`, the Rust MongoDB server is `secantusd-rs`, and the
-PostgreSQL-wire server gets its first console script, `secantusd-py-pg`. The
-old `secantusdb` and `secantus` names remain as aliases for the Python server,
-so existing installs and scripts keep working.
+PostgreSQL-wire server gets its first console script, `secantusd-py-pg`. This is
+a clean break with no backwards-compatibility shim: the old `secantusdb` and
+`secantus` console scripts are gone, and the two utility commands are renamed to
+the bare-`secantus` import-name prefix (they aren't daemons, so the `secantusd-`
+prefix doesn't fit them) — `secantusdb-admin` → `secantus-admin` and
+`secantusdb-restore-archive` → `secantus-restore-archive`. The PyPI project name
+(`SecantusDB` / `pip install secantusdb`) and the `secantus` import package are
+unchanged.
 
 The shared configuration file is renamed to match: both Mongo daemons read
 `secantusd.toml` (auto-discovered in the cwd, `~/.secantus/`, and
 `/etc/secantus/`). The legacy `secantusdb.toml` name is still discovered at each
-location — the new name wins on a tie — so no existing deployment silently
-loses its config.
+location — the new name wins on a tie — so an existing config file keeps working.
 
 #### Added
 
@@ -246,12 +250,15 @@ loses its config.
 - The standalone Rust binary is now emitted as `secantusd-rs` (was `secantusdb`);
   its `--version` / `--help` / startup banner and the `secantusd-rs restore`
   usage text follow suit.
+- Utility console scripts renamed: `secantusdb-admin` → `secantus-admin`,
+  `secantusdb-restore-archive` → `secantus-restore-archive` (the argparse
+  `prog=` / help text follow).
 - `secantusdb.toml.example` renamed to `secantusd.toml.example`.
 
-#### Deprecated
+#### Removed
 
-- The `secantusdb` and `secantus` console scripts are retained only as aliases
-  of `secantusd-py`; prefer the new names.
+- The `secantusdb` and `secantus` console-script aliases of the Python server.
+  Use `secantusd-py` (or `python -m secantus`).
 
 ### Bitwise aggregation operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot` (both servers)
 
@@ -453,7 +460,7 @@ wording, so this closes a pymongo-gauge fidelity gap.
   constructor so the dispatch layer surfaces the specific code instead of `14`.
 ### The Rust server prunes its oplog from write volume alone
 
-The standalone Rust `secantusdb` server used to prune its oplog only from
+The standalone Rust `secantusd-rs` server used to prune its oplog only from
 the noop-heartbeat thread — and that thread is off by default
 (`--noop-heartbeat-seconds 0`). A long-lived, busy server with the
 default configuration could therefore grow its oplog past the retention
@@ -488,15 +495,15 @@ safe. Found by the nightly security review (2026-07-04 §I12).
 
 ### The standalone Rust server now honours every Python-server CLI flag
 
-The pure-Rust `secantusdb` binary — the standalone server you run with
+The pure-Rust `secantusd-rs` binary — the standalone server you run with
 no Python interpreter in the process — used to accept only a subset of
 the daemon flags the Python server understands. That gap meant a
-`secantusdb.toml` or flag set tuned for one server wouldn't drive the
+`secantusd.toml` or flag set tuned for one server wouldn't drive the
 other. It's now closed: the Rust binary accepts the same eight
 configuration flags the Python launcher does, with real behaviour behind
 each, so a single configuration drives either server identically.
 
-`--config` loads a `secantusdb.toml` with the same discovery order
+`--config` loads a `secantusd.toml` with the same discovery order
 (`./`, `~/.secantus/`, `/etc/secantus/`), the same `defaults < file <
 CLI flag` precedence, table renames, and strict unknown-key/table
 rejection as the Python loader. `--log-level` initialises a logger to
@@ -517,17 +524,17 @@ default WiredTiger cache is now `1G`, matching `python -m secantus`
 - The `--config` / `--log-level` / `--cache-size` / `--session-max` /
   `--sync-on-commit` / `--noop-heartbeat-seconds` /
   `--oplog-retention-seconds` / `--oplog-max-entries` flags on the
-  standalone `secantusdb` binary, with a faithful TOML config loader
+  standalone `secantusd-rs` binary, with a faithful TOML config loader
   (`secantus-server`'s new `config` module) mirroring
   `src/secantus/config.py`'s precedence and validation.
 - Background noop-heartbeat (with opportunistic `prune_oplog`) and
-  TTL-sweep threads in the `secantusdb` binary, sharing one
+  TTL-sweep threads in the `secantusd-rs` binary, sharing one
   `Arc<Storage>` and joining on a shutdown flag before WiredTiger closes.
 - `secantus_storage::wt_config` builds the WiredTiger connection string
   from the resolved cache-size / session-max / sync-on-commit knobs.
 
 #### Changed
-- The standalone `secantusdb` daemon defaults its WiredTiger cache to
+- The standalone `secantusd-rs` daemon defaults its WiredTiger cache to
   `1G` (matching the Python server) instead of the engine's `256M`
   default.
 ### Projection inclusion/exclusion mix reports mongod's specific error code
@@ -1956,7 +1963,7 @@ rename DDL are all reconstructed through the ordinary write paths, so the result
 is indistinguishable from the live database at that instant.
 
 Recovery is offline, matching real `mongod`: it writes a fresh data directory
-you then start a new server on. Drive it from the CLI (`secantusdb restore
+you then start a new server on. Drive it from the CLI (`secantusd-py restore
 --source <archive|dir> --target-dir <dir> [--to-time <ISO> | --to-timestamp
 <secs,ord>]`) or the `secantusAdmin.restoreToTimestamp` admin command. A
 multi-document transaction is always replayed all-or-nothing — its statements
@@ -1978,7 +1985,7 @@ the whole oplog live. See [Backup & point-in-time recovery](recovery.md).
   stopping at a target `ts` / wall-clock time.
 - `Storage.replay_mode()` — a context manager that suppresses oplog emission so
   replay drives the real write paths without regenerating the oplog.
-- `secantusdb restore` CLI subcommand and the `secantusAdmin.restoreToTimestamp`
+- `secantusd-py restore` CLI subcommand and the `secantusAdmin.restoreToTimestamp`
   wire command.
 - Backup archives now embed a `pitr-manifest.json` describing their recoverable
   oplog range (`Storage._pitr_manifest`).
@@ -1987,7 +1994,7 @@ the whole oplog live. See [Backup & point-in-time recovery](recovery.md).
   collection (previously only documents and indexes were). `Storage.create_collection`
   gained an `options=` argument; the same options now also surface in the
   `show_expanded_events` change-stream `create` event's `operationDescription`.
-- `--preserve-oplog` (`secantusdb restore`) / `preserveOplog: true`
+- `--preserve-oplog` (`secantusd-py restore`) / `preserveOplog: true`
   (`secantusAdmin.restoreToTimestamp`) carries the replayed oplog onto the
   restored directory verbatim, so a change stream on the restored server can
   resume from a token minted *before* the restore point. The default still starts

@@ -1,4 +1,4 @@
-"""Process lifecycle for ``secantusdb-admin``.
+"""Process lifecycle for ``secantus-admin``.
 
 Boots uvicorn in a daemon thread, waits for ``/healthz`` to come up,
 then either opens a pywebview window (default) or blocks on the server

@@ -67,8 +67,8 @@ secantusd-py --host 127.0.0.1 --port 27017
 ```
 
 `secantusd-py` is the standalone single-node Python server installed by `pip
-install SecantusDB`. The legacy aliases `secantusdb` / `secantus` and the module
-form `python -m secantus` invoke the same entry point.
+install SecantusDB`. The module form `python -m secantus` invokes the same
+entry point.
 
 Then from another shell — same commands you'd run against `mongod`:
 

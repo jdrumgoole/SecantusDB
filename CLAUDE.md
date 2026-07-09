@@ -153,7 +153,7 @@ one server bumps only that server's version:
   -o -name Cargo.lock | xargs sed -i '' 's/0.5.2-beta.N/0.5.2-beta.N+1/'`). The
   canonical embedded value is `secantus_server::VERSION`
   (`env!("CARGO_PKG_VERSION")`); the Rust server **embeds and surfaces** it in
-  `buildInfo.secantusVersion` (over the wire), the `secantusdb` binary's
+  `buildInfo.secantusVersion` (over the wire), the `secantusd-rs` binary's
   `--version`, the embedded Python handle's `RustServer.version` getter, and the
   `_secantus_server.__version__` module attribute.
 
@@ -171,7 +171,7 @@ The Rust side is a Cargo workspace under `crates/`: `secantus-core` (pure-Rust
 engines + geo + aggregation, **no PyO3**), `secantus-storage` (the full WT-backed
 `Storage`, pure-Rust), `secantus-wt` (the WT FFI), plus thin PyO3 binding crates
 (`secantus-core-py` → the `_secantus_core` abi3 extension). The PyO3-free split is
-exactly what lets the Rust server / standalone `secantusdb` binary reuse the
+exactly what lets the Rust server / standalone `secantusd-rs` binary reuse the
 engines.
 
 - **Current code vs direction.** Today the code still contains the transitional

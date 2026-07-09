@@ -1,6 +1,6 @@
 """Best-effort OS-level process-name override.
 
-A user running ``secantusdb-admin`` sees "Python" in the macOS menu
+A user running ``secantus-admin`` sees "Python" in the macOS menu
 bar, Dock, and Activity Monitor because the launcher process is a
 plain Python script. Two cheap fixes get us most of the way there:
 
