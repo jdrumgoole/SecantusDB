@@ -1131,9 +1131,17 @@ SELECT * FROM jsonb_each('{"a":1,"b":"x"}'::jsonb);            -- (a,1), (b,x)
 SELECT * FROM jsonb_each_text('{"a":1}'::jsonb) AS t(k, v);   -- (a,'1')
 ```
 
-The `jsonb_each` family is supported in this base-less `FROM` form; the
-lateral-join form (`FROM t, jsonb_each(t.doc)`) and the base-less
-`SELECT jsonb_each(x)` composite form are not yet modeled.
+`jsonb_each` / `jsonb_each_text` also work in the base-less `FROM` form above, and
+`jsonb_each` works in the **lateral-join** form — one `(key, value)` row per member
+of each outer row's object:
+
+```sql
+SELECT id, key, value FROM d, jsonb_each(doc);          -- expand each row's object
+SELECT id, k, v FROM d, jsonb_each(doc) AS e(k, v);     -- renamed columns
+```
+
+The lateral `jsonb_each_text` form and the base-less `SELECT jsonb_each(x)`
+composite form are not yet modeled.
 
 A single-column function's column takes the table alias — `generate_series(1,5) AS g`
 names the column `g` — or an explicit column alias (`AS g(n)`), or the function

@@ -1497,10 +1497,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   operands are `json.loads`-decoded first). **`jsonb_each` record SRFs landed (#155, b194):** `jsonb_each` /
   `json_each` (→ `(key text, value json)`) and `jsonb_each_text` / `json_each_text` (→ `(key text, value
   text)`, values rendered like `->>`) work in the base-less `FROM` form — two columns, `AS t(k, v)` renaming,
-  `WITH ORDINALITY`, WHERE / ORDER BY (`srf._build_record` / `_record_values`). **Still not modeled:** the
-  lateral-join form `FROM t, jsonb_each(t.doc)` (needs a `$objectToArray` + `$unwind` stage in the join
-  planner — `_unnest_join_stage` only handles array unnest) and the base-less `SELECT jsonb_each(x)` composite
-  form. **Parser quirk:** sqlglot reads
+  `WITH ORDINALITY`, WHERE / ORDER BY (`srf._build_record` / `_record_values`). **Lateral-join form landed
+  (#160, b198):** `FROM t, jsonb_each(t.doc) [AS e(k, v)]` expands each row's object into `(key, value)` pairs
+  via a `$objectToArray` + `$unwind` stage (`planner._jsonb_each_join_stage`, dispatched next to
+  `_unnest_join_stage`); columns default to `key`/`value` and resolve from the unwound `{k, v}` subdoc. **Still
+  not modeled:** the lateral `jsonb_each_text` form (the value would need per-row text rendering inside the
+  pipeline) and the base-less `SELECT jsonb_each(x)` composite form. **Parser quirk:** sqlglot reads
   a bare `f(a->'k')` arrow as a lambda, so a navigated *function argument* must be parenthesised
   (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
 - [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
