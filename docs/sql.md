@@ -2213,9 +2213,16 @@ WHEN NOT MATCHED BY SOURCE THEN UPDATE SET qty = 0   -- items absent from the sh
 RETURNING i.sku, i.qty;
 ```
 
-`RETURNING` resolves target columns (and computed expressions over them); the
-`merge_action()` function and source-column references in `RETURNING` aren't
-supported.
+`RETURNING` resolves target columns and computed expressions over them, plus
+`merge_action()` — which yields `'INSERT'`, `'UPDATE'`, or `'DELETE'` for each
+returned row — and **source-column references** (`s.col`):
+
+```sql
+MERGE INTO inventory i USING shipment s ON i.sku = s.sku
+WHEN MATCHED THEN UPDATE SET qty = i.qty + s.qty
+WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (s.sku, s.qty)
+RETURNING merge_action(), i.sku, s.qty AS shipped;
+```
 
 ## Bulk load / dump (`COPY`)
 

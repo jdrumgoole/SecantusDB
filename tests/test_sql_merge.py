@@ -185,3 +185,37 @@ def test_merge_one_source_matching_many_targets_is_allowed(storage):
         "ON t.region = s.region WHEN MATCHED THEN UPDATE SET amt = 0"
     )
     assert tgt(storage) == [(1, "e", 0), (2, "e", 0), (3, "w", 30)]
+
+
+def test_merge_returning_merge_action(storage):
+    load_src(storage, [(2, "e", 200), (4, "n", 40)])  # 2 matches, 4 is new
+    res = storage.q(
+        "MERGE INTO tgt t USING src s ON t.id = s.id "
+        "WHEN MATCHED THEN UPDATE SET amt = s.amt "
+        "WHEN NOT MATCHED THEN INSERT (id, region, amt) VALUES (s.id, s.region, s.amt) "
+        "RETURNING merge_action(), id"
+    )
+    assert sorted(res.rows) == [("INSERT", 4), ("UPDATE", 2)]
+    assert [c.name for c in res.columns] == ["merge_action", "id"]
+
+
+def test_merge_returning_action_for_delete(storage):
+    load_src(storage, [(1, "e", 0), (4, "n", 40)])
+    res = storage.q(
+        "MERGE INTO tgt t USING src s ON t.id = s.id "
+        "WHEN MATCHED THEN DELETE "
+        "WHEN NOT MATCHED THEN INSERT (id, region, amt) VALUES (s.id, s.region, s.amt) "
+        "RETURNING merge_action() AS act, id"
+    )
+    assert sorted(res.rows) == [("DELETE", 1), ("INSERT", 4)]
+
+
+def test_merge_returning_source_column(storage):
+    load_src(storage, [(2, "e", 200), (4, "n", 40)])
+    res = storage.q(
+        "MERGE INTO tgt t USING src s ON t.id = s.id "
+        "WHEN MATCHED THEN UPDATE SET amt = s.amt "
+        "WHEN NOT MATCHED THEN INSERT (id, region, amt) VALUES (s.id, s.region, s.amt) "
+        "RETURNING merge_action() AS act, id, s.amt AS src_amt"
+    )
+    assert sorted(res.rows) == [("INSERT", 4, 40), ("UPDATE", 2, 200)]

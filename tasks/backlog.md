@@ -2188,9 +2188,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   **Cardinality violation enforced (#156, b195):** when a target row is matched by more than one source row
   Postgres raises `21000` ("MERGE command cannot affect row a second time"); `_run_merge` now tracks the set
   of source-matched target docs and raises on the second match (a single source row matching many target rows
-  is still allowed — each acted on once). **Limitations:** an unqualified column ambiguous between target and
-  source resolves to the target, and `RETURNING` doesn't support `merge_action()` or source-column
-  references.
+  is still allowed — each acted on once). **`RETURNING merge_action()` + source columns landed (#161, b198):**
+  `_run_merge` tracks `(image, action, source_row)` per affected row and `_merge_returning_result` evaluates
+  the projection against the MERGE scope (target image + source row), so `merge_action()` → `'INSERT'` /
+  `'UPDATE'` / `'DELETE'` and `RETURNING s.col` reads the source. **Limitations:** an unqualified column
+  ambiguous between target and source resolves to the target.
 - [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
   (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope
   (`_const_scope`), not just bare literals + info functions; (2) a FROM-less `SELECT … WHERE <const>`

@@ -2021,6 +2021,13 @@ def _returning_columns(
             path, tag = _field(target, resolve)
             out_name = alias or "?column?"
             items.append((out_name, Column(out_name, tag, path, pk=False, nullable=True), None))
+        elif isinstance(target, exp.Anonymous) and str(target.this).lower() == "merge_action":
+            # ``merge_action()`` — only valid in a MERGE RETURNING; the executor
+            # resolves it to the row's action ('INSERT' / 'UPDATE' / 'DELETE').
+            out_name = alias or "merge_action"
+            items.append(
+                (out_name, Column(out_name, "text", out_name, pk=False, nullable=True), target)
+            )
         else:
             # A computed expression — evaluated per returned row (field unused).
             out_name = alias or "?column?"
