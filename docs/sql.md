@@ -1605,8 +1605,11 @@ the WHERE filters the joined rows after the join and before the `$group` — aga
 only the survivors are grouped. The inner query is a simple `SELECT … FROM
 one_table [WHERE …]` (no inner join / GROUP BY). The per-row evaluation is a full
 scan, so it's `O(outer × inner)` — fine for the ephemeral test data SecantusDB
-targets, not a query planner. Combining a correlated WHERE with a JOIN, a
-GROUP BY, **and** a window function all in one SELECT is not yet supported.
+targets, not a query planner. A correlated WHERE also composes with a GROUP BY
+**and** a window function in one SELECT — single-table or over a JOIN (the WHERE
+filters the joined rows before the `$group`, then the window runs over the grouped
+rows). A subquery in `HAVING` (`HAVING sum(x) > (SELECT … WHERE t.k = g.k)`) is
+likewise evaluated per grouped row, so it may correlate on the group key.
 
 ## Aggregates, GROUP BY, HAVING
 

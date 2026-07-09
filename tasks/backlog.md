@@ -2106,9 +2106,15 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   stages (the join prefix) run before the Python filter, so `_plan_join_group_select` runs the
   `$lookup`/`$unwind`, filters the joined rows by the correlated WHERE (outer scope via the join
   resolver), then runs the `$group` over the survivors (`executor._pipeline_input_docs` applies the
-  split). Still `0A000`: a correlated WHERE combined with JOIN, GROUP BY, **and** a window function all
-  in one SELECT (`_plan_join_group_window_select` raises rather than silently dropping the WHERE),
-  function calls inside a comparison (`qty = abs(shipped)`), and `<@`-style structural predicates.
+  split). **A correlated WHERE combined with GROUP BY *and* a window function now works too** (b206,
+  #171), single-table and over a JOIN: `EvaluatedSelectPlan` gained a pre-`$group` residual
+  (`pre_where` / `pre_where_resolve` / `pre_where_split`) — the executor runs the leading join-prefix
+  stages, filters the joined rows per the correlated predicate (WHERE precedes grouping), then runs the
+  rest of the pipeline; `_plan_join_group_window_select` dropped its former rejection. **A correlated /
+  subquery HAVING now works** (b206): a HAVING with a subquery routes to the group-window evaluated
+  path, its aggregates rewritten to their computed fields and the predicate carried as a post-group
+  residual (`_outer_agg_nodes` skips aggregates inside the subquery). Still `0A000`: function calls
+  inside a comparison used as a *pushdown* filter, and `<@`-style structural predicates.
 - [ ] **`RETURNING` landed** (b46). `INSERT` / `UPDATE` / `DELETE … RETURNING <proj>` projects the
   affected rows back as a result set (`planner._returning_columns` reuses the SELECT projection
   vocabulary `_out_columns`: `*`, columns, aliases, jsonb nav). `execute_insert` pins an `_id` on
@@ -2883,8 +2889,10 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   COLUMN SET DEFAULT`) and evaluated **per omitted row** at INSERT via `scalar.evaluate`
   (`_parse_default_expr`, lru-cached) — so `gen_random_uuid()` yields a fresh value per row. Reflected in
   `information_schema.columns.column_default` (`virtual._column_default_text`). A default referencing
-  another column raises `0A000`. **Limitations:** a `TYPE` change doesn't recast existing rows;
-  `pg_attrdef` still returns `[]` (the `information_schema` view is the reflection surface).
+  another column raises `0A000`. `pg_catalog.pg_attrdef` now emits one row per column with a DEFAULT
+  (`adbin` = the rendered default text via `virtual._pg_attrdef` / `_column_default_text`, b206 #171),
+  matching `information_schema.columns.column_default`. **Limitations:** a `TYPE` change doesn't recast
+  existing rows.
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
