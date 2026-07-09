@@ -850,6 +850,144 @@ def _merge_source(
     return (using.alias or using.name).lower(), rows, {c.name for c in tdef.columns}
 
 
+# --------------------------------------------------------------------------- #
+# Join DML: DELETE ... USING and UPDATE ... SET ... FROM
+# --------------------------------------------------------------------------- #
+
+
+def _collect_dml_sources(
+    tables: list[exp.Expression], db: str, catalog: Catalog, session: Session, storage: Any
+) -> list[tuple[str, list[dict[str, Any]], set[str]]]:
+    """Materialize the USING / FROM tables of a join DML into ``(alias, rows,
+    cols)`` triples. Each entry may itself carry comma / JOIN-chained tables."""
+    out: list[tuple[str, list[dict[str, Any]], set[str]]] = []
+    for node in tables:
+        chain = [node] + [j.this for j in (node.args.get("joins") or [])]
+        for t in chain:
+            out.append(_merge_source(t, db, catalog, session, storage))
+    return out
+
+
+def _dml_join_scope(
+    tdoc: dict[str, Any] | None,
+    binding: dict[str, dict[str, Any]],
+    target: TableDef,
+    target_alias: str,
+    source_cols: dict[str, set[str]],
+):
+    """A scope resolving a column against the target row (``tdoc``) or a source
+    binding (alias → source row). Unqualified names prefer the target."""
+    from secantus.paths import get_path
+
+    def scope(node: Any) -> Any:
+        alias = (node.table or "").lower() or None
+        name = node.name
+        if alias == target_alias or (alias is None and target.column(name) is not None):
+            return None if tdoc is None else get_path(tdoc, target.field_for(name))
+        if alias is not None and alias in binding:
+            return binding[alias].get(name)
+        if alias is None:
+            for a, cols in source_cols.items():
+                if name in cols:
+                    return binding[a].get(name)
+        raise errors.undefined_column(name)
+
+    return scope
+
+
+def _dml_join_matches(
+    target_docs: list[dict[str, Any]],
+    sources: list[tuple[str, list[dict[str, Any]], set[str]]],
+    where: exp.Expression | None,
+    target: TableDef,
+    target_alias: str,
+    sctx: Any,
+) -> list[tuple[dict[str, Any], dict[str, dict[str, Any]]]]:
+    """Each target row that joins at least one combination of source rows for which
+    the WHERE holds, paired with the *first* such binding (Postgres leaves which
+    source row wins unspecified when several match)."""
+    import itertools
+
+    aliases = [a for a, _, _ in sources]
+    row_lists = [rows for _, rows, _ in sources]
+    source_cols = {a: cols for a, _, cols in sources}
+    matches: list[tuple[dict[str, Any], dict[str, dict[str, Any]]]] = []
+    for tdoc in target_docs:
+        for combo in itertools.product(*row_lists):
+            binding = dict(zip(aliases, combo, strict=True))
+            scope = _dml_join_scope(tdoc, binding, target, target_alias, source_cols)
+            if where is None or scalar._truthy(scalar.evaluate(where, scope, sctx)):
+                matches.append((tdoc, binding))
+                break
+    return matches
+
+
+def _run_delete_using(
+    stmt: exp.Delete, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """``DELETE FROM t USING u [, v …] WHERE …`` — delete each target row that
+    joins a source row satisfying the WHERE (a semi-join)."""
+    target = _require_table(catalog, db, stmt.this.name, storage)
+    target_alias = (stmt.this.alias or stmt.this.name).lower()
+    sources = _collect_dml_sources(stmt.args["using"], db, catalog, session, storage)
+    sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    where = stmt.args.get("where")
+    target_docs = storage.find_matching(db, target.collection, {})
+    victims = [
+        tdoc
+        for tdoc, _ in _dml_join_matches(
+            target_docs, sources, where.this if where else None, target, target_alias, sctx
+        )
+    ]
+    if catalog is not None and not getattr(target, "reflected", False):
+        executor.enforce_parent_delete(victims, target, storage, db, catalog)
+    for tdoc in victims:
+        storage.delete_matching(db, target.collection, {"_id": tdoc["_id"]})
+    n = len(victims)
+    returning = planner._returning_columns(stmt, target)
+    if returning is not None:
+        return executor._returning_result(victims, returning, f"DELETE {n}", n, target, storage, db)
+    return SQLResult(command_tag=f"DELETE {n}", rowcount=n)
+
+
+def _run_update_from(
+    stmt: exp.Update, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """``UPDATE t SET … FROM u [, v …] WHERE …`` — update each target row that joins
+    a source row satisfying the WHERE; the SET right-hand sides may reference the
+    source (``SET col = u.col``)."""
+    target_node = stmt.this
+    target = _require_table(catalog, db, target_node.name, storage)
+    target_alias = (target_node.alias or target_node.name).lower()
+    from_node = stmt.args["from_"]
+    sources = _collect_dml_sources([from_node.this], db, catalog, session, storage)
+    source_cols = {a: cols for a, _, cols in sources}
+    sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    where = stmt.args.get("where")
+    target_docs = storage.find_matching(db, target.collection, {})
+    matches = _dml_join_matches(
+        target_docs, sources, where.this if where else None, target, target_alias, sctx
+    )
+    returning = planner._returning_columns(stmt, target)
+    updated: list[dict[str, Any]] = []
+    for tdoc, binding in matches:
+        scope = _dml_join_scope(tdoc, binding, target, target_alias, source_cols)
+        set_doc: dict[str, Any] = {}
+        for eq in stmt.expressions:
+            col = eq.this.name
+            set_doc[target.field_for(col)] = typemap.coerce(
+                scalar.evaluate(eq.expression, scope, sctx), target.type_for(col)
+            )
+        post = {**tdoc, **set_doc}
+        executor.enforce_update_images([post], [tdoc["_id"]], target, storage, db, catalog, session)
+        storage.update_matching(db, target.collection, {"_id": tdoc["_id"]}, {"$set": set_doc})
+        updated.append(post)
+    n = len(updated)
+    if returning is not None:
+        return executor._returning_result(updated, returning, f"UPDATE {n}", n, target, storage, db)
+    return SQLResult(command_tag=f"UPDATE {n}", rowcount=n)
+
+
 def _merge_pick_when(
     whens: list[exp.Expression], matched: bool, by_source: bool, scope: Any, sctx: Any
 ) -> exp.Expression | None:
@@ -1292,12 +1430,16 @@ def _run_statement(
         return _run_insert(stmt, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Update):
+        if stmt.args.get("from_") is not None:
+            return _run_update_from(stmt, storage, db, catalog, session)
         table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
         return executor.execute_update(
             planner.plan_update(stmt, table), storage, db, catalog, session
         )
 
     if isinstance(stmt, exp.Delete):
+        if stmt.args.get("using"):
+            return _run_delete_using(stmt, storage, db, catalog, session)
         table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
         return executor.execute_delete(
             planner.plan_delete(stmt, table), storage, db, catalog, session

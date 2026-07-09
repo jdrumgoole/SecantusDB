@@ -2193,6 +2193,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   the projection against the MERGE scope (target image + source row), so `merge_action()` → `'INSERT'` /
   `'UPDATE'` / `'DELETE'` and `RETURNING s.col` reads the source. **Limitations:** an unqualified column
   ambiguous between target and source resolves to the target.
+- [ ] **Join DML landed (#162/#163, b199).** `DELETE FROM t USING src[, …] WHERE <join>` and
+  `UPDATE t SET … FROM src[, …] WHERE <join>` bring in other tables. `engine._run_statement` routes an
+  UPDATE with `args["from_"]` → `_run_update_from` and a DELETE with `args["using"]` → `_run_delete_using`.
+  Both collect source rows via `_collect_dml_sources` (reusing `_merge_source`, so a source may be a table
+  or a `(SELECT …) alias`), then `_dml_join_matches` cartesian-products the sources per target doc and keeps
+  the target on the first source combination whose `WHERE` (evaluated through `_dml_join_scope`, which
+  resolves target vs source columns by alias) is truthy. DELETE is a **semi-join** — each matched target
+  deleted once even when many source rows match (parent-delete FK checks via `enforce_parent_delete`).
+  UPDATE evaluates each `SET` RHS against the joined scope (`typemap.coerce` to the target column type),
+  validates the post-image (`enforce_update_images`), and writes `$set`. Both honour `RETURNING`
+  (`executor._returning_result`). Command tags `DELETE n` / `UPDATE n`. **Before this the join clause was
+  silently ignored — `DELETE … USING` deleted every target row (data-loss bug).** Limitations: a target
+  row matched by multiple sources still updates from the *first* combination (Postgres leaves this
+  unspecified); no self-join of the target back into the source list.
 - [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
   (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope
   (`_const_scope`), not just bare literals + info functions; (2) a FROM-less `SELECT … WHERE <const>`
