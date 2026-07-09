@@ -99,3 +99,47 @@ def test_column_alias_form(t, session):
     # unnest(...) AS x(v) names the element column v.
     rows = run(t, session, "SELECT v FROM t, unnest(t.tags) AS x(v) WHERE id = 2").rows
     assert rows == [("c",)]
+
+
+# --------------------------------------------------------------------------- #
+# jsonb_each lateral-join form (#160)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def docs(storage, session):
+    run(storage, session, "CREATE TABLE d (id int PRIMARY KEY, doc jsonb)")
+    run(storage, session, 'INSERT INTO d VALUES (1, \'{"a":1,"b":2}\'), (2, \'{"x":9}\')')
+    return storage
+
+
+def test_jsonb_each_lateral(docs, session):
+    got = run(docs, session, "SELECT id, key, value FROM d, jsonb_each(doc) ORDER BY id, key").rows
+    assert got == [(1, "a", 1), (1, "b", 2), (2, "x", 9)]
+
+
+def test_jsonb_each_lateral_column_aliases(docs, session):
+    got = run(
+        docs, session, "SELECT id, k, v FROM d, jsonb_each(doc) AS e(k, v) ORDER BY id, k"
+    ).rows
+    assert got == [(1, "a", 1), (1, "b", 2), (2, "x", 9)]
+
+
+def test_jsonb_each_lateral_where_on_value(docs, session):
+    got = run(
+        docs,
+        session,
+        "SELECT id, key FROM d, jsonb_each(doc) WHERE value::int > 1 ORDER BY id, key",
+    ).rows
+    assert got == [(1, "b"), (2, "x")]
+
+
+def test_jsonb_each_lateral_empty_object_drops_row(docs, session):
+    run(docs, session, "INSERT INTO d VALUES (3, '{}')")
+    got = run(docs, session, "SELECT count(*) FROM d, jsonb_each(doc)").rows
+    assert got == [(3,)]  # id=3 contributes no rows (inner join)
+
+
+def test_jsonb_each_lateral_columns(docs, session):
+    res = run(docs, session, "SELECT key, value FROM d, jsonb_each(doc) WHERE id = 2")
+    assert [(c.name, c.type_tag) for c in res.columns] == [("key", "text"), ("value", "json")]

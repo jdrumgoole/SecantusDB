@@ -169,6 +169,11 @@ class UpdatePlan:
     # True when the SET changes a primary-key column, so the executor must re-key
     # (delete + re-insert under the new ``_id``) rather than update in place.
     rekey: bool = False
+    # ``SET col = <expr>`` targets whose RHS is a per-row expression (arithmetic, a
+    # column reference, ``||``, a function …) rather than a literal — each a
+    # ``(storage_field, type_tag, expr_node)`` evaluated against the old row by the
+    # executor. Empty for a pure-literal UPDATE (the fast bulk ``$set`` path).
+    computed: list[tuple[str, str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -2016,6 +2021,13 @@ def _returning_columns(
             path, tag = _field(target, resolve)
             out_name = alias or "?column?"
             items.append((out_name, Column(out_name, tag, path, pk=False, nullable=True), None))
+        elif isinstance(target, exp.Anonymous) and str(target.this).lower() == "merge_action":
+            # ``merge_action()`` — only valid in a MERGE RETURNING; the executor
+            # resolves it to the row's action ('INSERT' / 'UPDATE' / 'DELETE').
+            out_name = alias or "merge_action"
+            items.append(
+                (out_name, Column(out_name, "text", out_name, pk=False, nullable=True), target)
+            )
         else:
             # A computed expression — evaluated per returned row (field unused).
             out_name = alias or "?column?"
@@ -2341,6 +2353,7 @@ def _composite_subfield_target(target: exp.Expression, table: TableDef):
 def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
     set_doc: dict[str, Any] = {}
     rekey = False
+    computed: list[tuple[str, str, Any]] = []
     for assign in stmt.expressions:
         if not isinstance(assign, exp.EQ):
             raise errors.feature_not_supported(f"unsupported SET item: {assign.sql()}")
@@ -2351,7 +2364,10 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
             if comp_col.pk:
                 # Changing a composite-PK subfield re-keys the row (rewrites ``_id``).
                 rekey = True
-            raw = _literal(assign.expression)
+            raw = _try_literal(assign.expression)
+            if raw is _LITERAL_SENTINEL:  # a per-row expression, not a literal
+                computed.append((f"{comp_col.field}.{subfield}", tag, assign.expression))
+                continue
             if subfields is not None and raw is not None:
                 value = _build_composite(raw, subfields, tag)
             else:
@@ -2381,7 +2397,10 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
                     "428C9", f'column "{col_name}" can only be updated to DEFAULT'
                 )
             continue
-        raw = _literal(assign.expression)
+        raw = _try_literal(assign.expression)
+        if raw is _LITERAL_SENTINEL:  # ``SET col = <expr>`` — evaluated per row
+            computed.append((col.field, col.type_tag, assign.expression))
+            continue
         if raw is None and not col.nullable:
             raise errors.not_null_violation(col_name)
         if col.composite_type is not None and raw is not None:
@@ -2394,6 +2413,7 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         update={"$set": set_doc},
         returning=_returning_columns(stmt, table),
         rekey=rekey,
+        computed=computed,
     )
 
 
@@ -4237,6 +4257,64 @@ def _unnest_join_stage(
     return stages, alias, tdef
 
 
+def _is_jsonb_each_join(jt: exp.Expression) -> bool:
+    """Whether a join source is ``jsonb_each(...)`` / ``json_each(...)`` (the
+    json-valued record SRFs; the ``_text`` variants aren't supported in the lateral
+    form because the value would need per-row text rendering in the pipeline)."""
+    return (
+        isinstance(jt, exp.Table)
+        and isinstance(jt.this, exp.Anonymous)
+        and str(jt.this.this).rsplit(".", 1)[-1].lower() in ("jsonb_each", "json_each")
+    )
+
+
+def _jsonb_each_join_stage(
+    table_node: exp.Table, side: str, amap: dict[str, tuple[str, TableDef]]
+) -> tuple[list[dict[str, Any]], str, TableDef]:
+    """A ``FROM t, jsonb_each(t.doc) AS e(k, v)`` source: expand each outer row's
+    object into ``(key, value)`` pairs via ``$objectToArray`` + ``$unwind``. Returns
+    the stages, the alias, and a synthetic two-column ``TableDef`` (key ``text`` /
+    value ``json``, resolved from the unwound ``{k, v}`` subdocument)."""
+    fn = table_node.this
+    alias_node = table_node.args.get("alias")
+    # ``FROM t, jsonb_each(doc)`` needs no explicit alias — the columns default to
+    # ``key`` / ``value`` (Postgres); ``AS e(k, v)`` renames them.
+    if alias_node is not None and alias_node.name:
+        alias = alias_node.name
+        col_idents = alias_node.args.get("columns") or []
+    else:
+        alias = "jsonb_each"
+        col_idents = []
+    key_col = col_idents[0].name if col_idents else "key"
+    val_col = col_idents[1].name if len(col_idents) > 1 else "value"
+
+    arg = fn.expressions[0] if fn.expressions else None
+    if arg is not None and _is_field_node(arg):
+        path, _ = _field(arg, _join_resolver(amap))
+        src_expr: Any = f"${path}"
+    elif arg is not None and _is_literalish(arg):
+        src_expr = {"$literal": _json_value(arg)}
+    else:
+        raise errors.feature_not_supported("unsupported jsonb_each() source in FROM")
+
+    kv = f"__{alias}_kv"
+    # ``$objectToArray`` of a missing / non-object value yields null; ``$unwind``
+    # then drops the row (or keeps it as null for a LEFT / comma join).
+    stages = [
+        {"$addFields": {kv: {"$objectToArray": src_expr}}},
+        {"$unwind": {"path": f"${kv}", "preserveNullAndEmptyArrays": side == "LEFT"}},
+    ]
+    tdef = TableDef(
+        name=alias,
+        collection=alias,
+        columns=[
+            Column(key_col, "text", f"{kv}.k", pk=False, nullable=True),
+            Column(val_col, "json", f"{kv}.v", pk=False, nullable=True),
+        ],
+    )
+    return stages, alias, tdef
+
+
 def _build_join_pipeline(
     stmt: exp.Select, db: str, catalog: Any, storage: Any
 ) -> tuple[
@@ -4293,6 +4371,13 @@ def _build_join_pipeline(
             stages, un_alias, un_tdef = _unnest_join_stage(jt, side, amap)
             pipeline.extend(stages)
             amap[un_alias] = ("base", un_tdef)  # element field lives at top level
+            continue
+        if _is_jsonb_each_join(jt):
+            # ``FROM t, jsonb_each(t.doc) AS e(k, v)`` — expand each row's object
+            # into (key, value) pairs.
+            stages, je_alias, je_tdef = _jsonb_each_join_stage(jt, side, amap)
+            pipeline.extend(stages)
+            amap[je_alias] = ("base", je_tdef)  # k / v resolve via dotted fields
             continue
         join_alias, join_table = _resolve_source(jt, db, catalog, storage, derived)
         if on is None:

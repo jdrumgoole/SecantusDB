@@ -700,7 +700,9 @@ def _run_merge(
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     target_docs = storage.find_matching(db, target.collection, {})
     affected = 0
-    affected_docs: list[dict[str, Any]] = []  # post/pre-images for RETURNING
+    # (image, action, source_row) per affected row for RETURNING — the action
+    # feeds ``merge_action()`` and the source row lets RETURNING read source columns.
+    affected_rows: list[tuple[dict[str, Any], str, dict[str, Any] | None]] = []
     done: set[int] = set()  # target docs already acted on
     source_matched: set[int] = set()  # target docs some source row matched
 
@@ -716,11 +718,16 @@ def _run_merge(
 
         return scope
 
-    def record(count: int, doc: dict[str, Any] | None) -> None:
+    def record(
+        result: tuple[int, dict[str, Any] | None],
+        when: exp.Expression,
+        srow: dict[str, Any] | None,
+    ) -> None:
         nonlocal affected
+        count, doc = result
         affected += count
         if returning is not None and doc is not None:
-            affected_docs.append(doc)
+            affected_rows.append((doc, _merge_when_action(when), srow))
 
     for srow in source_rows:
         matched = [
@@ -743,16 +750,20 @@ def _run_merge(
                 continue
             for td in matched:
                 record(
-                    *_merge_apply_matched(when, target, td, storage, db, scope_for(td, srow), sctx)
+                    _merge_apply_matched(when, target, td, storage, db, scope_for(td, srow), sctx),
+                    when,
+                    srow,
                 )
                 done.add(id(td))
         else:
             when = _merge_pick_when(whens, False, False, scope_for(None, srow), sctx)
             if when is not None:
                 record(
-                    *_merge_apply_not_matched(
+                    _merge_apply_not_matched(
                         when, target, storage, db, scope_for(None, srow), sctx
-                    )
+                    ),
+                    when,
+                    srow,
                 )
 
     # WHEN NOT MATCHED BY SOURCE — target rows no source row matched.
@@ -763,15 +774,58 @@ def _run_merge(
             when = _merge_pick_when(whens, False, True, scope_for(td, None), sctx)
             if when is not None:
                 record(
-                    *_merge_apply_matched(when, target, td, storage, db, scope_for(td, None), sctx)
+                    _merge_apply_matched(when, target, td, storage, db, scope_for(td, None), sctx),
+                    when,
+                    None,
                 )
                 done.add(id(td))
 
     if returning is not None:
-        return executor._returning_result(
-            affected_docs, returning, f"MERGE {affected}", affected, target, storage, db
-        )
+        return _merge_returning_result(affected_rows, returning, target, scope_for, sctx, affected)
     return SQLResult(command_tag=f"MERGE {affected}", rowcount=affected)
+
+
+def _merge_when_action(when: exp.Expression) -> str:
+    """The action a WHEN clause performs, for ``merge_action()``."""
+    then = when.args["then"]
+    if isinstance(then, exp.Update):
+        return "UPDATE"
+    if isinstance(then, exp.Insert):
+        return "INSERT"
+    return "DELETE"  # the only other row-producing action (DO NOTHING records nothing)
+
+
+def _merge_returning_result(
+    affected_rows: list[tuple[dict[str, Any], str, dict[str, Any] | None]],
+    returning: list[tuple[str, Any, Any]],
+    target: TableDef,
+    scope_for: Any,
+    sctx: Any,
+    affected: int,
+) -> SQLResult:
+    """Shape a MERGE ``RETURNING`` — like a write's, but ``merge_action()`` resolves
+    to the per-row action and other expressions evaluate against a scope that sees
+    both the target image and the source row (so ``s.col`` works)."""
+    from secantus.paths import get_path
+    from secantus.sql.executor import ColumnDesc
+
+    columns = [
+        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
+        for name, col, _ in returning
+    ]
+
+    def cell(doc: dict[str, Any], action: str, srow: Any, col: Any, expr: Any) -> Any:
+        if expr is None:
+            return typemap.to_py(get_path(doc, col.field), col.type_tag)
+        if isinstance(expr, exp.Anonymous) and str(expr.this).lower() == "merge_action":
+            return action
+        return typemap.to_py(scalar.evaluate(expr, scope_for(doc, srow), sctx), col.type_tag)
+
+    rows = [
+        tuple(cell(doc, action, srow, col, expr) for _, col, expr in returning)
+        for doc, action, srow in affected_rows
+    ]
+    return SQLResult(command_tag=f"MERGE {affected}", columns=columns, rows=rows, rowcount=affected)
 
 
 def _merge_source(

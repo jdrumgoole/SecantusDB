@@ -172,6 +172,17 @@ DELETE FROM users WHERE age < 18;
 SELECT COUNT(*) FROM users;        -- 2
 ```
 
+An `UPDATE`'s `SET col = …` right-hand side may be a literal or a **per-row
+expression** — arithmetic, a column reference, `||`, or a function call — and every
+assignment sees the row's *old* values (so a two-column swap `SET a = b, b = a`
+works). A computed primary-key target (`SET id = id + 1`) re-keys the row:
+
+```sql
+UPDATE t SET n = n + 1 WHERE id = 1;      -- increment
+UPDATE t SET total = price * qty;         -- from other columns
+UPDATE t SET tag = upper(tag);            -- function call
+```
+
 `INSERT` also accepts a query as its source — `INSERT INTO target [(cols)]
 SELECT …`. The source runs first (it may filter, join, aggregate, or be a set
 operation / CTE) and its result columns map positionally onto the target
@@ -1120,9 +1131,17 @@ SELECT * FROM jsonb_each('{"a":1,"b":"x"}'::jsonb);            -- (a,1), (b,x)
 SELECT * FROM jsonb_each_text('{"a":1}'::jsonb) AS t(k, v);   -- (a,'1')
 ```
 
-The `jsonb_each` family is supported in this base-less `FROM` form; the
-lateral-join form (`FROM t, jsonb_each(t.doc)`) and the base-less
-`SELECT jsonb_each(x)` composite form are not yet modeled.
+`jsonb_each` / `jsonb_each_text` also work in the base-less `FROM` form above, and
+`jsonb_each` works in the **lateral-join** form — one `(key, value)` row per member
+of each outer row's object:
+
+```sql
+SELECT id, key, value FROM d, jsonb_each(doc);          -- expand each row's object
+SELECT id, k, v FROM d, jsonb_each(doc) AS e(k, v);     -- renamed columns
+```
+
+The lateral `jsonb_each_text` form and the base-less `SELECT jsonb_each(x)`
+composite form are not yet modeled.
 
 A single-column function's column takes the table alias — `generate_series(1,5) AS g`
 names the column `g` — or an explicit column alias (`AS g(n)`), or the function
@@ -2194,9 +2213,16 @@ WHEN NOT MATCHED BY SOURCE THEN UPDATE SET qty = 0   -- items absent from the sh
 RETURNING i.sku, i.qty;
 ```
 
-`RETURNING` resolves target columns (and computed expressions over them); the
-`merge_action()` function and source-column references in `RETURNING` aren't
-supported.
+`RETURNING` resolves target columns and computed expressions over them, plus
+`merge_action()` — which yields `'INSERT'`, `'UPDATE'`, or `'DELETE'` for each
+returned row — and **source-column references** (`s.col`):
+
+```sql
+MERGE INTO inventory i USING shipment s ON i.sku = s.sku
+WHEN MATCHED THEN UPDATE SET qty = i.qty + s.qty
+WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (s.sku, s.qty)
+RETURNING merge_action(), i.sku, s.qty AS shipped;
+```
 
 ## Bulk load / dump (`COPY`)
 

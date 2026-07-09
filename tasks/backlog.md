@@ -1497,10 +1497,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   operands are `json.loads`-decoded first). **`jsonb_each` record SRFs landed (#155, b194):** `jsonb_each` /
   `json_each` (→ `(key text, value json)`) and `jsonb_each_text` / `json_each_text` (→ `(key text, value
   text)`, values rendered like `->>`) work in the base-less `FROM` form — two columns, `AS t(k, v)` renaming,
-  `WITH ORDINALITY`, WHERE / ORDER BY (`srf._build_record` / `_record_values`). **Still not modeled:** the
-  lateral-join form `FROM t, jsonb_each(t.doc)` (needs a `$objectToArray` + `$unwind` stage in the join
-  planner — `_unnest_join_stage` only handles array unnest) and the base-less `SELECT jsonb_each(x)` composite
-  form. **Parser quirk:** sqlglot reads
+  `WITH ORDINALITY`, WHERE / ORDER BY (`srf._build_record` / `_record_values`). **Lateral-join form landed
+  (#160, b198):** `FROM t, jsonb_each(t.doc) [AS e(k, v)]` expands each row's object into `(key, value)` pairs
+  via a `$objectToArray` + `$unwind` stage (`planner._jsonb_each_join_stage`, dispatched next to
+  `_unnest_join_stage`); columns default to `key`/`value` and resolve from the unwound `{k, v}` subdoc. **Still
+  not modeled:** the lateral `jsonb_each_text` form (the value would need per-row text rendering inside the
+  pipeline) and the base-less `SELECT jsonb_each(x)` composite form. **Parser quirk:** sqlglot reads
   a bare `f(a->'k')` arrow as a lambda, so a navigated *function argument* must be parenthesised
   (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
 - [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
@@ -2186,9 +2188,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   **Cardinality violation enforced (#156, b195):** when a target row is matched by more than one source row
   Postgres raises `21000` ("MERGE command cannot affect row a second time"); `_run_merge` now tracks the set
   of source-matched target docs and raises on the second match (a single source row matching many target rows
-  is still allowed — each acted on once). **Limitations:** an unqualified column ambiguous between target and
-  source resolves to the target, and `RETURNING` doesn't support `merge_action()` or source-column
-  references.
+  is still allowed — each acted on once). **`RETURNING merge_action()` + source columns landed (#161, b198):**
+  `_run_merge` tracks `(image, action, source_row)` per affected row and `_merge_returning_result` evaluates
+  the projection against the MERGE scope (target image + source row), so `merge_action()` → `'INSERT'` /
+  `'UPDATE'` / `'DELETE'` and `RETURNING s.col` reads the source. **Limitations:** an unqualified column
+  ambiguous between target and source resolves to the target.
 - [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
   (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope
   (`_const_scope`), not just bare literals + info functions; (2) a FROM-less `SELECT … WHERE <const>`
@@ -2274,9 +2278,19 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   post-image validation, checks the new `_id` is free (else `23505`), then deletes the old row and inserts
   the re-keyed one (all deletes before any insert, so a PK swap between rows doesn't collide). Statement-atomic.
   **Limitations:** a reflected collection's `_id` still can't be updated (`0A000` — it's the real Mongo key);
-  a PK swap needs literal targets (`SET id = <expr>` referencing the row isn't supported — a general
-  UPDATE-SET-to-expression gap); renaming a composite-PK column via `ALTER TABLE` doesn't rewrite the
-  `_id.<name>` subdoc key (edge case); a SERIAL/identity column inside a composite PK is untested.
+  renaming a composite-PK column via `ALTER TABLE` doesn't rewrite the `_id.<name>` subdoc key (edge case);
+  a SERIAL/identity column inside a composite PK is untested. (A computed PK — `SET id = <expr>` — now works,
+  including a PK swap; see the UPDATE-SET-expression entry below.)
+- [ ] **`UPDATE ... SET col = <expr>` — per-row computed assignment landed (#159, b198).** A SET RHS that isn't
+  a literal (arithmetic, a column reference, `||`, a function call — `SET n = n + 1`, `SET a = b`, `SET s =
+  upper(s)`) is collected into `UpdatePlan.computed` (`(field, type_tag, expr)`) by `plan_update` (via
+  `_try_literal`), and `executor._execute_update_materialized` evaluates each against the **old** row (a
+  `scope` over the pre-image, so a two-column swap `SET a=b, b=a` is correct), coerces to the column type,
+  validates the post-image (NOT NULL `23502` / CHECK / UNIQUE / FK / generated — statement-atomic), and writes
+  it back per row (or delete+insert when the computed target is the PK). The pure-literal UPDATE keeps the
+  fast bulk `$set` path. Tests: `tests/test_sql_update_expr.py`. **Limitations:** a computed *composite-type*
+  subfield is coerced as a scalar (nested composite value not rebuilt); a SET RHS that is a correlated
+  subquery over another table isn't modelled.
 - [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
   passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
   in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.
