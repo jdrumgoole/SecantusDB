@@ -66,6 +66,22 @@ jobs:
         with:
           submodules: recursive  # vendor/wiredtiger is needed by the build
 
+      - name: Free up disk space (Linux)
+        if: runner.os == 'Linux'
+        # The durable-storage lane (ubuntu only) keeps thousands of on-disk
+        # WiredTiger homes for the whole session — tmp_path_retention_policy is
+        # pinned to "all" because deleting a passed test's WT home mid-session
+        # races WT's background threads → WT_PANIC (see tests/conftest.py). Each
+        # instance is already minimised (~10 MB via log=(prealloc=false)), but
+        # thousands of them approach the runner's ~21 GB free and tipped over
+        # with "No space left on device". Reclaim ~15-20 GB of preinstalled
+        # toolchains this build never uses (kept: the hostedtoolcache that
+        # setup-python reads). See tasks/backlog.md.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+          df -h /
+
       - name: Install swig (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y swig
@@ -120,7 +136,7 @@ jobs:
           echo "$dest/mongodb-database-tools-macos-${arch}-${dbtools_ver}/bin" >> "$GITHUB_PATH"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           # Default ``cache-dependency-glob`` is ``**/uv.lock``; on
@@ -226,7 +242,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -287,7 +303,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -380,7 +396,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock

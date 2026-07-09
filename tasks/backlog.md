@@ -189,6 +189,19 @@ lock), and the `secantus-conn-*` stop-drain stack-dump diagnostic.
 done:** V1 (gauge build caching) — `validate.yml` already caches every
 from-source build via `actions/cache`.
 
+**Shipped — CI disk headroom (2026-07-10).** The `test.yml` durable-storage lane
+(ubuntu only) runs the whole suite under `SECANTUS_FORCE_DURABLE=1`, and
+`tests/conftest.py` pins `tmp_path_retention_policy="all"` (deleting a passed
+test's WT home mid-session races WT's background threads → `WT_PANIC`), so
+thousands of on-disk WiredTiger homes accumulate for the whole session. Each is
+already minimised to ~10 MB (`log=(prealloc=false)` + `file_max=10MB` in
+`Storage`), but the total approaches the runner's ~21 GB free and intermittently
+hit "No space left on device" (grows with the test count). Fixed with a
+Linux-only "Free up disk space" step in `test.yml` that reclaims ~15-20 GB of
+unused preinstalled toolchains (android/dotnet/ghc/boost/swift/powershell)
+before the build. If the durable lane keeps growing, the next lever is a smaller
+per-instance footprint (not a mid-session delete — that reintroduces the panic).
+
 Deferred, low value / risk — revisit only if inner-loop wall becomes a real
 pain point again:
 
