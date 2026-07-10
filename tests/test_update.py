@@ -50,6 +50,52 @@ def test_pull_removes_matching() -> None:
     assert out == {"a": [1, 3]}
 
 
+def test_pull_predicate_criterion() -> None:
+    # An operator-only criterion is an element-value predicate.
+    assert apply_update({"a": [1, 5, 10, 15]}, {"$pull": {"a": {"$gte": 10}}}) == {"a": [1, 5]}
+    assert apply_update({"a": [1, 2, 3, 4]}, {"$pull": {"a": {"$in": [2, 4]}}}) == {"a": [1, 3]}
+
+
+def test_pull_subdocument_match() -> None:
+    docs = [{"x": 1, "y": "a"}, {"x": 5, "y": "b"}, {"x": 9, "y": "c"}]
+    # A field-doc criterion matches the element as a sub-document.
+    assert apply_update({"a": docs}, {"$pull": {"a": {"x": {"$gte": 5}}}}) == {
+        "a": [{"x": 1, "y": "a"}]
+    }
+    assert apply_update({"a": docs}, {"$pull": {"a": {"y": "b"}}}) == {
+        "a": [{"x": 1, "y": "a"}, {"x": 9, "y": "c"}]
+    }
+
+
+def test_pull_query_equality_types() -> None:
+    # query eq: bool is type-distinct from int, but 1 == 1.0 numerically.
+    assert apply_update({"a": [1, True, 2]}, {"$pull": {"a": 1}}) == {"a": [True, 2]}
+    assert apply_update({"a": [1, 1.0, 2]}, {"$pull": {"a": 1}}) == {"a": [2]}
+
+
+def test_pullall_removes_listed_values() -> None:
+    assert apply_update({"a": [1, 2, 3, 2, 1]}, {"$pullAll": {"a": [1, 2]}}) == {"a": [3]}
+    assert apply_update({"a": [1, 2, 3]}, {"$pullAll": {"a": [9]}}) == {"a": [1, 2, 3]}
+    with pytest.raises(UpdateError):
+        apply_update({"a": [1]}, {"$pullAll": {"a": 5}})
+
+
+def test_push_sort_modifier() -> None:
+    # Whole-element sort, ascending / descending.
+    assert apply_update({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": 1}}}) == {
+        "a": [1, 2, 3]
+    }
+    assert apply_update({"a": [1, 3]}, {"$push": {"a": {"$each": [2], "$sort": -1}}}) == {
+        "a": [3, 2, 1]
+    }
+    # Sort by sub-field, then slice.
+    out = apply_update(
+        {"a": [{"s": 3}, {"s": 1}]},
+        {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1}}}},
+    )
+    assert out == {"a": [{"s": 1}, {"s": 2}, {"s": 3}]}
+
+
 def test_addtoset_dedupes() -> None:
     out = apply_update({"a": [1, 2]}, {"$addToSet": {"a": 2}})
     assert out == {"a": [1, 2]}
