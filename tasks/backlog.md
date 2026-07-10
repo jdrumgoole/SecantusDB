@@ -2468,9 +2468,9 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   registration site (single-table + JOIN SELECT list, HAVING, and the group-window / hidden-agg
   closures — the last of which previously *silently dropped* a HAVING-only distinct FILTER). `min`/`max`
   (`DISTINCT`) already worked (they fall through to the plain accumulator, which threads `fcond`).
-  **Not supported (→ `0A000`):** `FILTER` with an in-aggregate `ORDER BY` (the sorted-push path would
-  need the sentinel threaded through the executor finish), and `DISTINCT` aggregates (with or without
-  FILTER) under GROUPING SETS (blocked by the broader ROLLUP/CUBE distinct guard).
+  `DISTINCT` count/sum/avg `FILTER` under GROUPING SETS also works (b211). **Not supported (→ `0A000`):**
+  `FILTER` with an in-aggregate `ORDER BY` (the sorted-push path would need the sentinel threaded through
+  the executor finish).
 - [ ] **`ALTER DOMAIN` landed** (b125): `ADD [CONSTRAINT c] CHECK (…) [NOT VALID]`, `DROP CONSTRAINT
   [IF EXISTS] c`, `SET DEFAULT expr` / `DROP DEFAULT`, `SET NOT NULL` / `DROP NOT NULL`, and `RENAME TO
   new`. Handled in `engine._alter_domain_command` (Command-parsed; catalog `update_domain`). `ADD …
@@ -2914,9 +2914,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   b202):** `GROUPING(a, …)` (parsed as `exp.Grouping`) projects a per-branch bitmask — 1 for each
   argument rolled up (absent from that branch's grouping set), 0 otherwise, MSB first
   (`_grouping_args` / `_grouping_bitmask`, emitted in `_grouping_set_branch` and, always 0, in the plain
-  `_plan_group_select`). **Limitations:** single-table only (GROUPING SETS over a JOIN →
-  `feature_not_supported`); no `HAVING`, correlated WHERE, or DISTINCT aggregate with GROUPING SETS; no
-  window over GROUPING SETS.
+  `_plan_group_select`). **DISTINCT aggregates under GROUPING SETS landed** (b211): `count`/`sum`/`avg`
+  (`DISTINCT x`) — with or without `FILTER` — route through `_register_distinct_agg` inside each grouping
+  set's branch (a `$addToSet` accumulator + a per-branch `$addFields` reduction stage before the branch's
+  `$project`); `min`/`max`(`DISTINCT`) take the plain accumulator (a distinct extremum equals the raw
+  extremum). `count(DISTINCT *)` → `0A000`. **Limitations:** single-table only (GROUPING SETS over a JOIN
+  → `feature_not_supported`); no `HAVING` or correlated WHERE with GROUPING SETS; no window over GROUPING
+  SETS.
 - [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
   routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`
