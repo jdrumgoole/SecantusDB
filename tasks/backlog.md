@@ -2921,9 +2921,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
   routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`
   output field and evaluates the wrapping expression per grouped row via the evaluated executor (the same
-  machinery window functions use). A bare aggregate stays on the fast `$group` path. **Still `0A000`:** a
-  computed GROUP BY key (`GROUP BY lower(name)`) — the group `_id` and SELECT resolution key off bare
-  column names.
+  machinery window functions use). A bare aggregate stays on the fast `$group` path. Computed GROUP BY
+  keys (`GROUP BY lower(name)`, `GROUP BY a + b`) work (single-table + JOIN) via
+  `_computed_group_keys` / `_lower_computed_group_keys`; a key using an unlowerable function (`substr`)
+  stays `0A000`.
+- [ ] **ORDER BY completeness in GROUP BY / pipeline queries landed** (b210): a pipeline `ORDER BY` now
+  accepts a **positional reference** (`ORDER BY 1`, `ORDER BY 2 DESC` → the Nth select item; out-of-range
+  → `42P10`) and an **aggregate / computed expression that matches a select-list item** (`ORDER BY
+  count(*) DESC`, `ORDER BY sum(x)` when that aggregate is selected). `_append_sort_limit` now takes the
+  ordered `out_columns` list and resolves each term via `_resolve_order_output` (positional index →
+  output name; else match the term's SQL against each select item's expression, select items and
+  `out_columns` being 1:1 in order; else a plain column). Works across single-table, JOIN, GROUPING SETS,
+  and group-window paths; enum-order resolution still applies only to plain-column terms. **Still
+  `0A000`:** `ORDER BY <aggregate>` where the aggregate is *not* in the select list (would need injecting
+  a new accumulator into the built pipeline).
 - [ ] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
   (`$unset`s the field on every doc), `RENAME COLUMN` (`$rename`s a non-PK field; a PK rename keeps
   the `_id` field and only changes the SQL name), `RENAME TO` (renames the table *and* moves the
