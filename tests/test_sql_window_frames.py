@@ -230,7 +230,8 @@ def test_range_numeric_offset_desc(storage, session):
     res = q(
         storage,
         session,
-        "SELECT id, SUM(amt) OVER (ORDER BY id DESC RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS s "
+        "SELECT id, SUM(amt) OVER "
+        "(ORDER BY id DESC RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS s "
         "FROM t ORDER BY id",
     )
     assert res.rows == [(1, 150), (2, 140), (3, 120), (4, 90), (5, 50)]
@@ -253,6 +254,7 @@ def test_range_numeric_offset_multi_order_key_rejected(storage, session):
         q(
             storage,
             session,
-            "SELECT SUM(amt) OVER (ORDER BY g, id RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t",
+            "SELECT SUM(amt) OVER "
+            "(ORDER BY g, id RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t",
         )
     assert ei.value.sqlstate == "0A000"

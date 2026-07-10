@@ -152,7 +152,8 @@ def test_function_in_colref_predicate_through_group_by(storage, session):
     rows = run_sql(
         storage,
         DB,
-        "SELECT region, SUM(amt) FROM sales WHERE amt = abs(target) GROUP BY region ORDER BY region",
+        "SELECT region, SUM(amt) FROM sales WHERE amt = abs(target) "
+        "GROUP BY region ORDER BY region",
         session=session,
     )[0].rows
     assert rows == [("e", 40), ("w", 45)]
@@ -193,7 +194,8 @@ def test_unsupported_function_in_colref_predicate_through_group_by(storage, sess
         run_sql(
             storage,
             DB,
-            "SELECT region, SUM(amt) FROM sales2 WHERE region = substr(region, 1, 1) GROUP BY region",
+            "SELECT region, SUM(amt) FROM sales2 "
+            "WHERE region = substr(region, 1, 1) GROUP BY region",
             session=session,
         )
     assert ei.value.sqlstate == "0A000"
