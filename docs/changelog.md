@@ -19,6 +19,32 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Trigonometric expression operators (both servers)
+
+The full trigonometric family lands on both servers — circular, inverse, and
+hyperbolic — matched to real `mongod` 6.0 via a three-way probe (mongod vs Rust
+vs Python server) with zero value divergences on the numeric path:
+
+`$sin` · `$cos` · `$tan` · `$asin` · `$acos` · `$atan` · `$atan2` ·
+`$sinh` · `$cosh` · `$tanh` · `$asinh` · `$acosh` · `$atanh`
+
+Inputs are int / long / double (result: double); `null` / missing propagate to
+null. Domain violations raise exactly as mongod does (`Location50989`): `$asin` /
+`$acos` / `$atanh` need `[-1, 1]`, `$acosh` needs `[1, ∞)`, and `$sin` / `$cos` /
+`$tan` reject `±Infinity` / `NaN`. `$atanh(±1)` returns `±Infinity` (not a domain
+error). A non-numeric argument raises `Location28765` (`Location51044` for
+`$atan2`).
+
+#### Added
+
+- `expressions.py` / `secantus-core`: the operators above. Both servers compute
+  through the platform libm — Rust `f64::sin` and CPython `math.sin` share it, so
+  they agree bit-for-bit (the same basis as the already-shipped `$exp` / `$ln`).
+  Decimal128 inputs are float-cast on the Python server (SecantusDB does not
+  reproduce mongod's decimal-precise transcendental result) and defer to the
+  Python oracle on the Rust side — the documented generic-code gap
+  (`tasks/backlog.md` §7.5).
+
 ### Set-expression and utility operators (both servers)
 
 The aggregation set-expression family lands on both servers, plus a handful of

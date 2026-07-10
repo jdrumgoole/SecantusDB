@@ -1372,10 +1372,12 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   2026-07-06 found these error on *both* — a dual-server gap, not Rust-only):
   `$median` / `$percentile` (t-digest accumulators). Remaining **expression** forms
   still absent from both: `$median` / `$percentile` over an array (t-digest /
-  approximate — parity-risky), and the trig / hashing family (`$sin`/`$cos`/`$atan2`/
-  … — libm last-ULP parity risk; `$toHashedIndexKey` — mongod-specific hash). Each
-  would need porting on **both** servers (Python module + Rust `secantus-core`) with
-  a parity corpus. **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot` as `$group` accumulators**
+  approximate — parity-risky), and the hashing family (`$toHashedIndexKey` —
+  mongod-specific hash). Each would need porting on **both** servers (Python module +
+  Rust `secantus-core`) with a parity corpus. (The **trig family** shipped — see
+  below; the anticipated libm last-ULP risk did not materialise, Rust `f64` and
+  CPython `math` share the platform libm.) **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot`
+  as `$group` accumulators**
   remain a follow-on (their *expression* forms shipped — see below; MongoDB 6.3+, so
   not validatable against the local mongod 6.0).
   **Sort-layer edge (pre-existing, not $topN-specific):** SecantusDB's sort treats a
@@ -1402,6 +1404,14 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   divergences: union/intersection return BSON-sorted, difference preserves
   first-array order, all set ops dedup by BSON-order equality; a non-array arg or a
   cross-type-unsortable element defers to the Python oracle on the Rust side); the
+  **trigonometric family** `$sin` / `$cos` / `$tan` / `$asin` / `$acos` / `$atan` /
+  `$atan2` / `$sinh` / `$cosh` / `$tanh` / `$asinh` / `$acosh` / `$atanh`
+  (0.5.3-beta.144 / 0.5.4b207 — three-way verified, zero value divergences: both
+  servers compute through the platform libm so Rust `f64` and CPython `math` agree
+  bit-for-bit; domain violations raise mongod's `Location50989` — `$asin`/`$acos`/
+  `$atanh` need [-1,1], `$acosh` needs [1,∞), `$sin`/`$cos`/`$tan` reject ±inf/NaN;
+  `$atanh(±1)` → ±inf; non-numeric raises `Location28765`, `$atan2` `Location51044`;
+  Decimal128 is float-cast on Python and defers on Rust); the
   bitwise **expression** operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
   (0.5.3-beta.136 / 0.5.4b164 — int/long operands, int32/int64 result width,
   empty-list identity, null propagation; a non-integer operand raises), and the

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import zoneinfo
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -447,6 +448,59 @@ def _op_log10(arg: Any, ctx: _Ctx) -> Any:
 
     v = _eval(arg, ctx)
     return math.log10(v) if v is not None and v > 0 else None
+
+
+def _trig_coerce(name: str, v: Any, code: int = 28765) -> float:
+    """Coerce a trig operand to float. bool / non-numeric raise ``code``
+    (mongod's ``Location28765`` for the unary ops, ``51044`` for ``$atan2``).
+    Decimal128 is float-cast, matching ``$degreesToRadians`` (SecantusDB does
+    not reproduce mongod's decimal-precise transcendental result)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
+        raise ExpressionError(f"{name} only supports numeric types, not {_type_name(v)}", code=code)
+    return float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+
+
+def _make_trig(name: str, fn: Any, domain: str) -> Any:
+    """Build a unary trig operator. ``domain`` gates the input the way mongod
+    does (all violations surface ``Location50989``): ``finite`` (sin/cos/tan
+    reject ±inf / NaN), ``unit`` (asin/acos need [-1,1]), ``atanh`` (same, but
+    ±1 → ±inf rather than a ``math`` domain error), ``geq1`` (acosh needs
+    [1,inf)), ``any`` (atan / the hyperbolics accept every finite + infinity)."""
+
+    def op(arg: Any, ctx: _Ctx) -> Any:
+        v = _eval(arg, ctx)
+        if v is None:
+            return None
+        x = _trig_coerce(name, v)
+        if domain == "finite" and not math.isfinite(x):
+            raise ExpressionError(
+                f"cannot apply {name} to {x}, value must be in (-inf,inf)", code=50989
+            )
+        if domain in ("unit", "atanh") and not (-1.0 <= x <= 1.0):
+            raise ExpressionError(
+                f"cannot apply {name} to {x}, value must be in [-1,1]", code=50989
+            )
+        if domain == "geq1" and not x >= 1.0:
+            raise ExpressionError(
+                f"cannot apply {name} to {x}, value must be in [1,inf]", code=50989
+            )
+        if domain == "atanh" and abs(x) == 1.0:
+            return math.inf if x > 0 else -math.inf
+        return fn(x)
+
+    return op
+
+
+def _op_atan2(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or len(arg) != 2:
+        raise ExpressionError("$atan2 requires two arguments", code=51044)
+    y = _eval(arg[0], ctx)
+    x = _eval(arg[1], ctx)
+    if y is None or x is None:
+        return None
+    fy = _trig_coerce("$atan2", y, code=51044)
+    fx = _trig_coerce("$atan2", x, code=51044)
+    return math.atan2(fy, fx)
 
 
 def _op_rand(arg: Any, _ctx: _Ctx) -> float:
@@ -2197,6 +2251,19 @@ _OPS = {
     "$ln": _op_ln,
     "$log": _op_log,
     "$log10": _op_log10,
+    "$sin": _make_trig("$sin", math.sin, "finite"),
+    "$cos": _make_trig("$cos", math.cos, "finite"),
+    "$tan": _make_trig("$tan", math.tan, "finite"),
+    "$asin": _make_trig("$asin", math.asin, "unit"),
+    "$acos": _make_trig("$acos", math.acos, "unit"),
+    "$atan": _make_trig("$atan", math.atan, "any"),
+    "$atan2": _op_atan2,
+    "$sinh": _make_trig("$sinh", math.sinh, "any"),
+    "$cosh": _make_trig("$cosh", math.cosh, "any"),
+    "$tanh": _make_trig("$tanh", math.tanh, "any"),
+    "$asinh": _make_trig("$asinh", math.asinh, "any"),
+    "$acosh": _make_trig("$acosh", math.acosh, "geq1"),
+    "$atanh": _make_trig("$atanh", math.atanh, "atanh"),
     "$rand": _op_rand,
     "$trunc": _op_trunc,
     "$bitAnd": _op_bit_and,

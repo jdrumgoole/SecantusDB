@@ -671,6 +671,60 @@ def test_aggregate_set_operators(coll) -> None:
     ]
 
 
+def test_aggregate_trig_operators(coll) -> None:
+    import math
+
+    coll.insert_one({"_id": 1})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "sin": {"$sin": 0},
+                        "cos": {"$cos": 0},
+                        "tan": {"$tan": 0},
+                        "asin": {"$asin": 1},
+                        "acos": {"$acos": 1},
+                        "atan": {"$atan": 1},
+                        "atan2": {"$atan2": [1, 1]},
+                        "sinh": {"$sinh": 0},
+                        "cosh": {"$cosh": 0},
+                        "tanh": {"$tanh": 0},
+                        "asinh": {"$asinh": 0},
+                        "acosh": {"$acosh": 1},
+                        "atanh": {"$atanh": 0},
+                        "atanh_edge": {"$atanh": 1},
+                        "null": {"$sin": None},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [
+        {
+            "sin": 0.0,
+            "cos": 1.0,
+            "tan": 0.0,
+            "asin": math.pi / 2,
+            "acos": 0.0,
+            "atan": math.pi / 4,
+            "atan2": math.pi / 4,
+            "sinh": 0.0,
+            "cosh": 1.0,
+            "tanh": 0.0,
+            "asinh": 0.0,
+            "acosh": 0.0,
+            "atanh": 0.0,
+            "atanh_edge": math.inf,
+            "null": None,
+        }
+    ]
+    # Domain error surfaces (mongod Location50989 on the Python server).
+    with pytest.raises(pymongo.errors.OperationFailure):
+        list(coll.aggregate([{"$project": {"r": {"$asin": 5}}}]))
+
+
 def test_aggregate_date_from_parts(coll) -> None:
     coll.insert_one({"_id": 1})
     out = list(
