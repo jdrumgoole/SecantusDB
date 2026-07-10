@@ -44,7 +44,10 @@ permissions:
 
 jobs:
   test:
-    runs-on: ${{ matrix.os }}
+    # The Linux lane. Windows runs as the sharded ``test-windows`` job below;
+    # macOS is excluded from CI entirely — built at release only (see
+    # top-of-file note).
+    runs-on: ubuntu-latest
     # The whole suite runs in ~4 min locally; 30 min is generous for CI. Without
     # this, a hung run (a daemon/thread not reaped — historically a rust-server
     # stop() / change-stream-tail wedge, see the faulthandler watchdog in
@@ -55,19 +58,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS excluded — built at release only (see top-of-file note).
-        os: [ubuntu-latest, windows-latest]
-        # Push / PR: 3.10 only (one cell per OS = 2 cells, fast feedback).
-        # Schedule / workflow_dispatch: full version sweep
-        # (4 Pythons × 2 OSes = 8 cells).
+        # Push / PR: 3.10 only (fast feedback). Schedule / workflow_dispatch:
+        # full version sweep.
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-        with:
-          submodules: recursive  # vendor/wiredtiger is needed by the build
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
-      - name: Free up disk space (Linux)
-        if: runner.os == 'Linux'
+      - name: Free up disk space
         # The durable-storage lane (ubuntu only) keeps thousands of on-disk
         # WiredTiger homes for the whole session — tmp_path_retention_policy is
         # pinned to "all" because deleting a passed test's WT home mid-session
@@ -82,24 +89,10 @@ jobs:
             /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
           df -h /
 
-      - name: Install swig (Linux)
-        if: runner.os == 'Linux'
+      - name: Install swig
         run: sudo apt-get update && sudo apt-get install -y swig
 
-      - name: Install swig (macOS)
-        if: runner.os == 'macOS'
-        run: brew install swig
-
-      - name: Install swig (Windows)
-        if: runner.os == 'Windows'
-        # SWIG ships preinstalled on windows-2022 runners, but choco
-        # re-installs idempotently to defend against runner image
-        # refreshes that drop it. Same line cibuildwheel uses for
-        # publish-time wheel builds.
-        run: choco install -y swig
-
-      - name: Install MongoDB CLI tools (Linux)
-        if: runner.os == 'Linux'
+      - name: Install MongoDB CLI tools
         # mongosh + Database Tools so the CLI-tool conformance tests
         # (tests/test_mongosh.py, test_mongodump_restore.py,
         # test_mongoimport_export.py, test_mongofiles.py,
@@ -113,27 +106,6 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
           sudo apt-get update
           sudo apt-get install -y mongodb-mongosh mongodb-database-tools
-
-      - name: Install MongoDB CLI tools (macOS)
-        if: runner.os == 'macOS'
-        # Homebrew's third-party `mongodb/brew` tap is refused on ~half of runs
-        # under Homebrew's tap-trust policy ("Refusing to load formula ... from
-        # untrusted tap mongodb/brew") — a cache-dependent flake that reds the
-        # macOS cell at random. Download the official mongosh + database-tools
-        # tarballs directly instead: deterministic, no tap, no Homebrew.
-        run: |
-          set -euxo pipefail
-          arch="$(uname -m)"   # arm64 on the Apple-Silicon macos-latest runners
-          dest="$RUNNER_TEMP/mongotools"
-          mkdir -p "$dest"
-          mongosh_ver=2.5.1
-          curl -fsSL "https://downloads.mongodb.com/compass/mongosh-${mongosh_ver}-darwin-${arch}.zip" -o "$dest/mongosh.zip"
-          unzip -q "$dest/mongosh.zip" -d "$dest"
-          echo "$dest/mongosh-${mongosh_ver}-darwin-${arch}/bin" >> "$GITHUB_PATH"
-          dbtools_ver=100.12.0
-          curl -fsSL "https://fastdl.mongodb.org/tools/db/mongodb-database-tools-macos-${arch}-${dbtools_ver}.zip" -o "$dest/dbtools.zip"
-          unzip -q "$dest/dbtools.zip" -d "$dest"
-          echo "$dest/mongodb-database-tools-macos-${arch}-${dbtools_ver}/bin" >> "$GITHUB_PATH"
 
       - name: Install uv
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
@@ -156,15 +128,6 @@ jobs:
         # time. ``website`` is intentionally excluded — pelican / boto3
         # aren't exercised by pytest and would just slow CI down.
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
-
-      - name: Install tzdata (Windows)
-        if: runner.os == 'Windows'
-        # Windows ships no IANA timezone database; Python's
-        # ``zoneinfo`` returns nothing for ``ZoneInfo("Europe/Dublin")``
-        # without it. ``tzdata`` is a tiny pure-Python package that
-        # bundles the IANA data. Linux/macOS use the system tzdata,
-        # so we only need this on Windows runners.
-        run: uv pip install tzdata
 
       - name: Lint
         run: uv run ruff check src tests
@@ -191,16 +154,163 @@ jobs:
         # ``--timeout`` above regardless, so the restart budget is safe.
         run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
 
+
+  # The Windows lane, split from the ``test`` job and sharded two ways so the
+  # slowest platform stops being the workflow's critical path (~20 min in one
+  # job on a 4-vCPU runner). The split is complete by construction: the ``sql``
+  # shard runs exactly the files the ``core`` shard ``--ignore-glob``s, so a new
+  # test file always lands in exactly one shard. Lint runs on Linux only — it is
+  # platform-independent.
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Push / PR: 3.10 only. Schedule / workflow_dispatch: full sweep.
+        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
+        shard: [sql, core]
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - name: Checkout the WiredTiger submodule
+        # See the ``test`` job's twin step for why this replaces
+        # ``submodules: recursive``.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
+
+      - name: Disable Defender real-time scanning
+        # Every test opens its own on-disk WiredTiger home under tmp_path —
+        # thousands of short-lived small files per run. Defender's real-time
+        # engine scans each one synchronously on create/write/close, which
+        # taxes exactly this workload; the runner VM is ephemeral and builds
+        # only this checkout, so scanning it buys nothing. Best-effort: if the
+        # image ever locks the preference, fall through rather than fail.
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Warning "could not disable Defender real-time scanning: $_" }
+
+      - name: Put temp files on the runner work disk
+        # pytest's tmp_path (→ every WT home) follows TMP/TEMP, which points at
+        # the small OS-disk profile temp dir; RUNNER_TEMP lives on the runner's
+        # work disk, provisioned for build I/O and wiped between jobs anyway.
+        shell: pwsh
+        run: |
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install swig
+        # SWIG ships preinstalled on windows-2022 runners, but choco
+        # re-installs idempotently to defend against runner image
+        # refreshes that drop it. Same line cibuildwheel uses for
+        # publish-time wheel builds.
+        run: choco install -y swig
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          # Same narrow glob as the ``test`` job: one lock file at the repo
+          # root, and the default recursive walk trips on deep vendor paths.
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+
+      - name: Install tzdata
+        # Windows ships no IANA timezone database; Python's
+        # ``zoneinfo`` returns nothing for ``ZoneInfo("Europe/Dublin")``
+        # without it. ``tzdata`` is a tiny pure-Python package that
+        # bundles the IANA data.
+        run: uv pip install tzdata
+
+      - name: Tests (${{ matrix.shard }} shard)
+        # Same pytest flags as the ``test`` job (see the comments there). The
+        # ``sql`` shard is the SQL engine + PG-wire suites; ``core`` is
+        # everything else. git-bash expands the globs.
+        shell: bash
+        run: |
+          if [ "${{ matrix.shard }}" = "sql" ]; then
+            uv run python -m pytest tests/test_sql_*.py tests/test_pgserver*.py \
+              --timeout=120 --timeout-method=thread --max-worker-restart=3
+          else
+            uv run python -m pytest \
+              --ignore-glob='tests/test_sql_*.py' --ignore-glob='tests/test_pgserver*.py' \
+              --timeout=120 --timeout-method=thread --max-worker-restart=3
+          fi
+
+  # The slow + durable lanes, split out of the ``test`` matrix job so they run
+  # in PARALLEL with the fast suite instead of serially after it: the durable
+  # pass re-runs the whole suite and roughly doubled the Linux lane's wall
+  # time (~708s fast + ~618s durable + ~59s slow serial in one job). Same
+  # commands, same coverage, same python-version sweep on schedule — only the
+  # job boundary moved. Setup cost (~3 min) is paid once more in exchange for
+  # taking ~11 min off the workflow's critical path.
+  test-durable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - name: Checkout the WiredTiger submodule
+        # See the ``test`` job's twin step for why this replaces
+        # ``submodules: recursive``.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
+
+      - name: Free up disk space
+        # The durable lane keeps thousands of on-disk WiredTiger homes for the
+        # whole session (tmp_path_retention_policy is pinned to "all" — see the
+        # ``test`` job's twin step and tests/conftest.py) and tipped over the
+        # runner's ~21 GB free without this.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+          df -h /
+
+      - name: Install swig
+        run: sudo apt-get update && sudo apt-get install -y swig
+
+      - name: Install MongoDB CLI tools
+        # Same rationale as the ``test`` job: without mongosh + Database Tools
+        # the CLI-tool conformance tests skip, and the durable pass must cover
+        # exactly what the fast pass covers.
+        run: |
+          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+          sudo apt-get update
+          sudo apt-get install -y mongodb-mongosh mongodb-database-tools
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+
       - name: Slow tests
         # Long-running stress / scaling tests carry ``@pytest.mark.slow`` and are
         # excluded from the default suite (addopts ``-m 'not ... slow'``) to keep
-        # the inner loop fast. Run them here — once, on Linux, reusing the env the
-        # matrix already built — so the races they guard (the xdist-worker-crash
+        # the inner loop fast. Run them here — once, on Linux — so the races they guard (the xdist-worker-crash
         # teardown drain in test_server_shutdown; the WT concurrency-ceiling
         # benchmark in test_concurrency) stay covered instead of running nowhere.
         # A command-line ``-m slow`` overrides the addopts marker filter while
         # ``-n auto``/``--dist=loadgroup`` from addopts are retained.
-        if: matrix.os == 'ubuntu-latest'
         run: uv run python -m pytest -m slow --timeout=120 --timeout-method=thread --max-worker-restart=3
 
       - name: Durable-storage tests
@@ -210,9 +320,8 @@ jobs:
         # suite here with ``SECANTUS_FORCE_DURABLE=1`` — which overrides the fast
         # default inside ``Storage`` — so the real journal + close-checkpoint
         # durability behaviour (schema, persistence, close-and-reopen, PITR /
-        # backup) is exercised on every push. Once, on Linux, reusing the env the
-        # matrix already built. This is the "real durable disk testing" path.
-        if: matrix.os == 'ubuntu-latest'
+        # backup) is exercised on every push. Once, on Linux. This is the
+        # "real durable disk testing" path.
         env:
           SECANTUS_FORCE_DURABLE: "1"
         run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
@@ -230,8 +339,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-        with:
-          submodules: recursive  # vendor/wiredtiger is needed by the build
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
       - name: Install swig
         run: sudo apt-get update && sudo apt-get install -y swig
@@ -289,8 +406,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-        with:
-          submodules: recursive  # vendor/wiredtiger is needed by the build
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
       # swig builds WT's Python module; clang/libclang for secantus-wt's bindgen;
       # ninja is the generator the WT ExternalProject forces.
@@ -367,11 +492,29 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-        with:
-          submodules: recursive  # vendor/wiredtiger is needed by the build
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
       # bindgen needs libclang; the WT ExternalProject forces the Ninja
       # generator; swig builds WT's (unused-here but configured) Python module.
+      - name: Disable Defender real-time scanning (Windows)
+        if: runner.os == 'Windows'
+        # Real-time scanning synchronously inspects every file the build
+        # creates (cargo + CMake object files, the WT tree, wheel staging) on
+        # an ephemeral VM that builds only this checkout. Best-effort.
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Warning "could not disable Defender real-time scanning: $_" }
+
       - name: Install toolchain (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
