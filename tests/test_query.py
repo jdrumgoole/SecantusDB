@@ -147,6 +147,28 @@ def test_all() -> None:
     assert not matches({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}})
 
 
+def test_all_with_elemmatch() -> None:
+    q = {"a": {"$all": [{"$elemMatch": {"$gt": 1, "$lt": 3}}]}}
+    assert matches({"a": [1, 2, 3]}, q)  # 2 is in (1, 3)
+    assert not matches({"a": [4, 5]}, q)
+    # Two clauses: array must have an element for each (may differ).
+    q2 = {"a": {"$all": [{"$elemMatch": {"$gt": 4}}, {"$elemMatch": {"$lt": 2}}]}}
+    assert matches({"a": [1, 5, 10]}, q2)
+    assert not matches({"a": [5, 10]}, q2)  # nothing < 2
+
+
+def test_in_with_regex() -> None:
+    # A regex candidate matches string values by pattern (not by equality).
+    assert matches({"s": "hello"}, {"s": {"$in": [Regex("^h", "i")]}})
+    assert matches({"s": "HELLO"}, {"s": {"$in": [Regex("^h", "i")]}})
+    assert not matches({"s": "world"}, {"s": {"$in": [Regex("^h", "i")]}})
+    # Mixed literal + regex candidates.
+    assert matches({"s": "abc"}, {"s": {"$in": ["x", Regex("^a")]}})
+    # $nin is the negation.
+    assert matches({"s": "world"}, {"s": {"$nin": [Regex("^h")]}})
+    assert not matches({"s": "hello"}, {"s": {"$nin": [Regex("^h")]}})
+
+
 def test_mod() -> None:
     assert matches({"n": 12}, {"n": {"$mod": [4, 0]}})
     assert matches({"n": 13}, {"n": {"$mod": [4, 1]}})

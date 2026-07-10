@@ -19,6 +19,28 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$in`/`$nin` regex candidates and `$all` + `$elemMatch` (both servers)
+
+A three-way query differential against real `mongod` 6.0 turned up two
+match-operator gaps present on both servers, now fixed and three-way verified.
+
+A regex inside `$in` (or `$nin`) now matches string values **by pattern**, as
+mongod does — `{s: {$in: [/^h/i]}}` matches `"hello"` and `"HELLO"`. Previously
+both servers treated the regex as a literal value to compare by equality, so it
+silently matched nothing (and on the Rust server it errored). And `$all` now
+accepts `$elemMatch` clauses (`{a: {$all: [{$elemMatch: {$gt: 1, $lt: 3}}]}}`) —
+each clause requires *some* array element to satisfy its sub-query, so an array
+is matched against several independent element predicates at once.
+
+#### Fixed
+
+- `query.py` / `secantus-core`: `$in` / `$nin` route a regex candidate through the
+  regex matcher (`_in_candidate_matches` / `in_candidate_matches`); `$all` handles
+  a `{$elemMatch: …}` entry by delegating to the `$elemMatch` matcher over the
+  whole array. (A related Rust-only gap — `$gt`/`$lt` against a cross-type operand
+  such as a document-valued array element deferring instead of comparing by BSON
+  type order — is tracked in `tasks/backlog.md` §7.5.)
+
 ### `$pull` query semantics, `$pullAll`, and `$push $sort` on the Rust server
 
 A three-way differential against real `mongod` 6.0 turned up two array-update

@@ -267,7 +267,22 @@ CURATED = [
     ({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}}),
     ({"tags": [1, 2, 3]}, {"tags": {"$all": [1.0, 2.0]}}),  # numeric bridge
     ({"tags": []}, {"tags": {"$all": []}}),
-    ({"tags": ["a", "b"]}, {"tags": {"$all": [Regex("^a")]}}),  # regex elem -> defer
+    ({"tags": ["a", "b"]}, {"tags": {"$all": [Regex("^a")]}}),  # regex elem (pattern match)
+    # $all with $elemMatch clauses — each clause needs some element to match.
+    ({"a": [1, 2, 3]}, {"a": {"$all": [{"$elemMatch": {"$gt": 1, "$lt": 3}}]}}),
+    ({"a": [4, 5]}, {"a": {"$all": [{"$elemMatch": {"$gt": 1, "$lt": 3}}]}}),  # no match
+    (
+        {"a": [1, 5, 10]},
+        {"a": {"$all": [{"$elemMatch": {"$gt": 4}}, {"$elemMatch": {"$lt": 2}}]}},
+    ),
+    ({"a": [1, 2, 3]}, {"a": {"$all": [2, {"$elemMatch": {"$gt": 2}}]}}),  # mixed
+    # $in / $nin with a regex candidate — matches string values by pattern.
+    ({"s": "hello"}, {"s": {"$in": [Regex("^h", "i")]}}),
+    ({"s": "World"}, {"s": {"$in": [Regex("^h", "i")]}}),  # no match
+    ({"s": "HELLO"}, {"s": {"$in": [Regex("^h", "i")]}}),  # case-insensitive
+    ({"s": "abc"}, {"s": {"$in": ["x", Regex("^a"), "y"]}}),  # mixed literal + regex
+    ({"s": "world"}, {"s": {"$nin": [Regex("^h")]}}),  # nin keeps non-matching
+    ({"s": "hello"}, {"s": {"$nin": [Regex("^h")]}}),  # nin excludes matching
     # --- regex ($regex/$options + bare BSON regex) — now handled in Rust ---
     ({"item": "paper"}, {"item": {"$regex": "^p"}}),
     ({"item": "journal"}, {"item": {"$regex": "^p"}}),
