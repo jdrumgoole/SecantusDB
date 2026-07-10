@@ -4088,6 +4088,11 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         if having is not None
         else None
     )
+    # An ORDER BY aggregate that isn't in the select list gets a hidden accumulator,
+    # projected so the $sort can reach it but kept out of out_columns.
+    order_aggs = _register_orderby_aggs_single(
+        stmt, table, accumulators, reductions, project, names
+    )
     pipeline: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
     # Reduce any DISTINCT sets to their scalar value before HAVING / projection.
     if reductions:
@@ -4095,7 +4100,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
-    _append_sort_limit(pipeline, stmt, out_columns, table)
+    _append_sort_limit(pipeline, stmt, out_columns, table, order_aggs=order_aggs)
     return PipelineSelectPlan(
         table.collection,
         base_filter,
@@ -5312,13 +5317,16 @@ def _plan_join_group_select(
         if having is not None
         else None
     )
+    order_aggs = _register_orderby_aggs_join(
+        stmt, resolve, accumulators, reductions, project, names
+    )
     pipeline.append({"$group": {"_id": group_id, **accumulators}})
     if reductions:
         pipeline.append({"$addFields": reductions})
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
-    _append_sort_limit(pipeline, stmt, out_columns, amap=amap)
+    _append_sort_limit(pipeline, stmt, out_columns, amap=amap, order_aggs=order_aggs)
     return PipelineSelectPlan(
         base.collection,
         {},
@@ -6392,13 +6400,18 @@ def _append_distinct(pipeline: list[dict[str, Any]], out_columns: list[tuple[str
 
 
 def _resolve_order_output(
-    node: exp.Expression, stmt: exp.Expression, out_columns: list[tuple[str, str]]
+    node: exp.Expression,
+    stmt: exp.Expression,
+    out_columns: list[tuple[str, str]],
+    order_aggs: dict[str, str] | None = None,
 ) -> str:
     """Resolve a pipeline ORDER BY term to an output column name. Handles a
     positional reference (``ORDER BY 2`` → the 2nd select item), an expression that
     matches a SELECT-list item (``ORDER BY count(*)`` when ``count(*)`` is selected —
-    select items and ``out_columns`` are 1:1 in order on the pipeline paths), and a
-    plain column name. Postgres resolves ORDER BY against output columns like this."""
+    select items and ``out_columns`` are 1:1 in order on the pipeline paths), an
+    aggregate that is *not* selected but registered as a hidden accumulator
+    (``order_aggs``, keyed by the term's SQL), and a plain column name. Postgres
+    resolves ORDER BY against output columns like this."""
     if isinstance(node, exp.Literal) and node.is_int:
         idx = int(node.this)
         if not 1 <= idx <= len(out_columns):
@@ -6411,6 +6424,8 @@ def _resolve_order_output(
             inner = sel.this if isinstance(sel, exp.Alias) else sel
             if i < len(out_columns) and inner.sql() == target:
                 return out_columns[i][0]
+        if order_aggs is not None and target in order_aggs:
+            return order_aggs[target]
     return _column_name(node)
 
 
@@ -6420,14 +6435,17 @@ def _append_sort_limit(
     out_columns: list[tuple[str, str]],
     table: TableDef | None = None,
     amap: dict[str, tuple[str, TableDef]] | None = None,
+    order_aggs: dict[str, str] | None = None,
 ) -> None:
     valid_names = {n for n, _ in out_columns}
+    if order_aggs:
+        valid_names |= set(order_aggs.values())
     order = stmt.args.get("order")
     if order is not None:
         terms: list[tuple[str, int, bool]] = []
         enum_labels: dict[str, list[str]] = {}
         for o in order.expressions:
-            col = _resolve_order_output(o.this, stmt, out_columns)
+            col = _resolve_order_output(o.this, stmt, out_columns, order_aggs)
             if col not in valid_names:
                 raise errors.undefined_column(col)
             terms.append((col, -1 if o.args.get("desc") else 1, _nulls_first(o)))
@@ -6447,6 +6465,104 @@ def _append_sort_limit(
         pipeline.append({"$skip": skip})
     if limit:
         pipeline.append({"$limit": limit})
+
+
+def _selected_sqls(stmt: exp.Expression) -> set[str]:
+    """The SQL text of each SELECT item's underlying expression (alias stripped) —
+    used to tell whether an ORDER BY aggregate is already in the select list."""
+    out: set[str] = set()
+    for e in stmt.expressions:
+        inner = e.this if isinstance(e, exp.Alias) else e
+        out.add(inner.sql())
+    return out
+
+
+def _register_orderby_aggs_single(
+    stmt: exp.Expression,
+    table: TableDef,
+    accumulators: dict[str, Any],
+    reductions: dict[str, Any],
+    project: dict[str, Any],
+    names: _NameAllocator,
+) -> dict[str, str]:
+    """Register a hidden ``$group`` accumulator for each ORDER BY aggregate that is
+    *not* in the select list (single-table GROUP BY) — ``SELECT dept … GROUP BY dept
+    ORDER BY sum(sal) DESC``. The accumulator is projected so the ``$sort`` can reach
+    it, but it stays out of ``out_columns`` so the executor drops it from the output.
+    Returns ``{order_by_term_sql: hidden_field_name}``."""
+    order = stmt.args.get("order")
+    if order is None:
+        return {}
+    selected = _selected_sqls(stmt)
+    hidden: dict[str, str] = {}
+    for o in order.expressions:
+        node = o.this
+        key = node.sql()
+        if key in selected or key in hidden:
+            continue  # already a select item (b210) or already registered here
+        agg = _aggregate_of(node)
+        if agg is None:
+            continue  # positional / plain column / non-aggregate — resolved elsewhere
+        func, col, distinct = agg
+        if distinct and func in _DISTINCT_FUNCS:
+            if col is None:
+                raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+            fname, _ = _register_distinct_agg(
+                func,
+                table.field_for(col),
+                table.type_for(col),
+                None,
+                names,
+                accumulators,
+                reductions,
+            )
+        else:
+            acc, _ = _accumulator(func, col, table, None)
+            fname = names.fresh("__ob")
+            accumulators[fname] = acc
+        project[fname] = f"${fname}"
+        hidden[key] = fname
+    return hidden
+
+
+def _register_orderby_aggs_join(
+    stmt: exp.Expression,
+    resolve: Resolve,
+    accumulators: dict[str, Any],
+    reductions: dict[str, Any],
+    project: dict[str, Any],
+    names: _NameAllocator,
+) -> dict[str, str]:
+    """``_register_orderby_aggs_single`` for the JOIN + GROUP BY path — the aggregate
+    argument lowers through the join ``resolve`` instead of a ``TableDef``."""
+    order = stmt.args.get("order")
+    if order is None:
+        return {}
+    selected = _selected_sqls(stmt)
+    hidden: dict[str, str] = {}
+    for o in order.expressions:
+        node = o.this
+        key = node.sql()
+        if key in selected or key in hidden:
+            continue
+        agg = _join_aggregate_of(node)
+        if agg is None:
+            continue
+        func, arg, distinct = agg
+        if distinct and func in _DISTINCT_FUNCS:
+            if arg is None:
+                raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+            path, tag = resolve(arg)
+            fname, _ = _register_distinct_agg(
+                func, path, tag, None, names, accumulators, reductions
+            )
+        else:
+            acc, _ = _join_accumulator(func, arg, resolve, None)
+            fname = names.fresh("__ob")
+            accumulators[fname] = acc
+        project[fname] = f"${fname}"
+        hidden[key] = fname
+    return hidden
 
 
 def _normalize_params(sql: str) -> str:

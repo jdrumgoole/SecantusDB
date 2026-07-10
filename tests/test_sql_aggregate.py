@@ -412,3 +412,69 @@ def test_order_by_position_rollup(storage, session):
     )
     # ORDER BY 1 sorts region; the grand-total row (NULL region) sorts last.
     assert res.rows == [("east", 2), ("west", 2), (None, 4)]
+
+
+# -- ORDER BY an aggregate not in the select list ---------------------------- #
+
+
+def test_order_by_unselected_aggregate(storage, session):
+    # ORDER BY sum(amount) with only region selected: sorts by the hidden sum,
+    # and the sum does not appear in the output.
+    _sales(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT region FROM sales GROUP BY region ORDER BY sum(amount) DESC",
+    )
+    # west sum 35 > east sum 30; only the selected column is returned.
+    assert len(res.columns) == 1
+    assert res.rows == [("west",), ("east",)]
+
+
+def test_order_by_unselected_count(storage, session):
+    _sales(storage, session)
+    # east and west each have 2 rows → tie on count(*), broken by region asc.
+    res = q(
+        storage,
+        session,
+        "SELECT region FROM sales GROUP BY region ORDER BY count(*) DESC, region",
+    )
+    assert res.rows == [("east",), ("west",)]
+    assert len(res.columns) == 1
+
+
+def test_order_by_unselected_aggregate_with_selected_agg(storage, session):
+    # A selected aggregate plus ordering by a *different*, unselected aggregate.
+    _sales(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT region, count(*) FROM sales GROUP BY region ORDER BY sum(amount) DESC",
+    )
+    assert res.rows == [("west", 2), ("east", 2)]
+
+
+def test_order_by_unselected_count_distinct(storage, session):
+    _sales(storage, session)
+    # east amounts {10,20} → 2 distinct; west {30,5} → 2; tie, region asc.
+    res = q(
+        storage,
+        session,
+        "SELECT region FROM sales GROUP BY region ORDER BY count(DISTINCT amount) DESC, region",
+    )
+    assert res.rows == [("east",), ("west",)]
+
+
+def test_order_by_unselected_aggregate_over_join(storage, session):
+    _sales(storage, session)
+    q(storage, session, "CREATE TABLE reg (region text PRIMARY KEY, tz text)")
+    q(storage, session, "INSERT INTO reg (region, tz) VALUES ('east', 'ET'), ('west', 'PT')")
+    res = q(
+        storage,
+        session,
+        "SELECT r.tz FROM sales s JOIN reg r ON s.region = r.region "
+        "GROUP BY r.tz ORDER BY sum(s.amount) DESC",
+    )
+    # west sum 35 (PT) > east sum 30 (ET).
+    assert res.rows == [("PT",), ("ET",)]
+    assert len(res.columns) == 1
