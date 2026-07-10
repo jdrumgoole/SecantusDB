@@ -2936,9 +2936,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   ordered `out_columns` list and resolves each term via `_resolve_order_output` (positional index →
   output name; else match the term's SQL against each select item's expression, select items and
   `out_columns` being 1:1 in order; else a plain column). Works across single-table, JOIN, GROUPING SETS,
-  and group-window paths; enum-order resolution still applies only to plain-column terms. **Still
-  `0A000`:** `ORDER BY <aggregate>` where the aggregate is *not* in the select list (would need injecting
-  a new accumulator into the built pipeline).
+  and group-window paths; enum-order resolution still applies only to plain-column terms. **ORDER BY an
+  aggregate that is *not* in the select list landed** (b212): `SELECT dept … GROUP BY dept ORDER BY
+  sum(sal) DESC` — `_register_orderby_aggs_single` / `_register_orderby_aggs_join` register a hidden
+  `$group` accumulator (a bare `count`/`sum`/`avg`/`min`/`max`, or `count`/`sum`/`avg`(`DISTINCT`) via
+  `_register_distinct_agg`) for each such term, projected so the `$sort` can reach it but kept out of
+  `out_columns` so the executor drops it from the output; `_resolve_order_output` maps the term's SQL to
+  the hidden field. Still `0A000`: a non-aggregate computed ORDER BY expression not in the select list,
+  and ORDER BY an unselected aggregate under GROUPING SETS (the union branches don't share hidden fields).
 - [ ] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
   (`$unset`s the field on every doc), `RENAME COLUMN` (`$rename`s a non-PK field; a PK rename keeps
   the `_id` field and only changes the SQL name), `RENAME TO` (renames the table *and* moves the
