@@ -30,6 +30,7 @@ from secantus.sql import errors, ranges, typemap
 from secantus.sql.catalog import (
     CheckConstraint,
     Column,
+    ExprIndex,
     ForeignKey,
     TableDef,
     UniqueConstraint,
@@ -77,6 +78,10 @@ class CreateIndexPlan:
     # A partial-index predicate (``CREATE INDEX … WHERE …``) lowered to a Mongo
     # filter, passed to storage as ``partialFilterExpression``. None = full index.
     partial_filter: dict[str, Any] | None = None
+    # An expression (functional) index — ``CREATE INDEX … ((expr))``. Carries the
+    # ``ExprIndex`` metadata to register on the table (its hidden ``field`` is the
+    # key indexed by ``key_spec``) and the raw expression SQL to backfill/maintain.
+    expr_index: Any = None  # catalog.ExprIndex | None
 
 
 @dataclass
@@ -1470,21 +1475,60 @@ def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:
     params = index.args.get("params")
     if params is None or not params.args.get("columns"):
         raise errors.feature_not_supported("CREATE INDEX requires a column list")
+    cols = params.args["columns"]
+    name_ident = index.this
     key_spec: dict[str, int] = {}
-    for col in params.args["columns"]:
+    expr_index = None
+    # A single-key expression index (``CREATE INDEX … ((a + b))``) is materialised
+    # into a hidden storage field indexed like a column (see ``catalog.ExprIndex``).
+    if len(cols) == 1 and not isinstance(
+        (cols[0].this if isinstance(cols[0], exp.Ordered) else cols[0]),
+        (exp.Column, exp.Identifier),
+    ):
+        ordered = cols[0] if isinstance(cols[0], exp.Ordered) else None
+        expr_node = ordered.this if ordered is not None else cols[0]
+        while isinstance(expr_node, exp.Paren):
+            expr_node = expr_node.this
+        direction = -1 if (ordered is not None and ordered.args.get("desc")) else 1
+        try:
+            _to_agg_expr(expr_node, table_resolver(table))  # validate it can be evaluated
+        except Exception as exc:  # noqa: BLE001
+            raise errors.feature_not_supported(
+                f"unsupported expression index key: {expr_node.sql()}"
+            ) from exc
+        index_name = name_ident.name if name_ident is not None else f"{table.name}_expr_idx"
+        hidden_field = f"__expr_{index_name}"
+        expr_index = ExprIndex(
+            name=index_name,
+            expr_sql=expr_node.sql(),
+            field=hidden_field,
+            type_tag=_infer_scalar_tag(expr_node, table_resolver(table)),
+            direction=direction,
+        )
+        key_spec = {hidden_field: direction}
+        where = params.args.get("where")
+        partial_filter = (
+            _expr_to_filter(where.this, table_resolver(table), None) if where is not None else None
+        )
+        return CreateIndexPlan(
+            collection=table.collection,
+            name=index_name,
+            key_spec=key_spec,
+            unique=bool(stmt.args.get("unique")),
+            if_not_exists=bool(stmt.args.get("exists")),
+            partial_filter=partial_filter,
+            expr_index=expr_index,
+        )
+    for col in cols:
         ordered = col if isinstance(col, exp.Ordered) else None
         col_node = ordered.this if ordered is not None else col
         if not isinstance(col_node, (exp.Column, exp.Identifier)):
-            # An expression index (``CREATE INDEX … ((a + b))``) can't map to a
-            # storage index over a stored field — faithful not-supported.
             raise errors.feature_not_supported(
-                "expression indexes are not supported (index a stored column, or "
-                "add a GENERATED column and index that)"
+                "a multi-key index mixing expressions and columns is not supported"
             )
         name = _column_name(col_node)
         direction = -1 if (ordered is not None and ordered.args.get("desc")) else 1
         key_spec[table.field_for(name)] = direction
-    name_ident = index.this
     index_name = name_ident.name if name_ident is not None else _default_index_name(key_spec)
     # A partial-index predicate (``WHERE …``) lowers to a Mongo filter.
     where = params.args.get("where")
@@ -2001,6 +2045,27 @@ def _udf_lookup(node: exp.Expression, catalog: Any, db: str | None) -> dict[str,
         return None
 
 
+def rewrite_expr_index_refs(stmt: exp.Select, table: TableDef) -> None:
+    """Rewrite each occurrence of an indexed expression (``ExprIndex.expr_sql``) in
+    the WHERE clause into a reference to that index's hidden field, so the query
+    plans through the normal single-field-index path (the field holds the
+    precomputed value). SELECT / GROUP BY / HAVING / ORDER BY are left untouched:
+    the output shape and grouping stay unaffected, and ORDER BY on the expression
+    already sorts correctly via per-row evaluation on the pipeline path (the hidden
+    field is projected away before a pipeline ``$sort`` could reach it)."""
+    eis = getattr(table, "expr_indexes", None)
+    if not eis:
+        return
+    targets = {ei.expr_sql: ei.field for ei in eis}
+    node = stmt.args.get("where")
+    if node is None:
+        return
+    for n in list(node.find_all(exp.Func, exp.Binary, exp.Paren)):
+        repl = targets.get(n.sql())
+        if repl is not None and n.parent is not None:
+            n.replace(exp.column(repl))
+
+
 def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = None) -> SelectPlan:
     if stmt.args.get("joins"):
         raise errors.feature_not_supported("JOIN is not supported yet")
@@ -2009,6 +2074,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
     if stmt.args.get("distinct"):
         raise errors.feature_not_supported("SELECT DISTINCT is not supported yet")
 
+    rewrite_expr_index_refs(stmt, table)
     filt = _where_filter(stmt, table, subctx)
     order = _order_terms(stmt, table)
     limit, skip = _limit_skip(stmt)
@@ -3162,6 +3228,10 @@ def _plan_pipeline_select(
     # (materialized into an ephemeral collection by the executor).
     derived: list[DerivedTable] = []
     _alias, table = _resolve_source(from_node.this, db, catalog, storage, derived)
+
+    # Route a WHERE / ORDER BY on an indexed expression onto its hidden field so the
+    # leading ``$match`` / sort can use the storage index.
+    rewrite_expr_index_refs(stmt, table)
 
     # Computed GROUP BY keys (``GROUP BY lower(name)`` / ``x + 1`` / ``ROLLUP(lower(x))``)
     # — rewrite each into a synthetic column materialised by a pre-``$group``

@@ -3168,8 +3168,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   scanning the catalog and calls `drop_index` (`42704` when absent). Indexes now reflect back
   through `get_indexes` / `Table(autoload_with=…).indexes` (the populated `pg_index` virtual
   table — `indkey`/`indclass`/`indoption` are typed as `int2vector`/`oidvector` so a libpq
-  client renders them as the space-separated text its catalog reflection parses). Still
-  missing: `ALTER TABLE` and partial/expression index options via SQL.
+  client renders them as the space-separated text its catalog reflection parses). **Partial
+  indexes** (`CREATE INDEX … WHERE …`) and **expression indexes** (`CREATE INDEX … ((expr))`)
+  are both supported. Expression indexes materialise the expression into a hidden
+  `__expr_<name>` field (registered on the `TableDef` as an `ExprIndex`, recomputed on every
+  write via `_apply_expr_index_fields`, backfilled on create); a matching `WHERE` is rewritten
+  to the hidden field (`rewrite_expr_index_refs`) so it rides the normal single-field-index
+  path (`IXSCAN`); the field is hidden from `SELECT *` / reflection; `DROP INDEX` unregisters
+  the `ExprIndex` and strips the field. `ORDER BY` on the expression is correct but not
+  index-accelerated (the hidden field is projected away before a pipeline `$sort`). Still
+  missing: `ALTER TABLE`-driven index changes.
 - [ ] **Dev-env import shim:** `tests/conftest.py` stubs `wiredtiger` only when the
   extension is absent so the pure SQL/operator tests import without a WT build. Inert in
   CI. Revisit if `secantus/__init__` is made lazy (would let `secantus.sql` import without
