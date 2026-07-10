@@ -3377,7 +3377,7 @@ def _plan_plain_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         project[nm] = f"${path}"
         out_columns.append((nm, tag))
     pipeline: list[dict[str, Any]] = [{"$project": project}]
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, table)
+    _append_sort_limit(pipeline, stmt, out_columns, table)
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
@@ -3480,7 +3480,7 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
         out_columns.append((nm, tag))
     pipeline: list[dict[str, Any]] = [{"$project": project}]
     _append_distinct(pipeline, out_columns)
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, table)
+    _append_sort_limit(pipeline, stmt, out_columns, table)
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
@@ -3895,7 +3895,7 @@ def _plan_grouping_sets_select(
         pipeline.append(
             {"$unionWith": {"coll": table.collection, "pipeline": prefix + add_stage + sub}}
         )
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, table)
+    _append_sort_limit(pipeline, stmt, out_columns, table)
     return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
 
 
@@ -4073,7 +4073,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, table)
+    _append_sort_limit(pipeline, stmt, out_columns, table)
     return PipelineSelectPlan(
         table.collection,
         base_filter,
@@ -5296,7 +5296,7 @@ def _plan_join_group_select(
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
-    _append_sort_limit(pipeline, stmt, {n for n, _ in out_columns}, amap=amap)
+    _append_sort_limit(pipeline, stmt, out_columns, amap=amap)
     return PipelineSelectPlan(
         base.collection,
         {},
@@ -6369,30 +6369,56 @@ def _append_distinct(pipeline: list[dict[str, Any]], out_columns: list[tuple[str
     pipeline.append({"$project": project})
 
 
+def _resolve_order_output(
+    node: exp.Expression, stmt: exp.Expression, out_columns: list[tuple[str, str]]
+) -> str:
+    """Resolve a pipeline ORDER BY term to an output column name. Handles a
+    positional reference (``ORDER BY 2`` → the 2nd select item), an expression that
+    matches a SELECT-list item (``ORDER BY count(*)`` when ``count(*)`` is selected —
+    select items and ``out_columns`` are 1:1 in order on the pipeline paths), and a
+    plain column name. Postgres resolves ORDER BY against output columns like this."""
+    if isinstance(node, exp.Literal) and node.is_int:
+        idx = int(node.this)
+        if not 1 <= idx <= len(out_columns):
+            raise errors.SQLError("42P10", f"ORDER BY position {idx} is not in select list")
+        return out_columns[idx - 1][0]
+    if not isinstance(node, exp.Column):
+        target = node.sql()
+        selects = stmt.expressions
+        for i, sel in enumerate(selects):
+            inner = sel.this if isinstance(sel, exp.Alias) else sel
+            if i < len(out_columns) and inner.sql() == target:
+                return out_columns[i][0]
+    return _column_name(node)
+
+
 def _append_sort_limit(
     pipeline: list[dict[str, Any]],
     stmt: exp.Expression,
-    valid_names: set[str],
+    out_columns: list[tuple[str, str]],
     table: TableDef | None = None,
     amap: dict[str, tuple[str, TableDef]] | None = None,
 ) -> None:
+    valid_names = {n for n, _ in out_columns}
     order = stmt.args.get("order")
     if order is not None:
         terms: list[tuple[str, int, bool]] = []
         enum_labels: dict[str, list[str]] = {}
         for o in order.expressions:
-            col = _column_name(o.this)
+            col = _resolve_order_output(o.this, stmt, out_columns)
             if col not in valid_names:
                 raise errors.undefined_column(col)
             terms.append((col, -1 if o.args.get("desc") else 1, _nulls_first(o)))
             # Resolve the source column (single-table via `table`, or across a
-            # join's alias map) so an enum column sorts by its declared order.
-            src = _column_for_order_node(o.this, amap) if amap is not None else None
-            if src is None and table is not None:
-                src = table.column(col)
-            labels = _enum_labels_for_column(src)
-            if labels is not None:
-                enum_labels[col] = labels
+            # join's alias map) so an enum column sorts by its declared order. Only
+            # a plain-column ORDER BY term has a source column for enum ordering.
+            if isinstance(o.this, exp.Column):
+                src = _column_for_order_node(o.this, amap) if amap is not None else None
+                if src is None and table is not None:
+                    src = table.column(col)
+                labels = _enum_labels_for_column(src)
+                if labels is not None:
+                    enum_labels[col] = labels
         _emit_pipeline_sort(pipeline, terms, enum_labels)
     limit, skip = _limit_skip(stmt)
     if skip:

@@ -345,3 +345,70 @@ def test_having_distinct_reuses_select_aggregate(storage, session):
         "HAVING count(DISTINCT x) > 1 ORDER BY g",
     )
     assert res.rows == [("a", 2)]
+
+
+# -- ORDER BY position / aggregate in grouped queries ------------------------ #
+
+
+def test_order_by_position_grouped(storage, session):
+    # ORDER BY 1 = the first select column (region); ORDER BY 2 = the count.
+    _sales(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT region, count(*) FROM sales GROUP BY region ORDER BY 1",
+    )
+    assert res.rows == [("east", 2), ("west", 2)]
+
+
+def test_order_by_position_desc_with_tiebreak(storage, session):
+    _sales(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT region, sum(amount) FROM sales GROUP BY region ORDER BY 2 DESC, 1",
+    )
+    # east sum=30, west sum=35 → west first.
+    assert res.rows == [("west", 35), ("east", 30)]
+
+
+def test_order_by_aggregate_expression(storage, session):
+    # ORDER BY count(*) resolves to the matching select-list aggregate output.
+    _sales(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT region, sum(amount) FROM sales GROUP BY region ORDER BY sum(amount) DESC",
+    )
+    assert res.rows == [("west", 35), ("east", 30)]
+
+
+def test_order_by_position_out_of_range(storage, session):
+    _sales(storage, session)
+    with pytest.raises(SQLError) as ei:
+        q(storage, session, "SELECT region, count(*) FROM sales GROUP BY region ORDER BY 5")
+    assert ei.value.sqlstate == "42P10"
+
+
+def test_order_by_position_over_join(storage, session):
+    _sales(storage, session)
+    q(storage, session, "CREATE TABLE reg (region text primary key, tz text)")
+    q(storage, session, "INSERT INTO reg (region, tz) VALUES ('east', 'ET'), ('west', 'PT')")
+    res = q(
+        storage,
+        session,
+        "SELECT r.tz, sum(s.amount) FROM sales s JOIN reg r ON s.region = r.region "
+        "GROUP BY r.tz ORDER BY 2 DESC",
+    )
+    assert res.rows == [("PT", 35), ("ET", 30)]
+
+
+def test_order_by_position_rollup(storage, session):
+    _sales(storage, session)
+    res = q(
+        storage,
+        session,
+        "SELECT region, count(*) FROM sales GROUP BY ROLLUP(region) ORDER BY 1",
+    )
+    # ORDER BY 1 sorts region; the grand-total row (NULL region) sorts last.
+    assert res.rows == [("east", 2), ("west", 2), (None, 4)]
