@@ -1447,7 +1447,7 @@ diff-based concurrent swap.
 
 Define a `LANGUAGE sql` function and call it anywhere an expression is allowed:
 
-```sql
+```postgresql
 CREATE FUNCTION add(a int, b int) RETURNS int AS $$ SELECT a + b $$ LANGUAGE sql;
 SELECT add(2, 3);                          -- 5
 SELECT id, add(v, 100) FROM t;             -- called per row
@@ -2775,7 +2775,7 @@ response, not delivered asynchronously mid-idle).
 The SQL-level prepared-statement commands parse a query once and rerun it with
 different argument values:
 
-```sql
+```postgresql
 PREPARE by_id (int) AS SELECT name FROM users WHERE id = $1;
 EXECUTE by_id (42);
 EXECUTE by_id (99);
