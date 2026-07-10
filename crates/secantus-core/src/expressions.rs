@@ -271,6 +271,22 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$pow" => op_pow(arg, ctx),
         "$round" => op_round(arg, ctx),
         "$trunc" => op_trunc(arg, ctx),
+        // trig (int/long/double -> Double via libm, matching Python `math`
+        // bit-for-bit on-platform like $exp/$ln; bool / Decimal128 / domain
+        // violations defer to the Python oracle)
+        "$sin" => op_trig(arg, ctx, Trig::Sin),
+        "$cos" => op_trig(arg, ctx, Trig::Cos),
+        "$tan" => op_trig(arg, ctx, Trig::Tan),
+        "$asin" => op_trig(arg, ctx, Trig::Asin),
+        "$acos" => op_trig(arg, ctx, Trig::Acos),
+        "$atan" => op_trig(arg, ctx, Trig::Atan),
+        "$atan2" => op_atan2(arg, ctx),
+        "$sinh" => op_trig(arg, ctx, Trig::Sinh),
+        "$cosh" => op_trig(arg, ctx, Trig::Cosh),
+        "$tanh" => op_trig(arg, ctx, Trig::Tanh),
+        "$asinh" => op_trig(arg, ctx, Trig::Asinh),
+        "$acosh" => op_trig(arg, ctx, Trig::Acosh),
+        "$atanh" => op_trig(arg, ctx, Trig::Atanh),
         // bitwise (int / long operands; a bool / double / other defers to Python,
         // whose exact type-error message is the oracle)
         "$bitAnd" => op_bit_fold(arg, ctx, BitOp::And),
@@ -1430,6 +1446,100 @@ fn op_deg_rad(arg: &Bson, ctx: &Ctx, to_rad: bool) -> R {
     } else {
         x * 180.0 / std::f64::consts::PI
     }))
+}
+
+#[derive(Clone, Copy)]
+enum Trig {
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+}
+
+/// Unary trig. int/long/double -> Double; null -> null; bool / Decimal128 /
+/// non-numeric -> Python (which raises `Location28765`). Domain / finiteness
+/// violations also defer (Python raises `Location50989`). Mirrors the
+/// `_make_trig` factory in `expressions.py`.
+fn op_trig(arg: &Bson, ctx: &Ctx, kind: Trig) -> R {
+    use Trig::*;
+    let x = match eval(arg, ctx)? {
+        Bson::Null => return Ok(Bson::Null),
+        Bson::Int32(n) => n as f64,
+        Bson::Int64(n) => n as f64,
+        Bson::Double(d) => d,
+        _ => return Err(Fallback), // bool / Decimal128 / non-numeric -> Python
+    };
+    let bad = match kind {
+        Sin | Cos | Tan => !x.is_finite(),
+        Asin | Acos | Atanh => !(-1.0..=1.0).contains(&x),
+        Acosh => x < 1.0,
+        _ => false, // atan / sinh / cosh / tanh / asinh accept every finite + inf
+    };
+    if bad {
+        return Err(Fallback);
+    }
+    if matches!(kind, Atanh) {
+        // atanh(±1) = ±inf (Python special-cases to dodge a math domain error).
+        if x.abs() == 1.0 {
+            return Ok(Bson::Double(if x > 0.0 {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            }));
+        }
+        // libm (and CPython `math.atanh` / mongod) compute atanh with exact odd
+        // symmetry; Rust's `f64::atanh` is off by 1 ULP for some negative inputs,
+        // so force the symmetry to keep the three servers bit-for-bit.
+        return Ok(Bson::Double(if x < 0.0 {
+            -((-x).atanh())
+        } else {
+            x.atanh()
+        }));
+    }
+    Ok(Bson::Double(match kind {
+        Sin => x.sin(),
+        Cos => x.cos(),
+        Tan => x.tan(),
+        Asin => x.asin(),
+        Acos => x.acos(),
+        Atan => x.atan(),
+        Sinh => x.sinh(),
+        Cosh => x.cosh(),
+        Tanh => x.tanh(),
+        Asinh => x.asinh(),
+        Acosh => x.acosh(),
+        Atanh => unreachable!("handled above"),
+    }))
+}
+
+/// `$atan2`: [y, x] -> atan2(y, x). Null if either arg is null; bool /
+/// Decimal128 / non-numeric defers (Python raises `Location51044`).
+fn op_atan2(arg: &Bson, ctx: &Ctx) -> R {
+    let vals = eval_args(arg, ctx)?;
+    if vals.len() != 2 {
+        return Err(Fallback);
+    }
+    if is_null(&vals[0]) || is_null(&vals[1]) {
+        return Ok(Bson::Null);
+    }
+    let extract = |b: &Bson| match b {
+        Bson::Int32(n) => Some(*n as f64),
+        Bson::Int64(n) => Some(*n as f64),
+        Bson::Double(d) => Some(*d),
+        _ => None,
+    };
+    let (Some(y), Some(x)) = (extract(&vals[0]), extract(&vals[1])) else {
+        return Err(Fallback);
+    };
+    Ok(Bson::Double(y.atan2(x)))
 }
 
 /// Evaluate an optional sub-expression; a missing key behaves like Python's
@@ -3523,6 +3633,37 @@ mod tests {
             &Document::new()
         )
         .is_err());
+    }
+
+    #[test]
+    fn trig() {
+        assert_eq!(ev(doc! {}, bson::bson!({"$sin": 0})), Bson::Double(0.0));
+        assert_eq!(ev(doc! {}, bson::bson!({"$cos": 0})), Bson::Double(1.0_f64));
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$asin": 1})),
+            Bson::Double(std::f64::consts::FRAC_PI_2)
+        );
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$atan2": [1, 1]})),
+            Bson::Double(std::f64::consts::FRAC_PI_4)
+        );
+        // atanh(±1) -> ±inf (not a domain error).
+        assert_eq!(
+            ev(doc! {}, bson::bson!({"$atanh": 1})),
+            Bson::Double(f64::INFINITY)
+        );
+        // null -> null.
+        assert_eq!(ev(doc! {}, bson::bson!({"$sin": Bson::Null})), Bson::Null);
+        // Domain / type violations defer to Python.
+        for expr in [
+            bson::bson!({"$asin": 5}),            // out of [-1,1]
+            bson::bson!({"$acosh": 0.5}),         // < 1
+            bson::bson!({"$sin": f64::INFINITY}), // non-finite
+            bson::bson!({"$cos": "hi"}),          // non-numeric
+            bson::bson!({"$atan2": ["hi", 1]}),   // atan2 non-numeric
+        ] {
+            assert!(evaluate(&doc! {}, &expr, &Document::new()).is_err());
+        }
     }
 
     #[test]

@@ -270,6 +270,38 @@ CURATED = [
     ({"$degreesToRadians": 45}, {}),
     ({"$radiansToDegrees": 1}, {}),
     ({"$radiansToDegrees": "$x"}, {}),  # missing -> null
+    # Trig family (libm: Rust f64 and CPython math share the platform libm, so
+    # they agree bit-for-bit; Decimal128 / bool / domain violations defer).
+    ({"$sin": 0}, {}),
+    ({"$sin": 1}, {}),
+    ({"$sin": 0.5}, {}),
+    ({"$cos": 1}, {}),
+    ({"$tan": 0.5}, {}),
+    ({"$asin": 0.5}, {}),
+    ({"$asin": 1}, {}),
+    ({"$acos": -0.5}, {}),
+    ({"$atan": 3.14159}, {}),
+    ({"$atan2": [1, 1]}, {}),
+    ({"$atan2": [1, 0]}, {}),
+    ({"$atan2": [0, 0]}, {}),
+    ({"$sinh": 1}, {}),
+    ({"$cosh": 0.5}, {}),
+    ({"$tanh": 2}, {}),
+    ({"$asinh": 1}, {}),
+    ({"$acosh": 2}, {}),
+    ({"$acosh": 1}, {}),
+    ({"$atanh": 0.5}, {}),
+    ({"$atanh": -0.5}, {}),  # negative: Rust f64::atanh is off by 1 ULP -> forced odd symmetry
+    ({"$atanh": -0.9}, {}),
+    ({"$atanh": 1}, {}),  # -> inf
+    ({"$atanh": -1}, {}),  # -> -inf
+    ({"$sin": None}, {}),  # null -> null
+    ({"$sin": "$x"}, {}),  # missing -> null
+    ({"$asin": 5}, {}),  # out of [-1,1] -> defer
+    ({"$acosh": 0.5}, {}),  # < 1 -> defer
+    ({"$cos": "hi"}, {}),  # non-numeric -> defer
+    ({"$sin": True}, {}),  # bool -> defer
+    ({"$atan2": ["hi", 1]}, {}),  # atan2 non-numeric -> defer
     # $map referencing a ROOT field path inside `in` ($$CURRENT stays ROOT).
     ({"$map": {"input": [1, 2], "in": {"$add": ["$$this", "$base"]}}}, {"base": 100}),
     # Date component extractors.

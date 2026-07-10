@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from secantus.expressions import ExpressionError, evaluate
@@ -783,3 +785,42 @@ def test_convert_to_date_from_string() -> None:
 
     out = evaluate({"$convert": {"input": "2026-04-28T12:00:00", "to": "date"}}, {})
     assert out == dt.datetime(2026, 4, 28, 12, 0, 0)
+
+
+def test_trig_basic() -> None:
+    assert evaluate({"$sin": 0}, {}) == 0.0
+    assert evaluate({"$cos": 0}, {}) == 1.0
+    assert evaluate({"$asin": 1}, {}) == math.pi / 2
+    assert evaluate({"$atan2": [1, 1]}, {}) == math.pi / 4
+    assert evaluate({"$acosh": 1}, {}) == 0.0
+
+
+def test_trig_atanh_edges() -> None:
+    assert evaluate({"$atanh": 1}, {}) == math.inf
+    assert evaluate({"$atanh": -1}, {}) == -math.inf
+
+
+def test_trig_null_propagation() -> None:
+    assert evaluate({"$sin": None}, {}) is None
+    assert evaluate({"$sin": "$missing"}, {}) is None
+    assert evaluate({"$atan2": [None, 1]}, {}) is None
+
+
+def test_trig_domain_errors() -> None:
+    for expr in ({"$asin": 5}, {"$acos": -2}, {"$acosh": 0.5}, {"$atanh": 2}):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == 50989
+    # sin/cos/tan reject non-finite.
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$sin": math.inf}, {})
+    assert exc.value.code == 50989
+
+
+def test_trig_type_errors() -> None:
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$sin": "hi"}, {})
+    assert exc.value.code == 28765
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$atan2": ["hi", 1]}, {})
+    assert exc.value.code == 51044
