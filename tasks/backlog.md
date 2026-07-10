@@ -2156,8 +2156,10 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   rest of the pipeline; `_plan_join_group_window_select` dropped its former rejection. **A correlated /
   subquery HAVING now works** (b206): a HAVING with a subquery routes to the group-window evaluated
   path, its aggregates rewritten to their computed fields and the predicate carried as a post-group
-  residual (`_outer_agg_nodes` skips aggregates inside the subquery). Still `0A000`: function calls
-  inside a comparison used as a *pushdown* filter, and `<@`-style structural predicates.
+  residual (`_outer_agg_nodes` skips aggregates inside the subquery). A function-call comparison
+  used as a *pushdown* filter (`WHERE amt = abs(target)`) works in GROUP BY / JOIN pipelines too (it
+  rides the shared `_expr_to_filter` / `_to_agg_expr` lowering, same as the single-table path; an
+  unlowerable function like `substr` stays `0A000`). Still `0A000`: `<@`-style structural predicates.
 - [ ] **`RETURNING` landed** (b46). `INSERT` / `UPDATE` / `DELETE … RETURNING <proj>` projects the
   affected rows back as a result set (`planner._returning_columns` reuses the SELECT projection
   vocabulary `_out_columns`: `*`, columns, aliases, jsonb nav). `execute_insert` pins an `_id` on
@@ -2240,9 +2242,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   **Window + `GROUP BY` + `JOIN` landed** (b73): `_plan_join_group_window_select` is the join analogue —
   it builds the `$lookup`/`$unwind`/`$match`/`$group`/`$project` pipeline (group keys + aggregates
   resolved through the join resolver), then the same window phase runs over the grouped rows. The shared
-  tail (`_finish_group_window`) is factored out of both planners. **Still `0A000`/unsupported:** numeric
-  `RANGE` offset (needs interval arithmetic on the order key), and the general `ORDER BY <alias>` gap in
-  the plain evaluated (non-group-window) path.
+  tail (`_finish_group_window`) is factored out of both planners. **Numeric `RANGE` offset frames
+  landed** (b208): `n PRECEDING` / `n FOLLOWING` with a numeric offset is a value window over the
+  sorted order key (`window._range_offset_bound`, computed in a direction-normalised key space so ASC
+  and DESC share one comparison); Postgres' single-ORDER-BY-column requirement is enforced, a negative
+  offset is `22013`, and a non-numeric (interval) offset stays `0A000`. **`ORDER BY <output-alias>`
+  landed everywhere** (b208): the simple pushdown path resolves a standalone output alias to its input
+  column (`_rewrite_order_by_aliases`, a real column of the same name wins per Postgres precedence);
+  the evaluated / group-window paths already resolved aliases.
 - [ ] **`INSERT … ON CONFLICT` landed** (b52). `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET …
   [WHERE …]` via `planner._plan_on_conflict` (an `OnConflict` on `InsertPlan`) + `executor.
   _execute_insert_on_conflict`: each proposed row probes the conflict target with `find_matching`; a
@@ -2449,8 +2456,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   NULL for avg/min/max — the aggregate engine skips NULL there). Threaded through every accumulator site:
   single-table `$group`, GROUPING SETS, JOIN+GROUP, and the HAVING / ORDER BY resolvers (the HAVING
   comparison matcher recognises `exp.Filter` as the aggregate side). A lone `count(*) FILTER (...)` is
-  kept off the simple-find fast path so the filter isn't dropped. **Not supported (→ `0A000`):** `FILTER`
-  on `array_agg` / `string_agg` (a `$push` can't drop non-matching rows cleanly), and with `DISTINCT`.
+  kept off the simple-find fast path so the filter isn't dropped. **`FILTER` on the `$push` aggregates
+  landed** (b208): `array_agg` / `string_agg` / `jsonb_object_agg` push a `None` sentinel for
+  non-matching rows (`_push_filtered`) and drop it in the post-`$group` projection (`_array_agg_project`
+  / `_jsonb_object_agg_project`; `string_agg`'s reduce already skips nulls) — across single-table,
+  GROUPING SETS, and JOIN+GROUP paths. array_agg boxes matching values as `{v}` so a matching NULL
+  survives the drop. **Not supported (→ `0A000`):** `FILTER` with `DISTINCT`, or with an in-aggregate
+  `ORDER BY` (the sorted-push path would need the sentinel threaded through the executor finish).
 - [ ] **`ALTER DOMAIN` landed** (b125): `ADD [CONSTRAINT c] CHECK (…) [NOT VALID]`, `DROP CONSTRAINT
   [IF EXISTS] c`, `SET DEFAULT expr` / `DROP DEFAULT`, `SET NOT NULL` / `DROP NOT NULL`, and `RENAME TO
   new`. Handled in `engine._alter_domain_command` (Command-parsed; catalog `update_domain`). `ADD …

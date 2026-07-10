@@ -1704,9 +1704,19 @@ HAVING count(*) FILTER (WHERE active) >= 1;                    -- in HAVING
 `FILTER` works on `count` / `sum` / `avg` / `min` / `max` / `bool_and` / `bool_or`
 in the SELECT list (grouped, whole-table, and over a JOIN) and in `HAVING`. It
 lowers to a `$cond` inside the accumulator (a non-matching row donates the neutral
-element — `0` for sum/count, NULL for avg/min/max). The condition supports
-comparisons, `AND` / `OR` / `NOT`, and `IS [NOT] NULL`. Not supported: `FILTER` on
-`array_agg` / `string_agg`, or combined with `DISTINCT` (both `0A000`).
+element — `0` for sum/count, NULL for avg/min/max). It also works on the
+collecting aggregates `array_agg` / `string_agg` / `jsonb_object_agg` (a
+non-matching row is dropped from the collected array/string/object; a *matching*
+`NULL` is still kept by `array_agg`, per Postgres):
+
+```sql
+SELECT dept, array_agg(sal) FILTER (WHERE active) FROM emp GROUP BY dept;
+SELECT string_agg(dept, ',') FILTER (WHERE active) FROM emp;
+```
+
+The condition supports comparisons, `AND` / `OR` / `NOT`, and `IS [NOT] NULL`. Not
+supported (both `0A000`): `FILTER` combined with `DISTINCT`, or with an in-call
+`ORDER BY` (`array_agg(x ORDER BY y) FILTER (…)`).
 
 `DISTINCT` inside an aggregate is supported for `COUNT` / `SUM` / `AVG` (and is a
 no-op for `MIN` / `MAX`, which are unaffected by duplicates). It deduplicates the
@@ -2010,8 +2020,11 @@ FROM sales;
 
 Explicit frames are supported — `ROWS` frames with any
 `UNBOUNDED` / `CURRENT ROW` / `n PRECEDING` / `n FOLLOWING` bound, and `RANGE`
-frames with `UNBOUNDED` / `CURRENT ROW` bounds (a numeric `RANGE` offset is
-rejected — use `ROWS`):
+frames with `UNBOUNDED` / `CURRENT ROW` bounds *and* a numeric `n PRECEDING` /
+`n FOLLOWING` offset (a row is in-frame when its `ORDER BY` key is within `n` of
+the current row's key — a value window, not a row count; Postgres requires exactly
+one `ORDER BY` column for an offset `RANGE` frame, and a non-numeric/interval
+offset is not supported):
 
 ```sql
 SELECT id,
@@ -3138,10 +3151,10 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`; target by column list or `ON CONSTRAINT <name>`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | — |
 | Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
 | CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE`/`MERGE` (incl. `WITH RECURSIVE` before a write); data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE … RETURNING …)`) | statement-level snapshot semantics; `WITH CHECK OPTION` |
-| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (both directions; `field <@ const` runs residual)/`?`/`?\|`/`?&`, column-to-column + arithmetic, `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | correlated subqueries with an outer JOIN/GROUP BY, function calls in a comparison |
+| `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (both directions; `field <@ const` runs residual)/`?`/`?\|`/`?&`, column-to-column + arithmetic, function calls in a comparison (`amt = abs(target)`, single-table + GROUP BY / JOIN pipelines), `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | a comparison function the aggregation engine can't lower (e.g. `substr`) |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) (select list *and* `HAVING`, single-table + JOIN), an **expression over an aggregate** (`sum(x)+1`, `round(avg(x),2)`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table) + the `GROUPING()` super-aggregate helper | `GROUPING SETS` over a JOIN / with HAVING, a **computed GROUP BY key** (`GROUP BY lower(name)`) |
-| Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` (`UNBOUNDED`/`CURRENT ROW`) | numeric `RANGE` offset, window + `GROUP BY` in one SELECT |
+| Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` frames (`UNBOUNDED`/`CURRENT ROW` **and** numeric `n PRECEDING`/`n FOLLOWING` offsets) | non-numeric/interval `RANGE` offset |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql`, single-statement body), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, `LANGUAGE plpgsql` / multi-statement functions |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (real nested rollback), two-phase commit `PREPARE TRANSACTION` / `COMMIT`/`ROLLBACK PREPARED` (cross-connection, `pg_prepared_xacts`) | prepared xacts surviving a restart, two-phase over the extended protocol |

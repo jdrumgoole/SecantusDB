@@ -2,9 +2,11 @@
 
 ``agg(...) FILTER (WHERE cond)`` contributes only rows satisfying ``cond`` to the
 aggregate. Lowered to a ``$cond`` inside each accumulator (neutral element 0 for
-sum/count, NULL for avg/min/max). Works in the SELECT list (grouped, joined, and
-no-GROUP-BY), and in HAVING. Not supported on array_agg / string_agg or with
-DISTINCT.
+sum/count, NULL for avg/min/max). The ``$push``-based aggregates
+(``array_agg`` / ``string_agg`` / ``jsonb_object_agg``) push a ``None`` sentinel
+for non-matching rows and drop it in the post-``$group`` projection. Works in the
+SELECT list (grouped, joined, and no-GROUP-BY), and in HAVING. Not supported with
+DISTINCT or an in-aggregate ORDER BY.
 """
 
 from __future__ import annotations
@@ -198,16 +200,65 @@ def test_having_filter_over_join(joined, session):
     assert rows == [("y",)]  # x filtered-sum=100, y=300
 
 
+# -- FILTER on the $push aggregates ------------------------------------------ #
+
+
+def test_filter_on_array_agg(emp, session):
+    rows = run(
+        emp,
+        session,
+        "SELECT dept, array_agg(sal) FILTER (WHERE active) FROM emp GROUP BY dept ORDER BY dept",
+    ).rows
+    assert rows == [("a", [100, 300]), ("b", [400])]
+
+
+def test_filter_on_array_agg_keeps_matching_nulls(emp, session):
+    # Postgres array_agg keeps NULL values of *matching* rows; only non-matching
+    # rows are dropped.
+    run(emp, session, "INSERT INTO emp VALUES (6,'a',NULL,70,true)")
+    rows = run(
+        emp,
+        session,
+        "SELECT array_agg(sal) FILTER (WHERE active) FROM emp WHERE dept='a'",
+    ).rows
+    assert rows == [([100, 300, None],)]
+
+
+def test_filter_on_string_agg(emp, session):
+    # active rows are a(1), a(3), b(4) → depts 'a','a','b'.
+    rows = run(emp, session, "SELECT string_agg(dept, ',') FILTER (WHERE active) FROM emp").rows
+    assert rows == [("a,a,b",)]
+
+
+def test_filter_on_jsonb_object_agg(emp, session):
+    rows = run(
+        emp,
+        session,
+        "SELECT dept, jsonb_object_agg(id, sal) FILTER (WHERE age > 40) "
+        "FROM emp GROUP BY dept ORDER BY dept",
+    ).rows
+    assert rows == [("a", {"2": 200, "3": 300}), ("b", {"4": 400})]
+
+
+def test_filter_on_array_agg_over_join(emp, session):
+    run(emp, session, "CREATE TABLE dept (name text PRIMARY KEY, region text)")
+    run(emp, session, "INSERT INTO dept VALUES ('a','west'), ('b','east')")
+    rows = run(
+        emp,
+        session,
+        "SELECT d.region, array_agg(e.sal) FILTER (WHERE e.active) "
+        "FROM emp e JOIN dept d ON e.dept = d.name GROUP BY d.region ORDER BY d.region",
+    ).rows
+    assert rows == [("east", [400]), ("west", [100, 300])]
+
+
 # -- unsupported -------------------------------------------------------------- #
 
 
-def test_filter_on_array_agg_unsupported(emp, session):
-    assert sqlstate(emp, session, "SELECT array_agg(sal) FILTER (WHERE active) FROM emp") == "0A000"
-
-
-def test_filter_on_string_agg_unsupported(emp, session):
+def test_filter_on_array_agg_with_order_by_unsupported(emp, session):
+    # FILTER combined with an in-aggregate ORDER BY isn't supported yet.
     assert (
-        sqlstate(emp, session, "SELECT string_agg(dept, ',') FILTER (WHERE active) FROM emp")
+        sqlstate(emp, session, "SELECT array_agg(sal ORDER BY sal) FILTER (WHERE active) FROM emp")
         == "0A000"
     )
 

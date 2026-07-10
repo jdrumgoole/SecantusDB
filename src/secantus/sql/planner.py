@@ -1804,6 +1804,36 @@ def _nulls_first(o: exp.Ordered) -> bool:
     return bool(nf) if nf is not None else bool(o.args.get("desc"))
 
 
+def _rewrite_order_by_aliases(stmt: exp.Select, table: TableDef) -> None:
+    """In the simple pushdown path an ORDER BY may name a SELECT output alias
+    (``SELECT a AS s … ORDER BY s``). Postgres resolves a *standalone* output alias
+    to its select-list expression; on this path that expression is always a plain
+    input column (a computed alias like ``a + b AS s`` would have routed to the
+    evaluated path instead). Rewrite each such bare ORDER BY column to its
+    underlying input column so ``_order_terms`` / ``_enum_order_map`` /
+    ``_citext_order_set`` resolve it — but only when no real base column of that
+    name exists, since a real column of the same name wins (Postgres precedence)."""
+    order = stmt.args.get("order")
+    if order is None:
+        return
+    alias_cols = {
+        e.alias: e.this
+        for e in stmt.expressions
+        if isinstance(e, exp.Alias) and isinstance(e.this, exp.Column)
+    }
+    if not alias_cols:
+        return
+    for o in order.expressions:
+        term = o.this
+        if (
+            isinstance(term, exp.Column)
+            and not term.table
+            and table.column(term.name) is None
+            and term.name in alias_cols
+        ):
+            o.set("this", alias_cols[term.name].copy())
+
+
 def _order_terms(stmt: exp.Expression, table: TableDef) -> list[tuple[str, int, bool]]:
     """ORDER BY lowered to ``(field_path, direction, nulls_first)`` triples — the
     single-table / correlated form, realized by a Postgres-semantics Python sort
@@ -2075,6 +2105,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
         raise errors.feature_not_supported("SELECT DISTINCT is not supported yet")
 
     rewrite_expr_index_refs(stmt, table)
+    _rewrite_order_by_aliases(stmt, table)
     filt = _where_filter(stmt, table, subctx)
     order = _order_terms(stmt, table)
     limit, skip = _limit_skip(stmt)
@@ -2943,6 +2974,41 @@ def _string_agg_project(fname: str, sep: str) -> dict[str, Any]:
     }
 
 
+def _push_filtered(value_expr: Any, fcond: Any, *, wrap: bool = False) -> Any:
+    """A ``$push`` element honouring ``FILTER (WHERE cond)``: a non-matching row
+    pushes ``None`` (dropped by the paired projection / reduce). ``wrap=True`` boxes
+    the value as ``{"v": …}`` so a *matching* NULL survives the drop (Postgres
+    ``array_agg`` keeps NULLs; ``string_agg`` / ``jsonb_object_agg`` skip them, so
+    they push the bare value and let ``None`` double as "absent")."""
+    if fcond is None:
+        return value_expr
+    return {"$cond": [fcond, ({"v": value_expr} if wrap else value_expr), None]}
+
+
+def _array_agg_project(fname: str, fcond: Any) -> Any:
+    """The projection for an ``array_agg`` field. Without a FILTER the pushed array
+    is emitted as-is; with one, drop the ``None`` sentinels and unbox the ``{v}``
+    wrappers (so matching NULLs are preserved)."""
+    if fcond is None:
+        return f"${fname}"
+    return {
+        "$map": {
+            "input": {"$filter": {"input": f"${fname}", "as": "e", "cond": {"$ne": ["$$e", None]}}},
+            "as": "e",
+            "in": "$$e.v",
+        }
+    }
+
+
+def _jsonb_object_agg_project(fname: str, fcond: Any) -> Any:
+    """``$arrayToObject`` over a ``jsonb_object_agg`` field, dropping the ``None``
+    sentinels a FILTER leaves behind."""
+    src: Any = f"${fname}"
+    if fcond is not None:
+        src = {"$filter": {"input": f"${fname}", "as": "e", "cond": {"$ne": ["$$e", None]}}}
+    return {"$arrayToObject": src}
+
+
 def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
     """If ``node`` is ``array_agg(<arg>)`` — or ``jsonb_agg`` / ``json_agg``, which
     build the same ``$push`` array and are likewise typed ``json`` here — return its
@@ -3014,15 +3080,18 @@ def _jsonb_object_agg_args(
     return None
 
 
-def _jsonb_object_agg_push(key: exp.Expression, val: exp.Expression, table: TableDef) -> dict:
+def _jsonb_object_agg_push(
+    key: exp.Expression, val: exp.Expression, table: TableDef, fcond: Any = None
+) -> dict:
     """The ``$push`` accumulator for ``jsonb_object_agg`` — a ``{k, v}`` pair per row
-    (key coerced to a string, per Postgres' text object keys)."""
-    return {
-        "$push": {
-            "k": {"$toString": _agg_arg_to_expr(key, table)},
-            "v": _agg_arg_to_expr(val, table),
-        }
+    (key coerced to a string, per Postgres' text object keys). With a ``FILTER
+    (WHERE cond)`` (``fcond``), a non-matching row pushes ``None``, dropped by the
+    paired ``_jsonb_object_agg_project`` before ``$arrayToObject``."""
+    pair = {
+        "k": {"$toString": _agg_arg_to_expr(key, table)},
+        "v": _agg_arg_to_expr(val, table),
     }
+    return {"$push": _push_filtered(pair, fcond)}
 
 
 # Ordered-set aggregates: ``<func>(...) WITHIN GROUP (ORDER BY expr)``.
@@ -3747,10 +3816,6 @@ def _grouping_set_branch(
         sagg = _string_agg_arg(e)
         agg = _aggregate_of(e)
         where = _agg_filter_where(e)
-        if (arr_arg is not None or sagg is not None or oagg is not None) and where is not None:
-            raise errors.feature_not_supported(
-                "FILTER (WHERE ...) is not supported on array_agg / string_agg / jsonb_object_agg"
-            )
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if grp is not None:
             for c in grp:
@@ -3760,17 +3825,19 @@ def _grouping_set_branch(
             out_columns.append((fname, "int4"))
         elif arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
-            accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
-            project[fname] = f"${fname}"
+            accumulators[fname] = {
+                "$push": _push_filtered(_agg_arg_to_expr(arr_arg, table), fcond, wrap=True)
+            }
+            project[fname] = _array_agg_project(fname, fcond)
             out_columns.append((fname, "json"))
         elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
-            accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table)
-            project[fname] = {"$arrayToObject": f"${fname}"}
+            accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table, fcond)
+            project[fname] = _jsonb_object_agg_project(fname, fcond)
             out_columns.append((fname, "json"))
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
-            accumulators[fname] = {"$push": _agg_arg_to_expr(sagg[0], table)}
+            accumulators[fname] = {"$push": _push_filtered(_agg_arg_to_expr(sagg[0], table), fcond)}
             project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif agg is not None:
@@ -3857,10 +3924,6 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         agg = _aggregate_of(e)
         osa = _ordered_set_agg(e)
         where = _agg_filter_where(e)
-        if (arr_arg is not None or sagg is not None or oagg is not None) and where is not None:
-            raise errors.feature_not_supported(
-                "FILTER (WHERE ...) is not supported on array_agg / string_agg / jsonb_object_agg"
-            )
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if grp is not None:
             # Plain GROUP BY: every argument is grouped, so GROUPING() is always 0.
@@ -3871,8 +3934,8 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             out_columns.append((fname, "int4"))
         elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
-            accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table)
-            project[fname] = {"$arrayToObject": f"${fname}"}
+            accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table, fcond)
+            project[fname] = _jsonb_object_agg_project(fname, fcond)
             out_columns.append((fname, "json"))
         elif ragg is not None:
             fname = names.fresh(alias or "range_agg")
@@ -3898,23 +3961,36 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             fname = names.fresh(alias or "array_agg")
             value_node, terms = _agg_order_spec(arr_arg)
             if terms:  # array_agg(x ORDER BY …): push {v, k}, executor sorts
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with an in-aggregate ORDER BY is not supported"
+                    )
                 accumulators[fname] = _sorted_agg_push(value_node, terms, table)
                 post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+                project[fname] = f"${fname}"
             else:
-                accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
-            project[fname] = f"${fname}"
+                accumulators[fname] = {
+                    "$push": _push_filtered(_agg_arg_to_expr(arr_arg, table), fcond, wrap=True)
+                }
+                project[fname] = _array_agg_project(fname, fcond)
             out_columns.append((fname, "json"))
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
             value_node, terms = _agg_order_spec(sagg[0])
             if terms:  # string_agg(x, sep ORDER BY …): push {v, k}, executor sorts+joins
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with an in-aggregate ORDER BY is not supported"
+                    )
                 accumulators[fname] = _sorted_agg_push(value_node, terms, table)
                 project[fname] = f"${fname}"
                 post_aggregates.append(
                     (fname, "sorted_string", ([(d, nf) for _k, d, nf in terms], sagg[1]))
                 )
             else:
-                accumulators[fname] = {"$push": _agg_arg_to_expr(sagg[0], table)}
+                accumulators[fname] = {
+                    "$push": _push_filtered(_agg_arg_to_expr(sagg[0], table), fcond)
+                }
                 project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
@@ -5101,33 +5177,39 @@ def _plan_join_group_select(
         sagg = _string_agg_arg(e)
         agg = _join_aggregate_of(e)
         where = _agg_filter_where(e)
-        if (arr_arg is not None or sagg is not None or oagg is not None) and where is not None:
-            raise errors.feature_not_supported(
-                "FILTER (WHERE ...) is not supported on array_agg / string_agg / jsonb_object_agg"
-            )
         fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
         if arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
             value_node, terms = _agg_order_spec(arr_arg)
             if terms:  # array_agg(x ORDER BY …): push {v, k}, executor sorts
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with an in-aggregate ORDER BY is not supported"
+                    )
                 accumulators[fname] = _sorted_agg_push_resolve(value_node, terms, resolve)
                 post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+                project[fname] = f"${fname}"
             else:
                 path, _ = resolve(arr_arg)
-                accumulators[fname] = {"$push": f"${path}"}
-            project[fname] = f"${fname}"
+                accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond, wrap=True)}
+                project[fname] = _array_agg_project(fname, fcond)
             out_columns.append((fname, "json"))
         elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
             kpath, _ = resolve(oagg[0])
             vpath, _ = resolve(oagg[1])
-            accumulators[fname] = {"$push": {"k": {"$toString": f"${kpath}"}, "v": f"${vpath}"}}
-            project[fname] = {"$arrayToObject": f"${fname}"}
+            pair = {"k": {"$toString": f"${kpath}"}, "v": f"${vpath}"}
+            accumulators[fname] = {"$push": _push_filtered(pair, fcond)}
+            project[fname] = _jsonb_object_agg_project(fname, fcond)
             out_columns.append((fname, "json"))
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
             value_node, terms = _agg_order_spec(sagg[0])
             if terms:  # string_agg(x, sep ORDER BY …): push {v, k}, executor sorts+joins
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with an in-aggregate ORDER BY is not supported"
+                    )
                 accumulators[fname] = _sorted_agg_push_resolve(value_node, terms, resolve)
                 project[fname] = f"${fname}"
                 post_aggregates.append(
@@ -5135,7 +5217,7 @@ def _plan_join_group_select(
                 )
             else:
                 path, _ = resolve(sagg[0])
-                accumulators[fname] = {"$push": f"${path}"}
+                accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond)}
                 project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):

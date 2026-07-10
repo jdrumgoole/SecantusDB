@@ -13,9 +13,12 @@ functions ``FIRST_VALUE`` / ``LAST_VALUE`` / ``NTH_VALUE``; aggregate windows
 ``SUM`` / ``COUNT`` / ``AVG`` / ``MIN`` / ``MAX``; and ``LAG`` / ``LEAD``.
 Explicit frame clauses are supported: ``ROWS`` frames with any
 ``UNBOUNDED`` / ``CURRENT ROW`` / ``n PRECEDING`` / ``n FOLLOWING`` bound, and
-``RANGE`` frames with ``UNBOUNDED`` / ``CURRENT ROW`` bounds (a numeric
-``RANGE`` offset, which needs interval arithmetic on the order key, is
-rejected). The default frame matches Postgres: whole partition with no
+``RANGE`` frames with ``UNBOUNDED`` / ``CURRENT ROW`` bounds *and* a numeric
+``n PRECEDING`` / ``n FOLLOWING`` offset (a row is in-frame when its ORDER BY
+key is within ``n`` of the current row's key along the sort order; Postgres
+requires exactly one ORDER BY column for an offset ``RANGE`` frame — a
+non-numeric / interval offset is still rejected). The default frame matches
+Postgres: whole partition with no
 ``ORDER BY``, else ``RANGE UNBOUNDED PRECEDING`` to ``CURRENT ROW`` (peers tied
 on the order key share the value).
 """
@@ -98,7 +101,10 @@ def _eval_window(w: exp.Window, docs: list[dict[str, Any]], scope_of: Any, sctx:
         okeys = [
             tuple(scalar.evaluate(oe, scope_of(d), sctx) for oe, _ in order_terms) for d in ordered
         ]
-        values = _window_values(func, spec, ordered, okeys, bool(order_terms), scope_of, sctx)
+        order_dirs = [d for _, d in order_terms]
+        values = _window_values(
+            func, spec, ordered, okeys, bool(order_terms), order_dirs, scope_of, sctx
+        )
         for d, v in zip(ordered, values, strict=True):
             result[id(d)] = v
     return [result[id(d)] for d in docs]
@@ -152,6 +158,7 @@ def _window_values(
     ordered: list[dict[str, Any]],
     okeys: list[tuple],
     has_order: bool,
+    order_dirs: list[int],
     scope_of: Any,
     sctx: Any,
 ) -> list[Any]:
@@ -168,7 +175,7 @@ def _window_values(
         return _lag_lead_values(func, ordered, scope_of, sctx)
 
     # Everything else is frame-sensitive: build each row's frame [lo, hi].
-    frames = _frames(spec, n, okeys, has_order)
+    frames = _frames(spec, n, okeys, has_order, order_dirs)
     if isinstance(func, (exp.FirstValue, exp.LastValue, exp.NthValue)):
         return _value_window(func, ordered, frames, scope_of, sctx)
     agg = _AGG_WINDOWS.get(type(func))
@@ -197,7 +204,11 @@ def _ntile_values(func: exp.Expression, n: int, scope_of: Any, sctx: Any) -> lis
 
 
 def _frames(
-    spec: exp.Expression | None, n: int, okeys: list[tuple], has_order: bool
+    spec: exp.Expression | None,
+    n: int,
+    okeys: list[tuple],
+    has_order: bool,
+    order_dirs: list[int],
 ) -> list[tuple[int, int]]:
     """The inclusive ``[lo, hi]`` frame index range for each row. With no explicit
     frame the Postgres default applies: the whole partition when there's no
@@ -217,8 +228,8 @@ def _frames(
             lo = _rows_bound(start, start_side, i, n, is_start=True)
             hi = _rows_bound(end, end_side, i, n, is_start=False)
         else:
-            lo = _range_bound(start, start_side, i, n, okeys, is_start=True)
-            hi = _range_bound(end, end_side, i, n, okeys, is_start=False)
+            lo = _range_bound(start, start_side, i, n, okeys, order_dirs, is_start=True)
+            hi = _range_bound(end, end_side, i, n, okeys, order_dirs, is_start=False)
         frames.append((max(0, lo), min(n - 1, hi)))
     return frames
 
@@ -246,16 +257,79 @@ def _rows_bound(val: Any, side: Any, i: int, n: int, *, is_start: bool) -> int:
     return i - k if side == "PRECEDING" else i + k
 
 
-def _range_bound(val: Any, side: Any, i: int, n: int, okeys: list[tuple], *, is_start: bool) -> int:
+def _range_bound(
+    val: Any,
+    side: Any,
+    i: int,
+    n: int,
+    okeys: list[tuple],
+    order_dirs: list[int],
+    *,
+    is_start: bool,
+) -> int:
     if isinstance(val, exp.Literal):
-        raise errors.feature_not_supported(
-            "RANGE frame with a numeric offset is not supported (use ROWS)"
-        )
+        return _range_offset_bound(val, side, i, n, okeys, order_dirs, is_start=is_start)
     if val is None or val == "CURRENT ROW":
         return _peer_start(okeys, i) if is_start else _peer_end(okeys, i, n)
     if val == "UNBOUNDED":
         return 0 if side == "PRECEDING" else n - 1
     raise errors.feature_not_supported(f"unsupported RANGE frame bound: {val}")
+
+
+def _range_offset_bound(
+    val: exp.Literal,
+    side: Any,
+    i: int,
+    n: int,
+    okeys: list[tuple],
+    order_dirs: list[int],
+    *,
+    is_start: bool,
+) -> int:
+    """A numeric ``RANGE`` offset bound (``n PRECEDING`` / ``n FOLLOWING``): a row is
+    in-frame when its ORDER BY key is within ``offset`` of the current row's key
+    along the sort order. Postgres requires exactly one ORDER BY column for an
+    offset RANGE frame. The bound is computed by value (not row count) over the
+    already-sorted ``okeys``.
+
+    Working in a direction-normalised key space ``nk = dir * key`` (non-decreasing
+    in walk order for both ASC and DESC), ``PRECEDING`` shifts the boundary down by
+    ``offset`` and ``FOLLOWING`` shifts it up, so the same comparison serves every
+    bound/direction combination."""
+    if len(order_dirs) != 1:
+        raise errors.feature_not_supported(
+            "RANGE with an offset requires exactly one ORDER BY column"
+        )
+    if val.is_string:
+        raise errors.feature_not_supported(
+            "RANGE with a non-numeric (interval) offset is not supported"
+        )
+    offset = float(val.this)
+    if offset < 0:
+        raise errors.SQLError("22013", "invalid preceding or following size in window function")
+    cur = okeys[i][0]
+    if cur is None:
+        # A NULL order key has no numeric distance; its frame is its NULL peers.
+        return _peer_start(okeys, i) if is_start else _peer_end(okeys, i, n)
+    direction = order_dirs[0]
+    if not isinstance(cur, (int, float)):
+        raise errors.feature_not_supported(
+            "RANGE with a numeric offset requires a numeric ORDER BY key"
+        )
+    nc = direction * cur
+    boundary = nc - offset if side == "PRECEDING" else nc + offset
+    if is_start:
+        for j in range(n):
+            k = okeys[j][0]
+            if k is not None and direction * k >= boundary:
+                return j
+        return n  # no row satisfies the lower bound → empty frame
+    hi = -1
+    for j in range(n):
+        k = okeys[j][0]
+        if k is not None and direction * k <= boundary:
+            hi = j
+    return hi
 
 
 def _value_window(
