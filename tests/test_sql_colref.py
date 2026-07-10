@@ -137,10 +137,65 @@ def test_function_in_colref_predicate(storage, session):
     assert ids == [1, 3]
 
 
+def test_function_in_colref_predicate_through_group_by(storage, session):
+    # The same $expr function lowering rides the GROUP BY pipeline's leading $match.
+    storage.insert(
+        DB,
+        "sales",
+        [
+            {"_id": bson.Int64(1), "region": "e", "amt": bson.Int64(10), "target": bson.Int64(-10)},
+            {"_id": bson.Int64(2), "region": "e", "amt": bson.Int64(30), "target": bson.Int64(30)},
+            {"_id": bson.Int64(3), "region": "w", "amt": bson.Int64(5), "target": bson.Int64(5)},
+            {"_id": bson.Int64(4), "region": "w", "amt": bson.Int64(40), "target": bson.Int64(-40)},
+        ],
+    )
+    rows = run_sql(
+        storage,
+        DB,
+        "SELECT region, SUM(amt) FROM sales WHERE amt = abs(target) GROUP BY region ORDER BY region",
+        session=session,
+    )[0].rows
+    assert rows == [("e", 40), ("w", 45)]
+
+
+def test_function_in_colref_predicate_through_join(storage, session):
+    # A function-call comparison also pushes down onto a JOIN pipeline's $match.
+    storage.insert(
+        DB,
+        "ord2",
+        [
+            {"_id": bson.Int64(1), "region": "e", "qty": bson.Int64(10), "cost": bson.Int64(-10)},
+            {"_id": bson.Int64(2), "region": "w", "qty": bson.Int64(40), "cost": bson.Int64(-40)},
+        ],
+    )
+    storage.insert(DB, "reg", [{"_id": "e", "region": "e"}, {"_id": "w", "region": "w"}])
+    rows = run_sql(
+        storage,
+        DB,
+        "SELECT o.region, SUM(o.qty) FROM ord2 o JOIN reg r ON o.region = r.region "
+        "WHERE o.qty = abs(o.cost) GROUP BY o.region ORDER BY o.region",
+        session=session,
+    )[0].rows
+    assert rows == [("e", 10), ("w", 40)]
+
+
 def test_unsupported_function_in_colref_predicate(storage, session):
     # A function the aggregation engine can't lower (substr) is still 0A000.
     with pytest.raises(SQLError) as ei:
         q(storage, session, "SELECT _id FROM orders WHERE qty = substr(shipped, 1, 1)")
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_unsupported_function_in_colref_predicate_through_group_by(storage, session):
+    # The 0A000 for an unlowerable function is identical on the pipeline path.
+    storage.insert(DB, "sales2", [{"_id": bson.Int64(1), "region": "e", "amt": bson.Int64(1)}])
+    with pytest.raises(SQLError) as ei:
+        run_sql(
+            storage,
+            DB,
+            "SELECT region, SUM(amt) FROM sales2 WHERE region = substr(region, 1, 1) GROUP BY region",
+            session=session,
+        )
     assert ei.value.sqlstate == "0A000"
 
 

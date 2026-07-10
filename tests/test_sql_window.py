@@ -184,16 +184,14 @@ def test_multiple_windows_one_select(storage, session):
     assert res.rows == [(1, 1, 70), (2, 2, 70), (3, 3, 70), (4, 4, 70), (5, 5, 70)]
 
 
-def test_range_numeric_offset_rejected(storage, session):
-    # A numeric RANGE offset needs interval arithmetic on the order key — rejected
-    # (ROWS offsets are supported instead).
-    from secantus.sql import SQLError
-
-    with pytest.raises(SQLError) as ei:
-        q(
-            storage,
-            session,
-            "SELECT SUM(amount) OVER (ORDER BY id RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) "
-            "FROM sales",
-        )
-    assert ei.value.sqlstate == "0A000"
+def test_range_numeric_offset(storage, session):
+    # A numeric RANGE offset is a value window on the ORDER BY key. ids 1..5 are
+    # dense so each frame is every earlier-or-equal id (key >= cur - 5) — a running
+    # sum of amounts 10,30,30,20,50.
+    res = q(
+        storage,
+        session,
+        "SELECT id, SUM(amount) OVER (ORDER BY id RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS s "
+        "FROM sales ORDER BY id",
+    )
+    assert res.rows == [(1, 10), (2, 40), (3, 70), (4, 90), (5, 140)]

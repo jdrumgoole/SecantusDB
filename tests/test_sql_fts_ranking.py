@@ -124,3 +124,29 @@ def test_order_by_computed_alias_general():
     run_sql(st, DB, "INSERT INTO t VALUES (1, 10), (2, 30), (3, 20)", session=sess)
     rows = run_sql(st, DB, "SELECT id, v * 2 AS d FROM t ORDER BY d DESC", session=sess)[-1].rows
     assert rows == [(2, 60), (3, 40), (1, 20)]
+
+
+def test_order_by_plain_column_alias_pushdown():
+    # A plain-column output alias (SELECT a AS s … ORDER BY s) on the simple
+    # pushdown path (no computed columns → no evaluated path) resolves to its input
+    # column. Previously raised 42703.
+    st = _new_storage()
+    sess = Session(database=DB)
+    run_sql(st, DB, "CREATE TABLE t (id int, a int)", session=sess)
+    run_sql(st, DB, "INSERT INTO t VALUES (1, 3), (2, 1), (3, 2)", session=sess)
+    asc = run_sql(st, DB, "SELECT a AS s FROM t ORDER BY s", session=sess)[-1].rows
+    assert asc == [(1,), (2,), (3,)]
+    desc = run_sql(st, DB, "SELECT a AS s FROM t ORDER BY s DESC", session=sess)[-1].rows
+    assert desc == [(3,), (2,), (1,)]
+
+
+def test_order_by_alias_real_column_wins():
+    # Postgres precedence: a real input column of the alias's name wins over the
+    # output alias. `ORDER BY a` orders by the real column a, not `b AS a`.
+    st = _new_storage()
+    sess = Session(database=DB)
+    run_sql(st, DB, "CREATE TABLE t (id int, a int, b int)", session=sess)
+    run_sql(st, DB, "INSERT INTO t VALUES (1, 3, 1), (2, 1, 2), (3, 2, 3)", session=sess)
+    rows = run_sql(st, DB, "SELECT a AS s, b AS a FROM t ORDER BY a", session=sess)[-1].rows
+    # ordered by real column a (3,1,2) ascending: id2(a1,b2), id3(a2,b3), id1(a3,b1)
+    assert rows == [(1, 2), (2, 3), (3, 1)]

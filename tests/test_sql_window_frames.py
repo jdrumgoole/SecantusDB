@@ -197,11 +197,62 @@ def test_range_peers_share_value(storage, session):
     assert res.rows == [(1, 10), (2, 60), (3, 60)]
 
 
-def test_range_numeric_offset_rejected(storage, session):
+def test_range_numeric_offset_preceding(storage, session):
+    # A row is in-frame when its key is within 5 of the current key (ids 1..5 are
+    # dense, so each frame is every earlier-or-equal id whose key >= cur - 5).
+    res = q(
+        storage,
+        session,
+        "SELECT id, SUM(amt) OVER (ORDER BY id RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS s "
+        "FROM t ORDER BY id",
+    )
+    assert res.rows == [(1, 10), (2, 30), (3, 60), (4, 100), (5, 150)]
+
+
+def test_range_numeric_offset_distance_not_rowcount(storage, session):
+    # Gapped keys: the frame is a value window, not a row count. Keys 1,2,5,6,10.
+    storage.q("CREATE TABLE p (k bigint primary key, v int)")
+    for k, v in [(1, 1), (2, 1), (5, 1), (6, 1), (10, 1)]:
+        storage.q(f"INSERT INTO p (k, v) VALUES ({k}, {v})")
+    res = q(
+        storage,
+        session,
+        "SELECT k, SUM(v) OVER (ORDER BY k RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS s "
+        "FROM p ORDER BY k",
+    )
+    # k1:{1,2} k2:{1,2} k5:{5,6} k6:{5,6} k10:{10}
+    assert res.rows == [(1, 2), (2, 2), (5, 2), (6, 2), (10, 1)]
+
+
+def test_range_numeric_offset_desc(storage, session):
+    # DESC flips the inequality: PRECEDING covers higher keys (earlier in the DESC
+    # walk). id1's frame is every id with key in [1, 6] = all rows.
+    res = q(
+        storage,
+        session,
+        "SELECT id, SUM(amt) OVER (ORDER BY id DESC RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS s "
+        "FROM t ORDER BY id",
+    )
+    assert res.rows == [(1, 150), (2, 140), (3, 120), (4, 90), (5, 50)]
+
+
+def test_range_numeric_offset_following(storage, session):
+    res = q(
+        storage,
+        session,
+        "SELECT id, SUM(amt) OVER (ORDER BY id RANGE BETWEEN CURRENT ROW AND 2 FOLLOWING) AS s "
+        "FROM t ORDER BY id",
+    )
+    # id1:{1,2,3}=60 id2:{2,3,4}=90 id3:{3,4,5}=120 id4:{4,5}=90 id5:{5}=50
+    assert res.rows == [(1, 60), (2, 90), (3, 120), (4, 90), (5, 50)]
+
+
+def test_range_numeric_offset_multi_order_key_rejected(storage, session):
+    # Postgres requires exactly one ORDER BY column for an offset RANGE frame.
     with pytest.raises(SQLError) as ei:
         q(
             storage,
             session,
-            "SELECT SUM(amt) OVER (ORDER BY id RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t",
+            "SELECT SUM(amt) OVER (ORDER BY g, id RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t",
         )
     assert ei.value.sqlstate == "0A000"
