@@ -1958,6 +1958,150 @@ def _op_reduce(arg: Any, ctx: _Ctx) -> Any:
     return accumulator
 
 
+def _set_eq(a: Any, b: Any) -> bool:
+    """Two values are the same set element iff neither sorts before the other in
+    BSON order (so ``1`` == ``1.0`` but ``1`` != ``true``, matching mongod's set
+    semantics)."""
+    from secantus.ordering import _bson_lt
+
+    return not _bson_lt(a, b) and not _bson_lt(b, a)
+
+
+def _set_dedup_sorted(items: list[Any]) -> list[Any]:
+    """Deduplicate (by BSON-order equality) and sort by BSON order — the shape
+    mongod returns from ``$setUnion`` / ``$setIntersection``."""
+    from secantus.ordering import _SortKey
+
+    out: list[Any] = []
+    for x in sorted(items, key=_SortKey):
+        if not out or not _set_eq(out[-1], x):
+            out.append(x)
+    return out
+
+
+def _set_arrays(op: str, arg: Any, ctx: _Ctx, *, n: int | None = None) -> list[list[Any]]:
+    """Evaluate a set operator's array arguments, validating each is an array."""
+    vals = _eval_args(arg, ctx)
+    if n is not None and len(vals) != n:
+        raise ExpressionError(f"{op} requires {n} arguments")
+    for v in vals:
+        if not isinstance(v, list):
+            raise ExpressionError(f"{op} requires array arguments")
+    return vals
+
+
+def _op_set_union(arg: Any, ctx: _Ctx) -> list[Any]:
+    all_elems: list[Any] = []
+    for v in _set_arrays("$setUnion", arg, ctx):
+        all_elems.extend(v)
+    return _set_dedup_sorted(all_elems)
+
+
+def _op_set_intersection(arg: Any, ctx: _Ctx) -> list[Any]:
+    arrays = _set_arrays("$setIntersection", arg, ctx)
+    if not arrays:
+        return []
+    result = [
+        x for x in arrays[0] if all(any(_set_eq(x, y) for y in other) for other in arrays[1:])
+    ]
+    return _set_dedup_sorted(result)
+
+
+def _op_set_difference(arg: Any, ctx: _Ctx) -> list[Any]:
+    a, b = _set_arrays("$setDifference", arg, ctx, n=2)
+    out: list[Any] = []
+    for x in a:  # first-array order, deduplicated
+        if not any(_set_eq(x, y) for y in b) and not any(_set_eq(x, y) for y in out):
+            out.append(x)
+    return out
+
+
+def _op_set_equals(arg: Any, ctx: _Ctx) -> bool:
+    arrays = _set_arrays("$setEquals", arg, ctx)
+    base = _set_dedup_sorted(arrays[0]) if arrays else []
+    for other in arrays[1:]:
+        o = _set_dedup_sorted(other)
+        if len(o) != len(base) or any(not _set_eq(base[i], o[i]) for i in range(len(base))):
+            return False
+    return True
+
+
+def _op_set_is_subset(arg: Any, ctx: _Ctx) -> bool:
+    a, b = _set_arrays("$setIsSubset", arg, ctx, n=2)
+    return all(any(_set_eq(x, y) for y in b) for x in a)
+
+
+def _op_all_elements_true(arg: Any, ctx: _Ctx) -> bool:
+    arr = _eval_args(arg, ctx)[0]
+    if not isinstance(arr, list):
+        raise ExpressionError("$allElementsTrue requires an array")
+    return all(_bool(x) for x in arr)
+
+
+def _op_any_element_true(arg: Any, ctx: _Ctx) -> bool:
+    arr = _eval_args(arg, ctx)[0]
+    if not isinstance(arr, list):
+        raise ExpressionError("$anyElementTrue requires an array")
+    return any(_bool(x) for x in arr)
+
+
+def _op_cmp(arg: Any, ctx: _Ctx) -> int:
+    """``$cmp``: three-way comparison of two values by BSON order → -1 / 0 / 1."""
+    from secantus.ordering import _bson_lt
+
+    a, b = _eval_args(arg, ctx)
+    if _bson_lt(a, b):
+        return -1
+    return 1 if _bson_lt(b, a) else 0
+
+
+def _op_binary_size(arg: Any, ctx: _Ctx) -> Any:
+    """``$binarySize``: byte length of a string (UTF-8) or binary value. Null /
+    missing → null."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return len(v.encode("utf-8"))
+    if isinstance(v, (bytes, bson.Binary)):
+        return len(v)
+    raise ExpressionError("$binarySize requires a string or binData")
+
+
+def _op_bson_size(arg: Any, ctx: _Ctx) -> Any:
+    """``$bsonSize``: the BSON-encoded byte size of a document. Null → null."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if not isinstance(v, Mapping):
+        raise ExpressionError("$bsonSize requires a document")
+    return len(bson.encode(dict(v)))
+
+
+def _op_degrees_to_radians(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
+        raise ExpressionError("$degreesToRadians requires a number")
+    x = float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+    return x * math.pi / 180.0
+
+
+def _op_radians_to_degrees(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
+        raise ExpressionError("$radiansToDegrees requires a number")
+    x = float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+    return x * 180.0 / math.pi
+
+
 def _bit_operand(op: str, v: Any) -> tuple[int, bool]:
     """Coerce a ``$bit*`` operand to ``(value, is_long)``. mongod's bitwise
     operators accept only int (32-bit) and long (64-bit) — a bool, double,
@@ -2126,4 +2270,16 @@ _OPS = {
     "$filter": _op_filter,
     "$map": _op_map,
     "$reduce": _op_reduce,
+    "$setUnion": _op_set_union,
+    "$setIntersection": _op_set_intersection,
+    "$setDifference": _op_set_difference,
+    "$setEquals": _op_set_equals,
+    "$setIsSubset": _op_set_is_subset,
+    "$allElementsTrue": _op_all_elements_true,
+    "$anyElementTrue": _op_any_element_true,
+    "$cmp": _op_cmp,
+    "$binarySize": _op_binary_size,
+    "$bsonSize": _op_bson_size,
+    "$degreesToRadians": _op_degrees_to_radians,
+    "$radiansToDegrees": _op_radians_to_degrees,
 }

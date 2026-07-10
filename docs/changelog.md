@@ -19,6 +19,33 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### Set-expression and utility operators (both servers)
+
+The aggregation set-expression family lands on both servers, plus a handful of
+comparison / size / angle utilities — all matched to real `mongod` 6.0 via a
+three-way probe (mongod vs Rust vs Python server) with zero value divergences:
+
+- **`$setUnion` / `$setIntersection` / `$setDifference`** — set algebra over
+  arrays. Union and intersection return their result in BSON sort order (matching
+  mongod); difference preserves first-array order. All three dedup by BSON-order
+  equality, so `1` and `1.0` collapse but `1` and `true` do not.
+- **`$setEquals` / `$setIsSubset`** — set membership predicates over two-or-more /
+  exactly-two arrays.
+- **`$allElementsTrue` / `$anyElementTrue`** — truthiness reductions over an array.
+- **`$cmp`** — three-way comparison (-1/0/1) using the full BSON cross-type order.
+- **`$binarySize`** (UTF-8 byte length of a string / length of Binary; null → null)
+  and **`$bsonSize`** (encoded BSON byte size of a document; null → null).
+- **`$degreesToRadians` / `$radiansToDegrees`** — angle conversions.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: the operators above. Set ops share a
+  `_set_dedup_sorted` / `set_dedup_sorted` helper that sorts by BSON order and dedups
+  adjacent equal values; a non-array argument (or an element the Rust core can't
+  cross-type-order) raises on the Python server with mongod's code and defers to the
+  Python oracle on the Rust side (documented generic-code gap, `tasks/backlog.md`
+  §7.5).
+
 ### Batch of aggregation expression operators (both servers)
 
 Nine more aggregation expression operators land on both servers, all matched to
