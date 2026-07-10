@@ -3575,12 +3575,16 @@ def _register_distinct_agg(
     names: _NameAllocator,
     accumulators: dict[str, Any],
     reductions: dict[str, Any],
+    fcond: Any = None,
 ) -> tuple[str, str]:
     """Wire a DISTINCT count/sum/avg: a ``$addToSet`` accumulator collects the
     distinct values; a post-``$group`` ``$addFields`` reduces the set. Returns
-    the output field name and its type tag."""
+    the output field name and its type tag. With a ``FILTER (WHERE cond)``
+    (``fcond``), a non-matching row contributes ``None`` to the set, which the
+    reduction's NULL filter drops — so only matching rows' distinct values count
+    (SQL ``agg(DISTINCT x) FILTER (WHERE cond)`` semantics)."""
     set_name = names.fresh(f"{alias or func}__distinct")
-    accumulators[set_name] = {"$addToSet": f"${field}"}
+    accumulators[set_name] = {"$addToSet": _push_filtered(f"${field}", fcond)}
     fname = names.fresh(alias or func)
     reductions[fname] = _distinct_reduction(func, f"${set_name}")
     return fname, _agg_out_tag(func, tag)
@@ -4020,10 +4024,6 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             if distinct and func in _DISTINCT_FUNCS:
                 if col is None:
                     raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
-                if fcond is not None:
-                    raise errors.feature_not_supported(
-                        "FILTER (WHERE ...) with DISTINCT is not supported"
-                    )
                 fname, tag = _register_distinct_agg(
                     func,
                     table.field_for(col),
@@ -4032,6 +4032,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                     names,
                     accumulators,
                     reductions,
+                    fcond,
                 )
             else:
                 acc, tag = _accumulator(func, col, table, fcond)
@@ -4249,6 +4250,8 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
         if agg in agg_fields:
             return agg_fields[agg]
         func, col, distinct = agg
+        where = _agg_filter_where(node)
+        fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if distinct and func in _DISTINCT_FUNCS:
             if col is None:
                 raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
@@ -4260,10 +4263,9 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
                 names,
                 accumulators,
                 reductions,
+                fcond,
             )
         else:
-            where = _agg_filter_where(node)
-            fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
             acc, tag = _accumulator(func, col, table, fcond)
             fname = names.fresh(func)
             accumulators[fname] = acc
@@ -4415,6 +4417,8 @@ def _having_to_match(
         if agg is None:
             raise errors.feature_not_supported(f"unsupported HAVING term: {term.sql()}")
         func, col, distinct = agg
+        where = _agg_filter_where(term)
+        fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if distinct and func in _DISTINCT_FUNCS:
             if agg in agg_fields:  # already registered by the SELECT list — reuse
                 return agg_fields[agg], _agg_out_tag(func, table.type_for(col) if col else None)
@@ -4430,11 +4434,10 @@ def _having_to_match(
                 names,
                 accumulators,
                 reductions,
+                fcond,
             )
             agg_fields[agg] = fname
             return fname, tag
-        where = _agg_filter_where(term)
-        fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         acc, tag = _accumulator(func, col, table, fcond)
         if agg not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
@@ -5249,13 +5252,9 @@ def _plan_join_group_select(
             if distinct and func in _DISTINCT_FUNCS:
                 if arg is None:
                     raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
-                if fcond is not None:
-                    raise errors.feature_not_supported(
-                        "FILTER (WHERE ...) with DISTINCT is not supported"
-                    )
                 path, tag = resolve(arg)
                 fname, tag = _register_distinct_agg(
-                    func, path, tag, alias, names, accumulators, reductions
+                    func, path, tag, alias, names, accumulators, reductions, fcond
                 )
             else:
                 acc, tag = _join_accumulator(func, arg, resolve, fcond)
@@ -5367,16 +5366,16 @@ def _plan_join_group_window_select(
         key = _agg_key(func, arg, resolve, distinct)
         if key in agg_fields:
             return agg_fields[key]
+        where = _agg_filter_where(node)
+        fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
         if distinct and func in _DISTINCT_FUNCS:
             if arg is None:
                 raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
             path, tag = resolve(arg)
             fname, tag = _register_distinct_agg(
-                func, path, tag, None, names, accumulators, reductions
+                func, path, tag, None, names, accumulators, reductions, fcond
             )
         else:
-            where = _agg_filter_where(node)
-            fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
             acc, tag = _join_accumulator(func, arg, resolve, fcond)
             fname = names.fresh(func)
             accumulators[fname] = acc
@@ -5460,6 +5459,8 @@ def _join_having_to_match(
             raise errors.feature_not_supported(f"unsupported HAVING term: {term.sql()}")
         func, arg, distinct = agg
         key = _agg_key(func, arg, resolve, distinct)
+        where = _agg_filter_where(term)
+        fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
         if distinct and func in _DISTINCT_FUNCS:
             if key in agg_fields:  # already registered by the SELECT list — reuse
                 path, tag = resolve(arg)
@@ -5470,12 +5471,10 @@ def _join_having_to_match(
                 )
             path, tag = resolve(arg)
             fname, tag = _register_distinct_agg(
-                func, path, tag, None, names, accumulators, reductions
+                func, path, tag, None, names, accumulators, reductions, fcond
             )
             agg_fields[key] = fname
             return fname, tag
-        where = _agg_filter_where(term)
-        fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
         acc, tag = _join_accumulator(func, arg, resolve, fcond)
         if key not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
