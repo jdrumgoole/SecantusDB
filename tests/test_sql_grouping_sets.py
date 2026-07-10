@@ -124,3 +124,68 @@ def test_grouping_sets_over_join_rejected(storage, session):
             "SELECT t.region, SUM(t.amt) FROM t JOIN u ON t.region = u.region "
             "GROUP BY ROLLUP(t.region)",
         )
+
+
+# -- DISTINCT aggregates under GROUPING SETS --------------------------------- #
+
+
+def _order(got):
+    return sorted(got, key=lambda r: (r[0] is None, r[0]))
+
+
+def test_rollup_count_distinct(storage, session):
+    # e amts {10,20,5}=3 distinct, w {30,15}=2; grand total {10,20,5,30,15}=5.
+    got = rows(
+        storage,
+        session,
+        "SELECT region, count(DISTINCT amt) AS d FROM t GROUP BY ROLLUP(region)",
+    )
+    assert _order(got) == [("e", 3), ("w", 2), (None, 5)]
+
+
+def test_rollup_sum_distinct(storage, session):
+    # e distinct {10,20,5}=35, w {30,15}=45, total {10,20,5,30,15}=80.
+    got = rows(
+        storage,
+        session,
+        "SELECT region, sum(DISTINCT amt) AS s FROM t GROUP BY ROLLUP(region)",
+    )
+    assert _order(got) == [("e", 35), ("w", 45), (None, 80)]
+
+
+def test_cube_distinct_and_plain_together(storage, session):
+    # DISTINCT and a plain aggregate coexist in one CUBE query.
+    got = rows(
+        storage,
+        session,
+        "SELECT region, count(DISTINCT amt) AS d, count(*) AS c FROM t GROUP BY CUBE(region)",
+    )
+    assert _order(got) == [("e", 3, 3), ("w", 2, 2), (None, 5, 5)]
+
+
+def test_grouping_sets_min_distinct(storage, session):
+    # min(DISTINCT) == min; works under GROUPING SETS via the plain accumulator.
+    got = rows(
+        storage,
+        session,
+        "SELECT region, min(DISTINCT amt) AS m FROM t GROUP BY GROUPING SETS ((region), ())",
+    )
+    assert _order(got) == [("e", 5), ("w", 15), (None, 5)]
+
+
+def test_rollup_count_distinct_filter(storage, session):
+    # FILTER + DISTINCT under ROLLUP: only amt > 10 contributes.
+    got = rows(
+        storage,
+        session,
+        "SELECT region, count(DISTINCT amt) FILTER (WHERE amt > 10) AS d "
+        "FROM t GROUP BY ROLLUP(region)",
+    )
+    # e: {20}=1 ; w: {30,15}=2 ; total: {20,30,15}=3.
+    assert _order(got) == [("e", 1), ("w", 2), (None, 3)]
+
+
+def test_rollup_count_distinct_star_rejected(storage, session):
+    with pytest.raises(errors.SQLError) as ei:
+        rows(storage, session, "SELECT region, count(DISTINCT *) FROM t GROUP BY ROLLUP(region)")
+    assert ei.value.sqlstate == "0A000"

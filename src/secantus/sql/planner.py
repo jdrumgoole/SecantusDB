@@ -3809,6 +3809,7 @@ def _grouping_set_branch(
     in_set = set(gset)
     group_id = {c: f"${table.field_for(c)}" for c in gset} or None
     accumulators: dict[str, Any] = {}
+    reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
     names = _NameAllocator()
@@ -3845,10 +3846,28 @@ def _grouping_set_branch(
             project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif agg is not None:
-            func, col, _distinct = agg
-            acc, tag = _accumulator(func, col, table, fcond)
-            fname = names.fresh(alias or func)
-            accumulators[fname] = acc
+            func, col, distinct = agg
+            # DISTINCT count/sum/avg → a $addToSet accumulator + a post-$group
+            # reduction (mirrors the plain-GROUP-BY path); min/max ignore DISTINCT
+            # (a distinct extremum equals the raw extremum) so they take the plain
+            # accumulator, which threads any FILTER condition.
+            if distinct and func in _DISTINCT_FUNCS:
+                if col is None:
+                    raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+                fname, tag = _register_distinct_agg(
+                    func,
+                    table.field_for(col),
+                    table.type_for(col),
+                    alias,
+                    names,
+                    accumulators,
+                    reductions,
+                    fcond,
+                )
+            else:
+                acc, tag = _accumulator(func, col, table, fcond)
+                fname = names.fresh(alias or func)
+                accumulators[fname] = acc
             project[fname] = f"${fname}"
             out_columns.append((fname, tag))
         else:
@@ -3865,7 +3884,12 @@ def _grouping_set_branch(
                 table.field_for(col)  # validate it's a real column
                 project[out_name] = {"$literal": None}
             out_columns.append((out_name, table.type_for(col)))
-    return [{"$group": {"_id": group_id, **accumulators}}, {"$project": project}], out_columns
+    stages: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+    if reductions:
+        # Reduce each DISTINCT set to its scalar value before the projection.
+        stages.append({"$addFields": reductions})
+    stages.append({"$project": project})
+    return stages, out_columns
 
 
 def _plan_grouping_sets_select(
@@ -3882,8 +3906,6 @@ def _plan_grouping_sets_select(
         raise errors.feature_not_supported("HAVING with GROUPING SETS is not supported")
     if _residual_where(stmt, table) is not None:
         raise errors.feature_not_supported("a correlated WHERE with GROUPING SETS is not supported")
-    if any(a[2] for e in stmt.expressions if (a := _aggregate_of(e)) is not None):
-        raise errors.feature_not_supported("DISTINCT aggregate with GROUPING SETS is not supported")
     base_filter = _where_filter(stmt, table)
     add_stage = [{"$addFields": gkey_addfields}] if gkey_addfields else []
     sets = _grouping_sets(stmt.args["group"])
