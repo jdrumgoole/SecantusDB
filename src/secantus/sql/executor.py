@@ -482,9 +482,7 @@ def execute_drop_index(
     raise errors.SQLError("42704", f'index "{plan.name}" does not exist')
 
 
-def _drop_expr_index(
-    table: Any, index_name: str, catalog: Catalog, storage: Any, db: str
-) -> None:
+def _drop_expr_index(table: Any, index_name: str, catalog: Catalog, storage: Any, db: str) -> None:
     """When the dropped index is an expression index, unregister it from the owning
     table (so the WHERE/ORDER rewrite stops firing) and strip its hidden field from
     every row."""
