@@ -1,18 +1,17 @@
-"""Partial indexes (``CREATE INDEX … WHERE …``) and the rejection of expression
-indexes.
+"""Partial indexes (``CREATE INDEX … WHERE …``).
 
 A partial-index predicate lowers to a Mongo filter passed to storage as
 ``partialFilterExpression`` — the same option the MongoDB-side partial index uses,
-so the query planner accelerates matching queries. Expression indexes
-(``CREATE INDEX … ((a + b))``) can't map to a stored-field index and are a faithful
-``0A000`` not-supported.
+so the query planner accelerates matching queries. (Expression indexes —
+``CREATE INDEX … ((a + b))`` — are now supported too; they have their own suite in
+``test_sql_expr_index.py``.)
 """
 
 from __future__ import annotations
 
 import pytest
 
-from secantus.sql import errors, run_sql
+from secantus.sql import run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -36,12 +35,6 @@ def storage(session, tmp_path):
 
 def run(storage, session, sql):
     return run_sql(storage, DB, sql, session=session)[-1]
-
-
-def sqlstate(storage, session, sql):
-    with pytest.raises(errors.SQLError) as ei:
-        run(storage, session, sql)
-    return ei.value.sqlstate
 
 
 def _index(storage, name):
@@ -85,10 +78,6 @@ def test_partial_index_if_not_exists(storage, session):
         run(storage, session, "CREATE INDEX IF NOT EXISTS ix ON t (a) WHERE a > 0").command_tag
         == "CREATE INDEX"
     )
-
-
-def test_expression_index_rejected(storage, session):
-    assert sqlstate(storage, session, "CREATE INDEX ix ON t ((a + b))") == "0A000"
 
 
 def test_index_still_reflects_in_pg_index(storage, session):

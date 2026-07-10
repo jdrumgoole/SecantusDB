@@ -410,13 +410,18 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
 
 
 def execute_create_index(
-    plan: planner.CreateIndexPlan, catalog: Catalog, storage: Any, db: str
+    plan: planner.CreateIndexPlan, catalog: Catalog, storage: Any, db: str, session: Any = None
 ) -> SQLResult:
     existing = [ix.get("name") for ix in storage.list_indexes(db, plan.collection)]
     if plan.name in existing:
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE INDEX")
         raise errors.SQLError("42P07", f'relation "{plan.name}" already exists')
+    # An expression index materialises the indexed expression into a hidden field
+    # (registered on the table, recomputed on every write); backfill it into every
+    # existing row *before* building the B-tree so the entries are populated.
+    if plan.expr_index is not None:
+        _create_expr_index(plan, catalog, storage, db, session)
     options: dict[str, Any] = {}
     if plan.unique:
         options["unique"] = True
@@ -424,6 +429,39 @@ def execute_create_index(
         options["partialFilterExpression"] = plan.partial_filter
     storage.create_index(db, plan.collection, plan.name, plan.key_spec, options or None)
     return SQLResult(command_tag="CREATE INDEX")
+
+
+def _create_expr_index(
+    plan: planner.CreateIndexPlan, catalog: Catalog, storage: Any, db: str, session: Any
+) -> None:
+    from secantus.sql import scalar
+
+    ei = plan.expr_index
+    owner = next(
+        (
+            t
+            for tn in catalog.list_tables(db)
+            if (t := catalog.get(db, tn)) is not None and t.collection == plan.collection
+        ),
+        None,
+    )
+    if owner is None:
+        raise errors.SQLError("42P01", f'relation for collection "{plan.collection}" not found')
+    if any(existing.field == ei.field for existing in owner.expr_indexes):
+        return  # already registered (idempotent re-create)
+    owner.expr_indexes.append(ei)
+    catalog.replace(db, owner)
+    # Backfill: compute the expression per existing row and persist the hidden field.
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    for doc in storage.find_matching(db, plan.collection, {}):
+        _apply_expr_index_fields([doc], owner, ctx)
+        storage.update_matching(
+            db,
+            plan.collection,
+            {"_id": doc["_id"]},
+            {"$set": {ei.field: doc[ei.field]}},
+            multi=False,
+        )
 
 
 def execute_drop_index(
@@ -437,10 +475,29 @@ def execute_drop_index(
             continue
         if any(ix.get("name") == plan.name for ix in storage.list_indexes(db, table.collection)):
             storage.drop_index(db, table.collection, plan.name)
+            _drop_expr_index(table, plan.name, catalog, storage, db)
             return SQLResult(command_tag="DROP INDEX")
     if plan.if_exists:
         return SQLResult(command_tag="DROP INDEX")
     raise errors.SQLError("42704", f'index "{plan.name}" does not exist')
+
+
+def _drop_expr_index(
+    table: Any, index_name: str, catalog: Catalog, storage: Any, db: str
+) -> None:
+    """When the dropped index is an expression index, unregister it from the owning
+    table (so the WHERE/ORDER rewrite stops firing) and strip its hidden field from
+    every row."""
+    ei = next((e for e in table.expr_indexes if e.name == index_name), None)
+    if ei is None:
+        return
+    table.expr_indexes = [e for e in table.expr_indexes if e.name != index_name]
+    catalog.replace(db, table)
+    for doc in storage.find_matching(db, table.collection, {}):
+        if ei.field in doc:
+            storage.update_matching(
+                db, table.collection, {"_id": doc["_id"]}, {"$unset": {ei.field: ""}}, multi=False
+            )
 
 
 def _returning_result(
@@ -745,6 +802,35 @@ def _apply_generated_columns(docs: list[dict[str, Any]], table: Any, ctx: Any) -
             doc[col.field] = typemap.coerce(value, col.type_tag)
 
 
+@functools.lru_cache(maxsize=256)
+def _parse_expr_index(expr_sql: str) -> Any:
+    import sqlglot
+
+    return sqlglot.parse_one(expr_sql, read="postgres")
+
+
+def _apply_expr_index_fields(docs: list[dict[str, Any]], table: Any, ctx: Any) -> None:
+    """Compute each expression index's value from the row and store it in the index's
+    hidden ``field`` (so the storage B-tree over that field stays current). Mirrors
+    ``_apply_generated_columns``; runs on every insert / update post-image."""
+    from secantus.sql import scalar
+
+    if getattr(table, "reflected", False):
+        return
+    eis = getattr(table, "expr_indexes", None)
+    if not eis:
+        return
+    for doc in docs:
+
+        def scope(node: Any, _doc: Any = doc) -> Any:
+            col = table.column(node.name)
+            return get_path(_doc, col.field if col is not None else node.name)
+
+        for ei in eis:
+            value = scalar.evaluate(_parse_expr_index(ei.expr_sql), scope, ctx)
+            doc[ei.field] = typemap.coerce(value, ei.type_tag)
+
+
 def _validate_rls_check(docs: list[dict[str, Any]], table: Any, command: str, ctx: Any) -> None:
     """Enforce each row's RLS ``WITH CHECK`` predicate (#129). No-op unless the
     session enforces RLS and the table has policies enabled."""
@@ -764,6 +850,7 @@ def enforce_insert_rows(
 
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     _apply_generated_columns(docs, table, ctx)
+    _apply_expr_index_fields(docs, table, ctx)
     _validate_rows(docs, table, storage, db, session, catalog)
     _validate_enum_columns(docs, table, catalog, db)
     _validate_domain_columns(docs, table, storage, db, session, catalog)
@@ -789,6 +876,7 @@ def enforce_update_images(
         return
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     _apply_generated_columns(post_images, table, ctx)
+    _apply_expr_index_fields(post_images, table, ctx)
     for post in post_images:
         _validate_write_row(post, table, ctx)
     _validate_rls_check(post_images, table, "UPDATE", ctx)
@@ -1489,25 +1577,25 @@ def execute_update(
             plan.table,
             scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session),
         )
-    gen_cols = (
-        [c for c in plan.table.columns if c.generated is not None]
-        if not getattr(plan.table, "reflected", False)
-        else []
-    )
-    # A generated column's value depends on each row's post-image, so the bulk
-    # ``$set`` can't carry it; capture the target ids first, then recompute and
+    reflected = getattr(plan.table, "reflected", False)
+    gen_cols = [c for c in plan.table.columns if c.generated is not None] if not reflected else []
+    expr_idxs = list(getattr(plan.table, "expr_indexes", [])) if not reflected else []
+    # A generated column / expression index depends on each row's post-image, so the
+    # bulk ``$set`` can't carry it; capture the target ids first, then recompute and
     # persist per row after the update lands.
-    if plan.returning is not None or gen_cols:
+    if plan.returning is not None or gen_cols or expr_idxs:
         ids = [d["_id"] for d in storage.find_matching(db, coll, plan.filter)]
     res = storage.update_matching(db, coll, plan.filter, plan.update, multi=True)
     matched = int(res["matched"])
-    if gen_cols and ids:
+    if (gen_cols or expr_idxs) and ids:
         from secantus.sql import scalar
 
         ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
         for doc in storage.find_matching(db, coll, {"_id": {"$in": ids}}):
             _apply_generated_columns([doc], plan.table, ctx)
+            _apply_expr_index_fields([doc], plan.table, ctx)
             gset = {c.field: doc[c.field] for c in gen_cols}
+            gset.update({ei.field: doc[ei.field] for ei in expr_idxs})
             storage.update_matching(db, coll, {"_id": doc["_id"]}, {"$set": gset}, multi=False)
     if plan.returning is not None:
         post = storage.find_matching(db, coll, {"_id": {"$in": ids}}) if ids else []
@@ -1666,6 +1754,7 @@ def _validate_update_post_images(
     if post_images is None:
         post_images = [apply_update(doc, plan.update) for doc in matched]
     _apply_generated_columns(post_images, table, ctx)
+    _apply_expr_index_fields(post_images, table, ctx)
     for post in post_images:
         _validate_write_row(post, table, ctx)
     _validate_enum_columns(post_images, table, catalog, db)

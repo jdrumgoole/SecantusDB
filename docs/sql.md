@@ -2403,9 +2403,28 @@ CREATE INDEX ix_active ON orders (user_id) WHERE status = 'active';
 CREATE UNIQUE INDEX ux_email ON users (email) WHERE email IS NOT NULL;
 ```
 
-Expression indexes (`CREATE INDEX … ((a + b))`) are **not** supported — the
-storage layer indexes stored fields, not computed values. Add a
-`GENERATED ALWAYS AS (…) STORED` column and index that instead.
+**Expression indexes** — `CREATE INDEX … ((<expr>))` — index a computed
+expression (a function call like `lower(name)`, or an arithmetic expression like
+`a + b`). SecantusDB materialises the expression into a hidden per-row field,
+recomputes it on every write, and builds an ordinary secondary index over it; a
+`WHERE` clause containing that exact expression is rewritten to ride the index, so
+`explain` reports an **Index Scan**. The hidden field never appears in `SELECT *`
+or catalog reflection, and `DROP INDEX` removes both the index and the field.
+
+```sql
+CREATE INDEX ix_lower_name ON users ((lower(name)));
+SELECT * FROM users WHERE lower(name) = 'bob';   -- Index Scan using ix_lower_name
+
+CREATE INDEX ix_total ON line_items ((qty * price));
+SELECT * FROM line_items WHERE qty * price = 100;
+```
+
+The expression must be one SecantusDB's expression engine can evaluate (the same
+functions and operators available in the `SELECT` list); an unsupported construct
+raises a `0A000` not-supported. Only single-expression indexes are supported —
+mixing an expression with plain columns in one index (`CREATE INDEX … (a, (b +
+c))`) is rejected. `ORDER BY` on the indexed expression still returns correct
+results, but sorts via per-row evaluation rather than index order.
 
 ### `EXPLAIN`
 

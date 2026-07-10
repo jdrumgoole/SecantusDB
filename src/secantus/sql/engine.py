@@ -1383,7 +1383,7 @@ def _run_statement(
             if table is None:
                 raise errors.undefined_table(tname)
             return executor.execute_create_index(
-                planner.plan_create_index(stmt, table), catalog, storage, db
+                planner.plan_create_index(stmt, table), catalog, storage, db, session
             )
         if kind == "VIEW":
             if _is_materialized(stmt):

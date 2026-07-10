@@ -128,6 +128,10 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
         relid = table_oids[t.name]
         field_to_attnum = {col.field: i for i, col in enumerate(t.columns, start=1)}
         field_to_name = {col.field: col.name for col in t.columns}
+        # An expression index is stored over a hidden ``__expr_<name>`` field; map
+        # that field back to its source SQL so the index reflects like Postgres'
+        # (indkey attnum 0 marks an expression column).
+        field_to_expr = {ei.field: ei for ei in getattr(t, "expr_indexes", [])}
         pk_cols = t.pk_columns
         if pk_cols:
             out.append(
@@ -149,6 +153,26 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
             if ix.get("name") == "_id_":
                 continue  # WiredTiger's physical _id index — the PK is shown as <t>_pkey
             key = ix.get("key") or {}
+            expr_fields = [f for f in key if f in field_to_expr]
+            if expr_fields:
+                # Expression index: single hidden field → attnum 0 + rendered SQL.
+                ei = field_to_expr[expr_fields[0]]
+                out.append(
+                    {
+                        "indexrelid": oid,
+                        "indrelid": relid,
+                        "relname": ix["name"],
+                        "indkey": [0],
+                        "unique": bool(ix.get("unique")),
+                        "primary": False,
+                        "conname": None,
+                        "table": t.name,
+                        "columns": [f"({ei.expr_sql.lower()})"],
+                        "partial": bool(ix.get("partialFilterExpression")),
+                    }
+                )
+                oid += 1
+                continue
             indkey = [field_to_attnum.get(f) for f in key]
             if not indkey or any(a is None for a in indkey):
                 continue  # index over a non-column field — not reflectable as SQL

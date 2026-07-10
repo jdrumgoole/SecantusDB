@@ -158,6 +158,23 @@ class UniqueConstraint:
     initially_deferred: bool = False
 
 
+@dataclass(frozen=True)
+class ExprIndex:
+    """An expression (functional) index — ``CREATE INDEX … ((a + b))``. The
+    expression is materialised into a hidden storage doc field (``field``, a
+    ``__``-prefixed key that is *not* a table column, so it never appears in
+    ``SELECT *`` / reflection) recomputed on every write; the storage B-tree indexes
+    that field. Queries whose WHERE / ORDER BY name the same expression are rewritten
+    onto ``field`` so the index lights up. ``expr_sql`` is the normalised SQL of the
+    indexed expression (the match key); ``type_tag`` is its inferred result type."""
+
+    name: str
+    expr_sql: str
+    field: str
+    type_tag: str
+    direction: int = 1
+
+
 @dataclass
 class TableDef:
     name: str
@@ -171,6 +188,10 @@ class TableDef:
     check_constraints: list[CheckConstraint] = field(default_factory=list)
     unique_constraints: list[UniqueConstraint] = field(default_factory=list)
     comment: str | None = None  # COMMENT ON TABLE (reflected via pg_description)
+    # Expression (functional) indexes. Their hidden ``field`` keys resolve like
+    # columns (so a query rewritten onto one plans through the normal index path)
+    # but are NOT in ``columns`` (so ``SELECT *`` / reflection never surface them).
+    expr_indexes: list[ExprIndex] = field(default_factory=list)
 
     def column(self, name: str) -> Column | None:
         for c in self.columns:
@@ -178,10 +199,18 @@ class TableDef:
                 return c
         return None
 
+    def _expr_index_field(self, name: str) -> ExprIndex | None:
+        for ei in self.expr_indexes:
+            if ei.field == name:
+                return ei
+        return None
+
     def field_for(self, name: str) -> str:
         c = self.column(name)
         if c is not None:
             return c.field
+        if self._expr_index_field(name) is not None:
+            return name
         if self.reflected:
             return name
         raise errors.undefined_column(name)
@@ -190,6 +219,9 @@ class TableDef:
         c = self.column(name)
         if c is not None:
             return c.type_tag
+        ei = self._expr_index_field(name)
+        if ei is not None:
+            return ei.type_tag
         if self.reflected:
             return "any"
         raise errors.undefined_column(name)
@@ -265,6 +297,16 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
             }
             for uq in table.unique_constraints
         ],
+        "expr_indexes": [
+            {
+                "name": ei.name,
+                "expr_sql": ei.expr_sql,
+                "field": ei.field,
+                "type_tag": ei.type_tag,
+                "direction": ei.direction,
+            }
+            for ei in table.expr_indexes
+        ],
     }
 
 
@@ -319,6 +361,16 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 initially_deferred=bool(uq.get("initially_deferred", False)),
             )
             for uq in doc.get("unique_constraints", [])
+        ],
+        expr_indexes=[
+            ExprIndex(
+                name=ei["name"],
+                expr_sql=ei["expr_sql"],
+                field=ei["field"],
+                type_tag=ei["type_tag"],
+                direction=int(ei.get("direction", 1)),
+            )
+            for ei in doc.get("expr_indexes", [])
         ],
     )
 
