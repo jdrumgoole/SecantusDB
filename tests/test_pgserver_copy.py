@@ -1,7 +1,7 @@
 """``COPY … FROM/TO STDIN/STDOUT`` over the wire.
 
 Drives the CopyIn / CopyOut sub-protocol against a real ``SecantusPGServer`` over
-a loopback socket (backed by an in-memory ``FakeStorage`` — no WiredTiger). The
+a loopback socket (backed by the real WT-backed ``Storage``). The
 client sends ``COPY t FROM STDIN``, gets ``CopyInResponse`` ('G'), streams
 ``CopyData`` ('d') + ``CopyDone`` ('c'), and reads ``CommandComplete`` +
 ``ReadyForQuery``; the reverse for ``COPY t TO STDOUT``.

@@ -2,13 +2,14 @@
 
 A pure-Python PG v3 client drives a real ``SecantusPGServer`` over a loopback
 socket — the deterministic "a real client connected and got rows" proof. The
-server runs over an injected in-memory ``FakeStorage`` so no WiredTiger build is
-needed; the wire framing and handshake are exercised for real.
+server runs over an injected real WT-backed ``Storage``; the wire framing and
+handshake are exercised for real.
 """
 
 from __future__ import annotations
 
 import contextlib
+import logging
 import socket
 import struct
 
@@ -255,3 +256,25 @@ def test_connection_cap_rejects_over_limit(tmp_path):
     finally:
         srv.stop()
         st.close()
+
+
+def test_stop_drains_handler_threads_before_storage_close(tmp_path, caplog):
+    # A client abandoned mid-transaction (no Terminate, socket left open) must
+    # not leave its handler thread using a WT session while the embedder runs
+    # ``stop()`` + ``storage.close()`` — that concurrent close corrupts the WT
+    # session handle ("WT session close failed during close" in the log).
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st)
+    srv.start()
+    host, port = srv.address
+    c = PGClient(host, port)
+    c.startup()
+    c.query("CREATE TABLE t (id bigint primary key, n int)")
+    c.query("BEGIN")
+    c.query("INSERT INTO t (id, n) VALUES (1, 10)")  # txn left open, socket abandoned
+    with caplog.at_level(logging.ERROR, logger="secantus.storage.close"):
+        srv.stop()
+        assert not [t for t in srv._handler_threads if t.is_alive()]
+        st.close()
+    assert not [r for r in caplog.records if "close failed" in r.message]
+    c.sock.close()

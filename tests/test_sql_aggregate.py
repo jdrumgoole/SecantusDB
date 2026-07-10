@@ -1,8 +1,8 @@
 """P5 tests: JOIN, GROUP BY, and aggregate functions.
 
-End-to-end through ``run_sql`` over the in-memory ``FakeStorage`` (whose query +
-aggregation semantics are the real engines), so the SQL→pipeline translation is
-exercised against the same `$group`/`$lookup` the production server uses.
+End-to-end through ``run_sql`` over the real WT-backed ``Storage``, so the
+SQL→pipeline translation is exercised against the same `$group`/`$lookup` the
+production server uses.
 """
 
 from __future__ import annotations
