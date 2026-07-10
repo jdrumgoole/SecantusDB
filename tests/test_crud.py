@@ -3662,3 +3662,27 @@ def test_push_addtoset_each_modifiers(coll) -> None:
     coll.update_one({"_id": 1}, {"$set": {"a": [1]}})
     coll.update_one({"_id": 1}, {"$push": {"a": 7}})
     assert coll.find_one({"_id": 1})["a"] == [1, 7]
+
+
+def test_pull_predicate_and_pullall(coll) -> None:
+    """`$pull` with a query predicate / sub-document criterion, and `$pullAll`."""
+    coll.insert_one({"_id": 1, "a": [1, 5, 10, 15]})
+    coll.update_one({"_id": 1}, {"$pull": {"a": {"$gte": 10}}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 5]
+
+    coll.update_one(
+        {"_id": 1},
+        {"$set": {"a": [{"x": 1, "y": "a"}, {"x": 5, "y": "b"}, {"x": 9, "y": "c"}]}},
+    )
+    coll.update_one({"_id": 1}, {"$pull": {"a": {"x": {"$gte": 5}}}})
+    assert coll.find_one({"_id": 1})["a"] == [{"x": 1, "y": "a"}]
+
+    # query eq: bool is type-distinct from int (keeps True); 1 == 1.0 numerically.
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, True, 2]}})
+    coll.update_one({"_id": 1}, {"$pull": {"a": 1}})
+    assert coll.find_one({"_id": 1})["a"] == [True, 2]
+
+    # $pullAll removes every listed value by literal equality.
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, 2, 3, 2, 1]}})
+    coll.update_one({"_id": 1}, {"$pullAll": {"a": [1, 2]}})
+    assert coll.find_one({"_id": 1})["a"] == [3]

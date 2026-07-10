@@ -77,8 +77,7 @@ CURATED = [
     ({}, {"$bit": {"b": {"or": 7}}}, False),
     ({}, {"$push": {"tags": "x"}}, False),
     ({"tags": ["x"]}, {"$push": {"tags": "y"}}, False),
-    # $push / $addToSet $each modifiers: multi-append, $position, $slice (compute);
-    # $sort defers to Python.
+    # $push / $addToSet $each modifiers: multi-append, $position, $slice, $sort.
     ({"a": [3, 1, 2]}, {"$push": {"a": {"$each": [5, 4]}}}, False),
     ({}, {"$push": {"a": {"$each": [1, 2, 3]}}}, False),
     ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9], "$slice": -2}}}, False),
@@ -87,7 +86,6 @@ CURATED = [
     ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9], "$position": -1}}}, False),
     ({"a": [1, 2]}, {"$addToSet": {"a": {"$each": [2, 3, 3, 4]}}}, False),
     ({}, {"$addToSet": {"a": {"$each": [1, 1, 2]}}}, False),
-    ({"a": [1, 2]}, {"$push": {"a": {"$each": [4, 3], "$sort": 1}}}, False),  # $sort -> defer
     ({"a": [1, 2, 3]}, {"$pop": {"a": 1}}, False),
     ({"a": [1, 2, 3]}, {"$pop": {"a": -1}}, False),
     ({"a": []}, {"$pop": {"a": 1}}, False),
@@ -121,9 +119,44 @@ CURATED = [
     ({"a": 5}, {"$addToSet": {"a": 1}}, False),  # non-array -> defer (Python raises)
     # $pull — remove elements `==` the criterion (value compare, not query).
     ({"a": [1, 2, 3, 2]}, {"$pull": {"a": 2}}, False),
-    ({"a": [{"x": 1}, {"x": 2}]}, {"$pull": {"a": {"x": 1}}}, False),  # structural
-    ({"a": [1, True, 2]}, {"$pull": {"a": 1}}, False),  # 1==True removes both
+    ({"a": [{"x": 1}, {"x": 2}]}, {"$pull": {"a": {"x": 1}}}, False),  # sub-doc match
+    ({"a": [1, True, 2]}, {"$pull": {"a": 1}}, False),  # query eq: bool != int (keeps True)
+    ({"a": [1, 1.0, 2]}, {"$pull": {"a": 1}}, False),  # query eq: 1 == 1.0 (removes both)
     ({"a": 5}, {"$pull": {"a": 1}}, False),  # non-array -> no-op
+    # $pull with a query predicate / sub-document criterion (via query::matches).
+    ({"a": [1, 5, 10, 15]}, {"$pull": {"a": {"$gte": 10}}}, False),
+    ({"a": [1, 2, 3, 4]}, {"$pull": {"a": {"$in": [2, 4]}}}, False),
+    ({"a": [1, 2, 3]}, {"$pull": {"a": {"$lt": 3}}}, False),
+    (
+        {"a": [{"x": 1, "y": "a"}, {"x": 5, "y": "b"}, {"x": 9, "y": "c"}]},
+        {"$pull": {"a": {"x": {"$gte": 5}}}},
+        False,
+    ),
+    (
+        {"a": [{"x": 1, "y": "a"}, {"x": 5, "y": "b"}]},
+        {"$pull": {"a": {"y": "b"}}},
+        False,
+    ),
+    ({"a": [{"b": {"c": 1}}, {"b": {"c": 2}}]}, {"$pull": {"a": {"b.c": 2}}}, False),
+    # $pullAll — literal equality over a value list.
+    ({"a": [1, 2, 3, 2, 1]}, {"$pullAll": {"a": [1, 2]}}, False),
+    ({"a": [1, 2, 3]}, {"$pullAll": {"a": [9]}}, False),  # nothing removed
+    ({"a": 5}, {"$pullAll": {"a": [1]}}, False),  # non-array field -> no-op
+    # $push $sort — 1/-1 whole-element and {field: dir} sorts (BSON order).
+    ({"a": [1, 2]}, {"$push": {"a": {"$each": [4, 3], "$sort": 1}}}, False),
+    ({"a": [3, 1, 2]}, {"$push": {"a": {"$each": [], "$sort": -1}}}, False),
+    (
+        {"a": [{"s": 3}, {"s": 1}]},
+        {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1}}}},
+        False,
+    ),
+    (
+        {"a": [{"s": 1}, {"s": 3}]},
+        {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": -1}}}},
+        False,
+    ),
+    # $push $sort + $slice combined (position -> sort -> slice).
+    ({"a": [5, 1, 3]}, {"$push": {"a": {"$each": [2, 4], "$sort": 1, "$slice": 3}}}, False),
     # $bit already handled above.
     # Cases the Rust path should defer (rust returns None -> skipped):
     ({"_id": 1}, {"_id": 2, "x": 9}, False),  # _id change -> error path
@@ -245,6 +278,7 @@ def _rand_update(rng):
             "$max",
             "$addToSet",
             "$pull",
+            "$pullAll",
             "replace",
         ]
     )
@@ -268,6 +302,14 @@ def _rand_update(rng):
             if rng.random() < 0.2:
                 val["$sort"] = rng.choice([1, -1])
         return {op: {field: val}}
+    if op == "$pull" and rng.random() < 0.4:
+        # $pull with a query predicate criterion.
+        pred = rng.choice(
+            [{"$gte": rng.randint(-3, 3)}, {"$lt": rng.randint(-3, 3)}, {"$in": [1, 2, 3]}]
+        )
+        return {op: {field: pred}}
+    if op == "$pullAll":
+        return {op: {field: [_rand_scalar(rng) for _ in range(rng.randint(0, 3))]}}
     if op in ("$push", "$min", "$max", "$addToSet", "$pull"):
         return {op: {field: _rand_scalar(rng)}}
     if op == "$pop":

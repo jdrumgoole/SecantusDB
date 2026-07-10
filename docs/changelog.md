@@ -19,6 +19,39 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+### `$pull` query semantics, `$pullAll`, and `$push $sort` on the Rust server
+
+A three-way differential against real `mongod` 6.0 turned up two array-update
+**correctness** bugs present on both servers, plus a Rust-server feature gap —
+all now fixed and three-way verified.
+
+`$pull` previously removed only elements *literally equal* to the criterion, so a
+predicate like `{$pull: {a: {$gte: 10}}}` silently removed nothing and a
+sub-document criterion like `{$pull: {a: {x: 5}}}` never matched. `$pull` now
+applies the criterion under full query semantics — an operator-only criterion
+(`{$gte: 10}`, `{$in: […]}`) is an element-value predicate; any other document
+criterion is a sub-document match against each element; a scalar is BSON-aware
+equality (so `1` matches `1.0` but not `true`, exactly as mongod does — the old
+literal-`==` path wrongly conflated `1` and `true`). `$pullAll`, which removes
+every element equal to any value in a list, was **entirely unimplemented** (both
+servers rejected it as an unknown modifier) and now works. On the Rust server the
+`$push` `$sort` modifier (`1` / `-1` whole-element or `{field: dir}`, in BSON
+order) now computes natively instead of deferring.
+
+#### Fixed
+
+- `update.py` / `secantus-core`: `$pull` now matches via the query engine
+  (`query.matches` / `query::matches`) instead of literal equality; `$pullAll`
+  added to both engines and to the Rust `KNOWN_UPDATE_OPS` validator.
+
+#### Added
+
+- `secantus-core`: `$push` `$sort` (whole-element and `{field: dir}` forms) on the
+  Rust server, via the shared `order::cmp` / `is_sortable` contract; an element
+  outside the sortable subset still defers. `$inc` / `$mul` with a Decimal128
+  operand remains a Rust-side defer (decimal arithmetic parity is out of scope —
+  `tasks/backlog.md` §7.5).
+
 ### Trigonometric expression operators (both servers)
 
 The full trigonometric family lands on both servers — circular, inverse, and

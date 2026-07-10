@@ -390,7 +390,7 @@ const PIPELINE_UPDATE_STAGES: [&str; 6] = [
 
 /// Update modifiers mongod accepts (`secantus.update._KNOWN_UPDATE_OPS`). A
 /// top-level `$`-key outside this set is an "Unknown modifier" parse error.
-const KNOWN_UPDATE_OPS: [&str; 14] = [
+const KNOWN_UPDATE_OPS: [&str; 15] = [
     "$set",
     "$setOnInsert",
     "$unset",
@@ -402,6 +402,7 @@ const KNOWN_UPDATE_OPS: [&str; 14] = [
     "$push",
     "$addToSet",
     "$pull",
+    "$pullAll",
     "$pop",
     "$rename",
     "$bit",

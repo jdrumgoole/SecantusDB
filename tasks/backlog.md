@@ -1411,7 +1411,15 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   bit-for-bit; domain violations raise mongod's `Location50989` — `$asin`/`$acos`/
   `$atanh` need [-1,1], `$acosh` needs [1,∞), `$sin`/`$cos`/`$tan` reject ±inf/NaN;
   `$atanh(±1)` → ±inf; non-numeric raises `Location28765`, `$atan2` `Location51044`;
-  Decimal128 is float-cast on Python and defers on Rust); the
+  Decimal128 is float-cast on Python and defers on Rust); the **array-update
+  operators** `$pull` (query semantics — element-value predicate / sub-document
+  match / BSON-aware equality via `query::matches`, replacing the old literal-`==`
+  path that silently ignored predicates and wrongly conflated `1`/`true`),
+  `$pullAll` (literal-equality removal, previously unimplemented on *both* servers —
+  rejected as an unknown modifier), and the Rust-server `$push` `$sort` modifier
+  (`1`/`-1` whole-element or `{field: dir}`, BSON order via `order::cmp`;
+  0.5.3-beta.145 / 0.5.4b208 — found by a three-way update differential vs mongod
+  6.0, all four fixes verified with zero divergences); the
   bitwise **expression** operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
   (0.5.3-beta.136 / 0.5.4b164 — int/long operands, int32/int64 result width,
   empty-list identity, null propagation; a non-integer operand raises), and the

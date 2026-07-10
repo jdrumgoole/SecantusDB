@@ -30,6 +30,7 @@ _KNOWN_UPDATE_OPS = frozenset(
         "$push",
         "$addToSet",
         "$pull",
+        "$pullAll",
         "$pop",
         "$rename",
         "$bit",
@@ -100,6 +101,24 @@ def _push_slice(arr: list[Any], n: Any) -> list[Any]:
     if n == 0:
         return []
     return arr[:n] if n > 0 else arr[n:]
+
+
+def _pull_matches(matches: Any, element: Any, criterion: Any) -> bool:
+    """Whether an array element should be removed by ``$pull`` under mongod's
+    query semantics (verified three-way vs mongod 6.0):
+
+    - a criterion of only ``$``-operators (``{$gte: 10}``) is an **element-value
+      predicate** — each element is tested as the value;
+    - any other document criterion (``{x: {$gte: 5}}``, ``{y: "b"}``, ``{b.c: 2}``)
+      is a **sub-document match** against the element (a scalar element never
+      matches, so it stays);
+    - a scalar criterion is equality (BSON-aware, via the same query engine).
+    """
+    if isinstance(criterion, Mapping):
+        if criterion and all(isinstance(k, str) and k.startswith("$") for k in criterion):
+            return matches({"__e": element}, {"__e": criterion})
+        return matches(element, criterion) if isinstance(element, Mapping) else False
+    return matches({"__e": element}, {"__e": criterion})
 
 
 def validate_update_doc(update: Any) -> None:
@@ -449,11 +468,21 @@ def _apply_op(
                         arr.append(elem)
                 set_path(doc, concrete, arr)
     elif op == "$pull":
+        from secantus.query import matches
+
         for path, criterion in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
                 if isinstance(arr, list):
-                    arr[:] = [e for e in arr if e != criterion]
+                    arr[:] = [e for e in arr if not _pull_matches(matches, e, criterion)]
+    elif op == "$pullAll":
+        for path, values in payload.items():
+            if not isinstance(values, list):
+                raise UpdateError("$pullAll requires an array argument")
+            for concrete in _expand(doc, path, array_filters, positional_matches):
+                arr = get_path(doc, concrete, default=None)
+                if isinstance(arr, list):
+                    arr[:] = [e for e in arr if not any(e == v for v in values)]
     elif op == "$pop":
         for path, direction in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
