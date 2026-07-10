@@ -28,12 +28,15 @@ def test_stop_drains_in_flight_change_stream_before_close(tmp_path) -> None:
     srv = SecantusDBServer(port=0, storage_path=str(tmp_path))
     srv.start()
     mc = MongoClient(srv.uri, serverSelectionTimeoutMS=3000)
+    cs = None
+    watcher = None
     try:
         coll = mc["db"]["c"]
         coll.insert_one({"_id": 1})
         # A long await time parks the server-side getMore on the oplog CV.
         cs = coll.watch(max_await_time_ms=10_000)
-        threading.Thread(target=lambda: [cs.try_next() for _ in range(2)], daemon=True).start()
+        watcher = threading.Thread(target=lambda: [cs.try_next() for _ in range(2)], daemon=True)
+        watcher.start()
         time.sleep(0.3)  # let the getMore enter the oplog-CV wait
         assert srv._active_conns >= 1, "expected an in-flight connection thread"
 
@@ -46,8 +49,21 @@ def test_stop_drains_in_flight_change_stream_before_close(tmp_path) -> None:
         assert srv._active_conns == 0
         assert elapsed < 5.0, f"stop() took {elapsed:.1f}s — drain didn't signal the waiter"
     finally:
+        # Reap the client-side watcher thread. Closing the change stream + client
+        # unblocks its in-flight ``try_next`` (a getMore ``recv`` that, on
+        # Windows, does *not* return when only the server closes the socket) so
+        # the thread exits instead of lingering into xdist worker shutdown. A
+        # leaked thread stuck in that recv kept the worker alive until the 25-min
+        # faulthandler watchdog killed it — reported as a "crash" against
+        # whatever unlucky test ran next. join()+assert makes a regression loud.
+        with contextlib.suppress(Exception):
+            if cs is not None:
+                cs.close()
         with contextlib.suppress(Exception):
             mc.close()
+        if watcher is not None:
+            watcher.join(timeout=15)
+            assert not watcher.is_alive(), "change-stream watcher thread failed to reap"
 
 
 @pytest.mark.slow
