@@ -1714,9 +1714,19 @@ SELECT dept, array_agg(sal) FILTER (WHERE active) FROM emp GROUP BY dept;
 SELECT string_agg(dept, ',') FILTER (WHERE active) FROM emp;
 ```
 
+`FILTER` also combines with `DISTINCT` — `count(DISTINCT x) FILTER (WHERE cond)`
+counts the distinct `x`-values drawn only from matching rows (likewise
+`sum`/`avg`), in the SELECT list and in `HAVING`:
+
+```sql
+SELECT dept, count(DISTINCT sal) FILTER (WHERE active) FROM emp GROUP BY dept;
+SELECT dept FROM emp GROUP BY dept HAVING count(DISTINCT sal) FILTER (WHERE active) > 1;
+```
+
 The condition supports comparisons, `AND` / `OR` / `NOT`, and `IS [NOT] NULL`. Not
-supported (both `0A000`): `FILTER` combined with `DISTINCT`, or with an in-call
-`ORDER BY` (`array_agg(x ORDER BY y) FILTER (…)`).
+supported (`0A000`): `FILTER` with an in-call `ORDER BY`
+(`array_agg(x ORDER BY y) FILTER (…)`), and `DISTINCT` aggregates under
+`GROUPING SETS` / `ROLLUP` / `CUBE`.
 
 `DISTINCT` inside an aggregate is supported for `COUNT` / `SUM` / `AVG` (and is a
 no-op for `MIN` / `MAX`, which are unaffected by duplicates). It deduplicates the

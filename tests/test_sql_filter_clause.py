@@ -5,8 +5,10 @@ aggregate. Lowered to a ``$cond`` inside each accumulator (neutral element 0 for
 sum/count, NULL for avg/min/max). The ``$push``-based aggregates
 (``array_agg`` / ``string_agg`` / ``jsonb_object_agg``) push a ``None`` sentinel
 for non-matching rows and drop it in the post-``$group`` projection. Works in the
-SELECT list (grouped, joined, and no-GROUP-BY), and in HAVING. Not supported with
-DISTINCT or an in-aggregate ORDER BY.
+SELECT list (grouped, joined, and no-GROUP-BY), and in HAVING — and combines with
+``DISTINCT`` (``count(DISTINCT x) FILTER (WHERE cond)``: the aggregate over the
+distinct set of x-values drawn only from matching rows). Not supported with an
+in-aggregate ORDER BY.
 """
 
 from __future__ import annotations
@@ -263,10 +265,68 @@ def test_filter_on_array_agg_with_order_by_unsupported(emp, session):
     )
 
 
-def test_filter_with_distinct_unsupported(emp, session):
-    assert (
-        sqlstate(
-            emp, session, "SELECT count(DISTINCT sal) FILTER (WHERE active) FROM emp GROUP BY dept"
-        )
-        == "0A000"
-    )
+# -- FILTER + DISTINCT -------------------------------------------------------- #
+
+
+def test_count_distinct_filter_grouped(emp, session):
+    # active rows: a{100,300}, b{400} -> distinct counts 2, 1.
+    rows = run(
+        emp,
+        session,
+        "SELECT dept, count(DISTINCT sal) FILTER (WHERE active) "
+        "FROM emp GROUP BY dept ORDER BY dept",
+    ).rows
+    assert rows == [("a", 2), ("b", 1)]
+
+
+def test_sum_distinct_filter_grouped(emp, session):
+    # a: 100+300=400 ; b: 400.
+    rows = run(
+        emp,
+        session,
+        "SELECT dept, sum(DISTINCT sal) FILTER (WHERE active) FROM emp GROUP BY dept ORDER BY dept",
+    ).rows
+    assert rows == [("a", 400), ("b", 400)]
+
+
+def test_avg_distinct_filter_grouped(emp, session):
+    rows = run(
+        emp,
+        session,
+        "SELECT dept, avg(DISTINCT sal) FILTER (WHERE active) FROM emp GROUP BY dept ORDER BY dept",
+    ).rows
+    assert rows == [("a", 200.0), ("b", 400.0)]
+
+
+def test_count_distinct_filter_dedups_matching_rows(emp, session):
+    # A second active row with sal=100 in dept a must NOT change the distinct count.
+    run(emp, session, "INSERT INTO emp VALUES (6,'a',100,33,true)")
+    rows = run(
+        emp,
+        session,
+        "SELECT dept, count(DISTINCT sal) FILTER (WHERE active) "
+        "FROM emp GROUP BY dept ORDER BY dept",
+    ).rows
+    assert rows == [("a", 2), ("b", 1)]
+
+
+def test_distinct_filter_in_having(emp, session):
+    rows = run(
+        emp,
+        session,
+        "SELECT dept FROM emp GROUP BY dept "
+        "HAVING count(DISTINCT sal) FILTER (WHERE active) > 1 ORDER BY dept",
+    ).rows
+    assert rows == [("a",)]  # a has 2 distinct active sals, b has 1
+
+
+def test_distinct_filter_over_join(emp, session):
+    run(emp, session, "CREATE TABLE dept (name text PRIMARY KEY, region text)")
+    run(emp, session, "INSERT INTO dept VALUES ('a','west'), ('b','east')")
+    rows = run(
+        emp,
+        session,
+        "SELECT d.region, count(DISTINCT e.sal) FILTER (WHERE e.active) "
+        "FROM emp e JOIN dept d ON e.dept = d.name GROUP BY d.region ORDER BY d.region",
+    ).rows
+    assert rows == [("east", 1), ("west", 2)]

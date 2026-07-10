@@ -2461,8 +2461,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   non-matching rows (`_push_filtered`) and drop it in the post-`$group` projection (`_array_agg_project`
   / `_jsonb_object_agg_project`; `string_agg`'s reduce already skips nulls) — across single-table,
   GROUPING SETS, and JOIN+GROUP paths. array_agg boxes matching values as `{v}` so a matching NULL
-  survives the drop. **Not supported (→ `0A000`):** `FILTER` with `DISTINCT`, or with an in-aggregate
-  `ORDER BY` (the sorted-push path would need the sentinel threaded through the executor finish).
+  survives the drop. **`FILTER` + `DISTINCT` landed** (b209): `count`/`sum`/`avg`(`DISTINCT x`)
+  `FILTER (WHERE cond)` threads `fcond` into `_register_distinct_agg`, whose `$addToSet` now collects
+  `_push_filtered(field, fcond)` — a non-matching row contributes `None`, which `_distinct_reduction`'s
+  existing NULL filter drops, so only matching rows' distinct values count. Wired at every distinct-agg
+  registration site (single-table + JOIN SELECT list, HAVING, and the group-window / hidden-agg
+  closures — the last of which previously *silently dropped* a HAVING-only distinct FILTER). `min`/`max`
+  (`DISTINCT`) already worked (they fall through to the plain accumulator, which threads `fcond`).
+  **Not supported (→ `0A000`):** `FILTER` with an in-aggregate `ORDER BY` (the sorted-push path would
+  need the sentinel threaded through the executor finish), and `DISTINCT` aggregates (with or without
+  FILTER) under GROUPING SETS (blocked by the broader ROLLUP/CUBE distinct guard).
 - [ ] **`ALTER DOMAIN` landed** (b125): `ADD [CONSTRAINT c] CHECK (…) [NOT VALID]`, `DROP CONSTRAINT
   [IF EXISTS] c`, `SET DEFAULT expr` / `DROP DEFAULT`, `SET NOT NULL` / `DROP NOT NULL`, and `RENAME TO
   new`. Handled in `engine._alter_domain_command` (Command-parsed; catalog `update_domain`). `ADD …
