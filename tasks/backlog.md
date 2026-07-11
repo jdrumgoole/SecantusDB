@@ -2918,8 +2918,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`DISTINCT x`) — with or without `FILTER` — route through `_register_distinct_agg` inside each grouping
   set's branch (a `$addToSet` accumulator + a per-branch `$addFields` reduction stage before the branch's
   `$project`); `min`/`max`(`DISTINCT`) take the plain accumulator (a distinct extremum equals the raw
-  extremum). `count(DISTINCT *)` → `0A000`. **Limitations:** single-table only (GROUPING SETS over a JOIN
-  → `feature_not_supported`); no `HAVING` or correlated WHERE with GROUPING SETS; no window over GROUPING
+  extremum). `count(DISTINCT *)` → `0A000`. **`HAVING` with GROUPING SETS landed** (b213): each grouping
+  set's branch resolves the HAVING via the shared `_having_to_match` (before its `$group` is built, so any
+  hidden aggregate accumulator the predicate needs lands in the group stage) and applies the resulting
+  `$match` to that branch's grouped rows; every branch registers HAVING identically so the `$unionWith`
+  shapes stay aligned. Aggregate predicates (incl. `count`/`sum`/`avg`(`DISTINCT`) and aggregates not in
+  the select list), group-column predicates (a set that aggregated the column away compares against NULL,
+  per Postgres), and `AND`/`OR` combinations all work. **Limitations:** single-table only (GROUPING SETS
+  over a JOIN → `feature_not_supported`); no correlated WHERE with GROUPING SETS; no window over GROUPING
   SETS.
 - [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`

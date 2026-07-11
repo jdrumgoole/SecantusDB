@@ -189,3 +189,70 @@ def test_rollup_count_distinct_star_rejected(storage, session):
     with pytest.raises(errors.SQLError) as ei:
         rows(storage, session, "SELECT region, count(DISTINCT *) FROM t GROUP BY ROLLUP(region)")
     assert ei.value.sqlstate == "0A000"
+
+
+# -- HAVING with GROUPING SETS ----------------------------------------------- #
+
+
+def test_rollup_having_on_count(storage, session):
+    # region e has 3 rows, w has 2; the grand-total row has 5. HAVING count(*) > 2
+    # keeps e and the grand total.
+    got = rows(
+        storage,
+        session,
+        "SELECT region, count(*) AS c FROM t GROUP BY ROLLUP(region) HAVING count(*) > 2",
+    )
+    assert _order(got) == [("e", 3), (None, 5)]
+
+
+def test_rollup_having_on_sum(storage, session):
+    # e sum 35, w sum 45, grand total 80. HAVING sum(amt) >= 45 keeps w + total.
+    got = rows(
+        storage,
+        session,
+        "SELECT region, sum(amt) AS s FROM t GROUP BY ROLLUP(region) HAVING sum(amt) >= 45",
+    )
+    assert _order(got) == [("w", 45), (None, 80)]
+
+
+def test_grouping_sets_having_on_group_column(storage, session):
+    # HAVING on a group column: only the region='e' subtotal row (the grand-total
+    # row has region NULL and is excluded).
+    got = rows(
+        storage,
+        session,
+        "SELECT region, count(*) AS c FROM t GROUP BY ROLLUP(region) HAVING region = 'e'",
+    )
+    assert got == [("e", 3)]
+
+
+def test_rollup_having_aggregate_not_selected(storage, session):
+    # HAVING references an aggregate that isn't in the select list.
+    got = rows(
+        storage,
+        session,
+        "SELECT region FROM t GROUP BY ROLLUP(region) HAVING sum(amt) > 40",
+    )
+    assert _order(got) == [("w",), (None,)]  # w=45, total=80; e=35 excluded
+
+
+def test_cube_having_and_predicate(storage, session):
+    got = rows(
+        storage,
+        session,
+        "SELECT region, count(*) AS c FROM t GROUP BY CUBE(region) "
+        "HAVING count(*) >= 2 AND sum(amt) > 40",
+    )
+    assert _order(got) == [("w", 2), (None, 5)]
+
+
+def test_rollup_having_count_distinct(storage, session):
+    # count(DISTINCT city) per region: e has {ny, bos}=2, w has {sf}=1; grand total
+    # {ny, bos, sf}=3. HAVING count(DISTINCT city) >= 2 keeps e + grand total.
+    got = rows(
+        storage,
+        session,
+        "SELECT region, count(DISTINCT city) AS d FROM t GROUP BY ROLLUP(region) "
+        "HAVING count(DISTINCT city) >= 2",
+    )
+    assert _order(got) == [("e", 2), (None, 3)]
