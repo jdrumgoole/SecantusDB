@@ -3275,9 +3275,7 @@ def _plan_pipeline_select(
     if stmt.args.get("joins"):
         if _has_grouping_sets(stmt):
             if _select_has_window(stmt):
-                raise errors.feature_not_supported(
-                    "window functions over GROUPING SETS are not supported"
-                )
+                return _plan_join_grouping_sets_window_select(stmt, db, catalog, storage)
             return _plan_join_grouping_sets_select(stmt, db, catalog, storage)
         has_agg = any(
             _aggregate_of(e) is not None
@@ -5803,6 +5801,139 @@ def _plan_join_grouping_sets_select(
         )
     _append_sort_limit(pipeline, stmt, out_columns, amap=amap)
     return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
+
+
+def _plan_join_grouping_sets_window_select(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
+) -> EvaluatedSelectPlan:
+    """Window function(s) over a GROUPING SETS / ROLLUP / CUBE query that *also* sits
+    over a JOIN — the join analogue of ``_plan_grouping_sets_window_select`` (b219),
+    combined with the join grouping-sets union (b218).
+
+    Each grouping set's branch replays the ``$lookup``/``$unwind``/``$match`` join
+    prefix and projects *flat* group-column + aggregate fields (aggregate args and
+    group keys resolved through the join resolver); the branches are unioned via
+    ``$unionWith``; then the union is handed to the evaluated executor, which
+    computes each window over the grouped rows. A rolled-up row (a group column
+    reads NULL) still participates, and ``GROUPING()`` is available inside the
+    window's ORDER BY / PARTITION BY."""
+    stmt = stmt.copy()  # we mutate the tree, replacing aggregates / GROUPING with columns
+    base, _amap, resolve, join_prefix, derived = _build_join_pipeline(stmt, db, catalog, storage)
+    if stmt.args.get("where") is not None and where_needs_per_row(stmt):
+        raise errors.feature_not_supported(
+            "a correlated WHERE with a window over GROUPING SETS over a JOIN is not supported"
+        )
+    having = stmt.args.get("having")
+    if having is not None and having.this.find(exp.Select) is not None:
+        raise errors.feature_not_supported(
+            "a subquery in HAVING with a window over GROUPING SETS over a JOIN is not supported"
+        )
+    group_node = stmt.args["group"]
+    # Computed grouping keys over a JOIN aren't materialised here (bare columns only).
+    col_node_for = _group_col_nodes(group_node)
+    sets = _grouping_sets(group_node)
+    group_cols = sorted({c for gs in sets for c in gs})
+
+    names = _NameAllocator()
+    field_tags: dict[str, str] = {}
+    group_keys: dict[str, str] = {}  # bare name -> resolved "$path" (for HAVING)
+    key_tag: dict[str, str] = {}
+    for c in group_cols:
+        path, tag = resolve(col_node_for[c])
+        group_keys[c] = f"${path}"
+        key_tag[c] = tag
+        field_tags[c] = tag
+        names.fresh(c)  # reserve group names so synthetic agg fields never collide
+
+    accumulators: dict[str, Any] = {}
+    reductions: dict[str, Any] = {}
+    agg_fields: dict[str, str] = {}  # _agg_key -> field name
+    agg_field_names: list[str] = []
+
+    def register_agg(node: exp.AggFunc) -> str:
+        arr_arg = _array_agg_arg(node)
+        if arr_arg is not None:
+            fname = names.fresh("array_agg")
+            path, _ = resolve(arr_arg)
+            accumulators[fname] = {"$push": f"${path}"}
+            field_tags[fname] = "json"
+            agg_field_names.append(fname)
+            return fname
+        agg = _join_aggregate_of(node)
+        if agg is None:
+            raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
+        func, arg, distinct = agg
+        key = _agg_key(func, arg, resolve, distinct)
+        if key in agg_fields:
+            return agg_fields[key]
+        where = _agg_filter_where(node)
+        fcond = _filter_cond_to_agg(where, resolve) if where is not None else None
+        if distinct and func in _DISTINCT_FUNCS:
+            if arg is None:
+                raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+            path, tag = resolve(arg)
+            fname, tag = _register_distinct_agg(
+                func, path, tag, None, names, accumulators, reductions, fcond
+            )
+        else:
+            acc, tag = _join_accumulator(func, arg, resolve, fcond)
+            fname = names.fresh(func)
+            accumulators[fname] = acc
+        agg_fields[key] = fname
+        field_tags[fname] = tag
+        agg_field_names.append(fname)
+        return fname
+
+    # ``GROUPING(col, …)`` → a per-branch literal bitmask field, rewritten to a
+    # column reference so the window phase resolves it like any grouped field.
+    grouping_specs: list[tuple[str, list[str]]] = []
+    for gnode in list(stmt.find_all(exp.Grouping)):
+        gcols = [_column_name(a) for a in gnode.expressions]
+        for c in gcols:
+            if c not in col_node_for:
+                raise errors.feature_not_supported(
+                    f"GROUPING() argument must be a grouping column: {c}"
+                )
+        gfname = names.fresh("grouping")
+        field_tags[gfname] = "int4"
+        grouping_specs.append((gfname, gcols))
+        gnode.replace(exp.column(gfname))
+
+    for node in _group_agg_nodes(stmt):
+        node.replace(exp.column(register_agg(node)))
+
+    having_match = (
+        _join_having_to_match(
+            having.this, resolve, accumulators, agg_fields, group_keys, key_tag, names, reductions
+        )
+        if having is not None
+        else None
+    )
+
+    def branch(gset: list[str]) -> list[dict[str, Any]]:
+        in_set = set(gset)
+        group_id = {c: f"${resolve(col_node_for[c])[0]}" for c in gset} or None
+        project: dict[str, Any] = {"_id": 0}
+        for c in group_cols:
+            project[c] = f"$_id.{c}" if c in in_set else {"$literal": None}
+        for fname in agg_field_names:
+            project[fname] = f"${fname}"
+        for gfname, gcols in grouping_specs:
+            project[gfname] = {"$literal": _grouping_bitmask(gcols, in_set)}
+        stages: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+        if reductions:
+            stages.append({"$addFields": reductions})
+        if having_match is not None:
+            stages.append({"$match": having_match})
+        stages.append({"$project": project})
+        return stages
+
+    pipeline = list(join_prefix) + branch(sets[0])
+    for gset in sets[1:]:
+        pipeline.append(
+            {"$unionWith": {"coll": base.collection, "pipeline": list(join_prefix) + branch(gset)}}
+        )
+    return _finish_group_window(stmt, base.collection, {}, pipeline, field_tags, derived)
 
 
 def _plan_join_group_window_select(

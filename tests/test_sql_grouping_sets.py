@@ -198,17 +198,54 @@ def test_grouping_sets_over_join_computed_key_rejected(dim, session):
     assert ei.value.sqlstate == "0A000"
 
 
-def test_grouping_sets_over_join_window_rejected(dim, session):
-    # A window over GROUPING SETS is supported single-table (b219) but not yet when
-    # the GROUPING SETS also sits over a JOIN — that combo stays 0A000.
-    with pytest.raises(errors.SQLError) as ei:
-        rows(
-            dim,
-            session,
-            "SELECT u.label, SUM(t.amt), row_number() OVER (ORDER BY SUM(t.amt)) "
-            "FROM t JOIN u ON t.region = u.region GROUP BY ROLLUP(u.label)",
-        )
-    assert ei.value.sqlstate == "0A000"
+def test_window_over_grouping_sets_join(dim, session):
+    # A window over GROUPING SETS that also sits over a JOIN (b221).
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, SUM(t.amt) AS tot, row_number() OVER (ORDER BY SUM(t.amt)) AS rn "
+        "FROM t JOIN u ON t.region = u.region GROUP BY ROLLUP(u.label) ORDER BY rn",
+    )
+    # East = 35, West = 45, grand total = 80 → ranked ascending by sum.
+    assert got == [("East", 35, 1), ("West", 45, 2), (None, 80, 3)]
+
+
+def test_window_over_grouping_sets_join_grouping_helper(dim, session):
+    # GROUPING() usable inside the window ORDER BY over the join.
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, GROUPING(u.label) AS g, SUM(t.amt) AS tot, "
+        "row_number() OVER (ORDER BY GROUPING(u.label), u.label) AS rn "
+        "FROM t JOIN u ON t.region = u.region GROUP BY ROLLUP(u.label) ORDER BY rn",
+    )
+    assert got == [("East", 0, 35, 1), ("West", 0, 45, 2), (None, 1, 80, 3)]
+
+
+def test_window_over_grouping_sets_join_having(dim, session):
+    # HAVING prunes grouped rows before the window ranks the survivors.
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, SUM(t.amt) AS tot, row_number() OVER (ORDER BY SUM(t.amt)) AS rn "
+        "FROM t JOIN u ON t.region = u.region GROUP BY ROLLUP(u.label) "
+        "HAVING SUM(t.amt) >= 45 ORDER BY rn",
+    )
+    # East (35) filtered out; West (45) and grand total (80) survive.
+    assert got == [("West", 45, 1), (None, 80, 2)]
+
+
+def test_window_over_grouping_sets_join_count_distinct(dim, session):
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, count(DISTINCT t.amt) AS c, "
+        "rank() OVER (ORDER BY count(DISTINCT t.amt) DESC) AS rk "
+        "FROM t JOIN u ON t.region = u.region GROUP BY ROLLUP(u.label) "
+        "ORDER BY rk, u.label NULLS LAST",
+    )
+    # East {10,20,5}=3, West {30,15}=2, all {10,20,5,30,15}=5 → rank by distinct desc.
+    assert got == [(None, 5, 1), ("East", 3, 2), ("West", 2, 3)]
 
 
 # -- DISTINCT aggregates under GROUPING SETS --------------------------------- #

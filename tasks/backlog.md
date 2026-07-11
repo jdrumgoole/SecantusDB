@@ -2992,11 +2992,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   evaluated executor computes the windows over the grouped rows. A rolled-up row (group column NULL) still
   participates in the window; `GROUPING()` is materialised as a per-branch literal field and usable inside
   the window's `ORDER BY`/`PARTITION BY`; `HAVING` filters each branch before the window.
-  **Limitations:** a window over GROUPING SETS that *also* sits over a JOIN → `0A000` (the join grouping-sets
-  path still rejects windows); a subquery in `HAVING` alongside a window over GROUPING SETS → `0A000`; a
-  *computed* grouping key over a JOIN (`ROLLUP(lower(d.label))`) is not materialised (bare-column
-  `_grouping_sets` → `0A000`); a correlated / per-row WHERE with GROUPING SETS over a JOIN →
-  `feature_not_supported`; single-table GROUPING SETS with an in-aggregate `ORDER BY` over a JOIN → `0A000`.
+  **Window over GROUPING SETS *and* a JOIN landed** (b221): `_plan_join_grouping_sets_window_select` combines
+  b218 (join grouping-sets union, aggregate args / group keys resolved through the join resolver, join prefix
+  replayed per branch) with b219 (flat per-branch projection + `GROUPING()` materialisation → `_finish_group_window`
+  runs the windows over the union). `HAVING`, `count(DISTINCT)`, and `GROUPING()` in the window ORDER BY all work.
+  **Limitations:** a subquery in `HAVING` alongside a window over GROUPING SETS → `0A000`; a *computed* grouping
+  key over a JOIN (`ROLLUP(lower(d.label))`) is not materialised (bare-column `_grouping_sets` → `0A000`); a
+  correlated / per-row WHERE with GROUPING SETS over a JOIN → `feature_not_supported`; single-table GROUPING
+  SETS with an in-aggregate `ORDER BY` over a JOIN → `0A000`.
 - [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
   routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`
