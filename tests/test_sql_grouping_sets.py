@@ -199,7 +199,8 @@ def test_grouping_sets_over_join_computed_key_rejected(dim, session):
 
 
 def test_grouping_sets_over_join_window_rejected(dim, session):
-    # A window over GROUPING SETS (join or not) is still rejected — b219.
+    # A window over GROUPING SETS is supported single-table (b219) but not yet when
+    # the GROUPING SETS also sits over a JOIN — that combo stays 0A000.
     with pytest.raises(errors.SQLError) as ei:
         rows(
             dim,

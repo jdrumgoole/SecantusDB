@@ -120,3 +120,68 @@ def test_non_grouped_column_rejected(storage):
     with pytest.raises(errors.SQLError) as ei:
         storage.q("SELECT dept, sal, RANK() OVER (ORDER BY SUM(sal)) FROM emp GROUP BY dept")
     assert ei.value.sqlstate == "42803"
+
+
+# -- window over GROUPING SETS / ROLLUP / CUBE (b219) ------------------------- #
+
+
+def test_row_number_over_rollup(storage):
+    # SUM(sal) per region: e=60 (10+20+30), w=60 (5+15+40); grand total 120.
+    # Ordered by SUM(sal) DESC then region: the grand-total row (120) ranks first.
+    res = storage.q(
+        "SELECT region, SUM(sal) AS s, "
+        "ROW_NUMBER() OVER (ORDER BY SUM(sal) DESC, region NULLS FIRST) AS rn "
+        "FROM emp GROUP BY ROLLUP(region) ORDER BY rn"
+    )
+    assert res.rows == [(None, 120, 1), ("e", 60, 2), ("w", 60, 3)]
+
+
+def test_rank_partition_over_cube(storage):
+    # CUBE(region) → per-region rows + the grand total. PARTITION BY region makes
+    # each row its own partition, so every rank is 1.
+    res = storage.q(
+        "SELECT region, SUM(sal) AS s, "
+        "RANK() OVER (PARTITION BY region ORDER BY SUM(sal)) AS rk "
+        "FROM emp GROUP BY CUBE(region) ORDER BY region NULLS LAST"
+    )
+    assert res.rows == [("e", 60, 1), ("w", 60, 1), (None, 120, 1)]
+
+
+def test_grouping_helper_with_window(storage):
+    # GROUPING(region) is 0 on the per-region rows, 1 on the rolled-up total; the
+    # window orders by (GROUPING, region) so the total sorts last.
+    res = storage.q(
+        "SELECT region, GROUPING(region) AS g, SUM(sal) AS s, "
+        "ROW_NUMBER() OVER (ORDER BY GROUPING(region), region) AS rn "
+        "FROM emp GROUP BY ROLLUP(region) ORDER BY rn"
+    )
+    assert res.rows == [("e", 0, 60, 1), ("w", 0, 60, 2), (None, 1, 120, 3)]
+
+
+def test_having_and_window_over_rollup(storage):
+    # HAVING prunes grouped rows before the window ranks the survivors.
+    res = storage.q(
+        "SELECT region, SUM(sal) AS s, ROW_NUMBER() OVER (ORDER BY region NULLS LAST) AS rn "
+        "FROM emp GROUP BY ROLLUP(region) HAVING SUM(sal) >= 100 ORDER BY rn"
+    )
+    # only the grand total (120) survives HAVING SUM(sal) >= 100.
+    assert res.rows == [(None, 120, 1)]
+
+
+def test_running_window_over_grouping_sets(storage):
+    # A running SUM over the grouped rows of GROUPING SETS ((region), ()).
+    res = storage.q(
+        "SELECT region, SUM(sal) AS s, "
+        "SUM(SUM(sal)) OVER (ORDER BY region NULLS LAST) AS run "
+        "FROM emp GROUP BY GROUPING SETS ((region), ()) ORDER BY region NULLS LAST"
+    )
+    # e=60 (run 60), w=60 (run 120), total=120 (run 240).
+    assert res.rows == [("e", 60, 60), ("w", 60, 120), (None, 120, 240)]
+
+
+def test_column_tags_window_over_rollup(storage):
+    res = storage.q(
+        "SELECT region, SUM(sal) AS s, ROW_NUMBER() OVER (ORDER BY SUM(sal)) AS rn "
+        "FROM emp GROUP BY ROLLUP(region)"
+    )
+    assert [c.type_tag for c in res.columns] == ["text", "int4", "int8"]
