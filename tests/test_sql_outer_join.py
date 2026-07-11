@@ -3,8 +3,10 @@
 `$lookup` is left-driven, so `A RIGHT JOIN B` is planned as `B LEFT JOIN A`
 (drive from B, look A up, preserve unmatched B), and `A FULL JOIN B` is the
 LEFT join from A unioned with the B rows that found no A match (reshaped so B's
-columns sit under its alias and A's read as NULL). Only the two-table case is
-supported; a chain mixing in a RIGHT/FULL is rejected.
+columns sit under its alias and A's read as NULL). A *pure*-RIGHT chain of 3+
+tables reverses into a LEFT chain driven from the last table (adjacency-guarded);
+mixed LEFT/RIGHT chains, a non-adjacent RIGHT ON, and any multi-table FULL stay
+`0A000`.
 """
 
 from __future__ import annotations
@@ -131,10 +133,117 @@ def test_right_join_with_scalar_expr(storage, session):
     assert _sorted(rows) == [("A1", 5), ("A1", 7), ("A2", 3), (None, 9)]
 
 
-def test_three_table_right_join_rejected(storage, session):
+def test_mixed_inner_and_right_chain_rejected(storage, session):
+    # A chain mixing an INNER (or LEFT) join with a RIGHT one can't be reversed into
+    # a single pure-LEFT chain — it stays 0A000.
     storage.q("CREATE TABLE c (id bigint primary key)")
     with pytest.raises(SQLError) as ei:
         q(storage, session, "SELECT * FROM a RIGHT JOIN b ON a.id = b.aid JOIN c ON c.id = a.id")
+    assert ei.value.sqlstate == "0A000"
+
+
+# -- pure-RIGHT chains of 3+ tables ------------------------------------------ #
+
+
+@pytest.fixture
+def chain(storage, session):
+    # a(id, av), b(id, aid, bv), c(id, bid, cv): each RIGHT-joins the prior table.
+    storage.q("CREATE TABLE bb (id bigint primary key, aid bigint, bv text)")
+    storage.q("CREATE TABLE cc (id bigint primary key, bid bigint, cv text)")
+    storage.q("INSERT INTO bb (id, aid, bv) VALUES (10, 1, 'b10'), (11, 1, 'b11'), (12, 99, 'b12')")
+    storage.q(
+        "INSERT INTO cc (id, bid, cv) VALUES "
+        "(100, 10, 'c100'), (101, 12, 'c101'), (102, 88, 'c102')"
+    )
+    return storage
+
+
+def test_three_table_right_chain(chain, session):
+    # Keep every cc row, then match bb, then aa. c100→b10→a1 ; c101→b12(aid 99, no a)
+    # ; c102→(bid 88, no b, so no a).
+    rows = q(
+        chain,
+        session,
+        "SELECT a.av, bb.bv, cc.cv FROM a RIGHT JOIN bb ON a.id = bb.aid "
+        "RIGHT JOIN cc ON bb.id = cc.bid",
+    ).rows
+    assert _sorted(rows) == [("a1", "b10", "c100"), (None, "b12", "c101"), (None, None, "c102")]
+
+
+def test_three_table_right_chain_where(chain, session):
+    rows = q(
+        chain,
+        session,
+        "SELECT a.av, cc.cv FROM a RIGHT JOIN bb ON a.id = bb.aid "
+        "RIGHT JOIN cc ON bb.id = cc.bid WHERE cc.cv IS NOT NULL ORDER BY cc.cv",
+    ).rows
+    assert rows == [("a1", "c100"), (None, "c101"), (None, "c102")]
+
+
+def test_three_table_right_chain_select_star_column_order(chain, session):
+    # SELECT * keeps FROM order (a.*, bb.*, cc.*) even though the pipeline drives
+    # from cc; the fully-unmatched cc row null-pads a and bb.
+    res = q(
+        chain,
+        session,
+        "SELECT * FROM a RIGHT JOIN bb ON a.id = bb.aid RIGHT JOIN cc ON bb.id = cc.bid "
+        "ORDER BY cc.id",
+    )
+    assert [c.name for c in res.columns] == ["id", "av", "id_2", "aid", "bv", "id_3", "bid", "cv"]
+    assert res.rows[-1] == (None, None, None, None, None, 102, 88, "c102")
+
+
+def test_three_table_right_chain_group_by(chain, session):
+    rows = q(
+        chain,
+        session,
+        "SELECT cc.cv, count(a.av) FROM a RIGHT JOIN bb ON a.id = bb.aid "
+        "RIGHT JOIN cc ON bb.id = cc.bid GROUP BY cc.cv ORDER BY cc.cv",
+    ).rows
+    # only c100 has a matching a; count(a.av) counts non-null → 1, else 0.
+    assert rows == [("c100", 1), ("c101", 0), ("c102", 0)]
+
+
+def test_four_table_right_chain(chain, session):
+    chain.q("CREATE TABLE dd (id bigint primary key, cid bigint, dv text)")
+    chain.q("INSERT INTO dd (id, cid, dv) VALUES (1000, 100, 'd1000'), (1001, 999, 'd1001')")
+    rows = q(
+        chain,
+        session,
+        "SELECT a.av, bb.bv, cc.cv, dd.dv FROM a RIGHT JOIN bb ON a.id = bb.aid "
+        "RIGHT JOIN cc ON bb.id = cc.bid RIGHT JOIN dd ON cc.id = dd.cid ORDER BY dd.dv",
+    ).rows
+    assert rows == [("a1", "b10", "c100", "d1000"), (None, None, None, "d1001")]
+
+
+def test_right_chain_non_adjacent_on_rejected(chain, session):
+    # The 2nd RIGHT ON references a non-adjacent table (a, not bb) — can't reverse.
+    with pytest.raises(SQLError) as ei:
+        q(
+            chain,
+            session,
+            "SELECT * FROM a RIGHT JOIN bb ON a.id = bb.aid RIGHT JOIN cc ON a.id = cc.bid",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_mixed_left_right_chain_rejected(chain, session):
+    with pytest.raises(SQLError) as ei:
+        q(
+            chain,
+            session,
+            "SELECT * FROM a LEFT JOIN bb ON a.id = bb.aid RIGHT JOIN cc ON bb.id = cc.bid",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_full_in_three_table_chain_rejected(chain, session):
+    with pytest.raises(SQLError) as ei:
+        q(
+            chain,
+            session,
+            "SELECT * FROM a FULL JOIN bb ON a.id = bb.aid RIGHT JOIN cc ON bb.id = cc.bid",
+        )
     assert ei.value.sqlstate == "0A000"
 
 
