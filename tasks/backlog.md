@@ -2978,10 +2978,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   aggregate args resolve through the join resolver (`_group_col_nodes` maps each bare grouping name to its
   qualified `exp.Column` so `resolve` can reach the post-unwind path); `HAVING`, `count`/`sum`/`avg`
   (`DISTINCT`), `array_agg`/`string_agg`/`jsonb_object_agg`, and the `GROUPING()` helper all work per set.
-  **Limitations:** no window over GROUPING SETS; a *computed* grouping key over a JOIN
-  (`ROLLUP(lower(d.label))`) is not materialised on this path (bare-column `_grouping_sets` → `0A000`); a
-  correlated / per-row WHERE with GROUPING SETS over a JOIN → `feature_not_supported`; single-table
-  GROUPING SETS with an in-aggregate `ORDER BY` over a JOIN → `0A000`.
+  **Window over GROUPING SETS landed** (b219, single-table): `_plan_grouping_sets_window_select` runs the
+  grouping-sets `$unionWith` pipeline but each branch projects *flat* group-column + aggregate fields (via
+  the same `register_agg` the window+GROUP path uses), then hands the union to `_finish_group_window` so the
+  evaluated executor computes the windows over the grouped rows. A rolled-up row (group column NULL) still
+  participates in the window; `GROUPING()` is materialised as a per-branch literal field and usable inside
+  the window's `ORDER BY`/`PARTITION BY`; `HAVING` filters each branch before the window.
+  **Limitations:** a window over GROUPING SETS that *also* sits over a JOIN → `0A000` (the join grouping-sets
+  path still rejects windows); a subquery in `HAVING` alongside a window over GROUPING SETS → `0A000`; a
+  *computed* grouping key over a JOIN (`ROLLUP(lower(d.label))`) is not materialised (bare-column
+  `_grouping_sets` → `0A000`); a correlated / per-row WHERE with GROUPING SETS over a JOIN →
+  `feature_not_supported`; single-table GROUPING SETS with an in-aggregate `ORDER BY` over a JOIN → `0A000`.
 - [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
   routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`
