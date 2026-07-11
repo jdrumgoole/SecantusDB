@@ -115,15 +115,99 @@ def test_grouping_sets_with_where_and_order(storage, session):
     assert got == [("e", 30), ("w", 45), (None, 75)]
 
 
-def test_grouping_sets_over_join_rejected(storage, session):
-    run_sql(storage, DB, "CREATE TABLE u (id bigint primary key, region text)", session=session)
-    with pytest.raises(errors.SQLError):
+# -- GROUPING SETS over a JOIN ----------------------------------------------- #
+
+
+@pytest.fixture
+def dim(storage, session):
+    # A region → label dimension to join against `t`.
+    run_sql(storage, DB, "CREATE TABLE u (region text primary key, label text)", session=session)
+    run_sql(storage, DB, "INSERT INTO u VALUES ('e', 'East'), ('w', 'West')", session=session)
+    return storage
+
+
+def test_rollup_over_join(dim, session):
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, SUM(t.amt) FROM t JOIN u ON t.region = u.region "
+        "GROUP BY ROLLUP(u.label) ORDER BY u.label NULLS LAST",
+    )
+    # East = 10+20+5 = 35, West = 30+15 = 45, grand total 80.
+    assert got == [("East", 35), ("West", 45), (None, 80)]
+
+
+def test_cube_over_join(dim, session):
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, t.city, SUM(t.amt) FROM t JOIN u ON t.region = u.region "
+        "GROUP BY CUBE(u.label, t.city)",
+    )
+    # CUBE(label, city): (label,city)=3 + (label)=2 + (city)=3 + ()=1 = 9 rows.
+    assert len(got) == 9
+    assert (None, None, 80) in got  # grand total
+    assert ("East", None, 35) in got  # label subtotal
+    assert (None, "ny", 30) in got  # city subtotal across regions
+    assert ("East", "ny", 30) in got  # leaf
+
+
+def test_grouping_sets_over_join_count_distinct(dim, session):
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, count(DISTINCT t.amt) FROM t JOIN u ON t.region = u.region "
+        "GROUP BY ROLLUP(u.label) ORDER BY u.label NULLS LAST",
+    )
+    # East distinct amts {10,20,5}=3, West {30,15}=2, all {10,20,5,30,15}=5.
+    assert got == [("East", 3), ("West", 2), (None, 5)]
+
+
+def test_grouping_sets_over_join_having(dim, session):
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, SUM(t.amt) FROM t JOIN u ON t.region = u.region "
+        "GROUP BY ROLLUP(u.label) HAVING SUM(t.amt) >= 45 ORDER BY u.label NULLS LAST",
+    )
+    # East (35) filtered out; West (45) and grand total (80) survive.
+    assert got == [("West", 45), (None, 80)]
+
+
+def test_grouping_over_join_bitmask(dim, session):
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, GROUPING(u.label) AS g, SUM(t.amt) "
+        "FROM t JOIN u ON t.region = u.region "
+        "GROUP BY ROLLUP(u.label) ORDER BY u.label NULLS LAST",
+    )
+    # GROUPING(label) is 0 for the per-label rows, 1 for the rolled-up total.
+    assert got == [("East", 0, 35), ("West", 0, 45), (None, 1, 80)]
+
+
+def test_grouping_sets_over_join_computed_key_rejected(dim, session):
+    # A computed grouping key over a JOIN isn't materialised on this path yet.
+    with pytest.raises(errors.SQLError) as ei:
         rows(
-            storage,
+            dim,
             session,
-            "SELECT t.region, SUM(t.amt) FROM t JOIN u ON t.region = u.region "
-            "GROUP BY ROLLUP(t.region)",
+            "SELECT lower(u.label), SUM(t.amt) FROM t JOIN u ON t.region = u.region "
+            "GROUP BY ROLLUP(lower(u.label))",
         )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_grouping_sets_over_join_window_rejected(dim, session):
+    # A window over GROUPING SETS (join or not) is still rejected — b219.
+    with pytest.raises(errors.SQLError) as ei:
+        rows(
+            dim,
+            session,
+            "SELECT u.label, SUM(t.amt), row_number() OVER (ORDER BY SUM(t.amt)) "
+            "FROM t JOIN u ON t.region = u.region GROUP BY ROLLUP(u.label)",
+        )
+    assert ei.value.sqlstate == "0A000"
 
 
 # -- DISTINCT aggregates under GROUPING SETS --------------------------------- #
