@@ -1760,9 +1760,21 @@ SELECT region, city, SUM(amount)
 FROM sales GROUP BY GROUPING SETS ((region), (city), ());
 ```
 
-A leading plain `GROUP BY a, ROLLUP(b)` keeps `a` in every grouping set. These
-are single-table only (a `JOIN`, `HAVING`, `DISTINCT` aggregate, or window over
-GROUPING SETS is rejected).
+A leading plain `GROUP BY a, ROLLUP(b)` keeps `a` in every grouping set.
+`HAVING` and `DISTINCT` aggregates (`count(DISTINCT x)`) work per grouping set,
+and the whole construct runs **over a `JOIN`** too — each grouping set replays the
+`$lookup`/`$unwind` join prefix before its own `$group`, so `GROUP BY ROLLUP(d.label)`
+across joined tables produces the same subtotal hierarchy:
+
+```sql
+SELECT d.label, SUM(t.amt), GROUPING(d.label) AS g
+FROM t JOIN d ON t.region = d.region
+GROUP BY ROLLUP(d.label);
+```
+
+A window over GROUPING SETS, a *computed* grouping key over a JOIN
+(`GROUP BY ROLLUP(lower(d.label))`), and a correlated `WHERE` with GROUPING SETS
+over a JOIN are still rejected (`0A000`).
 
 The `GROUPING(a, …)` super-aggregate helper is supported: it returns a bitmask
 that is 1 for each argument rolled up (absent from that row's grouping set) and 0
@@ -3163,7 +3175,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE`/`MERGE` (incl. `WITH RECURSIVE` before a write); data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE … RETURNING …)`) | statement-level snapshot semantics; `WITH CHECK OPTION` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (both directions; `field <@ const` runs residual)/`?`/`?\|`/`?&`, column-to-column + arithmetic, function calls in a comparison (`amt = abs(target)`, single-table + GROUP BY / JOIN pipelines), `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | a comparison function the aggregation engine can't lower (e.g. `substr`) |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
-| Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) (select list *and* `HAVING`, single-table + JOIN), an **expression over an aggregate** (`sum(x)+1`, `round(avg(x),2)`), a **computed GROUP BY key** (`GROUP BY lower(name)`, `GROUP BY a+b`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table, incl. `HAVING` and `COUNT`/`SUM`/`AVG`(`DISTINCT`) per set) + the `GROUPING()` super-aggregate helper, **`ORDER BY <position>`** (`ORDER BY 1`) and **`ORDER BY <aggregate>`** (`ORDER BY count(*) DESC`, when selected) | `GROUPING SETS` over a JOIN, or with a window / correlated WHERE |
+| Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) (select list *and* `HAVING`, single-table + JOIN), an **expression over an aggregate** (`sum(x)+1`, `round(avg(x),2)`), a **computed GROUP BY key** (`GROUP BY lower(name)`, `GROUP BY a+b`), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table **and over a JOIN**, incl. `HAVING` and `COUNT`/`SUM`/`AVG`(`DISTINCT`) per set) + the `GROUPING()` super-aggregate helper, **`ORDER BY <position>`** (`ORDER BY 1`) and **`ORDER BY <aggregate>`** (`ORDER BY count(*) DESC`, when selected) | `GROUPING SETS` with a window, a *computed* grouping key over a JOIN, or a correlated WHERE over a JOIN |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` frames (`UNBOUNDED`/`CURRENT ROW` **and** numeric `n PRECEDING`/`n FOLLOWING` offsets) | non-numeric/interval `RANGE` offset |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | `RIGHT`/`FULL` in a 3+ table chain, `LATERAL` over a join / aggregate subquery |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql`, single-statement body), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, `LANGUAGE plpgsql` / multi-statement functions |

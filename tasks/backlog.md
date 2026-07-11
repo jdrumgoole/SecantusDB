@@ -2971,9 +2971,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `$match` to that branch's grouped rows; every branch registers HAVING identically so the `$unionWith`
   shapes stay aligned. Aggregate predicates (incl. `count`/`sum`/`avg`(`DISTINCT`) and aggregates not in
   the select list), group-column predicates (a set that aggregated the column away compares against NULL,
-  per Postgres), and `AND`/`OR` combinations all work. **Limitations:** single-table only (GROUPING SETS
-  over a JOIN → `feature_not_supported`); no correlated WHERE with GROUPING SETS; no window over GROUPING
-  SETS.
+  per Postgres), and `AND`/`OR` combinations all work. **GROUPING SETS over a JOIN landed** (b218):
+  `_plan_join_grouping_sets_select` + `_join_grouping_set_branch` build the `$lookup`/`$unwind`/`$match`
+  join prefix once (via `_build_join_pipeline`), then union a per-grouping-set `$group`/`$project` branch
+  that *replays* that prefix in each `$unionWith` (re-reading the base collection). Group columns /
+  aggregate args resolve through the join resolver (`_group_col_nodes` maps each bare grouping name to its
+  qualified `exp.Column` so `resolve` can reach the post-unwind path); `HAVING`, `count`/`sum`/`avg`
+  (`DISTINCT`), `array_agg`/`string_agg`/`jsonb_object_agg`, and the `GROUPING()` helper all work per set.
+  **Limitations:** no window over GROUPING SETS; a *computed* grouping key over a JOIN
+  (`ROLLUP(lower(d.label))`) is not materialised on this path (bare-column `_grouping_sets` → `0A000`); a
+  correlated / per-row WHERE with GROUPING SETS over a JOIN → `feature_not_supported`; single-table
+  GROUPING SETS with an in-aggregate `ORDER BY` over a JOIN → `0A000`.
 - [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
   routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`
