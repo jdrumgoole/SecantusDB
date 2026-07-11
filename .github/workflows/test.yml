@@ -127,7 +127,12 @@ jobs:
         # tests/test_admin_*.py; without it those tests error at import
         # time. ``website`` is intentionally excluded — pelican / boto3
         # aren't exercised by pytest and would just slow CI down.
-        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+        # ``--python`` pins the venv to the MATRIX interpreter: without it
+        # ``uv sync`` honours the repo's ``.python-version`` (3.12), so every
+        # matrix cell — including the scheduled 3.10-3.13 sweep — was silently
+        # testing 3.12 (a "3.10" job's traceback showed hostedtoolcache
+        # Python 3.12.10).
+        run: uv sync --python ${{ matrix.python-version }} --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
       - name: Lint
         run: uv run ruff check src tests
@@ -220,7 +225,12 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dependencies
-        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+        # ``--python`` pins the venv to the MATRIX interpreter: without it
+        # ``uv sync`` honours the repo's ``.python-version`` (3.12), so every
+        # matrix cell — including the scheduled 3.10-3.13 sweep — was silently
+        # testing 3.12 (a "3.10" job's traceback showed hostedtoolcache
+        # Python 3.12.10).
+        run: uv sync --python ${{ matrix.python-version }} --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
       - name: Install tzdata
         # Windows ships no IANA timezone database; Python's
@@ -301,7 +311,12 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dependencies
-        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+        # ``--python`` pins the venv to the MATRIX interpreter: without it
+        # ``uv sync`` honours the repo's ``.python-version`` (3.12), so every
+        # matrix cell — including the scheduled 3.10-3.13 sweep — was silently
+        # testing 3.12 (a "3.10" job's traceback showed hostedtoolcache
+        # Python 3.12.10).
+        run: uv sync --python ${{ matrix.python-version }} --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
       - name: Slow tests
         # Long-running stress / scaling tests carry ``@pytest.mark.slow`` and are
