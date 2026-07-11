@@ -54,6 +54,14 @@ jobs:
     # tests/conftest.py) blocks the runner until GitHub's 6-hour kill with no
     # diagnostics. macOS is dropped from this matrix for the same flakiness
     # (9e16e49); the cap also protects the release-time macOS run.
+    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
+    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
+    # (3.12); without it, a bare `uv run` after the sync re-resolves against
+    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
+    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
+    # same mechanism that made every matrix cell silently test 3.12 before.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -127,12 +135,7 @@ jobs:
         # tests/test_admin_*.py; without it those tests error at import
         # time. ``website`` is intentionally excluded — pelican / boto3
         # aren't exercised by pytest and would just slow CI down.
-        # ``--python`` pins the venv to the MATRIX interpreter: without it
-        # ``uv sync`` honours the repo's ``.python-version`` (3.12), so every
-        # matrix cell — including the scheduled 3.10-3.13 sweep — was silently
-        # testing 3.12 (a "3.10" job's traceback showed hostedtoolcache
-        # Python 3.12.10).
-        run: uv sync --python ${{ matrix.python-version }} --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
       - name: Lint
         run: uv run ruff check src tests
@@ -168,6 +171,14 @@ jobs:
   # platform-independent.
   test-windows:
     runs-on: windows-latest
+    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
+    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
+    # (3.12); without it, a bare `uv run` after the sync re-resolves against
+    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
+    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
+    # same mechanism that made every matrix cell silently test 3.12 before.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -225,12 +236,7 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dependencies
-        # ``--python`` pins the venv to the MATRIX interpreter: without it
-        # ``uv sync`` honours the repo's ``.python-version`` (3.12), so every
-        # matrix cell — including the scheduled 3.10-3.13 sweep — was silently
-        # testing 3.12 (a "3.10" job's traceback showed hostedtoolcache
-        # Python 3.12.10).
-        run: uv sync --python ${{ matrix.python-version }} --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
       - name: Install tzdata
         # Windows ships no IANA timezone database; Python's
@@ -263,6 +269,14 @@ jobs:
   # taking ~11 min off the workflow's critical path.
   test-durable:
     runs-on: ubuntu-latest
+    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
+    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
+    # (3.12); without it, a bare `uv run` after the sync re-resolves against
+    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
+    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
+    # same mechanism that made every matrix cell silently test 3.12 before.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -311,12 +325,7 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dependencies
-        # ``--python`` pins the venv to the MATRIX interpreter: without it
-        # ``uv sync`` honours the repo's ``.python-version`` (3.12), so every
-        # matrix cell — including the scheduled 3.10-3.13 sweep — was silently
-        # testing 3.12 (a "3.10" job's traceback showed hostedtoolcache
-        # Python 3.12.10).
-        run: uv sync --python ${{ matrix.python-version }} --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
       - name: Slow tests
         # Long-running stress / scaling tests carry ``@pytest.mark.slow`` and are
