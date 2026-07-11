@@ -314,7 +314,7 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
         "$in" => {
             let arr = arg.as_array().ok_or(Fallback)?;
             for cand in arr {
-                if eq_with_array(values, cand, coll)? {
+                if in_candidate_matches(values, cand, coll)? {
                     return Ok(true);
                 }
             }
@@ -323,7 +323,7 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
         "$nin" => {
             let arr = arg.as_array().ok_or(Fallback)?;
             for cand in arr {
-                if eq_with_array(values, cand, coll)? {
+                if in_candidate_matches(values, cand, coll)? {
                     return Ok(false);
                 }
             }
@@ -368,6 +368,18 @@ fn is_exotic(b: &Bson) -> bool {
             | Bson::DbPointer(_)
             | Bson::Undefined
     )
+}
+
+/// A single `$in` / `$nin` candidate. A regex candidate matches string values by
+/// pattern (mongod semantics — bare equality would silently match nothing);
+/// everything else is array-aware, collation-aware equality. Mirrors
+/// `query._in_candidate_matches`.
+fn in_candidate_matches(values: &[Option<&Bson>], cand: &Bson, coll: Option<&Collation>) -> R {
+    if matches!(cand, Bson::RegularExpression(_)) {
+        op_regex(values, cand, None)
+    } else {
+        eq_with_array(values, cand, coll)
+    }
 }
 
 fn eq_with_array(values: &[Option<&Bson>], expected: &Bson, coll: Option<&Collation>) -> R {
@@ -1040,6 +1052,20 @@ fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
         let Some(Bson::Array(arr)) = v else { continue };
         let mut all_present = true;
         for r in required {
+            // A `{$elemMatch: {...}}` clause requires *some* element of the array
+            // to match the sub-query (mongod's `$all` + `$elemMatch` form).
+            if let Bson::Document(rd) = r {
+                if rd.len() == 1 {
+                    if let Some(sub) = rd.get("$elemMatch") {
+                        let arr_bson = Bson::Array(arr.clone());
+                        if !op_elem_match(&[Some(&arr_bson)], sub)? {
+                            all_present = false;
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
             let mut found = false;
             for e in arr {
                 let matched = match r {

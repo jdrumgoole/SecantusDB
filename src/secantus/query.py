@@ -292,6 +292,17 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
     return _eq_with_array(values, condition, collation)
 
 
+def _in_candidate_matches(
+    values: list[Any], candidate: Any, collation: Collation | None = None
+) -> bool:
+    """A single `$in` / `$nin` candidate: a regex candidate matches string values
+    by pattern (mongod semantics — the old bare-equality path silently matched
+    nothing); everything else is array-aware, collation-aware equality."""
+    if isinstance(candidate, Regex):
+        return _op_regex(values, candidate.pattern, candidate.flags)
+    return _eq_with_array(values, candidate, collation)
+
+
 def _eq_with_array(values: list[Any], expected: Any, collation: Collation | None = None) -> bool:
     for v in values:
         if v is MISSING:
@@ -373,9 +384,9 @@ def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | Non
     if op == "$lte":
         return _cmp(values, arg, lambda a, b: a <= b, collation)
     if op == "$in":
-        return any(_eq_with_array(values, candidate, collation) for candidate in arg)
+        return any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$nin":
-        return not any(_eq_with_array(values, candidate, collation) for candidate in arg)
+        return not any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$exists":
         present = any(v is not MISSING for v in values)
         return present == bool(arg)
@@ -906,10 +917,16 @@ def _op_all(values: list[Any], required: Any) -> bool:
             return False
         return elem == r
 
+    def _required_satisfied(v: list[Any], r: Any) -> bool:
+        # A `{$elemMatch: {...}}` clause requires *some* element of the array to
+        # match the sub-query (mongod's `$all` + `$elemMatch` form); every other
+        # clause requires some element to equal / pattern-match it.
+        if isinstance(r, Mapping) and list(r.keys()) == ["$elemMatch"]:
+            return _op_elem_match([v], r["$elemMatch"])
+        return any(_elem_matches_required(elem, r) for elem in v)
+
     for v in values:
-        if isinstance(v, list) and all(
-            any(_elem_matches_required(elem, r) for elem in v) for r in required
-        ):
+        if isinstance(v, list) and all(_required_satisfied(v, r) for r in required):
             return True
     return False
 

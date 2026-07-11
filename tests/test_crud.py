@@ -511,6 +511,45 @@ def test_query_all(coll) -> None:
     assert ids == [1, 3]
 
 
+def test_query_all_with_elemmatch(coll) -> None:
+    coll.insert_many(
+        [
+            {"_id": 1, "a": [1, 2, 3]},
+            {"_id": 2, "a": [4, 5]},
+            {"_id": 3, "a": [1, 5, 10]},
+        ]
+    )
+    ids = sorted(
+        d["_id"] for d in coll.find({"a": {"$all": [{"$elemMatch": {"$gt": 1, "$lt": 3}}]}})
+    )
+    assert ids == [1]
+    ids2 = sorted(
+        d["_id"]
+        for d in coll.find(
+            {"a": {"$all": [{"$elemMatch": {"$gt": 4}}, {"$elemMatch": {"$lt": 2}}]}}
+        )
+    )
+    assert ids2 == [3]
+
+
+def test_query_in_with_regex(coll) -> None:
+    from bson import Regex
+
+    coll.insert_many(
+        [
+            {"_id": 1, "s": "hello"},
+            {"_id": 2, "s": "World"},
+            {"_id": 3, "s": "HELLO"},
+            {"_id": 4, "s": "hi"},
+        ]
+    )
+    ids = sorted(d["_id"] for d in coll.find({"s": {"$in": [Regex("^h", "i")]}}))
+    assert ids == [1, 3, 4]
+    # $nin excludes the regex matches.
+    ids2 = sorted(d["_id"] for d in coll.find({"s": {"$nin": [Regex("^h", "i")]}}))
+    assert ids2 == [2]
+
+
 def test_query_mod(coll) -> None:
     coll.insert_many([{"_id": i, "n": i} for i in range(10)])
     ids = sorted(d["_id"] for d in coll.find({"n": {"$mod": [3, 0]}}))

@@ -1419,7 +1419,12 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   rejected as an unknown modifier), and the Rust-server `$push` `$sort` modifier
   (`1`/`-1` whole-element or `{field: dir}`, BSON order via `order::cmp`;
   0.5.3-beta.145 / 0.5.4b208 — found by a three-way update differential vs mongod
-  6.0, all four fixes verified with zero divergences); the
+  6.0, all four fixes verified with zero divergences); the **query match
+  operators** `$in` / `$nin` with a **regex candidate** (matches string values by
+  pattern, not by literal equality — the old path silently matched nothing / errored
+  on Rust) and `$all` with **`$elemMatch` clauses** (each clause requires some array
+  element to satisfy its sub-query; 0.5.3-beta.146 / 0.5.4b209 — found by a
+  three-way query differential vs mongod 6.0, both fixes verified Rust==Python); the
   bitwise **expression** operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
   (0.5.3-beta.136 / 0.5.4b164 — int/long operands, int32/int64 result width,
   empty-list identity, null propagation; a non-integer operand raises), and the
@@ -1442,6 +1447,17 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
   both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
   bit-for-bit despite CPython 3.12's compensated `sum()`).
+- [ ] **Rust query — cross-type range comparison defers (`$gt`/`$gte`/`$lt`/`$lte`).**
+  `compare_values` in `secantus-core/src/query.rs` returns `Fallback` whenever either
+  operand is a document / array / exotic type, so a range predicate against a
+  cross-type operand (e.g. a document-valued array element vs `{$gt: 2}`) errors on
+  the Rust server where mongod compares by BSON canonical-type order (a document
+  out-ranks every number). The Python server is correct. This surfaces via
+  `$elemMatch` / `$all` + `$elemMatch` over an array of documents (found by the
+  three-way query differential, 2026-07-10). A faithful fix ports mongod's
+  cross-type ordering into the matcher (`crate::order` has the total order but
+  defers on the same non-sortable subset) — deferred as a delicate core-`cmp`
+  change. Same-type range comparisons (the common case) are correct.
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
