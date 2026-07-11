@@ -27,6 +27,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from types import FrameType, TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -96,6 +97,9 @@ class SecantusPGServer:
         self._stop_event = threading.Event()
         self._conns: set[socket.socket] = set()
         self._conns_lock = threading.Lock()
+        # Live handler threads, joined by ``stop()`` (pruned of dead threads on
+        # each accept so the set stays bounded by the connection cap).
+        self._handler_threads: set[threading.Thread] = set()
         # Server-wide LISTEN / NOTIFY channel registry.
         self._notify = NotifyHub()
         # Server-wide live-session registry for pg_stat_activity (#137), plus a
@@ -188,6 +192,19 @@ class SecantusPGServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        # Drain handler threads before returning: a handler mid-request may
+        # still be using its per-thread WT session, and an embedder is entitled
+        # to call ``storage.close()`` right after ``stop()`` — closing a WT
+        # session another thread is concurrently using corrupts the session
+        # handle (surfaces as a ``Session__freecb`` TypeError during close).
+        with self._conns_lock:
+            handlers = [t for t in self._handler_threads if t.is_alive()]
+            self._handler_threads.clear()
+        deadline = time.monotonic() + 5.0
+        for t in handlers:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+            if t.is_alive():
+                logger.warning("pg handler thread %s still alive after stop()", t.name)
         if self._owns_storage:
             with contextlib.suppress(Exception):
                 self.storage.close()
@@ -220,7 +237,11 @@ class SecantusPGServer:
                 continue
             with contextlib.suppress(OSError):
                 conn.settimeout(self.client_idle_timeout_s)
-            threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+            handler = threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True)
+            with self._conns_lock:
+                self._handler_threads = {t for t in self._handler_threads if t.is_alive()}
+                self._handler_threads.add(handler)
+            handler.start()
 
     # -- per-connection ----------------------------------------------------- #
 
