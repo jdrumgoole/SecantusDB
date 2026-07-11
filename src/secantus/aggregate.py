@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
-from secantus.expressions import ExpressionError, evaluate
+from secantus.expressions import MISSING, ExpressionError, evaluate, evaluate_or_missing
 from secantus.numerics import bson_add
 from secantus.paths import get_path, set_path, unset_path
 from secantus.query import QueryError, matches
@@ -876,16 +876,21 @@ def _acc_last(
 def _acc_push(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    bucket.setdefault(field, []).append(evaluate(arg, doc, vars))
+    # mongod skips a missing field value (an explicit null is still pushed); the
+    # accumulated field is created as [] even when every value is missing.
+    lst = bucket.setdefault(field, [])
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is not MISSING:
+        lst.append(v)
 
 
 def _acc_add_to_set(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    v = evaluate(arg, doc, vars)
-    bucket.setdefault(field, [])
-    if v not in bucket[field]:
-        bucket[field].append(v)
+    seen = bucket.setdefault(field, [])
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is not MISSING and v not in seen:
+        seen.append(v)
 
 
 def _acc_std(

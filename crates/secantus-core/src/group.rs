@@ -34,6 +34,22 @@ fn eval(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
     expressions::evaluate(doc, expr, vars).map_err(|_| ())
 }
 
+/// Evaluate an accumulator input, distinguishing a missing field from an explicit
+/// null: a top-level absent field path yields `None` (skip), everything else
+/// (incl. a present null) yields `Some(value)`. Mirrors
+/// `expressions.evaluate_or_missing`; `$push` / `$addToSet` skip missing values as
+/// mongod does.
+fn eval_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Option<Bson>> {
+    if let Bson::String(s) = expr {
+        if let Some(path) = s.strip_prefix('$') {
+            if !path.starts_with('$') {
+                return Ok(crate::paths::get_path(doc, path).cloned());
+            }
+        }
+    }
+    eval(expr, doc, vars).map(Some)
+}
+
 /// Canonical, hashable group-key — mirrors `_hashable` + Python dict equality.
 /// Also used by `$densify` for partition keys (same dict semantics).
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -301,9 +317,15 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             }
         }
         Acc::Last(slot) => *slot = Some(eval(arg, doc, vars)?),
-        Acc::Push(list) => list.push(eval(arg, doc, vars)?),
+        Acc::Push(list) => {
+            if let Some(v) = eval_or_missing(arg, doc, vars)? {
+                list.push(v);
+            }
+        }
         Acc::AddToSet(list) => {
-            let v = eval(arg, doc, vars)?;
+            let Some(v) = eval_or_missing(arg, doc, vars)? else {
+                return Ok(());
+            };
             let mut present = false;
             for existing in list.iter() {
                 if expressions::py_eq(&v, existing).map_err(|_| ())? {

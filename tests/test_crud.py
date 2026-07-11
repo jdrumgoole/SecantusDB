@@ -1013,6 +1013,23 @@ def test_aggregate_group_with_avg(coll) -> None:
     assert out == [{"_id": "a", "avg": 3.0}, {"_id": "b", "avg": 10.0}]
 
 
+def test_aggregate_push_addtoset_skip_missing(coll) -> None:
+    """$push / $addToSet skip a missing field value (mongod semantics), keep null."""
+    coll.insert_many(
+        [
+            {"_id": 1, "g": "a", "s": "x"},
+            {"_id": 2, "g": "a"},  # missing s -> skipped
+            {"_id": 3, "g": "a", "s": None},  # explicit null -> kept
+            {"_id": 4, "g": "a", "s": "x"},
+        ]
+    )
+    out = list(coll.aggregate([{"$group": {"_id": "$g", "p": {"$push": "$s"}}}]))
+    assert out == [{"_id": "a", "p": ["x", None, "x"]}]
+    out2 = list(coll.aggregate([{"$group": {"_id": "$g", "v": {"$addToSet": "$s"}}}]))
+    v = out2[0]["v"]
+    assert sorted(x for x in v if x is not None) == ["x"] and None in v
+
+
 def test_aggregate_replace_root(coll) -> None:
     coll.insert_one({"_id": 1, "inner": {"a": 1, "b": 2}})
     out = list(coll.aggregate([{"$replaceRoot": {"newRoot": "$inner"}}]))

@@ -6,6 +6,20 @@ from bson import Int64
 from secantus.aggregate import AggregateError, apply_pipeline
 
 
+def test_push_addtoset_skip_missing_field() -> None:
+    """$push / $addToSet skip a MISSING field value (mongod semantics) but keep an
+    explicit null; an all-missing field still produces []."""
+    docs = [{"s": "x"}, {}, {"s": None}, {"s": "x"}]
+    out = apply_pipeline(docs, [{"$group": {"_id": None, "p": {"$push": "$s"}}}])
+    assert out[0]["p"] == ["x", None, "x"]  # missing skipped, null kept
+    out2 = apply_pipeline(docs, [{"$group": {"_id": None, "v": {"$addToSet": "$s"}}}])
+    assert sorted(x for x in out2[0]["v"] if x is not None) == ["x"]
+    assert None in out2[0]["v"]  # explicit null retained
+    # All-missing field -> [] (not [null, ...]).
+    out3 = apply_pipeline([{}, {}], [{"$group": {"_id": None, "p": {"$push": "$gone"}}}])
+    assert out3[0]["p"] == []
+
+
 def test_group_sum_preserves_int64_type() -> None:
     """$sum over Int64 values stays Int64 (mongod widens int32 < int64),
     not a bare int that narrows to int32 on the wire."""

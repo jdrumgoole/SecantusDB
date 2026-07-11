@@ -1425,6 +1425,11 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   on Rust) and `$all` with **`$elemMatch` clauses** (each clause requires some array
   element to satisfy its sub-query; 0.5.3-beta.146 / 0.5.4b209 — found by a
   three-way query differential vs mongod 6.0, both fixes verified Rust==Python); the
+  **`$push` / `$addToSet` skip-missing** accumulator fix (a missing accumulator
+  field is not added — an explicit null still is — matching mongod; via the
+  missing-aware `evaluate_or_missing` / `eval_or_missing`; 0.5.3-beta.147 / 0.5.4b215
+  — found by a three-way aggregate differential vs mongod 6.0, verified
+  Rust==Python==mongod); the
   bitwise **expression** operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
   (0.5.3-beta.136 / 0.5.4b164 — int/long operands, int32/int64 result width,
   empty-list identity, null propagation; a non-integer operand raises), and the
@@ -1447,17 +1452,38 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
   both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
   bit-for-bit despite CPython 3.12's compensated `sum()`).
-- [ ] **Rust query — cross-type range comparison defers (`$gt`/`$gte`/`$lt`/`$lte`).**
-  `compare_values` in `secantus-core/src/query.rs` returns `Fallback` whenever either
-  operand is a document / array / exotic type, so a range predicate against a
-  cross-type operand (e.g. a document-valued array element vs `{$gt: 2}`) errors on
-  the Rust server where mongod compares by BSON canonical-type order (a document
-  out-ranks every number). The Python server is correct. This surfaces via
-  `$elemMatch` / `$all` + `$elemMatch` over an array of documents (found by the
-  three-way query differential, 2026-07-10). A faithful fix ports mongod's
-  cross-type ordering into the matcher (`crate::order` has the total order but
-  defers on the same non-sortable subset) — deferred as a delicate core-`cmp`
-  change. Same-type range comparisons (the common case) are correct.
+- [ ] **Cross-type range comparison diverges from mongod on BOTH servers
+  (`$gt`/`$gte`/`$lt`/`$lte`).** mongod compares range operands by BSON
+  canonical-type order (a document out-ranks every number, so `{a: {$gt: 2}}`
+  matches a document-valued `a`). Neither SecantusDB server reproduces this:
+  the **Python** matcher (`query._try_cmp`) applies Python's native `a > b`, which
+  raises `TypeError` across incomparable types and is swallowed as *no match*; the
+  **Rust** matcher (`compare_values` in `secantus-core/src/query.rs`) returns
+  `Fallback` for any document / array / exotic operand, so the Rust *server* errors
+  where Python silently returns no-match. The results only coincide with mongod when
+  a cross-type element is excluded for other reasons (e.g. a paired `$gt`+`$lt` where
+  the type-order value fails one bound). This surfaces via `$elemMatch` / `$all` +
+  `$elemMatch` over an array of documents (found by the three-way query differential,
+  2026-07-10). A faithful fix ports mongod's cross-type ordering into **both**
+  matchers (`crate::order` has the total order but defers on the same non-sortable
+  subset; Python would need an explicit canonical-type-rank compare) — deferred as a
+  delicate change to long-standing range-comparison semantics with pymongo-gauge
+  regression risk. Same-type range comparisons (the overwhelmingly common case) are
+  correct on both servers.
+- [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
+  servers).** (a) **`$mergeObjects` as a `$group` accumulator** — mongod merges the
+  input object across the group (`{$group: {_id: "$g", m: {$mergeObjects: "$sub"}}}`);
+  both servers reject it (it works only as a `$project` expression). Needs a new
+  accumulator in `aggregate._ACC_DISPATCH` + `group.rs` `Acc`. (b) **`$getField` on
+  an absent field returns `null` instead of missing** — mongod omits a projected
+  field whose `$getField` resolves to an absent key (`input.get(field)` → the
+  missing sentinel, so `$project` drops it); both servers emit `null`. Fix returns
+  the `_REMOVE_SENTINEL`, but requires the `$project`/`$addFields` stage to drop a
+  sentinel-valued computed field (verify `$$REMOVE` handling first). (c)
+  **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but
+  differ from mongod in the final ULP (e.g. `2.357022603955158` vs mongod's
+  `2.3570226039551585`); mongod uses a different summation order. Precision-only,
+  hard to match exactly — likely a permanent minor divergence.
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
