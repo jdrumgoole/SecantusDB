@@ -3801,11 +3801,15 @@ def _grouping_sets(group_node: exp.Group) -> list[list[str]]:
 
 
 def _grouping_set_branch(
-    stmt: exp.Select, table: TableDef, gset: list[str]
+    stmt: exp.Select, table: TableDef, gset: list[str], group_cols: list[str]
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """One grouping set's ``[$group, $project]`` sub-pipeline. Group columns not in
     this set project as literal NULL (Postgres' grouping-set semantics), so every
-    branch has the same output shape (required for the ``$unionWith``)."""
+    branch has the same output shape (required for the ``$unionWith``). A ``HAVING``
+    filters this branch's grouped rows via a ``$match`` on the ``$group`` output
+    (resolved before the ``$group`` is built so any hidden aggregate accumulator it
+    needs lands in the group stage); every branch registers HAVING the same way, so
+    the shapes stay aligned."""
     in_set = set(gset)
     group_id = {c: f"${table.field_for(c)}" for c in gset} or None
     accumulators: dict[str, Any] = {}
@@ -3884,10 +3888,21 @@ def _grouping_set_branch(
                 table.field_for(col)  # validate it's a real column
                 project[out_name] = {"$literal": None}
             out_columns.append((out_name, table.type_for(col)))
+    # Resolve HAVING before building the $group so any hidden accumulator it needs
+    # is included; the resulting $match runs on the grouped doc (which carries
+    # `_id.<col>` for this set's group columns and the accumulator fields).
+    having = stmt.args.get("having")
+    having_match = (
+        _having_to_match(having.this, table, accumulators, {}, group_cols, names, reductions)
+        if having is not None
+        else None
+    )
     stages: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
     if reductions:
-        # Reduce each DISTINCT set to its scalar value before the projection.
+        # Reduce each DISTINCT set to its scalar value before HAVING / the projection.
         stages.append({"$addFields": reductions})
+    if having_match is not None:
+        stages.append({"$match": having_match})
     stages.append({"$project": project})
     return stages, out_columns
 
@@ -3902,14 +3917,14 @@ def _plan_grouping_sets_select(
     into synthetic ``__gkeyN`` fields; it runs before each branch's ``$group`` — in
     the base pipeline *and* every ``$unionWith`` sub-pipeline (which reads the
     collection fresh, so the fields must be recomputed there too)."""
-    if stmt.args.get("having") is not None:
-        raise errors.feature_not_supported("HAVING with GROUPING SETS is not supported")
     if _residual_where(stmt, table) is not None:
         raise errors.feature_not_supported("a correlated WHERE with GROUPING SETS is not supported")
     base_filter = _where_filter(stmt, table)
     add_stage = [{"$addFields": gkey_addfields}] if gkey_addfields else []
     sets = _grouping_sets(stmt.args["group"])
-    branches = [_grouping_set_branch(stmt, table, gs) for gs in sets]
+    # HAVING may reference any column that appears in some grouping set.
+    group_cols = sorted({c for gs in sets for c in gs})
+    branches = [_grouping_set_branch(stmt, table, gs, group_cols) for gs in sets]
     pipeline = add_stage + list(branches[0][0])
     out_columns = branches[0][1]
     prefix = [{"$match": base_filter}] if base_filter else []
