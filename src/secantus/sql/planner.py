@@ -3334,6 +3334,7 @@ def _plan_pipeline_select(
         _select_has_window(stmt)
         or _select_has_computed_aggregate(stmt)
         or _having_has_subquery(stmt)
+        or (grouped and _select_projects_subquery(stmt))
     ) and (grouped or _group_agg_nodes(stmt)):
         # Window functions computed over GROUP BY aggregates, an expression that
         # *wraps* an aggregate (``sum(x) + 1``), or a subquery in HAVING — all run the
@@ -4173,11 +4174,30 @@ def _select_has_computed_aggregate(stmt: exp.Select) -> bool:
         if _is_bare_aggregate(inner) or _grouping_args(e) is not None:
             continue
         # ``GROUPING()`` subclasses AggFunc but is a super-aggregate helper handled
-        # by the group / grouping-sets planner, not a real aggregate.
+        # by the group / grouping-sets planner, not a real aggregate. An aggregate
+        # inside a scalar subquery belongs to that inner query, not this one.
         agg = next(
-            (a for a in inner.find_all(exp.AggFunc) if not isinstance(a, exp.Grouping)), None
+            (
+                a
+                for a in inner.find_all(exp.AggFunc)
+                if not isinstance(a, exp.Grouping) and not _nested_in_subquery(a, inner)
+            ),
+            None,
         )
         if agg is not None:
+            return True
+    return False
+
+
+def _select_projects_subquery(stmt: exp.Select) -> bool:
+    """Whether any SELECT item projects a subquery (``SELECT g, (SELECT max(v) FROM u)
+    FROM t``). Such a query — when it is also grouped — routes to the evaluated group
+    path, which runs each projection (including the subquery) per grouped row rather
+    than through the fast ``$group``/``$project`` path (which can't project a
+    subquery)."""
+    for e in stmt.expressions:
+        inner = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(inner, exp.Subquery) or inner.find(exp.Subquery) is not None:
             return True
     return False
 
@@ -4191,22 +4211,29 @@ def _having_has_subquery(stmt: exp.Select) -> bool:
     return having is not None and having.this.find(exp.Select) is not None
 
 
+def _nested_in_subquery(n: exp.Expression, root: exp.Expression) -> bool:
+    """Whether ``n`` (found under ``root`` via ``find_all``) is nested inside a
+    subquery *below* ``root`` — i.e. it belongs to an inner ``(SELECT …)`` rather
+    than this query level. An aggregate in a scalar subquery in the SELECT list
+    (``SELECT g, (SELECT max(v) FROM u) FROM t``) is the inner query's aggregate,
+    not an outer GROUP BY aggregate."""
+    if n is root:
+        return False
+    p = n.parent
+    while p is not None:
+        if p is root:
+            return False
+        if isinstance(p, (exp.Subquery, exp.Select)):
+            return True
+        p = p.parent
+    return False
+
+
 def _outer_agg_nodes(node: exp.Expression) -> list[exp.AggFunc]:
     """The aggregates directly in ``node`` (e.g. a HAVING predicate) that are *not*
     nested inside a subquery — those belong to this query's GROUP BY, whereas an
     aggregate inside a ``(SELECT …)`` belongs to that inner query."""
-    out: list[exp.AggFunc] = []
-    for n in node.find_all(exp.AggFunc):
-        p = n.parent
-        nested = False
-        while p is not None and p is not node:
-            if isinstance(p, (exp.Subquery, exp.Select)):
-                nested = True
-                break
-            p = p.parent
-        if not nested:
-            out.append(n)
-    return out
+    return [n for n in node.find_all(exp.AggFunc) if not _nested_in_subquery(n, node)]
 
 
 def _group_agg_nodes(stmt: exp.Select) -> list[exp.AggFunc]:
@@ -4226,6 +4253,8 @@ def _group_agg_nodes(stmt: exp.Select) -> list[exp.AggFunc]:
             parent = n.parent
             if isinstance(parent, exp.Window) and parent.this is n:
                 continue  # a window aggregate — resolved over the grouped rows
+            if _nested_in_subquery(n, root):
+                continue  # an aggregate inside a scalar subquery — the inner query's
             found.append(n)
     return found
 
