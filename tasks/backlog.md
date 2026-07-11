@@ -2364,9 +2364,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   subqueries don't need it). **Correlated subqueries in a pipeline work** (verified & pinned b205,
   #170 — the note was stale): a correlated WHERE / EXISTS / IN over a GROUP BY or JOIN rides the
   residual per-row path, and a correlated scalar subquery in the SELECT list works single-table and
-  over a join. The one remaining gap is a correlated subquery in **HAVING** (`HAVING agg > (SELECT …
-  WHERE t.k = outer.k)`) → `0A000`, since HAVING lowers to a post-`$group` `$match` with no per-group
-  subquery evaluation.
+  over a join. **A scalar subquery *containing an aggregate* in the SELECT list is now robust** (b215):
+  aggregate-detection (`_group_agg_nodes` / `_select_has_computed_aggregate`, via the new
+  `_nested_in_subquery`) no longer descends into subqueries, so `SELECT g, (SELECT max(v) FROM u) FROM t`
+  and `SELECT g, (SELECT count(*) FROM u WHERE u.g = t.g) FROM t` no longer mis-fire the "must appear in
+  GROUP BY" (`42803`) error; a *grouped* query that also projects a subquery
+  (`_select_projects_subquery`) routes to the evaluated group path. The one remaining gap is a correlated
+  subquery in **HAVING** (`HAVING agg > (SELECT … WHERE t.k = outer.k)`) → `0A000`, since HAVING lowers to
+  a post-`$group` `$match` with no per-group subquery evaluation.
 - [ ] **`ORDER BY` NULL placement landed** (b54). Postgres orders NULL as the largest value (ASC →
   NULLs last, DESC → NULLs first) with `NULLS FIRST`/`NULLS LAST` overriding; Mongo sort treats
   NULL/missing as the *smallest*, so the SQL layer no longer delegates NULL placement to storage.

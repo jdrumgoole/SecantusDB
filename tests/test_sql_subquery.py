@@ -202,3 +202,55 @@ def test_multi_column_subquery_rejected(storage, session):
             "SELECT name FROM customers WHERE _id IN (SELECT cust, total FROM orders)",
         )
     assert ei.value.sqlstate == "0A000"
+
+
+# -- scalar subquery in the SELECT list -------------------------------------- #
+
+
+def rows_of(storage, session, sql):
+    return run_sql(storage, DB, sql, session=session)[0].rows
+
+
+def test_scalar_subquery_in_select_uncorrelated(storage, session):
+    # A subquery containing an aggregate in the SELECT list of a non-grouped query
+    # must not make the outer query look grouped (previously raised 42803).
+    got = rows_of(
+        storage,
+        session,
+        "SELECT name, (SELECT max(total) FROM orders) AS m FROM customers ORDER BY name",
+    )
+    assert got == [("alice", 100), ("bob", 100), ("carol", 100)]
+
+
+def test_scalar_subquery_in_select_correlated(storage, session):
+    # A correlated subquery in the SELECT list is evaluated per row.
+    got = rows_of(
+        storage,
+        session,
+        "SELECT name, (SELECT count(*) FROM orders o WHERE o.cust = customers._id) AS n "
+        "FROM customers ORDER BY name",
+    )
+    assert got == [("alice", 1), ("bob", 0), ("carol", 1)]
+
+
+def test_scalar_subquery_in_grouped_select(storage, session):
+    # A grouped query may also project a scalar subquery — it routes to the
+    # evaluated group path.
+    got = rows_of(
+        storage,
+        session,
+        "SELECT region, count(*) AS c, (SELECT max(total) FROM orders) AS m "
+        "FROM customers GROUP BY region ORDER BY region",
+    )
+    assert got == [("east", 2, 100), ("west", 1, 100)]
+
+
+def test_scalar_subquery_does_not_mask_real_group_by_error(storage, session):
+    # A genuinely ungrouped column is still rejected even with a subquery present.
+    with pytest.raises(SQLError) as ei:
+        rows_of(
+            storage,
+            session,
+            "SELECT name, count(*) FROM customers",
+        )
+    assert ei.value.sqlstate == "42803"
