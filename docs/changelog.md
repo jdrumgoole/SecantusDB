@@ -19,7 +19,48 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-<<<<<<< HEAD
+### `$push` / `$addToSet` skip missing field values (both servers)
+
+A three-way aggregate differential against real `mongod` 6.0 found that the
+`$push` and `$addToSet` group accumulators were adding `null` for a document
+whose accumulated field is **absent**, where mongod skips it entirely. They now
+match mongod: a missing field is not accumulated, while an explicit `null` still
+is — so `{$push: "$s"}` over `["x", <missing>, null, "x"]` yields
+`["x", null, "x"]`, and an all-missing field still produces `[]` (not a list of
+nulls). The distinction is drawn by a new missing-aware evaluate helper
+(`evaluate_or_missing` / `eval_or_missing`) that surfaces an absent field path as
+a distinct sentinel rather than `null`.
+
+#### Fixed
+
+- `aggregate.py` / `secantus-core`: `$push` / `$addToSet` (in both `$group` and
+  `$setWindowFields`) skip a missing accumulator value. (The differential also
+  surfaced three items deferred to `tasks/backlog.md` §7.5: `$mergeObjects` as a
+  `$group` accumulator, `$getField` returning `null` instead of missing for an
+  absent field, and a last-ULP `$stdDevPop` difference vs mongod.)
+
+### PG server shutdown drains client handlers before storage close
+
+`SecantusPGServer.stop()` now tracks its per-connection handler threads and
+joins them (bounded, 5 s) after closing their sockets. Previously `stop()`
+returned while a handler could still be mid-request on its per-thread
+WiredTiger session, so an embedder's natural `stop()` → `storage.close()`
+sequence raced the handler and corrupted the WT session handle (a logged
+`WT session close failed during close` / `Session__freecb` TypeError during
+teardown — visible whenever a client was abandoned mid-transaction, e.g. a
+failing test). A handler that outlives the drain window is logged by name.
+
+#### Fixed
+
+- `sql/pgserver.py`: `stop()` joins live handler threads before returning, so
+  `storage.close()` immediately after `stop()` can no longer close a WT session
+  a handler thread is still using. Regression test: abandon a client
+  mid-transaction, `stop()`, assert every handler exited and `close()` logs no
+  session-close error.
+- Test docstrings in `test_pgserver.py` / `test_pgserver_copy.py` /
+  `test_sql_aggregate.py` still described the deleted `FakeStorage` in-memory
+  mock; they now state the real WT-backed `Storage` these suites run on.
+
 ### `$in`/`$nin` regex candidates and `$all` + `$elemMatch` (both servers)
 
 A three-way query differential against real `mongod` 6.0 turned up two
@@ -42,29 +83,6 @@ is matched against several independent element predicates at once.
   such as a document-valued array element deferring instead of comparing by BSON
   type order — is tracked in `tasks/backlog.md` §7.5.)
 
-=======
-### PG server shutdown drains client handlers before storage close
-
-`SecantusPGServer.stop()` now tracks its per-connection handler threads and
-joins them (bounded, 5 s) after closing their sockets. Previously `stop()`
-returned while a handler could still be mid-request on its per-thread
-WiredTiger session, so an embedder's natural `stop()` → `storage.close()`
-sequence raced the handler and corrupted the WT session handle (a logged
-`WT session close failed during close` / `Session__freecb` TypeError during
-teardown — visible whenever a client was abandoned mid-transaction, e.g. a
-failing test). A handler that outlives the drain window is logged by name.
-
-#### Fixed
-
-- `sql/pgserver.py`: `stop()` joins live handler threads before returning, so
-  `storage.close()` immediately after `stop()` can no longer close a WT session
-  a handler thread is still using. Regression test: abandon a client
-  mid-transaction, `stop()`, assert every handler exited and `close()` logs no
-  session-close error.
-- Test docstrings in `test_pgserver.py` / `test_pgserver_copy.py` /
-  `test_sql_aggregate.py` still described the deleted `FakeStorage` in-memory
-  mock; they now state the real WT-backed `Storage` these suites run on.
->>>>>>> 8fcf4b0e (PG server: stop() drains handler threads before storage close (b214))
 ### `$pull` query semantics, `$pullAll`, and `$push $sort` on the Rust server
 
 A three-way differential against real `mongod` 6.0 turned up two array-update

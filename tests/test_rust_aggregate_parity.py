@@ -119,6 +119,12 @@ CURATED = [
     [{"$group": {"_id": "$b", "f": {"$first": "$a"}, "l": {"$last": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "all": {"$push": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "set": {"$addToSet": "$a"}}}, {"$sort": {"_id": 1}}],
+    # $push / $addToSet skip a MISSING field value (nested is absent on some docs);
+    # an all-missing field yields [] (not [null, ...]).
+    [{"$group": {"_id": None, "p": {"$push": "$nested"}}}],
+    [{"$group": {"_id": None, "s": {"$addToSet": "$nested"}}}],
+    [{"$group": {"_id": None, "p": {"$push": "$nope"}}}],  # all missing -> []
+    [{"$group": {"_id": None, "s": {"$addToSet": "$nope"}}}],
     # $stdDevPop / $stdDevSamp — pop is 0 for a single value, samp is null for <2.
     [{"$group": {"_id": "$b", "sd": {"$stdDevPop": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "sd": {"$stdDevSamp": "$a"}}}, {"$sort": {"_id": 1}}],

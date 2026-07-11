@@ -65,6 +65,22 @@ def _eval(expr: Any, ctx: _Ctx) -> Any:
 
 _REMOVE_SENTINEL: Any = object()
 
+#: Sentinel for "the expression resolved to a missing field" (distinct from an
+#: explicit ``null``). Reuses the ``$$REMOVE`` marker.
+MISSING: Any = _REMOVE_SENTINEL
+
+
+def evaluate_or_missing(
+    expr: Any, doc: Mapping[str, Any], vars: dict[str, Any] | None = None
+) -> Any:
+    """Like :func:`evaluate`, but a top-level absent field path yields
+    :data:`MISSING` (distinct from ``None``) so accumulators can skip a missing
+    value the way mongod does — ``$push`` / ``$addToSet`` accumulate an explicit
+    ``null`` but not a missing field."""
+    if isinstance(expr, str) and expr.startswith("$") and not expr.startswith("$$"):
+        return get_path(dict(doc), expr[1:], default=MISSING)
+    return evaluate(expr, doc, vars)
+
 
 def _resolve_var(name: str, ctx: _Ctx) -> Any:
     # ``$$var.a.b`` means resolve ``var`` from system / user vars, then
