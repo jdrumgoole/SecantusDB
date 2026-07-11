@@ -5140,15 +5140,21 @@ def _build_join_pipeline(
 
     # ``$lookup`` is inherently left-driven (for each base doc, fetch matching
     # foreign docs), so RIGHT / FULL OUTER need the base swapped and (for FULL) an
-    # anti-join union. That only composes cleanly for a single two-table join — a
-    # chain mixing in a RIGHT/FULL is rejected rather than silently mis-joined.
-    if any(str(jn.args.get("side") or "").upper() in ("RIGHT", "FULL") for jn in joins):
-        if len(joins) != 1:
-            raise errors.feature_not_supported(
-                "RIGHT / FULL OUTER JOIN is only supported between two tables"
+    # anti-join union. A single two-table outer join composes directly; a *pure*
+    # RIGHT chain of 3+ tables reverses into a LEFT chain driven from the last table
+    # (approach a). Mixed LEFT/RIGHT chains and any multi-table FULL stay 0A000.
+    sides = [str(jn.args.get("side") or "").upper() for jn in joins]
+    if any(s in ("RIGHT", "FULL") for s in sides):
+        if len(joins) == 1:
+            return _build_outer_join_pipeline(
+                stmt, base_alias, base, joins[0], db, catalog, storage, derived
             )
-        return _build_outer_join_pipeline(
-            stmt, base_alias, base, joins[0], db, catalog, storage, derived
+        if set(sides) == {"RIGHT"}:
+            return _build_right_chain_pipeline(
+                stmt, base_alias, base, joins, db, catalog, storage, derived
+            )
+        raise errors.feature_not_supported(
+            "RIGHT / FULL OUTER JOIN in a 3+ table chain is only supported for an all-RIGHT chain"
         )
 
     amap: dict[str, tuple[str, TableDef]] = {base_alias: ("base", base)}
@@ -5288,6 +5294,90 @@ def _full_join_anti_branch(
         {"$match": {a_alias: {"$size": 0}}},
         {"$replaceWith": {b_alias: "$$ROOT"}},
     ]
+
+
+def _on_referenced_aliases(on: exp.Expression) -> set[str] | None:
+    """The set of table aliases an ON predicate references. Returns None if any
+    column is unqualified — then adjacency can't be proven and the caller bails."""
+    refs: set[str] = set()
+    for col in on.find_all(exp.Column):
+        if not col.table:
+            return None
+        refs.add(col.table)
+    return refs
+
+
+def _build_right_chain_pipeline(
+    stmt: exp.Select,
+    base_alias: str,
+    base: TableDef,
+    joins: list[exp.Expression],
+    db: str,
+    catalog: Any,
+    storage: Any,
+    derived: list[DerivedTable],
+) -> tuple[
+    TableDef, dict[str, tuple[str, TableDef]], Resolve, list[dict[str, Any]], list[DerivedTable]
+]:
+    """A *pure* RIGHT chain of 3+ tables, via approach (a): reverse into a LEFT chain
+    driven from the last table.
+
+    ``A RIGHT JOIN B ON o1 RIGHT JOIN C ON o2`` binds left-associatively as
+    ``(A RJ B) RJ C``. Since ``X RJ Y == Y LJ X``, that is
+    ``C LEFT JOIN B ON o2 LEFT JOIN A ON o1`` — the reversed FROM order driven from
+    C. The re-association is sound only when each ON is *adjacent* (joins its table
+    to the immediately-prior FROM table), so no predicate reaches across the chain;
+    a non-adjacent ON falls back to ``0A000``. The ``amap`` is rebuilt in original
+    FROM order so ``SELECT *`` keeps Postgres's left-to-right column order even
+    though the pipeline drives from the far end."""
+    # Resolve every source in FROM order: T0 = base, T1..Tn from the join list.
+    tables: list[tuple[str, TableDef]] = [(base_alias, base)]
+    ons: list[exp.Expression] = []
+    for jn in joins:
+        jt = jn.this
+        on = jn.args.get("on")
+        if on is None or isinstance(jt, (exp.Lateral, exp.Unnest)) or _is_jsonb_each_join(jt):
+            raise errors.feature_not_supported(
+                "a RIGHT JOIN chain supports only plain-table joins with an ON clause"
+            )
+        j_alias, j_table = _resolve_source(jt, db, catalog, storage, derived)
+        tables.append((j_alias, j_table))
+        ons.append(on)
+
+    # Adjacency guard: join k (bringing table T_{k+1}) may reference only that table
+    # and its predecessor T_k in FROM order.
+    aliases = [a for a, _ in tables]
+    for k, on in enumerate(ons):
+        refs = _on_referenced_aliases(on)
+        if refs is None or not refs <= {aliases[k + 1], aliases[k]}:
+            raise errors.feature_not_supported(
+                "a RIGHT JOIN chain is only supported when each ON joins adjacent tables"
+            )
+
+    # Reversed LEFT chain: base = the last table; then walk the joins back-to-front,
+    # each bringing its predecessor table in with the same ON (which now relates an
+    # already-placed table to the newly-joined one).
+    n = len(joins)
+    new_base_alias, new_base = tables[n]
+    amap: dict[str, tuple[str, TableDef]] = {new_base_alias: ("base", new_base)}
+    pipeline: list[dict[str, Any]] = []
+    for k in range(n - 1, -1, -1):
+        j_alias, j_table = tables[k]
+        pipeline.append(_lookup_stage(ons[k], j_alias, j_table, amap))
+        pipeline.append({"$unwind": {"path": f"${j_alias}", "preserveNullAndEmptyArrays": True}})
+        amap[j_alias] = ("join", j_table)
+
+    # Rebuild amap in original FROM order for SELECT * (roles unchanged: the reversed
+    # base drives, every other table is nested under its alias).
+    ordered_amap: dict[str, tuple[str, TableDef]] = {}
+    for a, t in tables:
+        ordered_amap[a] = ("base", t) if a == new_base_alias else ("join", t)
+    resolve = _join_resolver(ordered_amap)
+
+    where = stmt.args.get("where")
+    if where is not None and not where_needs_per_row(stmt):
+        pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
+    return new_base, ordered_amap, resolve, pipeline, derived
 
 
 def _plan_join_select(

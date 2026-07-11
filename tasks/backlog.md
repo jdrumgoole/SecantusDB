@@ -1613,7 +1613,14 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   no A match (an anti-join sub-pipeline that nests B under its alias so A's columns read NULL);
   `_build_outer_join_pipeline` / `_full_join_anti_branch` in the planner, `amap` kept in FROM order
   so `SELECT *` preserves Postgres column order. Works with WHERE / GROUP BY / aggregates / scalar
-  exprs. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
+  exprs. **Pure-`RIGHT` chains of 3+ tables land** (b220): `_build_right_chain_pipeline` reverses an
+  all-`RIGHT` chain into a `LEFT` chain driven from the last table (`(A RJ B) RJ C == C LJ B LJ A`),
+  runs the existing lookup/unwind loop forcing `LEFT`, and rebuilds `amap` in FROM order for
+  `SELECT *`. Sound only under an **adjacency guard** (`_on_referenced_aliases`): each `ON` must join
+  its table to the immediately-prior FROM table, else re-association isn't valid → `0A000`. A chain
+  mixing `LEFT`/`RIGHT`, a non-adjacent `RIGHT` `ON`, an unqualified `ON` column, and any multi-table
+  `FULL` all stay `0A000` (FULL-in-a-chain would need a per-step correlated anti-join `$unionWith`
+  with growing-shape null-padding — deferred). **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
   `FROM a, b` form) compiles to the cartesian product — an empty `$lookup` pipeline returns every
   foreign doc, then `$unwind` (no preserve) pairs each with the outer row; an outer join without `ON`
   is a `42601`. Non-equi (`a.x < b.y`) and `OR` join conditions already rode the `$lookup` `let`/
@@ -1636,7 +1643,8 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   and `_plan_grouping_sets_select` injects the synthetic-key `$addFields` into the base pipeline
   *and* every `$unionWith` branch (each reads the collection fresh); `GROUPING(lower(x))` works via
   the same rewrite. Still `0A000`:
-  `RIGHT`/`FULL` in a 3+ table chain, subqueries. SUM/MIN/MAX
+  a mixed `LEFT`/`RIGHT` or any `FULL` 3+ table chain (a *pure*-`RIGHT` adjacent chain works, b220),
+  subqueries. SUM/MIN/MAX
   result typing is approximate (uses the column's tag; AVG → float8; arithmetic → numeric).
   **`DISTINCT` aggregates landed** (b48): `COUNT`/`SUM`/`AVG(DISTINCT col)` compile to a
   `$addToSet` accumulator plus a post-`$group` `$addFields` that reduces the set
