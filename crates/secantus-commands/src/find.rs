@@ -198,6 +198,20 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if let Some(err) = projection_mix_error(spec) {
             return Ok(err.into_reply());
         }
+        // Positional (`arr.$`) validation is parse-time in mongod, so an invalid
+        // one errors even when nothing matches. The Rust engine can't reproduce
+        // the exact Location code (31276 / 31395 / 51246) — a generic BadValue,
+        // same as its other deferred error paths.
+        let q = if filter.is_empty() {
+            None
+        } else {
+            Some(&filter)
+        };
+        if secantus_core::projection::validate_projection(spec, q).is_err() {
+            return Ok(
+                CommandError::new(2, "BadValue", "invalid positional projection").into_reply(),
+            );
+        }
     }
     let hint = doc.get("hint");
     let collation = collation_of(doc);
@@ -405,7 +419,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // and decodes just the firstBatch.
     let (first_batch, cursor_id): (Vec<Bson>, i64) = match projection {
         Some(spec) => {
-            let projected = project_to_docs(docs, spec)?;
+            let projected = project_to_docs(docs, spec, &filter)?;
             if single_batch {
                 (projected.into_iter().map(Bson::Document).collect(), 0)
             } else {
@@ -667,7 +681,16 @@ fn projection_mix_error(spec: &Document) -> Option<CommandError> {
 /// Apply a projection spec to each result doc via `secantus_core::projection`.
 /// A `Fallback` (a projection the Rust engine can't reproduce exactly) surfaces
 /// as `BadValue` — the Rust server only ships what the Rust engine supports.
-fn project_to_docs(docs: Vec<Vec<u8>>, spec: &Document) -> Result<Vec<Document>, CommandError> {
+fn project_to_docs(
+    docs: Vec<Vec<u8>>,
+    spec: &Document,
+    filter: &Document,
+) -> Result<Vec<Document>, CommandError> {
+    let query = if filter.is_empty() {
+        None
+    } else {
+        Some(filter)
+    };
     docs.iter()
         .map(|bytes| {
             let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
@@ -677,7 +700,7 @@ fn project_to_docs(docs: Vec<Vec<u8>>, spec: &Document) -> Result<Vec<Document>,
                     format!("failed to decode document: {e}"),
                 )
             })?;
-            secantus_core::projection::apply_projection(&d, spec).map_err(|_| {
+            secantus_core::projection::apply_projection(&d, spec, query).map_err(|_| {
                 CommandError::new(
                     2,
                     "BadValue",

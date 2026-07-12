@@ -311,37 +311,56 @@ fn apply_update_batch(
 /// inclusion/exclusion which Python raises on, nested-document specs, unusual
 /// `$slice` args, or a `$elemMatch` sub-filter the matcher defers).
 #[pyfunction]
+#[pyo3(signature = (doc_bytes, spec_bytes, query_bytes=None))]
 fn apply_projection(
     py: Python<'_>,
     doc_bytes: &[u8],
     spec_bytes: &[u8],
+    query_bytes: Option<&[u8]>,
 ) -> PyResult<Option<Py<PyBytes>>> {
     let doc: Document = bson::from_slice(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
     let spec: Document = bson::from_slice(spec_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
+    let query = decode_optional_query(query_bytes)?;
     let out = py
-        .allow_threads(|| match projection::apply_projection(&doc, &spec) {
-            Ok(out) => encode_doc(&out).map(Some),
-            Err(projection::Fallback) => Ok(None),
-        })
+        .allow_threads(
+            || match projection::apply_projection(&doc, &spec, query.as_ref()) {
+                Ok(out) => encode_doc(&out).map(Some),
+                Err(projection::Fallback) => Ok(None),
+            },
+        )
         .map_err(PyValueError::new_err)?;
     Ok(out.map(|b| to_pybytes(py, b)))
+}
+
+/// Decode an optional `query` filter (empty / absent -> `None`), used by the
+/// projection bindings to resolve a positional `arr.$` projection.
+fn decode_optional_query(query_bytes: Option<&[u8]>) -> PyResult<Option<Document>> {
+    match query_bytes {
+        Some(qb) if !qb.is_empty() => bson::from_slice(qb)
+            .map(Some)
+            .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}"))),
+        _ => Ok(None),
+    }
 }
 
 /// Batched `projection.apply_projection`: project a whole result list in one
 /// call (every `find` doc), one GIL release for all N. `{"d": [doc, ...]}` in,
 /// `{"d": [projected, ...]}` out, whole-batch fallback (`None`) if any defers.
 #[pyfunction]
+#[pyo3(signature = (docs_bytes, spec_bytes, query_bytes=None))]
 fn apply_projection_batch(
     py: Python<'_>,
     docs_bytes: &[u8],
     spec_bytes: &[u8],
+    query_bytes: Option<&[u8]>,
 ) -> PyResult<Option<Py<PyBytes>>> {
     let docs_wrap: Document = bson::from_slice(docs_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
     let spec: Document = bson::from_slice(spec_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
+    let query = decode_optional_query(query_bytes)?;
     let Some(Bson::Array(arr)) = docs_wrap.get("d") else {
         return Err(PyValueError::new_err("docs wrapper missing array 'd'"));
     };
@@ -356,7 +375,7 @@ fn apply_projection_batch(
         .allow_threads(move || {
             let mut results: Vec<Bson> = Vec::with_capacity(docs.len());
             for doc in &docs {
-                match projection::apply_projection(doc, &spec) {
+                match projection::apply_projection(doc, &spec, query.as_ref()) {
                     Ok(p) => results.push(Bson::Document(p)),
                     Err(projection::Fallback) => return Ok(None),
                 }

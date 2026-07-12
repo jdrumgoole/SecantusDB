@@ -148,29 +148,31 @@ one server bumps only that server's version:
   simply carries the last released version.
 - **Rust server version** — the `version` field in **every** `crates/*/Cargo.toml`,
   kept in **lockstep** across all crates (`0.MAJOR.PATCH-beta.N`, SemVer
-  pre-release). Most slices just increment `N`. **Bumping the patch (or
-  minor/major) component resets the beta label to 0** — e.g. `0.5.2-beta.20` →
-  `0.5.3-beta.0`, never `0.5.3-beta.21`.
-  Bump it for Rust-server changes (`crates/**`). There is no single
-  `[workspace.package]` source because the WiredTiger-linked crates
+  pre-release). **Feature PRs do NOT bump it** either — like the Python version, it
+  is assigned when a Rust release is cut (the `secantusdb-v<crate-version>` tag),
+  not per-PR. **Bumping the patch (or minor/major) component resets the beta label
+  to 0** — e.g. `0.5.2-beta.20` → `0.5.3-beta.0`, never `0.5.3-beta.21`. There is no
+  single `[workspace.package]` source because the WiredTiger-linked crates
   (`secantus-storage` / `-wt` / `-storage-adapter` / `-server-py` / `-storage-py` /
   `secantusdb`) are **excluded** from the clean workspace and can't inherit a
-  workspace version — so all twelve `Cargo.toml` (and their `Cargo.lock`) carry the
-  number and are bumped together (e.g. `find crates -maxdepth 2 -name Cargo.toml
-  -o -name Cargo.lock | xargs sed -i '' 's/0.5.2-beta.N/0.5.2-beta.N+1/'`). The
-  canonical embedded value is `secantus_server::VERSION`
+  workspace version — so at release all twelve `Cargo.toml` (and their `Cargo.lock`)
+  carry the number and are bumped together (e.g. `find crates -maxdepth 2 -name
+  Cargo.toml -o -name Cargo.lock | xargs sed -i '' 's/0.5.2-beta.N/0.5.2-beta.N+1/'`).
+  The canonical embedded value is `secantus_server::VERSION`
   (`env!("CARGO_PKG_VERSION")`); the Rust server **embeds and surfaces** it in
   `buildInfo.secantusVersion` (over the wire), the `secantusd-rs` binary's
   `--version`, the embedded Python handle's `RustServer.version` getter, and the
-  `_secantus_server.__version__` module attribute.
+  `_secantus_server.__version__` module attribute. Between releases `main` carries
+  the last released Rust version.
 
-The Rust version is still bumped **per-PR** (unlike the Python version) because it
-is the traceability handle surfaced in `buildInfo.secantusVersion`, and because
-Rust-touching sessions are rare — so the 12-`Cargo.toml` bump only ever collides
-one Rust session against another, not against the many Python-only (SQL) sessions.
-A dual-server change therefore bumps the **Rust** version per-PR and leaves the
-**Python** version to the release. (If concurrent Rust sessions become common,
-move the Rust bump to a release step too, for the same reason.)
+**No version bumps in feature PRs — either server.** Both the Python and the Rust
+version are assigned at release time, so a feature PR touches neither `version`
+line. This is the whole point: an in-flight PR that bumped a version picked a
+number that was stale by merge time, so any two concurrent PRs collided on that
+one line (Python) or on the twelve `Cargo.toml` (Rust). Leaving both to the
+release makes concurrent feature PRs — Python-only, Rust-only, or dual-server —
+independent. Describe the change in a `changelog.d/` fragment (see the
+Documentation / Conventions sections); the release stamps the version.
 
 **The authoritative plan is `tasks/rust-server-plan.md`.** It supersedes the
 earlier *in-process selectable-engine* model (`SECANTUS_ENGINE` process-wide

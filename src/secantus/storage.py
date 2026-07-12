@@ -1448,7 +1448,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection) for r in rows]
+            rows = [apply_projection(r, projection, filter) for r in rows]
         return rows
 
     def _is_system_users(self, db: str, coll: str) -> bool:
@@ -1535,7 +1535,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection) for r in rows]
+            rows = [apply_projection(r, projection, filter) for r in rows]
         return rows
 
     def _count_system_users(
@@ -1602,7 +1602,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection) for r in rows]
+            rows = [apply_projection(r, projection, filter) for r in rows]
         return rows
 
     def _count_system_version(
@@ -3421,7 +3421,7 @@ class Storage:
         if limit > 0:
             out = out[:limit]
         if projection:
-            out = [apply_projection(d, projection) for d in out]
+            out = [apply_projection(d, projection, filter) for d in out]
         return out
 
     def _apply_minmax_bounds(
