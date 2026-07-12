@@ -243,17 +243,20 @@ def test_trailing_right_compound_on(trj, session):
     assert rows == [(100, 10), (200, None), (300, None)]
 
 
-def test_trailing_right_on_spans_both_composite_tables_rejected(trj, session):
-    # RIGHT ON references C and *both* composite tables → two-level let threading,
-    # deliberately unsupported.
-    with pytest.raises(SQLError) as ei:
-        q(
-            trj,
-            session,
-            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak "
-            "RIGHT JOIN jc ON jc.bk = jb.bk AND jc.cid = ja.k",
-        )
-    assert ei.value.sqlstate == "0A000"
+def test_trailing_right_on_spans_both_composite_tables(trj, session):
+    # The RIGHT ON references C and *both* composite tables (jc.bk=jb.bk AND
+    # jc.cid=ja.k) — the composite is built forward and o2 filtered generically, so a
+    # multi-table o2 is sound. jc(1,10) matches the (ja1, jb bk10) composite row.
+    trj.q("INSERT INTO jc VALUES (1, 10)")
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, ja.k, jb.bk FROM ja JOIN jb ON ja.k = jb.ak "
+        "RIGHT JOIN jc ON jc.bk = jb.bk AND jc.cid = ja.k",
+    ).rows
+    assert _sorted(rows) == _sorted(
+        [(1, 1, 10), (100, None, None), (200, None, None), (300, None, None)]
+    )
 
 
 # -- trailing FULL over a two-table INNER composite (b227) ------------------- #
@@ -337,15 +340,18 @@ def test_trailing_full_with_where(trj, session):
     assert _sorted(rows) == _sorted([(200, None), (300, None)])
 
 
-def test_trailing_full_on_spans_both_composite_tables_rejected(trj, session):
-    with pytest.raises(SQLError) as ei:
-        q(
-            trj,
-            session,
-            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak "
-            "FULL JOIN jc ON jc.bk = jb.bk AND jc.cid = ja.k",
-        )
-    assert ei.value.sqlstate == "0A000"
+def test_trailing_full_on_spans_both_composite_tables(trj, session):
+    # Multi-table o2 under FULL. No jc has cid=1, so the (ja1, jb bk10) composite row
+    # matches nothing → FULL keeps it as a composite-only row (None on the C side).
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, ja.k, jb.bk FROM ja JOIN jb ON ja.k = jb.ak "
+        "FULL JOIN jc ON jc.bk = jb.bk AND jc.cid = ja.k",
+    ).rows
+    assert _sorted(rows) == _sorted(
+        [(None, 1, 10), (100, None, None), (200, None, None), (300, None, None)]
+    )
 
 
 # -- trailing RIGHT/FULL over a leading-LEFT composite (b228) ---------------- #
@@ -580,15 +586,60 @@ def test_trailing3_right_over_left_composite(t3, session):
     )
 
 
-def test_trailing3_four_table_composite_rejected(t3, session):
-    # Four-table composite is out of scope.
-    t3.q("CREATE TABLE te (ek int primary key, eak int)")
+def _t3_four(t3):
+    # Extend the 3-table composite to four: te joins on te.eak = a.ak (one te per a).
+    #   composite ta⋈tb⋈td⋈te: R1(a1,e1000) R2(a2,e2000) R3(a3,e3000)
+    t3.q("CREATE TABLE te (ek int primary key, eak int, ev text)")
+    t3.q("INSERT INTO te VALUES (1000, 1, 'e1'), (2000, 2, 'e2'), (3000, 3, 'e3')")
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    t3.q("INSERT INTO tc VALUES (1000, 'c1'), (2000, 'c2'), (9999, 'c3')")
+
+
+_T4J = _T3J + " JOIN te e ON e.eak = a.ak"
+
+
+def test_trailing4_right_composite(t3, session):
+    # A four-table composite with a trailing RIGHT. R3 (e3000) matches no tc → dropped.
+    _t3_four(t3)
+    rows = q(
+        t3, session, "SELECT a.av, e.ek, c.cx " + _T4J + " RIGHT JOIN tc c ON c.cx = e.ek"
+    ).rows
+    assert _sorted(rows) == _sorted([("a1", 1000, 1000), ("a2", 2000, 2000), (None, None, 9999)])
+
+
+def test_trailing4_full_composite(t3, session):
+    # FULL keeps the composite-only R3 (e3000, no tc) and the unmatched tc(9999).
+    _t3_four(t3)
+    rows = q(t3, session, "SELECT a.av, e.ek, c.cx " + _T4J + " FULL JOIN tc c ON c.cx = e.ek").rows
+    assert _sorted(rows) == _sorted(
+        [("a1", 1000, 1000), ("a2", 2000, 2000), ("a3", 3000, None), (None, None, 9999)]
+    )
+
+
+def test_trailing_five_table_composite(t3, session):
+    # Five tables: prove N-table generality (composite ta⋈tb⋈td⋈te⋈tf, trailing RIGHT).
+    _t3_four(t3)
+    t3.q("CREATE TABLE tf (fk int primary key, fek int, fv text)")
+    t3.q("INSERT INTO tf VALUES (1, 1000, 'f1'), (2, 2000, 'f2'), (3, 3000, 'f3')")
+    rows = q(
+        t3,
+        session,
+        "SELECT a.av, f.fk, c.cx " + _T4J + " JOIN tf f ON f.fek = e.ek "
+        "RIGHT JOIN tc c ON c.cx = e.ek",
+    ).rows
+    assert _sorted(rows) == _sorted([("a1", 1, 1000), ("a2", 2, 2000), (None, None, 9999)])
+
+
+def test_trailing4_still_rejects_bad_shape(t3, session):
+    # A non-adjacent composite ON (references a table not yet joined) stays 0A000.
+    t3.q("CREATE TABLE te (ek int primary key, eak int, ev text)")
     t3.q("CREATE TABLE tc (cx int primary key, cv text)")
     with pytest.raises(SQLError) as ei:
         q(
             t3,
             session,
-            "SELECT c.cx " + _T3J + " JOIN te e ON e.eak = a.ak RIGHT JOIN tc c ON c.cx = b.bk",
+            "SELECT c.cx FROM ta a JOIN tb b ON a.ak = b.bak JOIN te e ON e.eak = d.dk "
+            "JOIN td d ON d.dbk = b.bk RIGHT JOIN tc c ON c.cx = b.bk",
         )
     assert ei.value.sqlstate == "0A000"
 
