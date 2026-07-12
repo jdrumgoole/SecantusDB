@@ -1665,8 +1665,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   composite restricted by `o2`, keep only the C rows whose composite is `$size: 0` (a single-level pivot lookup
   could *not* detect this — a C matching a pivot whose pivot has no far match still belongs in the anti-branch), then
   `$replaceWith {c: $$ROOT}` so A/B read NULL. Both branches share the `{A base, B join, C join}` layout so the union
-  lines up under one resolver. Same guards as b226 (via `_trailing_composite_operands`). **Still `0A000`:** a trailing
-  outer join over a `LEFT`/3+-table composite, an outer `ON` spanning *both* composite tables (two-level `let`
+  lines up under one resolver. Same guards as b226 (via `_trailing_composite_operands`).
+  **The trailing outer join now also covers a leading-`LEFT` composite** (b228): `A LEFT JOIN B ON o1 RIGHT|FULL
+  JOIN C ON o2` (`sides == ["LEFT", "RIGHT"]` / `["LEFT", "FULL"]`) routes to the *same* builders. Insight: `A LEFT
+  JOIN B` differs from `A INNER JOIN B` only in the `(a, NULL)` rows for `B`-less `a`s. When the outer `ON` targets
+  the *non-driving* B (pivot=B), those NULL-`b` rows never satisfy `o2` on a B column, so the LEFT composite is
+  **INNER-equivalent**; when it targets the *preserved base* A (pivot=A), those rows must survive. So the only change
+  is the far `$unwind`'s preserve flag: `far_preserve = composite_is_LEFT and pivot == base_A` (threaded into
+  `_nested_composite_lookup`), plus the FULL main branch's B-`$unwind` preserve = `composite_is_LEFT`. Everything else
+  (nested lookup, RIGHT preserve, FULL anti-branch, resolver, guards) is unchanged. **Still `0A000`:** a trailing
+  outer join over a **3+-table** composite, an outer `ON` spanning *both* composite tables (two-level `let`
   threading), a non-adjacent `RIGHT` `ON`, and a second `FULL` in the tail. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
   `FROM a, b` form) compiles to the cartesian product — an empty `$lookup` pipeline returns every
   foreign doc, then `$unwind` (no preserve) pairs each with the outer row; an outer join without `ON`
