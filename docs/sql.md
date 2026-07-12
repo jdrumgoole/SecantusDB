@@ -1472,7 +1472,42 @@ built-in name always wins.
 
 Errors mirror Postgres: redefining the same `(name, arity)` without `OR REPLACE`
 raises `42723`; `DROP FUNCTION` of an unknown function raises `42883` (silenced by
-`IF EXISTS`). A non-`sql` language (`plpgsql`, …) raises `0A000`.
+`IF EXISTS`). An unknown language (`plpython3u`, …) raises `0A000`.
+
+### `LANGUAGE plpgsql`
+
+Scalar `LANGUAGE plpgsql` functions run through a compact procedural interpreter
+covering the subset that most hand-written and ORM-/migration-generated functions
+use — `DECLARE`, assignment (`:=`), `IF … ELSIF … ELSE … END IF`, `RETURN`,
+`SELECT … INTO`, and embedded write statements:
+
+```postgresql
+CREATE FUNCTION grade(score int) RETURNS text AS $$
+DECLARE g text;
+BEGIN
+  IF score >= 90 THEN g := 'A';
+  ELSIF score >= 80 THEN g := 'B';
+  ELSE g := 'F';
+  END IF;
+  RETURN g;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION sal_of(who text) RETURNS int AS $$
+DECLARE s int;
+BEGIN
+  SELECT sal INTO s FROM emp WHERE name = who;
+  RETURN s;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+A bare identifier that matches a declared variable or a parameter resolves to that
+value; everything else (table columns, functions, subqueries) is left to the
+ordinary SQL machinery. `IF` treats a `NULL` condition as false. **Out of scope**
+(rejected with `0A000`, at `CREATE` time): loops (`LOOP` / `WHILE` / `FOR`),
+`RAISE`, `RETURN QUERY` / `RETURN NEXT` (set-returning), `CASE` statements,
+cursors, `EXCEPTION` handlers, and dynamic `EXECUTE`.
 
 User functions are reflected like Postgres', so `psql`'s `\df` and SQLAlchemy see
 them: they appear in `pg_catalog.pg_proc` (with `proname` / `pronargs` /
@@ -1488,10 +1523,12 @@ SELECT proname, pg_get_function_arguments(oid), pg_get_function_result(oid)
 FROM pg_catalog.pg_proc WHERE proname = 'add';   -- add | a integer, b integer | integer
 ```
 
-**Simplifications:** only `LANGUAGE sql` with a single-statement body; a
-set-returning (`RETURNS SETOF` / `TABLE`) function returns only its first row in a
-scalar context (use it as a scalar); and `pg_proc` lists only user-defined
-functions (built-ins aren't enumerated there).
+**Simplifications:** `LANGUAGE sql` bodies must be a single statement (a
+multi-statement `sql` body is not yet supported); `LANGUAGE plpgsql` covers the
+scalar subset above (no loops / `RAISE` / set-returning / `CASE` / cursors /
+exceptions); a set-returning (`RETURNS SETOF` / `TABLE`) function returns only its
+first row in a scalar context (use it as a scalar); and `pg_proc` lists only
+user-defined functions (built-ins aren't enumerated there).
 
 ## Querying
 
@@ -3254,7 +3291,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) (select list *and* `HAVING`, single-table + JOIN), an **expression over an aggregate** (`sum(x)+1`, `round(avg(x),2)`), a **computed GROUP BY key** (`GROUP BY lower(name)`, `GROUP BY a+b`, incl. over a JOIN and under GROUPING SETS), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table **and over a JOIN**, incl. `HAVING`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) per set, the statistical / bitwise aggregates (`variance`/`var_pop`/`stddev*`/`bit_and`/`bit_or`/`bit_xor`) per set, computed keys, **and a window over it — single-table or over a JOIN**) + the `GROUPING()` super-aggregate helper, **`ORDER BY <position>`** (`ORDER BY 1`) and **`ORDER BY <aggregate>`** (`ORDER BY count(*) DESC`, when selected) | a correlated WHERE over a JOIN, or a subquery in HAVING alongside a window over GROUPING SETS |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` frames (`UNBOUNDED`/`CURRENT ROW`, numeric `n PRECEDING`/`n FOLLOWING` offsets, **and** `INTERVAL` offsets over a date/timestamp key) | a `RANGE` interval offset on a non-temporal key |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, a **pure-`RIGHT` adjacent chain of 3+ tables**, a **leading `RIGHT`/`FULL` join + `INNER`/`LEFT` tail**, a **trailing `RIGHT`/`FULL` join over an `N`-table `INNER`/`LEFT` composite** (`A [INNER|LEFT] JOIN B [… JOIN …] RIGHT|FULL JOIN C`, outer `ON` over any subset of composite tables), `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (simple single-table subquery, or a **rich** subquery — join / `GROUP BY` / `DISTINCT` / aggregate — evaluated per outer row; correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | a `RIGHT`/`FULL` join that isn't first in a 3+ chain (other than the trailing-outer-over-a-composite case), a non-adjacent `RIGHT` `ON`, a second `FULL` in the tail, a composite whose own joins aren't adjacent |
-| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql`, single-statement body), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, `LANGUAGE plpgsql` / multi-statement functions |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql` single-statement body, or `LANGUAGE plpgsql` scalar body — `DECLARE` / `:=` / `IF` / `RETURN` / `SELECT … INTO`), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, multi-statement `LANGUAGE sql` bodies, `plpgsql` loops / `RAISE` / set-returning / `CASE` / cursors / exceptions |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (real nested rollback), two-phase commit `PREPARE TRANSACTION` / `COMMIT`/`ROLLBACK PREPARED` (cross-connection, `pg_prepared_xacts`) | prepared xacts surviving a restart, two-phase over the extended protocol |
 | Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors), `EXPLAIN [ANALYZE]` (`FORMAT TEXT`/`JSON`, faithful Index/Seq Scan) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows, per-node `EXPLAIN` costs / timing |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format, `COPY … FROM/TO STDIN/STDOUT` (text + CSV) | binary-format `COPY`, `COPY` from/to a server-side file |
