@@ -855,6 +855,42 @@ def test_aggregate_date_from_parts(coll) -> None:
     ]
 
 
+def test_aggregate_to_date(coll) -> None:
+    # $toDate: <expr> is shorthand for $convert: {input: <expr>, to: "date"}.
+    # A date is returned unchanged; an int/long/double is milliseconds since the
+    # Unix epoch; an ISO string is parsed; null / missing -> null. (ObjectId is
+    # NOT converted — SecantusDB's $convert-to-date, which $toDate delegates to,
+    # doesn't yet support that source, so $toDate mirrors it exactly.)
+    stored = dt.datetime(2020, 5, 6, 7, 8, 9)
+    coll.insert_one({"_id": 1, "d": stored, "ms": 1700000000000, "s": "2026-04-28T12:00:00"})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "from_date": {"$toDate": "$d"},
+                        "from_millis": {"$toDate": "$ms"},
+                        "from_string": {"$toDate": "$s"},
+                        "from_null": {"$toDate": None},
+                        "from_missing": {"$toDate": "$nope"},
+                    }
+                }
+            ]
+        )
+    )
+    # pymongo returns naive UTC datetimes by default.
+    assert out == [
+        {
+            "from_date": stored,
+            "from_millis": dt.datetime(2023, 11, 14, 22, 13, 20),
+            "from_string": dt.datetime(2026, 4, 28, 12, 0, 0),
+            "from_null": None,
+            "from_missing": None,
+        }
+    ]
+
+
 def test_aggregate_date_extractor_timezone(coll) -> None:
     # 2023-01-15T16:30Z: UTC hour 16; America/New_York is EST (-05:00) -> hour 11,
     # still the 15th. The {date, timezone} object form is mongod's timezone-aware

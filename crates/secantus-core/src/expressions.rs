@@ -260,6 +260,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$toInt" => op_to_int(arg, ctx),
         "$toDouble" => op_to_double(arg, ctx),
         "$toDecimal" => op_to_decimal(arg, ctx),
+        "$toDate" => op_to_date(arg, ctx),
         "$convert" => op_convert(arg, ctx),
         "$toBool" => op_to_bool(arg, ctx),
         "$toString" => op_to_string(arg, ctx),
@@ -2375,6 +2376,23 @@ fn decimal_from_str(s: &str) -> R {
     s.parse::<bson::Decimal128>()
         .map(Bson::Decimal128)
         .map_err(|_| Fallback)
+}
+
+/// `$toDate: <expr>` — shorthand for `$convert: {input: <expr>, to: "date"}`.
+/// Delegates to the exact `convert_value(.., 9)` date path so the two stay
+/// identical. `null` -> null; a `DateTime` is returned unchanged; every other
+/// source type (int/long/double millis, ISO string, ObjectId) defers to Python,
+/// mirroring the `$convert` date path (which defers those to keep the tz-aware /
+/// naive datetime parity intact).
+fn op_to_date(arg: &Bson, ctx: &Ctx) -> R {
+    let v = eval(arg, ctx)?;
+    if matches!(v, Bson::Null) {
+        return Ok(Bson::Null);
+    }
+    match convert_value(&v, 9) {
+        Conv::Ok(out) => Ok(out),
+        Conv::Failed | Conv::Unsupported => Err(Fallback),
+    }
 }
 
 /// `$convert` outcome for one (value, target): a successful conversion, a

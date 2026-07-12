@@ -391,6 +391,18 @@ CURATED = [
     ({"$convert": {"input": "notanumber", "to": "int"}}, {}),  # str->int defer
     ({"$convert": {"input": "$d", "to": "int"}}, {"d": Decimal128("3.5")}),  # dec->int defer
     ({"$convert": {"input": 5}}, {}),  # missing `to` -> defer
+    # $toDate: shorthand for $convert to "date". Rust handles the date
+    # passthrough natively (asserts) and defers int-millis / string to Python
+    # exactly like the $convert date path (keeping the tz-aware / naive datetime
+    # parity intact). null / missing -> null (handled in Rust). An ObjectId is
+    # unsupported by the $convert date path, so $toDate defers it too (Rust None).
+    ({"$toDate": "$d"}, {"d": _DT}),  # date passthrough -> asserts
+    ({"$toDate": "$x"}, {}),  # missing -> null
+    ({"$toDate": None}, {}),  # null -> null
+    ({"$toDate": 1700000000000}, {}),  # int millis -> defer to Python
+    ({"$toDate": "$n"}, {"n": Int64(1700000000000)}),  # int64 millis -> defer
+    ({"$toDate": "$s"}, {"s": "2026-04-28T12:00:00"}),  # ISO string -> defer
+    ({"$toDate": "$o"}, {"o": ObjectId("507f1f77bcf86cd799439011")}),  # objectId -> defer
     # $regexMatch / $regexFind / $regexFindAll — ASCII patterns (byte offset ==
     # code-point idx), simple captures. The linear `regex` crate's leftmost-first
     # semantics align with Python `re` here.
