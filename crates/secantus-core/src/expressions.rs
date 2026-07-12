@@ -18,7 +18,9 @@
 //! (`$mergeObjects`/`$objectToArray`/`$getField`/`$setField`); `$zip`; the
 //! scope-introducing `$let`/`$map`/`$filter`/`$reduce`; UTC date component
 //! extractors (`$year`/`$month`/`$dayOfMonth`/`$hour`/`$minute`/`$second`/
-//! `$dayOfWeek`) + `$dateToParts`; date arithmetic (`$dateAdd`/`$dateSubtract`/
+//! `$millisecond`/`$dayOfWeek`/`$dayOfYear`/`$week`/`$isoWeek`/`$isoDayOfWeek`/
+//! `$isoWeekYear`) + `$dateToParts` (with `iso8601`); date arithmetic
+//! (`$dateAdd`/`$dateSubtract`/
 //! `$dateDiff`/`$dateTrunc` — UTC, dependency-free calendar math); a safe subset
 //! of conversions (`$toInt`/`$toDouble`/`$toBool`/`$toString` for numbers/bools/
 //! strings); exactly-deterministic math (`$abs`/`$floor`/`$ceil`/`$sqrt`); and
@@ -241,7 +243,13 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$hour" => date_part(arg, ctx, DatePart::Hour),
         "$minute" => date_part(arg, ctx, DatePart::Minute),
         "$second" => date_part(arg, ctx, DatePart::Second),
+        "$millisecond" => date_part(arg, ctx, DatePart::Millisecond),
         "$dayOfWeek" => date_part(arg, ctx, DatePart::DayOfWeek),
+        "$dayOfYear" => date_part(arg, ctx, DatePart::DayOfYear),
+        "$week" => date_part(arg, ctx, DatePart::Week),
+        "$isoWeek" => date_part(arg, ctx, DatePart::IsoWeek),
+        "$isoDayOfWeek" => date_part(arg, ctx, DatePart::IsoDayOfWeek),
+        "$isoWeekYear" => date_part(arg, ctx, DatePart::IsoWeekYear),
         // date arithmetic (UTC; no timezone arg form)
         "$dateAdd" => op_date_add(arg, ctx, 1),
         "$dateSubtract" => op_date_add(arg, ctx, -1),
@@ -1580,7 +1588,13 @@ enum DatePart {
     Hour,
     Minute,
     Second,
+    Millisecond,
     DayOfWeek,
+    DayOfYear,
+    Week,
+    IsoWeek,
+    IsoDayOfWeek,
+    IsoWeekYear,
 }
 
 /// Civil (year, month, day) from a count of days since 1970-01-01 (Howard
@@ -1637,8 +1651,39 @@ fn date_part(arg: &Bson, ctx: &Ctx, part: DatePart) -> R {
         DatePart::Hour => ms_of_day / 3_600_000,
         DatePart::Minute => (ms_of_day / 60_000) % 60,
         DatePart::Second => (ms_of_day / 1000) % 60,
+        DatePart::Millisecond => ms_of_day % 1000,
         // mongod $dayOfWeek: Sunday=1 .. Saturday=7 (1970-01-01 was Thursday=5).
         DatePart::DayOfWeek => (days + 4).rem_euclid(7) + 1,
+        // ISO weekday: Monday=1 .. Sunday=7 (1970-01-01 was Thursday=4).
+        DatePart::IsoDayOfWeek => (days + 3).rem_euclid(7) + 1,
+        DatePart::IsoWeek | DatePart::IsoWeekYear => {
+            let (y, m, d) = civil_from_days(days);
+            let (iso_year, iso_week) = iso_year_week(y, m, d).ok_or(Fallback)?;
+            match part {
+                DatePart::IsoWeek => iso_week,
+                DatePart::IsoWeekYear => iso_year,
+                _ => unreachable!(),
+            }
+        }
+        DatePart::DayOfYear => {
+            let (y, m, d) = civil_from_days(days);
+            days_from_civil(y, m, d) - days_from_civil(y, 1, 1) + 1
+        }
+        // US week (mongod $week): weeks start Sunday, 0-53; week 0 is the days
+        // before the year's first Sunday. Mirrors strftime `%U`.
+        DatePart::Week => {
+            let (y, _m, _d) = civil_from_days(days);
+            let jan1 = days_from_civil(y, 1, 1);
+            let yday0 = days - jan1; // 0-based day of year
+                                     // Weekday of Jan 1 with Sunday=0 .. Saturday=6.
+            let jan1_wday_sun0 = (jan1 + 4).rem_euclid(7);
+            let days_to_first_sunday = (7 - jan1_wday_sun0).rem_euclid(7);
+            if yday0 < days_to_first_sunday {
+                0
+            } else {
+                (yday0 - days_to_first_sunday) / 7 + 1
+            }
+        }
         _ => {
             let (y, m, d) = civil_from_days(days);
             match part {
@@ -1650,6 +1695,15 @@ fn date_part(arg: &Bson, ctx: &Ctx, part: DatePart) -> R {
         }
     };
     Ok(Bson::Int32(value as i32))
+}
+
+/// ISO-8601 (year, week) for a civil date, via `chrono`. `None` (→ defer to
+/// Python) when the date falls outside chrono's `NaiveDate` range.
+fn iso_year_week(y: i64, m: i64, d: i64) -> Option<(i64, i64)> {
+    use chrono::{Datelike, NaiveDate};
+    let date = NaiveDate::from_ymd_opt(i32::try_from(y).ok()?, m as u32, d as u32)?;
+    let iso = date.iso_week();
+    Some((iso.year() as i64, iso.week() as i64))
 }
 
 // --- date arithmetic ($dateAdd / $dateSubtract / $dateDiff / $dateTrunc) -
@@ -2840,7 +2894,7 @@ fn op_sort_array(arg: &Bson, ctx: &Ctx) -> R {
     Ok(Bson::Array(out))
 }
 
-// --- $dateToParts (UTC; ignores timezone/iso8601 like the Python impl) ---
+// --- $dateToParts (timezone-aware; `iso8601: true` switches to ISO parts) ---
 
 fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
@@ -2856,10 +2910,25 @@ fn op_date_to_parts(arg: &Bson, ctx: &Ctx) -> R {
             let days = millis.div_euclid(86_400_000);
             let ms = millis.rem_euclid(86_400_000);
             let (y, m, dy) = civil_from_days(days);
+            let iso8601 = match d.get("iso8601") {
+                None => false,
+                Some(e) => match eval(e, ctx)? {
+                    Bson::Boolean(b) => b,
+                    _ => return Err(Fallback),
+                },
+            };
             let mut out = Document::new();
-            out.insert("year".to_string(), Bson::Int32(y as i32));
-            out.insert("month".to_string(), Bson::Int32(m as i32));
-            out.insert("day".to_string(), Bson::Int32(dy as i32));
+            if iso8601 {
+                let (iso_year, iso_week) = iso_year_week(y, m, dy).ok_or(Fallback)?;
+                let iso_dow = (days + 3).rem_euclid(7) + 1;
+                out.insert("isoWeekYear".to_string(), Bson::Int32(iso_year as i32));
+                out.insert("isoWeek".to_string(), Bson::Int32(iso_week as i32));
+                out.insert("isoDayOfWeek".to_string(), Bson::Int32(iso_dow as i32));
+            } else {
+                out.insert("year".to_string(), Bson::Int32(y as i32));
+                out.insert("month".to_string(), Bson::Int32(m as i32));
+                out.insert("day".to_string(), Bson::Int32(dy as i32));
+            }
             out.insert("hour".to_string(), Bson::Int32((ms / 3_600_000) as i32));
             out.insert(
                 "minute".to_string(),

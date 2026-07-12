@@ -881,6 +881,86 @@ def test_aggregate_date_to_parts_timezone(coll) -> None:
     }
 
 
+def test_aggregate_date_component_extractors(coll) -> None:
+    # 2027-01-01 is a Friday belonging to ISO year 2026 week 53; also exercise a
+    # timezone-shifted day-boundary crossing and the millisecond component.
+    coll.insert_one(
+        {"_id": 1, "d": dt.datetime(2026, 3, 15, 10, 30, 45, 123000, tzinfo=dt.timezone.utc)}
+    )
+    coll.insert_one({"_id": 2, "d": dt.datetime(2027, 1, 1, tzinfo=dt.timezone.utc)})
+    # 2026-03-15T02:00Z -> -05:00 is the 14th (day of year 73).
+    coll.insert_one({"_id": 3, "d": dt.datetime(2026, 3, 15, 2, 0, tzinfo=dt.timezone.utc)})
+    out = list(
+        coll.aggregate(
+            [
+                {"$sort": {"_id": 1}},
+                {
+                    "$project": {
+                        "_id": 1,
+                        "doy": {"$dayOfYear": "$d"},
+                        "week": {"$week": "$d"},
+                        "isoweek": {"$isoWeek": "$d"},
+                        "isodow": {"$isoDayOfWeek": "$d"},
+                        "isoyear": {"$isoWeekYear": "$d"},
+                        "ms": {"$millisecond": "$d"},
+                        "tz_doy": {"$dayOfYear": {"date": "$d", "timezone": "-05:00"}},
+                    }
+                },
+            ]
+        )
+    )
+    assert out[0] == {
+        "_id": 1,
+        "doy": 74,
+        "week": 11,
+        "isoweek": 11,
+        "isodow": 7,  # Sunday
+        "isoyear": 2026,
+        "ms": 123,
+        "tz_doy": 74,
+    }
+    assert out[1]["isoweek"] == 53
+    assert out[1]["isoyear"] == 2026
+    assert out[1]["isodow"] == 5  # Friday
+    assert out[2]["tz_doy"] == 73  # shifted to the 14th (day-of-year 73)
+
+
+def test_aggregate_date_to_parts_iso8601(coll) -> None:
+    # 2027-01-01 (Friday) belongs to ISO year 2026, week 53.
+    coll.insert_one({"_id": 1, "d": dt.datetime(2027, 1, 1, 13, 14, 15, 678000)})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "iso": {"$dateToParts": {"date": "$d", "iso8601": True}},
+                        "civil": {"$dateToParts": {"date": "$d", "iso8601": False}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out[0]["iso"] == {
+        "isoWeekYear": 2026,
+        "isoWeek": 53,
+        "isoDayOfWeek": 5,
+        "hour": 13,
+        "minute": 14,
+        "second": 15,
+        "millisecond": 678,
+    }
+    assert out[0]["civil"] == {
+        "year": 2027,
+        "month": 1,
+        "day": 1,
+        "hour": 13,
+        "minute": 14,
+        "second": 15,
+        "millisecond": 678,
+    }
+
+
 def test_aggregate_max_n_min_n(coll) -> None:
     coll.insert_one({"_id": 1, "a": [3, 1, 4, 1, 5, 9, 2, 6], "with_nulls": [3, None, 1, None, 5]})
     out = list(
