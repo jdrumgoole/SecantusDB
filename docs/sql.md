@@ -1987,14 +1987,20 @@ queries. The plain forms are `DISTINCT`; the `ALL` forms keep multiplicities
 (`INTERSECT ALL` → the min of the two counts, `EXCEPT ALL` → left minus right).
 Output column names come from the **first** query, and the arms must have the
 same number of columns (a mismatch is a `42601` error). A trailing `ORDER BY`
-(by output-column name or ordinal position) and `LIMIT` / `OFFSET` apply to the
-combined result:
+(by output-column name or ordinal position — an expression `ORDER BY` on a
+set-operation result is rejected, as in Postgres) and `LIMIT` / `OFFSET` apply to
+the combined result. A **`VALUES` list** works as a standalone query and as a
+set-operation arm; its columns are named `column1` … `columnN` and typed from the
+first non-`NULL` value in each position:
 
 ```sql
 SELECT region FROM sales_2023 UNION SELECT region FROM sales_2024 ORDER BY region;
 SELECT id FROM active EXCEPT SELECT id FROM banned;
 SELECT sku FROM warehouse_a INTERSECT SELECT sku FROM warehouse_b;
 SELECT n FROM a UNION ALL SELECT n FROM b ORDER BY 1 LIMIT 10;
+
+VALUES (1, 'a'), (2, 'b') ORDER BY 1;             -- a standalone constant table
+SELECT id FROM active UNION VALUES (99), (100);   -- a VALUES set-operation arm
 ```
 
 The combine happens in Python over each arm's result rows, so it composes with
@@ -3222,7 +3228,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Area | Supported | Not yet |
 |---|---|---|
 | DML | `SELECT`, `INSERT` (`VALUES` / `… SELECT`), `INSERT … ON CONFLICT` (`DO NOTHING` / `DO UPDATE`; target by column list or `ON CONSTRAINT <name>`), `UPDATE`, `DELETE`, `RETURNING` (columns + computed expressions) | — |
-| Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`) | corresponding-column-name reconciliation, `ORDER BY` over an expression |
+| Set ops | `UNION`/`UNION ALL`, `INTERSECT`/`INTERSECT ALL`, `EXCEPT`/`EXCEPT ALL` (chained; trailing `ORDER BY`/`LIMIT`), a `VALUES` list as a standalone query or a set-op arm | corresponding-column-name reconciliation (`CORRESPONDING`), cross-arm type unification (columns take the first arm's types) |
 | CTEs | `WITH name AS (...)` (multiple, chained) + `WITH RECURSIVE` (anchor `UNION`/`UNION ALL` recursive term, column aliases) on `SELECT` / set-op queries and on `INSERT`/`UPDATE`/`DELETE`/`MERGE` (incl. `WITH RECURSIVE` before a write); data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE … RETURNING …)`) | statement-level snapshot semantics; `WITH CHECK OPTION` |
 | `WHERE` | `=` `<>` `<` `<=` `>` `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, `~`/`~*`/`!~`/`!~*` (POSIX regex), `IS [NOT] NULL`, `AND`/`OR`/`NOT`, jsonb `@>`/`<@` (both directions; `field <@ const` runs residual)/`?`/`?\|`/`?&`, column-to-column + arithmetic, function calls in a comparison (`amt = abs(target)`, single-table + GROUP BY / JOIN pipelines), `IN`/`NOT IN`/scalar `OP (SELECT …)` subqueries (correlated or not), `EXISTS`/`NOT EXISTS` | a comparison function the aggregation engine can't lower (e.g. `substr`) |
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |

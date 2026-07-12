@@ -1448,6 +1448,9 @@ def _run_statement(
     if isinstance(stmt, exp.Select):
         return _run_select(stmt, storage, db, catalog, session)
 
+    if isinstance(stmt, exp.Values):
+        return _run_values(stmt, storage, db, catalog, session)
+
     check_pred = None
     if isinstance(stmt, (exp.Insert, exp.Update, exp.Delete)):
         # DML through an (automatically-updatable) view rewrites onto its base
@@ -1870,6 +1873,8 @@ def _run_query(
         return _run_set_operation(node, storage, db, catalog, session)
     if isinstance(node, exp.Select):
         return _run_select(node, storage, db, catalog, session)
+    if isinstance(node, exp.Values):
+        return _run_values(node, storage, db, catalog, session)
     raise errors.feature_not_supported(f"unsupported set-operation arm: {type(node).__name__}")
 
 
@@ -3624,6 +3629,51 @@ def _setop_order_limit(
     if limit:
         rows = rows[:limit]
     return rows
+
+
+def _values_column_names(stmt: exp.Values, ncols: int) -> list[str]:
+    """Output column names for a ``VALUES`` list: an explicit ``AS t(a, b)`` alias's
+    columns if present, else Postgres's default ``column1`` … ``columnN``."""
+    alias = stmt.args.get("alias")
+    cols = [c.name for c in alias.columns] if alias is not None and alias.columns else []
+    names = list(cols[:ncols])
+    names += [f"column{j + 1}" for j in range(len(names), ncols)]
+    return names
+
+
+def _run_values(
+    stmt: exp.Values, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """Evaluate a ``VALUES (…), (…) [ORDER BY …] [LIMIT …]`` constant table — a
+    standalone query or a set-operation arm.
+
+    Each cell is a constant expression (evaluated with no row scope); every row must
+    have the same width. Columns are named ``column1`` … ``columnN`` (or the
+    ``AS t(…)`` alias's names) and typed from the first non-NULL value in each
+    position. Postgres allows only an ordinal / output-column ``ORDER BY`` on a
+    ``VALUES`` list, which ``_setop_order_limit`` enforces (an expression ``ORDER BY``
+    is rejected there, matching Postgres)."""
+    tuples = stmt.expressions
+    if not tuples:
+        raise errors.SQLError("42601", "VALUES lists must have at least one row")
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    ncols = len(tuples[0].expressions)
+    rows: list[tuple[Any, ...]] = []
+    for t in tuples:
+        cells = t.expressions
+        if len(cells) != ncols:
+            raise errors.SQLError("42601", "VALUES lists must all be the same length")
+        rows.append(tuple(scalar.evaluate(c, planner._const_scope, ctx) for c in cells))
+    names = _values_column_names(stmt, ncols)
+    columns: list[ColumnDesc] = []
+    for j in range(ncols):
+        val = next((r[j] for r in rows if r[j] is not None), None)
+        tag = planner._infer_value_tag(val)
+        columns.append(ColumnDesc(names[j], tag, typemap.PG_OID.get(tag, typemap.PG_OID["text"])))
+    rows = _setop_order_limit(stmt, rows, columns)
+    return SQLResult(
+        command_tag=f"SELECT {len(rows)}", columns=columns, rows=rows, rowcount=len(rows)
+    )
 
 
 def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
