@@ -2089,6 +2089,21 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # Real evaluation happens per-doc inside find_matching with the
         # actual document and threaded ``let`` vars.
         pass
+    # Positional-projection validation happens at parse time in mongod — before
+    # matching — so it fires even when nothing matches. (Per-doc apply_projection
+    # would otherwise only see it once a document is projected.)
+    if projection:
+        from secantus.projection import ProjectionError, validate_projection
+
+        try:
+            validate_projection(projection, filter_)
+        except ProjectionError as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": exc.code or 2,
+                "codeName": exc.code_name or "BadValue",
+            }
     try:
         docs = ctx.storage.find_matching(
             ctx.db_name,

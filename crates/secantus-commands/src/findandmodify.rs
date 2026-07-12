@@ -171,7 +171,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             };
             let upserted_id = outcome.upserted_id.unwrap_or(Bson::Null);
             let value = if return_new && upserted_id != Bson::Null {
-                fetch_projected(storage, &ctx.db_name, &coll, &upserted_id, fields)?
+                fetch_projected(storage, &ctx.db_name, &coll, &upserted_id, fields, &query)?
             } else {
                 Bson::Null
             };
@@ -197,7 +197,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         if let Err(e) = storage.delete_matching(&ctx.db_name, &coll, &id_filter, 1) {
             return Ok(storage_err_reply(e));
         }
-        let value = project_value(matched_doc, fields)?;
+        let value = project_value(matched_doc, fields, &query)?;
         return Ok(doc! {
             "lastErrorObject": { "n": 1, "updatedExisting": true },
             "value": value,
@@ -269,9 +269,9 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     }
 
     let value = if return_new {
-        fetch_projected(storage, &ctx.db_name, &coll, &matched_id, fields)?
+        fetch_projected(storage, &ctx.db_name, &coll, &matched_id, fields, &query)?
     } else {
-        project_value(matched_doc, fields)?
+        project_value(matched_doc, fields, &query)?
     };
     Ok(doc! {
         "lastErrorObject": { "n": 1, "updatedExisting": true },
@@ -295,29 +295,37 @@ fn fetch_projected(
     coll: &str,
     id: &Bson,
     fields: Option<&Document>,
+    query: &Document,
 ) -> Result<Bson, CommandError> {
     let filter = doc! { "_id": id.clone() };
     let found = storage
         .find(db, coll, &filter, None, None)
         .map_err(command_error)?;
     match found.into_iter().next() {
-        Some(b) => project_value(decode(&b)?, fields),
+        Some(b) => project_value(decode(&b)?, fields, query),
         None => Ok(Bson::Null),
     }
 }
 
 /// Apply the optional projection to a value document, returning it as `Bson`.
-fn project_value(value: Document, fields: Option<&Document>) -> Result<Bson, CommandError> {
+fn project_value(
+    value: Document,
+    fields: Option<&Document>,
+    query: &Document,
+) -> Result<Bson, CommandError> {
+    let q = if query.is_empty() { None } else { Some(query) };
     match fields {
-        Some(spec) if !spec.is_empty() => secantus_core::projection::apply_projection(&value, spec)
-            .map(Bson::Document)
-            .map_err(|_| {
-                CommandError::new(
-                    2,
-                    "BadValue",
-                    "projection is not supported by the Rust server",
-                )
-            }),
+        Some(spec) if !spec.is_empty() => {
+            secantus_core::projection::apply_projection(&value, spec, q)
+                .map(Bson::Document)
+                .map_err(|_| {
+                    CommandError::new(
+                        2,
+                        "BadValue",
+                        "projection is not supported by the Rust server",
+                    )
+                })
+        }
         _ => Ok(Bson::Document(value)),
     }
 }

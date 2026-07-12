@@ -27,6 +27,92 @@ def _is_elem_match_spec(value: Any) -> bool:
     return isinstance(value, Mapping) and len(value) == 1 and "$elemMatch" in value
 
 
+def _is_positional_key(key: str) -> bool:
+    """A positional-projection key ``arr.$`` (the projection ``$`` operator, not
+    the update one). ``arr.$.field`` is not a projection form."""
+    return key.endswith(".$")
+
+
+def _positional_element_predicate(
+    query: Mapping[str, Any] | None, array_path: str
+) -> tuple[Mapping[str, Any] | None, Any]:
+    """Build the per-element predicate the positional ``arr.$`` projects against,
+    from the query's clauses on ``array_path``. Returns ``(doc_pred, value_pred)``
+    where ``doc_pred`` is a sub-document match (``{sub: v}`` from ``arr.sub``
+    clauses and from an ``arr: {$elemMatch: E}`` clause) and ``value_pred`` is a
+    direct value/operator predicate (from ``arr: <value|ops>``). Returns
+    ``(None, _MISSING)`` when the query has no clause on ``array_path`` — mongod
+    errors ``Location51246`` in that case."""
+    if not isinstance(query, Mapping):
+        return None, _MISSING
+    doc_pred: dict[str, Any] = {}
+    value_pred: Any = _MISSING
+    prefix = array_path + "."
+    found = False
+    for key, val in query.items():
+        if key == array_path:
+            found = True
+            if isinstance(val, Mapping) and set(val.keys()) == {"$elemMatch"}:
+                em = val["$elemMatch"]
+                if isinstance(em, Mapping):
+                    doc_pred.update(em)
+            else:
+                value_pred = val
+        elif key.startswith(prefix):
+            found = True
+            doc_pred[key[len(prefix) :]] = val
+    if not found:
+        return None, _MISSING
+    return doc_pred, value_pred
+
+
+def validate_projection(
+    spec: Mapping[str, Any] | None, query: Mapping[str, Any] | None = None
+) -> None:
+    """Raise ``ProjectionError`` for an invalid positional projection. mongod
+    validates the projection at parse time — *before* matching — so these errors
+    fire even when the query returns zero documents (whereas the per-doc
+    :func:`apply_projection` only sees them once a document is projected)."""
+    if not spec:
+        return
+    positional = [k for k in spec if _is_positional_key(k)]
+    if not positional:
+        return
+    if len(positional) > 1:
+        raise ProjectionError(
+            "Cannot specify more than one positional projection per query.",
+            code=31276,
+            code_name="Location31276",
+        )
+    key = positional[0]
+    if not spec[key]:
+        raise ProjectionError(
+            "positional projection cannot be used with exclusion",
+            code=31395,
+            code_name="Location31395",
+        )
+    doc_pred, _ = _positional_element_predicate(query, key[: -len(".$")])
+    if doc_pred is None:
+        raise ProjectionError(
+            "positional operator '.$' couldn't find a matching element in the query",
+            code=51246,
+            code_name="Location51246",
+        )
+
+
+def _positional_first(arr: Any, doc_pred: Mapping[str, Any], value_pred: Any) -> Any:
+    """First element of ``arr`` matching the positional predicate, or ``_MISSING``."""
+    if not isinstance(arr, list):
+        return _MISSING
+    for elem in arr:
+        if doc_pred and not (isinstance(elem, Mapping) and matches(elem, doc_pred)):
+            continue
+        if value_pred is not _MISSING and not matches({"_": elem}, {"_": value_pred}):
+            continue
+        return elem
+    return _MISSING
+
+
 def _is_slice_spec(value: Any) -> bool:
     return isinstance(value, Mapping) and len(value) == 1 and "$slice" in value
 
@@ -66,32 +152,66 @@ def _apply_slice(arr: Any, slice_arg: Any) -> Any:
 
 
 def apply_projection_batch(
-    docs: list[dict[str, Any]], spec: Mapping[str, Any] | None
+    docs: list[dict[str, Any]],
+    spec: Mapping[str, Any] | None,
+    query: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Project every doc in ``docs`` against ``spec`` in one shot.
 
-    Every ``find`` result is projected; an empty spec is a no-op copy.
+    Every ``find`` result is projected; an empty spec is a no-op copy. ``query`` is
+    the find filter, needed only to resolve a positional ``arr.$`` projection.
     """
     if not spec:
         return [copy.deepcopy(d) for d in docs]
-    return [apply_projection(d, spec) for d in docs]
+    return [apply_projection(d, spec, query) for d in docs]
 
 
-def apply_projection(doc: dict[str, Any], spec: Mapping[str, Any] | None) -> dict[str, Any]:
+def apply_projection(
+    doc: dict[str, Any],
+    spec: Mapping[str, Any] | None,
+    query: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     if not spec:
         return copy.deepcopy(doc)
 
-    # Separate ``$slice`` projections — they don't participate in
-    # inclusion / exclusion mode detection (mongod treats them as
-    # "neutral" modifiers that re-shape the value at a path). Apply
-    # them after the inclusion/exclusion pass on the result doc.
+    # Separate ``$slice`` and positional (``arr.$``) projections — they don't
+    # participate in inclusion / exclusion mode detection (mongod treats them as
+    # value re-shapers). Apply them after the inclusion/exclusion pass.
     slice_specs: dict[str, Any] = {}
+    positional_specs: dict[str, Any] = {}
     spec_main: dict[str, Any] = {}
     for k, v in spec.items():
         if _is_slice_spec(v):
             slice_specs[k] = v["$slice"]
+        elif _is_positional_key(k):
+            positional_specs[k] = v
         else:
             spec_main[k] = v
+
+    if positional_specs:
+        if len(positional_specs) > 1:
+            raise ProjectionError(
+                "Cannot specify more than one positional projection per query.",
+                code=31276,
+                code_name="Location31276",
+            )
+        # A positional projection is inclusion-only; an exclusion value rejects.
+        ((pos_key, pos_val),) = positional_specs.items()
+        if not pos_val:
+            raise ProjectionError(
+                "positional projection cannot be used with exclusion",
+                code=31395,
+                code_name="Location31395",
+            )
+        array_path = pos_key[: -len(".$")]
+        doc_pred, value_pred = _positional_element_predicate(query, array_path)
+        if doc_pred is None:
+            raise ProjectionError(
+                "positional operator '.$' couldn't find a matching element in the query",
+                code=51246,
+                code_name="Location51246",
+            )
+        return _apply_positional(doc, spec_main, slice_specs, array_path, doc_pred, value_pred)
 
     non_id = {k: v for k, v in spec_main.items() if k != "_id"}
     if not non_id:
@@ -154,6 +274,52 @@ def apply_projection(doc: dict[str, Any], spec: Mapping[str, Any] | None) -> dic
         result.pop("_id", None)
     for path, slice_arg in slice_specs.items():
         current = get_path(result, path, default=_MISSING)
+        if current is not _MISSING:
+            set_path(result, path, _apply_slice(current, slice_arg))
+    return result
+
+
+def _apply_positional(
+    doc: dict[str, Any],
+    spec_main: Mapping[str, Any],
+    slice_specs: Mapping[str, Any],
+    array_path: str,
+    doc_pred: Mapping[str, Any],
+    value_pred: Any,
+) -> dict[str, Any]:
+    """Inclusion projection carrying a positional ``arr.$``: include the other
+    requested fields plus ``array_path: [first-matching-element]``."""
+    result: dict[str, Any] = {}
+    if spec_main.get("_id", 1) and "_id" in doc:
+        result["_id"] = copy.deepcopy(doc["_id"])
+    non_id = {k: v for k, v in spec_main.items() if k != "_id"}
+    for field, v in non_id.items():
+        # Positional forces inclusion mode; a companion exclusion is the same
+        # mix mongod rejects (Location31254).
+        if not (_is_elem_match_spec(v) or v):
+            raise ProjectionError(
+                f"Cannot do exclusion on field {field} in inclusion projection",
+                code=31254,
+                code_name="Location31254",
+            )
+    plain_paths = [p for p, v in non_id.items() if not _is_elem_match_spec(v)]
+    if plain_paths:
+        result.update(_include_doc(doc, _spec_tree(plain_paths)))
+    for p, v in non_id.items():
+        if _is_elem_match_spec(v):
+            first = _first_match(doc, p, v["$elemMatch"])
+            if first is not _MISSING:
+                set_path(result, p, [copy.deepcopy(first)])
+    first = _positional_first(get_path(doc, array_path), doc_pred, value_pred)
+    if first is not _MISSING:
+        set_path(result, array_path, [copy.deepcopy(first)])
+    for path, slice_arg in slice_specs.items():
+        current = get_path(result, path, default=_MISSING)
+        if current is _MISSING:
+            extracted = get_path(doc, path, default=_MISSING)
+            if extracted is not _MISSING:
+                set_path(result, path, copy.deepcopy(extracted))
+                current = get_path(result, path, default=_MISSING)
         if current is not _MISSING:
             set_path(result, path, _apply_slice(current, slice_arg))
     return result

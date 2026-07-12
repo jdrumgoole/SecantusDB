@@ -1778,6 +1778,41 @@ def test_projection_elem_match_first_match(coll) -> None:
     assert doc == {"_id": 1, "items": [{"qty": 5}]}
 
 
+def test_projection_positional_operator(coll) -> None:
+    coll.insert_many(
+        [
+            {"_id": 1, "items": [{"k": "a", "n": 1}, {"k": "b", "n": 2}, {"k": "c", "n": 3}]},
+            {"_id": 2, "items": [{"k": "b", "n": 5}, {"k": "b", "n": 6}]},
+        ]
+    )
+    # The query predicate on the array selects the first matching element.
+    out = sorted(coll.find({"items.k": "b"}, {"items.$": 1}), key=lambda d: d["_id"])
+    assert out == [
+        {"_id": 1, "items": [{"k": "b", "n": 2}]},
+        {"_id": 2, "items": [{"k": "b", "n": 5}]},
+    ]
+
+
+def test_projection_positional_scalar_and_elemmatch(coll) -> None:
+    coll.insert_one({"_id": 1, "nums": [1, 5, 10, 15]})
+    assert coll.find_one({"nums": {"$gte": 10}}, {"nums.$": 1}) == {"_id": 1, "nums": [10]}
+    coll.replace_one({"_id": 1}, {"_id": 1, "items": [{"n": 1}, {"n": 9}]})
+    got = coll.find_one({"items": {"$elemMatch": {"n": {"$gt": 5}}}}, {"items.$": 1})
+    assert got == {"_id": 1, "items": [{"n": 9}]}
+
+
+def test_projection_positional_errors(coll) -> None:
+    coll.insert_one({"_id": 1, "items": [{"k": "b"}], "nums": [1, 2]})
+    # >1 positional (validated at parse time — errors even with zero matches).
+    with pytest.raises(pymongo.errors.OperationFailure) as e1:
+        list(coll.find({"items.k": "zzz", "nums": 999}, {"items.$": 1, "nums.$": 1}))
+    assert e1.value.code == 31276
+    # Positional array not referenced by the query.
+    with pytest.raises(pymongo.errors.OperationFailure) as e2:
+        list(coll.find({"_id": 1}, {"items.$": 1}))
+    assert e2.value.code == 51246
+
+
 def test_explain_find_returns_query_planner(coll) -> None:
     coll.insert_many([{"_id": i, "n": i} for i in range(5)])
     explanation = coll.find({"n": {"$gte": 2}}).explain()

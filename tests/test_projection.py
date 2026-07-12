@@ -166,3 +166,54 @@ def test_inclusion_keeps_dict_skeleton_for_missing_leaf() -> None:
         "_id": 1,
         "a": [{}],
     }
+
+
+def test_positional_dotted_field() -> None:
+    doc = {"_id": 1, "items": [{"k": "a", "n": 1}, {"k": "b", "n": 2}, {"k": "c", "n": 3}]}
+    out = apply_projection(doc, {"items.$": 1}, {"items.k": "b"})
+    assert out == {"_id": 1, "items": [{"k": "b", "n": 2}]}
+
+
+def test_positional_scalar_range() -> None:
+    doc = {"_id": 4, "nums": [1, 5, 10, 15]}
+    out = apply_projection(doc, {"nums.$": 1}, {"nums": {"$gte": 10}})
+    assert out == {"_id": 4, "nums": [10]}
+
+
+def test_positional_elemmatch_query() -> None:
+    doc = {"_id": 1, "items": [{"k": "a", "n": 1}, {"k": "c", "n": 3}]}
+    out = apply_projection(doc, {"items.$": 1}, {"items": {"$elemMatch": {"n": {"$gt": 2}}}})
+    assert out == {"_id": 1, "items": [{"k": "c", "n": 3}]}
+
+
+def test_positional_first_of_many_plus_field() -> None:
+    doc = {"_id": 2, "a": 7, "items": [{"k": "b", "n": 5}, {"k": "b", "n": 6}]}
+    out = apply_projection(doc, {"_id": 0, "a": 1, "items.$": 1}, {"items.k": "b"})
+    assert out == {"a": 7, "items": [{"k": "b", "n": 5}]}
+
+
+def test_positional_errors() -> None:
+    doc = {"_id": 1, "items": [{"k": "b"}]}
+    # No query clause on the positional array.
+    with pytest.raises(ProjectionError) as e1:
+        apply_projection(doc, {"items.$": 1}, {"a": 1})
+    assert e1.value.code == 51246
+    # More than one positional.
+    with pytest.raises(ProjectionError) as e2:
+        apply_projection(doc, {"items.$": 1, "nums.$": 1}, {"items.k": "b", "nums": 1})
+    assert e2.value.code == 31276
+    # Positional with exclusion.
+    with pytest.raises(ProjectionError) as e3:
+        apply_projection(doc, {"items.$": 0}, {"items.k": "b"})
+    assert e3.value.code == 31395
+
+
+def test_validate_projection_parse_time() -> None:
+    from secantus.projection import validate_projection
+
+    # Validates even with no documents (mongod validates at parse time).
+    with pytest.raises(ProjectionError) as e:
+        validate_projection({"items.$": 1, "nums.$": 1}, {"items.k": "b"})
+    assert e.value.code == 31276
+    # A valid positional projection validates clean.
+    validate_projection({"items.$": 1}, {"items.k": "b"})
