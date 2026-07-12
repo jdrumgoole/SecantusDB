@@ -1484,6 +1484,22 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   differ from mongod in the final ULP (e.g. `2.357022603955158` vs mongod's
   `2.3570226039551585`); mongod uses a different summation order. Precision-only,
   hard to match exactly — likely a permanent minor divergence.
+- [ ] **`find()` projection gaps found by the three-way differential (2026-07-12,
+  both servers).** (a) **Positional `$` projection** (`find({"items.k": "b"},
+  {"items.$": 1})`) is broken: mongod returns only the *first array element that
+  matched the query on that path* (`items: [{k:"b", n:2}]`), but both servers strip
+  `items` to a list of empty docs (`[{}, {}, {}]`) — they treat `items.$` as an
+  inclusion of a nonexistent field `$` inside each element. A faithful fix threads
+  the **query filter** into `apply_projection` (it currently takes only `(doc,
+  spec)`): the `find` command handler has the filter, and `projection._first_match`
+  already finds the first element matching a sub-predicate for `$elemMatch`
+  projection — reuse it with the query's predicate on the positional path. Multi-
+  layer (projection engine + command layer, on **both** servers) and quirk-rich
+  (positional `$` may appear once, only for an array field named in the query), so
+  scoped as its own batch. (b) **`$meta` projection** (`{score: {$meta:
+  "indexKey"}}` / `"textScore"` / `"recordId"`) — niche; mongod returns index/meta
+  info, Python emits an empty/partial doc, Rust errors. Low priority (text-search /
+  index-metadata surface SecantusDB doesn't otherwise model).
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
