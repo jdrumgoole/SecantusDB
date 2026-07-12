@@ -1157,6 +1157,7 @@ def _describe_statement(
     if not isinstance(stmt, exp.Select):
         return None
     table_node = stmt.find(exp.Table)
+    planner.rewrite_pg_typeof(stmt, _pg_typeof_table(storage, db, catalog, table_node))
     if table_node is None:
         plan = planner.plan_constant_select(stmt, session)
         return [ColumnDesc(n, t, typemap.PG_OID.get(t, 25)) for n, t, _ in plan.columns]
@@ -1731,10 +1732,23 @@ def _validate_locks(stmt: exp.Select) -> None:
                 )
 
 
+def _pg_typeof_table(storage: Any, db: str, catalog: Catalog, table_node: exp.Table | None):
+    """Best-effort TableDef for ``rewrite_pg_typeof``'s column resolution — None
+    for FROM-less selects and relations we can't resolve (the rewrite then skips
+    any call it can't type and the normal path surfaces the real error)."""
+    if table_node is None or table_node.args.get("db"):
+        return None
+    try:
+        return catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
+    except errors.SQLError:
+        return None
+
+
 def _run_select(
     stmt: exp.Select, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
     _validate_locks(stmt)  # FOR UPDATE / SHARE: single-node no-op, but OF-targets validated.
+    planner.rewrite_pg_typeof(stmt, _pg_typeof_table(storage, db, catalog, stmt.find(exp.Table)))
     # A base-less set-returning function as the row source: ``FROM generate_series(…)``
     # / ``FROM unnest(…)`` / … or a bare ``SELECT generate_series(…)``.
     srf_source = srf.from_source(stmt) or srf.fromless_projection(stmt)

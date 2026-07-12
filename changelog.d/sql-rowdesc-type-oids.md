@@ -13,6 +13,11 @@ SQLAlchemy decode results without special-casing.
 
 #### Added
 
+- `pg_typeof()` and `'name'::regtype`: the type-introspection pair psycopg's
+  type suite leans on (`select pg_typeof(%s::int2) = 'smallint'::regtype`).
+  `pg_typeof` resolves at plan time from the same static inference that types
+  RowDescription; `::regtype` normalizes any accepted spelling (`int4`,
+  `varchar`, `float4`) to the canonical pretty form `pg_typeof` prints.
 - `typemap.py`: first-class `int2` (21) and `float4` (700) type tags —
   `smallint` / `real` columns, casts, arrays (`1005` / `1021`), catalog
   `pg_type` rows, and `information_schema` spellings; `SMALLSERIAL` columns

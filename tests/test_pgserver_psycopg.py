@@ -308,3 +308,13 @@ def test_binary_array_parameter_roundtrip(real_server):
         conn.execute("CREATE TABLE arrp (a int4[])")
         conn.execute("INSERT INTO arrp VALUES (%s)", ([1, 2, 3],))
         assert conn.execute("SELECT a FROM arrp").fetchone() == ([1, 2, 3],)
+
+
+def test_pg_typeof_over_the_wire(real_server):
+    """psycopg's type tests assert ``select pg_typeof(%s::T) = 'T'::regtype``."""
+    with connect(real_server, autocommit=True) as conn:
+        cur = conn.execute("select pg_typeof(%s::int2) = 'smallint'::regtype", (1,))
+        assert cur.fetchone() == (True,)
+        assert conn.execute("select pg_typeof(1.5)").fetchone() == ("numeric",)
+        cur = conn.execute("select pg_typeof(now())")
+        assert cur.fetchone() == ("timestamp with time zone",)

@@ -197,6 +197,42 @@ PG_TYPENAME: dict[str, str] = {
     **{t: t for t in _GEO_TAGS},
 }
 
+# SQL type spelling -> internal tag, for ``'name'::regtype`` normalization. Both
+# the internal (``int2``) and pretty (``smallint``) spellings resolve, plus the
+# common aliases Postgres accepts.
+_REGTYPE_SPELLINGS: dict[str, str] = {
+    **{name: tag for tag, name in PG_TYPENAME.items()},
+    **{name: tag for tag, name in SQL_TYPE_NAME.items()},
+    "int": "int4",
+    "serial": "int4",
+    "bigserial": "int8",
+    "smallserial": "int2",
+    "float": "float8",
+    "decimal": "numeric",
+    "varchar": "text",
+    "character varying": "text",
+    "char": "text",
+    "character": "text",
+    "bpchar": "text",
+    "json": "json",
+    "timestamptz": "timestamptz",
+    "timetz": "timetz",
+}
+
+
+def normalize_regtype(name: str) -> str:
+    """Render a type name the way ``'name'::regtype`` prints in Postgres —
+    normalized to the canonical pretty spelling (``'int4'`` -> ``integer``).
+    Unknown names pass through unchanged (we don't model every catalog type)."""
+    text = " ".join(str(name).strip().lower().split())
+    if text.endswith("[]"):
+        elem = normalize_regtype(text[:-2])
+        return f"{elem}[]"
+    base = text.split("(", 1)[0].strip()
+    tag = _REGTYPE_SPELLINGS.get(base)
+    return SQL_TYPE_NAME.get(tag, tag) if tag is not None else text
+
+
 # sqlglot DataType.Type -> our type tag. Several SQL spellings collapse onto one
 # tag (varchar/char -> text; double/float -> float8) the way Postgres widens
 # them for storage purposes here.

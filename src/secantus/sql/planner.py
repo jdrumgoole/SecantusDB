@@ -6963,6 +6963,42 @@ _INT_TAG_ORDER = {"int2": 0, "int4": 1, "int8": 2}
 _NUMERIC_FAMILY = frozenset({"int2", "int4", "int8", "float4", "float8", "numeric"})
 
 
+def _pg_typeof_name(arg: exp.Expression, resolve: Resolve) -> str:
+    """The regtype text ``pg_typeof(arg)`` prints for ``arg``'s static type."""
+    # An untyped string literal (and a bare NULL) is the ``unknown`` pseudo-type
+    # in Postgres until context types it.
+    if isinstance(arg, exp.Null):
+        return "unknown"
+    if isinstance(arg, exp.Literal) and arg.is_string:
+        return "unknown"
+    tag = _infer_scalar_tag(arg, resolve)
+    if typemap.is_array_tag(tag):
+        elem = typemap.array_element_tag(tag)
+        return f"{typemap.SQL_TYPE_NAME.get(elem, elem)}[]"
+    return typemap.SQL_TYPE_NAME.get(tag, tag)
+
+
+def rewrite_pg_typeof(stmt: exp.Expression, table: TableDef | None) -> None:
+    """Replace ``pg_typeof(x)`` calls with their regtype text, in place.
+
+    ``pg_typeof`` is *static* — it reports the argument's type without needing
+    its value — so it resolves at plan time via the same inference that types
+    RowDescription. A call directly in the SELECT list keeps Postgres' output
+    column name (``pg_typeof``)."""
+    resolve = table_resolver(table) if table is not None else _const_scope
+    for node in list(stmt.find_all(exp.Anonymous)):
+        if str(node.this).lower() != "pg_typeof" or not node.expressions:
+            continue
+        try:
+            name = _pg_typeof_name(node.expressions[0], resolve)
+        except errors.SQLError:
+            continue  # let the normal path surface the real error
+        replacement: exp.Expression = exp.Literal.string(name)
+        if isinstance(node.parent, exp.Select):
+            replacement = exp.alias_(replacement, "pg_typeof")
+        node.replace(replacement)
+
+
 def _arith_operand_tag(node: exp.Expression, resolve: Resolve) -> str | None:
     """The numeric tag an arithmetic operand contributes, or None if non-numeric.
 
