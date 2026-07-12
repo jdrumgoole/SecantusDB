@@ -133,12 +133,161 @@ def test_right_join_with_scalar_expr(storage, session):
     assert _sorted(rows) == [("A1", 5), ("A1", 7), ("A2", 3), (None, 9)]
 
 
-def test_trailing_right_after_inner_rejected(storage, session):
-    # A RIGHT/FULL that is *not* the leading join puts the accumulated composite on
-    # the left of the outer join — that stays 0A000 (INNER then RIGHT).
-    storage.q("CREATE TABLE c (id bigint primary key, aid int)")
+# -- trailing RIGHT over a two-table INNER composite (b226) ------------------- #
+
+
+@pytest.fixture
+def trj(storage, session):
+    # Self-contained INNER-composite fixture.  `ja⋈jb` on ja.k=jb.ak is the INNER
+    # composite; jc sits on the RIGHT of the trailing join.
+    #   ja: {k:1}, {k:2}
+    #   jb: {id:1, ak:1, bk:10}, {id:2, ak:99, bk:20}  # bk:20 row has NO ja (ak 99)
+    #   jc: {cid:100, bk:10}, {cid:200, bk:20}, {cid:300, bk:30}  # bk-keyed (pivot jb)
+    #   ka: {ck:100, k:1}, {ck:200, k:2}, {ck:300, k:3}          # k-keyed  (pivot ja)
+    storage.q("CREATE TABLE ja (k int primary key)")
+    storage.q("INSERT INTO ja VALUES (1), (2)")
+    storage.q("CREATE TABLE jb (id int primary key, ak int, bk int)")
+    storage.q("INSERT INTO jb VALUES (1, 1, 10), (2, 99, 20)")
+    storage.q("CREATE TABLE jc (cid int primary key, bk int)")
+    storage.q("INSERT INTO jc VALUES (100, 10), (200, 20), (300, 30)")
+    storage.q("CREATE TABLE ka (ck int primary key, k int)")
+    storage.q("INSERT INTO ka VALUES (100, 1), (200, 2), (300, 3)")
+    return storage
+
+
+def test_trailing_right_pivot_is_join_table(trj, session):
+    # `(ja JOIN jb) RIGHT JOIN jc ON jc.bk = jb.bk`.  Pivot is jb.  Only jb(bk:10)
+    # has a ja match, so jc(100) → composite; jc(200) matches jb(bk:20) but that jb
+    # has no ja, so the INNER composite is empty → all-NULL pad (NOT jb.bk=20!);
+    # jc(300) matches no jb → all-NULL pad.
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, ja.k, jb.bk FROM ja JOIN jb ON ja.k = jb.ak "
+        "RIGHT JOIN jc ON jc.bk = jb.bk ORDER BY jc.cid",
+    ).rows
+    assert rows == [(100, 1, 10), (200, None, None), (300, None, None)]
+
+
+def test_trailing_right_pivot_is_base_table(trj, session):
+    # Same composite, but the RIGHT ON references the *base* (ja): pivot is ja.
+    # ja(k:1) has a jb → ka(100) → composite; ka(200) matches ja(k:2) which has no
+    # jb → empty composite → NULL; ka(300) matches no ja → NULL.
+    rows = q(
+        trj,
+        session,
+        "SELECT ka.ck, ja.k, jb.bk FROM ja JOIN jb ON ja.k = jb.ak "
+        "RIGHT JOIN ka ON ka.k = ja.k ORDER BY ka.ck",
+    ).rows
+    assert rows == [(100, 1, 10), (200, None, None), (300, None, None)]
+
+
+def test_trailing_right_all_unmatched_c_preserved(trj, session):
+    # Every jc row unmatched → every one preserved with NULL pad.
+    trj.q("INSERT INTO jc VALUES (400, 77)")
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, jb.bk FROM ja JOIN jb ON ja.k = jb.ak "
+        "RIGHT JOIN jc ON jc.bk = jb.bk WHERE jc.cid >= 300 ORDER BY jc.cid",
+    ).rows
+    assert rows == [(300, None), (400, None)]
+
+
+def test_trailing_right_multiple_composite_matches(trj, session):
+    # A jc row matching more than one composite row yields one output row each.
+    trj.q("INSERT INTO jb VALUES (3, 1, 10)")  # a second jb(ak:1, bk:10) under ja(1)
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, jb.id FROM ja JOIN jb ON ja.k = jb.ak "
+        "RIGHT JOIN jc ON jc.bk = jb.bk ORDER BY jc.cid, jb.id",
+    ).rows
+    assert rows == [(100, 1), (100, 3), (200, None), (300, None)]
+
+
+def test_trailing_right_select_star_column_order(trj, session):
+    # SELECT * keeps FROM order: ja.k, jb.(id,ak,bk), jc.(cid,bk).
+    rows = q(
+        trj,
+        session,
+        "SELECT * FROM ja JOIN jb ON ja.k = jb.ak RIGHT JOIN jc ON jc.bk = jb.bk ORDER BY jc.cid",
+    ).rows
+    assert rows == [
+        (1, 1, 1, 10, 100, 10),
+        (None, None, None, None, 200, 20),
+        (None, None, None, None, 300, 30),
+    ]
+
+
+def test_trailing_right_with_group_by(trj, session):
+    # GROUP BY over the driving (jc) key; count of non-null composite rows.
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, count(jb.bk) FROM ja JOIN jb ON ja.k = jb.ak "
+        "RIGHT JOIN jc ON jc.bk = jb.bk GROUP BY jc.cid ORDER BY jc.cid",
+    ).rows
+    assert rows == [(100, 1), (200, 0), (300, 0)]
+
+
+def test_trailing_right_compound_on(trj, session):
+    # A compound RIGHT ON drives the let/pipeline `$lookup` form; the residual
+    # jc-only predicate stays sound (pivot is still just jb).
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, jb.bk FROM ja JOIN jb ON ja.k = jb.ak "
+        "RIGHT JOIN jc ON jc.bk = jb.bk AND jc.cid > 50 ORDER BY jc.cid",
+    ).rows
+    assert rows == [(100, 10), (200, None), (300, None)]
+
+
+def test_trailing_full_over_composite_rejected(trj, session):
+    # A trailing FULL needs a nested anti-branch emptiness test — stays 0A000.
     with pytest.raises(SQLError) as ei:
-        q(storage, session, "SELECT * FROM a JOIN b ON a.id = b.aid RIGHT JOIN c ON c.aid = a.id")
+        q(
+            trj,
+            session,
+            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak FULL JOIN jc ON jc.bk = jb.bk",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_trailing_right_three_table_composite_rejected(trj, session):
+    # A 3-table composite on the left of the RIGHT — nesting depth grows, 0A000.
+    trj.q("CREATE TABLE jd (id int primary key, ak int)")
+    with pytest.raises(SQLError) as ei:
+        q(
+            trj,
+            session,
+            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak JOIN jd ON jd.ak = ja.k "
+            "RIGHT JOIN jc ON jc.bk = jb.bk",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_trailing_right_on_spans_both_composite_tables_rejected(trj, session):
+    # RIGHT ON references C and *both* composite tables → two-level let threading,
+    # deliberately unsupported.
+    with pytest.raises(SQLError) as ei:
+        q(
+            trj,
+            session,
+            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak "
+            "RIGHT JOIN jc ON jc.bk = jb.bk AND jc.cid = ja.k",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_trailing_right_over_leading_left_composite_rejected(trj, session):
+    # The composite is A LEFT JOIN B (not INNER) — out of this slice's sound scope.
+    with pytest.raises(SQLError) as ei:
+        q(
+            trj,
+            session,
+            "SELECT jc.cid FROM ja LEFT JOIN jb ON ja.k = jb.ak RIGHT JOIN jc ON jc.bk = jb.bk",
+        )
     assert ei.value.sqlstate == "0A000"
 
 

@@ -1643,9 +1643,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   driving side, never a `$lookup.from` / `$unionWith.coll`; for a leading FULL the tail runs after the
   anti-join `$unionWith` so it applies to both branches (the anti-branch already nests `b.<field>`, so the
   tail `ON` resolves identically and A's columns read NULL there). `amap` stays FROM-ordered (SELECT *
-  correct); WHERE/GROUP BY unchanged. **Still `0A000`:** a `RIGHT`/`FULL` join that isn't `joins[0]` (a
-  composite on the *left* of an outer join — the hard correlated-replay-anti-join case), a non-adjacent
-  `RIGHT` `ON`, and a second `FULL` in the tail. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
+  correct); WHERE/GROUP BY unchanged.
+  **A trailing `RIGHT` join over a two-table `INNER` composite lands** (b226): `_build_trailing_right_join_pipeline`
+  handles `A JOIN B ON o1 RIGHT JOIN C ON o2` (`sides == ["", "RIGHT"]`) — the composite `A⋈B` sits on the
+  *left* of the outer join, so it can't drive a `$lookup` and a *flat* forward reversal (`C LEFT JOIN pivot LEFT
+  JOIN far`) is **unsound** (it leaks intermediate half-matches: a C row matching the pivot whose pivot row has no
+  far match keeps the pivot's columns instead of the correct all-NULL pad). Sound lowering: drive from C, compute
+  the INNER composite *atomically* with a nested `$lookup` — the outer lookup fetches the *pivot* (the composite
+  table `o2` references) filtered by `o2`, and inside it a second `$lookup` fetches the *far* table filtered by `o1`
+  with an INNER `$unwind` (a pivot row with no far match drops, exactly as `A⋈B` would); the outer `$unwind`
+  preserves C (RIGHT side → unmatched C pads NULL). A/B are hoisted to alias-level keys so `_join_resolver` reads
+  them as ordinary `join`-role aliases unchanged; `amap` stays FROM-ordered (SELECT * correct); WHERE/GROUP BY
+  unchanged. Guarded to the provably-sound shape (qualified ON; `o1 ⊆ {A,B}`; `o2` references C + exactly one of
+  A/B). **Still `0A000`:** a *trailing* `FULL` (needs a nested anti-branch emptiness test + two-table null-pad — the
+  hard correlated-replay case), a trailing `RIGHT` over a `LEFT`/3+-table composite, a `RIGHT` `ON` spanning *both*
+  composite tables (two-level `let` threading), a non-adjacent `RIGHT` `ON`, and a second `FULL` in the tail. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
   `FROM a, b` form) compiles to the cartesian product — an empty `$lookup` pipeline returns every
   foreign doc, then `$unwind` (no preserve) pairs each with the outer row; an outer join without `ON`
   is a `42601`. Non-equi (`a.x < b.y`) and `OR` join conditions already rode the `$lookup` `let`/
