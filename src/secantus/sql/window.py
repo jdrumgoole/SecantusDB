@@ -14,10 +14,10 @@ functions ``FIRST_VALUE`` / ``LAST_VALUE`` / ``NTH_VALUE``; aggregate windows
 Explicit frame clauses are supported: ``ROWS`` frames with any
 ``UNBOUNDED`` / ``CURRENT ROW`` / ``n PRECEDING`` / ``n FOLLOWING`` bound, and
 ``RANGE`` frames with ``UNBOUNDED`` / ``CURRENT ROW`` bounds *and* a numeric
-``n PRECEDING`` / ``n FOLLOWING`` offset (a row is in-frame when its ORDER BY
-key is within ``n`` of the current row's key along the sort order; Postgres
-requires exactly one ORDER BY column for an offset ``RANGE`` frame — a
-non-numeric / interval offset is still rejected). The default frame matches
+``n PRECEDING`` / ``n FOLLOWING`` offset **or** an ``INTERVAL`` offset over a
+date/timestamp key (a row is in-frame when its ORDER BY key is within the offset
+of the current row's key along the sort order; Postgres requires exactly one
+ORDER BY column for an offset ``RANGE`` frame). The default frame matches
 Postgres: whole partition with no
 ``ORDER BY``, else ``RANGE UNBOUNDED PRECEDING`` to ``CURRENT ROW`` (peers tied
 on the order key share the value).
@@ -25,6 +25,7 @@ on the order key share the value).
 
 from __future__ import annotations
 
+import datetime as _dt
 from typing import Any
 
 from sqlglot import exp
@@ -269,11 +270,76 @@ def _range_bound(
 ) -> int:
     if isinstance(val, exp.Literal):
         return _range_offset_bound(val, side, i, n, okeys, order_dirs, is_start=is_start)
+    if isinstance(val, exp.Interval):
+        return _range_interval_bound(val, side, i, n, okeys, order_dirs, is_start=is_start)
     if val is None or val == "CURRENT ROW":
         return _peer_start(okeys, i) if is_start else _peer_end(okeys, i, n)
     if val == "UNBOUNDED":
         return 0 if side == "PRECEDING" else n - 1
     raise errors.feature_not_supported(f"unsupported RANGE frame bound: {val}")
+
+
+def _interval_subdoc(node: exp.Interval) -> dict:
+    """An ``exp.Interval`` frame bound (``INTERVAL '1 day'``) -> an interval
+    subdocument, mirroring the planner's literal conversion."""
+    from secantus.sql import intervals as _intervals
+
+    raw = node.this.this if isinstance(node.this, exp.Literal) else node.this
+    unit = node.args.get("unit")
+    if unit is not None:
+        return _intervals.from_unit(float(raw), unit.name)
+    return _intervals.parse(str(raw))
+
+
+def _range_interval_bound(
+    val: exp.Interval,
+    side: Any,
+    i: int,
+    n: int,
+    okeys: list[tuple],
+    order_dirs: list[int],
+    *,
+    is_start: bool,
+) -> int:
+    """An ``INTERVAL`` ``RANGE`` offset bound (``INTERVAL '1 day' PRECEDING`` /
+    ``FOLLOWING``) over a date/timestamp ORDER BY key. The boundary is the current
+    row's key shifted by the interval along the sort direction — ``PRECEDING`` back,
+    ``FOLLOWING`` forward — and a row is in-frame when its key sits on the in-frame
+    side of that boundary. Like the numeric offset form, Postgres requires exactly
+    one ORDER BY column."""
+    from secantus.sql import intervals as _intervals
+
+    if len(order_dirs) != 1:
+        raise errors.feature_not_supported(
+            "RANGE with an offset requires exactly one ORDER BY column"
+        )
+    subdoc = _interval_subdoc(val)
+    months, days, micros = _intervals._fields(subdoc)
+    if months < 0 or days < 0 or micros < 0:
+        raise errors.SQLError("22013", "invalid preceding or following size in window function")
+    cur = okeys[i][0]
+    if cur is None:
+        # A NULL order key has no distance; its frame is its NULL peers.
+        return _peer_start(okeys, i) if is_start else _peer_end(okeys, i, n)
+    if not isinstance(cur, (_dt.date, _dt.datetime)):
+        raise errors.feature_not_supported(
+            "RANGE with an interval offset requires a date/timestamp ORDER BY key"
+        )
+    direction = order_dirs[0]
+    sign = -1 if side == "PRECEDING" else 1
+    boundary = _intervals.to_date(cur, subdoc, direction * sign)
+    if is_start:
+        for j in range(n):
+            k = okeys[j][0]
+            if k is not None and (k >= boundary if direction == 1 else k <= boundary):
+                return j
+        return n  # no row satisfies the lower bound → empty frame
+    hi = -1
+    for j in range(n):
+        k = okeys[j][0]
+        if k is not None and (k <= boundary if direction == 1 else k >= boundary):
+            hi = j
+    return hi
 
 
 def _range_offset_bound(
