@@ -499,3 +499,94 @@ def test_bit_xor_over_grouping_sets_join(storage, session):
         "GROUP BY ROLLUP(bd.lbl) ORDER BY bd.lbl NULLS LAST",
     )
     assert got == [("X", 5), ("Y", 6), (None, 3)]
+
+
+# -- in-aggregate ORDER BY (sorted array_agg / string_agg) under GROUPING SETS (b224) -- #
+
+
+def test_array_agg_ordered_under_rollup(storage, session):
+    # array_agg(amt ORDER BY amt) per grouping set; amt: e=[10,20,5], w=[30,15].
+    got = _order(
+        rows(
+            storage,
+            session,
+            "SELECT region, array_agg(amt ORDER BY amt) AS a FROM t GROUP BY ROLLUP(region)",
+        )
+    )
+    assert got == [("e", [5, 10, 20]), ("w", [15, 30]), (None, [5, 10, 15, 20, 30])]
+
+
+def test_array_agg_ordered_desc_under_cube(storage, session):
+    got = _order(
+        rows(
+            storage,
+            session,
+            "SELECT region, array_agg(amt ORDER BY amt DESC) AS a FROM t GROUP BY CUBE(region)",
+        )
+    )
+    assert got == [("e", [20, 10, 5]), ("w", [30, 15]), (None, [30, 20, 15, 10, 5])]
+
+
+def test_string_agg_ordered_under_rollup(storage, session):
+    # cities per region: e={ny,ny,bos}, w={sf,sf}. ORDER BY city then dedup-free join.
+    got = _order(
+        rows(
+            storage,
+            session,
+            "SELECT region, string_agg(city, ',' ORDER BY city) AS s "
+            "FROM t GROUP BY ROLLUP(region)",
+        )
+    )
+    assert got == [
+        ("e", "bos,ny,ny"),
+        ("w", "sf,sf"),
+        (None, "bos,ny,ny,sf,sf"),
+    ]
+
+
+def test_array_agg_ordered_with_plain_agg_under_rollup(storage, session):
+    got = _order(
+        rows(
+            storage,
+            session,
+            "SELECT region, SUM(amt) AS s, array_agg(amt ORDER BY amt) AS a "
+            "FROM t GROUP BY ROLLUP(region)",
+        )
+    )
+    assert got == [
+        ("e", 35, [5, 10, 20]),
+        ("w", 45, [15, 30]),
+        (None, 80, [5, 10, 15, 20, 30]),
+    ]
+
+
+def test_array_agg_ordered_over_grouping_sets_join(dim, session):
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, array_agg(t.amt ORDER BY t.amt) AS a FROM t JOIN u ON t.region = u.region "
+        "GROUP BY ROLLUP(u.label) ORDER BY u.label NULLS LAST",
+    )
+    assert got == [("East", [5, 10, 20]), ("West", [15, 30]), (None, [5, 10, 15, 20, 30])]
+
+
+def test_string_agg_ordered_desc_over_grouping_sets_join(dim, session):
+    got = rows(
+        dim,
+        session,
+        "SELECT u.label, string_agg(city, ',' ORDER BY city DESC) AS s "
+        "FROM t JOIN u ON t.region = u.region GROUP BY ROLLUP(u.label) ORDER BY u.label NULLS LAST",
+    )
+    assert got == [("East", "ny,ny,bos"), ("West", "sf,sf"), (None, "sf,sf,ny,ny,bos")]
+
+
+def test_array_agg_ordered_filter_under_rollup_rejected(storage, session):
+    # FILTER combined with an in-aggregate ORDER BY is still 0A000.
+    with pytest.raises(errors.SQLError) as ei:
+        rows(
+            storage,
+            session,
+            "SELECT region, array_agg(amt ORDER BY amt) FILTER (WHERE amt > 8) "
+            "FROM t GROUP BY ROLLUP(region)",
+        )
+    assert ei.value.sqlstate == "0A000"

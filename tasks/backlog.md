@@ -2154,7 +2154,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (NULL values skipped, NULL when all-NULL). Recorded as a `PipelineSelectPlan.post_aggregates` entry
   (`sorted_array` / `sorted_string`). Single-table + whole-table, **and over a JOIN** (b205, #170:
   `_sorted_agg_push_resolve` lowers the value / sort-key expressions through the join resolver, and the
-  join planner records the same `post_aggregates` entry) — not yet in GROUPING SETS. The finalization
+  join planner records the same `post_aggregates` entry), **and under GROUPING SETS** (b224: each grouping
+  set's branch — single-table `_grouping_set_branch` / join `_join_grouping_set_branch` — pushes the `{v, k}`
+  pairs and records the `sorted_array` / `sorted_string` `post_aggregates` entry, which the grouping-sets
+  planner threads onto the union's `PipelineSelectPlan`; the sort runs per output row over the whole union.
+  `FILTER` with an in-call `ORDER BY` stays `0A000`). The finalization
   (`executor._apply_post_aggregates`) runs in **both** the top-level pipeline executor and derived-table
   materialization (`_run_subplan_to_docs`) so the `{v, k}` push pairs never leak — this also closed a
   latent b127 gap where an ordered-set agg inside a derived table (e.g. SQLAlchemy's index reflection,
@@ -3010,8 +3014,8 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `any`) via a `key_path` map; works with `HAVING`, `GROUPING()`, and a window. An unlowerable key (e.g. `substr`)
   still → `0A000`.
   **Limitations:** a subquery in `HAVING` alongside a window over GROUPING SETS → `0A000`; a correlated /
-  per-row WHERE with GROUPING SETS over a JOIN → `feature_not_supported`; single-table GROUPING SETS with an
-  in-aggregate `ORDER BY` over a JOIN → `0A000`.
+  per-row WHERE with GROUPING SETS over a JOIN → `feature_not_supported`. (An in-aggregate `ORDER BY` under
+  GROUPING SETS, single-table or over a JOIN, now works — b224.)
 - [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
   routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`

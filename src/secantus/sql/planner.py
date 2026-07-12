@@ -3870,10 +3870,20 @@ def _grouping_set_branch(
             out_columns.append((fname, "int4"))
         elif arr_arg is not None:
             fname = names.fresh(alias or "array_agg")
-            accumulators[fname] = {
-                "$push": _push_filtered(_agg_arg_to_expr(arr_arg, table), fcond, wrap=True)
-            }
-            project[fname] = _array_agg_project(fname, fcond)
+            value_node, terms = _agg_order_spec(arr_arg)
+            if terms:  # array_agg(x ORDER BY …): push {v, k}, executor sorts over the union
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with an in-aggregate ORDER BY is not supported"
+                    )
+                accumulators[fname] = _sorted_agg_push(value_node, terms, table)
+                project[fname] = f"${fname}"
+                post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+            else:
+                accumulators[fname] = {
+                    "$push": _push_filtered(_agg_arg_to_expr(arr_arg, table), fcond, wrap=True)
+                }
+                project[fname] = _array_agg_project(fname, fcond)
             out_columns.append((fname, "json"))
         elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
@@ -3882,8 +3892,22 @@ def _grouping_set_branch(
             out_columns.append((fname, "json"))
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
-            accumulators[fname] = {"$push": _push_filtered(_agg_arg_to_expr(sagg[0], table), fcond)}
-            project[fname] = _string_agg_project(fname, sagg[1])
+            value_node, terms = _agg_order_spec(sagg[0])
+            if terms:  # string_agg(x, sep ORDER BY …): push {v, k}, executor sorts+joins
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with an in-aggregate ORDER BY is not supported"
+                    )
+                accumulators[fname] = _sorted_agg_push(value_node, terms, table)
+                project[fname] = f"${fname}"
+                post_aggregates.append(
+                    (fname, "sorted_string", ([(d, nf) for _k, d, nf in terms], sagg[1]))
+                )
+            else:
+                accumulators[fname] = {
+                    "$push": _push_filtered(_agg_arg_to_expr(sagg[0], table), fcond)
+                }
+                project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
             # variance / var_pop (square of stdDev) and bit_and/or/xor (push + Python
@@ -5718,15 +5742,20 @@ def _join_grouping_set_branch(
             project[fname] = {"$literal": _grouping_bitmask(grp, in_set)}
             out_columns.append((fname, "int4"))
         elif arr_arg is not None:
-            _value_node, terms = _agg_order_spec(arr_arg)
-            if terms:
-                raise errors.feature_not_supported(
-                    "array_agg(... ORDER BY ...) with GROUPING SETS over a JOIN is not supported"
-                )
             fname = names.fresh(alias or "array_agg")
-            path, _ = resolve(arr_arg)
-            accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond, wrap=True)}
-            project[fname] = _array_agg_project(fname, fcond)
+            value_node, terms = _agg_order_spec(arr_arg)
+            if terms:  # array_agg(x ORDER BY …) over the join: push {v, k}, sort over union
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with an in-aggregate ORDER BY is not supported"
+                    )
+                accumulators[fname] = _sorted_agg_push_resolve(value_node, terms, resolve)
+                project[fname] = f"${fname}"
+                post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+            else:
+                path, _ = resolve(arr_arg)
+                accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond, wrap=True)}
+                project[fname] = _array_agg_project(fname, fcond)
             out_columns.append((fname, "json"))
         elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
@@ -5737,15 +5766,22 @@ def _join_grouping_set_branch(
             project[fname] = _jsonb_object_agg_project(fname, fcond)
             out_columns.append((fname, "json"))
         elif sagg is not None:
-            _value_node, terms = _agg_order_spec(sagg[0])
-            if terms:
-                raise errors.feature_not_supported(
-                    "string_agg(... ORDER BY ...) with GROUPING SETS over a JOIN is not supported"
-                )
             fname = names.fresh(alias or "string_agg")
-            path, _ = resolve(sagg[0])
-            accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond)}
-            project[fname] = _string_agg_project(fname, sagg[1])
+            value_node, terms = _agg_order_spec(sagg[0])
+            if terms:  # string_agg(x, sep ORDER BY …) over the join: push {v, k}, sort+join
+                if fcond is not None:
+                    raise errors.feature_not_supported(
+                        "FILTER (WHERE ...) with an in-aggregate ORDER BY is not supported"
+                    )
+                accumulators[fname] = _sorted_agg_push_resolve(value_node, terms, resolve)
+                project[fname] = f"${fname}"
+                post_aggregates.append(
+                    (fname, "sorted_string", ([(d, nf) for _k, d, nf in terms], sagg[1]))
+                )
+            else:
+                path, _ = resolve(sagg[0])
+                accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond)}
+                project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
             # variance / var_pop and bit_and/or/xor over the join — a $group
