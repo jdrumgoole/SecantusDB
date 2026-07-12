@@ -824,3 +824,94 @@ def test_trig_type_errors() -> None:
     with pytest.raises(ExpressionError) as exc:
         evaluate({"$atan2": ["hi", 1]}, {})
     assert exc.value.code == 51044
+
+
+def test_get_field_absent_is_missing() -> None:
+    from secantus.expressions import MISSING
+
+    # A field absent from the input document resolves to the MISSING marker.
+    assert evaluate({"$getField": {"field": "k", "input": "$sub"}}, {"sub": {"j": 2}}) is MISSING
+    # An input path that is itself missing also resolves to MISSING (mongod 6.0).
+    assert evaluate({"$getField": {"field": "k", "input": "$sub"}}, {}) is MISSING
+
+
+def test_get_field_null_input_is_null() -> None:
+    from secantus.expressions import MISSING
+
+    # An input that resolves to an explicit null yields null (NOT missing) —
+    # verified against mongod 6.0.
+    got = evaluate({"$getField": {"field": "k", "input": "$sub"}}, {"sub": None})
+    assert got is None
+    assert got is not MISSING
+    got2 = evaluate({"$getField": {"field": "k", "input": {"$literal": None}}}, {})
+    assert got2 is None
+    assert got2 is not MISSING
+
+
+def test_get_field_present_null_is_null() -> None:
+    # A field present with an explicit null returns null, NOT the MISSING marker.
+    from secantus.expressions import MISSING
+
+    got = evaluate({"$getField": {"field": "k", "input": "$sub"}}, {"sub": {"k": None}})
+    assert got is None
+    assert got is not MISSING
+
+
+def test_get_field_present_value() -> None:
+    assert evaluate({"$getField": {"field": "k", "input": "$sub"}}, {"sub": {"k": 1}}) == 1
+
+
+def test_project_getfield_missing_is_omitted() -> None:
+    from secantus.aggregate import PipelineContext, apply_pipeline
+
+    ctx = PipelineContext(storage=None, db_name="t", vars={})  # type: ignore[arg-type]
+    docs = [
+        {"_id": 1, "sub": {"k": 1}},
+        {"_id": 2, "sub": {"j": 2}},
+        {"_id": 5},
+    ]
+    out = apply_pipeline(
+        docs, [{"$project": {"r": {"$getField": {"field": "k", "input": "$sub"}}}}], ctx
+    )
+    # _id:1 -> r present; _id:2 and _id:5 -> r omitted entirely (not null).
+    assert out == [{"_id": 1, "r": 1}, {"_id": 2}, {"_id": 5}]
+
+
+def test_project_getfield_present_null_emitted() -> None:
+    from secantus.aggregate import PipelineContext, apply_pipeline
+
+    ctx = PipelineContext(storage=None, db_name="t", vars={})  # type: ignore[arg-type]
+    out = apply_pipeline(
+        [{"_id": 1, "sub": {"k": None}}],
+        [{"$project": {"r": {"$getField": {"field": "k", "input": "$sub"}}}}],
+        ctx,
+    )
+    assert out == [{"_id": 1, "r": None}]
+
+
+def test_addfields_getfield_missing_is_dropped() -> None:
+    from secantus.aggregate import PipelineContext, apply_pipeline
+
+    ctx = PipelineContext(storage=None, db_name="t", vars={})  # type: ignore[arg-type]
+    # Absent field -> the target is not written (existing values untouched).
+    out = apply_pipeline(
+        [{"_id": 1, "sub": {"j": 2}}],
+        [{"$addFields": {"r": {"$getField": {"field": "k", "input": "$sub"}}}}],
+        ctx,
+    )
+    assert out == [{"_id": 1, "sub": {"j": 2}}]
+    # An existing field set to $$REMOVE is removed (mongod semantics).
+    out2 = apply_pipeline(
+        [{"_id": 1, "keep": 9, "drop": 3}],
+        [{"$addFields": {"drop": "$$REMOVE"}}],
+        ctx,
+    )
+    assert out2 == [{"_id": 1, "keep": 9}]
+
+
+def test_project_remove_sentinel_is_omitted() -> None:
+    from secantus.aggregate import PipelineContext, apply_pipeline
+
+    ctx = PipelineContext(storage=None, db_name="t", vars={})  # type: ignore[arg-type]
+    out = apply_pipeline([{"_id": 1, "a": 1}], [{"$project": {"r": "$$REMOVE"}}], ctx)
+    assert out == [{"_id": 1}]

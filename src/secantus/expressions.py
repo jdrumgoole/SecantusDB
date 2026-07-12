@@ -626,10 +626,32 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
             raise ExpressionError("$getField field must evaluate to a string")
     else:
         raise ExpressionError("$getField requires a string or {field, input} document")
-    input_doc = _eval(input_expr, ctx)
+    # Evaluate ``input`` in a missing-aware way so we can tell an input that
+    # resolved to *missing* (an absent field path) apart from an explicit
+    # ``null``. mongod (verified against 6.0):
+    #   - input missing            -> $getField is missing  (field dropped)
+    #   - input null               -> $getField is null     (field kept null)
+    #   - input document, no field -> $getField is missing  (field dropped)
+    #   - input document, field present (incl. null) -> that value
+    if (
+        isinstance(input_expr, str)
+        and input_expr.startswith("$")
+        and not input_expr.startswith("$$")
+    ):
+        input_doc = get_path(dict(ctx.doc), input_expr[1:], default=_REMOVE_SENTINEL)
+    else:
+        input_doc = _eval(input_expr, ctx)
+    if input_doc is _REMOVE_SENTINEL:
+        return _REMOVE_SENTINEL
     if input_doc is None or not isinstance(input_doc, Mapping):
         return None
-    return input_doc.get(field)
+    # A field absent from the input document resolves to "missing" (the same
+    # marker as ``$$REMOVE``), so a ``$project`` / ``$addFields`` computed field
+    # that reads it is omitted from the output. A field present with an explicit
+    # ``null`` still returns ``None`` (and is emitted).
+    if field not in input_doc:
+        return _REMOVE_SENTINEL
+    return input_doc[field]
 
 
 def _op_switch(arg: Any, ctx: _Ctx) -> Any:

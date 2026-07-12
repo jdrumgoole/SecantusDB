@@ -93,6 +93,12 @@ CURATED = [
     [{"$project": {"a": 1, "_id": 0}}],
     [{"$project": {"b": 0}}],
     [{"$project": {"sum": {"$add": ["$a", 100]}, "_id": 0}}],
+    # $getField reading an absent field resolves to the MISSING marker, which a
+    # computed $project/$addFields field omits (Rust defers this to Python; both
+    # sides must agree the field is dropped, not emitted null).
+    [{"$project": {"r": {"$getField": {"field": "k", "input": "$nested"}}}}],
+    [{"$addFields": {"r": {"$getField": {"field": "k", "input": "$nested"}}}}],
+    [{"$project": {"r": "$$REMOVE"}}],
     [{"$addFields": {"c": {"$multiply": ["$a", 2]}}}],
     [{"$set": {"a": {"$add": ["$a", 1]}}}],
     [{"$unset": "b"}],
