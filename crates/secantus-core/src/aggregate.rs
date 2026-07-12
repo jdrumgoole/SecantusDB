@@ -409,6 +409,13 @@ fn add_fields_one(mut doc: Document, spec: &Document, vars: &Document) -> R<Docu
         computed.push((path, evaluate(expr, &doc, vars)?));
     }
     for (path, v) in computed {
+        // A computed value of `Bson::Undefined` is the "missing" marker (e.g. a
+        // `$getField` on an absent field): mongod omits the field. Unset any
+        // existing value at the path rather than writing the marker.
+        if matches!(v, Bson::Undefined) {
+            paths::unset_path(&mut doc, path);
+            continue;
+        }
         paths::set_path(&mut doc, path, v).map_err(|_| Fallback)?;
     }
     Ok(doc)
@@ -499,6 +506,11 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
         }
         for (key, expr) in computed {
             let v = evaluate(expr, doc, vars)?;
+            // `Bson::Undefined` is the "missing" marker (e.g. `$getField` on an
+            // absent field): mongod omits the field rather than emitting null.
+            if matches!(v, Bson::Undefined) {
+                continue;
+            }
             paths::set_path(&mut result, key, v).map_err(|_| Fallback)?;
         }
         return Ok(result);

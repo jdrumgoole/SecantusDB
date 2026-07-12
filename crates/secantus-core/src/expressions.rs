@@ -1073,15 +1073,15 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
             };
             // Evaluate `input` missing-aware: an input field-path that resolves
             // to a *missing* field makes the whole `$getField` "missing" (mongod
-            // 6.0: input missing -> missing, input null -> null). Rust has no
-            // distinct missing sentinel in its `Bson` space, so defer that case
-            // to the pure-Python engine (which drops the field) — mirroring how
-            // `$$REMOVE` already defers.
+            // 6.0: input missing -> missing, input null -> null). We represent the
+            // "missing" value as `Bson::Undefined` — the internal marker a
+            // `$project`/`$addFields` computed field omits from the output rather
+            // than emitting as null (see `add_fields_one`/`project_one`).
             let input = match d.get("input") {
                 Some(Bson::String(s)) if s.starts_with('$') && !s.starts_with("$$") => {
                     match paths::get_path(ctx.doc, &s[1..]) {
                         Some(v) => v.clone(),
-                        None => return Err(Fallback), // input missing -> defer
+                        None => return Ok(Bson::Undefined), // input missing -> missing
                     }
                 }
                 Some(e) => eval(e, ctx)?,
@@ -1093,13 +1093,12 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
     };
     match input {
         // A field absent from the input document resolves to the "missing" value
-        // (the same as `$$REMOVE`) — which a `$project`/`$addFields` computed
-        // field omits from the output rather than emitting as null. Defer that
-        // case to the pure-Python engine. A field present with an explicit null
-        // returns null.
+        // (`Bson::Undefined`) — which a `$project`/`$addFields` computed field
+        // omits rather than emitting as null. A field present with an explicit
+        // null returns null.
         Bson::Document(doc) => match doc.get(&field) {
             Some(v) => Ok(v.clone()),
-            None => Err(Fallback),
+            None => Ok(Bson::Undefined),
         },
         _ => Ok(Bson::Null), // null / non-document input -> None
     }
