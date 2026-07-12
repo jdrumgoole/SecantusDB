@@ -1634,9 +1634,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   runs the existing lookup/unwind loop forcing `LEFT`, and rebuilds `amap` in FROM order for
   `SELECT *`. Sound only under an **adjacency guard** (`_on_referenced_aliases`): each `ON` must join
   its table to the immediately-prior FROM table, else re-association isn't valid → `0A000`. A chain
-  mixing `LEFT`/`RIGHT`, a non-adjacent `RIGHT` `ON`, an unqualified `ON` column, and any multi-table
-  `FULL` all stay `0A000` (FULL-in-a-chain would need a per-step correlated anti-join `$unionWith`
-  with growing-shape null-padding — deferred). **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
+  mixing `LEFT`/`RIGHT`, a non-adjacent `RIGHT` `ON`, and an unqualified `ON` column stay `0A000`.
+  **A leading `RIGHT`/`FULL` join + `INNER`/`LEFT` tail lands** (b225): `_build_leading_outer_join_pipeline`
+  handles `A RIGHT|FULL JOIN B ON p1 [INNER|LEFT] JOIN C ON p2 …` — the leading outer join
+  (`_outer_join_stages`, factored out of `_build_outer_join_pipeline`) builds the composite `(A⋈B)` as the
+  driving *stream*, then each tail join runs the ordinary forward `$lookup`/`$unwind` (`_append_forward_join`,
+  factored out of `_build_join_pipeline`'s loop) over it. Sound because the composite is only ever the
+  driving side, never a `$lookup.from` / `$unionWith.coll`; for a leading FULL the tail runs after the
+  anti-join `$unionWith` so it applies to both branches (the anti-branch already nests `b.<field>`, so the
+  tail `ON` resolves identically and A's columns read NULL there). `amap` stays FROM-ordered (SELECT *
+  correct); WHERE/GROUP BY unchanged. **Still `0A000`:** a `RIGHT`/`FULL` join that isn't `joins[0]` (a
+  composite on the *left* of an outer join — the hard correlated-replay-anti-join case), a non-adjacent
+  `RIGHT` `ON`, and a second `FULL` in the tail. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
   `FROM a, b` form) compiles to the cartesian product — an empty `$lookup` pipeline returns every
   foreign doc, then `$unwind` (no preserve) pairs each with the outer row; an outer join without `ON`
   is a `42601`. Non-equi (`a.x < b.y`) and `OR` join conditions already rode the `$lookup` `let`/

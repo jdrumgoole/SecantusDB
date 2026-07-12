@@ -133,12 +133,124 @@ def test_right_join_with_scalar_expr(storage, session):
     assert _sorted(rows) == [("A1", 5), ("A1", 7), ("A2", 3), (None, 9)]
 
 
-def test_mixed_inner_and_right_chain_rejected(storage, session):
-    # A chain mixing an INNER (or LEFT) join with a RIGHT one can't be reversed into
-    # a single pure-LEFT chain — it stays 0A000.
-    storage.q("CREATE TABLE c (id bigint primary key)")
+def test_trailing_right_after_inner_rejected(storage, session):
+    # A RIGHT/FULL that is *not* the leading join puts the accumulated composite on
+    # the left of the outer join — that stays 0A000 (INNER then RIGHT).
+    storage.q("CREATE TABLE c (id bigint primary key, aid int)")
     with pytest.raises(SQLError) as ei:
-        q(storage, session, "SELECT * FROM a RIGHT JOIN b ON a.id = b.aid JOIN c ON c.id = a.id")
+        q(storage, session, "SELECT * FROM a JOIN b ON a.id = b.aid RIGHT JOIN c ON c.aid = a.id")
+    assert ei.value.sqlstate == "0A000"
+
+
+# -- leading RIGHT/FULL join + INNER/LEFT tail (b225) ------------------------- #
+
+
+@pytest.fixture
+def lead(storage, session):
+    # Self-contained: la(id, av)=(1,a1),(2,a2); lb(id, aid, amt): lb10→a1,
+    # lb11→aid 3 (no a); lc(id, bid, cv): lc20→lb10, lc21→bid 99 (no lb).
+    storage.q("CREATE TABLE la (id int primary key, av text)")
+    storage.q("INSERT INTO la VALUES (1, 'a1'), (2, 'a2')")
+    storage.q("CREATE TABLE lb (id int primary key, aid int, amt int)")
+    storage.q("INSERT INTO lb VALUES (10, 1, 100), (11, 3, 200)")
+    storage.q("CREATE TABLE lc (id int primary key, bid int, cv text)")
+    storage.q("INSERT INTO lc VALUES (20, 10, 'c1'), (21, 99, 'cX')")
+    return storage
+
+
+def test_leading_right_then_inner(lead, session):
+    # RIGHT keeps lb10(a1) and lb11(no a); INNER JOIN lc keeps only lb10→c1.
+    rows = q(
+        lead,
+        session,
+        "SELECT la.av, lb.amt, lc.cv FROM la RIGHT JOIN lb ON la.id = lb.aid "
+        "JOIN lc ON lc.bid = lb.id",
+    ).rows
+    assert _sorted(rows) == [("a1", 100, "c1")]
+
+
+def test_leading_right_then_left(lead, session):
+    rows = q(
+        lead,
+        session,
+        "SELECT la.av, lb.amt, lc.cv FROM la RIGHT JOIN lb ON la.id = lb.aid "
+        "LEFT JOIN lc ON lc.bid = lb.id",
+    ).rows
+    # lb10→c1 ; lb11 (no a) → no c.
+    assert _sorted(rows) == [("a1", 100, "c1"), (None, 200, None)]
+
+
+def test_leading_full_then_inner(lead, session):
+    # FULL keeps a2 (no lb) and lb11 (no a); INNER JOIN lc keeps only lb10→c1.
+    rows = q(
+        lead,
+        session,
+        "SELECT la.av, lb.amt, lc.cv FROM la FULL JOIN lb ON la.id = lb.aid "
+        "JOIN lc ON lc.bid = lb.id",
+    ).rows
+    assert _sorted(rows) == [("a1", 100, "c1")]
+
+
+def test_leading_full_then_left_keeps_both_null_sides(lead, session):
+    rows = q(
+        lead,
+        session,
+        "SELECT la.av, lb.amt, lc.cv FROM la FULL JOIN lb ON la.id = lb.aid "
+        "LEFT JOIN lc ON lc.bid = lb.id",
+    ).rows
+    # a1/lb10→c1 ; a2 (no lb)→NULL ; lb11 (no a)→NULL.
+    assert _sorted(rows) == [("a1", 100, "c1"), ("a2", None, None), (None, 200, None)]
+
+
+def test_leading_right_tail_with_where(lead, session):
+    rows = q(
+        lead,
+        session,
+        "SELECT la.av, lb.amt, lc.cv FROM la RIGHT JOIN lb ON la.id = lb.aid "
+        "LEFT JOIN lc ON lc.bid = lb.id WHERE lb.amt >= 200",
+    ).rows
+    assert _sorted(rows) == [(None, 200, None)]
+
+
+def test_leading_right_tail_with_group_by(lead, session):
+    rows = q(
+        lead,
+        session,
+        "SELECT lb.amt, COUNT(lc.cv) AS n FROM la RIGHT JOIN lb ON la.id = lb.aid "
+        "LEFT JOIN lc ON lc.bid = lb.id GROUP BY lb.amt",
+    ).rows
+    # lb10 (amt 100) has a c match; lb11 (amt 200) has none.
+    assert _sorted(rows) == [(100, 1), (200, 0)]
+
+
+def test_leading_right_tail_select_star_column_order(lead, session):
+    res = q(
+        lead,
+        session,
+        "SELECT * FROM la RIGHT JOIN lb ON la.id = lb.aid LEFT JOIN lc ON lc.bid = lb.id",
+    )
+    # la.*, lb.*, lc.* in FROM order.
+    assert [c.name for c in res.columns] == ["id", "av", "id_2", "aid", "amt", "id_3", "bid", "cv"]
+
+
+def test_leading_left_then_right_still_rejected(lead, session):
+    # A trailing RIGHT after a LEFT — the composite is on the outer join's left. 0A000.
+    with pytest.raises(SQLError) as ei:
+        q(
+            lead,
+            session,
+            "SELECT * FROM la LEFT JOIN lb ON la.id = lb.aid RIGHT JOIN lc ON lc.bid = lb.id",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_double_full_still_rejected(lead, session):
+    with pytest.raises(SQLError) as ei:
+        q(
+            lead,
+            session,
+            "SELECT * FROM la FULL JOIN lb ON la.id = lb.aid FULL JOIN lc ON lc.bid = lb.id",
+        )
     assert ei.value.sqlstate == "0A000"
 
 

@@ -5179,6 +5179,72 @@ def _jsonb_each_join_stage(
     return stages, alias, tdef
 
 
+def _append_forward_join(
+    jn: exp.Expression,
+    amap: dict[str, tuple[str, TableDef]],
+    pipeline: list[dict[str, Any]],
+    db: str,
+    catalog: Any,
+    storage: Any,
+    derived: list[DerivedTable],
+) -> None:
+    """Append one left-driven join's stages to ``pipeline`` and register its alias
+    in ``amap``. Handles INNER / LEFT / CROSS table joins plus the LATERAL / unnest /
+    jsonb_each table-function sources — every case whose driving side is whatever the
+    pipeline already produced (so the ``$lookup``'s ``from`` is always a real
+    collection)."""
+    jt = jn.this
+    side = str(jn.args.get("side") or "").upper()
+    on = jn.args.get("on")
+    if isinstance(jt, exp.Lateral):
+        # A LATERAL subquery correlates *inside* itself (its WHERE references outer
+        # columns), so the join ON is only ever TRUE (or absent for the comma / CROSS
+        # form). A real ON predicate here isn't supported.
+        if on is not None and not (isinstance(on, exp.Boolean) and bool(on.this)):
+            raise errors.feature_not_supported(
+                "LATERAL join ON must be TRUE — correlate inside the subquery's WHERE"
+            )
+        lat_alias, lat_table, stages = _lateral_stage(jt, side, amap, db, catalog, storage, derived)
+        pipeline.extend(stages)
+        amap[lat_alias] = ("join", lat_table)
+        return
+    if isinstance(jt, exp.Unnest):
+        # ``FROM t, unnest(t.tags) AS tag`` — a table-function source. Expose the
+        # array under the alias column, then $unwind it (one row per element, paired
+        # with the outer row). LEFT/comma keeps empty arrays.
+        stages, un_alias, un_tdef = _unnest_join_stage(jt, side, amap)
+        pipeline.extend(stages)
+        amap[un_alias] = ("base", un_tdef)  # element field lives at top level
+        return
+    if _is_jsonb_each_join(jt):
+        # ``FROM t, jsonb_each(t.doc) AS e(k, v)`` — expand each row's object into
+        # (key, value) pairs.
+        stages, je_alias, je_tdef = _jsonb_each_join_stage(jt, side, amap)
+        pipeline.extend(stages)
+        amap[je_alias] = ("base", je_tdef)  # k / v resolve via dotted fields
+        return
+    join_alias, join_table = _resolve_source(jt, db, catalog, storage, derived)
+    if on is None:
+        # No ON: a CROSS JOIN or an implicit comma-join — the cartesian product (an
+        # empty `$lookup` pipeline returns every foreign doc, then `$unwind` pairs
+        # each with the outer row). An outer join without ON is not valid SQL.
+        if side in ("LEFT", "RIGHT", "FULL"):
+            raise errors.syntax_error(f"{side} JOIN requires an ON clause")
+        pipeline.append(
+            {"$lookup": {"from": join_table.collection, "pipeline": [], "as": join_alias}}
+        )
+        pipeline.append(
+            {"$unwind": {"path": f"${join_alias}", "preserveNullAndEmptyArrays": False}}
+        )
+        amap[join_alias] = ("join", join_table)
+        return
+    pipeline.append(_lookup_stage(on, join_alias, join_table, amap))
+    pipeline.append(
+        {"$unwind": {"path": f"${join_alias}", "preserveNullAndEmptyArrays": side == "LEFT"}}
+    )
+    amap[join_alias] = ("join", join_table)
+
+
 def _build_join_pipeline(
     stmt: exp.Select, db: str, catalog: Any, storage: Any
 ) -> tuple[
@@ -5206,8 +5272,17 @@ def _build_join_pipeline(
             return _build_right_chain_pipeline(
                 stmt, base_alias, base, joins, db, catalog, storage, derived
             )
+        if sides[0] in ("RIGHT", "FULL") and all(s in ("", "LEFT") for s in sides[1:]):
+            # A *leading* RIGHT/FULL join, then a tail of only INNER/LEFT joins. The
+            # leading outer join builds the composite (A⋈B) as the driving stream;
+            # each tail join $lookups its (real-collection) table over that stream, so
+            # the composite is never a $lookup source and the plan stays sound.
+            return _build_leading_outer_join_pipeline(
+                stmt, base_alias, base, joins, db, catalog, storage, derived
+            )
         raise errors.feature_not_supported(
-            "RIGHT / FULL OUTER JOIN in a 3+ table chain is only supported for an all-RIGHT chain"
+            "RIGHT / FULL OUTER JOIN in a 3+ table chain is only supported for an all-RIGHT "
+            "chain or a leading RIGHT/FULL join followed by INNER/LEFT joins"
         )
 
     amap: dict[str, tuple[str, TableDef]] = {base_alias: ("base", base)}
@@ -5217,59 +5292,7 @@ def _build_join_pipeline(
     # into an already-joined alias (a chain like a⋈b⋈c where c joins on b), which
     # Mongo's dotted localField handles since b was unwound into the doc.
     for jn in joins:
-        jt = jn.this
-        side = str(jn.args.get("side") or "").upper()
-        on = jn.args.get("on")
-        if isinstance(jt, exp.Lateral):
-            # A LATERAL subquery correlates *inside* itself (its WHERE references
-            # outer columns), so the join ON is only ever TRUE (or absent for the
-            # comma / CROSS form). A real ON predicate here isn't supported.
-            if on is not None and not (isinstance(on, exp.Boolean) and bool(on.this)):
-                raise errors.feature_not_supported(
-                    "LATERAL join ON must be TRUE — correlate inside the subquery's WHERE"
-                )
-            lat_alias, lat_table, stages = _lateral_stage(
-                jt, side, amap, db, catalog, storage, derived
-            )
-            pipeline.extend(stages)
-            amap[lat_alias] = ("join", lat_table)
-            continue
-        if isinstance(jt, exp.Unnest):
-            # ``FROM t, unnest(t.tags) AS tag`` — a table-function source. Expose
-            # the array under the alias column, then $unwind it (one row per
-            # element, paired with the outer row). LEFT/comma keeps empty arrays.
-            stages, un_alias, un_tdef = _unnest_join_stage(jt, side, amap)
-            pipeline.extend(stages)
-            amap[un_alias] = ("base", un_tdef)  # element field lives at top level
-            continue
-        if _is_jsonb_each_join(jt):
-            # ``FROM t, jsonb_each(t.doc) AS e(k, v)`` — expand each row's object
-            # into (key, value) pairs.
-            stages, je_alias, je_tdef = _jsonb_each_join_stage(jt, side, amap)
-            pipeline.extend(stages)
-            amap[je_alias] = ("base", je_tdef)  # k / v resolve via dotted fields
-            continue
-        join_alias, join_table = _resolve_source(jt, db, catalog, storage, derived)
-        if on is None:
-            # No ON: a CROSS JOIN or an implicit comma-join — the cartesian
-            # product (an empty `$lookup` pipeline returns every foreign doc, then
-            # `$unwind` pairs each with the outer row). An outer join without ON is
-            # not valid SQL.
-            if side in ("LEFT", "RIGHT", "FULL"):
-                raise errors.syntax_error(f"{side} JOIN requires an ON clause")
-            pipeline.append(
-                {"$lookup": {"from": join_table.collection, "pipeline": [], "as": join_alias}}
-            )
-            pipeline.append(
-                {"$unwind": {"path": f"${join_alias}", "preserveNullAndEmptyArrays": False}}
-            )
-            amap[join_alias] = ("join", join_table)
-            continue
-        pipeline.append(_lookup_stage(on, join_alias, join_table, amap))
-        pipeline.append(
-            {"$unwind": {"path": f"${join_alias}", "preserveNullAndEmptyArrays": side == "LEFT"}}
-        )
-        amap[join_alias] = ("join", join_table)
+        _append_forward_join(jn, amap, pipeline, db, catalog, storage, derived)
 
     resolve = _join_resolver(amap)
     where = stmt.args.get("where")
@@ -5300,12 +5323,31 @@ def _build_outer_join_pipeline(
     (reshaped so B's columns sit under its alias and A's columns read as NULL).
     The ``amap`` is always inserted in FROM order (A then B) so ``SELECT *`` keeps
     Postgres's left-to-right column order regardless of which side drives."""
+    base, amap, pipeline = _outer_join_stages(a_alias, a_table, jn, db, catalog, storage, derived)
+    resolve = _join_resolver(amap)
+    where = stmt.args.get("where")
+    if where is not None and not where_needs_per_row(stmt):
+        pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
+    return base, amap, resolve, pipeline, derived
+
+
+def _outer_join_stages(
+    a_alias: str,
+    a_table: TableDef,
+    jn: exp.Expression,
+    db: str,
+    catalog: Any,
+    storage: Any,
+    derived: list[DerivedTable],
+) -> tuple[TableDef, dict[str, tuple[str, TableDef]], list[dict[str, Any]]]:
+    """The ``$lookup``/``$unwind`` (+ FULL anti-join ``$unionWith``) stages for one
+    ``A <RIGHT|FULL> JOIN B``, plus the driving ``base`` and the FROM-ordered
+    ``amap``. No WHERE is appended — the caller places it after any trailing joins."""
     side = str(jn.args.get("side") or "").upper()
     b_alias, b_table = _resolve_source(jn.this, db, catalog, storage, derived)
     on = jn.args.get("on")
     if on is None:
         raise errors.feature_not_supported("JOIN without ON is not supported")
-
     if side == "RIGHT":
         amap = {a_alias: ("join", a_table), b_alias: ("base", b_table)}
         pipeline = [
@@ -5326,12 +5368,42 @@ def _build_outer_join_pipeline(
             },
         ]
         base = a_table
+    return base, amap, pipeline
 
+
+def _build_leading_outer_join_pipeline(
+    stmt: exp.Select,
+    base_alias: str,
+    base: TableDef,
+    joins: list[exp.Expression],
+    db: str,
+    catalog: Any,
+    storage: Any,
+    derived: list[DerivedTable],
+) -> tuple[
+    TableDef, dict[str, tuple[str, TableDef]], Resolve, list[dict[str, Any]], list[DerivedTable]
+]:
+    """A *leading* ``RIGHT``/``FULL`` join followed by a tail of only INNER/LEFT
+    joins — ``A RIGHT|FULL JOIN B ON p1 [INNER|LEFT] JOIN C ON p2 …``.
+
+    The leading outer join (`_outer_join_stages`) builds the composite ``(A⋈B)`` as
+    the driving stream (FROM-ordered ``amap``: A then B). Each tail join then runs
+    the ordinary forward ``$lookup``/``$unwind`` over that stream — the composite is
+    only ever the *driving* side, never a ``$lookup.from`` / ``$unionWith.coll``, so
+    the "composite is not a real collection" obstruction never arises. For a leading
+    FULL, the tail joins run after the anti-join ``$unionWith`` and so apply to both
+    branches (the anti-branch already carries ``b.<field>`` under B's alias, so the
+    tail ON resolves identically and A's columns read NULL there)."""
+    driving, amap, pipeline = _outer_join_stages(
+        base_alias, base, joins[0], db, catalog, storage, derived
+    )
+    for jn in joins[1:]:
+        _append_forward_join(jn, amap, pipeline, db, catalog, storage, derived)
     resolve = _join_resolver(amap)
     where = stmt.args.get("where")
     if where is not None and not where_needs_per_row(stmt):
         pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
-    return base, amap, resolve, pipeline, derived
+    return driving, amap, resolve, pipeline, derived
 
 
 def _full_join_anti_branch(
