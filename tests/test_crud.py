@@ -632,6 +632,39 @@ def test_aggregate_project_with_computed_field(coll) -> None:
     assert out == [{"sum": 7}]
 
 
+def test_aggregate_getfield_absent_is_omitted(coll) -> None:
+    # $getField reading a field absent from the input resolves to "missing";
+    # a $project computed field that resolves to missing is OMITTED entirely
+    # (matching mongod) — never emitted as null. But an input that resolves to
+    # an explicit null yields null (the field is emitted).
+    coll.insert_many(
+        [
+            {"_id": 1, "sub": {"k": 1}},
+            {"_id": 2, "sub": {"j": 2}},
+            {"_id": 3, "sub": None},
+            {"_id": 5},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {"$sort": {"_id": 1}},
+                {"$project": {"r": {"$getField": {"field": "k", "input": "$sub"}}}},
+            ]
+        )
+    )
+    # _id:1 -> r=1; _id:2 (no k) omitted; _id:3 (sub null) -> r=null; _id:5 (no sub) omitted.
+    assert out == [{"_id": 1, "r": 1}, {"_id": 2}, {"_id": 3, "r": None}, {"_id": 5}]
+
+
+def test_aggregate_getfield_present_null_is_emitted(coll) -> None:
+    # A field present with an explicit null returns null and IS emitted.
+    coll.insert_one({"_id": 1, "sub": {"k": None}})
+    pipeline = [{"$project": {"r": {"$getField": {"field": "k", "input": "$sub"}}}}]
+    out = list(coll.aggregate(pipeline))
+    assert out == [{"_id": 1, "r": None}]
+
+
 def test_aggregate_new_expression_operators(coll) -> None:
     from bson import Timestamp
 

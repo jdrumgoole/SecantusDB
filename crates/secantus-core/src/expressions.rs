@@ -1071,7 +1071,19 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
             let Bson::String(field) = eval(fe, ctx)? else {
                 return Err(Fallback); // field must evaluate to a string
             };
+            // Evaluate `input` missing-aware: an input field-path that resolves
+            // to a *missing* field makes the whole `$getField` "missing" (mongod
+            // 6.0: input missing -> missing, input null -> null). We represent the
+            // "missing" value as `Bson::Undefined` — the internal marker a
+            // `$project`/`$addFields` computed field omits from the output rather
+            // than emitting as null (see `add_fields_one`/`project_one`).
             let input = match d.get("input") {
+                Some(Bson::String(s)) if s.starts_with('$') && !s.starts_with("$$") => {
+                    match paths::get_path(ctx.doc, &s[1..]) {
+                        Some(v) => v.clone(),
+                        None => return Ok(Bson::Undefined), // input missing -> missing
+                    }
+                }
                 Some(e) => eval(e, ctx)?,
                 None => Bson::Document(ctx.doc.clone()),
             };
@@ -1079,10 +1091,17 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
         }
         _ => return Err(Fallback),
     };
-    Ok(match input {
-        Bson::Document(doc) => doc.get(&field).cloned().unwrap_or(Bson::Null),
-        _ => Bson::Null, // null / non-document input -> None
-    })
+    match input {
+        // A field absent from the input document resolves to the "missing" value
+        // (`Bson::Undefined`) — which a `$project`/`$addFields` computed field
+        // omits rather than emitting as null. A field present with an explicit
+        // null returns null.
+        Bson::Document(doc) => match doc.get(&field) {
+            Some(v) => Ok(v.clone()),
+            None => Ok(Bson::Undefined),
+        },
+        _ => Ok(Bson::Null), // null / non-document input -> None
+    }
 }
 
 fn op_set_field(arg: &Bson, ctx: &Ctx) -> R {

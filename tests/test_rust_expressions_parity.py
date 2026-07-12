@@ -679,7 +679,10 @@ CURATED = [
     ({"$trim": {"input": "$s", "chars": " "}}, {"s": None}),  # null input -> null
     # $getField / $setField / $zip.
     ({"$getField": "x"}, {"x": 5}),
-    ({"$getField": "missing"}, {}),  # absent -> null
+    ({"$getField": "missing"}, {}),  # absent -> MISSING marker -> Rust defers
+    ({"$getField": {"field": "k", "input": "$o"}}, {"o": {"j": 2}}),  # absent field -> defer
+    ({"$getField": {"field": "k", "input": "$o"}}, {"o": {"k": None}}),  # present null -> null
+    ({"$getField": {"field": "k", "input": "$o"}}, {}),  # input path missing -> defer
     ({"$getField": {"field": "a.b", "input": "$o"}}, {"o": {"a.b": 9, "c": 1}}),
     ({"$getField": {"field": "$fname", "input": "$o"}}, {"fname": "k", "o": {"k": 7}}),
     ({"$getField": {"field": "k", "input": "$o"}}, {"o": None}),  # null input -> null

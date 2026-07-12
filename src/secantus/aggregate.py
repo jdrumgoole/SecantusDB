@@ -247,7 +247,13 @@ def _project_one(
             if value is not None or _path_present(doc, path):
                 set_path(result, path, copy.deepcopy(value))
         for key, expr in computed.items():
-            set_path(result, key, evaluate(expr, doc, vars))
+            value = evaluate(expr, doc, vars)
+            # A computed field that resolves to the "missing" marker (an
+            # absent field via ``$getField`` / an explicit ``$$REMOVE``) is
+            # omitted from the output, matching mongod — never emitted as null.
+            if value is MISSING:
+                continue
+            set_path(result, key, value)
         return result
 
     result = copy.deepcopy(doc)
@@ -282,7 +288,15 @@ def _add_fields_one(
 ) -> dict[str, Any]:
     result = copy.deepcopy(doc)
     for path, expr in spec.items():
-        set_path(result, path, evaluate(expr, doc, vars))
+        value = evaluate(expr, doc, vars)
+        # A field that resolves to the "missing" marker (absent field via
+        # ``$getField`` / ``$$REMOVE``) is dropped rather than written —
+        # matching mongod's ``$addFields``, which removes an existing field
+        # when its new value is the missing/``$$REMOVE`` value.
+        if value is MISSING:
+            unset_path(result, path)
+            continue
+        set_path(result, path, value)
     return result
 
 
