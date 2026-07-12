@@ -279,6 +279,18 @@ def test_bit_and_or_xor() -> None:
     assert apply_update({"f": 0b1100}, {"$bit": {"f": {"xor": 0b1010}}}) == {"f": 0b0110}
 
 
+def test_bit_multiple_ops_applied_in_order() -> None:
+    # mongod applies every listed op in order: (v & 0b1010) | 0b0001.
+    assert apply_update({"f": 0b1100}, {"$bit": {"f": {"and": 0b1010, "or": 0b0001}}}) == {
+        "f": 0b1001
+    }
+    # xor after or.
+    assert apply_update({"f": 0b1000}, {"$bit": {"f": {"or": 0b0001, "xor": 0b1001}}}) == {"f": 0}
+    # An empty $bit doc is rejected.
+    with pytest.raises(UpdateError):
+        apply_update({"f": 1}, {"$bit": {"f": {}}})
+
+
 def test_bit_on_missing_field_treats_as_zero() -> None:
     assert apply_update({}, {"$bit": {"f": {"or": 0b101}}}) == {"f": 0b101}
 

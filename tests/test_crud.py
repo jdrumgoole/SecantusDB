@@ -3811,6 +3811,13 @@ def test_push_addtoset_each_modifiers(coll) -> None:
     assert coll.find_one({"_id": 1})["a"] == [1, 7]
 
 
+def test_update_bit_multiple_ops(coll) -> None:
+    """`$bit` applies multiple operations to a field in order (mongod semantics)."""
+    coll.insert_one({"_id": 1, "n": 0b1100})
+    coll.update_one({"_id": 1}, {"$bit": {"n": {"and": 0b1010, "or": 0b0001}}})
+    assert coll.find_one({"_id": 1})["n"] == 0b1001  # (0b1100 & 0b1010) | 0b0001
+
+
 def test_pull_predicate_and_pullall(coll) -> None:
     """`$pull` with a query predicate / sub-document criterion, and `$pullAll`."""
     coll.insert_one({"_id": 1, "a": [1, 5, 10, 15]})
