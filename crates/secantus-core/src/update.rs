@@ -223,11 +223,18 @@ fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
     Ok(Bson::Double(if mul { a * b } else { a + b }))
 }
 
-/// Current value of a field for $inc/$mul: missing or explicit null -> int 0.
-fn current_or_zero(result: &Document, path: &str) -> Bson {
+/// Current value of a field for $inc/$mul. A *missing* field is treated as
+/// int 0 (mongod applies the delta), but a field present with an explicit
+/// `null` is a TypeMismatch (code 14) — mongod refuses to coerce a present
+/// non-numeric value to 0. We defer that (and any other present value that
+/// `arith` can't handle) to the Python oracle so it raises the exact coded
+/// error; the Rust *server* surfaces a generic BadValue (the documented
+/// error-code gap).
+fn current_or_zero(result: &Document, path: &str) -> R<Bson> {
     match get_path(result, path) {
-        None | Some(Bson::Null) => Bson::Int32(0),
-        Some(v) => v.clone(),
+        None => Ok(Bson::Int32(0)),
+        Some(Bson::Null) => Err(Fallback),
+        Some(v) => Ok(v.clone()),
     }
 }
 
@@ -461,7 +468,7 @@ fn apply_op(
         "$inc" => {
             for (path, delta) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
-                    let cur = current_or_zero(result, &cpath);
+                    let cur = current_or_zero(result, &cpath)?;
                     let new = arith(&cur, delta, false)?;
                     set_path(result, &cpath, new)?;
                 }
@@ -470,7 +477,7 @@ fn apply_op(
         "$mul" => {
             for (path, factor) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
-                    let cur = current_or_zero(result, &cpath);
+                    let cur = current_or_zero(result, &cpath)?;
                     let new = arith(&cur, factor, true)?;
                     set_path(result, &cpath, new)?;
                 }
@@ -828,6 +835,11 @@ mod tests {
         assert!(apply_update(&doc! {"a": 1}, &doc! {"$min": {"a": "x"}}, false).is_err());
         // Bare `apply_update` (no positional_matches) can't resolve `$` -> defer.
         assert!(apply_update(&doc! {"a": [1]}, &doc! {"$set": {"a.$": 9}}, false).is_err());
+        // $inc / $mul on an explicit-null field -> defer so Python raises the
+        // TypeMismatch (code 14). A *missing* field still applies (see
+        // `inc_widths_and_floats`).
+        assert!(apply_update(&doc! {"n": Bson::Null}, &doc! {"$inc": {"n": 5}}, false).is_err());
+        assert!(apply_update(&doc! {"n": Bson::Null}, &doc! {"$mul": {"n": 5}}, false).is_err());
     }
 
     fn upd_af(d: Document, u: Document, filters: Vec<Document>, pos: Document) -> Document {

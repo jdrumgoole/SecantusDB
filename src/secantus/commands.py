@@ -2478,12 +2478,15 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 break
             continue
         except UpdateError as exc:
-            # ``_id`` immutability gets a special code (66
-            # ImmutableField) so drivers' canonical handling triggers.
-            # Everything else falls under FailedToParse (9) — malformed
+            # An explicit ``code`` on the ``UpdateError`` wins (e.g.
+            # ``$inc``/``$mul`` on a non-numeric value → 14 TypeMismatch).
+            # Otherwise: ``_id`` immutability gets a special code (66
+            # ImmutableField) so drivers' canonical handling triggers, and
+            # everything else falls under FailedToParse (9) — malformed
             # operators / mixed ops & replacement fields.
             msg = str(exc)
-            code = 66 if "immutable field" in msg else 9
+            default_code = 66 if "immutable field" in msg else 9
+            code = exc.code if exc.code is not None else default_code
             write_errors.append({"index": index, "code": code, "errmsg": msg})
             if ordered:
                 break

@@ -40,6 +40,30 @@ def test_inc_existing_and_missing() -> None:
     assert apply_update({}, {"$inc": {"a": 5}}) == {"a": 5}
 
 
+def test_inc_absent_field_treated_as_zero() -> None:
+    # A *missing* field is treated as 0 and the delta applied (mongod parity).
+    assert apply_update({}, {"$inc": {"n": 5}}) == {"n": 5}
+    assert apply_update({"other": 1}, {"$inc": {"n": 3}}) == {"other": 1, "n": 3}
+
+
+def test_mul_absent_field_treated_as_zero() -> None:
+    assert apply_update({}, {"$mul": {"n": 5}}) == {"n": 0}
+
+
+def test_inc_explicit_null_field_errors_typemismatch() -> None:
+    # A field present with an explicit null is a TypeMismatch (code 14) —
+    # mongod refuses to coerce a present non-numeric value to 0.
+    with pytest.raises(UpdateError) as excinfo:
+        apply_update({"n": None}, {"$inc": {"n": 5}})
+    assert excinfo.value.code == 14
+
+
+def test_mul_explicit_null_field_errors_typemismatch() -> None:
+    with pytest.raises(UpdateError) as excinfo:
+        apply_update({"n": None}, {"$mul": {"n": 5}})
+    assert excinfo.value.code == 14
+
+
 def test_push_creates_array() -> None:
     assert apply_update({}, {"$push": {"tags": "x"}}) == {"tags": ["x"]}
     assert apply_update({"tags": ["x"]}, {"$push": {"tags": "y"}}) == {"tags": ["x", "y"]}

@@ -120,6 +120,30 @@ def test_inc_and_sum_preserve_int64_over_the_wire(coll) -> None:
     assert res[0]["t"] == 20 and isinstance(res[0]["t"], Int64)
 
 
+def test_inc_mul_on_explicit_null_field_errors(coll) -> None:
+    """$inc / $mul on a field present with an explicit null is a TypeMismatch
+    (code 14) — mongod refuses to coerce a present non-numeric value to 0. A
+    *missing* field is still treated as 0 and the operation applied."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": None})
+    with pytest.raises(OperationFailure) as exc_inc:
+        coll.update_one({"_id": 1}, {"$inc": {"n": 5}})
+    assert exc_inc.value.code == 14
+
+    with pytest.raises(OperationFailure) as exc_mul:
+        coll.update_one({"_id": 1}, {"$mul": {"n": 5}})
+    assert exc_mul.value.code == 14
+
+    # The null was never coerced to a number.
+    assert coll.find_one({"_id": 1})["n"] is None
+
+    # A missing field is still treated as 0 and the delta applied.
+    coll.insert_one({"_id": 2})
+    coll.update_one({"_id": 2}, {"$inc": {"n": 5}})
+    assert coll.find_one({"_id": 2})["n"] == 5
+
+
 def test_update_with_push(coll) -> None:
     coll.insert_one({"_id": 1, "tags": ["x"]})
     coll.update_one({"_id": 1}, {"$push": {"tags": "y"}})
