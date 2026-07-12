@@ -2973,7 +2973,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`DISTINCT x`) — with or without `FILTER` — route through `_register_distinct_agg` inside each grouping
   set's branch (a `$addToSet` accumulator + a per-branch `$addFields` reduction stage before the branch's
   `$project`); `min`/`max`(`DISTINCT`) take the plain accumulator (a distinct extremum equals the raw
-  extremum). `count(DISTINCT *)` → `0A000`. **`HAVING` with GROUPING SETS landed** (b213): each grouping
+  extremum). `count(DISTINCT *)` → `0A000`. **Statistical / bitwise aggregates under GROUPING SETS landed**
+  (b223): `variance`/`var_pop` (a `$stdDevSamp`/`$stdDevPop` accumulator squared) and `bit_and`/`bit_or`/
+  `bit_xor` (a `$push` + Python fold) now work per grouping set — each branch (`_grouping_set_branch` /
+  `_join_grouping_set_branch`) carries the accumulator and returns a `post_aggregates` entry; the grouping-sets
+  planners thread one copy (identical across branches) onto the `PipelineSelectPlan`, and
+  `executor._apply_post_aggregates` runs the finish over the whole union. Single-table and over a JOIN. `stddev*`
+  needs no finish (native `$stdDev*`). `FILTER` on these / `func(*)` → `0A000`. **`HAVING` with GROUPING SETS landed** (b213): each grouping
   set's branch resolves the HAVING via the shared `_having_to_match` (before its `$group` is built, so any
   hidden aggregate accumulator the predicate needs lands in the group stage) and applies the resulting
   `$match` to that branch's grouped rows; every branch registers HAVING identically so the `$unionWith`

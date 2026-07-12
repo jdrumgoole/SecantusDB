@@ -3835,20 +3835,23 @@ def _group_col_nodes(group_node: exp.Group) -> dict[str, exp.Column]:
 
 def _grouping_set_branch(
     stmt: exp.Select, table: TableDef, gset: list[str], group_cols: list[str]
-) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]], list[tuple[str, str, float | None]]]:
     """One grouping set's ``[$group, $project]`` sub-pipeline. Group columns not in
     this set project as literal NULL (Postgres' grouping-set semantics), so every
     branch has the same output shape (required for the ``$unionWith``). A ``HAVING``
     filters this branch's grouped rows via a ``$match`` on the ``$group`` output
     (resolved before the ``$group`` is built so any hidden aggregate accumulator it
     needs lands in the group stage); every branch registers HAVING the same way, so
-    the shapes stay aligned."""
+    the shapes stay aligned. Returns ``(stages, out_columns, post_aggregates)`` —
+    ``post_aggregates`` finishes statistical / bitwise aggregates in Python after the
+    union (identical across branches, so the planner keeps one copy)."""
     in_set = set(gset)
     group_id = {c: f"${table.field_for(c)}" for c in gset} or None
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
+    post_aggregates: list[tuple[str, str, float | None]] = []
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -3882,6 +3885,29 @@ def _grouping_set_branch(
             accumulators[fname] = {"$push": _push_filtered(_agg_arg_to_expr(sagg[0], table), fcond)}
             project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
+        elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
+            # variance / var_pop (square of stdDev) and bit_and/or/xor (push + Python
+            # fold) — a $group accumulator plus a post-aggregate finish that runs
+            # over the unioned rows (same field name in every branch).
+            func, col, _distinct = agg
+            if col is None:
+                raise errors.feature_not_supported(f"{func}(*) is not supported")
+            if fcond is not None:
+                raise errors.feature_not_supported(
+                    f"FILTER (WHERE ...) on {func}() is not supported"
+                )
+            fname = names.fresh(alias or func)
+            val = f"${table.field_for(col)}"
+            if func in _BIT_AGG_FUNCS:
+                accumulators[fname] = {"$push": val}
+                tag = table.type_for(col) if table.type_for(col) in ("int4", "int8") else "int8"
+                post_aggregates.append((fname, func, None))
+            else:
+                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                tag = "numeric"
+                post_aggregates.append((fname, "variance", None))
+            project[fname] = f"${fname}"
+            out_columns.append((fname, tag))
         elif agg is not None:
             func, col, distinct = agg
             # DISTINCT count/sum/avg → a $addToSet accumulator + a post-$group
@@ -3937,7 +3963,7 @@ def _grouping_set_branch(
     if having_match is not None:
         stages.append({"$match": having_match})
     stages.append({"$project": project})
-    return stages, out_columns
+    return stages, out_columns, post_aggregates
 
 
 def _plan_grouping_sets_select(
@@ -3960,13 +3986,18 @@ def _plan_grouping_sets_select(
     branches = [_grouping_set_branch(stmt, table, gs, group_cols) for gs in sets]
     pipeline = add_stage + list(branches[0][0])
     out_columns = branches[0][1]
+    # The statistical / bitwise post-aggregate finish is identical across branches
+    # (same aggregates → same field names), so one copy applies to the whole union.
+    post_aggregates = branches[0][2]
     prefix = [{"$match": base_filter}] if base_filter else []
-    for sub, _cols in branches[1:]:
+    for sub, _cols, _post in branches[1:]:
         pipeline.append(
             {"$unionWith": {"coll": table.collection, "pipeline": prefix + add_stage + sub}}
         )
     _append_sort_limit(pipeline, stmt, out_columns, table)
-    return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
+    return PipelineSelectPlan(
+        table.collection, base_filter, pipeline, out_columns, post_aggregates=post_aggregates
+    )
 
 
 def _plan_grouping_sets_window_select(
@@ -5649,7 +5680,7 @@ def _join_grouping_set_branch(
     key_tag: dict[str, str],
     key_path: dict[str, str],
     gset: list[str],
-) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]], list[tuple[str, str, float | None]]]:
     """One grouping set's ``[$group, $project]`` sub-pipeline for the JOIN path —
     the join analogue of ``_grouping_set_branch``. Group columns / aggregate args
     resolve through the join ``resolve`` (so ``d.region`` / ``SUM(e.amt)`` map to
@@ -5657,13 +5688,16 @@ def _join_grouping_set_branch(
     every branch shares the same output shape (required for the ``$unionWith``).
     ``group_keys`` / ``key_tag`` cover every grouping column across all sets so a
     ``HAVING`` may reference any of them. ``key_path`` maps each grouping column
-    (bare or synthetic ``__gkeyN``) to its resolved ``$group`` key path."""
+    (bare or synthetic ``__gkeyN``) to its resolved ``$group`` key path. Returns
+    ``(stages, out_columns, post_aggregates)`` — statistical / bitwise finishes run
+    in Python over the union (identical across branches)."""
     in_set = set(gset)
     group_id = {c: f"${key_path[c]}" for c in gset} or None
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
+    post_aggregates: list[tuple[str, str, float | None]] = []
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -5713,6 +5747,30 @@ def _join_grouping_set_branch(
             accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond)}
             project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
+        elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
+            # variance / var_pop and bit_and/or/xor over the join — a $group
+            # accumulator plus a post-aggregate finish (resolved through the join
+            # resolver), run over the unioned rows.
+            func, arg_node, _distinct = agg
+            if arg_node is None:
+                raise errors.feature_not_supported(f"{func}(*) is not supported")
+            if fcond is not None:
+                raise errors.feature_not_supported(
+                    f"FILTER (WHERE ...) on {func}() is not supported"
+                )
+            fname = names.fresh(alias or func)
+            path, coltag = resolve(arg_node)
+            val = f"${path}"
+            if func in _BIT_AGG_FUNCS:
+                accumulators[fname] = {"$push": val}
+                tag = coltag if coltag in ("int4", "int8") else "int8"
+                post_aggregates.append((fname, func, None))
+            else:
+                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                tag = "numeric"
+                post_aggregates.append((fname, "variance", None))
+            project[fname] = f"${fname}"
+            out_columns.append((fname, tag))
         elif agg is not None:
             func, arg, distinct = agg
             if distinct and func in _DISTINCT_FUNCS:
@@ -5760,7 +5818,7 @@ def _join_grouping_set_branch(
     if having_match is not None:
         stages.append({"$match": having_match})
     stages.append({"$project": project})
-    return stages, out_columns
+    return stages, out_columns, post_aggregates
 
 
 def _lower_join_group_keys(
@@ -5823,12 +5881,16 @@ def _plan_join_grouping_sets_select(
     ]
     pipeline = list(join_prefix) + list(branches[0][0])
     out_columns = branches[0][1]
-    for sub, _cols in branches[1:]:
+    # Statistical / bitwise post-aggregate finish — identical across branches.
+    post_aggregates = branches[0][2]
+    for sub, _cols, _post in branches[1:]:
         pipeline.append(
             {"$unionWith": {"coll": base.collection, "pipeline": list(join_prefix) + sub}}
         )
     _append_sort_limit(pipeline, stmt, out_columns, amap=amap)
-    return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
+    return PipelineSelectPlan(
+        base.collection, {}, pipeline, out_columns, derived=derived, post_aggregates=post_aggregates
+    )
 
 
 def _plan_join_grouping_sets_window_select(
