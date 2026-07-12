@@ -54,6 +54,14 @@ jobs:
     # tests/conftest.py) blocks the runner until GitHub's 6-hour kill with no
     # diagnostics. macOS is dropped from this matrix for the same flakiness
     # (9e16e49); the cap also protects the release-time macOS run.
+    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
+    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
+    # (3.12); without it, a bare `uv run` after the sync re-resolves against
+    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
+    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
+    # same mechanism that made every matrix cell silently test 3.12 before.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -163,6 +171,14 @@ jobs:
   # platform-independent.
   test-windows:
     runs-on: windows-latest
+    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
+    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
+    # (3.12); without it, a bare `uv run` after the sync re-resolves against
+    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
+    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
+    # same mechanism that made every matrix cell silently test 3.12 before.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -253,6 +269,14 @@ jobs:
   # taking ~11 min off the workflow's critical path.
   test-durable:
     runs-on: ubuntu-latest
+    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
+    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
+    # (3.12); without it, a bare `uv run` after the sync re-resolves against
+    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
+    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
+    # same mechanism that made every matrix cell silently test 3.12 before.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     timeout-minutes: 30
     strategy:
       fail-fast: false

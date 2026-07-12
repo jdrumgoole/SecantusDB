@@ -312,4 +312,6 @@ def _as_dt(v: Any) -> _dt.datetime:
         return v
     if isinstance(v, _dt.date):
         return _dt.datetime(v.year, v.month, v.day)
-    return _dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    from secantus.sql.datetimes import parse_iso_datetime
+
+    return parse_iso_datetime(v)
