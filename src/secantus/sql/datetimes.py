@@ -19,6 +19,29 @@ import datetime as _dt
 import re
 from typing import Any
 
+_SHORT_OFFSET_RE = re.compile(r"([+-]\d{2})(\d{2})?$")
+
+
+def parse_iso_datetime(v: Any) -> _dt.datetime:
+    """``datetime.fromisoformat`` with a Python 3.10 compatibility net.
+
+    3.11+ parses a trailing ``Z`` and Postgres's short UTC offsets (``+00`` /
+    ``+0000``) directly; 3.10 rejects them — and PG text rendering emits the
+    short form, so timestamptz literals and round-tripped wire text must parse
+    here. Try the fast path first (a no-op passthrough on 3.11+), and only on
+    failure widen a trailing short offset to ``+HH:MM``.
+    """
+    s = str(v).strip().replace("Z", "+00:00")
+    try:
+        return _dt.datetime.fromisoformat(s)
+    except ValueError:
+        m = _SHORT_OFFSET_RE.search(s)
+        if m:
+            fixed = s[: m.start()] + m.group(1) + ":" + (m.group(2) or "00")
+            return _dt.datetime.fromisoformat(fixed)
+        raise
+
+
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?$")
 _TIMETZ_RE = re.compile(

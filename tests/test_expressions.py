@@ -426,7 +426,7 @@ def test_date_from_string_on_error_fallback() -> None:
 def test_date_to_string_with_iana_timezone() -> None:
     import datetime as dt
 
-    when = dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=dt.UTC)
+    when = dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=dt.timezone.utc)
     out = evaluate(
         {"$dateToString": {"date": "$ts", "format": "%H:%M %Z", "timezone": "Europe/Dublin"}},
         {"ts": when},
@@ -438,7 +438,7 @@ def test_date_to_string_with_iana_timezone() -> None:
 def test_date_to_string_with_utc_offset() -> None:
     import datetime as dt
 
-    when = dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=dt.UTC)
+    when = dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=dt.timezone.utc)
     out = evaluate(
         {"$dateToString": {"date": "$ts", "format": "%H:%M", "timezone": "+05:30"}},
         {"ts": when},
@@ -449,7 +449,7 @@ def test_date_to_string_with_utc_offset() -> None:
 def test_date_to_string_with_gmt_alias() -> None:
     import datetime as dt
 
-    when = dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=dt.UTC)
+    when = dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=dt.timezone.utc)
     out = evaluate(
         {"$dateToString": {"date": "$ts", "format": "%H:%M", "timezone": "GMT"}},
         {"ts": when},
@@ -482,7 +482,7 @@ def test_date_from_string_with_timezone_interprets_naive_input() -> None:
         {},
     )
     # 12:00 in +02:00 represents the instant 10:00 UTC.
-    assert out == dt.datetime(2026, 5, 2, 10, 0, 0, tzinfo=dt.UTC)
+    assert out == dt.datetime(2026, 5, 2, 10, 0, 0, tzinfo=dt.timezone.utc)
     # Returned datetime is tz-aware in the requested zone.
     assert out.utcoffset() == dt.timedelta(hours=2)
 

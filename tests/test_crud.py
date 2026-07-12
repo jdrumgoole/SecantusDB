@@ -50,7 +50,7 @@ def test_round_trips_objectid_and_datetime(server: SecantusDBServer) -> None:
     try:
         coll = aware_client["testdb"]["things"]
         oid = ObjectId()
-        when = dt.datetime(2026, 4, 26, 12, 0, 0, tzinfo=dt.UTC)
+        when = dt.datetime(2026, 4, 26, 12, 0, 0, tzinfo=dt.timezone.utc)
         coll.insert_one({"_id": oid, "ts": when})
         doc = coll.find_one({"_id": oid})
         assert doc is not None

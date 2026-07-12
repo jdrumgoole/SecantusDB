@@ -492,18 +492,17 @@ def coerce(value: Any, tag: str) -> Any:
     if tag == "timestamptz":
         if isinstance(value, _dt.datetime):
             return value
-        # ISO-8601 string literal -> datetime. fromisoformat handles offsets
-        # and a trailing 'Z' on 3.11+.
-        return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        # ISO-8601 string literal -> datetime (with the 3.10 short-offset net).
+        from secantus.sql.datetimes import parse_iso_datetime
+
+        return parse_iso_datetime(value)
     if tag == "timestamp":
         # Naive "without time zone": an offset in the input is dropped and the
         # wall-clock fields kept (Postgres timestamp semantics), so the stored /
         # compared value is always tz-naive.
-        dt = (
-            value
-            if isinstance(value, _dt.datetime)
-            else _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        )
+        from secantus.sql.datetimes import parse_iso_datetime
+
+        dt = value if isinstance(value, _dt.datetime) else parse_iso_datetime(value)
         return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
     if tag in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes

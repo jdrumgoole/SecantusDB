@@ -816,8 +816,10 @@ def _eval_interval(node: exp.Interval, scope: Scope, ctx: ScalarContext) -> dict
 def _as_datetime(v: Any) -> _dt.datetime | _dt.date:
     if isinstance(v, (_dt.datetime, _dt.date)):
         return v
+    from secantus.sql.datetimes import parse_iso_datetime
+
     text = _as_text(v)
-    return _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return parse_iso_datetime(text)
 
 
 def _eval_extract(node: exp.Extract, scope: Scope, ctx: ScalarContext) -> Any:
