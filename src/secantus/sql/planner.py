@@ -5292,10 +5292,19 @@ def _build_join_pipeline(
             return _build_trailing_right_join_pipeline(
                 stmt, base_alias, base, joins, db, catalog, storage, derived
             )
+        if len(joins) == 2 and sides == ["", "FULL"]:
+            # A *trailing* FULL over a two-table INNER composite —
+            # ``A JOIN B ON o1 FULL JOIN C ON o2``. `(A⋈B) FULL JOIN C` unions the
+            # forward `(A⋈B) LEFT JOIN C` main branch with a `$unionWith` anti-branch
+            # of the C rows whose composite (an emptiness test via the same nested
+            # `$lookup`) is empty. Re-raises ``0A000`` for shapes it can't prove sound.
+            return _build_trailing_full_join_pipeline(
+                stmt, base_alias, base, joins, db, catalog, storage, derived
+            )
         raise errors.feature_not_supported(
             "RIGHT / FULL OUTER JOIN in a 3+ table chain is only supported for an all-RIGHT "
             "chain, a leading RIGHT/FULL join followed by INNER/LEFT joins, or a trailing "
-            "RIGHT join over a two-table INNER composite"
+            "RIGHT/FULL join over a two-table INNER composite"
         )
 
     amap: dict[str, tuple[str, TableDef]] = {base_alias: ("base", base)}
@@ -5518,6 +5527,139 @@ def _build_right_chain_pipeline(
     return new_base, ordered_amap, resolve, pipeline, derived
 
 
+def _trailing_composite_operands(
+    kind: str,
+    a_alias: str,
+    a_table: TableDef,
+    joins: list[exp.Expression],
+    db: str,
+    catalog: Any,
+    storage: Any,
+    derived: list[DerivedTable],
+) -> tuple[
+    exp.Expression, exp.Expression, str, TableDef, str, TableDef, str, TableDef, str, TableDef
+]:
+    """Resolve + validate the operands of a trailing outer join over a two-table
+    INNER composite (``A JOIN B ON o1 <RIGHT|FULL> JOIN C ON o2``).
+
+    Returns ``(o1, o2, b_alias, b_table, c_alias, c_table, pivot_alias, pivot_table,
+    far_alias, far_table)``. Raises ``0A000`` for any shape that can't be proven
+    sound: a missing ON, a non-plain-table source, unqualified ON columns, an ``o1``
+    reaching outside {A, B}, or an ``o2`` referencing C and *both* (or neither)
+    composite tables. ``kind`` (``"RIGHT"`` / ``"FULL"``) only shapes the error text."""
+    jn_b, jn_c = joins
+    o1 = jn_b.args.get("on")
+    o2 = jn_c.args.get("on")
+    if o1 is None or o2 is None:
+        raise errors.feature_not_supported(
+            f"a trailing {kind} join over a composite requires an ON clause on both joins"
+        )
+    if (
+        isinstance(jn_b.this, (exp.Lateral, exp.Unnest))
+        or _is_jsonb_each_join(jn_b.this)
+        or isinstance(jn_c.this, (exp.Lateral, exp.Unnest))
+        or _is_jsonb_each_join(jn_c.this)
+    ):
+        raise errors.feature_not_supported(
+            f"a trailing {kind} join is only supported over plain-table joins"
+        )
+    b_alias, b_table = _resolve_source(jn_b.this, db, catalog, storage, derived)
+    c_alias, c_table = _resolve_source(jn_c.this, db, catalog, storage, derived)
+
+    # o1 must relate exactly the composite tables A and B; o2 must relate C to exactly
+    # one composite table (the pivot). Both must be fully qualified so we can prove
+    # which tables each predicate touches (mirrors `_build_right_chain_pipeline`).
+    o1_refs = _on_referenced_aliases(o1)
+    o2_refs = _on_referenced_aliases(o2)
+    if o1_refs is None or o2_refs is None:
+        raise errors.feature_not_supported(
+            f"a trailing {kind} join requires fully-qualified ON columns"
+        )
+    if not o1_refs <= {a_alias, b_alias}:
+        raise errors.feature_not_supported(
+            "the composite join's ON may reference only its two tables"
+        )
+    pivots = o2_refs - {c_alias}
+    if c_alias not in o2_refs or len(pivots) != 1 or not pivots <= {a_alias, b_alias}:
+        raise errors.feature_not_supported(
+            f"a trailing {kind} join's ON must reference C and exactly one composite table"
+        )
+    if pivots == {b_alias}:
+        pivot_alias, pivot_table = b_alias, b_table
+        far_alias, far_table = a_alias, a_table
+    else:
+        pivot_alias, pivot_table = a_alias, a_table
+        far_alias, far_table = b_alias, b_table
+    return (
+        o1,
+        o2,
+        b_alias,
+        b_table,
+        c_alias,
+        c_table,
+        pivot_alias,
+        pivot_table,
+        far_alias,
+        far_table,
+    )
+
+
+def _nested_composite_lookup(
+    o1: exp.Expression,
+    o2: exp.Expression,
+    c_alias: str,
+    c_table: TableDef,
+    pivot_alias: str,
+    pivot_table: TableDef,
+    far_alias: str,
+    far_table: TableDef,
+    *,
+    as_field: str,
+) -> dict[str, Any]:
+    """A ``$lookup`` stage that materializes the INNER composite ``A⋈B`` (restricted
+    to the rows that satisfy ``o2`` against the *driving* C document) under
+    ``as_field``. Drives over a stream where C is the base (bare fields).
+
+    Since ``$lookup.from`` is a single collection, the composite is computed with a
+    *nested* lookup: the outer lookup fetches the pivot table filtered by ``o2`` (C on
+    the outer/known side, bound as ``let`` vars); its sub-pipeline nests the pivot
+    doc under its alias, then a second ``$lookup`` fetches the far table filtered by
+    ``o1`` with an INNER ``$unwind`` (a pivot row with no far match drops, exactly as
+    the INNER ``A⋈B`` would); the composite row is reshaped to ``{far: …, pivot: …}``
+    keyed by the real aliases. The resulting ``as_field`` array is empty iff C has no
+    composite match — which is what both the RIGHT preserve-unwind and the FULL
+    anti-join emptiness test rely on."""
+    tr_o2 = _OnTranslator(pivot_alias, pivot_table, {c_alias: ("base", c_table)})
+    cond_o2 = tr_o2.expr(o2)
+    tr_o1 = _OnTranslator(far_alias, far_table, {pivot_alias: ("join", pivot_table)})
+    cond_o1 = tr_o1.expr(o1)
+    far_tmp = "__trj_far"
+    sub_pipeline: list[dict[str, Any]] = [
+        {"$match": {"$expr": cond_o2}},
+        {"$replaceWith": {pivot_alias: "$$ROOT"}},
+        {
+            "$lookup": {
+                "from": far_table.collection,
+                "let": {var: f"${path}" for path, var in tr_o1.lets.items()},
+                "pipeline": [{"$match": {"$expr": cond_o1}}],
+                "as": far_tmp,
+            }
+        },
+        # INNER: a pivot row with no far match drops, so the composite carries only
+        # true A⋈B rows.
+        {"$unwind": {"path": f"${far_tmp}", "preserveNullAndEmptyArrays": False}},
+        {"$replaceWith": {far_alias: f"${far_tmp}", pivot_alias: f"${pivot_alias}"}},
+    ]
+    return {
+        "$lookup": {
+            "from": pivot_table.collection,
+            "let": {var: f"${path}" for path, var in tr_o2.lets.items()},
+            "pipeline": sub_pipeline,
+            "as": as_field,
+        }
+    }
+
+
 def _build_trailing_right_join_pipeline(
     stmt: exp.Select,
     a_alias: str,
@@ -5539,99 +5681,40 @@ def _build_trailing_right_join_pipeline(
     intermediate half-matches (a C row matching the pivot whose pivot row has no far
     match would keep the pivot's columns instead of the correct all-NULL pad). So we
     drive from C and compute the INNER composite **atomically** with a nested
-    ``$lookup``: the outer lookup fetches the *pivot* table (the composite table that
-    C's ON references) filtered by ``o2``; inside it a second ``$lookup`` fetches the
-    *far* table filtered by ``o1`` with an INNER ``$unwind`` (so a pivot row with no
-    far match is dropped, exactly as the INNER ``A⋈B`` would). The outer ``$unwind``
-    preserves C (the RIGHT side), so an unmatched C emits one all-NULL-padded row.
-    A/B are hoisted to alias-level keys so the ordinary ``_join_resolver`` reads them
-    as normal ``join``-role aliases with no special-casing. ``SELECT *`` keeps
-    Postgres's FROM order (A, B, C) via the FROM-ordered ``amap``.
+    ``$lookup`` (`_nested_composite_lookup`). The outer ``$unwind`` preserves C (the
+    RIGHT side), so an unmatched C emits one all-NULL-padded row. A/B are hoisted to
+    alias-level keys so the ordinary ``_join_resolver`` reads them as normal
+    ``join``-role aliases with no special-casing. ``SELECT *`` keeps Postgres's FROM
+    order (A, B, C) via the FROM-ordered ``amap``. Anything not provably sound
+    re-raises ``0A000`` (see `_trailing_composite_operands`)."""
+    (
+        o1,
+        o2,
+        b_alias,
+        b_table,
+        c_alias,
+        c_table,
+        pivot_alias,
+        pivot_table,
+        far_alias,
+        far_table,
+    ) = _trailing_composite_operands(
+        "RIGHT", a_alias, a_table, joins, db, catalog, storage, derived
+    )
 
-    Only the provably-sound shape is built here; anything else re-raises ``0A000``:
-    a missing ON on either join, unqualified ON columns (pivot unprovable), an ``o1``
-    that reaches outside {A, B}, or an ``o2`` that references C and *both* composite
-    tables (or neither)."""
-    jn_b, jn_c = joins
-    o1 = jn_b.args.get("on")
-    o2 = jn_c.args.get("on")
-    if o1 is None or o2 is None:
-        raise errors.feature_not_supported(
-            "a trailing RIGHT join over a composite requires an ON clause on both joins"
-        )
-    if (
-        isinstance(jn_b.this, (exp.Lateral, exp.Unnest))
-        or _is_jsonb_each_join(jn_b.this)
-        or isinstance(jn_c.this, (exp.Lateral, exp.Unnest))
-        or _is_jsonb_each_join(jn_c.this)
-    ):
-        raise errors.feature_not_supported(
-            "a trailing RIGHT join is only supported over plain-table joins"
-        )
-    b_alias, b_table = _resolve_source(jn_b.this, db, catalog, storage, derived)
-    c_alias, c_table = _resolve_source(jn_c.this, db, catalog, storage, derived)
-
-    # o1 must relate exactly the composite tables A and B; o2 must relate C to exactly
-    # one composite table (the pivot). Both must be fully qualified so we can prove
-    # which tables each predicate touches (mirrors `_build_right_chain_pipeline`).
-    o1_refs = _on_referenced_aliases(o1)
-    o2_refs = _on_referenced_aliases(o2)
-    if o1_refs is None or o2_refs is None:
-        raise errors.feature_not_supported(
-            "a trailing RIGHT join requires fully-qualified ON columns"
-        )
-    if not o1_refs <= {a_alias, b_alias}:
-        raise errors.feature_not_supported(
-            "the composite join's ON may reference only its two tables"
-        )
-    pivots = o2_refs - {c_alias}
-    if c_alias not in o2_refs or len(pivots) != 1 or not pivots <= {a_alias, b_alias}:
-        raise errors.feature_not_supported(
-            "a trailing RIGHT join's ON must reference C and exactly one composite table"
-        )
-    if pivots == {b_alias}:
-        pivot_alias, pivot_table = b_alias, b_table
-        far_alias, far_table = a_alias, a_table
-    else:
-        pivot_alias, pivot_table = a_alias, a_table
-        far_alias, far_table = b_alias, b_table
-
-    # Outer lookup ON (o2): the pivot is the *new* table (top-level in its
-    # collection), C is the outer/known side (bare fields — C drives as base).
-    tr_o2 = _OnTranslator(pivot_alias, pivot_table, {c_alias: ("base", c_table)})
-    cond_o2 = tr_o2.expr(o2)
-    # Inner lookup ON (o1): the far table is the *new* table; the pivot is now nested
-    # under its own alias key inside the sub-pipeline (role "join").
-    tr_o1 = _OnTranslator(far_alias, far_table, {pivot_alias: ("join", pivot_table)})
-    cond_o1 = tr_o1.expr(o1)
-
-    far_tmp = "__trj_far"
     composite = "__trj"
-    sub_pipeline: list[dict[str, Any]] = [
-        {"$match": {"$expr": cond_o2}},
-        {"$replaceWith": {pivot_alias: "$$ROOT"}},
-        {
-            "$lookup": {
-                "from": far_table.collection,
-                "let": {var: f"${path}" for path, var in tr_o1.lets.items()},
-                "pipeline": [{"$match": {"$expr": cond_o1}}],
-                "as": far_tmp,
-            }
-        },
-        # INNER: a pivot row with no far match drops, so `__trj` carries only true
-        # A⋈B composite rows.
-        {"$unwind": {"path": f"${far_tmp}", "preserveNullAndEmptyArrays": False}},
-        {"$replaceWith": {far_alias: f"${far_tmp}", pivot_alias: f"${pivot_alias}"}},
-    ]
     pipeline: list[dict[str, Any]] = [
-        {
-            "$lookup": {
-                "from": pivot_table.collection,
-                "let": {var: f"${path}" for path, var in tr_o2.lets.items()},
-                "pipeline": sub_pipeline,
-                "as": composite,
-            }
-        },
+        _nested_composite_lookup(
+            o1,
+            o2,
+            c_alias,
+            c_table,
+            pivot_alias,
+            pivot_table,
+            far_alias,
+            far_table,
+            as_field=composite,
+        ),
         # LEFT-from-C: an unmatched C (empty composite) is preserved and pads NULL.
         {"$unwind": {"path": f"${composite}", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {a_alias: f"${composite}.{a_alias}", b_alias: f"${composite}.{b_alias}"}},
@@ -5650,6 +5733,85 @@ def _build_trailing_right_join_pipeline(
     if where is not None and not where_needs_per_row(stmt):
         pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
     return c_table, amap, resolve, pipeline, derived
+
+
+def _build_trailing_full_join_pipeline(
+    stmt: exp.Select,
+    a_alias: str,
+    a_table: TableDef,
+    joins: list[exp.Expression],
+    db: str,
+    catalog: Any,
+    storage: Any,
+    derived: list[DerivedTable],
+) -> tuple[
+    TableDef, dict[str, tuple[str, TableDef]], Resolve, list[dict[str, Any]], list[DerivedTable]
+]:
+    """A two-table INNER composite followed by a single trailing FULL join —
+    ``A JOIN B ON o1 FULL JOIN C ON o2``.
+
+    ``(A⋈B) FULL JOIN C`` = ``[(A⋈B) LEFT JOIN C]  ∪  [C rows with no composite
+    match, null-padded]``. The **main branch** is the ordinary forward pipeline —
+    drive from A, INNER-``$lookup`` B (``o1``), then LEFT-``$lookup`` C (``o2``); C is
+    a real collection so this half is sound and already expressible. Roles: A base
+    (bare), B and C nested under their aliases. The **anti-branch** ``$unionWith``s
+    the C collection and reuses `_nested_composite_lookup` as an *emptiness test*:
+    for each C, materialize the composite restricted by ``o2``; keep only the C rows
+    whose composite came back empty (``$size: 0`` — no ``A⋈B`` row matches, which a
+    single-level pivot lookup could *not* detect); then nest the whole C doc under
+    its alias so ``c.<field>`` resolves and A's (base) bare paths + B's are absent
+    (→ NULL). Both branches share the same ``{A base, B join, C join}`` layout, so
+    the union lines up under one ``_join_resolver``. Non-sound shapes → ``0A000``."""
+    (
+        o1,
+        o2,
+        b_alias,
+        b_table,
+        c_alias,
+        c_table,
+        pivot_alias,
+        pivot_table,
+        far_alias,
+        far_table,
+    ) = _trailing_composite_operands("FULL", a_alias, a_table, joins, db, catalog, storage, derived)
+
+    # Main branch: (A⋈B) LEFT JOIN C. A drives (base); B INNER; C LEFT.
+    amap: dict[str, tuple[str, TableDef]] = {a_alias: ("base", a_table)}
+    pipeline: list[dict[str, Any]] = [
+        _lookup_stage(o1, b_alias, b_table, amap),
+        {"$unwind": {"path": f"${b_alias}", "preserveNullAndEmptyArrays": False}},
+    ]
+    amap[b_alias] = ("join", b_table)
+    pipeline.append(_lookup_stage(o2, c_alias, c_table, amap))
+    pipeline.append({"$unwind": {"path": f"${c_alias}", "preserveNullAndEmptyArrays": True}})
+    amap[c_alias] = ("join", c_table)
+
+    # Anti-branch: C rows whose composite (restricted by o2) is empty, null-padded and
+    # reshaped so C sits under its alias (A/B absent → NULL), matching the main layout.
+    anti_field = "__tfj"
+    anti_pipeline: list[dict[str, Any]] = [
+        _nested_composite_lookup(
+            o1,
+            o2,
+            c_alias,
+            c_table,
+            pivot_alias,
+            pivot_table,
+            far_alias,
+            far_table,
+            as_field=anti_field,
+        ),
+        {"$match": {anti_field: {"$size": 0}}},
+        {"$project": {anti_field: 0}},
+        {"$replaceWith": {c_alias: "$$ROOT"}},
+    ]
+    pipeline.append({"$unionWith": {"coll": c_table.collection, "pipeline": anti_pipeline}})
+
+    resolve = _join_resolver(amap)
+    where = stmt.args.get("where")
+    if where is not None and not where_needs_per_row(stmt):
+        pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
+    return a_table, amap, resolve, pipeline, derived
 
 
 def _plan_join_select(
