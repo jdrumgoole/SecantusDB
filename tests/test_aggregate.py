@@ -30,9 +30,7 @@ def test_group_merge_objects_accumulator() -> None:
         {"g": 1},  # missing -> skipped
         {"g": 1, "sub": None},  # null -> skipped
     ]
-    out = apply_pipeline(
-        docs, [{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}]
-    )
+    out = apply_pipeline(docs, [{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}])
     assert out == [{"_id": 1, "m": {"a": 1, "b": 2, "c": 3}}]
 
     # A group where every operand is missing/null yields {} (empty doc), present.
