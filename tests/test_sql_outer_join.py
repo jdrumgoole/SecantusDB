@@ -243,17 +243,6 @@ def test_trailing_right_compound_on(trj, session):
     assert rows == [(100, 10), (200, None), (300, None)]
 
 
-def test_trailing_full_over_composite_rejected(trj, session):
-    # A trailing FULL needs a nested anti-branch emptiness test — stays 0A000.
-    with pytest.raises(SQLError) as ei:
-        q(
-            trj,
-            session,
-            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak FULL JOIN jc ON jc.bk = jb.bk",
-        )
-    assert ei.value.sqlstate == "0A000"
-
-
 def test_trailing_right_three_table_composite_rejected(trj, session):
     # A 3-table composite on the left of the RIGHT — nesting depth grows, 0A000.
     trj.q("CREATE TABLE jd (id int primary key, ak int)")
@@ -287,6 +276,120 @@ def test_trailing_right_over_leading_left_composite_rejected(trj, session):
             trj,
             session,
             "SELECT jc.cid FROM ja LEFT JOIN jb ON ja.k = jb.ak RIGHT JOIN jc ON jc.bk = jb.bk",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+# -- trailing FULL over a two-table INNER composite (b227) ------------------- #
+
+
+def test_trailing_full_keeps_composite_only_and_unmatched_c(trj, session):
+    # Add jb(3, ak:1, bk:99) → composite row (ja1, bk:99) matches NO jc.  FULL keeps
+    # it (C NULL) *and* the unmatched jc rows (composite NULL) — the two halves that
+    # distinguish FULL from RIGHT.
+    trj.q("INSERT INTO jb VALUES (3, 1, 99)")
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, ja.k, jb.bk FROM ja JOIN jb ON ja.k = jb.ak FULL JOIN jc ON jc.bk = jb.bk",
+    ).rows
+    assert _sorted(rows) == _sorted(
+        [(100, 1, 10), (None, 1, 99), (200, None, None), (300, None, None)]
+    )
+
+
+def test_trailing_full_vs_right_differ_on_composite_only_row(trj, session):
+    # Same data: RIGHT drops the composite-only (None, 1, 99) row that FULL keeps.
+    trj.q("INSERT INTO jb VALUES (3, 1, 99)")
+    right = q(
+        trj,
+        session,
+        "SELECT jc.cid, ja.k, jb.bk FROM ja JOIN jb ON ja.k = jb.ak RIGHT JOIN jc ON jc.bk = jb.bk",
+    ).rows
+    assert _sorted(right) == _sorted([(100, 1, 10), (200, None, None), (300, None, None)])
+
+
+def test_trailing_full_pivot_is_base_table(trj, session):
+    # o2 references the base (ja): pivot is ja.  ka(200) matches ja(2) which has no jb
+    # → empty composite → anti row; ka(300) matches no ja → anti row.
+    rows = q(
+        trj,
+        session,
+        "SELECT ka.ck, ja.k, jb.bk FROM ja JOIN jb ON ja.k = jb.ak FULL JOIN ka ON ka.k = ja.k",
+    ).rows
+    assert _sorted(rows) == _sorted([(100, 1, 10), (200, None, None), (300, None, None)])
+
+
+def test_trailing_full_select_star_column_order(trj, session):
+    trj.q("INSERT INTO jb VALUES (3, 1, 99)")
+    rows = q(
+        trj,
+        session,
+        "SELECT * FROM ja JOIN jb ON ja.k = jb.ak FULL JOIN jc ON jc.bk = jb.bk",
+    ).rows
+    # ja.k, jb.(id,ak,bk), jc.(cid,bk)
+    assert _sorted(rows) == _sorted(
+        [
+            (1, 1, 1, 10, 100, 10),
+            (1, 3, 1, 99, None, None),
+            (None, None, None, None, 200, 20),
+            (None, None, None, None, 300, 30),
+        ]
+    )
+
+
+def test_trailing_full_with_group_by(trj, session):
+    trj.q("INSERT INTO jb VALUES (3, 1, 99)")
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, count(ja.k) FROM ja JOIN jb ON ja.k = jb.ak "
+        "FULL JOIN jc ON jc.bk = jb.bk GROUP BY jc.cid",
+    ).rows
+    # jc.cid 100→1 composite, NULL→1 (the bk:99 composite-only row), 200→0, 300→0.
+    assert _sorted(rows) == _sorted([(100, 1), (None, 1), (200, 0), (300, 0)])
+
+
+def test_trailing_full_with_where(trj, session):
+    # WHERE applies after the union; keep only the unmatched-jc anti rows.
+    rows = q(
+        trj,
+        session,
+        "SELECT jc.cid, ja.k FROM ja JOIN jb ON ja.k = jb.ak "
+        "FULL JOIN jc ON jc.bk = jb.bk WHERE jc.cid >= 200",
+    ).rows
+    assert _sorted(rows) == _sorted([(200, None), (300, None)])
+
+
+def test_trailing_full_three_table_composite_rejected(trj, session):
+    trj.q("CREATE TABLE jd (id int primary key, ak int)")
+    with pytest.raises(SQLError) as ei:
+        q(
+            trj,
+            session,
+            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak JOIN jd ON jd.ak = ja.k "
+            "FULL JOIN jc ON jc.bk = jb.bk",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_trailing_full_on_spans_both_composite_tables_rejected(trj, session):
+    with pytest.raises(SQLError) as ei:
+        q(
+            trj,
+            session,
+            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak "
+            "FULL JOIN jc ON jc.bk = jb.bk AND jc.cid = ja.k",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_trailing_full_over_leading_left_composite_rejected(trj, session):
+    with pytest.raises(SQLError) as ei:
+        q(
+            trj,
+            session,
+            "SELECT jc.cid FROM ja LEFT JOIN jb ON ja.k = jb.ak FULL JOIN jc ON jc.bk = jb.bk",
         )
     assert ei.value.sqlstate == "0A000"
 

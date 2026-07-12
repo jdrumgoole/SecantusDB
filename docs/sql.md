@@ -1862,14 +1862,16 @@ table to the immediately-prior one) is reversed into a `LEFT` chain driven from
 the last table; a **leading `RIGHT`/`FULL` join followed by a tail of only
 `INNER`/`LEFT` joins** (`A RIGHT|FULL JOIN B ON … [INNER|LEFT] JOIN C ON …`) —
 the leading outer join builds the composite as the driving stream and each tail
-join looks its table up over it; and a **trailing `RIGHT` join over a two-table
-`INNER` composite** (`A JOIN B ON … RIGHT JOIN C ON …`, the `RIGHT` `ON`
-referencing `C` and exactly one of `A`/`B`) — driven from `C` with the `A⋈B`
-composite computed atomically by a nested `$lookup` (a flat reversal would leak
-half-matches, so this is the only sound lowering). A chain with a `RIGHT` `ON`
-that reaches a non-adjacent table, a second `FULL` in the tail, a *trailing*
-`FULL` or a trailing `RIGHT` over a `LEFT`/3-table composite, and a `RIGHT` `ON`
-spanning *both* composite tables stay `0A000`:
+join looks its table up over it; and a **trailing `RIGHT` or `FULL` join over a
+two-table `INNER` composite** (`A JOIN B ON … RIGHT|FULL JOIN C ON …`, the
+outer `ON` referencing `C` and exactly one of `A`/`B`) — the `A⋈B` composite is
+computed atomically by a nested `$lookup` (a flat reversal would leak
+half-matches, so this is the only sound lowering). `RIGHT` drives from `C` and
+preserves it; `FULL` unions the forward `(A⋈B) LEFT JOIN C` main branch with a
+`$unionWith` anti-branch of the `C` rows whose composite is empty. A chain with
+a `RIGHT` `ON` that reaches a non-adjacent table, a second `FULL` in the tail, a
+trailing outer join over a `LEFT`/3-table composite, and an outer `ON` spanning
+*both* composite tables stay `0A000`:
 
 ```sql
 SELECT o.id, o.total, c.name
@@ -3221,7 +3223,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) (select list *and* `HAVING`, single-table + JOIN), an **expression over an aggregate** (`sum(x)+1`, `round(avg(x),2)`), a **computed GROUP BY key** (`GROUP BY lower(name)`, `GROUP BY a+b`, incl. over a JOIN and under GROUPING SETS), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table **and over a JOIN**, incl. `HAVING`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) per set, the statistical / bitwise aggregates (`variance`/`var_pop`/`stddev*`/`bit_and`/`bit_or`/`bit_xor`) per set, computed keys, **and a window over it — single-table or over a JOIN**) + the `GROUPING()` super-aggregate helper, **`ORDER BY <position>`** (`ORDER BY 1`) and **`ORDER BY <aggregate>`** (`ORDER BY count(*) DESC`, when selected) | a correlated WHERE over a JOIN, or a subquery in HAVING alongside a window over GROUPING SETS |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` frames (`UNBOUNDED`/`CURRENT ROW` **and** numeric `n PRECEDING`/`n FOLLOWING` offsets) | non-numeric/interval `RANGE` offset |
-| Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, a **pure-`RIGHT` adjacent chain of 3+ tables**, a **leading `RIGHT`/`FULL` join + `INNER`/`LEFT` tail**, a **trailing `RIGHT` join over a two-table `INNER` composite** (`A JOIN B … RIGHT JOIN C`, `ON` referencing `C` + one composite table), `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | a `RIGHT`/`FULL` join that isn't first in a 3+ chain (other than the trailing-`RIGHT`-over-`INNER` case), a non-adjacent `RIGHT` `ON`, a second `FULL` in the tail, a *trailing* `FULL` / a trailing `RIGHT` over a `LEFT`/3-table composite / a `RIGHT` `ON` spanning both composite tables, `LATERAL` over a join / aggregate subquery |
+| Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, a **pure-`RIGHT` adjacent chain of 3+ tables**, a **leading `RIGHT`/`FULL` join + `INNER`/`LEFT` tail**, a **trailing `RIGHT`/`FULL` join over a two-table `INNER` composite** (`A JOIN B … RIGHT|FULL JOIN C`, `ON` referencing `C` + one composite table), `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | a `RIGHT`/`FULL` join that isn't first in a 3+ chain (other than the trailing-outer-over-`INNER` case), a non-adjacent `RIGHT` `ON`, a second `FULL` in the tail, a trailing outer join over a `LEFT`/3-table composite / an outer `ON` spanning both composite tables, `LATERAL` over a join / aggregate subquery |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql`, single-statement body), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, `LANGUAGE plpgsql` / multi-statement functions |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (real nested rollback), two-phase commit `PREPARE TRANSACTION` / `COMMIT`/`ROLLBACK PREPARED` (cross-connection, `pg_prepared_xacts`) | prepared xacts surviving a restart, two-phase over the extended protocol |
 | Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors), `EXPLAIN [ANALYZE]` (`FORMAT TEXT`/`JSON`, faithful Index/Seq Scan) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows, per-node `EXPLAIN` costs / timing |
