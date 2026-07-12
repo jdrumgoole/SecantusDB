@@ -47,6 +47,23 @@ def test_group_merge_objects_accumulator() -> None:
             [{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}],
         )
 
+    # $mergeObjects is $group-only: mongod rejects it as a $setWindowFields
+    # window function (FailedToParse, code 9) — verified three-way vs mongod 6.0.
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline(
+            [{"g": 1, "sub": {"a": 1}}],
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"g": 1},
+                        "output": {"m": {"$mergeObjects": "$sub"}},
+                    }
+                }
+            ],
+        )
+    assert exc.value.code == 9
+
 
 def test_group_sum_preserves_int64_type() -> None:
     """$sum over Int64 values stays Int64 (mongod widens int32 < int64),

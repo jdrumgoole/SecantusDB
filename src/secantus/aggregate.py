@@ -2146,6 +2146,15 @@ def _stage_set_window_fields(
                 raise AggregateError(f"{op} requires {{input, unit?}}")
             compiled.append((field, op, arg, window))
             continue
+        if op == "$mergeObjects":
+            # $mergeObjects is a $group-only accumulator; mongod rejects it as a
+            # window function (verified three-way vs mongod 6.0: FailedToParse).
+            raise AggregateError(
+                f"Unrecognized window function, or the window function {op} is not "
+                "supported in $setWindowFields",
+                code=9,
+                code_name="FailedToParse",
+            )
         if op not in _ACC_DISPATCH:
             raise AggregateError(
                 f"$setWindowFields: unsupported function {op!r} "
