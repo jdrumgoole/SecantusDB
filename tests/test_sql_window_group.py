@@ -46,7 +46,8 @@ def test_rank_over_group_aggregate(storage):
         "FROM emp GROUP BY dept ORDER BY dept"
     )
     assert res.rows == [("a", 30, 1), ("b", 50, 3), ("c", 40, 2)]
-    assert [c.type_tag for c in res.columns] == ["text", "int4", "int8"]
+    # sum(int) is bigint in Postgres.
+    assert [c.type_tag for c in res.columns] == ["text", "int8", "int8"]
 
 
 def test_aggregate_nested_in_window_aggregate(storage):
@@ -184,4 +185,5 @@ def test_column_tags_window_over_rollup(storage):
         "SELECT region, SUM(sal) AS s, ROW_NUMBER() OVER (ORDER BY SUM(sal)) AS rn "
         "FROM emp GROUP BY ROLLUP(region)"
     )
-    assert [c.type_tag for c in res.columns] == ["text", "int4", "int8"]
+    # sum(int) is bigint in Postgres.
+    assert [c.type_tag for c in res.columns] == ["text", "int8", "int8"]

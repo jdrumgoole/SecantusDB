@@ -164,6 +164,57 @@ _OUT_BINARY = {
 }
 
 
+# Array type OID -> (element OID, element tag), derived from the same table the
+# wire layer's RowDescription uses.
+_ARRAY_ELEM_BY_OID: dict[int, tuple[int, str]] = {
+    arr_oid: (typemap.PG_OID[elem], elem)
+    for elem, arr_oid in typemap._ARRAY_PG_OID.items()
+    if elem in typemap.PG_OID
+}
+
+
+def _encode_array(value: Any, arr_oid: int, tag: str | None) -> bytes:
+    """Binary-encode a one-dimensional array result (ndim/hasnull/elemoid header,
+    one per-dim {len, lbound} pair, then length-prefixed elements)."""
+    elem_oid, elem_tag = _ARRAY_ELEM_BY_OID[arr_oid]
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = typemap._parse_pg_array_literal(str(value))
+    has_null = any(v is None for v in items)
+    out = bytearray(struct.pack("!iii", 1 if items else 0, int(has_null), elem_oid))
+    if items:
+        out += struct.pack("!ii", len(items), 1)
+        for v in items:
+            if v is None:
+                out += struct.pack("!i", -1)
+            else:
+                b = _encode_value(v, elem_oid, elem_tag)
+                out += struct.pack("!i", len(b)) + b
+    return bytes(out)
+
+
+def _decode_array(raw: bytes) -> list:
+    """Decode a binary array parameter to a Python list (one dimension)."""
+    ndim, _has_null, elem_oid = struct.unpack_from("!iii", raw, 0)
+    if ndim == 0:
+        return []
+    n, _lbound = struct.unpack_from("!ii", raw, 12)
+    decoder = _BINARY.get(elem_oid)
+    items: list = []
+    off = 20
+    for _ in range(n):
+        (length,) = struct.unpack_from("!i", raw, off)
+        off += 4
+        if length < 0:
+            items.append(None)
+            continue
+        b = raw[off : off + length]
+        off += length
+        items.append(decoder(b) if decoder is not None else b.decode("utf-8", "replace"))
+    return items
+
+
 def _encode_value(value: Any, oid: int, tag: str | None) -> bytes | None:
     """Binary-encode a result value for ``oid``; None stays None (NULL on the wire)."""
     if value is None:
@@ -171,6 +222,8 @@ def _encode_value(value: Any, oid: int, tag: str | None) -> bytes | None:
     enc = _OUT_BINARY.get(oid)
     if enc is not None:
         return enc(value)
+    if oid in _ARRAY_ELEM_BY_OID:
+        return _encode_array(value, oid, tag)
     if oid == 3802:  # jsonb: 1-byte version header + UTF-8 JSON text
         return b"\x01" + (typemap.to_pg_text(value, tag) or b"")
     # text / varchar / unknown: the binary form equals the text bytes.
@@ -196,7 +249,11 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int) -> Any:
     if fmt == 0:  # text
         return raw.decode("utf-8")
     decoder = _BINARY.get(oid)
-    return decoder(raw) if decoder is not None else raw.decode("utf-8", "replace")
+    if decoder is not None:
+        return decoder(raw)
+    if oid in _ARRAY_ELEM_BY_OID:
+        return _decode_array(raw)
+    return raw.decode("utf-8", "replace")
 
 
 class ExtendedSession:
@@ -285,6 +342,7 @@ class ExtendedSession:
                 else None
             )
             cols = self._describe_columns(stmt)
+            _apply_param_result_oids(cols, prep)
             out += self._row_desc_or_no_data(cols)
             return bytes(out)
         # Portal describe — params are bound, so describe the bound statement, and
@@ -293,6 +351,7 @@ class ExtendedSession:
         if portal is None:
             raise errors.SQLError("34000", f'portal "{name}" does not exist')
         cols = self._describe_columns(self._bound(portal))
+        _apply_param_result_oids(cols, portal.prepared)
         formats = _column_formats(portal.result_formats, len(cols)) if cols else None
         return self._row_desc_or_no_data(cols, formats)
 
@@ -372,6 +431,37 @@ class ExtendedSession:
         if cols is None:
             return pgwire.no_data()
         return pgwire.row_description([(c.name, c.pg_oid) for c in cols], formats)
+
+
+_TAG_BY_OID = {oid: tag for tag, oid in typemap.PG_OID.items()}
+
+
+def _apply_param_result_oids(cols: list | None, prep: Prepared) -> None:
+    """Give a bare ``$N`` output column the client's declared parameter OID.
+
+    ``SELECT $1`` must describe with the type the client sent in Parse (psycopg
+    binds a Python int as int8, not int4); planning sees only the substituted
+    Python value, which can't carry that distinction."""
+    if not cols or prep.stmt is None or not any(prep.param_oids):
+        return
+    if not isinstance(prep.stmt, exp.Select):
+        return
+    for i, e in enumerate(prep.stmt.expressions):
+        if i >= len(cols):
+            break
+        inner = e.this if isinstance(e, exp.Alias) else e
+        while isinstance(inner, exp.Paren) and inner.this is not None:
+            inner = inner.this
+        if not isinstance(inner, exp.Parameter):
+            continue
+        try:
+            idx = int(inner.name) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(prep.param_oids) and prep.param_oids[idx]:
+            oid = prep.param_oids[idx]
+            cols[i].pg_oid = oid
+            cols[i].type_tag = _TAG_BY_OID.get(oid, cols[i].type_tag)
 
 
 def _is_row_returning(res: Any) -> bool:

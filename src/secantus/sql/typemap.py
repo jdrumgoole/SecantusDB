@@ -33,8 +33,10 @@ PG_OID: dict[str, int] = {
     "bool": 16,
     "bytea": 17,
     "int8": 20,
+    "int2": 21,
     "int4": 23,
     "text": 25,
+    "float4": 700,
     "float8": 701,
     "timestamptz": 1184,
     "timestamp": 1114,  # naive "timestamp without time zone"
@@ -133,8 +135,10 @@ _MULTIRANGE_TAGS = frozenset(
 # Internal type tag -> SQL type name (for information_schema.columns.data_type
 # and any place a human-facing type spelling is needed).
 SQL_TYPE_NAME: dict[str, str] = {
+    "int2": "smallint",
     "int4": "integer",
     "int8": "bigint",
+    "float4": "real",
     "float8": "double precision",
     "numeric": "numeric",
     "text": "text",
@@ -164,8 +168,10 @@ SQL_TYPE_NAME: dict[str, str] = {
 
 # Internal type tag -> Postgres pg_type.typname (for pg_catalog.pg_type rows).
 PG_TYPENAME: dict[str, str] = {
+    "int2": "int2",
     "int4": "int4",
     "int8": "int8",
+    "float4": "float4",
     "float8": "float8",
     "numeric": "numeric",
     "text": "text",
@@ -197,9 +203,9 @@ PG_TYPENAME: dict[str, str] = {
 _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.BIGINT: "int8",
     exp.DataType.Type.INT: "int4",
-    exp.DataType.Type.SMALLINT: "int4",
-    exp.DataType.Type.TINYINT: "int4",
-    exp.DataType.Type.FLOAT: "float8",
+    exp.DataType.Type.SMALLINT: "int2",
+    exp.DataType.Type.TINYINT: "int2",
+    exp.DataType.Type.FLOAT: "float4",
     exp.DataType.Type.DOUBLE: "float8",
     exp.DataType.Type.DECIMAL: "numeric",
     exp.DataType.Type.BIGDECIMAL: "numeric",
@@ -236,8 +242,10 @@ _DATATYPE_TAGS: dict[Any, str] = {
 _ARRAY_PG_OID: dict[str, int] = {
     "bool": 1000,
     "int8": 1016,
+    "int2": 1005,
     "int4": 1007,
     "text": 1009,
+    "float4": 1021,
     "float8": 1022,
     "numeric": 1231,
     "timestamptz": 1185,
@@ -475,11 +483,11 @@ def coerce(value: Any, tag: str) -> Any:
         from secantus.sql import xmltype as _xmltype
 
         return _xmltype.parse(value)
-    if tag == "int4":
+    if tag in ("int2", "int4"):
         return int(value)
     if tag == "int8":
         return bson.Int64(int(value))
-    if tag == "float8":
+    if tag in ("float4", "float8"):
         return float(value)
     if tag == "numeric":
         return bson.Decimal128(value if isinstance(value, Decimal) else Decimal(str(value)))

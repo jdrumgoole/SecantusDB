@@ -117,7 +117,8 @@ def test_computed_type_tags(storage, session):
         "SELECT price * qty AS total, upper(name) AS u, length(name) AS l FROM items WHERE _id = 1",
     )
     tags = {c.name: c.type_tag for c in res.columns}
-    assert tags == {"total": "numeric", "u": "text", "l": "int4"}
+    # price/qty are int8 columns; bigint * bigint stays bigint in Postgres.
+    assert tags == {"total": "int8", "u": "text", "l": "int4"}
 
 
 def test_computed_over_join(storage, session):

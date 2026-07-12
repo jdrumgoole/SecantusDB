@@ -1288,12 +1288,12 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     if (
         value is not None
         and _is_bit_expr(node.this)
-        and to_tag in ("int4", "int8", "numeric", "float8")
+        and to_tag in ("int2", "int4", "int8", "numeric", "float4", "float8")
     ):
         from secantus.sql import bitstr as _bitstr
 
         n = _bitstr.to_int(str(value))
-        return float(n) if to_tag == "float8" else n
+        return float(n) if to_tag in ("float4", "float8") else n
     # Otherwise we don't model regclass/oid identity types; evaluating the inner
     # value is enough for the catalog queries that use casts (compared / discarded,
     # never round-tripped through a real type).

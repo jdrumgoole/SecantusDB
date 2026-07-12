@@ -229,3 +229,82 @@ def test_sqlalchemy_psycopg_reflection(server):
         assert {ix.name for ix in t.indexes} == {"ix_name"}
     finally:
         engine.dispose()
+
+
+# -- RowDescription type-OID fidelity ----------------------------------------- #
+
+
+@pytest.fixture
+def real_server(tmp_path):
+    from secantus.storage import Storage
+
+    storage = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=storage)
+    srv.start()
+    try:
+        yield srv
+    finally:
+        srv.stop()
+        storage.close()
+
+
+def test_row_description_oids_for_computed_columns(real_server):
+    """Computed / derived result columns must describe with real Postgres OIDs —
+    psycopg's typed loaders key off them (tests/types/* in the psycopg gauge)."""
+    with connect(real_server, autocommit=True) as conn:
+        conn.execute("CREATE TABLE oidt (a int4, sm int2, f real, b boolean, arr int4[])")
+        conn.execute("INSERT INTO oidt VALUES (2, 1, 1.5, true, '{1,2}')")
+        cases = [
+            ("select true", 16),
+            ("select 1", 23),
+            ("select 1::int2", 21),
+            ("select 1.5::float4", 700),
+            ("select 1.5", 1700),  # unadorned decimal constant is numeric
+            ("select '{1,2}'::int4[]", 1007),
+            ("select array[1,2,3]", 1007),
+            ("select 1 + 1", 23),
+            ("select case when true then 1 else 2 end", 23),
+            ("select count(*) from oidt", 20),
+            ("select sum(a) from oidt", 20),  # sum(int) -> bigint
+            ("select avg(a) from oidt", 1700),  # avg(int) -> numeric
+            ("select a * 2 from oidt", 23),
+            ("select sm from oidt", 21),
+            ("select f from oidt", 700),
+            ("select arr from oidt", 1007),
+            ("select a > 1 from oidt", 16),
+            ("select case when a > 1 then a * 2 else a end from oidt", 23),
+        ]
+        for sql, want in cases:
+            got = conn.execute(sql).description[0].type_code
+            assert got == want, f"{sql}: expected OID {want}, got {got}"
+
+
+def test_row_description_oid_for_bound_parameter(real_server):
+    """``SELECT $1`` describes with the OID the client declared in Parse."""
+    with connect(real_server, autocommit=True) as conn:
+        cur = conn.execute("select %s", (True,))
+        assert cur.description[0].type_code == 16
+        assert cur.fetchone() == (True,)
+        cur = conn.execute("select %s", (1,))
+        # psycopg declares the smallest fitting int type (int2 for 1).
+        assert cur.description[0].type_code == 21
+        assert cur.fetchone() == (1,)
+
+
+def test_binary_result_format_arrays(real_server):
+    """Array results requested in binary format decode correctly — the array OID
+    engages psycopg's binary array parser, so the wire bytes must be the real
+    binary array layout, not text bytes."""
+    with connect(real_server, autocommit=True) as conn:
+        assert conn.execute("select '{1,2,3}'::int4[]", binary=True).fetchone() == ([1, 2, 3],)
+        assert conn.execute("select '{a,b}'::text[]", binary=True).fetchone() == (["a", "b"],)
+        assert conn.execute("select '{}'::int4[]", binary=True).fetchone() == ([],)
+        assert conn.execute("select '{1,NULL}'::int8[]", binary=True).fetchone() == ([1, None],)
+
+
+def test_binary_array_parameter_roundtrip(real_server):
+    """A list bound as a binary parameter decodes into a real array value."""
+    with connect(real_server, autocommit=True) as conn:
+        conn.execute("CREATE TABLE arrp (a int4[])")
+        conn.execute("INSERT INTO arrp VALUES (%s)", ([1, 2, 3],))
+        assert conn.execute("SELECT a FROM arrp").fetchone() == ([1, 2, 3],)

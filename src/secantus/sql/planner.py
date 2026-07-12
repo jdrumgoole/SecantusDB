@@ -355,9 +355,9 @@ def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
         return _regclass_oid(value)
     tag = typemap.type_tag_for_sql(datatype) if isinstance(datatype, exp.DataType) else None
     try:
-        if tag in ("int4", "int8"):
+        if tag in ("int2", "int4", "int8"):
             return int(value)
-        if tag == "float8":
+        if tag in ("float4", "float8"):
             return float(value)
         if tag == "numeric":
             from decimal import Decimal
@@ -2025,7 +2025,9 @@ def plan_constant_select(
         target = e.this if isinstance(e, exp.Alias) else e
         if isinstance(target, _LITERAL_NODES):
             value = _literal(target)
-            columns.append((alias or "?column?", _infer_value_tag(value), value))
+            # Tag from the AST, not the Python value — a decimal constant
+            # (``SELECT 1.5``) is numeric in Postgres, which the float can't show.
+            columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
         elif _is_sequence_func(target):
             # nextval / currval / setval / lastval need storage + session state,
             # so they go through the scalar evaluator (not the storage-free
@@ -3533,10 +3535,10 @@ def _accumulator_for(
         return {"$sum": {"$cond": [cond, 1, 0]}}, "int8"
     if func == "sum":
         body = {"$cond": [filter_cond, val, 0]} if filter_cond is not None else val
-        return {"$sum": body}, (tag if tag in ("int4", "int8", "numeric", "float8") else "float8")
+        return {"$sum": body}, _sum_tag(tag)
     if func == "avg":
         body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
-        return {"$avg": body}, "float8"
+        return {"$avg": body}, _avg_tag(tag)
     if func in ("min", "bool_and"):
         body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
         return {"$min": body}, ("bool" if func == "bool_and" else (tag or "text"))
@@ -3565,13 +3567,31 @@ def _accumulator(
 _DISTINCT_FUNCS = {"count", "sum", "avg"}
 
 
+def _sum_tag(tag: str | None) -> str:
+    """Postgres' sum() output type: int2/int4 -> int8, int8 -> numeric, floats
+    and numeric keep their type."""
+    if tag in ("int2", "int4"):
+        return "int8"
+    if tag in ("int8", "numeric"):
+        return "numeric"
+    if tag in ("float4", "float8"):
+        return tag
+    return "float8"
+
+
+def _avg_tag(tag: str | None) -> str:
+    """Postgres' avg() output type: numeric for integer/numeric inputs, float8
+    for floats."""
+    return "float8" if tag in ("float4", "float8") else "numeric"
+
+
 def _agg_out_tag(func: str, tag: str | None) -> str:
     if func == "count":
         return "int8"
     if func == "sum":
-        return tag if tag in ("int4", "int8", "numeric", "float8") else "float8"
+        return _sum_tag(tag)
     if func == "avg":
-        return "float8"
+        return _avg_tag(tag)
     return tag or "text"
 
 
@@ -6939,6 +6959,39 @@ def _range_tag_of(operands: Any, resolve: Resolve) -> str | None:
     return None
 
 
+_INT_TAG_ORDER = {"int2": 0, "int4": 1, "int8": 2}
+_NUMERIC_FAMILY = frozenset({"int2", "int4", "int8", "float4", "float8", "numeric"})
+
+
+def _arith_operand_tag(node: exp.Expression, resolve: Resolve) -> str | None:
+    """The numeric tag an arithmetic operand contributes, or None if non-numeric.
+
+    An unadorned decimal constant is ``numeric`` in Postgres (``1.5`` in SQL text
+    is not a float8), which the Python-value inference can't see."""
+    if isinstance(node, (exp.Paren, exp.Neg)) and node.this is not None:
+        return _arith_operand_tag(node.this, resolve)
+    if isinstance(node, exp.Literal) and not node.is_string:
+        text = str(node.this).lower()
+        if "." in text or "e" in text:
+            return "numeric"
+    tag = _infer_scalar_tag(node, resolve)
+    return tag if tag in _NUMERIC_FAMILY else None
+
+
+def _unify_numeric_tags(tags: list[str]) -> str | None:
+    """Combine numeric operand tags per Postgres' promotion rules, or None when
+    any tag is outside the numeric family (caller decides the fallback)."""
+    if not tags or any(t not in _NUMERIC_FAMILY for t in tags):
+        return None
+    if all(t in _INT_TAG_ORDER for t in tags):
+        return max(tags, key=lambda t: _INT_TAG_ORDER[t])
+    if all(t == "float4" for t in tags):
+        return "float4"
+    if any(t in ("float4", "float8") for t in tags):
+        return "float8"
+    return "numeric"
+
+
 def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     """Best-effort output type tag for a computed SELECT expression."""
     # Composite field access ``(col).field`` types as the field's declared type.
@@ -7108,12 +7161,16 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         ):
             return _to
         _mapped = typemap.type_tag_for_sql(node.to)
+        if typemap.is_array_tag(_mapped) and _mapped in typemap.PG_OID:
+            return _mapped
         if (
             _mapped in typemap._BIT_TAGS
             or _mapped
             in (
+                "int2",
                 "int4",
                 "int8",
+                "float4",
                 "float8",
                 "numeric",
                 "bool",
@@ -7129,6 +7186,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
                 "hstore",
                 "citext",
                 "xml",
+                "json",
             )
             or _mapped in typemap._GEO_TAGS
         ):
@@ -7137,8 +7195,32 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
         return _infer_scalar_tag(node.this, resolve)
     if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
         # A bare literal in the SELECT list (``SELECT 0 AS lvl``) must type from its
-        # value, else an int rides the wire as text.
+        # value, else an int rides the wire as text. An unadorned decimal constant
+        # (``1.5``) is numeric in Postgres, not float8 — the Python float can't
+        # carry that distinction, so check the literal text first.
+        _lit_inner = node.this if isinstance(node, exp.Neg) else node
+        if isinstance(_lit_inner, exp.Literal) and not _lit_inner.is_string:
+            _lit_text = str(_lit_inner.this).lower()
+            if "." in _lit_text or "e" in _lit_text:
+                return "numeric"
         return _infer_value_tag(_literal(node))
+    if isinstance(node, exp.Case):
+        # Type from the result branches (THEN values + ELSE), unified with the
+        # same numeric rules as arithmetic; NULL branches don't vote.
+        _branches = [i.args.get("true") for i in node.args.get("ifs", [])]
+        if node.args.get("default") is not None:
+            _branches.append(node.args["default"])
+        _tags = [
+            _infer_scalar_tag(b, resolve)
+            for b in _branches
+            if b is not None and not isinstance(b, exp.Null)
+        ]
+        return _unify_numeric_tags(_tags) or (_tags[0] if _tags else "text")
+    if isinstance(node, exp.Array):
+        # ``array[...]`` types from its first element (Postgres unifies elements;
+        # the first drives the array OID here).
+        _etag = _infer_scalar_tag(node.expressions[0], resolve) if node.expressions else "text"
+        return f"{_etag}[]" if f"{_etag}[]" in typemap.PG_OID else "text[]"
     if isinstance(node, exp.Bracket) and node.expressions:
         # ``arr[i]`` yields the element type; ``arr[lo:hi]`` stays the array type.
         base_tag = _infer_scalar_tag(node.this, resolve)
@@ -7214,21 +7296,22 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             return _infer_scalar_tag(left, resolve)
         if isinstance(left, exp.Interval):
             return _infer_scalar_tag(right, resolve)
-    if isinstance(
-        node,
-        (
-            exp.Add,
-            exp.Sub,
-            exp.Mul,
-            exp.Div,
-            exp.Mod,
-            exp.Abs,
-            exp.Round,
-            exp.Ceil,
-            exp.Floor,
-            exp.Pow,
-        ),
-    ):
+    if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)):
+        # Numeric operand rules: int op int stays integer (Postgres integer
+        # division truncates, matching ``_pg_div``), floats widen per Postgres'
+        # promotion table, numeric absorbs ints. Anything unrecognised keeps the
+        # old blanket ``numeric``.
+        _lt = _arith_operand_tag(node.this, resolve)
+        _rt = _arith_operand_tag(node.expression, resolve) if node.expression is not None else None
+        _unified = _unify_numeric_tags([t for t in (_lt, _rt) if t is not None])
+        if _unified is not None:
+            return _unified
+        return "numeric"
+    if isinstance(node, exp.Abs):
+        # abs() keeps its operand's numeric type.
+        _at = _arith_operand_tag(node.this, resolve) if node.this is not None else None
+        return _at if _at in _NUMERIC_FAMILY else "numeric"
+    if isinstance(node, (exp.Round, exp.Ceil, exp.Floor, exp.Pow)):
         return "numeric"
     # Transcendental / root functions produce double precision; ``trunc`` / ``sign``
     # / ``factorial`` stay exact numeric. Classes are looked up by attribute because

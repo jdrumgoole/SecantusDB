@@ -41,7 +41,8 @@ def test_rank_over_join_group_aggregate(storage):
         "FROM orders o JOIN customers c ON o.cid = c.id GROUP BY c.region ORDER BY c.region"
     )
     assert res.rows == [("e", 65, 1), ("w", 40, 2)]
-    assert [c.type_tag for c in res.columns] == ["text", "int4", "int8"]
+    # sum(int) is bigint in Postgres.
+    assert [c.type_tag for c in res.columns] == ["text", "int8", "int8"]
 
 
 def test_window_aggregate_nested_over_join_group(storage):
