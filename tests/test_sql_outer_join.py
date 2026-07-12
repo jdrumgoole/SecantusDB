@@ -269,17 +269,6 @@ def test_trailing_right_on_spans_both_composite_tables_rejected(trj, session):
     assert ei.value.sqlstate == "0A000"
 
 
-def test_trailing_right_over_leading_left_composite_rejected(trj, session):
-    # The composite is A LEFT JOIN B (not INNER) — out of this slice's sound scope.
-    with pytest.raises(SQLError) as ei:
-        q(
-            trj,
-            session,
-            "SELECT jc.cid FROM ja LEFT JOIN jb ON ja.k = jb.ak RIGHT JOIN jc ON jc.bk = jb.bk",
-        )
-    assert ei.value.sqlstate == "0A000"
-
-
 # -- trailing FULL over a two-table INNER composite (b227) ------------------- #
 
 
@@ -384,12 +373,122 @@ def test_trailing_full_on_spans_both_composite_tables_rejected(trj, session):
     assert ei.value.sqlstate == "0A000"
 
 
-def test_trailing_full_over_leading_left_composite_rejected(trj, session):
+# -- trailing RIGHT/FULL over a leading-LEFT composite (b228) ---------------- #
+
+
+@pytest.fixture
+def llj(storage, session):
+    # A LEFT JOIN B composite: la⋈lb on la.k=lb.ak, with la(3) having NO lb row so the
+    # composite carries the (k:3, NULL) LEFT row that an INNER composite would drop.
+    #   la: {k:1}, {k:2}, {k:3}
+    #   lb: {id:1, ak:1, bk:10}, {id:2, ak:1, bk:20}, {id:3, ak:2, bk:30}
+    #   composite (A LEFT JOIN B): (k1,bk10), (k1,bk20), (k2,bk30), (k3,NULL)
+    #   lc: {cid:100, k:1}, {cid:200, k:3}, {cid:300, k:9}   # k-keyed  (pivot la, base)
+    #   ld: {cid:100, bk:10}, {cid:200, bk:99}               # bk-keyed (pivot lb)
+    storage.q("CREATE TABLE la (k int primary key)")
+    storage.q("INSERT INTO la VALUES (1), (2), (3)")
+    storage.q("CREATE TABLE lb (id int primary key, ak int, bk int)")
+    storage.q("INSERT INTO lb VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)")
+    storage.q("CREATE TABLE lc (cid int primary key, k int)")
+    storage.q("INSERT INTO lc VALUES (100, 1), (200, 3), (300, 9)")
+    storage.q("CREATE TABLE ld (cid int primary key, bk int)")
+    storage.q("INSERT INTO ld VALUES (100, 10), (200, 99)")
+    return storage
+
+
+def test_trailing_right_leftcomposite_pivot_is_base(llj, session):
+    # RIGHT ON references the LEFT-preserved base la: the (k:3, NULL) composite row
+    # participates, so lc(200, k:3) yields (200, 3, NULL) — NOT the all-NULL pad an
+    # INNER composite would give.
+    rows = q(
+        llj,
+        session,
+        "SELECT lc.cid, la.k, lb.bk FROM la LEFT JOIN lb ON la.k = lb.ak "
+        "RIGHT JOIN lc ON lc.k = la.k",
+    ).rows
+    assert _sorted(rows) == _sorted([(100, 1, 10), (100, 1, 20), (200, 3, None), (300, None, None)])
+
+
+def test_trailing_right_leftcomposite_differs_from_inner(llj, session):
+    # The same query with an INNER composite drops the b-less la(3), so lc(200) pads
+    # all-NULL — the row that distinguishes a LEFT composite from an INNER one.
+    rows = q(
+        llj,
+        session,
+        "SELECT lc.cid, la.k, lb.bk FROM la JOIN lb ON la.k = lb.ak RIGHT JOIN lc ON lc.k = la.k",
+    ).rows
+    assert _sorted(rows) == _sorted(
+        [(100, 1, 10), (100, 1, 20), (200, None, None), (300, None, None)]
+    )
+
+
+def test_trailing_right_leftcomposite_pivot_is_join_table(llj, session):
+    # RIGHT ON references the non-driving lb: the (a, NULL) rows never satisfy an ON on
+    # lb.bk, so this is INNER-equivalent. ld(200, bk:99) matches nothing → NULL pad.
+    rows = q(
+        llj,
+        session,
+        "SELECT ld.cid, la.k, lb.bk FROM la LEFT JOIN lb ON la.k = lb.ak "
+        "RIGHT JOIN ld ON ld.bk = lb.bk",
+    ).rows
+    assert _sorted(rows) == _sorted([(100, 1, 10), (200, None, None)])
+
+
+def test_trailing_full_leftcomposite_pivot_is_base(llj, session):
+    # FULL over the LEFT composite: main keeps the composite-only (None, 2, 30) and the
+    # b-less (200, 3, NULL); anti keeps the unmatched lc(300).
+    rows = q(
+        llj,
+        session,
+        "SELECT lc.cid, la.k, lb.bk FROM la LEFT JOIN lb ON la.k = lb.ak "
+        "FULL JOIN lc ON lc.k = la.k",
+    ).rows
+    assert _sorted(rows) == _sorted(
+        [(100, 1, 10), (100, 1, 20), (None, 2, 30), (200, 3, None), (300, None, None)]
+    )
+
+
+def test_trailing_full_leftcomposite_select_star_column_order(llj, session):
+    rows = q(
+        llj,
+        session,
+        "SELECT * FROM la LEFT JOIN lb ON la.k = lb.ak FULL JOIN lc ON lc.k = la.k",
+    ).rows
+    # la.k, lb.(id,ak,bk), lc.(cid,k)
+    assert _sorted(rows) == _sorted(
+        [
+            (1, 1, 1, 10, 100, 1),
+            (1, 2, 1, 20, 100, 1),
+            (2, 3, 2, 30, None, None),
+            (3, None, None, None, 200, 3),
+            (None, None, None, None, 300, 9),
+        ]
+    )
+
+
+def test_trailing_full_leftcomposite_pivot_is_join_table(llj, session):
+    # pivot lb (INNER-equivalent): main emits each composite row LEFT-joined to ld;
+    # anti keeps ld(200, bk:99).
+    rows = q(
+        llj,
+        session,
+        "SELECT ld.cid, la.k, lb.bk FROM la LEFT JOIN lb ON la.k = lb.ak "
+        "FULL JOIN ld ON ld.bk = lb.bk",
+    ).rows
+    assert _sorted(rows) == _sorted(
+        [(100, 1, 10), (None, 1, 20), (None, 2, 30), (None, 3, None), (200, None, None)]
+    )
+
+
+def test_trailing_leftcomposite_three_table_rejected(llj, session):
+    # A 3-table leading composite is still out of scope.
+    llj.q("CREATE TABLE le (id int primary key, ak int)")
     with pytest.raises(SQLError) as ei:
         q(
-            trj,
+            llj,
             session,
-            "SELECT jc.cid FROM ja LEFT JOIN jb ON ja.k = jb.ak FULL JOIN jc ON jc.bk = jb.bk",
+            "SELECT lc.cid FROM la LEFT JOIN lb ON la.k = lb.ak JOIN le ON le.ak = la.k "
+            "RIGHT JOIN lc ON lc.k = la.k",
         )
     assert ei.value.sqlstate == "0A000"
 
@@ -485,17 +584,6 @@ def test_leading_right_tail_select_star_column_order(lead, session):
     assert [c.name for c in res.columns] == ["id", "av", "id_2", "aid", "amt", "id_3", "bid", "cv"]
 
 
-def test_leading_left_then_right_still_rejected(lead, session):
-    # A trailing RIGHT after a LEFT — the composite is on the outer join's left. 0A000.
-    with pytest.raises(SQLError) as ei:
-        q(
-            lead,
-            session,
-            "SELECT * FROM la LEFT JOIN lb ON la.id = lb.aid RIGHT JOIN lc ON lc.bid = lb.id",
-        )
-    assert ei.value.sqlstate == "0A000"
-
-
 def test_double_full_still_rejected(lead, session):
     with pytest.raises(SQLError) as ei:
         q(
@@ -587,16 +675,6 @@ def test_right_chain_non_adjacent_on_rejected(chain, session):
             chain,
             session,
             "SELECT * FROM a RIGHT JOIN bb ON a.id = bb.aid RIGHT JOIN cc ON a.id = cc.bid",
-        )
-    assert ei.value.sqlstate == "0A000"
-
-
-def test_mixed_left_right_chain_rejected(chain, session):
-    with pytest.raises(SQLError) as ei:
-        q(
-            chain,
-            session,
-            "SELECT * FROM a LEFT JOIN bb ON a.id = bb.aid RIGHT JOIN cc ON bb.id = cc.bid",
         )
     assert ei.value.sqlstate == "0A000"
 
