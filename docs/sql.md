@@ -1667,8 +1667,11 @@ SELECT string_agg(name, ', ' ORDER BY name DESC) FROM emp;
 ```
 
 The value + sort-key pair is collected per row and sorted in Python before the
-array is built / the string joined. Supported grouped, whole-table, and **over a
-`JOIN`** (the value / sort-key expressions lower through the join resolver).
+array is built / the string joined. Supported grouped, whole-table, **over a
+`JOIN`** (the value / sort-key expressions lower through the join resolver), and
+**under `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS`** (single-table and over a
+JOIN — each grouping set's branch pushes the pair and the sort runs over the
+unioned rows).
 
 The **ordered-set aggregates** `percentile_cont(f)` / `percentile_disc(f)` /
 `mode()` are supported via `WITHIN GROUP (ORDER BY expr)`:
