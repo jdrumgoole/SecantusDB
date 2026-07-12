@@ -5647,6 +5647,7 @@ def _join_grouping_set_branch(
     col_node_for: dict[str, exp.Column],
     group_keys: dict[str, str],
     key_tag: dict[str, str],
+    key_path: dict[str, str],
     gset: list[str],
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """One grouping set's ``[$group, $project]`` sub-pipeline for the JOIN path —
@@ -5655,9 +5656,10 @@ def _join_grouping_set_branch(
     the post-unwind paths); columns absent from this set project as literal NULL so
     every branch shares the same output shape (required for the ``$unionWith``).
     ``group_keys`` / ``key_tag`` cover every grouping column across all sets so a
-    ``HAVING`` may reference any of them."""
+    ``HAVING`` may reference any of them. ``key_path`` maps each grouping column
+    (bare or synthetic ``__gkeyN``) to its resolved ``$group`` key path."""
     in_set = set(gset)
-    group_id = {c: f"${resolve(col_node_for[c])[0]}" for c in gset} or None
+    group_id = {c: f"${key_path[c]}" for c in gset} or None
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
@@ -5736,7 +5738,9 @@ def _join_grouping_set_branch(
                 )
             col = _column_name(inner)
             out_name = names.fresh(alias or col)
-            _, tag = resolve(inner)  # validate + type
+            # A grouping column (bare or synthetic ``__gkeyN``) takes its precomputed
+            # tag; any other column resolves + types through the join resolver.
+            tag = key_tag[col] if col in key_tag else resolve(inner)[1]
             if col in in_set:
                 project[out_name] = f"$_id.{col}"
             else:
@@ -5759,6 +5763,24 @@ def _join_grouping_set_branch(
     return stages, out_columns
 
 
+def _lower_join_group_keys(
+    stmt: exp.Select, resolve: Resolve, join_prefix: list[dict[str, Any]]
+) -> tuple[exp.Select, dict[str, Any]]:
+    """Lower any *computed* GROUP BY keys over a JOIN (``ROLLUP(lower(d.label))``)
+    into synthetic ``__gkeyN`` fields: a ``$addFields`` materialising them is appended
+    to the shared ``join_prefix`` (so they exist in the base pipeline *and* every
+    replayed ``$unionWith`` branch), and SELECT / GROUP BY / HAVING / ORDER references
+    are rewritten to the bare ``__gkeyN`` columns. Returns ``(rewritten_stmt,
+    gkey_fields)``; ``gkey_fields`` is empty when there are no computed keys."""
+    computed = _computed_group_keys(stmt.args.get("group"))
+    if not computed:
+        return stmt, {}
+    targets, gkey_fields = _lower_computed_group_keys(computed, resolve, set())
+    stmt = _apply_group_key_rewrite(stmt, targets)
+    join_prefix.append({"$addFields": gkey_fields})
+    return stmt, gkey_fields
+
+
 def _plan_join_grouping_sets_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan:
@@ -5774,23 +5796,29 @@ def _plan_join_grouping_sets_select(
         raise errors.feature_not_supported(
             "a correlated WHERE with GROUPING SETS over a JOIN is not supported"
         )
+    # Computed GROUP BY keys (``ROLLUP(lower(d.label))``) lower through the join
+    # resolver into synthetic ``__gkeyN`` fields materialised by a ``$addFields``
+    # appended to the join prefix — so they exist in the base pipeline *and* every
+    # replayed ``$unionWith`` branch — then SELECT / HAVING / ORDER references rewrite
+    # to those fields.
+    stmt, gkey_fields = _lower_join_group_keys(stmt, resolve, join_prefix)
     group_node = stmt.args["group"]
-    # Computed GROUP BY keys (``ROLLUP(lower(c.name))``) aren't materialised on this
-    # path — ``_grouping_sets`` / ``_group_col_nodes`` only handle bare columns, so a
-    # computed key surfaces as an unsupported-expression 0A000.
     col_node_for = _group_col_nodes(group_node)
     sets = _grouping_sets(group_node)
     group_cols = sorted({c for gs in sets for c in gs})
-    # HAVING / branch group-key resolution needs every grouping column resolved once.
+    # HAVING / branch group-key resolution needs every grouping column resolved once;
+    # a synthetic ``__gkeyN`` key resolves to its own top-level field (tag ``any``).
     group_keys: dict[str, str] = {}
     key_tag: dict[str, str] = {}
+    key_path: dict[str, str] = {}
     for c in group_cols:
-        path, tag = resolve(col_node_for[c])
+        path, tag = (c, "any") if c in gkey_fields else resolve(col_node_for[c])
         group_keys[c] = f"${path}"
         key_tag[c] = tag
+        key_path[c] = path
 
     branches = [
-        _join_grouping_set_branch(stmt, resolve, col_node_for, group_keys, key_tag, gs)
+        _join_grouping_set_branch(stmt, resolve, col_node_for, group_keys, key_tag, key_path, gs)
         for gs in sets
     ]
     pipeline = list(join_prefix) + list(branches[0][0])
@@ -5828,8 +5856,10 @@ def _plan_join_grouping_sets_window_select(
         raise errors.feature_not_supported(
             "a subquery in HAVING with a window over GROUPING SETS over a JOIN is not supported"
         )
+    # Computed grouping keys over a JOIN (``ROLLUP(lower(d.label))``) lower into
+    # synthetic ``__gkeyN`` fields materialised by a ``$addFields`` on the join prefix.
+    stmt, gkey_fields = _lower_join_group_keys(stmt, resolve, join_prefix)
     group_node = stmt.args["group"]
-    # Computed grouping keys over a JOIN aren't materialised here (bare columns only).
     col_node_for = _group_col_nodes(group_node)
     sets = _grouping_sets(group_node)
     group_cols = sorted({c for gs in sets for c in gs})
@@ -5838,10 +5868,12 @@ def _plan_join_grouping_sets_window_select(
     field_tags: dict[str, str] = {}
     group_keys: dict[str, str] = {}  # bare name -> resolved "$path" (for HAVING)
     key_tag: dict[str, str] = {}
+    key_path: dict[str, str] = {}  # bare/synthetic name -> resolved $group key path
     for c in group_cols:
-        path, tag = resolve(col_node_for[c])
+        path, tag = (c, "any") if c in gkey_fields else resolve(col_node_for[c])
         group_keys[c] = f"${path}"
         key_tag[c] = tag
+        key_path[c] = path
         field_tags[c] = tag
         names.fresh(c)  # reserve group names so synthetic agg fields never collide
 
@@ -5912,7 +5944,7 @@ def _plan_join_grouping_sets_window_select(
 
     def branch(gset: list[str]) -> list[dict[str, Any]]:
         in_set = set(gset)
-        group_id = {c: f"${resolve(col_node_for[c])[0]}" for c in gset} or None
+        group_id = {c: f"${key_path[c]}" for c in gset} or None
         project: dict[str, Any] = {"_id": 0}
         for c in group_cols:
             project[c] = f"$_id.{c}" if c in in_set else {"$literal": None}

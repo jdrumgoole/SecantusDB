@@ -2996,10 +2996,16 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   b218 (join grouping-sets union, aggregate args / group keys resolved through the join resolver, join prefix
   replayed per branch) with b219 (flat per-branch projection + `GROUPING()` materialisation → `_finish_group_window`
   runs the windows over the union). `HAVING`, `count(DISTINCT)`, and `GROUPING()` in the window ORDER BY all work.
-  **Limitations:** a subquery in `HAVING` alongside a window over GROUPING SETS → `0A000`; a *computed* grouping
-  key over a JOIN (`ROLLUP(lower(d.label))`) is not materialised (bare-column `_grouping_sets` → `0A000`); a
-  correlated / per-row WHERE with GROUPING SETS over a JOIN → `feature_not_supported`; single-table GROUPING
-  SETS with an in-aggregate `ORDER BY` over a JOIN → `0A000`.
+  **Computed grouping key over a JOIN landed** (b222): `_lower_join_group_keys` lowers each computed key
+  (`ROLLUP(lower(d.label))`, `n.k+1`) through the join resolver into a synthetic `__gkeyN` field, appends a
+  `$addFields` materialising it to the *shared* join prefix (so it exists in the base pipeline and every replayed
+  `$unionWith` branch), and rewrites SELECT / GROUP BY / HAVING / ORDER references to the bare `__gkeyN` column
+  (`_apply_group_key_rewrite`). Branch group_id / types resolve the synthetic key to its own top-level field (tag
+  `any`) via a `key_path` map; works with `HAVING`, `GROUPING()`, and a window. An unlowerable key (e.g. `substr`)
+  still → `0A000`.
+  **Limitations:** a subquery in `HAVING` alongside a window over GROUPING SETS → `0A000`; a correlated /
+  per-row WHERE with GROUPING SETS over a JOIN → `feature_not_supported`; single-table GROUPING SETS with an
+  in-aggregate `ORDER BY` over a JOIN → `0A000`.
 - [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
   routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`

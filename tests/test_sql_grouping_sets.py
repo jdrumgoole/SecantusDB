@@ -186,14 +186,51 @@ def test_grouping_over_join_bitmask(dim, session):
     assert got == [("East", 0, 35), ("West", 0, 45), (None, 1, 80)]
 
 
-def test_grouping_sets_over_join_computed_key_rejected(dim, session):
-    # A computed grouping key over a JOIN isn't materialised on this path yet.
+def test_grouping_sets_over_join_computed_key(dim, session):
+    # A computed grouping key over a JOIN (b222): lower each through the join
+    # resolver into a synthetic field materialised on the join prefix.
+    got = rows(
+        dim,
+        session,
+        "SELECT lower(u.label) AS l, SUM(t.amt) FROM t JOIN u ON t.region = u.region "
+        "GROUP BY ROLLUP(lower(u.label)) ORDER BY l NULLS LAST",
+    )
+    assert got == [("east", 35), ("west", 45), (None, 80)]
+
+
+def test_grouping_sets_over_join_computed_key_having_grouping(dim, session):
+    # Computed key + HAVING + GROUPING() over a join.
+    got = rows(
+        dim,
+        session,
+        "SELECT lower(u.label) AS l, GROUPING(lower(u.label)) AS g, SUM(t.amt) AS tot "
+        "FROM t JOIN u ON t.region = u.region GROUP BY ROLLUP(lower(u.label)) "
+        "HAVING SUM(t.amt) >= 45 ORDER BY l NULLS LAST",
+    )
+    # East (35) filtered out; West (45) and grand total (80, GROUPING=1) survive.
+    assert got == [("west", 0, 45), (None, 1, 80)]
+
+
+def test_grouping_sets_over_join_computed_key_window(dim, session):
+    # Computed key under a window over GROUPING SETS + JOIN (b221 + b222 paths).
+    got = rows(
+        dim,
+        session,
+        "SELECT lower(u.label) AS l, SUM(t.amt) AS tot, "
+        "row_number() OVER (ORDER BY SUM(t.amt) DESC) AS rn "
+        "FROM t JOIN u ON t.region = u.region GROUP BY ROLLUP(lower(u.label)) ORDER BY rn",
+    )
+    assert got == [(None, 80, 1), ("west", 45, 2), ("east", 35, 3)]
+
+
+def test_grouping_sets_over_join_unlowerable_key_rejected(dim, session):
+    # A key using a function the aggregation engine can't lower still raises 0A000.
     with pytest.raises(errors.SQLError) as ei:
         rows(
             dim,
             session,
-            "SELECT lower(u.label), SUM(t.amt) FROM t JOIN u ON t.region = u.region "
-            "GROUP BY ROLLUP(lower(u.label))",
+            "SELECT substr(u.label, 1, 1), SUM(t.amt) FROM t JOIN u ON t.region = u.region "
+            "GROUP BY ROLLUP(substr(u.label, 1, 1))",
         )
     assert ei.value.sqlstate == "0A000"
 
