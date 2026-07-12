@@ -1975,10 +1975,29 @@ LEFT JOIN LATERAL (
 ) o ON true;
 ```
 
-The subquery is single-table with an optional `WHERE` / `ORDER BY` / `LIMIT`; it
-lowers to a correlated `$lookup`. `JOIN LATERAL … ON <cond>` must use `ON true`
-(the correlation lives in the subquery's `WHERE`); a `LATERAL` subquery
-containing a join, `GROUP BY`, or aggregate is not supported.
+A *simple* single-table subquery (optional `WHERE` / `ORDER BY` / `LIMIT`) lowers
+to a correlated `$lookup`. A *rich* subquery — one that contains a join,
+`GROUP BY`, `HAVING`, `DISTINCT`, or a bare aggregate — is instead evaluated per
+outer row: the outer column references are bound to that row's values, the inner
+query runs as an ordinary (now-uncorrelated) SELECT, and its rows are joined back
+onto the outer row. This covers correlated aggregates, `GROUP BY`/`DISTINCT`
+inside the lateral, and joins inside the lateral:
+
+```sql
+-- correlated aggregate: one row per outer row (0 for the empty group)
+SELECT t.name, s.c
+FROM t CROSS JOIN LATERAL (SELECT count(*) AS c FROM u WHERE u.tid = t.id) s;
+
+-- DISTINCT inside the lateral
+SELECT t.name, s.val
+FROM t CROSS JOIN LATERAL (SELECT DISTINCT val FROM u WHERE u.tid = t.id) s;
+```
+
+For `INNER` / `CROSS JOIN LATERAL` an outer row with no lateral rows is dropped;
+`LEFT JOIN LATERAL` keeps it with the lateral columns reading NULL. (A bare
+scalar aggregate such as `sum`/`count` always yields exactly one row, so it never
+drops the outer row.) `JOIN LATERAL … ON <cond>` must still use `ON true` — the
+correlation lives in the subquery's `WHERE`, not the join condition.
 
 ## Set operations
 
@@ -3234,7 +3253,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Projection | columns, `*`, aliases, `jsonb` paths, `jsonb_*` functions, `DISTINCT`, `DISTINCT ON (…)`, computed expressions (arithmetic, `\|\|`, `upper`/`lower`/`length`/`substring`/`round`/`coalesce`/`greatest`/...) | computed GROUP BY keys, expressions over an aggregate |
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) (select list *and* `HAVING`, single-table + JOIN), an **expression over an aggregate** (`sum(x)+1`, `round(avg(x),2)`), a **computed GROUP BY key** (`GROUP BY lower(name)`, `GROUP BY a+b`, incl. over a JOIN and under GROUPING SETS), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table **and over a JOIN**, incl. `HAVING`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) per set, the statistical / bitwise aggregates (`variance`/`var_pop`/`stddev*`/`bit_and`/`bit_or`/`bit_xor`) per set, computed keys, **and a window over it — single-table or over a JOIN**) + the `GROUPING()` super-aggregate helper, **`ORDER BY <position>`** (`ORDER BY 1`) and **`ORDER BY <aggregate>`** (`ORDER BY count(*) DESC`, when selected) | a correlated WHERE over a JOIN, or a subquery in HAVING alongside a window over GROUPING SETS |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` frames (`UNBOUNDED`/`CURRENT ROW`, numeric `n PRECEDING`/`n FOLLOWING` offsets, **and** `INTERVAL` offsets over a date/timestamp key) | a `RANGE` interval offset on a non-temporal key |
-| Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, a **pure-`RIGHT` adjacent chain of 3+ tables**, a **leading `RIGHT`/`FULL` join + `INNER`/`LEFT` tail**, a **trailing `RIGHT`/`FULL` join over an `N`-table `INNER`/`LEFT` composite** (`A [INNER|LEFT] JOIN B [… JOIN …] RIGHT|FULL JOIN C`, outer `ON` over any subset of composite tables), `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (single-table subquery, correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | a `RIGHT`/`FULL` join that isn't first in a 3+ chain (other than the trailing-outer-over-a-composite case), a non-adjacent `RIGHT` `ON`, a second `FULL` in the tail, a composite whose own joins aren't adjacent, `LATERAL` over a join / aggregate subquery |
+| Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, a **pure-`RIGHT` adjacent chain of 3+ tables**, a **leading `RIGHT`/`FULL` join + `INNER`/`LEFT` tail**, a **trailing `RIGHT`/`FULL` join over an `N`-table `INNER`/`LEFT` composite** (`A [INNER|LEFT] JOIN B [… JOIN …] RIGHT|FULL JOIN C`, outer `ON` over any subset of composite tables), `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (simple single-table subquery, or a **rich** subquery — join / `GROUP BY` / `DISTINCT` / aggregate — evaluated per outer row; correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | a `RIGHT`/`FULL` join that isn't first in a 3+ chain (other than the trailing-outer-over-a-composite case), a non-adjacent `RIGHT` `ON`, a second `FULL` in the tail, a composite whose own joins aren't adjacent |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql`, single-statement body), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, `LANGUAGE plpgsql` / multi-statement functions |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (real nested rollback), two-phase commit `PREPARE TRANSACTION` / `COMMIT`/`ROLLBACK PREPARED` (cross-connection, `pg_prepared_xacts`) | prepared xacts surviving a restart, two-phase over the extended protocol |
 | Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors), `EXPLAIN [ANALYZE]` (`FORMAT TEXT`/`JSON`, faithful Index/Seq Scan) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows, per-node `EXPLAIN` costs / timing |

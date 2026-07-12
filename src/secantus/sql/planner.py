@@ -2679,6 +2679,26 @@ class DerivedTable:
 
 
 @dataclass
+class LateralJoin:
+    """A *rich* ``[LEFT] JOIN LATERAL (subquery) alias`` whose subquery has its own
+    JOIN / GROUP BY / aggregate / DISTINCT — too much to lower to a correlated
+    ``$lookup`` sub-pipeline. It runs nested-loop on the evaluated path: for each
+    outer row the executor substitutes the correlated outer columns with that row's
+    values and runs ``select`` as a plain (non-correlated) inner query.
+
+    ``inner_aliases`` are the subquery's own FROM/JOIN aliases (a column qualified by
+    anything else is an outer correlation to substitute); ``side`` is ``"LEFT"`` for a
+    ``LEFT JOIN LATERAL`` (keep an outer row whose subquery is empty, null-padded) or
+    ``""`` for INNER/CROSS (drop it)."""
+
+    alias: str
+    tdef: TableDef
+    select: exp.Select
+    side: str
+    inner_aliases: set[str | None]
+
+
+@dataclass
 class PipelineSelectPlan:
     base_collection: str
     base_filter: dict[str, Any]
@@ -2740,6 +2760,9 @@ class EvaluatedSelectPlan:
     # ORDER BY index -> the enum's declared labels, when that ORDER BY term is an
     # enum column, so the executor sorts by declared order not lexically.
     enum_orders: dict[int, list[str]] = field(default_factory=dict)
+    # Rich ``JOIN LATERAL`` sources (subquery with its own join/group/aggregate),
+    # expanded nested-loop per outer row by the executor after the pipeline runs.
+    lateral_joins: list[LateralJoin] = field(default_factory=list)
 
 
 def _evaluated_enum_orders(
@@ -4959,6 +4982,117 @@ def _lookup_stage(
     }
 
 
+# Collector for *rich* LATERAL joins encountered while building a join pipeline.
+# ``_plan_join_select`` sets a fresh list before building and reads it after; the
+# forward-join builder appends to it. Left unset (None) on the GROUP BY / window
+# paths, where a rich LATERAL stays ``0A000``.
+_lateral_collect: contextvars.ContextVar[list[LateralJoin] | None] = contextvars.ContextVar(
+    "_lateral_collect", default=None
+)
+
+
+def _lateral_inner_aliases(select: exp.Select) -> set[str | None]:
+    """The FROM/JOIN aliases defined *inside* a LATERAL subquery — a column qualified
+    by anything else is an outer correlation. (Mirrors ``_subquery_has_outer_ref``.)"""
+    inner: set[str | None] = set()
+    from_node = select.find(exp.From)
+    if from_node is not None:
+        src = from_node.this
+        inner.add(src.alias or getattr(src, "name", None))
+    for jn in select.args.get("joins") or []:
+        src = jn.this
+        inner.add(src.alias or getattr(src, "name", None))
+    return inner
+
+
+def _lateral_is_rich(sub: exp.Select) -> bool:
+    """Whether a LATERAL subquery is too rich for the correlated-``$lookup`` lowering
+    — it has its own JOIN / GROUP BY / HAVING / DISTINCT / aggregate, or a projection
+    the pipeline can't build. Such a subquery runs nested-loop on the evaluated path."""
+    has_agg = any(
+        _aggregate_of(e) is not None
+        or _array_agg_arg(e) is not None
+        or _jsonb_object_agg_args(e) is not None
+        or _range_agg_arg(e) is not None
+        or _string_agg_arg(e) is not None
+        for e in sub.expressions
+    )
+    return bool(
+        sub.args.get("joins")
+        or sub.args.get("group")
+        or sub.args.get("having")
+        or sub.args.get("distinct")
+        or has_agg
+        or _stmt_needs_evaluation(sub)
+    )
+
+
+def _lateral_literal(value: Any) -> exp.Expression:
+    """Wrap an outer row's Python value as a SQL literal node to splice into a
+    correlated LATERAL subquery in place of the outer column reference."""
+    import datetime as _dt
+    from decimal import Decimal
+
+    if value is None:
+        return exp.Null()
+    if isinstance(value, bool):
+        return exp.Boolean(this=value)
+    if isinstance(value, int):
+        return exp.Literal.number(str(value))
+    if isinstance(value, (float, Decimal)):
+        return exp.Literal.number(repr(value) if isinstance(value, float) else str(value))
+    if isinstance(value, _dt.datetime):
+        return exp.cast(exp.Literal.string(value.isoformat(sep=" ")), "timestamp")
+    if isinstance(value, _dt.date):
+        return exp.cast(exp.Literal.string(value.isoformat()), "date")
+    return exp.Literal.string(str(value))
+
+
+def _substitute_outer_columns(
+    select: exp.Select, inner_aliases: set[str | None], value_of: Any
+) -> exp.Select:
+    """A copy of ``select`` with every *outer* column reference (qualified by a table
+    not in ``inner_aliases``) replaced by ``_lateral_literal(value_of(col))`` — turning
+    the correlated subquery into a plain, non-correlated one for this outer row."""
+    out = select.copy()
+    for col in list(out.find_all(exp.Column)):
+        if col.table and col.table not in inner_aliases:
+            col.replace(_lateral_literal(value_of(col)))
+    return out
+
+
+def _plan_rich_lateral(
+    lateral: exp.Lateral, side: str, db: str, catalog: Any, storage: Any
+) -> LateralJoin:
+    """Plan a rich ``JOIN LATERAL (subquery) alias`` into a ``LateralJoin``. The
+    subquery's output shape (column names + tags) is obtained once by planning it with
+    the outer correlations replaced by ``NULL`` (a non-correlated query); the executor
+    re-substitutes real outer values per row at run time."""
+    alias = lateral.alias
+    if not alias:
+        raise errors.feature_not_supported("a LATERAL subquery requires an alias")
+    sub = lateral.this
+    if isinstance(sub, exp.Subquery):
+        sub = sub.this
+    if not isinstance(sub, exp.Select):
+        raise errors.feature_not_supported(f"unsupported LATERAL source: {lateral.sql()}")
+    inner_aliases = _lateral_inner_aliases(sub)
+    shape = _substitute_outer_columns(sub, inner_aliases, lambda _col: None)
+    shape_plan = plan_pipeline_select(shape, db, catalog, storage)
+    tdef = TableDef(
+        name=alias,
+        collection=alias,
+        columns=[Column(n, t, n, pk=False, nullable=True) for n, t in shape_plan.out_columns],
+    )
+    return LateralJoin(
+        alias=alias,
+        tdef=tdef,
+        select=sub,
+        side=str(side or "").upper(),
+        inner_aliases=inner_aliases,
+    )
+
+
 def _lateral_stage(
     lateral: exp.Lateral,
     side: str,
@@ -5234,6 +5368,24 @@ def _append_forward_join(
             raise errors.feature_not_supported(
                 "LATERAL join ON must be TRUE — correlate inside the subquery's WHERE"
             )
+        lat_sub = jt.this
+        if isinstance(lat_sub, exp.Subquery):
+            lat_sub = lat_sub.this
+        if isinstance(lat_sub, exp.Select) and _lateral_is_rich(lat_sub):
+            # A subquery with its own join/group/aggregate/DISTINCT — collected for the
+            # evaluated nested-loop path. Only available in a plain SELECT (the
+            # collector is set); a rich LATERAL under an outer GROUP BY / window stays
+            # 0A000.
+            collector = _lateral_collect.get()
+            if collector is None:
+                raise errors.feature_not_supported(
+                    "a LATERAL subquery with a join / GROUP BY / aggregate is only supported "
+                    "in a plain SELECT (not combined with an outer GROUP BY or window)"
+                )
+            lat = _plan_rich_lateral(jt, side, db, catalog, storage)
+            collector.append(lat)
+            amap[lat.alias] = ("join", lat.tdef)
+            return
         lat_alias, lat_table, stages = _lateral_stage(jt, side, amap, db, catalog, storage, derived)
         pipeline.extend(stages)
         amap[lat_alias] = ("join", lat_table)
@@ -5694,13 +5846,23 @@ def _build_trailing_composite_pipeline(
 def _plan_join_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
-    base, amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
+    # Collect any rich LATERAL joins encountered while building the pipeline (they're
+    # registered in ``amap`` but produce no pipeline stages — the executor expands
+    # them nested-loop). A fresh collector scopes this to the plain join-select path.
+    token = _lateral_collect.set([])
+    try:
+        base, amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
+        laterals = _lateral_collect.get() or []
+    finally:
+        _lateral_collect.reset(token)
 
     # A scalar SELECT list / ORDER BY, a correlated / EXISTS WHERE (which the
-    # pipeline builder deliberately left un-pushed), or DISTINCT ON (keep-first
-    # per key) all need the per-row evaluator.
-    if _stmt_needs_evaluation(stmt) or where_needs_per_row(stmt) or _distinct_on(stmt):
-        return _build_evaluated_join(stmt, base, amap, resolve, pipeline, derived)
+    # pipeline builder deliberately left un-pushed), DISTINCT ON (keep-first per key),
+    # or a rich LATERAL all need the per-row evaluator.
+    if _stmt_needs_evaluation(stmt) or where_needs_per_row(stmt) or _distinct_on(stmt) or laterals:
+        plan = _build_evaluated_join(stmt, base, amap, resolve, pipeline, derived)
+        plan.lateral_joins = laterals
+        return plan
 
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []

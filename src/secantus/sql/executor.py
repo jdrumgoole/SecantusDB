@@ -1234,6 +1234,42 @@ def _run_subplan_to_docs(
     raise errors.feature_not_supported("unsupported derived-table plan")
 
 
+def _expand_lateral(
+    docs: list[dict[str, Any]],
+    lat: Any,
+    resolve: Any,
+    storage: Any,
+    db: str,
+    sctx: Any,
+) -> list[dict[str, Any]]:
+    """Nested-loop expansion of one rich ``JOIN LATERAL``: for each outer ``doc``,
+    substitute its column values into the correlated subquery, run the (now plain)
+    inner query in full, and pair each inner row with the outer row under
+    ``doc[lat.alias]``. LEFT keeps an outer row whose subquery is empty (inner
+    columns NULL); INNER/CROSS drops it."""
+    from secantus.sql import engine
+
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+
+        def value_of(col: Any, _doc: dict[str, Any] = doc) -> Any:
+            return get_path(_doc, resolve(col)[0])
+
+        substituted = planner._substitute_outer_columns(lat.select, lat.inner_aliases, value_of)
+        res = engine.run_inner_select(substituted, storage, db, sctx.catalog, sctx.session)
+        names = [c.name for c in res.columns]
+        if res.rows:
+            for row in res.rows:
+                nd = dict(doc)
+                nd[lat.alias] = {names[i]: row[i] for i in range(len(names))}
+                out.append(nd)
+        elif lat.side == "LEFT":
+            nd = dict(doc)
+            nd[lat.alias] = dict.fromkeys(names)
+            out.append(nd)
+    return out
+
+
 def _evaluated_value_rows(
     plan: planner.EvaluatedSelectPlan, storage: Any, db: str, sctx: Any
 ) -> list[tuple[Any, ...]]:
@@ -1276,6 +1312,11 @@ def _evaluated_value_rows(
             return bool(r) if r is not None else False
 
         docs = [d for d in docs if keep(d)]
+    # Rich JOIN LATERAL sources: expand each outer doc by running the correlated
+    # subquery with this row's values substituted (nested-loop LATERAL), before
+    # windows / projection see the rows.
+    for lat in getattr(plan, "lateral_joins", None) or []:
+        docs = _expand_lateral(docs, lat, plan.resolve, storage, db, sctx)
     # Window functions depend on the whole partition, so they're computed over all
     # rows up front and stored on each doc; the scope resolves an exp.Window node
     # (keyed by id) to that precomputed field.
