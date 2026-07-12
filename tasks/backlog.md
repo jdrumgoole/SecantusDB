@@ -1673,9 +1673,23 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   **INNER-equivalent**; when it targets the *preserved base* A (pivot=A), those rows must survive. So the only change
   is the far `$unwind`'s preserve flag: `far_preserve = composite_is_LEFT and pivot == base_A` (threaded into
   `_nested_composite_lookup`), plus the FULL main branch's B-`$unwind` preserve = `composite_is_LEFT`. Everything else
-  (nested lookup, RIGHT preserve, FULL anti-branch, resolver, guards) is unchanged. **Still `0A000`:** a trailing
-  outer join over a **3+-table** composite, an outer `ON` spanning *both* composite tables (two-level `let`
-  threading), a non-adjacent `RIGHT` `ON`, and a second `FULL` in the tail. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
+  (nested lookup, RIGHT preserve, FULL anti-branch, resolver, guards) is unchanged.
+  **The trailing outer join now also covers a THREE-table composite** (b229): `A [INNER|LEFT] JOIN B ON o1
+  [INNER|LEFT] JOIN D ON o1b RIGHT|FULL JOIN C ON o2` (`sides == ["","","RIGHT"]` etc.; `_build_trailing3_composite_pipeline`,
+  routed for `len(joins)==3` with the first two sides ∈ {INNER, LEFT} and the last RIGHT/FULL). Uses the **main ∪ anti**
+  framing (proven exact): `(A⋈B⋈D) RIGHT JOIN C` = `[(A⋈B⋈D) INNER JOIN C] ∪ [C with no composite match]`, `FULL` =
+  the same with the main C-join LEFT. **Main branch** = the ordinary *forward* pipeline (drive A, `$lookup` B then D
+  honoring their INNER/LEFT sides, then C INNER for RIGHT / LEFT for FULL) — no reversal, so the composite is built at
+  its natural root A and there is no half-match leak. **Anti branch** = `$unionWith` the C collection + a `$lookup`
+  *from A* whose sub-pipeline rebuilds the *same forward composite* (via the shared `_emit_composite`) and `$match`es
+  it by `o2`, keeping the C rows whose composite is `$size: 0`, then `$replaceWith {c: $$ROOT}`. Crucially the anti
+  composite is rooted at **A, not re-rooted at the pivot** — re-rooting an all-INNER join is safe but re-rooting across
+  a LEFT join changes the row set, so rooting at A is what makes this sound for **INNER *and* LEFT** composites at any
+  pivot (A/B/D). The anti `$match` translates `o2` with `_OnTranslator(new_amap=composite)` (composite columns → their
+  field paths, C columns → `$$` let vars) — a small reusable extension to `_OnTranslator`. **Still `0A000`:** a
+  **4+-table** composite, an outer `ON` spanning *both* tables of a *two*-table composite (b226 restriction; sound
+  under this framing but untested — could relax), a non-adjacent/unqualified composite `ON`, a non-plain-table source,
+  a non-adjacent `RIGHT` `ON`, and a second `FULL` in the tail. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
   `FROM a, b` form) compiles to the cartesian product — an empty `$lookup` pipeline returns every
   foreign doc, then `$unwind` (no preserve) pairs each with the outer row; an outer join without `ON`
   is a `42601`. Non-equi (`a.x < b.y`) and `OR` join conditions already rode the `$lookup` `let`/
