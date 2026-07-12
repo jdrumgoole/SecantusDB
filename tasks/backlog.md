@@ -2379,7 +2379,11 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   landed** (b208): `n PRECEDING` / `n FOLLOWING` with a numeric offset is a value window over the
   sorted order key (`window._range_offset_bound`, computed in a direction-normalised key space so ASC
   and DESC share one comparison); Postgres' single-ORDER-BY-column requirement is enforced, a negative
-  offset is `22013`, and a non-numeric (interval) offset stays `0A000`. **`ORDER BY <output-alias>`
+  offset is `22013`. **`INTERVAL` `RANGE` offsets landed** (b231): `RANGE BETWEEN INTERVAL '1 day'
+  PRECEDING …` over a `date`/`timestamp` ORDER BY key (`window._range_interval_bound` + `_interval_subdoc`;
+  the boundary is `intervals.to_date(cur, offset, direction*sign)` and rows are kept on the in-frame side,
+  the operator flipping with the sort direction). Same single-ORDER-BY-column rule; a negative interval is
+  `22013`; an interval offset on a non-temporal key is `0A000`. **`ORDER BY <output-alias>`
   landed everywhere** (b208): the simple pushdown path resolves a standalone output alias to its input
   column (`_rewrite_order_by_aliases`, a real column of the same name wins per Postgres precedence);
   the evaluated / group-window paths already resolved aliases.

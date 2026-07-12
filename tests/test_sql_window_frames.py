@@ -2,9 +2,10 @@
 
 Explicit ``ROWS`` frames (any ``UNBOUNDED`` / ``CURRENT ROW`` / ``n PRECEDING`` /
 ``n FOLLOWING`` bound) and ``RANGE`` frames (``UNBOUNDED`` / ``CURRENT ROW``
-bounds; a numeric ``RANGE`` offset is rejected), plus the ``NTILE`` /
-``FIRST_VALUE`` / ``LAST_VALUE`` / ``NTH_VALUE`` functions. Windows route through
-the evaluated-select path; ``secantus.sql.window`` computes the frame per row.
+bounds, a numeric ``n PRECEDING`` / ``n FOLLOWING`` offset, and an ``INTERVAL``
+offset over a date/timestamp key), plus the ``NTILE`` / ``FIRST_VALUE`` /
+``LAST_VALUE`` / ``NTH_VALUE`` functions. Windows route through the
+evaluated-select path; ``secantus.sql.window`` computes the frame per row.
 """
 
 from __future__ import annotations
@@ -256,5 +257,107 @@ def test_range_numeric_offset_multi_order_key_rejected(storage, session):
             session,
             "SELECT SUM(amt) OVER "
             "(ORDER BY g, id RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+# -- interval RANGE offsets over a date/timestamp key (b231) ----------------- #
+
+
+@pytest.fixture
+def tsdata(storage, session):
+    # Timestamped rows with a one-day gap (01-04 missing) so a value-window differs
+    # from a row-count window.
+    storage.q("CREATE TABLE ev (ts timestamp primary key, v int)")
+    for ts, v in [
+        ("2020-01-01", 10),
+        ("2020-01-02", 20),
+        ("2020-01-03", 30),
+        ("2020-01-05", 40),
+    ]:
+        storage.q(f"INSERT INTO ev VALUES (TIMESTAMP '{ts}', {v})")
+    return storage
+
+
+def _sums(storage, session, frame, order="ts"):
+    res = q(
+        storage,
+        session,
+        f"SELECT ts, SUM(v) OVER (ORDER BY {order} {frame}) FROM ev ORDER BY ts",
+    )
+    return [r[1] for r in res.rows]
+
+
+def test_range_interval_preceding_to_current(tsdata, session):
+    # frame = [cur - 1 day, cur]: 01-01→{01-01}=10; 01-02→{01,02}=30; 01-03→{02,03}=50;
+    # 01-05→{01-04(absent),01-05}=40.
+    assert _sums(tsdata, session, "RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW") == [
+        10,
+        30,
+        50,
+        40,
+    ]
+
+
+def test_range_interval_current_to_following(tsdata, session):
+    # frame = [cur, cur + 1 day].
+    assert _sums(tsdata, session, "RANGE BETWEEN CURRENT ROW AND INTERVAL '1 day' FOLLOWING") == [
+        30,
+        50,
+        30,
+        40,
+    ]
+
+
+def test_range_interval_symmetric(tsdata, session):
+    # [cur - 2 days, cur + 2 days].
+    frame = "RANGE BETWEEN INTERVAL '2 days' PRECEDING AND INTERVAL '2 days' FOLLOWING"
+    assert _sums(tsdata, session, frame) == [60, 60, 100, 70]
+
+
+def test_range_interval_desc(tsdata, session):
+    # DESC: PRECEDING covers larger timestamps (earlier in the DESC walk).
+    res = q(
+        tsdata,
+        session,
+        "SELECT ts, SUM(v) OVER (ORDER BY ts DESC "
+        "RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) FROM ev ORDER BY ts DESC",
+    )
+    assert [r[1] for r in res.rows] == [40, 30, 50, 30]
+
+
+def test_range_interval_hours_subday(storage, session):
+    # A sub-day interval over intraday timestamps.
+    storage.q("CREATE TABLE h (ts timestamp primary key, v int)")
+    for ts, v in [("2020-01-01 10:00", 1), ("2020-01-01 10:30", 2), ("2020-01-01 12:00", 3)]:
+        storage.q(f"INSERT INTO h VALUES (TIMESTAMP '{ts}', {v})")
+    res = q(
+        storage,
+        session,
+        "SELECT ts, SUM(v) OVER (ORDER BY ts "
+        "RANGE BETWEEN INTERVAL '1 hour' PRECEDING AND CURRENT ROW) FROM h ORDER BY ts",
+    )
+    assert [r[1] for r in res.rows] == [1, 3, 3]
+
+
+def test_range_interval_multi_order_key_rejected(tsdata, session):
+    with pytest.raises(SQLError) as ei:
+        q(
+            tsdata,
+            session,
+            "SELECT SUM(v) OVER (ORDER BY v, ts "
+            "RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) FROM ev",
+        )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_range_interval_on_non_temporal_key_rejected(storage, session):
+    # An interval offset needs a date/timestamp ORDER BY key.
+    with pytest.raises(SQLError) as ei:
+        q(
+            storage,
+            session,
+            "SELECT SUM(amt) OVER "
+            "(ORDER BY id RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) FROM t",
         )
     assert ei.value.sqlstate == "0A000"
