@@ -243,19 +243,6 @@ def test_trailing_right_compound_on(trj, session):
     assert rows == [(100, 10), (200, None), (300, None)]
 
 
-def test_trailing_right_three_table_composite_rejected(trj, session):
-    # A 3-table composite on the left of the RIGHT — nesting depth grows, 0A000.
-    trj.q("CREATE TABLE jd (id int primary key, ak int)")
-    with pytest.raises(SQLError) as ei:
-        q(
-            trj,
-            session,
-            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak JOIN jd ON jd.ak = ja.k "
-            "RIGHT JOIN jc ON jc.bk = jb.bk",
-        )
-    assert ei.value.sqlstate == "0A000"
-
-
 def test_trailing_right_on_spans_both_composite_tables_rejected(trj, session):
     # RIGHT ON references C and *both* composite tables → two-level let threading,
     # deliberately unsupported.
@@ -348,18 +335,6 @@ def test_trailing_full_with_where(trj, session):
         "FULL JOIN jc ON jc.bk = jb.bk WHERE jc.cid >= 200",
     ).rows
     assert _sorted(rows) == _sorted([(200, None), (300, None)])
-
-
-def test_trailing_full_three_table_composite_rejected(trj, session):
-    trj.q("CREATE TABLE jd (id int primary key, ak int)")
-    with pytest.raises(SQLError) as ei:
-        q(
-            trj,
-            session,
-            "SELECT jc.cid FROM ja JOIN jb ON ja.k = jb.ak JOIN jd ON jd.ak = ja.k "
-            "FULL JOIN jc ON jc.bk = jb.bk",
-        )
-    assert ei.value.sqlstate == "0A000"
 
 
 def test_trailing_full_on_spans_both_composite_tables_rejected(trj, session):
@@ -480,16 +455,148 @@ def test_trailing_full_leftcomposite_pivot_is_join_table(llj, session):
     )
 
 
-def test_trailing_leftcomposite_three_table_rejected(llj, session):
-    # A 3-table leading composite is still out of scope.
-    llj.q("CREATE TABLE le (id int primary key, ak int)")
+# -- trailing RIGHT/FULL over a THREE-table composite (b229) ----------------- #
+
+
+@pytest.fixture
+def t3(storage, session):
+    # 3-table composite ta⋈tb⋈td, joined `ta.ak=tb.bak` then `td.dbk=tb.bk`.
+    #   ta: ak 1/2/3        tb: bk 10/20/30/40 with bak 1/2/9/3  (bk30 orphan: bak 9)
+    #   td: dk 100/200/300 with dbk 10/20/40
+    #   composite (all INNER): R1(ak1,bk10,dk100) R2(ak2,bk20,dk200) R3(ak3,bk40,dk300)
+    #   (tb.bk30 drops — bak 9 has no ta; no td has dbk 30.)
+    storage.q("CREATE TABLE ta (ak int primary key, av text)")
+    storage.q("INSERT INTO ta VALUES (1, 'a1'), (2, 'a2'), (3, 'a3')")
+    storage.q("CREATE TABLE tb (bk int primary key, bak int, bv text)")
+    storage.q("INSERT INTO tb VALUES (10, 1, 'b1'), (20, 2, 'b2'), (30, 9, 'b3'), (40, 3, 'b4')")
+    storage.q("CREATE TABLE td (dk int primary key, dbk int, dv text)")
+    storage.q("INSERT INTO td VALUES (100, 10, 'd1'), (200, 20, 'd2'), (300, 40, 'd3')")
+    return storage
+
+
+_T3J = "FROM ta a JOIN tb b ON a.ak = b.bak JOIN td d ON d.dbk = b.bk"
+
+
+def test_trailing3_right_pivot_is_middle(t3, session):
+    # o2 references the middle composite table b. R3 (bk 40) matches no c → dropped
+    # (RIGHT); c3 (99) has no composite → all-NULL pad.
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    t3.q("INSERT INTO tc VALUES (10, 'c1'), (20, 'c2'), (99, 'c3')")
+    rows = q(
+        t3, session, "SELECT a.av, b.bk, d.dk, c.cx " + _T3J + " RIGHT JOIN tc c ON c.cx = b.bk"
+    ).rows
+    assert _sorted(rows) == _sorted(
+        [("a1", 10, 100, 10), ("a2", 20, 200, 20), (None, None, None, 99)]
+    )
+
+
+def test_trailing3_full_keeps_composite_only_and_anti(t3, session):
+    # FULL adds the composite-only R3 (kept) and the unmatched-c3 anti row.
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    t3.q("INSERT INTO tc VALUES (10, 'c1'), (20, 'c2'), (99, 'c3')")
+    rows = q(
+        t3, session, "SELECT a.av, b.bk, d.dk, c.cx " + _T3J + " FULL JOIN tc c ON c.cx = b.bk"
+    ).rows
+    assert _sorted(rows) == _sorted(
+        [("a1", 10, 100, 10), ("a2", 20, 200, 20), ("a3", 40, 300, None), (None, None, None, 99)]
+    )
+
+
+def test_trailing3_right_no_half_match_leak(t3, session):
+    # tb.bk=30 (b3) belongs to NO composite row (its bak 9 has no ta). A c on cx=30
+    # must pad the WHOLE composite side NULL — never leak b3's bk/bak/bv. This is the
+    # 3-table generalization of the b226 half-match leak.
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    t3.q("INSERT INTO tc VALUES (30, 'cBAD')")
+    rows = q(
+        t3,
+        session,
+        "SELECT a.av, b.bk, b.bv, d.dk, c.cx " + _T3J + " RIGHT JOIN tc c ON c.cx = b.bk",
+    ).rows
+    assert rows == [(None, None, None, None, 30)]
+
+
+def test_trailing3_right_pivot_is_base(t3, session):
+    # o2 references the base a.
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    t3.q("INSERT INTO tc VALUES (1, 'cA1'), (2, 'cA2'), (7, 'cA9')")
+    rows = q(
+        t3, session, "SELECT a.av, d.dk, c.cx " + _T3J + " RIGHT JOIN tc c ON c.cx = a.ak"
+    ).rows
+    assert _sorted(rows) == _sorted([("a1", 100, 1), ("a2", 200, 2), (None, None, 7)])
+
+
+def test_trailing3_full_pivot_is_last(t3, session):
+    # o2 references the last composite table d.
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    t3.q("INSERT INTO tc VALUES (100, 'cD1'), (200, 'cD2'), (999, 'cD9')")
+    rows = q(t3, session, "SELECT a.av, d.dk, c.cx " + _T3J + " FULL JOIN tc c ON c.cx = d.dk").rows
+    assert _sorted(rows) == _sorted(
+        [("a1", 100, 100), ("a2", 200, 200), ("a3", 300, None), (None, None, 999)]
+    )
+
+
+def test_trailing3_full_select_star_column_order(t3, session):
+    # SELECT * keeps FROM order: a.(ak,av), b.(bk,bak,bv), d.(dk,dbk,dv), c.(cx,cv).
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    t3.q("INSERT INTO tc VALUES (100, 'cD1'), (200, 'cD2'), (999, 'cD9')")
+    rows = q(t3, session, "SELECT * " + _T3J + " FULL JOIN tc c ON c.cx = d.dk").rows
+    assert _sorted(rows) == _sorted(
+        [
+            (1, "a1", 10, 1, "b1", 100, 10, "d1", 100, "cD1"),
+            (2, "a2", 20, 2, "b2", 200, 20, "d2", 200, "cD2"),
+            (3, "a3", 40, 3, "b4", 300, 40, "d3", None, None),
+            (None, None, None, None, None, None, None, None, 999, "cD9"),
+        ]
+    )
+
+
+def test_trailing3_right_with_where_and_group_by(t3, session):
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    t3.q("INSERT INTO tc VALUES (10, 'c1'), (20, 'c2'), (99, 'c3')")
+    rows = q(
+        t3,
+        session,
+        "SELECT c.cx, count(a.av) " + _T3J + " RIGHT JOIN tc c ON c.cx = b.bk "
+        "GROUP BY c.cx HAVING c.cx >= 20 ORDER BY c.cx",
+    ).rows
+    assert rows == [(20, 1), (99, 0)]
+
+
+def test_trailing3_right_over_left_composite(t3, session):
+    # A LEFT composite: `ta LEFT JOIN tb LEFT JOIN td`. a3 (no tb) survives as
+    # (a3, NULL, NULL); a c on a.ak=3 keeps it — an INNER composite would all-NULL pad.
+    t3.q("DELETE FROM tb WHERE bk IN (30, 40)")  # a3 now has no tb row
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    t3.q("INSERT INTO tc VALUES (1, 'c1'), (3, 'c3'), (9, 'c9')")
+    rows = q(
+        t3,
+        session,
+        "SELECT a.av, b.bk, d.dk, c.cx FROM ta a LEFT JOIN tb b ON a.ak = b.bak "
+        "LEFT JOIN td d ON d.dbk = b.bk RIGHT JOIN tc c ON c.cx = a.ak",
+    ).rows
+    assert _sorted(rows) == _sorted(
+        [("a1", 10, 100, 1), ("a3", None, None, 3), (None, None, None, 9)]
+    )
+
+
+def test_trailing3_four_table_composite_rejected(t3, session):
+    # Four-table composite is out of scope.
+    t3.q("CREATE TABLE te (ek int primary key, eak int)")
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
     with pytest.raises(SQLError) as ei:
         q(
-            llj,
+            t3,
             session,
-            "SELECT lc.cid FROM la LEFT JOIN lb ON la.k = lb.ak JOIN le ON le.ak = la.k "
-            "RIGHT JOIN lc ON lc.k = la.k",
+            "SELECT c.cx " + _T3J + " JOIN te e ON e.eak = a.ak RIGHT JOIN tc c ON c.cx = b.bk",
         )
+    assert ei.value.sqlstate == "0A000"
+
+
+def test_trailing3_unqualified_on_rejected(t3, session):
+    t3.q("CREATE TABLE tc (cx int primary key, cv text)")
+    with pytest.raises(SQLError) as ei:
+        q(t3, session, "SELECT c.cx " + _T3J + " RIGHT JOIN tc c ON cx = b.bk")
     assert ei.value.sqlstate == "0A000"
 
 
