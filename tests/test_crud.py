@@ -992,6 +992,29 @@ def test_aggregate_group_stddev(coll) -> None:
     assert out[0]["samp"] == 2.0
 
 
+def test_aggregate_group_merge_objects(coll) -> None:
+    # $mergeObjects as a $group accumulator merges each operand doc across the
+    # group (later keys override earlier); null/missing operands are skipped; an
+    # all-missing group still yields {}.
+    coll.insert_many(
+        [
+            {"g": "x", "sub": {"a": 1, "b": 1}},
+            {"g": "x", "sub": {"b": 2, "c": 3}},  # b overrides, c adds
+            {"g": "x"},  # missing sub -> skipped
+            {"g": "x", "sub": None},  # null sub -> skipped
+            {"g": "y"},  # whole group missing/null -> {}
+        ]
+    )
+    out = sorted(
+        coll.aggregate([{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}]),
+        key=lambda d: d["_id"],
+    )
+    assert out == [
+        {"_id": "x", "m": {"a": 1, "b": 2, "c": 3}},
+        {"_id": "y", "m": {}},
+    ]
+
+
 def test_aggregate_unwind_stage(coll) -> None:
     coll.insert_one({"_id": 1, "tags": ["a", "b", "c"]})
     out = list(coll.aggregate([{"$unwind": "$tags"}]))

@@ -157,6 +157,11 @@ pub(crate) enum Acc {
     Last(Option<Bson>),
     Push(Vec<Bson>),
     AddToSet(Vec<Bson>),
+    // `$mergeObjects`: merge each per-doc operand document into the accumulator
+    // (later keys override earlier — `dict.update` semantics). A null/missing
+    // operand is skipped; a non-null, non-document operand defers to Python
+    // (which raises Location 40400). An all-missing group still yields `{}`.
+    MergeObjects(Document),
     // `$stdDevPop` / `$stdDevSamp`: collect the numeric values, compute at
     // finalize. `pop` selects population (÷n, 0 for a single value) vs sample
     // (÷n-1, null for <2 values). Field stays absent when no numeric value seen.
@@ -217,6 +222,7 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
         "$last" => Acc::Last(None),
         "$push" => Acc::Push(Vec::new()),
         "$addToSet" => Acc::AddToSet(Vec::new()),
+        "$mergeObjects" => Acc::MergeObjects(Document::new()),
         "$stdDevPop" => Acc::StdDev {
             values: Vec::new(),
             pop: true,
@@ -335,6 +341,22 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             }
             if !present {
                 list.push(v);
+            }
+        }
+        Acc::MergeObjects(merged) => {
+            // Null/missing operand -> skip. Non-null, non-document operand ->
+            // defer to Python (which raises Location 40400). Document -> merge
+            // with later-key-wins semantics.
+            if let Some(v) = eval_or_missing(arg, doc, vars)? {
+                match v {
+                    Bson::Null => {}
+                    Bson::Document(d) => {
+                        for (k, val) in d {
+                            merged.insert(k, val);
+                        }
+                    }
+                    _ => return Err(()),
+                }
             }
         }
         Acc::StdDev { values, .. } => {
@@ -596,6 +618,9 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
             Acc::AddToSet(list) => {
                 out.insert(field.to_string(), Bson::Array(list));
             }
+            Acc::MergeObjects(merged) => {
+                out.insert(field.to_string(), Bson::Document(merged));
+            }
             Acc::StdDev { values, pop } => {
                 // No numeric value seen -> the pure code never creates the bucket
                 // key, so the field is absent. Otherwise `_std_dev` may still be
@@ -657,6 +682,9 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
         Acc::Min(v) | Acc::Max(v) => v.unwrap_or(Bson::Null),
         Acc::First(v) | Acc::Last(v) => v.unwrap_or(Bson::Null),
         Acc::Push(list) | Acc::AddToSet(list) => Bson::Array(list),
+        // Empty window -> {} (a fresh accumulator over zero docs), matching
+        // `_empty_window_value("$mergeObjects")`.
+        Acc::MergeObjects(merged) => Bson::Document(merged),
         // A window writes a value into every row: empty / degenerate -> null.
         Acc::StdDev { values, pop } => std_dev(&values, pop).map_or(Bson::Null, Bson::Double),
         Acc::NElem { kind, n, vals } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),

@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
-from secantus.expressions import MISSING, ExpressionError, evaluate, evaluate_or_missing
+from secantus.expressions import (
+    MISSING,
+    ExpressionError,
+    _bson_type_name,
+    evaluate,
+    evaluate_or_missing,
+)
 from secantus.numerics import bson_add
 from secantus.paths import get_path, set_path, unset_path
 from secantus.query import QueryError, matches
@@ -893,6 +899,27 @@ def _acc_add_to_set(
         seen.append(v)
 
 
+def _acc_merge_objects(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    # $mergeObjects accumulator: merge each per-doc operand document into the
+    # accumulator (later keys override earlier — dict.update semantics). A
+    # null/missing operand is skipped; a non-null, non-document operand is an
+    # error (mongod Location 40400). An all-missing group still yields {}.
+    acc = bucket.setdefault(field, {})
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is MISSING or v is None:
+        return
+    if not isinstance(v, Mapping):
+        raise AggregateError(
+            "$mergeObjects requires object inputs, but input "
+            f"{v!r} is of type {_bson_type_name(v)}",
+            code=40400,
+            code_name="Location40400",
+        )
+    acc.update(v)
+
+
 def _acc_std(
     bucket: dict[str, Any],
     field: str,
@@ -1104,6 +1131,7 @@ _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$last": _acc_last,
     "$push": _acc_push,
     "$addToSet": _acc_add_to_set,
+    "$mergeObjects": _acc_merge_objects,
     "$stdDevPop": _acc_std_pop,
     "$stdDevSamp": _acc_std_samp,
     "$firstN": _acc_first_n,
@@ -2118,6 +2146,15 @@ def _stage_set_window_fields(
                 raise AggregateError(f"{op} requires {{input, unit?}}")
             compiled.append((field, op, arg, window))
             continue
+        if op == "$mergeObjects":
+            # $mergeObjects is a $group-only accumulator; mongod rejects it as a
+            # window function (verified three-way vs mongod 6.0: FailedToParse).
+            raise AggregateError(
+                f"Unrecognized window function, or the window function {op} is not "
+                "supported in $setWindowFields",
+                code=9,
+                code_name="FailedToParse",
+            )
         if op not in _ACC_DISPATCH:
             raise AggregateError(
                 f"$setWindowFields: unsupported function {op!r} "
@@ -2594,6 +2631,8 @@ def _empty_window_value(op: str) -> Any:
         return 0
     if op in ("$push", "$addToSet"):
         return []
+    if op == "$mergeObjects":
+        return {}
     return None
 
 

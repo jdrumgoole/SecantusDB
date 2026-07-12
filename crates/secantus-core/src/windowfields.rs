@@ -138,6 +138,10 @@ pub fn set_window_fields_stage(
             if sort_by.is_none() || !spec.contains_key("input") {
                 return Err(());
             }
+        } else if op == "$mergeObjects" {
+            // $mergeObjects is a $group-only accumulator; mongod rejects it as a
+            // window function (FailedToParse) — defer so Python raises the code.
+            return Err(());
         } else {
             group::new_acc(op)?; // reject unsupported accumulator (incl. time-series) → defer
         }

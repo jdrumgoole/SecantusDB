@@ -1471,15 +1471,12 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   regression risk. Same-type range comparisons (the overwhelmingly common case) are
   correct on both servers.
 - [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
-  servers).** (a) **`$mergeObjects` as a `$group` accumulator** — mongod merges the
-  input object across the group (`{$group: {_id: "$g", m: {$mergeObjects: "$sub"}}}`);
-  both servers reject it (it works only as a `$project` expression). Needs a new
-  accumulator in `aggregate._ACC_DISPATCH` + `group.rs` `Acc`. (b) **`$getField` on
+  servers).** (a) **`$getField` on
   an absent field returns `null` instead of missing** — mongod omits a projected
   field whose `$getField` resolves to an absent key (`input.get(field)` → the
   missing sentinel, so `$project` drops it); both servers emit `null`. Fix returns
   the `_REMOVE_SENTINEL`, but requires the `$project`/`$addFields` stage to drop a
-  sentinel-valued computed field (verify `$$REMOVE` handling first). (c)
+  sentinel-valued computed field (verify `$$REMOVE` handling first). (b)
   **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but
   differ from mongod in the final ULP (e.g. `2.357022603955158` vs mongod's
   `2.3570226039551585`); mongod uses a different summation order. Precision-only,

@@ -125,6 +125,12 @@ CURATED = [
     [{"$group": {"_id": None, "s": {"$addToSet": "$nested"}}}],
     [{"$group": {"_id": None, "p": {"$push": "$nope"}}}],  # all missing -> []
     [{"$group": {"_id": None, "s": {"$addToSet": "$nope"}}}],
+    # $mergeObjects accumulator — merge each operand doc across the group (later
+    # keys win); null/missing operands skipped; an all-missing group yields {}.
+    # `nested` is present on one doc and missing on the others (mixed shape).
+    [{"$group": {"_id": None, "m": {"$mergeObjects": "$nested"}}}],
+    [{"$group": {"_id": "$b", "m": {"$mergeObjects": "$nested"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": None, "m": {"$mergeObjects": "$nope"}}}],  # all missing -> {}
     # $stdDevPop / $stdDevSamp — pop is 0 for a single value, samp is null for <2.
     [{"$group": {"_id": "$b", "sd": {"$stdDevPop": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "sd": {"$stdDevSamp": "$a"}}}, {"$sort": {"_id": 1}}],
