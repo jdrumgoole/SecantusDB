@@ -60,8 +60,7 @@ def test_pg_typeof_columns(storage):
     q(storage, "INSERT INTO pt VALUES (1, 2, 1.5, 'x', '{1,2}')")
     res = q(
         storage,
-        "SELECT pg_typeof(a), pg_typeof(sm), pg_typeof(f), pg_typeof(name), pg_typeof(arr) "
-        "FROM pt",
+        "SELECT pg_typeof(a), pg_typeof(sm), pg_typeof(f), pg_typeof(name), pg_typeof(arr) FROM pt",
     )
     assert res.rows == [("integer", "smallint", "real", "text", "integer[]")]
 
