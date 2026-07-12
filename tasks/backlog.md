@@ -1469,7 +1469,20 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   subset; Python would need an explicit canonical-type-rank compare) — deferred as a
   delicate change to long-standing range-comparison semantics with pymongo-gauge
   regression risk. Same-type range comparisons (the overwhelmingly common case) are
-  correct on both servers.
+  correct on both servers. **Related — the `$min`/`$max` UPDATE operators have the
+  same cross-type gap AND a Python robustness bug** (found by a three-way update
+  differential, 2026-07-12): mongod's `$max`/`$min` compare the incoming value
+  against the current field value by BSON canonical-type order (so `$max` of int `5`
+  vs string `"str"` sets `"str"`, a string out-ranking a number); both servers
+  instead error, and `update.py` **leaks a raw `TypeError`** (`'>' not supported
+  between 'str' and 'int'` at `_apply_op`'s `value > current`) rather than a clean
+  error — it must at minimum be caught (don't leak tracebacks to the wire), and
+  ideally routed through the same BSON-order comparator a cross-type fix would add.
+- [ ] **`$inc` / `$mul` on an explicit-null field** — mongod rejects it
+  (`Cannot apply $inc to a value of non-numeric type`, code 14); both servers treat
+  the null as 0 and apply the operation (too lenient). Found by the three-way update
+  differential (2026-07-12). Clean fix on both engines (reject a non-numeric,
+  non-missing current value).
 - [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
   servers).**
   **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but

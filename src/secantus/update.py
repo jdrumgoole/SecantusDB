@@ -516,23 +516,28 @@ def _apply_op(
                     set_path(doc, np_path, value)
     elif op == "$bit":
         for path, ops in payload.items():
-            if not isinstance(ops, Mapping) or len(ops) != 1:
-                raise UpdateError("$bit requires a single-op document per field")
-            (bit_op,) = ops.keys()
-            mask = ops[bit_op]
-            if not isinstance(mask, int) or isinstance(mask, bool):
-                raise UpdateError("$bit mask must be an integer")
+            # mongod applies every listed operation to the field in order
+            # (e.g. {and: X, or: Y} is (v & X) | Y), not just a single op.
+            if not isinstance(ops, Mapping) or not ops:
+                raise UpdateError("$bit requires a document with at least one bitwise operation")
+            parsed_ops: list[tuple[str, int]] = []
+            for bit_op, mask in ops.items():
+                if bit_op not in ("and", "or", "xor"):
+                    raise UpdateError(f"$bit unsupported sub-op: {bit_op}")
+                if not isinstance(mask, int) or isinstance(mask, bool):
+                    raise UpdateError("$bit mask must be an integer")
+                parsed_ops.append((bit_op, mask))
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 current = get_path(doc, concrete, default=0) or 0
                 if not isinstance(current, int) or isinstance(current, bool):
                     raise UpdateError(f"$bit on non-integer at {concrete!r}")
-                if bit_op == "and":
-                    set_path(doc, concrete, current & mask)
-                elif bit_op == "or":
-                    set_path(doc, concrete, current | mask)
-                elif bit_op == "xor":
-                    set_path(doc, concrete, current ^ mask)
-                else:
-                    raise UpdateError(f"$bit unsupported sub-op: {bit_op}")
+                for bit_op, mask in parsed_ops:
+                    if bit_op == "and":
+                        current = current & mask
+                    elif bit_op == "or":
+                        current = current | mask
+                    else:
+                        current = current ^ mask
+                set_path(doc, concrete, current)
     else:
         raise UpdateError(f"unsupported update operator: {op}")

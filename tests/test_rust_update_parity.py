@@ -75,6 +75,9 @@ CURATED = [
     ({"b": 6}, {"$bit": {"b": {"xor": 3}}}, False),
     ({"b": Int64(12)}, {"$bit": {"b": {"and": 10}}}, False),
     ({}, {"$bit": {"b": {"or": 7}}}, False),
+    # Multiple bit ops applied in order.
+    ({"b": 0b1100}, {"$bit": {"b": {"and": 0b1010, "or": 0b0001}}}, False),
+    ({"b": 0b1000}, {"$bit": {"b": {"or": 0b0001, "xor": 0b1001}}}, False),
     ({}, {"$push": {"tags": "x"}}, False),
     ({"tags": ["x"]}, {"$push": {"tags": "y"}}, False),
     # $push / $addToSet $each modifiers: multi-append, $position, $slice, $sort.

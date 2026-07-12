@@ -534,35 +534,44 @@ fn apply_op(
         }
         "$bit" => {
             for (path, ops) in payload {
-                // `{field: {and|or|xor: <int mask>}}` — exactly one sub-op.
+                // `{field: {and|or|xor: <int mask>, ...}}` — mongod applies every
+                // listed operation to the field in order (e.g. (v & X) | Y).
                 let ops = match ops {
-                    Bson::Document(d) if d.len() == 1 => d,
-                    _ => return Err(Fallback), // not a single-op doc -> Python raises
+                    Bson::Document(d) if !d.is_empty() => d,
+                    _ => return Err(Fallback), // empty / non-doc -> Python raises
                 };
-                let (bit_op, mask_b) = ops.iter().next().unwrap();
-                let mask = match mask_b {
-                    Bson::Int32(n) => *n as i64,
-                    Bson::Int64(n) => *n,
-                    _ => return Err(Fallback), // non-integer mask -> Python raises
-                };
+                let mut parsed: Vec<(&str, i64)> = Vec::with_capacity(ops.len());
+                for (bit_op, mask_b) in ops {
+                    let op_s = bit_op.as_str();
+                    if !matches!(op_s, "and" | "or" | "xor") {
+                        return Err(Fallback); // unknown sub-op -> Python raises
+                    }
+                    let mask = match mask_b {
+                        Bson::Int32(n) => *n as i64,
+                        Bson::Int64(n) => *n,
+                        _ => return Err(Fallback), // non-integer mask -> Python raises
+                    };
+                    parsed.push((op_s, mask));
+                }
                 for cpath in expand_path(result, path, filters, pos)? {
-                    let cur = match get_path(result, &cpath) {
+                    let mut cur = match get_path(result, &cpath) {
                         None | Some(Bson::Null) => 0i64,
                         Some(Bson::Int32(n)) => *n as i64,
                         Some(Bson::Int64(n)) => *n,
                         Some(_) => return Err(Fallback), // $bit on non-integer -> Python raises
                     };
-                    let res = match bit_op.as_str() {
-                        "and" => cur & mask,
-                        "or" => cur | mask,
-                        "xor" => cur ^ mask,
-                        _ => return Err(Fallback), // unknown sub-op -> Python raises
-                    };
+                    for (bit_op, mask) in &parsed {
+                        cur = match *bit_op {
+                            "and" => cur & mask,
+                            "or" => cur | mask,
+                            _ => cur ^ mask,
+                        };
+                    }
                     // Python computes a plain int -> bson encodes it as int32 when
                     // it fits, else int64. Match that so the BSON subtype agrees.
-                    let val = match i32::try_from(res) {
+                    let val = match i32::try_from(cur) {
                         Ok(v) => Bson::Int32(v),
-                        Err(_) => Bson::Int64(res),
+                        Err(_) => Bson::Int64(cur),
                     };
                     set_path(result, &cpath, val)?;
                 }
