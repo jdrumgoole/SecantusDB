@@ -1078,9 +1078,7 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
             // to the pure-Python engine (which drops the field) — mirroring how
             // `$$REMOVE` already defers.
             let input = match d.get("input") {
-                Some(Bson::String(s))
-                    if s.starts_with('$') && !s.starts_with("$$") =>
-                {
+                Some(Bson::String(s)) if s.starts_with('$') && !s.starts_with("$$") => {
                     match paths::get_path(ctx.doc, &s[1..]) {
                         Some(v) => v.clone(),
                         None => return Err(Fallback), // input missing -> defer
