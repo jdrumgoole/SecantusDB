@@ -137,8 +137,15 @@ version lines** — they **diverged at `0.5.2`** (Python `0.5.2b33` / Rust crate
 one server bumps only that server's version:
 
 - **Python server version** — `pyproject.toml` `version` + `src/secantus/__init__.py`
-  `__version__` (`0.5.2bN`, PEP 440). This is the **PyPI package** version. Bump it
-  for Python-server changes (`src/secantus/**`).
+  `__version__` (`0.5.2bN`, PEP 440). This is the **PyPI package** version.
+  **Feature PRs do NOT bump it.** The version is assigned at release time by
+  `release-prepare` (`invoke release-prepare X.Y.Z` → `_bump_version_files`). This
+  is deliberate: every PR that bumped the single `version` line picked a concrete
+  number at branch time that was stale by merge time, so any two concurrent PRs
+  conflicted on that one line — the dominant source of cross-session rebase churn
+  (many parallel SQL sessions all bumping `pyproject.toml`). Leaving the version to
+  the release makes concurrent feature PRs independent. Between releases `main`
+  simply carries the last released version.
 - **Rust server version** — the `version` field in **every** `crates/*/Cargo.toml`,
   kept in **lockstep** across all crates (`0.MAJOR.PATCH-beta.N`, SemVer
   pre-release). Most slices just increment `N`. **Bumping the patch (or
@@ -157,10 +164,13 @@ one server bumps only that server's version:
   `--version`, the embedded Python handle's `RustServer.version` getter, and the
   `_secantus_server.__version__` module attribute.
 
-A change that genuinely touches both servers (e.g. an operator-semantics change
-landed in the Python module *and* its Rust port) bumps both. Don't bump the Python
-package version for Rust-only work just because the Rust extension is currently
-bundled into the `secantus` wheel — the two numbers are decoupled by intent.
+The Rust version is still bumped **per-PR** (unlike the Python version) because it
+is the traceability handle surfaced in `buildInfo.secantusVersion`, and because
+Rust-touching sessions are rare — so the 12-`Cargo.toml` bump only ever collides
+one Rust session against another, not against the many Python-only (SQL) sessions.
+A dual-server change therefore bumps the **Rust** version per-PR and leaves the
+**Python** version to the release. (If concurrent Rust sessions become common,
+move the Rust bump to a release step too, for the same reason.)
 
 **The authoritative plan is `tasks/rust-server-plan.md`.** It supersedes the
 earlier *in-process selectable-engine* model (`SECANTUS_ENGINE` process-wide
@@ -232,6 +242,7 @@ After every push (to a feature branch via PR — the default — or to `main`), 
 - **Major features and non-trivial updates go in a git worktree on a feature branch — never directly on `main`.** New CRUD operators, aggregation stages, storage-layer changes, wire-protocol additions, indexing work, and similar multi-file changes all qualify. Trivial one-file tweaks (typo fixes, single-line config edits) can stay on `main`. Create a worktree alongside the repo: `git worktree add ../SecantusDB-<branch> -b <branch>`. Develop and run the full test suite (and `./inv rust-gate` for Rust-server work) there.
 - **Pin a worktree to a commit for any timing / performance measurement.** Because multiple sessions run parallel worktrees, `main` (and your own checkout) can advance *mid-run* — a baseline, scaling curve, or floor measurement taken across a moving `main` compares different code against a different test population and is worthless. (Observed: a scaling curve was invalidated when `main` moved `3a86d9e5`→`b6b20df7` between runs, the suite growing ~1400 tests underneath it, with a transient breakage flickering through one run.) For any measurement, create a **detached worktree frozen at a SHA** — `git worktree add --detach ../SecantusDB-measure "$(git rev-parse origin/main)"` — run every comparison run there, and confirm `git rev-parse HEAD` is unchanged before *and* after. Caveat: a fresh worktree has no `vendor/wiredtiger`, and the copied-`.so` venv trick (memory `worktree-test-venv`) is fine for *collection* but can throw WT `Session__freecb` errors on `close()` that inflate *runtime* timings — for close-to-metal timing, measure in the main repo's built venv (e.g. a self-contained raw-WT script like `scratchpad/wt_floor.py`) or build WT in the worktree. See `tasks/test-performance-plan.md`.
 - **Land via branch push + PR, not `git push HEAD:main`.** Push the feature branch (`git push -u origin <branch>`) and open a PR (`gh pr create --base main`); let CI run on the PR, then merge when green. **Do not push straight to `main` from a session** — every session pushing the same ref (`refs/heads/main`) lands them in the same CI concurrency group, so a newer push cancels the older session's in-flight run (and forces constant rebases). One feature branch per session = one CI lane per session; distinct refs never cancel each other. After merge, clean up: `git worktree remove ../SecantusDB-<branch> && git branch -d <branch>`. (`test.yml` / `wheels.yml` / `rust-wheels.yml` are keyed `concurrency: ${{ github.workflow }}-${{ github.ref }}`, `cancel-in-progress: true` — per-ref, so the cancel only bites within a single branch, which is what you want.)
+- **Record the changelog with a fragment, not by editing `docs/changelog.md`.** A feature PR adds one file `changelog.d/<short-slug>.md` holding a single entry (a `###` headline + prose lede + `#### Added` / `#### Fixed` / … sections, no version number or `##` header) — see `changelog.d/README.md`. **Do not edit `docs/changelog.md` directly in a feature PR** and **do not bump the Python `version`** (see the Versioning section): those two shared lines are what made every pair of concurrent PRs conflict. New fragment files never collide, so concurrent sessions stay independent. At release, `invoke changelog-collate` (run automatically by `release-prepare`) folds the fragments into `## [Unreleased]` and deletes them; the normal promote-to-a-dated-section step is unchanged.
 - New CRUD operators or aggregation stages should land with both a unit test (in `tests/test_query.py` / `tests/test_update.py` / `tests/test_aggregate.py` / `tests/test_expressions.py`) and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
 - Layer boundaries to defend: the wire layer never knows about commands; the command layer never knows about SQL; pure operator engines (`query`, `update`, `expressions`, `aggregate`, `projection`) take only docs in and out, no I/O.
 - Errors raised inside command handlers are caught by `dispatch` and turned into `{ok: 0, errmsg, code, codeName}`. Don't leak Python tracebacks to the wire.

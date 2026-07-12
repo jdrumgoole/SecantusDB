@@ -1215,6 +1215,26 @@ def validate_readme(c: Context) -> None:
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)([ab]\d+|rc\d+)?$")
 
 
+@task(name="changelog-collate")
+def changelog_collate(c: Context) -> None:
+    """Fold ``changelog.d/*.md`` fragments into ``docs/changelog.md``.
+
+    Each PR adds a fragment under ``changelog.d/`` instead of editing the shared
+    ``docs/changelog.md`` (see ``changelog.d/README.md``). This folds every
+    fragment into the ``## [Unreleased]`` section, in filename order, and deletes
+    the fragment files. ``release-prepare`` runs this automatically; run it by
+    hand to preview the collated changelog before a release.
+    """
+    from changelog.fragments import collate
+
+    folded = collate()
+    if not folded:
+        print("no changelog fragments to collate")
+        return
+    for p in folded:
+        print(f"    folded {p}")
+
+
 @task
 def release(c: Context, version: str) -> None:
     """Cut a release: prepare + finalize, end-to-end.
@@ -1273,20 +1293,30 @@ def release_prepare(c: Context, version: str) -> None:
     _ensure_tag_unused(version)
     _ensure_rtd_token()
 
-    print("==> [1/5] Full default test suite")
+    print("==> [1/7] Full default test suite")
     c.run("uv run python -m pytest", pty=True)
-    print("==> [2/5] Perf regression gates")
+    print("==> [2/7] Perf regression gates")
     c.run(
         "uv run python -m pytest -p no:xdist -o addopts= -m perf tests/test_perf_regression.py",
         pty=True,
     )
 
-    print(f"==> [3/5] Bumping version files to {version}")
+    print("==> [3/7] Collating changelog fragments")
+    from changelog.fragments import collate
+
+    folded = collate()
+    for p in folded:
+        print(f"    folded {p}")
+
+    print(f"==> [4/7] Bumping version files to {version}")
     _bump_version_files(version)
     c.run("uv lock", pty=True)
 
-    print(f"==> [4/6] Committing + tagging v{version}")
-    c.run("git add pyproject.toml src/secantus/__init__.py uv.lock", pty=True)
+    print(f"==> [5/7] Committing + tagging v{version}")
+    c.run(
+        "git add pyproject.toml src/secantus/__init__.py uv.lock docs/changelog.md changelog.d",
+        pty=True,
+    )
     # If the version is already at ``version`` on HEAD (e.g. because a
     # parallel-session merge bumped it), the ``git add`` stages nothing
     # and ``git commit`` would abort with "nothing to commit". Detect
@@ -1303,7 +1333,7 @@ def release_prepare(c: Context, version: str) -> None:
     # depends on the order of branch-then-tag.
     c.run(f"git push origin main v{version}", pty=True)
 
-    print(f"==> [5/6] Creating GitHub Release v{version}")
+    print(f"==> [6/7] Creating GitHub Release v{version}")
     # Pre-release if the version has an `aN` / `bN` / `rcN` suffix.
     is_prerelease = bool(re.search(r"[abc]\d+$|rc\d+$", version))
     cmd = (
@@ -1321,7 +1351,7 @@ def release_prepare(c: Context, version: str) -> None:
     # than after it. Best-effort: if the RTD API errors here, finalize
     # will retry — better to push the release than to abort prepare
     # over a transient RTD blip.
-    print(f"==> [6/6] Activating RTD `v{version}` slug for early build")
+    print(f"==> [7/7] Activating RTD `v{version}` slug for early build")
     try:
         _activate_rtd_version(version, _ensure_rtd_token())
     except SystemExit as e:
