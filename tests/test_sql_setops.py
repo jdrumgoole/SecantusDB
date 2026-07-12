@@ -146,3 +146,76 @@ def test_arity_mismatch_rejected(storage, session):
     with pytest.raises(SQLError) as ei:
         rows(storage, session, "SELECT n FROM a UNION SELECT _id, n FROM b")
     assert ei.value.sqlstate == "42601"
+
+
+# -- VALUES lists — standalone and as a set-operation arm (b232) -------------- #
+
+
+def test_values_standalone(storage, session):
+    res = run_sql(storage, DB, "VALUES (1, 'a'), (2, 'b')", session=session)[0]
+    assert res.rows == [(1, "a"), (2, "b")]
+    assert [c.name for c in res.columns] == ["column1", "column2"]
+    assert [c.type_tag for c in res.columns] == ["int4", "text"]
+
+
+def test_values_order_by_and_limit(storage, session):
+    assert rows(storage, session, "VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 2") == [(3,), (2,)]
+
+
+def test_values_order_by_output_column_name(storage, session):
+    assert rows(storage, session, "VALUES (3), (1), (2) ORDER BY column1") == [(1,), (2,), (3,)]
+
+
+def test_values_computed_cells(storage, session):
+    # Cells are constant expressions, evaluated with no row scope.
+    assert rows(storage, session, "VALUES (1 + 1, upper('x'))") == [(2, "X")]
+
+
+def test_values_as_union_right_arm(storage, session):
+    assert rows(storage, session, "SELECT n FROM a UNION VALUES (7), (8) ORDER BY 1") == [
+        (1,),
+        (2,),
+        (3,),
+        (7,),
+        (8,),
+    ]
+
+
+def test_values_as_union_left_arm_names_columns(storage, session):
+    # First arm (VALUES) supplies the output column name → column1.
+    res = run_sql(storage, DB, "VALUES (7), (8) UNION SELECT n FROM a ORDER BY 1", session=session)[
+        0
+    ]
+    assert [c.name for c in res.columns] == ["column1"]
+    assert res.rows == [(1,), (2,), (3,), (7,), (8,)]
+
+
+def test_values_union_values(storage, session):
+    assert rows(storage, session, "VALUES (1), (2) UNION VALUES (2), (3) ORDER BY 1") == [
+        (1,),
+        (2,),
+        (3,),
+    ]
+
+
+def test_values_except(storage, session):
+    assert rows(storage, session, "SELECT n FROM a EXCEPT VALUES (2), (3) ORDER BY 1") == [(1,)]
+
+
+def test_values_uneven_width_rejected(storage, session):
+    with pytest.raises(SQLError) as ei:
+        rows(storage, session, "VALUES (1, 2), (3)")
+    assert ei.value.sqlstate == "42601"
+
+
+def test_values_arm_arity_mismatch_rejected(storage, session):
+    with pytest.raises(SQLError) as ei:
+        rows(storage, session, "SELECT n FROM a UNION VALUES (1, 2)")
+    assert ei.value.sqlstate == "42601"
+
+
+def test_values_expression_order_by_rejected(storage, session):
+    # Postgres allows only an ordinal / output-column ORDER BY on a VALUES list.
+    with pytest.raises(SQLError) as ei:
+        rows(storage, session, "VALUES (1), (2) ORDER BY column1 + 1")
+    assert ei.value.sqlstate == "42703"

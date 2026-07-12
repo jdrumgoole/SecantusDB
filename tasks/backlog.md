@@ -2311,9 +2311,17 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   semantics, `ALL` keeps min-count for INTERSECT / left-minus-right for EXCEPT), output columns
   come from the first arm, and a trailing `ORDER BY` (output-column name or ordinal) + `LIMIT`/
   `OFFSET` apply to the combined result. `describe_statement` resolves the result shape from the
-  leftmost arm so the extended protocol's Describe works. Arity mismatch → `42601`. **Limits:** no
-  cross-arm type reconciliation (columns/types taken verbatim from the first arm); `ORDER BY` after
-  a set op only accepts an output column name or ordinal, not an arbitrary expression.
+  leftmost arm so the extended protocol's Describe works. Arity mismatch → `42601`. **`VALUES` lists
+  landed** (b232): `engine._run_values` evaluates a `VALUES (…), (…) [ORDER BY …] [LIMIT …]` constant
+  table (each cell a constant expression via `scalar.evaluate` with `planner._const_scope`; columns
+  named `column1…`/the `AS t(…)` alias, typed from the first non-NULL value per position via
+  `planner._infer_value_tag`; ordinal/output-column `ORDER BY` reuses `_setop_order_limit`). Wired
+  into both `_run_statement` (a standalone `VALUES` query) and `_run_query` (a `VALUES` set-op arm, so
+  `SELECT … UNION VALUES (…)` and `VALUES (…) UNION SELECT …` work). Uneven row widths / a set-op arity
+  mismatch → `42601`. **Limits (both faithful to Postgres):** no cross-arm type reconciliation
+  (columns/types taken verbatim from the first arm); a set-op / `VALUES` `ORDER BY` accepts only an
+  output-column name or ordinal, not an arbitrary expression (`42703`) — Postgres rejects the latter too.
+  (`VALUES` as a FROM-clause derived table is a separate, still-open path.)
 - [ ] **Non-recursive CTEs landed** (b49). `WITH name AS (...) [, ...] <query>` in
   `engine._run_with`: each CTE is materialized to rows (run through `_run_query`) and registered as
   an ephemeral collection on a `CatalogBackend`, with a `_CTECatalog` overlay mapping CTE names to
