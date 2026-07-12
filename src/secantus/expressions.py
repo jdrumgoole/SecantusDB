@@ -857,6 +857,18 @@ def _op_date_to_parts(arg: Any, ctx: _Ctx) -> Any:
         # so the parts read local wall-clock — instant->wall-clock, unambiguous.
         date_aware = date if date.tzinfo is not None else date.replace(tzinfo=_dt.timezone.utc)
         date = date_aware.astimezone(tz)
+    iso8601 = _eval(arg.get("iso8601"), ctx) if "iso8601" in arg else False
+    if iso8601:
+        iso_year, iso_week, iso_dow = date.isocalendar()
+        return {
+            "isoWeekYear": iso_year,
+            "isoWeek": iso_week,
+            "isoDayOfWeek": iso_dow,
+            "hour": date.hour,
+            "minute": date.minute,
+            "second": date.second,
+            "millisecond": date.microsecond // 1000,
+        }
     return {
         "year": date.year,
         "month": date.month,
@@ -1551,6 +1563,49 @@ def _op_minute(arg: Any, ctx: _Ctx) -> Any:
 def _op_second(arg: Any, ctx: _Ctx) -> Any:
     d = _date_operand(arg, ctx)
     return d.second if d is not None else None
+
+
+def _op_millisecond(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.microsecond // 1000 if d is not None else None
+
+
+def _op_day_of_year(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.timetuple().tm_yday if d is not None else None
+
+
+def _us_week(d: _dt.datetime) -> int:
+    """US week number (mongod ``$week``): weeks start Sunday, 0-53; week 0 is the
+    days before the year's first Sunday. Equivalent to ``%U`` (strftime)."""
+    yday = d.timetuple().tm_yday  # 1-366
+    # Weekday of Jan 1 with Sunday=0 .. Saturday=6.
+    jan1_wday_sun0 = (_dt.date(d.year, 1, 1).weekday() + 1) % 7
+    # Days from Jan 1 to the year's first Sunday (0 if Jan 1 is a Sunday).
+    days_to_first_sunday = (7 - jan1_wday_sun0) % 7
+    if yday <= days_to_first_sunday:
+        return 0
+    return (yday - days_to_first_sunday - 1) // 7 + 1
+
+
+def _op_week(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return _us_week(d) if d is not None else None
+
+
+def _op_iso_week(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.isocalendar()[1] if d is not None else None
+
+
+def _op_iso_day_of_week(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.isocalendar()[2] if d is not None else None
+
+
+def _op_iso_week_year(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.isocalendar()[0] if d is not None else None
 
 
 def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
@@ -2358,6 +2413,12 @@ _OPS = {
     "$hour": _op_hour,
     "$minute": _op_minute,
     "$second": _op_second,
+    "$millisecond": _op_millisecond,
+    "$dayOfYear": _op_day_of_year,
+    "$week": _op_week,
+    "$isoWeek": _op_iso_week,
+    "$isoDayOfWeek": _op_iso_day_of_week,
+    "$isoWeekYear": _op_iso_week_year,
     "$dateToString": _op_date_to_string,
     "$dateFromString": _op_date_from_string,
     "$arrayElemAt": _op_array_elem_at,

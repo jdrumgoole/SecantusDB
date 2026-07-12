@@ -753,6 +753,113 @@ def test_date_to_parts() -> None:
     }
 
 
+def test_date_component_extractors_more() -> None:
+    import datetime as dt
+
+    # 2026-03-15 is a Sunday.
+    when = dt.datetime(2026, 3, 15, 10, 30, 45, 123000)
+    doc = {"d": when}
+    assert evaluate({"$dayOfYear": "$d"}, doc) == 74
+    assert evaluate({"$week": "$d"}, doc) == 11
+    assert evaluate({"$isoWeek": "$d"}, doc) == 11
+    assert evaluate({"$isoDayOfWeek": "$d"}, doc) == 7  # Sunday
+    assert evaluate({"$isoWeekYear": "$d"}, doc) == 2026
+    assert evaluate({"$millisecond": "$d"}, doc) == 123
+
+
+def test_day_of_year_boundaries() -> None:
+    import datetime as dt
+
+    assert evaluate({"$dayOfYear": "$d"}, {"d": dt.datetime(2026, 1, 1)}) == 1
+    # 2024 is a leap year.
+    assert evaluate({"$dayOfYear": "$d"}, {"d": dt.datetime(2024, 12, 31)}) == 366
+
+
+def test_us_week_boundaries() -> None:
+    import datetime as dt
+
+    # 2026-01-01 is a Thursday -> before the first Sunday -> week 0.
+    assert evaluate({"$week": "$d"}, {"d": dt.datetime(2026, 1, 1)}) == 0
+    # 2023-01-01 is a Sunday -> that Sunday starts week 1.
+    assert evaluate({"$week": "$d"}, {"d": dt.datetime(2023, 1, 1)}) == 1
+
+
+def test_iso_week_year_boundary() -> None:
+    import datetime as dt
+
+    # 2026-01-01 is a Thursday -> belongs to ISO year 2026, week 1.
+    d0 = dt.datetime(2026, 1, 1)
+    assert evaluate({"$isoWeek": "$d"}, {"d": d0}) == 1
+    assert evaluate({"$isoWeekYear": "$d"}, {"d": d0}) == 2026
+    # 2027-01-01 is a Friday -> belongs to ISO year 2026, week 53.
+    d1 = dt.datetime(2027, 1, 1)
+    assert evaluate({"$isoWeek": "$d"}, {"d": d1}) == 53
+    assert evaluate({"$isoWeekYear": "$d"}, {"d": d1}) == 2026
+    assert evaluate({"$isoDayOfWeek": "$d"}, {"d": d1}) == 5  # Friday
+
+
+def test_date_extractors_with_timezone() -> None:
+    import datetime as dt
+
+    # 2026-03-15T02:00Z. In a -05:00 fixed offset zone this is 2026-03-14 21:00
+    # (previous day), crossing a day boundary.
+    when = dt.datetime(2026, 3, 15, 2, 0, 0, tzinfo=dt.timezone.utc)
+    doc = {"d": when}
+    assert evaluate({"$dayOfMonth": {"date": "$d", "timezone": "-05:00"}}, doc) == 14
+    assert evaluate({"$dayOfYear": {"date": "$d", "timezone": "-05:00"}}, doc) == 73
+    assert evaluate({"$isoDayOfWeek": {"date": "$d", "timezone": "-05:00"}}, doc) == 6  # Saturday
+    # Named IANA zone (America/New_York, EDT -04:00 in March) also shifts to the 14th.
+    assert evaluate({"$dayOfMonth": {"date": "$d", "timezone": "America/New_York"}}, doc) == 14
+    assert evaluate({"$isoWeek": {"date": "$d", "timezone": "America/New_York"}}, doc) == 11
+
+
+def test_date_extractors_null_and_missing() -> None:
+    for op in ("$dayOfYear", "$week", "$isoWeek", "$isoDayOfWeek", "$isoWeekYear", "$millisecond"):
+        assert evaluate({op: "$d"}, {"d": None}) is None
+        assert evaluate({op: "$missing"}, {}) is None
+        # A non-date operand resolves to null (matching the existing extractors).
+        assert evaluate({op: "$d"}, {"d": "not a date"}) is None
+
+
+def test_date_to_parts_iso8601() -> None:
+    import datetime as dt
+
+    when = dt.datetime(2027, 1, 1, 13, 14, 15, 678000)  # Friday -> ISO 2026/W53/5
+    assert evaluate({"$dateToParts": {"date": "$d", "iso8601": True}}, {"d": when}) == {
+        "isoWeekYear": 2026,
+        "isoWeek": 53,
+        "isoDayOfWeek": 5,
+        "hour": 13,
+        "minute": 14,
+        "second": 15,
+        "millisecond": 678,
+    }
+    # iso8601: false is the existing non-ISO shape, unchanged.
+    assert evaluate({"$dateToParts": {"date": "$d", "iso8601": False}}, {"d": when}) == {
+        "year": 2027,
+        "month": 1,
+        "day": 1,
+        "hour": 13,
+        "minute": 14,
+        "second": 15,
+        "millisecond": 678,
+    }
+
+
+def test_date_to_parts_iso8601_with_timezone() -> None:
+    import datetime as dt
+
+    # 2027-01-01T02:00Z -> in -05:00 this is 2026-12-31 21:00 (Thursday) -> ISO 2026/W53/4
+    when = dt.datetime(2027, 1, 1, 2, 0, 0, tzinfo=dt.timezone.utc)
+    out = evaluate(
+        {"$dateToParts": {"date": "$d", "iso8601": True, "timezone": "-05:00"}}, {"d": when}
+    )
+    assert out["isoWeekYear"] == 2026
+    assert out["isoWeek"] == 53
+    assert out["isoDayOfWeek"] == 4  # Thursday
+    assert out["hour"] == 21
+
+
 def test_convert_string_to_int() -> None:
     assert evaluate({"$convert": {"input": "42", "to": "int"}}, {}) == 42
 

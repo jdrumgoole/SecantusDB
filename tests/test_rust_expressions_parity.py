@@ -696,6 +696,38 @@ CURATED = [
     ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True}}, {}),
     ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True, "defaults": [0, 0]}}, {}),
     ({"$zip": {"inputs": "$x"}}, {}),  # missing -> null inputs -> null
+    # New date-component extractors ($dayOfYear/$week/$isoWeek/$isoDayOfWeek/
+    # $isoWeekYear/$millisecond) — bare-date and {date, timezone} forms.
+    ({"$dayOfYear": "$d"}, {"d": _DT}),
+    ({"$week": "$d"}, {"d": _DT}),
+    ({"$isoWeek": "$d"}, {"d": _DT}),
+    ({"$isoDayOfWeek": "$d"}, {"d": _DT}),
+    ({"$isoWeekYear": "$d"}, {"d": _DT}),
+    ({"$millisecond": "$d"}, {"d": _DT}),
+    ({"$millisecond": "$d"}, {"d": _mkdate(_DT.timestamp() * 1000 + 123)}),
+    # Year-boundary cases (Jan 1 Thursday -> US week 0; Jan 1 next year Friday ->
+    # ISO week 53 of the prior ISO year).
+    ({"$week": "$d"}, {"d": datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)}),
+    ({"$isoWeek": "$d"}, {"d": datetime.datetime(2027, 1, 1, tzinfo=datetime.timezone.utc)}),
+    ({"$isoWeekYear": "$d"}, {"d": datetime.datetime(2027, 1, 1, tzinfo=datetime.timezone.utc)}),
+    ({"$dayOfYear": "$d"}, {"d": datetime.datetime(2024, 12, 31, tzinfo=datetime.timezone.utc)}),
+    # {date, timezone} object form — fixed offset and named IANA zone crossing a
+    # day boundary. (Named-zone cases compute on the Rust side via chrono-tz.)
+    ({"$dayOfYear": {"date": "$d", "timezone": "-05:00"}}, {"d": _DT}),
+    ({"$isoDayOfWeek": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),
+    ({"$isoWeek": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),
+    # null / non-date operands -> null (both engines).
+    ({"$isoWeek": "$x"}, {}),
+    ({"$millisecond": "$d"}, {"d": None}),
+    # $dateToParts iso8601 both modes + timezone.
+    ({"$dateToParts": {"date": "$d", "iso8601": True}}, {"d": _DT}),
+    ({"$dateToParts": {"date": "$d", "iso8601": False}}, {"d": _DT}),
+    (
+        {"$dateToParts": {"date": "$d", "iso8601": True}},
+        {"d": datetime.datetime(2027, 1, 1, 2, 0, tzinfo=datetime.timezone.utc)},
+    ),
+    ({"$dateToParts": {"date": "$d", "iso8601": True, "timezone": "-05:00"}}, {"d": _DT}),
+    ({"$dateToParts": {"date": "$d", "iso8601": True, "timezone": "America/New_York"}}, {"d": _DT}),
     # Date arithmetic.
     ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 5}}, {"d": _DT}),
     ({"$dateAdd": {"startDate": "$d", "unit": "month", "amount": 1}}, {"d": _DT}),
@@ -870,7 +902,21 @@ def test_date_extractor_fuzz():
     (negative millis) — against Python's datetime."""
     rng = random.Random(0xDA7E)
     epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-    ops = ["$year", "$month", "$dayOfMonth", "$hour", "$minute", "$second", "$dayOfWeek"]
+    ops = [
+        "$year",
+        "$month",
+        "$dayOfMonth",
+        "$hour",
+        "$minute",
+        "$second",
+        "$millisecond",
+        "$dayOfWeek",
+        "$dayOfYear",
+        "$week",
+        "$isoWeek",
+        "$isoDayOfWeek",
+        "$isoWeekYear",
+    ]
     for _ in range(4000):
         # ~ year 1900 .. 2400 (spans negative/positive millis)
         ms = rng.randint(-2_200_000_000_000, 13_600_000_000_000)

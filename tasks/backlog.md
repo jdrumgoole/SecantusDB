@@ -1495,6 +1495,17 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   index-metadata surface SecantusDB doesn't otherwise model). Found alongside the
   positional-`$` projection fix by the three-way projection differential
   (2026-07-12); the positional `$` operator itself now ships on both servers.
+- [ ] **Date extractors return `null` on a non-date input where mongod errors
+  `16006`** (pre-existing, ALL 13 extractors on both servers). mongod raises
+  `Location16006` ("can't convert from BSON type … to Date") when `$year` / `$month`
+  / `$dayOfMonth` / `$hour` / `$minute` / `$second` / `$dayOfWeek` / `$dayOfYear` /
+  `$week` / `$isoWeek` / `$isoDayOfWeek` / `$isoWeekYear` / `$millisecond` get a
+  non-date, non-null value (a string, an int, …); both SecantusDB servers return
+  `null` instead (via the shared `_date_operand` / `_ensure_datetime` machinery). An
+  explicit `null` input correctly yields `null` on both. Found while adding the six
+  new extractors (2026-07-13) — the new six were kept consistent with the existing
+  seven rather than diverging. Fix all thirteen together in the shared extractor
+  helper.
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
