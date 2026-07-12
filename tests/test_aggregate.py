@@ -20,6 +20,36 @@ def test_push_addtoset_skip_missing_field() -> None:
     assert out3[0]["p"] == []
 
 
+def test_group_merge_objects_accumulator() -> None:
+    """$mergeObjects as a $group accumulator merges each operand doc across the
+    group (later keys override earlier); null/missing operands are skipped; an
+    all-missing/null group yields {}; a non-null non-document operand errors."""
+    docs = [
+        {"g": 1, "sub": {"a": 1, "b": 1}},
+        {"g": 1, "sub": {"b": 2, "c": 3}},  # b overrides, c adds
+        {"g": 1},  # missing -> skipped
+        {"g": 1, "sub": None},  # null -> skipped
+    ]
+    out = apply_pipeline(
+        docs, [{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}]
+    )
+    assert out == [{"_id": 1, "m": {"a": 1, "b": 2, "c": 3}}]
+
+    # A group where every operand is missing/null yields {} (empty doc), present.
+    out2 = apply_pipeline(
+        [{"g": 2}, {"g": 2, "sub": None}],
+        [{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}],
+    )
+    assert out2 == [{"_id": 2, "m": {}}]
+
+    # Non-null, non-document operand is an error (mongod Location 40400).
+    with pytest.raises(AggregateError):
+        apply_pipeline(
+            [{"g": 3, "sub": 5}],
+            [{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}],
+        )
+
+
 def test_group_sum_preserves_int64_type() -> None:
     """$sum over Int64 values stays Int64 (mongod widens int32 < int64),
     not a bare int that narrows to int32 on the wire."""
