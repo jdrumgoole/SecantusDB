@@ -1686,10 +1686,20 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   composite is rooted at **A, not re-rooted at the pivot** — re-rooting an all-INNER join is safe but re-rooting across
   a LEFT join changes the row set, so rooting at A is what makes this sound for **INNER *and* LEFT** composites at any
   pivot (A/B/D). The anti `$match` translates `o2` with `_OnTranslator(new_amap=composite)` (composite columns → their
-  field paths, C columns → `$$` let vars) — a small reusable extension to `_OnTranslator`. **Still `0A000`:** a
-  **4+-table** composite, an outer `ON` spanning *both* tables of a *two*-table composite (b226 restriction; sound
-  under this framing but untested — could relax), a non-adjacent/unqualified composite `ON`, a non-plain-table source,
-  a non-adjacent `RIGHT` `ON`, and a second `FULL` in the tail. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
+  field paths, C columns → `$$` let vars) — a small reusable extension to `_OnTranslator`.
+  **The trailing-composite builders are now unified into one `N`-table builder** (b230): `_build_trailing_composite_pipeline`
+  replaces the four b226–b229 builders (and drops `_nested_composite_lookup` / `_trailing_composite_operands` / the
+  `far_preserve` flag / the drive-from-C 2-table path). It handles a composite of **any** size (`joins[:-1]` are the
+  leading INNER/LEFT joins, `joins[-1]` the trailing RIGHT/FULL) via the b229 main ∪ anti construction: forward main
+  branch (`_emit_composite` loops the leading joins, then C joined INNER for RIGHT / LEFT for FULL), and a `$unionWith`
+  anti branch that rebuilds the same forward composite in a `$lookup` from A and keeps the `$size:0` C rows. Because
+  the composite is only ever built forward from A, the single-pivot restriction is gone — **`o2` may reference C plus
+  any subset of the composite tables** (both the 2-table "spans both" case and 4/5-table composites now work). Routing
+  collapsed to one guard: `all(s in ("","LEFT") for s in sides[:-1]) and sides[-1] in ("RIGHT","FULL")` (with
+  `len==1` still the 2-table base case). The 2-table RIGHT plan now drives from A rather than C — identical rows, and
+  `SELECT *` column order is unchanged (FROM-ordered `amap`). **Still `0A000`:** a composite whose own joins aren't
+  adjacent (each leading `ON` must join its table to an already-known one), an unqualified/`o2`-doesn't-touch-composite
+  ON, a non-plain-table source, a non-adjacent `RIGHT` `ON`, and a second `FULL` in the tail. **`CROSS JOIN` + comma-joins land** (b57): a join with no `ON` (`CROSS JOIN` or the implicit
   `FROM a, b` form) compiles to the cartesian product — an empty `$lookup` pipeline returns every
   foreign doc, then `$unwind` (no preserve) pairs each with the outer row; an outer join without `ON`
   is a `42601`. Non-equi (`a.x < b.y`) and `OR` join conditions already rode the `$lookup` `let`/
