@@ -6963,7 +6963,16 @@ _INT_TAG_ORDER = {"int2": 0, "int4": 1, "int8": 2}
 _NUMERIC_FAMILY = frozenset({"int2", "int4", "int8", "float4", "float8", "numeric"})
 
 
-def _pg_typeof_name(arg: exp.Expression, resolve: Resolve) -> str:
+def _tag_to_regtype(tag: str) -> str:
+    if typemap.is_array_tag(tag):
+        elem = typemap.array_element_tag(tag)
+        return f"{typemap.SQL_TYPE_NAME.get(elem, elem)}[]"
+    return typemap.SQL_TYPE_NAME.get(tag, tag)
+
+
+def _pg_typeof_name(
+    arg: exp.Expression, resolve: Resolve, param_oids: tuple[int, ...] | list[int]
+) -> str:
     """The regtype text ``pg_typeof(arg)`` prints for ``arg``'s static type."""
     # An untyped string literal (and a bare NULL) is the ``unknown`` pseudo-type
     # in Postgres until context types it.
@@ -6971,26 +6980,38 @@ def _pg_typeof_name(arg: exp.Expression, resolve: Resolve) -> str:
         return "unknown"
     if isinstance(arg, exp.Literal) and arg.is_string:
         return "unknown"
-    tag = _infer_scalar_tag(arg, resolve)
-    if typemap.is_array_tag(tag):
-        elem = typemap.array_element_tag(tag)
-        return f"{typemap.SQL_TYPE_NAME.get(elem, elem)}[]"
-    return typemap.SQL_TYPE_NAME.get(tag, tag)
+    # A bare ``$N`` types as the OID the client declared in Parse (psycopg's
+    # ``select pg_typeof(%s)`` sends the value's type there); an undeclared
+    # parameter (OID 0) falls to text, the type Postgres assumes when the call
+    # gives the parameter no other context.
+    if isinstance(arg, exp.Parameter):
+        try:
+            idx = int(arg.name) - 1
+        except (TypeError, ValueError):
+            return "text"
+        oid = param_oids[idx] if 0 <= idx < len(param_oids) else 0
+        return _tag_to_regtype(typemap.OID_TO_TAG.get(oid, "text"))
+    return _tag_to_regtype(_infer_scalar_tag(arg, resolve))
 
 
-def rewrite_pg_typeof(stmt: exp.Expression, table: TableDef | None) -> None:
+def rewrite_pg_typeof(
+    stmt: exp.Expression,
+    table: TableDef | None,
+    param_oids: tuple[int, ...] | list[int] = (),
+) -> None:
     """Replace ``pg_typeof(x)`` calls with their regtype text, in place.
 
     ``pg_typeof`` is *static* — it reports the argument's type without needing
     its value — so it resolves at plan time via the same inference that types
     RowDescription. A call directly in the SELECT list keeps Postgres' output
-    column name (``pg_typeof``)."""
+    column name (``pg_typeof``). For prepared statements the rewrite runs at
+    Parse time so ``$N`` arguments can type from the client's declared OIDs."""
     resolve = table_resolver(table) if table is not None else _const_scope
     for node in list(stmt.find_all(exp.Anonymous)):
         if str(node.this).lower() != "pg_typeof" or not node.expressions:
             continue
         try:
-            name = _pg_typeof_name(node.expressions[0], resolve)
+            name = _pg_typeof_name(node.expressions[0], resolve, param_oids)
         except errors.SQLError:
             continue  # let the normal path surface the real error
         replacement: exp.Expression = exp.Literal.string(name)

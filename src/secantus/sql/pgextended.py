@@ -306,6 +306,16 @@ class ExtendedSession:
             raise errors.syntax_error("cannot insert multiple commands into a prepared statement")
         stmt = stmts[0] if stmts else None
         count = planner.parameter_count(stmt) if stmt is not None else 0
+        if isinstance(stmt, exp.Select):
+            # pg_typeof($N) types from the OIDs the client declares here in
+            # Parse — after Bind substitutes values that information is gone.
+            planner.rewrite_pg_typeof(
+                stmt,
+                engine._pg_typeof_table(
+                    self.storage, self.session.database, self.catalog, stmt.find(exp.Table)
+                ),
+                oids,
+            )
         self.prepared[name] = Prepared(name, stmt, oids, count)
         return pgwire.parse_complete()
 

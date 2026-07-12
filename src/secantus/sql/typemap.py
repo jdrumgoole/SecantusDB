@@ -331,6 +331,10 @@ _ARRAY_PG_OID: dict[str, int] = {
 # RowDescription reports the array type OID for an array column, not the element's.
 PG_OID.update({f"{elem}[]": oid for elem, oid in _ARRAY_PG_OID.items()})
 
+# OID -> tag inverse (built after the array registration so array OIDs resolve;
+# PG_OID has no duplicate OIDs).
+OID_TO_TAG: dict[int, str] = {oid: tag for tag, oid in PG_OID.items()}
+
 
 def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     """Map a parsed SQL ``DataType`` to an internal tag, or None if unknown. An
