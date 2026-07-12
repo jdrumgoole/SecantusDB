@@ -170,13 +170,24 @@ def test_duplicate_without_replace_rejected():
     assert exc.value.sqlstate == "42723"
 
 
-def test_non_sql_language_rejected():
+def test_plpgsql_language_accepted():
+    # LANGUAGE plpgsql is now supported (b234) — see tests/test_sql_plpgsql.py.
+    st, sess = _sess()
+    _run(
+        st,
+        sess,
+        "CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql",
+    )
+    assert _val(st, sess, "SELECT f()") == 1
+
+
+def test_unknown_language_rejected():
     st, sess = _sess()
     with pytest.raises(errors.SQLError) as exc:
         _run(
             st,
             sess,
-            "CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql",
+            "CREATE FUNCTION f() RETURNS int AS $$ return 1 $$ LANGUAGE plpython3u",
         )
     assert exc.value.sqlstate == "0A000"
 

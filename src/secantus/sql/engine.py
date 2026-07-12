@@ -2692,15 +2692,21 @@ def _create_function(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
             if isinstance(prop.this, exp.DataType):
                 return_tag = typemap.type_tag_for_sql(prop.this)
 
-    if language not in ("sql",):
+    if language not in ("sql", "plpgsql"):
         raise errors.feature_not_supported(
-            f"CREATE FUNCTION LANGUAGE {language} is not supported (only LANGUAGE sql)"
+            f"CREATE FUNCTION LANGUAGE {language} is not supported (only LANGUAGE sql / plpgsql)"
         )
 
     body = _function_body_text(stmt.expression).strip()
-    parsed = planner.parse(body)
-    if len(parsed) != 1:
-        raise errors.feature_not_supported("a SQL function body must be a single statement")
+    if language == "plpgsql":
+        # Validate the procedural body up front; the interpreter re-parses at call.
+        from secantus.sql import plpgsql
+
+        plpgsql.parse(body)
+    else:
+        parsed = planner.parse(body)
+        if len(parsed) != 1:
+            raise errors.feature_not_supported("a SQL function body must be a single statement")
 
     if not stmt.args.get("replace") and catalog.function_exists(db, name, nargs):
         raise errors.SQLError("42723", f'function "{name}" already exists with same argument types')

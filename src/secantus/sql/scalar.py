@@ -1861,6 +1861,11 @@ def _invoke_udf(func: dict, args: list[Any], ctx: ScalarContext) -> Any:
     the single-statement body to its scalar result via the subquery machinery."""
     from secantus.sql import planner as _planner
 
+    if func.get("language") == "plpgsql":
+        from secantus.sql import plpgsql
+
+        return plpgsql.invoke(func, args, ctx)
+
     body = _planner.parse(func["body"])[0]
     if not isinstance(body, exp.Select):
         raise errors.feature_not_supported("a SQL function body must be a SELECT")

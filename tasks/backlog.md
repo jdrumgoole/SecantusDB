@@ -2104,9 +2104,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   `where_needs_per_row(..., catalog, db)` + `_where_has_udf`; the evaluated-select column type comes from the UDF's
   `return_tag` (read off the planning `_pipeline_subctx` in `_infer_scalar_tag`). Nesting (a function calling another)
   works. Errors: duplicate `(name, arity)` without OR REPLACE → 42723; DROP of unknown → 42883 (IF EXISTS silences).
-  Tests: `tests/test_sql_functions.py` (17) + a pg8000 wire test. **Simplifications:** `LANGUAGE sql` only, single-
-  statement body; a set-returning (`SETOF`/`TABLE`) function yields only its first row in a scalar context; and
-  functions aren't surfaced through `pg_proc` yet (so `\df` / SQLAlchemy function reflection don't list them).
+  Tests: `tests/test_sql_functions.py` (17) + a pg8000 wire test. **`LANGUAGE plpgsql` scalar bodies landed**
+  (b234): a compact procedural interpreter in `secantus/sql/plpgsql.py` (own tokeniser + recursive-descent parser
+  + tree-walking `_Runner`) runs the scalar subset — `[DECLARE …] BEGIN … END` (nestable), assignment (`:=` / `=`),
+  `IF … ELSIF … ELSE … END IF`, `RETURN [expr]` / `RETURN NULL`, `SELECT … INTO var[, …]`, `PERFORM`, and bare
+  `INSERT`/`UPDATE`/`DELETE`. `engine._create_function` validates the body via `plpgsql.parse` at CREATE and stores
+  the raw text; `scalar._invoke_udf` dispatches on `func["language"]` to `plpgsql.invoke`. Expressions eval through
+  `scalar.evaluate` with a scope that resolves declared vars / params (positional `$N` pre-substituted); embedded SQL
+  statements inline vars/params as literals and run through `engine.run_inner_select` / `_run_statement`. `IF` treats
+  NULL as false; declared type tags drive an optional assignment/return coercion. Tests: `tests/test_sql_plpgsql.py`
+  (14). **Out of scope (0A000 at CREATE):** loops (`LOOP`/`WHILE`/`FOR`), `RAISE`, `RETURN QUERY`/`NEXT`
+  (set-returning), `CASE` statements, cursors, `EXCEPTION` handlers, dynamic `EXECUTE`; block-scoped variable
+  shadowing isn't modeled (flat env); embedded-SQL literal inlining stringifies date/Decimal params (`_value_to_node`
+  limitation). **Still simplifications:** a *multi-statement* `LANGUAGE sql` body is still rejected (deferred — the
+  other flagged site at `engine._create_function`); a set-returning (`SETOF`/`TABLE`) function yields only its first
+  row in a scalar context.
 - [ ] **Arrays of the new types + array ops landed** (b161): two parts. (1) **Array type OIDs** — `typemap._ARRAY_PG_OID`
   gains the real Postgres array-type OIDs for the newer element types (`uuid[]` 2951, `inet[]`/`cidr[]`/`macaddr[]`,
   `date[]`/`time[]`/`timetz[]`, `interval[]`, `bit[]`/`varbit[]`, `money[]`, `xml[]`, `json[]`→jsonb 3807, the
