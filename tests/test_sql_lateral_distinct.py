@@ -148,13 +148,49 @@ def test_lateral_top_2_per_group(storage, session):
     ) == [("a", 40), ("a", 10), ("b", 30), ("b", 20)]
 
 
-def test_lateral_aggregate_subquery_rejected(storage, session):
-    with pytest.raises(errors.SQLError):
-        rows(
-            storage,
-            session,
-            "SELECT * FROM t CROSS JOIN LATERAL (SELECT sum(val) FROM u WHERE u.tid = t.id) s",
-        )
+# -- Rich LATERAL: correlated aggregate / GROUP BY / DISTINCT inside (b233) --- #
+
+
+def test_lateral_correlated_count_per_group(storage, session):
+    # A correlated scalar-aggregate subquery yields exactly one row per outer
+    # row (0 for the empty group, so t=c survives with count 0).
+    assert rows(
+        storage,
+        session,
+        "SELECT t.name, s.c FROM t CROSS JOIN LATERAL "
+        "(SELECT count(*) AS c FROM u WHERE u.tid = t.id) s ORDER BY t.name",
+    ) == [("a", 2), ("b", 3), ("c", 0)]
+
+
+def test_lateral_correlated_sum_left(storage, session):
+    # sum() over the empty group is NULL; LEFT keeps t=c with a NULL total.
+    assert rows(
+        storage,
+        session,
+        "SELECT t.name, s.total FROM t LEFT JOIN LATERAL "
+        "(SELECT sum(val) AS total FROM u WHERE u.tid = t.id) s ON true ORDER BY t.name",
+    ) == [("a", 50), ("b", 55), ("c", None)]
+
+
+def test_lateral_distinct_inside(storage, session):
+    # DISTINCT inside the correlated subquery — one row per distinct val.
+    assert rows(
+        storage,
+        session,
+        "SELECT t.name, s.val FROM t CROSS JOIN LATERAL "
+        "(SELECT DISTINCT val FROM u WHERE u.tid = t.id) s ORDER BY t.name, s.val",
+    ) == [("a", 10), ("a", 40), ("b", 5), ("b", 20), ("b", 30)]
+
+
+def test_lateral_group_by_inside(storage, session):
+    # GROUP BY inside the correlated subquery, expanded per outer row.
+    assert rows(
+        storage,
+        session,
+        "SELECT t.name, s.val, s.c FROM t CROSS JOIN LATERAL "
+        "(SELECT val, count(*) AS c FROM u WHERE u.tid = t.id GROUP BY val) s "
+        "ORDER BY t.name, s.val",
+    ) == [("a", 10, 1), ("a", 40, 1), ("b", 5, 1), ("b", 20, 1), ("b", 30, 1)]
 
 
 def test_lateral_on_condition_rejected(storage, session):

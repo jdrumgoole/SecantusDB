@@ -3050,10 +3050,22 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   LATERAL` / `JOIN LATERAL … ON true` / `LEFT JOIN LATERAL … ON true`) lowers a single-table correlated
   subquery to a `$lookup` (`let` outer bindings + sub-`pipeline` with a `$match {$expr}` correlation via
   the existing `_OnTranslator`, optional `$sort`/`$limit` for top-N, `$project`) + `$unwind`
-  (`planner._lateral_stage`, dispatched in `_build_join_pipeline`'s join loop). **Limitations:** the
-  `LATERAL` subquery must be single-table (no join / GROUP BY / aggregate / scalar-fn subquery →
-  `feature_not_supported`); `JOIN LATERAL` with a non-`TRUE` ON is rejected (correlate in the subquery
-  WHERE); `DISTINCT ON` doesn't enforce Postgres' "ORDER BY must start with the DISTINCT ON exprs" rule
+  (`planner._lateral_stage`, dispatched in `_build_join_pipeline`'s join loop). **Rich `LATERAL`
+  subqueries landed** (b233): a subquery containing a join / `GROUP BY` / `HAVING` / `DISTINCT` /
+  bare aggregate no longer errors — it's evaluated per outer row instead of lowered to a `$lookup`.
+  The planner collects such laterals via the `_lateral_collect` ContextVar (set for the span of
+  `_build_join_pipeline`), forces the evaluated path, and stashes them on `EvaluatedSelectPlan.lateral_joins`
+  as `LateralJoin(alias, tdef, select, side, inner_aliases)` where `select` is the *un-substituted*
+  correlated AST. At execution `executor._expand_lateral` binds each outer column ref to that row's value
+  (`planner._substitute_outer_columns` rewrites the refs to literals), runs the now-uncorrelated inner
+  query via `engine.run_inner_select`, and cross-joins its rows onto the outer row; `INNER`/`CROSS`
+  drops an outer row with no lateral rows, `LEFT` null-pads it. **Limitations:** `JOIN LATERAL` with a
+  non-`TRUE` ON is still rejected (correlate in the subquery WHERE); a rich lateral encountered outside a
+  join-pipeline context (ContextVar unset) raises `0A000`. A bare scalar aggregate over an empty group
+  in an `INNER`/`CROSS` lateral drops the outer row rather than keeping it with a NULL — a consequence
+  of the pre-existing "whole-table aggregate over an empty table returns no row (except `count`)" gap
+  (see §aggregate note above); `count`-style aggregates and `LEFT JOIN LATERAL` are unaffected.
+  `DISTINCT ON` doesn't enforce Postgres' "ORDER BY must start with the DISTINCT ON exprs" rule
   (lenient — keeps whatever the sort order gives).
 - [ ] **`GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` landed** (b83, single-table). Enumerated grouping
   sets (`planner._grouping_sets`: ROLLUP → prefixes, CUBE → all subsets, explicit GROUPING SETS as
