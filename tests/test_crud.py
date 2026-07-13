@@ -86,6 +86,34 @@ def test_find_with_dotted_path(coll) -> None:
     assert found[0]["name"] == "a"
 
 
+def test_range_operators_are_type_bracketed(coll) -> None:
+    """mongod's $gt/$lt/$gte/$lte are type-bracketed: a scalar bound never matches
+    a value of a different type bracket. Verified against real mongod (2026-07-13):
+    a document-valued field no-matches a numeric bound (rather than erroring), and
+    bool is its own bracket — a bool field never matches a numeric bound and vice
+    versa, but bool-vs-bool compares (True > False)."""
+    coll.insert_many(
+        [
+            {"_id": 1, "a": 5},
+            {"_id": 2, "a": True},
+            {"_id": 3, "a": False},
+            {"_id": 4, "a": {"x": 1}},
+            {"_id": 5, "a": [1, 2, 3]},
+            {"_id": 6, "items": [{"k": 1}, {"k": 2}]},
+        ]
+    )
+    # Document-valued field vs a numeric bound: no match, no error.
+    assert [d["_id"] for d in coll.find({"a": {"$gt": 2}})] == [1, 5]  # 5, and [1,2,3] via multikey
+    # $elemMatch: {$gt: n} over an array of sub-documents: clean no-match.
+    assert list(coll.find({"items": {"$elemMatch": {"$gt": 2}}})) == []
+    # bool is its own bracket: a bool field never matches a numeric range bound.
+    assert [d["_id"] for d in coll.find({"a": {"$lt": 2}})] == [5]  # only [1,2,3] via elem 1<2
+    assert [d["_id"] for d in coll.find({"a": {"$gt": 0}})] == [1, 5]
+    # bool-vs-bool still compares.
+    assert [d["_id"] for d in coll.find({"a": {"$gt": False}})] == [2]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$gte": False}})) == [2, 3]
+
+
 def test_update_one_with_set(coll) -> None:
     coll.insert_one({"_id": 1, "n": 5})
     result = coll.update_one({"_id": 1}, {"$set": {"n": 99}})

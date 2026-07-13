@@ -545,24 +545,16 @@ fn compare_values(
     b: &Bson,
     coll: Option<&Collation>,
 ) -> Result<Option<Ordering>, Fallback> {
-    // Python compares bool as its int value (bool is an int subclass): bool vs
-    // int / long / double compares numerically; bool vs any other type — incl.
-    // Decimal128 — makes `op(bool, other)` raise `TypeError`, i.e. no match. (A
-    // bool operand is 0 or 1, so an `f64` compare is exact even against a large
-    // int, whose magnitude is unambiguously != 0/1.)
+    // MongoDB ranks bool as its own type bracket: under range operators a bool
+    // compares only with another bool, never with a number or any other type
+    // (verified against mongod — `{a: {$gt: 0}}` skips a bool-valued `a`). A bool
+    // operand therefore yields an ordering only when BOTH sides are bool; against
+    // anything else it's not comparable (no match), mirroring Python's matcher,
+    // whose bool-vs-non-bool range compare is guarded to no-match.
     if matches!(a, Bson::Boolean(_)) || matches!(b, Bson::Boolean(_)) {
-        fn num_f(v: &Bson) -> Option<f64> {
-            match v {
-                Bson::Boolean(x) => Some(*x as i64 as f64),
-                Bson::Int32(n) => Some(*n as f64),
-                Bson::Int64(n) => Some(*n as f64),
-                Bson::Double(d) => Some(*d),
-                _ => None,
-            }
-        }
-        return Ok(match (num_f(a), num_f(b)) {
-            (Some(x), Some(y)) => x.partial_cmp(&y), // NaN -> None (Python nan compares False)
-            _ => None,                               // bool vs non-numeric -> no match
+        return Ok(match (a, b) {
+            (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
+            _ => None,
         });
     }
     if let (Some(na), Some(nb)) = (numeric::classify(a), numeric::classify(b)) {
@@ -572,11 +564,20 @@ fn compare_values(
     if let (Some(c), Bson::String(x), Bson::String(y)) = (coll, a, b) {
         return Ok(Some(collation::compare(x, y, c).ok_or(Fallback)?));
     }
-    if matches!(a, Bson::Array(_) | Bson::Document(_))
-        || matches!(b, Bson::Array(_) | Bson::Document(_))
-        || is_exotic(a)
-        || is_exotic(b)
-    {
+    // A document operand: Python's `<` on dicts raises TypeError — i.e. no match —
+    // and mongod's range operators ($gt/$lt/…) are type-bracketed, so a
+    // document-valued field never satisfies a scalar bound (and a document bound
+    // never matches a scalar field). Return None (no-match) rather than deferring:
+    // this is what lets `$elemMatch: {$gt: n}` over an array of sub-documents, or a
+    // plain `{a: {$gt: n}}` against a document-valued `a`, no-match cleanly on the
+    // Rust server instead of erroring on an otherwise-fine cross-type query.
+    if matches!(a, Bson::Document(_)) || matches!(b, Bson::Document(_)) {
+        return Ok(None);
+    }
+    // Structural array ordering (Python compares lists element-wise/lexicographically)
+    // and the exotic BSON types (JS code, symbol, dbpointer, undefined) aren't
+    // reproduced here — defer to the Python oracle.
+    if matches!(a, Bson::Array(_)) || matches!(b, Bson::Array(_)) || is_exotic(a) || is_exotic(b) {
         return Err(Fallback);
     }
     Ok(match (a, b) {
@@ -1267,6 +1268,22 @@ mod tests {
     }
 
     #[test]
+    fn bool_is_its_own_range_bracket() {
+        // Under range operators bool compares only with bool (mongod brackets
+        // bool away from numbers). A bool field never matches a numeric bound,
+        // and a numeric field never matches a bool bound.
+        assert!(!m(doc! {"x": true}, doc! {"x": {"$gt": 0}}));
+        assert!(!m(doc! {"x": true}, doc! {"x": {"$lt": 2}}));
+        assert!(!m(doc! {"x": false}, doc! {"x": {"$gte": 0}}));
+        assert!(!m(doc! {"x": 5}, doc! {"x": {"$gt": false}}));
+        assert!(!m(doc! {"x": 0}, doc! {"x": {"$lt": true}}));
+        // bool-vs-bool still compares (True > False, False >= False).
+        assert!(m(doc! {"x": true}, doc! {"x": {"$gt": false}}));
+        assert!(m(doc! {"x": false}, doc! {"x": {"$gte": false}}));
+        assert!(!m(doc! {"x": false}, doc! {"x": {"$gt": false}}));
+    }
+
+    #[test]
     fn expr_now_handled() {
         // $expr with supported operators is handled in Rust now (was a fallback).
         assert!(m(
@@ -1276,6 +1293,31 @@ mod tests {
         assert!(!m(
             doc! {"a": 1, "b": 3},
             doc! {"$expr": {"$gt": ["$a", "$b"]}}
+        ));
+    }
+
+    #[test]
+    fn range_against_document_no_matches() {
+        // mongod's range operators are type-bracketed: a document-valued field
+        // never satisfies a scalar bound, and a document bound never matches a
+        // scalar field. Python's native `<` on dicts raises TypeError (no match);
+        // the Rust matcher mirrors that with a clean no-match rather than a
+        // Fallback — so these evaluate here instead of deferring / erroring.
+        assert!(!m(doc! {"a": {"x": 1}}, doc! {"a": {"$gt": 2}}));
+        assert!(!m(doc! {"a": {"x": 1}}, doc! {"a": {"$lt": 2}}));
+        assert!(!m(doc! {"a": 2}, doc! {"a": {"$gt": {"x": 1}}}));
+        assert!(!m(doc! {"a": {"x": 2}}, doc! {"a": {"$gt": {"x": 1}}}));
+        // The differential case: $elemMatch: {$gt: n} over an array of
+        // sub-documents. Each element is a document, so every element no-matches
+        // the scalar bound — the whole predicate is false, not an error.
+        assert!(!m(
+            doc! {"items": [{"k": 1}, {"k": 2}]},
+            doc! {"items": {"$elemMatch": {"$gt": 2}}}
+        ));
+        // Sanity: a scalar-array element still matches via the multikey path.
+        assert!(m(
+            doc! {"items": [1, 2, 3]},
+            doc! {"items": {"$elemMatch": {"$gt": 2}}}
         ));
     }
 
