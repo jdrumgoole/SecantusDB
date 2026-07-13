@@ -1208,6 +1208,14 @@ def _is_bit_expr(node: exp.Expression) -> bool:
 
 def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
+    # ``'int4'::regtype`` — normalize the type name to its canonical pretty
+    # spelling so it compares equal to what ``pg_typeof`` prints.
+    if (
+        value is not None
+        and isinstance(node.to, exp.ObjectIdentifier)
+        and str(node.to.this).upper() == "REGTYPE"
+    ):
+        return typemap.normalize_regtype(str(value))
     # ``'[1,10)'::int4range`` — parse a range text literal into its subdocument.
     to = node.to.sql(dialect="postgres").lower().strip() if node.to is not None else ""
     # ``'1 day'::interval`` — parse an interval literal (a subdoc passes through).
@@ -1288,12 +1296,12 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     if (
         value is not None
         and _is_bit_expr(node.this)
-        and to_tag in ("int4", "int8", "numeric", "float8")
+        and to_tag in ("int2", "int4", "int8", "numeric", "float4", "float8")
     ):
         from secantus.sql import bitstr as _bitstr
 
         n = _bitstr.to_int(str(value))
-        return float(n) if to_tag == "float8" else n
+        return float(n) if to_tag in ("float4", "float8") else n
     # Otherwise we don't model regclass/oid identity types; evaluating the inner
     # value is enough for the catalog queries that use casts (compared / discarded,
     # never round-tripped through a real type).

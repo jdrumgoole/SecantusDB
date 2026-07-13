@@ -33,8 +33,10 @@ PG_OID: dict[str, int] = {
     "bool": 16,
     "bytea": 17,
     "int8": 20,
+    "int2": 21,
     "int4": 23,
     "text": 25,
+    "float4": 700,
     "float8": 701,
     "timestamptz": 1184,
     "timestamp": 1114,  # naive "timestamp without time zone"
@@ -133,8 +135,10 @@ _MULTIRANGE_TAGS = frozenset(
 # Internal type tag -> SQL type name (for information_schema.columns.data_type
 # and any place a human-facing type spelling is needed).
 SQL_TYPE_NAME: dict[str, str] = {
+    "int2": "smallint",
     "int4": "integer",
     "int8": "bigint",
+    "float4": "real",
     "float8": "double precision",
     "numeric": "numeric",
     "text": "text",
@@ -164,8 +168,10 @@ SQL_TYPE_NAME: dict[str, str] = {
 
 # Internal type tag -> Postgres pg_type.typname (for pg_catalog.pg_type rows).
 PG_TYPENAME: dict[str, str] = {
+    "int2": "int2",
     "int4": "int4",
     "int8": "int8",
+    "float4": "float4",
     "float8": "float8",
     "numeric": "numeric",
     "text": "text",
@@ -191,15 +197,51 @@ PG_TYPENAME: dict[str, str] = {
     **{t: t for t in _GEO_TAGS},
 }
 
+# SQL type spelling -> internal tag, for ``'name'::regtype`` normalization. Both
+# the internal (``int2``) and pretty (``smallint``) spellings resolve, plus the
+# common aliases Postgres accepts.
+_REGTYPE_SPELLINGS: dict[str, str] = {
+    **{name: tag for tag, name in PG_TYPENAME.items()},
+    **{name: tag for tag, name in SQL_TYPE_NAME.items()},
+    "int": "int4",
+    "serial": "int4",
+    "bigserial": "int8",
+    "smallserial": "int2",
+    "float": "float8",
+    "decimal": "numeric",
+    "varchar": "text",
+    "character varying": "text",
+    "char": "text",
+    "character": "text",
+    "bpchar": "text",
+    "json": "json",
+    "timestamptz": "timestamptz",
+    "timetz": "timetz",
+}
+
+
+def normalize_regtype(name: str) -> str:
+    """Render a type name the way ``'name'::regtype`` prints in Postgres —
+    normalized to the canonical pretty spelling (``'int4'`` -> ``integer``).
+    Unknown names pass through unchanged (we don't model every catalog type)."""
+    text = " ".join(str(name).strip().lower().split())
+    if text.endswith("[]"):
+        elem = normalize_regtype(text[:-2])
+        return f"{elem}[]"
+    base = text.split("(", 1)[0].strip()
+    tag = _REGTYPE_SPELLINGS.get(base)
+    return SQL_TYPE_NAME.get(tag, tag) if tag is not None else text
+
+
 # sqlglot DataType.Type -> our type tag. Several SQL spellings collapse onto one
 # tag (varchar/char -> text; double/float -> float8) the way Postgres widens
 # them for storage purposes here.
 _DATATYPE_TAGS: dict[Any, str] = {
     exp.DataType.Type.BIGINT: "int8",
     exp.DataType.Type.INT: "int4",
-    exp.DataType.Type.SMALLINT: "int4",
-    exp.DataType.Type.TINYINT: "int4",
-    exp.DataType.Type.FLOAT: "float8",
+    exp.DataType.Type.SMALLINT: "int2",
+    exp.DataType.Type.TINYINT: "int2",
+    exp.DataType.Type.FLOAT: "float4",
     exp.DataType.Type.DOUBLE: "float8",
     exp.DataType.Type.DECIMAL: "numeric",
     exp.DataType.Type.BIGDECIMAL: "numeric",
@@ -236,8 +278,10 @@ _DATATYPE_TAGS: dict[Any, str] = {
 _ARRAY_PG_OID: dict[str, int] = {
     "bool": 1000,
     "int8": 1016,
+    "int2": 1005,
     "int4": 1007,
     "text": 1009,
+    "float4": 1021,
     "float8": 1022,
     "numeric": 1231,
     "timestamptz": 1185,
@@ -286,6 +330,10 @@ _ARRAY_PG_OID: dict[str, int] = {
 # Register the array tags (``text[]`` -> 1009, ...) in PG_OID so the wire layer's
 # RowDescription reports the array type OID for an array column, not the element's.
 PG_OID.update({f"{elem}[]": oid for elem, oid in _ARRAY_PG_OID.items()})
+
+# OID -> tag inverse (built after the array registration so array OIDs resolve;
+# PG_OID has no duplicate OIDs).
+OID_TO_TAG: dict[int, str] = {oid: tag for tag, oid in PG_OID.items()}
 
 
 def type_tag_for_sql(datatype: exp.DataType) -> str | None:
@@ -475,11 +523,11 @@ def coerce(value: Any, tag: str) -> Any:
         from secantus.sql import xmltype as _xmltype
 
         return _xmltype.parse(value)
-    if tag == "int4":
+    if tag in ("int2", "int4"):
         return int(value)
     if tag == "int8":
         return bson.Int64(int(value))
-    if tag == "float8":
+    if tag in ("float4", "float8"):
         return float(value)
     if tag == "numeric":
         return bson.Decimal128(value if isinstance(value, Decimal) else Decimal(str(value)))
