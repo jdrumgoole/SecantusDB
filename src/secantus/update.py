@@ -10,7 +10,9 @@ from secantus.paths import get_path, has_path, set_path, unset_path
 
 
 class UpdateError(Exception):
-    pass
+    def __init__(self, message: str, *, code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # The update modifiers ``_apply_op`` knows how to apply. Used by
@@ -412,9 +414,21 @@ def _apply_op(
     elif op == "$inc":
         for path, delta in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                current = get_path(doc, concrete, default=0)
-                if current is None:
-                    current = 0
+                # A missing field is treated as 0 (mongod applies the delta),
+                # but a field present with an explicit ``null`` (or any other
+                # non-numeric value) is a TypeMismatch (code 14) — the field
+                # exists and is not numeric, so mongod refuses to coerce it.
+                if not has_path(doc, concrete):
+                    current: Any = 0
+                else:
+                    current = get_path(doc, concrete)
+                    if current is None:
+                        raise UpdateError(
+                            f"Cannot apply $inc to a value of non-numeric type. "
+                            f"{{{concrete}}} has the field '{concrete.split('.')[-1]}' "
+                            f"of non-numeric type null",
+                            code=14,
+                        )
                 # bson_add preserves the BSON numeric type (mongod widens
                 # int32 < int64 < double < decimal128) — Int64(5) + 3 → Int64(8),
                 # not a bare int that narrows to int32 on the wire.
@@ -422,9 +436,17 @@ def _apply_op(
     elif op == "$mul":
         for path, factor in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                current = get_path(doc, concrete, default=0)
-                if current is None:
+                if not has_path(doc, concrete):
                     current = 0
+                else:
+                    current = get_path(doc, concrete)
+                    if current is None:
+                        raise UpdateError(
+                            f"Cannot apply $mul to a value of non-numeric type. "
+                            f"{{{concrete}}} has the field '{concrete.split('.')[-1]}' "
+                            f"of non-numeric type null",
+                            code=14,
+                        )
                 set_path(doc, concrete, bson_mul(current, factor))
     elif op == "$min":
         for path, value in payload.items():

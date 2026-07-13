@@ -70,6 +70,13 @@ CURATED = [
     ({"a": 2}, {"$mul": {"a": 3}}, False),
     ({"a": 2}, {"$mul": {"a": 1.5}}, False),
     ({}, {"$mul": {"a": 4}}, False),
+    # $inc / $mul on an *absent* field -> treat as 0 and apply (Rust computes).
+    ({"other": 1}, {"$inc": {"n": 5}}, False),
+    ({"other": 1}, {"$mul": {"n": 5}}, False),
+    # $inc / $mul on an *explicit-null* field -> Rust defers so the pure-Python
+    # engine raises TypeMismatch (code 14). rust returns None => no-assert skip.
+    ({"n": None}, {"$inc": {"n": 5}}, False),
+    ({"n": None}, {"$mul": {"n": 5}}, False),
     ({"b": 1}, {"$bit": {"b": {"and": 0}}}, False),
     ({"b": 5}, {"$bit": {"b": {"or": 2}}}, False),
     ({"b": 6}, {"$bit": {"b": {"xor": 3}}}, False),

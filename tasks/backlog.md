@@ -1478,11 +1478,6 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   between 'str' and 'int'` at `_apply_op`'s `value > current`) rather than a clean
   error — it must at minimum be caught (don't leak tracebacks to the wire), and
   ideally routed through the same BSON-order comparator a cross-type fix would add.
-- [ ] **`$inc` / `$mul` on an explicit-null field** — mongod rejects it
-  (`Cannot apply $inc to a value of non-numeric type`, code 14); both servers treat
-  the null as 0 and apply the operation (too lenient). Found by the three-way update
-  differential (2026-07-12). Clean fix on both engines (reject a non-numeric,
-  non-missing current value).
 - [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
   servers).**
   **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but
