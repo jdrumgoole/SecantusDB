@@ -1500,6 +1500,17 @@ def _ensure_datetime(value: Any) -> _dt.datetime | None:
     return None
 
 
+def _coerce_extractor_date(value: Any) -> _dt.datetime | None:
+    """A date-extractor operand (`$year`/`$dayOfYear`/…) must be a Date, null, or a
+    missing field. mongod raises ``Location16006`` on any other present value (a
+    string, a number, …); null / missing yield null."""
+    if isinstance(value, _dt.datetime):
+        return value
+    if value is None:
+        return None
+    raise ExpressionError(f"can't convert from BSON type {_type_name(value)} to Date", code=16006)
+
+
 def _date_operand(arg: Any, ctx: _Ctx) -> _dt.datetime | None:
     """Resolve a date-extractor operand (`$year`/`$hour`/…) to a `datetime` or
     `None`. mongod accepts two forms:
@@ -1519,7 +1530,7 @@ def _date_operand(arg: Any, ctx: _Ctx) -> _dt.datetime | None:
         and "date" in arg
         and not (len(arg) == 1 and next(iter(arg)).startswith("$"))
     ):
-        d = _ensure_datetime(_eval(arg["date"], ctx))
+        d = _coerce_extractor_date(_eval(arg["date"], ctx))
         if d is None:
             return None
         tz = _resolve_timezone(arg.get("timezone"))
@@ -1527,7 +1538,7 @@ def _date_operand(arg: Any, ctx: _Ctx) -> _dt.datetime | None:
             d_aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
             d = d_aware.astimezone(tz)
         return d
-    return _ensure_datetime(_eval(arg, ctx))
+    return _coerce_extractor_date(_eval(arg, ctx))
 
 
 def _op_year(arg: Any, ctx: _Ctx) -> Any:

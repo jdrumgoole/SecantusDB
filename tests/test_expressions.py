@@ -814,11 +814,28 @@ def test_date_extractors_with_timezone() -> None:
 
 
 def test_date_extractors_null_and_missing() -> None:
-    for op in ("$dayOfYear", "$week", "$isoWeek", "$isoDayOfWeek", "$isoWeekYear", "$millisecond"):
+    # All 13 extractors: null / missing -> null; a non-date value -> Location16006.
+    for op in (
+        "$year",
+        "$month",
+        "$dayOfMonth",
+        "$hour",
+        "$minute",
+        "$second",
+        "$dayOfWeek",
+        "$dayOfYear",
+        "$week",
+        "$isoWeek",
+        "$isoDayOfWeek",
+        "$isoWeekYear",
+        "$millisecond",
+    ):
         assert evaluate({op: "$d"}, {"d": None}) is None
         assert evaluate({op: "$missing"}, {}) is None
-        # A non-date operand resolves to null (matching the existing extractors).
-        assert evaluate({op: "$d"}, {"d": "not a date"}) is None
+        for bad in ("not a date", 5):
+            with pytest.raises(ExpressionError) as exc:
+                evaluate({op: "$d"}, {"d": bad})
+            assert exc.value.code == 16006
 
 
 def test_date_to_parts_iso8601() -> None:

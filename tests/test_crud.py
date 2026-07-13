@@ -949,6 +949,21 @@ def test_aggregate_date_component_extractors(coll) -> None:
     assert out[2]["tz_doy"] == 73  # shifted to the 14th (day-of-year 73)
 
 
+def test_aggregate_date_extractor_non_date_errors(coll) -> None:
+    """A date extractor on a non-date value errors (mongod Location16006); null
+    and a missing field yield null."""
+    coll.insert_one({"_id": 1, "s": "not a date", "z": None})
+    for op in ("$year", "$dayOfYear", "$isoWeek", "$millisecond"):
+        with pytest.raises(pymongo.errors.OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: "$s"}}}]))
+        assert exc.value.code == 16006
+        # null / missing -> null (not an error).
+        out = list(coll.aggregate([{"$project": {"_id": 0, "r": {op: "$z"}}}]))
+        assert out == [{"r": None}]
+        out2 = list(coll.aggregate([{"$project": {"_id": 0, "r": {op: "$nope"}}}]))
+        assert out2 == [{"r": None}]
+
+
 def test_aggregate_date_to_parts_iso8601(coll) -> None:
     # 2027-01-01 (Friday) belongs to ISO year 2026, week 53.
     coll.insert_one({"_id": 1, "d": dt.datetime(2027, 1, 1, 13, 14, 15, 678000)})
