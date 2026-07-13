@@ -1615,7 +1615,9 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 /// Resolve a date-extractor operand (`$year`/`$hour`/…) to epoch millis **already
 /// shifted into the requested timezone** (so a component read off it is local
-/// wall-clock), or `None` when the operand isn't a datetime (→ `Bson::Null`).
+/// wall-clock). `Ok(None)` for a null / missing operand (→ `Bson::Null`); a
+/// present non-date operand (a string, a number, …) returns `Err(Fallback)` so the
+/// Python oracle raises mongod's `Location16006` ("can't convert … to Date").
 ///
 /// mongod accepts a bare date expression *or* a `{date, timezone}` object; the
 /// object form is a document with a `date` key that isn't itself an operator
@@ -1630,7 +1632,8 @@ fn date_operand_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
         if d.contains_key("date") && !is_operator {
             let millis = match eval(d.get("date").unwrap(), ctx)? {
                 Bson::DateTime(dt) => dt.timestamp_millis(),
-                _ => return Ok(None), // non-datetime -> None (null)
+                Bson::Null => return Ok(None), // null / missing -> null
+                _ => return Err(Fallback),     // non-date -> Python raises Location16006
             };
             let offset_ms = timezone_offset_ms(d.get("timezone"), millis)?;
             return Ok(Some(millis + offset_ms));
@@ -1638,13 +1641,14 @@ fn date_operand_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
     }
     match eval(arg, ctx)? {
         Bson::DateTime(dt) => Ok(Some(dt.timestamp_millis())),
-        _ => Ok(None), // Python returns None for non-datetime
+        Bson::Null => Ok(None), // null / missing -> null
+        _ => Err(Fallback),     // non-date -> Python raises Location16006
     }
 }
 
 fn date_part(arg: &Bson, ctx: &Ctx, part: DatePart) -> R {
     let Some(millis) = date_operand_millis(arg, ctx)? else {
-        return Ok(Bson::Null); // Python returns None for non-datetime
+        return Ok(Bson::Null); // null / missing operand -> null
     };
     let days = millis.div_euclid(86_400_000);
     let ms_of_day = millis.rem_euclid(86_400_000);
