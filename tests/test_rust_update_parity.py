@@ -110,16 +110,21 @@ CURATED = [
     ({"n": 5}, {"$set": {"n": 5}, "$inc": {"m": 1}}, False),
     ({}, {}, False),  # empty update
     ({"a": 1}, {"b": 2, "c": [1, 2, {"d": 3}]}, False),  # replacement, no _id
-    # $min / $max — numeric compare, absent/null treated as no-current, bool-as-int.
+    # $min / $max — BSON cross-type order; missing set, explicit-null compared.
     ({"a": 5}, {"$min": {"a": 3}}, False),  # 3 < 5 -> 3
     ({"a": 5}, {"$min": {"a": 7}}, False),  # no change
     ({}, {"$min": {"a": 4}}, False),  # absent -> set
-    ({"a": None}, {"$max": {"a": 9}}, False),  # null -> set
+    ({"a": None}, {"$max": {"a": 9}}, False),  # 9 > null -> set
+    ({"a": None}, {"$min": {"a": 9}}, False),  # null < 9 -> keep null
     ({"a": 5}, {"$max": {"a": 9}}, False),
-    ({"a": True}, {"$max": {"a": 2}}, False),  # bool-as-int max(1,2)=2
+    ({"a": True}, {"$max": {"a": 2}}, False),  # bool current -> Rust defers (skip)
     ({"a": "m"}, {"$min": {"a": "a"}}, False),  # string compare
     ({"a": 2}, {"$min": {"a": 1.5}}, False),  # int/float cross-numeric
-    ({"a": 5}, {"$min": {"a": "x"}}, False),  # cross-type -> defer (Python raises)
+    # Cross-type (sortable) now COMPUTES on both engines via BSON order:
+    ({"a": 5}, {"$min": {"a": "x"}}, False),  # number < string -> keep 5
+    ({"a": 5}, {"$max": {"a": "x"}}, False),  # string > number -> set "x"
+    ({"a": ObjectId("507f1f77bcf86cd799439011")}, {"$max": {"a": 5}}, False),  # oid > num
+    ({"a": "x"}, {"$max": {"a": 5}}, False),  # string > number -> keep "x"
     # $addToSet — dedup by value (bool-as-int, structural), absent -> create.
     ({"a": [1, 2]}, {"$addToSet": {"a": 3}}, False),  # append
     ({"a": [1, 2, 3]}, {"$addToSet": {"a": 2}}, False),  # present -> no change

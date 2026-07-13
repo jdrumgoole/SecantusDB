@@ -449,16 +449,23 @@ def _apply_op(
                         )
                 set_path(doc, concrete, bson_mul(current, factor))
     elif op == "$min":
+        # A missing field is set unconditionally; otherwise compare by MongoDB's
+        # BSON cross-type order (`_bson_lt`), not Python `<` — so a cross-type
+        # pair (e.g. a string vs a number) orders like mongod instead of raising
+        # a TypeError, and an explicit-null current is a real value (rank 2), not
+        # "no current".
+        from secantus.ordering import _bson_lt
+
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                current = get_path(doc, concrete, default=None)
-                if current is None or value < current:
+                if not has_path(doc, concrete) or _bson_lt(value, get_path(doc, concrete)):
                     set_path(doc, concrete, value)
     elif op == "$max":
+        from secantus.ordering import _bson_lt
+
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                current = get_path(doc, concrete, default=None)
-                if current is None or value > current:
+                if not has_path(doc, concrete) or _bson_lt(get_path(doc, concrete), value):
                     set_path(doc, concrete, value)
     elif op == "$push":
         for path, value in payload.items():

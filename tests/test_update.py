@@ -154,6 +154,28 @@ def test_min_max() -> None:
     assert apply_update({"a": 5}, {"$max": {"a": 3}}) == {"a": 5}
 
 
+def test_min_max_cross_type_bson_order() -> None:
+    # mongod compares by BSON canonical-type order (null < number < string <
+    # objectId < bool < date). No Python TypeError leak on cross-type.
+    from bson import ObjectId
+
+    d = __import__("datetime").datetime(2026, 1, 1)
+    oid = ObjectId("507f1f77bcf86cd799439011")
+    assert apply_update({"a": 5}, {"$max": {"a": "str"}}) == {"a": "str"}  # string > number
+    assert apply_update({"a": 5}, {"$max": {"a": d}}) == {"a": d}  # date > number
+    assert apply_update({"a": d}, {"$max": {"a": "str"}}) == {"a": d}  # date > string
+    assert apply_update({"a": oid}, {"$max": {"a": 5}}) == {"a": oid}  # objectId > number
+    assert apply_update({"a": 5}, {"$min": {"a": "str"}}) == {"a": 5}  # number < string
+
+
+def test_min_max_missing_vs_explicit_null() -> None:
+    # A MISSING field is set unconditionally; an explicit null is a real value
+    # (BSON rank 2, below numbers), compared by order — not "no current".
+    assert apply_update({}, {"$max": {"a": 5}}) == {"a": 5}  # missing -> set
+    assert apply_update({"a": None}, {"$max": {"a": 5}}) == {"a": 5}  # 5 > null -> set
+    assert apply_update({"a": None}, {"$min": {"a": 5}}) == {"a": None}  # null < 5 -> keep null
+
+
 def test_apply_does_not_mutate_input() -> None:
     src = {"a": 1, "nested": {"b": [1, 2]}}
     apply_update(src, {"$set": {"nested.b.0": 99}, "$inc": {"a": 1}})

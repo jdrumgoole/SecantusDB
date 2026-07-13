@@ -1469,15 +1469,14 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   subset; Python would need an explicit canonical-type-rank compare) — deferred as a
   delicate change to long-standing range-comparison semantics with pymongo-gauge
   regression risk. Same-type range comparisons (the overwhelmingly common case) are
-  correct on both servers. **Related — the `$min`/`$max` UPDATE operators have the
-  same cross-type gap AND a Python robustness bug** (found by a three-way update
-  differential, 2026-07-12): mongod's `$max`/`$min` compare the incoming value
-  against the current field value by BSON canonical-type order (so `$max` of int `5`
-  vs string `"str"` sets `"str"`, a string out-ranking a number); both servers
-  instead error, and `update.py` **leaks a raw `TypeError`** (`'>' not supported
-  between 'str' and 'int'` at `_apply_op`'s `value > current`) rather than a clean
-  error — it must at minimum be caught (don't leak tracebacks to the wire), and
-  ideally routed through the same BSON-order comparator a cross-type fix would add.
+  correct on both servers. (The **`$min`/`$max` UPDATE** operators had the same
+  cross-type gap plus a Python `TypeError` traceback leak — **fixed 2026-07-13**:
+  Python now compares by BSON order via `ordering._bson_lt` (no leak, cross-type
+  matches mongod, explicit-null distinguished from missing); the Rust engine uses
+  `order::cmp` over the sortable subset and defers only a **bool / Decimal128 /
+  NaN / exotic** operand — that residual bool/Decimal128 defer on the Rust *server*
+  is the one remaining piece, and it needs the same non-sortable-order work as the
+  query matcher above.)
 - [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
   servers).**
   **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but
