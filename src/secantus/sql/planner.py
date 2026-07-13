@@ -221,6 +221,8 @@ def _literal(node: exp.Expression) -> Any:
         return _coerce_cast(_literal(node.this), node.to)
     if isinstance(node, exp.Neg):
         inner = _literal(node.this)
+        if inner is None:
+            return None  # - NULL is NULL (``- CAST(NULL AS REAL)``)
         if isinstance(inner, dict) and "interval" in inner:
             from secantus.sql import intervals as _intervals
 
@@ -937,6 +939,15 @@ def _expr_to_filter(
     # is the empty-result filter.
     if isinstance(node, exp.Boolean):
         return {} if node.this else {"$nor": [{}]}
+
+    # A comparison against a bare NULL literal (``col <> NULL`` — NOT the
+    # ``IS NULL`` form, which parses as exp.Is) is always unknown in SQL, and
+    # unknown never satisfies a WHERE: match nothing. Mongo's ``$ne: null``
+    # would instead match every doc whose field isn't null — the opposite.
+    if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)) and (
+        isinstance(node.this, exp.Null) or isinstance(node.expression, exp.Null)
+    ):
+        return {"$nor": [{}]}
 
     # A schema-qualified function predicate (``pg_catalog.pg_table_is_visible(...)``)
     # parses as Dot(Identifier, Anonymous); unwrap to the function call.
@@ -2877,6 +2888,41 @@ _HAVING_CMP: dict[type, tuple[str, str]] = {
 }
 
 
+def _strip_identity_wrappers(arg: exp.Expression | None) -> exp.Expression | None:
+    """Peel decorations that don't change an aggregate argument's value:
+    parentheses and *pairs* of unary minus (``- - ( col0 )`` is ``col0``; a
+    single ``-`` is a real negation and stays)."""
+    while arg is not None:
+        if isinstance(arg, exp.Paren):
+            arg = arg.this
+            continue
+        if isinstance(arg, exp.Neg) and isinstance(arg.this, (exp.Neg, exp.Paren)):
+            inner = arg.this
+            while isinstance(inner, exp.Paren):
+                inner = inner.this
+            if isinstance(inner, exp.Neg):
+                arg = inner.this
+                continue
+        break
+    return arg
+
+
+def _agg_expr_arg(node: exp.Expression) -> exp.Expression | None:
+    """The (identity-stripped) argument node of an aggregate call — for lowering
+    expression arguments that aren't a bare column. None for ``COUNT(*)`` or a
+    non-aggregate node."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Filter):
+        inner = inner.this
+    for cls in _AGG_CLASSES:
+        if isinstance(inner, cls):
+            arg = inner.this
+            if isinstance(arg, exp.Distinct):
+                arg = arg.expressions[0] if arg.expressions else None
+            return _strip_identity_wrappers(arg)
+    return None
+
+
 def _aggregate_of(node: exp.Expression) -> tuple[str, str | None, bool] | None:
     """If ``node`` (or its alias target) is an aggregate, return
     ``(func, column, distinct)``. ``column`` is None for ``COUNT(*)``; the
@@ -2891,6 +2937,7 @@ def _aggregate_of(node: exp.Expression) -> tuple[str, str | None, bool] | None:
             if distinct:
                 exprs = arg.expressions
                 arg = exprs[0] if exprs else None
+            arg = _strip_identity_wrappers(arg)
             col = _column_name(arg) if isinstance(arg, exp.Column) else None
             return name, col, distinct
     # ``every(x)`` is the standard-SQL spelling of ``bool_and(x)`` (parses as an
@@ -3253,8 +3300,20 @@ def _agg_arg_to_expr(node: exp.Expression, table: TableDef) -> Any:
         return _agg_arg_to_expr(node.this, table)
     if isinstance(node, exp.Column):
         return f"${table.field_for(node.name)}"
+    if isinstance(node, exp.Neg) and not isinstance(node.this, (exp.Literal, exp.Null)):
+        return {"$multiply": [-1, _agg_arg_to_expr(node.this, table)]}
     if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
         return {"$literal": _literal(node)}
+    _arith_ops = {
+        exp.Add: "$add",
+        exp.Sub: "$subtract",
+        exp.Mul: "$multiply",
+        exp.Div: "$divide",
+        exp.Mod: "$mod",
+    }
+    op = _arith_ops.get(type(node))
+    if op is not None and node.expression is not None:
+        return {op: [_agg_arg_to_expr(node.this, table), _agg_arg_to_expr(node.expression, table)]}
     fname = None
     if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
         fname = node.expression.name
@@ -3623,8 +3682,26 @@ def _accumulator_for(
 
 
 def _accumulator(
-    func: str, col: str | None, table: TableDef, filter_cond: Any = None
+    func: str,
+    col: str | None,
+    table: TableDef,
+    filter_cond: Any = None,
+    arg_node: exp.Expression | None = None,
 ) -> tuple[dict[str, Any], str]:
+    if (
+        col is None
+        and arg_node is not None
+        and not isinstance(arg_node, exp.Star)
+        and func in ("sum", "avg", "min", "max")
+    ):
+        # An expression argument (``SUM(- 83)``, ``MAX(col0 + 1)``) lowers to a
+        # Mongo aggregation expression (_agg_arg_to_expr raises 0A000 for
+        # shapes it can't lower).
+        body = _agg_arg_to_expr(arg_node, table)
+        if filter_cond is not None:
+            body = {"$cond": [filter_cond, body, 0 if func == "sum" else None]}
+        tag = _agg_out_tag(func, _infer_scalar_tag(arg_node, table_resolver(table)))
+        return {f"${func}": body}, tag
     if col is None:
         return _accumulator_for(func, None, None, filter_cond)
     return _accumulator_for(func, table.field_for(col), table.type_for(col), filter_cond)
@@ -4063,7 +4140,7 @@ def _grouping_set_branch(
                     fcond,
                 )
             else:
-                acc, tag = _accumulator(func, col, table, fcond)
+                acc, tag = _accumulator(func, col, table, fcond, arg_node=_agg_expr_arg(e))
                 fname = names.fresh(alias or func)
                 accumulators[fname] = acc
             project[fname] = f"${fname}"
@@ -4203,7 +4280,7 @@ def _plan_grouping_sets_window_select(
                 fcond,
             )
         else:
-            acc, tag = _accumulator(func, col, table, fcond)
+            acc, tag = _accumulator(func, col, table, fcond, arg_node=_agg_expr_arg(node))
             fname = names.fresh(func)
             accumulators[fname] = acc
         agg_fields[agg] = fname
@@ -4406,7 +4483,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                     fcond,
                 )
             else:
-                acc, tag = _accumulator(func, col, table, fcond)
+                acc, tag = _accumulator(func, col, table, fcond, arg_node=_agg_expr_arg(e))
                 fname = names.fresh(alias or func)
                 accumulators[fname] = acc
             agg_fields[(func, col, distinct)] = fname
@@ -4466,7 +4543,7 @@ def _residual_where(stmt: exp.Select, table: TableDef) -> exp.Expression | None:
     references the outer row — an ``EXISTS`` or correlated subquery. ``None`` when
     the WHERE (if any) lowers cleanly to a Mongo filter."""
     where = stmt.args.get("where")
-    if where is None or not where_needs_per_row(stmt):
+    if where is None or not where_needs_per_row(stmt, table):
         return None
     return where.this
 
@@ -4670,7 +4747,7 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
                 fcond,
             )
         else:
-            acc, tag = _accumulator(func, col, table, fcond)
+            acc, tag = _accumulator(func, col, table, fcond, arg_node=_agg_expr_arg(node))
             fname = names.fresh(func)
             accumulators[fname] = acc
         agg_fields[agg] = fname
@@ -4842,7 +4919,7 @@ def _having_to_match(
             )
             agg_fields[agg] = fname
             return fname, tag
-        acc, tag = _accumulator(func, col, table, fcond)
+        acc, tag = _accumulator(func, col, table, fcond, arg_node=_agg_expr_arg(term))
         if agg not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
             accumulators[fname] = acc

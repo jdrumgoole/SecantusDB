@@ -1560,6 +1560,53 @@ def _sorted_agg_value(kind: str, payload: Any, pairs: Any) -> Any:
     return sep.join(parts) if parts else None
 
 
+def _empty_implicit_aggregate_row(pipeline: list, ctx: Any) -> list | None:
+    """One synthesized row for an implicit whole-table aggregate over zero rows.
+
+    Postgres returns a single row from ``SELECT AVG(x) FROM t WHERE false`` —
+    count-shaped accumulators are 0, every other aggregate is NULL. Mongo's
+    ``$group`` with ``_id: null`` over empty input emits nothing, so the row is
+    built here and run through the stages after the ``$group`` (projection,
+    computed fields)."""
+    from secantus.aggregate import apply_pipeline
+
+    gidx = next(
+        (
+            i
+            for i, st in enumerate(pipeline)
+            if isinstance(st, dict) and "$group" in st and st["$group"].get("_id") is None
+        ),
+        None,
+    )
+    if gidx is None:
+        return None
+
+    def _is_count_acc(spec: Any) -> bool:
+        if not (isinstance(spec, dict) and "$sum" in spec):
+            return False
+        body = spec["$sum"]
+        if isinstance(body, int):
+            return True  # {"$sum": 1} — COUNT(*)
+        return (
+            isinstance(body, dict)
+            and "$cond" in body
+            and isinstance(body["$cond"], list)
+            and body["$cond"][1:] == [1, 0]  # COUNT(col) / FILTERed count
+        )
+
+    doc: dict[str, Any] = {"_id": None}
+    for name, spec in pipeline[gidx]["$group"].items():
+        if name == "_id":
+            continue
+        if _is_count_acc(spec):
+            doc[name] = 0
+        elif isinstance(spec, dict) and "$push" in spec:
+            doc[name] = []  # pushed collections (bit_agg / sorted aggs) fold over []
+        else:
+            doc[name] = None
+    return apply_pipeline([doc], pipeline[gidx + 1 :], ctx)
+
+
 def execute_pipeline_select(
     plan: planner.PipelineSelectPlan, storage: Any, db: str, sctx: Any = None
 ) -> SQLResult:
@@ -1570,6 +1617,10 @@ def execute_pipeline_select(
     docs, remaining = _pipeline_input_docs(plan, storage, db, sctx)
     ctx = PipelineContext(storage=storage, db_name=db, coll_name=plan.base_collection)
     result = _apply_post_aggregates(plan, apply_pipeline(docs, remaining, ctx))
+    if not result:
+        synthesized = _empty_implicit_aggregate_row(remaining, ctx)
+        if synthesized is not None:
+            result = _apply_post_aggregates(plan, synthesized)
     columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
     rows = [
         tuple(typemap.to_py(doc.get(name), tag) for name, tag in plan.out_columns) for doc in result

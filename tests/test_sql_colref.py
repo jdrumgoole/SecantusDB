@@ -189,18 +189,17 @@ def test_function_in_colref_predicate_evaluates_per_row(storage, session):
     assert q(storage, session, "SELECT _id FROM orders WHERE qty = substr(shipped, 1, 1)") == []
 
 
-def test_unsupported_function_in_colref_predicate_through_group_by(storage, session):
-    # The 0A000 for an unlowerable function is identical on the pipeline path.
+def test_unlowerable_predicate_through_group_by_evaluates_per_row(storage, session):
+    # An unlowerable predicate on the pipeline path evaluates per-row before
+    # the $group (was 0A000): substr('e', 1, 1) = 'e' matches the row.
     storage.insert(DB, "sales2", [{"_id": bson.Int64(1), "region": "e", "amt": bson.Int64(1)}])
-    with pytest.raises(SQLError) as ei:
-        run_sql(
-            storage,
-            DB,
-            "SELECT region, SUM(amt) FROM sales2 "
-            "WHERE region = substr(region, 1, 1) GROUP BY region",
-            session=session,
-        )
-    assert ei.value.sqlstate == "0A000"
+    res = run_sql(
+        storage,
+        DB,
+        "SELECT region, SUM(amt) FROM sales2 WHERE region = substr(region, 1, 1) GROUP BY region",
+        session=session,
+    )[-1]
+    assert res.rows == [("e", 1)]
 
 
 # -- filter shape (semantics pinned) ----------------------------------------- #
