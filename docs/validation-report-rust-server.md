@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-07-07 — SecantusDB 0.5.4b177 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-07-13 — SecantusDB 0.5.4b234 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
