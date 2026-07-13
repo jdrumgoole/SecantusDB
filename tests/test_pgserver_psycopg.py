@@ -471,3 +471,23 @@ def test_quoted_builtin_type_names_in_ddl(real_server):
             ["x"],
             Decimal("1.5"),
         )
+
+
+def test_copy_bare_options_spelling(server):
+    """psycopg emits ``COPY … TO STDOUT (FORMAT csv)`` without WITH — sqlglot
+    only parses the WITH form, so parse() inserts it. Both the table and the
+    query form take options, and the query form evaluates expressions."""
+    with connect(server, autocommit=True) as conn:
+        conn.execute("create table bo (a int4, b text)")
+        conn.execute("insert into bo values (1, 'x'), (2, 'y')")
+        cur = conn.cursor()
+        with cur.copy("copy bo to stdout (format csv, header)") as copy:
+            rows = [bytes(r) for r in copy]
+        assert b"".join(rows) == b"a,b\n1,x\n2,y\n"
+        with cur.copy("copy (select b from bo order by a desc) to stdout (format text)") as copy:
+            rows = [bytes(r) for r in copy]
+        assert b"".join(rows) == b"y\nx\n"
+        with cur.copy("copy (select chr(8364)) to stdout (format text)") as copy:
+            copy.set_types(["text"])
+            assert copy.read_row() == ("€",)
+            assert copy.read_row() is None

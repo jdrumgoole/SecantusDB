@@ -7928,6 +7928,14 @@ UNCOMMENT_SENTINEL = "\x00__secantus_uncomment__"
 # Only a whole ``COMMENT ON … IS NULL`` statement — anchored so a query's
 # ``WHERE x IS NULL`` is never touched.
 _COMMENT_NULL_RE = re.compile(r"(?is)^(\s*COMMENT\s+ON\b.*\bIS\s+)NULL(\s*;?\s*)$")
+# sqlglot parses COPY's options only in the ``WITH (…)`` spelling; the bare
+# ``COPY … TO STDOUT (FORMAT csv)`` form (what psycopg emits) needs the WITH
+# inserted. Anchored on the STDIN/STDOUT target and a known option keyword so a
+# parenthesis inside the query part of ``COPY (query) TO STDOUT`` isn't touched.
+_COPY_BARE_OPTIONS_RE = re.compile(
+    r"(?is)^(\s*copy\b.*?\b(?:to\s+stdout|from\s+stdin))\s*"
+    r"\((?=\s*(?:format|header|delimiter|null|quote|escape|encoding|freeze|force))"
+)
 
 
 #: Reject a statement string longer than this before handing it to sqlglot. 1 MB
@@ -7956,6 +7964,8 @@ def parse(sql: str) -> list[exp.Expression]:
     # expression), so a NULL comment (comment removal) is rewritten to a sentinel
     # the executor reads back as "remove". COMMENT statements are standalone.
     sql = _COMMENT_NULL_RE.sub(lambda m: f"{m.group(1)}'{UNCOMMENT_SENTINEL}'{m.group(2)}", sql)
+    # ``COPY … TO STDOUT (FORMAT csv)`` — insert the WITH sqlglot requires.
+    sql = _COPY_BARE_OPTIONS_RE.sub(r"\1 WITH (", sql)
     try:
         return [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
     except sqlglot.errors.ParseError as exc:

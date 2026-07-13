@@ -1182,6 +1182,12 @@ def _describe_statement(
                 query = stmt.copy()
                 query.set("from", exp.From(this=exp.Table(this=exp.to_identifier(tdef.name))))
                 query.set("expressions", [exp.column(tdef.columns[0].name)])
+            if planner._stmt_needs_evaluation(query):
+                eval_plan = planner._build_evaluated_single(query, tdef)
+                return [
+                    ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25))
+                    for name, tag in eval_plan.out_columns
+                ]
             srf_plan = planner.plan_select(query, tdef)
         except (errors.SQLError, TypeError, ValueError):
             return None
@@ -1848,8 +1854,19 @@ def _run_select(
     vtable = virtual.lookup(schema_name, table_node.name)
     if vtable is not None:
         rows = vtable.builder(db, session, storage, catalog)
-        plan = planner.plan_select(stmt, vtable.table_def())
-        return executor.execute_select(plan, virtual.MemoryBackend(rows), db)
+        backend = virtual.MemoryBackend(rows)
+        tdef = vtable.table_def()
+        if planner._stmt_needs_evaluation(stmt):
+            # Computed projections over a catalog table (``SELECT 1 FROM
+            # pg_class …`` and friends) need per-row evaluation.
+            mem_sctx = scalar.ScalarContext(
+                storage=backend, catalog=catalog, db=db, session=session
+            )
+            return executor.execute_evaluated_select(
+                planner._build_evaluated_single(stmt, tdef), backend, db, mem_sctx
+            )
+        plan = planner.plan_select(stmt, tdef)
+        return executor.execute_select(plan, backend, db)
 
     # A declared table, else a reflected (schema-on-read) view of an existing
     # Mongo collection — the dual-protocol read path.
@@ -1889,9 +1906,15 @@ def _run_srf_select(
         query = stmt.copy()
         query.set("from", exp.From(this=exp.Table(this=exp.to_identifier(tdef.name))))
         query.set("expressions", [exp.column(tdef.columns[0].name)])
-    return executor.execute_select(
-        planner.plan_select(query, tdef), virtual.MemoryBackend(rows), db
-    )
+    backend = virtual.MemoryBackend(rows)
+    if planner._stmt_needs_evaluation(query):
+        # A computed projection (``SELECT x * 2 FROM generate_series(…) t(x)``)
+        # needs per-row evaluation over the materialized rows.
+        mem_sctx = scalar.ScalarContext(storage=backend, catalog=catalog, db=db, session=session)
+        return executor.execute_evaluated_select(
+            planner._build_evaluated_single(query, tdef), backend, db, mem_sctx
+        )
+    return executor.execute_select(planner.plan_select(query, tdef), backend, db)
 
 
 def _run_insert(
