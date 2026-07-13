@@ -640,6 +640,34 @@ def validate_node(c: Context, server: str = "python") -> None:
     print(f"\nWrote docs/validation-report-node{suffix}.md")
 
 
+@task(name="validate-psycopg")
+def validate_psycopg(c: Context) -> None:
+    """Run psycopg 3's vendored test suite against a SecantusPGServer daemon.
+
+    The SQL-server conformance gauge (tasks/sql-gauges-plan.md G2): psycopg's
+    own tests, unmodified, over a real TCP connection with PSYCOPG_TEST_DSN
+    pointing at a daemon SecantusPGServer. Generates
+    docs/validation-report-psycopg.md. Python server only — the Rust server
+    has no SQL front end.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/psycopg/tests").exists():
+        c.run("git submodule update --init vendor/psycopg", pty=True)
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m psycopg_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m psycopg_validation.generate_report "
+        ".validation/psycopg-raw.json docs/validation-report-psycopg.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-psycopg.md")
+
+
 @task(name="validate-ruby")
 def validate_ruby(c: Context, server: str = "python") -> None:
     """Run mongo-ruby-driver's tests against an embedded SecantusDB.
