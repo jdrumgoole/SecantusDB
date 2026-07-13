@@ -318,3 +318,26 @@ def test_jsonb_each_empty_object():
 def test_json_each_text_bool_and_null():
     rows = _rows('SELECT * FROM json_each_text(\'{"a":true,"b":null}\'::json) ORDER BY key')
     assert rows == [("a", "true"), ("b", None)]
+
+
+def test_computed_projection_over_srf():
+    assert _rows("select x * 2 from generate_series(1, 3) as t(x)") == [(2,), (4,), (6,)]
+    assert _rows("select x * 2 as y from generate_series(1, 3) as t(x) order by y desc") == [
+        (6,),
+        (4,),
+        (2,),
+    ]
+    assert _rows("select 1 from generate_series(1, 3)") == [(1,), (1,), (1,)]
+
+
+def test_computed_projection_over_catalog_table():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database=DB)
+        run_sql(st, DB, "create table pc (a int4)", session=sess)
+        res = run_sql(st, DB, "select upper(relname) from pg_class where relname = 'pc'", session=sess)[-1]
+        assert res.rows == [("PC",)]
+        res = run_sql(st, DB, "select 1 from pg_namespace limit 1", session=sess)[-1]
+        assert res.rows == [(1,)]
+    finally:
+        st.close()
