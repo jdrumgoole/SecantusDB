@@ -2502,9 +2502,16 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
         // compare equal to a bson-decoded naive datetime, so we defer it.
         9 => match value {
             Bson::DateTime(_) => Conv::Ok(value.clone()),
+            // int / long / double: milliseconds since the Unix epoch -> date.
+            Bson::Int32(n) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*n as i64))),
+            Bson::Int64(n) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*n))),
+            Bson::Double(d) if d.is_finite() => {
+                Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*d as i64)))
+            }
+            Bson::Double(_) => Conv::Failed, // inf/NaN -> onError / raise
+            // string (ISO parse) / objectId (embedded timestamp) -> Python oracle.
             _ => Conv::Unsupported,
         },
-        // string (2) / objectId (7): str()/isoformat/hex parsing -> Python.
         _ => Conv::Unsupported,
     }
 }
