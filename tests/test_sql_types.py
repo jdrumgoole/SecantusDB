@@ -241,3 +241,28 @@ def test_infinite_float_param_node():
 def test_untyped_empty_multirange_binary_param():
     assert pgextended._decode_param(b"\x00\x00\x00\x00", 1, 0) == "{}"
     assert typemap.coerce("{}", "nummultirange") == {"multirange": []}
+
+
+def test_three_valued_logic_in_per_row_where():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table tv (a int4, b int4)", session=sess)
+        run_sql(st, "d", "insert into tv values (1, 2), (5, 6)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # NOT over an unknown is unknown — the row is excluded, not included.
+        assert rows("select a from tv where a not between (null) and b") == []
+        # ...but a definitively-false arm dominates the NULL bound.
+        assert rows("select a from tv where b not between null and a") == [(1,), (5,)]
+        # Untranslatable-WHERE shapes route to per-row evaluation.
+        assert rows("select 1 from tv where 1 in (2)") == []
+        assert rows("select a from tv where - b + a > - 10") == [(1,), (5,)]
+        assert rows("select distinct a from tv where - b + a is not null") == [(1,), (5,)]
+        # Computed unary projections type and evaluate.
+        assert rows("select - a as neg from tv order by neg") == [(-5,), (-1,)]
+        assert rows("select + + 90 * a * - b from tv order by 1") == [(-2700,), (-180,)]
+    finally:
+        st.close()
