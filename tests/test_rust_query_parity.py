@@ -208,6 +208,18 @@ CURATED = [
     ),
     ({"vals": [1, 5, 10]}, {"vals": {"$elemMatch": {"$gte": 3, "$lt": 7}}}),
     ({"vals": [1, 5, 10]}, {"vals": {"$elemMatch": {"$gte": 11}}}),
+    # Cross-type range against a document-valued field / a document bound:
+    # mongod's range operators are type-bracketed, so these never match. Python's
+    # native `<` on dicts raises TypeError (no match); the Rust matcher mirrors it
+    # with a clean no-match instead of a Fallback (was: deferred / Rust-server error).
+    ({"a": {"x": 1}}, {"a": {"$gt": 2}}),
+    ({"a": {"x": 1}}, {"a": {"$lt": 2}}),
+    ({"a": {"x": 1}}, {"a": {"$gte": 2}}),
+    ({"a": 2}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"x": 2}}, {"a": {"$gt": {"x": 1}}}),  # doc-vs-doc still no-match (dicts unorderable)
+    # $elemMatch: {$gt: n} over an array of sub-documents — the differential case.
+    ({"items": [{"k": 1}, {"k": 2}]}, {"items": {"$elemMatch": {"$gt": 2}}}),
+    ({"items": [{"k": 1}, {"k": 2}]}, {"items": {"$elemMatch": {"$lt": 2}}}),
     ({"a": 1}, {"a": 1, "$comment": "hi"}),
     ({"a": 2}, {"a": 1, "$comment": "hi"}),
     ({"flags": 0b1011}, {"flags": {"$bitsAllSet": 0b1010}}),
@@ -227,19 +239,23 @@ CURATED = [
     ({"x": True}, {"x": 1}),
     ({"x": 1}, {"x": True}),
     ({"x": False}, {"x": 0}),
-    # bool-as-int comparison ($gt/$lt/$gte/$lte): bool compares numerically with
-    # int / long / double (True == 1), but bool vs a non-numeric (incl.
-    # Decimal128) is TypeError -> no match.
-    ({"x": True}, {"x": {"$gt": 0}}),
-    ({"x": True}, {"x": {"$lt": 1}}),
-    ({"x": True}, {"x": {"$gte": 1}}),
-    ({"x": False}, {"x": {"$lt": 1}}),
-    ({"x": 5}, {"x": {"$gt": True}}),
-    ({"x": True}, {"x": {"$gt": False}}),
-    ({"x": True}, {"x": {"$gt": Int64(0)}}),
+    # bool is its own range bracket ($gt/$lt/$gte/$lte): a bool compares only with
+    # another bool (True > False), never with a number or any other type — mongod
+    # brackets bool away from numbers, so all the bool-vs-number cases no-match.
+    ({"x": True}, {"x": {"$gt": 0}}),  # bool vs number -> no match
+    ({"x": True}, {"x": {"$lt": 1}}),  # bool vs number -> no match
+    ({"x": True}, {"x": {"$gte": 1}}),  # bool vs number -> no match
+    ({"x": False}, {"x": {"$lt": 1}}),  # bool vs number -> no match
+    ({"x": 5}, {"x": {"$gt": True}}),  # number vs bool bound -> no match
+    ({"x": 0}, {"x": {"$lt": True}}),  # number vs bool bound -> no match
+    ({"x": True}, {"x": {"$gt": False}}),  # bool vs bool -> True > False -> match
+    ({"x": False}, {"x": {"$gte": False}}),  # bool vs bool -> match
+    ({"x": False}, {"x": {"$gt": False}}),  # bool vs bool -> no match
+    ({"x": True}, {"x": {"$gt": Int64(0)}}),  # bool vs long -> no match
     ({"x": True}, {"x": {"$gt": "a"}}),  # bool vs string -> no match
     ({"x": True}, {"x": {"$gt": Decimal128("0.5")}}),  # bool vs decimal -> no match
-    ({"x": [True, False]}, {"x": {"$gt": 0}}),  # multikey array with bool elements
+    ({"x": [True, False]}, {"x": {"$gt": 0}}),  # multikey bool elements vs number -> no match
+    ({"x": [True, False]}, {"x": {"$gt": False}}),  # multikey bool elements vs bool -> match
     ({"x": Decimal128("3.5")}, {"x": {"$gt": 2}}),
     ({"x": 3.5}, {"x": {"$gt": Decimal128("2")}}),
     ({"x": Decimal128("1.5")}, {"x": {"$gt": 2}}),

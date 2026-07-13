@@ -650,6 +650,13 @@ def _try_cmp(
             return bool(op(c, 0))
         except TypeError:
             return False
+    # MongoDB ranks bool as its own type bracket: under range operators a bool
+    # compares only with another bool, never with a number. Python treats bool as
+    # an int subclass, so `op(True, 2)` would otherwise evaluate `1 < 2` and
+    # spuriously match — guard against that (equality already brackets bool
+    # separately). Both-bool falls through to a normal (correct) bool compare.
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
     a, b = _coerce_numeric(a, b)
     a, b = _coerce_datetime(a, b)
     try:

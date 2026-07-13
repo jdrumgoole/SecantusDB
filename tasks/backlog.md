@@ -1452,24 +1452,35 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
   both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
   bit-for-bit despite CPython 3.12's compensated `sum()`).
-- [ ] **Cross-type range comparison diverges from mongod on BOTH servers
-  (`$gt`/`$gte`/`$lt`/`$lte`).** mongod compares range operands by BSON
-  canonical-type order (a document out-ranks every number, so `{a: {$gt: 2}}`
-  matches a document-valued `a`). Neither SecantusDB server reproduces this:
-  the **Python** matcher (`query._try_cmp`) applies Python's native `a > b`, which
-  raises `TypeError` across incomparable types and is swallowed as *no match*; the
-  **Rust** matcher (`compare_values` in `secantus-core/src/query.rs`) returns
-  `Fallback` for any document / array / exotic operand, so the Rust *server* errors
-  where Python silently returns no-match. The results only coincide with mongod when
-  a cross-type element is excluded for other reasons (e.g. a paired `$gt`+`$lt` where
-  the type-order value fails one bound). This surfaces via `$elemMatch` / `$all` +
-  `$elemMatch` over an array of documents (found by the three-way query differential,
-  2026-07-10). A faithful fix ports mongod's cross-type ordering into **both**
-  matchers (`crate::order` has the total order but defers on the same non-sortable
-  subset; Python would need an explicit canonical-type-rank compare) — deferred as a
-  delicate change to long-standing range-comparison semantics with pymongo-gauge
-  regression risk. Same-type range comparisons (the overwhelmingly common case) are
-  correct on both servers. (The **`$min`/`$max` UPDATE** operators had the same
+- [ ] **Cross-type range comparison — mostly FIXED 2026-07-13; small Rust-server
+  residue remains (`$gt`/`$gte`/`$lt`/`$lte`).** mongod's range operators are
+  **type-bracketed** (verified with a three-way probe against real `mongod` 6.0):
+  a scalar bound only matches values in the same BSON type bracket — `{a: {$gt: 2}}`
+  does **not** match a document- or string-valued `a`, only numbers (plus array
+  elements that are numbers). So the earlier premise here (that mongod uses full
+  cross-type BSON order for range, à la sort) was wrong; the Python matcher's
+  no-match on cross-type scalars was already correct. Two real divergences were
+  fixed:
+  - **Document/array operand → Rust server error.** `compare_values` returned
+    `Fallback` for a document operand, so the Rust *server* raised `BadValue` on an
+    otherwise-fine query (`{a: {$gt: 2}}` against a document-valued `a`, or
+    `{items: {$elemMatch: {$gt: n}}}` over an array of sub-documents — found by the
+    three-way differential 2026-07-10). Now a **document** operand returns
+    `Ok(None)` (clean no-match, mirroring Python + mongod).
+  - **Bool matched numeric bounds on both engines.** Python's `bool` is an `int`
+    subclass, so `True < 2` matched; the Rust `compare_values` bool block compared
+    bool numerically against int/long/double. mongod brackets bool separately —
+    a bool field never matches a numeric bound and vice versa, but `bool`-vs-`bool`
+    compares. Fixed in **both** engines (Python `_try_cmp` bool-bracket guard; Rust
+    `compare_values` bool compares only with bool). Parity fuzz + a three-way probe
+    (collection-scan **and** index-scan paths) confirm all three agree.
+  - **Remaining residue (Rust *server* only, rare):** an **array-vs-array** bound
+    (`{a: {$gt: [1,2]}}`) still defers (`Fallback` → `BadValue` on the Rust server)
+    because Python's oracle is native list lexicographic comparison, which the Rust
+    matcher doesn't reproduce; the **exotic** BSON types (JS code / symbol /
+    dbpointer / undefined) as a range operand likewise defer. Both are
+    vanishingly rare in real queries; the Python server handles them.
+  (The **`$min`/`$max` UPDATE** operators had the same
   cross-type gap plus a Python `TypeError` traceback leak — **fixed 2026-07-13**:
   Python now compares by BSON order via `ordering._bson_lt` (no leak, cross-type
   matches mongod, explicit-null distinguished from missing); the Rust engine uses
