@@ -2061,6 +2061,19 @@ def _op_to_decimal(arg: Any, ctx: _Ctx) -> Any:
     raise ExpressionError(f"$toDecimal cannot convert {type(value).__name__}")
 
 
+def _op_to_date(arg: Any, ctx: _Ctx) -> Any:
+    # ``$toDate: <expr>`` is exactly ``$convert: {input: <expr>, to: "date"}``.
+    # Delegate to the same conversion path so the two stay identical (same
+    # supported input types, same errors). null / missing -> null.
+    value = _eval(arg, ctx)
+    if value is None:
+        return None
+    try:
+        return _convert_value(value, "date")
+    except (ValueError, TypeError, InvalidOperation, ExpressionError) as exc:
+        raise ExpressionError(f"$toDate cannot convert {type(value).__name__}") from exc
+
+
 def _op_filter(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$filter requires a document spec")
@@ -2432,6 +2445,7 @@ _OPS = {
     "$toDouble": _op_to_double,
     "$toBool": _op_to_bool,
     "$toDecimal": _op_to_decimal,
+    "$toDate": _op_to_date,
     "$convert": _op_convert,
     "$filter": _op_filter,
     "$map": _op_map,

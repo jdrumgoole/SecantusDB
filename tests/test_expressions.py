@@ -894,6 +894,32 @@ def test_convert_to_date_from_string() -> None:
     assert out == dt.datetime(2026, 4, 28, 12, 0, 0)
 
 
+def test_to_date_noop_on_date() -> None:
+    import datetime as dt
+
+    d = dt.datetime(2020, 1, 1, 0, 0, 0)
+    assert evaluate({"$toDate": d}, {}) == d
+
+
+def test_to_date_from_int_millis() -> None:
+    import datetime as dt
+
+    # milliseconds since the Unix epoch -> 2023-11-14T22:13:20Z
+    out = evaluate({"$toDate": 1700000000000}, {})
+    assert out == dt.datetime(2023, 11, 14, 22, 13, 20, tzinfo=dt.timezone.utc)
+
+
+def test_to_date_from_string() -> None:
+    import datetime as dt
+
+    out = evaluate({"$toDate": "2026-04-28T12:00:00"}, {})
+    assert out == dt.datetime(2026, 4, 28, 12, 0, 0)
+
+
+def test_to_date_null_is_null() -> None:
+    assert evaluate({"$toDate": None}, {}) is None
+
+
 def test_trig_basic() -> None:
     assert evaluate({"$sin": 0}, {}) == 0.0
     assert evaluate({"$cos": 0}, {}) == 1.0

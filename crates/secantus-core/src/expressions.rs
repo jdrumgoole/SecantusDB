@@ -260,6 +260,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$toInt" => op_to_int(arg, ctx),
         "$toDouble" => op_to_double(arg, ctx),
         "$toDecimal" => op_to_decimal(arg, ctx),
+        "$toDate" => op_to_date(arg, ctx),
         "$convert" => op_convert(arg, ctx),
         "$toBool" => op_to_bool(arg, ctx),
         "$toString" => op_to_string(arg, ctx),
@@ -2377,6 +2378,23 @@ fn decimal_from_str(s: &str) -> R {
         .map_err(|_| Fallback)
 }
 
+/// `$toDate: <expr>` — shorthand for `$convert: {input: <expr>, to: "date"}`.
+/// Delegates to the exact `convert_value(.., 9)` date path so the two stay
+/// identical. `null` -> null; a `DateTime` is returned unchanged; every other
+/// source type (int/long/double millis, ISO string, ObjectId) defers to Python,
+/// mirroring the `$convert` date path (which defers those to keep the tz-aware /
+/// naive datetime parity intact).
+fn op_to_date(arg: &Bson, ctx: &Ctx) -> R {
+    let v = eval(arg, ctx)?;
+    if matches!(v, Bson::Null) {
+        return Ok(Bson::Null);
+    }
+    match convert_value(&v, 9) {
+        Conv::Ok(out) => Ok(out),
+        Conv::Failed | Conv::Unsupported => Err(Fallback),
+    }
+}
+
 /// `$convert` outcome for one (value, target): a successful conversion, a
 /// supported conversion that *failed* (Python would raise → `onError` applies),
 /// or a target/source combination this bounded port doesn't implement (defer the
@@ -2484,9 +2502,16 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
         // compare equal to a bson-decoded naive datetime, so we defer it.
         9 => match value {
             Bson::DateTime(_) => Conv::Ok(value.clone()),
+            // int / long / double: milliseconds since the Unix epoch -> date.
+            Bson::Int32(n) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*n as i64))),
+            Bson::Int64(n) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*n))),
+            Bson::Double(d) if d.is_finite() => {
+                Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*d as i64)))
+            }
+            Bson::Double(_) => Conv::Failed, // inf/NaN -> onError / raise
+            // string (ISO parse) / objectId (embedded timestamp) -> Python oracle.
             _ => Conv::Unsupported,
         },
-        // string (2) / objectId (7): str()/isoformat/hex parsing -> Python.
         _ => Conv::Unsupported,
     }
 }
