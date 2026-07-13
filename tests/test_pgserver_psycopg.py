@@ -318,3 +318,156 @@ def test_pg_typeof_over_the_wire(real_server):
         assert conn.execute("select pg_typeof(1.5)").fetchone() == ("numeric",)
         cur = conn.execute("select pg_typeof(now())")
         assert cur.fetchone() == ("timestamp with time zone",)
+
+
+def test_executemany_returning_describes_columns(real_server):
+    """DML with RETURNING must answer Describe with a RowDescription — NoData
+    followed by DataRows is a protocol violation (psycopg's pipelined
+    executemany crashes with 'server sent data without prior row description')."""
+    with connect(real_server, autocommit=True) as conn:
+        conn.execute("CREATE TABLE em (num int4, data text)")
+        cur = conn.cursor()
+        cur.executemany(
+            "insert into em(num, data) values (%s, %s) returning num",
+            [(10, "hello"), (20, "world")],
+        )
+        cur.executemany(
+            "insert into em(num, data) values (%s, %s) returning num",
+            [(30, "a"), (40, "b")],
+            returning=True,
+        )
+        assert cur.fetchone() == (30,)
+        assert cur.nextset()
+        assert cur.fetchone() == (40,)
+        rows = conn.execute("select num from em order by num").fetchall()
+        assert rows == [(10,), (20,), (30,), (40,)]
+
+
+@pytest.mark.parametrize("fmt_in", ["s", "t", "b"])
+@pytest.mark.parametrize("fmt_out", [False, True])
+def test_text_array_full_charset_roundtrip(real_server, fmt_in, fmt_out):
+    """chr(1)..chr(255) + '€' round-trip through every param/result format combo.
+    Guards three bugs: binary array params stringified via Python repr in
+    substitute_parameters; array elements lost to over-broad whitespace
+    stripping in the literal parser (\\x1c is isspace() to Python, data to
+    Postgres); unquoted whitespace emitted by the array renderer."""
+    a = list(map(chr, range(1, 256))) + ["€"]
+    with connect(real_server, autocommit=True) as conn:
+        cur = conn.cursor(binary=fmt_out)
+        (res,) = cur.execute(f"select %{fmt_in}::text[]", (a,)).fetchone()
+        assert res == a
+
+
+@pytest.mark.parametrize("fmt_in", ["s", "t", "b"])
+@pytest.mark.parametrize("fmt_out", [False, True])
+def test_bytea_array_roundtrip(real_server, fmt_in, fmt_out):
+    a = [bytes(range(0, 256))]
+    with connect(real_server, autocommit=True) as conn:
+        cur = conn.cursor(binary=fmt_out)
+        (res,) = cur.execute(f"select %{fmt_in}::bytea[]", (a,)).fetchone()
+        assert res == a
+
+
+@pytest.mark.parametrize(
+    ("enc", "probe"),
+    [("latin1", "ä"), ("latin9", "€"), ("utf8", "€漢")],
+)
+def test_client_encoding_roundtrip(real_server, enc, probe):
+    """SET client_encoding converts query text, text/binary params, and text/
+    binary results at the wire boundary; ParameterStatus reports the canonical
+    Postgres spelling so psycopg switches its own codec."""
+    with connect(real_server, autocommit=True) as conn:
+        conn.execute(f"set client_encoding to '{enc}'")
+        assert (
+            conn.info.parameter_status("client_encoding")
+            == {
+                "latin1": "LATIN1",
+                "latin9": "LATIN9",
+                "utf8": "UTF8",
+            }[enc]
+        )
+        assert conn.execute(f"select '{probe}'").fetchone() == (probe,)
+        assert conn.execute("select %s::text", (probe,)).fetchone() == (probe,)
+        assert conn.execute("select %b::text", (probe,)).fetchone() == (probe,)
+        cur = conn.cursor(binary=True)
+        assert cur.execute("select %s::text", (probe,)).fetchone() == (probe,)
+
+
+def test_client_encoding_invalid_value(real_server):
+    with (
+        connect(real_server, autocommit=True) as conn,
+        pytest.raises(psycopg.errors.InvalidParameterValue),
+    ):
+        conn.execute("set client_encoding to 'klingon'")
+
+
+def test_client_encoding_startup_parameter(real_server):
+    host, port = real_server.address
+    with psycopg.connect(
+        host=host, port=port, dbname="db", user="joe", client_encoding="latin1"
+    ) as conn:
+        assert conn.info.parameter_status("client_encoding") == "LATIN1"
+        assert conn.execute("select 'ä'").fetchone() == ("ä",)
+
+
+def test_stream_set_returning_function(real_server):
+    """cur.stream() (libpq single-row mode) describes before executing — the
+    Describe path must resolve a set-returning row source's shape instead of
+    evaluating the SRF as a scalar (which errored every stream test)."""
+    with connect(real_server, autocommit=True) as conn:
+        cur = conn.cursor()
+        assert list(cur.stream("select generate_series(1, 5) as a")) == [
+            (1,),
+            (2,),
+            (3,),
+            (4,),
+            (5,),
+        ]
+        assert list(cur.stream("select generate_series(2, 1) as a")) == []
+        assert list(cur.stream("select * from generate_series(1, 3)")) == [(1,), (2,), (3,)]
+
+
+def test_text_param_nul_byte_rejected(real_server):
+    """Postgres rejects NUL in text values (22021 -> DataError)."""
+    with connect(real_server, autocommit=True) as conn, pytest.raises(psycopg.DataError):
+        conn.execute("select %b::text", ("foo\x00bar",))
+
+
+def test_untranslatable_character_errors(real_server):
+    """A result character with no equivalent in client_encoding raises 22P05
+    (DataError), matching Postgres — not a silent '?' substitution."""
+    with connect(real_server, autocommit=True) as conn:
+        conn.execute("set client_encoding to latin1")
+        with pytest.raises(psycopg.DataError):
+            conn.execute("select chr(%s)::text", (8364,))  # '€' not in latin1
+
+
+def test_numeric_special_values_binary(real_server):
+    """NaN and ±Infinity ride the binary numeric format (signs 0xC000/0xD000/
+    0xF000) in both directions."""
+    with connect(real_server, autocommit=True) as conn:
+        cur = conn.cursor(binary=True)
+        assert cur.execute("select %b::numeric", (Decimal("Infinity"),)).fetchone() == (
+            Decimal("Infinity"),
+        )
+        assert cur.execute("select %b::numeric", (Decimal("-Infinity"),)).fetchone() == (
+            Decimal("-Infinity"),
+        )
+        (nan,) = cur.execute("select %b::numeric", (Decimal("NaN"),)).fetchone()
+        assert nan.is_nan()
+
+
+def test_quoted_builtin_type_names_in_ddl(real_server):
+    """psycopg's faker fixture emits CREATE TABLE with sql.Identifier(type)
+    columns ('"cidr"'), which must resolve as the built-in, not an enum."""
+    from ipaddress import IPv4Network
+
+    with connect(real_server, autocommit=True) as conn:
+        conn.execute('create table qt (c "cidr", a "text"[], n "numeric")')
+        conn.execute("insert into qt values (%s, %s, %s)", ("10.0.0.0/24", ["x"], Decimal("1.5")))
+        # psycopg decodes via the reported OIDs: cidr -> IPv4Network.
+        assert conn.execute("select c, a, n from qt").fetchone() == (
+            IPv4Network("10.0.0.0/24"),
+            ["x"],
+            Decimal("1.5"),
+        )

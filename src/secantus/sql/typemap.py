@@ -220,6 +220,20 @@ _REGTYPE_SPELLINGS: dict[str, str] = {
 }
 
 
+def builtin_tag_for_name(name: str) -> str | None:
+    """The internal tag for a *quoted* built-in type spelling, or None.
+
+    ``CREATE TABLE t (c "cidr")`` parses the quoted name as a user-defined
+    type; psycopg's own test fixtures build DDL exactly this way
+    (``sql.Identifier(info.name)``), so quoted built-in names must resolve
+    before the enum/domain fallback."""
+    key = " ".join(str(name).strip().strip('"').lower().split())
+    if key.endswith("[]"):
+        elem = builtin_tag_for_name(key[:-2])
+        return f"{elem}[]" if elem is not None and f"{elem}[]" in PG_OID else None
+    return _REGTYPE_SPELLINGS.get(key.split("(", 1)[0].strip())
+
+
 def normalize_regtype(name: str) -> str:
     """Render a type name the way ``'name'::regtype`` prints in Postgres —
     normalized to the canonical pretty spelling (``'int4'`` -> ``integer``).
@@ -342,6 +356,10 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     if datatype.this == exp.DataType.Type.ARRAY:
         inner = datatype.args.get("expressions") or []
         elem = type_tag_for_sql(inner[0]) if inner else None
+        if elem is None and inner:
+            # A quoted built-in element spelling (``"cidr"[]``) parses as a
+            # user-defined element type — resolve it like the bare-name case.
+            elem = builtin_tag_for_name(inner[0].sql(dialect="postgres"))
         return f"{elem}[]" if elem is not None else None
     tag = _DATATYPE_TAGS.get(datatype.this)
     if tag is not None:
@@ -417,8 +435,11 @@ def _parse_pg_array_literal(text: str) -> list:
         return []
     out: list = []
     i, n = 0, len(body)
+    # Postgres' whitespace set for array literals — NOT Python str.strip()'s:
+    # \x1c-\x1f are isspace() to Python but data to Postgres.
+    pg_ws = " \t\n\r\v\f"
     while i < n:
-        while i < n and body[i] in " \t":
+        while i < n and body[i] in pg_ws:
             i += 1
         if i < n and body[i] == '"':  # quoted element (keeps commas / literal NULL)
             i += 1
@@ -439,7 +460,7 @@ def _parse_pg_array_literal(text: str) -> list:
             j = body.find(",", i)
             if j == -1:
                 j = n
-            token = body[i:j].strip()
+            token = body[i:j].strip(pg_ws)
             out.append(None if token.upper() == "NULL" else token)
             i = j + 1
     return out
@@ -708,7 +729,14 @@ def _render_pg_array(items: Any, elem_tag: str) -> str:
             continue
         rendered = to_pg_text(v, elem_tag)
         text = rendered.decode("utf-8") if rendered is not None else ""
-        if text == "" or text.upper() == "NULL" or any(c in text for c in ',{}"\\ \t'):
+        # Quote on ANY whitespace (str.isspace covers \n, \r, \x1c-\x1f, …) —
+        # unquoted whitespace is stripped by array-literal parsers, ours included.
+        if (
+            text == ""
+            or text.upper() == "NULL"
+            or any(c in text for c in ',{}"\\')
+            or any(ch.isspace() for ch in text)
+        ):
             escaped = text.replace("\\", "\\\\").replace('"', '\\"')
             parts.append(f'"{escaped}"')
         else:

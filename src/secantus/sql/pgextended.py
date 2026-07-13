@@ -62,6 +62,10 @@ def _decode_numeric(b: bytes) -> Decimal:
     digits = [struct.unpack_from("!H", b, 8 + 2 * i)[0] for i in range(ndigits)]
     if sign == 0xC000:  # NaN
         return Decimal("NaN")
+    if sign == 0xD000:  # +Infinity
+        return Decimal("Infinity")
+    if sign == 0xF000:  # -Infinity
+        return Decimal("-Infinity")
     s = "".join(f"{d:04d}" for d in digits) or "0"
     # The first digit group sits at base-10000 position ``weight``.
     value = Decimal(s).scaleb((weight - (ndigits - 1)) * 4) if digits else Decimal(0)
@@ -116,6 +120,8 @@ def _encode_numeric(value: Any) -> bytes:
     d = value if isinstance(value, Decimal) else Decimal(str(value))
     if d.is_nan():
         return struct.pack("!HhHH", 0, 0, 0xC000, 0)
+    if d.is_infinite():
+        return struct.pack("!HhHH", 0, 0, 0xF000 if d < 0 else 0xD000, 0)
     sign = 0x4000 if d < 0 else 0x0000
     d = -d if d < 0 else d
     _, digits_t, exp_t = d.as_tuple()
@@ -173,7 +179,9 @@ _ARRAY_ELEM_BY_OID: dict[int, tuple[int, str]] = {
 }
 
 
-def _encode_array(value: Any, arr_oid: int, tag: str | None) -> bytes:
+def _encode_array(
+    value: Any, arr_oid: int, tag: str | None, encoding: str | None = "utf-8"
+) -> bytes:
     """Binary-encode a one-dimensional array result (ndim/hasnull/elemoid header,
     one per-dim {len, lbound} pair, then length-prefixed elements)."""
     elem_oid, elem_tag = _ARRAY_ELEM_BY_OID[arr_oid]
@@ -188,19 +196,27 @@ def _encode_array(value: Any, arr_oid: int, tag: str | None) -> bytes:
         for v in items:
             if v is None:
                 out += struct.pack("!i", -1)
-            else:
-                b = _encode_value(v, elem_oid, elem_tag)
-                out += struct.pack("!i", len(b)) + b
+                continue
+            if isinstance(v, str) and elem_tag not in ("text", "citext"):
+                # Elements parsed out of an array *text* literal are strings;
+                # the element's binary encoder needs the native value
+                # (``\x6162`` -> bytes, ``t`` -> bool, ``1`` -> int).
+                if elem_tag == "bool":
+                    v = v.strip().lower() in ("t", "true", "yes", "on", "1")
+                else:
+                    v = typemap.coerce(v, elem_tag)
+            b = _encode_value(v, elem_oid, elem_tag, encoding)
+            out += struct.pack("!i", len(b)) + b
     return bytes(out)
 
 
-def _decode_array(raw: bytes) -> list:
+def _decode_array(raw: bytes, encoding: str | None = "utf-8") -> list:
     """Decode a binary array parameter to a Python list (one dimension)."""
     ndim, _has_null, elem_oid = struct.unpack_from("!iii", raw, 0)
     if ndim == 0:
         return []
     n, _lbound = struct.unpack_from("!ii", raw, 12)
-    decoder = _BINARY.get(elem_oid)
+    decoder = None if elem_oid in (0, 25, 1043) else _BINARY.get(elem_oid)
     items: list = []
     off = 20
     for _ in range(n):
@@ -211,27 +227,36 @@ def _decode_array(raw: bytes) -> list:
             continue
         b = raw[off : off + length]
         off += length
-        items.append(decoder(b) if decoder is not None else b.decode("utf-8", "replace"))
+        items.append(decoder(b) if decoder is not None else pgwire.decode_text(b, encoding))
     return items
 
 
-def _encode_value(value: Any, oid: int, tag: str | None) -> bytes | None:
-    """Binary-encode a result value for ``oid``; None stays None (NULL on the wire)."""
+def _encode_value(
+    value: Any, oid: int, tag: str | None, encoding: str | None = "utf-8"
+) -> bytes | None:
+    """Binary-encode a result value for ``oid``; None stays None (NULL on the wire).
+
+    The binary form of text-shaped types is still text *in the client's
+    encoding* — Postgres converts those like the text format."""
     if value is None:
         return None
     enc = _OUT_BINARY.get(oid)
     if enc is not None:
         return enc(value)
     if oid in _ARRAY_ELEM_BY_OID:
-        return _encode_array(value, oid, tag)
-    if oid == 3802:  # jsonb: 1-byte version header + UTF-8 JSON text
-        return b"\x01" + (typemap.to_pg_text(value, tag) or b"")
-    # text / varchar / unknown: the binary form equals the text bytes.
-    return typemap.to_pg_text(value, tag) or b""
+        return _encode_array(value, oid, tag, encoding)
+    if oid == 3802:  # jsonb: 1-byte version header + JSON text (client encoding)
+        return b"\x01" + (pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b"")
+    # text / varchar / unknown: the binary form equals the (client-encoded) text bytes.
+    return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b""
 
 
-def _result_value(value: Any, fmt: int, oid: int, tag: str | None) -> bytes | None:
-    return _encode_value(value, oid, tag) if fmt == 1 else typemap.to_pg_text(value, tag)
+def _result_value(
+    value: Any, fmt: int, oid: int, tag: str | None, encoding: str | None = "utf-8"
+) -> bytes | None:
+    if fmt == 1:
+        return _encode_value(value, oid, tag, encoding)
+    return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding)
 
 
 def _column_formats(result_formats: list[int], ncols: int) -> list[int]:
@@ -243,17 +268,26 @@ def _column_formats(result_formats: list[int], ncols: int) -> list[int]:
     return [result_formats[i] if i < len(result_formats) else 0 for i in range(ncols)]
 
 
-def _decode_param(raw: bytes | None, fmt: int, oid: int) -> Any:
+def _reject_nul(text: str) -> str:
+    if "\x00" in text:
+        raise errors.SQLError("22021", 'invalid byte sequence for encoding "UTF8": 0x00')
+    return text
+
+
+def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = "utf-8") -> Any:
     if raw is None:
         return None
     if fmt == 0:  # text
-        return raw.decode("utf-8")
+        return _reject_nul(pgwire.decode_text(raw, encoding))
+    if oid in (0, 25, 1043):
+        # Binary text is still text in the client's encoding.
+        return _reject_nul(pgwire.decode_text(raw, encoding))
     decoder = _BINARY.get(oid)
     if decoder is not None:
         return decoder(raw)
     if oid in _ARRAY_ELEM_BY_OID:
-        return _decode_array(raw)
-    return raw.decode("utf-8", "replace")
+        return _decode_array(raw, encoding)
+    return raw.decode(encoding or "utf-8", "replace")
 
 
 class ExtendedSession:
@@ -289,7 +323,9 @@ class ExtendedSession:
             return pgwire.error_response("08P01", f"unexpected message type '{msg_type}'")
         except errors.SQLError as exc:
             self.skip_until_sync = True
-            return pgwire.error_response(exc.sqlstate, exc.message)
+            return pgwire.error_response(
+                exc.sqlstate, exc.message, encoding=self.session.wire_encoding
+            )
         except Exception:  # pragma: no cover - defensive
             logger.exception("error in extended protocol")
             self.skip_until_sync = True
@@ -300,7 +336,7 @@ class ExtendedSession:
     # -- handlers ----------------------------------------------------------- #
 
     def _parse(self, payload: bytes) -> bytes:
-        name, query, oids = pgwire.parse_parse(payload)
+        name, query, oids = pgwire.parse_parse(payload, self.session.wire_encoding)
         stmts = planner.parse(query)
         if len(stmts) > 1:
             raise errors.syntax_error("cannot insert multiple commands into a prepared statement")
@@ -333,7 +369,7 @@ class ExtendedSession:
             else:
                 fmt = formats[i]
             oid = prep.param_oids[i] if i < len(prep.param_oids) else 0
-            values.append(_decode_param(raw, fmt, oid))
+            values.append(_decode_param(raw, fmt, oid, self.session.wire_encoding))
         self.portals[portal] = Portal(portal, prep, values, result_formats=result_formats)
         return pgwire.bind_complete()
 
@@ -400,7 +436,7 @@ class ExtendedSession:
             for row in rows[portal.offset : end]:
                 out += pgwire.data_row(
                     [
-                        _result_value(v, f, c.pg_oid, c.type_tag)
+                        _result_value(v, f, c.pg_oid, c.type_tag, self.session.wire_encoding)
                         for v, f, c in zip(row, fmts, cols, strict=False)
                     ]
                 )

@@ -1222,11 +1222,18 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         tag = serial_tag or typemap.type_tag_for_sql(coldef.args["kind"])
         enum_name = None
         if tag is None:
-            # An unknown type name is a candidate enum type (stored as text,
-            # validated against the enum's labels at write time). If it isn't a
-            # declared enum, execute_create_table raises 42704.
-            enum_name = _enum_type_name(coldef.args["kind"])
-            if enum_name is not None:
+            named = _enum_type_name(coldef.args["kind"])
+            # A *quoted* built-in spelling (``"cidr"`` — psycopg's fixtures emit
+            # sql.Identifier(type) DDL) parses as user-defined; resolve it
+            # against the built-in registry before the enum fallback.
+            builtin = typemap.builtin_tag_for_name(named) if named is not None else None
+            if builtin is not None:
+                tag = builtin
+            elif named is not None:
+                # An unknown type name is a candidate enum type (stored as text,
+                # validated against the enum's labels at write time). If it isn't
+                # a declared enum, execute_create_table raises 42704.
+                enum_name = named
                 tag = "text"
         if tag is None:
             raise errors.feature_not_supported(
@@ -2624,6 +2631,18 @@ def plan_delete(stmt: exp.Delete, table: TableDef) -> DeletePlan:
     )
 
 
+def _py_elem_tag(value: Any) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (bytes, bytearray)):
+        return "bytea"
+    if isinstance(value, int):
+        return "int8"
+    if isinstance(value, float):
+        return "float8"
+    return "text"
+
+
 def _value_to_node(value: Any) -> exp.Expression:
     if value is None:
         return exp.Null()
@@ -2631,6 +2650,11 @@ def _value_to_node(value: Any) -> exp.Expression:
         return exp.Boolean(this=value)
     if isinstance(value, (int, float)):
         return exp.Literal.number(repr(value))
+    if isinstance(value, (list, tuple)):
+        # A binary array parameter decodes to a Python list; carry it as the
+        # Postgres array text literal (str() would embed the Python repr).
+        elem = next((v for v in value if v is not None), None)
+        return exp.Literal.string(typemap._render_pg_array(value, _py_elem_tag(elem)))
     return exp.Literal.string(str(value))
 
 

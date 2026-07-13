@@ -31,6 +31,7 @@ from secantus.sql import (
     virtual,
 )
 from secantus.sql import explain as explain_mod
+from secantus.sql import session as sql_session
 from secantus.sql.catalog import Catalog, Column, TableDef
 from secantus.sql.result import ColumnDesc, SQLResult
 from secantus.sql.session import (
@@ -1154,10 +1155,42 @@ def _describe_statement(
         while isinstance(arm, exp.SetOperation):
             arm = arm.left
         return _describe_statement(storage, db, arm, session, catalog)
+    if isinstance(stmt, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+        # A DML statement with RETURNING emits DataRows at Execute, so Describe
+        # must answer with their RowDescription — a NoData here followed by "D"
+        # messages is a protocol violation that crashes libpq clients
+        # (psycopg's pipelined executemany was the first to hit it).
+        return _describe_returning(storage, db, catalog, stmt)
     if not isinstance(stmt, exp.Select):
         return None
     table_node = stmt.find(exp.Table)
     planner.rewrite_pg_typeof(stmt, _pg_typeof_table(storage, db, catalog, table_node))
+    # A set-returning row source (``FROM generate_series(…)`` / a bare
+    # ``SELECT generate_series(…)``) — the constant-select planner would
+    # evaluate the SRF as a scalar and error. Derive the column shape the same
+    # way execution does; a shape that needs bound parameters defers to
+    # Execute's row description (NoData).
+    srf_source = srf.from_source(stmt) or srf.fromless_projection(stmt)
+    if srf_source is not None:
+        sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+        try:
+            _rows, tdef = srf.build(srf_source, sctx)
+            # Mirror _run_srf_select: the result shape is the outer projection
+            # planned over the synthetic SRF table, not the SRF's raw columns.
+            query = stmt
+            if stmt.args.get("from_") is None:
+                query = stmt.copy()
+                query.set("from", exp.From(this=exp.Table(this=exp.to_identifier(tdef.name))))
+                query.set("expressions", [exp.column(tdef.columns[0].name)])
+            srf_plan = planner.plan_select(query, tdef)
+        except (errors.SQLError, TypeError, ValueError):
+            return None
+        if srf_plan.count_star:
+            return [ColumnDesc(srf_plan.count_alias, "int8", typemap.PG_OID["int8"])]
+        return [
+            ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
+            for name, col in srf_plan.out_columns
+        ]
     if table_node is None:
         plan = planner.plan_constant_select(stmt, session)
         return [ColumnDesc(n, t, typemap.PG_OID.get(t, 25)) for n, t, _ in plan.columns]
@@ -1730,6 +1763,32 @@ def _validate_locks(stmt: exp.Select) -> None:
                     "42P01",
                     f'relation "{name}" in FOR UPDATE/SHARE clause not found in FROM clause',
                 )
+
+
+def _describe_returning(
+    storage: Any, db: str, catalog: Catalog, stmt: exp.Expression
+) -> list[ColumnDesc] | None:
+    """Result columns of a DML statement's RETURNING clause, or None when there
+    is no RETURNING (or the target can't be resolved — Execute then raises the
+    real error)."""
+    if stmt.args.get("returning") is None:
+        return None
+    table_node = stmt.find(exp.Table)
+    if table_node is None:
+        return None
+    tdef = catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
+    if tdef is None:
+        return None
+    try:
+        items = planner._returning_columns(stmt, tdef)
+    except errors.SQLError:
+        return None
+    if items is None:
+        return None
+    return [
+        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
+        for name, col, _expr in items
+    ]
 
 
 def _pg_typeof_table(storage: Any, db: str, catalog: Catalog, table_node: exp.Table | None):
@@ -3727,6 +3786,15 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
             else:
                 continue  # SET LOCAL outside a transaction — no lasting effect
         else:
+            if name.lower() == "client_encoding":
+                # Canonicalise (SHOW / ParameterStatus report the PG spelling)
+                # and reject encodings the wire layer can't convert.
+                canonical = sql_session.canonical_client_encoding(str(value))
+                if canonical is None:
+                    raise errors.SQLError(
+                        "22023", f'invalid value for parameter "client_encoding": "{value}"'
+                    )
+                value = canonical
             session.settings[name] = str(value)
         if name in REPORTABLE_GUCS:
             reported.append((name, str(value)))

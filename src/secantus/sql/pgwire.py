@@ -128,9 +128,52 @@ def read_message(sock: socket.socket) -> Message:
     return Message(type=type_byte.decode("latin-1"), payload=payload)
 
 
-def parse_query(payload: bytes) -> str:
+def decode_text(raw: bytes, encoding: str | None) -> str:
+    """Decode client-sent text per the connection's ``client_encoding``.
+
+    ``None`` (SQL_ASCII) performs no conversion — utf-8 + surrogateescape makes
+    arbitrary byte sequences round-trip losslessly through Python str."""
+    if encoding is None:
+        return raw.decode("utf-8", "surrogateescape")
+    return raw.decode(encoding)
+
+
+def encode_text(text: str, encoding: str | None, *, lossy: bool = False) -> bytes:
+    """Encode server text per the connection's ``client_encoding`` (inverse of
+    ``decode_text``).
+
+    Data conversion is strict: a character with no equivalent in the client
+    encoding raises 22P05, as Postgres does. ``lossy=True`` (error messages —
+    which must never raise while being delivered) degrades to ``?``."""
+    if encoding is None:
+        return text.encode("utf-8", "surrogateescape")
+    if lossy:
+        return text.encode(encoding, "replace")
+    try:
+        return text.encode(encoding)
+    except UnicodeEncodeError as exc:
+        from secantus.sql import errors as _errors
+
+        ch = text[exc.start]
+        raise _errors.SQLError(
+            "22P05",
+            f"character with byte sequence {ch.encode('utf-8').hex()} in encoding "
+            f'"UTF8" has no equivalent in the client encoding',
+        ) from exc
+
+
+def transcode_out(value: bytes | None, encoding: str | None) -> bytes | None:
+    """Re-encode a utf-8 result value for the client's encoding. The engine is
+    utf-8 throughout; this runs only at the wire boundary, and only when the
+    client asked for something else."""
+    if value is None or encoding is None or encoding == "utf-8":
+        return value
+    return encode_text(value.decode("utf-8", "surrogateescape"), encoding)
+
+
+def parse_query(payload: bytes, encoding: str | None = "utf-8") -> str:
     """Extract the SQL string from a 'Q' (Query) message payload."""
-    return payload.split(b"\x00", 1)[0].decode("utf-8")
+    return decode_text(payload.split(b"\x00", 1)[0], encoding)
 
 
 # --------------------------------------------------------------------------- #
@@ -143,10 +186,12 @@ def _read_cstr(payload: bytes, offset: int) -> tuple[str, int]:
     return payload[offset:end].decode("utf-8"), end + 1
 
 
-def parse_parse(payload: bytes) -> tuple[str, str, list[int]]:
+def parse_parse(payload: bytes, encoding: str | None = "utf-8") -> tuple[str, str, list[int]]:
     """'P' Parse: (statement_name, query, param_type_oids)."""
     name, offset = _read_cstr(payload, 0)
-    query, offset = _read_cstr(payload, offset)
+    end = payload.index(b"\x00", offset)
+    query = decode_text(payload[offset:end], encoding)
+    offset = end + 1
     (n,) = _INT16.unpack_from(payload, offset)
     offset += 2
     oids = [_INT32.unpack_from(payload, offset + 4 * i)[0] for i in range(n)]
@@ -316,7 +361,9 @@ def empty_query_response() -> bytes:
     return _msg("I", b"")
 
 
-def error_response(sqlstate: str, message: str, severity: str = "ERROR") -> bytes:
+def error_response(
+    sqlstate: str, message: str, severity: str = "ERROR", encoding: str | None = "utf-8"
+) -> bytes:
     # ErrorResponse is a sequence of (field-type byte, value cstring), ending
     # with a single NUL. S/V severity, C SQLSTATE, M human message are the
     # minimum libpq surfaces.
@@ -328,7 +375,8 @@ def error_response(sqlstate: str, message: str, severity: str = "ERROR") -> byte
         + b"C"
         + _cstr(sqlstate)
         + b"M"
-        + _cstr(message)
+        + encode_text(message, encoding, lossy=True)
+        + b"\x00"
         + b"\x00"
     )
     return _msg("E", payload)
