@@ -1538,6 +1538,14 @@ teardown. Remaining, worth tracking:
   handle grows a config surface.
 ## SQL / PostgreSQL interface — P0 spike limitations
 
+- [ ] **Cross-type comparisons evaluate to false instead of erroring.** A per-row
+  predicate comparing incompatible types (`int_col = substr(text_col, 1, 1)`)
+  quietly matches nothing; real Postgres raises `42883 operator does not exist:
+  bigint = text` at plan time. The scalar evaluator's Python `==` absorbs the
+  mismatch. Faithful behaviour needs type-aware comparison in the evaluator —
+  weigh against the dual-protocol reflected-table case where cross-BSON-type
+  comparison is deliberate.
+
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
 `tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
 

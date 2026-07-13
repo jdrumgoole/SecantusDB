@@ -180,11 +180,13 @@ def test_function_in_colref_predicate_through_join(storage, session):
     assert rows == [("e", 10), ("w", 40)]
 
 
-def test_unsupported_function_in_colref_predicate(storage, session):
-    # A function the aggregation engine can't lower (substr) is still 0A000.
-    with pytest.raises(SQLError) as ei:
-        q(storage, session, "SELECT _id FROM orders WHERE qty = substr(shipped, 1, 1)")
-    assert ei.value.sqlstate == "0A000"
+def test_function_in_colref_predicate_evaluates_per_row(storage, session):
+    # A predicate the pushdown can't lower (a scalar function against a column)
+    # now routes to per-row evaluation instead of 0A000. qty is an int and
+    # substr() yields text, and the evaluator's cross-type ``=`` is False —
+    # real Postgres would error 42883 (no int = text operator); the silent
+    # no-match is a documented divergence (tasks/backlog.md).
+    assert q(storage, session, "SELECT _id FROM orders WHERE qty = substr(shipped, 1, 1)") == []
 
 
 def test_unsupported_function_in_colref_predicate_through_group_by(storage, session):

@@ -2282,7 +2282,20 @@ def where_needs_per_row(
     # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
     if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
         return True
-    return any(_subquery_has_outer_ref(sub) for sub in node.find_all(exp.Select))
+    if any(_subquery_has_outer_ref(sub) for sub in node.find_all(exp.Select)):
+        return True
+    # Anything the pushdown lowering can't express — column arithmetic inside a
+    # comparison (``- b + a > -10``), a constant-LHS ``IN`` (``1 IN (2)``),
+    # ``NOT BETWEEN`` over expressions — is evaluated per-row rather than
+    # rejected. Dry-run the lowering to find out; the probe is skipped for
+    # subquery-bearing WHEREs (they need a live SubqueryCtx and are already
+    # routed by the checks above or supported by the pushdown path).
+    if table is not None and node.find(exp.Select) is None:
+        try:
+            _where_filter(stmt, table)
+        except errors.SQLError:
+            return True
+    return False
 
 
 def _is_net_operand(operand: exp.Expression, table: TableDef) -> bool:
@@ -3412,8 +3425,10 @@ def _plan_pipeline_select(
         plan = _plan_group_window_select(stmt, table)
     elif grouped:
         plan = _plan_group_select(stmt, table)
-    elif _stmt_needs_evaluation(stmt) or _distinct_on(stmt):
-        # DISTINCT ON needs the evaluated path's sort-then-keep-first-per-key.
+    elif _stmt_needs_evaluation(stmt) or _distinct_on(stmt) or where_needs_per_row(stmt, table):
+        # DISTINCT ON needs the evaluated path's sort-then-keep-first-per-key;
+        # a WHERE the pushdown can't lower (column arithmetic in a comparison,
+        # ``expr IS NOT NULL``) rides the same path as a per-row residual.
         plan = _build_evaluated_single(stmt, table)
     elif stmt.args.get("distinct"):
         plan = _plan_distinct_select(stmt, table)
@@ -3487,12 +3502,22 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
     order_node = stmt.args.get("order")
     if order_node is not None:
         for o in order_node.expressions:
-            # ORDER BY may name a SELECT output alias (``ORDER BY rank``) — Postgres
-            # resolves it to that output expression, so sorting a computed column
-            # (a ``ts_rank`` score, arithmetic, …) by its alias works.
+            # ORDER BY may name a SELECT output alias (``ORDER BY rank``) or a
+            # 1-based output ordinal (``ORDER BY 1``) — Postgres resolves both
+            # to that output expression, so sorting a computed column works.
             term = o.this
             if isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
                 term = alias_exprs[term.name]
+            elif (
+                isinstance(term, exp.Literal)
+                and not term.is_string
+                and str(term.this).isdigit()
+                and 1 <= int(term.this) <= len(out_exprs)
+                # An SRF output can't be the sort key pre-expansion (one source
+                # row fans out to many); leave the ordinal to the executor.
+                and _srf_of(out_exprs[int(term.this) - 1]) is None
+            ):
+                term = out_exprs[int(term.this) - 1]
             order.append((term, -1 if o.args.get("desc") else 1, _nulls_first(o)))
     limit, skip = _limit_skip(stmt)
     don = _distinct_on(stmt)
@@ -7321,6 +7346,11 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
             _lit_text = str(_lit_inner.this).lower()
             if "." in _lit_text or "e" in _lit_text:
                 return "numeric"
+        if isinstance(node, exp.Neg) and not isinstance(_lit_inner, (exp.Literal, exp.Null)):
+            # ``- col`` / ``- expr``: numeric negation keeps its operand's tag
+            # (_literal only extracts constants — it must not see a column).
+            _neg_tag = _infer_scalar_tag(_lit_inner, resolve)
+            return _neg_tag if _neg_tag in _NUMERIC_FAMILY else "numeric"
         return _infer_value_tag(_literal(node))
     if isinstance(node, exp.Case):
         # Type from the result branches (THEN values + ELSE), unified with the

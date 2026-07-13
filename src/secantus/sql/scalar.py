@@ -190,15 +190,34 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             return left is None
         return left == evaluate(node.expression, scope, ctx)
     if isinstance(node, exp.Not):
-        return not _truthy(evaluate(node.this, scope, ctx))
+        # Three-valued logic: NOT NULL is NULL (a WHERE treats it as
+        # not-matched), never TRUE.
+        inner = evaluate(node.this, scope, ctx)
+        return None if inner is None else not _truthy(inner)
     if isinstance(node, exp.And):
-        return _truthy(evaluate(node.this, scope, ctx)) and _truthy(
-            evaluate(node.expression, scope, ctx)
-        )
+        # Three-valued AND: FALSE dominates NULL (``NULL AND FALSE`` is FALSE —
+        # the distinction is visible under NOT), NULL when either side is
+        # unknown otherwise.
+        lv = evaluate(node.this, scope, ctx)
+        rv = evaluate(node.expression, scope, ctx)
+        lb = None if lv is None else _truthy(lv)
+        rb = None if rv is None else _truthy(rv)
+        if lb is False or rb is False:
+            return False
+        if lb is None or rb is None:
+            return None
+        return True
     if isinstance(node, exp.Or):
-        return _truthy(evaluate(node.this, scope, ctx)) or _truthy(
-            evaluate(node.expression, scope, ctx)
-        )
+        # Three-valued OR: TRUE dominates NULL.
+        lv = evaluate(node.this, scope, ctx)
+        rv = evaluate(node.expression, scope, ctx)
+        lb = None if lv is None else _truthy(lv)
+        rb = None if rv is None else _truthy(rv)
+        if lb is True or rb is True:
+            return True
+        if lb is None or rb is None:
+            return None
+        return False
     if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         return _eval_compare(node, scope, ctx)
     if isinstance(node, exp.Exists):
@@ -2618,12 +2637,24 @@ def _eval_in(node: exp.In, outer: Scope, ctx: ScalarContext) -> Any:
 
 
 def _eval_between(node: exp.Between, outer: Scope, ctx: ScalarContext) -> Any:
+    """``v BETWEEN low AND high`` decomposes to ``v >= low AND v <= high`` with
+    three-valued logic — a NULL bound yields FALSE (not NULL) when the other
+    comparison is already definitively false, which matters under NOT."""
     v = evaluate(node.this, outer, ctx)
     low = evaluate(node.args["low"], outer, ctx)
     high = evaluate(node.args["high"], outer, ctx)
-    if v is None or low is None or high is None:
+    lo_cmp = None if v is None or low is None else _cmp_ge(v, low)
+    hi_cmp = None if v is None or high is None else _cmp_ge(high, v)
+    if lo_cmp is False or hi_cmp is False:
+        return False
+    if lo_cmp is None or hi_cmp is None:
         return None
-    return low <= v <= high
+    return True
+
+
+def _cmp_ge(a: Any, b: Any) -> bool:
+    a, b = _unwrap_decimal(a), _unwrap_decimal(b)
+    return a >= b
 
 
 def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
