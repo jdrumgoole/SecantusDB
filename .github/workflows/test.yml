@@ -70,7 +70,7 @@ jobs:
         # full version sweep.
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
         # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
         # cloned all 12 vendored submodules — 11 of them driver-gauge repos
@@ -187,7 +187,7 @@ jobs:
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
         shard: [sql, core]
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
         # See the ``test`` job's twin step for why this replaces
         # ``submodules: recursive``.
@@ -283,7 +283,7 @@ jobs:
       matrix:
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
         # See the ``test`` job's twin step for why this replaces
         # ``submodules: recursive``.
@@ -362,7 +362,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
         # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
         # cloned all 12 vendored submodules — 11 of them driver-gauge repos
@@ -429,7 +429,7 @@ jobs:
   rust-storage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
         # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
         # cloned all 12 vendored submodules — 11 of them driver-gauge repos
@@ -515,7 +515,7 @@ jobs:
         # macOS excluded — built at release only (see top-of-file note).
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
         # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
         # cloned all 12 vendored submodules — 11 of them driver-gauge repos
