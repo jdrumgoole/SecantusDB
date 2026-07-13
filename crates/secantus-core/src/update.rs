@@ -7,17 +7,18 @@
 //! Handled: replacement-style updates, `$set`, `$setOnInsert`, `$unset`,
 //! `$inc`, `$mul`, `$push` (incl. the `$each` modifier form with `$position` /
 //! `$slice` / `$sort` — `1`/`-1` whole-element or `{field: dir}`, BSON-order),
-//! `$pop`, `$rename`, `$bit`, `$min`/`$max` (Python `<` for numeric / string /
-//! date pairs — cross-type defers), `$addToSet` (incl. `$each`), `$pull` (query
-//! semantics: element-value predicate / sub-document match / equality, via
-//! `query::matches`), `$pullAll` (literal equality via `expressions::py_eq`),
-//! plus `_id` immutability.
+//! `$pop`, `$rename`, `$bit`, `$min`/`$max` (BSON cross-type order over the
+//! sortable subset via `order::cmp` — null / number / string / objectId / date /
+//! doc / array; a missing field is set, an explicit-null is compared as rank 2),
+//! `$addToSet` (incl. `$each`), `$pull` (query semantics: element-value predicate /
+//! sub-document match / equality, via `query::matches`), `$pullAll` (literal
+//! equality via `expressions::py_eq`), plus `_id` immutability.
 //! Deferred to Python: pipeline (array) updates, positional operators
 //! (`$`/`$[]`/`$[id]`) and array filters, `$currentDate` (non-deterministic), a
 //! `$push` `$sort` over elements outside the sortable subset, a `$min`/`$max`
-//! comparison Python's `<` would raise (cross-type / Decimal128 / ObjectId /
-//! arrays), Decimal128 / non-numeric arithmetic, and every error condition (so
-//! Python raises the exact `UpdateError`).
+//! against a non-sortable operand (bool / Decimal128 / NaN / exotic — whose full
+//! order Python's `_bson_lt` handles), Decimal128 / non-numeric arithmetic, and
+//! every error condition (so Python raises the exact `UpdateError`).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -244,60 +245,6 @@ fn payload_doc(payload: &Bson) -> R<&Document> {
     match payload {
         Bson::Document(d) => Ok(d),
         _ => Err(Fallback),
-    }
-}
-
-/// Compare two BSON values the way Python's `<` / `>` would for `$min` / `$max`:
-/// `Some(Ordering)` only for the operand pairs Python compares *without raising*
-/// — both numeric (int / long / double / bool; exact when integral, else `f64`
-/// with a 2^53 safety bound so a large int can't lose precision), both strings
-/// (UTF-8 byte order == code-point order), or both dates. Any other pair
-/// (cross-type, Decimal128, ObjectId, arrays, NaN, …) returns `None`, which
-/// defers `$min`/`$max` to the Python oracle, whose `<` would raise or use an
-/// ordering not reproduced here.
-fn py_cmp(a: &Bson, b: &Bson) -> Option<Ordering> {
-    fn as_int(v: &Bson) -> Option<i64> {
-        match v {
-            Bson::Int32(n) => Some(*n as i64),
-            Bson::Int64(n) => Some(*n),
-            Bson::Boolean(x) => Some(*x as i64),
-            _ => None,
-        }
-    }
-    fn as_f(v: &Bson) -> Option<f64> {
-        match v {
-            Bson::Double(d) => Some(*d),
-            _ => as_int(v).map(|i| i as f64),
-        }
-    }
-    // Both integral (incl. bool) -> exact i64 comparison.
-    if let (Some(x), Some(y)) = (as_int(a), as_int(b)) {
-        return Some(x.cmp(&y));
-    }
-    let numeric = |v: &Bson| {
-        matches!(
-            v,
-            Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(_)
-        )
-    };
-    if numeric(a) && numeric(b) {
-        // One side is a double; refuse if an integer side can't be represented
-        // exactly as f64 (else the compare could diverge from Python's exact one).
-        for v in [a, b] {
-            if let Some(i) = as_int(v) {
-                if i.unsigned_abs() >= (1u64 << 53) {
-                    return None;
-                }
-            }
-        }
-        return as_f(a)?.partial_cmp(&as_f(b)?); // NaN -> None (defer)
-    }
-    match (a, b) {
-        (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
-        (Bson::DateTime(x), Bson::DateTime(y)) => {
-            Some(x.timestamp_millis().cmp(&y.timestamp_millis()))
-        }
-        _ => None,
     }
 }
 
@@ -588,17 +535,26 @@ fn apply_op(
             let want_less = op == "$min"; // $min sets when value < current
             for (path, value) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
-                    // Python treats an absent *or null* field as "no current" and
-                    // always sets (`current is None`); else it compares.
+                    // A *missing* field is set unconditionally; a present field
+                    // (incl. an explicit null, rank 2) is compared by MongoDB's BSON
+                    // cross-type order. `order::cmp` covers the sortable subset
+                    // (null / number / string / objectId / date / doc / array); a
+                    // bool / Decimal128 / NaN / exotic operand isn't in it, so defer
+                    // to Python (whose `_bson_lt` handles the full order).
                     let should_set = match get_path(result, &cpath) {
-                        None | Some(Bson::Null) => true,
+                        None => true,
                         Some(current) => {
-                            let ord = py_cmp(value, current).ok_or(Fallback)?;
-                            if want_less {
-                                ord == Ordering::Less
-                            } else {
-                                ord == Ordering::Greater
+                            if !crate::order::is_sortable(current)
+                                || !crate::order::is_sortable(value)
+                            {
+                                return Err(Fallback);
                             }
+                            let ord = if want_less {
+                                crate::order::cmp(value, current) // value < current
+                            } else {
+                                crate::order::cmp(current, value) // current < value
+                            };
+                            ord == Ordering::Less
                         }
                     };
                     if should_set {
@@ -831,8 +787,14 @@ mod tests {
         // _id change, mixing, cross-type $min, pipeline-only ops -> Fallback.
         assert!(apply_update(&doc! {"_id": 1}, &doc! {"$set": {"_id": 2}}, false).is_err());
         assert!(apply_update(&doc! {"a": 1}, &doc! {"$set": {"a": 1}, "b": 2}, false).is_err());
-        // Numeric $min now computes; a cross-type compare (Python `<` raises) defers.
-        assert!(apply_update(&doc! {"a": 1}, &doc! {"$min": {"a": "x"}}, false).is_err());
+        // $min/$max now compare cross-type by BSON order (number < string), so a
+        // string vs a number computes: $min keeps the (smaller) number.
+        assert_eq!(
+            apply_update(&doc! {"a": 1}, &doc! {"$min": {"a": "x"}}, false).unwrap(),
+            doc! {"a": 1}
+        );
+        // A non-sortable operand (bool) still defers so Python's _bson_lt handles it.
+        assert!(apply_update(&doc! {"a": 5}, &doc! {"$max": {"a": true}}, false).is_err());
         // Bare `apply_update` (no positional_matches) can't resolve `$` -> defer.
         assert!(apply_update(&doc! {"a": [1]}, &doc! {"$set": {"a.$": 9}}, false).is_err());
         // $inc / $mul on an explicit-null field -> defer so Python raises the
