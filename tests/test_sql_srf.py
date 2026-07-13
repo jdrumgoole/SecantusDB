@@ -335,7 +335,8 @@ def test_computed_projection_over_catalog_table():
     try:
         sess = Session(database=DB)
         run_sql(st, DB, "create table pc (a int4)", session=sess)
-        res = run_sql(st, DB, "select upper(relname) from pg_class where relname = 'pc'", session=sess)[-1]
+        sql = "select upper(relname) from pg_class where relname = 'pc'"
+        res = run_sql(st, DB, sql, session=sess)[-1]
         assert res.rows == [("PC",)]
         res = run_sql(st, DB, "select 1 from pg_namespace limit 1", session=sess)[-1]
         assert res.rows == [(1,)]
