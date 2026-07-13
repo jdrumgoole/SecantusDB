@@ -20,6 +20,7 @@ and ``bytea`` to a hex string. Decimal128 is the exact fit for ``numeric``.
 from __future__ import annotations
 
 import datetime as _dt
+import decimal as _decimal
 import json as _json
 from decimal import Decimal
 from typing import Any
@@ -35,6 +36,8 @@ PG_OID: dict[str, int] = {
     "int8": 20,
     "int2": 21,
     "int4": 23,
+    # oid: an unsigned int4-like object identifier (psycopg's Oid wrapper).
+    "oid": 26,
     "text": 25,
     "float4": 700,
     "float8": 701,
@@ -53,14 +56,17 @@ PG_OID: dict[str, int] = {
     "int4range": 3904,
     "numrange": 3906,
     "tsrange": 3908,
+    "tstzrange": 3910,
     "int8range": 3926,
     "daterange": 3912,
-    # Multirange types render as the ``{[a,b), [c,d)}`` text form.
+    # Multirange types render as the ``{[a,b),[c,d)}`` text form.
     "int4multirange": 4451,
     "nummultirange": 4532,
     "tsmultirange": 4533,
+    "tstzmultirange": 4534,
     "datemultirange": 4535,
     "int8multirange": 4536,
+    # oid — an unsigned 4-byte object identifier.
     # Full-text search types.
     "tsvector": 3614,
     "tsquery": 3615,
@@ -124,12 +130,19 @@ _GEO_TAGS = frozenset({"point", "lseg", "path", "box", "polygon", "line", "circl
 _VECTOR_TAGS = frozenset({"int2vector", "oidvector"})
 
 # Range type tags — stored as a subdocument, rendered as ``[lower,upper)``.
-_RANGE_TAGS = frozenset({"int4range", "int8range", "numrange", "tsrange", "daterange"})
+_RANGE_TAGS = frozenset({"int4range", "int8range", "numrange", "tsrange", "tstzrange", "daterange"})
 
 # Multirange type tags — stored as ``{"multirange": [range, …]}``, rendered as
-# ``{[a,b), [c,d)}``.
+# ``{[a,b),[c,d)}``.
 _MULTIRANGE_TAGS = frozenset(
-    {"int4multirange", "int8multirange", "nummultirange", "tsmultirange", "datemultirange"}
+    {
+        "int4multirange",
+        "int8multirange",
+        "nummultirange",
+        "tsmultirange",
+        "tstzmultirange",
+        "datemultirange",
+    }
 )
 
 # Internal type tag -> SQL type name (for information_schema.columns.data_type
@@ -138,6 +151,7 @@ SQL_TYPE_NAME: dict[str, str] = {
     "int2": "smallint",
     "int4": "integer",
     "int8": "bigint",
+    "oid": "oid",
     "float4": "real",
     "float8": "double precision",
     "numeric": "numeric",
@@ -171,6 +185,7 @@ PG_TYPENAME: dict[str, str] = {
     "int2": "int2",
     "int4": "int4",
     "int8": "int8",
+    "oid": "oid",
     "float4": "float4",
     "float8": "float8",
     "numeric": "numeric",
@@ -217,6 +232,9 @@ _REGTYPE_SPELLINGS: dict[str, str] = {
     "json": "json",
     "timestamptz": "timestamptz",
     "timetz": "timetz",
+    # ``"oid"[]`` DDL can't survive sqlglot's OID keyword; ``planner.parse``
+    # rewrites it to this quoted spelling, which resolves back here.
+    "secantus_oid": "oid",
 }
 
 
@@ -232,6 +250,19 @@ def builtin_tag_for_name(name: str) -> str | None:
         elem = builtin_tag_for_name(key[:-2])
         return f"{elem}[]" if elem is not None and f"{elem}[]" in PG_OID else None
     return _REGTYPE_SPELLINGS.get(key.split("(", 1)[0].strip())
+
+
+def regtype_from_oid(oid: int) -> str | None:
+    """The pretty spelling ``<oid>::regtype`` prints for a type OID (``21`` ->
+    ``smallint``, ``1005`` -> ``smallint[]``), or None for an OID we don't model
+    (the caller raises Postgres' 42704 undefined_object)."""
+    tag = OID_TO_TAG.get(oid)
+    if tag is None:
+        return None
+    if is_array_tag(tag):
+        elem = array_element_tag(tag)
+        return f"{SQL_TYPE_NAME.get(elem, elem)}[]"
+    return SQL_TYPE_NAME.get(tag, tag)
 
 
 def normalize_regtype(name: str) -> str:
@@ -294,6 +325,7 @@ _ARRAY_PG_OID: dict[str, int] = {
     "int8": 1016,
     "int2": 1005,
     "int4": 1007,
+    "oid": 1028,
     "text": 1009,
     "float4": 1021,
     "float8": 1022,
@@ -337,8 +369,17 @@ _ARRAY_PG_OID: dict[str, int] = {
     "int4range": 3905,
     "numrange": 3907,
     "tsrange": 3909,
+    "tstzrange": 3911,
     "int8range": 3927,
     "daterange": 3913,
+    # Multirange types.
+    "int4multirange": 6150,
+    "nummultirange": 6151,
+    "tsmultirange": 6152,
+    "tstzmultirange": 6153,
+    "datemultirange": 6155,
+    "int8multirange": 6157,
+    # oid.
 }
 
 # Register the array tags (``text[]`` -> 1009, ...) in PG_OID so the wire layer's
@@ -390,6 +431,10 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return base
     if base == "citext":
         return "citext"
+    # ``oid`` parses as an ``exp.ObjectIdentifier`` (whose ``.sql()`` is "OID"),
+    # not a DataType enum member — match on the rendered name.
+    if base == "oid":
+        return "oid"
     return None
 
 
@@ -544,19 +589,42 @@ def coerce(value: Any, tag: str) -> Any:
         from secantus.sql import xmltype as _xmltype
 
         return _xmltype.parse(value)
-    if tag in ("int2", "int4"):
+    if tag in ("int2", "int4", "oid"):
         return int(value)
+    if tag == "oid":
+        # oid is an unsigned 32-bit integer; Postgres' input/cast reinterprets a
+        # negative value modulo 2^32 ((-1)::oid -> 4294967295).
+        return int(value) & 0xFFFFFFFF
     if tag == "int8":
         return bson.Int64(int(value))
     if tag in ("float4", "float8"):
         return float(value)
     if tag == "numeric":
-        return bson.Decimal128(value if isinstance(value, Decimal) else Decimal(str(value)))
+        d = value if isinstance(value, Decimal) else Decimal(str(value))
+        try:
+            return bson.Decimal128(d)
+        except _decimal.DecimalException:
+            # Decimal128 holds 34 significant digits; a longer Decimal (from a
+            # binary numeric parameter) rounds into range rather than erroring —
+            # see tasks/backlog.md (numeric precision beyond Decimal128).
+            from bson.decimal128 import create_decimal128_context
+
+            with _decimal.localcontext(create_decimal128_context()) as ctx:
+                return bson.Decimal128(ctx.create_decimal(d))
     if tag in ("text", "citext"):
         # citext stores the original text verbatim (case preserved for display);
         # the case-insensitivity is applied by the query planner, not on write.
         return str(value)
     if tag == "bool":
+        if isinstance(value, str):
+            # A text-format bound parameter / literal arrives as Postgres' bool
+            # spelling — ``bool("f")`` would be True, so parse it properly.
+            s = value.strip().lower()
+            if s in ("t", "true", "yes", "on", "1"):
+                return True
+            if s in ("f", "false", "no", "off", "0"):
+                return False
+            raise ValueError(f"invalid input syntax for type boolean: {value!r}")
         return bool(value)
     if tag == "timestamptz":
         if isinstance(value, _dt.datetime):
@@ -582,7 +650,8 @@ def coerce(value: Any, tag: str) -> Any:
             return _datetimes.parse_time(value)
         return _datetimes.parse_timetz(value)
     if tag == "json":
-        return _json.loads(value) if isinstance(value, str) else value
+        parsed = _json.loads(value) if isinstance(value, str) else value
+        return _bson_safe_json(parsed)
     if tag == "bytea":
         from secantus.sql import bytea as _bytea
 
@@ -595,6 +664,45 @@ def coerce(value: Any, tag: str) -> Any:
         # constant and the stored value compare equal.
         return _bytea.parse(value)
     return value
+
+
+#: BSON int64 bounds — a JSON number outside them can't be stored as a BSON int.
+_INT64_MIN, _INT64_MAX = -(1 << 63), (1 << 63) - 1
+
+
+def _bson_safe_json(value: Any) -> Any:
+    """Make a parsed JSON value BSON-encodable: an int beyond int64 range (JSON
+    numbers are arbitrary-precision in Postgres) is stored as ``Decimal128``.
+    ``_render_json`` renders it back as a bare number."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not (_INT64_MIN <= value <= _INT64_MAX):
+        return bson.Decimal128(Decimal(value))
+    if isinstance(value, list):
+        return [_bson_safe_json(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _bson_safe_json(v) for k, v in value.items()}
+    return value
+
+
+def _render_json(value: Any) -> str:
+    """Render a stored JSON value as text. Identical to ``json.dumps`` except
+    that a ``Decimal128`` (an int that overflowed BSON's int64 — see
+    ``_bson_safe_json``) renders as a bare number, not a quoted string."""
+    if isinstance(value, bson.Decimal128):
+        return str(value.to_decimal())
+    if isinstance(value, Decimal):
+        # ``to_py`` unwraps a top-level Decimal128 column value to Decimal.
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_render_json(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return (
+            "{"
+            + ", ".join(f"{_json.dumps(str(k))}: {_render_json(v)}" for k, v in value.items())
+            + "}"
+        )
+    return _json.dumps(value, default=str)
 
 
 def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
@@ -613,6 +721,10 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     if is_array_tag(tag) and isinstance(value, (list, tuple)):
         elem = array_element_tag(tag)
         return _render_pg_array(value, elem).encode("utf-8")
+    if tag == "json":
+        # A JSON value renders as JSON text whatever its top-level type — a bare
+        # ``true`` / ``"str"`` must not fall through to the bool/str renderers.
+        return _render_json(value).encode("utf-8")
     if isinstance(value, bool):
         return b"t" if value else b"f"
     if isinstance(value, (bytes, bytearray)):
@@ -632,11 +744,11 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     if tag in _RANGE_TAGS and isinstance(value, dict):
         from secantus.sql import ranges as _ranges
 
-        return _ranges.render(value).encode("utf-8")
+        return _ranges.render(value, tag).encode("utf-8")
     if tag in _MULTIRANGE_TAGS and isinstance(value, dict):
         from secantus.sql import ranges as _ranges
 
-        return _ranges.render_multirange(value).encode("utf-8")
+        return _ranges.render_multirange(value, tag).encode("utf-8")
     if tag == "tsvector" and isinstance(value, dict):
         from secantus.sql import fts as _fts
 
@@ -668,7 +780,9 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     if tag == "composite" and isinstance(value, dict):
         return _render_pg_composite(value).encode("utf-8")
     if isinstance(value, (dict, list)):
-        return _json.dumps(value, default=str).encode("utf-8")
+        return _render_json(value).encode("utf-8")
+    if isinstance(value, bson.Decimal128):
+        return str(value.to_decimal()).encode("utf-8")
     return str(value).encode("utf-8")
 
 

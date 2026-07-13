@@ -13,14 +13,23 @@ from __future__ import annotations
 import datetime as _dt
 from typing import Any
 
+import bson
+
 # type tag -> (element tag, is_discrete). Discrete ranges canonicalise to ``[)``.
 RANGE_TYPES: dict[str, tuple[str, bool]] = {
     "int4range": ("int4", True),
     "int8range": ("int8", True),
     "numrange": ("numeric", False),
     "tsrange": ("timestamptz", False),
+    "tstzrange": ("timestamptz", False),
     "daterange": ("timestamptz", True),
 }
+
+
+def _cv(v: Any) -> Any:
+    """A bound value made comparable: ``bson.Decimal128`` (a ``numrange`` bound's
+    storage form) has no ordering operators, so unwrap it to ``Decimal``."""
+    return v.to_decimal() if isinstance(v, bson.Decimal128) else v
 
 
 def is_range_tag(tag: str | None) -> bool:
@@ -59,7 +68,9 @@ def make_range(lower: Any, upper: Any, bounds: str, tag: str) -> dict[str, Any]:
     if (
         lower is not None
         and upper is not None
-        and (lower > upper or (lower == upper and not (lower_inc and upper_inc)))
+        and (
+            _cv(lower) > _cv(upper) or (_cv(lower) == _cv(upper) and not (lower_inc and upper_inc))
+        )
     ):
         return {"empty": True}
     return {"lower": lower, "upper": upper, "lower_inc": lower_inc, "upper_inc": upper_inc}
@@ -81,7 +92,8 @@ def contains_value(rng: Any, value: Any) -> bool:
     """Does ``rng`` contain the scalar ``value``?"""
     if value is None or is_empty(rng) or not isinstance(rng, dict):
         return False
-    lo, hi = rng.get("lower"), rng.get("upper")
+    value = _cv(value)
+    lo, hi = _cv(rng.get("lower")), _cv(rng.get("upper"))
     if lo is not None and (value < lo or (value == lo and not rng.get("lower_inc"))):
         return False
     return not (hi is not None and (value > hi or (value == hi and not rng.get("upper_inc"))))
@@ -89,7 +101,7 @@ def contains_value(rng: Any, value: Any) -> bool:
 
 def _lower_le(a: dict, b: dict) -> bool:
     """Is a's lower bound <= b's lower bound (unbounded lower is smallest)?"""
-    la, lb = a.get("lower"), b.get("lower")
+    la, lb = _cv(a.get("lower")), _cv(b.get("lower"))
     if la is None:
         return True
     if lb is None:
@@ -101,7 +113,7 @@ def _lower_le(a: dict, b: dict) -> bool:
 
 def _upper_ge(a: dict, b: dict) -> bool:
     """Is a's upper bound >= b's upper bound (unbounded upper is largest)?"""
-    ua, ub = a.get("upper"), b.get("upper")
+    ua, ub = _cv(a.get("upper")), _cv(b.get("upper"))
     if ua is None:
         return True
     if ub is None:
@@ -129,7 +141,7 @@ def overlaps(a: Any, b: Any) -> bool:
 
 def _after_lower(hi_side: dict, lo_side: dict) -> bool:
     """Does ``hi_side``'s upper bound reach ``lo_side``'s lower bound?"""
-    up, lo = hi_side.get("upper"), lo_side.get("lower")
+    up, lo = _cv(hi_side.get("upper")), _cv(lo_side.get("lower"))
     if up is None or lo is None:
         return True
     if up != lo:
@@ -137,24 +149,47 @@ def _after_lower(hi_side: dict, lo_side: dict) -> bool:
     return bool(hi_side.get("upper_inc")) and bool(lo_side.get("lower_inc"))
 
 
-def _fmt(value: Any) -> str:
+def _fmt(value: Any, tag: str | None = None) -> str:
     if value is None:
         return ""
+    if isinstance(value, bson.Decimal128):
+        return str(value.to_decimal())
     if isinstance(value, _dt.datetime):
+        # A ``daterange`` bound is stored as a datetime (BSON has no date-only
+        # value) but renders as its date, the way Postgres prints it.
+        if tag == "daterange":
+            return value.date().isoformat()
+        # A stored ``tstzrange`` bound decodes tz-naive UTC from BSON; Postgres
+        # renders timestamptz bounds with their UTC offset.
+        if tag == "tstzrange" and value.tzinfo is None:
+            value = value.replace(tzinfo=_dt.timezone.utc)
         return value.isoformat(sep=" ")
     if isinstance(value, _dt.date):
         return value.isoformat()
     return str(value)
 
 
-def render(rng: Any) -> str:
+def _quote_bound(text: str) -> str:
+    """Double-quote a rendered bound the way Postgres does when it contains
+    characters that would confuse the range literal grammar."""
+    if text and not any(ch in text for ch in ' ,"\\[]()'):
+        return text
+    if text == "":
+        return '""'
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def render(rng: Any, tag: str | None = None) -> str:
     """Render a range as the Postgres text form ``[lower,upper)`` (``empty`` for the
-    empty range)."""
+    empty range). ``tag`` selects element-specific bound rendering."""
     if is_empty(rng) or not isinstance(rng, dict):
         return "empty"
     lb = "[" if rng.get("lower_inc") else "("
     ub = "]" if rng.get("upper_inc") else ")"
-    return f"{lb}{_fmt(rng.get('lower'))},{_fmt(rng.get('upper'))}{ub}"
+    lo, hi = rng.get("lower"), rng.get("upper")
+    lo_s = _quote_bound(_fmt(lo, tag)) if lo is not None else ""
+    hi_s = _quote_bound(_fmt(hi, tag)) if hi is not None else ""
+    return f"{lb}{lo_s},{hi_s}{ub}"
 
 
 def _pick_lower(a: dict, b: dict, *, smallest: bool) -> dict[str, Any]:
@@ -203,7 +238,7 @@ def adjacent(a: Any, b: Any) -> bool:
 def _touches(left: dict, right: dict) -> bool:
     """Does ``left``'s upper bound meet ``right``'s lower bound with exactly one
     side inclusive (so they abut without overlapping or leaving a gap)?"""
-    up, lo = left.get("upper"), right.get("lower")
+    up, lo = _cv(left.get("upper")), _cv(right.get("lower"))
     if up is None or lo is None or up != lo:
         return False
     return bool(left.get("upper_inc")) != bool(right.get("lower_inc"))
@@ -257,6 +292,7 @@ MULTIRANGE_TYPES: dict[str, str] = {
     "int8multirange": "int8range",
     "nummultirange": "numrange",
     "tsmultirange": "tsrange",
+    "tstzmultirange": "tstzrange",
     "datemultirange": "daterange",
 }
 
@@ -284,7 +320,7 @@ def make_multirange(rngs: list) -> dict[str, Any]:
 
 
 def _lower_sort_key(rng: dict):
-    lo = rng.get("lower")
+    lo = _cv(rng.get("lower"))
     return (0,) if lo is None else (1, lo, 0 if rng.get("lower_inc") else 1)
 
 
@@ -331,9 +367,12 @@ def overlaps_any(a: Any, b: Any) -> bool:
     return any(overlaps(x, y) for x in am for y in bm)
 
 
-def render_multirange(mr: Any) -> str:
-    """Render a multirange as the Postgres text form ``{[1,5), [10,20)}``."""
-    return "{" + ", ".join(render(r) for r in multirange_members(mr)) + "}"
+def render_multirange(mr: Any, tag: str | None = None) -> str:
+    """Render a multirange as the Postgres text form ``{[1,5),[10,20)}`` (no
+    space after the separator — Postgres prints it exactly like this). ``tag``
+    is the multirange type; members render as its range type."""
+    range_tag = MULTIRANGE_TYPES.get(tag) if tag else None
+    return "{" + ",".join(render(r, range_tag) for r in multirange_members(mr)) + "}"
 
 
 def parse_multirange(text: str, tag: str, coerce: Any) -> dict[str, Any]:

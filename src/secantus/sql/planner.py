@@ -17,9 +17,11 @@ import contextvars
 import functools
 import json
 import logging
+import math as _math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from decimal import Decimal as _Decimal
 from typing import Any
 
 import sqlglot
@@ -403,7 +405,10 @@ def _serial_tag(datatype: exp.Expression) -> str | None:
     """The integer type tag a SERIAL/BIGSERIAL/SMALLSERIAL column stores as, or
     None when ``datatype`` isn't a serial pseudo-type."""
     if isinstance(datatype, exp.DataType):
-        return _SERIAL_TAGS.get(datatype.this.name if datatype.this else "")
+        # ``datatype.this`` is normally a DataType.Type enum, but sqlglot keeps a
+        # plain string for some keyword types (``OID``).
+        this = datatype.this
+        return _SERIAL_TAGS.get(getattr(this, "name", str(this)) if this else "")
     return None
 
 
@@ -2648,8 +2653,22 @@ def _value_to_node(value: Any) -> exp.Expression:
         return exp.Null()
     if isinstance(value, bool):
         return exp.Boolean(this=value)
+    if isinstance(value, float) and not _math.isfinite(value):
+        # ``repr(inf)`` is not a parseable numeric literal; carry the Postgres
+        # spelling through a float8 cast (the cast evaluator converts it back).
+        text = "NaN" if _math.isnan(value) else ("-Infinity" if value < 0 else "Infinity")
+        return exp.Cast(this=exp.Literal.string(text), to=exp.DataType.build("double"))
     if isinstance(value, (int, float)):
         return exp.Literal.number(repr(value))
+    if isinstance(value, _Decimal):
+        # A numeric parameter must stay numeric — a bare string literal would
+        # compare as text (``'…'::numeric = $1`` false) and lose the declared
+        # type. The cast round-trips the exact digits.
+        return exp.Cast(this=exp.Literal.string(str(value)), to=exp.DataType.build("decimal"))
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        # A binary ``bytea`` parameter — carry it as the ``\x…`` hex text literal
+        # (str() would embed the Python ``b'…'`` repr).
+        return exp.Literal.string("\\x" + bytes(value).hex())
     if isinstance(value, (list, tuple)):
         # A binary array parameter decodes to a Python list; carry it as the
         # Postgres array text literal (str() would embed the Python repr).
@@ -7038,8 +7057,25 @@ def rewrite_pg_typeof(
             name = _pg_typeof_name(node.expressions[0], resolve, param_oids)
         except errors.SQLError:
             continue  # let the normal path surface the real error
+        parent = node.parent
+        # ``pg_typeof(x)::oid`` — regtype casts to oid as the type's OID, not its
+        # name text. Rewrite the inner call to the OID integer so the surrounding
+        # ``::oid`` cast types (OID 26) and coerces it as an oid value; the cast
+        # column keeps Postgres' output name (``pg_typeof``).
+        if (
+            isinstance(parent, exp.Cast)
+            and parent.to is not None
+            and typemap.type_tag_for_sql(parent.to) == "oid"
+        ):
+            tag = typemap.builtin_tag_for_name(name)
+            type_oid = typemap.PG_OID.get(tag) if tag is not None else None
+            if type_oid is not None:
+                node.replace(exp.Literal.number(type_oid))
+                if isinstance(parent.parent, exp.Select):
+                    parent.replace(exp.alias_(parent.copy(), "pg_typeof"))
+                continue
         replacement: exp.Expression = exp.Literal.string(name)
-        if isinstance(node.parent, exp.Select):
+        if isinstance(parent, exp.Select):
             replacement = exp.alias_(replacement, "pg_typeof")
         node.replace(replacement)
 
@@ -7251,6 +7287,7 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
                 "int2",
                 "int4",
                 "int8",
+                "oid",
                 "float4",
                 "float8",
                 "numeric",
@@ -7919,6 +7956,13 @@ def _normalize_params(sql: str) -> str:
 
 
 _RELEASE_SAVEPOINT_RE = re.compile(r"(?i)\brelease\s+savepoint\b")
+# sqlglot's Postgres dialect can't parse an ``oid`` array column type (``oid[]``
+# / ``"oid"[]``) — the OID keyword refuses the array suffix. Rewrite the element
+# name to a quoted spelling that parses as a user-defined type array and
+# resolves back to the ``oid`` tag via ``typemap._REGTYPE_SPELLINGS``. Applied
+# only to CREATE TABLE statements (see ``parse``).
+_OID_ARRAY_RE = re.compile(r'(?i)("?)\boid\1(\s*\[\s*\])')
+_CREATE_TABLE_RE = re.compile(r"(?i)^\s*create\s+(?:\w+\s+)*?table\b")
 # sqlglot's Postgres dialect can't parse ``MOVE`` (cursor positioning) at all, so
 # a lone MOVE statement is hand-built into the same ``Command`` shape FETCH gets.
 _MOVE_RE = re.compile(r"^\s*MOVE\b\s*(?P<tail>.*?)\s*;?\s*$", re.IGNORECASE | re.DOTALL)
@@ -7960,6 +8004,10 @@ def parse(sql: str) -> list[exp.Expression]:
     # (the standard form SQLAlchemy / psycopg emit) — drop the redundant keyword.
     # Savepoint commands are standalone, so this can't touch a string literal.
     sql = _RELEASE_SAVEPOINT_RE.sub("RELEASE", sql)
+    # ``oid[]`` column types don't parse (sqlglot's OID keyword rejects the array
+    # suffix) — rewrite the element name inside CREATE TABLE only.
+    if _CREATE_TABLE_RE.match(sql):
+        sql = _OID_ARRAY_RE.sub(r'"secantus_oid"\2', sql)
     # sqlglot can't parse ``COMMENT ON … IS NULL`` (it requires a string
     # expression), so a NULL comment (comment removal) is rewritten to a sentinel
     # the executor reads back as "remove". COMMENT statements are standalone.

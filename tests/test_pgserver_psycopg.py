@@ -491,3 +491,143 @@ def test_copy_bare_options_spelling(server):
             copy.set_types(["text"])
             assert copy.read_row() == ("€",)
             assert copy.read_row() is None
+
+
+def test_oid_type_roundtrip(server):
+    """``%s::oid`` describes with OID 26 and round-trips as an unsigned
+    int4-like integer, in both the text and binary result formats."""
+    with connect(server, autocommit=True) as conn:
+        for binary in (False, True):
+            cur = conn.cursor(binary=binary)
+            cur.execute("select %s::oid", (26,))
+            assert cur.description[0].type_code == 26
+            row = cur.fetchone()
+            assert row == (26,)
+            assert type(row[0]) is int
+            # oid is unsigned: the full 32-bit range survives the round-trip.
+            cur.execute("select %s::oid", (4294967295,))
+            assert cur.fetchone() == (4294967295,)
+            cur.execute("select '26'::oid")
+            assert cur.fetchone() == (26,)
+            # arrays: element OID 26, array OID 1028.
+            cur.execute("select array[%s::oid]", (21,))
+            assert cur.description[0].type_code == 1028
+            assert cur.fetchone() == ([21],)
+
+
+def test_oid_column_in_table(server):
+    with connect(server, autocommit=True) as conn:
+        conn.execute("create table oids (c oid)")
+        conn.execute("insert into oids values (%s)", (26,))
+        cur = conn.execute("select c from oids")
+        assert cur.description[0].type_code == 26
+        assert cur.fetchone() == (26,)
+
+
+def test_pg_typeof_param_cast_to_oid(server):
+    """psycopg's test_repr_wrapper pattern: ``pg_typeof(%s)::oid`` resolves to
+    the declared parameter type's OID (including oid itself)."""
+    from psycopg.types.numeric import Int2, Int8, Oid
+
+    with connect(server, autocommit=True) as conn:
+        assert conn.execute("select pg_typeof(%s)::oid", [Int2(0)]).fetchone() == (21,)
+        assert conn.execute("select pg_typeof(%s)::oid", [Int8(0)]).fetchone() == (20,)
+        assert conn.execute("select pg_typeof(%s)::oid", [Oid(0)]).fetchone() == (26,)
+
+
+def test_regtype_from_oid_over_wire(server):
+    from psycopg.types.numeric import Int4
+
+    with connect(server, autocommit=True) as conn:
+        assert conn.execute("select 21::regtype").fetchone() == ("smallint",)
+        assert conn.execute("select pg_typeof(%s) = %s::regtype", [Int4(1), 23]).fetchone() == (
+            True,
+        )
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            conn.execute("select 99999::regtype")
+
+
+def test_declared_param_oid_drives_result_encoding(server):
+    """The RowDescription for a bare ``select $1`` reports the OID the client
+    declared in Parse (Int2 -> 21, Float4 -> 700, ...). The DataRow encoding
+    must match that claim for every param wire format x result format combo —
+    the execute path used to encode the engine-inferred type instead, sending
+    e.g. 4-byte int4 (or raw text) bytes in a column described as binary int2."""
+    from psycopg.types.numeric import Float4, Float8, Int2, Int4, Int8, Oid
+
+    cases = [(Int2, 21), (Int4, 21), (Int8, 21), (Oid, 21), (Float4, 1.5), (Float8, 1.5)]
+    with connect(server, autocommit=True) as conn:
+        for fmt in ("s", "t", "b"):
+            for binary in (False, True):
+                for wrapper, val in cases:
+                    cur = conn.cursor(binary=binary)
+                    got = cur.execute(f"select %{fmt}", (wrapper(val),)).fetchone()[0]
+                    assert got == val, (fmt, binary, wrapper.__name__)
+
+
+def test_text_format_numeric_param_binary_result(server):
+    """A text-format Decimal param (declared numeric in Parse) selected under a
+    binary cursor: the server used to send the text bytes with fmt=1, which the
+    client rejects as a malformed binary numeric ('bad value for numeric sign')."""
+    with connect(server, autocommit=True) as conn:
+        cur = conn.cursor(binary=True)
+        assert cur.execute("select %t", (Decimal("21"),)).fetchone() == (Decimal("21"),)
+        assert cur.execute("select %t", (Decimal("-19.99"),)).fetchone() == (Decimal("-19.99"),)
+
+
+def test_string_cast_converts_value(server):
+    """``'42'::int`` is the integer 42 — as a comparison operand and on the
+    wire (a str passing through the cast used to be sent as text bytes in a
+    column whose RowDescription claims a binary numeric OID)."""
+    with connect(server, autocommit=True) as conn:
+        for binary in (False, True):
+            cur = conn.cursor(binary=binary)
+            assert cur.execute("select '42'::smallint, '1'::int, '1.5'::float8").fetchone() == (
+                42,
+                1,
+                1.5,
+            )
+            assert cur.execute("select '19.99'::numeric").fetchone() == (Decimal("19.99"),)
+            assert cur.execute("select 't'::boolean, 'f'::boolean").fetchone() == (True, False)
+        assert conn.execute("select '42'::smallint = %s", (42,)).fetchone() == (True,)
+
+
+def test_declared_param_type_governs_text_format(server):
+    """A text-format param IS a value of its declared type, exactly like its
+    binary twin: ``'…'::numeric = $1`` with a text-format Decimal must be true
+    (the str used to survive into the comparison and compare as text)."""
+    big = 2**63  # psycopg dumps ints beyond int8 as numeric
+    with connect(server, autocommit=True) as conn:
+        assert conn.execute(f"select '{big}'::numeric = %t", (big,)).fetchone() == (True,)
+        assert conn.execute("select '1'::int = %t", (1,)).fetchone() == (True,)
+        assert conn.execute("select 1.5 = %t", (1.5,)).fetchone() == (True,)
+
+
+def test_float_special_values_roundtrip(server):
+    """inf/-inf/nan floats as parameters in every wire format (``repr(inf)``
+    is not a parseable SQL literal; the substituted node must carry the
+    Postgres spelling through a float8 cast)."""
+    import math
+
+    with connect(server, autocommit=True) as conn:
+        for fmt in ("s", "t", "b"):
+            for val in (float("inf"), float("-inf")):
+                assert conn.execute(f"select %{fmt} = '{val:F}'::float8", (val,)).fetchone() == (
+                    True,
+                ), (fmt, val)
+            (nan,) = conn.execute(f"select %{fmt}", (float("nan"),)).fetchone()
+            assert math.isnan(nan), fmt
+
+
+def test_wide_numeric_binary_param(server):
+    """Binary numeric params wider than the default Decimal context precision
+    (28 significant digits) must decode exactly, not raise / round."""
+    wide = [
+        Decimal("9999999999999999999999999999.9"),
+        Decimal("1000000000000000000000000000.001"),
+        Decimal("-123456789012345678901234567890.123456789"),
+    ]
+    with connect(server, autocommit=True) as conn:
+        for d in wide:
+            assert conn.execute("select %b", (d,)).fetchone() == (d,), d
+            assert conn.execute("select %b::text", (d,)).fetchone() == (str(d),), d

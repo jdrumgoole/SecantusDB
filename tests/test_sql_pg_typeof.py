@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from secantus.sql import run_sql, typemap
+from secantus.sql import errors, run_sql, typemap
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -70,6 +70,44 @@ def test_pg_typeof_regtype_comparison(storage):
     assert q(storage, "select pg_typeof(1::int2) = 'int2'::regtype").rows == [(True,)]
     assert q(storage, "select pg_typeof(1.5::real) = 'float4'::regtype").rows == [(True,)]
     assert q(storage, "select pg_typeof(1) = 'bigint'::regtype").rows == [(False,)]
+
+
+def test_regtype_from_oid(storage):
+    # ``21::regtype`` (or '21'::regtype) resolves the OID to the type and prints
+    # the same pretty spelling pg_typeof does — psycopg's test_repr_wrapper runs
+    # ``select pg_typeof(%s) = %s::regtype`` passing the OID as an integer.
+    assert q(storage, "select 21::regtype").rows == [("smallint",)]
+    assert q(storage, "select '21'::regtype").rows == [("smallint",)]
+    assert q(storage, "select 23::regtype").rows == [("integer",)]
+    assert q(storage, "select 701::regtype").rows == [("double precision",)]
+    assert q(storage, "select 26::regtype").rows == [("oid",)]
+    assert q(storage, "select 1005::regtype").rows == [("smallint[]",)]
+    assert q(storage, "select 1028::regtype").rows == [("oid[]",)]
+    assert q(storage, "select pg_typeof(1::int2) = 21::regtype").rows == [(True,)]
+    assert q(storage, "select pg_typeof(1::int2) = 23::regtype").rows == [(False,)]
+
+
+def test_regtype_from_unknown_oid(storage):
+    with pytest.raises(errors.SQLError) as ei:
+        q(storage, "select 99999::regtype")
+    assert ei.value.sqlstate == "42704"
+    assert str(ei.value) == "type with OID 99999 does not exist"
+
+
+def test_pg_typeof_cast_to_oid(storage):
+    # ``pg_typeof(x)::oid`` — regtype casts to oid as the type's OID, described
+    # with the oid type (26) and keeping Postgres' output column name.
+    res = q(storage, "select pg_typeof(1::int2)::oid")
+    assert res.rows == [(21,)]
+    assert res.columns[0].name == "pg_typeof"
+    assert res.columns[0].pg_oid == 26
+    assert q(storage, "select pg_typeof(1)::oid").rows == [(23,)]
+    assert q(storage, "select pg_typeof('{1,2}'::int4[])::oid").rows == [(1007,)]
+
+
+def test_pg_typeof_of_oid_value(storage):
+    res = q(storage, "select pg_typeof(1::oid)")
+    assert res.rows == [("oid",)]
 
 
 def test_normalize_regtype_spellings():
