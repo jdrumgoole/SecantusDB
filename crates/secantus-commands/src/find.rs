@@ -105,10 +105,44 @@ fn capped_position_lost() -> CommandError {
 /// drivers' error-document tests see the operator in the message, matching
 /// mongod / the Python server.
 pub(crate) fn query_filter_error(filter: &Document) -> CommandError {
+    // An unrecognised aggregation-expression operator inside a `$expr` is
+    // mongod's `168 InvalidPipelineOperator` — `Unrecognized expression '$op'` —
+    // not a generic query-operator `BadValue`.
+    if let Some(op) = unknown_expr_operator_in_filter(filter) {
+        return CommandError::new(
+            168,
+            "InvalidPipelineOperator",
+            format!("Unrecognized expression '{op}'"),
+        );
+    }
     match secantus_core::query::first_unknown_operator(filter) {
         Some(op) => CommandError::new(2, "BadValue", format!("unsupported query operator: {op}")),
         None => CommandError::new(2, "BadValue", "unsupported or invalid query filter"),
     }
+}
+
+/// The first unrecognised expression operator reachable through a `$expr`
+/// anywhere in `filter` (recursing through `$and`/`$or`/`$nor`). `None` when no
+/// `$expr` references an unknown operator.
+fn unknown_expr_operator_in_filter(filter: &Document) -> Option<String> {
+    for (k, v) in filter.iter() {
+        if k == "$expr" {
+            if let Some(op) = secantus_core::expressions::first_unknown_expr_operator(v) {
+                return Some(op);
+            }
+        } else if (k == "$and" || k == "$or" || k == "$nor") && matches!(v, Bson::Array(_)) {
+            if let Bson::Array(arr) = v {
+                for sub in arr {
+                    if let Bson::Document(d) = sub {
+                        if let Some(op) = unknown_expr_operator_in_filter(d) {
+                            return Some(op);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `find` — run a query and open a cursor over the results.
@@ -181,6 +215,18 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let cursors = ctx.cursors()?;
 
     let filter = doc_field(doc, "filter");
+    // An unrecognized `$expr` expression operator is rejected by mongod at parse
+    // time (before any scan), so surface `168 InvalidPipelineOperator` regardless
+    // of whether the collection is empty or any doc matches. (The per-doc scan
+    // path below would otherwise map it to a generic BadValue.)
+    if let Some(op) = unknown_expr_operator_in_filter(&filter) {
+        return Ok(CommandError::new(
+            168,
+            "InvalidPipelineOperator",
+            format!("Unrecognized expression '{op}'"),
+        )
+        .into_reply());
+    }
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0).max(0) as usize;
     let limit = doc.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize; // 0 ⇒ no limit
     let sort = doc.get("sort").and_then(Bson::as_document);
@@ -196,6 +242,13 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // mongo-node-driver's projection-error tests assert.
     if let Some(spec) = projection {
         if let Some(err) = projection_mix_error(spec) {
+            return Ok(err.into_reply());
+        }
+        // `$meta` projection parse-time validation: an unknown argument is a
+        // Location17308, and `{$meta: "textScore"}` without a `$text` query is a
+        // Location40218. (Recognized-but-unsupported args validate clean here and
+        // are omitted from the result by `apply_projection`.)
+        if let Some(err) = projection_meta_error(spec, &filter) {
             return Ok(err.into_reply());
         }
         // Positional (`arr.$`) validation is parse-time in mongod, so an invalid
@@ -673,6 +726,55 @@ fn projection_mix_error(spec: &Document) -> Option<CommandError> {
                 });
             }
             _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `query` carries a `$text` clause (top-level or nested inside a
+/// `$and` / `$or` / `$nor` array). mongod requires a `$text` predicate before a
+/// `{$meta: "textScore"}` projection is legal. Mirrors `projection._query_has_text`.
+fn query_has_text(query: &Document) -> bool {
+    for (key, val) in query {
+        if key == "$text" {
+            return true;
+        }
+        if matches!(key.as_str(), "$and" | "$or" | "$nor") {
+            if let Bson::Array(arr) = val {
+                if arr.iter().filter_map(Bson::as_document).any(query_has_text) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// mongod's parse-time `$meta` projection errors, if the spec carries a faulty
+/// `{$meta: ...}` value. Oracle-pinned against mongod 6.0: an unrecognized
+/// argument is a Location17308 (`Unsupported argument to $meta: <arg>`), and
+/// `{$meta: "textScore"}` without a `$text` query is a Location40218 (`query
+/// requires text score metadata, but it is not available`). Recognized-but-
+/// unsupported args (`indexKey` / `recordId` / `sortKey` / …) validate clean and
+/// are omitted from the result by `secantus_core::projection::apply_projection`.
+fn projection_meta_error(spec: &Document, filter: &Document) -> Option<CommandError> {
+    for v in spec.values() {
+        let Some(arg) = secantus_core::projection::meta_spec(v) else {
+            continue;
+        };
+        if !secantus_core::projection::META_KEYWORDS.contains(&arg) {
+            return Some(CommandError::new(
+                17308,
+                "Location17308",
+                format!("Unsupported argument to $meta: {arg}"),
+            ));
+        }
+        if arg == "textScore" && !query_has_text(filter) {
+            return Some(CommandError::new(
+                40218,
+                "Location40218",
+                "query requires text score metadata, but it is not available",
+            ));
         }
     }
     None

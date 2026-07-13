@@ -35,7 +35,7 @@ from secantus.auth import (
 )
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorNotFound, CursorRegistry
-from secantus.expressions import ExpressionError
+from secantus.expressions import ExpressionError, UnknownExpressionOperatorError
 from secantus.failpoints import FailPointRegistry
 from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
@@ -2083,6 +2083,11 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         matches({}, filter_, vars=let)
     except QueryError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    except UnknownExpressionOperatorError as exc:
+        # An unrecognized ``$``-operator inside a query ``$expr`` is a
+        # parse-level error mongod rejects up front (168
+        # InvalidPipelineOperator), even against an empty collection.
+        return {"ok": 0.0, "errmsg": str(exc), "code": exc.code, "codeName": exc.code_name}
     except ExpressionError:
         # $expr against empty doc with unresolved field refs is fine —
         # the validation pass is only meant to catch parse-level errors.

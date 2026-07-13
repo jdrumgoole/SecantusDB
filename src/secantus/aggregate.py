@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from secantus.expressions import (
     MISSING,
     ExpressionError,
+    UnknownExpressionOperatorError,
     _bson_type_name,
     evaluate,
     evaluate_or_missing,
@@ -203,7 +204,16 @@ def _stage_project(
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$project requires a document spec")
-    return [_project_one(d, spec, ctx.vars) for d in docs]
+    try:
+        return [_project_one(d, spec, ctx.vars) for d in docs]
+    except UnknownExpressionOperatorError as exc:
+        # mongod wraps an unrecognized expression operator used inside a
+        # ``$project`` in a stage-specific ``Location31325`` error:
+        # ``Invalid $project :: caused by :: Unknown expression $op``.
+        raise ExpressionError(
+            f"Invalid $project :: caused by :: Unknown expression {exc.op}",
+            code=31325,
+        ) from exc
 
 
 def _project_one(

@@ -25,6 +25,36 @@ fn elem_match_spec(v: &Bson) -> Option<&Bson> {
     None
 }
 
+/// A `{$meta: <arg>}` projection value. SecantusDB doesn't compute any metadata,
+/// so a recognized `$meta` field is *omitted* from the projected doc (partial —
+/// graceful degradation). The two error cases (an unknown argument → Location17308,
+/// `textScore` without a `$text` query → Location40218) are validated at parse
+/// time in the command layer (`find::projection_meta_error`), which owns the
+/// `CommandError` type; here we just recognize and drop the field.
+pub fn meta_spec(v: &Bson) -> Option<&str> {
+    if let Bson::Document(d) = v {
+        if d.len() == 1 {
+            if let Some(Bson::String(arg)) = d.get("$meta") {
+                return Some(arg.as_str());
+            }
+        }
+    }
+    None
+}
+
+/// The `$meta` keywords mongod recognizes. Anything else is a Location17308.
+pub const META_KEYWORDS: &[&str] = &[
+    "textScore",
+    "indexKey",
+    "recordId",
+    "sortKey",
+    "searchScore",
+    "searchHighlights",
+    "geoNearDistance",
+    "geoNearPoint",
+    "vectorSearchScore",
+];
+
 fn slice_spec(v: &Bson) -> Option<&Bson> {
     if let Bson::Document(d) = v {
         if d.len() == 1 {
@@ -310,6 +340,35 @@ fn set(doc: &mut Document, path: &str, value: Bson) -> R<()> {
 pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document>) -> R<Document> {
     if spec.is_empty() {
         return Ok(doc.clone());
+    }
+
+    // A `$meta` field is inclusion-mode in mongod, but SecantusDB doesn't compute
+    // the metadata — so the field is *omitted* (partial degradation). Drop the
+    // meta keys; a spec that was *only* `$meta` fields becomes an inclusion of no
+    // fields (result: just `_id`, unless `_id` was excluded). Parse-time
+    // validation (Location17308 / 40218) lives in `find::projection_meta_error`.
+    if spec.values().any(|v| meta_spec(v).is_some()) {
+        let mut stripped = Document::new();
+        for (k, v) in spec {
+            if meta_spec(v).is_none() {
+                stripped.insert(k.clone(), v.clone());
+            }
+        }
+        let non_meta_non_id = stripped.keys().any(|k| k != "_id");
+        if !non_meta_non_id {
+            let mut result = Document::new();
+            let include_id = match stripped.get("_id") {
+                None => true,
+                Some(v) => spec_truthy(v)?,
+            };
+            if include_id {
+                if let Some(id) = doc.get("_id") {
+                    result.insert("_id".to_string(), id.clone());
+                }
+            }
+            return Ok(result);
+        }
+        return apply_projection(doc, &stripped, query);
     }
 
     // Separate $slice specs (neutral modifiers) and positional (`arr.$`) keys from
@@ -606,5 +665,51 @@ mod tests {
         );
         // mixed inclusion + exclusion -> defer
         assert!(apply_projection(&doc! {"a": 1, "b": 2}, &doc! {"a": 1, "b": 0}, None).is_err());
+    }
+
+    #[test]
+    fn meta_only_field_omitted() {
+        // A recognized-but-unsupported $meta arg: field omitted, inclusion keeps _id.
+        assert_eq!(
+            proj(
+                doc! {"_id": 1, "a": 1, "b": 2},
+                doc! {"m": {"$meta": "indexKey"}}
+            ),
+            doc! {"_id": 1}
+        );
+    }
+
+    #[test]
+    fn meta_alongside_inclusion() {
+        assert_eq!(
+            proj(
+                doc! {"_id": 1, "a": 1, "b": 2},
+                doc! {"a": 1, "score": {"$meta": "recordId"}}
+            ),
+            doc! {"_id": 1, "a": 1}
+        );
+    }
+
+    #[test]
+    fn meta_excludes_id() {
+        assert_eq!(
+            proj(
+                doc! {"_id": 1, "a": 1},
+                doc! {"_id": 0, "score": {"$meta": "sortKey"}}
+            ),
+            doc! {}
+        );
+    }
+
+    #[test]
+    fn meta_spec_recognizes_and_keywords() {
+        assert_eq!(
+            meta_spec(&bson::bson!({"$meta": "textScore"})),
+            Some("textScore")
+        );
+        assert_eq!(meta_spec(&bson::bson!({"$meta": 5})), None);
+        assert_eq!(meta_spec(&bson::bson!({"a": 1})), None);
+        assert!(META_KEYWORDS.contains(&"textScore"));
+        assert!(!META_KEYWORDS.contains(&"bogus"));
     }
 }

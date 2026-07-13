@@ -514,22 +514,26 @@ fn cmp_op(
 ) -> R {
     for v in values {
         let Some(val) = v else { continue };
+        // Whole-value compare. For a scalar `val` this is the ordinary compare.
+        // For an array `val`: against a *scalar* bound `compare_values` returns
+        // None (Python's `[..] < 2` raises -> no match), so this is harmless; but
+        // against an *array* bound it returns the lexicographic ordering, so an
+        // array field vs an array bound matches (mongod / Python `list < list`).
+        if let Some(o) = compare_values(val, target, coll)? {
+            if pred(o) {
+                return Ok(true);
+            }
+        }
         if let Bson::Array(arr) = val {
-            // Multikey field: match if any element satisfies the bound. mongod
-            // does NOT compare the array-as-a-whole against a scalar bound (an
-            // array always out-ranks a number in BSON type order, which would
-            // make every array field match), so the whole-array compare is
-            // deliberately skipped here.
+            // Multikey field: also match if any *element* satisfies the bound
+            // (a scalar-bound query against an array-valued field). The
+            // whole-array compare above covers the array-bound case.
             for e in arr {
                 if let Some(o) = compare_values(e, target, coll)? {
                     if pred(o) {
                         return Ok(true);
                     }
                 }
-            }
-        } else if let Some(o) = compare_values(val, target, coll)? {
-            if pred(o) {
-                return Ok(true);
             }
         }
     }
@@ -538,8 +542,10 @@ fn cmp_op(
 
 /// Ordering between two values, or `None` when not comparable (Python's
 /// comparison raises `TypeError`, which the matcher treats as no-match).
-/// `Err(Fallback)` for cases whose Python semantics we don't reproduce
-/// (structural array/doc ordering, exotic types).
+/// Arrays are compared element-wise / lexicographically (mirroring Python's
+/// native `list < list`); a document operand or an array-vs-scalar pair is
+/// not comparable (`None`). `Err(Fallback)` only for the exotic BSON types
+/// (JS code, symbol, dbpointer, undefined) whose ordering we don't reproduce.
 fn compare_values(
     a: &Bson,
     b: &Bson,
@@ -574,10 +580,30 @@ fn compare_values(
     if matches!(a, Bson::Document(_)) || matches!(b, Bson::Document(_)) {
         return Ok(None);
     }
-    // Structural array ordering (Python compares lists element-wise/lexicographically)
-    // and the exotic BSON types (JS code, symbol, dbpointer, undefined) aren't
+    // Structural array ordering: Python compares lists element-wise /
+    // lexicographically (`list < list`), which mongod's range operators mirror.
+    match (a, b) {
+        (Bson::Array(xs), Bson::Array(ys)) => {
+            for (ea, eb) in xs.iter().zip(ys.iter()) {
+                match compare_values(ea, eb, coll)? {
+                    Some(Ordering::Equal) => continue,
+                    Some(o) => return Ok(Some(o)),
+                    // An incomparable element pair: all earlier pairs were equal,
+                    // so this is where Python's `<` would raise TypeError — i.e.
+                    // the whole comparison is not comparable (no match).
+                    None => return Ok(None),
+                }
+            }
+            // One array is a prefix of the other: the shorter sorts first.
+            return Ok(Some(xs.len().cmp(&ys.len())));
+        }
+        // Array vs scalar / doc: Python's `[..] < 2` raises TypeError -> no match.
+        (Bson::Array(_), _) | (_, Bson::Array(_)) => return Ok(None),
+        _ => {}
+    }
+    // The exotic BSON types (JS code, symbol, dbpointer, undefined) aren't
     // reproduced here — defer to the Python oracle.
-    if matches!(a, Bson::Array(_)) || matches!(b, Bson::Array(_)) || is_exotic(a) || is_exotic(b) {
+    if is_exotic(a) || is_exotic(b) {
         return Err(Fallback);
     }
     Ok(match (a, b) {
@@ -686,6 +712,44 @@ pub fn bson_type_name(v: &Bson) -> &'static str {
 /// non-numeric bound, a non-int count, an uncompilable `pattern`, a non-string
 /// `type`, a malformed `enum` / `required` / `properties`, or an `enum` /
 /// bound comparison that defers — returns `Fallback` (Python runs instead).
+/// A canonical byte-key for `uniqueItems` duplicate detection. Numerics collapse
+/// cross-type by value (`sortkey::encode_value` gives them a common form), and
+/// documents / arrays recurse so nested cross-type-equal numerics collide —
+/// mirroring `secantus.query._unique_items_key`. Any value the encoder can't
+/// represent returns `Fallback` (Python runs instead).
+fn unique_items_key(value: &Bson) -> Result<Vec<u8>, Fallback> {
+    let mut out = Vec::new();
+    match value {
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+            out.push(b'n');
+            out.extend(crate::sortkey::encode_value(value, None).map_err(|_| Fallback)?);
+        }
+        Bson::Document(d) => {
+            out.push(b'd');
+            for (k, v) in d {
+                out.extend((k.len() as u32).to_be_bytes());
+                out.extend_from_slice(k.as_bytes());
+                let child = unique_items_key(v)?;
+                out.extend((child.len() as u32).to_be_bytes());
+                out.extend(child);
+            }
+        }
+        Bson::Array(a) => {
+            out.push(b'a');
+            for v in a {
+                let child = unique_items_key(v)?;
+                out.extend((child.len() as u32).to_be_bytes());
+                out.extend(child);
+            }
+        }
+        other => {
+            out.push(b's');
+            out.extend(crate::sortkey::encode_value(other, None).map_err(|_| Fallback)?);
+        }
+    }
+    Ok(out)
+}
+
 fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
     let Bson::Document(sch) = schema else {
         return Ok(false); // Python: `not isinstance(schema, Mapping)` -> False
@@ -795,14 +859,14 @@ fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
                 }
             }
         }
-        // `uniqueItems: true` — every element must be distinct. Uses the shared
-        // sort-key encoding as the equality key (collides equal-value numerics,
-        // order-sensitive for documents), matching the Python oracle. An element
-        // the encoder can't represent defers the whole match to Python.
+        // `uniqueItems: true` — every element must be distinct under MongoDB
+        // value equality, which collapses cross-type-equal numerics recursively
+        // inside sub-documents and sub-arrays ({a:1} == {a:1.0}). An element the
+        // encoder can't represent defers the whole match to Python.
         if matches!(sch.get("uniqueItems"), Some(Bson::Boolean(true))) {
             let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             for item in arr {
-                let key = crate::sortkey::encode_value(item, None).map_err(|_| Fallback)?;
+                let key = unique_items_key(item)?;
                 if !seen.insert(key) {
                     return Ok(false);
                 }
@@ -1321,6 +1385,52 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn array_vs_array_lexicographic_range() {
+        // Verified against real mongod 6.0 with docs:
+        //   {a:[1,3]} {a:[1,2]} {a:[1,2,3]} {a:5} {a:[2]}
+        //   {a: {$gt:  [1,2]}} -> [1,3], [1,2,3], [2]
+        //   {a: {$lt:  [1,3]}} -> [1,2], [1,2,3]
+        //   {a: {$gte: [1,2]}} -> [1,3], [1,2], [1,2,3], [2]
+        assert!(m(doc! {"a": [1, 3]}, doc! {"a": {"$gt": [1, 2]}}));
+        assert!(!m(doc! {"a": [1, 2]}, doc! {"a": {"$gt": [1, 2]}}));
+        assert!(m(doc! {"a": [1, 2, 3]}, doc! {"a": {"$gt": [1, 2]}}));
+        assert!(!m(doc! {"a": 5}, doc! {"a": {"$gt": [1, 2]}}));
+        assert!(m(doc! {"a": [2]}, doc! {"a": {"$gt": [1, 2]}}));
+
+        assert!(!m(doc! {"a": [1, 3]}, doc! {"a": {"$lt": [1, 3]}}));
+        assert!(m(doc! {"a": [1, 2]}, doc! {"a": {"$lt": [1, 3]}}));
+        assert!(m(doc! {"a": [1, 2, 3]}, doc! {"a": {"$lt": [1, 3]}}));
+        assert!(!m(doc! {"a": [2]}, doc! {"a": {"$lt": [1, 3]}}));
+
+        assert!(m(doc! {"a": [1, 3]}, doc! {"a": {"$gte": [1, 2]}}));
+        assert!(m(doc! {"a": [1, 2]}, doc! {"a": {"$gte": [1, 2]}}));
+        assert!(m(doc! {"a": [1, 2, 3]}, doc! {"a": {"$gte": [1, 2]}}));
+        assert!(m(doc! {"a": [2]}, doc! {"a": {"$gte": [1, 2]}}));
+
+        // Prefix ordering: [1,2] < [1,2,3] (shorter array is Less).
+        assert!(m(doc! {"a": [1, 2]}, doc! {"a": {"$lt": [1, 2, 3]}}));
+        assert!(m(doc! {"a": [1, 2, 3]}, doc! {"a": {"$gt": [1, 2]}}));
+
+        // Array-vs-scalar bound still works via the multikey element path:
+        // {a:[1,3]} vs {$gt:2} matches because element 3 > 2 (the whole-array
+        // compare against the scalar bound is None -> harmless no-match).
+        assert!(m(doc! {"a": [1, 3]}, doc! {"a": {"$gt": 2}}));
+        assert!(!m(doc! {"a": [1, 2]}, doc! {"a": {"$gt": 2}}));
+    }
+
+    #[test]
+    fn array_vs_array_cross_type_element_no_match() {
+        // A cross-type element pair (after equal leading elements) is where
+        // Python's list `<` would raise TypeError -> no match. The Rust matcher
+        // returns a clean false (Ok), never an Err(Fallback)/BadValue.
+        assert!(!m(doc! {"a": [1, "x"]}, doc! {"a": {"$gt": [1, 2]}}));
+        assert!(!m(doc! {"a": [1, "x"]}, doc! {"a": {"$lt": [1, 2]}}));
+        // A decisive difference before the cross-type element still orders:
+        // [2, "x"] vs [1, 2] -> first pair 2 > 1 is decisive (Greater).
+        assert!(m(doc! {"a": [2, "x"]}, doc! {"a": {"$gt": [1, 2]}}));
+    }
+
     fn re(pattern: &str, options: &str) -> Bson {
         Bson::RegularExpression(bson::Regex {
             pattern: pattern.into(),
@@ -1423,5 +1533,21 @@ mod tests {
             Some(&coll)
         )
         .is_err());
+    }
+
+    #[test]
+    fn json_schema_unique_items_crosstype() {
+        let schema = doc! {"$jsonSchema": {"properties": {"arr": {"uniqueItems": true}}}};
+        // top-level cross-type-equal numerics collide
+        assert!(!m(doc! {"arr": [1, 1.0]}, schema.clone()));
+        assert!(m(doc! {"arr": [1, 2]}, schema.clone()));
+        // nested cross-type-equal numerics collide ({a:1} == {a:1.0})
+        assert!(!m(doc! {"arr": [{"a": 1}, {"a": 1.0}]}, schema.clone()));
+        assert!(m(doc! {"arr": [{"a": 1}, {"a": 2}]}, schema.clone()));
+        // exact duplicate documents collide
+        assert!(!m(doc! {"arr": [{"a": 1}, {"a": 1}]}, schema.clone()));
+        // recursively inside sub-arrays
+        assert!(!m(doc! {"arr": [[1, 2], [1.0, 2.0]]}, schema.clone()));
+        assert!(m(doc! {"arr": [[1, 2], [1, 3]]}, schema));
     }
 }

@@ -24,12 +24,28 @@ class ExpressionError(Exception):
     explicitly.
     """
 
-    _CODE_NAMES = {14: "TypeMismatch", 2: "BadValue"}
+    _CODE_NAMES = {14: "TypeMismatch", 2: "BadValue", 168: "InvalidPipelineOperator"}
 
     def __init__(self, msg: str, *, code: int = 14, code_name: str | None = None) -> None:
         super().__init__(msg)
         self.code = code
         self.code_name = code_name or self._CODE_NAMES.get(code, f"Location{code}")
+
+
+class UnknownExpressionOperatorError(ExpressionError):
+    """A ``$``-prefixed expression operator SecantusDB does not recognize.
+
+    mongod surfaces different codes depending on context: a ``$expr`` inside
+    a query yields ``168 InvalidPipelineOperator`` with the message
+    ``Unrecognized expression '$op'`` (the default this class carries); an
+    expression inside an aggregation stage such as ``$project`` yields a
+    stage-specific ``Location`` code wrapping ``Unknown expression $op``.
+    Stage handlers catch this and re-raise with the wrapped form.
+    """
+
+    def __init__(self, op: str) -> None:
+        super().__init__(f"Unrecognized expression '{op}'", code=168)
+        self.op = op
 
 
 @dataclass
@@ -119,7 +135,7 @@ def _apply_op(op: str, arg: Any, ctx: _Ctx) -> Any:
         return arg
     handler = _OPS.get(op)
     if handler is None:
-        raise ExpressionError(f"unsupported aggregation expression operator: {op}")
+        raise UnknownExpressionOperatorError(op)
     return handler(arg, ctx)
 
 
