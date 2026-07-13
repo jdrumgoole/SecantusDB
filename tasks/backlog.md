@@ -1541,6 +1541,20 @@ teardown. Remaining, worth tracking:
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
 `tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
 
+- [ ] **Sub-millisecond timestamp fidelity.** `timestamp`/`timestamptz` (and ts/tstz
+  ranges + multiranges) truncate to milliseconds — BSON datetime is an int64 of
+  millis. Operations succeed; round-trips differ by <1ms. Exact microseconds need a
+  storage-representation change (ISO-text or a micros sidecar) that touches
+  comparisons, scalar functions, and sorting. Found by psycopg's full-type faker
+  (`validate-psycopg`, the only fidelity failures left in `test_leak`'s probe set).
+- [ ] **`numeric` beyond 34 significant digits.** Stored as Decimal128, which caps at
+  34 digits; wider values round into range (Postgres keeps them exact). Exact
+  storage would need a text/dual representation for `numeric`.
+- [ ] **Coercion errors in one extended-protocol path surface as `XX000` internal
+  error instead of `22P02`.** The declared-OID text-param conversion raises 22P02
+  correctly; some column-coercion failures during Execute still fall through the
+  generic handler. Map `ValueError`-class coercion failures to 22P02 there too.
+
 - [ ] **Wire server: simple + extended protocol, trust + SCRAM auth, optional TLS.**
   `pgserver.py` speaks v3 startup, simple `Query` (P1), extended `Parse`/`Bind`/
   `Describe`/`Execute`/`Close`/`Sync` (P3), `SCRAM-SHA-256` auth + TLS (P4). Binary

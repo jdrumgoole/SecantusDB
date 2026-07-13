@@ -42,8 +42,15 @@ dev = [
     "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
     "sqlglot>=25",  # SQL parser for the secantus.sql tests (mirrors the [sql] extra)
     "pg8000>=1.31",  # pure-Python Postgres driver: real-driver gauge for the SQL server
-    "psycopg[binary]>=3.1",  # libpq-based driver: strictest wire gauge (binary params, prepared stmts)
+    # Pinned exactly: the validate-psycopg gauge runs the vendored psycopg test
+    # suite (vendor/psycopg, same tag) against the installed wheel — the two
+    # must stay in lockstep. Bump both together.
+    "psycopg[binary]==3.3.4",
     "sqlalchemy>=2.0",  # ORM smoke for the SQL server (drives pg8000 + psycopg)
+    # psycopg's test-suite plugins (its [test] extra) for validate-psycopg:
+    "anyio>=4.0",
+    "pytest-cov>=3.0",
+    "pytest-randomly>=3.5",
     "invoke>=2.2",
     # Pinned exactly: ruff's formatter output changes between releases, so an
     # unpinned floor let CI silently pull a newer ruff that reformatted an

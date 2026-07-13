@@ -34,3 +34,6 @@
 [submodule "vendor/mongo-csharp-driver"]
 	path = vendor/mongo-csharp-driver
 	url = https://github.com/mongodb/mongo-csharp-driver.git
+[submodule "vendor/psycopg"]
+	path = vendor/psycopg
+	url = https://github.com/psycopg/psycopg

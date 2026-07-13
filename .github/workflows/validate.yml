@@ -40,6 +40,10 @@ jobs:
           - { name: c,       task: validate-c,    report: docs/validation-report-c.md }
           - { name: cxx,     task: validate-cxx,  report: docs/validation-report-cxx.md }
           - { name: dotnet,  task: validate-dotnet, report: docs/validation-report-dotnet.md }
+          # The SQL-server gauge (tasks/sql-gauges-plan.md G2): psycopg 3's own
+          # unmodified test suite over PSYCOPG_TEST_DSN against a daemon
+          # SecantusPGServer. Python-only toolchain — psycopg[binary] ships libpq.
+          - { name: psycopg, task: validate-psycopg, report: docs/validation-report-psycopg.md }
           # The R8 gate (tasks/rust-server-plan.md): the SAME unmodified pymongo
           # suite as the headline gauge, pointed at the Rust server via
           # SECANTUS_GAUGE_SERVER=rust. Needs the _secantus_server extension, so

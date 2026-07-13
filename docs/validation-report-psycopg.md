@@ -1,0 +1,1758 @@
+# psycopg conformance report
+
+- SecantusDB (Python server) 0.5.4b234
+- psycopg suite: vendor/psycopg @ unknown
+- generated: 2026-07-13 18:58 UTC
+
+| category | passed | failed | skipped | total | pass rate |
+|---|---|---|---|---|---|
+| test_adapt.py | 47 | 12 | 0 | 59 | 79.7% |
+| test_capabilities.py | 12 | 0 | 9 | 21 | 100.0% |
+| test_column.py | 11 | 42 | 0 | 53 | 20.8% |
+| test_connection.py | 79 | 23 | 2 | 104 | 77.5% |
+| test_connection_info.py | 27 | 10 | 3 | 40 | 73.0% |
+| test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
+| test_copy.py | 22 | 89 | 1 | 112 | 19.8% |
+| test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
+| test_cursor_client.py | 25 | 3 | 0 | 28 | 89.3% |
+| test_cursor_common.py | 250 | 30 | 8 | 288 | 89.3% |
+| test_cursor_raw.py | 78 | 0 | 0 | 78 | 100.0% |
+| test_cursor_server.py | 22 | 88 | 0 | 110 | 20.0% |
+| test_encodings.py | 17 | 0 | 0 | 17 | 100.0% |
+| test_errors.py | 20 | 10 | 1 | 31 | 66.7% |
+| test_generators.py | 3 | 2 | 1 | 6 | 60.0% |
+| test_prepared.py | 4 | 26 | 1 | 31 | 13.3% |
+| test_psycopg_dbapi20.py | 70 | 10 | 0 | 80 | 87.5% |
+| test_query.py | 44 | 0 | 0 | 44 | 100.0% |
+| test_rows.py | 18 | 0 | 0 | 18 | 100.0% |
+| test_sql.py | 115 | 4 | 5 | 124 | 96.6% |
+| test_transaction.py | 83 | 1 | 1 | 85 | 98.8% |
+| test_typeinfo.py | 32 | 54 | 0 | 86 | 37.2% |
+| test_typing.py | 0 | 125 | 0 | 125 | 0.0% |
+| types/test_array.py | 124 | 34 | 0 | 158 | 78.5% |
+| types/test_bool.py | 15 | 0 | 0 | 15 | 100.0% |
+| types/test_composite.py | 1 | 78 | 0 | 79 | 1.3% |
+| types/test_datetime.py | 296 | 259 | 12 | 567 | 53.3% |
+| types/test_enum.py | 45 | 152 | 0 | 197 | 22.8% |
+| types/test_hstore.py | 24 | 0 | 15 | 39 | 100.0% |
+| types/test_json.py | 77 | 181 | 0 | 258 | 29.8% |
+| types/test_multirange.py | 87 | 118 | 12 | 217 | 42.4% |
+| types/test_net.py | 3 | 30 | 0 | 33 | 9.1% |
+| types/test_none.py | 1 | 0 | 0 | 1 | 100.0% |
+| types/test_numeric.py | 357 | 13 | 0 | 370 | 96.5% |
+| types/test_numpy.py | 42 | 124 | 6 | 172 | 25.3% |
+| types/test_range.py | 117 | 158 | 12 | 287 | 42.5% |
+| types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
+| types/test_string.py | 108 | 26 | 1 | 135 | 80.6% |
+| types/test_uuid.py | 21 | 5 | 0 | 26 | 80.8% |
+| **total** | **2415** | **1707** | **116** | **4238** | **58.6%** |
+
+## Failures (1707)
+
+- `tests/test_adapt.py::test_load_cursor_ctx_nested[0-row('hello'::text)-obj1]`
+- `tests/test_adapt.py::test_load_cursor_ctx_nested[1-row('hello'::text)-obj1]`
+- `tests/test_adapt.py::test_no_cast_needed[b]`
+- `tests/test_adapt.py::test_no_cast_needed[s]`
+- `tests/test_adapt.py::test_no_cast_needed[t]`
+- `tests/test_adapt.py::test_random[0-b]`
+- `tests/test_adapt.py::test_random[0-s]`
+- `tests/test_adapt.py::test_random[0-t]`
+- `tests/test_adapt.py::test_random[1-b]`
+- `tests/test_adapt.py::test_random[1-s]`
+- `tests/test_adapt.py::test_random[1-t]`
+- `tests/test_adapt.py::test_return_untyped[b]`
+- `tests/test_column.py::test_description_attribs`
+- `tests/test_column.py::test_details[bit(1)-None-None-1-None]`
+- `tests/test_column.py::test_details[bit(42)-None-None-42-None]`
+- `tests/test_column.py::test_details[bit(83886080)-None-None-83886080-None]`
+- `tests/test_column.py::test_details[bpchar(42)-None-None-42-None]`
+- `tests/test_column.py::test_details[int4-None-None-None-4]`
+- `tests/test_column.py::test_details[interval-None-None-None-16]`
+- `tests/test_column.py::test_details[numeric(1,-1000)-1--1000-None-None]`
+- `tests/test_column.py::test_details[numeric(1,1000)-1-1000-None-None]`
+- `tests/test_column.py::test_details[numeric(10,0)-10-0-None-None]`
+- `tests/test_column.py::test_details[numeric(10,3)[]-10-3-None-None]`
+- `tests/test_column.py::test_details[numeric(1000,1000)-1000-1000-None-None]`
+- `tests/test_column.py::test_details[numeric(2,-3)-2--3-None-None]`
+- `tests/test_column.py::test_details[numeric(3,5)-3-5-None-None]`
+- `tests/test_column.py::test_details[time-None-None-None-8]`
+- `tests/test_column.py::test_details[timestamp-None-None-None-8]`
+- `tests/test_column.py::test_details[timestamptz-None-None-None-8]`
+- `tests/test_column.py::test_details[timetz-None-None-None-12]`
+- `tests/test_column.py::test_details[varbit(1)-None-None-1-None]`
+- `tests/test_column.py::test_details[varbit(42)-None-None-42-None]`
+- `tests/test_column.py::test_details[varbit(83886080)-None-None-83886080-None]`
+- `tests/test_column.py::test_details[varchar(1)-None-None-1-None]`
+- `tests/test_column.py::test_details[varchar(1)[]-None-None-1-None]`
+- `tests/test_column.py::test_details[varchar(10485760)-None-None-10485760-None]`
+- `tests/test_column.py::test_details[varchar(42)-None-None-42-None]`
+- `tests/test_column.py::test_details[varchar-None-None-None-None]`
+- `tests/test_column.py::test_details_time[0-interval]`
+- `tests/test_column.py::test_details_time[0-time]`
+- `tests/test_column.py::test_details_time[0-timestamp]`
+- `tests/test_column.py::test_details_time[0-timestamptz]`
+- `tests/test_column.py::test_details_time[0-timetz]`
+- `tests/test_column.py::test_details_time[2-interval]`
+- `tests/test_column.py::test_details_time[2-time]`
+- `tests/test_column.py::test_details_time[2-timestamp]`
+- `tests/test_column.py::test_details_time[2-timestamptz]`
+- `tests/test_column.py::test_details_time[2-timetz]`
+- `tests/test_column.py::test_details_time[6-interval]`
+- `tests/test_column.py::test_details_time[6-time]`
+- `tests/test_column.py::test_details_time[6-timestamp]`
+- `tests/test_column.py::test_details_time[6-timestamptz]`
+- `tests/test_column.py::test_details_time[6-timetz]`
+- `tests/test_column.py::test_name_encode[latin9]`
+- `tests/test_connection.py::test_broken`
+- `tests/test_connection.py::test_broken_connection`
+- `tests/test_connection.py::test_cancel_safe_error`
+- `tests/test_connection.py::test_cancel_safe_timeout`
+- `tests/test_connection.py::test_connect_bad`
+- `tests/test_connection.py::test_context_inerror_rollback_no_clobber`
+- `tests/test_connection.py::test_notice_handlers`
+- `tests/test_connection.py::test_right_exception_on_server_disconnect`
+- `tests/test_connection.py::test_right_exception_on_session_timeout`
+- `tests/test_connection.py::test_set_transaction_param_all`
+- `tests/test_connection.py::test_set_transaction_param_all_property`
+- `tests/test_connection.py::test_set_transaction_param_block[deferrable-False]`
+- `tests/test_connection.py::test_set_transaction_param_block[deferrable-True]`
+- `tests/test_connection.py::test_set_transaction_param_block[isolation_level-False]`
+- `tests/test_connection.py::test_set_transaction_param_block[isolation_level-True]`
+- `tests/test_connection.py::test_set_transaction_param_block[read_only-False]`
+- `tests/test_connection.py::test_set_transaction_param_block[read_only-True]`
+- `tests/test_connection.py::test_set_transaction_param_implicit[deferrable-False]`
+- `tests/test_connection.py::test_set_transaction_param_implicit[isolation_level-False]`
+- `tests/test_connection.py::test_set_transaction_param_implicit[read_only-False]`
+- `tests/test_connection.py::test_set_transaction_param_reset[deferrable]`
+- `tests/test_connection.py::test_set_transaction_param_reset[isolation_level]`
+- `tests/test_connection.py::test_set_transaction_param_reset[read_only]`
+- `tests/test_connection_info.py::test_encoding_env_var[euc-jp-EUC_JP-euc_jp]`
+- `tests/test_connection_info.py::test_encoding_env_var[eucjp-EUC_JP-euc_jp]`
+- `tests/test_connection_info.py::test_error_message`
+- `tests/test_connection_info.py::test_normalize_encoding[euc-jp-EUC_JP-euc_jp]`
+- `tests/test_connection_info.py::test_normalize_encoding[eucjp-EUC_JP-euc_jp]`
+- `tests/test_connection_info.py::test_normalize_encoding[latin9-LATIN9-iso8859-15]`
+- `tests/test_connection_info.py::test_parameter_status`
+- `tests/test_connection_info.py::test_set_encoding_unsupported`
+- `tests/test_connection_info.py::test_timezone`
+- `tests/test_connection_info.py::test_timezone_warn`
+- `tests/test_copy.py::test_binary_partial_row`
+- `tests/test_copy.py::test_clean_buffer_on_error[0]`
+- `tests/test_copy.py::test_clean_buffer_on_error[1]`
+- `tests/test_copy.py::test_connection_writer[0-sample_text]`
+- `tests/test_copy.py::test_connection_writer[1-sample_binary]`
+- `tests/test_copy.py::test_copy_bad_result`
+- `tests/test_copy.py::test_copy_big_size_block[bytearray]`
+- `tests/test_copy.py::test_copy_big_size_block[bytes]`
+- `tests/test_copy.py::test_copy_big_size_block[memoryview]`
+- `tests/test_copy.py::test_copy_big_size_block[str]`
+- `tests/test_copy.py::test_copy_big_size_record`
+- `tests/test_copy.py::test_copy_concurrency`
+- `tests/test_copy.py::test_copy_from_insane_size`
+- `tests/test_copy.py::test_copy_from_leaks[0-False]`
+- `tests/test_copy.py::test_copy_from_leaks[0-True]`
+- `tests/test_copy.py::test_copy_from_leaks[1-True]`
+- `tests/test_copy.py::test_copy_from_to`
+- `tests/test_copy.py::test_copy_from_to_bytes[bytearray]`
+- `tests/test_copy.py::test_copy_from_to_bytes[bytes]`
+- `tests/test_copy.py::test_copy_from_to_bytes[memoryview]`
+- `tests/test_copy.py::test_copy_in_allchars`
+- `tests/test_copy.py::test_copy_in_buffers[0-sample_text]`
+- `tests/test_copy.py::test_copy_in_buffers[1-sample_binary]`
+- `tests/test_copy.py::test_copy_in_buffers_pg_error`
+- `tests/test_copy.py::test_copy_in_buffers_with_pg_error`
+- `tests/test_copy.py::test_copy_in_buffers_with_py_error`
+- `tests/test_copy.py::test_copy_in_empty[0]`
+- `tests/test_copy.py::test_copy_in_empty[1]`
+- `tests/test_copy.py::test_copy_in_error`
+- `tests/test_copy.py::test_copy_in_error_empty[0]`
+- `tests/test_copy.py::test_copy_in_error_empty[1]`
+- `tests/test_copy.py::test_copy_in_records[0]`
+- `tests/test_copy.py::test_copy_in_records[1]`
+- `tests/test_copy.py::test_copy_in_records_binary[0]`
+- `tests/test_copy.py::test_copy_in_records_binary[1]`
+- `tests/test_copy.py::test_copy_in_records_set_types[0]`
+- `tests/test_copy.py::test_copy_in_records_set_types[1]`
+- `tests/test_copy.py::test_copy_in_str`
+- `tests/test_copy.py::test_copy_in_text_no_pinning`
+- `tests/test_copy.py::test_copy_in_text_pinned`
+- `tests/test_copy.py::test_copy_out_allchars[0]`
+- `tests/test_copy.py::test_copy_out_allchars[1]`
+- `tests/test_copy.py::test_copy_out_error_with_copy_not_finished`
+- `tests/test_copy.py::test_copy_out_iter[dict_row-0]`
+- `tests/test_copy.py::test_copy_out_iter[dict_row-1]`
+- `tests/test_copy.py::test_copy_out_iter[namedtuple_row-0]`
+- `tests/test_copy.py::test_copy_out_iter[namedtuple_row-1]`
+- `tests/test_copy.py::test_copy_out_iter[tuple_row-0]`
+- `tests/test_copy.py::test_copy_out_iter[tuple_row-1]`
+- `tests/test_copy.py::test_copy_out_param[%(n)s-params1]`
+- `tests/test_copy.py::test_copy_out_param[%s-params0]`
+- `tests/test_copy.py::test_copy_out_read[0]`
+- `tests/test_copy.py::test_copy_out_read[1]`
+- `tests/test_copy.py::test_copy_out_server_error`
+- `tests/test_copy.py::test_copy_rowcount`
+- `tests/test_copy.py::test_copy_table_across[binary]`
+- `tests/test_copy.py::test_copy_table_across[block]`
+- `tests/test_copy.py::test_copy_table_across[row]`
+- `tests/test_copy.py::test_copy_to_leaks[iter-0-False]`
+- `tests/test_copy.py::test_copy_to_leaks[iter-0-True]`
+- `tests/test_copy.py::test_copy_to_leaks[iter-1-True]`
+- `tests/test_copy.py::test_copy_to_leaks[read-0-False]`
+- `tests/test_copy.py::test_copy_to_leaks[read-0-True]`
+- `tests/test_copy.py::test_copy_to_leaks[read-1-True]`
+- `tests/test_copy.py::test_copy_to_leaks[row-0-False]`
+- `tests/test_copy.py::test_copy_to_leaks[row-0-True]`
+- `tests/test_copy.py::test_copy_to_leaks[row-1-True]`
+- `tests/test_copy.py::test_copy_to_leaks[rows-0-False]`
+- `tests/test_copy.py::test_copy_to_leaks[rows-0-True]`
+- `tests/test_copy.py::test_copy_to_leaks[rows-1-True]`
+- `tests/test_copy.py::test_read_row_notypes[0]`
+- `tests/test_copy.py::test_read_row_notypes[1]`
+- `tests/test_copy.py::test_rowlen_mismatch[False-0]`
+- `tests/test_copy.py::test_rowlen_mismatch[False-1]`
+- `tests/test_copy.py::test_rowlen_mismatch[True-0]`
+- `tests/test_copy.py::test_rowlen_mismatch[True-1]`
+- `tests/test_copy.py::test_rows[0]`
+- `tests/test_copy.py::test_rows[1]`
+- `tests/test_copy.py::test_rows_notypes[0]`
+- `tests/test_copy.py::test_rows_notypes[1]`
+- `tests/test_copy.py::test_set_types[0]`
+- `tests/test_copy.py::test_set_types[1]`
+- `tests/test_copy.py::test_subclass_adapter[0]`
+- `tests/test_copy.py::test_subclass_adapter[1]`
+- `tests/test_copy.py::test_subclass_nulling_dumper[0]`
+- `tests/test_copy.py::test_subclass_nulling_dumper[1]`
+- `tests/test_copy.py::test_worker_error_propagated`
+- `tests/test_copy.py::test_worker_life[0-sample_text]`
+- `tests/test_copy.py::test_worker_life[1-sample_binary]`
+- `tests/test_cursor_client.py::test_leak[asyncio-dict_row-many]`
+- `tests/test_cursor_client.py::test_leak[asyncio-dict_row-one]`
+- `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-all]`
+- `tests/test_cursor_common.py::test_executemany_lock[asyncio-ClientCursor]`
+- `tests/test_cursor_common.py::test_executemany_lock[asyncio-Cursor]`
+- `tests/test_cursor_common.py::test_executemany_lock[asyncio-RawCursor]`
+- `tests/test_cursor_common.py::test_executemany_null_first[asyncio-ClientCursor-b]`
+- `tests/test_cursor_common.py::test_executemany_null_first[asyncio-ClientCursor-s]`
+- `tests/test_cursor_common.py::test_executemany_null_first[asyncio-ClientCursor-t]`
+- `tests/test_cursor_common.py::test_executemany_null_first[asyncio-Cursor-b]`
+- `tests/test_cursor_common.py::test_executemany_null_first[asyncio-Cursor-s]`
+- `tests/test_cursor_common.py::test_executemany_null_first[asyncio-Cursor-t]`
+- `tests/test_cursor_common.py::test_executemany_null_first[asyncio-RawCursor-b]`
+- `tests/test_cursor_common.py::test_executemany_null_first[asyncio-RawCursor-s]`
+- `tests/test_cursor_common.py::test_executemany_null_first[asyncio-RawCursor-t]`
+- `tests/test_cursor_common.py::test_row_maker_returns_none[asyncio-ClientCursor]`
+- `tests/test_cursor_common.py::test_row_maker_returns_none[asyncio-Cursor]`
+- `tests/test_cursor_common.py::test_row_maker_returns_none[asyncio-RawCursor]`
+- `tests/test_cursor_common.py::test_statusmessage[asyncio-ClientCursor]`
+- `tests/test_cursor_common.py::test_statusmessage[asyncio-Cursor]`
+- `tests/test_cursor_common.py::test_statusmessage[asyncio-RawCursor]`
+- `tests/test_cursor_common.py::test_stream_badquery[asyncio-ClientCursor-copy (select 1) to stdout]`
+- `tests/test_cursor_common.py::test_stream_badquery[asyncio-Cursor-copy (select 1) to stdout]`
+- `tests/test_cursor_common.py::test_stream_badquery[asyncio-RawCursor-copy (select 1) to stdout]`
+- `tests/test_cursor_common.py::test_stream_error_notx[asyncio-ClientCursor]`
+- `tests/test_cursor_common.py::test_stream_error_notx[asyncio-Cursor]`
+- `tests/test_cursor_common.py::test_stream_error_notx[asyncio-RawCursor]`
+- `tests/test_cursor_common.py::test_stream_error_tx[asyncio-ClientCursor]`
+- `tests/test_cursor_common.py::test_stream_error_tx[asyncio-Cursor]`
+- `tests/test_cursor_common.py::test_stream_error_tx[asyncio-RawCursor]`
+- `tests/test_cursor_common.py::test_typeinfo[asyncio-ClientCursor]`
+- `tests/test_cursor_common.py::test_typeinfo[asyncio-Cursor]`
+- `tests/test_cursor_common.py::test_typeinfo[asyncio-RawCursor]`
+- `tests/test_cursor_server.py::test_binary_cursor_execute[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_binary_cursor_execute[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_binary_cursor_text_override[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_binary_cursor_text_override[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_close[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_close[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_close_idempotent[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_close_idempotent[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_close_no_clobber[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_close_no_clobber[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_close_on_error[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_close_on_error[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_context[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_context[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_cursor_close_fetchall[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_cursor_close_fetchall[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_cursor_close_fetchmany[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_cursor_close_fetchmany[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_cursor_close_fetchone[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_cursor_close_fetchone[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_description[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_description[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_execute_binary[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_execute_binary[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_execute_error[asyncio-RawServerCursor-create table ssc ()]`
+- `tests/test_cursor_server.py::test_execute_error[asyncio-RawServerCursor-select 1; select 2]`
+- `tests/test_cursor_server.py::test_execute_error[asyncio-RawServerCursor-wat]`
+- `tests/test_cursor_server.py::test_execute_error[asyncio-ServerCursor-create table ssc ()]`
+- `tests/test_cursor_server.py::test_execute_error[asyncio-ServerCursor-select 1; select 2]`
+- `tests/test_cursor_server.py::test_execute_error[asyncio-ServerCursor-wat]`
+- `tests/test_cursor_server.py::test_execute_reuse[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_execute_reuse[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_fetchall[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_fetchall[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_fetchmany[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_fetchmany[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_fetchone[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_fetchone[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_funny_name[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_funny_name[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_hold[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_hold[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_init_params[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_init_params[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_iter[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_iter[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_iter_rownumber[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_iter_rownumber[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_itersize[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_itersize[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_nextset[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_nextset[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_no_hold[asyncio-RawServerCursor-kwargs0]`
+- `tests/test_cursor_server.py::test_no_hold[asyncio-RawServerCursor-kwargs1]`
+- `tests/test_cursor_server.py::test_no_hold[asyncio-ServerCursor-kwargs0]`
+- `tests/test_cursor_server.py::test_no_hold[asyncio-ServerCursor-kwargs1]`
+- `tests/test_cursor_server.py::test_no_result[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_no_result[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_non_scrollable[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_non_scrollable[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_query_params[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_query_params[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_results_after_execute[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_results_after_execute[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_row_factory[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_row_factory[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_row_maker_returns_none[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_row_maker_returns_none[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_rownumber[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_rownumber[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_scroll[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_scroll[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_scrollable[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_scrollable[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_standard_row_factory[asyncio-RawServerCursor-dict_row]`
+- `tests/test_cursor_server.py::test_standard_row_factory[asyncio-RawServerCursor-namedtuple_row]`
+- `tests/test_cursor_server.py::test_standard_row_factory[asyncio-RawServerCursor-tuple_row]`
+- `tests/test_cursor_server.py::test_standard_row_factory[asyncio-ServerCursor-dict_row]`
+- `tests/test_cursor_server.py::test_standard_row_factory[asyncio-ServerCursor-namedtuple_row]`
+- `tests/test_cursor_server.py::test_standard_row_factory[asyncio-ServerCursor-tuple_row]`
+- `tests/test_cursor_server.py::test_steal_cursor[asyncio-RawServerCursor-namedtuple_row]`
+- `tests/test_cursor_server.py::test_steal_cursor[asyncio-RawServerCursor-tuple_row]`
+- `tests/test_cursor_server.py::test_steal_cursor[asyncio-ServerCursor-namedtuple_row]`
+- `tests/test_cursor_server.py::test_steal_cursor[asyncio-ServerCursor-tuple_row]`
+- `tests/test_cursor_server.py::test_stolen_cursor_close[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_stolen_cursor_close[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_warn_close[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_warn_close[asyncio-ServerCursor]`
+- `tests/test_errors.py::test_diag_attr_values`
+- `tests/test_errors.py::test_diag_encoding[latin9]`
+- `tests/test_errors.py::test_diag_encoding[utf8]`
+- `tests/test_errors.py::test_diag_independent`
+- `tests/test_errors.py::test_error_encoding[latin9]`
+- `tests/test_errors.py::test_error_encoding[utf8]`
+- `tests/test_errors.py::test_pgconn_error`
+- `tests/test_errors.py::test_pgconn_error_pickle`
+- `tests/test_errors.py::test_query_context`
+- `tests/test_errors.py::test_unknown_sqlstate`
+- `tests/test_generators.py::test_cancel`
+- `tests/test_generators.py::test_pipeline_communicate_abort`
+- `tests/test_prepared.py::test_auto_prepare`
+- `tests/test_prepared.py::test_auto_prepare_conn`
+- `tests/test_prepared.py::test_change_type`
+- `tests/test_prepared.py::test_change_type_execute`
+- `tests/test_prepared.py::test_change_type_executemany`
+- `tests/test_prepared.py::test_change_type_savepoint`
+- `tests/test_prepared.py::test_different_types`
+- `tests/test_prepared.py::test_do_prepare`
+- `tests/test_prepared.py::test_do_prepare_conn`
+- `tests/test_prepared.py::test_dont_prepare`
+- `tests/test_prepared.py::test_dont_prepare_conn`
+- `tests/test_prepared.py::test_evict_lru`
+- `tests/test_prepared.py::test_evict_lru_deallocate`
+- `tests/test_prepared.py::test_misc_statement[create table test_no_prepare ()]`
+- `tests/test_prepared.py::test_misc_statement[delete from prepared_test where num > 10]`
+- `tests/test_prepared.py::test_misc_statement[insert into prepared_test (num) values (1)]`
+- `tests/test_prepared.py::test_misc_statement[notify foo, 'bar']`
+- `tests/test_prepared.py::test_misc_statement[select num from prepared_test]`
+- `tests/test_prepared.py::test_misc_statement[set timezone = utc]`
+- `tests/test_prepared.py::test_misc_statement[update prepared_test set num = num * 2]`
+- `tests/test_prepared.py::test_no_prepare_error`
+- `tests/test_prepared.py::test_no_prepare_multi`
+- `tests/test_prepared.py::test_no_prepare_multi_with_drop`
+- `tests/test_prepared.py::test_params_types`
+- `tests/test_prepared.py::test_prepare_disable`
+- `tests/test_prepared.py::test_untyped_json`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_commit_in_tpc_fails`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_rollback_in_tpc_fails`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_tpc_begin`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_tpc_begin_in_tpc_transaction_fails`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_tpc_begin_in_transaction_fails`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_tpc_commit_with_prepare`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_tpc_commit_without_prepare`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_tpc_rollback_with_prepare`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_tpc_rollback_without_prepare`
+- `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_xid`
+- `tests/test_sql.py::TestSqlFormat::test_copy`
+- `tests/test_sql.py::test_quote_roundtrip[off]`
+- `tests/test_sql.py::test_quote_roundtrip[on]`
+- `tests/test_sql.py::test_quote_stable_despite_deranged_libpq[off]`
+- `tests/test_transaction.py::test_context_inerror_rollback_no_clobber[asyncio-pipeline=off]`
+- `tests/test_typeinfo.py::test_fetch[latin1-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch[latin1-IDLE-text]`
+- `tests/test_typeinfo.py::test_fetch[latin1-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch[latin1-INTRANS-text]`
+- `tests/test_typeinfo.py::test_fetch[latin1-None-name1]`
+- `tests/test_typeinfo.py::test_fetch[latin1-None-text]`
+- `tests/test_typeinfo.py::test_fetch[sql_ascii-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch[sql_ascii-IDLE-text]`
+- `tests/test_typeinfo.py::test_fetch[sql_ascii-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch[sql_ascii-INTRANS-text]`
+- `tests/test_typeinfo.py::test_fetch[sql_ascii-None-name1]`
+- `tests/test_typeinfo.py::test_fetch[sql_ascii-None-text]`
+- `tests/test_typeinfo.py::test_fetch[utf8-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch[utf8-IDLE-text]`
+- `tests/test_typeinfo.py::test_fetch[utf8-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch[utf8-INTRANS-text]`
+- `tests/test_typeinfo.py::test_fetch[utf8-None-name1]`
+- `tests/test_typeinfo.py::test_fetch[utf8-None-text]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-IDLE-text]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-INTRANS-text]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-None-name1]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-None-text]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-IDLE-text]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-INTRANS-text]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-None-name1]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-None-text]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-IDLE-text]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-INTRANS-text]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-None-name1]`
+- `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-None-text]`
+- `tests/test_typeinfo.py::test_fetch_by_schema_qualified_string[name1]`
+- `tests/test_typeinfo.py::test_fetch_by_schema_qualified_string[testschema.testtype]`
+- `tests/test_typeinfo.py::test_fetch_not_found[MultirangeInfo-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch_not_found[MultirangeInfo-IDLE-nosuch]`
+- `tests/test_typeinfo.py::test_fetch_not_found[MultirangeInfo-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch_not_found[MultirangeInfo-INTRANS-nosuch]`
+- `tests/test_typeinfo.py::test_fetch_not_found[RangeInfo-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch_not_found[RangeInfo-IDLE-nosuch]`
+- `tests/test_typeinfo.py::test_fetch_not_found[RangeInfo-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch_not_found[RangeInfo-INTRANS-nosuch]`
+- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-MultirangeInfo-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-MultirangeInfo-IDLE-nosuch]`
+- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-MultirangeInfo-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-MultirangeInfo-INTRANS-nosuch]`
+- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-RangeInfo-IDLE-name1]`
+- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-RangeInfo-IDLE-nosuch]`
+- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-RangeInfo-INTRANS-name1]`
+- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-RangeInfo-INTRANS-nosuch]`
+- `tests/test_typing.py::test_connection_type[await psycopg.AsyncConnection.connect()-psycopg.AsyncConnection[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_connection_type[await psycopg.AsyncConnection.connect(row_factory=rows.dict_row)-psycopg.AsyncConnection[Dict[str, Any]]]`
+- `tests/test_typing.py::test_connection_type[psycopg.Connection.connect()-psycopg.Connection[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_connection_type[psycopg.Connection.connect(row_factory=rows.dict_row)-psycopg.Connection[Dict[str, Any]]]`
+- `tests/test_typing.py::test_connection_type[psycopg.connect()-psycopg.Connection[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_connection_type[psycopg.connect(row_factory=rows.class_row(Thing))-psycopg.Connection[Thing]]`
+- `tests/test_typing.py::test_connection_type[psycopg.connect(row_factory=rows.dict_row)-psycopg.Connection[Dict[str, Any]]]`
+- `tests/test_typing.py::test_connection_type[psycopg.connect(row_factory=rows.namedtuple_row)-psycopg.Connection[NamedTuple]]`
+- `tests/test_typing.py::test_connection_type[psycopg.connect(row_factory=rows.tuple_row)-psycopg.Connection[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_connection_type[psycopg.connect(row_factory=thing_row)-psycopg.Connection[Thing]]`
+- `tests/test_typing.py::test_cur_subclass_execute[AsyncConnection-False]`
+- `tests/test_typing.py::test_cur_subclass_execute[AsyncConnection-True]`
+- `tests/test_typing.py::test_cur_subclass_execute[Connection-False]`
+- `tests/test_typing.py::test_cur_subclass_execute[Connection-True]`
+- `tests/test_typing.py::test_cursor_type[await psycopg.AsyncConnection.connect()-conn.cursor()-psycopg.AsyncCursor[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_cursor_type[await psycopg.AsyncConnection.connect()-conn.cursor(name='foo')-psycopg.AsyncServerCursor[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_cursor_type[await psycopg.AsyncConnection.connect()-conn.cursor(name='foo', row_factory=rows.dict_row)-psycopg.AsyncServerCursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_cursor_type[await psycopg.AsyncConnection.connect()-conn.cursor(row_factory=thing_row)-psycopg.AsyncCursor[Thing]]`
+- `tests/test_typing.py::test_cursor_type[await psycopg.AsyncConnection.connect(row_factory=rows.dict_row)-conn.cursor(name='foo')-psycopg.AsyncServerCursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_cursor_type[psycopg.connect()-conn.cursor()-psycopg.Cursor[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_cursor_type[psycopg.connect()-conn.cursor(name='foo')-psycopg.ServerCursor[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_cursor_type[psycopg.connect()-conn.cursor(name='foo', row_factory=rows.dict_row)-psycopg.ServerCursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_cursor_type[psycopg.connect()-conn.cursor(row_factory=thing_row)-psycopg.Cursor[Thing]]`
+- `tests/test_typing.py::test_cursor_type[psycopg.connect(row_factory=rows.class_row(Thing))-conn.cursor()-psycopg.Cursor[Thing]]`
+- `tests/test_typing.py::test_cursor_type[psycopg.connect(row_factory=rows.dict_row)-conn.cursor()-psycopg.Cursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_cursor_type[psycopg.connect(row_factory=rows.dict_row)-conn.cursor(name='foo')-psycopg.ServerCursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_cursor_type[psycopg.connect(row_factory=rows.dict_row)-conn.cursor(row_factory=rows.namedtuple_row)-psycopg.Cursor[NamedTuple]]`
+- `tests/test_typing.py::test_cursor_type[psycopg.connect(row_factory=thing_row)-conn.cursor()-psycopg.Cursor[Thing]]`
+- `tests/test_typing.py::test_cursor_type_init[await psycopg.AsyncConnection.connect()-psycopg.AsyncCursor(conn)-psycopg.AsyncCursor[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_cursor_type_init[await psycopg.AsyncConnection.connect()-psycopg.AsyncCursor(conn, row_factory=thing_row)-psycopg.AsyncCursor[Thing]]`
+- `tests/test_typing.py::test_cursor_type_init[await psycopg.AsyncConnection.connect()-psycopg.AsyncServerCursor(conn, name='foo')-psycopg.AsyncServerCursor[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_cursor_type_init[await psycopg.AsyncConnection.connect()-psycopg.AsyncServerCursor(conn, name='foo', row_factory=rows.dict_row)-psycopg.AsyncServerCursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_cursor_type_init[await psycopg.AsyncConnection.connect(row_factory=rows.dict_row)-psycopg.AsyncCursor(conn)-psycopg.AsyncCursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_cursor_type_init[await psycopg.AsyncConnection.connect(row_factory=rows.dict_row)-psycopg.AsyncServerCursor(conn, name='foo')-psycopg.AsyncServerCursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_cursor_type_init[psycopg.connect()-psycopg.Cursor(conn)-psycopg.Cursor[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_cursor_type_init[psycopg.connect()-psycopg.ServerCursor(conn, 'foo')-psycopg.ServerCursor[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_cursor_type_init[psycopg.connect(row_factory=rows.dict_row)-psycopg.Cursor(conn)-psycopg.Cursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_cursor_type_init[psycopg.connect(row_factory=rows.dict_row)-psycopg.Cursor(conn, row_factory=rows.namedtuple_row)-psycopg.Cursor[NamedTuple]]`
+- `tests/test_typing.py::test_cursor_type_init[psycopg.connect(row_factory=rows.dict_row)-psycopg.ServerCursor(conn, 'foo', row_factory=rows.namedtuple_row)-psycopg.ServerCursor[NamedTuple]]`
+- `tests/test_typing.py::test_cursor_type_init[psycopg.connect(row_factory=rows.dict_row)-psycopg.ServerCursor(conn, name='foo')-psycopg.ServerCursor[Dict[str, Any]]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-AsyncConnection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-AsyncConnection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-AsyncConnection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-AsyncConnection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-AsyncConnection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-AsyncConnection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-AsyncConnection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-AsyncConnection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-Connection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-Connection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-Connection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-Connection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-Connection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-Connection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-Connection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[all-list[{type}]-Connection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-AsyncConnection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-AsyncConnection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-AsyncConnection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-AsyncConnection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-AsyncConnection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-AsyncConnection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-AsyncConnection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-AsyncConnection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-Connection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-Connection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-Connection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-Connection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-Connection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-Connection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-Connection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[iter-{type}-Connection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-AsyncConnection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-AsyncConnection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-AsyncConnection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-AsyncConnection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-AsyncConnection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-AsyncConnection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-AsyncConnection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-AsyncConnection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-Connection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-Connection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-Connection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-Connection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-Connection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-Connection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-Connection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[many-list[{type}]-Connection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-AsyncConnection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-AsyncConnection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-AsyncConnection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-AsyncConnection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-AsyncConnection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-AsyncConnection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-AsyncConnection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-AsyncConnection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-Connection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-Connection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-Connection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-Connection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-Connection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-Connection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-Connection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[next-{type}-Connection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-AsyncConnection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-AsyncConnection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-AsyncConnection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-AsyncConnection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-AsyncConnection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-AsyncConnection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-AsyncConnection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-AsyncConnection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-Connection-False--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-Connection-False-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-Connection-False-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-Connection-False-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-Connection-True--Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-Connection-True-row_factory=rows.dict_row-Dict[str, Any]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-Connection-True-row_factory=rows.tuple_row-Tuple[Any, ...]]`
+- `tests/test_typing.py::test_fetch_type[one-{type} | None-Connection-True-row_factory=thing_row-Thing]`
+- `tests/test_typing.py::test_generic_connect[MyConnection.connect()-MyConnection[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_generic_connect[MyConnection.connect(row_factory=rows.dict_row)-MyConnection[Dict[str, Any]]]`
+- `tests/test_typing.py::test_generic_connect[MyConnection.connect(row_factory=rows.tuple_row)-MyConnection[Tuple[Any, ...]]]`
+- `tests/test_typing.py::test_typing_example[adapters_example.py]`
+- `tests/test_typing.py::test_typing_example[typing_example.py]`
+- `tests/types/test_array.py::test_all_chars[1-s]`
+- `tests/types/test_array.py::test_all_chars[1-t]`
+- `tests/types/test_array.py::test_all_chars_with_bounds[0]`
+- `tests/types/test_array.py::test_all_chars_with_bounds[1]`
+- `tests/types/test_array.py::test_array_of_unknown_builtin`
+- `tests/types/test_array.py::test_array_register`
+- `tests/types/test_array.py::test_array_with_bounds['[0:1]={a,b}'::text[]-want0-1]`
+- `tests/types/test_array.py::test_array_with_bounds['[1:1][-2:-1][3:5]={{{1,2,3},{4,5,6}}}'::int[]-want1-1]`
+- `tests/types/test_array.py::test_dump_list_int[obj1-{10,null,30}]`
+- `tests/types/test_array.py::test_dump_list_no_comma_separator`
+- `tests/types/test_array.py::test_dump_list_str[obj0-{{{{{{a}}}}}}-b]`
+- `tests/types/test_array.py::test_dump_list_str[obj2-{{{{{{"NULL"}}}}}}-b]`
+- `tests/types/test_array.py::test_dump_list_str[obj4-{foo,null,baz}-b]`
+- `tests/types/test_array.py::test_dump_list_str[obj4-{foo,null,baz}-s]`
+- `tests/types/test_array.py::test_dump_list_str[obj4-{foo,null,baz}-t]`
+- `tests/types/test_array.py::test_dump_list_str[obj6-{{foo,bar},{baz,qux},{quux,quuux}}-b]`
+- `tests/types/test_array.py::test_dump_list_str[obj7-{{{"fo{o","ba}r"},{"ba\\"z",qu\\'x},{"qu ux"," "}}}-b]`
+- `tests/types/test_array.py::test_dump_list_str[obj7-{{{"fo{o","ba}r"},{"ba\\"z",qu\\'x},{"qu ux"," "}}}-s]`
+- `tests/types/test_array.py::test_dump_list_str[obj7-{{{"fo{o","ba}r"},{"ba\\"z",qu\\'x},{"qu ux"," "}}}-t]`
+- `tests/types/test_array.py::test_empty_list[b]`
+- `tests/types/test_array.py::test_empty_list[s]`
+- `tests/types/test_array.py::test_empty_list[t]`
+- `tests/types/test_array.py::test_load_list_int[want1-{10,null,30}-0]`
+- `tests/types/test_array.py::test_load_list_int[want1-{10,null,30}-1]`
+- `tests/types/test_array.py::test_load_list_int[want2-{{10,20},{30,40}}-1]`
+- `tests/types/test_array.py::test_load_list_str[want0-{{{{{{a}}}}}}-1]`
+- `tests/types/test_array.py::test_load_list_str[want1-{{{{{{NULL}}}}}}-1]`
+- `tests/types/test_array.py::test_load_list_str[want2-{{{{{{"NULL"}}}}}}-1]`
+- `tests/types/test_array.py::test_load_list_str[want4-{foo,null,baz}-0]`
+- `tests/types/test_array.py::test_load_list_str[want6-{{foo,bar},{baz,qux},{quux,quuux}}-1]`
+- `tests/types/test_array.py::test_load_list_str[want7-{{{"fo{o","ba}r"},{"ba\\"z",qu\\'x},{"qu ux"," "}}}-1]`
+- `tests/types/test_array.py::test_load_nested_array[0]`
+- `tests/types/test_array.py::test_load_nested_array[1]`
+- `tests/types/test_array.py::test_register_array_leak`
+- `tests/types/test_composite.py::test_callable_dumper_not_registered`
+- `tests/types/test_composite.py::test_dump_builtin_empty_range[b]`
+- `tests/types/test_composite.py::test_dump_builtin_empty_range[s]`
+- `tests/types/test_composite.py::test_dump_builtin_empty_range[t]`
+- `tests/types/test_composite.py::test_dump_composite_all_chars[b]`
+- `tests/types/test_composite.py::test_dump_composite_all_chars[s]`
+- `tests/types/test_composite.py::test_dump_composite_all_chars[t]`
+- `tests/types/test_composite.py::test_dump_composite_null[b]`
+- `tests/types/test_composite.py::test_dump_composite_null[s]`
+- `tests/types/test_composite.py::test_dump_composite_null[t]`
+- `tests/types/test_composite.py::test_dump_no_sequence[b]`
+- `tests/types/test_composite.py::test_dump_no_sequence[s]`
+- `tests/types/test_composite.py::test_dump_no_sequence[t]`
+- `tests/types/test_composite.py::test_dump_no_sequence_failing[b]`
+- `tests/types/test_composite.py::test_dump_no_sequence_failing[s]`
+- `tests/types/test_composite.py::test_dump_no_sequence_failing[t]`
+- `tests/types/test_composite.py::test_dump_recursive_composite[b]`
+- `tests/types/test_composite.py::test_dump_recursive_composite[s]`
+- `tests/types/test_composite.py::test_dump_recursive_composite[t]`
+- `tests/types/test_composite.py::test_dump_tuple['foo''', '''foo', '"bar', 'bar"' -obj5]`
+- `tests/types/test_composite.py::test_dump_tuple[-obj0]`
+- `tests/types/test_composite.py::test_dump_tuple[42,'foo','ba,r','ba''z','qu"x'-obj4]`
+- `tests/types/test_composite.py::test_dump_tuple[null, ''-obj3]`
+- `tests/types/test_composite.py::test_dump_tuple[null,null-obj2]`
+- `tests/types/test_composite.py::test_dump_tuple[null-obj1]`
+- `tests/types/test_composite.py::test_dump_tuple_all_chars[s]`
+- `tests/types/test_composite.py::test_dump_tuple_all_chars[t]`
+- `tests/types/test_composite.py::test_dump_tuple_null`
+- `tests/types/test_composite.py::test_fetch_info[name2-fields2]`
+- `tests/types/test_composite.py::test_fetch_info[name3-fields3]`
+- `tests/types/test_composite.py::test_fetch_info[testcomp-fields0]`
+- `tests/types/test_composite.py::test_fetch_info[testschema.testcomp-fields1]`
+- `tests/types/test_composite.py::test_fetch_info_async[asyncio-name2-fields2]`
+- `tests/types/test_composite.py::test_fetch_info_async[asyncio-name3-fields3]`
+- `tests/types/test_composite.py::test_fetch_info_async[asyncio-testcomp-fields0]`
+- `tests/types/test_composite.py::test_fetch_info_async[asyncio-testschema.testcomp-fields1]`
+- `tests/types/test_composite.py::test_invalid_fields_names`
+- `tests/types/test_composite.py::test_literal_invalid_attr[1-f1]`
+- `tests/types/test_composite.py::test_literal_invalid_attr[\u20ac-f_]`
+- `tests/types/test_composite.py::test_literal_invalid_attr[\xfc\xe5\xe4\xf6-\xfc\xe5\xe4\xf6]`
+- `tests/types/test_composite.py::test_literal_invalid_attr[a-b-a_b]`
+- `tests/types/test_composite.py::test_literal_invalid_attr[order-order]`
+- `tests/types/test_composite.py::test_literal_invalid_name[']`
+- `tests/types/test_composite.py::test_literal_invalid_name[1]`
+- `tests/types/test_composite.py::test_literal_invalid_name[\u20ac]`
+- `tests/types/test_composite.py::test_literal_invalid_name[a-b]`
+- `tests/types/test_composite.py::test_literal_invalid_name[order]`
+- `tests/types/test_composite.py::test_load_all_chars[0]`
+- `tests/types/test_composite.py::test_load_all_chars[1]`
+- `tests/types/test_composite.py::test_load_composite[0]`
+- `tests/types/test_composite.py::test_load_composite[1]`
+- `tests/types/test_composite.py::test_load_composite_factory[0]`
+- `tests/types/test_composite.py::test_load_composite_factory[1]`
+- `tests/types/test_composite.py::test_load_different_records_cols[0]`
+- `tests/types/test_composite.py::test_load_different_records_cols[1]`
+- `tests/types/test_composite.py::test_load_different_records_rows[0]`
+- `tests/types/test_composite.py::test_load_different_records_rows[1]`
+- `tests/types/test_composite.py::test_load_keyword_composite_factory[0]`
+- `tests/types/test_composite.py::test_load_keyword_composite_factory[1]`
+- `tests/types/test_composite.py::test_load_record['foo''', '''foo', '"bar', 'bar"' -want5]`
+- `tests/types/test_composite.py::test_load_record[-want0]`
+- `tests/types/test_composite.py::test_load_record[42,'foo','ba,r','ba''z','qu"x'-want4]`
+- `tests/types/test_composite.py::test_load_record[null, ''-want3]`
+- `tests/types/test_composite.py::test_load_record[null,null-want2]`
+- `tests/types/test_composite.py::test_load_record[null-want1]`
+- `tests/types/test_composite.py::test_load_record_binary['foo''', '''foo', '"bar', 'bar"' -want5]`
+- `tests/types/test_composite.py::test_load_record_binary[-want0]`
+- `tests/types/test_composite.py::test_load_record_binary[10::int, null::text, 20::float, null::text, 'foo'::text, 'bar'::bytea -want6]`
+- `tests/types/test_composite.py::test_load_record_binary[42,'foo','ba,r','ba''z','qu"x'-want4]`
+- `tests/types/test_composite.py::test_load_record_binary[null, ''-want3]`
+- `tests/types/test_composite.py::test_load_record_binary[null,null-want2]`
+- `tests/types/test_composite.py::test_load_record_binary[null-want1]`
+- `tests/types/test_composite.py::test_load_recursive_composite[0]`
+- `tests/types/test_composite.py::test_load_recursive_composite[1]`
+- `tests/types/test_composite.py::test_register_scope`
+- `tests/types/test_composite.py::test_type_dumper_registered[b]`
+- `tests/types/test_composite.py::test_type_dumper_registered[s]`
+- `tests/types/test_composite.py::test_type_dumper_registered[t]`
+- `tests/types/test_datetime.py::TestDate::test_dump_date_datestyle[DMY]`
+- `tests/types/test_datetime.py::TestDate::test_dump_date_datestyle[MDY]`
+- `tests/types/test_datetime.py::TestDate::test_dump_date_datestyle[YMD]`
+- `tests/types/test_datetime.py::TestDate::test_infinity_date_example`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow[German-max]`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow[German-min]`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow[ISO-max]`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow[ISO-min]`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow[Postgres-max]`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow[Postgres-min]`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow[SQL-max]`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow[SQL-min]`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow_binary[max]`
+- `tests/types/test_datetime.py::TestDate::test_load_date_overflow_binary[min]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[-infinity-date too small-German]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[-infinity-date too small-ISO]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[-infinity-date too small-Postgres]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[-infinity-date too small-SQL]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[1000-01-01 BC-date too small-German]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[1000-01-01 BC-date too small-ISO]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[1000-01-01 BC-date too small-Postgres]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[1000-01-01 BC-date too small-SQL]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[10000-01-01-date too large-German]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[10000-01-01-date too large-ISO]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[10000-01-01-date too large-Postgres]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[10000-01-01-date too large-SQL]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[infinity-date too large-German]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[infinity-date too large-ISO]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[infinity-date too large-Postgres]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message[infinity-date too large-SQL]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message_binary[-infinity-date too small]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message_binary[1000-01-01 BC-date too small]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message_binary[10000-01-01-date too large]`
+- `tests/types/test_datetime.py::TestDate::test_load_overflow_message_binary[infinity-date too large]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-1000,1,1,0,0~2-1000-01-01 00:00+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-2000,1,1,0,0~-01:02:03-2000-01-01 00:00-01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-2000,1,1,0,0~-12-2000-01-01 00:00-12]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-2000,1,1,0,0~01:02:03-2000-01-01 00:00+01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-2000,1,1,0,0~12-2000-01-01 00:00+12]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-2000,1,1,0,0~2-2000-01-01 00:00+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-2000,12,31,23,59,59,999999~2-2000-12-31 23:59:59.999999+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-2034,02,03,23,34,27,951357~-4:27-2034-02-03 23:34:27.951357-04:27]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-2300,1,1,0,0,0,1~1-2300-01-01 00:00:00.000001+1]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-258,1,8,1,12,32,358261~1:2:3-0258-1-8 1:12:32.358261+01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-3000,1,1,0,0~2-3000-01-01 00:00+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-7000,1,1,0,0,0,1~-1:2:3-7000-01-01 00:00:00.000001-01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-max~2-9999-12-31 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-min~-12-0001-01-01 00:00-12:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[b-min~-2-0001-01-01 00:00-02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-1000,1,1,0,0~2-1000-01-01 00:00+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-2000,1,1,0,0~-01:02:03-2000-01-01 00:00-01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-2000,1,1,0,0~-12-2000-01-01 00:00-12]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-2000,1,1,0,0~01:02:03-2000-01-01 00:00+01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-2000,1,1,0,0~12-2000-01-01 00:00+12]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-2000,1,1,0,0~2-2000-01-01 00:00+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-2000,12,31,23,59,59,999999~2-2000-12-31 23:59:59.999999+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-2034,02,03,23,34,27,951357~-4:27-2034-02-03 23:34:27.951357-04:27]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-2300,1,1,0,0,0,1~1-2300-01-01 00:00:00.000001+1]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-258,1,8,1,12,32,358261~1:2:3-0258-1-8 1:12:32.358261+01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-3000,1,1,0,0~2-3000-01-01 00:00+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-7000,1,1,0,0,0,1~-1:2:3-7000-01-01 00:00:00.000001-01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-max~2-9999-12-31 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-min~-12-0001-01-01 00:00-12:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[s-min~-2-0001-01-01 00:00-02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-1000,1,1,0,0~2-1000-01-01 00:00+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-2000,1,1,0,0~-01:02:03-2000-01-01 00:00-01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-2000,1,1,0,0~-12-2000-01-01 00:00-12]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-2000,1,1,0,0~01:02:03-2000-01-01 00:00+01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-2000,1,1,0,0~12-2000-01-01 00:00+12]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-2000,1,1,0,0~2-2000-01-01 00:00+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-2000,12,31,23,59,59,999999~2-2000-12-31 23:59:59.999999+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-2034,02,03,23,34,27,951357~-4:27-2034-02-03 23:34:27.951357-04:27]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-2300,1,1,0,0,0,1~1-2300-01-01 00:00:00.000001+1]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-258,1,8,1,12,32,358261~1:2:3-0258-1-8 1:12:32.358261+01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-3000,1,1,0,0~2-3000-01-01 00:00+2]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-7000,1,1,0,0,0,1~-1:2:3-7000-01-01 00:00:00.000001-01:02:03]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-max~2-9999-12-31 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-min~-12-0001-01-01 00:00-12:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz[t-min~-2-0001-01-01 00:00-02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz_datestyle[DMY]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz_datestyle[MDY]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_dump_datetimetz_datestyle[YMD]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz[ISO-1900,1,1~05:21:10-1900-01-01-Asia/Kolkata]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz[ISO-2000,1,1~2-2000-01-01--02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz[ISO-2000,1,2,3,0,0,456789~-2-2000-01-02 03:00:00.456789-+02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz[ISO-2000,1,2,3,0,0,456789~2-2000-01-02 03:00:00.456789--02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz[ISO-2000,1,2,3,4,5,678~1-2000-01-02 03:04:05.000678-Europe/Rome]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz[ISO-2000,1,2,3,4,5,6~2-2000-01-02 03:04:05.000006--02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz[ISO-2000,12,31~2-2000-12-31--02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz[ISO-2000,7,2,3,4,5,678~2-2000-07-02 03:04:05.000678-Europe/Rome]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_binary[1900,1,1~05:21:10-1900-01-01-Asia/Kolkata]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_binary[2000,1,1~2-2000-01-01--02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_binary[2000,1,2,3,0,0,456789~-2-2000-01-02 03:00:00.456789-+02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_binary[2000,1,2,3,0,0,456789~2-2000-01-02 03:00:00.456789--02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_binary[2000,1,2,3,4,5,678~1-2000-01-02 03:04:05.000678-Europe/Rome]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_binary[2000,1,2,3,4,5,6~2-2000-01-02 03:04:05.000006--02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_binary[2000,12,31~2-2000-12-31--02:00]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_binary[2000,7,2,3,4,5,678~2-2000-07-02 03:04:05.000678-Europe/Rome]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[0-Europe/Rome-1000-1-1-2996]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[0-Europe/Rome-2000-1-1-3600]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[0-Europe/Rome-2000-7-1-7200]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[1-0-2000-1-1-0]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[1-Europe/Rome-1000-1-1-2996]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[1-Europe/Rome-2000-1-1-3600]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[1-Europe/Rome-2000-7-1-7200]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[1-NOSUCH0-2000-1-1-0]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[1-UTC-2000-1-1-0]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_load_datetimetz_tz[1-UTC-2000-7-1-0]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_max_with_timezone[0-max--06-America/Chicago]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_max_with_timezone[0-min-+09:18:59-Asia/Tokyo]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_max_with_timezone[1-max--06-America/Chicago]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_max_with_timezone[1-min-+09:18:59-Asia/Tokyo]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[-infinity-timestamp too small-German]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[-infinity-timestamp too small-Postgres]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[-infinity-timestamp too small-SQL]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[1000-01-01 12:00+00 BC-timestamp too small-German]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[1000-01-01 12:00+00 BC-timestamp too small-Postgres]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[1000-01-01 12:00+00 BC-timestamp too small-SQL]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[10000-01-01 12:00+00-timestamp too large-German]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[10000-01-01 12:00+00-timestamp too large-Postgres]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[10000-01-01 12:00+00-timestamp too large-SQL]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[infinity-timestamp too large-German]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[infinity-timestamp too large-Postgres]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message[infinity-timestamp too large-SQL]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message_binary[-infinity-timestamp too small]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message_binary[1000-01-01 12:00+00 BC-timestamp too small]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message_binary[10000-01-01 12:00+00-timestamp too large]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_overflow_message_binary[infinity-timestamp too large]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-1000,1,1,0,0-1000-01-01 00:00]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-2000,1,1,0,0,0,1-2000-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-2000,1,1,0,0-2000-01-01 00:00]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-2000,1,2,3,0,0,456789-2000-01-02 03:00:00.456789]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-2000,1,2,3,4,5,6-2000-01-02 03:04:05.000006]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-2000,1,2,3,4,5,678-2000-01-02 03:04:05.000678]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-2034,02,03,23,34,27,951357-2034-02-03 23:34:27.951357]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-2200,1,1,0,0,0,1-2200-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-2300,1,1,0,0,0,1-2300-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-258,1,8,1,12,32,358261-0258-1-8 1:12:32.358261]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-7000,1,1,0,0,0,1-7000-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-max-9999-12-31 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[b-min-0001-01-01 00:00]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-1000,1,1,0,0-1000-01-01 00:00]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-2000,1,1,0,0,0,1-2000-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-2000,1,1,0,0-2000-01-01 00:00]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-2000,1,2,3,0,0,456789-2000-01-02 03:00:00.456789]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-2000,1,2,3,4,5,6-2000-01-02 03:04:05.000006]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-2000,1,2,3,4,5,678-2000-01-02 03:04:05.000678]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-2034,02,03,23,34,27,951357-2034-02-03 23:34:27.951357]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-2200,1,1,0,0,0,1-2200-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-2300,1,1,0,0,0,1-2300-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-258,1,8,1,12,32,358261-0258-1-8 1:12:32.358261]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-7000,1,1,0,0,0,1-7000-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-max-9999-12-31 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[s-min-0001-01-01 00:00]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-1000,1,1,0,0-1000-01-01 00:00]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-2000,1,1,0,0,0,1-2000-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-2000,1,1,0,0-2000-01-01 00:00]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-2000,1,2,3,0,0,456789-2000-01-02 03:00:00.456789]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-2000,1,2,3,4,5,6-2000-01-02 03:04:05.000006]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-2000,1,2,3,4,5,678-2000-01-02 03:04:05.000678]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-2034,02,03,23,34,27,951357-2034-02-03 23:34:27.951357]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-2200,1,1,0,0,0,1-2200-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-2300,1,1,0,0,0,1-2300-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-258,1,8,1,12,32,358261-0258-1-8 1:12:32.358261]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-7000,1,1,0,0,0,1-7000-01-01 00:00:00.000001]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-max-9999-12-31 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime[t-min-0001-01-01 00:00]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime_datestyle[DMY]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime_datestyle[MDY]`
+- `tests/types/test_datetime.py::TestDatetime::test_dump_datetime_datestyle[YMD]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_binary[max-9999-12-31 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow[German-max]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow[German-min]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow[ISO-max]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow[ISO-min]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow[Postgres-max]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow[Postgres-min]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow[SQL-max]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow[SQL-min]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow_binary[max]`
+- `tests/types/test_datetime.py::TestDatetime::test_load_datetime_overflow_binary[min]`
+- `tests/types/test_datetime.py::TestDatetime::test_overflow_message_binary[-infinity-timestamp too small]`
+- `tests/types/test_datetime.py::TestDatetime::test_overflow_message_binary[1000-01-01 12:00 BC-timestamp too small]`
+- `tests/types/test_datetime.py::TestDatetime::test_overflow_message_binary[10000-01-01 12:00-timestamp too large]`
+- `tests/types/test_datetime.py::TestDatetime::test_overflow_message_binary[infinity-timestamp too large]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[iso_8601--1d--1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[iso_8601--1m--0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[iso_8601--1s--1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[iso_8601-1d-1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[iso_8601-1m-0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[iso_8601-1s-1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[iso_8601-max-999999999 days 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[iso_8601-min--999999999 days]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres--1d--1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres--1m--0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres--1s--1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres-1d-1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres-1m-0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres-1s-1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres-max-999999999 days 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres-min--999999999 days]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres_verbose--1d--1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres_verbose--1m--0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres_verbose--1s--1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres_verbose-1d-1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres_verbose-1m-0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres_verbose-1s-1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres_verbose-max-999999999 days 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[postgres_verbose-min--999999999 days]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[sql_standard--1d--1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[sql_standard--1m--0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[sql_standard--1s--1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[sql_standard-1d-1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[sql_standard-1m-0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[sql_standard-1s-1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[sql_standard-max-999999999 days 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval[sql_standard-min--999999999 days]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval_binary[-1d--1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval_binary[-1m--0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval_binary[-1s--1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval_binary[1d-1 day]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval_binary[1m-0.000001 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval_binary[1s-1 s]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval_binary[max-999999999 days 23:59:59.999999]`
+- `tests/types/test_datetime.py::TestInterval::test_dump_interval_binary[min--999999999 days]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[0--1s--1 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[0-1d,1s,1m-1 day 1.000001 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[0-1s,1000m-1.001 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[0-1s,1m-1.000001 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[0-1s-1 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[0-60s-1 min]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[1--1s--1 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[1-1d,1s,1m-1 day 1.000001 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[1-1s,1000m-1.001 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[1-1s,1m-1.000001 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[1-1s-1 sec]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval[1-60s-1 min]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval_overflow[max-0]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval_overflow[max-1]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval_overflow[min-0]`
+- `tests/types/test_datetime.py::TestInterval::test_load_interval_overflow[min-1]`
+- `tests/types/test_datetime.py::TestTime::test_dump_time[t-10,20,30,40-10:20:30.000040]`
+- `tests/types/test_datetime.py::TestTimeTz::test_dump_timetz[b-10,20,30,40~0-10:20:30.000040Z]`
+- `tests/types/test_datetime.py::TestTimeTz::test_dump_timetz[s-10,20,30,40~0-10:20:30.000040Z]`
+- `tests/types/test_datetime.py::TestTimeTz::test_dump_timetz[t-10,20,30,40~+2:30-10:20:30.000040+02:30]`
+- `tests/types/test_datetime.py::TestTimeTz::test_dump_timetz[t-10,20,30,40~-2-10:20:30.000040-02:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_dump_timetz[t-10,20,30,40~0-10:20:30.000040Z]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[0-0,0~-12-00:00-12:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[0-0,0~12-00:00--12:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[0-3,0,0,456789~-2-03:00:00.456789-+02:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[0-3,0,0,456789~2-03:00:00.456789--02:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[0-3,4,5,6~2-03:04:05.000006--02:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[0-3,4,5,6~7:8-03:04:05.000006--07:08]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[1-0,0~-12-00:00-12:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[1-0,0~12-00:00--12:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[1-3,0,0,456789~-2-03:00:00.456789-+02:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[1-3,0,0,456789~2-03:00:00.456789--02:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[1-3,4,5,6~2-03:04:05.000006--02:00]`
+- `tests/types/test_datetime.py::TestTimeTz::test_load_timetz[1-3,4,5,6~7:8-03:04:05.000006--07:08]`
+- `tests/types/test_enum.py::test_enum_array_dumper[0-b]`
+- `tests/types/test_enum.py::test_enum_array_dumper[0-s]`
+- `tests/types/test_enum.py::test_enum_array_dumper[0-t]`
+- `tests/types/test_enum.py::test_enum_array_dumper[1-b]`
+- `tests/types/test_enum.py::test_enum_array_dumper[1-s]`
+- `tests/types/test_enum.py::test_enum_array_dumper[1-t]`
+- `tests/types/test_enum.py::test_enum_array_loader[0-b]`
+- `tests/types/test_enum.py::test_enum_array_loader[0-s]`
+- `tests/types/test_enum.py::test_enum_array_loader[0-t]`
+- `tests/types/test_enum.py::test_enum_array_loader[1-b]`
+- `tests/types/test_enum.py::test_enum_array_loader[1-s]`
+- `tests/types/test_enum.py::test_enum_array_loader[1-t]`
+- `tests/types/test_enum.py::test_enum_dumper[0-b-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[0-b-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[0-b-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[0-s-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[0-s-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[0-s-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[0-t-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[0-t-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[0-t-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[1-b-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[1-b-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[1-b-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[1-s-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[1-s-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[1-s-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[1-t-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[1-t-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper[1-t-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[0-b-latin1]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[0-b-utf8]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[0-s-latin1]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[0-s-utf8]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[0-t-latin1]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[0-t-utf8]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[1-b-latin1]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[1-b-utf8]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[1-s-latin1]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[1-s-utf8]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[1-t-latin1]`
+- `tests/types/test_enum.py::test_enum_dumper_nonascii[1-t-utf8]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[0-b-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[0-b-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[0-b-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[0-s-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[0-s-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[0-s-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[0-t-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[0-t-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[0-t-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[1-b-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[1-b-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[1-b-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[1-s-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[1-s-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[1-s-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[1-t-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[1-t-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_dumper_sqlascii[1-t-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_error`
+- `tests/types/test_enum.py::test_enum_loader[0-b-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[0-b-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[0-b-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[0-s-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[0-s-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[0-s-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[0-t-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[0-t-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[0-t-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[1-b-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[1-b-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[1-b-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[1-s-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[1-s-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[1-s-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[1-t-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[1-t-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader[1-t-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[0-b-latin1]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[0-b-utf8]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[0-s-latin1]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[0-s-utf8]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[0-t-latin1]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[0-t-utf8]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[1-b-latin1]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[1-b-utf8]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[1-s-latin1]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[1-s-utf8]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[1-t-latin1]`
+- `tests/types/test_enum.py::test_enum_loader_nonascii[1-t-utf8]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[0-b-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[0-b-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[0-b-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[0-s-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[0-s-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[0-s-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[0-t-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[0-t-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[0-t-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[1-b-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[1-b-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[1-b-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[1-s-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[1-s-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[1-s-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[1-t-IntTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[1-t-PureTestEnum]`
+- `tests/types/test_enum.py::test_enum_loader_sqlascii[1-t-StrTestEnum]`
+- `tests/types/test_enum.py::test_enum_quoted_name[b]`
+- `tests/types/test_enum.py::test_enum_quoted_name[s]`
+- `tests/types/test_enum.py::test_enum_quoted_name[t]`
+- `tests/types/test_enum.py::test_fetch_info`
+- `tests/types/test_enum.py::test_fetch_info_async[asyncio]`
+- `tests/types/test_enum.py::test_generic_enum_array_loader[0-b]`
+- `tests/types/test_enum.py::test_generic_enum_array_loader[0-s]`
+- `tests/types/test_enum.py::test_generic_enum_array_loader[0-t]`
+- `tests/types/test_enum.py::test_generic_enum_array_loader[1-b]`
+- `tests/types/test_enum.py::test_generic_enum_array_loader[1-s]`
+- `tests/types/test_enum.py::test_generic_enum_array_loader[1-t]`
+- `tests/types/test_enum.py::test_generic_enum_loader[1-b-IntTestEnum]`
+- `tests/types/test_enum.py::test_generic_enum_loader[1-b-PureTestEnum]`
+- `tests/types/test_enum.py::test_generic_enum_loader[1-b-StrTestEnum]`
+- `tests/types/test_enum.py::test_generic_enum_loader[1-s-IntTestEnum]`
+- `tests/types/test_enum.py::test_generic_enum_loader[1-s-PureTestEnum]`
+- `tests/types/test_enum.py::test_generic_enum_loader[1-s-StrTestEnum]`
+- `tests/types/test_enum.py::test_generic_enum_loader[1-t-IntTestEnum]`
+- `tests/types/test_enum.py::test_generic_enum_loader[1-t-PureTestEnum]`
+- `tests/types/test_enum.py::test_generic_enum_loader[1-t-StrTestEnum]`
+- `tests/types/test_enum.py::test_generic_enum_loader_nonascii[1-b-latin1]`
+- `tests/types/test_enum.py::test_generic_enum_loader_nonascii[1-b-utf8]`
+- `tests/types/test_enum.py::test_generic_enum_loader_nonascii[1-s-latin1]`
+- `tests/types/test_enum.py::test_generic_enum_loader_nonascii[1-s-utf8]`
+- `tests/types/test_enum.py::test_generic_enum_loader_nonascii[1-t-latin1]`
+- `tests/types/test_enum.py::test_generic_enum_loader_nonascii[1-t-utf8]`
+- `tests/types/test_enum.py::test_register_makes_a_type`
+- `tests/types/test_enum.py::test_remap[mapping0-0-b]`
+- `tests/types/test_enum.py::test_remap[mapping0-0-s]`
+- `tests/types/test_enum.py::test_remap[mapping0-0-t]`
+- `tests/types/test_enum.py::test_remap[mapping0-1-b]`
+- `tests/types/test_enum.py::test_remap[mapping0-1-s]`
+- `tests/types/test_enum.py::test_remap[mapping0-1-t]`
+- `tests/types/test_enum.py::test_remap[mapping1-0-b]`
+- `tests/types/test_enum.py::test_remap[mapping1-0-s]`
+- `tests/types/test_enum.py::test_remap[mapping1-0-t]`
+- `tests/types/test_enum.py::test_remap[mapping1-1-b]`
+- `tests/types/test_enum.py::test_remap[mapping1-1-s]`
+- `tests/types/test_enum.py::test_remap[mapping1-1-t]`
+- `tests/types/test_enum.py::test_remap_by_value`
+- `tests/types/test_enum.py::test_remap_more_postgres`
+- `tests/types/test_enum.py::test_remap_more_python`
+- `tests/types/test_enum.py::test_remap_rename`
+- `tests/types/test_json.py::test_array_dump[b-Json-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_array_dump[b-Json-"te'xt"]`
+- `tests/types/test_json.py::test_array_dump[b-Json-123.45]`
+- `tests/types/test_json.py::test_array_dump[b-Json-123]`
+- `tests/types/test_json.py::test_array_dump[b-Json-["a", 100]]`
+- `tests/types/test_json.py::test_array_dump[b-Json-null]`
+- `tests/types/test_json.py::test_array_dump[b-Json-true]`
+- `tests/types/test_json.py::test_array_dump[b-Json-{"a": 100}]`
+- `tests/types/test_json.py::test_array_dump[b-Jsonb-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_array_dump[b-Jsonb-"te'xt"]`
+- `tests/types/test_json.py::test_array_dump[b-Jsonb-123.45]`
+- `tests/types/test_json.py::test_array_dump[b-Jsonb-123]`
+- `tests/types/test_json.py::test_array_dump[b-Jsonb-["a", 100]]`
+- `tests/types/test_json.py::test_array_dump[b-Jsonb-null]`
+- `tests/types/test_json.py::test_array_dump[b-Jsonb-true]`
+- `tests/types/test_json.py::test_array_dump[b-Jsonb-{"a": 100}]`
+- `tests/types/test_json.py::test_array_dump[s-Json-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_array_dump[s-Json-"te'xt"]`
+- `tests/types/test_json.py::test_array_dump[s-Json-123.45]`
+- `tests/types/test_json.py::test_array_dump[s-Json-123]`
+- `tests/types/test_json.py::test_array_dump[s-Json-["a", 100]]`
+- `tests/types/test_json.py::test_array_dump[s-Json-null]`
+- `tests/types/test_json.py::test_array_dump[s-Json-true]`
+- `tests/types/test_json.py::test_array_dump[s-Json-{"a": 100}]`
+- `tests/types/test_json.py::test_array_dump[s-Jsonb-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_array_dump[s-Jsonb-"te'xt"]`
+- `tests/types/test_json.py::test_array_dump[s-Jsonb-123.45]`
+- `tests/types/test_json.py::test_array_dump[s-Jsonb-123]`
+- `tests/types/test_json.py::test_array_dump[s-Jsonb-["a", 100]]`
+- `tests/types/test_json.py::test_array_dump[s-Jsonb-null]`
+- `tests/types/test_json.py::test_array_dump[s-Jsonb-true]`
+- `tests/types/test_json.py::test_array_dump[s-Jsonb-{"a": 100}]`
+- `tests/types/test_json.py::test_array_dump[t-Json-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_array_dump[t-Json-"te'xt"]`
+- `tests/types/test_json.py::test_array_dump[t-Json-123.45]`
+- `tests/types/test_json.py::test_array_dump[t-Json-123]`
+- `tests/types/test_json.py::test_array_dump[t-Json-["a", 100]]`
+- `tests/types/test_json.py::test_array_dump[t-Json-null]`
+- `tests/types/test_json.py::test_array_dump[t-Json-true]`
+- `tests/types/test_json.py::test_array_dump[t-Json-{"a": 100}]`
+- `tests/types/test_json.py::test_array_dump[t-Jsonb-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_array_dump[t-Jsonb-"te'xt"]`
+- `tests/types/test_json.py::test_array_dump[t-Jsonb-123.45]`
+- `tests/types/test_json.py::test_array_dump[t-Jsonb-123]`
+- `tests/types/test_json.py::test_array_dump[t-Jsonb-["a", 100]]`
+- `tests/types/test_json.py::test_array_dump[t-Jsonb-null]`
+- `tests/types/test_json.py::test_array_dump[t-Jsonb-true]`
+- `tests/types/test_json.py::test_array_dump[t-Jsonb-{"a": 100}]`
+- `tests/types/test_json.py::test_dump_customise[Json-b]`
+- `tests/types/test_json.py::test_dump_customise[Json-s]`
+- `tests/types/test_json.py::test_dump_customise[Json-t]`
+- `tests/types/test_json.py::test_dump_customise[Jsonb-b]`
+- `tests/types/test_json.py::test_dump_customise[Jsonb-s]`
+- `tests/types/test_json.py::test_dump_customise[Jsonb-t]`
+- `tests/types/test_json.py::test_dump_customise_bytes[Json-b]`
+- `tests/types/test_json.py::test_dump_customise_bytes[Json-s]`
+- `tests/types/test_json.py::test_dump_customise_bytes[Json-t]`
+- `tests/types/test_json.py::test_dump_customise_bytes[Jsonb-b]`
+- `tests/types/test_json.py::test_dump_customise_bytes[Jsonb-s]`
+- `tests/types/test_json.py::test_dump_customise_bytes[Jsonb-t]`
+- `tests/types/test_json.py::test_dump_customise_context[Json-b]`
+- `tests/types/test_json.py::test_dump_customise_context[Json-s]`
+- `tests/types/test_json.py::test_dump_customise_context[Json-t]`
+- `tests/types/test_json.py::test_dump_customise_context[Jsonb-b]`
+- `tests/types/test_json.py::test_dump_customise_context[Jsonb-s]`
+- `tests/types/test_json.py::test_dump_customise_context[Jsonb-t]`
+- `tests/types/test_json.py::test_dump_customise_wrapper[Json-b]`
+- `tests/types/test_json.py::test_dump_customise_wrapper[Json-s]`
+- `tests/types/test_json.py::test_dump_customise_wrapper[Json-t]`
+- `tests/types/test_json.py::test_dump_customise_wrapper[Jsonb-b]`
+- `tests/types/test_json.py::test_dump_customise_wrapper[Jsonb-s]`
+- `tests/types/test_json.py::test_dump_customise_wrapper[Jsonb-t]`
+- `tests/types/test_json.py::test_dump_dict[b-jsonb-JsonbBinaryDumper]`
+- `tests/types/test_json.py::test_dump_dict[t-jsonb-JsonbDumper]`
+- `tests/types/test_json.py::test_load[0-json-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load[0-json-"te'xt"]`
+- `tests/types/test_json.py::test_load[0-json-123.45]`
+- `tests/types/test_json.py::test_load[0-json-123]`
+- `tests/types/test_json.py::test_load[0-json-["a", 100]]`
+- `tests/types/test_json.py::test_load[0-json-null]`
+- `tests/types/test_json.py::test_load[0-json-true]`
+- `tests/types/test_json.py::test_load[0-json-{"a": 100}]`
+- `tests/types/test_json.py::test_load[0-jsonb-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load[0-jsonb-"te'xt"]`
+- `tests/types/test_json.py::test_load[0-jsonb-123.45]`
+- `tests/types/test_json.py::test_load[0-jsonb-123]`
+- `tests/types/test_json.py::test_load[0-jsonb-["a", 100]]`
+- `tests/types/test_json.py::test_load[0-jsonb-null]`
+- `tests/types/test_json.py::test_load[0-jsonb-true]`
+- `tests/types/test_json.py::test_load[0-jsonb-{"a": 100}]`
+- `tests/types/test_json.py::test_load[1-json-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load[1-json-"te'xt"]`
+- `tests/types/test_json.py::test_load[1-json-123.45]`
+- `tests/types/test_json.py::test_load[1-json-123]`
+- `tests/types/test_json.py::test_load[1-json-["a", 100]]`
+- `tests/types/test_json.py::test_load[1-json-null]`
+- `tests/types/test_json.py::test_load[1-json-true]`
+- `tests/types/test_json.py::test_load[1-json-{"a": 100}]`
+- `tests/types/test_json.py::test_load[1-jsonb-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load[1-jsonb-"te'xt"]`
+- `tests/types/test_json.py::test_load[1-jsonb-123.45]`
+- `tests/types/test_json.py::test_load[1-jsonb-123]`
+- `tests/types/test_json.py::test_load[1-jsonb-["a", 100]]`
+- `tests/types/test_json.py::test_load[1-jsonb-null]`
+- `tests/types/test_json.py::test_load[1-jsonb-true]`
+- `tests/types/test_json.py::test_load[1-jsonb-{"a": 100}]`
+- `tests/types/test_json.py::test_load_array[0-json-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load_array[0-json-"te'xt"]`
+- `tests/types/test_json.py::test_load_array[0-json-123.45]`
+- `tests/types/test_json.py::test_load_array[0-json-123]`
+- `tests/types/test_json.py::test_load_array[0-json-["a", 100]]`
+- `tests/types/test_json.py::test_load_array[0-json-null]`
+- `tests/types/test_json.py::test_load_array[0-json-true]`
+- `tests/types/test_json.py::test_load_array[0-json-{"a": 100}]`
+- `tests/types/test_json.py::test_load_array[0-jsonb-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load_array[0-jsonb-"te'xt"]`
+- `tests/types/test_json.py::test_load_array[0-jsonb-123.45]`
+- `tests/types/test_json.py::test_load_array[0-jsonb-123]`
+- `tests/types/test_json.py::test_load_array[0-jsonb-["a", 100]]`
+- `tests/types/test_json.py::test_load_array[0-jsonb-null]`
+- `tests/types/test_json.py::test_load_array[0-jsonb-true]`
+- `tests/types/test_json.py::test_load_array[0-jsonb-{"a": 100}]`
+- `tests/types/test_json.py::test_load_array[1-json-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load_array[1-json-"te'xt"]`
+- `tests/types/test_json.py::test_load_array[1-json-123.45]`
+- `tests/types/test_json.py::test_load_array[1-json-123]`
+- `tests/types/test_json.py::test_load_array[1-json-["a", 100]]`
+- `tests/types/test_json.py::test_load_array[1-json-null]`
+- `tests/types/test_json.py::test_load_array[1-json-true]`
+- `tests/types/test_json.py::test_load_array[1-json-{"a": 100}]`
+- `tests/types/test_json.py::test_load_array[1-jsonb-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load_array[1-jsonb-"te'xt"]`
+- `tests/types/test_json.py::test_load_array[1-jsonb-123.45]`
+- `tests/types/test_json.py::test_load_array[1-jsonb-123]`
+- `tests/types/test_json.py::test_load_array[1-jsonb-["a", 100]]`
+- `tests/types/test_json.py::test_load_array[1-jsonb-null]`
+- `tests/types/test_json.py::test_load_array[1-jsonb-true]`
+- `tests/types/test_json.py::test_load_array[1-jsonb-{"a": 100}]`
+- `tests/types/test_json.py::test_load_copy[0-json-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load_copy[0-json-"te'xt"]`
+- `tests/types/test_json.py::test_load_copy[0-json-123.45]`
+- `tests/types/test_json.py::test_load_copy[0-json-123]`
+- `tests/types/test_json.py::test_load_copy[0-json-["a", 100]]`
+- `tests/types/test_json.py::test_load_copy[0-json-null]`
+- `tests/types/test_json.py::test_load_copy[0-json-true]`
+- `tests/types/test_json.py::test_load_copy[0-json-{"a": 100}]`
+- `tests/types/test_json.py::test_load_copy[0-jsonb-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load_copy[0-jsonb-"te'xt"]`
+- `tests/types/test_json.py::test_load_copy[0-jsonb-123.45]`
+- `tests/types/test_json.py::test_load_copy[0-jsonb-123]`
+- `tests/types/test_json.py::test_load_copy[0-jsonb-["a", 100]]`
+- `tests/types/test_json.py::test_load_copy[0-jsonb-null]`
+- `tests/types/test_json.py::test_load_copy[0-jsonb-true]`
+- `tests/types/test_json.py::test_load_copy[0-jsonb-{"a": 100}]`
+- `tests/types/test_json.py::test_load_copy[1-json-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load_copy[1-json-"te'xt"]`
+- `tests/types/test_json.py::test_load_copy[1-json-123.45]`
+- `tests/types/test_json.py::test_load_copy[1-json-123]`
+- `tests/types/test_json.py::test_load_copy[1-json-["a", 100]]`
+- `tests/types/test_json.py::test_load_copy[1-json-null]`
+- `tests/types/test_json.py::test_load_copy[1-json-true]`
+- `tests/types/test_json.py::test_load_copy[1-json-{"a": 100}]`
+- `tests/types/test_json.py::test_load_copy[1-jsonb-"\\u00e0\\u20ac"]`
+- `tests/types/test_json.py::test_load_copy[1-jsonb-"te'xt"]`
+- `tests/types/test_json.py::test_load_copy[1-jsonb-123.45]`
+- `tests/types/test_json.py::test_load_copy[1-jsonb-123]`
+- `tests/types/test_json.py::test_load_copy[1-jsonb-["a", 100]]`
+- `tests/types/test_json.py::test_load_copy[1-jsonb-null]`
+- `tests/types/test_json.py::test_load_copy[1-jsonb-true]`
+- `tests/types/test_json.py::test_load_copy[1-jsonb-{"a": 100}]`
+- `tests/types/test_json.py::test_load_customise[json-False]`
+- `tests/types/test_json.py::test_load_customise[json-True]`
+- `tests/types/test_json.py::test_load_customise[jsonb-False]`
+- `tests/types/test_json.py::test_load_customise[jsonb-True]`
+- `tests/types/test_json.py::test_load_customise_context[json-False]`
+- `tests/types/test_json.py::test_load_customise_context[json-True]`
+- `tests/types/test_json.py::test_load_customise_context[jsonb-False]`
+- `tests/types/test_json.py::test_load_customise_context[jsonb-True]`
+- `tests/types/test_json.py::test_wrapper_regtype[b-Json]`
+- `tests/types/test_json.py::test_wrapper_regtype[s-Json]`
+- `tests/types/test_json.py::test_wrapper_regtype[t-Json]`
+- `tests/types/test_multirange.py::test_copy_in[0-2000,1,1-2001,1,1-[)]`
+- `tests/types/test_multirange.py::test_copy_in[0-2000,1,1-None-[)]`
+- `tests/types/test_multirange.py::test_copy_in[0-None-2001,1,1-()]`
+- `tests/types/test_multirange.py::test_copy_in[0-None-None-()]`
+- `tests/types/test_multirange.py::test_copy_in[0-None-None-empty]`
+- `tests/types/test_multirange.py::test_copy_in[1-2000,1,1-2001,1,1-[)]`
+- `tests/types/test_multirange.py::test_copy_in[1-2000,1,1-None-[)]`
+- `tests/types/test_multirange.py::test_copy_in[1-None-2001,1,1-()]`
+- `tests/types/test_multirange.py::test_copy_in[1-None-None-()]`
+- `tests/types/test_multirange.py::test_copy_in[1-None-None-empty]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[0-datemultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[0-int4multirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[0-int8multirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[0-nummultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[0-tsmultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[0-tstzmultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[1-datemultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[1-int4multirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[1-int8multirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[1-nummultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[1-tsmultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_set_type[1-tstzmultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[0-DateMultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[0-Int4Multirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[0-Int8Multirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[0-NumericMultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[0-TimestampMultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[0-TimestamptzMultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[1-DateMultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[1-Int4Multirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[1-Int8Multirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[1-NumericMultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[1-TimestampMultirange]`
+- `tests/types/test_multirange.py::test_copy_in_empty_wrappers[1-TimestamptzMultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[s-datemultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[s-int4multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[s-int8multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[s-nummultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[s-tsmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[s-tstzmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[t-datemultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[t-int4multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[t-int8multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[t-nummultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[t-tsmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array[t-tstzmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-datemultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-int4multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-int8multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-nummultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-tsmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-tstzmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-datemultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-int4multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-int8multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-nummultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-tsmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-tstzmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[b-datemultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[b-int4multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[b-int8multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[b-nummultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[b-tsmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[b-tstzmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[s-datemultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[s-int4multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[s-int8multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[s-nummultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[s-tsmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[s-tstzmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[t-datemultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[t-int4multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[t-int8multirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[t-nummultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[t-tsmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_empty[t-tstzmultirange]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-datemultirange-ranges5]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int4multirange-ranges0]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int4multirange-ranges1]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int8multirange-ranges2]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int8multirange-ranges3]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-nummultirange-ranges4]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-tsmultirange-ranges6]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-tstzmultirange-ranges7]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-datemultirange-ranges5]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-int4multirange-ranges0]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-int4multirange-ranges1]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-int8multirange-ranges2]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-int8multirange-ranges3]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-nummultirange-ranges4]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-tsmultirange-ranges6]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-tstzmultirange-ranges7]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-datemultirange-ranges5]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-int4multirange-ranges0]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-int4multirange-ranges1]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-int8multirange-ranges2]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-int8multirange-ranges3]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-nummultirange-ranges4]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-tsmultirange-ranges6]`
+- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-tstzmultirange-ranges7]`
+- `tests/types/test_multirange.py::test_dump_custom_empty`
+- `tests/types/test_multirange.py::test_dump_custom_none[b]`
+- `tests/types/test_multirange.py::test_dump_custom_none[s]`
+- `tests/types/test_multirange.py::test_dump_custom_none[t]`
+- `tests/types/test_multirange.py::test_fetch_info[name2-text]`
+- `tests/types/test_multirange.py::test_fetch_info[name3-float8]`
+- `tests/types/test_multirange.py::test_fetch_info[testmultirange-text]`
+- `tests/types/test_multirange.py::test_fetch_info[testschema.testmultirange-float8]`
+- `tests/types/test_multirange.py::test_fetch_info_async[asyncio-name2-text]`
+- `tests/types/test_multirange.py::test_fetch_info_async[asyncio-name3-float8]`
+- `tests/types/test_multirange.py::test_fetch_info_async[asyncio-testmultirange-text]`
+- `tests/types/test_multirange.py::test_fetch_info_async[asyncio-testschema.testmultirange-float8]`
+- `tests/types/test_multirange.py::test_fetch_info_not_found`
+- `tests/types/test_multirange.py::test_fetch_info_not_found_async[asyncio]`
+- `tests/types/test_multirange.py::test_literal_invalid_name[\u20ac]`
+- `tests/types/test_multirange.py::test_literal_invalid_name[a-b]`
+- `tests/types/test_multirange.py::test_load_custom_empty[0]`
+- `tests/types/test_multirange.py::test_load_custom_empty[1]`
+- `tests/types/test_net.py::test_address_dump[192.168.0.1-b]`
+- `tests/types/test_net.py::test_address_dump[192.168.0.1-s]`
+- `tests/types/test_net.py::test_address_dump[192.168.0.1-t]`
+- `tests/types/test_net.py::test_address_dump[2001:db8::-b]`
+- `tests/types/test_net.py::test_address_dump[2001:db8::-s]`
+- `tests/types/test_net.py::test_address_dump[2001:db8::-t]`
+- `tests/types/test_net.py::test_cidr_load[127.0.0.0/24-0]`
+- `tests/types/test_net.py::test_cidr_load[127.0.0.0/24-1]`
+- `tests/types/test_net.py::test_cidr_load[::ffff:102:300/128-0]`
+- `tests/types/test_net.py::test_cidr_load[::ffff:102:300/128-1]`
+- `tests/types/test_net.py::test_inet_load_address[127.0.0.1/32-0]`
+- `tests/types/test_net.py::test_inet_load_address[127.0.0.1/32-1]`
+- `tests/types/test_net.py::test_inet_load_address[::ffff:102:300/128-0]`
+- `tests/types/test_net.py::test_inet_load_address[::ffff:102:300/128-1]`
+- `tests/types/test_net.py::test_inet_load_network[127.0.0.1/24-0]`
+- `tests/types/test_net.py::test_inet_load_network[127.0.0.1/24-1]`
+- `tests/types/test_net.py::test_inet_load_network[::ffff:102:300/127-0]`
+- `tests/types/test_net.py::test_inet_load_network[::ffff:102:300/127-1]`
+- `tests/types/test_net.py::test_interface_dump[127.0.0.1/24-b]`
+- `tests/types/test_net.py::test_interface_dump[127.0.0.1/24-s]`
+- `tests/types/test_net.py::test_interface_dump[127.0.0.1/24-t]`
+- `tests/types/test_net.py::test_interface_dump[::ffff:102:300/128-b]`
+- `tests/types/test_net.py::test_interface_dump[::ffff:102:300/128-s]`
+- `tests/types/test_net.py::test_interface_dump[::ffff:102:300/128-t]`
+- `tests/types/test_net.py::test_network_dump[127.0.0.0/24-b]`
+- `tests/types/test_net.py::test_network_dump[127.0.0.0/24-s]`
+- `tests/types/test_net.py::test_network_dump[127.0.0.0/24-t]`
+- `tests/types/test_net.py::test_network_dump[::ffff:102:300/128-b]`
+- `tests/types/test_net.py::test_network_dump[::ffff:102:300/128-s]`
+- `tests/types/test_net.py::test_network_dump[::ffff:102:300/128-t]`
+- `tests/types/test_numeric.py::test_dump_float[b-nan-'NaN']`
+- `tests/types/test_numeric.py::test_dump_float[s-nan-'NaN']`
+- `tests/types/test_numeric.py::test_dump_float[t-nan-'NaN']`
+- `tests/types/test_numeric.py::test_dump_numeric_exhaustive[b]`
+- `tests/types/test_numeric.py::test_load_float_approx[0--exp(1.0)-float4--2.71828]`
+- `tests/types/test_numeric.py::test_load_float_approx[0--exp(1.0)-float8--2.71828182845905]`
+- `tests/types/test_numeric.py::test_load_float_approx[1--exp(1.0)-float4--2.71828]`
+- `tests/types/test_numeric.py::test_load_float_approx[1--exp(1.0)-float8--2.71828182845905]`
+- `tests/types/test_numeric.py::test_minus_minus[numeric]`
+- `tests/types/test_numeric.py::test_minus_minus_quote[numeric]`
+- `tests/types/test_numeric.py::test_quote_numeric[-0.00000000000000001- -1E-17]`
+- `tests/types/test_numeric.py::test_quote_numeric[nan-'NaN'::numeric]`
+- `tests/types/test_numeric.py::test_quote_numeric[snan-'NaN'::numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-bool_-False-bool]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-bool_-True-bool]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-int16--32768-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-int16-32767-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-int32--2147483648-int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-int32-0-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-int32-2147483647-int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-int64--9223372036854775808-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-int64-9223372036854775807-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-int8--128-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-int8-127-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-longlong--9223372036854775808-int8]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-longlong-9223372036854775807-int8]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-uint16-0-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-uint16-65535-int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-uint32-0-int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-uint32-4294967295-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-uint64-0-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-uint64-18446744073709551615-numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-uint8-0-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-uint8-255-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-ulonglong-0-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[0-ulonglong-18446744073709551615-numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-bool_-False-bool]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-bool_-True-bool]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-int16--32768-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-int16-32767-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-int32--2147483648-int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-int32-0-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-int32-2147483647-int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-int64--9223372036854775808-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-int64-9223372036854775807-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-int8--128-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-int8-127-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-longlong--9223372036854775808-int8]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-longlong-9223372036854775807-int8]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-uint16-0-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-uint16-65535-int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-uint32-0-int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-uint32-4294967295-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-uint64-0-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-uint64-18446744073709551615-numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-uint8-0-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-uint8-255-int2 int4 int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-ulonglong-0-int8 numeric]`
+- `tests/types/test_numpy.py::test_copy_by_oid[1-ulonglong-18446744073709551615-numeric]`
+- `tests/types/test_numpy.py::test_dump_int[b-bool_-False-'f'::bool]`
+- `tests/types/test_numpy.py::test_dump_int[b-bool_-True-'t'::bool]`
+- `tests/types/test_numpy.py::test_dump_int[b-int16--32768-'-32768'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[b-int16-0-'0'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[b-int16-32767-'32767'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[b-int32--2147483648-'-2147483648'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[b-int32-0-'0'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[b-int32-2147483647-'2147483647'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[b-int64--9223372036854775808-'-9223372036854775808'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[b-int64-0-'0'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[b-int64-9223372036854775807-'9223372036854775807'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[b-int8--128-'-128'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[b-int8-0-'0'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[b-int8-127-'127'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[b-longlong--9223372036854775808-'-9223372036854775808'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[b-longlong-9223372036854775807-'9223372036854775807'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[b-uint16-0-'0'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[b-uint16-65535-'65535'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[b-uint32-0-'0'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[b-uint32-4294967295-'4294967295'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[b-uint64-0-'0'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[b-uint64-18446744073709551615-'18446744073709551615'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[b-uint8-0-'0'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[b-uint8-255-'255'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[b-ulonglong-0-'0'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[b-ulonglong-18446744073709551615-'18446744073709551615'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[s-bool_-False-'f'::bool]`
+- `tests/types/test_numpy.py::test_dump_int[s-bool_-True-'t'::bool]`
+- `tests/types/test_numpy.py::test_dump_int[s-int16--32768-'-32768'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[s-int16-0-'0'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[s-int16-32767-'32767'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[s-int32--2147483648-'-2147483648'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[s-int32-0-'0'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[s-int32-2147483647-'2147483647'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[s-int64--9223372036854775808-'-9223372036854775808'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[s-int64-0-'0'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[s-int64-9223372036854775807-'9223372036854775807'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[s-int8--128-'-128'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[s-int8-0-'0'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[s-int8-127-'127'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[s-longlong--9223372036854775808-'-9223372036854775808'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[s-longlong-9223372036854775807-'9223372036854775807'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[s-uint16-0-'0'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[s-uint16-65535-'65535'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[s-uint32-0-'0'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[s-uint32-4294967295-'4294967295'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[s-uint64-0-'0'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[s-uint64-18446744073709551615-'18446744073709551615'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[s-uint8-0-'0'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[s-uint8-255-'255'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[s-ulonglong-0-'0'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[s-ulonglong-18446744073709551615-'18446744073709551615'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[t-bool_-False-'f'::bool]`
+- `tests/types/test_numpy.py::test_dump_int[t-bool_-True-'t'::bool]`
+- `tests/types/test_numpy.py::test_dump_int[t-int16--32768-'-32768'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[t-int16-0-'0'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[t-int16-32767-'32767'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[t-int32--2147483648-'-2147483648'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[t-int32-0-'0'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[t-int32-2147483647-'2147483647'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[t-int64--9223372036854775808-'-9223372036854775808'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[t-int64-0-'0'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[t-int64-9223372036854775807-'9223372036854775807'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[t-int8--128-'-128'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[t-int8-0-'0'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[t-int8-127-'127'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[t-longlong--9223372036854775808-'-9223372036854775808'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[t-longlong-9223372036854775807-'9223372036854775807'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[t-uint16-0-'0'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[t-uint16-65535-'65535'::int4]`
+- `tests/types/test_numpy.py::test_dump_int[t-uint32-0-'0'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[t-uint32-4294967295-'4294967295'::int8]`
+- `tests/types/test_numpy.py::test_dump_int[t-uint64-0-'0'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[t-uint64-18446744073709551615-'18446744073709551615'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[t-uint8-0-'0'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[t-uint8-255-'255'::int2]`
+- `tests/types/test_numpy.py::test_dump_int[t-ulonglong-0-'0'::numeric]`
+- `tests/types/test_numpy.py::test_dump_int[t-ulonglong-18446744073709551615-'18446744073709551615'::numeric]`
+- `tests/types/test_range.py::test_copy_in[0-2000,1,1-2001,1,1-[)]`
+- `tests/types/test_range.py::test_copy_in[0-2000,1,1-None-[)]`
+- `tests/types/test_range.py::test_copy_in[0-None-2001,1,1-()]`
+- `tests/types/test_range.py::test_copy_in[0-None-None-()]`
+- `tests/types/test_range.py::test_copy_in[0-None-None-empty]`
+- `tests/types/test_range.py::test_copy_in[1-2000,1,1-2001,1,1-[)]`
+- `tests/types/test_range.py::test_copy_in[1-2000,1,1-None-[)]`
+- `tests/types/test_range.py::test_copy_in[1-None-2001,1,1-()]`
+- `tests/types/test_range.py::test_copy_in[1-None-None-()]`
+- `tests/types/test_range.py::test_copy_in[1-None-None-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-daterange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-daterange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-int4range-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-int4range-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-int8range-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-int8range-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-numrange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-numrange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-tsrange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-tsrange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-tstzrange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[0-tstzrange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-daterange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-daterange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-int4range-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-int4range-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-int8range-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-int8range-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-numrange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-numrange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-tsrange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-tsrange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-tstzrange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_set_type[1-tstzrange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-DateRange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-DateRange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-Int4Range-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-Int4Range-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-Int8Range-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-Int8Range-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-NumericRange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-NumericRange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-TimestampRange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-TimestampRange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-TimestamptzRange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[0-TimestamptzRange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-DateRange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-DateRange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-Int4Range-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-Int4Range-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-Int8Range-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-Int8Range-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-NumericRange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-NumericRange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-TimestampRange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-TimestampRange-empty]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-TimestamptzRange-()]`
+- `tests/types/test_range.py::test_copy_in_empty_wrappers[1-TimestamptzRange-empty]`
+- `tests/types/test_range.py::test_dump_builtin_array[s-daterange]`
+- `tests/types/test_range.py::test_dump_builtin_array[s-int4range]`
+- `tests/types/test_range.py::test_dump_builtin_array[s-int8range]`
+- `tests/types/test_range.py::test_dump_builtin_array[s-numrange]`
+- `tests/types/test_range.py::test_dump_builtin_array[s-tsrange]`
+- `tests/types/test_range.py::test_dump_builtin_array[s-tstzrange]`
+- `tests/types/test_range.py::test_dump_builtin_array[t-daterange]`
+- `tests/types/test_range.py::test_dump_builtin_array[t-int4range]`
+- `tests/types/test_range.py::test_dump_builtin_array[t-int8range]`
+- `tests/types/test_range.py::test_dump_builtin_array[t-numrange]`
+- `tests/types/test_range.py::test_dump_builtin_array[t-tsrange]`
+- `tests/types/test_range.py::test_dump_builtin_array[t-tstzrange]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-daterange]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-int4range]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-int8range]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-numrange]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-tsrange]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-tstzrange]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-daterange]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-int4range]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-int8range]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-numrange]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-tsrange]`
+- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-tstzrange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[b-daterange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[b-int4range]`
+- `tests/types/test_range.py::test_dump_builtin_empty[b-int8range]`
+- `tests/types/test_range.py::test_dump_builtin_empty[b-numrange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[b-tsrange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[b-tstzrange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[s-daterange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[s-int4range]`
+- `tests/types/test_range.py::test_dump_builtin_empty[s-int8range]`
+- `tests/types/test_range.py::test_dump_builtin_empty[s-numrange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[s-tsrange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[s-tstzrange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[t-daterange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[t-int4range]`
+- `tests/types/test_range.py::test_dump_builtin_empty[t-int8range]`
+- `tests/types/test_range.py::test_dump_builtin_empty[t-numrange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[t-tsrange]`
+- `tests/types/test_range.py::test_dump_builtin_empty[t-tstzrange]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-daterange-min9-max9-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-int4range--2147483648-2147483647-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-int4range-10-20-[]]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-int4range-None-None-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-int8range--9223372036854775808-9223372036854775807-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-int8range-10-20-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-int8range-None-None-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-numrange-None-max8-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-numrange-min6-max6-(]]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-numrange-min7-None-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-tsrange-min10-max10-[]]`
+- `tests/types/test_range.py::test_dump_builtin_range[b-tstzrange-min11-max11-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-daterange-min9-max9-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-int4range--2147483648-2147483647-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-int4range-10-20-[]]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-int4range-None-None-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-int8range--9223372036854775808-9223372036854775807-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-int8range-10-20-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-int8range-None-None-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-numrange-None-max8-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-numrange-min6-max6-(]]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-numrange-min7-None-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-tsrange-min10-max10-[]]`
+- `tests/types/test_range.py::test_dump_builtin_range[s-tstzrange-min11-max11-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-daterange-min9-max9-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-int4range--2147483648-2147483647-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-int4range-10-20-[]]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-int4range-None-None-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-int8range--9223372036854775808-9223372036854775807-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-int8range-10-20-[)]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-int8range-None-None-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-numrange-None-max8-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-numrange-min6-max6-(]]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-numrange-min7-None-()]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-tsrange-min10-max10-[]]`
+- `tests/types/test_range.py::test_dump_builtin_range[t-tstzrange-min11-max11-()]`
+- `tests/types/test_range.py::test_dump_custom_empty`
+- `tests/types/test_range.py::test_dump_custom_null[b]`
+- `tests/types/test_range.py::test_dump_custom_null[s]`
+- `tests/types/test_range.py::test_dump_custom_null[t]`
+- `tests/types/test_range.py::test_dump_quoting`
+- `tests/types/test_range.py::test_fetch_info[name2-text]`
+- `tests/types/test_range.py::test_fetch_info[name3-float8]`
+- `tests/types/test_range.py::test_fetch_info[testrange-text]`
+- `tests/types/test_range.py::test_fetch_info[testschema.testrange-float8]`
+- `tests/types/test_range.py::test_fetch_info_async[asyncio-name2-text]`
+- `tests/types/test_range.py::test_fetch_info_async[asyncio-name3-float8]`
+- `tests/types/test_range.py::test_fetch_info_async[asyncio-testrange-text]`
+- `tests/types/test_range.py::test_fetch_info_async[asyncio-testschema.testrange-float8]`
+- `tests/types/test_range.py::test_fetch_info_not_found`
+- `tests/types/test_range.py::test_fetch_info_not_found_async[asyncio]`
+- `tests/types/test_range.py::test_literal_invalid_name[\u20ac]`
+- `tests/types/test_range.py::test_literal_invalid_name[a-b]`
+- `tests/types/test_range.py::test_literal_invalid_name[order]`
+- `tests/types/test_range.py::test_load_custom_empty[0]`
+- `tests/types/test_range.py::test_load_custom_empty[1]`
+- `tests/types/test_range.py::test_load_quoting[0]`
+- `tests/types/test_range.py::test_load_quoting[1]`
+- `tests/types/test_string.py::test_dump_1byte[Binary-b]`
+- `tests/types/test_string.py::test_dump_1byte[Binary-s]`
+- `tests/types/test_string.py::test_dump_1byte[Binary-t]`
+- `tests/types/test_string.py::test_dump_1byte[bytearray-b]`
+- `tests/types/test_string.py::test_dump_1byte[bytearray-s]`
+- `tests/types/test_string.py::test_dump_1byte[bytearray-t]`
+- `tests/types/test_string.py::test_dump_1byte[bytes-b]`
+- `tests/types/test_string.py::test_dump_1byte[bytes-s]`
+- `tests/types/test_string.py::test_dump_1byte[bytes-t]`
+- `tests/types/test_string.py::test_dump_1byte[memoryview-b]`
+- `tests/types/test_string.py::test_dump_1byte[memoryview-s]`
+- `tests/types/test_string.py::test_dump_1byte[memoryview-t]`
+- `tests/types/test_string.py::test_dump_text_oid[s]`
+- `tests/types/test_string.py::test_dump_text_oid[t]`
+- `tests/types/test_string.py::test_quote_1byte[Binary-off]`
+- `tests/types/test_string.py::test_quote_1byte[bytearray-off]`
+- `tests/types/test_string.py::test_quote_1byte[bytes-off]`
+- `tests/types/test_string.py::test_quote_1byte[memoryview-off]`
+- `tests/types/test_string.py::test_quote_1char[off]`
+- `tests/types/test_string.py::test_quote_1char[on]`
+- `tests/types/test_string.py::test_text_array[name-0-b]`
+- `tests/types/test_string.py::test_text_array[name-0-s]`
+- `tests/types/test_string.py::test_text_array[name-0-t]`
+- `tests/types/test_string.py::test_text_array[name-1-b]`
+- `tests/types/test_string.py::test_text_array[name-1-s]`
+- `tests/types/test_string.py::test_text_array[name-1-t]`
+- `tests/types/test_uuid.py::test_uuid_dump[01234567-89ab-cdef-0123-456789abcdef-t]`
+- `tests/types/test_uuid.py::test_uuid_dump[0123456789abcdef0123456789abcdef-t]`
+- `tests/types/test_uuid.py::test_uuid_dump[12345678-1234-5678-1234-567812345679-t]`
+- `tests/types/test_uuid.py::test_uuid_dump[12345678123456781234567812345679-t]`
+- `tests/types/test_uuid.py::test_uuid_dump[{a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11}-t]`
