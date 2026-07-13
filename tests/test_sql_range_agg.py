@@ -68,12 +68,13 @@ def test_difference_split_raises():
 
 def test_make_multirange_coalesces():
     mr = R.make_multirange([_r(1, 5), _r(10, 15), _r(3, 8)])
-    assert R.render_multirange(mr) == "{[1,8), [10,15)}"
+    # No space after the separator — Postgres prints ``{[1,8),[10,15)}``.
+    assert R.render_multirange(mr) == "{[1,8),[10,15)}"
 
 
 def test_parse_multirange_roundtrip():
     mr = R.parse_multirange("{[1,5), [10,20)}", "int4multirange", int)
-    assert R.render_multirange(mr) == "{[1,5), [10,20)}"
+    assert R.render_multirange(mr) == "{[1,5),[10,20)}"
 
 
 def test_parse_empty_multirange():

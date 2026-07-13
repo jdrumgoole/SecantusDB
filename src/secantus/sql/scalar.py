@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import decimal
 import json
 import math
 from collections.abc import Callable
@@ -1206,20 +1207,124 @@ def _is_bit_expr(node: exp.Expression) -> bool:
     return False
 
 
+_PG_BOOL_LITERALS = {
+    "t": True,
+    "true": True,
+    "y": True,
+    "yes": True,
+    "on": True,
+    "1": True,
+    "f": False,
+    "false": False,
+    "n": False,
+    "no": False,
+    "off": False,
+    "0": False,
+}
+
+
+def _invalid_input(tag: str, value: Any) -> errors.SQLError:
+    pretty = typemap.SQL_TYPE_NAME.get(tag, tag)
+    return errors.SQLError("22P02", f'invalid input syntax for type {pretty}: "{value}"')
+
+
+def _cast_scalar(value: Any, tag: str) -> Any:
+    """Convert ``value`` for a cast to a concrete scalar ``tag``.
+
+    Postgres casts *convert* — ``'1'::int`` is the integer 1, not a string
+    tagged int. Leaving the string through breaks equality (``'42'::int = 42``
+    is str-vs-int false) and the binary result format (the wire layer would
+    send text bytes in a column whose RowDescription claims a numeric OID)."""
+    value = _unwrap_decimal(value)
+    if tag in ("int2", "int4", "int8"):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return round(value)  # float -> int rounds half-even, like PG's rint()
+        if isinstance(value, Decimal):
+            # numeric -> int rounds ties away from zero in Postgres.
+            return int(value.to_integral_value(decimal.ROUND_HALF_UP))
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                raise _invalid_input(tag, value) from None
+        return value
+    if tag in ("float4", "float8"):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float, Decimal)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                raise _invalid_input(tag, value) from None
+        return value
+    if tag == "numeric":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (Decimal, int)):
+            return value
+        if isinstance(value, float):
+            return Decimal(str(value))
+        if isinstance(value, str):
+            try:
+                return Decimal(value.strip())
+            except decimal.InvalidOperation:
+                raise _invalid_input(tag, value) from None
+        return value
+    if tag == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            parsed = _PG_BOOL_LITERALS.get(value.strip().lower())
+            if parsed is None:
+                raise _invalid_input(tag, value)
+            return parsed
+        if isinstance(value, (int, float)):
+            return value != 0
+        return value
+    return value
+
+
 def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
     # ``'int4'::regtype`` — normalize the type name to its canonical pretty
-    # spelling so it compares equal to what ``pg_typeof`` prints.
+    # spelling so it compares equal to what ``pg_typeof`` prints. A numeric
+    # operand (``21::regtype`` / ``'21'::regtype``) is a type OID, resolved to
+    # the same pretty spelling (psycopg's test_repr_wrapper compares
+    # ``pg_typeof(%s) = %s::regtype`` passing the OID as an integer).
     if (
         value is not None
         and isinstance(node.to, exp.ObjectIdentifier)
         and str(node.to.this).upper() == "REGTYPE"
     ):
+        oid_operand: int | None = None
+        if isinstance(value, int) and not isinstance(value, bool):
+            oid_operand = int(value)
+        elif isinstance(value, str) and value.strip().isdigit():
+            oid_operand = int(value.strip())
+        if oid_operand is not None:
+            name = typemap.regtype_from_oid(oid_operand)
+            if name is None:
+                raise errors.SQLError("42704", f"type with OID {oid_operand} does not exist")
+            return name
         return typemap.normalize_regtype(str(value))
     # ``'[1,10)'::int4range`` — parse a range text literal into its subdocument.
     to = node.to.sql(dialect="postgres").lower().strip() if node.to is not None else ""
     # ``'1 day'::interval`` — parse an interval literal (a subdoc passes through).
     to_tag_early = typemap.type_tag_for_sql(node.to) if node.to is not None else None
+    # ``1::oid`` / ``'26'::oid`` — an unsigned int4-like integer.
+    if value is not None and to_tag_early == "oid":
+        try:
+            return typemap.coerce(value, "oid")
+        except (TypeError, ValueError):
+            raise errors.SQLError(
+                "22P02", f'invalid input syntax for type oid: "{value}"'
+            ) from None
     if value is not None and to_tag_early == "interval":
         from secantus.sql import intervals as _intervals
 
@@ -1302,6 +1407,17 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
 
         n = _bitstr.to_int(str(value))
         return float(n) if to_tag in ("float4", "float8") else n
+    # Concrete scalar targets convert the value (``'1'::int`` -> 1).
+    if value is not None and to_tag in (
+        "int2",
+        "int4",
+        "int8",
+        "float4",
+        "float8",
+        "numeric",
+        "bool",
+    ):
+        return _cast_scalar(value, to_tag)
     # Otherwise we don't model regclass/oid identity types; evaluating the inner
     # value is enough for the catalog queries that use casts (compared / discarded,
     # never round-tripped through a real type).
