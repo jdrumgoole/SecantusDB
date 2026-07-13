@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from secantus.sql import copyfmt, errors, pgwire, planner, typemap
 from secantus.sql import engine as sql_engine
+from secantus.sql import session as sql_session
 from secantus.sql.catalog import Catalog
 from secantus.sql.engine import run_sql
 from secantus.sql.pgauth import (
@@ -316,13 +317,21 @@ class SecantusPGServer:
             session.roles = self._users.roles_for(user)
         if application_name:
             session.settings["application_name"] = application_name
+        # client_encoding may arrive as a startup parameter; honour it the same
+        # way SET client_encoding would (unknown values fall back to UTF8 —
+        # erroring here would abort the handshake).
+        startup_enc = startup.params.get("client_encoding")
+        if startup_enc:
+            canonical = sql_session.canonical_client_encoding(startup_enc)
+            if canonical is not None:
+                session.settings["client_encoding"] = canonical
 
         out = bytearray()
         out += pgwire.authentication_ok()
         for name, value in (
             ("server_version", SERVER_VERSION),
             ("server_encoding", "UTF8"),
-            ("client_encoding", "UTF8"),
+            ("client_encoding", session.get_setting("client_encoding")),
             ("DateStyle", "ISO, MDY"),
             ("integer_datetimes", "on"),
             ("standard_conforming_strings", "on"),
@@ -387,13 +396,17 @@ class SecantusPGServer:
                 return
             if msg.type == "Q":  # simple Query
                 try:
-                    sql = pgwire.parse_query(msg.payload)
+                    sql = pgwire.parse_query(msg.payload, session.wire_encoding)
                 except UnicodeDecodeError:
                     # The message was fully length-framed and read, so the byte
                     # stream stays in sync — report the bad message and keep
                     # serving instead of dropping the connection. (§I16)
                     conn.sendall(
-                        pgwire.error_response("08P01", "invalid UTF-8 in query message")
+                        pgwire.error_response(
+                            "08P01",
+                            "invalid byte sequence for client_encoding in query message",
+                            encoding=session.wire_encoding,
+                        )
                         + pgwire.ready_for_query(session.txn_status())
                     )
                     continue
@@ -449,9 +462,9 @@ class SecantusPGServer:
                 out += pgwire.empty_query_response()
             else:
                 for res in results:
-                    out += _render_result(res)
+                    out += _render_result(res, session.wire_encoding)
         except errors.SQLError as exc:
-            out += pgwire.error_response(exc.sqlstate, exc.message)
+            out += pgwire.error_response(exc.sqlstate, exc.message, encoding=session.wire_encoding)
         except Exception:  # pragma: no cover - defensive
             logger.exception("error executing SQL")
             # Don't leak the raw Python exception text to the wire client — the
@@ -502,7 +515,7 @@ class SecantusPGServer:
                 return
             else:  # pragma: no cover - client desync
                 break
-        data = b"".join(chunks).decode("utf-8")
+        data = pgwire.decode_text(b"".join(chunks), session.wire_encoding)
         if plan.fmt == "csv":
             rows = copyfmt.parse_csv(
                 data, delimiter=plan.delimiter, null=plan.null, header=plan.header
@@ -527,7 +540,7 @@ class SecantusPGServer:
             text = copyfmt.format_text(rows, delimiter=plan.delimiter, null=plan.null)
         conn.sendall(pgwire.copy_out_response(len(plan.columns)))
         if text:
-            conn.sendall(pgwire.copy_data(text.encode("utf-8")))
+            conn.sendall(pgwire.copy_data(pgwire.encode_text(text, session.wire_encoding)))
         conn.sendall(pgwire.copy_done())
         conn.sendall(pgwire.command_complete(f"COPY {len(rows)}"))
         conn.sendall(pgwire.ready_for_query(session.txn_status()))
@@ -547,7 +560,7 @@ class SecantusPGServer:
         self.stop()
 
 
-def _render_result(res: Any) -> bytes:
+def _render_result(res: Any, encoding: str | None = "utf-8") -> bytes:
     """Serialise one ``SQLResult`` to its backend messages."""
     out = bytearray()
     for name, value in res.parameter_status:
@@ -557,7 +570,10 @@ def _render_result(res: Any) -> bytes:
         tags = [c.type_tag for c in res.columns]
         for row in res.rows:
             out += pgwire.data_row(
-                [typemap.to_pg_text(v, t) for v, t in zip(row, tags, strict=False)]
+                [
+                    pgwire.transcode_out(typemap.to_pg_text(v, t), encoding)
+                    for v, t in zip(row, tags, strict=False)
+                ]
             )
     out += pgwire.command_complete(res.command_tag)
     return bytes(out)

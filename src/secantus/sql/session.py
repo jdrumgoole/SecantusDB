@@ -35,6 +35,57 @@ GUC_DEFAULTS: dict[str, str] = {
     "is_superuser": "off",
 }
 
+# Postgres encoding name (canonicalised: upper, no -_/ separators) -> Python
+# codec. ``None`` means pass-through: SQL_ASCII performs no conversion in
+# Postgres, so wire bytes ride through unchanged (utf-8 + surrogateescape makes
+# arbitrary byte sequences round-trip losslessly through Python str).
+_PG_ENCODINGS: dict[str, str | None] = {
+    "UTF8": "utf-8",
+    "UNICODE": "utf-8",
+    "LATIN1": "iso8859-1",
+    "ISO88591": "iso8859-1",
+    "LATIN2": "iso8859-2",
+    "ISO88592": "iso8859-2",
+    "LATIN5": "iso8859-9",
+    "LATIN9": "iso8859-15",
+    "ISO885915": "iso8859-15",
+    "WIN1250": "cp1250",
+    "WIN1251": "cp1251",
+    "WIN1252": "cp1252",
+    "SQLASCII": None,
+}
+
+# Canonical PG spelling for the ParameterStatus / SHOW value.
+_PG_ENCODING_CANONICAL: dict[str, str] = {
+    "UTF8": "UTF8",
+    "UNICODE": "UTF8",
+    "LATIN1": "LATIN1",
+    "ISO88591": "LATIN1",
+    "LATIN2": "LATIN2",
+    "ISO88592": "LATIN2",
+    "LATIN5": "LATIN5",
+    "LATIN9": "LATIN9",
+    "ISO885915": "LATIN9",
+    "WIN1250": "WIN1250",
+    "WIN1251": "WIN1251",
+    "WIN1252": "WIN1252",
+    "SQLASCII": "SQL_ASCII",
+}
+
+
+def canonical_client_encoding(name: str) -> str | None:
+    """The canonical Postgres spelling for a client_encoding value the user SET
+    (``'latin-1'`` -> ``LATIN1``), or None when the encoding isn't supported."""
+    key = str(name).upper().replace("-", "").replace("_", "").replace("/", "")
+    return _PG_ENCODING_CANONICAL.get(key)
+
+
+def python_codec_for(pg_name: str) -> str | None:
+    """The Python codec for a canonical PG encoding name; None = pass-through."""
+    key = str(pg_name).upper().replace("-", "").replace("_", "")
+    return _PG_ENCODINGS.get(key, "utf-8")
+
+
 # GUCs the server echoes back via a ParameterStatus message when SET (the
 # protocol's GUC_REPORT set). Clients track these for behaviour decisions.
 REPORTABLE_GUCS = frozenset(
@@ -377,6 +428,12 @@ class Session:
 
     def get_setting(self, name: str) -> str:
         return self.settings.get(name, GUC_DEFAULTS.get(name, ""))
+
+    @property
+    def wire_encoding(self) -> str | None:
+        """The Python codec for this connection's ``client_encoding``, or None
+        for SQL_ASCII (no conversion — bytes pass through)."""
+        return python_codec_for(self.get_setting("client_encoding"))
 
     def txn_status(self) -> bytes:
         """The ReadyForQuery status byte: idle / in-transaction / failed."""
