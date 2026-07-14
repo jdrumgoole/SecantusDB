@@ -5,24 +5,31 @@ not be able to tell SecantusDB apart from a real `mongod` for the operations
 it supports. This page lists the divergences that exist anyway.
 
 :::{note}
-This page describes the **Python server** — the conformance leader. SecantusDB
-also ships a separate **Rust server** that speaks the same wire protocol but is
-still closing the conformance gap; the features it doesn't yet support are
-delineated in [The two servers](servers.md).
+This page describes the **Python server** — the conformance reference.
+SecantusDB also ships a separate **Rust server** that speaks the same wire
+protocol and now matches the Python server on pymongo's suite; its few
+remaining feature gaps are delineated in [The two servers](servers.md), and
+the full three-way matrix against real `mongod` is in the
+[Feature comparison](feature-comparison.md).
 :::
 
-## Stubs
+## Stubs and partial replies
 
-These commands accept the request and return a wire-valid response, but the
-response is fabricated.
+Most diagnostics commands now return real data; the remaining fabrications:
 
 | Command | Behaviour |
 | --- | --- |
-| `serverStatus` | Version + zeroed metrics (uptime, connections) |
-| `connectionStatus` | Real `authenticatedUsers` (from SCRAM-SHA-256). `authenticatedUserRoles` / `authenticatedUserPrivileges` are empty (RBAC not enforced — see [Authentication](authentication.md)) |
-| `hostInfo` / `whatsmyuri` / `buildInfo` | Hardcoded values; `buildInfo.version` is `"7.0.0"` |
-| `getLog` | Empty log array |
-| `startSession` / `endSessions` / `refreshSessions` | `startSession` returns a fresh UUID; the others are no-ops. **No session state is tracked**, so cross-session correlation isn't enforced |
+| `top` | Correct shape, but every per-namespace `{time, count}` counter is 0 (no per-ns instrumentation) |
+| `buildInfo` | `version` deliberately reports `"7.0.0"` (the MongoDB compatibility level drivers key feature gates on); the real package version is in `secantusVersion` |
+| `serverStatus` | Real uptime / connections / opcounters / network metrics on the production server path; zeroed only for embedded callers that drive `CommandContext` directly without a metrics instance |
+| `connectionStatus` | Real `authenticatedUsers` and `authenticatedUserRoles`; `authenticatedUserPrivileges` is left empty (mongod gates the per-action expansion behind a `showPrivileges` toggle we don't honour) |
+
+`getLog`, `hostInfo`, and `whatsmyuri` return real data (in-memory log ring,
+actual host OS/CPU/RAM, the requesting client's actual peer address). Logical
+sessions are tracked in a real registry (`lsid` registration on every
+command, 30-minute idle TTL, `endSessions` / `killSessions` honoured);
+cursor → session affinity isn't tracked, so killing a session doesn't kill
+its cursors — they age out under their own idle TTL.
 
 `dbStats` and `collStats` return real `count`, `size`, `storageSize`,
 `avgObjSize`, `indexSize`, `indexSizes`, `totalIndexSize`, and `totalSize`
@@ -33,16 +40,15 @@ otherwise, with `indexName`, `keyPattern`, and `direction` populated.
 
 ## Stopgaps (functional but with limitations)
 
-### `$lookup` doesn't use storage indexes
+### `$lookup` join strategy
 
-Joins are O(N+M) via an in-memory hash table built once over the foreign
-collection (covers array-valued local/foreign fields correctly via
+When the foreign collection has an index whose leading field is
+`foreignField` (single-field, compound leading-prefix, or multikey), each
+outer document's lookup rides that index (IXSCAN). Without a matching index
+the join falls back to an O(N+M) in-memory hash table built once over the
+foreign collection (array-valued local/foreign fields are covered via
 element expansion). Both simple (`localField`/`foreignField`) and
-`let`/`pipeline` forms are accelerated.
-
-A true index-driven join would skip materialising the foreign collection
-but needs multikey-index support to stay correct for array-valued foreign
-fields.
+`let`/`pipeline` forms work.
 
 ### `_id` numeric type bridge
 
@@ -52,12 +58,10 @@ through to the BSON-blob path; behaviour is unspecified.
 
 ### Date format strings
 
-`$dateFromString` and `$dateToString` use Python's `strptime` / `strftime`
-codes plus the `%L` extension for milliseconds. The `timezone` argument
-is supported (IANA, UTC offsets, `GMT`/`UTC`).
-
-Still missing: full MongoDB format spec (`%G` / `%V` ISO-week, `%j`
-day-of-year edge cases) and the MongoDB-specific format tokens.
+`$dateFromString` and `$dateToString` support mongod's format-token set —
+`%Y %m %d %H %M %S %L %j %w %u %U %V %G %z %Z %%` — including the ISO-week
+family and mongod's Sunday-first `%w` numbering. The `timezone` argument is
+supported (IANA, UTC offsets, `GMT`/`UTC`).
 
 ### `$merge` `whenMatched: "merge"`
 
@@ -75,7 +79,7 @@ writers across processes. Tests are single-process so this is fine.
 | --- | --- |
 | `unique` | Honoured |
 | `sparse` | Honoured |
-| `expireAfterSeconds` | Honoured via `Storage.prune_ttl` (opt-in; no background sweeper) |
+| `expireAfterSeconds` | Honoured — a background sweeper prunes on a 60-second cadence (mongod's default; `ttl_sweep_seconds` configures it), and `Storage.prune_ttl` is callable directly with an injectable clock for deterministic tests |
 | `partialFilterExpression` | Honoured at write time and at picker time |
 | `collation` | Honoured at index-write and at picker time — strings are stored under collation-normalised bytes so a query carrying a matching `collation` lights up the index at IXSCAN. Strength 1/2/3 + `caseLevel` supported; `numericOrdering` not (needs a length-prefixed digit-run encoding — query falls back to COLLSCAN, results stay correct via `matches()`). See [Indexes](indexes.md) |
 
@@ -100,14 +104,12 @@ These are explicit non-goals:
   SecantusDB is single-process. (Change streams *are* supported —
   oplog-backed and single-node — see [Change streams](change-streams.md).
   The oplog is queryable at `local.oplog.rs` like real mongod.)
-- **Authentication mechanisms beyond SCRAM-SHA-256 and MONGODB-X509** —
-  LDAP, Kerberos, GSSAPI, MONGODB-AWS, MONGODB-OIDC. `SCRAM-SHA-256`
-  and `MONGODB-X509` (cert-as-username, over mTLS) *are* implemented;
-  SCRAM-SHA-1 is not advertised (modern drivers default to SHA-256).
-  See [Authentication](authentication.md).
-- **Authorization (RBAC)** — `createUser` accepts a `roles` array but
-  no command consults it. An authenticated principal is treated as
-  fully privileged.
+- **Authentication mechanisms beyond SCRAM and MONGODB-X509** —
+  LDAP, Kerberos, GSSAPI, MONGODB-AWS, MONGODB-OIDC. `SCRAM-SHA-256`,
+  `SCRAM-SHA-1` (per-user opt-in), and `MONGODB-X509` (cert-as-username,
+  over mTLS) *are* implemented, and authorization (RBAC — built-in and
+  custom roles) is enforced when `--auth` is on. See
+  [Authentication](authentication.md).
 - **Native TLS + mTLS** are supported as of v0.5.1b21/b22.
   Configure via `[tls] cert_file` / `key_file` (server-side TLS)
   and optionally `[tls] ca_file` / `require_client_cert` (mTLS);
