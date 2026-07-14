@@ -117,12 +117,11 @@ Everything a single-node application needs from the wire:
 - Change streams — single-node, oplog-backed; collection / db / cluster
   scope; resume tokens; `fullDocument: "updateLookup"`; pre-images via
   `fullDocumentBeforeChange`; blocking `awaitData` getMore.
-- **Authentication** — SCRAM-SHA-256 over the standard wire protocol,
-  with `createUser` / `dropUser` / `usersInfo` admin commands and
-  per-connection state. Off by default; flip on with `--auth` /
-  `require_auth=True`. See [Authentication](authentication.md).
-  (Authorization / RBAC is *not* enforced — an authenticated principal
-  is treated as fully privileged.)
+- **Authentication and authorization** — SCRAM-SHA-256 / SCRAM-SHA-1 and
+  MONGODB-X509 over the standard wire protocol, the full user / role admin
+  command set, and enforced RBAC (built-in and custom roles). Off by
+  default; flip on with `--auth` / `require_auth=True`. See
+  [Authentication](authentication.md).
 
 See [Indexes](indexes.md) and [Aggregation](aggregation.md) for the full
 inventory, and [Compatibility](compatibility.md) for what's intentionally
@@ -134,12 +133,10 @@ Anything that depends on **real** cluster topology — multi-node replica
 sets, sharding, election, cross-node oplog — and the infrastructure
 features tangential to single-node operation:
 
-- Authentication mechanisms beyond SCRAM-SHA-256 (x509, LDAP, Kerberos,
-  GSSAPI, MONGODB-AWS, MONGODB-OIDC). SCRAM-SHA-256 itself **is**
-  supported — see [Authentication](authentication.md).
-- Authorization (RBAC) — `createUser` accepts a `roles` array but no
-  command consults it; an authenticated principal is treated as fully
-  privileged.
+- Authentication mechanisms beyond SCRAM and MONGODB-X509 (LDAP,
+  Kerberos, GSSAPI, MONGODB-AWS, MONGODB-OIDC). SCRAM-SHA-256 /
+  SCRAM-SHA-1, MONGODB-X509, and enforced RBAC **are** supported — see
+  [Authentication](authentication.md).
 - Text search (no full-text index).
 - `$where` (no JS runtime).
 
