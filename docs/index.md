@@ -182,6 +182,8 @@ clustering and infrastructure that `mongod` brings.
 - [Concurrency](concurrency.md) — what scales, what doesn't, and why
   multi-writer throughput is capped by WiredTiger.
 - [Compatibility](compatibility.md) — known divergences from real MongoDB.
+- [Feature comparison](feature-comparison.md) — MongoDB vs the Python server
+  vs the Rust server, feature by feature.
 - [API reference](api.md) — `SecantusDBServer`, `Storage`, public surface.
 
 ## License
@@ -219,6 +221,7 @@ recovery
 production
 concurrency
 compatibility
+feature-comparison
 benchmark
 validation-summary
 validation-report
@@ -234,6 +237,7 @@ validation-report-php-ext
 validation-report-c
 validation-report-cxx
 validation-report-dotnet
+validation-report-psycopg
 validation-report-rust-server
 api
 changelog
