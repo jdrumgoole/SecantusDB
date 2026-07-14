@@ -764,8 +764,30 @@ def _info_sequences(db: str, session: Session, storage: Any, catalog: Catalog) -
     return rows
 
 
+_SCHEMA_OID_BASE = 69000
+
+
+def _schema_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    lister = getattr(catalog, "list_schemas", None)
+    names = lister(db) if lister is not None else []
+    return {name: _SCHEMA_OID_BASE + i for i, name in enumerate(names)}
+
+
 def _pg_namespace(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    return [{"oid": oid, "nspname": name} for name, oid in _NS_OIDS.items()]
+    rows = [{"oid": oid, "nspname": name} for name, oid in _NS_OIDS.items()]
+    rows.extend({"oid": oid, "nspname": name} for name, oid in _schema_oids(db, catalog).items())
+    return rows
+
+
+def _split_user_type_name(name: str, schema_oids: dict[str, int]) -> tuple[str, int]:
+    """A stored user-type name split into (bare typname, namespace oid) — types
+    in a user schema are stored dotted ("testschema.testcomp")."""
+    if "." in name:
+        schema, bare = name.split(".", 1)
+        oid = schema_oids.get(schema)
+        if oid is not None:
+            return bare, oid
+    return name, _NS_OIDS["public"]
 
 
 def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -1496,14 +1518,17 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         }
         for tag, typname in typemap.PG_TYPENAME.items()
     ]
-    # User-declared enum types (typtype 'e') live in the public namespace.
+    # User-declared enum types (typtype 'e') live in their schema's namespace
+    # (public unless created schema-qualified).
+    schema_oids = _schema_oids(db, catalog)
     for name, oid in _enum_oids(db, catalog).items():
+        typname, nsoid = _split_user_type_name(name, schema_oids)
         rows.append(
             {
                 "oid": oid,
-                "typname": name,
+                "typname": typname,
                 "typcollation": 0,
-                "typnamespace": _NS_OIDS["public"],
+                "typnamespace": nsoid,
                 "typbasetype": 0,
                 "typtypmod": -1,
                 "typnotnull": False,
@@ -1518,12 +1543,13 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         domain = getter(db, name) if getter is not None else None
         base_tag = domain.get("base_tag") if domain else None
         default = domain.get("default") if domain else None
+        typname, nsoid = _split_user_type_name(name, schema_oids)
         rows.append(
             {
                 "oid": oid,
-                "typname": name,
+                "typname": typname,
                 "typcollation": 0,
-                "typnamespace": _NS_OIDS["public"],
+                "typnamespace": nsoid,
                 "typbasetype": typemap.PG_OID.get(base_tag or "", 25),
                 "typtypmod": -1,
                 "typnotnull": bool(domain.get("not_null")) if domain else False,
@@ -1536,12 +1562,13 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
     # the type's fields.
     rel_oids = _composite_rel_oids(db, catalog)
     for name, oid in _composite_oids(db, catalog).items():
+        typname, nsoid = _split_user_type_name(name, schema_oids)
         rows.append(
             {
                 "oid": oid,
-                "typname": name,
+                "typname": typname,
                 "typcollation": 0,
-                "typnamespace": _NS_OIDS["public"],
+                "typnamespace": nsoid,
                 "typbasetype": 0,
                 "typtypmod": -1,
                 "typnotnull": False,
@@ -1574,9 +1601,11 @@ def user_type_oid(db: str, catalog: Catalog, name: str) -> int | None:
     None — the ``to_regtype()`` tail for names the built-in tables don't know.
     A ``public.`` schema qualifier (psycopg's TypeInfo passes the name as
     typed by the user) is accepted."""
-    text = name.strip().strip('"')
+    # Normalize quoting per dotted part ('"testschema"."testtype"' — psycopg's
+    # sql.Identifier spelling) and strip the default public namespace.
+    text = ".".join(part.strip().strip('"') for part in name.strip().split("."))
     if text.lower().startswith("public."):
-        text = text[len("public.") :].strip('"')
+        text = text[len("public.") :]
     for lookup in (_enum_oids, _domain_oids, _composite_oids):
         oid = lookup(db, catalog).get(text)
         if oid is not None:

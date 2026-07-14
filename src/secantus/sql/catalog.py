@@ -26,6 +26,7 @@ SEQUENCE_COLLECTION = "__sql_sequences__"
 ROLE_COLLECTION = "__sql_roles__"
 ROLE_MEMBER_COLLECTION = "__sql_role_members__"
 GRANT_COLLECTION = "__sql_grants__"
+SCHEMA_COLLECTION = "__sql_schemas__"
 ENUM_COLLECTION = "__sql_enums__"
 DOMAIN_COLLECTION = "__sql_domains__"
 COMPOSITE_COLLECTION = "__sql_composites__"
@@ -967,6 +968,26 @@ class Catalog:
     def list_enums(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, ENUM_COLLECTION, {})
         return sorted(d["enum"] for d in docs)
+
+    # -- user schemas -------------------------------------------------------- #
+    # ``CREATE SCHEMA name`` — a namespace for user-declared types (and, later,
+    # tables). Types created in a schema are stored under their dotted
+    # qualified name ("testschema.testcomp"); pg_namespace / pg_type surface
+    # the schema with a minted namespace oid.
+
+    def create_schema(self, db: str, name: str) -> None:
+        if not self.schema_exists(db, name):
+            self._storage.insert(db, SCHEMA_COLLECTION, [{"_id": name, "schema": name}])
+
+    def schema_exists(self, db: str, name: str) -> bool:
+        return bool(self._storage.find_matching(db, SCHEMA_COLLECTION, {"_id": name}, limit=1))
+
+    def drop_schema(self, db: str, name: str) -> bool:
+        return self._storage.delete_matching(db, SCHEMA_COLLECTION, {"_id": name}) > 0
+
+    def list_schemas(self, db: str) -> list[str]:
+        docs = self._storage.find_matching(db, SCHEMA_COLLECTION, {})
+        return sorted(d["schema"] for d in docs)
 
     # -- composite types ---------------------------------------------------- #
     # ``CREATE TYPE name AS (field type, …)`` — the ordered ``(field, type_tag)``
