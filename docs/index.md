@@ -237,6 +237,7 @@ validation-report-dotnet
 validation-report-psycopg
 validation-report-slt
 validation-report-rust-server
+validation-report-java-rust-server
 api
 changelog
 ```
