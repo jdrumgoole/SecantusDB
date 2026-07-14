@@ -1488,6 +1488,11 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
             "typdefault": None,
             # Range types report typtype 'r'; everything else is a base type 'b'.
             "typtype": "r" if tag in typemap._RANGE_TAGS else "b",
+            # The paired ``_<type>`` array type's oid — 0 when we don't model
+            # one (drivers treat 0 as "no array type"). psycopg's
+            # TypeInfo.fetch reads it as array_oid.
+            "typarray": typemap._ARRAY_PG_OID.get(tag, 0),
+            "typdelim": ",",
         }
         for tag, typname in typemap.PG_TYPENAME.items()
     ]
@@ -1545,10 +1550,69 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typrelid": rel_oids.get(name, 0),
             }
         )
-    # Non-composite types have no backing relation.
+    # Non-composite types have no backing relation; user-declared types
+    # (enum / domain / composite) don't model a paired array type.
     for row in rows:
         row.setdefault("typrelid", 0)
+        row.setdefault("typarray", 0)
+        row.setdefault("typdelim", ",")
     return rows
+
+
+def user_type_name(db: str, catalog: Catalog, oid: int) -> str | None:
+    """The name of a user-declared type (enum / domain / composite) by oid, or
+    None — the ``oid::regtype`` tail for oids the built-in tables don't know."""
+    for lookup in (_enum_oids, _domain_oids, _composite_oids):
+        for name, type_oid in lookup(db, catalog).items():
+            if type_oid == oid:
+                return name
+    return None
+
+
+def user_type_oid(db: str, catalog: Catalog, name: str) -> int | None:
+    """The oid of a user-declared type (enum / domain / composite) by name, or
+    None — the ``to_regtype()`` tail for names the built-in tables don't know.
+    A ``public.`` schema qualifier (psycopg's TypeInfo passes the name as
+    typed by the user) is accepted."""
+    text = name.strip().strip('"')
+    if text.lower().startswith("public."):
+        text = text[len("public.") :].strip('"')
+    for lookup in (_enum_oids, _domain_oids, _composite_oids):
+        oid = lookup(db, catalog).get(text)
+        if oid is not None:
+            return oid
+    return None
+
+
+# Range tag -> the *declared* subtype tag (tsrange's bounds are stored as
+# timestamptz internally, but its pg_range row must advertise ``timestamp``).
+_RANGE_SUBTYPE: dict[str, str] = {
+    "int4range": "int4",
+    "int8range": "int8",
+    "numrange": "numeric",
+    "tsrange": "timestamp",
+    "tstzrange": "timestamptz",
+    "daterange": "date",
+}
+
+
+def _pg_range(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_range`` — one row per built-in range type, mapping the
+    range oid to its element (subtype) oid. psycopg's ``RangeInfo.fetch`` joins
+    it (``pg_range r ON t.oid = r.rngtypid``); the multirange fetch reads
+    ``rngmultitypid`` too."""
+    from secantus.sql.ranges import RANGE_TO_MULTIRANGE
+
+    return [
+        {
+            "rngtypid": typemap.PG_OID[range_tag],
+            "rngsubtype": typemap.PG_OID[elem_tag],
+            "rngmultitypid": typemap.PG_OID.get(RANGE_TO_MULTIRANGE.get(range_tag, ""), 0),
+            "rngcollation": 0,
+        }
+        for range_tag, elem_tag in _RANGE_SUBTYPE.items()
+        if range_tag in typemap.PG_OID
+    ]
 
 
 def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -2175,8 +2239,21 @@ _register(
         ("typdefault", "text"),
         ("typtype", "text"),
         ("typrelid", "int4"),
+        ("typarray", "int4"),
+        ("typdelim", "text"),
     ],
     _pg_type,
+)
+_register(
+    "pg_catalog",
+    "pg_range",
+    [
+        ("rngtypid", "int4"),
+        ("rngsubtype", "int4"),
+        ("rngmultitypid", "int4"),
+        ("rngcollation", "int4"),
+    ],
+    _pg_range,
 )
 _register(
     "pg_catalog",

@@ -113,6 +113,8 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
 _SCALAR_EVAL_ANON = frozenset(
     {
         "isempty",
+        # to_regtype needs the catalog (user-declared enum/composite oids).
+        "to_regtype",
         # Array introspection (multi-dimensional aware) is done by the full scalar
         # evaluator, which can evaluate an ``ARRAY[...]`` / nested-array argument.
         "cardinality",

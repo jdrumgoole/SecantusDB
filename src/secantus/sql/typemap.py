@@ -266,6 +266,20 @@ def regtype_from_oid(oid: int) -> str | None:
     return SQL_TYPE_NAME.get(tag, tag)
 
 
+def oid_for_regtype(name: str) -> int | None:
+    """The type oid for a (possibly aliased) type name, or None when unknown —
+    ``to_regtype('int4')`` -> 23, ``to_regtype('nope')`` -> NULL. Array
+    spellings resolve to the paired array type's oid."""
+    text = " ".join(str(name).strip().lower().split())
+    if text.endswith("[]"):
+        base = text[:-2].split("(", 1)[0].strip()
+        tag = _REGTYPE_SPELLINGS.get(base)
+        return _ARRAY_PG_OID.get(tag) if tag is not None else None
+    base = text.split("(", 1)[0].strip()
+    tag = _REGTYPE_SPELLINGS.get(base)
+    return PG_OID.get(tag) if tag is not None else None
+
+
 def normalize_regtype(name: str) -> str:
     """Render a type name the way ``'name'::regtype`` prints in Postgres —
     normalized to the canonical pretty spelling (``'int4'`` -> ``integer``).

@@ -1857,17 +1857,29 @@ def _run_select(
         rows = vtable.builder(db, session, storage, catalog)
         backend = virtual.MemoryBackend(rows)
         tdef = vtable.table_def()
-        if planner._stmt_needs_evaluation(stmt):
-            # Computed projections over a catalog table (``SELECT 1 FROM
-            # pg_class …`` and friends) need per-row evaluation.
-            mem_sctx = scalar.ScalarContext(
-                storage=backend, catalog=catalog, db=db, session=session
-            )
-            return executor.execute_evaluated_select(
-                planner._build_evaluated_single(stmt, tdef), backend, db, mem_sctx
-            )
-        plan = planner.plan_select(stmt, tdef)
-        return executor.execute_select(plan, backend, db)
+        # Publish the subquery context so the pushdown can resolve
+        # catalog-dependent constants (``WHERE t.oid = to_regtype('mood')`` —
+        # a user-declared enum's oid lives in the real catalog).
+        token = planner._pipeline_subctx.set(
+            planner.SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session)
+        )
+        try:
+            if planner._stmt_needs_evaluation(stmt) or planner.where_needs_per_row(
+                stmt, tdef, catalog, db
+            ):
+                # Computed projections — or a WHERE the pushdown can't lower —
+                # over a catalog table need per-row evaluation with the REAL
+                # catalog in scope.
+                mem_sctx = scalar.ScalarContext(
+                    storage=backend, catalog=catalog, db=db, session=session
+                )
+                return executor.execute_evaluated_select(
+                    planner._build_evaluated_single(stmt, tdef), backend, db, mem_sctx
+                )
+            plan = planner.plan_select(stmt, tdef)
+            return executor.execute_select(plan, backend, db)
+        finally:
+            planner._pipeline_subctx.reset(token)
 
     # A declared table, else a reflected (schema-on-read) view of an existing
     # Mongo collection — the dual-protocol read path.
