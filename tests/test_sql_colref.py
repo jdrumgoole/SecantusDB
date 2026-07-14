@@ -15,7 +15,7 @@ import bson
 import pytest
 import sqlglot
 
-from secantus.sql import SQLError, run_sql
+from secantus.sql import run_sql
 from secantus.sql.catalog import Column, TableDef
 from secantus.sql.planner import plan_select
 from secantus.sql.session import Session
