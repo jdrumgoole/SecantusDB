@@ -767,6 +767,10 @@ def _to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any:
         return "$" + _field(node, resolve)[0]
     if isinstance(node, exp.Cast):
         return _to_agg_expr(node.this, resolve)
+    if isinstance(node, exp.Neg) and not isinstance(node.this, (exp.Literal, exp.Null)):
+        # Unary minus over a non-literal (``- col2``) — a negative literal
+        # falls through to ``_literal`` instead.
+        return {"$multiply": [-1, _to_agg_expr(node.this, resolve)]}
     if type(node) in _ARITH_OPS:
         lowered = {
             _ARITH_OPS[type(node)]: [
@@ -980,6 +984,23 @@ def _null_guarded_expr_cmp(
     return {
         "$expr": {"$and": [{"$ne": [lexpr, None]}, {"$ne": [rexpr, None]}, {op: [lexpr, rexpr]}]}
     }
+
+
+def _always_unknown_predicate(core: exp.Expression) -> bool:
+    """Whether a (NOT/paren-stripped) predicate is *always unknown* because of
+    a NULL-literal operand: a NULL side of a comparison, a NULL left side of a
+    non-empty ``IN`` list, or a NULL BETWEEN subject (or both bounds NULL).
+    Unknown never satisfies a filter, and NOT preserves unknown — callers fold
+    to match-nothing regardless of NOT nesting."""
+    if isinstance(core, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        return _null_literal_operand(core.this) or _null_literal_operand(core.expression)
+    if isinstance(core, exp.In) and core.args.get("query") is None and core.expressions:
+        return _null_literal_operand(core.this)
+    if isinstance(core, exp.Between):
+        return _null_literal_operand(core.this) or (
+            _null_literal_operand(core.args["low"]) and _null_literal_operand(core.args["high"])
+        )
+    return False
 
 
 def _null_literal_operand(side: exp.Expression) -> bool:
@@ -5429,7 +5450,97 @@ def _having_to_match(
         op, flipped = _HAVING_CMP[type(node)]
         return {field: {(op if on_left else flipped): value}}
 
+    # A NULL-literal operand that makes the predicate *always unknown* — a
+    # NULL side of a comparison, a NULL IN a non-empty list, a NULL BETWEEN
+    # subject (or both bounds NULL) — excludes the group, and NOT preserves
+    # unknown, so the fold holds through any NOT / paren nesting.
+    core = node
+    while isinstance(core, (exp.Not, exp.Paren)):
+        core = core.this
+    if _always_unknown_predicate(core):
+        return {"$nor": [{}]}
+
+    # ``HAVING [NOT …] <operand> IS [NOT] NULL`` — IS NOT NULL parses as
+    # Not(Is(…)); IS NULL is two-valued, so each NOT just flips the filter and
+    # any nesting depth stays exact.
+    is_node = node
+    negate = False
+    while isinstance(is_node, (exp.Not, exp.Paren)):
+        if isinstance(is_node, exp.Not):
+            negate = not negate
+        is_node = is_node.this
+    if isinstance(is_node, exp.Is) and isinstance(is_node.expression, exp.Null):
+
+        def gk_resolve(col_node: exp.Expression) -> tuple[str, str]:
+            if not isinstance(col_node, exp.Column):
+                raise errors.feature_not_supported(f"expected a column: {col_node.sql()}")
+            name = _column_name(col_node)
+            if name not in group_cols:
+                raise errors.SQLError(
+                    "42803",
+                    f'column "{name}" must appear in the GROUP BY clause '
+                    "or be used in an aggregate function",
+                )
+            return f"_id.{name}", table.type_for(name)
+
+        operand = is_node.this
+        while isinstance(operand, exp.Paren):
+            operand = operand.this
+        if isinstance(operand, (exp.Column, exp.Filter, *(_AGG_CLASSES.keys()))):
+            field, _tag = field_tag(operand)
+            return {field: {"$ne": None}} if negate else {field: None}
+        if next(operand.find_all(exp.AggFunc), None) is None:
+            # A computed operand over group keys (``(- col2) IS NOT NULL``).
+            value = _to_agg_expr(operand, gk_resolve)
+            return {"$expr": {("$ne" if negate else "$eq"): [value, None]}}
+
+    if (
+        isinstance(is_node, exp.In)
+        and is_node.args.get("query") is None
+        and is_node.expressions
+        and next(is_node.find_all(exp.AggFunc), None) is None
+        and next(is_node.find_all(exp.Select), None) is None
+    ):
+        # ``HAVING [NOT] <expr> IN (<exprs over group keys>)`` — three-valued
+        # membership over the grouped fields.
+        def gk2_resolve(col_node: exp.Expression) -> tuple[str, str]:
+            if not isinstance(col_node, exp.Column):
+                raise errors.feature_not_supported(f"expected a column: {col_node.sql()}")
+            name = _column_name(col_node)
+            if name not in group_cols:
+                raise errors.SQLError(
+                    "42803",
+                    f'column "{name}" must appear in the GROUP BY clause '
+                    "or be used in an aggregate function",
+                )
+            return f"_id.{name}", table.type_for(name)
+
+        return _having_in_filter(is_node, negate, gk2_resolve)
+
     raise errors.feature_not_supported(f"unsupported HAVING clause: {node.sql()}")
+
+
+def _having_in_filter(in_node: exp.In, negate: bool, gk_resolve: Resolve) -> dict[str, Any]:
+    """Lower ``[NOT] <expr> IN (<exprs>)`` over grouped fields with SQL
+    three-valued semantics: IN is true when some candidate definitively equals
+    the (non-null) left side; NOT IN is true only when the left side and every
+    candidate are non-null and all differ (a NULL anywhere makes it unknown —
+    the group is excluded either way)."""
+    lhs = _to_agg_expr(in_node.this, gk_resolve)
+    cands = [_to_agg_expr(e, gk_resolve) for e in in_node.expressions]
+    if negate:
+        cond: dict[str, Any] = {
+            "$and": [{"$ne": [lhs, None]}]
+            + [{"$and": [{"$ne": [c, None]}, {"$ne": [lhs, c]}]} for c in cands]
+        }
+    else:
+        cond = {
+            "$or": [
+                {"$and": [{"$ne": [lhs, None]}, {"$ne": [c, None]}, {"$eq": [lhs, c]}]}
+                for c in cands
+            ]
+        }
+    return {"$expr": cond}
 
 
 def _join_where_lowerable(stmt: exp.Select, resolve: Resolve) -> bool:
@@ -5627,7 +5738,22 @@ def _lookup_stage(
     A single equality uses the simple ``localField``/``foreignField`` form (so a
     user-table join keeps index acceleration). A compound ON (multi-key join or
     residual predicates on the joined table) uses the ``let``/``pipeline`` form.
+    A *constant* ON folds three-valued: TRUE joins every foreign row (cartesian),
+    FALSE/unknown joins none (INNER drops the row; LEFT null-pads at the
+    ``$unwind``).
     """
+    const = _constant_predicate_filter(on)
+    if const is None:
+        # An always-unknown ON (a NULL-literal comparison operand, under any
+        # NOT/paren nesting) never joins either — same as a constant FALSE.
+        core = on
+        while isinstance(core, (exp.Not, exp.Paren)):
+            core = core.this
+        if _always_unknown_predicate(core):
+            const = {"$nor": [{}]}
+    if const is not None:
+        pipeline = [] if const == {} else [{"$match": const}]
+        return {"$lookup": {"from": join_table.collection, "pipeline": pipeline, "as": join_alias}}
     simple = _on_is_simple_equality(on, join_alias, amap)
     if simple is not None:
         new_col, known_alias, known_col = simple
@@ -6654,6 +6780,7 @@ def _plan_join_group_select(
     group_node = stmt.args.get("group")
     group_keys: dict[str, str] = {}  # _id key name -> resolved "$path"
     key_tag: dict[str, str] = {}
+    qualified_key: dict[tuple[str | None, str], str] = {}
     if group_node is not None:
         for c in group_node.expressions:
             if not isinstance(c, exp.Column):
@@ -6664,6 +6791,12 @@ def _plan_join_group_select(
                 key_tag[keyname] = "any"
                 continue
             path, tag = resolve(c)
+            if keyname in group_keys and group_keys[keyname] != f"${path}":
+                # The same bare column name grouped from two aliases
+                # (``GROUP BY cor1.col1, cor0.col1``) — mint a distinct grouped
+                # field; qualified references find it via ``qualified_key``.
+                keyname = f"{c.table or 'key'}__{keyname}"
+            qualified_key[(c.table or None, _column_name(c))] = keyname
             group_keys[keyname] = f"${path}"
             key_tag[keyname] = tag
     group_id = group_keys or None
@@ -6796,14 +6929,15 @@ def _plan_join_group_select(
                 raise errors.feature_not_supported(
                     f"non-aggregate SELECT expression not supported with GROUP BY: {inner.sql()}"
                 )
-            keyname = _column_name(inner)
+            colname = _column_name(inner)
+            keyname = qualified_key.get((inner.table or None, colname), colname)
             if keyname not in group_keys:
                 raise errors.SQLError(
                     "42803",
-                    f'column "{keyname}" must appear in the GROUP BY clause '
+                    f'column "{colname}" must appear in the GROUP BY clause '
                     "or be used in an aggregate function",
                 )
-            out_name = names.fresh(alias or keyname)
+            out_name = names.fresh(alias or colname)
             project[out_name] = f"$_id.{keyname}"
             out_columns.append((out_name, key_tag[keyname]))
 
@@ -6824,6 +6958,13 @@ def _plan_join_group_select(
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
+    if stmt.args.get("distinct") and not post_aggregates and not order_aggs:
+        # SELECT DISTINCT over the grouped join output — same dedup $group as
+        # the single-table group planner (skipped when the executor still has
+        # post-aggregates to finish or a hidden ORDER BY aggregate must survive).
+        dedup_id = {name: f"${name}" for name, _tag in out_columns}
+        pipeline.append({"$group": {"_id": dedup_id}})
+        pipeline.append({"$project": {"_id": 0, **{n: f"$_id.{n}" for n in dedup_id}}})
     _append_sort_limit(pipeline, stmt, out_columns, amap=amap, order_aggs=order_aggs)
     return PipelineSelectPlan(
         base.collection,
@@ -7260,16 +7401,25 @@ def _plan_join_group_window_select(
     key_tag: dict[str, str] = {}
     field_tags: dict[str, str] = {}
     names = _NameAllocator()
+    key_rewrites: list[tuple[str | None, str, str]] = []
     if group_node is not None:
         for c in group_node.expressions:
             if not isinstance(c, exp.Column):
                 raise errors.feature_not_supported(f"GROUP BY expression not supported: {c.sql()}")
             keyname = _column_name(c)
             path, tag = resolve(c)
+            if keyname in group_keys and group_keys[keyname] != f"${path}":
+                # The same bare column name grouped from two aliases
+                # (``GROUP BY cor1.col1, cor0.col1``) — mint a distinct grouped
+                # field and rewrite this alias's references after the aggregate
+                # pass (collapsing them grouped by only one of the columns).
+                keyname = names.fresh(f"{c.table or 'key'}__{keyname}")
+                key_rewrites.append((c.table or None, _column_name(c), keyname))
+            else:
+                names.fresh(keyname)  # reserve so synthetic agg fields never collide
             group_keys[keyname] = f"${path}"
             key_tag[keyname] = tag
             field_tags[keyname] = tag
-            names.fresh(keyname)  # reserve so synthetic agg fields never collide
     group_id = group_keys or None
 
     accumulators: dict[str, Any] = {}
@@ -7336,6 +7486,24 @@ def _plan_join_group_window_select(
 
     for node in _group_agg_nodes(stmt):
         node.replace(exp.column(register_agg(node)))
+
+    if key_rewrites:
+        # Rewrite the SELECT / ORDER BY / HAVING references of the renamed
+        # duplicate keys onto their minted grouped fields. Aggregate arguments
+        # were already replaced above (they resolve pre-group paths); the WHERE
+        # is deliberately untouched (it filters the pre-group joined rows).
+        roots: list[exp.Expression] = list(stmt.expressions)
+        order_node = stmt.args.get("order")
+        if order_node is not None:
+            roots.extend(o.this for o in order_node.expressions)
+        having_node = stmt.args.get("having")
+        if having_node is not None:
+            roots.append(having_node.this)
+        for alias, colname, keyname in key_rewrites:
+            for r in roots:
+                for col in list(r.find_all(exp.Column)):
+                    if col.name == colname and (col.table or None) == alias:
+                        col.replace(exp.column(keyname))
 
     having = stmt.args.get("having")
     having_match = (
@@ -7448,6 +7616,73 @@ def _join_having_to_match(
             return {field: {"$ne": value}}
         op, flipped = _HAVING_CMP[type(node)]
         return {field: {(op if on_left else flipped): value}}
+
+    # A NULL-literal operand that makes the predicate *always unknown* — a
+    # NULL side of a comparison, a NULL IN a non-empty list, a NULL BETWEEN
+    # subject (or both bounds NULL) — excludes the group, and NOT preserves
+    # unknown, so the fold holds through any NOT / paren nesting.
+    core = node
+    while isinstance(core, (exp.Not, exp.Paren)):
+        core = core.this
+    if _always_unknown_predicate(core):
+        return {"$nor": [{}]}
+
+    # ``HAVING [NOT …] <operand> IS [NOT] NULL`` — IS NOT NULL parses as
+    # Not(Is(…)); IS NULL is two-valued, so each NOT just flips the filter and
+    # any nesting depth stays exact.
+    is_node = node
+    negate = False
+    while isinstance(is_node, (exp.Not, exp.Paren)):
+        if isinstance(is_node, exp.Not):
+            negate = not negate
+        is_node = is_node.this
+    if isinstance(is_node, exp.Is) and isinstance(is_node.expression, exp.Null):
+
+        def gk_resolve(col_node: exp.Expression) -> tuple[str, str]:
+            if not isinstance(col_node, exp.Column):
+                raise errors.feature_not_supported(f"expected a column: {col_node.sql()}")
+            keyname = _column_name(col_node)
+            if keyname not in group_keys:
+                raise errors.SQLError(
+                    "42803",
+                    f'column "{keyname}" must appear in the GROUP BY clause '
+                    "or be used in an aggregate function",
+                )
+            return f"_id.{keyname}", key_tag[keyname]
+
+        operand = is_node.this
+        while isinstance(operand, exp.Paren):
+            operand = operand.this
+        if isinstance(operand, (exp.Column, exp.Filter, *_AGG_CLASSES.keys())):
+            field, _tag = field_tag(operand)
+            return {field: {"$ne": None}} if negate else {field: None}
+        if next(operand.find_all(exp.AggFunc), None) is None:
+            # A computed operand over group keys (``(- col2) IS NOT NULL``).
+            value = _to_agg_expr(operand, gk_resolve)
+            return {"$expr": {("$ne" if negate else "$eq"): [value, None]}}
+
+    if (
+        isinstance(is_node, exp.In)
+        and is_node.args.get("query") is None
+        and is_node.expressions
+        and next(is_node.find_all(exp.AggFunc), None) is None
+        and next(is_node.find_all(exp.Select), None) is None
+    ):
+        # ``HAVING [NOT] <expr> IN (<exprs over group keys>)`` — three-valued
+        # membership over the grouped join fields.
+        def gk2_resolve(col_node: exp.Expression) -> tuple[str, str]:
+            if not isinstance(col_node, exp.Column):
+                raise errors.feature_not_supported(f"expected a column: {col_node.sql()}")
+            keyname = _column_name(col_node)
+            if keyname not in group_keys:
+                raise errors.SQLError(
+                    "42803",
+                    f'column "{keyname}" must appear in the GROUP BY clause '
+                    "or be used in an aggregate function",
+                )
+            return f"_id.{keyname}", key_tag[keyname]
+
+        return _having_in_filter(is_node, negate, gk2_resolve)
 
     raise errors.feature_not_supported(f"unsupported HAVING clause: {node.sql()}")
 

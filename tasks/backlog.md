@@ -1605,15 +1605,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   error instead of `22P02`.** The declared-OID text-param conversion raises 22P02
   correctly; some column-coercion failures during Execute still fall through the
   generic handler. Map `ValueError`-class coercion failures to 22P02 there too.
-- [ ] **HAVING with a computed `IS [NOT] NULL` term** (`HAVING (- col2) IS NOT
-  NULL`, `HAVING NOT (col1 + col1) IS NULL`) raises `0A000 unsupported HAVING
-  clause` — `_having_to_match` only lowers bare-column / aggregate terms. Next:
-  a HAVING-residual route mirroring the WHERE probes (the group-window paths
-  already carry `residual_having` for subqueries). First error in the
-  sqllogictest `random/groupby` files (sweep notes in `tasks/sql-gauges-plan.md`).
-- [ ] **Constant JOIN ON condition** (`LEFT JOIN tab0 ON 80 = 70`) raises
-  `ON must compare columns` — the join builder requires a column equi-join.
-  A constant-false ON over LEFT JOIN should null-pad every left row.
+- [ ] **HAVING general-shape residual**: the HAVING lowerers now cover
+  comparisons, `IS [NOT] NULL` (incl. computed group-key operands),
+  `[NOT] IN` over group keys, and always-unknown NULL-operand folds — but any
+  shape outside those still raises `0A000`. The systemic fix is a
+  HAVING-residual route mirroring the WHERE probes (the group-window paths
+  already carry `residual_having` for subqueries).
 - [ ] **Multi-way comma-join performance**: sqllogictest `select4.test`/`select5.test`
   4-way joins with equi-WHEREs exceed 300s — the pipeline nests `$lookup`s without
   pushing the WHERE's equi-conditions into the lookup stages.
