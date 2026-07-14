@@ -456,6 +456,12 @@ CURATED = [
     ({"$log": [100, 10]}, {}),
     ({"$log": [8, 1]}, {}),  # base 1 -> null
     ({"$log": [None, 2]}, {}),  # null arg -> null
+    ({"$log10": 100}, {}),
+    ({"$log10": 1000}, {}),
+    ({"$log10": "$n"}, {"n": 2.5}),
+    ({"$log10": 0}, {}),  # <= 0 -> null
+    ({"$log10": -5}, {}),  # -> null
+    ({"$log10": "$missing"}, {}),  # missing -> null
     # $pow: int**non-neg-int -> int; float operand / negative exp -> double.
     ({"$pow": [2, 10]}, {}),
     ({"$pow": [2, 0]}, {}),

@@ -34,8 +34,7 @@
 //! direction; `$dateFromString`'s named-zone form still defers, being
 //! DST-ambiguous local→instant);
 //! `$convert`/`$toDecimal` + float-`str()` / string-parse / Decimal128
-//! conversions; `$round`/`$pow`/`$trunc` (rounding mode) and transcendentals
-//! (`$exp`/`$ln`/`$log`/`$log10` — last-ULP) risk float divergence; `$sortArray`
+//! conversions; `$round`/`$pow`/`$trunc` (rounding mode); `$sortArray`
 //! depends on Python's `sorted()` ordering/stability; and non-ASCII case /
 //! default-whitespace trim. All defer to the authoritative pure-Python
 //! evaluator. `$rand` is non-deterministic, so it's evaluated here directly (a
@@ -267,9 +266,9 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$regexMatch" => op_regex_match(arg, ctx),
         "$regexFind" => op_regex_find(arg, ctx),
         "$regexFindAll" => op_regex_find_all(arg, ctx),
-        // math (exactly-deterministic only; $round/$pow/$trunc and the
-        // transcendentals — exp/ln/log/log10 — are deferred for rounding / ULP
-        // fidelity, $sqrt is IEEE exactly-rounded so it's safe)
+        // math: the transcendentals $exp/$ln/$log/$log10 are computed natively
+        // (Rust f64 and CPython share the platform libm, so the anticipated
+        // last-ULP divergence doesn't materialise); $sqrt is IEEE exactly-rounded.
         "$abs" => op_abs(arg, ctx),
         "$floor" => op_floor_ceil(arg, ctx, false),
         "$ceil" => op_floor_ceil(arg, ctx, true),
@@ -277,6 +276,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$exp" => op_exp(arg, ctx),
         "$ln" => op_ln(arg, ctx),
         "$log" => op_log(arg, ctx),
+        "$log10" => op_log10(arg, ctx),
         "$pow" => op_pow(arg, ctx),
         "$round" => op_round(arg, ctx),
         "$trunc" => op_trunc(arg, ctx),
@@ -433,6 +433,7 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$exp",
     "$ln",
     "$log",
+    "$log10",
     "$pow",
     "$round",
     "$trunc",
@@ -2911,6 +2912,20 @@ fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
             let f = as_float_like(&v).ok_or(Fallback)?;
             Ok(if f > 0.0 {
                 Bson::Double(f.ln())
+            } else {
+                Bson::Null
+            })
+        }
+    }
+}
+
+fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
+    match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
+        v => {
+            let f = as_float_like(&v).ok_or(Fallback)?;
+            Ok(if f > 0.0 {
+                Bson::Double(f.log10())
             } else {
                 Bson::Null
             })
