@@ -314,6 +314,48 @@ def test_await_data_blocks_then_wakes_on_insert(client: MongoClient) -> None:
     assert elapsed < delay + 2.5
 
 
+def test_await_data_write_between_drain_and_wait_wakes_promptly(
+    server: SecantusDBServer, client: MongoClient, monkeypatch
+) -> None:
+    """Regression: a write landing between the getMore's producer drain and
+    its awaitData wait must trip the wake predicate. The buggy ordering
+    captured the oplog tail *after* the drain, so such a write was counted
+    into the captured tail and the getMore slept its full maxTimeMS with the
+    event already in the oplog (surfacing it only on the post-wait re-drain).
+    The monkeypatched drain lands an insert immediately after the first
+    getMore drain returns empty — deterministically inside the race window.
+    """
+    from secantus import commands as commands_mod
+
+    db = client["csdb_gap"]
+    coll = db["c"]
+    db.create_collection("c")
+
+    real_drain = commands_mod._drain_change_stream_producer
+    fired = threading.Event()
+
+    def drain_then_insert(entry: Any) -> None:
+        real_drain(entry)
+        if not fired.is_set() and not entry.remaining:
+            fired.set()
+            server.storage.insert("csdb_gap", "c", [{"_id": 1, "x": 1}])
+
+    monkeypatch.setattr(commands_mod, "_drain_change_stream_producer", drain_then_insert)
+
+    max_await_ms = 2000
+    cs = coll.watch(max_await_time_ms=max_await_ms)
+    start = time.monotonic()
+    events = _drain(cs, target=1, timeout=6.0)
+    elapsed = time.monotonic() - start
+    cs.close()
+    assert fired.is_set()
+    assert len(events) == 1
+    assert events[0]["operationType"] == "insert"
+    # The wake must be immediate (predicate already true), not the full
+    # maxTimeMS sleep the buggy capture-after-drain ordering produced.
+    assert elapsed < max_await_ms / 1000.0 * 0.75
+
+
 def test_resume_after_pruned_token_raises_history_lost(server, client) -> None:
     db = client["csdb_pruned"]
     coll = db["c"]

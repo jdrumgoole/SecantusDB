@@ -3914,7 +3914,17 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # real mongod treats that as "wait indefinitely". We bound the wait so
         # the connection thread can be reaped on shutdown.
         wait_seconds = max_time_ms / 1000.0 if max_time_ms > 0 else 1.0
-        captured_tail = ctx.storage.oplog_tail_seq()
+        # Baseline the wake predicate on the producer's consumed position
+        # (``entry.position_seq``): the drain above advanced it to the tail
+        # it observed, so any write landing AFTER that observation —
+        # including one in the gap between the drain and this wait — makes
+        # ``tail > baseline`` true and skips the wait. A fresh post-drain
+        # tail snapshot counted such a write into the baseline, so the
+        # getMore slept its full maxTimeMS with the event already in the
+        # oplog, surfacing it only on the post-wait re-drain — past the
+        # client's await window. Mirrors the Rust server's
+        # ``wait_for_oplog(position, ...)``.
+        baseline_seq = entry.position_seq
         with ctx.storage._oplog_cv:
             # Wake predicate must not acquire ``storage._lock`` — the
             # write path holds ``_lock`` then notifies under
@@ -3925,7 +3935,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # read self-corrects on the next iteration of wait_for.
             ctx.storage._oplog_cv.wait_for(
                 lambda: (
-                    ctx.storage.oplog_tail_seq_nolock() > captured_tail
+                    ctx.storage.oplog_tail_seq_nolock() > baseline_seq
                     or entry.invalidated
                     or entry.dropped
                     or ctx.storage._shutting_down
