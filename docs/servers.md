@@ -29,16 +29,17 @@ live only in the Rust server.
 | | Python server | Rust server |
 | --- | --- | --- |
 | Package | `pip install SecantusDB` (always present) | built behind a flag / `pip install "secantus[rust]"` |
-| Maturity | conformance leader — **99.2%** of pymongo's own suite | **92.0%** of the same suite (catching up) |
+| Maturity | conformance reference — **99.5%** of pymongo's own suite | **99.5%** of the same suite |
 | Best for | the default: tests, dev, embedded apps, single-node prototypes | throughput-sensitive workloads where the Rust hot path matters |
 | Request path | pure Python | pure Rust (off the GIL) |
 
-Use the **Python server** unless you have a specific reason not to. It passes a
-higher fraction of the driver suites and supports the full in-scope feature set
-described in [Compatibility](compatibility.md). The Rust server is faster
-per operation (see [Benchmark](benchmark.md)) but is still closing the
-conformance gap below — pick it only when its remaining gaps don't touch your
-workload.
+Use the **Python server** unless you have a specific reason not to. It is the
+conformance reference, supports the full in-scope feature set described in
+[Compatibility](compatibility.md), and is the only server with the
+[SQL / PostgreSQL frontend](sql.md). The Rust server now matches it on
+pymongo's suite and is faster per operation (see [Benchmark](benchmark.md));
+its few remaining feature gaps are listed below and in the
+[Feature comparison](feature-comparison.md).
 
 ## Versioning
 
@@ -120,9 +121,10 @@ See the [SQL / PostgreSQL interface](sql.md).
 
 Both servers share the project-wide non-goals — anything that depends on **real
 cluster topology** (multi-node replica sets, sharding, elections, cross-node
-oplog), auth mechanisms beyond `SCRAM-SHA-256` / `MONGODB-X509`, authorization
-(RBAC), `OP_COMPRESSED`, text / hashed / wildcard indexes, and
-`$where` / `$function` / `$accumulator` / `mapReduce` (no embedded JS runtime).
+oplog), auth mechanisms beyond SCRAM (SHA-1 / SHA-256) and `MONGODB-X509`,
+`OP_COMPRESSED`, text / hashed / wildcard indexes, and
+`$where` / `$function` / `$accumulator` / JS `mapReduce` (no embedded JS
+runtime).
 These are out of scope for **both** servers; the per-feature detail lives in
 [Compatibility](compatibility.md).
 
@@ -130,37 +132,36 @@ These are out of scope for **both** servers; the per-feature detail lives in
 
 The Python server implements the full in-scope wire surface. Its remaining
 divergences are the stopgaps and known edge cases enumerated in
-[Compatibility](compatibility.md) — `$lookup` is a hash-join rather than an
-index-driven join, the `_id` numeric-type bridge is undefined for `NaN` /
-infinity, `top` counters are always zero, and a handful of date-format and
+[Compatibility](compatibility.md) — the `_id` numeric-type bridge is
+undefined for `NaN` / infinity, `top` counters are always zero, and a handful
+of date-format and
 `$group`-ordering edge cases. There is no *feature* the Python server is
 missing relative to the in-scope set; it is the conformance reference the Rust
 server is measured against.
 
 ### Rust server
 
-The Rust server passes 92.0% of pymongo's suite versus the Python server's
-99.2%. **That gap is the Rust server's remaining to-do list** — features the
-Python server already supports but the Rust server does not yet:
+The Rust server now passes the same 99.5% of pymongo's suite as the Python
+server. The remaining *feature* differences (full three-way matrix in the
+[Feature comparison](feature-comparison.md)) are:
 
-- **DDL change-stream events (`showExpandedEvents`)** — the Rust server's
-  `create_index` / `drop_index` / `collMod` write no oplog `c` entry, so a
-  `showExpandedEvents: true` change stream never sees `createIndexes` /
-  `dropIndexes` / `modify` events. (`create` / `drop` collection events *are*
-  emitted.)
-- **Large-event splitting** — `splitLargeChangeStreamEvents` always reports a
-  single fragment (`of: 1`); the Rust server can't yet split a change event
-  larger than the 16 MB BSON limit.
-- **Read concern / write concern** — accepted on the wire for compatibility,
-  then ignored (no snapshot / majority semantics applied).
-- **Timeseries `_id` non-uniqueness** — the Rust storage layer keys every
-  document by `_id`, so it rejects the duplicate `_id`s a timeseries
-  collection relies on (the Python server suffixes the key to allow them).
-- Assorted CRUD / cursor / introspection edge cases that make up the rest of
-  the conformance gap (`test_cursor`, `test_collection_management`,
-  `test_database` — see the
-  [Rust-server validation report](validation-report-rust-server.md) for the
-  current failing-test list).
+- **SQL / PostgreSQL frontend** — the PG wire listener (`secantusd-py-pg`)
+  is Python-server-only.
+- **`mapReduce` and `top`** — the Python server ships a minimal `mapReduce`
+  (`{out: {inline: 1}}` only) and a zero-counter `top`; the Rust server
+  answers `CommandNotFound` for both.
+- **Point-in-time restore over the wire** — `secantusAdmin.restoreToTimestamp`
+  is Python-server-only; the Rust server does the same restore via the
+  `secantusd-rs restore` CLI subcommand.
+- **Session lifecycle** — `endSessions` / `refreshSessions` / `killSessions`
+  are acknowledged no-ops on the Rust server; the Python server tracks
+  sessions with a 30-minute idle TTL.
+- **Operator edges** — a handful of `$dateFromString` / `$dateToString`
+  format directives, Decimal128 arithmetic edges, and mixed-type sort
+  orderings the Rust engine rejects rather than risk diverging from the
+  Python oracle.
+- **Thinner diagnostics** — `serverStatus` / `dbStats` / `collStats` return a
+  smaller subset of fields than the Python server's replies.
 
 Both servers mint resume tokens in SecantusDB's own `{s, t, n, k}` layout
 rather than mongod's keystring format — tokens round-trip within SecantusDB but
