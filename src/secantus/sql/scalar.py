@@ -2631,9 +2631,17 @@ def _eval_in(node: exp.In, outer: Scope, ctx: ScalarContext) -> Any:
         candidates = [evaluate(proj, scope, ctx) for scope in _inner_row_scopes(select, outer, ctx)]
     else:
         candidates = [evaluate(e, outer, ctx) for e in node.expressions]
+    if not candidates:
+        # ``x IN ()`` — not valid Postgres, but the sqllogictest corpus uses it
+        # (SQLite semantics): the empty set contains nothing, even for a NULL
+        # left side, so IN is FALSE and NOT IN is TRUE.
+        return False
     if left is None:
         return None  # NULL IN (...) is unknown
-    return any(left == v for v in candidates)
+    # Three-valued membership: a NULL candidate makes a non-match unknown.
+    if any(left == v for v in candidates if v is not None):
+        return True
+    return None if any(v is None for v in candidates) else False
 
 
 def _eval_between(node: exp.Between, outer: Scope, ctx: ScalarContext) -> Any:

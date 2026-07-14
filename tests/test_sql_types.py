@@ -266,3 +266,47 @@ def test_three_valued_logic_in_per_row_where():
         assert rows("select + + 90 * a * - b from tv order by 1") == [(-2700,), (-180,)]
     finally:
         st.close()
+
+
+def test_aggregate_expression_arguments():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table ag (col0 int4, col1 int4)", session=sess)
+        run_sql(st, "d", "insert into ag values (46, 1), (64, 3), (75, 5)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # Identity-wrapped args strip; real expressions lower to agg exprs.
+        assert rows("select - max( - - col0 ) from ag") == [(-75,)]
+        assert rows("select sum( all - 83 ) from ag") == [(-249,)]
+        assert rows("select sum( distinct - - ( col1 ) ) from ag") == [(9,)]
+        assert rows("select - cast( + - sum( - col1 ) as integer ) from ag") == [(-9,)]
+        assert rows("select max(col0 + 1) from ag") == [(76,)]
+        assert rows("select count(*), sum(col1 + col0) from ag") == [(3, 194)]
+    finally:
+        st.close()
+
+
+def test_empty_implicit_aggregate_returns_one_row():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table em (a int4)", session=sess)
+        run_sql(st, "d", "insert into em values (1)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # PG: an implicit whole-table aggregate over zero rows is ONE row —
+        # counts 0, everything else NULL. A grouped query stays zero rows.
+        assert rows("select avg(a) from em where a > 99") == [(None,)]
+        assert rows("select sum(a), max(a) from em where a > 99") == [(None, None)]
+        assert rows("select count(*), avg(a) from em where a > 99") == [(0, None)]
+        assert rows("select a from em where a > 99 group by a") == []
+        # Comparison with a bare NULL literal matches nothing on the pushdown.
+        assert rows("select a from em where a <> NULL") == []
+        assert rows("select 1 from em where NULL NOT IN ()") == [(1,)]
+    finally:
+        st.close()
