@@ -480,21 +480,37 @@ class SecantusPGServer:
         session.state = "idle"  # query done; pg_stat_activity shows it idle (#137)
         conn.sendall(bytes(out))
 
+    def _txn_scope(self, session: Session) -> Any:
+        """The session's open user transaction as a context manager, or a
+        no-op scope outside a BEGIN block. COPY's catalog resolution, reads,
+        and writes must all run inside the transaction — otherwise a COPY
+        can't see same-transaction DDL (``CREATE TABLE`` + ``COPY`` in one
+        block is psycopg's standard fixture shape) and, worse, its rows land
+        OUTSIDE the transaction and would survive a ROLLBACK."""
+        if session.txn_handle is not None:
+            return self.storage.use_user_transaction(session.txn_handle)
+        return contextlib.nullcontext()
+
     def _handle_copy(self, conn: socket.socket, session: Session, stmt: Any) -> None:
         """Run the ``COPY`` sub-protocol: CopyInResponse → CopyData* → CopyDone for
         ``FROM STDIN``, or CopyOutResponse → CopyData* → CopyDone for ``TO STDOUT``."""
         catalog = Catalog(self.storage)
         try:
-            plan = sql_engine.copy_plan(stmt, self.storage, session.database, catalog, session)
+            with self._txn_scope(session):
+                plan = sql_engine.copy_plan(stmt, self.storage, session.database, catalog, session)
             if plan.to_stdout:
                 self._copy_out(conn, session, catalog, plan)
             else:
                 self._copy_in(conn, session, catalog, plan)
         except errors.SQLError as exc:
+            if session.txn_handle is not None:
+                session.txn_failed = True  # a failed COPY aborts the block, like PG
             conn.sendall(pgwire.error_response(exc.sqlstate, exc.message))
             conn.sendall(pgwire.ready_for_query(session.txn_status()))
         except Exception:  # pragma: no cover - defensive
             logger.exception("error executing COPY")
+            if session.txn_handle is not None:
+                session.txn_failed = True
             # Generic wire message; full detail stays in the server log. (§I17)
             conn.sendall(pgwire.error_response("XX000", _INTERNAL_ERROR_MSG))
             conn.sendall(pgwire.ready_for_query(session.txn_status()))
@@ -523,8 +539,13 @@ class SecantusPGServer:
         else:
             rows = copyfmt.parse_text(data, delimiter=plan.delimiter, null=plan.null)
         try:
-            n = sql_engine.copy_insert(self.storage, session.database, catalog, session, plan, rows)
+            with self._txn_scope(session):
+                n = sql_engine.copy_insert(
+                    self.storage, session.database, catalog, session, plan, rows
+                )
         except errors.SQLError as exc:
+            if session.txn_handle is not None:
+                session.txn_failed = True
             conn.sendall(pgwire.error_response(exc.sqlstate, exc.message))
             conn.sendall(pgwire.ready_for_query(session.txn_status()))
             return
@@ -532,7 +553,8 @@ class SecantusPGServer:
         conn.sendall(pgwire.ready_for_query(session.txn_status()))
 
     def _copy_out(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
-        rows = sql_engine.copy_extract(self.storage, session.database, catalog, session, plan)
+        with self._txn_scope(session):
+            rows = sql_engine.copy_extract(self.storage, session.database, catalog, session, plan)
         if plan.fmt == "csv":
             header = plan.columns if plan.header else None
             text = copyfmt.format_csv(rows, delimiter=plan.delimiter, null=plan.null, header=header)
