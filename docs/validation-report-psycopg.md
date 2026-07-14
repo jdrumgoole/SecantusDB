@@ -2,11 +2,11 @@
 
 - SecantusDB (Python server) 0.5.4b234
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-07-13 18:58 UTC
+- generated: 2026-07-14 20:53 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
-| test_adapt.py | 47 | 12 | 0 | 59 | 79.7% |
+| test_adapt.py | 48 | 11 | 0 | 59 | 81.4% |
 | test_capabilities.py | 12 | 0 | 9 | 21 | 100.0% |
 | test_column.py | 11 | 42 | 0 | 53 | 20.8% |
 | test_connection.py | 79 | 23 | 2 | 104 | 77.5% |
@@ -15,7 +15,7 @@
 | test_copy.py | 22 | 89 | 1 | 112 | 19.8% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_client.py | 25 | 3 | 0 | 28 | 89.3% |
-| test_cursor_common.py | 250 | 30 | 8 | 288 | 89.3% |
+| test_cursor_common.py | 253 | 27 | 8 | 288 | 90.4% |
 | test_cursor_raw.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_server.py | 22 | 88 | 0 | 110 | 20.0% |
 | test_encodings.py | 17 | 0 | 0 | 17 | 100.0% |
@@ -27,27 +27,27 @@
 | test_rows.py | 18 | 0 | 0 | 18 | 100.0% |
 | test_sql.py | 115 | 4 | 5 | 124 | 96.6% |
 | test_transaction.py | 83 | 1 | 1 | 85 | 98.8% |
-| test_typeinfo.py | 32 | 54 | 0 | 86 | 37.2% |
+| test_typeinfo.py | 64 | 22 | 0 | 86 | 74.4% |
 | test_typing.py | 0 | 125 | 0 | 125 | 0.0% |
-| types/test_array.py | 124 | 34 | 0 | 158 | 78.5% |
+| types/test_array.py | 125 | 33 | 0 | 158 | 79.1% |
 | types/test_bool.py | 15 | 0 | 0 | 15 | 100.0% |
 | types/test_composite.py | 1 | 78 | 0 | 79 | 1.3% |
 | types/test_datetime.py | 296 | 259 | 12 | 567 | 53.3% |
 | types/test_enum.py | 45 | 152 | 0 | 197 | 22.8% |
 | types/test_hstore.py | 24 | 0 | 15 | 39 | 100.0% |
 | types/test_json.py | 77 | 181 | 0 | 258 | 29.8% |
-| types/test_multirange.py | 87 | 118 | 12 | 217 | 42.4% |
+| types/test_multirange.py | 89 | 116 | 12 | 217 | 43.4% |
 | types/test_net.py | 3 | 30 | 0 | 33 | 9.1% |
 | types/test_none.py | 1 | 0 | 0 | 1 | 100.0% |
-| types/test_numeric.py | 357 | 13 | 0 | 370 | 96.5% |
+| types/test_numeric.py | 366 | 4 | 0 | 370 | 98.9% |
 | types/test_numpy.py | 42 | 124 | 6 | 172 | 25.3% |
-| types/test_range.py | 117 | 158 | 12 | 287 | 42.5% |
+| types/test_range.py | 119 | 156 | 12 | 287 | 43.3% |
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 108 | 26 | 1 | 135 | 80.6% |
 | types/test_uuid.py | 21 | 5 | 0 | 26 | 80.8% |
-| **total** | **2415** | **1707** | **116** | **4238** | **58.6%** |
+| **total** | **2465** | **1657** | **116** | **4238** | **59.8%** |
 
-## Failures (1707)
+## Failures (1657)
 
 - `tests/test_adapt.py::test_load_cursor_ctx_nested[0-row('hello'::text)-obj1]`
 - `tests/test_adapt.py::test_load_cursor_ctx_nested[1-row('hello'::text)-obj1]`
@@ -55,7 +55,6 @@
 - `tests/test_adapt.py::test_no_cast_needed[s]`
 - `tests/test_adapt.py::test_no_cast_needed[t]`
 - `tests/test_adapt.py::test_random[0-b]`
-- `tests/test_adapt.py::test_random[0-s]`
 - `tests/test_adapt.py::test_random[0-t]`
 - `tests/test_adapt.py::test_random[1-b]`
 - `tests/test_adapt.py::test_random[1-s]`
@@ -225,9 +224,9 @@
 - `tests/test_copy.py::test_worker_error_propagated`
 - `tests/test_copy.py::test_worker_life[0-sample_text]`
 - `tests/test_copy.py::test_worker_life[1-sample_binary]`
-- `tests/test_cursor_client.py::test_leak[asyncio-dict_row-many]`
 - `tests/test_cursor_client.py::test_leak[asyncio-dict_row-one]`
-- `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-all]`
+- `tests/test_cursor_client.py::test_leak[asyncio-namedtuple_row-one]`
+- `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-one]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-ClientCursor]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-Cursor]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-RawCursor]`
@@ -255,9 +254,6 @@
 - `tests/test_cursor_common.py::test_stream_error_tx[asyncio-ClientCursor]`
 - `tests/test_cursor_common.py::test_stream_error_tx[asyncio-Cursor]`
 - `tests/test_cursor_common.py::test_stream_error_tx[asyncio-RawCursor]`
-- `tests/test_cursor_common.py::test_typeinfo[asyncio-ClientCursor]`
-- `tests/test_cursor_common.py::test_typeinfo[asyncio-Cursor]`
-- `tests/test_cursor_common.py::test_typeinfo[asyncio-RawCursor]`
 - `tests/test_cursor_server.py::test_binary_cursor_execute[asyncio-RawServerCursor]`
 - `tests/test_cursor_server.py::test_binary_cursor_execute[asyncio-ServerCursor]`
 - `tests/test_cursor_server.py::test_binary_cursor_text_override[asyncio-RawServerCursor]`
@@ -400,59 +396,27 @@
 - `tests/test_sql.py::test_quote_stable_despite_deranged_libpq[off]`
 - `tests/test_transaction.py::test_context_inerror_rollback_no_clobber[asyncio-pipeline=off]`
 - `tests/test_typeinfo.py::test_fetch[latin1-IDLE-name1]`
-- `tests/test_typeinfo.py::test_fetch[latin1-IDLE-text]`
 - `tests/test_typeinfo.py::test_fetch[latin1-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch[latin1-INTRANS-text]`
 - `tests/test_typeinfo.py::test_fetch[latin1-None-name1]`
-- `tests/test_typeinfo.py::test_fetch[latin1-None-text]`
 - `tests/test_typeinfo.py::test_fetch[sql_ascii-IDLE-name1]`
-- `tests/test_typeinfo.py::test_fetch[sql_ascii-IDLE-text]`
 - `tests/test_typeinfo.py::test_fetch[sql_ascii-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch[sql_ascii-INTRANS-text]`
 - `tests/test_typeinfo.py::test_fetch[sql_ascii-None-name1]`
-- `tests/test_typeinfo.py::test_fetch[sql_ascii-None-text]`
 - `tests/test_typeinfo.py::test_fetch[utf8-IDLE-name1]`
-- `tests/test_typeinfo.py::test_fetch[utf8-IDLE-text]`
 - `tests/test_typeinfo.py::test_fetch[utf8-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch[utf8-INTRANS-text]`
 - `tests/test_typeinfo.py::test_fetch[utf8-None-name1]`
-- `tests/test_typeinfo.py::test_fetch[utf8-None-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-IDLE-name1]`
-- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-IDLE-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-INTRANS-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-None-name1]`
-- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-None-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-IDLE-name1]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-IDLE-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-INTRANS-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-None-name1]`
-- `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-None-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-IDLE-name1]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-IDLE-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-INTRANS-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-None-name1]`
-- `tests/test_typeinfo.py::test_fetch_async[asyncio-utf8-None-text]`
 - `tests/test_typeinfo.py::test_fetch_by_schema_qualified_string[name1]`
 - `tests/test_typeinfo.py::test_fetch_by_schema_qualified_string[testschema.testtype]`
-- `tests/test_typeinfo.py::test_fetch_not_found[MultirangeInfo-IDLE-name1]`
-- `tests/test_typeinfo.py::test_fetch_not_found[MultirangeInfo-IDLE-nosuch]`
-- `tests/test_typeinfo.py::test_fetch_not_found[MultirangeInfo-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch_not_found[MultirangeInfo-INTRANS-nosuch]`
-- `tests/test_typeinfo.py::test_fetch_not_found[RangeInfo-IDLE-name1]`
-- `tests/test_typeinfo.py::test_fetch_not_found[RangeInfo-IDLE-nosuch]`
-- `tests/test_typeinfo.py::test_fetch_not_found[RangeInfo-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch_not_found[RangeInfo-INTRANS-nosuch]`
-- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-MultirangeInfo-IDLE-name1]`
-- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-MultirangeInfo-IDLE-nosuch]`
-- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-MultirangeInfo-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-MultirangeInfo-INTRANS-nosuch]`
-- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-RangeInfo-IDLE-name1]`
-- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-RangeInfo-IDLE-nosuch]`
-- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-RangeInfo-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch_not_found_async[asyncio-RangeInfo-INTRANS-nosuch]`
 - `tests/test_typing.py::test_connection_type[await psycopg.AsyncConnection.connect()-psycopg.AsyncConnection[Tuple[Any, ...]]]`
 - `tests/test_typing.py::test_connection_type[await psycopg.AsyncConnection.connect(row_factory=rows.dict_row)-psycopg.AsyncConnection[Dict[str, Any]]]`
 - `tests/test_typing.py::test_connection_type[psycopg.Connection.connect()-psycopg.Connection[Tuple[Any, ...]]]`
@@ -611,7 +575,6 @@
 - `tests/types/test_array.py::test_load_list_str[want7-{{{"fo{o","ba}r"},{"ba\\"z",qu\\'x},{"qu ux"," "}}}-1]`
 - `tests/types/test_array.py::test_load_nested_array[0]`
 - `tests/types/test_array.py::test_load_nested_array[1]`
-- `tests/types/test_array.py::test_register_array_leak`
 - `tests/types/test_composite.py::test_callable_dumper_not_registered`
 - `tests/types/test_composite.py::test_dump_builtin_empty_range[b]`
 - `tests/types/test_composite.py::test_dump_builtin_empty_range[s]`
@@ -1394,8 +1357,6 @@
 - `tests/types/test_multirange.py::test_fetch_info_async[asyncio-name3-float8]`
 - `tests/types/test_multirange.py::test_fetch_info_async[asyncio-testmultirange-text]`
 - `tests/types/test_multirange.py::test_fetch_info_async[asyncio-testschema.testmultirange-float8]`
-- `tests/types/test_multirange.py::test_fetch_info_not_found`
-- `tests/types/test_multirange.py::test_fetch_info_not_found_async[asyncio]`
 - `tests/types/test_multirange.py::test_literal_invalid_name[\u20ac]`
 - `tests/types/test_multirange.py::test_literal_invalid_name[a-b]`
 - `tests/types/test_multirange.py::test_load_custom_empty[0]`
@@ -1434,15 +1395,6 @@
 - `tests/types/test_numeric.py::test_dump_float[s-nan-'NaN']`
 - `tests/types/test_numeric.py::test_dump_float[t-nan-'NaN']`
 - `tests/types/test_numeric.py::test_dump_numeric_exhaustive[b]`
-- `tests/types/test_numeric.py::test_load_float_approx[0--exp(1.0)-float4--2.71828]`
-- `tests/types/test_numeric.py::test_load_float_approx[0--exp(1.0)-float8--2.71828182845905]`
-- `tests/types/test_numeric.py::test_load_float_approx[1--exp(1.0)-float4--2.71828]`
-- `tests/types/test_numeric.py::test_load_float_approx[1--exp(1.0)-float8--2.71828182845905]`
-- `tests/types/test_numeric.py::test_minus_minus[numeric]`
-- `tests/types/test_numeric.py::test_minus_minus_quote[numeric]`
-- `tests/types/test_numeric.py::test_quote_numeric[-0.00000000000000001- -1E-17]`
-- `tests/types/test_numeric.py::test_quote_numeric[nan-'NaN'::numeric]`
-- `tests/types/test_numeric.py::test_quote_numeric[snan-'NaN'::numeric]`
 - `tests/types/test_numpy.py::test_copy_by_oid[0-bool_-False-bool]`
 - `tests/types/test_numpy.py::test_copy_by_oid[0-bool_-True-bool]`
 - `tests/types/test_numpy.py::test_copy_by_oid[0-int16--32768-int2 int4 int8 numeric]`
@@ -1716,8 +1668,6 @@
 - `tests/types/test_range.py::test_fetch_info_async[asyncio-name3-float8]`
 - `tests/types/test_range.py::test_fetch_info_async[asyncio-testrange-text]`
 - `tests/types/test_range.py::test_fetch_info_async[asyncio-testschema.testrange-float8]`
-- `tests/types/test_range.py::test_fetch_info_not_found`
-- `tests/types/test_range.py::test_fetch_info_not_found_async[asyncio]`
 - `tests/types/test_range.py::test_literal_invalid_name[\u20ac]`
 - `tests/types/test_range.py::test_literal_invalid_name[a-b]`
 - `tests/types/test_range.py::test_literal_invalid_name[order]`
