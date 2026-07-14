@@ -441,11 +441,14 @@ now committed tooling at 26/30 with 4 declared divergences), #418 (psycopg
 TypeInfo catalog fidelity: `pg_type.typarray`/`typdelim`, `pg_range`,
 `to_regtype()`, user-type `oid::regtype` — all five TypeInfo fetch flows work
 end-to-end), #419 (report refresh). **psycopg gauge: 58.7% → 59.8%** (2465
-passed). Next psycopg levers, in measured order: COPY fixture-table cascades
-(`UndefinedTable: copyrange`/`copy_in`/`copymr`/`numpyoid`, ~190), `CREATE
+passed). Then **#420** (this plan checked in) and **#421** (COPY runs inside
+the open transaction block — the sub-protocol handler never entered
+`use_user_transaction`, so same-block `CREATE TABLE` was invisible to COPY
+*and copied rows survived a ROLLBACK*; the three copy-heavy psycopg suites
+moved 230 → 374 passing). Next psycopg levers, in measured order: `CREATE
 SCHEMA` (71), server-side cursors (`InvalidCursorName`, ~110 with
 test_cursor_server), `pg_prepared_statements` (21), mypy in the gauge venv
-(125, environmental).
+(125, environmental); then a full gauge re-run to restamp the headline.
 
 **Second slice (same day, PR pending): 19/26 → 22/26.** HAVING grew
 `IS [NOT] NULL` (bare / aggregate / computed group-key operands, exact under
