@@ -235,6 +235,7 @@ validation-report-c
 validation-report-cxx
 validation-report-dotnet
 validation-report-psycopg
+validation-report-slt
 validation-report-rust-server
 api
 changelog

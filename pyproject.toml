@@ -191,6 +191,12 @@ sdist.exclude = [
     "cxx_validation/**",
     "vendor/mongo-csharp-driver/**",
     "dotnet_validation/**",
+    # SQL-server gauges: psycopg's own test suite and the sqllogictest
+    # corpus, both vendored dev-only (invoke validate-psycopg / validate-slt).
+    "vendor/psycopg/**",
+    "psycopg_validation/**",
+    "vendor/sqllogictest/**",
+    "slt_validation/**",
     ".validation/**",
     # brandkit/ is marketing content (logos, brand-guide HTML); not
     # needed at install or run time. The docs that need it pull from
