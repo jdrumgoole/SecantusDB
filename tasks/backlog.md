@@ -319,6 +319,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 ### P2 — polish
 
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
+- [ ] **`StarletteDeprecationWarning` from fastapi's testclient import** — the six
+  admin websocket tests each emit "Using `httpx` with `starlette.testclient` is
+  deprecated; install `httpx2`" from fastapi's own import shim. The last warnings
+  in the default suite. Fix is a dev-dependency bump (fastapi/starlette/httpx2)
+  in its own PR — no runtime code involved.
 
 ## 7. Python → Rust rewrite (in progress)
 
