@@ -358,3 +358,61 @@ def test_group_by_over_virtual_table(storage, session):
         "WHERE c.table_name = 'users' GROUP BY c.table_name",
     )
     assert res.rows == [("users", 3)]
+
+
+def test_pg_type_typarray_and_pg_range(storage, session):
+    rows = run_sql(
+        storage,
+        "db",
+        "select typname, typarray, typdelim from pg_type where typname = 'int4'",
+        session=session,
+    )[-1].rows
+    assert rows == [("int4", 1007, ",")]
+    rows = run_sql(
+        storage,
+        "db",
+        "select rngsubtype, rngmultitypid from pg_range where rngtypid = 3904",
+        session=session,
+    )[-1].rows
+    assert rows == [(23, 4451)]
+
+
+def test_to_regtype_and_regtype_cast(storage, session):
+    def rows(sql):
+        return run_sql(storage, "db", sql, session=session)[-1].rows
+
+    assert rows("select to_regtype('int4'), to_regtype('text'), to_regtype('nope')") == [
+        (23, 25, None)
+    ]
+    run_sql(storage, "db", "create type mood as enum ('sad', 'ok')", session=session)
+    # User-declared types resolve — FROM-less, and inside a catalog WHERE.
+    (oid,) = rows("select to_regtype('mood')")[0]
+    assert isinstance(oid, int) and oid >= 65000
+    assert rows("select typname from pg_type t where t.oid = to_regtype('mood')") == [("mood",)]
+    # ``oid::regtype::text`` renders the user type's name.
+    assert rows(f"select {oid}::regtype::text") == [("mood",)]
+
+
+def test_psycopg_enum_fetch_query_shape(storage, session):
+    run_sql(storage, "db", "create type mood as enum ('sad', 'ok', 'happy')", session=session)
+    rows = run_sql(
+        storage,
+        "db",
+        """SELECT name, oid, array_oid, regtype, array_agg(label) AS labels
+FROM (
+    SELECT
+        t.typname AS name, t.oid AS oid, t.typarray AS array_oid,
+        t.oid::regtype::text AS regtype, e.enumlabel AS label
+    FROM pg_type t
+    LEFT JOIN  pg_enum e
+    ON e.enumtypid = t.oid
+    WHERE t.oid = to_regtype('mood')
+    ORDER BY e.enumsortorder
+) x
+GROUP BY name, oid, array_oid, regtype""",
+        session=session,
+    )[-1].rows
+    assert len(rows) == 1
+    name, _oid, _arr, regtype, labels = rows[0]
+    assert (name, regtype) == ("mood", "mood")
+    assert list(labels) == ["sad", "ok", "happy"]

@@ -315,13 +315,22 @@ def _literal(node: exp.Expression) -> Any:
 
 
 def _to_regtype(name: Any) -> int | None:
-    """Map a type name (as ``to_regtype`` takes) to its OID, or None if unknown."""
+    """Map a type name (as ``to_regtype`` takes) to its OID, or None if unknown.
+
+    User-declared types (enum / domain / composite) resolve through the
+    planning ``_pipeline_subctx`` catalog when one is live — psycopg's
+    ``EnumInfo.fetch`` keys ``WHERE t.oid = to_regtype('mood')`` on it."""
     if not isinstance(name, str):
         return None
     key = name.strip().lower()
     for tag, typname in typemap.PG_TYPENAME.items():
         if key in (typname, tag, typemap.SQL_TYPE_NAME.get(tag)):
             return typemap.PG_OID.get(tag)
+    sub = _pipeline_subctx.get()
+    if sub is not None and getattr(sub, "catalog", None) is not None:
+        from secantus.sql import virtual
+
+        return virtual.user_type_oid(sub.db, sub.catalog, name)
     return None
 
 
@@ -1005,10 +1014,15 @@ def _always_unknown_predicate(core: exp.Expression) -> bool:
 
 def _null_literal_operand(side: exp.Expression) -> bool:
     """Whether a comparison operand is a literal that folds to SQL NULL —
-    ``NULL``, ``(NULL)``, ``- CAST(NULL AS INTEGER)``, …"""
+    ``NULL``, ``(NULL)``, ``- CAST(NULL AS INTEGER)``, … A *function call*
+    (``to_regtype('mood')``) is never a NULL literal: its value needs a live
+    catalog/session context the fold doesn't have, so a context-free
+    evaluation to None must not turn the comparison into match-nothing."""
     if isinstance(side, exp.Null):
         return True
     if not _is_literalish(side):
+        return False
+    if next(side.find_all(exp.Anonymous), None) is not None:
         return False
     try:
         return _literal(side) is None
@@ -5360,6 +5374,9 @@ def _constant_predicate_filter(node: exp.Expression) -> dict[str, Any] | None:
         next(node.find_all(exp.Column), None) is not None
         or next(node.find_all(exp.AggFunc), None) is not None
         or next(node.find_all(exp.Select), None) is not None
+        # An Anonymous call (to_regtype, random, …) needs a live catalog /
+        # session context — a context-free evaluation would fold wrongly.
+        or next(node.find_all(exp.Anonymous), None) is not None
     ):
         return None
     from secantus.sql import scalar

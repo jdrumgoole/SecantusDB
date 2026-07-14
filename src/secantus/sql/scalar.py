@@ -1339,6 +1339,12 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             oid_operand = int(value.strip())
         if oid_operand is not None:
             name = typemap.regtype_from_oid(oid_operand)
+            if name is None and ctx is not None and ctx.catalog is not None:
+                # A user-declared type's oid (enum / domain / composite) —
+                # psycopg's TypeInfo.fetch renders ``t.oid::regtype::text``.
+                from secantus.sql import virtual
+
+                name = virtual.user_type_name(ctx.db, ctx.catalog, oid_operand)
             if name is None:
                 raise errors.SQLError("42704", f"type with OID {oid_operand} does not exist")
             return name
@@ -1625,6 +1631,17 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         return _has_column_privilege(args, ctx)
     if name == "format_type":
         return _format_type(args[0] if args else None, args[1] if len(args) > 1 else None)
+    if name == "to_regtype":
+        # The type's oid, or NULL for an unknown name (unlike ``::regtype``,
+        # which errors) — psycopg's TypeInfo.fetch keys its WHERE on this.
+        if not args or args[0] is None:
+            return None
+        oid = typemap.oid_for_regtype(str(args[0]))
+        if oid is None and ctx is not None and ctx.catalog is not None:
+            from secantus.sql import virtual
+
+            oid = virtual.user_type_oid(ctx.db, ctx.catalog, str(args[0]))
+        return oid
     if name == "pg_get_constraintdef":
         # Render a foreign-key constraint (by oid) the way Postgres does so
         # SQLAlchemy's inspector can reflect it; unknown oid / no ctx → NULL
