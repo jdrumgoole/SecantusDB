@@ -122,6 +122,9 @@ class _Cursor:
     rows: list = field(default_factory=list)
     pos: int = -1
     hold: bool = False
+    # For pg_cursors: the DECLARE's query text and the creation instant.
+    statement: str = ""
+    created: Any = None
 
 
 class ActivityRegistry:
@@ -242,6 +245,9 @@ class Session:
     savepoints: list[Any] = field(default_factory=list)
     # Open server-side cursors by name (``DECLARE … CURSOR`` / ``FETCH`` / ``CLOSE``).
     cursors: dict[str, Any] = field(default_factory=dict)
+    # The connection's wire-level (extended-protocol Parse) prepared statements —
+    # set by ExtendedSession so pg_prepared_statements can list them.
+    wire_prepared: dict[str, Any] = field(default_factory=dict)
     # SQL-level prepared statements (``PREPARE name AS …`` / ``EXECUTE`` /
     # ``DEALLOCATE``). Maps a statement name to ``(query_ast, param_count)``. These
     # are the SQL command-level prepared statements — distinct from the extended

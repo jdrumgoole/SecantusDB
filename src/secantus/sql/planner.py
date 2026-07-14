@@ -2991,6 +2991,23 @@ def substitute_parameters(stmt: exp.Expression, values: list[Any]) -> exp.Expres
         if idx < 0 or idx >= len(values):
             raise errors.syntax_error(f"bind parameter ${param.name} has no value")
         param.replace(_value_to_node(values[idx]))
+    # A statement sqlglot keeps as a raw Command (``DECLARE c CURSOR FOR
+    # SELECT $1::text``) carries its ``$N`` placeholders inside the tail
+    # *text*, invisible to find_all — substitute them textually with rendered
+    # literals. (A ``$N`` inside a quoted string in the tail would be
+    # substituted too; cursor declarations don't hit that in practice.)
+    if isinstance(stmt, exp.Command) and values:
+        tail = stmt.args.get("expression")
+        text = str(tail.this) if isinstance(tail, exp.Literal) else None
+        if text is not None and re.search(r"\$\d+", text):
+
+            def _sub(m: re.Match) -> str:
+                idx = int(m.group(1)) - 1
+                if idx < 0 or idx >= len(values):
+                    raise errors.syntax_error(f"bind parameter ${m.group(1)} has no value")
+                return _value_to_node(values[idx]).sql(dialect="postgres")
+
+            stmt.set("expression", exp.Literal.string(re.sub(r"\$(\d+)", _sub, text)))
     return stmt
 
 

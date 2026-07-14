@@ -663,3 +663,50 @@ def test_copy_runs_inside_the_open_transaction(server):
         cur.execute("select t from ctx")
         assert cur.fetchall() == [("alpha",)]
         conn.commit()
+
+
+def test_server_side_cursor_lifecycle(server):
+    """psycopg's ServerCursor: DECLARE via the extended protocol, then a wire
+    Describe('P', name) — a DECLAREd cursor IS a portal — then FETCH
+    statements, pg_cursors visibility, parameterized declarations (the $N
+    lives inside the raw Command tail), and Close."""
+    with connect(server) as conn:
+        setup = conn.cursor()
+        setup.execute("create table sc (a int4)")
+        setup.execute("insert into sc values (1), (2), (3)")
+        conn.commit()
+
+        with conn.cursor(name="foo") as cur:
+            cur.execute("select a from sc order by a")
+            assert cur.fetchone() == (1,)
+            assert cur.fetchmany(2) == [(2,), (3,)]
+            setup.execute("select name, is_holdable, statement from pg_cursors")
+            (name, hold, statement) = setup.fetchone()
+            assert (name, hold) == ("foo", False)
+            assert "select a from sc" in statement
+
+        # Parameterized DECLARE: psycopg sends the $1 inside the DECLARE text.
+        with conn.cursor(name="pc") as cur:
+            cur.execute("select %s::text", ("hello",))
+            assert cur.fetchall() == [("hello",)]
+
+        # Iteration in itersize batches (FETCH FORWARD n loops).
+        with conn.cursor(name="itc") as cur:
+            cur.itersize = 2
+            cur.execute("select a from sc order by a")
+            assert list(cur) == [(1,), (2,), (3,)]
+
+        setup.execute("select count(*) from pg_cursors")
+        assert setup.fetchone() == (0,)
+        conn.commit()
+
+
+def test_pg_prepared_statements_lists_wire_prepared(server):
+    with connect(server) as conn:
+        cur = conn.cursor()
+        # psycopg prepares after prepare_threshold executions; force it.
+        for _ in range(2):
+            cur.execute("select 1", prepare=True)
+        cur.execute("select name, from_sql from pg_prepared_statements")
+        rows = cur.fetchall()
+        assert rows and all(fs is False for _n, fs in rows)

@@ -1417,6 +1417,55 @@ def _pg_stat_database(db: str, session: Session, storage: Any, catalog: Catalog)
     return rows
 
 
+def _pg_cursors(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """``pg_catalog.pg_cursors`` — this connection's open DECLAREd cursors."""
+    return [
+        {
+            "name": c.name,
+            "statement": getattr(c, "statement", "") or "",
+            "is_holdable": bool(getattr(c, "hold", False)),
+            "is_binary": False,
+            "is_scrollable": True,
+            "creation_time": getattr(c, "created", None),
+        }
+        for c in session.cursors.values()
+    ]
+
+
+def _pg_prepared_statements(
+    db: str, session: Session, storage: Any, catalog: Catalog
+) -> list[dict]:
+    """``pg_catalog.pg_prepared_statements`` — SQL-level ``PREPARE``d statements
+    plus this connection's wire-level (extended Parse) ones."""
+    rows = []
+    for name, entry in (getattr(session, "prepared", None) or {}).items():
+        stmt = entry[0] if isinstance(entry, tuple) else entry
+        text = stmt.sql(dialect="postgres") if hasattr(stmt, "sql") else str(stmt)
+        rows.append(
+            {
+                "name": name,
+                "statement": f"PREPARE {name} AS {text}",
+                "prepare_time": None,
+                "parameter_types": None,
+                "from_sql": True,
+            }
+        )
+    for name, prep in (getattr(session, "wire_prepared", None) or {}).items():
+        if not name:
+            continue  # the unnamed statement isn't listed
+        stmt = getattr(prep, "stmt", None)
+        rows.append(
+            {
+                "name": name,
+                "statement": stmt.sql(dialect="postgres") if stmt is not None else "",
+                "prepare_time": None,
+                "parameter_types": None,
+                "from_sql": False,
+            }
+        )
+    return rows
+
+
 def _pg_prepared_xacts(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     """``pg_catalog.pg_prepared_xacts`` — one row per prepared two-phase
     transaction (#139), from the server-wide ``PreparedXactRegistry``. ``transaction``
@@ -2144,6 +2193,31 @@ _register(
         ("database", "text"),
     ],
     _pg_prepared_xacts,
+)
+_register(
+    "pg_catalog",
+    "pg_cursors",
+    [
+        ("name", "text"),
+        ("statement", "text"),
+        ("is_holdable", "bool"),
+        ("is_binary", "bool"),
+        ("is_scrollable", "bool"),
+        ("creation_time", "timestamptz"),
+    ],
+    _pg_cursors,
+)
+_register(
+    "pg_catalog",
+    "pg_prepared_statements",
+    [
+        ("name", "text"),
+        ("statement", "text"),
+        ("prepare_time", "timestamptz"),
+        ("parameter_types", "text"),
+        ("from_sql", "bool"),
+    ],
+    _pg_prepared_statements,
 )
 _register(
     "pg_catalog",

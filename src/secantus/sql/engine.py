@@ -547,7 +547,15 @@ def _declare_cursor(
         raise errors.program_limit_exceeded(
             f"cursor result too large: {len(rows)} rows exceeds the {MAX_CURSOR_ROWS} limit"
         )
-    session.cursors[name] = _Cursor(name=name, columns=result.columns, rows=rows, pos=-1, hold=hold)
+    session.cursors[name] = _Cursor(
+        name=name,
+        columns=result.columns,
+        rows=rows,
+        pos=-1,
+        hold=hold,
+        statement=f"DECLARE {tail}",
+        created=_dt.datetime.now(_dt.timezone.utc),
+    )
     return SQLResult(command_tag="DECLARE CURSOR")
 
 

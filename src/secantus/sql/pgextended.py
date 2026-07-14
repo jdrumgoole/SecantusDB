@@ -615,6 +615,10 @@ class ExtendedSession:
         self.prepared: dict[str, Prepared] = {}
         self.portals: dict[str, Portal] = {}
         self.skip_until_sync = False
+        # Expose the wire-prepared registry to the Session so the pg_cursors /
+        # pg_prepared_statements virtual tables (whose builders only see the
+        # Session) can list this connection's prepared statements.
+        session.wire_prepared = self.prepared
 
     def process(self, msg_type: str, payload: bytes) -> bytes:
         """Handle one extended-protocol message; return the bytes to send."""
@@ -712,6 +716,12 @@ class ExtendedSession:
         # report the per-column result formats the client asked for in Bind.
         portal = self.portals.get(name)
         if portal is None:
+            # A DECLAREd server-side cursor IS a portal in the v3 protocol —
+            # psycopg's ServerCursor sends Describe('P', name) right after the
+            # DECLARE to learn the row shape.
+            cursor = self.session.cursors.get(name)
+            if cursor is not None:
+                return self._row_desc_or_no_data(list(cursor.columns))
             raise errors.SQLError("34000", f'portal "{name}" does not exist')
         cols = self._describe_columns(self._bound(portal))
         _apply_param_result_oids(cols, portal.prepared)
@@ -779,6 +789,9 @@ class ExtendedSession:
             self.prepared.pop(name, None)
         else:
             self.portals.pop(name, None)
+            # Close('P') on a DECLAREd cursor's name destroys the cursor (a
+            # DECLAREd cursor is a portal in the v3 protocol).
+            self.session.cursors.pop(name, None)
         return pgwire.close_complete()
 
     # -- helpers ------------------------------------------------------------ #
