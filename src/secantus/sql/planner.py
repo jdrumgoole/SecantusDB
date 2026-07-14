@@ -366,6 +366,14 @@ def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
         return value
     if isinstance(datatype, exp.ObjectIdentifier) and str(datatype.this).upper() == "REGCLASS":
         return _regclass_oid(value)
+    if isinstance(datatype, exp.ObjectIdentifier) and str(datatype.this).upper() == "REGTYPE":
+        # ``'name'::regtype`` in a pushdown constant — resolve to the type oid
+        # (built-ins and, via the planning subctx, user-declared types).
+        # Unlike to_regtype(), the cast errors on an unknown name, like PG.
+        oid = _to_regtype(value)
+        if oid is None:
+            raise errors.SQLError("42704", f'type "{value}" does not exist')
+        return oid
     tag = typemap.type_tag_for_sql(datatype) if isinstance(datatype, exp.DataType) else None
     try:
         if tag in ("int2", "int4", "int8"):

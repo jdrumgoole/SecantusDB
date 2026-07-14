@@ -1605,6 +1605,13 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   error instead of `22P02`.** The declared-OID text-param conversion raises 22P02
   correctly; some column-coercion failures during Execute still fall through the
   generic handler. Map `ValueError`-class coercion failures to 22P02 there too.
+- [ ] **Schema-qualified tables** (`CREATE TABLE testschema.t (…)`) — CREATE
+  SCHEMA and schema-qualified user *types* landed; tables in a user schema
+  still raise. Needs the (db, coll) storage key to carry the schema (or a
+  dotted-collection mapping like the types take).
+- [ ] **User-defined range types** (`CREATE TYPE t AS RANGE (subtype = …)`)
+  — psycopg's testrange/testmultirange fixtures create them; needs a range
+  registry + codec plumbing keyed by the minted oid.
 - [ ] **HAVING general-shape residual**: the HAVING lowerers now cover
   comparisons, `IS [NOT] NULL` (incl. computed group-key operands),
   `[NOT] IN` over group keys, and always-unknown NULL-operand folds — but any

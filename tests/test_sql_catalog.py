@@ -416,3 +416,49 @@ GROUP BY name, oid, array_oid, regtype""",
     name, _oid, _arr, regtype, labels = rows[0]
     assert (name, regtype) == ("mood", "mood")
     assert list(labels) == ["sad", "ok", "happy"]
+
+
+def test_create_schema_and_qualified_types(storage, session):
+    def rows(sql):
+        return run_sql(storage, "db", sql, session=session)[-1].rows
+
+    run_sql(storage, "db", "create schema if not exists testschema", session=session)
+    run_sql(storage, "db", "create schema if not exists testschema", session=session)  # idempotent
+    with pytest.raises(Exception) as exc:
+        run_sql(storage, "db", "create schema testschema", session=session)
+    assert getattr(exc.value, "sqlstate", None) == "42P06"
+
+    run_sql(
+        storage,
+        "db",
+        "create type testschema.testcomp as (foo text, bar int8)",
+        session=session,
+    )
+    # pg_namespace carries the schema; pg_type splits the dotted name.
+    assert rows("select nspname from pg_namespace where nspname = 'testschema'") == [
+        ("testschema",)
+    ]
+    got = rows(
+        "select t.typname, n.nspname from pg_type t join pg_namespace n"
+        " on t.typnamespace = n.oid where t.typname = 'testcomp'"
+    )
+    assert got == [("testcomp", "testschema")]
+    # Qualified resolution: to_regtype and the ::regtype literal cast.
+    (oid,) = rows("select to_regtype('testschema.testcomp')")[0]
+    assert rows("select typname from pg_type where oid = 'testschema.testcomp'::regtype") == [
+        ("testcomp",)
+    ]
+    assert rows(f"select {oid}::regtype::text") == [("testschema.testcomp",)]
+
+    # DROP SCHEMA: dependency error without CASCADE, cascade drops the types.
+    with pytest.raises(Exception) as exc:
+        run_sql(storage, "db", "drop schema testschema", session=session)
+    assert getattr(exc.value, "sqlstate", None) == "2BP01"
+    run_sql(storage, "db", "drop schema testschema cascade", session=session)
+    assert rows("select to_regtype('testschema.testcomp')") == [(None,)]
+    run_sql(storage, "db", "drop schema if exists testschema", session=session)
+    with pytest.raises(Exception) as exc:
+        run_sql(storage, "db", "drop schema testschema", session=session)
+    assert getattr(exc.value, "sqlstate", None) == "3F000"
+    # DROP TYPE IF EXISTS tolerates the missing schema.
+    run_sql(storage, "db", "drop type if exists testschema.testcomp cascade", session=session)

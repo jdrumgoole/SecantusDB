@@ -1435,6 +1435,8 @@ def _run_statement(
             return _create_type(stmt, db, catalog)
         if kind == "FUNCTION":
             return _create_function(stmt, db, catalog)
+        if kind == "SCHEMA":
+            return _create_schema(stmt, db, catalog)
         raise errors.feature_not_supported(f"CREATE {kind} is not supported")
 
     if isinstance(stmt, exp.Drop):
@@ -1453,6 +1455,8 @@ def _run_statement(
             return _drop_type(stmt, db, catalog)
         if kind == "FUNCTION":
             return _drop_function(stmt, db, catalog)
+        if kind == "SCHEMA":
+            return _drop_schema(stmt, db, catalog)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
 
     if isinstance(stmt, exp.Alter):
@@ -2673,11 +2677,68 @@ def _drop_sequence(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     return SQLResult(command_tag="DROP SEQUENCE")
 
 
+_BUILTIN_SCHEMAS = ("public", "pg_catalog", "information_schema")
+
+
+def _create_schema(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
+    """``CREATE SCHEMA [IF NOT EXISTS] name`` — a namespace for user-declared
+    types (schema-qualified tables stay 0A000 for now)."""
+    name = stmt.this.args["db"].name
+    if name in _BUILTIN_SCHEMAS or catalog.schema_exists(db, name):
+        if stmt.args.get("exists"):  # IF NOT EXISTS
+            return SQLResult(command_tag="CREATE SCHEMA")
+        raise errors.SQLError("42P06", f'schema "{name}" already exists')
+    catalog.create_schema(db, name)
+    return SQLResult(command_tag="CREATE SCHEMA")
+
+
+def _drop_schema(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
+    """``DROP SCHEMA [IF EXISTS] name [CASCADE]`` — CASCADE drops the schema's
+    types; without it, a non-empty schema is a 2BP01 dependency error."""
+    name = stmt.this.args["db"].name
+    if not catalog.schema_exists(db, name):
+        if stmt.args.get("exists"):
+            return SQLResult(command_tag="DROP SCHEMA")
+        raise errors.SQLError("3F000", f'schema "{name}" does not exist')
+    prefix = f"{name}."
+    enums = [n for n in catalog.list_enums(db) if n.startswith(prefix)]
+    composites = [n for n in catalog.list_composites(db) if n.startswith(prefix)]
+    domains = [n for n in catalog.list_domains(db) if n.startswith(prefix)]
+    if (enums or composites or domains) and not stmt.args.get("cascade"):
+        raise errors.SQLError(
+            "2BP01", f'cannot drop schema "{name}" because other objects depend on it'
+        )
+    for n in enums:
+        catalog.drop_enum(db, n)
+    for n in composites:
+        catalog.drop_composite(db, n)
+    for n in domains:
+        catalog.drop_domain(db, n)
+    catalog.drop_schema(db, name)
+    return SQLResult(command_tag="DROP SCHEMA")
+
+
+def _qualified_type_name(node: exp.Expression, db: str, catalog: Catalog) -> str:
+    """The (possibly schema-qualified) name a CREATE/DROP TYPE targets. Types in
+    a user schema are stored under their dotted name; ``public.`` is the
+    default namespace and stays bare. An unknown schema is a 3F000 error."""
+    schema_id = node.args.get("db")
+    if schema_id is None:
+        return node.name
+    schema = schema_id.name
+    if schema == "public":
+        return node.name
+    if not catalog.schema_exists(db, schema):
+        raise errors.SQLError("3F000", f'schema "{schema}" does not exist')
+    return f"{schema}.{node.name}"
+
+
 def _create_type(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
     """``CREATE TYPE name AS ENUM ('a', 'b', …)`` records the enum's label list;
     ``CREATE TYPE name AS (field type, …)`` records a composite type's ordered
-    fields. Range / base types are not supported."""
-    name = stmt.this.name
+    fields. A schema-qualified name stores under its dotted form. Range / base
+    types are not supported."""
+    name = _qualified_type_name(stmt.this, db, catalog)
     expr = stmt.args.get("expression")
     # Composite form: sqlglot parses the ``(field type, …)`` body as a Schema of
     # ColumnDefs.
@@ -2742,7 +2803,12 @@ def _composite_fields_from_schema(
 
 
 def _drop_type(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
-    name = stmt.this.name
+    try:
+        name = _qualified_type_name(stmt.this, db, catalog)
+    except errors.SQLError:
+        if stmt.args.get("exists"):  # DROP TYPE IF EXISTS tolerates a missing schema
+            return SQLResult(command_tag="DROP TYPE")
+        raise
     dropped = catalog.drop_enum(db, name) or catalog.drop_composite(db, name)
     if not dropped and not stmt.args.get("exists"):
         raise errors.SQLError("42704", f'type "{name}" does not exist')
