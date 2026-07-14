@@ -310,3 +310,32 @@ def test_empty_implicit_aggregate_returns_one_row():
         assert rows("select 1 from em where NULL NOT IN ()") == [(1,)]
     finally:
         st.close()
+
+
+def test_join_aggregate_expression_args_and_where_residual():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table j0 (col0 int4)", session=sess)
+        run_sql(st, "d", "create table j1 (col0 int4)", session=sess)
+        run_sql(st, "d", "insert into j0 values (1), (2)", session=sess)
+        run_sql(st, "d", "insert into j1 values (3)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # Expression aggregate args resolve through the join resolver.
+        assert rows("select max(cor0.col0 + 1) from j0 cor0 cross join j1") == [(3,)]
+        # A WHERE the join $match can't lower routes to the per-row residual.
+        assert rows(
+            "select sum( all - 83 ) from j0 cor0 cross join j0 cor1 where not ( 15 ) is null"
+        ) == [(-332,)]
+        assert rows(
+            "select cor0.col0 from j0 cor0 cross join j1 where - cor0.col0 + 3 > 1 order by 1"
+        ) == [(1,)]
+        # Computed-over-aggregate outputs route to the group-then-evaluate
+        # builder even without GROUP BY or windows.
+        assert rows("select count(*) * 32 from j1 cross join j0") == [(64,)]
+        assert rows("select count(*) + sum(cor0.col0) from j0 cor0 cross join j1") == [(5,)]
+    finally:
+        st.close()

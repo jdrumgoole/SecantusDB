@@ -3431,6 +3431,11 @@ def _plan_pipeline_select(
             return _plan_join_group_window_select(stmt, db, catalog, storage)
         if grouped:
             return _plan_join_group_select(stmt, db, catalog, storage)
+        if _group_agg_nodes(stmt):
+            # A computed-over-aggregate output without GROUP BY (``COUNT(*) * 32``
+            # over a join) — the group-then-evaluate builder handles it with an
+            # empty window list.
+            return _plan_join_group_window_select(stmt, db, catalog, storage)
         return _plan_join_select(stmt, db, catalog, storage)
     from_node = next((v for v in stmt.args.values() if isinstance(v, exp.From)), None)
     if from_node is None:
@@ -4943,6 +4948,21 @@ def _having_to_match(
     raise errors.feature_not_supported(f"unsupported HAVING clause: {node.sql()}")
 
 
+def _join_where_lowerable(stmt: exp.Select, resolve: Resolve) -> bool:
+    """Whether a join's WHERE lowers to a ``$match`` — dry-run of the same
+    ``_expr_to_filter`` the builders push (the join twin of the probe in
+    ``where_needs_per_row``). Subquery-bearing WHEREs keep their existing
+    routing (they need a live SubqueryCtx)."""
+    where = stmt.args.get("where")
+    if where is None or where.this.find(exp.Select) is not None:
+        return True
+    try:
+        _expr_to_filter(where.this, resolve, None)
+    except errors.SQLError:
+        return False
+    return True
+
+
 def _join_resolver(amap: dict[str, tuple[str, TableDef]]) -> Resolve:
     def resolve(node: exp.Expression) -> tuple[str, str]:
         if not isinstance(node, exp.Column):
@@ -5662,7 +5682,7 @@ def _build_join_pipeline(
     where = stmt.args.get("where")
     # A correlated / EXISTS WHERE is left for per-row evaluation (see
     # ``_build_evaluated_join``); only a pushdown-able WHERE becomes a ``$match``.
-    if where is not None and not where_needs_per_row(stmt):
+    if where is not None and not where_needs_per_row(stmt) and _join_where_lowerable(stmt, resolve):
         pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
     return base, amap, resolve, pipeline, derived
 
@@ -5690,7 +5710,7 @@ def _build_outer_join_pipeline(
     base, amap, pipeline = _outer_join_stages(a_alias, a_table, jn, db, catalog, storage, derived)
     resolve = _join_resolver(amap)
     where = stmt.args.get("where")
-    if where is not None and not where_needs_per_row(stmt):
+    if where is not None and not where_needs_per_row(stmt) and _join_where_lowerable(stmt, resolve):
         pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
     return base, amap, resolve, pipeline, derived
 
@@ -6081,6 +6101,14 @@ def _join_accumulator(
 ) -> tuple[dict[str, Any], str]:
     if arg is None:
         return _accumulator_for(func, None, None, filter_cond)
+    arg = _strip_identity_wrappers(arg)
+    if not _is_field_node(arg) and func in ("sum", "avg", "min", "max"):
+        # An expression argument (``SUM(- 83)``, ``MAX(o.qty + 1)``) — lower it
+        # the way the single-table accumulator does.
+        body = _to_agg_expr(arg, resolve)
+        if filter_cond is not None:
+            body = {"$cond": [filter_cond, body, 0 if func == "sum" else None]}
+        return {f"${func}": body}, _agg_out_tag(func, _infer_scalar_tag(arg, resolve))
     path, tag = resolve(arg)
     return _accumulator_for(func, path, tag, filter_cond)
 
@@ -6089,7 +6117,13 @@ def _agg_key(
     func: str, arg: exp.Expression | None, resolve: Resolve, distinct: bool = False
 ) -> str:
     """A hashable identity for an aggregate (for HAVING accumulator dedup)."""
-    return f"{func}:{'d' if distinct else ''}:{'*' if arg is None else resolve(arg)[0]}"
+    if arg is None:
+        ident = "*"
+    elif _is_field_node(arg):
+        ident = resolve(arg)[0]
+    else:
+        ident = arg.sql()  # expression argument — identity by SQL text
+    return f"{func}:{'d' if distinct else ''}:{ident}"
 
 
 def _plan_join_group_select(
@@ -6103,7 +6137,12 @@ def _plan_join_group_select(
     # ``_build_join_pipeline``); it's filtered per joined row after the join prefix
     # and before the ``$group`` below. ``residual_split`` marks that boundary.
     where_node = stmt.args.get("where")
-    residual = where_node.this if (where_node is not None and where_needs_per_row(stmt)) else None
+    residual = (
+        where_node.this
+        if where_node is not None
+        and (where_needs_per_row(stmt) or not _join_where_lowerable(stmt, resolve))
+        else None
+    )
     residual_split = len(pipeline)
 
     # Computed GROUP BY keys (``GROUP BY lower(c.name)`` / ``o.qty + 1``) — lower each
@@ -7765,7 +7804,12 @@ def _build_evaluated_join(
     # A correlated / EXISTS WHERE wasn't pushed into the pipeline (see
     # ``_build_join_pipeline``); carry it for per-joined-row evaluation.
     where_node = stmt.args.get("where")
-    residual = where_node.this if (where_node is not None and where_needs_per_row(stmt)) else None
+    residual = (
+        where_node.this
+        if where_node is not None
+        and (where_needs_per_row(stmt) or not _join_where_lowerable(stmt, resolve))
+        else None
+    )
     don = _distinct_on(stmt)
     enum_orders = _evaluated_enum_orders(order, lambda node: _column_for_order_node(node, amap))
     return EvaluatedSelectPlan(
