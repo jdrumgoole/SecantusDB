@@ -721,3 +721,150 @@ def test_computed_comparison_null_operand_excluded():
         assert sorted(rows("select col1 from cc where col1 * 2 <> col2")) == [(2,), (5,)]
     finally:
         st.close()
+
+
+def test_having_is_null_forms():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table hn (col1 int4, col2 int4)", session=sess)
+        run_sql(st, "d", "insert into hn values (1, 10), (2, null)", session=sess)
+
+        def rows(sql):
+            return sorted(run_sql(st, "d", sql, session=sess)[-1].rows)
+
+        # Bare, aggregate, and computed operands; direct and negated forms.
+        assert rows("select col2 from hn group by col2 having col2 is null") == [(None,)]
+        assert rows("select col2 from hn group by col2 having col2 is not null") == [(10,)]
+        assert rows("select sum(col2) from hn group by col1 having sum(col2) is not null") == [
+            (10,)
+        ]
+        assert rows("select col2 + col2 from hn group by col2 having ( - col2 ) is not null") == [
+            (20,)
+        ]
+        assert rows("select col1 from hn group by col1 having not ( col1 + col1 ) is null") == [
+            (1,),
+            (2,),
+        ]
+        # The join HAVING lowerer mirrors the same forms.
+        assert rows(
+            "select cor0.col2 from hn cor0 cross join hn cor1 "
+            "group by cor0.col2 having (- cor0.col2) is not null"
+        ) == [(10,)]
+    finally:
+        st.close()
+
+
+def test_constant_join_on():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table ca (a int4)", session=sess)
+        run_sql(st, "d", "create table cb (b int4)", session=sess)
+        run_sql(st, "d", "insert into ca values (1), (2)", session=sess)
+        run_sql(st, "d", "insert into cb values (7)", session=sess)
+
+        def rows(sql):
+            return sorted(run_sql(st, "d", sql, session=sess)[-1].rows)
+
+        # Constant ON folds three-valued: FALSE/unknown null-pads a LEFT JOIN
+        # (one row per left row) and empties an INNER; TRUE is the cartesian.
+        assert rows("select 11 from cb left join ca on 80 = 70") == [(11,)]
+        assert rows("select b, a from cb left join ca on false") == [(7, None)]
+        assert rows("select 11 from cb join ca on 80 = 70") == []
+        assert rows("select count(*) from cb join ca on null") == [(0,)]
+        assert rows("select 11 from cb left join ca on 80 = 80") == [(11,), (11,)]
+    finally:
+        st.close()
+
+
+def test_join_group_by_duplicate_column_names():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table dj (col0 int4, col1 int4)", session=sess)
+        run_sql(st, "d", "insert into dj values (22, 6), (28, 57), (82, 44)", session=sess)
+
+        def rows(sql):
+            return sorted(run_sql(st, "d", sql, session=sess)[-1].rows)
+
+        # GROUP BY the same bare column name from two aliases must group by
+        # BOTH (9 groups over the 3x3 cross join), not collapse to one key.
+        assert (
+            rows("select cor0.col1 from dj cor0 cross join dj cor1 group by cor1.col1, cor0.col1")
+            == [(6,)] * 3 + [(44,)] * 3 + [(57,)] * 3
+        )
+        # ...on the computed-projection (group-window) path too.
+        assert (
+            rows(
+                "select 50 + - cor0.col1 from dj cor0 cross join dj cor1 "
+                "group by cor1.col1, cor0.col1"
+            )
+            == [(-7,)] * 3 + [(6,)] * 3 + [(44,)] * 3
+        )
+        # Both duplicate keys project side by side.
+        assert (
+            len(
+                rows(
+                    "select cor0.col1, cor1.col1 from dj cor0 cross join dj cor1 "
+                    "group by cor1.col1, cor0.col1"
+                )
+            )
+            == 9
+        )
+    finally:
+        st.close()
+
+
+def test_join_grouped_distinct_dedup():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table ga (col1 int4)", session=sess)
+        run_sql(st, "d", "create table gb (col0 int4)", session=sess)
+        run_sql(st, "d", "insert into ga values (0), (0), (81)", session=sess)
+        run_sql(st, "d", "insert into gb values (22), (28)", session=sess)
+
+        def rows(sql):
+            return sorted(run_sql(st, "d", sql, session=sess)[-1].rows)
+
+        # DISTINCT over a subset of the join's group keys dedups.
+        assert rows(
+            "select distinct cor1.col0 from ga cor0 cross join gb cor1 "
+            "group by cor0.col1, cor1.col0"
+        ) == [(22,), (28,)]
+    finally:
+        st.close()
+
+
+def test_having_null_operand_and_in_over_group_keys():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table hg (col0 int4, col2 int4)", session=sess)
+        run_sql(st, "d", "insert into hg values (1, 10), (2, null)", session=sess)
+
+        def rows(sql):
+            return sorted(run_sql(st, "d", sql, session=sess)[-1].rows)
+
+        # Always-unknown NULL-operand predicates exclude every group, through
+        # any NOT nesting.
+        assert rows("select col0 from hg group by col0 having not null in ( - col0 )") == []
+        assert rows("select col0 from hg group by col0 having not null = col0") == []
+        assert (
+            rows("select col0 from hg group by col0 having not null not between - col0 and null")
+            == []
+        )
+        # Doubly-negated IS NULL flips back.
+        assert rows("select col2 from hg group by col2 having not col2 is not null") == [(None,)]
+        # Membership over group keys, three-valued: NOT x IN (x) never holds,
+        # x IN (x) holds only for non-null keys.
+        assert rows("select col0 from hg group by col0 having not col0 in ( col0 )") == []
+        assert rows("select col2 from hg group by col2 having col2 in ( col2 )") == [(10,)]
+        # An always-unknown JOIN ON never matches: LEFT null-pads per left row.
+        assert rows(
+            "select cor0.col0 from hg cor0 left join hg cor1 on not null < - cor0.col0 "
+            "group by cor0.col0"
+        ) == [(1,), (2,)]
+    finally:
+        st.close()
