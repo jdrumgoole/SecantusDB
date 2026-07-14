@@ -631,3 +631,35 @@ def test_wide_numeric_binary_param(server):
         for d in wide:
             assert conn.execute("select %b", (d,)).fetchone() == (d,), d
             assert conn.execute("select %b::text", (d,)).fetchone() == (str(d),), d
+
+
+def test_copy_runs_inside_the_open_transaction(server):
+    """COPY must run inside the session's transaction block: it sees
+    same-transaction DDL (psycopg's fixtures do CREATE TABLE + COPY in one
+    block), reads pending rows on the way out, and its writes roll back with
+    the block — previously the COPY path ran outside ``use_user_transaction``,
+    so the CREATE was invisible and copied rows survived a ROLLBACK."""
+    with connect(server) as conn:
+        cur = conn.cursor()
+        # CREATE + COPY IN + read back, all in one uncommitted block.
+        cur.execute("create table ctx (id serial primary key, t text)")
+        with cur.copy("copy ctx (t) from stdin") as copy:
+            copy.write_row(("alpha",))
+        cur.execute("select t from ctx")
+        assert cur.fetchall() == [("alpha",)]
+        conn.commit()
+
+        # COPY OUT sees rows inserted earlier in the same block.
+        cur.execute("insert into ctx (t) values ('beta')")
+        with cur.copy("copy ctx (t) to stdout") as copy:
+            data = b"".join(bytes(c) for c in copy)
+        assert data == b"alpha\nbeta\n"
+        conn.rollback()
+
+        # Rows copied inside an aborted block vanish with it.
+        with cur.copy("copy ctx (t) from stdin") as copy:
+            copy.write_row(("gamma",))
+        conn.rollback()
+        cur.execute("select t from ctx")
+        assert cur.fetchall() == [("alpha",)]
+        conn.commit()
