@@ -319,6 +319,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 ### P2 — polish
 
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
+- [ ] **`StarletteDeprecationWarning` from fastapi's testclient import** — the six
+  admin websocket tests each emit "Using `httpx` with `starlette.testclient` is
+  deprecated; install `httpx2`" from fastapi's own import shim. The last warnings
+  in the default suite. Fix is a dev-dependency bump (fastapi/starlette/httpx2)
+  in its own PR — no runtime code involved.
 
 ## 7. Python → Rust rewrite (in progress)
 
@@ -1600,6 +1605,18 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   error instead of `22P02`.** The declared-OID text-param conversion raises 22P02
   correctly; some column-coercion failures during Execute still fall through the
   generic handler. Map `ValueError`-class coercion failures to 22P02 there too.
+- [ ] **HAVING with a computed `IS [NOT] NULL` term** (`HAVING (- col2) IS NOT
+  NULL`, `HAVING NOT (col1 + col1) IS NULL`) raises `0A000 unsupported HAVING
+  clause` — `_having_to_match` only lowers bare-column / aggregate terms. Next:
+  a HAVING-residual route mirroring the WHERE probes (the group-window paths
+  already carry `residual_having` for subqueries). First error in the
+  sqllogictest `random/groupby` files (sweep notes in `tasks/sql-gauges-plan.md`).
+- [ ] **Constant JOIN ON condition** (`LEFT JOIN tab0 ON 80 = 70`) raises
+  `ON must compare columns` — the join builder requires a column equi-join.
+  A constant-false ON over LEFT JOIN should null-pad every left row.
+- [ ] **Multi-way comma-join performance**: sqllogictest `select4.test`/`select5.test`
+  4-way joins with equi-WHEREs exceed 300s — the pipeline nests `$lookup`s without
+  pushing the WHERE's equi-conditions into the lookup stages.
 
 - [ ] **Wire server: simple + extended protocol, trust + SCRAM auth, optional TLS.**
   `pgserver.py` speaks v3 startup, simple `Query` (P1), extended `Parse`/`Bind`/

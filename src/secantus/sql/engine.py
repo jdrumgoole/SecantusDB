@@ -1813,6 +1813,7 @@ def _run_select(
     stmt: exp.Select, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
     _validate_locks(stmt)  # FOR UPDATE / SHARE: single-node no-op, but OF-targets validated.
+    planner.unwrap_paren_join_from(stmt)  # FROM (a JOIN b) — grouping parens, not a derived table
     planner.rewrite_pg_typeof(stmt, _pg_typeof_table(storage, db, catalog, stmt.find(exp.Table)))
     # A base-less set-returning function as the row source: ``FROM generate_series(…)``
     # / ``FROM unnest(…)`` / … or a bare ``SELECT generate_series(…)``.

@@ -35,7 +35,19 @@ def test_stop_drains_in_flight_change_stream_before_close(tmp_path) -> None:
         coll.insert_one({"_id": 1})
         # A long await time parks the server-side getMore on the oplog CV.
         cs = coll.watch(max_await_time_ms=10_000)
-        watcher = threading.Thread(target=lambda: [cs.try_next() for _ in range(2)], daemon=True)
+
+        def drive_getmores() -> None:
+            # Errors here are the *expected* teardown path: stop() tears the
+            # connection down under the first in-flight try_next (that unblock
+            # is what the test proves), and the second try_next races the
+            # finally block's mc.close() — pymongo raising InvalidOperation /
+            # network errors in this thread is not a failure. Left unhandled it
+            # surfaces as a PytestUnhandledThreadExceptionWarning.
+            with contextlib.suppress(Exception):
+                for _ in range(2):
+                    cs.try_next()
+
+        watcher = threading.Thread(target=drive_getmores, daemon=True)
         watcher.start()
         time.sleep(0.3)  # let the getMore enter the oplog-CV wait
         assert srv._active_conns >= 1, "expected an in-flight connection thread"

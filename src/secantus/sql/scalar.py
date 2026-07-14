@@ -324,6 +324,8 @@ def _as_text(value: Any) -> str:
 
 def _pg_div(left: Any, right: Any) -> Any:
     # Postgres integer division truncates toward zero; ``/`` on mixed/float is real.
+    if right == 0:
+        raise errors.SQLError("22012", "division by zero")
     if isinstance(left, int) and isinstance(right, int):
         q = abs(left) // abs(right)
         return -q if (left < 0) ^ (right < 0) else q
@@ -332,6 +334,8 @@ def _pg_div(left: Any, right: Any) -> Any:
 
 def _pg_mod(left: Any, right: Any) -> Any:
     # Postgres mod takes the sign of the dividend (unlike Python ``%``).
+    if right == 0:
+        raise errors.SQLError("22012", "division by zero")
     r = math.fmod(left, right)
     return int(r) if isinstance(left, int) and isinstance(right, int) else r
 
@@ -595,7 +599,11 @@ def _eval_nullif(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
 
 
 def _eval_coalesce(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
-    for v in _variadic(node, scope, ctx):
+    # Lazy, like Postgres: arguments after the first non-null are never
+    # evaluated (``COALESCE(-14, 1/0)`` must not raise division_by_zero).
+    args = ([node.this] if node.this is not None else []) + list(node.expressions)
+    for a in args:
+        v = evaluate(a, scope, ctx)
         if v is not None:
             return v
     return None
@@ -1204,7 +1212,10 @@ def _eval_case(node: exp.Case, scope: Scope, ctx: ScalarContext) -> Any:
     for branch in node.args.get("ifs", []):
         cond = branch.this
         if base is not None:
-            matched = base_val == evaluate(cond, scope, ctx)
+            # Operand form compares with SQL equality: a NULL operand or WHEN
+            # value never matches (``CASE NULL WHEN NULL THEN …`` skips).
+            when_val = evaluate(cond, scope, ctx)
+            matched = base_val is not None and when_val is not None and base_val == when_val
         else:
             matched = _truthy(evaluate(cond, scope, ctx))
         if matched:

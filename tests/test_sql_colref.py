@@ -222,12 +222,29 @@ def _filter_for(where_sql):
 
 
 def test_colref_lowers_to_expr():
-    assert _filter_for("qty > shipped") == {"$expr": {"$gt": ["$qty", "$shipped"]}}
+    # Both sides are null-guarded: BSON total order is two-valued (NULL sorts
+    # below numbers), but SQL's unknown never satisfies a WHERE.
+    assert _filter_for("qty > shipped") == {
+        "$expr": {
+            "$and": [
+                {"$ne": ["$qty", None]},
+                {"$ne": ["$shipped", None]},
+                {"$gt": ["$qty", "$shipped"]},
+            ]
+        }
+    }
 
 
 def test_arithmetic_lowers_to_expr():
+    product = {"$multiply": ["$cost", 1.5]}
     assert _filter_for("price < cost * 1.5") == {
-        "$expr": {"$lt": ["$price", {"$multiply": ["$cost", 1.5]}]}
+        "$expr": {
+            "$and": [
+                {"$ne": ["$price", None]},
+                {"$ne": [product, None]},
+                {"$lt": ["$price", product]},
+            ]
+        }
     }
 
 
