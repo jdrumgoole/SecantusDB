@@ -1368,6 +1368,18 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `timezone_offset_ms` helper; previously both ignored it). Fractional seconds stay
   deferred (BSON is millisecond-only). The Python server already supports the
   remaining `$dateFromString`/`$dateToString` directive edges.
+- [ ] **Log-family domain errors diverge from mongod (both servers).** For an
+  out-of-domain argument (`$log10`/`$ln` of a non-positive number, `$log` with a
+  non-positive value/base or base 1, `$sqrt` of a negative number) mongod raises a
+  Location error (e.g. `28761` "$log10's argument must be a positive number"),
+  whereas both SecantusDB servers return **`null`** (Python's `math.*` guarded by
+  `if v > 0`, faithfully mirrored in Rust). Both servers agree with each other; only
+  the mongod error is not reproduced. A faithful fix raises the per-op Location code
+  on **both** engines (Python module + Rust `secantus-core`) and updates the
+  expression parity corpus. Low priority — no data/correctness issue, valid inputs
+  are exact. Found by the three-way differential sweep 2026-07-14. (The `$log10`
+  operator itself is now native on the Rust server; previously it errored with a
+  generic `BadValue` even for valid input.)
 - [ ] **`$group` accumulators absent from both servers** (a differential probe
   2026-07-06 found these error on *both* — a dual-server gap, not Rust-only):
   `$median` / `$percentile` (t-digest accumulators). Remaining **expression** forms
