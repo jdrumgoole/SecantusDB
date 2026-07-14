@@ -668,6 +668,34 @@ def validate_psycopg(c: Context) -> None:
     print("\nWrote docs/validation-report-psycopg.md")
 
 
+@task(name="validate-slt")
+def validate_slt(c: Context) -> None:
+    """Run the sqllogictest corpus against a SecantusPGServer daemon.
+
+    The SQL-server correctness gauge (tasks/sql-gauges-plan.md G1): the
+    SQLite-originated sqllogictest corpus, vendored unmodified, executed by
+    sqllogictest-rs (``cargo install sqllogictest-bin``) over real pgwire —
+    one fresh daemon per file. Generates docs/validation-report-slt.md.
+    Python server only — the Rust server has no SQL front end.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/sqllogictest/test").exists():
+        c.run("git submodule update --init vendor/sqllogictest", pty=True)
+    pathlib.Path(".validation").mkdir(exist_ok=True)
+    c.run(
+        "PYTHONPATH=. uv run --no-sync python -m slt_validation.runner",
+        pty=True,
+        warn=True,
+    )
+    c.run(
+        "uv run --no-sync python -m slt_validation.generate_report "
+        ".validation/slt-raw.json docs/validation-report-slt.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-slt.md")
+
+
 @task(name="validate-ruby")
 def validate_ruby(c: Context, server: str = "python") -> None:
     """Run mongo-ruby-driver's tests against an embedded SecantusDB.

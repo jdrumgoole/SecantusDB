@@ -37,3 +37,7 @@
 [submodule "vendor/psycopg"]
 	path = vendor/psycopg
 	url = https://github.com/psycopg/psycopg
+[submodule "vendor/sqllogictest"]
+	path = vendor/sqllogictest
+	url = https://github.com/gregrahn/sqllogictest.git
+	shallow = true
