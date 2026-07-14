@@ -1298,6 +1298,16 @@ def _evaluated_value_rows(
         docs = apply_pipeline([d for d in docs if keep_base(d)], plan.pipeline[split:], ctx)
     else:
         docs = apply_pipeline(docs, plan.pipeline, ctx)
+    if not docs:
+        # An implicit whole-table aggregate over zero input rows still returns one
+        # row (same synthesis as execute_pipeline_select, here for the
+        # group-then-evaluate path: ``SELECT -AVG(x) FROM t WHERE <matches nothing>``).
+        tail = (
+            plan.pipeline[plan.pre_where_split :] if plan.pre_where is not None else plan.pipeline
+        )
+        synthesized = _empty_implicit_aggregate_row(tail, ctx)
+        if synthesized is not None:
+            docs = synthesized
     # A correlated / EXISTS WHERE that couldn't push into the pipeline is applied
     # per joined row here (before windows / projection see the survivors); the
     # scope resolves outer columns via the join resolver, and the subquery reads
@@ -1600,8 +1610,10 @@ def _empty_implicit_aggregate_row(pipeline: list, ctx: Any) -> list | None:
             continue
         if _is_count_acc(spec):
             doc[name] = 0
-        elif isinstance(spec, dict) and "$push" in spec:
-            doc[name] = []  # pushed collections (bit_agg / sorted aggs) fold over []
+        elif isinstance(spec, dict) and ("$push" in spec or "$addToSet" in spec):
+            # Pushed / distinct-set collections (bit_agg / sorted aggs / DISTINCT
+            # reductions) fold over [].
+            doc[name] = []
         else:
             doc[name] = None
     return apply_pipeline([doc], pipeline[gidx + 1 :], ctx)

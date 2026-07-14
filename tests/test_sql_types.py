@@ -339,3 +339,385 @@ def test_join_aggregate_expression_args_and_where_residual():
         assert rows("select count(*) + sum(cor0.col0) from j0 cor0 cross join j1") == [(5,)]
     finally:
         st.close()
+
+
+def test_fromless_aggregates_fold_over_one_row():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # PG feeds a FROM-less aggregation exactly one implicit row.
+        assert rows("select count(*)") == [(1,)]
+        assert rows("select all + count( * ) as col0") == [(1,)]
+        assert rows("select count(22), count(null)") == [(1, 0)]
+        assert rows("select sum(distinct 73), min(all -32), avg(5)") == [(73, -32, 5)]
+        assert rows("select nullif( - count( * ), 67 ) + 54") == [(53,)]
+        assert rows("select max(3) where 1 = 2") == []
+    finally:
+        st.close()
+
+
+def test_empty_aggregate_row_on_evaluated_group_path():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table ev (col1 int4, col2 int4)", session=sess)
+        run_sql(st, "d", "insert into ev values (2, 3)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # Computed-over-aggregate outputs (the group-then-evaluate path) still
+        # synthesize the one whole-table-aggregate row over zero input rows.
+        assert rows("select - avg( - - col1 ) from ev where null = col1 + 69") == [(None,)]
+        assert rows(
+            "select - count( * ) / 47 from ev where not col2 not in ( cast(null as real) )"
+        ) == [(0,)]
+        assert rows("select count(*) * 32 from ev where col1 > 99") == [(0,)]
+    finally:
+        st.close()
+
+
+def test_group_by_computed_projections():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table gp (col0 int4, col2 int4)", session=sess)
+        run_sql(st, "d", "insert into gp values (1, 7), (4, 7)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # Arbitrary expressions over group keys (and bare constants) project.
+        assert rows("select - col0 * 84 + 38 from gp group by col0 order by 1") == [
+            (-298,),
+            (-46,),
+        ]
+        assert rows("select distinct - 53 from gp group by col2") == [(-53,)]
+        assert rows(
+            "select case when col0 > 2 then 1 else 0 end from gp group by col0 order by 1"
+        ) == [
+            (0,),
+            (1,),
+        ]
+    finally:
+        st.close()
+
+
+def test_parenthesized_join_from():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table pj (col0 int4)", session=sess)
+        run_sql(st, "d", "insert into pj values (1), (2)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # FROM-parens are grouping, not a derived table needing an alias.
+        assert rows("select count(*) from ( pj as cor0 cross join pj cor1 )") == [(4,)]
+        assert rows(
+            "select min(all - 32), count(*) * count(*) from ( pj as cor0 cross join pj cor1 )"
+        ) == [(-32, 16)]
+    finally:
+        st.close()
+
+
+def test_constant_lhs_in_subquery():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table ci (x int4)", session=sess)
+        run_sql(st, "d", "insert into ci values (1)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        assert rows("select 1 from ci where 1 in (select 1)") == [(1,)]
+        assert rows("select 1 from ci where 1 in (select 2)") == []
+        assert rows("select 1 from ci where 1 not in (select 2)") == [(1,)]
+        assert rows("select 1 from ci where null in (select 1)") == []
+        assert rows("select 1 from ci where 1 not in (select null)") == []
+    finally:
+        st.close()
+
+
+def test_three_valued_null_semantics_on_pushdown():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table tn (a int4, d int4)", session=sess)
+        run_sql(st, "d", "insert into tn values (1, 120), (2, 200), (3, null)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # A NULL operand makes these unknown — excluded, never matched. Mongo's
+        # bare $ne / $nor / $nin / $in-with-None would include the NULL row.
+        assert rows("select a from tn where d <> 120") == [(2,)]
+        assert rows("select a from tn where not (d = 120)") == [(2,)]
+        assert rows("select a from tn where d not between 110 and 150") == [(2,)]
+        assert rows("select a from tn where d not in (120, 121)") == [(2,)]
+        assert rows("select a from tn where d not in (120, null)") == []
+        assert rows("select a from tn where d in (200, null)") == [(2,)]
+        assert rows("select a from tn where not (d < 130)") == [(2,)]
+        # De Morgan: a definitively-false conjunct rescues the NULL row.
+        assert rows("select a from tn where not (a = 1 and d = 120) order by a") == [(2,), (3,)]
+        assert rows("select a from tn where not (a = 9 or d = 120) order by a") == [(2,)]
+        # NOT over a pattern match is null-guarded.
+        assert rows("select a from tn where not (cast(d as text) like '12%')") == [(2,)]
+    finally:
+        st.close()
+
+
+def test_float8_wire_text_rendering():
+    assert typemap.to_pg_text(12.0, "float8") == b"12"
+    assert typemap.to_pg_text(-0.0, "float8") == b"-0"
+    assert typemap.to_pg_text(0.5, "float8") == b"0.5"
+    assert typemap.to_pg_text(1e20, "float8") == b"1e+20"
+    assert typemap.to_pg_text(float("nan"), "float8") == b"NaN"
+    assert typemap.to_pg_text(float("inf"), "float8") == b"Infinity"
+    assert typemap.to_pg_text(float("-inf"), "float8") == b"-Infinity"
+    assert typemap.to_pg_text([1.0, 2.5], "float8[]") == b"{1,2.5}"
+
+
+def test_count_and_distinct_expression_aggregates():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table ce (col0 int4)", session=sess)
+        run_sql(st, "d", "insert into ce values (1), (2), (3)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # COUNT over a literal is not COUNT(*) — it counts non-null evaluations.
+        assert rows("select count(73) from ce") == [(3,)]
+        assert rows("select count(null) from ce") == [(0,)]
+        assert rows("select count(null) from ce cor0 cross join ce cor1") == [(0,)]
+        # DISTINCT over expression arguments.
+        assert rows("select sum(distinct 77) from ce") == [(77,)]
+        assert rows("select count(distinct 44) from ce") == [(1,)]
+        assert rows("select distinct - count(distinct 74) from ce cor0 cross join ce cor1") == [
+            (-1,)
+        ]
+    finally:
+        st.close()
+
+
+def test_sum_over_all_null_is_null():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table sn (a int4, g int4)", session=sess)
+        run_sql(st, "d", "insert into sn values (null, 1), (null, 1)", session=sess)
+        run_sql(st, "d", "create table sj (x int4)", session=sess)
+        run_sql(st, "d", "insert into sj values (7)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # PG: SUM with zero non-null inputs is NULL, not Mongo's $sum 0.
+        assert rows("select sum(a) from sn") == [(None,)]
+        assert rows("select sum(- cast(null as integer)) from sn") == [(None,)]
+        assert rows("select sum(distinct a) from sn") == [(None,)]
+        assert rows("select sum(a) from sn group by g") == [(None,)]
+        assert rows("select sum(sn.a) from sn cross join sj") == [(None,)]
+        assert rows("select sum(sn.a) + 1 from sn cross join sj") == [(None,)]
+    finally:
+        st.close()
+
+
+def test_grouped_star_and_distinct_dedup():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table gs (col0 int4, col1 int4)", session=sess)
+        run_sql(st, "d", "insert into gs values (83, 0), (26, 0), (43, 81)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # SELECT * under GROUP BY over every column expands to the group keys.
+        assert sorted(rows("select distinct * from gs group by col1, col0")) == [
+            (26, 0),
+            (43, 81),
+            (83, 0),
+        ]
+        # SELECT DISTINCT over grouped output dedups the projected rows.
+        assert sorted(rows("select distinct col1 from gs group by col1, col0")) == [(0,), (81,)]
+    finally:
+        st.close()
+
+
+def test_division_by_zero_sqlstate():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        with pytest.raises(Exception) as exc:
+            run_sql(st, "d", "select 1 / 0", session=sess)
+        assert getattr(exc.value, "sqlstate", None) == "22012"
+        with pytest.raises(Exception) as exc:
+            run_sql(st, "d", "select 1 % 0", session=sess)
+        assert getattr(exc.value, "sqlstate", None) == "22012"
+    finally:
+        st.close()
+
+
+def test_join_where_residual_not_dropped():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table jw (a int4)", session=sess)
+        run_sql(st, "d", "insert into jw values (1), (2)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # A WHERE the join $match can't lower must filter per-row, not vanish.
+        assert rows("select * from jw, jw cor0 where ( null ) between null and null") == []
+    finally:
+        st.close()
+
+
+def test_lazy_coalesce_and_constant_having():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table ch (col2 int4)", session=sess)
+        run_sql(st, "d", "insert into ch values (1), (2)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # COALESCE is lazy: arms after the first non-null never evaluate.
+        assert rows("select coalesce(-14, 1/0, -93)") == [(-14,)]
+        assert rows("select coalesce(-14, 1/0) from ch") == [(-14,), (-14,)]
+        # Constant HAVING folds three-valued: unknown excludes every group.
+        assert rows("select col2 from ch group by col2 having not null is null") == []
+        assert rows("select col2 from ch group by col2 having not null < null") == []
+        assert len(rows("select col2 from ch group by col2 having null is null")) == 2
+        # DISTINCT aggregates over zero rows synthesize NULL, not a crash.
+        assert rows("select sum(distinct col2) from ch where 1 = 2") == [(None,)]
+        assert rows("select avg(distinct col2) from ch where null is not null") == [(None,)]
+    finally:
+        st.close()
+
+
+def test_operand_case_null_never_matches():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table oc (a int4, e int4)", session=sess)
+        run_sql(st, "d", "insert into oc values (null, null), (1, 2)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # Operand-form CASE uses SQL equality: NULL never matches NULL.
+        assert rows(
+            "select case a + 1 when e then 444 else 555 end from oc order by a nulls first"
+        ) == [(555,), (444,)]
+    finally:
+        st.close()
+
+
+def test_expression_aggregates_do_not_share_accumulators():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table ea (col1 int4)", session=sess)
+        run_sql(st, "d", "insert into ea values (81)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # Two expression aggregates of the same function must not collide on
+        # the (func, None) dedup key and share one accumulator.
+        assert rows("select - 62 + max(3) * max(- 94 - - 16) from ea") == [(-296,)]
+        # ...while identical aggregates still dedup to one accumulator.
+        assert rows("select max(col1) + max(col1) from ea") == [(162,)]
+    finally:
+        st.close()
+
+
+def test_integer_division_truncates_in_aggregate_args():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table dv (col1 int4)", session=sess)
+        run_sql(st, "d", "insert into dv values (81)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # PG integer '/' truncates toward zero; Mongo's $divide is real division.
+        assert rows("select min(col1 / -99) from dv") == [(0,)]
+        assert rows("select min(col1 / 2) from dv") == [(40,)]
+        assert rows("select min(col1 / 2.0) from dv") == [(40.5,)]
+    finally:
+        st.close()
+
+
+def test_join_group_window_where_residual_not_dropped():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table jg (a int4)", session=sess)
+        run_sql(st, "d", "insert into jg values (1), (2), (3)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # A WHERE the join $match can't lower still filters before the $group
+        # on the computed-over-aggregate (group-window) path.
+        assert rows(
+            "select count(*) + 93 from ( jg as cor0 cross join jg cor1 ) where not null is null"
+        ) == [(93,)]
+    finally:
+        st.close()
+
+
+def test_wrapped_null_literal_comparisons_match_nothing():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table wn (col1 int4)", session=sess)
+        run_sql(st, "d", "insert into wn values (51), (67)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # NULL comparison operands fold to match-nothing even when wrapped
+        # (parens, negation, cast) — the $expr lowering's BSON-order compare
+        # would otherwise match rows.
+        assert rows("select col1 from wn where 51 <> ( null )") == []
+        assert rows("select col1 from wn where ( null ) <> 89 * 41 + col1") == []
+        assert rows("select col1 from wn where - cast ( null as integer ) <> 90 * col1") == []
+        assert rows("select col1 from wn where not (51 = ( null ))") == []
+    finally:
+        st.close()
+
+
+def test_computed_comparison_null_operand_excluded():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+        run_sql(st, "d", "create table cc (col1 int4, col2 int4)", session=sess)
+        run_sql(st, "d", "insert into cc values (5, 7), (2, 3)", session=sess)
+
+        def rows(sql):
+            return run_sql(st, "d", sql, session=sess)[-1].rows
+
+        # A computed comparison whose side evaluates NULL is unknown — excluded.
+        # (The $expr lowering's BSON-order compare would match: NULL <> 19.)
+        assert (
+            rows("select col1 from cc where col2 + 76 / (cast(null as integer) + col1) <> 19") == []
+        )
+        assert rows("select col1 from cc where col1 + col2 > 8") == [(5,)]
+        assert sorted(rows("select col1 from cc where col1 * 2 <> col2")) == [(2,), (5,)]
+    finally:
+        st.close()

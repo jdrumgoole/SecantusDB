@@ -741,6 +741,19 @@ _ARITH_OPS: dict[type, str] = {
 }
 
 
+def _int_division_operands(node: exp.Expression, resolve: Resolve) -> bool:
+    """Whether both ``/`` operands type as integers (→ truncating PG division).
+    An unresolvable operand tag counts as non-integer (real division, the safe
+    default for schema-on-read shapes)."""
+    for operand in (node.this, node.expression):
+        try:
+            if _infer_scalar_tag(operand, resolve) not in _INT_TAG_ORDER:
+                return False
+        except errors.SQLError:
+            return False
+    return True
+
+
 def _to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any:
     """Lower a scalar WHERE operand to a Mongo aggregation expression for ``$expr``.
 
@@ -755,12 +768,16 @@ def _to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any:
     if isinstance(node, exp.Cast):
         return _to_agg_expr(node.this, resolve)
     if type(node) in _ARITH_OPS:
-        return {
+        lowered = {
             _ARITH_OPS[type(node)]: [
                 _to_agg_expr(node.this, resolve),
                 _to_agg_expr(node.expression, resolve),
             ]
         }
+        if isinstance(node, exp.Div) and _int_division_operands(node, resolve):
+            # PG integer ``/`` truncates toward zero; Mongo's $divide is real.
+            return {"$trunc": [lowered, 0]}
+        return lowered
     if isinstance(node, exp.Bracket) and node.expressions:
         idx_node = node.expressions[0]
         if not isinstance(idx_node, exp.Slice):
@@ -895,6 +912,28 @@ def _eval_in_subquery(query_node: exp.Expression, subctx: SubqueryCtx, tag: str)
     return [typemap.coerce(row[0], tag) for row in res.rows]
 
 
+def _constant_in_result(node: exp.In, subctx: SubqueryCtx | None) -> bool | None:
+    """Fold a constant-LHS ``IN`` (value list or subquery) to its three-valued
+    outcome: True / False / None-for-unknown. ``IN`` over an empty set is FALSE
+    even for a NULL left side; a NULL left side or a NULL candidate otherwise
+    makes a non-match unknown (matters under NOT: ``1 NOT IN (NULL, 2)`` is
+    unknown, not true)."""
+    left = _literal(node.this)
+    if node.args.get("query") is not None:
+        if subctx is None:
+            raise errors.feature_not_supported("IN (subquery) is not supported")
+        candidates = _eval_in_subquery(node.args["query"], subctx, "any")
+    else:
+        candidates = [_literal(e) for e in node.expressions]
+    if not candidates:
+        return False
+    if left is None:
+        return None
+    if any(c == left for c in candidates if c is not None):
+        return True
+    return None if any(c is None for c in candidates) else False
+
+
 def _eval_scalar_subquery(query_node: exp.Expression, subctx: SubqueryCtx, tag: str) -> Any:
     select = _validate_scalar_subquery(_subquery_select(query_node))
     res = _run_inner_select(select, subctx)
@@ -928,6 +967,34 @@ def _comparison_subquery_filter(
     return {field: value} if op == "$eq" else {field: {op: value}}
 
 
+def _null_guarded_expr_cmp(
+    op: str, left: exp.Expression, right: exp.Expression, resolve: Resolve
+) -> dict[str, Any]:
+    """A computed comparison lowered to ``$expr`` with SQL three-valued
+    semantics. Mongo's aggregation comparisons use BSON total order (NULL sorts
+    below numbers, two-valued: ``NULL <> 19`` is true, ``NULL <= 0`` is true),
+    so guard both sides non-null — a NULL operand makes the comparison unknown,
+    and unknown never satisfies a WHERE."""
+    lexpr = _to_agg_expr(left, resolve)
+    rexpr = _to_agg_expr(right, resolve)
+    return {
+        "$expr": {"$and": [{"$ne": [lexpr, None]}, {"$ne": [rexpr, None]}, {op: [lexpr, rexpr]}]}
+    }
+
+
+def _null_literal_operand(side: exp.Expression) -> bool:
+    """Whether a comparison operand is a literal that folds to SQL NULL —
+    ``NULL``, ``(NULL)``, ``- CAST(NULL AS INTEGER)``, …"""
+    if isinstance(side, exp.Null):
+        return True
+    if not _is_literalish(side):
+        return False
+    try:
+        return _literal(side) is None
+    except errors.SQLError:
+        return False
+
+
 def _expr_to_filter(
     node: exp.Expression, resolve: Resolve, subctx: SubqueryCtx | None = None
 ) -> dict[str, Any]:
@@ -940,12 +1007,13 @@ def _expr_to_filter(
     if isinstance(node, exp.Boolean):
         return {} if node.this else {"$nor": [{}]}
 
-    # A comparison against a bare NULL literal (``col <> NULL`` — NOT the
-    # ``IS NULL`` form, which parses as exp.Is) is always unknown in SQL, and
-    # unknown never satisfies a WHERE: match nothing. Mongo's ``$ne: null``
-    # would instead match every doc whose field isn't null — the opposite.
+    # A comparison against a NULL literal (``col <> NULL`` / ``51 <> (NULL)`` /
+    # ``- CAST(NULL AS INT) <> x`` — NOT the ``IS NULL`` form, which parses as
+    # exp.Is) is always unknown in SQL, and unknown never satisfies a WHERE:
+    # match nothing. Mongo's ``$ne: null`` (or a BSON-order ``$expr``
+    # comparison) would instead match rows — the opposite.
     if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)) and (
-        isinstance(node.this, exp.Null) or isinstance(node.expression, exp.Null)
+        _null_literal_operand(node.this) or _null_literal_operand(node.expression)
     ):
         return {"$nor": [{}]}
 
@@ -977,7 +1045,7 @@ def _expr_to_filter(
         if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
             field, _ = _field(inner.this, resolve)
             return {field: {"$ne": None}}
-        return {"$nor": [_expr_to_filter(inner, resolve, subctx)]}
+        return _negated_filter(inner, resolve, subctx)
 
     if isinstance(node, exp.Exists):
         raise errors.feature_not_supported("EXISTS (subquery) is not supported")
@@ -1017,7 +1085,7 @@ def _expr_to_filter(
             if tag == "citext":
                 return _citext_cmp_filter(field, "$eq", _literal(pair[1]))
             return {field: typemap.coerce(_literal(pair[1]), tag)}
-        return {"$expr": {"$eq": [_to_agg_expr(left, resolve), _to_agg_expr(right, resolve)]}}
+        return _null_guarded_expr_cmp("$eq", left, right, resolve)
 
     if isinstance(node, exp.NEQ):
         left, right = node.this, node.expression
@@ -1026,8 +1094,11 @@ def _expr_to_filter(
             field, tag = _field(pair[0], resolve)
             if tag == "citext":
                 return _citext_cmp_filter(field, "$ne", _literal(pair[1]))
-            return {field: {"$ne": typemap.coerce(_literal(pair[1]), tag)}}
-        return {"$expr": {"$ne": [_to_agg_expr(left, resolve), _to_agg_expr(right, resolve)]}}
+            # SQL ``<>`` is unknown (not true) for a NULL operand; Mongo's bare
+            # ``$ne`` would match NULL/missing rows, so guard the field non-null.
+            value = typemap.coerce(_literal(pair[1]), tag)
+            return {"$and": [{field: {"$ne": value}}, {field: {"$ne": None}}]}
+        return _null_guarded_expr_cmp("$ne", left, right, resolve)
 
     for cls, (op, flipped) in _CMP_OPS.items():
         if isinstance(node, cls):
@@ -1042,24 +1113,29 @@ def _expr_to_filter(
                 if tag == "citext":
                     return _citext_cmp_filter(field, flipped, _literal(left))
                 return {field: {flipped: typemap.coerce(_literal(left), tag)}}
-            return {
-                "$expr": {
-                    _EXPR_CMP[cls]: [_to_agg_expr(left, resolve), _to_agg_expr(right, resolve)]
-                }
-            }
+            return _null_guarded_expr_cmp(_EXPR_CMP[cls], left, right, resolve)
 
     if isinstance(node, exp.In):
+        if not _is_field_node(node.this) and _is_literalish(node.this):
+            # Constant-LHS membership (``1 IN (2)`` / ``1 IN (SELECT 1)``) folds to
+            # match-all / match-nothing (unknown never satisfies a WHERE, and IN
+            # over an empty set is FALSE even for a NULL left side).
+            return {} if _constant_in_result(node, subctx) is True else {"$nor": [{}]}
         field, tag = _field(node.this, resolve)
         if node.args.get("query") is not None:
             if subctx is None:
                 raise errors.feature_not_supported("IN (subquery) is not supported")
-            return {field: {"$in": _eval_in_subquery(node.args["query"], subctx, tag)}}
-        if tag == "citext":
-            # Case-insensitive membership: fold the field and every candidate.
-            folded = [str(_literal(e)).lower() for e in node.expressions]
-            return {"$expr": {"$in": [{"$toLower": f"${field}"}, folded]}}
-        values = [typemap.coerce(_literal(e), tag) for e in node.expressions]
-        return {field: {"$in": values}}
+            values = _eval_in_subquery(node.args["query"], subctx, tag)
+        else:
+            if tag == "citext":
+                # Case-insensitive membership: fold the field and every candidate.
+                folded = [str(_literal(e)).lower() for e in node.expressions]
+                return {"$expr": {"$in": [{"$toLower": f"${field}"}, folded]}}
+            values = [typemap.coerce(_literal(e), tag) for e in node.expressions]
+        # A NULL candidate can only turn a non-match unknown — and unknown never
+        # satisfies a WHERE — so drop it; Mongo's ``$in`` with ``None`` would
+        # instead match NULL rows.
+        return {field: {"$in": [v for v in values if v is not None]}}
 
     if isinstance(node, exp.Between):
         field, tag = _field(node.this, resolve)
@@ -1141,6 +1217,120 @@ def _expr_to_filter(
         return {field: True}
 
     raise errors.feature_not_supported(f"unsupported WHERE clause: {node.sql()}")
+
+
+_NEG_CMP_NODE: dict[type, type] = {
+    exp.EQ: exp.NEQ,
+    exp.NEQ: exp.EQ,
+    exp.GT: exp.LTE,
+    exp.GTE: exp.LT,
+    exp.LT: exp.GTE,
+    exp.LTE: exp.GT,
+}
+
+
+def _negated_filter(
+    inner: exp.Expression, resolve: Resolve, subctx: SubqueryCtx | None
+) -> dict[str, Any]:
+    """Lower ``NOT <inner>`` with SQL three-valued semantics.
+
+    Mongo's ``$nor`` is two-valued: it matches rows where ``<inner>`` is
+    *unknown* (a NULL operand), which SQL's ``NOT`` must not — ``d NOT BETWEEN
+    110 AND 150`` excludes a NULL ``d``. So push the negation into the tree —
+    De Morgan over AND/OR, operator flips at comparison leaves — and lower the
+    positive rewrite. A shape with no exact rewrite gets a null-guarded
+    ``$nor`` when it predicates a single field (there unknown ⇔ field IS
+    NULL); anything else raises feature_not_supported so the statement routes
+    to the per-row evaluated path, whose scalar NOT is three-valued."""
+    while isinstance(inner, exp.Paren):
+        inner = inner.this
+    if isinstance(inner, exp.Boolean):
+        return _expr_to_filter(exp.Boolean(this=not inner.this), resolve, subctx)
+    if isinstance(inner, exp.Null):
+        return {"$nor": [{}]}  # NOT NULL is unknown: match nothing
+    if isinstance(inner, exp.Not):
+        # NOT NOT p ≡ p under WHERE (unknown is excluded either way).
+        return _expr_to_filter(inner.this, resolve, subctx)
+    if isinstance(inner, exp.Is):
+        # IS [NOT] NULL / IS TRUE / IS DISTINCT FROM are two-valued: $nor is exact.
+        return {"$nor": [_expr_to_filter(inner, resolve, subctx)]}
+    if isinstance(inner, exp.And):
+        return {
+            "$or": [
+                _negated_filter(inner.this, resolve, subctx),
+                _negated_filter(inner.expression, resolve, subctx),
+            ]
+        }
+    if isinstance(inner, exp.Or):
+        return _merge_and(
+            [
+                _negated_filter(inner.this, resolve, subctx),
+                _negated_filter(inner.expression, resolve, subctx),
+            ]
+        )
+    neg_cls = _NEG_CMP_NODE.get(type(inner))
+    if neg_cls is not None:
+        left, right = inner.this, inner.expression
+        if _null_literal_operand(left) or _null_literal_operand(right):
+            return {"$nor": [{}]}  # a comparison with NULL never turns true under NOT
+        if (
+            _field_literal_pair(left, right) is None
+            and not isinstance(left, exp.Subquery)
+            and not isinstance(right, exp.Subquery)
+        ):
+            # A computed comparison would lower to $expr, whose BSON-order
+            # comparisons are two-valued over NULL — per-row instead.
+            raise errors.feature_not_supported(f"NOT over a computed comparison: {inner.sql()}")
+        return _expr_to_filter(neg_cls(this=left.copy(), expression=right.copy()), resolve, subctx)
+    if isinstance(inner, exp.Between):
+        this, low, high = inner.this, inner.args["low"], inner.args["high"]
+        if not (_is_field_node(this) and _is_literalish(low) and _is_literalish(high)):
+            raise errors.feature_not_supported(f"NOT over a computed BETWEEN: {inner.sql()}")
+        return {
+            "$or": [
+                _expr_to_filter(exp.LT(this=this.copy(), expression=low.copy()), resolve, subctx),
+                _expr_to_filter(exp.GT(this=this.copy(), expression=high.copy()), resolve, subctx),
+            ]
+        }
+    if isinstance(inner, exp.In):
+        if not _is_field_node(inner.this) and _is_literalish(inner.this):
+            # NOT IN is true only when IN is definitively false — unknown
+            # (``1 NOT IN (NULL, 2)``) stays excluded.
+            return {} if _constant_in_result(inner, subctx) is False else {"$nor": [{}]}
+        field, tag = _field(inner.this, resolve)
+        if inner.args.get("query") is not None:
+            if subctx is None:
+                raise errors.feature_not_supported("IN (subquery) is not supported")
+            values = _eval_in_subquery(inner.args["query"], subctx, tag)
+        elif tag == "citext":
+            return {
+                "$and": [
+                    {"$nor": [_expr_to_filter(inner, resolve, subctx)]},
+                    {field: {"$ne": None}},
+                ]
+            }
+        else:
+            values = [typemap.coerce(_literal(e), tag) for e in inner.expressions]
+        if any(v is None for v in values):
+            return {"$nor": [{}]}  # x NOT IN (…, NULL) is never true
+        return {"$and": [{field: {"$nin": values}}, {field: {"$ne": None}}]}
+    # Generic single-field fallback: NOT p ≡ (p is false AND field non-null),
+    # sound exactly when p is unknown iff its one field is NULL — no NULL
+    # literal, no subquery, and a non-$expr positive lowering ($expr compares
+    # in two-valued BSON order).
+    pos = _expr_to_filter(inner, resolve, subctx)
+    if inner.find(exp.Null) is None and inner.find(exp.Select) is None:
+        fields = set()
+        for c in inner.find_all(exp.Column):
+            try:
+                fields.add(resolve(c)[0])
+            except errors.SQLError:
+                fields.clear()
+                break
+        if len(fields) == 1 and "$expr" not in str(pos):
+            field = next(iter(fields))
+            return {"$and": [{"$nor": [pos]}, {field: {"$ne": None}}]}
+    raise errors.feature_not_supported(f"unsupported NOT: NOT {inner.sql()}")
 
 
 def _json_value(node: exp.Expression) -> Any:
@@ -2004,10 +2194,47 @@ def _infer_value_tag(value: Any) -> str:
 _LITERAL_NODES = (exp.Literal, exp.Boolean, exp.Null, exp.Neg, exp.Paren)
 
 
+def _is_pure_literal(node: exp.Expression) -> bool:
+    """Whether the subtree is literals all the way down (``- ( 5 )``) — a Neg /
+    Paren wrapping a function call (``- NULLIF(…)``) is not, and must go to the
+    scalar evaluator rather than ``_literal``."""
+    if isinstance(node, (exp.Neg, exp.Paren)):
+        return _is_pure_literal(node.this)
+    return isinstance(node, (exp.Literal, exp.Boolean, exp.Null))
+
+
 def _const_scope(node: exp.Expression) -> Any:
     """The scope for a FROM-less SELECT: any column reference is undefined."""
     name = node.name if isinstance(node, exp.Column) else node.sql()
     raise errors.undefined_column(name)
+
+
+_SINGLE_ROW_AGGS = (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)
+
+
+def _fold_single_row_aggregates(node: exp.Expression, ctx: Any) -> exp.Expression:
+    """Fold aggregates in a FROM-less SELECT to constants.
+
+    Postgres feeds a FROM-less aggregation exactly one implicit row, so
+    ``COUNT(*)`` is 1, ``COUNT(e)`` is 0/1 by ``e``'s NULL-ness, and
+    ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` of ``e`` are ``e`` itself."""
+    from secantus.sql import scalar
+
+    def fold(n: exp.Expression) -> exp.Expression:
+        if not isinstance(n, _SINGLE_ROW_AGGS):
+            return n
+        arg = n.this
+        if isinstance(arg, exp.Distinct):
+            if len(arg.expressions) != 1:
+                raise errors.feature_not_supported(f"unsupported aggregate: {n.sql()}")
+            arg = arg.expressions[0]
+        if isinstance(n, exp.Count):
+            if arg is None or isinstance(arg, exp.Star):
+                return exp.Literal.number(1)
+            return exp.Literal.number(0 if scalar.evaluate(arg, _const_scope, ctx) is None else 1)
+        return _value_to_node(scalar.evaluate(arg, _const_scope, ctx))
+
+    return node.transform(fold)
 
 
 _SEQUENCE_FUNCS = frozenset({"nextval", "currval", "setval", "lastval"})
@@ -2046,7 +2273,11 @@ def plan_constant_select(
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         target = e.this if isinstance(e, exp.Alias) else e
-        if isinstance(target, _LITERAL_NODES):
+        if target.find(exp.AggFunc) is not None:
+            if alias is None and isinstance(target, _SINGLE_ROW_AGGS):
+                alias = target.key  # Postgres names a bare aggregate output "count" etc.
+            target = _fold_single_row_aggregates(target.copy(), ctx)
+        if isinstance(target, _LITERAL_NODES) and _is_pure_literal(target):
             value = _literal(target)
             # Tag from the AST, not the Python value — a decimal constant
             # (``SELECT 1.5``) is numeric in Postgres, which the float can't show.
@@ -2923,6 +3154,21 @@ def _agg_expr_arg(node: exp.Expression) -> exp.Expression | None:
     return None
 
 
+def _single_agg_key(node: exp.Expression, agg: tuple[str, str | None, bool]) -> tuple:
+    """Accumulator-dedup identity for a single-table aggregate. ``_aggregate_of``
+    reports ``col=None`` for both ``COUNT(*)`` and any *expression* argument, so
+    two different expression aggregates (``MAX(3)`` / ``MAX(a - b)``) would
+    collide on ``(func, None, distinct)`` and share one accumulator; identify
+    expression args by their SQL text instead (the join paths' ``_agg_key``
+    already does)."""
+    func, col, distinct = agg
+    if col is not None:
+        return (func, col, distinct)
+    arg = _agg_expr_arg(node)
+    ident = arg.sql() if arg is not None and not isinstance(arg, exp.Star) else None
+    return (func, ident, distinct)
+
+
 def _aggregate_of(node: exp.Expression) -> tuple[str, str | None, bool] | None:
     """If ``node`` (or its alias target) is an aggregate, return
     ``(func, column, distinct)``. ``column`` is None for ``COUNT(*)``; the
@@ -3313,7 +3559,13 @@ def _agg_arg_to_expr(node: exp.Expression, table: TableDef) -> Any:
     }
     op = _arith_ops.get(type(node))
     if op is not None and node.expression is not None:
-        return {op: [_agg_arg_to_expr(node.this, table), _agg_arg_to_expr(node.expression, table)]}
+        lowered = {
+            op: [_agg_arg_to_expr(node.this, table), _agg_arg_to_expr(node.expression, table)]
+        }
+        if isinstance(node, exp.Div) and _int_division_operands(node, table_resolver(table)):
+            # PG integer ``/`` truncates toward zero; Mongo's $divide is real.
+            return {"$trunc": [lowered, 0]}
+        return lowered
     fname = None
     if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
         fname = node.expression.name
@@ -3358,12 +3610,18 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     if not aggs:
         return False
     # A lone COUNT(*) (no GROUP BY, no FILTER) is served by the simpler find path.
+    # ``COUNT(<literal>)`` also reports ``col=None`` — check the arg really is
+    # ``*`` so it stays on the pipeline path.
     if len(stmt.expressions) == 1:
-        only = _aggregate_of(stmt.expressions[0])
+        e = stmt.expressions[0]
+        only = _aggregate_of(e)
+        inner = e.this if isinstance(e, exp.Alias) else e
         if (
             only is not None
             and only == ("count", None, False)
-            and _agg_filter_where(stmt.expressions[0]) is None
+            and isinstance(inner, exp.Count)
+            and (inner.this is None or isinstance(inner.this, exp.Star))
+            and _agg_filter_where(e) is None
         ):
             return False
     return True
@@ -3397,6 +3655,31 @@ def _lookup_table_def(
     return None
 
 
+def unwrap_paren_join_from(stmt: exp.Select) -> None:
+    """Hoist a parenthesized join out of FROM, in place.
+
+    ``FROM (a CROSS JOIN b)`` parses as an alias-less ``Subquery`` wrapping the
+    first table with the joins attached to it — not a derived table. Postgres
+    treats the parens as pure grouping, so rewrite to ``FROM a CROSS JOIN b``
+    (inner joins precede any outer-level joins). An *aliased* subquery is a real
+    derived table and is left alone."""
+    frm = stmt.args.get("from_") or stmt.args.get("from")
+    if frm is None:
+        return
+    node = frm.this
+    while (
+        isinstance(node, exp.Subquery)
+        and not node.alias
+        and isinstance(node.this, (exp.Table, exp.Subquery))
+        and node.this.args.get("joins")
+    ):
+        inner = node.this
+        joins = inner.args.pop("joins", None) or []
+        stmt.set("joins", joins + (stmt.args.get("joins") or []))
+        frm.set("this", inner)
+        node = inner
+
+
 def plan_pipeline_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
@@ -3412,6 +3695,7 @@ def plan_pipeline_select(
 def _plan_pipeline_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
+    unwrap_paren_join_from(stmt)
     if stmt.args.get("joins"):
         if _has_grouping_sets(stmt):
             if _select_has_window(stmt):
@@ -3426,8 +3710,14 @@ def _plan_pipeline_select(
             for e in stmt.expressions
         )
         grouped = bool(stmt.args.get("group") or stmt.args.get("having") or has_agg)
-        if _select_has_window(stmt) and (grouped or _group_agg_nodes(stmt)):
-            # Window functions over a JOIN + GROUP BY (or implicit aggregation).
+        if (
+            _select_has_window(stmt)
+            or _select_has_computed_aggregate(stmt)
+            or (grouped and _group_projection_needs_evaluation(stmt))
+        ) and (grouped or _group_agg_nodes(stmt)):
+            # Window functions — or an expression *wrapping* an aggregate
+            # (``COUNT(*) * COUNT(*)``) — over a JOIN + GROUP BY (or implicit
+            # aggregation) run the wrapping phase via the evaluated executor.
             return _plan_join_group_window_select(stmt, db, catalog, storage)
         if grouped:
             return _plan_join_group_select(stmt, db, catalog, storage)
@@ -3468,6 +3758,8 @@ def _plan_pipeline_select(
         for e in stmt.expressions
     )
     grouped = bool(stmt.args.get("group") or stmt.args.get("having") or has_aggregate)
+    if grouped:
+        _expand_grouped_star(stmt, table)
     if _has_grouping_sets(stmt):
         if _select_has_window(stmt):
             plan: PipelineSelectPlan | EvaluatedSelectPlan = _plan_grouping_sets_window_select(
@@ -3481,6 +3773,7 @@ def _plan_pipeline_select(
         or _select_has_computed_aggregate(stmt)
         or _having_has_subquery(stmt)
         or (grouped and _select_projects_subquery(stmt))
+        or (grouped and _group_projection_needs_evaluation(stmt))
     ) and (grouped or _group_agg_nodes(stmt)):
         # Window functions computed over GROUP BY aggregates, an expression that
         # *wraps* an aggregate (``sum(x) + 1``), or a subquery in HAVING — all run the
@@ -3697,12 +3990,16 @@ def _accumulator(
         col is None
         and arg_node is not None
         and not isinstance(arg_node, exp.Star)
-        and func in ("sum", "avg", "min", "max")
+        and func in ("count", "sum", "avg", "min", "max")
     ):
         # An expression argument (``SUM(- 83)``, ``MAX(col0 + 1)``) lowers to a
         # Mongo aggregation expression (_agg_arg_to_expr raises 0A000 for
         # shapes it can't lower).
         body = _agg_arg_to_expr(arg_node, table)
+        if func == "count":  # COUNT(<expr>) counts non-null values (COUNT(NULL) is 0)
+            matched = {"$ne": [body, None]}
+            cond = {"$and": [filter_cond, matched]} if filter_cond is not None else matched
+            return {"$sum": {"$cond": [cond, 1, 0]}}, "int8"
         if filter_cond is not None:
             body = {"$cond": [filter_cond, body, 0 if func == "sum" else None]}
         tag = _agg_out_tag(func, _infer_scalar_tag(arg_node, table_resolver(table)))
@@ -3755,31 +4052,56 @@ def _distinct_reduction(func: str, set_field: str) -> dict[str, Any]:
         "$reduce": {"input": nonnull, "initialValue": 0, "in": {"$add": ["$$value", "$$this"]}}
     }
     if func == "sum":
-        return total
+        # PG: SUM over zero non-null values is NULL, not 0.
+        return {"$cond": [{"$eq": [{"$size": nonnull}, 0]}, None, total]}
     if func == "avg":
         cnt = {"$size": nonnull}
         return {"$cond": [{"$eq": [cnt, 0]}, None, {"$divide": [total, cnt]}]}
     raise errors.feature_not_supported(f"DISTINCT is not supported for {func}()")
 
 
+def _guard_sum_null(
+    fname: str,
+    value: Any,
+    filter_cond: Any,
+    names: _NameAllocator,
+    accumulators: dict[str, Any],
+    reductions: dict[str, Any],
+) -> None:
+    """Postgres' SUM over zero non-null contributing values is NULL; Mongo's
+    ``$sum`` yields 0. Pair the sum with a non-null contribution counter and
+    rewrite the output to NULL when nothing contributed (``value`` is the raw
+    aggregation expression the sum reads, before any FILTER folding)."""
+    nn = names.fresh(f"{fname}__nn")
+    matched = {"$ne": [value, None]}
+    cond = {"$and": [filter_cond, matched]} if filter_cond is not None else matched
+    accumulators[nn] = {"$sum": {"$cond": [cond, 1, 0]}}
+    reductions[fname] = {"$cond": [{"$gt": [f"${nn}", 0]}, f"${fname}", None]}
+
+
 def _register_distinct_agg(
     func: str,
-    field: str,
+    field: str | None,
     tag: str | None,
     alias: str | None,
     names: _NameAllocator,
     accumulators: dict[str, Any],
     reductions: dict[str, Any],
     fcond: Any = None,
+    value: Any = None,
 ) -> tuple[str, str]:
     """Wire a DISTINCT count/sum/avg: a ``$addToSet`` accumulator collects the
     distinct values; a post-``$group`` ``$addFields`` reduces the set. Returns
-    the output field name and its type tag. With a ``FILTER (WHERE cond)``
+    the output field name and its type tag. The distinct value is the ``field``
+    path, or the pre-lowered aggregation expression ``value`` when the argument
+    isn't a bare column (``SUM(DISTINCT 77)``). With a ``FILTER (WHERE cond)``
     (``fcond``), a non-matching row contributes ``None`` to the set, which the
     reduction's NULL filter drops — so only matching rows' distinct values count
     (SQL ``agg(DISTINCT x) FILTER (WHERE cond)`` semantics)."""
     set_name = names.fresh(f"{alias or func}__distinct")
-    accumulators[set_name] = {"$addToSet": _push_filtered(f"${field}", fcond)}
+    accumulators[set_name] = {
+        "$addToSet": _push_filtered(value if field is None else f"${field}", fcond)
+    }
     fname = names.fresh(alias or func)
     reductions[fname] = _distinct_reduction(func, f"${set_name}")
     return fname, _agg_out_tag(func, tag)
@@ -4266,28 +4588,50 @@ def _plan_grouping_sets_window_select(
         agg = _aggregate_of(node)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
+        agg = _single_agg_key(node, agg)
         if agg in agg_fields:
             return agg_fields[agg]
-        func, col, distinct = agg
+        func, col, distinct = _aggregate_of(node)
         where = _agg_filter_where(node)
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if distinct and func in _DISTINCT_FUNCS:
             if col is None:
-                raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
-            fname, tag = _register_distinct_agg(
-                func,
-                table.field_for(col),
-                table.type_for(col),
-                None,
-                names,
-                accumulators,
-                reductions,
-                fcond,
-            )
+                arg_node = _agg_expr_arg(node)
+                if arg_node is None or isinstance(arg_node, exp.Star):
+                    raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+                fname, tag = _register_distinct_agg(
+                    func,
+                    None,
+                    _infer_scalar_tag(arg_node, table_resolver(table)),
+                    None,
+                    names,
+                    accumulators,
+                    reductions,
+                    fcond,
+                    value=_agg_arg_to_expr(arg_node, table),
+                )
+            else:
+                fname, tag = _register_distinct_agg(
+                    func,
+                    table.field_for(col),
+                    table.type_for(col),
+                    None,
+                    names,
+                    accumulators,
+                    reductions,
+                    fcond,
+                )
         else:
             acc, tag = _accumulator(func, col, table, fcond, arg_node=_agg_expr_arg(node))
             fname = names.fresh(func)
             accumulators[fname] = acc
+            if func == "sum":
+                value = (
+                    f"${table.field_for(col)}"
+                    if col is not None
+                    else _agg_arg_to_expr(_agg_expr_arg(node), table)
+                )
+                _guard_sum_null(fname, value, fcond, names, accumulators, reductions)
         agg_fields[agg] = fname
         field_tags[fname] = tag
         agg_field_names.append(fname)
@@ -4476,22 +4820,45 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             func, col, distinct = agg
             if distinct and func in _DISTINCT_FUNCS:
                 if col is None:
-                    raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
-                fname, tag = _register_distinct_agg(
-                    func,
-                    table.field_for(col),
-                    table.type_for(col),
-                    alias,
-                    names,
-                    accumulators,
-                    reductions,
-                    fcond,
-                )
+                    arg_node = _agg_expr_arg(e)
+                    if arg_node is None or isinstance(arg_node, exp.Star):
+                        raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+                    # An expression DISTINCT argument (``SUM(DISTINCT 77)``)
+                    # pushes the lowered expression into the distinct set.
+                    fname, tag = _register_distinct_agg(
+                        func,
+                        None,
+                        _infer_scalar_tag(arg_node, table_resolver(table)),
+                        alias,
+                        names,
+                        accumulators,
+                        reductions,
+                        fcond,
+                        value=_agg_arg_to_expr(arg_node, table),
+                    )
+                else:
+                    fname, tag = _register_distinct_agg(
+                        func,
+                        table.field_for(col),
+                        table.type_for(col),
+                        alias,
+                        names,
+                        accumulators,
+                        reductions,
+                        fcond,
+                    )
             else:
                 acc, tag = _accumulator(func, col, table, fcond, arg_node=_agg_expr_arg(e))
                 fname = names.fresh(alias or func)
                 accumulators[fname] = acc
-            agg_fields[(func, col, distinct)] = fname
+                if func == "sum":
+                    value = (
+                        f"${table.field_for(col)}"
+                        if col is not None
+                        else _agg_arg_to_expr(_agg_expr_arg(e), table)
+                    )
+                    _guard_sum_null(fname, value, fcond, names, accumulators, reductions)
+            agg_fields[_single_agg_key(e, (func, col, distinct))] = fname
             project[fname] = f"${fname}"
             out_columns.append((fname, tag))
         else:
@@ -4531,6 +4898,15 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     if having_match is not None:
         pipeline.append({"$match": having_match})
     pipeline.append({"$project": project})
+    if stmt.args.get("distinct") and not post_aggregates and not order_aggs:
+        # SELECT DISTINCT over grouped output (``SELECT DISTINCT col1 … GROUP BY
+        # col1, col0``) dedups the projected rows — a second $group over every
+        # output column. Skipped when the executor still has to finish
+        # post-aggregates (their values aren't final in the pipeline) or when a
+        # hidden ORDER BY aggregate must survive to the $sort.
+        dedup_id = {name: f"${name}" for name, _tag in out_columns}
+        pipeline.append({"$group": {"_id": dedup_id}})
+        pipeline.append({"$project": {"_id": 0, **{n: f"$_id.{n}" for n in dedup_id}}})
     _append_sort_limit(pipeline, stmt, out_columns, table, order_aggs=order_aggs)
     return PipelineSelectPlan(
         table.collection,
@@ -4573,6 +4949,64 @@ def _is_bare_aggregate(e: exp.Expression) -> bool:
         or _string_agg_arg(e) is not None
         or _ordered_set_agg(e) is not None
     )
+
+
+def _expand_grouped_star(stmt: exp.Select, table: TableDef) -> None:
+    """Expand ``SELECT *`` under GROUP BY into explicit columns, in place, when
+    every table column is a group key (Postgres allows the star there since
+    each output is a grouping column). Left untouched otherwise — the group
+    planners' own 42803 check reports the offending column."""
+    if not any(
+        isinstance(e.this if isinstance(e, exp.Alias) else e, exp.Star) for e in stmt.expressions
+    ):
+        return
+    group_node = stmt.args.get("group")
+    if group_node is None:
+        return
+    try:
+        group_cols = {_column_name(g) for g in group_node.expressions}
+    except errors.SQLError:
+        return
+    if not all(c.name in group_cols for c in table.columns):
+        return
+    new_exprs: list[exp.Expression] = []
+    for e in stmt.expressions:
+        inner = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(inner, exp.Star):
+            new_exprs.extend(exp.column(c.name) for c in table.columns)
+        else:
+            new_exprs.append(e)
+    stmt.set("expressions", new_exprs)
+
+
+def _group_projection_needs_evaluation(stmt: exp.Select) -> bool:
+    """Whether a grouped SELECT projects an expression the ``$group`` planner's
+    projection loop can't shape — not a bare column / ``*`` and not one of the
+    recognized aggregate forms (``-col0 * 84 + 38`` over a group key, a bare
+    constant under GROUP BY, a CASE over group keys, …). Those route to the
+    group-then-evaluate path, which computes arbitrary expressions over the
+    grouped rows. A projection that *is* a computed GROUP BY key is excluded —
+    the group planners rewrite those to synthetic key columns themselves."""
+    group_node = stmt.args.get("group")
+    group_sqls = {g.sql() for g in group_node.expressions} if group_node is not None else set()
+    for e in stmt.expressions:
+        inner = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(inner, (exp.Star, exp.Column)):
+            continue
+        if inner.sql() in group_sqls:
+            continue
+        if (
+            _grouping_args(e) is not None
+            or _array_agg_arg(e) is not None
+            or _jsonb_object_agg_args(e) is not None
+            or _range_agg_arg(e) is not None
+            or _string_agg_arg(e) is not None
+            or _ordered_set_agg(e) is not None
+            or _aggregate_of(e) is not None
+        ):
+            continue
+        return True
+    return False
 
 
 def _select_has_computed_aggregate(stmt: exp.Select) -> bool:
@@ -4733,28 +5167,50 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
         agg = _aggregate_of(node)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
+        agg = _single_agg_key(node, agg)
         if agg in agg_fields:
             return agg_fields[agg]
-        func, col, distinct = agg
+        func, col, distinct = _aggregate_of(node)
         where = _agg_filter_where(node)
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if distinct and func in _DISTINCT_FUNCS:
             if col is None:
-                raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
-            fname, tag = _register_distinct_agg(
-                func,
-                table.field_for(col),
-                table.type_for(col),
-                None,
-                names,
-                accumulators,
-                reductions,
-                fcond,
-            )
+                arg_node = _agg_expr_arg(node)
+                if arg_node is None or isinstance(arg_node, exp.Star):
+                    raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
+                fname, tag = _register_distinct_agg(
+                    func,
+                    None,
+                    _infer_scalar_tag(arg_node, table_resolver(table)),
+                    None,
+                    names,
+                    accumulators,
+                    reductions,
+                    fcond,
+                    value=_agg_arg_to_expr(arg_node, table),
+                )
+            else:
+                fname, tag = _register_distinct_agg(
+                    func,
+                    table.field_for(col),
+                    table.type_for(col),
+                    None,
+                    names,
+                    accumulators,
+                    reductions,
+                    fcond,
+                )
         else:
             acc, tag = _accumulator(func, col, table, fcond, arg_node=_agg_expr_arg(node))
             fname = names.fresh(func)
             accumulators[fname] = acc
+            if func == "sum":
+                value = (
+                    f"${table.field_for(col)}"
+                    if col is not None
+                    else _agg_arg_to_expr(_agg_expr_arg(node), table)
+                )
+                _guard_sum_null(fname, value, fcond, names, accumulators, reductions)
         agg_fields[agg] = fname
         field_tags[fname] = tag
         agg_field_names.append(fname)
@@ -4838,15 +5294,20 @@ def _finish_group_window(
         if alias is not None:
             alias_exprs[alias] = inner
 
-    # ORDER BY may reference a SELECT output alias (``ORDER BY rk``) — Postgres
-    # resolves it to that output expression, so sorting on a window/aggregate
-    # alias works even though the grouped rows carry no such field.
+    # ORDER BY may reference a SELECT output alias (``ORDER BY rk``) or an
+    # ordinal (``ORDER BY 1``) — Postgres resolves both to the output
+    # expression, so sorting on a window/aggregate/computed output works even
+    # though the grouped rows carry no such field.
     order: list[tuple[exp.Expression, int, bool]] = []
     order_node = stmt.args.get("order")
     if order_node is not None:
         for o in order_node.expressions:
             term = o.this
-            if isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
+            if isinstance(term, exp.Literal) and not term.is_string and str(term.name).isdigit():
+                idx = int(term.name) - 1
+                if 0 <= idx < len(out_exprs):
+                    term = out_exprs[idx]
+            elif isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
                 term = alias_exprs[term.name]
             order.append((term, -1 if o.args.get("desc") else 1, _nulls_first(o)))
 
@@ -4870,6 +5331,25 @@ def _finish_group_window(
     )
 
 
+def _constant_predicate_filter(node: exp.Expression) -> dict[str, Any] | None:
+    """Fold a constant predicate (no columns, aggregates, or subqueries — e.g.
+    ``HAVING NOT NULL IS NULL``) to a match-all / match-nothing filter with
+    three-valued semantics, or None when it isn't constant (or doesn't fold)."""
+    if (
+        next(node.find_all(exp.Column), None) is not None
+        or next(node.find_all(exp.AggFunc), None) is not None
+        or next(node.find_all(exp.Select), None) is not None
+    ):
+        return None
+    from secantus.sql import scalar
+
+    try:
+        v = scalar.evaluate(node, _const_scope, scalar.ScalarContext(None, None, "", None))
+    except errors.SQLError:
+        return None
+    return {} if v else {"$nor": [{}]}  # unknown (None) never satisfies
+
+
 def _having_to_match(
     node: exp.Expression,
     table: TableDef,
@@ -4882,6 +5362,9 @@ def _having_to_match(
     def rec(n: exp.Expression) -> dict[str, Any]:
         return _having_to_match(n, table, accumulators, agg_fields, group_cols, names, reductions)
 
+    const = _constant_predicate_filter(node)
+    if const is not None:
+        return const
     if isinstance(node, exp.Paren):
         return rec(node.this)
     if isinstance(node, exp.And):
@@ -4903,6 +5386,7 @@ def _having_to_match(
         if agg is None:
             raise errors.feature_not_supported(f"unsupported HAVING term: {term.sql()}")
         func, col, distinct = agg
+        agg = _single_agg_key(term, agg)
         where = _agg_filter_where(term)
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
         if distinct and func in _DISTINCT_FUNCS:
@@ -6042,9 +6526,17 @@ def _plan_join_select(
         _lateral_collect.reset(token)
 
     # A scalar SELECT list / ORDER BY, a correlated / EXISTS WHERE (which the
-    # pipeline builder deliberately left un-pushed), DISTINCT ON (keep-first per key),
-    # or a rich LATERAL all need the per-row evaluator.
-    if _stmt_needs_evaluation(stmt) or where_needs_per_row(stmt) or _distinct_on(stmt) or laterals:
+    # pipeline builder deliberately left un-pushed), a WHERE the join $match
+    # couldn't lower (it was skipped in _build_join_pipeline — dropping it here
+    # would return unfiltered rows), DISTINCT ON (keep-first per key), or a rich
+    # LATERAL all need the per-row evaluator.
+    if (
+        _stmt_needs_evaluation(stmt)
+        or where_needs_per_row(stmt)
+        or not _join_where_lowerable(stmt, resolve)
+        or _distinct_on(stmt)
+        or laterals
+    ):
         plan = _build_evaluated_join(stmt, base, amap, resolve, pipeline, derived)
         plan.lateral_joins = laterals
         return plan
@@ -6102,10 +6594,14 @@ def _join_accumulator(
     if arg is None:
         return _accumulator_for(func, None, None, filter_cond)
     arg = _strip_identity_wrappers(arg)
-    if not _is_field_node(arg) and func in ("sum", "avg", "min", "max"):
+    if not _is_field_node(arg) and func in ("count", "sum", "avg", "min", "max"):
         # An expression argument (``SUM(- 83)``, ``MAX(o.qty + 1)``) — lower it
         # the way the single-table accumulator does.
         body = _to_agg_expr(arg, resolve)
+        if func == "count":  # COUNT(<expr>) counts non-null values (COUNT(NULL) is 0)
+            matched = {"$ne": [body, None]}
+            cond = {"$and": [filter_cond, matched]} if filter_cond is not None else matched
+            return {"$sum": {"$cond": [cond, 1, 0]}}, "int8"
         if filter_cond is not None:
             body = {"$cond": [filter_cond, body, 0 if func == "sum" else None]}
         return {f"${func}": body}, _agg_out_tag(func, _infer_scalar_tag(arg, resolve))
@@ -6259,14 +6755,36 @@ def _plan_join_group_select(
             if distinct and func in _DISTINCT_FUNCS:
                 if arg is None:
                     raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
-                path, tag = resolve(arg)
-                fname, tag = _register_distinct_agg(
-                    func, path, tag, alias, names, accumulators, reductions, fcond
-                )
+                if _is_field_node(_strip_identity_wrappers(arg)):
+                    path, tag = resolve(_strip_identity_wrappers(arg))
+                    fname, tag = _register_distinct_agg(
+                        func, path, tag, alias, names, accumulators, reductions, fcond
+                    )
+                else:
+                    # Expression DISTINCT argument (``COUNT(DISTINCT 74)``).
+                    fname, tag = _register_distinct_agg(
+                        func,
+                        None,
+                        _infer_scalar_tag(arg, resolve),
+                        alias,
+                        names,
+                        accumulators,
+                        reductions,
+                        fcond,
+                        value=_to_agg_expr(arg, resolve),
+                    )
             else:
                 acc, tag = _join_accumulator(func, arg, resolve, fcond)
                 fname = names.fresh(alias or func)
                 accumulators[fname] = acc
+                if func == "sum" and arg is not None:
+                    stripped = _strip_identity_wrappers(arg)
+                    value = (
+                        f"${resolve(stripped)[0]}"
+                        if _is_field_node(stripped)
+                        else _to_agg_expr(stripped, resolve)
+                    )
+                    _guard_sum_null(fname, value, fcond, names, accumulators, reductions)
             agg_fields[_agg_key(func, arg, resolve, distinct)] = fname
             project[fname] = f"${fname}"
             out_columns.append((fname, tag))
@@ -6625,14 +7143,37 @@ def _plan_join_grouping_sets_window_select(
         if distinct and func in _DISTINCT_FUNCS:
             if arg is None:
                 raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
-            path, tag = resolve(arg)
-            fname, tag = _register_distinct_agg(
-                func, path, tag, None, names, accumulators, reductions, fcond
-            )
+            stripped = _strip_identity_wrappers(arg)
+            if _is_field_node(stripped):
+                path, tag = resolve(stripped)
+                fname, tag = _register_distinct_agg(
+                    func, path, tag, None, names, accumulators, reductions, fcond
+                )
+            else:
+                # Expression DISTINCT argument (``COUNT(DISTINCT 74)``).
+                fname, tag = _register_distinct_agg(
+                    func,
+                    None,
+                    _infer_scalar_tag(stripped, resolve),
+                    None,
+                    names,
+                    accumulators,
+                    reductions,
+                    fcond,
+                    value=_to_agg_expr(stripped, resolve),
+                )
         else:
             acc, tag = _join_accumulator(func, arg, resolve, fcond)
             fname = names.fresh(func)
             accumulators[fname] = acc
+            if func == "sum" and arg is not None:
+                stripped = _strip_identity_wrappers(arg)
+                value = (
+                    f"${resolve(stripped)[0]}"
+                    if _is_field_node(stripped)
+                    else _to_agg_expr(stripped, resolve)
+                )
+                _guard_sum_null(fname, value, fcond, names, accumulators, reductions)
         agg_fields[key] = fname
         field_tags[fname] = tag
         agg_field_names.append(fname)
@@ -6699,12 +7240,18 @@ def _plan_join_group_window_select(
     resolver), then the evaluated executor runs the windows over them."""
     stmt = stmt.copy()  # we mutate the tree, replacing aggregates with columns
     base, _amap, resolve, pipeline, derived = _build_join_pipeline(stmt, db, catalog, storage)
-    # A correlated / EXISTS WHERE couldn't push into the join's ``$match`` — carry it
-    # as a residual that filters the joined rows before the ``$group`` (the split is
-    # the current length of the join prefix).
+    # A correlated / EXISTS WHERE — or one the join ``$match`` couldn't lower
+    # (``_build_join_pipeline`` skipped the push; dropping it here would group
+    # unfiltered rows) — is carried as a residual that filters the joined rows
+    # before the ``$group`` (the split is the current length of the join prefix).
     where_node = stmt.args.get("where")
     residual_pre = (
-        where_node.this if (where_node is not None and where_needs_per_row(stmt)) else None
+        where_node.this
+        if (
+            where_node is not None
+            and (where_needs_per_row(stmt) or not _join_where_lowerable(stmt, resolve))
+        )
+        else None
     )
     pre_split = len(pipeline)
 
@@ -6751,14 +7298,37 @@ def _plan_join_group_window_select(
         if distinct and func in _DISTINCT_FUNCS:
             if arg is None:
                 raise errors.feature_not_supported(f"{func}(DISTINCT *) is not supported")
-            path, tag = resolve(arg)
-            fname, tag = _register_distinct_agg(
-                func, path, tag, None, names, accumulators, reductions, fcond
-            )
+            stripped = _strip_identity_wrappers(arg)
+            if _is_field_node(stripped):
+                path, tag = resolve(stripped)
+                fname, tag = _register_distinct_agg(
+                    func, path, tag, None, names, accumulators, reductions, fcond
+                )
+            else:
+                # Expression DISTINCT argument (``COUNT(DISTINCT 74)``).
+                fname, tag = _register_distinct_agg(
+                    func,
+                    None,
+                    _infer_scalar_tag(stripped, resolve),
+                    None,
+                    names,
+                    accumulators,
+                    reductions,
+                    fcond,
+                    value=_to_agg_expr(stripped, resolve),
+                )
         else:
             acc, tag = _join_accumulator(func, arg, resolve, fcond)
             fname = names.fresh(func)
             accumulators[fname] = acc
+            if func == "sum" and arg is not None:
+                stripped = _strip_identity_wrappers(arg)
+                value = (
+                    f"${resolve(stripped)[0]}"
+                    if _is_field_node(stripped)
+                    else _to_agg_expr(stripped, resolve)
+                )
+                _guard_sum_null(fname, value, fcond, names, accumulators, reductions)
         agg_fields[key] = fname
         field_tags[fname] = tag
         agg_field_names.append(fname)
@@ -6817,6 +7387,9 @@ def _join_having_to_match(
             n, resolve, accumulators, agg_fields, group_keys, key_tag, names, reductions
         )
 
+    const = _constant_predicate_filter(node)
+    if const is not None:
+        return const
     if isinstance(node, exp.Paren):
         return rec(node.this)
     if isinstance(node, exp.And):
@@ -7250,8 +7823,34 @@ def _unify_numeric_tags(tags: list[str]) -> str | None:
     return "numeric"
 
 
+_tag_memo: contextvars.ContextVar[dict | None] = contextvars.ContextVar("_tag_memo", default=None)
+
+
 def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
-    """Best-effort output type tag for a computed SELECT expression."""
+    """Best-effort output type tag for a computed SELECT expression.
+
+    Memoized per (node, resolve) for the duration of the outermost call: the
+    helpers re-visit operand subtrees (numeric family probes, date/interval
+    disambiguation), which is exponential on long arithmetic chains without a
+    memo (a 20-term sqllogictest expression took ~0.5s; whole files timed out)."""
+    memo = _tag_memo.get()
+    if memo is None:
+        token = _tag_memo.set({})
+        try:
+            return _infer_scalar_tag(node, resolve)
+        finally:
+            _tag_memo.reset(token)
+    key = (id(node), id(resolve))
+    hit = memo.get(key)
+    if hit is not None:
+        return hit[0]
+    tag = _infer_scalar_tag_impl(node, resolve)
+    memo[key] = (tag, node, resolve)  # node/resolve refs pin the ids
+    return tag
+
+
+def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
+    """The uncached body of ``_infer_scalar_tag``."""
     # Composite field access ``(col).field`` types as the field's declared type.
     composite_tag = _composite_field_tag(node, resolve)
     if composite_tag is not None:

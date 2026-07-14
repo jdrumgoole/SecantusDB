@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as _dt
 import decimal as _decimal
 import json as _json
+import math as _math
 from decimal import Decimal
 from typing import Any
 
@@ -783,7 +784,21 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         return _render_json(value).encode("utf-8")
     if isinstance(value, bson.Decimal128):
         return str(value.to_decimal()).encode("utf-8")
+    if isinstance(value, float):
+        return _render_pg_float(value).encode("ascii")
     return str(value).encode("utf-8")
+
+
+def _render_pg_float(value: float) -> str:
+    """Postgres ``float8out`` text: shortest round-trip form, no ``.0`` on an
+    integral value (``12`` not ``12.0``), and PG's ``NaN`` / ``Infinity`` /
+    ``-Infinity`` spellings (Python's are ``nan`` / ``inf``)."""
+    if _math.isnan(value):
+        return "NaN"
+    if _math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
+    s = repr(value)
+    return s[:-2] if s.endswith(".0") else s
 
 
 def _render_pg_composite(value: dict) -> str:
