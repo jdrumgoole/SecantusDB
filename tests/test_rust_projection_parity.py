@@ -104,6 +104,13 @@ CURATED = [
     ({"_id": 1, "a": 1, "b": 2}, {}),  # empty spec
     ({"_id": 1, "a": 1, "b": 2}, {"a": True, "b": False}),  # mixed -> defer
     ({"a": 1, "b": 2}, {"a": 1}),  # no _id in doc
+    # $meta with a recognized-but-unsupported arg: field omitted (both engines
+    # agree). textScore/17308/40218 error cases are validated at parse time in
+    # the command layer, not here — this asserts the graceful-omit behaviour.
+    ({"_id": 1, "a": 1, "b": 2}, {"score": {"$meta": "indexKey"}}),
+    ({"_id": 1, "a": 1, "b": 2}, {"a": 1, "score": {"$meta": "recordId"}}),
+    ({"_id": 1, "a": 1, "b": 2}, {"_id": 0, "score": {"$meta": "sortKey"}}),
+    ({"_id": 1, "a": 1, "b": 2}, {"m": {"$meta": "geoNearDistance"}}),
 ]
 
 

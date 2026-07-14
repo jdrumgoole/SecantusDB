@@ -306,6 +306,12 @@ def test_json_schema_unique_items() -> None:
     # distinct vs duplicate documents
     assert matches({"tags": [{"x": 1}, {"x": 2}]}, {"$jsonSchema": schema})
     assert not matches({"tags": [{"x": 1}, {"x": 1}]}, {"$jsonSchema": schema})
+    # nested cross-type-equal numerics collide ({a: 1} == {a: 1.0})
+    assert not matches({"tags": [{"a": 1}, {"a": 1.0}]}, {"$jsonSchema": schema})
+    assert matches({"tags": [{"a": 1}, {"a": 2}]}, {"$jsonSchema": schema})
+    # and recursively inside sub-arrays
+    assert not matches({"tags": [[1, 2], [1.0, 2.0]]}, {"$jsonSchema": schema})
+    assert matches({"tags": [[1, 2], [1, 3]]}, {"$jsonSchema": schema})
     # uniqueItems: false is a no-op
     off = {"properties": {"tags": {"uniqueItems": False}}}
     assert matches({"tags": [1, 1]}, {"$jsonSchema": off})

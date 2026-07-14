@@ -27,6 +27,79 @@ def _is_elem_match_spec(value: Any) -> bool:
     return isinstance(value, Mapping) and len(value) == 1 and "$elemMatch" in value
 
 
+# Recognized ``$meta`` keywords (mongod). An unrecognized argument is a
+# Location17308; ``textScore`` without a ``$text`` query is a Location40218.
+# Everything here is accepted at parse time; SecantusDB doesn't actually compute
+# any of these metadata values, so the projected field is omitted (partial —
+# graceful degradation — rather than a wrong value or a spurious error).
+_META_KEYWORDS = frozenset(
+    {
+        "textScore",
+        "indexKey",
+        "recordId",
+        "sortKey",
+        "searchScore",
+        "searchHighlights",
+        "geoNearDistance",
+        "geoNearPoint",
+        "vectorSearchScore",
+    }
+)
+
+
+def _is_meta_spec(value: Any) -> bool:
+    return isinstance(value, Mapping) and len(value) == 1 and "$meta" in value
+
+
+def _query_has_text(query: Mapping[str, Any] | None) -> bool:
+    """Whether ``query`` carries a ``$text`` clause (top-level or nested inside a
+    ``$and`` / ``$or`` / ``$nor`` array). mongod requires a ``$text`` predicate
+    before a ``{$meta: "textScore"}`` projection is legal."""
+    if not isinstance(query, Mapping):
+        return False
+    for key, val in query.items():
+        if key == "$text":
+            return True
+        if (
+            key in ("$and", "$or", "$nor")
+            and isinstance(val, (list, tuple))
+            and any(_query_has_text(clause) for clause in val)
+        ):
+            return True
+    return False
+
+
+def validate_meta_projection(
+    spec: Mapping[str, Any] | None, query: Mapping[str, Any] | None = None
+) -> None:
+    """Raise ``ProjectionError`` for a faulty ``{$meta: ...}`` projection value.
+    Oracle-pinned against mongod 6.0:
+      * an unrecognized ``$meta`` argument => Location17308
+        ``Unsupported argument to $meta: <arg>``
+      * ``{$meta: "textScore"}`` without a ``$text`` query => Location40218
+        ``query requires text score metadata, but it is not available``
+    Recognized-but-unsupported args (``indexKey`` / ``recordId`` / ``sortKey`` /
+    …) validate cleanly here; :func:`apply_projection` omits the field."""
+    if not spec:
+        return
+    for value in spec.values():
+        if not _is_meta_spec(value):
+            continue
+        arg = value["$meta"]
+        if arg not in _META_KEYWORDS:
+            raise ProjectionError(
+                f"Unsupported argument to $meta: {arg}",
+                code=17308,
+                code_name="Location17308",
+            )
+        if arg == "textScore" and not _query_has_text(query):
+            raise ProjectionError(
+                "query requires text score metadata, but it is not available",
+                code=40218,
+                code_name="Location40218",
+            )
+
+
 def _is_positional_key(key: str) -> bool:
     """A positional-projection key ``arr.$`` (the projection ``$`` operator, not
     the update one). ``arr.$.field`` is not a projection form."""
@@ -75,6 +148,7 @@ def validate_projection(
     :func:`apply_projection` only sees them once a document is projected)."""
     if not spec:
         return
+    validate_meta_projection(spec, query)
     positional = [k for k in spec if _is_positional_key(k)]
     if not positional:
         return
@@ -173,6 +247,26 @@ def apply_projection(
 ) -> dict[str, Any]:
     if not spec:
         return copy.deepcopy(doc)
+
+    # ``$meta`` projections validate at parse time (Location17308 for an unknown
+    # argument, Location40218 for ``textScore`` without a ``$text`` query). A
+    # ``$meta`` field is inclusion-mode in mongod, but SecantusDB doesn't compute
+    # the metadata — so the field is *omitted* (partial, graceful degradation).
+    # We drop the meta keys from the spec while remembering one was present: a
+    # spec that was *only* ``$meta`` fields becomes an inclusion projection of no
+    # fields (mongod result: just ``_id``, unless ``_id`` was excluded).
+    meta_present = any(_is_meta_spec(v) for v in spec.values())
+    if meta_present:
+        validate_meta_projection(spec, query)
+        spec = {k: v for k, v in spec.items() if not _is_meta_spec(v)}
+        non_meta_non_id = any(k != "_id" for k in spec)
+        if not non_meta_non_id:
+            # Inclusion projection with no surviving field: keep only ``_id``
+            # (dropped when the spec excludes it via ``_id: 0``).
+            result: dict[str, Any] = {}
+            if spec.get("_id", 1) and "_id" in doc:
+                result["_id"] = copy.deepcopy(doc["_id"])
+            return result
 
     # Separate ``$slice`` and positional (``arr.$``) projections — they don't
     # participate in inclusion / exclusion mode detection (mongod treats them as

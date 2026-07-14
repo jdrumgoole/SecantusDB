@@ -217,3 +217,71 @@ def test_validate_projection_parse_time() -> None:
     assert e.value.code == 31276
     # A valid positional projection validates clean.
     validate_projection({"items.$": 1}, {"items.k": "b"})
+
+
+def test_meta_unknown_arg_errors_17308() -> None:
+    doc = {"_id": 1, "a": 1}
+    with pytest.raises(ProjectionError) as e:
+        apply_projection(doc, {"score": {"$meta": "bogus"}})
+    assert e.value.code == 17308
+    assert e.value.code_name == "Location17308"
+    assert str(e.value) == "Unsupported argument to $meta: bogus"
+
+
+def test_meta_textscore_without_text_errors_40218() -> None:
+    doc = {"_id": 1, "a": 1}
+    with pytest.raises(ProjectionError) as e:
+        apply_projection(doc, {"score": {"$meta": "textScore"}}, {"a": 1})
+    assert e.value.code == 40218
+    assert e.value.code_name == "Location40218"
+    assert str(e.value) == "query requires text score metadata, but it is not available"
+
+
+def test_meta_textscore_with_text_query_omits_field() -> None:
+    doc = {"_id": 1, "a": 1}
+    out = apply_projection(doc, {"score": {"$meta": "textScore"}}, {"$text": {"$search": "x"}})
+    # $meta field is omitted (not computed); inclusion projection keeps only _id.
+    assert out == {"_id": 1}
+
+
+def test_meta_textscore_with_nested_text_query() -> None:
+    doc = {"_id": 1, "a": 1}
+    out = apply_projection(
+        doc,
+        {"score": {"$meta": "textScore"}},
+        {"$and": [{"a": 1}, {"$text": {"$search": "x"}}]},
+    )
+    assert out == {"_id": 1}
+
+
+def test_meta_recognized_unsupported_arg_omits_field() -> None:
+    doc = {"_id": 1, "a": 1, "b": 2}
+    for arg in ("indexKey", "recordId", "sortKey"):
+        out = apply_projection(doc, {"m": {"$meta": arg}})
+        assert out == {"_id": 1}
+
+
+def test_meta_alongside_inclusion_field() -> None:
+    doc = {"_id": 1, "a": 1, "b": 2}
+    out = apply_projection(doc, {"a": 1, "score": {"$meta": "indexKey"}})
+    # Inclusion of `a`; the $meta field is omitted.
+    assert out == {"_id": 1, "a": 1}
+
+
+def test_meta_excludes_id() -> None:
+    doc = {"_id": 1, "a": 1}
+    out = apply_projection(doc, {"_id": 0, "score": {"$meta": "recordId"}})
+    assert out == {}
+
+
+def test_validate_meta_projection_parse_time() -> None:
+    from secantus.projection import validate_meta_projection
+
+    with pytest.raises(ProjectionError) as e:
+        validate_meta_projection({"s": {"$meta": "nope"}}, None)
+    assert e.value.code == 17308
+    with pytest.raises(ProjectionError) as e2:
+        validate_meta_projection({"s": {"$meta": "textScore"}}, {"a": 1})
+    assert e2.value.code == 40218
+    # Recognized-but-unsupported validates clean.
+    validate_meta_projection({"s": {"$meta": "indexKey"}}, None)

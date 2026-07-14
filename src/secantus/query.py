@@ -12,7 +12,6 @@ from bson import Binary, Decimal128, Int64, ObjectId, Regex
 from secantus.collation import Collation
 from secantus.collation import compare_keys as _coll_compare
 from secantus.collation import equal as _coll_equal
-from secantus.sortkey import encode_value as _encode_sortkey
 
 
 class _Missing:
@@ -98,6 +97,28 @@ def _match_clause(
     return _field_matches(_resolve_path(doc, key), condition, collation)
 
 
+def _unique_items_key(value: Any) -> Any:
+    """A hashable canonical key for ``uniqueItems`` duplicate detection.
+
+    Numerics collapse to a common ``("n", Decimal)`` form so int / long /
+    double / Decimal128 compare by value; sub-documents and sub-arrays recurse
+    so nested cross-type-equal numerics collide too.
+    """
+    if isinstance(value, bool):
+        return ("b", value)
+    if isinstance(value, (int, float)):
+        return ("n", Decimal(str(value)))
+    if isinstance(value, Decimal128):
+        return ("n", value.to_decimal())
+    if isinstance(value, Mapping):
+        return ("d", tuple((k, _unique_items_key(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return ("a", tuple(_unique_items_key(v) for v in value))
+    if isinstance(value, bytes):
+        return ("y", bytes(value))
+    return ("s", type(value).__name__, value)
+
+
 def _validate_json_schema(value: Any, schema: Any) -> bool:
     if not isinstance(schema, Mapping):
         return False
@@ -142,14 +163,13 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
                 if not _validate_json_schema(item, schema["items"]):
                     return False
         if schema.get("uniqueItems") is True:
-            # Every element must be distinct. The shared sort-key encoding is the
-            # equality key: it collides equal-value numerics (1 == 1.0 at top
-            # level) and is order-sensitive for documents, matching real mongod
-            # for scalar arrays. (Nested cross-type-equal numerics are a known
-            # gap — see tasks/backlog.md.)
-            seen: set[bytes] = set()
+            # Every element must be distinct under MongoDB value equality, which
+            # bridges cross-type-equal numerics (int/long/double/Decimal128 by
+            # value) recursively inside sub-documents and sub-arrays — so
+            # ``{a: 1}`` and ``{a: 1.0}`` collide, matching real mongod.
+            seen: set[Any] = set()
             for item in value:
-                key = _encode_sortkey(item)
+                key = _unique_items_key(item)
                 if key in seen:
                     return False
                 seen.add(key)

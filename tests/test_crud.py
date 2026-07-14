@@ -486,6 +486,33 @@ def test_projection_dotted_inclusion(coll) -> None:
     assert doc == {"addr": {"city": "Dublin"}}
 
 
+def test_projection_meta_textscore_without_text_is_40218(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 1})
+    with pytest.raises(OperationFailure) as exc:
+        coll.find_one({"a": 1}, {"score": {"$meta": "textScore"}})
+    assert exc.value.code == 40218
+    assert "query requires text score metadata, but it is not available" in str(exc.value)
+
+
+def test_projection_meta_unknown_arg_is_17308(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 1})
+    with pytest.raises(OperationFailure) as exc:
+        coll.find_one({}, {"score": {"$meta": "bogus"}})
+    assert exc.value.code == 17308
+    assert "Unsupported argument to $meta: bogus" in str(exc.value)
+
+
+def test_projection_meta_recognized_arg_omits_field(coll) -> None:
+    coll.insert_one({"_id": 1, "a": 1, "b": 2})
+    doc = coll.find_one({}, {"m": {"$meta": "indexKey"}})
+    # Recognized-but-unsupported $meta arg: field omitted, inclusion keeps _id.
+    assert doc == {"_id": 1}
+
+
 def test_small_batch_size_paginates_via_getmore(coll, server: SecantusDBServer) -> None:
     coll.insert_many([{"_id": i, "n": i} for i in range(25)])
     cursor = coll.find().sort("n", 1).batch_size(10)
@@ -3937,6 +3964,41 @@ def test_json_schema_unique_items_find(coll) -> None:
     schema = {"$jsonSchema": {"properties": {"tags": {"bsonType": "array", "uniqueItems": True}}}}
     got = sorted(d["_id"] for d in coll.find(schema))
     assert got == [1, 4]
+
+
+def test_json_schema_unique_items_nested_crosstype(coll) -> None:
+    """`uniqueItems` value equality bridges cross-type-equal numerics even
+    inside nested sub-documents ({a:1} == {a:1.0}), matching real mongod."""
+    coll.insert_many(
+        [
+            {"_id": 1, "arr": [{"a": 1}, {"a": 1.0}]},  # cross-type dup -> no match
+            {"_id": 2, "arr": [{"a": 1}, {"a": 2}]},  # distinct -> matches
+            {"_id": 3, "arr": [1, 1.0]},  # top-level cross-type dup -> no match
+            {"_id": 4, "arr": [1, 2]},  # distinct -> matches
+            {"_id": 5, "arr": [{"a": 1}, {"a": 1}]},  # exact dup -> no match
+        ]
+    )
+    schema = {"$jsonSchema": {"properties": {"arr": {"uniqueItems": True}}}}
+    got = sorted(d["_id"] for d in coll.find(schema))
+    assert got == [2, 4]
+
+
+def test_unknown_expression_operator_error_codes(coll) -> None:
+    """An unrecognized aggregation-expression operator reports mongod's
+    context-specific error code: 168 InvalidPipelineOperator inside a query
+    ``$expr``; Location31325 inside a ``$project``. Verified against mongod 6.0."""
+    import pymongo
+
+    coll.insert_one({"_id": 1, "a": 5})
+    with pytest.raises(pymongo.errors.OperationFailure) as expr_exc:
+        list(coll.find({"$expr": {"$notreal": [1, 2]}}))
+    assert expr_exc.value.code == 168
+    assert "Unrecognized expression '$notreal'" in expr_exc.value.details["errmsg"]
+
+    with pytest.raises(pymongo.errors.OperationFailure) as proj_exc:
+        list(coll.aggregate([{"$project": {"y": {"$notreal": ["$a"]}}}]))
+    assert proj_exc.value.code == 31325
+    assert "Unknown expression $notreal" in proj_exc.value.details["errmsg"]
 
 
 def test_view_reads_resolve_the_pipeline(client: MongoClient) -> None:

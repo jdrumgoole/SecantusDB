@@ -1474,12 +1474,19 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
     compares. Fixed in **both** engines (Python `_try_cmp` bool-bracket guard; Rust
     `compare_values` bool compares only with bool). Parity fuzz + a three-way probe
     (collection-scan **and** index-scan paths) confirm all three agree.
-  - **Remaining residue (Rust *server* only, rare):** an **array-vs-array** bound
-    (`{a: {$gt: [1,2]}}`) still defers (`Fallback` → `BadValue` on the Rust server)
-    because Python's oracle is native list lexicographic comparison, which the Rust
-    matcher doesn't reproduce; the **exotic** BSON types (JS code / symbol /
-    dbpointer / undefined) as a range operand likewise defer. Both are
-    vanishingly rare in real queries; the Python server handles them.
+  - **Array-vs-array bound — FIXED 2026-07-13 (Rust server).** An **array-vs-array**
+    bound (`{a: {$gt: [1,2]}}`) is now compared **whole-array lexicographically** in
+    the Rust matcher (`compare_values` recurses element-wise, mirroring Python's
+    native `list < list` and mongod — verified against real mongod 6.0), and
+    `cmp_op` also does the whole-value compare so an array field vs an array bound
+    matches. A cross-type element pair (where Python's `<` would raise) returns a
+    clean no-match, not a `Fallback`. Pinned by curated parity cases +
+    `array_vs_array_lexicographic_range` / `array_vs_array_cross_type_element_no_match`
+    unit tests.
+  - **Remaining residue (Rust *server* only, rare):** the **exotic** BSON types
+    (JS code / symbol / dbpointer / undefined) as a range operand still defer
+    (`Fallback` → `BadValue` on the Rust server); vanishingly rare, the Python
+    server handles them.
   (The **`$min`/`$max` UPDATE** operators had the same
   cross-type gap plus a Python `TypeError` traceback leak — **fixed 2026-07-13**:
   Python now compares by BSON order via `ordering._bson_lt` (no leak, cross-type
@@ -1494,36 +1501,44 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   differ from mongod in the final ULP (e.g. `2.357022603955158` vs mongod's
   `2.3570226039551585`); mongod uses a different summation order. Precision-only,
   hard to match exactly — likely a permanent minor divergence.
-- [ ] **`$meta` projection** (`{score: {$meta: "indexKey"}}` / `"textScore"` /
-  `"recordId"`) — niche; mongod returns index / meta info, the Python server emits
-  an empty/partial doc, the Rust server errors. Low priority (text-search /
-  index-metadata surface SecantusDB doesn't otherwise model). Found alongside the
+- [ ] **`$meta` projection values** (`{score: {$meta: "recordId"}}` / `"indexKey"` /
+  `"sortKey"`) — the recognized-but-unsupported `$meta` args now validate clean on
+  both servers and the field is **omitted** (partial, graceful degradation) rather
+  than faithfully computed — mongod returns the actual index / record-id / sort-key
+  metadata, which SecantusDB doesn't model. Low priority (index-metadata surface
+  SecantusDB doesn't otherwise expose). The two `$meta` *error* cases are now
+  faithful on both servers: `{$meta: "textScore"}` without a `$text` query →
+  `Location40218`, an unknown `$meta` arg → `Location17308`. Found alongside the
   positional-`$` projection fix by the three-way projection differential
-  (2026-07-12); the positional `$` operator itself now ships on both servers.
+  (2026-07-12).
 - [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
   (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
   on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
   `items`/`uniqueItems`/`required`/`properties`/`additionalProperties`/
   `patternProperties`/`dependencies`/`allOf`/`anyOf`/`oneOf`/`not` all ship on
-  both. **`uniqueItems` known gap:** cross-type-equal numerics nested inside a
-  document/array element — e.g. `[{a: 1}, {a: 1.0}]` — are treated as distinct on
-  both servers, where mongod considers them equal. Top-level scalar arrays,
-  including cross-type `[1, 1.0]`, are faithful.)
-- [ ] **Error-code nit — unrecognized expression operator (both servers diverge
-  from mongod).** For a genuinely nonexistent expression operator (e.g.
-  `{$project: {x: {$notreal: [...]}}}` or `find({$expr: {$notreal: [...]}})`),
-  mongod returns `168 InvalidPipelineOperator` "Unrecognized expression
-  '$notreal'". The **Python server** returns `14 TypeMismatch` ("unsupported
-  aggregation expression operator: $notreal"); the **Rust server** returns
-  `2 BadValue` (the generic Fallback→"construct not supported by the Rust server"
-  message). Both reject the query (no correctness/data issue) — only the code and
-  wording differ. A faithful fix is *not* a blanket "unknown op → 168": it needs
-  the **full catalog of real mongod expression operators** so we only emit
-  "Unrecognized" for operators mongod itself doesn't know — mislabeling a
-  real-but-unimplemented operator (e.g. one Python defers) as "Unrecognized" would
-  be a *new* divergence (mongod recognizes and evaluates it). Deferred until a
-  gauge/consumer actually asserts this code; confirmed by differential probing
-  2026-07-05.
+  both. `uniqueItems` uses MongoDB value equality, bridging cross-type-equal
+  numerics recursively inside document/array elements — `[{a: 1}, {a: 1.0}]` and
+  `[1, 1.0]` are both correctly treated as duplicates.)
+- [ ] **Error-code — unrecognized expression operator: mostly FIXED 2026-07-13;
+  one Rust-server residue.** For a genuinely nonexistent expression operator,
+  mongod returns a context-specific code. Now matched:
+  - **Query `$expr`** (`find({$expr: {$notreal: [...]}})`) → `168
+    InvalidPipelineOperator` "Unrecognized expression '$notreal'" on **both**
+    servers (was `14 TypeMismatch` on Python, generic `2 BadValue` on Rust). The
+    Rust side is an up-front parse-time check in `find.rs` driven by
+    `expressions::first_unknown_expr_operator` (a `KNOWN_EXPR_OPS` catalog pinned
+    to `apply_op` by a unit test), so only a truly-unknown `$`-operator is
+    flagged — a recognised-but-deferred operator still defers to Python.
+  - **Aggregation `$project`** (`{$project: {x: {$notreal: [...]}}}`) →
+    `Location31325` "Invalid $project :: caused by :: Unknown expression $notreal"
+    on the **Python server** (was `14 TypeMismatch`). **Rust residue:** the Rust
+    server still returns generic `2 BadValue` here — a faithful `$project` check
+    must distinguish the projection-only operators (`$slice` / `$elemMatch` /
+    `$meta`, which are valid inside `$project` and are NOT expression operators)
+    from genuine expressions, so a blanket `first_unknown_expr_operator` scan of a
+    `$project` spec would mislabel them. Deferred as the remaining piece; both
+    servers reject the query either way (no correctness/data issue). Confirmed by
+    three-way probe 2026-07-13.
 
 ### 7.6 Standalone `secantusdb` binary: CLI-flag conformance shipped (beta.96)
 

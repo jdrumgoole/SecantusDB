@@ -167,6 +167,35 @@ CURATED = [
     ({"dim": [10, 15.25]}, {"dim": {"$gt": 15, "$lt": 20}}),
     ({"dim": [14, 21]}, {"dim": {"$lte": 14}}),
     ({"dim": ["a", "z"]}, {"dim": {"$gt": "m"}}),
+    # Array-vs-array bound: whole-array lexicographic comparison, identical to
+    # Python's native `list < list` and to mongod. Pinned to the Python oracle.
+    ({"a": [1, 3]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, 2]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, 2, 3]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": 5}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [2]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, 3]}, {"a": {"$lt": [1, 3]}}),
+    ({"a": [1, 2]}, {"a": {"$lt": [1, 3]}}),
+    ({"a": [1, 2, 3]}, {"a": {"$lt": [1, 3]}}),
+    ({"a": [2]}, {"a": {"$lt": [1, 3]}}),
+    ({"a": [1, 3]}, {"a": {"$gte": [1, 2]}}),
+    ({"a": [1, 2]}, {"a": {"$gte": [1, 2]}}),
+    ({"a": [1, 2, 3]}, {"a": {"$gte": [1, 2]}}),
+    ({"a": [2]}, {"a": {"$gte": [1, 2]}}),
+    ({"a": [1, 2]}, {"a": {"$lte": [1, 2]}}),
+    # Prefix ordering: [1,2] < [1,2,3] (shorter sorts first).
+    ({"a": [1, 2]}, {"a": {"$lt": [1, 2, 3]}}),
+    ({"a": [1, 2, 3]}, {"a": {"$gt": [1, 2]}}),
+    # Cross-type element pair after equal leading elements -> no match (Python's
+    # `list < list` raises TypeError -> swallowed; Rust returns a clean False).
+    ({"a": [1, "x"]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, "x"]}, {"a": {"$lt": [1, 2]}}),
+    ({"a": [2, "x"]}, {"a": {"$gt": [1, 2]}}),  # decisive first pair 2>1
+    # Array field vs scalar bound still rides the multikey element path.
+    ({"a": [1, 3]}, {"a": {"$gt": 2}}),
+    ({"a": [1, 2]}, {"a": {"$gt": 2}}),
+    # Cross-type numeric elements (int vs double) compare by value, like Python.
+    ({"a": [1, 2.5]}, {"a": {"$gt": [1, 2]}}),
     ({"a": 2}, {"a": {"$in": [1, 2, 3]}}),
     ({"a": 4}, {"a": {"$in": [1, 2, 3]}}),
     ({"a": 4}, {"a": {"$nin": [1, 2, 3]}}),
@@ -453,6 +482,13 @@ CURATED = [
     ({"xs": ["a", "b", "a"]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
     ({"xs": [{"a": 1}, {"a": 2}]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
     ({"xs": [{"a": 1}, {"a": 1}]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    # nested cross-type-equal numerics collide recursively ({a:1} == {a:1.0}).
+    (
+        {"xs": [{"a": 1}, {"a": 1.0}]},
+        {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}},
+    ),
+    ({"xs": [[1, 2], [1.0, 2.0]]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [[1, 2], [1, 3]]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
     ({"xs": [1, 1]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": False}}}}),
     # enum.
     ({"c": "red"}, {"$jsonSchema": {"properties": {"c": {"enum": ["red", "green"]}}}}),

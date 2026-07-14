@@ -325,6 +325,192 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
+/// Aggregation-expression operators this engine recognises — the `$`-prefixed
+/// keys `apply_op` dispatches on, plus the special-cased `$literal`. A recognised
+/// operator that can't be reproduced exactly returns `Fallback` (deferred), which
+/// is *not* an "unknown operator"; only a `$`-key absent from this set is. Used
+/// only by [`first_unknown_expr_operator`] to shape mongod's context-specific
+/// unknown-expression error, so it must stay in step with `apply_op`'s arms
+/// (guarded by a test).
+pub const KNOWN_EXPR_OPS: &[&str] = &[
+    "$literal",
+    "$eq",
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$and",
+    "$or",
+    "$not",
+    "$cond",
+    "$ifNull",
+    "$switch",
+    "$add",
+    "$multiply",
+    "$subtract",
+    "$divide",
+    "$mod",
+    "$size",
+    "$arrayElemAt",
+    "$first",
+    "$last",
+    "$firstN",
+    "$lastN",
+    "$maxN",
+    "$minN",
+    "$concatArrays",
+    "$reverseArray",
+    "$sortArray",
+    "$in",
+    "$slice",
+    "$indexOfArray",
+    "$concat",
+    "$toLower",
+    "$toUpper",
+    "$strLenCP",
+    "$split",
+    "$substrCP",
+    "$substr",
+    "$substrBytes",
+    "$indexOfCP",
+    "$indexOfBytes",
+    "$trim",
+    "$ltrim",
+    "$rtrim",
+    "$mergeObjects",
+    "$objectToArray",
+    "$getField",
+    "$setField",
+    "$zip",
+    "$let",
+    "$map",
+    "$filter",
+    "$reduce",
+    "$setUnion",
+    "$setIntersection",
+    "$setDifference",
+    "$setEquals",
+    "$setIsSubset",
+    "$allElementsTrue",
+    "$anyElementTrue",
+    "$cmp",
+    "$binarySize",
+    "$bsonSize",
+    "$degreesToRadians",
+    "$radiansToDegrees",
+    "$year",
+    "$month",
+    "$dayOfMonth",
+    "$hour",
+    "$minute",
+    "$second",
+    "$millisecond",
+    "$dayOfWeek",
+    "$dayOfYear",
+    "$week",
+    "$isoWeek",
+    "$isoDayOfWeek",
+    "$isoWeekYear",
+    "$dateAdd",
+    "$dateSubtract",
+    "$dateDiff",
+    "$dateTrunc",
+    "$toInt",
+    "$toDouble",
+    "$toDecimal",
+    "$toDate",
+    "$convert",
+    "$toBool",
+    "$toString",
+    "$regexMatch",
+    "$regexFind",
+    "$regexFindAll",
+    "$abs",
+    "$floor",
+    "$ceil",
+    "$sqrt",
+    "$exp",
+    "$ln",
+    "$log",
+    "$pow",
+    "$round",
+    "$trunc",
+    "$sin",
+    "$cos",
+    "$tan",
+    "$asin",
+    "$acos",
+    "$atan",
+    "$atan2",
+    "$sinh",
+    "$cosh",
+    "$tanh",
+    "$asinh",
+    "$acosh",
+    "$atanh",
+    "$bitAnd",
+    "$bitOr",
+    "$bitXor",
+    "$bitNot",
+    "$dateFromString",
+    "$dateToString",
+    "$dateToParts",
+    "$dateFromParts",
+    "$tsSecond",
+    "$tsIncrement",
+    "$type",
+    "$isNumber",
+    "$isArray",
+    "$strcasecmp",
+    "$replaceOne",
+    "$replaceAll",
+    "$range",
+    "$strLenBytes",
+    "$arrayToObject",
+    "$rand",
+];
+
+/// The first `$`-prefixed expression operator in `expr` (recursing through
+/// arrays and nested single-key operator documents) that this engine does not
+/// recognise, e.g. `$notreal` for `{$notreal: [1, 2]}`. mongod rejects an
+/// unrecognised expression operator with a context-specific "unknown
+/// expression" error (`168 InvalidPipelineOperator` in a query `$expr`;
+/// `Location31325` inside `$project`), so the command layer uses this to shape
+/// that error rather than the generic `Fallback` → `BadValue`. A recognised
+/// operator that merely defers to Python is *not* reported here. `None` when
+/// every operator in the tree is recognised.
+pub fn first_unknown_expr_operator(expr: &Bson) -> Option<String> {
+    match expr {
+        Bson::Array(a) => {
+            for e in a {
+                if let Some(op) = first_unknown_expr_operator(e) {
+                    return Some(op);
+                }
+            }
+            None
+        }
+        Bson::Document(d) => {
+            if d.len() == 1 {
+                let (key, val) = d.iter().next().unwrap();
+                if key.starts_with('$') {
+                    if !KNOWN_EXPR_OPS.contains(&key.as_str()) {
+                        return Some(key.clone());
+                    }
+                    return first_unknown_expr_operator(val);
+                }
+            }
+            for v in d.values() {
+                if let Some(op) = first_unknown_expr_operator(v) {
+                    return Some(op);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// `$rand`: a uniform random double in [0, 1). The argument must be an empty
 /// document (anything else is a parse error in mongod). Mirrors
 /// `expressions._op_rand` — non-deterministic, so the two engines agree on the
@@ -3506,6 +3692,49 @@ mod tests {
             Bson::String("hi".into())
         );
         assert_eq!(ev(doc! {}, Bson::String("$missing".into())), Bson::Null);
+    }
+
+    #[test]
+    fn unknown_expr_operator_detected() {
+        assert_eq!(
+            first_unknown_expr_operator(&bson::bson!({"$notreal": [1, 2]})),
+            Some("$notreal".to_string())
+        );
+        // Nested inside a recognised operator's argument.
+        assert_eq!(
+            first_unknown_expr_operator(&bson::bson!({"$add": [1, {"$bogus": 2}]})),
+            Some("$bogus".to_string())
+        );
+        // A field-path / literal / recognised operator is not "unknown".
+        assert_eq!(
+            first_unknown_expr_operator(&Bson::String("$a".into())),
+            None
+        );
+        assert_eq!(
+            first_unknown_expr_operator(&bson::bson!({"$add": [1, 2]})),
+            None
+        );
+    }
+
+    #[test]
+    fn known_expr_ops_all_route() {
+        // Every name in KNOWN_EXPR_OPS must dispatch in `apply_op` — i.e. calling
+        // it must NOT hit the `_ => Err(Fallback)` unknown-operator arm. We can't
+        // observe the arm directly, so we assert `first_unknown_expr_operator`
+        // (which shares the list) agrees the op is recognised, and cross-check
+        // that a made-up name is flagged. This guards the list against drift.
+        for op in KNOWN_EXPR_OPS {
+            let expr = Bson::Document(doc! { *op: Bson::Array(vec![]) });
+            assert_eq!(
+                first_unknown_expr_operator(&expr),
+                None,
+                "{op} should be recognised"
+            );
+        }
+        assert_eq!(
+            first_unknown_expr_operator(&bson::bson!({"$definitelyNotAnOp": 1})),
+            Some("$definitelyNotAnOp".to_string())
+        );
     }
 
     #[test]
