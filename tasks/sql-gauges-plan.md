@@ -450,6 +450,20 @@ SCHEMA` (71), server-side cursors (`InvalidCursorName`, ~110 with
 test_cursor_server), `pg_prepared_statements` (21), mypy in the gauge venv
 (125, environmental); then a full gauge re-run to restamp the headline.
 
+**2026-07-15 session (continuing the same run):** #425 (CREATE SCHEMA +
+schema-qualified user types — clears the 71-test cluster), #427 (server-side
+cursors: a DECLAREd cursor IS a portal, Describe('P')/Close('P') fallback,
+$N-in-Command substitution, pg_cursors + pg_prepared_statements; cursor +
+prepared suites 26 → 102), #429 (**WT session leak → eviction livelock**:
+every writer connection leaked its cached WT session because pgserver's
+teardown never called _reset_thread_session — the single-daemon gauge wedged
+at ~test 420 3/3; fixed + flip-tested regression test; gauge now completes in
+~125s). **psycopg headline: 2554 passed / 61.9%** (from 2465 / 59.8%).
+Next levers: enum result OIDs in RowDescription (the ~150-test enum-behavior
+cluster + "unknown oid" cluster, 212 — needs minted user-type array oids and
+catalog-aware ColumnDesc resolution; ~26 ColumnDesc sites), CREATE TYPE AS
+RANGE, schema-qualified tables, select4/5 join perf.
+
 **Second slice (same day, PR pending): 19/26 → 22/26.** HAVING grew
 `IS [NOT] NULL` (bare / aggregate / computed group-key operands, exact under
 any NOT nesting), three-valued `[NOT] IN` over group keys, and always-unknown
