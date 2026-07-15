@@ -1,7 +1,9 @@
 name: Validate (driver conformance)
 
-# Runs the vendored driver test suites (pymongo, go, node, java,
-# ruby, rust, php-lib, php-ext, c, cxx, dotnet) against SecantusDB and regenerates the per-driver
+# Runs the vendored driver test suites (pymongo, pymongo-async, go, node,
+# java, kotlin, ruby, rust, php-lib, php-ext, c, cxx, dotnet, psycopg, plus
+# the pymongo- and java-vs-Rust-server gates) against SecantusDB and
+# regenerates the per-driver
 # `docs/validation-report*.md` files. Slow (~10–15 min per driver on
 # a fresh WT build) so this is NOT on every push — it runs weekly on
 # Monday and can be triggered manually.
@@ -50,6 +52,14 @@ jobs:
           # its sync step builds the wheel with SECANTUS_BUILD_STORAGE_ENGINE=ON
           # (extra toolchain steps below).
           - { name: pymongo-rust-server, task: "validate --server rust", report: docs/validation-report-rust-server.md }
+          # The Java analogue of the R8 gate: the SAME unmodified
+          # mongo-java-driver suite as the java gauge, pointed at the
+          # standalone Rust server. Needs the JVM toolchain of the java gauge
+          # PLUS the storage-engine sync, which stages the secantusd-rs
+          # daemon into .venv/bin (SECANTUSDB_BIN on the run step points
+          # gauge_common.rust_binary at it — the default search only covers
+          # the cargo target dir).
+          - { name: java-rust-server, task: "validate-java --server rust", report: docs/validation-report-java-rust-server.md }
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
@@ -62,11 +72,11 @@ jobs:
       # extensions inside the wheel build: bindgen needs libclang, the WT
       # ExternalProject forces Ninja, and the cargo build needs a Rust toolchain.
       - name: Install storage-engine toolchain
-        if: matrix.driver.name == 'pymongo-rust-server'
+        if: contains(matrix.driver.name, 'rust-server')
         run: sudo apt-get install -y clang libclang-dev llvm-dev ninja-build
 
       - name: Install Rust toolchain
-        if: matrix.driver.name == 'pymongo-rust-server'
+        if: contains(matrix.driver.name, 'rust-server')
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
 
       - name: Install uv
@@ -78,11 +88,11 @@ jobs:
         run: uv python install 3.12
 
       - name: Sync dependencies
-        if: matrix.driver.name != 'pymongo-rust-server'
+        if: ${{ !contains(matrix.driver.name, 'rust-server') }}
         run: uv sync --extra dev   # builds vendored WT, installs pytest-json-report
 
       - name: Sync dependencies (storage engine ON)
-        if: matrix.driver.name == 'pymongo-rust-server'
+        if: contains(matrix.driver.name, 'rust-server')
         # Same sync, but the editable build runs CMake with the storage-engine
         # flag flipped ON so `import _secantus_server` works in the project
         # venv — that's what `invoke validate --server rust` launches.
@@ -188,14 +198,14 @@ jobs:
             ${{ runner.os }}-node-modules-
 
       - name: Set up JDK
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server'
         uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a  # v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -260,6 +270,10 @@ jobs:
           tools: composer
 
       - name: Run ${{ matrix.driver.name }} validation
+        env:
+          # gauge_common.rust_binary()'s default search only covers the cargo
+          # target dir; the storage-engine sync stages the daemon in .venv/bin.
+          SECANTUSDB_BIN: ${{ matrix.driver.name == 'java-rust-server' && '.venv/bin/secantusd-rs' || '' }}
         run: uv run python -m invoke ${{ matrix.driver.task }}
 
       - name: Show report summary
@@ -330,8 +344,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add docs/validation-report*.md
-          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby + rust + php-lib + php-ext + pymongo-vs-Rust-server)"
+          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby + rust + php-lib + php-ext + pymongo-vs-Rust-server + java-vs-Rust-server)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver / php-library / php-extension validation reports, plus the pymongo-vs-Rust-server R8 gate. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php output."
+            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver / php-library / php-extension validation reports, plus the pymongo-vs-Rust-server R8 gate and its java-vs-Rust-server analogue. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php output."
