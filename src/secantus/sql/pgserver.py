@@ -272,6 +272,17 @@ class SecantusPGServer:
             if session is not None:
                 self._notify.unlisten_all(session)  # drop this conn's LISTENs
                 self._activity.unregister(session)  # drop from pg_stat_activity (#137)
+            # Release this thread's cached WT session + cursors back to the
+            # engine, exactly like the Mongo server's teardown (server.py).
+            # Without this every pg connection leaked its WT session: the
+            # dead thread's positioned cursors kept pages pinned, and after a
+            # few hundred connections cache eviction livelocked with an
+            # application thread stuck in __wt_cache_eviction_worker while
+            # holding the storage RLock — every other connection then queued
+            # forever (the psycopg gauge's single-daemon run wedged at
+            # ~test 420, three out of three runs).
+            with contextlib.suppress(Exception):
+                self.storage._reset_thread_session()
             with self._conns_lock:
                 self._conns.discard(conn)
 
@@ -531,7 +542,14 @@ class SecantusPGServer:
                 return
             else:  # pragma: no cover - client desync
                 break
-        data = pgwire.decode_text(b"".join(chunks), session.wire_encoding)
+        try:
+            data = pgwire.decode_text(b"".join(chunks), session.wire_encoding)
+        except UnicodeDecodeError:
+            # Binary/garbage COPY payloads must surface as a faithful SQL
+            # error, not an internal one.
+            raise errors.SQLError(
+                "22021", f'invalid byte sequence for encoding "{session.wire_encoding}"'
+            ) from None
         if plan.fmt == "csv":
             rows = copyfmt.parse_csv(
                 data, delimiter=plan.delimiter, null=plan.null, header=plan.header

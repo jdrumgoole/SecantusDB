@@ -710,3 +710,34 @@ def test_pg_prepared_statements_lists_wire_prepared(server):
         cur.execute("select name, from_sql from pg_prepared_statements")
         rows = cur.fetchall()
         assert rows and all(fs is False for _n, fs in rows)
+
+
+def test_connection_teardown_releases_wt_session(server):
+    """Every pg connection thread caches a WT session; the handler's teardown
+    must release it (like the Mongo server does). Left leaked, dead threads'
+    positioned cursors pin cache pages until WT eviction livelocks with an
+    application thread stuck in __wt_cache_eviction_worker holding the storage
+    RLock — the full psycopg gauge wedged at ~400 connections, 3 runs of 3."""
+    import time as _time
+
+    storage = server.storage
+    with connect(server) as conn:
+        conn.execute("create table wt_leak (a int4)")
+        conn.commit()
+    baseline = len(storage._all_sessions)
+    for _ in range(8):
+        with connect(server) as conn:
+            # Must WRITE — reads use per-call sessions; it's the write path
+            # that caches the per-thread WT session (verified: 8 writer
+            # connections leaked 8 sessions before the teardown fix).
+            conn.execute("insert into wt_leak values (1)")
+            conn.commit()
+    # Teardown runs on the handler thread after the client closes; give it a beat.
+    deadline = _time.monotonic() + 10
+    while _time.monotonic() < deadline:
+        if len(storage._all_sessions) <= baseline + 1:
+            break
+        _time.sleep(0.05)
+    assert len(storage._all_sessions) <= baseline + 1, (
+        f"WT sessions leaked: {baseline} -> {len(storage._all_sessions)} after 8 connections"
+    )
