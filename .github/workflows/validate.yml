@@ -286,6 +286,17 @@ jobs:
           path: ${{ matrix.driver.report }}
           if-no-files-found: error
 
+      # The raw gauge output (pytest-json / JUnit XML / mocha JSON / ...) feeds
+      # the cross-driver summary regeneration in the aggregate job. Each runner
+      # executes exactly one gauge, so its .validation/ holds only that gauge's
+      # artifacts.
+      - name: Upload raw gauge output
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: raw-${{ matrix.driver.name }}
+          path: .validation/
+          if-no-files-found: error
+
   aggregate:
     name: Aggregate reports and open PR
     needs: validate
@@ -325,17 +336,42 @@ jobs:
           fi
           ls -la docs/validation-report*.md
 
+      - name: Reassemble .validation from raw artifacts
+        run: |
+          shopt -s nullglob
+          mkdir -p .validation
+          for d in artifacts/raw-*/; do
+            cp -R "$d". .validation/
+          done
+          ls .validation/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Regenerate cross-driver summary
+        # --no-project: the generator is stdlib-only and reads the package
+        # version straight from src/, so no WT build is needed here.
+        run: |
+          PYTHONPATH=. uv run --no-project python -m validation_summary.generate \
+            --raw-dir .validation --out docs/validation-summary.md
+          head -20 docs/validation-summary.md
+
       - name: Track new report files
         # `git diff --quiet` is blind to untracked files (a brand-new
         # gauge's report, e.g. validation-report-rust-server.md, would be
         # invisible). Intent-to-add makes them show up in the diff.
-        run: git add --intent-to-add docs/validation-report*.md
+        run: git add --intent-to-add docs/validation-report*.md docs/validation-summary.md
 
       - name: Open PR if reports changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if git diff --quiet docs/validation-report*.md; then
+          if git diff --quiet docs/validation-report*.md docs/validation-summary.md; then
             echo "No change to validation reports."
             exit 0
           fi
@@ -343,9 +379,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add docs/validation-report*.md
-          git commit -m "Refresh validation reports (pymongo + go + node + java + ruby + rust + php-lib + php-ext + pymongo-vs-Rust-server + java-vs-Rust-server)"
+          git add docs/validation-report*.md docs/validation-summary.md
+          git commit -m "Refresh validation reports + cross-driver summary (pymongo + go + node + java + ruby + rust + php-lib + php-ext + pymongo-vs-Rust-server + java-vs-Rust-server)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver / php-library / php-extension validation reports, plus the pymongo-vs-Rust-server R8 gate and its java-vs-Rust-server analogue. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php output."
+            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver / php-library / php-extension validation reports, plus the pymongo-vs-Rust-server R8 gate and its java-vs-Rust-server analogue. The cross-driver summary (docs/validation-summary.md) is regenerated from the same run's raw artifacts. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php output."
