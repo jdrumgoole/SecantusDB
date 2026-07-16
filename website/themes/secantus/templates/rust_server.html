@@ -14,7 +14,7 @@
     <p class="section-lead">A whole second server, written in Rust from the wire up &mdash; dispatch, cursors, change streams, and WiredTiger storage &mdash; with no Python in the request path. Same wire protocol, same conformance gauges, a single standalone binary.</p>
     <div class="ctas">
       <a class="btn btn-primary" href="{{ SECANTUS_GITHUB_URL }}/releases" rel="noopener">Download a binary &rarr;</a>
-      <a class="btn btn-ghost" href="{{ SECANTUS_DOCS_URL }}" rel="noopener">Read the docs</a>
+      <a class="btn btn-ghost" href="{{ SECANTUS_DOCS_URL }}servers.html" rel="noopener">Read the docs</a>
     </div>
   </div>
 </section>
@@ -26,7 +26,7 @@
     <div class="benefits">
       <div class="benefit">
         <h3><span class="pip"></span>One standalone binary</h3>
-        <p>The Rust server ships as a single executable with WiredTiger statically linked &mdash; <code>secantusdb-rs</code>. No interpreter, no virtualenv, no system Mongo. Drop it in a container or a CI image and run.</p>
+        <p>The Rust server ships as a single executable with WiredTiger statically linked &mdash; <code>secantusd-rs</code>. No interpreter, no virtualenv, no system Mongo. Drop it in a container or a CI image and run.</p>
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>No Python in the request path</h3>
@@ -38,7 +38,7 @@
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>Same conformance bar</h3>
-        <p>The unmodified driver-conformance gauges run against the Rust server too &mdash; the same upstream test suites the driver maintainers run against a real <code>mongod</code>.</p>
+        <p>The unmodified driver-conformance gauges run against the Rust server too &mdash; the same upstream suites the driver maintainers run against a real <code>mongod</code>. It passes 99.5% of pymongo's own test suite, level with the Python server; the <a href="{{ SECANTUS_DOCS_URL }}feature-comparison.html" rel="noopener">feature comparison</a> maps both servers against real MongoDB, feature by feature.</p>
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>Real WiredTiger storage</h3>
@@ -59,16 +59,16 @@
     <div class="install-cols">
       <div class="install-col">
         <h3>Bundled in the wheel</h3>
-        <p>The <code>secantus</code> wheel ships the Rust server as the <code>secantusdb-rs</code> command, alongside the pure-Python <code>secantusdb</code>.</p>
+        <p>The <code>secantus</code> wheel ships the Rust server as the <code>secantusd-rs</code> command, alongside the pure-Python <code>secantusdb</code>.</p>
         <pre class="install-code"><code>pip install SecantusDB
-secantusdb-rs --port 27017 --storage-path ./data</code></pre>
+secantusd-rs --port 27017 --storage-path ./data</code></pre>
       </div>
       <div class="install-col">
         <h3>Standalone binary</h3>
-        <p>Prebuilt static-WiredTiger archives are published on GitHub Releases (Linux x86_64 and macOS arm64) &mdash; no Python at all.</p>
+        <p>Prebuilt static-WiredTiger archives are published on GitHub Releases (Linux x86_64 and macOS arm64) &mdash; no Python at all. Look for the <code>secantusdb-v&lt;version&gt;</code> tags; each archive ships with a <code>.sha256</code> checksum.</p>
         <pre class="install-code"><code># download + extract from the releases page,
-# then run the secantusdb-rs binary:
-./secantusdb-rs --port 27017 --storage-path ./data</code></pre>
+# then run the secantusd-rs binary:
+./secantusd-rs --port 27017 --storage-path ./data</code></pre>
         <p class="install-cta"><a href="{{ SECANTUS_GITHUB_URL }}/releases" rel="noopener">GitHub Releases &rarr;</a></p>
       </div>
     </div>
@@ -87,7 +87,7 @@ secantusdb-rs --port 27017 --storage-path ./data</code></pre>
         <tbody>
           <tr><th>Request path</th><td>Pure Python</td><td>Pure Rust</td></tr>
           <tr><th>Best for</th><td>Hackability, the widest feature surface, the reference</td><td>Speed and a standalone, dependency-free binary</td></tr>
-          <tr><th>How you run it</th><td><code>pip install SecantusDB</code> &rarr; <code>SecantusDBServer(...)</code></td><td><code>secantusdb-rs</code> binary (bundled in the wheel or from Releases)</td></tr>
+          <tr><th>How you run it</th><td><code>pip install SecantusDB</code> &rarr; <code>SecantusDBServer(...)</code></td><td><code>secantusd-rs</code> binary (bundled in the wheel or from Releases)</td></tr>
           <tr><th>Python required at runtime</th><td>Yes</td><td>No</td></tr>
           <tr><th>Storage engine</th><td>WiredTiger</td><td>WiredTiger</td></tr>
           <tr><th>Wire protocol &amp; drivers</th><td>MongoDB <code>OP_MSG</code> &mdash; all drivers</td><td>MongoDB <code>OP_MSG</code> &mdash; all drivers</td></tr>
@@ -97,8 +97,14 @@ secantusdb-rs --port 27017 --storage-path ./data</code></pre>
     </div>
     <div class="ctas" style="margin-top: 36px;">
       <a class="btn btn-primary" href="{{ SECANTUS_GITHUB_URL }}/releases" rel="noopener">Download the binary</a>
-      <a class="btn btn-secondary" href="{{ SECANTUS_DOCS_URL }}" rel="noopener">Read the docs</a>
+      <a class="btn btn-secondary" href="{{ SECANTUS_DOCS_URL }}servers.html" rel="noopener">Read the docs</a>
     </div>
+    <p class="section-lead" style="margin-top: 24px;">Rust-server documentation on Read&nbsp;the&nbsp;Docs:
+      <a href="{{ SECANTUS_DOCS_URL }}servers.html" rel="noopener">The two servers</a> &middot;
+      <a href="{{ SECANTUS_DOCS_URL }}feature-comparison.html" rel="noopener">Feature comparison</a> &middot;
+      <a href="{{ SECANTUS_DOCS_URL }}validation-report-rust-server.html" rel="noopener">Conformance report</a> &middot;
+      <a href="{{ SECANTUS_DOCS_URL }}recovery.html" rel="noopener">Backup &amp; point-in-time recovery</a>
+    </p>
   </div>
 </section>
 {% endblock %}
