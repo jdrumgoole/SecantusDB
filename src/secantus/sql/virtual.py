@@ -1886,6 +1886,24 @@ def _pg_database(db: str, session: Session, storage: Any, catalog: Catalog) -> l
     return [{"oid": 1, "datname": db, "datallowconn": True}]
 
 
+def _pg_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """The ``pg_tables`` system view — one row per user table (psql's ``\\dt``
+    and various clients' bootstrap queries read it)."""
+    return [
+        {
+            "schemaname": "public",
+            "tablename": t.name,
+            "tableowner": session.user,
+            "tablespace": None,
+            "hasindexes": bool(getattr(t, "indexes", None)),
+            "hasrules": False,
+            "hastriggers": False,
+            "rowsecurity": False,
+        }
+        for t in _user_tables(db, catalog)
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
@@ -2066,6 +2084,21 @@ _register(
     "pg_namespace",
     [("oid", "int4"), ("nspname", "text")],
     _pg_namespace,
+)
+_register(
+    "pg_catalog",
+    "pg_tables",
+    [
+        ("schemaname", "text"),
+        ("tablename", "text"),
+        ("tableowner", "text"),
+        ("tablespace", "text"),
+        ("hasindexes", "bool"),
+        ("hasrules", "bool"),
+        ("hastriggers", "bool"),
+        ("rowsecurity", "bool"),
+    ],
+    _pg_tables,
 )
 _register(
     "pg_catalog",

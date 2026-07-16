@@ -108,6 +108,14 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
         return ("set_config", session.settings[guc], "text")
     if name == "pg_backend_pid":
         return ("pg_backend_pid", session.backend_pid, "int4")
+    if name == "pg_sleep":
+        import time as _time
+
+        # PG returns void after sleeping. Capped: our per-connection threads
+        # have no cancel path, so an unbounded sleep would pin one forever.
+        seconds = float(args[0]) if args and args[0] is not None else 0.0
+        _time.sleep(max(0.0, min(seconds, 30.0)))
+        return ("pg_sleep", "", "text")
     if name in ("pg_is_in_recovery",):
         return (name, False, "bool")
     if name in ("jsonb_build_object", "json_build_object"):

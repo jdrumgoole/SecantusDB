@@ -322,16 +322,42 @@ def ready_for_query(status: bytes = b"I") -> bytes:
     return _msg("Z", status)
 
 
-def row_description(columns: list[tuple[str, int]], formats: list[int] | None = None) -> bytes:
+# Fixed-width type OID -> pg_type.typlen (drivers surface it as Column
+# internal_size). Variable-width types report -1.
+_TYPLEN: dict[int, int] = {
+    16: 1,  # bool
+    20: 8,  # int8
+    21: 2,  # int2
+    23: 4,  # int4
+    26: 4,  # oid
+    700: 4,  # float4
+    701: 8,  # float8
+    1082: 4,  # date
+    1083: 8,  # time
+    1114: 8,  # timestamp
+    1184: 8,  # timestamptz
+    1186: 16,  # interval
+    1266: 12,  # timetz
+    2950: 16,  # uuid
+    790: 8,  # money
+}
+
+
+def row_description(
+    columns: list[tuple[str, int]],
+    formats: list[int] | None = None,
+    encoding: str | None = None,
+) -> bytes:
     """``columns`` is a list of (name, type_oid); ``formats`` the per-column result
-    format codes (0=text, 1=binary), defaulting to all-text. Sizes left -1."""
+    format codes (0=text, 1=binary), defaulting to all-text. Column names encode
+    in the client's ``client_encoding`` (``encoding``; UTF-8 when None)."""
     payload = bytearray(_INT16.pack(len(columns)))
     for i, (name, type_oid) in enumerate(columns):
-        payload += _cstr(name)
+        payload += name.encode(encoding or "utf-8", errors="replace") + b"\x00"
         payload += _INT32.pack(0)  # table OID (unknown)
         payload += _INT16.pack(0)  # column attribute number
         payload += _INT32.pack(type_oid)
-        payload += _INT16.pack(-1)  # type size (variable)
+        payload += _INT16.pack(_TYPLEN.get(type_oid, -1))  # type size
         payload += _INT32.pack(-1)  # type modifier
         payload += _INT16.pack(formats[i] if formats is not None else 0)  # 0=text, 1=binary
     return _msg("T", bytes(payload))

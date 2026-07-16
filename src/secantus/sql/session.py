@@ -33,6 +33,14 @@ GUC_DEFAULTS: dict[str, str] = {
     "search_path": '"$user", public',
     "application_name": "",
     "is_superuser": "off",
+    # Transaction characteristics — single-node, so these are honest constants
+    # (SET TRANSACTION is a no-op) but ``current_setting`` must report them.
+    "transaction_isolation": "read committed",
+    "transaction_read_only": "off",
+    "transaction_deferrable": "off",
+    "default_transaction_isolation": "read committed",
+    "default_transaction_read_only": "off",
+    "default_transaction_deferrable": "off",
 }
 
 # Postgres encoding name (canonicalised: upper, no -_/ separators) -> Python
