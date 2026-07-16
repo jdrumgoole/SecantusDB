@@ -862,3 +862,39 @@ def test_temporal_params_keep_their_type(server):
             "select '2020-05-06'::date + 1 = %s", [_dt.date(2020, 5, 7)]
         ).fetchone() == (True,)
         assert conn.execute("select '1 sec'::interval").fetchone() == (_dt.timedelta(seconds=1),)
+
+
+def test_composite_registration_roundtrip(server):
+    """Composite types materialize end-to-end: the minted (allocation-stable)
+    OID rides RowDescription so a registered psycopg loader returns named
+    tuples; row(...) builds anonymous records; casts parse record literals;
+    field access types by the declared field."""
+    from psycopg.types.composite import CompositeInfo, register_composite
+
+    with connect(server, autocommit=True) as conn:
+        conn.execute("create type testcomp as (foo text, bar int8, baz float8)")
+        info = CompositeInfo.fetch(conn, "testcomp")
+        assert tuple(info.field_names) == ("foo", "bar", "baz")
+        register_composite(info, conn)
+
+        for binary in (False, True):
+            cur = conn.cursor(binary=binary)
+            row = cur.execute("select row('hello', 10, 20)::testcomp").fetchone()[0]
+            assert (row.foo, row.bar, row.baz) == ("hello", 10, 20.0)
+            assert isinstance(row.baz, float)
+
+        got = conn.execute("select '(foo,42,3.14)'::testcomp").fetchone()[0]
+        assert (got.foo, got.bar, got.baz) == ("foo", 42, 3.14)
+
+        # A registered dumper binds params with the minted oid; pg_typeof sees
+        # the type and field access types by the declared field.
+        t = info.python_type("x", 7, 1.5)
+        assert conn.execute("select pg_typeof(%s)::text, (%s).bar", [t, t]).fetchone() == (
+            "testcomp",
+            7,
+        )
+        # Anonymous records: psycopg's text loader yields strings; the binary
+        # record layout carries per-field oids, so fields come back typed.
+        assert conn.execute("select row(1, 'a')").fetchone()[0] == ("1", "a")
+        with conn.cursor(binary=True) as bcur:
+            assert bcur.execute("select row(1, 'a')").fetchone()[0] == (1, "a")

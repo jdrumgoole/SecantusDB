@@ -1000,6 +1000,56 @@ def _render_pg_float(value: float) -> str:
     return s[:-2] if s.endswith(".0") else s
 
 
+def parse_pg_record_literal(text: str) -> list[str | None]:
+    """Parse a Postgres record text literal ``(a,"b,c",,\\"q\\")`` into raw field
+    strings (None for an empty/NULL field). Handles double-quoted fields with
+    ``""`` doubling and backslash escapes, including nested ``(…)`` records
+    carried as quoted text."""
+    s = text.strip()
+    if not (s.startswith("(") and s.endswith(")")):
+        raise ValueError(f"malformed record literal: {text!r}")
+    body = s[1:-1]
+    fields: list[str | None] = []
+    buf: list[str] = []
+    quoted = was_quoted = False
+    i, n = 0, len(body)
+    while i <= n:
+        c = body[i] if i < n else ","  # virtual trailing comma flushes the last field
+        if quoted:
+            if c == "\\" and i + 1 < n:
+                buf.append(body[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                if i + 1 < n and body[i + 1] == '"':
+                    buf.append('"')
+                    i += 2
+                    continue
+                quoted = False
+                i += 1
+                continue
+            buf.append(c)
+            i += 1
+            continue
+        if c == '"':
+            quoted = was_quoted = True
+            i += 1
+            continue
+        if c == ",":
+            text_field = "".join(buf)
+            fields.append(text_field if (text_field or was_quoted) else None)
+            buf, was_quoted = [], False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            buf.append(body[i + 1])
+            i += 2
+            continue
+        buf.append(c)
+        i += 1
+    return fields
+
+
 def _render_pg_composite(value: dict) -> str:
     """Render a composite value (a subdocument, already in field order) as the
     Postgres record text literal ``(f1,f2,…)``. A NULL field is empty; a field is

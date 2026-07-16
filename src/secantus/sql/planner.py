@@ -2360,7 +2360,7 @@ def plan_constant_select(
             columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
     pg_oids: list[int | None] = [None] * len(columns)
     for i, e in enumerate(stmt.expressions):
-        override = _constant_enum_override(e, ctx)
+        override = _constant_enum_override(e, ctx) or _constant_composite_extra_override(e, ctx)
         if override is not None:
             tag, oid = override
             pg_oids[i] = oid
@@ -2389,6 +2389,53 @@ def _constant_enum_override(e: exp.Expression, ctx: Any) -> tuple[str | None, in
         elem_oid = scalar.enum_cast_oid(inner, ctx)
         if elem_oid is not None:
             return ("text[]", elem_oid + USER_TYPE_ARRAY_OID_OFFSET)
+    if scalar._composite_cast_target(target.to, ctx) is not None:
+        # ``'(a,b)'::testcomp`` — describe with the minted composite oid so a
+        # registered psycopg loader fires; the value is a record subdoc, tagged
+        # composite so it renders as ``(a,b)``.
+        from secantus.sql import virtual
+        from secantus.sql.catalog import fold_type_name
+
+        name = fold_type_name(target.to.sql(dialect="postgres"))
+        oid = virtual._composite_oids(ctx.db, ctx.catalog).get(name)
+        if oid is not None:
+            return ("composite", oid)
+    return None
+
+
+def _constant_composite_extra_override(
+    e: exp.Expression, ctx: Any
+) -> tuple[str | None, int] | None:
+    """Overrides beyond plain casts: an ``array[…::testcomp]`` describes with
+    the composite's paired array oid; ``('…'::testcomp).field`` types as the
+    field's declared tag."""
+    if ctx is None or getattr(ctx, "catalog", None) is None or getattr(ctx, "db", None) is None:
+        return None
+    from secantus.sql import scalar, virtual
+    from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET, fold_type_name
+
+    target = e.this if isinstance(e, exp.Alias) else e
+    if isinstance(target, exp.Array) and target.expressions:
+        elems = target.expressions
+        if all(
+            isinstance(el, exp.Cast) and scalar._composite_cast_target(el.to, ctx) is not None
+            for el in elems
+        ):
+            name = fold_type_name(elems[0].to.sql(dialect="postgres"))
+            oid = virtual._composite_oids(ctx.db, ctx.catalog).get(name)
+            if oid is not None:
+                return ("composite[]", oid + USER_TYPE_ARRAY_OID_OFFSET)
+    if isinstance(target, exp.Dot) and isinstance(target.this, exp.Paren):
+        inner = target.this.this
+        if isinstance(inner, exp.Cast):
+            fields = scalar._composite_cast_target(inner.to, ctx)
+            if fields is not None:
+                fname = str(target.expression.name)
+                for entry in fields:
+                    if entry[0] == fname:
+                        sub = entry[2] if len(entry) > 2 else None
+                        tag = "composite" if sub is not None else entry[1]
+                        return (tag, typemap.PG_OID.get(tag, 25))
     return None
 
 
@@ -3026,13 +3073,14 @@ def _value_to_node(value: Any) -> exp.Expression:
             to=exp.DataType.build("interval"),
         )
     if isinstance(value, typemap.TaggedText):
-        # A range/multirange-declared parameter (or an array of them) — the
+        # A typed-text parameter (range/multirange, or a user composite) — the
         # ``::tag`` cast coerces the text into the structured value so equality
-        # against another range compares subdocs, not str-vs-dict.
-        return exp.Cast(
-            this=exp.Literal.string(str(value)),
-            to=exp.DataType.build(value.tag, dialect="postgres"),
-        )
+        # against another value compares subdocs, not str-vs-dict.
+        try:
+            dtype = exp.DataType.build(value.tag, dialect="postgres")
+        except Exception:  # noqa: BLE001 — a user-defined type name needs udt
+            dtype = exp.DataType.build(value.tag, dialect="postgres", udt=True)
+        return exp.Cast(this=exp.Literal.string(str(value)), to=dtype)
     if isinstance(value, typemap.JsonText):
         # A json/jsonb-declared parameter — substitute as a ``::jsonb`` cast so
         # the raw JSON text parses into a real JSON value and types as json (a
@@ -8108,7 +8156,10 @@ def _tag_to_regtype(tag: str) -> str:
 
 
 def _pg_typeof_name(
-    arg: exp.Expression, resolve: Resolve, param_oids: tuple[int, ...] | list[int]
+    arg: exp.Expression,
+    resolve: Resolve,
+    param_oids: tuple[int, ...] | list[int],
+    user_type_name: Any = None,
 ) -> str:
     """The regtype text ``pg_typeof(arg)`` prints for ``arg``'s static type."""
     # An untyped string literal (and a bare NULL) is the ``unknown`` pseudo-type
@@ -8117,6 +8168,17 @@ def _pg_typeof_name(
         return "unknown"
     if isinstance(arg, exp.Literal) and arg.is_string:
         return "unknown"
+    # A cast to a user-declared type (a substituted composite/enum parameter
+    # arrives as ``'…'::testcomp``) prints the type's own name.
+    if (
+        isinstance(arg, exp.Cast)
+        and isinstance(arg.to, exp.DataType)
+        and arg.to.this
+        and getattr(arg.to.this, "name", None) == "USERDEFINED"
+    ):
+        from secantus.sql.catalog import fold_type_name
+
+        return fold_type_name(arg.to.sql(dialect="postgres"))
     # A bare ``$N`` types as the OID the client declared in Parse (psycopg's
     # ``select pg_typeof(%s)`` sends the value's type there); an undeclared
     # parameter (OID 0) falls to text, the type Postgres assumes when the call
@@ -8127,7 +8189,14 @@ def _pg_typeof_name(
         except (TypeError, ValueError):
             return "text"
         oid = param_oids[idx] if 0 <= idx < len(param_oids) else 0
-        return _tag_to_regtype(typemap.OID_TO_TAG.get(oid, "text"))
+        tag = typemap.OID_TO_TAG.get(oid)
+        if tag is None and oid and user_type_name is not None:
+            # A minted user-type oid (registered composite/enum dumpers declare
+            # them) — resolve through the caller's catalog.
+            uname = user_type_name(oid)
+            if uname:
+                return str(uname)
+        return _tag_to_regtype(tag or "text")
     return _tag_to_regtype(_infer_scalar_tag(arg, resolve))
 
 
@@ -8135,6 +8204,7 @@ def rewrite_pg_typeof(
     stmt: exp.Expression,
     table: TableDef | None,
     param_oids: tuple[int, ...] | list[int] = (),
+    user_type_name: Any = None,
 ) -> None:
     """Replace ``pg_typeof(x)`` calls with their regtype text, in place.
 
@@ -8148,7 +8218,7 @@ def rewrite_pg_typeof(
         if str(node.this).lower() != "pg_typeof" or not node.expressions:
             continue
         try:
-            name = _pg_typeof_name(node.expressions[0], resolve, param_oids)
+            name = _pg_typeof_name(node.expressions[0], resolve, param_oids, user_type_name)
         except errors.SQLError:
             continue  # let the normal path surface the real error
         parent = node.parent
@@ -8255,6 +8325,9 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # Multirange constructor (``int4multirange(...)``) -> the multirange type.
     if isinstance(node, exp.Anonymous) and str(node.this).lower() in typemap._MULTIRANGE_TAGS:
         return str(node.this).lower()
+    # ``row(...)`` -> an anonymous record.
+    if isinstance(node, exp.Anonymous) and str(node.this).lower() == "row":
+        return "composite"
     # ``range_merge(a, b)`` -> the operands' range type.
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "range_merge":
         rtag = _range_tag_of(node.expressions, resolve)

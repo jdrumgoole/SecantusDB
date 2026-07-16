@@ -1490,6 +1490,58 @@ def enum_cast_target(datatype: exp.Expression | None, ctx: ScalarContext | None)
     return getter(ctx.db, name) if getter is not None else None
 
 
+def _composite_cast_target(
+    datatype: exp.Expression | None, ctx: ScalarContext | None
+) -> list | None:
+    """The composite type's field list when ``datatype`` is a USERDEFINED cast
+    target naming a declared composite, else None."""
+    if ctx is None or getattr(ctx, "catalog", None) is None or getattr(ctx, "db", None) is None:
+        return None
+    if not (
+        isinstance(datatype, exp.DataType)
+        and datatype.this
+        and getattr(datatype.this, "name", None) == "USERDEFINED"
+    ):
+        return None
+    from secantus.sql.catalog import fold_type_name
+
+    name = fold_type_name(datatype.sql(dialect="postgres"))
+    getter = getattr(ctx.catalog, "get_composite", None)
+    return getter(ctx.db, name) if getter is not None else None
+
+
+def _composite_from_text(text: str, fields: list, type_name: str) -> dict:
+    """Record text literal -> a typed subdocument keyed by the composite's field
+    names; a field that is itself composite recurses on its quoted ``(…)`` text."""
+    return _composite_from_seq(typemap.parse_pg_record_literal(text), fields, type_name)
+
+
+def _composite_from_seq(values: Any, fields: list, type_name: str) -> dict:
+    """Positional record values (raw text fields, a ``row(…)`` result's values,
+    or nested subdocs) -> a typed subdocument keyed by the composite's fields."""
+    values = list(values)
+    if len(values) != len(fields):
+        raise errors.SQLError(
+            "22P02",
+            f'malformed record literal for type "{type_name}": '
+            f"expected {len(fields)} fields, got {len(values)}",
+        )
+    out: dict[str, Any] = {}
+    for val, entry in zip(values, fields, strict=True):
+        fname, tag = entry[0], entry[1]
+        sub = entry[2] if len(entry) > 2 else None
+        if val is None:
+            out[fname] = None
+        elif sub is not None:
+            if isinstance(val, dict):
+                out[fname] = _composite_from_seq(val.values(), list(sub), tag)
+            else:
+                out[fname] = _composite_from_text(str(val), list(sub), tag)
+        else:
+            out[fname] = typemap.coerce(val, tag)
+    return out
+
+
 def enum_cast_oid(datatype: exp.Expression | None, ctx: ScalarContext | None) -> int | None:
     """The minted pg_type oid for an enum cast target, or None when the target
     isn't a known enum. Legacy enum docs written before oids were persisted fall
@@ -1568,6 +1620,25 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             return None
         items = value if isinstance(value, list) else typemap._parse_pg_array_literal(str(value))
         return [validate_enum_label(elem_doc, v) for v in items]
+    # ``'(foo,42)'::testcomp`` — a cast to a declared composite type parses the
+    # record literal into the typed, field-named subdocument.
+    comp_fields = _composite_cast_target(node.to, ctx)
+    if comp_fields is not None:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, dict):
+                # A ``row(…)`` result (anonymous f1..fN keys) or an existing
+                # subdoc — remap positionally onto the type's named fields.
+                return _composite_from_seq(
+                    value.values(), comp_fields, node.to.sql(dialect="postgres")
+                )
+            return _composite_from_text(str(value), comp_fields, node.to.sql(dialect="postgres"))
+        except ValueError as e:
+            raise errors.SQLError(
+                "22P02",
+                f"malformed record literal: {str(value)[:80]!r}",
+            ) from e
     # ``'int4'::regtype`` — normalize the type name to its canonical pretty
     # spelling so it compares equal to what ``pg_typeof`` prints. A numeric
     # operand (``21::regtype`` / ``'21'::regtype``) is a type OID, resolved to
@@ -2097,6 +2168,10 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
     if name in ("jsonb_pretty",):
         v = args[0] if args else None
         return None if v is None else json.dumps(v, indent=4, default=str)
+    if name == "row":
+        # ``row(a, b, …)`` — an anonymous record value (Postgres names the
+        # fields f1..fN); rendered as ``(a,b)`` and described as RECORD (2249).
+        return {f"f{i + 1}": v for i, v in enumerate(args)}
     if name == "coalesce":
         for a in args:
             if a is not None:
