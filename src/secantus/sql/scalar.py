@@ -1320,8 +1320,76 @@ def _cast_scalar(value: Any, tag: str) -> Any:
     return value
 
 
+def enum_cast_target(datatype: exp.Expression | None, ctx: ScalarContext | None) -> Any | None:
+    """The stored enum doc when ``datatype`` is a USERDEFINED cast target naming
+    a known enum (``'ok'::mood`` / ``%s::"CamelCaseEnum"``), else None. Applies
+    Postgres identifier folding to the spelled name."""
+    if ctx is None or getattr(ctx, "catalog", None) is None or getattr(ctx, "db", None) is None:
+        return None
+    if not (
+        isinstance(datatype, exp.DataType)
+        and datatype.this
+        and getattr(datatype.this, "name", None) == "USERDEFINED"
+    ):
+        return None
+    from secantus.sql.catalog import fold_type_name
+
+    name = fold_type_name(datatype.sql(dialect="postgres"))
+    getter = getattr(ctx.catalog, "get_enum", None)
+    return getter(ctx.db, name) if getter is not None else None
+
+
+def enum_cast_oid(datatype: exp.Expression | None, ctx: ScalarContext | None) -> int | None:
+    """The minted pg_type oid for an enum cast target, or None when the target
+    isn't a known enum. Legacy enum docs written before oids were persisted fall
+    back to the positional mint via ``Catalog.enum_type_oids``."""
+    doc = enum_cast_target(datatype, ctx)
+    if doc is None:
+        return None
+    oid = doc.get("oid")
+    if oid is None:
+        oid = ctx.catalog.enum_type_oids(ctx.db).get(doc["enum"])
+    return oid
+
+
+def validate_enum_label(enum_doc: Any, value: Any) -> Any:
+    """Postgres cast-to-enum semantics: NULL passes, any other value must be a
+    string equal to one of the declared labels (else 22P02)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in enum_doc["labels"]:
+        raise errors.SQLError(
+            "22P02", f'invalid input value for enum {enum_doc["enum"]}: "{value}"'
+        )
+    return value
+
+
+def enum_array_cast_element(
+    datatype: exp.Expression | None, ctx: ScalarContext | None
+) -> Any | None:
+    """The element enum doc when ``datatype`` is an ARRAY of a declared enum
+    (``%s::mood[]``), else None."""
+    if not (isinstance(datatype, exp.DataType) and datatype.this == exp.DataType.Type.ARRAY):
+        return None
+    inner = datatype.args.get("expressions") or []
+    return enum_cast_target(inner[0], ctx) if inner else None
+
+
 def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
+    # ``'ok'::mood`` — a cast to a declared enum validates the label (22P02) and
+    # yields the label text (an enum's value form IS its text).
+    enum_doc = enum_cast_target(node.to, ctx)
+    if enum_doc is not None:
+        return validate_enum_label(enum_doc, value)
+    # ``%s::mood[]`` — an enum-array cast validates each element; the value is a
+    # list of labels (a text literal ``{a,b}`` parses first).
+    elem_doc = enum_array_cast_element(node.to, ctx)
+    if elem_doc is not None:
+        if value is None:
+            return None
+        items = value if isinstance(value, list) else typemap._parse_pg_array_literal(str(value))
+        return [validate_enum_label(elem_doc, v) for v in items]
     # ``'int4'::regtype`` — normalize the type name to its canonical pretty
     # spelling so it compares equal to what ``pg_typeof`` prints. A numeric
     # operand (``21::regtype`` / ``'21'::regtype``) is a type OID, resolved to
@@ -1341,10 +1409,14 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             name = typemap.regtype_from_oid(oid_operand)
             if name is None and ctx is not None and ctx.catalog is not None:
                 # A user-declared type's oid (enum / domain / composite) —
-                # psycopg's TypeInfo.fetch renders ``t.oid::regtype::text``.
+                # psycopg's TypeInfo.fetch renders ``t.oid::regtype::text`` and
+                # its ClientCursor pastes the result verbatim as a cast suffix,
+                # so a mixed-case name must come back quoted like real PG.
                 from secantus.sql import virtual
 
                 name = virtual.user_type_name(ctx.db, ctx.catalog, oid_operand)
+                if name is not None:
+                    name = virtual.quote_type_name(name)
             if name is None:
                 raise errors.SQLError("42704", f"type with OID {oid_operand} does not exist")
             return name

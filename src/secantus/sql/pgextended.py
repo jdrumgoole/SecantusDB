@@ -27,7 +27,7 @@ import bson
 from sqlglot import exp
 
 from secantus.sql import engine, errors, pgwire, planner, typemap
-from secantus.sql.catalog import Catalog
+from secantus.sql.catalog import ENUM_TYPE_OID_BASE, USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.session import Session
 
 logger = logging.getLogger(__name__)
@@ -460,13 +460,27 @@ _ARRAY_ELEM_BY_OID: dict[int, tuple[int, str]] = {
 # client can still bind an array parameter with the plain-json OIDs.
 _ARRAY_ELEM_BY_OID[199] = (114, "json")
 
+# A user type's paired array oid is its own oid + USER_TYPE_ARRAY_OID_OFFSET
+# (see catalog.py); everything at or above this floor is a user-type array whose
+# elements travel as text (an enum's wire form is its label).
+_USER_ARRAY_OID_FLOOR = ENUM_TYPE_OID_BASE + USER_TYPE_ARRAY_OID_OFFSET
+
+
+def _array_elem_info(arr_oid: int) -> tuple[int, str]:
+    """(element oid, element tag) for an array-type oid — modelled built-ins from
+    the static table, user-type arrays derived from the offset scheme."""
+    info = _ARRAY_ELEM_BY_OID.get(arr_oid)
+    if info is not None:
+        return info
+    return (arr_oid - USER_TYPE_ARRAY_OID_OFFSET, "text")
+
 
 def _encode_array(
     value: Any, arr_oid: int, tag: str | None, encoding: str | None = "utf-8"
 ) -> bytes:
     """Binary-encode a one-dimensional array result (ndim/hasnull/elemoid header,
     one per-dim {len, lbound} pair, then length-prefixed elements)."""
-    elem_oid, elem_tag = _ARRAY_ELEM_BY_OID[arr_oid]
+    elem_oid, elem_tag = _array_elem_info(arr_oid)
     if isinstance(value, (list, tuple)):
         items = value
     else:
@@ -526,7 +540,7 @@ def _encode_value(
     enc = _OUT_BINARY.get(oid)
     if enc is not None:
         return enc(value)
-    if oid in _ARRAY_ELEM_BY_OID:
+    if oid in _ARRAY_ELEM_BY_OID or oid >= _USER_ARRAY_OID_FLOOR:
         return _encode_array(value, oid, tag, encoding)
     if oid == 3802:  # jsonb: 1-byte version header + JSON text (client encoding)
         return b"\x01" + (pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b"")
@@ -602,7 +616,10 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
     decoder = _BINARY.get(oid)
     if decoder is not None:
         return decoder(raw)
-    if oid in _ARRAY_ELEM_BY_OID:
+    if oid in _ARRAY_ELEM_BY_OID or oid >= _USER_ARRAY_OID_FLOOR:
+        # A user-type array oid (a registered enum's array dumper binds with the
+        # minted array oid); the embedded element oid is unknown to _BINARY, so
+        # elements fall back to text — which IS an enum's value form.
         return _decode_array(raw, encoding)
     return raw.decode(encoding or "utf-8", "replace")
 
@@ -690,9 +707,27 @@ class ExtendedSession:
             else:
                 fmt = formats[i]
             oid = prep.param_oids[i] if i < len(prep.param_oids) else 0
-            values.append(_decode_param(raw, fmt, oid, self.session.wire_encoding))
+            value = _decode_param(raw, fmt, oid, self.session.wire_encoding)
+            values.append(self._check_enum_param(oid, value))
         self.portals[portal] = Portal(portal, prep, values, result_formats=result_formats)
         return pgwire.bind_complete()
+
+    def _check_enum_param(self, oid: int, value: Any) -> Any:
+        """Postgres validates a parameter declared with an enum type oid against
+        the enum's labels at Bind (a psycopg ``register_enum`` dumper declares
+        params with the minted oid) — 22P02 for a label the type doesn't have."""
+        if value is None or not isinstance(oid, int) or oid < ENUM_TYPE_OID_BASE:
+            return value
+        from secantus.sql import scalar, virtual
+
+        db = self.session.database
+        name = virtual.user_type_name(db, self.catalog, oid)
+        if name is None:
+            return value
+        enum = self.catalog.get_enum(db, name)
+        if enum is None:
+            return value
+        return scalar.validate_enum_label(enum, value)
 
     def _describe(self, payload: bytes) -> bytes:
         kind, name = pgwire.parse_describe(payload)

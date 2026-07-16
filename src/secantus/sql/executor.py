@@ -498,6 +498,28 @@ def _drop_expr_index(table: Any, index_name: str, catalog: Catalog, storage: Any
             )
 
 
+def _out_column_descs(
+    cols: list[tuple[str, Any]], storage: Any, db: str | None
+) -> list[ColumnDesc]:
+    """Describe ``(out_name, Column)`` output pairs for a result.
+
+    An enum-typed column reports the enum's minted pg_type oid — the same mint
+    ``pg_type`` / ``pg_enum`` reflect — instead of text's 25, so a client that
+    registered the type from the catalog (psycopg's ``EnumInfo.fetch``)
+    recognises result columns. The value bytes are the label text either way
+    (an enum's binary wire form IS its text), so only the oid changes."""
+    enum_oids: dict[str, int] | None = None
+    out: list[ColumnDesc] = []
+    for name, col in cols:
+        oid = typemap.PG_OID.get(col.type_tag, 25)
+        if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:
+            if enum_oids is None:
+                enum_oids = Catalog(storage).enum_type_oids(db)
+            oid = enum_oids.get(col.enum_type, oid)
+        out.append(ColumnDesc(name, col.type_tag, oid))
+    return out
+
+
 def _returning_result(
     docs: list[dict[str, Any]],
     returning: list[tuple[str, Any, Any]],
@@ -513,10 +535,7 @@ def _returning_result(
     Each returning item is ``(name, Column, expr)``; a plain item (``expr`` None)
     reads straight from the doc, a computed one is evaluated per row against a
     scope over the returned doc."""
-    columns = [
-        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
-        for name, col, _ in returning
-    ]
+    columns = _out_column_descs([(name, col) for name, col, _ in returning], storage, db)
     ctx = None
     if any(expr is not None for _, _, expr in returning):
         from secantus.sql import scalar
@@ -1082,7 +1101,11 @@ def _apply_conflict_update(
 
 
 def execute_constant_select(plan: planner.ConstantSelectPlan) -> SQLResult:
-    columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag, _ in plan.columns]
+    oids = plan.pg_oids or [None] * len(plan.columns)
+    columns = [
+        ColumnDesc(name, tag, oid if oid is not None else typemap.PG_OID.get(tag, 25))
+        for (name, tag, _), oid in zip(plan.columns, oids, strict=True)
+    ]
     rows = [tuple(value for _, _, value in plan.columns)] if plan.emit else []
     return SQLResult(
         command_tag=f"SELECT {len(rows)}", columns=columns, rows=rows, rowcount=len(rows)
@@ -1114,10 +1137,7 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
         docs = storage.find_matching(
             db, plan.table.collection, plan.filter, skip=plan.skip, limit=plan.limit
         )
-    columns = [
-        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
-        for name, col in plan.out_columns
-    ]
+    columns = _out_column_descs(plan.out_columns, storage, db)
     rows: list[tuple[Any, ...]] = []
     for doc in docs:
         # get_path walks dotted field paths (jsonb navigation); a plain field
@@ -1182,10 +1202,7 @@ def execute_correlated_select(
     if plan.limit:
         matched = matched[: plan.limit]
 
-    columns = [
-        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
-        for name, col in plan.out_columns
-    ]
+    columns = _out_column_descs(plan.out_columns, storage, db)
     rows = [
         tuple(typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in plan.out_columns)
         for doc in matched

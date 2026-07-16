@@ -133,6 +133,11 @@ class ConstantSelectPlan:
     # result has the column shape but zero rows.
     columns: list[tuple[str, str, Any]]  # (out_name, type_tag, python_value)
     emit: bool = True
+    # Per-column RowDescription oid overrides, parallel to ``columns`` (None =
+    # derive from the tag). Carries a ``'ok'::mood`` cast's enum oid — the tag
+    # stays ``text`` (the value form IS the label text) but the descriptor must
+    # report the minted enum oid or a client's registered loader won't fire.
+    pg_oids: list[int | None] = field(default_factory=list)
 
 
 @dataclass
@@ -2344,7 +2349,38 @@ def plan_constant_select(
         else:
             value = scalar.evaluate(target, _const_scope, ctx)
             columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
-    return ConstantSelectPlan(columns=columns, emit=emit)
+    pg_oids: list[int | None] = [None] * len(columns)
+    for i, e in enumerate(stmt.expressions):
+        override = _constant_enum_override(e, ctx)
+        if override is not None:
+            tag, oid = override
+            pg_oids[i] = oid
+            if tag is not None:
+                name, _old_tag, value = columns[i]
+                columns[i] = (name, tag, value)
+    return ConstantSelectPlan(columns=columns, emit=emit, pg_oids=pg_oids)
+
+
+def _constant_enum_override(e: exp.Expression, ctx: Any) -> tuple[str | None, int] | None:
+    """A ``(tag_override, oid)`` for a constant-select output that casts to a
+    declared enum (``'ok'::mood`` → the minted enum oid, tag unchanged) or an
+    enum array (``%s::mood[]`` → the paired array oid, tag ``text[]`` so the
+    value renders as an array literal)."""
+    from secantus.sql import scalar
+    from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET
+
+    target = e.this if isinstance(e, exp.Alias) else e
+    if not isinstance(target, exp.Cast):
+        return None
+    oid = scalar.enum_cast_oid(target.to, ctx)
+    if oid is not None:
+        return (None, oid)
+    if scalar.enum_array_cast_element(target.to, ctx) is not None:
+        inner = (target.to.args.get("expressions") or [None])[0]
+        elem_oid = scalar.enum_cast_oid(inner, ctx)
+        if elem_oid is not None:
+            return ("text[]", elem_oid + USER_TYPE_ARRAY_OID_OFFSET)
+    return None
 
 
 def _where_has_udf(node: exp.Expression, catalog: Any, db: str | None) -> bool:

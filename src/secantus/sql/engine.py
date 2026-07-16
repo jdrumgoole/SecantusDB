@@ -816,12 +816,9 @@ def _merge_returning_result(
     to the per-row action and other expressions evaluate against a scope that sees
     both the target image and the source row (so ``s.col`` works)."""
     from secantus.paths import get_path
-    from secantus.sql.executor import ColumnDesc
+    from secantus.sql.executor import _out_column_descs
 
-    columns = [
-        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
-        for name, col, _ in returning
-    ]
+    columns = _out_column_descs([(name, col) for name, col, _ in returning], sctx.storage, sctx.db)
 
     def cell(doc: dict[str, Any], action: str, srow: Any, col: Any, expr: Any) -> Any:
         if expr is None:
@@ -1201,13 +1198,14 @@ def _describe_statement(
             return None
         if srf_plan.count_star:
             return [ColumnDesc(srf_plan.count_alias, "int8", typemap.PG_OID["int8"])]
-        return [
-            ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
-            for name, col in srf_plan.out_columns
-        ]
+        return executor._out_column_descs(srf_plan.out_columns, storage, db)
     if table_node is None:
-        plan = planner.plan_constant_select(stmt, session)
-        return [ColumnDesc(n, t, typemap.PG_OID.get(t, 25)) for n, t, _ in plan.columns]
+        plan = planner.plan_constant_select(stmt, session, storage, catalog, db)
+        oids = plan.pg_oids or [None] * len(plan.columns)
+        return [
+            ColumnDesc(n, t, oid if oid is not None else typemap.PG_OID.get(t, 25))
+            for (n, t, _), oid in zip(plan.columns, oids, strict=True)
+        ]
     if planner.select_needs_pipeline(stmt):
         pplan = planner.plan_pipeline_select(stmt, db, catalog, storage)
         return [ColumnDesc(n, t, typemap.PG_OID.get(t, 25)) for n, t in pplan.out_columns]
@@ -1223,10 +1221,7 @@ def _describe_statement(
     select_plan = planner.plan_select(stmt, table)
     if select_plan.count_star:
         return [ColumnDesc(select_plan.count_alias, "int8", typemap.PG_OID["int8"])]
-    return [
-        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
-        for name, col in select_plan.out_columns
-    ]
+    return executor._out_column_descs(select_plan.out_columns, storage, db)
 
 
 def _show_name(stmt: exp.Command) -> str:
@@ -1803,10 +1798,7 @@ def _describe_returning(
         return None
     if items is None:
         return None
-    return [
-        ColumnDesc(name, col.type_tag, typemap.PG_OID.get(col.type_tag, 25))
-        for name, col, _expr in items
-    ]
+    return executor._out_column_descs([(name, col) for name, col, _expr in items], storage, db)
 
 
 def _pg_typeof_table(storage: Any, db: str, catalog: Catalog, table_node: exp.Table | None):

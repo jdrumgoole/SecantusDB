@@ -741,3 +741,73 @@ def test_connection_teardown_releases_wt_session(server):
     assert len(storage._all_sessions) <= baseline + 1, (
         f"WT sessions leaked: {baseline} -> {len(storage._all_sessions)} after 8 connections"
     )
+
+
+def test_enum_result_oid_registers_with_psycopg(server):
+    """RowDescription reports an enum result column with the enum's pg_type oid,
+    so psycopg's catalog-driven ``EnumInfo.fetch`` + ``register_enum`` flow works
+    end-to-end: the fetched oid matches ``cursor.description.type_code`` and the
+    registered loader turns result values into Python enum members."""
+    import enum
+
+    from psycopg.types.enum import EnumInfo, register_enum
+
+    with connect(server, autocommit=True) as conn:
+        conn.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+        conn.execute("CREATE TABLE moods (id bigint primary key, m mood)")
+        conn.execute("INSERT INTO moods VALUES (1, 'happy')")
+
+        info = EnumInfo.fetch(conn, "mood")
+        assert info is not None
+        assert info.labels == ["sad", "ok", "happy"]
+
+        cur = conn.execute("SELECT m FROM moods")
+        assert cur.description[0].type_code == info.oid
+        assert cur.fetchone() == ("happy",)  # unregistered: the label as str
+
+        Mood = enum.Enum("Mood", {label: label for label in info.labels})
+        register_enum(info, conn, Mood)
+        assert conn.execute("SELECT m FROM moods").fetchone() == (Mood.happy,)
+        assert conn.execute("INSERT INTO moods VALUES (2, 'sad') RETURNING m").fetchone() == (
+            Mood.sad,
+        )
+
+
+def test_enum_cast_and_param_validation(server):
+    """The cast/param side of enum conformance: ``%s::mood`` describes with the
+    enum oid so a registered loader fires on cast results; a parameter declared
+    with an enum oid (a registered dumper's Bind) is label-validated (22P02);
+    and ``%s::mood[]`` round-trips as a list through the minted array oid."""
+    import enum
+
+    from psycopg.types.enum import EnumInfo, register_enum
+
+    class Mood(str, enum.Enum):
+        sad = "sad"
+        ok = "ok"
+        happy = "happy"
+
+    with connect(server, autocommit=True) as conn:
+        conn.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+        info = EnumInfo.fetch(conn, "mood")
+        assert info.array_oid > 0
+        register_enum(info, conn, Mood)
+
+        for binary in (False, True):
+            cur = conn.execute("SELECT %s::mood", ["happy"], binary=binary)
+            assert cur.description[0].type_code == info.oid
+            assert cur.fetchone() == (Mood.happy,)
+
+        cur = conn.execute("SELECT %s::mood[]", [["ok", "sad"]])
+        assert cur.description[0].type_code == info.array_oid
+        assert cur.fetchone() == ([Mood.ok, Mood.sad],)
+
+        with pytest.raises(psycopg.errors.DataError):
+            conn.execute("SELECT 'nope'::mood")
+        # A registered dumper binds Mood params with the enum oid; a label the
+        # type doesn't have is rejected at Bind like real Postgres.
+        conn.execute("CREATE TYPE other AS ENUM ('X')")
+        other = EnumInfo.fetch(conn, "other")
+        register_enum(other, conn, Mood)  # deliberately wrong mapping
+        with pytest.raises(psycopg.errors.DataError):
+            conn.execute("SELECT %s", [Mood.ok])

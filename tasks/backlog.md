@@ -3061,10 +3061,27 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   (`Column.enum_type`, stored as `text`) is detected in `plan_create_table` via `_enum_type_name` (a
   USERDEFINED DataType); `execute_create_table` verifies the enum exists (else `42704`), and
   `executor._validate_enum_columns` rejects a value outside the labels with `22P02` on every write path
-  (INSERT / UPDATE / ON CONFLICT / MERGE). Reflection: `pg_type` (`typtype='e'`, oid base 65000),
-  `pg_enum` (label rows with `enumsortorder`), and enum columns' `pg_attribute.atttypid` → the enum oid.
-  Tests: `tests/test_sql_enum.py`. **Limitations:** only the ENUM form of `CREATE TYPE` (composite /
-  range / base types → `0A000`); enums live in the connection's db, not schema-scoped.
+  (INSERT / UPDATE / ON CONFLICT / MERGE). Reflection: `pg_type` (`typtype='e'`, oid base 65000, minted
+  by `Catalog.enum_type_oids` — allocation-stable, persisted at CREATE, never renumbered/reused), `pg_enum`
+  (label rows with `enumsortorder`), and enum columns' `pg_attribute.atttypid` → the enum oid.
+  `RowDescription` reports the same minted oid for enum result columns (SELECT / correlated SELECT /
+  RETURNING incl. MERGE / extended-protocol Describe) via `executor._out_column_descs`, so psycopg's
+  `EnumInfo.fetch` + `register_enum` round-trips to Python enum members. User types (enum / domain /
+  composite) report a derived `pg_type.typarray` (`oid + USER_TYPE_ARRAY_OID_OFFSET`) — never 0, which
+  psycopg's `test_register_scope` used to pop the global INVALID_OID fallback loader (the 212-test
+  "unknown oid loader not found" gauge cluster). Casts to a declared enum (`'ok'::mood` / `%s::mood` /
+  `%s::mood[]`) validate labels (22P02) and describe with the enum oid (arrays: the paired array oid —
+  `scalar.enum_cast_target` / `planner._constant_enum_override`); a Bind parameter declared with an enum
+  oid is label-validated (`pgextended._check_enum_param`); binary array params/results handle user-type
+  array oids (elements travel as text); `oid::regtype::text` quotes mixed-case names
+  (`virtual.quote_type_name`). psycopg's `tests/types/test_enum.py` passes 197/197. Tests:
+  `tests/test_sql_enum.py`, `tests/test_pgserver_psycopg.py`. **Limitations:** only the ENUM form of
+  `CREATE TYPE` (composite / range / base types → `0A000`); enums live in the connection's db, not
+  schema-scoped; JOIN / GROUP BY / evaluated-expression plans (`PipelineSelectPlan` /
+  `EvaluatedSelectPlan`, `out_columns` as `(name, tag)` pairs) drop the enum tag at plan time so those
+  result columns still describe as `text` 25; enum-cast oids ride constant selects only (a cast inside a
+  table SELECT's projection types by the column machinery); no `pg_type` row for the paired `_name`
+  array type itself (only `typarray` on the base row); `mood[]` table columns aren't supported.
 - [ ] **`ALTER TYPE … ADD VALUE` + enum-aware ORDER BY landed** (b112): `ALTER TYPE name ADD VALUE
   [IF NOT EXISTS] 'label' [BEFORE|AFTER 'other']` (arrives as a `Command`, parsed by
   `engine._ALTER_TYPE_ADD_RE` → `Catalog.alter_enum_add_value`) inserts a new label into the enum's

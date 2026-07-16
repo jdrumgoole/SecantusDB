@@ -464,6 +464,40 @@ cluster + "unknown oid" cluster, 212 — needs minted user-type array oids and
 catalog-aware ColumnDesc resolution; ~26 ColumnDesc sites), CREATE TYPE AS
 RANGE, schema-qualified tables, select4/5 join perf.
 
+**2026-07-16 session (enum result OIDs — the lever above, landed):**
+RowDescription reports the minted enum oid for enum result columns (SELECT /
+correlated / RETURNING incl. MERGE / Describe, via `executor._out_column_descs`
+over the shared `Catalog.enum_type_oids` mint — now allocation-stable:
+persisted at CREATE TYPE, never renumbered/reused, because a positional mint
+renumbers types under a client's registered loaders). Two adjacent root causes
+fell out of the gauge A/B: (1) `::regtype`/`to_regtype` of user-type names
+didn't apply Postgres identifier folding, so `EnumInfo.fetch(conn,
+"StrTestEnum")` returned None and poisoned psycopg's whole enum suite; (2) ALL
+user types reported `pg_type.typarray = 0`, and psycopg's `test_register_scope`
+pops the loader keyed on `array_oid` — popping oid 0 deleted the **global
+unknown-oid fallback loader** and poisoned every later unknown-oid text load in
+the process. That was the entire pre-existing 212-test "unknown oid loader not
+found" cluster (spread over range/numpy/multirange/string/uuid/composite).
+User types now mint `typarray = oid + 100000`. Controlled A/B (deterministic
+order, `-p no:randomly`, pinned base worktree): **2554 / 61.9% → 2809 / 68.1%
+(+255, zero stable regressions; "unknown oid loader not found" 212 → 0)**.
+
+**Second slice (same session): the cast / Bind / array paths.** `%s::mood`
+constant-select casts describe with the enum oid and validate labels (22P02);
+a Bind parameter declared with an enum oid (a registered psycopg dumper) is
+label-validated; `oid::regtype::text` quotes mixed-case names (psycopg's
+ClientCursor pastes the fetched regtype verbatim as a cast suffix — unquoted
+`CamelCaseEnum` folds back to lowercase and misses the type); `%s::mood[]`
+round-trips as a list through the minted array oid in text AND binary
+(`pgextended` now derives user-type array element oids from the offset
+scheme in both directions). psycopg's `tests/types/test_enum.py`: **197/197**
+(base: 45/197). Full-gauge deterministic A/B vs origin/main: **2554 / 61.9% →
+2900 / 70.3% (+346; regressions only the churny `test_leak` parametrization
+flips + one load-flake copy timeout that passes in isolation)**. Remaining
+enum-adjacent gaps (backlog b107): enum tags dropped by JOIN/GROUP BY plan
+shapes, `mood[]` table columns, no pg_type row for the paired `_name` array
+type.
+
 **Second slice (same day, PR pending): 19/26 → 22/26.** HAVING grew
 `IS [NOT] NULL` (bare / aggregate / computed group-key operands, exact under
 any NOT nesting), three-valued `[NOT] IN` over group keys, and always-unknown
