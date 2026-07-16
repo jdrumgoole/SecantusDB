@@ -1,11 +1,11 @@
 <section class="hero">
   <div class="wrap">
-    <h1>The SQLite of document databases &mdash; <span class="accent">embeddable, compatible with MongoDB.</span></h1>
-    <p class="lead">SecantusDB is a real MongoDB server written in Python: it speaks the MongoDB wire protocol on the same TCP socket a <code>mongod</code> would, so any standard driver &mdash; <code>pymongo</code>, <code>mongo-go-driver</code>, <code>mongosh</code>, <code>mongodump</code> &mdash; connects unchanged. Backed by the same <strong>WiredTiger</strong> engine MongoDB uses.</p>
+    <h1>The SQLite of document databases &mdash; <span class="accent">one database, two implementations.</span></h1>
+    <p class="lead">SecantusDB is a real MongoDB server backed by the same <strong>WiredTiger</strong> engine MongoDB uses &mdash; it speaks the MongoDB wire protocol on the same TCP socket a <code>mongod</code> would, so any standard driver connects unchanged. Pick your runtime: <a href="/python-db.html"><strong>Python DB</strong></a>, the embeddable reference with the broadest surface and a SQL/PostgreSQL frontend, or <a href="/rust-db.html"><strong>Rust DB</strong></a>, the same database as one dependency-free static binary.</p>
     <div class="ctas">
-      <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}index.html" rel="noopener">Read the docs</a>
-      <a class="btn btn-secondary" href="{{ SECANTUS_PYPI_URL }}" rel="noopener"><code>pip install SecantusDB</code></a>
-      <a class="btn btn-secondary" href="{{ SECANTUS_GITHUB_URL }}" rel="noopener">GitHub</a>
+      <a class="btn btn-primary" href="/python-db.html">Python DB &rarr;</a>
+      <a class="btn btn-primary" href="/rust-db.html">Rust DB &rarr;</a>
+      <a class="btn btn-secondary" href="{{ SECANTUS_DOCS_URL }}index.html" rel="noopener">Docs</a>
     </div>
   </div>
 </section>

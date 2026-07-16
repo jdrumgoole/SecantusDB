@@ -12,37 +12,25 @@
 
   {% include 'partials/beta_banner.html' %}
 
+  <section class="section engines-section">
+    <div class="wrap">
+      <h2>Two implementations, one wire protocol</h2>
+      <p class="section-lead">Both speak the same MongoDB wire protocol, pass the same unmodified driver gauges, and persist through the same WiredTiger storage &mdash; a data directory written by one opens in the other. Pick the runtime that fits your stack, not a different database.</p>
+      {% include 'partials/two_servers.html' %}
+    </div>
+  </section>
+
   <section class="section code-example">
     <div class="wrap">
       <h2>Drop-in for <code>pymongo</code></h2>
-      <p class="section-lead">Same wire protocol, same handshake, same error codes. The application code is <strong>byte-identical</strong> &mdash; only the setup line changes.</p>
+      <p class="section-lead">Same wire protocol, same handshake, same error codes &mdash; against either implementation. The application code is <strong>byte-identical</strong>; only the setup line changes.</p>
 
       {% include 'partials/code_comparison.html' %}
 
       <div class="ctas" style="margin-top: 28px;">
-        <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}index.html" rel="noopener">Read the docs</a>
-        <a class="btn btn-secondary" href="{{ SECANTUS_PYPI_URL }}" rel="noopener"><code>pip install SecantusDB</code></a>
-      </div>
-    </div>
-  </section>
-
-  <section class="section alt">
-    <div class="wrap">
-      <h2>Why SecantusDB</h2>
-      <p class="section-lead">Production-grade engineering &mdash; real wire protocol, real WiredTiger storage &mdash; scoped today to test and dev environments. Each panel links to the reference docs.</p>
-      {% include 'partials/benefits_grid.html' %}
-      <h3 class="perf-heading">Performance</h3>
-      <p class="perf-note">A like-for-like benchmark currently has SecantusDB <strong>~8&times;&ndash;46&times; slower per operation</strong> than <code>mongod</code> &mdash; the storage engine is the same WiredTiger C library, but the layers above it are Python. CRUD reads sit near the low end; bulk update / delete and aggregation at the high end. The trade is conformance and WiredTiger durability over per-op latency &mdash; for ephemeral test and dev data, the wall-clock difference rarely matters. <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Benchmark &amp; methodology &rarr;</a></p>
-    </div>
-  </section>
-
-  <section class="section engines-section">
-    <div class="wrap">
-      <h2>Two servers, one wire protocol</h2>
-      <p class="section-lead">Choose your engine. Both speak the same MongoDB wire protocol, pass the same unmodified driver gauges, and persist through the same WiredTiger storage &mdash; so you pick the runtime that fits your stack, not a different database.</p>
-      {% include 'partials/two_servers.html' %}
-      <div class="ctas" style="margin-top: 32px;">
-        <a class="btn btn-primary" href="/rust-server.html">Meet the Rust server &rarr;</a>
+        <a class="btn btn-primary" href="/python-db.html">Python DB &rarr;</a>
+        <a class="btn btn-primary" href="/rust-db.html">Rust DB &rarr;</a>
+        <a class="btn btn-secondary" href="{{ SECANTUS_DOCS_URL }}feature-comparison.html" rel="noopener">Feature comparison</a>
       </div>
     </div>
   </section>

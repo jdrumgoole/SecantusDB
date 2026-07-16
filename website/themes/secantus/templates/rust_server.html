@@ -1,8 +1,8 @@
 {% extends 'base.html' %}
 
-{% block title %}The Rust server — {{ SITENAME }}{% endblock %}
+{% block title %}Rust DB — {{ SITENAME }}{% endblock %}
 {% block description %}SecantusDB's pure-Rust server: a single standalone WiredTiger-backed binary that speaks the MongoDB wire protocol, with no Python in the request path.{% endblock %}
-{% block canonical_path %}rust-server.html{% endblock %}
+{% block canonical_path %}rust-db.html{% endblock %}
 
 {% block top_banner %}{% endblock %}
 
@@ -10,7 +10,7 @@
 <section class="section engines-section page-hero-engine">
   <div class="wrap">
     <span class="engine-tag">Rust</span>
-    <h1>The SecantusDB Rust server</h1>
+    <h1>SecantusDB Rust DB</h1>
     <p class="section-lead">A whole second server, written in Rust from the wire up &mdash; dispatch, cursors, change streams, and WiredTiger storage &mdash; with no Python in the request path. Same wire protocol, same conformance gauges, a single standalone binary.</p>
     <div class="ctas">
       <a class="btn btn-primary" href="{{ SECANTUS_GITHUB_URL }}/releases" rel="noopener">Download a binary &rarr;</a>

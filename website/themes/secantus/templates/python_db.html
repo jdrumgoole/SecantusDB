@@ -1,0 +1,83 @@
+{% extends 'base.html' %}
+
+{% block title %}Python DB — {{ SITENAME }}{% endblock %}
+{% block description %}SecantusDB's pure-Python server: the reference implementation — embeddable in two lines, the broadest feature surface, plus the SQL/PostgreSQL frontend.{% endblock %}
+{% block canonical_path %}python-db.html{% endblock %}
+
+{% block top_banner %}{% endblock %}
+
+{% block content %}
+<section class="section engines-section page-hero-engine">
+  <div class="wrap">
+    <span class="engine-tag">Python</span>
+    <h1>SecantusDB Python DB</h1>
+    <p class="section-lead">The reference implementation &mdash; a real MongoDB server in pure Python, embeddable in two lines from any test or app, with the broadest feature surface and the SQL/PostgreSQL frontend. Backed by the same <strong>WiredTiger</strong> engine MongoDB uses.</p>
+    <div class="ctas">
+      <a class="btn btn-primary" href="{{ SECANTUS_PYPI_URL }}" rel="noopener"><code>pip install SecantusDB</code></a>
+      <a class="btn btn-ghost" href="{{ SECANTUS_DOCS_URL }}index.html" rel="noopener">Read the Python docs</a>
+    </div>
+  </div>
+</section>
+
+<section class="section code-example">
+  <div class="wrap">
+    <h2>Drop-in for <code>pymongo</code></h2>
+    <p class="section-lead">Same wire protocol, same handshake, same error codes. The application code is <strong>byte-identical</strong> &mdash; only the setup line changes.</p>
+
+    {% include 'partials/code_comparison.html' %}
+
+    <div class="ctas" style="margin-top: 28px;">
+      <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}quickstart.html" rel="noopener">Quickstart</a>
+      <a class="btn btn-secondary" href="{{ SECANTUS_DOCS_URL }}examples.html" rel="noopener">Examples</a>
+    </div>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <h2>Why the Python DB</h2>
+    <p class="section-lead">Production-grade engineering &mdash; real wire protocol, real WiredTiger storage &mdash; scoped today to test and dev environments. Each panel links to the reference docs.</p>
+    {% include 'partials/benefits_grid.html' %}
+    <h3 class="perf-heading">Performance</h3>
+    <p class="perf-note">A like-for-like benchmark currently has the Python DB <strong>~8&times;&ndash;46&times; slower per operation</strong> than <code>mongod</code> &mdash; the storage engine is the same WiredTiger C library, but the layers above it are Python. CRUD reads sit near the low end; bulk update / delete and aggregation at the high end. The trade is conformance and WiredTiger durability over per-op latency &mdash; for ephemeral test and dev data, the wall-clock difference rarely matters. Need raw speed? That's what <a href="/rust-db.html">Rust DB</a> is for. <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Benchmark &amp; methodology &rarr;</a></p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>It speaks SQL too</h2>
+    <p class="section-lead">The Python DB is the home of the <strong>SQL/PostgreSQL frontend</strong>: the same WiredTiger data is reachable over the PostgreSQL wire protocol &mdash; <code>psql</code>, psycopg, SQLAlchemy &mdash; and a document written with <code>pymongo</code> reads back as a row. Validated against psycopg 3's own unmodified test suite and the sqllogictest corpus.</p>
+    <div class="ctas">
+      <a class="btn btn-secondary" href="{{ SECANTUS_DOCS_URL }}sql.html" rel="noopener">SQL / PostgreSQL interface &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <h2>Get it</h2>
+    <div class="install-cols">
+      <div class="install-col">
+        <h3>Embedded (two lines)</h3>
+        <pre class="install-code"><code>pip install SecantusDB
+# then in your test or app:
+with SecantusDBServer(port=0) as server:
+    client = MongoClient(server.uri)</code></pre>
+      </div>
+      <div class="install-col">
+        <h3>Standalone daemon</h3>
+        <pre class="install-code"><code>secantusd-py --port 27017 --storage-path ./data
+# PostgreSQL wire:
+secantusd-py-pg --port 5432 --storage-path ./data</code></pre>
+      </div>
+    </div>
+    <p class="section-lead" style="margin-top: 24px;">Python DB documentation:
+      <a href="{{ SECANTUS_DOCS_URL }}quickstart.html" rel="noopener">Quickstart</a> &middot;
+      <a href="{{ SECANTUS_DOCS_URL }}servers.html" rel="noopener">The two servers</a> &middot;
+      <a href="{{ SECANTUS_DOCS_URL }}sql.html" rel="noopener">SQL interface</a> &middot;
+      <a href="{{ SECANTUS_DOCS_URL }}recovery.html" rel="noopener">Backup &amp; PITR</a> &middot;
+      <a href="{{ SECANTUS_DOCS_URL }}feature-comparison.html" rel="noopener">Feature comparison</a>
+    </p>
+  </div>
+</section>
+{% endblock %}
