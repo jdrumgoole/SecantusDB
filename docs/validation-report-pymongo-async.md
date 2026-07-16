@@ -22,15 +22,15 @@ Run `uv run python -m invoke validate-pymongo-async` to refresh. This is the asy
 | `test_custom_types.py` | 51 | 0 | 0 | 0 | 51 | 100.0% |
 | `test_database.py` | 35 | 0 | 0 | 1 | 36 | 100.0% |
 | `test_examples.py` | 18 | 0 | 0 | 2 | 20 | 100.0% |
-| `test_logger.py` | 3 | 1 | 0 | 2 | 6 | 75.0% |
+| `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
 | `test_read_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_read_preferences.py` | 9 | 1 | 0 | 20 | 30 | 90.0% |
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
 | `test_transactions_unified.py` | 92 | 0 | 0 | 172 | 264 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
-| **Overall** | **924** | **8** | **0** | **491** | **1423** | **99.1%** |
+| **Overall** | **925** | **7** | **0** | **491** | **1423** | **99.2%** |
 
-## Failures (8)
+## Failures (7)
 
 First 30 failure node-ids for manual triage:
 
@@ -41,7 +41,6 @@ vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_maxtime_
 vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_to_list_csot_applied
 vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_to_list_length
 vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_where
-vendor/pymongo-tests/test/asynchronous/test_logger.py::TestLogger::test_default_truncation_limit
 vendor/pymongo-tests/test/asynchronous/test_read_preferences.py::TestMongosAndReadPreference::test_read_preference_hedge_deprecated
 ```
 
