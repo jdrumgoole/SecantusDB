@@ -111,8 +111,9 @@ Unknown timezone names raise an error (no silent misinterpretation).
 
 ### Type checks and conversions
 
-`$type`, `$toInt`, `$toLong`, `$toDouble`, `$toBool`, `$toDecimal`,
-`$toString`, `$toObjectId`, `$toDate`. The `$type` operator returns the
+`$type`, `$convert`, `$toInt`, `$toDouble`, `$toBool`, `$toDecimal`,
+`$toString`, `$toDate` (`$toLong` / `$toObjectId` are not implemented —
+use `$convert` where a supported target type fits). The `$type` operator returns the
 BSON type alias for a value; the int32-vs-int64 distinction depends on
 Python value range rather than the original BSON tag (which we throw away
 on decode).
@@ -138,8 +139,10 @@ on decode).
 
 - Put `$match` first so it can be lifted into the initial fetch's filter
   and benefit from index acceleration.
-- `$lookup` joins are O(N+M) in memory; use `$match` before `$lookup` to
-  shrink the outer side.
+- `$lookup` rides an index on the foreign collection when one exists whose
+  leading field is `foreignField` (IXSCAN per outer document); without one it
+  falls back to an O(N+M) in-memory hash join. Either way, `$match` before
+  `$lookup` shrinks the outer side.
 - `$sort` followed by `$limit` is NOT yet a single optimised stage — sort
   runs the full collection then limit truncates. For test workloads this
   is fine; for large simulated datasets, prefer to sort by an indexed

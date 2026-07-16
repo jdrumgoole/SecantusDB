@@ -33,10 +33,10 @@ doesn't pretend to compete in that space.
 | Per-commit durability | `synchronous_commit=on` default | `sync_on_commit=true` opt-in (see [Configuration](configuration.md)) |
 | Full snapshot backup | `pg_basebackup` | `secantusAdmin.backupArchive` (`.tar.gz`) |
 | Restore | swap dbpath + start | `secantus-restore-archive` → start fresh server |
-| Point-in-time recovery | WAL archiving + `recovery_target_time` | not supported |
+| Point-in-time recovery | WAL archiving + `recovery_target_time` | oplog replay to a timestamp — `secantusAdmin.restoreToTimestamp` (see [Recovery](recovery.md)) |
 | Native TLS | `ssl=on` | server-side TLS via `[tls] cert_file` / `key_file` |
-| Auth methods | md5 / scram / cert / peer / ldap / gss / pam | SCRAM-SHA-256 only |
-| Constraints / triggers / FKs / views | rich | none (document store) |
+| Auth methods | md5 / scram / cert / peer / ldap / gss / pam | SCRAM-SHA-256 / SCRAM-SHA-1 / MONGODB-X509 (mTLS), with enforced RBAC |
+| Constraints / triggers / FKs / views | rich | schema validators (`$jsonSchema`), views (`viewOn` + pipeline); FKs/triggers via the [SQL frontend](sql.md), not the document store |
 | Replication | streaming + logical | none (single-node by design) |
 | Indexing | B-tree / partial / multikey / GIN / GIST / BRIN | B-tree / compound / unique / partial / multikey / sparse / TTL / 2d / 2dsphere |
 | Profiling | `log_min_duration_statement` + `pg_stat_*` | `profile` command + admin UI |

@@ -19,6 +19,1102 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.4b235] — 2026-07-16
+
+### Point-in-time recovery, a SQL server with its own gauges, and operator parity across both servers
+
+This is the largest SecantusDB release to date — a month of parallel work,
+125 changelog entries. The headline capability is **point-in-time
+recovery**: every write already flowed through the oplog, and
+`secantusAdmin.restoreToTimestamp` now replays it to reconstruct the
+database exactly as it stood at any moment inside the retention window —
+with hot backup archives, base snapshots, and archives portable between the
+Python and Rust servers. The other headline is housekeeping with teeth: the
+daemons got distinguishable names (`secantusd-py`, `secantusd-rs`,
+`secantusd-py-pg` — the old `secantusdb` console script is gone), and
+Python 3.10 is now genuinely supported and genuinely tested in CI.
+
+The PostgreSQL-wire SQL server graduated from experiment to measured
+surface. It now has two external conformance gauges of its own — psycopg
+3's unmodified test suite and the SQLite-originated sqllogictest corpus —
+and the long tail they surfaced landed alongside them: server-side cursors
+over the wire, `COPY` inside transaction blocks, `CREATE SCHEMA`,
+`LANGUAGE plpgsql` function bodies, the full binary codec surface with real
+Postgres type OIDs, per-statement RBAC reusing the Mongo role model, and
+SQL's three-valued NULL semantics carried all the way down the
+filter-pushdown path.
+
+On the MongoDB side, both servers picked up a wide operator-fidelity batch
+— the `$setWindowFields` operator set completed (`$derivative` /
+`$integral` with time units, `$locf`, `$linearFill`, `$expMovingAvg`, range
+windows), the N-ary accumulators, trigonometric and set expressions, a
+much larger date toolbox, and dozens of exact-error-code alignments — and
+the Rust server reached pymongo-suite parity with the Python server (99.5%
+each). Measurement grew to match: sixteen driver-conformance gauges now run
+weekly (C, C++, C#, Kotlin, pymongo async, psycopg, and the Rust-server
+gates joined this cycle), feeding a regenerated cross-driver summary and a
+new three-way feature-comparison page. One genuine bug that machinery
+caught — an awaitData wake race that could delay change-stream delivery by
+a full `maxTimeMS` — is fixed, alongside security hardening (two admin-UI
+CVEs, SCRAM-credential leak paths closed, constant-time token comparison).
+
+#### Highlights
+
+- Point-in-time recovery: `secantusAdmin.backupArchive` /
+  `archiveBaseSnapshot` / `restoreArchive` / `restoreToTimestamp` on the
+  Python server; the same archives restore on the Rust server via
+  `secantusd-rs restore`. See [Recovery](recovery.md).
+- Daemon renames: `secantusd-py` (MongoDB wire, Python), `secantusd-rs`
+  (MongoDB wire, Rust), `secantusd-py-pg` (PostgreSQL wire). The legacy
+  `secantusdb` / `secantus` console scripts are removed.
+- SQL server conformance gauges: `invoke validate-psycopg` (psycopg 3's own
+  suite) and `invoke validate-slt` (sqllogictest corpus), with the
+  wire-protocol, codec, cursor, `COPY`, schema, and plpgsql work they drove.
+- Both servers: completed `$setWindowFields` operators, `$topN` /
+  `$bottomN` / `$firstN` / `$lastN` / `$maxN` / `$minN` accumulators,
+  `$mergeObjects` as an accumulator, trigonometric / set / bitwise
+  expression operators, `$dateFromParts`, `$toDate`, timezone-aware date
+  extraction, and mongod-exact error codes for unknown operators.
+- Rust server catch-up to parity: index-driven `$lookup`, views, `getLog`,
+  `killOp`, role grants, oplog maintenance commands, IANA timezones in
+  date formatting, and the pymongo suite at 99.5% — level with the Python
+  server.
+- Change streams: the awaitData wake race is fixed (a write landing between
+  the producer drain and the wait could stall delivery a full `maxTimeMS`);
+  resume tokens advance per event even at `batchSize` 1.
+- Security: two admin-UI CVEs fixed plus a stored-XSS; `admin.system.users`
+  no longer leaks SCRAM credentials; constant-time secret comparison in the
+  PostgreSQL SCRAM and admin-token checks.
+- Conformance measurement: sixteen gauges (C, C++, C#, Kotlin, pymongo
+  async, psycopg, sqllogictest, and the two Rust-server gates joined),
+  weekly report + cross-driver-summary refresh, and the
+  [Feature comparison](feature-comparison.md) page.
+- Python 3.10 support, tested per-version in CI.
+- Process: changelog fragments (`changelog.d/`) and release-time version
+  assignment ended cross-PR conflicts on `docs/changelog.md` and
+  `pyproject.toml`.
+
+
+### Change streams: awaitData wake no longer misses a write landing mid-getMore
+
+A tailable `getMore` baselined its awaitData wake predicate on a fresh
+oplog-tail snapshot taken *after* draining the change-stream producer. A
+write landing in the gap between the drain and the wait was counted into
+that snapshot and never tripped the predicate — the `getMore` slept its
+full `maxTimeMS` with the event already in the oplog, surfacing it only on
+the post-wait re-drain. On a loaded machine that pushed delivery past the
+client's await window (seen as a one-off
+`test_await_data_blocks_then_wakes_on_insert` failure in the durable CI
+lane). The predicate now baselines on the producer's own consumed position
+(`entry.position_seq`, which the drain advances to the tail it actually
+observed) — any write after that observation wakes or skips the wait,
+mirroring the Rust server's `wait_for_oplog(position, ...)`, which was
+never affected. A regression test pins the interleaving deterministically
+by landing an insert inside the former race window. A side benefit: a
+resuming cursor that drains a full filtered batch no longer sleeps its
+whole `maxTimeMS` before fetching the next backlog page.
+
+#### Fixed
+
+- `commands.py` tailable `getMore`: wake predicate compares the oplog tail
+  against `entry.position_seq` instead of a post-drain tail snapshot.
+
+### `$bit` update applies multiple operations (both servers)
+
+The `$bit` update operator now accepts more than one bitwise operation per field
+and applies them in order, matching mongod: `{$bit: {n: {and: X, or: Y}}}`
+computes `(n & X) | Y`. Both servers previously rejected any `$bit` document with
+more than a single sub-operation. Found by a three-way update differential vs
+real `mongod` 6.0.
+
+#### Fixed
+
+- `update.py` / `secantus-core`: `$bit` iterates every `and`/`or`/`xor` entry in
+  the per-field document (in order) instead of requiring exactly one; an empty
+  `$bit` document is still rejected, and the int32/int64 result width is preserved
+  as before.
+
+### Changelog fragments and release-time version assignment
+
+Concurrent development got much less painful. Previously every PR edited the top
+of `docs/changelog.md`'s `[Unreleased]` section and bumped the single `version`
+line in `pyproject.toml` — two shared lines that made *any* two in-flight PRs
+conflict, so merging one forced the others to rebase and hand-resolve the same
+files. Feature PRs now add a `changelog.d/<slug>.md` fragment (one entry per
+file) instead of touching `docs/changelog.md`, and they no longer bump the
+Python package version at all — the version is assigned once, at release time, by
+`release-prepare`. New fragment files never collide, so parallel sessions stay
+independent.
+
+#### Added
+
+- `changelog.d/` fragment convention (`changelog.d/README.md`), a
+  `changelog.fragments` collator, and an `invoke changelog-collate` task that
+  folds fragments into `## [Unreleased]`. `release-prepare` runs the collation
+  automatically before it stamps the version.
+
+#### Changed
+
+- Feature PRs no longer bump the Python `version` / `__version__` (assigned at
+  release) or edit `docs/changelog.md` directly. The Rust crate version is still
+  bumped per-PR (its `buildInfo` traceability handle; rare same-session-only
+  collisions). See the Versioning and Conventions sections of `CLAUDE.md`.
+
+### Date extractors error on a non-date input (both servers)
+
+All thirteen date-component extractors — `$year` / `$month` / `$dayOfMonth` /
+`$hour` / `$minute` / `$second` / `$dayOfWeek` / `$dayOfYear` / `$week` /
+`$isoWeek` / `$isoDayOfWeek` / `$isoWeekYear` / `$millisecond` — now raise
+mongod's `Location16006` ("can't convert from BSON type … to Date") when given a
+present non-date value (a string, a number, a bool, …), instead of silently
+returning `null`. A `null` or a missing field still yields `null`, as before.
+
+#### Fixed
+
+- `expressions.py` / `secantus-core`: the shared date-operand resolver
+  (`_date_operand` / `date_operand_millis`) distinguishes a null / missing operand
+  (→ null) from a present non-date value. The Python server raises `Location16006`;
+  the Rust server surfaces a generic `BadValue` on that path (the documented
+  error-code gap). Verified three-way vs real `mongod` 6.0 (Python zero
+  divergences).
+
+### Six more date-component extractors and `$dateToParts` ISO mode
+
+The aggregation date toolbox picks up the components MongoDB exposes but
+SecantusDB was still missing: `$dayOfYear` (1-366), `$week` (US week number,
+0-53, weeks starting Sunday), `$isoWeek` (ISO-8601 week 1-53), `$isoDayOfWeek`
+(1=Monday … 7=Sunday), `$isoWeekYear` (the ISO week-numbering year), and
+`$millisecond`. Each slots in alongside the existing extractors and accepts the
+same two shapes — a bare date expression or a `{date, timezone}` object — so a
+fixed `±HH:MM` offset or a named IANA zone (`America/New_York`) shifts the
+instant before the component is read. The year-boundary edge cases match
+mongod: `2026-01-01` (a Thursday) is US week 0, and `2027-01-01` (a Friday) is
+ISO week 53 of ISO year 2026.
+
+`$dateToParts` now honours `iso8601: true`, returning `{isoWeekYear, isoWeek,
+isoDayOfWeek, hour, minute, second, millisecond}` instead of the calendar
+`{year, month, day, …}` shape. The `timezone` option applies in both modes, and
+`iso8601: false` (or absent) keeps the existing output unchanged.
+
+Both servers gain the operators together, pinned byte-for-byte by the Rust ↔
+Python expression parity harness. The named-IANA-zone cases compute natively on
+the Rust side via `chrono-tz`.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$dayOfYear`, `$week`, `$isoWeek`,
+  `$isoDayOfWeek`, `$isoWeekYear`, and `$millisecond` aggregation-expression
+  operators, each supporting the `{date, timezone}` object form.
+- `expressions.py` / `secantus-core`: `$dateToParts` now supports
+  `iso8601: true`, emitting the ISO week-based parts document.
+
+### Docs: three-way feature comparison (MongoDB vs Python server vs Rust server)
+
+A new [Feature comparison](https://secantusdb.readthedocs.io/en/latest/feature-comparison.html)
+docs page decomposes the validation-report pass rates into a per-feature
+matrix: commands, query/update/expression operators, aggregation stages,
+accumulators and window functions, index types, collections, change streams,
+transactions, auth, backup/PITR, and the SQL frontend — each marked
+supported / partial / missing for real `mongod`, the Python server, and the
+Rust server.
+
+#### Changed
+
+- `docs/servers.md`: refreshed the stale "what the Rust server doesn't
+  support" list — the pymongo-suite gap has closed to parity (99.5% both) and
+  the DDL-change-stream-event, large-event-splitting, and timeseries-`_id`
+  bullets described already-shipped features; replaced with the current gap
+  set (SQL frontend, `mapReduce`/`top`, wire-level `restoreToTimestamp`,
+  session lifecycle no-ops, oracle-deferred operator edges, thinner
+  diagnostics). Dropped the out-of-scope claim that RBAC is unimplemented
+  (both servers enforce it).
+- `docs/index.md`: added the new page to the toctree and quick links, and
+  included the previously-orphaned psycopg validation report in the toctree
+  (it was failing the `-W` docs build as `toc.not_included`).
+
+### `$getField` on an absent field now resolves to missing, not null
+
+Reading a field that doesn't exist with `$getField` used to hand back an
+explicit `null`. Real MongoDB treats an absent field as the *missing* value —
+and a `$project` or `$addFields` computed field that resolves to missing is
+omitted from the output document entirely, rather than emitted as `null`. Both
+SecantusDB servers now match that: `{$project: {r: {$getField: {field: "k",
+input: "$sub"}}}}` over `[{sub: {k: 1}}, {sub: {j: 2}}, {}]` yields `[{r: 1},
+{}, {}]` — the documents with no `sub.k` carry no `r` field at all. A field that
+is present with an explicit `null` still returns `null` and is emitted, so the
+missing-vs-null distinction is preserved.
+
+The same change makes `$$REMOVE` behave correctly as a `$project` / `$addFields`
+computed value: the field is dropped instead of leaking the internal removal
+sentinel.
+
+#### Fixed
+
+- `expressions.py` / `secantus-core`: `$getField` returns the missing/`$$REMOVE`
+  marker (not `null`) for a field absent from its input; on the Rust side that
+  case defers to the pure-Python engine, keeping the parity harness green.
+- `aggregate.py`: `$project` and `$addFields` computed fields that evaluate to
+  the missing marker are omitted from the output (an existing `$addFields`
+  target set to the marker is removed), matching mongod.
+
+### `$inc` / `$mul` on an explicit-null field now errors like mongod
+
+Applying `$inc` or `$mul` to a field that is present with an explicit `null`
+value now raises a `TypeMismatch` (error code 14), exactly as real MongoDB
+does — "Cannot apply $inc to a value of non-numeric type … of non-numeric type
+null". Previously both servers silently coerced the null to `0` and applied the
+delta, so `{$inc: {n: 5}}` against `{n: null}` returned `{n: 5}` instead of
+failing. A *missing* (absent) field is still treated as `0` and the operation
+applied — that has always matched mongod and is unchanged.
+
+The fix distinguishes an absent field from a present-but-null one: the pure-Python
+engine raises the coded error directly, and the Rust core defers the null case to
+the Python oracle so the exact error code is preserved (the Rust server surfaces
+a generic `BadValue`, the documented error-code gap).
+
+#### Fixed
+
+- `update.py` / `secantus-core`: `$inc` / `$mul` on a field present with an
+  explicit `null` now errors with code 14 (`TypeMismatch`) instead of coercing
+  the null to `0`. A missing field is still treated as `0` and the operation
+  applied.
+
+### Docs: the Rust-server Java gauge report joins the site
+
+`invoke validate-java --server rust` has been writing
+`docs/validation-report-java-rust-server.md` — the mongo-java-driver suite
+pointed at the standalone Rust server — but the report had never been
+committed or added to the docs toctree. It now ships alongside the other
+validation reports (445/2 passed, 99.6%; the two failures are the
+`mapReduce` tests, consistent with the Rust server not implementing
+`mapReduce`).
+
+#### Fixed
+
+- `java_validation/generate_report.py`: the generator emitted the
+  Python-server title and refresh command for both servers; a
+  `-rust-server` output now gets a `(Rust server)` title, the
+  `--server rust` refresh command, and a note that the two-phase spawn
+  boots `secantusd-rs`.
+
+### `$jsonSchema` `uniqueItems` bridges cross-type numerics recursively (both servers)
+
+`{$jsonSchema: {properties: {arr: {uniqueItems: true}}}}` now detects duplicate
+array elements using MongoDB value equality, which treats int / long / double /
+Decimal128 as equal when their values match — and does so recursively inside
+sub-documents and sub-arrays. So an array like `[{a: 1}, {a: 1.0}]` is correctly
+rejected (the two documents are equal), matching real `mongod` 6.0.
+
+Previously only *top-level* scalar arrays collapsed cross-type numerics (`[1, 1.0]`
+was already a duplicate); a cross-type-equal numeric nested inside a document or
+array element (`[{a: 1}, {a: 1.0}]`) was wrongly treated as distinct on both
+servers, because duplicate detection keyed off a raw BSON encoding that differs for
+int `1` versus double `1.0`.
+
+#### Fixed
+
+- `query.py` / `secantus-core`: `uniqueItems` duplicate detection uses a recursive
+  canonical key (`_unique_items_key` / `unique_items_key`) that normalises numerics
+  to a common value form at every nesting level and recurses into sub-documents and
+  sub-arrays, instead of Python structural `==` or a raw sort-key/BSON encoding.
+
+### `$mergeObjects` as a `$group` / `$setWindowFields` accumulator
+
+MongoDB's `$mergeObjects` was already available as a `$project` expression, but
+not as an accumulator inside `$group` or `$setWindowFields`. It now is: SecantusDB
+merges each group member's operand document into a single accumulated document,
+with later documents' keys overriding earlier ones. A null or missing operand is
+skipped, a group whose operands are all missing/null yields an empty document
+`{}`, and a non-null, non-document operand raises the same `Location40400` error
+mongod returns — so `{$group: {_id: "$g", merged: {$mergeObjects: "$sub"}}}` now
+behaves exactly like a real server.
+
+The accumulator ships on both the Python server and the Rust server, pinned
+byte-for-byte by the aggregation parity harness.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$mergeObjects` accumulator for
+  `$group` and `$setWindowFields` — merge operand documents across the group
+  (later keys win), skip null/missing, empty group → `{}`, non-document operand →
+  `Location40400`.
+
+### `$meta` projection faithful error codes (both servers)
+
+`find()`'s `{field: {$meta: <arg>}}` projection now returns the same errors real
+`mongod` does. A `{$meta: "textScore"}` projection without a `$text` predicate in
+the query fails with `Location40218` (`query requires text score metadata, but it
+is not available`), and any unrecognized `$meta` argument fails with
+`Location17308` (`Unsupported argument to $meta: <arg>`). Both errors are raised
+at parse time — before matching — so they fire even against an empty collection,
+matching mongod. Verified against real mongod 6.0.
+
+For a recognized-but-unsupported `$meta` keyword (`indexKey`, `recordId`,
+`sortKey`, and the search/geo/vector variants) SecantusDB degrades gracefully:
+rather than emitting a wrong metadata value, it omits the projected field
+entirely, leaving the rest of the projection intact. Previously the Python server
+mis-handled the `$meta` value as a truthy inclusion flag and the Rust server
+errored generically on it.
+
+#### Fixed
+
+- `projection.py` / `secantus-core` / `secantus-commands`: `{$meta: "textScore"}`
+  without a `$text` query raises `Location40218`, and an unknown `$meta` argument
+  raises `Location17308`, on both servers with mongod's exact codes and wording.
+  A recognized-but-unsupported `$meta` arg is validated clean and the field is
+  omitted from the result (partial — SecantusDB doesn't compute the metadata).
+
+### `$min` / `$max` compare by BSON order — no more traceback leak (both servers)
+
+The `$min` and `$max` update operators now compare the incoming value against the
+current field value by MongoDB's BSON canonical-type order, instead of Python's
+native `<` / `>`. This fixes two bugs found by a three-way update differential
+against real `mongod` 6.0:
+
+- **A leaked traceback.** A cross-type compare — e.g. `{$max: {a: "str"}}` on a
+  numeric `a` — raised a raw `TypeError` (`'>' not supported between 'str' and
+  'int'`) that surfaced to the client. Now it orders like mongod: a string
+  out-ranks a number, so `$max` sets `"str"`; `$max` of an ObjectId, a date, or a
+  bool over a number likewise picks the higher-ranked value.
+- **Explicit null treated as "no current".** An explicit-null field is a real
+  value (BSON rank 2, below numbers), not an absent field. `{$min: {a: 9}}` on
+  `{a: null}` now keeps `null` (null < 9); a genuinely *missing* field is still set
+  unconditionally.
+
+#### Fixed
+
+- `update.py` / `secantus-core`: `$min`/`$max` use `ordering._bson_lt` (Python) /
+  `order::cmp` (Rust) with a missing-vs-present split. The Rust engine handles the
+  sortable subset (null / number / string / objectId / date / doc / array)
+  natively and defers a bool / Decimal128 / NaN / exotic operand to the Python
+  oracle (whose `_bson_lt` covers the full order).
+
+### PG server: connection teardown releases the thread's WiredTiger session
+
+Every PG connection thread that wrote data leaked its cached WT session on
+disconnect (the Mongo server's teardown has always released it;
+`_handle_client`'s never did). Dead threads' positioned cursors kept cache
+pages pinned, and after a few hundred connections WiredTiger's eviction
+livelocked — an application thread wedged in `__wt_cache_eviction_worker`
+while holding the storage lock, queueing every other connection forever. The
+full psycopg gauge's single-daemon run hung at ~test 420 three times out of
+three; with the fix it completes in ~125s (faster than the ~550s baseline,
+since sessions no longer pile up). Verified by an 8-writer-connection leak
+probe (unfixed: 2 → 10 sessions; fixed: flat) pinned as a regression test.
+Also: a binary/garbage COPY payload now raises SQLSTATE 22021 (invalid byte
+sequence) instead of escaping as an internal error.
+
+#### Fixed
+
+- `pgserver.py`: `_handle_client`'s finally releases the thread's WT session
+  and cached cursors via `Storage._reset_thread_session()`, mirroring the
+  Mongo server; `_copy_in` guards `decode_text` with a faithful 22021.
+- psycopg gauge headline after the day's slices (COPY transactionality,
+  CREATE SCHEMA, server-side cursors, this fix), on the standard
+  single-daemon protocol: **2554 passed / 61.9%**, up from 2465 / 59.8% —
+  report refreshed.
+
+### Positional `$` projection (both servers)
+
+`find()`'s positional projection operator now works on both servers:
+`find({"items.k": "b"}, {"items.$": 1})` returns only the **first array element
+that matched the query** on that path — `items: [{k: "b", …}]` — instead of the
+whole array stripped to empty documents, which is what both servers previously
+produced. The matched element is resolved from the query's clause on the array
+(a dotted `items.sub` field, a direct value/range on `items`, or an
+`items: {$elemMatch: …}`), so it works for arrays of documents and arrays of
+scalars alike. Found by a three-way projection differential against real
+`mongod` 6.0; all value cases match exactly.
+
+#### Fixed
+
+- `projection.py` / `secantus-core`: the positional `$` projection resolves and
+  returns the first query-matched array element. The find command threads the
+  filter into the projection engine so the operator has the query context it
+  needs. Validation is parse-time (matching mongod), so an invalid positional —
+  more than one (`Location31276`), an exclusion form (`Location31395`), or an
+  array field the query doesn't reference (`Location51246`) — errors even when the
+  query matches nothing. The Python server reproduces mongod's exact Location
+  codes; the Rust server surfaces a generic `BadValue` on these error paths (the
+  documented cross-cutting error-code gap). (`$meta` projection remains deferred —
+  `tasks/backlog.md` §7.5.)
+
+### The psycopg conformance gauge: SecantusDB's SQL server gets its headline number
+
+The SQL server now has what the Mongo server has had for a year: an
+external conformance gauge running a real driver's own unmodified test
+suite. `invoke validate-psycopg` vendors psycopg 3.3.4 (pinned in lockstep
+with the `dev`-extra wheel), spawns a `SecantusPGServer` daemon on an
+ephemeral port, verifies it actually is SecantusDB (a stray real Postgres
+would inflate the numbers), runs the full sync half of psycopg's suite over
+`PSYCOPG_TEST_DSN`, and renders `docs/validation-report-psycopg.md` with
+the per-file pass/fail/skip breakdown. It joins the weekly `validate.yml`
+matrix as the fourteenth gauge — and the first for the SQL side. The
+opening baseline over the full sync suite is 2415 passed of ~4100 run
+(58.6%); the six-file subset that drove this month's conformance work
+stands at 91%.
+
+#### Added
+
+- `psycopg_validation/` (runner, include list, report generator),
+  `invoke validate-psycopg`, a `psycopg` lane in `validate.yml`, and the
+  `vendor/psycopg` submodule @ 3.3.4. `psycopg[binary]` is now pinned
+  exactly so the vendored suite and the installed wheel stay in lockstep.
+
+### Python 3.10 actually works — and CI actually tests it
+
+The CI test matrix's `python-version` never took effect: `uv sync` honours the
+repo's `.python-version` pin (3.12), so every matrix cell — including the
+scheduled 3.10–3.13 sweep — was silently testing 3.12. With the interpreter
+genuinely pinned per cell (a job-level `UV_PYTHON`, which outranks the pin file
+for every `uv` invocation in the job), the first real 3.10 run surfaced three
+breakers that the gap had been hiding, all now fixed: the config loader's
+module-level `tomllib` import (stdlib only from 3.11) crashed
+`secantus.config` / the `secantusd-py` CLI on 3.10; `datetime.UTC` (a 3.11+
+alias) in fifteen test call sites; and `datetime.fromisoformat` on 3.10
+rejecting Postgres's short UTC offsets (`+00` / `+0000`), which PG text
+rendering emits and timestamptz literals carry.
+
+#### Fixed
+
+- `config.py`: fall back to the API-identical `tomli` backport on Python 3.10
+  (`tomli>=2.0; python_version < '3.11'` added to the core dependencies).
+- `sql/datetimes.py`: new `parse_iso_datetime` — `fromisoformat` fast path
+  (a no-op passthrough on 3.11+) that widens a trailing short UTC offset to
+  `+HH:MM` only on failure; wired into `scalar._as_datetime`, `intervals`,
+  and both `typemap.coerce` timestamp branches.
+- `.github/workflows/test.yml`: the three matrix jobs set a job-level
+  `UV_PYTHON: ${{ matrix.python-version }}` so `uv sync` and every `uv run`
+  agree on the matrix interpreter (a sync-only `--python` flag is not enough —
+  a later bare `uv run` re-resolves against `.python-version` and recreates
+  the venv without the dev extras).
+- Tests: `datetime.UTC` → `datetime.timezone.utc` in
+  `test_indexes` / `test_expressions` / `test_crud`.
+
+### Range operators are type-bracketed, matching mongod
+
+MongoDB's range operators (`$gt` / `$gte` / `$lt` / `$lte`) are *type-bracketed*:
+a scalar bound only ever matches values in the same BSON type bracket. SecantusDB
+now honours that on both the Python and the Rust server, closing two divergences
+that a three-way probe against real `mongod` surfaced.
+
+A document-valued (or array-of-documents) field no longer errors on the Rust
+server when compared against a scalar bound — `{a: {$gt: 2}}` against a
+document-valued `a`, and `{items: {$elemMatch: {$gt: n}}}` over an array of
+sub-documents, now cleanly no-match (as they always did on the Python server and
+on `mongod`) instead of the Rust server returning a `BadValue`. And **bool is its
+own bracket**: a boolean-valued field no longer spuriously matches a numeric bound
+(Python's `bool` is an `int` subclass, so `True < 2` used to match on both
+engines), while `bool`-vs-`bool` comparisons (`True > False`) still work. Both the
+collection-scan and index-scan paths agree with `mongod` on every case.
+
+#### Fixed
+
+- Range operators (`$gt`/`$gte`/`$lt`/`$lte`) are now type-bracketed on both
+  servers. A document/array operand against a scalar bound no-matches instead of
+  erroring on the Rust server; a boolean field no longer matches a numeric bound
+  (bool compares only with bool). Verified against real `mongod` 6.0 with a
+  three-way probe (collection-scan and index-scan paths both).
+
+### Rust server compares array-vs-array range bounds lexicographically
+
+A range query whose bound is an array — `{a: {$gt: [1, 2]}}` — now evaluates on
+the Rust server instead of erroring. The Rust matcher previously deferred any
+array operand to a `Fallback`, which the Rust server surfaced as a `BadValue`;
+it now compares the two arrays **whole-array lexicographically**, exactly as the
+Python server (via Python's native `list < list`) and real `mongod` do.
+
+The comparison recurses element-by-element: the first decisive element pair wins,
+equal leading elements continue to the next pair, and if one array is a prefix of
+the other the shorter one sorts first. A cross-type element pair (where Python's
+`<` would raise `TypeError`) yields a clean no-match rather than an error, and an
+array field compared against a *scalar* bound still rides the multikey element
+path (`{a: [1, 3]}` matches `{a: {$gt: 2}}` because `3 > 2`). Only the exotic BSON
+types (JS code / symbol / dbpointer / undefined) as a range operand still defer to
+the Python engine.
+
+Verified against real `mongod` 6.0 and pinned to the Python oracle by new curated
+parity cases and Rust unit tests.
+
+#### Fixed
+
+- Rust server: `$gt` / `$gte` / `$lt` / `$lte` with an **array bound** (e.g.
+  `{a: {$gt: [1, 2]}}`) now compares whole-array lexicographically instead of
+  returning `BadValue`, matching the Python server and `mongod`. Array-vs-scalar
+  bounds continue to match via the multikey element path; a cross-type element
+  pair no-matches cleanly.
+
+### `$log10` now evaluates natively on the Rust server
+
+The `$log10` aggregation-expression operator is now computed natively by the Rust
+engine, so the Rust server evaluates it instead of rejecting the pipeline with a
+`BadValue`. The rest of the transcendental family (`$exp` / `$ln` / `$log`) was
+already native; `$log10` had simply been left out. Rust's `f64::log10` and
+CPython's `math.log10` share the platform libm, so the two servers agree
+bit-for-bit (pinned by the expression parity corpus). Found by a three-way
+differential sweep against real mongod 6.0.
+
+#### Fixed
+
+- `$log10` is evaluated by the Rust `secantus-core` expression engine (was a
+  Fallback → `BadValue` on the Rust server). Matches the Python server and mongod
+  for positive inputs; a non-positive input yields `null` on both servers (see
+  `tasks/backlog.md` §7 for the pre-existing log-domain divergence from mongod).
+
+### Tooling: the sqllogictest conformance gauge (invoke validate-slt)
+
+The SQL server gets its correctness gauge (tasks/sql-gauges-plan.md G1): the
+SQLite-originated sqllogictest corpus — 622 files, millions of records — is
+vendored pristine at `vendor/sqllogictest` and executed by sqllogictest-rs
+over real pgwire, one fresh `SecantusPGServer` daemon per file. A
+preprocessing pass (never touching the vendored tree) bridges the three
+corpus/runner incompatibilities established empirically: trailing comments on
+`skipif`/`onlyif` lines, value-per-line expected blocks for
+`nosort`/`rowsort` multi-column records, and sqlite's implicit
+`hash-threshold 8` default. The curated 30-file include list currently
+passes 26/30 end-to-end; the 4 failures are declared
+`EXPECTED_DIVERGENCES` (SQLite read-only views, SQLite's
+division-by-zero→NULL vs PG's 22012, and the runner's missing `query I`
+type coercion), so the gauge is green in its own terms and reports loudly if
+a divergence resolves.
+
+#### Added
+
+- `vendor/sqllogictest` (shallow submodule, dev-only, excluded from
+  sdist/wheel), the `slt_validation/` gauge package (preprocessor, per-file
+  daemon runner with identity verification, report generator, include +
+  expected-divergence lists), the `invoke validate-slt` task, and
+  `docs/validation-report-slt.md` in the Sphinx toctree. Requires the
+  `sqllogictest` binary (`cargo install sqllogictest-bin`).
+- `pyproject.toml`: sdist excludes for `vendor/sqllogictest` /
+  `slt_validation` — and the previously-missing `vendor/psycopg` /
+  `psycopg_validation` entries.
+
+### SQL: COPY runs inside the open transaction block
+
+The COPY sub-protocol handler never entered the session's user transaction:
+`COPY` after a same-block `CREATE TABLE` failed with `UndefinedTable`
+(psycopg's standard fixture shape, cascading through ~190 of its COPY-backed
+tests), `COPY TO STDOUT` couldn't see rows inserted earlier in the block —
+and worst, `COPY FROM STDIN` rows were written *outside* the transaction, so
+they survived a `ROLLBACK`. Plan resolution, the copy-in insert, and the
+copy-out extract now all run under `use_user_transaction` when a block is
+open, and a failed COPY marks the block aborted like Postgres does.
+
+#### Fixed
+
+- `pgserver.py`: `_handle_copy` / `_copy_in` / `_copy_out` wrap their engine
+  calls in the session's open user transaction (no-op outside a block);
+  a COPY error inside a block sets `txn_failed`. The three copy-heavy psycopg
+  suites (test_copy / test_range / test_multirange) move 230 → 374 passing.
+
+### SQL server: bare COPY options and computed projections over row sources
+
+Two more gauge-driven fixes. `COPY … TO STDOUT (FORMAT csv)` — the
+options spelling psycopg emits, without `WITH` — now parses (sqlglot only
+accepts the `WITH (…)` form, so `parse()` inserts it, anchored on the
+STDIN/STDOUT target and a known option keyword). And projections that
+compute over a set-returning or catalog row source — `SELECT x * 2 FROM
+generate_series(1,3) AS t(x)`, `SELECT 1 FROM pg_namespace` — run through
+the per-row evaluated plan instead of failing with "expected a column".
+The psycopg-gauge subset stands at 685 of 979 (70%), from 42% at the
+first run.
+
+#### Fixed
+
+- `planner.py`: `COPY … TO STDOUT/FROM STDIN (options)` normalizes to the
+  `WITH (options)` spelling sqlglot parses; both the table and the query
+  form take options.
+- `engine.py`: SRF and virtual-catalog row sources route computed
+  projections (arithmetic, literals, scalar functions) through the
+  evaluated-select plan — execution and Describe agree on the shape.
+
+### SQL: CREATE SCHEMA and schema-qualified user types
+
+`CREATE SCHEMA [IF NOT EXISTS]` / `DROP SCHEMA [IF EXISTS] [CASCADE]` land,
+with user-declared types (enum / domain / composite) creatable and droppable
+under a schema (`CREATE TYPE testschema.testcomp AS (…)`). Qualified names
+resolve everywhere psycopg's type machinery needs them: `to_regtype`, the
+`'schema.name'::regtype` literal cast (previously an internal error — the
+pushdown's cast coercion knew `regclass` but not `regtype`), `oid::regtype`
+rendering, and `TypeInfo`/`CompositeInfo` fetches by dotted string or
+`sql.Identifier` spelling. `pg_namespace` carries user schemas with minted
+oids and `pg_type` reports the bare `typname` under the schema's
+`typnamespace`. Dropping a non-empty schema without CASCADE is a 2BP01
+dependency error, CASCADE drops the contained types, and `DROP TYPE IF
+EXISTS` tolerates a missing schema. This clears the psycopg gauge's entire
+"CREATE SCHEMA is not supported" cluster and unblocks the schema-gated
+composite/range/typeinfo fixtures. (Schema-qualified *tables* remain 0A000 —
+`tasks/backlog.md`; user-defined `CREATE TYPE … AS RANGE` likewise.)
+
+#### Added
+
+- `catalog.py`: schema registry (`create_schema` / `schema_exists` /
+  `drop_schema` / `list_schemas`); `engine.py`: `CREATE`/`DROP SCHEMA`
+  routing, qualified-name extraction for `CREATE`/`DROP TYPE`;
+  `virtual.py`: user-schema `pg_namespace` rows, dotted-name splitting in
+  `pg_type`, quote-normalized qualified lookups; `planner.py`: the
+  `::regtype` literal cast resolves built-ins and user types (42704 on
+  unknown, like PG).
+
+### SQL server: arbitrary WHERE expressions and three-valued logic
+
+The sqllogictest random corpus writes SQL the way a fuzzer does — `WHERE
+- col2 + col1 IS NOT NULL`, `WHERE 1 IN (2)`, `SELECT + + 90 * a * - b` —
+and the planner used to reject anything its Mongo-filter pushdown couldn't
+express. Untranslatable WHERE clauses now route to per-row evaluation
+automatically (a dry-run of the lowering decides), computed unary
+projections type correctly instead of crashing tag inference, `ORDER BY
+<ordinal>` resolves to the output expression on the evaluated path, and the
+scalar evaluator's NOT/AND/OR/BETWEEN implement SQL's three-valued logic
+(`NOT NULL` is NULL, `NULL AND FALSE` is FALSE — visible under NOT).
+
+#### Fixed
+
+- `planner.py`: `where_needs_per_row` dry-runs the pushdown lowering and
+  falls back to per-row evaluation when it raises; the DISTINCT plan path
+  consults it too; `_infer_scalar_tag` types `- col` from its operand;
+  `ORDER BY 1` resolves the output ordinal (except SRF outputs, which sort
+  post-expansion).
+- `scalar.py`: three-valued NOT/AND/OR and a decomposed BETWEEN whose
+  definitively-false arm dominates a NULL bound.
+- A predicate the pushdown can't lower no longer errors 0A000; cross-type
+  comparisons under per-row evaluation match nothing instead of raising
+  Postgres' 42883 — a documented divergence (`tasks/backlog.md`).
+
+### SQL server: client_encoding, wire-protocol fixes, and binary-format hardening from the psycopg gauge
+
+Running psycopg 3's own unmodified test suite against the SQL server
+(`tasks/sql-gauges-plan.md`) surfaced a batch of wire-protocol and
+type-handling divergences beyond the type-OID work. The headline is
+`client_encoding` support: the server now honours the startup parameter and
+`SET client_encoding` (LATIN1/LATIN2/LATIN5/LATIN9, WIN1250-1252,
+SQL_ASCII pass-through), converting query text, text and binary parameters,
+text and binary results, arrays, COPY data, and error messages at the wire
+boundary while the engine stays UTF-8 throughout. Alongside it, a real
+protocol-ordering bug: Describe answered NoData for DML with RETURNING while
+Execute then emitted DataRows — a violation that crashed psycopg's pipelined
+`executemany`. The measured effect on the fixed psycopg-gauge subset
+(six files, psycopg 3.3.4): 409 → 637 passed of 979 (42% → 65%) across this
+and the preceding type-OID release.
+
+#### Added
+
+- `client_encoding` (startup parameter and `SET`, with canonical
+  ParameterStatus reporting and `22023` on unknown encodings); an
+  untranslatable result character raises `22P05` like Postgres instead of
+  degrading to `?`, and a NUL byte in a text parameter is rejected with
+  `22021`.
+- Quoted built-in type names in DDL (`CREATE TABLE t (c "cidr")`, the form
+  psycopg's fixtures emit via `sql.Identifier`) resolve as built-ins —
+  including array spellings — instead of failing as undeclared enums.
+
+#### Fixed
+
+- `pgextended.py`: Describe on INSERT/UPDATE/DELETE/MERGE … RETURNING
+  answers with the RETURNING columns' RowDescription (was NoData followed by
+  DataRows — a protocol violation).
+- `engine.py`: Describe on a set-returning row source (`FROM
+  generate_series(…)` / bare `SELECT generate_series(…)`) resolves the
+  result shape instead of erroring — this is what failed every
+  `cursor.stream()` (libpq single-row mode) call.
+- Array round-trips, all six param/result format combinations: a binary
+  array parameter's Python list is rendered as a Postgres array literal
+  (was the Python `repr`); the array-literal parser strips only Postgres'
+  whitespace set (`\x1c`–`\x1f` are `str.isspace()` to Python but data to
+  Postgres); the renderer quotes every whitespace character; binary array
+  elements coerce to native values (`bytea` hex, `bool` `'t'/'f'`) before
+  encoding. chr(1)–chr(255) plus `€` now round-trip byte-exact in text and
+  bytea arrays.
+- Binary `numeric` handles `±Infinity` in both directions (signs
+  `0xD000`/`0xF000`; encoding previously crashed, decoding produced
+  garbage).
+
+### SQL server: oid/regtype, declared-parameter typing, and the full binary codec surface
+
+Three parallel work streams off the psycopg gauge, landing together. The
+`oid` type (26, arrays 1028) is now first-class — columns, casts, binary
+codecs, `pg_type` rows — and `21::regtype` resolves an OID to its type name
+the way Postgres does. Parameter typing got the same discipline on every
+path: the OID a client declares in Parse now governs the value whether it
+arrives in text or binary format, `'19.99'::numeric`-style scalar casts
+convert instead of passing strings through, and Execute encodes DataRows
+with the same column OIDs Describe reported (the mismatch fed text bytes to
+clients parsing binary numerics). And the binary result/parameter codec
+surface now covers what psycopg's full-type faker exercises: time, timetz,
+interval, uuid, inet, cidr, macaddr, json, and every range and multirange
+type — including new tstzrange/tstzmultirange registration, PG-exact
+multirange rendering, JSON integers beyond int64, and Decimal128-safe
+numeric handling at any width. psycopg's `test_leak` (the full-type
+CRUD matrix) went from 72 failures to 72 passes; the six-file gauge subset
+stands at 887 of 979 (91%), from 42% at the first external run.
+
+#### Added
+
+- `oid` type end-to-end; `N::regtype` OID resolution (42704 on unknown
+  OIDs); `pg_typeof(x)::oid` resolves to the type's OID.
+- Binary codecs (both directions) for time/timetz/interval/uuid/inet/cidr/
+  macaddr/json and all range/multirange types; tstzrange/tstzmultirange
+  types; `oid[]`/`json[]`/multirange array OIDs.
+
+#### Fixed
+
+- Execute now applies the same declared-parameter OID overrides to its
+  DataRow encoding that Describe applies to RowDescription — the divergence
+  sent int4/text bytes in fields announced as int2/numeric.
+- Text-format parameters with a declared scalar OID convert to the native
+  type (declared type governs, matching the binary twin; garbage raises
+  22P02); scalar casts to int/float/numeric/bool convert with PG rounding
+  semantics.
+- Binary numeric survives values wider than Python's default 28-digit
+  context (wide-context decode, context-free negate/abs); >34-digit
+  numerics round into Decimal128 range instead of erroring on INSERT.
+- Numeric/bytes/±inf parameters keep their types through statement binding
+  (typed cast nodes / hex literals instead of bare string literals).
+- Multirange text rendering drops the ", " separator Postgres doesn't
+  print; daterange bounds render date-only; bool coercion of 'f'/'false'
+  strings; JSON top-level scalars render as JSON.
+
+### SQL: HAVING IS NULL forms, constant JOIN ON, duplicate join group keys
+
+Round four of the sqllogictest corpus tail. `HAVING <operand> IS [NOT] NULL`
+now lowers for bare-column, aggregate, and computed-over-group-key operands
+(`HAVING (- col2) IS NOT NULL`) on both the single-table and join HAVING
+lowerers. A constant JOIN ON condition (`LEFT JOIN tab0 ON 80 = 70`) folds
+three-valued — TRUE joins every foreign row, FALSE/unknown joins none (INNER
+drops the row, LEFT null-pads). And two join GROUP BY wrong-answer bugs: the
+same bare column name grouped from two aliases (`GROUP BY cor1.col1,
+cor0.col1`) collapsed to a single group key, and `SELECT DISTINCT` over
+grouped join output never deduplicated.
+
+#### Fixed
+
+- `planner.py`: `_having_to_match` / `_join_having_to_match` lower
+  `IS [NOT] NULL` over bare columns, aggregates, and computed group-key
+  expressions (the last via `_to_agg_expr` over a group-key resolver, correct
+  through any NOT nesting); `[NOT] <expr> IN (<exprs over group keys>)`
+  lowers three-valued; always-unknown NULL-operand predicates
+  (`HAVING NOT NULL IN (- col1)`, `NOT NULL NOT BETWEEN - col0 AND NULL`)
+  fold to match-nothing; `_to_agg_expr` learns unary minus over non-literals.
+- `planner.py`: an always-unknown JOIN ON (`ON NOT NULL < expr`) folds like a
+  constant-false ON instead of raising.
+- `planner.py`: `_lookup_stage` folds a constant ON via
+  `_constant_predicate_filter` instead of raising "ON must compare columns".
+- `planner.py`: duplicate bare column names in a join GROUP BY mint distinct
+  grouped fields on both the join-group and join-group-window paths
+  (qualified references rewrite/resolve onto the minted key); grouped
+  `SELECT DISTINCT` over a join dedups with the same second `$group` the
+  single-table planner uses.
+
+### SQL server: join-path aggregate expressions and WHERE residuals
+
+The JOIN planners catch up with the single-table paths from the last two
+rounds: aggregate arguments over joins can be expressions
+(`MAX(cor0.col0 + 1)`, `SUM(- 83)` over a CROSS JOIN), lowered through the
+join resolver with identity decorations stripped, and a join WHERE the
+`$match` lowering can't express routes to the per-row residual the join
+pipelines already carry (a dry-run probe, the join twin of the
+single-table one) instead of erroring.
+
+#### Fixed
+
+- `planner.py`: computed-over-aggregate outputs over a join
+  (`COUNT(*) * 32 FROM a CROSS JOIN b`) route to the group-then-evaluate
+  builder instead of failing per-row; `_join_accumulator` lowers
+  expression arguments for
+  sum/avg/min/max; `_agg_key` identifies expression aggregates by SQL text
+  instead of crashing the resolver; `_join_where_lowerable` dry-runs
+  `_expr_to_filter` and the inner/outer join builders plus both join
+  residual sites consult it.
+
+### SQL server: RowDescription reports real Postgres type OIDs for computed columns
+
+A libpq client keys its result decoding off the type OID in each
+`RowDescription` column, and SecantusDB's SQL server used to fall back to
+`text` (25) for most computed results — `CASE` expressions, `array[...]`
+constructors, array casts, integer arithmetic, bound parameters — and widened
+`smallint`/`real` to `integer`/`double precision` everywhere. The first
+external-gauge run (psycopg 3's own test suite plus the sqllogictest corpus,
+see `tasks/sql-gauges-plan.md` §6) flagged this as the single
+highest-leverage divergence. Computed and derived columns now describe with
+the OID real Postgres would use, so typed loaders in psycopg / pg8000 /
+SQLAlchemy decode results without special-casing.
+
+#### Added
+
+- `pg_typeof()` and `'name'::regtype`: the type-introspection pair psycopg's
+  type suite leans on (`select pg_typeof(%s::int2) = 'smallint'::regtype`).
+  `pg_typeof` resolves at plan time from the same static inference that types
+  RowDescription; `::regtype` normalizes any accepted spelling (`int4`,
+  `varchar`, `float4`) to the canonical pretty form `pg_typeof` prints.
+- `typemap.py`: first-class `int2` (21) and `float4` (700) type tags —
+  `smallint` / `real` columns, casts, arrays (`1005` / `1021`), catalog
+  `pg_type` rows, and `information_schema` spellings; `SMALLSERIAL` columns
+  now describe as `int2` instead of `text`.
+
+#### Fixed
+
+- `planner.py`: type inference for computed SELECT columns — `CASE` types
+  from its result branches; `array[...]` and array casts report the array
+  OID; integer arithmetic stays integer (`int + int` → `int4`, matching
+  `_pg_div`'s truncating division) instead of `numeric`; an unadorned
+  decimal constant (`SELECT 1.5`) is `numeric`, matching Postgres;
+  `sum(int2/int4)` → `int8`, `sum(int8)` → `numeric`, `avg(integer)` →
+  `numeric` per Postgres' aggregate result types; `CAST($1 AS SMALLINT)`
+  coerces its text-bound value numerically.
+- `pgextended.py`: `SELECT $1` describes with the parameter OID the client
+  declared in Parse (psycopg binds a small Python int as `int2`), instead of
+  re-inferring from the substituted Python value.
+- `pgextended.py`: binary result format and binary parameters now cover
+  arrays (the real ndim/hasnull/elemoid wire layout, both directions). The
+  correct array OIDs engage a libpq client's binary array parser, which the
+  text-bytes fallback would have fed garbage.
+
+### SQL: server-side cursors over the wire, pg_cursors, pg_prepared_statements
+
+psycopg's `ServerCursor` works end-to-end. A `DECLARE`d cursor is a portal in
+the v3 protocol, and psycopg's first move after the DECLARE is a wire
+`Describe('P', name)` — which our extended-protocol session answered with
+`34000 portal does not exist`. The portal Describe (and Close) now fall back
+to the session's DECLAREd cursors, parameterized declarations substitute
+their `$N` placeholders inside the raw `DECLARE … FOR SELECT $1` command
+text, and the session's cursors and prepared statements surface in new
+`pg_cursors` / `pg_prepared_statements` catalog tables. psycopg's
+test_cursor_server + test_prepared move 26 → 102 passing.
+
+#### Added
+
+- `pg_catalog.pg_cursors` (name / statement / is_holdable / is_binary /
+  is_scrollable / creation_time, from the session's open cursors) and
+  `pg_catalog.pg_prepared_statements` (SQL-level `PREPARE`d plus the
+  connection's wire-Parse statements, exposed via `Session.wire_prepared`).
+
+#### Fixed
+
+- `pgextended.py`: `Describe('P', name)` on a DECLAREd cursor returns its
+  RowDescription; `Close('P', name)` destroys the cursor.
+- `planner.py`: `substitute_parameters` also substitutes `$N` textually
+  inside a raw `exp.Command` tail (DECLARE bodies aren't parsed trees).
+
+### SQL: three-valued NULL semantics on the pushdown, and the aggregate long tail
+
+The SQL server's Mongo-filter pushdown now honours SQL's three-valued logic: `<>`,
+`NOT (...)`, `NOT BETWEEN`, and `NOT IN` no longer match rows whose operand column
+is NULL (Mongo's `$ne`/`$nor`/`$nin` are two-valued and matched them), a NULL
+candidate in an `IN` list can no longer match a NULL row, and `x NOT IN (…, NULL)`
+correctly matches nothing. `SUM` over zero non-null inputs returns NULL instead of
+Mongo's 0, on every plan path. Alongside, a round of sqllogictest-corpus aggregate
+and planner shapes: FROM-less aggregates (`SELECT COUNT(*)` is 1), `COUNT(<expr>)`
+counting non-null evaluations, expression `DISTINCT` aggregate arguments
+(`SUM(DISTINCT 77)`), computed and constant projections under GROUP BY, `SELECT *`
+grouped by every column, `SELECT DISTINCT` over grouped output, parenthesized join
+sources (`FROM (a CROSS JOIN b)`), constant-LHS `IN` (list and subquery forms),
+division by zero raising SQLSTATE 22012, and Postgres-exact `float8` wire text
+(`12`, not `12.0`; `NaN`/`Infinity` spellings). Three files of the corpus's
+`random/` suites now pass end-to-end that previously failed on their first record.
+
+#### Fixed
+
+- `planner.py`: `_negated_filter` lowers `NOT` by pushing the negation into the
+  tree (De Morgan, comparison-operator flips, null-guarded single-field fallback)
+  instead of Mongo's two-valued `$nor`; `<>` is null-guarded; `$in` lists drop
+  NULL candidates; constant-LHS `IN`/`NOT IN` fold three-valued (list + subquery);
+  a NULL comparison operand folds to match-nothing even when wrapped
+  (`51 <> (NULL)`, `- CAST(NULL AS INT) <> x`); computed comparisons lowered to
+  `$expr` guard both sides non-null (BSON total order is two-valued —
+  `NULL <> 19` matched every row).
+- `planner.py`: a join WHERE the `$match` lowering can't express routes to the
+  per-row evaluated join / the pre-group residual instead of being silently
+  dropped, on both the plain-join and the join-group-window paths
+  (`WHERE (NULL) BETWEEN NULL AND NULL` returned every row).
+- `planner.py`: two *different* expression aggregates of the same function
+  (`MAX(3)` and `MAX(-94 - -16)`) no longer collide on the `(func, None)`
+  accumulator-dedup key and share one value; integer `/` inside aggregate
+  arguments and `$expr` lowers with PG's truncate-toward-zero semantics
+  (`MIN(col1 / -99)` was computed with real division).
+- `planner.py` / `executor.py`: `SUM` over only-NULL inputs is NULL on the plain
+  group, group-window, join, join-window, and DISTINCT paths; the evaluated group
+  path synthesizes the one implicit-aggregate row over empty input like the
+  pipeline path already did.
+- `planner.py`: FROM-less SELECTs fold aggregates over their one implicit row;
+  `COUNT(<literal>)` no longer misroutes to the lone-`COUNT(*)` fast path;
+  `COUNT(<expr>)` counts non-null evaluations (`COUNT(NULL)` is 0).
+- `planner.py`: expression `DISTINCT` aggregate arguments push the lowered
+  expression into the distinct set (single-table, group-window, join, join-window
+  registrars); computed-over-aggregate outputs over a JOIN route to the
+  group-then-evaluate builder (`COUNT(*) * COUNT(*)`).
+- `planner.py`: grouped SELECTs with computed/constant projections route to the
+  evaluated group path; `SELECT *` under GROUP BY expands when every column is a
+  group key; `SELECT DISTINCT` over grouped output dedups; `ORDER BY <ordinal>`
+  resolves on the group-then-evaluate path.
+- `planner.py`: `FROM (a CROSS JOIN b)` unwraps grouping parens instead of
+  erroring "a derived table requires an alias".
+- `scalar.py`: division / modulo by zero raise SQLSTATE 22012 instead of leaking
+  an internal error; `COALESCE` evaluates lazily like Postgres, so a
+  division-by-zero in a never-reached argument no longer raises; operand-form
+  `CASE x WHEN v` uses SQL equality (a NULL operand or WHEN value never
+  matches, where Python `==` matched NULL to NULL).
+- `planner.py` / `executor.py`: a constant `HAVING` (``HAVING NOT NULL IS
+  NULL``) folds three-valued to match-all / match-nothing; DISTINCT aggregates
+  over zero input rows synthesize their NULL row instead of crashing on the
+  ``$addToSet`` reduction ("$size requires an array").
+- `typemap.py`: `float8` text output uses Postgres' shortest form (`12`, `-0`,
+  `1e+20`, `NaN`, `Infinity`).
+- `planner.py`: `_infer_scalar_tag` is memoized per statement — deep arithmetic
+  chains were exponential (a 20-term sqllogictest expression took ~0.5s; whole
+  corpus files timed out).
+
+### SQL: psycopg TypeInfo catalog fidelity (typarray, pg_range, to_regtype)
+
+psycopg's type-registration machinery works end-to-end: `TypeInfo.fetch`,
+`RangeInfo.fetch`, `MultirangeInfo.fetch`, `EnumInfo.fetch` (with labels),
+and `CompositeInfo.fetch` (with field names) all resolve against the virtual
+catalog. `pg_type` gains `typarray` / `typdelim`, a `pg_range` table maps
+range oids to their declared subtype and multirange oids, `to_regtype()` is
+implemented (built-ins and user-declared enum/domain/composite types,
+returning NULL for unknown names), and `oid::regtype::text` renders
+user-declared type names. Catalog-table WHEREs that can't lower now evaluate
+per-row with the real catalog in scope, and a context-dependent function call
+(`to_regtype('mood')`) is no longer folded as if it were a NULL literal.
+
+#### Added
+
+- `pg_type.typarray` / `typdelim` columns; the `pg_catalog.pg_range` virtual
+  table (`rngtypid` / `rngsubtype` / `rngmultitypid`, declared subtypes —
+  `tsrange` advertises `timestamp`, `daterange` advertises `date`);
+  `to_regtype(name)` (scalar + FROM-less + pushdown-constant paths).
+
+#### Fixed
+
+- `oid::regtype` on a user-declared type's oid resolves its name through the
+  catalog instead of raising 42704.
+- The catalog-table fast path publishes the planning subquery context and
+  routes non-lowerable WHEREs through per-row evaluation with the real
+  catalog (a synthetic catalog over the row backend knew no user types).
+- The NULL-operand comparison folds no longer treat an `Anonymous` function
+  call as a NULL literal (`WHERE t.oid = to_regtype('mood')` matched nothing).
+
+### Docs: compatibility / authentication / index pages caught up with shipped features
+
+Three docs pages still described the server as it was several releases ago.
+`compatibility.md`'s stub table claimed `getLog` returns an empty array,
+`hostInfo` / `whatsmyuri` / `buildInfo` are hardcoded, sessions are untracked,
+and `serverStatus` is all zeros — all of those return real data now, so the
+table shrinks to the honest remainder (`top`'s zero counters, `buildInfo`'s
+deliberate `7.0.0` compatibility identity, `connectionStatus`'s empty
+privileges expansion, `serverStatus`'s zeroed fallback for bare
+`CommandContext` embedders). The `$lookup` stopgap section described the
+pre-index-join hash-only implementation; the date-format section listed
+ISO-week tokens as missing; the TTL-index row said there was no background
+sweeper. All rewritten to match the code.
+
+`authentication.md` and `index.md` both still said authorization (RBAC) is
+not implemented and that an authenticated principal is fully privileged —
+RBAC has been enforced for a while (built-in and custom roles, checked on
+every command when `--auth` is on). `authentication.md` gains an
+Authorization section documenting the enforcement model, the built-in role
+list, and the custom-role / grant-revoke command set; both scope lists now
+credit SCRAM-SHA-1 and MONGODB-X509 correctly.
+
+#### Changed
+
+- `docs/compatibility.md`: stub table rewritten to current behaviour;
+  `$lookup` section describes the index-driven join (IXSCAN on a matching
+  foreign-field index, hash-join fallback); date-format token list updated
+  (`%G %V %j %U %u %w` all supported); TTL row documents the 60-second
+  background sweeper; out-of-scope auth bullet updated (SCRAM-SHA-1
+  implemented, RBAC enforced); Rust-server note updated to conformance
+  parity with a pointer to the feature comparison.
+- `docs/authentication.md`: RBAC documented as enforced (new Authorization
+  section: built-in roles, custom roles, grant/revoke quartet, code-13
+  behaviour); `createUser` example uses a real role binding.
+- `docs/index.md`: in-scope and out-of-scope auth bullets updated to
+  SCRAM (SHA-1/SHA-256) + MONGODB-X509 + enforced RBAC.
+
+### `$toDate` conversion expression on both servers
+
+The `$toDate` aggregation expression now works on the pure-Python and Rust
+servers. `$toDate: <expr>` is the shorthand for `$convert: {input: <expr>, to:
+"date"}`, and SecantusDB implements it as exactly that — a date is returned
+unchanged, an int/long/double is read as milliseconds since the Unix epoch, and
+an ISO-8601 string is parsed, while `null` or a missing field yields `null`.
+
+Because `$toDate` delegates straight to the existing `$convert`-to-date path, it
+inherits precisely the same supported inputs and errors: whatever `$convert` can
+turn into a date, so can `$toDate`, with no separate conversion code to drift.
+The Rust engine's `$convert`-to-date was also widened to convert an int / long /
+double (epoch milliseconds) to a date natively, so both `$convert` and `$toDate`
+now compute the numeric case on the Rust server rather than deferring; ISO-string
+and ObjectId inputs still defer to the Python oracle (matching `$dateFromString`'s
+partial Rust support). The two engines stay byte-for-byte in step (pinned by the
+expression parity harness).
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$toDate` aggregation expression operator,
+  delegating to the existing `$convert`-to-date conversion; the Rust
+  `$convert`-to-date path gains native int/long/double → epoch-millis conversion.
+
+### Unrecognized aggregation-expression operators report mongod's error codes
+
+When a query or pipeline references an aggregation-expression operator that
+doesn't exist (e.g. a typo like `$notreal`, or an operator MongoDB itself hasn't
+shipped), SecantusDB now rejects it with the same context-specific error code and
+message that real `mongod` returns, instead of a generic one.
+
+An unknown operator inside a query `$expr` — `find({$expr: {$notreal: [...]}})` —
+now surfaces `168 InvalidPipelineOperator` with the message
+`Unrecognized expression '$notreal'` on both the Python and the Rust server
+(previously the Python server returned `14 TypeMismatch` and the Rust server a
+generic `2 BadValue`). An unknown operator inside an aggregation `$project` —
+`aggregate([{$project: {y: {$notreal: [...]}}}])` — returns
+`Location31325` `Invalid $project :: caused by :: Unknown expression $notreal` on
+the Python server. mongod emits these same "unknown expression" errors even for
+operators it recognises by name but hasn't implemented, so SecantusDB simply
+matches that behaviour for any operator it doesn't recognise.
+
+#### Fixed
+
+- Query `$expr` with an unrecognized expression operator returns
+  `168 InvalidPipelineOperator "Unrecognized expression '$op'"` on both servers
+  (was `14 TypeMismatch` on Python, `2 BadValue` on Rust).
+- Aggregation `$project` with an unrecognized expression operator returns
+  `Location31325 "Invalid $project :: caused by :: Unknown expression $op"` on the
+  Python server (was `14 TypeMismatch`). The Rust server still returns a generic
+  `BadValue` here — faithful `$project` detection needs to distinguish the
+  projection-only operators (`$slice` / `$elemMatch` / `$meta`) from expressions,
+  tracked in `tasks/backlog.md` §7.
+
+### CI: the Java-vs-Rust-server gauge joins the weekly validate run
+
+`docs/validation-report-java-rust-server.md` was only refreshable by hand —
+the weekly `validate.yml` run regenerated every other committed report but
+not this one, so it would have gone stale. A `java-rust-server` matrix entry
+now runs `invoke validate-java --server rust` weekly alongside the other
+gauges: it reuses the java gauge's JVM/Gradle toolchain plus the
+storage-engine sync, and points `gauge_common.rust_binary` at the
+venv-staged `secantusd-rs` via `SECANTUSDB_BIN` (the default search only
+covers the cargo target dir).
+
+### CI: the cross-driver summary regenerates with the weekly validate run
+
+`docs/validation-summary.md` had been frozen since 2026-06-20 ("the 11
+gauges") while the per-driver reports refreshed weekly. Each gauge job now
+uploads its raw output (`.validation/`) as an artifact alongside its
+report, and the aggregate job reassembles them and regenerates the summary
+in the same refresh PR — no WiredTiger build needed there, because the
+generator now reads the package version straight from `src/` and resolves
+vendored-driver SHAs from the superproject's gitlinks (`git ls-tree`)
+instead of requiring checked-out submodules.
+
+#### Added
+
+- `validation_summary.generate`: collectors for the **mongo-kotlin-driver**
+  gauge (JUnit XML from `:driver-kotlin-sync:integrationTest`) and the
+  **pymongo (async)** gauge (`AsyncMongoClient` suite), bringing the
+  summary to 13 gauges; the gauge count in the prose is computed, not
+  hand-written.
+
 ### `$push` / `$addToSet` skip missing field values (both servers)
 
 A three-way aggregate differential against real `mongod` 6.0 found that the

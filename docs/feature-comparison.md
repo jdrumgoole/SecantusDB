@@ -164,9 +164,10 @@ rejects rather than risk diverging from the Python oracle — some
 edges, and sorts over non-totally-orderable value mixes (NaN / bool /
 Decimal128).
 
-Error-code nit on both: an unknown expression operator surfaces as `BadValue`
-(Rust) / `TypeMismatch` (Python) instead of mongod's
-`InvalidPipelineOperator` (168).
+Unknown expression operators report mongod's error codes: a query `$expr`
+returns `InvalidPipelineOperator` (168) on both servers, and a `$project`
+returns mongod's `Location31325` shape on the Python server (the Rust server
+still returns a generic `BadValue` for the `$project` case).
 
 ## Indexes
 
