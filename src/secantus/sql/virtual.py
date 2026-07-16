@@ -15,13 +15,22 @@ an undefined-table error rather than a wrong answer.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
 from secantus.paths import get_path
 from secantus.query import matches
 from secantus.sql import typemap
-from secantus.sql.catalog import Catalog, Column, ForeignKey, TableDef
+from secantus.sql.catalog import (
+    ENUM_TYPE_OID_BASE,
+    USER_TYPE_ARRAY_OID_OFFSET,
+    Catalog,
+    Column,
+    ForeignKey,
+    TableDef,
+    fold_type_name,
+)
 from secantus.sql.session import Session
 
 # Stable, fictional OIDs for the namespaces we advertise.
@@ -1508,13 +1517,13 @@ def _pg_collation(db: str, session: Session, storage: Any, catalog: Catalog) -> 
     return []
 
 
-_ENUM_OID_BASE = 65000
+_ENUM_OID_BASE = ENUM_TYPE_OID_BASE
 
 
 def _enum_oids(db: str, catalog: Catalog) -> dict[str, int]:
-    lister = getattr(catalog, "list_enums", None)
-    names = lister(db) if lister is not None else []
-    return {name: _ENUM_OID_BASE + i for i, name in enumerate(names)}
+    # The mint lives on Catalog because RowDescription must report the same
+    # oids this module reflects through pg_type / pg_enum / pg_attribute.
+    return catalog.enum_type_oids(db)
 
 
 _DOMAIN_OID_BASE = 66000
@@ -1583,6 +1592,11 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typnotnull": False,
                 "typdefault": None,
                 "typtype": "e",
+                # A real server pairs every user type with a ``_name`` array
+                # type; reporting 0 here let psycopg's TypeInfo registration
+                # paths touch oid 0 = INVALID_OID (its own suite pops the
+                # global unknown-oid fallback loader through array_oid).
+                "typarray": oid + USER_TYPE_ARRAY_OID_OFFSET,
             }
         )
     # User-declared domain types (typtype 'd') carry their base type's oid in
@@ -1604,6 +1618,7 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typnotnull": bool(domain.get("not_null")) if domain else False,
                 "typdefault": None if default is None else str(default),
                 "typtype": "d",
+                "typarray": oid + USER_TYPE_ARRAY_OID_OFFSET,
             }
         )
     # User-declared composite types (typtype 'c') live in the public namespace;
@@ -1624,10 +1639,11 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typdefault": None,
                 "typtype": "c",
                 "typrelid": rel_oids.get(name, 0),
+                "typarray": oid + USER_TYPE_ARRAY_OID_OFFSET,
             }
         )
-    # Non-composite types have no backing relation; user-declared types
-    # (enum / domain / composite) don't model a paired array type.
+    # Non-composite types have no backing relation; built-in types without a
+    # modelled ``_type`` pair report typarray 0 ("no array type").
     for row in rows:
         row.setdefault("typrelid", 0)
         row.setdefault("typarray", 0)
@@ -1645,14 +1661,35 @@ def user_type_name(db: str, catalog: Catalog, oid: int) -> str | None:
     return None
 
 
+_BARE_IDENT_RE = re.compile(r"[a-z_][a-z0-9_$]*\Z")
+
+
+def quote_type_name(name: str) -> str:
+    """Render a user-type name the way ``oid::regtype`` prints it: each dotted
+    part double-quoted unless it is already a plain lower-case identifier
+    (``CamelCaseEnum`` → ``"CamelCaseEnum"``). psycopg's ClientCursor pastes this
+    string verbatim as a cast suffix, so an unquoted mixed-case name would fold
+    back to lowercase and miss the type."""
+
+    def _q(part: str) -> str:
+        if _BARE_IDENT_RE.fullmatch(part):
+            return part
+        return '"' + part.replace('"', '""') + '"'
+
+    return ".".join(_q(part) for part in name.split("."))
+
+
 def user_type_oid(db: str, catalog: Catalog, name: str) -> int | None:
     """The oid of a user-declared type (enum / domain / composite) by name, or
     None — the ``to_regtype()`` tail for names the built-in tables don't know.
     A ``public.`` schema qualifier (psycopg's TypeInfo passes the name as
     typed by the user) is accepted."""
-    # Normalize quoting per dotted part ('"testschema"."testtype"' — psycopg's
-    # sql.Identifier spelling) and strip the default public namespace.
-    text = ".".join(part.strip().strip('"') for part in name.strip().split("."))
+
+    # Normalize per dotted part ('"testschema"."testtype"' — psycopg's
+    # sql.Identifier spelling) with Postgres identifier folding: a quoted part
+    # keeps its case, an unquoted part folds to lowercase ('StrTestEnum' ==
+    # strtestenum). Then strip the default public namespace.
+    text = fold_type_name(name)
     if text.lower().startswith("public."):
         text = text[len("public.") :]
     for lookup in (_enum_oids, _domain_oids, _composite_oids):

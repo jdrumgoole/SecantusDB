@@ -28,12 +28,38 @@ ROLE_MEMBER_COLLECTION = "__sql_role_members__"
 GRANT_COLLECTION = "__sql_grants__"
 SCHEMA_COLLECTION = "__sql_schemas__"
 ENUM_COLLECTION = "__sql_enums__"
+# The enum oid counter lives outside ENUM_COLLECTION so list_enums stays a plain scan.
+ENUM_META_COLLECTION = "__sql_enum_meta__"
+# Base for minted enum pg_type oids (see ``Catalog.enum_type_oids``).
+ENUM_TYPE_OID_BASE = 65000
+# A user type's paired array-type oid (pg_type ``typarray``) is its own oid
+# plus this offset — derived, never stored, and clear of every other minted-oid
+# base (functions 65000+, domains 66000+, composites 67000+). Reporting a real
+# ``typarray`` is load-bearing: psycopg's TypeInfo keys array registrations on
+# it, and an ``array_oid`` of 0 lets client code touch oid 0 = INVALID_OID —
+# psycopg's own test suite pops the global unknown-oid fallback loader that way.
+USER_TYPE_ARRAY_OID_OFFSET = 100_000
 DOMAIN_COLLECTION = "__sql_domains__"
 COMPOSITE_COLLECTION = "__sql_composites__"
 FUNCTION_COLLECTION = "__sql_functions__"
 POLICY_COLLECTION = "__sql_policies__"
 RLS_COLLECTION = "__sql_rls__"
 COLUMN_GRANT_COLLECTION = "__sql_column_grants__"
+
+
+def fold_type_name(name: str) -> str:
+    """Normalize a user-type name as Postgres resolves identifiers: each dotted
+    part folds to lowercase unless double-quoted (a quoted part keeps its case,
+    quotes stripped). ``'StrTestEnum'`` → ``strtestenum``; ``'"CamelCaseEnum"'``
+    → ``CamelCaseEnum``. Shared by ``::regtype`` resolution and cast targets."""
+
+    def _fold(part: str) -> str:
+        p = part.strip()
+        if len(p) >= 2 and p.startswith('"') and p.endswith('"'):
+            return p[1:-1]
+        return p.lower()
+
+    return ".".join(_fold(part) for part in name.strip().split("."))
 
 
 def _ser_composite_fields(fields: Any) -> list | None:
@@ -916,8 +942,35 @@ class Catalog:
     def create_enum(self, db: str, name: str, labels: list[str]) -> None:
         self._storage.delete_matching(db, ENUM_COLLECTION, {"_id": name})
         self._storage.insert(
-            db, ENUM_COLLECTION, [{"_id": name, "enum": name, "labels": list(labels)}]
+            db,
+            ENUM_COLLECTION,
+            [{"_id": name, "enum": name, "labels": list(labels), "oid": self._mint_enum_oid(db)}],
         )
+
+    def _mint_enum_oid(self, db: str) -> int:
+        """Allocate the next enum pg_type oid — monotonic, never reused, like a
+        real server's oid counter. Positional minting (base + sorted-name index)
+        is NOT an option: a later CREATE/DROP TYPE would renumber every other
+        enum, and a client that registered a loader for the old oid (psycopg's
+        ``register_enum``) would silently decode a different type through it."""
+        docs = self._storage.find_matching(
+            db, ENUM_META_COLLECTION, {"_id": "oid_counter"}, limit=1
+        )
+        if docs:
+            oid = docs[0]["next"]
+        else:
+            # First mint (or a pre-counter database): start above every oid
+            # already in use so legacy positionally-minted enums keep theirs.
+            existing = self._storage.find_matching(db, ENUM_COLLECTION, {})
+            taken = [d["oid"] for d in existing if "oid" in d]
+            oid = (
+                max([ENUM_TYPE_OID_BASE + len(existing) - 1, *taken]) + 1
+                if existing
+                else ENUM_TYPE_OID_BASE
+            )
+        self._storage.delete_matching(db, ENUM_META_COLLECTION, {"_id": "oid_counter"})
+        self._storage.insert(db, ENUM_META_COLLECTION, [{"_id": "oid_counter", "next": oid + 1}])
+        return oid
 
     def get_enum(self, db: str, name: str) -> dict[str, Any] | None:
         docs = self._storage.find_matching(db, ENUM_COLLECTION, {"_id": name}, limit=1)
@@ -963,11 +1016,26 @@ class Catalog:
         else:
             labels.append(label)
         self._storage.delete_matching(db, ENUM_COLLECTION, {"_id": name})
-        self._storage.insert(db, ENUM_COLLECTION, [{"_id": name, "enum": name, "labels": labels}])
+        # Rewrite the whole doc, preserving the minted oid — ALTER TYPE must not
+        # renumber the type out from under a client's registered loader.
+        self._storage.insert(db, ENUM_COLLECTION, [{**doc, "labels": labels}])
 
     def list_enums(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, ENUM_COLLECTION, {})
         return sorted(d["enum"] for d in docs)
+
+    def enum_type_oids(self, db: str) -> dict[str, int]:
+        """The minted pg_type oid per enum. The single mint shared by pg_type /
+        pg_enum / pg_attribute reflection AND the wire layer's RowDescription —
+        both sides must agree or a client that registered the type from the
+        catalog (psycopg's ``EnumInfo.fetch``) won't recognise result columns.
+        Oids are stored on the enum doc at CREATE TYPE; the positional form is
+        only a fallback for docs written before oids were persisted."""
+        docs = self._storage.find_matching(db, ENUM_COLLECTION, {})
+        out: dict[str, int] = {}
+        for i, doc in enumerate(sorted(docs, key=lambda d: d["enum"])):
+            out[doc["enum"]] = doc.get("oid", ENUM_TYPE_OID_BASE + i)
+        return out
 
     # -- user schemas -------------------------------------------------------- #
     # ``CREATE SCHEMA name`` — a namespace for user-declared types (and, later,
