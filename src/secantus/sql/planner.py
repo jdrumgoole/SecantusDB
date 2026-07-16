@@ -328,10 +328,18 @@ def _to_regtype(name: Any) -> int | None:
     ``EnumInfo.fetch`` keys ``WHERE t.oid = to_regtype('mood')`` on it."""
     if not isinstance(name, str):
         return None
-    key = name.strip().lower()
-    for tag, typname in typemap.PG_TYPENAME.items():
-        if key in (typname, tag, typemap.SQL_TYPE_NAME.get(tag)):
-            return typemap.PG_OID.get(tag)
+    key = name.strip()
+    if len(key) >= 2 and key.startswith('"') and key.endswith('"'):
+        # psycopg's sql.Identifier spelling ('"text"') — quoted names keep
+        # their case; built-ins only match when already lowercase.
+        key = key[1:-1]
+        if key != key.lower():
+            key = None
+    if key is not None:
+        key = key.lower()
+        for tag, typname in typemap.PG_TYPENAME.items():
+            if key in (typname, tag, typemap.SQL_TYPE_NAME.get(tag)):
+                return typemap.PG_OID.get(tag)
     sub = _pipeline_subctx.get()
     if sub is not None and getattr(sub, "catalog", None) is not None:
         from secantus.sql import virtual

@@ -948,11 +948,12 @@ class ExtendedSession:
             self.storage, self.session.database, stmt, self.session, self.catalog
         )
 
-    @staticmethod
-    def _row_desc_or_no_data(cols: list | None, formats: list[int] | None = None) -> bytes:
+    def _row_desc_or_no_data(self, cols: list | None, formats: list[int] | None = None) -> bytes:
         if cols is None:
             return pgwire.no_data()
-        return pgwire.row_description([(c.name, c.pg_oid) for c in cols], formats)
+        return pgwire.row_description(
+            [(c.name, c.pg_oid) for c in cols], formats, encoding=self.session.wire_encoding
+        )
 
 
 _TAG_BY_OID = {oid: tag for tag, oid in typemap.PG_OID.items()}

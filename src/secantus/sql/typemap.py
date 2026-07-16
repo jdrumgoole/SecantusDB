@@ -272,8 +272,15 @@ def regtype_from_oid(oid: int) -> str | None:
 def oid_for_regtype(name: str) -> int | None:
     """The type oid for a (possibly aliased) type name, or None when unknown —
     ``to_regtype('int4')`` -> 23, ``to_regtype('nope')`` -> NULL. Array
-    spellings resolve to the paired array type's oid."""
-    text = " ".join(str(name).strip().lower().split())
+    spellings resolve to the paired array type's oid. A double-quoted
+    identifier (psycopg's ``sql.Identifier`` spelling: ``'"text"'``) resolves
+    like the bare name."""
+    raw = str(name).strip()
+    if len(raw) >= 2 and raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1]
+        if raw != raw.lower():
+            return None  # quoted identifiers keep case; built-ins are lowercase
+    text = " ".join(raw.strip().lower().split())
     if text.endswith("[]"):
         base = text[:-2].split("(", 1)[0].strip()
         tag = _REGTYPE_SPELLINGS.get(base)
@@ -637,6 +644,27 @@ def _parse_pg_array_literal(text: str) -> list:
     return out
 
 
+def _coercion_error(tag: str, value: Any) -> Exception:
+    """A 22P02 that is ALSO a ValueError: paths that soft-catch ValueError
+    around ``coerce`` keep their fallbacks, while an uncaught failure reaches
+    the wire as invalid_text_representation instead of an internal error."""
+    from secantus.sql import errors as _sql_errors
+
+    class _CoercionError(_sql_errors.SQLError, ValueError):
+        pass
+
+    return _CoercionError(
+        "22P02", f'invalid input syntax for type {SQL_TYPE_NAME.get(tag, tag)}: "{value}"'
+    )
+
+
+def _int_or_22p02(value: Any, tag: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise _coercion_error(tag, value) from e
+
+
 def coerce(value: Any, tag: str) -> Any:
     """Coerce a Python literal to the BSON value stored for column ``tag``.
 
@@ -716,15 +744,18 @@ def coerce(value: Any, tag: str) -> Any:
 
         return _xmltype.parse(value)
     if tag in ("int2", "int4", "oid"):
-        return int(value)
+        return _int_or_22p02(value, tag)
     if tag == "oid":
         # oid is an unsigned 32-bit integer; Postgres' input/cast reinterprets a
         # negative value modulo 2^32 ((-1)::oid -> 4294967295).
-        return int(value) & 0xFFFFFFFF
+        return _int_or_22p02(value, tag) & 0xFFFFFFFF
     if tag == "int8":
-        return bson.Int64(int(value))
+        return bson.Int64(_int_or_22p02(value, tag))
     if tag in ("float4", "float8"):
-        return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError) as e:
+            raise _coercion_error(tag, value) from e
     if tag == "numeric":
         d = value if isinstance(value, Decimal) else Decimal(str(value))
         try:

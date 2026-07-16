@@ -540,6 +540,10 @@ class SecantusPGServer:
                 break
             elif msg.type == "f":  # CopyFail
                 reason = msg.payload.split(b"\x00", 1)[0].decode("utf-8", "replace")
+                if session.txn_handle is not None:
+                    # A failed COPY aborts the enclosing transaction (INERROR),
+                    # exactly like any other errored statement.
+                    session.txn_failed = True
                 conn.sendall(pgwire.error_response("57014", f"COPY from stdin failed: {reason}"))
                 conn.sendall(pgwire.ready_for_query(session.txn_status()))
                 return
@@ -576,14 +580,34 @@ class SecantusPGServer:
     def _copy_out(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
         with self._txn_scope(session):
             rows = sql_engine.copy_extract(self.storage, session.database, catalog, session, plan)
-        if plan.fmt == "csv":
-            header = plan.columns if plan.header else None
-            text = copyfmt.format_csv(rows, delimiter=plan.delimiter, null=plan.null, header=header)
-        else:
-            text = copyfmt.format_text(rows, delimiter=plan.delimiter, null=plan.null)
         conn.sendall(pgwire.copy_out_response(len(plan.columns)))
-        if text:
-            conn.sendall(pgwire.copy_data(pgwire.encode_text(text, session.wire_encoding)))
+        # One CopyData message per logical row, like a real server — libpq
+        # clients (psycopg's Copy.rows()) frame rows by message. Each row is
+        # FORMATTED individually: splitting a pre-rendered blob on newlines
+        # would splinter CSV rows with quoted embedded newlines, and
+        # str.splitlines would additionally split on U+0085/U+2028-style
+        # separators inside escaped text-format fields.
+        chunks: list[str] = []
+        if plan.fmt == "csv":
+            if plan.header:
+                chunks.append(
+                    copyfmt.format_csv(
+                        [], delimiter=plan.delimiter, null=plan.null, header=plan.columns
+                    )
+                )
+            chunks += [
+                copyfmt.format_csv([row], delimiter=plan.delimiter, null=plan.null) for row in rows
+            ]
+        else:
+            chunks += [
+                copyfmt.format_text([row], delimiter=plan.delimiter, null=plan.null) for row in rows
+            ]
+        if chunks:
+            out = bytearray()
+            for chunk in chunks:
+                if chunk:
+                    out += pgwire.copy_data(pgwire.encode_text(chunk, session.wire_encoding))
+            conn.sendall(bytes(out))
         conn.sendall(pgwire.copy_done())
         conn.sendall(pgwire.command_complete(f"COPY {len(rows)}"))
         conn.sendall(pgwire.ready_for_query(session.txn_status()))
@@ -614,7 +638,7 @@ def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None
     for name, value in status:
         out += pgwire.parameter_status(name, value)
     if res.columns or res.command_tag.startswith("SELECT"):
-        out += pgwire.row_description([(c.name, c.pg_oid) for c in res.columns])
+        out += pgwire.row_description([(c.name, c.pg_oid) for c in res.columns], encoding=encoding)
         tags = [c.type_tag for c in res.columns]
         for row in res.rows:
             out += pgwire.data_row(
