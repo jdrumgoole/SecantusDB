@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-07-15 — SecantusDB 0.5.4b234 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-07-16 — SecantusDB 0.5.4b234 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -17,7 +17,7 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
 | `test_command_monitoring.py` | 31 | 0 | 0 | 7 | 38 | 100.0% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
-| `test_common.py` | 3 | 1 | 0 | 0 | 4 | 75.0% |
+| `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_crud_unified.py` | 301 | 0 | 0 | 185 | 486 | 100.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 63 | 4 | 0 | 5 | 72 | 94.0% |
@@ -36,16 +36,15 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1018** | **7** | **0** | **475** | **1500** | **99.3%** |
+| **Overall** | **1019** | **6** | **0** | **475** | **1500** | **99.4%** |
 
-## Failures (7)
+## Failures (6)
 
 First 30 failure node-ids for manual triage:
 
 ```
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_hashed
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
-vendor/pymongo-tests/test/test_common.py::TestCommon::test_validate_boolean
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_maxtime_ms_message
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_csot_applied
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_length
