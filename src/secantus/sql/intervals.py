@@ -26,22 +26,47 @@ class IntervalError(ValueError):
     """A malformed interval literal."""
 
 
-# Unit name (singular) -> ("months" | "days" | "micros", multiplier).
+# ``1d`` / ``5.5min`` — a number with its unit attached in one token.
+_ATTACHED_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)([A-Za-z]+)\Z")
+
+
+# Unit name (singular) -> ("months" | "days" | "micros", multiplier). Postgres
+# accepts abbreviated unit spellings (``1 sec``, ``5 min``, ``2 hr``, ``1d``) —
+# the singularised abbreviations live here alongside the full names.
 _UNIT_FIELD: dict[str, tuple[str, int]] = {
     "microsecond": ("micros", 1),
+    "us": ("micros", 1),
+    "usec": ("micros", 1),
     "millisecond": ("micros", 1_000),
+    "ms": ("micros", 1_000),
+    "msec": ("micros", 1_000),
     "second": ("micros", MICROS_PER_SECOND),
+    "s": ("micros", MICROS_PER_SECOND),
+    "sec": ("micros", MICROS_PER_SECOND),
     "minute": ("micros", 60 * MICROS_PER_SECOND),
+    "m": ("micros", 60 * MICROS_PER_SECOND),
+    "min": ("micros", 60 * MICROS_PER_SECOND),
     "hour": ("micros", 3600 * MICROS_PER_SECOND),
+    "h": ("micros", 3600 * MICROS_PER_SECOND),
+    "hr": ("micros", 3600 * MICROS_PER_SECOND),
     "day": ("days", 1),
+    "d": ("days", 1),
     "week": ("days", 7),
+    "w": ("days", 7),
     "month": ("months", 1),
     "mon": ("months", 1),
     "quarter": ("months", 3),
     "year": ("months", 12),
+    "y": ("months", 12),
+    "yr": ("months", 12),
     "decade": ("months", 120),
+    "dec": ("months", 120),
     "century": ("months", 1200),
+    "cent": ("months", 1200),
+    "c": ("months", 1200),
     "millennium": ("months", 12000),
+    "millennia": ("months", 12000),
+    "mil": ("months", 12000),
 }
 
 
@@ -59,9 +84,13 @@ def is_interval(v: Any) -> bool:
 
 
 def _singular(unit: str) -> str:
+    # Exact spellings first — stripping the plural 's' blindly would turn the
+    # abbreviations ``ms`` / ``us`` into minutes / an unknown unit.
     u = unit.lower().strip()
-    if u.endswith("s") and u not in ("s",):
-        u = u[:-1]
+    if u in _UNIT_FIELD:
+        return u
+    if u.endswith("s") and u[:-1] in _UNIT_FIELD:
+        return u[:-1]
     return u
 
 
@@ -130,8 +159,19 @@ def parse(text: str) -> dict:
             continue
         try:
             value = float(tok)
-        except ValueError as e:
-            raise IntervalError(f"invalid interval literal: {text!r}") from e
+        except ValueError:
+            # Attached-unit form (``1d`` / ``3h`` / ``5.5min``) — number and
+            # unit in one token.
+            m_att = _ATTACHED_RE.match(tok)
+            if m_att is None:
+                raise IntervalError(f"invalid interval literal: {text!r}") from None
+            part = from_unit(float(m_att.group(1)), m_att.group(2))
+            pm, pd, pu = _fields(part)
+            months += pm
+            days += pd
+            micros += pu
+            i += 1
+            continue
         if i + 1 >= len(tokens):
             # A bare trailing number is seconds (``'0'`` / ``'30'``), matching
             # Postgres' lenient interval input.
@@ -205,6 +245,13 @@ def mul(a: Any, factor: float) -> dict:
     return make(whole_months, whole_days, micros)
 
 
+def total_micros(a: Any) -> int:
+    """The interval's justified duration in microseconds (1 month = 30 days,
+    1 day = 24 h) — the value Postgres compares and sorts intervals by."""
+    months, days, micros = _fields(a)
+    return (months * 30 + days) * MICROS_PER_DAY + micros
+
+
 def justify_days(a: Any) -> dict:
     """Roll every 30 days up into a month."""
     m, d, u = _fields(a)
@@ -232,10 +279,41 @@ def _divmod_toward_zero(n: int, d: int) -> tuple[int, int]:
 
 
 def to_date(base: Any, subdoc: Any, sign: int) -> Any:
-    """Apply ``sign * interval`` to a ``date`` / ``datetime``."""
+    """Apply ``sign * interval`` to a ``date`` / ``datetime``. A result outside
+    Python's datetime range (PG's is far wider) is computed with proleptic
+    ordinal math and returned as timestamp text."""
     months, days, micros = _fields(subdoc)
-    result = _add_months(base, sign * months) if months else base
-    return result + _dt.timedelta(days=sign * days, microseconds=sign * micros)
+    try:
+        result = _add_months(base, sign * months) if months else base
+        return result + _dt.timedelta(days=sign * days, microseconds=sign * micros)
+    except (OverflowError, ValueError):
+        from secantus.sql import datetimes as _datetimes
+
+        clock = (
+            (base.hour * 3600 + base.minute * 60 + base.second) * 1_000_000 + base.microsecond
+            if isinstance(base, _dt.datetime)
+            else 0
+        )
+        total = clock + sign * micros
+        day_shift, clock = divmod(total, MICROS_PER_DAY)
+        # Months first (calendar-aware via ordinal month walk), then days.
+        y, mo, d = base.year, base.month, base.day
+        if months:
+            t = y * 12 + (mo - 1) + sign * months
+            y, mo = divmod(t, 12)
+            mo += 1
+            d = min(d, calendar.monthrange(2000 + (y % 4), mo)[1] if 1 <= y <= 9999 else 28)
+        n = _datetimes.gregorian_ordinal(y, mo, d) + sign * days + day_shift
+        y, mo, d = _datetimes.ordinal_to_gregorian(n)
+        secs, us = divmod(clock, 1_000_000)
+        hh, rem = divmod(secs, 3600)
+        mi, ss = divmod(rem, 60)
+        text = f"{max(y, 1 - y):04d}-{mo:02d}-{d:02d} {hh:02d}:{mi:02d}:{ss:02d}"
+        if us:
+            text += f".{us:06d}".rstrip("0")
+        if y <= 0:
+            text += " BC"
+        return text
 
 
 def _add_months(base: Any, months: int) -> Any:
