@@ -1166,6 +1166,15 @@ def _describe_statement(
         # messages is a protocol violation that crashes libpq clients
         # (psycopg's pipelined executemany was the first to hit it).
         return _describe_returning(storage, db, catalog, stmt)
+    if isinstance(stmt, exp.Values):
+        # A bare ``VALUES (…)`` emits DataRows at Execute — same protocol rule
+        # as RETURNING: NoData followed by "D" crashes libpq's stream mode. The
+        # cells are constant expressions, so deriving the shape is side-effect
+        # free; unbound placeholders defer to Execute's row description.
+        try:
+            return list(_run_values(stmt, storage, db, catalog, session).columns)
+        except (errors.SQLError, TypeError, ValueError):
+            return None
     if not isinstance(stmt, exp.Select):
         return None
     table_node = stmt.find(exp.Table)
@@ -1607,6 +1616,11 @@ def _run_statement(
     if noop is not None:
         return SQLResult(command_tag=noop)
 
+    if isinstance(stmt, (exp.Column, exp.Identifier, exp.Literal, exp.Anonymous)):
+        # Garbage input ("wat") parses as a bare column/identifier expression,
+        # not a statement — Postgres raises a syntax error, and clients map
+        # 42601 to ProgrammingError (0A000 maps to NotSupportedError).
+        raise errors.SQLError("42601", f'syntax error at or near "{stmt.sql()[:40]}"')
     raise errors.feature_not_supported(f"unsupported statement: {type(stmt).__name__}")
 
 
