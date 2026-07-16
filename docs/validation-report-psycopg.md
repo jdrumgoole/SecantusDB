@@ -2,19 +2,19 @@
 
 - SecantusDB (Python server) 0.5.4b234
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-07-15 22:14 UTC
+- generated: 2026-07-16 10:32 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
 | test_adapt.py | 47 | 12 | 0 | 59 | 79.7% |
 | test_capabilities.py | 12 | 0 | 9 | 21 | 100.0% |
-| test_column.py | 11 | 42 | 0 | 53 | 20.8% |
-| test_connection.py | 79 | 23 | 2 | 104 | 77.5% |
+| test_column.py | 10 | 43 | 0 | 53 | 18.9% |
+| test_connection.py | 77 | 25 | 2 | 104 | 75.5% |
 | test_connection_info.py | 27 | 10 | 3 | 40 | 73.0% |
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
 | test_copy.py | 74 | 37 | 1 | 112 | 66.7% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
-| test_cursor_client.py | 24 | 4 | 0 | 28 | 85.7% |
+| test_cursor_client.py | 25 | 3 | 0 | 28 | 89.3% |
 | test_cursor_common.py | 253 | 27 | 8 | 288 | 90.4% |
 | test_cursor_raw.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_server.py | 85 | 25 | 0 | 110 | 77.3% |
@@ -26,10 +26,10 @@
 | test_query.py | 44 | 0 | 0 | 44 | 100.0% |
 | test_rows.py | 18 | 0 | 0 | 18 | 100.0% |
 | test_sql.py | 115 | 4 | 5 | 124 | 96.6% |
-| test_transaction.py | 83 | 1 | 1 | 85 | 98.8% |
-| test_typeinfo.py | 67 | 19 | 0 | 86 | 77.9% |
+| test_transaction.py | 79 | 5 | 1 | 85 | 94.0% |
+| test_typeinfo.py | 68 | 18 | 0 | 86 | 79.1% |
 | test_typing.py | 0 | 125 | 0 | 125 | 0.0% |
-| types/test_array.py | 125 | 33 | 0 | 158 | 79.1% |
+| types/test_array.py | 121 | 37 | 0 | 158 | 76.6% |
 | types/test_bool.py | 15 | 0 | 0 | 15 | 100.0% |
 | types/test_composite.py | 4 | 75 | 0 | 79 | 5.1% |
 | types/test_datetime.py | 293 | 262 | 12 | 567 | 52.8% |
@@ -39,15 +39,15 @@
 | types/test_multirange.py | 89 | 116 | 12 | 217 | 43.4% |
 | types/test_net.py | 3 | 30 | 0 | 33 | 9.1% |
 | types/test_none.py | 1 | 0 | 0 | 1 | 100.0% |
-| types/test_numeric.py | 365 | 5 | 0 | 370 | 98.6% |
+| types/test_numeric.py | 362 | 8 | 0 | 370 | 97.8% |
 | types/test_numpy.py | 42 | 124 | 6 | 172 | 25.3% |
 | types/test_range.py | 119 | 156 | 12 | 287 | 43.3% |
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
-| types/test_string.py | 76 | 58 | 1 | 135 | 56.7% |
+| types/test_string.py | 108 | 26 | 1 | 135 | 80.6% |
 | types/test_uuid.py | 11 | 15 | 0 | 26 | 42.3% |
-| **total** | **2554** | **1569** | **115** | **4238** | **61.9%** |
+| **total** | **2574** | **1549** | **115** | **4238** | **62.4%** |
 
-## Failures (1569)
+## Failures (1549)
 
 - `tests/test_adapt.py::test_load_cursor_ctx_nested[0-row('hello'::text)-obj1]`
 - `tests/test_adapt.py::test_load_cursor_ctx_nested[1-row('hello'::text)-obj1]`
@@ -82,6 +82,7 @@
 - `tests/test_column.py::test_details[varbit(1)-None-None-1-None]`
 - `tests/test_column.py::test_details[varbit(42)-None-None-42-None]`
 - `tests/test_column.py::test_details[varbit(83886080)-None-None-83886080-None]`
+- `tests/test_column.py::test_details[varbit-None-None-None-None]`
 - `tests/test_column.py::test_details[varchar(1)-None-None-1-None]`
 - `tests/test_column.py::test_details[varchar(1)[]-None-None-1-None]`
 - `tests/test_column.py::test_details[varchar(10485760)-None-None-10485760-None]`
@@ -108,7 +109,9 @@
 - `tests/test_connection.py::test_cancel_safe_error`
 - `tests/test_connection.py::test_cancel_safe_timeout`
 - `tests/test_connection.py::test_connect_bad`
+- `tests/test_connection.py::test_context_commit`
 - `tests/test_connection.py::test_context_inerror_rollback_no_clobber`
+- `tests/test_connection.py::test_context_rollback`
 - `tests/test_connection.py::test_notice_handlers`
 - `tests/test_connection.py::test_right_exception_on_server_disconnect`
 - `tests/test_connection.py::test_right_exception_on_session_timeout`
@@ -173,10 +176,9 @@
 - `tests/test_copy.py::test_subclass_adapter[1]`
 - `tests/test_copy.py::test_subclass_nulling_dumper[1]`
 - `tests/test_copy.py::test_worker_life[1-sample_binary]`
+- `tests/test_cursor_client.py::test_leak[asyncio-dict_row-iter]`
 - `tests/test_cursor_client.py::test_leak[asyncio-namedtuple_row-all]`
-- `tests/test_cursor_client.py::test_leak[asyncio-namedtuple_row-iter]`
-- `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-all]`
-- `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-one]`
+- `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-many]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-ClientCursor]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-Cursor]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-RawCursor]`
@@ -208,7 +210,6 @@
 - `tests/test_cursor_server.py::test_binary_cursor_execute[asyncio-ServerCursor]`
 - `tests/test_cursor_server.py::test_binary_cursor_text_override[asyncio-RawServerCursor]`
 - `tests/test_cursor_server.py::test_binary_cursor_text_override[asyncio-ServerCursor]`
-- `tests/test_cursor_server.py::test_close[asyncio-ServerCursor]`
 - `tests/test_cursor_server.py::test_close_on_error[asyncio-RawServerCursor]`
 - `tests/test_cursor_server.py::test_close_on_error[asyncio-ServerCursor]`
 - `tests/test_cursor_server.py::test_description[asyncio-RawServerCursor]`
@@ -220,9 +221,10 @@
 - `tests/test_cursor_server.py::test_execute_error[asyncio-ServerCursor-create table ssc ()]`
 - `tests/test_cursor_server.py::test_execute_error[asyncio-ServerCursor-select 1; select 2]`
 - `tests/test_cursor_server.py::test_execute_error[asyncio-ServerCursor-wat]`
-- `tests/test_cursor_server.py::test_hold[asyncio-RawServerCursor]`
+- `tests/test_cursor_server.py::test_execute_reuse[asyncio-ServerCursor]`
 - `tests/test_cursor_server.py::test_non_scrollable[asyncio-RawServerCursor]`
 - `tests/test_cursor_server.py::test_non_scrollable[asyncio-ServerCursor]`
+- `tests/test_cursor_server.py::test_pgresult[asyncio-RawServerCursor]`
 - `tests/test_cursor_server.py::test_row_factory[asyncio-RawServerCursor]`
 - `tests/test_cursor_server.py::test_row_factory[asyncio-ServerCursor]`
 - `tests/test_cursor_server.py::test_row_maker_returns_none[asyncio-RawServerCursor]`
@@ -266,7 +268,11 @@
 - `tests/test_sql.py::test_quote_roundtrip[off]`
 - `tests/test_sql.py::test_quote_roundtrip[on]`
 - `tests/test_sql.py::test_quote_stable_despite_deranged_libpq[off]`
+- `tests/test_transaction.py::test_context_active_rollback_no_clobber`
 - `tests/test_transaction.py::test_context_inerror_rollback_no_clobber[asyncio-pipeline=off]`
+- `tests/test_transaction.py::test_named_savepoints_exception_exit[asyncio-pipeline=on]`
+- `tests/test_transaction.py::test_nested_transaction_status`
+- `tests/test_transaction.py::test_transaction_status`
 - `tests/test_typeinfo.py::test_fetch[latin1-IDLE-name1]`
 - `tests/test_typeinfo.py::test_fetch[latin1-INTRANS-name1]`
 - `tests/test_typeinfo.py::test_fetch[latin1-None-name1]`
@@ -278,7 +284,6 @@
 - `tests/test_typeinfo.py::test_fetch[utf8-None-name1]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-IDLE-name1]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-INTRANS-name1]`
-- `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-INTRANS-text]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-latin1-None-name1]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-IDLE-name1]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-INTRANS-name1]`
@@ -433,8 +438,12 @@
 - `tests/types/test_array.py::test_empty_list[b]`
 - `tests/types/test_array.py::test_empty_list[s]`
 - `tests/types/test_array.py::test_empty_list[t]`
+- `tests/types/test_array.py::test_load_array_no_comma_separator`
+- `tests/types/test_array.py::test_load_list_int[want0-{10,20,-30}-0]`
+- `tests/types/test_array.py::test_load_list_int[want0-{10,20,-30}-1]`
 - `tests/types/test_array.py::test_load_list_int[want1-{10,null,30}-0]`
 - `tests/types/test_array.py::test_load_list_int[want1-{10,null,30}-1]`
+- `tests/types/test_array.py::test_load_list_int[want2-{{10,20},{30,40}}-0]`
 - `tests/types/test_array.py::test_load_list_int[want2-{{10,20},{30,40}}-1]`
 - `tests/types/test_array.py::test_load_list_str[want0-{{{{{{a}}}}}}-1]`
 - `tests/types/test_array.py::test_load_list_str[want1-{{{{{{NULL}}}}}}-1]`
@@ -1264,7 +1273,10 @@
 - `tests/types/test_numeric.py::test_dump_float[s-nan-'NaN']`
 - `tests/types/test_numeric.py::test_dump_float[t-nan-'NaN']`
 - `tests/types/test_numeric.py::test_dump_numeric_exhaustive[b]`
+- `tests/types/test_numeric.py::test_dump_numeric_exhaustive[s]`
+- `tests/types/test_numeric.py::test_dump_numeric_exhaustive[t]`
 - `tests/types/test_numeric.py::test_load_float_copy`
+- `tests/types/test_numeric.py::test_load_numeric_exhaustive[1]`
 - `tests/types/test_numpy.py::test_copy_by_oid[0-bool_-False-bool]`
 - `tests/types/test_numpy.py::test_copy_by_oid[0-bool_-True-bool]`
 - `tests/types/test_numpy.py::test_copy_by_oid[0-int16--32768-int2 int4 int8 numeric]`
@@ -1559,38 +1571,6 @@
 - `tests/types/test_string.py::test_dump_1byte[memoryview-t]`
 - `tests/types/test_string.py::test_dump_text_oid[s]`
 - `tests/types/test_string.py::test_dump_text_oid[t]`
-- `tests/types/test_string.py::test_load_ascii[bpchar-0]`
-- `tests/types/test_string.py::test_load_ascii[bpchar-1]`
-- `tests/types/test_string.py::test_load_ascii[name-0]`
-- `tests/types/test_string.py::test_load_ascii[name-1]`
-- `tests/types/test_string.py::test_load_ascii[text-0]`
-- `tests/types/test_string.py::test_load_ascii[text-1]`
-- `tests/types/test_string.py::test_load_ascii[varchar-0]`
-- `tests/types/test_string.py::test_load_ascii[varchar-1]`
-- `tests/types/test_string.py::test_load_badenc[bpchar-0]`
-- `tests/types/test_string.py::test_load_badenc[bpchar-1]`
-- `tests/types/test_string.py::test_load_badenc[name-0]`
-- `tests/types/test_string.py::test_load_badenc[name-1]`
-- `tests/types/test_string.py::test_load_badenc[text-0]`
-- `tests/types/test_string.py::test_load_badenc[text-1]`
-- `tests/types/test_string.py::test_load_badenc[varchar-0]`
-- `tests/types/test_string.py::test_load_badenc[varchar-1]`
-- `tests/types/test_string.py::test_load_enc[bpchar-latin9-0]`
-- `tests/types/test_string.py::test_load_enc[bpchar-latin9-1]`
-- `tests/types/test_string.py::test_load_enc[bpchar-utf8-0]`
-- `tests/types/test_string.py::test_load_enc[bpchar-utf8-1]`
-- `tests/types/test_string.py::test_load_enc[name-latin9-0]`
-- `tests/types/test_string.py::test_load_enc[name-latin9-1]`
-- `tests/types/test_string.py::test_load_enc[name-utf8-0]`
-- `tests/types/test_string.py::test_load_enc[name-utf8-1]`
-- `tests/types/test_string.py::test_load_enc[text-latin9-0]`
-- `tests/types/test_string.py::test_load_enc[text-latin9-1]`
-- `tests/types/test_string.py::test_load_enc[text-utf8-0]`
-- `tests/types/test_string.py::test_load_enc[text-utf8-1]`
-- `tests/types/test_string.py::test_load_enc[varchar-latin9-0]`
-- `tests/types/test_string.py::test_load_enc[varchar-latin9-1]`
-- `tests/types/test_string.py::test_load_enc[varchar-utf8-0]`
-- `tests/types/test_string.py::test_load_enc[varchar-utf8-1]`
 - `tests/types/test_string.py::test_quote_1byte[Binary-off]`
 - `tests/types/test_string.py::test_quote_1byte[bytearray-off]`
 - `tests/types/test_string.py::test_quote_1byte[bytes-off]`
