@@ -19,6 +19,443 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.4b236] — 2026-07-17
+
+### Measured everywhere: a concurrent test suite that caught real bugs, three-way benchmarks, and self-hosted docs
+
+SecantusDB now measures itself against real `mongod` in both dimensions.
+The per-operation benchmark became a three-way comparison — the Rust
+server lands at **2.1×–4.5× of mongod**, roughly 2.7×–5.2× faster than
+the Python server workload-for-workload — and a new **concurrent test
+suite** (`bench.concurrency --server all`) sweeps 1–8 parallel writers
+across the Python server, the Rust server, and mongod. That harness paid
+for itself immediately: its first runs caught a write-path bug where a
+WiredTiger transaction marked rollback-only by a concurrent competitor
+surfaced to clients as a generic `InternalError` instead of a retryable
+write conflict, plus a Windows-only ordering bug in the admin console's
+recent-connections list.
+
+The conflict story now matches mongod end to end. Commit-time conflicts
+map to the same retryable `WriteConflict` machinery as operation-time
+ones; plain writes retry **without a deadline** — a client never sees
+`WriteConflict` outside a multi-document transaction, exactly like
+mongod's `writeConflictRetry`; and the two hot-path writes to the shared
+oplog-metadata row (per oplog emit, and per cluster-time mint — the
+latter ran on every driver heartbeat) are gone, with restart
+monotonicity guaranteed structurally by a one-second recovery bump of
+the cluster clock.
+
+The documentation moved home. Both docs trees — the main reference and a
+new dedicated Rust-server tree — are now built and deployed with the
+website at `secantusdb.com/docs/` and `/docs/rust/`, wearing the site's
+banner; readthedocs.org keeps a pointer banner to the new location, and
+the release pipeline dropped its four Read-the-Docs legs. The SQL server
+kept marching on the psycopg gauge: range/multirange parameters as
+first-class values, enum result OIDs in RowDescription, composite-type
+materialization, JSON/datetime binary codec fidelity, and a batch of
+protocol quick-wins.
+
+#### Highlights
+
+- Concurrency: `bench.concurrency --server python|rust|mongod|all` with
+  failure-diagnosis instruments (writer log tails, `--server-log`);
+  measured table in [Concurrency](concurrency.html).
+- Fixed by it: commit-time WT conflicts are retryable `WriteConflict`
+  (was `InternalError`); unbounded `writeConflictRetry` for plain writes;
+  heartbeats no longer write the oplog meta row; admin recent-targets
+  ordering is deterministic under timestamp ties.
+- Benchmarks: three-way `docs/benchmark.md` — Rust server 2.1×–4.5× of
+  mongod per operation.
+- Docs: self-hosted at secantusdb.com/docs (main) and /docs/rust (the new
+  nine-page Rust-server tree); RTD carries a moved banner; `[project.urls]`
+  metadata on PyPI; the weekly validate run regenerates the cross-driver
+  summary and the Rust-server gauge reports.
+- SQL: range/multirange parameters, enum OIDs in RowDescription,
+  composite materialization, psycopg JSON/datetime codec fidelity,
+  protocol quick-wins.
+
+
+### Benchmark: the Rust server measured — 2.1×–4.5× of mongod
+
+`docs/benchmark.md` is regenerated as a three-way comparison
+(`bench.compare_servers`): real `mongod`, the Rust server, and the Python
+server, six workloads end-to-end through `pymongo` on on-disk WiredTiger.
+The Rust server lands at **2.1×–4.5× of mongod** per operation and
+~2.7×–5.2× faster than the Python server workload-for-workload; the Python
+server sits at 6×–20.5× of mongod on this run. The Rust docs tree cites the
+numbers, and its releases page now links the `secantusdb-v`-filtered
+GitHub listing (binary releases are pre-releases, so the bare releases page
+leads with the source-only PyPI release).
+
+### Concurrent writers: heartbeats stop writing the oplog meta row; conflict retries are unbounded
+
+Two follow-ups from the concurrency harness. `current_cluster_time()` no
+longer persists the oplog meta row on every call — it runs on every
+`hello` reply under the replica-set persona (driver heartbeats) and on
+change-stream high-water-mark minting, so it was a single-row write
+hotspot; restart monotonicity is now guaranteed structurally (recovery
+bumps the cluster clock one second past the meta hint, the oplog tail,
+and the wall clock, so mints that were never persisted can't be
+re-minted). And the non-transaction write-conflict retry loop loses its
+5-second deadline: real mongod's `writeConflictRetry` loops until the
+write goes through, so a client never sees `WriteConflict` (112) for a
+plain write — ours now matches, logging a warning during long retry
+stretches. Post-fix sweeps show zero client-visible conflict errors at
+1–8 concurrent writers.
+
+#### Fixed
+
+- `Storage.current_cluster_time()` is write-free; recovery bump keeps
+  restart cluster time strictly monotonic (regression-tested with a
+  simulated crash).
+- `_retry_write_conflicts`: unbounded retry with capped backoff outside
+  user transactions (inside one, conflicts still surface immediately as
+  mongod's statement-time `WriteConflict`).
+
+### Concurrent writers: commit-time conflicts retry instead of erroring
+
+Under concurrent writers, a WiredTiger batch transaction can be marked
+rollback-only by a competitor after its last operation succeeded; the
+conflict then surfaces at `commit_transaction` as a bare EINVAL with no
+`WT_ROLLBACK` marker, which escaped the write-conflict retry wrapper and
+reached clients as a generic `InternalError` (code 1). Found by the new
+three-server `bench.concurrency` harness. Commit failures now map to the
+retryable `WriteConflictError` when WiredTiger reports a rollback reason or
+the documented rollback-required EINVAL shape; commit failures that are
+neither (I/O errors, panics) stay loud, per the never-swallow rule. The
+remaining structural contention (every batch transaction updates the shared
+oplog-meta row, so writers on different collections still conflict) is
+recorded in `tasks/backlog.md` for the WT concurrency plan.
+
+#### Fixed
+
+- `storage._commit_batch_transaction`: commit-time rollback-required
+  failures become `WriteConflictError` (retried outside user transactions;
+  mongod's statement-time `WriteConflict` inside them) instead of
+  `InternalError`.
+
+### The concurrency benchmark measures all three servers
+
+`bench.concurrency` grows a `--server python|rust|mongod|all` switch —
+`all` sweeps the three back-to-back and prints a combined
+throughput-vs-writers table — plus two diagnosis instruments the first
+run immediately paid for: failing writers dump their log tails instead of
+silently zeroing, and `--server-log` captures the server's own
+stdout/stderr. [Concurrency](https://secantusdb.com/docs/concurrency.html)
+now carries the measured end-to-end table (mongod scales to 4.1× at 8
+writers; the Rust server holds flat behind its global write mutex; the
+Python server degrades under the shared oplog-meta hotspot — with
+conflicts retried and surfaced honestly since the commit-conflict fix this
+harness uncovered).
+
+### Docs: the site banner tops every self-hosted docs page
+
+Both self-hosted docs trees (secantusdb.com/docs/ and /docs/rust/) now carry
+the standard site banner — SecantusDB · Python DB · Rust DB · Blog ·
+Python docs · Rust docs — via furo's announcement bar, so the documentation
+reads as part of secantusdb.com rather than a detached sub-site. The
+readthedocs.io copies keep their "docs have moved" banner instead (the two
+are the same announcement slot, switched on the READTHEDOCS build env var).
+
+### Docs move to secantusdb.com; Read the Docs carries a pointer banner
+
+The documentation is now self-hosted: the main tree at
+`secantusdb.com/docs/` and the Rust server's tree at
+`secantusdb.com/docs/rust/`, both deployed atomically with every website
+publish. The release pipeline drops its four Read the Docs legs
+(`release-finalize` now waits only for the publish workflow and the PyPI
+listing, and no longer requires `READTHEDOCS_TOKEN`); README, and the new
+`[project.urls]` PyPI metadata, point at the self-hosted locations. The
+readthedocs.io copies stay online but every page there now carries a
+banner linking to the up-to-date docs (furo's announcement bar, enabled
+only when `READTHEDOCS=True` is in the build environment, so the
+self-hosted build never shows it).
+
+### Docs: a dedicated Rust-server documentation tree
+
+The Rust server gets its own Sphinx tree (`docs-rust/`, built with
+`invoke docs-rust`): installation from the prebuilt `secantusdb-v*` binary
+archives, the full `secantusd-rs` CLI-flag and `secantusd.toml` reference,
+the embedded `RustServer` handle, security (SCRAM / X509 / RBAC / rustls
+TLS), backup and point-in-time recovery via `secantusd-rs restore`, the
+crates architecture, conformance numbers, and the binary release track.
+The tree is pure Markdown (no autodoc — its version is read from the
+lockstep crate version), so it builds in any bare worktree, and it deploys
+to secantusdb.com alongside the main docs.
+
+### SQL server: composite types materialize — row(), record casts, typed field access
+
+Composite values were half-real: a `'(foo,42,3.14)'::testcomp` cast passed raw
+text through with a text OID, so psycopg's `register_composite` loaders never
+fired, `row(…)` didn't exist, and `(value).field` access failed on anything
+but a table column. The whole path is now materialized: `row(a, b, …)` builds
+an anonymous record (rendered `(a,b)`, described as RECORD 2249, with the PG
+binary record layout on binary cursors); casts to a declared composite parse
+the record text literal — including quoted/escaped fields and nested records —
+into the typed, field-named subdocument; a parameter a registered psycopg
+dumper declares with the minted composite OID round-trips in both text and
+binary formats; `array[…::testcomp]` describes with the paired array OID;
+`pg_typeof` prints the type's name; and `('…'::testcomp).bar` types as the
+declared field, not text.
+
+Composite and domain OIDs also switched to the allocation-stable mint that
+enums got earlier (assigned at `CREATE TYPE`/`CREATE DOMAIN` from a persisted
+counter, never renumbered or reused) — positional minting shifted every type's
+OID whenever a lexically-earlier name appeared, sending registered client
+loaders decoding the wrong type. `oid::regtype` output now also double-quotes
+reserved words (`"order"`), which psycopg's `sql.Literal` pastes verbatim.
+psycopg's `tests/types/test_composite.py` goes from 66 failing to 17 (the
+remainder: binary record edge samples and suite-order effects).
+
+#### Added
+
+- `scalar.py`: `row(…)` anonymous records; composite cast materialization
+  (`_composite_from_text` / `_composite_from_seq` with positional remap for
+  `row(…)::type`); `typemap.parse_pg_record_literal`.
+- `pgextended.py`: PG binary record encode (`_encode_record`) and param decode
+  (`_binary_record_to_text`); minted user-type binary params keep raw payloads
+  until the catalog resolves them at Bind; `pg_typeof($N)` resolves minted
+  user-type OIDs.
+- `catalog.py`: allocation-stable `composite_type_oids` / `domain_type_oids`
+  (shared `_mint_user_type_oid` counter machinery).
+
+#### Fixed
+
+- `planner.py`: constant-select RowDescription overrides for composite casts
+  (minted OID, `composite` tag), `array[…::testcomp]` (paired array OID), and
+  composite field access (the field's declared tag); user-defined type names
+  build as `udt` DataTypes in parameter substitution.
+- `virtual.quote_type_name`: reserved words double-quote in regtype output.
+
+### SQL server: a round of protocol-fidelity fixes from the psycopg gauge
+
+A batch of small wire-protocol and error-surface divergences, each found by
+running psycopg's own test suite against the server: `to_regtype` now accepts
+double-quoted identifiers (psycopg's `TypeInfo.fetch(conn,
+sql.Identifier("text"))` was returning None); garbage input (`"wat"`) raises
+a real syntax error (42601) instead of feature-not-supported, so clients map
+it to ProgrammingError; a non-numeric string bound to an integer or float
+column surfaces `22P02 invalid input syntax` instead of an internal error;
+COPY TO STDOUT sends one CopyData message per row like a real server (a
+single all-rows blob made every row after the first vanish in psycopg's
+`Copy.rows()`); a client's CopyFail aborts the enclosing transaction
+(INERROR); a bare `VALUES (…)` answers extended-protocol Describe with its
+row shape instead of NoData-then-DataRows (a protocol violation that crashes
+libpq's stream mode); RowDescription reports fixed-width types' `typlen` and
+encodes column names in the client's encoding; `pg_sleep()` sleeps;
+`pg_tables` exists; and the transaction-characteristics GUCs
+(`transaction_isolation` etc.) report their honest single-node constants.
+
+Together these clear ~60 tests across psycopg's `test_typeinfo` (18 → 0),
+`test_cursor_common` (27 → 3), `test_copy` (37 → 26) and `test_column`
+(42 → 35) files.
+
+#### Fixed
+
+- `typemap.oid_for_regtype` / `planner._to_regtype`: double-quoted identifier
+  resolution with Postgres case rules (quoted names keep case; built-ins only
+  match lowercase).
+- `engine.py`: bare expression statements → `42601`; extended-protocol
+  Describe of `VALUES` returns the row shape.
+- `typemap.coerce`: int/float coercion failures raise `22P02` (as an
+  exception that is also a `ValueError`, so soft-fallback callers keep their
+  behaviour).
+- `pgserver.py`: COPY OUT chunks per row; CopyFail marks the transaction
+  failed.
+- `pgwire.row_description`: static `typlen` table; client-encoding column
+  names (threaded from both the simple and extended paths).
+- `functions.py`: `pg_sleep` (capped at 30s — our connection threads have no
+  cancel path); `session.py`: transaction-characteristics GUC defaults.
+- `virtual.py`: the `pg_tables` system view.
+
+### SQL server: the psycopg JSON and datetime suites go fully green
+
+Two of the three biggest failure clusters in the psycopg conformance gauge —
+`tests/types/test_json.py` (181 failing) and `tests/types/test_datetime.py`
+(259 failing) — now pass completely, taking the gauge headline from 2900
+passed (70.3%) to 3473 passed (84.2%) under deterministic test order. The
+third cluster, `test_typing.py` (125), was purely environmental: it shells out
+to a bare `mypy`, which the gauge venv didn't carry — mypy now rides the `dev`
+extra and all 125 pass.
+
+The JSON cluster came down to one root cause with wide blast radius: json and
+jsonb values were never parsed at ingress. A `'{"a":1}'::jsonb` cast passed
+raw text through, so `->`/`->>` navigation returned NULL and output
+double-encoded. Casts and json-declared parameters now parse into real JSON
+values, `array[…]::text` renders Postgres' `array_out` literal instead of a
+JSON list, `E'…'` escape strings evaluate (psycopg's `sql.Literal` emits them
+for any string containing a backslash), and the plain-json OIDs (114/199)
+alias the jsonb tag.
+
+The datetime cluster decomposed into seven root causes, all fixed: temporal
+parameters substituting as bare text (a datetime param silently compared
+false against an equal cast literal); interval literals rejecting PG's unit
+abbreviations (`1s`, `5 min`, `1d 3h`); parser gaps for `epoch`, `infinity`,
+BC dates, non-padded fields and loose UTC offsets; the session `TimeZone` GUC
+being ignored on both input and output (including POSIX-inverted numeric
+zones and `set_config()`, which now emits ParameterStatus); `DateStyle`-aware
+text rendering (German/SQL/Postgres orders); binary encoders using float
+seconds (a 1µs error at year 9999) and lacking infinity sentinels; and
+PG-range values beyond Python's datetime limits, now carried as text via
+proleptic-Gregorian ordinal math so `'9999-12-31'::date + 1` returns
+`10000-01-01` like a real server. Intervals also gained PG's justified
+duration comparison (`-1 day +23:59:59.999999 = -0.000001s`).
+
+#### Added
+
+- `datetimes.py`: proleptic-Gregorian ordinal helpers valid outside
+  [year 1, 9999], `infinity`/`-infinity`/`epoch` sentinels, wide/BC timestamp
+  canonical text + binary wire values, `TimeZone`-GUC tzinfo resolution
+  (POSIX sign convention, zoneinfo names), loose-input widening.
+- `intervals.py`: PG unit abbreviations (`s`/`sec`/`min`/`h`/`d`/`w`/`y`/
+  `ms`/`us`, attached forms like `1d`), justified `total_micros`.
+- `typemap.py`: session-bound render context (TimeZone/DateStyle GUCs honoured
+  at output), typed parameter carriers (`JsonText`/`DateText`/`TimeText`/
+  `TimeTzText`) that substitute as casts, `json` OID aliases.
+- `session.py`: case-insensitive GUC name canonicalization (`set timezone`
+  hits `TimeZone`); `set_config()` on a reportable GUC emits ParameterStatus.
+- `pyproject.toml`: `mypy` in the `dev` extra (psycopg's `test_typing.py`
+  shells out to it).
+
+#### Fixed
+
+- `planner._value_to_node`: datetime / date / time / timetz / interval / json
+  parameters substitute as typed casts, not bare string literals — the same
+  treatment `Decimal` already had.
+- `pgextended.py`: temporal text params convert per their declared OID; binary
+  interval params decode to the interval subdoc; binary timestamp/date
+  encoders use integer-µs arithmetic and PG's infinity sentinels.
+- `scalar.py`: `'nope'::timestamp` raises `22007` instead of silently passing
+  raw text into the binary encoder; `ts::text` renders through the
+  session-aware renderer; mixed naive/aware datetime comparisons treat naive
+  as UTC; multi-value `SET name = v1, v2` (DateStyle) is stored and reported.
+- `engine.py` / `functions.py`: `client_encoding` canonicalises on every SET
+  path (`utf-8` → `UTF8` in ParameterStatus).
+
+### SQL server: range and multirange parameters become first-class values
+
+Range-typed parameters used to arrive as raw text and never become range
+values: `select 'empty'::int4range = %s` with a psycopg `Range` parameter
+silently compared a subdocument against a string and returned false. A
+parameter declared with a range or multirange OID (or their array forms) now
+travels as tagged text and substitutes as a `::type` cast, so the existing
+cast coercion turns it into the structured value. Array casts
+(`'{empty,"[1,3)"}'::int4range[]`) coerce their elements, untyped literals
+compared against a range value take the range's type (Postgres' context
+inference), and `range::text` renders the `[a,b)` literal.
+
+Equality itself also got Postgres semantics: range bounds store in the
+subtype's canonical form regardless of construction path (a
+`daterange(date, date)` constructor bound now matches the text cast's bound;
+`numrange` bounds unify int / Decimal / Decimal128), and comparisons go
+through a representation-independent canonical identity. psycopg's range and
+multirange suites drop from 149 failing + 31 errors to 10 + 31 — the
+remainder being untyped binary parameters (psycopg dumps a bound-less
+`Range(empty=True)` with OID 0 in binary; needs Parse-time parameter-type
+inference) and `CREATE TYPE … AS RANGE` (both recorded in `tasks/backlog.md`).
+
+#### Added
+
+- `ranges.canonical` / `canonical_multirange`: representation-independent
+  range identity used by comparisons.
+- `typemap.TaggedText`: the typed-parameter carrier for range/multirange
+  (and array-of-range) declared OIDs.
+
+#### Fixed
+
+- `pgextended.py`: text and binary range/multirange parameters (and binary
+  arrays of them) substitute as typed casts; `ParameterDescription` resolves
+  an undeclared parameter to `text` like Postgres' parse analysis instead of
+  echoing 0.
+- `ranges.make_range`: bounds coerce to the subtype's canonical storage form.
+- `scalar.py`: untyped-literal context coercion against range values;
+  `::range[]` element coercion; `range::text` rendering.
+
+### SQL server: enum result OIDs in RowDescription, and real array OIDs for user types
+
+An enum-typed result column used to describe itself as plain `text` (OID 25),
+which broke the catalog-driven type registration flow every Postgres driver
+builds on: psycopg's `EnumInfo.fetch` would find the type's minted OID in
+`pg_type`, but no result column ever carried it, so `register_enum` loaders
+never fired and enum values always came back as bare strings. `RowDescription`
+now reports the same minted OID that `pg_type` / `pg_enum` / `pg_attribute`
+reflect — the mint moved onto `Catalog.enum_type_oids` so reflection and the
+wire layer cannot drift — and the full psycopg round-trip works: fetch the
+type, register a Python `enum.Enum`, and SELECT / RETURNING rows come back as
+enum members.
+
+Chasing the conformance numbers surfaced a second, far larger bug: every
+user-declared type (enum / domain / composite) reported `pg_type.typarray = 0`.
+Clients key array-type registrations on that value, and 0 is `INVALID_OID` —
+psycopg's own suite pops the loader registered under `array_oid`, which
+deleted psycopg's *global unknown-oid fallback loader* and poisoned every
+subsequent unknown-OID text load in the process. User types now mint a derived
+paired array OID (`oid + 100000`).
+
+Enum values also flow through expressions and parameters, not just table
+columns, so the cast and Bind paths grew the same fidelity: `SELECT %s::mood`
+describes with the enum OID and validates the label (`22P02 invalid input
+value for enum` on a label the type doesn't have), a parameter a registered
+psycopg dumper declares with the enum OID is label-validated at Bind,
+`oid::regtype::text` quotes mixed-case type names the way real Postgres does
+(psycopg's ClientCursor pastes that string verbatim as a cast suffix), and
+`%s::mood[]` round-trips as a list through the minted array OID in both text
+and binary formats. psycopg's enum-adaptation suite (`tests/types/test_enum.py`,
+197 tests) passes completely. On the full psycopg conformance gauge the work
+takes the headline from 2554 passed (61.9%) to 2900 passed (70.3%) under
+deterministic test order — +346 tests, including the entire 212-test
+"unknown oid loader not found" cluster and all 152 enum failures.
+
+#### Added
+
+- `catalog.py`: `Catalog.enum_type_oids(db)` — the single enum-OID mint,
+  shared by `pg_catalog` reflection (`virtual._enum_oids` now delegates) and
+  result-column description. OIDs are **allocation-stable**: assigned from a
+  persisted counter at `CREATE TYPE`, kept across `ALTER TYPE … ADD VALUE`,
+  and never renumbered or reused after `DROP TYPE` — the previous positional
+  mint (base + sorted-name index) shifted every enum's OID whenever a
+  lexically-earlier type appeared, which would send a client's registered
+  loader decoding the wrong type.
+- `executor._out_column_descs`: enum-aware `(name, Column)` → `ColumnDesc`
+  resolution, used by SELECT (plain, correlated), INSERT / UPDATE / DELETE /
+  MERGE `RETURNING`, and extended-protocol Describe (statements and
+  RETURNING).
+- `virtual._pg_type`: enum / domain / composite rows carry a derived
+  `typarray` (`oid + USER_TYPE_ARRAY_OID_OFFSET`) instead of 0.
+- `scalar.py` / `planner.py`: casts to a declared enum (`'ok'::mood`,
+  `%s::mood`, `%s::mood[]`) validate labels (`22P02`) and describe with the
+  enum's OID (arrays: the paired array OID) in constant selects.
+- `pgextended.py`: a Bind parameter declared with an enum OID is
+  label-validated (`22P02`); binary array parameters and results handle
+  user-type array OIDs (elements travel as text — an enum's wire form is its
+  label).
+
+#### Fixed
+
+- `executor.py` / `engine.py`: enum columns in `RowDescription` report the
+  enum's OID instead of 25 across the simple-SELECT, RETURNING, and Describe
+  paths. JOIN / GROUP BY / evaluated-expression plans still describe enum
+  outputs as `text` (their column shape drops the enum tag at plan time) —
+  recorded in `tasks/backlog.md`.
+- `scalar.py`: `oid::regtype::text` of a user type quotes names that need it
+  (`"CamelCaseEnum"`) — an unquoted mixed-case name pasted back as a cast
+  suffix folds to lowercase and misses the type.
+- `virtual.user_type_oid`: `::regtype` / `to_regtype()` resolution of a
+  user-declared type name now applies Postgres identifier folding — an
+  unquoted part folds to lowercase (`'StrTestEnum'::regtype` finds
+  `strtestenum`), a quoted part keeps its case. psycopg's
+  `EnumInfo.fetch(conn, "MixedCaseName")` was returning `None`, which
+  poisoned its entire enum-adaptation suite.
+
+### Admin UI: recent-connections order is deterministic under timestamp ties
+
+`TargetStore.recent()` ordered by `last_used_at` alone; on Windows,
+`time.time()`'s ~15.6ms resolution makes back-to-back records tie, so the
+recent-targets list (and the trim that caps the table) could return them in
+arbitrary order — caught as a Windows-only CI flake. Both queries now break
+ties by `rowid DESC` (the later insert), pinned by a regression test that
+freezes the clock.
+
 ## [0.5.4b235] — 2026-07-16
 
 ### Point-in-time recovery, a SQL server with its own gauges, and operator parity across both servers
