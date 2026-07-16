@@ -23,7 +23,8 @@ def _read_project_version() -> str:
 
 SECANTUS_VERSION: str = _read_project_version()
 SECANTUS_IS_ALPHA: bool = "a" in SECANTUS_VERSION.split(".")[-1]
-SECANTUS_DOCS_URL: str = "https://secantusdb.readthedocs.io/en/latest/"
+SECANTUS_DOCS_URL: str = "https://secantusdb.com/docs/"
+SECANTUS_RUST_DOCS_URL: str = "https://secantusdb.com/docs/rust/"
 SECANTUS_PYPI_URL: str = "https://pypi.org/project/SecantusDB/"
 SECANTUS_GITHUB_URL: str = "https://github.com/jdrumgoole/SecantusDB"
 SECANTUS_TAGLINE: str = "THE SQLITE OF DOCUMENT DATABASES"
@@ -92,6 +93,7 @@ JINJA_GLOBALS = {
     "SECANTUS_VERSION": SECANTUS_VERSION,
     "SECANTUS_IS_ALPHA": SECANTUS_IS_ALPHA,
     "SECANTUS_DOCS_URL": SECANTUS_DOCS_URL,
+    "SECANTUS_RUST_DOCS_URL": SECANTUS_RUST_DOCS_URL,
     "SECANTUS_PYPI_URL": SECANTUS_PYPI_URL,
     "SECANTUS_GITHUB_URL": SECANTUS_GITHUB_URL,
     "SECANTUS_TAGLINE": SECANTUS_TAGLINE,
