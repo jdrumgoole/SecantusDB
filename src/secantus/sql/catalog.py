@@ -30,8 +30,11 @@ SCHEMA_COLLECTION = "__sql_schemas__"
 ENUM_COLLECTION = "__sql_enums__"
 # The enum oid counter lives outside ENUM_COLLECTION so list_enums stays a plain scan.
 ENUM_META_COLLECTION = "__sql_enum_meta__"
-# Base for minted enum pg_type oids (see ``Catalog.enum_type_oids``).
+# Bases for minted user-type pg_type oids (see ``Catalog.enum_type_oids`` /
+# ``domain_type_oids`` / ``composite_type_oids``).
 ENUM_TYPE_OID_BASE = 65000
+DOMAIN_TYPE_OID_BASE = 66000
+COMPOSITE_TYPE_OID_BASE = 67000
 # A user type's paired array-type oid (pg_type ``typarray``) is its own oid
 # plus this offset — derived, never stored, and clear of every other minted-oid
 # base (functions 65000+, domains 66000+, composites 67000+). Reporting a real
@@ -948,28 +951,25 @@ class Catalog:
         )
 
     def _mint_enum_oid(self, db: str) -> int:
-        """Allocate the next enum pg_type oid — monotonic, never reused, like a
-        real server's oid counter. Positional minting (base + sorted-name index)
-        is NOT an option: a later CREATE/DROP TYPE would renumber every other
-        enum, and a client that registered a loader for the old oid (psycopg's
-        ``register_enum``) would silently decode a different type through it."""
-        docs = self._storage.find_matching(
-            db, ENUM_META_COLLECTION, {"_id": "oid_counter"}, limit=1
-        )
+        return self._mint_user_type_oid(db, "oid_counter", ENUM_TYPE_OID_BASE, ENUM_COLLECTION)
+
+    def _mint_user_type_oid(self, db: str, counter_key: str, base: int, collection: str) -> int:
+        """Allocate the next pg_type oid for a user-type kind — monotonic, never
+        reused, like a real server's oid counter. Positional minting (base +
+        sorted-name index) is NOT an option: a later CREATE/DROP TYPE would
+        renumber every other type of the kind, and a client that registered a
+        loader for the old oid would silently decode a different type."""
+        docs = self._storage.find_matching(db, ENUM_META_COLLECTION, {"_id": counter_key}, limit=1)
         if docs:
             oid = docs[0]["next"]
         else:
             # First mint (or a pre-counter database): start above every oid
-            # already in use so legacy positionally-minted enums keep theirs.
-            existing = self._storage.find_matching(db, ENUM_COLLECTION, {})
+            # already in use so legacy positionally-minted types keep theirs.
+            existing = self._storage.find_matching(db, collection, {})
             taken = [d["oid"] for d in existing if "oid" in d]
-            oid = (
-                max([ENUM_TYPE_OID_BASE + len(existing) - 1, *taken]) + 1
-                if existing
-                else ENUM_TYPE_OID_BASE
-            )
-        self._storage.delete_matching(db, ENUM_META_COLLECTION, {"_id": "oid_counter"})
-        self._storage.insert(db, ENUM_META_COLLECTION, [{"_id": "oid_counter", "next": oid + 1}])
+            oid = max([base + len(existing) - 1, *taken]) + 1 if existing else base
+        self._storage.delete_matching(db, ENUM_META_COLLECTION, {"_id": counter_key})
+        self._storage.insert(db, ENUM_META_COLLECTION, [{"_id": counter_key, "next": oid + 1}])
         return oid
 
     def get_enum(self, db: str, name: str) -> dict[str, Any] | None:
@@ -1068,8 +1068,26 @@ class Catalog:
         self._storage.insert(
             db,
             COMPOSITE_COLLECTION,
-            [{"_id": name, "composite": name, "fields": _ser_composite_fields(fields)}],
+            [
+                {
+                    "_id": name,
+                    "composite": name,
+                    "fields": _ser_composite_fields(fields),
+                    "oid": self._mint_user_type_oid(
+                        db, "composite_oid_counter", COMPOSITE_TYPE_OID_BASE, COMPOSITE_COLLECTION
+                    ),
+                }
+            ],
         )
+
+    def composite_type_oids(self, db: str) -> dict[str, int]:
+        """Minted pg_type oid per composite — allocation-stable (see
+        ``enum_type_oids``); positional fallback for pre-oid docs."""
+        docs = self._storage.find_matching(db, COMPOSITE_COLLECTION, {})
+        out: dict[str, int] = {}
+        for i, doc in enumerate(sorted(docs, key=lambda d: d["composite"])):
+            out[doc["composite"]] = doc.get("oid", COMPOSITE_TYPE_OID_BASE + i)
+        return out
 
     def get_composite(self, db: str, name: str) -> list[tuple] | None:
         docs = self._storage.find_matching(db, COMPOSITE_COLLECTION, {"_id": name}, limit=1)
@@ -1117,9 +1135,21 @@ class Catalog:
                     "checks": list(checks or []),
                     "has_default": bool(has_default),
                     "default": default,
+                    "oid": self._mint_user_type_oid(
+                        db, "domain_oid_counter", DOMAIN_TYPE_OID_BASE, DOMAIN_COLLECTION
+                    ),
                 }
             ],
         )
+
+    def domain_type_oids(self, db: str) -> dict[str, int]:
+        """Minted pg_type oid per domain — allocation-stable (see
+        ``enum_type_oids``); positional fallback for pre-oid docs."""
+        docs = self._storage.find_matching(db, DOMAIN_COLLECTION, {})
+        out: dict[str, int] = {}
+        for i, doc in enumerate(sorted(docs, key=lambda d: d["domain"])):
+            out[doc["domain"]] = doc.get("oid", DOMAIN_TYPE_OID_BASE + i)
+        return out
 
     def get_domain(self, db: str, name: str) -> dict[str, Any] | None:
         docs = self._storage.find_matching(db, DOMAIN_COLLECTION, {"_id": name}, limit=1)

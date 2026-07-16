@@ -23,6 +23,8 @@ from secantus.paths import get_path
 from secantus.query import matches
 from secantus.sql import typemap
 from secantus.sql.catalog import (
+    COMPOSITE_TYPE_OID_BASE,
+    DOMAIN_TYPE_OID_BASE,
     ENUM_TYPE_OID_BASE,
     USER_TYPE_ARRAY_OID_OFFSET,
     Catalog,
@@ -1526,22 +1528,20 @@ def _enum_oids(db: str, catalog: Catalog) -> dict[str, int]:
     return catalog.enum_type_oids(db)
 
 
-_DOMAIN_OID_BASE = 66000
+_DOMAIN_OID_BASE = DOMAIN_TYPE_OID_BASE
 
 
 def _domain_oids(db: str, catalog: Catalog) -> dict[str, int]:
-    lister = getattr(catalog, "list_domains", None)
-    names = lister(db) if lister is not None else []
-    return {name: _DOMAIN_OID_BASE + i for i, name in enumerate(names)}
+    # Allocation-stable mint on Catalog (see _enum_oids).
+    return catalog.domain_type_oids(db)
 
 
-_COMPOSITE_OID_BASE = 67000
+_COMPOSITE_OID_BASE = COMPOSITE_TYPE_OID_BASE
 
 
 def _composite_oids(db: str, catalog: Catalog) -> dict[str, int]:
-    lister = getattr(catalog, "list_composites", None)
-    names = lister(db) if lister is not None else []
-    return {name: _COMPOSITE_OID_BASE + i for i, name in enumerate(names)}
+    # Allocation-stable mint on Catalog (see _enum_oids).
+    return catalog.composite_type_oids(db)
 
 
 _COMPOSITE_REL_OID_BASE = 68000
@@ -1663,16 +1663,100 @@ def user_type_name(db: str, catalog: Catalog, oid: int) -> str | None:
 
 _BARE_IDENT_RE = re.compile(r"[a-z_][a-z0-9_$]*\Z")
 
+# Reserved words that ``regtype`` output must double-quote even when lowercase
+# (``create type "order"`` renders as ``"order"``, never bare). The subset of
+# PG's fully-reserved keywords likely to appear as type names.
+_RESERVED_TYPE_WORDS = frozenset(
+    [
+        "all",
+        "analyse",
+        "analyze",
+        "and",
+        "any",
+        "array",
+        "as",
+        "asc",
+        "asymmetric",
+        "both",
+        "case",
+        "cast",
+        "check",
+        "collate",
+        "column",
+        "constraint",
+        "create",
+        "current_date",
+        "current_role",
+        "current_time",
+        "current_timestamp",
+        "current_user",
+        "default",
+        "deferrable",
+        "desc",
+        "distinct",
+        "do",
+        "else",
+        "end",
+        "except",
+        "false",
+        "fetch",
+        "for",
+        "foreign",
+        "from",
+        "grant",
+        "group",
+        "having",
+        "in",
+        "initially",
+        "intersect",
+        "into",
+        "lateral",
+        "leading",
+        "limit",
+        "localtime",
+        "localtimestamp",
+        "not",
+        "null",
+        "offset",
+        "on",
+        "only",
+        "or",
+        "order",
+        "placing",
+        "primary",
+        "references",
+        "returning",
+        "select",
+        "session_user",
+        "some",
+        "symmetric",
+        "table",
+        "then",
+        "to",
+        "trailing",
+        "true",
+        "union",
+        "unique",
+        "user",
+        "using",
+        "variadic",
+        "when",
+        "where",
+        "window",
+        "with",
+    ]
+)
+
 
 def quote_type_name(name: str) -> str:
     """Render a user-type name the way ``oid::regtype`` prints it: each dotted
-    part double-quoted unless it is already a plain lower-case identifier
-    (``CamelCaseEnum`` → ``"CamelCaseEnum"``). psycopg's ClientCursor pastes this
-    string verbatim as a cast suffix, so an unquoted mixed-case name would fold
-    back to lowercase and miss the type."""
+    part double-quoted unless it is a plain lower-case identifier that isn't a
+    reserved word (``CamelCaseEnum`` → ``"CamelCaseEnum"``, ``order`` →
+    ``"order"``). psycopg's ClientCursor pastes this string verbatim as a cast
+    suffix, so an unquoted mixed-case or reserved name would misparse."""
 
     def _q(part: str) -> str:
-        if _BARE_IDENT_RE.fullmatch(part):
+        if _BARE_IDENT_RE.fullmatch(part) and part not in _RESERVED_TYPE_WORDS:
             return part
         return '"' + part.replace('"', '""') + '"'
 

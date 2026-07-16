@@ -533,6 +533,16 @@ CREATE TYPE AS RANGE — both in `tasks/backlog.md`). Composite (66) still open:
 `row()` constructor 38, composite-value materialization 24, small catalog
 bugs 4 (see the diagnosis in this entry's session notes).
 
+**Fourth round: composite materialization.** `row(…)` anonymous records
+(text + PG binary record layout), composite cast/record-literal parsing into
+typed subdocs (quoted/escaped/nested fields, positional remap for
+``row(…)::type``), minted-OID RowDescription overrides (casts, arrays of
+composites, typed field access), binary composite params decoded via the
+embedded per-field oids, composite/domain OIDs moved to the allocation-stable
+mint, and reserved-word quoting in regtype output.
+`types/test_composite.py`: 66 → **17** (remainder: binary record edge
+samples, `test_dump_builtin_empty_range` interplay, suite-order singles).
+
 **Second slice (same day, PR pending): 19/26 → 22/26.** HAVING grew
 `IS [NOT] NULL` (bare / aggregate / computed group-key operands, exact under
 any NOT nesting), three-valued `[NOT] IN` over group keys, and always-unknown
