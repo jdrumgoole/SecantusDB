@@ -14,9 +14,10 @@ PyPI package. A release is a `secantusdb-v<crate-version>` tag (e.g.
    after the tag.
 
 Find them on the
-[GitHub Releases page](https://github.com/jdrumgoole/SecantusDB/releases)
-— the Rust binary releases are the `secantusdb-v*` tags, interleaved with
-the PyPI package's `v*` tags.
+[binary-releases listing](https://github.com/jdrumgoole/SecantusDB/releases?q=secantusdb-v&expanded=true)
+(the `secantusdb-v*` tags — they're GitHub pre-releases, so the bare
+releases page leads with the PyPI package's source-only `v*` releases
+instead).
 
 ## Version scheme
 
