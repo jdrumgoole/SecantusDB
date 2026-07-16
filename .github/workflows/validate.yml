@@ -296,6 +296,11 @@ jobs:
           name: raw-${{ matrix.driver.name }}
           path: .validation/
           if-no-files-found: error
+          # .validation is a dot-directory; upload-artifact EXCLUDES hidden
+          # files by default, which made this step find zero files and fail
+          # every gauge job on the first live run (while the summary then
+          # regenerated from an empty .validation/ — "the 0 gauges").
+          include-hidden-files: true
 
   aggregate:
     name: Aggregate reports and open PR
@@ -337,12 +342,22 @@ jobs:
           ls -la docs/validation-report*.md
 
       - name: Reassemble .validation from raw artifacts
+        # Same zero-match guard discipline as the report staging above: an
+        # empty reassembly must fail here, not ship a summary that says
+        # "the 0 gauges compare like for like".
         run: |
           shopt -s nullglob
           mkdir -p .validation
+          staged=0
           for d in artifacts/raw-*/; do
             cp -R "$d". .validation/
+            staged=$((staged + 1))
           done
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::no raw gauge artifacts found under artifacts/ — the raw-upload step is broken again"
+            exit 1
+          fi
+          echo "reassembled $staged raw artifact(s)"
           ls .validation/
 
       - name: Install uv
