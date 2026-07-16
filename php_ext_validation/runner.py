@@ -34,11 +34,13 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_paths import INCLUDE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-php-driver"
-JUNIT_OUT = REPO_ROOT / ".validation" / "php-ext-junit.xml"
+JUNIT_OUT = REPO_ROOT / ".validation" / f"php-ext-junit{gauge_common.report_suffix()}.xml"
 
 # Hard wall-clock limit on the run-tests.php invocation. A single .phpt that
 # waits on a cursor / getMore the server doesn't satisfy as expected can pin
@@ -66,9 +68,7 @@ def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
 
 
 def _resolve_php_bin() -> str | None:
-    return shutil.which("php") or _first_existing(
-        ["/opt/homebrew/bin/php", "/usr/local/bin/php"]
-    )
+    return shutil.which("php") or _first_existing(["/opt/homebrew/bin/php", "/usr/local/bin/php"])
 
 
 def _first_existing(paths: list[str]) -> str | None:
@@ -177,27 +177,45 @@ def main() -> int:
     JUNIT_OUT.parent.mkdir(parents=True, exist_ok=True)
     JUNIT_OUT.unlink(missing_ok=True)
 
+    # run-tests.php writes a scratch file (``run-test-info.php``) into its OWN
+    # directory (``__DIR__``). A system PHP install's build dir — e.g. Debian /
+    # CI's ``/usr/lib/php/<api>/build/`` — is root-owned and not writable by the
+    # runner user, so that write fails ("Permission denied") and run-tests.php
+    # bails BEFORE emitting any JUnit (empty file → ``generate_report``
+    # ``ParseError``, an opaque CI-only failure). A user-owned Homebrew prefix is
+    # writable, which is why this only bit in CI. Copy the script into a writable
+    # temp dir and run the copy so ``__DIR__`` is always writable. Defined before
+    # the daemon ``try`` so the ``finally`` cleanup can always reference it.
+    runtests_dir = tempfile.mkdtemp(prefix="secantus-php-runtests-")
+    run_tests_local = Path(runtests_dir) / "run-tests.php"
+    shutil.copy(run_tests, run_tests_local)
+    run_tests = run_tests_local
+
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-php-ext-gauge-")
+    # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+    daemon, host, port = gauge_common.spawn_daemon(
+        [
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            host,
+            "--port",
+            "0",
+            "--storage-path",
+            storage_dir,
+            "--log-level",
+            "WARNING",
+        ],
+        label="php_ext_validation",
+    )
     print(
-        f"php_ext_validation: starting daemon on {host}:{port} "
+        f"php_ext_validation: started daemon on {host}:{port} "
         f"(storage {storage_dir}, will be cleaned up)",
         file=sys.stderr,
     )
-
-    daemon = subprocess.Popen(
-        [
-            sys.executable, "-m", "secantus",
-            "--host", host, "--port", str(port),
-            "--storage-path", storage_dir,
-            "--log-level", "WARNING",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "php_ext_validation")
 
         env = os.environ.copy()
@@ -210,10 +228,13 @@ def main() -> int:
         env["PATH"] = f"{Path(php_bin).parent}:{env.get('PATH', '')}"
 
         cmd = [
-            php_bin, str(run_tests),
-            "-p", php_bin,
+            php_bin,
+            str(run_tests),
+            "-p",
+            php_bin,
             "-q",
-            "-g", "FAIL,XFAIL,BORK,WARN,LEAK",
+            "-g",
+            "FAIL,XFAIL,BORK,WARN,LEAK",
             *INCLUDE,
         ]
         print(
@@ -247,6 +268,7 @@ def main() -> int:
             daemon.kill()
             daemon.wait()
         shutil.rmtree(storage_dir, ignore_errors=True)
+        shutil.rmtree(runtests_dir, ignore_errors=True)
 
     return 0
 

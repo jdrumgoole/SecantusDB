@@ -65,11 +65,24 @@ def _match_clause(
     vars: dict[str, Any] | None,
     collation: Collation | None,
 ) -> bool:
-    if key == "$and":
-        return all(matches(doc, c, vars=vars, collation=collation) for c in condition)
-    if key == "$or":
-        return any(matches(doc, c, vars=vars, collation=collation) for c in condition)
-    if key == "$nor":
+    if key in ("$and", "$or", "$nor"):
+        # mongod requires a non-empty array of sub-documents. A non-list (or a
+        # non-document element) is a parse error — BadValue (2) — NOT an
+        # unhandled iteration crash. Without this guard ``for c in condition``
+        # raised ``TypeError: '<type>' object is not iterable`` for e.g.
+        # ``{$or: true}``, which leaked out of the QueryError catch and
+        # surfaced as a generic InternalError (1) instead of mongod's BadValue.
+        if not isinstance(condition, list):
+            raise QueryError(f"{key} must be an array")
+        if not condition:
+            raise QueryError(f"{key} must be a nonempty array")
+        for c in condition:
+            if not isinstance(c, Mapping):
+                raise QueryError(f"{key} entries need to be full objects")
+        if key == "$and":
+            return all(matches(doc, c, vars=vars, collation=collation) for c in condition)
+        if key == "$or":
+            return any(matches(doc, c, vars=vars, collation=collation) for c in condition)
         return not any(matches(doc, c, vars=vars, collation=collation) for c in condition)
     if key == "$expr":
         from secantus.expressions import evaluate
@@ -82,6 +95,28 @@ def _match_clause(
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
     return _field_matches(_resolve_path(doc, key), condition, collation)
+
+
+def _unique_items_key(value: Any) -> Any:
+    """A hashable canonical key for ``uniqueItems`` duplicate detection.
+
+    Numerics collapse to a common ``("n", Decimal)`` form so int / long /
+    double / Decimal128 compare by value; sub-documents and sub-arrays recurse
+    so nested cross-type-equal numerics collide too.
+    """
+    if isinstance(value, bool):
+        return ("b", value)
+    if isinstance(value, (int, float)):
+        return ("n", Decimal(str(value)))
+    if isinstance(value, Decimal128):
+        return ("n", value.to_decimal())
+    if isinstance(value, Mapping):
+        return ("d", tuple((k, _unique_items_key(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return ("a", tuple(_unique_items_key(v) for v in value))
+    if isinstance(value, bytes):
+        return ("y", bytes(value))
+    return ("s", type(value).__name__, value)
 
 
 def _validate_json_schema(value: Any, schema: Any) -> bool:
@@ -127,6 +162,17 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
             for item in value:
                 if not _validate_json_schema(item, schema["items"]):
                     return False
+        if schema.get("uniqueItems") is True:
+            # Every element must be distinct under MongoDB value equality, which
+            # bridges cross-type-equal numerics (int/long/double/Decimal128 by
+            # value) recursively inside sub-documents and sub-arrays — so
+            # ``{a: 1}`` and ``{a: 1.0}`` collide, matching real mongod.
+            seen: set[Any] = set()
+            for item in value:
+                key = _unique_items_key(item)
+                if key in seen:
+                    return False
+                seen.add(key)
     if isinstance(value, Mapping):
         if "required" in schema:
             for required_key in schema["required"]:
@@ -140,7 +186,47 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
             return False
         if "maxProperties" in schema and len(value) > schema["maxProperties"]:
             return False
-    return True
+        pattern_props = schema.get("patternProperties")
+        pattern_res = []
+        if isinstance(pattern_props, Mapping):
+            for pat, sub_schema in pattern_props.items():
+                rx = _compile_regex(pat, 0)  # search semantics; length cap fires
+                pattern_res.append(rx)
+                for k, v in value.items():
+                    if rx.search(k) and not _validate_json_schema(v, sub_schema):
+                        return False
+        if "additionalProperties" in schema:
+            # "Additional" = a key not named in ``properties`` and not matching any
+            # ``patternProperties`` regex.
+            ap = schema["additionalProperties"]
+            named = set(schema.get("properties", {}))
+            extras = [
+                k for k in value if k not in named and not any(rx.search(k) for rx in pattern_res)
+            ]
+            if ap is False and extras:
+                return False
+            if isinstance(ap, Mapping):
+                for k in extras:
+                    if not _validate_json_schema(value[k], ap):
+                        return False
+        deps = schema.get("dependencies")
+        if isinstance(deps, Mapping):
+            for prop, dep in deps.items():
+                if prop not in value:
+                    continue
+                if isinstance(dep, list):
+                    if any(req not in value for req in dep):  # property dependency
+                        return False
+                elif isinstance(dep, Mapping) and not _validate_json_schema(value, dep):
+                    return False  # schema dependency
+    # Logical combinators apply to the value regardless of its type.
+    if "allOf" in schema and not all(_validate_json_schema(value, s) for s in schema["allOf"]):
+        return False
+    if "anyOf" in schema and not any(_validate_json_schema(value, s) for s in schema["anyOf"]):
+        return False
+    if "oneOf" in schema and sum(_validate_json_schema(value, s) for s in schema["oneOf"]) != 1:
+        return False
+    return not ("not" in schema and _validate_json_schema(value, schema["not"]))
 
 
 def _matches_json_type(value: Any, json_type: str) -> bool:
@@ -226,6 +312,17 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
     return _eq_with_array(values, condition, collation)
 
 
+def _in_candidate_matches(
+    values: list[Any], candidate: Any, collation: Collation | None = None
+) -> bool:
+    """A single `$in` / `$nin` candidate: a regex candidate matches string values
+    by pattern (mongod semantics — the old bare-equality path silently matched
+    nothing); everything else is array-aware, collation-aware equality."""
+    if isinstance(candidate, Regex):
+        return _op_regex(values, candidate.pattern, candidate.flags)
+    return _eq_with_array(values, candidate, collation)
+
+
 def _eq_with_array(values: list[Any], expected: Any, collation: Collation | None = None) -> bool:
     for v in values:
         if v is MISSING:
@@ -279,6 +376,14 @@ def _eq_numeric_aware(a: Any, b: Any, collation: Collation | None = None) -> boo
         return _coll_equal(a, b, collation)
     if a == b:
         return True
+    # tz-aware / tz-naive datetimes of the same instant compare equal: a BSON date
+    # decodes tz-naive UTC while a SQL ``timestamptz`` literal arrives tz-aware UTC,
+    # and ``naive == aware`` is always False in Python. Treat naive as UTC (the same
+    # convention pymongo's BSON encoder uses), so ``WHERE ts = '...+00:00'`` matches
+    # the stored value — mirroring the range operators' ``_coerce_datetime``.
+    if isinstance(a, _dt.datetime) and isinstance(b, _dt.datetime):
+        a2, b2 = _coerce_datetime(a, b)
+        return a2 == b2
     a2, b2 = _coerce_numeric(a, b)
     if a2 is a:
         return False
@@ -299,9 +404,9 @@ def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | Non
     if op == "$lte":
         return _cmp(values, arg, lambda a, b: a <= b, collation)
     if op == "$in":
-        return any(_eq_with_array(values, candidate, collation) for candidate in arg)
+        return any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$nin":
-        return not any(_eq_with_array(values, candidate, collation) for candidate in arg)
+        return not any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$exists":
         present = any(v is not MISSING for v in values)
         return present == bool(arg)
@@ -565,11 +670,36 @@ def _try_cmp(
             return bool(op(c, 0))
         except TypeError:
             return False
+    # MongoDB ranks bool as its own type bracket: under range operators a bool
+    # compares only with another bool, never with a number. Python treats bool as
+    # an int subclass, so `op(True, 2)` would otherwise evaluate `1 < 2` and
+    # spuriously match — guard against that (equality already brackets bool
+    # separately). Both-bool falls through to a normal (correct) bool compare.
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
     a, b = _coerce_numeric(a, b)
+    a, b = _coerce_datetime(a, b)
     try:
         return bool(op(a, b))
     except TypeError:
         return False
+
+
+def _coerce_datetime(a: Any, b: Any) -> tuple[Any, Any]:
+    """Bridge tz-aware / tz-naive datetimes so a range comparison never raises a
+    ``TypeError`` (which would be swallowed and silently drop the row). BSON dates
+    decode tz-naive UTC; a SQL ``timestamptz`` literal arrives tz-aware UTC — the
+    same instant — so a naive datetime is treated as UTC before comparing."""
+    if (
+        isinstance(a, _dt.datetime)
+        and isinstance(b, _dt.datetime)
+        and (a.tzinfo is None) != (b.tzinfo is None)
+    ):
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=_dt.timezone.utc)
+        if b.tzinfo is None:
+            b = b.replace(tzinfo=_dt.timezone.utc)
+    return a, b
 
 
 def _coerce_numeric(a: Any, b: Any) -> tuple[Any, Any]:
@@ -730,6 +860,43 @@ _TYPE_PREDS: dict[Any, Callable[[Any], bool]] = {
 }
 
 
+def bson_type_name(v: Any) -> str:
+    """mongod's BSON type-alias string for a decoded value.
+
+    Used to fill ``consideredType`` in document-validation failure
+    details (the C# CRUD-spec prose test pins ``"int"`` for a Python
+    ``int``). Order matters: ``bool`` and ``Int64`` are ``int``
+    subclasses and must be checked first.
+    """
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, Int64):
+        return "long"
+    if isinstance(v, int):
+        return "int"
+    if isinstance(v, float):
+        return "double"
+    if isinstance(v, Decimal128):
+        return "decimal"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, ObjectId):
+        return "objectId"
+    if isinstance(v, _dt.datetime):
+        return "date"
+    if v is None:
+        return "null"
+    if isinstance(v, Regex):
+        return "regex"
+    if isinstance(v, (bytes, Binary)):
+        return "binData"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return "object"
+
+
 def _matches_type(value: Any, type_spec: Any) -> bool:
     pred = _TYPE_PREDS.get(type_spec)
     return bool(pred(value)) if pred else False
@@ -777,10 +944,16 @@ def _op_all(values: list[Any], required: Any) -> bool:
             return False
         return elem == r
 
+    def _required_satisfied(v: list[Any], r: Any) -> bool:
+        # A `{$elemMatch: {...}}` clause requires *some* element of the array to
+        # match the sub-query (mongod's `$all` + `$elemMatch` form); every other
+        # clause requires some element to equal / pattern-match it.
+        if isinstance(r, Mapping) and list(r.keys()) == ["$elemMatch"]:
+            return _op_elem_match([v], r["$elemMatch"])
+        return any(_elem_matches_required(elem, r) for elem in v)
+
     for v in values:
-        if isinstance(v, list) and all(
-            any(_elem_matches_required(elem, r) for elem in v) for r in required
-        ):
+        if isinstance(v, list) and all(_required_satisfied(v, r) for r in required):
             return True
     return False
 

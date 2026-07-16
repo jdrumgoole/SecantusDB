@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
-from secantus.expressions import evaluate
+from secantus.expressions import (
+    MISSING,
+    ExpressionError,
+    UnknownExpressionOperatorError,
+    _bson_type_name,
+    evaluate,
+    evaluate_or_missing,
+)
 from secantus.numerics import bson_add
 from secantus.paths import get_path, set_path, unset_path
-from secantus.query import matches
+from secantus.query import QueryError, matches
 
 if TYPE_CHECKING:
     from secantus.storage import Storage
@@ -27,6 +35,22 @@ class AggregateError(Exception):
         super().__init__(message)
         self.code = code
         self.code_name = code_name
+
+
+# Atlas Search is an Atlas-only feature. A real non-Atlas mongod rejects the
+# ``$listSearchIndexes`` aggregation stage (and the createSearchIndexes /
+# updateSearchIndex / dropSearchIndex commands, see ``commands.py``) with a
+# message naming Atlas; the driver index-management spec tests assert only that
+# the error mentions "Atlas". Shared with ``commands.py`` so the stage and the
+# commands stay in lockstep.
+SEARCH_INDEX_ATLAS_MSG = (
+    "Using Atlas Search Database Commands and the $listSearchIndexes aggregation "
+    "stage requires additional configuration. Please connect to Atlas or an "
+    "Atlas-compatible deployment to use this feature."
+)
+# Atlas-only aggregation stages: not supported off Atlas, rejected with the
+# Atlas message above rather than the generic "unrecognized stage" error.
+_ATLAS_ONLY_STAGES = frozenset({"$listSearchIndexes", "$search", "$searchMeta", "$vectorSearch"})
 
 
 @dataclass
@@ -48,6 +72,19 @@ class PipelineContext:
     # ``command`` sub-doc on the self-row mongo-node-driver's
     # ``$currentOp`` test introspects.
     command_doc: dict[str, Any] | None = None
+    # ``bypassDocumentValidation`` from the aggregate command. When
+    # false (the default) a ``$out`` / ``$merge`` write into a
+    # collection that carries a ``validator`` enforces it — mongo-c-
+    # driver's ``aggregate/bypass_document_validation`` test sets a
+    # ``{number: {$gte: 5}}`` validator and expects the cursor to error.
+    bypass_validation: bool = False
+    # The current connection's ``hello.client`` handshake subdoc (driver
+    # name/version, OS, application name). Surfaced by ``$currentOp`` as the
+    # ``clientMetadata`` document + the top-level ``appName`` on the self-row,
+    # which mongocxx's "client metadata handshake feature" test reads back via
+    # ``db.aggregate([{$currentOp: {}}])``. Set by the aggregate command handler
+    # from the connection registry; ``None`` for non-connection callers.
+    client_metadata: dict[str, Any] | None = None
 
     def with_vars(self, more: dict[str, Any]) -> PipelineContext:
         return PipelineContext(
@@ -58,6 +95,8 @@ class PipelineContext:
             change_stream=self.change_stream,
             collation=self.collation,
             command_doc=self.command_doc,
+            bypass_validation=self.bypass_validation,
+            client_metadata=self.client_metadata,
         )
 
 
@@ -80,6 +119,18 @@ def apply_pipeline(
             ctx = PipelineContext(vars={"NOW": now})
         else:
             ctx.vars["NOW"] = now
+    # ``$out`` / ``$merge`` may only appear as the final stage. mongod
+    # rejects a non-terminal write stage with Location40601 before
+    # executing anything (mongo-cxx-driver's "out fails when not last").
+    for i, stage in enumerate(pipeline):
+        if isinstance(stage, Mapping) and i != len(pipeline) - 1:
+            for write_stage in ("$out", "$merge"):
+                if write_stage in stage:
+                    raise AggregateError(
+                        f"{write_stage} can only be the final stage in the pipeline",
+                        code=40601,
+                        code_name="Location40601",
+                    )
     for stage in pipeline:
         docs = _apply_stage(stage, docs, ctx)
     return docs
@@ -93,6 +144,12 @@ def _apply_stage(
     if len(stage) != 1:
         raise AggregateError("each pipeline stage must have exactly one key")
     name, spec = next(iter(stage.items()))
+    if name in _ATLAS_ONLY_STAGES:
+        # Atlas-only stage on a non-Atlas deployment — mongod fails it with a
+        # message naming Atlas (CommandNotSupported), not the generic
+        # "unrecognized stage" error (mongo-c-driver
+        # /index-management/listSearchIndexes asserts errorContains "Atlas").
+        raise AggregateError(SEARCH_INDEX_ATLAS_MSG, code=115, code_name="CommandNotSupported")
     handler = _STAGES.get(name)
     if handler is None:
         # mongod's exact shape: 40324 with this wording (the unified
@@ -147,7 +204,16 @@ def _stage_project(
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$project requires a document spec")
-    return [_project_one(d, spec, ctx.vars) for d in docs]
+    try:
+        return [_project_one(d, spec, ctx.vars) for d in docs]
+    except UnknownExpressionOperatorError as exc:
+        # mongod wraps an unrecognized expression operator used inside a
+        # ``$project`` in a stage-specific ``Location31325`` error:
+        # ``Invalid $project :: caused by :: Unknown expression $op``.
+        raise ExpressionError(
+            f"Invalid $project :: caused by :: Unknown expression {exc.op}",
+            code=31325,
+        ) from exc
 
 
 def _project_one(
@@ -191,7 +257,13 @@ def _project_one(
             if value is not None or _path_present(doc, path):
                 set_path(result, path, copy.deepcopy(value))
         for key, expr in computed.items():
-            set_path(result, key, evaluate(expr, doc, vars))
+            value = evaluate(expr, doc, vars)
+            # A computed field that resolves to the "missing" marker (an
+            # absent field via ``$getField`` / an explicit ``$$REMOVE``) is
+            # omitted from the output, matching mongod — never emitted as null.
+            if value is MISSING:
+                continue
+            set_path(result, key, value)
         return result
 
     result = copy.deepcopy(doc)
@@ -226,7 +298,15 @@ def _add_fields_one(
 ) -> dict[str, Any]:
     result = copy.deepcopy(doc)
     for path, expr in spec.items():
-        set_path(result, path, evaluate(expr, doc, vars))
+        value = evaluate(expr, doc, vars)
+        # A field that resolves to the "missing" marker (absent field via
+        # ``$getField`` / ``$$REMOVE``) is dropped rather than written —
+        # matching mongod's ``$addFields``, which removes an existing field
+        # when its new value is the missing/``$$REMOVE`` value.
+        if value is MISSING:
+            unset_path(result, path)
+            continue
+        set_path(result, path, value)
     return result
 
 
@@ -718,7 +798,43 @@ def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
     for k, v in list(bucket.items()):
         if isinstance(v, dict) and "_avg_total" in v and "_avg_n" in v:
             bucket[k] = v["_avg_total"] / v["_avg_n"] if v["_avg_n"] else None
+        elif isinstance(v, dict) and "_std_vals" in v:
+            bucket[k] = _std_dev(v["_std_vals"], pop=v["_std_pop"])
+        elif isinstance(v, dict) and "_nelem_vals" in v:
+            bucket[k] = _nelem_finalize(v)
+        elif isinstance(v, dict) and "_topn_items" in v:
+            bucket[k] = _topn_finalize(v)
     return bucket
+
+
+def _std_dev(values: list[Any], *, pop: bool) -> float | None:
+    """Population / sample standard deviation, matching Mongo's ``$stdDevPop`` /
+    ``$stdDevSamp``: pop is null for an empty set (0 for a single value); samp is
+    null for fewer than two values.
+
+    Deliberately uses **naive left-fold float summation** (an explicit loop, not
+    the ``sum()`` builtin) plus multiply-based squaring and ``math.sqrt`` — all
+    correctly-rounded IEEE operations in a fixed order — so the result is bit-for-bit
+    reproducible by the Rust engine (whose ``Iterator::sum`` is the same naive fold).
+    CPython 3.12's ``sum()`` switched to Neumaier *compensated* summation for
+    floats, which is more accurate but would round a last ULP differently from
+    Rust's naive fold; ``** 2`` / ``** 0.5`` go through ``pow`` and can likewise
+    diverge from multiply / hardware sqrt. (mongod computes stddev with an online
+    Welford-style algorithm, so neither server matches it to the last ULP anyway —
+    aligning the two SecantusDB engines is what matters here.)"""
+    n = len(values)
+    if n == 0 or (not pop and n < 2):
+        return None
+    total = 0.0
+    for x in values:
+        total += x  # bool folds to 0.0/1.0, matching the Rust engine
+    mean = total / n
+    denom = n if pop else n - 1
+    acc = 0.0
+    for x in values:
+        d = x - mean
+        acc += d * d
+    return math.sqrt(acc / denom)
 
 
 _AccHandler = Callable[[dict[str, Any], str, Any, Mapping[str, Any], dict[str, Any]], None]
@@ -790,16 +906,243 @@ def _acc_last(
 def _acc_push(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    bucket.setdefault(field, []).append(evaluate(arg, doc, vars))
+    # mongod skips a missing field value (an explicit null is still pushed); the
+    # accumulated field is created as [] even when every value is missing.
+    lst = bucket.setdefault(field, [])
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is not MISSING:
+        lst.append(v)
 
 
 def _acc_add_to_set(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
+    seen = bucket.setdefault(field, [])
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is not MISSING and v not in seen:
+        seen.append(v)
+
+
+def _acc_merge_objects(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    # $mergeObjects accumulator: merge each per-doc operand document into the
+    # accumulator (later keys override earlier — dict.update semantics). A
+    # null/missing operand is skipped; a non-null, non-document operand is an
+    # error (mongod Location 40400). An all-missing group still yields {}.
+    acc = bucket.setdefault(field, {})
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is MISSING or v is None:
+        return
+    if not isinstance(v, Mapping):
+        raise AggregateError(
+            "$mergeObjects requires object inputs, but input "
+            f"{v!r} is of type {_bson_type_name(v)}",
+            code=40400,
+            code_name="Location40400",
+        )
+    acc.update(v)
+
+
+def _acc_std(
+    bucket: dict[str, Any],
+    field: str,
+    arg: Any,
+    doc: Mapping[str, Any],
+    vars: dict[str, Any],
+    *,
+    pop: bool,
+) -> None:
     v = evaluate(arg, doc, vars)
-    bucket.setdefault(field, [])
-    if v not in bucket[field]:
-        bucket[field].append(v)
+    if v is None:
+        return
+    state = bucket.get(field)
+    if not isinstance(state, dict) or "_std_vals" not in state:
+        state = {"_std_vals": [], "_std_pop": pop}
+        bucket[field] = state
+    state["_std_vals"].append(v)
+
+
+def _acc_std_pop(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_std(bucket, field, arg, doc, vars, pop=True)
+
+
+def _acc_std_samp(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_std(bucket, field, arg, doc, vars, pop=False)
+
+
+def _acc_nelem(
+    bucket: dict[str, Any],
+    field: str,
+    arg: Any,
+    doc: Mapping[str, Any],
+    vars: dict[str, Any],
+    *,
+    kind: str,
+) -> None:
+    """``$firstN`` / ``$lastN`` / ``$maxN`` / ``$minN`` (accumulator form): collect
+    the per-doc ``input`` value across the group; the result (``n`` first/last in
+    doc order, or ``n`` largest/smallest) is computed at finalize. ``$firstN`` /
+    ``$lastN`` **include null** values (they're the first/last values seen);
+    ``$maxN`` / ``$minN`` ignore them (matched to mongod 6.0 via a three-way probe).
+    ``{n, input}`` validation matches the expression forms."""
+    from secantus.expressions import nelem_parse_n
+
+    if not isinstance(arg, Mapping) or "n" not in arg:
+        raise ExpressionError("Missing value for 'n'", code=5787906)
+    if "input" not in arg:
+        raise ExpressionError("Missing value for 'input'", code=5787907)
+    n = nelem_parse_n(evaluate(arg["n"], doc, vars))
+    value = evaluate(arg["input"], doc, vars)
+    state = bucket.get(field)
+    if not isinstance(state, dict) or "_nelem_vals" not in state:
+        state = {"_nelem_vals": [], "_nelem_n": n, "_nelem_kind": kind}
+        bucket[field] = state
+    else:
+        state["_nelem_n"] = n  # n is constant across the group; last write wins
+    state["_nelem_vals"].append(value)
+
+
+def _acc_first_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_nelem(bucket, field, arg, doc, vars, kind="firstN")
+
+
+def _acc_last_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_nelem(bucket, field, arg, doc, vars, kind="lastN")
+
+
+def _acc_max_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_nelem(bucket, field, arg, doc, vars, kind="maxN")
+
+
+def _acc_min_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_nelem(bucket, field, arg, doc, vars, kind="minN")
+
+
+def _nelem_finalize(state: dict[str, Any]) -> list[Any]:
+    """Finalize an N-element accumulator state to its result list."""
+    vals = state["_nelem_vals"]
+    n = state["_nelem_n"]
+    kind = state["_nelem_kind"]
+    if kind == "firstN":
+        return vals[:n]
+    if kind == "lastN":
+        return vals[-n:]
+    from secantus.ordering import _SortKey
+
+    non_null = [x for x in vals if x is not None]
+    non_null.sort(key=_SortKey, reverse=(kind == "maxN"))
+    return non_null[:n]
+
+
+def _acc_topn(
+    bucket: dict[str, Any],
+    field: str,
+    arg: Any,
+    doc: Mapping[str, Any],
+    vars: dict[str, Any],
+    *,
+    kind: str,
+) -> None:
+    """``$top`` / ``$bottom`` / ``$topN`` / ``$bottomN`` accumulators: sort the
+    group's docs by ``sortBy`` (multi-key BSON order; null / missing sort low and
+    are **not** filtered) and take the top / bottom entries' ``output``. ``$topN`` /
+    ``$bottomN`` take ``n`` (first / last ``n`` of the sort) and return a list;
+    ``$top`` / ``$bottom`` take no ``n`` and return a single value. Validation
+    matches mongod 6.0 (three-way verified)."""
+    from secantus.expressions import nelem_parse_n
+
+    op = "$" + kind
+    has_n = kind in ("topN", "bottomN")
+    if not isinstance(arg, Mapping):
+        raise ExpressionError(f"{op} requires an object", code=5788001)
+    if not has_n and "n" in arg:
+        raise ExpressionError(f"Unknown argument to {op} 'n'", code=5788002)
+    if has_n and "n" not in arg:
+        raise ExpressionError("Missing value for 'n'", code=5788003)
+    if "output" not in arg:
+        raise ExpressionError("Missing value for 'output'", code=5788004)
+    if "sortBy" not in arg:
+        raise ExpressionError("Missing value for 'sortBy'", code=5788005)
+    sortby = arg["sortBy"]
+    if not isinstance(sortby, Mapping):
+        raise ExpressionError("invalid parameter: expected an object (sortBy)", code=10065)
+    n = nelem_parse_n(evaluate(arg["n"], doc, vars)) if has_n else 1
+    sort_vals = tuple(get_path(dict(doc), f) for f in sortby)
+    output_val = evaluate(arg["output"], doc, vars)
+    state = bucket.get(field)
+    if not isinstance(state, dict) or "_topn_items" not in state:
+        state = {
+            "_topn_items": [],
+            "_topn_n": n,
+            "_topn_dirs": [int(d) == -1 for d in sortby.values()],
+            "_topn_kind": kind,
+        }
+        bucket[field] = state
+    else:
+        state["_topn_n"] = n  # n is constant across the group
+    state["_topn_items"].append((sort_vals, output_val))
+
+
+def _acc_top(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_topn(bucket, field, arg, doc, vars, kind="top")
+
+
+def _acc_bottom(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_topn(bucket, field, arg, doc, vars, kind="bottom")
+
+
+def _acc_top_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_topn(bucket, field, arg, doc, vars, kind="topN")
+
+
+def _acc_bottom_n(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_topn(bucket, field, arg, doc, vars, kind="bottomN")
+
+
+def _topn_finalize(state: dict[str, Any]) -> Any:
+    """Finalize a ``$top``/``$bottom``/``$topN``/``$bottomN`` state: stable-sort the
+    collected ``(sort_values, output)`` items by the ``sortBy`` directions, then
+    return the top/bottom ``output`` value(s). ``$top``/``$bottom`` return a single
+    value; ``$topN``/``$bottomN`` return a list."""
+    from secantus.ordering import _SortKey
+
+    items = state["_topn_items"]
+    n = state["_topn_n"]
+    dirs = state["_topn_dirs"]
+    kind = state["_topn_kind"]
+    items = sorted(
+        items,
+        key=lambda it: tuple(_SortKey(v, reverse=rev) for v, rev in zip(it[0], dirs, strict=False)),
+    )
+    outputs = [out for _, out in items]
+    if kind == "top":
+        return outputs[0]
+    if kind == "bottom":
+        return outputs[-1]
+    if kind == "topN":
+        return outputs[:n]
+    return outputs[-n:]  # bottomN
 
 
 _ACC_DISPATCH: dict[str, _AccHandler] = {
@@ -812,6 +1155,17 @@ _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$last": _acc_last,
     "$push": _acc_push,
     "$addToSet": _acc_add_to_set,
+    "$mergeObjects": _acc_merge_objects,
+    "$stdDevPop": _acc_std_pop,
+    "$stdDevSamp": _acc_std_samp,
+    "$firstN": _acc_first_n,
+    "$lastN": _acc_last_n,
+    "$maxN": _acc_max_n,
+    "$minN": _acc_min_n,
+    "$top": _acc_top,
+    "$bottom": _acc_bottom,
+    "$topN": _acc_top_n,
+    "$bottomN": _acc_bottom_n,
 }
 
 
@@ -1191,6 +1545,35 @@ def _stage_bucket(
     return result
 
 
+def _enforce_target_validator(
+    ctx: PipelineContext, target_db: str, target_coll: str, docs: list[dict[str, Any]]
+) -> None:
+    """Enforce the destination collection's ``validator`` on a ``$out`` /
+    ``$merge`` write unless the command set ``bypassDocumentValidation``.
+
+    mongod runs writes from these stages through the same document
+    validation as an ordinary insert: a doc that fails the validator
+    aborts the pipeline with ``DocumentValidationFailure`` (121) when
+    ``validationAction`` is ``"error"`` (the default). ``"warn"`` is a
+    no-op here (we don't surface server logs).
+    """
+    if ctx.bypass_validation or ctx.storage is None:
+        return
+    opts = ctx.storage.get_collection_options(target_db, target_coll)
+    validator = opts.get("validator")
+    if not isinstance(validator, dict) or not validator:
+        return
+    if opts.get("validationAction", "error") != "error":
+        return
+    for doc in docs:
+        if not matches(doc, validator):
+            raise AggregateError(
+                "Document failed validation",
+                code=121,
+                code_name="DocumentValidationFailure",
+            )
+
+
 def _stage_out(spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext) -> list[dict[str, Any]]:
     if ctx.storage is None:
         raise AggregateError("$out requires storage context")
@@ -1203,6 +1586,7 @@ def _stage_out(spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext) -> l
             raise AggregateError("$out requires a coll string")
     else:
         raise AggregateError("$out requires a string or {db, coll}")
+    _enforce_target_validator(ctx, target_db, target_coll, docs)
     ctx.storage.drop_collection(target_db, target_coll)
     if docs:
         ctx.storage.insert(target_db, target_coll, [copy.deepcopy(d) for d in docs])
@@ -1471,18 +1855,29 @@ def _stage_current_op(
         command_doc.setdefault("cursor", {})
     else:
         command_doc = {"aggregate": 1}
-    return [
-        {
-            "type": "op",
-            "host": "secantus",
-            "desc": "$currentOp",
-            "active": False,
-            "currentOpTime": "",
-            "command": command_doc,
-            "ns": _ctx.db_name + "." + (_ctx.coll_name or "$cmd.aggregate"),
-            "op": "command",
-        }
-    ]
+    entry: dict[str, Any] = {
+        "type": "op",
+        "host": "secantus",
+        "desc": "$currentOp",
+        "active": False,
+        "currentOpTime": "",
+        "command": command_doc,
+        "ns": _ctx.db_name + "." + (_ctx.coll_name or "$cmd.aggregate"),
+        "op": "command",
+    }
+    # Surface the connection's driver handshake metadata, like mongod's
+    # ``$currentOp``: the full ``clientMetadata`` document plus the top-level
+    # ``appName`` lifted from ``application.name``. mongocxx's "client metadata
+    # handshake feature" test connects with ``?appName=xyz`` and scans
+    # ``db.aggregate([{$currentOp: {}}])`` for an op whose ``appName`` matches,
+    # then verifies its ``clientMetadata.{application,driver,os}``.
+    meta = _ctx.client_metadata
+    if isinstance(meta, Mapping):
+        entry["clientMetadata"] = dict(meta)
+        application = meta.get("application")
+        if isinstance(application, Mapping) and application.get("name"):
+            entry["appName"] = application["name"]
+    return [entry]
 
 
 def _stage_bucket_auto(
@@ -1729,6 +2124,61 @@ def _stage_set_window_fields(
                 raise AggregateError(f"$setWindowFields {op} requires sortBy")
             compiled.append((field, op, arg, window))
             continue
+        if op == "$shift":
+            # Position-based (like the rank funcs): value from `by` slots away in
+            # the sorted partition. No window; requires a sortBy.
+            if window is not None:
+                raise AggregateError("$setWindowFields $shift does not accept a window")
+            if not sort_by:
+                raise AggregateError("$setWindowFields $shift requires sortBy")
+            if not isinstance(arg, Mapping) or "output" not in arg or "by" not in arg:
+                raise AggregateError("$shift requires {output, by, default?}")
+            if not isinstance(arg["by"], int) or isinstance(arg["by"], bool):
+                raise AggregateError("$shift 'by' must be an integer")
+            compiled.append((field, op, arg, window))
+            continue
+        if op == "$expMovingAvg":
+            # Prefix-accumulated over the sorted partition. No window; requires a
+            # sortBy. Validating the {input, N|alpha} shape up front (raises on a
+            # bad spec, exactly one of N/alpha).
+            if window is not None:
+                raise AggregateError("$setWindowFields $expMovingAvg does not accept a window")
+            if not sort_by:
+                raise AggregateError("$setWindowFields $expMovingAvg requires sortBy")
+            if not isinstance(arg, Mapping) or "input" not in arg:
+                raise AggregateError("$expMovingAvg requires {input, N|alpha}")
+            _ema_alpha(arg)  # validates exactly-one-of N/alpha and their ranges
+            compiled.append((field, op, arg, window))
+            continue
+        if op in ("$locf", "$linearFill"):
+            # Gap-filling over the sorted partition (arg is the input expression).
+            # No window; requires a sortBy. $linearFill additionally needs a single
+            # ascending numeric sort field as the interpolation x-axis.
+            if window is not None:
+                raise AggregateError(f"$setWindowFields {op} does not accept a window")
+            if not sort_by:
+                raise AggregateError(f"$setWindowFields {op} requires sortBy")
+            compiled.append((field, op, arg, window))
+            continue
+        if op in ("$derivative", "$integral"):
+            # Window operators over the sortBy value (x) and input (y). Require a
+            # sortBy; a time `unit` scales the x-axis against a date sortBy
+            # (validated at evaluation, when the partition's values are known).
+            if not sort_by:
+                raise AggregateError(f"$setWindowFields {op} requires sortBy")
+            if not isinstance(arg, Mapping) or "input" not in arg:
+                raise AggregateError(f"{op} requires {{input, unit?}}")
+            compiled.append((field, op, arg, window))
+            continue
+        if op == "$mergeObjects":
+            # $mergeObjects is a $group-only accumulator; mongod rejects it as a
+            # window function (verified three-way vs mongod 6.0: FailedToParse).
+            raise AggregateError(
+                f"Unrecognized window function, or the window function {op} is not "
+                "supported in $setWindowFields",
+                code=9,
+                code_name="FailedToParse",
+            )
         if op not in _ACC_DISPATCH:
             raise AggregateError(
                 f"$setWindowFields: unsupported function {op!r} "
@@ -1760,13 +2210,46 @@ def _stage_set_window_fields(
         # Precompute per-partition rank vectors only when a rank function
         # is referenced. One linear walk covers all three.
         rank_state = _compute_rank_state(partition_docs, sort_by, compiled)
+        # Range-based windows resolve their bounds against the sortBy *value*, so
+        # they need the per-slot values of a single ascending sort field. Anything
+        # else (multi-field / descending / no sortBy) leaves this None, and a range
+        # window then raises in ``_range_window_bounds``.
+        range_vals = None
+        range_date_ms = None
+        if sort_by and len(sort_by) == 1:
+            sort_field, sort_dir = next(iter(sort_by.items()))
+            if sort_dir == 1:
+                range_vals = [get_path(doc, sort_field) for doc in partition_docs]
+                # A date-valued x-axis is offered to range windows (with a time
+                # `unit`) as epoch millis; the raw dates stay in ``range_vals`` so
+                # the other window ops keep deferring on a non-numeric sortBy.
+                if range_vals and all(isinstance(v, _dt.datetime) for v in range_vals):
+                    range_date_ms = [_date_ms(v) for v in range_vals]
+        # $expMovingAvg / $locf / $linearFill are per-slot vectors computed once
+        # per partition per output field.
+        fill_state = {
+            field: _compute_window_vector(op, partition_docs, arg, range_vals, ctx)
+            for field, op, arg, _w in compiled
+            if op in ("$expMovingAvg", "$locf", "$linearFill")
+        }
         for slot, (orig_i, _) in enumerate(members):
             target = out_docs[orig_i]
             for field, op, arg, window in compiled:
                 if op in _RANK_FUNCS:
                     target[field] = rank_state[op][slot]
                     continue
-                low, high = _window_bounds(slot, n, window)
+                if op == "$shift":
+                    target[field] = _shift_value(arg, slot, partition_docs, ctx)
+                    continue
+                if op in ("$expMovingAvg", "$locf", "$linearFill"):
+                    target[field] = fill_state[field][slot]
+                    continue
+                low, high = _resolve_window(slot, n, window, range_vals, range_date_ms)
+                if op in ("$derivative", "$integral"):
+                    target[field] = _ts_window_value(
+                        op, arg, low, high, partition_docs, range_vals, range_date_ms, ctx
+                    )
+                    continue
                 if high < low:
                     target[field] = _empty_window_value(op)
                     continue
@@ -1842,16 +2325,304 @@ def _sort_key_values(doc: Mapping[str, Any], sort_by: Mapping[str, Any]) -> tupl
     return tuple(get_path(dict(doc), field, default=None) for field in sort_by)
 
 
+def _resolve_window(
+    slot: int,
+    n: int,
+    window: Mapping[str, Any] | None,
+    range_vals: list[Any] | None,
+    range_date_ms: list[int] | None = None,
+) -> tuple[int, int]:
+    """Dispatch a window spec to the document-based or range-based resolver."""
+    if window is not None and "range" in window:
+        return _range_window_bounds(slot, n, window, range_vals, range_date_ms)
+    return _window_bounds(slot, n, window)
+
+
+def _range_window_bounds(
+    slot: int,
+    n: int,
+    window: Mapping[str, Any],
+    range_vals: list[Any] | None,
+    range_date_ms: list[int] | None = None,
+) -> tuple[int, int]:
+    """Resolve a ``range``-based window: include rows whose sortBy value falls in
+    ``[cur + lower, cur + upper]`` (``cur`` = this row's value). Bounds may be
+    ``"unbounded"`` (open), ``"current"`` (this row's value), or a number offset.
+
+    A time ``unit`` scales each offset by that unit's millisecond span and pins
+    the x-axis to the date sortBy's epoch millis (``range_date_ms``). mongod's
+    rule is enforced both ways: ``unit`` **requires** a date sortBy, and a date
+    sortBy **requires** ``unit`` — the numeric x-axis (``range_vals``) and the
+    date x-axis are mutually exclusive. A missing/descending/multi-field sort, a
+    variable-length unit (month/quarter/year), or a non-numeric value raises.
+    """
+    has_unit = "unit" in window
+    if has_unit:
+        if range_date_ms is None:
+            raise AggregateError(
+                "$setWindowFields range window 'unit' requires a date sortBy field"
+            )
+        unit_ms = _WINDOW_UNIT_MS.get(window["unit"])
+        if unit_ms is None:
+            raise AggregateError(
+                f"$setWindowFields range window unit {window['unit']!r} is not supported "
+                "(variable-length month/quarter/year)"
+            )
+        # Offset in the date's own units — the x-axis is epoch millis.
+        range_vals = range_date_ms
+    else:
+        if range_date_ms is not None:
+            raise AggregateError(
+                "$setWindowFields range window over a date sortBy requires a 'unit'"
+            )
+        unit_ms = 1
+    if range_vals is None:
+        raise AggregateError(
+            "$setWindowFields range windows require a single ascending sortBy field"
+        )
+    bounds = window["range"]
+    if not isinstance(bounds, list) or len(bounds) != 2:
+        raise AggregateError("$setWindowFields window.range must be a [lower, upper] pair")
+    cur = range_vals[slot]
+    if not _is_number(cur):
+        raise AggregateError("$setWindowFields range windows require numeric sortBy values")
+
+    def edge(b: Any) -> Any:
+        if b == "unbounded":
+            return None
+        if b == "current":
+            return cur
+        if not _is_number(b):
+            raise AggregateError(
+                f"$setWindowFields window.range bound {b!r} must be a number "
+                "or 'unbounded' / 'current'"
+            )
+        return cur + b * unit_ms
+
+    lo, hi = edge(bounds[0]), edge(bounds[1])
+    # range_vals is ascending; walk in from both ends. A non-numeric value in the
+    # partition makes the comparison ill-defined -> raise (mongod rejects it too).
+    if any(not _is_number(v) for v in range_vals):
+        raise AggregateError("$setWindowFields range windows require numeric sortBy values")
+    low = 0
+    while low < n and lo is not None and range_vals[low] < lo:
+        low += 1
+    high = n - 1
+    while high >= 0 and hi is not None and range_vals[high] > hi:
+        high -= 1
+    return low, high
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+# Fixed-duration window units → milliseconds (variable-length month/quarter/year
+# defer). Used to offset a date-valued range window in the sortBy's own units.
+_WINDOW_UNIT_MS: dict[str, int] = {
+    "week": 604_800_000,
+    "day": 86_400_000,
+    "hour": 3_600_000,
+    "minute": 60_000,
+    "second": 1_000,
+    "millisecond": 1,
+}
+
+_EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+
+
+def _date_ms(dt: _dt.datetime) -> int:
+    """Epoch milliseconds for a datetime, matching a BSON Date (naive → UTC). Exact
+    integer arithmetic so the Rust port (`bson DateTime::timestamp_millis`) agrees."""
+    aware = dt if dt.tzinfo is not None else dt.replace(tzinfo=_dt.timezone.utc)
+    delta = aware - _EPOCH_UTC
+    return delta.days * 86_400_000 + delta.seconds * 1_000 + delta.microseconds // 1_000
+
+
+def _ema_alpha(spec: Mapping[str, Any]) -> float:
+    """The smoothing factor for `$expMovingAvg`: `2/(N+1)` from a positive-int
+    `N`, or a given `alpha` in (0, 1). Exactly one must be present."""
+    has_n, has_alpha = "N" in spec, "alpha" in spec
+    if has_n == has_alpha:
+        raise AggregateError("$expMovingAvg requires exactly one of N / alpha")
+    if has_n:
+        n = spec["N"]
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise AggregateError("$expMovingAvg N must be a positive integer")
+        return 2 / (n + 1)
+    a = spec["alpha"]
+    if not _is_number(a) or not (0 < a < 1):
+        raise AggregateError("$expMovingAvg alpha must be a number in (0, 1)")
+    return float(a)
+
+
+def _compute_window_vector(
+    op: str,
+    partition_docs: list[dict[str, Any]],
+    arg: Any,
+    range_vals: list[Any] | None,
+    ctx: PipelineContext,
+) -> list[Any]:
+    """Per-slot output for the prefix/partition window operators."""
+    if op == "$expMovingAvg":
+        return _compute_ema(partition_docs, arg, ctx)
+    if op == "$locf":
+        return _compute_locf(partition_docs, arg, ctx)
+    return _compute_linear_fill(partition_docs, arg, range_vals, ctx)  # $linearFill
+
+
+def _compute_locf(
+    partition_docs: list[dict[str, Any]],
+    expr: Any,
+    ctx: PipelineContext,
+) -> list[Any]:
+    """Last-observation-carried-forward of ``expr`` over the sorted partition:
+    a null / missing value takes the last non-null seen; leading nulls stay null."""
+    out: list[Any] = []
+    last: Any = None
+    seen = False
+    for doc in partition_docs:
+        v = evaluate(expr, doc, ctx.vars)
+        if v is not None:
+            last, seen = v, True
+            out.append(v)
+        else:
+            out.append(last if seen else None)
+    return out
+
+
+def _compute_linear_fill(
+    partition_docs: list[dict[str, Any]],
+    expr: Any,
+    range_vals: list[Any] | None,
+    ctx: PipelineContext,
+) -> list[Any]:
+    """Linear interpolation of ``expr``'s nulls between surrounding non-null
+    anchors, using the (single ascending numeric) sortBy value as the x-axis.
+    Leading / trailing nulls stay null. Values in IEEE double so the Rust port
+    matches bit-for-bit."""
+    if range_vals is None:
+        raise AggregateError("$linearFill requires a single ascending sortBy field")
+    vals = [evaluate(expr, doc, ctx.vars) for doc in partition_docs]
+    out = list(vals)
+    anchors = [i for i, v in enumerate(vals) if v is not None]
+    for a, b in zip(anchors, anchors[1:], strict=False):
+        x0, x1, y0, y1 = range_vals[a], range_vals[b], vals[a], vals[b]
+        if not all(_is_number(x) for x in (x0, x1, y0, y1)):
+            raise AggregateError("$linearFill requires numeric sortBy values and inputs")
+        if x1 == x0:
+            raise AggregateError("$linearFill: coincident sortBy values")
+        for i in range(a + 1, b):
+            x = range_vals[i]
+            if not _is_number(x):
+                raise AggregateError("$linearFill requires numeric sortBy values")
+            out[i] = y0 + (y1 - y0) * ((x - x0) / (x1 - x0))
+    return out
+
+
+def _ts_window_value(
+    op: str,
+    arg: Mapping[str, Any],
+    low: int,
+    high: int,
+    partition_docs: list[dict[str, Any]],
+    range_vals: list[Any] | None,
+    range_date_ms: list[int] | None,
+    ctx: PipelineContext,
+) -> Any:
+    """`$derivative` / `$integral` over the window `[low, high]`, using the sortBy
+    value as x and ``input`` as y. `$derivative` is the slope between the first
+    and last window points (null if fewer than two, or the x's coincide);
+    `$integral` is the trapezoidal area.
+
+    Without a ``unit``: a single ascending numeric sortBy (`range_vals`) is the
+    x-axis. With a fixed-duration ``unit``: the x-axis is a date sortBy's epoch
+    millis (`range_date_ms`) divided by the unit's millisecond span, so the rate
+    is *per unit* (e.g. per hour). `unit` requires a date sortBy; a variable-
+    length unit (month/quarter/year) raises. Math in IEEE double."""
+    input_expr = arg["input"]
+    unit = arg.get("unit")
+    if unit is not None:
+        if range_date_ms is None:
+            raise AggregateError(f"$setWindowFields {op} 'unit' requires a date sortBy field")
+        unit_ms = _WINDOW_UNIT_MS.get(unit)
+        if unit_ms is None:
+            raise AggregateError(
+                f"$setWindowFields {op} unit {unit!r} is not supported "
+                "(variable-length month/quarter/year)"
+            )
+        # x-axis is the date's epoch millis scaled into the requested unit.
+        xs: list[Any] = [ms / unit_ms for ms in range_date_ms]
+    else:
+        if range_vals is None:
+            raise AggregateError(
+                f"$setWindowFields {op} requires a single ascending numeric sortBy"
+            )
+        xs = range_vals
+    pts: list[tuple[float, float]] = []
+    for i in range(low, high + 1):
+        x, y = xs[i], evaluate(input_expr, partition_docs[i], ctx.vars)
+        if not (_is_number(x) and _is_number(y)):
+            raise AggregateError(f"$setWindowFields {op} requires numeric sortBy values and inputs")
+        pts.append((x, y))
+    if op == "$derivative":
+        if len(pts) < 2:
+            return None
+        (x0, y0), (x1, y1) = pts[0], pts[-1]
+        return None if x1 == x0 else (y1 - y0) / (x1 - x0)
+    total = 0.0  # $integral — trapezoidal sum
+    for (xa, ya), (xb, yb) in zip(pts, pts[1:], strict=False):
+        total += (xb - xa) * (ya + yb) / 2
+    return total
+
+
+def _compute_ema(
+    partition_docs: list[dict[str, Any]],
+    spec: Mapping[str, Any],
+    ctx: PipelineContext,
+) -> list[float]:
+    """Per-slot exponential moving average over the sorted partition:
+    ``ema[0] = input[0]``; ``ema[i] = input[i]*alpha + ema[i-1]*(1-alpha)``. All
+    in IEEE double so the Rust port matches bit-for-bit."""
+    alpha = _ema_alpha(spec)
+    out: list[float] = []
+    prev: float | None = None
+    for doc in partition_docs:
+        val = evaluate(spec["input"], doc, ctx.vars)
+        if not _is_number(val):
+            raise AggregateError("$expMovingAvg input must be numeric")
+        val = float(val)
+        ema = val if prev is None else val * alpha + prev * (1 - alpha)
+        out.append(ema)
+        prev = ema
+    return out
+
+
+def _shift_value(
+    spec: Mapping[str, Any],
+    slot: int,
+    partition_docs: list[dict[str, Any]],
+    ctx: PipelineContext,
+) -> Any:
+    """`$shift` — the `output` expression evaluated on the row ``by`` positions
+    away in the sorted partition, or ``default`` (evaluated as a constant, or
+    ``null``) when that position is outside the partition."""
+    idx = slot + spec["by"]
+    if 0 <= idx < len(partition_docs):
+        return evaluate(spec["output"], partition_docs[idx], ctx.vars)
+    if "default" in spec:
+        return evaluate(spec["default"], partition_docs[slot], ctx.vars)
+    return None
+
+
 def _window_bounds(slot: int, n: int, window: Mapping[str, Any] | None) -> tuple[int, int]:
-    """Resolve a window spec for a given row position.
+    """Resolve a document-based window spec for a given row position.
 
     Returns inclusive ``(lower, upper)`` indices into the partition.
     ``window=None`` or missing ``documents`` → the whole partition
     (matches mongod's default window).
     """
     if window is None or "documents" not in window:
-        if window is not None and "range" in window:
-            raise AggregateError("$setWindowFields range-based windows are not yet implemented")
         return 0, n - 1
     bounds = window["documents"]
     if not isinstance(bounds, list) or len(bounds) != 2:
@@ -1884,6 +2655,8 @@ def _empty_window_value(op: str) -> Any:
         return 0
     if op in ("$push", "$addToSet"):
         return []
+    if op == "$mergeObjects":
+        return {}
     return None
 
 
@@ -2124,6 +2897,63 @@ def _parse_geo_near_origin(near: Any, spherical_opt: Any) -> tuple[bool, tuple[f
     raise AggregateError("$geoNear `near` must be a GeoJSON Point or a [x, y] pair")
 
 
+def _geo_near_index_filter(
+    spec: Any, storage: Any, db_name: str | None, coll_name: str | None
+) -> dict[str, Any] | None:
+    """Conservative ``$geoWithin`` candidate filter for a leading ``$geoNear`` with
+    a ``maxDistance``, so the initial fetch can ride a geo index instead of
+    scanning the whole collection — or ``None`` when the optimization doesn't
+    apply (no ``maxDistance``, unparseable ``near``, or no matching geo index on
+    ``key``).
+
+    The candidate radius is inflated by a tiny epsilon so the fetched set is a
+    strict **superset** of the exact within-``maxDistance`` set; the ``$geoNear``
+    stage then re-applies the exact distance filter, so its output is byte-for-byte
+    identical to the brute-force path — only the number of docs fetched shrinks.
+    The candidate shape (``$centerSphere`` vs ``$center``) must match the index
+    type (``2dsphere`` vs ``2d``); a mismatch falls back to the full scan.
+    """
+    if not isinstance(spec, Mapping):
+        return None
+    max_distance = spec.get("maxDistance")
+    if not isinstance(max_distance, (int, float)) or isinstance(max_distance, bool):
+        return None
+    if storage is None or not db_name or not coll_name:
+        return None
+    # Geo-indexed fields (field -> "2dsphere"/"2d"), in list_indexes order.
+    geo_fields: dict[str, str] = {}
+    for index in storage.list_indexes(db_name, coll_name):
+        key_spec = index.get("key", {})
+        if not isinstance(key_spec, Mapping):
+            continue
+        for field, value in key_spec.items():
+            if isinstance(value, str) and value in ("2dsphere", "2d"):
+                geo_fields.setdefault(field, value)
+    if not geo_fields:
+        return None
+    key = spec.get("key")
+    if not (isinstance(key, str) and key):
+        key = next(iter(geo_fields))  # infer: first geo index (mongod's behaviour)
+    if key not in geo_fields:
+        return None
+    try:
+        spherical, center = _parse_geo_near_origin(spec.get("near"), spec.get("spherical"))
+    except AggregateError:
+        return None
+    idx_type = geo_fields[key]
+    if spherical and idx_type != "2dsphere":
+        return None
+    if not spherical and idx_type != "2d":
+        return None
+    from secantus.geo import EARTH_RADIUS_METERS
+
+    radius = float(max_distance) * (1.0 + 1e-9)  # inflate -> guaranteed superset
+    cx, cy = center
+    if spherical:
+        return {key: {"$geoWithin": {"$centerSphere": [[cx, cy], radius / EARTH_RADIUS_METERS]}}}
+    return {key: {"$geoWithin": {"$center": [[cx, cy], radius]}}}
+
+
 _STAGES = {
     "$match": _stage_match,
     "$count": _stage_count,
@@ -2176,9 +3006,31 @@ def validate_stage_names(pipeline: list[Any]) -> None:
         if not isinstance(stage, Mapping) or len(stage) != 1:
             raise AggregateError("each pipeline stage must have exactly one key")
         name = next(iter(stage))
+        if name in _ATLAS_ONLY_STAGES:
+            # Atlas-only stage — reject with the Atlas message at parse time
+            # (this validation runs before any document flows), so the driver
+            # sees "Atlas" rather than the generic unrecognized-stage error.
+            raise AggregateError(SEARCH_INDEX_ATLAS_MSG, code=115, code_name="CommandNotSupported")
         if name not in _STAGES:
             raise AggregateError(
                 f"Unrecognized pipeline stage name: '{name}'",
                 code=40324,
                 code_name="Location40324",
             )
+        # Validate ``$match`` filter syntax up-front too. A change-stream
+        # pipeline doesn't execute until the first ``getMore``, so an
+        # unknown query operator inside ``$match`` (e.g. ``{$foo: -1}``)
+        # would otherwise only surface there — mongo-cxx-driver's
+        # "invalid pipeline / Error on .begin()" test requires the error
+        # at aggregate (``.begin()``) time. Running the matcher against an
+        # empty doc triggers the same operator validation. Only the
+        # syntactic ``QueryError`` is surfaced now; ``$expr`` evaluation
+        # errors that only make sense against a real change event stay
+        # deferred to execution time.
+        if name == "$match" and isinstance(stage[name], Mapping):
+            try:
+                matches({}, stage[name])
+            except QueryError:
+                raise
+            except Exception:
+                pass

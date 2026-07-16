@@ -24,14 +24,14 @@ import types
 
 import bson
 import pytest
-from bson import Binary, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
+from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
 from bson.timestamp import Timestamp
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
 # Load the pure-Python encoder by path (avoid secantus/__init__ -> server ->
-# WiredTiger import chain). A stub `secantus` package with __path__ lets the
-# module's `from secantus import engine` auto-resolve engine.py without the
+# WiredTiger import chain). A stub `secantus` package with __path__ lets
+# sortkey.py's intra-package imports auto-resolve from src/secantus without the
 # heavy server imports.
 _ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "secantus"
 if "secantus" not in sys.modules:
@@ -117,6 +117,9 @@ def _curated_values():
         {"a": 1, "b": "x"},
         {"nested": {"deep": [1, {"k": ObjectId()}]}},
         Regex("^abc$", "im"),
+        # bson.Code subclasses str, so both engines rank it RANK_STRING.
+        Code("function(){}"),
+        Code("x"),
     ]
 
 

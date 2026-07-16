@@ -14,8 +14,10 @@ import bson
 
 from secantus import changestreams
 from secantus.aggregate import (
+    SEARCH_INDEX_ATLAS_MSG,
     AggregateError,
     PipelineContext,
+    _geo_near_index_filter,
     apply_pipeline,
     validate_stage_names,
 )
@@ -33,7 +35,7 @@ from secantus.auth import (
 )
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorNotFound, CursorRegistry
-from secantus.expressions import ExpressionError
+from secantus.expressions import ExpressionError, UnknownExpressionOperatorError
 from secantus.failpoints import FailPointRegistry
 from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
@@ -127,6 +129,26 @@ SERVER_VERSION = "7.0.0"
 SERVER_VERSION_ARRAY = [7, 0, 0, 0]
 DEFAULT_BATCH_SIZE = 101
 
+# ``topologyVersion.processId`` identifies the *server process* and is fixed for
+# its lifetime — the SDAM spec compares it across heartbeats, and a *changed*
+# processId is read as "the server restarted", which makes drivers invalidate
+# and clear the connection pool (close + reconnect). Minting a fresh ObjectId per
+# hello (the old behaviour) therefore triggered a spurious pool-clear on nearly
+# every monitoring heartbeat. Pin it once per process. (Java-gauge finding)
+_HELLO_PROCESS_ID = bson.ObjectId()
+
+
+def _coerce_command_int(value: Any) -> int:
+    """Coerce a numeric command argument (e.g. ``batchSize``) to ``int``.
+
+    Drivers may encode a numeric option as any BSON number — mongo-c-driver's
+    ``batchsize_override_decimal128`` test sends ``batchSize`` as a Decimal128.
+    ``int(Decimal128)`` raises, so unwrap to the underlying ``Decimal`` first.
+    """
+    if isinstance(value, bson.Decimal128):
+        return int(value.to_decimal())
+    return int(value)
+
 
 # Mongod's well-known error codes that crop up in failpoint tests +
 # the ad-hoc errors we already emit. Used by `_code_name_for` to give
@@ -198,6 +220,22 @@ def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
                 "errmsg": f"No write concern mode named {w!r} found in replica set configuration",
                 "code": 79,
                 "codeName": "UnknownReplWriteConcern",
+            }
+        if isinstance(w, int) and (w < 0 or w > 50):
+            # mongod caps a numeric ``w`` at 50 (the max number of voting
+            # replica-set members) and rejects an out-of-range ``w`` at
+            # writeConcern *parse* time with FailedToParse (9) — NOT a
+            # ``writeConcernError`` attached to a successful reply (that's
+            # the satisfiable-but-too-many-nodes case, ``1 < w <= 50``,
+            # handled by ``_unsatisfiable_wc_error``). mongo-c-driver's
+            # /Collection/{drop,rename,index} + /Database/drop assert exactly
+            # this for ``w: 99`` (``assert_wc_oob_error``, the server-version
+            # >= 4.3.3 branch).
+            return {
+                "ok": 0.0,
+                "errmsg": "w has to be a non-negative number and not greater than 50",
+                "code": 9,
+                "codeName": "FailedToParse",
             }
     if "j" in wc and not isinstance(wc["j"], (bool, int)):
         # Real mongod is loose on the ``j`` type — bool or int both
@@ -343,6 +381,90 @@ def _resolve_let_vars(let: Any) -> dict[str, Any]:
     return {**now_vars, **resolved}
 
 
+# mongod's per-operator failure reasons in ``errInfo.details.reason``.
+# Only ``$type`` is byte-pinned by a driver test (mongo-csharp-driver's
+# ``WriteError_details`` prose test → "type did not match"); the rest are
+# best-effort approximations of mongod's wording.
+_VALIDATION_REASON: dict[str, str] = {
+    "$type": "type did not match",
+    "$exists": "field was missing",
+    "$regex": "regular expression did not match",
+    "$size": "array did not match specified size",
+    "$mod": "$mod did not evaluate to the expected remainder",
+    "$all": "array did not contain all specified values",
+    "$elemMatch": "no matching array element found",
+    "$in": "value was not in the set of allowed values",
+    "$nin": "value was in the set of disallowed values",
+}
+
+
+def _validation_failure_details(
+    validator: Mapping[str, Any], doc: Mapping[str, Any]
+) -> dict[str, Any]:
+    """mongod-shaped ``errInfo.details`` for a doc that failed a
+    query-expression collection validator.
+
+    Walks the validator's field clauses, finds the first the document
+    violates, and reports the failing operator with the value the server
+    considered — matching the structure the mongo-csharp-driver CRUD-spec
+    prose test ``WriteError_details`` asserts (``operatorName`` /
+    ``specifiedAs`` / ``reason`` / ``consideredValue`` / ``consideredType``).
+    """
+    from secantus.paths import get_path, has_path
+    from secantus.query import bson_type_name
+
+    # $jsonSchema validators report a different (schema-rules) structure
+    # we don't synthesise; name the operator and stop.
+    if "$jsonSchema" in validator:
+        return {"operatorName": "$jsonSchema"}
+
+    for field, spec in validator.items():
+        if isinstance(field, str) and field.startswith("$"):
+            # Document-level logical operator ($and/$or/$nor) — skip for
+            # per-field detail (best-effort).
+            continue
+        if matches(doc, {field: spec}):
+            continue
+        present = has_path(doc, field)
+        value = get_path(doc, field) if present else None
+        if (
+            isinstance(spec, Mapping)
+            and spec
+            and all(isinstance(k, str) and k.startswith("$") for k in spec)
+        ):
+            # Operator form — isolate the specific operator that failed.
+            op = next(iter(spec))
+            for candidate in spec:
+                if not matches(doc, {field: {candidate: spec[candidate]}}):
+                    op = candidate
+                    break
+            detail: dict[str, Any] = {
+                "operatorName": op,
+                "specifiedAs": {field: dict(spec)},
+                "reason": _VALIDATION_REASON.get(op, "comparison failed"),
+            }
+        else:
+            detail = {
+                "operatorName": "$eq",
+                "specifiedAs": {field: spec},
+                "reason": "comparison failed",
+            }
+        if present:
+            detail["consideredValue"] = value
+            detail["consideredType"] = bson_type_name(value)
+        return detail
+    return {"operatorName": "validator"}
+
+
+def _validation_error_info(validator: Mapping[str, Any], doc: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``errInfo`` body for a failed document validation:
+    ``failingDocumentId`` plus the per-operator ``details``."""
+    return {
+        "failingDocumentId": doc.get("_id"),
+        "details": _validation_failure_details(validator, doc),
+    }
+
+
 def _validate_doc_against_collection(
     storage: Storage, db: str, coll: str, doc: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -364,15 +486,7 @@ def _validate_doc_against_collection(
         "errmsg": "Document failed validation",
         "code": 121,
         "codeName": "DocumentValidationFailure",
-        "errInfo": {
-            "failingDocumentId": doc.get("_id"),
-            "details": {
-                "operatorName": "validator",
-                "schemaRulesNotSatisfied": [
-                    {"operatorName": k, "specifiedAs": {k: v}} for k, v in validator.items()
-                ],
-            },
-        },
+        "errInfo": _validation_error_info(validator, doc),
     }
 
 
@@ -444,7 +558,7 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "isWritablePrimary": True,
         "ismaster": True,
         "topologyVersion": {
-            "processId": bson.ObjectId.from_datetime(_dt.datetime.now(_dt.timezone.utc)),
+            "processId": _HELLO_PROCESS_ID,
             "counter": bson.Int64(0),
         },
         "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
@@ -540,6 +654,28 @@ def _speculative_auth(spec: dict[str, Any], ctx: CommandContext) -> dict[str, An
 
 def _ping(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     return {"ok": 1.0}
+
+
+_NO_REPLICATION_ENABLED = 76  # mongod's NoReplicationEnabled error code
+
+
+def _repl_set_get_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    # SecantusDB is a single-node surrogate: it advertises itself as a
+    # replica-set primary in `hello` (so pymongo's change-stream topology
+    # accepts it), but it is not a real replica set and has no member roster
+    # to report. Return exactly what a standalone mongod returns for
+    # `replSetGetStatus` — `NoReplicationEnabled` with the canonical
+    # "not running with --replSet" message. Drivers and their test harnesses
+    # special-case this message to mean "standalone, skip replica-set-only
+    # behaviour" (e.g. libmongoc's `test_framework_replset_member_count`),
+    # whereas a bare CommandNotFound (code 59) is treated as an unexpected
+    # error and aborts the harness.
+    return {
+        "ok": 0.0,
+        "errmsg": "not running with --replSet",
+        "code": _NO_REPLICATION_ENABLED,
+        "codeName": "NoReplicationEnabled",
+    }
 
 
 def _build_info(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
@@ -937,6 +1073,38 @@ def _secantus_admin_backup_archive(doc: dict[str, Any], ctx: CommandContext) -> 
     return {"path": result["path"], "sizeBytes": result["sizeBytes"], "ok": 1.0}
 
 
+def _secantus_admin_archive_base_snapshot(
+    doc: dict[str, Any], ctx: CommandContext
+) -> dict[str, Any]:
+    """SecantusDB extension: take a PITR v2 base snapshot into ``archiveDir``.
+
+    Writes ``base-<headSeq>.tar.gz`` into ``archiveDir`` (a server-side path).
+    Pair with a server started with ``--oplog-archive-dir <archiveDir>`` so the
+    oplog rows ``prune_oplog`` drops are archived as segments into the same
+    directory; recovery then stitches the newest base ≤ T plus the segments to
+    reach any time in the archived window. Call this periodically — there is no
+    background scheduler. Returns ``{path, sizeBytes, headSeq, ok: 1}``.
+    """
+    archive_dir = doc.get("archiveDir")
+    if not isinstance(archive_dir, str) or not archive_dir:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.archiveBaseSnapshot requires archiveDir: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    try:
+        result = ctx.storage.archive_base_snapshot(archive_dir)
+    except RuntimeError as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
+    return {
+        "path": result["path"],
+        "sizeBytes": result["sizeBytes"],
+        "headSeq": result["headSeq"],
+        "ok": 1.0,
+    }
+
+
 def _secantus_admin_restore_archive(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     """SecantusDB extension: extract a backup archive into ``targetDir``.
 
@@ -983,6 +1151,74 @@ def _secantus_admin_restore_archive(doc: dict[str, Any], _ctx: CommandContext) -
         "targetDir": result["targetDir"],
         "fileCount": result["fileCount"],
         "archive": result["archive"],
+        "ok": 1.0,
+    }
+
+
+def _secantus_admin_restore_to_timestamp(
+    doc: dict[str, Any], _ctx: CommandContext
+) -> dict[str, Any]:
+    """SecantusDB extension: point-in-time recovery (PITR).
+
+    Rebuild ``targetDir`` as the database was at a target time by replaying an
+    oplog source forward (see :mod:`secantus.oplog_replay`). ``source`` is a
+    **stopped** server's data directory or a backup ``.tar.gz`` produced by
+    ``backupArchive``. Optional ``toTimestamp`` (a BSON ``Timestamp``) or
+    ``toTime`` (a date) picks the recovery point; with neither, the whole oplog
+    is replayed. Offline-shaped like ``restoreArchive`` — the running server's
+    own storage is untouched; the operator points a *new* SecantusDB at
+    ``targetDir``. Returns the replay stats.
+    """
+    from secantus import oplog_replay
+
+    source = doc.get("source")
+    target_dir = doc.get("targetDir")
+    if not isinstance(source, str) or not source:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.restoreToTimestamp requires source: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if not isinstance(target_dir, str) or not target_dir:
+        return {
+            "ok": 0.0,
+            "errmsg": "secantusAdmin.restoreToTimestamp requires targetDir: <string>",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    to_ts = doc.get("toTimestamp")
+    to_wall = doc.get("toTime")
+    # ``preserveOplog`` carries the replayed oplog onto the restored directory
+    # so a change stream there can resume from before the restore point. Default
+    # is a fresh timeline (like mongorestore).
+    carry_oplog = bool(doc.get("preserveOplog", False))
+    try:
+        from secantus import pitr_archive
+
+        if pitr_archive.is_archive_dir(source):
+            # PITR v2: a directory of base snapshots + oplog segments.
+            stats = pitr_archive.restore_from_archive_dir(
+                source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
+            )
+        elif source.endswith((".tar.gz", ".tgz")):
+            stats = oplog_replay.restore_archive_to_timestamp(
+                source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
+            )
+        else:
+            stats = oplog_replay.restore_to_timestamp(
+                source, target_dir, to_ts=to_ts, to_wall=to_wall, carry_oplog=carry_oplog
+            )
+    except (ValueError, RuntimeError) as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 20, "codeName": "IllegalOperation"}
+    return {
+        "targetDir": stats["targetDir"],
+        "opsApplied": stats["opsApplied"],
+        "entriesSeen": stats["entriesSeen"],
+        "lastSeq": stats["lastSeq"],
+        "lastTs": stats.get("lastTs"),
+        "lastWall": stats.get("lastWall"),
+        "oplogCarried": stats.get("oplogCarried", 0),
         "ok": 1.0,
     }
 
@@ -1741,10 +1977,7 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                         "index": index,
                         "code": 121,
                         "errmsg": "Document failed validation",
-                        "errInfo": {
-                            "failingDocumentId": id_value,
-                            "details": {"operatorName": "validator"},
-                        },
+                        "errInfo": _validation_error_info(validator_spec, d),
                     }
                 )
                 if ordered:
@@ -1809,8 +2042,36 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # cursor with batchSize 0, then calls SetBatchSize on the
     # batch cursor and asserts the next getMore carries that size.
     raw_batch_size = doc.get("batchSize")
-    batch_size = DEFAULT_BATCH_SIZE if raw_batch_size is None else int(raw_batch_size)
+    batch_size = (
+        DEFAULT_BATCH_SIZE if raw_batch_size is None else _coerce_command_int(raw_batch_size)
+    )
     single_batch = bool(doc.get("singleBatch", False))
+    # View: translate the find into an equivalent aggregate over the base
+    # collection (the find options become pipeline stages after the view's own
+    # pipeline) and run it through the aggregate path, which resolves the view.
+    # find and aggregate return the same cursor-reply shape.
+    if isinstance(ctx.storage.get_collection_options(ctx.db_name, coll).get("viewOn"), str):
+        agg_pipeline: list[Any] = []
+        if filter_:
+            agg_pipeline.append({"$match": filter_})
+        if sort:
+            agg_pipeline.append({"$sort": sort})
+        if skip:
+            agg_pipeline.append({"$skip": skip})
+        if limit:
+            agg_pipeline.append({"$limit": limit})
+        if projection:
+            agg_pipeline.append({"$project": projection})
+        agg_doc: dict[str, Any] = {
+            "aggregate": coll,
+            "pipeline": agg_pipeline,
+            "cursor": {"batchSize": batch_size},
+        }
+        if collation is not None:
+            agg_doc["collation"] = collation
+        if doc.get("let") is not None:
+            agg_doc["let"] = doc["let"]
+        return _aggregate(agg_doc, ctx)
     # Validate filter syntax up-front. matches() raises QueryError for
     # unknown top-level operators; running it against an empty doc is
     # cheap and triggers the same validation paths the real query would
@@ -1822,12 +2083,32 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         matches({}, filter_, vars=let)
     except QueryError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+    except UnknownExpressionOperatorError as exc:
+        # An unrecognized ``$``-operator inside a query ``$expr`` is a
+        # parse-level error mongod rejects up front (168
+        # InvalidPipelineOperator), even against an empty collection.
+        return {"ok": 0.0, "errmsg": str(exc), "code": exc.code, "codeName": exc.code_name}
     except ExpressionError:
         # $expr against empty doc with unresolved field refs is fine —
         # the validation pass is only meant to catch parse-level errors.
         # Real evaluation happens per-doc inside find_matching with the
         # actual document and threaded ``let`` vars.
         pass
+    # Positional-projection validation happens at parse time in mongod — before
+    # matching — so it fires even when nothing matches. (Per-doc apply_projection
+    # would otherwise only see it once a document is projected.)
+    if projection:
+        from secantus.projection import ProjectionError, validate_projection
+
+        try:
+            validate_projection(projection, filter_)
+        except ProjectionError as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": exc.code or 2,
+                "codeName": exc.code_name or "BadValue",
+            }
     try:
         docs = ctx.storage.find_matching(
             ctx.db_name,
@@ -1901,7 +2182,17 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # seq rather than the doc-table id_key path ``_find_tailable`` uses.
         if ctx.db_name == "local" and coll == "oplog.rs":
             return _find_tailable_oplog(filter_, docs, batch_size, ns, await_data, ctx)
-        return _find_tailable(coll, docs, batch_size, ns, await_data, ctx)
+        return _find_tailable(
+            coll,
+            docs,
+            batch_size,
+            ns,
+            await_data,
+            ctx,
+            filter_=filter_,
+            let=let,
+            collation=collation,
+        )
     if single_batch:
         first_batch, cursor_id = docs, 0
     else:
@@ -1920,6 +2211,10 @@ def _find_tailable(
     ns: str,
     await_data: bool,
     ctx: CommandContext,
+    *,
+    filter_: dict[str, Any] | None = None,
+    let: dict[str, Any] | None = None,
+    collation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a tailable cursor on a capped collection.
 
@@ -1971,8 +2266,13 @@ def _find_tailable(
         new_rows = storage.scan_docs_after_id_key(db_name, coll, after=after)
         if not new_rows:
             return []
+        # Advance the watermark past every row we scanned — matched or not —
+        # so non-matching docs aren't re-examined on the next poll.
         state["after_id_key"] = new_rows[-1][0]
-        return [doc for _id_k, doc in new_rows]
+        out = [doc for _id_k, doc in new_rows]
+        if filter_:
+            out = [d for d in out if matches(d, filter_, vars=let, collation=collation)]
+        return out
 
     cursor_id = ctx.cursors.register_tailable(
         ns,
@@ -2183,12 +2483,15 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 break
             continue
         except UpdateError as exc:
-            # ``_id`` immutability gets a special code (66
-            # ImmutableField) so drivers' canonical handling triggers.
-            # Everything else falls under FailedToParse (9) — malformed
+            # An explicit ``code`` on the ``UpdateError`` wins (e.g.
+            # ``$inc``/``$mul`` on a non-numeric value → 14 TypeMismatch).
+            # Otherwise: ``_id`` immutability gets a special code (66
+            # ImmutableField) so drivers' canonical handling triggers, and
+            # everything else falls under FailedToParse (9) — malformed
             # operators / mixed ops & replacement fields.
             msg = str(exc)
-            code = 66 if "immutable field" in msg else 9
+            default_code = 66 if "immutable field" in msg else 9
+            code = exc.code if exc.code is not None else default_code
             write_errors.append({"index": index, "code": code, "errmsg": msg})
             if ordered:
                 break
@@ -2609,6 +2912,14 @@ def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     oplog_err = _reject_oplog_rs_write(ctx, coll, "drop")
     if oplog_err is not None:
         return oplog_err
+    # mongod kills the collection's open cursors on drop. Tombstone them
+    # *before* the storage drop: dropping the collection emits an oplog
+    # entry that wakes any awaitData ``getMore`` parked on a tailable
+    # cursor, and it must observe the ``dropped`` flag (set here) so it
+    # returns "collection dropped" rather than re-polling the now-gone
+    # collection. Non-tailable cursors are removed (later getMore →
+    # CursorNotFound, per mongo-c-driver's ``error_document/getmore``).
+    ctx.cursors.kill_namespace(_ns(ctx.db_name, coll))
     existed = ctx.storage.drop_collection(ctx.db_name, coll)
     if not existed:
         # Modern mongod treats ``drop`` of a non-existent collection as
@@ -2622,12 +2933,18 @@ def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"ns": _ns(ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0}
 
 
-def _drop_database(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+def _drop_database(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     ctx.storage.drop_database(ctx.db_name)
     return {"dropped": ctx.db_name, "ok": 1.0}
 
 
 def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    wc_err = _validate_write_concern(doc)
+    if wc_err is not None:
+        return wc_err
     src_ns = doc.get("renameCollection")
     dst_ns = doc.get("to")
     drop_target = bool(doc.get("dropTarget", False))
@@ -2654,6 +2971,10 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
         code = 26 if err and "does not exist" in err else 48
         code_name = "NamespaceNotFound" if code == 26 else "NamespaceExists"
         return {"ok": 0.0, "errmsg": err, "code": code, "codeName": code_name}
+    # A rename invalidates cursors open on the old namespace, same as drop.
+    ctx.cursors.kill_namespace(src_ns)
+    if drop_target:
+        ctx.cursors.kill_namespace(dst_ns)
     return {"ok": 1.0}
 
 
@@ -2706,7 +3027,6 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 72,
                 "codeName": "InvalidOptions",
             }
-    ctx.storage.create_collection(ctx.db_name, coll)
     stored: dict[str, Any] = {}
     if capped:
         stored["capped"] = True
@@ -2782,8 +3102,14 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             view_pipeline = []
         stored["viewOn"] = view_on
         stored["viewPipeline"] = list(view_pipeline)
-    if stored:
-        ctx.storage.set_collection_options(ctx.db_name, coll, **stored)
+    # Create with the options inline so they ride the ``create`` oplog ``c``
+    # entry (carried as siblings of ``create`` in ``o``). This is what lets
+    # PITR replay and ``show_expanded_events`` create events reconstruct
+    # ``capped`` / ``size`` / ``max`` / ``validator`` / … rather than seeing a
+    # bare ``{create, idIndex}``. Building ``stored`` before the create call
+    # also means an invalid ``clusteredIndex`` rejects without leaving a
+    # half-created collection behind.
+    ctx.storage.create_collection(ctx.db_name, coll, options=stored or None)
     return {"ok": 1.0}
 
 
@@ -2849,6 +3175,34 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             reply["expireAfterSeconds_new"] = new_expiry
             ctx.storage.set_index_expiry(ctx.db_name, coll, target["name"], new_expiry)
             description["index"] = {"name": target["name"], "expireAfterSeconds": new_expiry}
+        # ``prepareUnique`` arms the index so new writes that would break
+        # uniqueness are rejected (11000) while pre-existing duplicates
+        # are tolerated — the staging step before a ``unique: true``
+        # conversion (mongo-c-driver's ``modifyCollection-errorResponse``).
+        if "prepareUnique" in index_spec:
+            prep = bool(index_spec["prepareUnique"])
+            ctx.storage.set_index_options(ctx.db_name, coll, target["name"], prepareUnique=prep)
+            description["index"] = {"name": target["name"], "prepareUnique": prep}
+        # ``unique: true`` converts the index. If any documents already
+        # share a key the conversion is refused with code 359 and the
+        # offending ``_id`` groups reported as ``violations`` (the unified
+        # ``modifyCollection prepareUnique violations`` spec test).
+        if index_spec.get("unique") is True and not target.get("unique"):
+            dups = ctx.storage.find_index_duplicates(ctx.db_name, coll, target["name"])
+            if dups:
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"Cannot convert index {target['name']} to unique: found duplicate values"
+                    ),
+                    "code": 359,
+                    "codeName": "CannotConvertIndexToUnique",
+                    "violations": [{"ids": ids} for ids in dups],
+                }
+            ctx.storage.set_index_options(
+                ctx.db_name, coll, target["name"], unique=True, prepareUnique=False
+            )
+            description["index"] = {"name": target["name"], "unique": True}
     # Emit the collMod command oplog entry so a change stream with
     # ``showExpandedEvents`` surfaces a ``modify`` event.
     ctx.storage.record_collmod(ctx.db_name, coll, description)
@@ -3070,6 +3424,7 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         CreateIndexUnsupported,
         GeoExtractError,
         IndexConflict,
+        IndexKeySpecsConflict,
         IndexOptionsConflict,
     )
 
@@ -3232,6 +3587,13 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 85,
                 "codeName": "IndexOptionsConflict",
             }
+        except IndexKeySpecsConflict as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": 86,
+                "codeName": "IndexKeySpecsConflict",
+            }
         except IndexConflict as exc:
             return {
                 "ok": 0.0,
@@ -3252,12 +3614,20 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         if new:
             created += 1
-    return {
+    reply = {
         "createdCollectionAutomatically": created_auto,
         "numIndexesBefore": num_before,
         "numIndexesAfter": num_before + created,
         "ok": 1.0,
     }
+    # When every requested index already existed (nothing new created), mongod
+    # adds ``note: "all indexes already exist"``. Drivers key off this to report
+    # the create as a no-op (e.g. mongocxx's ``index_view::create_one`` returns
+    # an empty optional, which its ``fails for same keys and options`` test
+    # asserts) rather than as a freshly-created index.
+    if created == 0 and indexes:
+        reply["note"] = "all indexes already exist"
+    return reply
 
 
 def _drop_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -3300,6 +3670,24 @@ def _drop_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "IndexNotFound",
         }
     return {"nIndexesWas": num_before, "ok": 1.0}
+
+
+# Atlas Search index management (createSearchIndexes / updateSearchIndex /
+# dropSearchIndex commands + the $listSearchIndexes aggregation stage) is an
+# Atlas-only feature. A real non-Atlas mongod registers these commands but
+# fails them at execution with a message naming Atlas; the driver
+# index-management spec tests assert only that the error mentions "Atlas"
+# (mongo-c-driver's /index-management/{list,drop,update}SearchIndex). We are
+# not Atlas and never will be, so we reject them the same way. The shared
+# message lives in ``aggregate`` so the $listSearchIndexes stage and these
+# commands stay in lockstep.
+def _search_index_not_supported(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+    return {
+        "ok": 0.0,
+        "errmsg": SEARCH_INDEX_ATLAS_MSG,
+        "code": 115,
+        "codeName": "CommandNotSupported",
+    }
 
 
 def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -3370,6 +3758,20 @@ def _capped_position_lost_reply() -> dict[str, Any]:
     }
 
 
+def _collection_dropped_reply(ns: str) -> dict[str, Any]:
+    """Error a tailable ``getMore`` returns when its collection was dropped
+    out from under it. mongod kills the plan executor with ``QueryPlanKilled``
+    (175) and a message naming the dropped namespace; mongo-php-driver's
+    ``cursor-tailable_error-001`` asserts the message contains
+    "collection dropped"."""
+    return {
+        "ok": 0.0,
+        "errmsg": f"collection dropped: {ns}",
+        "code": 175,
+        "codeName": "QueryPlanKilled",
+    }
+
+
 def _drain_change_stream_producer(entry: Any) -> None:
     """Pull one producer batch into ``entry.remaining`` if it's empty.
 
@@ -3400,6 +3802,28 @@ def _change_stream_cursor_doc(
         # The invalidate event has now been delivered.
         entry.final_event_pending = False
     cursor_alive = not (entry.invalidated and not entry.remaining and not entry.final_event_pending)
+    if batch and entry.last_token is not None:
+        # The postBatchResumeToken must reflect the resume token of the last
+        # event ACTUALLY RETURNED in this batch — not the producer's prefetch
+        # tail. The producer reads up to 200 oplog rows ahead while the cursor
+        # hands them back ``batch_size`` at a time, so with a small batchSize a
+        # single getMore returns one event while ``entry.last_token`` already
+        # points at the last *buffered* event. Each change event's ``_id`` IS
+        # its resume token (incl. documentKey), so pin the token to the last
+        # returned event. mongocxx's "ChangeStream must continuously track the
+        # last seen resumeToken" reads the PBRT after each batchSize=1 getMore
+        # and requires it to advance per event.
+        #
+        # Gated on ``entry.last_token is not None``: only change-stream cursors
+        # carry a resume token (set at registration). This builder is shared
+        # with capped-collection tailable cursors, whose documents have plain
+        # ``_id`` values (e.g. an int) and no postBatchResumeToken — overwriting
+        # ``last_token`` with such an ``_id`` made the reply carry a non-document
+        # PBRT and broke strict drivers (the Java driver: "Value expected to be
+        # of type DOCUMENT is of unexpected type INT32").
+        last_ev = batch[-1]
+        if isinstance(last_ev, Mapping) and "_id" in last_ev:
+            entry.last_token = last_ev["_id"]
     cursor_doc: dict[str, Any] = {
         batch_key: batch,
         # Cursor `id` MUST be int64 — Go driver hard-fails int32.
@@ -3471,6 +3895,11 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "cursor": {"nextBatch": [], "id": bson.Int64(0), "ns": ns},
             "ok": 1.0,
         }
+    # Collection dropped out from under the cursor: surface the dropped
+    # error before anything else (any buffered rows are stale).
+    if entry.dropped:
+        ctx.cursors.kill([cursor_id])
+        return _collection_dropped_reply(entry.namespace or ns)
     # Drain any already-buffered events first.
     try:
         _drain_change_stream_producer(entry)
@@ -3485,7 +3914,17 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # real mongod treats that as "wait indefinitely". We bound the wait so
         # the connection thread can be reaped on shutdown.
         wait_seconds = max_time_ms / 1000.0 if max_time_ms > 0 else 1.0
-        captured_tail = ctx.storage.oplog_tail_seq()
+        # Baseline the wake predicate on the producer's consumed position
+        # (``entry.position_seq``): the drain above advanced it to the tail
+        # it observed, so any write landing AFTER that observation —
+        # including one in the gap between the drain and this wait — makes
+        # ``tail > baseline`` true and skips the wait. A fresh post-drain
+        # tail snapshot counted such a write into the baseline, so the
+        # getMore slept its full maxTimeMS with the event already in the
+        # oplog, surfacing it only on the post-wait re-drain — past the
+        # client's await window. Mirrors the Rust server's
+        # ``wait_for_oplog(position, ...)``.
+        baseline_seq = entry.position_seq
         with ctx.storage._oplog_cv:
             # Wake predicate must not acquire ``storage._lock`` — the
             # write path holds ``_lock`` then notifies under
@@ -3496,12 +3935,17 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # read self-corrects on the next iteration of wait_for.
             ctx.storage._oplog_cv.wait_for(
                 lambda: (
-                    ctx.storage.oplog_tail_seq_nolock() > captured_tail
+                    ctx.storage.oplog_tail_seq_nolock() > baseline_seq
                     or entry.invalidated
+                    or entry.dropped
                     or ctx.storage._shutting_down
                 ),
                 timeout=wait_seconds,
             )
+        # A concurrent drop may have tombstoned the cursor while we waited.
+        if entry.dropped:
+            ctx.cursors.kill([cursor_id])
+            return _collection_dropped_reply(entry.namespace or ns)
         try:
             _drain_change_stream_producer(entry)
         except changestreams.ChangeStreamFatalError as exc:
@@ -3568,6 +4012,28 @@ def _map_reduce(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"results": [], "ok": 1.0}
 
 
+def _resolve_view(ctx: CommandContext, coll: str, pipeline: list[Any]) -> tuple[str, list[Any]]:
+    """Resolve a view namespace to its base collection + combined pipeline.
+
+    Follows a ``viewOn`` chain (a view may be defined on another view),
+    prepending each view's stored ``viewPipeline`` ahead of the caller's
+    pipeline, until a base (non-view) collection is reached. A cycle in the chain
+    is broken defensively. Returns ``(base_coll, combined_pipeline)`` — the inputs
+    unchanged when ``coll`` isn't a view.
+    """
+    combined = list(pipeline)
+    seen: set[str] = set()
+    while coll not in seen:
+        seen.add(coll)
+        opts = ctx.storage.get_collection_options(ctx.db_name, coll)
+        view_on = opts.get("viewOn")
+        if not isinstance(view_on, str):
+            break
+        combined = list(opts.get("viewPipeline") or []) + combined
+        coll = view_on
+    return coll, combined
+
+
 def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus import changestreams
     from secantus.storage import BadHint, IndexConflict
@@ -3582,7 +4048,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     collation = doc.get("collation")
     cursor_opts = doc.get("cursor") or {}
     raw_agg_batch = cursor_opts.get("batchSize")
-    batch_size = DEFAULT_BATCH_SIZE if raw_agg_batch is None else int(raw_agg_batch)
+    batch_size = DEFAULT_BATCH_SIZE if raw_agg_batch is None else _coerce_command_int(raw_agg_batch)
     coll_name = ""
 
     first_stage = pipeline[0] if pipeline else {}
@@ -3655,6 +4121,11 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
     if isinstance(coll, str):
         coll_name = coll
+        # Resolve a view to its base collection + prepended view pipeline (a view
+        # may be defined on another view). The reply ns and pipeline context keep
+        # the queried (view) name; only the fetch reads the base collection.
+        base_coll, pipeline = _resolve_view(ctx, coll, pipeline)
+        first_stage = pipeline[0] if pipeline else {}
         if isinstance(first_stage, Mapping) and (
             "$collStats" in first_stage
             or "$indexStats" in first_stage
@@ -3673,10 +4144,21 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             ):
                 initial_filter = dict(first_stage["$match"])
                 pipeline = list(pipeline[1:])
+            elif isinstance(first_stage, Mapping) and "$geoNear" in first_stage:
+                # A leading $geoNear with a maxDistance and a matching geo index
+                # rides that index via a conservative $geoWithin candidate fetch
+                # instead of scanning the whole collection. The $geoNear stage is
+                # NOT skipped — it re-applies the exact distance filter, so the
+                # output is identical; only the fetched candidate set shrinks.
+                candidate = _geo_near_index_filter(
+                    first_stage["$geoNear"], ctx.storage, ctx.db_name, base_coll
+                )
+                if candidate is not None:
+                    initial_filter = candidate
             try:
                 docs = ctx.storage.find_matching(
                     ctx.db_name,
-                    coll,
+                    base_coll,
                     initial_filter,
                     hint=hint,
                     let=let,
@@ -3688,6 +4170,10 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     else:
         docs = []
         ns = f"{ctx.db_name}.$cmd.aggregate"
+    # The current connection's hello.client handshake metadata, so a
+    # ``$currentOp`` stage can surface ``clientMetadata`` + ``appName`` on its
+    # self-row (mongocxx's "client metadata handshake feature" test).
+    conn_info = ctx.connections.get(ctx.connection_id) if ctx.connections is not None else None
     pipeline_ctx = PipelineContext(
         storage=ctx.storage,
         db_name=ctx.db_name,
@@ -3695,6 +4181,8 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         vars=dict(let) if let else {},
         collation=collation,
         command_doc=dict(doc),
+        bypass_validation=bool(doc.get("bypassDocumentValidation", False)),
+        client_metadata=conn_info.client_metadata if conn_info is not None else None,
     )
     try:
         docs = apply_pipeline(docs, pipeline, pipeline_ctx)
@@ -3874,22 +4362,26 @@ def _aggregate_change_stream(
             return []
         rows = storage.read_oplog(start_seq=entry.position_seq + 1, limit=200, ns_filter=_ns_filter)
         if not rows:
-            # No new MATCHING oplog entries since last poll, but the
-            # oplog as a whole may have moved on (writes on other
-            # collections, periodic noop heartbeats). The
-            # postBatchResumeToken should advance to reflect the
-            # latest oplog position so consumers on quiet collections
-            # can resume past unrelated activity — mongo-go-driver's
-            # ``resume_token_updated_on_empty_batch`` test asserts
-            # exactly that. Pin ``position_seq`` to the oplog tail so
-            # the next read starts from there.
+            # No new MATCHING oplog entries since last poll. If the oplog as a
+            # whole has moved on (writes on other collections, periodic noop
+            # heartbeats), advance ``position_seq`` to the tail and mint a fresh
+            # high-water-mark token so a quiet collection's postBatchResumeToken
+            # can move past unrelated activity — mongo-go-driver's
+            # ``resume_token_updated_on_empty_batch`` asserts exactly that.
+            # When the tail has NOT moved, leave ``last_token`` untouched:
+            # re-minting with a fresh cluster time would change the token even
+            # though nothing happened, breaking the spec rule that a no-change
+            # empty batch reports the SAME resume token as the last event
+            # delivered (mongocxx's "continuously track the last seen
+            # resumeToken" asserts the post-exhaustion token equals the last
+            # doc's token).
             tail_seq = storage.oplog_tail_seq()
             if tail_seq > entry.position_seq:
                 entry.position_seq = tail_seq
-            ts = storage.current_cluster_time()
-            entry.last_token = changestreams.make_resume_token(
-                changestreams.ResumeTokenData(entry.position_seq, ts, ns, {})
-            )
+                ts = storage.current_cluster_time()
+                entry.last_token = changestreams.make_resume_token(
+                    changestreams.ResumeTokenData(entry.position_seq, ts, ns, {})
+                )
             return []
         events: list[dict[str, Any]] = []
         last_seen = entry.position_seq
@@ -3960,6 +4452,7 @@ def _aggregate_change_stream(
         await_data=True,
         position_seq=start_seq - 1,
         collection_uuid=coll_uuid,
+        change_stream=True,
     )
     entry = ctx.cursors.get(cursor_id)
     entry_ref["entry"] = entry
@@ -5190,6 +5683,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "isMaster": _hello,
     "ismaster": _hello,
     "ping": _ping,
+    "replSetGetStatus": _repl_set_get_status,
     "buildInfo": _build_info,
     "buildinfo": _build_info,
     "endSessions": _end_sessions,
@@ -5210,7 +5704,9 @@ _HANDLERS: dict[str, CommandHandler] = {
     "secantusAdmin.pruneOplog": _secantus_admin_prune_oplog,
     "secantusAdmin.pruneTtl": _secantus_admin_prune_ttl,
     "secantusAdmin.backupArchive": _secantus_admin_backup_archive,
+    "secantusAdmin.archiveBaseSnapshot": _secantus_admin_archive_base_snapshot,
     "secantusAdmin.restoreArchive": _secantus_admin_restore_archive,
+    "secantusAdmin.restoreToTimestamp": _secantus_admin_restore_to_timestamp,
     "explain": _explain,
     "serverStatus": _server_status,
     "top": _top,
@@ -5239,6 +5735,10 @@ _HANDLERS: dict[str, CommandHandler] = {
     "listIndexes": _list_indexes,
     "createIndexes": _create_indexes,
     "dropIndexes": _drop_indexes,
+    # Atlas-only search index management — rejected with an "Atlas" error.
+    "createSearchIndexes": _search_index_not_supported,
+    "updateSearchIndex": _search_index_not_supported,
+    "dropSearchIndex": _search_index_not_supported,
     "killCursors": _kill_cursors,
     "getMore": _get_more,
     "aggregate": _aggregate,
@@ -5377,7 +5877,9 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "secantusAdmin.pruneOplog": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.pruneTtl": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.backupArchive": (A_FSYNC, SCOPE_CLUSTER),
+    "secantusAdmin.archiveBaseSnapshot": (A_FSYNC, SCOPE_CLUSTER),
     "secantusAdmin.restoreArchive": (A_FSYNC, SCOPE_CLUSTER),
+    "secantusAdmin.restoreToTimestamp": (A_FSYNC, SCOPE_CLUSTER),
 }
 
 
@@ -5944,6 +6446,20 @@ def _finish_txn_statement(ctx: CommandContext, txn: Transaction, result: dict[st
 
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     name = command_name(doc)
+    # Database-name length limit. mongod rejects any namespace whose
+    # database component exceeds 63 bytes with InvalidNamespace before
+    # the command runs (libmongoc's ``long_namespace/unsupported_long_db``
+    # inserts into a 64-character database and expects a server error).
+    db_name = ctx.db_name or ""
+    if len(db_name.encode("utf-8")) > 63:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Invalid database name: '{db_name}'. Database names must be at most 63 characters."
+            ),
+            "code": 73,
+            "codeName": "InvalidNamespace",
+        }
     # Read-concern + apiVersion validation runs before every command
     # — they're cross-cutting concerns the wire layer should reject
     # uniformly, so invalid shapes don't silently pass through to

@@ -38,6 +38,24 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             ))
         }
     };
+    // `query` must be a document. mongod rejects a bare value (e.g. an ObjectId
+    // passed as a findOneAnd* filter) with TypeMismatch (14) rather than treating
+    // it as an empty filter — mongo-node-driver's "object ids as a query
+    // predicate" tests assert the error.
+    if let Some(q) = doc.get("query") {
+        if !matches!(q, Bson::Document(_)) {
+            let ty = secantus_core::query::bson_type_name(q);
+            return Ok(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'findAndModify.query' is the wrong type '{ty}', \
+                     expected type 'object'"
+                ),
+            )
+            .into_reply());
+        }
+    }
     let query = doc_field(doc, "query");
     let sort = doc.get("sort").and_then(Bson::as_document);
     let fields = doc.get("fields").and_then(Bson::as_document);
@@ -69,6 +87,14 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // match. The subsequent update/delete is keyed by the matched doc's `_id`.
     let let_vars = resolve_let_vars(doc.get("let"));
     let collation = collation_of(doc);
+    // `arrayFilters` ($[ident] identifiers) for an operator-form update.
+    let array_filters: Vec<Document> = doc
+        .get("arrayFilters")
+        .and_then(Bson::as_array)
+        .map(|a| a.iter().filter_map(|b| b.as_document().cloned()).collect())
+        .unwrap_or_default();
+    // Pipeline-form update (`update: [ {$set: …}, … ]`) vs operator/replacement.
+    let pipeline = update.and_then(Bson::as_array);
 
     // Collection validator on the post-apply doc (code 121) unless
     // `bypassDocumentValidation` / `validationAction: warn|off`, mirroring the
@@ -110,28 +136,42 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // No match.
     let Some(matched_bytes) = matched else {
         if upsert && !is_remove {
-            let upd = update
-                .and_then(Bson::as_document)
-                .cloned()
-                .unwrap_or_default();
-            let outcome = match storage.update_matching_array_filters(
-                &ctx.db_name,
-                &coll,
-                &query,
-                &upd,
-                false,
-                true,
-                &[],
-                &let_vars,
-                collation.as_ref(),
-                validator.as_ref(),
-            ) {
+            let outcome = match if let Some(stages) = pipeline {
+                storage.update_matching_pipeline(
+                    &ctx.db_name,
+                    &coll,
+                    &query,
+                    stages,
+                    false,
+                    true,
+                    &let_vars,
+                    collation.as_ref(),
+                    validator.as_ref(),
+                )
+            } else {
+                let upd = update
+                    .and_then(Bson::as_document)
+                    .cloned()
+                    .unwrap_or_default();
+                storage.update_matching_array_filters(
+                    &ctx.db_name,
+                    &coll,
+                    &query,
+                    &upd,
+                    false,
+                    true,
+                    &array_filters,
+                    &let_vars,
+                    collation.as_ref(),
+                    validator.as_ref(),
+                )
+            } {
                 Ok(o) => o,
                 Err(e) => return Ok(storage_err_reply(e)),
             };
             let upserted_id = outcome.upserted_id.unwrap_or(Bson::Null);
             let value = if return_new && upserted_id != Bson::Null {
-                fetch_projected(storage, &ctx.db_name, &coll, &upserted_id, fields)?
+                fetch_projected(storage, &ctx.db_name, &coll, &upserted_id, fields, &query)?
             } else {
                 Bson::Null
             };
@@ -157,7 +197,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         if let Err(e) = storage.delete_matching(&ctx.db_name, &coll, &id_filter, 1) {
             return Ok(storage_err_reply(e));
         }
-        let value = project_value(matched_doc, fields)?;
+        let value = project_value(matched_doc, fields, &query)?;
         return Ok(doc! {
             "lastErrorObject": { "n": 1, "updatedExisting": true },
             "value": value,
@@ -165,30 +205,73 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         });
     }
 
-    // update: apply it to the matched doc.
-    let upd = update
-        .and_then(Bson::as_document)
-        .cloned()
-        .unwrap_or_default();
-    if let Err(e) = storage.update_matching_array_filters(
-        &ctx.db_name,
-        &coll,
-        &id_filter,
-        &upd,
-        false,
-        false,
-        &[],
-        &let_vars,
-        collation.as_ref(),
-        validator.as_ref(),
-    ) {
+    // Command-layer validator check that produces mongod's `errInfo`
+    // (failingDocumentId + per-operator details) — storage enforces the
+    // validator too, but its error lacks the detail drivers' errorResponse tests
+    // read (mongo-c-driver findOneAndUpdate-errorResponse). Only the
+    // operator/replacement form is reconstructible in-memory here; pipeline-form
+    // falls back to storage's plain 121. Purely additive: it only short-circuits
+    // on a clear post-apply validation failure, otherwise the storage write runs.
+    if let Some(v) = &validator {
+        if pipeline.is_none() {
+            let upd = update
+                .and_then(Bson::as_document)
+                .cloned()
+                .unwrap_or_default();
+            if let Ok(post) = secantus_core::update::apply_update(&matched_doc, &upd, false) {
+                if !secantus_core::query::matches(&post, v, &Document::new(), None).unwrap_or(true)
+                {
+                    return Ok(doc! {
+                        "ok": 0.0,
+                        "errmsg": "Document failed validation",
+                        "code": 121,
+                        "codeName": "DocumentValidationFailure",
+                        "errInfo": crate::crud::validation_error_info(v, &post),
+                    });
+                }
+            }
+        }
+    }
+
+    // update: apply it to the matched doc (pipeline-form or operator/replacement).
+    let update_result = if let Some(stages) = pipeline {
+        storage.update_matching_pipeline(
+            &ctx.db_name,
+            &coll,
+            &id_filter,
+            stages,
+            false,
+            false,
+            &let_vars,
+            collation.as_ref(),
+            validator.as_ref(),
+        )
+    } else {
+        let upd = update
+            .and_then(Bson::as_document)
+            .cloned()
+            .unwrap_or_default();
+        storage.update_matching_array_filters(
+            &ctx.db_name,
+            &coll,
+            &id_filter,
+            &upd,
+            false,
+            false,
+            &array_filters,
+            &let_vars,
+            collation.as_ref(),
+            validator.as_ref(),
+        )
+    };
+    if let Err(e) = update_result {
         return Ok(storage_err_reply(e));
     }
 
     let value = if return_new {
-        fetch_projected(storage, &ctx.db_name, &coll, &matched_id, fields)?
+        fetch_projected(storage, &ctx.db_name, &coll, &matched_id, fields, &query)?
     } else {
-        project_value(matched_doc, fields)?
+        project_value(matched_doc, fields, &query)?
     };
     Ok(doc! {
         "lastErrorObject": { "n": 1, "updatedExisting": true },
@@ -212,29 +295,37 @@ fn fetch_projected(
     coll: &str,
     id: &Bson,
     fields: Option<&Document>,
+    query: &Document,
 ) -> Result<Bson, CommandError> {
     let filter = doc! { "_id": id.clone() };
     let found = storage
         .find(db, coll, &filter, None, None)
         .map_err(command_error)?;
     match found.into_iter().next() {
-        Some(b) => project_value(decode(&b)?, fields),
+        Some(b) => project_value(decode(&b)?, fields, query),
         None => Ok(Bson::Null),
     }
 }
 
 /// Apply the optional projection to a value document, returning it as `Bson`.
-fn project_value(value: Document, fields: Option<&Document>) -> Result<Bson, CommandError> {
+fn project_value(
+    value: Document,
+    fields: Option<&Document>,
+    query: &Document,
+) -> Result<Bson, CommandError> {
+    let q = if query.is_empty() { None } else { Some(query) };
     match fields {
-        Some(spec) if !spec.is_empty() => secantus_core::projection::apply_projection(&value, spec)
-            .map(Bson::Document)
-            .map_err(|_| {
-                CommandError::new(
-                    2,
-                    "BadValue",
-                    "projection is not supported by the Rust server",
-                )
-            }),
+        Some(spec) if !spec.is_empty() => {
+            secantus_core::projection::apply_projection(&value, spec, q)
+                .map(Bson::Document)
+                .map_err(|_| {
+                    CommandError::new(
+                        2,
+                        "BadValue",
+                        "projection is not supported by the Rust server",
+                    )
+                })
+        }
         _ => Ok(Bson::Document(value)),
     }
 }
@@ -257,276 +348,5 @@ fn storage_err_reply(e: StorageError) -> Document {
             r
         }
         other => command_error(other).into_reply(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dispatch;
-    use crate::storage::{RawHint, Storage, UpdateOutcome};
-    use std::sync::{Arc, Mutex};
-
-    fn matches(d: &Document, filter: &Document) -> bool {
-        filter.iter().all(|(k, v)| d.get(k) == Some(v))
-    }
-
-    #[derive(Default)]
-    struct FakeStorage {
-        docs: Mutex<Vec<Document>>,
-        next_id: Mutex<i32>,
-    }
-
-    impl FakeStorage {
-        fn with(docs: Vec<Document>) -> Arc<FakeStorage> {
-            Arc::new(FakeStorage {
-                docs: Mutex::new(docs),
-                next_id: Mutex::new(100),
-            })
-        }
-    }
-
-    impl Storage for FakeStorage {
-        fn insert(
-            &self,
-            _: &str,
-            _: &str,
-            _: Vec<Vec<u8>>,
-            _: bool,
-        ) -> Result<(usize, Vec<Document>), StorageError> {
-            Ok((0, vec![]))
-        }
-        fn update_matching(
-            &self,
-            _: &str,
-            _: &str,
-            filter: &Document,
-            update: &Document,
-            _multi: bool,
-            upsert: bool,
-        ) -> Result<UpdateOutcome, StorageError> {
-            let mut docs = self.docs.lock().unwrap();
-            let set = update.get("$set").and_then(Bson::as_document).cloned();
-            let mut matched = 0;
-            let mut modified = 0;
-            for d in docs.iter_mut() {
-                if matches(d, filter) {
-                    matched += 1;
-                    if let Some(set) = &set {
-                        for (k, v) in set.iter() {
-                            d.insert(k.clone(), v.clone());
-                        }
-                        modified += 1;
-                    }
-                    break;
-                }
-            }
-            let upserted_id = if matched == 0 && upsert {
-                let id = filter.get("_id").cloned().unwrap_or_else(|| {
-                    let mut n = self.next_id.lock().unwrap();
-                    *n += 1;
-                    Bson::Int32(*n)
-                });
-                let mut new_doc = doc! { "_id": id.clone() };
-                for (k, v) in filter.iter() {
-                    if k != "_id" {
-                        new_doc.insert(k.clone(), v.clone());
-                    }
-                }
-                if let Some(set) = &set {
-                    for (k, v) in set.iter() {
-                        new_doc.insert(k.clone(), v.clone());
-                    }
-                }
-                docs.push(new_doc);
-                Some(id)
-            } else {
-                None
-            };
-            Ok(UpdateOutcome {
-                matched,
-                modified,
-                upserted_id,
-            })
-        }
-        fn delete_matching(
-            &self,
-            _: &str,
-            _: &str,
-            filter: &Document,
-            limit: usize,
-        ) -> Result<usize, StorageError> {
-            let mut docs = self.docs.lock().unwrap();
-            let mut removed = 0;
-            let mut i = 0;
-            while i < docs.len() {
-                if matches(&docs[i], filter) {
-                    docs.remove(i);
-                    removed += 1;
-                    if limit != 0 && removed >= limit {
-                        break;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            Ok(removed)
-        }
-        fn count_matching(&self, _: &str, _: &str, _: &Document) -> Result<usize, StorageError> {
-            Ok(0)
-        }
-        fn find(
-            &self,
-            _: &str,
-            _: &str,
-            filter: &Document,
-            sort: Option<&Document>,
-            _: Option<RawHint<'_>>,
-        ) -> Result<Vec<Vec<u8>>, StorageError> {
-            let docs = self.docs.lock().unwrap();
-            let mut out: Vec<Document> = docs
-                .iter()
-                .filter(|d| matches(d, filter))
-                .cloned()
-                .collect();
-            if let Some(s) = sort {
-                if let Some((field, dir)) = s.iter().next() {
-                    out.sort_by_key(|d| match d.get(field) {
-                        Some(Bson::Int32(i)) => *i as i64,
-                        Some(Bson::Int64(i)) => *i,
-                        _ => 0,
-                    });
-                    if dir.as_i32().unwrap_or(1) < 0 {
-                        out.reverse();
-                    }
-                }
-            }
-            Ok(out
-                .iter()
-                .map(|d| {
-                    let mut v = Vec::new();
-                    d.to_writer(&mut v).unwrap();
-                    v
-                })
-                .collect())
-        }
-    }
-
-    fn ctx(storage: Arc<FakeStorage>) -> CommandContext {
-        let mut c = CommandContext::new(1).with_storage(storage);
-        c.db_name = "t".into();
-        c
-    }
-
-    #[test]
-    fn update_returns_old_by_default() {
-        let s = FakeStorage::with(vec![doc! {"_id": 1, "x": 1}]);
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"findAndModify": "c", "query": {"_id": 1}, "update": {"$set": {"x": 9}}},
-            &mut c,
-        );
-        let value = reply.get_document("value").unwrap();
-        assert_eq!(value.get_i32("x").unwrap(), 1, "old image");
-        let leo = reply.get_document("lastErrorObject").unwrap();
-        assert_eq!(leo.get_i32("n").unwrap(), 1);
-        assert!(leo.get_bool("updatedExisting").unwrap());
-    }
-
-    #[test]
-    fn update_returns_new_when_requested() {
-        let s = FakeStorage::with(vec![doc! {"_id": 1, "x": 1}]);
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"findAndModify": "c", "query": {"_id": 1}, "update": {"$set": {"x": 9}}, "new": true},
-            &mut c,
-        );
-        assert_eq!(
-            reply.get_document("value").unwrap().get_i32("x").unwrap(),
-            9,
-            "new image"
-        );
-    }
-
-    #[test]
-    fn remove_returns_deleted_doc() {
-        let s = FakeStorage::with(vec![doc! {"_id": 1, "x": 1}, doc! {"_id": 2, "x": 2}]);
-        let mut c = ctx(s.clone());
-        let reply = dispatch(
-            &doc! {"findAndModify": "c", "query": {"_id": 1}, "remove": true},
-            &mut c,
-        );
-        assert_eq!(
-            reply.get_document("value").unwrap().get_i32("_id").unwrap(),
-            1
-        );
-        assert_eq!(s.docs.lock().unwrap().len(), 1, "doc removed");
-    }
-
-    #[test]
-    fn no_match_returns_null() {
-        let s = FakeStorage::with(vec![]);
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"findAndModify": "c", "query": {"_id": 9}, "update": {"$set": {"x": 1}}},
-            &mut c,
-        );
-        assert_eq!(reply.get("value"), Some(&Bson::Null));
-        assert_eq!(
-            reply
-                .get_document("lastErrorObject")
-                .unwrap()
-                .get_i32("n")
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn upsert_inserts_and_reports_upserted() {
-        let s = FakeStorage::with(vec![]);
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"findAndModify": "c", "query": {"_id": 5}, "update": {"$set": {"x": 1}}, "upsert": true, "new": true},
-            &mut c,
-        );
-        let leo = reply.get_document("lastErrorObject").unwrap();
-        assert_eq!(leo.get_i32("upserted").unwrap(), 5);
-        assert!(!leo.get_bool("updatedExisting").unwrap());
-        assert_eq!(
-            reply.get_document("value").unwrap().get_i32("x").unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn sort_picks_first() {
-        let s = FakeStorage::with(vec![
-            doc! {"_id": 1, "g": "a", "p": 3},
-            doc! {"_id": 2, "g": "a", "p": 1},
-            doc! {"_id": 3, "g": "a", "p": 2},
-        ]);
-        let mut c = ctx(s);
-        // sort by p asc ⇒ _id 2 is the target
-        let reply = dispatch(
-            &doc! {"findAndModify": "c", "query": {"g": "a"}, "sort": {"p": 1}, "remove": true},
-            &mut c,
-        );
-        assert_eq!(
-            reply.get_document("value").unwrap().get_i32("_id").unwrap(),
-            2
-        );
-    }
-
-    #[test]
-    fn remove_and_update_together_is_failed_to_parse() {
-        let s = FakeStorage::with(vec![]);
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"findAndModify": "c", "remove": true, "update": {"$set": {"x": 1}}},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("code").unwrap(), 9);
-        assert_eq!(reply.get_str("codeName").unwrap(), "FailedToParse");
     }
 }

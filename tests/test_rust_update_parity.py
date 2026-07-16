@@ -70,8 +70,32 @@ CURATED = [
     ({"a": 2}, {"$mul": {"a": 3}}, False),
     ({"a": 2}, {"$mul": {"a": 1.5}}, False),
     ({}, {"$mul": {"a": 4}}, False),
+    # $inc / $mul on an *absent* field -> treat as 0 and apply (Rust computes).
+    ({"other": 1}, {"$inc": {"n": 5}}, False),
+    ({"other": 1}, {"$mul": {"n": 5}}, False),
+    # $inc / $mul on an *explicit-null* field -> Rust defers so the pure-Python
+    # engine raises TypeMismatch (code 14). rust returns None => no-assert skip.
+    ({"n": None}, {"$inc": {"n": 5}}, False),
+    ({"n": None}, {"$mul": {"n": 5}}, False),
+    ({"b": 1}, {"$bit": {"b": {"and": 0}}}, False),
+    ({"b": 5}, {"$bit": {"b": {"or": 2}}}, False),
+    ({"b": 6}, {"$bit": {"b": {"xor": 3}}}, False),
+    ({"b": Int64(12)}, {"$bit": {"b": {"and": 10}}}, False),
+    ({}, {"$bit": {"b": {"or": 7}}}, False),
+    # Multiple bit ops applied in order.
+    ({"b": 0b1100}, {"$bit": {"b": {"and": 0b1010, "or": 0b0001}}}, False),
+    ({"b": 0b1000}, {"$bit": {"b": {"or": 0b0001, "xor": 0b1001}}}, False),
     ({}, {"$push": {"tags": "x"}}, False),
     ({"tags": ["x"]}, {"$push": {"tags": "y"}}, False),
+    # $push / $addToSet $each modifiers: multi-append, $position, $slice, $sort.
+    ({"a": [3, 1, 2]}, {"$push": {"a": {"$each": [5, 4]}}}, False),
+    ({}, {"$push": {"a": {"$each": [1, 2, 3]}}}, False),
+    ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9], "$slice": -2}}}, False),
+    ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9], "$slice": 2}}}, False),
+    ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9, 8], "$position": 1}}}, False),
+    ({"a": [1, 2, 3]}, {"$push": {"a": {"$each": [9], "$position": -1}}}, False),
+    ({"a": [1, 2]}, {"$addToSet": {"a": {"$each": [2, 3, 3, 4]}}}, False),
+    ({}, {"$addToSet": {"a": {"$each": [1, 1, 2]}}}, False),
     ({"a": [1, 2, 3]}, {"$pop": {"a": 1}}, False),
     ({"a": [1, 2, 3]}, {"$pop": {"a": -1}}, False),
     ({"a": []}, {"$pop": {"a": 1}}, False),
@@ -86,35 +110,74 @@ CURATED = [
     ({"n": 5}, {"$set": {"n": 5}, "$inc": {"m": 1}}, False),
     ({}, {}, False),  # empty update
     ({"a": 1}, {"b": 2, "c": [1, 2, {"d": 3}]}, False),  # replacement, no _id
-    # Cases the Rust path should defer (rust returns None -> skipped):
-    ({"a": 5}, {"$min": {"a": 3}}, False),
+    # $min / $max — BSON cross-type order; missing set, explicit-null compared.
+    ({"a": 5}, {"$min": {"a": 3}}, False),  # 3 < 5 -> 3
+    ({"a": 5}, {"$min": {"a": 7}}, False),  # no change
+    ({}, {"$min": {"a": 4}}, False),  # absent -> set
+    ({"a": None}, {"$max": {"a": 9}}, False),  # 9 > null -> set
+    ({"a": None}, {"$min": {"a": 9}}, False),  # null < 9 -> keep null
+    ({"a": 5}, {"$max": {"a": 9}}, False),
+    ({"a": True}, {"$max": {"a": 2}}, False),  # bool current -> Rust defers (skip)
+    ({"a": "m"}, {"$min": {"a": "a"}}, False),  # string compare
+    ({"a": 2}, {"$min": {"a": 1.5}}, False),  # int/float cross-numeric
+    # Cross-type (sortable) now COMPUTES on both engines via BSON order:
+    ({"a": 5}, {"$min": {"a": "x"}}, False),  # number < string -> keep 5
+    ({"a": 5}, {"$max": {"a": "x"}}, False),  # string > number -> set "x"
+    ({"a": ObjectId("507f1f77bcf86cd799439011")}, {"$max": {"a": 5}}, False),  # oid > num
+    ({"a": "x"}, {"$max": {"a": 5}}, False),  # string > number -> keep "x"
+    # $addToSet — dedup by value (bool-as-int, structural), absent -> create.
+    ({"a": [1, 2]}, {"$addToSet": {"a": 3}}, False),  # append
+    ({"a": [1, 2, 3]}, {"$addToSet": {"a": 2}}, False),  # present -> no change
+    ({"a": [1, 2]}, {"$addToSet": {"a": True}}, False),  # True==1 present
+    ({"a": [{"x": 1}]}, {"$addToSet": {"a": {"x": 1}}}, False),  # structural dup
+    ({}, {"$addToSet": {"a": 7}}, False),  # absent -> [7]
+    ({"a": 5}, {"$addToSet": {"a": 1}}, False),  # non-array -> defer (Python raises)
+    # $pull — remove elements `==` the criterion (value compare, not query).
     ({"a": [1, 2, 3, 2]}, {"$pull": {"a": 2}}, False),
-    ({"a": [1, 2]}, {"$addToSet": {"a": 3}}, False),
+    ({"a": [{"x": 1}, {"x": 2}]}, {"$pull": {"a": {"x": 1}}}, False),  # sub-doc match
+    ({"a": [1, True, 2]}, {"$pull": {"a": 1}}, False),  # query eq: bool != int (keeps True)
+    ({"a": [1, 1.0, 2]}, {"$pull": {"a": 1}}, False),  # query eq: 1 == 1.0 (removes both)
+    ({"a": 5}, {"$pull": {"a": 1}}, False),  # non-array -> no-op
+    # $pull with a query predicate / sub-document criterion (via query::matches).
+    ({"a": [1, 5, 10, 15]}, {"$pull": {"a": {"$gte": 10}}}, False),
+    ({"a": [1, 2, 3, 4]}, {"$pull": {"a": {"$in": [2, 4]}}}, False),
+    ({"a": [1, 2, 3]}, {"$pull": {"a": {"$lt": 3}}}, False),
+    (
+        {"a": [{"x": 1, "y": "a"}, {"x": 5, "y": "b"}, {"x": 9, "y": "c"}]},
+        {"$pull": {"a": {"x": {"$gte": 5}}}},
+        False,
+    ),
+    (
+        {"a": [{"x": 1, "y": "a"}, {"x": 5, "y": "b"}]},
+        {"$pull": {"a": {"y": "b"}}},
+        False,
+    ),
+    ({"a": [{"b": {"c": 1}}, {"b": {"c": 2}}]}, {"$pull": {"a": {"b.c": 2}}}, False),
+    # $pullAll — literal equality over a value list.
+    ({"a": [1, 2, 3, 2, 1]}, {"$pullAll": {"a": [1, 2]}}, False),
+    ({"a": [1, 2, 3]}, {"$pullAll": {"a": [9]}}, False),  # nothing removed
+    ({"a": 5}, {"$pullAll": {"a": [1]}}, False),  # non-array field -> no-op
+    # $push $sort — 1/-1 whole-element and {field: dir} sorts (BSON order).
+    ({"a": [1, 2]}, {"$push": {"a": {"$each": [4, 3], "$sort": 1}}}, False),
+    ({"a": [3, 1, 2]}, {"$push": {"a": {"$each": [], "$sort": -1}}}, False),
+    (
+        {"a": [{"s": 3}, {"s": 1}]},
+        {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1}}}},
+        False,
+    ),
+    (
+        {"a": [{"s": 1}, {"s": 3}]},
+        {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": -1}}}},
+        False,
+    ),
+    # $push $sort + $slice combined (position -> sort -> slice).
+    ({"a": [5, 1, 3]}, {"$push": {"a": {"$each": [2, 4], "$sort": 1, "$slice": 3}}}, False),
+    # $bit already handled above.
+    # Cases the Rust path should defer (rust returns None -> skipped):
     ({"_id": 1}, {"_id": 2, "x": 9}, False),  # _id change -> error path
     ({}, {"$set": {"a": 1}, "b": 2}, False),  # mixing -> error path
     ({"a": [1]}, {"$set": {"a.$": 9}}, False),  # positional -> defer
 ]
-
-
-def _norm_int_width(v):
-    """Coerce ``Int64`` → ``int`` recursively so parity comparisons ignore the
-    int32-vs-int64 BSON *subtype* while still catching every other divergence.
-
-    The pure-Python engine now follows mongod's numeric type promotion
-    (int32 < int64 < double < decimal128), so ``$inc`` / ``$mul`` over an
-    ``Int64`` field yields ``Int64``. The Rust update engine doesn't preserve
-    that yet — it narrows the *same value* back to int32 — so compare values,
-    not subtypes, until the Rust port catches up (or defers these cases). See
-    ``tasks/backlog.md``. Floats / Decimal128 / strings / etc. are untouched,
-    so a genuine type mismatch still fails the assertion.
-    """
-    if isinstance(v, Int64):
-        return int(v)
-    if isinstance(v, list):
-        return [_norm_int_width(x) for x in v]
-    if isinstance(v, dict):
-        return {k: _norm_int_width(x) for k, x in v.items()}
-    return v
 
 
 @pytest.mark.parametrize("doc,update,upsert", CURATED)
@@ -125,9 +188,10 @@ def test_curated_parity(doc, update, upsert):
     if rust is None:
         return  # fallback case — shim would run pure Python
     py = _pure.apply_update(doc, update, is_upsert=upsert)
-    assert _norm_int_width(bson.decode(rust)) == _norm_int_width(py), (
-        f"rust={bson.decode(rust)} pure={py} update={update}"
-    )
+    # The Rust update engine now follows mongod's numeric type promotion
+    # (int32 < int64 < double < decimal128) exactly like the pure-Python engine,
+    # so the BSON int32-vs-int64 subtype must match — compare values directly.
+    assert bson.decode(rust) == py, f"rust={bson.decode(rust)} pure={py} update={update}"
 
 
 def _rust_apply_with(doc, update, array_filters=None, positional_matches=None, is_upsert=False):
@@ -180,9 +244,7 @@ def test_array_filter_parity(doc, update, af, pos):
     if rust is None:
         return  # fallback — Python handles it
     py = _pure.apply_update(doc, update, array_filters=list(af), positional_matches=dict(pos))
-    assert _norm_int_width(bson.decode(rust)) == _norm_int_width(py), (
-        f"rust={bson.decode(rust)} pure={py} update={update} af={af}"
-    )
+    assert bson.decode(rust) == py, f"rust={bson.decode(rust)} pure={py} update={update} af={af}"
 
 
 def _rand_scalar(rng):
@@ -218,7 +280,23 @@ def _rand_doc(rng):
 
 
 def _rand_update(rng):
-    op = rng.choice(["$set", "$unset", "$inc", "$mul", "$push", "$pop", "$rename", "replace"])
+    op = rng.choice(
+        [
+            "$set",
+            "$unset",
+            "$inc",
+            "$mul",
+            "$push",
+            "$pop",
+            "$rename",
+            "$min",
+            "$max",
+            "$addToSet",
+            "$pull",
+            "$pullAll",
+            "replace",
+        ]
+    )
     field = rng.choice(["a", "b", "n", "a.x", "b.0"])
     if op == "replace":
         return {k: _rand_scalar(rng) for k in rng.sample(["p", "q", "r"], rng.randint(0, 3))}
@@ -228,7 +306,26 @@ def _rand_update(rng):
         return {op: {field: ""}}
     if op in ("$inc", "$mul"):
         return {op: {field: rng.choice([rng.randint(-5, 5), round(rng.uniform(-3, 3), 2)])}}
-    if op == "$push":
+    if op in ("$push", "$addToSet") and rng.random() < 0.4:
+        # $each modifier form (with occasional $position / $slice / $sort).
+        val = {"$each": [_rand_scalar(rng) for _ in range(rng.randint(0, 3))]}
+        if op == "$push":
+            if rng.random() < 0.4:
+                val["$position"] = rng.randint(-3, 4)
+            if rng.random() < 0.4:
+                val["$slice"] = rng.randint(-3, 4)
+            if rng.random() < 0.2:
+                val["$sort"] = rng.choice([1, -1])
+        return {op: {field: val}}
+    if op == "$pull" and rng.random() < 0.4:
+        # $pull with a query predicate criterion.
+        pred = rng.choice(
+            [{"$gte": rng.randint(-3, 3)}, {"$lt": rng.randint(-3, 3)}, {"$in": [1, 2, 3]}]
+        )
+        return {op: {field: pred}}
+    if op == "$pullAll":
+        return {op: {field: [_rand_scalar(rng) for _ in range(rng.randint(0, 3))]}}
+    if op in ("$push", "$min", "$max", "$addToSet", "$pull"):
         return {op: {field: _rand_scalar(rng)}}
     if op == "$pop":
         return {op: {field: rng.choice([1, -1])}}
@@ -247,7 +344,7 @@ def test_randomised_fuzz_parity():
             continue
         handled += 1
         py = _pure.apply_update(doc, update, is_upsert=upsert)
-        assert _norm_int_width(bson.decode(rust)) == _norm_int_width(py), (
+        assert bson.decode(rust) == py, (
             f"divergence: rust={bson.decode(rust)} pure={py} update={update} doc={doc}"
         )
     assert handled > 1000, f"expected many handled cases, only {handled}"
@@ -276,7 +373,5 @@ def test_batch_apply_parity():
             continue
         handled += 1
         py = [_pure.apply_update(d, update, is_upsert=upsert) for d in docs]
-        assert _norm_int_width(rust) == _norm_int_width(py), (
-            f"batch divergence: rust={rust} pure={py} update={update}"
-        )
+        assert rust == py, f"batch divergence: rust={rust} pure={py} update={update}"
     assert handled > 500, f"expected many handled batches, only {handled}"

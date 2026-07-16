@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 import secantus
+from secantus.admin import capabilities
 from secantus.admin.client import MongoFacade, display_uri
 from secantus.admin.embedded import EmbeddedServer
 from secantus.admin.history import HistoryStore
@@ -73,6 +74,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.sampler = sampler
     sampler.start()
+    # Probe the target once, off the event loop, to learn which admin
+    # features it supports (see secantus.admin.capabilities). Best-effort:
+    # an unreachable target leaves the permissive UNKNOWN default in place
+    # and a later target swap re-probes.
+    with suppress(Exception):
+        app.state.capabilities = await loop.run_in_executor(
+            None, capabilities.probe, app.state.mongo
+        )
     try:
         yield
     finally:
@@ -109,6 +118,10 @@ def create_app(
     # trailing query string. Templates read it via
     # ``request.app.state.mongo_uri_display``.
     app.state.mongo_uri_display = display_uri(mongo_uri)
+    # What the current target supports, for UI feature-gating. Starts as
+    # the permissive UNKNOWN set (nothing hidden); the lifespan startup
+    # probe and every target swap replace it with the real capabilities.
+    app.state.capabilities = capabilities.UNKNOWN
     app.state.templates_dir = _TEMPLATES_DIR
     # Token is exposed on app.state so WS handlers can verify it (the
     # HTTP middleware doesn't see WebSocket scopes, so per-route checks

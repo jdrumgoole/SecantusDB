@@ -17,6 +17,7 @@ Acceptance order per request (first match wins):
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import Awaitable, Callable
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -42,7 +43,14 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        path = request.url.path
+        # Use the ASGI-parsed request path (set by the server from the request
+        # line), NOT request.url.path. The latter is rebuilt from the Host
+        # header, which CVE-2026-48710 ("BadHost") showed can be spoofed with
+        # path separators (`Host: x/healthz?t=`) to make request.url.path
+        # return a bypass prefix and skip the token check. scope["path"] is
+        # immune to Host spoofing. (starlette>=1.0.1 also fixes the URL build;
+        # this is defence-in-depth.)
+        path = request.scope.get("path", request.url.path)
         if any(path == p or path.startswith(p) for p in _BYPASS_PREFIXES):
             return await call_next(request)
 
@@ -51,7 +59,12 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
             or request.headers.get(HEADER_NAME)
             or request.cookies.get(COOKIE_NAME)
         )
-        if presented != self._token:
+        # Constant-time compare so a timing side-channel can't narrow the token
+        # a byte at a time. `presented` may be absent; encode to bytes so a
+        # non-ASCII value can't make `compare_digest` raise. (#195)
+        if presented is None or not hmac.compare_digest(
+            presented.encode("utf-8"), self._token.encode("utf-8")
+        ):
             return JSONResponse(
                 {"error": "missing or invalid admin token"},
                 status_code=401,
@@ -96,7 +109,10 @@ def verify_websocket_token(
         presented = query_params.get(QUERY_NAME)
     if presented is None and hasattr(cookies, "get"):
         presented = cookies.get(COOKIE_NAME)
-    return presented == expected
+    # Constant-time compare (see the HTTP middleware). (#195)
+    if presented is None:
+        return False
+    return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
 
 
 __all__ = [

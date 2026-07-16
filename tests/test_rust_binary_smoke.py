@@ -25,7 +25,7 @@ import pytest
 pymongo = pytest.importorskip("pymongo")
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-_BANNER = re.compile(r"secantusdb listening on (\S+):(\d+)")
+_BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
 
 
 def _binary_path() -> pathlib.Path | None:
@@ -34,7 +34,7 @@ def _binary_path() -> pathlib.Path | None:
         p = pathlib.Path(env)
         return p if p.exists() else None
     for profile in ("debug", "release"):
-        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusdb"
+        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
         if sys.platform == "win32":
             p = p.with_suffix(".exe")
         if p.exists():

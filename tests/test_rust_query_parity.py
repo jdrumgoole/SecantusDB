@@ -27,6 +27,7 @@ import types
 import bson
 import pytest
 from bson import Decimal128, Int64, ObjectId, Regex
+from bson.code import Code
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -135,6 +136,13 @@ CURATED = [
     ({"a": {"b": {"c": 5}}}, {"a.b.c": 5}),
     ({"a": {"b": {"c": 5}}}, {"a.b.c": 6}),
     ({"tags": ["red", "blue", "green"]}, {"tags": "red"}),
+    # JS-Code equality — Rust now matches by value, like Python.
+    ({"f": Code("function () {}")}, {"f": Code("function () {}")}),
+    ({"f": Code("function () {}")}, {"f": Code("other")}),
+    ({"f": Code("c", {"a": 55})}, {"f": Code("c", {"a": 55})}),
+    # $all with regex elements matches array elements as patterns.
+    ({"k": ["serialization", "test", "x"]}, {"k": {"$all": [Regex("ser"), Regex("test")]}}),
+    ({"k": ["abc", "def"]}, {"k": {"$all": [Regex("zzz")]}}),
     # Embedded-document equality is order-sensitive + exact (Rust defers
     # on Document/Array expected values; Python is the oracle).
     ({"s": {"h": 14, "w": 21}}, {"s": {"h": 14, "w": 21}}),
@@ -151,6 +159,43 @@ CURATED = [
     ({"age": 30}, {"age": {"$gte": 30}}),
     ({"age": 30}, {"age": {"$lt": 31}}),
     ({"age": 30}, {"age": {"$lt": 30}}),
+    # Range operators against an array-valued (multikey) field: match when any
+    # element satisfies the bound; the array-as-a-whole is never compared to the
+    # scalar bound (an array out-ranks a number in BSON type order).
+    ({"dim": [14, 21]}, {"dim": {"$gt": 25}}),
+    ({"dim": [22.85, 30]}, {"dim": {"$gt": 25}}),
+    ({"dim": [10, 15.25]}, {"dim": {"$gt": 15, "$lt": 20}}),
+    ({"dim": [14, 21]}, {"dim": {"$lte": 14}}),
+    ({"dim": ["a", "z"]}, {"dim": {"$gt": "m"}}),
+    # Array-vs-array bound: whole-array lexicographic comparison, identical to
+    # Python's native `list < list` and to mongod. Pinned to the Python oracle.
+    ({"a": [1, 3]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, 2]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, 2, 3]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": 5}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [2]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, 3]}, {"a": {"$lt": [1, 3]}}),
+    ({"a": [1, 2]}, {"a": {"$lt": [1, 3]}}),
+    ({"a": [1, 2, 3]}, {"a": {"$lt": [1, 3]}}),
+    ({"a": [2]}, {"a": {"$lt": [1, 3]}}),
+    ({"a": [1, 3]}, {"a": {"$gte": [1, 2]}}),
+    ({"a": [1, 2]}, {"a": {"$gte": [1, 2]}}),
+    ({"a": [1, 2, 3]}, {"a": {"$gte": [1, 2]}}),
+    ({"a": [2]}, {"a": {"$gte": [1, 2]}}),
+    ({"a": [1, 2]}, {"a": {"$lte": [1, 2]}}),
+    # Prefix ordering: [1,2] < [1,2,3] (shorter sorts first).
+    ({"a": [1, 2]}, {"a": {"$lt": [1, 2, 3]}}),
+    ({"a": [1, 2, 3]}, {"a": {"$gt": [1, 2]}}),
+    # Cross-type element pair after equal leading elements -> no match (Python's
+    # `list < list` raises TypeError -> swallowed; Rust returns a clean False).
+    ({"a": [1, "x"]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, "x"]}, {"a": {"$lt": [1, 2]}}),
+    ({"a": [2, "x"]}, {"a": {"$gt": [1, 2]}}),  # decisive first pair 2>1
+    # Array field vs scalar bound still rides the multikey element path.
+    ({"a": [1, 3]}, {"a": {"$gt": 2}}),
+    ({"a": [1, 2]}, {"a": {"$gt": 2}}),
+    # Cross-type numeric elements (int vs double) compare by value, like Python.
+    ({"a": [1, 2.5]}, {"a": {"$gt": [1, 2]}}),
     ({"a": 2}, {"a": {"$in": [1, 2, 3]}}),
     ({"a": 4}, {"a": {"$in": [1, 2, 3]}}),
     ({"a": 4}, {"a": {"$nin": [1, 2, 3]}}),
@@ -192,6 +237,18 @@ CURATED = [
     ),
     ({"vals": [1, 5, 10]}, {"vals": {"$elemMatch": {"$gte": 3, "$lt": 7}}}),
     ({"vals": [1, 5, 10]}, {"vals": {"$elemMatch": {"$gte": 11}}}),
+    # Cross-type range against a document-valued field / a document bound:
+    # mongod's range operators are type-bracketed, so these never match. Python's
+    # native `<` on dicts raises TypeError (no match); the Rust matcher mirrors it
+    # with a clean no-match instead of a Fallback (was: deferred / Rust-server error).
+    ({"a": {"x": 1}}, {"a": {"$gt": 2}}),
+    ({"a": {"x": 1}}, {"a": {"$lt": 2}}),
+    ({"a": {"x": 1}}, {"a": {"$gte": 2}}),
+    ({"a": 2}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"x": 2}}, {"a": {"$gt": {"x": 1}}}),  # doc-vs-doc still no-match (dicts unorderable)
+    # $elemMatch: {$gt: n} over an array of sub-documents — the differential case.
+    ({"items": [{"k": 1}, {"k": 2}]}, {"items": {"$elemMatch": {"$gt": 2}}}),
+    ({"items": [{"k": 1}, {"k": 2}]}, {"items": {"$elemMatch": {"$lt": 2}}}),
     ({"a": 1}, {"a": 1, "$comment": "hi"}),
     ({"a": 2}, {"a": 1, "$comment": "hi"}),
     ({"flags": 0b1011}, {"flags": {"$bitsAllSet": 0b1010}}),
@@ -211,6 +268,23 @@ CURATED = [
     ({"x": True}, {"x": 1}),
     ({"x": 1}, {"x": True}),
     ({"x": False}, {"x": 0}),
+    # bool is its own range bracket ($gt/$lt/$gte/$lte): a bool compares only with
+    # another bool (True > False), never with a number or any other type — mongod
+    # brackets bool away from numbers, so all the bool-vs-number cases no-match.
+    ({"x": True}, {"x": {"$gt": 0}}),  # bool vs number -> no match
+    ({"x": True}, {"x": {"$lt": 1}}),  # bool vs number -> no match
+    ({"x": True}, {"x": {"$gte": 1}}),  # bool vs number -> no match
+    ({"x": False}, {"x": {"$lt": 1}}),  # bool vs number -> no match
+    ({"x": 5}, {"x": {"$gt": True}}),  # number vs bool bound -> no match
+    ({"x": 0}, {"x": {"$lt": True}}),  # number vs bool bound -> no match
+    ({"x": True}, {"x": {"$gt": False}}),  # bool vs bool -> True > False -> match
+    ({"x": False}, {"x": {"$gte": False}}),  # bool vs bool -> match
+    ({"x": False}, {"x": {"$gt": False}}),  # bool vs bool -> no match
+    ({"x": True}, {"x": {"$gt": Int64(0)}}),  # bool vs long -> no match
+    ({"x": True}, {"x": {"$gt": "a"}}),  # bool vs string -> no match
+    ({"x": True}, {"x": {"$gt": Decimal128("0.5")}}),  # bool vs decimal -> no match
+    ({"x": [True, False]}, {"x": {"$gt": 0}}),  # multikey bool elements vs number -> no match
+    ({"x": [True, False]}, {"x": {"$gt": False}}),  # multikey bool elements vs bool -> match
     ({"x": Decimal128("3.5")}, {"x": {"$gt": 2}}),
     ({"x": 3.5}, {"x": {"$gt": Decimal128("2")}}),
     ({"x": Decimal128("1.5")}, {"x": {"$gt": 2}}),
@@ -238,7 +312,22 @@ CURATED = [
     ({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}}),
     ({"tags": [1, 2, 3]}, {"tags": {"$all": [1.0, 2.0]}}),  # numeric bridge
     ({"tags": []}, {"tags": {"$all": []}}),
-    ({"tags": ["a", "b"]}, {"tags": {"$all": [Regex("^a")]}}),  # regex elem -> defer
+    ({"tags": ["a", "b"]}, {"tags": {"$all": [Regex("^a")]}}),  # regex elem (pattern match)
+    # $all with $elemMatch clauses — each clause needs some element to match.
+    ({"a": [1, 2, 3]}, {"a": {"$all": [{"$elemMatch": {"$gt": 1, "$lt": 3}}]}}),
+    ({"a": [4, 5]}, {"a": {"$all": [{"$elemMatch": {"$gt": 1, "$lt": 3}}]}}),  # no match
+    (
+        {"a": [1, 5, 10]},
+        {"a": {"$all": [{"$elemMatch": {"$gt": 4}}, {"$elemMatch": {"$lt": 2}}]}},
+    ),
+    ({"a": [1, 2, 3]}, {"a": {"$all": [2, {"$elemMatch": {"$gt": 2}}]}}),  # mixed
+    # $in / $nin with a regex candidate — matches string values by pattern.
+    ({"s": "hello"}, {"s": {"$in": [Regex("^h", "i")]}}),
+    ({"s": "World"}, {"s": {"$in": [Regex("^h", "i")]}}),  # no match
+    ({"s": "HELLO"}, {"s": {"$in": [Regex("^h", "i")]}}),  # case-insensitive
+    ({"s": "abc"}, {"s": {"$in": ["x", Regex("^a"), "y"]}}),  # mixed literal + regex
+    ({"s": "world"}, {"s": {"$nin": [Regex("^h")]}}),  # nin keeps non-matching
+    ({"s": "hello"}, {"s": {"$nin": [Regex("^h")]}}),  # nin excludes matching
     # --- regex ($regex/$options + bare BSON regex) — now handled in Rust ---
     ({"item": "paper"}, {"item": {"$regex": "^p"}}),
     ({"item": "journal"}, {"item": {"$regex": "^p"}}),
@@ -256,7 +345,16 @@ CURATED = [
     ({"x": "foobar"}, {"x": {"$regex": "o.b", "$options": "s"}}),
     ({"x": 5}, {"x": {"$regex": "5"}}),  # non-string value -> no match
     ({}, {"x": {"$regex": "anything"}}),  # missing field -> no match
-    ({"x": r"(a)\1"}, {"x": {"$regex": r"(a)\1"}}),  # backref pattern -> Rust defers
+    # backref / lookaround now compile via fancy-regex (linear engine can't),
+    # so Rust evaluates them instead of deferring — must match Python `re`.
+    ({"x": "aa"}, {"x": {"$regex": r"(a)\1"}}),  # backreference -> match
+    ({"x": r"(a)\1"}, {"x": {"$regex": r"(a)\1"}}),  # one 'a' -> no match
+    ({"x": "foobar"}, {"x": {"$regex": r"foo(?!baz)"}}),  # neg lookahead -> match
+    ({"x": "foobaz"}, {"x": {"$regex": r"foo(?!baz)"}}),  # neg lookahead -> no match
+    ({"x": "systemcoll"}, {"x": {"$regex": r"^(?!system\.)"}}),  # listColl filter -> match
+    ({"x": "system.foo"}, {"x": {"$regex": r"^(?!system\.)"}}),  # -> no match
+    ({"x": "Foobar"}, {"x": {"$regex": r"foo(?!baz)", "$options": "i"}}),  # flags + lookahead
+    ({"x": "xyzabc"}, {"x": {"$regex": r"(?<=xyz)abc"}}),  # lookbehind -> match
     # --- geo (slices geo-1 / geo-1b): point docs vs region/near queries ---
     # $geoWithin $box — point inside / outside.
     ({"loc": [5.0, 5.0]}, {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}}),
@@ -335,8 +433,180 @@ CURATED = [
             }
         },
     ),
-    # $center -> Rust returns None (Fallback to Python); curated test skips it.
+    # $geoWithin $center (planar disk) — in / out. Rust uses an exact disk and
+    # Python a Shapely 64-gon buffer; they agree away from the sub-degree boundary
+    # annulus, so these points sit well inside / outside.
     ({"loc": [1.0, 1.0]}, {"loc": {"$geoWithin": {"$center": [[0.0, 0.0], 5.0]}}}),
+    ({"loc": [40.0, 40.0]}, {"loc": {"$geoWithin": {"$center": [[0.0, 0.0], 5.0]}}}),
+    # $near legacy 2d sibling form ({$near: [x,y], $maxDistance, $minDistance}) —
+    # the shape Java's Filters.near builds. In / out of the planar bound.
+    ({"loc": [1.0, 1.0]}, {"loc": {"$near": [0.0, 0.0], "$maxDistance": 5.0}}),
+    ({"loc": [5.0, 5.0]}, {"loc": {"$near": [0.0, 0.0], "$maxDistance": 5.0}}),
+    ({"loc": [1.0, 1.0]}, {"loc": {"$near": [0.0, 0.0], "$maxDistance": 5.0, "$minDistance": 3.0}}),
+    # $nearSphere legacy sibling form ($maxDistance in radians on the unit sphere).
+    ({"loc": [0.0, 0.0]}, {"loc": {"$nearSphere": [0.0, 0.0], "$maxDistance": 0.1}}),
+    ({"loc": [10.0, 10.0]}, {"loc": {"$nearSphere": [0.0, 0.0], "$maxDistance": 0.1}}),
+    # $jsonSchema — the bounded keyword subset the pure server validates.
+    # bsonType (alias + numeric code + list), type (JSON type).
+    ({"name": "Joe"}, {"$jsonSchema": {"properties": {"name": {"bsonType": "string"}}}}),
+    ({"name": 5}, {"$jsonSchema": {"properties": {"name": {"bsonType": "string"}}}}),
+    ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"bsonType": ["int", "long"]}}}}),
+    ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"bsonType": 16}}}}),  # numeric code
+    ({"n": 5.0}, {"$jsonSchema": {"properties": {"n": {"type": "number"}}}}),
+    ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),
+    ({"n": 5.5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),  # double !integer
+    # required + top-level.
+    ({"a": 1, "b": 2}, {"$jsonSchema": {"required": ["a", "b"]}}),
+    ({"a": 1}, {"$jsonSchema": {"required": ["a", "b"]}}),  # missing b -> False
+    ({"a": 1}, {"$jsonSchema": {"bsonType": "object", "required": ["a"]}}),
+    # numeric bounds (min/max/exclusive) — only apply to numeric values.
+    ({"age": 30}, {"$jsonSchema": {"properties": {"age": {"minimum": 0, "maximum": 120}}}}),
+    ({"age": -1}, {"$jsonSchema": {"properties": {"age": {"minimum": 0}}}}),  # below min
+    ({"age": 5}, {"$jsonSchema": {"properties": {"age": {"exclusiveMinimum": 5}}}}),  # == excl
+    ({"age": 5}, {"$jsonSchema": {"properties": {"age": {"exclusiveMaximum": 10}}}}),
+    # string length + pattern.
+    ({"s": "abc"}, {"$jsonSchema": {"properties": {"s": {"minLength": 2, "maxLength": 4}}}}),
+    ({"s": "a"}, {"$jsonSchema": {"properties": {"s": {"minLength": 2}}}}),  # too short
+    ({"s": "hello"}, {"$jsonSchema": {"properties": {"s": {"pattern": "^h"}}}}),
+    ({"s": "world"}, {"$jsonSchema": {"properties": {"s": {"pattern": "^h"}}}}),  # no match
+    # array items + counts.
+    ({"xs": [1, 2, 3]}, {"$jsonSchema": {"properties": {"xs": {"minItems": 2, "maxItems": 5}}}}),
+    ({"xs": [1]}, {"$jsonSchema": {"properties": {"xs": {"minItems": 2}}}}),  # too few
+    ({"xs": [1, 2]}, {"$jsonSchema": {"properties": {"xs": {"items": {"bsonType": "int"}}}}}),
+    ({"xs": [1, "x"]}, {"$jsonSchema": {"properties": {"xs": {"items": {"bsonType": "int"}}}}}),
+    # uniqueItems — distinct scalars pass; a duplicate (incl. cross-type-equal
+    # numeric 1 == 1.0 at top level) or duplicate documents fail; false is a no-op.
+    ({"xs": [1, 2, 3]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [1, 2, 2]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [1, 1.0]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": ["a", "b", "a"]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [{"a": 1}, {"a": 2}]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [{"a": 1}, {"a": 1}]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    # nested cross-type-equal numerics collide recursively ({a:1} == {a:1.0}).
+    (
+        {"xs": [{"a": 1}, {"a": 1.0}]},
+        {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}},
+    ),
+    ({"xs": [[1, 2], [1.0, 2.0]]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [[1, 2], [1, 3]]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": True}}}}),
+    ({"xs": [1, 1]}, {"$jsonSchema": {"properties": {"xs": {"uniqueItems": False}}}}),
+    # enum.
+    ({"c": "red"}, {"$jsonSchema": {"properties": {"c": {"enum": ["red", "green"]}}}}),
+    ({"c": "blue"}, {"$jsonSchema": {"properties": {"c": {"enum": ["red", "green"]}}}}),
+    # object property counts.
+    ({"o": {"a": 1, "b": 2}}, {"$jsonSchema": {"properties": {"o": {"maxProperties": 3}}}}),
+    ({"o": {"a": 1, "b": 2}}, {"$jsonSchema": {"properties": {"o": {"minProperties": 3}}}}),
+    # nested: properties within properties + required.
+    (
+        {"user": {"name": "Al", "age": 3}},
+        {
+            "$jsonSchema": {
+                "properties": {
+                    "user": {
+                        "bsonType": "object",
+                        "required": ["name"],
+                        "properties": {"age": {"minimum": 0}},
+                    }
+                }
+            }
+        },
+    ),
+    # allOf — all sub-schemas must hold.
+    (
+        {"n": 5},
+        {"$jsonSchema": {"properties": {"n": {"allOf": [{"bsonType": "int"}, {"minimum": 0}]}}}},
+    ),
+    (
+        {"n": -1},
+        {"$jsonSchema": {"properties": {"n": {"allOf": [{"bsonType": "int"}, {"minimum": 0}]}}}},
+    ),
+    # anyOf — at least one.
+    (
+        {"x": "s"},
+        {
+            "$jsonSchema": {
+                "properties": {"x": {"anyOf": [{"bsonType": "string"}, {"bsonType": "int"}]}}
+            }
+        },
+    ),
+    (
+        {"x": 1.5},
+        {
+            "$jsonSchema": {
+                "properties": {"x": {"anyOf": [{"bsonType": "string"}, {"bsonType": "int"}]}}
+            }
+        },
+    ),
+    # oneOf — exactly one (both bounds match -> fail).
+    (
+        {"n": 5},
+        {"$jsonSchema": {"properties": {"n": {"oneOf": [{"minimum": 0}, {"bsonType": "string"}]}}}},
+    ),
+    (
+        {"n": 5},
+        {"$jsonSchema": {"properties": {"n": {"oneOf": [{"minimum": 0}, {"maximum": 10}]}}}},
+    ),
+    # not — must NOT match.
+    ({"x": "s"}, {"$jsonSchema": {"properties": {"x": {"not": {"bsonType": "int"}}}}}),
+    ({"x": 5}, {"$jsonSchema": {"properties": {"x": {"not": {"bsonType": "int"}}}}}),
+    # additionalProperties: false forbids extras; true / schema allow.
+    ({"a": 1}, {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": False}}),
+    ({"a": 1, "b": 2}, {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": False}}),
+    ({"a": 1, "b": 2}, {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": True}}),
+    (
+        {"a": 1, "b": "x"},
+        {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": {"bsonType": "string"}}},
+    ),
+    (
+        {"a": 1, "b": 2},
+        {"$jsonSchema": {"properties": {"a": {}}, "additionalProperties": {"bsonType": "string"}}},
+    ),
+    # top-level combinator over the whole document.
+    ({"t": "x"}, {"$jsonSchema": {"anyOf": [{"required": ["t"]}, {"required": ["u"]}]}}),
+    # patternProperties — keys matching the regex validate against the sub-schema.
+    ({"s_a": "x", "n": 5}, {"$jsonSchema": {"patternProperties": {"^s_": {"bsonType": "string"}}}}),
+    ({"s_a": 5}, {"$jsonSchema": {"patternProperties": {"^s_": {"bsonType": "string"}}}}),
+    # additionalProperties: false with patternProperties allowing s_* keys.
+    (
+        {"id": 1, "s_x": 2},
+        {
+            "$jsonSchema": {
+                "properties": {"id": {}},
+                "patternProperties": {"^s_": {}},
+                "additionalProperties": False,
+            }
+        },
+    ),
+    (
+        {"id": 1, "other": 2},
+        {
+            "$jsonSchema": {
+                "properties": {"id": {}},
+                "patternProperties": {"^s_": {}},
+                "additionalProperties": False,
+            }
+        },
+    ),
+    # dependencies — property (list) form and schema form.
+    ({"card": 1, "billing": 2}, {"$jsonSchema": {"dependencies": {"card": ["billing"]}}}),
+    ({"card": 1}, {"$jsonSchema": {"dependencies": {"card": ["billing"]}}}),
+    ({"x": 1}, {"$jsonSchema": {"dependencies": {"card": ["billing"]}}}),  # trigger absent -> ok
+    (
+        {"a": 1, "b": 2},
+        {
+            "$jsonSchema": {
+                "dependencies": {"a": {"required": ["b"], "properties": {"b": {"bsonType": "int"}}}}
+            }
+        },
+    ),
+    (
+        {"a": 1, "b": "x"},
+        {
+            "$jsonSchema": {
+                "dependencies": {"a": {"required": ["b"], "properties": {"b": {"bsonType": "int"}}}}
+            }
+        },
+    ),
 ]
 
 

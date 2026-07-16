@@ -31,11 +31,14 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_packages import INCLUDE, SKIP_PATTERNS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-go-driver"
-RAW_OUT = REPO_ROOT / ".validation" / "go-raw.ndjson"
+# Per-server raw-output path so a Rust-server run doesn't clobber the Python one.
+RAW_OUT = REPO_ROOT / ".validation" / f"go-raw{gauge_common.report_suffix()}.ndjson"
 
 
 def _pick_ephemeral_port() -> int:
@@ -113,7 +116,6 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-go-gauge-")
     print(
         f"go_validation: storage tempdir {storage_dir} (will be cleaned up)",
@@ -126,7 +128,7 @@ def main() -> int:
         "--host",
         host,
         "--port",
-        str(port),
+        "0",
         "--storage-path",
         storage_dir,
         "--log-level",
@@ -139,14 +141,28 @@ def main() -> int:
         "--noop-heartbeat-seconds",
         "10",
     ]
-    print(f"go_validation: starting daemon on {host}:{port}", file=sys.stderr)
-    daemon = subprocess.Popen(daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    # Spawn on a kernel-assigned port and read it back (race-free; see
+    # gauge_common.spawn_daemon). Targets the Python or Rust server per
+    # SECANTUS_GAUGE_SERVER.
+    daemon, host, port = gauge_common.spawn_daemon(daemon_cmd, label="go_validation")
+    print(
+        f"go_validation: started {gauge_common.gauge_server()} daemon on {host}:{port}",
+        file=sys.stderr,
+    )
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "go_validation")
 
         env = os.environ.copy()
-        env["MONGODB_URI"] = f"mongodb://{host}:{port}"
+        # serverSelectionTimeoutMS is bumped from the driver's 30s default to
+        # 60s. Under `validate-all`'s multi-gauge CPU / socket-buffer
+        # contention the daemon can briefly miss a heartbeat, and
+        # `TestIndexView/drop_one` / `drop_all` then trip the 30s
+        # server-selection deadline mid-test (`context deadline exceeded`,
+        # topology `Type: Unknown`) — a documented flake, not a server bug
+        # (tasks/backlog.md). The longer floor rides out the transient blip; a
+        # genuinely unreachable daemon still fails well inside the 30m package
+        # timeout.
+        env["MONGODB_URI"] = f"mongodb://{host}:{port}/?serverSelectionTimeoutMS=60000"
         env.setdefault("REQUIRE_API_VERSION", "false")
 
         # Default Go per-package timeout is 10 min. The mongo-go-driver

@@ -31,11 +31,13 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_paths import INCLUDE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-php-library"
-JUNIT_OUT = REPO_ROOT / ".validation" / "php-lib-junit.xml"
+JUNIT_OUT = REPO_ROOT / ".validation" / f"php-lib-junit{gauge_common.report_suffix()}.xml"
 
 # Hard wall-clock limit on the phpunit invocation. A single test that waits
 # on a server behaviour SecantusDB doesn't emulate the way the library
@@ -67,9 +69,7 @@ def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
 def _resolve_php_bins() -> tuple[str, str] | None:
     """Locate ``php`` and ``composer`` on PATH (or Homebrew). Returns
     ``(php, composer)`` or ``None`` if either is missing."""
-    php = shutil.which("php") or _first_existing(
-        ["/opt/homebrew/bin/php", "/usr/local/bin/php"]
-    )
+    php = shutil.which("php") or _first_existing(["/opt/homebrew/bin/php", "/usr/local/bin/php"])
     composer = shutil.which("composer") or _first_existing(
         ["/opt/homebrew/bin/composer", "/usr/local/bin/composer"]
     )
@@ -175,26 +175,30 @@ def main() -> int:
     JUNIT_OUT.unlink(missing_ok=True)
 
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-php-lib-gauge-")
+    # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+    daemon, host, port = gauge_common.spawn_daemon(
+        [
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            host,
+            "--port",
+            "0",
+            "--storage-path",
+            storage_dir,
+            "--log-level",
+            "WARNING",
+        ],
+        label="php_lib_validation",
+    )
     print(
-        f"php_lib_validation: starting daemon on {host}:{port} "
+        f"php_lib_validation: started daemon on {host}:{port} "
         f"(storage {storage_dir}, will be cleaned up)",
         file=sys.stderr,
     )
-
-    daemon = subprocess.Popen(
-        [
-            sys.executable, "-m", "secantus",
-            "--host", host, "--port", str(port),
-            "--storage-path", storage_dir,
-            "--log-level", "WARNING",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "php_lib_validation")
 
         env = os.environ.copy()
@@ -205,8 +209,7 @@ def main() -> int:
         phpunit = str(VENDOR / "vendor" / "bin" / "phpunit")
         cmd = [php_bin, phpunit, "--log-junit", str(JUNIT_OUT), *INCLUDE]
         print(
-            f"php_lib_validation: `{' '.join(cmd)}` in {VENDOR} "
-            f"(MONGODB_URI={env['MONGODB_URI']})",
+            f"php_lib_validation: `{' '.join(cmd)}` in {VENDOR} (MONGODB_URI={env['MONGODB_URI']})",
             file=sys.stderr,
         )
         try:

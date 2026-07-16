@@ -25,3 +25,19 @@
 [submodule "vendor/mongo-php-driver"]
 	path = vendor/mongo-php-driver
 	url = https://github.com/mongodb/mongo-php-driver.git
+[submodule "vendor/mongo-c-driver"]
+	path = vendor/mongo-c-driver
+	url = https://github.com/mongodb/mongo-c-driver.git
+[submodule "vendor/mongo-cxx-driver"]
+	path = vendor/mongo-cxx-driver
+	url = https://github.com/mongodb/mongo-cxx-driver.git
+[submodule "vendor/mongo-csharp-driver"]
+	path = vendor/mongo-csharp-driver
+	url = https://github.com/mongodb/mongo-csharp-driver.git
+[submodule "vendor/psycopg"]
+	path = vendor/psycopg
+	url = https://github.com/psycopg/psycopg
+[submodule "vendor/sqllogictest"]
+	path = vendor/sqllogictest
+	url = https://github.com/gregrahn/sqllogictest.git
+	shallow = true

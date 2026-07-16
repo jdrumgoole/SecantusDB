@@ -1,0 +1,66 @@
+name: Security Review
+
+# Nightly automated security review of the whole repo (both servers).
+# Runs the prompt in scripts/security-review-prompt.md via Claude Code,
+# writes a dated report under docs/security-reports/, self-merges the
+# docs-only report PR, and files `security`-labelled issues for any
+# CRITICAL / WARNING findings. Mirrors the regstack process.
+
+on:
+  schedule:
+    # 06:26 UTC nightly (off the :00/:30 marks to avoid the fleet pileup).
+    # GitHub Actions cron is always UTC.
+    - cron: '26 6 * * *'
+  # Manual trigger for testing / on-demand reviews.
+  workflow_dispatch: {}
+
+# Least privilege that still lets the agent land the report PR and file
+# issues. Note: a docs-only report PR (docs/security-reports/**) matches the
+# test/wheel workflows' paths-ignore, so it has no required checks and can
+# squash-merge immediately.
+permissions:
+  contents: write # commit + push the security-review/* branch
+  pull-requests: write # open and squash-merge the report PR
+  issues: write # file `security` issues for CRITICAL/WARNING findings
+  actions: read
+  # No id-token: write — the review authenticates via CLAUDE_CODE_OAUTH_TOKEN
+  # and gh (contents/PR/issues), never OIDC. Dropping it keeps the token
+  # least-privileged. (security review 2026-06-30 §I6)
+
+concurrency:
+  group: security-review
+  cancel-in-progress: false
+
+jobs:
+  security-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # Full history so the git-history / accidentally-committed-secrets
+          # sections (§11) have something to walk.
+          fetch-depth: 0
+          # Don't fetch the heavy vendored submodules (WiredTiger source,
+          # the driver test trees); the review reads them from the gitlink
+          # refs and pyproject, and doesn't need the full checkout.
+          submodules: false
+
+      - name: Run nightly security review
+        uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342  # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The whole procedure (review → dated report → self-merging PR →
+          # security issues) lives in the prompt file so it's version-
+          # controlled and editable without touching this workflow.
+          prompt: |
+            Read scripts/security-review-prompt.md and follow it exactly, end to end:
+            perform the full security review of this repository, write the dated report
+            to docs/security-reports/YYYY-MM-DD.md, open and squash-merge the docs-only
+            report PR (leaving no branch or open PR behind), and file a `security`-labelled
+            GitHub issue for each CRITICAL or WARNING finding. Do NOT fix any findings in
+            this run — review, document, and file issues only.
+          # Allow the tools the procedure needs: shell (git/gh/uv), file
+          # read/write for the report, and web access for CVE lookups.
+          claude_args: '--allowed-tools "Bash,Read,Grep,Glob,Write,Edit,WebSearch,WebFetch"'

@@ -142,6 +142,59 @@ pub fn compute_update_description(pre: &Document, post: &Document) -> R<Document
     Ok(out)
 }
 
+/// Apply a `$v: 2` `updateDescription` (`{updatedFields, removedFields,
+/// truncatedArrays}`) to `doc`, returning the post-image. The inverse of
+/// [`compute_update_description`] and the keystone of oplog replay (PITR): it
+/// rolls a document forward without re-running the original update operators.
+/// Mirrors `secantus.diff.apply_update_description`.
+///
+/// `disambiguatedPaths` is intentionally not consulted — every path is applied
+/// against the real pre-image, whose container types (map vs array) already
+/// resolve the numeric-key vs array-index ambiguity that field exists to flag
+/// for a blind reader. Order matches Python: updates, then removals, then array
+/// truncations.
+pub fn apply_update_description(mut doc: Document, diff: &Document) -> R<Document> {
+    if let Ok(updated) = diff.get_document("updatedFields") {
+        for (path, value) in updated {
+            crate::paths::set_path(&mut doc, path.as_str(), value.clone()).map_err(|_| Fallback)?;
+        }
+    }
+    if let Ok(removed) = diff.get_array("removedFields") {
+        for p in removed {
+            if let Bson::String(path) = p {
+                crate::paths::unset_path(&mut doc, path);
+            }
+        }
+    }
+    if let Ok(truncated) = diff.get_array("truncatedArrays") {
+        for entry in truncated {
+            let Bson::Document(e) = entry else { continue };
+            let Ok(field) = e.get_str("field") else {
+                continue;
+            };
+            let new_size = e
+                .get_i32("newSize")
+                .map(|n| n as usize)
+                .or_else(|_| e.get_i64("newSize").map(|n| n as usize));
+            let Ok(new_size) = new_size else { continue };
+            // Clone-truncate-set: release the immutable `get_path` borrow before
+            // the mutable `set_path`.
+            let shorter = match crate::paths::get_path(&doc, field) {
+                Some(Bson::Array(arr)) if new_size < arr.len() => {
+                    let mut a = arr.clone();
+                    a.truncate(new_size);
+                    Some(a)
+                }
+                _ => None,
+            };
+            if let Some(a) = shorter {
+                crate::paths::set_path(&mut doc, field, Bson::Array(a)).map_err(|_| Fallback)?;
+            }
+        }
+    }
+    Ok(doc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +248,28 @@ mod tests {
             out.get_document("updatedFields").unwrap(),
             &doc! {"a": [1, 2, 3]}
         );
+    }
+
+    /// `apply_update_description` is the exact inverse of `compute`: rolling the
+    /// pre-image forward by the computed diff reproduces the post-image. Covers
+    /// scalar change, nested add, field removal, and array truncation in one go.
+    #[test]
+    fn apply_inverts_compute() {
+        let cases = [
+            (doc! {"a": 1}, doc! {"a": 2}),
+            (doc! {"a": 1, "b": 2}, doc! {"a": 1}), // removal
+            (doc! {"a": {"b": 1}}, doc! {"a": {"b": 1, "c": 9}}), // nested add
+            (doc! {"a": [1, 2, 3]}, doc! {"a": [1, 9]}), // truncate + change
+            (doc! {"a": [1, 2]}, doc! {"a": [1, 2, 3]}), // growth
+            (
+                doc! {"x": 1, "y": [1, 2, 3], "z": {"d": 5}, "gone": true},
+                doc! {"x": 2, "y": [1, 9], "z": {"d": 5, "e": 7}},
+            ),
+        ];
+        for (pre, post) in cases {
+            let diff = compute_update_description(&pre, &post).expect("compute");
+            let rolled = apply_update_description(pre.clone(), &diff).expect("apply");
+            assert_eq!(rolled, post, "roundtrip failed for pre={pre:?}");
+        }
     }
 }

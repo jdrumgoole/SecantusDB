@@ -30,6 +30,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from secantus.paths import get_path, set_path, unset_path
+
 
 def _record_ambiguous(path: str, segments: list[Any], disambiguated: dict[str, list[Any]]) -> None:
     """mongod 6.1+ ``disambiguatedPaths``: any reported path containing a
@@ -134,3 +136,35 @@ def compute_update_description(pre: Mapping[str, Any], post: Mapping[str, Any]) 
         # use $$unsetOrMatches — absence is valid when unambiguous).
         out["disambiguatedPaths"] = disambiguated
     return out
+
+
+def apply_update_description(doc: dict[str, Any], diff: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply a ``$v: 2`` ``updateDescription`` to ``doc`` in place; return ``doc``.
+
+    This is the inverse of :func:`compute_update_description`: given the
+    pre-image ``doc`` and the ``{updatedFields, removedFields, truncatedArrays}``
+    payload stored under an oplog update's ``o.diff``, it reconstructs the
+    post-image. Used by oplog replay (point-in-time recovery) to roll a
+    document forward without re-running the original update operators.
+
+    ``disambiguatedPaths`` is intentionally not consulted: every path is
+    applied against the real pre-image, so the runtime type of each parent
+    container (``dict`` vs ``list``) already resolves the numeric-key vs
+    array-index ambiguity that field exists to flag for a blind reader. The
+    dotted-path helpers key off that container type, matching how the original
+    update wrote the value.
+
+    Order matters: ``updatedFields`` (which only ever target indices below an
+    array's new length) are written first, then ``removedFields`` are unset,
+    then ``truncatedArrays`` shorten any arrays last.
+    """
+    for path, value in (diff.get("updatedFields") or {}).items():
+        set_path(doc, path, value)
+    for path in diff.get("removedFields") or []:
+        unset_path(doc, path)
+    for entry in diff.get("truncatedArrays") or []:
+        arr = get_path(doc, entry["field"])
+        new_size = entry["newSize"]
+        if isinstance(arr, list) and new_size < len(arr):
+            del arr[new_size:]
+    return doc

@@ -6,6 +6,65 @@ from bson import Int64
 from secantus.aggregate import AggregateError, apply_pipeline
 
 
+def test_push_addtoset_skip_missing_field() -> None:
+    """$push / $addToSet skip a MISSING field value (mongod semantics) but keep an
+    explicit null; an all-missing field still produces []."""
+    docs = [{"s": "x"}, {}, {"s": None}, {"s": "x"}]
+    out = apply_pipeline(docs, [{"$group": {"_id": None, "p": {"$push": "$s"}}}])
+    assert out[0]["p"] == ["x", None, "x"]  # missing skipped, null kept
+    out2 = apply_pipeline(docs, [{"$group": {"_id": None, "v": {"$addToSet": "$s"}}}])
+    assert sorted(x for x in out2[0]["v"] if x is not None) == ["x"]
+    assert None in out2[0]["v"]  # explicit null retained
+    # All-missing field -> [] (not [null, ...]).
+    out3 = apply_pipeline([{}, {}], [{"$group": {"_id": None, "p": {"$push": "$gone"}}}])
+    assert out3[0]["p"] == []
+
+
+def test_group_merge_objects_accumulator() -> None:
+    """$mergeObjects as a $group accumulator merges each operand doc across the
+    group (later keys override earlier); null/missing operands are skipped; an
+    all-missing/null group yields {}; a non-null non-document operand errors."""
+    docs = [
+        {"g": 1, "sub": {"a": 1, "b": 1}},
+        {"g": 1, "sub": {"b": 2, "c": 3}},  # b overrides, c adds
+        {"g": 1},  # missing -> skipped
+        {"g": 1, "sub": None},  # null -> skipped
+    ]
+    out = apply_pipeline(docs, [{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}])
+    assert out == [{"_id": 1, "m": {"a": 1, "b": 2, "c": 3}}]
+
+    # A group where every operand is missing/null yields {} (empty doc), present.
+    out2 = apply_pipeline(
+        [{"g": 2}, {"g": 2, "sub": None}],
+        [{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}],
+    )
+    assert out2 == [{"_id": 2, "m": {}}]
+
+    # Non-null, non-document operand is an error (mongod Location 40400).
+    with pytest.raises(AggregateError):
+        apply_pipeline(
+            [{"g": 3, "sub": 5}],
+            [{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}],
+        )
+
+    # $mergeObjects is $group-only: mongod rejects it as a $setWindowFields
+    # window function (FailedToParse, code 9) — verified three-way vs mongod 6.0.
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline(
+            [{"g": 1, "sub": {"a": 1}}],
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"g": 1},
+                        "output": {"m": {"$mergeObjects": "$sub"}},
+                    }
+                }
+            ],
+        )
+    assert exc.value.code == 9
+
+
 def test_group_sum_preserves_int64_type() -> None:
     """$sum over Int64 values stays Int64 (mongod widens int32 < int64),
     not a bare int that narrows to int32 on the wire."""
@@ -173,6 +232,23 @@ def test_pipeline_chain_match_sort_project_limit() -> None:
 def test_unsupported_stage_raises() -> None:
     with pytest.raises(AggregateError):
         apply_pipeline([{"x": 1}], [{"$bogusStage": {}}])
+
+
+def test_atlas_only_stage_rejected_with_atlas_message() -> None:
+    # Atlas-only stages ($listSearchIndexes / $search / $searchMeta /
+    # $vectorSearch) are rejected with a message naming Atlas and code 115,
+    # not the generic 40324 "unrecognized stage" — drivers' index-management
+    # spec tests assert errorContains "Atlas".
+    from secantus.aggregate import validate_stage_names
+
+    for stage in ("$listSearchIndexes", "$search", "$searchMeta", "$vectorSearch"):
+        with pytest.raises(AggregateError, match="Atlas") as exc:
+            apply_pipeline([{"x": 1}], [{stage: {}}])
+        assert exc.value.code == 115
+        assert exc.value.code_name == "CommandNotSupported"
+        # Also rejected up-front at parse time (before any document flows).
+        with pytest.raises(AggregateError, match="Atlas"):
+            validate_stage_names([{stage: {}}])
 
 
 def test_project_mixed_inclusion_exclusion_rejected() -> None:

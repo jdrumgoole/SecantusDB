@@ -1,6 +1,6 @@
 [package]
 name = "secantusdb"
-version = "0.5.3-beta.21"
+version = "0.5.3-beta.147"
 edition = "2021"
 description = "Standalone SecantusDB server binary (Rust): WiredTiger-backed, MongoDB wire protocol."
 license = "GPL-2.0-only"
@@ -17,13 +17,20 @@ publish = false
 # into the parent `crates` workspace, matching secantus-storage-adapter.
 [workspace]
 
+# Binary name follows the `secantusd-<engine>` daemon scheme so the compiled
+# Rust server is distinguishable from the Python one (`secantusd-py`). The Cargo
+# package stays `secantusdb`; only the emitted binary is `secantusd-rs`.
 [[bin]]
-name = "secantusdb"
+name = "secantusd-rs"
 path = "src/main.rs"
 
 [dependencies]
+bson = "2"
 ctrlc = { version = "3", features = ["termination"] }
 secantus-storage = { path = "../secantus-storage" }
 secantus-storage-adapter = { path = "../secantus-storage-adapter" }
 secantus-commands = { path = "../secantus-commands" }
 secantus-server = { path = "../secantus-server" }
+# --log-level: init a logger to the resolved level before storage opens.
+log = "0.4"
+env_logger = "0.11"

@@ -1,0 +1,218 @@
+# Release the standalone `secantusdb` Rust server binary (R7) as prebuilt,
+# static-WiredTiger archives attached to a GitHub Release.
+#
+# WHY this shape:
+#   * `secantusdb` statically links WiredTiger (`secantus-wt/build.rs` emits
+#     `rustc-link-lib=static=wiredtiger`), so the only dynamic dependency left is
+#     libc. That makes a single self-contained binary per target — no `cmake` /
+#     `ninja` / `swig` / WT on the user's machine, matching the project's wheel
+#     promise.
+#   * The vendored WiredTiger static lib is produced by the SAME path CI already
+#     proves green in the `storage-engine` job: build the `secantus` wheel with
+#     `SECANTUS_BUILD_STORAGE_ENGINE=ON`, which runs the patched CMake build and
+#     drops `libwiredtiger.a` + headers under `build/*/wt-build`. The binary then
+#     links it via `SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB`. Reusing that path
+#     (rather than a bespoke WT build) keeps the cmake/*.py patches in force.
+#
+# TAG SCHEME — deliberately distinct from the PyPI publish trigger:
+#   publish.yml fires on `vX.Y.Z` / `vX.Y.ZbN` (the Python package). The Rust
+#   server versions independently (`crates/*/Cargo.toml`, e.g. `0.5.3-beta.21`),
+#   so its binary releases tag as `secantusdb-v<crate-version>` — which does NOT
+#   match publish.yml's `v[0-9]+...` patterns, so the two never collide.
+#     git tag secantusdb-v0.5.3-beta.21 && git push origin secantusdb-v0.5.3-beta.21
+#
+# SCOPE (v1): the two targets CI already builds + smokes (x86_64 glibc Linux,
+# arm64 macOS). The Linux binary's glibc floor is the build runner's glibc
+# (ubuntu-22.04 ⇒ glibc 2.35), fine for modern CI/dev distros. Broader-reach
+# targets are listed as follow-ons at the bottom with their blockers (musl-static
+# for an any-distro Linux binary; aarch64 Linux; Windows — blocked on the MSVC WT
+# static-lib gap, tasks/backlog.md §7).
+
+name: Release secantusdb binary
+
+on:
+  push:
+    tags:
+      - "secantusdb-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing secantusdb-v* tag to (re)build binaries for"
+        required: true
+
+permissions:
+  contents: write # create / upload assets to the GitHub Release
+
+concurrency:
+  group: release-binaries-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            os: linux
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            os: macos
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # The vendored WiredTiger lives in a submodule — without it the wheel
+          # build (and thus the static lib) can't be produced.
+          submodules: recursive
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag + assert it matches the crate version
+        shell: bash
+        # Pass the workflow_dispatch input through the environment rather than
+        # expanding ${{ github.event.inputs.tag }} inline into the script — an
+        # env var is a value the shell reads, so a tag containing shell
+        # metacharacters can't be interpolated into the run block (Actions
+        # script-injection hygiene). github.event_name below is a GitHub-set
+        # enum, not user input, so it stays inline. (security review §I19)
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${INPUT_TAG}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          ver="${tag#secantusdb-v}"
+          crate=$(grep -m1 '^version' crates/secantusdb/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$ver" != "$crate" ]; then
+            echo "::error::tag version ($ver) != crates/secantusdb Cargo.toml version ($crate)"
+            exit 1
+          fi
+          {
+            echo "TAG=$tag"
+            echo "VERSION=$ver"
+          } >> "$GITHUB_ENV"
+
+      # WiredTiger build prerequisites — same set as the `storage-engine` job.
+      # bindgen needs libclang; the WT ExternalProject forces Ninja; swig builds
+      # WT's (unused-here) Python module that its CMake still configures.
+      - name: Install toolchain (Linux)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+
+      - name: Install toolchain (macOS)
+        if: matrix.os == 'macos'
+        run: brew install swig ninja
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Build vendored WiredTiger (static) via the storage-engine wheel build
+        # scikit-build-core forwards SKBUILD_CMAKE_DEFINE as a -D define, flipping
+        # the storage-engine CMake option ON for this build only. Side effect we
+        # want: libwiredtiger.a + include/wiredtiger.h under build/*/wt-build.
+        env:
+          SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
+        run: uv build --wheel --out-dir dist-storage
+
+      - name: Build the static-WiredTiger secantusdb binary
+        shell: bash
+        run: |
+          wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+          if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ]; then
+            echo "::error::vendored WiredTiger not found under build/*/wt-build"
+            exit 1
+          fi
+          export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
+          cargo build --release --locked --target ${{ matrix.target }} \
+            --manifest-path crates/secantusdb/Cargo.toml
+          bin="crates/secantusdb/target/${{ matrix.target }}/release/secantusd-rs"
+          strip "$bin" || true
+          echo "BIN=$bin" >> "$GITHUB_ENV"
+          "$bin" --version
+
+      - name: Smoke the release binary (pymongo → secantusdb → WiredTiger)
+        # SECANTUSDB_BIN points the smoke test at the exact artifact we ship,
+        # not a freshly-rebuilt debug binary.
+        shell: bash
+        env:
+          SECANTUSDB_BIN: ${{ env.BIN }}
+        run: >-
+          uv run --no-project --with pymongo --with pytest
+          python -m pytest tests/test_rust_binary_smoke.py
+          -o addopts= -p no:cacheprovider -q
+
+      - name: Package the archive + checksum
+        shell: bash
+        run: |
+          stem="secantusdb-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$stem"
+          # Ship the binary as `secantusd-rs`, matching the command name the
+          # wheel installs (the pure-Python `secantusd-py` is a different program).
+          cp "$BIN" "$stem/secantusd-rs"
+          cp LICENSE README.md "$stem/"
+          tar -czf "$stem.tar.gz" "$stem"
+          shasum -a 256 "$stem.tar.gz" > "$stem.tar.gz.sha256"
+          ls -l "$stem.tar.gz" "$stem.tar.gz.sha256"
+
+      # Keep the artifacts on the run too, so a workflow_dispatch dry-run can be
+      # inspected without (or before) touching a Release.
+      - name: Upload run artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: secantusdb-${{ matrix.target }}
+          path: |
+            secantusdb-*.tar.gz
+            secantusdb-*.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Attach to the GitHub Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3.0.1
+        with:
+          tag_name: ${{ env.TAG }}
+          # A SemVer pre-release (the `-beta.N` suffix has a hyphen) ⇒ mark the
+          # Release as a pre-release.
+          prerelease: ${{ contains(env.VERSION, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            secantusdb-*.tar.gz
+            secantusdb-*.tar.gz.sha256
+
+# ---------------------------------------------------------------------------
+# Follow-on matrix entries (NOT yet enabled — each needs verification first):
+#
+#   - target: x86_64-unknown-linux-musl   # fully static, runs on ANY Linux
+#       Build inside a musl env (Alpine container or `cibuildwheel` musllinux,
+#       which already builds WT under musl for the wheels). Removes the glibc
+#       floor entirely. Preferred long-term Linux artifact; the gnu build above
+#       is the pragmatic v1.
+#   - target: aarch64-unknown-linux-gnu / -musl
+#       runner: ubuntu-22.04-arm (arm64 Linux runners are GA). Verify the WT
+#       CMake build + bindgen on arm64 first.
+#   - target: x86_64-apple-darwin
+#       Intentionally absent, mirroring the wheel matrix (Apple Silicon is the
+#       active macOS target; Intel runner pool is scarce).
+#   - target: x86_64-pc-windows-msvc
+#       BLOCKED: the MSVC WT build produces no libwiredtiger.a, so build.rs can't
+#       static-link it; Windows ships via the wheel's bundled _secantus_server
+#       handle only. See tasks/backlog.md §7 (R7 tail). Unblock by emitting a WT
+#       static lib from the MSVC build and teaching build.rs to find it.
+#
+# Optimisation (deferred for correctness): cache build/*/wt-build keyed on the
+# vendored WiredTiger submodule SHA so most runs skip the ~minutes-long WT build.
+# ---------------------------------------------------------------------------

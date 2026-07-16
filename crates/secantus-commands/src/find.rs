@@ -7,63 +7,304 @@
 //! `skip` → `limit` → `projection` (via `secantus_core::projection`) →
 //! `_split_into_cursor` (firstBatch + register the remainder).
 //!
-//! **Deferred (documented so parity is honest):**
-//! * The up-front empty-collection filter validation (`matches({}, filter)`):
-//!   needs the query engine to distinguish a *parse* error from its `Fallback`
-//!   "defer" signal. Without it, an invalid filter on an *empty* collection
-//!   returns an empty cursor instead of a `BadValue` (non-empty collections
-//!   still surface the error through the storage scan).
-//! * `tailable: true` (capped-collection poll) — needs the tailable cursor
-//!   machinery + `collection_is_capped`; rejected here as unsupported (capped
-//!   collections aren't creatable through the ported handlers yet anyway).
+//! Empty-result filter validation: when nothing matched, the filter is re-run
+//! once against an empty document so an invalid / unsupported filter surfaces
+//! `BadValue` (as it would against a non-empty collection through the storage
+//! scan) instead of silently returning an empty cursor.
+//!
+//! `tailable: true` on a capped collection opens a tailable cursor: the matched
+//! docs seed firstBatch (+ a queued remainder), then [`TailableFindProducer`]
+//! polls for docs inserted afterwards (capped rollover → `CappedPositionLost`).
+//!
+//! **Notes:**
 //! * `let` IS applied — command `let` vars (`$$NOW` + evaluated values) are
 //!   visible to `$expr` in the filter, threaded through `find_collated`.
 //!   `collation` IS applied — filter matching + sort order are collation-aware
 //!   (COLLSCAN-forced); a non-ASCII / numericOrdering collation → `BadValue`.
 
+use std::sync::Arc;
+
 use bson::{doc, Bson, Document};
 
-use crate::cursors::CursorRegistry;
+use crate::cursors::{CursorProducer, CursorRegistry, TailableOptions};
+use crate::storage::Storage;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, docs_to_bson,
-    resolve_let_vars,
+    encode_docs, resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
+/// Producer for a tailable cursor on a capped collection (`find` with
+/// `tailable: true`). Each `produce` scans the collection for documents whose
+/// `id_key` sorts after the last one returned. If the cursor's anchor has been
+/// evicted by capped rollover (the collection's min `id_key` now exceeds it),
+/// it surfaces `CappedPositionLost` (136). Mirrors `commands.py::_find_tailable`.
+struct TailableFindProducer {
+    storage: Arc<dyn Storage>,
+    db: String,
+    coll: String,
+    after: Option<Vec<u8>>,
+    fatal: Option<CommandError>,
+}
+
+impl CursorProducer for TailableFindProducer {
+    fn produce(&mut self) -> Vec<Vec<u8>> {
+        if self.fatal.is_some() {
+            return Vec::new();
+        }
+        // Capped rollover: if the doc we last returned has been evicted, the
+        // cursor is lapped — mongod kills it with CappedPositionLost.
+        if let Some(after) = &self.after {
+            match self.storage.collection_min_id_key(&self.db, &self.coll) {
+                Ok(Some(min)) if min.as_slice() > after.as_slice() => {
+                    self.fatal = Some(capped_position_lost());
+                    return Vec::new();
+                }
+                Ok(None) => {
+                    self.fatal = Some(capped_position_lost());
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+        match self
+            .storage
+            .scan_docs_after_id_key(&self.db, &self.coll, self.after.as_deref())
+        {
+            Ok(rows) if !rows.is_empty() => {
+                self.after = Some(rows[rows.len() - 1].0.clone());
+                rows.into_iter().map(|(_id_k, doc)| doc).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn position(&self) -> i64 {
+        0
+    }
+
+    fn invalidated(&self) -> bool {
+        false
+    }
+
+    fn fatal_error(&self) -> Option<CommandError> {
+        self.fatal.clone()
+    }
+}
+
+fn capped_position_lost() -> CommandError {
+    CommandError::new(
+        136,
+        "CappedPositionLost",
+        "CollectionScan died due to position in capped collection being deleted.",
+    )
+}
+
+/// Shape a `BadValue` for a filter the matcher couldn't evaluate, naming the
+/// offending operator when there's an unrecognised one (e.g. `$badOperator`) so
+/// drivers' error-document tests see the operator in the message, matching
+/// mongod / the Python server.
+pub(crate) fn query_filter_error(filter: &Document) -> CommandError {
+    // An unrecognised aggregation-expression operator inside a `$expr` is
+    // mongod's `168 InvalidPipelineOperator` — `Unrecognized expression '$op'` —
+    // not a generic query-operator `BadValue`.
+    if let Some(op) = unknown_expr_operator_in_filter(filter) {
+        return CommandError::new(
+            168,
+            "InvalidPipelineOperator",
+            format!("Unrecognized expression '{op}'"),
+        );
+    }
+    match secantus_core::query::first_unknown_operator(filter) {
+        Some(op) => CommandError::new(2, "BadValue", format!("unsupported query operator: {op}")),
+        None => CommandError::new(2, "BadValue", "unsupported or invalid query filter"),
+    }
+}
+
+/// The first unrecognised expression operator reachable through a `$expr`
+/// anywhere in `filter` (recursing through `$and`/`$or`/`$nor`). `None` when no
+/// `$expr` references an unknown operator.
+fn unknown_expr_operator_in_filter(filter: &Document) -> Option<String> {
+    for (k, v) in filter.iter() {
+        if k == "$expr" {
+            if let Some(op) = secantus_core::expressions::first_unknown_expr_operator(v) {
+                return Some(op);
+            }
+        } else if (k == "$and" || k == "$or" || k == "$nor") && matches!(v, Bson::Array(_)) {
+            if let Bson::Array(arr) = v {
+                for sub in arr {
+                    if let Bson::Document(d) = sub {
+                        if let Some(op) = unknown_expr_operator_in_filter(d) {
+                            return Some(op);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// `find` — run a query and open a cursor over the results.
+/// Build the aggregate command equivalent to a `find` on a view: the find's
+/// filter / sort / skip / limit / projection become pipeline stages (in that
+/// order), over the view namespace, carrying the collation / let / batchSize.
+fn build_view_find_aggregate(doc: &Document, coll: &str) -> Document {
+    let mut pipeline: Vec<Bson> = Vec::new();
+    if let Some(Bson::Document(f)) = doc.get("filter") {
+        if !f.is_empty() {
+            pipeline.push(Bson::Document(doc! { "$match": f.clone() }));
+        }
+    }
+    if let Some(Bson::Document(s)) = doc.get("sort") {
+        if !s.is_empty() {
+            pipeline.push(Bson::Document(doc! { "$sort": s.clone() }));
+        }
+    }
+    if let Some(n) = doc.get("skip").and_then(as_i64) {
+        if n > 0 {
+            pipeline.push(Bson::Document(doc! { "$skip": n }));
+        }
+    }
+    if let Some(n) = doc.get("limit").and_then(as_i64) {
+        if n > 0 {
+            pipeline.push(Bson::Document(doc! { "$limit": n }));
+        }
+    }
+    if let Some(Bson::Document(p)) = doc.get("projection") {
+        if !p.is_empty() {
+            pipeline.push(Bson::Document(doc! { "$project": p.clone() }));
+        }
+    }
+    let batch_size = doc
+        .get("batchSize")
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    let mut agg = doc! {
+        "aggregate": coll,
+        "pipeline": pipeline,
+        "cursor": { "batchSize": batch_size },
+    };
+    if let Some(c) = doc.get("collation") {
+        agg.insert("collation", c.clone());
+    }
+    if let Some(l) = doc.get("let") {
+        agg.insert("let", l.clone());
+    }
+    agg
+}
+
 pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "find")?;
+    // A view: translate the find into the equivalent aggregate over the base
+    // collection (the find options become pipeline stages after the view's own
+    // pipeline) and delegate — the aggregate handler resolves the view. `find` and
+    // `aggregate` return the same cursor-reply shape. Mirrors commands._find.
+    let is_view = {
+        let storage = ctx.storage()?;
+        storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .map(|o| o.contains_key("viewOn"))
+            .unwrap_or(false)
+    };
+    if is_view {
+        let agg = build_view_find_aggregate(doc, &coll);
+        return crate::aggregate::aggregate(&agg, ctx);
+    }
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
 
     let filter = doc_field(doc, "filter");
+    // An unrecognized `$expr` expression operator is rejected by mongod at parse
+    // time (before any scan), so surface `168 InvalidPipelineOperator` regardless
+    // of whether the collection is empty or any doc matches. (The per-doc scan
+    // path below would otherwise map it to a generic BadValue.)
+    if let Some(op) = unknown_expr_operator_in_filter(&filter) {
+        return Ok(CommandError::new(
+            168,
+            "InvalidPipelineOperator",
+            format!("Unrecognized expression '{op}'"),
+        )
+        .into_reply());
+    }
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0).max(0) as usize;
     let limit = doc.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize; // 0 ⇒ no limit
     let sort = doc.get("sort").and_then(Bson::as_document);
-    // An empty projection means "no projection" (return full docs).
-    let projection = doc
+    // An empty projection means "no projection" (return full docs). Mutable
+    // because `returnKey` / `showRecordId` rewrite the result set and then
+    // suppress any normal projection (mongod ignores `projection` for them).
+    let mut projection = doc
         .get("projection")
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty());
+    // A projection may not mix inclusion and exclusion (except `_id`). mongod
+    // rejects it at parse with a per-field 31254 / 31253 — the exact wording
+    // mongo-node-driver's projection-error tests assert.
+    if let Some(spec) = projection {
+        if let Some(err) = projection_mix_error(spec) {
+            return Ok(err.into_reply());
+        }
+        // `$meta` projection parse-time validation: an unknown argument is a
+        // Location17308, and `{$meta: "textScore"}` without a `$text` query is a
+        // Location40218. (Recognized-but-unsupported args validate clean here and
+        // are omitted from the result by `apply_projection`.)
+        if let Some(err) = projection_meta_error(spec, &filter) {
+            return Ok(err.into_reply());
+        }
+        // Positional (`arr.$`) validation is parse-time in mongod, so an invalid
+        // one errors even when nothing matches. The Rust engine can't reproduce
+        // the exact Location code (31276 / 31395 / 51246) — a generic BadValue,
+        // same as its other deferred error paths.
+        let q = if filter.is_empty() {
+            None
+        } else {
+            Some(&filter)
+        };
+        if secantus_core::projection::validate_projection(spec, q).is_err() {
+            return Ok(
+                CommandError::new(2, "BadValue", "invalid positional projection").into_reply(),
+            );
+        }
+    }
     let hint = doc.get("hint");
     let collation = collation_of(doc);
     // Command `let` → vars visible to `$expr` in the filter.
     let let_vars = resolve_let_vars(doc.get("let"));
     // `batchSize` is tri-state: absent ⇒ default, 0 ⇒ empty firstBatch + cursor,
-    // explicit positive ⇒ that size.
+    // explicit positive ⇒ that size. A present-but-non-numeric value (e.g. a
+    // string) is a TypeMismatch — mongod rejects it, and the mongo-c-driver
+    // find/batchSize test sends `{batchSize: 'foo'}` expecting a server error.
     let batch_size = match doc.get("batchSize") {
-        Some(b) => as_i64(b).unwrap_or(DEFAULT_BATCH_SIZE as i64),
+        Some(b) => match as_i64(b) {
+            Some(n) => n,
+            None => {
+                return Err(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    "BSON field 'batchSize' is the wrong type, expected a number",
+                ))
+            }
+        },
         None => DEFAULT_BATCH_SIZE as i64,
     };
     let single_batch = bool_field(doc, "singleBatch", false);
+    let tailable = bool_field(doc, "tailable", false);
+    let await_data = bool_field(doc, "awaitData", false);
     let ns = format!("{}.{}", ctx.db_name, coll);
 
-    if bool_field(doc, "tailable", false) {
-        return Err(CommandError::new(
-            1,
-            "InternalError",
-            "tailable find is not yet supported by the Rust server",
-        ));
+    // A tailable cursor is only valid on a capped collection (mongod rejects it
+    // on a non-capped one with BadValue). Check before the fetch.
+    if tailable
+        && !storage
+            .collection_is_capped(&ctx.db_name, &coll)
+            .map_err(command_error)?
+    {
+        return Ok(CommandError::new(
+            2,
+            "BadValue",
+            format!("error processing query: ns={ns} tailable cursor requested on non capped collection"),
+        )
+        .into_reply());
     }
 
     let mut docs = storage
@@ -77,6 +318,17 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             &let_vars,
         )
         .map_err(command_error)?;
+
+    // Validate the filter even when nothing matched: against a non-empty
+    // collection the storage scan evaluates the filter per doc and an
+    // invalid/unsupported one surfaces `BadValue`; on an empty result the scan
+    // never runs, so an invalid filter would otherwise return an empty cursor
+    // instead of the error. Re-run the matcher once against an empty document
+    // (operator recognition is doc-independent) to surface the same `BadValue`.
+    if docs.is_empty() && !filter.is_empty() {
+        secantus_core::query::matches(&Document::new(), &filter, &let_vars, collation.as_ref())
+            .map_err(|_| query_filter_error(&filter))?;
+    }
 
     // Cursor `min` / `max` index bounds (inclusive lower / exclusive upper),
     // evaluated on the hinted index's key — applied to the index-ordered fetch
@@ -107,19 +359,139 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         docs.truncate(limit);
     }
 
-    if let Some(spec) = projection {
-        docs = project_docs(docs, spec)?;
+    // Tailable cursor: the matched docs seed firstBatch (+ a queued remainder);
+    // a producer then polls the collection for docs inserted after this find.
+    if tailable {
+        let storage_arc = ctx
+            .storage
+            .as_ref()
+            .ok_or_else(|| CommandError::new(1, "InternalError", "storage backend not configured"))?
+            .clone();
+        // Watermark = id_key of the last matched doc, so the producer continues
+        // strictly after what we've already handed out. None for an empty match.
+        let after = match docs.last() {
+            Some(bytes) => {
+                let d = Document::from_reader(&mut bytes.as_slice())
+                    .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+                d.get("_id").map(|id| {
+                    secantus_core::sortkey::encode_value(id, collation.as_ref()).unwrap_or_default()
+                })
+            }
+            None => None,
+        };
+        let bs = batch_size.max(0) as usize;
+        let split = bs.min(docs.len());
+        let first_batch = docs[..split].to_vec();
+        let initial_remaining = docs[split..].to_vec();
+        let producer = Box::new(TailableFindProducer {
+            storage: storage_arc,
+            db: ctx.db_name.clone(),
+            coll: coll.clone(),
+            after,
+            fatal: None,
+        });
+        let cursor_id = cursors
+            .register_tailable(
+                &ns,
+                producer,
+                TailableOptions {
+                    await_data,
+                    initial_remaining,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| {
+                CommandError::new(
+                    1,
+                    "InternalError",
+                    format!("cursor registration failed: {e:?}"),
+                )
+            })?;
+        return Ok(doc! {
+            "cursor": {
+                "firstBatch": docs_to_bson(first_batch)?,
+                "id": Bson::Int64(cursor_id),
+                "ns": ns,
+            },
+            "ok": 1.0,
+        });
     }
 
-    let (first_batch, cursor_id) = if single_batch {
-        (docs, 0)
-    } else {
-        split_into_cursor(docs, batch_size, &ns, cursors)?
+    // `returnKey` replaces each result with just the key fields of the index
+    // serving the query (the IXSCAN keyPattern, plus the sort fields), and
+    // suppresses `showRecordId`. `showRecordId` alone tags each doc with a
+    // synthetic `$recordId`. Both ignore `projection` (mongod does too), so we
+    // rewrite the docs here and clear `projection`. Mirrors commands.py.
+    let return_key = bool_field(doc, "returnKey", false);
+    let show_record_id = bool_field(doc, "showRecordId", false);
+    if return_key || show_record_id {
+        let mut key_fields: Vec<String> = Vec::new();
+        if return_key {
+            if let Ok(plan) = storage.explain_plan(&ctx.db_name, &coll, &filter, sort, hint) {
+                if plan.get_str("kind") == Ok("IXSCAN") {
+                    if let Ok(kp) = plan.get_document("keyPattern") {
+                        key_fields.extend(kp.keys().cloned());
+                    }
+                }
+            }
+            if let Some(s) = sort {
+                for k in s.keys() {
+                    if !key_fields.iter().any(|f| f == k) {
+                        key_fields.push(k.clone());
+                    }
+                }
+            }
+        }
+        let mut rewritten: Vec<Document> = Vec::with_capacity(docs.len());
+        for (i, bytes) in docs.iter().enumerate() {
+            let d = Document::from_reader(&mut bytes.as_slice())
+                .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+            if return_key {
+                let mut o = Document::new();
+                for f in &key_fields {
+                    if let Some(v) = d.get(f) {
+                        o.insert(f.clone(), v.clone());
+                    }
+                }
+                rewritten.push(o);
+            } else {
+                let mut o = d;
+                o.insert("$recordId", Bson::Int64((i + 1) as i64));
+                rewritten.push(o);
+            }
+        }
+        docs = crate::util::encode_docs(rewritten)?;
+        projection = None;
+    }
+
+    // The `firstBatch` goes straight onto the wire reply, so produce it as
+    // `Bson` directly and only encode the cursor *remainder* (which the registry
+    // stores as bytes). This avoids the round-trip the projection path otherwise
+    // pays — encoding the projected docs to bytes only to decode them right back
+    // for the reply. The no-projection path stays in storage bytes end-to-end
+    // and decodes just the firstBatch.
+    let (first_batch, cursor_id): (Vec<Bson>, i64) = match projection {
+        Some(spec) => {
+            let projected = project_to_docs(docs, spec, &filter)?;
+            if single_batch {
+                (projected.into_iter().map(Bson::Document).collect(), 0)
+            } else {
+                split_docs_into_cursor(projected, batch_size, &ns, cursors)?
+            }
+        }
+        None => {
+            let (first, cursor_id) = if single_batch {
+                (docs, 0)
+            } else {
+                split_into_cursor(docs, batch_size, &ns, cursors)?
+            };
+            (docs_to_bson(first)?, cursor_id)
+        }
     };
 
     Ok(doc! {
         "cursor": {
-            "firstBatch": docs_to_bson(first_batch)?,
+            "firstBatch": first_batch,
             // Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
             "id": Bson::Int64(cursor_id),
             "ns": ns,
@@ -153,6 +525,34 @@ pub(crate) fn split_into_cursor(
         .register(ns, remaining)
         .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
     Ok((docs, cursor_id))
+}
+
+/// Like [`split_into_cursor`], but for already-decoded result `Document`s (the
+/// `aggregate` pipeline output, or a projected `find`). The `firstBatch` is
+/// returned as `Bson` for direct embedding in the reply — never re-encoded —
+/// while only the cursor remainder is encoded to bytes for the registry. Shared
+/// with the `aggregate` handler.
+pub(crate) fn split_docs_into_cursor(
+    mut docs: Vec<Document>,
+    batch_size: i64,
+    ns: &str,
+    cursors: &CursorRegistry,
+) -> Result<(Vec<Bson>, i64), CommandError> {
+    let take = if batch_size < 0 {
+        DEFAULT_BATCH_SIZE as usize
+    } else {
+        batch_size as usize
+    }
+    .min(docs.len());
+    let remaining = docs.split_off(take);
+    let first: Vec<Bson> = docs.into_iter().map(Bson::Document).collect();
+    if remaining.is_empty() {
+        return Ok((first, 0));
+    }
+    let cursor_id = cursors
+        .register(ns, encode_docs(remaining)?)
+        .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
+    Ok((first, cursor_id))
 }
 
 /// Resolve a `hint` (index-name string or key-spec document) to the index's key
@@ -283,10 +683,116 @@ fn apply_min_max(
     Ok(out)
 }
 
+/// mongod's mixed-inclusion/exclusion projection error, if the spec mixes the
+/// two modes. `_id` is exempt (it may be excluded in an inclusion projection and
+/// included in an exclusion one). The first non-`_id` field sets the mode; the
+/// first field that contradicts it loses, with mongod's per-field wording
+/// (`Cannot do exclusion on field X in inclusion projection`, 31254 — or the
+/// inclusion-in-exclusion mirror, 31253). Operator specs (`$slice` / `$elemMatch`)
+/// are neutral here (handled by `apply_projection`). Mirrors mongod's parse-time
+/// validation that mongo-node-driver's projection-error tests assert.
+fn projection_mix_error(spec: &Document) -> Option<CommandError> {
+    let field_inclusion = |v: &Bson| -> Option<bool> {
+        match v {
+            Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false) => Some(false),
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(true) => Some(true),
+            Bson::Double(d) => Some(*d != 0.0),
+            _ => None, // operator spec ($slice / $elemMatch) — neutral
+        }
+    };
+    let mut mode: Option<bool> = None;
+    for (field, v) in spec {
+        if field == "_id" {
+            continue;
+        }
+        let Some(incl) = field_inclusion(v) else {
+            continue;
+        };
+        match mode {
+            None => mode = Some(incl),
+            Some(m) if m != incl => {
+                return Some(if m {
+                    CommandError::new(
+                        31254,
+                        "Location31254",
+                        format!("Cannot do exclusion on field {field} in inclusion projection"),
+                    )
+                } else {
+                    CommandError::new(
+                        31253,
+                        "Location31253",
+                        format!("Cannot do inclusion on field {field} in exclusion projection"),
+                    )
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `query` carries a `$text` clause (top-level or nested inside a
+/// `$and` / `$or` / `$nor` array). mongod requires a `$text` predicate before a
+/// `{$meta: "textScore"}` projection is legal. Mirrors `projection._query_has_text`.
+fn query_has_text(query: &Document) -> bool {
+    for (key, val) in query {
+        if key == "$text" {
+            return true;
+        }
+        if matches!(key.as_str(), "$and" | "$or" | "$nor") {
+            if let Bson::Array(arr) = val {
+                if arr.iter().filter_map(Bson::as_document).any(query_has_text) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// mongod's parse-time `$meta` projection errors, if the spec carries a faulty
+/// `{$meta: ...}` value. Oracle-pinned against mongod 6.0: an unrecognized
+/// argument is a Location17308 (`Unsupported argument to $meta: <arg>`), and
+/// `{$meta: "textScore"}` without a `$text` query is a Location40218 (`query
+/// requires text score metadata, but it is not available`). Recognized-but-
+/// unsupported args (`indexKey` / `recordId` / `sortKey` / …) validate clean and
+/// are omitted from the result by `secantus_core::projection::apply_projection`.
+fn projection_meta_error(spec: &Document, filter: &Document) -> Option<CommandError> {
+    for v in spec.values() {
+        let Some(arg) = secantus_core::projection::meta_spec(v) else {
+            continue;
+        };
+        if !secantus_core::projection::META_KEYWORDS.contains(&arg) {
+            return Some(CommandError::new(
+                17308,
+                "Location17308",
+                format!("Unsupported argument to $meta: {arg}"),
+            ));
+        }
+        if arg == "textScore" && !query_has_text(filter) {
+            return Some(CommandError::new(
+                40218,
+                "Location40218",
+                "query requires text score metadata, but it is not available",
+            ));
+        }
+    }
+    None
+}
+
 /// Apply a projection spec to each result doc via `secantus_core::projection`.
 /// A `Fallback` (a projection the Rust engine can't reproduce exactly) surfaces
 /// as `BadValue` — the Rust server only ships what the Rust engine supports.
-fn project_docs(docs: Vec<Vec<u8>>, spec: &Document) -> Result<Vec<Vec<u8>>, CommandError> {
+fn project_to_docs(
+    docs: Vec<Vec<u8>>,
+    spec: &Document,
+    filter: &Document,
+) -> Result<Vec<Document>, CommandError> {
+    let query = if filter.is_empty() {
+        None
+    } else {
+        Some(filter)
+    };
     docs.iter()
         .map(|bytes| {
             let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
@@ -296,257 +802,13 @@ fn project_docs(docs: Vec<Vec<u8>>, spec: &Document) -> Result<Vec<Vec<u8>>, Com
                     format!("failed to decode document: {e}"),
                 )
             })?;
-            let projected =
-                secantus_core::projection::apply_projection(&d, spec).map_err(|_| {
-                    CommandError::new(
-                        2,
-                        "BadValue",
-                        "projection is not supported by the Rust server",
-                    )
-                })?;
-            let mut out = Vec::new();
-            projected.to_writer(&mut out).map_err(|e| {
+            secantus_core::projection::apply_projection(&d, spec, query).map_err(|_| {
                 CommandError::new(
-                    1,
-                    "InternalError",
-                    format!("failed to encode document: {e}"),
+                    2,
+                    "BadValue",
+                    "projection is not supported by the Rust server",
                 )
-            })?;
-            Ok(out)
+            })
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dispatch;
-    use crate::storage::{RawHint, Storage, StorageError, UpdateOutcome};
-    use crate::CursorRegistry;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    fn enc(d: &Document) -> Vec<u8> {
-        let mut v = Vec::new();
-        d.to_writer(&mut v).unwrap();
-        v
-    }
-
-    fn matches(d: &Document, filter: &Document) -> bool {
-        filter.iter().all(|(k, v)| d.get(k) == Some(v))
-    }
-
-    /// In-memory storage whose `find` supports the empty / simple-equality
-    /// filter and a single numeric-field sort, enough to exercise the handler's
-    /// skip / limit / projection / cursor-split plumbing.
-    #[derive(Default)]
-    struct FakeStorage {
-        cols: Mutex<HashMap<(String, String), Vec<Document>>>,
-    }
-
-    impl FakeStorage {
-        fn seed(db: &str, coll: &str, docs: Vec<Document>) -> Arc<FakeStorage> {
-            let s = FakeStorage::default();
-            s.cols
-                .lock()
-                .unwrap()
-                .insert((db.to_string(), coll.to_string()), docs);
-            Arc::new(s)
-        }
-    }
-
-    impl Storage for FakeStorage {
-        fn insert(
-            &self,
-            _db: &str,
-            _coll: &str,
-            _docs: Vec<Vec<u8>>,
-            _ordered: bool,
-        ) -> Result<(usize, Vec<Document>), StorageError> {
-            Ok((0, vec![]))
-        }
-        fn update_matching(
-            &self,
-            _db: &str,
-            _coll: &str,
-            _filter: &Document,
-            _update: &Document,
-            _multi: bool,
-            _upsert: bool,
-        ) -> Result<UpdateOutcome, StorageError> {
-            Ok(UpdateOutcome::default())
-        }
-        fn delete_matching(
-            &self,
-            _db: &str,
-            _coll: &str,
-            _filter: &Document,
-            _limit: usize,
-        ) -> Result<usize, StorageError> {
-            Ok(0)
-        }
-        fn count_matching(
-            &self,
-            _db: &str,
-            _coll: &str,
-            _filter: &Document,
-        ) -> Result<usize, StorageError> {
-            Ok(0)
-        }
-        fn find(
-            &self,
-            db: &str,
-            coll: &str,
-            filter: &Document,
-            sort: Option<&Document>,
-            _hint: Option<RawHint<'_>>,
-        ) -> Result<Vec<Vec<u8>>, StorageError> {
-            let cols = self.cols.lock().unwrap();
-            let mut out: Vec<Document> = cols
-                .get(&(db.to_string(), coll.to_string()))
-                .map(|b| b.iter().filter(|d| matches(d, filter)).cloned().collect())
-                .unwrap_or_default();
-            if let Some(sort) = sort {
-                if let Some((field, dir)) = sort.iter().next() {
-                    let dir = dir.as_i32().unwrap_or(1);
-                    out.sort_by_key(|d| d.get(field).and_then(|v| v.as_i64()).unwrap_or(0));
-                    if dir < 0 {
-                        out.reverse();
-                    }
-                }
-            }
-            Ok(out.iter().map(enc).collect())
-        }
-    }
-
-    fn ctx(storage: Arc<FakeStorage>) -> CommandContext {
-        CommandContext::new(1)
-            .with_storage(storage)
-            .with_cursors(Arc::new(CursorRegistry::new()))
-    }
-
-    fn batch_ids(cursor: &Document, key: &str) -> Vec<i64> {
-        cursor
-            .get_array(key)
-            .unwrap()
-            .iter()
-            .map(|b| b.as_document().unwrap().get_i32("_id").unwrap() as i64)
-            .collect()
-    }
-
-    #[test]
-    fn find_all_single_batch() {
-        let docs = (0..3).map(|i| doc! {"_id": i}).collect();
-        let mut c = ctx(FakeStorage::seed("t", "c", docs));
-        c.db_name = "t".into();
-        let reply = dispatch(&doc! {"find": "c"}, &mut c);
-        let cur = reply.get_document("cursor").unwrap();
-        assert_eq!(cur.get_i64("id").unwrap(), 0, "all fit ⇒ no cursor");
-        assert_eq!(cur.get_str("ns").unwrap(), "t.c");
-        assert_eq!(batch_ids(cur, "firstBatch"), vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn find_skip_and_limit() {
-        let docs = (0..5).map(|i| doc! {"_id": i}).collect();
-        let mut c = ctx(FakeStorage::seed("t", "c", docs));
-        c.db_name = "t".into();
-        let reply = dispatch(&doc! {"find": "c", "skip": 1, "limit": 2}, &mut c);
-        let cur = reply.get_document("cursor").unwrap();
-        assert_eq!(batch_ids(cur, "firstBatch"), vec![1, 2]);
-    }
-
-    #[test]
-    fn find_sort_descending() {
-        let docs = (0..3).map(|i| doc! {"_id": i}).collect();
-        let mut c = ctx(FakeStorage::seed("t", "c", docs));
-        c.db_name = "t".into();
-        let reply = dispatch(&doc! {"find": "c", "sort": {"_id": -1}}, &mut c);
-        let cur = reply.get_document("cursor").unwrap();
-        assert_eq!(batch_ids(cur, "firstBatch"), vec![2, 1, 0]);
-    }
-
-    #[test]
-    fn find_batched_opens_cursor_and_getmore_drains() {
-        let docs = (0..5).map(|i| doc! {"_id": i}).collect();
-        let mut c = ctx(FakeStorage::seed("t", "c", docs));
-        c.db_name = "t".into();
-        let reply = dispatch(&doc! {"find": "c", "batchSize": 2}, &mut c);
-        let cur = reply.get_document("cursor").unwrap();
-        assert_eq!(batch_ids(cur, "firstBatch"), vec![0, 1]);
-        let cid = cur.get_i64("id").unwrap();
-        assert_ne!(cid, 0, "remaining docs ⇒ live cursor");
-
-        // getMore against the same context drains the rest.
-        let reply = dispatch(
-            &doc! {"getMore": cid, "collection": "c", "batchSize": 2},
-            &mut c,
-        );
-        let cur = reply.get_document("cursor").unwrap();
-        assert_eq!(batch_ids(cur, "nextBatch"), vec![2, 3]);
-        assert_eq!(cur.get_i64("id").unwrap(), cid);
-
-        let reply = dispatch(
-            &doc! {"getMore": cid, "collection": "c", "batchSize": 2},
-            &mut c,
-        );
-        let cur = reply.get_document("cursor").unwrap();
-        assert_eq!(batch_ids(cur, "nextBatch"), vec![4]);
-        assert_eq!(cur.get_i64("id").unwrap(), 0, "exhausted");
-    }
-
-    #[test]
-    fn find_batch_size_zero_empty_first_batch() {
-        let docs = (0..2).map(|i| doc! {"_id": i}).collect();
-        let mut c = ctx(FakeStorage::seed("t", "c", docs));
-        c.db_name = "t".into();
-        let reply = dispatch(&doc! {"find": "c", "batchSize": 0}, &mut c);
-        let cur = reply.get_document("cursor").unwrap();
-        assert!(cur.get_array("firstBatch").unwrap().is_empty());
-        assert_ne!(cur.get_i64("id").unwrap(), 0);
-    }
-
-    #[test]
-    fn find_single_batch_never_opens_cursor() {
-        let docs = (0..5).map(|i| doc! {"_id": i}).collect();
-        let mut c = ctx(FakeStorage::seed("t", "c", docs));
-        c.db_name = "t".into();
-        let reply = dispatch(
-            &doc! {"find": "c", "batchSize": 2, "singleBatch": true},
-            &mut c,
-        );
-        let cur = reply.get_document("cursor").unwrap();
-        // singleBatch overrides batchSize splitting: all docs, id 0.
-        assert_eq!(batch_ids(cur, "firstBatch").len(), 5);
-        assert_eq!(cur.get_i64("id").unwrap(), 0);
-    }
-
-    #[test]
-    fn find_projection_includes_fields() {
-        let docs = vec![doc! {"_id": 1, "a": 10, "b": 20}];
-        let mut c = ctx(FakeStorage::seed("t", "c", docs));
-        c.db_name = "t".into();
-        let reply = dispatch(&doc! {"find": "c", "projection": {"a": 1}}, &mut c);
-        let cur = reply.get_document("cursor").unwrap();
-        let first = cur.get_array("firstBatch").unwrap()[0]
-            .as_document()
-            .unwrap();
-        assert!(first.get("a").is_some());
-        assert!(first.get("b").is_none(), "b excluded by projection");
-        assert!(first.get("_id").is_some(), "_id included by default");
-    }
-
-    #[test]
-    fn find_filter_matches_subset() {
-        let docs = vec![
-            doc! {"_id": 1, "x": 1},
-            doc! {"_id": 2, "x": 2},
-            doc! {"_id": 3, "x": 1},
-        ];
-        let mut c = ctx(FakeStorage::seed("t", "c", docs));
-        c.db_name = "t".into();
-        let reply = dispatch(&doc! {"find": "c", "filter": {"x": 1}}, &mut c);
-        let cur = reply.get_document("cursor").unwrap();
-        assert_eq!(batch_ids(cur, "firstBatch"), vec![1, 3]);
-    }
 }

@@ -24,7 +24,7 @@ import types
 
 import bson
 import pytest
-from bson import Int64, ObjectId
+from bson import Decimal128, Int64, ObjectId, Timestamp
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -59,6 +59,16 @@ def _rust_eval(expr, doc, vars=None):
     return None if res is None else bson.decode(res)["r"]
 
 
+def _bson_norm(v):
+    """Normalise a pure-Python result the way BSON storage would — the wire form
+    both servers actually return. In particular a tz-aware ``datetime`` collapses
+    to its UTC instant (naive), matching the Rust value which is already
+    bson-decoded; identity for every other BSON type. This is the faithful
+    comparison (stored value), and it can't hide a real value bug — a wrong
+    instant still differs after normalisation."""
+    return bson.decode(bson.encode({"v": v}))["v"]
+
+
 _DT = datetime.datetime(2026, 6, 5, 12, 34, 56, tzinfo=datetime.timezone.utc)
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
@@ -69,6 +79,51 @@ def _mkdate(ms):
 
 # (expr, doc) pairs over the ported operator core.
 CURATED = [
+    # Bitwise ($bitAnd/$bitOr/$bitXor/$bitNot) — int/long, empty-list identity,
+    # null propagation, mixed int/long result width. Non-int operands defer.
+    ({"$bitAnd": ["$a", "$b"]}, {"a": 12, "b": 10}),
+    ({"$bitOr": ["$a", "$b", 1]}, {"a": 12, "b": 10}),
+    ({"$bitXor": ["$a", "$b"]}, {"a": 12, "b": 10}),
+    ({"$bitNot": "$a"}, {"a": 12}),
+    ({"$bitNot": "$a"}, {"a": -5}),
+    ({"$bitAnd": ["$a", 255]}, {"a": Int64(0xFF00FF00)}),  # long -> long result
+    ({"$bitXor": ["$a", Int64(3)]}, {"a": 12}),  # mixed int/long -> long
+    ({"$bitAnd": []}, {}),  # identity -1
+    ({"$bitOr": []}, {}),  # identity 0
+    ({"$bitAnd": ["$a", "$missing"]}, {"a": 12}),  # null propagation
+    ({"$bitAnd": ["$a", 1.5]}, {"a": 12}),  # double operand -> defer (Python raises)
+    ({"$bitOr": ["$a", True]}, {"a": 12}),  # bool operand -> defer
+    # $firstN / $lastN (expression form) — slice first/last n; n>len -> all.
+    # Validation matches mongod: null/missing/non-array input errors (5788200),
+    # non-integral / n<=0 errors — all defer (Rust None, Python raises). An
+    # integral double n is accepted.
+    ({"$firstN": {"n": 2, "input": "$a"}}, {"a": [10, 20, 30, 40]}),
+    ({"$lastN": {"n": 2, "input": "$a"}}, {"a": [10, 20, 30, 40]}),
+    ({"$firstN": {"n": 10, "input": "$a"}}, {"a": [10, 20]}),
+    ({"$lastN": {"n": 10, "input": "$a"}}, {"a": [10, 20]}),
+    ({"$firstN": {"n": 1, "input": "$a"}}, {"a": []}),
+    ({"$firstN": {"n": 2.0, "input": "$a"}}, {"a": [10, 20, 30]}),  # integral double n
+    ({"$firstN": {"n": Int64(2), "input": "$a"}}, {"a": [7, 8, 9]}),  # long n ok
+    ({"$firstN": {"n": 2, "input": "$missing"}}, {}),  # missing input -> error (defer)
+    ({"$firstN": {"n": 2, "input": None}}, {}),  # null input -> error (defer)
+    ({"$firstN": {"n": 0, "input": "$a"}}, {"a": [1, 2]}),  # n<=0 -> defer
+    ({"$lastN": {"n": 1.5, "input": "$a"}}, {"a": [1, 2]}),  # non-integral n -> defer
+    ({"$firstN": {"n": 2, "input": 5}}, {}),  # non-array -> defer
+    # $maxN / $minN (expression form) — n largest/smallest by BSON order; null
+    # elements ignored; cross-type sortable subset compares, bool/Decimal128 defers;
+    # null/non-array input errors like $firstN (defer).
+    ({"$maxN": {"n": 3, "input": "$a"}}, {"a": [3, 1, 4, 1, 5, 9, 2, 6]}),
+    ({"$minN": {"n": 3, "input": "$a"}}, {"a": [3, 1, 4, 1, 5, 9, 2, 6]}),
+    ({"$maxN": {"n": 2, "input": "$a"}}, {"a": [3, None, 1, None, 5]}),  # nulls ignored
+    ({"$minN": {"n": 2, "input": "$a"}}, {"a": [3, None, 1, None, 5]}),
+    ({"$maxN": {"n": 99, "input": "$a"}}, {"a": [3, 1, 2]}),  # n>len -> all sorted
+    ({"$minN": {"n": 2, "input": [None, None]}}, {}),  # all-null array -> []
+    ({"$maxN": {"n": 2, "input": "$missing"}}, {}),  # missing input -> error (defer)
+    ({"$maxN": {"n": 2, "input": ["b", "a", "c"]}}, {}),  # strings
+    ({"$maxN": {"n": 2, "input": [1, "a", 2.5, "b"]}}, {}),  # cross-type BSON order
+    ({"$maxN": {"n": 1, "input": [True, 1]}}, {}),  # bool element -> defer
+    ({"$maxN": {"n": 0, "input": "$a"}}, {"a": [1, 2]}),  # n<=0 -> defer
+    ({"$minN": {"n": 2, "input": 5}}, {}),  # non-array -> defer
     ("$a", {"a": 5}),
     ("hi", {}),
     ("$missing", {}),
@@ -117,6 +172,27 @@ CURATED = [
     ({"$last": "$a"}, {"a": [1, 2]}),
     ({"$concatArrays": [[1, 2], [3]]}, {}),
     ({"$reverseArray": [1, 2, 3]}, {}),
+    # $sortArray. Int form: homogeneous / numeric scalars (Python's native sort
+    # raises on docs or incomparable mixes, so the corpus avoids those). Doc form
+    # uses BSON sort order on the named fields.
+    ({"$sortArray": {"input": [3, 1, 2], "sortBy": 1}}, {}),
+    ({"$sortArray": {"input": [3, 1, 2], "sortBy": -1}}, {}),
+    ({"$sortArray": {"input": [3, 1.5, 2, 1.5], "sortBy": 1}}, {}),  # numeric + stable ties
+    ({"$sortArray": {"input": ["b", "a", "c"], "sortBy": -1}}, {}),
+    ({"$sortArray": {"input": "$xs", "sortBy": 1}}, {"xs": [5, 2, 8, 1]}),
+    ({"$sortArray": {"input": "$missing", "sortBy": 1}}, {}),  # missing input -> null
+    ({"$sortArray": {"input": [{"x": 3}, {"x": 1}, {"x": 2}], "sortBy": {"x": 1}}}, {}),
+    (
+        {
+            "$sortArray": {
+                "input": [{"a": 1, "b": 2}, {"a": 1, "b": 1}, {"a": 0, "b": 9}],
+                "sortBy": {"a": 1, "b": -1},
+            }
+        },
+        {},
+    ),
+    # missing sort field sorts as null (first)
+    ({"$sortArray": {"input": [{"x": 2}, {"y": 1}], "sortBy": {"x": 1}}}, {}),
     ({"$in": [2, [1, 2, 3]]}, {}),
     ({"$in": [9, [1, 2, 3]]}, {}),
     # Nested
@@ -164,6 +240,68 @@ CURATED = [
         {"xs": ["a", "b", "c"]},
     ),
     ({"$let": {"vars": {"d": {"$add": ["$x", 1]}}, "in": {"$multiply": ["$$d", 2]}}}, {"x": 5}),
+    # Set operators — union/intersection BSON-sorted, difference first-array order;
+    # dedup by BSON equality; a non-array arg or unsortable element defers.
+    ({"$setUnion": [[3, 1, 2], [5, 4]]}, {}),
+    ({"$setUnion": [[3, 3, 1], [1, 2]]}, {}),
+    ({"$setUnion": [["b", 1, "a"], [2, "a"]]}, {}),  # cross-type order
+    ({"$setUnion": [[1], [1.0]]}, {}),  # 1 == 1.0 dedup
+    ({"$setIntersection": [[3, 1, 2, 5], [2, 5, 1]]}, {}),
+    ({"$setIntersection": [[1, 2], [3, 4]]}, {}),  # empty
+    ({"$setDifference": [[5, 3, 1, 2], [3]]}, {}),
+    ({"$setEquals": [[1, 2], [2, 1]]}, {}),
+    ({"$setEquals": [[1, 2], [1, 3]]}, {}),
+    ({"$setIsSubset": [[1, 2], [1, 2, 3]]}, {}),
+    ({"$setIsSubset": [[1, 4], [1, 2, 3]]}, {}),
+    ({"$allElementsTrue": [[1, True]]}, {}),
+    ({"$allElementsTrue": [[1, 0]]}, {}),
+    ({"$anyElementTrue": [[0, False, 1]]}, {}),
+    ({"$setUnion": [[1], 5]}, {}),  # non-array -> defer
+    ({"$setUnion": [[True, 1]]}, {}),  # bool element -> defer (unsortable)
+    # $cmp / $binarySize / $bsonSize / degrees.
+    ({"$cmp": [1, 2]}, {}),
+    ({"$cmp": [5, 5]}, {}),
+    ({"$cmp": ["b", "a"]}, {}),
+    ({"$cmp": [1, "x"]}, {}),  # cross-type BSON order
+    ({"$binarySize": "$s"}, {"s": "héllo"}),
+    ({"$binarySize": "$x"}, {}),  # missing -> null
+    ({"$bsonSize": "$$ROOT"}, {"a": 5, "b": "x"}),
+    ({"$degreesToRadians": 180}, {}),
+    ({"$degreesToRadians": 45}, {}),
+    ({"$radiansToDegrees": 1}, {}),
+    ({"$radiansToDegrees": "$x"}, {}),  # missing -> null
+    # Trig family (libm: Rust f64 and CPython math share the platform libm, so
+    # they agree bit-for-bit; Decimal128 / bool / domain violations defer).
+    ({"$sin": 0}, {}),
+    ({"$sin": 1}, {}),
+    ({"$sin": 0.5}, {}),
+    ({"$cos": 1}, {}),
+    ({"$tan": 0.5}, {}),
+    ({"$asin": 0.5}, {}),
+    ({"$asin": 1}, {}),
+    ({"$acos": -0.5}, {}),
+    ({"$atan": 3.14159}, {}),
+    ({"$atan2": [1, 1]}, {}),
+    ({"$atan2": [1, 0]}, {}),
+    ({"$atan2": [0, 0]}, {}),
+    ({"$sinh": 1}, {}),
+    ({"$cosh": 0.5}, {}),
+    ({"$tanh": 2}, {}),
+    ({"$asinh": 1}, {}),
+    ({"$acosh": 2}, {}),
+    ({"$acosh": 1}, {}),
+    ({"$atanh": 0.5}, {}),
+    ({"$atanh": -0.5}, {}),  # negative: Rust f64::atanh is off by 1 ULP -> forced odd symmetry
+    ({"$atanh": -0.9}, {}),
+    ({"$atanh": 1}, {}),  # -> inf
+    ({"$atanh": -1}, {}),  # -> -inf
+    ({"$sin": None}, {}),  # null -> null
+    ({"$sin": "$x"}, {}),  # missing -> null
+    ({"$asin": 5}, {}),  # out of [-1,1] -> defer
+    ({"$acosh": 0.5}, {}),  # < 1 -> defer
+    ({"$cos": "hi"}, {}),  # non-numeric -> defer
+    ({"$sin": True}, {}),  # bool -> defer
+    ({"$atan2": ["hi", 1]}, {}),  # atan2 non-numeric -> defer
     # $map referencing a ROOT field path inside `in` ($$CURRENT stays ROOT).
     ({"$map": {"input": [1, 2], "in": {"$add": ["$$this", "$base"]}}}, {"base": 100}),
     # Date component extractors.
@@ -173,6 +311,31 @@ CURATED = [
     ({"$hour": "$d"}, {"d": _DT}),
     ({"$dayOfWeek": "$d"}, {"d": _DT}),
     ({"$year": "$d"}, {"d": "not a date"}),  # non-date -> null
+    # Date extractors — {date, timezone} object form. Instant->wall-clock is
+    # unambiguous, so fixed-offset and named IANA zones (via chrono-tz) both match
+    # Python zoneinfo. Corpus curated to post-2007 dates in decade-stable zones.
+    ({"$hour": {"date": "$d"}}, {"d": _DT}),  # no tz -> UTC
+    ({"$hour": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),  # fixed offset
+    (
+        {"$hour": {"date": "$d", "timezone": "America/New_York"}},
+        {"d": datetime.datetime(2023, 1, 15, 16, 30, tzinfo=datetime.timezone.utc)},  # winter EST
+    ),
+    (
+        {"$dayOfMonth": {"date": "$d", "timezone": "America/New_York"}},
+        # 02:30Z on the 15th is 21:30 EST on the 14th — the tz shift crosses midnight.
+        {"d": datetime.datetime(2023, 1, 15, 2, 30, tzinfo=datetime.timezone.utc)},
+    ),
+    (
+        {"$hour": {"date": "$d", "timezone": "Asia/Tokyo"}},
+        {"d": _DT},  # JST +09:00
+    ),
+    (
+        {"$dayOfWeek": {"date": "$d", "timezone": "Australia/Sydney"}},
+        {"d": _DT},
+    ),
+    ({"$year": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),
+    ({"$hour": {"date": "$x", "timezone": "UTC"}}, {}),  # missing date -> null
+    ({"$hour": {"date": "$d", "timezone": "Not/AZone"}}, {"d": _DT}),  # unknown -> defer
     # Type conversions (safe subset).
     ({"$toInt": 3.9}, {}),
     ({"$toInt": "$n"}, {"n": -3.9}),
@@ -193,6 +356,79 @@ CURATED = [
     ({"$toString": "$s"}, {"s": "hi"}),
     ({"$toInt": "12"}, {}),  # string parse -> defer
     ({"$toString": 3.14}, {}),  # float str() -> defer
+    # $toDecimal: int / bool / finite double (shortest round-trip text) / numeric
+    # string / Decimal128 passthrough. Floats use exactly-representable values so
+    # `{:?}` text matches Python's `repr` and the Decimal128 bytes agree.
+    ({"$toDecimal": 5}, {}),
+    ({"$toDecimal": "$n"}, {"n": Int64(7)}),
+    ({"$toDecimal": True}, {}),
+    ({"$toDecimal": 4.125}, {}),
+    ({"$toDecimal": "1234.5678"}, {}),
+    ({"$toDecimal": "$d"}, {"d": Decimal128("3.14")}),  # passthrough
+    ({"$toDecimal": "$x"}, {}),  # missing -> null
+    ({"$toDecimal": "notanumber"}, {}),  # unparseable -> defer
+    # $convert: bounded port (numeric / bool / decimal targets + null/onNull/
+    # onError). String / objectId targets and string/Decimal128 numeric sources
+    # defer to Python. Targets given as both alias strings and numeric codes.
+    ({"$convert": {"input": 5, "to": "double"}}, {}),
+    ({"$convert": {"input": True, "to": 1}}, {}),  # numeric target code
+    ({"$convert": {"input": 5, "to": "bool"}}, {}),
+    ({"$convert": {"input": 0, "to": "bool"}}, {}),
+    ({"$convert": {"input": "", "to": "bool"}}, {}),
+    ({"$convert": {"input": "hi", "to": "bool"}}, {}),
+    ({"$convert": {"input": True, "to": "int"}}, {}),
+    ({"$convert": {"input": 7.9, "to": "int"}}, {}),  # truncates
+    ({"$convert": {"input": 5, "to": "long"}}, {}),  # -> Int64
+    ({"$convert": {"input": "1234.5678", "to": "decimal"}}, {}),
+    ({"$convert": {"input": 5, "to": "decimal"}}, {}),
+    ({"$convert": {"input": 4.125, "to": "decimal"}}, {}),
+    ({"$convert": {"input": "$dt", "to": "date"}}, {"dt": datetime.datetime(2021, 1, 2)}),
+    ({"$convert": {"input": "$x", "to": "int", "onNull": -1}}, {}),  # null -> onNull
+    ({"$convert": {"input": "$x", "to": "int"}}, {}),  # null -> null
+    ({"$convert": {"input": "nope", "to": "decimal", "onError": -7}}, {}),  # fail -> onError
+    # $convert defers (Rust None; Python not invoked since rust is None first).
+    ({"$convert": {"input": 5, "to": "string"}}, {}),  # string target -> defer
+    ({"$convert": {"input": "notanumber", "to": "int"}}, {}),  # str->int defer
+    ({"$convert": {"input": "$d", "to": "int"}}, {"d": Decimal128("3.5")}),  # dec->int defer
+    ({"$convert": {"input": 5}}, {}),  # missing `to` -> defer
+    # $toDate: shorthand for $convert to "date". Rust handles the date
+    # passthrough natively (asserts) and defers int-millis / string to Python
+    # exactly like the $convert date path (keeping the tz-aware / naive datetime
+    # parity intact). null / missing -> null (handled in Rust). An ObjectId is
+    # unsupported by the $convert date path, so $toDate defers it too (Rust None).
+    ({"$toDate": "$d"}, {"d": _DT}),  # date passthrough -> asserts
+    ({"$toDate": "$x"}, {}),  # missing -> null
+    ({"$toDate": None}, {}),  # null -> null
+    ({"$toDate": 1700000000000}, {}),  # int millis -> defer to Python
+    ({"$toDate": "$n"}, {"n": Int64(1700000000000)}),  # int64 millis -> defer
+    ({"$toDate": "$s"}, {"s": "2026-04-28T12:00:00"}),  # ISO string -> defer
+    ({"$toDate": "$o"}, {"o": ObjectId("507f1f77bcf86cd799439011")}),  # objectId -> defer
+    # $regexMatch / $regexFind / $regexFindAll — ASCII patterns (byte offset ==
+    # code-point idx), simple captures. The linear `regex` crate's leftmost-first
+    # semantics align with Python `re` here.
+    ({"$regexMatch": {"input": "hello world", "regex": "wor"}}, {}),
+    ({"$regexMatch": {"input": "hello", "regex": "^h"}}, {}),
+    ({"$regexMatch": {"input": "Hello", "regex": "hello", "options": "i"}}, {}),
+    ({"$regexMatch": {"input": "hello", "regex": "xyz"}}, {}),  # no match -> False
+    ({"$regexMatch": {"input": 123, "regex": "1"}}, {}),  # non-string input -> False
+    ({"$regexMatch": {"input": "$s", "regex": "b"}}, {"s": "abc"}),  # field-path input
+    ({"$regexMatch": {"input": "aa", "regex": r"(a)\1"}}, {}),  # backref -> fancy is_match
+    ({"$regexFind": {"input": "hello world", "regex": "o"}}, {}),
+    ({"$regexFind": {"input": "2024-01", "regex": r"(\d+)-(\d+)"}}, {}),  # captures
+    ({"$regexFind": {"input": "a", "regex": "(a)(b)?"}}, {}),  # non-participating -> null
+    ({"$regexFind": {"input": "abc", "regex": "x"}}, {}),  # no match -> null
+    ({"$regexFind": {"input": 5, "regex": "5"}}, {}),  # non-string input -> null
+    ({"$regexFindAll": {"input": "a1b2c3", "regex": r"\d"}}, {}),
+    ({"$regexFindAll": {"input": "a1b2", "regex": r"([a-z])(\d)"}}, {}),  # captures
+    ({"$regexFindAll": {"input": "xyz", "regex": r"\d"}}, {}),  # none -> []
+    ({"$regexFindAll": {"input": 5, "regex": "."}}, {}),  # non-string -> []
+    # Fancy-regex finds: backreferences / lookaround now compute (the backtracking
+    # engine is Python-`re`-compatible), no longer deferring.
+    ({"$regexFind": {"input": "hello", "regex": r"(l)\1"}}, {}),  # backref -> "ll" @2
+    ({"$regexFind": {"input": "foobar", "regex": r"foo(?=bar)"}}, {}),  # lookahead, no capture
+    ({"$regexFind": {"input": "xfoobar", "regex": r"(?<=x)foo"}}, {}),  # lookbehind @1
+    ({"$regexFindAll": {"input": "aabbcc", "regex": r"(.)\1"}}, {}),  # backref, all pairs
+    ({"$regexMatch": {"input": "foobar", "regex": r"foo(?=bar)"}}, {}),  # lookahead match
     # Math (deterministic subset).
     ({"$abs": -5}, {}),
     ({"$abs": "$n"}, {"n": -5.5}),
@@ -207,9 +443,227 @@ CURATED = [
     ({"$sqrt": 2}, {}),
     ({"$sqrt": "$n"}, {"n": -1}),  # negative -> null
     ({"$sqrt": 0}, {}),
-    # $dateToParts (UTC).
+    # $exp / $ln / $log (libm: Rust f64 and CPython math share the platform libm,
+    # so the bits agree; the test asserts rust == py, not a literal).
+    ({"$exp": 0}, {}),
+    ({"$exp": 1}, {}),
+    ({"$exp": "$x"}, {}),  # missing -> null
+    ({"$ln": 1}, {}),
+    ({"$ln": "$n"}, {"n": 2.5}),
+    ({"$ln": 0}, {}),  # <= 0 -> null
+    ({"$ln": -3}, {}),  # -> null
+    ({"$log": [8, 2]}, {}),
+    ({"$log": [100, 10]}, {}),
+    ({"$log": [8, 1]}, {}),  # base 1 -> null
+    ({"$log": [None, 2]}, {}),  # null arg -> null
+    ({"$log10": 100}, {}),
+    ({"$log10": 1000}, {}),
+    ({"$log10": "$n"}, {"n": 2.5}),
+    ({"$log10": 0}, {}),  # <= 0 -> null
+    ({"$log10": -5}, {}),  # -> null
+    ({"$log10": "$missing"}, {}),  # missing -> null
+    # $pow: int**non-neg-int -> int; float operand / negative exp -> double.
+    ({"$pow": [2, 10]}, {}),
+    ({"$pow": [2, 0]}, {}),
+    ({"$pow": [2, -1]}, {}),  # -> 0.5 (double)
+    ({"$pow": [2.0, 3]}, {}),  # float base -> double
+    ({"$pow": ["$b", 3]}, {"b": 3}),
+    # $round: half-to-even; int stays int, double rounds to `place` decimals.
+    ({"$round": [3.14159, 2]}, {}),
+    ({"$round": [2.25, 1]}, {}),  # banker's: 2.25 -> 2.2
+    ({"$round": 5}, {}),  # int -> unchanged int
+    ({"$round": [15, -1]}, {}),  # -> 20 (int)
+    ({"$round": "$x"}, {}),  # missing -> null
+    # $trunc: truncate toward zero; always a double (Python `/` float division).
+    ({"$trunc": [3.789, 2]}, {}),
+    ({"$trunc": 5}, {}),  # -> 5.0 (double)
+    ({"$trunc": [-3.789, 1]}, {}),
+    # $dateToParts — UTC and timezone (instant->wall-clock; fixed-offset + named
+    # IANA zones both compute, curated to post-2007 dates in decade-stable zones).
     ({"$dateToParts": {"date": "$d"}}, {"d": _DT}),
     ({"$dateToParts": {"date": "$x"}}, {}),  # missing -> null
+    ({"$dateToParts": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),
+    (
+        {"$dateToParts": {"date": "$d", "timezone": "America/New_York"}},
+        {"d": datetime.datetime(2023, 1, 15, 16, 30, 45, tzinfo=datetime.timezone.utc)},
+    ),
+    ({"$dateToParts": {"date": "$d", "timezone": "Asia/Tokyo"}}, {"d": _DT}),
+    ({"$dateToParts": {"date": "$d", "timezone": "Not/AZone"}}, {"d": _DT}),  # unknown -> defer
+    # $dateFromParts — calendar build with rollover; defaults month/day=1, time=0;
+    # any null component -> null; fixed-offset tz is local->instant. Non-integral,
+    # missing/out-of-range year, ISO-week form, named tz all defer (Python raises
+    # or computes via zoneinfo).
+    ({"$dateFromParts": {"year": 2023, "month": 6, "day": 15}}, {}),
+    ({"$dateFromParts": {"year": 2023, "month": 13, "day": 1}}, {}),  # rollover
+    ({"$dateFromParts": {"year": 2023, "month": 0, "day": 1}}, {}),
+    ({"$dateFromParts": {"year": 2023, "month": 6, "day": 0}}, {}),
+    ({"$dateFromParts": {"year": 2023, "month": 6, "day": 15, "hour": 25}}, {}),
+    ({"$dateFromParts": {"year": 2023, "month": -1}}, {}),
+    ({"$dateFromParts": {"year": 2023.0, "month": 6.0, "day": 15.0}}, {}),  # integral doubles
+    ({"$dateFromParts": {"year": 2023, "millisecond": 1500}}, {}),
+    ({"$dateFromParts": {"year": "$y", "month": 3, "day": 15}}, {"y": 2024}),  # expr year
+    (
+        {"$dateFromParts": {"year": 2023, "month": 6, "day": 15, "hour": 12, "timezone": "+05:00"}},
+        {},
+    ),
+    ({"$dateFromParts": {"year": 2023, "timezone": "-08:00"}}, {}),
+    ({"$dateFromParts": {"year": None, "month": 6}}, {}),  # null -> null
+    ({"$dateFromParts": {"year": 2023, "month": 6.5}}, {}),  # non-integral -> defer
+    ({"$dateFromParts": {"month": 6}}, {}),  # missing year -> defer
+    ({"$dateFromParts": {"year": 10000}}, {}),  # year range -> defer
+    ({"$dateFromParts": {"isoWeekYear": 2023}}, {}),  # iso form -> defer
+    ({"$dateFromParts": {"year": 2023, "timezone": "America/New_York"}}, {}),  # named tz -> defer
+    # $dateFromParts ISO-week form — Monday of ISO week 1 + (week-1)/(day-1) rollover.
+    ({"$dateFromParts": {"isoWeekYear": 2023, "isoWeek": 5, "isoDayOfWeek": 3}}, {}),
+    ({"$dateFromParts": {"isoWeekYear": 2023}}, {}),  # defaults isoWeek/day = 1
+    ({"$dateFromParts": {"isoWeekYear": 2023, "isoWeek": 53, "isoDayOfWeek": 1}}, {}),  # rollover
+    ({"$dateFromParts": {"isoWeekYear": 2023, "isoWeek": 5, "timezone": "+05:00"}}, {}),
+    ({"$dateFromParts": {"isoWeek": 5}}, {}),  # missing isoWeekYear -> defer
+    # $tsSecond / $tsIncrement — Timestamp fields; null -> null; non-ts -> defer.
+    ({"$tsSecond": "$t"}, {"t": Timestamp(1700000000, 7)}),
+    ({"$tsIncrement": "$t"}, {"t": Timestamp(1700000000, 7)}),
+    ({"$tsSecond": "$x"}, {}),  # missing -> null
+    ({"$tsSecond": 5}, {}),  # non-timestamp -> defer
+    # $type — full type coverage incl. missing.
+    ({"$type": "$a"}, {"a": 5}),
+    ({"$type": "$a"}, {"a": Int64(9)}),
+    ({"$type": "$a"}, {"a": 3.5}),
+    ({"$type": "$a"}, {"a": Decimal128("1.5")}),
+    ({"$type": "$a"}, {"a": True}),
+    ({"$type": "$a"}, {"a": "s"}),
+    ({"$type": "$a"}, {"a": [1]}),
+    ({"$type": "$a"}, {"a": None}),  # explicit null
+    ({"$type": "$a"}, {"a": ObjectId()}),
+    ({"$type": "$a"}, {"a": Timestamp(1, 2)}),
+    ({"$type": "$missing"}, {}),  # missing field -> "missing"
+    ({"$type": {"$literal": 5}}, {}),
+    # $isNumber / $isArray.
+    ({"$isNumber": "$a"}, {"a": 5}),
+    ({"$isNumber": "$a"}, {"a": Decimal128("1.5")}),
+    ({"$isNumber": "$a"}, {"a": True}),
+    ({"$isNumber": "$a"}, {"a": "s"}),
+    ({"$isNumber": "$x"}, {}),  # missing -> False
+    ({"$isArray": "$a"}, {"a": [1, 2]}),
+    ({"$isArray": "$a"}, {"a": "s"}),
+    # $strcasecmp — case-insensitive; null -> "".
+    ({"$strcasecmp": ["abc", "ABC"]}, {}),
+    ({"$strcasecmp": ["a", "b"]}, {}),
+    ({"$strcasecmp": ["b", "a"]}, {}),
+    ({"$strcasecmp": ["$n", "a"]}, {"n": None}),
+    ({"$strcasecmp": ["café", "CAFÉ"]}, {}),  # non-ASCII -> defer
+    # $replaceOne / $replaceAll.
+    ({"$replaceOne": {"input": "abcabc", "find": "bc", "replacement": "X"}}, {}),
+    ({"$replaceAll": {"input": "abcabc", "find": "bc", "replacement": "X"}}, {}),
+    ({"$replaceOne": {"input": "xyz", "find": "a", "replacement": "b"}}, {}),  # no match
+    (
+        {"$replaceAll": {"input": "$n", "find": "a", "replacement": "b"}},
+        {"n": None},
+    ),  # null -> null
+    ({"$replaceOne": {"input": "abc", "find": 5, "replacement": "b"}}, {}),  # non-string -> defer
+    # $dateFromString — parity-safe slice: naive canonical ISO (date-only /
+    # whole-second), no format/timezone. Fractional / Z / offset / format /
+    # timezone / invalid all defer.
+    ({"$dateFromString": {"dateString": "2024-01-15"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00"}}, {}),
+    ({"$dateFromString": {"dateString": "$s"}}, {"s": "2020-02-29T23:59:59"}),  # leap day
+    ({"$dateFromString": {"dateString": None}}, {}),  # null -> null
+    ({"$dateFromString": {"dateString": None, "onNull": "was null"}}, {}),  # -> onNull
+    # tz designators compute — result normalised to its UTC instant (naive) both
+    # sides. Z (UTC), + offset (wall - offset), - offset (wall + offset).
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00Z"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00+05:00"}}, {}),  # -> 05:30Z
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00-08:00"}}, {}),  # -> 18:30Z
+    ({"$dateFromString": {"dateString": "2024-01-15T00:30:00+05:00"}}, {}),  # crosses to prev day
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00.123456"}}, {}),  # frac -> defer
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00.5Z"}}, {}),  # frac+Z -> defer
+    ({"$dateFromString": {"dateString": "2024-13-01"}}, {}),  # bad month -> defer
+    (
+        {"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}},
+        {},
+    ),  # format -> defer
+    ({"$dateFromString": {"dateString": "2024-01-15", "timezone": "America/New_York"}}, {}),  # tz
+    # Fixed-offset timezone: a naive string is interpreted in that zone
+    # (utc = wall - offset); UTC/GMT aliases and ±HHMM / ±HH:MM forms compute.
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "+05:00"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15", "timezone": "-08:00"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "+0530"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "UTC"}}, {}),
+    # A string that already carries an offset ignores the timezone field.
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00Z", "timezone": "+05:00"}}, {}),
+    # $dateFromString `format` (strptime) — numeric-directive subset, built from
+    # CPython _strptime's exact per-directive regexes so field matching agrees.
+    ({"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:45", "format": "%Y-%m-%dT%H:%M:%S"}}, {}),
+    ({"$dateFromString": {"dateString": "20240115", "format": "%Y%m%d"}}, {}),  # adjacent
+    ({"$dateFromString": {"dateString": "2024-1-5", "format": "%Y-%m-%d"}}, {}),  # single-digit
+    ({"$dateFromString": {"dateString": "68-06-15", "format": "%y-%m-%d"}}, {}),  # 2000s pivot
+    ({"$dateFromString": {"dateString": "69-06-15", "format": "%y-%m-%d"}}, {}),  # 1900s pivot
+    ({"$dateFromString": {"dateString": "2024-100", "format": "%Y-%j"}}, {}),  # day-of-year
+    ({"$dateFromString": {"dateString": "100", "format": "%j"}}, {}),  # default year 1900
+    ({"$dateFromString": {"dateString": "date: 2024-01-15", "format": "date: %Y-%m-%d"}}, {}),
+    (
+        {
+            "$dateFromString": {
+                "dateString": "2024-01-15",
+                "format": "%Y-%m-%d",
+                "timezone": "+05:00",
+            }
+        },
+        {},
+    ),
+    # defers: bad field / leap second / unsupported directive / literal mismatch.
+    ({"$dateFromString": {"dateString": "2023-02-29", "format": "%Y-%m-%d"}}, {}),  # -> defer
+    (
+        {"$dateFromString": {"dateString": "10:30:60", "format": "%H:%M:%S"}},
+        {},
+    ),  # leap sec -> defer
+    ({"$dateFromString": {"dateString": "2024-01-15", "format": "%Y-%m-%d%z"}}, {}),  # %z -> defer
+    (
+        {"$dateFromString": {"dateString": "2024/01/15", "format": "%Y-%m-%d"}},
+        {},
+    ),  # mismatch -> defer
+    # $dateToString — default format + unambiguous directives. `_DT` is a modern
+    # date; a separate date carries non-zero milliseconds for %L.
+    ({"$dateToString": {"date": "$d"}}, {"d": _DT}),  # default %Y-%m-%dT%H:%M:%S.%LZ
+    ({"$dateToString": {"date": "$d", "format": "%Y-%m-%d"}}, {"d": _DT}),
+    ({"$dateToString": {"date": "$d", "format": "%H:%M:%S"}}, {"d": _DT}),
+    ({"$dateToString": {"date": "$d", "format": "doy=%j dow=%w iso=%u"}}, {"d": _DT}),
+    ({"$dateToString": {"date": "$d", "format": "literal %% pct"}}, {"d": _DT}),
+    ({"$dateToString": {"date": "$m"}}, {"m": _mkdate(1_749_000_000_234)}),  # %L = 234
+    ({"$dateToString": {"date": 5}}, {}),  # non-datetime -> null
+    ({"$dateToString": {"date": "$x"}}, {}),  # missing -> null
+    # Named IANA timezone: Rust resolves the DST-correct offset at the instant via
+    # chrono-tz (instant->wall-clock is unambiguous, so it matches Python zoneinfo).
+    # Curated to post-2007 dates in decade-stable major zones to stay clear of tzdb
+    # release skew between chrono-tz's bundled db and CI's Python tzdata.
+    ({"$dateToString": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),  # summer EDT
+    (
+        {
+            "$dateToString": {
+                "date": "$d",
+                "format": "%Y-%m-%d %H:%M",
+                "timezone": "America/New_York",
+            }
+        },
+        {"d": datetime.datetime(2023, 1, 15, 16, 30, tzinfo=datetime.timezone.utc)},  # winter EST
+    ),
+    (
+        {"$dateToString": {"date": "$d", "format": "%H:%M", "timezone": "Europe/Dublin"}},
+        {"d": datetime.datetime(2023, 7, 15, 16, 30, tzinfo=datetime.timezone.utc)},  # IST +01:00
+    ),
+    (
+        {"$dateToString": {"date": "$d", "format": "%Y-%m-%d %H:%M", "timezone": "Asia/Tokyo"}},
+        {"d": _DT},  # JST +09:00 (no DST)
+    ),
+    ({"$dateToString": {"date": "$d", "timezone": "Not/AZone"}}, {"d": _DT}),  # unknown -> defer
+    # Fixed-offset timezone shifts the wall clock before rendering.
+    ({"$dateToString": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),
+    (
+        {"$dateToString": {"date": "$d", "timezone": "-0800", "format": "%Y-%m-%d %H:%M"}},
+        {"d": _DT},
+    ),
+    ({"$dateToString": {"date": "$d", "timezone": "UTC"}}, {"d": _DT}),
+    ({"$dateToString": {"date": "$d", "format": "%z"}}, {"d": _DT}),  # unknown directive -> defer
     # $range.
     ({"$range": [0, 5]}, {}),
     ({"$range": [0, 10, 2]}, {}),
@@ -243,7 +697,10 @@ CURATED = [
     ({"$trim": {"input": "$s", "chars": " "}}, {"s": None}),  # null input -> null
     # $getField / $setField / $zip.
     ({"$getField": "x"}, {"x": 5}),
-    ({"$getField": "missing"}, {}),  # absent -> null
+    ({"$getField": "missing"}, {}),  # absent -> MISSING marker -> Rust defers
+    ({"$getField": {"field": "k", "input": "$o"}}, {"o": {"j": 2}}),  # absent field -> defer
+    ({"$getField": {"field": "k", "input": "$o"}}, {"o": {"k": None}}),  # present null -> null
+    ({"$getField": {"field": "k", "input": "$o"}}, {}),  # input path missing -> defer
     ({"$getField": {"field": "a.b", "input": "$o"}}, {"o": {"a.b": 9, "c": 1}}),
     ({"$getField": {"field": "$fname", "input": "$o"}}, {"fname": "k", "o": {"k": 7}}),
     ({"$getField": {"field": "k", "input": "$o"}}, {"o": None}),  # null input -> null
@@ -257,6 +714,38 @@ CURATED = [
     ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True}}, {}),
     ({"$zip": {"inputs": [[1, 2, 3], [4]], "useLongestLength": True, "defaults": [0, 0]}}, {}),
     ({"$zip": {"inputs": "$x"}}, {}),  # missing -> null inputs -> null
+    # New date-component extractors ($dayOfYear/$week/$isoWeek/$isoDayOfWeek/
+    # $isoWeekYear/$millisecond) — bare-date and {date, timezone} forms.
+    ({"$dayOfYear": "$d"}, {"d": _DT}),
+    ({"$week": "$d"}, {"d": _DT}),
+    ({"$isoWeek": "$d"}, {"d": _DT}),
+    ({"$isoDayOfWeek": "$d"}, {"d": _DT}),
+    ({"$isoWeekYear": "$d"}, {"d": _DT}),
+    ({"$millisecond": "$d"}, {"d": _DT}),
+    ({"$millisecond": "$d"}, {"d": _mkdate(_DT.timestamp() * 1000 + 123)}),
+    # Year-boundary cases (Jan 1 Thursday -> US week 0; Jan 1 next year Friday ->
+    # ISO week 53 of the prior ISO year).
+    ({"$week": "$d"}, {"d": datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)}),
+    ({"$isoWeek": "$d"}, {"d": datetime.datetime(2027, 1, 1, tzinfo=datetime.timezone.utc)}),
+    ({"$isoWeekYear": "$d"}, {"d": datetime.datetime(2027, 1, 1, tzinfo=datetime.timezone.utc)}),
+    ({"$dayOfYear": "$d"}, {"d": datetime.datetime(2024, 12, 31, tzinfo=datetime.timezone.utc)}),
+    # {date, timezone} object form — fixed offset and named IANA zone crossing a
+    # day boundary. (Named-zone cases compute on the Rust side via chrono-tz.)
+    ({"$dayOfYear": {"date": "$d", "timezone": "-05:00"}}, {"d": _DT}),
+    ({"$isoDayOfWeek": {"date": "$d", "timezone": "+05:30"}}, {"d": _DT}),
+    ({"$isoWeek": {"date": "$d", "timezone": "America/New_York"}}, {"d": _DT}),
+    # null / non-date operands -> null (both engines).
+    ({"$isoWeek": "$x"}, {}),
+    ({"$millisecond": "$d"}, {"d": None}),
+    # $dateToParts iso8601 both modes + timezone.
+    ({"$dateToParts": {"date": "$d", "iso8601": True}}, {"d": _DT}),
+    ({"$dateToParts": {"date": "$d", "iso8601": False}}, {"d": _DT}),
+    (
+        {"$dateToParts": {"date": "$d", "iso8601": True}},
+        {"d": datetime.datetime(2027, 1, 1, 2, 0, tzinfo=datetime.timezone.utc)},
+    ),
+    ({"$dateToParts": {"date": "$d", "iso8601": True, "timezone": "-05:00"}}, {"d": _DT}),
+    ({"$dateToParts": {"date": "$d", "iso8601": True, "timezone": "America/New_York"}}, {"d": _DT}),
     # Date arithmetic.
     ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 5}}, {"d": _DT}),
     ({"$dateAdd": {"startDate": "$d", "unit": "month", "amount": 1}}, {"d": _DT}),
@@ -316,8 +805,23 @@ def test_curated_parity(expr, doc):
     rust = _rust_eval(expr, doc)
     if rust is None:
         return
-    py = _pure.evaluate(expr, doc)
+    py = _bson_norm(_pure.evaluate(expr, doc))
     assert rust == py, f"rust={rust!r} pure={py!r} expr={expr}"
+
+
+def test_rand_shape_parity():
+    # $rand is non-deterministic — the engines can't agree bit-for-bit, only on
+    # the shape: a float in [0, 1). Verify both produce that (and that the Rust
+    # engine evaluates it, not defers), and that a malformed arg defers/raises.
+    for _ in range(64):
+        rust = _rust_eval({"$rand": {}}, {})
+        assert isinstance(rust, float) and 0.0 <= rust < 1.0, f"rust $rand={rust!r}"
+        py = _pure.evaluate({"$rand": {}}, {})
+        assert isinstance(py, float) and 0.0 <= py < 1.0, f"pure $rand={py!r}"
+    # Non-empty argument: Rust defers (None), Python raises a parse error.
+    assert _rust_eval({"$rand": {"x": 1}}, {}) is None
+    with pytest.raises(_pure.ExpressionError):
+        _pure.evaluate({"$rand": {"x": 1}}, {})
 
 
 def _rand_scalar(rng):
@@ -416,7 +920,21 @@ def test_date_extractor_fuzz():
     (negative millis) — against Python's datetime."""
     rng = random.Random(0xDA7E)
     epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-    ops = ["$year", "$month", "$dayOfMonth", "$hour", "$minute", "$second", "$dayOfWeek"]
+    ops = [
+        "$year",
+        "$month",
+        "$dayOfMonth",
+        "$hour",
+        "$minute",
+        "$second",
+        "$millisecond",
+        "$dayOfWeek",
+        "$dayOfYear",
+        "$week",
+        "$isoWeek",
+        "$isoDayOfWeek",
+        "$isoWeekYear",
+    ]
     for _ in range(4000):
         # ~ year 1900 .. 2400 (spans negative/positive millis)
         ms = rng.randint(-2_200_000_000_000, 13_600_000_000_000)
@@ -429,6 +947,48 @@ def test_date_extractor_fuzz():
                 continue
             py = _pure.evaluate(expr, doc)
             assert rust == py, f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
+
+
+def test_date_from_string_strptime_fuzz():
+    """$dateFromString `format` (strptime): the Rust regex-built parser must match
+    Python's datetime.strptime exactly wherever Rust computes (else it defers).
+    Mixes valid strftime-rendered inputs with random junk so both the compute and
+    the defer/raise paths are exercised."""
+    rng = random.Random(0x57717D)
+    fmts = [
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y%m%d",
+        "%m-%d-%Y",
+        "%Y-%j",
+        "%y-%m-%d",
+        "at %Y-%m-%d %H:%M",
+        "%H:%M:%S",
+    ]
+    for _ in range(6000):
+        fmt = rng.choice(fmts)
+        if rng.random() < 0.8:
+            try:
+                dt = datetime.datetime(
+                    rng.randint(1, 9999),
+                    rng.randint(1, 12),
+                    rng.randint(1, 28),
+                    rng.randint(0, 23),
+                    rng.randint(0, 59),
+                    rng.randint(0, 59),
+                )
+                inp = dt.strftime(fmt)
+            except ValueError:
+                continue
+        else:
+            inp = "".join(rng.choice("0123456789-/T: ") for _ in range(rng.randint(3, 12)))
+        expr = {"$dateFromString": {"dateString": inp, "format": fmt}}
+        rust = _rust_eval(expr, {})
+        if rust is None:
+            continue  # Rust deferred -> Python (compute or raise) handles it
+        py = _bson_norm(_pure.evaluate(expr, {}))
+        assert rust == py, f"rust={rust!r} pure={py!r} inp={inp!r} fmt={fmt!r}"
 
 
 def test_date_arithmetic_fuzz():

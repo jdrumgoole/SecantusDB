@@ -43,6 +43,9 @@ pub struct ResumeTokenData {
     pub ts: Timestamp,
     pub ns: String,
     pub document_key: Document,
+    /// True for the token of an `invalidate` event. `resumeAfter` on such a token
+    /// is rejected (the stream it came from is over); `startAfter` is required.
+    pub from_invalidate: bool,
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -70,6 +73,9 @@ pub fn make_resume_token(data: &ResumeTokenData) -> Result<Document> {
     inner.insert("t", Bson::Timestamp(data.ts));
     inner.insert("n", data.ns.clone());
     inner.insert("k", Bson::Document(data.document_key.clone()));
+    if data.from_invalidate {
+        inner.insert("i", true);
+    }
     let bytes = encode_doc(&inner)?;
     let mut out = Document::new();
     out.insert("_data", hex_encode(&bytes));
@@ -100,6 +106,7 @@ pub fn parse_resume_token(token: &Document) -> Result<ResumeTokenData> {
         ts,
         ns: inner.get_str("n").unwrap_or("").to_string(),
         document_key: inner.get_document("k").cloned().unwrap_or_default(),
+        from_invalidate: inner.get_bool("i").unwrap_or(false),
     })
 }
 
@@ -171,6 +178,22 @@ fn attach_full_document(
     {
         let ns = oplog_entry.get_str("ns").unwrap_or("");
         let (db, coll) = split_ns(ns);
+        // `required` / `whenAvailable` read the stored POST-image (mongod 6.0
+        // semantics): the collection must have changeStreamPreAndPostImages
+        // enabled. With it disabled, `required` errors and `whenAvailable` yields
+        // null. Only the legacy `updateLookup` does a live re-read regardless.
+        if (mode == FULL_DOC_REQUIRED || mode == FULL_DOC_WHEN_AVAILABLE)
+            && !storage.pre_post_images_enabled(&db, &coll)?
+        {
+            if mode == FULL_DOC_REQUIRED {
+                return Err(StorageError::ChangeStreamFatal(format!(
+                    "the 'fullDocument: required' option requires \
+                     changeStreamPreAndPostImages to be enabled on the collection {ns}"
+                )));
+            }
+            event.insert("fullDocument", Bson::Null);
+            return Ok(());
+        }
         let doc_id = oplog_entry
             .get_document("o2")
             .ok()
@@ -231,6 +254,7 @@ fn attach_full_document_before_change(
 /// opt into). `invalidates_after` is `true` when the cursor should emit a final
 /// `invalidate` after this event (drop on a watched collection, etc.). Mirrors
 /// `changestreams.project`.
+#[allow(clippy::too_many_arguments)]
 pub fn project(
     seq: i64,
     oplog_entry: &Document,
@@ -281,6 +305,7 @@ pub fn project(
             ts,
             ns: ns.clone(),
             document_key: document_key.clone(),
+            from_invalidate: false,
         })?;
         let mut event = Document::new();
         event.insert("_id", Bson::Document(token));
@@ -290,6 +315,13 @@ pub fn project(
         event.insert("documentKey", Bson::Document(document_key));
         if let Some(w) = &wall {
             event.insert("wallTime", w.clone());
+        }
+        // showExpandedEvents surfaces the collection UUID on CRUD events (mongod
+        // 6.0+). The oplog entry carries it as `ui` (BinData 4).
+        if show_expanded_events {
+            if let Some(ui) = oplog_entry.get("ui") {
+                event.insert("collectionUUID", ui.clone());
+            }
         }
         if op == "u" && op_type == "update" {
             let diff = oplog_entry
@@ -316,6 +348,10 @@ pub fn project(
             storage,
             full_document_before_change_mode,
         )?;
+        // Splitting (splitLargeChangeStreamEvents / $changeStreamSplitLargeEvent)
+        // is applied by the caller via `stamp_split_event` so one over-16MB event
+        // can expand into several fragments — mirrors `commands.py`'s producer
+        // applying `stamp_split_event` to each projected event.
         return Ok((Some(event), false));
     }
 
@@ -344,6 +380,7 @@ fn project_command(
             ts,
             ns: affected_ns.to_string(),
             document_key: Document::new(),
+            from_invalidate: false,
         })?;
         let mut event = Document::new();
         event.insert("_id", Bson::Document(token));
@@ -394,16 +431,50 @@ fn project_command(
         if !to_coll.is_empty() {
             to.insert("coll", to_coll);
         }
-        let event = base(
-            "rename",
-            from_ns,
-            &[
-                ("ns", Bson::Document(ns_doc(from_ns))),
-                ("to", Bson::Document(to)),
-            ],
-        )?;
+        let mut fields: Vec<(&str, Bson)> = vec![
+            ("ns", Bson::Document(ns_doc(from_ns))),
+            ("to", Bson::Document(to.clone())),
+        ];
+        if show_expanded_events {
+            // mongod 6.0+ attaches `operationDescription` to expanded rename
+            // events: the `to` namespace plus `dropTarget` (the dropped target
+            // collection's UUID) when the rename replaced an existing collection.
+            let mut op_desc = Document::new();
+            op_desc.insert("to", Bson::Document(to));
+            if let Some(dt) = cmd.get("dropTarget") {
+                op_desc.insert("dropTarget", dt.clone());
+            }
+            fields.push(("operationDescription", Bson::Document(op_desc)));
+        }
+        let event = base("rename", from_ns, &fields)?;
         let invalidates = matches!(scope, Scope::Coll { .. });
         return Ok((Some(event), invalidates));
+    }
+    if let Ok(coll) = cmd.get_str("create") {
+        if !show_expanded_events {
+            return Ok((None, false));
+        }
+        let affected_ns = format!("{cmd_db}.{coll}");
+        if !scope_matches(&affected_ns, scope) {
+            return Ok((None, false));
+        }
+        // `operationDescription` carries the create options other than the name
+        // (e.g. `idIndex`), matching mongod's expanded `create` event.
+        let mut op_desc = Document::new();
+        for (k, v) in &cmd {
+            if k != "create" {
+                op_desc.insert(k.clone(), v.clone());
+            }
+        }
+        let event = base(
+            "create",
+            &affected_ns,
+            &[
+                ("ns", Bson::Document(ns_doc(&affected_ns))),
+                ("operationDescription", Bson::Document(op_desc)),
+            ],
+        )?;
+        return Ok((Some(event), false));
     }
     if let Ok(coll) = cmd.get_str("createIndexes") {
         if !show_expanded_events {
@@ -465,6 +536,31 @@ fn project_command(
         )?;
         return Ok((Some(event), false));
     }
+    if let Ok(coll) = cmd.get_str("collMod") {
+        if !show_expanded_events {
+            return Ok((None, false));
+        }
+        let affected_ns = format!("{cmd_db}.{coll}");
+        if !scope_matches(&affected_ns, scope) {
+            return Ok((None, false));
+        }
+        // `operationDescription` is the collMod doc minus the command name.
+        let mut op_desc = Document::new();
+        for (k, v) in &cmd {
+            if k != "collMod" {
+                op_desc.insert(k.clone(), v.clone());
+            }
+        }
+        let event = base(
+            "modify",
+            &affected_ns,
+            &[
+                ("ns", Bson::Document(ns_doc(&affected_ns))),
+                ("operationDescription", Bson::Document(op_desc)),
+            ],
+        )?;
+        return Ok((Some(event), false));
+    }
     Ok((None, false))
 }
 
@@ -492,6 +588,7 @@ pub fn invalidate_event(seq: i64, oplog_entry: &Document) -> Result<Document> {
         ts,
         ns: affected_ns,
         document_key: Document::new(),
+        from_invalidate: true,
     })?;
     let mut event = Document::new();
     event.insert("_id", Bson::Document(token));

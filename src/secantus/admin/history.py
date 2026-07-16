@@ -62,13 +62,28 @@ class HistoryStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @staticmethod
+    def _key(uri: str) -> str:
+        # Never persist a credentialed URI. The password (and query
+        # string) are stripped to the same ``display_uri`` form used for
+        # rendering, so a plaintext ``mongodb://user:pass@host`` can't
+        # end up sitting in the on-disk admin.db (readable by any process
+        # running as the same local user, and captured in any dump of the
+        # file). Scrubbing here — at the store boundary — means a caller
+        # passing the raw URI can't reintroduce the leak. The scrubbed
+        # form is deterministic, so record/recent still key consistently.
+        from secantus.admin.client import display_uri
+
+        return display_uri(uri)
+
     def record(self, uri: str, kind: str, payload: str) -> None:
         if kind not in VALID_KINDS:
             raise ValueError(f"unknown kind: {kind!r}")
+        key = self._key(uri)
         with closing(self._connect()) as conn:
             conn.execute(
                 "INSERT INTO recent_queries (uri, kind, payload, created_at) VALUES (?, ?, ?, ?)",
-                (uri, kind, payload, self._time()),
+                (key, kind, payload, self._time()),
             )
             # Prune oldest beyond MAX_PER_URI.
             conn.execute(
@@ -82,11 +97,12 @@ class HistoryStore:
                       LIMIT ?
                   )
                 """,
-                (uri, uri, MAX_PER_URI),
+                (key, key, MAX_PER_URI),
             )
             conn.commit()
 
     def recent(self, uri: str, *, limit: int = 20) -> list[HistoryEntry]:
+        key = self._key(uri)
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
@@ -96,7 +112,7 @@ class HistoryStore:
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """,
-                (uri, max(1, int(limit))),
+                (key, max(1, int(limit))),
             ).fetchall()
         return [
             HistoryEntry(

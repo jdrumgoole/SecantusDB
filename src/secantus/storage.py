@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time as _time
 import uuid as _uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any
 
 import bson
@@ -142,6 +142,10 @@ _ROLES_TABLE = "table:secantus_roles"
 _PROFILE_TABLE = "table:secantus_profile_settings"
 
 _OPLOG_PRUNE_INTERVAL = 1000  # call prune_oplog every N emits
+
+# Name of the advisory point-in-time-recovery manifest embedded in a backup
+# archive (see Storage._pitr_manifest). Not a WiredTiger file; WT ignores it.
+_PITR_MANIFEST_NAME = "pitr-manifest.json"
 
 _ENTRY_SEP = b"\x00\x00"
 
@@ -690,6 +694,14 @@ class IndexOptionsConflict(Exception):
     ``Collection#create_indexes`` specs) assert on the rejection."""
 
 
+class IndexKeySpecsConflict(Exception):
+    """``create_index`` was called with a name that already exists in the
+    collection but for a **different key spec** (e.g. ``{a: 1}`` vs
+    ``{a: -1}``). Real mongod rejects with ``IndexKeySpecsConflict`` (code
+    86); mongo-cxx-driver's ``create_index tests/fails`` and
+    ``index_view/fails for same name`` pin the rejection."""
+
+
 class GeoExtractError(Exception):
     """Doc's geo field can't be indexed — bad shape or out-of-bounds coords.
 
@@ -782,6 +794,8 @@ class Storage:
         cache_size: str = "1G",
         session_max: int = 1000,
         sync_on_commit: bool = False,
+        oplog_archive_dir: str | None = None,
+        durable: bool | None = None,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -821,6 +835,32 @@ class Storage:
         self.cache_size = cache_size
         self.session_max = session_max
         self.sync_on_commit = sync_on_commit
+        # ``durable`` (I2a test-mode fast storage). Resolution precedence:
+        #   1. ``SECANTUS_FORCE_DURABLE=1`` — always durable, overriding any
+        #      caller/default. This is the switch that runs the WHOLE test suite
+        #      against real journal + close-checkpoint durability (the "real
+        #      durable disk testing" path): `SECANTUS_FORCE_DURABLE=1 invoke
+        #      test`, and a dedicated CI lane.
+        #   2. explicit ``durable=`` argument (persistence / reopen / PITR /
+        #      backup fixtures pass ``durable=True`` so they always exercise the
+        #      journal + checkpoint, regardless of the test-fast default).
+        #   3. ``durable=None`` (unset) — durable UNLESS
+        #      ``SECANTUS_TEST_FAST_STORAGE=1`` is set (the test conftest sets it
+        #      so the default suite runs fast). Production never sets it, so the
+        #      shipped ``SecantusDBServer`` defaults to fully durable.
+        # ``durable=False`` opens the on-disk engine with the journal disabled
+        # and skips the checkpoint on ``close()``. All 12 tables are still
+        # created on disk (schema / B-tree / within-session persistence stay
+        # real), but the instance is NOT crash- or reopen-durable — correct only
+        # for ephemeral test instances whose storage dir is discarded. It cuts
+        # open+close from ~245 ms to ~52 ms and, more importantly, removes the
+        # fsync that serialises across parallel test workers (see
+        # tasks/test-performance-plan.md §I2a and the scaling curve).
+        if os.environ.get("SECANTUS_FORCE_DURABLE") == "1":
+            durable = True
+        elif durable is None:
+            durable = os.environ.get("SECANTUS_TEST_FAST_STORAGE") != "1"
+        self._durable = durable
         if path == ":memory:":
             self._tempdir = tempfile.mkdtemp(prefix="secantus_wt_")
             home = self._tempdir
@@ -857,17 +897,52 @@ class Storage:
             #
             # ``file_max=10MB`` bounds journal segment size; smaller
             # files churn the log more, larger files delay reclamation.
-            # 10 MB matches mongod's WT default.
-            sync_part = (
-                "transaction_sync=(enabled=true,method=fsync)"
-                if sync_on_commit
-                else "transaction_sync=(enabled=false,method=fsync)"
-            )
-            config = (
-                f"create,session_max={session_max},cache_size={cache_size},"
-                f"log=(enabled=true,file_max=10MB),"
-                f"{sync_part}"
-            )
+            # 10 MB matches mongod's WT default. (Kept at 10 MB, not
+            # smaller: a single log record must fit in one segment, and a
+            # write of a near-``maxBsonObjectSize`` (16 MB) document needs
+            # headroom.)
+            #
+            # ``prealloc=false`` disables WT's log-file pre-allocation.
+            # By default WT's log server keeps two ``file_max``-sized
+            # ``WiredTigerPreplog`` files ready ahead of the active log, so
+            # every on-disk instance costs ~3x ``file_max`` (~30 MB here)
+            # of log space even for a database holding a few KB. That
+            # pre-allocation is a write-latency optimisation for
+            # sustained-throughput servers; SecantusDB is an ephemeral
+            # in-process test database whose instances are small and
+            # short-lived, so the latency win is irrelevant and the disk
+            # cost is not — a full test run spins up thousands of
+            # instances. Disabling prealloc drops each instance's log
+            # footprint from ~30 MB to ~10 MB with no durability change
+            # (recovery still replays the same log records); WT just
+            # allocates each segment on demand instead of ahead of time.
+            if durable:
+                sync_part = (
+                    "transaction_sync=(enabled=true,method=fsync)"
+                    if sync_on_commit
+                    else "transaction_sync=(enabled=false,method=fsync)"
+                )
+                config = (
+                    f"create,session_max={session_max},cache_size={cache_size},"
+                    f"log=(enabled=true,file_max=10MB,prealloc=false),"
+                    f"{sync_part}"
+                )
+            else:
+                # Fast test mode. Keep the journal ENABLED but skip the explicit
+                # close-checkpoint (see ``close``). Counter-intuitively, keeping
+                # logging on is the fast path: ``WT_CONNECTION->close`` only
+                # implicit-checkpoints (an fsync) when logging is *off*, so
+                # ``log=off`` is actually SLOWER on close once real data has been
+                # written. With logging on and no explicit checkpoint, close does
+                # no fsync — that removed fsync is what avoids the per-worker disk
+                # serialisation under xdist. (Data stays recoverable via log
+                # replay on reopen; the checkpoint the durable path adds bounds
+                # recovery time and truncates the log — see FORCE_DURABLE.)
+                config = (
+                    f"create,session_max={session_max},cache_size={cache_size},"
+                    f"log=(enabled=true,file_max=10MB,prealloc=false),"
+                    f"transaction_sync=(enabled=false,method=fsync)"
+                )
         # The on-disk WT home is stashed so ``create_archive`` can tar
         # it after a checkpoint without re-deriving the path.
         self.home_path = home
@@ -894,6 +969,11 @@ class Storage:
         # Oplog state — durable across restart via _OPLOG_META_TABLE.
         self.oplog_retention_seconds = float(oplog_retention_seconds)
         self.oplog_max_entries = int(oplog_max_entries)
+        # When set, ``prune_oplog`` writes the rows it is about to drop into a
+        # durable oplog segment in this directory first (PITR v2), so recovery
+        # can reach a time before the live oplog floor. See
+        # :mod:`secantus.pitr_archive`.
+        self.oplog_archive_dir = oplog_archive_dir
         self._time = time_func or _time.time
         self._oplog_cv = threading.Condition(threading.Lock())
         # Set by ``signal_shutdown()`` at server stop so tailable getMore
@@ -973,14 +1053,33 @@ class Storage:
             blob = bytes(c.get_value())
             if blob:
                 state = bson.decode(blob)
-                nat = state.get("next_nat_seq")
-                if nat is None:
-                    nat = self._scan_max_nat_seq() + 1
-                return (
+                # The persisted counters are a *hint*, not the source of
+                # truth: ``_emit_oplog`` no longer re-persists the meta row
+                # on every write (it WT-rollbacks under concurrent writers —
+                # see ``_emit_oplog``), so the on-disk ``next_seq`` /
+                # ``next_nat_seq`` lag behind the actual tables whenever a
+                # checkpoint (e.g. ``backupArchive``) lands between the last
+                # meta persist and the next one. Trusting a stale value would
+                # re-mint an already-used seq: a duplicate oplog seq (lost
+                # change events) or — for the natural-order index — a seq
+                # collision that overwrites a live doc's nat entry and
+                # corrupts capped-collection FIFO eviction after restore.
+                # So clamp each counter UP to what the tables actually
+                # contain; the hint only ever saves a scan, never lowers us.
+                next_seq = max(
                     int(state.get("next_seq", 1)),
+                    self._scan_max_oplog_seq() + 1,
+                )
+                nat = state.get("next_nat_seq")
+                next_nat = max(
+                    self._scan_max_nat_seq() + 1,
+                    1 if nat is None else int(nat),
+                )
+                return (
+                    next_seq,
                     int(state.get("last_ts_secs", 0)),
                     int(state.get("last_ts_ord", 0)),
-                    int(nat),
+                    next_nat,
                 )
         # Fallback: scan oplog table for max key + reconstruct from entry.
         c2 = self._cursor(_OPLOG_TABLE)
@@ -1001,6 +1100,19 @@ class Storage:
                         last_secs, last_ord = ts.time, ts.inc
             rc = c2.next()
         return last_seq + 1, last_secs, last_ord, self._scan_max_nat_seq() + 1
+
+    def _scan_max_oplog_seq(self) -> int:
+        """Largest ``seq`` present in ``_OPLOG_TABLE`` (0 if empty).
+
+        Cheap: the oplog table is keyed on the bare ``seq`` (``key_format=q``),
+        so a single ``prev()`` from the end yields the global maximum. Used to
+        clamp the recovered ``next_seq`` up past any stale persisted hint so a
+        reopen can never re-mint an already-used oplog seq.
+        """
+        c = self._cursor(_OPLOG_TABLE)
+        if c.prev() == 0:
+            return int(c.get_key())
+        return 0
 
     def _scan_max_nat_seq(self) -> int:
         """Largest insertion ``seq`` present in ``_NAT_TABLE`` (0 if empty).
@@ -1276,6 +1388,8 @@ class Storage:
         """
         rows: list[dict[str, Any]] = []
         with self._lock:
+            if self._closed:
+                return rows
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_OPLOG_TABLE, None)
@@ -1334,7 +1448,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection) for r in rows]
+            rows = [apply_projection(r, projection, filter) for r in rows]
         return rows
 
     def _is_system_users(self, db: str, coll: str) -> bool:
@@ -1371,6 +1485,25 @@ class Storage:
                     session.close()
         return rows
 
+    @staticmethod
+    def _without_credentials(record: dict[str, Any]) -> dict[str, Any]:
+        """Return ``record`` minus its SCRAM ``credentials`` blob.
+
+        The generic CRUD read path onto ``admin.system.users`` is
+        reachable with only the ordinary collection-read action
+        (``A_FIND``), but the SCRAM ``storedKey`` / ``serverKey`` / salt /
+        iteration-count is the sensitive artifact — the ``/etc/shadow``
+        equivalent that enables offline cracking and server
+        impersonation. ``usersInfo`` gates it behind ``A_VIEW_USER`` +
+        ``showCredentials``; the generic ``find`` / ``count`` /
+        ``aggregate`` view must never surface it. See issue #167.
+        """
+        if "credentials" not in record:
+            return record
+        stripped = dict(record)
+        stripped.pop("credentials", None)
+        return stripped
+
     def _find_system_users(
         self,
         filter: dict[str, Any] | None,
@@ -1383,14 +1516,16 @@ class Storage:
         collation: Any,
     ) -> list[dict[str, Any]]:
         """Read path for ``admin.system.users``. The user records
-        themselves already carry the mongod-shaped fields (``_id`` =
-        ``<db>.<user>``, ``user``, ``db``, ``credentials``, ``roles``,
-        ``mechanisms``), so the view is the row set unchanged plus the
-        usual filter / sort / skip / limit / projection pipeline."""
+        carry the mongod-shaped fields (``_id`` = ``<db>.<user>``,
+        ``user``, ``db``, ``roles``, ``mechanisms``), so the view is the
+        row set plus the usual filter / sort / skip / limit / projection
+        pipeline — but with the SCRAM ``credentials`` blob stripped
+        first (see :meth:`_without_credentials`), so it is never returned
+        and can't be used as a filter match-oracle."""
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
-        rows = self._scan_user_records()
+        rows = [self._without_credentials(r) for r in self._scan_user_records()]
         if filter:
             rows = [r for r in rows if matches(r, filter, vars=let, collation=collation_obj)]
         if sort:
@@ -1400,7 +1535,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection) for r in rows]
+            rows = [apply_projection(r, projection, filter) for r in rows]
         return rows
 
     def _count_system_users(
@@ -1413,7 +1548,9 @@ class Storage:
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
-        rows = self._scan_user_records()
+        # Strip credentials before counting too, so a filter on
+        # ``credentials.*`` can't be used as a match-oracle (see #167).
+        rows = [self._without_credentials(r) for r in self._scan_user_records()]
         if not filter:
             return len(rows)
         return sum(1 for r in rows if matches(r, filter, vars=let, collation=collation_obj))
@@ -1465,7 +1602,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection) for r in rows]
+            rows = [apply_projection(r, projection, filter) for r in rows]
         return rows
 
     def _count_system_version(
@@ -1501,6 +1638,25 @@ class Storage:
             if matches(r, filter, vars=let, collation=collation_obj)
         )
 
+    @contextlib.contextmanager
+    def replay_mode(self) -> Iterator[None]:
+        """Suppress oplog emission on the calling thread for the duration.
+
+        Point-in-time recovery replays an existing oplog into a fresh store by
+        driving the ordinary write paths (insert / update / delete / DDL) so
+        the documents, indexes, and natural order are rebuilt exactly as they
+        were produced live. Those paths normally append to the oplog and mint
+        fresh timestamps — wrong here, because the oplog is the *input*, not
+        something to regenerate. Inside this context ``_emit_oplog`` is a
+        no-op. See :mod:`secantus.oplog_replay`.
+        """
+        prev = getattr(self._tls, "replay_silent", False)
+        self._tls.replay_silent = True
+        try:
+            yield
+        finally:
+            self._tls.replay_silent = prev
+
     def _emit_oplog(
         self,
         entries: list[dict[str, Any]],
@@ -1527,6 +1683,11 @@ class Storage:
         buffer through this same method (with the buffering hook
         disarmed) inside the transaction's WT session.
         """
+        if getattr(self._tls, "replay_silent", False):
+            # Oplog replay (PITR) drives the real write paths for their
+            # storage / index / natural-order effects but must not
+            # regenerate the oplog it is replaying. See ``replay_mode``.
+            return 0
         handle = getattr(self._tls, "user_txn", None)
         if handle is not None:
             if self.enable_oplog and entries:
@@ -1599,6 +1760,8 @@ class Storage:
         """
         out: list[tuple[int, dict[str, Any]]] = []
         with self._lock:
+            if self._closed:
+                return out
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_OPLOG_TABLE, None)
@@ -1634,6 +1797,8 @@ class Storage:
         Uses a private session for cross-thread visibility (see ``read_oplog``).
         """
         with self._lock:
+            if self._closed:
+                return None
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_PREIMAGE_TABLE, None)
@@ -1651,6 +1816,63 @@ class Storage:
             finally:
                 with contextlib.suppress(Exception):
                     session.close()
+
+    def import_oplog_segment(
+        self,
+        rows: Iterable[tuple[int, Mapping[str, Any]]],
+        pre_images: Mapping[int, Mapping[str, Any]] | None = None,
+    ) -> int:
+        """Write **verbatim** oplog rows ``(seq, entry)`` into the oplog table,
+        carrying their original seq / ts / wall, and advance the seq + cluster
+        clock past them so subsequent live writes mint strictly-greater values.
+
+        This is the seam point-in-time recovery uses to preserve the source's
+        oplog timeline on the restored store (``carry_oplog`` /
+        ``--preserve-oplog``): a change stream on the restored server can then
+        resume from a token minted *before* the restore point, because the rows
+        that token references are present. ``pre_images`` maps seq -> pre-image
+        document for the seqs that had one stored.
+
+        Unlike ``_emit_oplog`` this does NOT mint new seqs — the rows keep their
+        identity, so resume tokens stay valid. Returns the highest seq written
+        (0 if ``rows`` is empty). No-op when ``enable_oplog`` is False.
+        """
+        if not self.enable_oplog:
+            return 0
+        pre_images = pre_images or {}
+        max_seq = 0
+        best_secs = 0
+        best_ord = 0
+        with self._lock:
+            op_cur = self._cursor(_OPLOG_TABLE)
+            pre_cur = None
+            wrote = False
+            for seq, entry in rows:
+                wrote = True
+                iseq = int(seq)
+                op_cur[iseq] = bson.encode(dict(entry))
+                pre = pre_images.get(iseq)
+                if pre is not None:
+                    if pre_cur is None:
+                        pre_cur = self._cursor(_PREIMAGE_TABLE)
+                    pre_cur[iseq] = bson.encode(dict(pre))
+                if iseq > max_seq:
+                    max_seq = iseq
+                ts = entry.get("ts")
+                if isinstance(ts, Timestamp) and (ts.time, ts.inc) > (best_secs, best_ord):
+                    best_secs, best_ord = ts.time, ts.inc
+            if not wrote:
+                return 0
+            with self._oplog_seq_lock:
+                if max_seq + 1 > self._next_seq:
+                    self._next_seq = max_seq + 1
+                if (best_secs, best_ord) > (self._last_ts_secs, self._last_ts_ord):
+                    self._last_ts_secs = best_secs
+                    self._last_ts_ord = best_ord
+            self._persist_oplog_meta()
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
+        return max_seq
 
     def oplog_tail_seq(self) -> int:
         """Highest seq currently present (or last emitted). 0 if empty."""
@@ -1679,6 +1901,8 @@ class Storage:
         Uses a private session for cross-thread visibility.
         """
         with self._lock:
+            if self._closed:
+                return 0
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_OPLOG_TABLE, None)
@@ -1700,6 +1924,8 @@ class Storage:
         Uses a private session for cross-thread visibility.
         """
         with self._lock:
+            if self._closed:
+                return 0
             session = self._conn.open_session()
             try:
                 c = session.open_cursor(_OPLOG_TABLE, None)
@@ -1770,6 +1996,10 @@ class Storage:
                     extra -= 1
         if not doomed:
             return 0
+        # PITR v2: archive the doomed rows to a durable segment *before* deleting
+        # them, so recovery can still reach a time before the new oplog floor.
+        if self.oplog_archive_dir is not None:
+            self._archive_doomed_oplog(sorted(doomed))
         op_del = self._cursor(_OPLOG_TABLE)
         pre_del = self._cursor(_PREIMAGE_TABLE)
         for seq in doomed:
@@ -1782,6 +2012,32 @@ class Storage:
                 pre_del.remove()
             pre_del.reset()
         return len(doomed)
+
+    def _archive_doomed_oplog(self, doomed_sorted: list[int]) -> None:
+        """Write the soon-to-be-pruned oplog rows (and their pre-images) into a
+        durable segment in ``oplog_archive_dir``. Called under ``self._lock``
+        from ``_prune_oplog_locked`` before the rows are deleted."""
+        from . import pitr_archive
+
+        op_cur = self._cursor(_OPLOG_TABLE)
+        pre_cur = self._cursor(_PREIMAGE_TABLE)
+        rows: list[tuple[int, dict[str, Any], dict[str, Any] | None]] = []
+        for seq in doomed_sorted:
+            op_cur.set_key(seq)
+            if op_cur.search() != 0:
+                op_cur.reset()
+                continue
+            entry = bson.decode(bytes(op_cur.get_value()))
+            op_cur.reset()
+            pre = None
+            pre_cur.set_key(seq)
+            if pre_cur.search() == 0:
+                pre_blob = bytes(pre_cur.get_value())
+                if pre_blob:
+                    pre = bson.decode(pre_blob)
+            pre_cur.reset()
+            rows.append((seq, entry, pre))
+        pitr_archive.write_segment(self.oplog_archive_dir, rows)
 
     # --- Users (auth) ---
 
@@ -2014,6 +2270,21 @@ class Storage:
         with self._oplog_cv:
             self._oplog_cv.notify_all()
 
+    def __enter__(self) -> Storage:
+        """Support ``with Storage(path) as store:`` — the block's exit calls
+        ``close()`` so WiredTiger is torn down (threads joined, oplog meta
+        persisted, connection closed) even if the body raises. ``close()`` is
+        idempotent, so an explicit ``close()`` inside the block is still safe."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> None:
+        self.close()
+
     def close(self) -> None:
         # Stop background threads before tearing down WT — both the
         # TTL sweeper and the noop heartbeat acquire ``self._lock``,
@@ -2027,6 +2298,9 @@ class Storage:
         if self._noop_thread is not None and self._noop_thread.is_alive():
             self._noop_thread.join(timeout=2.0)
             self._noop_thread = None
+        import logging
+
+        log = logging.getLogger("secantus.storage.close")
         with self._lock:
             if self._closed:
                 return
@@ -2036,8 +2310,18 @@ class Storage:
             # storms under concurrent writers), so this is the
             # canonical place to write the in-memory ``_next_seq``
             # and timestamp counters down to disk before shutdown.
-            with contextlib.suppress(Exception):
+            #
+            # Teardown continues past any single failure so close()
+            # stays idempotent and releases as many resources as it
+            # can — but every failure is *logged*, never swallowed
+            # silently. In a database a checkpoint or connection-close
+            # error is a durability signal (see CLAUDE.md "Never ignore
+            # an error"), so the embedder gets a trace telling them the
+            # last durable image may be incomplete.
+            try:
                 self._persist_oplog_meta()
+            except Exception:
+                log.exception("failed to persist oplog meta during close")
             # Force a checkpoint before tearing the connection down.
             # ``WT_CONNECTION->close`` does this implicitly, but only
             # when logging is off (or hits the connection's
@@ -2047,16 +2331,32 @@ class Storage:
             # behaviour callers reasonably expect from ``close()``.
             # Skip for in-memory backends: WT's in_memory engine
             # rejects checkpoint() with a noisy stderr log
-            # (``__wt_inmem_unsupported_op``) on every call.
-            if not self._in_memory:
-                with contextlib.suppress(Exception):
-                    self._session().checkpoint()
+            # (``__wt_inmem_unsupported_op``) on every call. Also skip when
+            # ``durable=False`` (fast test mode): the journal is off and the
+            # storage dir is discarded, so there is nothing to make durable —
+            # this is where the ~5x open/close saving comes from (no fsync).
+            if not self._in_memory and self._durable:
+                # Use a dedicated session opened directly on the connection —
+                # NOT ``self._session()`` — because ``_closed`` is already True
+                # and ``_session()`` now refuses to open on a closed store.
+                try:
+                    ck = self._conn.open_session()
+                    try:
+                        ck.checkpoint()
+                    finally:
+                        ck.close()
+                except Exception:
+                    log.exception("final checkpoint failed during close")
             for s in self._all_sessions:
-                with contextlib.suppress(Exception):
+                try:
                     s.close()
+                except Exception:
+                    log.exception("WT session close failed during close")
             self._all_sessions.clear()
-            with contextlib.suppress(Exception):
+            try:
                 self._conn.close()
+            except Exception:
+                log.exception("WT connection close failed during close")
             if self._tempdir is not None:
                 # Don't follow symlinks during cleanup. A local attacker
                 # racing the mkdtemp could replace `_tempdir` with a
@@ -2206,13 +2506,21 @@ class Storage:
         if s is None:
             return
         cursors = getattr(self._tls, "cursors", {}) or {}
-        for c in cursors.values():
-            with contextlib.suppress(Exception):
-                c.close()
-        with contextlib.suppress(Exception):
-            s.close()
-        with self._lock, contextlib.suppress(ValueError):
-            self._all_sessions.remove(s)
+        # Close the cursors + session UNDER THE LOCK and only while the store is
+        # open. Without the lock this races Storage.close()'s ``_all_sessions``
+        # teardown → double-close of the same WT session → use-after-free
+        # segfault. When ``_closed`` is set, close() has already closed every
+        # session in ``_all_sessions`` (including this one), so we must not touch
+        # WT — just drop the thread-local references.
+        with self._lock:
+            if not self._closed:
+                for c in cursors.values():
+                    with contextlib.suppress(Exception):
+                        c.close()
+                with contextlib.suppress(Exception):
+                    s.close()
+                with contextlib.suppress(ValueError):
+                    self._all_sessions.remove(s)
         self._tls.session = None
         self._tls.cursors = {}
 
@@ -2250,6 +2558,8 @@ class Storage:
         round-trips cleanly through git/mail/scp; the typical workload
         compresses well because WT pages aren't snappy/zstd at rest.
         """
+        import io
+        import json
         import tarfile
 
         if self._in_memory:
@@ -2265,6 +2575,10 @@ class Storage:
             if self._closed:
                 raise RuntimeError("create_archive: storage is closed")
             self._session().checkpoint()
+            # Advisory PITR metadata describing the oplog range this archive
+            # can recover to. Computed under the lock, before the backup
+            # cursor opens; embedded in the tar (WiredTiger ignores it).
+            manifest = self._pitr_manifest()
             # A private session for the backup cursor so its lifecycle
             # doesn't interfere with the per-thread cached session
             # that handles regular work.
@@ -2283,11 +2597,71 @@ class Storage:
                             rel = cursor.get_key()
                             full = os.path.join(self.home_path, rel)
                             tar.add(full, arcname=rel)
+                        data = json.dumps(manifest, default=str).encode()
+                        info = tarfile.TarInfo(name=_PITR_MANIFEST_NAME)
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
                 finally:
                     cursor.close()
             finally:
                 backup_session.close()
         return {"path": abs_out, "sizeBytes": os.path.getsize(abs_out)}
+
+    def archive_base_snapshot(self, archive_dir: str) -> dict[str, int | str]:
+        """Take a base snapshot into ``archive_dir`` for PITR v2, named by its
+        oplog head seq (``base-<head>.tar.gz``) so the restore path can order and
+        select snapshots. Thin wrapper over :meth:`create_archive`.
+
+        Pair with ``oplog_archive_dir=<archive_dir>`` (so pruned oplog rows are
+        archived as segments into the same directory) and call this periodically
+        — there is no background scheduler, matching ``prune_ttl`` / ``prune_oplog``.
+        """
+        from . import pitr_archive
+
+        with self._lock:
+            head = self.oplog_tail_seq_nolock()
+        out = os.path.join(archive_dir, pitr_archive.base_name(head))
+        result = self.create_archive(out)
+        result["headSeq"] = head
+        return result
+
+    def _pitr_manifest(self) -> dict[str, Any]:
+        """Build the point-in-time-recovery manifest embedded in a backup
+        archive: the oplog seq range and timestamps it can recover to, plus
+        whether the oplog still reaches genesis (an un-pruned front, which v1
+        empty-base replay requires). Advisory only — restore reads the oplog
+        directly; the manifest lets tooling report a backup's recoverable
+        range without opening WiredTiger. Must be called under ``self._lock``."""
+        floor = self.oplog_floor_seq()
+        head = self.oplog_tail_seq_nolock()
+
+        def _row(seq: int) -> dict[str, Any] | None:
+            if seq <= 0:
+                return None
+            rows = self.read_oplog(start_seq=seq, limit=1)
+            return rows[0][1] if rows else None
+
+        def _ts_of(row: dict[str, Any] | None) -> list[int] | None:
+            ts = row.get("ts") if row else None
+            return [ts.time, ts.inc] if isinstance(ts, Timestamp) else None
+
+        def _wall_of(row: dict[str, Any] | None) -> str | None:
+            wall = row.get("wall") if row else None
+            return wall.isoformat() if isinstance(wall, _dt.datetime) else None
+
+        floor_row = _row(floor)
+        head_row = _row(head)
+        return {
+            "secantusPitrManifest": 1,
+            "oplogEnabled": bool(self.enable_oplog),
+            "oplogFloorSeq": floor,
+            "oplogHeadSeq": head,
+            "genesisIntact": floor == 1,
+            "oplogFloorTs": _ts_of(floor_row),
+            "oplogHeadTs": _ts_of(head_row),
+            "oplogFloorWall": _wall_of(floor_row),
+            "oplogHeadWall": _wall_of(head_row),
+        }
 
     @contextlib.contextmanager
     def _batch_transaction(self, *, sync: bool = False) -> Any:
@@ -2349,10 +2723,18 @@ class Storage:
     def _session(self) -> Any:
         s = getattr(self._tls, "session", None)
         if s is None:
-            s = self._conn.open_session()
-            self._tls.session = s
-            self._tls.cursors = {}
+            # Open the session UNDER THE LOCK, and refuse if the store is
+            # closed. Without this fence, a connection thread opening its first
+            # session races Storage.close()'s ``conn.close()`` — ``open_session``
+            # on a torn-down connection is a use-after-free (segfault). ``_lock``
+            # is an RLock, so callers that already hold it (public methods) are
+            # unaffected.
             with self._lock:
+                if self._closed:
+                    raise RuntimeError("Storage is closed")
+                s = self._conn.open_session()
+                self._tls.session = s
+                self._tls.cursors = {}
                 self._all_sessions.append(s)
         return s
 
@@ -2580,7 +2962,18 @@ class Storage:
         with self._lock:
             return self._coll_options(db, coll) is not None
 
-    def create_collection(self, db: str, coll: str) -> bool:
+    def create_collection(
+        self, db: str, coll: str, options: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Create ``db.coll`` (no-op-False if it already exists).
+
+        ``options`` is the collection-options blob (``capped`` / ``size`` /
+        ``max`` / ``validator`` / ``viewOn`` / … — everything the ``create``
+        command persists). It is written to the options blob *and* carried as
+        siblings of ``create`` in the ``c`` oplog entry's ``o``, so PITR replay
+        and ``show_expanded_events`` create events reconstruct the options
+        rather than seeing a bare ``{create, idIndex}``.
+        """
         with self._lock:
             c = self._cursor(_COLL_TABLE)
             c.set_key(db, coll)
@@ -2588,18 +2981,22 @@ class Storage:
                 return False
             c.reset()
             c[db, coll] = b""
-            self._collection_uuid(db, coll)  # mint and persist
-            ui = self._collection_uuid(db, coll)
+            if options:
+                # Persist before minting the UUID — ``_collection_uuid``'s
+                # mint path re-reads and merges, so the options survive.
+                self._write_coll_options(db, coll, dict(options))
+            ui = self._collection_uuid(db, coll)  # mint and persist
+            o: dict[str, Any] = {"create": coll}
+            if options:
+                o.update(options)
+            o["idIndex"] = {"v": 2, "key": {"_id": 1}, "name": "_id_"}
             self._emit_oplog(
                 [
                     {
                         "op": "c",
                         "ns": f"{db}.$cmd",
                         "ui": bson.Binary(ui.bytes, subtype=4),
-                        "o": {
-                            "create": coll,
-                            "idIndex": {"v": 2, "key": {"_id": 1}, "name": "_id_"},
-                        },
+                        "o": o,
                     }
                 ]
             )
@@ -3024,7 +3421,7 @@ class Storage:
         if limit > 0:
             out = out[:limit]
         if projection:
-            out = [apply_projection(d, projection) for d in out]
+            out = [apply_projection(d, projection, filter) for d in out]
         return out
 
     def _apply_minmax_bounds(
@@ -4224,6 +4621,21 @@ class Storage:
         for _field, _spec_val in key_spec.items():
             if _spec_val in ("text", "hashed"):
                 raise CreateIndexUnsupported(f"{_spec_val} indexes are not supported by SecantusDB")
+            # A string index-key value names an index *plugin* (the special
+            # index types). mongod recognises a fixed set — anything else is
+            # rejected at parse time with "Unknown index plugin '<value>'"
+            # (CannotCreateIndex, 67). We accept the geo plugins (2d /
+            # 2dsphere); text / hashed are caught above as out-of-scope; any
+            # other string (e.g. a typo'd ``{abc: "hallo thar"}``) is invalid.
+            # mongo-c-driver's /Collection/index_w_write_concern asserts the
+            # server rejects such a key.
+            if isinstance(_spec_val, str) and _spec_val not in (
+                "2d",
+                "2dsphere",
+                "2dsphere_bucket",
+                "geoHaystack",
+            ):
+                raise CreateIndexUnsupported(f"Unknown index plugin '{_spec_val}'")
         options = dict(options or {})
         with self._lock:
             self._ensure_collection(db, coll)
@@ -4237,7 +4649,20 @@ class Storage:
                 # create_indexes when index creation fails`` test pins.
                 existing_raw = bytes(c.get_value())
                 existing = bson.decode(existing_raw) if existing_raw else {}
+                existing_key = dict(existing.get("key") or {})
                 existing_opts = dict(existing.get("options") or {})
+                # Same name, different key spec → IndexKeySpecsConflict (86).
+                # Key comparison is order-sensitive: mongod treats
+                # ``{a: 1, b: 1}`` and ``{b: 1, a: 1}`` as distinct indexes, so
+                # plain dict ``==`` (order-insensitive) would wrongly call them
+                # equal — compare the ordered item lists.
+                if list(existing_key.items()) != list(dict(key_spec).items()):
+                    raise IndexKeySpecsConflict(
+                        "An existing index has the same name as the requested "
+                        "index. Requested index: "
+                        f"{{ key: {dict(key_spec)!r}, name: {name!r} }}, "
+                        f"existing index: {{ key: {existing_key!r}, name: {name!r} }}"
+                    )
                 _CONFLICTING_OPTS = (
                     "unique",
                     "sparse",
@@ -4431,6 +4856,64 @@ class Storage:
             c.reset()
             c[db, coll, name] = bson.encode(payload)
             return True
+
+    def set_index_options(self, db: str, coll: str, name: str, **opts: Any) -> bool:
+        """Merge ``opts`` into an existing index's stored options blob.
+
+        Read-modify-write of the ``{key, options}`` payload, mirroring
+        ``set_index_expiry``. Backs ``collMod {index: {keyPattern|name,
+        prepareUnique|unique: ...}}``. Returns ``True`` when the index
+        existed and was updated.
+        """
+        with self._lock:
+            self._refresh_read_snapshot()
+            c = self._cursor(_IDX_TABLE)
+            c.set_key(db, coll, name)
+            if c.search() != 0:
+                return False
+            payload = bson.decode(bytes(c.get_value()))
+            options = payload.get("options", {})
+            options.update(opts)
+            payload["options"] = options
+            c.reset()
+            c[db, coll, name] = bson.encode(payload)
+            return True
+
+    def find_index_duplicates(self, db: str, coll: str, name: str) -> list[list[Any]]:
+        """Group ``_id`` values of documents that share the same key on
+        index ``name``, returning one ``_id`` list per duplicated key
+        (groups of size >= 2, ``_id``-sorted within each group).
+
+        Backs ``collMod {index: {unique: true}}``: a non-empty result
+        means the conversion to unique must be refused with code 359
+        (``CannotConvertIndexToUnique``) and the groups reported as
+        ``violations``.
+        """
+        with self._lock:
+            self._refresh_read_snapshot()
+            spec: tuple[dict[str, Any], dict[str, Any]] | None = None
+            for n, key_spec, opts in self._iter_indexes(db, coll):
+                if n == name:
+                    spec = (key_spec, opts)
+                    break
+            if spec is None:
+                return []
+            key_spec, opts = spec
+            sparse = bool(opts.get("sparse"))
+            coll_opt = _parse_index_collation(opts.get("collation"))
+            blobs = [blob for _id_k, blob in self._scan_docs(db, coll)]
+        groups: dict[bytes, list[Any]] = {}
+        for blob in blobs:
+            doc = bson.decode(blob)
+            kb = _index_key(doc, key_spec, sparse=sparse, collation=coll_opt)
+            if kb is None:
+                continue
+            groups.setdefault(kb, []).append(doc.get("_id"))
+        out: list[list[Any]] = []
+        for ids in groups.values():
+            if len(ids) > 1:
+                out.append(sorted(ids, key=_id_key))
+        return out
 
     def drop_all_indexes(self, db: str, coll: str) -> int:
         with self._lock:
@@ -4709,7 +5192,11 @@ class Storage:
             partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
         for name, key_spec, sparse, unique in indexes:
-            if not unique:
+            # ``prepareUnique`` enforces uniqueness on new writes without
+            # the index being formally unique yet — mongod blocks dup
+            # inserts the moment ``collMod {index: {prepareUnique: true}}``
+            # lands, even while pre-existing duplicates remain.
+            if not unique and not index_options.get(name, {}).get("prepareUnique"):
                 continue
             pf = partials.get(name)
             if pf is not None and not matches(candidate_doc, pf):

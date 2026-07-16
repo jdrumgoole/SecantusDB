@@ -47,7 +47,7 @@ def test_defaults_match_legacy_cli_defaults() -> None:
 
 
 def test_explicit_path_overrides_only_set_fields(tmp_path) -> None:
-    p = tmp_path / "secantusdb.toml"
+    p = tmp_path / "secantusd.toml"
     p.write_text(
         """
         [server]
@@ -145,7 +145,7 @@ def test_oplog_table_uses_renamed_keys(tmp_path) -> None:
 
 
 def test_auto_discovery_picks_cwd_first(tmp_path, monkeypatch) -> None:
-    cwd_file = tmp_path / "secantusdb.toml"
+    cwd_file = tmp_path / "secantusd.toml"
     cwd_file.write_text('[server]\nhost = "from-cwd"\n')
     monkeypatch.chdir(tmp_path)
     cfg, source = load_config(None)
@@ -154,25 +154,50 @@ def test_auto_discovery_picks_cwd_first(tmp_path, monkeypatch) -> None:
     assert cfg.host == "from-cwd"
 
 
+def test_auto_discovery_finds_legacy_name(tmp_path, monkeypatch) -> None:
+    # A config written under the old ``secantusdb.toml`` name is still
+    # discovered when the new ``secantusd.toml`` is absent.
+    legacy = tmp_path / "secantusdb.toml"
+    legacy.write_text('[server]\nhost = "from-legacy"\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    cfg, source = load_config(None)
+    assert source is not None
+    assert source.resolve() == legacy.resolve()
+    assert cfg.host == "from-legacy"
+
+
+def test_new_name_wins_over_legacy_in_same_dir(tmp_path, monkeypatch) -> None:
+    (tmp_path / "secantusdb.toml").write_text('[server]\nhost = "legacy"\n')
+    (tmp_path / "secantusd.toml").write_text('[server]\nhost = "new"\n')
+    monkeypatch.chdir(tmp_path)
+    cfg, source = load_config(None)
+    assert cfg.host == "new"
+    assert source is not None and source.name == "secantusd.toml"
+
+
 def test_auto_discovery_returns_defaults_when_no_file_present(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    # Point HOME at an empty dir so ~/.secantus/secantusdb.toml is
-    # also missing. /etc/secantus/secantusdb.toml is left alone — if
+    # Point HOME at an empty dir so ~/.secantus/secantusd.toml is
+    # also missing. /etc/secantus/secantusd.toml is left alone — if
     # someone running this test really has one there, that's their
     # config, and the test would fail; treat that as acceptable.
     monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
     cfg, source = load_config(None)
     assert cfg == SecantusConfig()
-    # Source may be None (clean) or /etc/... if the developer's box
-    # has one.
-    assert source is None or source == Path("/etc/secantus/secantusdb.toml")
+    # Source may be None (clean) or /etc/... (either config name) if
+    # the developer's box has one.
+    assert source is None or source in (
+        Path("/etc/secantus/secantusd.toml"),
+        Path("/etc/secantus/secantusdb.toml"),
+    )
 
 
 def test_discover_config_path_returns_cwd_when_present(tmp_path, monkeypatch) -> None:
-    f = tmp_path / "secantusdb.toml"
+    f = tmp_path / "secantusd.toml"
     f.write_text("")
     monkeypatch.chdir(tmp_path)
-    assert discover_config_path() == Path("secantusdb.toml")
+    assert discover_config_path() == Path("secantusd.toml")
 
 
 # ---------------------------------------------------------------------------

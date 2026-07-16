@@ -40,6 +40,30 @@ def test_inc_existing_and_missing() -> None:
     assert apply_update({}, {"$inc": {"a": 5}}) == {"a": 5}
 
 
+def test_inc_absent_field_treated_as_zero() -> None:
+    # A *missing* field is treated as 0 and the delta applied (mongod parity).
+    assert apply_update({}, {"$inc": {"n": 5}}) == {"n": 5}
+    assert apply_update({"other": 1}, {"$inc": {"n": 3}}) == {"other": 1, "n": 3}
+
+
+def test_mul_absent_field_treated_as_zero() -> None:
+    assert apply_update({}, {"$mul": {"n": 5}}) == {"n": 0}
+
+
+def test_inc_explicit_null_field_errors_typemismatch() -> None:
+    # A field present with an explicit null is a TypeMismatch (code 14) —
+    # mongod refuses to coerce a present non-numeric value to 0.
+    with pytest.raises(UpdateError) as excinfo:
+        apply_update({"n": None}, {"$inc": {"n": 5}})
+    assert excinfo.value.code == 14
+
+
+def test_mul_explicit_null_field_errors_typemismatch() -> None:
+    with pytest.raises(UpdateError) as excinfo:
+        apply_update({"n": None}, {"$mul": {"n": 5}})
+    assert excinfo.value.code == 14
+
+
 def test_push_creates_array() -> None:
     assert apply_update({}, {"$push": {"tags": "x"}}) == {"tags": ["x"]}
     assert apply_update({"tags": ["x"]}, {"$push": {"tags": "y"}}) == {"tags": ["x", "y"]}
@@ -48,6 +72,52 @@ def test_push_creates_array() -> None:
 def test_pull_removes_matching() -> None:
     out = apply_update({"a": [1, 2, 3, 2]}, {"$pull": {"a": 2}})
     assert out == {"a": [1, 3]}
+
+
+def test_pull_predicate_criterion() -> None:
+    # An operator-only criterion is an element-value predicate.
+    assert apply_update({"a": [1, 5, 10, 15]}, {"$pull": {"a": {"$gte": 10}}}) == {"a": [1, 5]}
+    assert apply_update({"a": [1, 2, 3, 4]}, {"$pull": {"a": {"$in": [2, 4]}}}) == {"a": [1, 3]}
+
+
+def test_pull_subdocument_match() -> None:
+    docs = [{"x": 1, "y": "a"}, {"x": 5, "y": "b"}, {"x": 9, "y": "c"}]
+    # A field-doc criterion matches the element as a sub-document.
+    assert apply_update({"a": docs}, {"$pull": {"a": {"x": {"$gte": 5}}}}) == {
+        "a": [{"x": 1, "y": "a"}]
+    }
+    assert apply_update({"a": docs}, {"$pull": {"a": {"y": "b"}}}) == {
+        "a": [{"x": 1, "y": "a"}, {"x": 9, "y": "c"}]
+    }
+
+
+def test_pull_query_equality_types() -> None:
+    # query eq: bool is type-distinct from int, but 1 == 1.0 numerically.
+    assert apply_update({"a": [1, True, 2]}, {"$pull": {"a": 1}}) == {"a": [True, 2]}
+    assert apply_update({"a": [1, 1.0, 2]}, {"$pull": {"a": 1}}) == {"a": [2]}
+
+
+def test_pullall_removes_listed_values() -> None:
+    assert apply_update({"a": [1, 2, 3, 2, 1]}, {"$pullAll": {"a": [1, 2]}}) == {"a": [3]}
+    assert apply_update({"a": [1, 2, 3]}, {"$pullAll": {"a": [9]}}) == {"a": [1, 2, 3]}
+    with pytest.raises(UpdateError):
+        apply_update({"a": [1]}, {"$pullAll": {"a": 5}})
+
+
+def test_push_sort_modifier() -> None:
+    # Whole-element sort, ascending / descending.
+    assert apply_update({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": 1}}}) == {
+        "a": [1, 2, 3]
+    }
+    assert apply_update({"a": [1, 3]}, {"$push": {"a": {"$each": [2], "$sort": -1}}}) == {
+        "a": [3, 2, 1]
+    }
+    # Sort by sub-field, then slice.
+    out = apply_update(
+        {"a": [{"s": 3}, {"s": 1}]},
+        {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1}}}},
+    )
+    assert out == {"a": [{"s": 1}, {"s": 2}, {"s": 3}]}
 
 
 def test_addtoset_dedupes() -> None:
@@ -82,6 +152,28 @@ def test_min_max() -> None:
     assert apply_update({"a": 5}, {"$min": {"a": 9}}) == {"a": 5}
     assert apply_update({"a": 5}, {"$max": {"a": 9}}) == {"a": 9}
     assert apply_update({"a": 5}, {"$max": {"a": 3}}) == {"a": 5}
+
+
+def test_min_max_cross_type_bson_order() -> None:
+    # mongod compares by BSON canonical-type order (null < number < string <
+    # objectId < bool < date). No Python TypeError leak on cross-type.
+    from bson import ObjectId
+
+    d = __import__("datetime").datetime(2026, 1, 1)
+    oid = ObjectId("507f1f77bcf86cd799439011")
+    assert apply_update({"a": 5}, {"$max": {"a": "str"}}) == {"a": "str"}  # string > number
+    assert apply_update({"a": 5}, {"$max": {"a": d}}) == {"a": d}  # date > number
+    assert apply_update({"a": d}, {"$max": {"a": "str"}}) == {"a": d}  # date > string
+    assert apply_update({"a": oid}, {"$max": {"a": 5}}) == {"a": oid}  # objectId > number
+    assert apply_update({"a": 5}, {"$min": {"a": "str"}}) == {"a": 5}  # number < string
+
+
+def test_min_max_missing_vs_explicit_null() -> None:
+    # A MISSING field is set unconditionally; an explicit null is a real value
+    # (BSON rank 2, below numbers), compared by order — not "no current".
+    assert apply_update({}, {"$max": {"a": 5}}) == {"a": 5}  # missing -> set
+    assert apply_update({"a": None}, {"$max": {"a": 5}}) == {"a": 5}  # 5 > null -> set
+    assert apply_update({"a": None}, {"$min": {"a": 5}}) == {"a": None}  # null < 5 -> keep null
 
 
 def test_apply_does_not_mutate_input() -> None:
@@ -231,6 +323,18 @@ def test_bit_and_or_xor() -> None:
     assert apply_update({"f": 0b1100}, {"$bit": {"f": {"and": 0b1010}}}) == {"f": 0b1000}
     assert apply_update({"f": 0b1100}, {"$bit": {"f": {"or": 0b0011}}}) == {"f": 0b1111}
     assert apply_update({"f": 0b1100}, {"$bit": {"f": {"xor": 0b1010}}}) == {"f": 0b0110}
+
+
+def test_bit_multiple_ops_applied_in_order() -> None:
+    # mongod applies every listed op in order: (v & 0b1010) | 0b0001.
+    assert apply_update({"f": 0b1100}, {"$bit": {"f": {"and": 0b1010, "or": 0b0001}}}) == {
+        "f": 0b1001
+    }
+    # xor after or.
+    assert apply_update({"f": 0b1000}, {"$bit": {"f": {"or": 0b0001, "xor": 0b1001}}}) == {"f": 0}
+    # An empty $bit doc is rejected.
+    with pytest.raises(UpdateError):
+        apply_update({"f": 1}, {"$bit": {"f": {}}})
 
 
 def test_bit_on_missing_field_treats_as_zero() -> None:

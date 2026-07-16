@@ -23,6 +23,10 @@ pub use secantus_core::collation::Collation;
 /// `secantus-commands` stay decoupled from the storage crate's `Hint` type.
 pub type RawHint<'a> = &'a Bson;
 
+/// `(id_key, bson)` document rows, as returned by the collection scans the
+/// tailable-find producer polls (`scan_docs_after_id_key`).
+pub type IdKeyRows = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// The outcome of an `update` operation (mirrors
 /// `secantus_storage::UpdateOutcome`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -89,6 +93,10 @@ pub struct ChangeStreamOptions {
     pub full_document_before_change: String,
     /// `showExpandedEvents: true` surfaces DDL events (create / modify / …).
     pub show_expanded_events: bool,
+    /// A `$changeStreamSplitLargeEvent` stage was present: every event carries a
+    /// `splitEvent: {fragment, of}` envelope (we never actually split, so always
+    /// `{fragment: 1, of: 1}`).
+    pub split_large_events: bool,
 }
 
 /// One poll of the oplog tail for a change-stream cursor: the projected event
@@ -100,6 +108,10 @@ pub struct ChangeStreamBatch {
     pub events: Vec<Vec<u8>>,
     pub new_position: i64,
     pub invalidated: bool,
+    /// A fatal projection error (e.g. `fullDocument: required` with
+    /// changeStreamPreAndPostImages disabled) — `(code, errmsg)`. The producer
+    /// surfaces it as a getMore-time `ok: 0` reply that ends the stream.
+    pub fatal: Option<(i32, String)>,
 }
 
 /// The storage operations the command handlers depend on. Bytes at the seam:
@@ -148,6 +160,7 @@ pub trait Storage: Send + Sync {
             events: Vec::new(),
             new_position: after_seq,
             invalidated: false,
+            fatal: None,
         })
     }
 
@@ -185,6 +198,13 @@ pub trait Storage: Send + Sync {
     /// WiredTiger-linked `changestreams` module. Default: `None`.
     fn resume_token_seq(&self, _token: &Document) -> Option<i64> {
         None
+    }
+
+    /// Whether a resume token is for an `invalidate` event. `resumeAfter` on such
+    /// a token is rejected (the stream it came from is over) — mongod requires
+    /// `startAfter` instead (`InvalidResumeToken`, 260). Default: `false`.
+    fn resume_token_from_invalidate(&self, _token: &Document) -> bool {
+        false
     }
 
     /// A high-water-mark resume token at oplog `seq` and the current cluster
@@ -379,9 +399,32 @@ pub trait Storage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Names of all databases that hold at least one collection (for
+    /// `listDatabases`). Default empty; the WT adapter forwards.
+    fn list_databases(&self) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// Create a collection. `true` if newly created, `false` if it already existed.
     fn create_collection(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
         Ok(true)
+    }
+
+    /// Create a collection, persisting `options` (`capped` / `validator` / …) AND
+    /// carrying them in the `create` oplog entry so PITR replay reconstructs them.
+    /// Default: create then a plain (oplog-silent) option write; the WT adapter
+    /// forwards to `Storage::create_collection_with_options`.
+    fn create_collection_with_options(
+        &self,
+        db: &str,
+        coll: &str,
+        options: &Document,
+    ) -> Result<bool, StorageError> {
+        let created = self.create_collection(db, coll)?;
+        if created && !options.is_empty() {
+            self.set_collection_options(db, coll, options)?;
+        }
+        Ok(created)
     }
 
     /// The collection's stored options blob (`validator` / `validationAction` /
@@ -392,7 +435,7 @@ pub trait Storage: Send + Sync {
     }
 
     /// Merge `opts` into the collection's stored options (creating it if needed) —
-    /// for `create` with options and `collMod`. Default no-op; WT adapter forwards.
+    /// for `create` with options. Default no-op; WT adapter forwards.
     fn set_collection_options(
         &self,
         _db: &str,
@@ -400,6 +443,13 @@ pub trait Storage: Send + Sync {
         _opts: &Document,
     ) -> Result<(), StorageError> {
         Ok(())
+    }
+
+    /// `collMod`: like [`Storage::set_collection_options`], but also emits a DDL
+    /// `op: "c"` `collMod` oplog entry so a `showExpandedEvents` change stream
+    /// surfaces a `modify` event. Default falls back to the silent option write.
+    fn coll_mod(&self, db: &str, coll: &str, opts: &Document) -> Result<(), StorageError> {
+        self.set_collection_options(db, coll, opts)
     }
 
     /// Drop a collection. `true` if it existed.
@@ -457,9 +507,95 @@ pub trait Storage: Send + Sync {
         Ok(0)
     }
 
+    /// Merge `opts` into an existing index's stored options (e.g. `prepareUnique`
+    /// / `unique`). Backs `collMod {index: {keyPattern|name, ...}}`. `true` if the
+    /// index existed. Default no-op for test fakes; the WT adapter forwards to
+    /// `Storage::set_index_options`.
+    fn set_index_options(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+        _opts: &Document,
+    ) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Group the `_id`s of docs sharing a key on index `name` (groups of >= 2).
+    /// A non-empty result blocks a `collMod {index: {unique: true}}` conversion
+    /// (code 359 + `violations`). Default empty; the WT adapter forwards to
+    /// `Storage::find_index_duplicates`.
+    fn find_index_duplicates(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+    ) -> Result<Vec<Vec<Bson>>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// Drop an entire database (all its collections + indexes).
     fn drop_database(&self, _db: &str) -> Result<(), StorageError> {
         Ok(())
+    }
+
+    /// Force a checkpoint and write a backup `.tar.gz` of the WiredTiger home to
+    /// `output_path`, returning `(path, size_bytes)`. Backs `secantusAdmin.backupArchive`
+    /// (PITR). Default: unsupported (test fakes have no on-disk state); the WT
+    /// adapter forwards to `Storage::create_archive`.
+    fn create_archive(&self, _output_path: &str) -> Result<(String, u64), StorageError> {
+        Err(StorageError::Internal(
+            "backupArchive: this storage backend has no on-disk state to archive".into(),
+        ))
+    }
+
+    /// Take a PITR v2 base snapshot into `archive_dir` (`base-<head>.tar.gz`),
+    /// returning `(path, size_bytes)`. Backs `secantusAdmin.archiveBaseSnapshot`.
+    /// Default: unsupported; the WT adapter forwards to
+    /// `Storage::archive_base_snapshot`.
+    fn archive_base_snapshot(&self, _archive_dir: &str) -> Result<(String, u64), StorageError> {
+        Err(StorageError::Internal(
+            "archiveBaseSnapshot: this storage backend has no on-disk state to archive".into(),
+        ))
+    }
+
+    /// Drop oplog rows past the retention window, returning the number pruned.
+    /// Backs `secantusAdmin.pruneOplog` — an operator-driven immediate sweep
+    /// (the WT backend also prunes opportunistically on every emit). Default:
+    /// unsupported; the WT adapter forwards to `Storage::prune_oplog`.
+    fn prune_oplog(&self) -> Result<usize, StorageError> {
+        Err(StorageError::Internal(
+            "pruneOplog: this storage backend has no oplog to prune".into(),
+        ))
+    }
+
+    /// Run TTL pruning across every collection, returning the number of docs
+    /// deleted. Backs `secantusAdmin.pruneTtl` — an immediate pass (the WT
+    /// backend also sweeps on a background cadence). Default: unsupported; the
+    /// WT adapter forwards to `Storage::prune_ttl_all_collections`.
+    fn prune_ttl_all(&self) -> Result<usize, StorageError> {
+        Err(StorageError::Internal(
+            "pruneTtl: this storage backend has no TTL indexes to prune".into(),
+        ))
+    }
+
+    /// Extract a backup archive (from `create_archive`) into `target_dir`,
+    /// returning `(abs_target, abs_archive, file_count)`. Backs
+    /// `secantusAdmin.restoreArchive` — a side-channel restore into a fresh
+    /// directory the operator then points a new server at; the running server's
+    /// storage is untouched. Rejects a non-empty target unless `allow_existing`,
+    /// and rejects an archive with no `WiredTiger` metadata. Default:
+    /// unsupported; the WT adapter forwards to
+    /// `secantus_storage::extract_backup_archive_ex`.
+    fn restore_archive(
+        &self,
+        _archive_path: &str,
+        _target_dir: &str,
+        _allow_existing: bool,
+    ) -> Result<(String, String, u64), StorageError> {
+        Err(StorageError::Internal(
+            "restoreArchive: this storage backend has no on-disk archive support".into(),
+        ))
     }
 
     /// Rename a collection. Returns `(succeeded, error_message)`; `succeeded ==
@@ -478,6 +614,34 @@ pub trait Storage: Send + Sync {
     /// Whether the collection is capped.
     fn collection_is_capped(&self, _db: &str, _coll: &str) -> Result<bool, StorageError> {
         Ok(false)
+    }
+
+    /// The collection's 16-byte UUID (mongod's collection identity, surfaced as
+    /// `info.uuid` BinData(4) in `listCollections` and `ui` in the oplog).
+    fn collection_uuid(&self, _db: &str, _coll: &str) -> Result<Vec<u8>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Documents whose `id_key` sorts strictly after `after` (all of them when
+    /// `after` is `None`), as `(id_key, bson)` pairs — the tailable-find producer
+    /// polls this for docs inserted since it last returned.
+    fn scan_docs_after_id_key(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _after: Option<&[u8]>,
+    ) -> Result<IdKeyRows, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// The smallest `id_key` currently in the collection (`None` if empty) — a
+    /// tailable cursor uses it to detect capped rollover (`CappedPositionLost`).
+    fn collection_min_id_key(
+        &self,
+        _db: &str,
+        _coll: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
     }
 
     /// Total size in bytes of the collection's documents.

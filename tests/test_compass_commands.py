@@ -58,6 +58,19 @@ def test_instance_detail_probes(client: MongoClient) -> None:
     assert "argv" in cmd_line and "parsed" in cmd_line
 
 
+def test_repl_set_get_status_standalone_error(client: MongoClient) -> None:
+    """``replSetGetStatus`` must answer like a standalone mongod —
+    ``NoReplicationEnabled`` (76) with the canonical "not running with
+    --replSet" message — not CommandNotFound. Driver test harnesses
+    special-case that exact message to mean "standalone, skip the
+    replica-set-only paths"; a bare code-59 aborts them (libmongoc's
+    ``test_framework_replset_member_count`` is the motivating case)."""
+    with pytest.raises(OperationFailure) as exc:
+        client.admin.command("replSetGetStatus")
+    assert exc.value.code == 76
+    assert "not running with --replSet" in str(exc.value)
+
+
 def test_atlas_version_returns_command_not_found(client: MongoClient) -> None:
     """Compass probes ``atlasVersion`` to detect Atlas; on-prem mongod
     (and SecantusDB) must answer CommandNotFound (59), which Compass

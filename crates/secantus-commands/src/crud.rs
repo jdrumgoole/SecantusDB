@@ -11,15 +11,112 @@
 //! `let` + `collation` thread through update / delete / count (collation forces a
 //! COLLSCAN; non-ASCII / numericOrdering collation → `BadValue`).
 //!
-//! **Deferred (documented so parity is honest):**
-//! * `writeConcern` validation and `writeConcernError` attachment (cross-cutting,
-//!   lands with the write-concern slice).
-//! * `validator` enforcement on `update` / replace (needs the post-apply doc in
-//!   storage; `insert` is enforced here at the command layer).
-//! * `_reject_oplog_rs_write` (writes to `local.oplog.rs`); view-collection
-//!   `count`.
+//! `writeConcern` validation (malformed `w` / `j` / `wtimeout`) runs in `dispatch`
+//! before the handler (`validate_write_concern`), and `writeConcernError`
+//! attachment for a satisfiable-but-too-wide `w > 1` is added after
+//! (`attach_write_concern_error`). `validator` enforcement runs on `insert` (here)
+//! and on `update` / replace (the validator is read here and threaded into the
+//! storage update to check the post-apply doc).
+//!
+//! Direct writes to the synthetic read-only views `local.oplog.rs` /
+//! `admin.system.users` are rejected in `dispatch` (`reject_synthetic_view_write`,
+//! code 13); reads on a user view (`find` / `aggregate` / `count`) resolve the
+//! view's `viewOn` + pipeline in the aggregate/find command layer
+//! (`aggregate::resolve_view`).
 
 use bson::{doc, Bson, Document};
+
+/// mongod's per-operator `errInfo.details.reason` wording (best-effort; only a
+/// few are byte-pinned by driver tests). Mirrors `commands._VALIDATION_REASON`.
+fn validation_reason(op: &str) -> &'static str {
+    match op {
+        "$type" => "type did not match",
+        "$exists" => "field was missing",
+        "$regex" => "regular expression did not match",
+        "$size" => "array did not match specified size",
+        "$mod" => "$mod did not evaluate to the expected remainder",
+        "$all" => "array did not contain all specified values",
+        "$elemMatch" => "no matching array element found",
+        "$in" => "value was not in the set of allowed values",
+        "$nin" => "value was in the set of disallowed values",
+        _ => "comparison failed",
+    }
+}
+
+/// Whether `doc` satisfies the single-field clause `{field: spec}`.
+fn clause_matches(doc: &Document, field: &str, spec: &Bson) -> bool {
+    let mut clause = Document::new();
+    clause.insert(field, spec.clone());
+    secantus_core::query::matches(doc, &clause, &Document::new(), None).unwrap_or(false)
+}
+
+/// mongod-shaped `errInfo.details` for a doc that failed a query-expression
+/// validator: walk the clauses, find the first the doc violates, and report the
+/// failing operator. Mirrors `commands._validation_failure_details`.
+fn validation_failure_details(validator: &Document, doc: &Document) -> Document {
+    use secantus_core::{get_path, has_path};
+    if validator.contains_key("$jsonSchema") {
+        return doc! {"operatorName": "$jsonSchema"};
+    }
+    for (field, spec) in validator {
+        if field.starts_with('$') {
+            continue; // document-level logical operator — skip for per-field detail
+        }
+        if clause_matches(doc, field, spec) {
+            continue;
+        }
+        let mut spec_as = Document::new();
+        spec_as.insert(field, spec.clone());
+        // Operator-form clause: isolate the specific failing operator; otherwise
+        // a bare-equality clause reports as `$eq`.
+        let mut detail = match spec {
+            Bson::Document(opspec)
+                if !opspec.is_empty() && opspec.keys().all(|k| k.starts_with('$')) =>
+            {
+                let mut op = opspec.keys().next().cloned().unwrap_or_default();
+                for cand in opspec.keys() {
+                    let single = doc! { cand.clone(): opspec.get(cand).unwrap().clone() };
+                    if !clause_matches(doc, field, &Bson::Document(single)) {
+                        op = cand.clone();
+                        break;
+                    }
+                }
+                let reason = validation_reason(&op);
+                doc! { "operatorName": op, "specifiedAs": spec_as, "reason": reason }
+            }
+            _ => {
+                doc! { "operatorName": "$eq", "specifiedAs": spec_as, "reason": "comparison failed" }
+            }
+        };
+        // The value the server considered (and its BSON type), when the field is
+        // present — drivers' errorResponse tests read both (mongo-csharp-driver
+        // `WriteError_details`, mongo-java-driver `findOneAndUpdate-errorResponse`).
+        if has_path(doc, field) {
+            if let Some(value) = get_path(doc, field) {
+                detail.insert("consideredValue", value.clone());
+                detail.insert(
+                    "consideredType",
+                    secantus_core::query::bson_type_name(value),
+                );
+            }
+        }
+        return detail;
+    }
+    doc! {"operatorName": "validator"}
+}
+
+/// The `errInfo` body for a failed document validation: `failingDocumentId`
+/// (when the doc has an `_id`) plus the per-operator `details`. Lets drivers'
+/// errorResponse tests pick out which doc was rejected. Mirrors
+/// `commands._validation_error_info`. Shared with `findandmodify`.
+pub(crate) fn validation_error_info(validator: &Document, doc: &Document) -> Document {
+    let mut info = Document::new();
+    if let Some(id) = doc.get("_id") {
+        info.insert("failingDocumentId", id.clone());
+    }
+    info.insert("details", validation_failure_details(validator, doc));
+    info
+}
 
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, resolve_let_vars,
@@ -102,13 +199,16 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 continue;
             }
         }
-        // Collection validator (code 121, DocumentValidationFailure).
+        // Collection validator (code 121, DocumentValidationFailure). mongod
+        // attaches an `errInfo` (failingDocumentId + per-operator details) that
+        // drivers' errorResponse tests read; mirror it.
         if let Some(v) = &validator {
             if !secantus_core::query::matches(d, v, &Document::new(), None).unwrap_or(true) {
                 pre_errors.push(doc! {
                     "index": index as i32,
                     "code": 121,
                     "errmsg": "Document failed validation",
+                    "errInfo": validation_error_info(v, d),
                 });
                 if ordered {
                     break;
@@ -212,9 +312,60 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let filter = doc_field(doc, "query");
     let collation = collation_of(doc);
 
-    let mut n = storage
-        .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
-        .map_err(command_error)? as i64;
+    // View support: a collection created with `viewOn` is a read-only view; its
+    // count runs the view's pipeline (plus the count's query as a trailing
+    // `$match`) through the aggregation engine. estimatedDocumentCount (the
+    // drivers' "estimatedDocumentCount works correctly on views" tests) leans on
+    // this. Mirrors `commands.py::_count`.
+    let view_on = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .ok()
+        .and_then(|o| o.get_str("viewOn").ok().map(String::from));
+    let mut n = if let Some(view_on) = view_on {
+        let opts = storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .map_err(command_error)?;
+        let mut pipeline: Vec<Bson> = opts
+            .get_array("viewPipeline")
+            .ok()
+            .cloned()
+            .unwrap_or_default();
+        if !filter.is_empty() {
+            pipeline.push(Bson::Document(doc! { "$match": filter.clone() }));
+        }
+        pipeline.push(Bson::Document(doc! { "$count": "n" }));
+        let agg = doc! { "aggregate": view_on, "pipeline": pipeline, "cursor": {} };
+        let reply = crate::aggregate::aggregate(&agg, ctx)?;
+        reply
+            .get_document("cursor")
+            .ok()
+            .and_then(|c| c.get_array("firstBatch").ok())
+            .and_then(|b| b.first())
+            .and_then(Bson::as_document)
+            .and_then(|d| d.get("n").and_then(as_i64))
+            .unwrap_or(0)
+    } else if let Some(hint) = doc.get("hint") {
+        // A `hint` forces a specific index; for an empty filter this still walks
+        // that index, so hinting a sparse index counts only the docs present in
+        // it (php-lib Count `testHintOption`). Count via the hinted find, which
+        // honours the hint + sparse semantics. Mirrors `commands.py::_count`.
+        storage
+            .find_collated(
+                &ctx.db_name,
+                &coll,
+                &filter,
+                None,
+                Some(hint),
+                collation.as_ref(),
+                &Document::new(),
+            )
+            .map_err(command_error)?
+            .len() as i64
+    } else {
+        storage
+            .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
+            .map_err(command_error)? as i64
+    };
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0);
     if skip > 0 {
         n = (n - skip).max(0);
@@ -239,7 +390,7 @@ const PIPELINE_UPDATE_STAGES: [&str; 6] = [
 
 /// Update modifiers mongod accepts (`secantus.update._KNOWN_UPDATE_OPS`). A
 /// top-level `$`-key outside this set is an "Unknown modifier" parse error.
-const KNOWN_UPDATE_OPS: [&str; 14] = [
+const KNOWN_UPDATE_OPS: [&str; 15] = [
     "$set",
     "$setOnInsert",
     "$unset",
@@ -251,6 +402,7 @@ const KNOWN_UPDATE_OPS: [&str; 14] = [
     "$push",
     "$addToSet",
     "$pull",
+    "$pullAll",
     "$pop",
     "$rename",
     "$bit",
@@ -288,8 +440,38 @@ fn unsupported_update_modifier(u: &Document) -> Option<String> {
 /// filter, `$[ident]` from the per-statement `arrayFilters`); `let` + `collation`
 /// thread through (collation forces a COLLSCAN match).
 ///
-/// **Deferred (tracked in backlog §7):** `validator`, `writeConcern`,
-/// `_reject_oplog_rs_write` (none are in the Rust `update_matching` seam yet).
+/// The collection `validator` is enforced on the post-apply document (read once
+/// here, threaded into `Storage::update_matching`); malformed `writeConcern` is
+/// rejected in `dispatch` before this handler. **Deferred:**
+/// `_reject_oplog_rs_write` (writes to `local.oplog.rs`).
+///
+/// Whether a timeseries update's `u` touches only the metaField (mongod 7.0's
+/// rule): an operator-form update whose every modifier targets a path rooted at
+/// `meta`. Replacement / pipeline updates and an empty `meta` (no metaField
+/// declared) never qualify.
+fn ts_update_is_meta_only(u: Option<&Bson>, meta: &str) -> bool {
+    if meta.is_empty() {
+        return false;
+    }
+    let Some(Bson::Document(ud)) = u else {
+        return false;
+    };
+    if ud.is_empty() || !ud.keys().all(|k| k.starts_with('$')) {
+        return false;
+    }
+    for (_op, arg) in ud {
+        let Some(fields) = arg.as_document() else {
+            return false;
+        };
+        for fpath in fields.keys() {
+            if fpath.split('.').next().unwrap_or("") != meta {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "update")?;
     let storage = ctx.storage()?;
@@ -309,12 +491,12 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `bypassDocumentValidation` or `validationAction: warn|off`. The validator
     // is read once here (no storage lock held) and threaded into the storage
     // update so it can check the rewritten doc before writing.
+    let opts = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .map_err(command_error)?;
     let validator = if bool_field(doc, "bypassDocumentValidation", false) {
         None
     } else {
-        let opts = storage
-            .get_collection_options(&ctx.db_name, &coll)
-            .map_err(command_error)?;
         let action = opts.get_str("validationAction").unwrap_or("error");
         if action == "warn" || action == "off" {
             None
@@ -322,6 +504,13 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             opts.get("validator").and_then(Bson::as_document).cloned()
         }
     };
+    // mongod 7.0 restricts updates on a timeseries collection to the metaField
+    // only. `ts_meta` is `Some(metaField)` for a timeseries collection (an empty
+    // string when no metaField is declared — then nothing is updatable).
+    let ts_meta: Option<String> = opts
+        .get_document("timeseries")
+        .ok()
+        .map(|t| t.get_str("metaField").unwrap_or("").to_string());
 
     for (index, spec) in updates.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
@@ -344,6 +533,23 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let q = doc_field(spec, "q");
         let multi = bool_field(spec, "multi", false);
         let upsert = bool_field(spec, "upsert", false);
+
+        // Timeseries (mongod 7.0): an update may only modify the metaField, via
+        // operator-form modifiers — no replacement / pipeline / non-meta paths.
+        if let Some(meta) = &ts_meta {
+            if !ts_update_is_meta_only(spec.get("u"), meta) {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32,
+                    "code": 2,
+                    "errmsg": "Cannot perform an update on a time-series collection \
+                               that modifies a field other than the metaField",
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
 
         // Parse-time validation of an operator-form `u`: an unknown modifier (or
         // mixing operators with replacement fields) is rejected at parse time —
@@ -483,568 +689,4 @@ fn encode_doc(d: &Document) -> Result<Vec<u8>, CommandError> {
 
 fn bson_array(docs: Vec<Document>) -> Vec<Bson> {
     docs.into_iter().map(Bson::Document).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dispatch;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    /// A minimal in-memory storage for exercising the handlers' reply-shaping.
-    /// Real matching/indexing is `secantus-storage`'s job (tested there); this
-    /// fake supports the empty filter (all docs) and a single `{field: value}`
-    /// equality, which is all the handler-plumbing tests need.
-    #[derive(Default)]
-    struct FakeStorage {
-        cols: Mutex<HashMap<(String, String), Vec<Document>>>,
-        opts: Mutex<HashMap<(String, String), Document>>,
-    }
-
-    impl FakeStorage {
-        fn arc() -> Arc<FakeStorage> {
-            Arc::new(FakeStorage::default())
-        }
-        fn seed(&self, db: &str, coll: &str, docs: Vec<Document>) {
-            self.cols
-                .lock()
-                .unwrap()
-                .insert((db.to_string(), coll.to_string()), docs);
-        }
-        fn set_options(&self, db: &str, coll: &str, opts: Document) {
-            self.opts
-                .lock()
-                .unwrap()
-                .insert((db.to_string(), coll.to_string()), opts);
-        }
-    }
-
-    fn matches(d: &Document, filter: &Document) -> bool {
-        filter.iter().all(|(k, v)| d.get(k) == Some(v))
-    }
-
-    impl crate::Storage for FakeStorage {
-        fn insert(
-            &self,
-            db: &str,
-            coll: &str,
-            docs: Vec<Vec<u8>>,
-            ordered: bool,
-        ) -> Result<(usize, Vec<Document>), StorageError> {
-            let mut cols = self.cols.lock().unwrap();
-            let bucket = cols.entry((db.to_string(), coll.to_string())).or_default();
-            let mut inserted = 0;
-            let mut errors = Vec::new();
-            for (i, bytes) in docs.iter().enumerate() {
-                let d = bson::Document::from_reader(&mut bytes.as_slice()).unwrap();
-                // Duplicate-`_id` rejection, the canonical insert error path.
-                let dup = match d.get("_id") {
-                    Some(id) => bucket.iter().any(|e| e.get("_id") == Some(id)),
-                    None => false,
-                };
-                if dup {
-                    errors.push(doc! {
-                        "index": i as i32,
-                        "code": 11000,
-                        "errmsg": "E11000 duplicate key error",
-                        "keyPattern": { "_id": 1 },
-                        "keyValue": { "_id": d.get("_id").cloned().unwrap_or(Bson::Null) },
-                    });
-                    if ordered {
-                        break;
-                    }
-                    continue;
-                }
-                bucket.push(d);
-                inserted += 1;
-            }
-            Ok((inserted, errors))
-        }
-
-        fn update_matching(
-            &self,
-            db: &str,
-            coll: &str,
-            filter: &Document,
-            update: &Document,
-            multi: bool,
-            upsert: bool,
-        ) -> Result<UpdateOutcome, StorageError> {
-            // Minimal `$set`-only semantics, enough to exercise the handler's
-            // matched/modified accounting, multi, and upsert.
-            let mut cols = self.cols.lock().unwrap();
-            let bucket = cols.entry((db.to_string(), coll.to_string())).or_default();
-            let set = update.get("$set").and_then(Bson::as_document).cloned();
-            let mut matched = 0usize;
-            let mut modified = 0usize;
-            for d in bucket.iter_mut() {
-                if !matches(d, filter) {
-                    continue;
-                }
-                matched += 1;
-                if let Some(set) = &set {
-                    let mut changed = false;
-                    for (k, v) in set.iter() {
-                        if d.get(k) != Some(v) {
-                            d.insert(k.clone(), v.clone());
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        modified += 1;
-                    }
-                }
-                if !multi {
-                    break;
-                }
-            }
-            let upserted_id = if matched == 0 && upsert {
-                let id = filter.get("_id").cloned().unwrap_or(Bson::Int64(999));
-                let mut new_doc = doc! { "_id": id.clone() };
-                if let Some(set) = &set {
-                    for (k, v) in set.iter() {
-                        new_doc.insert(k.clone(), v.clone());
-                    }
-                }
-                bucket.push(new_doc);
-                Some(id)
-            } else {
-                None
-            };
-            Ok(UpdateOutcome {
-                matched,
-                modified,
-                upserted_id,
-            })
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn update_matching_pipeline(
-            &self,
-            db: &str,
-            coll: &str,
-            filter: &Document,
-            pipeline: &[Bson],
-            multi: bool,
-            _upsert: bool,
-            _let_vars: &Document,
-            _collation: Option<&crate::storage::Collation>,
-            _validator: Option<&Document>,
-        ) -> Result<UpdateOutcome, StorageError> {
-            // Apply the pipeline to each matched doc (the real storage path).
-            let mut cols = self.cols.lock().unwrap();
-            let bucket = cols.entry((db.to_string(), coll.to_string())).or_default();
-            let mut matched = 0usize;
-            let mut modified = 0usize;
-            for d in bucket.iter_mut() {
-                if !matches(d, filter) {
-                    continue;
-                }
-                matched += 1;
-                let out = secantus_core::aggregate::apply_pipeline(
-                    vec![d.clone()],
-                    pipeline,
-                    &Document::new(),
-                    None,
-                )
-                .map_err(|_| StorageError::WriteError {
-                    code: 2,
-                    errmsg: "pipeline".into(),
-                })?;
-                if let Some(new) = out.into_iter().next() {
-                    if &new != d {
-                        *d = new;
-                        modified += 1;
-                    }
-                }
-                if !multi {
-                    break;
-                }
-            }
-            Ok(UpdateOutcome {
-                matched,
-                modified,
-                upserted_id: None,
-            })
-        }
-
-        fn delete_matching(
-            &self,
-            db: &str,
-            coll: &str,
-            filter: &Document,
-            limit: usize,
-        ) -> Result<usize, StorageError> {
-            let mut cols = self.cols.lock().unwrap();
-            let bucket = cols.entry((db.to_string(), coll.to_string())).or_default();
-            let mut removed = 0;
-            let mut i = 0;
-            while i < bucket.len() {
-                if matches(&bucket[i], filter) {
-                    bucket.remove(i);
-                    removed += 1;
-                    if limit != 0 && removed >= limit {
-                        break;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            Ok(removed)
-        }
-
-        fn count_matching(
-            &self,
-            db: &str,
-            coll: &str,
-            filter: &Document,
-        ) -> Result<usize, StorageError> {
-            let cols = self.cols.lock().unwrap();
-            Ok(cols
-                .get(&(db.to_string(), coll.to_string()))
-                .map(|b| b.iter().filter(|d| matches(d, filter)).count())
-                .unwrap_or(0))
-        }
-        fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
-            Ok(self
-                .opts
-                .lock()
-                .unwrap()
-                .get(&(db.to_string(), coll.to_string()))
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        fn find(
-            &self,
-            db: &str,
-            coll: &str,
-            filter: &Document,
-            _sort: Option<&Document>,
-            _hint: Option<crate::storage::RawHint<'_>>,
-        ) -> Result<Vec<Vec<u8>>, StorageError> {
-            let cols = self.cols.lock().unwrap();
-            Ok(cols
-                .get(&(db.to_string(), coll.to_string()))
-                .map(|b| {
-                    b.iter()
-                        .filter(|d| matches(d, filter))
-                        .map(|d| {
-                            let mut v = Vec::new();
-                            d.to_writer(&mut v).unwrap();
-                            v
-                        })
-                        .collect()
-                })
-                .unwrap_or_default())
-        }
-    }
-
-    use crate::UpdateOutcome;
-
-    fn ctx(storage: Arc<FakeStorage>) -> CommandContext {
-        CommandContext::new(1).with_storage(storage)
-    }
-
-    #[test]
-    fn insert_then_count() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        let reply = dispatch(
-            &doc! {"insert": "c", "documents": [{"_id": 1}, {"_id": 2}], "$db": "t"},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("n").unwrap(), 2);
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        assert!(reply.get("writeErrors").is_none());
-
-        let mut c = ctx(s);
-        c.db_name = "admin".into();
-        // db defaults to the ctx db_name (admin); insert went to ctx default
-        // too, so count against the same namespace.
-        let reply = dispatch(&doc! {"count": "c"}, &mut c);
-        assert_eq!(reply.get_i32("n").unwrap(), 2);
-    }
-
-    #[test]
-    fn insert_rejects_validator_violation() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        let db = c.db_name.clone();
-        s.set_options(&db, "c", doc! {"validator": {"a": {"$exists": true}}});
-        // doc 0 violates (no `a`), doc 1 passes.
-        let reply = dispatch(
-            &doc! {"insert": "c", "documents": [{"_id": 1}, {"_id": 2, "a": 1}],
-            "ordered": false},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("n").unwrap(), 1, "only the valid doc inserts");
-        let we = reply.get_array("writeErrors").unwrap();
-        assert_eq!(we.len(), 1);
-        let e = we[0].as_document().unwrap();
-        assert_eq!(e.get_i32("code").unwrap(), 121);
-        assert_eq!(e.get_i32("index").unwrap(), 0);
-    }
-
-    #[test]
-    fn insert_bypass_document_validation_skips_validator() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        let db = c.db_name.clone();
-        s.set_options(&db, "c", doc! {"validator": {"a": {"$exists": true}}});
-        let reply = dispatch(
-            &doc! {"insert": "c", "documents": [{"_id": 1}],
-            "bypassDocumentValidation": true},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("n").unwrap(), 1);
-        assert!(reply.get("writeErrors").is_none());
-    }
-
-    #[test]
-    fn insert_empty_documents_is_invalid_length() {
-        let mut c = ctx(FakeStorage::arc());
-        let reply = dispatch(&doc! {"insert": "c", "documents": []}, &mut c);
-        assert_eq!(reply.get_i32("code").unwrap(), 4);
-        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidLength");
-    }
-
-    #[test]
-    fn insert_id_with_dollar_prefix_rejected() {
-        let mut c = ctx(FakeStorage::arc());
-        let reply = dispatch(
-            &doc! {"insert": "c", "documents": [{"_id": {"$bad": 1}}]},
-            &mut c,
-        );
-        // ordered (default) + a pre-check failure ⇒ nothing inserted, one error.
-        assert_eq!(reply.get_i32("n").unwrap(), 0);
-        let we = reply.get_array("writeErrors").unwrap();
-        assert_eq!(we.len(), 1);
-        let e = we[0].as_document().unwrap();
-        assert_eq!(e.get_i32("code").unwrap(), 2);
-        assert!(e.get_str("errmsg").unwrap().contains("$bad"));
-    }
-
-    #[test]
-    fn insert_duplicate_key_unordered_continues_and_remaps_index() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        // seed _id 2
-        dispatch(&doc! {"insert": "c", "documents": [{"_id": 2}]}, &mut c);
-        // unordered batch: [ok(1), dup(2), ok(3)] ⇒ n=2, one writeError at index 1.
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {
-                "insert": "c",
-                "documents": [{"_id": 1}, {"_id": 2}, {"_id": 3}],
-                "ordered": false,
-            },
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("n").unwrap(), 2);
-        let we = reply.get_array("writeErrors").unwrap();
-        assert_eq!(we.len(), 1);
-        let e = we[0].as_document().unwrap();
-        assert_eq!(e.get_i32("index").unwrap(), 1, "index remapped to original");
-        assert_eq!(e.get_i32("code").unwrap(), 11000);
-    }
-
-    #[test]
-    fn insert_pre_error_index_remap_unordered() {
-        // [bad-$id(0), ok(1), dup(2)] unordered: the storage error on the dup
-        // (original index 2) must remap correctly past the pre-error at 0.
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(&doc! {"insert": "c", "documents": [{"_id": 9}]}, &mut c);
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {
-                "insert": "c",
-                "documents": [{"_id": {"$x": 1}}, {"_id": 5}, {"_id": 9}],
-                "ordered": false,
-            },
-            &mut c,
-        );
-        // _id 5 inserted; _id 9 duplicate; _id {$x} pre-rejected.
-        assert_eq!(reply.get_i32("n").unwrap(), 1);
-        let we = reply.get_array("writeErrors").unwrap();
-        assert_eq!(we.len(), 2);
-        let pre = we[0].as_document().unwrap();
-        assert_eq!(pre.get_i32("index").unwrap(), 0);
-        assert_eq!(pre.get_i32("code").unwrap(), 2);
-        let dup = we[1].as_document().unwrap();
-        assert_eq!(dup.get_i32("index").unwrap(), 2);
-        assert_eq!(dup.get_i32("code").unwrap(), 11000);
-    }
-
-    #[test]
-    fn delete_removes_and_counts() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(
-            &doc! {"insert": "c", "documents": [{"_id": 1, "x": 1}, {"_id": 2, "x": 1}, {"_id": 3, "x": 2}]},
-            &mut c,
-        );
-        let mut c = ctx(s.clone());
-        // limit 0 ⇒ delete all matching x:1
-        let reply = dispatch(
-            &doc! {"delete": "c", "deletes": [{"q": {"x": 1}, "limit": 0}]},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("n").unwrap(), 2);
-        let mut c = ctx(s);
-        let reply = dispatch(&doc! {"count": "c"}, &mut c);
-        assert_eq!(reply.get_i32("n").unwrap(), 1);
-    }
-
-    #[test]
-    fn delete_limit_one() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(
-            &doc! {"insert": "c", "documents": [{"_id": 1, "x": 1}, {"_id": 2, "x": 1}]},
-            &mut c,
-        );
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"delete": "c", "deletes": [{"q": {"x": 1}, "limit": 1}]},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("n").unwrap(), 1);
-    }
-
-    #[test]
-    fn count_skip_and_limit_clamp() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(
-            &doc! {"insert": "c", "documents": [{"_id": 1}, {"_id": 2}, {"_id": 3}, {"_id": 4}]},
-            &mut c,
-        );
-        let mut c = ctx(s.clone());
-        assert_eq!(
-            dispatch(&doc! {"count": "c", "skip": 1}, &mut c)
-                .get_i32("n")
-                .unwrap(),
-            3
-        );
-        let mut c = ctx(s);
-        assert_eq!(
-            dispatch(&doc! {"count": "c", "limit": 2}, &mut c)
-                .get_i32("n")
-                .unwrap(),
-            2
-        );
-    }
-
-    #[test]
-    fn data_command_without_storage_is_internal_error() {
-        let mut c = CommandContext::new(1); // no storage attached
-        let reply = dispatch(&doc! {"count": "c"}, &mut c);
-        assert_eq!(reply.get_i32("code").unwrap(), 1);
-        assert_eq!(reply.get_str("codeName").unwrap(), "InternalError");
-    }
-
-    #[test]
-    fn update_set_modifies_and_counts() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(
-            &doc! {"insert": "c", "documents": [{"_id": 1, "x": 1}]},
-            &mut c,
-        );
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$set": {"x": 2}}}]},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("n").unwrap(), 1);
-        assert_eq!(reply.get_i32("nModified").unwrap(), 1);
-        assert!(reply.get("upserted").is_none());
-        assert!(reply.get("writeErrors").is_none());
-    }
-
-    #[test]
-    fn update_multi_touches_all_matches() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(
-            &doc! {"insert": "c", "documents": [{"_id": 1, "x": 1}, {"_id": 2, "x": 1}]},
-            &mut c,
-        );
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"update": "c", "updates": [{"q": {"x": 1}, "u": {"$set": {"y": 9}}, "multi": true}]},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("n").unwrap(), 2);
-        assert_eq!(reply.get_i32("nModified").unwrap(), 2);
-    }
-
-    #[test]
-    fn update_upsert_reports_upserted_id() {
-        let mut c = ctx(FakeStorage::arc());
-        let reply = dispatch(
-            &doc! {"update": "c", "updates": [{"q": {"_id": 5}, "u": {"$set": {"a": 1}}, "upsert": true}]},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("n").unwrap(), 1, "upsert counts toward n");
-        assert_eq!(reply.get_i32("nModified").unwrap(), 0);
-        let up = reply.get_array("upserted").unwrap();
-        assert_eq!(up.len(), 1);
-        let e = up[0].as_document().unwrap();
-        assert_eq!(e.get_i32("index").unwrap(), 0);
-        assert_eq!(e.get_i32("_id").unwrap(), 5);
-    }
-
-    #[test]
-    fn update_sort_option_rejected_pre_8() {
-        let mut c = ctx(FakeStorage::arc());
-        let reply = dispatch(
-            &doc! {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "sort": {"a": 1}}]},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("code").unwrap(), 9);
-        assert_eq!(reply.get_str("codeName").unwrap(), "FailedToParse");
-    }
-
-    #[test]
-    fn update_pipeline_unknown_stage_is_command_error() {
-        let mut c = ctx(FakeStorage::arc());
-        let reply = dispatch(
-            &doc! {"update": "c", "updates": [{"q": {}, "u": [{"$badStage": {}}]}]},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("code").unwrap(), 168);
-        assert_eq!(
-            reply.get_str("codeName").unwrap(),
-            "InvalidPipelineOperator"
-        );
-    }
-
-    #[test]
-    fn update_valid_pipeline_applies_via_storage() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        let db = c.db_name.clone();
-        s.seed(
-            &db,
-            "c",
-            vec![doc! {"_id": 1, "a": 0}, doc! {"_id": 2, "a": 0}],
-        );
-        let reply = dispatch(
-            &doc! {"update": "c", "updates": [
-                {"q": {}, "u": [{"$set": {"a": 1}}], "multi": true}
-            ]},
-            &mut c,
-        );
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        assert!(reply.get("writeErrors").is_none(), "pipeline now applies");
-        assert_eq!(reply.get_i32("n").unwrap(), 2);
-        assert_eq!(reply.get_i32("nModified").unwrap(), 2);
-        let cols = s.cols.lock().unwrap();
-        let bucket = cols.get(&(db, "c".to_string())).unwrap();
-        assert!(bucket.iter().all(|d| d.get_i32("a") == Ok(1)));
-    }
 }

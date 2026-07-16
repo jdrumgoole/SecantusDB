@@ -35,6 +35,8 @@ import threading
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_modules import INCLUDE
 
 
@@ -75,7 +77,7 @@ def _jstack_all_javas(jstack_dir: Path, java_home: str | None) -> None:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-java-driver"
-RESULTS_DIR = REPO_ROOT / ".validation" / "java-results"
+RESULTS_DIR = REPO_ROOT / ".validation" / f"java-results{gauge_common.report_suffix()}"
 
 # Test users mongo-java-driver's ClusterFixture connection string
 # expects when ``-Dorg.mongodb.test.uri`` carries credentials.
@@ -223,7 +225,6 @@ def main() -> int:
     RESULTS_DIR.mkdir(parents=True)
 
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
 
     # Tempdir storage so the user records we seed in phase 1 survive
     # the daemon restart in phase 2 with --auth.
@@ -233,7 +234,7 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
+    def _spawn_daemon(*, with_auth: bool) -> tuple[subprocess.Popen, str, int]:
         cmd = [
             sys.executable,
             "-m",
@@ -241,7 +242,7 @@ def main() -> int:
             "--host",
             host,
             "--port",
-            str(port),
+            "0",
             "--storage-path",
             storage_dir,
             "--log-level",
@@ -258,14 +259,13 @@ def main() -> int:
         ]
         if with_auth:
             cmd.append("--auth")
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+        # Each phase binds its own port; seeded users persist via storage_dir.
+        return gauge_common.spawn_daemon(cmd, label="java_validation")
 
-    print(
-        f"java_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr
-    )
-    daemon = _spawn_daemon(with_auth=False)
+    print("java_validation: phase 1 — seeding daemon (no --auth)", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=False)
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "java_validation")
         print("java_validation: seeding root-user", file=sys.stderr)
         import pymongo
@@ -283,14 +283,9 @@ def main() -> int:
             daemon.kill()
             daemon.wait()
 
-    print(
-        f"java_validation: phase 2 — running gauge with --auth on {host}:{port}",
-        file=sys.stderr,
-    )
-    daemon = _spawn_daemon(with_auth=True)
+    print("java_validation: phase 2 — running gauge with --auth", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=True)
     try:
-        _wait_for_listener(host, port)
-
         uri = f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/?authSource=admin"
         env = os.environ.copy()
         if java_home_override:
@@ -327,9 +322,23 @@ def main() -> int:
         # (vendored tree stays unmodified). Worker count is the runner's
         # CPU count by default; ``SECANTUS_GAUGE_PARALLEL_FORKS`` overrides.
         init_script = REPO_ROOT / "java_validation" / "init.gradle.kts"
-        forks = os.environ.get("SECANTUS_GAUGE_PARALLEL_FORKS")
-        if forks is None:
-            env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(os.cpu_count() or 1)
+        # Base parallel-fork count: the user-supplied override if set, else
+        # the runner's CPU count. This is the CEILING — the per-module fork
+        # count (computed inside the loop below) is capped at the number of
+        # test classes that module actually runs. Do NOT export it globally
+        # here: ``init.gradle.kts`` reads ``SECANTUS_GAUGE_PARALLEL_FORKS``
+        # for EVERY ``Test`` task, and a module that runs fewer test classes
+        # than forks makes Gradle spawn empty test-worker forks. An empty
+        # fork never writes its ``build/test-results/test/binary/output.bin.idx``,
+        # and Gradle's result aggregator then dies with
+        # ``FileNotFoundException: .../binary/output.bin.idx`` — no JUnit XML
+        # is produced and the whole module is marked failed. ``:driver-sync``
+        # (22 classes) has enough work to fill 12 forks and survives, but
+        # ``:driver-core`` (only 2 geo specs) races into the crash. Capping
+        # forks at the class count per module keeps driver-sync fully parallel
+        # while driver-core drops to 2 forks with no empty forks.
+        _forks_override = os.environ.get("SECANTUS_GAUGE_PARALLEL_FORKS")
+        base_forks = int(_forks_override) if _forks_override else (os.cpu_count() or 1)
 
         # Wipe stale JUnit XML before running so a failed build can't
         # masquerade as a passing run. If Gradle aborts (unsupported JDK,
@@ -346,7 +355,16 @@ def main() -> int:
                 shutil.rmtree(stale_results, ignore_errors=True)
 
         gradle_rcs: list[int] = []
-        for spec in INCLUDE:
+        # Harvest JUnit XML *per invocation*, not once at the end: two specs can
+        # target the same gradle task (e.g. ``:driver-sync:test`` split into a
+        # parallel functional group and a serial monitoring group), and Gradle's
+        # ``--rerun-tasks`` clears the task's ``build/test-results/test/`` dir
+        # before each run — so the second invocation would wipe the first's XML.
+        # Copy each invocation's XML into its own ``RESULTS_DIR`` subdir right
+        # after it finishes; ``generate_report`` rglobs, so the split is
+        # transparent to the report.
+        copied = 0
+        for spec_idx, spec in enumerate(INCLUDE):
             cmd = [
                 "./gradlew",
                 "--no-daemon",
@@ -388,6 +406,25 @@ def main() -> int:
                 f"java_validation: running {spec.task}{filter_msg} in {VENDOR} (URI={uri})",
                 file=sys.stderr,
             )
+
+            # Fork count for this invocation. ``serial`` specs run at 1 fork —
+            # they hold the timing-sensitive SDAM / command-monitoring tests,
+            # which assert exact event sequences and flake under parallel CPU
+            # contention against the single-GIL Python daemon (the Rust server,
+            # being truly multithreaded, passes them at full parallelism). Other
+            # specs cap the fork count at the number of test classes they run so
+            # Gradle never spawns an empty test-worker fork (an empty fork leaves
+            # ``output.bin.idx`` unwritten → the result aggregator crashes with
+            # FileNotFoundException; see the base_forks comment above). An
+            # unfiltered module (``test_classes == []``) runs its whole suite, so
+            # it keeps the full ``base_forks`` — plenty of work to fill every fork.
+            if spec.serial:
+                module_forks = 1
+            elif len(spec.test_classes) == 0:
+                module_forks = base_forks
+            else:
+                module_forks = min(base_forks, max(1, len(spec.test_classes)))
+            env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(module_forks)
 
             proc = subprocess.Popen(
                 cmd,
@@ -453,20 +490,20 @@ def main() -> int:
             forward_done.wait(timeout=2)
             gradle_rcs.append(gradle_rc)
 
-        gradle_rc = max(gradle_rcs) if gradle_rcs else 0
+            # Harvest this invocation's JUnit XML immediately (before the next
+            # ``--rerun-tasks`` on the same module can clear it). ``spec.task``
+            # is ``:<module>:test`` → module dir ``<module>``; the per-spec
+            # index keeps two invocations of the same task in separate dirs.
+            module_name = spec.task.strip(":").split(":")[0]
+            results = VENDOR / module_name / "build" / "test-results" / "test"
+            if results.is_dir():
+                dest = RESULTS_DIR / f"{module_name}__{spec_idx}"
+                dest.mkdir(parents=True, exist_ok=True)
+                for xml in results.glob("TEST-*.xml"):
+                    shutil.copy(xml, dest / xml.name)
+                    copied += 1
 
-        # Copy JUnit XML out of the source tree to keep our parser simple
-        # and avoid touching the submodule.
-        copied = 0
-        for module_dir in VENDOR.iterdir():
-            results = module_dir / "build" / "test-results" / "test"
-            if not results.is_dir():
-                continue
-            dest = RESULTS_DIR / module_dir.name
-            dest.mkdir(parents=True, exist_ok=True)
-            for xml in results.glob("TEST-*.xml"):
-                shutil.copy(xml, dest / xml.name)
-                copied += 1
+        gradle_rc = max(gradle_rcs) if gradle_rcs else 0
 
         if copied == 0:
             print(

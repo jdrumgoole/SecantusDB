@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.5.3b13"
+version = "0.5.4b235"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,6 +26,9 @@ dependencies = [
     # native components; on virtually every box already as a
     # transitive dep of botocore / pytest / etc.
     "python-dateutil>=2.8",
+    # tomllib backport for the config loader (secantus.config); stdlib
+    # from 3.11, so 3.10 installs need the API-identical tomli.
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -35,9 +38,25 @@ dev = [
     "pytest-json-report>=1.5",  # for pymongo-validation report generation
     "pytest-benchmark>=4.0",  # for tests/test_perf_regression.py
     "pytest-timeout>=2.4",  # per-test deadline; names hung tests instead of letting CI hang at 97%
+    "pytest-asyncio>=0.24",  # drives pymongo's async test suite in the validate-pymongo-async gauge
     "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
+    "sqlglot>=25",  # SQL parser for the secantus.sql tests (mirrors the [sql] extra)
+    "pg8000>=1.31",  # pure-Python Postgres driver: real-driver gauge for the SQL server
+    # Pinned exactly: the validate-psycopg gauge runs the vendored psycopg test
+    # suite (vendor/psycopg, same tag) against the installed wheel — the two
+    # must stay in lockstep. Bump both together.
+    "psycopg[binary]==3.3.4",
+    "sqlalchemy>=2.0",  # ORM smoke for the SQL server (drives pg8000 + psycopg)
+    # psycopg's test-suite plugins (its [test] extra) for validate-psycopg:
+    "anyio>=4.0",
+    "pytest-cov>=3.0",
+    "pytest-randomly>=3.5",
     "invoke>=2.2",
-    "ruff>=0.6",
+    # Pinned exactly: ruff's formatter output changes between releases, so an
+    # unpinned floor let CI silently pull a newer ruff that reformatted an
+    # untouched file and failed the `ruff format --check` gate on every PR. Bump
+    # this deliberately (and re-run `ruff format`) when adopting a new ruff.
+    "ruff==0.15.20",
     "sphinx>=7.2",
     "myst-parser>=2.0",
     "furo>=2024.1",
@@ -55,35 +74,59 @@ admin = [
     # Local FastAPI app served behind a pywebview window. Loopback-only
     # with a per-launch token; no external services. See docs/admin.md.
     "fastapi>=0.110",
+    # starlette>=1.0.1 fixes CVE-2026-48710 ("BadHost"): pre-1.0.1 builds
+    # request.url from an unvalidated Host header, letting a crafted Host
+    # shift request.url.path and bypass the admin token middleware's
+    # /healthz + /static/ prefix allowlist. Pinned explicitly (fastapi pulls
+    # starlette transitively, but an explicit floor guarantees the patched
+    # version). The middleware also reads the ASGI scope path directly now
+    # (admin/middleware.py) as defence-in-depth.
+    "starlette>=1.0.1",
     "uvicorn[standard]>=0.27",
     "jinja2>=3.1",
     "httpx>=0.27",
     "pywebview>=5.0",
-    "python-multipart>=0.0.9",
+    # python-multipart>=0.0.30 fixes CVE-2026-53539: a quadratic-CPU DoS in
+    # the urlencoded-form parser on bodies containing semicolons.
+    "python-multipart>=0.0.30",
     # OS-level process-name override — makes the macOS menu bar / Dock
     # / Activity Monitor say "SecantusDB admin" instead of "Python".
     "setproctitle>=1.3",
 ]
 rust = [
-    # Optional Rust acceleration core (the `_secantus_core` extension). Kept as
-    # a separate companion wheel rather than bundled, pinned in lockstep so the
-    # accelerator always matches this release's behaviour. The pure-Python
-    # engines remain the default; enable with SECANTUS_ENGINE=rust|auto. Built
-    # from the PyO3 bindings crate crates/secantus-core-py/ (which wraps the pure
-    # Rust engines in crates/secantus-core/); see tasks/rust-rewrite-plan.md.
+    # The Rust engine core (`_secantus_core`) as a separate companion wheel: the
+    # reusable engines behind the Rust server + the byte-for-byte parity-test
+    # oracle. The Python server does NOT import it (the in-process engine
+    # selection was retired); installing this extra is only useful for the
+    # parity tests / using the engines as a library. Built from the PyO3 bindings
+    # crate crates/secantus-core-py/ (wrapping crates/secantus-core/).
     "secantus-core==0.5.2b15",
+]
+sql = [
+    # The embedded SQL engine + (later) the PostgreSQL-wire server. sqlglot is
+    # a pure-Python SQL parser (no native build), so this extra is opt-in and
+    # never enters the core Mongo wheel's dependency closure. The Python server
+    # does NOT import `secantus.sql`; installing this extra is only needed to
+    # use the SQL interface. See tasks/sql-postgres-plan.md.
+    "sqlglot>=25",
 ]
 
 [project.scripts]
-# `secantusdb` is the primary console script, matching the PyPI distribution
-# name. `secantus` is kept as a shorter legacy alias — both invoke the same
-# entry point and start a standalone single-node server.
-secantusdb = "secantus.cli:main"
-secantus = "secantus.cli:main"
-secantusdb-admin = "secantus.admin.cli:main"
+# Daemon naming: `secantusd-<engine>[-<protocol>]`. `-d` signals a daemon
+# (like `mongod`); the engine tag (`-py` / `-rs`) disambiguates the Python and
+# Rust builds that would otherwise both be `secantusd`; a protocol tag (`-pg`)
+# names the wire protocol when it isn't the default MongoDB wire.
+#   secantusd-py     — Python MongoDB-wire server (this package)
+#   secantusd-py-pg  — Python PostgreSQL-wire server (secantus.sql.pgserver)
+#   secantusd-rs     — Rust MongoDB-wire server (crates/secantusdb [[bin]])
+secantusd-py = "secantus.cli:main"
+secantusd-py-pg = "secantus.sql.pgserver:main"
+# Utility commands carry the bare `secantus` import-name prefix (they aren't
+# daemons, so the `secantusd-` prefix doesn't apply).
+secantus-admin = "secantus.admin.cli:main"
 # Offline restore tool: extract a SecantusDB backup archive into a
-# fresh directory the user then points a new `secantusdb` at.
-secantusdb-restore-archive = "secantus.restore_cli:main"
+# fresh directory the user then points a new `secantusd-py` at.
+secantus-restore-archive = "secantus.restore_cli:main"
 
 [build-system]
 # SWIG is required at build time but pulled from the host (Homebrew /
@@ -123,18 +166,37 @@ sdist.exclude = [
     "vendor/pymongo-tests/**",
     "pymongo_validation/**",
     "pymongo-validation/**",
+    # pymongo-async reuses the vendor/pymongo-tests submodule (the async
+    # suite under test/asynchronous/); only its adapter dir needs excluding.
+    "pymongo_async_validation/**",
     "vendor/mongo-go-driver/**",
     "go_validation/**",
     "vendor/node-mongodb-native/**",
     "node_validation/**",
+    # mongo-java-driver hosts both the Java and the Kotlin driver; the
+    # vendor tree is already excluded above, so the Kotlin gauge just adds
+    # its own adapter dir.
     "vendor/mongo-java-driver/**",
     "java_validation/**",
+    "kotlin_validation/**",
     "vendor/mongo-ruby-driver/**",
     "ruby_validation/**",
     "vendor/mongo-php-library/**",
     "php_lib_validation/**",
     "vendor/mongo-php-driver/**",
     "php_ext_validation/**",
+    "vendor/mongo-c-driver/**",
+    "c_validation/**",
+    "vendor/mongo-cxx-driver/**",
+    "cxx_validation/**",
+    "vendor/mongo-csharp-driver/**",
+    "dotnet_validation/**",
+    # SQL-server gauges: psycopg's own test suite and the sqllogictest
+    # corpus, both vendored dev-only (invoke validate-psycopg / validate-slt).
+    "vendor/psycopg/**",
+    "psycopg_validation/**",
+    "vendor/sqllogictest/**",
+    "slt_validation/**",
     ".validation/**",
     # brandkit/ is marketing content (logos, brand-guide HTML); not
     # needed at install or run time. The docs that need it pull from
@@ -149,6 +211,15 @@ sdist.exclude = [
     # (tests/test_geo_cross_driver.py) ships, but the JS/Go sources
     # don't need to live in the wheel — they're dev-only scaffolding.
     "tests/cross_driver/**",
+    # Dev-only trees that aren't needed to build or install the package: the
+    # Sphinx docs, the invoke task defs, the benchmark harness, and the CI
+    # workflow config. Trimming them keeps the source tarball lean without
+    # touching what the build actually consumes (src/, CMakeLists, cmake/,
+    # vendor/wiredtiger, pyproject). (security review §I7)
+    "docs/**",
+    "tasks/**",
+    "bench/**",
+    ".github/**",
 ]
 
 [tool.cibuildwheel]
@@ -168,26 +239,56 @@ test-requires = ["pytest", "pytest-xdist"]
 test-command = "pytest -v {project}/tests/test_smoke.py {project}/tests/test_pymongo_smoke.py"
 
 [tool.cibuildwheel.linux]
-# manylinux x86_64 + aarch64 + musllinux x86_64 + aarch64; install swig in
-# whichever container cibuildwheel is using:
-#   - manylinux2014: CentOS 7 (yum)
-#   - manylinux_2_28: AlmaLinux 8 (dnf)
-#   - musllinux_1_2: Alpine (apk)
-# Each image ships exactly one of these, so the chained `||` picks the right
-# one and the others fail fast with command-not-found.
+# manylinux_2_28 (AlmaLinux 8, dnf) + musllinux_1_2 (Alpine, apk). The
+# storage-engine build (SECANTUS_BUILD_STORAGE_ENGINE=ON) compiles the Rust
+# extensions, which need (a) swig for WiredTiger's Python module, (b) a Rust
+# toolchain, and (c) libclang for `secantus-wt`'s bindgen. We pin manylinux to
+# 2_28 (glibc 2.28+) because its `dnf install clang clang-libs` gives a modern
+# libclang (the CentOS-7 manylinux2014 SCL clang is far more painful). The
+# install path of libclang.so differs by distro (manylinux /usr/lib64, musllinux
+# /usr/lib), so we symlink whichever we find into a fixed /opt/libclang and point
+# LIBCLANG_PATH there (set in the workflows). `$HOME/.cargo/bin` is on PATH via
+# CIBW_ENVIRONMENT so the build sees the rustup-installed cargo.
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
 archs = ["x86_64", "aarch64"]
-before-build = "apk add --no-cache swig || dnf install -y swig || yum install -y swig"
+before-build = """
+(dnf install -y swig clang clang-libs clang-devel llvm-libs || apk add --no-cache swig clang clang-dev llvm-dev)
+mkdir -p /opt/libclang
+lc=$(find /usr -name 'libclang.so*' 2>/dev/null | head -1); [ -n "$lc" ] && ln -sf "$lc" /opt/libclang/libclang.so
+command -v cargo >/dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable)
+"""
 
 [tool.cibuildwheel.macos]
-# arm64 only; x86_64 isn't a supported wheel target.
+# arm64 only; x86_64 isn't a supported wheel target. The storage-engine build
+# needs swig + Rust + libclang: the macos-14 runner ships Rust and Xcode's clang.
+# We deliberately do NOT install/point at Homebrew's `llvm` — its newer libclang
+# parses WiredTiger's headers into broken bindings (missing WT_CURSOR fields);
+# bindgen auto-discovers Xcode's libclang, which is what the storage-engine CI
+# job uses successfully. `brew install` is idempotent.
 archs = ["arm64"]
-before-build = "brew install swig"
+before-build = "brew install swig && (command -v cargo >/dev/null 2>&1 || brew install rust)"
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
-# SWIG ships preinstalled on windows-2022 runners; choco re-installs it idempotently
-# so a refreshed runner image without it still works.
-before-build = "choco install -y swig"
+# SWIG (preinstalled, re-installed idempotently) + LLVM for bindgen's libclang.
+# Rust ships preinstalled on the windows-2022 runner, so we don't choco-install
+# it (that would risk shadowing the runner's rustup cargo). Then copy libclang.dll
+# to a SPACE-FREE path: bindgen could not find it at "C:\Program Files\LLVM\bin"
+# (`invalid: []`) because the space in the path doesn't survive cibuildwheel's
+# env serialization on Windows; a no-space LIBCLANG_PATH sidesteps that.
+before-build = 'choco install -y swig llvm && (if not exist C:\libclang mkdir C:\libclang) && copy /Y "C:\Program Files\LLVM\bin\libclang.dll" C:\libclang'
+# Flag + libclang + shared cargo target for the storage-engine bundle
+# (_secantus_storage / _secantus_server extensions + secantusd-rs.exe). Set here,
+# not in a workflow CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't
+# overridden). Raw values — cibuildwheel quotes table values itself, so our own
+# quotes once produced a doubled-quote "Malformed environment option".
+# SECANTUS_CARGO_TARGET (no ccache on Windows) just shares one target dir across
+# the 4 CPython builds in the job so the Rust deps compile once, not 4×.
+# Forward slashes: a backslash in C:\... gets eaten when the path flows through
+# CMake (`\c` escape), turning it into the invalid drive-relative `C:cargo-target`.
+# CMake, cargo and clang-sys all accept forward slashes on Windows.
+environment = { SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:/libclang', SECANTUS_CARGO_TARGET = 'C:/cargo-target' }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

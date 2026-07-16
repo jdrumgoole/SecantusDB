@@ -42,11 +42,13 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_paths import CARGO_FEATURES, INCLUDE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-rust-driver"
-RAW_OUT = REPO_ROOT / ".validation" / "rust-raw.json"
+RAW_OUT = REPO_ROOT / ".validation" / f"rust-raw{gauge_common.report_suffix()}.json"
 
 # Hard wall-clock limit on the cargo test invocation. The Rust
 # driver's tests are async and rely on tokio timeouts internally;
@@ -116,9 +118,7 @@ def main() -> int:
         return 2
 
     RAW_OUT.parent.mkdir(exist_ok=True)
-    port = _free_port()
     storage = Path(tempfile.mkdtemp(prefix="secantus-rust-gauge-"))
-    uri = f"mongodb://127.0.0.1:{port}/"
 
     daemon_cmd = [
         sys.executable,
@@ -127,16 +127,20 @@ def main() -> int:
         "--host",
         "127.0.0.1",
         "--port",
-        str(port),
+        "0",
         "--storage-path",
         str(storage),
         "--log-level",
         "WARNING",
     ]
-    print(f"rust_validation: launching SecantusDB → {uri}", file=sys.stderr)
-    daemon = subprocess.Popen(daemon_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+    daemon, host, port = gauge_common.spawn_daemon(daemon_cmd, label="rust_validation")
+    uri = f"mongodb://{host}:{port}/"
+    print(
+        f"rust_validation: launched {gauge_common.gauge_server()} SecantusDB → {uri}",
+        file=sys.stderr,
+    )
     try:
-        _wait_for_listener(port)
         _verify_secantus(uri)
         rc, raw = _run_cargo_tests(uri)
     finally:

@@ -1,0 +1,885 @@
+"""Extended query protocol: prepared statements, portals, and bound parameters.
+
+The simple ``Query`` path (P1) parses and runs SQL text in one shot. The
+extended protocol splits that into Parse → Bind → Describe → Execute → Sync, so
+a client can prepare a statement once and run it many times with different
+``$1`` parameters. This is what psycopg / JDBC use.
+
+``ExtendedSession`` holds the per-connection prepared-statement and portal
+registries and a state machine that processes one frontend message at a time,
+returning the bytes to send back. On error it enters the protocol's
+"skip until Sync" state, so a failed statement doesn't desync the stream.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import decimal
+import ipaddress as _ipaddress
+import logging
+import struct
+import uuid as _uuid
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Any
+
+import bson
+from sqlglot import exp
+
+from secantus.sql import engine, errors, pgwire, planner, typemap
+from secantus.sql.catalog import ENUM_TYPE_OID_BASE, USER_TYPE_ARRAY_OID_OFFSET, Catalog
+from secantus.sql.session import Session
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Prepared:
+    name: str
+    stmt: exp.Expression | None  # None for an empty query string
+    param_oids: list[int]
+    param_count: int
+
+
+@dataclass
+class Portal:
+    name: str
+    prepared: Prepared
+    params: list[Any]
+    bound_stmt: exp.Expression | None = None
+    result: Any = None  # SQLResult, computed lazily at Execute
+    offset: int = 0
+    executed: bool = False
+    # Bind's result-format codes (0=text, 1=binary): [] all-text, [c] all-c, else per-col.
+    result_formats: list[int] = field(default_factory=list)
+
+
+# Postgres binary timestamps count microseconds from 2000-01-01 00:00:00 UTC;
+# dates count days from the same epoch.
+_PG_EPOCH = _dt.datetime(2000, 1, 1, tzinfo=_dt.timezone.utc)
+_PG_EPOCH_DATE = _dt.date(2000, 1, 1)
+
+
+def _decode_numeric(b: bytes) -> Decimal:
+    """Decode Postgres' binary ``numeric`` (base-10000 digits)."""
+    ndigits, weight, sign, dscale = struct.unpack_from("!HhHH", b, 0)
+    digits = [struct.unpack_from("!H", b, 8 + 2 * i)[0] for i in range(ndigits)]
+    if sign == 0xC000:  # NaN
+        return Decimal("NaN")
+    if sign == 0xD000:  # +Infinity
+        return Decimal("Infinity")
+    if sign == 0xF000:  # -Infinity
+        return Decimal("-Infinity")
+    s = "".join(f"{d:04d}" for d in digits) or "0"
+    # The first digit group sits at base-10000 position ``weight``; give the
+    # context enough precision for arbitrarily wide values (the default 28
+    # significant digits silently rounds — or refuses to quantize — wide numerics).
+    dctx = decimal.Context(prec=max(len(s) + dscale + 4, 40))
+    value = dctx.scaleb(Decimal(s), (weight - (ndigits - 1)) * 4) if digits else Decimal(0)
+    if sign == 0x4000:
+        value = value.copy_negate()  # context-free: ``-value`` rounds to context prec
+    # Round to the declared display scale so 19.99 doesn't become 19.9900...
+    return value.quantize(Decimal(1).scaleb(-dscale), context=dctx) if dscale else value
+
+
+def _decode_timestamptz(b: bytes) -> _dt.datetime:
+    return _PG_EPOCH + _dt.timedelta(microseconds=struct.unpack("!q", b)[0])
+
+
+def _decode_timestamp(b: bytes) -> _dt.datetime:
+    """Binary ``timestamp`` (without time zone) — same layout, but tz-naive."""
+    return _decode_timestamptz(b).replace(tzinfo=None)
+
+
+def _micros_to_time_text(micros: int) -> str:
+    secs, frac = divmod(micros, 1_000_000)
+    hh, rem = divmod(secs, 3600)
+    mm, ss = divmod(rem, 60)
+    out = f"{hh:02d}:{mm:02d}:{ss:02d}"
+    if frac:
+        out += f".{frac:06d}".rstrip("0")
+    return out
+
+
+def _decode_time(b: bytes) -> str:
+    """Binary ``time`` — int64 microseconds since midnight → canonical text."""
+    return _micros_to_time_text(struct.unpack("!q", b)[0])
+
+
+def _decode_timetz(b: bytes) -> str:
+    """Binary ``timetz`` — micros since midnight + zone (seconds west of UTC)."""
+    micros, zone = struct.unpack("!qi", b)
+    offset = -zone  # PG counts west positive; ISO offsets count east positive
+    sign = "+" if offset >= 0 else "-"
+    oh, om = divmod(abs(offset) // 60, 60)
+    return f"{_micros_to_time_text(micros)}{sign}{oh:02d}:{om:02d}"
+
+
+def _decode_interval(b: bytes) -> str:
+    """Binary ``interval`` — (micros int64, days int32, months int32) → the PG
+    text form, which rides the existing interval text parser."""
+    from secantus.sql import intervals as _intervals
+
+    micros, days, months = struct.unpack("!qii", b)
+    return _intervals.render(_intervals.make(months, days, micros))
+
+
+def _decode_inet(b: bytes) -> str:
+    """Binary ``inet`` / ``cidr`` — family, bits, is_cidr, nbytes, address."""
+    _family, bits, _is_cidr, nb = struct.unpack_from("!BBBB", b, 0)
+    addr = _ipaddress.ip_address(bytes(b[4 : 4 + nb]))
+    return f"{addr}/{bits}"
+
+
+def _decode_macaddr(b: bytes) -> str:
+    return ":".join(f"{x:02x}" for x in bytes(b))
+
+
+def _decode_uuid(b: bytes) -> str:
+    return str(_uuid.UUID(bytes=bytes(b)))
+
+
+def _decode_jsonb(b: bytes) -> str:
+    """Binary ``jsonb`` — a 1-byte version header, then JSON text."""
+    return bytes(b[1:]).decode("utf-8")
+
+
+# Range/multirange binary flags (Postgres' rangetypes.h).
+_RANGE_EMPTY = 0x01
+_RANGE_LB_INC = 0x02
+_RANGE_UB_INC = 0x04
+_RANGE_LB_INF = 0x08
+_RANGE_UB_INF = 0x10
+
+# Range type OID -> element type OID.
+_RANGE_ELEM_OID = {3904: 23, 3906: 1700, 3908: 1114, 3910: 1184, 3912: 1082, 3926: 20}
+# Multirange type OID -> its range type OID.
+_MULTIRANGE_RANGE_OID = {4451: 3904, 4532: 3906, 4533: 3908, 4534: 3910, 4535: 3912, 4536: 3926}
+
+
+def _bound_text(value: Any) -> str:
+    """Render a decoded range bound as a (quoted where needed) literal token."""
+    if isinstance(value, _dt.datetime):
+        text = value.isoformat(sep=" ")
+    elif isinstance(value, _dt.date):
+        text = value.isoformat()
+    else:
+        text = str(value)
+    return f'"{text}"' if " " in text else text
+
+
+def _decode_range(raw: bytes, elem_oid: int) -> str:
+    """Decode a binary range parameter to its text literal (``[a,b)`` / ``empty``),
+    which rides the existing range text parser."""
+    flags = raw[0]
+    if flags & _RANGE_EMPTY:
+        return "empty"
+    decoder = _BINARY[elem_oid]
+    off = 1
+    bounds: list[str] = []
+    for inf_flag in (_RANGE_LB_INF, _RANGE_UB_INF):
+        if flags & inf_flag:
+            bounds.append("")
+            continue
+        (length,) = struct.unpack_from("!i", raw, off)
+        off += 4
+        bounds.append(_bound_text(decoder(raw[off : off + length])))
+        off += length
+    lb = "[" if flags & _RANGE_LB_INC else "("
+    ub = "]" if flags & _RANGE_UB_INC else ")"
+    return f"{lb}{bounds[0]},{bounds[1]}{ub}"
+
+
+def _decode_multirange(raw: bytes, range_oid: int) -> str:
+    """Decode a binary multirange parameter to its text literal ``{[a,b),…}``."""
+    (count,) = struct.unpack_from("!i", raw, 0)
+    elem_oid = _RANGE_ELEM_OID[range_oid]
+    off = 4
+    parts: list[str] = []
+    for _ in range(count):
+        (length,) = struct.unpack_from("!i", raw, off)
+        off += 4
+        parts.append(_decode_range(raw[off : off + length], elem_oid))
+        off += length
+    return "{" + ",".join(parts) + "}"
+
+
+# Binary parameter decoders by Postgres type OID. The text format (fmt 0) decodes
+# to str and rides column-type coercion; libpq clients (psycopg) send many types
+# in binary. Types whose storage form is canonical text (time / inet / uuid /
+# interval / ranges …) decode to that text and ride the same coercion path.
+_BINARY = {
+    16: lambda b: b == b"\x01",  # bool
+    17: lambda b: bytes(b),  # bytea
+    20: lambda b: struct.unpack("!q", b)[0],  # int8
+    21: lambda b: struct.unpack("!h", b)[0],  # int2
+    23: lambda b: struct.unpack("!i", b)[0],  # int4
+    25: lambda b: b.decode("utf-8"),  # text
+    26: lambda b: struct.unpack("!I", b)[0],  # oid (unsigned)
+    114: lambda b: b.decode("utf-8"),  # json — binary form is the text
+    700: lambda b: struct.unpack("!f", b)[0],  # float4
+    701: lambda b: struct.unpack("!d", b)[0],  # float8
+    829: _decode_macaddr,  # macaddr
+    869: _decode_inet,  # inet
+    650: _decode_inet,  # cidr — same wire layout
+    1043: lambda b: b.decode("utf-8"),  # varchar
+    1082: lambda b: _PG_EPOCH_DATE + _dt.timedelta(days=struct.unpack("!i", b)[0]),  # date
+    1083: _decode_time,  # time
+    1114: _decode_timestamp,  # timestamp (no tz)
+    1184: _decode_timestamptz,  # timestamptz
+    1186: _decode_interval,  # interval
+    1266: _decode_timetz,  # timetz
+    1700: _decode_numeric,  # numeric
+    2950: _decode_uuid,  # uuid
+    3802: _decode_jsonb,  # jsonb
+}
+_BINARY.update(
+    {oid: (lambda b, _e=elem: _decode_range(b, _e)) for oid, elem in _RANGE_ELEM_OID.items()}
+)
+_BINARY.update(
+    {
+        oid: (lambda b, _r=rng: _decode_multirange(b, _r))
+        for oid, rng in _MULTIRANGE_RANGE_OID.items()
+    }
+)
+
+
+def _encode_timestamptz(value: Any) -> bytes:
+    if isinstance(value, str):
+        # Timestamps can reach the encoder as ISO text (a text-format parameter
+        # bound to a timestamp-typed column); parse rather than silently sending
+        # text bytes in a field the client will parse as binary.
+        from secantus.sql.datetimes import parse_iso_datetime
+
+        value = parse_iso_datetime(value)
+    if not isinstance(value, _dt.datetime):
+        return str(value).encode("utf-8")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=_dt.timezone.utc)
+    return struct.pack("!q", round((value - _PG_EPOCH).total_seconds() * 1_000_000))
+
+
+def _encode_date(value: Any) -> bytes:
+    if isinstance(value, str):
+        # A ``date`` is *stored* as its canonical ``YYYY-MM-DD`` text.
+        value = _dt.date.fromisoformat(value.strip()[:10])
+    if isinstance(value, _dt.datetime):
+        value = value.date()
+    if isinstance(value, _dt.date):
+        return struct.pack("!i", (value - _PG_EPOCH_DATE).days)
+    return str(value).encode("utf-8")
+
+
+def _encode_bool(value: Any) -> bytes:
+    if isinstance(value, str):
+        # A text-format bool parameter arrives as "t"/"f" — both truthy as str.
+        value = value.strip().lower() in ("t", "true", "yes", "on", "1")
+    return b"\x01" if value else b"\x00"
+
+
+def _time_text_to_micros(text: str) -> tuple[int, int]:
+    """Split stored ``HH:MM:SS[.ffffff][±HH:MM]`` text into (micros, offset_secs)."""
+    s = text.strip()
+    if s.startswith("24:"):
+        # Postgres allows ``24:00:00``; datetime.time does not.
+        return 24 * 3600 * 1_000_000, 0
+    t = _dt.time.fromisoformat(s)
+    micros = ((t.hour * 60 + t.minute) * 60 + t.second) * 1_000_000 + t.microsecond
+    off = t.utcoffset()
+    return micros, int(off.total_seconds()) if off is not None else 0
+
+
+def _encode_time(value: Any) -> bytes:
+    micros, _off = _time_text_to_micros(str(value))
+    return struct.pack("!q", micros)
+
+
+def _encode_timetz(value: Any) -> bytes:
+    micros, off = _time_text_to_micros(str(value))
+    return struct.pack("!qi", micros, -off)  # PG counts the zone west-positive
+
+
+def _encode_interval(value: Any) -> bytes:
+    from secantus.sql import intervals as _intervals
+
+    if not (isinstance(value, dict) and "interval" in value):
+        value = _intervals.parse(str(value))
+    months, days, micros = _intervals._fields(value)
+    return struct.pack("!qii", micros, days, months)
+
+
+def _encode_uuid(value: Any) -> bytes:
+    return _uuid.UUID(str(value)).bytes
+
+
+def _encode_inet_factory(is_cidr: bool):
+    def _encode(value: Any) -> bytes:
+        iface = _ipaddress.ip_interface(str(value))
+        packed = iface.ip.packed
+        family = 2 if iface.version == 4 else 3  # PGSQL_AF_INET / PGSQL_AF_INET6
+        return (
+            struct.pack("!BBBB", family, iface.network.prefixlen, int(is_cidr), len(packed))
+            + packed
+        )
+
+    return _encode
+
+
+def _encode_macaddr(value: Any) -> bytes:
+    return bytes.fromhex(str(value).replace(":", "").replace("-", ""))
+
+
+def _encode_range_bound(value: Any, elem_oid: int) -> bytes:
+    """Binary-encode a stored range bound (bounds live in the element's storage
+    form: int / Int64 / Decimal128 / datetime)."""
+    if elem_oid == 23:
+        return struct.pack("!i", int(value))
+    if elem_oid == 20:
+        return struct.pack("!q", int(value))
+    if elem_oid == 1700:
+        return _encode_numeric(value.to_decimal() if isinstance(value, bson.Decimal128) else value)
+    if elem_oid == 1082:
+        return _encode_date(value)
+    return _encode_timestamptz(value)  # 1114 / 1184
+
+
+def _encode_range(value: Any, range_oid: int) -> bytes:
+    """Binary-encode a stored range subdocument (flags byte + bounds)."""
+    elem_oid = _RANGE_ELEM_OID[range_oid]
+    if not isinstance(value, dict) or value.get("empty"):
+        return struct.pack("!B", _RANGE_EMPTY)
+    flags = 0
+    if value.get("lower_inc"):
+        flags |= _RANGE_LB_INC
+    if value.get("upper_inc"):
+        flags |= _RANGE_UB_INC
+    lo, hi = value.get("lower"), value.get("upper")
+    if lo is None:
+        flags |= _RANGE_LB_INF
+    if hi is None:
+        flags |= _RANGE_UB_INF
+    out = bytearray(struct.pack("!B", flags))
+    for bound in (lo, hi):
+        if bound is None:
+            continue
+        b = _encode_range_bound(bound, elem_oid)
+        out += struct.pack("!i", len(b)) + b
+    return bytes(out)
+
+
+def _encode_multirange(value: Any, mr_oid: int) -> bytes:
+    range_oid = _MULTIRANGE_RANGE_OID[mr_oid]
+    members = value.get("multirange", []) if isinstance(value, dict) else []
+    out = bytearray(struct.pack("!i", len(members)))
+    for m in members:
+        b = _encode_range(m, range_oid)
+        out += struct.pack("!i", len(b)) + b
+    return bytes(out)
+
+
+def _encode_numeric(value: Any) -> bytes:
+    """Encode a Decimal as Postgres' binary ``numeric`` (base-10000 digits)."""
+    d = value if isinstance(value, Decimal) else Decimal(str(value))
+    if d.is_nan():
+        return struct.pack("!HhHH", 0, 0, 0xC000, 0)
+    if d.is_infinite():
+        return struct.pack("!HhHH", 0, 0, 0xF000 if d < 0 else 0xD000, 0)
+    sign = 0x4000 if d < 0 else 0x0000
+    # copy_abs is context-free — unary minus would round to the (28-digit)
+    # context precision and corrupt long numerics.
+    d = d.copy_abs()
+    _, digits_t, exp_t = d.as_tuple()
+    dscale = -exp_t if exp_t < 0 else 0
+    if exp_t >= 0:
+        intg, frac = "".join(map(str, digits_t)) + "0" * exp_t, ""
+    else:
+        ds = "".join(map(str, digits_t))
+        if len(ds) <= -exp_t:
+            ds = "0" * (-exp_t - len(ds) + 1) + ds
+        intg, frac = ds[:exp_t], ds[exp_t:]
+    intg = intg or "0"
+    intg = "0" * ((-len(intg)) % 4) + intg
+    frac = frac + "0" * ((-len(frac)) % 4)
+    groups_int = [int(intg[i : i + 4]) for i in range(0, len(intg), 4)]
+    digits = groups_int + [int(frac[i : i + 4]) for i in range(0, len(frac), 4)]
+    weight = len(groups_int) - 1
+    while len(digits) > 1 and digits[0] == 0:  # strip leading zero groups
+        digits.pop(0)
+        weight -= 1
+    while digits and digits[-1] == 0:  # strip trailing zero groups
+        digits.pop()
+    if not digits:
+        return struct.pack("!HhHH", 0, 0, sign, dscale)
+    out = bytearray(struct.pack("!HhHH", len(digits), weight, sign, dscale))
+    for g in digits:
+        out += struct.pack("!H", g)
+    return bytes(out)
+
+
+# Binary *output* encoders by Postgres type OID — the inverse of ``_BINARY``. The
+# value arrives in its *storage* form (canonical text for date/time/net/uuid,
+# subdocuments for interval/range/multirange). Text/varchar/json binary is just
+# the UTF-8 text bytes; jsonb (3802) prefixes a version byte.
+_OUT_BINARY = {
+    16: _encode_bool,  # bool
+    17: lambda v: bytes(v),  # bytea
+    20: lambda v: struct.pack("!q", int(v)),  # int8
+    21: lambda v: struct.pack("!h", int(v)),  # int2
+    23: lambda v: struct.pack("!i", int(v)),  # int4
+    26: lambda v: struct.pack("!I", int(v) & 0xFFFFFFFF),  # oid (unsigned)
+    650: _encode_inet_factory(True),  # cidr
+    700: lambda v: struct.pack("!f", float(v)),  # float4
+    701: lambda v: struct.pack("!d", float(v)),  # float8
+    829: _encode_macaddr,  # macaddr
+    869: _encode_inet_factory(False),  # inet
+    1082: _encode_date,  # date
+    1083: _encode_time,  # time
+    1114: _encode_timestamptz,  # timestamp (no tz)
+    1184: _encode_timestamptz,  # timestamptz
+    1186: _encode_interval,  # interval
+    1266: _encode_timetz,  # timetz
+    1700: lambda v: _encode_numeric(
+        v.to_decimal() if isinstance(v, bson.Decimal128) else v
+    ),  # numeric
+    2950: _encode_uuid,  # uuid
+}
+_OUT_BINARY.update({oid: (lambda v, _o=oid: _encode_range(v, _o)) for oid in _RANGE_ELEM_OID})
+_OUT_BINARY.update(
+    {oid: (lambda v, _o=oid: _encode_multirange(v, _o)) for oid in _MULTIRANGE_RANGE_OID}
+)
+
+
+# Array type OID -> (element OID, element tag), derived from the same table the
+# wire layer's RowDescription uses.
+_ARRAY_ELEM_BY_OID: dict[int, tuple[int, str]] = {
+    arr_oid: (typemap.PG_OID[elem], elem)
+    for elem, arr_oid in typemap._ARRAY_PG_OID.items()
+    if elem in typemap.PG_OID
+}
+# json[] (199 → json 114) — our ``json`` tag maps to jsonb (3802/3807), but a
+# client can still bind an array parameter with the plain-json OIDs.
+_ARRAY_ELEM_BY_OID[199] = (114, "json")
+
+# A user type's paired array oid is its own oid + USER_TYPE_ARRAY_OID_OFFSET
+# (see catalog.py); everything at or above this floor is a user-type array whose
+# elements travel as text (an enum's wire form is its label).
+_USER_ARRAY_OID_FLOOR = ENUM_TYPE_OID_BASE + USER_TYPE_ARRAY_OID_OFFSET
+
+
+def _array_elem_info(arr_oid: int) -> tuple[int, str]:
+    """(element oid, element tag) for an array-type oid — modelled built-ins from
+    the static table, user-type arrays derived from the offset scheme."""
+    info = _ARRAY_ELEM_BY_OID.get(arr_oid)
+    if info is not None:
+        return info
+    return (arr_oid - USER_TYPE_ARRAY_OID_OFFSET, "text")
+
+
+def _encode_array(
+    value: Any, arr_oid: int, tag: str | None, encoding: str | None = "utf-8"
+) -> bytes:
+    """Binary-encode a one-dimensional array result (ndim/hasnull/elemoid header,
+    one per-dim {len, lbound} pair, then length-prefixed elements)."""
+    elem_oid, elem_tag = _array_elem_info(arr_oid)
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = typemap._parse_pg_array_literal(str(value))
+    has_null = any(v is None for v in items)
+    out = bytearray(struct.pack("!iii", 1 if items else 0, int(has_null), elem_oid))
+    if items:
+        out += struct.pack("!ii", len(items), 1)
+        for v in items:
+            if v is None:
+                out += struct.pack("!i", -1)
+                continue
+            if isinstance(v, str) and elem_tag not in ("text", "citext", "json"):
+                # Elements parsed out of an array *text* literal are strings;
+                # the element's binary encoder needs the native value
+                # (``\x6162`` -> bytes, ``t`` -> bool, ``1`` -> int). A stored
+                # ``json`` string element IS the value — don't re-parse it.
+                if elem_tag == "bool":
+                    v = v.strip().lower() in ("t", "true", "yes", "on", "1")
+                else:
+                    v = typemap.coerce(v, elem_tag)
+            b = _encode_value(v, elem_oid, elem_tag, encoding)
+            out += struct.pack("!i", len(b)) + b
+    return bytes(out)
+
+
+def _decode_array(raw: bytes, encoding: str | None = "utf-8") -> list:
+    """Decode a binary array parameter to a Python list (one dimension)."""
+    ndim, _has_null, elem_oid = struct.unpack_from("!iii", raw, 0)
+    if ndim == 0:
+        return []
+    n, _lbound = struct.unpack_from("!ii", raw, 12)
+    decoder = None if elem_oid in (0, 25, 1043) else _BINARY.get(elem_oid)
+    items: list = []
+    off = 20
+    for _ in range(n):
+        (length,) = struct.unpack_from("!i", raw, off)
+        off += 4
+        if length < 0:
+            items.append(None)
+            continue
+        b = raw[off : off + length]
+        off += length
+        items.append(decoder(b) if decoder is not None else pgwire.decode_text(b, encoding))
+    return items
+
+
+def _encode_value(
+    value: Any, oid: int, tag: str | None, encoding: str | None = "utf-8"
+) -> bytes | None:
+    """Binary-encode a result value for ``oid``; None stays None (NULL on the wire).
+
+    The binary form of text-shaped types is still text *in the client's
+    encoding* — Postgres converts those like the text format."""
+    if value is None:
+        return None
+    enc = _OUT_BINARY.get(oid)
+    if enc is not None:
+        return enc(value)
+    if oid in _ARRAY_ELEM_BY_OID or oid >= _USER_ARRAY_OID_FLOOR:
+        return _encode_array(value, oid, tag, encoding)
+    if oid == 3802:  # jsonb: 1-byte version header + JSON text (client encoding)
+        return b"\x01" + (pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b"")
+    # text / varchar / unknown: the binary form equals the (client-encoded) text bytes.
+    return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b""
+
+
+def _result_value(
+    value: Any, fmt: int, oid: int, tag: str | None, encoding: str | None = "utf-8"
+) -> bytes | None:
+    if fmt == 1:
+        return _encode_value(value, oid, tag, encoding)
+    return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding)
+
+
+def _column_formats(result_formats: list[int], ncols: int) -> list[int]:
+    """Expand Bind's result-format codes to one per column."""
+    if not result_formats:
+        return [0] * ncols
+    if len(result_formats) == 1:
+        return [result_formats[0]] * ncols
+    return [result_formats[i] if i < len(result_formats) else 0 for i in range(ncols)]
+
+
+def _reject_nul(text: str) -> str:
+    if "\x00" in text:
+        raise errors.SQLError("22021", 'invalid byte sequence for encoding "UTF8": 0x00')
+    return text
+
+
+# Text-format parameter conversions by declared type OID. The declared type
+# governs the parameter's value regardless of wire format (a text-format int8
+# param IS an integer, exactly like its binary twin), so the common unambiguous
+# scalars convert here — leaving the str through makes ``$1`` compare and encode
+# as text while the RowDescription/Describe machinery reports the declared OID.
+_TEXT_PARAM = {
+    16: lambda s: s.strip().lower() in ("t", "true", "y", "yes", "on", "1"),  # bool
+    20: int,  # int8
+    21: int,  # int2
+    23: int,  # int4
+    26: int,  # oid
+    700: float,  # float4
+    701: float,  # float8
+    1700: Decimal,  # numeric
+}
+
+
+def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = "utf-8") -> Any:
+    if raw is None:
+        return None
+    if fmt == 0:  # text
+        text = _reject_nul(pgwire.decode_text(raw, encoding))
+        conv = _TEXT_PARAM.get(oid)
+        if conv is None:
+            return text
+        try:
+            return conv(text.strip())
+        except (ValueError, ArithmeticError) as exc:
+            name = typemap.SQL_TYPE_NAME.get(_TAG_BY_OID.get(oid, ""), "?")
+            raise errors.SQLError(
+                "22P02", f'invalid input syntax for type {name}: "{text}"'
+            ) from exc
+        return _reject_nul(pgwire.decode_text(raw, encoding))
+    if oid == 0 and bytes(raw) == b"\x00\x00\x00\x00":
+        # An *untyped* binary parameter (psycopg dumps an empty multirange with
+        # no subtype info as oid 0 + a zero member count). Postgres resolves
+        # unknown params from the target column; the empty-multirange text form
+        # coerces correctly against any multirange column.
+        return "{}"
+    if oid in (0, 25, 1043):
+        # Binary text is still text in the client's encoding.
+        return _reject_nul(pgwire.decode_text(raw, encoding))
+    decoder = _BINARY.get(oid)
+    if decoder is not None:
+        return decoder(raw)
+    if oid in _ARRAY_ELEM_BY_OID or oid >= _USER_ARRAY_OID_FLOOR:
+        # A user-type array oid (a registered enum's array dumper binds with the
+        # minted array oid); the embedded element oid is unknown to _BINARY, so
+        # elements fall back to text — which IS an enum's value form.
+        return _decode_array(raw, encoding)
+    return raw.decode(encoding or "utf-8", "replace")
+
+
+class ExtendedSession:
+    def __init__(self, storage: Any, session: Session) -> None:
+        self.storage = storage
+        self.session = session
+        self.catalog = Catalog(storage)
+        self.prepared: dict[str, Prepared] = {}
+        self.portals: dict[str, Portal] = {}
+        self.skip_until_sync = False
+        # Expose the wire-prepared registry to the Session so the pg_cursors /
+        # pg_prepared_statements virtual tables (whose builders only see the
+        # Session) can list this connection's prepared statements.
+        session.wire_prepared = self.prepared
+
+    def process(self, msg_type: str, payload: bytes) -> bytes:
+        """Handle one extended-protocol message; return the bytes to send."""
+        if msg_type == "S":  # Sync — always answered, clears any error state
+            self.skip_until_sync = False
+            return pgwire.ready_for_query(self.session.txn_status())
+        if self.skip_until_sync:
+            return b""  # discard everything until the next Sync
+        if msg_type == "H":  # Flush — we send eagerly, nothing to flush
+            return b""
+        try:
+            if msg_type == "P":
+                return self._parse(payload)
+            if msg_type == "B":
+                return self._bind(payload)
+            if msg_type == "D":
+                return self._describe(payload)
+            if msg_type == "E":
+                return self._execute(payload)
+            if msg_type == "C":
+                return self._close(payload)
+            self.skip_until_sync = True
+            return pgwire.error_response("08P01", f"unexpected message type '{msg_type}'")
+        except errors.SQLError as exc:
+            self.skip_until_sync = True
+            return pgwire.error_response(
+                exc.sqlstate, exc.message, encoding=self.session.wire_encoding
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("error in extended protocol")
+            self.skip_until_sync = True
+            # Generic wire message; full detail stays in the server log — don't
+            # leak the raw Python exception text to the client. (§I17)
+            return pgwire.error_response("XX000", "internal error")
+
+    # -- handlers ----------------------------------------------------------- #
+
+    def _parse(self, payload: bytes) -> bytes:
+        name, query, oids = pgwire.parse_parse(payload, self.session.wire_encoding)
+        stmts = planner.parse(query)
+        if len(stmts) > 1:
+            raise errors.syntax_error("cannot insert multiple commands into a prepared statement")
+        stmt = stmts[0] if stmts else None
+        count = planner.parameter_count(stmt) if stmt is not None else 0
+        if isinstance(stmt, exp.Select):
+            # pg_typeof($N) types from the OIDs the client declares here in
+            # Parse — after Bind substitutes values that information is gone.
+            planner.rewrite_pg_typeof(
+                stmt,
+                engine._pg_typeof_table(
+                    self.storage, self.session.database, self.catalog, stmt.find(exp.Table)
+                ),
+                oids,
+            )
+        self.prepared[name] = Prepared(name, stmt, oids, count)
+        return pgwire.parse_complete()
+
+    def _bind(self, payload: bytes) -> bytes:
+        portal, stmt_name, formats, raw_values, result_formats = pgwire.parse_bind(payload)
+        prep = self.prepared.get(stmt_name)
+        if prep is None:
+            raise errors.SQLError("26000", f'prepared statement "{stmt_name}" does not exist')
+        values: list[Any] = []
+        for i, raw in enumerate(raw_values):
+            if not formats:
+                fmt = 0
+            elif len(formats) == 1:
+                fmt = formats[0]
+            else:
+                fmt = formats[i]
+            oid = prep.param_oids[i] if i < len(prep.param_oids) else 0
+            value = _decode_param(raw, fmt, oid, self.session.wire_encoding)
+            values.append(self._check_enum_param(oid, value))
+        self.portals[portal] = Portal(portal, prep, values, result_formats=result_formats)
+        return pgwire.bind_complete()
+
+    def _check_enum_param(self, oid: int, value: Any) -> Any:
+        """Postgres validates a parameter declared with an enum type oid against
+        the enum's labels at Bind (a psycopg ``register_enum`` dumper declares
+        params with the minted oid) — 22P02 for a label the type doesn't have."""
+        if value is None or not isinstance(oid, int) or oid < ENUM_TYPE_OID_BASE:
+            return value
+        from secantus.sql import scalar, virtual
+
+        db = self.session.database
+        name = virtual.user_type_name(db, self.catalog, oid)
+        if name is None:
+            return value
+        enum = self.catalog.get_enum(db, name)
+        if enum is None:
+            return value
+        return scalar.validate_enum_label(enum, value)
+
+    def _describe(self, payload: bytes) -> bytes:
+        kind, name = pgwire.parse_describe(payload)
+        if kind == "S":
+            prep = self.prepared.get(name)
+            if prep is None:
+                raise errors.SQLError("26000", f'prepared statement "{name}" does not exist')
+            n = max(prep.param_count, len(prep.param_oids))
+            oids = [prep.param_oids[i] if i < len(prep.param_oids) else 0 for i in range(n)]
+            out = bytearray(pgwire.parameter_description(oids))
+            stmt = (
+                planner.substitute_parameters(prep.stmt, [None] * prep.param_count)
+                if prep.stmt is not None
+                else None
+            )
+            cols = self._describe_columns(stmt)
+            _apply_param_result_oids(cols, prep)
+            out += self._row_desc_or_no_data(cols)
+            return bytes(out)
+        # Portal describe — params are bound, so describe the bound statement, and
+        # report the per-column result formats the client asked for in Bind.
+        portal = self.portals.get(name)
+        if portal is None:
+            # A DECLAREd server-side cursor IS a portal in the v3 protocol —
+            # psycopg's ServerCursor sends Describe('P', name) right after the
+            # DECLARE to learn the row shape.
+            cursor = self.session.cursors.get(name)
+            if cursor is not None:
+                return self._row_desc_or_no_data(list(cursor.columns))
+            raise errors.SQLError("34000", f'portal "{name}" does not exist')
+        cols = self._describe_columns(self._bound(portal))
+        _apply_param_result_oids(cols, portal.prepared)
+        formats = _column_formats(portal.result_formats, len(cols)) if cols else None
+        return self._row_desc_or_no_data(cols, formats)
+
+    def _execute(self, payload: bytes) -> bytes:
+        portal_name, max_rows = pgwire.parse_execute(payload)
+        portal = self.portals.get(portal_name)
+        if portal is None:
+            raise errors.SQLError("34000", f'portal "{portal_name}" does not exist')
+        if portal.prepared.stmt is None:
+            return pgwire.empty_query_response()
+        if not portal.executed:
+            bound = self._bound(portal)
+            # pg_stat_activity (#137): mark this backend active with its query for
+            # the duration of execution; it stays as the last query when idle.
+            sess = self.session
+            sess.state = "active"
+            sess.current_query = bound.sql(dialect="postgres") if bound is not None else ""
+            sess.query_start = _dt.datetime.now(_dt.timezone.utc)
+            try:
+                portal.result = engine.run_statement(
+                    self.storage, self.session.database, bound, self.session, self.catalog
+                )
+            finally:
+                sess.state = "idle"
+            portal.executed = True
+            portal.offset = 0
+        res = portal.result
+        out = bytearray()
+        for pname, pvalue in res.parameter_status:
+            out += pgwire.parameter_status(pname, pvalue)
+        if _is_row_returning(res):
+            rows = res.rows
+            cols = res.columns
+            # Describe reported bare-``$N`` columns with the client's declared
+            # Parse OIDs; the execution result carries the engine-inferred types
+            # (a text-format int2 param plans as text, a binary int as int4).
+            # Encoding MUST match the RowDescription the client already saw, or
+            # a binary-format column carries bytes of a different type/format.
+            _apply_param_result_oids(cols, portal.prepared)
+            fmts = _column_formats(portal.result_formats, len(cols))
+            end = len(rows) if max_rows <= 0 else min(len(rows), portal.offset + max_rows)
+            for row in rows[portal.offset : end]:
+                out += pgwire.data_row(
+                    [
+                        _result_value(v, f, c.pg_oid, c.type_tag, self.session.wire_encoding)
+                        for v, f, c in zip(row, fmts, cols, strict=False)
+                    ]
+                )
+            if max_rows > 0 and end < len(rows):
+                portal.offset = end
+                out += pgwire.portal_suspended()
+            else:
+                portal.offset = end
+                out += pgwire.command_complete(res.command_tag)
+        else:
+            out += pgwire.command_complete(res.command_tag)
+        return bytes(out)
+
+    def _close(self, payload: bytes) -> bytes:
+        kind, name = pgwire.parse_close(payload)
+        if kind == "S":
+            self.prepared.pop(name, None)
+        else:
+            self.portals.pop(name, None)
+            # Close('P') on a DECLAREd cursor's name destroys the cursor (a
+            # DECLAREd cursor is a portal in the v3 protocol).
+            self.session.cursors.pop(name, None)
+        return pgwire.close_complete()
+
+    # -- helpers ------------------------------------------------------------ #
+
+    def _bound(self, portal: Portal) -> exp.Expression | None:
+        if portal.bound_stmt is None and portal.prepared.stmt is not None:
+            portal.bound_stmt = planner.substitute_parameters(portal.prepared.stmt, portal.params)
+        return portal.bound_stmt
+
+    def _describe_columns(self, stmt: exp.Expression | None) -> list | None:
+        if stmt is None:
+            return None
+        return engine.describe_statement(
+            self.storage, self.session.database, stmt, self.session, self.catalog
+        )
+
+    @staticmethod
+    def _row_desc_or_no_data(cols: list | None, formats: list[int] | None = None) -> bytes:
+        if cols is None:
+            return pgwire.no_data()
+        return pgwire.row_description([(c.name, c.pg_oid) for c in cols], formats)
+
+
+_TAG_BY_OID = {oid: tag for tag, oid in typemap.PG_OID.items()}
+
+
+def _apply_param_result_oids(cols: list | None, prep: Prepared) -> None:
+    """Give a bare ``$N`` output column the client's declared parameter OID.
+
+    ``SELECT $1`` must describe with the type the client sent in Parse (psycopg
+    binds a Python int as int8, not int4); planning sees only the substituted
+    Python value, which can't carry that distinction."""
+    if not cols or prep.stmt is None or not any(prep.param_oids):
+        return
+    if not isinstance(prep.stmt, exp.Select):
+        return
+    for i, e in enumerate(prep.stmt.expressions):
+        if i >= len(cols):
+            break
+        inner = e.this if isinstance(e, exp.Alias) else e
+        while isinstance(inner, exp.Paren) and inner.this is not None:
+            inner = inner.this
+        if not isinstance(inner, exp.Parameter):
+            continue
+        try:
+            idx = int(inner.name) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(prep.param_oids) and prep.param_oids[idx]:
+            oid = prep.param_oids[idx]
+            cols[i].pg_oid = oid
+            cols[i].type_tag = _TAG_BY_OID.get(oid, cols[i].type_tag)
+
+
+def _is_row_returning(res: Any) -> bool:
+    return bool(res.columns) or res.command_tag.startswith("SELECT")

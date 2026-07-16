@@ -58,7 +58,20 @@ pub trait CursorProducer: Send {
     /// dropDatabase on the watched scope). Once true, the cursor emits its
     /// buffered events then closes.
     fn invalidated(&self) -> bool;
+    /// A fatal error the producer hit while projecting an event (e.g. a user
+    /// `$project`/`$unset` stripped the `_id`/resume token — mongod code 280,
+    /// `ChangeStreamFatalError`). Surfaced by the getMore handler as an `ok: 0`
+    /// reply that ends the stream. `None` for the common case.
+    fn fatal_error(&self) -> Option<CommandError> {
+        None
+    }
 }
+
+/// The result of draining a tailable change-stream batch:
+/// `(batch, position, closed, fatal_error)`. `position` is the producer's oplog
+/// seq (for the resume token); `closed` is set once the cursor is exhausted /
+/// invalidated; `fatal_error` carries a getMore-time projection error (code 280).
+type TailableBatch = (Vec<Vec<u8>>, i64, bool, Option<CommandError>);
 
 /// Options for a tailable (change-stream) cursor registration.
 #[derive(Default)]
@@ -93,6 +106,9 @@ struct Entry {
     final_event_pending: bool,
     #[allow(dead_code)]
     last_token: Option<Document>,
+    /// A fatal projection error (code 280) the producer hit; once set, the next
+    /// getMore returns it as an `ok: 0` reply and the cursor is dropped.
+    fatal_error: Option<CommandError>,
 }
 
 /// A read-only snapshot of a cursor's routing state, so the getMore handler can
@@ -194,6 +210,7 @@ impl CursorRegistry {
                 invalidated: false,
                 final_event_pending: false,
                 last_token: None,
+                fatal_error: None,
             },
         );
         Ok(id)
@@ -229,6 +246,7 @@ impl CursorRegistry {
                 invalidated: false,
                 final_event_pending: false,
                 last_token: None,
+                fatal_error: None,
             },
         );
         Ok(id)
@@ -304,7 +322,7 @@ impl CursorRegistry {
         &self,
         cursor_id: i64,
         batch_size: i64,
-    ) -> Result<(Vec<Vec<u8>>, i64, bool), CursorError> {
+    ) -> Result<TailableBatch, CursorError> {
         let mut inner = self.inner.lock().unwrap();
         self.prune_locked(&mut inner);
         let now = (self.clock)();
@@ -315,12 +333,15 @@ impl CursorRegistry {
         e.last_access = now;
         // Poll the producer once when nothing is buffered and the cursor hasn't
         // been invalidated (by an oplog drop/rename or a concurrent killCursors).
-        if e.remaining.is_empty() && !e.invalidated {
+        if e.remaining.is_empty() && !e.invalidated && e.fatal_error.is_none() {
             if let Some(p) = e.producer.as_mut() {
                 let events = p.produce();
                 e.position_seq = p.position();
                 if p.invalidated() {
                     e.invalidated = true;
+                }
+                if let Some(err) = p.fatal_error() {
+                    e.fatal_error = Some(err);
                 }
                 e.remaining.extend(events);
             }
@@ -333,11 +354,18 @@ impl CursorRegistry {
         let take = want.min(e.remaining.len());
         let batch: Vec<Vec<u8>> = e.remaining.drain(..take).collect();
         let position = e.position_seq;
-        let closed = e.invalidated && e.remaining.is_empty();
+        // A fatal projection error (code 280) ends the stream once any buffered
+        // events have drained; surface it (and drop the cursor) only when empty.
+        let fatal = if e.remaining.is_empty() {
+            e.fatal_error.clone()
+        } else {
+            None
+        };
+        let closed = (e.invalidated || fatal.is_some()) && e.remaining.is_empty();
         if closed {
             inner.cursors.remove(&cursor_id);
         }
-        Ok((batch, position, closed))
+        Ok((batch, position, closed, fatal))
     }
 
     /// Kill the given cursors, returning `(killed, not_found)`.
@@ -354,6 +382,26 @@ impl CursorRegistry {
             }
         }
         (killed, not_found)
+    }
+
+    /// Drop every cursor open on `namespace` (a `db.coll` string), returning the
+    /// count. mongod kills a collection's cursors when it's dropped or renamed,
+    /// so a later `getMore` fails with `CursorNotFound`; SecantusDB's cursors
+    /// hold detached snapshots, so without this they'd keep serving rows after
+    /// the collection is gone (mongo-c-driver's `error_document/getmore` test).
+    /// Mirrors `cursors.kill_namespace`.
+    pub fn kill_namespace(&self, namespace: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let doomed: Vec<i64> = inner
+            .cursors
+            .iter()
+            .filter(|(_, e)| e.namespace == namespace)
+            .map(|(&cid, _)| cid)
+            .collect();
+        for cid in &doomed {
+            inner.cursors.remove(cid);
+        }
+        doomed.len()
     }
 
     /// Mark a cursor invalidated (a blocked tailable getMore wakes and ends).
@@ -484,14 +532,21 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let mut batch;
         let mut position;
         let mut closed;
+        let mut fatal;
         loop {
             match cursors.tailable_next_batch(cursor_id, batch_size) {
-                Ok((b, p, c)) => {
+                Ok((b, p, c, f)) => {
                     batch = b;
                     position = p;
                     closed = c;
+                    fatal = f;
                 }
                 Err(_) => return Ok(cursor_not_found(cursor_id)),
+            }
+            // A fatal projection error (e.g. the user pipeline stripped the
+            // resume-token `_id`) ends the stream immediately — don't block.
+            if fatal.is_some() {
+                break;
             }
             if !batch.is_empty() || closed || !info.await_data {
                 break;
@@ -504,6 +559,12 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // `position` or the deadline; then re-poll (the producer reads the
             // newly-appended entries). killCursors wakes this via notify.
             storage.wait_for_oplog(position, (deadline - now).as_millis() as u64);
+        }
+
+        // A fatal projection error ends the stream with an `ok: 0` reply (the
+        // cursor was already dropped in the registry).
+        if let Some(err) = fatal {
+            return Ok(err.into_reply());
         }
 
         // postBatchResumeToken: the last event's token, or — on an empty batch —
@@ -727,12 +788,12 @@ mod tests {
             )
             .unwrap();
         // First poll produces the event; position advances; cursor stays open.
-        let (batch, pos, closed) = reg.tailable_next_batch(id, 10).unwrap();
+        let (batch, pos, closed, _fatal) = reg.tailable_next_batch(id, 10).unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(pos, 5);
         assert!(!closed);
         // Second poll: nothing new, cursor persists (not exhausted).
-        let (batch2, _pos2, closed2) = reg.tailable_next_batch(id, 10).unwrap();
+        let (batch2, _pos2, closed2, _f2) = reg.tailable_next_batch(id, 10).unwrap();
         assert!(batch2.is_empty());
         assert!(!closed2);
         assert_eq!(reg.len(), 1);
@@ -759,7 +820,7 @@ mod tests {
             .unwrap();
         // The invalidate event is delivered; buffer now empty + invalidated =>
         // the cursor closes (id 0) and is removed.
-        let (batch, _pos, closed) = reg.tailable_next_batch(id, 10).unwrap();
+        let (batch, _pos, closed, _fatal) = reg.tailable_next_batch(id, 10).unwrap();
         assert_eq!(batch.len(), 1);
         assert!(closed);
         assert_eq!(reg.len(), 0);
@@ -839,6 +900,29 @@ mod tests {
         // claim collection "other" ⇒ ns mismatch ⇒ CursorNotFound
         let reply = dispatch(&doc! {"getMore": id, "collection": "other"}, &mut c);
         assert_eq!(reply.get_i32("code").unwrap(), 43);
+    }
+
+    #[test]
+    fn kill_namespace_drops_matching_cursors() {
+        // kill_namespace removes only cursors on the exact ns; a later getMore on
+        // a killed cursor is CursorNotFound (43). Guards the drop/rename → getMore
+        // path the mongo-c-driver error_document/getmore test exercises.
+        let reg = Arc::new(CursorRegistry::new());
+        let a = reg
+            .register("t.c", vec![enc(&doc! {"_id": 1}), enc(&doc! {"_id": 2})])
+            .unwrap();
+        let b = reg
+            .register("t.other", vec![enc(&doc! {"_id": 1})])
+            .unwrap();
+        assert_eq!(reg.kill_namespace("t.c"), 1);
+        let mut c = ctx_with_cursors(reg);
+        c.db_name = "t".into();
+        // The dropped-ns cursor is gone → CursorNotFound.
+        let reply = dispatch(&doc! {"getMore": a, "collection": "c"}, &mut c);
+        assert_eq!(reply.get_i32("code").unwrap(), 43);
+        // The other-ns cursor survives.
+        let reply = dispatch(&doc! {"getMore": b, "collection": "other"}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     }
 
     #[test]

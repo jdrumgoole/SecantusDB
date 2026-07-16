@@ -34,10 +34,13 @@ pub mod update;
 // part of the crate's public surface (kept crate-private so their deliberate
 // `Result<_, ()>` "defer" signals stay internal rather than public API).
 mod densify;
+mod fill;
 mod group;
 mod numeric;
 mod order;
 mod paths;
+mod regexutil;
+mod windowfields;
 
 // Re-export the read-only dotted-path helpers (only) so the Rust storage layer's
 // index-key builders can resolve `key_spec` fields against documents, mirroring

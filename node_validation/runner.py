@@ -35,11 +35,13 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_paths import INCLUDE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "node-mongodb-native"
-RAW_OUT = REPO_ROOT / ".validation" / "node-raw.json"
+RAW_OUT = REPO_ROOT / ".validation" / f"node-raw{gauge_common.report_suffix()}.json"
 
 
 def _pick_ephemeral_port() -> int:
@@ -47,6 +49,7 @@ def _pick_ephemeral_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
 
 ROOT_USER = "root-user"
 ROOT_PASSWORD = "password"
@@ -80,9 +83,13 @@ def _wait_for_listener(host: str, port: int, timeout: float = 10.0) -> None:
 def _ensure_npm_install() -> int:
     if (VENDOR / "node_modules" / "mocha").is_dir():
         return 0
-    print("node_validation: running `npm install` (first time only, ~1-2 min)", file=sys.stderr)
+    print("node_validation: running `npm ci` (first time only, ~1-2 min)", file=sys.stderr)
+    # ``npm ci`` (not ``install``) installs strictly from the committed
+    # lockfile and never mutates ``package-lock.json`` — ``npm install``
+    # prunes a redundant lockfile entry, dirtying the submodule and
+    # breaking the zero-local-edits gauge invariant.
     proc = subprocess.run(
-        ["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"],
+        ["npm", "ci", "--no-audit", "--no-fund", "--ignore-scripts"],
         cwd=VENDOR,
     )
     return proc.returncode
@@ -162,7 +169,6 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
 
     storage_dir = tempfile.mkdtemp(prefix="secantus-node-gauge-")
     print(
@@ -170,32 +176,38 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
+    def _spawn_daemon(*, with_auth: bool) -> tuple[subprocess.Popen, str, int]:
         cmd = [
-            sys.executable, "-m", "secantus",
-            "--host", host,
-            "--port", str(port),
-            "--storage-path", storage_dir,
-            "--log-level", "WARNING",
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            host,
+            "--port",
+            "0",
+            "--storage-path",
+            storage_dir,
+            "--log-level",
+            "WARNING",
             "--standalone",
         ]
         if with_auth:
             cmd.append("--auth")
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+        # Each phase binds its own port; seeded users persist via storage_dir.
+        return gauge_common.spawn_daemon(cmd, label="node_validation")
 
-    print(f"node_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr)
-    daemon = _spawn_daemon(with_auth=False)
+    print("node_validation: phase 1 — seeding daemon (no --auth)", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=False)
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "node_validation")
         print("node_validation: seeding root-user", file=sys.stderr)
         import pymongo
+
         client = pymongo.MongoClient(
             f"mongodb://{host}:{port}/", directConnection=True, serverSelectionTimeoutMS=5_000
         )
-        client.admin.command(
-            "createUser", ROOT_USER, pwd=ROOT_PASSWORD, roles=["root"]
-        )
+        client.admin.command("createUser", ROOT_USER, pwd=ROOT_PASSWORD, roles=["root"])
         client.close()
     finally:
         daemon.terminate()
@@ -205,48 +217,50 @@ def main() -> int:
             daemon.kill()
             daemon.wait()
 
-    print(
-        f"node_validation: phase 2 — running gauge with --auth on {host}:{port}",
-        file=sys.stderr,
-    )
-    daemon = _spawn_daemon(with_auth=True)
+    print("node_validation: phase 2 — running gauge with --auth", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=True)
     try:
-        _wait_for_listener(host, port)
-
         env = os.environ.copy()
         env["MONGODB_URI"] = (
-            f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/"
-            f"?authSource=admin"
+            f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/?authSource=admin"
         )
         # Required by ``test/tools/runner/hooks/configuration.ts`` —
         # if AUTH != 'noauth' the bootstrap insists on the
         # ``bob:pwd123`` default URI, overriding ours. Setting AUTH=auth
         # tells the bootstrap to honour ``MONGODB_URI`` verbatim.
         env["AUTH"] = "auth"
-        # The driver's tests use ESM-style imports without extensions
-        # (`from '../../mongodb'`). Node 22+'s
-        # ``--experimental-strip-types`` resolves them at runtime.
-        existing = env.get("NODE_OPTIONS", "")
-        env["NODE_OPTIONS"] = (
-            existing + " --experimental-strip-types"
-        ).strip()
+        # TypeScript is transpiled by ``ts-node/register`` (already in
+        # ``test/mocha_mongodb.js``'s ``require`` list) — CommonJS +
+        # ``transpileOnly``, which resolves the driver's extensionless
+        # imports (`from '../../mongodb'`) and ``import x = require(...)``
+        # forms. Do **not** inject ``--experimental-strip-types``: Node's
+        # strip-only loader can't transform ``import = require`` and fights
+        # ts-node. On Node >= 23 the strip-types loader is on by default and
+        # ts-node's own mocha config disables it, so pass it through too.
 
         cmd = [
-            "npx", "mocha",
-            "--config", "test/mocha_mongodb.js",
-            "--reporter", "json",
-            "--timeout", str(MOCHA_PER_TEST_TIMEOUT_MS),
+            "npx",
+            "mocha",
+            "--config",
+            "test/mocha_mongodb.js",
+            "--reporter",
+            "json",
+            "--timeout",
+            str(MOCHA_PER_TEST_TIMEOUT_MS),
             *INCLUDE,
         ]
         print(
-            f"node_validation: `{' '.join(cmd)}` in {VENDOR} "
-            f"(MONGODB_URI={env['MONGODB_URI']})",
+            f"node_validation: `{' '.join(cmd)}` in {VENDOR} (MONGODB_URI={env['MONGODB_URI']})",
             file=sys.stderr,
         )
         try:
             with RAW_OUT.open("w") as out:
                 proc = subprocess.run(
-                    cmd, cwd=VENDOR, env=env, stdout=out, stderr=subprocess.PIPE,
+                    cmd,
+                    cwd=VENDOR,
+                    env=env,
+                    stdout=out,
+                    stderr=subprocess.PIPE,
                     timeout=MOCHA_TIMEOUT_SECONDS,
                 )
             stderr = proc.stderr
@@ -266,6 +280,7 @@ def main() -> int:
             return 1
 
         import json as _json
+
         try:
             raw = _json.loads(RAW_OUT.read_text())
         except _json.JSONDecodeError:

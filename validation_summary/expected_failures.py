@@ -41,6 +41,61 @@ JAVA: list[ExpectedFailure] = [
             "but the command-level gate inert. Documented in tasks/backlog.md §5."
         ),
     ),
+    # The five entries below were triaged 2026-06-30 (Python server, HEAD
+    # d8e75ff) and proven NOT to be server divergences: driving the same
+    # operations via pymongo against an on-disk daemon produced exactly the
+    # spec-expected wire replies, and the pymongo gauge passes the *identical*
+    # upstream command-monitoring / versioned-api spec files (which assert the
+    # same event counts — so the server induces no extra round-trips). Each is
+    # a Java-driver-internal concern with no server wire surface. Details in
+    # tasks/backlog.md §5.
+    ExpectedFailure(
+        pattern="metadata append does not create new connections",
+        rationale=(
+            "ClientMetadataTest: asserts the driver does NOT open a new "
+            "connection or re-send `hello` after a client-side `appendMetadata` "
+            "call. `appendMetadata` crosses no wire — purely Java-driver "
+            "connection/handshake logic. Not server-fixable."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="find and getMore append API version",
+        rationale=(
+            "VersionedApiTest: asserts the Java driver decorates outbound "
+            'find/getMore with `apiVersion:"1"`. SecantusDB already accepts '
+            "the serverApi fields (ok:1, correct cursor lifecycle); the "
+            "assertion is on the driver's outbound command, not a server reply. "
+            "pymongo passes the identical crud-api-version-1 spec."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="A successful deleteMany",
+        rationale=(
+            "CommandMonitoringTest: server reply is spec-correct "
+            "(single `delete` round-trip → {ok:1, n:2}); pymongo passes the "
+            "identical command-monitoring spec. Failure is Java-driver event "
+            "accounting against the standalone topology, not a server reply."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="A successful find with a getMore",
+        rationale=(
+            "CommandMonitoringTest: server emits exactly the spec-expected "
+            "find->getMore wire sequence (firstBatch 3 + Int64 cursor id, then "
+            "nextBatch 2 + id:0, no extra round-trip); pymongo passes the "
+            "identical spec. Failure is Java-driver event accounting."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="Create a client, run a command, and close the client",
+        rationale=(
+            "ConnectionPoolLoggingTest: asserts a fixed sequence of the Java "
+            "driver's CMAP connection-pool debug *log messages*. The server "
+            "emits no log lines over the wire and cannot influence them. "
+            "Out of scope (the sibling 'checkout fails' subtest is already "
+            "driver-skipped)."
+        ),
+    ),
 ]
 
 GO: list[ExpectedFailure] = [
@@ -116,6 +171,36 @@ RUBY: list[ExpectedFailure] = [
 ]
 
 PYMONGO: list[ExpectedFailure] = []
+
+C: list[ExpectedFailure] = [
+    ExpectedFailure(
+        pattern="/Client/select_server",
+        rationale=(
+            "libmongoc asserts the selected server is standalone / mongos / "
+            "RS-secondary, but SecantusDB advertises itself as an RS *primary* "
+            "in `hello` (deliberate — pymongo's change-stream topology machinery "
+            "needs a replica-set primary). RSPrimary fails the test's "
+            "`is_standalone_or_(rs_secondary_or_)mongos` check. A consequence of "
+            "the single-node-replica-set advertisement, not a CRUD/wire gap."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="/Client/last_write_date_absent",
+        rationale=(
+            "Asserts `lastWriteDate` is absent (a standalone trait); SecantusDB "
+            "advertises as an RS primary and so returns `lastWrite.lastWriteDate` "
+            "in `hello`. Same root cause as the `/Client/select_server` entries — "
+            "the single-node-replica-set advertisement."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="/Client/ipv6",
+        rationale=(
+            "Requires an IPv6 listener (`MONGOC_TEST_IPV6`); the gauge daemon "
+            "binds IPv4 `127.0.0.1` only. Environment-specific, not a protocol gap."
+        ),
+    ),
+]
 
 
 def find_match(failures: list[ExpectedFailure], description: str) -> ExpectedFailure | None:

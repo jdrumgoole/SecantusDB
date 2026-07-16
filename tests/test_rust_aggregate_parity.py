@@ -13,6 +13,7 @@ ported stages so the pure path never needs `secantus.storage`.
 
 from __future__ import annotations
 
+import datetime as _dt
 import importlib.util
 import pathlib
 import random
@@ -92,6 +93,12 @@ CURATED = [
     [{"$project": {"a": 1, "_id": 0}}],
     [{"$project": {"b": 0}}],
     [{"$project": {"sum": {"$add": ["$a", 100]}, "_id": 0}}],
+    # $getField reading an absent field resolves to the MISSING marker, which a
+    # computed $project/$addFields field omits (Rust defers this to Python; both
+    # sides must agree the field is dropped, not emitted null).
+    [{"$project": {"r": {"$getField": {"field": "k", "input": "$nested"}}}}],
+    [{"$addFields": {"r": {"$getField": {"field": "k", "input": "$nested"}}}}],
+    [{"$project": {"r": "$$REMOVE"}}],
     [{"$addFields": {"c": {"$multiply": ["$a", 2]}}}],
     [{"$set": {"a": {"$add": ["$a", 1]}}}],
     [{"$unset": "b"}],
@@ -118,6 +125,55 @@ CURATED = [
     [{"$group": {"_id": "$b", "f": {"$first": "$a"}, "l": {"$last": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "all": {"$push": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "set": {"$addToSet": "$a"}}}, {"$sort": {"_id": 1}}],
+    # $push / $addToSet skip a MISSING field value (nested is absent on some docs);
+    # an all-missing field yields [] (not [null, ...]).
+    [{"$group": {"_id": None, "p": {"$push": "$nested"}}}],
+    [{"$group": {"_id": None, "s": {"$addToSet": "$nested"}}}],
+    [{"$group": {"_id": None, "p": {"$push": "$nope"}}}],  # all missing -> []
+    [{"$group": {"_id": None, "s": {"$addToSet": "$nope"}}}],
+    # $mergeObjects accumulator — merge each operand doc across the group (later
+    # keys win); null/missing operands skipped; an all-missing group yields {}.
+    # `nested` is present on one doc and missing on the others (mixed shape).
+    [{"$group": {"_id": None, "m": {"$mergeObjects": "$nested"}}}],
+    [{"$group": {"_id": "$b", "m": {"$mergeObjects": "$nested"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": None, "m": {"$mergeObjects": "$nope"}}}],  # all missing -> {}
+    # $stdDevPop / $stdDevSamp — pop is 0 for a single value, samp is null for <2.
+    [{"$group": {"_id": "$b", "sd": {"$stdDevPop": "$a"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "sd": {"$stdDevSamp": "$a"}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": None, "p": {"$stdDevPop": "$a"}, "s": {"$stdDevSamp": "$a"}}}],
+    # $firstN / $lastN / $maxN / $minN accumulators — firstN/lastN keep nulls,
+    # maxN/minN drop them; integral-double n accepted.
+    [{"$group": {"_id": "$b", "r": {"$firstN": {"n": 2, "input": "$a"}}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "r": {"$lastN": {"n": 2, "input": "$a"}}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "r": {"$maxN": {"n": 2, "input": "$a"}}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": "$b", "r": {"$minN": {"n": 2, "input": "$a"}}}}, {"$sort": {"_id": 1}}],
+    [{"$group": {"_id": None, "r": {"$firstN": {"n": 3, "input": "$a"}}}}],
+    [{"$group": {"_id": None, "r": {"$maxN": {"n": 2.0, "input": "$a"}}}}],
+    # $top / $bottom / $topN / $bottomN — sort by sortBy, take top/bottom output(s).
+    [
+        {"$group": {"_id": "$b", "r": {"$topN": {"n": 2, "sortBy": {"a": -1}, "output": "$a"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {"$group": {"_id": "$b", "r": {"$bottomN": {"n": 2, "sortBy": {"a": 1}, "output": "$a"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {"$group": {"_id": "$b", "r": {"$top": {"sortBy": {"a": -1}, "output": "$a"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {"$group": {"_id": "$b", "r": {"$bottom": {"sortBy": {"a": 1}, "output": "$a"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {
+            "$group": {
+                "_id": None,
+                "r": {"$topN": {"n": 2, "sortBy": {"a": -1}, "output": ["$a", "$b"]}},
+            }
+        }
+    ],
     [{"$group": {"_id": "$nested.k", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
     [{"$sortByCount": "$b"}],
     [{"$unwind": "$tags"}, {"$group": {"_id": "$tags", "c": {"$sum": 1}}}, {"$sort": {"_id": 1}}],
@@ -134,6 +190,22 @@ CURATED = [
             }
         }
     ],
+    # $bucketAuto — count-chunking (equal values still split), custom output
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 3}}],
+    [{"$sort": {"_id": 1}}, {"$bucketAuto": {"groupBy": "$_id", "buckets": 4}}],
+    [
+        {
+            "$bucketAuto": {
+                "groupBy": "$a",
+                "buckets": 2,
+                "output": {"n": {"$sum": 1}, "av": {"$avg": "$a"}},
+            }
+        }
+    ],
+    # $redact — descend, pruning a nested sub-doc by content ($$PRUNE/$$DESCEND).
+    [{"$redact": {"$cond": {"if": {"$eq": ["$k", 9]}, "then": "$$PRUNE", "else": "$$DESCEND"}}}],
+    [{"$redact": "$$KEEP"}],
     # $facet — multiple sub-pipelines over the same input
     [
         {
@@ -217,6 +289,469 @@ def test_group_numeric_key_collision():
     assert rust is not None, "expected the Rust $group to handle numeric-key collision"
     py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
     assert rust == py, f"rust={rust} pure={py}"
+
+
+@pytest.mark.parametrize(
+    "docs,pipeline",
+    [
+        # value fill (missing + null -> value), and value-as-expression.
+        (
+            [{"_id": 1, "a": 1}, {"_id": 2, "a": None}, {"_id": 3}],
+            [{"$fill": {"output": {"a": {"value": 0}}}}],
+        ),
+        (
+            [{"_id": 1, "a": 1, "b": 5}, {"_id": 2, "a": None, "b": 7}],
+            [{"$fill": {"output": {"a": {"value": "$b"}}}}],
+        ),
+        # locf — leading null stays null, later gaps carry forward.
+        (
+            [
+                {"_id": 1, "t": 1, "v": None},
+                {"_id": 2, "t": 2, "v": 10},
+                {"_id": 3, "t": 3},
+                {"_id": 4, "t": 4, "v": 30},
+                {"_id": 5, "t": 5},
+            ],
+            [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "locf"}}}}],
+        ),
+        # linear — numeric anchors with clean fractions; trailing null stays null.
+        (
+            [
+                {"_id": 1, "t": 0, "v": 0},
+                {"_id": 2, "t": 1},
+                {"_id": 3, "t": 2},
+                {"_id": 4, "t": 4, "v": 8},
+                {"_id": 5, "t": 5},
+            ],
+            [{"$fill": {"sortBy": {"t": 1}, "output": {"v": {"method": "linear"}}}}],
+        ),
+        # partitionByFields + locf — output in partition-discovery order.
+        (
+            [
+                {"_id": 1, "g": "a", "t": 1, "v": 10},
+                {"_id": 2, "g": "b", "t": 1, "v": 5},
+                {"_id": 3, "g": "a", "t": 2},
+                {"_id": 4, "g": "b", "t": 2},
+            ],
+            [
+                {
+                    "$fill": {
+                        "partitionByFields": ["g"],
+                        "sortBy": {"t": 1},
+                        "output": {"v": {"method": "locf"}},
+                    }
+                }
+            ],
+        ),
+        # partitionBy expression.
+        (
+            [{"_id": 1, "g": "a", "t": 1, "v": 10}, {"_id": 2, "g": "a", "t": 2}],
+            [
+                {
+                    "$fill": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {"v": {"method": "locf"}},
+                    }
+                }
+            ],
+        ),
+    ],
+)
+def test_fill_parity(docs, pipeline):
+    docs = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline = bson.decode(bson.encode({"p": pipeline}))["p"]
+    rust = _rust_pipeline(docs, pipeline)
+    assert rust is not None, f"expected Rust $fill to handle {pipeline}"
+    py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
+
+
+@pytest.mark.parametrize(
+    "docs,pipeline",
+    [
+        # Rank trio with a tie (sorted 10, 10, 20). $documentNumber 1/2/3;
+        # $rank 1/1/3 (gap on tie); $denseRank 1/1/2 (no gap). Output stays in
+        # input order.
+        (
+            [{"_id": 1, "s": 10}, {"_id": 2, "s": 20}, {"_id": 3, "s": 10}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"s": 1},
+                        "output": {
+                            "dn": {"$documentNumber": {}},
+                            "rk": {"$rank": {}},
+                            "dr": {"$denseRank": {}},
+                        },
+                    }
+                }
+            ],
+        ),
+        # Running sum over ["unbounded", "current"] → 1, 3, 6.
+        (
+            [{"_id": 1, "t": 1, "v": 1}, {"_id": 2, "t": 2, "v": 2}, {"_id": 3, "t": 3, "v": 3}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "run": {"$sum": "$v", "window": {"documents": ["unbounded", "current"]}}
+                        },
+                    }
+                }
+            ],
+        ),
+        # Sliding avg over [-1, 0] → 1.0, 1.5, 2.5 (clean doubles).
+        (
+            [{"_id": 1, "t": 1, "v": 1}, {"_id": 2, "t": 2, "v": 2}, {"_id": 3, "t": 3, "v": 3}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"m": {"$avg": "$v", "window": {"documents": [-1, 0]}}},
+                    }
+                }
+            ],
+        ),
+        # partitionBy expression + whole-partition (default) window sum: each row
+        # gets its partition total (a:3, b:10). No sortBy.
+        (
+            [
+                {"_id": 1, "g": "a", "v": 1},
+                {"_id": 2, "g": "b", "v": 10},
+                {"_id": 3, "g": "a", "v": 2},
+            ],
+            [{"$setWindowFields": {"partitionBy": "$g", "output": {"tot": {"$sum": "$v"}}}}],
+        ),
+        # $push over ["unbounded", "current"] within a partition.
+        (
+            [
+                {"_id": 1, "g": "a", "t": 1, "v": "x"},
+                {"_id": 2, "g": "a", "t": 2, "v": "y"},
+                {"_id": 3, "g": "b", "t": 1, "v": "z"},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "hist": {
+                                "$push": "$v",
+                                "window": {"documents": ["unbounded", "current"]},
+                            }
+                        },
+                    }
+                }
+            ],
+        ),
+        # $min/$max/$first/$last over the whole (sorted) partition.
+        (
+            [{"_id": 1, "t": 2, "v": 5}, {"_id": 2, "t": 1, "v": 3}, {"_id": 3, "t": 3, "v": 9}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "mn": {"$min": "$v"},
+                            "mx": {"$max": "$v"},
+                            "f": {"$first": "$v"},
+                            "l": {"$last": "$v"},
+                        },
+                    }
+                }
+            ],
+        ),
+        # Range windows: value-based bounds over a single ascending numeric sort.
+        # Rolling [-1, 0] with a gap (no t=4), running [unbounded, current],
+        # forward [current, unbounded], and a symmetric [-1, 1].
+        (
+            [
+                {"_id": 1, "t": 1, "v": 10},
+                {"_id": 2, "t": 2, "v": 20},
+                {"_id": 3, "t": 3, "v": 30},
+                {"_id": 4, "t": 5, "v": 50},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+                    }
+                }
+            ],
+        ),
+        (
+            [{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "r": {"$sum": "$v", "window": {"range": ["unbounded", "current"]}}
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "f": {"$sum": "$v", "window": {"range": ["current", "unbounded"]}}
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [{"_id": 1, "t": 10, "v": 1}, {"_id": 2, "t": 11, "v": 2}, {"_id": 3, "t": 13, "v": 4}],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"a": {"$avg": "$v", "window": {"range": [-1, 1]}}},
+                    }
+                }
+            ],
+        ),
+        # Date-unit range windows: a `unit` scales the offset and the x-axis is
+        # the epoch-millis of a date sortBy. 2-day trailing sum, a `week` unit,
+        # and a symmetric `hour` window all compute; a variable-length `month`
+        # unit defers to Python.
+        (
+            [
+                {
+                    "_id": i,
+                    "t": _dt.datetime(2020, 1, 1 + i, tzinfo=_dt.timezone.utc),
+                    "v": (i + 1) * 10,
+                }
+                for i in range(5)
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "s": {"$sum": "$v", "window": {"range": [-2, 0], "unit": "day"}}
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [
+                {"_id": i, "t": _dt.datetime(2020, 1, 1 + 7 * i, tzinfo=_dt.timezone.utc), "v": i}
+                for i in range(4)
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "r": {"$sum": "$v", "window": {"range": [-1, 0], "unit": "week"}}
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [
+                {
+                    "_id": i,
+                    "t": _dt.datetime(2020, 1, 1, i, tzinfo=_dt.timezone.utc),
+                    "v": (i + 1) * 5,
+                }
+                for i in range(5)
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "a": {"$avg": "$v", "window": {"range": [-1, 1], "unit": "hour"}}
+                        },
+                    }
+                }
+            ],
+        ),
+        # $shift — value `by` positions away in sorted order: prev (default), next
+        # (null out of range), self (by 0), and an expression output.
+        (
+            [{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "prev": {"$shift": {"output": "$v", "by": -1, "default": 0}},
+                            "next": {"$shift": {"output": "$v", "by": 1}},
+                            "self": {"$shift": {"output": "$v", "by": 0}},
+                            "prev2": {"$shift": {"output": {"$add": ["$v", 1]}, "by": -2}},
+                        },
+                    }
+                }
+            ],
+        ),
+        # $expMovingAvg — N form (alpha = 2/(N+1)) and explicit alpha; IEEE-double
+        # recurrence matches the oracle bit-for-bit. Also a per-partition case.
+        (
+            [{"_id": i, "t": i, "v": v} for i, v in enumerate([10, 20, 30, 40])],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "eN": {"$expMovingAvg": {"input": "$v", "N": 3}},
+                            "eA": {"$expMovingAvg": {"input": "$v", "alpha": 0.4}},
+                        },
+                    }
+                }
+            ],
+        ),
+        (
+            [
+                {"_id": 1, "g": "a", "t": 1, "v": 2},
+                {"_id": 2, "g": "a", "t": 2, "v": 4},
+                {"_id": 3, "g": "b", "t": 1, "v": 100},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {"e": {"$expMovingAvg": {"input": "$v", "N": 2}}},
+                    }
+                }
+            ],
+        ),
+        # $locf (carry forward; leading null stays null) + $linearFill (interpolate
+        # on the t x-axis; trailing null stays null).
+        (
+            [
+                {"_id": 1, "t": 0, "v": None},
+                {"_id": 2, "t": 1, "v": 10},
+                {"_id": 3, "t": 2, "v": None},
+                {"_id": 4, "t": 4, "v": 40},
+                {"_id": 5, "t": 5, "v": None},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"lo": {"$locf": "$v"}, "li": {"$linearFill": "$v"}},
+                    }
+                }
+            ],
+        ),
+        # $locf per-partition; carries a non-numeric value too.
+        (
+            [
+                {"_id": 1, "g": "a", "t": 1, "v": "x"},
+                {"_id": 2, "g": "a", "t": 2, "v": None},
+                {"_id": 3, "g": "b", "t": 1, "v": None},
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {"lo": {"$locf": "$v"}},
+                    }
+                }
+            ],
+        ),
+        # $derivative / $integral — whole-partition (default window) slope & area,
+        # plus a rolling 2-doc derivative. window is a sibling of the operator.
+        (
+            [
+                {"_id": i, "t": t, "v": v}
+                for i, (t, v) in enumerate([(0, 0), (1, 10), (2, 20), (4, 60)])
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "d": {"$derivative": {"input": "$v"}},
+                            "i": {"$integral": {"input": "$v"}},
+                            "rd": {
+                                "$derivative": {"input": "$v"},
+                                "window": {"documents": [-1, 0]},
+                            },
+                        },
+                    }
+                }
+            ],
+        ),
+        # $derivative / $integral with a time `unit` over a date sortBy: the
+        # x-axis is the date's epoch millis scaled into the unit, so the rate is
+        # per hour. Both engines scale identically (millis / unit_ms in f64).
+        (
+            [
+                {
+                    "_id": i,
+                    "t": _dt.datetime(2020, 1, 1, i, tzinfo=_dt.timezone.utc),
+                    "v": v,
+                }
+                for i, v in enumerate([0, 10, 30, 45])
+            ],
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "d": {"$derivative": {"input": "$v", "unit": "hour"}},
+                            "i": {"$integral": {"input": "$v", "unit": "hour"}},
+                        },
+                    }
+                }
+            ],
+        ),
+    ],
+)
+def test_set_window_fields_parity(docs, pipeline):
+    docs = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline = bson.decode(bson.encode({"p": pipeline}))["p"]
+    rust = _rust_pipeline(docs, pipeline)
+    assert rust is not None, f"expected Rust $setWindowFields to handle {pipeline}"
+    py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        # Time `unit` on a *numeric* sortBy — mongod requires a date sortBy, so
+        # both sides reject it (Rust defers, Python raises).
+        [
+            {
+                "$setWindowFields": {
+                    "sortBy": {"t": 1},
+                    "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0], "unit": "day"}}},
+                }
+            }
+        ],
+        # Descending sort — range windows only support a single ascending field.
+        [
+            {
+                "$setWindowFields": {
+                    "sortBy": {"t": -1},
+                    "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+                }
+            }
+        ],
+    ],
+)
+def test_set_window_fields_range_unsupported_defers(pipeline):
+    # These range shapes are mongod-valid but not ported → the Rust stage defers.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "t": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": pipeline}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
 
 
 @pytest.mark.parametrize("direction", [1, -1])
@@ -307,6 +842,9 @@ def _rand_stage(rng):
             "group_minmax",
             "group_push",
             "group_set",
+            "group_std",
+            "group_nelem",
+            "group_topn",
             "sortbycount",
             "bucket",
             "bucket_default",
@@ -359,6 +897,21 @@ def _rand_stage(rng):
         return {"$group": {"_id": "$" + field, "p": {"$push": "$" + f2}, "av": {"$avg": "$" + f2}}}
     if kind == "group_set":
         return {"$group": {"_id": "$" + field, "set": {"$addToSet": "$" + f2}}}
+    if kind == "group_std":
+        op = rng.choice(["$stdDevPop", "$stdDevSamp"])
+        return {"$group": {"_id": "$" + field, "sd": {op: "$" + f2}}}
+    if kind == "group_nelem":
+        op = rng.choice(["$firstN", "$lastN", "$maxN", "$minN"])
+        spec = {"n": rng.randint(1, 3), "input": "$" + f2}
+        return {"$group": {"_id": "$" + field, "r": {op: spec}}}
+    if kind == "group_topn":
+        sort_field = rng.choice(["a", "b", "c"])
+        sort_by = {sort_field: rng.choice([1, -1])}
+        op = rng.choice(["$top", "$bottom", "$topN", "$bottomN"])
+        spec = {"sortBy": sort_by, "output": "$" + f2}
+        if op in ("$topN", "$bottomN"):
+            spec["n"] = rng.randint(1, 3)
+        return {"$group": {"_id": "$" + field, "r": {op: spec}}}
     if kind == "sortbycount":
         return {"$sortByCount": "$" + field}
     if kind in ("bucket", "bucket_default"):

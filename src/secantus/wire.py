@@ -129,36 +129,62 @@ def read_message(sock: socket.socket) -> Message:
             return Message(header=header, op=_parse_op_msg(body))
         if header.op_code == OP_QUERY:
             return Message(header=header, op=_parse_op_query(body))
-    except (bson.InvalidBSON, _BodyBoundsError) as exc:
+    except (bson.InvalidBSON, _BodyBoundsError, struct.error) as exc:
         # Client sent a body whose framing is plausible but whose
         # inner BSON document fails validation (e.g. a BinData with
         # a mismatched length field, or an int32 declaring a doc size
-        # that overflows the buffer). Real mongod replies with a
-        # ``BadValue`` error and keeps the connection alive — surface
-        # the header here so the connection loop can do the same
-        # rather than dropping the socket on the next message.
+        # that overflows the buffer), or whose framing is truncated so
+        # an ``unpack_from`` reads past the buffer (``struct.error``).
+        # The parsers also translate a missing NUL terminator / invalid
+        # UTF-8 in a cstring into ``_BodyBoundsError``. In every case
+        # real mongod replies with a ``BadValue`` error and keeps the
+        # connection alive — surface the header here so the connection
+        # loop can do the same rather than dropping the socket (and
+        # leaking a traceback) on a malformed frame.
         raise MalformedBodyError(header, f"invalid BSON in body: {exc}") from exc
     raise WireProtocolError(f"unsupported op_code {header.op_code}")
 
 
 def _parse_op_query(buf: bytes) -> OpQuery:
+    # Every read below is on attacker-controlled bytes. A malformed frame
+    # must raise ``_BodyBoundsError`` / ``struct.error`` (both translated to
+    # a ``BadValue`` reply by ``read_message``), never an uncaught exception
+    # that drops the connection. The OP_MSG parser is hardened the same way.
     if len(buf) < 4:
         raise WireProtocolError("OP_QUERY body too short")
     (flags,) = _UINT32.unpack_from(buf, 0)
     offset = 4
-    name_end = buf.index(b"\x00", offset)
-    full_collection_name = buf[offset:name_end].decode("utf-8")
+    # fullCollectionName is a NUL-terminated cstring. ``bytes.index`` raises
+    # ``ValueError`` when the NUL is absent — a malformed frame, not a bug.
+    try:
+        name_end = buf.index(b"\x00", offset)
+    except ValueError as exc:
+        raise _BodyBoundsError(
+            "OP_QUERY: collection name not NUL-terminated within message body"
+        ) from exc
+    try:
+        full_collection_name = buf[offset:name_end].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _BodyBoundsError("OP_QUERY: collection name is not valid UTF-8") from exc
     offset = name_end + 1
+    # numberToSkip (int32) + numberToReturn (int32) + the query doc's leading
+    # length int32 = 12 bytes that must be present before we unpack them.
+    if offset + 12 > len(buf):
+        raise _BodyBoundsError("OP_QUERY: truncated before skip/return/query length")
     (number_to_skip,) = _INT32.unpack_from(buf, offset)
     offset += 4
     (number_to_return,) = _INT32.unpack_from(buf, offset)
     offset += 4
     (doc_len,) = _INT32.unpack_from(buf, offset)
+    _check_doc_len(doc_len, offset, len(buf), "OP_QUERY query")
     query = bson.decode(buf[offset : offset + doc_len])
     offset += doc_len
     selector: dict[str, Any] | None = None
     if offset < len(buf):
+        if offset + 4 > len(buf):
+            raise _BodyBoundsError("OP_QUERY: truncated before selector length")
         (sel_len,) = _INT32.unpack_from(buf, offset)
+        _check_doc_len(sel_len, offset, len(buf), "OP_QUERY selector")
         selector = bson.decode(buf[offset : offset + sel_len])
     return OpQuery(
         flags=flags,
@@ -232,8 +258,20 @@ def _parse_op_msg(buf: bytes) -> OpMsg:
                 )
             section_end = offset + section_len
             offset += 4
-            ident_end = buf.index(b"\x00", offset, section_end)
-            identifier = buf[offset:ident_end].decode("utf-8")
+            # The section identifier is a NUL-terminated cstring within the
+            # section bounds; a missing NUL / bad UTF-8 is a malformed frame.
+            try:
+                ident_end = buf.index(b"\x00", offset, section_end)
+            except ValueError as exc:
+                raise _BodyBoundsError(
+                    "OP_MSG kind-1: section identifier not NUL-terminated"
+                ) from exc
+            try:
+                identifier = buf[offset:ident_end].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise _BodyBoundsError(
+                    "OP_MSG kind-1: section identifier is not valid UTF-8"
+                ) from exc
             offset = ident_end + 1
             docs: list[dict[str, Any]] = []
             while offset < section_end:

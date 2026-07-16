@@ -130,6 +130,21 @@ def test_bool_id_not_treated_as_numeric(storage: Storage) -> None:
     assert inserted == 2
 
 
+def test_create_index_name_conflicts(storage: Storage) -> None:
+    from secantus.storage import IndexKeySpecsConflict, IndexOptionsConflict
+
+    storage.create_collection("db", "c")
+    assert storage.create_index("db", "c", "idx", {"a": 1}, {}) is True
+    # Same name, different key spec -> IndexKeySpecsConflict.
+    with pytest.raises(IndexKeySpecsConflict):
+        storage.create_index("db", "c", "idx", {"a": -1}, {})
+    # Same name, same key, different options -> IndexOptionsConflict.
+    with pytest.raises(IndexOptionsConflict):
+        storage.create_index("db", "c", "idx", {"a": 1}, {"unique": True})
+    # Identical re-create -> no-op (False), no exception.
+    assert storage.create_index("db", "c", "idx", {"a": 1}, {}) is False
+
+
 def test_rename_collection_moves_docs_and_indexes(storage: Storage) -> None:
     storage.insert("db", "src", [{"_id": 1, "x": 1}, {"_id": 2, "x": 2}])
     storage.create_index("db", "src", "x_1", {"x": 1}, {})
@@ -199,6 +214,51 @@ def test_sort_cross_type_order(storage: Storage) -> None:
     assert pos[6] < pos[5]  # object < array
     assert pos[5] < pos[7]  # array < ObjectId
     assert pos[7] < pos[3]  # ObjectId < bool
+
+
+def test_reopen_clamps_seq_counters_past_stale_meta(tmp_path) -> None:
+    """A stale persisted meta row must never lower the recovered counters.
+
+    ``_emit_oplog`` deliberately stops re-persisting the oplog-meta row on
+    every write (it WT-rollbacks under concurrent writers). The row is only
+    refreshed by ``current_cluster_time`` (every ``hello``), ``prune_oplog``,
+    and ``close`` — so a checkpoint taken by ``backupArchive`` between two
+    refreshes captures a ``next_seq`` / ``next_nat_seq`` that lags the actual
+    oplog / natural-order tables. If recovery *trusts* that stale value it
+    re-mints an already-used seq: a duplicate oplog seq, or a natural-order
+    seq collision that overwrites a live doc's nat entry and corrupts
+    capped-collection FIFO eviction after restore. Recovery must clamp each
+    counter UP to what the tables contain.
+    """
+    s1 = Storage(str(tmp_path))
+    try:
+        s1.insert("db", "c", [{"_id": i} for i in range(6)])
+        real_nat = s1._next_nat_seq
+        real_seq = s1._next_seq
+        assert real_nat > 1  # the inserts minted nat seqs
+        # Simulate a hello/current_cluster_time that ran *before* the inserts:
+        # it would have persisted these low counters, and the insert path
+        # never refreshed them. Force that exact on-disk state, checkpoint,
+        # and leave the in-memory counters stale so close() re-persists them.
+        s1._next_nat_seq = 1
+        s1._next_seq = 1
+        s1._persist_oplog_meta()
+        s1.checkpoint()
+    finally:
+        s1.close()
+
+    s2 = Storage(str(tmp_path))
+    try:
+        # The stale meta (next_*=1) must be overridden by the table scans.
+        assert s2._next_nat_seq >= real_nat
+        assert s2._next_seq >= real_seq
+        # A fresh insert mints a nat seq strictly above every existing one,
+        # so the natural-order index stays collision-free.
+        before = s2._next_nat_seq
+        s2.insert("db", "c", [{"_id": 99}])
+        assert s2._next_nat_seq == before + 1
+    finally:
+        s2.close()
 
 
 def test_storage_persists_across_reopen(tmp_path) -> None:
@@ -730,5 +790,74 @@ def test_timeseries_allows_duplicate_ids(tmp_path) -> None:
         assert len(by_id) == 2
         assert s.delete_matching("ts", "m", {"_id": 1}) == 2
         assert list(s.find_matching("ts", "m", {})) == []
+    finally:
+        s.close()
+
+
+def test_close_logs_teardown_errors_instead_of_swallowing(tmp_path, caplog) -> None:
+    # A failure during the close() teardown (checkpoint, session/conn
+    # close, oplog-meta persist) must be logged, never silently
+    # discarded — a checkpoint error on the final flush is a durability
+    # signal (issue #138). close() still completes idempotently.
+    import logging
+
+    s = Storage(str(tmp_path))
+    s.insert("db", "c", [{"x": 1}])
+
+    def _boom() -> None:
+        raise RuntimeError("simulated checkpoint failure")
+
+    s._persist_oplog_meta = _boom  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.ERROR, logger="secantus.storage.close"):
+        s.close()  # must not raise
+
+    assert s._closed is True
+    matching = [
+        r
+        for r in caplog.records
+        if r.name == "secantus.storage.close" and r.levelno >= logging.ERROR
+    ]
+    assert matching, "close() teardown error was swallowed without logging"
+    assert any("simulated checkpoint failure" in (r.exc_text or "") for r in matching) or any(
+        "oplog meta" in r.getMessage() for r in matching
+    )
+
+
+def test_durable_resolution(tmp_path, monkeypatch) -> None:
+    """`durable` precedence: FORCE_DURABLE > explicit arg > FAST-default > durable."""
+    monkeypatch.delenv("SECANTUS_FORCE_DURABLE", raising=False)
+    monkeypatch.setenv("SECANTUS_TEST_FAST_STORAGE", "1")
+    # Explicit args win over the fast-test default.
+    s = Storage(str(tmp_path / "a"), durable=True)
+    assert s._durable is True
+    s.close()
+    s = Storage(str(tmp_path / "b"), durable=False)
+    assert s._durable is False
+    s.close()
+    # Unset arg + FAST env -> fast (non-durable).
+    s = Storage(str(tmp_path / "c"))
+    assert s._durable is False
+    s.close()
+    # No env at all -> the shipped/production default is durable.
+    monkeypatch.delenv("SECANTUS_TEST_FAST_STORAGE", raising=False)
+    s = Storage(str(tmp_path / "d"))
+    assert s._durable is True
+    s.close()
+    # FORCE_DURABLE wins over everything, even an explicit durable=False.
+    monkeypatch.setenv("SECANTUS_FORCE_DURABLE", "1")
+    monkeypatch.setenv("SECANTUS_TEST_FAST_STORAGE", "1")
+    s = Storage(str(tmp_path / "e"), durable=False)
+    assert s._durable is True
+    s.close()
+
+
+def test_fast_storage_round_trips(tmp_path) -> None:
+    """durable=False (journal on, close-checkpoint skipped) still creates tables
+    on disk and round-trips a document within the session."""
+    s = Storage(str(tmp_path / "fast"), durable=False)
+    try:
+        s.insert("db", "c", [{"_id": 1, "x": "hi"}])
+        assert s.find_matching("db", "c", {"_id": 1}) == [{"_id": 1, "x": "hi"}]
     finally:
         s.close()

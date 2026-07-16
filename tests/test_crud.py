@@ -50,7 +50,7 @@ def test_round_trips_objectid_and_datetime(server: SecantusDBServer) -> None:
     try:
         coll = aware_client["testdb"]["things"]
         oid = ObjectId()
-        when = dt.datetime(2026, 4, 26, 12, 0, 0, tzinfo=dt.UTC)
+        when = dt.datetime(2026, 4, 26, 12, 0, 0, tzinfo=dt.timezone.utc)
         coll.insert_one({"_id": oid, "ts": when})
         doc = coll.find_one({"_id": oid})
         assert doc is not None
@@ -86,6 +86,34 @@ def test_find_with_dotted_path(coll) -> None:
     assert found[0]["name"] == "a"
 
 
+def test_range_operators_are_type_bracketed(coll) -> None:
+    """mongod's $gt/$lt/$gte/$lte are type-bracketed: a scalar bound never matches
+    a value of a different type bracket. Verified against real mongod (2026-07-13):
+    a document-valued field no-matches a numeric bound (rather than erroring), and
+    bool is its own bracket — a bool field never matches a numeric bound and vice
+    versa, but bool-vs-bool compares (True > False)."""
+    coll.insert_many(
+        [
+            {"_id": 1, "a": 5},
+            {"_id": 2, "a": True},
+            {"_id": 3, "a": False},
+            {"_id": 4, "a": {"x": 1}},
+            {"_id": 5, "a": [1, 2, 3]},
+            {"_id": 6, "items": [{"k": 1}, {"k": 2}]},
+        ]
+    )
+    # Document-valued field vs a numeric bound: no match, no error.
+    assert [d["_id"] for d in coll.find({"a": {"$gt": 2}})] == [1, 5]  # 5, and [1,2,3] via multikey
+    # $elemMatch: {$gt: n} over an array of sub-documents: clean no-match.
+    assert list(coll.find({"items": {"$elemMatch": {"$gt": 2}}})) == []
+    # bool is its own bracket: a bool field never matches a numeric range bound.
+    assert [d["_id"] for d in coll.find({"a": {"$lt": 2}})] == [5]  # only [1,2,3] via elem 1<2
+    assert [d["_id"] for d in coll.find({"a": {"$gt": 0}})] == [1, 5]
+    # bool-vs-bool still compares.
+    assert [d["_id"] for d in coll.find({"a": {"$gt": False}})] == [2]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$gte": False}})) == [2, 3]
+
+
 def test_update_one_with_set(coll) -> None:
     coll.insert_one({"_id": 1, "n": 5})
     result = coll.update_one({"_id": 1}, {"$set": {"n": 99}})
@@ -118,6 +146,30 @@ def test_inc_and_sum_preserve_int64_over_the_wire(coll) -> None:
         coll.aggregate([{"$match": {"g": "a"}}, {"$group": {"_id": "$g", "t": {"$sum": "$q"}}}])
     )
     assert res[0]["t"] == 20 and isinstance(res[0]["t"], Int64)
+
+
+def test_inc_mul_on_explicit_null_field_errors(coll) -> None:
+    """$inc / $mul on a field present with an explicit null is a TypeMismatch
+    (code 14) — mongod refuses to coerce a present non-numeric value to 0. A
+    *missing* field is still treated as 0 and the operation applied."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": None})
+    with pytest.raises(OperationFailure) as exc_inc:
+        coll.update_one({"_id": 1}, {"$inc": {"n": 5}})
+    assert exc_inc.value.code == 14
+
+    with pytest.raises(OperationFailure) as exc_mul:
+        coll.update_one({"_id": 1}, {"$mul": {"n": 5}})
+    assert exc_mul.value.code == 14
+
+    # The null was never coerced to a number.
+    assert coll.find_one({"_id": 1})["n"] is None
+
+    # A missing field is still treated as 0 and the delta applied.
+    coll.insert_one({"_id": 2})
+    coll.update_one({"_id": 2}, {"$inc": {"n": 5}})
+    assert coll.find_one({"_id": 2})["n"] == 5
 
 
 def test_update_with_push(coll) -> None:
@@ -408,10 +460,57 @@ def test_projection_exclusion(coll) -> None:
     assert doc == {"_id": 1, "a": 1, "c": 3}
 
 
+def test_projection_inclusion_exclusion_mix_is_31254(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"a": 1, "b": 2})
+    with pytest.raises(OperationFailure) as exc:
+        coll.find_one({}, {"a": 1, "b": 0})
+    assert exc.value.code == 31254
+    assert "Cannot do exclusion on field b in inclusion projection" in str(exc.value)
+
+
+def test_projection_exclusion_inclusion_mix_is_31253(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"a": 1, "b": 2})
+    with pytest.raises(OperationFailure) as exc:
+        coll.find_one({}, {"a": 0, "b": 1})
+    assert exc.value.code == 31253
+    assert "Cannot do inclusion on field b in exclusion projection" in str(exc.value)
+
+
 def test_projection_dotted_inclusion(coll) -> None:
     coll.insert_one({"_id": 1, "addr": {"city": "Dublin", "zip": "D02"}, "name": "Joe"})
     doc = coll.find_one({}, {"addr.city": 1, "_id": 0})
     assert doc == {"addr": {"city": "Dublin"}}
+
+
+def test_projection_meta_textscore_without_text_is_40218(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 1})
+    with pytest.raises(OperationFailure) as exc:
+        coll.find_one({"a": 1}, {"score": {"$meta": "textScore"}})
+    assert exc.value.code == 40218
+    assert "query requires text score metadata, but it is not available" in str(exc.value)
+
+
+def test_projection_meta_unknown_arg_is_17308(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 1})
+    with pytest.raises(OperationFailure) as exc:
+        coll.find_one({}, {"score": {"$meta": "bogus"}})
+    assert exc.value.code == 17308
+    assert "Unsupported argument to $meta: bogus" in str(exc.value)
+
+
+def test_projection_meta_recognized_arg_omits_field(coll) -> None:
+    coll.insert_one({"_id": 1, "a": 1, "b": 2})
+    doc = coll.find_one({}, {"m": {"$meta": "indexKey"}})
+    # Recognized-but-unsupported $meta arg: field omitted, inclusion keeps _id.
+    assert doc == {"_id": 1}
 
 
 def test_small_batch_size_paginates_via_getmore(coll, server: SecantusDBServer) -> None:
@@ -489,6 +588,45 @@ def test_query_all(coll) -> None:
     )
     ids = sorted(d["_id"] for d in coll.find({"tags": {"$all": ["a", "b"]}}))
     assert ids == [1, 3]
+
+
+def test_query_all_with_elemmatch(coll) -> None:
+    coll.insert_many(
+        [
+            {"_id": 1, "a": [1, 2, 3]},
+            {"_id": 2, "a": [4, 5]},
+            {"_id": 3, "a": [1, 5, 10]},
+        ]
+    )
+    ids = sorted(
+        d["_id"] for d in coll.find({"a": {"$all": [{"$elemMatch": {"$gt": 1, "$lt": 3}}]}})
+    )
+    assert ids == [1]
+    ids2 = sorted(
+        d["_id"]
+        for d in coll.find(
+            {"a": {"$all": [{"$elemMatch": {"$gt": 4}}, {"$elemMatch": {"$lt": 2}}]}}
+        )
+    )
+    assert ids2 == [3]
+
+
+def test_query_in_with_regex(coll) -> None:
+    from bson import Regex
+
+    coll.insert_many(
+        [
+            {"_id": 1, "s": "hello"},
+            {"_id": 2, "s": "World"},
+            {"_id": 3, "s": "HELLO"},
+            {"_id": 4, "s": "hi"},
+        ]
+    )
+    ids = sorted(d["_id"] for d in coll.find({"s": {"$in": [Regex("^h", "i")]}}))
+    assert ids == [1, 3, 4]
+    # $nin excludes the regex matches.
+    ids2 = sorted(d["_id"] for d in coll.find({"s": {"$nin": [Regex("^h", "i")]}}))
+    assert ids2 == [2]
 
 
 def test_query_mod(coll) -> None:
@@ -573,6 +711,553 @@ def test_aggregate_project_with_computed_field(coll) -> None:
     assert out == [{"sum": 7}]
 
 
+def test_aggregate_getfield_absent_is_omitted(coll) -> None:
+    # $getField reading a field absent from the input resolves to "missing";
+    # a $project computed field that resolves to missing is OMITTED entirely
+    # (matching mongod) — never emitted as null. But an input that resolves to
+    # an explicit null yields null (the field is emitted).
+    coll.insert_many(
+        [
+            {"_id": 1, "sub": {"k": 1}},
+            {"_id": 2, "sub": {"j": 2}},
+            {"_id": 3, "sub": None},
+            {"_id": 5},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {"$sort": {"_id": 1}},
+                {"$project": {"r": {"$getField": {"field": "k", "input": "$sub"}}}},
+            ]
+        )
+    )
+    # _id:1 -> r=1; _id:2 (no k) omitted; _id:3 (sub null) -> r=null; _id:5 (no sub) omitted.
+    assert out == [{"_id": 1, "r": 1}, {"_id": 2}, {"_id": 3, "r": None}, {"_id": 5}]
+
+
+def test_aggregate_getfield_present_null_is_emitted(coll) -> None:
+    # A field present with an explicit null returns null and IS emitted.
+    coll.insert_one({"_id": 1, "sub": {"k": None}})
+    pipeline = [{"$project": {"r": {"$getField": {"field": "k", "input": "$sub"}}}}]
+    out = list(coll.aggregate(pipeline))
+    assert out == [{"_id": 1, "r": None}]
+
+
+def test_aggregate_new_expression_operators(coll) -> None:
+    from bson import Timestamp
+
+    coll.insert_one({"_id": 1, "ts": Timestamp(1700000000, 7), "n": 5, "arr": [1], "s": "Hello"})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "tsSec": {"$tsSecond": "$ts"},
+                        "tsInc": {"$tsIncrement": "$ts"},
+                        "type_n": {"$type": "$n"},
+                        "type_miss": {"$type": "$nope"},
+                        "isNum": {"$isNumber": "$n"},
+                        "isArr": {"$isArray": "$arr"},
+                        "scc": {"$strcasecmp": ["$s", "HELLO"]},
+                        "rep": {
+                            "$replaceAll": {"input": "abcabc", "find": "bc", "replacement": "X"}
+                        },
+                        "iso": {
+                            "$dateFromParts": {"isoWeekYear": 2023, "isoWeek": 5, "isoDayOfWeek": 3}
+                        },
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [
+        {
+            "tsSec": 1700000000,
+            "tsInc": 7,
+            "type_n": "int",
+            "type_miss": "missing",
+            "isNum": True,
+            "isArr": True,
+            "scc": 0,
+            "rep": "aXaX",
+            "iso": dt.datetime(2023, 2, 1),
+        }
+    ]
+
+
+def test_aggregate_set_operators(coll) -> None:
+    coll.insert_one({"_id": 1, "a": 5, "b": "x"})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "union": {"$setUnion": [[3, 1, 2], [5, 4]]},
+                        "inter": {"$setIntersection": [[3, 1, 2, 5], [2, 5, 1]]},
+                        "diff": {"$setDifference": [[5, 3, 1, 2], [3]]},
+                        "eq": {"$setEquals": [[1, 2], [2, 1]]},
+                        "sub": {"$setIsSubset": [[1, 2], [1, 2, 3]]},
+                        "allt": {"$allElementsTrue": [[1, True]]},
+                        "cmp": {"$cmp": [1, 2]},
+                        "bsz": {"$bsonSize": "$$ROOT"},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [
+        {
+            "union": [1, 2, 3, 4, 5],
+            "inter": [1, 2, 5],
+            "diff": [5, 1, 2],
+            "eq": True,
+            "sub": True,
+            "allt": True,
+            "cmp": -1,
+            "bsz": 30,
+        }
+    ]
+
+
+def test_aggregate_trig_operators(coll) -> None:
+    import math
+
+    coll.insert_one({"_id": 1})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "sin": {"$sin": 0},
+                        "cos": {"$cos": 0},
+                        "tan": {"$tan": 0},
+                        "asin": {"$asin": 1},
+                        "acos": {"$acos": 1},
+                        "atan": {"$atan": 1},
+                        "atan2": {"$atan2": [1, 1]},
+                        "sinh": {"$sinh": 0},
+                        "cosh": {"$cosh": 0},
+                        "tanh": {"$tanh": 0},
+                        "asinh": {"$asinh": 0},
+                        "acosh": {"$acosh": 1},
+                        "atanh": {"$atanh": 0},
+                        "atanh_edge": {"$atanh": 1},
+                        "null": {"$sin": None},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [
+        {
+            "sin": 0.0,
+            "cos": 1.0,
+            "tan": 0.0,
+            "asin": math.pi / 2,
+            "acos": 0.0,
+            "atan": math.pi / 4,
+            "atan2": math.pi / 4,
+            "sinh": 0.0,
+            "cosh": 1.0,
+            "tanh": 0.0,
+            "asinh": 0.0,
+            "acosh": 0.0,
+            "atanh": 0.0,
+            "atanh_edge": math.inf,
+            "null": None,
+        }
+    ]
+    # Domain error surfaces (mongod Location50989 on the Python server).
+    with pytest.raises(pymongo.errors.OperationFailure):
+        list(coll.aggregate([{"$project": {"r": {"$asin": 5}}}]))
+
+
+def test_aggregate_date_from_parts(coll) -> None:
+    coll.insert_one({"_id": 1})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "basic": {"$dateFromParts": {"year": 2023, "month": 6, "day": 15}},
+                        "rollover": {"$dateFromParts": {"year": 2023, "month": 13, "day": 1}},
+                        "tz": {
+                            "$dateFromParts": {
+                                "year": 2023,
+                                "month": 6,
+                                "day": 15,
+                                "hour": 12,
+                                "timezone": "+05:00",
+                            }
+                        },
+                    }
+                }
+            ]
+        )
+    )
+    # pymongo returns naive UTC datetimes by default.
+    assert out == [
+        {
+            "basic": dt.datetime(2023, 6, 15),
+            "rollover": dt.datetime(2024, 1, 1),
+            "tz": dt.datetime(2023, 6, 15, 7, 0),  # 12:00 +05:00 -> 07:00 UTC
+        }
+    ]
+
+
+def test_aggregate_to_date(coll) -> None:
+    # $toDate: <expr> is shorthand for $convert: {input: <expr>, to: "date"}.
+    # A date is returned unchanged; an int/long/double is milliseconds since the
+    # Unix epoch; an ISO string is parsed; null / missing -> null. (ObjectId is
+    # NOT converted — SecantusDB's $convert-to-date, which $toDate delegates to,
+    # doesn't yet support that source, so $toDate mirrors it exactly.)
+    stored = dt.datetime(2020, 5, 6, 7, 8, 9)
+    coll.insert_one({"_id": 1, "d": stored, "ms": 1700000000000, "s": "2026-04-28T12:00:00"})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "from_date": {"$toDate": "$d"},
+                        "from_millis": {"$toDate": "$ms"},
+                        "from_string": {"$toDate": "$s"},
+                        "from_null": {"$toDate": None},
+                        "from_missing": {"$toDate": "$nope"},
+                    }
+                }
+            ]
+        )
+    )
+    # pymongo returns naive UTC datetimes by default.
+    assert out == [
+        {
+            "from_date": stored,
+            "from_millis": dt.datetime(2023, 11, 14, 22, 13, 20),
+            "from_string": dt.datetime(2026, 4, 28, 12, 0, 0),
+            "from_null": None,
+            "from_missing": None,
+        }
+    ]
+
+
+def test_aggregate_date_extractor_timezone(coll) -> None:
+    # 2023-01-15T16:30Z: UTC hour 16; America/New_York is EST (-05:00) -> hour 11,
+    # still the 15th. The {date, timezone} object form is mongod's timezone-aware
+    # extractor spec; a bare "$d" reads UTC.
+    coll.insert_one({"_id": 1, "d": dt.datetime(2023, 1, 15, 16, 30, tzinfo=dt.timezone.utc)})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "utc_hour": {"$hour": "$d"},
+                        "ny_hour": {"$hour": {"date": "$d", "timezone": "America/New_York"}},
+                        "ny_day": {"$dayOfMonth": {"date": "$d", "timezone": "America/New_York"}},
+                        "off_hour": {"$hour": {"date": "$d", "timezone": "+05:30"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"utc_hour": 16, "ny_hour": 11, "ny_day": 15, "off_hour": 22}]
+
+
+def test_aggregate_date_to_parts_timezone(coll) -> None:
+    # $dateToParts reads local wall-clock in the given zone. 16:30:45Z is EST
+    # (-05:00) in New York -> hour 11, still the 15th.
+    coll.insert_one({"_id": 1, "d": dt.datetime(2023, 1, 15, 16, 30, 45, tzinfo=dt.timezone.utc)})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "parts": {"$dateToParts": {"date": "$d", "timezone": "America/New_York"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out[0]["parts"] == {
+        "year": 2023,
+        "month": 1,
+        "day": 15,
+        "hour": 11,
+        "minute": 30,
+        "second": 45,
+        "millisecond": 0,
+    }
+
+
+def test_aggregate_date_component_extractors(coll) -> None:
+    # 2027-01-01 is a Friday belonging to ISO year 2026 week 53; also exercise a
+    # timezone-shifted day-boundary crossing and the millisecond component.
+    coll.insert_one(
+        {"_id": 1, "d": dt.datetime(2026, 3, 15, 10, 30, 45, 123000, tzinfo=dt.timezone.utc)}
+    )
+    coll.insert_one({"_id": 2, "d": dt.datetime(2027, 1, 1, tzinfo=dt.timezone.utc)})
+    # 2026-03-15T02:00Z -> -05:00 is the 14th (day of year 73).
+    coll.insert_one({"_id": 3, "d": dt.datetime(2026, 3, 15, 2, 0, tzinfo=dt.timezone.utc)})
+    out = list(
+        coll.aggregate(
+            [
+                {"$sort": {"_id": 1}},
+                {
+                    "$project": {
+                        "_id": 1,
+                        "doy": {"$dayOfYear": "$d"},
+                        "week": {"$week": "$d"},
+                        "isoweek": {"$isoWeek": "$d"},
+                        "isodow": {"$isoDayOfWeek": "$d"},
+                        "isoyear": {"$isoWeekYear": "$d"},
+                        "ms": {"$millisecond": "$d"},
+                        "tz_doy": {"$dayOfYear": {"date": "$d", "timezone": "-05:00"}},
+                    }
+                },
+            ]
+        )
+    )
+    assert out[0] == {
+        "_id": 1,
+        "doy": 74,
+        "week": 11,
+        "isoweek": 11,
+        "isodow": 7,  # Sunday
+        "isoyear": 2026,
+        "ms": 123,
+        "tz_doy": 74,
+    }
+    assert out[1]["isoweek"] == 53
+    assert out[1]["isoyear"] == 2026
+    assert out[1]["isodow"] == 5  # Friday
+    assert out[2]["tz_doy"] == 73  # shifted to the 14th (day-of-year 73)
+
+
+def test_aggregate_date_extractor_non_date_errors(coll) -> None:
+    """A date extractor on a non-date value errors (mongod Location16006); null
+    and a missing field yield null."""
+    coll.insert_one({"_id": 1, "s": "not a date", "z": None})
+    for op in ("$year", "$dayOfYear", "$isoWeek", "$millisecond"):
+        with pytest.raises(pymongo.errors.OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: "$s"}}}]))
+        assert exc.value.code == 16006
+        # null / missing -> null (not an error).
+        out = list(coll.aggregate([{"$project": {"_id": 0, "r": {op: "$z"}}}]))
+        assert out == [{"r": None}]
+        out2 = list(coll.aggregate([{"$project": {"_id": 0, "r": {op: "$nope"}}}]))
+        assert out2 == [{"r": None}]
+
+
+def test_aggregate_date_to_parts_iso8601(coll) -> None:
+    # 2027-01-01 (Friday) belongs to ISO year 2026, week 53.
+    coll.insert_one({"_id": 1, "d": dt.datetime(2027, 1, 1, 13, 14, 15, 678000)})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "iso": {"$dateToParts": {"date": "$d", "iso8601": True}},
+                        "civil": {"$dateToParts": {"date": "$d", "iso8601": False}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out[0]["iso"] == {
+        "isoWeekYear": 2026,
+        "isoWeek": 53,
+        "isoDayOfWeek": 5,
+        "hour": 13,
+        "minute": 14,
+        "second": 15,
+        "millisecond": 678,
+    }
+    assert out[0]["civil"] == {
+        "year": 2027,
+        "month": 1,
+        "day": 1,
+        "hour": 13,
+        "minute": 14,
+        "second": 15,
+        "millisecond": 678,
+    }
+
+
+def test_aggregate_max_n_min_n(coll) -> None:
+    coll.insert_one({"_id": 1, "a": [3, 1, 4, 1, 5, 9, 2, 6], "with_nulls": [3, None, 1, None, 5]})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "top3": {"$maxN": {"n": 3, "input": "$a"}},
+                        "bot3": {"$minN": {"n": 3, "input": "$a"}},
+                        "max_nn": {"$maxN": {"n": 2, "input": "$with_nulls"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"top3": [9, 6, 5], "bot3": [1, 1, 2], "max_nn": [5, 3]}]
+
+
+def test_aggregate_first_n_last_n(coll) -> None:
+    coll.insert_one({"_id": 1, "a": [10, 20, 30, 40, 50]})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "f": {"$firstN": {"n": 2, "input": "$a"}},
+                        "l": {"$lastN": {"n": 2, "input": "$a"}},
+                        "all_": {"$firstN": {"n": 99, "input": "$a"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"f": [10, 20], "l": [40, 50], "all_": [10, 20, 30, 40, 50]}]
+
+
+def test_aggregate_bitwise_operators(coll) -> None:
+    from bson import Int64
+
+    coll.insert_one({"_id": 1, "a": 12, "b": 10, "big": Int64(0xFF00)})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "and_": {"$bitAnd": ["$a", "$b"]},
+                        "or_": {"$bitOr": ["$a", "$b", 1]},
+                        "xor_": {"$bitXor": ["$a", "$b"]},
+                        "not_": {"$bitNot": "$a"},
+                        "long_": {"$bitAnd": ["$big", 255]},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"and_": 8, "or_": 15, "xor_": 6, "not_": -13, "long_": 0}]
+    # An all-long operand keeps the long (int64) type over the wire.
+    assert isinstance(out[0]["long_"], Int64)
+
+
+def test_aggregate_group_topn_accumulators(coll) -> None:
+    # Sort by score: x2(9) > x1(3) > x3(1). $topN/$top take the highest, $bottomN
+    # the lowest end of the sort order; $top/$bottom are single values.
+    coll.insert_many(
+        [
+            {"t": "a", "s": "x1", "score": 3},
+            {"t": "a", "s": "x2", "score": 9},
+            {"t": "a", "s": "x3", "score": 1},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$t",
+                        "top2": {"$topN": {"n": 2, "sortBy": {"score": -1}, "output": "$s"}},
+                        "bot2": {"$bottomN": {"n": 2, "sortBy": {"score": 1}, "output": "$s"}},
+                        "hi": {"$top": {"sortBy": {"score": -1}, "output": "$s"}},
+                        "lo": {"$bottom": {"sortBy": {"score": -1}, "output": "$s"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"_id": "a", "top2": ["x2", "x1"], "bot2": ["x1", "x2"], "hi": "x2", "lo": "x3"}]
+
+
+def test_aggregate_group_nelem_accumulators(coll) -> None:
+    # Group values in doc order: 3, 1, null, 5, 2. $firstN/$lastN keep the null;
+    # $maxN/$minN drop it (matched to mongod).
+    coll.insert_many(
+        [
+            {"g": "a", "v": 3},
+            {"g": "a", "v": 1},
+            {"g": "a", "v": None},
+            {"g": "a", "v": 5},
+            {"g": "a", "v": 2},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$g",
+                        "first3": {"$firstN": {"n": 3, "input": "$v"}},
+                        "last2": {"$lastN": {"n": 2, "input": "$v"}},
+                        "max2": {"$maxN": {"n": 2, "input": "$v"}},
+                        "min2": {"$minN": {"n": 2, "input": "$v"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [
+        {"_id": "a", "first3": [3, 1, None], "last2": [5, 2], "max2": [5, 3], "min2": [1, 2]}
+    ]
+
+
+def test_aggregate_group_stddev(coll) -> None:
+    # Values 2,4,6: population variance (4+0+4)/3 -> stdDevPop sqrt(8/3);
+    # sample variance 8/2 = 4 -> stdDevSamp 2.0.
+    coll.insert_many([{"g": "x", "v": 2}, {"g": "x", "v": 4}, {"g": "x", "v": 6}])
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$g",
+                        "pop": {"$stdDevPop": "$v"},
+                        "samp": {"$stdDevSamp": "$v"},
+                    }
+                }
+            ]
+        )
+    )
+    assert out[0]["pop"] == (8.0 / 3.0) ** 0.5
+    assert out[0]["samp"] == 2.0
+
+
+def test_aggregate_group_merge_objects(coll) -> None:
+    # $mergeObjects as a $group accumulator merges each operand doc across the
+    # group (later keys override earlier); null/missing operands are skipped; an
+    # all-missing group still yields {}.
+    coll.insert_many(
+        [
+            {"g": "x", "sub": {"a": 1, "b": 1}},
+            {"g": "x", "sub": {"b": 2, "c": 3}},  # b overrides, c adds
+            {"g": "x"},  # missing sub -> skipped
+            {"g": "x", "sub": None},  # null sub -> skipped
+            {"g": "y"},  # whole group missing/null -> {}
+        ]
+    )
+    out = sorted(
+        coll.aggregate([{"$group": {"_id": "$g", "m": {"$mergeObjects": "$sub"}}}]),
+        key=lambda d: d["_id"],
+    )
+    assert out == [
+        {"_id": "x", "m": {"a": 1, "b": 2, "c": 3}},
+        {"_id": "y", "m": {}},
+    ]
+
+
 def test_aggregate_unwind_stage(coll) -> None:
     coll.insert_one({"_id": 1, "tags": ["a", "b", "c"]})
     out = list(coll.aggregate([{"$unwind": "$tags"}]))
@@ -592,6 +1277,23 @@ def test_aggregate_group_with_avg(coll) -> None:
         key=lambda d: d["_id"],
     )
     assert out == [{"_id": "a", "avg": 3.0}, {"_id": "b", "avg": 10.0}]
+
+
+def test_aggregate_push_addtoset_skip_missing(coll) -> None:
+    """$push / $addToSet skip a missing field value (mongod semantics), keep null."""
+    coll.insert_many(
+        [
+            {"_id": 1, "g": "a", "s": "x"},
+            {"_id": 2, "g": "a"},  # missing s -> skipped
+            {"_id": 3, "g": "a", "s": None},  # explicit null -> kept
+            {"_id": 4, "g": "a", "s": "x"},
+        ]
+    )
+    out = list(coll.aggregate([{"$group": {"_id": "$g", "p": {"$push": "$s"}}}]))
+    assert out == [{"_id": "a", "p": ["x", None, "x"]}]
+    out2 = list(coll.aggregate([{"$group": {"_id": "$g", "v": {"$addToSet": "$s"}}}]))
+    v = out2[0]["v"]
+    assert sorted(x for x in v if x is not None) == ["x"] and None in v
 
 
 def test_aggregate_replace_root(coll) -> None:
@@ -805,6 +1507,46 @@ def test_create_index_with_explicit_name_and_compound(coll) -> None:
     coll.create_index([("a", 1), ("b", -1)], name="ab_idx")
     found = next(i for i in coll.list_indexes() if i["name"] == "ab_idx")
     assert dict(found["key"]) == {"a": 1, "b": -1}
+
+
+def test_create_index_same_name_different_key_conflicts(coll) -> None:
+    """Re-creating an index name with a different key spec is rejected with
+    IndexKeySpecsConflict (86), matching mongod. mongo-cxx-driver's
+    `create_index tests/fails` and `index_view/fails for same name` pin this."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"a": 1})
+    coll.create_index([("a", 1)], name="myIndex")
+    with pytest.raises(OperationFailure) as exc:
+        coll.create_index([("a", -1)], name="myIndex")
+    assert exc.value.code == 86
+    assert exc.value.details.get("codeName") == "IndexKeySpecsConflict"
+
+
+def test_create_index_same_name_different_options_conflicts(coll) -> None:
+    """Same name + same key but different options → IndexOptionsConflict (85)."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"b": 1})
+    coll.create_index([("b", 1)], name="b_idx")
+    with pytest.raises(OperationFailure) as exc:
+        coll.create_index([("b", 1)], name="b_idx", unique=True)
+    assert exc.value.code == 85
+    assert exc.value.details.get("codeName") == "IndexOptionsConflict"
+
+
+def test_create_index_identical_recreate_is_noop(coll) -> None:
+    """Re-creating an identical index (same key, name, options) is a no-op:
+    the createIndexes reply carries `note: "all indexes already exist"` and the
+    index count is unchanged — drivers (mongocxx's `fails for same keys and
+    options`) report it as "already exists" rather than a fresh create."""
+    coll.insert_one({"a": 1})
+    coll.create_index([("a", 1)], name="a_1")
+    reply = coll.database.command(
+        "createIndexes", coll.name, indexes=[{"key": {"a": 1}, "name": "a_1"}]
+    )
+    assert reply["note"] == "all indexes already exist"
+    assert reply["numIndexesBefore"] == reply["numIndexesAfter"]
 
 
 def test_unique_index_blocks_duplicate_insert_via_pymongo(coll) -> None:
@@ -1300,6 +2042,41 @@ def test_projection_elem_match_first_match(coll) -> None:
     coll.insert_one({"_id": 1, "items": [{"qty": 1}, {"qty": 5}, {"qty": 10}]})
     doc = coll.find_one({}, {"items": {"$elemMatch": {"qty": {"$gte": 5}}}})
     assert doc == {"_id": 1, "items": [{"qty": 5}]}
+
+
+def test_projection_positional_operator(coll) -> None:
+    coll.insert_many(
+        [
+            {"_id": 1, "items": [{"k": "a", "n": 1}, {"k": "b", "n": 2}, {"k": "c", "n": 3}]},
+            {"_id": 2, "items": [{"k": "b", "n": 5}, {"k": "b", "n": 6}]},
+        ]
+    )
+    # The query predicate on the array selects the first matching element.
+    out = sorted(coll.find({"items.k": "b"}, {"items.$": 1}), key=lambda d: d["_id"])
+    assert out == [
+        {"_id": 1, "items": [{"k": "b", "n": 2}]},
+        {"_id": 2, "items": [{"k": "b", "n": 5}]},
+    ]
+
+
+def test_projection_positional_scalar_and_elemmatch(coll) -> None:
+    coll.insert_one({"_id": 1, "nums": [1, 5, 10, 15]})
+    assert coll.find_one({"nums": {"$gte": 10}}, {"nums.$": 1}) == {"_id": 1, "nums": [10]}
+    coll.replace_one({"_id": 1}, {"_id": 1, "items": [{"n": 1}, {"n": 9}]})
+    got = coll.find_one({"items": {"$elemMatch": {"n": {"$gt": 5}}}}, {"items.$": 1})
+    assert got == {"_id": 1, "items": [{"n": 9}]}
+
+
+def test_projection_positional_errors(coll) -> None:
+    coll.insert_one({"_id": 1, "items": [{"k": "b"}], "nums": [1, 2]})
+    # >1 positional (validated at parse time — errors even with zero matches).
+    with pytest.raises(pymongo.errors.OperationFailure) as e1:
+        list(coll.find({"items.k": "zzz", "nums": 999}, {"items.$": 1, "nums.$": 1}))
+    assert e1.value.code == 31276
+    # Positional array not referenced by the query.
+    with pytest.raises(pymongo.errors.OperationFailure) as e2:
+        list(coll.find({"_id": 1}, {"items.$": 1}))
+    assert e2.value.code == 51246
 
 
 def test_explain_find_returns_query_planner(coll) -> None:
@@ -2092,9 +2869,11 @@ def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
     # `Database.command()` returns the raw doc rather than raising — check
     # the wce directly on the reply.
     db = client["wc_unsat_db"]
-    # `create` with w:4000 — collection IS created (the op runs), reply
-    # carries writeConcernError.
-    reply = db.command({"create": "things", "writeConcern": {"w": 4000}})
+    # `create` with w:2 — within mongod's 0..50 parse range but unsatisfiable
+    # on our single-node replica set: the collection IS created (the op runs)
+    # and the reply carries writeConcernError. (w above 50 is a *parse* error
+    # instead — see test_write_concern_w_above_50_is_parse_error.)
+    reply = db.command({"create": "things", "writeConcern": {"w": 2}})
     assert reply["ok"] == 1.0
     wce = reply.get("writeConcernError")
     assert wce is not None, f"expected writeConcernError, got {reply!r}"
@@ -2102,8 +2881,8 @@ def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
     assert wce["codeName"] == "CannotSatisfyWriteConcern"
     assert "things" in db.list_collection_names()
 
-    # `drop` with w:4000 — same shape: op runs, wce attached.
-    reply = db.command({"drop": "things", "writeConcern": {"w": 4000}})
+    # `drop` with w:2 — same shape: op runs, wce attached.
+    reply = db.command({"drop": "things", "writeConcern": {"w": 2}})
     assert reply["ok"] == 1.0
     assert reply.get("writeConcernError", {}).get("code") == 100
     assert "things" not in db.list_collection_names()
@@ -2119,6 +2898,41 @@ def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
     assert reply["ok"] == 1.0
     assert "writeConcernError" not in reply
     assert "majority_things" in db.list_collection_names()
+
+
+def test_write_concern_w_above_50_is_parse_error(client: MongoClient) -> None:
+    """A numeric ``writeConcern.w`` above 50 (mongod's max voting-member count)
+    is rejected at *parse* time with FailedToParse (9) — a top-level command
+    error, not a ``writeConcernError`` attached to a success. This is the C
+    driver's ``assert_wc_oob_error`` shape (server >= 4.3.3) that mongo-c-driver's
+    /Collection/{drop,rename,index} + /Database/drop assert for ``w: 99``."""
+    from pymongo.errors import OperationFailure
+
+    db = client["wc_oob_db"]
+    db.command({"create": "c"})
+
+    def assert_oob(cmd: dict) -> None:
+        with pytest.raises(OperationFailure) as exc:
+            db.command(cmd)
+        assert exc.value.code == 9, f"{cmd}: expected code 9, got {exc.value.code}"
+        assert "not greater than 50" in str(exc.value)
+
+    assert_oob(
+        {
+            "createIndexes": "c",
+            "indexes": [{"key": {"a": 1}, "name": "a_1"}],
+            "writeConcern": {"w": 99},
+        }
+    )
+    assert_oob({"renameCollection": "wc_oob_db.c", "to": "wc_oob_db.c2", "writeConcern": {"w": 99}})
+    assert_oob({"drop": "c2", "writeConcern": {"w": 99}})
+    assert_oob({"dropDatabase": 1, "writeConcern": {"w": 99}})
+    # Boundary: w == 50 is valid (parse-OK), so it's the unsatisfiable path, not
+    # a parse error — a success with a writeConcernError, not an OperationFailure.
+    db.command({"create": "fifty"})
+    reply = db.command({"drop": "fifty", "writeConcern": {"w": 50}})
+    assert reply["ok"] == 1.0
+    assert reply.get("writeConcernError", {}).get("code") == 100
 
 
 def test_unacknowledged_writes_do_not_desync_connection(server: SecantusDBServer) -> None:
@@ -2409,6 +3223,48 @@ def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None
         cur.close()
 
 
+def test_tailable_await_filter_applies_to_follow_up_inserts(client: MongoClient) -> None:
+    """The tailable producer must re-apply the find filter to docs inserted
+    after the find — not just to firstBatch. Regression for the libmongoc
+    ``/Collection/tailable/timeout/single`` failure: a TAILABLE_AWAIT cursor
+    with a filter matching nothing was surfacing every later (and existing)
+    doc, because the producer returned scanned rows unfiltered."""
+    db = client["tail_filter_db"]
+    db.tailcap.drop()
+    db.create_collection("tailcap", capped=True, size=64 * 1024)
+    db.tailcap.insert_one({"x": 1})  # does NOT match {a: 1}
+
+    cur = db.tailcap.find(
+        {"a": 1},
+        cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+        batch_size=10,
+    ).max_await_time_ms(100)
+
+    # No matching doc exists yet — the cursor must yield nothing and stay alive.
+    with pytest.raises(StopIteration):
+        cur.next()
+
+    # A non-matching insert must remain invisible.
+    db.tailcap.insert_one({"x": 2})
+    with pytest.raises(StopIteration):
+        cur.next()
+
+    # A matching insert must surface.
+    db.tailcap.insert_one({"a": 1, "tag": "hit"})
+    found = None
+    deadline = dt.datetime.now() + dt.timedelta(seconds=5)
+    while found is None and dt.datetime.now() < deadline:
+        try:
+            found = cur.next()
+        except StopIteration:
+            continue
+    assert found is not None and found.get("tag") == "hit", (
+        f"tailable filter did not surface the matching insert, got {found!r}"
+    )
+    with contextlib.suppress(Exception):
+        cur.close()
+
+
 def test_tailable_capped_rollover_kills_cursor(client: MongoClient) -> None:
     """When a capped collection rolls over and evicts the document a tailable
     cursor is anchored on, mongod kills the cursor with CappedPositionLost
@@ -2432,6 +3288,93 @@ def test_tailable_capped_rollover_kills_cursor(client: MongoClient) -> None:
     assert cursor.to_list() == []
     assert cursor.alive is False
     assert db.cap.count_documents({}) == 3
+
+
+def test_tailable_drop_returns_collection_dropped(client: MongoClient) -> None:
+    """Dropping a capped collection out from under a tailable cursor makes the
+    next getMore fail with QueryPlanKilled (175) and a "collection dropped"
+    message — what mongod surfaces to a tailing client. mongo-php-driver's
+    cursor-tailable_error-001 asserts the message mentions "collection
+    dropped"; a bare CursorNotFound (which non-tailable cursors still get)
+    would not satisfy it. Tested at the command level because pymongo's
+    high-level cursor swallows 175 as a clean tailable close (see the
+    companion test below)."""
+    db = client["tail_drop_db"]
+    db.cap.drop()
+    db.create_collection("cap", capped=True, size=1024 * 1024)
+    db.cap.insert_many([{"_id": i} for i in (1, 2, 3)])
+
+    res = db.command("find", "cap", filter={}, tailable=True, batchSize=2)
+    cid = res["cursor"]["id"]
+    assert cid != 0
+
+    db.command("drop", "cap")
+
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        db.command("getMore", cid, collection="cap")
+    assert exc.value.code == 175, f"want QueryPlanKilled(175), got {exc.value.code}"
+    assert "collection dropped" in str(exc.value)
+
+    # A NON-tailable cursor whose collection is dropped still gets the plain
+    # CursorNotFound (43) — mongo-c-driver's error_document/getmore depends
+    # on it, so the tailable special-case must not bleed into regular cursors.
+    db.reg.drop()
+    db.reg.insert_many([{"_id": i} for i in range(5)])
+    res2 = db.command("find", "reg", filter={}, batchSize=2)
+    cid2 = res2["cursor"]["id"]
+    db.command("drop", "reg")
+    with pytest.raises(pymongo.errors.OperationFailure) as exc2:
+        db.command("getMore", cid2, collection="reg")
+    assert exc2.value.code == 43, f"want CursorNotFound(43), got {exc2.value.code}"
+
+
+def test_tailable_drop_closes_pymongo_cursor_cleanly(client: MongoClient) -> None:
+    """pymongo lists 175 (QueryPlanKilled) in ``_CURSOR_CLOSED_ERRORS``, so a
+    high-level TAILABLE cursor whose collection is dropped simply stops
+    iterating (``alive`` False) rather than raising — the server still emits
+    the 175 the wire test above asserts; this pins the driver-visible
+    behaviour."""
+    db = client["tail_drop_clean_db"]
+    db.cap.drop()
+    db.create_collection("cap", capped=True, size=1024 * 1024)
+    db.cap.insert_many([{"_id": i} for i in (1, 2, 3)])
+
+    cursor = db.cap.find(cursor_type=pymongo.CursorType.TAILABLE).max_await_time_ms(50)
+    drained = [cursor.next()["_id"] for _ in range(3)]
+    assert drained == [1, 2, 3]
+
+    db.command("drop", "cap")
+    assert cursor.to_list() == []
+    assert cursor.alive is False
+
+
+def test_atlas_search_index_commands_rejected(client: MongoClient) -> None:
+    """Atlas Search index management is Atlas-only. A non-Atlas mongod rejects
+    the createSearchIndexes / updateSearchIndex / dropSearchIndex commands and
+    the $listSearchIndexes aggregation stage with an error naming Atlas — the
+    mongo-c-driver /index-management/{list,drop,update}SearchIndex tests assert
+    the error mentions "Atlas". Previously these surfaced as CommandNotFound /
+    unrecognized-stage, neither containing "Atlas"."""
+    db = client["atlas_search_db"]
+    db.coll.insert_one({"x": 1})
+
+    # $listSearchIndexes aggregation stage.
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        list(db.coll.aggregate([{"$listSearchIndexes": {}}]))
+    assert "Atlas" in str(exc.value)
+
+    # The three search-index management commands.
+    for cmd in (
+        {"createSearchIndexes": "coll", "indexes": [{"name": "i", "definition": {}}]},
+        {"updateSearchIndex": "coll", "name": "i", "definition": {}},
+        {"dropSearchIndex": "coll", "name": "i"},
+    ):
+        with pytest.raises(pymongo.errors.OperationFailure) as exc:
+            db.command(cmd)
+        assert "Atlas" in str(exc.value), f"{next(iter(cmd))} error missing 'Atlas'"
+
+    # A normal aggregation is unaffected.
+    assert list(db.coll.aggregate([{"$match": {"x": 1}}, {"$project": {"_id": 0}}])) == [{"x": 1}]
 
 
 # --- local.oplog.rs wire-surface (pymongo-driven) -------------------------
@@ -3005,3 +3948,155 @@ def test_exhaust_midstream_getmore_fault_terminates_cleanly(coll, monkeypatch) -
 
     # The connection survives — a fresh command on the same client works.
     assert coll.count_documents({}) == 5
+
+
+def test_json_schema_unique_items_find(coll) -> None:
+    """`$jsonSchema` with `uniqueItems: true` over the wire: only docs whose
+    array field has all-distinct elements match."""
+    coll.insert_many(
+        [
+            {"_id": 1, "tags": ["a", "b", "c"]},  # unique -> matches
+            {"_id": 2, "tags": ["a", "b", "a"]},  # duplicate -> no match
+            {"_id": 3, "tags": [1, 1.0]},  # cross-type-equal numeric -> no match
+            {"_id": 4, "tags": []},  # empty -> matches
+        ]
+    )
+    schema = {"$jsonSchema": {"properties": {"tags": {"bsonType": "array", "uniqueItems": True}}}}
+    got = sorted(d["_id"] for d in coll.find(schema))
+    assert got == [1, 4]
+
+
+def test_json_schema_unique_items_nested_crosstype(coll) -> None:
+    """`uniqueItems` value equality bridges cross-type-equal numerics even
+    inside nested sub-documents ({a:1} == {a:1.0}), matching real mongod."""
+    coll.insert_many(
+        [
+            {"_id": 1, "arr": [{"a": 1}, {"a": 1.0}]},  # cross-type dup -> no match
+            {"_id": 2, "arr": [{"a": 1}, {"a": 2}]},  # distinct -> matches
+            {"_id": 3, "arr": [1, 1.0]},  # top-level cross-type dup -> no match
+            {"_id": 4, "arr": [1, 2]},  # distinct -> matches
+            {"_id": 5, "arr": [{"a": 1}, {"a": 1}]},  # exact dup -> no match
+        ]
+    )
+    schema = {"$jsonSchema": {"properties": {"arr": {"uniqueItems": True}}}}
+    got = sorted(d["_id"] for d in coll.find(schema))
+    assert got == [2, 4]
+
+
+def test_unknown_expression_operator_error_codes(coll) -> None:
+    """An unrecognized aggregation-expression operator reports mongod's
+    context-specific error code: 168 InvalidPipelineOperator inside a query
+    ``$expr``; Location31325 inside a ``$project``. Verified against mongod 6.0."""
+    import pymongo
+
+    coll.insert_one({"_id": 1, "a": 5})
+    with pytest.raises(pymongo.errors.OperationFailure) as expr_exc:
+        list(coll.find({"$expr": {"$notreal": [1, 2]}}))
+    assert expr_exc.value.code == 168
+    assert "Unrecognized expression '$notreal'" in expr_exc.value.details["errmsg"]
+
+    with pytest.raises(pymongo.errors.OperationFailure) as proj_exc:
+        list(coll.aggregate([{"$project": {"y": {"$notreal": ["$a"]}}}]))
+    assert proj_exc.value.code == 31325
+    assert "Unknown expression $notreal" in proj_exc.value.details["errmsg"]
+
+
+def test_view_reads_resolve_the_pipeline(client: MongoClient) -> None:
+    """find / aggregate / count on a view resolve the view's pipeline against its
+    base collection (previously they returned nothing). Covers filtering, sort,
+    skip, limit, projection, and a view defined on another view."""
+    db = client["view_reads"]
+    db.src.insert_many([{"_id": i, "a": i % 3, "v": i} for i in range(9)])
+    db.command("create", "vw", viewOn="src", pipeline=[{"$match": {"a": 1}}])
+
+    # find over the view (a == 1 → _ids 1, 4, 7)
+    assert sorted(d["_id"] for d in db.vw.find({})) == [1, 4, 7]
+    assert sorted(d["_id"] for d in db.vw.find({"v": {"$gt": 3}})) == [4, 7]
+    assert [d["_id"] for d in db.vw.find({}).sort("_id", -1).limit(2)] == [7, 4]
+    assert [d["_id"] for d in db.vw.find({}).sort("_id", 1).skip(1)] == [4, 7]
+    assert db.vw.find_one({"_id": 4}, {"v": 1, "_id": 0}) == {"v": 4}
+
+    # aggregate + count over the view
+    assert [d["_id"] for d in db.vw.aggregate([{"$sort": {"_id": 1}}])] == [1, 4, 7]
+    assert db.vw.count_documents({}) == 3
+    assert db.vw.count_documents({"v": {"$gt": 3}}) == 2
+
+    # a view defined on another view resolves recursively
+    db.command("create", "vw2", viewOn="vw", pipeline=[{"$match": {"v": {"$gt": 3}}}])
+    assert sorted(d["_id"] for d in db.vw2.find({})) == [4, 7]
+    assert db.vw2.count_documents({}) == 2
+
+
+def test_push_addtoset_each_modifiers(coll) -> None:
+    """`$push` / `$addToSet` `$each` (with `$position` / `$slice` / `$sort`) append
+    multiple elements, previously the `$each` doc was stored as a single element."""
+    coll.insert_one({"_id": 1, "a": [3, 1, 2]})
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [5, 4]}}})
+    assert coll.find_one({"_id": 1})["a"] == [3, 1, 2, 5, 4]
+
+    coll.update_one({"_id": 1}, {"$set": {"a": [3, 1, 2]}})
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [5, 4], "$sort": 1}}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 2, 3, 4, 5]
+
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, 2, 3]}})
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [9], "$slice": -2}}})
+    assert coll.find_one({"_id": 1})["a"] == [3, 9]
+
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, 2, 3]}})
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [9, 8], "$position": 1}}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 9, 8, 2, 3]
+
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, 2]}})
+    coll.update_one({"_id": 1}, {"$addToSet": {"a": {"$each": [2, 3, 3, 4]}}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 2, 3, 4]
+
+    # plain (non-$each) push/addToSet unchanged
+    coll.update_one({"_id": 1}, {"$set": {"a": [1]}})
+    coll.update_one({"_id": 1}, {"$push": {"a": 7}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 7]
+
+
+def test_update_bit_multiple_ops(coll) -> None:
+    """`$bit` applies multiple operations to a field in order (mongod semantics)."""
+    coll.insert_one({"_id": 1, "n": 0b1100})
+    coll.update_one({"_id": 1}, {"$bit": {"n": {"and": 0b1010, "or": 0b0001}}})
+    assert coll.find_one({"_id": 1})["n"] == 0b1001  # (0b1100 & 0b1010) | 0b0001
+
+
+def test_update_min_max_cross_type(coll) -> None:
+    """`$min`/`$max` compare by BSON cross-type order (no server-side crash on a
+    string-vs-number compare); a missing field is set, explicit null is a value."""
+    coll.insert_one({"_id": 1, "a": 5})
+    coll.update_one({"_id": 1}, {"$max": {"a": "str"}})  # string > number
+    assert coll.find_one({"_id": 1})["a"] == "str"
+    coll.update_one({"_id": 1}, {"$set": {"a": 5}})
+    coll.update_one({"_id": 1}, {"$min": {"a": "str"}})  # number < string -> keep 5
+    assert coll.find_one({"_id": 1})["a"] == 5
+    # Explicit null vs number.
+    coll.update_one({"_id": 1}, {"$set": {"a": None}})
+    coll.update_one({"_id": 1}, {"$min": {"a": 9}})  # null < 9 -> keep null
+    assert coll.find_one({"_id": 1})["a"] is None
+
+
+def test_pull_predicate_and_pullall(coll) -> None:
+    """`$pull` with a query predicate / sub-document criterion, and `$pullAll`."""
+    coll.insert_one({"_id": 1, "a": [1, 5, 10, 15]})
+    coll.update_one({"_id": 1}, {"$pull": {"a": {"$gte": 10}}})
+    assert coll.find_one({"_id": 1})["a"] == [1, 5]
+
+    coll.update_one(
+        {"_id": 1},
+        {"$set": {"a": [{"x": 1, "y": "a"}, {"x": 5, "y": "b"}, {"x": 9, "y": "c"}]}},
+    )
+    coll.update_one({"_id": 1}, {"$pull": {"a": {"x": {"$gte": 5}}}})
+    assert coll.find_one({"_id": 1})["a"] == [{"x": 1, "y": "a"}]
+
+    # query eq: bool is type-distinct from int (keeps True); 1 == 1.0 numerically.
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, True, 2]}})
+    coll.update_one({"_id": 1}, {"$pull": {"a": 1}})
+    assert coll.find_one({"_id": 1})["a"] == [True, 2]
+
+    # $pullAll removes every listed value by literal equality.
+    coll.update_one({"_id": 1}, {"$set": {"a": [1, 2, 3, 2, 1]}})
+    coll.update_one({"_id": 1}, {"$pullAll": {"a": [1, 2]}})
+    assert coll.find_one({"_id": 1})["a"] == [3]

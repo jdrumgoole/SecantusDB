@@ -88,24 +88,35 @@ validation → cursor `min()`/`max()` index bounds. Also **closed issue #57**
 
 ## Next steps (in priority order)
 
+**Status 2026-06-24:** pymongo gauge now **99.1% (1019 pass / 9 fail / 475 skip)**.
+Items 2–4 below (the old "correctness trio": `test_options`,
+`test_estimated_document_count`, `test_update_one_pipeline`) were **fixed in a
+later slice and verified green** — `test_bulk.py` is 100% and `test_collection.py`'s
+only fails are `test_index_hashed` / `test_index_text` (out of scope). Removed
+from the list. The **entire remaining pymongo tail is out-of-scope or the
+coordinated change-stream block** — there is no clean self-contained correctness
+fix left in the pymongo gauge. The 9 fails:
+  - `test_change_stream.py::...::test_split_large_change` — >16 MB event splitting (item 1 below).
+  - `test_collection.py::test_index_hashed` / `test_index_text` — hashed/text indexes (out of scope, CLAUDE.md).
+  - `test_cursor.py::test_maxtime_ms_message` / `test_to_list_csot_applied` — pymongo client-side CSOT/error-msg (out of scope).
+  - `test_cursor.py::test_where` — `$where` needs a JS runtime (out of scope).
+  - 3× `test_transactions_unified.py` `*secondary*readPreference*` — single-node topology inherent (intentional).
+
 1. **Quick fresh diagnosis first** — bucket `.validation/raw-rust-server.json`
    failures (exclude change-stream + txn/topology/csot out-of-scope) to re-pick,
    since the mix shifts each slice. (Pattern used this session: a throwaway
-   Python script over the json grouping by error signature.)
-2. **`test_options`** — `listCollections` doesn't report capped options
-   (`{capped, size}`) that `create` already stores. Small handler fix in
-   `admin.rs::list_collections`. (~1 test)
-3. **`test_estimatedDocumentCount`** — wrong count (`2 != 0`). (~1–2)
-4. **`test_UpdateOne_using_pipelines`** — pipeline-update result mismatch (~2,
-   data-correctness).
-5. **Change-stream cluster (~28 fails — the biggest remaining block)** — but it's
+   Python script over the json grouping by error signature.) For higher leverage
+   than pymongo (which is at its ceiling), re-bucket the **other-driver** gauges
+   (C 96.9%, Node 96.9%, Ruby 95.9%, PHP-lib 97.4%) — that's where non-shared,
+   non-intentional rust-only fails are most likely to still exist.
+2. **Change-stream cluster (~28 fails — the biggest remaining block)** — but it's
    the parallel session's domain and feature-heavy. Root causes already found +
    recorded in `tasks/backlog.md`: DDL events not emitted for `showExpandedEvents`
    (createIndexes/dropIndexes/collMod write no oplog `c`), and `test_split_large_change`
    (>16 MB event, no real splitting). **Coordinate with the Python session** before
    touching this — don't do it unilaterally.
-6. Out of reach / features: `$where` (JS), `test_maxtime_ms_message` (error-msg
-   format), tailable cursors on capped collections, clustered indexes.
+3. Out of reach / features: `$where` (JS), `test_maxtime_ms_message` (error-msg
+   format), tailable cursors on capped collections, hashed/text indexes.
 
 ## Canonical references
 

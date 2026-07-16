@@ -23,14 +23,33 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import secantus
 from validation_summary import expected_failures as ef_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _secantus_version() -> str:
+    """The Python-server version, without requiring the built package.
+
+    ``import secantus`` pulls in the compiled ``wiredtiger`` module via
+    ``secantus.server`` — fine in a synced dev venv, but the weekly
+    workflow's aggregate job regenerates this summary on a bare runner
+    where building WiredTiger just to read ``__version__`` would cost
+    minutes. Fall back to parsing the assignment out of the source.
+    """
+    try:
+        import secantus
+
+        return secantus.__version__
+    except Exception:
+        src = (REPO_ROOT / "src" / "secantus" / "__init__.py").read_text()
+        m = re.search(r'__version__\s*=\s*"([^"]+)"', src)
+        return m.group(1) if m else "unknown"
 
 
 @dataclass
@@ -79,17 +98,43 @@ class GaugeStats:
         return f"{(self.passed / adj_ran * 100):.1f}%"
 
 
+def _gitlink_sha(rel: str) -> str:
+    """The submodule SHA pinned in the superproject tree (``git ls-tree``)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "ls-tree", "HEAD", f"vendor/{rel}"],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+            timeout=10,
+            check=True,
+        ).stdout.split()
+        # "<mode> commit <sha>\tvendor/<rel>"
+        if len(out) >= 3 and out[1] == "commit":
+            return out[2][:12]
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _read_submodule_head(rel: str) -> str:
     """Resolve the HEAD SHA of a vendored submodule (truncated).
 
     Follows ``HEAD`` even when it's a symbolic ref into ``refs/heads/``
     so that submodules pinned to a branch tip (e.g. ``ref: refs/heads/
     main``) still report a SHA rather than the literal ref string.
+
+    When the submodule isn't checked out (the weekly workflow's aggregate
+    job does a plain non-recursive checkout), fall back to the gitlink SHA
+    recorded in the superproject's tree via ``git ls-tree`` — that's the
+    pinned SHA regardless of working-tree state.
     """
     head_file = REPO_ROOT / "vendor" / rel / ".git"
     try:
         if not head_file.is_file():
-            return "unknown"
+            return _gitlink_sha(rel)
         gitdir_str = head_file.read_text().strip().removeprefix("gitdir: ")
         # The ``gitdir`` line is relative to the submodule directory.
         gitdir = (REPO_ROOT / "vendor" / rel / gitdir_str).resolve()
@@ -174,6 +219,45 @@ def _collect_pymongo(raw_dir: Path) -> GaugeStats | None:
         skipped=skipped,
         failure_descriptions=failure_descs,
         note="curated server-touching pytest paths under vendor/pymongo-tests/test/",
+    )
+
+
+def _collect_pymongo_async(raw_dir: Path) -> GaugeStats | None:
+    """Read the async gauge's ``pytest-json-report`` output
+    (``.validation/pymongo-async-raw.json``) — pymongo's native
+    ``AsyncMongoClient`` suite, same repo and non-server-file filter as the
+    sync gauge."""
+    f = raw_dir / "pymongo-async-raw.json"
+    if not f.exists():
+        return None
+    raw = json.loads(f.read_text())
+
+    def _is_server_test(nodeid: str) -> bool:
+        return nodeid.split("::")[0].split("/")[-1] not in _PYMONGO_NON_SERVER_FILES
+
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for t in raw.get("tests", []):
+        if not _is_server_test(t.get("nodeid", "")):
+            continue
+        o = t.get("outcome")
+        if o == "passed":
+            passed += 1
+        elif o in ("failed", "error"):
+            failed += 1
+            failure_descs.append(t["nodeid"])
+        elif o == "skipped":
+            skipped += 1
+    passed += raw.get("summary", {}).get("subtests passed", 0)
+    return GaugeStats(
+        name="pymongo (async)",
+        language="Python",
+        driver_version=_read_submodule_head("pymongo-tests"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="AsyncMongoClient suite under vendor/pymongo-tests/test/asynchronous/",
     )
 
 
@@ -335,6 +419,43 @@ def _collect_java(raw_dir: Path) -> GaugeStats | None:
     )
 
 
+def _collect_kotlin(raw_dir: Path) -> GaugeStats | None:
+    """Walk JUnit XML output (``.validation/kotlin-results/<module>/TEST-*.xml``).
+
+    The Kotlin driver ships inside the mongo-java-driver monorepo
+    (``:driver-kotlin-sync:integrationTest``), so the driver version is the
+    same vendored submodule's HEAD.
+    """
+    xml_dir = raw_dir / "kotlin-results"
+    if not xml_dir.is_dir():
+        return None
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for xml in xml_dir.rglob("TEST-*.xml"):
+        try:
+            root = ET.parse(xml).getroot()
+        except ET.ParseError:
+            continue
+        for case in root.iter("testcase"):
+            if case.find("failure") is not None or case.find("error") is not None:
+                failed += 1
+                failure_descs.append(case.attrib.get("name", ""))
+            elif case.find("skipped") is not None:
+                skipped += 1
+            else:
+                passed += 1
+    return GaugeStats(
+        name="mongo-kotlin-driver",
+        language="Kotlin",
+        driver_version=_read_submodule_head("mongo-java-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="driver-kotlin-sync integrationTest (ships in the mongo-java-driver monorepo)",
+    )
+
+
 def _collect_rust(raw_dir: Path) -> GaugeStats | None:
     """Read the rust gauge's parsed cargo output (``.validation/rust-raw.json``)."""
     f = raw_dir / "rust-raw.json"
@@ -461,15 +582,127 @@ def _collect_php_lib(raw_dir: Path) -> GaugeStats | None:
     )
 
 
+def _collect_c(raw_dir: Path) -> GaugeStats | None:
+    """Read ``test-libmongoc`` JSON (``.validation/c-raw.json``).
+
+    Shape: ``{"results": [{"status": "pass"|"fail"|"skip", "test_file":
+    "/Suite/test", ...}, ...]}`` (see ``src/libmongoc/tests/TestSuite.c``).
+    """
+    f = raw_dir / "c-raw.json"
+    if not f.exists():
+        return None
+    # test-libmongoc's -F output isn't strictly valid JSON (trailing commas,
+    # possibly truncated); the gauge package's tolerant loader extracts the
+    # status/test_file pairs.
+    from c_validation import load_results
+
+    raw = load_results(f)
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for t in raw.get("results", []):
+        status = (t.get("status") or "").lower()
+        if status == "pass":
+            passed += 1
+        elif status == "fail":
+            failed += 1
+            failure_descs.append(t.get("test_file", ""))
+        elif status == "skip":
+            skipped += 1
+    return GaugeStats(
+        name="mongo-c-driver",
+        language="C",
+        driver_version=_read_submodule_head("mongo-c-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated test-libmongoc wire-protocol suites (CRUD / cursor / aggregate / command)",
+    )
+
+
+def _collect_cxx(raw_dir: Path) -> GaugeStats | None:
+    """Walk mongocxx's Catch2 JUnit XML (``.validation/cxx-raw.xml``)."""
+    f = raw_dir / "cxx-raw.xml"
+    if not f.exists():
+        return None
+    try:
+        root = ET.parse(f).getroot()
+    except ET.ParseError:
+        return None
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for case in root.iter("testcase"):
+        name = case.attrib.get("name", "")
+        if case.find("failure") is not None or case.find("error") is not None:
+            failed += 1
+            failure_descs.append(name)
+        elif case.find("skipped") is not None:
+            skipped += 1
+        else:
+            passed += 1
+    return GaugeStats(
+        name="mongo-cxx-driver",
+        language="C++",
+        driver_version=_read_submodule_head("mongo-cxx-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated mongocxx test_driver Catch2 suite (CRUD / cursor / aggregate / gridfs)",
+    )
+
+
+# TRX outcomes that are skips (vs Passed / failures).
+_TRX_NS = "{http://microsoft.com/schemas/VisualStudio/TeamTest/2010}"
+_TRX_SKIP = {"NotExecuted", "Inconclusive", "NotRunnable", "Pending", "Warning"}
+
+
+def _collect_dotnet(raw_dir: Path) -> GaugeStats | None:
+    """Read ``dotnet test`` TRX output (``.validation/dotnet-raw.trx``)."""
+    f = raw_dir / "dotnet-raw.trx"
+    if not f.exists():
+        return None
+    try:
+        root = ET.parse(f).getroot()
+    except ET.ParseError:
+        return None
+    passed = failed = skipped = 0
+    failure_descs: list[str] = []
+    for res in root.iter(f"{_TRX_NS}UnitTestResult"):
+        outcome = res.attrib.get("outcome", "")
+        if outcome == "Passed":
+            passed += 1
+        elif outcome in _TRX_SKIP:
+            skipped += 1
+        else:
+            failed += 1
+            failure_descs.append(res.attrib.get("testName", ""))
+    return GaugeStats(
+        name="mongo-csharp-driver",
+        language="C#",
+        driver_version=_read_submodule_head("mongo-csharp-driver"),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        failure_descriptions=failure_descs,
+        note="curated MongoDB.Driver.Tests CRUD specification suite (xUnit)",
+    )
+
+
 _COLLECTORS = (
     _collect_pymongo,
+    _collect_pymongo_async,
     _collect_java,
+    _collect_kotlin,
     _collect_go,
     _collect_node,
     _collect_ruby,
     _collect_rust,
     _collect_php_lib,
     _collect_php_ext,
+    _collect_c,
+    _collect_cxx,
+    _collect_dotnet,
 )
 
 # Gauge name -> its per-driver report page (relative to docs/). Used by the
@@ -483,6 +716,9 @@ _REPORT_LINKS = {
     "mongo-rust-driver": "./validation-report-rust.md",
     "mongo-php-library": "./validation-report-php-lib.md",
     "mongo-php-driver": "./validation-report-php-ext.md",
+    "mongo-c-driver": "./validation-report-c.md",
+    "mongo-cxx-driver": "./validation-report-cxx.md",
+    "mongo-csharp-driver": "./validation-report-dotnet.md",
 }
 
 
@@ -493,6 +729,7 @@ _EXPECTED_FAILURES_BY_GAUGE: dict[str, list[ef_module.ExpectedFailure]] = {
     "mongo-go-driver": ef_module.GO,
     "mongo-node-driver": ef_module.NODE,
     "mongo-ruby-driver": ef_module.RUBY,
+    "mongo-c-driver": ef_module.C,
 }
 
 
@@ -530,7 +767,7 @@ def render(raw_dir: Path, out_path: Path) -> None:
     md.append("# Cross-Driver Conformance Summary")
     md.append("")
     md.append(
-        f"Generated {dt.date.today().isoformat()} — SecantusDB {secantus.__version__}. "
+        f"Generated {dt.date.today().isoformat()} — SecantusDB {_secantus_version()}. "
         "Each per-driver gauge runs the driver vendor's own integration test suite "
         "(unmodified) against a SecantusDB daemon and emits its raw output to "
         f"`.validation/`. This summary normalises on **test count** so the {len(gauges)} gauges "

@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use bson::{Bson, Document};
 use secantus_commands::storage::{
-    ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, RawHint,
-    Storage as CmdStorage, StorageError, UpdateOutcome,
+    ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, IdKeyRows,
+    RawHint, Storage as CmdStorage, StorageError, UpdateOutcome,
 };
 use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
 use secantus_storage::{
@@ -112,6 +112,7 @@ impl CmdStorage for StorageAdapter {
         let mut events: Vec<Vec<u8>> = Vec::new();
         let mut new_position = after_seq;
         let mut invalidated = false;
+        let mut fatal: Option<(i32, String)> = None;
         for (seq, blob) in rows {
             // Always advance the position past a scanned entry, even when it
             // projects to nothing (noop heartbeats / other-scope writes) — that
@@ -119,7 +120,7 @@ impl CmdStorage for StorageAdapter {
             new_position = seq;
             let entry = Document::from_reader(&mut blob.as_slice())
                 .map_err(|e| StorageError::Internal(format!("oplog decode: {e}")))?;
-            let (event, invalidates) = changestreams::project(
+            let projected = changestreams::project(
                 seq,
                 &entry,
                 &self.inner,
@@ -127,23 +128,28 @@ impl CmdStorage for StorageAdapter {
                 &opts.full_document_before_change,
                 &wt_scope,
                 opts.show_expanded_events,
-            )
-            .map_err(map_err)?;
+            );
+            // A fatal projection error (e.g. fullDocument: required with
+            // changeStreamPreAndPostImages disabled) ends the stream with an
+            // ok: 0 reply rather than tearing down the poll — surface it via the
+            // batch so the producer/getMore can report it (code 280).
+            let (event, invalidates) = match projected {
+                Ok(v) => v,
+                Err(WtError::ChangeStreamFatal(m)) => {
+                    fatal = Some((280, m));
+                    break;
+                }
+                Err(e) => return Err(map_err(e)),
+            };
             if let Some(ev) = event {
-                let mut buf = Vec::new();
-                ev.to_writer(&mut buf)
-                    .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
-                events.push(buf);
+                push_event(&mut events, ev, opts.split_large_events)?;
                 if invalidates {
                     // An invalidating event (drop / rename / dropDatabase on the
                     // watched scope) is followed by a synthesized terminal
                     // `invalidate` event, then the cursor closes — mirroring
                     // `commands.py`'s producer (project → invalidate_event → break).
                     let inv = changestreams::invalidate_event(seq, &entry).map_err(map_err)?;
-                    let mut inv_buf = Vec::new();
-                    inv.to_writer(&mut inv_buf)
-                        .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
-                    events.push(inv_buf);
+                    push_event(&mut events, inv, opts.split_large_events)?;
                     invalidated = true;
                     break;
                 }
@@ -153,6 +159,7 @@ impl CmdStorage for StorageAdapter {
             events,
             new_position,
             invalidated,
+            fatal,
         })
     }
 
@@ -180,6 +187,12 @@ impl CmdStorage for StorageAdapter {
         changestreams::parse_resume_token(token).ok().map(|d| d.seq)
     }
 
+    fn resume_token_from_invalidate(&self, token: &Document) -> bool {
+        changestreams::parse_resume_token(token)
+            .map(|d| d.from_invalidate)
+            .unwrap_or(false)
+    }
+
     fn high_water_mark_token(&self, seq: i64) -> Vec<u8> {
         let ts = self.inner.peek_cluster_time().unwrap_or(bson::Timestamp {
             time: 0,
@@ -190,6 +203,7 @@ impl CmdStorage for StorageAdapter {
             ts,
             ns: String::new(),
             document_key: Document::new(),
+            from_invalidate: false,
         };
         match changestreams::make_resume_token(&data) {
             Ok(doc) => {
@@ -409,8 +423,23 @@ impl CmdStorage for StorageAdapter {
         self.inner.list_collections(db).map_err(map_err)
     }
 
+    fn list_databases(&self) -> Result<Vec<String>, StorageError> {
+        self.inner.list_databases().map_err(map_err)
+    }
+
     fn create_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
         self.inner.create_collection(db, coll).map_err(map_err)
+    }
+
+    fn create_collection_with_options(
+        &self,
+        db: &str,
+        coll: &str,
+        options: &Document,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .create_collection_with_options(db, coll, options)
+            .map_err(map_err)
     }
 
     fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
@@ -458,6 +487,10 @@ impl CmdStorage for StorageAdapter {
         self.inner
             .set_collection_options(db, coll, opts)
             .map_err(map_err)
+    }
+
+    fn coll_mod(&self, db: &str, coll: &str, opts: &Document) -> Result<(), StorageError> {
+        self.inner.coll_mod(db, coll, opts).map_err(map_err)
     }
 
     fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
@@ -509,8 +542,67 @@ impl CmdStorage for StorageAdapter {
         self.inner.drop_all_indexes(db, coll).map_err(map_err)
     }
 
+    fn set_index_options(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        opts: &Document,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .set_index_options(db, coll, name, opts)
+            .map_err(map_err)
+    }
+
+    fn find_index_duplicates(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Vec<Vec<Bson>>, StorageError> {
+        self.inner
+            .find_index_duplicates(db, coll, name)
+            .map_err(map_err)
+    }
+
     fn drop_database(&self, db: &str) -> Result<(), StorageError> {
         self.inner.drop_database(db).map_err(map_err)
+    }
+
+    fn create_archive(&self, output_path: &str) -> Result<(String, u64), StorageError> {
+        self.inner
+            .create_archive(output_path)
+            .map(|info| (info.path, info.size_bytes))
+            .map_err(map_err)
+    }
+
+    fn archive_base_snapshot(&self, archive_dir: &str) -> Result<(String, u64), StorageError> {
+        self.inner
+            .archive_base_snapshot(archive_dir)
+            .map(|info| (info.path, info.size_bytes))
+            .map_err(map_err)
+    }
+
+    fn prune_oplog(&self) -> Result<usize, StorageError> {
+        self.inner.prune_oplog(None).map_err(map_err)
+    }
+
+    fn prune_ttl_all(&self) -> Result<usize, StorageError> {
+        self.inner
+            .prune_ttl_all_collections(bson::DateTime::now())
+            .map_err(map_err)
+    }
+
+    fn restore_archive(
+        &self,
+        archive_path: &str,
+        target_dir: &str,
+        allow_existing: bool,
+    ) -> Result<(String, String, u64), StorageError> {
+        // Free function on the storage crate — no live handle needed; it rebuilds
+        // a fresh on-disk directory the operator points a new server at.
+        secantus_storage::extract_backup_archive_ex(archive_path, target_dir, allow_existing)
+            .map_err(map_err)
     }
 
     fn rename_collection(
@@ -528,6 +620,25 @@ impl CmdStorage for StorageAdapter {
 
     fn collection_is_capped(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
         self.inner.collection_is_capped(db, coll).map_err(map_err)
+    }
+
+    fn collection_uuid(&self, db: &str, coll: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.collection_uuid(db, coll).map_err(map_err)
+    }
+
+    fn scan_docs_after_id_key(
+        &self,
+        db: &str,
+        coll: &str,
+        after: Option<&[u8]>,
+    ) -> Result<IdKeyRows, StorageError> {
+        self.inner
+            .scan_docs_after_id_key(db, coll, after)
+            .map_err(map_err)
+    }
+
+    fn collection_min_id_key(&self, db: &str, coll: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.collection_min_id_key(db, coll).map_err(map_err)
     }
 
     fn collection_data_size(&self, db: &str, coll: &str) -> Result<i64, StorageError> {
@@ -600,6 +711,30 @@ impl CmdStorage for StorageAdapter {
 /// Translate the WT-free command-layer scope into the storage projector's
 /// `Scope`. Identity-shaped; the split exists only to keep `secantus-commands`
 /// free of the WiredTiger-linked `secantus-storage` crate.
+/// Encode a projected change event into the batch, splitting it into fragments
+/// first when the user opted into `splitLargeChangeStreamEvents` /
+/// `$changeStreamSplitLargeEvent` (one over-16MB event → several fragments, each
+/// a valid event tagged `splitEvent: {fragment, of}`). Mirrors `commands.py`'s
+/// producer applying `stamp_split_event` to every projected / invalidate event.
+fn push_event(
+    events: &mut Vec<Vec<u8>>,
+    ev: Document,
+    split_large_events: bool,
+) -> Result<(), StorageError> {
+    let fragments = if split_large_events {
+        changestreams::stamp_split_event(ev).map_err(map_err)?
+    } else {
+        vec![ev]
+    };
+    for frag in fragments {
+        let mut buf = Vec::new();
+        frag.to_writer(&mut buf)
+            .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
+        events.push(buf);
+    }
+    Ok(())
+}
+
 fn to_wt_scope(scope: &ChangeStreamScope) -> WtScope {
     match scope {
         ChangeStreamScope::Cluster => WtScope::Cluster,
@@ -653,6 +788,12 @@ fn map_err(e: WtError) -> StorageError {
             code: 121,
             errmsg: "Document failed validation".to_string(),
         },
+        // An update that would change `_id` → mongod's ImmutableField (66).
+        WtError::ImmutableField => StorageError::WriteError {
+            code: 66,
+            errmsg: "Performing an update on the path '_id' would modify the immutable field '_id'"
+                .to_string(),
+        },
         // Bad hint / unsupported query construct → BadValue (2), the same code
         // the Python server surfaces for these at the command layer.
         WtError::BadHint(m) => StorageError::WriteError { code: 2, errmsg: m },
@@ -670,10 +811,23 @@ fn map_err(e: WtError) -> StorageError {
         },
         // Index-create / change-stream faults don't arise on the CRUD path, but
         // map them to a command-level internal error if they ever surface here.
-        WtError::CreateIndexUnsupported(m)
-        | WtError::IndexOptionsConflict(m)
-        | WtError::ChangeStreamFatal(m)
-        | WtError::Internal(m) => StorageError::Internal(m),
+        // Index re-create conflicts → mongod's IndexOptionsConflict (85) /
+        // IndexKeySpecsConflict (86); an unsupported index type (text/hashed) →
+        // CannotCreateIndex (67). These reach the command layer via createIndexes.
+        WtError::IndexOptionsConflict(m) => StorageError::WriteError {
+            code: 85,
+            errmsg: m,
+        },
+        WtError::IndexKeySpecsConflict(m) => StorageError::WriteError {
+            code: 86,
+            errmsg: m,
+        },
+        WtError::CreateIndexUnsupported(m) => StorageError::WriteError {
+            code: 67,
+            errmsg: m,
+        },
+        // Change-stream faults don't arise on the CRUD path; map to internal.
+        WtError::ChangeStreamFatal(m) | WtError::Internal(m) => StorageError::Internal(m),
         WtError::Wt(err) => StorageError::Internal(format!("WiredTiger error: {err:?}")),
         WtError::Bson(m) => StorageError::Internal(format!("BSON error: {m}")),
     }

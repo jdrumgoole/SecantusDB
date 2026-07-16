@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 import signal
 import sys
@@ -31,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run a SecantusDB standalone single-node MongoDB server "
             "speaking the pymongo wire protocol. Flags override values "
-            "in secantusdb.toml; secantusdb.toml overrides built-in "
+            "in secantusd.toml; secantusd.toml overrides built-in "
             "defaults."
         ),
     )
@@ -41,10 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "Path to a secantusdb.toml configuration file. When omitted, "
-            "the launcher auto-discovers ./secantusdb.toml, "
-            "~/.secantus/secantusdb.toml, /etc/secantus/secantusdb.toml "
-            "(first hit wins). Passing this flag disables auto-discovery."
+            "Path to a secantusd.toml configuration file. When omitted, "
+            "the launcher auto-discovers ./secantusd.toml, "
+            "~/.secantus/secantusd.toml, /etc/secantus/secantusd.toml "
+            "(and the legacy secantusdb.toml at each location) — first "
+            "hit wins. Passing this flag disables auto-discovery."
         ),
     )
     parser.add_argument("--host", default=None)
@@ -160,6 +162,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--oplog-archive-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Enable PITR v2: archive oplog rows to durable segments in DIR before "
+            "pruning drops them. Pair with periodic base snapshots "
+            "(secantusAdmin.archiveBaseSnapshot) so recovery can reach a time "
+            "before the live oplog floor. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--tls-cert-file",
         default=None,
         metavar="PATH",
@@ -202,19 +215,6 @@ def build_parser() -> argparse.ArgumentParser:
             "gate only."
         ),
     )
-    parser.add_argument(
-        "--engine",
-        choices=["python", "rust", "auto"],
-        default=None,
-        help=(
-            "Operator-engine implementation. 'python' (default) uses the "
-            "original pure-Python engines; 'rust' uses the optional compiled "
-            "core where a component is ported, falling back to Python "
-            "otherwise; 'auto' uses Rust if the extension is installed. Both "
-            "engines are permanently supported. Also settable via the "
-            "SECANTUS_ENGINE environment variable."
-        ),
-    )
     return parser
 
 
@@ -234,6 +234,7 @@ def _overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
         "sync_on_commit": "sync_on_commit",
         "oplog_retention_seconds": "oplog_retention_seconds",
         "oplog_max_entries": "oplog_max_entries",
+        "oplog_archive_dir": "oplog_archive_dir",
         "tls_cert_file": "tls_cert_file",
         "tls_key_file": "tls_key_file",
         "tls_ca_file": "tls_ca_file",
@@ -247,7 +248,132 @@ def _overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
     return overrides
 
 
+def _build_restore_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="secantusdb restore",
+        description=(
+            "Point-in-time recovery: rebuild a fresh data directory as the "
+            "database was at a target time, by replaying a backup's oplog "
+            "forward. The source must be a stopped server's data directory "
+            "or a backup .tar.gz (a live data directory can't be opened — "
+            "WiredTiger holds a single-writer lock). Start a new server on "
+            "--target-dir afterwards."
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        required=True,
+        metavar="PATH",
+        help=(
+            "Backup .tar.gz archive, a stopped server's data directory, or a "
+            "PITR v2 archive directory (base snapshots + oplog segments — lets "
+            "recovery reach a time before the live oplog floor)."
+        ),
+    )
+    parser.add_argument(
+        "--target-dir",
+        required=True,
+        metavar="PATH",
+        help="Fresh directory to rebuild into (must not be a live server's path).",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--to-time",
+        metavar="ISO8601",
+        help=(
+            "Recover to the last write at or before this wall-clock time, e.g. "
+            "'2026-06-17T14:30:00Z'. Naive times are treated as UTC."
+        ),
+    )
+    group.add_argument(
+        "--to-timestamp",
+        metavar="SECS[,ORD]",
+        help="Recover to this cluster timestamp (seconds, optional ordinal).",
+    )
+    parser.add_argument(
+        "--preserve-oplog",
+        action="store_true",
+        help=(
+            "Carry the replayed oplog onto the restored directory so a change "
+            "stream there can resume from a token minted before the restore "
+            "point. Default: start a fresh oplog timeline (like mongorestore)."
+        ),
+    )
+    return parser
+
+
+def _parse_iso_utc(value: str) -> datetime.datetime:
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    dt = datetime.datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def _restore_main(argv: list[str]) -> int:
+    from bson import Timestamp
+
+    from secantus import oplog_replay
+
+    args = _build_restore_parser().parse_args(argv)
+    to_ts = None
+    to_wall = None
+    if args.to_timestamp is not None:
+        secs, _, ordinal = args.to_timestamp.partition(",")
+        try:
+            to_ts = Timestamp(int(secs), int(ordinal) if ordinal else 0)
+        except ValueError:
+            print("secantusdb restore: --to-timestamp must be SECS[,ORD]", file=sys.stderr)
+            return 2
+    if args.to_time is not None:
+        try:
+            to_wall = _parse_iso_utc(args.to_time)
+        except ValueError:
+            print(f"secantusdb restore: cannot parse --to-time {args.to_time!r}", file=sys.stderr)
+            return 2
+
+    from secantus import pitr_archive
+
+    try:
+        if pitr_archive.is_archive_dir(args.source):
+            # PITR v2: a directory of base snapshots + oplog segments.
+            stats = pitr_archive.restore_from_archive_dir(
+                args.source,
+                args.target_dir,
+                to_ts=to_ts,
+                to_wall=to_wall,
+                carry_oplog=args.preserve_oplog,
+            )
+        else:
+            fn = (
+                oplog_replay.restore_archive_to_timestamp
+                if args.source.endswith((".tar.gz", ".tgz"))
+                else oplog_replay.restore_to_timestamp
+            )
+            stats = fn(
+                args.source,
+                args.target_dir,
+                to_ts=to_ts,
+                to_wall=to_wall,
+                carry_oplog=args.preserve_oplog,
+            )
+    except (ValueError, RuntimeError) as exc:
+        print(f"secantusdb restore: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"Restored {stats['opsApplied']} operations "
+        f"(through oplog seq {stats['lastSeq']}) into {stats['targetDir']}.\n"
+        f"Start a server on it: secantusdb --storage-path {stats['targetDir']}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
+    if raw and raw[0] == "restore":
+        # ``secantusdb restore ...`` is the only subcommand; everything else
+        # is the daemon (bare ``secantusdb --flags`` keeps working unchanged).
+        return _restore_main(raw[1:])
     args = build_parser().parse_args(argv)
 
     try:
@@ -273,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
         replica_set_name=None if cfg.standalone else "secantus",
         oplog_retention_seconds=cfg.oplog_retention_seconds,
         oplog_max_entries=cfg.oplog_max_entries,
+        oplog_archive_dir=cfg.oplog_archive_dir,
         cache_size=cfg.cache_size,
         session_max=cfg.session_max,
         sync_on_commit=cfg.sync_on_commit,
@@ -280,7 +407,6 @@ def main(argv: list[str] | None = None) -> int:
         tls_key_file=cfg.tls_key_file,
         tls_ca_file=cfg.tls_ca_file,
         tls_require_client_cert=cfg.tls_require_client_cert,
-        engine=args.engine,
     )
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:

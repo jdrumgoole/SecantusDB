@@ -39,9 +39,11 @@ pub mod crud;
 pub mod cursors;
 pub mod diagnostics;
 pub mod distinct;
+pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
 pub mod handshake;
+pub mod logbuf;
 pub mod rbac;
 pub mod roles;
 pub mod storage;
@@ -69,6 +71,16 @@ pub const DEFAULT_BATCH_SIZE: i32 = 101;
 /// Valid `readConcern.level` values (`commands.py::_VALID_READ_CONCERN_LEVELS`).
 const VALID_READ_CONCERN_LEVELS: [&str; 5] =
     ["local", "available", "majority", "linearizable", "snapshot"];
+
+/// Lets `killOp` reach the server's live-connection registry to close a
+/// connection by its `conn_id` (our per-connection opid — one in-flight op per
+/// connection). Implemented by the server over its connection map; `None` in
+/// unit-test / storage-less contexts (where `killOp` reports "no connection
+/// registry", matching the Python server).
+pub trait ConnectionKiller: Send + Sync {
+    /// Close the connection with `conn_id`, returning whether one was found.
+    fn kill(&self, conn_id: i64) -> bool;
+}
 
 /// The per-request state a handler reads. Handshake- and CRUD-scoped for this
 /// slice; it grows (auth, sessions, cursors, metrics, …) as command families
@@ -109,6 +121,21 @@ pub struct CommandContext {
     /// on plaintext connections or when no client cert was presented; the
     /// `MONGODB-X509` mechanism (R5c) reads it.
     pub peer_cert_dn: Option<String>,
+    /// Server-wide `configureFailPoint` registry. `None` in unit-test contexts;
+    /// the server wires one in so `failCommand` short-circuits in dispatch.
+    pub failpoints: Option<Arc<failpoints::FailPointRegistry>>,
+    /// Set by a `failCommand` failpoint with `closeConnection: true` — the
+    /// server drops the socket after dispatch instead of replying, so the driver
+    /// sees a network error (the drivers' retryability / socket-error tests).
+    pub close_connection: bool,
+    /// The server's live-connection registry, so `killOp` can close a connection
+    /// by its `conn_id`. `None` until the server wires one in (and in unit-test
+    /// contexts).
+    pub conn_killer: Option<Arc<dyn ConnectionKiller>>,
+    /// The server's in-memory log ring buffer, read by `getLog`. `None` until the
+    /// server wires one in (and in unit-test contexts) — `getLog` then reports an
+    /// empty log.
+    pub logs: Option<Arc<logbuf::LogBuffer>>,
 }
 
 impl CommandContext {
@@ -130,6 +157,10 @@ impl CommandContext {
             transactions: None,
             conn_auth: None,
             peer_cert_dn: None,
+            failpoints: None,
+            close_connection: false,
+            conn_killer: None,
+            logs: None,
         }
     }
 
@@ -162,6 +193,27 @@ impl CommandContext {
         self
     }
 
+    /// Attach the server's live-connection registry (builder-style). `killOp`
+    /// uses it to close a connection by its `conn_id`.
+    pub fn with_conn_killer(mut self, conn_killer: Arc<dyn ConnectionKiller>) -> Self {
+        self.conn_killer = Some(conn_killer);
+        self
+    }
+
+    /// Attach the server's in-memory log ring buffer (builder-style). `getLog`
+    /// reads it.
+    pub fn with_logs(mut self, logs: Arc<logbuf::LogBuffer>) -> Self {
+        self.logs = Some(logs);
+        self
+    }
+
+    /// Attach the server-wide failpoint registry (builder-style). `dispatch`
+    /// applies matching `failCommand` failpoints; `configureFailPoint` configures.
+    pub fn with_failpoints(mut self, failpoints: Arc<failpoints::FailPointRegistry>) -> Self {
+        self.failpoints = Some(failpoints);
+        self
+    }
+
     /// The storage backend, or an `InternalError` if none is configured. Data
     /// commands call this; a missing backend is a server-wiring bug, not a
     /// client error.
@@ -191,11 +243,16 @@ impl CommandContext {
 
 /// A command failure carrying mongod's error triple. Shaped into an `ok: 0`
 /// reply by [`CommandError::into_reply`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommandError {
     pub code: i32,
     pub code_name: String,
     pub errmsg: String,
+    /// Extra top-level fields merged into the error reply (e.g. a DuplicateKey's
+    /// `keyPattern` / `keyValue`). `None` for the common case — boxed so the
+    /// error type stays small in `Result`. (`bson::Document` is `PartialEq` but
+    /// not `Eq`, so this type is `PartialEq`-only.)
+    pub extra: Option<Box<Document>>,
 }
 
 impl CommandError {
@@ -204,7 +261,14 @@ impl CommandError {
             code,
             code_name: code_name.into(),
             errmsg: errmsg.into(),
+            extra: None,
         }
+    }
+
+    /// Attach extra top-level fields to the error reply (merged by `into_reply`).
+    pub fn with_extra(mut self, extra: Document) -> Self {
+        self.extra = Some(Box::new(extra));
+        self
     }
 
     /// `59 CommandNotFound` for an unregistered command name.
@@ -212,14 +276,21 @@ impl CommandError {
         CommandError::new(59, "CommandNotFound", format!("no such command: '{name}'"))
     }
 
-    /// The standard `{ok: 0, errmsg, code, codeName}` reply document.
+    /// The standard `{ok: 0, errmsg, code, codeName}` reply document, plus any
+    /// `extra` fields (e.g. `keyPattern` / `keyValue`).
     pub fn into_reply(self) -> Document {
-        doc! {
+        let mut reply = doc! {
             "ok": 0.0,
             "errmsg": self.errmsg,
             "code": self.code,
             "codeName": self.code_name,
+        };
+        if let Some(extra) = self.extra {
+            for (k, v) in *extra {
+                reply.insert(k, v);
+            }
         }
+        reply
     }
 }
 
@@ -241,6 +312,7 @@ fn lookup(name: &str) -> Option<Handler> {
     Some(match name {
         "hello" | "isMaster" | "ismaster" => handshake::hello,
         "ping" => handshake::ping,
+        "replSetGetStatus" => handshake::repl_set_get_status,
         "buildInfo" | "buildinfo" => handshake::build_info,
         "insert" => crud::insert,
         "update" => crud::update,
@@ -257,15 +329,25 @@ fn lookup(name: &str) -> Option<Handler> {
         "collmod" => admin::coll_mod,
         "explain" => admin::explain,
         "drop" => admin::drop,
+        "secantusAdmin.backupArchive" => admin::backup_archive,
+        "secantusAdmin.archiveBaseSnapshot" => admin::archive_base_snapshot,
+        "secantusAdmin.pruneOplog" => admin::prune_oplog,
+        "secantusAdmin.pruneTtl" => admin::prune_ttl,
+        "secantusAdmin.restoreArchive" => admin::restore_archive,
         "listCollections" => admin::list_collections,
+        "listDatabases" => admin::list_databases,
         "listIndexes" => admin::list_indexes,
         "createIndexes" => admin::create_indexes,
         "dropIndexes" => admin::drop_indexes,
         "dropDatabase" => admin::drop_database,
         "renameCollection" => admin::rename_collection,
         "collStats" => admin::coll_stats,
-        "dbStats" => admin::db_stats,
+        // mongod accepts the lowercase `dbstats` spelling too (the C driver's
+        // command_fully_qualified test sends it over the legacy OP_QUERY path).
+        "dbStats" | "dbstats" => admin::db_stats,
         "serverStatus" => admin::server_status,
+        "currentOp" => admin::current_op,
+        "killOp" => diagnostics::kill_op,
         "validate" => admin::validate,
         "profile" => admin::profile,
         "startSession" => diagnostics::start_session,
@@ -282,6 +364,8 @@ fn lookup(name: &str) -> Option<Handler> {
         "createUser" => auth::create_user,
         "updateUser" => auth::update_user,
         "dropUser" => auth::drop_user,
+        "grantRolesToUser" => auth::grant_roles_to_user,
+        "revokeRolesFromUser" => auth::revoke_roles_from_user,
         "dropAllUsersFromDatabase" => auth::drop_all_users_from_database,
         "usersInfo" => auth::users_info,
         "createRole" => roles::create_role,
@@ -297,10 +381,40 @@ fn lookup(name: &str) -> Option<Handler> {
         "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
         "connectionStatus" => diagnostics::connection_status,
         "whatsmyuri" => diagnostics::whatsmyuri,
+        "fsync" => diagnostics::fsync,
         "hostInfo" => diagnostics::host_info,
         "getLog" => diagnostics::get_log,
+        "configureFailPoint" => configure_fail_point,
         _ => return None,
     })
+}
+
+/// `configureFailPoint` — install / replace / disable a `failCommand` failpoint
+/// (other names are accept-but-ignore). Mirrors `commands._configure_fail_point`.
+fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let name = match doc.get("configureFailPoint") {
+        Some(Bson::String(s)) => s.clone(),
+        _ => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "configureFailPoint requires a string name",
+            ))
+        }
+    };
+    let mode = doc
+        .get("mode")
+        .cloned()
+        .unwrap_or_else(|| Bson::String("off".to_string()));
+    let data = doc
+        .get("data")
+        .and_then(Bson::as_document)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(reg) = &ctx.failpoints {
+        reg.configure(&name, &mode, &data);
+    }
+    Ok(doc! { "ok": 1.0 })
 }
 
 /// Dispatch one command to its handler, applying the cross-cutting validation
@@ -309,7 +423,7 @@ fn lookup(name: &str) -> Option<Handler> {
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     let mut reply = dispatch_inner(doc, ctx);
     attach_write_concern_error(doc, &mut reply);
-    attach_cluster_time_gossip(&mut reply, ctx);
+    attach_cluster_time_gossip(doc, &mut reply, ctx);
     reply
 }
 
@@ -341,8 +455,187 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     }
 }
 
+/// Commands that accept a `writeConcern` and whose malformed value mongod
+/// rejects *before* running — the set `commands.py::_validate_write_concern` is
+/// prepended to (insert / update / delete / findAndModify / create / collMod /
+/// createIndexes / drop / dropIndexes / dropDatabase / renameCollection).
+fn is_write_concern_command(name: &str) -> bool {
+    matches!(
+        name,
+        "insert"
+            | "update"
+            | "delete"
+            | "findAndModify"
+            | "findandmodify"
+            | "create"
+            | "collMod"
+            | "collmod"
+            | "createIndexes"
+            | "drop"
+            | "dropIndexes"
+            | "dropDatabase"
+            | "renameCollection"
+    )
+}
+
+/// Reject a malformed `writeConcern` before a write command runs, mirroring
+/// `commands.py::_validate_write_concern`: a non-document `writeConcern` or a
+/// non-bool/int `j` / non-number `wtimeout` → `TypeMismatch` (14); a `w` that's a
+/// bool or non-number/string → `TypeMismatch` (14); a string `w` other than
+/// `"majority"` → `UnknownReplWriteConcern` (79); an integer `w` outside `[0, 50]`
+/// → `FailedToParse` (9). `None` when absent or well-formed. (`w > 1` still
+/// succeeds with a `writeConcernError` attached — see `attach_write_concern_error`.)
+fn validate_write_concern(doc: &Document) -> Option<CommandError> {
+    let wc = match doc.get("writeConcern") {
+        None => return None,
+        Some(Bson::Document(d)) => d,
+        Some(_) => {
+            return Some(CommandError::new(
+                14,
+                "TypeMismatch",
+                "writeConcern must be a document",
+            ))
+        }
+    };
+    if let Some(w) = wc.get("w") {
+        match w {
+            Bson::Int32(_) | Bson::Int64(_) => {
+                let n = if let Bson::Int32(x) = w {
+                    *x as i64
+                } else if let Bson::Int64(x) = w {
+                    *x
+                } else {
+                    0
+                };
+                if !(0..=50).contains(&n) {
+                    return Some(CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "w has to be a non-negative number and not greater than 50",
+                    ));
+                }
+            }
+            Bson::String(s) if s == "majority" => {}
+            Bson::String(s) => {
+                return Some(CommandError::new(
+                    79,
+                    "UnknownReplWriteConcern",
+                    format!("No write concern mode named '{s}' found in replica set configuration"),
+                ))
+            }
+            _ => {
+                return Some(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    "writeConcern.w must be a number or string",
+                ))
+            }
+        }
+    }
+    if let Some(j) = wc.get("j") {
+        if !matches!(j, Bson::Boolean(_) | Bson::Int32(_) | Bson::Int64(_)) {
+            return Some(CommandError::new(
+                14,
+                "TypeMismatch",
+                "writeConcern.j must be a boolean or integer",
+            ));
+        }
+    }
+    if let Some(wt) = wc.get("wtimeout") {
+        if !matches!(wt, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) {
+            return Some(CommandError::new(
+                14,
+                "TypeMismatch",
+                "writeConcern.wtimeout must be a number",
+            ));
+        }
+    }
+    None
+}
+
+/// Refuse a direct `insert` / `update` / `delete` on a synthetic read-only view,
+/// mirroring `commands.py::_reject_oplog_rs_write`: `local.oplog.rs` (a view over
+/// the oplog WT table, written only via oplog emission) and `admin.system.users`
+/// (written only via `createUser` / `updateUser` / `dropUser`). A direct write
+/// would land in the wrong table or break the view's invariants, so it's rejected
+/// with code 13 (`Unauthorized`), the same code mongod returns for an RBAC denial.
+fn reject_synthetic_view_write(name: &str, doc: &Document, db: &str) -> Option<CommandError> {
+    let coll = match name {
+        "insert" | "update" | "delete" => doc.get_str(name).ok()?,
+        _ => return None,
+    };
+    let detail = match (db, coll) {
+        ("local", "oplog.rs") => {
+            "local.oplog.rs (synthetic read-only view of the SecantusDB oplog)"
+        }
+        ("admin", "system.users") => {
+            "admin.system.users (synthetic read-only view — use createUser / \
+             updateUser / dropUser instead)"
+        }
+        _ => return None,
+    };
+    Some(CommandError::new(
+        13,
+        "Unauthorized",
+        format!("not authorized for {name} on {detail}"),
+    ))
+}
+
+/// Reject a namespace component (database / collection / index name) that
+/// carries an embedded NUL byte.
+///
+/// BSON strings are length-prefixed and may legally contain a NUL, so a
+/// client can send `{find: "c\0evil"}` or a `$db` with an interior NUL. Such
+/// a value would reach secantus-wt's `cstr` key encoder
+/// (`CString::new(..).expect(..)`) and **panic** — and because the storage
+/// serialises WT ops under a `std::sync::Mutex`, that panic unwinds while the
+/// lock is held and poisons it for *every* connection, turning a per-request
+/// fault into a whole-server DoS. Reject it here, before it reaches storage,
+/// with the same `InvalidNamespace` error mongod returns. (#139)
+pub(crate) fn nul_in_namespace(kind: &str, value: &str) -> Option<CommandError> {
+    if value.contains('\0') {
+        Some(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Invalid {kind}: names cannot contain a NUL ('\\0') byte."),
+        ))
+    } else {
+        None
+    }
+}
+
 fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     let name = command_name(doc);
+
+    // Database-name length limit: mongod rejects any namespace whose database
+    // component exceeds 63 bytes with InvalidNamespace before the command runs
+    // (libmongoc's `long_namespace/unsupported_long_db` inserts into a
+    // 64-character database and expects a server error). Mirrors commands.py.
+    if ctx.db_name.len() > 63 {
+        return CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!(
+                "Invalid database name: '{}'. Database names must be at most 63 characters.",
+                ctx.db_name
+            ),
+        )
+        .into_reply();
+    }
+
+    // Embedded-NUL guard for the database + collection name. The collection is
+    // the command's first-value string for every collection-scoped command
+    // (`{find: "coll", ...}`, `{insert: "coll", ...}`, ...); a non-string first
+    // value (e.g. `{ping: 1}`) simply isn't checked. Index names are guarded
+    // separately inside the index handlers. (#139)
+    if let Some(e) = nul_in_namespace("database name", &ctx.db_name) {
+        return e.into_reply();
+    }
+    if let Ok(coll) = doc.get_str(name) {
+        if let Some(e) = nul_in_namespace("collection name", coll) {
+            return e.into_reply();
+        }
+    }
 
     if let Err(e) = validate_read_concern(doc, name, ctx) {
         return e.into_reply();
@@ -359,10 +652,71 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             if let Err(e) = authorize(name, doc, ctx) {
                 return e.into_reply();
             }
+            // Failpoint (`failCommand`): a matching failpoint can block, then
+            // either short-circuit the command with an injected error or (when
+            // it only carries a writeConcernError) let it run and attach the
+            // block afterwards. `configureFailPoint` itself is exempt.
+            let fp = if name != "configureFailPoint" {
+                ctx.failpoints.as_ref().and_then(|r| r.match_command(name))
+            } else {
+                None
+            };
+            if let Some(m) = &fp {
+                if m.block_time_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(m.block_time_ms as u64));
+                }
+                // closeConnection: flag the socket for the server to drop after
+                // dispatch (the reply is discarded). mongod sends nothing back.
+                if m.close_connection {
+                    ctx.close_connection = true;
+                    return doc! { "ok": 1.0 };
+                }
+                if let Some(code) = m.error_code {
+                    let mut reply = CommandError::new(
+                        code,
+                        failpoints::fail_code_name(code),
+                        "Failing command due to 'failCommand' failpoint",
+                    )
+                    .into_reply();
+                    if !m.error_labels.is_empty() {
+                        reply.insert(
+                            "errorLabels",
+                            m.error_labels
+                                .iter()
+                                .map(|s| Bson::String(s.clone()))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    return reply;
+                }
+            }
+            // Malformed writeConcern is rejected before a write command runs
+            // (mirrors commands.py, which prepends _validate_write_concern to each
+            // write handler). Reads don't carry a writeConcern.
+            if is_write_concern_command(name) {
+                if let Some(e) = validate_write_concern(doc) {
+                    return e.into_reply();
+                }
+            }
+            // Refuse a direct insert/update/delete on a synthetic read-only view
+            // (local.oplog.rs / admin.system.users), mirroring commands.py.
+            if let Some(e) = reject_synthetic_view_write(name, doc, &ctx.db_name) {
+                return e.into_reply();
+            }
             // Time profile-eligible commands so dispatch can record a
             // `system.profile` entry when the per-database level requires it.
             let start = profile_eligible(name, doc).then(std::time::Instant::now);
-            let reply = run_with_txn_envelope(name, handler, doc, ctx);
+            let mut reply = run_with_txn_envelope(name, handler, doc, ctx);
+            // A failpoint-configured writeConcernError attaches to a successful reply.
+            if let Some(m) = &fp {
+                if let Some(wce) = &m.write_concern_error {
+                    if reply.get_f64("ok").unwrap_or(0.0) == 1.0
+                        && !reply.contains_key("writeConcernError")
+                    {
+                        reply.insert("writeConcernError", Bson::Document(wce.clone()));
+                    }
+                }
+            }
             if let Some(start) = start {
                 maybe_record_profile(name, doc, &reply, start, ctx);
             }
@@ -718,7 +1072,7 @@ fn finish_txn_statement(
 /// preserve a handler that already attached a more specific value (e.g. the
 /// change-stream `aggregate` reply). The keyless signature (20 zero bytes,
 /// keyId 0) is what auth-less replica sets send. Mirrors `commands.py::dispatch`.
-fn attach_cluster_time_gossip(reply: &mut Document, ctx: &CommandContext) {
+fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &CommandContext) {
     if ctx.replica_set_name.is_none() {
         return;
     }
@@ -748,6 +1102,34 @@ fn attach_cluster_time_gossip(reply: &mut Document, ctx: &CommandContext) {
     if !reply.contains_key("operationTime") {
         reply.insert("operationTime", Bson::Timestamp(ts));
     }
+    // Snapshot sessions: pymongo pins the session's read timestamp from the
+    // FIRST snapshot read's reply — `cursor.atClusterTime` for cursor commands,
+    // top-level `atClusterTime` otherwise — and echoes it as
+    // `readConcern.atClusterTime` on subsequent reads. Reads aren't actually
+    // pinned (single node, accept-and-record), but the wire contract is met.
+    // Mirrors `commands.py::dispatch`.
+    let is_snapshot = req
+        .get_document("readConcern")
+        .ok()
+        .and_then(|rc| rc.get_str("level").ok())
+        == Some("snapshot");
+    let ok = matches!(reply.get("ok"), Some(Bson::Double(d)) if *d != 0.0)
+        || matches!(reply.get("ok"), Some(Bson::Int32(n)) if *n != 0)
+        || matches!(reply.get("ok"), Some(Bson::Int64(n)) if *n != 0);
+    if is_snapshot && ok {
+        match reply.get_mut("cursor") {
+            Some(Bson::Document(cur)) => {
+                if !cur.contains_key("atClusterTime") {
+                    cur.insert("atClusterTime", Bson::Timestamp(ts));
+                }
+            }
+            _ => {
+                if !reply.contains_key("atClusterTime") {
+                    reply.insert("atClusterTime", Bson::Timestamp(ts));
+                }
+            }
+        }
+    }
 }
 
 /// `--auth` gating + RBAC privilege check (`commands.py::dispatch`). A no-op when
@@ -765,7 +1147,7 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
         .as_ref()
         .map(|a| {
             a.lock()
-                .expect("conn auth mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .is_authenticated()
         })
         .unwrap_or(false);
@@ -786,7 +1168,7 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
                 .as_ref()
                 .map(|a| {
                     a.lock()
-                        .expect("conn auth mutex poisoned")
+                        .unwrap_or_else(|e| e.into_inner())
                         .effective_roles
                         .clone()
                 })
@@ -862,6 +1244,7 @@ fn is_no_privilege_command(name: &str) -> bool {
             | "connectionStatus"
             | "abortTransaction"
             | "commitTransaction"
+            | "replSetGetStatus"
     )
 }
 
@@ -885,11 +1268,14 @@ fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
         "dropDatabase" => (A_DROP_DATABASE, SCOPE_DATABASE),
         "renameCollection" => (A_RENAME_COLL_SAME_DB, SCOPE_COLLECTION),
         "listCollections" => (A_LIST_COLLECTIONS, SCOPE_DATABASE),
+        "listDatabases" => (A_LIST_DATABASES, SCOPE_CLUSTER),
         "dbStats" | "dbstats" => (A_DB_STATS, SCOPE_DATABASE),
         "collStats" => (A_COLL_STATS, SCOPE_COLLECTION),
         "createUser" => (A_CREATE_USER, SCOPE_DATABASE),
         "updateUser" => (A_CHANGE_PASSWORD, SCOPE_DATABASE),
         "dropUser" => (A_DROP_USER, SCOPE_DATABASE),
+        "grantRolesToUser" => (A_GRANT_ROLE, SCOPE_DATABASE),
+        "revokeRolesFromUser" => (A_REVOKE_ROLE, SCOPE_DATABASE),
         "dropAllUsersFromDatabase" => (A_DROP_USER, SCOPE_DATABASE),
         "usersInfo" => (A_VIEW_USER, SCOPE_DATABASE),
         "createRole" => (A_CREATE_ROLE, SCOPE_DATABASE),
@@ -902,6 +1288,8 @@ fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
         "revokeRolesFromRole" => (A_REVOKE_ROLE, SCOPE_DATABASE),
         "rolesInfo" => (A_VIEW_ROLE, SCOPE_DATABASE),
         "serverStatus" => (A_SERVER_STATUS, SCOPE_CLUSTER),
+        "currentOp" => (A_INPROG, SCOPE_CLUSTER),
+        "killOp" => (A_KILLOP, SCOPE_CLUSTER),
         "hostInfo" => (A_HOST_INFO, SCOPE_CLUSTER),
         "getCmdLineOpts" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
         "getParameter" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
@@ -998,14 +1386,80 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
             ));
         }
     }
-    if doc.get("apiStrict").and_then(Bson::as_bool) == Some(true) && name == "distinct" {
-        return Err(CommandError::new(
-            323,
-            "APIStrictError",
-            format!("Provided command {name} is not in API Version 1"),
-        ));
+    if doc.get("apiStrict").and_then(Bson::as_bool) == Some(true) {
+        // `distinct` is the canary command rejected under apiStrict (mirrors
+        // commands.py's narrow `_API_V1_REJECTED_BY_NAME`).
+        if name == "distinct" {
+            return Err(CommandError::new(
+                323,
+                "APIStrictError",
+                format!("Provided command {name} is not in API Version 1"),
+            ));
+        }
+        // An aggregate whose pipeline uses a stage outside API Version 1 (e.g.
+        // `$listLocalSessions`) is rejected — drivers probe with exactly that to
+        // land an APIStrictError from inside an allowed command.
+        if name == "aggregate" {
+            if let Some(Bson::Array(pipeline)) = doc.get("pipeline") {
+                for stage in pipeline {
+                    if let Some(s) = stage.as_document().and_then(|d| d.keys().next()) {
+                        if !api_v1_agg_stage(s) {
+                            return Err(CommandError::new(
+                                323,
+                                "APIStrictError",
+                                format!(
+                                    "Provided aggregation pipeline stage {s} is not in API Version 1"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Aggregation stages inside API Version 1 (`commands.py::_API_V1_AGG_STAGES`).
+/// A pipeline stage outside this set under `apiStrict: true` is an
+/// `APIStrictError`. Deliberately excludes `$listLocalSessions` / `$listSessions`
+/// / `$currentOp` — the stages driver tests probe with.
+fn api_v1_agg_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "$addFields"
+            | "$bucket"
+            | "$bucketAuto"
+            | "$changeStream"
+            | "$collStats"
+            | "$count"
+            | "$densify"
+            | "$documents"
+            | "$facet"
+            | "$fill"
+            | "$geoNear"
+            | "$graphLookup"
+            | "$group"
+            | "$indexStats"
+            | "$limit"
+            | "$lookup"
+            | "$match"
+            | "$merge"
+            | "$out"
+            | "$project"
+            | "$redact"
+            | "$replaceRoot"
+            | "$replaceWith"
+            | "$sample"
+            | "$set"
+            | "$setWindowFields"
+            | "$skip"
+            | "$sort"
+            | "$sortByCount"
+            | "$unionWith"
+            | "$unset"
+            | "$unwind"
+    )
 }
 
 /// Render a BSON value the way Python's `{!r}` does for the messages above:
@@ -1031,6 +1485,36 @@ mod tests {
     fn command_name_is_first_key() {
         assert_eq!(command_name(&doc! {"ping": 1, "$db": "admin"}), "ping");
         assert_eq!(command_name(&Document::new()), "");
+    }
+
+    #[test]
+    fn nul_in_namespace_rejects_interior_nul() {
+        assert!(nul_in_namespace("collection name", "fine").is_none());
+        let e = nul_in_namespace("collection name", "c\0x").expect("should reject");
+        assert_eq!(
+            e.into_reply().get_str("codeName").unwrap(),
+            "InvalidNamespace"
+        );
+    }
+
+    #[test]
+    fn dispatch_rejects_nul_collection_name() {
+        // A well-formed BSON command whose collection name carries an interior
+        // NUL must return InvalidNamespace, not panic — a panic here would
+        // unwind while the storage lock is held and poison it (#139).
+        let reply = dispatch(&doc! {"find": "c\0evil"}, &mut ctx());
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 73);
+        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidNamespace");
+    }
+
+    #[test]
+    fn dispatch_rejects_nul_database_name() {
+        let mut c = ctx();
+        c.db_name = "te\0st".to_string();
+        let reply = dispatch(&doc! {"find": "coll"}, &mut c);
+        assert_eq!(reply.get_i32("code").unwrap(), 73);
+        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidNamespace");
     }
 
     #[test]
@@ -1126,11 +1610,98 @@ mod tests {
     }
 
     #[test]
+    fn long_database_name_is_invalid_namespace() {
+        // A database component over 63 bytes is rejected with InvalidNamespace
+        // (73) before the command runs (libmongoc long_namespace test).
+        let mut c = ctx();
+        c.db_name = "d".repeat(64);
+        let reply = dispatch(&doc! {"ping": 1}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 73);
+        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidNamespace");
+        // Exactly 63 is allowed.
+        let mut c = ctx();
+        c.db_name = "d".repeat(63);
+        assert_eq!(
+            dispatch(&doc! {"ping": 1}, &mut c).get_f64("ok").unwrap(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn snapshot_read_concern_pins_at_cluster_time() {
+        // A successful snapshot-level read echoes `atClusterTime` so pymongo can
+        // pin the session timestamp: nested under `cursor` for cursor replies,
+        // top-level otherwise. Tests the gossip helper directly (the read-concern
+        // validation that gates which commands may use snapshot is separate, and
+        // the end-to-end find/aggregate/distinct paths are covered by the gauge).
+        let mut c = ctx();
+        c.replica_set_name = Some("secantus".into());
+        // Non-cursor reply (e.g. distinct) -> top-level atClusterTime.
+        let req = doc! {"distinct": "t", "readConcern": {"level": "snapshot"}};
+        let mut reply = doc! {"ok": 1.0, "values": []};
+        attach_cluster_time_gossip(&req, &mut reply, &c);
+        assert!(matches!(
+            reply.get("atClusterTime"),
+            Some(Bson::Timestamp(_))
+        ));
+        // Cursor reply (e.g. find) -> nested under cursor.atClusterTime.
+        let req2 = doc! {"find": "t", "readConcern": {"level": "snapshot"}};
+        let mut reply2 = doc! {"ok": 1.0, "cursor": {"id": 0i64, "ns": "d.t", "firstBatch": []}};
+        attach_cluster_time_gossip(&req2, &mut reply2, &c);
+        let cur = reply2.get_document("cursor").unwrap();
+        assert!(matches!(cur.get("atClusterTime"), Some(Bson::Timestamp(_))));
+        // No snapshot readConcern -> no atClusterTime.
+        let mut reply3 = doc! {"ok": 1.0};
+        attach_cluster_time_gossip(&doc! {"find": "t"}, &mut reply3, &c);
+        assert!(reply3.get("atClusterTime").is_none());
+        // A failed reply (ok:0) doesn't pin, even with snapshot readConcern.
+        let mut reply4 = doc! {"ok": 0.0};
+        attach_cluster_time_gossip(&req, &mut reply4, &c);
+        assert!(reply4.get("atClusterTime").is_none());
+        // Standalone (no persona) never gossips.
+        let mut reply5 = doc! {"ok": 1.0};
+        attach_cluster_time_gossip(&req, &mut reply5, &ctx());
+        assert!(reply5.get("atClusterTime").is_none());
+    }
+
+    #[test]
     fn standalone_replies_do_not_gossip_cluster_time() {
         // No replica-set persona: no gossip (matches standalone mongod).
         let reply = dispatch(&doc! {"ping": 1}, &mut ctx());
         assert!(reply.get("$clusterTime").is_none());
         assert!(reply.get("operationTime").is_none());
+    }
+
+    #[test]
+    fn api_strict_rejects_non_v1_aggregation_stage() {
+        // `$listLocalSessions` is outside API Version 1 → APIStrictError (323),
+        // surfaced by validate_api before the handler ever needs storage.
+        let reply = dispatch(
+            &doc! {
+                "aggregate": 1,
+                "pipeline": [{"$listLocalSessions": {}}, {"$limit": 1}],
+                "apiVersion": "1",
+                "apiStrict": true,
+            },
+            &mut ctx(),
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 323);
+        // `distinct` is the rejected canary command.
+        let d = dispatch(
+            &doc! {"distinct": "c", "key": "x", "apiVersion": "1", "apiStrict": true},
+            &mut ctx(),
+        );
+        assert_eq!(d.get_i32("code").unwrap(), 323);
+        // A v1 stage is not rejected by the api gate (it may fail later for lack
+        // of storage, but not with 323).
+        let ok = dispatch(
+            &doc! {"aggregate": 1, "pipeline": [{"$match": {}}],
+            "apiVersion": "1", "apiStrict": true},
+            &mut ctx(),
+        );
+        assert_ne!(ok.get_i32("code").ok(), Some(323));
     }
 
     #[test]

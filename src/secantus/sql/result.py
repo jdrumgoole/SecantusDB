@@ -1,0 +1,39 @@
+"""Result shapes returned by the embedded SQL engine."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class ColumnDesc:
+    """One output column: its name, internal type tag, and Postgres OID.
+
+    The OID is what the wire layer will put in ``RowDescription``; carried here
+    so the embedded result already describes itself the way the protocol needs.
+    """
+
+    name: str
+    type_tag: str
+    pg_oid: int
+
+
+@dataclass
+class SQLResult:
+    """The outcome of one SQL statement.
+
+    ``command_tag`` is the Postgres ``CommandComplete`` tag (``SELECT 3``,
+    ``INSERT 0 2``, ``UPDATE 1``, ``DELETE 0``, ``CREATE TABLE``). For SELECT,
+    ``columns`` describes the result shape and ``rows`` holds the data as plain
+    Python tuples in column order; for DML they are empty and ``rowcount`` is
+    the affected-row count.
+    """
+
+    command_tag: str
+    columns: list[ColumnDesc] = field(default_factory=list)
+    rows: list[tuple[Any, ...]] = field(default_factory=list)
+    rowcount: int = 0
+    # GUCs to echo back as ParameterStatus messages (set by ``SET`` on a
+    # reportable parameter). Empty for everything else.
+    parameter_status: list[tuple[str, str]] = field(default_factory=list)

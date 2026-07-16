@@ -9,10 +9,13 @@ via ``admin.system.users.find()`` saw no rows.
 
 This slice surfaces the records under that namespace with the same
 mongod-shaped fields the records already carry (``_id`` =
-``"<db>.<user>"``, ``user``, ``db``, ``credentials``, ``roles``,
-``mechanisms``). Writes to the synthetic namespace are rejected
-with mongod's ``Unauthorized`` (code 13) — the view is read-only;
-mutate through ``createUser`` / ``updateUser`` / ``dropUser``.
+``"<db>.<user>"``, ``user``, ``db``, ``roles``, ``mechanisms``) —
+but the SCRAM ``credentials`` blob is always stripped from this
+generic read path (issue #167); it is only reachable via
+``usersInfo`` with ``showCredentials`` + the ``A_VIEW_USER``
+privilege. Writes to the synthetic namespace are rejected with
+mongod's ``Unauthorized`` (code 13) — the view is read-only; mutate
+through ``createUser`` / ``updateUser`` / ``dropUser``.
 """
 
 from __future__ import annotations
@@ -62,13 +65,16 @@ def test_find_admin_system_users_returns_created_users(client) -> None:
     names = sorted(d["user"] for d in docs)
     assert names == ["alice", "bob"]
 
-    # mongod-shaped fields are all present.
+    # mongod-shaped fields are all present — except the SCRAM
+    # ``credentials`` blob, which the generic read path always strips
+    # (issue #167). Credentials are only reachable via ``usersInfo`` with
+    # ``showCredentials`` + the ``A_VIEW_USER`` privilege.
     for d in docs:
         assert d["_id"] == f"admin.{d['user']}"
         assert d["db"] == "admin"
         assert d["roles"] == []
         assert "SCRAM-SHA-256" in d.get("mechanisms", [])
-        assert "credentials" in d
+        assert "credentials" not in d
 
 
 def test_find_users_across_databases(client) -> None:
@@ -145,6 +151,73 @@ def test_other_db_system_users_is_empty(client) -> None:
 
     docs = list(client["mydb"]["system.users"].find())
     assert docs == []
+
+
+# ---------------------------------------------------------------------------
+# Credential leakage (issue #167)
+# ---------------------------------------------------------------------------
+
+
+def test_find_never_exposes_credentials(client) -> None:
+    """A plain find on admin.system.users must never return the SCRAM
+    credential material — it's the /etc/shadow-equivalent that enables
+    offline cracking + server impersonation. Only usersInfo (gated by
+    A_VIEW_USER + showCredentials) may surface it (issue #167)."""
+    _make_user(client, "admin", "alice")
+    _make_user(client, "appdb", "bob")
+
+    docs = list(client["admin"]["system.users"].find())
+    assert len(docs) == 2
+    for d in docs:
+        assert "credentials" not in d
+        # The non-sensitive shape is intact.
+        assert d["user"] in ("alice", "bob")
+        assert "SCRAM-SHA-256" in d.get("mechanisms", [])
+
+
+def test_count_and_aggregate_never_expose_credentials(client) -> None:
+    _make_user(client, "admin", "alice")
+
+    # aggregate: no stage can surface credentials because they're stripped
+    # before the pipeline runs.
+    docs = list(client["admin"]["system.users"].aggregate([{"$match": {}}]))
+    assert docs and all("credentials" not in d for d in docs)
+
+    # A projection explicitly asking for credentials still gets nothing.
+    proj = list(client["admin"]["system.users"].find({}, projection={"credentials": 1}))
+    assert all("credentials" not in d for d in proj)
+
+
+def test_credentials_cannot_be_used_as_a_filter_oracle(client) -> None:
+    """Credentials are stripped *before* the filter runs, so a query that
+    probes credential fields can't be used to confirm/deny their contents
+    (issue #167)."""
+    _make_user(client, "admin", "alice")
+
+    # The field is absent, so an $exists probe matches nothing...
+    assert client["admin"]["system.users"].count_documents({"credentials": {"$exists": True}}) == 0
+    # ...and a dotted probe into the SCRAM blob matches nothing either.
+    assert (
+        client["admin"]["system.users"].count_documents(
+            {"credentials.SCRAM-SHA-256.salt": {"$exists": True}}
+        )
+        == 0
+    )
+    # A normal (non-credential) filter still works.
+    assert client["admin"]["system.users"].count_documents({"user": "alice"}) == 1
+
+
+def test_usersinfo_still_gates_credentials(client) -> None:
+    """The intended, gated path is unaffected: usersInfo without
+    showCredentials omits credentials; with showCredentials it includes
+    them (the auth handshake needs them)."""
+    _make_user(client, "admin", "alice")
+
+    info = client["admin"].command("usersInfo", "alice")
+    assert info["users"] and "credentials" not in info["users"][0]
+
+    shown = client["admin"].command("usersInfo", "alice", showCredentials=True)
+    assert shown["users"] and "credentials" in shown["users"][0]
 
 
 # ---------------------------------------------------------------------------

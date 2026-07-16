@@ -63,6 +63,17 @@ def _classify(case: ET.Element) -> str:
 
 
 def render(xml_path: Path, out_path: Path) -> None:
+    # Fail with a clear diagnostic — not a raw ``ParseError`` traceback — when
+    # run-tests.php produced no JUnit (missing or 0-byte file). That opaque
+    # crash is exactly how the CI-only run-tests.php permission failure hid for
+    # weeks; surface it plainly so the runner log above is the obvious next read.
+    if not xml_path.is_file() or xml_path.stat().st_size == 0:
+        raise SystemExit(
+            f"php_ext_validation: JUnit XML {xml_path} is missing or empty — "
+            "run-tests.php produced no output. See the runner log above for the "
+            "cause (e.g. run-tests.php failing to write its scratch files). No "
+            "report was generated."
+        )
     root = ET.parse(xml_path).getroot()
 
     by_cat: dict[str, dict[str, int]] = defaultdict(

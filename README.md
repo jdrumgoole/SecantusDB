@@ -35,7 +35,7 @@ tool — [`pymongo`](https://pymongo.readthedocs.io/en/stable/),
 `MongoClient` at it and your application code doesn't know the
 difference, as long as the application only needs single-node behaviour.
 No `mongod` to install, no port conflicts, parallel-test friendly,
-embedded or as a standalone daemon (`secantusdb`).
+embedded or as a standalone daemon (`secantusd-py`).
 
 Single-node only by design: replica sets, sharding, and anything that
 depends on real cluster topology are out of scope. Within that
@@ -90,19 +90,54 @@ compound, mixed-direction, partial, TTL, sort — proper `explain` output
 (`IXSCAN` vs `COLLSCAN`), and a hash-join `$lookup`.
 
 **Authentication**: SCRAM-SHA-256 — MongoDB's default since 4.0 — is
-implemented end-to-end on the wire. Off by default; flip on with
-`secantusdb --auth` (or `SecantusDBServer(..., require_auth=True)`),
-provision users with `createUser`, then connect with the standard
-`MongoClient(uri, username=, password=)` shape. See
-[Authentication](https://secantusdb.readthedocs.io/en/latest/authentication.html). Authorization (RBAC), x509,
-LDAP, Kerberos, and TLS are *not* implemented — an authenticated
-principal is currently treated as fully privileged.
+implemented end-to-end on the wire, alongside **native TLS / mTLS** and
+the **MONGODB-X509** cert-as-username mechanism. Off by default; flip
+SCRAM on with `secantusd-py --auth` (or `SecantusDBServer(...,
+require_auth=True)`), provision users with `createUser`, then connect
+with the standard `MongoClient(uri, username=, password=)` shape. See
+[Authentication](https://secantusdb.readthedocs.io/en/latest/authentication.html). Authorization
+(RBAC) is *not* enforced — an authenticated principal is currently
+treated as fully privileged — and LDAP / Kerberos / GSSAPI / AWS / OIDC
+auth mechanisms are out of scope.
 
-What's **out of scope:** real replica sets, sharding, RBAC, x509 /
-LDAP / Kerberos auth, TLS, text / wildcard indexes, `$where`, real
-transaction rollback. If you need those, run a real `mongod`. Geo
+What's **out of scope:** real replica sets, sharding, RBAC, auth
+mechanisms beyond SCRAM-SHA-256 / MONGODB-X509 (no LDAP / Kerberos /
+GSSAPI / AWS / OIDC), `OP_COMPRESSED`, text / hashed / wildcard indexes,
+and `$where` / `$function` / `$accumulator` / `mapReduce` (no embedded
+JS runtime). If you need those, run a real `mongod`. Native TLS + mTLS,
+multi-document transactions (with WiredTiger-native rollback), and geo
 support (`$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`,
-`$geoNear`, `2dsphere` and `2d` indexes) is in scope and shipped.
+`$geoNear`, `2dsphere` and `2d` indexes) are all in scope and shipped.
+
+## SQL / PostgreSQL interface (opt-in)
+
+SecantusDB can also speak **SQL over the PostgreSQL wire protocol**. Install the
+extra (`pip install "secantus[sql]"`), start a `SecantusPGServer` — optionally
+sharing the *same* storage as the MongoDB server — and connect with `psql`,
+pg8000, or SQLAlchemy over a `postgresql://` URL:
+
+```python
+from secantus.sql import SecantusPGServer
+
+with SecantusPGServer(port=5432) as server:
+    ...  # SELECT / INSERT / UPDATE / DELETE, JOIN, GROUP BY, transactions, ...
+```
+
+Or run it as a standalone daemon — `pip install "secantus[sql]"` puts a
+`secantusd-py-pg` script on your `PATH`:
+
+```bash
+secantusd-py-pg --host 127.0.0.1 --port 5432 --storage-path ./secantus-data
+```
+
+SQL is compiled down to the same query / aggregation engines the MongoDB side
+uses, so it inherits index acceleration and the type system. A collection
+written with `pymongo` is queryable as a SQL table with **no `CREATE TABLE`**
+(schema-on-read), nested documents surface as `jsonb` (`->`, `->>`, `#>`), and
+`BEGIN` / `COMMIT` / `ROLLBACK` are real transactions. Auth (SCRAM-SHA-256) and
+TLS work the same as on the Mongo side. See
+[SQL / PostgreSQL interface](https://secantusdb.readthedocs.io/en/latest/sql.html)
+for the supported-SQL matrix and examples.
 
 ## Installation
 
@@ -141,46 +176,52 @@ needs three native build tools on `PATH`:
 
 See [Installation](https://secantusdb.readthedocs.io/en/latest/installation.html) for dev-install instructions.
 
-### Optional Rust acceleration
+### The Rust server (separate)
 
-The operator engines (query matching, updates, the aggregation-expression
-evaluator, projection, and the storage-independent aggregation pipeline) have an
-optional Rust implementation that runs off the GIL. It's an **accelerator, not a
-replacement** — the pure-Python engines are always present and remain the
-**default**, and the Rust core is pinned byte-for-byte against them.
+SecantusDB ships **two separate servers** on independent version lines: the
+pure-Python server (this package's `SecantusDBServer`) and a self-contained
+**Rust server** that speaks the same wire protocol off the GIL. You run one or
+the other — there is no in-process engine switching. The Python server is always
+pure-Python; the Rust engines live only in the Rust server.
+
+> The old in-process accelerator (`SECANTUS_ENGINE=rust` / `SecantusDBServer(engine=...)`)
+> has been **retired** in favour of this two-server split.
+
+The Rust side is a Cargo workspace under `crates/`: a pure-Rust engine crate
+(`secantus-core`, no PyO3) reused by the Rust server and the standalone
+`secantusd-rs` binary, plus a thin PyO3 bindings crate (`secantus-core-py`)
+that builds the `secantus-core` wheel — the vehicle that pins each Rust engine
+byte-for-byte against its pure-Python counterpart.
 
 ```bash
 pip install "secantus[rust]"      # pulls the matching secantus-core wheel
 ```
 
-Enable it process-wide (default stays Python):
-
-```bash
-export SECANTUS_ENGINE=rust       # or "auto" — rust if the extension is present
-```
-
-```python
-from secantus import SecantusDBServer
-server = SecantusDBServer(engine="rust")   # same effect, programmatic
-```
-
-`rust` transparently falls back to Python for anything it doesn't reproduce, so
-it's always correct. The Rust side is a Cargo workspace under `crates/`: a
-pure-Rust engine crate (`secantus-core`, no PyO3) plus a thin PyO3 bindings crate
-(`secantus-core-py`) that builds the `secantus-core` wheel. Splitting them keeps
-the engines reusable so they can evolve toward a first-class, standalone Rust
-build.
+The Python server is the **conformance leader** and the default choice: it
+passes **99.2%** of pymongo's own test suite. The Rust server runs the same
+unmodified suite and currently passes **92.0%** — it's faster per operation
+(see [`docs/benchmark.md`](https://secantusdb.readthedocs.io/en/latest/benchmark.html)) but is
+still closing the gap. The features the Rust server doesn't support yet —
+`showExpandedEvents` DDL change events, large change-event splitting, read /
+write-concern semantics, timeseries `_id` non-uniqueness — and a side-by-side
+of when to pick each server are spelled out in
+[The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html).
 
 ## Standalone daemon (drop-in `mongod` replacement)
 
-`pip install` puts a `secantusdb` script on your `PATH`. Run it like
+`pip install` puts a `secantusd-py` script on your `PATH`. Run it like
 you'd run `mongod`:
 
 ```bash
-secantusdb --host 127.0.0.1 --port 27017
+secantusd-py --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default; pass --storage-path :memory:
 # for an ephemeral temp dir cleaned up on shutdown.
 ```
+
+The same `pip install secantus` also puts the standalone **Rust** server on your
+`PATH` as `secantusd-rs` (same flags, same wire protocol; see
+[The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html)) —
+on Linux, macOS (Apple Silicon), and Windows. Intel-Mac wheels are pure-Python.
 
 Then point any MongoDB driver or tool at it — **no application code
 changes**, just the URI:
@@ -262,6 +303,7 @@ Full docs are on [Read the Docs](https://secantusdb.readthedocs.io/en/latest/).
 Highlights:
 
 - [Quickstart](https://secantusdb.readthedocs.io/en/latest/quickstart.html) — embedding in tests, running standalone.
+- [The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html) — Python vs Rust server, which to use, and what each doesn't support yet.
 - [Architecture](https://secantusdb.readthedocs.io/en/latest/architecture.html) — the layered design.
 - [Indexes](https://secantusdb.readthedocs.io/en/latest/indexes.html) — what `find()` and `aggregate` accelerate,
   `explain` semantics, hints, partial indexes, TTL.

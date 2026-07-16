@@ -26,12 +26,28 @@ use std::collections::HashMap;
 use bson::{Bson, Document};
 
 use crate::expressions;
-use crate::numeric::{self, as_int_like, int_to_bson, NumVal};
+use crate::numeric::{self, as_int_like, int_promoted_to_bson, int_to_bson, is_int64, NumVal};
 
 type R<T> = Result<T, ()>;
 
 fn eval(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
     expressions::evaluate(doc, expr, vars).map_err(|_| ())
+}
+
+/// Evaluate an accumulator input, distinguishing a missing field from an explicit
+/// null: a top-level absent field path yields `None` (skip), everything else
+/// (incl. a present null) yields `Some(value)`. Mirrors
+/// `expressions.evaluate_or_missing`; `$push` / `$addToSet` skip missing values as
+/// mongod does.
+fn eval_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Option<Bson>> {
+    if let Bson::String(s) = expr {
+        if let Some(path) = s.strip_prefix('$') {
+            if !path.starts_with('$') {
+                return Ok(crate::paths::get_path(doc, path).cloned());
+            }
+        }
+    }
+    eval(expr, doc, vars).map(Some)
 }
 
 /// Canonical, hashable group-key — mirrors `_hashable` + Python dict equality.
@@ -85,10 +101,14 @@ pub fn gkey(v: &Bson) -> R<GKey> {
     }
 }
 
-/// Running numeric value preserving Python's int-vs-float distinction.
+/// Running numeric value preserving Python's int-vs-float distinction. The
+/// integral variant also tracks whether any operand was int64, so the result
+/// promotes to int64 (MongoDB's numeric widening — `numerics.bson_add`).
 #[derive(Clone, Copy)]
-enum Num {
-    Int(i128),
+// `pub(crate)` only because it is reachable through the `pub(crate) Acc` the
+// `windowfields` module reuses; not part of any real cross-module API.
+pub(crate) enum Num {
+    Int { v: i128, wide: bool },
     Float(f64),
 }
 
@@ -100,12 +120,15 @@ impl Num {
             Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(_) => {
                 let n = as_int_like(v).unwrap();
                 Ok(match self {
-                    Num::Int(a) => Num::Int(a + n),
+                    Num::Int { v: a, wide } => Num::Int {
+                        v: a + n,
+                        wide: wide || is_int64(v),
+                    },
                     Num::Float(f) => Num::Float(f + n as f64),
                 })
             }
             Bson::Double(d) => Ok(match self {
-                Num::Int(a) => Num::Float(a as f64 + d),
+                Num::Int { v: a, .. } => Num::Float(a as f64 + d),
                 Num::Float(f) => Num::Float(f + d),
             }),
             _ => Err(()), // string / array / doc / Decimal128 / null -> TypeError
@@ -114,14 +137,17 @@ impl Num {
 
     fn to_bson(self) -> R<Bson> {
         match self {
-            Num::Int(a) => int_to_bson(a).ok_or(()),
+            Num::Int { v, wide } => int_promoted_to_bson(v, wide).ok_or(()),
             Num::Float(f) => Ok(Bson::Double(f)),
         }
     }
 }
 
 /// One accumulator's running state.
-enum Acc {
+// Shared with `windowfields` (`$setWindowFields`), which reuses the same
+// per-op accumulator state / step / finalize logic over sliding document
+// windows rather than whole groups — hence `pub(crate)`.
+pub(crate) enum Acc {
     Sum(Num),
     Count(i64),
     Avg(Option<(Num, i64)>), // None until the first non-null value (field stays absent)
@@ -131,6 +157,52 @@ enum Acc {
     Last(Option<Bson>),
     Push(Vec<Bson>),
     AddToSet(Vec<Bson>),
+    // `$mergeObjects`: merge each per-doc operand document into the accumulator
+    // (later keys override earlier — `dict.update` semantics). A null/missing
+    // operand is skipped; a non-null, non-document operand defers to Python
+    // (which raises Location 40400). An all-missing group still yields `{}`.
+    MergeObjects(Document),
+    // `$stdDevPop` / `$stdDevSamp`: collect the numeric values, compute at
+    // finalize. `pop` selects population (÷n, 0 for a single value) vs sample
+    // (÷n-1, null for <2 values). Field stays absent when no numeric value seen.
+    StdDev {
+        values: Vec<f64>,
+        pop: bool,
+    },
+    // `$firstN` / `$lastN` / `$maxN` / `$minN` accumulators: collect the per-doc
+    // `input` value; result computed at finalize. `n` is parsed from the spec on
+    // the first `apply` (constant across the group). `$firstN`/`$lastN` keep null
+    // values; `$maxN`/`$minN` drop them (mongod-faithful, three-way verified).
+    NElem {
+        kind: NElemKind,
+        n: Option<usize>,
+        vals: Vec<Bson>,
+    },
+    // `$top` / `$bottom` / `$topN` / `$bottomN`: collect `(sortBy-values, output)`
+    // per doc; at finalize stable-sort by the `sortBy` directions and take the
+    // top/bottom output(s). `n` and the sort directions are parsed on first apply.
+    TopN {
+        kind: TopNKind,
+        n: Option<usize>,
+        dirs: Vec<bool>, // true == descending
+        items: Vec<(Vec<Bson>, Bson)>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NElemKind {
+    First,
+    Last,
+    Max,
+    Min,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TopNKind {
+    Top,
+    Bottom,
+    TopN,
+    BottomN,
 }
 
 struct Compiled<'a> {
@@ -139,9 +211,9 @@ struct Compiled<'a> {
     arg: &'a Bson,
 }
 
-fn new_acc(op: &str) -> R<Acc> {
+pub(crate) fn new_acc(op: &str) -> R<Acc> {
     Ok(match op {
-        "$sum" => Acc::Sum(Num::Int(0)),
+        "$sum" => Acc::Sum(Num::Int { v: 0, wide: false }),
         "$count" => Acc::Count(0),
         "$avg" => Acc::Avg(None),
         "$min" => Acc::Min(None),
@@ -150,6 +222,59 @@ fn new_acc(op: &str) -> R<Acc> {
         "$last" => Acc::Last(None),
         "$push" => Acc::Push(Vec::new()),
         "$addToSet" => Acc::AddToSet(Vec::new()),
+        "$mergeObjects" => Acc::MergeObjects(Document::new()),
+        "$stdDevPop" => Acc::StdDev {
+            values: Vec::new(),
+            pop: true,
+        },
+        "$stdDevSamp" => Acc::StdDev {
+            values: Vec::new(),
+            pop: false,
+        },
+        "$firstN" => Acc::NElem {
+            kind: NElemKind::First,
+            n: None,
+            vals: Vec::new(),
+        },
+        "$lastN" => Acc::NElem {
+            kind: NElemKind::Last,
+            n: None,
+            vals: Vec::new(),
+        },
+        "$maxN" => Acc::NElem {
+            kind: NElemKind::Max,
+            n: None,
+            vals: Vec::new(),
+        },
+        "$minN" => Acc::NElem {
+            kind: NElemKind::Min,
+            n: None,
+            vals: Vec::new(),
+        },
+        "$top" => Acc::TopN {
+            kind: TopNKind::Top,
+            n: None,
+            dirs: Vec::new(),
+            items: Vec::new(),
+        },
+        "$bottom" => Acc::TopN {
+            kind: TopNKind::Bottom,
+            n: None,
+            dirs: Vec::new(),
+            items: Vec::new(),
+        },
+        "$topN" => Acc::TopN {
+            kind: TopNKind::TopN,
+            n: None,
+            dirs: Vec::new(),
+            items: Vec::new(),
+        },
+        "$bottomN" => Acc::TopN {
+            kind: TopNKind::BottomN,
+            n: None,
+            dirs: Vec::new(),
+            items: Vec::new(),
+        },
         _ => return Err(()), // unsupported accumulator -> Python (raises or handles)
     })
 }
@@ -164,7 +289,7 @@ fn arg_is_one(arg: &Bson) -> bool {
         || matches!(arg, Bson::Double(d) if *d == 1.0)
 }
 
-fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()> {
+pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()> {
     match acc {
         Acc::Sum(running) => {
             // `1 if arg == 1 else evaluate(arg)`, then None -> 0.
@@ -183,7 +308,7 @@ fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()
             if !is_null(&v) {
                 let (total, count) = match state.take() {
                     Some(s) => s,
-                    None => (Num::Int(0), 0),
+                    None => (Num::Int { v: 0, wide: false }, 0),
                 };
                 *state = Some((total.add(&v)?, count + 1));
             }
@@ -198,9 +323,15 @@ fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()
             }
         }
         Acc::Last(slot) => *slot = Some(eval(arg, doc, vars)?),
-        Acc::Push(list) => list.push(eval(arg, doc, vars)?),
+        Acc::Push(list) => {
+            if let Some(v) = eval_or_missing(arg, doc, vars)? {
+                list.push(v);
+            }
+        }
         Acc::AddToSet(list) => {
-            let v = eval(arg, doc, vars)?;
+            let Some(v) = eval_or_missing(arg, doc, vars)? else {
+                return Ok(());
+            };
             let mut present = false;
             for existing in list.iter() {
                 if expressions::py_eq(&v, existing).map_err(|_| ())? {
@@ -212,8 +343,222 @@ fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()
                 list.push(v);
             }
         }
+        Acc::MergeObjects(merged) => {
+            // Null/missing operand -> skip. Non-null, non-document operand ->
+            // defer to Python (which raises Location 40400). Document -> merge
+            // with later-key-wins semantics.
+            if let Some(v) = eval_or_missing(arg, doc, vars)? {
+                match v {
+                    Bson::Null => {}
+                    Bson::Document(d) => {
+                        for (k, val) in d {
+                            merged.insert(k, val);
+                        }
+                    }
+                    _ => return Err(()),
+                }
+            }
+        }
+        Acc::StdDev { values, .. } => {
+            // Python appends every non-null value; a non-numeric would then blow
+            // up `sum(values)` at finalize, so we defer such a group to Python
+            // (which raises). `null` is skipped. Bool counts as 0/1 (Python sums
+            // bools as ints) — matches the pure evaluator.
+            let v = eval(arg, doc, vars)?;
+            if !is_null(&v) {
+                values.push(numeric_f64(&v).ok_or(())?);
+            }
+        }
+        Acc::NElem { n, vals, .. } => {
+            // `arg` is `{n, input}`. Validate n (positive integral; integral double
+            // accepted) and require `input`; anything invalid defers to Python,
+            // which raises the exact mongod code. `input` is collected per doc,
+            // null included (finalize drops nulls for max/min only).
+            let Bson::Document(d) = arg else {
+                return Err(());
+            };
+            let nn = match eval(d.get("n").ok_or(())?, doc, vars)? {
+                Bson::Int32(x) => x as i64,
+                Bson::Int64(x) => x,
+                Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => x as i64,
+                _ => return Err(()),
+            };
+            if nn <= 0 {
+                return Err(());
+            }
+            *n = Some(nn as usize);
+            vals.push(eval(d.get("input").ok_or(())?, doc, vars)?);
+        }
+        Acc::TopN {
+            kind,
+            n,
+            dirs,
+            items,
+        } => {
+            // `arg` is `{n?, sortBy, output}`. Any invalid shape defers to Python,
+            // which raises the exact mongod code (5788002-5, 10065, 5787908).
+            let Bson::Document(d) = arg else {
+                return Err(());
+            };
+            let has_n = matches!(kind, TopNKind::TopN | TopNKind::BottomN);
+            if has_n != d.contains_key("n") {
+                return Err(()); // topN/bottomN need n; top/bottom reject it
+            }
+            let Some(Bson::Document(sortby)) = d.get("sortBy") else {
+                return Err(()); // missing / non-object sortBy
+            };
+            if !d.contains_key("output") {
+                return Err(());
+            }
+            let nn = if has_n {
+                match eval(d.get("n").unwrap(), doc, vars)? {
+                    Bson::Int32(x) => x as i64,
+                    Bson::Int64(x) => x,
+                    Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => x as i64,
+                    _ => return Err(()),
+                }
+            } else {
+                1
+            };
+            if nn <= 0 {
+                return Err(());
+            }
+            *n = Some(nn as usize);
+            if dirs.is_empty() {
+                *dirs = sortby
+                    .values()
+                    .map(|v| as_int_like(v) == Some(-1))
+                    .collect();
+            }
+            let sort_vals: Vec<Bson> = sortby
+                .keys()
+                .map(|f| {
+                    crate::paths::get_path(doc, f)
+                        .cloned()
+                        .unwrap_or(Bson::Null)
+                })
+                .collect();
+            let output = eval(d.get("output").unwrap(), doc, vars)?;
+            items.push((sort_vals, output));
+        }
     }
     Ok(())
+}
+
+/// Stable-sort the `(sort_values, output)` items by the `sortBy` directions and
+/// return the top/bottom output(s). `$top`/`$bottom` return a single value;
+/// `$topN`/`$bottomN` return an array. A sort value outside the sortable subset
+/// defers to Python (its `_SortKey` handles the wider set). Mirrors the pure
+/// `_topn_finalize`.
+fn topn_result(
+    kind: TopNKind,
+    n: usize,
+    dirs: &[bool],
+    mut items: Vec<(Vec<Bson>, Bson)>,
+) -> R<Bson> {
+    for (sv, _) in &items {
+        if !sv.iter().all(crate::order::is_sortable) {
+            return Err(());
+        }
+    }
+    items.sort_by(|a, b| {
+        for (i, desc) in dirs.iter().enumerate() {
+            let (av, bv) = (a.0.get(i), b.0.get(i));
+            let ord = match (av, bv) {
+                (Some(x), Some(y)) => crate::order::cmp(x, y),
+                _ => Ordering::Equal,
+            };
+            let ord = if *desc { ord.reverse() } else { ord };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+    let outputs: Vec<Bson> = items.into_iter().map(|(_, o)| o).collect();
+    Ok(match kind {
+        TopNKind::Top => outputs.into_iter().next().unwrap_or(Bson::Null),
+        TopNKind::Bottom => outputs.into_iter().last().unwrap_or(Bson::Null),
+        TopNKind::TopN => {
+            let k = n.min(outputs.len());
+            Bson::Array(outputs[..k].to_vec())
+        }
+        TopNKind::BottomN => {
+            let k = n.min(outputs.len());
+            Bson::Array(outputs[outputs.len() - k..].to_vec())
+        }
+    })
+}
+
+/// Finalize an N-element accumulator to its result list. `$firstN`/`$lastN` keep
+/// nulls (first/last `n` in insertion order); `$maxN`/`$minN` drop nulls, then sort
+/// via the `order::cmp`/`is_sortable` contract (`$maxN` descending, `$minN`
+/// ascending) — an element outside the sortable subset defers the group to Python.
+fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
+    match kind {
+        NElemKind::First => {
+            let k = n.min(vals.len());
+            Ok(vals[..k].to_vec())
+        }
+        NElemKind::Last => {
+            let k = n.min(vals.len());
+            Ok(vals[vals.len() - k..].to_vec())
+        }
+        NElemKind::Max | NElemKind::Min => {
+            let mut nn: Vec<Bson> = vals.into_iter().filter(|x| !is_null(x)).collect();
+            if !nn.iter().all(crate::order::is_sortable) {
+                return Err(());
+            }
+            let largest = matches!(kind, NElemKind::Max);
+            nn.sort_by(|a, b| {
+                if largest {
+                    crate::order::cmp(b, a)
+                } else {
+                    crate::order::cmp(a, b)
+                }
+            });
+            let k = n.min(nn.len());
+            Ok(nn[..k].to_vec())
+        }
+    }
+}
+
+/// A numeric value as `f64` for `$stdDev*`: int / long / double, plus bool as
+/// `0.0`/`1.0` (Python folds bools into the numeric sum). Anything else → `None`,
+/// so the caller defers the group to Python (whose `sum()` would raise).
+fn numeric_f64(b: &Bson) -> Option<f64> {
+    match b {
+        Bson::Int32(n) => Some(*n as f64),
+        Bson::Int64(n) => Some(*n as f64),
+        Bson::Double(d) => Some(*d),
+        Bson::Boolean(x) => Some(if *x { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+/// Population / sample standard deviation, mirroring the pure `_std_dev`: `None`
+/// for an empty set, and additionally for a sample (`pop == false`) with < 2
+/// values (population of a single value is `0.0`). Squares with plain
+/// multiplication (`d * d`) and roots with `sqrt` — both correctly-rounded IEEE
+/// operations that reproduce CPython's `(x - mean) ** 2` / `... ** 0.5` bit-for-bit
+/// (a fuzz seed exposed that `f64::powf(2.0)` can round differently from
+/// multiplication). Sums in document order to match `sum(...)`.
+fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
+    let n = values.len();
+    if n == 0 || (!pop && n < 2) {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let denom = if pop { n } else { n - 1 } as f64;
+    let var = values
+        .iter()
+        .map(|x| {
+            let d = x - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / denom;
+    Some(var.sqrt())
 }
 
 /// `$min` / `$max`: `cur is None or (v is not None and v <cmp> cur)`. Uses
@@ -250,7 +595,7 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 // where the bucket key is never created).
                 if let Some((total, count)) = state {
                     let tf = match total {
-                        Num::Int(a) => {
+                        Num::Int { v: a, .. } => {
                             if a.unsigned_abs() > (1u128 << 53) {
                                 return Err(()); // precision: defer to Python int/int divide
                             }
@@ -273,9 +618,83 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
             Acc::AddToSet(list) => {
                 out.insert(field.to_string(), Bson::Array(list));
             }
+            Acc::MergeObjects(merged) => {
+                out.insert(field.to_string(), Bson::Document(merged));
+            }
+            Acc::StdDev { values, pop } => {
+                // No numeric value seen -> the pure code never creates the bucket
+                // key, so the field is absent. Otherwise `_std_dev` may still be
+                // null (sample of a single value), which the pure code writes.
+                if !values.is_empty() {
+                    let v = std_dev(&values, pop).map_or(Bson::Null, Bson::Double);
+                    out.insert(field.to_string(), v);
+                }
+            }
+            Acc::NElem { kind, n, vals } => {
+                out.insert(
+                    field.to_string(),
+                    Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
+                );
+            }
+            Acc::TopN {
+                kind,
+                n,
+                dirs,
+                items,
+            } => {
+                out.insert(
+                    field.to_string(),
+                    topn_result(kind, n.unwrap_or(1), &dirs, items)?,
+                );
+            }
         }
     }
     Ok(out)
+}
+
+/// Finalize a single accumulator to its scalar value, for `$setWindowFields`
+/// (one value per output field per row, not a whole group doc). Differs from
+/// `finalize` only in that `$avg` over no non-null value yields `Null` rather
+/// than an absent field — mongod's `$setWindowFields` writes the window's
+/// empty/degenerate value (`_empty_window_value`) into every row. Because a
+/// fresh accumulator applied over zero window docs already lands on those
+/// defaults (`$sum`/`$count` -> 0, `$push`/`$addToSet` -> [], everything else
+/// -> Null), the empty-window case needs no special path.
+pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
+    Ok(match acc {
+        Acc::Sum(n) => n.to_bson()?,
+        Acc::Count(n) => int_to_bson(n as i128).ok_or(())?,
+        Acc::Avg(state) => match state {
+            Some((total, count)) => {
+                let tf = match total {
+                    Num::Int { v: a, .. } => {
+                        if a.unsigned_abs() > (1u128 << 53) {
+                            return Err(()); // precision: defer to Python int/int divide
+                        }
+                        a as f64
+                    }
+                    Num::Float(f) => f,
+                };
+                Bson::Double(tf / count as f64)
+            }
+            None => Bson::Null,
+        },
+        Acc::Min(v) | Acc::Max(v) => v.unwrap_or(Bson::Null),
+        Acc::First(v) | Acc::Last(v) => v.unwrap_or(Bson::Null),
+        Acc::Push(list) | Acc::AddToSet(list) => Bson::Array(list),
+        // Empty window -> {} (a fresh accumulator over zero docs), matching
+        // `_empty_window_value("$mergeObjects")`.
+        Acc::MergeObjects(merged) => Bson::Document(merged),
+        // A window writes a value into every row: empty / degenerate -> null.
+        Acc::StdDev { values, pop } => std_dev(&values, pop).map_or(Bson::Null, Bson::Double),
+        Acc::NElem { kind, n, vals } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
+        Acc::TopN {
+            kind,
+            n,
+            dirs,
+            items,
+        } => topn_result(kind, n.unwrap_or(1), &dirs, items)?,
+    })
 }
 
 /// Compile the accumulator specs (each must be a single-op doc) and run the
@@ -490,6 +909,78 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
     Ok(out)
 }
 
+/// `$bucketAuto` — sort docs by the `groupBy` value (byte-sortable sort key, so
+/// cross-type order matches mongod / storage) and split them into at most
+/// `buckets` chunks of roughly equal count, then run the `output` accumulators
+/// (default `{count: {$sum: 1}}`) per chunk with `_id: {min, max}`. Mirrors
+/// `aggregate._stage_bucket_auto`: a pure count-chunking — documents that share a
+/// boundary value are *not* coalesced into one bucket (so N equal values still
+/// split across buckets), matching the Python server.
+pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+    let Bson::Document(s) = spec else {
+        return Err(());
+    };
+    let Some(group_by) = s.get("groupBy") else {
+        return Err(());
+    };
+    let n_buckets = match s.get("buckets") {
+        Some(Bson::Int32(n)) if *n >= 1 => *n as usize,
+        Some(Bson::Int64(n)) if *n >= 1 => *n as usize,
+        _ => return Err(()),
+    };
+    let default_output = bson::doc! {"count": {"$sum": 1i32}};
+    let output_spec: &Document = match s.get("output") {
+        Some(Bson::Document(d)) if !d.is_empty() => d,
+        None | Some(Bson::Document(_)) => &default_output,
+        Some(_) => return Err(()),
+    };
+
+    // Evaluate groupBy per doc, then sort by the byte-sortable encoding (the same
+    // order Python's `_SortKey` gives). A value the encoder can't represent
+    // defers the whole stage to Python.
+    let mut pairs: Vec<(Bson, &Document)> = Vec::with_capacity(docs.len());
+    for d in docs {
+        pairs.push((eval(group_by, d, vars)?, d));
+    }
+    let mut keyed: Vec<(Vec<u8>, Bson, &Document)> = Vec::with_capacity(pairs.len());
+    for (v, d) in pairs {
+        let k = crate::sortkey::encode_value(&v, None).map_err(|_| ())?;
+        keyed.push((k, v, d));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    if keyed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let bucket_size = std::cmp::max(1, keyed.len() / n_buckets);
+    let mut out: Vec<Document> = Vec::new();
+    let mut i = 0usize;
+    while i < keyed.len() && out.len() < n_buckets {
+        let is_last = out.len() == n_buckets - 1;
+        let end = if is_last {
+            keyed.len()
+        } else {
+            std::cmp::min(i + bucket_size, keyed.len())
+        };
+        let chunk = &keyed[i..end];
+        if chunk.is_empty() {
+            break;
+        }
+        // Upper bound: the next chunk's first value when there is one, else this
+        // chunk's last value (mirrors Python's `pairs[i + bucket_size]` lookahead).
+        let upper = if !is_last && i + bucket_size < keyed.len() {
+            keyed[i + bucket_size].1.clone()
+        } else {
+            chunk[chunk.len() - 1].1.clone()
+        };
+        let id = Bson::Document(bson::doc! { "min": chunk[0].1.clone(), "max": upper });
+        let chunk_docs: Vec<&Document> = chunk.iter().map(|(_, _, d)| *d).collect();
+        out.push(accumulate_into(id, output_spec, &chunk_docs, vars)?);
+        i += chunk.len();
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +1048,109 @@ mod tests {
                 Bson::Int32(2)
             ]))
         );
+    }
+
+    #[test]
+    fn topn_bottomn_accumulators() {
+        // docs: (s, score) — sort by score desc: x2(9), x1(3), x3(1).
+        let docs = vec![
+            doc! {"s": "x1", "score": 3i32},
+            doc! {"s": "x2", "score": 9i32},
+            doc! {"s": "x3", "score": 1i32},
+        ];
+        let out = g(
+            bson::bson!({
+                "_id": Bson::Null,
+                "tn": {"$topN": {"n": 2, "sortBy": {"score": -1}, "output": "$s"}},
+                "bn": {"$bottomN": {"n": 2, "sortBy": {"score": 1}, "output": "$s"}},
+                "t": {"$top": {"sortBy": {"score": -1}, "output": "$s"}},
+                "b": {"$bottom": {"sortBy": {"score": -1}, "output": "$s"}},
+            }),
+            docs,
+        );
+        let s = |v: &str| Bson::String(v.into());
+        // topN score desc: top 2 = x2, x1.
+        assert_eq!(out[0].get("tn"), Some(&Bson::Array(vec![s("x2"), s("x1")])));
+        // bottomN score asc [x3,x1,x2] -> last 2 = x1, x2.
+        assert_eq!(out[0].get("bn"), Some(&Bson::Array(vec![s("x1"), s("x2")])));
+        // $top / $bottom are single values.
+        assert_eq!(out[0].get("t"), Some(&s("x2")));
+        assert_eq!(out[0].get("b"), Some(&s("x3")));
+        // Validation: $top with n, missing sortBy/output, n<=0 -> defer (Python raises).
+        let d = vec![doc! {"s": "a", "score": 1i32}];
+        for bad in [
+            bson::bson!({"$top": {"n": 2, "sortBy": {"score": -1}, "output": "$s"}}),
+            bson::bson!({"$topN": {"n": 2, "output": "$s"}}),
+            bson::bson!({"$topN": {"n": 2, "sortBy": {"score": -1}}}),
+            bson::bson!({"$topN": {"n": 0, "sortBy": {"score": -1}, "output": "$s"}}),
+        ] {
+            let spec = bson::bson!({"_id": Bson::Null, "r": bad});
+            assert!(group_stage(&spec, &d, &Document::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn nelem_accumulators() {
+        // Group values in doc order: 3, 1, null, 5, 2.
+        let docs = vec![
+            doc! {"v": 3i32},
+            doc! {"v": 1i32},
+            doc! {"v": Bson::Null},
+            doc! {"v": 5i32},
+            doc! {"v": 2i32},
+        ];
+        let out = g(
+            bson::bson!({
+                "_id": Bson::Null,
+                "f": {"$firstN": {"n": 2, "input": "$v"}},
+                "l": {"$lastN": {"n": 2, "input": "$v"}},
+                "mx": {"$maxN": {"n": 2, "input": "$v"}},
+                "mn": {"$minN": {"n": 2, "input": "$v"}},
+                "f3": {"$firstN": {"n": 3, "input": "$v"}},
+                "mx3": {"$maxN": {"n": 3, "input": "$v"}},
+            }),
+            docs,
+        );
+        let arr = |xs: &[i32]| Bson::Array(xs.iter().map(|x| Bson::Int32(*x)).collect());
+        assert_eq!(out[0].get("f"), Some(&arr(&[3, 1])));
+        assert_eq!(out[0].get("l"), Some(&arr(&[5, 2])));
+        assert_eq!(out[0].get("mx"), Some(&arr(&[5, 3])));
+        assert_eq!(out[0].get("mn"), Some(&arr(&[1, 2])));
+        // firstN keeps null; maxN drops it.
+        assert_eq!(
+            out[0].get("f3"),
+            Some(&Bson::Array(vec![
+                Bson::Int32(3),
+                Bson::Int32(1),
+                Bson::Null
+            ]))
+        );
+        assert_eq!(out[0].get("mx3"), Some(&arr(&[5, 3, 2])));
+    }
+
+    #[test]
+    fn std_dev_pop_and_samp() {
+        // Values 2, 4, 6: mean 4, pop var (4+0+4)/3 = 8/3 -> sqrt ~1.63299;
+        // sample var 8/2 = 4 -> 2.0.
+        let docs = vec![doc! {"v": 2i32}, doc! {"v": 4i32}, doc! {"v": 6i32}];
+        let out = g(
+            bson::bson!({"_id": Bson::Null, "p": {"$stdDevPop": "$v"}, "s": {"$stdDevSamp": "$v"}}),
+            docs,
+        );
+        assert_eq!(out[0].get("p"), Some(&Bson::Double((8.0f64 / 3.0).sqrt())));
+        assert_eq!(out[0].get("s"), Some(&Bson::Double(2.0)));
+        // Single value: pop -> 0.0, samp -> null. All-missing -> field absent.
+        let out2 = g(
+            bson::bson!({
+                "_id": Bson::Null,
+                "p": {"$stdDevPop": "$v"}, "s": {"$stdDevSamp": "$v"},
+                "m": {"$stdDevPop": "$missing"},
+            }),
+            vec![doc! {"v": 5i32}],
+        );
+        assert_eq!(out2[0].get("p"), Some(&Bson::Double(0.0)));
+        assert_eq!(out2[0].get("s"), Some(&Bson::Null));
+        assert!(out2[0].get("m").is_none());
     }
 
     #[test]

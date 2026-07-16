@@ -1,5 +1,9 @@
 {% extends "base.html" %}
 {% block content %}
+{% set caps = request.app.state.capabilities %}
+{% if not caps.server_log %}
+  <div class="flash flash-warn">{{ caps.label }} doesn't serve a <code>getLog</code> ring buffer — this page will stay empty.</div>
+{% endif %}
 <p class="modal-meta">
   Last entries from the in-memory <code>getLog("global")</code> ring.
   Refreshes every 2 seconds.

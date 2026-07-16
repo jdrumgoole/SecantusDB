@@ -6,17 +6,27 @@ First-cut subset that matches the common driver-test surface:
   ``$max`` / ``$first`` / ``$last`` / ``$push`` / ``$addToSet`` /
   ``$count``).
 * Position-based windows via ``window: {documents: [<lower>, <upper>]}``.
+* Value-based windows via ``window: {range: [<lower>, <upper>]}`` over a single
+  ascending numeric sortBy field (bounds ``[cur+lo, cur+hi]``), or over a date
+  sortBy with a fixed-duration ``unit`` (``week`` / ``day`` / ``hour`` /
+  ``minute`` / ``second`` / ``millisecond``) that scales the offsets.
 * Bound forms: integer offsets, ``"current"``, ``"unbounded"``.
 * Default window (when not specified) covers the whole partition.
 
-Deferred (raises ``AggregateError`` with a clear message): range-based
-windows (``window: {range: [...]}``), time-series functions
-(``$derivative`` / ``$integral`` / ``$linearFill`` / ``$locf`` /
-``$shift`` / ``$expMovingAvg``), and rank functions (``$rank`` /
-``$denseRank`` / ``$documentNumber``).
+Also supported: the time-series operators ``$shift`` / ``$expMovingAvg`` /
+``$locf`` / ``$linearFill`` / ``$derivative`` / ``$integral``, and the rank
+functions (``$rank`` / ``$denseRank`` / ``$documentNumber`` — see
+``tests/test_window_rank_functions.py``).
+
+Deferred (raises ``AggregateError`` with a clear message): range windows with a
+variable-length ``unit`` (``month`` / ``quarter`` / ``year``) or a non-ascending
+/ multi-field / non-numeric sortBy, and ``$derivative`` / ``$integral`` with a
+time ``unit``.
 """
 
 from __future__ import annotations
+
+import datetime as _dt
 
 import pytest
 from pymongo import MongoClient
@@ -305,10 +315,139 @@ def test_partition_sort_changes_running_total_order(client) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_unsupported_time_series_function_raises(client) -> None:
-    """Time-series functions are still deferred — raise so the gap is
-    visible. (Rank functions shipped separately — see
-    ``tests/test_window_rank_functions.py`` for their semantics.)"""
+def test_shift_prev_next_with_default(client) -> None:
+    """`$shift` reads the `output` expression from the row `by` positions away in
+    the sorted partition, falling to `default` / null past the edge."""
+    coll = client["swf_db"]["shift"]
+    coll.insert_many([{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)])  # v: 10,20,30,40
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "prev": {"$shift": {"output": "$v", "by": -1, "default": 0}},
+                            "next": {"$shift": {"output": "$v", "by": 1}},
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["prev"] for d in out] == [0, 10, 20, 30]
+    assert [d["next"] for d in out] == [20, 30, 40, None]
+
+
+def test_shift_partitioned(client) -> None:
+    """`$shift` is per-partition — it never reads across a partition boundary."""
+    coll = client["swf_db"]["shift_part"]
+    coll.insert_many(
+        [
+            {"_id": 1, "g": "a", "t": 1, "v": 1},
+            {"_id": 2, "g": "a", "t": 2, "v": 2},
+            {"_id": 3, "g": "b", "t": 1, "v": 9},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": "$g",
+                        "sortBy": {"t": 1},
+                        "output": {"nxt": {"$shift": {"output": "$v", "by": 1, "default": -1}}},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    # a: [1->2, 2->default], b: single row -> default.
+    assert [d["nxt"] for d in out] == [2, -1, -1]
+
+
+def test_exp_moving_avg_n_and_alpha(client) -> None:
+    """`$expMovingAvg` — `ema[i] = v[i]*a + ema[i-1]*(1-a)`, with `a = 2/(N+1)`
+    for the N form (N=3 -> a=0.5) or an explicit `alpha`."""
+    coll = client["swf_db"]["ema"]
+    coll.insert_many([{"_id": i, "t": i, "v": v} for i, v in enumerate([10, 20, 30, 40])])
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "eN": {"$expMovingAvg": {"input": "$v", "N": 3}},
+                            "eA": {"$expMovingAvg": {"input": "$v", "alpha": 0.5}},
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["eN"] for d in out] == [10.0, 15.0, 22.5, 31.25]
+    assert [d["eA"] for d in out] == [10.0, 15.0, 22.5, 31.25]
+
+
+def test_exp_moving_avg_requires_one_of_n_alpha(client) -> None:
+    """Exactly one of N / alpha — neither or both raises."""
+    coll = client["swf_db"]["ema_bad"]
+    coll.insert_one({"_id": 1, "t": 1, "v": 1})
+    for spec in ({"input": "$v"}, {"input": "$v", "N": 3, "alpha": 0.5}):
+        with pytest.raises(OperationFailure):
+            list(
+                coll.aggregate(
+                    [
+                        {
+                            "$setWindowFields": {
+                                "sortBy": {"t": 1},
+                                "output": {"e": {"$expMovingAvg": spec}},
+                            }
+                        }
+                    ]
+                )
+            )
+
+
+def test_locf_and_linear_fill(client) -> None:
+    """`$locf` carries the last non-null forward; `$linearFill` interpolates on
+    the sortBy x-axis. Leading nulls (locf) / trailing nulls (both) stay null."""
+    coll = client["swf_db"]["fill"]
+    coll.insert_many(
+        [
+            {"_id": 1, "t": 0, "v": None},
+            {"_id": 2, "t": 1, "v": 10},
+            {"_id": 3, "t": 2, "v": None},
+            {"_id": 4, "t": 4, "v": 40},
+            {"_id": 5, "t": 5, "v": None},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"lo": {"$locf": "$v"}, "li": {"$linearFill": "$v"}},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["lo"] for d in out] == [None, 10, 10, 40, 40]
+    # t=1..4 line from (1,10) to (4,40): at t=2 -> 20, at t=3 -> 30 (not present),
+    # but here t goes 0,1,2,4,5: interp at t=2 -> 10+(40-10)*(2-1)/(4-1) = 20.
+    assert [d["li"] for d in out] == [None, 10, 20.0, 40, None]
+
+
+def test_derivative_unit_on_numeric_sort_raises(client) -> None:
+    """A `$derivative` / `$integral` `unit` requires a date sortBy — a numeric
+    sortBy raises."""
     coll = client["swf_db"]["timeseries"]
     coll.insert_one({"_id": 1, "v": 1, "ts": 1})
 
@@ -319,7 +458,7 @@ def test_unsupported_time_series_function_raises(client) -> None:
                     {
                         "$setWindowFields": {
                             "sortBy": {"ts": 1},
-                            "output": {"d": {"$derivative": {"input": "$v"}}},
+                            "output": {"d": {"$derivative": {"input": "$v", "unit": "second"}}},
                         }
                     }
                 ]
@@ -327,23 +466,231 @@ def test_unsupported_time_series_function_raises(client) -> None:
         )
 
 
-def test_range_window_not_yet_implemented(client) -> None:
-    """Range-based windows raise rather than silently doing the wrong thing."""
-    coll = client["swf_db"]["range"]
-    coll.insert_one({"_id": 1, "ts": 1, "v": 1})
+def test_derivative_and_integral_with_time_unit(client) -> None:
+    """`$derivative` / `$integral` with a time `unit` over a date sortBy: the
+    x-axis is the date scaled into the unit, so the rate is *per hour*."""
+    coll = client["swf_db"]["ts_unit"]
+    coll.insert_many(
+        [
+            {"_id": i, "t": _dt.datetime(2020, 1, 1, i, tzinfo=_dt.timezone.utc), "v": v}
+            for i, v in enumerate([0, 10, 30])
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            # slope over the whole partition: (30-0)/2h = 15/hour
+                            "d": {"$derivative": {"input": "$v", "unit": "hour"}},
+                            # trapezoidal area: 5 + 20 = 25 (x in hours)
+                            "i": {"$integral": {"input": "$v", "unit": "hour"}},
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["d"] for d in out] == [15.0, 15.0, 15.0]
+    assert [d["i"] for d in out] == [25.0, 25.0, 25.0]
 
+
+def test_derivative_variable_length_unit_raises(client) -> None:
+    """A variable-length `unit` (month/quarter/year) on `$derivative` defers."""
+    coll = client["swf_db"]["ts_month"]
+    coll.insert_many(
+        [
+            {"_id": i, "t": _dt.datetime(2020, 1 + i, 1, tzinfo=_dt.timezone.utc), "v": i}
+            for i in range(3)
+        ]
+    )
     with pytest.raises(OperationFailure):
         list(
             coll.aggregate(
                 [
                     {
                         "$setWindowFields": {
-                            "sortBy": {"ts": 1},
+                            "sortBy": {"t": 1},
+                            "output": {"d": {"$derivative": {"input": "$v", "unit": "month"}}},
+                        }
+                    }
+                ]
+            )
+        )
+
+
+def test_derivative_and_integral(client) -> None:
+    """`$derivative` is the slope over the window (null for <2 points);
+    `$integral` is the trapezoidal area, both against the sortBy x-axis."""
+    coll = client["swf_db"]["deriv"]
+    coll.insert_many(
+        [{"_id": i, "t": t, "v": v} for i, (t, v) in enumerate([(0, 0), (1, 10), (2, 20), (4, 60)])]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "d": {"$derivative": {"input": "$v"}},  # (60-0)/(4-0) = 15
+                            "i": {"$integral": {"input": "$v"}},  # 5 + 15 + 80 = 100
+                            "rd": {
+                                "$derivative": {"input": "$v"},
+                                "window": {"documents": [-1, 0]},
+                            },
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["d"] for d in out] == [15.0, 15.0, 15.0, 15.0]
+    assert [d["i"] for d in out] == [100.0, 100.0, 100.0, 100.0]
+    # rolling 2-doc slope: first row has a single-point window -> null.
+    assert [d["rd"] for d in out] == [None, 10.0, 10.0, 20.0]
+
+
+def test_range_window_rolling_sum(client) -> None:
+    """Value-based window: include rows whose sortBy value is within
+    ``[cur - 1, cur]``. A gap in the sort values (no t=4) shrinks the window."""
+    coll = client["swf_db"]["range_roll"]
+    coll.insert_many(
+        [
+            {"_id": 1, "t": 1, "v": 10},
+            {"_id": 2, "t": 2, "v": 20},
+            {"_id": 3, "t": 3, "v": 30},
+            {"_id": 4, "t": 5, "v": 50},
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {"s": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    # t=1 -> {t in [0,1]} = 10; t=2 -> {1,2} = 30; t=3 -> {2,3} = 50;
+    # t=5 -> {t in [4,5]} = 50 (t=3 is outside, no t=4).
+    assert [d["s"] for d in out] == [10, 30, 50, 50]
+
+
+def test_range_window_unbounded_to_current_running_total(client) -> None:
+    coll = client["swf_db"]["range_run"]
+    coll.insert_many([{"_id": i, "t": i, "v": (i + 1) * 10} for i in range(4)])
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "r": {"$sum": "$v", "window": {"range": ["unbounded", "current"]}}
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["r"] for d in out] == [10, 30, 60, 100]
+
+
+def test_range_window_time_unit_on_numeric_sort_raises(client) -> None:
+    """A range window ``unit`` requires a date sortBy — a numeric sortBy raises."""
+    coll = client["swf_db"]["range_unit"]
+    coll.insert_one({"_id": 1, "t": 1, "v": 1})
+    with pytest.raises(OperationFailure):
+        list(
+            coll.aggregate(
+                [
+                    {
+                        "$setWindowFields": {
+                            "sortBy": {"t": 1},
                             "output": {
-                                "x": {
-                                    "$sum": "$v",
-                                    "window": {"range": [-1, 1]},
-                                }
+                                "x": {"$sum": "$v", "window": {"range": [-1, 0], "unit": "day"}}
+                            },
+                        }
+                    }
+                ]
+            )
+        )
+
+
+def test_range_window_date_unit_day_rolling_sum(client) -> None:
+    """A ``unit: "day"`` range window over a date sortBy sums the trailing
+    2-day span for each row (x-axis is the date's epoch millis)."""
+    coll = client["swf_db"]["range_day"]
+    coll.insert_many(
+        [
+            {
+                "_id": i,
+                "t": _dt.datetime(2020, 1, 1 + i, tzinfo=_dt.timezone.utc),
+                "v": (i + 1) * 10,
+            }
+            for i in range(5)
+        ]
+    )
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "sortBy": {"t": 1},
+                        "output": {
+                            "s": {"$sum": "$v", "window": {"range": [-2, 0], "unit": "day"}}
+                        },
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+    assert [d["s"] for d in out] == [10, 30, 60, 90, 120]
+
+
+def test_range_window_date_without_unit_raises(client) -> None:
+    """A range window over a date sortBy requires a ``unit``."""
+    coll = client["swf_db"]["range_nounit"]
+    coll.insert_one({"_id": 1, "t": _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc), "v": 1})
+    with pytest.raises(OperationFailure):
+        list(
+            coll.aggregate(
+                [
+                    {
+                        "$setWindowFields": {
+                            "sortBy": {"t": 1},
+                            "output": {"x": {"$sum": "$v", "window": {"range": [-1, 0]}}},
+                        }
+                    }
+                ]
+            )
+        )
+
+
+def test_range_window_variable_length_unit_raises(client) -> None:
+    """A variable-length ``unit`` (month/quarter/year) is still deferred."""
+    coll = client["swf_db"]["range_month"]
+    coll.insert_one({"_id": 1, "t": _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc), "v": 1})
+    with pytest.raises(OperationFailure):
+        list(
+            coll.aggregate(
+                [
+                    {
+                        "$setWindowFields": {
+                            "sortBy": {"t": 1},
+                            "output": {
+                                "x": {"$sum": "$v", "window": {"range": [-1, 0], "unit": "month"}}
                             },
                         }
                     }

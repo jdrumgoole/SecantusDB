@@ -62,13 +62,13 @@ connect to it over TCP. Two ways to launch.
 ### CLI
 
 ```bash
-secantusdb --host 127.0.0.1 --port 27017
+secantusd-py --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default
 ```
 
-`secantusdb` is the standalone single-node server installed by `pip install
-SecantusDB`. The legacy alias `secantus` and the module form
-`python -m secantus` invoke the same entry point.
+`secantusd-py` is the standalone single-node Python server installed by `pip
+install SecantusDB`. The module form `python -m secantus` invokes the same
+entry point.
 
 Then from another shell — same commands you'd run against `mongod`:
 

@@ -9,6 +9,13 @@ __pycache__/
 venv/
 .env
 
+# Never commit private keys / certs / keystores — a safety net so a stray
+# credential file can't be added by accident. (security review §I8)
+*.pem
+*.key
+*.p12
+*.pfx
+
 build/
 dist/
 wheelhouse/
@@ -30,8 +37,11 @@ docs/_build/
 .vscode/
 
 # Claude Code's per-worktree harness config (hooks, plugins, settings).
-# Local to the developer; never committed.
-.claude/
+# settings.local.json (and everything else under .claude/) stays per-developer
+# and uncommitted; settings.json is the shared, committed team config —
+# e.g. the test-run permission allowlist every contributor benefits from.
+.claude/*
+!.claude/settings.json
 
 # Cross-driver smoke test scaffolding. The Go module's downloaded
 # deps live in $GOPATH (already outside the repo); the Node smoke's

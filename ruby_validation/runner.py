@@ -39,11 +39,13 @@ import tempfile
 import time
 from pathlib import Path
 
+import gauge_common
+
 from .include_paths import INCLUDE, SKIP_TAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-ruby-driver"
-RAW_OUT = REPO_ROOT / ".validation" / "ruby-raw.json"
+RAW_OUT = REPO_ROOT / ".validation" / f"ruby-raw{gauge_common.report_suffix()}.json"
 
 # Hard wall-clock limit on the rspec invocation. The Ruby driver's
 # integration suite has tests that wait indefinitely on tailable
@@ -231,7 +233,6 @@ def main() -> int:
     RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
 
     host = "127.0.0.1"
-    port = _pick_ephemeral_port()
 
     # Use an on-disk tempdir (NOT ``:memory:``) so the user records we
     # seed survive the auth-mode flip below. ``:memory:`` would lose
@@ -243,7 +244,7 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    def _spawn_daemon(*, with_auth: bool) -> subprocess.Popen:
+    def _spawn_daemon(*, with_auth: bool) -> tuple[subprocess.Popen, str, int]:
         cmd = [
             sys.executable,
             "-m",
@@ -251,7 +252,7 @@ def main() -> int:
             "--host",
             host,
             "--port",
-            str(port),
+            "0",
             "--storage-path",
             storage_dir,
             "--log-level",
@@ -259,16 +260,14 @@ def main() -> int:
         ]
         if with_auth:
             cmd.append("--auth")
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
+        # Each phase binds its own port; the seeded users persist via storage_dir,
+        # so the auth phase doesn't need to reuse phase 1's port.
+        return gauge_common.spawn_daemon(cmd, label="ruby_validation")
 
-    print(f"ruby_validation: phase 1 — seeding daemon (no --auth) on {host}:{port}", file=sys.stderr)
-    daemon = _spawn_daemon(with_auth=False)
+    print("ruby_validation: phase 1 — seeding daemon (no --auth)", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=False)
     try:
-        _wait_for_listener(host, port)
         _verify_secantus_identity(host, port, "ruby_validation")
         print("ruby_validation: seeding root-user + ruby-test-user", file=sys.stderr)
         _seed_users(host, port)
@@ -280,14 +279,9 @@ def main() -> int:
             daemon.kill()
             daemon.wait()
 
-    print(
-        f"ruby_validation: phase 2 — running gauge with --auth on {host}:{port}",
-        file=sys.stderr,
-    )
-    daemon = _spawn_daemon(with_auth=True)
+    print("ruby_validation: phase 2 — running gauge with --auth", file=sys.stderr)
+    daemon, host, port = _spawn_daemon(with_auth=True)
     try:
-        _wait_for_listener(host, port)
-
         env = os.environ.copy()
         env["MONGODB_URI"] = (
             f"mongodb://{ROOT_USER}:{ROOT_PASSWORD}@{host}:{port}/?authSource=admin"
@@ -302,8 +296,7 @@ def main() -> int:
             cmd.extend(["--tag", f"~{tag}"])
         cmd.extend(INCLUDE)
         print(
-            f"ruby_validation: `{' '.join(cmd)}` in {VENDOR} "
-            f"(MONGODB_URI={env['MONGODB_URI']})",
+            f"ruby_validation: `{' '.join(cmd)}` in {VENDOR} (MONGODB_URI={env['MONGODB_URI']})",
             file=sys.stderr,
         )
         try:

@@ -5,29 +5,29 @@ mechanism since 4.0, end-to-end on the wire. The same `MongoClient(uri,
 username=, password=)` calls you'd point at a real `mongod` work against
 SecantusDB unchanged.
 
-This is wire-protocol authentication only — `saslStart` / `saslContinue`
-plus the `createUser` / `dropUser` / `usersInfo` admin commands and the
-per-connection state machine. **Authorization (RBAC) is not implemented
-yet**: an authenticated principal is treated as fully privileged. See
-[Compatibility](compatibility.md) and `tasks/backlog.md` for the
-remaining gaps.
+Authentication covers `saslStart` / `saslContinue` plus the full user
+admin command set (`createUser` / `updateUser` / `dropUser` / `usersInfo` /
+`dropAllUsersFromDatabase`) and the per-connection state machine.
+**Authorization (RBAC) is enforced too**: with `--auth` on, every command an
+authenticated principal issues is checked against its role bindings — see
+[Authorization](#authorization-rbac) below.
 
 ## Off by default
 
-Auth is opt-in. A vanilla `secantusdb` daemon and the embedded
+Auth is opt-in. A vanilla `secantusd-py` daemon and the embedded
 `SecantusDBServer(...)` accept commands from any connection — same as
 running `mongod` without `--auth`. This keeps the test-harness use case
 zero-friction.
 
 ```bash
-secantusdb --port 27117          # no auth required
+secantusd-py --port 27117          # no auth required
 ```
 
 ## Turning auth on
 
 Two equivalent switches:
 
-- CLI flag: `secantusdb --auth`
+- CLI flag: `secantusd-py --auth`
 - Constructor: `SecantusDBServer(..., require_auth=True)`
 
 With auth on, only the handshake and the SCRAM exchange run on an
@@ -36,7 +36,7 @@ unauthenticated connection. Everything else (`find`, `insert`,
 completes a `saslStart` / `saslContinue` round-trip.
 
 ```bash
-secantusdb --auth --port 27117
+secantusd-py --auth --port 27117
 ```
 
 ## Provisioning users
@@ -54,7 +54,7 @@ admin.command(
     {
         "createUser": "alice",
         "pwd": "hunter2",
-        "roles": [],            # roles accepted but not enforced (RBAC TBD)
+        "roles": [{"role": "readWrite", "db": "mydb"}],
     }
 )
 ```
@@ -124,6 +124,39 @@ admin.command({"usersInfo": 1})                                # all users in th
 admin.command({"usersInfo": "alice"})                          # one
 admin.command({"usersInfo": "alice", "showCredentials": True}) # include hashes
 admin.command("connectionStatus")                              # auth state
+```
+
+## Authorization (RBAC)
+
+With `--auth` on, every command from an authenticated connection is checked
+against the connection's effective roles; a miss returns `Unauthorized`
+(code 13) with mongod's `not authorized on <db> to execute command` message.
+With auth off (the zero-friction test-harness default) no privilege checks
+run.
+
+Built-in roles mirror mongod's: `read`, `readWrite`, `dbAdmin`, `userAdmin`,
+`dbOwner`, `readAnyDatabase`, `readWriteAnyDatabase`, `dbAdminAnyDatabase`,
+`userAdminAnyDatabase`, `clusterMonitor`, `clusterAdmin`, `backup`,
+`restore`, `root`.
+
+Custom roles are supported through the standard command set —
+`createRole` / `updateRole` / `dropRole` / `dropAllRolesFromDatabase` /
+`rolesInfo`, plus the grant/revoke quartet (`grantRolesToUser` /
+`revokeRolesFromUser` / `grantPrivilegesToRole` / `revokePrivilegesFromRole` /
+`grantRolesToRole` / `revokeRolesFromRole`). Role documents nest (a role can
+inherit other roles); resolution walks the closure.
+
+```python
+admin.command(
+    {
+        "createRole": "metricsReader",
+        "privileges": [
+            {"resource": {"db": "metrics", "collection": ""}, "actions": ["find"]}
+        ],
+        "roles": [],
+    }
+)
+admin.command({"grantRolesToUser": "alice", "roles": [{"role": "metricsReader", "db": "admin"}]})
 ```
 
 ## MONGODB-X509 — cert-as-username auth
@@ -227,5 +260,4 @@ advertised by default**. Pass `mechanisms=["SCRAM-SHA-1"]` to
 - **Internal cluster auth (keyfile / x509)** — only meaningful with
   replica sets / sharding, both out of scope.
 
-These are tracked in `tasks/backlog.md` and will land in follow-up
-slices.
+These are tracked in `tasks/backlog.md`.

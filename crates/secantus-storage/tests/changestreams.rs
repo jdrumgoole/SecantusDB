@@ -274,6 +274,65 @@ fn scope_filters_events() {
 }
 
 #[test]
+fn rename_event_carries_operation_description_with_drop_target() {
+    // With showExpandedEvents, a rename that replaced an existing target carries
+    // `operationDescription: {to, dropTarget}` (the dropTarget UUID comes from
+    // the oplog `o.dropTarget`). Mirrors mongod 6.0+ expanded rename events.
+    with_db(|st| {
+        let dropped_ui = Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: vec![7u8; 16],
+        });
+        let entry = doc! {
+            "op": "c",
+            "ns": "app.$cmd",
+            "o": {
+                "renameCollection": "app.c",
+                "to": "app.foo",
+                "dropTarget": dropped_ui.clone(),
+            },
+            "ts": Bson::Timestamp(Timestamp { time: 300, increment: 1 }),
+        };
+        let (ev, inv) = changestreams::project(
+            7,
+            &entry,
+            st,
+            FULL_DOC_DEFAULT,
+            FULL_DOC_DEFAULT,
+            &coll_scope(),
+            true, // show_expanded_events
+        )
+        .unwrap();
+        let ev = ev.unwrap();
+        assert_eq!(ev.get_str("operationType").unwrap(), "rename");
+        assert_eq!(
+            ev.get_document("to").unwrap(),
+            &doc! {"db": "app", "coll": "foo"}
+        );
+        let op_desc = ev.get_document("operationDescription").unwrap();
+        assert_eq!(
+            op_desc.get_document("to").unwrap(),
+            &doc! {"db": "app", "coll": "foo"}
+        );
+        assert_eq!(op_desc.get("dropTarget"), Some(&dropped_ui));
+        assert!(inv); // a rename of the watched collection ends the stream
+
+        // Without showExpandedEvents, there's no operationDescription at all.
+        let (ev2, _) = changestreams::project(
+            7,
+            &entry,
+            st,
+            FULL_DOC_DEFAULT,
+            FULL_DOC_DEFAULT,
+            &coll_scope(),
+            false,
+        )
+        .unwrap();
+        assert!(ev2.unwrap().get("operationDescription").is_none());
+    });
+}
+
+#[test]
 fn noop_heartbeat_projects_nothing() {
     with_db(|st| {
         let seq = st.emit_noop_heartbeat().unwrap();
@@ -335,6 +394,7 @@ fn resume_token_round_trips() {
         },
         ns: "app.c".into(),
         document_key: doc! {"_id": 7},
+        from_invalidate: false,
     };
     let token = changestreams::make_resume_token(&data).unwrap();
     let parsed = changestreams::parse_resume_token(&token).unwrap();
@@ -350,4 +410,40 @@ fn small_event_gets_single_fragment() {
         frags[0].get_document("splitEvent").unwrap(),
         &doc! {"fragment": 1, "of": 1}
     );
+}
+
+#[test]
+fn over_16mb_event_splits_by_heavy_field() {
+    // An update with a ~10MB pre-image and a ~10MB updated value exceeds 16MB and
+    // has two heavy (>1MB) fields, so it splits into 2 fragments — one heavy field
+    // each, light metadata copied into both (mirrors pymongo test_split_large_change).
+    let big = "q".repeat(10 * 1024 * 1024);
+    let event = doc! {
+        "_id": doc! {"_data": "tok"},
+        "operationType": "update",
+        "ns": doc! {"db": "d", "coll": "c"},
+        "fullDocumentBeforeChange": big.clone(),
+        "updateDescription": doc! {"updatedFields": doc! {"value": big}},
+    };
+    let frags = changestreams::stamp_split_event(event).unwrap();
+    assert_eq!(frags.len(), 2);
+    assert_eq!(
+        frags[0].get_document("splitEvent").unwrap(),
+        &doc! {"fragment": 1, "of": 2}
+    );
+    assert_eq!(
+        frags[1].get_document("splitEvent").unwrap(),
+        &doc! {"fragment": 2, "of": 2}
+    );
+    // Light metadata is copied verbatim into every fragment.
+    for f in &frags {
+        assert_eq!(f.get_str("operationType").unwrap(), "update");
+        assert!(f.get_document("ns").is_ok());
+    }
+    // Each heavy field lands in exactly one fragment.
+    let has_pre: Vec<bool> = frags
+        .iter()
+        .map(|f| f.contains_key("fullDocumentBeforeChange"))
+        .collect();
+    assert_eq!(has_pre.iter().filter(|b| **b).count(), 1);
 }

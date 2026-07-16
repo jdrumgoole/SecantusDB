@@ -50,8 +50,9 @@ def _load_pure_projection():
 _pure = _load_pure_projection()
 
 
-def _rust_proj(doc, spec):
-    res = _rust.apply_projection(bson.encode(doc), bson.encode(spec))
+def _rust_proj(doc, spec, query=None):
+    qb = bson.encode(query) if query else None
+    res = _rust.apply_projection(bson.encode(doc), bson.encode(spec), qb)
     return None if res is None else bson.decode(res)
 
 
@@ -103,6 +104,13 @@ CURATED = [
     ({"_id": 1, "a": 1, "b": 2}, {}),  # empty spec
     ({"_id": 1, "a": 1, "b": 2}, {"a": True, "b": False}),  # mixed -> defer
     ({"a": 1, "b": 2}, {"a": 1}),  # no _id in doc
+    # $meta with a recognized-but-unsupported arg: field omitted (both engines
+    # agree). textScore/17308/40218 error cases are validated at parse time in
+    # the command layer, not here — this asserts the graceful-omit behaviour.
+    ({"_id": 1, "a": 1, "b": 2}, {"score": {"$meta": "indexKey"}}),
+    ({"_id": 1, "a": 1, "b": 2}, {"a": 1, "score": {"$meta": "recordId"}}),
+    ({"_id": 1, "a": 1, "b": 2}, {"_id": 0, "score": {"$meta": "sortKey"}}),
+    ({"_id": 1, "a": 1, "b": 2}, {"m": {"$meta": "geoNearDistance"}}),
 ]
 
 
@@ -115,6 +123,45 @@ def test_curated_parity(doc, spec):
         return
     py = _pure.apply_projection(doc, spec)
     assert rust == py, f"rust={rust} pure={py} spec={spec}"
+
+
+# Positional `arr.$` projection — needs the query (filter) to resolve which
+# element matched. (doc, spec, query).
+POSITIONAL_CURATED = [
+    (
+        {"_id": 1, "items": [{"k": "a", "n": 1}, {"k": "b", "n": 2}, {"k": "c", "n": 3}]},
+        {"items.$": 1},
+        {"items.k": "b"},
+    ),
+    ({"_id": 4, "nums": [1, 5, 10, 15]}, {"nums.$": 1}, {"nums": {"$gte": 10}}),
+    (
+        {"_id": 1, "items": [{"k": "a", "n": 1}, {"k": "c", "n": 3}]},
+        {"items.$": 1},
+        {"items": {"$elemMatch": {"n": {"$gt": 2}}}},
+    ),
+    (
+        {"_id": 2, "items": [{"k": "b", "n": 5}, {"k": "b", "n": 6}]},
+        {"items.$": 1},
+        {"items.k": "b"},
+    ),  # first of two matches
+    (
+        {"_id": 1, "a": 7, "items": [{"k": "a"}, {"k": "b"}]},
+        {"_id": 0, "a": 1, "items.$": 1},
+        {"items.k": "b"},
+    ),  # positional + other field, _id:0
+]
+
+
+@pytest.mark.parametrize("doc,spec,query", POSITIONAL_CURATED)
+def test_positional_parity(doc, spec, query):
+    doc = bson.decode(bson.encode(doc))
+    spec = bson.decode(bson.encode(spec))
+    query = bson.decode(bson.encode(query))
+    rust = _rust_proj(doc, spec, query)
+    if rust is None:
+        return
+    py = _pure.apply_projection(doc, spec, query)
+    assert rust == py, f"rust={rust} pure={py} spec={spec} query={query}"
 
 
 def _rand_doc(rng):

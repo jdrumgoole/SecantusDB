@@ -15,6 +15,20 @@ on:
       - 'docs/**'
   workflow_dispatch:  # Manual ad-hoc trigger.
 
+# Keyed on the ref so each branch / PR is its own lane: a newer push to the same
+# ref cancels that ref's stale build, but distinct refs never cancel each other.
+# (Several sessions pushing the same ref — e.g. main — still collide; the project
+# convention is one feature branch per session, merged via PR.)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the build jobs only check out the repo, restore ccache, and
+# upload build artifacts — none of which need write access to repo contents.
+# (security review §I6)
+permissions:
+  contents: read
+
 jobs:
   build_wheels:
     name: Build ${{ matrix.platform }} wheels
@@ -23,12 +37,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-x86_64 (macos-13 runners) is not supported. The runner
-          # queue is too scarce for reliable CI, and Apple Silicon is the
-          # active development target.
-          - os: macos-14
-            platform: macos-arm64
-            cibw_archs: arm64
+          # macOS (macos-14 / arm64) is intentionally absent from this
+          # continuous matrix: the runner queue is scarce and the from-source
+          # WiredTiger build is slow/flaky, so it's too costly to run on every
+          # push. macOS wheels ARE built and validated at release time
+          # (publish.yml's matrix still includes macos-14 / macos-arm64).
+          # macos-x86_64 (macos-13) is unsupported regardless — Apple Silicon
+          # is the active target.
           - os: ubuntu-22.04
             platform: linux-x86_64
             cibw_archs: x86_64
@@ -39,9 +54,28 @@ jobs:
             platform: windows-x86_64
             cibw_archs: AMD64
     steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
+
+      - name: Disable Defender real-time scanning (Windows)
+        if: runner.os == 'Windows'
+        # Real-time scanning synchronously inspects every file the build
+        # creates (cargo + CMake object files, the WT tree, wheel staging) on
+        # an ephemeral VM that builds only this checkout. Best-effort.
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Warning "could not disable Defender real-time scanning: $_" }
+
 
       # Same ccache plumbing as publish.yml — see comments there.
       # Sharing the cache key (ccache-<platform>-wt-<sha>) across the
@@ -54,7 +88,7 @@ jobs:
 
       - name: Restore ccache
         if: matrix.platform != 'windows-x86_64'
-        uses: actions/cache@v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/ccache
           key: ccache-${{ matrix.platform }}-wt-${{ steps.wt-sha.outputs.sha }}
@@ -62,7 +96,7 @@ jobs:
             ccache-${{ matrix.platform }}-
 
       - name: Build wheels with cibuildwheel
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55  # v4.1.0
         env:
           CIBW_ARCHS: ${{ matrix.cibw_archs }}
           CIBW_BEFORE_ALL_LINUX: |
@@ -76,17 +110,29 @@ jobs:
               chmod +x /usr/bin/ccache
             fi
           CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
+          # SECANTUS_BUILD_STORAGE_ENGINE=ON bundles the Rust extensions +
+          # secantusd-rs into the wheel. $HOME/.cargo/bin is on PATH so the
+          # build sees the rustup-installed cargo; LIBCLANG_PATH=/opt/libclang
+          # is where before-build symlinks the container's libclang for bindgen.
           CIBW_ENVIRONMENT_LINUX: >-
             CCACHE_DIR=/host_ccache
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
+            SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
+            PATH=$HOME/.cargo/bin:$PATH
+            LIBCLANG_PATH=/opt/libclang
+            RUSTFLAGS="-Ctarget-feature=-crt-static"
+            SECANTUS_CARGO_TARGET=/host_ccache/cargo-target
           CIBW_BEFORE_ALL_MACOS: brew install ccache
           CIBW_ENVIRONMENT_MACOS: >-
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
+            SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
+            PATH=$HOME/.cargo/bin:$PATH
+            SECANTUS_CARGO_TARGET=$HOME/.cache/ccache/cargo-target
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: wheels-${{ matrix.platform }}
           path: wheelhouse/*.whl
@@ -95,17 +141,25 @@ jobs:
     name: Build sdist
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
 
       - name: Build sdist
         run: uv build --sdist
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: sdist
           path: dist/*.tar.gz

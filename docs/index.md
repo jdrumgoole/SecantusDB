@@ -30,7 +30,7 @@ There are two ways to use it:
   application or test process. No subprocess, no port collision (use
   `port=0`), no separate daemon to manage. Also ideal for tests under
   `pytest-xdist`.
-- **Standalone daemon** — `pip install` puts a `secantusdb` script on
+- **Standalone daemon** — `pip install` puts a `secantusd-py` script on
   `PATH` that runs the server like a `mongod`. Drop-in replacement for a
   single-node `mongod` in dev / CI / small production-shaped workloads
   where the beta caveats are acceptable.
@@ -39,6 +39,11 @@ Single-node only by design. Replica sets, sharding, and anything that
 depends on real cluster topology are out of scope — but within the
 single-node scope, SecantusDB is the database your driver thinks it's
 talking to: same handshake, same wire frames, same error codes.
+
+It also speaks **SQL over the PostgreSQL wire protocol** as an opt-in extra
+(`pip install "secantus[sql]"`): the same data is reachable from `psql`, pg8000,
+or SQLAlchemy, and a document written with `pymongo` reads back as a row. See
+[SQL / PostgreSQL interface](sql.md).
 
 ## Embedded
 
@@ -62,7 +67,7 @@ ephemeral WiredTiger home — suites then run cleanly under `pytest-xdist`.
 ## Standalone daemon
 
 ```bash
-secantusdb --host 127.0.0.1 --port 27017
+secantusd-py --host 127.0.0.1 --port 27017
 # storage at ./secantus-data by default
 ```
 
@@ -83,13 +88,19 @@ The conformance evidence: the official test suites for **pymongo**,
 **mongo-ruby-driver**, **mongo-rust-driver**, and the **PHP**
 library + extension all run against
 SecantusDB **unmodified** — see the
-[pymongo](validation-report.md), [Go-driver](validation-report-go.md),
+[pymongo](validation-report.md),
+[pymongo-async](validation-report-pymongo-async.md),
+[Go-driver](validation-report-go.md),
 [Node-driver](validation-report-node.md),
 [Java-driver](validation-report-java.md),
+[Kotlin-driver](validation-report-kotlin.md),
 [Ruby-driver](validation-report-ruby.md),
 [Rust-driver](validation-report-rust.md),
-[PHP-library](validation-report-php-lib.md), and
-[PHP-extension](validation-report-php-ext.md) validation reports for
+[PHP-library](validation-report-php-lib.md),
+[PHP-extension](validation-report-php-ext.md),
+[C-driver](validation-report-c.md),
+[C++-driver](validation-report-cxx.md), and
+[.NET-driver](validation-report-dotnet.md) validation reports for
 current pass-rates per feature category.
 
 ## What's in scope
@@ -106,12 +117,11 @@ Everything a single-node application needs from the wire:
 - Change streams — single-node, oplog-backed; collection / db / cluster
   scope; resume tokens; `fullDocument: "updateLookup"`; pre-images via
   `fullDocumentBeforeChange`; blocking `awaitData` getMore.
-- **Authentication** — SCRAM-SHA-256 over the standard wire protocol,
-  with `createUser` / `dropUser` / `usersInfo` admin commands and
-  per-connection state. Off by default; flip on with `--auth` /
-  `require_auth=True`. See [Authentication](authentication.md).
-  (Authorization / RBAC is *not* enforced — an authenticated principal
-  is treated as fully privileged.)
+- **Authentication and authorization** — SCRAM-SHA-256 / SCRAM-SHA-1 and
+  MONGODB-X509 over the standard wire protocol, the full user / role admin
+  command set, and enforced RBAC (built-in and custom roles). Off by
+  default; flip on with `--auth` / `require_auth=True`. See
+  [Authentication](authentication.md).
 
 See [Indexes](indexes.md) and [Aggregation](aggregation.md) for the full
 inventory, and [Compatibility](compatibility.md) for what's intentionally
@@ -123,12 +133,10 @@ Anything that depends on **real** cluster topology — multi-node replica
 sets, sharding, election, cross-node oplog — and the infrastructure
 features tangential to single-node operation:
 
-- Authentication mechanisms beyond SCRAM-SHA-256 (x509, LDAP, Kerberos,
-  GSSAPI, MONGODB-AWS, MONGODB-OIDC). SCRAM-SHA-256 itself **is**
-  supported — see [Authentication](authentication.md).
-- Authorization (RBAC) — `createUser` accepts a `roles` array but no
-  command consults it; an authenticated principal is treated as fully
-  privileged.
+- Authentication mechanisms beyond SCRAM and MONGODB-X509 (LDAP,
+  Kerberos, GSSAPI, MONGODB-AWS, MONGODB-OIDC). SCRAM-SHA-256 /
+  SCRAM-SHA-1, MONGODB-X509, and enforced RBAC **are** supported — see
+  [Authentication](authentication.md).
 - Text search (no full-text index).
 - `$where` (no JS runtime).
 
@@ -144,6 +152,8 @@ clustering and infrastructure that `mongod` brings.
   prerequisites.
 - [Quickstart](quickstart.md) — embedded in your app, run as a daemon, or wired into tests.
 - [Examples](examples.md) — connect, insert, index, query, drop.
+- [The two servers](servers.md) — the pure-Python server vs the Rust server,
+  which to use, and what each one doesn't support yet.
 - [Architecture](architecture.md) — wire / commands / query / aggregate /
   storage layers.
 - [Indexes](indexes.md) — single-field, compound, mixed-direction, partial,
@@ -157,14 +167,20 @@ clustering and infrastructure that `mongod` brings.
   resume tokens, pre-images, retention.
 - [Authentication](authentication.md) — SCRAM-SHA-256, `--auth`,
   `createUser` / `dropUser` / `usersInfo`.
-- [Admin web UI](admin.md) — `secantusdb-admin` console, page tour,
+- [Admin web UI](admin.md) — `secantus-admin` console, page tour,
   security model, programmatic use.
+- [Backup & point-in-time recovery](recovery.md) — how PITR works
+  (oplog model, the applier, manifests), snapshot backups, restoring to
+  a target timestamp, arbitrary-window archiving, change-stream resume
+  continuity, and cross-server compatibility — for both servers.
 - [Running in production](production.md) — honest comparison vs
   single-node Postgres, what's missing for production use, and a
   concrete `systemd` / TLS / backup / monitoring deployment shape.
 - [Concurrency](concurrency.md) — what scales, what doesn't, and why
   multi-writer throughput is capped by WiredTiger.
 - [Compatibility](compatibility.md) — known divergences from real MongoDB.
+- [Feature comparison](feature-comparison.md) — MongoDB vs the Python server
+  vs the Rust server, feature by feature.
 - [API reference](api.md) — `SecantusDBServer`, `Storage`, public surface.
 
 ## License
@@ -188,28 +204,40 @@ SecantusDB is dual-licensed:
 installation
 quickstart
 examples
+servers
 configuration
 architecture
 indexes
 geospatial
 aggregation
+sql
 change-streams
 authentication
 admin
+recovery
 production
 concurrency
 compatibility
+feature-comparison
 benchmark
 validation-summary
 validation-report
+validation-report-pymongo-async
 validation-report-go
 validation-report-node
 validation-report-java
+validation-report-kotlin
 validation-report-ruby
 validation-report-rust
 validation-report-php-lib
 validation-report-php-ext
+validation-report-c
+validation-report-cxx
+validation-report-dotnet
+validation-report-psycopg
+validation-report-slt
 validation-report-rust-server
+validation-report-java-rust-server
 api
 changelog
 ```

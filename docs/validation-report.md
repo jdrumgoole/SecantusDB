@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-06-15 — SecantusDB 0.5.3b7 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-07-16 — SecantusDB 0.5.4b234 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -20,25 +20,25 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_crud_unified.py` | 301 | 0 | 0 | 185 | 486 | 100.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
-| `test_cursor.py` | 64 | 3 | 0 | 5 | 72 | 95.5% |
+| `test_cursor.py` | 63 | 4 | 0 | 5 | 72 | 94.0% |
 | `test_custom_types.py` | 51 | 0 | 0 | 0 | 51 | 100.0% |
 | `test_database.py` | 35 | 0 | 0 | 1 | 36 | 100.0% |
 | `test_decimal128.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_examples.py` | 18 | 0 | 0 | 2 | 20 | 100.0% |
-| `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
+| `test_logger.py` | 3 | 1 | 0 | 2 | 6 | 75.0% |
 | `test_operations.py` | 2 | 0 | 0 | 0 | 2 | 100.0% |
 | `test_raw_bson.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_read_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
-| `test_transactions_unified.py` | 92 | 3 | 0 | 172 | 267 | 96.8% |
+| `test_transactions_unified.py` | 92 | 0 | 0 | 172 | 264 | 100.0% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1020** | **8** | **0** | **475** | **1503** | **99.2%** |
+| **Overall** | **1018** | **7** | **0** | **475** | **1500** | **99.3%** |
 
-## Failures (8)
+## Failures (7)
 
 First 30 failure node-ids for manual triage:
 
@@ -47,10 +47,9 @@ vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_hashed
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_maxtime_ms_message
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_csot_applied
+vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_length
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedReadPref::test_secondary_readPreference
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_explicit_secondary_read_preference
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRunCommand::test_run_command_fails_with_secondary_read_preference_from_transaction_options
+vendor/pymongo-tests/test/test_logger.py::TestLogger::test_default_truncation_limit
 ```
 
 ## How this is generated

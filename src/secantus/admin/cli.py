@@ -1,4 +1,4 @@
-"""Command-line entry point for ``secantusdb-admin``.
+"""Command-line entry point for ``secantus-admin``.
 
 Resolves the token, configures uvicorn, optionally opens a pywebview
 window, and runs until shutdown. ``--no-window`` is the headless mode
@@ -38,7 +38,7 @@ def _resolve_token(*, override: str | None, token_path: Path) -> str:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="secantusdb-admin",
+        prog="secantus-admin",
         description="Local admin UI for a SecantusDB (or any MongoDB) server.",
     )
     parser.add_argument(
@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Install it with one of:\n"
             f"  pip install 'secantusdb[admin]'\n"
             f"  uv sync --extra admin\n"
-            f"  uv run --extra admin secantusdb-admin\n\n"
+            f"  uv run --extra admin secantus-admin\n\n"
             f"From a checkout, ``uv run --extra admin invoke admin`` works too.\n"
         )
         return 1

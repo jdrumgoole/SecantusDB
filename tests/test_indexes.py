@@ -1701,7 +1701,7 @@ def test_ttl_prune_deletes_expired_docs(storage: Storage) -> None:
     import datetime as _dt
 
     storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 60})
-    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.timezone.utc)
     storage.insert(
         "db",
         "c",
@@ -1721,7 +1721,7 @@ def test_ttl_prune_no_op_when_nothing_expired(storage: Storage) -> None:
     import datetime as _dt
 
     storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 3600})
-    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.timezone.utc)
     storage.insert(
         "db",
         "c",
@@ -1740,11 +1740,11 @@ def test_ttl_prune_skips_non_ttl_indexes(storage: Storage) -> None:
         "db",
         "c",
         [
-            {"_id": i, "n": i, "createdAt": _dt.datetime(2020, 1, 1, tzinfo=_dt.UTC)}
+            {"_id": i, "n": i, "createdAt": _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc)}
             for i in range(3)
         ],
     )
-    pruned = storage.prune_ttl("db", "c", now=_dt.datetime(2026, 5, 2, tzinfo=_dt.UTC))
+    pruned = storage.prune_ttl("db", "c", now=_dt.datetime(2026, 5, 2, tzinfo=_dt.timezone.utc))
     assert pruned == 0
 
 
@@ -1753,7 +1753,7 @@ def test_ttl_prune_skips_docs_without_indexed_field(storage: Storage) -> None:
     import datetime as _dt
 
     storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 60})
-    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.timezone.utc)
     storage.insert(
         "db",
         "c",
@@ -1773,7 +1773,7 @@ def test_ttl_prune_skips_non_date_field(storage: Storage) -> None:
     import datetime as _dt
 
     storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 60})
-    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.timezone.utc)
     storage.insert(
         "db",
         "c",
@@ -1795,7 +1795,7 @@ def test_ttl_prune_uses_real_now_when_omitted(storage: Storage) -> None:
     storage.insert(
         "db",
         "c",
-        [{"_id": 1, "createdAt": _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC)}],
+        [{"_id": 1, "createdAt": _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)}],
     )
     # Default now() resolves to actual current time → epoch is way past TTL.
     pruned = storage.prune_ttl("db", "c")
@@ -1806,7 +1806,7 @@ def test_ttl_prune_removes_index_entries_too(storage: Storage) -> None:
     import datetime as _dt
 
     storage.create_index("db", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 60})
-    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.UTC)
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.timezone.utc)
     storage.insert(
         "db",
         "c",
@@ -1849,7 +1849,7 @@ def test_find_no_sort_objectid_insertion_order(storage: Storage) -> None:
 
     import bson
 
-    base = _dt.datetime(2026, 5, 2, tzinfo=_dt.UTC)
+    base = _dt.datetime(2026, 5, 2, tzinfo=_dt.timezone.utc)
     oids = [bson.ObjectId.from_datetime(base + _dt.timedelta(seconds=i)) for i in range(5)]
     # Insert reversed; find() returns them in insertion (reversed) order, not
     # _id-chronological order.
@@ -2030,7 +2030,7 @@ def test_prune_ttl_all_collections_walks_every_namespace(storage: Storage) -> No
     storage.create_index("db2", "c", "ttl_1", {"createdAt": 1}, {"expireAfterSeconds": 60})
     storage.create_index("db1", "noexp", "x_1", {"x": 1}, {})  # no TTL: stays untouched
 
-    base = _dt.datetime(2026, 5, 7, 12, 0, 0, tzinfo=_dt.UTC)
+    base = _dt.datetime(2026, 5, 7, 12, 0, 0, tzinfo=_dt.timezone.utc)
     storage.insert("db1", "c", [{"_id": 1, "createdAt": base - _dt.timedelta(seconds=120)}])
     storage.insert("db2", "c", [{"_id": 1, "createdAt": base - _dt.timedelta(seconds=120)}])
     storage.insert("db1", "noexp", [{"_id": 1, "x": 7}])

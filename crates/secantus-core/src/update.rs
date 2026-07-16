@@ -5,20 +5,29 @@
 //! pure-Python `apply_update` instead (which also raises the right errors).
 //!
 //! Handled: replacement-style updates, `$set`, `$setOnInsert`, `$unset`,
-//! `$inc`, `$mul`, `$push`, `$pop`, `$rename`, plus `_id` immutability.
+//! `$inc`, `$mul`, `$push` (incl. the `$each` modifier form with `$position` /
+//! `$slice` / `$sort` — `1`/`-1` whole-element or `{field: dir}`, BSON-order),
+//! `$pop`, `$rename`, `$bit`, `$min`/`$max` (BSON cross-type order over the
+//! sortable subset via `order::cmp` — null / number / string / objectId / date /
+//! doc / array; a missing field is set, an explicit-null is compared as rank 2),
+//! `$addToSet` (incl. `$each`), `$pull` (query semantics: element-value predicate /
+//! sub-document match / equality, via `query::matches`), `$pullAll` (literal
+//! equality via `expressions::py_eq`), plus `_id` immutability.
 //! Deferred to Python: pipeline (array) updates, positional operators
-//! (`$`/`$[]`/`$[id]`) and array filters, `$currentDate` (non-deterministic),
-//! `$min`/`$max`/`$pull`/`$addToSet`/`$bit` (Python comparison/`==` semantics),
-//! Decimal128 / non-numeric arithmetic, and every error condition (so Python
-//! raises the exact `UpdateError`).
+//! (`$`/`$[]`/`$[id]`) and array filters, `$currentDate` (non-deterministic), a
+//! `$push` `$sort` over elements outside the sortable subset, a `$min`/`$max`
+//! against a non-sortable operand (bool / Decimal128 / NaN / exotic — whose full
+//! order Python's `_bson_lt` handles), Decimal128 / non-numeric arithmetic, and
+//! every error condition (so Python raises the exact `UpdateError`).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use bson::{Bson, Document};
+use bson::{doc, Bson, Document};
 
-use crate::numeric::{as_float_like, as_int_like, int_to_bson};
+use crate::numeric::{as_float_like, as_int_like, int_promoted_to_bson, is_int64};
 use crate::paths::{self, get_path, has_path};
-use crate::query;
+use crate::{expressions, query};
 
 #[derive(Debug)]
 pub struct Fallback;
@@ -204,7 +213,10 @@ fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
         } else {
             a.checked_add(b)
         };
-        return int_to_bson(r.ok_or(Fallback)?).ok_or(Fallback);
+        // MongoDB promotes the result to int64 if either operand is already
+        // int64 (or a 32-bit result would overflow) — matching `numerics.bson_*`.
+        let wide = is_int64(current) || is_int64(operand);
+        return int_promoted_to_bson(r.ok_or(Fallback)?, wide).ok_or(Fallback);
     }
     // Float path: any non-numeric operand (current/operand) makes Python raise.
     let a = as_float_like(current).ok_or(Fallback)?;
@@ -212,11 +224,18 @@ fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
     Ok(Bson::Double(if mul { a * b } else { a + b }))
 }
 
-/// Current value of a field for $inc/$mul: missing or explicit null -> int 0.
-fn current_or_zero(result: &Document, path: &str) -> Bson {
+/// Current value of a field for $inc/$mul. A *missing* field is treated as
+/// int 0 (mongod applies the delta), but a field present with an explicit
+/// `null` is a TypeMismatch (code 14) — mongod refuses to coerce a present
+/// non-numeric value to 0. We defer that (and any other present value that
+/// `arith` can't handle) to the Python oracle so it raises the exact coded
+/// error; the Rust *server* surfaces a generic BadValue (the documented
+/// error-code gap).
+fn current_or_zero(result: &Document, path: &str) -> R<Bson> {
     match get_path(result, path) {
-        None | Some(Bson::Null) => Bson::Int32(0),
-        Some(v) => v.clone(),
+        None => Ok(Bson::Int32(0)),
+        Some(Bson::Null) => Err(Fallback),
+        Some(v) => Ok(v.clone()),
     }
 }
 
@@ -226,6 +245,147 @@ fn payload_doc(payload: &Bson) -> R<&Document> {
     match payload {
         Bson::Document(d) => Ok(d),
         _ => Err(Fallback),
+    }
+}
+
+/// Apply one `$push` value to `arr`: a plain value is appended; the `{$each: […]}`
+/// modifier form appends each element, honouring `$position` and `$slice`. Mirrors
+/// the pure `_apply_push`. **`$sort` defers** (Python's BSON-order array sort), as
+/// does a non-integer `$position`/`$slice`, a non-array `$each`, or an unknown
+/// modifier — the pure engine either sorts or raises there.
+fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
+    let m = match value {
+        Bson::Document(d) if d.contains_key("$each") => d,
+        _ => {
+            arr.push(value.clone());
+            return Ok(());
+        }
+    };
+    for k in m.keys() {
+        match k.as_str() {
+            "$each" | "$position" | "$slice" | "$sort" => {}
+            _ => return Err(Fallback), // unknown modifier -> Python raises
+        }
+    }
+    let each = match m.get("$each") {
+        Some(Bson::Array(a)) => a,
+        _ => return Err(Fallback),
+    };
+    match m.get("$position") {
+        None => arr.extend(each.iter().cloned()),
+        Some(p) => {
+            let n = as_int_like(p).ok_or(Fallback)?;
+            let idx = if n >= 0 {
+                (n as usize).min(arr.len())
+            } else {
+                (arr.len() as i128 + n).max(0) as usize
+            };
+            for (off, e) in each.iter().enumerate() {
+                arr.insert(idx + off, e.clone());
+            }
+        }
+    }
+    // mongod order: $position insert, then $sort the whole array, then $slice.
+    if let Some(spec) = m.get("$sort") {
+        push_sort(arr, spec)?;
+    }
+    if let Some(s) = m.get("$slice") {
+        let n = as_int_like(s).ok_or(Fallback)?;
+        if n == 0 {
+            arr.clear();
+        } else if n > 0 {
+            arr.truncate(n as usize);
+        } else {
+            let keep = (-n) as usize;
+            if arr.len() > keep {
+                arr.drain(0..arr.len() - keep);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `$push` `$sort`: `1`/`-1` sorts whole elements in BSON order; a `{field: dir}`
+/// doc sorts (stably, field-by-field, in reverse spec order) by those paths. Any
+/// element outside the sortable subset defers to Python (same `order::cmp` /
+/// `is_sortable` contract as `$sortArray`). Mirrors `_push_sort`.
+fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
+    // Key an element for a `{field: dir}` sort: a document element keys off the
+    // field path (missing -> null); a scalar element keys off itself.
+    fn key_of(e: &Bson, field: &str) -> Bson {
+        match e {
+            Bson::Document(d) => crate::paths::get_path(d, field)
+                .cloned()
+                .unwrap_or(Bson::Null),
+            other => other.clone(),
+        }
+    }
+    match spec {
+        Bson::Int32(_) | Bson::Int64(_) => {
+            let dir = as_int_like(spec).ok_or(Fallback)?;
+            if !arr.iter().all(crate::order::is_sortable) {
+                return Err(Fallback);
+            }
+            if dir == -1 {
+                arr.sort_by(|a, b| crate::order::cmp(b, a));
+            } else {
+                arr.sort_by(crate::order::cmp);
+            }
+        }
+        Bson::Document(spec_doc) => {
+            let fields: Vec<(&String, i128)> = spec_doc
+                .iter()
+                .map(|(f, d)| as_int_like(d).map(|di| (f, di)).ok_or(Fallback))
+                .collect::<R<Vec<_>>>()?;
+            for (field, _) in &fields {
+                if !arr
+                    .iter()
+                    .all(|e| crate::order::is_sortable(&key_of(e, field)))
+                {
+                    return Err(Fallback);
+                }
+            }
+            // Stable field-by-field, applied in reverse spec order (Python parity).
+            for (field, dir) in fields.iter().rev() {
+                arr.sort_by(|a, b| {
+                    let (ka, kb) = (key_of(a, field), key_of(b, field));
+                    if *dir == -1 {
+                        crate::order::cmp(&kb, &ka)
+                    } else {
+                        crate::order::cmp(&ka, &kb)
+                    }
+                });
+            }
+        }
+        _ => return Err(Fallback), // non-int / non-doc $sort -> Python raises
+    }
+    Ok(())
+}
+
+/// Whether an array element should be removed by `$pull` under mongod's query
+/// semantics (verified three-way vs mongod 6.0): a criterion of only
+/// `$`-operators is an element-value predicate; any other document criterion is a
+/// sub-document match against the element (a scalar element never matches); a
+/// scalar criterion is BSON-aware equality. Mirrors `_pull_matches`. A construct
+/// the query engine can't evaluate exactly (regex / collation edge) defers.
+fn pull_matches(element: &Bson, criterion: &Bson) -> R<bool> {
+    match criterion {
+        Bson::Document(c) if !c.is_empty() && c.keys().all(|k| k.starts_with('$')) => {
+            let d = doc! { "__e": element.clone() };
+            let q = doc! { "__e": criterion.clone() };
+            crate::query::matches(&d, &q, &Document::new(), None).map_err(|_| Fallback)
+        }
+        Bson::Document(c) => match element {
+            Bson::Document(ed) => {
+                crate::query::matches(ed, c, &Document::new(), None).map_err(|_| Fallback)
+            }
+            _ => Ok(false),
+        },
+        _ => {
+            let d = doc! { "__e": element.clone() };
+            let q = doc! { "__e": criterion.clone() };
+            crate::query::matches(&d, &q, &Document::new(), None).map_err(|_| Fallback)
+        }
     }
 }
 
@@ -255,7 +415,7 @@ fn apply_op(
         "$inc" => {
             for (path, delta) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
-                    let cur = current_or_zero(result, &cpath);
+                    let cur = current_or_zero(result, &cpath)?;
                     let new = arith(&cur, delta, false)?;
                     set_path(result, &cpath, new)?;
                 }
@@ -264,7 +424,7 @@ fn apply_op(
         "$mul" => {
             for (path, factor) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
-                    let cur = current_or_zero(result, &cpath);
+                    let cur = current_or_zero(result, &cpath)?;
                     let new = arith(&cur, factor, true)?;
                     set_path(result, &cpath, new)?;
                 }
@@ -273,16 +433,13 @@ fn apply_op(
         "$push" => {
             for (path, value) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
-                    match get_path(result, &cpath).cloned() {
-                        None | Some(Bson::Null) => {
-                            set_path(result, &cpath, Bson::Array(vec![value.clone()]))?;
-                        }
-                        Some(Bson::Array(mut a)) => {
-                            a.push(value.clone());
-                            set_path(result, &cpath, Bson::Array(a))?;
-                        }
+                    let mut a = match get_path(result, &cpath).cloned() {
+                        None | Some(Bson::Null) => Vec::new(),
+                        Some(Bson::Array(a)) => a,
                         Some(_) => return Err(Fallback), // $push on non-array -> Python raises
-                    }
+                    };
+                    push_apply(&mut a, value)?;
+                    set_path(result, &cpath, Bson::Array(a))?;
                 }
             }
         }
@@ -329,8 +486,161 @@ fn apply_op(
                 }
             }
         }
-        // $currentDate (non-deterministic), $min/$max/$pull/$addToSet/$bit
-        // (Python comparison/== semantics), and unknown ops -> Python.
+        "$bit" => {
+            for (path, ops) in payload {
+                // `{field: {and|or|xor: <int mask>, ...}}` — mongod applies every
+                // listed operation to the field in order (e.g. (v & X) | Y).
+                let ops = match ops {
+                    Bson::Document(d) if !d.is_empty() => d,
+                    _ => return Err(Fallback), // empty / non-doc -> Python raises
+                };
+                let mut parsed: Vec<(&str, i64)> = Vec::with_capacity(ops.len());
+                for (bit_op, mask_b) in ops {
+                    let op_s = bit_op.as_str();
+                    if !matches!(op_s, "and" | "or" | "xor") {
+                        return Err(Fallback); // unknown sub-op -> Python raises
+                    }
+                    let mask = match mask_b {
+                        Bson::Int32(n) => *n as i64,
+                        Bson::Int64(n) => *n,
+                        _ => return Err(Fallback), // non-integer mask -> Python raises
+                    };
+                    parsed.push((op_s, mask));
+                }
+                for cpath in expand_path(result, path, filters, pos)? {
+                    let mut cur = match get_path(result, &cpath) {
+                        None | Some(Bson::Null) => 0i64,
+                        Some(Bson::Int32(n)) => *n as i64,
+                        Some(Bson::Int64(n)) => *n,
+                        Some(_) => return Err(Fallback), // $bit on non-integer -> Python raises
+                    };
+                    for (bit_op, mask) in &parsed {
+                        cur = match *bit_op {
+                            "and" => cur & mask,
+                            "or" => cur | mask,
+                            _ => cur ^ mask,
+                        };
+                    }
+                    // Python computes a plain int -> bson encodes it as int32 when
+                    // it fits, else int64. Match that so the BSON subtype agrees.
+                    let val = match i32::try_from(cur) {
+                        Ok(v) => Bson::Int32(v),
+                        Err(_) => Bson::Int64(cur),
+                    };
+                    set_path(result, &cpath, val)?;
+                }
+            }
+        }
+        "$min" | "$max" => {
+            let want_less = op == "$min"; // $min sets when value < current
+            for (path, value) in payload {
+                for cpath in expand_path(result, path, filters, pos)? {
+                    // A *missing* field is set unconditionally; a present field
+                    // (incl. an explicit null, rank 2) is compared by MongoDB's BSON
+                    // cross-type order. `order::cmp` covers the sortable subset
+                    // (null / number / string / objectId / date / doc / array); a
+                    // bool / Decimal128 / NaN / exotic operand isn't in it, so defer
+                    // to Python (whose `_bson_lt` handles the full order).
+                    let should_set = match get_path(result, &cpath) {
+                        None => true,
+                        Some(current) => {
+                            if !crate::order::is_sortable(current)
+                                || !crate::order::is_sortable(value)
+                            {
+                                return Err(Fallback);
+                            }
+                            let ord = if want_less {
+                                crate::order::cmp(value, current) // value < current
+                            } else {
+                                crate::order::cmp(current, value) // current < value
+                            };
+                            ord == Ordering::Less
+                        }
+                    };
+                    if should_set {
+                        set_path(result, &cpath, value.clone())?;
+                    }
+                }
+            }
+        }
+        "$addToSet" => {
+            for (path, value) in payload {
+                // `$each` adds each element (deduped); otherwise the value itself.
+                let items: Vec<Bson> = match value {
+                    Bson::Document(d) if d.contains_key("$each") => match d.get("$each") {
+                        Some(Bson::Array(a)) => a.clone(),
+                        _ => return Err(Fallback), // $each not an array -> Python raises
+                    },
+                    _ => vec![value.clone()],
+                };
+                for cpath in expand_path(result, path, filters, pos)? {
+                    let mut a = match get_path(result, &cpath).cloned() {
+                        None | Some(Bson::Null) => Vec::new(),
+                        Some(Bson::Array(a)) => a,
+                        Some(_) => return Err(Fallback), // non-array -> Python raises
+                    };
+                    for item in &items {
+                        let mut present = false;
+                        for e in &a {
+                            if expressions::py_eq(e, item).map_err(|_| Fallback)? {
+                                present = true;
+                                break;
+                            }
+                        }
+                        if !present {
+                            a.push(item.clone());
+                        }
+                    }
+                    set_path(result, &cpath, Bson::Array(a))?;
+                }
+            }
+        }
+        "$pull" => {
+            for (path, criterion) in payload {
+                for cpath in expand_path(result, path, filters, pos)? {
+                    // Remove elements matching the criterion under query semantics
+                    // (element-value predicate / sub-document match / equality); a
+                    // non-array field is a no-op.
+                    if let Some(Bson::Array(a)) = get_path(result, &cpath).cloned() {
+                        let mut kept = Vec::with_capacity(a.len());
+                        for e in a {
+                            if !pull_matches(&e, criterion)? {
+                                kept.push(e);
+                            }
+                        }
+                        set_path(result, &cpath, Bson::Array(kept))?;
+                    }
+                }
+            }
+        }
+        "$pullAll" => {
+            for (path, values) in payload {
+                let Bson::Array(vals) = values else {
+                    return Err(Fallback); // non-array arg -> Python raises
+                };
+                for cpath in expand_path(result, path, filters, pos)? {
+                    // Remove every element equal to any listed value (literal
+                    // equality, not predicates); non-array field is a no-op.
+                    if let Some(Bson::Array(a)) = get_path(result, &cpath).cloned() {
+                        let mut kept = Vec::with_capacity(a.len());
+                        for e in a {
+                            let mut drop = false;
+                            for v in vals {
+                                if expressions::py_eq(&e, v).map_err(|_| Fallback)? {
+                                    drop = true;
+                                    break;
+                                }
+                            }
+                            if !drop {
+                                kept.push(e);
+                            }
+                        }
+                        set_path(result, &cpath, Bson::Array(kept))?;
+                    }
+                }
+            }
+        }
+        // $currentDate (non-deterministic) and unknown ops -> Python.
         _ => return Err(Fallback),
     }
     Ok(())
@@ -444,6 +754,27 @@ mod tests {
     }
 
     #[test]
+    fn bit_operator() {
+        assert_eq!(
+            upd(doc! {"b": 1i32}, doc! {"$bit": {"b": {"and": 0}}}),
+            doc! {"b": 0i32}
+        );
+        assert_eq!(
+            upd(doc! {"b": 5i32}, doc! {"$bit": {"b": {"or": 2}}}),
+            doc! {"b": 7i32}
+        );
+        assert_eq!(
+            upd(doc! {"b": 6i32}, doc! {"$bit": {"b": {"xor": 3}}}),
+            doc! {"b": 5i32}
+        );
+        // Missing field defaults to 0.
+        assert_eq!(
+            upd(doc! {}, doc! {"$bit": {"b": {"or": 7}}}),
+            doc! {"b": 7i32}
+        );
+    }
+
+    #[test]
     fn replacement_preserves_id() {
         assert_eq!(
             upd(doc! {"_id": 7, "a": 1}, doc! {"b": 2}),
@@ -453,12 +784,24 @@ mod tests {
 
     #[test]
     fn fallbacks() {
-        // _id change, mixing, $min, pipeline-only ops -> Fallback.
+        // _id change, mixing, cross-type $min, pipeline-only ops -> Fallback.
         assert!(apply_update(&doc! {"_id": 1}, &doc! {"$set": {"_id": 2}}, false).is_err());
         assert!(apply_update(&doc! {"a": 1}, &doc! {"$set": {"a": 1}, "b": 2}, false).is_err());
-        assert!(apply_update(&doc! {"a": 1}, &doc! {"$min": {"a": 0}}, false).is_err());
+        // $min/$max now compare cross-type by BSON order (number < string), so a
+        // string vs a number computes: $min keeps the (smaller) number.
+        assert_eq!(
+            apply_update(&doc! {"a": 1}, &doc! {"$min": {"a": "x"}}, false).unwrap(),
+            doc! {"a": 1}
+        );
+        // A non-sortable operand (bool) still defers so Python's _bson_lt handles it.
+        assert!(apply_update(&doc! {"a": 5}, &doc! {"$max": {"a": true}}, false).is_err());
         // Bare `apply_update` (no positional_matches) can't resolve `$` -> defer.
         assert!(apply_update(&doc! {"a": [1]}, &doc! {"$set": {"a.$": 9}}, false).is_err());
+        // $inc / $mul on an explicit-null field -> defer so Python raises the
+        // TypeMismatch (code 14). A *missing* field still applies (see
+        // `inc_widths_and_floats`).
+        assert!(apply_update(&doc! {"n": Bson::Null}, &doc! {"$inc": {"n": 5}}, false).is_err());
+        assert!(apply_update(&doc! {"n": Bson::Null}, &doc! {"$mul": {"n": 5}}, false).is_err());
     }
 
     fn upd_af(d: Document, u: Document, filters: Vec<Document>, pos: Document) -> Document {

@@ -33,7 +33,7 @@ the same `secantus.admin.cli:main` entry point.
 ### Console script
 
 ```bash
-secantusdb-admin --uri mongodb://127.0.0.1:27017
+secantus-admin --uri mongodb://127.0.0.1:27017
 ```
 
 ### Module
@@ -69,7 +69,7 @@ holds the process open until you close the window (or hit `Ctrl-C`).
 remote dev boxes:
 
 ```bash
-secantusdb-admin --uri mongodb://127.0.0.1:27017 --port 8765 --no-window
+secantus-admin --uri mongodb://127.0.0.1:27017 --port 8765 --no-window
 # open http://127.0.0.1:8765/?t=<token>  in a browser
 ```
 
@@ -99,6 +99,54 @@ process on a machine has full local trust.
 * When the target server runs with `--auth`, embed the credentials in
   the URI: `mongodb://alice:secret@127.0.0.1:27017/?authSource=admin`.
   The UI's pymongo client uses them like any other tool would.
+
+## Server detection & feature gating
+
+The admin app is a plain pymongo client, so a single build can drive any
+of the three MongoDB-wire servers — the SecantusDB **Python** server, the
+SecantusDB **Rust** server, or a real **`mongod`**. They don't implement
+the same command surface, though: the four proprietary `secantusAdmin.*`
+maintenance / backup commands exist only on SecantusDB (no `mongod` has
+them), and the Rust server hasn't yet ported a handful of standard admin
+commands. Rather than let you click a button that returns
+`CommandNotFound`, the app **probes the target once at connect** (and
+again on every target swap) and gates its feature buttons to what that
+server actually supports.
+
+Detection reads the server's own self-identification — no configuration,
+no guessing:
+
+* `serverStatus.secantus.server` is `"python"` / `"rust"` on the two
+  SecantusDB servers;
+* `buildInfo.secantusVersion` is present on both (absent on `mongod`).
+
+The detected server type shows as a pill next to the target badge in the
+page header (**SecantusDB (Python)**, **SecantusDB (Rust)**, or
+**MongoDB `<version>`**). Unsupported actions are rendered **disabled**
+with a tooltip explaining why, and pages that would simply come back
+empty (Logs, Profiler on the Rust server) carry an info banner. An
+unreachable or not-yet-probed target stays **fully permissive** — nothing
+is hidden until the app positively knows the server can't do it, so a
+transiently-down server never hides a working button.
+
+What gets gated, by target:
+
+| Feature (page) | Wire command | Python | Rust | `mongod` |
+|---|---|:--:|:--:|:--:|
+| Native checkpoint backup (`/backup`) | `secantusAdmin.backupArchive` | ✅ | ✅ | — |
+| Native archive restore (`/backup`) | `secantusAdmin.restoreArchive` | ✅ | — | — |
+| Prune oplog / TTL (`/maintenance`) | `secantusAdmin.pruneOplog` / `.pruneTtl` | ✅ | — | — |
+| Edit user roles (`/users`) | `grantRolesToUser` / `revokeRolesFromUser` | ✅ | — | ✅ |
+| Kill connection (`/connections`) | `killOp` | ✅ | — | ✅ |
+| Logs (`/logs`) | `getLog` | ✅ | banner | ✅ |
+| Profiler (`/profiler`) | `profile` | ✅ | banner | ✅ |
+
+`mongodump` / `mongorestore` backups (`/backup`) and every other page go
+through standard wire commands and work against all three. The gate is
+UI-only — if a command ever does slip through it still returns a clean
+error, never a traceback. The Rust server's gaps are tracked upstream and
+close over time; when the target is a real `mongod`, only the
+SecantusDB-only `secantusAdmin.*` actions are hidden.
 
 ## Page tour
 
@@ -357,7 +405,7 @@ For offline restore (when the source SecantusDB isn't running),
 use the bundled CLI:
 
 ```bash
-secantusdb-restore-archive --archive PATH.tar.gz --target-dir PATH
+secantus-restore-archive --archive PATH.tar.gz --target-dir PATH
 ```
 
 Same validation, no wire-protocol round-trip. Pass

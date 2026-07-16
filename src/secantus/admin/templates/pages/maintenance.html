@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% from "partials/_macros.html" import empty_row %}
 {% block content %}
+{% set caps = request.app.state.capabilities %}
 {% if error %}<div class="error">{{ error }}</div>{% endif %}
 {% if flash %}
   <div class="flash flash-{{ flash.kind }}">{{ flash.msg }}</div>
@@ -15,12 +16,17 @@
   <form method="post" action="/maintenance/fsync" class="inline-form">
     <button type="submit" class="btn-secondary">Force checkpoint (fsync)</button>
   </form>
+  {% if caps.native_prune %}
   <form method="post" action="/maintenance/prune-oplog" class="inline-form">
     <button type="submit" class="btn-secondary">Prune oplog</button>
   </form>
   <form method="post" action="/maintenance/prune-ttl" class="inline-form">
     <button type="submit" class="btn-secondary">Prune TTL</button>
   </form>
+  {% else %}
+  <button type="button" class="btn-secondary" disabled
+          title="Manual prune (secantusAdmin.pruneOplog / pruneTtl) is a SecantusDB-only command — not supported by {{ caps.label }}.">Prune oplog / TTL unavailable</button>
+  {% endif %}
 </div>
 
 <h2 class="section-title">Danger zone</h2>

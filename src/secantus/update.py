@@ -10,7 +10,9 @@ from secantus.paths import get_path, has_path, set_path, unset_path
 
 
 class UpdateError(Exception):
-    pass
+    def __init__(self, message: str, *, code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # The update modifiers ``_apply_op`` knows how to apply. Used by
@@ -30,11 +32,95 @@ _KNOWN_UPDATE_OPS = frozenset(
         "$push",
         "$addToSet",
         "$pull",
+        "$pullAll",
         "$pop",
         "$rename",
         "$bit",
     }
 )
+
+
+def _is_each_modifier(value: Any) -> bool:
+    """Whether a `$push` / `$addToSet` value is the `{$each: [...], ...}` modifier
+    form (vs a plain value to append)."""
+    return isinstance(value, Mapping) and "$each" in value
+
+
+def _apply_push(arr: list[Any], value: Any) -> list[Any]:
+    """Apply one `$push` to `arr` (a fresh copy). A plain value is appended; the
+    `{$each: [...]}` modifier form appends each element, honouring `$position`
+    (insert index, negative counts from the end), then `$sort` (whole-element
+    `1`/`-1` or a `{field: dir}` doc, in BSON order), then `$slice` (keep the
+    first N for N≥0, the last |N| for N<0, empty for 0) — mongod's modifier order.
+    """
+    if not _is_each_modifier(value):
+        arr.append(value)
+        return arr
+    allowed = {"$each", "$position", "$slice", "$sort"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise UpdateError(f"Unrecognized $push modifier: {next(iter(unknown))!r}")
+    each = value["$each"]
+    if not isinstance(each, list):
+        raise UpdateError("$each must be an array")
+    position = value.get("$position")
+    if position is not None:
+        if not isinstance(position, int) or isinstance(position, bool):
+            raise UpdateError("$position must be an integer")
+        idx = position if position >= 0 else max(len(arr) + position, 0)
+        arr[idx:idx] = each
+    else:
+        arr.extend(each)
+    if "$sort" in value:
+        arr = _push_sort(arr, value["$sort"])
+    if "$slice" in value:
+        arr = _push_slice(arr, value["$slice"])
+    return arr
+
+
+def _push_sort(arr: list[Any], spec: Any) -> list[Any]:
+    """`$push` `$sort`: `1`/`-1` sorts whole elements (BSON order); a `{field: dir}`
+    document sorts (stably, field-by-field) by those paths."""
+    from secantus.storage import _SortKey
+
+    if isinstance(spec, int) and not isinstance(spec, bool):
+        return sorted(arr, key=_SortKey, reverse=(spec == -1))
+    if isinstance(spec, Mapping):
+        result = list(arr)
+        for field, direction in reversed(list(spec.items())):
+            result.sort(
+                key=lambda e, f=field: _SortKey(get_path(e, f) if isinstance(e, Mapping) else e),
+                reverse=(int(direction) == -1),
+            )
+        return result
+    raise UpdateError("$sort requires 1, -1, or a document")
+
+
+def _push_slice(arr: list[Any], n: Any) -> list[Any]:
+    """`$push` `$slice`: keep the first `n` (n≥0), the last `|n|` (n<0), or none."""
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise UpdateError("$slice must be an integer")
+    if n == 0:
+        return []
+    return arr[:n] if n > 0 else arr[n:]
+
+
+def _pull_matches(matches: Any, element: Any, criterion: Any) -> bool:
+    """Whether an array element should be removed by ``$pull`` under mongod's
+    query semantics (verified three-way vs mongod 6.0):
+
+    - a criterion of only ``$``-operators (``{$gte: 10}``) is an **element-value
+      predicate** — each element is tested as the value;
+    - any other document criterion (``{x: {$gte: 5}}``, ``{y: "b"}``, ``{b.c: 2}``)
+      is a **sub-document match** against the element (a scalar element never
+      matches, so it stays);
+    - a scalar criterion is equality (BSON-aware, via the same query engine).
+    """
+    if isinstance(criterion, Mapping):
+        if criterion and all(isinstance(k, str) and k.startswith("$") for k in criterion):
+            return matches({"__e": element}, {"__e": criterion})
+        return matches(element, criterion) if isinstance(element, Mapping) else False
+    return matches({"__e": element}, {"__e": criterion})
 
 
 def validate_update_doc(update: Any) -> None:
@@ -328,9 +414,21 @@ def _apply_op(
     elif op == "$inc":
         for path, delta in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                current = get_path(doc, concrete, default=0)
-                if current is None:
-                    current = 0
+                # A missing field is treated as 0 (mongod applies the delta),
+                # but a field present with an explicit ``null`` (or any other
+                # non-numeric value) is a TypeMismatch (code 14) — the field
+                # exists and is not numeric, so mongod refuses to coerce it.
+                if not has_path(doc, concrete):
+                    current: Any = 0
+                else:
+                    current = get_path(doc, concrete)
+                    if current is None:
+                        raise UpdateError(
+                            f"Cannot apply $inc to a value of non-numeric type. "
+                            f"{{{concrete}}} has the field '{concrete.split('.')[-1]}' "
+                            f"of non-numeric type null",
+                            code=14,
+                        )
                 # bson_add preserves the BSON numeric type (mongod widens
                 # int32 < int64 < double < decimal128) — Int64(5) + 3 → Int64(8),
                 # not a bare int that narrows to int32 on the wire.
@@ -338,49 +436,82 @@ def _apply_op(
     elif op == "$mul":
         for path, factor in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                current = get_path(doc, concrete, default=0)
-                if current is None:
+                if not has_path(doc, concrete):
                     current = 0
+                else:
+                    current = get_path(doc, concrete)
+                    if current is None:
+                        raise UpdateError(
+                            f"Cannot apply $mul to a value of non-numeric type. "
+                            f"{{{concrete}}} has the field '{concrete.split('.')[-1]}' "
+                            f"of non-numeric type null",
+                            code=14,
+                        )
                 set_path(doc, concrete, bson_mul(current, factor))
     elif op == "$min":
+        # A missing field is set unconditionally; otherwise compare by MongoDB's
+        # BSON cross-type order (`_bson_lt`), not Python `<` — so a cross-type
+        # pair (e.g. a string vs a number) orders like mongod instead of raising
+        # a TypeError, and an explicit-null current is a real value (rank 2), not
+        # "no current".
+        from secantus.ordering import _bson_lt
+
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                current = get_path(doc, concrete, default=None)
-                if current is None or value < current:
+                if not has_path(doc, concrete) or _bson_lt(value, get_path(doc, concrete)):
                     set_path(doc, concrete, value)
     elif op == "$max":
+        from secantus.ordering import _bson_lt
+
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                current = get_path(doc, concrete, default=None)
-                if current is None or value > current:
+                if not has_path(doc, concrete) or _bson_lt(get_path(doc, concrete), value):
                     set_path(doc, concrete, value)
     elif op == "$push":
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
                 if arr is None:
-                    set_path(doc, concrete, [value])
+                    arr = []
                 elif isinstance(arr, list):
-                    arr.append(value)
+                    arr = list(arr)
                 else:
                     raise UpdateError(f"$push on non-array at {concrete!r}")
+                set_path(doc, concrete, _apply_push(arr, value))
     elif op == "$addToSet":
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
                 if arr is None:
-                    set_path(doc, concrete, [value])
+                    arr = []
                 elif isinstance(arr, list):
-                    if value not in arr:
-                        arr.append(value)
+                    arr = list(arr)
                 else:
                     raise UpdateError(f"$addToSet on non-array at {concrete!r}")
+                # `$each` adds each element (deduped); otherwise the value itself.
+                to_add = value["$each"] if _is_each_modifier(value) else [value]
+                if _is_each_modifier(value) and not isinstance(value["$each"], list):
+                    raise UpdateError("$each must be an array")
+                for elem in to_add:
+                    if elem not in arr:
+                        arr.append(elem)
+                set_path(doc, concrete, arr)
     elif op == "$pull":
+        from secantus.query import matches
+
         for path, criterion in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
                 if isinstance(arr, list):
-                    arr[:] = [e for e in arr if e != criterion]
+                    arr[:] = [e for e in arr if not _pull_matches(matches, e, criterion)]
+    elif op == "$pullAll":
+        for path, values in payload.items():
+            if not isinstance(values, list):
+                raise UpdateError("$pullAll requires an array argument")
+            for concrete in _expand(doc, path, array_filters, positional_matches):
+                arr = get_path(doc, concrete, default=None)
+                if isinstance(arr, list):
+                    arr[:] = [e for e in arr if not any(e == v for v in values)]
     elif op == "$pop":
         for path, direction in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
@@ -414,23 +545,28 @@ def _apply_op(
                     set_path(doc, np_path, value)
     elif op == "$bit":
         for path, ops in payload.items():
-            if not isinstance(ops, Mapping) or len(ops) != 1:
-                raise UpdateError("$bit requires a single-op document per field")
-            (bit_op,) = ops.keys()
-            mask = ops[bit_op]
-            if not isinstance(mask, int) or isinstance(mask, bool):
-                raise UpdateError("$bit mask must be an integer")
+            # mongod applies every listed operation to the field in order
+            # (e.g. {and: X, or: Y} is (v & X) | Y), not just a single op.
+            if not isinstance(ops, Mapping) or not ops:
+                raise UpdateError("$bit requires a document with at least one bitwise operation")
+            parsed_ops: list[tuple[str, int]] = []
+            for bit_op, mask in ops.items():
+                if bit_op not in ("and", "or", "xor"):
+                    raise UpdateError(f"$bit unsupported sub-op: {bit_op}")
+                if not isinstance(mask, int) or isinstance(mask, bool):
+                    raise UpdateError("$bit mask must be an integer")
+                parsed_ops.append((bit_op, mask))
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 current = get_path(doc, concrete, default=0) or 0
                 if not isinstance(current, int) or isinstance(current, bool):
                     raise UpdateError(f"$bit on non-integer at {concrete!r}")
-                if bit_op == "and":
-                    set_path(doc, concrete, current & mask)
-                elif bit_op == "or":
-                    set_path(doc, concrete, current | mask)
-                elif bit_op == "xor":
-                    set_path(doc, concrete, current ^ mask)
-                else:
-                    raise UpdateError(f"$bit unsupported sub-op: {bit_op}")
+                for bit_op, mask in parsed_ops:
+                    if bit_op == "and":
+                        current = current & mask
+                    elif bit_op == "or":
+                        current = current | mask
+                    else:
+                        current = current ^ mask
+                set_path(doc, concrete, current)
     else:
         raise UpdateError(f"unsupported update operator: {op}")

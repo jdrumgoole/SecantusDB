@@ -166,3 +166,122 @@ def test_inclusion_keeps_dict_skeleton_for_missing_leaf() -> None:
         "_id": 1,
         "a": [{}],
     }
+
+
+def test_positional_dotted_field() -> None:
+    doc = {"_id": 1, "items": [{"k": "a", "n": 1}, {"k": "b", "n": 2}, {"k": "c", "n": 3}]}
+    out = apply_projection(doc, {"items.$": 1}, {"items.k": "b"})
+    assert out == {"_id": 1, "items": [{"k": "b", "n": 2}]}
+
+
+def test_positional_scalar_range() -> None:
+    doc = {"_id": 4, "nums": [1, 5, 10, 15]}
+    out = apply_projection(doc, {"nums.$": 1}, {"nums": {"$gte": 10}})
+    assert out == {"_id": 4, "nums": [10]}
+
+
+def test_positional_elemmatch_query() -> None:
+    doc = {"_id": 1, "items": [{"k": "a", "n": 1}, {"k": "c", "n": 3}]}
+    out = apply_projection(doc, {"items.$": 1}, {"items": {"$elemMatch": {"n": {"$gt": 2}}}})
+    assert out == {"_id": 1, "items": [{"k": "c", "n": 3}]}
+
+
+def test_positional_first_of_many_plus_field() -> None:
+    doc = {"_id": 2, "a": 7, "items": [{"k": "b", "n": 5}, {"k": "b", "n": 6}]}
+    out = apply_projection(doc, {"_id": 0, "a": 1, "items.$": 1}, {"items.k": "b"})
+    assert out == {"a": 7, "items": [{"k": "b", "n": 5}]}
+
+
+def test_positional_errors() -> None:
+    doc = {"_id": 1, "items": [{"k": "b"}]}
+    # No query clause on the positional array.
+    with pytest.raises(ProjectionError) as e1:
+        apply_projection(doc, {"items.$": 1}, {"a": 1})
+    assert e1.value.code == 51246
+    # More than one positional.
+    with pytest.raises(ProjectionError) as e2:
+        apply_projection(doc, {"items.$": 1, "nums.$": 1}, {"items.k": "b", "nums": 1})
+    assert e2.value.code == 31276
+    # Positional with exclusion.
+    with pytest.raises(ProjectionError) as e3:
+        apply_projection(doc, {"items.$": 0}, {"items.k": "b"})
+    assert e3.value.code == 31395
+
+
+def test_validate_projection_parse_time() -> None:
+    from secantus.projection import validate_projection
+
+    # Validates even with no documents (mongod validates at parse time).
+    with pytest.raises(ProjectionError) as e:
+        validate_projection({"items.$": 1, "nums.$": 1}, {"items.k": "b"})
+    assert e.value.code == 31276
+    # A valid positional projection validates clean.
+    validate_projection({"items.$": 1}, {"items.k": "b"})
+
+
+def test_meta_unknown_arg_errors_17308() -> None:
+    doc = {"_id": 1, "a": 1}
+    with pytest.raises(ProjectionError) as e:
+        apply_projection(doc, {"score": {"$meta": "bogus"}})
+    assert e.value.code == 17308
+    assert e.value.code_name == "Location17308"
+    assert str(e.value) == "Unsupported argument to $meta: bogus"
+
+
+def test_meta_textscore_without_text_errors_40218() -> None:
+    doc = {"_id": 1, "a": 1}
+    with pytest.raises(ProjectionError) as e:
+        apply_projection(doc, {"score": {"$meta": "textScore"}}, {"a": 1})
+    assert e.value.code == 40218
+    assert e.value.code_name == "Location40218"
+    assert str(e.value) == "query requires text score metadata, but it is not available"
+
+
+def test_meta_textscore_with_text_query_omits_field() -> None:
+    doc = {"_id": 1, "a": 1}
+    out = apply_projection(doc, {"score": {"$meta": "textScore"}}, {"$text": {"$search": "x"}})
+    # $meta field is omitted (not computed); inclusion projection keeps only _id.
+    assert out == {"_id": 1}
+
+
+def test_meta_textscore_with_nested_text_query() -> None:
+    doc = {"_id": 1, "a": 1}
+    out = apply_projection(
+        doc,
+        {"score": {"$meta": "textScore"}},
+        {"$and": [{"a": 1}, {"$text": {"$search": "x"}}]},
+    )
+    assert out == {"_id": 1}
+
+
+def test_meta_recognized_unsupported_arg_omits_field() -> None:
+    doc = {"_id": 1, "a": 1, "b": 2}
+    for arg in ("indexKey", "recordId", "sortKey"):
+        out = apply_projection(doc, {"m": {"$meta": arg}})
+        assert out == {"_id": 1}
+
+
+def test_meta_alongside_inclusion_field() -> None:
+    doc = {"_id": 1, "a": 1, "b": 2}
+    out = apply_projection(doc, {"a": 1, "score": {"$meta": "indexKey"}})
+    # Inclusion of `a`; the $meta field is omitted.
+    assert out == {"_id": 1, "a": 1}
+
+
+def test_meta_excludes_id() -> None:
+    doc = {"_id": 1, "a": 1}
+    out = apply_projection(doc, {"_id": 0, "score": {"$meta": "recordId"}})
+    assert out == {}
+
+
+def test_validate_meta_projection_parse_time() -> None:
+    from secantus.projection import validate_meta_projection
+
+    with pytest.raises(ProjectionError) as e:
+        validate_meta_projection({"s": {"$meta": "nope"}}, None)
+    assert e.value.code == 17308
+    with pytest.raises(ProjectionError) as e2:
+        validate_meta_projection({"s": {"$meta": "textScore"}}, {"a": 1})
+    assert e2.value.code == 40218
+    # Recognized-but-unsupported validates clean.
+    validate_meta_projection({"s": {"$meta": "indexKey"}}, None)

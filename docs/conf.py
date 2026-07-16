@@ -35,7 +35,19 @@ source_suffix = {
 }
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    # Nightly security-review output (docs/security-reports/**) is an
+    # internal artifact, not part of the published manual: the dated
+    # reports enumerate findings (some not yet fixed) that don't belong
+    # on the public RTD site, and they're intentionally not in any
+    # toctree. Excluding the whole directory keeps them browsable on
+    # GitHub while stopping each new report from tripping the -W build
+    # with a "document isn't included in any toctree" warning.
+    "security-reports/**",
+]
 
 html_theme = "furo"
 html_static_path = ["_static"]
@@ -74,6 +86,12 @@ intersphinx_mapping = {
 }
 
 autodoc_member_order = "bysource"
+# Mock the compiled WiredTiger extension so autodoc can `import secantus`
+# without a built C-extension. The pure-Python server only touches `wiredtiger`
+# at call time (not import time in a way mock can't satisfy), so the API docs
+# render identically. This is what lets `invoke docs` build with no WiredTiger
+# compile — including in a fresh git worktree that never ran a project build.
+autodoc_mock_imports = ["wiredtiger"]
 myst_enable_extensions = ["colon_fence", "deflist"]
 # Auto-generate slug-shaped anchors for ## / ### / #### headings so
 # cross-doc links like ``[Querying the oplog](change-streams.md#

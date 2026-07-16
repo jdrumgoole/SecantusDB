@@ -19,6 +19,3273 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.4b235] — 2026-07-16
+
+### Point-in-time recovery, a SQL server with its own gauges, and operator parity across both servers
+
+This is the largest SecantusDB release to date — a month of parallel work,
+125 changelog entries. The headline capability is **point-in-time
+recovery**: every write already flowed through the oplog, and
+`secantusAdmin.restoreToTimestamp` now replays it to reconstruct the
+database exactly as it stood at any moment inside the retention window —
+with hot backup archives, base snapshots, and archives portable between the
+Python and Rust servers. The other headline is housekeeping with teeth: the
+daemons got distinguishable names (`secantusd-py`, `secantusd-rs`,
+`secantusd-py-pg` — the old `secantusdb` console script is gone), and
+Python 3.10 is now genuinely supported and genuinely tested in CI.
+
+The PostgreSQL-wire SQL server graduated from experiment to measured
+surface. It now has two external conformance gauges of its own — psycopg
+3's unmodified test suite and the SQLite-originated sqllogictest corpus —
+and the long tail they surfaced landed alongside them: server-side cursors
+over the wire, `COPY` inside transaction blocks, `CREATE SCHEMA`,
+`LANGUAGE plpgsql` function bodies, the full binary codec surface with real
+Postgres type OIDs, per-statement RBAC reusing the Mongo role model, and
+SQL's three-valued NULL semantics carried all the way down the
+filter-pushdown path.
+
+On the MongoDB side, both servers picked up a wide operator-fidelity batch
+— the `$setWindowFields` operator set completed (`$derivative` /
+`$integral` with time units, `$locf`, `$linearFill`, `$expMovingAvg`, range
+windows), the N-ary accumulators, trigonometric and set expressions, a
+much larger date toolbox, and dozens of exact-error-code alignments — and
+the Rust server reached pymongo-suite parity with the Python server (99.5%
+each). Measurement grew to match: sixteen driver-conformance gauges now run
+weekly (C, C++, C#, Kotlin, pymongo async, psycopg, and the Rust-server
+gates joined this cycle), feeding a regenerated cross-driver summary and a
+new three-way feature-comparison page. One genuine bug that machinery
+caught — an awaitData wake race that could delay change-stream delivery by
+a full `maxTimeMS` — is fixed, alongside security hardening (two admin-UI
+CVEs, SCRAM-credential leak paths closed, constant-time token comparison).
+
+#### Highlights
+
+- Point-in-time recovery: `secantusAdmin.backupArchive` /
+  `archiveBaseSnapshot` / `restoreArchive` / `restoreToTimestamp` on the
+  Python server; the same archives restore on the Rust server via
+  `secantusd-rs restore`. See [Recovery](recovery.md).
+- Daemon renames: `secantusd-py` (MongoDB wire, Python), `secantusd-rs`
+  (MongoDB wire, Rust), `secantusd-py-pg` (PostgreSQL wire). The legacy
+  `secantusdb` / `secantus` console scripts are removed.
+- SQL server conformance gauges: `invoke validate-psycopg` (psycopg 3's own
+  suite) and `invoke validate-slt` (sqllogictest corpus), with the
+  wire-protocol, codec, cursor, `COPY`, schema, and plpgsql work they drove.
+- Both servers: completed `$setWindowFields` operators, `$topN` /
+  `$bottomN` / `$firstN` / `$lastN` / `$maxN` / `$minN` accumulators,
+  `$mergeObjects` as an accumulator, trigonometric / set / bitwise
+  expression operators, `$dateFromParts`, `$toDate`, timezone-aware date
+  extraction, and mongod-exact error codes for unknown operators.
+- Rust server catch-up to parity: index-driven `$lookup`, views, `getLog`,
+  `killOp`, role grants, oplog maintenance commands, IANA timezones in
+  date formatting, and the pymongo suite at 99.5% — level with the Python
+  server.
+- Change streams: the awaitData wake race is fixed (a write landing between
+  the producer drain and the wait could stall delivery a full `maxTimeMS`);
+  resume tokens advance per event even at `batchSize` 1.
+- Security: two admin-UI CVEs fixed plus a stored-XSS; `admin.system.users`
+  no longer leaks SCRAM credentials; constant-time secret comparison in the
+  PostgreSQL SCRAM and admin-token checks.
+- Conformance measurement: sixteen gauges (C, C++, C#, Kotlin, pymongo
+  async, psycopg, sqllogictest, and the two Rust-server gates joined),
+  weekly report + cross-driver-summary refresh, and the
+  [Feature comparison](feature-comparison.md) page.
+- Python 3.10 support, tested per-version in CI.
+- Process: changelog fragments (`changelog.d/`) and release-time version
+  assignment ended cross-PR conflicts on `docs/changelog.md` and
+  `pyproject.toml`.
+
+
+### Change streams: awaitData wake no longer misses a write landing mid-getMore
+
+A tailable `getMore` baselined its awaitData wake predicate on a fresh
+oplog-tail snapshot taken *after* draining the change-stream producer. A
+write landing in the gap between the drain and the wait was counted into
+that snapshot and never tripped the predicate — the `getMore` slept its
+full `maxTimeMS` with the event already in the oplog, surfacing it only on
+the post-wait re-drain. On a loaded machine that pushed delivery past the
+client's await window (seen as a one-off
+`test_await_data_blocks_then_wakes_on_insert` failure in the durable CI
+lane). The predicate now baselines on the producer's own consumed position
+(`entry.position_seq`, which the drain advances to the tail it actually
+observed) — any write after that observation wakes or skips the wait,
+mirroring the Rust server's `wait_for_oplog(position, ...)`, which was
+never affected. A regression test pins the interleaving deterministically
+by landing an insert inside the former race window. A side benefit: a
+resuming cursor that drains a full filtered batch no longer sleeps its
+whole `maxTimeMS` before fetching the next backlog page.
+
+#### Fixed
+
+- `commands.py` tailable `getMore`: wake predicate compares the oplog tail
+  against `entry.position_seq` instead of a post-drain tail snapshot.
+
+### `$bit` update applies multiple operations (both servers)
+
+The `$bit` update operator now accepts more than one bitwise operation per field
+and applies them in order, matching mongod: `{$bit: {n: {and: X, or: Y}}}`
+computes `(n & X) | Y`. Both servers previously rejected any `$bit` document with
+more than a single sub-operation. Found by a three-way update differential vs
+real `mongod` 6.0.
+
+#### Fixed
+
+- `update.py` / `secantus-core`: `$bit` iterates every `and`/`or`/`xor` entry in
+  the per-field document (in order) instead of requiring exactly one; an empty
+  `$bit` document is still rejected, and the int32/int64 result width is preserved
+  as before.
+
+### Changelog fragments and release-time version assignment
+
+Concurrent development got much less painful. Previously every PR edited the top
+of `docs/changelog.md`'s `[Unreleased]` section and bumped the single `version`
+line in `pyproject.toml` — two shared lines that made *any* two in-flight PRs
+conflict, so merging one forced the others to rebase and hand-resolve the same
+files. Feature PRs now add a `changelog.d/<slug>.md` fragment (one entry per
+file) instead of touching `docs/changelog.md`, and they no longer bump the
+Python package version at all — the version is assigned once, at release time, by
+`release-prepare`. New fragment files never collide, so parallel sessions stay
+independent.
+
+#### Added
+
+- `changelog.d/` fragment convention (`changelog.d/README.md`), a
+  `changelog.fragments` collator, and an `invoke changelog-collate` task that
+  folds fragments into `## [Unreleased]`. `release-prepare` runs the collation
+  automatically before it stamps the version.
+
+#### Changed
+
+- Feature PRs no longer bump the Python `version` / `__version__` (assigned at
+  release) or edit `docs/changelog.md` directly. The Rust crate version is still
+  bumped per-PR (its `buildInfo` traceability handle; rare same-session-only
+  collisions). See the Versioning and Conventions sections of `CLAUDE.md`.
+
+### Date extractors error on a non-date input (both servers)
+
+All thirteen date-component extractors — `$year` / `$month` / `$dayOfMonth` /
+`$hour` / `$minute` / `$second` / `$dayOfWeek` / `$dayOfYear` / `$week` /
+`$isoWeek` / `$isoDayOfWeek` / `$isoWeekYear` / `$millisecond` — now raise
+mongod's `Location16006` ("can't convert from BSON type … to Date") when given a
+present non-date value (a string, a number, a bool, …), instead of silently
+returning `null`. A `null` or a missing field still yields `null`, as before.
+
+#### Fixed
+
+- `expressions.py` / `secantus-core`: the shared date-operand resolver
+  (`_date_operand` / `date_operand_millis`) distinguishes a null / missing operand
+  (→ null) from a present non-date value. The Python server raises `Location16006`;
+  the Rust server surfaces a generic `BadValue` on that path (the documented
+  error-code gap). Verified three-way vs real `mongod` 6.0 (Python zero
+  divergences).
+
+### Six more date-component extractors and `$dateToParts` ISO mode
+
+The aggregation date toolbox picks up the components MongoDB exposes but
+SecantusDB was still missing: `$dayOfYear` (1-366), `$week` (US week number,
+0-53, weeks starting Sunday), `$isoWeek` (ISO-8601 week 1-53), `$isoDayOfWeek`
+(1=Monday … 7=Sunday), `$isoWeekYear` (the ISO week-numbering year), and
+`$millisecond`. Each slots in alongside the existing extractors and accepts the
+same two shapes — a bare date expression or a `{date, timezone}` object — so a
+fixed `±HH:MM` offset or a named IANA zone (`America/New_York`) shifts the
+instant before the component is read. The year-boundary edge cases match
+mongod: `2026-01-01` (a Thursday) is US week 0, and `2027-01-01` (a Friday) is
+ISO week 53 of ISO year 2026.
+
+`$dateToParts` now honours `iso8601: true`, returning `{isoWeekYear, isoWeek,
+isoDayOfWeek, hour, minute, second, millisecond}` instead of the calendar
+`{year, month, day, …}` shape. The `timezone` option applies in both modes, and
+`iso8601: false` (or absent) keeps the existing output unchanged.
+
+Both servers gain the operators together, pinned byte-for-byte by the Rust ↔
+Python expression parity harness. The named-IANA-zone cases compute natively on
+the Rust side via `chrono-tz`.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$dayOfYear`, `$week`, `$isoWeek`,
+  `$isoDayOfWeek`, `$isoWeekYear`, and `$millisecond` aggregation-expression
+  operators, each supporting the `{date, timezone}` object form.
+- `expressions.py` / `secantus-core`: `$dateToParts` now supports
+  `iso8601: true`, emitting the ISO week-based parts document.
+
+### Docs: three-way feature comparison (MongoDB vs Python server vs Rust server)
+
+A new [Feature comparison](https://secantusdb.readthedocs.io/en/latest/feature-comparison.html)
+docs page decomposes the validation-report pass rates into a per-feature
+matrix: commands, query/update/expression operators, aggregation stages,
+accumulators and window functions, index types, collections, change streams,
+transactions, auth, backup/PITR, and the SQL frontend — each marked
+supported / partial / missing for real `mongod`, the Python server, and the
+Rust server.
+
+#### Changed
+
+- `docs/servers.md`: refreshed the stale "what the Rust server doesn't
+  support" list — the pymongo-suite gap has closed to parity (99.5% both) and
+  the DDL-change-stream-event, large-event-splitting, and timeseries-`_id`
+  bullets described already-shipped features; replaced with the current gap
+  set (SQL frontend, `mapReduce`/`top`, wire-level `restoreToTimestamp`,
+  session lifecycle no-ops, oracle-deferred operator edges, thinner
+  diagnostics). Dropped the out-of-scope claim that RBAC is unimplemented
+  (both servers enforce it).
+- `docs/index.md`: added the new page to the toctree and quick links, and
+  included the previously-orphaned psycopg validation report in the toctree
+  (it was failing the `-W` docs build as `toc.not_included`).
+
+### `$getField` on an absent field now resolves to missing, not null
+
+Reading a field that doesn't exist with `$getField` used to hand back an
+explicit `null`. Real MongoDB treats an absent field as the *missing* value —
+and a `$project` or `$addFields` computed field that resolves to missing is
+omitted from the output document entirely, rather than emitted as `null`. Both
+SecantusDB servers now match that: `{$project: {r: {$getField: {field: "k",
+input: "$sub"}}}}` over `[{sub: {k: 1}}, {sub: {j: 2}}, {}]` yields `[{r: 1},
+{}, {}]` — the documents with no `sub.k` carry no `r` field at all. A field that
+is present with an explicit `null` still returns `null` and is emitted, so the
+missing-vs-null distinction is preserved.
+
+The same change makes `$$REMOVE` behave correctly as a `$project` / `$addFields`
+computed value: the field is dropped instead of leaking the internal removal
+sentinel.
+
+#### Fixed
+
+- `expressions.py` / `secantus-core`: `$getField` returns the missing/`$$REMOVE`
+  marker (not `null`) for a field absent from its input; on the Rust side that
+  case defers to the pure-Python engine, keeping the parity harness green.
+- `aggregate.py`: `$project` and `$addFields` computed fields that evaluate to
+  the missing marker are omitted from the output (an existing `$addFields`
+  target set to the marker is removed), matching mongod.
+
+### `$inc` / `$mul` on an explicit-null field now errors like mongod
+
+Applying `$inc` or `$mul` to a field that is present with an explicit `null`
+value now raises a `TypeMismatch` (error code 14), exactly as real MongoDB
+does — "Cannot apply $inc to a value of non-numeric type … of non-numeric type
+null". Previously both servers silently coerced the null to `0` and applied the
+delta, so `{$inc: {n: 5}}` against `{n: null}` returned `{n: 5}` instead of
+failing. A *missing* (absent) field is still treated as `0` and the operation
+applied — that has always matched mongod and is unchanged.
+
+The fix distinguishes an absent field from a present-but-null one: the pure-Python
+engine raises the coded error directly, and the Rust core defers the null case to
+the Python oracle so the exact error code is preserved (the Rust server surfaces
+a generic `BadValue`, the documented error-code gap).
+
+#### Fixed
+
+- `update.py` / `secantus-core`: `$inc` / `$mul` on a field present with an
+  explicit `null` now errors with code 14 (`TypeMismatch`) instead of coercing
+  the null to `0`. A missing field is still treated as `0` and the operation
+  applied.
+
+### Docs: the Rust-server Java gauge report joins the site
+
+`invoke validate-java --server rust` has been writing
+`docs/validation-report-java-rust-server.md` — the mongo-java-driver suite
+pointed at the standalone Rust server — but the report had never been
+committed or added to the docs toctree. It now ships alongside the other
+validation reports (445/2 passed, 99.6%; the two failures are the
+`mapReduce` tests, consistent with the Rust server not implementing
+`mapReduce`).
+
+#### Fixed
+
+- `java_validation/generate_report.py`: the generator emitted the
+  Python-server title and refresh command for both servers; a
+  `-rust-server` output now gets a `(Rust server)` title, the
+  `--server rust` refresh command, and a note that the two-phase spawn
+  boots `secantusd-rs`.
+
+### `$jsonSchema` `uniqueItems` bridges cross-type numerics recursively (both servers)
+
+`{$jsonSchema: {properties: {arr: {uniqueItems: true}}}}` now detects duplicate
+array elements using MongoDB value equality, which treats int / long / double /
+Decimal128 as equal when their values match — and does so recursively inside
+sub-documents and sub-arrays. So an array like `[{a: 1}, {a: 1.0}]` is correctly
+rejected (the two documents are equal), matching real `mongod` 6.0.
+
+Previously only *top-level* scalar arrays collapsed cross-type numerics (`[1, 1.0]`
+was already a duplicate); a cross-type-equal numeric nested inside a document or
+array element (`[{a: 1}, {a: 1.0}]`) was wrongly treated as distinct on both
+servers, because duplicate detection keyed off a raw BSON encoding that differs for
+int `1` versus double `1.0`.
+
+#### Fixed
+
+- `query.py` / `secantus-core`: `uniqueItems` duplicate detection uses a recursive
+  canonical key (`_unique_items_key` / `unique_items_key`) that normalises numerics
+  to a common value form at every nesting level and recurses into sub-documents and
+  sub-arrays, instead of Python structural `==` or a raw sort-key/BSON encoding.
+
+### `$mergeObjects` as a `$group` / `$setWindowFields` accumulator
+
+MongoDB's `$mergeObjects` was already available as a `$project` expression, but
+not as an accumulator inside `$group` or `$setWindowFields`. It now is: SecantusDB
+merges each group member's operand document into a single accumulated document,
+with later documents' keys overriding earlier ones. A null or missing operand is
+skipped, a group whose operands are all missing/null yields an empty document
+`{}`, and a non-null, non-document operand raises the same `Location40400` error
+mongod returns — so `{$group: {_id: "$g", merged: {$mergeObjects: "$sub"}}}` now
+behaves exactly like a real server.
+
+The accumulator ships on both the Python server and the Rust server, pinned
+byte-for-byte by the aggregation parity harness.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$mergeObjects` accumulator for
+  `$group` and `$setWindowFields` — merge operand documents across the group
+  (later keys win), skip null/missing, empty group → `{}`, non-document operand →
+  `Location40400`.
+
+### `$meta` projection faithful error codes (both servers)
+
+`find()`'s `{field: {$meta: <arg>}}` projection now returns the same errors real
+`mongod` does. A `{$meta: "textScore"}` projection without a `$text` predicate in
+the query fails with `Location40218` (`query requires text score metadata, but it
+is not available`), and any unrecognized `$meta` argument fails with
+`Location17308` (`Unsupported argument to $meta: <arg>`). Both errors are raised
+at parse time — before matching — so they fire even against an empty collection,
+matching mongod. Verified against real mongod 6.0.
+
+For a recognized-but-unsupported `$meta` keyword (`indexKey`, `recordId`,
+`sortKey`, and the search/geo/vector variants) SecantusDB degrades gracefully:
+rather than emitting a wrong metadata value, it omits the projected field
+entirely, leaving the rest of the projection intact. Previously the Python server
+mis-handled the `$meta` value as a truthy inclusion flag and the Rust server
+errored generically on it.
+
+#### Fixed
+
+- `projection.py` / `secantus-core` / `secantus-commands`: `{$meta: "textScore"}`
+  without a `$text` query raises `Location40218`, and an unknown `$meta` argument
+  raises `Location17308`, on both servers with mongod's exact codes and wording.
+  A recognized-but-unsupported `$meta` arg is validated clean and the field is
+  omitted from the result (partial — SecantusDB doesn't compute the metadata).
+
+### `$min` / `$max` compare by BSON order — no more traceback leak (both servers)
+
+The `$min` and `$max` update operators now compare the incoming value against the
+current field value by MongoDB's BSON canonical-type order, instead of Python's
+native `<` / `>`. This fixes two bugs found by a three-way update differential
+against real `mongod` 6.0:
+
+- **A leaked traceback.** A cross-type compare — e.g. `{$max: {a: "str"}}` on a
+  numeric `a` — raised a raw `TypeError` (`'>' not supported between 'str' and
+  'int'`) that surfaced to the client. Now it orders like mongod: a string
+  out-ranks a number, so `$max` sets `"str"`; `$max` of an ObjectId, a date, or a
+  bool over a number likewise picks the higher-ranked value.
+- **Explicit null treated as "no current".** An explicit-null field is a real
+  value (BSON rank 2, below numbers), not an absent field. `{$min: {a: 9}}` on
+  `{a: null}` now keeps `null` (null < 9); a genuinely *missing* field is still set
+  unconditionally.
+
+#### Fixed
+
+- `update.py` / `secantus-core`: `$min`/`$max` use `ordering._bson_lt` (Python) /
+  `order::cmp` (Rust) with a missing-vs-present split. The Rust engine handles the
+  sortable subset (null / number / string / objectId / date / doc / array)
+  natively and defers a bool / Decimal128 / NaN / exotic operand to the Python
+  oracle (whose `_bson_lt` covers the full order).
+
+### PG server: connection teardown releases the thread's WiredTiger session
+
+Every PG connection thread that wrote data leaked its cached WT session on
+disconnect (the Mongo server's teardown has always released it;
+`_handle_client`'s never did). Dead threads' positioned cursors kept cache
+pages pinned, and after a few hundred connections WiredTiger's eviction
+livelocked — an application thread wedged in `__wt_cache_eviction_worker`
+while holding the storage lock, queueing every other connection forever. The
+full psycopg gauge's single-daemon run hung at ~test 420 three times out of
+three; with the fix it completes in ~125s (faster than the ~550s baseline,
+since sessions no longer pile up). Verified by an 8-writer-connection leak
+probe (unfixed: 2 → 10 sessions; fixed: flat) pinned as a regression test.
+Also: a binary/garbage COPY payload now raises SQLSTATE 22021 (invalid byte
+sequence) instead of escaping as an internal error.
+
+#### Fixed
+
+- `pgserver.py`: `_handle_client`'s finally releases the thread's WT session
+  and cached cursors via `Storage._reset_thread_session()`, mirroring the
+  Mongo server; `_copy_in` guards `decode_text` with a faithful 22021.
+- psycopg gauge headline after the day's slices (COPY transactionality,
+  CREATE SCHEMA, server-side cursors, this fix), on the standard
+  single-daemon protocol: **2554 passed / 61.9%**, up from 2465 / 59.8% —
+  report refreshed.
+
+### Positional `$` projection (both servers)
+
+`find()`'s positional projection operator now works on both servers:
+`find({"items.k": "b"}, {"items.$": 1})` returns only the **first array element
+that matched the query** on that path — `items: [{k: "b", …}]` — instead of the
+whole array stripped to empty documents, which is what both servers previously
+produced. The matched element is resolved from the query's clause on the array
+(a dotted `items.sub` field, a direct value/range on `items`, or an
+`items: {$elemMatch: …}`), so it works for arrays of documents and arrays of
+scalars alike. Found by a three-way projection differential against real
+`mongod` 6.0; all value cases match exactly.
+
+#### Fixed
+
+- `projection.py` / `secantus-core`: the positional `$` projection resolves and
+  returns the first query-matched array element. The find command threads the
+  filter into the projection engine so the operator has the query context it
+  needs. Validation is parse-time (matching mongod), so an invalid positional —
+  more than one (`Location31276`), an exclusion form (`Location31395`), or an
+  array field the query doesn't reference (`Location51246`) — errors even when the
+  query matches nothing. The Python server reproduces mongod's exact Location
+  codes; the Rust server surfaces a generic `BadValue` on these error paths (the
+  documented cross-cutting error-code gap). (`$meta` projection remains deferred —
+  `tasks/backlog.md` §7.5.)
+
+### The psycopg conformance gauge: SecantusDB's SQL server gets its headline number
+
+The SQL server now has what the Mongo server has had for a year: an
+external conformance gauge running a real driver's own unmodified test
+suite. `invoke validate-psycopg` vendors psycopg 3.3.4 (pinned in lockstep
+with the `dev`-extra wheel), spawns a `SecantusPGServer` daemon on an
+ephemeral port, verifies it actually is SecantusDB (a stray real Postgres
+would inflate the numbers), runs the full sync half of psycopg's suite over
+`PSYCOPG_TEST_DSN`, and renders `docs/validation-report-psycopg.md` with
+the per-file pass/fail/skip breakdown. It joins the weekly `validate.yml`
+matrix as the fourteenth gauge — and the first for the SQL side. The
+opening baseline over the full sync suite is 2415 passed of ~4100 run
+(58.6%); the six-file subset that drove this month's conformance work
+stands at 91%.
+
+#### Added
+
+- `psycopg_validation/` (runner, include list, report generator),
+  `invoke validate-psycopg`, a `psycopg` lane in `validate.yml`, and the
+  `vendor/psycopg` submodule @ 3.3.4. `psycopg[binary]` is now pinned
+  exactly so the vendored suite and the installed wheel stay in lockstep.
+
+### Python 3.10 actually works — and CI actually tests it
+
+The CI test matrix's `python-version` never took effect: `uv sync` honours the
+repo's `.python-version` pin (3.12), so every matrix cell — including the
+scheduled 3.10–3.13 sweep — was silently testing 3.12. With the interpreter
+genuinely pinned per cell (a job-level `UV_PYTHON`, which outranks the pin file
+for every `uv` invocation in the job), the first real 3.10 run surfaced three
+breakers that the gap had been hiding, all now fixed: the config loader's
+module-level `tomllib` import (stdlib only from 3.11) crashed
+`secantus.config` / the `secantusd-py` CLI on 3.10; `datetime.UTC` (a 3.11+
+alias) in fifteen test call sites; and `datetime.fromisoformat` on 3.10
+rejecting Postgres's short UTC offsets (`+00` / `+0000`), which PG text
+rendering emits and timestamptz literals carry.
+
+#### Fixed
+
+- `config.py`: fall back to the API-identical `tomli` backport on Python 3.10
+  (`tomli>=2.0; python_version < '3.11'` added to the core dependencies).
+- `sql/datetimes.py`: new `parse_iso_datetime` — `fromisoformat` fast path
+  (a no-op passthrough on 3.11+) that widens a trailing short UTC offset to
+  `+HH:MM` only on failure; wired into `scalar._as_datetime`, `intervals`,
+  and both `typemap.coerce` timestamp branches.
+- `.github/workflows/test.yml`: the three matrix jobs set a job-level
+  `UV_PYTHON: ${{ matrix.python-version }}` so `uv sync` and every `uv run`
+  agree on the matrix interpreter (a sync-only `--python` flag is not enough —
+  a later bare `uv run` re-resolves against `.python-version` and recreates
+  the venv without the dev extras).
+- Tests: `datetime.UTC` → `datetime.timezone.utc` in
+  `test_indexes` / `test_expressions` / `test_crud`.
+
+### Range operators are type-bracketed, matching mongod
+
+MongoDB's range operators (`$gt` / `$gte` / `$lt` / `$lte`) are *type-bracketed*:
+a scalar bound only ever matches values in the same BSON type bracket. SecantusDB
+now honours that on both the Python and the Rust server, closing two divergences
+that a three-way probe against real `mongod` surfaced.
+
+A document-valued (or array-of-documents) field no longer errors on the Rust
+server when compared against a scalar bound — `{a: {$gt: 2}}` against a
+document-valued `a`, and `{items: {$elemMatch: {$gt: n}}}` over an array of
+sub-documents, now cleanly no-match (as they always did on the Python server and
+on `mongod`) instead of the Rust server returning a `BadValue`. And **bool is its
+own bracket**: a boolean-valued field no longer spuriously matches a numeric bound
+(Python's `bool` is an `int` subclass, so `True < 2` used to match on both
+engines), while `bool`-vs-`bool` comparisons (`True > False`) still work. Both the
+collection-scan and index-scan paths agree with `mongod` on every case.
+
+#### Fixed
+
+- Range operators (`$gt`/`$gte`/`$lt`/`$lte`) are now type-bracketed on both
+  servers. A document/array operand against a scalar bound no-matches instead of
+  erroring on the Rust server; a boolean field no longer matches a numeric bound
+  (bool compares only with bool). Verified against real `mongod` 6.0 with a
+  three-way probe (collection-scan and index-scan paths both).
+
+### Rust server compares array-vs-array range bounds lexicographically
+
+A range query whose bound is an array — `{a: {$gt: [1, 2]}}` — now evaluates on
+the Rust server instead of erroring. The Rust matcher previously deferred any
+array operand to a `Fallback`, which the Rust server surfaced as a `BadValue`;
+it now compares the two arrays **whole-array lexicographically**, exactly as the
+Python server (via Python's native `list < list`) and real `mongod` do.
+
+The comparison recurses element-by-element: the first decisive element pair wins,
+equal leading elements continue to the next pair, and if one array is a prefix of
+the other the shorter one sorts first. A cross-type element pair (where Python's
+`<` would raise `TypeError`) yields a clean no-match rather than an error, and an
+array field compared against a *scalar* bound still rides the multikey element
+path (`{a: [1, 3]}` matches `{a: {$gt: 2}}` because `3 > 2`). Only the exotic BSON
+types (JS code / symbol / dbpointer / undefined) as a range operand still defer to
+the Python engine.
+
+Verified against real `mongod` 6.0 and pinned to the Python oracle by new curated
+parity cases and Rust unit tests.
+
+#### Fixed
+
+- Rust server: `$gt` / `$gte` / `$lt` / `$lte` with an **array bound** (e.g.
+  `{a: {$gt: [1, 2]}}`) now compares whole-array lexicographically instead of
+  returning `BadValue`, matching the Python server and `mongod`. Array-vs-scalar
+  bounds continue to match via the multikey element path; a cross-type element
+  pair no-matches cleanly.
+
+### `$log10` now evaluates natively on the Rust server
+
+The `$log10` aggregation-expression operator is now computed natively by the Rust
+engine, so the Rust server evaluates it instead of rejecting the pipeline with a
+`BadValue`. The rest of the transcendental family (`$exp` / `$ln` / `$log`) was
+already native; `$log10` had simply been left out. Rust's `f64::log10` and
+CPython's `math.log10` share the platform libm, so the two servers agree
+bit-for-bit (pinned by the expression parity corpus). Found by a three-way
+differential sweep against real mongod 6.0.
+
+#### Fixed
+
+- `$log10` is evaluated by the Rust `secantus-core` expression engine (was a
+  Fallback → `BadValue` on the Rust server). Matches the Python server and mongod
+  for positive inputs; a non-positive input yields `null` on both servers (see
+  `tasks/backlog.md` §7 for the pre-existing log-domain divergence from mongod).
+
+### Tooling: the sqllogictest conformance gauge (invoke validate-slt)
+
+The SQL server gets its correctness gauge (tasks/sql-gauges-plan.md G1): the
+SQLite-originated sqllogictest corpus — 622 files, millions of records — is
+vendored pristine at `vendor/sqllogictest` and executed by sqllogictest-rs
+over real pgwire, one fresh `SecantusPGServer` daemon per file. A
+preprocessing pass (never touching the vendored tree) bridges the three
+corpus/runner incompatibilities established empirically: trailing comments on
+`skipif`/`onlyif` lines, value-per-line expected blocks for
+`nosort`/`rowsort` multi-column records, and sqlite's implicit
+`hash-threshold 8` default. The curated 30-file include list currently
+passes 26/30 end-to-end; the 4 failures are declared
+`EXPECTED_DIVERGENCES` (SQLite read-only views, SQLite's
+division-by-zero→NULL vs PG's 22012, and the runner's missing `query I`
+type coercion), so the gauge is green in its own terms and reports loudly if
+a divergence resolves.
+
+#### Added
+
+- `vendor/sqllogictest` (shallow submodule, dev-only, excluded from
+  sdist/wheel), the `slt_validation/` gauge package (preprocessor, per-file
+  daemon runner with identity verification, report generator, include +
+  expected-divergence lists), the `invoke validate-slt` task, and
+  `docs/validation-report-slt.md` in the Sphinx toctree. Requires the
+  `sqllogictest` binary (`cargo install sqllogictest-bin`).
+- `pyproject.toml`: sdist excludes for `vendor/sqllogictest` /
+  `slt_validation` — and the previously-missing `vendor/psycopg` /
+  `psycopg_validation` entries.
+
+### SQL: COPY runs inside the open transaction block
+
+The COPY sub-protocol handler never entered the session's user transaction:
+`COPY` after a same-block `CREATE TABLE` failed with `UndefinedTable`
+(psycopg's standard fixture shape, cascading through ~190 of its COPY-backed
+tests), `COPY TO STDOUT` couldn't see rows inserted earlier in the block —
+and worst, `COPY FROM STDIN` rows were written *outside* the transaction, so
+they survived a `ROLLBACK`. Plan resolution, the copy-in insert, and the
+copy-out extract now all run under `use_user_transaction` when a block is
+open, and a failed COPY marks the block aborted like Postgres does.
+
+#### Fixed
+
+- `pgserver.py`: `_handle_copy` / `_copy_in` / `_copy_out` wrap their engine
+  calls in the session's open user transaction (no-op outside a block);
+  a COPY error inside a block sets `txn_failed`. The three copy-heavy psycopg
+  suites (test_copy / test_range / test_multirange) move 230 → 374 passing.
+
+### SQL server: bare COPY options and computed projections over row sources
+
+Two more gauge-driven fixes. `COPY … TO STDOUT (FORMAT csv)` — the
+options spelling psycopg emits, without `WITH` — now parses (sqlglot only
+accepts the `WITH (…)` form, so `parse()` inserts it, anchored on the
+STDIN/STDOUT target and a known option keyword). And projections that
+compute over a set-returning or catalog row source — `SELECT x * 2 FROM
+generate_series(1,3) AS t(x)`, `SELECT 1 FROM pg_namespace` — run through
+the per-row evaluated plan instead of failing with "expected a column".
+The psycopg-gauge subset stands at 685 of 979 (70%), from 42% at the
+first run.
+
+#### Fixed
+
+- `planner.py`: `COPY … TO STDOUT/FROM STDIN (options)` normalizes to the
+  `WITH (options)` spelling sqlglot parses; both the table and the query
+  form take options.
+- `engine.py`: SRF and virtual-catalog row sources route computed
+  projections (arithmetic, literals, scalar functions) through the
+  evaluated-select plan — execution and Describe agree on the shape.
+
+### SQL: CREATE SCHEMA and schema-qualified user types
+
+`CREATE SCHEMA [IF NOT EXISTS]` / `DROP SCHEMA [IF EXISTS] [CASCADE]` land,
+with user-declared types (enum / domain / composite) creatable and droppable
+under a schema (`CREATE TYPE testschema.testcomp AS (…)`). Qualified names
+resolve everywhere psycopg's type machinery needs them: `to_regtype`, the
+`'schema.name'::regtype` literal cast (previously an internal error — the
+pushdown's cast coercion knew `regclass` but not `regtype`), `oid::regtype`
+rendering, and `TypeInfo`/`CompositeInfo` fetches by dotted string or
+`sql.Identifier` spelling. `pg_namespace` carries user schemas with minted
+oids and `pg_type` reports the bare `typname` under the schema's
+`typnamespace`. Dropping a non-empty schema without CASCADE is a 2BP01
+dependency error, CASCADE drops the contained types, and `DROP TYPE IF
+EXISTS` tolerates a missing schema. This clears the psycopg gauge's entire
+"CREATE SCHEMA is not supported" cluster and unblocks the schema-gated
+composite/range/typeinfo fixtures. (Schema-qualified *tables* remain 0A000 —
+`tasks/backlog.md`; user-defined `CREATE TYPE … AS RANGE` likewise.)
+
+#### Added
+
+- `catalog.py`: schema registry (`create_schema` / `schema_exists` /
+  `drop_schema` / `list_schemas`); `engine.py`: `CREATE`/`DROP SCHEMA`
+  routing, qualified-name extraction for `CREATE`/`DROP TYPE`;
+  `virtual.py`: user-schema `pg_namespace` rows, dotted-name splitting in
+  `pg_type`, quote-normalized qualified lookups; `planner.py`: the
+  `::regtype` literal cast resolves built-ins and user types (42704 on
+  unknown, like PG).
+
+### SQL server: arbitrary WHERE expressions and three-valued logic
+
+The sqllogictest random corpus writes SQL the way a fuzzer does — `WHERE
+- col2 + col1 IS NOT NULL`, `WHERE 1 IN (2)`, `SELECT + + 90 * a * - b` —
+and the planner used to reject anything its Mongo-filter pushdown couldn't
+express. Untranslatable WHERE clauses now route to per-row evaluation
+automatically (a dry-run of the lowering decides), computed unary
+projections type correctly instead of crashing tag inference, `ORDER BY
+<ordinal>` resolves to the output expression on the evaluated path, and the
+scalar evaluator's NOT/AND/OR/BETWEEN implement SQL's three-valued logic
+(`NOT NULL` is NULL, `NULL AND FALSE` is FALSE — visible under NOT).
+
+#### Fixed
+
+- `planner.py`: `where_needs_per_row` dry-runs the pushdown lowering and
+  falls back to per-row evaluation when it raises; the DISTINCT plan path
+  consults it too; `_infer_scalar_tag` types `- col` from its operand;
+  `ORDER BY 1` resolves the output ordinal (except SRF outputs, which sort
+  post-expansion).
+- `scalar.py`: three-valued NOT/AND/OR and a decomposed BETWEEN whose
+  definitively-false arm dominates a NULL bound.
+- A predicate the pushdown can't lower no longer errors 0A000; cross-type
+  comparisons under per-row evaluation match nothing instead of raising
+  Postgres' 42883 — a documented divergence (`tasks/backlog.md`).
+
+### SQL server: client_encoding, wire-protocol fixes, and binary-format hardening from the psycopg gauge
+
+Running psycopg 3's own unmodified test suite against the SQL server
+(`tasks/sql-gauges-plan.md`) surfaced a batch of wire-protocol and
+type-handling divergences beyond the type-OID work. The headline is
+`client_encoding` support: the server now honours the startup parameter and
+`SET client_encoding` (LATIN1/LATIN2/LATIN5/LATIN9, WIN1250-1252,
+SQL_ASCII pass-through), converting query text, text and binary parameters,
+text and binary results, arrays, COPY data, and error messages at the wire
+boundary while the engine stays UTF-8 throughout. Alongside it, a real
+protocol-ordering bug: Describe answered NoData for DML with RETURNING while
+Execute then emitted DataRows — a violation that crashed psycopg's pipelined
+`executemany`. The measured effect on the fixed psycopg-gauge subset
+(six files, psycopg 3.3.4): 409 → 637 passed of 979 (42% → 65%) across this
+and the preceding type-OID release.
+
+#### Added
+
+- `client_encoding` (startup parameter and `SET`, with canonical
+  ParameterStatus reporting and `22023` on unknown encodings); an
+  untranslatable result character raises `22P05` like Postgres instead of
+  degrading to `?`, and a NUL byte in a text parameter is rejected with
+  `22021`.
+- Quoted built-in type names in DDL (`CREATE TABLE t (c "cidr")`, the form
+  psycopg's fixtures emit via `sql.Identifier`) resolve as built-ins —
+  including array spellings — instead of failing as undeclared enums.
+
+#### Fixed
+
+- `pgextended.py`: Describe on INSERT/UPDATE/DELETE/MERGE … RETURNING
+  answers with the RETURNING columns' RowDescription (was NoData followed by
+  DataRows — a protocol violation).
+- `engine.py`: Describe on a set-returning row source (`FROM
+  generate_series(…)` / bare `SELECT generate_series(…)`) resolves the
+  result shape instead of erroring — this is what failed every
+  `cursor.stream()` (libpq single-row mode) call.
+- Array round-trips, all six param/result format combinations: a binary
+  array parameter's Python list is rendered as a Postgres array literal
+  (was the Python `repr`); the array-literal parser strips only Postgres'
+  whitespace set (`\x1c`–`\x1f` are `str.isspace()` to Python but data to
+  Postgres); the renderer quotes every whitespace character; binary array
+  elements coerce to native values (`bytea` hex, `bool` `'t'/'f'`) before
+  encoding. chr(1)–chr(255) plus `€` now round-trip byte-exact in text and
+  bytea arrays.
+- Binary `numeric` handles `±Infinity` in both directions (signs
+  `0xD000`/`0xF000`; encoding previously crashed, decoding produced
+  garbage).
+
+### SQL server: oid/regtype, declared-parameter typing, and the full binary codec surface
+
+Three parallel work streams off the psycopg gauge, landing together. The
+`oid` type (26, arrays 1028) is now first-class — columns, casts, binary
+codecs, `pg_type` rows — and `21::regtype` resolves an OID to its type name
+the way Postgres does. Parameter typing got the same discipline on every
+path: the OID a client declares in Parse now governs the value whether it
+arrives in text or binary format, `'19.99'::numeric`-style scalar casts
+convert instead of passing strings through, and Execute encodes DataRows
+with the same column OIDs Describe reported (the mismatch fed text bytes to
+clients parsing binary numerics). And the binary result/parameter codec
+surface now covers what psycopg's full-type faker exercises: time, timetz,
+interval, uuid, inet, cidr, macaddr, json, and every range and multirange
+type — including new tstzrange/tstzmultirange registration, PG-exact
+multirange rendering, JSON integers beyond int64, and Decimal128-safe
+numeric handling at any width. psycopg's `test_leak` (the full-type
+CRUD matrix) went from 72 failures to 72 passes; the six-file gauge subset
+stands at 887 of 979 (91%), from 42% at the first external run.
+
+#### Added
+
+- `oid` type end-to-end; `N::regtype` OID resolution (42704 on unknown
+  OIDs); `pg_typeof(x)::oid` resolves to the type's OID.
+- Binary codecs (both directions) for time/timetz/interval/uuid/inet/cidr/
+  macaddr/json and all range/multirange types; tstzrange/tstzmultirange
+  types; `oid[]`/`json[]`/multirange array OIDs.
+
+#### Fixed
+
+- Execute now applies the same declared-parameter OID overrides to its
+  DataRow encoding that Describe applies to RowDescription — the divergence
+  sent int4/text bytes in fields announced as int2/numeric.
+- Text-format parameters with a declared scalar OID convert to the native
+  type (declared type governs, matching the binary twin; garbage raises
+  22P02); scalar casts to int/float/numeric/bool convert with PG rounding
+  semantics.
+- Binary numeric survives values wider than Python's default 28-digit
+  context (wide-context decode, context-free negate/abs); >34-digit
+  numerics round into Decimal128 range instead of erroring on INSERT.
+- Numeric/bytes/±inf parameters keep their types through statement binding
+  (typed cast nodes / hex literals instead of bare string literals).
+- Multirange text rendering drops the ", " separator Postgres doesn't
+  print; daterange bounds render date-only; bool coercion of 'f'/'false'
+  strings; JSON top-level scalars render as JSON.
+
+### SQL: HAVING IS NULL forms, constant JOIN ON, duplicate join group keys
+
+Round four of the sqllogictest corpus tail. `HAVING <operand> IS [NOT] NULL`
+now lowers for bare-column, aggregate, and computed-over-group-key operands
+(`HAVING (- col2) IS NOT NULL`) on both the single-table and join HAVING
+lowerers. A constant JOIN ON condition (`LEFT JOIN tab0 ON 80 = 70`) folds
+three-valued — TRUE joins every foreign row, FALSE/unknown joins none (INNER
+drops the row, LEFT null-pads). And two join GROUP BY wrong-answer bugs: the
+same bare column name grouped from two aliases (`GROUP BY cor1.col1,
+cor0.col1`) collapsed to a single group key, and `SELECT DISTINCT` over
+grouped join output never deduplicated.
+
+#### Fixed
+
+- `planner.py`: `_having_to_match` / `_join_having_to_match` lower
+  `IS [NOT] NULL` over bare columns, aggregates, and computed group-key
+  expressions (the last via `_to_agg_expr` over a group-key resolver, correct
+  through any NOT nesting); `[NOT] <expr> IN (<exprs over group keys>)`
+  lowers three-valued; always-unknown NULL-operand predicates
+  (`HAVING NOT NULL IN (- col1)`, `NOT NULL NOT BETWEEN - col0 AND NULL`)
+  fold to match-nothing; `_to_agg_expr` learns unary minus over non-literals.
+- `planner.py`: an always-unknown JOIN ON (`ON NOT NULL < expr`) folds like a
+  constant-false ON instead of raising.
+- `planner.py`: `_lookup_stage` folds a constant ON via
+  `_constant_predicate_filter` instead of raising "ON must compare columns".
+- `planner.py`: duplicate bare column names in a join GROUP BY mint distinct
+  grouped fields on both the join-group and join-group-window paths
+  (qualified references rewrite/resolve onto the minted key); grouped
+  `SELECT DISTINCT` over a join dedups with the same second `$group` the
+  single-table planner uses.
+
+### SQL server: join-path aggregate expressions and WHERE residuals
+
+The JOIN planners catch up with the single-table paths from the last two
+rounds: aggregate arguments over joins can be expressions
+(`MAX(cor0.col0 + 1)`, `SUM(- 83)` over a CROSS JOIN), lowered through the
+join resolver with identity decorations stripped, and a join WHERE the
+`$match` lowering can't express routes to the per-row residual the join
+pipelines already carry (a dry-run probe, the join twin of the
+single-table one) instead of erroring.
+
+#### Fixed
+
+- `planner.py`: computed-over-aggregate outputs over a join
+  (`COUNT(*) * 32 FROM a CROSS JOIN b`) route to the group-then-evaluate
+  builder instead of failing per-row; `_join_accumulator` lowers
+  expression arguments for
+  sum/avg/min/max; `_agg_key` identifies expression aggregates by SQL text
+  instead of crashing the resolver; `_join_where_lowerable` dry-runs
+  `_expr_to_filter` and the inner/outer join builders plus both join
+  residual sites consult it.
+
+### SQL server: RowDescription reports real Postgres type OIDs for computed columns
+
+A libpq client keys its result decoding off the type OID in each
+`RowDescription` column, and SecantusDB's SQL server used to fall back to
+`text` (25) for most computed results — `CASE` expressions, `array[...]`
+constructors, array casts, integer arithmetic, bound parameters — and widened
+`smallint`/`real` to `integer`/`double precision` everywhere. The first
+external-gauge run (psycopg 3's own test suite plus the sqllogictest corpus,
+see `tasks/sql-gauges-plan.md` §6) flagged this as the single
+highest-leverage divergence. Computed and derived columns now describe with
+the OID real Postgres would use, so typed loaders in psycopg / pg8000 /
+SQLAlchemy decode results without special-casing.
+
+#### Added
+
+- `pg_typeof()` and `'name'::regtype`: the type-introspection pair psycopg's
+  type suite leans on (`select pg_typeof(%s::int2) = 'smallint'::regtype`).
+  `pg_typeof` resolves at plan time from the same static inference that types
+  RowDescription; `::regtype` normalizes any accepted spelling (`int4`,
+  `varchar`, `float4`) to the canonical pretty form `pg_typeof` prints.
+- `typemap.py`: first-class `int2` (21) and `float4` (700) type tags —
+  `smallint` / `real` columns, casts, arrays (`1005` / `1021`), catalog
+  `pg_type` rows, and `information_schema` spellings; `SMALLSERIAL` columns
+  now describe as `int2` instead of `text`.
+
+#### Fixed
+
+- `planner.py`: type inference for computed SELECT columns — `CASE` types
+  from its result branches; `array[...]` and array casts report the array
+  OID; integer arithmetic stays integer (`int + int` → `int4`, matching
+  `_pg_div`'s truncating division) instead of `numeric`; an unadorned
+  decimal constant (`SELECT 1.5`) is `numeric`, matching Postgres;
+  `sum(int2/int4)` → `int8`, `sum(int8)` → `numeric`, `avg(integer)` →
+  `numeric` per Postgres' aggregate result types; `CAST($1 AS SMALLINT)`
+  coerces its text-bound value numerically.
+- `pgextended.py`: `SELECT $1` describes with the parameter OID the client
+  declared in Parse (psycopg binds a small Python int as `int2`), instead of
+  re-inferring from the substituted Python value.
+- `pgextended.py`: binary result format and binary parameters now cover
+  arrays (the real ndim/hasnull/elemoid wire layout, both directions). The
+  correct array OIDs engage a libpq client's binary array parser, which the
+  text-bytes fallback would have fed garbage.
+
+### SQL: server-side cursors over the wire, pg_cursors, pg_prepared_statements
+
+psycopg's `ServerCursor` works end-to-end. A `DECLARE`d cursor is a portal in
+the v3 protocol, and psycopg's first move after the DECLARE is a wire
+`Describe('P', name)` — which our extended-protocol session answered with
+`34000 portal does not exist`. The portal Describe (and Close) now fall back
+to the session's DECLAREd cursors, parameterized declarations substitute
+their `$N` placeholders inside the raw `DECLARE … FOR SELECT $1` command
+text, and the session's cursors and prepared statements surface in new
+`pg_cursors` / `pg_prepared_statements` catalog tables. psycopg's
+test_cursor_server + test_prepared move 26 → 102 passing.
+
+#### Added
+
+- `pg_catalog.pg_cursors` (name / statement / is_holdable / is_binary /
+  is_scrollable / creation_time, from the session's open cursors) and
+  `pg_catalog.pg_prepared_statements` (SQL-level `PREPARE`d plus the
+  connection's wire-Parse statements, exposed via `Session.wire_prepared`).
+
+#### Fixed
+
+- `pgextended.py`: `Describe('P', name)` on a DECLAREd cursor returns its
+  RowDescription; `Close('P', name)` destroys the cursor.
+- `planner.py`: `substitute_parameters` also substitutes `$N` textually
+  inside a raw `exp.Command` tail (DECLARE bodies aren't parsed trees).
+
+### SQL: three-valued NULL semantics on the pushdown, and the aggregate long tail
+
+The SQL server's Mongo-filter pushdown now honours SQL's three-valued logic: `<>`,
+`NOT (...)`, `NOT BETWEEN`, and `NOT IN` no longer match rows whose operand column
+is NULL (Mongo's `$ne`/`$nor`/`$nin` are two-valued and matched them), a NULL
+candidate in an `IN` list can no longer match a NULL row, and `x NOT IN (…, NULL)`
+correctly matches nothing. `SUM` over zero non-null inputs returns NULL instead of
+Mongo's 0, on every plan path. Alongside, a round of sqllogictest-corpus aggregate
+and planner shapes: FROM-less aggregates (`SELECT COUNT(*)` is 1), `COUNT(<expr>)`
+counting non-null evaluations, expression `DISTINCT` aggregate arguments
+(`SUM(DISTINCT 77)`), computed and constant projections under GROUP BY, `SELECT *`
+grouped by every column, `SELECT DISTINCT` over grouped output, parenthesized join
+sources (`FROM (a CROSS JOIN b)`), constant-LHS `IN` (list and subquery forms),
+division by zero raising SQLSTATE 22012, and Postgres-exact `float8` wire text
+(`12`, not `12.0`; `NaN`/`Infinity` spellings). Three files of the corpus's
+`random/` suites now pass end-to-end that previously failed on their first record.
+
+#### Fixed
+
+- `planner.py`: `_negated_filter` lowers `NOT` by pushing the negation into the
+  tree (De Morgan, comparison-operator flips, null-guarded single-field fallback)
+  instead of Mongo's two-valued `$nor`; `<>` is null-guarded; `$in` lists drop
+  NULL candidates; constant-LHS `IN`/`NOT IN` fold three-valued (list + subquery);
+  a NULL comparison operand folds to match-nothing even when wrapped
+  (`51 <> (NULL)`, `- CAST(NULL AS INT) <> x`); computed comparisons lowered to
+  `$expr` guard both sides non-null (BSON total order is two-valued —
+  `NULL <> 19` matched every row).
+- `planner.py`: a join WHERE the `$match` lowering can't express routes to the
+  per-row evaluated join / the pre-group residual instead of being silently
+  dropped, on both the plain-join and the join-group-window paths
+  (`WHERE (NULL) BETWEEN NULL AND NULL` returned every row).
+- `planner.py`: two *different* expression aggregates of the same function
+  (`MAX(3)` and `MAX(-94 - -16)`) no longer collide on the `(func, None)`
+  accumulator-dedup key and share one value; integer `/` inside aggregate
+  arguments and `$expr` lowers with PG's truncate-toward-zero semantics
+  (`MIN(col1 / -99)` was computed with real division).
+- `planner.py` / `executor.py`: `SUM` over only-NULL inputs is NULL on the plain
+  group, group-window, join, join-window, and DISTINCT paths; the evaluated group
+  path synthesizes the one implicit-aggregate row over empty input like the
+  pipeline path already did.
+- `planner.py`: FROM-less SELECTs fold aggregates over their one implicit row;
+  `COUNT(<literal>)` no longer misroutes to the lone-`COUNT(*)` fast path;
+  `COUNT(<expr>)` counts non-null evaluations (`COUNT(NULL)` is 0).
+- `planner.py`: expression `DISTINCT` aggregate arguments push the lowered
+  expression into the distinct set (single-table, group-window, join, join-window
+  registrars); computed-over-aggregate outputs over a JOIN route to the
+  group-then-evaluate builder (`COUNT(*) * COUNT(*)`).
+- `planner.py`: grouped SELECTs with computed/constant projections route to the
+  evaluated group path; `SELECT *` under GROUP BY expands when every column is a
+  group key; `SELECT DISTINCT` over grouped output dedups; `ORDER BY <ordinal>`
+  resolves on the group-then-evaluate path.
+- `planner.py`: `FROM (a CROSS JOIN b)` unwraps grouping parens instead of
+  erroring "a derived table requires an alias".
+- `scalar.py`: division / modulo by zero raise SQLSTATE 22012 instead of leaking
+  an internal error; `COALESCE` evaluates lazily like Postgres, so a
+  division-by-zero in a never-reached argument no longer raises; operand-form
+  `CASE x WHEN v` uses SQL equality (a NULL operand or WHEN value never
+  matches, where Python `==` matched NULL to NULL).
+- `planner.py` / `executor.py`: a constant `HAVING` (``HAVING NOT NULL IS
+  NULL``) folds three-valued to match-all / match-nothing; DISTINCT aggregates
+  over zero input rows synthesize their NULL row instead of crashing on the
+  ``$addToSet`` reduction ("$size requires an array").
+- `typemap.py`: `float8` text output uses Postgres' shortest form (`12`, `-0`,
+  `1e+20`, `NaN`, `Infinity`).
+- `planner.py`: `_infer_scalar_tag` is memoized per statement — deep arithmetic
+  chains were exponential (a 20-term sqllogictest expression took ~0.5s; whole
+  corpus files timed out).
+
+### SQL: psycopg TypeInfo catalog fidelity (typarray, pg_range, to_regtype)
+
+psycopg's type-registration machinery works end-to-end: `TypeInfo.fetch`,
+`RangeInfo.fetch`, `MultirangeInfo.fetch`, `EnumInfo.fetch` (with labels),
+and `CompositeInfo.fetch` (with field names) all resolve against the virtual
+catalog. `pg_type` gains `typarray` / `typdelim`, a `pg_range` table maps
+range oids to their declared subtype and multirange oids, `to_regtype()` is
+implemented (built-ins and user-declared enum/domain/composite types,
+returning NULL for unknown names), and `oid::regtype::text` renders
+user-declared type names. Catalog-table WHEREs that can't lower now evaluate
+per-row with the real catalog in scope, and a context-dependent function call
+(`to_regtype('mood')`) is no longer folded as if it were a NULL literal.
+
+#### Added
+
+- `pg_type.typarray` / `typdelim` columns; the `pg_catalog.pg_range` virtual
+  table (`rngtypid` / `rngsubtype` / `rngmultitypid`, declared subtypes —
+  `tsrange` advertises `timestamp`, `daterange` advertises `date`);
+  `to_regtype(name)` (scalar + FROM-less + pushdown-constant paths).
+
+#### Fixed
+
+- `oid::regtype` on a user-declared type's oid resolves its name through the
+  catalog instead of raising 42704.
+- The catalog-table fast path publishes the planning subquery context and
+  routes non-lowerable WHEREs through per-row evaluation with the real
+  catalog (a synthetic catalog over the row backend knew no user types).
+- The NULL-operand comparison folds no longer treat an `Anonymous` function
+  call as a NULL literal (`WHERE t.oid = to_regtype('mood')` matched nothing).
+
+### Docs: compatibility / authentication / index pages caught up with shipped features
+
+Three docs pages still described the server as it was several releases ago.
+`compatibility.md`'s stub table claimed `getLog` returns an empty array,
+`hostInfo` / `whatsmyuri` / `buildInfo` are hardcoded, sessions are untracked,
+and `serverStatus` is all zeros — all of those return real data now, so the
+table shrinks to the honest remainder (`top`'s zero counters, `buildInfo`'s
+deliberate `7.0.0` compatibility identity, `connectionStatus`'s empty
+privileges expansion, `serverStatus`'s zeroed fallback for bare
+`CommandContext` embedders). The `$lookup` stopgap section described the
+pre-index-join hash-only implementation; the date-format section listed
+ISO-week tokens as missing; the TTL-index row said there was no background
+sweeper. All rewritten to match the code.
+
+`authentication.md` and `index.md` both still said authorization (RBAC) is
+not implemented and that an authenticated principal is fully privileged —
+RBAC has been enforced for a while (built-in and custom roles, checked on
+every command when `--auth` is on). `authentication.md` gains an
+Authorization section documenting the enforcement model, the built-in role
+list, and the custom-role / grant-revoke command set; both scope lists now
+credit SCRAM-SHA-1 and MONGODB-X509 correctly.
+
+#### Changed
+
+- `docs/compatibility.md`: stub table rewritten to current behaviour;
+  `$lookup` section describes the index-driven join (IXSCAN on a matching
+  foreign-field index, hash-join fallback); date-format token list updated
+  (`%G %V %j %U %u %w` all supported); TTL row documents the 60-second
+  background sweeper; out-of-scope auth bullet updated (SCRAM-SHA-1
+  implemented, RBAC enforced); Rust-server note updated to conformance
+  parity with a pointer to the feature comparison.
+- `docs/authentication.md`: RBAC documented as enforced (new Authorization
+  section: built-in roles, custom roles, grant/revoke quartet, code-13
+  behaviour); `createUser` example uses a real role binding.
+- `docs/index.md`: in-scope and out-of-scope auth bullets updated to
+  SCRAM (SHA-1/SHA-256) + MONGODB-X509 + enforced RBAC.
+
+### `$toDate` conversion expression on both servers
+
+The `$toDate` aggregation expression now works on the pure-Python and Rust
+servers. `$toDate: <expr>` is the shorthand for `$convert: {input: <expr>, to:
+"date"}`, and SecantusDB implements it as exactly that — a date is returned
+unchanged, an int/long/double is read as milliseconds since the Unix epoch, and
+an ISO-8601 string is parsed, while `null` or a missing field yields `null`.
+
+Because `$toDate` delegates straight to the existing `$convert`-to-date path, it
+inherits precisely the same supported inputs and errors: whatever `$convert` can
+turn into a date, so can `$toDate`, with no separate conversion code to drift.
+The Rust engine's `$convert`-to-date was also widened to convert an int / long /
+double (epoch milliseconds) to a date natively, so both `$convert` and `$toDate`
+now compute the numeric case on the Rust server rather than deferring; ISO-string
+and ObjectId inputs still defer to the Python oracle (matching `$dateFromString`'s
+partial Rust support). The two engines stay byte-for-byte in step (pinned by the
+expression parity harness).
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$toDate` aggregation expression operator,
+  delegating to the existing `$convert`-to-date conversion; the Rust
+  `$convert`-to-date path gains native int/long/double → epoch-millis conversion.
+
+### Unrecognized aggregation-expression operators report mongod's error codes
+
+When a query or pipeline references an aggregation-expression operator that
+doesn't exist (e.g. a typo like `$notreal`, or an operator MongoDB itself hasn't
+shipped), SecantusDB now rejects it with the same context-specific error code and
+message that real `mongod` returns, instead of a generic one.
+
+An unknown operator inside a query `$expr` — `find({$expr: {$notreal: [...]}})` —
+now surfaces `168 InvalidPipelineOperator` with the message
+`Unrecognized expression '$notreal'` on both the Python and the Rust server
+(previously the Python server returned `14 TypeMismatch` and the Rust server a
+generic `2 BadValue`). An unknown operator inside an aggregation `$project` —
+`aggregate([{$project: {y: {$notreal: [...]}}}])` — returns
+`Location31325` `Invalid $project :: caused by :: Unknown expression $notreal` on
+the Python server. mongod emits these same "unknown expression" errors even for
+operators it recognises by name but hasn't implemented, so SecantusDB simply
+matches that behaviour for any operator it doesn't recognise.
+
+#### Fixed
+
+- Query `$expr` with an unrecognized expression operator returns
+  `168 InvalidPipelineOperator "Unrecognized expression '$op'"` on both servers
+  (was `14 TypeMismatch` on Python, `2 BadValue` on Rust).
+- Aggregation `$project` with an unrecognized expression operator returns
+  `Location31325 "Invalid $project :: caused by :: Unknown expression $op"` on the
+  Python server (was `14 TypeMismatch`). The Rust server still returns a generic
+  `BadValue` here — faithful `$project` detection needs to distinguish the
+  projection-only operators (`$slice` / `$elemMatch` / `$meta`) from expressions,
+  tracked in `tasks/backlog.md` §7.
+
+### CI: the Java-vs-Rust-server gauge joins the weekly validate run
+
+`docs/validation-report-java-rust-server.md` was only refreshable by hand —
+the weekly `validate.yml` run regenerated every other committed report but
+not this one, so it would have gone stale. A `java-rust-server` matrix entry
+now runs `invoke validate-java --server rust` weekly alongside the other
+gauges: it reuses the java gauge's JVM/Gradle toolchain plus the
+storage-engine sync, and points `gauge_common.rust_binary` at the
+venv-staged `secantusd-rs` via `SECANTUSDB_BIN` (the default search only
+covers the cargo target dir).
+
+### CI: the cross-driver summary regenerates with the weekly validate run
+
+`docs/validation-summary.md` had been frozen since 2026-06-20 ("the 11
+gauges") while the per-driver reports refreshed weekly. Each gauge job now
+uploads its raw output (`.validation/`) as an artifact alongside its
+report, and the aggregate job reassembles them and regenerates the summary
+in the same refresh PR — no WiredTiger build needed there, because the
+generator now reads the package version straight from `src/` and resolves
+vendored-driver SHAs from the superproject's gitlinks (`git ls-tree`)
+instead of requiring checked-out submodules.
+
+#### Added
+
+- `validation_summary.generate`: collectors for the **mongo-kotlin-driver**
+  gauge (JUnit XML from `:driver-kotlin-sync:integrationTest`) and the
+  **pymongo (async)** gauge (`AsyncMongoClient` suite), bringing the
+  summary to 13 gauges; the gauge count in the prose is computed, not
+  hand-written.
+
+### `$push` / `$addToSet` skip missing field values (both servers)
+
+A three-way aggregate differential against real `mongod` 6.0 found that the
+`$push` and `$addToSet` group accumulators were adding `null` for a document
+whose accumulated field is **absent**, where mongod skips it entirely. They now
+match mongod: a missing field is not accumulated, while an explicit `null` still
+is — so `{$push: "$s"}` over `["x", <missing>, null, "x"]` yields
+`["x", null, "x"]`, and an all-missing field still produces `[]` (not a list of
+nulls). The distinction is drawn by a new missing-aware evaluate helper
+(`evaluate_or_missing` / `eval_or_missing`) that surfaces an absent field path as
+a distinct sentinel rather than `null`.
+
+#### Fixed
+
+- `aggregate.py` / `secantus-core`: `$push` / `$addToSet` (in both `$group` and
+  `$setWindowFields`) skip a missing accumulator value. (The differential also
+  surfaced three items deferred to `tasks/backlog.md` §7.5: `$mergeObjects` as a
+  `$group` accumulator, `$getField` returning `null` instead of missing for an
+  absent field, and a last-ULP `$stdDevPop` difference vs mongod.)
+
+### PG server shutdown drains client handlers before storage close
+
+`SecantusPGServer.stop()` now tracks its per-connection handler threads and
+joins them (bounded, 5 s) after closing their sockets. Previously `stop()`
+returned while a handler could still be mid-request on its per-thread
+WiredTiger session, so an embedder's natural `stop()` → `storage.close()`
+sequence raced the handler and corrupted the WT session handle (a logged
+`WT session close failed during close` / `Session__freecb` TypeError during
+teardown — visible whenever a client was abandoned mid-transaction, e.g. a
+failing test). A handler that outlives the drain window is logged by name.
+
+#### Fixed
+
+- `sql/pgserver.py`: `stop()` joins live handler threads before returning, so
+  `storage.close()` immediately after `stop()` can no longer close a WT session
+  a handler thread is still using. Regression test: abandon a client
+  mid-transaction, `stop()`, assert every handler exited and `close()` logs no
+  session-close error.
+- Test docstrings in `test_pgserver.py` / `test_pgserver_copy.py` /
+  `test_sql_aggregate.py` still described the deleted `FakeStorage` in-memory
+  mock; they now state the real WT-backed `Storage` these suites run on.
+
+### `$in`/`$nin` regex candidates and `$all` + `$elemMatch` (both servers)
+
+A three-way query differential against real `mongod` 6.0 turned up two
+match-operator gaps present on both servers, now fixed and three-way verified.
+
+A regex inside `$in` (or `$nin`) now matches string values **by pattern**, as
+mongod does — `{s: {$in: [/^h/i]}}` matches `"hello"` and `"HELLO"`. Previously
+both servers treated the regex as a literal value to compare by equality, so it
+silently matched nothing (and on the Rust server it errored). And `$all` now
+accepts `$elemMatch` clauses (`{a: {$all: [{$elemMatch: {$gt: 1, $lt: 3}}]}}`) —
+each clause requires *some* array element to satisfy its sub-query, so an array
+is matched against several independent element predicates at once.
+
+#### Fixed
+
+- `query.py` / `secantus-core`: `$in` / `$nin` route a regex candidate through the
+  regex matcher (`_in_candidate_matches` / `in_candidate_matches`); `$all` handles
+  a `{$elemMatch: …}` entry by delegating to the `$elemMatch` matcher over the
+  whole array. (A related Rust-only gap — `$gt`/`$lt` against a cross-type operand
+  such as a document-valued array element deferring instead of comparing by BSON
+  type order — is tracked in `tasks/backlog.md` §7.5.)
+
+### `$pull` query semantics, `$pullAll`, and `$push $sort` on the Rust server
+
+A three-way differential against real `mongod` 6.0 turned up two array-update
+**correctness** bugs present on both servers, plus a Rust-server feature gap —
+all now fixed and three-way verified.
+
+`$pull` previously removed only elements *literally equal* to the criterion, so a
+predicate like `{$pull: {a: {$gte: 10}}}` silently removed nothing and a
+sub-document criterion like `{$pull: {a: {x: 5}}}` never matched. `$pull` now
+applies the criterion under full query semantics — an operator-only criterion
+(`{$gte: 10}`, `{$in: […]}`) is an element-value predicate; any other document
+criterion is a sub-document match against each element; a scalar is BSON-aware
+equality (so `1` matches `1.0` but not `true`, exactly as mongod does — the old
+literal-`==` path wrongly conflated `1` and `true`). `$pullAll`, which removes
+every element equal to any value in a list, was **entirely unimplemented** (both
+servers rejected it as an unknown modifier) and now works. On the Rust server the
+`$push` `$sort` modifier (`1` / `-1` whole-element or `{field: dir}`, in BSON
+order) now computes natively instead of deferring.
+
+#### Fixed
+
+- `update.py` / `secantus-core`: `$pull` now matches via the query engine
+  (`query.matches` / `query::matches`) instead of literal equality; `$pullAll`
+  added to both engines and to the Rust `KNOWN_UPDATE_OPS` validator.
+
+#### Added
+
+- `secantus-core`: `$push` `$sort` (whole-element and `{field: dir}` forms) on the
+  Rust server, via the shared `order::cmp` / `is_sortable` contract; an element
+  outside the sortable subset still defers. `$inc` / `$mul` with a Decimal128
+  operand remains a Rust-side defer (decimal arithmetic parity is out of scope —
+  `tasks/backlog.md` §7.5).
+
+### Trigonometric expression operators (both servers)
+
+The full trigonometric family lands on both servers — circular, inverse, and
+hyperbolic — matched to real `mongod` 6.0 via a three-way probe (mongod vs Rust
+vs Python server) with zero value divergences on the numeric path:
+
+`$sin` · `$cos` · `$tan` · `$asin` · `$acos` · `$atan` · `$atan2` ·
+`$sinh` · `$cosh` · `$tanh` · `$asinh` · `$acosh` · `$atanh`
+
+Inputs are int / long / double (result: double); `null` / missing propagate to
+null. Domain violations raise exactly as mongod does (`Location50989`): `$asin` /
+`$acos` / `$atanh` need `[-1, 1]`, `$acosh` needs `[1, ∞)`, and `$sin` / `$cos` /
+`$tan` reject `±Infinity` / `NaN`. `$atanh(±1)` returns `±Infinity` (not a domain
+error). A non-numeric argument raises `Location28765` (`Location51044` for
+`$atan2`).
+
+#### Added
+
+- `expressions.py` / `secantus-core`: the operators above. Both servers compute
+  through the platform libm — Rust `f64::sin` and CPython `math.sin` share it, so
+  they agree bit-for-bit (the same basis as the already-shipped `$exp` / `$ln`).
+  Decimal128 inputs are float-cast on the Python server (SecantusDB does not
+  reproduce mongod's decimal-precise transcendental result) and defer to the
+  Python oracle on the Rust side — the documented generic-code gap
+  (`tasks/backlog.md` §7.5).
+
+### Set-expression and utility operators (both servers)
+
+The aggregation set-expression family lands on both servers, plus a handful of
+comparison / size / angle utilities — all matched to real `mongod` 6.0 via a
+three-way probe (mongod vs Rust vs Python server) with zero value divergences:
+
+- **`$setUnion` / `$setIntersection` / `$setDifference`** — set algebra over
+  arrays. Union and intersection return their result in BSON sort order (matching
+  mongod); difference preserves first-array order. All three dedup by BSON-order
+  equality, so `1` and `1.0` collapse but `1` and `true` do not.
+- **`$setEquals` / `$setIsSubset`** — set membership predicates over two-or-more /
+  exactly-two arrays.
+- **`$allElementsTrue` / `$anyElementTrue`** — truthiness reductions over an array.
+- **`$cmp`** — three-way comparison (-1/0/1) using the full BSON cross-type order.
+- **`$binarySize`** (UTF-8 byte length of a string / length of Binary; null → null)
+  and **`$bsonSize`** (encoded BSON byte size of a document; null → null).
+- **`$degreesToRadians` / `$radiansToDegrees`** — angle conversions.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: the operators above. Set ops share a
+  `_set_dedup_sorted` / `set_dedup_sorted` helper that sorts by BSON order and dedups
+  adjacent equal values; a non-array argument (or an element the Rust core can't
+  cross-type-order) raises on the Python server with mongod's code and defers to the
+  Python oracle on the Rust side (documented generic-code gap, `tasks/backlog.md`
+  §7.5).
+
+### Batch of aggregation expression operators (both servers)
+
+Nine more aggregation expression operators land on both servers, all matched to
+real `mongod` 6.0 via a three-way probe (mongod vs Rust vs Python server):
+
+- **`$tsSecond` / `$tsIncrement`** — the seconds / increment fields of a BSON
+  Timestamp (as longs); null/missing → null, non-timestamp → error.
+- **`$dateFromParts` ISO-week form** — `{isoWeekYear, isoWeek, isoDayOfWeek}` (the
+  calendar form shipped earlier); starts at the Monday of ISO week 1 and rolls over
+  (`isoWeek` 53 → next ISO year).
+- **`$type`** — the BSON type string of a value, with `"missing"` for an absent
+  field (distinct from `"null"`).
+- **`$isNumber`** (int/long/double/decimal, not bool) and **`$isArray`**.
+- **`$strcasecmp`** — case-insensitive string comparison (-1/0/1; null → empty
+  string).
+- **`$replaceOne` / `$replaceAll`** — substring replacement; any null
+  input/find/replacement → null, a non-string one → error.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: the operators above. `$strcasecmp` and
+  `$replaceOne`/`$replaceAll` follow the existing string-op contract (Rust computes
+  ASCII and defers non-ASCII case mapping to the Python oracle); the ISO-week form
+  uses `chrono`'s ISO calendar. The Python server reproduces mongod's error codes
+  exactly (`5687301`/`5687302`, `40515`/`40516`/`40523`, `51745`); the Rust server
+  errors on the same inputs but with a generic code (its core defers error-raising —
+  documented gap, `tasks/backlog.md` §7.5).
+
+### `$dateFromParts` expression (both servers)
+
+Both servers now build dates from calendar components with `$dateFromParts`:
+`{$dateFromParts: {year, month, day, hour, minute, second, millisecond, timezone}}`.
+Components default to month/day = 1 and time = 0, and out-of-range values **roll
+over** exactly as mongod does — month 13 → next January, month 0 → previous
+December, day 0 → last day of the previous month, hour 25 → next day, millisecond
+1500 → +1.5 s. `year` is required and must be 1–9999. A `timezone` interprets the
+components as local time in that zone (local→instant). Any null component yields
+null. Matched to real `mongod` 6.0 via a three-way probe (mongod vs Rust vs Python
+server): all values, rollovers, and the validation error codes (`40515` non-integral
+component, `40516` missing year, `40523` year out of range) confirmed.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$dateFromParts` — month-carry + day/time
+  `timedelta` arithmetic for the rollover. The Python server also resolves *named*
+  IANA timezones (via `zoneinfo`); the Rust server computes fixed-offset zones
+  natively and defers named zones to the Python oracle (the local→instant direction
+  is DST-ambiguous, as with `$dateFromString`). The ISO-week form
+  (`isoWeekYear` / `isoWeek` / `isoDayOfWeek`) is not yet supported.
+
+### `$top` / `$bottom` / `$topN` / `$bottomN` accumulators (both servers)
+
+Both servers now support MongoDB 5.2's sort-key `$group` (and `$setWindowFields`)
+accumulators: `{$topN: {n, sortBy, output}}` sorts the group's documents by
+`sortBy` and returns the top `n` documents' `output`, `$bottomN` the bottom `n`;
+`$top` / `$bottom` are the single-value forms and take no `n`. The `sortBy` is a
+multi-key spec with per-field directions, matching `$sort`'s cross-type BSON order.
+Matched to real `mongod` 6.0 via a three-way probe (mongod vs Rust vs Python
+server) — values, multi-key sort, array `output`, integral-double `n`, and the
+validation error codes (`5788002`-`5788005`, `5787908`, `10065`) all confirmed.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$top` / `$bottom` / `$topN` /
+  `$bottomN` accumulators — collect `(sortBy-values, output)` per doc, stable-sort
+  by the `sortBy` directions at finalize (via the same `_SortKey` / `order::cmp`
+  contract as `$sort`, deferring an unsortable sort key to the Python oracle), and
+  take the top/bottom output(s). Usable in `$group` and `$setWindowFields`.
+
+### Server stop names the connection thread when a shutdown drain wedges
+
+`SecantusDBServer.stop()` already drains its per-connection handler threads to
+zero before closing WiredTiger (polling the active-connection count, re-closing
+sockets each poll), and storage's per-op `_closed` fences make that teardown
+safe even if the drain times out. What it lacked was *observability*: on a drain
+timeout it logged only a count ("N connection thread(s) still active"), which is
+exactly what made the intermittent xdist-worker-death race in this area hard to
+pin down. Connection threads are now named `secantus-conn-<host>:<port>`, and the
+timeout warning dumps the live stack of each still-active one — so a genuine
+shutdown wedge names its own culprit instead of surfacing as an opaque number.
+
+#### Changed
+
+- `server.py`: per-connection handler threads are named `secantus-conn-<addr>`;
+  the stop-drain timeout warning now includes each stuck thread's stack
+  (`_format_stuck_conn_stacks`).
+### `$top` / `$bottom` / `$topN` / `$bottomN` accumulators (both servers)
+
+Both servers now support MongoDB 5.2's sort-key `$group` (and `$setWindowFields`)
+accumulators: `{$topN: {n, sortBy, output}}` sorts the group's documents by
+`sortBy` and returns the top `n` documents' `output`, `$bottomN` the bottom `n`;
+`$top` / `$bottom` are the single-value forms and take no `n`. The `sortBy` is a
+multi-key spec with per-field directions, matching `$sort`'s cross-type BSON order.
+Matched to real `mongod` 6.0 via a three-way probe (mongod vs Rust vs Python
+server) — values, multi-key sort, array `output`, integral-double `n`, and the
+validation error codes (`5788002`-`5788005`, `5787908`, `10065`) all confirmed.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$top` / `$bottom` / `$topN` /
+  `$bottomN` accumulators — collect `(sortBy-values, output)` per doc, stable-sort
+  by the `sortBy` directions at finalize (via the same `_SortKey` / `order::cmp`
+  contract as `$sort`, deferring an unsortable sort key to the Python oracle), and
+  take the top/bottom output(s). Usable in `$group` and `$setWindowFields`.
+
+### `$firstN` / `$lastN` / `$maxN` / `$minN` as `$group` accumulators (both servers)
+
+Both servers now support the N-element operators as `$group` (and
+`$setWindowFields`) accumulators, completing the family whose expression forms
+shipped earlier: `{$firstN: {n, input}}` collects the first `n` per-doc `input`
+values across the group, `$lastN` the last `n`, and `$maxN` / `$minN` the `n`
+largest / smallest by BSON order. Matched to real `mongod` 6.0 via a three-way
+probe (mongod vs Rust server vs Python server): **`$firstN` / `$lastN` keep null
+values** (they're the first/last values seen), while **`$maxN` / `$minN` drop
+them**; `{n, input}` validation (integral-double `n` accepted, mongod error codes)
+is shared with the expression forms.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$firstN` / `$lastN` / `$maxN` /
+  `$minN` accumulators (shared `nelem_parse_n` validator; `$maxN`/`$minN` sort via
+  the `order::cmp`/`is_sortable` contract, deferring bool/Decimal128 elements to
+  Python's `_SortKey`). Usable in `$group` and `$setWindowFields`.
+
+### Storage close-path race fixed; opt-in fast test storage
+
+The WiredTiger-backed storage close path carried a latent use-after-free race.
+A connection thread opening or resetting its per-thread session
+(`_session` / `_reset_thread_session`) and the cross-thread oplog readers
+touched the WiredTiger connection *outside* the storage lock, so under rapid
+concurrent teardown they could race `close()`'s own session/connection teardown
+— a double-close or an open-on-a-closed-connection that segfaults. Every one of
+those paths is now fenced against the closed flag under the storage lock. The
+shipped server always checkpoints on close, whose timing masked the race in
+practice, and the pure-Rust server already drains its connection threads to
+zero before closing the connection — so neither production server was exposed —
+but the race was real and is now closed.
+
+Separately, `Storage` and `SecantusDBServer` gained a `durable` parameter so the
+test suite can run against a faster non-durable storage mode (journal on,
+close-checkpoint skipped — every table is still created on disk, so schema,
+persistence and within-session behaviour stay real). It is **opt-in and defaults
+to durable**, so the shipped server is unchanged. `SECANTUS_FORCE_DURABLE=1`
+forces full journal + checkpoint durability everywhere and overrides the fast
+default; a CI lane runs the whole suite that way on every push, so the
+checkpoint-durability path (schema, close-and-reopen, PITR / backup) stays
+continuously exercised even though the default local suite now runs fast.
+
+#### Added
+
+- `Storage` / `SecantusDBServer`: a `durable` parameter (defaults to durable),
+  with `SECANTUS_FORCE_DURABLE` (force durable, wins over everything) and the
+  conftest-set `SECANTUS_TEST_FAST_STORAGE` (fast default for the test suite)
+  environment overrides.
+- CI: a `SECANTUS_FORCE_DURABLE=1` full-suite lane so durability paths run every push.
+
+#### Fixed
+
+- Storage close-path use-after-free / double-close race: `_session`,
+  `_reset_thread_session`, and the oplog readers (`read_oplog`, `read_preimage`,
+  `oplog_floor_seq`, `find_seq_for_ts`, scan helpers) now open/close WiredTiger
+  sessions only under the storage lock and only while the store is open.
+### `$firstN` / `$lastN` / `$maxN` / `$minN` as `$group` accumulators (both servers)
+
+Both servers now support the N-element operators as `$group` (and
+`$setWindowFields`) accumulators, completing the family whose expression forms
+shipped earlier: `{$firstN: {n, input}}` collects the first `n` per-doc `input`
+values across the group, `$lastN` the last `n`, and `$maxN` / `$minN` the `n`
+largest / smallest by BSON order. Matched to real `mongod` 6.0 via a three-way
+probe (mongod vs Rust server vs Python server): **`$firstN` / `$lastN` keep null
+values** (they're the first/last values seen), while **`$maxN` / `$minN` drop
+them**; `{n, input}` validation (integral-double `n` accepted, mongod error codes)
+is shared with the expression forms.
+
+#### Added
+
+- `aggregate.py` / `secantus-core` (`group.rs`): `$firstN` / `$lastN` / `$maxN` /
+  `$minN` accumulators (shared `nelem_parse_n` validator; `$maxN`/`$minN` sort via
+  the `order::cmp`/`is_sortable` contract, deferring bool/Decimal128 elements to
+  Python's `_SortKey`). Usable in `$group` and `$setWindowFields`.
+
+### Date-operator timezone errors now report mongod's exact codes (Python server)
+
+A three-way conformance probe (real `mongod` 6.0 vs the Rust server vs the Python
+server) found that the date operators' `timezone` errors used a generic code. The
+Python server now reports mongod's exact codes: an **unrecognized time zone**
+(`{$dateToString: {…, timezone: "Not/AZone"}}`, and likewise for the `$hour`/…
+extractors and `$dateToParts`) is `Location40485` "unrecognized time zone
+identifier: \"…\"", and a **non-string timezone** is `Location40517` "timezone must
+evaluate to a string, found …". (The Rust server raises on the same inputs but with
+a generic code — its core defers error-raising to Python.)
+
+#### Fixed
+
+- `expressions.py` (`_resolve_timezone`): pin the unknown-zone / non-string-timezone
+  errors to mongod's `40485` / `40517`, shared by every timezone-aware date operator.
+
+### N-element array expressions `$firstN` / `$lastN` / `$maxN` / `$minN` (both servers)
+
+Both servers now support MongoDB 5.2's N-element array aggregation expressions:
+`$firstN` / `$lastN` return the first / last `n` elements of an array, and `$maxN`
+/ `$minN` the `n` largest / smallest by MongoDB's cross-type BSON sort order
+(descending for `$maxN`, ascending for `$minN`, with null elements ignored). When
+the array has fewer than `n` elements all are returned. Neither server recognised
+these before.
+
+The `{n, input}` validation is **matched to real mongod 6.0** (via a three-way
+probe against `mongod`): `n` may be any positive integral number — an integral
+double like `2.0` is accepted — and a missing `n` / `input`, a non-integral or
+non-positive `n`, or a **null / missing / non-array `input`** each raises mongod's
+exact error code (`Location5787902`-`5787908` / `Location5788200`). In particular a
+null or missing `input` is an *error*, not null — an earlier draft (and the
+`$firstN`/`$lastN` that first shipped under this Unreleased section) returned null
+there, which diverged from mongod; this is now corrected.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$firstN` / `$lastN` / `$maxN` / `$minN`
+  expression operators over a shared, mongod-faithful `{n, input}` validator
+  (`_nelem_n_and_input` / `nelem_n_and_input`). `$maxN` / `$minN` sort via the same
+  `order::cmp` / `is_sortable` contract `$sortArray` uses (an element outside the
+  sortable subset — bool, Decimal128, … — defers to the Python `_SortKey` oracle),
+  so the two engines agree on cross-type order. The Python server reproduces
+  mongod's error codes exactly; the Rust server raises on the same inputs but with
+  a generic code (its core defers error-raising to Python). The `$group`
+  accumulator forms remain a follow-on (`tasks/backlog.md` §7.5).
+
+### Distinguishable daemon names: `secantusd-py`, `secantusd-rs`, `secantusd-py-pg`
+
+The two servers used to collide on the command name `secantusdb`, and the Rust
+binary went by the confusable `secantusdb-rs`. Each daemon now has a clear name
+under a shared `secantusd-<engine>[-<protocol>]` scheme: the Python MongoDB
+server is `secantusd-py`, the Rust MongoDB server is `secantusd-rs`, and the
+PostgreSQL-wire server gets its first console script, `secantusd-py-pg`. This is
+a clean break with no backwards-compatibility shim: the old `secantusdb` and
+`secantus` console scripts are gone, and the two utility commands are renamed to
+the bare-`secantus` import-name prefix (they aren't daemons, so the `secantusd-`
+prefix doesn't fit them) — `secantusdb-admin` → `secantus-admin` and
+`secantusdb-restore-archive` → `secantus-restore-archive`. The PyPI project name
+(`SecantusDB` / `pip install secantusdb`) and the `secantus` import package are
+unchanged.
+
+The shared configuration file is renamed to match: both Mongo daemons read
+`secantusd.toml` (auto-discovered in the cwd, `~/.secantus/`, and
+`/etc/secantus/`). The legacy `secantusdb.toml` name is still discovered at each
+location — the new name wins on a tie — so an existing config file keeps working.
+
+#### Added
+
+- `secantusd-py` / `secantusd-py-pg` console scripts; `secantusd-py-pg` is a new
+  CLI entry point (`main()` / `build_parser()`) for `SecantusPGServer`.
+- Config auto-discovery now probes `secantusd.toml` ahead of the legacy
+  `secantusdb.toml` at every location, in both the Python and Rust loaders.
+
+#### Changed
+
+- The standalone Rust binary is now emitted as `secantusd-rs` (was `secantusdb`);
+  its `--version` / `--help` / startup banner and the `secantusd-rs restore`
+  usage text follow suit.
+- Utility console scripts renamed: `secantusdb-admin` → `secantus-admin`,
+  `secantusdb-restore-archive` → `secantus-restore-archive` (the argparse
+  `prog=` / help text follow).
+- `secantusdb.toml.example` renamed to `secantusd.toml.example`.
+
+#### Removed
+
+- The `secantusdb` and `secantus` console-script aliases of the Python server.
+  Use `secantusd-py` (or `python -m secantus`).
+
+### Bitwise aggregation operators `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot` (both servers)
+
+Both servers now support MongoDB 6.3's bitwise aggregation expressions.
+`$bitAnd` / `$bitOr` / `$bitXor` fold a list of int/long operands with the
+corresponding bitwise operator; `$bitNot` complements a single operand. The
+result is a long when any operand is a long and an int otherwise; a null or
+missing operand makes the whole result null; an empty operand list yields the
+operator's identity (all-ones for `$bitAnd`, `0` for `$bitOr` / `$bitXor`). A
+non-integer operand (double, bool, decimal, …) raises, matching mongod. Neither
+server recognised these before.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$bitAnd` / `$bitOr` / `$bitXor` / `$bitNot`
+  aggregation expressions, with int32/int64 result-width tracking. (The `$group`
+  accumulator forms remain a follow-on — see `tasks/backlog.md` §7.5.)
+
+### Rust server: `$stdDevPop` / `$stdDevSamp` group accumulators
+
+The Rust server now supports the `$stdDevPop` and `$stdDevSamp` accumulators in
+`$group` (and `$setWindowFields`), matching the Python server — population
+standard deviation (÷n, `0` for a single value) and sample standard deviation
+(÷n-1, `null` for fewer than two values). Previously the Rust server rejected
+these accumulators; the Python server already had them.
+
+To keep the two engines bit-for-bit identical, both now compute the deviation with
+the same fixed sequence of correctly-rounded IEEE operations — a naive left-fold
+float sum, multiply-based squaring, and hardware `sqrt`. CPython 3.12's `sum()`
+builtin switched to Neumaier *compensated* summation for floats, which is more
+accurate but would diverge from the Rust engine's naive fold by a last ULP, so the
+Python `_std_dev` now sums with an explicit loop instead of `sum()`. (mongod uses
+an online Welford-style algorithm, so neither server matches it to the last ULP;
+aligning the two SecantusDB engines is the goal.) A parity fuzz seed caught the
+divergence before it shipped.
+
+#### Added
+
+- `secantus-core` (`group.rs`): `$stdDevPop` / `$stdDevSamp` accumulators (numeric
+  values folded to `f64`, non-numeric defers to Python), shared by `$group` and
+  `$setWindowFields`.
+
+#### Changed
+
+- `aggregate.py` (`_std_dev`): compute with a naive float fold + multiply + `sqrt`
+  (no `sum()` / `** 2` / `** 0.5`) so the Python and Rust engines agree bit-for-bit.
+
+### Stable `hello` topologyVersion — no more spurious connection-pool churn (both servers)
+
+`hello`'s `topologyVersion.processId` was minted fresh on every call
+(`ObjectId` from `now()` on the Python server, `ObjectId::new()` on the Rust
+server). The SDAM spec treats a *changed* `processId` as "the server restarted",
+so drivers reacted to nearly every monitoring heartbeat by invalidating and
+clearing the connection pool — closing the live connection and reconnecting.
+Both servers now pin `processId` once per process, so a driver sees a stable
+topology and keeps its connections. This was surfaced by the Java driver's
+connection-pool-logging and client-metadata event-count tests (which observed
+the extra `connectionClosed` / "Connection pool cleared" events), but the churn
+affected every driver's SDAM.
+
+#### Fixed
+
+- **Python server** (`commands.py`) and **Rust server** (`secantus-commands`
+  `handshake.rs`): `hello` returns a process-stable `topologyVersion.processId`
+  instead of a fresh ObjectId per call. Regressions:
+  `tests/test_hello_topology.py` (pymongo, both processId stability and
+  cross-connection identity) and a `secantus-commands` unit test.
+
+### `$dateToParts` honours a `timezone` (both servers)
+
+`$dateToParts` now accepts a `timezone` and returns the year/month/day/hour/…
+parts read off the wall clock in that zone, instead of always in UTC.
+`{$dateToParts: {date: "$d", timezone: "America/New_York"}}` on a `16:30Z` instant
+returns hour `11` in winter (EST); `Asia/Tokyo` rolls the day forward. Fixed-offset
+zones (`+05:30`, `UTC`) and named IANA zones both resolve; no `timezone` still
+reads UTC. Like the date extractors, this was a gap in **both** servers — each
+previously ignored `timezone` on `$dateToParts`.
+
+The Rust server resolves named zones via the shared `timezone_offset_ms` helper
+(the unambiguous instant→wall-clock direction, matching Python `zoneinfo`); an
+unknown zone name defers to the Python oracle. `$dateTrunc` / `$dateDiff` timezone
+remain deferred — `$dateTrunc` truncates to a *local* boundary that must convert
+back to an instant (local→instant, DST-ambiguous), and `$dateDiff`'s `day`/`week`
+already count elapsed duration rather than local-calendar boundaries, so timezone
+there would compound an existing divergence (see `tasks/backlog.md` §7.5).
+
+#### Added
+
+- `expressions.py` / `secantus-core`: `$dateToParts` reads `timezone` (fixed-offset
+  + named IANA), shifting the instant into the zone before splitting into parts.
+  The Rust side factors the fixed-offset/named-zone resolution into a shared
+  `timezone_offset_ms` helper now used by `$dateToString`, the `{date, timezone}`
+  extractors, and `$dateToParts`.
+
+### Date component extractors honour a `timezone` (both servers)
+
+The date component operators — `$year`, `$month`, `$dayOfMonth`, `$dayOfWeek`,
+`$hour`, `$minute`, `$second` — now accept mongod's `{date: <expr>, timezone:
+<expr>}` object form, reading the component off the wall clock in the requested
+zone rather than always in UTC. `{$hour: {date: "$d", timezone:
+"America/New_York"}}` on a `16:30Z` instant returns `11` in winter (EST) and `12`
+in summer (EDT); a shift that crosses midnight moves `$dayOfMonth` too. Both
+fixed-offset zones (`+05:30`, `UTC`) and named IANA zones resolve, and a bare date
+expression still reads UTC as before.
+
+This closes a conformance gap that was present in **both** servers — previously
+each ignored `timezone` on these operators and a `{date, timezone}` argument
+silently returned null. The Rust server resolves named zones via the same
+`chrono-tz` path as `$dateToString` (the unambiguous instant→wall-clock direction,
+matching Python `zoneinfo`); an unknown zone name defers to the Python oracle.
+
+#### Added
+
+- `expressions.py` / `secantus-core`: a shared date-operand resolver
+  (`_date_operand` / `date_operand_millis`) that both the bare-date and
+  `{date, timezone}` object forms of the seven date component extractors route
+  through, shifting the instant into the requested zone before the component is
+  read. Fixed-offset and named IANA zones both supported on both servers.
+
+### Rust server: `$dateToString` now formats dates in named IANA timezones
+
+The Rust server can now render `$dateToString` in a named IANA timezone —
+`{$dateToString: {date: "$d", timezone: "America/New_York"}}` — with the correct
+daylight-saving offset for the instant being formatted, exactly as the Python
+server (and real mongod) do. A summer date shifts by `-04:00` (EDT), a winter one
+by `-05:00` (EST); `Europe/Dublin`, `Asia/Tokyo`, and every other zone resolve the
+same way. Previously the Rust server accepted only fixed-offset zones (`+05:30`,
+`UTC`) and errored on a named zone, since it has no Python `zoneinfo` to defer to.
+
+This is the unambiguous instant-to-wall-clock direction: a UTC instant maps to
+exactly one local time in any zone, so the bundled `chrono-tz` database and Python
+`zoneinfo` agree. (`$dateFromString`'s named-zone form — naive-local-to-instant,
+which is ambiguous across a DST gap/overlap — still defers to the Python oracle.)
+
+#### Added
+
+- `secantus-core`: `chrono-tz` dependency and a named-zone offset resolver
+  (`named_tz_offset_ms`) wired into `$dateToString`. A named zone resolves its
+  DST-correct UTC offset at the rendered instant; an unknown zone name still
+  defers. Both servers now agree on named-timezone `$dateToString`.
+
+### Rust server: connection-auth mutex locks are poison-tolerant
+
+The three production sites that lock the per-connection auth mutex in
+`secantus-commands` used `.lock().expect("conn auth mutex poisoned")`, which
+would panic if the mutex had been poisoned by an earlier panic while the lock
+was held. They now use the same `.lock().unwrap_or_else(|e| e.into_inner())`
+pattern as the rest of the crate (`logbuf`, `transactions`), recovering the
+guard instead of panicking — so a poisoned auth mutex degrades to a caught
+error at the `catch_unwind` dispatch boundary rather than compounding into a
+second panic. No behaviour change on the healthy path. Found by the nightly
+security review (2026-07-04 §I14).
+
+#### Changed
+
+- `secantus-commands` (`lib.rs` ×2, `auth.rs` ×1): connection-auth mutex locks
+  are poison-tolerant. The two remaining `.lock().unwrap()` sites the review
+  flagged are in `#[cfg(test)]` mock stores and are intentionally left panicking
+  (a test that poisons its own mock lock should fail loudly).
+### Rust server: `$dateToString` now formats dates in named IANA timezones
+
+The Rust server can now render `$dateToString` in a named IANA timezone —
+`{$dateToString: {date: "$d", timezone: "America/New_York"}}` — with the correct
+daylight-saving offset for the instant being formatted, exactly as the Python
+server (and real mongod) do. A summer date shifts by `-04:00` (EDT), a winter one
+by `-05:00` (EST); `Europe/Dublin`, `Asia/Tokyo`, and every other zone resolve the
+same way. Previously the Rust server accepted only fixed-offset zones (`+05:30`,
+`UTC`) and errored on a named zone, since it has no Python `zoneinfo` to defer to.
+
+This is the unambiguous instant-to-wall-clock direction: a UTC instant maps to
+exactly one local time in any zone, so the bundled `chrono-tz` database and Python
+`zoneinfo` agree. (`$dateFromString`'s named-zone form — naive-local-to-instant,
+which is ambiguous across a DST gap/overlap — still defers to the Python oracle.)
+
+#### Added
+
+- `secantus-core`: `chrono-tz` dependency and a named-zone offset resolver
+  (`named_tz_offset_ms`) wired into `$dateToString`. A named zone resolves its
+  DST-correct UTC offset at the rendered instant; an unknown zone name still
+  defers. Both servers now agree on named-timezone `$dateToString`.
+
+### Projection inclusion/exclusion mix reports mongod's specific error code
+
+Mixing an inclusion and an exclusion in the same `find()` projection (e.g.
+`{a: 1, b: 0}`) now fails with mongod's *specific* per-field error instead of a
+generic `TypeMismatch`. An exclusion inside an inclusion projection returns
+`Location31254` ("Cannot do exclusion on field b in inclusion projection"); an
+inclusion inside an exclusion projection returns `Location31253` ("Cannot do
+inclusion on field b in exclusion projection"). The offending field is named in
+the message, matching real mongod and the Rust server (which already emitted
+these codes). Drivers' projection-error tests assert both the code and the exact
+wording, so this closes a pymongo-gauge fidelity gap.
+
+#### Fixed
+
+- `projection.py`: `_detect_inclusion` validates field-by-field in order and
+  raises `ProjectionError` with `code`/`code_name` pinned to `31254`/`31253`
+  (the offending field named); `ProjectionError` gained a `code`/`code_name`
+  constructor so the dispatch layer surfaces the specific code instead of `14`.
+### The Rust server prunes its oplog from write volume alone
+
+The standalone Rust `secantusd-rs` server used to prune its oplog only from
+the noop-heartbeat thread — and that thread is off by default
+(`--noop-heartbeat-seconds 0`). A long-lived, busy server with the
+default configuration could therefore grow its oplog past the retention
+window and entry cap without bound, since nothing was trimming it. The
+Rust storage engine now self-prunes on the write path, exactly as the
+Python server has always done: every 1000 emitted oplog entries it runs
+an opportunistic `prune_oplog`, so the oplog stays bounded from writes
+alone, with or without a heartbeat. Document data is never touched by a
+prune.
+
+#### Fixed
+- `secantus_storage::emit_oplog` bumps an in-memory emit counter and runs
+  an opportunistic `prune_oplog` every `OPLOG_PRUNE_INTERVAL` (1000)
+  entries — mirroring the Python server's `_emit_oplog`. The prune reuses
+  the write path's already-held storage lock (`prune_oplog_inner(...,
+  take_lock: false)`) and is best-effort, so it never fails an otherwise
+  successful write.
+
+### `Storage` is now a context manager
+
+`Storage` gained the `__enter__` / `__exit__` protocol, so you can write
+`with Storage(path) as store:` and have WiredTiger torn down (background threads
+joined, oplog meta persisted, connection closed) on block exit — even if the
+body raises — instead of relying on the embedder to remember `close()`.
+`close()` remains idempotent, so an explicit close inside the block is still
+safe. Found by the nightly security review (2026-07-04 §I12).
+
+#### Added
+
+- `Storage.__enter__` / `Storage.__exit__` — context-manager support that calls
+  `close()` on exit. Tests in `tests/test_storage_ctxmgr.py`.
+
+### The standalone Rust server now honours every Python-server CLI flag
+
+The pure-Rust `secantusd-rs` binary — the standalone server you run with
+no Python interpreter in the process — used to accept only a subset of
+the daemon flags the Python server understands. That gap meant a
+`secantusd.toml` or flag set tuned for one server wouldn't drive the
+other. It's now closed: the Rust binary accepts the same eight
+configuration flags the Python launcher does, with real behaviour behind
+each, so a single configuration drives either server identically.
+
+`--config` loads a `secantusd.toml` with the same discovery order
+(`./`, `~/.secantus/`, `/etc/secantus/`), the same `defaults < file <
+CLI flag` precedence, table renames, and strict unknown-key/table
+rejection as the Python loader. `--log-level` initialises a logger to
+the requested level; `--cache-size`, `--session-max`, and
+`--sync-on-commit` tune the WiredTiger connection; and
+`--oplog-retention-seconds`, `--oplog-max-entries`, and
+`--noop-heartbeat-seconds` control oplog retention plus a background
+heartbeat that keeps quiet change-stream cursors' resume tokens inside
+the retention window. The heartbeat thread and a TTL sweeper also give
+the standalone binary the periodic oplog-prune and expired-document
+maintenance the Python daemon has always run.
+
+One behavioural alignment worth calling out: the standalone daemon's
+default WiredTiger cache is now `1G`, matching `python -m secantus`
+(the embedded Rust handle's default is unchanged).
+
+#### Added
+- The `--config` / `--log-level` / `--cache-size` / `--session-max` /
+  `--sync-on-commit` / `--noop-heartbeat-seconds` /
+  `--oplog-retention-seconds` / `--oplog-max-entries` flags on the
+  standalone `secantusd-rs` binary, with a faithful TOML config loader
+  (`secantus-server`'s new `config` module) mirroring
+  `src/secantus/config.py`'s precedence and validation.
+- Background noop-heartbeat (with opportunistic `prune_oplog`) and
+  TTL-sweep threads in the `secantusd-rs` binary, sharing one
+  `Arc<Storage>` and joining on a shutdown flag before WiredTiger closes.
+- `secantus_storage::wt_config` builds the WiredTiger connection string
+  from the resolved cache-size / session-max / sync-on-commit knobs.
+
+#### Changed
+- The standalone `secantusd-rs` daemon defaults its WiredTiger cache to
+  `1G` (matching the Python server) instead of the engine's `256M`
+  default.
+### Projection inclusion/exclusion mix reports mongod's specific error code
+
+Mixing an inclusion and an exclusion in the same `find()` projection (e.g.
+`{a: 1, b: 0}`) now fails with mongod's *specific* per-field error instead of a
+generic `TypeMismatch`. An exclusion inside an inclusion projection returns
+`Location31254` ("Cannot do exclusion on field b in inclusion projection"); an
+inclusion inside an exclusion projection returns `Location31253` ("Cannot do
+inclusion on field b in exclusion projection"). The offending field is named in
+the message, matching real mongod and the Rust server (which already emitted
+these codes). Drivers' projection-error tests assert both the code and the exact
+wording, so this closes a pymongo-gauge fidelity gap.
+
+#### Fixed
+
+- `projection.py`: `_detect_inclusion` validates field-by-field in order and
+  raises `ProjectionError` with `code`/`code_name` pinned to `31254`/`31253`
+  (the offending field named); `ProjectionError` gained a `code`/`code_name`
+  constructor so the dispatch layer surfaces the specific code instead of `14`.
+
+### Admin UI: stop passing the raw (credential-bearing) MongoDB URI into the server page
+
+The admin server page's render context included `current_uri_raw`, the raw
+`mongo_uri` (which can carry a username/password), even though no template ever
+referenced it — a latent credential-exposure surface with no live leak. Removed
+the dead context variable; the page continues to show the scrubbed
+`current_uri_display`. Found by the nightly security review (2026-07-04 §I13).
+
+#### Security
+
+- `admin/routers/server.py`: drop the unused `current_uri_raw` template context
+  variable so the unscrubbed connection URI is no longer handed to the renderer.
+
+### PostgreSQL/SQL server: malformed messages get an error reply instead of a dropped connection
+
+The PG/SQL server's simple-query loop now answers a malformed message with a
+proper `ErrorResponse` rather than letting the exception escape to the outer
+handler and silently drop the connection. Most notably, a **SQL syntax error**
+over the simple-query protocol previously escaped (the parse ran outside the
+handler's `try`) and dropped the connection with no reply; it now returns
+`42601` and the connection stays alive. Invalid UTF-8 in a query message returns
+`08P01` and the connection survives (the message was length-framed, so the byte
+stream is still in sync), and a genuine framing error (an implausible length
+prefix) sends a FATAL `08P01` before closing instead of dropping silently.
+
+Found by the nightly security review (2026-07-04 §I16).
+
+#### Fixed
+
+- `sql/pgserver.py`: `planner.parse` moved inside `_handle_query`'s try so a
+  syntax error returns `42601` instead of dropping the connection; `_query_loop`
+  now catches `PGProtocolError` (framing) and `UnicodeDecodeError` (query text)
+  and replies with `08P01`. Regression: `tests/test_pgserver_framing.py`.
+
+### PostgreSQL/SQL server: a malformed SCRAM client-first is a typed auth error
+
+A truncated SCRAM gs2 header (e.g. a client-first message of just `"n,"`, with no
+bare message after the header) made `ScramExchange.server_first` raise a bare
+`ValueError` from an unpack, caught only by the connection's outer generic
+handler. It now raises the typed `PGAuthError`, consistent with the rest of the
+PG-auth path — the connection still fails cleanly with no leak, just via the
+right exception type. Found by the nightly security review (2026-07-04 §I21).
+
+#### Fixed
+
+- `sql/pgauth.py`: `ScramExchange.server_first` guards the gs2-header split and
+  raises `PGAuthError` on a truncated header instead of an unpack `ValueError`.
+  New unit tests in `tests/test_pgauth.py`.
+
+### `$push` / `$addToSet` honour the `$each` modifier
+
+`$push` and `$addToSet` now unwrap the `$each` modifier and append every element,
+instead of storing the `{$each: […]}` document as a single array element. So
+`{$push: {scores: {$each: [90, 85, 82]}}}` appends three scores, and
+`{$addToSet: {tags: {$each: ["a", "b", "a"]}}}` adds each not-already-present tag —
+matching MongoDB. `$push` also honours the companion modifiers `$position` (insert
+at an index, negative from the end), `$slice` (keep the first N / last |N| / none),
+and `$sort` (order the array — whole elements by `1`/`-1`, or documents by a
+`{field: dir}` spec, in BSON order).
+
+Previously both operators appended the modifier document verbatim — a silent
+data-shape bug for one of the most common update forms. It ships on both the
+Python and Rust servers, pinned by the update parity suite; the Rust engine
+computes `$each` / `$position` / `$slice` natively and defers `$sort` (BSON-order
+array sort) to the Python oracle.
+
+#### Fixed
+
+- `$push` / `$addToSet` `$each` is now unwrapped (multi-element append / add),
+  with `$push` `$position` / `$slice` / `$sort` modifiers, instead of the `$each`
+  document being stored as a single element. Ships on both servers
+  (`update.apply_update` + `secantus-core::update`).
+
+### Rust server: correct error codes for unrecognized / Atlas aggregation stages
+
+The Rust server now validates aggregation stage names up-front, matching the
+Python server (and mongod): an unrecognized stage (`{$badStage: …}`) is rejected
+with `Location40324` ("Unrecognized pipeline stage name"), and an Atlas-only stage
+(`$search` / `$vectorSearch` / `$searchMeta` / `$listSearchIndexes`) with
+`CommandNotSupported` (115) and the Atlas configuration message. Previously both
+surfaced as a generic `BadValue` (2), so drivers couldn't tell an unknown stage
+from any other unsupported construct.
+
+#### Fixed
+
+- **Rust server:** an unrecognized aggregation stage now returns code 40324 (was
+  2), and an Atlas-only stage returns 115 with the Atlas message
+  (`aggregate::validate_stage_names`, recognized-stage set kept in sync with the
+  Python `aggregate._STAGES` registry). Regression:
+  `tests/test_rust_server_smoke.py::test_aggregate_stage_name_validation_against_rust_server`.
+
+### PostgreSQL/SQL server: an unexpected internal error no longer leaks its Python text to the client
+
+When a statement hit an *unexpected* exception (not a curated `SQLError`), the
+PostgreSQL/SQL server sent the raw `str(exc)` back to the client as
+`internal error: <text>`. That text could disclose internal file paths, type
+names, or document values. The server now logs the full exception server-side
+(as it already did) but answers the client with a generic `XX000 internal error`,
+matching the Mongo dispatch's discipline of never leaking a Python traceback to
+the wire. Curated `SQLError`s are unaffected — they still surface their real
+SQLSTATE and user-facing message.
+
+Found by the nightly security review (2026-07-04 §I17).
+
+#### Security
+
+- `sql/pgserver.py` (simple-query + COPY paths) and `sql/pgextended.py` (extended
+  protocol) no longer interpolate the raw exception into the `ErrorResponse` for
+  an unexpected internal error. Regression: `tests/test_pgserver_error_hygiene.py`.
+
+### Reads on a view resolve its pipeline
+
+`find`, `aggregate`, and `count_documents` on a view now run the view's stored
+pipeline against its base collection instead of returning nothing. Create a view
+with `db.createView("active", "users", [{$match: {status: "active"}}])` and a
+`find` / `aggregate` on `active` reads exactly the matching users — with the
+caller's filter, sort, skip, limit, and projection applied on top (a `find` is
+translated into the equivalent aggregate over the base collection). A view defined
+on another view resolves recursively.
+
+Previously only the `count` command resolved views; `find` and `aggregate` (and
+therefore `count_documents`, which pymongo implements via `aggregate`) treated the
+view as an empty collection.
+
+#### Fixed
+
+- `find` / `aggregate` on a view now resolve the view's `viewOn` + pipeline
+  (recursively for a view-on-a-view) via `commands._resolve_view`, applying the
+  request's own filter/sort/skip/limit/projection over the result. Fixes
+  `count_documents` on a view returning 0.
+
+### Rust server: reads on a view resolve its pipeline
+
+The Rust server now mirrors the Python server: `find`, `aggregate`, and
+`count_documents` on a view resolve the view's `viewOn` + stored pipeline against
+its base collection (recursively for a view-on-a-view) instead of returning
+nothing. The aggregate command's initial fetch resolves the view chain (next to
+the leading-`$match` / `$geoNear` lifts, keeping the view name for the reply `ns`);
+`find` on a view is translated into the equivalent aggregate. Previously the Rust
+server treated a view as an empty collection.
+
+#### Fixed
+
+- **Rust server:** `find` / `aggregate` / `count` on a view resolve
+  `viewOn` + `viewPipeline` (`aggregate::resolve_view`), applying the request's own
+  filter/sort/skip/limit/projection on top. Regression:
+  `tests/test_rust_server_smoke.py::test_view_reads_resolve_against_rust_server`.
+
+### Rust server: refuses direct writes to synthetic read-only views
+
+The Rust server now rejects a direct `insert` / `update` / `delete` on
+`local.oplog.rs` or `admin.system.users` with `Unauthorized` (13), matching the
+Python server (and mongod's RBAC-denial code). These namespaces are synthetic
+read-only views — `local.oplog.rs` projects the oplog WT table (written only via
+oplog emission) and `admin.system.users` is fronted by `createUser` /
+`updateUser` / `dropUser` — so a direct write would land in the wrong table or
+break the view's invariants. Previously the Rust server silently accepted such
+writes. A regular collection write is unaffected.
+
+#### Fixed
+
+- **Rust server:** direct `insert` / `update` / `delete` on `local.oplog.rs` /
+  `admin.system.users` is now rejected with code 13 (matching the Python server),
+  instead of being silently accepted. Regression: `tests/test_rust_server_smoke.py::
+  test_synthetic_view_write_rejected_against_rust_server`.
+
+### PostgreSQL/SQL server: per-statement RBAC, reusing the Mongo role model
+
+The PostgreSQL/SQL server gained an authorization layer. Until now an
+authenticated SQL client — or, in the documented trust default, any client —
+could run any statement against any database it named at connect time, so a SQL
+client had broader effective access than an equivalently-authenticated Mongo
+client on the same data. The SQL surface now enforces the *same* RBAC engine the
+Mongo server uses (`secantus.rbac`): each statement maps to one action on the
+connection's database and is checked against the authenticated user's roles.
+
+Authorization is opt-in and backward-compatible. Start the server with
+`require_auth=True` and per-user role bindings via the new `user_roles` argument
+(`{"analyst": [{"role": "read", "db": "shop"}]}`) to turn it on; without
+`user_roles`, and for the embedded `run_sql` API, the surface stays unrestricted
+exactly as before. Built-in roles (`read` / `readWrite` / `dbAdmin` / `dbOwner` /
+`root`) resolve directly and custom roles resolve through the shared roles table,
+so a role defined once governs both protocols on a shared `Storage`. A denied
+statement returns SQLSTATE `42501` and the connection survives.
+
+Found by the nightly security review (issue #193).
+
+#### Added
+
+- `SecantusPGServer(user_roles=...)`: per-user RBAC role bindings, enforced
+  per-statement when `require_auth` is on. New pure `sql/authz.py` maps each
+  statement to an `rbac` action and calls `rbac.check_privilege`; transaction
+  control, `SET`/`SHOW`, and cursor navigation need no privilege. New
+  `errors.insufficient_privilege` (SQLSTATE 42501).
+
+#### Security
+
+- SQL clients on a `Storage` shared with a Mongo server are now gated by the same
+  roles as Mongo clients, closing the "authenticated SQL client has unrestricted
+  access" gap. Regressions in `tests/test_sql_authz.py` (engine-level, built-in +
+  custom roles) and `tests/test_pgserver_auth.py` (over the wire).
+
+### Rust server: rejects a malformed `writeConcern`
+
+The Rust server now validates a write command's `writeConcern` before running it,
+matching the Python server (and mongod). A negative or too-large integer `w` is a
+`FailedToParse` (9), a string `w` other than `"majority"` is an
+`UnknownReplWriteConcern` (79), and a bool / non-number-or-string `w` — or a
+non-bool/int `j` or non-number `wtimeout` — is a `TypeMismatch` (14). A
+well-formed writeConcern is accepted as before, and a satisfiable-but-too-wide
+`w > 1` still succeeds with the single-node `writeConcernError` attached. The check
+runs in `dispatch` for every write command (insert / update / delete /
+findAndModify / create / collMod / createIndexes / drop / dropIndexes /
+dropDatabase / renameCollection).
+
+#### Fixed
+
+- **Rust server:** malformed `writeConcern` values are now rejected with mongod's
+  codes (9 / 79 / 14) before the write runs, instead of being silently accepted.
+  Regression: `tests/test_rust_server_smoke.py::
+  test_write_concern_validation_against_rust_server`.
+
+### Rust server: `$lookup` drives the foreign index (and fixes its result order)
+
+The Rust server's simple-form `$lookup` now drives a per-outer-doc index probe
+when the foreign collection has a leading-field index on `foreignField`
+(single-field, compound-prefix, or multikey — all resolve to an IXSCAN via
+`Storage::find`), falling back to the full-scan hash-join only when no such index
+exists. This mirrors the Python server's `$lookup` path.
+
+Besides the performance win, this **fixes a two-server divergence**: the previous
+hash-join returned the joined `as` array in foreign-collection scan order, while
+the Python server (and the index probe) return it in index order. For an indexed
+`$lookup` the two servers now produce byte-for-byte identical results, including
+the order of documents within `as`. A regression test drives the Rust server and
+asserts the index-ordered output.
+
+#### Fixed
+
+- **Rust server:** simple-form `$lookup` over an indexed `foreignField` now returns
+  the `as` array in index order (matching the Python server) instead of
+  foreign-scan order, and rides the index instead of materialising the whole
+  foreign collection. Regression: `tests/test_rust_server_smoke.py::
+  test_lookup_index_order_against_rust_server`.
+
+### PostgreSQL/SQL server: connection cap, cursor caps, and a parser guard
+
+The PostgreSQL wire server gained the resource limits its MongoDB counterpart
+already had, closing a compounding denial-of-service surface (all reachable
+pre-auth, since `require_auth` defaults off):
+
+- **Connection cap.** `SecantusPGServer` now enforces `max_connections` (default
+  1000, matching the Mongo server's `DEFAULT_MAX_CONNECTIONS`). An over-cap
+  accept is closed immediately instead of spawning a handler thread.
+- **Per-session cursor caps.** `DECLARE CURSOR` (which eagerly materializes its
+  whole result set) now rejects a session's 101st open cursor, and a cursor
+  whose result exceeds 1,000,000 rows, with `program_limit_exceeded` (SQLSTATE
+  54000). Combined with the connection cap, total cursor memory is bounded.
+- **Parser guard.** `planner.parse` rejects a statement longer than 1 MB before
+  handing it to sqlglot, and converts the `RecursionError` from a deeply-nested
+  statement (e.g. hundreds of parentheses — a ~600-byte trigger) into a clean
+  54000 error instead of relying on the connection loop's broad `except`.
+
+Found by the nightly security review (issue #194).
+
+#### Security
+
+- `sql/pgserver.py`: `max_connections` cap (default `DEFAULT_MAX_CONNECTIONS`).
+- `sql/engine.py`: `MAX_CURSORS_PER_SESSION` (100) + `MAX_CURSOR_ROWS` (1e6) caps
+  on `DECLARE CURSOR`.
+- `sql/planner.py`: `MAX_SQL_LENGTH` (1 MB) cap + `RecursionError` guard in
+  `parse`. New `errors.program_limit_exceeded` (SQLSTATE 54000). Regressions in
+  `tests/test_sql_cursors.py` + `tests/test_pgserver.py`.
+
+### `$geoNear` rides the geo index instead of scanning
+
+A bounded `$geoNear` — one with a `maxDistance` — no longer walks the whole
+collection computing a distance for every document. When it's the leading stage
+and the collection has a matching geo index on the queried field, SecantusDB now
+lifts the search into a conservative `$geoWithin` candidate query and serves it
+through the same geo-index path `$near` and `$geoWithin` already use, then
+computes exact distances and sorts over just the candidates.
+
+The candidate radius is inflated by a negligible epsilon so the fetched set is a
+strict superset of the exact within-`maxDistance` set; the `$geoNear` stage then
+re-applies the exact distance filter, so results — the documents, their order, and
+the attached `distanceField` — are byte-for-byte identical to the brute-force
+path. Only the number of documents fetched shrinks. An unbounded `$geoNear` (no
+`maxDistance`) must still return every document in distance order, so it keeps
+scanning; the optimization is scoped to the bounded case, and a mismatched index
+type falls back to the full scan. A randomized regression test asserts the
+optimized output equals the scan output across many queries.
+
+#### Changed
+
+- `$geoNear` with a `maxDistance` and a matching `2dsphere` / `2d` index now
+  fetches candidates through the geo index (`aggregate._geo_near_index_filter`,
+  lifted into the aggregate command's initial fetch) instead of a full collection
+  scan. Output is unchanged. (Rust-server mirror below.)
+
+### Rust server: `$geoNear` rides the geo index for a bounded search
+
+The Rust server now mirrors the Python server's `$geoNear` index optimization. A
+leading `$geoNear` with a `maxDistance` and a matching `2d` / `2dsphere` index no
+longer scans the whole collection: the search is lifted into a conservative
+`$geoWithin` candidate fetch in the aggregate command's initial fetch (next to the
+existing leading-`$match` lift), and the `$geoNear` stage then re-applies the exact
+distance filter over just the candidates.
+
+The candidate radius is inflated by a negligible epsilon so the fetched set is a
+strict superset of the exact within-`maxDistance` set, keeping the output — docs,
+order, and attached `distanceField` — byte-for-byte identical to the brute-force
+path. An unbounded `$geoNear` still scans, and a mismatched index type falls back
+to the full scan. A regression test drives the Rust server directly, asserting the
+optimized output equals the scan output across many random queries.
+
+#### Changed
+
+- **Rust server:** `$geoNear` with a `maxDistance` and a matching geo index fetches
+  candidates through the index (`aggregate::geo_near_index_filter` in
+  `secantus-commands`) instead of a full collection scan. Output is unchanged.
+  Regression: `tests/test_rust_server_smoke.py::
+  test_geo_near_index_optimization_against_rust_server`.
+
+### Constant-time secret comparison in the PostgreSQL SCRAM + admin-token checks
+
+Two authentication comparisons used a plain `!=` / `==` on secret material,
+which CPython does not guarantee to run in constant time — a timing side-channel
+that can narrow a secret a byte at a time. The PostgreSQL/SQL server's SCRAM
+proof check (`sql/pgauth.py`) compared the recomputed stored-key digest with
+`!=`, and the admin console's token middleware (`admin/middleware.py`) compared
+the presented token with `!=` / `==` on both the HTTP and WebSocket paths. All
+three now use `hmac.compare_digest` (bytes-encoded, so a non-ASCII presented
+value is rejected rather than raising), matching the Mongo-side SCRAM check in
+`secantus.auth` which was already constant-time. Behaviour is otherwise
+unchanged — valid credentials/tokens are accepted, wrong or missing ones
+rejected. Found by the nightly security review (issue #195).
+
+#### Security
+
+- `sql/pgauth.py`: SCRAM stored-key comparison uses `hmac.compare_digest`.
+- `admin/middleware.py`: HTTP `TokenAuthMiddleware` and `verify_websocket_token`
+  compare the admin token with `hmac.compare_digest` (and reject a
+  missing/non-ASCII token without raising). Regression:
+  `tests/test_admin_skeleton.py::test_verify_websocket_token_is_constant_time_and_robust`.
+
+### Rust server: bool-as-int range comparison in the query matcher
+
+The Rust server's query matcher now compares a boolean field against a numeric
+`$gt` / `$lt` / `$gte` / `$lte` bound (and vice versa) natively, instead of
+deferring the whole match to a `BadValue`. Following the Python oracle — which
+compares with Python's `<`, where `bool` is an `int` subclass — `True` counts as
+`1` and `False` as `0`: `{x: {$gt: 0}}` now matches `x: true` on the Rust server,
+matching the Python one. A bool compared against a non-numeric type (string,
+Decimal128, date, …) is `TypeError` in Python, i.e. no match, and is reproduced
+as such. Boolean *equality* is unaffected (a bool stays distinct from `1`).
+
+Pinned by the query parity suite (curated bool-vs-number / bool-vs-non-numeric /
+multikey cases, plus the existing randomized fuzz whose scalar corpus already
+includes booleans — 0 divergences).
+
+#### Added
+
+- **Rust server:** bool-as-int `$gt` / `$lt` / `$gte` / `$lte` comparison in the
+  `secantus-core` query matcher (numeric compare vs int / long / double; no match
+  vs any other type), matching the Python oracle's `<` semantics.
+
+### Rust server: `getLog` returns a real in-memory log
+
+The Rust server's `getLog` was a stub returning an empty array; it now surfaces a
+real bounded in-memory log ring buffer (`secantus_commands::logbuf::LogBuffer`,
+5000-entry cap, the Rust port of `logbuf.py`). The server records a startup line
+and a `"connection accepted"` NETWORK line per connection, and `getLog: "global"`
+returns them as mongod-shaped pre-formatted strings
+(`"<ts> <level> <component> <msg>"`) with `totalLinesWritten`. The admin
+console's Logs page now shows activity against a Rust target instead of an empty
+table. Slice 5 of the Rust admin-command parity work (issue #163).
+
+This resolves the last genuine gap in #163: with `getLog` real, `killOp` and the
+role grant/revoke + native backup/restore/prune commands all landed, and the
+`profile` command was already at parity with the Python server (both persist the
+level / slowms / sampleRate config; neither captures slow ops — out of scope for
+the surrogate). `currentOp` / `serverStatus` remain intentionally minimal.
+
+#### Added
+
+- **Rust server:** `secantus_commands::logbuf::LogBuffer` + a `getLog`-backed log
+  ring buffer wired through the server (connection-accept + startup lines) and a
+  `logs` handle on `CommandContext`. Regressions: `crates/secantus-commands` unit
+  tests (buffer append/tail/capacity; `getLog` formatting; empty without a
+  buffer) and `tests/test_rust_server_smoke.py::test_get_log_returns_connection_lines`.
+
+### Rust server: `$min` / `$max` / `$addToSet` / `$pull` update operators
+
+The Rust server now applies four more update operators natively instead of
+rejecting them: `$min` and `$max` (keep the smaller / larger of the current and
+given value), `$addToSet` (append to an array only if not already present), and
+`$pull` (remove the array elements equal to a value). Previously each surfaced as
+a `BadValue` error on the Rust server; they now match the Python server.
+
+Fidelity follows the Python oracle exactly. `$min`/`$max` compare with Python's
+`<` semantics for numeric / string / date pairs (bool counts as its integer
+value; a cross-type comparison Python would raise on defers to Python), and an
+absent-or-null field is treated as "no current value". `$addToSet` and `$pull`
+use Python `==` element equality — cross-type-equal numerics (`1` == `True`) and
+structural document/array equality included — via the shared value-equality
+helper. It's pinned by the update parity suite with curated edge cases and a fuzz
+corpus (0 divergences). `$bit` was already native.
+
+#### Added
+
+- **Rust server:** `$min` / `$max` / `$addToSet` / `$pull` update operators in the
+  `secantus-core` update engine, matching the Python oracle's comparison / `==`
+  element semantics.
+
+### Rust server: `$dateFromString` `format` (strptime)
+
+The Rust server now parses a `$dateFromString` `format` string natively for the
+numeric-directive subset (`%Y` `%y` `%m` `%d` `%H` `%M` `%S` `%j` `%%`, literals,
+and whitespace), instead of the whole expression being unsupported. So
+`$dateFromString: {dateString: "15/01/2024", format: "%d/%m/%Y"}` now evaluates on
+the Rust server, matching the Python one.
+
+Fidelity is structural: the format is translated into a regex built from
+CPython's own `_strptime` per-directive sub-patterns, so field matching — the
+2-digit-year pivot (`00`–`68` → 2000s, `69`–`99` → 1900s), the value-range digit
+rules, single-digit leniency, day-of-year, and full-input consumption — is
+identical to Python's by construction. It's pinned by the expression parity suite
+with a 6000-case fuzz corpus (0 divergences). Directives outside the subset
+(`%z` / `%Z` / `%a` / `%b` / `%p` / …), a `%j` combined with `%m`/`%d`, a leap
+second, or any input Python would reject still defer to the Python oracle.
+
+#### Added
+
+- **Rust server:** `$dateFromString` `format` (strptime) for the numeric-directive
+  subset, built from CPython `_strptime`'s exact regex fragments for byte-faithful
+  field matching. Combined with the fixed-offset `timezone` support, a naive
+  strptime result is interpreted in the given offset zone.
+
+### Rust server: `killOp`
+
+The Rust server now implements `killOp`. Real mongod signals a per-op interrupt
+flag; SecantusDB's faithful analogue (in both servers) is "close the socket" —
+since we model one in-flight op per connection, the `op` a caller passes is the
+connection's `conn_id` (readable off `hello`'s `connectionId`). The server gained
+a live-connection registry (`conn_id → socket clone`, populated on accept and
+cleared on disconnect); `killOp` shuts down the target socket, so the connection
+thread's next read returns 0 and the connection ends. The opid is accepted as
+Int32 / Int64 / integral Double / numeric string, and the reply mirrors the
+Python handler: `{info: "operation killed" | "no operation with that opid" |
+"no connection registry", ok: 1}`, or `TypeMismatch` for a non-integer `op`.
+The admin console's Connections → Kill button now works against a Rust target.
+Slice 4 of the Rust admin-command parity work (issue #163).
+
+Remaining #163 gaps: fleshing out the `getLog` / `profile` stubs (both need
+real capture infrastructure — a log ring buffer and slow-op timing).
+
+#### Added
+
+- **Rust server:** `killOp` (gated by `A_KILLOP` under `--auth`), backed by a new
+  server-side connection registry + a `ConnectionKiller` handle on
+  `CommandContext`. Regressions: `crates/secantus-commands` unit tests
+  (registry-present/absent, found/not-found, numeric-string opid, non-integer →
+  `TypeMismatch`) and
+  `tests/test_rust_server_smoke.py::test_kill_op_closes_a_connection`.
+
+### Rust server: fixed-offset `timezone` on `$dateToString` / `$dateFromString`
+
+The Rust server now handles a fixed-offset `timezone` on the `$dateToString` and
+`$dateFromString` aggregation-expression operators natively, instead of the whole
+expression being unsupported. `$dateToString` with `timezone: "+05:30"` shifts the
+wall clock before formatting; `$dateFromString` with a `timezone` interprets a
+naive date string as being in that zone (and ignores it when the string already
+carries its own offset), matching the Python server exactly. The `UTC` / `GMT`
+aliases and both the `±HHMM` and `±HH:MM` offset spellings are accepted.
+
+Named IANA zones (`America/New_York`) still defer — they need a bundled tz
+database — as does a `$dateFromString` `format` (strptime). This narrows the gap
+between the two servers on the date operators; the behaviour is pinned against the
+Python oracle by the expression parity suite.
+
+#### Added
+
+- **Rust server:** fixed-offset / `UTC` / `GMT` `timezone` support on
+  `$dateToString` and `$dateFromString` (offset arithmetic in the shared
+  `secantus-core` expression engine). Named IANA zones and `format` strptime still
+  defer.
+
+### `$jsonSchema` gains `uniqueItems`
+
+The `$jsonSchema` query operator now understands `uniqueItems`. With
+`uniqueItems: true` on an array schema, a document matches only when every element
+of the array is distinct — the way to say "this list has no repeats" in a
+validator or a `$jsonSchema` query. Elements are compared by value: cross-type
+numerics that are numerically equal (`1` and `1.0`) count as duplicates, and
+documents compare field-by-field in order, matching how mongod compares them.
+
+The check ships on both the Python and Rust servers, pinned by the query parity
+suite; it reuses the shared byte-sortable value encoding as the equality key, so
+both engines agree bit-for-bit. (One documented gap: cross-type-equal numerics
+*nested inside* a document element — `[{a: 1}, {a: 1.0}]` — are treated as
+distinct on both servers; top-level scalar arrays are fully faithful.)
+
+#### Added
+
+- `$jsonSchema` `uniqueItems: true` — rejects arrays with duplicate elements
+  (value equality, cross-type-numeric aware for top-level scalars). `false` is a
+  no-op.
+
+### Rust server: `grantRolesToUser` / `revokeRolesFromUser`
+
+The Rust server now implements the two user-role management commands it was
+missing: `grantRolesToUser` adds roles to a user's assignment list (deduped by
+`(role, db)`), and `revokeRolesFromUser` removes them. Both validate the
+requested roles against the built-in + custom role catalogue (`RoleNotFound`),
+require the user to exist (`UserNotFound`), and refresh the calling connection's
+effective roles so a privilege change takes effect immediately — matching the
+Python handlers. Previously the Rust server could only set a user's roles at
+`createUser` / `updateUser` time; the admin console's Users → Roles editor can
+now grant/revoke against a Rust target. Slice 3 of the Rust admin-command parity
+work (issue #163).
+
+Remaining #163 gaps: `killOp`, and fleshing out the `getLog` / `profile` stubs.
+
+#### Added
+
+- **Rust server:** `grantRolesToUser` / `revokeRolesFromUser` commands (gated by
+  `A_GRANT_ROLE` / `A_REVOKE_ROLE` under `--auth`). Regressions:
+  `crates/secantus-commands` unit tests (grant/revoke, dedup, `UserNotFound`,
+  `RoleNotFound`) and
+  `tests/test_rust_server_smoke.py::test_secantus_grant_revoke_roles_to_user`.
+
+### Rust server: `secantusAdmin.restoreArchive`
+
+The Rust server now implements `secantusAdmin.restoreArchive`, completing the
+proprietary backup/restore + prune command family (`backupArchive` and the
+prune commands already shipped). It extracts a backup `.tar.gz` (produced by
+`backupArchive`) into a fresh `targetDir` the operator then points a new server
+at — the running server's storage is untouched, the same side-channel restore
+model as the Python command and real mongod's "stop, swap dbpath, start". It
+rejects a non-empty target unless `allowExisting: true`, verifies the archive is
+a genuine SecantusDB / WiredTiger backup *before* extracting (so a malformed
+archive can't pollute the target), and returns `{targetDir, fileCount, archive,
+ok}`, mirroring the Python handler. This is slice 2 of the Rust admin-command
+parity work (issue #163); the admin console's Backup page can now drive native
+archive restore against a Rust target.
+
+Remaining #163 gaps: the standard admin commands `grantRolesToUser` /
+`revokeRolesFromUser` / `killOp`, plus fleshing out the `getLog` / `profile`
+stubs.
+
+#### Added
+
+- **Rust server:** `secantusAdmin.restoreArchive` wire command
+  (`Storage::restore_archive` on the command trait →
+  `secantus_storage::extract_backup_archive_ex`, with the target-emptiness /
+  WiredTiger-metadata guards and abs-path + file-count reply). Regressions:
+  `tests/test_rust_server_smoke.py::test_secantus_admin_restore_archive_roundtrips`
+  and `::test_restore_archive_rejects_nonempty_target`.
+
+### Rust server: `secantusAdmin.pruneOplog` and `pruneTtl` maintenance commands
+
+The Rust server now implements two of the proprietary `secantusAdmin.*`
+maintenance commands the Python server already had: `pruneOplog` (force an
+immediate oplog-retention sweep) and `pruneTtl` (run TTL pruning across every
+collection now). Both return `{pruned: <count>, ok: 1}`, mirroring the Python
+handlers. The underlying storage already prunes on its own cadence; these
+wire commands let an operator — or the admin console's Maintenance page —
+drive a deterministic pass on demand. This closes the first slice of the Rust
+admin-command parity gap (issue #163); the admin UI's capability probe will now
+enable the "Prune oplog / TTL" buttons against a Rust target.
+
+Remaining #163 gaps (tracked, not in this slice): `secantusAdmin.restoreArchive`
+and the standard admin commands `grantRolesToUser` / `revokeRolesFromUser` /
+`killOp`, plus fleshing out the `getLog` / `profile` stubs.
+
+#### Added
+
+- **Rust server:** `secantusAdmin.pruneOplog` / `secantusAdmin.pruneTtl` wire
+  commands (`Storage::prune_oplog` / `prune_ttl_all` on the command `Storage`
+  trait, forwarded by the WT adapter to the real storage engine). Regression:
+  `tests/test_rust_server_smoke.py::test_secantus_admin_prune_commands`.
+
+### `$derivative` and `$integral` gain a time `unit`
+
+The `$setWindowFields` rate operators `$derivative` and `$integral` now accept a
+time `unit`. Over a date-valued `sortBy`, `$derivative: {input: "$v", unit:
+"hour"}` reports the change in `v` *per hour* — the x-axis is the date's epoch
+milliseconds scaled into the requested unit — and `$integral` computes the
+trapezoidal area with the same unit-scaled x-axis. This is how you express a rate
+of change in meaningful units (per second, per hour, per day) instead of the raw
+millisecond spacing between timestamps.
+
+As with time-`unit` range windows, the `unit` requires a date `sortBy` (a numeric
+sort with a `unit` is rejected) and the fixed-duration units
+`week`/`day`/`hour`/`minute`/`second`/`millisecond` are supported; variable-length
+`month`/`quarter`/`year` defer. The feature ships on both servers, pinned by the
+`$setWindowFields` parity suite — the millisecond-to-unit scaling runs in IEEE
+double on both sides so the results match bit-for-bit. This completes the
+`$setWindowFields` time-`unit` surface.
+
+#### Added
+
+- `$setWindowFields` `$derivative` / `$integral` accept a fixed-duration time
+  `unit` over a date `sortBy`, scaling the x-axis into that unit so the rate /
+  area is expressed per unit. `unit` requires a date sortBy; variable-length
+  units defer.
+
+### `$setWindowFields` range windows over a date sortBy
+
+A `$setWindowFields` value-`range` window can now span a *time* interval. Give the
+window a `unit` — `week`, `day`, `hour`, `minute`, `second`, or `millisecond` —
+and the numeric `range: [lower, upper]` bounds are measured in that unit against a
+date-valued `sortBy` field. A `range: [-2, 0], unit: "day"` window is the trailing
+three-day span ending at each row, so `{$sum: "$v"}` over it is a rolling 3-day
+total regardless of how the dates are spaced.
+
+The rule mongod enforces holds both ways: a `unit` requires a date `sortBy` (a
+numeric sort with a `unit` is rejected), and a date `sortBy` in a range window
+requires a `unit` (there is no implicit millisecond arithmetic on dates).
+Variable-length units — `month`, `quarter`, `year` — are still rejected, since
+their span depends on the calendar position. The feature ships on both the Python
+and Rust servers, pinned by the `$setWindowFields` parity suite; the date x-axis
+is carried as epoch milliseconds so both engines compute identical window bounds.
+
+#### Added
+
+- `$setWindowFields` `range` windows accept a fixed-duration time `unit`
+  (`week`/`day`/`hour`/`minute`/`second`/`millisecond`) over a date `sortBy`,
+  offsetting the bounds in that unit against the date's epoch millis. `unit` and a
+  date sortBy are mutually required; variable-length `month`/`quarter`/`year`
+  defer with an error.
+
+### `$jsonSchema` gains `patternProperties` and `dependencies`
+
+The `$jsonSchema` query operator now understands `patternProperties` and
+`dependencies`. `patternProperties` applies a sub-schema to every field whose
+*name* matches a regular expression — the way to say "every `s_*` field must be a
+string" without listing them — and it also tells `additionalProperties: false`
+which keys are legitimately covered, so pattern-matched fields are no longer
+flagged as unexpected. `dependencies` expresses conditional structure: when a
+trigger field is present, either a list of other fields must also be present
+(property dependency) or the whole document must satisfy a sub-schema (schema
+dependency) — e.g. "if `card` is set, `billing` is required."
+
+Both ship on the Python and Rust servers, pinned by the query parity suite;
+`patternProperties` reuses the shared regex engine.
+
+#### Added
+
+- `$jsonSchema` `patternProperties` (regex-keyed sub-schemas, also honoured by
+  `additionalProperties`) and `dependencies` (property-list and schema forms).
+
+### `$setWindowFields` completes its time-series window operators with `$derivative` and `$integral`
+
+`$setWindowFields` now supports `$derivative` and `$integral`, the last two of
+MongoDB's time-series window operators. Over the window, `$derivative` reports the
+rate of change — the slope between the first and last points, `(yₙ − y₀) / (xₙ −
+x₀)`, with the `sortBy` value as x and `input` as y — and `$integral` reports the
+area under the curve by the trapezoidal rule. Together with `$shift`,
+`$expMovingAvg`, `$locf`, and `$linearFill`, that rounds out the full set of
+time-series window functions: rates, running smoothing, lag/lead, and gap-filling
+all now run in-process.
+
+Both operate over any window (`documents` or `range`), require a single ascending
+numeric `sortBy` as the x-axis, and run the same IEEE-double arithmetic on the
+Python and Rust servers (pinned bit-for-bit by the aggregation parity suite). A
+`$derivative` window with fewer than two points is `null`. A time `unit` (for a
+date x-axis) is not yet modelled and raises a clear error.
+
+#### Added
+
+- `$setWindowFields` `$derivative` and `$integral` window operators (`{input}`) —
+  slope / trapezoidal area over the sortBy x-axis, over any window.
+
+### `$setWindowFields` gains `$locf` and `$linearFill`
+
+`$setWindowFields` now supports the two gap-filling window operators, `$locf` and
+`$linearFill`. `{$locf: <expr>}` ("last observation carried forward") replaces a
+null with the most recent non-null value seen in sort order — the standard way to
+hold a reading steady until the next sample. `{$linearFill: <expr>}` instead draws
+a straight line between the surrounding non-null anchors and reads off the missing
+values along it, using the `sortBy` value as the x-axis. Leading nulls (for
+`$locf`) and leading/trailing nulls (for `$linearFill`, which has nothing to
+interpolate between) stay null.
+
+Both run on the Python and Rust servers alike, pinned by the aggregation parity
+suite (the interpolation is IEEE-double, so the two agree bit-for-bit). With these
+plus `$shift` and `$expMovingAvg`, only `$derivative` and `$integral` remain of
+the time-series window operators.
+
+#### Added
+
+- `$setWindowFields` `$locf` and `$linearFill` gap-fill window operators
+  (`<expr>`) — prefix/partition-based, require a `sortBy` (`$linearFill` a single
+  ascending numeric one).
+
+### Rust server: an interior-NUL db/collection/index name no longer panics the connection
+
+A well-formed BSON command whose database, collection, or index name carried
+an embedded NUL byte (BSON strings are length-prefixed and may legally contain
+one) reached the Rust server's WiredTiger key encoder (`secantus-wt`'s `cstr`,
+`CString::new(..).expect(..)`) and **panicked**. Because the storage layer
+serialises WiredTiger operations under a `std::sync::Mutex`, that panic unwound
+while the lock was held and **poisoned it for every connection** — turning a
+single crafted command into a whole-server denial of service, and dropping the
+offending socket with no `{ok: 0, ...}` reply (unlike the Python server, which
+catches every error in `dispatch`).
+
+The Rust server now rejects an interior-NUL database / collection / index name
+during command validation — before it reaches storage — with the same
+`InvalidNamespace` error mongod returns, so the connection survives with a
+clean wire reply. As defense-in-depth, the per-connection dispatch call is now
+wrapped in `catch_unwind`: any future unguarded panic in a handler produces a
+wire-level `InternalError` reply instead of a silent disconnect. This is the
+Rust-side analogue of the earlier Python-server OP_QUERY hardening. Found by
+the nightly security review (issue #139).
+
+#### Security
+
+- **Rust server:** interior-NUL `db` / `coll` / `index` names are rejected with
+  `InvalidNamespace` before reaching the WiredTiger key encoder (which would
+  otherwise panic and poison the shared storage mutex — a whole-server DoS).
+  Per-connection dispatch is wrapped in `catch_unwind` so any residual panic
+  surfaces as an `InternalError` wire reply rather than a dropped socket.
+  Regressions in `crates/secantus-commands` unit tests.
+
+### `admin.system.users` no longer leaks SCRAM credentials via find/count/aggregate
+
+A query against `admin.system.users` — reachable through ordinary
+`find` / `count` / `aggregate` / `explain` / `distinct` / `mapReduce`,
+which need only the standard collection-read action — used to return each
+user record *including* its SCRAM `credentials` blob (`storedKey`,
+`serverKey`, `salt`, iteration count). That's the sensitive artifact:
+even without the plaintext password it enables offline dictionary/brute
+attacks (salt + iterations are the `/etc/shadow` equivalent) and, via
+`serverKey`, lets an attacker stand up a rogue server that completes the
+SASL server side. A principal holding only `read` / `readAnyDatabase` on
+`admin` — a routine monitoring/backup grant — could read every user's
+credential material, which is exactly what `usersInfo` intentionally
+gates behind `A_VIEW_USER` + `showCredentials`.
+
+The generic read path now strips `credentials` unconditionally, *before*
+the filter runs, so it is never returned and can't be used as a
+match-oracle either. Credentials remain reachable only through
+`usersInfo` with `showCredentials` and the `A_VIEW_USER` privilege — the
+one intentionally-gated path, unchanged. Found by the nightly security
+review (issue #167).
+
+#### Security
+
+- `Storage._find_system_users` / `_count_system_users`: the SCRAM
+  `credentials` blob is stripped from the generic `admin.system.users`
+  read path (`find` / `count` / `aggregate` / …) before filtering, so a
+  low-privilege reader can no longer harvest credential material.
+  `usersInfo` (gated by `A_VIEW_USER` + `showCredentials`) is unchanged.
+  Regressions in `tests/test_system_users_view.py`.
+### `$setWindowFields` gains `$expMovingAvg`
+
+`$setWindowFields` now supports `$expMovingAvg`, the exponential moving average —
+the second time-series window operator (after `$shift`).
+`{$expMovingAvg: {input: <expr>, N: <n>}}` smooths a series over the sorted
+partition, weighting recent rows more heavily: each output is
+`input·α + previous·(1−α)`, with `α = 2/(N+1)`. An explicit
+`{alpha: <0…1>}` may be given instead of `N`. It's the standard smoothing for
+noisy time-series — a trend line that reacts faster than a flat rolling average.
+
+The recurrence runs in IEEE double on both the Python and Rust servers, so the
+two agree bit-for-bit (pinned by the aggregation parity suite). The remaining
+time-series operators (`$derivative`, `$integral`, `$linearFill`, `$locf`) still
+raise a clear error.
+
+#### Added
+
+- `$setWindowFields` `$expMovingAvg` window operator (`{input, N | alpha}`) —
+  prefix-accumulated per partition, requires a `sortBy`.
+
+### `$jsonSchema` gains logical combinators and `additionalProperties`
+
+The `$jsonSchema` query operator now understands the JSON-Schema logical
+combinators — `allOf`, `anyOf`, `oneOf`, and `not` — plus `additionalProperties`.
+`allOf`/`anyOf`/`oneOf` compose sub-schemas (all / at-least-one / exactly-one
+must hold), `not` inverts one, and `additionalProperties` controls fields not
+named in `properties`: `false` forbids them outright, while a sub-schema
+validates each one. Together they cover the structural side of collection
+validators that go beyond flat field constraints — "exactly one of these shapes",
+"none of that", "no unexpected fields".
+
+These keywords were previously absent from *both* servers; they now ship on the
+Python and Rust servers alike, pinned by the query parity suite.
+(`patternProperties` is still not modelled.)
+
+#### Added
+
+- `$jsonSchema` `allOf` / `anyOf` / `oneOf` / `not` combinators and
+  `additionalProperties` (`true` / `false` / sub-schema).
+
+### `$setWindowFields` gains the `$shift` window operator
+
+`$setWindowFields` now supports `$shift` — the first of MongoDB's time-series
+window operators. `$shift` reaches across the sorted partition to read a value
+from a neighbouring row: `{$shift: {output: <expr>, by: <n>, default: <expr>}}`
+evaluates `output` on the row `n` positions away (negative looks back, positive
+looks ahead), falling to `default` (or `null`) when that position is past the
+partition edge. It's the idiomatic way to compute a delta from the previous row,
+peek at the next value, or lag/lead a series — without a self-join. Shifts never
+cross a partition boundary.
+
+The same semantics ship in both the Python and Rust servers, pinned by the
+aggregation parity suite. The remaining time-series operators (`$derivative`,
+`$integral`, `$expMovingAvg`, …) still raise a clear error.
+
+#### Added
+
+- `$setWindowFields` `$shift` window operator (`{output, by, default?}`) —
+  position-based, per-partition, requires a `sortBy`.
+
+### `$setWindowFields` learns value-based (range) windows
+
+The `$setWindowFields` aggregation stage now supports value-based windows —
+`window: {range: [lower, upper]}` — alongside the position-based `documents`
+windows it already had. Where a `documents` window counts rows relative to the
+current one, a `range` window is defined by the sortBy *value*: it includes every
+row whose value falls in `[current + lower, current + upper]`. That's the natural
+way to express "sum everything within 10 units of this point" or a gap-aware
+running total, and it's what analytics pipelines reach for. Bounds may be a
+number, `"current"` (this row's value), or `"unbounded"`.
+
+The window resolves against a single ascending numeric sortBy field; a range
+window with a time `unit`, or over a descending / multi-field / non-numeric sort,
+still raises a clear error rather than guessing. The same semantics ship in both
+the Python and Rust servers, pinned together by the aggregation parity suite.
+
+#### Added
+
+- `$setWindowFields` value-based windows (`window: {range: [lo, hi]}`) over a
+  single ascending numeric `sortBy`, with `"unbounded"` / `"current"` / numeric
+  bounds. Time-unit ranges and non-ascending / multi-field / non-numeric sorts
+  remain deferred with a clear `AggregateError`.
+
+### Smaller on-disk footprint: WiredTiger log pre-allocation disabled
+
+Each on-disk SecantusDB instance used to reserve ~30 MB of WiredTiger log
+files regardless of how little data it held — the active `WiredTigerLog`
+plus two 10 MB `WiredTigerPreplog` files WT pre-allocates ahead of the
+active log. That pre-allocation is a write-latency optimisation for
+long-running, high-throughput servers; SecantusDB's instances are small,
+ephemeral, in-process test databases, so it bought nothing and cost disk —
+acutely on CI, where a full ~2000-test on-disk run retained thousands of
+instances and exhausted the Windows runner's disk (`No space left on
+device` → `WT_PANIC`). Disabling `log=(prealloc=false)` drops each
+instance's log footprint from ~30 MB to ~10 MB with no durability change
+(recovery replays the same log records; WT just allocates each segment on
+demand). `file_max` stays 10 MB so a near-`maxBsonObjectSize` document
+still fits in one segment.
+
+#### Changed
+- `Storage`: on-disk WiredTiger opens with `log=(...,prealloc=false)` —
+  ~3x smaller per-instance log footprint, no durability impact.
+
+
+### A malformed OP_QUERY frame returns BadValue instead of dropping the connection
+
+A legacy `OP_QUERY` frame whose `fullCollectionName` carried no NUL
+terminator made `bytes.index(b"\x00", ...)` raise an uncaught `ValueError`
+that escaped the wire layer's `(InvalidBSON, _BodyBoundsError)` handler,
+killed the connection handler without sending a reply, and logged a Python
+traceback. The same gap existed for several siblings on the same
+attacker-controlled path: a non-UTF-8 collection name (`UnicodeDecodeError`),
+a frame truncated before the skip/return/query fields (`struct.error`), and a
+negative/oversized declared query-doc length (the `OP_MSG` path already
+guarded this with `_check_doc_len`, but `OP_QUERY` did not). The OP_MSG
+kind-1 section-identifier `.index()` / `.decode()` had the identical
+unterminated-cstring gap.
+
+`_parse_op_query` is now hardened the same way `_parse_op_msg` already was —
+every read on the network buffer raises `_BodyBoundsError` / `struct.error`,
+which `read_message` translates into a `BadValue` (2) wire reply while keeping
+the connection alive (matching `mongod`). `read_message` also now catches
+`struct.error` as a backstop so no malformed frame can escape as an uncaught
+exception. Found by the nightly security review (issue #116).
+
+#### Security
+- `wire._parse_op_query` / `_parse_op_msg`: malformed OP_QUERY/OP_MSG frames
+  (missing cstring NUL, invalid UTF-8, truncation, bad BSON length) now yield
+  a `BadValue` reply and a surviving connection instead of a dropped socket +
+  logged traceback. Regression: `tests/test_wire_malformed.py` (5 new
+  OP_QUERY cases).
+
+### Admin UI security hardening (two CVEs + a stored-XSS fix)
+
+Three findings from the nightly security review, all confined to the
+optional `[admin]` extra (the loopback FastAPI console):
+
+- **CVE-2026-48710 "BadHost" (issue #114):** the admin token middleware
+  gated its `/healthz` + `/static/` bypass allowlist on `request.url.path`,
+  which pre-`starlette` 1.0.1 is rebuilt from an unvalidated `Host` header —
+  a request with `Host: x/healthz?t=` could shift `request.url.path` to a
+  bypass prefix and reach protected admin endpoints unauthenticated. Bumped
+  the `starlette` floor to `>=1.0.1`, **and** the middleware now reads the
+  ASGI `scope["path"]` (immune to `Host` spoofing) as defence-in-depth.
+- **CVE-2026-53539 (issue #113):** `python-multipart` `<0.0.30` has a
+  quadratic-CPU DoS in its urlencoded-form parser. Bumped the floor to
+  `>=0.0.30`.
+- **Stored XSS in the geo viewer (issue #115):** the geo page injected
+  sampled document data into an inline `<script>` via `json_util.dumps` — a
+  document whose string `_id` contained `</script><script>…` closed the
+  block and injected arbitrary JS (with access to pywebview's `js_api`).
+  Feature JSON is now escaped for the script context (`<`/`>`/`&`/U+2028/
+  U+2029 → `\uXXXX`) so a payload can never break out of the block.
+
+#### Security
+- `admin/middleware.py`: token-bypass check reads `scope["path"]`, not the
+  Host-derived `request.url.path`.
+- `admin/routers/extras.py`: `_json_for_script` escapes geo feature JSON for
+  safe inline-`<script>` embedding.
+- `pyproject.toml` `[admin]`: `starlette>=1.0.1`, `python-multipart>=0.0.30`.
+- Regressions: `tests/test_admin_security.py`.
+
+### Capped-collection eviction survives a backup taken mid-stream
+
+A capped collection restored from a `backupArchive` could evict the wrong
+document on its next insert — dropping the freshly-inserted row instead of the
+oldest one. The cause was a stale recovery hint: the oplog-meta row that records
+the next insertion sequence is only refreshed on `hello`, `prune_oplog`, and
+`close` (the per-write path stopped re-persisting it because it WT-rollbacks
+under concurrent writers), so a checkpoint taken between two refreshes captures a
+sequence counter that lags the actual data. On reopen the server *trusted* that
+stale value, re-minting an already-used natural-order sequence; the collision
+overwrote a live document's entry in the insertion-order index and corrupted
+capped FIFO eviction. The symptom was load- and timing-dependent — it surfaced
+only when the driver's background topology `hello` happened to fall before the
+last insert rather than after it.
+
+Recovery now treats the persisted `next_seq` / `next_nat_seq` as a *hint that can
+only be corrected upward*: it clamps each counter to what the oplog and
+natural-order tables actually contain, so a lagging meta row can never lower the
+sequence and re-mint a used value. The oplog maximum is read with a single
+`prev()` (the table is keyed on the bare sequence), keeping reopen cheap.
+
+#### Fixed
+
+- Capped-collection FIFO eviction after restoring a `backupArchive` that was
+  taken between oplog-meta refreshes — the recovered insertion-sequence counter
+  is now clamped up to the natural-order table's maximum rather than trusting a
+  stale persisted value, eliminating the sequence collision that dropped a
+  just-inserted document. The same clamp guards the oplog `next_seq` against
+  re-minting a used sequence (which would silently overwrite an oplog row).
+
+### Storage close no longer swallows durability errors; admin history/backup never persist credentials
+
+Two security findings from the nightly review are closed. `Storage.close()`
+used to wrap its final teardown — the last oplog-meta persist, the shutdown
+checkpoint, and every WiredTiger session/connection close — in bare
+`contextlib.suppress(Exception)`, discarding a checkpoint or connection-close
+failure with no trace at all. In a database that is a durability signal, not
+noise: the embedder had no way to know the last on-disk image might be
+incomplete. The teardown now logs every caught failure via
+`log.exception(...)` (matching the TTL-sweep and noop-heartbeat loops) while
+still completing idempotently.
+
+The admin console's query-history store and backup helpers no longer let a
+credentialed connection string reach disk or the UI in plaintext. `HistoryStore`
+scrubs the URI to its password-free `display_uri()` form at the store boundary
+before it becomes a SQLite lookup key, so `~/.secantus/admin.db` can never hold
+a `mongodb://user:pass@host` string (and a caller passing the raw URI can't
+reintroduce the leak). The mongodump/mongorestore helpers still hand the live
+credential to the subprocess — they need it to authenticate — but now redact the
+password from any captured stdout/stderr, closing the path where a tool that
+echoes the connection string on error surfaces the secret in the rendered
+backup result.
+
+#### Fixed
+
+- `Storage.close()` teardown errors (oplog-meta persist, shutdown checkpoint,
+  WT session/connection close) are logged instead of silently suppressed
+  (security issue #138).
+- Admin `HistoryStore` persists the scrubbed `display_uri()` form instead of the
+  raw credentialed `mongo_uri`; mongodump/mongorestore captured output has the
+  password redacted (security issue #140).
+
+### Admin console detects the target server and gates features it can't do
+
+The admin UI is a plain pymongo client, so it can point at any of the
+three MongoDB-wire servers: the SecantusDB Python server, the SecantusDB
+Rust server, or a real `mongod`. They differ in which commands they
+implement — most visibly the four proprietary `secantusAdmin.*`
+backup/maintenance commands (no `mongod` has them) and a handful of
+standard admin commands the Rust server hasn't ported yet. Until now the
+console advertised every button regardless of target, so clicking
+"native checkpoint backup" against a `mongod`, or "prune oplog" against
+the Rust server, returned a bare `CommandNotFound`.
+
+The console now probes the target once at connect (and on every target
+swap) via `buildInfo` + `serverStatus`, classifies it as Python / Rust /
+MongoDB from the server's own self-identification
+(`serverStatus.secantus.server` and `buildInfo.secantusVersion`), and
+derives a capability set the templates consult. A detected-server pill
+appears next to the target badge, and features the target can't honour
+are disabled with an explanatory tooltip instead of failing on click:
+native backup archive / restore and manual oplog/TTL prune (all
+`secantusAdmin.*`, SecantusDB-only), plus role grant/revoke and
+connection-kill (`killOp`) where the Rust server hasn't ported them. An
+unreachable or not-yet-probed target stays fully permissive, so a
+transiently-down server never hides a working button.
+
+#### Added
+
+- `secantus.admin.capabilities`: server-capability probe + classifier
+  (`classify` / `probe` / `ServerCapabilities` / `UNKNOWN`), wired into
+  the app lifespan startup and `swap_target`, exposed to templates as
+  `request.app.state.capabilities`.
+- Admin templates gate `secantusAdmin.*` backup/maintenance buttons,
+  role grant/revoke, and connection-kill to the detected server's
+  capabilities, and show a server-type badge.
+
+### Atlas Search index commands are rejected with an "Atlas" error
+
+Atlas Search index management — the `createSearchIndexes`, `updateSearchIndex`,
+and `dropSearchIndex` commands plus the `$listSearchIndexes` aggregation stage
+(and its `$search` / `$searchMeta` / `$vectorSearch` siblings) — is an
+Atlas-only feature. A real non-Atlas `mongod` registers these but fails them at
+execution with a message naming Atlas. SecantusDB now does the same
+(`CommandNotSupported`, message mentioning Atlas) instead of returning
+`CommandNotFound` / an "unrecognized pipeline stage" error. Closes the
+mongo-c-driver `/index-management/{list,drop,update,create}SearchIndex` tests,
+which assert the error contains "Atlas".
+
+#### Added
+- `createSearchIndexes` / `updateSearchIndex` / `dropSearchIndex` command
+  handlers and `$listSearchIndexes` / `$search` / `$searchMeta` /
+  `$vectorSearch` aggregation-stage rejection, all returning the shared
+  `aggregate.SEARCH_INDEX_ATLAS_MSG` (mirrors mongod's not-on-Atlas error).
+
+### Dropping a collection under a tailable cursor reports "collection dropped"
+
+When a capped collection is dropped while a tailable cursor is open on
+it, the next `getMore` now fails with `QueryPlanKilled` (175) and a
+"collection dropped" message — exactly what mongod surfaces to a tailing
+client. Previously the cursor was simply removed, so the follow-up
+`getMore` returned a bare `CursorNotFound` (43). Regular (non-tailable)
+cursors are unchanged: dropping their collection still yields
+`CursorNotFound`, which the strict wire gauges rely on. Closes
+mongo-php-driver's `cursor-tailable_error-001`, which asserts the
+dropped-collection error mentions "collection dropped".
+
+#### Fixed
+- `CursorRegistry.kill_namespace` tombstones tailable cursors (sets a
+  `dropped` flag, keeps the entry) instead of deleting them; non-tailable
+  cursors are still deleted. `_get_more` returns the new
+  `QueryPlanKilled` "collection dropped" reply for a tombstoned tailable
+  cursor, and `_drop` tombstones before the storage drop so a parked
+  `awaitData` `getMore` (woken by the drop's oplog write) observes the
+  flag.
+
+### A tailable cursor's filter now applies to docs inserted after the find
+
+A tailable + `awaitData` cursor on a capped collection re-polls the
+collection for documents inserted after the `find`. That poll was
+returning *every* new row, ignoring the cursor's query filter — so a
+tailable cursor watching for `{a: 1}` would surface unrelated inserts
+(and even pre-existing non-matching docs) the moment it ran a `getMore`.
+The producer now re-applies the find filter (with the same `let` vars and
+collation) to each scanned row, exactly as the oplog-tailing variant
+already did. The watermark still advances past every scanned row, matched
+or not, so non-matching docs aren't re-examined on the next poll. Closes
+the mongo-c-driver gauge's `/Collection/tailable/timeout/single`.
+
+#### Fixed
+- `commands._find_tailable`: the capped-collection tailable producer
+  filters follow-up inserts through `query.matches` instead of returning
+  them unconditionally.
+
+### A malformed `$and` / `$or` / `$nor` is a clean parse error, not a crash
+
+`$and` / `$or` / `$nor` require a non-empty array of sub-documents. A query
+passing a non-array (`{$or: true}`), an empty array, or a non-document element
+used to crash the query engine — `for c in condition` raised a Python
+`TypeError` that escaped the parse-error handling and surfaced over the wire as
+a generic `InternalError` (1) with the traceback logged server-side. It now
+matches mongod: a `BadValue` (2) parse error ("$or must be an array" / "must be
+a nonempty array" / "entries need to be full objects"). Surfaced while triaging
+the mongo-c-driver gauge's malformed-input command-monitoring tests.
+
+#### Fixed
+- `query._match_clause`: `$and` / `$or` / `$nor` validate their argument is a
+  non-empty list of documents and raise `QueryError` (→ BadValue 2) for any
+  malformed shape, instead of letting a `TypeError` leak out as InternalError.
+
+### An unrecognised index-key string is rejected as an unknown plugin
+
+A string value in an index key names a special index type ("plugin") — `2d`,
+`2dsphere`, `text`, `hashed`. SecantusDB already accepted the geo plugins and
+rejected `text`/`hashed` as out-of-scope, but it let *any other* string through:
+`createIndex({abc: "hallo thar"})` silently created a broken index instead of
+erroring. It now matches mongod and rejects an unrecognised plugin name with
+`CannotCreateIndex` (67) "Unknown index plugin '<value>'".
+
+This closes the mongo-c-driver gauge's `/Collection/index_w_write_concern` test,
+which (after the 0.5.4b13 write-concern fix) was failing on its invalid-index
+assertion — it creates `{abc: "hallo thar"}` and expects the server to reject
+it. The test name is misleading; the failure had nothing to do with write
+concern.
+
+#### Fixed
+- `storage.create_index`: a string index-key value that isn't a recognised
+  plugin (`2d` / `2dsphere` / `2dsphere_bucket` / `geoHaystack`) is rejected
+  with `CannotCreateIndex` (67) "Unknown index plugin '<value>'", alongside the
+  existing `text` / `hashed` out-of-scope rejection.
+
+### A numeric write-concern `w` above 50 is now a parse error
+
+A `writeConcern` with a numeric `w` greater than 50 (or negative) is now rejected
+at parse time with `FailedToParse` (9) and the message "w has to be a non-negative
+number and not greater than 50" — matching mongod, which caps `w` at the maximum
+number of voting replica-set members (50). Previously SecantusDB treated any
+`w` above 1 the same way (a `CannotSatisfyWriteConcern` writeConcernError, code
+100, attached to a *successful* reply). That's only correct for `1 < w <= 50` —
+satisfiable on a multi-node deployment but not on our single node. Above 50 the
+value is simply invalid, and mongod errors the whole command.
+
+This closes the mongo-c-driver gauge's last cluster of failures —
+`/Collection/{drop,rename,index}` and `/Database/drop`, which each run a DDL op
+with `w: 99` and assert the `assert_wc_oob_error` shape (code 9, the message
+above) for a server advertising version >= 4.3.3 (we advertise 7.0). The
+"state-ordering" label these carried in the backlog was a misdiagnosis: the
+failure is deterministic, not dependent on test order.
+
+#### Fixed
+- `commands._validate_write_concern`: a numeric `writeConcern.w` outside `[0, 50]`
+  is rejected with `FailedToParse` (9) before the command runs, instead of
+  falling through to the satisfiability check (code 100). `_drop_database` and
+  `_rename_collection` now run this validation too (they previously skipped it,
+  relying only on the dispatch-level `_unsatisfiable_wc_error`).
+
+The `$currentOp` aggregation stage now surfaces the connecting driver's
+handshake metadata — the full `clientMetadata` document (driver name/version,
+OS, application name) plus a top-level `appName` — on its self-row, matching
+real `mongod`. Previously only the `currentOp` *command* echoed this back; the
+aggregation form (`db.aggregate([{$currentOp: {}}])`) returned a bare stub, so a
+client couldn't find its own operation by `appName` or read back the metadata it
+sent on connect.
+
+This was the last real divergence the mongo-cxx-driver gauge's "integration
+tests for client metadata handshake feature" exercised — it connects with
+`?appName=xyz`, scans `$currentOp` for the matching op, and verifies its
+`clientMetadata.{application,driver,os}`. With this and the 0.5.4b11
+resume-token fix, the cxx gauge's remaining real failures are closed.
+
+#### Fixed
+- `aggregate._stage_current_op`: the `$currentOp` self-row now carries
+  `clientMetadata` (the connection's `hello.client` subdoc) and a top-level
+  `appName` lifted from `application.name`, threaded in via a new
+  `PipelineContext.client_metadata` field that the `aggregate` command handler
+  populates from the connection registry. The `currentOp` command already did
+  this; the aggregation stage now matches.
+
+### Change-stream resume tokens now advance per event, even at batchSize 1
+
+A change stream's `postBatchResumeToken` now tracks the resume token of the
+**last event actually returned in each batch**, not the last event the server
+happened to prefetch. The producer reads up to 200 oplog rows ahead while the
+cursor hands them back `batchSize` at a time, so with a small batch size the
+token reported on each `getMore` was stale — three single-event reads all
+carried the same token. Drivers that resume off the per-batch token (the whole
+point of `postBatchResumeToken`) would resume from the wrong place. Alongside
+it, an empty `getMore` over a quiet collection no longer re-mints the token with
+a fresh cluster time when the oplog tail hasn't actually moved, so an exhausted
+stream reports the same resume token as its last event rather than drifting.
+
+This was surfaced by the mongo-cxx-driver gauge's spec prose test "ChangeStream
+must continuously track the last seen resumeToken" (`batchSize=1`, read three
+events, assert each token differs, then assert the post-exhaustion token equals
+the last event's). The fix is server-side and driver-agnostic — every change-
+stream driver benefits.
+
+#### Fixed
+- `commands._change_stream_cursor_doc`: `postBatchResumeToken` is now the `_id`
+  (resume token) of the last event in the returned batch, not the producer's
+  prefetch-tail `last_token` — so per-batch tokens advance correctly under any
+  `batchSize`.
+- `commands` change-stream producer: an empty `getMore` only advances /
+  re-mints the resume token when the oplog tail has genuinely moved past the
+  cursor's position, preserving the go `resume_token_updated_on_empty_batch`
+  advance while fixing the mongocxx no-change-equals-last-token case. (On a
+  truly quiet collection the token now advances via the oplog's periodic noop
+  heartbeats, mirroring mongod's `periodicNoopIntervalSecs` — not a per-getMore
+  clock tick.)
+- The change-stream batch builder (`_change_stream_cursor_doc`) is shared with
+  capped-collection tailable cursors, whose documents carry plain `_id` values
+  and no resume token. The new `postBatchResumeToken` = last-event-`_id` logic
+  is gated to change-stream cursors only, so a capped tailable getMore no longer
+  emits a non-document PBRT (strict drivers — the Java driver — rejected an
+  int32 there).
+
+### Two more conformance gauges: the Kotlin driver and pymongo async
+
+SecantusDB now also measures itself against the official MongoDB **Kotlin**
+driver and against pymongo's native **async** (`AsyncMongoClient`) suite —
+bringing the gauge count to thirteen. Both reuse infrastructure already in the
+tree rather than vendoring new submodules: the Kotlin driver ships *inside* the
+mongo-java-driver monorepo (`driver-kotlin-sync`), so its gauge runs the
+`:driver-kotlin-sync:integrationTest` Gradle task against an embedded SecantusDB
+daemon over the same JDK/Gradle toolchain the Java gauge already needs; and the
+async gauge points pymongo's `test/asynchronous/` suite at the same
+embedded-server plugin the sync gauge uses, run under `pytest-asyncio` with
+`asyncio_mode=auto`. The async gauge is the more interesting of the two — it
+exercises the async/await wire path that replaced Motor, which drives cursors and
+change-stream `getMore` polling through a different event-loop code path than the
+synchronous client, catching divergences a sync-only gauge can't see.
+
+Run them with `invoke validate-pymongo-async` and `invoke validate-kotlin`. Both
+join the weekly `validate.yml` matrix and `invoke validate-all`. Neither touches
+the shipped `secantus` package — the gauge directories are dev-only, excluded
+from the wheel and sdist like every other gauge.
+
+Bringing the Kotlin gauge up also surfaced and fixed a latent break in the
+shared gauge plumbing: every daemon-subprocess gauge (go / node / java / ruby /
+rust / c / cxx / dotnet) passes `--log-level WARNING`, but `gauge_common.
+spawn_daemon` learns the daemon's kernel-assigned port by grepping its
+`listening on <host>:<port>` line — which the Python server logs at INFO, so
+WARNING suppressed it and the spawn waited the full timeout (and, with a
+blocking read, could hang for hours — one scheduled CI run was cancelled at 6h).
+The spawn now forces the Python daemon to INFO (per-request logging is at DEBUG,
+so this adds only the one readiness line, no noise) and reads the daemon's output
+under a hard deadline so a missing line times out instead of hanging. This is
+why those gauges were red in the weekly run; they go green again with this fix.
+
+#### Added
+- `pymongo_async_validation/` gauge package (`include_paths` / `generate_report`)
+  and the `invoke validate-pymongo-async` task — pymongo's native
+  `AsyncMongoClient` suite against an embedded SecantusDB, reusing
+  `pymongo_validation.plugin` and the `vendor/pymongo-tests` submodule. Adds a
+  `pytest-asyncio` dev dependency.
+- `kotlin_validation/` gauge package (`include_modules` / `runner` /
+  `generate_report` / `init.gradle.kts`) and the `invoke validate-kotlin` task —
+  the official Kotlin driver's `:driver-kotlin-sync:integrationTest` suite against
+  a standalone SecantusDB daemon, sharing the Java gauge's JVM toolchain and
+  `vendor/mongo-java-driver` submodule.
+- Both gauges wired into `invoke validate-all` / `validate-all-servers` and the
+  CI `validate.yml` matrix.
+
+#### Fixed
+- `gauge_common.spawn_daemon`: the Python daemon is now forced to `--log-level
+  INFO` so its `listening on …` readiness line (logged at INFO) is visible even
+  though gauges pass `--log-level WARNING`, and the readiness read is bounded by
+  the spawn deadline instead of a blocking `readline()`. Unbreaks the
+  daemon-subprocess gauges (go / node / java / ruby / rust / c / cxx / dotnet),
+  which were failing/hanging in CI because WARNING suppressed the line.
+
+### Closing the gaps the C, C++, and C# gauges opened
+
+Adding the mongo-c-driver, mongo-cxx-driver, and mongo-csharp-driver gauges
+turned up a cluster of small conformance divergences in the Python server, and
+this release fixes the actionable ones. None were show-stoppers on their own —
+they're the kind of edge that a permissive driver like pymongo glosses over but
+a strict C extension or a spec-faithful CRUD suite pins exactly — and together
+they tighten how faithfully SecantusDB answers the corners of the wire protocol.
+
+The headline is document-validation error detail: a write that fails a
+collection validator now returns mongod's full per-operator `errInfo.details`
+(`operatorName` / `specifiedAs` / `reason` / `consideredValue` / `consideredType`)
+instead of a bare placeholder, so a driver can tell you *why* a document was
+rejected. Alongside it: `$out` / `$merge` are now rejected unless they're the
+final pipeline stage, they enforce the destination collection's validator
+(honouring `bypassDocumentValidation`), a change stream opened with an invalid
+`$match` errors immediately rather than on the first batch, `batchSize` accepts
+any BSON number type, over-long database names are rejected, dropping or renaming
+a collection invalidates its open cursors, and `collMod` can stage an index
+`prepareUnique` and convert it to `unique` — reporting the duplicate `_id`
+groups as `violations` when the conversion can't proceed.
+
+#### Added
+- `collMod {index: {prepareUnique: true}}` arms an existing index so new
+  uniqueness-violating writes are rejected (11000) while pre-existing duplicates
+  remain, and `collMod {index: {unique: true}}` converts it — refusing with
+  `CannotConvertIndexToUnique` (359) plus a `violations: [{ids: [...]}]` array
+  when duplicates exist (`storage.set_index_options` / `find_index_duplicates`).
+
+#### Fixed
+- Document validation now synthesises mongod's per-operator `errInfo.details`
+  for query-expression validators (`commands._validation_failure_details`),
+  used by both the insert path and `findAndModify` upsert simulation.
+- `$out` / `$merge` are rejected with `Location40601` (40601) unless they are the
+  final pipeline stage, and they enforce the destination collection's `validator`
+  unless `bypassDocumentValidation` is set (`DocumentValidationFailure`, 121).
+- Change streams validate `$match` filter syntax at open time, so an unknown
+  query operator errors at `.begin()` (aggregate) rather than the first `getMore`.
+- `find` / `aggregate` accept a `batchSize` encoded as any BSON number, including
+  `Decimal128`.
+- Commands targeting a database whose name exceeds 63 bytes are rejected with
+  `InvalidNamespace` (73).
+- Dropping or renaming a collection now kills its open cursors, so a later
+  `getMore` fails with `CursorNotFound` (43) instead of serving stale rows.
+
+### createIndexes now rejects conflicting index definitions
+
+`createIndexes` previously accepted a re-creation that collided with an existing
+index, silently treating it as a no-op. It now matches `mongod`: re-using an
+index name for a **different key spec** is rejected with `IndexKeySpecsConflict`
+(code 86), re-using a name with the **same key but different options** is
+rejected with `IndexOptionsConflict` (code 85), and an **identical** re-create
+returns `note: "all indexes already exist"` so drivers report it as a no-op
+rather than a fresh build. This was surfaced by the mongo-cxx-driver gauge
+(`create_index tests/fails`, `index_view/fails for same name`, `fails for same
+keys and options`), and applies to every driver's `createIndex` / index-view
+API.
+
+#### Fixed
+- `createIndexes`: same-name-different-key now errors `IndexKeySpecsConflict`
+  (86); identical re-creates now carry `note: "all indexes already exist"`
+  (`storage.create_index` / `commands._create_indexes`). Same-name-different-
+  options continues to error `IndexOptionsConflict` (85).
+
+### An eleventh conformance gauge: the MongoDB C# / .NET driver
+
+SecantusDB now also measures itself against the official MongoDB **C# / .NET**
+driver — the one the .NET, Unity, and Xamarin ecosystems build on — bringing the
+gauge count to eleven. The gauge runs the driver's own xUnit suite via `dotnet
+test` against an embedded SecantusDB daemon, with `MONGODB_URI` pointed at it,
+scoped to the CRUD specification conformance tests
+(`MongoDB.Driver.Tests.Specifications.crud`). `MongoDB.Driver.Tests` as a whole
+is enormous and dominated by non-server unit tests and external-service suites
+(client-side encryption, Atlas Search, multi-node transactions), so the CRUD
+spec runner is the focused, bounded conformance slice — expandable to more spec
+families over time. The driver's `[RequireServer]` attribute self-skips tests
+whose server-version or topology requirements a single node doesn't meet.
+
+Run it with `invoke validate-dotnet` (needs the .NET SDK and `gpg` — the driver's
+encryption project verifies a downloaded libmongocrypt during build). It joins
+the weekly `validate.yml` matrix and the cross-driver summary.
+
+#### Added
+- `dotnet_validation/` gauge package (`runner` / `generate_report` /
+  `include_paths`) and the `invoke validate-dotnet` task; wired into `invoke
+  validate-all`, the cross-driver summary (`validation_summary`), and CI.
+
+### Two new conformance gauges: the MongoDB C and C++ drivers
+
+SecantusDB now measures itself against the official MongoDB **C** (`libmongoc`)
+and **C++** (`mongocxx`) drivers — bringing the gauge count to ten. libmongoc is
+the lowest-level official client, the one the PHP, Ruby, and PyMongo
+C-extensions ultimately wrap; mongocxx is the modern C++ driver built on top of
+it. Both gauges build the driver's own test suite from source and run it,
+unmodified, against an embedded SecantusDB daemon — `test-libmongoc` (curated
+CRUD / cursor / aggregation / command / GridFS / index suites over
+`MONGOC_TEST_URI`) for C, and the mongocxx `test_driver` Catch2 suite for C++.
+Strict native clients surface type- and wire-shape divergences that more
+permissive drivers accept silently.
+
+Two wrinkles were worth solving. First, libmongoc's test fixture probes the
+server with `replSetGetStatus` and aborts the whole run on an unexpected error,
+so SecantusDB now answers it like a standalone `mongod` —
+`NoReplicationEnabled` (code 76), "not running with --replSet" — which driver
+harnesses special-case as "standalone, skip the replica-set-only paths". Second,
+mongocxx's tests hard-wire `mongodb://localhost:27017` with no environment
+override, so the C++ gauge binds its daemon on port 27017 and refuses to run if
+something else already holds it (it won't gauge a foreign server).
+
+Run them with `invoke validate-c` / `invoke validate-cxx` (both need `cmake` and
+a C/C++ toolchain; the first run builds the drivers, later runs reuse the cached
+builds). Both join the weekly `validate.yml` matrix and the cross-driver summary.
+
+#### Added
+- `c_validation/` and `cxx_validation/` gauge packages (`runner` /
+  `generate_report` / `include_paths` each) and the `invoke validate-c` /
+  `invoke validate-cxx` tasks; wired into `invoke validate-all`, the cross-driver
+  summary (`validation_summary`), and CI.
+- `replSetGetStatus` command: returns the standalone-mongod
+  `NoReplicationEnabled` error so single-node-aware driver test fixtures skip
+  replica-set-only behaviour instead of aborting.
+
+### The in-process Rust engine selection is fully removed
+
+The transitional in-process engine selection — `SECANTUS_ENGINE=python|rust|auto`,
+the `--engine` CLI flag, and the `SecantusDBServer(engine=...)` constructor
+parameter — has been removed entirely. It was already inert since 0.5.3b3 (no
+operator module delegated to the `_secantus_core` extension any more), so this is
+a no-op for behaviour: the Python server has been pure-Python end to end for
+several releases. This change deletes the dead surface so there is one obvious
+way things work.
+
+SecantusDB's Rust implementation lives in the **separate Rust server** (and the
+standalone `secantusdb` binary), not in this package's request path. The
+`secantus-core` wheel remains as the engine library and the parity-test oracle
+that pins each Rust engine byte-for-byte against its pure-Python counterpart.
+
+#### Removed
+- The `--engine` CLI flag and the `engine=` parameter on `SecantusDBServer`.
+  Passing `engine=` now raises `TypeError` (the flag had no effect since 0.5.3b3).
+- The `secantus.engine` module (the inert compatibility stub) and its
+  `tests/test_engine.py`.
+- The `SECANTUS_ENGINE=rust` full-suite CI step, which re-ran the test suite
+  under a now-dead env var and was a source of flaky worker-crash failures.
+
+### Point-in-time recovery: restore the database as it was at any moment in its oplog
+
+SecantusDB already kept a mongod-shaped oplog and could take consistent
+WiredTiger backup archives; this release joins the two into real point-in-time
+recovery. Given a backup (or a stopped server's data directory), you can now
+rebuild a fresh database as it was at any target timestamp by replaying the
+oplog forward — documents, in-place updates, deletes, collection options
+(`capped` / `size` / `max` / `validator` / `viewOn` / …), and index / `collMod` /
+rename DDL are all reconstructed through the ordinary write paths, so the result
+is indistinguishable from the live database at that instant.
+
+Recovery is offline, matching real `mongod`: it writes a fresh data directory
+you then start a new server on. Drive it from the CLI (`secantusd-py restore
+--source <archive|dir> --target-dir <dir> [--to-time <ISO> | --to-timestamp
+<secs,ord>]`) or the `secantusAdmin.restoreToTimestamp` admin command. A
+multi-document transaction is always replayed all-or-nothing — its statements
+share one commit timestamp, so a recovery point never lands mid-transaction.
+Out of the box the recovery window is the oplog retention window (tune
+`--oplog-retention-seconds` / `--oplog-max-entries` for the horizon you need). To
+reach further back, turn on oplog archiving (`--oplog-archive-dir`) and take
+periodic base snapshots: SecantusDB then keeps the dropped oplog on disk and
+recovery stitches the newest snapshot before your target together with the
+archived oplog, so any moment in the archived history is reachable without keeping
+the whole oplog live. See [Backup & point-in-time recovery](recovery.md).
+
+#### Added
+- `secantus.diff.apply_update_description` — applies a `$v: 2`
+  `updateDescription` back to a document (the inverse of
+  `compute_update_description`); the keystone of oplog replay.
+- `secantus.oplog_replay` — `replay()` / `restore_to_timestamp()` /
+  `restore_archive_to_timestamp()`: replays an oplog source into a fresh store,
+  stopping at a target `ts` / wall-clock time.
+- `Storage.replay_mode()` — a context manager that suppresses oplog emission so
+  replay drives the real write paths without regenerating the oplog.
+- `secantusd-py restore` CLI subcommand and the `secantusAdmin.restoreToTimestamp`
+  wire command.
+- Backup archives now embed a `pitr-manifest.json` describing their recoverable
+  oplog range (`Storage._pitr_manifest`).
+- Collection options (`capped` / `size` / `max` / `validator` / `viewOn` / …) now
+  ride the `create` oplog entry, so PITR replay reconstructs them on the restored
+  collection (previously only documents and indexes were). `Storage.create_collection`
+  gained an `options=` argument; the same options now also surface in the
+  `show_expanded_events` change-stream `create` event's `operationDescription`.
+- `--preserve-oplog` (`secantusd-py restore`) / `preserveOplog: true`
+  (`secantusAdmin.restoreToTimestamp`) carries the replayed oplog onto the
+  restored directory verbatim, so a change stream on the restored server can
+  resume from a token minted *before* the restore point. The default still starts
+  a fresh oplog timeline, matching `mongorestore`. Backed by
+  `Storage.import_oplog_segment`.
+- **PITR v2 — arbitrary-window recovery** (`secantus.pitr_archive`). A server
+  started with `--oplog-archive-dir <dir>` (`[oplog] archive_dir`) archives the
+  oplog rows `prune_oplog` is about to drop into durable segment files first;
+  `secantusAdmin.archiveBaseSnapshot` / `Storage.archive_base_snapshot` take base
+  snapshots into the same directory. Recovery then accepts that **archive
+  directory** as the `restore` source (CLI / wire auto-detect it): it picks the
+  newest base snapshot at or before the target time and stitches the archived
+  oplog forward onto it. This lifts the v1 genesis-intact restriction — a restore
+  can reach a time *before* the live oplog floor, without keeping the entire oplog
+  live. Base snapshots are taken on demand (no background scheduler, matching
+  `prune_ttl` / `prune_oplog`).
+
 ## [0.5.3b13] — 2026-06-16
 
 ### `find()` with no sort now returns documents in insertion order

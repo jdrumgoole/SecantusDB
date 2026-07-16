@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import zoneinfo
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -23,12 +24,28 @@ class ExpressionError(Exception):
     explicitly.
     """
 
-    _CODE_NAMES = {14: "TypeMismatch", 2: "BadValue"}
+    _CODE_NAMES = {14: "TypeMismatch", 2: "BadValue", 168: "InvalidPipelineOperator"}
 
     def __init__(self, msg: str, *, code: int = 14, code_name: str | None = None) -> None:
         super().__init__(msg)
         self.code = code
         self.code_name = code_name or self._CODE_NAMES.get(code, f"Location{code}")
+
+
+class UnknownExpressionOperatorError(ExpressionError):
+    """A ``$``-prefixed expression operator SecantusDB does not recognize.
+
+    mongod surfaces different codes depending on context: a ``$expr`` inside
+    a query yields ``168 InvalidPipelineOperator`` with the message
+    ``Unrecognized expression '$op'`` (the default this class carries); an
+    expression inside an aggregation stage such as ``$project`` yields a
+    stage-specific ``Location`` code wrapping ``Unknown expression $op``.
+    Stage handlers catch this and re-raise with the wrapped form.
+    """
+
+    def __init__(self, op: str) -> None:
+        super().__init__(f"Unrecognized expression '{op}'", code=168)
+        self.op = op
 
 
 @dataclass
@@ -63,6 +80,22 @@ def _eval(expr: Any, ctx: _Ctx) -> Any:
 
 
 _REMOVE_SENTINEL: Any = object()
+
+#: Sentinel for "the expression resolved to a missing field" (distinct from an
+#: explicit ``null``). Reuses the ``$$REMOVE`` marker.
+MISSING: Any = _REMOVE_SENTINEL
+
+
+def evaluate_or_missing(
+    expr: Any, doc: Mapping[str, Any], vars: dict[str, Any] | None = None
+) -> Any:
+    """Like :func:`evaluate`, but a top-level absent field path yields
+    :data:`MISSING` (distinct from ``None``) so accumulators can skip a missing
+    value the way mongod does — ``$push`` / ``$addToSet`` accumulate an explicit
+    ``null`` but not a missing field."""
+    if isinstance(expr, str) and expr.startswith("$") and not expr.startswith("$$"):
+        return get_path(dict(doc), expr[1:], default=MISSING)
+    return evaluate(expr, doc, vars)
 
 
 def _resolve_var(name: str, ctx: _Ctx) -> Any:
@@ -102,7 +135,7 @@ def _apply_op(op: str, arg: Any, ctx: _Ctx) -> Any:
         return arg
     handler = _OPS.get(op)
     if handler is None:
-        raise ExpressionError(f"unsupported aggregation expression operator: {op}")
+        raise UnknownExpressionOperatorError(op)
     return handler(arg, ctx)
 
 
@@ -449,6 +482,59 @@ def _op_log10(arg: Any, ctx: _Ctx) -> Any:
     return math.log10(v) if v is not None and v > 0 else None
 
 
+def _trig_coerce(name: str, v: Any, code: int = 28765) -> float:
+    """Coerce a trig operand to float. bool / non-numeric raise ``code``
+    (mongod's ``Location28765`` for the unary ops, ``51044`` for ``$atan2``).
+    Decimal128 is float-cast, matching ``$degreesToRadians`` (SecantusDB does
+    not reproduce mongod's decimal-precise transcendental result)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
+        raise ExpressionError(f"{name} only supports numeric types, not {_type_name(v)}", code=code)
+    return float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+
+
+def _make_trig(name: str, fn: Any, domain: str) -> Any:
+    """Build a unary trig operator. ``domain`` gates the input the way mongod
+    does (all violations surface ``Location50989``): ``finite`` (sin/cos/tan
+    reject ±inf / NaN), ``unit`` (asin/acos need [-1,1]), ``atanh`` (same, but
+    ±1 → ±inf rather than a ``math`` domain error), ``geq1`` (acosh needs
+    [1,inf)), ``any`` (atan / the hyperbolics accept every finite + infinity)."""
+
+    def op(arg: Any, ctx: _Ctx) -> Any:
+        v = _eval(arg, ctx)
+        if v is None:
+            return None
+        x = _trig_coerce(name, v)
+        if domain == "finite" and not math.isfinite(x):
+            raise ExpressionError(
+                f"cannot apply {name} to {x}, value must be in (-inf,inf)", code=50989
+            )
+        if domain in ("unit", "atanh") and not (-1.0 <= x <= 1.0):
+            raise ExpressionError(
+                f"cannot apply {name} to {x}, value must be in [-1,1]", code=50989
+            )
+        if domain == "geq1" and not x >= 1.0:
+            raise ExpressionError(
+                f"cannot apply {name} to {x}, value must be in [1,inf]", code=50989
+            )
+        if domain == "atanh" and abs(x) == 1.0:
+            return math.inf if x > 0 else -math.inf
+        return fn(x)
+
+    return op
+
+
+def _op_atan2(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, list) or len(arg) != 2:
+        raise ExpressionError("$atan2 requires two arguments", code=51044)
+    y = _eval(arg[0], ctx)
+    x = _eval(arg[1], ctx)
+    if y is None or x is None:
+        return None
+    fy = _trig_coerce("$atan2", y, code=51044)
+    fx = _trig_coerce("$atan2", x, code=51044)
+    return math.atan2(fy, fx)
+
+
 def _op_rand(arg: Any, _ctx: _Ctx) -> float:
     # MongoDB 5.0+: ``{$rand: {}}`` returns a uniform random double in
     # [0, 1). Argument must be an empty document; anything else is a
@@ -556,10 +642,32 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
             raise ExpressionError("$getField field must evaluate to a string")
     else:
         raise ExpressionError("$getField requires a string or {field, input} document")
-    input_doc = _eval(input_expr, ctx)
+    # Evaluate ``input`` in a missing-aware way so we can tell an input that
+    # resolved to *missing* (an absent field path) apart from an explicit
+    # ``null``. mongod (verified against 6.0):
+    #   - input missing            -> $getField is missing  (field dropped)
+    #   - input null               -> $getField is null     (field kept null)
+    #   - input document, no field -> $getField is missing  (field dropped)
+    #   - input document, field present (incl. null) -> that value
+    if (
+        isinstance(input_expr, str)
+        and input_expr.startswith("$")
+        and not input_expr.startswith("$$")
+    ):
+        input_doc = get_path(dict(ctx.doc), input_expr[1:], default=_REMOVE_SENTINEL)
+    else:
+        input_doc = _eval(input_expr, ctx)
+    if input_doc is _REMOVE_SENTINEL:
+        return _REMOVE_SENTINEL
     if input_doc is None or not isinstance(input_doc, Mapping):
         return None
-    return input_doc.get(field)
+    # A field absent from the input document resolves to "missing" (the same
+    # marker as ``$$REMOVE``), so a ``$project`` / ``$addFields`` computed field
+    # that reads it is omitted from the output. A field present with an explicit
+    # ``null`` still returns ``None`` (and is emitted).
+    if field not in input_doc:
+        return _REMOVE_SENTINEL
+    return input_doc[field]
 
 
 def _op_switch(arg: Any, ctx: _Ctx) -> Any:
@@ -759,6 +867,24 @@ def _op_date_to_parts(arg: Any, ctx: _Ctx) -> Any:
         return None
     if not isinstance(date, _dt.datetime):
         raise ExpressionError("$dateToParts date must be a datetime")
+    tz = _resolve_timezone(arg.get("timezone"))
+    if tz is not None:
+        # Naive input is treated as UTC (BSON Date semantics); shift into the zone
+        # so the parts read local wall-clock — instant->wall-clock, unambiguous.
+        date_aware = date if date.tzinfo is not None else date.replace(tzinfo=_dt.timezone.utc)
+        date = date_aware.astimezone(tz)
+    iso8601 = _eval(arg.get("iso8601"), ctx) if "iso8601" in arg else False
+    if iso8601:
+        iso_year, iso_week, iso_dow = date.isocalendar()
+        return {
+            "isoWeekYear": iso_year,
+            "isoWeek": iso_week,
+            "isoDayOfWeek": iso_dow,
+            "hour": date.hour,
+            "minute": date.minute,
+            "second": date.second,
+            "millisecond": date.microsecond // 1000,
+        }
     return {
         "year": date.year,
         "month": date.month,
@@ -768,6 +894,281 @@ def _op_date_to_parts(arg: Any, ctx: _Ctx) -> Any:
         "second": date.second,
         "millisecond": date.microsecond // 1000,
     }
+
+
+def _dfp_int(name: str, v: Any) -> int:
+    """Coerce a `$dateFromParts` component to an int, matching mongod's
+    `Location40515` for a non-integral value (an integral double like `6.0` is
+    accepted; `6.5` / a string is not)."""
+    if isinstance(v, bool):
+        raise ExpressionError(
+            f"'{name}' must evaluate to an integer, found {_nelem_render(v)}", code=40515
+        )
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, Decimal128) and ((dec := v.to_decimal()) == dec.to_integral_value()):
+        return int(dec)
+    raise ExpressionError(
+        f"'{name}' must evaluate to an integer, found {_nelem_render(v)}", code=40515
+    )
+
+
+def _dfp_components(
+    arg: Mapping[str, Any], ctx: _Ctx, spec: tuple[tuple[str, int | None], ...]
+) -> dict[str, int] | None:
+    """Evaluate the named `$dateFromParts` components, applying defaults and
+    mongod's null-propagation (any null component → ``None``) and integral
+    validation (``_dfp_int``)."""
+    parts: dict[str, int] = {}
+    for name, default in spec:
+        if name in arg:
+            v = _eval(arg[name], ctx)
+            if v is None:
+                return None  # null component -> null result
+            parts[name] = _dfp_int(name, v)
+        else:
+            parts[name] = default  # type: ignore[assignment]
+    return parts
+
+
+def _dfp_calendar(arg: Mapping[str, Any], ctx: _Ctx) -> _dt.datetime | None:
+    """Calendar (year/month/day) form of ``$dateFromParts`` — month carry, then
+    day/time as a `timedelta` so out-of-range components roll over."""
+    parts = _dfp_components(
+        arg,
+        ctx,
+        (
+            ("year", None),
+            ("month", 1),
+            ("day", 1),
+            ("hour", 0),
+            ("minute", 0),
+            ("second", 0),
+            ("millisecond", 0),
+        ),
+    )
+    if parts is None:
+        return None
+    year = parts["year"]
+    if not (1 <= year <= 9999):
+        raise ExpressionError(f"'year' must be in the range 1 to 9999, found {year}", code=40523)
+    total_months = year * 12 + (parts["month"] - 1)
+    base_year, base_month0 = divmod(total_months, 12)
+    if not (1 <= base_year <= 9999):
+        raise ExpressionError(
+            f"'year' must be in the range 1 to 9999, found {base_year}", code=40523
+        )
+    return _dt.datetime(base_year, base_month0 + 1, 1) + _dt.timedelta(
+        days=parts["day"] - 1,
+        hours=parts["hour"],
+        minutes=parts["minute"],
+        seconds=parts["second"],
+        milliseconds=parts["millisecond"],
+    )
+
+
+def _dfp_iso(arg: Mapping[str, Any], ctx: _Ctx) -> _dt.datetime | None:
+    """ISO-week (isoWeekYear/isoWeek/isoDayOfWeek) form of ``$dateFromParts``:
+    start at the Monday of ISO week 1, then add (week-1) weeks + (day-1) days +
+    the time components as a `timedelta` (so `isoWeek` 53 rolls into the next
+    ISO year, exactly as mongod does)."""
+    if "isoWeekYear" not in arg:
+        raise ExpressionError(
+            "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
+            code=40516,
+        )
+    parts = _dfp_components(
+        arg,
+        ctx,
+        (
+            ("isoWeekYear", None),
+            ("isoWeek", 1),
+            ("isoDayOfWeek", 1),
+            ("hour", 0),
+            ("minute", 0),
+            ("second", 0),
+            ("millisecond", 0),
+        ),
+    )
+    if parts is None:
+        return None
+    try:
+        base = _dt.datetime.fromisocalendar(parts["isoWeekYear"], 1, 1)
+    except ValueError as exc:
+        raise ExpressionError(
+            f"'isoWeekYear' must be in the range 1 to 9999, found {parts['isoWeekYear']}",
+            code=40523,
+        ) from exc
+    return base + _dt.timedelta(
+        weeks=parts["isoWeek"] - 1,
+        days=parts["isoDayOfWeek"] - 1,
+        hours=parts["hour"],
+        minutes=parts["minute"],
+        seconds=parts["second"],
+        milliseconds=parts["millisecond"],
+    )
+
+
+def _op_ts_second(arg: Any, ctx: _Ctx) -> Any:
+    """``$tsSecond``: the seconds field of a BSON Timestamp (as a long). Null /
+    missing → null; a non-timestamp raises ``Location5687301``."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if not isinstance(v, bson.Timestamp):
+        raise ExpressionError("Argument to $tsSecond must be a timestamp", code=5687301)
+    return Int64(v.time)
+
+
+def _op_ts_increment(arg: Any, ctx: _Ctx) -> Any:
+    """``$tsIncrement``: the increment (ordinal) field of a BSON Timestamp (as a
+    long). Null / missing → null; a non-timestamp raises ``Location5687302``."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if not isinstance(v, bson.Timestamp):
+        raise ExpressionError("Argument to $tsIncrement must be a timestamp", code=5687302)
+    return Int64(v.inc)
+
+
+def _type_name(v: Any) -> str:
+    """The BSON type string mongod's ``$type`` reports."""
+    from bson import Binary, MaxKey, MinKey, ObjectId, Regex, Timestamp
+
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, Int64):
+        return "long"
+    if isinstance(v, int):
+        return "int" if -(2**31) <= v < 2**31 else "long"
+    if isinstance(v, float):
+        return "double"
+    if isinstance(v, Decimal128):
+        return "decimal"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, (bytes, Binary)):
+        return "binData"
+    if isinstance(v, ObjectId):
+        return "objectId"
+    if isinstance(v, _dt.datetime):
+        return "date"
+    if isinstance(v, Timestamp):
+        return "timestamp"
+    if isinstance(v, Regex):
+        return "regex"
+    if isinstance(v, MinKey):
+        return "minKey"
+    if isinstance(v, MaxKey):
+        return "maxKey"
+    if isinstance(v, list):
+        return "array"
+    return "object"
+
+
+_TYPE_MISSING = object()
+
+
+def _op_type(arg: Any, ctx: _Ctx) -> Any:
+    """``$type``: the BSON type string of the argument. A field path that doesn't
+    exist yields ``"missing"`` (mongod distinguishes an absent field from an
+    explicit null)."""
+    if (
+        isinstance(arg, str)
+        and arg.startswith("$")
+        and not arg.startswith("$$")
+        and get_path(dict(ctx.doc), arg[1:], default=_TYPE_MISSING) is _TYPE_MISSING
+    ):
+        return "missing"
+    return _type_name(_eval(arg, ctx))
+
+
+def _op_is_number(arg: Any, ctx: _Ctx) -> bool:
+    """``$isNumber``: true for int / long / double / decimal (not bool)."""
+    v = _eval(arg, ctx)
+    return isinstance(v, (int, float, Decimal128)) and not isinstance(v, bool)
+
+
+def _op_is_array(arg: Any, ctx: _Ctx) -> bool:
+    """``$isArray``: true iff the argument is an array."""
+    return isinstance(_eval(arg, ctx), list)
+
+
+def _op_strcasecmp(arg: Any, ctx: _Ctx) -> int:
+    """``$strcasecmp``: case-insensitive comparison of two strings → -1 / 0 / 1.
+    A null / missing operand is treated as the empty string."""
+    vals = _eval_args(arg, ctx)
+    if len(vals) != 2:
+        raise ExpressionError("$strcasecmp requires two arguments")
+    a, b = ("" if vals[0] is None else vals[0]), ("" if vals[1] is None else vals[1])
+    if not isinstance(a, str) or not isinstance(b, str):
+        raise ExpressionError("$strcasecmp requires string operands")
+    au, bu = a.upper(), b.upper()
+    return -1 if au < bu else (1 if au > bu else 0)
+
+
+def _op_replace(arg: Any, ctx: _Ctx, *, count: int) -> Any:
+    """``$replaceOne`` (count 1) / ``$replaceAll`` (count -1): replace occurrence(s)
+    of ``find`` in ``input`` with ``replacement``. Any null input/find/replacement
+    → null; a non-string one raises ``Location51745``."""
+    op = "$replaceOne" if count == 1 else "$replaceAll"
+    if not isinstance(arg, Mapping) or not {"input", "find", "replacement"} <= set(arg):
+        raise ExpressionError(f"{op} requires 'input', 'find' and 'replacement'")
+    inp = _eval(arg["input"], ctx)
+    find = _eval(arg["find"], ctx)
+    rep = _eval(arg["replacement"], ctx)
+    if inp is None or find is None or rep is None:
+        return None
+    for v, name in ((inp, "input"), (find, "find"), (rep, "replacement")):
+        if not isinstance(v, str):
+            raise ExpressionError(f"{op} requires that '{name}' be a string", code=51745)
+    return inp.replace(find, rep) if count == -1 else inp.replace(find, rep, 1)
+
+
+def _op_replace_one(arg: Any, ctx: _Ctx) -> Any:
+    return _op_replace(arg, ctx, count=1)
+
+
+def _op_replace_all(arg: Any, ctx: _Ctx) -> Any:
+    return _op_replace(arg, ctx, count=-1)
+
+
+def _op_date_from_parts(arg: Any, ctx: _Ctx) -> Any:
+    """``$dateFromParts``: build a date from calendar components. Components default
+    to month/day = 1 and hour/minute/second/millisecond = 0; out-of-range values
+    roll over (month 13 -> next January, day 0 -> last day of the previous month,
+    etc.) exactly as mongod does. Any null component yields null. ``year`` is
+    required (1-9999); a non-integral component is ``Location40515``, a missing
+    ``year`` is ``Location40516``, an out-of-range ``year`` is ``Location40523``.
+    A ``timezone`` interprets the components as local time in that zone
+    (local->instant). Two forms: the calendar form above and the **ISO-week** form
+    (``isoWeekYear`` + optional ``isoWeek`` / ``isoDayOfWeek``, both defaulting to
+    1). Verified against mongod 6.0 via a three-way probe."""
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateFromParts requires a document spec")
+    is_iso = "isoWeekYear" in arg or "isoWeek" in arg or "isoDayOfWeek" in arg
+    if is_iso:
+        result = _dfp_iso(arg, ctx)
+        if result is None:
+            return None
+    else:
+        if "year" not in arg:
+            raise ExpressionError(
+                "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
+                code=40516,
+            )
+        result = _dfp_calendar(arg, ctx)
+        if result is None:
+            return None
+    tz = _resolve_timezone(arg.get("timezone"))
+    if tz is not None:
+        # The components are local time in `tz`; convert to the UTC instant.
+        result = result.replace(tzinfo=tz).astimezone(_dt.timezone.utc).replace(tzinfo=None)
+    return result
 
 
 def _op_date_diff(arg: Any, ctx: _Ctx) -> Any:
@@ -1115,39 +1516,123 @@ def _ensure_datetime(value: Any) -> _dt.datetime | None:
     return None
 
 
+def _coerce_extractor_date(value: Any) -> _dt.datetime | None:
+    """A date-extractor operand (`$year`/`$dayOfYear`/…) must be a Date, null, or a
+    missing field. mongod raises ``Location16006`` on any other present value (a
+    string, a number, …); null / missing yield null."""
+    if isinstance(value, _dt.datetime):
+        return value
+    if value is None:
+        return None
+    raise ExpressionError(f"can't convert from BSON type {_type_name(value)} to Date", code=16006)
+
+
+def _date_operand(arg: Any, ctx: _Ctx) -> _dt.datetime | None:
+    """Resolve a date-extractor operand (`$year`/`$hour`/…) to a `datetime` or
+    `None`. mongod accepts two forms:
+
+      * a bare date expression (`"$field"`, `{$dateFromParts: …}`, …), or
+      * a `{date: <expr>, timezone: <expr>}` object that shifts the instant into a
+        timezone before the component is read.
+
+    The object form is detected as a document carrying a ``date`` key that is not
+    itself an operator expression (`{$op: …}`). A `timezone` (fixed-offset or named
+    IANA zone) re-expresses the instant in that zone (naive input treated as UTC,
+    matching BSON Date semantics) so the returned `datetime`'s wall-clock fields are
+    local — exactly like `$dateToString`'s `timezone`. Absent/`None` timezone leaves
+    the instant in UTC."""
+    if (
+        isinstance(arg, Mapping)
+        and "date" in arg
+        and not (len(arg) == 1 and next(iter(arg)).startswith("$"))
+    ):
+        d = _coerce_extractor_date(_eval(arg["date"], ctx))
+        if d is None:
+            return None
+        tz = _resolve_timezone(arg.get("timezone"))
+        if tz is not None:
+            d_aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
+            d = d_aware.astimezone(tz)
+        return d
+    return _coerce_extractor_date(_eval(arg, ctx))
+
+
 def _op_year(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.year if d is not None else None
 
 
 def _op_month(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.month if d is not None else None
 
 
 def _op_day_of_month(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.day if d is not None else None
 
 
 def _op_day_of_week(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return (d.isoweekday() % 7) + 1 if d is not None else None
 
 
 def _op_hour(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.hour if d is not None else None
 
 
 def _op_minute(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.minute if d is not None else None
 
 
 def _op_second(arg: Any, ctx: _Ctx) -> Any:
-    d = _ensure_datetime(_eval(arg, ctx))
+    d = _date_operand(arg, ctx)
     return d.second if d is not None else None
+
+
+def _op_millisecond(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.microsecond // 1000 if d is not None else None
+
+
+def _op_day_of_year(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.timetuple().tm_yday if d is not None else None
+
+
+def _us_week(d: _dt.datetime) -> int:
+    """US week number (mongod ``$week``): weeks start Sunday, 0-53; week 0 is the
+    days before the year's first Sunday. Equivalent to ``%U`` (strftime)."""
+    yday = d.timetuple().tm_yday  # 1-366
+    # Weekday of Jan 1 with Sunday=0 .. Saturday=6.
+    jan1_wday_sun0 = (_dt.date(d.year, 1, 1).weekday() + 1) % 7
+    # Days from Jan 1 to the year's first Sunday (0 if Jan 1 is a Sunday).
+    days_to_first_sunday = (7 - jan1_wday_sun0) % 7
+    if yday <= days_to_first_sunday:
+        return 0
+    return (yday - days_to_first_sunday - 1) // 7 + 1
+
+
+def _op_week(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return _us_week(d) if d is not None else None
+
+
+def _op_iso_week(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.isocalendar()[1] if d is not None else None
+
+
+def _op_iso_day_of_week(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.isocalendar()[2] if d is not None else None
+
+
+def _op_iso_week_year(arg: Any, ctx: _Ctx) -> Any:
+    d = _date_operand(arg, ctx)
+    return d.isocalendar()[0] if d is not None else None
 
 
 def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
@@ -1160,7 +1645,12 @@ def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
     if name is None:
         return None
     if not isinstance(name, str):
-        raise ExpressionError(f"timezone must be a string, got {type(name).__name__}")
+        # mongod: Location40517 "timezone must evaluate to a string, found <type>"
+        # (verified via a three-way probe against mongod 6.0).
+        raise ExpressionError(
+            f"timezone must evaluate to a string, found {_bson_type_name(name)}",
+            code=40517,
+        )
     if name in ("UTC", "GMT", "Etc/UTC", "Etc/GMT"):
         return _dt.timezone.utc
     if name and name[0] in ("+", "-"):
@@ -1170,11 +1660,12 @@ def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
             hours = int(digits[:2])
             minutes = int(digits[2:])
             return _dt.timezone(sign * _dt.timedelta(hours=hours, minutes=minutes))
-        raise ExpressionError(f"unknown timezone: {name!r}")
+        raise ExpressionError(f'unrecognized time zone identifier: "{name}"', code=40485)
     try:
         return zoneinfo.ZoneInfo(name)
     except zoneinfo.ZoneInfoNotFoundError as exc:
-        raise ExpressionError(f"unknown timezone: {name!r}") from exc
+        # mongod: Location40485 "unrecognized time zone identifier: \"<name>\""
+        raise ExpressionError(f'unrecognized time zone identifier: "{name}"', code=40485) from exc
 
 
 def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
@@ -1255,6 +1746,105 @@ def _op_first(arg: Any, ctx: _Ctx) -> Any:
 def _op_last(arg: Any, ctx: _Ctx) -> Any:
     arr = _eval(arg, ctx)
     return arr[-1] if isinstance(arr, list) and arr else None
+
+
+def _nelem_render(v: Any) -> str:
+    """Render a value the way mongod does in the "found <v>" tail of an ``n``
+    type error — strings are quoted, other scalars stringified."""
+    if isinstance(v, str):
+        return f'"{v}"'
+    return str(v)
+
+
+def nelem_parse_n(n_val: Any) -> int:
+    """Validate an already-evaluated ``n`` for the N-element operators, matching
+    mongod's error codes (verified against mongod 6.0): a non-integral number is
+    ``Location5787903``, a non-numeric is ``Location5787902``, and ``n <= 0`` is
+    ``Location5787908``. An integral double (``2.0``) is accepted. Shared by the
+    expression forms (``_nelem_n_and_input``) and the ``$group`` accumulator forms
+    (``aggregate._acc_nelem``)."""
+    if isinstance(n_val, bool):
+        raise ExpressionError(
+            f"Value for 'n' must be of integral type, but found {_nelem_render(n_val)}",
+            code=5787902,
+        )
+    if isinstance(n_val, int) or (isinstance(n_val, float) and n_val.is_integer()):
+        n = int(n_val)
+    elif isinstance(n_val, Decimal128) and ((dec := n_val.to_decimal()) == dec.to_integral_value()):
+        n = int(dec)
+    elif isinstance(n_val, (float, Decimal128)):
+        raise ExpressionError(
+            f"Value for 'n' must be of integral type, but found {_nelem_render(n_val)}",
+            code=5787903,
+        )
+    else:
+        raise ExpressionError(
+            f"Value for 'n' must be of integral type, but found {_nelem_render(n_val)}",
+            code=5787902,
+        )
+    if n <= 0:
+        raise ExpressionError(f"'n' must be greater than 0, found {n}", code=5787908)
+    return n
+
+
+def _nelem_n_and_input(arg: Any, ctx: _Ctx) -> tuple[int, list[Any]]:
+    """Validate and evaluate the ``{n, input}`` spec shared by ``$firstN`` /
+    ``$lastN`` / ``$maxN`` / ``$minN`` (expression form), matching mongod's error
+    codes exactly (verified against mongod 6.0): a missing ``n`` / ``input`` is
+    ``Location5787906`` / ``Location5787907``; ``n`` validation is
+    ``nelem_parse_n``; and a null / missing / non-array ``input`` is
+    ``Location5788200`` — mongod does **not** treat a null input as null here, it
+    raises."""
+    if not isinstance(arg, Mapping) or "n" not in arg:
+        raise ExpressionError("Missing value for 'n'", code=5787906)
+    if "input" not in arg:
+        raise ExpressionError("Missing value for 'input'", code=5787907)
+    n = nelem_parse_n(_eval(arg["n"], ctx))
+    arr = _eval(arg["input"], ctx)
+    if not isinstance(arr, list):
+        raise ExpressionError("Input must be an array", code=5788200)
+    return n, arr
+
+
+def _first_last_n(arg: Any, ctx: _Ctx, *, first: bool) -> Any:
+    """``$firstN`` / ``$lastN`` (expression form): the first / last ``n`` elements
+    of an array. When the array has fewer than ``n`` elements the whole array is
+    returned. Validation (``n`` / ``input``) matches mongod — see
+    ``_nelem_n_and_input``."""
+    n, arr = _nelem_n_and_input(arg, ctx)
+    return arr[:n] if first else arr[-n:]
+
+
+def _op_first_n(arg: Any, ctx: _Ctx) -> Any:
+    return _first_last_n(arg, ctx, first=True)
+
+
+def _op_last_n(arg: Any, ctx: _Ctx) -> Any:
+    return _first_last_n(arg, ctx, first=False)
+
+
+def _max_min_n(arg: Any, ctx: _Ctx, *, largest: bool) -> Any:
+    """``$maxN`` / ``$minN`` (expression form): the ``n`` largest / smallest
+    elements of an array, by MongoDB's cross-type BSON order. Null (and missing)
+    *elements* are ignored (mongod does not consider them); the result is in
+    descending order for ``$maxN`` and ascending for ``$minN``. Fewer than ``n``
+    non-null values returns all of them. Validation matches mongod — see
+    ``_nelem_n_and_input`` (a null / non-array ``input`` raises, unlike the
+    elements)."""
+    n, arr = _nelem_n_and_input(arg, ctx)
+    from secantus.ordering import _SortKey
+
+    non_null = [x for x in arr if x is not None]
+    non_null.sort(key=_SortKey, reverse=largest)
+    return non_null[:n]
+
+
+def _op_max_n(arg: Any, ctx: _Ctx) -> Any:
+    return _max_min_n(arg, ctx, largest=True)
+
+
+def _op_min_n(arg: Any, ctx: _Ctx) -> Any:
+    return _max_min_n(arg, ctx, largest=False)
 
 
 def _op_slice(arg: Any, ctx: _Ctx) -> Any:
@@ -1498,6 +2088,19 @@ def _op_to_decimal(arg: Any, ctx: _Ctx) -> Any:
     raise ExpressionError(f"$toDecimal cannot convert {type(value).__name__}")
 
 
+def _op_to_date(arg: Any, ctx: _Ctx) -> Any:
+    # ``$toDate: <expr>`` is exactly ``$convert: {input: <expr>, to: "date"}``.
+    # Delegate to the same conversion path so the two stay identical (same
+    # supported input types, same errors). null / missing -> null.
+    value = _eval(arg, ctx)
+    if value is None:
+        return None
+    try:
+        return _convert_value(value, "date")
+    except (ValueError, TypeError, InvalidOperation, ExpressionError) as exc:
+        raise ExpressionError(f"$toDate cannot convert {type(value).__name__}") from exc
+
+
 def _op_filter(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$filter requires a document spec")
@@ -1542,6 +2145,213 @@ def _op_reduce(arg: Any, ctx: _Ctx) -> Any:
     return accumulator
 
 
+def _set_eq(a: Any, b: Any) -> bool:
+    """Two values are the same set element iff neither sorts before the other in
+    BSON order (so ``1`` == ``1.0`` but ``1`` != ``true``, matching mongod's set
+    semantics)."""
+    from secantus.ordering import _bson_lt
+
+    return not _bson_lt(a, b) and not _bson_lt(b, a)
+
+
+def _set_dedup_sorted(items: list[Any]) -> list[Any]:
+    """Deduplicate (by BSON-order equality) and sort by BSON order — the shape
+    mongod returns from ``$setUnion`` / ``$setIntersection``."""
+    from secantus.ordering import _SortKey
+
+    out: list[Any] = []
+    for x in sorted(items, key=_SortKey):
+        if not out or not _set_eq(out[-1], x):
+            out.append(x)
+    return out
+
+
+def _set_arrays(op: str, arg: Any, ctx: _Ctx, *, n: int | None = None) -> list[list[Any]]:
+    """Evaluate a set operator's array arguments, validating each is an array."""
+    vals = _eval_args(arg, ctx)
+    if n is not None and len(vals) != n:
+        raise ExpressionError(f"{op} requires {n} arguments")
+    for v in vals:
+        if not isinstance(v, list):
+            raise ExpressionError(f"{op} requires array arguments")
+    return vals
+
+
+def _op_set_union(arg: Any, ctx: _Ctx) -> list[Any]:
+    all_elems: list[Any] = []
+    for v in _set_arrays("$setUnion", arg, ctx):
+        all_elems.extend(v)
+    return _set_dedup_sorted(all_elems)
+
+
+def _op_set_intersection(arg: Any, ctx: _Ctx) -> list[Any]:
+    arrays = _set_arrays("$setIntersection", arg, ctx)
+    if not arrays:
+        return []
+    result = [
+        x for x in arrays[0] if all(any(_set_eq(x, y) for y in other) for other in arrays[1:])
+    ]
+    return _set_dedup_sorted(result)
+
+
+def _op_set_difference(arg: Any, ctx: _Ctx) -> list[Any]:
+    a, b = _set_arrays("$setDifference", arg, ctx, n=2)
+    out: list[Any] = []
+    for x in a:  # first-array order, deduplicated
+        if not any(_set_eq(x, y) for y in b) and not any(_set_eq(x, y) for y in out):
+            out.append(x)
+    return out
+
+
+def _op_set_equals(arg: Any, ctx: _Ctx) -> bool:
+    arrays = _set_arrays("$setEquals", arg, ctx)
+    base = _set_dedup_sorted(arrays[0]) if arrays else []
+    for other in arrays[1:]:
+        o = _set_dedup_sorted(other)
+        if len(o) != len(base) or any(not _set_eq(base[i], o[i]) for i in range(len(base))):
+            return False
+    return True
+
+
+def _op_set_is_subset(arg: Any, ctx: _Ctx) -> bool:
+    a, b = _set_arrays("$setIsSubset", arg, ctx, n=2)
+    return all(any(_set_eq(x, y) for y in b) for x in a)
+
+
+def _op_all_elements_true(arg: Any, ctx: _Ctx) -> bool:
+    arr = _eval_args(arg, ctx)[0]
+    if not isinstance(arr, list):
+        raise ExpressionError("$allElementsTrue requires an array")
+    return all(_bool(x) for x in arr)
+
+
+def _op_any_element_true(arg: Any, ctx: _Ctx) -> bool:
+    arr = _eval_args(arg, ctx)[0]
+    if not isinstance(arr, list):
+        raise ExpressionError("$anyElementTrue requires an array")
+    return any(_bool(x) for x in arr)
+
+
+def _op_cmp(arg: Any, ctx: _Ctx) -> int:
+    """``$cmp``: three-way comparison of two values by BSON order → -1 / 0 / 1."""
+    from secantus.ordering import _bson_lt
+
+    a, b = _eval_args(arg, ctx)
+    if _bson_lt(a, b):
+        return -1
+    return 1 if _bson_lt(b, a) else 0
+
+
+def _op_binary_size(arg: Any, ctx: _Ctx) -> Any:
+    """``$binarySize``: byte length of a string (UTF-8) or binary value. Null /
+    missing → null."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return len(v.encode("utf-8"))
+    if isinstance(v, (bytes, bson.Binary)):
+        return len(v)
+    raise ExpressionError("$binarySize requires a string or binData")
+
+
+def _op_bson_size(arg: Any, ctx: _Ctx) -> Any:
+    """``$bsonSize``: the BSON-encoded byte size of a document. Null → null."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if not isinstance(v, Mapping):
+        raise ExpressionError("$bsonSize requires a document")
+    return len(bson.encode(dict(v)))
+
+
+def _op_degrees_to_radians(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
+        raise ExpressionError("$degreesToRadians requires a number")
+    x = float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+    return x * math.pi / 180.0
+
+
+def _op_radians_to_degrees(arg: Any, ctx: _Ctx) -> Any:
+    import math
+
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
+        raise ExpressionError("$radiansToDegrees requires a number")
+    x = float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+    return x * 180.0 / math.pi
+
+
+def _bit_operand(op: str, v: Any) -> tuple[int, bool]:
+    """Coerce a ``$bit*`` operand to ``(value, is_long)``. mongod's bitwise
+    operators accept only int (32-bit) and long (64-bit) — a bool, double,
+    decimal, or anything else raises. ``bson.Int64`` marks a long; a plain ``int``
+    is a 32-bit int (``bson`` widens on encode only when out of int32 range)."""
+    if isinstance(v, bool):
+        raise ExpressionError(f"{op} only supports int and long operands, not bool")
+    if isinstance(v, Int64):
+        return int(v), True
+    if isinstance(v, int):
+        return v, False
+    raise ExpressionError(f"{op} only supports int and long operands, not {_bson_type_name(v)}")
+
+
+def _bit_result(value: int, is_long: bool) -> Any:
+    """Wrap a bitwise result: ``Int64`` when any operand was long, else a plain
+    ``int`` (encoded as int32 when in range, matching mongod's int result)."""
+    return Int64(value) if is_long else value
+
+
+def _op_bit_fold(op: str, identity: int, arg: Any, ctx: _Ctx) -> Any:
+    """``$bitAnd`` / ``$bitOr`` / ``$bitXor``: fold the (int/long) operands with a
+    bitwise operator. A null / missing operand makes the whole result null; the
+    result is long iff any operand was long; an empty operand list yields the
+    operator's identity (all-ones for and, 0 for or / xor)."""
+    vals = _eval_args(arg, ctx)
+    if any(v is None for v in vals):
+        return None
+    acc = identity
+    is_long = False
+    for v in vals:
+        n, lng = _bit_operand(op, v)
+        is_long = is_long or lng
+        if op == "$bitAnd":
+            acc &= n
+        elif op == "$bitOr":
+            acc |= n
+        else:  # $bitXor
+            acc ^= n
+    return _bit_result(acc, is_long)
+
+
+def _op_bit_and(arg: Any, ctx: _Ctx) -> Any:
+    return _op_bit_fold("$bitAnd", -1, arg, ctx)
+
+
+def _op_bit_or(arg: Any, ctx: _Ctx) -> Any:
+    return _op_bit_fold("$bitOr", 0, arg, ctx)
+
+
+def _op_bit_xor(arg: Any, ctx: _Ctx) -> Any:
+    return _op_bit_fold("$bitXor", 0, arg, ctx)
+
+
+def _op_bit_not(arg: Any, ctx: _Ctx) -> Any:
+    """``$bitNot``: bitwise complement of a single int/long operand (null → null)."""
+    v = _eval(arg, ctx)
+    if v is None:
+        return None
+    n, is_long = _bit_operand("$bitNot", v)
+    return _bit_result(~n, is_long)
+
+
 _OPS = {
     "$concat": _op_concat,
     "$add": _op_add,
@@ -1574,8 +2384,29 @@ _OPS = {
     "$ln": _op_ln,
     "$log": _op_log,
     "$log10": _op_log10,
+    "$sin": _make_trig("$sin", math.sin, "finite"),
+    "$cos": _make_trig("$cos", math.cos, "finite"),
+    "$tan": _make_trig("$tan", math.tan, "finite"),
+    "$asin": _make_trig("$asin", math.asin, "unit"),
+    "$acos": _make_trig("$acos", math.acos, "unit"),
+    "$atan": _make_trig("$atan", math.atan, "any"),
+    "$atan2": _op_atan2,
+    "$sinh": _make_trig("$sinh", math.sinh, "any"),
+    "$cosh": _make_trig("$cosh", math.cosh, "any"),
+    "$tanh": _make_trig("$tanh", math.tanh, "any"),
+    "$asinh": _make_trig("$asinh", math.asinh, "any"),
+    "$acosh": _make_trig("$acosh", math.acosh, "geq1"),
+    "$atanh": _make_trig("$atanh", math.atanh, "atanh"),
     "$rand": _op_rand,
     "$trunc": _op_trunc,
+    "$bitAnd": _op_bit_and,
+    "$bitOr": _op_bit_or,
+    "$bitXor": _op_bit_xor,
+    "$bitNot": _op_bit_not,
+    "$firstN": _op_first_n,
+    "$lastN": _op_last_n,
+    "$maxN": _op_max_n,
+    "$minN": _op_min_n,
     "$mergeObjects": _op_merge_objects,
     "$objectToArray": _op_object_to_array,
     "$setField": _op_set_field,
@@ -1590,6 +2421,15 @@ _OPS = {
     "$dateDiff": _op_date_diff,
     "$dateTrunc": _op_date_trunc,
     "$dateToParts": _op_date_to_parts,
+    "$dateFromParts": _op_date_from_parts,
+    "$tsSecond": _op_ts_second,
+    "$tsIncrement": _op_ts_increment,
+    "$type": _op_type,
+    "$isNumber": _op_is_number,
+    "$isArray": _op_is_array,
+    "$strcasecmp": _op_strcasecmp,
+    "$replaceOne": _op_replace_one,
+    "$replaceAll": _op_replace_all,
     "$split": _op_split,
     "$trim": _op_trim,
     "$ltrim": _op_ltrim,
@@ -1613,6 +2453,12 @@ _OPS = {
     "$hour": _op_hour,
     "$minute": _op_minute,
     "$second": _op_second,
+    "$millisecond": _op_millisecond,
+    "$dayOfYear": _op_day_of_year,
+    "$week": _op_week,
+    "$isoWeek": _op_iso_week,
+    "$isoDayOfWeek": _op_iso_day_of_week,
+    "$isoWeekYear": _op_iso_week_year,
     "$dateToString": _op_date_to_string,
     "$dateFromString": _op_date_from_string,
     "$arrayElemAt": _op_array_elem_at,
@@ -1626,8 +2472,21 @@ _OPS = {
     "$toDouble": _op_to_double,
     "$toBool": _op_to_bool,
     "$toDecimal": _op_to_decimal,
+    "$toDate": _op_to_date,
     "$convert": _op_convert,
     "$filter": _op_filter,
     "$map": _op_map,
     "$reduce": _op_reduce,
+    "$setUnion": _op_set_union,
+    "$setIntersection": _op_set_intersection,
+    "$setDifference": _op_set_difference,
+    "$setEquals": _op_set_equals,
+    "$setIsSubset": _op_set_is_subset,
+    "$allElementsTrue": _op_all_elements_true,
+    "$anyElementTrue": _op_any_element_true,
+    "$cmp": _op_cmp,
+    "$binarySize": _op_binary_size,
+    "$bsonSize": _op_bson_size,
+    "$degreesToRadians": _op_degrees_to_radians,
+    "$radiansToDegrees": _op_radians_to_degrees,
 }

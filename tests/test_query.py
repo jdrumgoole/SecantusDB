@@ -72,6 +72,22 @@ def test_and_or_nor() -> None:
     assert matches(doc, {"$nor": [{"a": 99}, {"b": 99}]})
 
 
+def test_and_or_nor_malformed_raises() -> None:
+    """``$and`` / ``$or`` / ``$nor`` require a non-empty array of sub-documents.
+    A non-list, an empty list, or a non-document element is a parse error
+    (``QueryError`` → BadValue 2 on the wire), not a Python ``TypeError`` that
+    leaks out as a generic InternalError."""
+    for op in ("$and", "$or", "$nor"):
+        with pytest.raises(QueryError):
+            matches({"a": 1}, {op: True})
+        with pytest.raises(QueryError):
+            matches({"a": 1}, {op: 5})
+        with pytest.raises(QueryError):
+            matches({"a": 1}, {op: []})
+        with pytest.raises(QueryError):
+            matches({"a": 1}, {op: [True]})
+
+
 def test_not_at_field_level() -> None:
     assert matches({"a": 5}, {"a": {"$not": {"$gt": 10}}})
     assert not matches({"a": 50}, {"a": {"$not": {"$gt": 10}}})
@@ -129,6 +145,28 @@ def test_size() -> None:
 def test_all() -> None:
     assert matches({"tags": ["a", "b", "c"]}, {"tags": {"$all": ["a", "b"]}})
     assert not matches({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}})
+
+
+def test_all_with_elemmatch() -> None:
+    q = {"a": {"$all": [{"$elemMatch": {"$gt": 1, "$lt": 3}}]}}
+    assert matches({"a": [1, 2, 3]}, q)  # 2 is in (1, 3)
+    assert not matches({"a": [4, 5]}, q)
+    # Two clauses: array must have an element for each (may differ).
+    q2 = {"a": {"$all": [{"$elemMatch": {"$gt": 4}}, {"$elemMatch": {"$lt": 2}}]}}
+    assert matches({"a": [1, 5, 10]}, q2)
+    assert not matches({"a": [5, 10]}, q2)  # nothing < 2
+
+
+def test_in_with_regex() -> None:
+    # A regex candidate matches string values by pattern (not by equality).
+    assert matches({"s": "hello"}, {"s": {"$in": [Regex("^h", "i")]}})
+    assert matches({"s": "HELLO"}, {"s": {"$in": [Regex("^h", "i")]}})
+    assert not matches({"s": "world"}, {"s": {"$in": [Regex("^h", "i")]}})
+    # Mixed literal + regex candidates.
+    assert matches({"s": "abc"}, {"s": {"$in": ["x", Regex("^a")]}})
+    # $nin is the negation.
+    assert matches({"s": "world"}, {"s": {"$nin": [Regex("^h")]}})
+    assert not matches({"s": "hello"}, {"s": {"$nin": [Regex("^h")]}})
 
 
 def test_mod() -> None:
@@ -258,6 +296,94 @@ def test_json_schema_enum() -> None:
     assert not matches({"status": "pending"}, {"$jsonSchema": schema})
 
 
+def test_json_schema_unique_items() -> None:
+    schema = {"properties": {"tags": {"bsonType": "array", "uniqueItems": True}}}
+    assert matches({"tags": ["a", "b", "c"]}, {"$jsonSchema": schema})
+    assert matches({"tags": []}, {"$jsonSchema": schema})
+    assert not matches({"tags": ["a", "b", "a"]}, {"$jsonSchema": schema})
+    # cross-type-equal numerics collide (1 == 1.0) at the top level
+    assert not matches({"tags": [1, 1.0]}, {"$jsonSchema": schema})
+    # distinct vs duplicate documents
+    assert matches({"tags": [{"x": 1}, {"x": 2}]}, {"$jsonSchema": schema})
+    assert not matches({"tags": [{"x": 1}, {"x": 1}]}, {"$jsonSchema": schema})
+    # nested cross-type-equal numerics collide ({a: 1} == {a: 1.0})
+    assert not matches({"tags": [{"a": 1}, {"a": 1.0}]}, {"$jsonSchema": schema})
+    assert matches({"tags": [{"a": 1}, {"a": 2}]}, {"$jsonSchema": schema})
+    # and recursively inside sub-arrays
+    assert not matches({"tags": [[1, 2], [1.0, 2.0]]}, {"$jsonSchema": schema})
+    assert matches({"tags": [[1, 2], [1, 3]]}, {"$jsonSchema": schema})
+    # uniqueItems: false is a no-op
+    off = {"properties": {"tags": {"uniqueItems": False}}}
+    assert matches({"tags": [1, 1]}, {"$jsonSchema": off})
+
+
+def test_json_schema_all_of() -> None:
+    schema = {"properties": {"n": {"allOf": [{"bsonType": "int"}, {"minimum": 0}]}}}
+    assert matches({"n": 5}, {"$jsonSchema": schema})
+    assert not matches({"n": -1}, {"$jsonSchema": schema})  # fails minimum
+    assert not matches({"n": 1.5}, {"$jsonSchema": schema})  # fails bsonType
+
+
+def test_json_schema_any_of() -> None:
+    schema = {"properties": {"x": {"anyOf": [{"bsonType": "string"}, {"bsonType": "int"}]}}}
+    assert matches({"x": "s"}, {"$jsonSchema": schema})
+    assert matches({"x": 3}, {"$jsonSchema": schema})
+    assert not matches({"x": 1.5}, {"$jsonSchema": schema})
+
+
+def test_json_schema_one_of() -> None:
+    schema = {"properties": {"n": {"oneOf": [{"bsonType": "int"}, {"bsonType": "string"}]}}}
+    assert matches({"n": 5}, {"$jsonSchema": schema})  # exactly one (int)
+    assert matches({"n": "s"}, {"$jsonSchema": schema})  # exactly one (string)
+    assert not matches({"n": 1.5}, {"$jsonSchema": schema})  # neither -> zero matches
+    # A value satisfying BOTH sub-schemas -> more than one -> fails. (5 is >= 0
+    # and <= 10; a bound-only schema doesn't constrain the other direction.)
+    two = {"properties": {"n": {"oneOf": [{"minimum": 0}, {"maximum": 10}]}}}
+    assert not matches({"n": 5}, {"$jsonSchema": two})
+
+
+def test_json_schema_not() -> None:
+    schema = {"properties": {"x": {"not": {"bsonType": "int"}}}}
+    assert matches({"x": "s"}, {"$jsonSchema": schema})
+    assert not matches({"x": 5}, {"$jsonSchema": schema})
+
+
+def test_json_schema_additional_properties() -> None:
+    false_schema = {"properties": {"a": {}}, "additionalProperties": False}
+    assert matches({"a": 1}, {"$jsonSchema": false_schema})
+    assert not matches({"a": 1, "b": 2}, {"$jsonSchema": false_schema})  # extra `b`
+    # a sub-schema validates each additional property
+    typed = {"properties": {"a": {}}, "additionalProperties": {"bsonType": "string"}}
+    assert matches({"a": 1, "b": "x"}, {"$jsonSchema": typed})
+    assert not matches({"a": 1, "b": 2}, {"$jsonSchema": typed})
+
+
+def test_json_schema_pattern_properties() -> None:
+    schema = {"patternProperties": {"^s_": {"bsonType": "string"}}}
+    assert matches({"s_name": "x", "n": 5}, {"$jsonSchema": schema})  # s_name str, n ignored
+    assert not matches({"s_name": 5}, {"$jsonSchema": schema})  # s_name not a string
+    # a pattern-matched key is not "additional"
+    strict = {
+        "properties": {"id": {}},
+        "patternProperties": {"^s_": {}},
+        "additionalProperties": False,
+    }
+    assert matches({"id": 1, "s_x": 2}, {"$jsonSchema": strict})
+    assert not matches({"id": 1, "other": 2}, {"$jsonSchema": strict})  # `other` is additional
+
+
+def test_json_schema_dependencies() -> None:
+    # property (list) form: if `card` present, `billing` must be too.
+    lst = {"dependencies": {"card": ["billing"]}}
+    assert matches({"card": 1, "billing": 2}, {"$jsonSchema": lst})
+    assert not matches({"card": 1}, {"$jsonSchema": lst})
+    assert matches({"x": 1}, {"$jsonSchema": lst})  # trigger absent -> ok
+    # schema form: if `a` present, the doc must validate against the sub-schema.
+    sch = {"dependencies": {"a": {"required": ["b"], "properties": {"b": {"bsonType": "int"}}}}}
+    assert matches({"a": 1, "b": 2}, {"$jsonSchema": sch})
+    assert not matches({"a": 1, "b": "x"}, {"$jsonSchema": sch})
+
+
 def test_json_schema_array_items() -> None:
     schema = {"properties": {"tags": {"bsonType": "array", "items": {"bsonType": "string"}}}}
     assert matches({"tags": ["a", "b"]}, {"$jsonSchema": schema})
@@ -330,3 +456,21 @@ def test_embedded_document_equality_is_ordered_and_exact() -> None:
     arr = {"s": {"a": [1, 2], "b": 3}}
     assert matches(arr, {"s": {"a": [1, 2], "b": 3}})
     assert not matches(arr, {"s": {"a": [2, 1], "b": 3}})
+
+
+def test_datetime_naive_aware_equality_same_instant():
+    # A BSON date decodes tz-naive UTC; a SQL timestamptz literal arrives tz-aware
+    # UTC. Bare equality must match the same instant across the naive/aware boundary
+    # (naive is treated as UTC, matching pymongo's BSON encoding). #142
+    import datetime as dt
+
+    naive = dt.datetime(2020, 1, 2, 3, 4, 5)
+    aware = dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+    assert matches({"at": naive}, {"at": aware})
+    assert matches({"at": aware}, {"at": naive})
+    assert matches({"at": naive}, {"at": {"$eq": aware}})
+    assert matches({"at": naive}, {"at": {"$in": [aware]}})
+    assert not matches({"at": naive}, {"at": {"$ne": aware}})
+    # A different instant (offset shifts it) must NOT match.
+    other = dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone(dt.timedelta(hours=2)))
+    assert not matches({"at": naive}, {"at": other})

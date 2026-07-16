@@ -43,6 +43,53 @@ pub fn whatsmyuri(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "you": "127.0.0.1:0", "ok": 1.0 })
 }
 
+/// `fsync` — flush data to disk. WiredTiger checkpoints on its own cadence, so
+/// this reports success without forcing one. `lock: true` (which would block
+/// writes until `fsyncUnlock` — needs coordination we don't have) is rejected
+/// rather than silently skipped, so backup tools relying on the lock aren't
+/// misled. Mirrors `commands.py::_fsync`.
+pub fn fsync(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    if doc.get("lock").and_then(Bson::as_bool) == Some(true) {
+        return Ok(crate::CommandError::new(
+            9,
+            "FailedToParse",
+            "fsync with lock:true is not supported by SecantusDB",
+        )
+        .into_reply());
+    }
+    Ok(doc! { "numFiles": 1i32, "ok": 1.0 })
+}
+
+/// `killOp` — close a client connection by its `op` (our per-connection
+/// `conn_id`; we model one in-flight op per connection, so the opid a caller
+/// reads off `hello`'s `connectionId` / `currentOp` is directly killable). Real
+/// mongod signals a per-op interrupt flag long-running paths poll; SecantusDB's
+/// faithful analogue is "close the socket" — the connection thread's next read
+/// returns 0, the loop exits, and the connection unregisters. The opid is
+/// accepted as Int32 / Int64 / an integral Double / a numeric string (drivers
+/// serialise it differently). Mirrors `commands.py::_kill_op`.
+pub fn kill_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let op_id: i64 = match doc.get("op") {
+        Some(Bson::Int32(n)) => i64::from(*n),
+        Some(Bson::Int64(n)) => *n,
+        Some(Bson::Double(d)) if d.fract() == 0.0 => *d as i64,
+        Some(Bson::String(s)) if s.parse::<i64>().is_ok() => s.parse::<i64>().unwrap(),
+        other => {
+            return Err(crate::CommandError::new(
+                14,
+                "TypeMismatch",
+                format!("killOp requires an integer `op` field, got {other:?}"),
+            ));
+        }
+    };
+    let info = match &ctx.conn_killer {
+        None => "no connection registry",
+        Some(killer) if killer.kill(op_id) => "operation killed",
+        Some(_) => "no operation with that opid",
+    };
+    Ok(doc! { "info": info, "ok": 1.0 })
+}
+
 /// `connectionStatus` — auth info for the connection (empty until R5 auth).
 pub fn connection_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! {
@@ -86,9 +133,28 @@ pub fn host_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     })
 }
 
-/// `getLog` — the in-memory log buffer (empty; no log buffer yet).
-pub fn get_log(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    Ok(doc! { "totalLinesWritten": 0_i32, "log": Vec::<Bson>::new(), "ok": 1.0 })
+/// `getLog` — the server's in-memory log ring buffer. mongod returns the log as
+/// a list of pre-formatted strings (`"<ts> <level> <component> <msg>"`); we
+/// mirror that format so tooling that grep-parses the response keeps working.
+/// Without a buffer wired in (unit tests), reports an empty log. Mirrors
+/// `commands.py::_get_log`.
+pub fn get_log(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let Some(logs) = &ctx.logs else {
+        return Ok(doc! { "totalLinesWritten": 0_i32, "log": Vec::<Bson>::new(), "ok": 1.0 });
+    };
+    let entries = logs.tail(None);
+    let formatted: Vec<Bson> = entries
+        .iter()
+        .map(|e| {
+            let ts = e.ts.try_to_rfc3339_string().unwrap_or_default();
+            Bson::String(format!("{ts} {} {} {}", e.level, e.component, e.msg))
+        })
+        .collect();
+    Ok(doc! {
+        "totalLinesWritten": entries.len() as i32,
+        "log": formatted,
+        "ok": 1.0,
+    })
 }
 
 /// `getParameter` — a minimal set of well-known server parameters.
@@ -154,6 +220,97 @@ mod tests {
             }
             other => panic!("expected UUID binary, got {other:?}"),
         }
+    }
+
+    /// A `ConnectionKiller` that records the ids it was asked to kill and reports
+    /// a fixed found/not-found result.
+    struct FakeKiller {
+        found: bool,
+        killed: std::sync::Mutex<Vec<i64>>,
+    }
+    impl crate::ConnectionKiller for FakeKiller {
+        fn kill(&self, conn_id: i64) -> bool {
+            self.killed.lock().unwrap().push(conn_id);
+            self.found
+        }
+    }
+
+    #[test]
+    fn kill_op_without_registry_reports_no_registry() {
+        let reply = dispatch(&doc! {"killOp": 1, "op": 7_i32}, &mut ctx());
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(reply.get_str("info").unwrap(), "no connection registry");
+    }
+
+    #[test]
+    fn kill_op_kills_a_known_connection() {
+        let killer = std::sync::Arc::new(FakeKiller {
+            found: true,
+            killed: Default::default(),
+        });
+        let mut c = ctx().with_conn_killer(killer.clone());
+        let reply = dispatch(&doc! {"killOp": 1, "op": 42_i64}, &mut c);
+        assert_eq!(reply.get_str("info").unwrap(), "operation killed");
+        assert_eq!(*killer.killed.lock().unwrap(), vec![42]);
+    }
+
+    #[test]
+    fn kill_op_unknown_opid_reports_no_operation() {
+        let killer = std::sync::Arc::new(FakeKiller {
+            found: false,
+            killed: Default::default(),
+        });
+        let mut c = ctx().with_conn_killer(killer);
+        let reply = dispatch(&doc! {"killOp": 1, "op": 99_i32}, &mut c);
+        assert_eq!(
+            reply.get_str("info").unwrap(),
+            "no operation with that opid"
+        );
+    }
+
+    #[test]
+    fn kill_op_accepts_a_numeric_string_op() {
+        let killer = std::sync::Arc::new(FakeKiller {
+            found: true,
+            killed: Default::default(),
+        });
+        let mut c = ctx().with_conn_killer(killer.clone());
+        let reply = dispatch(&doc! {"killOp": 1, "op": "7"}, &mut c);
+        assert_eq!(reply.get_str("info").unwrap(), "operation killed");
+        assert_eq!(*killer.killed.lock().unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn kill_op_non_integer_op_is_type_mismatch() {
+        let reply = dispatch(&doc! {"killOp": 1, "op": "not-an-int"}, &mut ctx());
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 14);
+        assert_eq!(reply.get_str("codeName").unwrap(), "TypeMismatch");
+    }
+
+    #[test]
+    fn get_log_without_buffer_is_empty() {
+        let reply = dispatch(&doc! {"getLog": "global"}, &mut ctx());
+        assert_eq!(reply.get_i32("totalLinesWritten").unwrap(), 0);
+        assert_eq!(reply.get_array("log").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn get_log_returns_buffered_lines_formatted() {
+        let logs = std::sync::Arc::new(crate::logbuf::LogBuffer::new());
+        logs.append("I", "NETWORK", "connection accepted #1");
+        logs.append("I", "CONTROL", "started");
+        let mut c = ctx().with_logs(logs);
+        let reply = dispatch(&doc! {"getLog": "global"}, &mut c);
+        assert_eq!(reply.get_i32("totalLinesWritten").unwrap(), 2);
+        let log = reply.get_array("log").unwrap();
+        assert_eq!(log.len(), 2);
+        // Format is "<ts> <level> <component> <msg>".
+        let line0 = log[0].as_str().unwrap();
+        assert!(
+            line0.contains("I NETWORK connection accepted #1"),
+            "unexpected log line: {line0}"
+        );
     }
 
     #[test]

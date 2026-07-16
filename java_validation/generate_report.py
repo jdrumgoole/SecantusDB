@@ -99,8 +99,13 @@ def render(xml_dir: Path, out_path: Path) -> None:
     grand_ran = totals["passed"] + totals["failed"]
     grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
 
+    rust = "-rust-server" in out_path.name
     md: list[str] = []
-    md.append("# mongo-java-driver Validation Report")
+    md.append(
+        "# mongo-java-driver Validation Report (Rust server)"
+        if rust
+        else "# mongo-java-driver Validation Report"
+    )
     md.append("")
     md.append(
         f"Generated {dt.date.today().isoformat()} — SecantusDB "
@@ -108,12 +113,22 @@ def render(xml_dir: Path, out_path: Path) -> None:
         f"{_read_driver_version()[:12]} (`vendor/mongo-java-driver/`)."
     )
     md.append("")
-    md.append(
-        "Run `uv run python -m invoke validate-java` to refresh. The pass "
-        "rate is the analogue of the pymongo / mongo-go-driver / "
-        "mongo-node-driver gauges for the official Java driver — the "
-        "language enterprise MongoDB consumers most often use."
-    )
+    if rust:
+        md.append(
+            "Run `uv run python -m invoke validate-java --server rust` to "
+            "refresh. The same unmodified suite as "
+            "`docs/validation-report-java.md`, pointed at the standalone "
+            "**Rust server** (`secantusd-rs`) instead of the Python one — "
+            "the gap between the two reports is part of the Rust server's "
+            "remaining to-do list."
+        )
+    else:
+        md.append(
+            "Run `uv run python -m invoke validate-java` to refresh. The pass "
+            "rate is the analogue of the pymongo / mongo-go-driver / "
+            "mongo-node-driver gauges for the official Java driver — the "
+            "language enterprise MongoDB consumers most often use."
+        )
     md.append("")
     md.append("## Scope")
     md.append("")
@@ -180,6 +195,14 @@ def render(xml_dir: Path, out_path: Path) -> None:
         "non-RS deployments."
     )
     md.append("")
+    if rust:
+        md.append(
+            "In `--server rust` mode the same two-phase spawn runs the "
+            "standalone `secantusd-rs` binary (via `gauge_common.for_server`, "
+            "same flags) instead of `python -m secantus`, so the numbers "
+            "above measure the Rust server."
+        )
+        md.append("")
     md.append(
         "These are **integration specs** under "
         "`driver-sync/src/test/functional/` — every test opens a real "

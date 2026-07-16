@@ -13,6 +13,7 @@ enough to justify its own module.
 from __future__ import annotations
 
 import datetime as _dt
+import re
 from typing import Any
 
 from bson import json_util
@@ -105,6 +106,28 @@ def logs_partial(request: Request) -> HTMLResponse:
 # ---- geo viewer ------------------------------------------------------------
 
 
+# JSON characters dangerous to drop raw into an inline <script> block: a
+# string `_id` containing `</script>` would close the block and inject JS
+# (stored XSS, with access to pywebview's js_api). Escaping to \uXXXX keeps
+# the value valid JSON (the browser decodes it back) while a literal
+# `</script>` / `<!--` can never appear in the page source. U+2028 / U+2029
+# are valid in JSON but are JS line terminators, so they're escaped too.
+_SCRIPT_JSON_ESCAPES = {
+    "<": "\\u003c",
+    ">": "\\u003e",
+    "&": "\\u0026",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
+}
+_SCRIPT_JSON_RE = re.compile("[<>&\u2028\u2029]")
+
+
+def _json_for_script(value: Any) -> str:
+    """``json_util.dumps`` then escape characters unsafe in an inline
+    ``<script>`` so document data can't break out of the block (XSS)."""
+    return _SCRIPT_JSON_RE.sub(lambda m: _SCRIPT_JSON_ESCAPES[m.group()], json_util.dumps(value))
+
+
 def _extract_features(docs: list[dict[str, Any]], geo_field: str) -> list[dict[str, Any]]:
     """Pluck GeoJSON-ish geometry values from each doc, ignoring misses.
 
@@ -152,7 +175,7 @@ def geo_page(request: Request, db: str, coll: str) -> HTMLResponse:
         if geo_field is not None:
             docs = request.app.state.mongo.sample_collection(db, coll, size=sample_size)
             features = _extract_features(docs, geo_field)
-            features_json = json_util.dumps(features)
+            features_json = _json_for_script(features)
     except MongoError as exc:
         error = str(exc)
     templates = _templates(request)

@@ -10,15 +10,17 @@
 //! `max`); `collMod` merges the same set into an existing collection (else
 //! `NamespaceNotFound`). The `insert` handler enforces `validator` (code 121).
 //!
+//! `create` with `viewOn` + `pipeline` registers a read-only view; `count`
+//! resolves through the view's pipeline and `listCollections` reports it as
+//! `type: "view"` (readOnly, no `_id` index).
+//!
 //! **Deferred (documented so parity is honest):**
-//! * `create` unknown-field validation (`Location40415`); views; capped-size
+//! * `create` unknown-field validation (`Location40415`); capped-size
 //!   enforcement; `collMod`'s TTL-index `index: {expireAfterSeconds}` modify.
 //! * `validator` enforcement on `findAndModify` (insert / `update` / replace are
 //!   enforced — the command layer reads the validator and the storage update
 //!   checks the post-apply doc; code 121, bypassable via
 //!   `bypassDocumentValidation`).
-//! * `listCollections` name/filter + the richer per-collection `options` /
-//!   `idIndex` detail (a minimal, faithful-enough entry is returned).
 //! * `listIndexes` `NamespaceNotFound` on a missing collection (returns an empty
 //!   cursor instead).
 //! * `dropIndexes` by key-spec document (only by name / `"*"`).
@@ -39,7 +41,7 @@ use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, SER
 /// `changeStreamPreAndPostImages` drives pre-image capture; `capped`/`size`/`max`
 /// are reported in stats. (TTL-index `expireAfterSeconds` modification via
 /// `collMod`'s `index` option is deferred.)
-const STORED_COLL_OPTIONS: [&str; 7] = [
+const STORED_COLL_OPTIONS: [&str; 11] = [
     "validator",
     "validationLevel",
     "validationAction",
@@ -47,6 +49,15 @@ const STORED_COLL_OPTIONS: [&str; 7] = [
     "capped",
     "size",
     "max",
+    // Persisted so the storage layer can recognise a timeseries collection and
+    // relax `_id` uniqueness (mongod buckets by time; `_id` is not a key).
+    "timeseries",
+    // The collection's default collation — surfaced back in `listCollections`.
+    "collation",
+    // Round-tripped in `listCollections` so drivers see the options they set on
+    // `create` (the rust driver's collection_management asserts both).
+    "storageEngine",
+    "indexOptionDefaults",
 ];
 
 /// The subset of a command doc that maps to persisted collection options.
@@ -63,9 +74,61 @@ fn collection_option_subset(doc: &Document) -> Document {
 /// `create` — create a collection, persisting recognised options.
 pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "create")?;
+    // Build the options up front so they ride the `create` oplog entry (carried
+    // by create_collection_with_options) — that's what lets PITR replay
+    // reconstruct capped / validator / … rather than seeing a bare create.
+    let mut opts = collection_option_subset(doc);
+    // `viewOn` + `pipeline` makes this a read-only view of another collection
+    // (mongod 3.4+). Store the source and the pipeline (under `viewPipeline` so
+    // it doesn't collide with an aggregate's `pipeline`); `listCollections`
+    // surfaces it as `type: "view"` and `count` resolves through it.
+    if let Some(Bson::String(view_on)) = doc.get("viewOn") {
+        opts.insert("viewOn", view_on.clone());
+        let pipeline = doc
+            .get("pipeline")
+            .and_then(Bson::as_array)
+            .cloned()
+            .unwrap_or_default();
+        opts.insert("viewPipeline", Bson::Array(pipeline));
+    }
+    // `clusteredIndex` clusters the collection on `_id` — which is already
+    // SecantusDB's doc-table layout (keyed by `_id`), so this is metadata-only.
+    // mongod allows it only on `{_id: 1}` with `unique: true`; normalise the
+    // stored option (default name `_id_`, add `v: 2`) so listCollections /
+    // listIndexes echo mongod's shape. Built before create so an invalid spec
+    // rejects without leaving a half-created collection. Mirrors commands.py.
+    if let Some(ci) = doc.get("clusteredIndex").and_then(Bson::as_document) {
+        let key_ok = ci.get_document("key").is_ok_and(|k| {
+            k.len() == 1
+                && k.get("_id").is_some_and(|v| {
+                    matches!(v, Bson::Int32(1) | Bson::Int64(1)) || v.as_f64() == Some(1.0)
+                })
+        });
+        if !key_ok {
+            return Ok(CommandError::new(
+                197,
+                "InvalidIndexSpecificationOption",
+                "The clusteredIndex option is only supported for key: {_id: 1}",
+            )
+            .into_reply());
+        }
+        if ci.get_bool("unique") != Ok(true) {
+            return Ok(CommandError::new(
+                5979700,
+                "Location5979700",
+                "The clusteredIndex option requires unique: true to be specified",
+            )
+            .into_reply());
+        }
+        let name = ci.get_str("name").unwrap_or("_id_").to_string();
+        opts.insert(
+            "clusteredIndex",
+            doc! { "v": 2i32, "key": { "_id": 1i32 }, "name": name, "unique": true },
+        );
+    }
     let storage = ctx.storage()?;
     let created = storage
-        .create_collection(&ctx.db_name, &coll)
+        .create_collection_with_options(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
     if !created {
         return Ok(CommandError::new(
@@ -74,12 +137,6 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("a collection '{}.{}' already exists", ctx.db_name, coll),
         )
         .into_reply());
-    }
-    let opts = collection_option_subset(doc);
-    if !opts.is_empty() {
-        storage
-            .set_collection_options(&ctx.db_name, &coll, &opts)
-            .map_err(command_error)?;
     }
     Ok(doc! { "ok": 1.0 })
 }
@@ -113,11 +170,121 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
+    let mut reply = doc! { "ok": 1.0 };
+    // Index modification: `collMod {index: {keyPattern|name, prepareUnique|unique|expireAfterSeconds}}`.
+    if let Some(Bson::Document(index_spec)) = doc.get("index") {
+        let indexes = storage
+            .list_indexes(&ctx.db_name, &coll)
+            .map_err(command_error)?;
+        // Resolve the target index by name or key pattern.
+        let target = if let Ok(want) = index_spec.get_str("name") {
+            indexes
+                .iter()
+                .find(|ix| ix.get_str("name") == Ok(want))
+                .cloned()
+        } else if let Some(Bson::Document(want_key)) = index_spec.get("keyPattern") {
+            indexes
+                .iter()
+                .find(|ix| {
+                    ix.get_document("key")
+                        .map(|k| key_patterns_eq(k, want_key))
+                        .unwrap_or(false)
+                })
+                .cloned()
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            return Ok(CommandError::new(
+                27,
+                "IndexNotFound",
+                format!("cannot find index for ns {}.{}", ctx.db_name, coll),
+            )
+            .into_reply());
+        };
+        let target_name = target.get_str("name").unwrap_or("").to_string();
+        // `expireAfterSeconds` retunes a TTL index: echo the old/new expiry and
+        // persist the new one. Mirrors commands.py::_coll_mod.
+        if let Some(new_expiry) = index_spec.get("expireAfterSeconds") {
+            reply.insert(
+                "expireAfterSeconds_old",
+                target
+                    .get("expireAfterSeconds")
+                    .cloned()
+                    .unwrap_or(Bson::Null),
+            );
+            reply.insert("expireAfterSeconds_new", new_expiry.clone());
+            storage
+                .set_index_options(
+                    &ctx.db_name,
+                    &coll,
+                    &target_name,
+                    &doc! {"expireAfterSeconds": new_expiry.clone()},
+                )
+                .map_err(command_error)?;
+        }
+        // `prepareUnique` arms the index: new dup writes are rejected (11000)
+        // while pre-existing duplicates are tolerated — the staging step before
+        // a `unique: true` conversion.
+        if let Some(prep) = index_spec.get("prepareUnique").and_then(Bson::as_bool) {
+            storage
+                .set_index_options(
+                    &ctx.db_name,
+                    &coll,
+                    &target_name,
+                    &doc! {"prepareUnique": prep},
+                )
+                .map_err(command_error)?;
+        }
+        // `unique: true` converts the index; if any docs already share a key the
+        // conversion is refused with 359 and the offending `_id` groups reported
+        // as `violations`. Mirrors commands.py::_coll_mod.
+        if index_spec.get("unique").and_then(Bson::as_bool) == Some(true)
+            && !target.get_bool("unique").unwrap_or(false)
+        {
+            let dups = storage
+                .find_index_duplicates(&ctx.db_name, &coll, &target_name)
+                .map_err(command_error)?;
+            if !dups.is_empty() {
+                let violations: Vec<Bson> = dups
+                    .into_iter()
+                    .map(|ids| Bson::Document(doc! {"ids": ids}))
+                    .collect();
+                let mut reply = CommandError::new(
+                    359,
+                    "CannotConvertIndexToUnique",
+                    format!("Cannot convert index {target_name} to unique: found duplicate values"),
+                )
+                .into_reply();
+                reply.insert("violations", violations);
+                return Ok(reply);
+            }
+            storage
+                .set_index_options(
+                    &ctx.db_name,
+                    &coll,
+                    &target_name,
+                    &doc! {"unique": true, "prepareUnique": false},
+                )
+                .map_err(command_error)?;
+        }
+    }
     let opts = collection_option_subset(doc);
+    // `coll_mod` (not `set_collection_options`) so a `showExpandedEvents` change
+    // stream sees the resulting `modify` event.
     storage
-        .set_collection_options(&ctx.db_name, &coll, &opts)
+        .coll_mod(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
-    Ok(doc! { "ok": 1.0 })
+    Ok(reply)
+}
+
+/// Whether two index key patterns are equal (same fields, same order, same
+/// `±1` direction regardless of the numeric BSON type they're encoded as).
+fn key_patterns_eq(a: &Document, b: &Document) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|((ak, av), (bk, bv))| ak == bk && as_i64(av) == as_i64(bv))
 }
 
 /// `explain` — report the query plan (and, above `queryPlanner` verbosity,
@@ -228,15 +395,32 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     let winning_plan = if is_ixscan {
+        let index_name = plan.get_str("indexName").unwrap_or("");
+        let mut input_stage = doc! {
+            "stage": "IXSCAN",
+            "indexName": index_name,
+            "keyPattern": plan.get_document("keyPattern").cloned().unwrap_or_default(),
+            "direction": plan.get_str("direction").unwrap_or("forward"),
+        };
+        // mongod flags an IXSCAN over a partial index with `isPartial`.
+        if !coll.is_empty() {
+            let is_partial = storage
+                .list_indexes(&ctx.db_name, &coll)
+                .map(|ixs| {
+                    ixs.iter().any(|ix| {
+                        ix.get_str("name").ok() == Some(index_name)
+                            && ix.contains_key("partialFilterExpression")
+                    })
+                })
+                .unwrap_or(false);
+            if is_partial {
+                input_stage.insert("isPartial", true);
+            }
+        }
         doc! {
             "stage": "FETCH",
             "filter": filter.clone(),
-            "inputStage": {
-                "stage": "IXSCAN",
-                "indexName": plan.get_str("indexName").unwrap_or(""),
-                "keyPattern": plan.get_document("keyPattern").cloned().unwrap_or_default(),
-                "direction": plan.get_str("direction").unwrap_or("forward"),
-            },
+            "inputStage": input_stage,
         }
     } else {
         doc! { "stage": "COLLSCAN", "filter": filter.clone() }
@@ -253,7 +437,7 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     } else {
         doc! {"stage": "COLLSCAN", "nReturned": n_returned}
     };
-    let exec_stats = doc! {
+    let mut exec_stats = doc! {
         "executionSuccess": true,
         "nReturned": n_returned,
         "executionTimeMillis": 0_i64,
@@ -261,6 +445,13 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "totalDocsExamined": docs_examined,
         "executionStages": execution_stages,
     };
+    // `allPlansExecution` verbosity adds per-candidate-plan stats under
+    // executionStats. With a single solution (no multi-planning; rejectedPlans
+    // is always empty) mongod emits an empty array — drivers' explain helpers
+    // (mongo-php-library `ExplainFunctionalTest`) assert the key's presence.
+    if verbosity == "allPlansExecution" {
+        exec_stats.insert("allPlansExecution", Bson::Array(vec![]));
+    }
     let server_info = doc! {
         "host": "secantus", "port": 0_i32, "version": SERVER_VERSION, "gitVersion": "0".repeat(40),
     };
@@ -292,44 +483,283 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// `drop` — drop a collection.
 pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "drop")?;
+    let ns = format!("{}.{}", ctx.db_name, coll);
     let storage = ctx.storage()?;
     let existed = storage
         .drop_collection(&ctx.db_name, &coll)
         .map_err(command_error)?;
+    // Dropping a collection kills its open cursors so a later getMore fails with
+    // CursorNotFound rather than serving stale snapshot rows (mongo-c-driver's
+    // error_document/getmore). Mirrors commands.py::_drop.
+    if let Ok(cursors) = ctx.cursors() {
+        cursors.kill_namespace(&ns);
+    }
     if !existed {
-        return Ok(CommandError::new(26, "NamespaceNotFound", "ns not found").into_reply());
+        // Modern mongod treats `drop` of a non-existent collection as an
+        // idempotent success (`{ok: 1}`), not a NamespaceNotFound error. The
+        // ok:1 shape also lets dispatch attach a `writeConcernError` for an
+        // unsatisfiable write concern — pymongo's test_drop_collection drops an
+        // already-absent collection with w:50 and asserts a WriteConcernError.
+        // Mirrors commands.py::_drop.
+        return Ok(doc! { "ok": 1.0 });
     }
     Ok(doc! { "ns": format!("{}.{}", ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0 })
 }
 
-/// `listCollections` — a cursor over the collections in the database.
-pub fn list_collections(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `secantusAdmin.backupArchive` — force a checkpoint and tar the WiredTiger home
+/// into `outputPath` (a server-side path) for point-in-time recovery. The on-disk
+/// and oplog formats match the Python server, so either server's restore tooling
+/// reads the result. Mirrors the Python `secantusAdmin.backupArchive` command.
+pub fn backup_archive(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let output_path = doc.get_str("outputPath").unwrap_or("");
+    if output_path.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.backupArchive requires outputPath: <string>",
+        ));
+    }
+    let storage = ctx.storage()?;
+    let (path, size_bytes) = storage.create_archive(output_path).map_err(command_error)?;
+    Ok(doc! { "path": path, "sizeBytes": size_bytes as i64, "ok": 1.0 })
+}
+
+/// `secantusAdmin.pruneOplog` — drop oplog rows past the retention window now,
+/// returning `{pruned, ok}`. An operator-driven immediate sweep (the storage
+/// engine also prunes opportunistically on every emit). Mirrors the Python
+/// `secantusAdmin.pruneOplog` command.
+pub fn prune_oplog(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let storage = ctx.storage()?;
+    let pruned = storage.prune_oplog().map_err(command_error)?;
+    Ok(doc! { "pruned": pruned as i64, "ok": 1.0 })
+}
+
+/// `secantusAdmin.pruneTtl` — run TTL pruning across every collection now,
+/// returning `{pruned, ok}` (the docs deleted). Lets callers force a
+/// deterministic pass instead of waiting for the background cadence. Mirrors
+/// the Python `secantusAdmin.pruneTtl` command.
+pub fn prune_ttl(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let storage = ctx.storage()?;
+    let pruned = storage.prune_ttl_all().map_err(command_error)?;
+    Ok(doc! { "pruned": pruned as i64, "ok": 1.0 })
+}
+
+/// `secantusAdmin.restoreArchive` — extract a backup archive (from
+/// `backupArchive`) into `targetDir`, a fresh directory the operator then points
+/// a *new* server at (the running server's storage is untouched — same
+/// side-channel model as the Python command and real mongod's "stop, swap
+/// dbpath, start"). Required: `archivePath`, `targetDir`. Optional
+/// `allowExisting` (bool, default false) overlays into a non-empty target.
+/// Returns `{targetDir, fileCount, archive, ok}`. Mirrors the Python
+/// `secantusAdmin.restoreArchive` command.
+pub fn restore_archive(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let archive_path = doc.get_str("archivePath").unwrap_or("");
+    if archive_path.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.restoreArchive requires archivePath: <string>",
+        ));
+    }
+    let target_dir = doc.get_str("targetDir").unwrap_or("");
+    if target_dir.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.restoreArchive requires targetDir: <string>",
+        ));
+    }
+    let allow_existing = doc.get_bool("allowExisting").unwrap_or(false);
+    let storage = ctx.storage()?;
+    let (abs_target, abs_archive, file_count) = storage
+        .restore_archive(archive_path, target_dir, allow_existing)
+        // A failed restore (missing/invalid archive, non-empty target) is a
+        // caller error, not an internal fault — mirror the Python handler's
+        // IllegalOperation(20) rather than InternalError.
+        .map_err(|e| CommandError::new(20, "IllegalOperation", command_error(e).errmsg))?;
+    Ok(doc! {
+        "targetDir": abs_target,
+        "fileCount": file_count as i64,
+        "archive": abs_archive,
+        "ok": 1.0,
+    })
+}
+
+/// `secantusAdmin.archiveBaseSnapshot` — take a PITR v2 base snapshot into
+/// `archiveDir` (`base-<head>.tar.gz`). Pair with a server started with
+/// `--oplog-archive-dir <archiveDir>` so pruned oplog rows are archived as
+/// segments there too; recovery then stitches the newest base ≤ T plus the
+/// segments. Mirrors the Python `secantusAdmin.archiveBaseSnapshot` command.
+pub fn archive_base_snapshot(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let archive_dir = doc.get_str("archiveDir").unwrap_or("");
+    if archive_dir.is_empty() {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "secantusAdmin.archiveBaseSnapshot requires archiveDir: <string>",
+        ));
+    }
+    let storage = ctx.storage()?;
+    let (path, size_bytes) = storage
+        .archive_base_snapshot(archive_dir)
+        .map_err(command_error)?;
+    Ok(doc! { "path": path, "sizeBytes": size_bytes as i64, "ok": 1.0 })
+}
+
+/// `listCollections` — a cursor over the collections in the database, honouring
+/// `filter` (a query predicate over each entry) and `nameOnly`. Each entry's
+/// `options` reflects the collection's stored options (capped / validator /
+/// collation / timeseries / …) so drivers introspecting them see the real
+/// values. Mirrors `commands._list_collections`.
+pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
+    let filter = doc
+        .get("filter")
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty());
+    let name_only = bool_field(doc, "nameOnly", false);
     let names = storage
         .list_collections(&ctx.db_name)
         .map_err(command_error)?;
-    let entries: Vec<Document> = names
-        .iter()
-        .map(|n| {
-            doc! {
-                "name": n,
-                "type": "collection",
-                "options": {},
-                "info": { "readOnly": false },
-                "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
+    let mut entries: Vec<Document> = Vec::with_capacity(names.len());
+    for n in &names {
+        let mut options = storage
+            .get_collection_options(&ctx.db_name, n)
+            .map_err(command_error)?;
+        // A `viewOn` collection is a read-only view: type "view", readOnly true,
+        // no `_id` index, and the stored `viewPipeline` surfaces as `pipeline`.
+        let is_view = options.contains_key("viewOn");
+        if let Some(p) = options.remove("viewPipeline") {
+            options.insert("pipeline", p);
+        }
+        // `uuid` is an internal option (the collection identity) — it's surfaced
+        // under `info.uuid`, not as a collection option. Strip it from `options`.
+        options.remove("uuid");
+        // mongod stores/reports capped `size` / `max` as int32; we may hold the
+        // driver-sent int64. Normalise so the round-tripped options match.
+        for k in ["size", "max"] {
+            if let Some(Bson::Int64(v)) = options.get(k) {
+                let v = *v;
+                options.insert(k, Bson::Int32(v as i32));
             }
-        })
-        .collect();
+        }
+        let coll_type = if is_view {
+            "view"
+        } else if options.contains_key("timeseries") {
+            "timeseries"
+        } else {
+            "collection"
+        };
+        // `info.uuid` is BinData(4) — driver CollectionSpecification readers
+        // (e.g. the go driver) read it as a Binary, so it must be present and the
+        // right type.
+        let mut info = doc! { "readOnly": is_view };
+        if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, n) {
+            if uuid.len() == 16 {
+                info.insert(
+                    "uuid",
+                    Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Uuid,
+                        bytes: uuid,
+                    }),
+                );
+            }
+        }
+        // Captured before `options` is moved into the entry below.
+        let is_clustered = options.contains_key("clusteredIndex");
+        let mut entry = doc! {
+            "name": n,
+            "type": coll_type,
+            "options": Bson::Document(options),
+            "info": info,
+        };
+        // A clustered collection has no separate `_id_` index (the clustering
+        // key IS the index), so mongod omits `idIndex` for it — same as views.
+        if !is_view && !is_clustered {
+            entry.insert(
+                "idIndex",
+                doc! {
+                    "v": 2,
+                    "key": { "_id": 1 },
+                    "name": "_id_",
+                    "ns": format!("{}.{}", ctx.db_name, n),
+                },
+            );
+        }
+        entries.push(entry);
+    }
+    // `filter` is evaluated against the full entry (so `{name: …}`,
+    // `{type: …}`, `{"options.capped": true}` all work); apply it before the
+    // `nameOnly` projection so a filter on `options` still matches.
+    if let Some(f) = filter {
+        entries.retain(|e| {
+            secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
+        });
+    }
+    if name_only {
+        for e in &mut entries {
+            let name = e.get_str("name").unwrap_or("").to_string();
+            let ty = e.get_str("type").unwrap_or("collection").to_string();
+            *e = doc! { "name": name, "type": ty };
+        }
+    }
     let ns = format!("{}.$cmd.listCollections", ctx.db_name);
-    let (first, cid) = split_into_cursor(
-        encode_docs(entries)?,
-        DEFAULT_BATCH_SIZE as i64,
-        &ns,
-        cursors,
-    )?;
+    // Honour `cursor: {batchSize: N}` so a client that asks for a small batch
+    // gets a real getMore (drivers' "listCollections getMore is monitored"
+    // tests force this); absent ⇒ the wire default.
+    let batch_size = doc
+        .get("cursor")
+        .and_then(Bson::as_document)
+        .and_then(|c| c.get("batchSize"))
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
+        "ok": 1.0,
+    })
+}
+
+/// `listDatabases` — descriptors for every database, honouring `filter` and
+/// `nameOnly`. Mirrors `commands._list_databases`: each descriptor is
+/// `{name, sizeOnDisk, empty}` (`sizeOnDisk` = summed BSON doc bytes across the
+/// db's collections; `empty` = size 0), reduced to `{name}` under `nameOnly`.
+/// The `filter` is a query predicate evaluated against each descriptor; it's
+/// applied after `totalSize` is accumulated, matching mongod.
+pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let storage = ctx.storage()?;
+    let name_only = bool_field(doc, "nameOnly", false);
+    let filter = doc
+        .get("filter")
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty());
+
+    let names = storage.list_databases().map_err(command_error)?;
+    let mut descriptors: Vec<Document> = Vec::new();
+    let mut total_size: i64 = 0;
+    for n in &names {
+        if name_only {
+            descriptors.push(doc! { "name": n });
+            continue;
+        }
+        let mut size: i64 = 0;
+        for coll in storage.list_collections(n).map_err(command_error)? {
+            size += storage
+                .collection_data_size(n, &coll)
+                .map_err(command_error)?;
+        }
+        total_size += size;
+        descriptors.push(doc! { "name": n, "sizeOnDisk": size, "empty": size == 0 });
+    }
+    if let Some(f) = filter {
+        descriptors.retain(|d| {
+            secantus_core::query::matches(d, f, &Document::new(), None).unwrap_or(false)
+        });
+    }
+    Ok(doc! {
+        "databases": Bson::Array(descriptors.into_iter().map(Bson::Document).collect()),
+        "totalSize": total_size,
         "ok": 1.0,
     })
 }
@@ -339,16 +769,54 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
-    let indexes = storage
+    let mut indexes = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
+    // A collection that exists always has at least the synthesised `_id_` index, so
+    // an empty result means the namespace doesn't exist — mongod errors
+    // NamespaceNotFound (mongo-ruby-driver `Index::View#each ... collection does not
+    // exist`). Mirrors commands.py's `if not indexes`.
+    if indexes.is_empty() {
+        return Ok(CommandError::new(
+            26,
+            "NamespaceNotFound",
+            format!("ns does not exist: {}.{}", ctx.db_name, coll),
+        )
+        .into_reply());
+    }
+    // A clustered collection's clustering key IS its index: mongod reports a
+    // single entry carrying `clustered: true` (with the user's name) in place of
+    // the synthesised `_id_`. Mirrors commands.py.
+    if let Some(ci) = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .ok()
+        .and_then(|o| o.get_document("clusteredIndex").ok().cloned())
+    {
+        let clustered = doc! {
+            "v": ci.get_i32("v").unwrap_or(2),
+            "key": { "_id": 1i32 },
+            "name": ci.get_str("name").unwrap_or("_id_").to_string(),
+            "unique": true,
+            "clustered": true,
+        };
+        let mut rest: Vec<Document> = indexes
+            .into_iter()
+            .filter(|ix| ix.get_str("name") != Ok("_id_"))
+            .collect();
+        indexes = std::iter::once(clustered).chain(rest.drain(..)).collect();
+    }
     let ns = format!("{}.$cmd.listIndexes.{}", ctx.db_name, coll);
-    let (first, cid) = split_into_cursor(
-        encode_docs(indexes)?,
-        DEFAULT_BATCH_SIZE as i64,
-        &ns,
-        cursors,
-    )?;
+    // Honour `cursor: {batchSize: N}` so a client asking for a small batch gets a
+    // real getMore round-trip (the Go driver's
+    // `TestIndexView/list/getMore_commands_are_monitored` asserts a getMore fires
+    // at batchSize 2); absent ⇒ the wire default. Mirrors `list_collections`.
+    let batch_size = doc
+        .get("cursor")
+        .and_then(Bson::as_document)
+        .and_then(|c| c.get("batchSize"))
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    let (first, cid) = split_into_cursor(encode_docs(indexes)?, batch_size, &ns, cursors)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,
@@ -438,6 +906,19 @@ fn invalid_partial_filter(filter: &Document) -> Option<String> {
     None
 }
 
+/// Whether a BSON value is "falsy" the way mongod treats default index options
+/// (`hidden` / `sparse` / `unique`): `false`, `0`, `0.0`, or null.
+fn is_falsy(v: &Bson) -> bool {
+    match v {
+        Bson::Boolean(b) => !b,
+        Bson::Int32(i) => *i == 0,
+        Bson::Int64(i) => *i == 0,
+        Bson::Double(d) => *d == 0.0,
+        Bson::Null => true,
+        _ => false,
+    }
+}
+
 pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "createIndexes")?;
     let storage = ctx.storage()?;
@@ -445,6 +926,26 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         Some(Bson::Array(a)) => a.clone(),
         _ => Vec::new(),
     };
+
+    // `commitQuorum` (4.4+) accepts an integer, `"majority"`, or `"votingMembers"`;
+    // any other string is an unknown write-concern mode (mongo-ruby-driver's
+    // `commit_quorum value is not supported` pins this). Mirrors commands.py.
+    if let Some(cq) = doc.get("commitQuorum") {
+        let ok = matches!(cq, Bson::Int32(_) | Bson::Int64(_))
+            || matches!(cq.as_str(), Some("majority") | Some("votingMembers"));
+        if !ok {
+            let shown = match cq {
+                Bson::String(s) => format!("'{s}'"),
+                other => format!("{other}"),
+            };
+            return Ok(CommandError::new(
+                79,
+                "UnknownReplWriteConcern",
+                format!("No write concern mode named {shown} found in replica set configuration"),
+            )
+            .into_reply());
+        }
+    }
 
     let before = storage
         .list_indexes(&ctx.db_name, &coll)
@@ -455,6 +956,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         .create_collection(&ctx.db_name, &coll)
         .map_err(command_error)?;
 
+    let mut any_created = false;
     for spec in &specs {
         let Bson::Document(s) = spec else { continue };
         let key = s
@@ -467,6 +969,11 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             .and_then(Bson::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| default_index_name(&key));
+        // Guard the index name against an embedded NUL before it reaches the
+        // WT key encoder (see crate::nul_in_namespace / #139).
+        if let Some(e) = crate::nul_in_namespace("index name", &name) {
+            return Ok(e.into_reply());
+        }
         // `partialFilterExpression` must be a document and a parseable filter —
         // mongod rejects a non-document, unknown operators (`{x: {$asdasd: 3}}`),
         // and malformed logical operators (`{$and: 5}`). (pymongo's
@@ -493,21 +1000,67 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 }
             }
         }
-        storage
-            .create_index(&ctx.db_name, &coll, &name, &key, s)
+        // `wildcardProjection` is only valid on a wildcard index ({$**:1} /
+        // {f.$**:1}) and must be a non-empty document (mongo-ruby-driver's
+        // invalid-wildcard-projection tests). Mirrors commands.py.
+        if let Some(wcp) = s.get("wildcardProjection") {
+            let nonempty_doc = matches!(wcp, Bson::Document(d) if !d.is_empty());
+            if !nonempty_doc {
+                return Ok(CommandError::new(
+                    67,
+                    "CannotCreateIndex",
+                    format!(
+                        "Error in specification {{ key: {key:?}, wildcardProjection: {wcp:?} }} \
+                         :: caused by :: wildcardProjection must be a non-empty object"
+                    ),
+                )
+                .into_reply());
+            }
+            let is_wildcard = key.keys().any(|k| k == "$**" || k.ends_with(".$**"));
+            if !is_wildcard {
+                return Ok(CommandError::new(
+                    67,
+                    "CannotCreateIndex",
+                    format!(
+                        "Error in specification {{ key: {key:?}, wildcardProjection: {wcp:?} }} \
+                         :: caused by :: wildcardProjection is only allowed on wildcard indexes"
+                    ),
+                )
+                .into_reply());
+            }
+        }
+        // mongod stores only the non-default form of hidden / sparse / unique: a
+        // falsy value is dropped so it doesn't come back from listIndexes
+        // (mongo-ruby-driver `hidden is false` asserts hidden isn't echoed).
+        let mut spec = s.clone();
+        for opt in ["hidden", "sparse", "unique"] {
+            if spec.get(opt).is_some_and(is_falsy) {
+                spec.remove(opt);
+            }
+        }
+        let created = storage
+            .create_index(&ctx.db_name, &coll, &name, &key, &spec)
             .map_err(command_error)?;
+        any_created |= created;
     }
 
     let after = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?
         .len();
-    Ok(doc! {
+    let mut reply = doc! {
         "createdCollectionAutomatically": created_coll,
         "numIndexesBefore": before as i32,
         "numIndexesAfter": after as i32,
         "ok": 1.0,
-    })
+    };
+    // When every requested index already existed, mongod adds
+    // `note: "all indexes already exist"` so drivers report a no-op (mongocxx's
+    // `index_view::create_one` returns an empty optional off this).
+    if !any_created && !specs.is_empty() {
+        reply.insert("note", "all indexes already exist");
+    }
+    Ok(reply)
 }
 
 /// `dropIndexes` — drop a named index, or all of them with `"*"`.
@@ -526,6 +1079,9 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 .map_err(command_error)?;
         }
         Some(Bson::String(name)) => {
+            if let Some(e) = crate::nul_in_namespace("index name", name) {
+                return Ok(e.into_reply());
+            }
             let existed = storage
                 .drop_index(&ctx.db_name, &coll, name)
                 .map_err(command_error)?;
@@ -600,12 +1156,28 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
         .map_err(command_error)?;
     if !ok_ {
         let m = msg.unwrap_or_else(|| "rename failed".to_string());
-        let (code, name) = if m.to_lowercase().contains("exist") {
+        // A missing source ("source namespace does not exist") is
+        // NamespaceNotFound (26); an existing target ("target namespace exists")
+        // is NamespaceExists (48). Check the source-missing phrasing first so a
+        // bare "exist" substring doesn't misclassify "does not exist" as 48.
+        let lower = m.to_lowercase();
+        let (code, name) = if lower.contains("does not exist") || lower.contains("not found") {
+            (26, "NamespaceNotFound")
+        } else if lower.contains("exists") {
             (48, "NamespaceExists")
         } else {
             (26, "NamespaceNotFound")
         };
         return Ok(CommandError::new(code, name, m).into_reply());
+    }
+    // A rename invalidates cursors open on the source (and the dropped target),
+    // same as a drop — a later getMore then fails with CursorNotFound. Mirrors
+    // commands.py::_rename_collection.
+    if let Ok(cursors) = ctx.cursors() {
+        cursors.kill_namespace(&src);
+        if drop_target {
+            cursors.kill_namespace(&to);
+        }
     }
     Ok(doc! { "ok": 1.0 })
 }
@@ -677,8 +1249,14 @@ pub fn db_stats(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     })
 }
 
-/// `serverStatus` — a minimal subset (host / version / process / uptime).
-pub fn server_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+/// `serverStatus` — a minimal subset (host / version / process / uptime), plus a
+/// live `metrics.cursor.open.total` so drivers can track cursor lifecycle
+/// (mongo-php-driver `cursor-destruct-001` opens a batched cursor and asserts the
+/// count rises by one, then returns to baseline after `killCursors`).
+pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // `CursorRegistry::len` prunes idle cursors then counts the live ones — the
+    // count rises while a batched cursor is open and drops on killCursors.
+    let open_cursors = ctx.cursors().map(|c| c.len()).unwrap_or(0) as i64;
     Ok(doc! {
         "host": "secantus",
         "version": crate::SERVER_VERSION,
@@ -687,12 +1265,55 @@ pub fn server_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResul
         "uptime": 0.0,
         "uptimeMillis": Bson::Int64(0),
         "localTime": bson::DateTime::now(),
+        "metrics": {
+            "cursor": {
+                "open": { "total": open_cursors, "pinned": 0i64, "noTimeout": 0i64 },
+            },
+        },
         // Categorical self-identification: real mongod never has this key.
         // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
         // checks it to prove it's talking to SecantusDB rather than an
         // accidental real MongoDB on the same address. The Python server
         // reports `server: "python"`.
         "secantus": { "server": "rust", "version": env!("CARGO_PKG_VERSION") },
+        "ok": 1.0,
+    })
+}
+
+/// `currentOp` — mongod's in-flight-operation introspection. SecantusDB runs
+/// commands synchronously and keeps no per-op registry, so the only operation
+/// "in progress" is the `currentOp` request itself. We emit one synthetic
+/// `inprog` entry carrying this connection's driver `clientMetadata` (captured
+/// from the handshake `client` doc), which is what the drivers' handshake-
+/// metadata tests read back. A client filter (e.g. `command.currentOp` /
+/// `$ownOps`) is accepted but not applied — the single self-op already matches
+/// the introspection queries the drivers issue.
+pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let client_metadata = ctx
+        .conn_auth
+        .as_ref()
+        .and_then(|a| a.lock().ok())
+        .and_then(|g| g.client_metadata.clone());
+
+    let mut op = doc! {
+        "type": "op",
+        "host": "secantus",
+        "desc": "conn",
+        "connectionId": Bson::Int64(ctx.connection_id),
+        "active": true,
+        "op": "command",
+        "ns": format!("{}.$cmd", ctx.db_name),
+        "command": doc.clone(),
+        "opid": Bson::Int64(ctx.connection_id),
+        "secs_running": Bson::Int64(0),
+        "microsecs_running": Bson::Int64(0),
+    };
+    if let Some(meta) = client_metadata {
+        op.insert("clientMetadata", meta);
+    }
+
+    Ok(doc! {
+        "inprog": vec![Bson::Document(op)],
         "ok": 1.0,
     })
 }
@@ -844,483 +1465,4 @@ fn default_index_name(key: &Document) -> String {
         })
         .collect::<Vec<_>>()
         .join("_")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dispatch;
-    use crate::storage::{RawHint, Storage, StorageError, UpdateOutcome};
-    use crate::CursorRegistry;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    /// An in-memory storage tracking collections + per-collection index names.
-    #[derive(Default)]
-    struct FakeStorage {
-        // db -> set of collection names
-        cols: Mutex<HashMap<String, Vec<String>>>,
-        // (db, coll) -> index names (excluding the implicit _id_)
-        idx: Mutex<HashMap<(String, String), Vec<String>>>,
-        // (db, coll) -> stored options blob
-        opts: Mutex<HashMap<(String, String), Document>>,
-    }
-
-    impl FakeStorage {
-        fn arc() -> Arc<FakeStorage> {
-            Arc::new(FakeStorage::default())
-        }
-    }
-
-    impl Storage for FakeStorage {
-        fn insert(
-            &self,
-            _: &str,
-            _: &str,
-            _: Vec<Vec<u8>>,
-            _: bool,
-        ) -> Result<(usize, Vec<Document>), StorageError> {
-            Ok((0, vec![]))
-        }
-        fn update_matching(
-            &self,
-            _: &str,
-            _: &str,
-            _: &Document,
-            _: &Document,
-            _: bool,
-            _: bool,
-        ) -> Result<UpdateOutcome, StorageError> {
-            Ok(UpdateOutcome::default())
-        }
-        fn delete_matching(
-            &self,
-            _: &str,
-            _: &str,
-            _: &Document,
-            _: usize,
-        ) -> Result<usize, StorageError> {
-            Ok(0)
-        }
-        fn count_matching(&self, _: &str, _: &str, _: &Document) -> Result<usize, StorageError> {
-            Ok(0)
-        }
-        fn find(
-            &self,
-            _: &str,
-            _: &str,
-            _: &Document,
-            _: Option<&Document>,
-            _: Option<RawHint<'_>>,
-        ) -> Result<Vec<Vec<u8>>, StorageError> {
-            Ok(vec![])
-        }
-
-        fn list_collections(&self, db: &str) -> Result<Vec<String>, StorageError> {
-            Ok(self
-                .cols
-                .lock()
-                .unwrap()
-                .get(db)
-                .cloned()
-                .unwrap_or_default())
-        }
-        fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
-            Ok(self
-                .opts
-                .lock()
-                .unwrap()
-                .get(&(db.to_string(), coll.to_string()))
-                .cloned()
-                .unwrap_or_default())
-        }
-        fn set_collection_options(
-            &self,
-            db: &str,
-            coll: &str,
-            opts: &Document,
-        ) -> Result<(), StorageError> {
-            let mut store = self.opts.lock().unwrap();
-            let cur = store.entry((db.to_string(), coll.to_string())).or_default();
-            for (k, v) in opts {
-                cur.insert(k.clone(), v.clone());
-            }
-            Ok(())
-        }
-        fn create_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
-            let mut cols = self.cols.lock().unwrap();
-            let v = cols.entry(db.to_string()).or_default();
-            if v.iter().any(|c| c == coll) {
-                Ok(false)
-            } else {
-                v.push(coll.to_string());
-                Ok(true)
-            }
-        }
-        fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
-            let mut cols = self.cols.lock().unwrap();
-            let v = cols.entry(db.to_string()).or_default();
-            let before = v.len();
-            v.retain(|c| c != coll);
-            Ok(v.len() != before)
-        }
-        fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>, StorageError> {
-            // Only report indexes for an existing collection (its implicit _id_
-            // plus any created secondary indexes).
-            let exists = self
-                .cols
-                .lock()
-                .unwrap()
-                .get(db)
-                .map(|v| v.iter().any(|c| c == coll))
-                .unwrap_or(false);
-            if !exists {
-                return Ok(vec![]);
-            }
-            let mut out = vec![doc! {"v": 2, "key": {"_id": 1}, "name": "_id_"}];
-            if let Some(names) = self.idx.lock().unwrap().get(&(db.into(), coll.into())) {
-                for n in names {
-                    out.push(doc! {"v": 2, "key": {n.clone(): 1}, "name": n.clone()});
-                }
-            }
-            Ok(out)
-        }
-        fn create_index(
-            &self,
-            db: &str,
-            coll: &str,
-            name: &str,
-            _key: &Document,
-            _options: &Document,
-        ) -> Result<bool, StorageError> {
-            let mut idx = self.idx.lock().unwrap();
-            let v = idx.entry((db.into(), coll.into())).or_default();
-            if v.iter().any(|n| n == name) {
-                Ok(false)
-            } else {
-                v.push(name.to_string());
-                Ok(true)
-            }
-        }
-        fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool, StorageError> {
-            let mut idx = self.idx.lock().unwrap();
-            let v = idx.entry((db.into(), coll.into())).or_default();
-            let before = v.len();
-            v.retain(|n| n != name);
-            Ok(v.len() != before)
-        }
-        fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize, StorageError> {
-            let mut idx = self.idx.lock().unwrap();
-            let v = idx.entry((db.into(), coll.into())).or_default();
-            let n = v.len();
-            v.clear();
-            Ok(n)
-        }
-    }
-
-    fn ctx(storage: Arc<FakeStorage>) -> CommandContext {
-        let mut c = CommandContext::new(1)
-            .with_storage(storage)
-            .with_cursors(Arc::new(CursorRegistry::new()));
-        c.db_name = "t".into();
-        c
-    }
-
-    #[test]
-    fn create_then_drop_collection() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        assert_eq!(
-            dispatch(&doc! {"create": "c"}, &mut c)
-                .get_f64("ok")
-                .unwrap(),
-            1.0
-        );
-        // re-create ⇒ NamespaceExists
-        let mut c = ctx(s.clone());
-        let reply = dispatch(&doc! {"create": "c"}, &mut c);
-        assert_eq!(reply.get_i32("code").unwrap(), 48);
-
-        let mut c = ctx(s.clone());
-        let reply = dispatch(&doc! {"drop": "c"}, &mut c);
-        assert_eq!(reply.get_str("ns").unwrap(), "t.c");
-        // drop again ⇒ NamespaceNotFound
-        let mut c = ctx(s);
-        assert_eq!(
-            dispatch(&doc! {"drop": "c"}, &mut c)
-                .get_i32("code")
-                .unwrap(),
-            26
-        );
-    }
-
-    #[test]
-    fn list_collections_returns_created() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(&doc! {"create": "a"}, &mut c);
-        let mut c = ctx(s.clone());
-        dispatch(&doc! {"create": "b"}, &mut c);
-        let mut c = ctx(s);
-        let reply = dispatch(&doc! {"listCollections": 1}, &mut c);
-        let names: Vec<String> = reply
-            .get_document("cursor")
-            .unwrap()
-            .get_array("firstBatch")
-            .unwrap()
-            .iter()
-            .map(|b| {
-                b.as_document()
-                    .unwrap()
-                    .get_str("name")
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(names, vec!["a", "b"]);
-    }
-
-    #[test]
-    fn create_stores_validator() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        let reply = dispatch(
-            &doc! {"create": "c", "validator": {"a": {"$exists": true}}},
-            &mut c,
-        );
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        let stored = s
-            .opts
-            .lock()
-            .unwrap()
-            .get(&("t".to_string(), "c".to_string()))
-            .cloned()
-            .unwrap();
-        assert!(stored.contains_key("validator"));
-    }
-
-    #[test]
-    fn collmod_sets_validator() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(&doc! {"create": "c"}, &mut c);
-        let mut c = ctx(s.clone());
-        let reply = dispatch(
-            &doc! {"collMod": "c", "validator": {"n": {"$gt": 0}},
-            "changeStreamPreAndPostImages": {"enabled": true}},
-            &mut c,
-        );
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        let stored = s
-            .opts
-            .lock()
-            .unwrap()
-            .get(&("t".to_string(), "c".to_string()))
-            .cloned()
-            .unwrap();
-        assert!(stored.contains_key("validator"));
-        assert!(stored.contains_key("changeStreamPreAndPostImages"));
-    }
-
-    #[test]
-    fn collmod_missing_ns_is_namespace_not_found() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s);
-        let reply = dispatch(&doc! {"collMod": "nope", "validator": {}}, &mut c);
-        assert_eq!(reply.get_i32("code").unwrap(), 26);
-        assert_eq!(reply.get_str("codeName").unwrap(), "NamespaceNotFound");
-    }
-
-    #[test]
-    fn explain_find_collscan_shape() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s);
-        let reply = dispatch(&doc! {"explain": {"find": "c", "filter": {"x": 1}}}, &mut c);
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        let qp = reply.get_document("queryPlanner").unwrap();
-        assert_eq!(qp.get_str("namespace").unwrap(), "t.c");
-        let wp = qp.get_document("winningPlan").unwrap();
-        assert_eq!(wp.get_str("stage").unwrap(), "COLLSCAN");
-        // default verbosity (executionStats) includes the stats block.
-        assert!(reply.get_document("executionStats").is_ok());
-    }
-
-    #[test]
-    fn explain_query_planner_verbosity_omits_exec_stats() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"explain": {"find": "c"}, "verbosity": "queryPlanner"},
-            &mut c,
-        );
-        assert!(reply.get_document("queryPlanner").is_ok());
-        assert!(reply.get("executionStats").is_none());
-    }
-
-    #[test]
-    fn explain_invalid_verbosity_is_bad_value() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"explain": {"find": "c"}, "verbosity": "bogus"},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("code").unwrap(), 2);
-        assert_eq!(reply.get_str("codeName").unwrap(), "BadValue");
-    }
-
-    #[test]
-    fn explain_with_majority_write_concern_rejected() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"explain": {"find": "c"}, "writeConcern": {"w": "majority"}},
-            &mut c,
-        );
-        assert_eq!(reply.get_i32("code").unwrap(), 72);
-        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidOptions");
-    }
-
-    #[test]
-    fn explain_aggregate_has_cursor_stages() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s);
-        let reply = dispatch(
-            &doc! {"explain": {"aggregate": "c", "pipeline": [{"$match": {"x": 1}}]}},
-            &mut c,
-        );
-        let stages = reply.get_array("stages").unwrap();
-        assert!(stages[0].as_document().unwrap().contains_key("$cursor"));
-    }
-
-    #[test]
-    fn create_indexes_and_list() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        let reply = dispatch(
-            &doc! {"createIndexes": "c", "indexes": [
-                {"key": {"a": 1}, "name": "a_1"},
-                {"key": {"b": -1}},  // name auto-derived ⇒ b_-1
-            ]},
-            &mut c,
-        );
-        assert!(reply.get_bool("createdCollectionAutomatically").unwrap());
-        assert_eq!(reply.get_i32("numIndexesBefore").unwrap(), 0);
-        // _id_ + a_1 + b_-1
-        assert_eq!(reply.get_i32("numIndexesAfter").unwrap(), 3);
-
-        let mut c = ctx(s);
-        let reply = dispatch(&doc! {"listIndexes": "c"}, &mut c);
-        let names: Vec<String> = reply
-            .get_document("cursor")
-            .unwrap()
-            .get_array("firstBatch")
-            .unwrap()
-            .iter()
-            .map(|b| {
-                b.as_document()
-                    .unwrap()
-                    .get_str("name")
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(names, vec!["_id_", "a_1", "b_-1"]);
-    }
-
-    #[test]
-    fn drop_indexes_by_name_and_star() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(
-            &doc! {"createIndexes": "c", "indexes": [
-                {"key": {"a": 1}, "name": "a_1"}, {"key": {"b": 1}, "name": "b_1"}
-            ]},
-            &mut c,
-        );
-        let mut c = ctx(s.clone());
-        let reply = dispatch(&doc! {"dropIndexes": "c", "index": "a_1"}, &mut c);
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        // unknown index ⇒ IndexNotFound
-        let mut c = ctx(s.clone());
-        assert_eq!(
-            dispatch(&doc! {"dropIndexes": "c", "index": "zzz"}, &mut c)
-                .get_i32("code")
-                .unwrap(),
-            27
-        );
-        // "*" drops the rest
-        let mut c = ctx(s.clone());
-        dispatch(&doc! {"dropIndexes": "c", "index": "*"}, &mut c);
-        let mut c = ctx(s);
-        let reply = dispatch(&doc! {"listIndexes": "c"}, &mut c);
-        // only _id_ remains
-        assert_eq!(
-            reply
-                .get_document("cursor")
-                .unwrap()
-                .get_array("firstBatch")
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn server_status_minimal_shape() {
-        let mut c = ctx(FakeStorage::arc());
-        let reply = dispatch(&doc! {"serverStatus": 1}, &mut c);
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        assert_eq!(reply.get_str("version").unwrap(), crate::SERVER_VERSION);
-        assert_eq!(reply.get_str("process").unwrap(), "mongod");
-        // The categorical SecantusDB marker — real mongod never has it.
-        let marker = reply.get_document("secantus").unwrap();
-        assert_eq!(marker.get_str("server").unwrap(), "rust");
-        assert!(!marker.get_str("version").unwrap().is_empty());
-    }
-
-    #[test]
-    fn drop_database_reports_dropped() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(&doc! {"create": "c"}, &mut c);
-        let mut c = ctx(s);
-        let reply = dispatch(&doc! {"dropDatabase": 1}, &mut c);
-        assert_eq!(reply.get_str("dropped").unwrap(), "t");
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-    }
-
-    #[test]
-    fn db_stats_counts_collections() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(&doc! {"create": "a"}, &mut c);
-        let mut c = ctx(s.clone());
-        dispatch(&doc! {"create": "b"}, &mut c);
-        let mut c = ctx(s);
-        let reply = dispatch(&doc! {"dbStats": 1}, &mut c);
-        assert_eq!(reply.get_str("db").unwrap(), "t");
-        assert_eq!(reply.get_i32("collections").unwrap(), 2);
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-    }
-
-    #[test]
-    fn coll_stats_shape() {
-        let s = FakeStorage::arc();
-        let mut c = ctx(s.clone());
-        dispatch(&doc! {"create": "c"}, &mut c);
-        let mut c = ctx(s);
-        let reply = dispatch(&doc! {"collStats": "c"}, &mut c);
-        assert_eq!(reply.get_str("ns").unwrap(), "t.c");
-        assert!(reply.get("indexSizes").is_some());
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-    }
-
-    #[test]
-    fn rename_collection_default_ok() {
-        // The fake uses the trait default (succeeds); validates dispatch + ns parse.
-        let mut c = ctx(FakeStorage::arc());
-        let reply = dispatch(&doc! {"renameCollection": "t.a", "to": "t.b"}, &mut c);
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-    }
 }

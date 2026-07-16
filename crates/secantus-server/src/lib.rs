@@ -20,19 +20,26 @@
 //! yet — `hello`'s replica-set `lastWrite` uses a zero timestamp until then).
 
 pub mod args;
+pub mod config;
 
+pub use config::{ConfigOverrides, ResolvedConfig};
+
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bson::{doc, Bson, Document};
-use secantus_commands::{dispatch, CommandContext, ConnectionAuth, CursorRegistry, Storage};
+use secantus_commands::logbuf::LogBuffer;
+use secantus_commands::{
+    dispatch, CommandContext, ConnectionAuth, ConnectionKiller, CursorRegistry, Storage,
+};
 use secantus_wire::{
     build_op_msg_reply, build_op_reply, Header, Op, OpMsg, WireError, HEADER_SIZE,
-    OP_MSG_FLAG_MORE_TO_COME,
+    OP_MSG_FLAG_EXHAUST_ALLOWED, OP_MSG_FLAG_MORE_TO_COME,
 };
 
 /// How long a connection read blocks before re-checking the shutdown flag, so
@@ -46,6 +53,60 @@ const ACCEPT_POLL: Duration = Duration::from_millis(5);
 /// buffered by the kernel and delivered in milliseconds), tight enough to reap
 /// a slow-loris connection that dribbles a partial frame forever.
 const DEFAULT_MESSAGE_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Hard ceiling on the total bytes held across all connections' in-flight
+/// message-body buffers. [`MAX_MESSAGE_SIZE`] bounds a *single* message (48 MB),
+/// but without a global cap many concurrent large messages could exhaust the
+/// heap. A connection reserves `body_len` here before allocating its body
+/// buffer and releases the reservation once the message is dispatched and
+/// answered. The cap is comfortably larger than `MAX_MESSAGE_SIZE`, so any one
+/// message always eventually fits and a waiting connection never wedges.
+const MAX_INFLIGHT_BYTES: usize = 512 * 1024 * 1024;
+
+/// A global byte budget for concurrent message-body allocations. `acquire`
+/// blocks while granting `n` more would exceed the cap, unless nothing is
+/// outstanding (so a lone oversized request proceeds rather than deadlock). The
+/// returned [`AllocReservation`] releases the bytes on drop and wakes a waiter.
+struct AllocBudget {
+    used: Mutex<usize>,
+    available: Condvar,
+    cap: usize,
+}
+
+impl AllocBudget {
+    fn new(cap: usize) -> Self {
+        AllocBudget {
+            used: Mutex::new(0),
+            available: Condvar::new(),
+            cap,
+        }
+    }
+
+    /// Reserve `n` bytes, blocking until they fit under the cap. Poison-tolerant
+    /// (`into_inner`): a panicked peer must not wedge the whole server.
+    fn acquire(&self, n: usize) -> AllocReservation<'_> {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used != 0 && *used + n > self.cap {
+            used = self.available.wait(used).unwrap_or_else(|e| e.into_inner());
+        }
+        *used += n;
+        AllocReservation { budget: self, n }
+    }
+}
+
+/// RAII reservation against an [`AllocBudget`]; releases on drop.
+struct AllocReservation<'a> {
+    budget: &'a AllocBudget,
+    n: usize,
+}
+
+impl Drop for AllocReservation<'_> {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock().unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(self.n);
+        self.budget.available.notify_all();
+    }
+}
 
 /// TLS / mTLS options (R5c). Mirrors `server.py`'s `tls_*` constructor knobs:
 /// `cert_file` + `key_file` enable server-side TLS; adding `ca_file` (and
@@ -101,19 +162,77 @@ struct Shared {
     storage: Arc<dyn Storage>,
     cursors: Arc<CursorRegistry>,
     transactions: Arc<secantus_commands::transactions::TransactionRegistry>,
+    /// Server-wide `configureFailPoint` registry, shared across connections.
+    failpoints: Arc<secantus_commands::failpoints::FailPointRegistry>,
     address: SocketAddr,
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
     stop: AtomicBool,
+    /// Live per-connection threads. `stop` waits for this to reach zero before
+    /// returning, so every connection thread has released its `Arc<Storage>` and
+    /// the WiredTiger connection can close cleanly (its final checkpoint must not
+    /// race a data-dir removal / reopen — see `ConnGuard`). Held behind its own
+    /// `Arc` (not via `Shared`) so a connection thread can drop its `Shared`
+    /// ref — and thus the storage ref — *before* it decrements the count.
+    active: Arc<AtomicUsize>,
     /// The built rustls server config when TLS is on (shared across connections).
     tls: Option<Arc<rustls::ServerConfig>>,
+    /// Global cap on concurrent in-flight message-body allocations.
+    alloc_budget: AllocBudget,
+    /// Live-connection registry: `conn_id → a clone of the connection's socket`,
+    /// so `killOp` can close a connection by its id. Each connection registers
+    /// on accept and unregisters on exit (`ConnEntryGuard`). Poison-tolerant.
+    conns: Arc<Mutex<HashMap<i64, TcpStream>>>,
+    /// The `ConnectionKiller` handed to each request's `CommandContext` so the
+    /// `killOp` handler can reach `conns` without depending on server internals.
+    conn_killer: Arc<dyn ConnectionKiller>,
+    /// In-memory log ring buffer surfaced by `getLog`; the server appends
+    /// connection-lifecycle lines and hands it to each request's context.
+    logs: Arc<LogBuffer>,
+}
+
+/// Closes a connection by `conn_id` on behalf of `killOp`, by shutting down the
+/// registered socket clone. Backs [`ConnectionKiller`].
+struct ConnRegistry {
+    conns: Arc<Mutex<HashMap<i64, TcpStream>>>,
+}
+
+impl ConnectionKiller for ConnRegistry {
+    fn kill(&self, conn_id: i64) -> bool {
+        let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        match conns.get(&conn_id) {
+            Some(sock) => {
+                // Best-effort: `shutdown` makes the peer's read return 0 and the
+                // connection thread exit (which unregisters the entry). An
+                // already-closed socket erroring here is harmless.
+                let _ = sock.shutdown(Shutdown::Both);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// RAII: removes a connection's entry from the registry when its thread exits.
+struct ConnEntryGuard {
+    conns: Arc<Mutex<HashMap<i64, TcpStream>>>,
+    conn_id: i64,
+}
+
+impl Drop for ConnEntryGuard {
+    fn drop(&mut self) {
+        self.conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.conn_id);
+    }
 }
 
 /// The Rust server's own version, embedded at compile time from the crate
 /// version (`crates/*/Cargo.toml`, bumped in lockstep). This is the canonical
 /// "Rust server version" — distinct from the Python server's `0.5.2bN` PyPI
 /// version (the two diverged at `0.5.2`; see the project `CLAUDE.md`). The
-/// `secantusdb` binary's `--version`, the embedded Python handle's `.version`,
+/// `secantusd-rs` binary's `--version`, the embedded Python handle's `.version`,
 /// and `buildInfo.secantusVersion` all surface this value.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -135,13 +254,51 @@ impl RunningServer {
         format!("mongodb://{}", self.shared.address)
     }
 
-    /// Signal shutdown and join the accept loop. Connection threads notice the
-    /// flag within `READ_POLL` and exit on their own.
+    /// Signal shutdown, join the accept loop, and **wait for the connection
+    /// threads to drain** before returning. Connection threads are detached, but
+    /// each holds an `Arc<Storage>`; if `stop` returned while one was still alive,
+    /// the WiredTiger connection wouldn't close until that thread later exited —
+    /// and its final close-checkpoint would then race the caller removing or
+    /// reopening the data dir (observed as `WT_PANIC: ... the system must
+    /// restart` when `WiredTigerHS.wt` vanished mid-checkpoint). Draining makes
+    /// teardown synchronous and the data dir quiescent on return. Mirrors the
+    /// Python server's "drain active connections before storage.close()".
     pub fn stop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.accept.take() {
             let _ = handle.join();
         }
+        // Connection threads notice the flag within READ_POLL (plain reads) or
+        // wake from a tailable getMore's ~1s oplog wait, then drop their storage
+        // ref. Poll until none remain; bounded so a wedged thread can't hang stop.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.shared.active.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(READ_POLL);
+        }
+    }
+}
+
+/// Increments the live-connection count for a connection thread's lifetime and
+/// decrements on drop — so an early `?` return or a panic still releases the
+/// slot. Holds only the counter `Arc` (never `Shared`), so it must be created
+/// *after* the thread already owns its `Shared`/storage ref and dropped *after*
+/// that ref is released: the decrement then signals "this thread holds no
+/// storage", which is exactly the invariant `stop`'s drain relies on.
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    fn new(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        ConnGuard(active)
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -204,16 +361,32 @@ pub fn bind(
         ))
     };
 
+    let conns: Arc<Mutex<HashMap<i64, TcpStream>>> = Arc::new(Mutex::new(HashMap::new()));
+    let conn_killer: Arc<dyn ConnectionKiller> = Arc::new(ConnRegistry {
+        conns: conns.clone(),
+    });
+    let logs = Arc::new(LogBuffer::new());
+    logs.append(
+        "I",
+        "CONTROL",
+        format!("SecantusDB (rust) {VERSION} started"),
+    );
     let shared = Arc::new(Shared {
         config,
         storage,
         cursors,
         transactions,
+        failpoints: Arc::new(secantus_commands::failpoints::FailPointRegistry::new()),
         address,
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
         stop: AtomicBool::new(false),
+        active: Arc::new(AtomicUsize::new(0)),
         tls,
+        alloc_budget: AllocBudget::new(MAX_INFLIGHT_BYTES),
+        conns,
+        conn_killer,
+        logs,
     });
 
     let accept_shared = shared.clone();
@@ -230,10 +403,19 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         match listener.accept() {
             Ok((stream, _peer)) => {
                 let conn_shared = shared.clone();
+                // Counter Arc is independent of `Shared`, so the guard can outlive
+                // `conn_shared`'s drop (which releases this thread's storage ref).
+                let active = shared.active.clone();
                 // Detached: the thread exits on EOF or when the stop flag is set
-                // (its blocking reads use READ_POLL timeouts).
+                // (its blocking reads use READ_POLL timeouts). `stop` waits on the
+                // count, not a JoinHandle.
                 thread::spawn(move || {
+                    let guard = ConnGuard::new(active);
                     let _ = handle_connection(stream, conn_shared);
+                    // `conn_shared` (and every per-request storage clone) is now
+                    // dropped; only then decrement, so a zero count guarantees no
+                    // connection thread still references storage.
+                    drop(guard);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -248,8 +430,42 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
 /// TLS handshake (extracting the client cert DN) or plaintext, before driving
 /// the request loop in [`serve`].
 fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+    // The listener is non-blocking and (on macOS/BSD) the accepted socket
+    // inherits O_NONBLOCK. Put it back to blocking so a large `write_all` (a
+    // reply bigger than the kernel send buffer, ~1 MB) blocks until drained
+    // instead of failing with WouldBlock and dropping the connection. Reads
+    // still get a timeout via `set_read_timeout` (blocking-with-timeout).
+    tcp.set_nonblocking(false)?;
     tcp.set_read_timeout(Some(READ_POLL))?;
     let conn_id = shared.next_conn_id.fetch_add(1, Ordering::SeqCst);
+    // Register a killable handle (a clone of this socket) under `conn_id` so a
+    // `killOp` from another connection can `shutdown` it; the guard unregisters
+    // when this thread exits. Cloning failure is non-fatal — the connection just
+    // isn't killable (better than refusing it). The clone shares the OS socket,
+    // so a `shutdown` on it tears down this connection (TLS included, since the
+    // underlying TCP is what closes).
+    if let Ok(kill_handle) = tcp.try_clone() {
+        shared
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conn_id, kill_handle);
+    }
+    let _conn_entry = ConnEntryGuard {
+        conns: shared.conns.clone(),
+        conn_id,
+    };
+    // Record the accept in the getLog ring buffer (mirrors the Python server's
+    // "connection accepted" NETWORK line).
+    let peer = tcp
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    shared.logs.append(
+        "I",
+        "NETWORK",
+        format!("connection accepted from {peer} #{conn_id}"),
+    );
     // Per-connection auth state, shared across every request on this socket so a
     // SCRAM conversation (saslStart → saslContinue) and the authenticated
     // principals persist for the connection's lifetime.
@@ -327,7 +543,10 @@ fn serve<S: Read + Write>(
             Err(_) => return Ok(()),
         };
 
-        // Body.
+        // Body. Reserve against the global allocation budget first so a flood of
+        // concurrent large messages can't exhaust the heap; the reservation is
+        // released at the end of this loop iteration when `_body_budget` drops.
+        let _body_budget = shared.alloc_budget.acquire(body_len);
         let mut body = vec![0u8; body_len];
         match read_full(stream, &mut body, shared, &mut deadline)? {
             ReadOutcome::Filled => {}
@@ -337,6 +556,7 @@ fn serve<S: Read + Write>(
         match secantus_wire::parse_body(header.op_code, &body) {
             Ok(Op::Msg(msg)) => {
                 let more_to_come = msg.flags & OP_MSG_FLAG_MORE_TO_COME != 0;
+                let exhaust_allowed = msg.flags & OP_MSG_FLAG_EXHAUST_ALLOWED != 0;
                 let request = match merge_op_msg_body(&msg) {
                     Ok(d) => d,
                     Err(e) => {
@@ -345,8 +565,60 @@ fn serve<S: Read + Write>(
                         continue;
                     }
                 };
-                let reply = run_dispatch(&request, conn_id, shared, conn_auth, &peer_cert_dn);
-                if !more_to_come {
+                let (reply, close_conn) =
+                    run_dispatch(&request, conn_id, shared, conn_auth, &peer_cert_dn);
+                // A `closeConnection` failpoint drops the socket without replying,
+                // so the driver observes a network error.
+                if close_conn {
+                    return Ok(());
+                }
+                if more_to_come {
+                    // Fire-and-forget request (`w: 0` write): spec forbids a reply.
+                    continue;
+                }
+                // OP_MSG exhaust: a getMore with `exhaustAllowed` set streams every
+                // remaining batch back over the same socket with `moreToCome`,
+                // instead of one reply per getMore. mongod only streams on getMore
+                // (the find/aggregate reply that opens the cursor is sent normally).
+                if exhaust_allowed
+                    && request.contains_key("getMore")
+                    && matches!(reply.get("cursor"), Some(Bson::Document(_)))
+                {
+                    if !stream_exhaust_getmore(
+                        stream,
+                        &header,
+                        shared,
+                        &request,
+                        conn_id,
+                        conn_auth,
+                        &peer_cert_dn,
+                        reply,
+                    )? {
+                        return Ok(());
+                    }
+                } else if exhaust_allowed
+                    && is_hello_command(&request)
+                    && request.contains_key("maxAwaitTimeMS")
+                    && reply_ok(&reply)
+                {
+                    // Streaming-SDAM monitor: an awaitable `hello`/`isMaster`
+                    // (carries `maxAwaitTimeMS`) sent with `exhaustAllowed` wants
+                    // a continuous `moreToCome` hello stream. Honour it so the
+                    // driver's monitor doesn't raise "Server ended moreToCome
+                    // unexpectedly" on teardown.
+                    if !stream_awaitable_hello(
+                        stream,
+                        &header,
+                        shared,
+                        &request,
+                        conn_id,
+                        conn_auth,
+                        &peer_cert_dn,
+                        reply,
+                    )? {
+                        return Ok(());
+                    }
+                } else {
                     write_op_msg(stream, &header, shared, &reply)?;
                 }
             }
@@ -457,18 +729,36 @@ fn merge_op_msg_body(msg: &OpMsg) -> Result<Document, WireError> {
     Ok(body)
 }
 
+/// Dispatch one request, returning the reply plus whether the connection should
+/// be dropped (a `closeConnection` failpoint fired — the reply is discarded).
 fn run_dispatch(
     request: &Document,
     conn_id: i64,
     shared: &Arc<Shared>,
     conn_auth: &Arc<Mutex<ConnectionAuth>>,
     peer_cert_dn: &Option<String>,
-) -> Document {
+) -> (Document, bool) {
     let mut ctx = make_context(conn_id, shared, conn_auth, peer_cert_dn);
     if let Ok(db) = request.get_str("$db") {
         ctx.db_name = db.to_string();
     }
-    dispatch(request, &mut ctx)
+    // Defense-in-depth: every handler is contracted to return a `CommandError`
+    // rather than panic, and the known interior-NUL vector is rejected earlier
+    // in `dispatch_inner` (#139). But if any handler ever panics, catch it here
+    // and reply with a wire-level `InternalError` instead of letting the panic
+    // unwind the connection thread and drop the socket with no reply — matching
+    // the Python server's dispatch-level catch-all.
+    let reply =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(request, &mut ctx)))
+            .unwrap_or_else(|_| {
+                let mut d = Document::new();
+                d.insert("ok", 0.0_f64);
+                d.insert("errmsg", "internal server error");
+                d.insert("code", 1_i32);
+                d.insert("codeName", "InternalError");
+                d
+            });
+    (reply, ctx.close_connection)
 }
 
 fn make_context(
@@ -481,7 +771,10 @@ fn make_context(
         .with_storage(shared.storage.clone())
         .with_cursors(shared.cursors.clone())
         .with_transactions(shared.transactions.clone())
-        .with_conn_auth(conn_auth.clone());
+        .with_failpoints(shared.failpoints.clone())
+        .with_conn_auth(conn_auth.clone())
+        .with_conn_killer(shared.conn_killer.clone())
+        .with_logs(shared.logs.clone());
     ctx.server_address = Some((shared.address.ip().to_string(), shared.address.port()));
     ctx.replica_set_name = shared.config.replica_set_name.clone();
     ctx.require_auth = shared.config.require_auth;
@@ -514,6 +807,206 @@ fn write_op_msg<S: Write>(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, 0);
     stream.write_all(&frame)
+}
+
+/// Write one OP_MSG reply with the given flag bits (e.g. `moreToCome` for an
+/// exhaust-stream batch).
+fn write_op_msg_flags<S: Write>(
+    stream: &mut S,
+    header: &Header,
+    shared: &Arc<Shared>,
+    reply: &Document,
+    flags: u32,
+) -> io::Result<()> {
+    let mut body_bytes = Vec::with_capacity(256);
+    reply
+        .to_writer(&mut body_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, flags);
+    stream.write_all(&frame)
+}
+
+/// Stream the rest of an exhaust cursor over one socket. Called when a getMore
+/// arrives with the OP_MSG `exhaustAllowed` flag set: `first_reply` (the getMore
+/// handler's reply) and every subsequent batch are sent with `moreToCome` set,
+/// pulling further batches with synthetic getMores, until the cursor drains —
+/// then a final `id: 0` reply with `moreToCome` clear closes the stream. mongod
+/// keeps the cursor alive until a getMore returns an empty batch, so a cursor
+/// that drains on a non-empty batch still gets a trailing empty reply. Mirrors
+/// `server.py::_stream_exhaust_getmore`. `Ok(true)` = stream written (connection
+/// survives); `Ok(false)` = a write failed mid-stream (drop the connection).
+#[allow(clippy::too_many_arguments)]
+fn stream_exhaust_getmore<S: Write>(
+    stream: &mut S,
+    header: &Header,
+    shared: &Arc<Shared>,
+    request: &Document,
+    conn_id: i64,
+    conn_auth: &Arc<Mutex<ConnectionAuth>>,
+    peer_cert_dn: &Option<String>,
+    first_reply: Document,
+) -> io::Result<bool> {
+    let target_id = match request.get("getMore") {
+        Some(b) => b.clone(),
+        None => return Ok(true),
+    };
+    let coll = request.get_str("collection").unwrap_or("").to_string();
+    let db = request.get_str("$db").unwrap_or("admin").to_string();
+    let ns = first_reply
+        .get_document("cursor")
+        .ok()
+        .and_then(|c| c.get_str("ns").ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{db}.{coll}"));
+
+    let send = |stream: &mut S, doc: &Document, more: bool| -> io::Result<bool> {
+        let flags = if more { OP_MSG_FLAG_MORE_TO_COME } else { 0 };
+        match write_op_msg_flags(stream, header, shared, doc, flags) {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    };
+
+    let mut doc = first_reply;
+    loop {
+        let cursor = match doc.get("cursor") {
+            Some(Bson::Document(c)) => c.clone(),
+            // An error reply (ok: 0) mid-stream — deliver it without moreToCome.
+            _ => return send(stream, &doc, false),
+        };
+        let batch: Vec<Bson> = cursor
+            .get_array("nextBatch")
+            .or_else(|_| cursor.get_array("firstBatch"))
+            .cloned()
+            .unwrap_or_default();
+        let drained = cursor.get_i64("id").unwrap_or(0) == 0;
+        if drained {
+            if !batch.is_empty()
+                && !send(
+                    stream,
+                    &doc! {"cursor": {"nextBatch": batch, "id": target_id.clone(), "ns": &ns}, "ok": 1.0},
+                    true,
+                )?
+            {
+                return Ok(false);
+            }
+            let empty: Vec<Bson> = Vec::new();
+            return send(
+                stream,
+                &doc! {"cursor": {"nextBatch": empty, "id": 0i64, "ns": &ns}, "ok": 1.0},
+                false,
+            );
+        }
+        if batch.is_empty() {
+            // A live cursor that yielded nothing (tailable/awaitData wait expired):
+            // deliver this empty batch without moreToCome and stop streaming so we
+            // don't spin. Normal cursors never reach here (empty drains id to 0).
+            return send(stream, &doc, false);
+        }
+        if !send(stream, &doc, true)? {
+            return Ok(false);
+        }
+        let mut getmore = doc! {"getMore": target_id.clone(), "collection": &coll, "$db": &db};
+        if let Some(bs) = request.get("batchSize") {
+            getmore.insert("batchSize", bs.clone());
+        }
+        if let Some(mt) = request.get("maxTimeMS") {
+            getmore.insert("maxTimeMS", mt.clone());
+        }
+        let (reply, _close) = run_dispatch(&getmore, conn_id, shared, conn_auth, peer_cert_dn);
+        doc = reply;
+    }
+}
+
+/// True if `request` is a `hello` / `isMaster` / `ismaster` handshake command.
+fn is_hello_command(request: &Document) -> bool {
+    matches!(
+        request.keys().next().map(String::as_str),
+        Some("hello") | Some("isMaster") | Some("ismaster")
+    )
+}
+
+/// True if `reply.ok` is truthy (1.0 / nonzero int).
+fn reply_ok(reply: &Document) -> bool {
+    matches!(reply.get("ok"), Some(Bson::Double(d)) if *d != 0.0)
+        || matches!(reply.get("ok"), Some(Bson::Int32(n)) if *n != 0)
+        || matches!(reply.get("ok"), Some(Bson::Int64(n)) if *n != 0)
+}
+
+/// Stream awaitable (streaming-SDAM) `hello` replies over an exhaust monitor
+/// connection. Once a driver sees `topologyVersion` it switches its monitor to
+/// the streaming protocol: it sends `hello` with `maxAwaitTimeMS` and the
+/// `exhaustAllowed` flag and keeps the connection open expecting a *continuous*
+/// stream of `moreToCome` replies (mongod holds each until the topology changes
+/// or `maxAwaitTimeMS` elapses). If the server answers with a single
+/// `moreToCome`-clear reply, the driver's monitor still treats the connection as
+/// a live stream and, when the socket later closes, raises "Server ended
+/// moreToCome unexpectedly" and clears the pool. Our topology is fixed, so we
+/// re-emit the same hello state every `maxAwaitTimeMS` with `moreToCome` set;
+/// the wait polls `shared.stop` so shutdown is prompt, and on shutdown we send a
+/// final `moreToCome`-clear reply (a clean end the driver accepts silently).
+/// Mirrors `server.py::_stream_awaitable_hello`. `Ok(true)` = ended cleanly,
+/// `Ok(false)` = a write failed (drop the connection).
+#[allow(clippy::too_many_arguments)]
+fn stream_awaitable_hello<S: Read + Write>(
+    stream: &mut S,
+    header: &Header,
+    shared: &Arc<Shared>,
+    request: &Document,
+    conn_id: i64,
+    conn_auth: &Arc<Mutex<ConnectionAuth>>,
+    peer_cert_dn: &Option<String>,
+    first_reply: Document,
+) -> io::Result<bool> {
+    let max_await_ms = request
+        .get_i64("maxAwaitTimeMS")
+        .or_else(|_| request.get_i32("maxAwaitTimeMS").map(i64::from))
+        .unwrap_or(10_000)
+        .max(0) as u64;
+
+    // Establish the stream with the reply the handler already produced.
+    if write_op_msg_flags(
+        stream,
+        header,
+        shared,
+        &first_reply,
+        OP_MSG_FLAG_MORE_TO_COME,
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
+    loop {
+        // Hold up to maxAwaitTimeMS (topology never changes). Each iteration
+        // probes the socket (its read timeout is `READ_POLL`): a 0-byte read is
+        // EOF — the client closed it or a kill shut it down — and any bytes mid-
+        // stream are an unexpected client message; either way we drop the stream.
+        // `shared.stop` is checked too so the monitor thread is reaped promptly
+        // on shutdown, ending the stream with a clean `moreToCome`-clear reply.
+        let deadline = Instant::now() + Duration::from_millis(max_await_ms);
+        loop {
+            if shared.stop.load(Ordering::SeqCst) {
+                let _ = write_op_msg_flags(stream, header, shared, &first_reply, 0);
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            let mut probe = [0u8; 1];
+            match stream.read(&mut probe) {
+                Ok(0) => return Ok(false), // EOF: client closed / killed
+                Ok(_) => return Ok(false), // unexpected data mid-stream: drop
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut => {}
+                Err(_) => return Ok(false), // socket error: drop
+            }
+        }
+        let (reply, _close) = run_dispatch(request, conn_id, shared, conn_auth, peer_cert_dn);
+        if write_op_msg_flags(stream, header, shared, &reply, OP_MSG_FLAG_MORE_TO_COME).is_err() {
+            return Ok(false);
+        }
+    }
 }
 
 fn write_op_reply<S: Write>(
@@ -613,4 +1106,61 @@ fn read_full<S: Read>(
         }
     }
     Ok(ReadOutcome::Filled)
+}
+
+#[cfg(test)]
+mod alloc_budget_tests {
+    use super::AllocBudget;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn reservation_releases_on_drop() {
+        let b = AllocBudget::new(100);
+        {
+            let _r = b.acquire(60);
+            assert_eq!(*b.used.lock().unwrap(), 60);
+        }
+        assert_eq!(*b.used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn over_cap_blocks_until_released() {
+        let b = Arc::new(AllocBudget::new(100));
+        let first = b.acquire(80); // 80/100 used
+
+        let started = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let b2 = b.clone();
+        let started2 = started.clone();
+        let done2 = done.clone();
+        let h = thread::spawn(move || {
+            started2.store(true, Ordering::SeqCst);
+            // 80 + 40 > 100 → must block until `first` is released.
+            let _r = b2.acquire(40);
+            done2.store(true, Ordering::SeqCst);
+        });
+
+        // Give the waiter time to reach the blocking wait.
+        while !started.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(!done.load(Ordering::SeqCst), "should still be blocked");
+
+        drop(first); // frees 80 → the 40 now fits
+        h.join().unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(*b.used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn lone_oversized_request_proceeds() {
+        // Nothing outstanding: a request larger than the cap must not deadlock.
+        let b = AllocBudget::new(100);
+        let _r = b.acquire(500);
+        assert_eq!(*b.used.lock().unwrap(), 500);
+    }
 }

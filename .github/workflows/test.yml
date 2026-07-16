@@ -18,9 +18,13 @@ on:
       - 'LICENSE*'
       - 'docs/**'
   # Weekly full-matrix run: every Monday 06:00 UTC, exercises all
-  # supported CPython versions (3.10–3.13) across Linux/macOS/Windows.
+  # supported CPython versions (3.10–3.13) across Linux/Windows.
   # Push/PR runs only test 3.10 on each OS to keep latency tight; this
   # cron catches version-specific regressions before they accumulate.
+  # macOS is intentionally excluded from this CI workflow — its runners
+  # build vendored WiredTiger from source on a slow, contended pool (10–40+
+  # min, occasionally hanging), which is too costly to gate every push/PR on.
+  # macOS wheels are still built and validated at release time (publish.yml).
   schedule:
     - cron: '0 6 * * 1'
   # Manual full-matrix trigger from the Actions tab. Same effect as the
@@ -32,40 +36,71 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: these jobs only check out the repo, restore caches, and run
+# the test suite — none of which need write access to repo contents. Declaring
+# an explicit read-only scope drops the default token's broader grant. (§I6)
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ${{ matrix.os }}
+    # The Linux lane. Windows runs as the sharded ``test-windows`` job below;
+    # macOS is excluded from CI entirely — built at release only (see
+    # top-of-file note).
+    runs-on: ubuntu-latest
+    # The whole suite runs in ~4 min locally; 30 min is generous for CI. Without
+    # this, a hung run (a daemon/thread not reaped — historically a rust-server
+    # stop() / change-stream-tail wedge, see the faulthandler watchdog in
+    # tests/conftest.py) blocks the runner until GitHub's 6-hour kill with no
+    # diagnostics. macOS is dropped from this matrix for the same flakiness
+    # (9e16e49); the cap also protects the release-time macOS run.
+    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
+    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
+    # (3.12); without it, a bare `uv run` after the sync re-resolves against
+    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
+    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
+    # same mechanism that made every matrix cell silently test 3.12 before.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        # Push / PR: 3.10 only (one cell per OS = 3 cells, fast feedback).
-        # Schedule / workflow_dispatch: full version sweep
-        # (4 Pythons × 3 OSes = 12 cells).
+        # Push / PR: 3.10 only (fast feedback). Schedule / workflow_dispatch:
+        # full version sweep.
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
     steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive  # vendor/wiredtiger is needed by the build
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
-      - name: Install swig (Linux)
-        if: runner.os == 'Linux'
+      - name: Free up disk space
+        # The durable-storage lane (ubuntu only) keeps thousands of on-disk
+        # WiredTiger homes for the whole session — tmp_path_retention_policy is
+        # pinned to "all" because deleting a passed test's WT home mid-session
+        # races WT's background threads → WT_PANIC (see tests/conftest.py). Each
+        # instance is already minimised (~10 MB via log=(prealloc=false)), but
+        # thousands of them approach the runner's ~21 GB free and tipped over
+        # with "No space left on device". Reclaim ~15-20 GB of preinstalled
+        # toolchains this build never uses (kept: the hostedtoolcache that
+        # setup-python reads). See tasks/backlog.md.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+          df -h /
+
+      - name: Install swig
         run: sudo apt-get update && sudo apt-get install -y swig
 
-      - name: Install swig (macOS)
-        if: runner.os == 'macOS'
-        run: brew install swig
-
-      - name: Install swig (Windows)
-        if: runner.os == 'Windows'
-        # SWIG ships preinstalled on windows-2022 runners, but choco
-        # re-installs idempotently to defend against runner image
-        # refreshes that drop it. Same line cibuildwheel uses for
-        # publish-time wheel builds.
-        run: choco install -y swig
-
-      - name: Install MongoDB CLI tools (Linux)
-        if: runner.os == 'Linux'
+      - name: Install MongoDB CLI tools
         # mongosh + Database Tools so the CLI-tool conformance tests
         # (tests/test_mongosh.py, test_mongodump_restore.py,
         # test_mongoimport_export.py, test_mongofiles.py,
@@ -80,14 +115,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mongodb-mongosh mongodb-database-tools
 
-      - name: Install MongoDB CLI tools (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew tap mongodb/brew
-          brew install mongosh mongodb-database-tools
-
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           # Default ``cache-dependency-glob`` is ``**/uv.lock``; on
@@ -107,15 +136,6 @@ jobs:
         # time. ``website`` is intentionally excluded — pelican / boto3
         # aren't exercised by pytest and would just slow CI down.
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
-
-      - name: Install tzdata (Windows)
-        if: runner.os == 'Windows'
-        # Windows ships no IANA timezone database; Python's
-        # ``zoneinfo`` returns nothing for ``ZoneInfo("Europe/Dublin")``
-        # without it. ``tzdata`` is a tiny pure-Python package that
-        # bundles the IANA data. Linux/macOS use the system tzdata,
-        # so we only need this on Windows runners.
-        run: uv pip install tzdata
 
       - name: Lint
         run: uv run ruff check src tests
@@ -142,30 +162,228 @@ jobs:
         # ``--timeout`` above regardless, so the restart budget is safe.
         run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
 
-  # The matrix above runs the default pure-Python engines. This job builds the
-  # optional Rust accelerator core (``_secantus_core``) and validates it two
-  # ways: the engine-parity suites (pure-Python vs Rust, byte-for-byte) and the
-  # FULL pytest suite under ``SECANTUS_ENGINE=rust`` — so the Rust engine is
-  # differentially validated against real WiredTiger-backed behaviour through
-  # pymongo. (The Rust engines reproduce the pure path exactly or fall back to
-  # it, so the full suite is expected green under either engine.)
+
+  # The Windows lane, split from the ``test`` job and sharded two ways so the
+  # slowest platform stops being the workflow's critical path (~20 min in one
+  # job on a 4-vCPU runner). The split is complete by construction: the ``sql``
+  # shard runs exactly the files the ``core`` shard ``--ignore-glob``s, so a new
+  # test file always lands in exactly one shard. Lint runs on Linux only — it is
+  # platform-independent.
+  test-windows:
+    runs-on: windows-latest
+    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
+    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
+    # (3.12); without it, a bare `uv run` after the sync re-resolves against
+    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
+    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
+    # same mechanism that made every matrix cell silently test 3.12 before.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Push / PR: 3.10 only. Schedule / workflow_dispatch: full sweep.
+        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
+        shard: [sql, core]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Checkout the WiredTiger submodule
+        # See the ``test`` job's twin step for why this replaces
+        # ``submodules: recursive``.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
+
+      - name: Disable Defender real-time scanning
+        # Every test opens its own on-disk WiredTiger home under tmp_path —
+        # thousands of short-lived small files per run. Defender's real-time
+        # engine scans each one synchronously on create/write/close, which
+        # taxes exactly this workload; the runner VM is ephemeral and builds
+        # only this checkout, so scanning it buys nothing. Best-effort: if the
+        # image ever locks the preference, fall through rather than fail.
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Warning "could not disable Defender real-time scanning: $_" }
+
+      - name: Put temp files on the runner work disk
+        # pytest's tmp_path (→ every WT home) follows TMP/TEMP, which points at
+        # the small OS-disk profile temp dir; RUNNER_TEMP lives on the runner's
+        # work disk, provisioned for build I/O and wiped between jobs anyway.
+        shell: pwsh
+        run: |
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install swig
+        # SWIG ships preinstalled on windows-2022 runners, but choco
+        # re-installs idempotently to defend against runner image
+        # refreshes that drop it. Same line cibuildwheel uses for
+        # publish-time wheel builds.
+        run: choco install -y swig
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          # Same narrow glob as the ``test`` job: one lock file at the repo
+          # root, and the default recursive walk trips on deep vendor paths.
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+
+      - name: Install tzdata
+        # Windows ships no IANA timezone database; Python's
+        # ``zoneinfo`` returns nothing for ``ZoneInfo("Europe/Dublin")``
+        # without it. ``tzdata`` is a tiny pure-Python package that
+        # bundles the IANA data.
+        run: uv pip install tzdata
+
+      - name: Tests (${{ matrix.shard }} shard)
+        # Same pytest flags as the ``test`` job (see the comments there). The
+        # ``sql`` shard is the SQL engine + PG-wire suites; ``core`` is
+        # everything else. git-bash expands the globs.
+        shell: bash
+        run: |
+          if [ "${{ matrix.shard }}" = "sql" ]; then
+            uv run python -m pytest tests/test_sql_*.py tests/test_pgserver*.py \
+              --timeout=120 --timeout-method=thread --max-worker-restart=3
+          else
+            uv run python -m pytest \
+              --ignore-glob='tests/test_sql_*.py' --ignore-glob='tests/test_pgserver*.py' \
+              --timeout=120 --timeout-method=thread --max-worker-restart=3
+          fi
+
+  # The slow + durable lanes, split out of the ``test`` matrix job so they run
+  # in PARALLEL with the fast suite instead of serially after it: the durable
+  # pass re-runs the whole suite and roughly doubled the Linux lane's wall
+  # time (~708s fast + ~618s durable + ~59s slow serial in one job). Same
+  # commands, same coverage, same python-version sweep on schedule — only the
+  # job boundary moved. Setup cost (~3 min) is paid once more in exchange for
+  # taking ~11 min off the workflow's critical path.
+  test-durable:
+    runs-on: ubuntu-latest
+    # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
+    # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
+    # (3.12); without it, a bare `uv run` after the sync re-resolves against
+    # the pin, REMOVES the matrix-python venv, and re-creates a 3.12 one
+    # without the dev extras (first symptom: `Failed to spawn: ruff`) — the
+    # same mechanism that made every matrix cell silently test 3.12 before.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Checkout the WiredTiger submodule
+        # See the ``test`` job's twin step for why this replaces
+        # ``submodules: recursive``.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
+
+      - name: Free up disk space
+        # The durable lane keeps thousands of on-disk WiredTiger homes for the
+        # whole session (tmp_path_retention_policy is pinned to "all" — see the
+        # ``test`` job's twin step and tests/conftest.py) and tipped over the
+        # runner's ~21 GB free without this.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+          df -h /
+
+      - name: Install swig
+        run: sudo apt-get update && sudo apt-get install -y swig
+
+      - name: Install MongoDB CLI tools
+        # Same rationale as the ``test`` job: without mongosh + Database Tools
+        # the CLI-tool conformance tests skip, and the durable pass must cover
+        # exactly what the fast pass covers.
+        run: |
+          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+          sudo apt-get update
+          sudo apt-get install -y mongodb-mongosh mongodb-database-tools
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+
+      - name: Slow tests
+        # Long-running stress / scaling tests carry ``@pytest.mark.slow`` and are
+        # excluded from the default suite (addopts ``-m 'not ... slow'``) to keep
+        # the inner loop fast. Run them here — once, on Linux — so the races they guard (the xdist-worker-crash
+        # teardown drain in test_server_shutdown; the WT concurrency-ceiling
+        # benchmark in test_concurrency) stay covered instead of running nowhere.
+        # A command-line ``-m slow`` overrides the addopts marker filter while
+        # ``-n auto``/``--dist=loadgroup`` from addopts are retained.
+        run: uv run python -m pytest -m slow --timeout=120 --timeout-method=thread --max-worker-restart=3
+
+      - name: Durable-storage tests
+        # The default suite above runs FAST (the test conftest sets
+        # ``SECANTUS_TEST_FAST_STORAGE=1``: journal on, close-checkpoint skipped),
+        # so it does NOT exercise the checkpoint-durability path. Re-run the whole
+        # suite here with ``SECANTUS_FORCE_DURABLE=1`` — which overrides the fast
+        # default inside ``Storage`` — so the real journal + close-checkpoint
+        # durability behaviour (schema, persistence, close-and-reopen, PITR /
+        # backup) is exercised on every push. Once, on Linux. This is the
+        # "real durable disk testing" path.
+        env:
+          SECANTUS_FORCE_DURABLE: "1"
+        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
+
+  # The matrix above runs the pure-Python server. This job builds the Rust core
+  # (``_secantus_core``) and pins each Rust engine byte-for-byte against its
+  # pure-Python counterpart via the engine-parity suites (the operator oracle).
+  # NOTE: the old ``SECANTUS_ENGINE=rust`` full-suite step was removed when the
+  # in-process engine selection was retired (two-server model) — with no Python
+  # module delegating to ``_secantus_core`` any more, running the full suite
+  # under that env var was a no-op re-run of the ``test`` job and a flake source.
+  # The Rust engines are now exercised only as the separate Rust server and via
+  # these parity suites.
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive  # vendor/wiredtiger is needed by the build
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
       - name: Install swig
         run: sudo apt-get update && sudo apt-get install -y swig
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
         with:
           components: clippy, rustfmt
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -194,18 +412,10 @@ jobs:
       - name: Engine-parity suites (pure-Python vs Rust)
         run: >-
           uv run python -m pytest
-          tests/test_engine.py
           tests/test_rust_sortkey_parity.py tests/test_rust_query_parity.py
           tests/test_rust_update_parity.py tests/test_rust_expressions_parity.py
           tests/test_rust_projection_parity.py tests/test_rust_diff_parity.py
           tests/test_rust_aggregate_parity.py
-
-      - name: Full suite under the Rust engine
-        env:
-          SECANTUS_ENGINE: rust
-        # ``--max-worker-restart=3`` for the same transient-worker-crash flake
-        # as the pure-Python ``test`` job above (the timeout still guards hangs).
-        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
 
   # The WiredTiger-linking Rust storage crate (`secantus-storage`, Phase 4) — the
   # secondary-index + CRUD storage layer. It's excluded from the `crates/`
@@ -219,9 +429,17 @@ jobs:
   rust-storage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive  # vendor/wiredtiger is needed by the build
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
       # swig builds WT's Python module; clang/libclang for secantus-wt's bindgen;
       # ninja is the generator the WT ExternalProject forces.
@@ -229,12 +447,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
         with:
           components: clippy, rustfmt
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -268,37 +486,59 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
-      - name: Cargo fmt / clippy / build (secantus-storage-adapter, R4b)
+      - name: Cargo fmt / clippy / test (secantus-storage-adapter, R4b)
         # The WiredTiger → command-`Storage` adapter (R4b). Like secantus-storage
         # it links WiredTiger and is excluded from the workspace, so it's built
         # here against the vendored WT resolved above. clippy/build also settle
         # whether `secantus_storage::Storage` is `Send + Sync` (the command
-        # `Storage` trait's supertrait). It has no tests of its own.
+        # `Storage` trait's supertrait). Its `tests/command_*_wt.rs` drive the
+        # command layer end-to-end through the real WT adapter — the layer that
+        # catches command-behaviour regressions — so run them here.
         working-directory: crates/secantus-storage-adapter
         run: |
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
-          cargo build
+          cargo test
 
   # Builds the main `secantus` wheel with the off-by-default storage-engine flag
   # flipped ON (SECANTUS_BUILD_STORAGE_ENGINE=ON): the Rust `_secantus_storage`
   # extension links the SAME bundled WiredTiger this wheel already builds and
   # ships inside it. Proves the "bundle behind a build flag" packaging end to end
-  # across Linux / macOS / Windows. The DEFAULT wheel build (flag OFF, no
-  # Rust/clang needed) is covered by the `test` matrix and wheels.yml.
+  # across Linux / Windows (macOS at release only — see top-of-file note). The
+  # DEFAULT wheel build (flag OFF, no Rust/clang needed) is covered by the
+  # `test` matrix and wheels.yml.
   storage-engine:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS excluded — built at release only (see top-of-file note).
+        os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive  # vendor/wiredtiger is needed by the build
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Checkout the WiredTiger submodule
+        # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
+        # cloned all 12 vendored submodules — 11 of them driver-gauge repos
+        # (mongo-java-driver, mongo-c-driver, ...) whose gigabytes of history
+        # only the weekly validate workflow reads. Shallow-init just WT; fall
+        # back to a full fetch if the shallow probe is refused.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
       # bindgen needs libclang; the WT ExternalProject forces the Ninja
       # generator; swig builds WT's (unused-here but configured) Python module.
+      - name: Disable Defender real-time scanning (Windows)
+        if: runner.os == 'Windows'
+        # Real-time scanning synchronously inspects every file the build
+        # creates (cargo + CMake object files, the WT tree, wheel staging) on
+        # an ephemeral VM that builds only this checkout. Best-effort.
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Warning "could not disable Defender real-time scanning: $_" }
+
       - name: Install toolchain (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
@@ -320,10 +560,10 @@ jobs:
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -351,6 +591,26 @@ jobs:
           python -c "import _secantus_storage, _secantus_server;
           print('bundled OK:', _secantus_storage.__file__, _secantus_server.__file__)"
 
+      - name: Assert the wheel bundles secantusd-rs on PATH + it runs (non-Windows)
+        # CMake installs the standalone binary into the wheel's scripts dir
+        # (SKBUILD_SCRIPTS_DIR), so installing the wheel puts `secantusd-rs` on
+        # PATH — distinct from the pure-Python `secantus.cli:main` `secantusd-py`
+        # console script. Drive the bundled binary through the same smoke test
+        # via SECANTUSDB_BIN. Windows is skipped (the bin isn't built there; see
+        # CMakeLists.txt / tasks/backlog.md §7).
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          whl=$(ls dist-storage/*.whl)
+          uv run --no-project --with pymongo --with pytest --with "$whl" bash -c '
+            set -e
+            bin=$(command -v secantusd-rs) || { echo "secantusd-rs not on PATH after install" >&2; exit 1; }
+            echo "secantusd-rs -> $bin"
+            "$bin" --version
+            SECANTUSDB_BIN="$bin" python -m pytest tests/test_rust_binary_smoke.py \
+              -o addopts= -p no:cacheprovider -q
+          '
+
       - name: Storage + Rust-server smoke tests
         # test_rust_storage_smoke.py drives the storage engine; test_rust_server
         # _smoke.py drives the embedded Rust server (R6) end-to-end via pymongo —
@@ -362,7 +622,7 @@ jobs:
           python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
           -o addopts= -p no:cacheprovider -q
 
-      - name: Build + smoke the standalone secantusdb binary (R7)
+      - name: Build + smoke the standalone secantusd-rs binary (R7)
         # The bin crate links the SAME vendored WiredTiger the wheel build above
         # produced under build/*/wt-build (scikit-build-core's build-dir), via
         # build.rs's SECANTUS_WT_INCLUDE / SECANTUS_WT_LIB override. Windows is

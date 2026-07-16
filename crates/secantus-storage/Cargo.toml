@@ -1,6 +1,6 @@
 [package]
 name = "secantus-storage"
-version = "0.5.3-beta.21"
+version = "0.5.3-beta.147"
 edition = "2021"
 description = "SecantusDB's storage layer in Rust (Phase 4): WiredTiger-backed collections/documents over secantus-wt, with id_key sort encoding from secantus-core."
 license = "GPL-2.0-only"
@@ -18,3 +18,11 @@ secantus-core = { path = "../secantus-core" }
 # S2 cell coverings for `2dsphere` index acceleration (geo-3). Kept here, not in
 # secantus-core, so the shipped `secantus-core` wheel stays lean.
 s2 = "0.0.12"
+# Backup archives (PITR): tar the WiredTiger `backup:` file set into a gzip
+# stream, with a JSON pitr-manifest. Mirrors Python `Storage.create_archive`.
+tar = "0.4"
+flate2 = "1"
+serde_json = "1"
+# Restore extracts a base snapshot to a temp dir while stitching its oplog (also
+# used by tests).
+tempfile = "3"

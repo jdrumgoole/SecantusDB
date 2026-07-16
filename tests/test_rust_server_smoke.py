@@ -431,3 +431,347 @@ def test_change_stream_against_rust_server(tmp_path) -> None:
             cs.close()
     finally:
         srv.stop()
+
+
+def test_secantus_admin_prune_commands(tmp_path) -> None:
+    """secantusAdmin.pruneOplog / pruneTtl return {pruned, ok} against the Rust
+    server (issue #163 — the native maintenance commands the admin UI drives).
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        client = _client(srv)
+        # Seed a little data so the oplog + a collection exist.
+        client["t"]["c"].insert_many([{"_id": i} for i in range(3)])
+
+        r1 = client.admin.command({"secantusAdmin.pruneOplog": 1})
+        assert r1["ok"] == 1.0
+        assert isinstance(r1["pruned"], int) and r1["pruned"] >= 0
+
+        r2 = client.admin.command({"secantusAdmin.pruneTtl": 1})
+        assert r2["ok"] == 1.0
+        assert isinstance(r2["pruned"], int) and r2["pruned"] >= 0
+    finally:
+        srv.stop()
+
+
+def test_secantus_admin_restore_archive_roundtrips(tmp_path) -> None:
+    """backupArchive -> restoreArchive round-trips data through a fresh dir, and
+    the restored directory is a startable WT home (issue #163)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    archive = str(tmp_path / "backup.tar.gz")
+    target = str(tmp_path / "restored")
+    try:
+        client = _client(srv)
+        client["t"]["c"].insert_many([{"_id": i, "x": i * 2} for i in range(5)])
+        r = client.admin.command({"secantusAdmin.backupArchive": 1, "outputPath": archive})
+        assert r["ok"] == 1.0
+
+        rr = client.admin.command(
+            {"secantusAdmin.restoreArchive": 1, "archivePath": archive, "targetDir": target}
+        )
+        assert rr["ok"] == 1.0
+        assert rr["fileCount"] > 0
+        assert rr["targetDir"] and rr["archive"]
+    finally:
+        srv.stop()
+
+    # The restored directory is a startable WT home carrying the data.
+    srv2 = _server.RustServer(target, 0)
+    try:
+        c2 = _client(srv2)["t"]["c"]
+        assert sorted(d["_id"] for d in c2.find({})) == [0, 1, 2, 3, 4]
+        assert c2.find_one({"_id": 3})["x"] == 6
+    finally:
+        srv2.stop()
+
+
+def test_restore_archive_rejects_nonempty_target(tmp_path) -> None:
+    """A non-empty target without allowExisting is IllegalOperation(20)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    archive = str(tmp_path / "b.tar.gz")
+    target = tmp_path / "restored"
+    target.mkdir()
+    (target / "sentinel").write_text("x")
+    try:
+        client = _client(srv)
+        client["t"]["c"].insert_one({"_id": 1})
+        client.admin.command({"secantusAdmin.backupArchive": 1, "outputPath": archive})
+        with pytest.raises(pymongo.errors.OperationFailure) as ei:
+            client.admin.command(
+                {
+                    "secantusAdmin.restoreArchive": 1,
+                    "archivePath": archive,
+                    "targetDir": str(target),
+                }
+            )
+        assert ei.value.code == 20
+    finally:
+        srv.stop()
+
+
+def test_secantus_grant_revoke_roles_to_user(tmp_path) -> None:
+    """grantRolesToUser / revokeRolesFromUser modify a user's roles on the Rust
+    server, reflected by usersInfo (issue #163)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        admin = _client(srv)["admin"]
+        admin.command("createUser", "carol", pwd="pw", roles=[{"role": "read", "db": "admin"}])
+
+        admin.command("grantRolesToUser", "carol", roles=[{"role": "readWrite", "db": "admin"}])
+        info = admin.command("usersInfo", "carol")
+        roles = {(r["role"], r["db"]) for r in info["users"][0]["roles"]}
+        assert roles == {("read", "admin"), ("readWrite", "admin")}
+
+        admin.command("revokeRolesFromUser", "carol", roles=[{"role": "read", "db": "admin"}])
+        info2 = admin.command("usersInfo", "carol")
+        roles2 = {(r["role"], r["db"]) for r in info2["users"][0]["roles"]}
+        assert roles2 == {("readWrite", "admin")}
+    finally:
+        srv.stop()
+
+
+def test_kill_op_closes_a_connection(tmp_path) -> None:
+    """killOp closes another connection by its conn_id (from hello.connectionId)
+    and reports {info, ok}; a bogus opid is reported not-found (issue #163)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        c1 = _client(srv)
+        cid1 = c1.admin.command("hello")["connectionId"]
+        c2 = _client(srv)
+
+        killed = c2.admin.command({"killOp": 1, "op": cid1})
+        assert killed["ok"] == 1.0
+        assert killed["info"] == "operation killed"
+
+        bogus = c2.admin.command({"killOp": 1, "op": 2_000_000_000})
+        assert bogus["info"] == "no operation with that opid"
+
+        c1.close()
+        c2.close()
+    finally:
+        srv.stop()
+
+
+def test_get_log_returns_connection_lines(tmp_path) -> None:
+    """getLog surfaces the server's in-memory log ring buffer, including the
+    connection-accept line (issue #163)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        client = _client(srv)
+        client.admin.command("ping")  # ensure a connection is established
+        res = client.admin.command({"getLog": "global"})
+        assert res["ok"] == 1.0
+        assert res["totalLinesWritten"] >= 1
+        assert any("connection accepted" in line for line in res["log"])
+    finally:
+        srv.stop()
+
+
+def test_geo_near_index_optimization_against_rust_server(tmp_path) -> None:
+    """A leading bounded ``$geoNear`` rides the geo index (conservative
+    ``$geoWithin`` candidate fetch) on the Rust server; output must be identical
+    to the brute-force scan. Compare an indexed collection against an unindexed
+    one over many random queries."""
+    import random
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        rng = random.Random(2024)
+        docs = [
+            {
+                "_id": i,
+                "loc": {
+                    "type": "Point",
+                    "coordinates": [rng.uniform(-15, 15), rng.uniform(-15, 15)],
+                },
+                "v": rng.randint(0, 5),
+            }
+            for i in range(400)
+        ]
+        db.idx.insert_many(docs)
+        db.noidx.insert_many(docs)
+        db.idx.create_index([("loc", "2dsphere")])  # only this one gets optimized
+
+        for _ in range(40):
+            cx, cy = rng.uniform(-15, 15), rng.uniform(-15, 15)
+            max_d = rng.uniform(50_000, 1_500_000)
+            stage = {
+                "$geoNear": {
+                    "near": {"type": "Point", "coordinates": [cx, cy]},
+                    "distanceField": "d",
+                    "maxDistance": max_d,
+                    "key": "loc",
+                    "spherical": True,
+                }
+            }
+            pipeline: list[dict] = [stage]
+            if rng.random() < 0.4:
+                pipeline.append({"$match": {"v": {"$gte": 2}}})
+            if rng.random() < 0.3:
+                stage["$geoNear"]["query"] = {"v": {"$lte": 4}}
+            opt = [(d["_id"], round(d["d"], 6)) for d in db.idx.aggregate(pipeline)]
+            brute = [(d["_id"], round(d["d"], 6)) for d in db.noidx.aggregate(pipeline)]
+            assert opt == brute, f"center={(cx, cy)} maxDistance={max_d}"
+    finally:
+        srv.stop()
+
+
+def test_lookup_index_order_against_rust_server(tmp_path) -> None:
+    """A simple `$lookup` whose foreign collection has a leading-field index on
+    `foreignField` drives a per-outer-doc index probe on the Rust server, so the
+    `as` array comes back in index order (not foreign-scan order) — matching the
+    Python server. Foreign docs are inserted out of index order to make the
+    distinction observable."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        db.o.insert_one({"_id": 1, "k": 1})
+        # inserted in a NON-(fk,tag) order; the compound index reorders to a,b,c
+        db.f.insert_many(
+            [
+                {"_id": 10, "fk": 1, "tag": "c"},
+                {"_id": 11, "fk": 1, "tag": "a"},
+                {"_id": 12, "fk": 1, "tag": "b"},
+            ]
+        )
+        db.f.create_index([("fk", 1), ("tag", 1)])
+        res = list(
+            db.o.aggregate(
+                [{"$lookup": {"from": "f", "localField": "k", "foreignField": "fk", "as": "m"}}]
+            )
+        )
+        # Index order by (fk, tag): a, b, c — not the c, a, b insertion order.
+        assert [m["tag"] for m in res[0]["m"]] == ["a", "b", "c"]
+
+        # An array local value uses $in and still matches all elements.
+        db.o2.insert_one({"_id": 2, "k": [1]})
+        db.f2.insert_many([{"_id": 20, "fk": 1}, {"_id": 21, "fk": 2}])
+        db.f2.create_index([("fk", 1)])
+        res2 = list(
+            db.o2.aggregate(
+                [{"$lookup": {"from": "f2", "localField": "k", "foreignField": "fk", "as": "m"}}]
+            )
+        )
+        assert [m["_id"] for m in res2[0]["m"]] == [20]
+    finally:
+        srv.stop()
+
+
+def test_write_concern_validation_against_rust_server(tmp_path) -> None:
+    """The Rust server rejects a malformed `writeConcern` before running a write
+    command, with mongod's codes (matching the Python server): negative/too-large
+    integer `w` → FailedToParse (9), unknown string `w` → UnknownReplWriteConcern
+    (79), a bool / non-number-or-string `w` → TypeMismatch (14). A well-formed
+    (or absent) writeConcern is accepted; `w > 1` still succeeds (the single-node
+    writeConcernError is attached, not an error)."""
+    import pymongo.errors
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        rejects = [
+            ({"w": -5}, 9),
+            ({"w": 99}, 9),
+            ({"w": "nope"}, 79),
+            ({"w": 1.5}, 14),
+            ({"w": True}, 14),
+            ({"j": "x"}, 14),
+        ]
+        for wc, code in rejects:
+            with pytest.raises(pymongo.errors.OperationFailure) as exc:
+                db.command("insert", "c", documents=[{"x": 1}], writeConcern=wc)
+            assert exc.value.code == code, f"wc={wc} expected {code} got {exc.value.code}"
+
+        # Well-formed / satisfiable writeConcerns are accepted.
+        for wc in [{"w": 1}, {"w": "majority"}, {"j": True}, {"wtimeout": 100}, {"w": 2}]:
+            r = db.command("insert", "c", documents=[{"x": 1}], writeConcern=wc)
+            assert r["ok"] == 1.0, f"wc={wc} should succeed"
+    finally:
+        srv.stop()
+
+
+def test_synthetic_view_write_rejected_against_rust_server(tmp_path) -> None:
+    """A direct insert / update / delete on a synthetic read-only view
+    (`local.oplog.rs` / `admin.system.users`) is rejected with code 13 on the Rust
+    server (matching the Python server / mongod), while a regular collection write
+    still succeeds."""
+    import pymongo.errors
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        client = _client(srv)
+        for db_name, coll in [("local", "oplog.rs"), ("admin", "system.users")]:
+            db = client[db_name]
+            for op, args in [
+                ("insert", {"documents": [{"x": 1}]}),
+                ("update", {"updates": [{"q": {}, "u": {"$set": {"x": 1}}}]}),
+                ("delete", {"deletes": [{"q": {}, "limit": 0}]}),
+            ]:
+                with pytest.raises(pymongo.errors.OperationFailure) as exc:
+                    db.command(op, coll, **args)
+                assert exc.value.code == 13, f"{db_name}.{coll} {op}: got {exc.value.code}"
+
+        # A regular collection write is unaffected.
+        r = client["t"].command("insert", "c", documents=[{"x": 1}])
+        assert r["ok"] == 1.0
+    finally:
+        srv.stop()
+
+
+def test_view_reads_resolve_against_rust_server(tmp_path) -> None:
+    """find / aggregate / count on a view resolve the view's pipeline against its
+    base collection on the Rust server (previously they returned nothing) —
+    including filter/sort/skip/limit/projection and a view-on-a-view."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        db.src.insert_many([{"_id": i, "a": i % 3, "v": i} for i in range(9)])
+        db.command("create", "vw", viewOn="src", pipeline=[{"$match": {"a": 1}}])
+
+        assert sorted(d["_id"] for d in db.vw.find({})) == [1, 4, 7]
+        assert sorted(d["_id"] for d in db.vw.find({"v": {"$gt": 3}})) == [4, 7]
+        assert [d["_id"] for d in db.vw.find({}).sort("_id", -1).limit(2)] == [7, 4]
+        assert [d["_id"] for d in db.vw.find({}).sort("_id", 1).skip(1)] == [4, 7]
+        assert db.vw.find_one({"_id": 4}, {"v": 1, "_id": 0}) == {"v": 4}
+        assert [d["_id"] for d in db.vw.aggregate([{"$sort": {"_id": 1}}])] == [1, 4, 7]
+        assert db.vw.count_documents({}) == 3
+        assert db.vw.count_documents({"v": {"$gt": 3}}) == 2
+
+        db.command("create", "vw2", viewOn="vw", pipeline=[{"$match": {"v": {"$gt": 3}}}])
+        assert sorted(d["_id"] for d in db.vw2.find({})) == [4, 7]
+        assert db.vw2.count_documents({}) == 2
+    finally:
+        srv.stop()
+
+
+def test_aggregate_stage_name_validation_against_rust_server(tmp_path) -> None:
+    """The Rust server validates aggregation stage names up-front (matching the
+    Python server / mongod): an unrecognized stage → Location40324, an Atlas-only
+    stage → CommandNotSupported (115). Recognized stages run normally."""
+    import pymongo.errors
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        db.c.insert_many([{"_id": i, "a": i % 3} for i in range(6)])
+
+        for pipeline, code in [
+            ([{"$badStage": {}}], 40324),
+            ([{"$match": {"a": 1}}, {"$nope": 1}], 40324),
+            ([{"$search": {}}], 115),
+            ([{"$vectorSearch": {}}], 115),
+            ([{"$listSearchIndexes": {}}], 115),
+        ]:
+            with pytest.raises(pymongo.errors.OperationFailure) as exc:
+                list(db.c.aggregate(pipeline))
+            assert exc.value.code == code, f"{pipeline}: expected {code} got {exc.value.code}"
+
+        # A recognized pipeline still runs.
+        got = sorted(
+            (d["_id"], d["n"])
+            for d in db.c.aggregate([{"$group": {"_id": "$a", "n": {"$sum": 1}}}])
+        )
+        assert got == [(0, 2), (1, 2), (2, 2)]
+    finally:
+        srv.stop()

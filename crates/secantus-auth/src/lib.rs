@@ -9,9 +9,11 @@
 //! **Scope:** SCRAM-SHA-256 only (the modern driver default). SCRAM-SHA-1 (with
 //! MongoDB's legacy MD5 prepass) and MONGODB-X509 (TLS, R5 tail) are deferred.
 //!
-//! **`saslprep`:** ASCII passwords pass through unchanged (the common case);
-//! non-ASCII SASLprep normalisation is deferred — a non-ASCII password would
-//! hash differently than a fully-SASLprepping client. Tracked in the backlog.
+//! **`saslprep`:** RFC 4013 SASLprep is applied to every password (mapping
+//! table B.1 → nothing and C.1.2 → ASCII space, NFKC normalisation, the
+//! prohibited-table + bidirectional checks). ASCII passwords are unaffected,
+//! and non-ASCII passwords hash identically to a SASLprep-compliant client
+//! (pymongo) and to the Python server's `auth.saslprep`.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -54,10 +56,16 @@ pub struct StoredCredentials {
     pub server_key: Vec<u8>,
 }
 
-/// SASLprep a password. ASCII passes through unchanged; non-ASCII is left as-is
-/// (a deferred gap — see the module docs).
-fn saslprep(password: &str) -> Vec<u8> {
-    password.as_bytes().to_vec()
+/// SASLprep a password per RFC 4013 (a stringprep profile): map table B.1 to
+/// nothing and C.1.2 to ASCII space, NFKC-normalise, then enforce the
+/// prohibited-character tables and the bidirectional check. ASCII passwords are
+/// the identity; non-ASCII passwords are normalised so they hash identically to
+/// a compliant client. A prohibited character or a bidi violation is an
+/// `AuthError`. Mirrors `secantus.auth.saslprep`.
+fn saslprep(password: &str) -> Result<Vec<u8>, AuthError> {
+    stringprep::saslprep(password)
+        .map(|s| s.into_owned().into_bytes())
+        .map_err(|e| err(&format!("SASLprep: {e}")))
 }
 
 /// Derive SCRAM-SHA-256 credentials from a plaintext password.
@@ -68,27 +76,31 @@ fn saslprep(password: &str) -> Vec<u8> {
 /// `ServerKey = HMAC(SaltedPassword, "Server Key")`.
 ///
 /// `salt` / `iterations` default to a fresh 28-byte salt and 15000 when `None`.
+///
+/// Errors only when the password fails RFC 4013 SASLprep (a prohibited
+/// character or a bidirectional-check violation).
 pub fn derive_credentials(
     password: &str,
     iterations: Option<u32>,
     salt: Option<Vec<u8>>,
-) -> StoredCredentials {
+) -> Result<StoredCredentials, AuthError> {
+    let prepped = saslprep(password)?;
     let iterations = iterations.unwrap_or(DEFAULT_ITERATIONS);
     let salt = salt.unwrap_or_else(|| {
         let bytes: [u8; SALT_BYTES] = rand::random();
         bytes.to_vec()
     });
     let mut salted = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(&saslprep(password), &salt, iterations, &mut salted);
+    pbkdf2::pbkdf2_hmac::<Sha256>(&prepped, &salt, iterations, &mut salted);
     let client_key = hmac(&salted, b"Client Key");
     let stored_key = Sha256::digest(&client_key).to_vec();
     let server_key = hmac(&salted, b"Server Key");
-    StoredCredentials {
+    Ok(StoredCredentials {
         iteration_count: iterations,
         salt,
         stored_key,
         server_key,
-    }
+    })
 }
 
 impl StoredCredentials {
@@ -176,7 +188,10 @@ pub fn begin_scram(
             // Fabricate same-shape creds so the proof step (not the lookup)
             // surfaces the failure.
             let fake: [u8; 16] = rand::random();
-            (derive_credentials(&B64.encode(fake), None, None), false)
+            // The base64 alphabet is pure ASCII, so SASLprep never fails here.
+            let fake_creds = derive_credentials(&B64.encode(fake), None, None)
+                .expect("base64 nonce is ASCII and saslpreps cleanly");
+            (fake_creds, false)
         }
     };
 
@@ -346,7 +361,7 @@ mod tests {
 
     #[test]
     fn full_scram_roundtrip_succeeds() {
-        let creds = derive_credentials("s3cr3t", None, None);
+        let creds = derive_credentials("s3cr3t", None, None).unwrap();
         let (first, bare) = client_first("alice", "clientNonceAAA");
         let (server_first, mut state) =
             begin_scram(1, "admin", &first, Some(creds.clone())).unwrap();
@@ -371,7 +386,7 @@ mod tests {
 
     #[test]
     fn wrong_password_fails() {
-        let creds = derive_credentials("right", None, None);
+        let creds = derive_credentials("right", None, None).unwrap();
         let (first, bare) = client_first("alice", "nonceBBB");
         let (server_first, mut state) = begin_scram(1, "admin", &first, Some(creds)).unwrap();
         let cf = client_final("wrong", &server_first, &bare);
@@ -397,11 +412,31 @@ mod tests {
     #[test]
     fn derive_is_deterministic_for_fixed_salt() {
         let salt = vec![7u8; SALT_BYTES];
-        let a = derive_credentials("pw", Some(1000), Some(salt.clone()));
-        let b = derive_credentials("pw", Some(1000), Some(salt));
+        let a = derive_credentials("pw", Some(1000), Some(salt.clone())).unwrap();
+        let b = derive_credentials("pw", Some(1000), Some(salt)).unwrap();
         assert_eq!(a, b);
         assert_eq!(a.iteration_count, 1000);
         assert_eq!(a.stored_key.len(), 32);
+    }
+
+    #[test]
+    fn saslprep_maps_and_normalises() {
+        // ASCII is the identity.
+        assert_eq!(saslprep("s3cr3t").unwrap(), b"s3cr3t".to_vec());
+        // C.1.2 non-ASCII space (U+00A0 NO-BREAK SPACE) maps to ASCII space.
+        assert_eq!(saslprep("a\u{00A0}b").unwrap(), b"a b".to_vec());
+        // NFKC normalisation: a full-width digit folds to its ASCII form.
+        assert_eq!(saslprep("\u{FF11}").unwrap(), b"1".to_vec());
+        // B.1 (commonly mapped to nothing): U+00AD SOFT HYPHEN is deleted.
+        assert_eq!(saslprep("a\u{00AD}b").unwrap(), b"ab".to_vec());
+    }
+
+    #[test]
+    fn saslprep_rejects_prohibited() {
+        // A prohibited control character (RFC 4013 §2.3 → table C.2.1).
+        assert!(saslprep("a\u{0007}b").is_err());
+        // The failure propagates through credential derivation.
+        assert!(derive_credentials("a\u{0007}b", None, None).is_err());
     }
 
     #[test]
@@ -413,7 +448,7 @@ mod tests {
 
     #[test]
     fn nonce_mismatch_rejected() {
-        let creds = derive_credentials("pw", None, None);
+        let creds = derive_credentials("pw", None, None).unwrap();
         let (first, _bare) = client_first("alice", "nonceDDD");
         let (_sf, mut state) = begin_scram(1, "admin", &first, Some(creds)).unwrap();
         // client-final with a nonce that doesn't end in the server nonce

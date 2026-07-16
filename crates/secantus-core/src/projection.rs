@@ -25,6 +25,36 @@ fn elem_match_spec(v: &Bson) -> Option<&Bson> {
     None
 }
 
+/// A `{$meta: <arg>}` projection value. SecantusDB doesn't compute any metadata,
+/// so a recognized `$meta` field is *omitted* from the projected doc (partial —
+/// graceful degradation). The two error cases (an unknown argument → Location17308,
+/// `textScore` without a `$text` query → Location40218) are validated at parse
+/// time in the command layer (`find::projection_meta_error`), which owns the
+/// `CommandError` type; here we just recognize and drop the field.
+pub fn meta_spec(v: &Bson) -> Option<&str> {
+    if let Bson::Document(d) = v {
+        if d.len() == 1 {
+            if let Some(Bson::String(arg)) = d.get("$meta") {
+                return Some(arg.as_str());
+            }
+        }
+    }
+    None
+}
+
+/// The `$meta` keywords mongod recognizes. Anything else is a Location17308.
+pub const META_KEYWORDS: &[&str] = &[
+    "textScore",
+    "indexKey",
+    "recordId",
+    "sortKey",
+    "searchScore",
+    "searchHighlights",
+    "geoNearDistance",
+    "geoNearPoint",
+    "vectorSearchScore",
+];
+
 fn slice_spec(v: &Bson) -> Option<&Bson> {
     if let Bson::Document(d) = v {
         if d.len() == 1 {
@@ -102,6 +132,177 @@ fn apply_slice(value: Bson, slice_arg: &Bson) -> R<Bson> {
     Err(Fallback) // unrecognised $slice argument shape -> Python
 }
 
+/// Build the per-element predicate a positional `arr.$` projects against, from the
+/// query's clauses on `array_path`. Returns `(doc_pred, value_pred)` — a
+/// sub-document match (from `arr.sub` clauses and an `arr: {$elemMatch: E}` clause)
+/// and an optional direct value/operator predicate (from `arr: <value|ops>`). None
+/// when the query has no clause on `array_path` (mongod errors Location51246).
+/// Mirrors `projection._positional_element_predicate`.
+fn positional_predicate(
+    query: Option<&Document>,
+    array_path: &str,
+) -> Option<(Document, Option<Bson>)> {
+    let query = query?;
+    let mut doc_pred = Document::new();
+    let mut value_pred: Option<Bson> = None;
+    let prefix = format!("{array_path}.");
+    let mut found = false;
+    for (key, val) in query {
+        if key == array_path {
+            found = true;
+            match val {
+                Bson::Document(d) if d.len() == 1 && d.contains_key("$elemMatch") => {
+                    if let Some(Bson::Document(em)) = d.get("$elemMatch") {
+                        for (k, v) in em {
+                            doc_pred.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                other => value_pred = Some(other.clone()),
+            }
+        } else if let Some(sub) = key.strip_prefix(&prefix) {
+            found = true;
+            doc_pred.insert(sub.to_string(), val.clone());
+        }
+    }
+    if !found {
+        return None;
+    }
+    Some((doc_pred, value_pred))
+}
+
+/// Validate a positional projection up-front (mongod validates at parse time, so
+/// an invalid `arr.$` errors even when nothing matches). `Err(Fallback)` for the
+/// error cases (>1 positional / exclusion / array field not in the query) — the
+/// find handler surfaces it as `BadValue`, and the pure-Python oracle raises the
+/// exact Location code (31276 / 31395 / 51246).
+pub fn validate_projection(spec: &Document, query: Option<&Document>) -> R<()> {
+    let positional: Vec<&String> = spec.keys().filter(|k| k.ends_with(".$")).collect();
+    if positional.is_empty() {
+        return Ok(());
+    }
+    if positional.len() > 1 {
+        return Err(Fallback);
+    }
+    let key = positional[0];
+    if !spec_truthy(&spec[key])? {
+        return Err(Fallback);
+    }
+    let array_path = &key[..key.len() - 2];
+    if positional_predicate(query, array_path).is_none() {
+        return Err(Fallback);
+    }
+    Ok(())
+}
+
+/// First element of `arr` matching the positional predicate, or `Ok(None)`.
+fn positional_first(
+    arr: Option<&Bson>,
+    doc_pred: &Document,
+    value_pred: Option<&Bson>,
+) -> R<Option<Bson>> {
+    let Some(Bson::Array(arr)) = arr else {
+        return Ok(None);
+    };
+    let empty = Document::new();
+    for elem in arr {
+        if !doc_pred.is_empty() {
+            match elem {
+                Bson::Document(ed) => {
+                    if !query::matches(ed, doc_pred, &empty, None).map_err(|_| Fallback)? {
+                        continue;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        if let Some(vp) = value_pred {
+            let mut wrapper = Document::new();
+            wrapper.insert("_".to_string(), elem.clone());
+            let mut q = Document::new();
+            q.insert("_".to_string(), vp.clone());
+            if !query::matches(&wrapper, &q, &empty, None).map_err(|_| Fallback)? {
+                continue;
+            }
+        }
+        return Ok(Some(elem.clone()));
+    }
+    Ok(None)
+}
+
+/// Inclusion projection carrying a positional `arr.$`: the other requested fields
+/// plus `array_path: [first-matching-element]`. Mirrors `projection._apply_positional`.
+fn apply_positional(
+    doc: &Document,
+    spec_main: &[(&str, &Bson)],
+    slice_specs: &[(&str, &Bson)],
+    array_path: &str,
+    doc_pred: &Document,
+    value_pred: Option<Bson>,
+) -> R<Document> {
+    let mut result = Document::new();
+    let id_spec = spec_main.iter().find(|(k, _)| *k == "_id").map(|(_, v)| *v);
+    let include_id = match id_spec {
+        None => true,
+        Some(v) => spec_truthy(v)?,
+    };
+    if include_id {
+        if let Some(id) = doc.get("_id") {
+            result.insert("_id".to_string(), id.clone());
+        }
+    }
+    let non_id: Vec<(&str, &Bson)> = spec_main
+        .iter()
+        .copied()
+        .filter(|(k, _)| *k != "_id")
+        .collect();
+    // Positional forces inclusion; a companion exclusion is the mix mongod rejects.
+    for (_, v) in &non_id {
+        if elem_match_spec(v).is_none() && !spec_truthy(v)? {
+            return Err(Fallback); // Location31254 -> Python
+        }
+    }
+    let plain: Vec<&str> = non_id
+        .iter()
+        .filter(|(_, v)| elem_match_spec(v).is_none())
+        .map(|(k, _)| *k)
+        .collect();
+    if !plain.is_empty() {
+        for (k, v) in include_doc(doc, &spec_tree(&plain)) {
+            result.insert(k, v);
+        }
+    }
+    for (path, value) in &non_id {
+        if let Some(sub) = elem_match_spec(value) {
+            let Bson::Document(subf) = sub else {
+                return Err(Fallback);
+            };
+            if let Some(first) = first_match(doc, path, subf)? {
+                set(&mut result, path, Bson::Array(vec![first]))?;
+            }
+        }
+    }
+    if let Some(first) = positional_first(
+        paths::get_path(doc, array_path),
+        doc_pred,
+        value_pred.as_ref(),
+    )? {
+        set(&mut result, array_path, Bson::Array(vec![first]))?;
+    }
+    for (path, slice_arg) in slice_specs {
+        if !paths::has_path(&result, path) {
+            if let Some(extracted) = paths::get_path(doc, path) {
+                set(&mut result, path, extracted.clone())?;
+            }
+        }
+        if let Some(current) = paths::get_path(&result, path).cloned() {
+            let sliced = apply_slice(current, slice_arg)?;
+            set(&mut result, path, sliced)?;
+        }
+    }
+    Ok(result)
+}
+
 /// First array element under `path` matching `sub_filter` (`$elemMatch`
 /// projection). `Ok(None)` for no match / non-array.
 fn first_match(doc: &Document, path: &str, sub_filter: &Document) -> R<Option<Bson>> {
@@ -136,19 +337,78 @@ fn set(doc: &mut Document, path: &str, value: Bson) -> R<()> {
 
 /// Apply a projection spec to a document. `Err(Fallback)` => defer to the
 /// pure-Python `apply_projection` (which also raises the mixed-mode error).
-pub fn apply_projection(doc: &Document, spec: &Document) -> R<Document> {
+pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document>) -> R<Document> {
     if spec.is_empty() {
         return Ok(doc.clone());
     }
 
-    // Separate $slice specs (neutral modifiers) from the inclusion/exclusion set.
+    // A `$meta` field is inclusion-mode in mongod, but SecantusDB doesn't compute
+    // the metadata — so the field is *omitted* (partial degradation). Drop the
+    // meta keys; a spec that was *only* `$meta` fields becomes an inclusion of no
+    // fields (result: just `_id`, unless `_id` was excluded). Parse-time
+    // validation (Location17308 / 40218) lives in `find::projection_meta_error`.
+    if spec.values().any(|v| meta_spec(v).is_some()) {
+        let mut stripped = Document::new();
+        for (k, v) in spec {
+            if meta_spec(v).is_none() {
+                stripped.insert(k.clone(), v.clone());
+            }
+        }
+        let non_meta_non_id = stripped.keys().any(|k| k != "_id");
+        if !non_meta_non_id {
+            let mut result = Document::new();
+            let include_id = match stripped.get("_id") {
+                None => true,
+                Some(v) => spec_truthy(v)?,
+            };
+            if include_id {
+                if let Some(id) = doc.get("_id") {
+                    result.insert("_id".to_string(), id.clone());
+                }
+            }
+            return Ok(result);
+        }
+        return apply_projection(doc, &stripped, query);
+    }
+
+    // Separate $slice specs (neutral modifiers) and positional (`arr.$`) keys from
+    // the inclusion/exclusion set.
     let mut slice_specs: Vec<(&str, &Bson)> = Vec::new();
+    let mut positional: Vec<(&str, &Bson)> = Vec::new();
     let mut spec_main: Vec<(&str, &Bson)> = Vec::new();
     for (k, v) in spec {
-        match slice_spec(v) {
-            Some(arg) => slice_specs.push((k, arg)),
-            None => spec_main.push((k, v)),
+        if let Some(arg) = slice_spec(v) {
+            slice_specs.push((k, arg));
+        } else if k.ends_with(".$") {
+            positional.push((k, v));
+        } else {
+            spec_main.push((k, v));
         }
+    }
+
+    if !positional.is_empty() {
+        // >1 positional, an exclusion positional, or a positional whose array field
+        // isn't in the query all error in mongod — defer to Python for the exact
+        // Location code (31276 / 31395 / 51246).
+        if positional.len() > 1 {
+            return Err(Fallback);
+        }
+        let (pos_key, pos_val) = positional[0];
+        if !spec_truthy(pos_val)? {
+            return Err(Fallback);
+        }
+        let array_path = &pos_key[..pos_key.len() - 2]; // strip ".$"
+        let Some((doc_pred, value_pred)) = positional_predicate(query, array_path) else {
+            return Err(Fallback); // no query clause on the array -> 51246
+        };
+        return apply_positional(
+            doc,
+            &spec_main,
+            &slice_specs,
+            array_path,
+            &doc_pred,
+            value_pred,
+        );
     }
 
     let id_spec: Option<&Bson> = spec_main.iter().find(|(k, _)| *k == "_id").map(|(_, v)| *v);
@@ -356,7 +616,7 @@ mod tests {
     use bson::doc;
 
     fn proj(d: Document, s: Document) -> Document {
-        apply_projection(&d, &s).expect("should not fall back")
+        apply_projection(&d, &s, None).expect("should not fall back")
     }
 
     #[test]
@@ -404,6 +664,52 @@ mod tests {
             doc! {"_id": 1, "a": [1, 2]}
         );
         // mixed inclusion + exclusion -> defer
-        assert!(apply_projection(&doc! {"a": 1, "b": 2}, &doc! {"a": 1, "b": 0}).is_err());
+        assert!(apply_projection(&doc! {"a": 1, "b": 2}, &doc! {"a": 1, "b": 0}, None).is_err());
+    }
+
+    #[test]
+    fn meta_only_field_omitted() {
+        // A recognized-but-unsupported $meta arg: field omitted, inclusion keeps _id.
+        assert_eq!(
+            proj(
+                doc! {"_id": 1, "a": 1, "b": 2},
+                doc! {"m": {"$meta": "indexKey"}}
+            ),
+            doc! {"_id": 1}
+        );
+    }
+
+    #[test]
+    fn meta_alongside_inclusion() {
+        assert_eq!(
+            proj(
+                doc! {"_id": 1, "a": 1, "b": 2},
+                doc! {"a": 1, "score": {"$meta": "recordId"}}
+            ),
+            doc! {"_id": 1, "a": 1}
+        );
+    }
+
+    #[test]
+    fn meta_excludes_id() {
+        assert_eq!(
+            proj(
+                doc! {"_id": 1, "a": 1},
+                doc! {"_id": 0, "score": {"$meta": "sortKey"}}
+            ),
+            doc! {}
+        );
+    }
+
+    #[test]
+    fn meta_spec_recognizes_and_keywords() {
+        assert_eq!(
+            meta_spec(&bson::bson!({"$meta": "textScore"})),
+            Some("textScore")
+        );
+        assert_eq!(meta_spec(&bson::bson!({"$meta": 5})), None);
+        assert_eq!(meta_spec(&bson::bson!({"a": 1})), None);
+        assert!(META_KEYWORDS.contains(&"textScore"));
+        assert!(!META_KEYWORDS.contains(&"bogus"));
     }
 }

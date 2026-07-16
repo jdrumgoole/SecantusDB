@@ -19,6 +19,7 @@
 //! `tasks/rust-rewrite-phase4-scoping.md`).
 
 use std::collections::{BTreeSet, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -37,6 +38,11 @@ use secantus_core::sortkey::{self, COMPOUND_SEP};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
 pub mod changestreams;
+pub mod pitr_archive;
+pub mod replay;
+
+/// Filename of the advisory PITR manifest embedded in a backup archive.
+pub(crate) const PITR_MANIFEST_NAME: &str = "pitr-manifest.json";
 
 use std::cell::Cell;
 
@@ -108,6 +114,15 @@ const DOC_TABLE: &str = "table:secantus_documents";
 const IDX_TABLE: &str = "table:secantus_indexes";
 const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
 
+// Natural-order (insertion) index. mongod returns an unsorted `find()` in
+// insertion (storage / RecordId) order, which equals `_id` order only for
+// monotonic `_id`s — so a separate seq index is needed. `NAT_TABLE` maps a
+// monotonic insertion `seq` to the doc's `id_key`; `NAT_SEQ_TABLE` is the reverse
+// (so a delete can find and drop the seq). Mirrors the Python storage's
+// `secantus_natural` / `secantus_natural_seq`.
+const NAT_TABLE: &str = "table:secantus_natural";
+const NAT_SEQ_TABLE: &str = "table:secantus_natural_seq";
+
 // Oplog / change-stream tables (Phase 4 sub-phase 3). `q`-keyed (int64 seq) for
 // the oplog + pre-images; a single `S` key ("state") for the recovery metadata.
 const OPLOG_TABLE: &str = "table:secantus_oplog";
@@ -143,6 +158,10 @@ const CONFLICTING_OPTS: &[&str] = &[
 /// Field-level operators a single-field index can serve. Mirrors
 /// `storage._RANGE_OPS`.
 const RANGE_OPS: &[&str] = &["$eq", "$gt", "$gte", "$lt", "$lte", "$in"];
+
+/// `(index_name, direction, is_compound)` — the index a leading-field lookup
+/// resolves to (the tuple `find_leading_field_index` returns).
+type LeadingFieldMatch = (String, i32, bool);
 
 /// The plan `find_matching` would use for a filter — what `explain_plan`
 /// reports. Mirrors `storage.explain_plan`'s `{kind, index_name, key_pattern,
@@ -180,6 +199,10 @@ struct IndexDesc {
     key_spec: Document,
     sparse: bool,
     unique: bool,
+    /// `prepareUnique` (set via `collMod`): enforce uniqueness on *new* writes
+    /// (block dup inserts with 11000) while pre-existing duplicates are tolerated
+    /// — the staging step before a `unique: true` conversion.
+    prepare_unique: bool,
     /// `partialFilterExpression` if non-empty — entries are written (and the
     /// index considered) only for docs/queries that match / imply it.
     partial: Option<Document>,
@@ -214,13 +237,10 @@ impl Geo2d {
 /// (`bits` / `min` / `max`, defaulting to mongod's 26 / -180 / 180). `None` if
 /// it isn't a single-field `2d` index.
 fn parse_geo_2d(key_spec: &Document, opts: &Document) -> Option<Geo2d> {
-    if key_spec.len() != 1 {
-        return None;
-    }
-    let (field, v) = key_spec.iter().next().unwrap();
-    if v.as_str() != Some("2d") {
-        return None;
-    }
+    // Like parse_geo_sphere: any field valued "2d" makes this a 2d index on that
+    // field; compound geo+scalar specs are accepted as geo-only (trailing scalar
+    // fields ignored at index time). Mirrors storage._geo_type_of.
+    let (field, _) = key_spec.iter().find(|(_, v)| v.as_str() == Some("2d"))?;
     let numf = |k: &str, default: f64| -> f64 {
         match opts.get(k) {
             Some(Bson::Double(x)) => *x,
@@ -274,13 +294,13 @@ impl GeoSphere {
 /// Parse a `2dsphere` geo index from its key spec (`{field: "2dsphere"}`).
 /// `None` if it isn't a single-field `2dsphere` index.
 fn parse_geo_sphere(key_spec: &Document) -> Option<GeoSphere> {
-    if key_spec.len() != 1 {
-        return None;
-    }
-    let (field, v) = key_spec.iter().next().unwrap();
-    if v.as_str() != Some("2dsphere") {
-        return None;
-    }
+    // A 2dsphere index is any spec containing a field whose value is the string
+    // "2dsphere". Compound geo+scalar specs ({g:"2dsphere", z:1}) are accepted as
+    // geo-only on the geo field; trailing scalar fields are ignored at index time
+    // and verified post-fetch (mirrors storage._geo_type_of).
+    let (field, _) = key_spec
+        .iter()
+        .find(|(_, v)| v.as_str() == Some("2dsphere"))?;
     Some(GeoSphere {
         field: field.clone(),
     })
@@ -370,6 +390,20 @@ const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
                               log=(enabled=true,file_max=10MB),\
                               transaction_sync=(enabled=false,method=fsync)";
 
+/// Build the WiredTiger connection config string from the tunable knobs the
+/// `secantusdb` daemon exposes (`--cache-size`, `--session-max`,
+/// `--sync-on-commit`). Mirrors `storage.py`'s config assembly and matches
+/// [`DEFAULT_CONFIG`] byte-for-byte for the engine defaults (`"256M"`, `1000`,
+/// `false`) — see the `wt_config_matches_default` test. The `secantusdb`
+/// binary passes the resolved `cache_size` (Python's default is `"1G"`), while
+/// the embedded / library default stays `256M` via [`Storage::open`].
+pub fn wt_config(cache_size: &str, session_max: u32, sync_on_commit: bool) -> String {
+    format!(
+        "create,session_max={session_max},cache_size={cache_size},log=(enabled=true,file_max=10MB),transaction_sync=(enabled={},method=fsync)",
+        if sync_on_commit { "true" } else { "false" }
+    )
+}
+
 // The full table set `storage.py` bootstraps. Sub-phase 1 only reads/writes the
 // collections + documents tables, but creating the rest keeps the on-disk schema
 // identical so later sub-phases don't need a migration.
@@ -380,6 +414,11 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     (
         "table:secantus_index_entries",
         "key_format=SSSu,value_format=u",
+    ),
+    ("table:secantus_natural", "key_format=SSq,value_format=u"),
+    (
+        "table:secantus_natural_seq",
+        "key_format=SSu,value_format=q",
     ),
     ("table:secantus_oplog", "key_format=q,value_format=u"),
     ("table:secantus_preimages", "key_format=q,value_format=u"),
@@ -414,6 +453,9 @@ pub enum StorageError {
     /// `create_index` was asked to re-create an existing index with conflicting
     /// options.
     IndexOptionsConflict(String),
+    /// `create_index` was asked to re-create an existing index *name* with a
+    /// different key spec.
+    IndexKeySpecsConflict(String),
     /// A query filter used a construct the Rust query engine can't evaluate
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
@@ -437,6 +479,9 @@ pub enum StorageError {
     /// The post-apply document failed the collection `validator`. Surfaces as
     /// mongod's `DocumentValidationFailure` (121).
     DocumentValidationFailure,
+    /// An update would modify the immutable `_id` field. Surfaces as mongod's
+    /// `ImmutableField` (66).
+    ImmutableField,
 }
 
 impl std::fmt::Display for StorageError {
@@ -454,9 +499,14 @@ impl std::fmt::Display for StorageError {
             }
             StorageError::CreateIndexUnsupported(m) => write!(f, "{m}"),
             StorageError::IndexOptionsConflict(m) => write!(f, "{m}"),
+            StorageError::IndexKeySpecsConflict(m) => write!(f, "{m}"),
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
+            StorageError::ImmutableField => write!(
+                f,
+                "Performing an update on the path '_id' would modify the immutable field '_id'"
+            ),
             StorageError::BadHint(m) => write!(f, "{m}"),
             StorageError::ChangeStreamFatal(m) => write!(f, "{m}"),
             StorageError::Internal(m) => write!(f, "{m}"),
@@ -491,6 +541,29 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 
 fn encode_doc(doc: &Document) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
+    // mongod stores `_id` as the FIRST field of every document. Replacement /
+    // upsert updates can leave `_id` elsewhere in field order; reorder it to the
+    // front so the stored (and later returned) document matches mongod exactly —
+    // order-sensitive driver comparisons (e.g. the C# CRUD-spec runner) check
+    // this. A no-op for docs without a top-level `_id` (oplog / index / meta
+    // blobs) or where `_id` is already first.
+    let needs_reorder =
+        doc.contains_key("_id") && doc.keys().next().map(String::as_str) != Some("_id");
+    if needs_reorder {
+        let mut ordered = Document::new();
+        if let Some(id) = doc.get("_id") {
+            ordered.insert("_id", id.clone());
+        }
+        for (k, v) in doc {
+            if k != "_id" {
+                ordered.insert(k.clone(), v.clone());
+            }
+        }
+        ordered
+            .to_writer(&mut buf)
+            .map_err(|e| StorageError::Bson(e.to_string()))?;
+        return Ok(buf);
+    }
     doc.to_writer(&mut buf)
         .map_err(|e| StorageError::Bson(e.to_string()))?;
     Ok(buf)
@@ -506,6 +579,115 @@ fn id_key(id: &Bson) -> Result<Vec<u8>> {
     sortkey::encode_value(id, None).map_err(|_| StorageError::UnsupportedId)
 }
 
+/// Whether applying `update` to a doc with `_id == old_id` would modify the
+/// immutable `_id` field (mongod rejects this with `ImmutableField`, code 66).
+/// Operator-form: any modifier touching `_id` (or an `_id.` sub-path), except a
+/// `$set`/`$setOnInsert` that sets `_id` to its current value. Replacement-form:
+/// a specified `_id` different from the current one.
+fn update_would_change_id(update: &Document, old_id: &Bson) -> bool {
+    let touches_id = |fields: &Document| fields.keys().any(|k| k == "_id" || k.starts_with("_id."));
+    if !update.keys().any(|k| k.starts_with('$')) {
+        // Replacement-style: only a *different* explicit `_id` is a violation.
+        return matches!(update.get("_id"), Some(v) if v != old_id);
+    }
+    for (op, arg) in update {
+        let Some(fields) = arg.as_document() else {
+            continue;
+        };
+        match op.as_str() {
+            "$set" | "$setOnInsert" => {
+                if let Some(v) = fields.get("_id") {
+                    if v != old_id {
+                        return true;
+                    }
+                }
+                if fields.keys().any(|k| k.starts_with("_id.")) {
+                    return true;
+                }
+            }
+            "$unset" | "$inc" | "$mul" | "$min" | "$max" | "$pop" | "$push" | "$pull"
+            | "$pullAll" | "$addToSet" | "$bit" | "$currentDate" => {
+                if touches_id(fields) {
+                    return true;
+                }
+            }
+            "$rename" => {
+                for (from, to) in fields {
+                    if from == "_id" || from.starts_with("_id.") {
+                        return true;
+                    }
+                    if let Bson::String(t) = to {
+                        if t == "_id" || t.starts_with("_id.") {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Resolve `$currentDate` to concrete clock values so the deterministic core
+/// update engine (which defers `$currentDate` as non-deterministic) never sees
+/// it. Each field is folded into `$set`: a `true` value or `{$type: "date"}`
+/// becomes the current UTC `DateTime`; `{$type: "timestamp"}` becomes
+/// `Timestamp(now_secs, 0)`. All fields in one update share a single clock read
+/// (mongod applies one operation time). The update is returned unchanged when it
+/// carries no `$currentDate`. Mirrors `update.py`'s `$currentDate` branch. An
+/// unrecognised option (anything other than `true` / `{$type: "date"|"timestamp"}`)
+/// or a non-document `$set`/`$currentDate` is rejected.
+fn resolve_current_date(update: &Document) -> Result<Document> {
+    let Some(cd_bson) = update.get("$currentDate") else {
+        return Ok(update.clone());
+    };
+    let Bson::Document(cd) = cd_bson else {
+        return Err(StorageError::QueryUnsupported);
+    };
+    let millis = now_millis();
+    let date = Bson::DateTime(bson::DateTime::from_millis(millis));
+    let ts = Bson::Timestamp(bson::Timestamp {
+        time: (millis / 1000) as u32,
+        increment: 0,
+    });
+    let mut out = update.clone();
+    out.remove("$currentDate");
+    let mut set = match out.remove("$set") {
+        Some(Bson::Document(d)) => d,
+        None => Document::new(),
+        Some(_) => return Err(StorageError::QueryUnsupported),
+    };
+    for (path, opts) in cd {
+        let value = match opts {
+            Bson::Boolean(true) => date.clone(),
+            Bson::Document(o) => match o.get_str("$type") {
+                Ok("date") => date.clone(),
+                Ok("timestamp") => ts.clone(),
+                _ => return Err(StorageError::QueryUnsupported),
+            },
+            _ => return Err(StorageError::QueryUnsupported),
+        };
+        set.insert(path.clone(), value);
+    }
+    out.insert("$set", Bson::Document(set));
+    Ok(out)
+}
+
+/// The doc-table key for `doc`: the caller-supplied override (timeseries rows
+/// carry a suffixed key) when present, else `id_key(doc["_id"])`.
+fn doc_table_key(doc: &Document, override_key: Option<&[u8]>) -> Result<Vec<u8>> {
+    match override_key {
+        Some(k) => Ok(k.to_vec()),
+        None => {
+            let id = doc
+                .get("_id")
+                .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
+            id_key(id)
+        }
+    }
+}
+
 // --- index-key construction (mirrors `storage.py`, byte-for-byte) ---
 
 /// The per-field sort direction of a `key_spec` value: `Some(1)`/`Some(-1)` for
@@ -518,6 +700,63 @@ fn direction_of(v: &Bson) -> Option<i32> {
         Bson::Double(d) => Some(*d as i32),
         _ => None,
     }
+}
+
+/// Whether two index key specs name the *same* index. Field names and order must
+/// match exactly (mongod treats `{a:1,b:1}` and `{b:1,a:1}` as distinct), but
+/// numeric direction values compare numerically — `{a: 1}` and `{a: 1.0}` are the
+/// same index (drivers such as mongocxx's GridFS create indexes with `1.0`).
+/// Non-numeric directions (geo type strings like `"2dsphere"`) compare exactly.
+fn index_keys_equiv(a: &Document, b: &Document) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|((ak, av), (bk, bv))| {
+            ak == bk
+                && match (direction_of(av), direction_of(bv)) {
+                    (Some(da), Some(db)) => da == db,
+                    _ => av == bv,
+                }
+        })
+}
+
+/// Format a scalar BSON value the way the mongo shell prints it, for the
+/// `dup key: { … }` fragment of an E11000 message (drivers like the PHP extension
+/// pin the text verbatim). Mirrors `storage._shell_value`.
+fn shell_value(v: &Bson) -> String {
+    match v {
+        Bson::Boolean(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Bson::String(s) => format!("\"{s}\""),
+        Bson::ObjectId(o) => format!("ObjectId('{o}')"),
+        Bson::Null => "null".to_string(),
+        Bson::Int32(i) => i.to_string(),
+        Bson::Int64(i) => i.to_string(),
+        // Match Python `str(float)`: integral doubles keep a trailing `.0`.
+        Bson::Double(d) if d.fract() == 0.0 && d.is_finite() => format!("{d:.1}"),
+        Bson::Double(d) => d.to_string(),
+        Bson::Decimal128(d) => d.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Build mongod's E11000 duplicate-key `errmsg`:
+/// `E11000 duplicate key error collection: <ns> index: <name> dup key: { <k>: <v>, … }`
+/// — the exact shape drivers assert against. Mirrors `storage.format_dup_key_errmsg`.
+fn format_dup_key_errmsg(namespace: &str, index_name: &str, key_value: &Document) -> String {
+    let dup = if key_value.is_empty() {
+        "{ }".to_string()
+    } else {
+        let inner: Vec<String> = key_value
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", shell_value(v)))
+            .collect();
+        format!("{{ {} }}", inner.join(", "))
+    };
+    format!("E11000 duplicate key error collection: {namespace} index: {index_name} dup key: {dup}")
 }
 
 /// Direction-aware sort-key encoding for one value (defers to Python on the
@@ -756,13 +995,103 @@ fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Vec<u8>>>> {
     }
 }
 
-/// True if `query` is at least as restrictive as `partial` — every key/value
-/// pair in `partial` appears with the same *bare* value in `query`.
-/// Conservative: operator-form clauses or document-level operators in the query
-/// don't count as implying the partial filter. Mirrors
-/// `storage._query_implies_partial`.
+/// True if `v` is a non-empty operator document (every key starts with `$`),
+/// e.g. `{$lte: 1.5}`. Mirrors Python's `all(k.startswith("$") for k in v)`.
+fn is_op_doc(v: &Bson) -> bool {
+    matches!(v, Bson::Document(d) if !d.is_empty() && d.keys().all(|k| k.starts_with('$')))
+}
+
+/// Does a single query constraint `(qop, qv)` guarantee the partial bound
+/// `(pop, pv)`? Comparison uses `encode_value` so it follows MongoDB's
+/// cross-type BSON sort order. Returns `false` for any pairing it can't prove
+/// (soundness over completeness). Mirrors `storage._op_implies_bound`.
+fn op_implies_bound(qop: &str, qv: &Bson, pop: &str, pv: &Bson) -> bool {
+    let (a, b) = match (
+        sortkey::encode_value(qv, None),
+        sortkey::encode_value(pv, None),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return false,
+    };
+    let (le, lt, ge, gt, eq) = (a <= b, a < b, a >= b, a > b, a == b);
+    match pop {
+        // query upper-bounds the field; need its max <= / < pv.
+        "$lte" | "$lt" => match qop {
+            "$eq" | "$lte" => {
+                if pop == "$lte" {
+                    le
+                } else {
+                    lt
+                }
+            }
+            "$lt" => le, // a < qv <= pv => a < pv => a <= pv (and a < pv for $lt)
+            _ => false,
+        },
+        "$gte" | "$gt" => match qop {
+            "$eq" | "$gte" => {
+                if pop == "$gte" {
+                    ge
+                } else {
+                    gt
+                }
+            }
+            "$gt" => ge,
+            _ => false,
+        },
+        "$eq" => qop == "$eq" && eq,
+        _ => false,
+    }
+}
+
+/// True if the query clause `qval` (a bare value or an operator dict) guarantees
+/// every constraint in the partial operator dict `pbound` (e.g. `{$lte: 1.5}`).
+/// Mirrors `storage._clause_implies_bounds`.
+fn clause_implies_bounds(qval: &Bson, pbound: &Document) -> bool {
+    let q_constraints: Vec<(&str, &Bson)> = match qval {
+        Bson::Document(d) if is_op_doc(qval) => d.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+        _ => vec![("$eq", qval)],
+    };
+    for (pop, pv) in pbound.iter() {
+        if !matches!(pop.as_str(), "$eq" | "$lt" | "$lte" | "$gt" | "$gte") {
+            return false; // partial filter uses an operator we can't reason about
+        }
+        if !q_constraints
+            .iter()
+            .any(|(qop, qv)| op_implies_bound(qop, qv, pop, pv))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// True if every document matching `query` is guaranteed to be in a partial
+/// index whose filter is `partial` — i.e. `query` is at least as restrictive as
+/// `partial` on every partial-filter field. SOUNDNESS is the rule: errs to
+/// `false` (skip the index, full scan) for anything it can't prove implied.
+/// Supports bare-equality partial values and the `$eq`/`$lt`/`$lte`/`$gt`/`$gte`
+/// range operators on both sides. Mirrors `storage._query_implies_partial`.
 fn query_implies_partial(query: &Document, partial: &Document) -> bool {
-    partial.iter().all(|(k, v)| query.get(k) == Some(v))
+    for (key, pval) in partial.iter() {
+        let qval = match query.get(key) {
+            Some(v) => v,
+            None => return false,
+        };
+        if is_op_doc(pval) {
+            if !clause_implies_bounds(qval, pval.as_document().unwrap()) {
+                return false;
+            }
+        } else if is_op_doc(qval) {
+            // bare-value partial, operator-form query: only an exact `$eq` of the
+            // same value implies it.
+            if qval.as_document().unwrap().get("$eq") != Some(pval) {
+                return false;
+            }
+        } else if qval != pval {
+            return false;
+        }
+    }
+    true
 }
 
 /// `(field, direction)` if `sort` is a single `±1` field (not operator-prefixed),
@@ -883,6 +1212,9 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
 /// concurrency story is unchanged; see `tasks/wt-bindings-plan.md`).
 pub struct Storage {
     conn: Connection,
+    /// The WiredTiger home (on-disk data) directory. Kept so `create_archive`
+    /// can tar the consistent file set the `backup:` cursor enumerates.
+    home: String,
     lock: Mutex<()>,
     /// Whether writes emit oplog entries (and the oplog tables are live). Mirrors
     /// `storage.enable_oplog`. Default `true`.
@@ -901,6 +1233,14 @@ pub struct Storage {
     /// `storage.oplog_retention_seconds` / `oplog_max_entries`.
     oplog_retention_seconds: i64,
     oplog_max_entries: usize,
+    /// Per-insert discriminator for timeseries doc-table keys (see
+    /// `timeseries_doc_suffix`). Wraps at 16 bits; combined with a nanosecond
+    /// timestamp it keeps duplicate-`_id` rows distinct across reopens.
+    ts_suffix_counter: AtomicU64,
+    /// When set, `prune_oplog` archives the rows it is about to drop into a
+    /// durable oplog segment in this directory first (PITR v2). Mirrors
+    /// `storage.oplog_archive_dir`.
+    oplog_archive_dir: Option<String>,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -910,7 +1250,19 @@ struct OplogState {
     next_seq: i64,
     last_ts_secs: i64,
     last_ts_ord: i64,
+    /// Next monotonic insertion `seq` for the natural-order index (independent of
+    /// the oplog `seq`; advances on every doc insert even when the oplog is off).
+    next_nat_seq: i64,
+    /// Oplog rows emitted since the last opportunistic prune. In-memory only
+    /// (resets on open, like `storage._oplog_emit_count`); never persisted.
+    emit_count: i64,
 }
+
+/// Emit this many oplog rows between opportunistic `prune_oplog` sweeps on the
+/// write path (mirrors `storage._OPLOG_PRUNE_INTERVAL`). This keeps the oplog
+/// bounded from writes alone, even when the noop-heartbeat sweeper is disabled
+/// (`noop_heartbeat_seconds == 0`, the default), which is the only other pruner.
+const OPLOG_PRUNE_INTERVAL: i64 = 1000;
 
 /// Milliseconds since the Unix epoch (UTC), for oplog `wall` times.
 fn now_millis() -> i64 {
@@ -945,6 +1297,11 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                     next_seq: g("next_seq").unwrap_or(1),
                     last_ts_secs: g("last_ts_secs").unwrap_or(0),
                     last_ts_ord: g("last_ts_ord").unwrap_or(0),
+                    // Absent in legacy / oplog-disabled rows — recover by scanning
+                    // the natural index so minted seqs stay strictly greater.
+                    next_nat_seq: g("next_nat_seq")
+                        .unwrap_or_else(|| scan_max_nat_seq(session) + 1),
+                    emit_count: 0,
                 });
             }
         }
@@ -975,7 +1332,147 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         next_seq: last_seq + 1,
         last_ts_secs: last_secs,
         last_ts_ord: last_ord,
+        next_nat_seq: scan_max_nat_seq(session) + 1,
+        emit_count: 0,
     })
+}
+
+/// Largest insertion `seq` present in `NAT_TABLE` (0 if empty) — used to recover
+/// the natural-order counter on open when the persisted `next_nat_seq` is absent,
+/// so minted seqs stay strictly greater than any existing one. Mirrors
+/// `storage._scan_max_nat_seq`.
+fn scan_max_nat_seq(session: &Session) -> i64 {
+    let Ok(c) = session.open_cursor(NAT_TABLE, None) else {
+        return 0;
+    };
+    // The table is keyed (db, coll, seq); the last row has the highest seq within
+    // the last (db, coll), but seqs are global-monotonic so any row's seq could be
+    // the max across collections — scan and take the max.
+    let mut max_seq = 0i64;
+    while c.next().unwrap_or(false) {
+        if let Ok((_db, _coll, seq)) = c.get_key_ssq() {
+            if seq > max_seq {
+                max_seq = seq;
+            }
+        }
+    }
+    max_seq
+}
+
+/// What `create_archive` produced: the absolute-ish output path and its size.
+/// Mirrors the `{path, sizeBytes}` Python `Storage.create_archive` returns.
+pub struct ArchiveInfo {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+fn archive_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
+    StorageError::Internal(format!("{ctx}: {e}"))
+}
+
+/// Extract a backup `.tar.gz` (from `create_archive`) into `target_dir`, which is
+/// then a startable WiredTiger home. Free function (no live `Storage` needed) so
+/// the restore path can rebuild a fresh directory. Mirrors Python
+/// `extract_backup_archive`.
+pub fn extract_backup_archive(archive_path: &str, target_dir: &str) -> Result<()> {
+    std::fs::create_dir_all(target_dir).map_err(|e| archive_err("extract_backup_archive", e))?;
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| archive_err("extract_backup_archive", e))?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+    archive
+        .unpack(target_dir)
+        .map_err(|e| archive_err("extract_backup_archive", e))?;
+    Ok(())
+}
+
+/// Extract a backup `.tar.gz` into `target_dir` with the same guardrails as the
+/// Python `extract_backup_archive`, returning `(abs_target, abs_archive,
+/// file_count)`. Backs `secantusAdmin.restoreArchive`:
+///
+/// * rejects a `target_dir` that already exists, is non-empty, and
+///   `allow_existing` is false;
+/// * verifies the archive is a SecantusDB / WiredTiger backup (contains a
+///   `WiredTiger` metadata entry) **before** extracting, so a malformed archive
+///   can't pollute `target_dir`.
+pub fn extract_backup_archive_ex(
+    archive_path: &str,
+    target_dir: &str,
+    allow_existing: bool,
+) -> Result<(String, String, u64)> {
+    let abs_archive = std::fs::canonicalize(archive_path)
+        .map_err(|_| {
+            archive_err(
+                "restoreArchive",
+                format!("archive not found: {archive_path}"),
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+
+    let target = std::path::Path::new(target_dir);
+    if target.exists() {
+        if !target.is_dir() {
+            return Err(archive_err(
+                "restoreArchive",
+                format!("target exists and is not a directory: {target_dir}"),
+            ));
+        }
+        let non_empty = std::fs::read_dir(target)
+            .map_err(|e| archive_err("restoreArchive", e))?
+            .next()
+            .is_some();
+        if non_empty && !allow_existing {
+            return Err(archive_err(
+                "restoreArchive",
+                format!(
+                    "target directory is not empty (pass allowExisting=true to overlay): {target_dir}"
+                ),
+            ));
+        }
+    } else {
+        std::fs::create_dir_all(target).map_err(|e| archive_err("restoreArchive", e))?;
+    }
+
+    // Pass 1: verify it's a SecantusDB backup + count entries, without touching
+    // the target (mirrors Python's "check the WiredTiger metadata is present
+    // before extraction so a malformed archive can't pollute target_dir").
+    let mut count: u64 = 0;
+    let mut has_wt = false;
+    {
+        let file =
+            std::fs::File::open(&abs_archive).map_err(|e| archive_err("restoreArchive", e))?;
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        for entry in ar.entries().map_err(|e| archive_err("restoreArchive", e))? {
+            let entry = entry.map_err(|e| archive_err("restoreArchive", e))?;
+            let path = entry.path().map_err(|e| archive_err("restoreArchive", e))?;
+            if path.as_os_str() == "WiredTiger" {
+                has_wt = true;
+            }
+            count += 1;
+        }
+    }
+    if !has_wt {
+        return Err(archive_err(
+            "restoreArchive",
+            format!(
+                "archive {abs_archive:?} is not a SecantusDB backup \
+                 (no WiredTiger metadata file inside)"
+            ),
+        ));
+    }
+
+    // Pass 2: extract.
+    let file = std::fs::File::open(&abs_archive).map_err(|e| archive_err("restoreArchive", e))?;
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    ar.unpack(target)
+        .map_err(|e| archive_err("restoreArchive", e))?;
+
+    let abs_target = std::fs::canonicalize(target)
+        .map_err(|e| archive_err("restoreArchive", e))?
+        .to_string_lossy()
+        .into_owned();
+    Ok((abs_target, abs_archive, count))
 }
 
 impl Storage {
@@ -1000,12 +1497,15 @@ impl Storage {
         };
         Ok(Storage {
             conn,
+            home: home.to_string(),
             lock: Mutex::new(()),
             enable_oplog: true,
             oplog: Mutex::new(state),
             oplog_cv: Condvar::new(),
             oplog_retention_seconds: 3600,
             oplog_max_entries: 100_000,
+            ts_suffix_counter: AtomicU64::new(0),
+            oplog_archive_dir: None,
         })
     }
 
@@ -1013,6 +1513,13 @@ impl Storage {
     /// Off means writes skip the oplog tables entirely.
     pub fn set_enable_oplog(&mut self, on: bool) {
         self.enable_oplog = on;
+    }
+
+    /// Enable PITR v2 oplog archiving: `prune_oplog` writes the rows it is about
+    /// to drop into a durable segment in `dir` first. `None` disables it. Mirrors
+    /// `Storage(oplog_archive_dir=...)`.
+    pub fn set_oplog_archive_dir(&mut self, dir: Option<String>) {
+        self.oplog_archive_dir = dir;
     }
 
     /// Set the oplog retention window in seconds (default 3600). Mirrors
@@ -1072,6 +1579,7 @@ impl Storage {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
+        let n = entries.len() as i64;
         let (start, ts) = self.mint_seq_and_ts(entries.len());
         let cur = session.open_cursor(OPLOG_TABLE, None)?;
         let mut pre_cur: Option<Cursor> = None;
@@ -1101,9 +1609,28 @@ impl Storage {
         // Wake any tailable change-stream getMore blocked in `wait_for_oplog`:
         // the rows are committed (autocommit per insert) and the tail (next_seq)
         // has advanced, so a woken waiter's producer re-read sees the new events.
-        {
-            let _g = self.oplog.lock().unwrap();
+        // Also bump the opportunistic-prune counter under the same lock.
+        let do_prune = {
+            let mut g = self.oplog.lock().unwrap();
             self.oplog_cv.notify_all();
+            g.emit_count += n;
+            if g.emit_count >= OPLOG_PRUNE_INTERVAL {
+                g.emit_count = 0;
+                true
+            } else {
+                false
+            }
+        };
+        // Opportunistically bound the oplog from write volume alone (mirrors
+        // `storage._emit_oplog`'s every-1000-emits prune). Every `emit_oplog`
+        // caller already holds `self.lock`, so the prune runs with `take_lock =
+        // false` to avoid re-locking the non-reentrant mutex. Best-effort: the
+        // write already committed, so a prune failure must not fail the write —
+        // the next sweep retries.
+        if do_prune {
+            if let Err(e) = self.prune_oplog_inner(None, false) {
+                debug_assert!(false, "opportunistic prune_oplog failed: {e:?}");
+            }
         }
         Ok(last)
     }
@@ -1141,12 +1668,27 @@ impl Storage {
     /// `storage.current_cluster_time`.
     pub fn current_cluster_time(&self) -> Result<bson::Timestamp> {
         let _g = self.lock.lock().unwrap();
-        let ts = {
+        // Mint the next timestamp and snapshot the recovery meta in a SINGLE
+        // oplog-mutex hold, instead of locking to mint and locking again inside
+        // `persist_oplog_meta` to read the same fields back. (The seq counter
+        // can't be demoted to a bare `AtomicI64`: `wait_for_oplog` pairs
+        // `next_seq` with `oplog_cv`, and the condvar's lost-wakeup guarantee
+        // requires the counter to be read under the same mutex as the wait.)
+        let (ts, meta) = {
             let mut st = self.oplog.lock().unwrap();
-            Self::mint_ts(&mut st)
+            let ts = Self::mint_ts(&mut st);
+            (
+                ts,
+                (
+                    st.next_seq,
+                    st.last_ts_secs,
+                    st.last_ts_ord,
+                    st.next_nat_seq,
+                ),
+            )
         };
         let session = self.conn.open_session()?;
-        self.persist_oplog_meta(&session)?;
+        self.persist_oplog_meta(&session, meta)?;
         Ok(ts)
     }
 
@@ -1171,14 +1713,13 @@ impl Storage {
     /// Persist the recovery meta row (`next_seq` / `last_ts_*`). Best-effort
     /// optimisation — `load_oplog_meta` reconstructs from the oplog table if the
     /// row is stale or missing. Mirrors `storage._persist_oplog_meta`.
-    fn persist_oplog_meta(&self, session: &Session) -> Result<()> {
+    fn persist_oplog_meta(&self, session: &Session, meta: (i64, i64, i64, i64)) -> Result<()> {
+        let (next_seq, last_ts_secs, last_ts_ord, next_nat_seq) = meta;
         let mut d = Document::new();
-        {
-            let st = self.oplog.lock().unwrap();
-            d.insert("next_seq", st.next_seq);
-            d.insert("last_ts_secs", st.last_ts_secs);
-            d.insert("last_ts_ord", st.last_ts_ord);
-        }
+        d.insert("next_seq", next_seq);
+        d.insert("last_ts_secs", last_ts_secs);
+        d.insert("last_ts_ord", last_ts_ord);
+        d.insert("next_nat_seq", next_nat_seq);
         let blob = encode_doc(&d)?;
         let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
         cur.set_key_s("state");
@@ -1193,7 +1734,10 @@ impl Storage {
     /// Mirrors `storage.read_oplog` (ns filtering / projection are a higher
     /// layer's job).
     pub fn read_oplog(&self, start_seq: i64, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
-        let _g = self.lock.lock().unwrap();
+        // No global lock: a fresh session's WiredTiger MVCC snapshot gives a
+        // consistent read without blocking writers. This is the hot tailable
+        // change-stream getMore path, so serialising it against every write
+        // would needlessly throttle throughput.
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(OPLOG_TABLE, None)?;
         cur.set_key_q(start_seq);
@@ -1223,10 +1767,62 @@ impl Storage {
         Ok(out)
     }
 
+    /// Whether `(db, coll)` is the synthetic `local.oplog.rs` view.
+    fn is_oplog_rs(&self, db: &str, coll: &str) -> bool {
+        self.enable_oplog && db == "local" && coll == "oplog.rs"
+    }
+
+    /// Read path for the synthetic `local.oplog.rs` view: every persisted oplog
+    /// entry, filtered by `filter` and ordered by `$natural` (the oplog's only
+    /// meaningful order — entries are scanned in seq == insertion == ts order,
+    /// so `$natural: 1` is the identity and `$natural: -1` reverses). A
+    /// non-`$natural` sort falls through to the generic compound-key post-sort.
+    /// skip / limit / projection are the caller's job. Mirrors
+    /// `storage._find_oplog_rs`.
+    fn find_oplog_rs(
+        &self,
+        filter: &Document,
+        sort: Option<&Document>,
+        coll_opt: Option<&Collation>,
+        vars: &Document,
+    ) -> Result<Vec<Vec<u8>>> {
+        let rows = self.read_oplog(0, usize::MAX)?;
+        let mut out: Vec<(Document, Vec<u8>)> = Vec::with_capacity(rows.len());
+        for (_seq, blob) in rows {
+            let d = decode_doc(&blob)?;
+            if filter.is_empty()
+                || query_matches(&d, filter, vars, coll_opt)
+                    .map_err(|_| StorageError::QueryUnsupported)?
+            {
+                out.push((d, blob));
+            }
+        }
+        if let Some(s) = sort {
+            if let Some(nat) = s.get("$natural") {
+                let dir = nat
+                    .as_i32()
+                    .or_else(|| nat.as_i64().map(|v| v as i32))
+                    .or_else(|| nat.as_f64().map(|v| v as i32))
+                    .unwrap_or(1);
+                if dir < 0 {
+                    out.reverse();
+                }
+            } else if let Some(spec) = multi_sort_spec(sort) {
+                let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(out.len());
+                for (d, blob) in out {
+                    keyed.push((sort_key(&d, &spec, coll_opt)?, blob));
+                }
+                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                return Ok(keyed.into_iter().map(|(_, b)| b).collect());
+            }
+        }
+        Ok(out.into_iter().map(|(_, b)| b).collect())
+    }
+
     /// The smallest seq currently present (0 if empty) — the retention floor a
     /// resume token must stay at or above. Mirrors `storage.oplog_floor_seq`.
     pub fn oplog_floor_seq(&self) -> Result<i64> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(OPLOG_TABLE, None)?;
         match cur.next() {
@@ -1239,8 +1835,164 @@ impl Storage {
     /// The highest seq emitted (`next_seq - 1`), 0 if none. Mirrors
     /// `storage.oplog_tail_seq`.
     pub fn oplog_tail_seq(&self) -> i64 {
-        let _g = self.lock.lock().unwrap();
+        // The tail counter lives under the dedicated oplog mutex; the global lock
+        // adds nothing here.
         self.oplog.lock().unwrap().next_seq - 1
+    }
+
+    /// Force a WiredTiger checkpoint (durable flush of the latest snapshot). Used
+    /// by oplog replay to make the restored database durable before the target
+    /// `Storage` is dropped.
+    pub fn checkpoint(&self) -> Result<()> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        session.checkpoint(None)?;
+        Ok(())
+    }
+
+    /// Force a checkpoint, then tar the consistent WiredTiger file set (enumerated
+    /// by WiredTiger's `backup:` cursor) into `output_path` as a gzip stream, with
+    /// an advisory `pitr-manifest.json` describing the oplog range it can recover
+    /// to. Mirrors Python `Storage.create_archive`. The on-disk + oplog formats
+    /// are identical across the two servers, so the Python restore tooling reads
+    /// this archive (and vice versa).
+    pub fn create_archive(&self, output_path: &str) -> Result<ArchiveInfo> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        // Durable, consistent snapshot first; the backup cursor enumerates the
+        // files that make it up and WiredTiger holds them stable for the cursor's
+        // lifetime, so we tar them all before it drops.
+        session.checkpoint(None)?;
+        let manifest = self.pitr_manifest()?;
+        let cursor = session.open_cursor("backup:", None)?;
+        let file =
+            std::fs::File::create(output_path).map_err(|e| archive_err("create_archive", e))?;
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        while cursor.next()? {
+            let rel = cursor.get_key_s()?;
+            let full = std::path::Path::new(&self.home).join(&rel);
+            builder
+                .append_path_with_name(&full, &rel)
+                .map_err(|e| archive_err("create_archive", e))?;
+        }
+        let data =
+            serde_json::to_vec(&manifest).map_err(|e| archive_err("create_archive manifest", e))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, PITR_MANIFEST_NAME, &data[..])
+            .map_err(|e| archive_err("create_archive", e))?;
+        builder
+            .into_inner()
+            .map_err(|e| archive_err("create_archive", e))?
+            .finish()
+            .map_err(|e| archive_err("create_archive", e))?;
+        let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+        Ok(ArchiveInfo {
+            path: output_path.to_string(),
+            size_bytes: size,
+        })
+    }
+
+    /// Take a PITR v2 base snapshot into `archive_dir`, named by its oplog head
+    /// seq (`base-<head>.tar.gz`) so the restore path can order and select
+    /// snapshots. Thin wrapper over `create_archive`. Pair with
+    /// `set_oplog_archive_dir(archive_dir)` and call periodically (no background
+    /// scheduler). Mirrors `storage.archive_base_snapshot`.
+    pub fn archive_base_snapshot(&self, archive_dir: &str) -> Result<ArchiveInfo> {
+        let head = self.oplog_tail_seq();
+        std::fs::create_dir_all(archive_dir)
+            .map_err(|e| archive_err("archive_base_snapshot", e))?;
+        let out = std::path::Path::new(archive_dir).join(pitr_archive::base_name(head));
+        self.create_archive(&out.to_string_lossy())
+    }
+
+    /// Read the doomed oplog rows (and pre-images) and write them to a durable
+    /// segment in `archive_dir` before `prune_oplog` deletes them. Best-effort
+    /// reads — a row that vanished concurrently is skipped.
+    fn archive_doomed_oplog(
+        &self,
+        session: &Session,
+        archive_dir: &str,
+        doomed_sorted: &[i64],
+    ) -> Result<()> {
+        let op_cur = session.open_cursor(OPLOG_TABLE, None)?;
+        let pre_cur = session.open_cursor(PREIMAGE_TABLE, None)?;
+        let mut rows: Vec<(i64, Document, Option<Document>)> = Vec::new();
+        for &seq in doomed_sorted {
+            op_cur.reset()?;
+            op_cur.set_key_q(seq);
+            if op_cur.search().is_err() {
+                continue;
+            }
+            let blob = op_cur.get_value_u()?;
+            if blob.is_empty() {
+                continue;
+            }
+            let entry = decode_doc(&blob)?;
+            pre_cur.reset()?;
+            pre_cur.set_key_q(seq);
+            let pre = match pre_cur.search() {
+                Ok(()) => {
+                    let pb = pre_cur.get_value_u()?;
+                    if pb.is_empty() {
+                        None
+                    } else {
+                        Some(decode_doc(&pb)?)
+                    }
+                }
+                Err(_) => None,
+            };
+            rows.push((seq, entry, pre));
+        }
+        pitr_archive::write_segment(archive_dir, &rows)?;
+        Ok(())
+    }
+
+    /// Build the advisory PITR manifest embedded in a backup archive: the oplog
+    /// seq range and timestamps it can recover to, plus whether the oplog still
+    /// reaches genesis. Mirrors Python `Storage._pitr_manifest` (a subset; wall
+    /// times land with the v2 base-selection work). Called under `self.lock`; the
+    /// oplog reads it uses are lock-free.
+    fn pitr_manifest(&self) -> Result<serde_json::Value> {
+        let floor = self.oplog_floor_seq()?;
+        let head = self.oplog_tail_seq();
+        let row_of = |seq: i64| -> Option<Document> {
+            if seq <= 0 {
+                return None;
+            }
+            let rows = self.read_oplog(seq, 1).ok()?;
+            let (_s, blob) = rows.into_iter().next()?;
+            decode_doc(&blob).ok()
+        };
+        let ts_of = |row: &Option<Document>| -> Option<[i64; 2]> {
+            match row.as_ref()?.get("ts") {
+                Some(Bson::Timestamp(ts)) => Some([i64::from(ts.time), i64::from(ts.increment)]),
+                _ => None,
+            }
+        };
+        let wall_of = |row: &Option<Document>| -> Option<String> {
+            match row.as_ref()?.get("wall") {
+                Some(Bson::DateTime(dt)) => dt.try_to_rfc3339_string().ok(),
+                _ => None,
+            }
+        };
+        let floor_row = row_of(floor);
+        let head_row = row_of(head);
+        Ok(serde_json::json!({
+            "secantusPitrManifest": 1,
+            "oplogEnabled": self.enable_oplog,
+            "oplogFloorSeq": floor,
+            "oplogHeadSeq": head,
+            "genesisIntact": floor == 1,
+            "oplogFloorTs": ts_of(&floor_row),
+            "oplogHeadTs": ts_of(&head_row),
+            "oplogFloorWall": wall_of(&floor_row),
+            "oplogHeadWall": wall_of(&head_row),
+        }))
     }
 
     /// Merge `opts` into the collection's options blob (creating the collection
@@ -1257,6 +2009,38 @@ impl Storage {
         write_coll_options(&session, db, coll, &current)
     }
 
+    /// `collMod`: merge `opts` into the collection's stored options (like
+    /// `set_collection_options`) AND emit a DDL `op: "c"` `collMod` oplog entry,
+    /// so a `showExpandedEvents` change stream surfaces a `modify` event. Used by
+    /// the `collMod` command (plain `set_collection_options` stays oplog-silent
+    /// for internal option writes such as `create`'s). Mirrors mongod's collMod
+    /// oplog (`o = {collMod: <coll>, <changed fields>}`).
+    pub fn coll_mod(&self, db: &str, coll: &str, opts: &Document) -> Result<()> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        ensure_collection(&session, db, coll)?;
+        let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
+        for (k, v) in opts {
+            current.insert(k.clone(), v.clone());
+        }
+        write_coll_options(&session, db, coll, &current)?;
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut o = Document::new();
+            o.insert("collMod", coll);
+            for (k, v) in opts {
+                o.insert(k.clone(), v.clone());
+            }
+            let mut entry = Document::new();
+            entry.insert("op", "c");
+            entry.insert("ns", format!("{db}.$cmd"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry], vec![None])?;
+        }
+        Ok(())
+    }
+
     /// The collection's 16-byte UUID (minting + persisting one on first use).
     /// Mirrors `storage.collection_uuid`.
     pub fn collection_uuid(&self, db: &str, coll: &str) -> Result<Vec<u8>> {
@@ -1266,10 +2050,19 @@ impl Storage {
         collection_uuid(&session, db, coll)
     }
 
+    /// Whether `changeStreamPreAndPostImages: {enabled: true}` is set on the
+    /// collection — change streams need it for `fullDocument: required` /
+    /// `whenAvailable` (post-image) and `fullDocumentBeforeChange`.
+    pub fn pre_post_images_enabled(&self, db: &str, coll: &str) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        pre_post_images_enabled(&session, db, coll)
+    }
+
     /// The pre-image document bytes stored for oplog `seq`, or `None`. Fresh
     /// session for cross-thread visibility. Mirrors `storage.read_preimage`.
     pub fn read_preimage(&self, seq: i64) -> Result<Option<Vec<u8>>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(PREIMAGE_TABLE, None)?;
         cur.set_key_q(seq);
@@ -1283,18 +2076,92 @@ impl Storage {
         }
     }
 
+    /// Write **verbatim** oplog rows `(seq, entry)` (carrying their original seq /
+    /// ts / wall) plus any pre-images into the oplog tables, and advance the seq +
+    /// cluster clock past them — so a restored store continues a pre-existing
+    /// timeline and a change stream there can resume from a token minted before
+    /// the restore point. Unlike `emit_oplog` this does NOT mint new seqs (the
+    /// rows keep their identity, so resume tokens stay valid) and is not gated on
+    /// `enable_oplog` (it's an explicit import). Returns the highest seq written.
+    /// Mirrors Python `Storage.import_oplog_segment`.
+    pub fn import_oplog_segment(
+        &self,
+        rows: &[(i64, Document)],
+        pre_images: &std::collections::HashMap<i64, Vec<u8>>,
+    ) -> Result<i64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        let mut pre_cur: Option<Cursor> = None;
+        let mut max_seq = 0i64;
+        let mut best = (0i64, 0i64);
+        for (seq, entry) in rows {
+            let blob = encode_doc(entry)?;
+            cur.reset()?;
+            cur.set_key_q(*seq);
+            cur.set_value_u(&blob);
+            cur.insert()?;
+            if let Some(pre) = pre_images.get(seq) {
+                if pre_cur.is_none() {
+                    pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
+                }
+                let pc = pre_cur.as_ref().unwrap();
+                pc.reset()?;
+                pc.set_key_q(*seq);
+                pc.set_value_u(pre);
+                pc.insert()?;
+            }
+            if *seq > max_seq {
+                max_seq = *seq;
+            }
+            if let Some(Bson::Timestamp(ts)) = entry.get("ts") {
+                let cand = (i64::from(ts.time), i64::from(ts.increment));
+                if cand > best {
+                    best = cand;
+                }
+            }
+        }
+        {
+            let mut st = self.oplog.lock().unwrap();
+            if max_seq + 1 > st.next_seq {
+                st.next_seq = max_seq + 1;
+            }
+            if best > (st.last_ts_secs, st.last_ts_ord) {
+                st.last_ts_secs = best.0;
+                st.last_ts_ord = best.1;
+            }
+            self.oplog_cv.notify_all();
+        }
+        Ok(max_seq)
+    }
+
     /// Drop oplog rows older than the retention window (`ts.time < now -
     /// retention`) and, if more than `oplog_max_entries` remain, the oldest
     /// surplus; paired pre-images go too. `now` is injected seconds (defaults to
     /// the wall clock). Returns the number of rows pruned. No background sweeper —
     /// the caller drives it. Mirrors `storage.prune_oplog` / `_prune_oplog_locked`.
     pub fn prune_oplog(&self, now: Option<i64>) -> Result<usize> {
-        let _g = self.lock.lock().unwrap();
+        self.prune_oplog_inner(now, true)
+    }
+
+    /// `prune_oplog`, parameterised on whether to acquire the global `self.lock`
+    /// for the delete phase. The public entry point passes `take_lock = true`;
+    /// the opportunistic write-path caller (`emit_oplog`) already holds the lock
+    /// and passes `false` (`std::Mutex` is not reentrant). The scan phase is
+    /// always lock-free on a fresh MVCC session either way.
+    fn prune_oplog_inner(&self, now: Option<i64>, take_lock: bool) -> Result<usize> {
         let session = self.conn.open_session()?;
         let when = now.unwrap_or_else(now_secs);
         let cutoff = when - self.oplog_retention_seconds;
 
-        // Phase 1: collect every seq + the ones past the retention window.
+        // Phase 1 (lock-free): collect every seq + the ones past the retention
+        // window. A fresh MVCC session reads consistently without blocking
+        // writers; prune is best-effort, so a slightly stale view is fine — and
+        // writers only ever append *higher* seqs, never touch the old rows we
+        // doom here.
         let oc = session.open_cursor(OPLOG_TABLE, None)?;
         let mut all_seqs: Vec<i64> = Vec::new();
         let mut doomed: Vec<i64> = Vec::new();
@@ -1333,7 +2200,23 @@ impl Storage {
         if doomed.is_empty() {
             return Ok(0);
         }
+        doomed.sort_unstable();
 
+        // PITR v2: archive the soon-to-be-dropped rows to a durable segment
+        // *before* deleting them, so recovery can still reach a time before the
+        // new oplog floor. Done before the lock (rows still present).
+        if let Some(archive_dir) = self.oplog_archive_dir.clone() {
+            self.archive_doomed_oplog(&session, &archive_dir, &doomed)?;
+        }
+
+        // Phase 2: take the global lock only for the mutation (the deletes),
+        // not the scan above — unless the caller (the write path) already holds
+        // it (`take_lock == false`), since `self.lock` is not reentrant.
+        let _g = if take_lock {
+            Some(self.lock.lock().unwrap())
+        } else {
+            None
+        };
         let op_del = session.open_cursor(OPLOG_TABLE, None)?;
         let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
         for &seq in &doomed {
@@ -1373,7 +2256,7 @@ impl Storage {
     /// The smallest seq whose entry `ts >= target` (tail + 1 if none qualify) —
     /// used to resolve `startAtOperationTime`. Mirrors `storage.find_seq_for_ts`.
     pub fn find_seq_for_ts(&self, ts: bson::Timestamp) -> Result<i64> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
         let session = self.conn.open_session()?;
         let c = session.open_cursor(OPLOG_TABLE, None)?;
         let mut more = c.next()?;
@@ -1497,6 +2380,36 @@ impl Storage {
     /// Insert one BSON-encoded document. Assigns an `ObjectId` `_id` if absent.
     /// Returns the document's `id_key`. A duplicate `_id` yields
     /// `StorageError::DuplicateId`.
+    /// Whether `(db, coll)` is a timeseries collection (its stored options carry
+    /// a `timeseries` sub-document). Mirrors `storage._is_timeseries`.
+    fn is_timeseries(&self, session: &Session, db: &str, coll: &str) -> Result<bool> {
+        Ok(coll_options(session, db, coll)?
+            .map(|o| o.contains_key("timeseries"))
+            .unwrap_or(false))
+    }
+
+    /// A doc-table key discriminator for a timeseries collection. Timeseries
+    /// collections don't enforce `_id` uniqueness, but the doc table is keyed by
+    /// `id_key(_id)`, so equal `_id`s would collide. Appending this suffix keeps
+    /// duplicates distinct while preserving `_id` grouping (the sortkey encoding
+    /// is prefix-free). A nanosecond timestamp survives reopens; a 16-bit counter
+    /// disambiguates same-nanosecond inserts. Reads decode + filter by content,
+    /// so the suffix is invisible above storage — but the `_id` point-lookup fast
+    /// path must be skipped (it reconstructs the UNsuffixed key). Mirrors
+    /// `storage._timeseries_doc_suffix`.
+    fn timeseries_doc_suffix(&self) -> Vec<u8> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let counter = (self.ts_suffix_counter.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16;
+        let mut out = Vec::with_capacity(10);
+        out.extend_from_slice(&nanos.to_be_bytes());
+        out.extend_from_slice(&counter.to_be_bytes());
+        out
+    }
+
     pub fn insert_one(&self, db: &str, coll: &str, doc_bytes: &[u8]) -> Result<Vec<u8>> {
         let _g = self.lock.lock().unwrap();
         let mut doc = decode_doc(doc_bytes)?;
@@ -1504,7 +2417,7 @@ impl Storage {
             doc.insert("_id", Bson::ObjectId(ObjectId::new()));
         }
         let id = doc.get("_id").expect("_id present").clone();
-        let key = id_key(&id)?;
+        let mut key = id_key(&id)?;
         let blob = encode_doc(&doc)?;
         if blob.len() > MAX_BSON_OBJECT_SIZE {
             return Err(StorageError::DocumentTooLarge(blob.len()));
@@ -1512,6 +2425,10 @@ impl Storage {
 
         let session = self.op_session()?;
         ensure_collection(&session, db, coll)?;
+        // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
+        if self.is_timeseries(&session, db, coll)? {
+            key.extend_from_slice(&self.timeseries_doc_suffix());
+        }
         // Reject unique-index violations before writing anything.
         let descs = self.index_descs(&session, db, coll)?;
         if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
@@ -1528,8 +2445,9 @@ impl Storage {
         }
         // Maintain secondary indexes: write this doc's entries, and lazily flag
         // any index this doc makes multikey (array value on an indexed field).
-        self.write_index_entries(&session, db, coll, &doc, &descs)?;
+        self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
         self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
+        self.write_nat_entry(&session, db, coll, &key)?;
         // Oplog: an insert is op "i". No pre-image (there's no prior document).
         if self.enable_oplog {
             let ui = collection_uuid(&session, db, coll)?;
@@ -1539,7 +2457,8 @@ impl Storage {
             entry.insert("op", "i");
             entry.insert("ns", format!("{db}.{coll}"));
             entry.insert("ui", uuid_binary(&ui));
-            entry.insert("o", Bson::Document(doc.clone()));
+            // `doc` is no longer needed after this — move it in rather than clone.
+            entry.insert("o", Bson::Document(doc));
             entry.insert("o2", Bson::Document(o2));
             self.emit_oplog(&session, vec![entry], vec![None])?;
         }
@@ -1551,9 +2470,10 @@ impl Storage {
     /// where `errors` are mongod-shaped write-error docs (`{index, code,
     /// errmsg, keyPattern?, keyValue?}`) for duplicate-`_id` / unique-index
     /// violations. `ordered` stops at the first error (else continues). All
-    /// successful inserts share one batched oplog emit. Mirrors
-    /// `storage.insert`. (Capped-collection eviction and geo-index validation
-    /// are not yet enforced by the Rust engine — see backlog.)
+    /// successful inserts share one batched oplog emit. Capped collections
+    /// evict oldest non-fresh docs to stay within `size`/`max` bounds. Mirrors
+    /// `storage.insert`. (Geo-index validation is not yet enforced by the Rust
+    /// engine — see backlog.)
     pub fn insert(
         &self,
         db: &str,
@@ -1567,6 +2487,7 @@ impl Storage {
         let descs = self.index_descs(&session, db, coll)?;
         let ns = format!("{db}.{coll}");
         let oplog_on = self.enable_oplog;
+        let timeseries = self.is_timeseries(&session, db, coll)?;
         let ui = if oplog_on {
             Some(collection_uuid(&session, db, coll)?)
         } else {
@@ -1575,6 +2496,7 @@ impl Storage {
         let mut inserted = 0usize;
         let mut errors: Vec<Document> = Vec::new();
         let mut oplog_entries: Vec<Document> = Vec::new();
+        let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
         let doc_cur = session.open_cursor(DOC_TABLE, Some("overwrite=false"))?;
         for (index, doc_bytes) in docs.iter().enumerate() {
             let mut doc = decode_doc(doc_bytes)?;
@@ -1582,16 +2504,18 @@ impl Storage {
                 doc.insert("_id", Bson::ObjectId(ObjectId::new()));
             }
             let id = doc.get("_id").expect("_id present").clone();
-            let key = id_key(&id)?;
+            let mut key = id_key(&id)?;
+            // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
+            if timeseries {
+                key.extend_from_slice(&self.timeseries_doc_suffix());
+            }
             // Unique-index pre-check (collect a write-error rather than abort).
             if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
+                let ns = format!("{db}.{coll}");
                 let mut e = Document::new();
                 e.insert("index", index as i32);
                 e.insert("code", 11000i32);
-                e.insert(
-                    "errmsg",
-                    format!("E11000 duplicate key error in index {}", c.index),
-                );
+                e.insert("errmsg", format_dup_key_errmsg(&ns, &c.index, &c.key_value));
                 e.insert("keyPattern", Bson::Document(c.key_pattern));
                 e.insert("keyValue", Bson::Document(c.key_value));
                 errors.push(e);
@@ -1614,10 +2538,20 @@ impl Storage {
             match doc_cur.insert() {
                 Ok(()) => {}
                 Err(e) if e.is_duplicate_key() => {
+                    let ns = format!("{db}.{coll}");
+                    let mut key_value = Document::new();
+                    key_value.insert("_id", id.clone());
+                    let mut key_pattern = Document::new();
+                    key_pattern.insert("_id", 1i32);
                     let mut ed = Document::new();
                     ed.insert("index", index as i32);
                     ed.insert("code", 11000i32);
-                    ed.insert("errmsg", format!("E11000 duplicate key error: _id {id:?}"));
+                    ed.insert(
+                        "errmsg",
+                        format_dup_key_errmsg(&ns, ID_INDEX_NAME, &key_value),
+                    );
+                    ed.insert("keyPattern", Bson::Document(key_pattern));
+                    ed.insert("keyValue", Bson::Document(key_value));
                     errors.push(ed);
                     if ordered {
                         break;
@@ -1626,8 +2560,10 @@ impl Storage {
                 }
                 Err(e) => return Err(e.into()),
             }
-            self.write_index_entries(&session, db, coll, &doc, &descs)?;
+            self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
             self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
+            self.write_nat_entry(&session, db, coll, &key)?;
+            fresh_id_keys.insert(key.clone());
             inserted += 1;
             if oplog_on {
                 let mut o2 = Document::new();
@@ -1636,14 +2572,32 @@ impl Storage {
                 entry.insert("op", "i");
                 entry.insert("ns", ns.clone());
                 entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
-                entry.insert("o", Bson::Document(doc.clone()));
+                // `doc` isn't used after this iteration — move it in.
+                entry.insert("o", Bson::Document(doc));
                 entry.insert("o2", Bson::Document(o2));
                 oplog_entries.push(entry);
             }
         }
+        // Capped-collection eviction: drop oldest non-fresh docs until within
+        // the collection's `size` / `max` bounds. Inserts have no pre-image, so
+        // the per-insert pre-image slots are all None; eviction appends its own.
+        let mut pre_images: Vec<Option<Vec<u8>>> = vec![None; oplog_entries.len()];
+        if inserted > 0 {
+            self.enforce_capped_bounds(
+                &session,
+                db,
+                coll,
+                &fresh_id_keys,
+                &descs,
+                oplog_on,
+                &ns,
+                ui.as_deref(),
+                &mut oplog_entries,
+                &mut pre_images,
+            )?;
+        }
         if oplog_on && !oplog_entries.is_empty() {
-            let n = oplog_entries.len();
-            self.emit_oplog(&session, oplog_entries, vec![None; n])?;
+            self.emit_oplog(&session, oplog_entries, pre_images)?;
         }
         Ok((inserted, errors))
     }
@@ -1737,8 +2691,10 @@ impl Storage {
         // new, and lazily flag any index the new doc makes multikey (sticky —
         // the old doc's array-ness is never cleared).
         if !descs.is_empty() {
-            self.delete_index_entries(&session, db, coll, &old_doc, &descs)?;
-            self.write_index_entries(&session, db, coll, &doc, &descs)?;
+            // `update_by_id` is a bare-`_id` path (not used for timeseries), so the
+            // key is the canonical `id_key(_id)` — let the helper recompute it.
+            self.delete_index_entries(&session, db, coll, &old_doc, &descs, None)?;
+            self.write_index_entries(&session, db, coll, &doc, &descs, None)?;
             self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
         }
         // Oplog: a full-document replacement is op "u" with `o` = the new doc
@@ -1758,7 +2714,8 @@ impl Storage {
             entry.insert("op", "u");
             entry.insert("ns", format!("{db}.{coll}"));
             entry.insert("ui", uuid_binary(&ui));
-            entry.insert("o", Bson::Document(doc.clone()));
+            // The replacement doc isn't needed after this — move it in.
+            entry.insert("o", Bson::Document(doc));
             entry.insert("o2", Bson::Document(o2));
             self.emit_oplog(&session, vec![entry], vec![pre])?;
         }
@@ -1781,7 +2738,9 @@ impl Storage {
         cur.remove()?;
         let old_doc = decode_doc(&old_blob)?;
         let descs = self.index_descs(&session, db, coll)?;
-        self.delete_index_entries(&session, db, coll, &old_doc, &descs)?;
+        // `delete_by_id` is a bare-`_id` path (not used for timeseries).
+        self.delete_index_entries(&session, db, coll, &old_doc, &descs, None)?;
+        self.delete_nat_entry(&session, db, coll, &key)?;
         // Oplog: a delete is op "d" with `o` = `o2` = {_id}. The pre-image (the
         // deleted doc) is stored when changeStreamPreAndPostImages is enabled.
         if self.enable_oplog {
@@ -1851,7 +2810,8 @@ impl Storage {
             if !expired {
                 continue;
             }
-            self.delete_index_entries(&session, db, coll, &doc, &descs)?;
+            self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
+            self.delete_nat_entry(&session, db, coll, &id_k)?;
             doc_cur.reset()?;
             doc_cur.set_key_ssu(db, coll, &id_k);
             match doc_cur.remove() {
@@ -1957,12 +2917,35 @@ impl Storage {
     /// already exists, `true` if created — minting its UUID and emitting an
     /// `op: "c"` `create` oplog entry. Mirrors `storage.create_collection`.
     pub fn create_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        self.create_collection_with_options(db, coll, &Document::new())
+    }
+
+    /// Like [`create_collection`], but persists `options` (`capped` / `size` /
+    /// `max` / `validator` / `viewOn` / …) to the collection blob **and** carries
+    /// them as siblings of `create` in the `c` oplog entry's `o`, so PITR replay
+    /// (Rust or Python) and `show_expanded_events` create events reconstruct them.
+    /// Mirrors Python `Storage.create_collection(..., options=...)`.
+    pub fn create_collection_with_options(
+        &self,
+        db: &str,
+        coll: &str,
+        options: &Document,
+    ) -> Result<bool> {
         let _g = self.lock.lock().unwrap();
         let session = self.op_session()?;
         if collection_registered(&session, db, coll)? {
             return Ok(false);
         }
         ensure_collection(&session, db, coll)?;
+        if !options.is_empty() {
+            // Persist before minting the UUID below — collection_uuid re-reads and
+            // merges, so the options survive.
+            let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
+            for (k, v) in options {
+                current.insert(k.clone(), v.clone());
+            }
+            write_coll_options(&session, db, coll, &current)?;
+        }
         if self.enable_oplog {
             let ui = collection_uuid(&session, db, coll)?;
             let mut id_key_spec = Document::new();
@@ -1973,6 +2956,9 @@ impl Storage {
             id_index.insert("name", ID_INDEX_NAME);
             let mut o = Document::new();
             o.insert("create", coll);
+            for (k, v) in options {
+                o.insert(k.clone(), v.clone());
+            }
             o.insert("idIndex", Bson::Document(id_index));
             let mut entry = Document::new();
             entry.insert("op", "c");
@@ -2172,6 +3158,12 @@ impl Storage {
             let mut o = Document::new();
             o.insert("renameCollection", format!("{src_db}.{src_coll}"));
             o.insert("to", format!("{dst_db}.{dst_coll}"));
+            // mongod records the dropped target's UUID under `dropTarget` in the
+            // rename oplog entry; the change-stream `rename` event surfaces it as
+            // `operationDescription.dropTarget` when `showExpandedEvents` is on.
+            if let Some(du) = &dst_ui {
+                o.insert("dropTarget", uuid_binary(du));
+            }
             let mut e = Document::new();
             e.insert("op", "c");
             e.insert("ns", format!("{src_db}.$cmd"));
@@ -2206,6 +3198,11 @@ impl Storage {
     /// Whether the collection has `capped: true`. Mirrors
     /// `storage.collection_is_capped`.
     pub fn collection_is_capped(&self, db: &str, coll: &str) -> Result<bool> {
+        // The synthetic oplog view is a capped collection (so tailable cursors
+        // are accepted on it), even though it has no registry row.
+        if self.is_oplog_rs(db, coll) {
+            return Ok(true);
+        }
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
         Ok(coll_options(&session, db, coll)?
@@ -2268,6 +3265,17 @@ impl Storage {
                 .filter(|(id_k, _)| id_k.as_slice() > a)
                 .collect(),
         })
+    }
+
+    /// The smallest `id_key` currently in a collection, or `None` if empty. A
+    /// tailable cursor uses this to detect capped rollover: if the doc it last
+    /// returned has been evicted (min `id_key` now exceeds the cursor's anchor),
+    /// mongod kills the cursor with `CappedPositionLost`.
+    pub fn collection_min_id_key(&self, db: &str, coll: &str) -> Result<Option<Vec<u8>>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let rows = self.scan_docs(&session, db, coll)?;
+        Ok(rows.into_iter().map(|(k, _)| k).min())
     }
 
     // --- users / roles / profiling (auth + profiling surface) ---
@@ -2548,8 +3556,22 @@ impl Storage {
         c.set_key_sss(db, coll, name);
         match c.search() {
             Ok(()) => {
-                // Index exists: reject conflicting options, else no-op success.
+                // Index exists: reject a conflicting key spec or options, else
+                // no-op success.
                 let existing = decode_doc(&c.get_value_u()?)?;
+                // Same name, different key spec → IndexKeySpecsConflict (86).
+                // Order-sensitive: mongod treats {a:1,b:1} and {b:1,a:1} as
+                // distinct indexes, so compare the ordered field lists.
+                let existing_key = existing.get_document("key").ok();
+                let same_key = existing_key.is_some_and(|k| index_keys_equiv(k, key_spec));
+                if !same_key {
+                    return Err(StorageError::IndexKeySpecsConflict(format!(
+                        "An existing index has the same name as the requested index. \
+                         Requested index: {{ key: {key_spec:?}, name: {name:?} }}, \
+                         existing index: {{ key: {:?}, name: {name:?} }}",
+                        existing_key.cloned().unwrap_or_default()
+                    )));
+                }
                 let existing_opts = existing.get_document("options").ok();
                 for opt in CONFLICTING_OPTS {
                     let in_new = options.contains_key(opt);
@@ -2668,6 +3690,25 @@ impl Storage {
             ec.set_value_u(b"");
             ec.insert()?;
         }
+        // Oplog: a DDL `op: "c"` `createIndexes` entry so a `showExpandedEvents`
+        // change stream surfaces a `createIndexes` event (the projector reads
+        // `o.createIndexes` + `o.indexes[].{v,key,name}`).
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut idx = Document::new();
+            idx.insert("v", 2i32);
+            idx.insert("key", Bson::Document(key_spec.clone()));
+            idx.insert("name", name);
+            let mut o = Document::new();
+            o.insert("createIndexes", coll);
+            o.insert("indexes", Bson::Array(vec![Bson::Document(idx)]));
+            let mut entry = Document::new();
+            entry.insert("op", "c");
+            entry.insert("ns", format!("{db}.$cmd"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry], vec![None])?;
+        }
         Ok(true)
     }
 
@@ -2705,6 +3746,122 @@ impl Storage {
         Ok(out)
     }
 
+    /// Retune a TTL index's `expireAfterSeconds` option, resolving the index by
+    /// name. Returns `false` if there is no such index. Used by `collMod` replay
+    /// (`{index: {name, expireAfterSeconds}}`). Mirrors `storage.set_index_expiry`.
+    pub fn set_index_expiry(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        expire_after_seconds: i64,
+    ) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        cur.set_key_sss(db, coll, name);
+        match cur.search() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        let mut payload = decode_doc(&cur.get_value_u()?)?;
+        let mut opts = payload.get_document("options").cloned().unwrap_or_default();
+        opts.insert("expireAfterSeconds", expire_after_seconds);
+        payload.insert("options", Bson::Document(opts));
+        let blob = encode_doc(&payload)?;
+        let wcur = session.open_cursor(IDX_TABLE, None)?;
+        wcur.set_key_sss(db, coll, name);
+        wcur.set_value_u(&blob);
+        wcur.update()?;
+        Ok(true)
+    }
+
+    /// Merge `new_opts` into an existing index's stored options blob
+    /// (read-modify-write, like `set_index_expiry`). Backs `collMod {index:
+    /// {keyPattern|name, prepareUnique|unique: ...}}`. Returns `true` when the
+    /// index existed and was updated. Mirrors `storage.set_index_options`.
+    pub fn set_index_options(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        new_opts: &Document,
+    ) -> Result<bool> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        cur.set_key_sss(db, coll, name);
+        match cur.search() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        let mut payload = decode_doc(&cur.get_value_u()?)?;
+        let mut opts = payload.get_document("options").cloned().unwrap_or_default();
+        for (k, v) in new_opts {
+            opts.insert(k.clone(), v.clone());
+        }
+        payload.insert("options", Bson::Document(opts));
+        let blob = encode_doc(&payload)?;
+        let wcur = session.open_cursor(IDX_TABLE, None)?;
+        wcur.set_key_sss(db, coll, name);
+        wcur.set_value_u(&blob);
+        wcur.update()?;
+        Ok(true)
+    }
+
+    /// Group the `_id`s of documents that share the same key on index `name`,
+    /// returning one `_id` list per duplicated key (groups of size >= 2,
+    /// `_id`-sorted within each group, in first-seen key order). A non-empty
+    /// result means a `collMod {index: {unique: true}}` conversion must be
+    /// refused with `CannotConvertIndexToUnique` (359) and these reported as
+    /// `violations`. Mirrors `storage.find_index_duplicates`.
+    pub fn find_index_duplicates(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Vec<Vec<Bson>>> {
+        let _g = self.lock.lock().unwrap();
+        let session = self.conn.open_session()?;
+        let descs = self.index_descs(&session, db, coll)?;
+        let desc = match descs.iter().find(|d| d.name == name) {
+            Some(d) => d,
+            None => return Ok(Vec::new()),
+        };
+        let mut index_of: std::collections::HashMap<Vec<u8>, usize> =
+            std::collections::HashMap::new();
+        let mut groups: Vec<Vec<Bson>> = Vec::new();
+        for (_id_k, blob) in self.scan_docs(&session, db, coll)? {
+            let doc = decode_doc(&blob)?;
+            let kb = match index_key(&doc, &desc.key_spec, desc.sparse)? {
+                Some(k) => k,
+                None => continue, // sparse: missing key isn't a duplicate
+            };
+            let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+            match index_of.get(&kb) {
+                Some(&i) => groups[i].push(id),
+                None => {
+                    index_of.insert(kb, groups.len());
+                    groups.push(vec![id]);
+                }
+            }
+        }
+        let mut out: Vec<Vec<Bson>> = Vec::new();
+        for mut ids in groups {
+            if ids.len() > 1 {
+                ids.sort_by(|a, b| {
+                    let ka = sortkey::encode_value(a, None).unwrap_or_default();
+                    let kbk = sortkey::encode_value(b, None).unwrap_or_default();
+                    ka.cmp(&kbk)
+                });
+                out.push(ids);
+            }
+        }
+        Ok(out)
+    }
+
     /// Drop the index named `name` (and all its entries). Returns `false` if no
     /// such index, or `name == "_id_"`. Mirrors `storage.drop_index`.
     pub fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool> {
@@ -2722,6 +3879,21 @@ impl Storage {
         }
         c.remove()?;
         self.delete_entries_prefix(&session, db, coll, name)?;
+        // Oplog: a DDL `op: "c"` `dropIndexes` entry so a `showExpandedEvents`
+        // change stream surfaces a `dropIndexes` event (the projector reads
+        // `o.dropIndexes` + `o.index`).
+        if self.enable_oplog {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut o = Document::new();
+            o.insert("dropIndexes", coll);
+            o.insert("index", name);
+            let mut entry = Document::new();
+            entry.insert("op", "c");
+            entry.insert("ns", format!("{db}.$cmd"));
+            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("o", Bson::Document(o));
+            self.emit_oplog(&session, vec![entry], vec![None])?;
+        }
         Ok(true)
     }
 
@@ -2813,6 +3985,304 @@ impl Storage {
         Ok(out)
     }
 
+    // --- natural-order (insertion) index maintenance + scan ---
+
+    /// Reserve the next monotonic insertion `seq`. Mirrors `storage._mint_nat_seq`.
+    fn mint_nat_seq(&self) -> i64 {
+        let mut st = self.oplog.lock().unwrap();
+        let seq = st.next_nat_seq;
+        st.next_nat_seq += 1;
+        seq
+    }
+
+    /// Record a doc's insertion position: `seq -> id_key` plus the reverse
+    /// `id_key -> seq`. Mirrors `storage._write_nat_entry`.
+    fn write_nat_entry(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        id_key: &[u8],
+    ) -> Result<()> {
+        let seq = self.mint_nat_seq();
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, seq);
+        nat.set_value_u(id_key);
+        nat.insert()?;
+        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        rev.set_key_ssu(db, coll, id_key);
+        rev.set_value_q(seq);
+        rev.insert()?;
+        Ok(())
+    }
+
+    /// Drop a doc's insertion-order entry (both directions). No-op if absent
+    /// (legacy docs predating the index). Mirrors `storage._delete_nat_entry`.
+    fn delete_nat_entry(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        id_key: &[u8],
+    ) -> Result<()> {
+        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        rev.set_key_ssu(db, coll, id_key);
+        let seq = match rev.search() {
+            Ok(()) => rev.get_value_q()?,
+            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        rev.remove()?;
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, seq);
+        match nat.search() {
+            Ok(()) => nat.remove()?,
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    /// Drop every natural-order entry for `(db, coll)` (both directions) — called
+    /// on drop / rename so a later re-create can't resurrect stale positions.
+    fn drop_nat_collection(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
+        // Forward (db, coll, seq): collect this collection's seqs, then remove.
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match nat.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    nat.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut seqs: Vec<i64> = Vec::new();
+        while more {
+            let (d, c, seq) = nat.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            seqs.push(seq);
+            more = nat.next()?;
+        }
+        for seq in seqs {
+            nat.set_key_ssq(db, coll, seq);
+            if nat.search().is_ok() {
+                nat.remove()?;
+            }
+        }
+        // Reverse (db, coll, id_key).
+        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        rev.set_key_ssu(db, coll, b"");
+        let mut more = match rev.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    rev.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        while more {
+            let (d, c, k) = rev.get_key_ssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            keys.push(k);
+            more = rev.next()?;
+        }
+        for k in keys {
+            rev.set_key_ssu(db, coll, &k);
+            if rev.search().is_ok() {
+                rev.remove()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// All doc blobs of a collection in **insertion order** via `NAT_TABLE` (seq
+    /// ascending, each fetched by `id_key`). Falls back to `id_key`-order
+    /// `scan_blobs` when the collection has no natural entries (legacy data).
+    /// Mirrors `storage._scan_docs_natural`.
+    fn scan_blobs_natural(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match nat.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    nat.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let doc = session.open_cursor(DOC_TABLE, None)?;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut saw_any = false;
+        while more {
+            let (d, c, _seq) = nat.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            let id_key = nat.get_value_u()?;
+            doc.set_key_ssu(db, coll, &id_key);
+            if doc.search().is_ok() {
+                saw_any = true;
+                out.push(doc.get_value_u()?);
+            }
+            more = nat.next()?;
+        }
+        if !saw_any {
+            // Collection has docs but no natural entries (legacy) — fall back.
+            return self.scan_blobs(session, db, coll);
+        }
+        Ok(out)
+    }
+
+    /// Like [`scan_docs`] but in natural (insertion `seq`) order, returning
+    /// `(id_key, blob)` pairs. Capped eviction uses this so FIFO holds even for
+    /// non-monotonic custom `_id`s (doc-table `id_key` order only equals insertion
+    /// order for monotonic `_id`s). Falls back to `scan_docs` (id_key order) for a
+    /// legacy collection with no natural-order entries.
+    fn scan_docs_natural(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match nat.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    nat.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let doc = session.open_cursor(DOC_TABLE, None)?;
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut saw_any = false;
+        while more {
+            let (d, c, _seq) = nat.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            let id_key = nat.get_value_u()?;
+            doc.set_key_ssu(db, coll, &id_key);
+            if doc.search().is_ok() {
+                saw_any = true;
+                out.push((id_key, doc.get_value_u()?));
+            }
+            more = nat.next()?;
+        }
+        if !saw_any {
+            return self.scan_docs(session, db, coll);
+        }
+        Ok(out)
+    }
+
+    /// Evict oldest non-fresh docs from a capped collection until within its
+    /// `size` (byte) and `max` (count) bounds. "Oldest" is natural (insertion
+    /// `seq`) order via `scan_docs_natural`, so FIFO holds even for non-monotonic
+    /// custom `_id`s. Appends a `"d"` oplog entry (and pre-image when enabled) per
+    /// eviction to the caller's vectors. No-op when the collection isn't capped or
+    /// has no bounds. Mirrors `storage._enforce_capped_bounds_locked`.
+    #[allow(clippy::too_many_arguments)]
+    fn enforce_capped_bounds(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        fresh_id_keys: &HashSet<Vec<u8>>,
+        descs: &[IndexDesc],
+        oplog_on: bool,
+        ns: &str,
+        ui: Option<&[u8]>,
+        oplog_entries: &mut Vec<Document>,
+        pre_images: &mut Vec<Option<Vec<u8>>>,
+    ) -> Result<()> {
+        let opts = match coll_options(session, db, coll)? {
+            Some(o) if o.get_bool("capped").unwrap_or(false) => o,
+            _ => return Ok(()),
+        };
+        let num = |k: &str| -> Option<i64> {
+            match opts.get(k) {
+                Some(Bson::Int32(v)) => Some(*v as i64),
+                Some(Bson::Int64(v)) => Some(*v),
+                Some(Bson::Double(v)) => Some(*v as i64),
+                _ => None,
+            }
+        };
+        let size_limit = num("size");
+        let max_limit = num("max");
+        if size_limit.is_none() && max_limit.is_none() {
+            return Ok(());
+        }
+        let scanned = self.scan_docs_natural(session, db, coll)?;
+        let mut total: i64 = scanned.iter().map(|(_, b)| b.len() as i64).sum();
+        let mut count = scanned.len() as i64;
+        let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
+        let doc_cur = session.open_cursor(DOC_TABLE, None)?;
+        for (id_k, blob) in scanned {
+            let over_size = size_limit.is_some_and(|s| total > s);
+            let over_max = max_limit.is_some_and(|m| count > m);
+            if !over_size && !over_max {
+                break;
+            }
+            if fresh_id_keys.contains(&id_k) {
+                // Don't evict docs inserted in this batch — with monotonic
+                // _ids they sort to the tail, so reaching one means the rest
+                // are fresh too.
+                break;
+            }
+            let doc = decode_doc(&blob)?;
+            self.delete_index_entries(session, db, coll, &doc, descs, Some(&id_k))?;
+            self.delete_nat_entry(session, db, coll, &id_k)?;
+            doc_cur.reset()?;
+            doc_cur.set_key_ssu(db, coll, &id_k);
+            match doc_cur.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+            total -= blob.len() as i64;
+            count -= 1;
+            if oplog_on {
+                let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+                let mut o = Document::new();
+                o.insert("_id", id);
+                let mut entry = Document::new();
+                entry.insert("op", "d");
+                entry.insert("ns", ns);
+                if let Some(u) = ui {
+                    entry.insert("ui", uuid_binary(u));
+                }
+                entry.insert("o", Bson::Document(o.clone()));
+                entry.insert("o2", Bson::Document(o));
+                oplog_entries.push(entry);
+                pre_images.push(if preimages_on {
+                    Some(encode_doc(&doc)?)
+                } else {
+                    None
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Flag every index in `descs` that `doc` makes multikey (an array value
     /// on an indexed field) by rewriting its registry options with
     /// `multikey: true`. Sticky — never cleared. Indexes already flagged are
@@ -2861,14 +4331,14 @@ impl Storage {
         coll: &str,
         doc: &Document,
         descs: &[IndexDesc],
+        id_key_override: Option<&[u8]>,
     ) -> Result<()> {
         if descs.is_empty() {
             return Ok(());
         }
-        let id = doc
-            .get("_id")
-            .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
-        let id_k = id_key(id)?;
+        // For timeseries collections the doc-table key is suffixed, so callers
+        // pass it explicitly; otherwise it's `id_key(_id)`.
+        let id_k = doc_table_key(doc, id_key_override)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
             // 2d geo index: one cell entry per point-valued field (point-only).
@@ -2919,14 +4389,12 @@ impl Storage {
         coll: &str,
         doc: &Document,
         descs: &[IndexDesc],
+        id_key_override: Option<&[u8]>,
     ) -> Result<()> {
         if descs.is_empty() {
             return Ok(());
         }
-        let id = doc
-            .get("_id")
-            .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
-        let id_k = id_key(id)?;
+        let id_k = doc_table_key(doc, id_key_override)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
             if let Some(geo) = &desc.geo_2d {
@@ -3004,6 +4472,7 @@ impl Storage {
                     key_spec,
                     sparse: opts.get_bool("sparse").unwrap_or(false),
                     unique: opts.get_bool("unique").unwrap_or(false),
+                    prepare_unique: opts.get_bool("prepareUnique").unwrap_or(false),
                     partial,
                     geo_2d,
                     geo_sphere,
@@ -3027,7 +4496,9 @@ impl Storage {
     ) -> Result<Option<UniqueConflict>> {
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
-            if !desc.unique || !self.doc_in_partial(candidate, desc)? {
+            // `prepareUnique` arms an index to reject dup *new* writes (11000)
+            // before it's formally unique — so it enforces uniqueness here too.
+            if (!desc.unique && !desc.prepare_unique) || !self.doc_in_partial(candidate, desc)? {
                 continue;
             }
             let kb = match index_key(candidate, &desc.key_spec, desc.sparse)? {
@@ -3176,6 +4647,10 @@ impl Storage {
                 Err(e) => return Err(e.into()),
             }
         }
+        // Drop the natural-order entries too, so a re-created collection can't
+        // resurrect stale insertion positions (which would double a re-inserted
+        // `_id` in a natural scan).
+        self.drop_nat_collection(session, db, coll)?;
         Ok(())
     }
 
@@ -3312,6 +4787,9 @@ impl Storage {
         coll_opt: Option<&Collation>,
         vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
+        if self.is_oplog_rs(db, coll) {
+            return self.find_oplog_rs(filter, sort, coll_opt, vars);
+        }
         let _g = self.lock.lock().unwrap();
         let session = self.op_session()?;
         let (sort_field, sort_dir) = single_sort_spec(sort);
@@ -3323,7 +4801,7 @@ impl Storage {
         let force_collscan = coll_opt.is_some();
 
         let blobs: Vec<Vec<u8>> = if force_collscan {
-            self.scan_blobs(&session, db, coll)?
+            self.scan_blobs_natural(&session, db, coll)?
         } else if let Some(h) = hint {
             let resolved = self.resolve_hint(&session, db, coll, h)?;
             let (cands, ord) =
@@ -3362,7 +4840,7 @@ impl Storage {
                             sort_dir != idx_dir,
                         )?
                     }
-                    None => self.scan_blobs(&session, db, coll)?,
+                    None => self.scan_blobs_natural(&session, db, coll)?,
                 }
             } else if let Some(multi) = multi_sort_spec(sort).filter(|m| m.len() > 1) {
                 // Multi-field sort: walk a strict-match compound index, else COLLSCAN.
@@ -3371,13 +4849,13 @@ impl Storage {
                         in_sort_order = true;
                         self.walk_index_in_order(&session, db, coll, &idx_name, reverse)?
                     }
-                    None => self.scan_blobs(&session, db, coll)?,
+                    None => self.scan_blobs_natural(&session, db, coll)?,
                 }
             } else {
-                self.scan_blobs(&session, db, coll)?
+                self.scan_blobs_natural(&session, db, coll)?
             }
         } else {
-            self.scan_blobs(&session, db, coll)?
+            self.scan_blobs_natural(&session, db, coll)?
         };
 
         // Decode + filter; keep the doc alongside the blob for the post-sort.
@@ -3456,6 +4934,11 @@ impl Storage {
         filter: &Document,
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
+        if self.is_oplog_rs(db, coll) {
+            return Ok(self
+                .find_oplog_rs(filter, None, coll_opt, &Document::new())?
+                .len());
+        }
         let _g = self.lock.lock().unwrap();
         let session = self.op_session()?;
         if filter.is_empty() {
@@ -3504,6 +4987,11 @@ impl Storage {
         // `let_vars` are visible to `$expr` in the filter (command `let`);
         // `coll_opt` forces a collation-aware COLLSCAN match.
         let is_replacement = !update.keys().any(|k| k.starts_with('$'));
+        // Resolve `$currentDate` to a concrete clock value once per operation (so
+        // a multi-update stamps every matched doc with the same time), keeping the
+        // deterministic core engine free of the clock.
+        let update = resolve_current_date(update)?;
+        let update = &update;
         self.update_matching_core(
             db,
             coll,
@@ -3515,6 +5003,14 @@ impl Storage {
             is_replacement,
             validator,
             &|doc, up| {
+                // mongod rejects any update that would change the immutable `_id`
+                // with ImmutableField (66) — surface that specific code rather than
+                // a generic "unsupported".
+                if let Some(old_id) = doc.get("_id") {
+                    if update_would_change_id(update, old_id) {
+                        return Err(StorageError::ImmutableField);
+                    }
+                }
                 let pos = secantus_core::update::find_positional_matches(doc, filter);
                 secantus_core::update::apply_update_with(doc, update, up, array_filters, &pos)
                     .map_err(|_| StorageError::QueryUnsupported)
@@ -3524,8 +5020,9 @@ impl Storage {
 
     /// Pipeline-form update (`u: [ {$set: …}, … ]`). Each matched doc is rewritten
     /// by running the aggregation pipeline over it (`apply_pipeline` on the single
-    /// doc); the `_id` is preserved by the pipeline stages (the allowed
-    /// `$set`/`$project`/`$replaceWith`/… never drop it). Always diff-style in the
+    /// doc); the original `_id` is re-applied when a stage (`$replaceRoot` /
+    /// `$replaceWith` / `$project`) drops it — mongod keeps `_id` immutable across
+    /// an update pipeline. Always diff-style in the
     /// oplog (`is_replacement = false`) so change streams report
     /// `operationType: "update"` — mirrors `storage.update_matching`'s list branch.
     /// On upsert with no match, the pipeline runs over the filter-seeded doc.
@@ -3560,7 +5057,20 @@ impl Storage {
                     None,
                 )
                 .map_err(|_| StorageError::QueryUnsupported)?;
-                out.into_iter().next().ok_or(StorageError::QueryUnsupported)
+                let mut new = out
+                    .into_iter()
+                    .next()
+                    .ok_or(StorageError::QueryUnsupported)?;
+                // mongod preserves the original `_id` through an update pipeline —
+                // a `$replaceRoot`/`$replaceWith`/`$project` stage can drop it, but
+                // the stored doc keeps its `_id` (which is immutable). Re-add it if
+                // a stage removed it. (`encode_doc` then restores `_id`-first order.)
+                if !new.contains_key("_id") {
+                    if let Some(id) = doc.get("_id") {
+                        new.insert("_id", id.clone());
+                    }
+                }
+                Ok(new)
             },
         )
     }
@@ -3630,16 +5140,20 @@ impl Storage {
                     return Err(StorageError::DocumentTooLarge(new_blob.len()));
                 }
                 modified += 1;
-                self.delete_index_entries(&session, db, coll, &doc, &descs)?;
+                // The doc stays at its existing key (`id_k`, suffixed for
+                // timeseries), so retract/write entries against that exact key.
+                self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
                 let cur = session.open_cursor(DOC_TABLE, None)?;
                 cur.set_key_ssu(db, coll, &id_k);
                 cur.set_value_u(&new_blob);
                 cur.update()?;
-                self.write_index_entries(&session, db, coll, &new, &descs)?;
+                self.write_index_entries(&session, db, coll, &new, &descs, Some(&id_k))?;
                 self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
                 if oplog_on {
                     let o_field = if is_replacement {
-                        Bson::Document(new.clone())
+                        // Replacement oplog `o` is the whole new doc; the diff
+                        // branch borrows it instead, so this move is safe.
+                        Bson::Document(new)
                     } else {
                         let mut o = Document::new();
                         o.insert("$v", 2i32);
@@ -3676,9 +5190,13 @@ impl Storage {
         let mut upserted_id: Option<Bson> = None;
         if matched == 0 && upsert {
             // Seed from the filter's bare-equality fields, then apply the update.
+            // A document value is skipped only when it's an OPERATOR expression
+            // (`{$gt: 5}`); a literal subdocument equality (`{f: .., f2: ..}`,
+            // e.g. a compound `_id`) is a real predicate and must be seeded —
+            // dropping it would mint a fresh ObjectId instead of using it.
             let mut seed = Document::new();
             for (k, v) in filter {
-                if !k.starts_with('$') && !matches!(v, Bson::Document(_)) {
+                if !k.starts_with('$') && !is_op_doc(v) {
                     seed.insert(k.clone(), v.clone());
                 }
             }
@@ -3696,7 +5214,11 @@ impl Storage {
             if let Some(c) = self.unique_conflict(&session, db, coll, &new, &descs, None)? {
                 return Err(StorageError::DuplicateKey(Box::new(c)));
             }
-            let new_id_key = id_key(&id)?;
+            let mut new_id_key = id_key(&id)?;
+            // Timeseries: suffix the upserted doc's key so duplicate `_id`s coexist.
+            if self.is_timeseries(&session, db, coll)? {
+                new_id_key.extend_from_slice(&self.timeseries_doc_suffix());
+            }
             let new_blob = encode_doc(&new)?;
             if new_blob.len() > MAX_BSON_OBJECT_SIZE {
                 return Err(StorageError::DocumentTooLarge(new_blob.len()));
@@ -3705,8 +5227,9 @@ impl Storage {
             cur.set_key_ssu(db, coll, &new_id_key);
             cur.set_value_u(&new_blob);
             cur.insert()?;
-            self.write_index_entries(&session, db, coll, &new, &descs)?;
+            self.write_index_entries(&session, db, coll, &new, &descs, Some(&new_id_key))?;
             self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
+            self.write_nat_entry(&session, db, coll, &new_id_key)?;
             if oplog_on {
                 let mut o2 = Document::new();
                 o2.insert("_id", id.clone());
@@ -3714,7 +5237,8 @@ impl Storage {
                 entry.insert("op", "i");
                 entry.insert("ns", ns.clone());
                 entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
-                entry.insert("o", Bson::Document(new.clone()));
+                // `new` isn't used after the upsert block — move it in.
+                entry.insert("o", Bson::Document(new));
                 entry.insert("o2", Bson::Document(o2));
                 oplog_entries.push(entry);
                 pre_images.push(None);
@@ -3773,7 +5297,8 @@ impl Storage {
             {
                 continue;
             }
-            self.delete_index_entries(&session, db, coll, &doc, &descs)?;
+            self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
+            self.delete_nat_entry(&session, db, coll, &id_k)?;
             let cur = session.open_cursor(DOC_TABLE, None)?;
             cur.set_key_ssu(db, coll, &id_k);
             cur.remove()?;
@@ -3954,9 +5479,10 @@ impl Storage {
         sort_dir: i32,
     ) -> Result<(Vec<Vec<u8>>, bool)> {
         match resolved {
-            ResolvedHint::Natural => Ok((self.scan_blobs(session, db, coll)?, false)),
+            // `$natural` is insertion order — walk the natural-order index.
+            ResolvedHint::Natural => Ok((self.scan_blobs_natural(session, db, coll)?, false)),
             ResolvedHint::IdIndex => {
-                // The doc table is keyed by id_key, so a natural scan is _id order.
+                // The doc table is keyed by id_key, so this scan IS _id order.
                 let mut docs = self.scan_blobs(session, db, coll)?;
                 let in_order = sort_field == Some("_id");
                 if in_order && sort_dir == -1 {
@@ -4079,8 +5605,11 @@ impl Storage {
         if filter.keys().any(|f| f.starts_with('$')) {
             return Ok(None);
         }
-        // `_id` equality is a primary-key point lookup on the documents table.
-        if filter.len() == 1 {
+        // `_id` equality is a primary-key point lookup on the documents table —
+        // EXCEPT in a timeseries collection, where the doc-table key is suffixed
+        // (duplicate `_id`s coexist), so a reconstructed bare key would miss
+        // rows. There, fall through to a collection scan.
+        if filter.len() == 1 && !self.is_timeseries(session, db, coll)? {
             if let Some(spec) = filter.get("_id") {
                 if let Some(id_keys) = id_point_lookup_keys(spec)? {
                     return Ok(Some(id_keys));
@@ -4108,15 +5637,22 @@ impl Storage {
                 return Ok(Some(r));
             }
         }
-        if filter.len() != 1 {
-            return Ok(None);
+        if filter.len() == 1 {
+            let (field, value) = filter.iter().next().unwrap();
+            let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+            return self.lookup_id_keys_via_leading_field(session, db, coll, &idx, value);
         }
-        let (field, value) = filter.iter().next().unwrap();
-        let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
-            Some(m) => m,
-            None => return Ok(None),
-        };
-        self.lookup_id_keys_via_leading_field(session, db, coll, &idx, value)
+        // Multi-field filter: a single-field index can still serve it when every
+        // other filter field is absorbed by the index's (implied) partial filter.
+        let (_field, value, idx_match) =
+            match self.single_field_partial_residual_match(session, db, coll, filter)? {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+        self.lookup_id_keys_via_leading_field(session, db, coll, &idx_match, &value)
     }
 
     /// Find the `2d` index covering `field`, as `(index_name, params)`.
@@ -4297,6 +5833,70 @@ impl Storage {
             }
         }
         Ok(compound_fallback)
+    }
+
+    /// The `partialFilterExpression` of index `name`, or `None` (non-partial /
+    /// absent). Used by the residual-match path to verify residual fields are
+    /// exactly partial-filter fields.
+    fn partial_filter_for(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Option<Document>> {
+        for desc in self.index_descs(session, db, coll)? {
+            if desc.name == name {
+                return Ok(desc.partial.clone());
+            }
+        }
+        Ok(None)
+    }
+
+    /// For a *multi-field* filter, find a single-field (or leading-field) index
+    /// whose leading field serves one clause while every **other** filter field
+    /// is absorbed by the index's (implied) partial filter. e.g.
+    /// `find({x: {$gt: 1}, a: 1})` against an index on `x` partial on
+    /// `{a: {$lte: 1.5}}`: `x`'s range rides the index, `a: 1` is partial-implied
+    /// (rechecked by the exact `matches()` pass in `find_matching`). Returns
+    /// `(field, value, idx_match)` or `None`. Conservative: only *partial*
+    /// indexes qualify, and only when the residual fields are exactly
+    /// partial-filter fields. Mirrors
+    /// `storage._single_field_partial_residual_match`.
+    fn single_field_partial_residual_match(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<(String, Bson, LeadingFieldMatch)>> {
+        for (field, value) in filter.iter() {
+            // An operator-form clause must be range ops the index can serve;
+            // otherwise this field can't be the leading-field clause.
+            if let Bson::Document(opd) = value {
+                if opd.is_empty() || !opd.keys().all(|k| RANGE_OPS.contains(&k.as_str())) {
+                    continue;
+                }
+            }
+            let idx_match = match self.find_leading_field_index(session, db, coll, field, filter)? {
+                Some(m) => m,
+                None => continue,
+            };
+            let pf = match self.partial_filter_for(session, db, coll, &idx_match.0)? {
+                Some(pf) => pf,
+                None => continue,
+            };
+            // Every residual field must be a partial-filter field.
+            let residual_ok = filter
+                .keys()
+                .filter(|f| f.as_str() != field)
+                .all(|f| pf.contains_key(f));
+            if !residual_ok {
+                continue;
+            }
+            return Ok(Some((field.clone(), value.clone(), idx_match)));
+        }
+        Ok(None)
     }
 
     /// `id_key`s for `field <value>` against the index `(name, direction,
@@ -4684,7 +6284,9 @@ impl Storage {
         if filter.is_empty() || filter.keys().any(|f| f.starts_with('$')) {
             return Ok(None);
         }
-        if filter.len() == 1 {
+        // Timeseries skips the `_id` point lookup (suffixed keys) — see
+        // `try_index_id_keys`; mirror that here so `explain` reports COLLSCAN.
+        if filter.len() == 1 && !self.is_timeseries(session, db, coll)? {
             if let Some(spec) = filter.get("_id") {
                 if id_point_lookup_keys(spec)?.is_some() {
                     let mut kp = Document::new();
@@ -4727,25 +6329,34 @@ impl Storage {
                 return Ok(Some(p));
             }
         }
-        if filter.len() != 1 {
-            return Ok(None);
+        if filter.len() == 1 {
+            let (field, value) = filter.iter().next().unwrap();
+            let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+            // Operator-form values must be range ops the index can serve.
+            if let Bson::Document(opdoc) = value {
+                if opdoc.is_empty()
+                    || !opdoc.keys().all(|k| k.starts_with('$'))
+                    || !opdoc.keys().all(|k| RANGE_OPS.contains(&k.as_str()))
+                {
+                    return Ok(None);
+                }
+            }
+            return match self.key_spec_for(session, db, coll, &idx.0)? {
+                Some(key_spec) => Ok(Some((idx.0, key_spec))),
+                None => Ok(None),
+            };
         }
-        let (field, value) = filter.iter().next().unwrap();
-        let idx = match self.find_leading_field_index(session, db, coll, field, filter)? {
-            Some(m) => m,
+        // Multi-field filter: a single-field index whose leading field serves one
+        // clause while the rest are absorbed by its (implied) partial filter.
+        let idx_match = match self.single_field_partial_residual_match(session, db, coll, filter)? {
+            Some(m) => m.2,
             None => return Ok(None),
         };
-        // Operator-form values must be range ops the index can serve.
-        if let Bson::Document(opdoc) = value {
-            if opdoc.is_empty()
-                || !opdoc.keys().all(|k| k.starts_with('$'))
-                || !opdoc.keys().all(|k| RANGE_OPS.contains(&k.as_str()))
-            {
-                return Ok(None);
-            }
-        }
-        match self.key_spec_for(session, db, coll, &idx.0)? {
-            Some(key_spec) => Ok(Some((idx.0, key_spec))),
+        match self.key_spec_for(session, db, coll, &idx_match.0)? {
+            Some(key_spec) => Ok(Some((idx_match.0, key_spec))),
             None => Ok(None),
         }
     }
@@ -5160,10 +6771,520 @@ mod tests {
     use super::*;
     use bson::doc;
 
+    /// `wt_config` with the engine defaults must produce the exact
+    /// `DEFAULT_CONFIG` string so `Storage::open` behaviour is unchanged.
+    #[test]
+    fn wt_config_matches_default() {
+        assert_eq!(wt_config("256M", 1000, false), DEFAULT_CONFIG);
+    }
+
+    /// `sync_on_commit=true` flips `transaction_sync=enabled` to `true`.
+    #[test]
+    fn wt_config_sync_on_commit() {
+        let s = wt_config("1G", 200, true);
+        assert!(s.contains("cache_size=1G"));
+        assert!(s.contains("session_max=200"));
+        assert!(s.contains("transaction_sync=(enabled=true,method=fsync)"));
+    }
+
     /// Ascending sort-key bytes for a value (what an ASC single-field entry's
     /// `kb` is).
     fn ev(b: &Bson) -> Vec<u8> {
         sortkey::encode_value(b, None).unwrap()
+    }
+
+    #[test]
+    fn create_archive_roundtrips_data_through_extract() {
+        // WiredTiger-backed: needs the rust-storage test env (WT + libclang).
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1i32, "v": 7i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+
+        let archive = dir.path().join("backup.tar.gz");
+        let info = s.create_archive(archive.to_str().unwrap()).unwrap();
+        assert!(info.size_bytes > 0);
+        drop(s); // release WiredTiger's single-writer lock before reopening
+
+        let target = dir.path().join("restored");
+        extract_backup_archive(archive.to_str().unwrap(), target.to_str().unwrap()).unwrap();
+        assert!(target.join("pitr-manifest.json").exists());
+
+        let restored = Storage::open(target.to_str().unwrap()).unwrap();
+        let got = restored.find_matching("app", "c", &doc! {}).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(decode_doc(&got[0]).unwrap().get_i32("v").unwrap(), 7);
+    }
+
+    #[test]
+    fn resolve_current_date_folds_into_set() {
+        // `true` and `{$type: "date"}` → DateTime; `{$type: "timestamp"}` →
+        // Timestamp; all merged into an existing $set.
+        let upd = doc! {
+            "$set": {"status": "P"},
+            "$currentDate": {
+                "a": true,
+                "b": {"$type": "date"},
+                "c": {"$type": "timestamp"},
+            },
+        };
+        let out = resolve_current_date(&upd).unwrap();
+        assert!(!out.contains_key("$currentDate"));
+        let set = out.get_document("$set").unwrap();
+        assert_eq!(set.get_str("status").unwrap(), "P");
+        assert!(matches!(set.get("a"), Some(Bson::DateTime(_))));
+        assert!(matches!(set.get("b"), Some(Bson::DateTime(_))));
+        assert!(matches!(set.get("c"), Some(Bson::Timestamp(_))));
+        // No $currentDate → returned unchanged.
+        let plain = doc! {"$inc": {"n": 1i32}};
+        assert_eq!(resolve_current_date(&plain).unwrap(), plain);
+        // Unrecognised option → error (mirrors mongod / update.py rejecting it).
+        let bad = doc! {"$currentDate": {"x": {"$type": "nope"}}};
+        assert!(resolve_current_date(&bad).is_err());
+        let bad2 = doc! {"$currentDate": {"x": false}};
+        assert!(resolve_current_date(&bad2).is_err());
+    }
+
+    #[test]
+    fn query_implies_partial_operator_bounds() {
+        // bare equality implies an operator-form partial bound it satisfies.
+        assert!(query_implies_partial(
+            &doc! {"a": 1i32},
+            &doc! {"a": {"$lte": 1.5}}
+        ));
+        // ... but not one it violates.
+        assert!(!query_implies_partial(
+            &doc! {"a": 2i32},
+            &doc! {"a": {"$lte": 1.5}}
+        ));
+        // operator-form query implies a looser operator-form partial bound.
+        assert!(query_implies_partial(
+            &doc! {"a": {"$lte": 1i32}},
+            &doc! {"a": {"$lte": 1.5}}
+        ));
+        assert!(!query_implies_partial(
+            &doc! {"a": {"$lte": 1.6}},
+            &doc! {"a": {"$lte": 1.5}}
+        ));
+        // bare equality implies a bare-equality partial of the same value.
+        assert!(query_implies_partial(&doc! {"s": "x"}, &doc! {"s": "x"}));
+        // missing partial-filter field in the query is never implied.
+        assert!(!query_implies_partial(&doc! {"b": 1i32}, &doc! {"a": 1i32}));
+    }
+
+    #[test]
+    fn partial_index_used_via_residual_when_query_implies_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.create_index(
+            "app",
+            "t",
+            "x_1",
+            &doc! {"x": 1i32},
+            &doc! {"partialFilterExpression": {"a": {"$lte": 1.5}}},
+        )
+        .unwrap();
+        s.insert(
+            "app",
+            "t",
+            vec![
+                encode_doc(&doc! {"_id": 1i32, "x": 5i32, "a": 2i32}).unwrap(),
+                encode_doc(&doc! {"_id": 2i32, "x": 6i32, "a": 1i32}).unwrap(),
+                encode_doc(&doc! {"_id": 3i32, "x": 6i32, "a": 5i32}).unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+
+        // Residual `a:1` is partial-implied → IXSCAN on x_1, and the exact
+        // recheck must exclude the unindexed a=5 doc.
+        let plan = s
+            .explain_plan("app", "t", &doc! {"x": 6i32, "a": 1i32})
+            .unwrap();
+        assert!(matches!(&plan, ExplainPlan::IxScan { index_name, .. } if index_name == "x_1"));
+        let ids: Vec<i32> = s
+            .find_matching("app", "t", &doc! {"x": 6i32, "a": 1i32})
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+            .collect();
+        assert_eq!(ids, vec![2]);
+
+        // Operator-form leading clause + partial-implied residual → IXSCAN.
+        let plan = s
+            .explain_plan("app", "t", &doc! {"x": {"$gt": 1i32}, "a": 1i32})
+            .unwrap();
+        assert!(matches!(&plan, ExplainPlan::IxScan { index_name, .. } if index_name == "x_1"));
+
+        // Residual `a <= 1.6` does NOT imply `a <= 1.5` → COLLSCAN, but results
+        // still correct (only a=1 satisfies a<=1.6 among x=6 docs other than a=5).
+        let plan = s
+            .explain_plan("app", "t", &doc! {"x": 6i32, "a": {"$lte": 1.6}})
+            .unwrap();
+        assert!(matches!(plan, ExplainPlan::CollScan));
+
+        // No constraint on the partial field → COLLSCAN, returns both x=6 docs.
+        let plan = s.explain_plan("app", "t", &doc! {"x": 6i32}).unwrap();
+        assert!(matches!(plan, ExplainPlan::CollScan));
+        assert_eq!(
+            s.find_matching("app", "t", &doc! {"x": 6i32})
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn capped_collection_evicts_oldest_across_inserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.create_collection_with_options(
+            "app",
+            "cap",
+            &doc! {"capped": true, "size": 1_000_000i64, "max": 3i32},
+        )
+        .unwrap();
+        // One-at-a-time inserts: each is its own batch, so the prior docs are
+        // non-fresh and eviction trims to the cap.
+        for i in 0..6i32 {
+            s.insert(
+                "app",
+                "cap",
+                vec![encode_doc(&doc! {"_id": i}).unwrap()],
+                true,
+            )
+            .unwrap();
+        }
+        let mut ids: Vec<i32> = s
+            .find_matching("app", "cap", &doc! {})
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![3, 4, 5]);
+
+        // A single over-cap batch keeps all its docs (they're all "fresh").
+        s.create_collection_with_options(
+            "app",
+            "cap2",
+            &doc! {"capped": true, "size": 1_000_000i64, "max": 3i32},
+        )
+        .unwrap();
+        s.insert(
+            "app",
+            "cap2",
+            (0..6i32)
+                .map(|i| encode_doc(&doc! {"_id": i}).unwrap())
+                .collect(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.find_matching("app", "cap2", &doc! {}).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn oplog_rs_view_is_findable_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+        // The synthetic view surfaces the persisted oplog entries.
+        let entries = s.find_matching("local", "oplog.rs", &doc! {}).unwrap();
+        assert!(!entries.is_empty());
+        assert!(decode_doc(&entries[0]).unwrap().contains_key("ts"));
+        // count routes through the same synthesis.
+        assert_eq!(
+            s.count_matching("local", "oplog.rs", &doc! {}, None)
+                .unwrap(),
+            entries.len()
+        );
+        // Tailable cursors require a capped collection — the view reports capped.
+        assert!(s.collection_is_capped("local", "oplog.rs").unwrap());
+    }
+
+    #[test]
+    fn replay_rebuilds_database_from_oplog() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let empty = doc! {};
+        {
+            let s = Storage::open(src.to_str().unwrap()).unwrap();
+            s.insert(
+                "app",
+                "c",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32, "v": 1i32}).unwrap(),
+                    encode_doc(&doc! {"_id": 2i32, "v": 2i32}).unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            // operator update -> oplog $v:2 diff; reverse-applied on replay
+            s.update_matching(
+                "app",
+                "c",
+                &doc! {"_id": 1i32},
+                &doc! {"$set": {"v": 100i32}},
+                false,
+                false,
+                &[],
+                &empty,
+                None,
+                None,
+            )
+            .unwrap();
+            s.delete_matching("app", "c", &doc! {"_id": 2i32}, 1, &empty, None)
+                .unwrap();
+            s.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 3i32, "v": 3i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+        } // drop releases the WiredTiger single-writer lock
+
+        let out = dir.path().join("restored");
+        let stats = replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(stats.ops_applied >= 4);
+
+        let restored = Storage::open(out.to_str().unwrap()).unwrap();
+        let mut got: Vec<(i32, i32)> = restored
+            .find_matching("app", "c", &empty)
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let d = decode_doc(b).unwrap();
+                (d.get_i32("_id").unwrap(), d.get_i32("v").unwrap())
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![(1, 100), (3, 3)]);
+    }
+
+    #[test]
+    fn replay_reconstructs_collection_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let validator = doc! {"v": {"$gt": 0}};
+        {
+            let s = Storage::open(src.to_str().unwrap()).unwrap();
+            let opts = doc! {"capped": true, "size": 8192i64, "max": 100i64, "validator": validator.clone()};
+            assert!(s.create_collection_with_options("app", "c", &opts).unwrap());
+            s.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 1i32, "v": 5i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+        }
+
+        let out = dir.path().join("restored");
+        replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            out.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let restored = Storage::open(out.to_str().unwrap()).unwrap();
+        let got = restored.get_collection_options("app", "c").unwrap();
+        assert_eq!(got.get_bool("capped").ok(), Some(true));
+        assert_eq!(got.get_i64("size").ok(), Some(8192));
+        assert_eq!(got.get_i64("max").ok(), Some(100));
+        assert_eq!(got.get_document("validator").ok(), Some(&validator));
+    }
+
+    #[test]
+    fn restore_with_carry_oplog_preserves_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let src_seqs: Vec<i64> = {
+            let s = Storage::open(src.to_str().unwrap()).unwrap();
+            s.insert(
+                "app",
+                "c",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32}).unwrap(),
+                    encode_doc(&doc! {"_id": 2i32}).unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            s.read_oplog(1, 100)
+                .unwrap()
+                .iter()
+                .map(|(q, _)| *q)
+                .collect()
+        };
+
+        // carry_oplog = true: the restored store keeps the same oplog seqs ...
+        let carried = dir.path().join("carried");
+        replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            carried.to_str().unwrap(),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let r = Storage::open(carried.to_str().unwrap()).unwrap();
+        let restored_seqs: Vec<i64> = r
+            .read_oplog(1, 100)
+            .unwrap()
+            .iter()
+            .map(|(q, _)| *q)
+            .collect();
+        assert_eq!(restored_seqs, src_seqs);
+        let tail = r.oplog_tail_seq();
+        r.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 3i32}).unwrap()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.oplog_tail_seq(), tail + 1); // a fresh write continues the timeline
+        drop(r);
+
+        // ... while the default (no carry) leaves the restored oplog empty.
+        let fresh = dir.path().join("fresh");
+        replay::restore_to_timestamp(
+            src.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let f = Storage::open(fresh.to_str().unwrap()).unwrap();
+        assert!(f.read_oplog(1, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn v2_restore_reaches_before_pruned_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive");
+        let archive_s = archive.to_str().unwrap().to_string();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let enc = |id: i32| encode_doc(&doc! {"_id": id}).unwrap();
+        {
+            let mut s = Storage::open(src.to_str().unwrap()).unwrap();
+            s.set_oplog_archive_dir(Some(archive_s.clone()));
+            s.set_oplog_max_entries(2);
+            s.insert("app", "c", vec![enc(1), enc(2)], true).unwrap();
+            s.archive_base_snapshot(&archive_s).unwrap(); // base head = seq 2
+            s.insert("app", "c", vec![enc(3)], true).unwrap();
+            s.insert("app", "c", vec![enc(4)], true).unwrap();
+            s.insert("app", "c", vec![enc(5)], true).unwrap();
+            let pruned = s.prune_oplog(None).unwrap(); // cap=2 -> archive seq 1,2,3
+            assert!(pruned >= 3, "pruned {pruned}");
+            assert_eq!(s.oplog_floor_seq().unwrap(), 4); // live oplog no longer reaches seq 3
+        }
+
+        // v1 can't restore the src (floor past genesis); v2 stitches base + segments.
+        let out = dir.path().join("restored");
+        pitr_archive::restore_from_archive_dir(
+            &archive_s,
+            out.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let r = Storage::open(out.to_str().unwrap()).unwrap();
+        let mut ids: Vec<i32> = r
+            .find_matching("app", "c", &doc! {})
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3]); // base (1,2) + archived seq 3
+    }
+
+    #[test]
+    fn opportunistic_prune_bounds_oplog_from_writes() {
+        // The write path prunes the oplog every OPLOG_PRUNE_INTERVAL emits, so a
+        // long-running server bounds its oplog from writes alone — with NO
+        // explicit prune_oplog call and NO noop-heartbeat sweeper (the default).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        s.set_oplog_max_entries(10);
+        let enc = |id: i32| encode_doc(&doc! {"_id": id}).unwrap();
+        let total = OPLOG_PRUNE_INTERVAL as i32 + 1; // cross the threshold once
+        for i in 0..total {
+            s.insert("app", "c", vec![enc(i)], true).unwrap();
+        }
+        // The opportunistic prune at the OPLOG_PRUNE_INTERVAL-th emit trimmed the
+        // oplog to the 10-entry cap; only the handful of writes after it remain.
+        let live = s.read_oplog(1, 1_000_000).unwrap().len();
+        assert!(
+            live <= 50,
+            "oplog not opportunistically pruned: {live} live rows after {total} writes"
+        );
+        // Pruning the oplog never touches document data.
+        assert_eq!(
+            s.find_matching("app", "c", &doc! {}).unwrap().len() as i32,
+            total
+        );
+    }
+
+    #[test]
+    fn v2_segment_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().to_str().unwrap();
+        let rows = vec![
+            (
+                1i64,
+                doc! {"op": "i", "ns": "a.b", "o": {"_id": 1i32}},
+                None,
+            ),
+            (
+                2i64,
+                doc! {"op": "i", "ns": "a.b", "o": {"_id": 2i32}},
+                Some(doc! {"_id": 2i32, "old": true}),
+            ),
+        ];
+        pitr_archive::write_segment(archive, &rows).unwrap();
+        let got = pitr_archive::iter_archived_oplog(archive).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, 1);
+        assert_eq!(got[1].2, Some(doc! {"_id": 2i32, "old": true}));
+        assert!(pitr_archive::is_archive_dir(archive));
     }
 
     #[test]
