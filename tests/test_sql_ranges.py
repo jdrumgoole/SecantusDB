@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as _dt
 
+import bson
 import pytest
 
 from secantus.sql import ranges, run_sql
@@ -47,9 +48,15 @@ def test_make_range_discrete_canonicalises():
 
 
 def test_make_range_numrange_not_canonicalised():
-    # Continuous ranges keep their bound flags verbatim.
+    # Continuous ranges keep their bound flags verbatim; bounds store in the
+    # subtype's canonical form (numeric -> Decimal128) whatever the input type.
     r = ranges.make_range(1.5, 3.5, "(]", "numrange")
-    assert r == {"lower": 1.5, "upper": 3.5, "lower_inc": False, "upper_inc": True}
+    assert r == {
+        "lower": bson.Decimal128("1.5"),
+        "upper": bson.Decimal128("3.5"),
+        "lower_inc": False,
+        "upper_inc": True,
+    }
 
 
 def test_make_range_empty_collapses():
@@ -261,3 +268,47 @@ def test_pg_type_reports_range(storage, session):
         "SELECT typtype FROM pg_catalog.pg_type WHERE typname = 'int4range'",
     ).rows
     assert rows and rows[0][0] == "r"
+
+
+# -- representation-independent equality + constructor bound canonicalisation -- #
+
+
+def test_range_equality_across_construction_paths(storage, session):
+    # A constructor's bounds and a text cast's bounds store differently
+    # (int / Decimal vs Decimal128, date objects vs ISO text) — equality
+    # compares the canonical identity.
+    r = run(
+        storage,
+        session,
+        "SELECT numrange(-100::numeric, 100.123::numeric, '(]') = '(-100,100.123]'::numrange",
+    )
+    assert r.rows == [(True,)]
+    r = run(
+        storage,
+        session,
+        "SELECT daterange('2000-01-01'::date, '2020-01-01'::date, '[)')"
+        " = '[2000-01-01,2020-01-01)'::daterange",
+    )
+    assert r.rows == [(True,)]
+
+
+def test_untyped_literal_coerces_against_range(storage, session):
+    # PG infers an untyped literal's type from the other operand.
+    assert run(storage, session, "SELECT 'empty' = 'empty'::int4range").rows == [(True,)]
+    assert run(storage, session, "SELECT '{empty}' = array['empty'::int4range]").rows == [(True,)]
+
+
+def test_range_array_cast_coerces_elements(storage, session):
+    r = run(
+        storage,
+        session,
+        "SELECT array['empty'::int4range, '(,)'::int4range] = '{empty,\"(,)\"}'::int4range[]",
+    )
+    assert r.rows == [(True,)]
+    r = run(storage, session, "SELECT ('{\"[1,3)\"}'::int4range[])[1]")
+    assert r.rows == [({"lower": 1, "upper": 3, "lower_inc": True, "upper_inc": False},)]
+
+
+def test_range_cast_to_text_renders_literal(storage, session):
+    assert run(storage, session, "SELECT '[1,3)'::int4range::text").rows == [("[1,3)",)]
+    assert run(storage, session, "SELECT '{[1,3)}'::int4multirange::text").rows == [("{[1,3)}",)]
