@@ -39,7 +39,7 @@
     <p class="section-lead">Production-grade engineering &mdash; real wire protocol, real WiredTiger storage &mdash; scoped today to test and dev environments. Each panel links to the reference docs.</p>
     {% include 'partials/benefits_grid.html' %}
     <h3 class="perf-heading">Performance</h3>
-    <p class="perf-note">A like-for-like benchmark currently has the Python DB <strong>~8&times;&ndash;46&times; slower per operation</strong> than <code>mongod</code> &mdash; the storage engine is the same WiredTiger C library, but the layers above it are Python. CRUD reads sit near the low end; bulk update / delete and aggregation at the high end. The trade is conformance and WiredTiger durability over per-op latency &mdash; for ephemeral test and dev data, the wall-clock difference rarely matters. Need raw speed? That's what <a href="/rust-db.html">Rust DB</a> is for. <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Benchmark &amp; methodology &rarr;</a></p>
+    <p class="perf-note">A like-for-like benchmark currently has the Python DB <strong>~6&times;&ndash;21&times; slower per operation</strong> than <code>mongod</code> &mdash; the storage engine is the same WiredTiger C library, but the layers above it are Python. CRUD reads sit near the low end; bulk update / delete and aggregation at the high end. The trade is conformance and WiredTiger durability over per-op latency &mdash; for ephemeral test and dev data, the wall-clock difference rarely matters. Need raw speed? That's what <a href="/rust-db.html">Rust DB</a> is for. <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Benchmark &amp; methodology &rarr;</a></p>
   </div>
 </section>
 
