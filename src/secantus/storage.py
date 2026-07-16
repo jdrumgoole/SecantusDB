@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import functools
+import logging
 import os
 import re
 import shutil
@@ -563,8 +564,10 @@ class WriteConflictError(Exception):
     client as mongod's statement-time ``WriteConflict`` (code 112) with
     the ``TransientTransactionError`` label, and the transaction is
     aborted server-side. Outside a transaction the storage layer
-    retries the write briefly (a user transaction holds its uncommitted
-    writes until commit/abort) before giving up with the same error.
+    retries the write until it goes through (matching mongod's
+    unbounded ``writeConflictRetry`` — a user transaction holds its
+    uncommitted writes until commit/abort, so the competitor always
+    resolves), logging a warning during long retry stretches.
     """
 
 
@@ -650,9 +653,11 @@ class DocumentTooLargeError(Exception):
         self.code = code
 
 
-_WRITE_CONFLICT_RETRY_DEADLINE_S = 5.0
+_conflict_log = logging.getLogger("secantus.storage.conflict")
+
 _WRITE_CONFLICT_RETRY_DELAY_S = 0.005
 _WRITE_CONFLICT_RETRY_DELAY_MAX_S = 0.02
+_WRITE_CONFLICT_RETRY_LOG_EVERY_S = 5.0
 
 
 def _retry_write_conflicts(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -660,7 +665,13 @@ def _retry_write_conflicts(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     Safe because the failed attempt's ``_batch_transaction`` already
     rolled everything back and the per-collection lock is released on
-    the way out — the retry re-runs from scratch. Inside a user
+    the way out — the retry re-runs from scratch. Retries are
+    UNBOUNDED, matching mongod's ``writeConflictRetry``: a client of
+    mongod never sees ``WriteConflict`` for a plain write outside a
+    multi-document transaction, so neither should ours (the previous 5s
+    deadline turned saturated contention into client-visible errors).
+    A WARNING is logged every few seconds of continuous retrying so a
+    pathological livelock is visible in the server log. Inside a user
     transaction the conflict is NOT retried: it surfaces immediately so
     the command layer can abort the transaction with mongod's
     statement-time ``WriteConflict``.
@@ -668,7 +679,8 @@ def _retry_write_conflicts(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(fn)
     def wrapper(self: Storage, *args: Any, **kwargs: Any) -> Any:
-        deadline: float | None = None
+        started: float | None = None
+        last_log: float | None = None
         delay = _WRITE_CONFLICT_RETRY_DELAY_S
         while True:
             try:
@@ -679,12 +691,16 @@ def _retry_write_conflicts(fn: Callable[..., Any]) -> Callable[..., Any]:
                 if getattr(self._tls, "user_txn", None) is not None:
                     raise
                 now = _time.monotonic()
-                if deadline is None:
-                    deadline = now + _WRITE_CONFLICT_RETRY_DEADLINE_S
-                if now >= deadline:
-                    if isinstance(exc, WriteConflictError):
-                        raise
-                    raise WriteConflictError(str(exc)) from exc
+                if started is None:
+                    started = last_log = now
+                elif now - (last_log or now) >= _WRITE_CONFLICT_RETRY_LOG_EVERY_S:
+                    last_log = now
+                    _conflict_log.warning(
+                        "%s retrying on write conflicts for %.1fs (%s)",
+                        fn.__name__,
+                        now - started,
+                        exc,
+                    )
                 _time.sleep(delay)
                 delay = min(delay * 2, _WRITE_CONFLICT_RETRY_DELAY_MAX_S)
 
@@ -1056,6 +1072,20 @@ class Storage:
                 self._last_ts_ord,
                 self._next_nat_seq,
             ) = self._load_oplog_meta()
+            # Cluster-time mints are not persisted per call (see
+            # ``current_cluster_time``), so the recovered
+            # ``(last_ts_secs, last_ts_ord)`` can lag mints issued right
+            # before a crash. Bump one full second past everything we
+            # recovered: any unpersisted mint carried the wall-clock
+            # second it was issued in, which is <= the second we
+            # recovered from the meta row / oplog tail / this restart's
+            # own wall clock — so +1s is strictly greater than all of
+            # them. Costs at most a 1s forward jump of the (already
+            # logical) cluster clock per restart; never applied to a
+            # virgin store.
+            if self._last_ts_secs > 0:
+                self._last_ts_secs = max(self._last_ts_secs, int(self._time())) + 1
+                self._last_ts_ord = 0
 
         # TTL sweeper. Real mongod runs ``ttlMonitor`` every 60s by
         # default; we mirror that. ``ttl_sweep_seconds <= 0`` disables
@@ -1353,14 +1383,20 @@ class Storage:
         return self._collection_uuid(db, coll)
 
     def current_cluster_time(self) -> Timestamp:
-        """Return a strictly-monotonic ``Timestamp`` advancing the cluster clock."""
+        """Return a strictly-monotonic ``Timestamp`` advancing the cluster clock.
+
+        Deliberately does NOT persist the oplog meta row: this runs on
+        every ``hello`` reply under the replica-set persona (driver
+        heartbeats) and on change-stream high-water-mark minting, so a
+        per-call meta write is a single-row hotspot every concurrent
+        writer conflicts on (the same storm ``_emit_oplog`` was cured
+        of). Restart monotonicity is guaranteed structurally instead:
+        recovery bumps the clock one second past everything it can see
+        (see ``_load_oplog_meta``), which covers any mint that was never
+        persisted.
+        """
         with self._oplog_seq_lock:
-            ts = self._mint_ts()
-        # Meta persist uses the calling thread's WT session/cursor —
-        # safe to do outside the seq lock since it doesn't depend on
-        # the in-memory counters being held stable past the mint.
-        self._persist_oplog_meta()
-        return ts
+            return self._mint_ts()
 
     def peek_cluster_time(self) -> Timestamp:
         """The last minted cluster time WITHOUT advancing the clock.
