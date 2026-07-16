@@ -78,7 +78,7 @@ class TargetStore:
                 DELETE FROM connection_targets
                 WHERE uri NOT IN (
                     SELECT uri FROM connection_targets
-                    ORDER BY last_used_at DESC
+                    ORDER BY last_used_at DESC, rowid DESC
                     LIMIT ?
                 )
                 """,
@@ -97,7 +97,7 @@ class TargetStore:
                 """
                 SELECT uri, last_used_at, created_at
                 FROM connection_targets
-                ORDER BY last_used_at DESC
+                ORDER BY last_used_at DESC, rowid DESC
                 LIMIT ?
                 """,
                 (max(1, int(limit)),),

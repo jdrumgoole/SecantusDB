@@ -579,6 +579,52 @@ def _is_wt_rollback(exc: BaseException) -> bool:
     return "WT_ROLLBACK" in msg or "conflict between concurrent operations" in msg
 
 
+def _commit_batch_transaction(session: Any, sync: bool) -> None:
+    """Commit a batch transaction, mapping a commit-time conflict to
+    ``WriteConflictError``.
+
+    A concurrent transaction can mark this one rollback-only after its
+    last operation ran; WiredTiger then fails the ``commit_transaction``
+    call itself. That failure surfaces as a bare ``WiredTigerError``
+    whose message is just ``"Invalid argument"`` — no ``WT_ROLLBACK``
+    marker — so without this mapping it escapes the write-conflict
+    retry wrapper and reaches the client as a generic internal error
+    (found by ``bench.concurrency`` under 2+ concurrent writers).
+    ``get_rollback_reason()`` carries the real cause; a commit failure
+    with NO rollback reason is a genuine durability error and stays
+    loud.
+    """
+    try:
+        session.commit_transaction("sync=on" if sync else None)
+    except wt.WiredTigerError as exc:
+        reason = None
+        with contextlib.suppress(Exception):
+            reason = session.get_rollback_reason()
+        # WT rolls a failed commit back itself; the explicit rollback is
+        # belt-and-braces for binding versions that leave the txn open,
+        # and raises (suppressed) when there is no transaction to roll
+        # back.
+        with contextlib.suppress(Exception):
+            session.rollback_transaction()
+        # Empirically (WT 7.0 binding): when the transaction was marked
+        # rollback-only internally, commit's auto-rollback CLEARS the
+        # rollback reason before the exception reaches us, and the
+        # exception is the bare errno string "Invalid argument" — WT's
+        # documented EINVAL for committing a rollback-required
+        # transaction ("failed transaction requires rollback: conflict
+        # between concurrent operations" goes only to the event
+        # handler/stderr). Our commit config is a fixed literal
+        # (``sync=on``/None, exercised by every test run), so EINVAL
+        # here has exactly one remaining cause. The SWIG binding has no
+        # panic subclass (only WiredTigerError / WiredTigerRollbackError),
+        # so panics are excluded by their WT_PANIC message.
+        msg = str(exc).strip()
+        is_rollback_einval = "WT_PANIC" not in msg and msg == "Invalid argument"
+        if reason or is_rollback_einval or _is_wt_rollback(exc):
+            raise WriteConflictError(reason or str(exc)) from exc
+        raise
+
+
 # Non-transactional writers that hit a user transaction's uncommitted
 # write retry briefly instead of blocking: mongod blocks such writers
 # until the transaction commits or aborts, which we approximate with a
@@ -2718,7 +2764,7 @@ class Storage:
                 session.rollback_transaction()
             raise
         else:
-            session.commit_transaction("sync=on" if sync else None)
+            _commit_batch_transaction(session, sync)
 
     def _session(self) -> Any:
         s = getattr(self._tls, "session", None)
