@@ -14,6 +14,7 @@ Only the P0 subset is handled; anything outside it raises a
 from __future__ import annotations
 
 import contextvars
+import datetime as _dt
 import functools
 import json
 import logging
@@ -2999,6 +3000,48 @@ def _value_to_node(value: Any) -> exp.Expression:
         # compare as text (``'…'::numeric = $1`` false) and lose the declared
         # type. The cast round-trips the exact digits.
         return exp.Cast(this=exp.Literal.string(str(value)), to=exp.DataType.build("decimal"))
+    if isinstance(value, _dt.datetime):
+        # Same reasoning as Decimal: a datetime param substituted as a bare
+        # string would compare as text against a real datetime and be silently
+        # false. The cast re-parses the exact ISO text back to a datetime.
+        target = "timestamptz" if value.tzinfo is not None else "timestamp"
+        return exp.Cast(
+            this=exp.Literal.string(value.isoformat(sep=" ")), to=exp.DataType.build(target)
+        )
+    if isinstance(value, dict) and "interval" in value:
+        # An interval subdoc (binary or text interval param) — carried through
+        # an ``::interval`` cast so it stays a typed interval value.
+        from secantus.sql import intervals as _intervals
+
+        return exp.Cast(
+            this=exp.Literal.string(_intervals.render(value)),
+            to=exp.DataType.build("interval"),
+        )
+    if isinstance(value, typemap.TaggedText):
+        # A range/multirange-declared parameter (or an array of them) — the
+        # ``::tag`` cast coerces the text into the structured value so equality
+        # against another range compares subdocs, not str-vs-dict.
+        return exp.Cast(
+            this=exp.Literal.string(str(value)),
+            to=exp.DataType.build(value.tag, dialect="postgres"),
+        )
+    if isinstance(value, typemap.JsonText):
+        # A json/jsonb-declared parameter — substitute as a ``::jsonb`` cast so
+        # the raw JSON text parses into a real JSON value and types as json (a
+        # bare string literal would stay text and double-encode on output).
+        return exp.Cast(this=exp.Literal.string(str(value)), to=exp.DataType.build("jsonb"))
+    if isinstance(value, typemap.DateText):
+        return exp.Cast(this=exp.Literal.string(str(value)), to=exp.DataType.build("date"))
+    if isinstance(value, typemap.TimeText):
+        return exp.Cast(this=exp.Literal.string(str(value)), to=exp.DataType.build("time"))
+    if isinstance(value, typemap.TimeTzText):
+        return exp.Cast(this=exp.Literal.string(str(value)), to=exp.DataType.build("timetz"))
+    if isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
+        # A binary date parameter decodes to a date object — same ::date cast.
+        return exp.Cast(this=exp.Literal.string(value.isoformat()), to=exp.DataType.build("date"))
+    if isinstance(value, _dt.time):
+        target = "timetz" if value.tzinfo is not None else "time"
+        return exp.Cast(this=exp.Literal.string(value.isoformat()), to=exp.DataType.build(target))
     if isinstance(value, (bytes, bytearray, memoryview)):
         # A binary ``bytea`` parameter — carry it as the ``\x…`` hex text literal
         # (str() would embed the Python ``b'…'`` repr).
@@ -3007,6 +3050,22 @@ def _value_to_node(value: Any) -> exp.Expression:
         # A binary array parameter decodes to a Python list; carry it as the
         # Postgres array text literal (str() would embed the Python repr).
         elem = next((v for v in value if v is not None), None)
+        if isinstance(elem, typemap.TaggedText):
+            # A binary range[]/multirange[] param — elements decoded to their
+            # text literals; rebuild the array literal and cast to elem.tag[].
+            literal = typemap._render_pg_array(
+                [str(v) if v is not None else None for v in value], "text"
+            )
+            return exp.Cast(
+                this=exp.Literal.string(literal),
+                to=exp.DataType.build(f"{elem.tag}[]", dialect="postgres"),
+            )
+        if isinstance(elem, typemap.JsonText):
+            # json[]/jsonb[] param: elements are raw JSON text — parse them so
+            # the array literal renders each element as JSON (quoted, escaped)
+            # exactly like a client's own text dump of the same array.
+            parsed = [None if v is None else json.loads(str(v)) for v in value]
+            return exp.Literal.string(typemap._render_pg_array(parsed, "json"))
         return exp.Literal.string(typemap._render_pg_array(value, _py_elem_tag(elem)))
     return exp.Literal.string(str(value))
 

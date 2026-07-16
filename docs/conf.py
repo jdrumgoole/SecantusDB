@@ -50,6 +50,14 @@ exclude_patterns = [
 ]
 
 html_theme = "furo"
+
+# The docs are self-hosted at https://secantusdb.com/docs/ since 0.5.4b235;
+# the readthedocs.io copies stay up but carry a banner pointing at the new
+# canonical location. RTD sets READTHEDOCS=True in its build environment —
+# the self-hosted build never does, so the banner is RTD-only.
+import os as _os  # noqa: E402
+
+_ON_RTD = _os.environ.get("READTHEDOCS") == "True"
 html_static_path = ["_static"]
 # Brand assets — see brandkit/ at the repo root for the full kit and
 # brandkit/brand.html for the guided tour. The light/dark wordmark
@@ -61,6 +69,29 @@ html_static_path = ["_static"]
 # We're locked to Furo, so the theme-specific options are enough.
 html_favicon = "_static/favicon.svg"
 html_theme_options = {
+    **(
+        {
+            "announcement": (
+                'These docs have moved — the up-to-date documentation lives at '
+                '<a href="https://secantusdb.com/docs/index.html">secantusdb.com/docs</a> '
+                '(Rust server: <a href="https://secantusdb.com/docs/rust/index.html">'
+                "secantusdb.com/docs/rust</a>)."
+            )
+        }
+        if _ON_RTD
+        # Self-hosted build: the standard site banner, so the docs read as
+        # part of secantusdb.com rather than a detached sub-site.
+        else {
+            "announcement": (
+                '<a href="https://secantusdb.com/"><strong>SecantusDB</strong></a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/python-db.html">Python DB</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/rust-db.html">Rust DB</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/blog.html">Blog</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/docs/index.html">Python docs</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/docs/rust/index.html">Rust docs</a>'
+            )
+        }
+    ),
     "light_logo": "wordmark-horizontal.svg",
     "dark_logo": "wordmark-horizontal-on-dark.svg",
     # Brand palette: slate (neutral) + cyan (accent), matching

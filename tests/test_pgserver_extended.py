@@ -163,7 +163,10 @@ def test_describe_statement_reports_params_and_columns(client):
         pgwire.build_describe("S", "sel"),
     )
     pd = next(m for m in msgs if m.type == "t")
-    assert pgwire.parse_parameter_description(pd.payload) == [0]  # one param, type unknown
+    # An undeclared parameter resolves to text (25), matching Postgres' parse
+    # analysis — clients re-dump their parameters per this reply, and echoing
+    # 0 back left binary unknown-type params undecodable.
+    assert pgwire.parse_parameter_description(pd.payload) == [25]
     assert row_description(msgs) == ["id", "name"]
 
 

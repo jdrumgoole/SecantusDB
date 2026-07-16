@@ -99,6 +99,16 @@ REPORTABLE_GUCS = frozenset(
     }
 )
 
+# GUC names are case-insensitive; SET / SHOW / ParameterStatus all resolve to
+# the canonical spelling (``set timezone`` must hit ``TimeZone``'s default,
+# report as ``TimeZone``, and read back for rendering).
+_GUC_CANONICAL: dict[str, str] = {k.lower(): k for k in GUC_DEFAULTS}
+_GUC_CANONICAL.update({k.lower(): k for k in REPORTABLE_GUCS})
+
+
+def canonical_guc_name(name: str) -> str:
+    return _GUC_CANONICAL.get(name.strip().lower(), name.strip())
+
 
 @dataclass
 class _Savepoint:
@@ -216,6 +226,10 @@ class Session:
     user: str = "secantus"
     backend_pid: int = 0
     settings: dict[str, str] = field(default_factory=dict)
+    # Reportable-GUC changes made mid-statement by ``set_config()`` (which has
+    # no SQLResult of its own to carry them) — drained by the wire layer after
+    # each statement and emitted as ParameterStatus messages, like real PG.
+    pending_parameter_status: list[tuple[str, str]] = field(default_factory=list)
     # RBAC (#193). ``authz_active`` gates per-statement authorization — the wire
     # server sets it when started with ``require_auth`` *and* explicit per-user
     # role bindings. When false (embedded ``run_sql``, or trust mode) the SQL
@@ -433,7 +447,8 @@ class Session:
         return merged
 
     def get_setting(self, name: str) -> str:
-        return self.settings.get(name, GUC_DEFAULTS.get(name, ""))
+        key = canonical_guc_name(name)
+        return self.settings.get(key, GUC_DEFAULTS.get(key, ""))
 
     @property
     def wire_encoding(self) -> str | None:

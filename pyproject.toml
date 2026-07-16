@@ -51,6 +51,9 @@ dev = [
     "anyio>=4.0",
     "pytest-cov>=3.0",
     "pytest-randomly>=3.5",
+    # psycopg's tests/test_typing.py shells out to a bare `mypy` (125 tests) —
+    # uv run puts .venv/bin on PATH, so carrying mypy here makes them count.
+    "mypy>=1.14",
     "invoke>=2.2",
     # Pinned exactly: ruff's formatter output changes between releases, so an
     # unpinned floor let CI silently pull a newer ruff that reformatted an
@@ -110,6 +113,13 @@ sql = [
     # use the SQL interface. See tasks/sql-postgres-plan.md.
     "sqlglot>=25",
 ]
+
+[project.urls]
+Homepage = "https://secantusdb.com/"
+Documentation = "https://secantusdb.com/docs/index.html"
+"Rust server docs" = "https://secantusdb.com/docs/rust/index.html"
+Repository = "https://github.com/jdrumgoole/SecantusDB"
+Changelog = "https://secantusdb.com/docs/changelog.html"
 
 [project.scripts]
 # Daemon naming: `secantusd-<engine>[-<protocol>]`. `-d` signals a daemon

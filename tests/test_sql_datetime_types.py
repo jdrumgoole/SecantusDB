@@ -310,3 +310,106 @@ def test_timestamp_array_naive(storage, session):
     v = val(storage, session, "SELECT ts FROM tsarr WHERE id = 1")
     assert list(v) == [dt.datetime(2020, 1, 2, 3, 4, 5), dt.datetime(2021, 6, 7, 8, 9, 10)]
     assert all(x.tzinfo is None for x in v)
+
+
+# --------------------------------------------------------------------------- #
+# PG-range values beyond Python's datetime limits, special values, loose input
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_date_special_values():
+    assert datetimes.parse_date("infinity") == "infinity"
+    assert datetimes.parse_date("-infinity") == "-infinity"
+    assert datetimes.parse_date("epoch") == "1970-01-01"
+    assert datetimes.parse_date("1000-01-01 BC") == "1000-01-01 BC"
+    assert datetimes.parse_date("10000-01-01") == "10000-01-01"
+    assert datetimes.parse_date("2000-1-1") == "2000-01-01"
+
+
+def test_parse_iso_datetime_loose_spellings():
+    assert datetimes.parse_iso_datetime("2000-1-1") == dt.datetime(2000, 1, 1)
+    assert datetimes.parse_iso_datetime("0258-1-8 1:12:32") == dt.datetime(258, 1, 8, 1, 12, 32)
+    assert datetimes.parse_iso_datetime("2000-01-01 00:00+2") == dt.datetime(
+        2000, 1, 1, tzinfo=dt.timezone(dt.timedelta(hours=2))
+    )
+    assert datetimes.parse_iso_datetime("epoch") == dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    off = dt.timezone(dt.timedelta(hours=1, minutes=2, seconds=3))
+    assert datetimes.parse_iso_datetime("2000-01-01 12:00:00+01:02:03") == dt.datetime(
+        2000, 1, 1, 12, tzinfo=off
+    )
+
+
+def test_wide_timestamp_text_and_micros():
+    assert datetimes.wide_timestamp_text("10000-01-01 12:00") == "10000-01-01 12:00:00"
+    assert datetimes.wide_timestamp_text("1000-01-01 12:00 BC") == "1000-01-01 12:00:00 BC"
+    assert datetimes.wide_timestamp_text("2000-01-01") is None
+    # 10000-01-01 00:00 is exactly one day after 9999-12-31 24:00.
+    max_micros = datetimes.wide_timestamp_micros("10000-01-01 00:00:00")
+    from_max = (
+        dt.datetime(9999, 12, 31, tzinfo=dt.timezone.utc)
+        - dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+    ) // dt.timedelta(microseconds=1) + 86_400_000_000
+    assert max_micros == from_max
+
+
+def test_gregorian_ordinal_matches_python_in_range():
+    for y, m, d in [(1, 1, 1), (2000, 2, 29), (9999, 12, 31), (1970, 1, 1)]:
+        assert datetimes.gregorian_ordinal(y, m, d) == dt.date(y, m, d).toordinal()
+        assert datetimes.ordinal_to_gregorian(dt.date(y, m, d).toordinal()) == (y, m, d)
+
+
+def test_date_arithmetic_over_year_9999(tmp_path):
+    st = Storage(str(tmp_path))
+    s = Session(database=DB, user="secantus")
+    try:
+        res = run_sql(st, DB, "SELECT '9999-12-31'::date + 1", session=s)[-1]
+        assert res.rows == [("10000-01-01",)]
+        res = run_sql(st, DB, "SELECT 'infinity'::date", session=s)[-1]
+        assert res.rows == [("infinity",)]
+        res = run_sql(st, DB, "SELECT '1000-01-01 12:00 BC'::timestamp", session=s)[-1]
+        assert res.rows == [("1000-01-01 12:00:00 BC",)]
+    finally:
+        st.close()
+
+
+def test_tzinfo_for_setting_posix_inversion():
+    plus2 = datetimes.tzinfo_for_setting("-02:00")
+    assert dt.datetime(2000, 1, 1, tzinfo=plus2).utcoffset() == dt.timedelta(hours=2)
+    minus12 = datetimes.tzinfo_for_setting("12:00")
+    assert dt.datetime(2000, 1, 1, tzinfo=minus12).utcoffset() == dt.timedelta(hours=-12)
+    assert datetimes.tzinfo_for_setting("UTC") == dt.timezone.utc
+    assert datetimes.tzinfo_for_setting("NOSUCH0") == dt.timezone.utc
+
+
+def test_session_timezone_governs_timestamptz(tmp_path):
+    st = Storage(str(tmp_path))
+    s = Session(database=DB, user="secantus")
+    try:
+        run_sql(st, DB, "SET TimeZone = '-02:00'", session=s)
+        res = run_sql(st, DB, "SELECT '2000-01-01'::timestamptz", session=s)[-1]
+        # Wall clock in UTC+2 == 1999-12-31 22:00 UTC (embedded results are
+        # normalized tz-aware UTC).
+        assert res.rows == [(dt.datetime(1999, 12, 31, 22, 0, tzinfo=dt.timezone.utc),)]
+    finally:
+        st.close()
+
+
+def test_interval_unit_abbreviations_and_comparison(tmp_path):
+    from secantus.sql import intervals
+
+    assert intervals.parse("1s") == intervals.parse("1 second")
+    assert intervals.parse("2 ms")["interval"]["micros"] == 2000
+    assert intervals.parse("1d 3h 4m 5s")["interval"] == {
+        "months": 0,
+        "days": 1,
+        "micros": (3 * 3600 + 4 * 60 + 5) * 1_000_000,
+    }
+    st = Storage(str(tmp_path))
+    s = Session(database=DB, user="secantus")
+    try:
+        res = run_sql(
+            st, DB, "SELECT '-1 day 23:59:59.999999'::interval = '-0.000001 s'::interval", session=s
+        )[-1]
+        assert res.rows == [(True,)]
+    finally:
+        st.close()

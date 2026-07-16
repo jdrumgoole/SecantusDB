@@ -19,10 +19,13 @@ and ``bytea`` to a hex string. Decimal128 is the exact fit for ``numeric``.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import datetime as _dt
 import decimal as _decimal
 import json as _json
 import math as _math
+import re as _re
 from decimal import Decimal
 from typing import Any
 
@@ -404,6 +407,114 @@ PG_OID.update({f"{elem}[]": oid for elem, oid in _ARRAY_PG_OID.items()})
 # OID -> tag inverse (built after the array registration so array OIDs resolve;
 # PG_OID has no duplicate OIDs).
 OID_TO_TAG: dict[int, str] = {oid: tag for tag, oid in PG_OID.items()}
+# Plain-json oids alias the single ``json`` tag (we deliberately collapse
+# json/jsonb): a parameter declared oid 114 / 199 types as json, not text.
+OID_TO_TAG.setdefault(114, "json")
+OID_TO_TAG.setdefault(199, "json[]")
+
+
+# The connection whose results are currently being rendered — set per
+# connection by the PG servers so ``to_pg_text`` can honour session GUCs
+# (TimeZone) without threading a session through every call site.
+_render_session: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "secantus_sql_render_session", default=None
+)
+
+
+def set_render_session(session: Any) -> None:
+    """Bind the connection's session to this thread's render context."""
+    _render_session.set(session)
+
+
+_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_DOW_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_DATE_TEXT_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def render_datestyle() -> tuple[str, str]:
+    """The active session's DateStyle GUC as ``(style, order)`` — e.g.
+    ``("GERMAN", "DMY")``; ``("ISO", "YMD")`` when unbound."""
+    session = _render_session.get()
+    if session is None:
+        return ("ISO", "YMD")
+    ds = session.get_setting("DateStyle") or "ISO, MDY"
+    parts = [p.strip().upper() for p in ds.split(",")]
+    style = parts[0] if parts and parts[0] else "ISO"
+    order = parts[1] if len(parts) > 1 and parts[1] else "MDY"
+    if style == "GERMAN":
+        order = "DMY"
+    return (style, order)
+
+
+def _render_date_style(y: int, mo: int, d: int, style: str, order: str) -> str:
+    if style == "GERMAN":
+        return f"{d:02d}.{mo:02d}.{y:04d}"
+    if style == "SQL":
+        return f"{d:02d}/{mo:02d}/{y:04d}" if order == "DMY" else f"{mo:02d}/{d:02d}/{y:04d}"
+    if style == "POSTGRES":
+        return f"{d:02d}-{mo:02d}-{y:04d}" if order == "DMY" else f"{mo:02d}-{d:02d}-{y:04d}"
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
+def _render_timestamp_style(value: _dt.datetime, style: str, order: str) -> str:
+    """A naive timestamp's text under a non-ISO DateStyle — the exact shapes
+    psycopg's TimestampLoader parses per style/order."""
+    frac = f".{value.microsecond:06d}".rstrip("0") if value.microsecond else ""
+    clock = f"{value.hour:02d}:{value.minute:02d}:{value.second:02d}{frac}"
+    if style == "POSTGRES":
+        dow = _DOW_ABBR[value.weekday()]
+        mon = _MONTH_ABBR[value.month - 1]
+        if order == "DMY":
+            return f"{dow} {value.day:02d} {mon} {clock} {value.year:04d}"
+        return f"{dow} {mon} {value.day:02d} {clock} {value.year:04d}"
+    return f"{_render_date_style(value.year, value.month, value.day, style, order)} {clock}"
+
+
+def render_tzinfo() -> _dt.tzinfo:
+    """The active session's TimeZone GUC as a tzinfo (UTC when unbound)."""
+    session = _render_session.get()
+    if session is None:
+        return _dt.timezone.utc
+    from secantus.sql.datetimes import session_tzinfo
+
+    return session_tzinfo(session)
+
+
+class JsonText(str):
+    """Raw JSON text from a parameter declared json/jsonb (oid 114/3802).
+
+    The marker survives to ``planner._value_to_node``, which substitutes the
+    parameter as a ``::jsonb`` cast so the value parses into a real JSON value
+    (dict/list/scalar) and types as json downstream — a bare string literal
+    would stay text and double-encode on output."""
+
+
+class TaggedText(str):
+    """Canonical text of a parameter whose declared OID maps to a structured
+    tag (range / multirange, incl. their array forms) — substituted as a
+    ``::tag`` cast so the existing cast coercion turns it into the real value
+    (a range subdoc compares equal to another subdoc; raw text never does)."""
+
+    tag: str
+
+    def __new__(cls, text: str, tag: str) -> TaggedText:
+        obj = super().__new__(cls, text)
+        obj.tag = tag
+        return obj
+
+
+class DateText(str):
+    """Canonical date text from a parameter declared ``date`` (oid 1082) —
+    substituted as a ``::date`` cast so expressions type as date (``$1 + 1`` is
+    date arithmetic, and the result describes as date, not int)."""
+
+
+class TimeText(str):
+    """Canonical time text from a ``time`` (1083) parameter — ``::time`` cast."""
+
+
+class TimeTzText(str):
+    """Canonical timetz text from a ``timetz`` (1266) parameter — ``::timetz``."""
 
 
 def type_tag_for_sql(datatype: exp.DataType) -> str | None:
@@ -645,15 +756,36 @@ def coerce(value: Any, tag: str) -> Any:
         if isinstance(value, _dt.datetime):
             return value
         # ISO-8601 string literal -> datetime (with the 3.10 short-offset net).
-        from secantus.sql.datetimes import parse_iso_datetime
+        from secantus.sql.datetimes import (
+            datetime_sentinel,
+            parse_iso_datetime,
+            wide_timestamp_text,
+        )
 
+        sentinel = datetime_sentinel(value)
+        if sentinel is not None:
+            return sentinel
+        wide = wide_timestamp_text(value)
+        if wide is not None:
+            return wide  # PG-valid but beyond Python's datetime range: text
         return parse_iso_datetime(value)
     if tag == "timestamp":
         # Naive "without time zone": an offset in the input is dropped and the
         # wall-clock fields kept (Postgres timestamp semantics), so the stored /
         # compared value is always tz-naive.
-        from secantus.sql.datetimes import parse_iso_datetime
+        from secantus.sql.datetimes import (
+            datetime_sentinel,
+            parse_iso_datetime,
+            wide_timestamp_text,
+        )
 
+        if not isinstance(value, _dt.datetime):
+            sentinel = datetime_sentinel(value)
+            if sentinel is not None:
+                return sentinel
+            wide = wide_timestamp_text(value)
+            if wide is not None:
+                return wide
         dt = value if isinstance(value, _dt.datetime) else parse_iso_datetime(value)
         return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
     if tag in ("date", "time", "timetz"):
@@ -747,15 +879,33 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     if isinstance(value, _dt.datetime):
         # Postgres renders timestamptz space-separated with a UTC offset. A stored
         # timestamptz decodes tz-naive UTC from BSON, so tag it UTC before
-        # rendering; otherwise the offset is dropped and the client parses a
-        # tz-naive datetime for a timestamptz column.
-        if tag == "timestamptz" and value.tzinfo is None:
-            value = value.replace(tzinfo=_dt.timezone.utc)
+        # rendering — then convert to the session's TimeZone GUC like a real
+        # server (the wire text carries the session-zone wall clock + offset).
+        if tag == "timestamptz":
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=_dt.timezone.utc)
+            # Converting near datetime.min/max can cross Python's range — keep
+            # the value as-is in that case.
+            with contextlib.suppress(OverflowError, ValueError):
+                value = value.astimezone(render_tzinfo())
         # ``timestamp`` (without time zone) never carries an offset — strip any
         # stray tzinfo so the wire text is naive wall-clock.
         elif tag == "timestamp" and value.tzinfo is not None:
             value = value.replace(tzinfo=None)
+        if tag == "timestamp":
+            style, order = render_datestyle()
+            if style != "ISO":
+                return _render_timestamp_style(value, style, order).encode("utf-8")
         return value.isoformat(sep=" ").encode("utf-8")
+    if tag == "date":
+        # Dates are stored as canonical ``YYYY-MM-DD`` text; a non-ISO DateStyle
+        # reorders the fields the way psycopg's DateLoader slices them.
+        style, order = render_datestyle()
+        text = str(value)
+        if style != "ISO" and _DATE_TEXT_RE.match(text):
+            y, mo, d = (int(p) for p in text.split("-"))
+            return _render_date_style(y, mo, d, style, order).encode("utf-8")
+        return text.encode("utf-8")
     if tag in _RANGE_TAGS and isinstance(value, dict):
         from secantus.sql import ranges as _ranges
 
@@ -794,7 +944,11 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         return _intervals.render(value).encode("utf-8")
     if tag == "composite" and isinstance(value, dict):
         return _render_pg_composite(value).encode("utf-8")
-    if isinstance(value, (dict, list)):
+    if isinstance(value, list):
+        # A list under a non-array, non-json tag (``array[…]::text``) renders as
+        # Postgres' array_out literal, not a JSON list.
+        return _render_pg_array(value, infer_elem_tag(value)).encode("utf-8")
+    if isinstance(value, dict):
         return _render_json(value).encode("utf-8")
     if isinstance(value, bson.Decimal128):
         return str(value.to_decimal()).encode("utf-8")
@@ -861,6 +1015,25 @@ def to_py(value: Any, tag: str) -> Any:
     return value
 
 
+def infer_elem_tag(items: Any) -> str:
+    """Best-effort element tag for rendering an untyped Python list as a PG
+    array literal — keyed off the first non-None element."""
+    elem = next((v for v in items if v is not None), None)
+    if isinstance(elem, bool):
+        return "bool"
+    if isinstance(elem, int):
+        return "int8"
+    if isinstance(elem, float):
+        return "float8"
+    if isinstance(elem, _dt.datetime):
+        return "timestamptz"
+    if isinstance(elem, (dict, list)):
+        return "json"
+    if isinstance(elem, (bson.Decimal128, _decimal.Decimal)):
+        return "numeric"
+    return "text"
+
+
 def _render_pg_array(items: Any, elem_tag: str) -> str:
     """Render a Python list as a Postgres array text literal ``{a,b,c}``, quoting
     an element only when it needs it (empty, NULL-looking, or containing a comma /
@@ -868,7 +1041,12 @@ def _render_pg_array(items: Any, elem_tag: str) -> str:
     parts: list[str] = []
     for v in items:
         if v is None:
-            parts.append("NULL")
+            if elem_tag == "json":
+                # A JSON null element's text is ``null`` (quoted below so it
+                # doesn't read as an SQL NULL element), matching a client dump.
+                parts.append('"null"')
+            else:
+                parts.append("NULL")
             continue
         rendered = to_pg_text(v, elem_tag)
         text = rendered.decode("utf-8") if rendered is not None else ""
