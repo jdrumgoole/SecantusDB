@@ -3017,6 +3017,14 @@ def _value_to_node(value: Any) -> exp.Expression:
             this=exp.Literal.string(_intervals.render(value)),
             to=exp.DataType.build("interval"),
         )
+    if isinstance(value, typemap.TaggedText):
+        # A range/multirange-declared parameter (or an array of them) — the
+        # ``::tag`` cast coerces the text into the structured value so equality
+        # against another range compares subdocs, not str-vs-dict.
+        return exp.Cast(
+            this=exp.Literal.string(str(value)),
+            to=exp.DataType.build(value.tag, dialect="postgres"),
+        )
     if isinstance(value, typemap.JsonText):
         # A json/jsonb-declared parameter — substitute as a ``::jsonb`` cast so
         # the raw JSON text parses into a real JSON value and types as json (a
@@ -3042,6 +3050,16 @@ def _value_to_node(value: Any) -> exp.Expression:
         # A binary array parameter decodes to a Python list; carry it as the
         # Postgres array text literal (str() would embed the Python repr).
         elem = next((v for v in value if v is not None), None)
+        if isinstance(elem, typemap.TaggedText):
+            # A binary range[]/multirange[] param — elements decoded to their
+            # text literals; rebuild the array literal and cast to elem.tag[].
+            literal = typemap._render_pg_array(
+                [str(v) if v is not None else None for v in value], "text"
+            )
+            return exp.Cast(
+                this=exp.Literal.string(literal),
+                to=exp.DataType.build(f"{elem.tag}[]", dialect="postgres"),
+            )
         if isinstance(elem, typemap.JsonText):
             # json[]/jsonb[] param: elements are raw JSON text — parse them so
             # the array literal renders each element as JSON (quoted, escaped)

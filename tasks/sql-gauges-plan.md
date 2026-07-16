@@ -518,6 +518,21 @@ count: composite/range behavior incl. CREATE TYPE AS RANGE, column 42
 (typmod/type identity 33), copy 34 (binary COPY 14, one-CopyData-per-row 9),
 cursor_common 27, connection 23, typeinfo 18 (`to_regtype` quoted idents).
 
+**Third round (same session): range/multirange parameters.** Diagnosed by a
+read-only subagent (root causes: params never coerced 94, range arrays 48,
+CREATE TYPE AS RANGE 36, untyped-binary 10), then fixed the coercion class:
+range/multirange params (and arrays) travel as `typemap.TaggedText` and
+substitute as `::type` casts; `'{…}'::int4range[]` coerces elements; untyped
+literals take the range operand's type (PG context inference); bounds store
+canonically (`ranges.make_range` coerces per subtype) and equality compares
+`ranges.canonical` identity; `range::text` renders the literal;
+ParameterDescription resolves undeclared params to text like PG.
+`test_range.py` + `test_multirange.py`: 149 failed + 31 errors → **10 + 31**
+(remainder: untyped-binary params needing Parse-time type inference, and
+CREATE TYPE AS RANGE — both in `tasks/backlog.md`). Composite (66) still open:
+`row()` constructor 38, composite-value materialization 24, small catalog
+bugs 4 (see the diagnosis in this entry's session notes).
+
 **Second slice (same day, PR pending): 19/26 → 22/26.** HAVING grew
 `IS [NOT] NULL` (bare / aggregate / computed group-key operands, exact under
 any NOT nesting), three-valued `[NOT] IN` over group keys, and always-unknown

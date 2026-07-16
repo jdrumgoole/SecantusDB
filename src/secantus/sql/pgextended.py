@@ -236,14 +236,34 @@ _BINARY = {
     3802: _decode_jsonb,  # jsonb
 }
 _BINARY.update(
-    {oid: (lambda b, _e=elem: _decode_range(b, _e)) for oid, elem in _RANGE_ELEM_OID.items()}
+    {
+        oid: (
+            lambda b, _e=elem, _t=typemap.OID_TO_TAG[oid]: typemap.TaggedText(
+                _decode_range(b, _e), _t
+            )
+        )
+        for oid, elem in _RANGE_ELEM_OID.items()
+    }
 )
 _BINARY.update(
     {
-        oid: (lambda b, _r=rng: _decode_multirange(b, _r))
+        oid: (
+            lambda b, _r=rng, _t=typemap.OID_TO_TAG[oid]: typemap.TaggedText(
+                _decode_multirange(b, _r), _t
+            )
+        )
         for oid, rng in _MULTIRANGE_RANGE_OID.items()
     }
 )
+
+# OID -> range/multirange tag (base types and their array forms) — parameters
+# declared with these travel as TaggedText and substitute as ``::tag`` casts.
+_RANGEISH_TAG_BY_OID: dict[int, str] = {}
+for _tag in (*typemap._RANGE_TAGS, *typemap._MULTIRANGE_TAGS):
+    _RANGEISH_TAG_BY_OID[typemap.PG_OID[_tag]] = _tag
+    _arr = typemap._ARRAY_PG_OID.get(_tag)
+    if _arr is not None:
+        _RANGEISH_TAG_BY_OID[_arr] = f"{_tag}[]"
 
 
 def _encode_timestamptz(value: Any) -> bytes:
@@ -662,6 +682,11 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
             # A json/jsonb-declared text param — mark it so substitution casts
             # it into a parsed JSON value instead of leaving raw text.
             return typemap.JsonText(text)
+        range_tag = _RANGEISH_TAG_BY_OID.get(oid)
+        if range_tag is not None:
+            # Range / multirange (or arrays of them): carried as text with the
+            # declared tag so substitution casts it into the structured value.
+            return typemap.TaggedText(text, range_tag)
         conv = _TEXT_PARAM.get(oid)
         if conv is None:
             return text
@@ -805,7 +830,14 @@ class ExtendedSession:
             if prep is None:
                 raise errors.SQLError("26000", f'prepared statement "{name}" does not exist')
             n = max(prep.param_count, len(prep.param_oids))
-            oids = [prep.param_oids[i] if i < len(prep.param_oids) else 0 for i in range(n)]
+            # Postgres' parse analysis resolves an undeclared (oid 0) parameter
+            # to text when nothing else pins it, and REPORTS that resolution —
+            # psycopg re-dumps its parameters per this reply, so echoing 0 back
+            # leaves a binary unknown-type param undecodable server-side.
+            oids = [
+                prep.param_oids[i] if i < len(prep.param_oids) and prep.param_oids[i] else 25
+                for i in range(n)
+            ]
             out = bytearray(pgwire.parameter_description(oids))
             stmt = (
                 planner.substitute_parameters(prep.stmt, [None] * prep.param_count)

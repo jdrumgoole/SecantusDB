@@ -489,6 +489,20 @@ class JsonText(str):
     would stay text and double-encode on output."""
 
 
+class TaggedText(str):
+    """Canonical text of a parameter whose declared OID maps to a structured
+    tag (range / multirange, incl. their array forms) — substituted as a
+    ``::tag`` cast so the existing cast coercion turns it into the real value
+    (a range subdoc compares equal to another subdoc; raw text never does)."""
+
+    tag: str
+
+    def __new__(cls, text: str, tag: str) -> TaggedText:
+        obj = super().__new__(cls, text)
+        obj.tag = tag
+        return obj
+
+
 class DateText(str):
     """Canonical date text from a parameter declared ``date`` (oid 1082) —
     substituted as a ``::date`` cast so expressions type as date (``$1 + 1`` is

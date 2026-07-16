@@ -1240,6 +1240,71 @@ for _cls_name, _handler in (
         _SCALAR_FUNC_NODES[_cls] = _handler
 
 
+def _range_value_shape(v: Any) -> str | None:
+    """``"range"`` / ``"multirange"`` for a range-shaped subdocument, else None."""
+    if isinstance(v, dict):
+        if "multirange" in v:
+            return "multirange"
+        if "empty" in v or ("lower" in v and "upper" in v):
+            return "range"
+    return None
+
+
+def _infer_range_tag(v: dict, multi: bool) -> str:
+    """A range tag whose parser matches the subdoc's bound types — enough for an
+    untyped text literal to coerce into a comparable value."""
+    rngs = v.get("multirange", []) if multi else [v]
+    for r in rngs:
+        for key in ("lower", "upper"):
+            b = r.get(key) if isinstance(r, dict) else None
+            if b is None or isinstance(b, bool):
+                continue
+            if isinstance(b, int):
+                base = "int8range"
+            elif isinstance(b, _dt.datetime):
+                base = "tstzrange" if b.tzinfo is not None else "tsrange"
+            elif isinstance(b, str):
+                base = "daterange"
+            else:
+                base = "numrange"
+            return base.replace("range", "multirange") if multi else base
+    return "int4multirange" if multi else "int4range"
+
+
+def _coerce_untyped_range_operand(left: Any, right: Any) -> tuple[Any, Any]:
+    """Postgres infers an untyped literal's type from the other comparison
+    operand: ``'empty' = $1`` with a range-typed parameter parses the literal as
+    that range type. Coerce the str side when the other side is range-shaped."""
+    for a, b, flip in ((left, right, False), (right, left, True)):
+        shape = _range_value_shape(a)
+        if shape is not None and isinstance(b, str):
+            tag = _infer_range_tag(a, shape == "multirange")
+            try:
+                parsed = typemap.coerce(b, tag)
+            except (ValueError, errors.SQLError):
+                return left, right
+            return (a, parsed) if not flip else (parsed, a)
+        # array[…range…] = '<untyped array literal>' — infer the element type
+        # from the typed side's elements and parse the literal as tag[].
+        if (
+            isinstance(a, list)
+            and a
+            and all(_range_value_shape(v) is not None for v in a if v is not None)
+            and isinstance(b, str)
+        ):
+            first = next((v for v in a if v is not None), None)
+            if first is None:
+                return left, right
+            shape = _range_value_shape(first)
+            tag = _infer_range_tag(first, shape == "multirange")
+            try:
+                parsed = typemap.coerce(b, f"{tag}[]")
+            except (ValueError, errors.SQLError):
+                return left, right
+            return (a, parsed) if not flip else (parsed, a)
+    return left, right
+
+
 def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     left = evaluate(node.this, scope, ctx)
     right = evaluate(node.expression, scope, ctx)
@@ -1254,6 +1319,19 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
         # though the field triples differ.
         left = _intervals.total_micros(left)
         right = _intervals.total_micros(right)
+    left, right = _coerce_untyped_range_operand(left, right)
+    ls, rs = _range_value_shape(left), _range_value_shape(right)
+    if ls is not None and ls == rs:
+        # Ranges compare by canonical identity — bound representations vary by
+        # construction path (int vs Decimal vs Decimal128, date obj vs text).
+        from secantus.sql import ranges as _ranges
+
+        if ls == "multirange":
+            left = _ranges.canonical_multirange(left)
+            right = _ranges.canonical_multirange(right)
+        else:
+            left = _ranges.canonical(left)
+            right = _ranges.canonical(right)
     if (
         isinstance(left, _dt.datetime)
         and isinstance(right, _dt.datetime)
@@ -1636,6 +1714,13 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         and not isinstance(value, dict)
     ):
         return typemap.coerce(value, to)
+    # ``'{empty,"[1,3)"}'::int4range[]`` — an array-of-range/multirange cast
+    # coerces each element into its structured subdoc (a list of raw text
+    # elements never compares equal to array[…] of real range values).
+    if value is not None and typemap.is_array_tag(to):
+        elem_tag = typemap.array_element_tag(to)
+        if elem_tag in typemap._RANGE_TAGS or elem_tag in typemap._MULTIRANGE_TAGS:
+            return typemap.coerce(value, to)
     # Bit-string casts: ``::bit(n)`` / ``::varbit`` (from a '0'/'1' string or an
     # integer) and ``bit::int``.
     to_tag = typemap.type_tag_for_sql(node.to) if node.to is not None else None
@@ -1682,10 +1767,17 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         )
         rendered = typemap.to_pg_text(value, tag_for)
         return rendered.decode("utf-8") if rendered is not None else None
-    # ``expr::text`` of a structured value: a JSON value renders as JSON text,
-    # an array value as Postgres' array_out literal (``{a,b}``) — so both
-    # compare equal to a client-dumped parameter's text form.
+    # ``expr::text`` of a structured value: a range renders as its ``[a,b)``
+    # literal, a JSON value as JSON text, an array as Postgres' array_out
+    # literal — so each compares equal to a client-dumped parameter's text.
     if to_tag == "text" and isinstance(value, (dict, list)):
+        shape = _range_value_shape(value)
+        if shape is not None:
+            from secantus.sql import ranges as _ranges
+
+            if shape == "multirange":
+                return _ranges.render_multirange(value)
+            return _ranges.render(value)
         if _yields_json(node.this):
             return typemap._render_json(value)
         if isinstance(value, list):

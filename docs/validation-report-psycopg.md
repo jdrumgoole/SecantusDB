@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.5.4b235
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-07-16 13:50 UTC
+- generated: 2026-07-16 14:55 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -10,11 +10,11 @@
 | test_capabilities.py | 12 | 0 | 9 | 21 | 100.0% |
 | test_column.py | 11 | 42 | 0 | 53 | 20.8% |
 | test_connection.py | 79 | 23 | 2 | 104 | 77.5% |
-| test_connection_info.py | 27 | 10 | 3 | 40 | 73.0% |
+| test_connection_info.py | 31 | 6 | 3 | 40 | 83.8% |
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
 | test_copy.py | 74 | 37 | 1 | 112 | 66.7% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
-| test_cursor_client.py | 25 | 3 | 0 | 28 | 89.3% |
+| test_cursor_client.py | 26 | 2 | 0 | 28 | 92.9% |
 | test_cursor_common.py | 253 | 27 | 8 | 288 | 90.4% |
 | test_cursor_raw.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_server.py | 85 | 25 | 0 | 110 | 77.3% |
@@ -36,18 +36,18 @@
 | types/test_enum.py | 197 | 0 | 0 | 197 | 100.0% |
 | types/test_hstore.py | 24 | 0 | 15 | 39 | 100.0% |
 | types/test_json.py | 258 | 0 | 0 | 258 | 100.0% |
-| types/test_multirange.py | 123 | 82 | 12 | 217 | 60.0% |
+| types/test_multirange.py | 187 | 18 | 12 | 217 | 91.2% |
 | types/test_net.py | 3 | 30 | 0 | 33 | 9.1% |
 | types/test_none.py | 1 | 0 | 0 | 1 | 100.0% |
 | types/test_numeric.py | 366 | 4 | 0 | 370 | 98.9% |
 | types/test_numpy.py | 88 | 78 | 6 | 172 | 53.0% |
-| types/test_range.py | 177 | 98 | 12 | 287 | 64.4% |
+| types/test_range.py | 247 | 28 | 12 | 287 | 89.8% |
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 110 | 24 | 1 | 135 | 82.1% |
 | types/test_uuid.py | 21 | 5 | 0 | 26 | 80.8% |
-| **total** | **3473** | **653** | **112** | **4238** | **84.2%** |
+| **total** | **3612** | **514** | **112** | **4238** | **87.5%** |
 
-## Failures (653)
+## Failures (514)
 
 - `tests/test_adapt.py::test_load_cursor_ctx_nested[0-row('hello'::text)-obj1]`
 - `tests/test_adapt.py::test_load_cursor_ctx_nested[1-row('hello'::text)-obj1]`
@@ -131,10 +131,6 @@
 - `tests/test_connection_info.py::test_error_message`
 - `tests/test_connection_info.py::test_normalize_encoding[euc-jp-EUC_JP-euc_jp]`
 - `tests/test_connection_info.py::test_normalize_encoding[eucjp-EUC_JP-euc_jp]`
-- `tests/test_connection_info.py::test_normalize_encoding[latin9-LATIN9-iso8859-15]`
-- `tests/test_connection_info.py::test_normalize_encoding[utf-8-UTF8-utf-8]`
-- `tests/test_connection_info.py::test_normalize_encoding[utf8-UTF8-utf-8]`
-- `tests/test_connection_info.py::test_normalize_encoding[utf_8-UTF8-utf-8]`
 - `tests/test_connection_info.py::test_set_encoding_unsupported`
 - `tests/test_copy.py::test_binary_partial_row`
 - `tests/test_copy.py::test_connection_writer[1-sample_binary]`
@@ -175,7 +171,6 @@
 - `tests/test_copy.py::test_worker_life[1-sample_binary]`
 - `tests/test_cursor_client.py::test_leak[asyncio-namedtuple_row-iter]`
 - `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-all]`
-- `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-iter]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-ClientCursor]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-Cursor]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-RawCursor]`
@@ -381,72 +376,8 @@
 - `tests/types/test_composite.py::test_type_dumper_registered[b]`
 - `tests/types/test_composite.py::test_type_dumper_registered[s]`
 - `tests/types/test_composite.py::test_type_dumper_registered[t]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[s-datemultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[s-int4multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[s-int8multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[s-nummultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[s-tsmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[s-tstzmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[t-datemultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[t-int4multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[t-int8multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[t-nummultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[t-tsmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array[t-tstzmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-datemultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-int4multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-int8multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-nummultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-tsmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[s-tstzmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-datemultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-int4multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-int8multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-nummultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-tsmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_array_with_cast[t-tstzmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[b-datemultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[b-int4multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[b-int8multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[b-nummultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[b-tsmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[b-tstzmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[s-datemultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[s-int4multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[s-int8multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[s-nummultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[s-tsmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[s-tstzmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[t-datemultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[t-int4multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[t-int8multirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[t-nummultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[t-tsmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_empty[t-tstzmultirange]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-datemultirange-ranges5]`
 - `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int4multirange-ranges0]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int4multirange-ranges1]`
 - `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int8multirange-ranges2]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int8multirange-ranges3]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-nummultirange-ranges4]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-tsmultirange-ranges6]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-tstzmultirange-ranges7]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-datemultirange-ranges5]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-int4multirange-ranges0]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-int4multirange-ranges1]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-int8multirange-ranges2]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-int8multirange-ranges3]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-nummultirange-ranges4]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-tsmultirange-ranges6]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[s-tstzmultirange-ranges7]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-datemultirange-ranges5]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-int4multirange-ranges0]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-int4multirange-ranges1]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-int8multirange-ranges2]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-int8multirange-ranges3]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-nummultirange-ranges4]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-tsmultirange-ranges6]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[t-tstzmultirange-ranges7]`
 - `tests/types/test_multirange.py::test_dump_custom_empty`
 - `tests/types/test_multirange.py::test_dump_custom_none[b]`
 - `tests/types/test_multirange.py::test_dump_custom_none[s]`
@@ -575,84 +506,14 @@
 - `tests/types/test_numpy.py::test_dump_int[t-uint8-255-'255'::int2]`
 - `tests/types/test_numpy.py::test_dump_int[t-ulonglong-0-'0'::numeric]`
 - `tests/types/test_numpy.py::test_dump_int[t-ulonglong-18446744073709551615-'18446744073709551615'::numeric]`
-- `tests/types/test_range.py::test_dump_builtin_array[s-daterange]`
-- `tests/types/test_range.py::test_dump_builtin_array[s-int4range]`
-- `tests/types/test_range.py::test_dump_builtin_array[s-int8range]`
-- `tests/types/test_range.py::test_dump_builtin_array[s-numrange]`
-- `tests/types/test_range.py::test_dump_builtin_array[s-tsrange]`
-- `tests/types/test_range.py::test_dump_builtin_array[s-tstzrange]`
-- `tests/types/test_range.py::test_dump_builtin_array[t-daterange]`
-- `tests/types/test_range.py::test_dump_builtin_array[t-int4range]`
-- `tests/types/test_range.py::test_dump_builtin_array[t-int8range]`
-- `tests/types/test_range.py::test_dump_builtin_array[t-numrange]`
-- `tests/types/test_range.py::test_dump_builtin_array[t-tsrange]`
-- `tests/types/test_range.py::test_dump_builtin_array[t-tstzrange]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-daterange]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-int4range]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-int8range]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-numrange]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-tsrange]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[s-tstzrange]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-daterange]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-int4range]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-int8range]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-numrange]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-tsrange]`
-- `tests/types/test_range.py::test_dump_builtin_array_with_cast[t-tstzrange]`
 - `tests/types/test_range.py::test_dump_builtin_empty[b-daterange]`
 - `tests/types/test_range.py::test_dump_builtin_empty[b-int4range]`
 - `tests/types/test_range.py::test_dump_builtin_empty[b-int8range]`
 - `tests/types/test_range.py::test_dump_builtin_empty[b-numrange]`
 - `tests/types/test_range.py::test_dump_builtin_empty[b-tsrange]`
 - `tests/types/test_range.py::test_dump_builtin_empty[b-tstzrange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[s-daterange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[s-int4range]`
-- `tests/types/test_range.py::test_dump_builtin_empty[s-int8range]`
-- `tests/types/test_range.py::test_dump_builtin_empty[s-numrange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[s-tsrange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[s-tstzrange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[t-daterange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[t-int4range]`
-- `tests/types/test_range.py::test_dump_builtin_empty[t-int8range]`
-- `tests/types/test_range.py::test_dump_builtin_empty[t-numrange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[t-tsrange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[t-tstzrange]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-daterange-min9-max9-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-int4range--2147483648-2147483647-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-int4range-10-20-[]]`
 - `tests/types/test_range.py::test_dump_builtin_range[b-int4range-None-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-int8range--9223372036854775808-9223372036854775807-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-int8range-10-20-[)]`
 - `tests/types/test_range.py::test_dump_builtin_range[b-int8range-None-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-numrange-None-max8-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-numrange-min6-max6-(]]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-numrange-min7-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-tsrange-min10-max10-[]]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-tstzrange-min11-max11-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-daterange-min9-max9-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-int4range--2147483648-2147483647-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-int4range-10-20-[]]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-int4range-None-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-int8range--9223372036854775808-9223372036854775807-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-int8range-10-20-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-int8range-None-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-numrange-None-max8-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-numrange-min6-max6-(]]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-numrange-min7-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-tsrange-min10-max10-[]]`
-- `tests/types/test_range.py::test_dump_builtin_range[s-tstzrange-min11-max11-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-daterange-min9-max9-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-int4range--2147483648-2147483647-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-int4range-10-20-[]]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-int4range-None-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-int8range--9223372036854775808-9223372036854775807-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-int8range-10-20-[)]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-int8range-None-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-numrange-None-max8-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-numrange-min6-max6-(]]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-numrange-min7-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-tsrange-min10-max10-[]]`
-- `tests/types/test_range.py::test_dump_builtin_range[t-tstzrange-min11-max11-()]`
 - `tests/types/test_range.py::test_dump_custom_empty`
 - `tests/types/test_range.py::test_dump_custom_null[b]`
 - `tests/types/test_range.py::test_dump_custom_null[s]`

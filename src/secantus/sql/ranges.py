@@ -56,6 +56,15 @@ def make_range(lower: Any, upper: Any, bounds: str, tag: str) -> dict[str, Any]:
     lower_inc = bounds[0] == "["
     upper_inc = bounds[1] == "]"
     _elem, discrete = RANGE_TYPES[tag]
+    # Bounds store in the subtype's canonical form regardless of how they
+    # arrived (a ``daterange(date, date)`` constructor bound must match the
+    # text-cast path's ISO-text bound).
+    from secantus.sql import typemap as _typemap
+
+    if lower is not None:
+        lower = _typemap.coerce(lower, _elem)
+    if upper is not None:
+        upper = _typemap.coerce(upper, _elem)
     if discrete:
         # Canonicalise to [): a lower exclusive bound steps up; an upper inclusive
         # bound steps up (so [1,10] -> [1,11), (1,10] -> [2,11)).
@@ -419,3 +428,35 @@ def parse_literal(text: str, tag: str, coerce: Any) -> dict[str, Any]:
     lo = coerce(lo_s.strip().strip('"')) if lo_s.strip() else None
     hi = coerce(hi_s.strip().strip('"')) if hi_s.strip() else None
     return make_range(lo, hi, bounds, tag)
+
+
+def _canonical_bound(v: Any) -> Any:
+    """A comparison-stable form of a range bound: ``Decimal128`` unwraps to
+    ``Decimal`` (so int / Decimal / Decimal128 spellings of the same number
+    compare equal), naive datetimes read as UTC, date objects as ISO text."""
+    if isinstance(v, bson.Decimal128):
+        return v.to_decimal()
+    if isinstance(v, _dt.datetime):
+        return v.replace(tzinfo=_dt.timezone.utc) if v.tzinfo is None else v
+    if isinstance(v, _dt.date):
+        return v.isoformat()
+    return v
+
+
+def canonical(rng: Any) -> tuple:
+    """A hashable, representation-independent identity for a range subdocument —
+    what equality compares (a ``numrange(…)`` constructor's int bound must equal
+    the text cast's ``Decimal128``)."""
+    r = rng if isinstance(rng, dict) else {}
+    if r.get("empty"):
+        return ("empty",)
+    return (
+        _canonical_bound(r.get("lower")),
+        _canonical_bound(r.get("upper")),
+        bool(r.get("lower_inc")),
+        bool(r.get("upper_inc")),
+    )
+
+
+def canonical_multirange(mr: Any) -> tuple:
+    return tuple(canonical(r) for r in mr.get("multirange", []))
