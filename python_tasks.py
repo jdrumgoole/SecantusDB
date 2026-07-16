@@ -139,6 +139,24 @@ def docs(c: Context, builder: str = "html", clean: bool = False) -> None:
     )
 
 
+@task(name="docs-rust")
+def docs_rust(c: Context, builder: str = "html", clean: bool = False) -> None:
+    """Build the Rust-server docs tree (docs-rust/) with warnings-as-errors.
+
+    Pure-markdown Sphinx tree (no autodoc, no secantus import) — the version
+    is regex-read from crates/secantusdb/Cargo.toml, so this works in any
+    bare worktree with no build at all.
+    """
+    if clean:
+        c.run("rm -rf docs-rust/_build", pty=True)
+    qb = shlex.quote(builder)
+    c.run(
+        f"uv run --no-project {_DOCS_DEPS} "
+        f"sphinx-build -W --keep-going -b {qb} docs-rust docs-rust/_build/{qb}",
+        pty=True,
+    )
+
+
 @task(name="docs-serve")
 def docs_serve(c: Context, port: int = 8000) -> None:
     docs(c)
