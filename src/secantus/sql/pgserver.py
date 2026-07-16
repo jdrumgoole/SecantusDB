@@ -319,6 +319,9 @@ class SecantusPGServer:
             return None
 
         session = Session(database=db, user=user, backend_pid=backend_pid)
+        # Bind the session to this connection thread's render context so
+        # to_pg_text can honour per-session GUCs (TimeZone) at output time.
+        typemap.set_render_session(session)
         session.notify_hub = self._notify
         session.activity_registry = self._activity
         session.prepared_xacts = self._prepared_xacts
@@ -473,7 +476,7 @@ class SecantusPGServer:
                 out += pgwire.empty_query_response()
             else:
                 for res in results:
-                    out += _render_result(res, session.wire_encoding)
+                    out += _render_result(res, session.wire_encoding, session)
         except errors.SQLError as exc:
             out += pgwire.error_response(exc.sqlstate, exc.message, encoding=session.wire_encoding)
         except Exception:  # pragma: no cover - defensive
@@ -600,10 +603,15 @@ class SecantusPGServer:
         self.stop()
 
 
-def _render_result(res: Any, encoding: str | None = "utf-8") -> bytes:
+def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None) -> bytes:
     """Serialise one ``SQLResult`` to its backend messages."""
     out = bytearray()
-    for name, value in res.parameter_status:
+    status = list(res.parameter_status)
+    if session is not None and session.pending_parameter_status:
+        # Reportable GUCs changed mid-statement by set_config().
+        status += session.pending_parameter_status
+        session.pending_parameter_status = []
+    for name, value in status:
         out += pgwire.parameter_status(name, value)
     if res.columns or res.command_tag.startswith("SELECT"):
         out += pgwire.row_description([(c.name, c.pg_oid) for c in res.columns])

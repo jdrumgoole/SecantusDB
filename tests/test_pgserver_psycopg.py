@@ -811,3 +811,54 @@ def test_enum_cast_and_param_validation(server):
         register_enum(other, conn, Mood)  # deliberately wrong mapping
         with pytest.raises(psycopg.errors.DataError):
             conn.execute("SELECT %s", [Mood.ok])
+
+
+def test_jsonb_roundtrip_and_navigation(server):
+    """jsonb values parse at ingress: a cast or Json/Jsonb-wrapped parameter
+    loads back as a Python dict/list (not double-encoded text), ``->>``
+    navigates it, and 22P02 surfaces for malformed json."""
+    from psycopg.types.json import Json, Jsonb
+
+    with connect(server, autocommit=True) as conn:
+        assert conn.execute("""select '{"a": 100}'::jsonb""").fetchone() == ({"a": 100},)
+        assert conn.execute("""select '{"foo":"bar"}'::jsonb ->> 'foo'""").fetchone() == ("bar",)
+        for wrapper in (Json, Jsonb):
+            got = conn.execute("select %s", [wrapper({"foo": "bar"})]).fetchone()[0]
+            assert got == {"foo": "bar"}
+        assert conn.execute("select %s::jsonb", ["[1, 2]"]).fetchone() == ([1, 2],)
+        with pytest.raises(psycopg.errors.DataError):
+            conn.execute("select 'nope'::json")
+
+
+def test_datetime_session_gucs_over_wire(server):
+    """TimeZone governs timestamptz input/output; DateStyle reformats date and
+    timestamp text; set_config on a reportable GUC emits ParameterStatus."""
+    with connect(server, autocommit=True) as conn:
+        conn.execute("set timezone to '-02:00'")  # POSIX: UTC+2
+        got = conn.execute("select '2000-01-01'::timestamptz").fetchone()[0]
+        assert got == _dt.datetime(1999, 12, 31, 22, tzinfo=_dt.timezone.utc)
+
+        conn.execute("set datestyle = German, YMD")
+        assert conn.pgconn.parameter_status(b"DateStyle") == b"German, YMD"
+        assert conn.execute("select '2000-01-02'::date").fetchone()[0] == _dt.date(2000, 1, 2)
+
+        conn.execute("select set_config('TimeZone', 'UTC', false)")
+        assert conn.pgconn.parameter_status(b"TimeZone") == b"UTC"
+
+
+def test_temporal_params_keep_their_type(server):
+    """A bound datetime/interval/date parameter compares equal to the same value
+    written as a cast literal (it used to substitute as bare text and silently
+    compare false)."""
+    with connect(server, autocommit=True) as conn:
+        when = _dt.datetime(2000, 1, 2, 3, 4, 5, 6)
+        assert conn.execute(
+            "select '2000-01-02 03:04:05.000006'::timestamp = %s", [when]
+        ).fetchone() == (True,)
+        assert conn.execute(
+            "select '1 day'::interval = %s", [_dt.timedelta(days=1)]
+        ).fetchone() == (True,)
+        assert conn.execute(
+            "select '2020-05-06'::date + 1 = %s", [_dt.date(2020, 5, 7)]
+        ).fetchone() == (True,)
+        assert conn.execute("select '1 sec'::interval").fetchone() == (_dt.timedelta(seconds=1),)

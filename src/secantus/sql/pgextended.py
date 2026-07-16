@@ -115,13 +115,14 @@ def _decode_timetz(b: bytes) -> str:
     return f"{_micros_to_time_text(micros)}{sign}{oh:02d}:{om:02d}"
 
 
-def _decode_interval(b: bytes) -> str:
-    """Binary ``interval`` — (micros int64, days int32, months int32) → the PG
-    text form, which rides the existing interval text parser."""
+def _decode_interval(b: bytes) -> dict:
+    """Binary ``interval`` — (micros int64, days int32, months int32) → the
+    interval subdocument (the typed value casts and arithmetic compare against;
+    the old text form silently compared str vs subdoc → always false)."""
     from secantus.sql import intervals as _intervals
 
     micros, days, months = struct.unpack("!qii", b)
-    return _intervals.render(_intervals.make(months, days, micros))
+    return _intervals.make(months, days, micros)
 
 
 def _decode_inet(b: bytes) -> str:
@@ -140,8 +141,9 @@ def _decode_uuid(b: bytes) -> str:
 
 
 def _decode_jsonb(b: bytes) -> str:
-    """Binary ``jsonb`` — a 1-byte version header, then JSON text."""
-    return bytes(b[1:]).decode("utf-8")
+    """Binary ``jsonb`` — a 1-byte version header, then JSON text. Wrapped as
+    ``JsonText`` so substitution casts it back to a parsed JSON value."""
+    return typemap.JsonText(bytes(b[1:]).decode("utf-8"))
 
 
 # Range/multirange binary flags (Postgres' rangetypes.h).
@@ -216,7 +218,7 @@ _BINARY = {
     23: lambda b: struct.unpack("!i", b)[0],  # int4
     25: lambda b: b.decode("utf-8"),  # text
     26: lambda b: struct.unpack("!I", b)[0],  # oid (unsigned)
-    114: lambda b: b.decode("utf-8"),  # json — binary form is the text
+    114: lambda b: typemap.JsonText(b.decode("utf-8")),  # json — binary form is the text
     700: lambda b: struct.unpack("!f", b)[0],  # float4
     701: lambda b: struct.unpack("!d", b)[0],  # float8
     829: _decode_macaddr,  # macaddr
@@ -246,21 +248,44 @@ _BINARY.update(
 
 def _encode_timestamptz(value: Any) -> bytes:
     if isinstance(value, str):
+        from secantus.sql.datetimes import (
+            datetime_sentinel,
+            parse_iso_datetime,
+            wide_timestamp_micros,
+            wide_timestamp_text,
+        )
+
+        # ``infinity`` / ``-infinity`` map onto PG's int64 wire sentinels.
+        sentinel = datetime_sentinel(value)
+        if sentinel is not None:
+            return struct.pack("!q", 2**63 - 1 if sentinel == "infinity" else -(2**63))
+        # A PG-valid timestamp beyond Python's datetime range travels as text;
+        # its binary form is the true out-of-range instant (proleptic math).
+        if wide_timestamp_text(value) is not None:
+            return struct.pack("!q", wide_timestamp_micros(value))
         # Timestamps can reach the encoder as ISO text (a text-format parameter
         # bound to a timestamp-typed column); parse rather than silently sending
         # text bytes in a field the client will parse as binary.
-        from secantus.sql.datetimes import parse_iso_datetime
-
         value = parse_iso_datetime(value)
     if not isinstance(value, _dt.datetime):
         return str(value).encode("utf-8")
     if value.tzinfo is None:
         value = value.replace(tzinfo=_dt.timezone.utc)
-    return struct.pack("!q", round((value - _PG_EPOCH).total_seconds() * 1_000_000))
+    # Integer microsecond arithmetic — float total_seconds() loses µs precision
+    # ~8000 years out, nudging 9999-12-31 23:59:59.999999 across the year-10K
+    # boundary that clients reject.
+    return struct.pack("!q", (value - _PG_EPOCH) // _dt.timedelta(microseconds=1))
 
 
 def _encode_date(value: Any) -> bytes:
     if isinstance(value, str):
+        from secantus.sql.datetimes import datetime_sentinel, wide_date_days, wide_timestamp_text
+
+        sentinel = datetime_sentinel(value)
+        if sentinel is not None:
+            return struct.pack("!i", 2**31 - 1 if sentinel == "infinity" else -(2**31))
+        if wide_timestamp_text(value) is not None:
+            return struct.pack("!i", wide_date_days(value))
         # A ``date`` is *stored* as its canonical ``YYYY-MM-DD`` text.
         value = _dt.date.fromisoformat(value.strip()[:10])
     if isinstance(value, _dt.datetime):
@@ -576,6 +601,37 @@ def _reject_nul(text: str) -> str:
 # param IS an integer, exactly like its binary twin), so the common unambiguous
 # scalars convert here — leaving the str through makes ``$1`` compare and encode
 # as text while the RowDescription/Describe machinery reports the declared OID.
+def _text_param_timestamp(tag: str):
+    def conv(s: str) -> Any:
+        return typemap.coerce(s, tag)
+
+    return conv
+
+
+def _text_param_interval(s: str) -> Any:
+    from secantus.sql import intervals as _intervals
+
+    return _intervals.parse(s)
+
+
+def _text_param_date(s: str) -> Any:
+    from secantus.sql import datetimes as _datetimes
+
+    return typemap.DateText(_datetimes.parse_date(s))
+
+
+def _text_param_time(s: str) -> Any:
+    from secantus.sql import datetimes as _datetimes
+
+    return typemap.TimeText(_datetimes.parse_time(s))
+
+
+def _text_param_timetz(s: str) -> Any:
+    from secantus.sql import datetimes as _datetimes
+
+    return typemap.TimeTzText(_datetimes.parse_timetz(s))
+
+
 _TEXT_PARAM = {
     16: lambda s: s.strip().lower() in ("t", "true", "y", "yes", "on", "1"),  # bool
     20: int,  # int8
@@ -585,6 +641,15 @@ _TEXT_PARAM = {
     700: float,  # float4
     701: float,  # float8
     1700: Decimal,  # numeric
+    # Temporal params: the declared type governs the value regardless of wire
+    # format — left as raw text, ``'lit'::timestamp = $1`` compares datetime vs
+    # str and is silently false.
+    1082: _text_param_date,  # date -> canonical text (dates are stored as text)
+    1083: _text_param_time,  # time -> canonical text
+    1114: _text_param_timestamp("timestamp"),  # -> naive datetime
+    1184: _text_param_timestamp("timestamptz"),  # -> aware datetime
+    1186: _text_param_interval,  # -> interval subdoc
+    1266: _text_param_timetz,  # timetz -> canonical text
 }
 
 
@@ -593,6 +658,10 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
         return None
     if fmt == 0:  # text
         text = _reject_nul(pgwire.decode_text(raw, encoding))
+        if oid in (114, 3802):
+            # A json/jsonb-declared text param — mark it so substitution casts
+            # it into a parsed JSON value instead of leaving raw text.
+            return typemap.JsonText(text)
         conv = _TEXT_PARAM.get(oid)
         if conv is None:
             return text
@@ -788,7 +857,11 @@ class ExtendedSession:
             portal.offset = 0
         res = portal.result
         out = bytearray()
-        for pname, pvalue in res.parameter_status:
+        status = list(res.parameter_status)
+        if self.session.pending_parameter_status:
+            status += self.session.pending_parameter_status
+            self.session.pending_parameter_status = []
+        for pname, pvalue in status:
             out += pgwire.parameter_status(pname, pvalue)
         if _is_row_returning(res):
             rows = res.rows

@@ -3871,7 +3871,7 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
         inner = item.this if isinstance(item, exp.SetItem) else item
         if not isinstance(inner, exp.EQ):
             raise errors.feature_not_supported(f"unsupported SET item: {item.sql()}")
-        name = inner.this.name
+        name = sql_session.canonical_guc_name(inner.this.name)
         value_node = inner.expression
         if isinstance(value_node, exp.Literal):
             value = value_node.this
@@ -3983,6 +3983,15 @@ def _run_authorization_command(verb: str, tail: str, session: Session) -> SQLRes
     return None
 
 
+# ``name = value[, value…]`` / ``name TO value[, value…]`` — the Command-fallback
+# SET tail (multi-part values like ``datestyle = German, YMD``). Excludes the
+# SESSION CHARACTERISTICS / TRANSACTION forms, which stay no-ops.
+_SET_MULTI_RE = re.compile(
+    r"(?is)^(?!session\s+characteristics|transaction\b)"
+    r'([A-Za-z_][\w.]*|"[^"]+")\s*(?:=|\bto\b)\s*(.+?)\s*;?\s*$'
+)
+
+
 def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
     verb = str(stmt.this).upper()
     arg = stmt.expression
@@ -4030,6 +4039,24 @@ def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
         reported = [(name, session.get_setting(name))] if name in REPORTABLE_GUCS else []
         return SQLResult(command_tag="RESET", parameter_status=reported)
     if verb == "SET":
+        # ``SET name = v1, v2`` (DateStyle's two-part value) parses as a raw
+        # Command, not exp.Set — store and report it like the structured path.
+        m_set = _SET_MULTI_RE.match(name)
+        if m_set is not None:
+            guc = sql_session.canonical_guc_name(m_set.group(1))
+            value = ", ".join(part.strip().strip("'\"") for part in m_set.group(2).split(","))
+            if guc == "client_encoding":
+                # Canonicalise like the structured SET path (utf-8/utf_8 → UTF8);
+                # ParameterStatus must echo the PG spelling.
+                canonical = sql_session.canonical_client_encoding(value)
+                if canonical is None:
+                    raise errors.SQLError(
+                        "22023", f'invalid value for parameter "client_encoding": "{value}"'
+                    )
+                value = canonical
+            session.settings[guc] = value
+            reported = [(guc, value)] if guc in REPORTABLE_GUCS else []
+            return SQLResult(command_tag="SET", parameter_status=reported)
         # SET SESSION CHARACTERISTICS AS TRANSACTION ... falls back to a Command;
         # accepted as a no-op (single-node — no isolation/read-only semantics).
         return SQLResult(command_tag="SET")

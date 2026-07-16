@@ -51,6 +51,9 @@ dev = [
     "anyio>=4.0",
     "pytest-cov>=3.0",
     "pytest-randomly>=3.5",
+    # psycopg's tests/test_typing.py shells out to a bare `mypy` (125 tests) —
+    # uv run puts .venv/bin on PATH, so carrying mypy here makes them count.
+    "mypy>=1.14",
     "invoke>=2.2",
     # Pinned exactly: ruff's formatter output changes between releases, so an
     # unpinned floor let CI silently pull a newer ruff that reformatted an

@@ -92,8 +92,20 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
     if name == "set_config":
         if len(args) < 2:
             raise errors.syntax_error("set_config() requires (name, value, is_local)")
-        session.settings[str(args[0])] = "" if args[1] is None else str(args[1])
-        return ("set_config", session.settings[str(args[0])], "text")
+        from secantus.sql.session import (
+            REPORTABLE_GUCS,
+            canonical_client_encoding,
+            canonical_guc_name,
+        )
+
+        guc = canonical_guc_name(str(args[0]))
+        value = "" if args[1] is None else str(args[1])
+        if guc == "client_encoding":
+            value = canonical_client_encoding(value) or value
+        session.settings[guc] = value
+        if guc in REPORTABLE_GUCS:
+            session.pending_parameter_status.append((guc, session.settings[guc]))
+        return ("set_config", session.settings[guc], "text")
     if name == "pg_backend_pid":
         return ("pg_backend_pid", session.backend_pid, "int4")
     if name in ("pg_is_in_recovery",):

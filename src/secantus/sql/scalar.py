@@ -56,6 +56,55 @@ _OID_TO_TYPENAME: dict[int, str] = {
 }
 
 
+_ESTRING_SIMPLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _unescape_estring(raw: str) -> str:
+    """Decode a Postgres ``E'…'`` escape string: ``\\n``-style controls, 1-3
+    digit octal, ``\\xHH`` hex, ``\\uXXXX`` / ``\\UXXXXXXXX`` unicode; any other
+    escaped character stands for itself (``\\\\`` -> ``\\``, ``\\'`` -> ``'``)."""
+    out: list[str] = []
+    i, n = 0, len(raw)
+    while i < n:
+        c = raw[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = raw[i + 1]
+        if nxt in _ESTRING_SIMPLE:
+            out.append(_ESTRING_SIMPLE[nxt])
+            i += 2
+        elif nxt in "01234567":
+            j = i + 1
+            while j < min(i + 4, n) and raw[j] in "01234567":
+                j += 1
+            out.append(chr(int(raw[i + 1 : j], 8)))
+            i = j
+        elif nxt in "xX":
+            j = i + 2
+            while j < min(i + 4, n) and raw[j] in "0123456789abcdefABCDEF":
+                j += 1
+            if j == i + 2:
+                out.append(nxt)
+                i += 2
+            else:
+                out.append(chr(int(raw[i + 2 : j], 16)))
+                i = j
+        elif nxt in "uU":
+            width = 4 if nxt == "u" else 8
+            digits = raw[i + 2 : i + 2 + width]
+            if len(digits) == width and all(d in "0123456789abcdefABCDEF" for d in digits):
+                out.append(chr(int(digits, 16)))
+                i += 2 + width
+            else:
+                raise errors.SQLError("22025", "invalid Unicode escape value")
+        else:
+            out.append(nxt)
+            i += 2
+    return "".join(out)
+
+
 def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     """Evaluate a scalar expression node to a Python value."""
     if isinstance(node, exp.Paren):
@@ -77,6 +126,10 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return float(text) if ("." in text or "e" in text.lower()) else int(text)
     if isinstance(node, exp.BitString):  # ``B'1010'`` -> the '0'/'1' string
         return str(node.this)
+    if isinstance(node, exp.ByteString):
+        # ``E'…'`` escape-string literal (psycopg's sql.Literal emits it for any
+        # string containing a backslash) — sqlglot keeps the escapes raw.
+        return _unescape_estring(str(node.this))
     if isinstance(node, exp.Neg):
         v = evaluate(node.this, scope, ctx)
         if v is None:
@@ -1193,6 +1246,26 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
     if left is None or right is None:
         return None  # three-valued logic: comparison with NULL is unknown
     left, right = _unwrap_decimal(left), _unwrap_decimal(right)
+    from secantus.sql import intervals as _intervals
+
+    if _intervals.is_interval(left) and _intervals.is_interval(right):
+        # Postgres compares intervals by justified duration (1 month = 30 days,
+        # 1 day = 24h): ``-1 day +23:59:59.999999`` equals ``-0.000001 s`` even
+        # though the field triples differ.
+        left = _intervals.total_micros(left)
+        right = _intervals.total_micros(right)
+    if (
+        isinstance(left, _dt.datetime)
+        and isinstance(right, _dt.datetime)
+        and (left.tzinfo is None) != (right.tzinfo is None)
+    ):
+        # A stored/converted timestamptz is tz-naive UTC by convention; a bound
+        # parameter arrives tz-aware. Mixed naive/aware compares as the same
+        # UTC instant instead of Python's always-unequal (==) / TypeError (<).
+        if left.tzinfo is None:
+            left = left.replace(tzinfo=_dt.timezone.utc)
+        else:
+            right = right.replace(tzinfo=_dt.timezone.utc)
     if isinstance(node, exp.EQ):
         return left == right
     if isinstance(node, exp.NEQ):
@@ -1375,6 +1448,33 @@ def enum_array_cast_element(
     return enum_cast_target(inner[0], ctx) if inner else None
 
 
+def _array_elem_render_tag(node: exp.Expression, value: list) -> str:
+    """Element tag for rendering ``array[…]::text`` — ``json`` when the array
+    constructor's elements are json expressions (``array[%s::jsonb]``), so a
+    JSON true / "str" / null element renders as its JSON text, else inferred
+    from the Python element values."""
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if (
+        isinstance(node, exp.Array)
+        and node.expressions
+        and all(_yields_json(e) for e in node.expressions)
+    ):
+        return "json"
+    return typemap.infer_elem_tag(value)
+
+
+def _yields_json(node: exp.Expression) -> bool:
+    """Whether an expression statically yields a json value — a ``::json/jsonb``
+    cast or ``->``-style navigation. Drives ``::text`` rendering (JSON text vs
+    array_out literal) for structured values."""
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Cast):
+        return typemap.type_tag_for_sql(node.to) == "json"
+    return isinstance(node, _JSONB_NAV)
+
+
 def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
     # ``'ok'::mood`` — a cast to a declared enum validates the label (22P02) and
@@ -1433,6 +1533,17 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             raise errors.SQLError(
                 "22P02", f'invalid input syntax for type oid: "{value}"'
             ) from None
+    if value is not None and to_tag_early == "json":
+        # ``'{"a":1}'::jsonb`` parses into a real JSON value so ``->`` navigation
+        # and rendering see a dict/list, not raw text (which would double-encode).
+        if isinstance(value, (dict, list, bool, int, float)):
+            return value
+        try:
+            return typemap.coerce(value, "json")
+        except ValueError as e:
+            raise errors.SQLError(
+                "22P02", f"invalid input syntax for type json: {str(value)[:80]!r}"
+            ) from e
     if value is not None and to_tag_early == "interval":
         from secantus.sql import intervals as _intervals
 
@@ -1464,11 +1575,19 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     if value is not None and to_tag_early in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes
 
-        if to_tag_early == "date":
-            return _datetimes.parse_date(value)
-        if to_tag_early == "time":
-            return _datetimes.parse_time(value)
-        return _datetimes.parse_timetz(value)
+        try:
+            if to_tag_early == "date":
+                return _datetimes.parse_date(value)
+            if to_tag_early == "time":
+                return _datetimes.parse_time(value)
+            return _datetimes.parse_timetz(
+                value,
+                _datetimes.session_offset_text(ctx.session) if ctx is not None else "+00:00",
+            )
+        except _datetimes.DateTimeError as e:
+            raise errors.SQLError(
+                "22007", f'invalid input syntax for type {to_tag_early}: "{value}"'
+            ) from e
     # ``timestamp '2020-01-31'`` / ``timestamptz '…'`` -> a real datetime so
     # interval and date arithmetic land on a temporal value rather than a bare
     # string. ``timestamp`` is naive (any offset dropped); ``timestamptz`` keeps
@@ -1480,9 +1599,32 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             return value
         if not isinstance(value, _dt.date):
             try:
-                return typemap.coerce(value, to_tag_early)
-            except ValueError:
-                return value
+                result = typemap.coerce(value, to_tag_early)
+                if (
+                    to_tag_early == "timestamptz"
+                    and isinstance(result, _dt.datetime)
+                    and result.tzinfo is None
+                ):
+                    # An offset-less timestamptz literal is wall-clock in the
+                    # session's TimeZone GUC, like a real server.
+                    from secantus.sql import datetimes as _datetimes
+
+                    tz = _datetimes.session_tzinfo(ctx.session if ctx else None)
+                    if tz != _dt.timezone.utc:
+                        result = (
+                            result.replace(tzinfo=tz)
+                            .astimezone(_dt.timezone.utc)
+                            .replace(tzinfo=None)
+                        )
+                return result
+            except ValueError as e:
+                # PG errors on an unparseable timestamp literal; silently
+                # passing the raw string through detonates later in the binary
+                # encoder with an internal error.
+                raise errors.SQLError(
+                    "22007",
+                    f'invalid input syntax for type {to_tag_early}: "{value}"',
+                ) from e
     if (
         value is not None
         and (
@@ -1526,6 +1668,40 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         "bool",
     ):
         return _cast_scalar(value, to_tag)
+    # ``ts::text`` renders through the session-aware datetime renderer (TimeZone
+    # / DateStyle GUCs), like PG's timestamp_out — not raw isoformat.
+    if to_tag == "text" and isinstance(value, _dt.datetime):
+        inner = node.this
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        inner_tag = typemap.type_tag_for_sql(inner.to) if isinstance(inner, exp.Cast) else None
+        tag_for = (
+            inner_tag
+            if inner_tag in ("timestamp", "timestamptz")
+            else ("timestamptz" if value.tzinfo is not None else "timestamp")
+        )
+        rendered = typemap.to_pg_text(value, tag_for)
+        return rendered.decode("utf-8") if rendered is not None else None
+    # ``expr::text`` of a structured value: a JSON value renders as JSON text,
+    # an array value as Postgres' array_out literal (``{a,b}``) — so both
+    # compare equal to a client-dumped parameter's text form.
+    if to_tag == "text" and isinstance(value, (dict, list)):
+        if _yields_json(node.this):
+            return typemap._render_json(value)
+        if isinstance(value, list):
+            return typemap._render_pg_array(value, _array_elem_render_tag(node.this, value))
+    if to_tag == "text" and value is None:
+        # ``'null'::jsonb::text`` — a parsed JSON null (not an SQL NULL literal)
+        # renders as the text ``null``.
+        inner = node.this
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        if (
+            isinstance(inner, exp.Cast)
+            and typemap.type_tag_for_sql(inner.to) == "json"
+            and not isinstance(inner.this, exp.Null)
+        ):
+            return "null"
     # Otherwise we don't model regclass/oid identity types; evaluating the inner
     # value is enough for the catalog queries that use casts (compared / discarded,
     # never round-tripped through a real type).
