@@ -100,3 +100,4 @@ crates/secantus-server-py/Cargo.lock
 # Playwright MCP browser-session artefacts — Claude sessions write them to repo
 # root when capturing screenshots / DOM dumps. Always untracked, never shipped.
 .playwright-mcp/
+docs-rust/_build/
