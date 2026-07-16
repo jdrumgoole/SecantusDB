@@ -114,6 +114,13 @@ sql = [
     "sqlglot>=25",
 ]
 
+[project.urls]
+Homepage = "https://secantusdb.com/"
+Documentation = "https://secantusdb.com/docs/index.html"
+"Rust server docs" = "https://secantusdb.com/docs/rust/index.html"
+Repository = "https://github.com/jdrumgoole/SecantusDB"
+Changelog = "https://secantusdb.com/docs/changelog.html"
+
 [project.scripts]
 # Daemon naming: `secantusd-<engine>[-<protocol>]`. `-d` signals a daemon
 # (like `mongod`); the engine tag (`-py` / `-rs`) disambiguates the Python and

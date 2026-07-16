@@ -1314,9 +1314,9 @@ def release_prepare(c: Context, version: str) -> None:
     Release. Fits comfortably in 5–7 min on a quiet machine. Sub-agents can run
     this in the foreground with the harness's default Bash timeout.
     Pushing the tag triggers the `Publish to PyPI` workflow
-    asynchronously; pushing main triggers the RTD `latest` build
-    asynchronously. Both finish independently of this task — wait for
-    them via ``release-finalize``.
+    asynchronously — wait for it via ``release-finalize``. Docs are
+    self-hosted at https://secantusdb.com/docs/ and deploy with the
+    post-release website publish (see the secantusdb-release skill).
 
     Pre-flight requirements (all enforced):
       - On `main` branch.
@@ -1325,10 +1325,6 @@ def release_prepare(c: Context, version: str) -> None:
         tolerated; everything else rejects).
       - HEAD == origin/main (no unpushed commits).
       - Tag `vX.Y.Z` not already on origin.
-      - `READTHEDOCS_TOKEN` available — exported or in `.env` (this
-        phase doesn't use the token, but rejecting now means we don't
-        push a release and then discover the token is missing in
-        finalize).
 
     Pipeline:
       1. Full default test suite (`pytest` parallel, perf-excluded).
@@ -1337,38 +1333,33 @@ def release_prepare(c: Context, version: str) -> None:
       4. Commit, annotate-tag, push commit + tag (combined push).
       5. Create a GitHub Release for `vX.Y.Z` with auto-generated
          notes (marked pre-release for `aN`/`bN`/`rcN` versions).
-      6. Activate the RTD `vX.Y.Z` slug (best-effort) so its build
-         runs concurrent with the GitHub `Publish to PyPI` workflow
-         rather than after it. Failure here is non-fatal; finalize
-         retries the activation idempotently.
     """
     if not _VERSION_RE.match(version):
         raise SystemExit(f"version {version!r} doesn't match X.Y.Z[aN|bN|rcN]")
     _ensure_main_branch_clean()
     _ensure_in_sync_with_origin()
     _ensure_tag_unused(version)
-    _ensure_rtd_token()
 
-    print("==> [1/7] Full default test suite")
+    print("==> [1/6] Full default test suite")
     c.run("uv run python -m pytest", pty=True)
-    print("==> [2/7] Perf regression gates")
+    print("==> [2/6] Perf regression gates")
     c.run(
         "uv run python -m pytest -p no:xdist -o addopts= -m perf tests/test_perf_regression.py",
         pty=True,
     )
 
-    print("==> [3/7] Collating changelog fragments")
+    print("==> [3/6] Collating changelog fragments")
     from changelog.fragments import collate
 
     folded = collate()
     for p in folded:
         print(f"    folded {p}")
 
-    print(f"==> [4/7] Bumping version files to {version}")
+    print(f"==> [4/6] Bumping version files to {version}")
     _bump_version_files(version)
     c.run("uv lock", pty=True)
 
-    print(f"==> [5/7] Committing + tagging v{version}")
+    print(f"==> [5/6] Committing + tagging v{version}")
     c.run(
         "git add pyproject.toml src/secantus/__init__.py uv.lock docs/changelog.md changelog.d",
         pty=True,
@@ -1389,7 +1380,7 @@ def release_prepare(c: Context, version: str) -> None:
     # depends on the order of branch-then-tag.
     c.run(f"git push origin main v{version}", pty=True)
 
-    print(f"==> [6/7] Creating GitHub Release v{version}")
+    print(f"==> [6/6] Creating GitHub Release v{version}")
     # Pre-release if the version has an `aN` / `bN` / `rcN` suffix.
     is_prerelease = bool(re.search(r"[abc]\d+$|rc\d+$", version))
     cmd = (
@@ -1402,21 +1393,10 @@ def release_prepare(c: Context, version: str) -> None:
         cmd += " --prerelease"
     c.run(cmd, pty=True)
 
-    # Activate the RTD slug as early as possible so its build runs
-    # concurrent with the GitHub `Publish to PyPI` workflow rather
-    # than after it. Best-effort: if the RTD API errors here, finalize
-    # will retry — better to push the release than to abort prepare
-    # over a transient RTD blip.
-    print(f"==> [7/7] Activating RTD `v{version}` slug for early build")
-    try:
-        _activate_rtd_version(version, _ensure_rtd_token())
-    except SystemExit as e:
-        print(f"    warning: RTD activate failed in prepare ({e}); finalize will retry")
-
     print(
-        f"\nv{version} prepared, tag pushed, GitHub Release created, RTD build queued.\n"
+        f"\nv{version} prepared, tag pushed, GitHub Release created.\n"
         f"Run `invoke release-finalize {version}` next to wait for the\n"
-        f"publish workflow + PyPI + RTD propagation."
+        f"publish workflow + PyPI propagation."
     )
 
 
@@ -1424,52 +1404,38 @@ def release_prepare(c: Context, version: str) -> None:
 def release_finalize(c: Context, version: str) -> None:
     """Phase 2 of the release.
 
-    Poll publish workflow → PyPI → RTD `latest` → activate `vX.Y.Z`
-    slug → poll its build → PATCH RTD `default_version`.
+    Poll publish workflow → PyPI.
 
-    Polling can run for 15–25 min in the worst case (publish workflow
-    builds wheels for cp310-cp313 across 4 platforms; RTD compiles
-    WiredTiger from source twice — once for `latest`, once for the
-    tag). Sub-agents must call this with ``run_in_background=true``
-    on the Bash invocation to escape the harness's 10-min per-call
-    cap; foreground in a developer's shell is fine.
+    Polling can run for 15–25 min in the worst case (the publish
+    workflow builds wheels for cp310-cp313 across 4 platforms).
+    Sub-agents must call this with ``run_in_background=true`` on the
+    Bash invocation to escape the harness's 10-min per-call cap;
+    foreground in a developer's shell is fine. Docs are self-hosted
+    at https://secantusdb.com/docs/ and ship via the post-release
+    website publish, not here.
 
     Idempotent: every step short-circuits if the desired state is
     already true (publish workflow already concluded, PyPI already
-    lists the version, RTD build already finished, version already
-    active, `default_version` already set). Safe to re-run after any
-    timeout or interruption.
+    lists the version). Safe to re-run after any timeout or
+    interruption.
 
     Pre-flight requirements:
       - Tag `vX.Y.Z` exists on origin (the prepare phase pushed it).
-      - `READTHEDOCS_TOKEN` available.
 
     Pipeline:
-      6. Wait for GitHub `Publish to PyPI` workflow to succeed.
-      7. Wait for PyPI to list the new version.
-      8. Wait for RTD `latest` to publish a successful build of the
-         release commit.
-      9. Activate the `vX.Y.Z` slug on RTD and wait for its build.
-     10. Set RTD's `default_version` to `vX.Y.Z`.
+      7. Wait for GitHub `Publish to PyPI` workflow to succeed.
+      8. Wait for PyPI to list the new version.
     """
     if not _VERSION_RE.match(version):
         raise SystemExit(f"version {version!r} doesn't match X.Y.Z[aN|bN|rcN]")
-    rtd_token = _ensure_rtd_token()
     commit = _resolve_tag_commit(version)
 
-    print(f"==> [6/10] Waiting for GitHub `Publish to PyPI` workflow (commit {commit[:7]})")
+    print(f"==> [7/8] Waiting for GitHub `Publish to PyPI` workflow (commit {commit[:7]})")
     _wait_for_publish_workflow(commit)
-    print(f"==> [7/10] Waiting for PyPI to list {version}")
+    print(f"==> [8/8] Waiting for PyPI to list {version}")
     _wait_for_pypi_version(version)
-    print(f"==> [8/10] Waiting for RTD `latest` to build commit {commit[:7]}")
-    _wait_for_rtd_build(commit)
-    print(f"==> [9/10] Activating + building RTD `v{version}`")
-    _activate_rtd_version(version, rtd_token)
-    _wait_for_rtd_tag_build(version, rtd_token)
-    print(f"==> [10/10] Setting RTD `default_version` to `v{version}`")
-    _set_rtd_default_version(version, rtd_token)
 
-    print(f"\nv{version} released; GitHub Release, PyPI, and RTD up to date.")
+    print(f"\nv{version} released; GitHub Release and PyPI up to date.")
 
 
 def _resolve_tag_commit(version: str) -> str:
@@ -1650,172 +1616,3 @@ def _wait_for_pypi_version(version: str, *, timeout_s: int = 600) -> None:
     raise SystemExit(f"timed out after {timeout_s}s waiting for PyPI to list {version}")
 
 
-def _wait_for_rtd_build(commit: str, *, timeout_s: int = 900) -> None:
-    url = "https://readthedocs.org/api/v3/projects/secantusdb/builds/?limit=5"
-    deadline = time.monotonic() + timeout_s
-    last = ""
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                data = json.load(resp)
-        except Exception as e:
-            print(f"    RTD API error: {e}; retrying")
-            time.sleep(30)
-            continue
-        match = next(
-            (b for b in data.get("results", []) if (b.get("commit") or "").startswith(commit[:12])),
-            None,
-        )
-        if match is None:
-            line = f"    no RTD build found for {commit[:7]} yet; waiting"
-        else:
-            state = match["state"]["code"]
-            success = match.get("success")
-            line = f"    build {match['id']}: state={state} success={success}"
-            if state == "finished":
-                if success:
-                    print(line)
-                    return
-                raise SystemExit(f"RTD build {match['id']} for {commit[:7]} failed")
-        if line != last:
-            print(line)
-            last = line
-        time.sleep(30)
-    raise SystemExit(f"timed out after {timeout_s}s waiting for RTD build of {commit[:7]}")
-
-
-_RTD_PROJECT_API = "https://readthedocs.org/api/v3/projects/secantusdb"
-
-
-def _ensure_rtd_token() -> str:
-    """Pre-flight: require READTHEDOCS_TOKEN so the post-publish RTD admin
-    operations (activate version, set default_version) can run.
-
-    Resolution order:
-      1. ``READTHEDOCS_TOKEN`` already in the process env (e.g. set in
-         the user's shell rc).
-      2. ``READTHEDOCS_TOKEN=…`` line in a project-root ``.env`` file
-         (gitignored). This is the recommended on-disk store.
-    """
-    token = os.environ.get("READTHEDOCS_TOKEN")
-    if not token:
-        token = _read_dotenv_var("READTHEDOCS_TOKEN")
-    if not token:
-        raise SystemExit(
-            "READTHEDOCS_TOKEN is required for the release task — without it,\n"
-            "RTD's default version stays pinned to whatever it was before this\n"
-            "release. Mint one (read+write) at\n"
-            "    https://app.readthedocs.org/accounts/tokens/\n"
-            "and either export it in your shell or put `READTHEDOCS_TOKEN=…`\n"
-            "into a `.env` file at the repo root (which is gitignored)."
-        )
-    return token
-
-
-def _read_dotenv_var(key: str) -> str | None:
-    """Tiny ``.env`` parser: ``KEY=VALUE`` lines, optional surrounding
-    quotes, ``#`` comments. No interpolation, no exports — that would
-    duplicate python-dotenv for one variable."""
-    env_path = pathlib.Path(".env")
-    if not env_path.is_file():
-        return None
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        if k.strip() != key:
-            continue
-        v = v.strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-            v = v[1:-1]
-        return v or None
-    return None
-
-
-def _rtd_request(method: str, path: str, token: str, body: dict | None = None) -> dict:
-    """Issue a single RTD API v3 request and return the parsed JSON body.
-
-    `path` is appended to the project endpoint (e.g. ``""`` for the
-    project itself, ``"/versions/v0.3.0a4/"`` for a version). RTD
-    endpoints expect a trailing slash.
-    """
-    url = _RTD_PROJECT_API + path
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Token {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        payload = resp.read()
-    if not payload:
-        return {}
-    return json.loads(payload)
-
-
-def _activate_rtd_version(version: str, token: str) -> None:
-    """Set the `vX.Y.Z` slug to active so RTD builds it. RTD auto-queues
-    a build when a version flips to active=True."""
-    path = f"/versions/v{version}/"
-    try:
-        _rtd_request("PATCH", path, token, body={"active": True, "hidden": False})
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        raise SystemExit(
-            f"failed to activate RTD version v{version}: HTTP {e.code} {e.reason}\n{body}"
-        ) from e
-    print(f"    activated RTD version v{version}")
-
-
-def _wait_for_rtd_tag_build(version: str, token: str, *, timeout_s: int = 900) -> None:
-    """Poll RTD for the most recent build of the `vX.Y.Z` slug until it
-    finishes successfully. Activating a version triggers a build, but the
-    api may take a few seconds to register it — first iterations may
-    legitimately find nothing."""
-    deadline = time.monotonic() + timeout_s
-    last = ""
-    while time.monotonic() < deadline:
-        try:
-            data = _rtd_request("GET", f"/versions/v{version}/builds/?limit=1", token)
-        except Exception as e:
-            print(f"    RTD API error: {e}; retrying")
-            time.sleep(30)
-            continue
-        builds = data.get("results", [])
-        if not builds:
-            line = f"    no build for v{version} yet; waiting"
-        else:
-            b = builds[0]
-            state = b["state"]["code"]
-            success = b.get("success")
-            line = f"    v{version} build {b['id']}: state={state} success={success}"
-            if state == "finished":
-                if success:
-                    print(line)
-                    return
-                raise SystemExit(f"RTD build {b['id']} for v{version} failed")
-        if line != last:
-            print(line)
-            last = line
-        time.sleep(30)
-    raise SystemExit(f"timed out after {timeout_s}s waiting for RTD build of v{version}")
-
-
-def _set_rtd_default_version(version: str, token: str) -> None:
-    """PATCH the project's `default_version` so the bare RTD URL serves
-    `v{version}` rather than the previous default (typically `stable` or
-    `latest`)."""
-    try:
-        _rtd_request("PATCH", "/", token, body={"default_version": f"v{version}"})
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        raise SystemExit(
-            f"failed to set RTD default_version=v{version}: HTTP {e.code} {e.reason}\n{body}"
-        ) from e
-    print(f"    RTD default_version set to v{version}")

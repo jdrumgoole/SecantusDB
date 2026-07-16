@@ -9,7 +9,7 @@
 [![Tests: 584 passing](https://img.shields.io/badge/tests-584%20passing-brightgreen)](#)
 [![License: GPL-2.0-only (code) + CC-BY-4.0 (content)](https://img.shields.io/badge/license-GPL--2.0--only%20%2B%20CC--BY--4.0-blue)](#license)
 [![Python: 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![Documentation Status](https://readthedocs.org/projects/secantusdb/badge/?version=latest)](https://secantusdb.readthedocs.io/en/latest/)
+[![Documentation](https://img.shields.io/badge/docs-secantusdb.com-3b82f6)](https://secantusdb.com/docs/index.html)
 
 > [!WARNING]
 > **Beta software.** <a id="beta-software"></a>
@@ -70,7 +70,7 @@ Python, and a like-for-like benchmark currently has SecantusDB
 ~8×–46× slower per operation than mongod. CRUD reads sit near the
 lower end of that; bulk update / delete and aggregation sit at the
 upper end where Python loop overhead dominates. See
-[`docs/benchmark.md`](https://secantusdb.readthedocs.io/en/latest/benchmark.html) for current numbers and
+[`docs/benchmark.md`](https://secantusdb.com/docs/benchmark.html) for current numbers and
 methodology. The right use is tests, dev, embedded apps, and
 single-node prototypes where conformance + WT durability matter
 more than per-op latency.
@@ -95,7 +95,7 @@ the **MONGODB-X509** cert-as-username mechanism. Off by default; flip
 SCRAM on with `secantusd-py --auth` (or `SecantusDBServer(...,
 require_auth=True)`), provision users with `createUser`, then connect
 with the standard `MongoClient(uri, username=, password=)` shape. See
-[Authentication](https://secantusdb.readthedocs.io/en/latest/authentication.html). Authorization
+[Authentication](https://secantusdb.com/docs/authentication.html). Authorization
 (RBAC) is *not* enforced — an authenticated principal is currently
 treated as fully privileged — and LDAP / Kerberos / GSSAPI / AWS / OIDC
 auth mechanisms are out of scope.
@@ -136,7 +136,7 @@ written with `pymongo` is queryable as a SQL table with **no `CREATE TABLE`**
 (schema-on-read), nested documents surface as `jsonb` (`->`, `->>`, `#>`), and
 `BEGIN` / `COMMIT` / `ROLLBACK` are real transactions. Auth (SCRAM-SHA-256) and
 TLS work the same as on the Mongo side. See
-[SQL / PostgreSQL interface](https://secantusdb.readthedocs.io/en/latest/sql.html)
+[SQL / PostgreSQL interface](https://secantusdb.com/docs/sql.html)
 for the supported-SQL matrix and examples.
 
 ## Installation
@@ -174,7 +174,7 @@ needs three native build tools on `PATH`:
 | Fedora/RHEL | `sudo dnf install -y cmake ninja-build swig` |
 | Alpine | `apk add --no-cache cmake ninja swig build-base` |
 
-See [Installation](https://secantusdb.readthedocs.io/en/latest/installation.html) for dev-install instructions.
+See [Installation](https://secantusdb.com/docs/installation.html) for dev-install instructions.
 
 ### The Rust server (separate)
 
@@ -200,12 +200,12 @@ pip install "secantus[rust]"      # pulls the matching secantus-core wheel
 The Python server is the **conformance leader** and the default choice: it
 passes **99.2%** of pymongo's own test suite. The Rust server runs the same
 unmodified suite and currently passes **92.0%** — it's faster per operation
-(see [`docs/benchmark.md`](https://secantusdb.readthedocs.io/en/latest/benchmark.html)) but is
+(see [`docs/benchmark.md`](https://secantusdb.com/docs/benchmark.html)) but is
 still closing the gap. The features the Rust server doesn't support yet —
 `showExpandedEvents` DDL change events, large change-event splitting, read /
 write-concern semantics, timeseries `_id` non-uniqueness — and a side-by-side
 of when to pick each server are spelled out in
-[The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html).
+[The two servers](https://secantusdb.com/docs/servers.html).
 
 ## Standalone daemon (drop-in `mongod` replacement)
 
@@ -220,7 +220,7 @@ secantusd-py --host 127.0.0.1 --port 27017
 
 The same `pip install secantus` also puts the standalone **Rust** server on your
 `PATH` as `secantusd-rs` (same flags, same wire protocol; see
-[The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html)) —
+[The two servers](https://secantusdb.com/docs/servers.html)) —
 on Linux, macOS (Apple Silicon), and Windows. Intel-Mac wheels are pure-Python.
 
 Then point any MongoDB driver or tool at it — **no application code
@@ -238,13 +238,13 @@ client = MongoClient("mongodb://127.0.0.1:27017")  # same code as for mongod
 
 The conformance gauges back this up: the official driver test suites
 run **unmodified** against SecantusDB — see the
-[conformance validation summary](https://secantusdb.readthedocs.io/en/latest/validation-summary.html).
+[conformance validation summary](https://secantusdb.com/docs/validation-summary.html).
 
 ## Examples
 
 A walk through the operations a typical application exercises — connect,
 insert, index, query, drop. Full version with explanations: [examples in
-the docs](https://secantusdb.readthedocs.io/en/latest/examples.html).
+the docs](https://secantusdb.com/docs/examples.html).
 
 ```python
 from pymongo import MongoClient
@@ -299,19 +299,19 @@ with SecantusDBServer(port=0, storage_path=":memory:") as server:
 
 ## Documentation
 
-Full docs are on [Read the Docs](https://secantusdb.readthedocs.io/en/latest/).
+Full docs are at [secantusdb.com/docs](https://secantusdb.com/docs/index.html) — with the Rust server's own tree at [secantusdb.com/docs/rust](https://secantusdb.com/docs/rust/index.html).
 Highlights:
 
-- [Quickstart](https://secantusdb.readthedocs.io/en/latest/quickstart.html) — embedding in tests, running standalone.
-- [The two servers](https://secantusdb.readthedocs.io/en/latest/servers.html) — Python vs Rust server, which to use, and what each doesn't support yet.
-- [Architecture](https://secantusdb.readthedocs.io/en/latest/architecture.html) — the layered design.
-- [Indexes](https://secantusdb.readthedocs.io/en/latest/indexes.html) — what `find()` and `aggregate` accelerate,
+- [Quickstart](https://secantusdb.com/docs/quickstart.html) — embedding in tests, running standalone.
+- [The two servers](https://secantusdb.com/docs/servers.html) — Python vs Rust server, which to use, and what each doesn't support yet.
+- [Architecture](https://secantusdb.com/docs/architecture.html) — the layered design.
+- [Indexes](https://secantusdb.com/docs/indexes.html) — what `find()` and `aggregate` accelerate,
   `explain` semantics, hints, partial indexes, TTL.
-- [Aggregation](https://secantusdb.readthedocs.io/en/latest/aggregation.html) — supported pipeline stages and
+- [Aggregation](https://secantusdb.com/docs/aggregation.html) — supported pipeline stages and
   expression operators.
-- [Compatibility](https://secantusdb.readthedocs.io/en/latest/compatibility.html) — the divergences you should know
+- [Compatibility](https://secantusdb.com/docs/compatibility.html) — the divergences you should know
   about before you point an application at SecantusDB.
-- [Conformance validation](https://secantusdb.readthedocs.io/en/latest/validation-summary.html) — every
+- [Conformance validation](https://secantusdb.com/docs/validation-summary.html) — every
   supported driver's own test suite (pymongo, Go, Node, Java, Ruby,
   Rust, and the PHP library + extension) run **unmodified** against
   SecantusDB, with a cross-driver summary table and a per-driver report
