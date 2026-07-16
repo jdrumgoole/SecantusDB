@@ -40,5 +40,16 @@ myst_enable_extensions = [
 myst_heading_anchors = 4
 
 html_theme = "furo"
-html_title = f"SecantusDB Rust server {release}"
+html_title = f"SecantusDB Rust DB {release}"
+# The standard site banner, so the docs read as part of secantusdb.com.
+html_theme_options = {
+    "announcement": (
+        '<a href="https://secantusdb.com/"><strong>SecantusDB</strong></a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/python-db.html">Python DB</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/rust-db.html">Rust DB</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/blog.html">Blog</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/docs/index.html">Python docs</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/docs/rust/index.html">Rust docs</a>'
+    ),
+}
 html_static_path: list[str] = []

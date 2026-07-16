@@ -79,7 +79,18 @@ html_theme_options = {
             )
         }
         if _ON_RTD
-        else {}
+        # Self-hosted build: the standard site banner, so the docs read as
+        # part of secantusdb.com rather than a detached sub-site.
+        else {
+            "announcement": (
+                '<a href="https://secantusdb.com/"><strong>SecantusDB</strong></a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/python-db.html">Python DB</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/rust-db.html">Rust DB</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/blog.html">Blog</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/docs/index.html">Python docs</a> &nbsp;·&nbsp; '
+                '<a href="https://secantusdb.com/docs/rust/index.html">Rust docs</a>'
+            )
+        }
     ),
     "light_logo": "wordmark-horizontal.svg",
     "dark_logo": "wordmark-horizontal-on-dark.svg",
