@@ -61,6 +61,40 @@ cursor batches, careful checkpoint coordination). SecantusDB doesn't
 have that scheduler — and writing one isn't a SecantusDB project; it
 would essentially be re-implementing `mongod`.
 
+### End-to-end: both servers vs mongod
+
+Measured 2026-07-17 with the three-server harness
+(`uv run python -m bench.concurrency --server all --writers 1,2,4,8`):
+N writer processes, each streaming `insert_many` batches through
+`pymongo` for 30 s against its own collection, all three servers on
+on-disk WiredTiger.
+
+| N writers | Python server (docs/s) | Rust server (docs/s) | mongod (docs/s) |
+|---|---:|---:|---:|
+| 1 | 2,900 | 3,526 | 108,625 |
+| 2 | 893 | 1,777 | 199,810 |
+| 4 | 460 | 1,803 | 353,942 |
+| 8 | 500 | 1,876 | 448,989 |
+
+Three different shapes:
+
+- **mongod scales** — 4.1× its own single-writer aggregate at N=8. That's
+  the C++ scheduler above WT doing its job.
+- **The Rust server holds flat** at roughly half its single-writer rate:
+  its storage layer currently serialises writers behind one global mutex,
+  so concurrency costs a constant coordination overhead and buys nothing —
+  a measured improvement target, not a defect (writes stay correct and no
+  client ever sees an error).
+- **The Python server degrades** to ~0.2× under contention. Beyond the GIL
+  and the WT-binding ceiling above, its per-collection locking allows
+  concurrent WiredTiger transactions that all update the shared
+  oplog-metadata row, so writers conflict at commit even on different
+  collections. Conflicts are retried with backoff and, under sustained
+  saturation, can surface as mongod's retryable `WriteConflict` — never as
+  a generic error (that classification bug was found by this harness and
+  fixed). The oplog-meta hotspot is the next lever, tracked in
+  `tasks/backlog.md`.
+
 ### Why disabling logging doesn't fix it
 
 A natural follow-up: maybe the journal is the serialiser. We tested

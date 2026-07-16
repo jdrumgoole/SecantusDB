@@ -1,6 +1,8 @@
-"""N-writer concurrency benchmark.
+"""N-writer concurrency benchmark — Python server, Rust server, or mongod.
 
-Spawns one SecantusDB server with on-disk WT storage, then runs a
+Spawns one server with on-disk WT storage (``--server python`` /
+``rust`` / ``mongod``, or ``all`` to sweep the three back-to-back with a
+combined scaling table), then runs a
 configurable list of writer counts (default ``1,2,4,8``) one after
 another. For each count, ``N`` ``bench.load_writer`` processes write
 ``insert_many`` batches against their own collection for a fixed wall
@@ -23,6 +25,7 @@ single collection; Phase 2 has to push that above 1.5x.
 from __future__ import annotations
 
 import argparse
+import os
 import contextlib
 import re
 import shutil
@@ -74,15 +77,70 @@ def _parse_writer_log(text: str) -> tuple[int, int] | None:
     )
 
 
-def _spawn_server(port: int, storage_path: Path) -> subprocess.Popen[bytes]:
-    return subprocess.Popen(
-        [
+def _rust_binary() -> str:
+    """The standalone Rust daemon: $SECANTUSDB_BIN, the venv-staged copy
+    (storage-engine wheel build), or the cargo target dir."""
+    env = os.environ.get("SECANTUSDB_BIN")
+    if env and Path(env).exists():
+        return env
+    for cand in (
+        Path(sys.executable).parent / "secantusd-rs",
+        Path(__file__).resolve().parent.parent / "crates" / "secantusdb" / "target" / "release" / "secantusd-rs",
+        Path(__file__).resolve().parent.parent / "crates" / "secantusdb" / "target" / "debug" / "secantusd-rs",
+    ):
+        if cand.exists():
+            return str(cand)
+    raise SystemExit(
+        "secantusd-rs not found — build with "
+        "SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev, "
+        "or set SECANTUSDB_BIN."
+    )
+
+
+def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
+    if server == "python":
+        return [
             sys.executable, "-m", "secantus",
             "--host", "127.0.0.1",
             "--port", str(port),
             "--storage-path", str(storage_path),
             "--log-level", "WARNING",
-        ],
+        ]
+    if server == "rust":
+        return [
+            _rust_binary(),
+            "--host", "127.0.0.1",
+            "--port", str(port),
+            "--storage-path", str(storage_path),
+            "--log-level", "WARNING",
+        ]
+    if server == "mongod":
+        mongod = shutil.which("mongod")
+        if not mongod:
+            raise SystemExit("mongod not on PATH — install Community Server or skip --server mongod")
+        return [
+            mongod,
+            "--bind_ip", "127.0.0.1",
+            "--port", str(port),
+            "--dbpath", str(storage_path),
+            "--quiet",
+        ]
+    raise SystemExit(f"unknown server {server!r}")
+
+
+def _spawn_server(
+    port: int, storage_path: Path, server: str = "python", server_log: Path | None = None
+) -> subprocess.Popen[bytes]:
+    if server_log is not None:
+        out = server_log.open("ab")
+        return subprocess.Popen(
+            _server_argv(server, port, storage_path),
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+        )
+    return subprocess.Popen(
+        _server_argv(server, port, storage_path),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -143,8 +201,18 @@ def run_writers(
                 p.wait()
 
         stats: list[tuple[int, int] | None] = []
-        for log_path in log_paths:
-            stats.append(_parse_writer_log(log_path.read_text()))
+        for i, log_path in enumerate(log_paths):
+            text = log_path.read_text()
+            parsed = _parse_writer_log(text)
+            if parsed is None:
+                # A writer that ends without its summary line is lost data —
+                # surface its tail so the failure mode (crash traceback vs
+                # killed-before-flush) is visible instead of silently zeroed.
+                tail = "\n".join(text.strip().splitlines()[-6:]) or "<empty log>"
+                print(f"  WARN: writer {i} produced no summary; log tail:\n"
+                      + "\n".join(f"    | {line}" for line in tail.splitlines()),
+                      flush=True)
+            stats.append(parsed)
         return stats, elapsed
     finally:
         for log_path in log_paths:
@@ -157,18 +225,20 @@ def run_concurrency_sweep(
     duration: float,
     batch: int,
     shared_collection: bool,
-) -> int:
+    server: str = "python",
+    server_log: Path | None = None,
+) -> tuple[int, list[tuple[int, int, float]]]:
     storage = Path(tempfile.mkdtemp(prefix="bench-concurrency-"))
     port = _free_port()
-    server = _spawn_server(port, storage)
+    server_proc = _spawn_server(port, storage, server, server_log)
     try:
         if not _wait_listen("127.0.0.1", port, timeout=30):
             print("ERROR: server didn't come up", file=sys.stderr)
-            return 2
+            return 2, []
         uri = f"mongodb://127.0.0.1:{port}/"
         coll_mode = "shared collection" if shared_collection else "per-writer collections"
         print(
-            f"server: {uri}    duration: {duration:.0f}s/run    "
+            f"server: {server} @ {uri}    duration: {duration:.0f}s/run    "
             f"batch: {batch}    mode: {coll_mode}\n"
         )
 
@@ -221,14 +291,14 @@ def run_concurrency_sweep(
                 f"\n                scaling < 1.0x means contention is making "
                 f"things worse than serial execution.\n"
             )
-        return 0
+        return 0, results
     finally:
-        server.terminate()
+        server_proc.terminate()
         try:
-            server.wait(timeout=10)
+            server_proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait()
+            server_proc.kill()
+            server_proc.wait()
         shutil.rmtree(storage, ignore_errors=True)
 
 
@@ -248,6 +318,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help=f"Comma-separated writer counts (default: {DEFAULT_WRITERS}).")
     p.add_argument("--shared-collection", action="store_true",
                    help="All writers target the same collection (max contention).")
+    p.add_argument("--server-log", default="",
+                   help="Append the server's stdout/stderr to this file "
+                        "(default: discarded) — the harness's own diagnosis tool "
+                        "when writers report server errors.")
+    p.add_argument("--server", default="python",
+                   choices=["python", "rust", "mongod", "all"],
+                   help="Which server to drive (default: python). "
+                        "'all' sweeps python, rust, and mongod back-to-back "
+                        "and prints a combined table.")
     return p.parse_args(argv)
 
 
@@ -261,12 +340,33 @@ def main(argv: list[str] | None = None) -> int:
     if not writers_list:
         print("--writers cannot be empty", file=sys.stderr)
         return 2
-    return run_concurrency_sweep(
-        writers_list=writers_list,
-        duration=args.duration,
-        batch=max(1, args.batch_size),
-        shared_collection=args.shared_collection,
-    )
+    servers = ["python", "rust", "mongod"] if args.server == "all" else [args.server]
+    all_results: dict[str, list[tuple[int, int, float]]] = {}
+    for server in servers:
+        rc, results = run_concurrency_sweep(
+            writers_list=writers_list,
+            duration=args.duration,
+            batch=max(1, args.batch_size),
+            shared_collection=args.shared_collection,
+            server=server,
+            server_log=Path(args.server_log) if args.server_log else None,
+        )
+        if rc != 0:
+            return rc
+        all_results[server] = results
+    if len(servers) > 1:
+        print("=" * 72)
+        print(f"{'writers':<8}" + "".join(f"{s + ' docs/s':>20}" for s in servers))
+        print("-" * 72)
+        for i, n in enumerate(writers_list):
+            row = f"{n:<8}"
+            for s in servers:
+                total, elapsed = all_results[s][i][1], all_results[s][i][2]
+                rate = total / elapsed if elapsed > 0 else 0.0
+                row += f"{rate:>20,.0f}"
+            print(row)
+        print("=" * 72)
+    return 0
 
 
 if __name__ == "__main__":
