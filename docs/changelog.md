@@ -59,7 +59,7 @@ protocol quick-wins.
 
 - Concurrency: `bench.concurrency --server python|rust|mongod|all` with
   failure-diagnosis instruments (writer log tails, `--server-log`);
-  measured table in [Concurrency](concurrency.html).
+  measured table in [Concurrency](concurrency.md).
 - Fixed by it: commit-time WT conflicts are retryable `WriteConflict`
   (was `InternalError`); unbounded `writeConflictRetry` for plain writes;
   heartbeats no longer write the oplog meta row; admin recent-targets
