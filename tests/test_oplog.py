@@ -122,7 +122,14 @@ def test_oplog_survives_close_and_reopen() -> None:
         s2 = Storage(path)
         seqs_after = [seq for seq, _ in s2.read_oplog(start_seq=1, limit=10)]
         assert seqs_after == seqs_before == [1, 2]
-        assert (s2._last_ts_secs, s2._last_ts_ord) == last_ts_before
+        # Recovery bumps the cluster clock strictly PAST the persisted
+        # state (+1s past max(meta, oplog tail, wall clock)) so that
+        # cluster-time mints issued after the last persist — which no
+        # longer happens per call — can never be re-minted by the next
+        # incarnation. Exact restoration was the old contract; strict
+        # monotonicity is the new one (mongod's cluster time also jumps
+        # on restart).
+        assert (s2._last_ts_secs, s2._last_ts_ord) > last_ts_before
         # Continuing must mint a strictly greater seq AND ts.
         s2._emit_oplog([{"op": "i", "ns": "a.b", "o": {"_id": 3}, "o2": {"_id": 3}}])
         assert s2.oplog_tail_seq() == 3

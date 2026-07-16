@@ -85,15 +85,17 @@ Three different shapes:
   so concurrency costs a constant coordination overhead and buys nothing —
   a measured improvement target, not a defect (writes stay correct and no
   client ever sees an error).
-- **The Python server degrades** to ~0.2× under contention. Beyond the GIL
-  and the WT-binding ceiling above, its per-collection locking allows
-  concurrent WiredTiger transactions that all update the shared
-  oplog-metadata row, so writers conflict at commit even on different
-  collections. Conflicts are retried with backoff and, under sustained
-  saturation, can surface as mongod's retryable `WriteConflict` — never as
-  a generic error (that classification bug was found by this harness and
-  fixed). The oplog-meta hotspot is the next lever, tracked in
-  `tasks/backlog.md`.
+- **The Python server degrades** to ~0.2× under contention — the GIL plus
+  the WT-binding ceiling measured above. The shared oplog-metadata row
+  that used to make concurrent writers conflict at commit is no longer
+  written on the hot path (neither per oplog emit nor per cluster-time
+  mint — the latter ran on every driver heartbeat); the write conflicts
+  WiredTiger still reports under saturation are retried with backoff,
+  without a deadline, exactly like mongod's `writeConflictRetry` — a
+  client never sees an error, generic or otherwise (both the
+  swallowed-`InternalError` classification bug and the deadline that
+  could surface `WriteConflict` on plain writes were found by this
+  harness and fixed).
 
 ### Why disabling logging doesn't fix it
 
