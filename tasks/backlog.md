@@ -3554,3 +3554,21 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
 ---
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
+
+## Concurrent-writer contention (found by bench.concurrency, 2026-07-16)
+
+- **Shared oplog-meta row is a global write hotspot.** Every batch
+  transaction updates the single `secantus_oplog_meta` "state" row, so two
+  concurrent writers conflict at commit even on different collections —
+  per-collection locking cannot scale write throughput past ~0.3× of the
+  single-writer baseline while this row is inside the batch transaction.
+  Candidate fixes: persist oplog state outside the batch txn, persist it
+  periodically (recover by oplog scan, which startup already does), or an
+  atomic seq with no per-commit meta write.
+- **Non-transaction writes can surface `WriteConflict` (112) to clients.**
+  The `_retry_write_conflicts` wrapper gives up after 5s; real mongod's
+  `writeConflictRetry` loops indefinitely for plain writes, so a client of
+  mongod never sees 112 outside a multi-document transaction. Consider
+  removing the deadline (with backoff + jitter) for the non-txn path once
+  the hotspot above is fixed — today the deadline is what turns saturated
+  contention into client-visible errors.
