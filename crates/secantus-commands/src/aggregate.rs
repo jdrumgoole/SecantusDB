@@ -78,6 +78,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_stage_names(&pipeline) {
         return Ok(e.into_reply());
     }
+    // A genuinely unknown expression operator inside a `$project` spec is
+    // mongod's stage-specific Location31325, not the generic BadValue the
+    // engine fallback produces. Parse-time, like the stage-name check.
+    if let Err(e) = validate_project_exprs(&pipeline) {
+        return Ok(e.into_reply());
+    }
 
     // Inline `explain: true` on the aggregate command (the legacy flag, distinct
     // from the top-level `explain` wrapper): return the plan instead of running
@@ -367,6 +373,49 @@ fn recognized_stage(name: &str) -> bool {
 /// an unrecognised single-key stage → `Location40324`. Malformed stage shapes
 /// (non-document / empty / multi-key) are left to the engine path. Mirrors
 /// `aggregate.validate_stage_names`.
+/// Parse-time check for a genuinely unknown expression operator inside a
+/// `$project` stage — mongod reports `Location31325` ("Invalid $project ::
+/// caused by :: Unknown expression $op") where the engine-fallback path would
+/// give a generic `2 BadValue`. Mirrors `aggregate._stage_project`'s
+/// `UnknownExpressionOperatorError` wrap on the Python server.
+///
+/// Only values that would route to the expression evaluator are scanned: a
+/// single-key document whose key is a projection-only operator (`$slice` /
+/// `$elemMatch` / `$meta` — valid inside `$project`, NOT expression operators)
+/// is skipped, so it is never mislabeled. `first_unknown_expr_operator`
+/// recurses through nested documents/arrays and flags only a truly-unknown
+/// `$`-operator — a recognised-but-deferred operator still defers to Python.
+fn validate_project_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
+    const PROJECTION_ONLY_OPS: [&str; 3] = ["$slice", "$elemMatch", "$meta"];
+    for stage in pipeline {
+        let Some(spec) = stage
+            .as_document()
+            .and_then(|d| d.get("$project"))
+            .and_then(Bson::as_document)
+        else {
+            continue;
+        };
+        for (_field, value) in spec.iter() {
+            if let Bson::Document(d) = value {
+                if d.len() == 1 {
+                    let key = d.keys().next().map(String::as_str).unwrap_or_default();
+                    if PROJECTION_ONLY_OPS.contains(&key) {
+                        continue;
+                    }
+                }
+            }
+            if let Some(op) = secantus_core::expressions::first_unknown_expr_operator(value) {
+                return Err(CommandError::new(
+                    31325,
+                    "Location31325",
+                    format!("Invalid $project :: caused by :: Unknown expression {op}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
     for stage in pipeline {
         let Some(d) = stage.as_document() else {

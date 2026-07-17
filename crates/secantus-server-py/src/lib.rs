@@ -49,6 +49,11 @@ impl RustServer {
     /// * `tls_cert_file` / `tls_key_file` — enable server-side TLS (both or
     ///   neither). `tls_ca_file` (+ `tls_require_client_cert`) layers on mTLS
     ///   client-certificate verification.
+    /// * `cache_size` / `session_max` / `sync_on_commit` — the WiredTiger
+    ///   knobs the daemons expose (`--cache-size` / `--session-max` /
+    ///   `--sync-on-commit`), threaded into `wt_config`. Defaults match
+    ///   `python -m secantus` and the standalone `secantusd-rs` binary
+    ///   (1G cache, 1000 sessions, no per-commit fsync).
     #[new]
     #[pyo3(signature = (
         storage_path,
@@ -61,6 +66,9 @@ impl RustServer {
         tls_key_file = None,
         tls_ca_file = None,
         tls_require_client_cert = false,
+        cache_size = "1G".to_string(),
+        session_max = 1000,
+        sync_on_commit = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -74,18 +82,24 @@ impl RustServer {
         tls_key_file: Option<String>,
         tls_ca_file: Option<String>,
         tls_require_client_cert: bool,
+        cache_size: String,
+        session_max: u32,
+        sync_on_commit: bool,
     ) -> PyResult<Self> {
         // WiredTiger requires the home directory to exist; create it so any
         // path "just works" (matching the one-or-two-line ergonomic).
         std::fs::create_dir_all(storage_path).map_err(|e| {
             PyRuntimeError::new_err(format!("failed to create storage dir {storage_path}: {e}"))
         })?;
-        // Default to a 1G WiredTiger cache, matching `python -m secantus`, the
-        // Python `SecantusDBServer`, and the standalone `secantusdb` binary.
-        // (The engine's own `Storage::open` default stays 256M.)
-        let mut storage =
-            Storage::open_with_config(storage_path, &wt_config("1G", 1000, false))
-                .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
+        // Defaults match `python -m secantus`, the Python `SecantusDBServer`,
+        // and the standalone `secantusdb` binary (1G cache; the engine's own
+        // `Storage::open` default stays 256M). Each knob is overridable per
+        // handle so tests can exercise non-default WiredTiger configs.
+        let mut storage = Storage::open_with_config(
+            storage_path,
+            &wt_config(&cache_size, session_max, sync_on_commit),
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
         storage.set_enable_oplog(enable_oplog);
 
         // TLS: cert + key both required to enable it (matching server.py).

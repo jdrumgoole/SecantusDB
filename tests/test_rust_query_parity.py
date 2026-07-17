@@ -140,6 +140,17 @@ CURATED = [
     ({"f": Code("function () {}")}, {"f": Code("function () {}")}),
     ({"f": Code("function () {}")}, {"f": Code("other")}),
     ({"f": Code("c", {"a": 55})}, {"f": Code("c", {"a": 55})}),
+    # JS-Code under range operators — pymongo's Code is a str subclass, so the
+    # Python engine compares it as a plain string (scope ignored); the Rust
+    # matcher now mirrors that instead of deferring.
+    ({"f": Code("b")}, {"f": {"$gt": Code("a")}}),
+    ({"f": Code("a")}, {"f": {"$gt": Code("b")}}),
+    ({"f": Code("b")}, {"f": {"$gte": Code("b")}}),
+    ({"f": Code("b")}, {"f": {"$lt": "c"}}),  # Code vs plain string
+    ({"f": "b"}, {"f": {"$gt": Code("a")}}),  # string field vs Code bound
+    ({"f": Code("b", {"s": 1})}, {"f": {"$gt": Code("a")}}),  # scope ignored
+    ({"f": Code("b")}, {"f": {"$gt": 5}}),  # cross-bracket -> no match
+    ({"f": 5}, {"f": {"$lt": Code("a")}}),  # cross-bracket -> no match
     # $all with regex elements matches array elements as patterns.
     ({"k": ["serialization", "test", "x"]}, {"k": {"$all": [Regex("ser"), Regex("test")]}}),
     ({"k": ["abc", "def"]}, {"k": {"$all": [Regex("zzz")]}}),

@@ -153,6 +153,10 @@ def rust_parity(c: Context) -> None:
     c.run(
         "uv run --no-project --reinstall-package secantus-core "
         f"--with pymongo --with pytest --with {shlex.quote(wheels[-1])} "
+        # shapely / s2sphere / dateutil: the pure-Python geo + date paths the
+        # aggregate/query parity corpora exercise — without them the Python
+        # side of the geo curated cases errors with ModuleNotFoundError.
+        "--with shapely --with s2sphere --with python-dateutil "
         "python -m pytest tests/test_rust_sortkey_parity.py tests/test_rust_query_parity.py "
         "tests/test_rust_update_parity.py tests/test_rust_expressions_parity.py "
         "tests/test_rust_projection_parity.py tests/test_rust_diff_parity.py "
