@@ -23,6 +23,8 @@ from secantus.paths import get_path
 from secantus.query import matches
 from secantus.sql import typemap
 from secantus.sql.catalog import (
+    COMPOSITE_TYPE_OID_BASE,
+    DOMAIN_TYPE_OID_BASE,
     ENUM_TYPE_OID_BASE,
     USER_TYPE_ARRAY_OID_OFFSET,
     Catalog,
@@ -1526,22 +1528,20 @@ def _enum_oids(db: str, catalog: Catalog) -> dict[str, int]:
     return catalog.enum_type_oids(db)
 
 
-_DOMAIN_OID_BASE = 66000
+_DOMAIN_OID_BASE = DOMAIN_TYPE_OID_BASE
 
 
 def _domain_oids(db: str, catalog: Catalog) -> dict[str, int]:
-    lister = getattr(catalog, "list_domains", None)
-    names = lister(db) if lister is not None else []
-    return {name: _DOMAIN_OID_BASE + i for i, name in enumerate(names)}
+    # Allocation-stable mint on Catalog (see _enum_oids).
+    return catalog.domain_type_oids(db)
 
 
-_COMPOSITE_OID_BASE = 67000
+_COMPOSITE_OID_BASE = COMPOSITE_TYPE_OID_BASE
 
 
 def _composite_oids(db: str, catalog: Catalog) -> dict[str, int]:
-    lister = getattr(catalog, "list_composites", None)
-    names = lister(db) if lister is not None else []
-    return {name: _COMPOSITE_OID_BASE + i for i, name in enumerate(names)}
+    # Allocation-stable mint on Catalog (see _enum_oids).
+    return catalog.composite_type_oids(db)
 
 
 _COMPOSITE_REL_OID_BASE = 68000
@@ -1599,6 +1599,30 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typarray": oid + USER_TYPE_ARRAY_OID_OFFSET,
             }
         )
+    # User-declared range types (typtype 'r') and their auto-created companion
+    # multirange types (typtype 'm').
+    range_lister = getattr(catalog, "list_range_types", None)
+    for doc in range_lister(db) if range_lister is not None else []:
+        for key, oid_key, typtype in (("range", "oid", "r"), ("multirange", "multirange_oid", "m")):
+            tname = doc.get(key)
+            toid = doc.get(oid_key)
+            if not tname or not toid:
+                continue
+            typname, nsoid = _split_user_type_name(tname, schema_oids)
+            rows.append(
+                {
+                    "oid": toid,
+                    "typname": typname,
+                    "typcollation": 0,
+                    "typnamespace": nsoid,
+                    "typbasetype": 0,
+                    "typtypmod": -1,
+                    "typnotnull": False,
+                    "typdefault": None,
+                    "typtype": typtype,
+                    "typarray": toid + USER_TYPE_ARRAY_OID_OFFSET,
+                }
+            )
     # User-declared domain types (typtype 'd') carry their base type's oid in
     # typbasetype and the domain's NOT NULL in typnotnull.
     getter = getattr(catalog, "get_domain", None)
@@ -1651,10 +1675,22 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
     return rows
 
 
+def _range_type_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    """Range AND companion multirange names -> minted oids."""
+    lister = getattr(catalog, "list_range_types", None)
+    out: dict[str, int] = {}
+    for doc in lister(db) if lister is not None else []:
+        out[doc["range"]] = doc["oid"]
+        if doc.get("multirange") and doc.get("multirange_oid"):
+            out[doc["multirange"]] = doc["multirange_oid"]
+    return out
+
+
 def user_type_name(db: str, catalog: Catalog, oid: int) -> str | None:
-    """The name of a user-declared type (enum / domain / composite) by oid, or
-    None — the ``oid::regtype`` tail for oids the built-in tables don't know."""
-    for lookup in (_enum_oids, _domain_oids, _composite_oids):
+    """The name of a user-declared type (enum / domain / composite / range) by
+    oid, or None — the ``oid::regtype`` tail for oids the built-in tables don't
+    know."""
+    for lookup in (_enum_oids, _domain_oids, _composite_oids, _range_type_oids):
         for name, type_oid in lookup(db, catalog).items():
             if type_oid == oid:
                 return name
@@ -1663,16 +1699,100 @@ def user_type_name(db: str, catalog: Catalog, oid: int) -> str | None:
 
 _BARE_IDENT_RE = re.compile(r"[a-z_][a-z0-9_$]*\Z")
 
+# Reserved words that ``regtype`` output must double-quote even when lowercase
+# (``create type "order"`` renders as ``"order"``, never bare). The subset of
+# PG's fully-reserved keywords likely to appear as type names.
+_RESERVED_TYPE_WORDS = frozenset(
+    [
+        "all",
+        "analyse",
+        "analyze",
+        "and",
+        "any",
+        "array",
+        "as",
+        "asc",
+        "asymmetric",
+        "both",
+        "case",
+        "cast",
+        "check",
+        "collate",
+        "column",
+        "constraint",
+        "create",
+        "current_date",
+        "current_role",
+        "current_time",
+        "current_timestamp",
+        "current_user",
+        "default",
+        "deferrable",
+        "desc",
+        "distinct",
+        "do",
+        "else",
+        "end",
+        "except",
+        "false",
+        "fetch",
+        "for",
+        "foreign",
+        "from",
+        "grant",
+        "group",
+        "having",
+        "in",
+        "initially",
+        "intersect",
+        "into",
+        "lateral",
+        "leading",
+        "limit",
+        "localtime",
+        "localtimestamp",
+        "not",
+        "null",
+        "offset",
+        "on",
+        "only",
+        "or",
+        "order",
+        "placing",
+        "primary",
+        "references",
+        "returning",
+        "select",
+        "session_user",
+        "some",
+        "symmetric",
+        "table",
+        "then",
+        "to",
+        "trailing",
+        "true",
+        "union",
+        "unique",
+        "user",
+        "using",
+        "variadic",
+        "when",
+        "where",
+        "window",
+        "with",
+    ]
+)
+
 
 def quote_type_name(name: str) -> str:
     """Render a user-type name the way ``oid::regtype`` prints it: each dotted
-    part double-quoted unless it is already a plain lower-case identifier
-    (``CamelCaseEnum`` → ``"CamelCaseEnum"``). psycopg's ClientCursor pastes this
-    string verbatim as a cast suffix, so an unquoted mixed-case name would fold
-    back to lowercase and miss the type."""
+    part double-quoted unless it is a plain lower-case identifier that isn't a
+    reserved word (``CamelCaseEnum`` → ``"CamelCaseEnum"``, ``order`` →
+    ``"order"``). psycopg's ClientCursor pastes this string verbatim as a cast
+    suffix, so an unquoted mixed-case or reserved name would misparse."""
 
     def _q(part: str) -> str:
-        if _BARE_IDENT_RE.fullmatch(part):
+        if _BARE_IDENT_RE.fullmatch(part) and part not in _RESERVED_TYPE_WORDS:
             return part
         return '"' + part.replace('"', '""') + '"'
 
@@ -1692,7 +1812,7 @@ def user_type_oid(db: str, catalog: Catalog, name: str) -> int | None:
     text = fold_type_name(name)
     if text.lower().startswith("public."):
         text = text[len("public.") :]
-    for lookup in (_enum_oids, _domain_oids, _composite_oids):
+    for lookup in (_enum_oids, _domain_oids, _composite_oids, _range_type_oids):
         oid = lookup(db, catalog).get(text)
         if oid is not None:
             return oid
@@ -1718,7 +1838,7 @@ def _pg_range(db: str, session: Session, storage: Any, catalog: Catalog) -> list
     ``rngmultitypid`` too."""
     from secantus.sql.ranges import RANGE_TO_MULTIRANGE
 
-    return [
+    rows = [
         {
             "rngtypid": typemap.PG_OID[range_tag],
             "rngsubtype": typemap.PG_OID[elem_tag],
@@ -1728,6 +1848,17 @@ def _pg_range(db: str, session: Session, storage: Any, catalog: Catalog) -> list
         for range_tag, elem_tag in _RANGE_SUBTYPE.items()
         if range_tag in typemap.PG_OID
     ]
+    lister = getattr(catalog, "list_range_types", None)
+    for doc in lister(db) if lister is not None else []:
+        rows.append(
+            {
+                "rngtypid": doc["oid"],
+                "rngsubtype": typemap.PG_OID.get(doc.get("subtype_tag", ""), 25),
+                "rngmultitypid": doc.get("multirange_oid", 0),
+                "rngcollation": 0,
+            }
+        )
+    return rows
 
 
 def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:

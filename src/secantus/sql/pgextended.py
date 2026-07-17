@@ -176,7 +176,7 @@ def _decode_range(raw: bytes, elem_oid: int) -> str:
     flags = raw[0]
     if flags & _RANGE_EMPTY:
         return "empty"
-    decoder = _BINARY[elem_oid]
+    decoder = (lambda b: b.decode("utf-8")) if elem_oid in (0, 25, 1043) else _BINARY[elem_oid]
     off = 1
     bounds: list[str] = []
     for inf_flag in (_RANGE_LB_INF, _RANGE_UB_INF):
@@ -589,8 +589,113 @@ def _encode_value(
         return _encode_array(value, oid, tag, encoding)
     if oid == 3802:  # jsonb: 1-byte version header + JSON text (client encoding)
         return b"\x01" + (pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b"")
+    if (oid == 2249 or tag == "composite") and isinstance(value, dict):
+        # Anonymous record (2249) or a declared composite under its minted oid.
+        return _encode_record(value, encoding)
+    if isinstance(value, dict) and "multirange" in value:
+        # A user-declared multirange under its minted oid (built-ins matched
+        # _OUT_BINARY above).
+        return _encode_multirange_generic(value, encoding)
+    if isinstance(value, dict) and ("empty" in value or ("lower" in value and "upper" in value)):
+        return _encode_range_generic(value, encoding)
     # text / varchar / unknown: the binary form equals the (client-encoded) text bytes.
     return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b""
+
+
+def _py_value_field_oid(v: Any) -> tuple[int, str]:
+    """(oid, tag) for a record field's Python value — binary record fields carry
+    their own per-field type oids."""
+    if isinstance(v, bool):
+        return (16, "bool")
+    if isinstance(v, int):
+        return (20, "int8")
+    if isinstance(v, float):
+        return (701, "float8")
+    if isinstance(v, (Decimal, bson.Decimal128)):
+        return (1700, "numeric")
+    if isinstance(v, _dt.datetime):
+        return (1184, "timestamptz") if v.tzinfo is not None else (1114, "timestamp")
+    if isinstance(v, dict):
+        return (2249, "composite")
+    return (25, "text")
+
+
+def _binary_record_to_text(raw: bytes, encoding: str | None = "utf-8") -> str:
+    """Decode a PG binary record parameter into its record TEXT literal (fields
+    decoded per their embedded oids), which rides the composite text parser."""
+    (n,) = struct.unpack_from("!i", raw, 0)
+    off = 4
+    parts: list[str] = []
+    for _ in range(n):
+        oid, length = struct.unpack_from("!ii", raw, off)
+        off += 8
+        if length < 0:
+            parts.append("")
+            continue
+        payload = bytes(raw[off : off + length])
+        off += length
+        decoder = None if oid in (0, 25, 1043) else _BINARY.get(oid)
+        if decoder is not None:
+            val = decoder(payload)
+        elif oid == 2249:
+            val = _binary_record_to_text(payload, encoding)
+        else:
+            val = pgwire.decode_text(payload, encoding)
+        rendered = typemap.to_pg_text(val, typemap.OID_TO_TAG.get(oid))
+        text = rendered.decode("utf-8") if rendered is not None else str(val)
+        if text == "" or any(ch in text for ch in ',()"\\') or any(ch.isspace() for ch in text):
+            text = '"' + text.replace("\\", "\\\\").replace('"', '""') + '"'
+        parts.append(text)
+    return "(" + ",".join(parts) + ")"
+
+
+def _encode_record(value: dict, encoding: str | None = "utf-8") -> bytes:
+    """PG binary record: int32 nfields, then per field int32 type oid +
+    int32 length (-1 NULL) + data."""
+    out = bytearray(struct.pack("!i", len(value)))
+    for v in value.values():
+        if v is None:
+            out += struct.pack("!ii", 25, -1)
+            continue
+        oid, tag = _py_value_field_oid(v)
+        b = _encode_value(v, oid, tag, encoding) or b""
+        out += struct.pack("!ii", oid, len(b)) + b
+    return bytes(out)
+
+
+def _encode_range_generic(rng: dict, encoding: str | None = "utf-8") -> bytes:
+    """PG binary range for a user-declared range type — bounds encode in their
+    Python value's natural binary form (the client's registered subtype loader
+    expects exactly that)."""
+    if rng.get("empty"):
+        return bytes([_RANGE_EMPTY])
+    flags = 0
+    lo, hi = rng.get("lower"), rng.get("upper")
+    if rng.get("lower_inc"):
+        flags |= _RANGE_LB_INC
+    if rng.get("upper_inc"):
+        flags |= _RANGE_UB_INC
+    if lo is None:
+        flags |= _RANGE_LB_INF
+    if hi is None:
+        flags |= _RANGE_UB_INF
+    out = bytearray([flags])
+    for bound in (lo, hi):
+        if bound is None:
+            continue
+        b_oid, b_tag = _py_value_field_oid(bound)
+        b = _encode_value(bound, b_oid, b_tag, encoding) or b""
+        out += struct.pack("!i", len(b)) + b
+    return bytes(out)
+
+
+def _encode_multirange_generic(mr: dict, encoding: str | None = "utf-8") -> bytes:
+    rngs = mr.get("multirange", [])
+    out = bytearray(struct.pack("!i", len(rngs)))
+    for r in rngs:
+        b = _encode_range_generic(r, encoding)
+        out += struct.pack("!i", len(b)) + b
+    return bytes(out)
 
 
 def _result_value(
@@ -710,6 +815,11 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
     decoder = _BINARY.get(oid)
     if decoder is not None:
         return decoder(raw)
+    if ENUM_TYPE_OID_BASE <= oid < _USER_ARRAY_OID_FLOOR:
+        # A minted user-type oid: keep the payload raw — Bind resolves it with
+        # the catalog (an enum's binary form is its label text; a composite's
+        # is the binary record layout).
+        return bytes(raw)
     if oid in _ARRAY_ELEM_BY_OID or oid >= _USER_ARRAY_OID_FLOOR:
         # A user-type array oid (a registered enum's array dumper binds with the
         # minted array oid); the embedded element oid is unknown to _BINARY, so
@@ -777,12 +887,17 @@ class ExtendedSession:
         if isinstance(stmt, exp.Select):
             # pg_typeof($N) types from the OIDs the client declares here in
             # Parse — after Bind substitutes values that information is gone.
+            from secantus.sql import virtual
+
             planner.rewrite_pg_typeof(
                 stmt,
                 engine._pg_typeof_table(
                     self.storage, self.session.database, self.catalog, stmt.find(exp.Table)
                 ),
                 oids,
+                user_type_name=lambda oid: virtual.user_type_name(
+                    self.session.database, self.catalog, oid
+                ),
             )
         self.prepared[name] = Prepared(name, stmt, oids, count)
         return pgwire.parse_complete()
@@ -807,9 +922,10 @@ class ExtendedSession:
         return pgwire.bind_complete()
 
     def _check_enum_param(self, oid: int, value: Any) -> Any:
-        """Postgres validates a parameter declared with an enum type oid against
-        the enum's labels at Bind (a psycopg ``register_enum`` dumper declares
-        params with the minted oid) — 22P02 for a label the type doesn't have."""
+        """Resolve a parameter declared with a minted user-type oid: an enum
+        param is label-validated at Bind (22P02 for a label the type doesn't
+        have); a composite param's record text is tagged so substitution casts
+        it into the typed subdocument."""
         if value is None or not isinstance(oid, int) or oid < ENUM_TYPE_OID_BASE:
             return value
         from secantus.sql import scalar, virtual
@@ -819,9 +935,37 @@ class ExtendedSession:
         if name is None:
             return value
         enum = self.catalog.get_enum(db, name)
-        if enum is None:
-            return value
-        return scalar.validate_enum_label(enum, value)
+        if enum is not None:
+            if isinstance(value, bytes):  # binary enum form IS the label bytes
+                value = pgwire.decode_text(value, self.session.wire_encoding)
+            return scalar.validate_enum_label(enum, value)
+        if self.catalog.get_composite(db, name) is not None:
+            if isinstance(value, bytes):
+                value = _binary_record_to_text(value, self.session.wire_encoding)
+            return typemap.TaggedText(str(value), virtual.quote_type_name(name))
+        rng = getattr(self.catalog, "get_range_type", None)
+        rng_doc = rng(db, name) if rng is not None else None
+        if rng_doc is not None:
+            if isinstance(value, bytes):
+                # Binary custom range: PG's range wire layout with the declared
+                # subtype's bound encoding (multirange when the oid names the
+                # companion type).
+                elem_oid = typemap.PG_OID.get(rng_doc.get("subtype_tag", "text"), 25)
+                if name == rng_doc.get("multirange"):
+                    (count,) = struct.unpack_from("!i", value, 0)
+                    off, parts = 4, []
+                    for _ in range(count):
+                        (length,) = struct.unpack_from("!i", value, off)
+                        off += 4
+                        parts.append(_decode_range(value[off : off + length], elem_oid))
+                        off += length
+                    value = "{" + ",".join(parts) + "}"
+                else:
+                    value = _decode_range(value, elem_oid)
+            return typemap.TaggedText(str(value), virtual.quote_type_name(name))
+        if isinstance(value, bytes):  # unknown user type: best-effort text
+            return pgwire.decode_text(value, self.session.wire_encoding)
+        return value
 
     def _describe(self, payload: bytes) -> bytes:
         kind, name = pgwire.parse_describe(payload)

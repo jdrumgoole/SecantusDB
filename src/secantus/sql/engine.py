@@ -1567,6 +1567,10 @@ def _run_statement(
             return _alter_domain_command(stmt, storage, db, catalog)
         if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
             return _create_domain_command(stmt, db, catalog)
+        if verb == "CREATE" and _CREATE_RANGE_RE.match(_command_text(stmt)):
+            # ``CREATE TYPE name AS RANGE (subtype = X, …)`` exceeds sqlglot's
+            # parser and falls back to a Command.
+            return _create_range_type_command(stmt, db, catalog)
         if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
             return _drop_domain_command(stmt, db, catalog)
         if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("POLICY"):
@@ -2816,6 +2820,40 @@ def _composite_fields_from_schema(
     return fields
 
 
+# ``TYPE <name> AS RANGE (<options>)`` — the Command tail of a CREATE that
+# sqlglot can't parse. Options are ``key = value`` pairs; only ``subtype``
+# affects behaviour (collation / opclass / canonical are accepted, ignored).
+_CREATE_RANGE_RE = re.compile(
+    r'(?is)^\s*TYPE\s+((?:"[^"]+"|[\w$]+)(?:\.(?:"[^"]+"|[\w$]+))?)\s+AS\s+RANGE\s*\((.*)\)\s*;?\s*$'
+)
+
+
+def _create_range_type_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    m = _CREATE_RANGE_RE.match(_command_text(stmt))
+    assert m is not None  # gated by the dispatcher's match
+    from secantus.sql.catalog import fold_type_name
+
+    name = fold_type_name(m.group(1))
+    subtype_tag: str | None = None
+    for part in m.group(2).split(","):
+        if "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "subtype":
+            spelling = value.strip().strip('"')
+            oid = typemap.oid_for_regtype(spelling)
+            subtype_tag = typemap.OID_TO_TAG.get(oid) if oid is not None else None
+    if subtype_tag is None:
+        raise errors.SQLError(
+            "42704", f"CREATE TYPE … AS RANGE requires a recognised subtype: {m.group(2)!r}"
+        )
+    _check_type_name_free(catalog, db, name)
+    if catalog.range_type_exists(db, name):
+        raise errors.SQLError("42710", f'type "{name}" already exists')
+    catalog.create_range_type(db, name, subtype_tag)
+    return SQLResult(command_tag="CREATE TYPE")
+
+
 def _drop_type(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     try:
         name = _qualified_type_name(stmt.this, db, catalog)
@@ -2823,7 +2861,11 @@ def _drop_type(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
         if stmt.args.get("exists"):  # DROP TYPE IF EXISTS tolerates a missing schema
             return SQLResult(command_tag="DROP TYPE")
         raise
-    dropped = catalog.drop_enum(db, name) or catalog.drop_composite(db, name)
+    dropped = (
+        catalog.drop_enum(db, name)
+        or catalog.drop_composite(db, name)
+        or catalog.drop_range_type(db, name)
+    )
     if not dropped and not stmt.args.get("exists"):
         raise errors.SQLError("42704", f'type "{name}" does not exist')
     return SQLResult(command_tag="DROP TYPE")

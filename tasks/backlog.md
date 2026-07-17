@@ -3557,18 +3557,21 @@ When you fix one of these, delete the line. When you discover a new one, add it 
 
 ## Concurrent-writer contention (found by bench.concurrency, 2026-07-16)
 
-- **Shared oplog-meta row is a global write hotspot.** Every batch
-  transaction updates the single `secantus_oplog_meta` "state" row, so two
-  concurrent writers conflict at commit even on different collections —
-  per-collection locking cannot scale write throughput past ~0.3× of the
-  single-writer baseline while this row is inside the batch transaction.
-  Candidate fixes: persist oplog state outside the batch txn, persist it
-  periodically (recover by oplog scan, which startup already does), or an
-  atomic seq with no per-commit meta write.
-- **Non-transaction writes can surface `WriteConflict` (112) to clients.**
-  The `_retry_write_conflicts` wrapper gives up after 5s; real mongod's
-  `writeConflictRetry` loops indefinitely for plain writes, so a client of
-  mongod never sees 112 outside a multi-document transaction. Consider
-  removing the deadline (with backoff + jitter) for the non-txn path once
-  the hotspot above is fixed — today the deadline is what turns saturated
-  contention into client-visible errors.
+- ~~Shared oplog-meta row hotspot~~ and ~~5s WriteConflict deadline~~ —
+  **fixed**: the meta row is no longer written per oplog emit or per
+  cluster-time mint (recovery bumps the clock +1s past everything
+  recoverable instead), and the non-transaction write-conflict retry is
+  unbounded with periodic warnings, matching mongod's
+  `writeConflictRetry`. Post-fix sweeps show zero client-visible conflict
+  errors and zero retry stretches ≥5s.
+- **Residual**: under sustained multi-writer saturation WiredTiger still
+  occasionally marks concurrent batch transactions rollback-only
+  (observed as commit-time EINVAL before the mapping fix; cause not fully
+  attributed — cache/eviction pressure suspected, key-level conflicts
+  ruled out for per-collection writers). Retries absorb it today. If it
+  resurfaces as a throughput cliff, instrument `get_rollback_reason()`
+  in the retry wrapper and check WT eviction statistics. Multi-writer
+  THROUGHPUT scaling itself remains capped by the WT-binding/GIL ceiling
+  documented in docs/concurrency.md; lifting it is the
+  tasks/wt-concurrency-plan.md end-game (and the Rust server's global
+  write mutex is the equivalent lever there).

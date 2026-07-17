@@ -533,6 +533,34 @@ CREATE TYPE AS RANGE — both in `tasks/backlog.md`). Composite (66) still open:
 `row()` constructor 38, composite-value materialization 24, small catalog
 bugs 4 (see the diagnosis in this entry's session notes).
 
+**Fourth round: composite materialization.** `row(…)` anonymous records
+(text + PG binary record layout), composite cast/record-literal parsing into
+typed subdocs (quoted/escaped/nested fields, positional remap for
+``row(…)::type``), minted-OID RowDescription overrides (casts, arrays of
+composites, typed field access), binary composite params decoded via the
+embedded per-field oids, composite/domain OIDs moved to the allocation-stable
+mint, and reserved-word quoting in regtype output.
+`types/test_composite.py`: 66 → **17** (remainder: binary record edge
+samples, `test_dump_builtin_empty_range` interplay, suite-order singles).
+
+**Fifth round: CREATE TYPE … AS RANGE.** Engine-level Command interception
+(the statement exceeds sqlglot — same pattern as CREATE DOMAIN); the range
+type and its auto-created companion multirange (Postgres' rename rule) mint
+allocation-stable OIDs and reflect through `pg_type` (typtype `r`/`m`, real
+`typarray`) + `pg_range`; literal casts parse with the declared subtype's
+coercion (`ranges.custom_elem`), the constructor function works, registered
+psycopg dumpers' binary params decode via PG's range wire layout, results
+describe with the minted OID and encode in both formats, DROP TYPE removes
+the pair. Full-gauge deterministic A/B: **3736 / 90.5% → 3764 / 91.2%**, and
+the suite-wide error count fell 53 → 22 (first movement in nine runs — the
+custom-range fixtures had errored out of 31 range/multirange tests before
+any assertion ran). The four type suites now total 30 failed / 0 errors:
+composite 17, range 11, multirange 2, enum 0. Remaining levers by failure
+count: typmod/type identity in RowDescription 33, binary COPY 14,
+transaction characteristics 14, untyped-binary Parse-time inference ~10,
+plus residual edges (custom-range quoting ×3, composite binary samples ×4,
+suite-order singles).
+
 **Second slice (same day, PR pending): 19/26 → 22/26.** HAVING grew
 `IS [NOT] NULL` (bare / aggregate / computed group-key operands, exact under
 any NOT nesting), three-valued `[NOT] IN` over group keys, and always-unknown

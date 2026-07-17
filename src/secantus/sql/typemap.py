@@ -980,6 +980,16 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         # Postgres' array_out literal, not a JSON list.
         return _render_pg_array(value, infer_elem_tag(value)).encode("utf-8")
     if isinstance(value, dict):
+        # A range-shaped subdoc under an unknown tag (a user-declared range
+        # type's minted oid) renders as its range literal, not JSON.
+        if "multirange" in value:
+            from secantus.sql import ranges as _ranges
+
+            return _ranges.render_multirange(value).encode("utf-8")
+        if "empty" in value or ("lower" in value and "upper" in value):
+            from secantus.sql import ranges as _ranges
+
+            return _ranges.render(value).encode("utf-8")
         return _render_json(value).encode("utf-8")
     if isinstance(value, bson.Decimal128):
         return str(value.to_decimal()).encode("utf-8")
@@ -998,6 +1008,56 @@ def _render_pg_float(value: float) -> str:
         return "Infinity" if value > 0 else "-Infinity"
     s = repr(value)
     return s[:-2] if s.endswith(".0") else s
+
+
+def parse_pg_record_literal(text: str) -> list[str | None]:
+    """Parse a Postgres record text literal ``(a,"b,c",,\\"q\\")`` into raw field
+    strings (None for an empty/NULL field). Handles double-quoted fields with
+    ``""`` doubling and backslash escapes, including nested ``(…)`` records
+    carried as quoted text."""
+    s = text.strip()
+    if not (s.startswith("(") and s.endswith(")")):
+        raise ValueError(f"malformed record literal: {text!r}")
+    body = s[1:-1]
+    fields: list[str | None] = []
+    buf: list[str] = []
+    quoted = was_quoted = False
+    i, n = 0, len(body)
+    while i <= n:
+        c = body[i] if i < n else ","  # virtual trailing comma flushes the last field
+        if quoted:
+            if c == "\\" and i + 1 < n:
+                buf.append(body[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                if i + 1 < n and body[i + 1] == '"':
+                    buf.append('"')
+                    i += 2
+                    continue
+                quoted = False
+                i += 1
+                continue
+            buf.append(c)
+            i += 1
+            continue
+        if c == '"':
+            quoted = was_quoted = True
+            i += 1
+            continue
+        if c == ",":
+            text_field = "".join(buf)
+            fields.append(text_field if (text_field or was_quoted) else None)
+            buf, was_quoted = [], False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            buf.append(body[i + 1])
+            i += 2
+            continue
+        buf.append(c)
+        i += 1
+    return fields
 
 
 def _render_pg_composite(value: dict) -> str:
