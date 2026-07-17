@@ -1042,12 +1042,20 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   + `query::op_all` with three-way parity); structural array/doc *equality*
   (`array_eq` / `doc_eq`); bool-as-int `$gt`/`$lt`/`$gte`/`$lte` comparison
   (0.5.3-beta.119 — numeric vs int/long/double, no-match vs any other type,
-  matching Python's `<`). **Still deferred where faithful:** structural
-  array/doc *ordering* under `$gt`/`$lt` (array-vs-array lexicographic range
-  landed 2026-07-13; whole-doc ordering under range still defers), and the
-  exotic BSON types. (The retired in-process "flip `query.matches` default to
-  Rust" item is gone — the two-server model has no per-call engine selection;
-  `_secantus_core` is only the parity-test vehicle now.)
+  matching Python's `<`). **Structural ordering under `$gt`/`$lt` now done:**
+  array-vs-array lexicographic range (2026-07-13) and — fixed 2026-07-17 —
+  **doc-vs-doc ordering** (field-by-field: key string compare, else recurse,
+  else shorter-first), another dual-server bug found by the R8 triage:
+  `{a: {$gt: {x: 1}}}` returned nothing on *both* servers (Python's
+  `operator.gt` raises on dicts → swallowed no-match), where mongod orders
+  embedded documents. Fixed in `query._try_cmp` (via `ordering._bson_lt`) and
+  `query::compare_values` (via `order::bson_lt`), three-way mongod-verified; the
+  document-vs-scalar type bracket still no-matches correctly. **Still deferred
+  where faithful:** the exotic BSON types, and a rare array element pair whose
+  cross-type BSON rank Python's native `list` compare doesn't reproduce. (The
+  retired in-process "flip `query.matches` default to Rust" item is gone — the
+  two-server model has no per-call engine selection; `_secantus_core` is only
+  the parity-test vehicle now.)
 - [x] **Phase 1, leaf engine #3: `update.apply_update`** — the common
   deterministic operators ported to Rust (`crates/secantus-core/src/update.rs`,
   with the `secantus.paths` dotted-path helpers): replacement-style, `$set`,

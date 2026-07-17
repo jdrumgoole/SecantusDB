@@ -577,8 +577,27 @@ fn compare_values(
     // this is what lets `$elemMatch: {$gt: n}` over an array of sub-documents, or a
     // plain `{a: {$gt: n}}` against a document-valued `a`, no-match cleanly on the
     // Rust server instead of erroring on an otherwise-fine cross-type query.
-    if matches!(a, Bson::Document(_)) || matches!(b, Bson::Document(_)) {
-        return Ok(None);
+    match (a, b) {
+        // Two embedded documents order field-by-field under range operators
+        // (mongod: first differing key compares as a string, else recurse into
+        // the value, else the shorter document sorts first). `order::bson_lt`
+        // is exactly that comparator; `None` from it means a DBPointer sub-value
+        // Python resolves with a type-name tiebreak — defer that rare case.
+        (Bson::Document(_), Bson::Document(_)) => {
+            let ord = if crate::order::bson_lt(a, b).ok_or(Fallback)? {
+                Ordering::Less
+            } else if crate::order::bson_lt(b, a).ok_or(Fallback)? {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            };
+            return Ok(Some(ord));
+        }
+        // A document vs a non-document is a different BSON type bracket, so a
+        // document-valued field never satisfies a scalar bound (and vice versa):
+        // a clean no-match, not an error.
+        (Bson::Document(_), _) | (_, Bson::Document(_)) => return Ok(None),
+        _ => {}
     }
     // Structural array ordering: Python compares lists element-wise /
     // lexicographically (`list < list`), which mongod's range operators mirror.
@@ -1616,14 +1635,23 @@ mod tests {
     #[test]
     fn range_against_document_no_matches() {
         // mongod's range operators are type-bracketed: a document-valued field
-        // never satisfies a scalar bound, and a document bound never matches a
-        // scalar field. Python's native `<` on dicts raises TypeError (no match);
-        // the Rust matcher mirrors that with a clean no-match rather than a
-        // Fallback — so these evaluate here instead of deferring / erroring.
+        // never satisfies a *scalar* bound, and a scalar field never matches a
+        // *document* bound (a clean no-match, not an error).
         assert!(!m(doc! {"a": {"x": 1}}, doc! {"a": {"$gt": 2}}));
         assert!(!m(doc! {"a": {"x": 1}}, doc! {"a": {"$lt": 2}}));
         assert!(!m(doc! {"a": 2}, doc! {"a": {"$gt": {"x": 1}}}));
-        assert!(!m(doc! {"a": {"x": 2}}, doc! {"a": {"$gt": {"x": 1}}}));
+        // Two documents in the SAME bracket DO order, field-by-field (verified
+        // against mongod 7.0.12): {x:2} > {x:1}; {x:1,y:9} > {x:1} (longer wins
+        // on a value tie); {y:1} > {x:1} (key "y" > "x"); {x:1} is not > {x:1}.
+        assert!(m(doc! {"a": {"x": 2}}, doc! {"a": {"$gt": {"x": 1}}}));
+        assert!(m(
+            doc! {"a": {"x": 1, "y": 9}},
+            doc! {"a": {"$gt": {"x": 1}}}
+        ));
+        assert!(m(doc! {"a": {"y": 1}}, doc! {"a": {"$gt": {"x": 1}}}));
+        assert!(!m(doc! {"a": {"x": 1}}, doc! {"a": {"$gt": {"x": 1}}}));
+        assert!(m(doc! {"a": {"x": 1}}, doc! {"a": {"$gte": {"x": 1}}}));
+        assert!(m(doc! {"a": {"x": 0}}, doc! {"a": {"$lt": {"x": 1}}}));
         // The differential case: $elemMatch: {$gt: n} over an array of
         // sub-documents. Each element is a document, so every element no-matches
         // the scalar bound — the whole predicate is false, not an error.

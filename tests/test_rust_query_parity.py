@@ -178,6 +178,18 @@ CURATED = [
     ({"age": 30}, {"age": {"$gte": 30}}),
     ({"age": 30}, {"age": {"$lt": 31}}),
     ({"age": 30}, {"age": {"$lt": 30}}),
+    # Range against an embedded-document bound: order field-by-field (key
+    # compare, else recurse, else shorter-first); a document field vs a scalar
+    # bound and a scalar field vs a document bound both no-match (type bracket).
+    ({"a": {"x": 2}}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"x": 1}}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"x": 1}}, {"a": {"$gte": {"x": 1}}}),
+    ({"a": {"x": 1, "y": 9}}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"y": 1}}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"x": 0}}, {"a": {"$lt": {"x": 1}}}),
+    ({"a": {"x": 1}}, {"a": {"$lt": {"x": 1, "y": 5}}}),
+    ({"a": {"x": 1}}, {"a": {"$gt": 2}}),
+    ({"a": 2}, {"a": {"$gt": {"x": 1}}}),
     # Range operators against an array-valued (multikey) field: match when any
     # element satisfies the bound; the array-as-a-whole is never compared to the
     # scalar bound (an array out-ranks a number in BSON type order).

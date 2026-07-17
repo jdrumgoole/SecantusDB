@@ -824,6 +824,17 @@ def _try_cmp(
     # separately). Both-bool falls through to a normal (correct) bool compare.
     if isinstance(a, bool) != isinstance(b, bool):
         return False
+    # Two embedded documents order field-by-field under range operators
+    # (mongod: first differing key compares as a string, else recurse into the
+    # value, else the shorter document sorts first). Python's ``operator.gt``
+    # raises ``TypeError`` on two dicts, which the ``except`` below swallows to
+    # a silent no-match — so ``{a: {$gt: {x: 1}}}`` wrongly matched nothing.
+    # Route through the BSON-order comparator (same one ``$sort`` uses).
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        from secantus.ordering import _bson_lt
+
+        c = -1 if _bson_lt(a, b) else (1 if _bson_lt(b, a) else 0)
+        return bool(op(c, 0))
     a, b = _coerce_numeric(a, b)
     a, b = _coerce_datetime(a, b)
     try:
