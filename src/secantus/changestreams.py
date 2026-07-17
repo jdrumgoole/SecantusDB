@@ -296,6 +296,14 @@ def project(
                     "removedFields": [],
                     "truncatedArrays": [],
                 }
+            # mongod (probed 7.0.12): under showExpandedEvents the update
+            # description always carries ``disambiguatedPaths`` — an empty
+            # document when nothing was ambiguous (the diff writer only stores
+            # the key when non-empty); without the flag the key is absent.
+            if show_expanded_events:
+                event["updateDescription"].setdefault("disambiguatedPaths", {})
+            else:
+                event["updateDescription"].pop("disambiguatedPaths", None)
         _attach_full_document(
             event, op, oplog_entry, storage=storage, full_document_mode=full_document_mode
         )
@@ -457,7 +465,16 @@ def project(
                 "operationType": "dropIndexes",
                 "clusterTime": ts,
                 "ns": _ns_doc(affected_ns),
-                "operationDescription": {"indexes": [{"name": cmd.get("index", "")}]},
+                # mongod (probed 7.0.12) describes the dropped index in full.
+                # ``key`` rides in the oplog row; a legacy row without it
+                # degrades to the name-only shape.
+                "operationDescription": {
+                    "indexes": [
+                        {"v": 2, "key": dict(cmd["key"]), "name": cmd.get("index", "")}
+                        if isinstance(cmd.get("key"), Mapping) and cmd.get("key")
+                        else {"name": cmd.get("index", "")}
+                    ]
+                },
             }
             if wall is not None:
                 event["wallTime"] = wall

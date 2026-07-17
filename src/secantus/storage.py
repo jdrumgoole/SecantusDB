@@ -4913,6 +4913,11 @@ class Storage:
             c.set_key(db, coll, name)
             if c.search() != 0:
                 return False
+            # Capture the spec before removal: mongod's showExpandedEvents
+            # ``dropIndexes`` event describes the dropped index in full
+            # (``{v, key, name}``, probed 7.0.12), not just its name.
+            dropped = bson.decode(bytes(c.get_value()))
+            key_spec = dict(dropped.get("key", {}))
             c.remove()
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll, name))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
@@ -4923,7 +4928,7 @@ class Storage:
                         "op": "c",
                         "ns": f"{db}.$cmd",
                         "ui": bson.Binary(ui.bytes, subtype=4),
-                        "o": {"dropIndexes": coll, "index": name},
+                        "o": {"dropIndexes": coll, "index": name, "key": key_spec},
                     }
                 ]
             )
@@ -5019,11 +5024,14 @@ class Storage:
             # (the gauge's drop-then-reinsert E11000 cluster).
             self._refresh_read_snapshot()
             rows = self._collect_prefix(_IDX_TABLE, (db, coll))
-            names = [k[2] for k, _ in rows]
+            # Capture each index's key spec before deletion: mongod's
+            # showExpandedEvents ``dropIndexes`` event describes the dropped
+            # index in full (``{v, key, name}``, probed 7.0.12).
+            dropped = [(k[2], dict(bson.decode(bytes(v)).get("key", {}))) for k, v in rows]
             self._delete_keys(_IDX_TABLE, [k for k, _ in rows])
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
-            if names:
+            if dropped:
                 ui = self._collection_uuid(db, coll)
                 self._emit_oplog(
                     [
@@ -5031,9 +5039,9 @@ class Storage:
                             "op": "c",
                             "ns": f"{db}.$cmd",
                             "ui": bson.Binary(ui.bytes, subtype=4),
-                            "o": {"dropIndexes": coll, "index": n},
+                            "o": {"dropIndexes": coll, "index": n, "key": key},
                         }
-                        for n in names
+                        for n, key in dropped
                     ]
                 )
             return len(rows)

@@ -925,3 +925,52 @@ def test_median_and_percentile_accumulators(tmp_path) -> None:
         assert r["m"] == 2.0
     finally:
         srv.stop()
+
+
+def test_expanded_events_match_mongod_shapes(tmp_path) -> None:
+    """showExpandedEvents on the Rust server, matching the Python server and a
+    mongod 7.0.12 probe: createIndexes / dropIndexes events carry the full
+    index description (dropIndexes previously wasn't emitted at all on the
+    dropIndexes-"*" path), and expanded update events always carry
+    ``disambiguatedPaths`` while unexpanded ones never do."""
+    import time
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0, host="127.0.0.1", replica_set_name="secantus")
+    try:
+        db = _client(srv)["csx"]
+        db.c.insert_one({"_id": 0})
+        cs = db.c.watch(show_expanded_events=True, max_await_time_ms=300)
+        db.c.create_index([("x", 1)])
+        db.c.update_one({"_id": 0}, {"$set": {"a-c": 2}})
+        db.c.drop_indexes()
+        events = []
+        deadline = time.time() + 15
+        while time.time() < deadline and len(events) < 3:
+            ev = cs.try_next()
+            if ev is not None:
+                events.append(ev)
+        cs.close()
+        assert [e["operationType"] for e in events] == [
+            "createIndexes",
+            "update",
+            "dropIndexes",
+        ]
+        assert events[0]["operationDescription"] == {
+            "indexes": [{"v": 2, "key": {"x": 1}, "name": "x_1"}]
+        }
+        assert events[1]["updateDescription"]["disambiguatedPaths"] == {}
+        assert events[2]["operationDescription"] == {
+            "indexes": [{"v": 2, "key": {"x": 1}, "name": "x_1"}]
+        }
+
+        cs = db.c.watch(max_await_time_ms=300)
+        db.c.update_one({"_id": 0}, {"$set": {"n": 1}})
+        plain = None
+        deadline = time.time() + 15
+        while time.time() < deadline and plain is None:
+            plain = cs.try_next()
+        cs.close()
+        assert plain["operationType"] == "update"
+        assert "disambiguatedPaths" not in plain["updateDescription"]
+    finally:
+        srv.stop()

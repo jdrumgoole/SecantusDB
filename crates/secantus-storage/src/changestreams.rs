@@ -328,18 +328,28 @@ pub fn project(
                 .get_document("o")
                 .ok()
                 .and_then(|o| o.get_document("diff").ok().cloned());
-            match diff {
-                Some(d) => {
-                    event.insert("updateDescription", Bson::Document(d));
-                }
+            let mut ud = match diff {
+                Some(d) => d,
                 None => {
                     let mut ud = Document::new();
                     ud.insert("updatedFields", Bson::Document(Document::new()));
                     ud.insert("removedFields", Bson::Array(vec![]));
                     ud.insert("truncatedArrays", Bson::Array(vec![]));
-                    event.insert("updateDescription", Bson::Document(ud));
+                    ud
                 }
+            };
+            // mongod (probed 7.0.12): under showExpandedEvents the update
+            // description always carries `disambiguatedPaths` — an empty doc
+            // when nothing was ambiguous (the diff writer only stores the key
+            // when non-empty); without the flag the key is absent.
+            if show_expanded_events {
+                if !ud.contains_key("disambiguatedPaths") {
+                    ud.insert("disambiguatedPaths", Bson::Document(Document::new()));
+                }
+            } else {
+                ud.remove("disambiguatedPaths");
             }
+            event.insert("updateDescription", Bson::Document(ud));
         }
         attach_full_document(&mut event, op, oplog_entry, storage, full_document_mode)?;
         attach_full_document_before_change(
@@ -522,8 +532,20 @@ fn project_command(
         if !scope_matches(&affected_ns, scope) {
             return Ok((None, false));
         }
+        // mongod (probed 7.0.12) describes the dropped index in full
+        // (`{v, key, name}`); the key spec rides in the oplog row. A legacy
+        // row without it degrades to the name-only shape.
         let mut idx = Document::new();
-        idx.insert("name", cmd.get_str("index").unwrap_or(""));
+        match cmd.get_document("key") {
+            Ok(key) if !key.is_empty() => {
+                idx.insert("v", 2i32);
+                idx.insert("key", key.clone());
+                idx.insert("name", cmd.get_str("index").unwrap_or(""));
+            }
+            _ => {
+                idx.insert("name", cmd.get_str("index").unwrap_or(""));
+            }
+        }
         let mut op_desc = Document::new();
         op_desc.insert("indexes", Bson::Array(vec![Bson::Document(idx)]));
         let event = base(
