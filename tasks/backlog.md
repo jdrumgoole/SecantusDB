@@ -238,6 +238,22 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **ws-changes xdist worker crash (Linux CI, recurring).**
+  `tests/test_admin_skeleton.py::test_ws_changes_streams_collection_event`
+  intermittently hard-crashes its Linux xdist worker ("Not properly
+  terminated", ~11-12 min into the lane) and the REMAINING workers' progress
+  freezes at the same moment until the 25-min conftest watchdog kills them,
+  blaming bystander tests. Hit twice on 2026-07-17 (PR #451 durable lane, PR
+  #456 test lane — unrelated branches); reruns pass. Same suspect as the
+  macOS 6-hour-hang entry below: the admin UI websocket change-stream tail
+  (a previous occurrence pinned a core for 15+ minutes). Needs a root-cause
+  slice: reproduce under CPU starvation (the local box under parallel-session
+  load may do it), get the faulthandler dump from a first-attempt log, and
+  find both the crash cause AND why sibling workers stall (shared resource?
+  admin server port? WT cache pressure?). Do not deselect the test — this is
+  a real defect signal in the ws tail. Pattern catalogued in /ci-check.
+
+
 Subtler than the above; these may bite specific test suites.
 
 - [ ] **macOS CI test job hangs to the 6-hour kill (root cause unconfirmed).** The `test (macos-latest, 3.10)` job hit GitHub's 6-hour job timeout repeatedly (≥3× across unrelated PRs, including a *tooling-only* one), while passing in ~4 min on Linux/Windows and locally on macOS. Mitigated, not fixed: `9e16e49` dropped macOS from the continuous (push/PR) matrix, so it now runs **only at release time** (`publish.yml` / scheduled sweep) — where the hang can still bite. The per-test `timeout` (pytest-timeout, 600s) does **not** cover the wedge because it only guards a test's own body, not collection / session-scoped fixtures / xdist worker *shutdown*. **Prime suspect:** a daemon/thread not reaped on macOS keeping the worker process alive after its tests "finish" — most likely the Rust server's `stop()` / accept-thread join or a parked change-stream tailable `getMore` (the same shape as the *Python* `SecantusDBServer.stop()` use-after-free fixed in 0.5.3b5, below; `test_rust_server_stress.py` / `test_rust_pitr_cross_server.py` exercise the Rust lifecycle). **Diagnostics added** (`ci-macos-hang-guard`): a `timeout-minutes: 30` cap on the test job + a `faulthandler` session watchdog in `tests/conftest.py` that dumps every thread's stack and exits at 25 min — so the next occurrence names the wedged thread/test instead of dying silent. Close once a stack identifies the culprit and the lifecycle leak is fixed.
@@ -1373,18 +1389,15 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `timezone_offset_ms` helper; previously both ignored it). Fractional seconds stay
   deferred (BSON is millisecond-only). The Python server already supports the
   remaining `$dateFromString`/`$dateToString` directive edges.
-- [ ] **Log-family domain errors diverge from mongod (both servers).** For an
-  out-of-domain argument (`$log10`/`$ln` of a non-positive number, `$log` with a
-  non-positive value/base or base 1, `$sqrt` of a negative number) mongod raises a
-  Location error (e.g. `28761` "$log10's argument must be a positive number"),
-  whereas both SecantusDB servers return **`null`** (Python's `math.*` guarded by
-  `if v > 0`, faithfully mirrored in Rust). Both servers agree with each other; only
-  the mongod error is not reproduced. A faithful fix raises the per-op Location code
-  on **both** engines (Python module + Rust `secantus-core`) and updates the
-  expression parity corpus. Low priority — no data/correctness issue, valid inputs
-  are exact. Found by the three-way differential sweep 2026-07-14. (The `$log10`
-  operator itself is now native on the Rust server; previously it errored with a
-  generic `BadValue` even for valid input.)
+- [x] **Log-family domain errors — FIXED (2026-07-17, probed against mongod
+  7.0.12).** Out-of-domain args now raise mongod's Location codes on the Python
+  engine (`$ln` ≤ 0 → 28766, `$log10` ≤ 0 → 28761, `$log` argument → 28758 /
+  base → 28759, `$sqrt` < 0 → 28714, verbatim messages incl. ", but is X");
+  the Rust engine defers those cases so both servers surface the same errors
+  (the arithmetic-error precedent). NaN now propagates as nan (IEEE, matching
+  mongod) instead of null; null/missing still yield null. Parity-corpus
+  comments updated; pinned by `test_expressions.py::
+  test_log_family_domain_errors`.
 - [ ] **`$group` accumulator gaps — `$median`/`$percentile` SHIPPED on both
   servers (2026-07-17).** Both the group-accumulator and expression forms now
   run on Python and Rust, pinned by a live mongod **7.0.12** probe: the
@@ -1395,10 +1408,13 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   mongod's verbatim codes (40414 missing `method`/`input`/`p`; 2 non-approximate
   method; 7750301 non-array `p`; 7750303 out-of-range `p`). Still absent from
   both: the hashing family (`$toHashedIndexKey` — mongod-specific hash), and
-  **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot` as `$group` accumulators** (their
-  *expression* forms shipped — see below; MongoDB 6.3+; now validatable against
-  the local mongod 7.0.12 tarball at
-  `/usr/local/mongodb-macos-aarch64-7.0.12/bin/mongod`).
+  **`$bitAnd`/`$bitOr`/`$bitXor` as `$group` accumulators** (their
+  *expression* forms shipped — see below). NOT validatable locally: a
+  2026-07-17 probe against the mongod 7.0.12 tarball
+  (`/usr/local/mongodb-macos-aarch64-7.0.12/bin/mongod`) rejects
+  `{$group: {a: {$bitAnd: ...}}}` with `15952 unknown group operator` — the
+  accumulator form needs a newer mongod (docs say 6.3, reality says newer);
+  implement only once a mongod that accepts it is available to probe.
   **Sort-layer edge (pre-existing, not $topN-specific):** SecantusDB's sort treats a
   *missing* field as equal to explicit `null`, whereas mongod sorts missing just
   *above* null — so `$top`/`$bottom`/`$topN`/`$bottomN` (and `$sort`) can order docs

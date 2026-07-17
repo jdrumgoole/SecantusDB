@@ -2941,11 +2941,12 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
             let Some(f) = as_float_like(&v) else {
                 return Err(Fallback); // Decimal128 / non-numeric -> Python
             };
-            // Python: math.sqrt(v) if v >= 0 else None. NaN >= 0 is false -> None.
-            if f >= 0.0 {
-                Ok(Bson::Double(f.sqrt()))
+            // A negative argument is mongod's Location28714 — defer so
+            // Python raises it (NaN passes through as sqrt(nan) = nan).
+            if f < 0.0 {
+                Err(Fallback)
             } else {
-                Ok(Bson::Null)
+                Ok(Bson::Double(f.sqrt()))
             }
         }
     }
@@ -2962,18 +2963,19 @@ fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
-// `$ln`: natural log. Python returns null for v <= 0 (incl. NaN, since NaN > 0 is
-// false). Mirrors `expressions._op_ln`.
+// `$ln`: natural log. A non-positive argument is mongod's Location28766 —
+// defer so Python raises it (NaN passes through as ln(nan) = nan). Mirrors
+// `expressions._op_ln`.
 fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
             let f = as_float_like(&v).ok_or(Fallback)?;
-            Ok(if f > 0.0 {
-                Bson::Double(f.ln())
+            if f <= 0.0 {
+                Err(Fallback)
             } else {
-                Bson::Null
-            })
+                Ok(Bson::Double(f.ln()))
+            }
         }
     }
 }
@@ -2983,17 +2985,20 @@ fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
         Bson::Null => Ok(Bson::Null),
         v => {
             let f = as_float_like(&v).ok_or(Fallback)?;
-            Ok(if f > 0.0 {
-                Bson::Double(f.log10())
+            // A non-positive argument is mongod's Location28761 — defer so
+            // Python raises it (NaN passes through as log10(nan) = nan).
+            if f <= 0.0 {
+                Err(Fallback)
             } else {
-                Bson::Null
-            })
+                Ok(Bson::Double(f.log10()))
+            }
         }
     }
 }
 
-// `$log`: [number, base] -> log_base(number). Null if any arg null or out of
-// domain (n <= 0, base <= 0, base == 1). Mirrors `expressions._op_log`.
+// `$log`: [number, base] -> log_base(number). Null if any arg is null; an
+// out-of-domain arg (n <= 0, base <= 0, base == 1) defers so Python raises
+// mongod's Location28758/28759. Mirrors `expressions._op_log`.
 fn op_log(arg: &Bson, ctx: &Ctx) -> R {
     let vals = eval_args(arg, ctx)?;
     if vals.len() != 2 {
@@ -3005,8 +3010,10 @@ fn op_log(arg: &Bson, ctx: &Ctx) -> R {
     let (Some(n), Some(base)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
         return Err(Fallback);
     };
+    // Out-of-domain args are mongod's Location28758 (argument) / 28759
+    // (base) — defer so Python raises them (NaN passes through as nan).
     if n <= 0.0 || base <= 0.0 || base == 1.0 {
-        return Ok(Bson::Null);
+        return Err(Fallback);
     }
     // CPython's math.log(n, base) is log(n)/log(base); same operations -> same
     // result under the shared platform libm.

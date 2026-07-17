@@ -513,7 +513,9 @@ def test_abs_round_floor_ceil() -> None:
 
 def test_sqrt_pow() -> None:
     assert evaluate({"$sqrt": 9}, {}) == 3
-    assert evaluate({"$sqrt": -1}, {}) is None
+    # Out-of-domain now raises mongod's Location28714 (was null).
+    with pytest.raises(ExpressionError):
+        evaluate({"$sqrt": -1}, {})
     assert evaluate({"$pow": [2, 8]}, {}) == 256
 
 
@@ -523,7 +525,10 @@ def test_log_family() -> None:
     assert evaluate({"$ln": math.e}, {}) == pytest.approx(1)
     assert evaluate({"$log": [100, 10]}, {}) == pytest.approx(2)
     assert evaluate({"$log10": 1000}, {}) == pytest.approx(3)
-    assert evaluate({"$ln": -1}, {}) is None
+    # Out-of-domain now raises mongod's Location28766 (was null) — see
+    # test_log_family_domain_errors for the full matrix.
+    with pytest.raises(ExpressionError):
+        evaluate({"$ln": -1}, {})
 
 
 def test_trunc() -> None:
@@ -1065,3 +1070,36 @@ def test_project_remove_sentinel_is_omitted() -> None:
     ctx = PipelineContext(storage=None, db_name="t", vars={})  # type: ignore[arg-type]
     out = apply_pipeline([{"_id": 1, "a": 1}], [{"$project": {"r": "$$REMOVE"}}], ctx)
     assert out == [{"_id": 1}]
+
+
+def test_log_family_domain_errors() -> None:
+    """Out-of-domain log/sqrt args raise mongod's Location codes (probed
+    against mongod 7.0.12) instead of returning null; null/missing still pass
+    through as null, and NaN propagates as nan."""
+    import math
+
+    import pytest
+
+    from secantus.expressions import ExpressionError, evaluate
+
+    for expr, code in [
+        ({"$ln": 0}, 28766),
+        ({"$ln": -1}, 28766),
+        ({"$log10": 0}, 28761),
+        ({"$log10": -2.5}, 28761),
+        ({"$log": [0, 2]}, 28758),
+        ({"$log": [-1, 2]}, 28758),
+        ({"$log": [8, 0]}, 28759),
+        ({"$log": [8, 1]}, 28759),
+        ({"$log": [8, -2]}, 28759),
+        ({"$sqrt": -1}, 28714),
+        ({"$sqrt": -0.5}, 28714),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr
+
+    assert evaluate({"$ln": None}, {}, None) is None
+    assert evaluate({"$ln": "$missing"}, {}, None) is None
+    assert evaluate({"$sqrt": 0}, {}, None) == 0.0
+    assert math.isnan(evaluate({"$ln": float("nan")}, {}, None))
