@@ -147,6 +147,26 @@ def test_all() -> None:
     assert not matches({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}})
 
 
+def test_all_scalar_field_and_empty() -> None:
+    """mongod treats a *scalar* field like a one-element array for ``$all``
+    (verified against mongod 7.0.12): ``{tags: {$all: ["red"]}}`` matches both
+    ``tags: ["red", ...]`` and scalar ``tags: "red"`` — previously the scalar
+    was silently missed. Regex elements match the scalar as a pattern too. An
+    empty ``$all`` matches nothing (not everything), and ``$elemMatch`` clauses
+    still require an actual array."""
+    from bson import Regex
+
+    assert matches({"tags": "red"}, {"tags": {"$all": ["red"]}})
+    assert matches({"tags": "red"}, {"tags": {"$all": [Regex("^red$")]}})
+    assert not matches({"tags": "red"}, {"tags": {"$all": ["red", "blue"]}})
+    # $all: [] matches nothing.
+    assert not matches({"tags": ["a", "b"]}, {"tags": {"$all": []}})
+    assert not matches({"tags": "red"}, {"tags": {"$all": []}})
+    # $elemMatch requires an array — a scalar never satisfies it.
+    assert not matches({"tags": "red"}, {"tags": {"$all": [{"$elemMatch": {"$eq": "red"}}]}})
+    assert matches({"tags": ["red"]}, {"tags": {"$all": [{"$elemMatch": {"$eq": "red"}}]}})
+
+
 def test_all_with_elemmatch() -> None:
     q = {"a": {"$all": [{"$elemMatch": {"$gt": 1, "$lt": 3}}]}}
     assert matches({"a": [1, 2, 3]}, q)  # 2 is in (1, 3)
