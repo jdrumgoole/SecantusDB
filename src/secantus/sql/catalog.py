@@ -35,6 +35,8 @@ ENUM_META_COLLECTION = "__sql_enum_meta__"
 ENUM_TYPE_OID_BASE = 65000
 DOMAIN_TYPE_OID_BASE = 66000
 COMPOSITE_TYPE_OID_BASE = 67000
+RANGE_TYPE_OID_BASE = 69000
+RANGE_TYPE_COLLECTION = "__sql_range_types__"
 # A user type's paired array-type oid (pg_type ``typarray``) is its own oid
 # plus this offset — derived, never stored, and clear of every other minted-oid
 # base (functions 65000+, domains 66000+, composites 67000+). Reporting a real
@@ -1079,6 +1081,56 @@ class Catalog:
                 }
             ],
         )
+
+    # -- user range types ---------------------------------------------------- #
+    # ``CREATE TYPE name AS RANGE (subtype = X)``. Postgres auto-creates the
+    # companion multirange type (``testrange`` → ``testmultirange``); both get
+    # allocation-stable minted oids.
+
+    @staticmethod
+    def multirange_name_for(name: str) -> str:
+        head, sep, tail = name.rpartition("range")
+        return f"{head}multirange{tail}" if sep else f"{name}_multirange"
+
+    def create_range_type(self, db: str, name: str, subtype_tag: str) -> None:
+        self._storage.delete_matching(db, RANGE_TYPE_COLLECTION, {"_id": name})
+        oid = self._mint_user_type_oid(
+            db, "range_oid_counter", RANGE_TYPE_OID_BASE, RANGE_TYPE_COLLECTION
+        )
+        mr_oid = self._mint_user_type_oid(
+            db, "range_oid_counter", RANGE_TYPE_OID_BASE, RANGE_TYPE_COLLECTION
+        )
+        self._storage.insert(
+            db,
+            RANGE_TYPE_COLLECTION,
+            [
+                {
+                    "_id": name,
+                    "range": name,
+                    "subtype_tag": subtype_tag,
+                    "oid": oid,
+                    "multirange": self.multirange_name_for(name),
+                    "multirange_oid": mr_oid,
+                }
+            ],
+        )
+
+    def get_range_type(self, db: str, name: str) -> dict[str, Any] | None:
+        """The range-type doc by its range OR companion multirange name."""
+        docs = self._storage.find_matching(db, RANGE_TYPE_COLLECTION, {"_id": name}, limit=1)
+        if docs:
+            return docs[0]
+        docs = self._storage.find_matching(db, RANGE_TYPE_COLLECTION, {"multirange": name}, limit=1)
+        return docs[0] if docs else None
+
+    def range_type_exists(self, db: str, name: str) -> bool:
+        return self.get_range_type(db, name) is not None
+
+    def drop_range_type(self, db: str, name: str) -> bool:
+        return self._storage.delete_matching(db, RANGE_TYPE_COLLECTION, {"_id": name}) > 0
+
+    def list_range_types(self, db: str) -> list[dict[str, Any]]:
+        return self._storage.find_matching(db, RANGE_TYPE_COLLECTION, {})
 
     def composite_type_oids(self, db: str) -> dict[str, int]:
         """Minted pg_type oid per composite — allocation-stable (see

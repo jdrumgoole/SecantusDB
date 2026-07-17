@@ -67,10 +67,25 @@ def test_drop_type_if_exists(storage, session):
     assert run(storage, session, "DROP TYPE IF EXISTS nope").command_tag == "DROP TYPE"
 
 
-def test_range_create_type_unsupported(storage, session):
-    # Composite types are supported (see test_sql_composite_type); range / base
-    # types remain a faithful not-supported (0A000).
-    assert sqlstate(storage, session, "CREATE TYPE fr AS RANGE (subtype = float8)") == "0A000"
+def test_range_create_type(storage, session):
+    # Range types are supported (see also test_pgserver_psycopg): the type and
+    # its auto-created companion multirange reflect through pg_type/pg_range,
+    # and literal casts parse with the declared subtype.
+    assert (
+        run(storage, session, "CREATE TYPE fr AS RANGE (subtype = float8)").command_tag
+        == "CREATE TYPE"
+    )
+    rows = run(
+        storage,
+        session,
+        "SELECT typname, typtype FROM pg_type WHERE typname IN ('fr', 'fr_multirange')"
+        " ORDER BY typname",
+    ).rows
+    assert rows == [("fr", "r"), ("fr_multirange", "m")]
+    r = run(storage, session, "SELECT '[1.5,2.5)'::fr").rows[0][0]
+    assert r == {"lower": 1.5, "upper": 2.5, "lower_inc": True, "upper_inc": False}
+    # Base types remain a faithful not-supported (0A000).
+    assert sqlstate(storage, session, "CREATE TYPE base_t (input = f, output = g)") == "0A000"
 
 
 # -- enum-typed columns -------------------------------------------------------- #

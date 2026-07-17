@@ -898,3 +898,34 @@ def test_composite_registration_roundtrip(server):
         assert conn.execute("select row(1, 'a')").fetchone()[0] == ("1", "a")
         with conn.cursor(binary=True) as bcur:
             assert bcur.execute("select row(1, 'a')").fetchone()[0] == (1, "a")
+
+
+def test_create_type_as_range(server):
+    """CREATE TYPE … AS RANGE: RangeInfo/MultirangeInfo fetch through pg_type +
+    pg_range (stable minted oids, companion multirange), registered loaders
+    fire on casts and constructors, and params round-trip."""
+    from psycopg.types.multirange import Multirange, MultirangeInfo, register_multirange
+    from psycopg.types.range import Range, RangeInfo, register_range
+
+    with connect(server, autocommit=True) as conn:
+        conn.execute('create type textrange as range (subtype = text, collation = "C")')
+        info = RangeInfo.fetch(conn, "textrange")
+        assert info is not None and info.oid > 0
+        assert info.oid != info.array_oid > 0
+        assert info.subtype_oid == 25
+        register_range(info, conn)
+
+        got = conn.execute("select '[a,z)'::textrange").fetchone()[0]
+        assert got == Range("a", "z", "[)")
+        assert conn.execute(
+            "select textrange('a', 'z', '[)') = %s", [Range("a", "z")]
+        ).fetchone() == (True,)
+
+        mr_info = MultirangeInfo.fetch(conn, "textmultirange")
+        assert mr_info is not None and mr_info.range_oid == info.oid
+        register_multirange(mr_info, conn)
+        got = conn.execute("select '{[a,b)}'::textmultirange").fetchone()[0]
+        assert got == Multirange([Range("a", "b", "[)")])
+
+        conn.execute("drop type textrange cascade")
+        assert RangeInfo.fetch(conn, "textrange") is None

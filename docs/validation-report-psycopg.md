@@ -2,19 +2,19 @@
 
 - SecantusDB (Python server) 0.5.4b235
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-07-16 23:16 UTC
+- generated: 2026-07-17 00:17 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
-| test_adapt.py | 51 | 8 | 0 | 59 | 86.4% |
+| test_adapt.py | 49 | 10 | 0 | 59 | 83.1% |
 | test_capabilities.py | 12 | 0 | 9 | 21 | 100.0% |
 | test_column.py | 18 | 35 | 0 | 53 | 34.0% |
 | test_connection.py | 79 | 23 | 2 | 104 | 77.5% |
 | test_connection_info.py | 32 | 5 | 3 | 40 | 86.5% |
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
-| test_copy.py | 89 | 22 | 1 | 112 | 80.2% |
+| test_copy.py | 87 | 24 | 1 | 112 | 78.4% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
-| test_cursor_client.py | 27 | 1 | 0 | 28 | 96.4% |
+| test_cursor_client.py | 26 | 2 | 0 | 28 | 92.9% |
 | test_cursor_common.py | 277 | 3 | 8 | 288 | 98.9% |
 | test_cursor_raw.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_server.py | 89 | 21 | 0 | 110 | 80.9% |
@@ -36,25 +36,27 @@
 | types/test_enum.py | 197 | 0 | 0 | 197 | 100.0% |
 | types/test_hstore.py | 24 | 0 | 15 | 39 | 100.0% |
 | types/test_json.py | 258 | 0 | 0 | 258 | 100.0% |
-| types/test_multirange.py | 187 | 18 | 12 | 217 | 91.2% |
+| types/test_multirange.py | 203 | 2 | 12 | 217 | 99.0% |
 | types/test_net.py | 3 | 30 | 0 | 33 | 9.1% |
 | types/test_none.py | 1 | 0 | 0 | 1 | 100.0% |
 | types/test_numeric.py | 366 | 4 | 0 | 370 | 98.9% |
 | types/test_numpy.py | 88 | 78 | 6 | 172 | 53.0% |
-| types/test_range.py | 247 | 28 | 12 | 287 | 89.8% |
+| types/test_range.py | 264 | 11 | 12 | 287 | 96.0% |
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 110 | 24 | 1 | 135 | 82.1% |
 | types/test_uuid.py | 21 | 5 | 0 | 26 | 80.8% |
-| **total** | **3736** | **390** | **112** | **4238** | **90.5%** |
+| **total** | **3764** | **362** | **112** | **4238** | **91.2%** |
 
-## Failures (390)
+## Failures (362)
 
 - `tests/test_adapt.py::test_no_cast_needed[b]`
 - `tests/test_adapt.py::test_no_cast_needed[s]`
 - `tests/test_adapt.py::test_no_cast_needed[t]`
 - `tests/test_adapt.py::test_random[0-b]`
 - `tests/test_adapt.py::test_random[0-s]`
+- `tests/test_adapt.py::test_random[0-t]`
 - `tests/test_adapt.py::test_random[1-b]`
+- `tests/test_adapt.py::test_random[1-s]`
 - `tests/test_adapt.py::test_random[1-t]`
 - `tests/test_adapt.py::test_return_untyped[b]`
 - `tests/test_column.py::test_description_attribs`
@@ -123,6 +125,7 @@
 - `tests/test_copy.py::test_binary_partial_row`
 - `tests/test_copy.py::test_connection_writer[1-sample_binary]`
 - `tests/test_copy.py::test_copy_bad_result`
+- `tests/test_copy.py::test_copy_from_leaks[0-False]`
 - `tests/test_copy.py::test_copy_from_leaks[0-True]`
 - `tests/test_copy.py::test_copy_from_leaks[1-True]`
 - `tests/test_copy.py::test_copy_in_allchars`
@@ -137,11 +140,13 @@
 - `tests/test_copy.py::test_copy_out_read[1]`
 - `tests/test_copy.py::test_copy_table_across[binary]`
 - `tests/test_copy.py::test_copy_table_across[block]`
+- `tests/test_copy.py::test_copy_table_across[row]`
 - `tests/test_copy.py::test_read_row_notypes[1]`
 - `tests/test_copy.py::test_rows_notypes[1]`
 - `tests/test_copy.py::test_subclass_adapter[1]`
 - `tests/test_copy.py::test_subclass_nulling_dumper[1]`
 - `tests/test_copy.py::test_worker_life[1-sample_binary]`
+- `tests/test_cursor_client.py::test_leak[asyncio-dict_row-many]`
 - `tests/test_cursor_client.py::test_leak[asyncio-namedtuple_row-all]`
 - `tests/test_cursor_common.py::test_stream_badquery[asyncio-ClientCursor-copy (select 1) to stdout]`
 - `tests/test_cursor_common.py::test_stream_badquery[asyncio-Cursor-copy (select 1) to stdout]`
@@ -254,22 +259,6 @@
 - `tests/types/test_composite.py::test_load_recursive_composite[1]`
 - `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int4multirange-ranges0]`
 - `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int8multirange-ranges2]`
-- `tests/types/test_multirange.py::test_dump_custom_empty`
-- `tests/types/test_multirange.py::test_dump_custom_none[b]`
-- `tests/types/test_multirange.py::test_dump_custom_none[s]`
-- `tests/types/test_multirange.py::test_dump_custom_none[t]`
-- `tests/types/test_multirange.py::test_fetch_info[name2-text]`
-- `tests/types/test_multirange.py::test_fetch_info[name3-float8]`
-- `tests/types/test_multirange.py::test_fetch_info[testmultirange-text]`
-- `tests/types/test_multirange.py::test_fetch_info[testschema.testmultirange-float8]`
-- `tests/types/test_multirange.py::test_fetch_info_async[asyncio-name2-text]`
-- `tests/types/test_multirange.py::test_fetch_info_async[asyncio-name3-float8]`
-- `tests/types/test_multirange.py::test_fetch_info_async[asyncio-testmultirange-text]`
-- `tests/types/test_multirange.py::test_fetch_info_async[asyncio-testschema.testmultirange-float8]`
-- `tests/types/test_multirange.py::test_literal_invalid_name[\u20ac]`
-- `tests/types/test_multirange.py::test_literal_invalid_name[a-b]`
-- `tests/types/test_multirange.py::test_load_custom_empty[0]`
-- `tests/types/test_multirange.py::test_load_custom_empty[1]`
 - `tests/types/test_net.py::test_address_dump[192.168.0.1-b]`
 - `tests/types/test_net.py::test_address_dump[192.168.0.1-s]`
 - `tests/types/test_net.py::test_address_dump[192.168.0.1-t]`
@@ -390,24 +379,7 @@
 - `tests/types/test_range.py::test_dump_builtin_empty[b-tstzrange]`
 - `tests/types/test_range.py::test_dump_builtin_range[b-int4range-None-None-()]`
 - `tests/types/test_range.py::test_dump_builtin_range[b-int8range-None-None-()]`
-- `tests/types/test_range.py::test_dump_custom_empty`
-- `tests/types/test_range.py::test_dump_custom_null[b]`
-- `tests/types/test_range.py::test_dump_custom_null[s]`
-- `tests/types/test_range.py::test_dump_custom_null[t]`
 - `tests/types/test_range.py::test_dump_quoting`
-- `tests/types/test_range.py::test_fetch_info[name2-text]`
-- `tests/types/test_range.py::test_fetch_info[name3-float8]`
-- `tests/types/test_range.py::test_fetch_info[testrange-text]`
-- `tests/types/test_range.py::test_fetch_info[testschema.testrange-float8]`
-- `tests/types/test_range.py::test_fetch_info_async[asyncio-name2-text]`
-- `tests/types/test_range.py::test_fetch_info_async[asyncio-name3-float8]`
-- `tests/types/test_range.py::test_fetch_info_async[asyncio-testrange-text]`
-- `tests/types/test_range.py::test_fetch_info_async[asyncio-testschema.testrange-float8]`
-- `tests/types/test_range.py::test_literal_invalid_name[\u20ac]`
-- `tests/types/test_range.py::test_literal_invalid_name[a-b]`
-- `tests/types/test_range.py::test_literal_invalid_name[order]`
-- `tests/types/test_range.py::test_load_custom_empty[0]`
-- `tests/types/test_range.py::test_load_custom_empty[1]`
 - `tests/types/test_range.py::test_load_quoting[0]`
 - `tests/types/test_range.py::test_load_quoting[1]`
 - `tests/types/test_string.py::test_dump_1byte[Binary-b]`

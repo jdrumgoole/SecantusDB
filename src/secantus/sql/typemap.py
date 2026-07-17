@@ -980,6 +980,16 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         # Postgres' array_out literal, not a JSON list.
         return _render_pg_array(value, infer_elem_tag(value)).encode("utf-8")
     if isinstance(value, dict):
+        # A range-shaped subdoc under an unknown tag (a user-declared range
+        # type's minted oid) renders as its range literal, not JSON.
+        if "multirange" in value:
+            from secantus.sql import ranges as _ranges
+
+            return _ranges.render_multirange(value).encode("utf-8")
+        if "empty" in value or ("lower" in value and "upper" in value):
+            from secantus.sql import ranges as _ranges
+
+            return _ranges.render(value).encode("utf-8")
         return _render_json(value).encode("utf-8")
     if isinstance(value, bson.Decimal128):
         return str(value.to_decimal()).encode("utf-8")
