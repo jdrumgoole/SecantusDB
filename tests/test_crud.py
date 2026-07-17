@@ -4254,3 +4254,22 @@ def test_range_orders_embedded_documents(coll) -> None:
     assert sorted(d["_id"] for d in coll.find({"a": {"$lt": {"x": 1}}})) == [2]
     # A scalar field never matches a document bound.
     assert 6 not in [d["_id"] for d in coll.find({"a": {"$gt": {"x": 1}}})]
+
+
+def test_query_mod_truncation_and_bool(coll) -> None:
+    """$mod over the wire: double values (and the divisor) truncate toward
+    zero, bool is excluded, C-style modulo. Regression for a bug where the Rust
+    server errored on a double-valued field and both servers matched bool."""
+    coll.insert_many(
+        [
+            {"_id": 1, "a": 5},
+            {"_id": 2, "a": 5.0},
+            {"_id": 3, "a": True},
+            {"_id": 4, "a": 5.5},
+            {"_id": 5, "a": -5},
+            {"_id": 6, "a": 4.9},
+        ]
+    )
+    assert sorted(d["_id"] for d in coll.find({"a": {"$mod": [2, 1]}})) == [1, 2, 4]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$mod": [2, 0]}})) == [6]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$mod": [2.5, 0]}})) == [6]

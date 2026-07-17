@@ -195,6 +195,33 @@ def test_mod() -> None:
     assert not matches({"n": 13}, {"n": {"$mod": [4, 0]}})
 
 
+def test_mod_truncation_bool_and_errors() -> None:
+    """$mod fidelity, pinned against mongod 7.0.12: value AND divisor truncate
+    toward zero to integers; bool is excluded (not a number); C-style
+    (truncated) modulo, so -5 % 2 == -1; Decimal128 counts on the Python
+    engine; divisor 0 and a malformed spec raise."""
+    from bson import Decimal128
+
+    # Double values truncate toward zero (previously the Rust server errored).
+    assert matches({"n": 5.0}, {"n": {"$mod": [2, 1]}})
+    assert matches({"n": 5.5}, {"n": {"$mod": [2, 1]}})  # trunc 5
+    assert matches({"n": 4.9}, {"n": {"$mod": [2, 0]}})  # trunc 4
+    # The divisor truncates too: [2.5, 0] divides by 2.
+    assert matches({"n": 4.9}, {"n": {"$mod": [2.5, 0]}})
+    # bool is excluded (Python's True % 2 would have matched).
+    assert not matches({"n": True}, {"n": {"$mod": [2, 1]}})
+    # C-style modulo: -5 % 2 == -1, not 1.
+    assert not matches({"n": -5}, {"n": {"$mod": [2, 1]}})
+    assert matches({"n": -5}, {"n": {"$mod": [2, -1]}})
+    # Decimal128 counts (Python engine).
+    assert matches({"n": Decimal128("5")}, {"n": {"$mod": [2, 1]}})
+    # Errors.
+    with pytest.raises(QueryError):
+        matches({"n": 5}, {"n": {"$mod": [0, 1]}})
+    with pytest.raises(QueryError):
+        matches({"n": 5}, {"n": {"$mod": [2]}})
+
+
 def test_mod_on_array_element() -> None:
     assert matches({"vals": [3, 7, 12]}, {"vals": {"$mod": [4, 0]}})
 

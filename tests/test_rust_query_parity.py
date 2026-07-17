@@ -266,6 +266,16 @@ CURATED = [
     ({"n": 13}, {"n": {"$mod": [4, 1]}}),
     ({"n": 13}, {"n": {"$mod": [4, 0]}}),
     ({"vals": [3, 7, 12]}, {"vals": {"$mod": [4, 0]}}),
+    # $mod: double values truncate toward zero, divisor truncates too, bool is
+    # excluded, C-style modulo (-5 % 2 == -1). (Decimal128 defers on the Rust
+    # side — parity harness skips a defer.)
+    ({"n": 5.0}, {"n": {"$mod": [2, 1]}}),
+    ({"n": 5.5}, {"n": {"$mod": [2, 1]}}),
+    ({"n": 4.9}, {"n": {"$mod": [2, 0]}}),
+    ({"n": 4.9}, {"n": {"$mod": [2.5, 0]}}),
+    ({"n": True}, {"n": {"$mod": [2, 1]}}),
+    ({"n": -5}, {"n": {"$mod": [2, 1]}}),
+    ({"n": -5}, {"n": {"$mod": [2, -1]}}),
     (
         {"items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]},
         {"items": {"$elemMatch": {"sku": "b", "qty": {"$gte": 5}}}},
