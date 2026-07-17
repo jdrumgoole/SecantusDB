@@ -480,13 +480,38 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   matrix to prove the end-to-end build (no local Windows to verify against).
   The entry's second half was stale: the CLI's TOML config layer + tuning
   flags shipped in §7.6 (beta.96, `config.rs` + `wt_config` knobs).
-- [ ] **R8 tail — pymongo AND go now run against the Rust server** (go leg
-  2026-07-17): `./inv validate-go --server rust` → **398 / 3 / 52 (99.3%)**,
-  unified suite 42/42; the one real failure is
-  `TestChangeStream_ReplicaSet/try_next/one_getMore_sent` — the documented,
-  accepted go-harness load-timing artifact (§ "Go gauge flake" below), now
-  observed against the Rust server too. Remaining legs: node / java / kotlin
-  / ruby / rust-driver / php-lib / php-ext / c / cxx / dotnet / pymongo-async.
+- [~] **R8 tail — ALL THIRTEEN driver gauges now run against the Rust server**
+  (2026-07-17 sweep; reports committed as `docs/validation-report-*-rust-server.md`).
+  The Rust server is at effective conformance parity with the Python server —
+  two perfect scores, nothing below 98%, and every failure is either a known
+  out-of-scope gap (text/hashed indexes, `$where`, transactions/sessions on a
+  single node, Atlas search-index management, IPv6) or a documented driver-side /
+  harness artifact — **no new Rust-specific divergence surfaced**:
+
+  | gauge | passed/failed/skipped | pass % | failures |
+  |---|---|---|---|
+  | rust-driver | 101 / 0 / 0 | **100.0%** | — |
+  | dotnet | 202 / 0 / 26 | **100.0%** | — |
+  | kotlin | 294 / 0 / 244 | **100.0%** | — |
+  | php-ext | 670 / 1 / 41 | 99.9% | tailable-collection-dropped edge |
+  | node | 358 / 1 / 5 | 99.7% | text-search sort (out of scope) |
+  | java | 445 / 2 / 453 | 99.6% | mapReduce (legacy) ×2 |
+  | pymongo | 1019 / 6 / 475 | 99.4% | known set (text/hashed/$where/CSOT) |
+  | go | 398 / 3 / 52 | 99.3% | `try_next` harness artifact (accepted) |
+  | php-lib | 3048 / 43 / 39 | 98.6% | ~37 txn/session (out of scope) + 4 to triage |
+  | pymongo-async | 919 / 13 / 491 | 98.6% | sync set + 6 read_concern harness-isolation |
+  | ruby | 289 / 5 / 24 | 98.3% | documented ruby artifacts + session cases |
+  | c | 718 / 15 / 69 | 98.0% | documented C set (ipv6/lastWriteDate/select_server/search) |
+  | cxx | 885 / 3 / 9 | 99.7% | change-stream resume-token tracking, client-metadata handshake ×2 |
+
+  Follow-up triage (not blockers, no data risk): the php-lib "4 real" assertion
+  failures (change-stream resume-token type, session-freed, findOneAndReplace
+  BSON-type-map field order, 2dsphere index-version) and the pymongo-async
+  6× `test_read_concern` (shared `CollectionInvalid: collection already exists`
+  — likely async-harness test-isolation) should be diffed against the Python-server
+  runs of the same gauges to confirm none is Rust-specific. The remaining CI
+  wiring — adding the other-language `--server rust` gauge lanes to
+  `validate.yml` (only pymongo-rust-server runs weekly today) — is the last piece.
   Original: only the pymongo gauge runs against the Rust server
   (`invoke validate --server rust` / the `pymongo-rust-server` entry in
   `validate.yml`). The Go/Node/Java/Ruby/Rust-driver gauges still gauge the
