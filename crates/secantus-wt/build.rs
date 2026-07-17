@@ -14,8 +14,17 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn lib_present(dir: &str) -> bool {
-    Path::new(&format!("{dir}/libwiredtiger.a")).exists()
-        || Path::new(&format!("{dir}/libwiredtiger.so")).exists()
+    // Unix static/shared names, plus MSVC's `wiredtiger.lib` (the R7 tail:
+    // the Windows wheel build produces neither `lib*` name, so the standalone
+    // binary never resolved WT there) and macOS's `.dylib` for completeness.
+    [
+        "libwiredtiger.a",
+        "libwiredtiger.so",
+        "libwiredtiger.dylib",
+        "wiredtiger.lib",
+    ]
+    .iter()
+    .any(|n| Path::new(&format!("{dir}/{n}")).exists())
 }
 
 fn resolve_wt() -> (String, String) {
@@ -49,8 +58,8 @@ fn resolve_wt() -> (String, String) {
 
     panic!(
         "WiredTiger not found. Set SECANTUS_WT_INCLUDE (dir with wiredtiger.h) and \
-         SECANTUS_WT_LIB (dir with libwiredtiger.a/.so), or build the vendored \
-         WiredTiger. Probed: {candidates:?}"
+         SECANTUS_WT_LIB (dir with libwiredtiger.a/.so/.dylib or wiredtiger.lib), \
+         or build the vendored WiredTiger. Probed: {candidates:?}"
     );
 }
 

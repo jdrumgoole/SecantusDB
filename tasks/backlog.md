@@ -473,13 +473,21 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   reduces re-downloads within a job; cargo vendoring / a registry mirror would
   remove the risk entirely.
 **Deferred / not yet ported:**
-- [ ] **R7 tail** — a Windows standalone binary (`secantus-wt`'s `build.rs`
-  probes `libwiredtiger.a/.so`; the MSVC wheel build produces neither name, so
-  the bin builds only where the .a exists — wheel-bundled `_secantus_server`
-  covers Windows); the Python CLI's TOML config layer + tuning flags
-  (`--log-level` / `--cache-size` / `--session-max` / `--sync-on-commit` /
-  oplog retention / noop heartbeat) pending matching `Storage::open` knobs.
-- [ ] **R8 tail** — only the pymongo gauge runs against the Rust server
+- [ ] **R7 tail — probe fixed, Windows-binary CI verification pending**
+  (2026-07-17). `secantus-wt`'s `build.rs` now also probes MSVC's
+  `wiredtiger.lib` (and `.dylib`), so the standalone binary can resolve WT on
+  Windows; still to do: a Windows lane in the `secantusdb-v*` release-binaries
+  matrix to prove the end-to-end build (no local Windows to verify against).
+  The entry's second half was stale: the CLI's TOML config layer + tuning
+  flags shipped in §7.6 (beta.96, `config.rs` + `wt_config` knobs).
+- [ ] **R8 tail — pymongo AND go now run against the Rust server** (go leg
+  2026-07-17): `./inv validate-go --server rust` → **398 / 3 / 52 (99.3%)**,
+  unified suite 42/42; the one real failure is
+  `TestChangeStream_ReplicaSet/try_next/one_getMore_sent` — the documented,
+  accepted go-harness load-timing artifact (§ "Go gauge flake" below), now
+  observed against the Rust server too. Remaining legs: node / java / kotlin
+  / ruby / rust-driver / php-lib / php-ext / c / cxx / dotnet / pymongo-async.
+  Original: only the pymongo gauge runs against the Rust server
   (`invoke validate --server rust` / the `pymongo-rust-server` entry in
   `validate.yml`). The Go/Node/Java/Ruby/Rust-driver gauges still gauge the
   Python server only: their runners spawn `python -m secantus` as the daemon,
@@ -621,7 +629,18 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   by CMake and smoke-tested via pymongo across Linux/macOS/Windows. `RustServer`
   auto-creates the storage dir. **Follow-ups:** a Python `secantus`-package
   wrapper for `SecantusDBServer`-style ergonomics; an `invoke rust-server-py` task.
-- [ ] **R4 tail — TLS / mTLS** (`rustls`) + `peer_cert_dn` threading for X509.
+- [x] **R4 tail — TLS / mTLS + MONGODB-X509: SHIPPED and now verified end-to-end
+  (2026-07-17).** Server-side TLS, mTLS client-cert verification, and
+  `peer_cert_dn` threading were already implemented; the new Rust-server
+  e2e test (`test_rust_server_smoke.py::test_tls_and_x509_auth_end_to_end`,
+  the Python suite's two-stage bootstrap flow) exposed that
+  `cert_subject_dn` used x509-parser's raw `Display` — least-specific-first
+  with `", "` separators — so the extracted DN NEVER matched a provisioned
+  user record and X509 auth always failed with AuthenticationFailed. It now
+  emits the mongod-style RFC 4514 form (most-specific-first, bare commas,
+  short OID names, value escaping) byte-identical to
+  `secantus.auth.subject_dn_from_peercert`, so a user provisioned against
+  either server authenticates on the other.
 - [~] **`update` options** — DONE: pipeline-form `u` (`[...]`) via
   `update_matching_pipeline` (diff-style oplog → change streams see
   `operationType: "update"`); **positional operators (`$` / `$[]` / `$[ident]`)
@@ -665,14 +684,19 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
 - [ ] **`find` edges** — empty-collection/empty-result filter validation DONE:
   when nothing matched, the filter is re-run once against an empty document so an
   invalid / unsupported filter surfaces `BadValue` (consistent with the
-  non-empty storage-scan path) instead of an empty cursor. Still deferred:
-  `tailable: true` capped-collection poll. (Tracked in `find.rs` module docs.)
+  non-empty storage-scan path) instead of an empty cursor. The `tailable: true`
+  capped-collection poll SHIPPED since (find.rs's tailable producer, mirroring
+  `_find_tailable`) — verified live and pinned by
+  `test_rust_server_smoke.py::test_tailable_cursor_on_capped_collection`
+  (2026-07-17 audit).
 - [x] **R2c — `update` command.** Document-, replacement-, and pipeline-form `u`
   all apply; positional operators + `arrayFilters` + `let` + `collation` done;
   sort-rejection (9) + pipeline-stage validation (9 / 168) pre-checks done.
   `validator` still deferred (see "update options" above).
-- [ ] **`find` command** — lands with R3 (cursor registry) + `secantus-core`
-  projection; first-batch + `getMore`/`killCursors`.
+- [x] **`find` command — SHIPPED** (R3 landed long since: first-batch +
+  `getMore`/`killCursors`, cursor registry, `secantus-core` projection; the
+  Rust-server smoke suite and the pymongo gauge exercise all of it). Entry was
+  stale (2026-07-17 audit).
 - [x] **`collMod` + collection options + `validator` (insert).** `collMod` is now
   a registered command (`secantus-commands::admin::coll_mod`): merges recognised
   options (`validator` / `validationLevel` / `validationAction` /
@@ -898,14 +922,25 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   Rust equivalent of `storage._oplog_cv`; `oplog_tail_seq_nolock` subsumed. 4
   cross-thread WT-backed tests (`tests/condvar.rs`) + threaded smoke. `commands.py`
   refactor off the raw `_oplog_cv` onto this method pair lands with the adapter.
-- [ ] **Phase 4 sub-phase 5e — remaining gaps + adapter.** Remaining gaps:
+- [x] **Phase 4 sub-phase 5e — SUPERSEDED by the two-server model**
+  (`tasks/rust-server-plan.md`; 2026-07-17 audit). The `secantus.engine`
+  storage-selection + Python-`Storage`-adapter-over-`RustStorage` +
+  `SECANTUS_ENGINE=rust` gauge this entry planned is exactly the retired
+  in-process model; its goal — the full Rust storage validated by the pymongo
+  gauge — is delivered by the Rust *server* (99.4%, identical failure set to
+  the Python server). Original scope for reference: Remaining gaps:
   `checkpoint`/`close`/`create_archive` (admin/`fsync`/backup — none block the core
   conformance suites; `close` handled adapter-side). Then the `secantus.engine`
   storage-selection + Python `Storage` adapter over `RustStorage` (BSON seam,
   `EngineFallback` → Python-operators-over-Rust-docs, E11000/`BadHint` translation,
   `commands.py` getMore refactored onto `wait_for_oplog`/`notify_oplog_waiters`),
   then `test_storage.py`/`test_crud.py` + pymongo gauge under `SECANTUS_ENGINE=rust`.
-- [ ] **Phase 4 — storage keystone (continued).** Remaining: (a) wire
+- [x] **Phase 4 — storage keystone: (a) SUPERSEDED, (b) DONE** (2026-07-17
+  audit). (a) `secantus.engine` selection is the retired in-process model —
+  the Rust storage serves the Rust server instead. (b) the shipping
+  `wheels.yml` cibuildwheel matrix already builds with
+  `SECANTUS_BUILD_STORAGE_ENGINE=ON` (lines ~113-130), so the flag-flip this
+  entry was waiting on happened. Original scope: (a) wire
   `secantus.engine` storage selection so `SecantusDBServer` can use the Rust
   `Storage` under `SECANTUS_ENGINE=rust` — **gated on porting the rest of the
   `Storage` surface** (the server needs `find_matching`/indexes/oplog/etc., not
@@ -925,13 +960,22 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   once engine-selection makes the Rust storage engine selectable, flip the flag on
   in the shipping `wheels.yml` / cibuildwheel matrix (and add the abi3 storage
   extension to the wheel's repair/tag handling there).
-- [ ] **Toward a standalone Rust package (continued).** With the lib/bindings
+- [ ] **Toward a standalone Rust package — (b) DONE, (a) needs a crates.io
+  decision** (2026-07-17 audit). (b) the `secantusdb` binary crate exists and
+  ships (`secantusd-rs`, the `secantusdb-v*` release-binaries track). (a)
+  flipping `publish = false` and publishing `secantus-core` to crates.io needs
+  Joe's crates.io account + a public-API freeze decision — flagged. Original: With the lib/bindings
   split done, the remaining steps to "ultimately a Rust package": (a) settle the
   `secantus-core` lib's public API and flip `publish = false` → publish to
   crates.io; (b) add a `secantusdb` **binary crate** (a thin `main` over the
   engines + storage) — gated on the storage keystone (Phase 4 above), since a
   standalone server also needs storage in Rust, not just the operator engines.
-- [ ] **Make Rust the *recommended* default (Python stays available).**
+- [ ] **Make Rust the *recommended* default — a product/docs decision for
+  Joe** (2026-07-17 audit). The byte-seam overhead rationale below is moot
+  under the two-server model (the Rust server has no per-call seam); what
+  remains is the positioning call (docs/README recommending `secantusd-rs` /
+  the embedded Rust handle as the default) plus the R8 gauge evidence.
+  Original:
   Currently every component defaults to Python; `SECANTUS_ENGINE=rust` opts in.
   With the optional package now shipping (above), recommending Rust by default
   for installs that have the extension still wants: a decision on the byte seam's

@@ -13,11 +13,10 @@
 //! embedded Python lifecycle handle (R6) wraps: `bind` → an address pymongo
 //! connects to, `stop` → clean shutdown.
 //!
-//! **Deferred (tracked in `tasks/rust-server-plan.md`):** TLS / mTLS (R4 tail),
-//! auth state + `peer_cert_dn` threading (R5), metrics / sessions / failpoints /
-//! connection registry (their command slices), and sourcing `cluster_time` from
-//! storage (the command `Storage` trait doesn't expose `current_cluster_time`
-//! yet — `hello`'s replica-set `lastWrite` uses a zero timestamp until then).
+//! TLS / mTLS (rustls), auth state + `peer_cert_dn` threading (MONGODB-X509,
+//! mongod-form RFC 4514 DNs), metrics / sessions / failpoints, and the
+//! connection registry all ship here; see `tasks/rust-server-plan.md` for the
+//! phase history.
 
 pub mod args;
 pub mod config;
@@ -706,10 +705,73 @@ fn load_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>>
 
 /// Extract a peer certificate's subject DN as an RFC 4514 string
 /// (most-specific-first, short OID names), for `MONGODB-X509`.
+/// The verified client cert's subject as a mongod-style RFC 4514 DN string:
+/// most-specific-first (CN before OU before O …), comma-separated with NO
+/// space, short OID names, and the RFC 4514 value escaping — byte-for-byte
+/// the string `secantus.auth.subject_dn_from_peercert` produces on the
+/// Python server, so a user record provisioned against either server
+/// authenticates on the other. (x509-parser's own `Display` is
+/// least-specific-first with `", "` separators — the raw certificate order —
+/// which never matches the stored DN username.)
 fn cert_subject_dn(der: &[u8]) -> Option<String> {
     use x509_parser::prelude::FromDer;
     let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
-    Some(cert.subject().to_string())
+    let mut rdn_strs: Vec<String> = Vec::new();
+    // Iterate in reverse so the resulting string is most-specific-first.
+    let rdns: Vec<_> = cert.subject().iter().collect();
+    for rdn in rdns.into_iter().rev() {
+        let mut attrs: Vec<String> = Vec::new();
+        for attr in rdn.iter() {
+            let oid = attr.attr_type().to_id_string();
+            let short = dn_short_name(&oid);
+            let value = attr.as_str().map(str::to_string).unwrap_or_else(|_| {
+                // Non-UTF8 / unusual encodings: fall back to lossy bytes,
+                // mirroring Python's str() of whatever ssl decoded.
+                String::from_utf8_lossy(attr.attr_value().data).into_owned()
+            });
+            attrs.push(format!("{short}={}", escape_dn_value(&value)));
+        }
+        rdn_strs.push(attrs.join("+"));
+    }
+    if rdn_strs.is_empty() {
+        return None;
+    }
+    Some(rdn_strs.join(","))
+}
+
+/// RFC 4514 short names for the common subject attribute OIDs — the same set
+/// `secantus.auth._DN_SHORT_NAMES` maps (an unknown OID keeps its dotted id).
+fn dn_short_name(oid: &str) -> &str {
+    match oid {
+        "2.5.4.3" => "CN",
+        "2.5.4.10" => "O",
+        "2.5.4.11" => "OU",
+        "2.5.4.7" => "L",
+        "2.5.4.8" => "ST",
+        "2.5.4.6" => "C",
+        "2.5.4.9" => "STREET",
+        "0.9.2342.19200300.100.1.25" => "DC",
+        "0.9.2342.19200300.100.1.1" => "UID",
+        "2.5.4.5" => "serialNumber",
+        "1.2.840.113549.1.9.1" => "emailAddress",
+        other => other,
+    }
+}
+
+/// RFC 4514 value escaping, mirroring `secantus.auth._escape_dn_value`.
+fn escape_dn_value(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    for (i, ch) in chars.iter().enumerate() {
+        let special = matches!(ch, ',' | '+' | '"' | '\\' | '<' | '>' | ';' | '=' | '#')
+            || (i == 0 && *ch == ' ')
+            || (i == chars.len() - 1 && *ch == ' ');
+        if special {
+            out.push('\\');
+        }
+        out.push(*ch);
+    }
+    out
 }
 
 /// Build the request document: the kind-0 body with each kind-1 document
