@@ -3884,16 +3884,24 @@ impl Storage {
             Err(e) if e.is_not_found() => return Ok(false),
             Err(e) => return Err(e.into()),
         }
+        // Capture the spec before removal: mongod's showExpandedEvents
+        // `dropIndexes` event describes the dropped index in full
+        // (`{v, key, name}`, probed 7.0.12), not just its name.
+        let key_spec = decode_doc(&c.get_value_u()?)
+            .ok()
+            .and_then(|d| d.get_document("key").ok().cloned())
+            .unwrap_or_default();
         c.remove()?;
         self.delete_entries_prefix(&session, db, coll, name)?;
         // Oplog: a DDL `op: "c"` `dropIndexes` entry so a `showExpandedEvents`
         // change stream surfaces a `dropIndexes` event (the projector reads
-        // `o.dropIndexes` + `o.index`).
+        // `o.dropIndexes` + `o.index` + `o.key`).
         if self.enable_oplog {
             let ui = collection_uuid(&session, db, coll)?;
             let mut o = Document::new();
             o.insert("dropIndexes", coll);
             o.insert("index", name);
+            o.insert("key", Bson::Document(key_spec));
             let mut entry = Document::new();
             entry.insert("op", "c");
             entry.insert("ns", format!("{db}.$cmd"));
@@ -3909,12 +3917,12 @@ impl Storage {
     pub fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize> {
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
-        let names: Vec<String> = self
+        let dropped: Vec<(String, Document)> = self
             .iter_indexes(&session, db, coll)?
             .into_iter()
-            .map(|(n, _, _)| n)
+            .map(|(n, key_spec, _)| (n, key_spec))
             .collect();
-        for name in &names {
+        for (name, _) in &dropped {
             let c = session.open_cursor(IDX_TABLE, None)?;
             c.set_key_sss(db, coll, name);
             if c.search().is_ok() {
@@ -3922,7 +3930,28 @@ impl Storage {
             }
             self.delete_entries_prefix(&session, db, coll, name)?;
         }
-        Ok(names.len())
+        // Oplog: one `dropIndexes` "c" entry per dropped index (mongod emits
+        // per-index events for `dropIndexes: "*"` too), each carrying the key
+        // spec for the showExpandedEvents event's full index description.
+        if self.enable_oplog && !dropped.is_empty() {
+            let ui = collection_uuid(&session, db, coll)?;
+            let mut entries = Vec::with_capacity(dropped.len());
+            for (name, key_spec) in &dropped {
+                let mut o = Document::new();
+                o.insert("dropIndexes", coll);
+                o.insert("index", name.as_str());
+                o.insert("key", Bson::Document(key_spec.clone()));
+                let mut entry = Document::new();
+                entry.insert("op", "c");
+                entry.insert("ns", format!("{db}.$cmd"));
+                entry.insert("ui", uuid_binary(&ui));
+                entry.insert("o", Bson::Document(o));
+                entries.push(entry);
+            }
+            let n = entries.len();
+            self.emit_oplog(&session, entries, vec![None; n])?;
+        }
+        Ok(dropped.len())
     }
 
     /// Walk the registry for `(db, coll)`: `(name, key_spec, options)` per index.

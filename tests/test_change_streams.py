@@ -497,7 +497,9 @@ def test_drop_indexes_emits_change_event(client: MongoClient) -> None:
     e = events[0]
     assert e["operationType"] == "dropIndexes"
     assert e["ns"] == {"db": "csdb_drop_idx", "coll": "c"}
-    assert e["operationDescription"]["indexes"] == [{"name": "x_1"}]
+    # Full index description since the showExpandedEvents-shape fix (mongod
+    # 7.0.12-probed): {v, key, name}, not just the name.
+    assert e["operationDescription"]["indexes"] == [{"v": 2, "key": {"x": 1}, "name": "x_1"}]
 
 
 def test_create_collection_emits_change_event(client: MongoClient) -> None:
@@ -731,3 +733,48 @@ def test_resume_token_tracks_per_event_with_batch_size_one(client: MongoClient) 
     assert cs.try_next() is None
     assert cs.resume_token == tokens[2]
     cs.close()
+
+
+def test_expanded_events_match_mongod_shapes(client: MongoClient) -> None:
+    """showExpandedEvents shapes, verbatim from a mongod 7.0.12 probe:
+    createIndexes / dropIndexes events carry the full index description
+    ({v, key, name} — dropIndexes included, via the key spec captured at drop
+    time), and expanded update events always carry ``disambiguatedPaths``
+    (an empty document when nothing was ambiguous) while unexpanded ones
+    never do."""
+    import time
+
+    db = client["csx"]
+    db.c.insert_one({"_id": 0})
+    cs = db.c.watch(show_expanded_events=True, max_await_time_ms=300)
+    db.c.create_index([("x", 1)])
+    db.c.update_one({"_id": 0}, {"$set": {"a-c": 2}})
+    db.c.drop_indexes()
+    events = []
+    deadline = time.time() + 15
+    while time.time() < deadline and len(events) < 3:
+        ev = cs.try_next()
+        if ev is not None:
+            events.append(ev)
+    cs.close()
+    assert [e["operationType"] for e in events] == ["createIndexes", "update", "dropIndexes"]
+    create_ev, update_ev, drop_ev = events
+    assert create_ev["operationDescription"] == {
+        "indexes": [{"v": 2, "key": {"x": 1}, "name": "x_1"}]
+    }
+    assert update_ev["updateDescription"]["disambiguatedPaths"] == {}
+    assert drop_ev["operationDescription"] == {
+        "indexes": [{"v": 2, "key": {"x": 1}, "name": "x_1"}]
+    }
+
+    # Without the flag: no DDL events, and no disambiguatedPaths key.
+    cs = db.c.watch(max_await_time_ms=300)
+    db.c.create_index([("y", 1)])
+    db.c.update_one({"_id": 0}, {"$set": {"n": 1}})
+    plain = None
+    deadline = time.time() + 15
+    while time.time() < deadline and plain is None:
+        plain = cs.try_next()
+    cs.close()
+    assert plain["operationType"] == "update"
+    assert "disambiguatedPaths" not in plain["updateDescription"]
