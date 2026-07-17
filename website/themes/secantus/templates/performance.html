@@ -1,0 +1,74 @@
+{% extends 'base.html' %}
+
+{% block title %}Performance — {{ SITENAME }}{% endblock %}
+{% block description %}Measured three-way benchmarks: real mongod vs the SecantusDB Python DB and Rust DB — per-operation latency and concurrent-writer throughput.{% endblock %}
+{% block canonical_path %}performance.html{% endblock %}
+
+{% block top_banner %}{% endblock %}
+
+{% block content %}
+<section class="section engines-section page-hero-engine">
+  <div class="wrap">
+    <span class="engine-tag">Benchmarks</span>
+    <h1>Measured, not promised</h1>
+    <p class="section-lead">Every number on this page is measured on the same machine, through the same <code>pymongo</code> client, against the same on-disk WiredTiger storage &mdash; with real <code>mongod</code> as the reference. Two dimensions: <strong>per-operation latency</strong> (one client, six workloads) and <strong>throughput under concurrent writers</strong> (1&ndash;8 parallel writer processes). Both harnesses ship in the repo; both tables regenerate with one command.</p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>Per-operation latency</h2>
+    <p class="section-lead">Median of five runs per workload, 10,000-document dataset, end-to-end through the wire protocol and driver. <code>&times;</code> columns are how many times slower than <code>mongod</code>.</p>
+    <div class="compare-wrap">
+      <table class="compare-table">
+        <thead>
+          <tr><th>Workload</th><th>mongod</th><th>Rust DB</th><th>&times;</th><th>Python DB</th><th>&times;</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>insert (10k docs)</th><td>55.6 ms</td><td>118.8 ms</td><td>2.1&times;</td><td>332.5 ms</td><td>6.0&times;</td></tr>
+          <tr><th>find indexed range</th><td>4.3 ms</td><td>10.1 ms</td><td>2.4&times;</td><td>28.6 ms</td><td>6.7&times;</td></tr>
+          <tr><th>find full scan</th><td>7.7 ms</td><td>34.8 ms</td><td>4.5&times;</td><td>93.5 ms</td><td>12.2&times;</td></tr>
+          <tr><th>update_many (half)</th><td>35.2 ms</td><td>93.0 ms</td><td>2.6&times;</td><td>486.9 ms</td><td>13.8&times;</td></tr>
+          <tr><th>aggregate <code>$group</code></th><td>5.8 ms</td><td>24.6 ms</td><td>4.3&times;</td><td>118.6 ms</td><td>20.5&times;</td></tr>
+          <tr><th>delete_many (half)</th><td>21.6 ms</td><td>80.5 ms</td><td>3.7&times;</td><td>317.1 ms</td><td>14.7&times;</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="perf-note" style="margin-top: 20px;">The short version: the <strong>Rust DB runs at 2.1&times;&ndash;4.5&times; of mongod</strong> per operation &mdash; roughly 2.7&times;&ndash;5.2&times; faster than the Python DB workload-for-workload. All three sit on the identical WiredTiger C library; the gaps are the layers above it. <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Methodology &amp; how to reproduce &rarr;</a></p>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <h2>Throughput under concurrent writers</h2>
+    <p class="section-lead">N writer processes each stream <code>insert_many</code> batches for 30 seconds against their own collection. Aggregate documents per second:</p>
+    <div class="compare-wrap">
+      <table class="compare-table">
+        <thead>
+          <tr><th>Writers</th><th>mongod</th><th>Rust DB</th><th>Python DB</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>1</th><td>108,625</td><td>3,526</td><td>2,900</td></tr>
+          <tr><th>2</th><td>199,810</td><td>1,777</td><td>893</td></tr>
+          <tr><th>4</th><td>353,942</td><td>1,803</td><td>460</td></tr>
+          <tr><th>8</th><td>448,989</td><td>1,876</td><td>500</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="perf-note" style="margin-top: 20px;">Three different shapes, honestly told. <strong>mongod scales</strong> &mdash; 4.1&times; its own single-writer aggregate at eight writers; that's its C++ scheduler above WiredTiger doing its job. The <strong>Rust DB holds flat</strong> at roughly half its single-writer rate: its storage layer currently serialises writers behind one global mutex &mdash; a measured improvement target. The <strong>Python DB degrades</strong> under contention to ~0.2&times; &mdash; the GIL plus the measured WiredTiger-binding ceiling &mdash; but degrades <em>gracefully</em>: write conflicts retry server-side exactly like mongod's <code>writeConflictRetry</code>, and a client never sees an error. <a href="{{ SECANTUS_DOCS_URL }}concurrency.html" rel="noopener">The full concurrency story &rarr;</a></p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>What to make of it</h2>
+    <p class="section-lead">SecantusDB's trade is deliberate: <strong>conformance and WiredTiger durability over raw speed</strong>. For its home turf &mdash; embedded test and dev databases, single-node prototypes, CI &mdash; per-operation latency in the milliseconds and single-writer throughput in the thousands of documents per second rarely matter. When they do, the Rust DB is the answer within the family, and a real <code>mongod</code> is the answer beyond it &mdash; and because the wire protocol is identical, moving between all three is a connection-string change.</p>
+    <p class="perf-note">Caveats that apply to every number here: one machine (Apple Silicon), no network, no concurrent readers mixed with writers, dataset that fits in cache. The harnesses (<code>bench.compare_servers</code>, <code>bench.concurrency</code>) ship in the repository &mdash; run them on your own hardware and workload before drawing conclusions that matter.</p>
+    <div class="ctas" style="margin-top: 28px;">
+      <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Latency benchmark</a>
+      <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}concurrency.html" rel="noopener">Concurrency deep-dive</a>
+      <a class="btn btn-secondary" href="{{ SECANTUS_DOCS_URL }}feature-comparison.html" rel="noopener">Feature comparison</a>
+    </div>
+  </div>
+</section>
+{% endblock %}
