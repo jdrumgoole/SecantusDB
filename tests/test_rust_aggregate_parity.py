@@ -137,6 +137,36 @@ CURATED = [
     [{"$group": {"_id": None, "m": {"$mergeObjects": "$nested"}}}],
     [{"$group": {"_id": "$b", "m": {"$mergeObjects": "$nested"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": None, "m": {"$mergeObjects": "$nope"}}}],  # all missing -> {}
+    # $median / $percentile — mongod's discrete percentile (probed 7.0.12):
+    # sorted[max(0, ceil(p*n) - 1)] as a double; bool/NaN excluded; empty ->
+    # null / per-p nulls. Both group-accumulator and expression forms.
+    [
+        {
+            "$group": {
+                "_id": None,
+                "m": {"$median": {"input": "$a", "method": "approximate"}},
+                "p": {
+                    "$percentile": {
+                        "input": "$a",
+                        "p": [0.1, 0.25, 0.5, 0.75, 0.9, 1.0],
+                        "method": "approximate",
+                    }
+                },
+            }
+        }
+    ],
+    [
+        {"$group": {"_id": "$b", "m": {"$median": {"input": "$a", "method": "approximate"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {
+            "$project": {
+                "m": {"$median": {"input": [3.5, 1, 2], "method": "approximate"}},
+                "p": {"$percentile": {"input": [2, 4], "p": [0.5, 1.0], "method": "approximate"}},
+            }
+        }
+    ],
     # $stdDevPop / $stdDevSamp — pop is 0 for a single value, samp is null for <2.
     [{"$group": {"_id": "$b", "sd": {"$stdDevPop": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "sd": {"$stdDevSamp": "$a"}}}, {"$sort": {"_id": 1}}],

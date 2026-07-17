@@ -212,6 +212,8 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$rtrim" => op_trim(arg, ctx, TrimSide::Right),
         // objects
         "$mergeObjects" => op_merge_objects(arg, ctx),
+        "$median" => op_percentile_expr(arg, ctx, true),
+        "$percentile" => op_percentile_expr(arg, ctx, false),
         "$objectToArray" => op_object_to_array(arg, ctx),
         "$getField" => op_get_field(arg, ctx),
         "$setField" => op_set_field(arg, ctx),
@@ -378,7 +380,9 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$trim",
     "$ltrim",
     "$rtrim",
+    "$median",
     "$mergeObjects",
+    "$percentile",
     "$objectToArray",
     "$getField",
     "$setField",
@@ -1218,6 +1222,61 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
 }
 
 // --- objects ------------------------------------------------------------
+
+/// Expression-form `$median` / `$percentile` over an array input — mongod's
+/// discrete percentile (`sorted[max(0, ceil(p*n) - 1)]` as a double), sharing
+/// the value filter and rank math with the group accumulators. An invalid
+/// spec defers to Python, which raises mongod's exact error.
+fn op_percentile_expr(arg: &Bson, ctx: &Ctx, is_median: bool) -> R {
+    let Bson::Document(spec) = arg else {
+        return Err(Fallback);
+    };
+    if spec.get_str("method") != Ok("approximate") {
+        return Err(Fallback);
+    }
+    let input = spec.get("input").ok_or(Fallback)?;
+    let ps: Option<Vec<f64>> = if is_median {
+        None
+    } else {
+        let Some(Bson::Array(raw)) = spec.get("p") else {
+            return Err(Fallback);
+        };
+        let mut parsed = Vec::with_capacity(raw.len());
+        for p in raw {
+            let f = match p {
+                Bson::Int32(n) => *n as f64,
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                _ => return Err(Fallback),
+            };
+            if !(0.0..=1.0).contains(&f) {
+                return Err(Fallback);
+            }
+            parsed.push(f);
+        }
+        Some(parsed)
+    };
+    let raw = eval(input, ctx)?;
+    let items: Vec<&Bson> = match &raw {
+        Bson::Array(a) => a.iter().collect(),
+        other => vec![other],
+    };
+    let mut values: Vec<f64> = items
+        .into_iter()
+        .filter_map(crate::group::percentile_f64)
+        .collect();
+    values.sort_by(|a, b| a.partial_cmp(b).expect("NaN excluded at collect"));
+    Ok(if is_median {
+        crate::group::percentile_rank(&values, 0.5)
+    } else {
+        Bson::Array(
+            ps.unwrap_or_default()
+                .iter()
+                .map(|p| crate::group::percentile_rank(&values, *p))
+                .collect(),
+        )
+    })
+}
 
 fn op_merge_objects(arg: &Bson, ctx: &Ctx) -> R {
     let items: Vec<&Bson> = match arg {

@@ -4148,3 +4148,70 @@ def test_json_schema_keyword_validation_wire(coll) -> None:
             list(coll.find({"$jsonSchema": schema}))
         assert exc.value.code == code, schema
         assert frag in exc.value.details["errmsg"], schema
+
+
+def test_median_and_percentile_over_the_wire(coll) -> None:
+    """$median / $percentile group accumulators + expression forms, matching a
+    mongod 7.0.12 probe (discrete percentile, doubles out, verbatim errors)."""
+    import pymongo
+
+    coll.insert_many([{"x": v} for v in [10, 20, 30, 40]])
+    r = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": None,
+                        "med": {"$median": {"input": "$x", "method": "approximate"}},
+                        "pct": {
+                            "$percentile": {
+                                "input": "$x",
+                                "p": [0.1, 0.5, 0.75, 0.9],
+                                "method": "approximate",
+                            }
+                        },
+                    }
+                }
+            ]
+        )
+    )[0]
+    assert r["med"] == 20.0
+    assert r["pct"] == [10.0, 20.0, 30.0, 40.0]
+
+    r = list(
+        coll.aggregate(
+            [
+                {"$limit": 1},
+                {
+                    "$project": {
+                        "m": {"$median": {"input": [1, 2, 3, 4], "method": "approximate"}},
+                    }
+                },
+            ]
+        )
+    )[0]
+    assert r["m"] == 2.0
+
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        list(coll.aggregate([{"$group": {"_id": None, "m": {"$median": {"input": "$x"}}}}]))
+    assert exc.value.code == 40414
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        list(
+            coll.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "p": {
+                                "$percentile": {
+                                    "input": "$x",
+                                    "p": [1.5],
+                                    "method": "approximate",
+                                }
+                            },
+                        }
+                    }
+                ]
+            )
+        )
+    assert exc.value.code == 7750303

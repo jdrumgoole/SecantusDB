@@ -1401,3 +1401,73 @@ def test_now_system_variable() -> None:
     assert out[0]["t"] == out[1]["t"]
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     assert abs((now - out[0]["t"].replace(tzinfo=None)).total_seconds()) < 60
+
+
+def test_median_and_percentile_accumulators() -> None:
+    """mongod's discrete percentile (probed against 7.0.12):
+    sorted[max(0, ceil(p*n) - 1)] as a double; bool/NaN excluded, Decimal128
+    included; empty -> null / per-p nulls; verbatim error shapes."""
+    import pytest
+    from bson import Decimal128
+
+    from secantus.aggregate import AggregateError, apply_pipeline
+
+    docs = [{"x": v} for v in [3.5, 1, 2]]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$group": {
+                    "_id": None,
+                    "m": {"$median": {"input": "$x", "method": "approximate"}},
+                    "p": {
+                        "$percentile": {
+                            "input": "$x",
+                            "p": [0.1, 0.5, 0.75, 1.0],
+                            "method": "approximate",
+                        }
+                    },
+                }
+            }
+        ],
+        None,
+    )
+    assert out[0]["m"] == 2.0
+    assert out[0]["p"] == [1.0, 2.0, 3.5, 3.5]
+
+    # bool/NaN excluded, Decimal128 included (as double).
+    docs = [{"x": v} for v in [float("nan"), 2, 1, Decimal128("3.5"), True]]
+    out = apply_pipeline(
+        docs,
+        [{"$group": {"_id": None, "m": {"$median": {"input": "$x", "method": "approximate"}}}}],
+        None,
+    )
+    assert out[0]["m"] == 2.0
+
+    # All-missing -> null (median) / per-p nulls (percentile).
+    out = apply_pipeline(
+        [{"y": 1}],
+        [
+            {
+                "$group": {
+                    "_id": None,
+                    "m": {"$median": {"input": "$x", "method": "approximate"}},
+                    "p": {"$percentile": {"input": "$x", "p": [0.5, 0.9], "method": "approximate"}},
+                }
+            }
+        ],
+        None,
+    )
+    assert out[0]["m"] is None
+    assert out[0]["p"] == [None, None]
+
+    for acc, code in [
+        ({"$median": {"input": "$x"}}, 40414),  # missing method
+        ({"$median": {"input": "$x", "method": "exact"}}, 2),  # bad method
+        ({"$percentile": {"input": "$x", "p": [1.5], "method": "approximate"}}, 7750303),
+        ({"$percentile": {"input": "$x", "p": 0.5, "method": "approximate"}}, 7750301),
+        ({"$percentile": {"input": "$x", "method": "approximate"}}, 40414),  # missing p
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([{"x": 1}], [{"$group": {"_id": None, "v": acc}}], None)
+        assert exc.value.code == code, acc

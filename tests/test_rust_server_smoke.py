@@ -879,3 +879,49 @@ def test_json_schema_keyword_validation(tmp_path) -> None:
             assert frag in exc.value.details["errmsg"], schema
     finally:
         srv.stop()
+
+
+def test_median_and_percentile_accumulators(tmp_path) -> None:
+    """$median / $percentile on the Rust server (group + expression forms) —
+    mongod's discrete percentile, doubles out, matching the Python server."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"x": v} for v in [10, 20, 30, 40]])
+        r = list(
+            coll.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "med": {"$median": {"input": "$x", "method": "approximate"}},
+                            "pct": {
+                                "$percentile": {
+                                    "input": "$x",
+                                    "p": [0.1, 0.5, 0.75, 0.9],
+                                    "method": "approximate",
+                                }
+                            },
+                        }
+                    }
+                ]
+            )
+        )[0]
+        assert r["med"] == 20.0
+        assert r["pct"] == [10.0, 20.0, 30.0, 40.0]
+
+        r = list(
+            coll.aggregate(
+                [
+                    {"$limit": 1},
+                    {
+                        "$project": {
+                            "m": {"$median": {"input": [1, 2, 3, 4], "method": "approximate"}}
+                        }
+                    },
+                ]
+            )
+        )[0]
+        assert r["m"] == 2.0
+    finally:
+        srv.stop()

@@ -178,6 +178,17 @@ pub(crate) enum Acc {
         n: Option<usize>,
         vals: Vec<Bson>,
     },
+    // `$median` / `$percentile`: collect numeric values (int / long / double /
+    // Decimal128 as f64; bool and NaN excluded — mongod-probed 7.0.12), then
+    // compute mongod's discrete percentile (`sorted[max(0, ceil(p*n) - 1)]`,
+    // returned as a double; null / per-p nulls when no value was seen) at
+    // finalize. `ps` parses from the spec on the first apply (None = $median).
+    // An invalid spec defers to Python, which raises mongod's exact error.
+    Percentile {
+        is_median: bool,
+        ps: Option<Vec<f64>>,
+        values: Vec<f64>,
+    },
     // `$top` / `$bottom` / `$topN` / `$bottomN`: collect `(sortBy-values, output)`
     // per doc; at finalize stable-sort by the `sortBy` directions and take the
     // top/bottom output(s). `n` and the sort directions are parsed on first apply.
@@ -275,12 +286,65 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
             dirs: Vec::new(),
             items: Vec::new(),
         },
+        "$median" => Acc::Percentile {
+            is_median: true,
+            ps: None,
+            values: Vec::new(),
+        },
+        "$percentile" => Acc::Percentile {
+            is_median: false,
+            ps: None,
+            values: Vec::new(),
+        },
         _ => return Err(()), // unsupported accumulator -> Python (raises or handles)
     })
 }
 
 fn is_null(b: &Bson) -> bool {
     matches!(b, Bson::Null)
+}
+
+/// The f64 a value contributes to `$median` / `$percentile`, or None to skip
+/// it. mongod-probed: int / long / double / Decimal128 count (as doubles),
+/// bool and NaN are excluded, everything else is skipped. The Decimal128 →
+/// f64 path is `str::parse` on the decimal string — the same correctly-rounded
+/// conversion as Python's `float(Decimal(...))`.
+pub(crate) fn percentile_f64(v: &Bson) -> Option<f64> {
+    let f = match v {
+        Bson::Int32(n) => *n as f64,
+        Bson::Int64(n) => *n as f64,
+        Bson::Double(d) => *d,
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    (!f.is_nan()).then_some(f)
+}
+
+/// mongod's discrete percentile over sorted values:
+/// `sorted[max(0, ceil(p*n) - 1)]` as a double; null when no value was seen.
+pub(crate) fn percentile_rank(sorted_values: &[f64], p: f64) -> Bson {
+    if sorted_values.is_empty() {
+        return Bson::Null;
+    }
+    let idx = ((p * sorted_values.len() as f64).ceil() as i64 - 1).max(0) as usize;
+    Bson::Double(sorted_values[idx.min(sorted_values.len() - 1)])
+}
+
+/// Shared `$median` / `$percentile` finalize: sort (no NaN was collected) and
+/// rank; a percentile with no parsed `ps` (impossible for a non-empty group)
+/// yields an empty array.
+fn percentile_finalize(is_median: bool, ps: Option<Vec<f64>>, mut values: Vec<f64>) -> Bson {
+    values.sort_by(|a, b| a.partial_cmp(b).expect("NaN excluded at collect"));
+    if is_median {
+        percentile_rank(&values, 0.5)
+    } else {
+        Bson::Array(
+            ps.unwrap_or_default()
+                .iter()
+                .map(|p| percentile_rank(&values, *p))
+                .collect(),
+        )
+    }
 }
 
 /// `arg == 1` in Python — true for int 1, float 1.0, and bool True.
@@ -367,6 +431,42 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             let v = eval(arg, doc, vars)?;
             if !is_null(&v) {
                 values.push(numeric_f64(&v).ok_or(())?);
+            }
+        }
+        Acc::Percentile {
+            is_median,
+            ps,
+            values,
+        } => {
+            let Bson::Document(spec) = arg else {
+                return Err(()); // Python raises 7429703 / 40414
+            };
+            if spec.get_str("method") != Ok("approximate") {
+                return Err(()); // missing (40414) or non-approximate (BadValue)
+            }
+            let input = spec.get("input").ok_or(())?;
+            if !*is_median && ps.is_none() {
+                let Some(Bson::Array(raw)) = spec.get("p") else {
+                    return Err(()); // missing (40414) or non-array (7750301)
+                };
+                let mut parsed = Vec::with_capacity(raw.len());
+                for p in raw {
+                    let f = match p {
+                        Bson::Int32(n) => *n as f64,
+                        Bson::Int64(n) => *n as f64,
+                        Bson::Double(d) => *d,
+                        _ => return Err(()), // Python raises 7750303
+                    };
+                    if !(0.0..=1.0).contains(&f) {
+                        return Err(());
+                    }
+                    parsed.push(f);
+                }
+                *ps = Some(parsed);
+            }
+            let v = eval(input, doc, vars)?;
+            if let Some(f) = percentile_f64(&v) {
+                values.push(f);
             }
         }
         Acc::NElem { n, vals, .. } => {
@@ -630,6 +730,16 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                     out.insert(field.to_string(), v);
                 }
             }
+            Acc::Percentile {
+                is_median,
+                ps,
+                values,
+            } => {
+                out.insert(
+                    field.to_string(),
+                    percentile_finalize(is_median, ps, values),
+                );
+            }
             Acc::NElem { kind, n, vals } => {
                 out.insert(
                     field.to_string(),
@@ -687,6 +797,11 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
         Acc::MergeObjects(merged) => Bson::Document(merged),
         // A window writes a value into every row: empty / degenerate -> null.
         Acc::StdDev { values, pop } => std_dev(&values, pop).map_or(Bson::Null, Bson::Double),
+        Acc::Percentile {
+            is_median,
+            ps,
+            values,
+        } => percentile_finalize(is_median, ps, values),
         Acc::NElem { kind, n, vals } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
         Acc::TopN {
             kind,
