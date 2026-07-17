@@ -15,12 +15,13 @@ while the collection churns around them. The only error a loser may see is
 the typed signal mongod would send (11000 DuplicateKey, 112 WriteConflict) —
 anything else fails the test.
 
-Known divergence: the Rust server's findAndModify composes find + update +
-re-find across separate storage calls, so under contention two clients can be
-handed the same ``new: true`` post-image; its ticket test is
-xfail(strict=False) until the atomic find-and-modify storage primitive lands
-(tasks/backlog.md). The Python server captures the post-image inside the
-write (``Storage.update_matching(return_post_images=True)``) and must pass.
+findAndModify is the most contention-sensitive command here and both servers
+must pass all of it: the ``new: true`` post-image comes from the write itself
+(Python ``Storage.update_matching(return_post_images=True)``, Rust
+``UpdateOutcome::post_image``), and the write re-asserts the original query
+keyed by the matched ``_id`` in a re-pick loop — so ticket dispensers never
+hand out duplicates, and job-queue claims (``state: "new"`` → ``"taken"``)
+are exclusive even when every worker races for the same document.
 
 Rust-server lifecycle stress (many servers started/stopped concurrently)
 lives in ``test_rust_server_stress.py``; this file is about contention
@@ -45,18 +46,7 @@ WORKERS = 8
 WRITE_CONFLICT = 112
 DUPLICATE_KEY = 11000
 
-RUST_FAM_XFAIL = pytest.mark.xfail(
-    reason="Rust findAndModify is find + update + re-find across separate storage "
-    "calls (crates/secantus-commands/src/findandmodify.rs module caveat): a "
-    "concurrent writer can land between the update and the post-image re-read, "
-    "so two clients can be handed the same ticket. The Python server fixed this "
-    "with Storage.update_matching(return_post_images=True); the Rust storage "
-    "needs the same primitive — see tasks/backlog.md.",
-    strict=False,
-)
-
 BOTH_SERVERS = ["python", "rust"]
-FAM_SERVERS = ["python", pytest.param("rust", marks=RUST_FAM_XFAIL)]
 
 
 @pytest.fixture(params=BOTH_SERVERS)
@@ -182,7 +172,6 @@ def test_concurrent_inc_loses_no_updates(server):
     client.close()
 
 
-@pytest.mark.parametrize("kind", FAM_SERVERS, indirect=True)
 def test_findandmodify_tickets_are_unique_and_complete(server):
     per_worker = 25
     client = make_client(server)
@@ -213,6 +202,87 @@ def test_findandmodify_tickets_are_unique_and_complete(server):
     total = WORKERS * per_worker
     assert sorted(tickets) == list(range(1, total + 1)), "tickets were lost or duplicated"
     assert client["app"]["c"].find_one({"_id": "counter"})["n"] == total
+    client.close()
+
+
+def test_findandmodify_job_queue_claims_are_exclusive(server):
+    # The job-queue pattern: every worker races find_one_and_update(
+    # {state: "new"}, {$set: {state: taken-by-me}}) for the same small pool.
+    # The write must re-assert the query at write time — otherwise two workers
+    # that both picked job J both "take" it and one worker's claim is silently
+    # overwritten. Every job must end up claimed by exactly one worker, and
+    # the sum of claims must equal the job count.
+    jobs = 40
+    client = make_client(server)
+    coll0 = client["app"]["jobs"]
+    coll0.insert_many([{"_id": j, "state": "new"} for j in range(jobs)])
+    claims: dict[int, list[int]] = {}
+    lock = threading.Lock()
+    barrier = threading.Barrier(WORKERS)
+
+    def worker(i: int) -> None:
+        cl = make_client(server)
+        coll = cl["app"]["jobs"]
+        mine: list[int] = []
+        barrier.wait()
+        while True:
+            job = retrying(
+                lambda: coll.find_one_and_update(
+                    {"state": "new"},
+                    {"$set": {"state": "taken", "by": i}},
+                    return_document=pymongo.ReturnDocument.AFTER,
+                )
+            )
+            if job is None:
+                break
+            assert job["by"] == i, f"worker {i} was handed worker {job['by']}'s claim"
+            mine.append(job["_id"])
+        with lock:
+            claims[i] = mine
+        cl.close()
+
+    run_workers(WORKERS, worker)
+    claimed = [j for mine in claims.values() for j in mine]
+    assert sorted(claimed) == list(range(jobs)), "jobs were double-claimed or lost"
+    by_field = {d["_id"]: d["by"] for d in coll0.find({})}
+    for worker_id, mine in claims.items():
+        for job_id in mine:
+            assert by_field[job_id] == worker_id, (
+                f"job {job_id} claimed by {worker_id} but stored by={by_field[job_id]}"
+            )
+    client.close()
+
+
+def test_findandmodify_remove_claims_are_exclusive(server):
+    # fam remove=true: every worker races to remove docs from a shared pool;
+    # each removed pre-image may be handed to exactly one worker (the delete
+    # checks its deleted-count and re-picks on 0, so two removes can never
+    # both claim the same doc).
+    docs = 40
+    client = make_client(server)
+    coll0 = client["app"]["pool"]
+    coll0.insert_many([{"_id": j} for j in range(docs)])
+    removed: list[int] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(WORKERS)
+
+    def worker(i: int) -> None:
+        cl = make_client(server)
+        coll = cl["app"]["pool"]
+        mine: list[int] = []
+        barrier.wait()
+        while True:
+            doc = retrying(lambda: coll.find_one_and_delete({}))
+            if doc is None:
+                break
+            mine.append(doc["_id"])
+        with lock:
+            removed.extend(mine)
+        cl.close()
+
+    run_workers(WORKERS, worker)
+    assert sorted(removed) == list(range(docs)), "a doc was double-claimed or lost"
+    assert client["app"]["pool"].count_documents({}) == 0
     client.close()
 
 

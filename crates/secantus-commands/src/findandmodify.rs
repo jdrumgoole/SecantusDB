@@ -2,13 +2,15 @@
 //! it, returning the pre- or post-image.
 //!
 //! A port of `commands.py::_find_and_modify`, composed at the command layer from
-//! the existing `Storage` trait methods (`find` limit-1 + sort, then
-//! `update_matching` / `delete_matching`, then a re-`find` for the new image).
-//!
-//! **Caveat — not atomic across calls.** The Python server uses storage-internal
-//! atomicity; here the find + modify are separate storage calls, so a concurrent
-//! writer could interleave. Acceptable for the single-node test surrogate;
-//! tracked for a future find-and-modify storage primitive.
+//! the existing `Storage` trait methods: `find` limit-1 + sort picks the
+//! target, then the write (`update_matching_*` / `delete_matching_with_let`)
+//! is keyed by the matched `_id` *with the original query re-asserted*, in a
+//! re-pick loop — a concurrent writer that changes or steals the doc makes
+//! the write match 0 and we loop back, mirroring mongod re-evaluating the
+//! predicate when it acquires the document write. The `new: true` post-image
+//! comes from the write itself (`UpdateOutcome::post_image`, captured under
+//! the storage lock), never from a re-`find` — the re-read was a race that
+//! could hand two concurrent clients the same "new" document.
 //!
 //! `let` (`$expr` in `query`) + `collation` apply to the match (via
 //! `find_collated`); the update/delete is keyed by the matched `_id`.
@@ -119,165 +121,209 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         }
     };
 
-    // Find the target (first match in sort order).
-    let candidates = storage
-        .find_collated(
-            &ctx.db_name,
-            &coll,
-            &query,
-            sort,
-            None,
-            collation.as_ref(),
-            &let_vars,
-        )
-        .map_err(command_error)?;
-    let matched = candidates.into_iter().next();
+    // Find → re-assert → write loop. The write below is keyed by the matched
+    // doc's `_id` AND re-asserts the original query, so a concurrent writer
+    // that changes (or steals) the doc between our find and our write makes
+    // the write match 0 — we loop back and re-pick, mirroring mongod
+    // re-evaluating the predicate when it acquires the document write. The
+    // `new: true` post-image comes from the write itself
+    // (`UpdateOutcome::post_image`), never from a re-`find` a concurrent
+    // writer could land in front of.
+    loop {
+        // Find the target (first match in sort order).
+        let candidates = storage
+            .find_collated(
+                &ctx.db_name,
+                &coll,
+                &query,
+                sort,
+                None,
+                collation.as_ref(),
+                &let_vars,
+            )
+            .map_err(command_error)?;
+        let matched = candidates.into_iter().next();
 
-    // No match.
-    let Some(matched_bytes) = matched else {
-        if upsert && !is_remove {
-            let outcome = match if let Some(stages) = pipeline {
-                storage.update_matching_pipeline(
-                    &ctx.db_name,
-                    &coll,
-                    &query,
-                    stages,
-                    false,
-                    true,
-                    &let_vars,
-                    collation.as_ref(),
-                    validator.as_ref(),
-                )
-            } else {
-                let upd = update
-                    .and_then(Bson::as_document)
-                    .cloned()
-                    .unwrap_or_default();
-                storage.update_matching_array_filters(
-                    &ctx.db_name,
-                    &coll,
-                    &query,
-                    &upd,
-                    false,
-                    true,
-                    &array_filters,
-                    &let_vars,
-                    collation.as_ref(),
-                    validator.as_ref(),
-                )
-            } {
-                Ok(o) => o,
+        // No match.
+        let Some(matched_bytes) = matched else {
+            if upsert && !is_remove {
+                let outcome = match if let Some(stages) = pipeline {
+                    storage.update_matching_pipeline(
+                        &ctx.db_name,
+                        &coll,
+                        &query,
+                        stages,
+                        false,
+                        true,
+                        &let_vars,
+                        collation.as_ref(),
+                        validator.as_ref(),
+                    )
+                } else {
+                    let upd = update
+                        .and_then(Bson::as_document)
+                        .cloned()
+                        .unwrap_or_default();
+                    storage.update_matching_array_filters(
+                        &ctx.db_name,
+                        &coll,
+                        &query,
+                        &upd,
+                        false,
+                        true,
+                        &array_filters,
+                        &let_vars,
+                        collation.as_ref(),
+                        validator.as_ref(),
+                    )
+                } {
+                    Ok(o) => o,
+                    Err(e) => return Ok(storage_err_reply(e)),
+                };
+                let upserted_id = outcome.upserted_id.unwrap_or(Bson::Null);
+                let value = if return_new && upserted_id != Bson::Null {
+                    match outcome.post_image {
+                        // The upserted doc, from the write itself — a re-`find`
+                        // here races concurrent writers to the same doc.
+                        Some(post) => project_value(post, fields, &query)?,
+                        None => Bson::Null,
+                    }
+                } else {
+                    Bson::Null
+                };
+                return Ok(doc! {
+                    "lastErrorObject": { "n": 1, "updatedExisting": false, "upserted": upserted_id },
+                    "value": value,
+                    "ok": 1.0,
+                });
+            }
+            return Ok(doc! {
+                "lastErrorObject": { "n": 0, "updatedExisting": false },
+                "value": Bson::Null,
+                "ok": 1.0,
+            });
+        };
+
+        let matched_doc = decode(&matched_bytes)?;
+        let matched_id = matched_doc.get("_id").cloned().unwrap_or(Bson::Null);
+        // The write filter: the matched `_id` plus the original query re-asserted,
+        // so the write only lands if the doc still satisfies the predicate.
+        let mut write_filter = doc! { "_id": matched_id.clone() };
+        if !query.is_empty() {
+            write_filter.insert("$and", vec![Bson::Document(query.clone())]);
+        }
+
+        // remove=true: delete the matched doc, return its (pre-image) value.
+        if is_remove {
+            let deleted = match storage.delete_matching_with_let(
+                &ctx.db_name,
+                &coll,
+                &write_filter,
+                1,
+                &let_vars,
+                collation.as_ref(),
+            ) {
+                Ok(n) => n,
                 Err(e) => return Ok(storage_err_reply(e)),
             };
-            let upserted_id = outcome.upserted_id.unwrap_or(Bson::Null);
-            let value = if return_new && upserted_id != Bson::Null {
-                fetch_projected(storage, &ctx.db_name, &coll, &upserted_id, fields, &query)?
-            } else {
-                Bson::Null
-            };
+            if deleted == 0 {
+                // A concurrent writer removed or changed the doc first — the
+                // pre-image in hand was never ours to claim. Re-pick.
+                continue;
+            }
+            let value = project_value(matched_doc, fields, &query)?;
             return Ok(doc! {
-                "lastErrorObject": { "n": 1, "updatedExisting": false, "upserted": upserted_id },
+                "lastErrorObject": { "n": 1, "updatedExisting": true },
                 "value": value,
                 "ok": 1.0,
             });
         }
-        return Ok(doc! {
-            "lastErrorObject": { "n": 0, "updatedExisting": false },
-            "value": Bson::Null,
-            "ok": 1.0,
-        });
-    };
 
-    let matched_doc = decode(&matched_bytes)?;
-    let matched_id = matched_doc.get("_id").cloned().unwrap_or(Bson::Null);
-    let id_filter = doc! { "_id": matched_id.clone() };
-
-    // remove=true: delete the matched doc, return its (pre-image) value.
-    if is_remove {
-        if let Err(e) = storage.delete_matching(&ctx.db_name, &coll, &id_filter, 1) {
-            return Ok(storage_err_reply(e));
+        // Command-layer validator check that produces mongod's `errInfo`
+        // (failingDocumentId + per-operator details) — storage enforces the
+        // validator too, but its error lacks the detail drivers' errorResponse tests
+        // read (mongo-c-driver findOneAndUpdate-errorResponse). Only the
+        // operator/replacement form is reconstructible in-memory here; pipeline-form
+        // falls back to storage's plain 121. Purely additive: it only short-circuits
+        // on a clear post-apply validation failure, otherwise the storage write runs.
+        if let Some(v) = &validator {
+            if pipeline.is_none() {
+                let upd = update
+                    .and_then(Bson::as_document)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Ok(post) = secantus_core::update::apply_update(&matched_doc, &upd, false) {
+                    if !secantus_core::query::matches(&post, v, &Document::new(), None)
+                        .unwrap_or(true)
+                    {
+                        return Ok(doc! {
+                            "ok": 0.0,
+                            "errmsg": "Document failed validation",
+                            "code": 121,
+                            "codeName": "DocumentValidationFailure",
+                            "errInfo": crate::crud::validation_error_info(v, &post),
+                        });
+                    }
+                }
+            }
         }
-        let value = project_value(matched_doc, fields, &query)?;
+
+        // update: apply it to the matched doc (pipeline-form or operator/replacement).
+        let update_result = if let Some(stages) = pipeline {
+            storage.update_matching_pipeline(
+                &ctx.db_name,
+                &coll,
+                &write_filter,
+                stages,
+                false,
+                false,
+                &let_vars,
+                collation.as_ref(),
+                validator.as_ref(),
+            )
+        } else {
+            let upd = update
+                .and_then(Bson::as_document)
+                .cloned()
+                .unwrap_or_default();
+            storage.update_matching_array_filters(
+                &ctx.db_name,
+                &coll,
+                &write_filter,
+                &upd,
+                false,
+                false,
+                &array_filters,
+                &let_vars,
+                collation.as_ref(),
+                validator.as_ref(),
+            )
+        };
+        let outcome = match update_result {
+            Ok(o) => o,
+            Err(e) => return Ok(storage_err_reply(e)),
+        };
+        if outcome.matched == 0 {
+            // Lost the race — the doc no longer satisfies the query. Re-pick.
+            continue;
+        }
+
+        let value = if return_new {
+            match outcome.post_image {
+                // The post-image the write itself produced, captured under the
+                // storage lock — never a re-`find` a concurrent writer can beat.
+                Some(post) => project_value(post, fields, &query)?,
+                None => Bson::Null,
+            }
+        } else {
+            project_value(matched_doc, fields, &query)?
+        };
         return Ok(doc! {
             "lastErrorObject": { "n": 1, "updatedExisting": true },
             "value": value,
             "ok": 1.0,
         });
     }
-
-    // Command-layer validator check that produces mongod's `errInfo`
-    // (failingDocumentId + per-operator details) — storage enforces the
-    // validator too, but its error lacks the detail drivers' errorResponse tests
-    // read (mongo-c-driver findOneAndUpdate-errorResponse). Only the
-    // operator/replacement form is reconstructible in-memory here; pipeline-form
-    // falls back to storage's plain 121. Purely additive: it only short-circuits
-    // on a clear post-apply validation failure, otherwise the storage write runs.
-    if let Some(v) = &validator {
-        if pipeline.is_none() {
-            let upd = update
-                .and_then(Bson::as_document)
-                .cloned()
-                .unwrap_or_default();
-            if let Ok(post) = secantus_core::update::apply_update(&matched_doc, &upd, false) {
-                if !secantus_core::query::matches(&post, v, &Document::new(), None).unwrap_or(true)
-                {
-                    return Ok(doc! {
-                        "ok": 0.0,
-                        "errmsg": "Document failed validation",
-                        "code": 121,
-                        "codeName": "DocumentValidationFailure",
-                        "errInfo": crate::crud::validation_error_info(v, &post),
-                    });
-                }
-            }
-        }
-    }
-
-    // update: apply it to the matched doc (pipeline-form or operator/replacement).
-    let update_result = if let Some(stages) = pipeline {
-        storage.update_matching_pipeline(
-            &ctx.db_name,
-            &coll,
-            &id_filter,
-            stages,
-            false,
-            false,
-            &let_vars,
-            collation.as_ref(),
-            validator.as_ref(),
-        )
-    } else {
-        let upd = update
-            .and_then(Bson::as_document)
-            .cloned()
-            .unwrap_or_default();
-        storage.update_matching_array_filters(
-            &ctx.db_name,
-            &coll,
-            &id_filter,
-            &upd,
-            false,
-            false,
-            &array_filters,
-            &let_vars,
-            collation.as_ref(),
-            validator.as_ref(),
-        )
-    };
-    if let Err(e) = update_result {
-        return Ok(storage_err_reply(e));
-    }
-
-    let value = if return_new {
-        fetch_projected(storage, &ctx.db_name, &coll, &matched_id, fields, &query)?
-    } else {
-        project_value(matched_doc, fields, &query)?
-    };
-    Ok(doc! {
-        "lastErrorObject": { "n": 1, "updatedExisting": true },
-        "value": value,
-        "ok": 1.0,
-    })
 }
 
 // --- helpers -------------------------------------------------------------
@@ -285,26 +331,6 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
 fn decode(bytes: &[u8]) -> Result<Document, CommandError> {
     Document::from_reader(&mut &bytes[..])
         .map_err(|e| CommandError::new(1, "InternalError", format!("decode: {e}")))
-}
-
-/// Re-fetch the doc with `_id == id` and apply the projection — used for the
-/// post-image (`new: true`) and the upsert result.
-fn fetch_projected(
-    storage: &dyn crate::Storage,
-    db: &str,
-    coll: &str,
-    id: &Bson,
-    fields: Option<&Document>,
-    query: &Document,
-) -> Result<Bson, CommandError> {
-    let filter = doc! { "_id": id.clone() };
-    let found = storage
-        .find(db, coll, &filter, None, None)
-        .map_err(command_error)?;
-    match found.into_iter().next() {
-        Some(b) => project_value(decode(&b)?, fields, query),
-        None => Ok(Bson::Null),
-    }
 }
 
 /// Apply the optional projection to a value document, returning it as `Bson`.

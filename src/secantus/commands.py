@@ -2719,198 +2719,223 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             "codeName": "FailedToParse",
         }
 
-    candidates = ctx.storage.find_matching(
-        ctx.db_name, coll, query, sort=sort, limit=1, let=let, collation=collation
-    )
+    # Find → re-assert → write loop. The write below is keyed by the matched
+    # doc's ``_id`` AND re-asserts the original query, so a concurrent writer
+    # that changes (or steals) the doc between our find and our write makes
+    # the write match 0 — we loop back and re-pick, mirroring mongod
+    # re-evaluating the predicate when it acquires the document write. The
+    # ``new: true`` post-image comes from the write itself
+    # (``return_post_images``), never from a re-``find`` a concurrent writer
+    # could land in front of.
+    while True:
+        candidates = ctx.storage.find_matching(
+            ctx.db_name, coll, query, sort=sort, limit=1, let=let, collation=collation
+        )
 
-    if not candidates:
-        if upsert and not is_remove:
-            # Validator on the upsert path too — mongo-node-driver's
-            # ``Document Validation should allow bypassing document
-            # validation on findAndModify`` test calls
-            # ``findOneAndUpdate(..., upsert=true)`` against a
-            # validator-bound collection and asserts a
-            # ``MongoServerError`` when bypass is off.
-            bypass_validation_fam_up = bool(doc.get("bypassDocumentValidation", False))
-            coll_opts_up = ctx.storage.get_collection_options(ctx.db_name, coll)
-            validator_spec_up = coll_opts_up.get("validator")
-            validator_up = (
-                dict(validator_spec_up)
-                if isinstance(validator_spec_up, dict)
-                and validator_spec_up
-                and not bypass_validation_fam_up
-                else None
-            )
-            try:
-                result = ctx.storage.update_matching(
-                    ctx.db_name,
-                    coll,
-                    query,
-                    update,
-                    multi=False,
-                    upsert=True,
-                    let=let,
-                    array_filters=array_filters,
-                    collation=collation,
-                    validator=validator_up,
-                    journal=_wants_journal(doc),
-                    return_post_images=True,
+        if not candidates:
+            if upsert and not is_remove:
+                # Validator on the upsert path too — mongo-node-driver's
+                # ``Document Validation should allow bypassing document
+                # validation on findAndModify`` test calls
+                # ``findOneAndUpdate(..., upsert=true)`` against a
+                # validator-bound collection and asserts a
+                # ``MongoServerError`` when bypass is off.
+                bypass_validation_fam_up = bool(doc.get("bypassDocumentValidation", False))
+                coll_opts_up = ctx.storage.get_collection_options(ctx.db_name, coll)
+                validator_spec_up = coll_opts_up.get("validator")
+                validator_up = (
+                    dict(validator_spec_up)
+                    if isinstance(validator_spec_up, dict)
+                    and validator_spec_up
+                    and not bypass_validation_fam_up
+                    else None
                 )
-            except DocumentValidationError as exc:
+                try:
+                    result = ctx.storage.update_matching(
+                        ctx.db_name,
+                        coll,
+                        query,
+                        update,
+                        multi=False,
+                        upsert=True,
+                        let=let,
+                        array_filters=array_filters,
+                        collation=collation,
+                        validator=validator_up,
+                        journal=_wants_journal(doc),
+                        return_post_images=True,
+                    )
+                except DocumentValidationError as exc:
+                    return {
+                        "ok": 0.0,
+                        "errmsg": "Document failed validation",
+                        "code": 121,
+                        "codeName": "DocumentValidationFailure",
+                        "errInfo": {
+                            "failingDocumentId": exc.doc_id,
+                            "details": {"operatorName": "validator"},
+                        },
+                    }
+                except IndexConflict as exc:
+                    reply: dict[str, Any] = {
+                        "ok": 0.0,
+                        "errmsg": str(exc),
+                        "code": 11000,
+                        "codeName": "DuplicateKey",
+                    }
+                    if exc.key_pattern is not None:
+                        reply["keyPattern"] = exc.key_pattern
+                    if exc.key_value is not None:
+                        reply["keyValue"] = exc.key_value
+                    return reply
+                except GeoExtractError as exc:
+                    return {
+                        "ok": 0.0,
+                        "errmsg": str(exc),
+                        "code": 16572,
+                        "codeName": "Location16572",
+                    }
+                upserted_id = result["upserted_id"]
+                value: Any = None
+                if return_new and result["did_upsert"]:
+                    # The post-image captured by the write itself — a re-``find``
+                    # here races concurrent writers to the same doc.
+                    new_docs = result.get("post_images") or []
+                    if new_docs:
+                        value = new_docs[-1]
+                        if fields:
+                            value = apply_projection(value, fields)
                 return {
-                    "ok": 0.0,
-                    "errmsg": "Document failed validation",
-                    "code": 121,
-                    "codeName": "DocumentValidationFailure",
-                    "errInfo": {
-                        "failingDocumentId": exc.doc_id,
-                        "details": {"operatorName": "validator"},
+                    "lastErrorObject": {
+                        "n": 1,
+                        "updatedExisting": False,
+                        "upserted": upserted_id,
                     },
+                    "value": value,
+                    "ok": 1.0,
                 }
-            except IndexConflict as exc:
-                reply: dict[str, Any] = {
-                    "ok": 0.0,
-                    "errmsg": str(exc),
-                    "code": 11000,
-                    "codeName": "DuplicateKey",
-                }
-                if exc.key_pattern is not None:
-                    reply["keyPattern"] = exc.key_pattern
-                if exc.key_value is not None:
-                    reply["keyValue"] = exc.key_value
-                return reply
-            except GeoExtractError as exc:
-                return {
-                    "ok": 0.0,
-                    "errmsg": str(exc),
-                    "code": 16572,
-                    "codeName": "Location16572",
-                }
-            upserted_id = result["upserted_id"]
-            value: Any = None
-            if return_new and result["did_upsert"]:
-                # The post-image captured by the write itself — a re-``find``
-                # here races concurrent writers to the same doc.
-                new_docs = result.get("post_images") or []
-                if new_docs:
-                    value = new_docs[-1]
-                    if fields:
-                        value = apply_projection(value, fields)
             return {
-                "lastErrorObject": {
-                    "n": 1,
-                    "updatedExisting": False,
-                    "upserted": upserted_id,
-                },
+                "lastErrorObject": {"n": 0, "updatedExisting": False},
+                "value": None,
+                "ok": 1.0,
+            }
+
+        matched_doc = candidates[0]
+        matched_id = matched_doc["_id"]
+        # The write filter: the matched ``_id`` plus the original query
+        # re-asserted, so the write only lands if the doc still satisfies the
+        # predicate.
+        write_filter: dict[str, Any] = {"_id": matched_id}
+        if query:
+            write_filter["$and"] = [query]
+
+        if is_remove:
+            deleted = ctx.storage.delete_matching(
+                ctx.db_name,
+                coll,
+                write_filter,
+                limit=1,
+                let=let,
+                collation=collation,
+                journal=_wants_journal(doc),
+            )
+            if deleted == 0:
+                # A concurrent writer removed or changed the doc first — the
+                # pre-image in hand was never ours to claim. Re-pick.
+                continue
+            value = matched_doc
+            if fields:
+                value = apply_projection(value, fields)
+            return {
+                "lastErrorObject": {"n": 1, "updatedExisting": True},
                 "value": value,
                 "ok": 1.0,
             }
-        return {
-            "lastErrorObject": {"n": 0, "updatedExisting": False},
-            "value": None,
-            "ok": 1.0,
-        }
 
-    matched_doc = candidates[0]
-    matched_id = matched_doc["_id"]
+        # Document validator check: if the collection has a ``validator``
+        # set via ``collMod``/``create``, simulate the update first and
+        # reject when the resulting doc fails validation. Mongo-java-
+        # driver's ``findOneAndUpdate-errorResponse`` test pins this
+        # path — without it, the update silently succeeds and the test
+        # fails because no exception was thrown. Honour
+        # ``bypassDocumentValidation: true``.
+        bypass_validation_fam = bool(doc.get("bypassDocumentValidation", False))
+        coll_opts = ctx.storage.get_collection_options(ctx.db_name, coll)
+        validator_spec = coll_opts.get("validator")
+        if isinstance(validator_spec, dict) and validator_spec and not bypass_validation_fam:
+            from secantus.update import apply_update as _apply_update_check
+            from secantus.update import find_positional_matches as _pos_matches
 
-    if is_remove:
-        ctx.storage.delete_matching(
-            ctx.db_name,
-            coll,
-            {"_id": matched_id},
-            limit=1,
-            journal=_wants_journal(doc),
-        )
-        value = matched_doc
-        if fields:
+            try:
+                simulated = _apply_update_check(
+                    matched_doc,
+                    update,
+                    array_filters=array_filters,
+                    positional_matches=_pos_matches(matched_doc, {"_id": matched_id}),
+                    let=let,
+                )
+            except Exception:
+                simulated = None
+            if simulated is not None:
+                verr = _validate_doc_against_collection(ctx.storage, ctx.db_name, coll, simulated)
+                if verr is not None:
+                    return verr
+
+        try:
+            update_result = ctx.storage.update_matching(
+                ctx.db_name,
+                coll,
+                write_filter,
+                update,
+                multi=False,
+                array_filters=array_filters,
+                let=let,
+                collation=collation,
+                journal=_wants_journal(doc),
+                return_post_images=True,
+            )
+        except IndexConflict as exc:
+            reply2: dict[str, Any] = {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": 11000,
+                "codeName": "DuplicateKey",
+            }
+            if exc.key_pattern is not None:
+                reply2["keyPattern"] = exc.key_pattern
+            if exc.key_value is not None:
+                reply2["keyValue"] = exc.key_value
+            return reply2
+        except GeoExtractError as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": str(exc),
+                "code": 16572,
+                "codeName": "Location16572",
+            }
+        if update_result["matched"] == 0:
+            # Lost the race — the doc no longer satisfies the query. Re-pick.
+            continue
+
+        if return_new:
+            # Use the post-image the write itself produced (captured under the
+            # storage lock). A separate re-``find`` opens a race where a
+            # concurrent findAndModify's update lands in between and two clients
+            # are handed the same "new" document — fatal for the ticket-dispenser
+            # pattern findAndModify exists to serve.
+            post = update_result.get("post_images") or []
+            value = post[-1] if post else None
+        else:
+            value = matched_doc
+
+        if fields and value is not None:
             value = apply_projection(value, fields)
+
         return {
             "lastErrorObject": {"n": 1, "updatedExisting": True},
             "value": value,
             "ok": 1.0,
         }
-
-    # Document validator check: if the collection has a ``validator``
-    # set via ``collMod``/``create``, simulate the update first and
-    # reject when the resulting doc fails validation. Mongo-java-
-    # driver's ``findOneAndUpdate-errorResponse`` test pins this
-    # path — without it, the update silently succeeds and the test
-    # fails because no exception was thrown. Honour
-    # ``bypassDocumentValidation: true``.
-    bypass_validation_fam = bool(doc.get("bypassDocumentValidation", False))
-    coll_opts = ctx.storage.get_collection_options(ctx.db_name, coll)
-    validator_spec = coll_opts.get("validator")
-    if isinstance(validator_spec, dict) and validator_spec and not bypass_validation_fam:
-        from secantus.update import apply_update as _apply_update_check
-        from secantus.update import find_positional_matches as _pos_matches
-
-        try:
-            simulated = _apply_update_check(
-                matched_doc,
-                update,
-                array_filters=array_filters,
-                positional_matches=_pos_matches(matched_doc, {"_id": matched_id}),
-                let=let,
-            )
-        except Exception:
-            simulated = None
-        if simulated is not None:
-            verr = _validate_doc_against_collection(ctx.storage, ctx.db_name, coll, simulated)
-            if verr is not None:
-                return verr
-
-    try:
-        update_result = ctx.storage.update_matching(
-            ctx.db_name,
-            coll,
-            {"_id": matched_id},
-            update,
-            multi=False,
-            array_filters=array_filters,
-            let=let,
-            journal=_wants_journal(doc),
-            return_post_images=True,
-        )
-    except IndexConflict as exc:
-        reply2: dict[str, Any] = {
-            "ok": 0.0,
-            "errmsg": str(exc),
-            "code": 11000,
-            "codeName": "DuplicateKey",
-        }
-        if exc.key_pattern is not None:
-            reply2["keyPattern"] = exc.key_pattern
-        if exc.key_value is not None:
-            reply2["keyValue"] = exc.key_value
-        return reply2
-    except GeoExtractError as exc:
-        return {
-            "ok": 0.0,
-            "errmsg": str(exc),
-            "code": 16572,
-            "codeName": "Location16572",
-        }
-
-    if return_new:
-        # Use the post-image the write itself produced (captured under the
-        # storage lock). A separate re-``find`` opens a race where a
-        # concurrent findAndModify's update lands in between and two clients
-        # are handed the same "new" document — fatal for the ticket-dispenser
-        # pattern findAndModify exists to serve.
-        post = update_result.get("post_images") or []
-        value = post[-1] if post else None
-    else:
-        value = matched_doc
-
-    if fields and value is not None:
-        value = apply_projection(value, fields)
-
-    return {
-        "lastErrorObject": {"n": 1, "updatedExisting": True},
-        "value": value,
-        "ok": 1.0,
-    }
 
 
 def _drop(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:

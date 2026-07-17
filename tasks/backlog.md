@@ -3589,26 +3589,6 @@ Found by the two concurrency harnesses — `tests/test_mongo_server_concurrency.
 `tests/test_pgserver_concurrency.py` (psycopg vs the PG server); fixed items are
 recorded in that slice's changelog fragment. Still open:
 
-- [ ] **Rust findAndModify is not atomic across storage calls.** The command
-  layer composes find → update-by-`_id` → re-`find` (module caveat in
-  `crates/secantus-commands/src/findandmodify.rs`); a concurrent writer between
-  the update and the post-image re-read hands two clients the same `new: true`
-  document (measured: duplicate tickets under an 8-thread `$inc` dispenser —
-  `test_findandmodify_tickets_are_unique_and_complete` is xfail(strict=False)
-  until this lands). The Python server fixed the same race with
-  `Storage.update_matching(..., return_post_images=True)` (post-image captured
-  while the statement holds the storage lock); the Rust storage needs the same
-  primitive (extend `UpdateOutcome` with the post-image from
-  `update_matching_core`). The remove path has the sibling race: `delete_matching`'s
-  deleted-count is ignored, so two fam-removes can both claim the same pre-image.
-- [ ] **fam target selection doesn't re-assert the query at write time (both
-  servers).** findAndModify picks its target with a find, then updates/deletes by
-  bare `{_id}` — the original query is not re-checked under the write lock, so in
-  the job-queue pattern (`query: {state: "new"}, update: {$set: {state: "taken"}}`)
-  two clients can both "take" the same job (each update is a no-op for the query
-  but both see n:1). mongod re-evaluates the predicate when it acquires the write.
-  Fix: key the write on `{_id, $and: [query]}` and loop back to re-find on
-  matched=0. Same shape as the post-image fix; needs the retry loop.
 - [ ] **SQL UNIQUE constraints race across open transactions.** Statement-time
   constraint probes read the session's snapshot, so two *open transactions* that
   each insert the same UNIQUE value both pass the probe and both commit (the docs
