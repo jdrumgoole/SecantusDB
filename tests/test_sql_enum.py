@@ -271,3 +271,102 @@ def test_second_enum_oid_distinct_and_stable(mood, session):
     res = run(mood, session, "SELECT m, c FROM t")
     assert [c.pg_oid for c in res.columns] == [oids["mood"], oids["colour"]]
     assert oids["mood"] != oids["colour"]
+
+
+# -- enum oid through pipeline / evaluated plan shapes ------------------------- #
+# GROUP BY, JOIN, DISTINCT, and per-row-evaluated selects plan through the
+# pipeline/evaluated planners whose out_columns carry string tags; the enum
+# identity travels in out_enum_types so RowDescription still reports the mint.
+
+
+@pytest.fixture
+def peopled(mood, session):
+    run(mood, session, "CREATE TABLE people (name text PRIMARY KEY, m mood)")
+    run(mood, session, "INSERT INTO people VALUES ('a', 'sad'), ('b', 'ok'), ('c', 'ok')")
+    return mood
+
+
+def mood_oid(storage, session):
+    return run(storage, session, "SELECT oid FROM pg_type WHERE typname = 'mood'").rows[0][0]
+
+
+def test_group_by_enum_key_reports_enum_oid(peopled, session):
+    typ = mood_oid(peopled, session)
+    res = run(peopled, session, "SELECT m, count(*) FROM people GROUP BY m ORDER BY m")
+    assert [(c.name, c.pg_oid) for c in res.columns] == [("m", typ), ("count", 20)]
+    assert res.rows == [("sad", 1), ("ok", 2)]
+
+
+def test_join_enum_column_reports_enum_oid(peopled, session):
+    run(peopled, session, "CREATE TABLE teams (name text PRIMARY KEY, lead text)")
+    run(peopled, session, "INSERT INTO teams VALUES ('x', 'a'), ('y', 'b')")
+    typ = mood_oid(peopled, session)
+    res = run(
+        peopled,
+        session,
+        "SELECT t.name, p.m FROM teams t JOIN people p ON p.name = t.lead ORDER BY t.name",
+    )
+    assert [c.pg_oid for c in res.columns] == [25, typ]
+    assert res.rows == [("x", "sad"), ("y", "ok")]
+
+
+def test_join_group_by_enum_key_reports_enum_oid(peopled, session):
+    run(peopled, session, "CREATE TABLE teams (name text PRIMARY KEY, lead text)")
+    run(peopled, session, "INSERT INTO teams VALUES ('x', 'a'), ('y', 'b')")
+    typ = mood_oid(peopled, session)
+    res = run(
+        peopled,
+        session,
+        "SELECT p.m, count(*) FROM teams t JOIN people p ON p.name = t.lead"
+        " GROUP BY p.m ORDER BY p.m",
+    )
+    assert res.columns[0].pg_oid == typ
+
+
+def test_distinct_enum_reports_enum_oid(peopled, session):
+    typ = mood_oid(peopled, session)
+    res = run(peopled, session, "SELECT DISTINCT m FROM people ORDER BY m")
+    assert [(c.name, c.pg_oid) for c in res.columns] == [("m", typ)]
+    assert res.rows == [("sad",), ("ok",)]
+
+
+def test_evaluated_select_enum_column_reports_enum_oid(peopled, session):
+    # A scalar function alongside the enum column forces the per-row evaluator.
+    typ = mood_oid(peopled, session)
+    res = run(peopled, session, "SELECT m, upper(name) FROM people ORDER BY name")
+    assert res.columns[0].pg_oid == typ
+
+
+def test_enum_array_constructor_reports_array_oid(mood, session):
+    typ, typarray = run(
+        mood, session, "SELECT oid, typarray FROM pg_type WHERE typname = 'mood'"
+    ).rows[0]
+    res = run(mood, session, "SELECT array['sad'::mood, 'ok'::mood] AS ms")
+    assert res.columns[0].pg_oid == typarray != typ
+    assert res.rows == [(["sad", "ok"],)]
+
+
+# -- enum-array table columns (``mood[]``) ------------------------------------- #
+
+
+def test_create_table_enum_array_column(mood, session):
+    run(mood, session, "CREATE TABLE t (id int PRIMARY KEY, ms mood[])")
+    run(mood, session, "INSERT INTO t VALUES (1, '{sad,happy}')")
+    typarray = run(mood, session, "SELECT typarray FROM pg_type WHERE typname = 'mood'").rows[0][0]
+    res = run(mood, session, "SELECT ms FROM t")
+    assert res.columns[0].pg_oid == typarray
+    assert res.rows == [(["sad", "happy"],)]
+    star = run(mood, session, "SELECT * FROM t")
+    assert [c.pg_oid for c in star.columns] == [23, typarray]
+
+
+def test_enum_array_column_validates_labels(mood, session):
+    run(mood, session, "CREATE TABLE t (id int PRIMARY KEY, ms mood[])")
+    assert sqlstate(mood, session, "INSERT INTO t VALUES (1, '{sad,furious}')") == "22P02"
+    run(mood, session, "INSERT INTO t VALUES (2, NULL)")
+    run(mood, session, "INSERT INTO t VALUES (3, '{}')")
+    assert run(mood, session, "SELECT ms FROM t ORDER BY id").rows == [(None,), ([],)]
+
+
+def test_array_of_undeclared_type_rejected(mood, session):
+    assert sqlstate(mood, session, "CREATE TABLE t (id int PRIMARY KEY, xs nosuch[])") == "42704"

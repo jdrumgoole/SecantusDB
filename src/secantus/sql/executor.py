@@ -16,7 +16,7 @@ import bson
 
 from secantus.paths import get_path, has_path
 from secantus.sql import errors, planner, typemap
-from secantus.sql.catalog import Catalog
+from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
 
 
@@ -94,6 +94,10 @@ def _resolve_user_type_column(col: Any, catalog: Catalog, db: str) -> Any:
     name = col.enum_type
     if catalog.enum_exists(db, name):
         return col
+    if typemap.is_array_tag(col.type_tag):
+        # Only enum arrays are supported as user-type array columns; a
+        # composite/domain rewrite would lose the array shape.
+        raise errors.SQLError("42704", f'type "{name}[]" does not exist')
     composite = catalog.get_composite(db, name)
     if composite is not None:
         # A composite-typed column stores a subdocument; carry the type's ordered
@@ -515,8 +519,42 @@ def _out_column_descs(
         if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:
             if enum_oids is None:
                 enum_oids = Catalog(storage).enum_type_oids(db)
-            oid = enum_oids.get(col.enum_type, oid)
+            enum_oid = enum_oids.get(col.enum_type)
+            if enum_oid is not None:
+                # An enum-array column (``mood[]``) reports the minted array
+                # companion oid, a scalar enum column the enum oid itself.
+                if typemap.is_array_tag(col.type_tag):
+                    oid = enum_oid + USER_TYPE_ARRAY_OID_OFFSET
+                else:
+                    oid = enum_oid
         out.append(ColumnDesc(name, col.type_tag, oid))
+    return out
+
+
+def _tagged_out_column_descs(
+    cols: list[tuple[str, str]],
+    enum_types: dict[int, str],
+    storage: Any,
+    db: str | None,
+) -> list[ColumnDesc]:
+    """Describe ``(out_name, type_tag)`` output pairs (the pipeline/evaluated
+    plans' string-tag form). ``enum_types`` maps output positions to enum type
+    names — the tag alone can't carry the identity (labels are stored as text) —
+    so those positions resolve the minted enum oid like `_out_column_descs`."""
+    enum_oids: dict[str, int] | None = None
+    out: list[ColumnDesc] = []
+    for i, (name, tag) in enumerate(cols):
+        oid = typemap.PG_OID.get(tag, 25)
+        enum_name = enum_types.get(i)
+        if enum_name is not None and storage is not None and db is not None:
+            if enum_oids is None:
+                enum_oids = Catalog(storage).enum_type_oids(db)
+            enum_oid = enum_oids.get(enum_name)
+            if enum_oid is not None:
+                oid = (
+                    enum_oid + USER_TYPE_ARRAY_OID_OFFSET if typemap.is_array_tag(tag) else enum_oid
+                )
+        out.append(ColumnDesc(name, tag, oid))
     return out
 
 
@@ -744,11 +782,16 @@ def _validate_enum_columns(docs: list[dict[str, Any]], table: Any, catalog: Any,
             value = get_path(doc, col.field)
             if value is None:
                 continue
-            if value not in label_cache[col.enum_type]:
-                raise errors.SQLError(
-                    "22P02",
-                    f'invalid input value for enum {col.enum_type}: "{value}"',
-                )
+            # An enum-array column (``mood[]``) validates each element.
+            values = value if typemap.is_array_tag(col.type_tag) else [value]
+            if not isinstance(values, list):
+                values = [values]
+            for v in values:
+                if v is not None and v not in label_cache[col.enum_type]:
+                    raise errors.SQLError(
+                        "22P02",
+                        f'invalid input value for enum {col.enum_type}: "{v}"',
+                    )
 
 
 def _validate_domain_columns(
@@ -1650,7 +1693,7 @@ def execute_pipeline_select(
         synthesized = _empty_implicit_aggregate_row(remaining, ctx)
         if synthesized is not None:
             result = _apply_post_aggregates(plan, synthesized)
-    columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
+    columns = _tagged_out_column_descs(plan.out_columns, plan.out_enum_types, storage, db)
     rows = [
         tuple(typemap.to_py(doc.get(name), tag) for name, tag in plan.out_columns) for doc in result
     ]
@@ -1665,7 +1708,7 @@ def execute_evaluated_select(
     """Run a SELECT whose list / ORDER BY needs per-row evaluation (scalar /
     set-returning functions, CASE, correlated subqueries)."""
     rows = _evaluated_value_rows(plan, storage, db, sctx)
-    columns = [ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25)) for name, tag in plan.out_columns]
+    columns = _tagged_out_column_descs(plan.out_columns, plan.out_enum_types, storage, db)
     out_rows = [
         tuple(typemap.to_py(v, tag) for v, (_, tag) in zip(row, plan.out_columns, strict=True))
         for row in rows

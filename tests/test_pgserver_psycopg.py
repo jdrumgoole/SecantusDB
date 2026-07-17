@@ -813,6 +813,54 @@ def test_enum_cast_and_param_validation(server):
             conn.execute("SELECT %s", [Mood.ok])
 
 
+def test_enum_oid_through_plan_shapes_and_enum_arrays(server):
+    """The enum oid survives GROUP BY / JOIN / DISTINCT plan shapes (a registered
+    loader fires on those results too, in the simple and extended protocols),
+    and ``mood[]`` table columns store label arrays, validate elements, and
+    report the minted array oid so a registered loader returns enum members."""
+    import enum
+
+    from psycopg.types.enum import EnumInfo, register_enum
+
+    class Mood(str, enum.Enum):
+        sad = "sad"
+        ok = "ok"
+        happy = "happy"
+
+    with connect(server, autocommit=True) as conn:
+        conn.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+        conn.execute("CREATE TABLE people (name text primary key, m mood, ms mood[])")
+        conn.execute("INSERT INTO people VALUES ('a', 'sad', '{sad}'), ('b', 'ok', '{ok,happy}')")
+        info = EnumInfo.fetch(conn, "mood")
+        register_enum(info, conn, Mood)
+
+        cur = conn.execute("SELECT m, count(*) FROM people GROUP BY m ORDER BY m")
+        assert cur.description[0].type_code == info.oid
+        assert cur.fetchall() == [(Mood.sad, 1), (Mood.ok, 1)]
+
+        cur = conn.execute("SELECT DISTINCT m FROM people ORDER BY m")
+        assert cur.fetchall() == [(Mood.sad,), (Mood.ok,)]
+
+        conn.execute("CREATE TABLE teams (name text primary key, lead text)")
+        conn.execute("INSERT INTO teams VALUES ('x', 'b')")
+        cur = conn.execute("SELECT t.name, p.m FROM teams t JOIN people p ON p.name = t.lead")
+        assert cur.description[1].type_code == info.oid
+        assert cur.fetchall() == [("x", Mood.ok)]
+
+        # Extended protocol (a bound parameter forces Parse/Describe/Execute).
+        cur = conn.execute("SELECT m FROM people WHERE name = %s GROUP BY m", ["a"], binary=True)
+        assert cur.description[0].type_code == info.oid
+        assert cur.fetchall() == [(Mood.sad,)]
+
+        # mood[] columns: minted array oid + registered loader → enum members.
+        cur = conn.execute("SELECT ms FROM people ORDER BY name")
+        assert cur.description[0].type_code == info.array_oid
+        assert cur.fetchall() == [([Mood.sad],), ([Mood.ok, Mood.happy],)]
+
+        with pytest.raises(psycopg.errors.DataError):
+            conn.execute("INSERT INTO people VALUES ('c', 'ok', '{furious}')")
+
+
 def test_jsonb_roundtrip_and_navigation(server):
     """jsonb values parse at ingress: a cast or Json/Jsonb-wrapped parameter
     loads back as a Python dict/list (not double-encoded text), ``->>``

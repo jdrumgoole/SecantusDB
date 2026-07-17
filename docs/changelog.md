@@ -19,6 +19,96 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.5.4b237] — 2026-07-17
+
+### SQL: user-defined range types, and enum OIDs in every plan shape
+
+A focused SQL-server release, both slices driven by the psycopg
+conformance gauge. `CREATE TYPE ... AS RANGE` brings user-defined range
+types end to end — catalog rows, the v3 extended protocol's binary codec
+path, and range operators over the new types — building on the
+range/multirange parameter support that shipped in the previous release.
+And enum result OIDs now survive **every** plan shape: joins, subqueries,
+set operations, and computed projections all report the enum's real
+`pg_type` OID in RowDescription (previously only simple scans did), with
+`mood[]`-style enum-array columns decoding correctly on the binary path.
+
+#### Added
+
+- `CREATE TYPE ... AS RANGE` / `DROP TYPE`: catalog rows, binary codecs on
+  the extended protocol, range operators over user-defined range types.
+- Enum result OIDs in `RowDescription` across joins, subqueries, set
+  operations, and computed projections; enum-array (`mood[]`) columns on
+  the binary path.
+
+
+### SQL server: CREATE TYPE … AS RANGE
+
+User-declared range types land: `CREATE TYPE textrange AS RANGE (subtype =
+text)` mints the type and its auto-created companion multirange
+(`textmultirange`, following Postgres' naming rule) with allocation-stable
+OIDs, reflects both through `pg_type` (typtype `r` / `m`, real `typarray`)
+and `pg_range` (`rngtypid` / `rngsubtype` / `rngmultitypid`), and wires the
+full value path: literal casts (`'[a,b)'::textrange`,
+`'{[a,b)}'::textmultirange`) parse with the declared subtype's coercion, the
+type gets its constructor (`textrange(lo, hi, bounds)`), parameters a
+registered psycopg dumper declares with the minted OID round-trip in text and
+binary (PG's range wire layout), results describe with the minted OID and
+render/encode as ranges in both formats, and `DROP TYPE` removes the pair.
+psycopg's `RangeInfo.fetch` → `register_range` → typed `Range` values works
+end-to-end, as does the multirange counterpart.
+
+The statement itself exceeds sqlglot's parser (it falls back to a raw
+Command), so the engine intercepts the command tail — the same pattern
+`CREATE DOMAIN` uses. Together with the earlier waves this clears psycopg's
+custom-range fixtures, which previously errored out of thirty-one range and
+multirange tests before any assertion ran.
+
+#### Added
+
+- `catalog.py`: `create_range_type` / `get_range_type` (by range or companion
+  multirange name) / `drop_range_type` / `list_range_types`, minted from the
+  stable user-type OID counter; `multirange_name_for` (Postgres' rename rule).
+- `engine.py`: the `CREATE TYPE … AS RANGE (…)` Command interception (subtype
+  resolved via regtype spelling; collation/opclass options accepted, ignored);
+  `DROP TYPE` drops range types.
+- `ranges.py`: `custom_elem` parsing/construction for non-builtin subtypes.
+- `scalar.py`: custom range/multirange casts and constructors.
+- `pgextended.py`: binary custom-range/multirange parameter decode and the
+  generic binary range/multirange result encoders; user-type binary params
+  route by catalog kind.
+- `virtual.py`: `pg_type` + `pg_range` rows for user ranges; `regtype` /
+  `user_type_*` resolution covers them.
+
+### SQL server: enum OIDs through every plan shape, and enum-array columns
+
+The minted enum OID now survives every SELECT plan shape. GROUP BY keys,
+JOIN projections, `SELECT DISTINCT`, and per-row-evaluated selects (a scalar
+function alongside the enum column) previously described enum result columns
+as plain `text` (25) because the pipeline/evaluated planners flatten output
+columns to string type tags; the enum identity now travels in a parallel
+`out_enum_types` position map so RowDescription reports the mint — and a
+psycopg `register_enum` loader fires on those results — in both the simple
+and extended protocols. `array['sad'::mood, …]` constructors describe with
+the minted array-companion OID like the `::mood[]` cast already did.
+
+`mood[]` table columns land too: an array of a declared enum type was
+previously rejected outright (`unsupported column type`); it now stores a
+text array, validates every element against the enum's labels at write time
+(22P02), and reports the array-companion OID so a registered loader returns
+lists of enum members. An array of an undeclared type raises 42704.
+
+#### Added
+
+- `planner.py`: `out_enum_types` on `PipelineSelectPlan` / `EvaluatedSelectPlan`,
+  populated by the DISTINCT / GROUP BY / JOIN / evaluated builders;
+  `_enum_array_element_name` recognises `mood[]` column declarations; the
+  constant-select array-constructor override gains an enum branch.
+- `executor.py`: `_tagged_out_column_descs` resolves minted enum OIDs for the
+  string-tag plans (shared by Execute and Describe); `_out_column_descs`
+  reports the array-companion OID for enum-array columns; enum write
+  validation checks each element of an array value.
+
 ## [0.5.4b236] — 2026-07-17
 
 ### Measured everywhere: a concurrent test suite that caught real bugs, three-way benchmarks, and self-hosted docs
