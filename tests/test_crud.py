@@ -4100,3 +4100,51 @@ def test_pull_predicate_and_pullall(coll) -> None:
     coll.update_one({"_id": 1}, {"$set": {"a": [1, 2, 3, 2, 1]}})
     coll.update_one({"_id": 1}, {"$pullAll": {"a": [1, 2]}})
     assert coll.find_one({"_id": 1})["a"] == [3]
+
+
+def test_json_schema_keyword_validation_wire(coll) -> None:
+    """$jsonSchema keyword validation over the wire, verbatim from a mongod 7.0
+    probe: metadata keywords accepted; unsupported keywords 9 FailedToParse;
+    unknown keywords 9 (nested schemas included); draft-4 exclusive bounds and
+    multipleOf / tuple-items semantics."""
+    import pymongo
+
+    coll.insert_many([{"_id": 1, "n": 6, "arr": [1, "x"]}, {"_id": 2, "n": 7.5, "arr": [1]}])
+
+    assert len(list(coll.find({"$jsonSchema": {"title": "t", "description": "d"}}))) == 2
+    got = [
+        d["_id"]
+        for d in coll.find(
+            {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}}
+        )
+    ]
+    assert got == [2]
+    assert [
+        d["_id"] for d in coll.find({"$jsonSchema": {"properties": {"n": {"multipleOf": 2.5}}}})
+    ] == [2]
+    assert [
+        d["_id"]
+        for d in coll.find(
+            {
+                "$jsonSchema": {
+                    "properties": {
+                        "arr": {"items": [{"bsonType": "int"}], "additionalItems": False}
+                    }
+                }
+            }
+        )
+    ] == [2]
+
+    for schema, code, frag in [
+        ({"$ref": "#/x"}, 9, "not currently supported"),
+        ({"notakeyword": 1}, 9, "Unknown $jsonSchema keyword: notakeyword"),
+        ({"properties": {"n": {"notakeyword": 1}}}, 9, "Unknown $jsonSchema keyword"),
+        ({"minimum": 5, "exclusiveMinimum": 6}, 14, "must be a boolean"),
+        ({"exclusiveMinimum": True}, 9, "must be a present if"),
+        ({"multipleOf": 0}, 9, "positive value"),
+        ({"title": 5}, 14, "must be of type string"),
+    ]:
+        with pytest.raises(pymongo.errors.OperationFailure) as exc:
+            list(coll.find({"$jsonSchema": schema}))
+        assert exc.value.code == code, schema
+        assert frag in exc.value.details["errmsg"], schema

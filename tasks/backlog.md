@@ -1528,14 +1528,23 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `Location40218`, an unknown `$meta` arg → `Location17308`. Found alongside the
   positional-`$` projection fix by the three-way projection differential
   (2026-07-12).
-- [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
-  (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
-  on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
-  `items`/`uniqueItems`/`required`/`properties`/`additionalProperties`/
-  `patternProperties`/`dependencies`/`allOf`/`anyOf`/`oneOf`/`not` all ship on
-  both. `uniqueItems` uses MongoDB value equality, bridging cross-type-equal
-  numerics recursively inside document/array elements — `[{a: 1}, {a: 1.0}]` and
-  `[1, 1.0]` are both correctly treated as duplicates.)
+- [x] **Query operator: `$jsonSchema` keyword surface — COMPLETE on both
+  servers (2026-07-17, probed against real mongod 7.0).** Every mongod-accepted
+  keyword now ships on both engines, including the previously-missing
+  `multipleOf` (fmod semantics), tuple-form `items` + `additionalItems`, and
+  the `title`/`description` metadata (accepted-and-ignored, type-checked).
+  Exclusive bounds moved to mongod's **draft-4** semantics (`exclusiveMinimum`/
+  `exclusiveMaximum` are booleans sharpening `minimum`/`maximum`; the draft-6
+  numeric form is a parse error — the old numeric treatment was a divergence).
+  Keyword *validation* is parse-time and recursive on both servers with
+  mongod's verbatim codes/messages: unknown keyword / known-but-unsupported
+  (`$ref`/`$schema`/`default`/`definitions`/`format`/`id`) → `9 FailedToParse`;
+  type violations (`multipleOf` non-number, exclusive-bound non-boolean,
+  non-string metadata, non-object schema) → `14 TypeMismatch`. Python:
+  `query._check_json_schema_keywords` (QueryError now carries code/codeName);
+  Rust: `secantus_core::query::json_schema_keyword_error` + the find-command
+  parse-time check. (`type: "integer"` acceptance remains a small known
+  divergence — mongod rejects the alias; both our servers accept it.)
 - [x] **Error-code — unrecognized expression operator: FIXED on both servers.**
   Query `$expr` → `168 InvalidPipelineOperator` on both (find.rs parse-time
   check via `expressions::first_unknown_expr_operator`); aggregation

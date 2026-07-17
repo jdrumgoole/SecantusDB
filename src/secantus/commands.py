@@ -2082,7 +2082,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     try:
         matches({}, filter_, vars=let)
     except QueryError as exc:
-        return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+        return {"ok": 0.0, "errmsg": str(exc), "code": exc.code, "codeName": exc.code_name}
     except UnknownExpressionOperatorError as exc:
         # An unrecognized ``$``-operator inside a query ``$expr`` is a
         # parse-level error mongod rejects up front (168
@@ -2129,7 +2129,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     except MinMaxKeyError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 51174, "codeName": "Location51174"}
     except QueryError as exc:
-        return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+        return {"ok": 0.0, "errmsg": str(exc), "code": exc.code, "codeName": exc.code_name}
     # ``returnKey`` replaces each result with just the keys of the index that
     # serves the query (filter + sort): the index's key-pattern fields, plus
     # the sort fields (mongod serves a sort from an index — the ``_id`` order
@@ -2478,7 +2478,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # ``CommandMonitoringTest#updateOne with write errors``
             # asserts a ``commandSucceededEvent`` for the call, not a
             # ``commandFailedEvent``.
-            write_errors.append({"index": index, "code": 2, "errmsg": str(exc)})
+            write_errors.append({"index": index, "code": exc.code, "errmsg": str(exc)})
             if ordered:
                 break
             continue
@@ -2547,7 +2547,7 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # ``delete`` command must succeed with ``ok: 1`` and
             # ``writeErrors: [...]`` rather than failing the whole
             # batch on one bad filter.
-            write_errors.append({"index": index, "code": 2, "errmsg": str(exc)})
+            write_errors.append({"index": index, "code": exc.code, "errmsg": str(exc)})
             if ordered:
                 break
             continue

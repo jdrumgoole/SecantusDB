@@ -115,10 +115,42 @@ pub(crate) fn query_filter_error(filter: &Document) -> CommandError {
             format!("Unrecognized expression '{op}'"),
         );
     }
+    // An invalid `$jsonSchema` keyword carries mongod's own code (9
+    // FailedToParse / 14 TypeMismatch), not the generic BadValue.
+    if let Some((code, name, msg)) = json_schema_error_in_filter(filter) {
+        return CommandError::new(code, name, msg);
+    }
     match secantus_core::query::first_unknown_operator(filter) {
         Some(op) => CommandError::new(2, "BadValue", format!("unsupported query operator: {op}")),
         None => CommandError::new(2, "BadValue", "unsupported or invalid query filter"),
     }
+}
+
+/// The first invalid `$jsonSchema` keyword violation anywhere in `filter`
+/// (recursing through `$and`/`$or`/`$nor`), as mongod's (code, codeName,
+/// errmsg). mongod validates schema keywords at parse time, so the command
+/// entry points check this up-front — even against an empty collection.
+pub(crate) fn json_schema_error_in_filter(
+    filter: &Document,
+) -> Option<(i32, &'static str, String)> {
+    for (k, v) in filter.iter() {
+        if k == "$jsonSchema" {
+            if let Some(e) = secantus_core::query::json_schema_keyword_error(v) {
+                return Some(e);
+            }
+        } else if (k == "$and" || k == "$or" || k == "$nor") && matches!(v, Bson::Array(_)) {
+            if let Bson::Array(arr) = v {
+                for sub in arr {
+                    if let Bson::Document(d) = sub {
+                        if let Some(e) = json_schema_error_in_filter(d) {
+                            return Some(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The first unrecognised expression operator reachable through a `$expr`
@@ -226,6 +258,12 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("Unrecognized expression '{op}'"),
         )
         .into_reply());
+    }
+    // Same parse-time treatment for an invalid `$jsonSchema` keyword: mongod
+    // rejects it (9 FailedToParse / 14 TypeMismatch) before any scan, even on
+    // an empty collection — the per-doc path would silently ignore it.
+    if let Some((code, name, msg)) = json_schema_error_in_filter(&filter) {
+        return Ok(CommandError::new(code, name, msg).into_reply());
     }
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0).max(0) as usize;
     let limit = doc.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize; // 0 ⇒ no limit

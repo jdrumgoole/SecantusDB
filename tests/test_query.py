@@ -474,3 +474,62 @@ def test_datetime_naive_aware_equality_same_instant():
     # A different instant (offset shifts it) must NOT match.
     other = dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone(dt.timedelta(hours=2)))
     assert not matches({"at": naive}, {"at": other})
+
+
+def test_json_schema_keyword_validation_errors() -> None:
+    """Parse-time $jsonSchema keyword validation, verbatim from a mongod 7.0
+    probe: unknown keyword / unsupported keyword / draft-4 exclusive-bound
+    rules / multipleOf typing, each with mongod's code."""
+    import pytest
+
+    from secantus.query import QueryError
+
+    for schema, code, frag in [
+        ({"$ref": "#/x"}, 9, "not currently supported"),
+        ({"$schema": "x"}, 9, "not currently supported"),
+        ({"format": "email"}, 9, "not currently supported"),
+        ({"notakeyword": 1}, 9, "Unknown $jsonSchema keyword: notakeyword"),
+        ({"properties": {"n": {"notakeyword": 1}}}, 9, "Unknown $jsonSchema keyword"),
+        ({"items": {"notakeyword": 1}}, 9, "Unknown $jsonSchema keyword"),
+        ({"allOf": [{"notakeyword": 1}]}, 9, "Unknown $jsonSchema keyword"),
+        ({"minimum": 5, "exclusiveMinimum": 6}, 14, "must be a boolean"),
+        ({"exclusiveMinimum": True}, 9, "'minimum' must be a present if"),
+        ({"exclusiveMaximum": True}, 9, "'maximum' must be a present if"),
+        ({"multipleOf": 0}, 9, "must have a positive value"),
+        ({"multipleOf": -2}, 9, "must have a positive value"),
+        ({"multipleOf": "x"}, 14, "must be a number"),
+        ({"multipleOf": True}, 14, "must be a number"),
+        ({"title": 5}, 14, "must be of type string"),
+        (5, 14, "$jsonSchema must be an object"),
+    ]:
+        with pytest.raises(QueryError) as exc:
+            matches({}, {"$jsonSchema": schema})
+        assert exc.value.code == code, schema
+        assert frag in str(exc.value), schema
+
+
+def test_json_schema_draft4_bounds_multipleof_and_tuple_items() -> None:
+    """The newly-implemented keywords match mongod's probed semantics."""
+    ex_min = {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}
+    assert not matches({"n": 6}, {"$jsonSchema": ex_min})
+    assert matches({"n": 7}, {"$jsonSchema": ex_min})
+    assert matches({"n": 6}, {"$jsonSchema": {"properties": {"n": {"minimum": 6}}}})
+
+    mof = {"properties": {"n": {"multipleOf": 2.5}}}
+    assert matches({"n": 7.5}, {"$jsonSchema": mof})
+    assert not matches({"n": 6}, {"$jsonSchema": mof})
+
+    tup = {"properties": {"a": {"items": [{"bsonType": "int"}], "additionalItems": False}}}
+    assert matches({"a": [1]}, {"$jsonSchema": tup})
+    assert not matches({"a": [1, "x"]}, {"$jsonSchema": tup})
+    tup_schema = {
+        "properties": {
+            "a": {"items": [{"bsonType": "int"}], "additionalItems": {"bsonType": "string"}}
+        }
+    }
+    assert matches({"a": [1, "x"]}, {"$jsonSchema": tup_schema})
+    assert not matches({"a": [1, True]}, {"$jsonSchema": tup_schema})
+
+    # Metadata keywords are accepted and ignored, top-level and nested.
+    meta = {"title": "t", "description": "d", "properties": {"n": {"title": "x", "minimum": 1}}}
+    assert matches({"n": 5}, {"$jsonSchema": meta})
