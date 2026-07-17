@@ -590,6 +590,24 @@ def test_query_all(coll) -> None:
     assert ids == [1, 3]
 
 
+def test_query_all_scalar_field(coll) -> None:
+    """$all against a scalar field value matches like a one-element array
+    (mongod 7.0.12); an empty $all matches nothing. Regression for a bug where
+    both servers silently missed scalar-field docs."""
+    from bson import Regex
+
+    coll.insert_many(
+        [
+            {"_id": 1, "tags": ["red", "blue"]},
+            {"_id": 2, "tags": "red"},  # scalar field
+            {"_id": 3, "tags": "green"},
+        ]
+    )
+    assert sorted(d["_id"] for d in coll.find({"tags": {"$all": ["red"]}})) == [1, 2]
+    assert sorted(d["_id"] for d in coll.find({"tags": {"$all": [Regex("^red$")]}})) == [1, 2]
+    assert list(coll.find({"tags": {"$all": []}})) == []
+
+
 def test_query_all_with_elemmatch(coll) -> None:
     coll.insert_many(
         [

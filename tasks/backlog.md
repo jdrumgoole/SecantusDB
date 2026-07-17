@@ -1034,11 +1034,17 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
 - [ ] **Widen the Rust query matcher (Rust server)** — the matcher backs the
   Rust server directly; there is no Python fallback in that path, so an unported
   construct surfaces as `BadValue`. **Done:** `$all` (element equality via
-  `expressions::py_eq`; regex elements still defer); structural array/doc
-  *equality* (`array_eq` / `doc_eq`); bool-as-int `$gt`/`$lt`/`$gte`/`$lte`
-  comparison (0.5.3-beta.119 — numeric vs int/long/double, no-match vs any other
-  type, matching Python's `<`). **Still deferred where faithful:** regex array
-  elements in `$all`, structural array/doc *ordering* under `$gt`/`$lt`, and the
+  `expressions::py_eq`, **regex elements via `op_regex`**, and — fixed 2026-07-17
+  — a **scalar** field value matched like a one-element array, plus `$all: []`
+  matching nothing; this was a real dual-server correctness bug found by the R8
+  gauge triage: `{tags: {$all: ["red"]}}` silently missed scalar `tags: "red"`
+  on *both* servers, verified against mongod 7.0.12 and fixed in `query._op_all`
+  + `query::op_all` with three-way parity); structural array/doc *equality*
+  (`array_eq` / `doc_eq`); bool-as-int `$gt`/`$lt`/`$gte`/`$lte` comparison
+  (0.5.3-beta.119 — numeric vs int/long/double, no-match vs any other type,
+  matching Python's `<`). **Still deferred where faithful:** structural
+  array/doc *ordering* under `$gt`/`$lt` (array-vs-array lexicographic range
+  landed 2026-07-13; whole-doc ordering under range still defers), and the
   exotic BSON types. (The retired in-process "flip `query.matches` default to
   Rust" item is gone — the two-server model has no per-call engine selection;
   `_secantus_core` is only the parity-test vehicle now.)

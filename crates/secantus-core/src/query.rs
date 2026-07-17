@@ -1346,20 +1346,37 @@ fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
     let Bson::Array(required) = required else {
         return Err(Fallback); // Python raises QueryError on a non-array $all
     };
-    // A regex element matches array elements as a *pattern* (not by equality),
-    // mirroring `query._op_all`; a non-regex element matches by `py_eq`. A regex
-    // the engine can't compile still defers via `op_regex`.
+    // `$all: []` matches nothing (mongod), not everything — the vacuous
+    // all-clauses-satisfied below would otherwise be true for every value.
+    if required.is_empty() {
+        return Ok(false);
+    }
+    // A regex element matches as a *pattern* (not by equality), mirroring
+    // `query._op_all`; a non-regex element matches by `py_eq`. A regex the
+    // engine can't compile still defers via `op_regex`. mongod treats a scalar
+    // field value like a one-element array for `$all` (only `$elemMatch`
+    // clauses require an actual array) — verified against mongod 7.0.12.
     for v in values {
-        let Some(Bson::Array(arr)) = v else { continue };
+        let Some(field) = v else { continue };
+        // The elements to match each required clause against: the array's own
+        // elements, or the scalar itself as a single element.
+        let elems: &[Bson] = match field {
+            Bson::Array(arr) => arr,
+            scalar => std::slice::from_ref(scalar),
+        };
+        let is_array = matches!(field, Bson::Array(_));
         let mut all_present = true;
         for r in required {
-            // A `{$elemMatch: {...}}` clause requires *some* element of the array
-            // to match the sub-query (mongod's `$all` + `$elemMatch` form).
+            // A `{$elemMatch: {...}}` clause requires *some* element of an actual
+            // array to match the sub-query — a scalar field never satisfies it.
             if let Bson::Document(rd) = r {
                 if rd.len() == 1 {
                     if let Some(sub) = rd.get("$elemMatch") {
-                        let arr_bson = Bson::Array(arr.clone());
-                        if !op_elem_match(&[Some(&arr_bson)], sub)? {
+                        let ok = is_array && {
+                            let arr_bson = Bson::Array(elems.to_vec());
+                            op_elem_match(&[Some(&arr_bson)], sub)?
+                        };
+                        if !ok {
                             all_present = false;
                             break;
                         }
@@ -1368,7 +1385,7 @@ fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
                 }
             }
             let mut found = false;
-            for e in arr {
+            for e in elems {
                 let matched = match r {
                     Bson::RegularExpression(_) => op_regex(&[Some(e)], r, None)?,
                     _ => expressions::py_eq(e, r).map_err(|_| Fallback)?,

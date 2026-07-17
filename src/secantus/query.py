@@ -1091,18 +1091,24 @@ def _op_all(values: list[Any], required: Any) -> bool:
             return False
         return elem == r
 
-    def _required_satisfied(v: list[Any], r: Any) -> bool:
+    def _required_satisfied(v: Any, r: Any) -> bool:
         # A `{$elemMatch: {...}}` clause requires *some* element of the array to
-        # match the sub-query (mongod's `$all` + `$elemMatch` form); every other
-        # clause requires some element to equal / pattern-match it.
+        # match the sub-query (mongod's `$all` + `$elemMatch` form) — a scalar
+        # field can never satisfy it. Every other clause matches if the field is
+        # an array containing a matching element, OR a scalar that itself
+        # equals / pattern-matches the clause (mongod treats a scalar field like
+        # a one-element array for `$all`, verified against mongod 7.0.12).
         if isinstance(r, Mapping) and list(r.keys()) == ["$elemMatch"]:
-            return _op_elem_match([v], r["$elemMatch"])
-        return any(_elem_matches_required(elem, r) for elem in v)
+            return isinstance(v, list) and _op_elem_match([v], r["$elemMatch"])
+        if isinstance(v, list):
+            return any(_elem_matches_required(elem, r) for elem in v)
+        return _elem_matches_required(v, r)
 
-    for v in values:
-        if isinstance(v, list) and all(_required_satisfied(v, r) for r in required):
-            return True
-    return False
+    # `$all: []` matches nothing (mongod), not everything — guard the vacuous
+    # `all(...)` that would otherwise be True for every value.
+    if not required:
+        return False
+    return any(all(_required_satisfied(v, r) for r in required) for v in values)
 
 
 def _op_mod(values: list[Any], mod_spec: Any) -> bool:

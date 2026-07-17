@@ -154,6 +154,14 @@ CURATED = [
     # $all with regex elements matches array elements as patterns.
     ({"k": ["serialization", "test", "x"]}, {"k": {"$all": [Regex("ser"), Regex("test")]}}),
     ({"k": ["abc", "def"]}, {"k": {"$all": [Regex("zzz")]}}),
+    # $all against a SCALAR field (mongod treats it like a one-element array):
+    # equality and regex elements both match; $all: [] matches nothing.
+    ({"k": "red"}, {"k": {"$all": ["red"]}}),
+    ({"k": "red"}, {"k": {"$all": [Regex("^red$")]}}),
+    ({"k": "red"}, {"k": {"$all": ["red", "blue"]}}),
+    ({"k": ["a", "b"]}, {"k": {"$all": []}}),
+    ({"k": "red"}, {"k": {"$all": []}}),
+    ({"k": "red"}, {"k": {"$all": [{"$elemMatch": {"$eq": "red"}}]}}),
     # Embedded-document equality is order-sensitive + exact (Rust defers
     # on Document/Array expected values; Python is the oracle).
     ({"s": {"h": 14, "w": 21}}, {"s": {"h": 14, "w": 21}}),
