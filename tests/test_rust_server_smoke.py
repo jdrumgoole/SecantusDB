@@ -974,3 +974,123 @@ def test_expanded_events_match_mongod_shapes(tmp_path) -> None:
         assert "disambiguatedPaths" not in plain["updateDescription"]
     finally:
         srv.stop()
+
+
+def test_tls_and_x509_auth_end_to_end(tmp_path) -> None:
+    """R4 tail: server-side TLS, mTLS client-cert verification, and
+    MONGODB-X509 auth (peer_cert_dn threading) on the Rust server — the same
+    two-stage bootstrap flow as the Python server's ``test_x509_auth``:
+    provision the DN user over plain TLS, restart with ``require_auth`` +
+    ``tls_require_client_cert``, authenticate with the cert alone."""
+    import ssl
+
+    trustme = pytest.importorskip("trustme")
+    from secantus.auth import subject_dn_from_peercert
+
+    ca = trustme.CA()
+    server_cert = ca.issue_cert("127.0.0.1")
+    cert_path = tmp_path / "server.crt"
+    key_path = tmp_path / "server.key"
+    ca_path = tmp_path / "ca.crt"
+    server_cert.cert_chain_pems[0].write_to_path(cert_path)
+    server_cert.private_key_pem.write_to_path(key_path)
+    ca.cert_pem.write_to_path(ca_path)
+
+    alice = ca.issue_cert("alice.example", common_name="alice")
+    alice_pem = tmp_path / "alice.pem"
+    with alice_pem.open("wb") as f:
+        for blob in alice.cert_chain_pems:
+            f.write(blob.bytes())
+        f.write(alice.private_key_pem.bytes())
+    cert_only = tmp_path / "alice-cert-only.pem"
+    cert_only.write_bytes(alice.cert_chain_pems[0].bytes())
+    alice_dn = subject_dn_from_peercert(
+        ssl._ssl._test_decode_cert(str(cert_only))  # type: ignore[attr-defined]
+    )
+
+    data = str(tmp_path / "wt")
+    # Stage 1: TLS-only bootstrap to provision the X509 user.
+    srv = _server.RustServer(
+        data,
+        0,
+        tls_cert_file=str(cert_path),
+        tls_key_file=str(key_path),
+    )
+    try:
+        host, port = srv.address
+        boot = pymongo.MongoClient(
+            f"mongodb://{host}:{port}/?tls=true&tlsCAFile={ca_path}",
+            serverSelectionTimeoutMS=5000,
+        )
+        boot["$external"].command(
+            "createUser",
+            alice_dn,
+            roles=[{"role": "root", "db": "admin"}],
+            mechanisms=["MONGODB-X509"],
+        )
+        boot.close()
+    finally:
+        srv.stop()
+
+    # Stage 2: auth + mTLS on; the cert IS the credential.
+    srv = _server.RustServer(
+        data,
+        0,
+        require_auth=True,
+        tls_cert_file=str(cert_path),
+        tls_key_file=str(key_path),
+        tls_ca_file=str(ca_path),
+        tls_require_client_cert=True,
+    )
+    try:
+        host, port = srv.address
+        client = pymongo.MongoClient(
+            f"mongodb://{host}:{port}/?tls=true&tlsCAFile={ca_path}"
+            f"&tlsCertificateKeyFile={alice_pem}"
+            "&authMechanism=MONGODB-X509&authSource=$external",
+            serverSelectionTimeoutMS=5000,
+        )
+        client["x509db"]["c"].insert_one({"_id": 1, "v": "hello from alice"})
+        assert client["x509db"]["c"].find_one({"_id": 1})["v"] == "hello from alice"
+        client.close()
+
+        # Negative: a client presenting no cert is refused at the TLS layer.
+        bad = pymongo.MongoClient(
+            f"mongodb://{host}:{port}/?tls=true&tlsCAFile={ca_path}",
+            serverSelectionTimeoutMS=2000,
+        )
+        with pytest.raises(pymongo.errors.PyMongoError):
+            bad.admin.command("ping")
+        bad.close()
+    finally:
+        srv.stop()
+
+
+def test_tailable_cursor_on_capped_collection(tmp_path) -> None:
+    """A tailable cursor on a capped collection drains the initial batch, stays
+    open, and picks up documents inserted after the drain — the classic
+    tail-a-log pattern (mirrors ``commands.py::_find_tailable``)."""
+    import time
+
+    from pymongo.cursor import CursorType
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        db.create_collection("log", capped=True, size=65536)
+        db.log.insert_many([{"_id": i} for i in range(3)])
+        cur = db.log.find(cursor_type=CursorType.TAILABLE)
+        got = [d["_id"] for d in cur]
+        assert got == [0, 1, 2]
+        db.log.insert_one({"_id": 99})
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                got.append(next(cur)["_id"])
+                break
+            except StopIteration:
+                time.sleep(0.1)
+        assert got == [0, 1, 2, 99]
+        cur.close()
+    finally:
+        srv.stop()
