@@ -344,3 +344,20 @@ def test_bit_on_missing_field_treats_as_zero() -> None:
 def test_bit_on_non_int_raises() -> None:
     with pytest.raises(UpdateError):
         apply_update({"f": "abc"}, {"$bit": {"f": {"or": 1}}})
+
+
+def test_inc_mul_reject_non_numeric_operand() -> None:
+    """$inc / $mul by a non-number raise code 14 with mongod's message
+    (probed 7.0.12). bool is not a number here (Python's bool is an int, so
+    5 + True would otherwise compute); string / null also error instead of
+    raising a raw ValueError/TypeError from the arithmetic. Valid numeric
+    operands still apply."""
+    for op, verb in [("$inc", "increment"), ("$mul", "multiply")]:
+        for operand in (True, False, "x", None):
+            with pytest.raises(UpdateError) as exc:
+                apply_update({"n": 5}, {op: {"n": operand}})
+            assert exc.value.code == 14
+            assert f"Cannot {verb} with non-numeric argument" in str(exc.value)
+    # Valid numeric operands still apply.
+    assert apply_update({"n": 5}, {"$inc": {"n": 3}}) == {"n": 8}
+    assert apply_update({"n": 5}, {"$mul": {"n": 2.5}}) == {"n": 12.5}

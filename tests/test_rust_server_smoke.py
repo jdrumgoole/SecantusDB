@@ -1094,3 +1094,25 @@ def test_tailable_cursor_on_capped_collection(tmp_path) -> None:
         cur.close()
     finally:
         srv.stop()
+
+
+def test_inc_mul_reject_non_numeric_operand(tmp_path) -> None:
+    """$inc / $mul by a non-number (bool / string / null) is REJECTED on the
+    Rust server rather than silently computed (bool previously computed as
+    5 + 1 = 6). The Rust server surfaces BadValue (code 2) — the documented
+    update error-code gap; the Python server gives mongod's exact code 14 —
+    but the correctness contract (reject, don't compute) holds on both."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "n": 5})
+        for op in ("$inc", "$mul"):
+            for operand in (True, "x", None):
+                with pytest.raises(pymongo.errors.OperationFailure):
+                    coll.update_one({"_id": 1}, {op: {"n": operand}})
+        # Untouched by the rejected updates; a valid $inc still applies.
+        assert coll.find_one({"_id": 1})["n"] == 5
+        coll.update_one({"_id": 1}, {"$inc": {"n": 3}})
+        assert coll.find_one({"_id": 1})["n"] == 8
+    finally:
+        srv.stop()
