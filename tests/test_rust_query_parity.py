@@ -190,6 +190,14 @@ CURATED = [
     ({"a": {"x": 1}}, {"a": {"$lt": {"x": 1, "y": 5}}}),
     ({"a": {"x": 1}}, {"a": {"$gt": 2}}),
     ({"a": 2}, {"a": {"$gt": {"x": 1}}}),
+    # Array-vs-array range: elements order by full BSON order (type rank), so a
+    # cross-type element pair still orders (string element > number element).
+    ({"a": [1, "x"]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, "x"]}, {"a": {"$lt": [1, 2]}}),
+    ({"a": ["x", 1]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [2, "x"]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1]}, {"a": {"$lt": [1, 2]}}),
+    ({"a": [1, 2]}, {"a": {"$gte": [1, 2]}}),
     # Range operators against an array-valued (multikey) field: match when any
     # element satisfies the bound; the array-as-a-whole is never compared to the
     # scalar bound (an array out-ranks a number in BSON type order).

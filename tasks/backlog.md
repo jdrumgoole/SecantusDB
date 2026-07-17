@@ -1050,9 +1050,15 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   `operator.gt` raises on dicts → swallowed no-match), where mongod orders
   embedded documents. Fixed in `query._try_cmp` (via `ordering._bson_lt`) and
   `query::compare_values` (via `order::bson_lt`), three-way mongod-verified; the
-  document-vs-scalar type bracket still no-matches correctly. **Still deferred
-  where faithful:** the exotic BSON types, and a rare array element pair whose
-  cross-type BSON rank Python's native `list` compare doesn't reproduce. (The
+  document-vs-scalar type bracket still no-matches correctly. **Array-vs-array
+  cross-type element ordering also done** (2026-07-17, same R8 triage): array
+  elements order by *full* BSON order (type rank first), so `{a: {$gt: [1,2]}}`
+  matches `a: [1,"x"]` (string element outranks number) — both servers returned
+  nothing before (Python's list `<` raises str-vs-int). Fixed via `_bson_lt` /
+  `order::bson_lt` element-wise; the stale
+  `array_vs_array_cross_type_element_no_match` unit test that pinned the bug is
+  corrected. **Still deferred where faithful:** the exotic BSON types (JS code /
+  symbol compare as text; DBPointer / undefined no-match). (The
   retired in-process "flip `query.matches` default to Rust" item is gone — the
   two-server model has no per-call engine selection; `_secantus_core` is only
   the parity-test vehicle now.)

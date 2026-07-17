@@ -604,14 +604,18 @@ fn compare_values(
     match (a, b) {
         (Bson::Array(xs), Bson::Array(ys)) => {
             for (ea, eb) in xs.iter().zip(ys.iter()) {
-                match compare_values(ea, eb, coll)? {
-                    Some(Ordering::Equal) => continue,
-                    Some(o) => return Ok(Some(o)),
-                    // An incomparable element pair: all earlier pairs were equal,
-                    // so this is where Python's `<` would raise TypeError — i.e.
-                    // the whole comparison is not comparable (no match).
-                    None => return Ok(None),
+                // Array elements compare by FULL BSON order (type rank first),
+                // NOT the type-bracketed scalar compare above — mongod ranks a
+                // string element above a number element, so `[1,"x"] > [1,2]`.
+                // `order::bson_lt` is that full order (a DBPointer element
+                // defers, via `None`).
+                if crate::order::bson_lt(ea, eb).ok_or(Fallback)? {
+                    return Ok(Some(Ordering::Less));
                 }
+                if crate::order::bson_lt(eb, ea).ok_or(Fallback)? {
+                    return Ok(Some(Ordering::Greater));
+                }
+                // Equal — continue to the next element pair.
             }
             // One array is a prefix of the other: the shorter sorts first.
             return Ok(Some(xs.len().cmp(&ys.len())));
@@ -1701,14 +1705,15 @@ mod tests {
     }
 
     #[test]
-    fn array_vs_array_cross_type_element_no_match() {
-        // A cross-type element pair (after equal leading elements) is where
-        // Python's list `<` would raise TypeError -> no match. The Rust matcher
-        // returns a clean false (Ok), never an Err(Fallback)/BadValue.
-        assert!(!m(doc! {"a": [1, "x"]}, doc! {"a": {"$gt": [1, 2]}}));
+    fn array_vs_array_cross_type_element_ordering() {
+        // Array elements order by FULL BSON order (type rank first), so a
+        // cross-type element pair still orders — verified against mongod
+        // 7.0.12: `[1, "x"]` has a string (rank 4) where `[1, 2]` has a number
+        // (rank 3), so `[1, "x"] > [1, 2]`. (Previously both servers no-matched
+        // this — Python's list `<` raises on str-vs-int.)
+        assert!(m(doc! {"a": [1, "x"]}, doc! {"a": {"$gt": [1, 2]}}));
         assert!(!m(doc! {"a": [1, "x"]}, doc! {"a": {"$lt": [1, 2]}}));
-        // A decisive difference before the cross-type element still orders:
-        // [2, "x"] vs [1, 2] -> first pair 2 > 1 is decisive (Greater).
+        // A decisive difference before the cross-type element still orders.
         assert!(m(doc! {"a": [2, "x"]}, doc! {"a": {"$gt": [1, 2]}}));
     }
 

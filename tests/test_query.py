@@ -471,6 +471,19 @@ def test_range_orders_embedded_documents() -> None:
     assert not matches({"a": 2}, {"a": {"$gt": {"x": 1}}})
 
 
+def test_range_orders_arrays_by_full_bson_order() -> None:
+    """Two arrays order element-by-element under range, but each element pair
+    compares by FULL BSON order (type rank first) — mongod ranks a string
+    element above a number, so ``[1, "x"] > [1, 2]``. Previously both servers
+    no-matched a cross-type element pair (Python's list ``<`` raises str vs
+    int). Verified against mongod 7.0.12."""
+    assert matches({"a": [1, "x"]}, {"a": {"$gt": [1, 2]}})  # "x"(str) > 2(num)
+    assert not matches({"a": [1, "x"]}, {"a": {"$lt": [1, 2]}})
+    assert matches({"a": [2, "x"]}, {"a": {"$gt": [1, 2]}})  # decisive first elem
+    assert matches({"a": ["x", 1]}, {"a": {"$gt": [1, 2]}})  # str first > num first
+    assert matches({"a": [1]}, {"a": {"$lt": [1, 2]}})  # shorter prefix sorts first
+
+
 def test_embedded_document_equality_is_ordered_and_exact() -> None:
     """Full embedded-document equality is field-ORDER-sensitive and
     exact (no subset), recursively — a mongod gotcha. Oracle-pinned
