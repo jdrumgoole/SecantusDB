@@ -106,6 +106,11 @@ a structural one:
    reentrant (the code already works around this in `prune`), so either
    restructure call chains to never re-enter or use a reentrant lock for
    the per-collection slots.
+   *(Shipped 2026-07-17, rust-coll-locks slice — plus per-statement WT
+   snapshot transactions, which the split immediately proved necessary:
+   the first stress run caught a lost update from a stale-snapshot
+   read-modify-write across autocommit ops. No reentrant locks needed —
+   call chains acquire once at the public method.)*
 3. **Global counters off the write path.** Oplog seq/ts minting to an
    atomic + micro-lock (Python's `_oplog_seq_lock` shape); stop persisting
    oplog meta under the lock — adopt the Python endgame verbatim: persist
@@ -121,6 +126,11 @@ a structural one:
    auto-rollback). Add the Rust equivalent of `_commit_batch_transaction`'s
    mapping plus an unbounded `writeConflictRetry` wrapper with periodic
    warnings. `wait_for_oplog` is already conflict-correct.
+   *(Shipped 2026-07-17 with the same slice: EINVAL/WT_ROLLBACK → typed
+   WriteConflict at both statement and commit time (the Rust binding
+   carries the raw errno, so no message matching); unbounded retry with
+   5s-interval warnings outside user transactions; immediate surface
+   inside them.)*
 5. **Gates.** `tests/test_mongo_server_concurrency.py`'s Rust params (the
    #451 suite: exactly-one-winner, exact counts, typed-errors-only) are the
    correctness harness; `bench.concurrency --server rust` is the measure.

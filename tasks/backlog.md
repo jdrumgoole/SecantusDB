@@ -3633,8 +3633,18 @@ When you fix one of these, delete the line. When you discover a new one, add it 
   in the retry wrapper and check WT eviction statistics. Multi-writer
   THROUGHPUT scaling itself remains capped by the WT-binding/GIL ceiling
   documented in docs/concurrency.md; lifting it is the
-  tasks/wt-concurrency-plan.md end-game (and the Rust server's global
-  write mutex is the equivalent lever there).
+  tasks/wt-concurrency-plan.md end-game. (The Rust server's equivalent
+  lever — the global write mutex — was pulled 2026-07-17: per-collection
+  write locks + per-statement WT snapshot transactions + the conflict
+  machinery, the rust-coll-locks slice. Re-measure with
+  `bench.concurrency --server rust` and refresh docs/concurrency.md.)
+
+- Rust DDL paths (create/drop index, create/drop/rename collection) run
+  autocommit-per-operation under the global+collection locks — a crash
+  mid-DDL can leave orphan index-entry rows (invisible to readers, since
+  the registry row is the commit point, but a space leak). CRUD statements
+  are transactional since the rust-coll-locks slice; wrapping DDL the same
+  way is the remaining piece.
 
 ## Concurrency races (found by the concurrent stress suites, 2026-07-16)
 
