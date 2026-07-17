@@ -3616,6 +3616,17 @@ recorded in that slice's changelog fragment. Still open:
   lock table (like `NotifyHub` / `PreparedXactRegistry`) with blocking waits and
   deadlock detection.
 
+## Rust lock-free reads: DDL-vs-scan wobble (2026-07-17)
+
+- A `renameCollection` / `dropCollection` / `dropDatabase` racing a
+  lock-free read can yield a partial result set (the reader walks shared
+  tables while the DDL is mid-copy/mid-delete). Real mongod kills open
+  cursors on drop and errors them; we return the partial page instead. No
+  wrong documents are ever served (every candidate is re-verified) — the
+  divergence is result-set completeness during a concurrent namespace-level
+  DDL. Fix would be a namespace-generation check (bump a counter on DDL,
+  re-check before returning) or reader-visible kill markers.
+
 ## Follow-ups from the #451 (concurrency stress suites) review, 2026-07-17
 
 - [ ] **Rust `UpdateOutcome::post_image` is cloned unconditionally** — every

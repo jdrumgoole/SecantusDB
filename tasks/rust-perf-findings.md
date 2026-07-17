@@ -92,7 +92,13 @@ a structural one:
    sessions make lock-free reads safe; drop the mutex from the read-only
    methods (each already opens/uses its own session). No conflict machinery
    needed. Wins on every mixed workload immediately and shrinks writer
-   convoy pressure.
+   convoy pressure. *(Shipped 2026-07-17, rust-lockfree-reads slice: 19
+   read methods unlocked; three write-ordering fixes make the reader
+   invariants airtight — diff-based update index maintenance,
+   entries-before-registry createIndex, doc-row-first deletes. Residual
+   known wobble: rename/dropCollection racing a scan can yield a partial
+   result set, the moral equivalent of mongod killing cursors on drop —
+   noted in tasks/backlog.md.)*
 2. **Per-collection write locks (the port of Python Phase 2).** Registry of
    `(db, coll) → lock` (as `_coll_locks` in Python); the global mutex
    remains only for DDL, multi-collection writes (`$out` / `$merge`,
