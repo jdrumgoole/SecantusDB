@@ -69,6 +69,28 @@ N writer processes, each streaming `insert_many` batches through
 `pymongo` for 30 s against its own collection, all three servers on
 on-disk WiredTiger.
 
+```{raw} html
+<style>
+.dviz-wrap { --dv-mongo:#2a78d6; --dv-rust:#eb6834; --dv-py:#0891b2;
+  --dv-ink:#334155; --dv-ink2:#64748b; --dv-grid:#e2e8f0; --dv-ref:#94a3b8; margin:14px 0; }
+@media (prefers-color-scheme: dark) { body:not([data-theme="light"]) .dviz-wrap {
+  --dv-mongo:#3987e5; --dv-rust:#d95926; --dv-py:#0891b2;
+  --dv-ink:#cbd5e1; --dv-ink2:#94a3b8; --dv-grid:#1e293b; --dv-ref:#475569; } }
+body[data-theme="dark"] .dviz-wrap {
+  --dv-mongo:#3987e5; --dv-rust:#d95926; --dv-py:#0891b2;
+  --dv-ink:#cbd5e1; --dv-ink2:#94a3b8; --dv-grid:#1e293b; --dv-ref:#475569; }
+.dviz { width:100%; height:auto; display:block; }
+.dv-lab { font:500 12.5px/1 sans-serif; fill:var(--dv-ink); }
+.dv-val { font:600 11.5px/1 sans-serif; fill:var(--dv-ink); }
+.dv-tick { font:500 11px/1 sans-serif; fill:var(--dv-ink2); }
+.dv-grid { stroke:var(--dv-grid); stroke-width:1; }
+.dv-ref { stroke:var(--dv-ref); stroke-width:1.5; stroke-dasharray:4 3; }
+.dv-x { font-size:0.82em; opacity:0.75; }
+.dv-legend { display:flex; gap:16px; flex-wrap:wrap; margin:6px 0 4px; font-size:0.85rem; color:var(--dv-ink2); }
+.dv-legend .chip { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; vertical-align:-1px; }
+</style><div class="dviz-wrap"><div class="dv-legend"><span><span class="chip" style="background:var(--dv-mongo)"></span>mongod</span><span><span class="chip" style="background:var(--dv-rust)"></span>Rust server</span><span><span class="chip" style="background:var(--dv-py)"></span>Python server</span></div><svg viewBox="0 0 790 320" role="img" aria-label="Throughput scaling relative to each server single-writer rate" class="dviz"><line x1="56" y1="214" x2="668" y2="214" class="dv-ref"/><text x="48" y="218" text-anchor="end" class="dv-tick">1<tspan class="dv-x">x</tspan></text><line x1="56" y1="160" x2="668" y2="160" class="dv-grid"/><text x="48" y="164" text-anchor="end" class="dv-tick">2<tspan class="dv-x">x</tspan></text><line x1="56" y1="105" x2="668" y2="105" class="dv-grid"/><text x="48" y="109" text-anchor="end" class="dv-tick">3<tspan class="dv-x">x</tspan></text><line x1="56" y1="51" x2="668" y2="51" class="dv-grid"/><text x="48" y="55" text-anchor="end" class="dv-tick">4<tspan class="dv-x">x</tspan></text><text x="56" y="290" text-anchor="middle" class="dv-tick">1</text><text x="143" y="290" text-anchor="middle" class="dv-tick">2</text><text x="318" y="290" text-anchor="middle" class="dv-tick">4</text><text x="668" y="290" text-anchor="middle" class="dv-tick">8</text><text x="362" y="310" text-anchor="middle" class="dv-lab">concurrent writers</text><path d="M56.0,213.8 L143.4,168.2 L318.3,91.2 L668.0,44.1" fill="none" stroke="var(--dv-mongo)" stroke-width="2"/><circle cx="56.0" cy="213.8" r="4.5" fill="var(--dv-mongo)"><title>mongod — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="168.2" r="4.5" fill="var(--dv-mongo)"><title>mongod — 2 writers: 1.84x its single-writer rate</title></circle><circle cx="318.3" cy="91.2" r="4.5" fill="var(--dv-mongo)"><title>mongod — 4 writers: 3.26x its single-writer rate</title></circle><circle cx="668.0" cy="44.1" r="4.5" fill="var(--dv-mongo)"><title>mongod — 8 writers: 4.13x its single-writer rate</title></circle><path d="M56.0,213.8 L143.4,240.9 L318.3,240.3 L668.0,239.3" fill="none" stroke="var(--dv-rust)" stroke-width="2"/><circle cx="56.0" cy="213.8" r="4.5" fill="var(--dv-rust)"><title>Rust server — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="240.9" r="4.5" fill="var(--dv-rust)"><title>Rust server — 2 writers: 0.50x its single-writer rate</title></circle><circle cx="318.3" cy="240.3" r="4.5" fill="var(--dv-rust)"><title>Rust server — 4 writers: 0.51x its single-writer rate</title></circle><circle cx="668.0" cy="239.3" r="4.5" fill="var(--dv-rust)"><title>Rust server — 8 writers: 0.53x its single-writer rate</title></circle><path d="M56.0,213.8 L143.4,251.2 L318.3,259.3 L668.0,258.8" fill="none" stroke="var(--dv-py)" stroke-width="2"/><circle cx="56.0" cy="213.8" r="4.5" fill="var(--dv-py)"><title>Python server — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="251.2" r="4.5" fill="var(--dv-py)"><title>Python server — 2 writers: 0.31x its single-writer rate</title></circle><circle cx="318.3" cy="259.3" r="4.5" fill="var(--dv-py)"><title>Python server — 4 writers: 0.16x its single-writer rate</title></circle><circle cx="668.0" cy="258.8" r="4.5" fill="var(--dv-py)"><title>Python server — 8 writers: 0.17x its single-writer rate</title></circle><text x="674" y="48" class="dv-val" fill="var(--dv-mongo)">mongod 4.1<tspan class="dv-x">x</tspan></text><text x="674" y="240" class="dv-val" fill="var(--dv-rust)">Rust 0.5<tspan class="dv-x">x</tspan></text><text x="674" y="272" class="dv-val" fill="var(--dv-py)">Python 0.2<tspan class="dv-x">x</tspan></text></svg></div>
+```
+
 | N writers | Python server (docs/s) | Rust server (docs/s) | mongod (docs/s) |
 |---|---:|---:|---:|
 | 1 | 2,900 | 3,526 | 108,625 |
