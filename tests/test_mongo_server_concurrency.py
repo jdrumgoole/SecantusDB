@@ -1,17 +1,31 @@
-"""Aggressive concurrency suite for the embedded Rust server.
+"""Aggressive concurrency harness for the Mongo-wire servers — Python AND Rust.
 
-Many pymongo clients (one per thread, real TCP) hammer a single ``RustServer``
-with barrier-synchronized writes. Every test asserts a hard integrity
-invariant: exact final counts, no lost ``$inc`` updates, unique findAndModify
-tickets, exactly-one-winner unique-index races, readers that never observe a
-missing stable document while the collection churns around them. The only
-error a loser may see is the typed signal mongod would send (11000
-DuplicateKey, 112 WriteConflict) — anything else fails the test.
+One suite, parametrized over both server implementations: every test runs
+against the pure-Python ``SecantusDBServer`` and the embedded Rust server
+through real pymongo clients (one per thread, real TCP), with
+barrier-synchronized writes to maximize simultaneous arrivals. The SQL/PG
+analogue lives in ``test_pgserver_concurrency.py`` — the two harnesses are
+deliberately separate: different wire protocols, different drivers, different
+error vocabularies.
 
-Lifecycle stress (many servers started/stopped concurrently) lives in
-``test_rust_server_stress.py``; this file is about contention *within* one
-server. Gated on the WiredTiger-linking ``_secantus_server`` build, like the
-other rust-server suites.
+Every test asserts a hard integrity invariant: exact final counts, no lost
+``$inc`` updates, unique findAndModify tickets, exactly-one-winner
+unique-index races, readers that never observe a missing stable document
+while the collection churns around them. The only error a loser may see is
+the typed signal mongod would send (11000 DuplicateKey, 112 WriteConflict) —
+anything else fails the test.
+
+Known divergence: the Rust server's findAndModify composes find + update +
+re-find across separate storage calls, so under contention two clients can be
+handed the same ``new: true`` post-image; its ticket test is
+xfail(strict=False) until the atomic find-and-modify storage primitive lands
+(tasks/backlog.md). The Python server captures the post-image inside the
+write (``Storage.update_matching(return_post_images=True)``) and must pass.
+
+Rust-server lifecycle stress (many servers started/stopped concurrently)
+lives in ``test_rust_server_stress.py``; this file is about contention
+*within* one server. The Rust params skip when the WiredTiger-linking
+``_secantus_server`` build is absent, like the other rust-server suites.
 """
 
 from __future__ import annotations
@@ -21,8 +35,9 @@ import time
 
 import pytest
 
-_server = pytest.importorskip("_secantus_server")
 pymongo = pytest.importorskip("pymongo")
+
+from secantus.server import SecantusDBServer  # noqa: E402
 
 WORKERS = 8
 
@@ -30,14 +45,48 @@ WORKERS = 8
 WRITE_CONFLICT = 112
 DUPLICATE_KEY = 11000
 
+RUST_FAM_XFAIL = pytest.mark.xfail(
+    reason="Rust findAndModify is find + update + re-find across separate storage "
+    "calls (crates/secantus-commands/src/findandmodify.rs module caveat): a "
+    "concurrent writer can land between the update and the post-image re-read, "
+    "so two clients can be handed the same ticket. The Python server fixed this "
+    "with Storage.update_matching(return_post_images=True); the Rust storage "
+    "needs the same primitive — see tasks/backlog.md.",
+    strict=False,
+)
+
+BOTH_SERVERS = ["python", "rust"]
+FAM_SERVERS = ["python", pytest.param("rust", marks=RUST_FAM_XFAIL)]
+
+
+@pytest.fixture(params=BOTH_SERVERS)
+def kind(request):
+    if request.param == "rust":
+        pytest.importorskip("_secantus_server")
+    return request.param
+
 
 @pytest.fixture
-def server(tmp_path):
-    srv = _server.RustServer(str(tmp_path / "wt"), 0)
-    try:
-        yield srv
-    finally:
-        srv.stop()
+def server(kind, tmp_path):
+    if kind == "rust":
+        import _secantus_server
+
+        # The replica-set persona so change streams work, matching the Python
+        # server's default hello reply.
+        srv = _secantus_server.RustServer(
+            str(tmp_path / "wt"), 0, host="127.0.0.1", replica_set_name="secantus"
+        )
+        try:
+            yield srv
+        finally:
+            srv.stop()
+    else:
+        srv = SecantusDBServer(host="127.0.0.1", port=0, storage_path=str(tmp_path / "wt"))
+        srv.start()
+        try:
+            yield srv
+        finally:
+            srv.stop()
 
 
 def make_client(srv):
@@ -133,15 +182,7 @@ def test_concurrent_inc_loses_no_updates(server):
     client.close()
 
 
-@pytest.mark.xfail(
-    reason="Rust findAndModify is find + update + re-find across separate storage "
-    "calls (crates/secantus-commands/src/findandmodify.rs module caveat): a "
-    "concurrent writer can land between the update and the post-image re-read, "
-    "so two clients can be handed the same ticket. The Python server fixed this "
-    "with Storage.update_matching(return_post_images=True); the Rust storage "
-    "needs the same primitive — see tasks/backlog.md.",
-    strict=False,
-)
+@pytest.mark.parametrize("kind", FAM_SERVERS, indirect=True)
 def test_findandmodify_tickets_are_unique_and_complete(server):
     per_worker = 25
     client = make_client(server)
@@ -171,6 +212,22 @@ def test_findandmodify_tickets_are_unique_and_complete(server):
     run_workers(WORKERS, worker)
     total = WORKERS * per_worker
     assert sorted(tickets) == list(range(1, total + 1)), "tickets were lost or duplicated"
+    assert client["app"]["c"].find_one({"_id": "counter"})["n"] == total
+    client.close()
+
+
+def test_findandmodify_upsert_post_image_is_its_own_write(server):
+    # new:true + upsert on a fresh key returns the upserted doc itself, not a
+    # racy re-read.
+    client = make_client(server)
+    coll = client["app"]["c"]
+    doc = coll.find_one_and_update(
+        {"_id": "fresh"},
+        {"$inc": {"n": 5}},
+        upsert=True,
+        return_document=pymongo.ReturnDocument.AFTER,
+    )
+    assert doc == {"_id": "fresh", "n": 5}
     client.close()
 
 
@@ -378,41 +435,34 @@ def test_client_connection_churn_under_write_load(server):
     client.close()
 
 
-def test_change_stream_sees_every_concurrent_insert(tmp_path):
-    # Needs the replica-set persona for $changeStream.
-    srv = _server.RustServer(
-        str(tmp_path / "wt-cs"), 0, host="127.0.0.1", replica_set_name="secantus"
-    )
+def test_change_stream_sees_every_concurrent_insert(server):
+    writer_n, docs_per = 4, 25
+    client = make_client(server)
+    coll0 = client["csdb"]["c"]
+    coll0.insert_one({"_id": "seed"})  # create the collection
+
+    cs = coll0.watch(max_await_time_ms=200)
     try:
-        writer_n, docs_per = 4, 25
-        client = make_client(srv)
-        coll0 = client["csdb"]["c"]
-        coll0.insert_one({"_id": "seed"})  # create the collection
 
-        cs = coll0.watch(max_await_time_ms=200)
-        try:
+        def writer(i: int) -> None:
+            cl = make_client(server)
+            coll = cl["csdb"]["c"]
+            for k in range(docs_per):
+                coll.insert_one({"_id": f"{i}-{k}", "who": i})
+            cl.close()
 
-            def writer(i: int) -> None:
-                cl = make_client(srv)
-                coll = cl["csdb"]["c"]
-                for k in range(docs_per):
-                    coll.insert_one({"_id": f"{i}-{k}", "who": i})
-                cl.close()
+        run_workers(writer_n, writer)
 
-            run_workers(writer_n, writer)
-
-            want = writer_n * docs_per
-            got: set[str] = set()
-            deadline = time.monotonic() + 30
-            while len(got) < want and time.monotonic() < deadline:
-                ev = cs.try_next()
-                if ev is None:
-                    continue
-                if ev["operationType"] == "insert" and ev["documentKey"]["_id"] != "seed":
-                    got.add(ev["documentKey"]["_id"])
-            assert len(got) == want, f"change stream saw {len(got)} of {want} inserts"
-        finally:
-            cs.close()
-        client.close()
+        want = writer_n * docs_per
+        got: set[str] = set()
+        deadline = time.monotonic() + 30
+        while len(got) < want and time.monotonic() < deadline:
+            ev = cs.try_next()
+            if ev is None:
+                continue
+            if ev["operationType"] == "insert" and ev["documentKey"]["_id"] != "seed":
+                got.add(ev["documentKey"]["_id"])
+        assert len(got) == want, f"change stream saw {len(got)} of {want} inserts"
     finally:
-        srv.stop()
+        cs.close()
+    client.close()

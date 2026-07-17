@@ -3584,9 +3584,10 @@ When you fix one of these, delete the line. When you discover a new one, add it 
 
 ## Concurrency races (found by the concurrent stress suites, 2026-07-16)
 
-Found by `tests/test_pgserver_concurrency.py` / `tests/test_rust_server_concurrency.py`
-/ `tests/test_python_server_fam_concurrency.py`; fixed items are recorded in that
-slice's changelog fragment. Still open:
+Found by the two concurrency harnesses — `tests/test_mongo_server_concurrency.py`
+(pymongo vs the Python AND Rust servers, one parametrized suite) and
+`tests/test_pgserver_concurrency.py` (psycopg vs the PG server); fixed items are
+recorded in that slice's changelog fragment. Still open:
 
 - [ ] **Rust findAndModify is not atomic across storage calls.** The command
   layer composes find → update-by-`_id` → re-`find` (module caveat in

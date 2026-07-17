@@ -1,7 +1,9 @@
 ### Concurrency stress suites hammer the servers — and the races they caught are fixed
 
-Three new test suites drive the PostgreSQL-wire server, the embedded Rust
-server, and the Python Mongo server with barrier-synchronized thread storms —
+Two new concurrency harnesses hammer the servers with barrier-synchronized
+thread storms — one drives the Mongo-wire servers (the Python server and the
+embedded Rust server, every test parametrized over both) through real pymongo
+clients, the other drives the PostgreSQL-wire server through psycopg —
 same-key insert races, transactional increment hammers, bank-transfer
 invariants under concurrent readers, findAndModify ticket dispensers, unique-
 index races, DDL churn against live writers, and connection churn under load.
@@ -34,15 +36,14 @@ find-and-modify primitive it still needs (tasks/backlog.md).
   the total under concurrent readers, concurrent `nextval()`, DDL churn
   alongside DML, connection churn under write load, extended-protocol prepared
   statements across threads, and a bounded txn-vs-autocommit stall check.
-- `tests/test_rust_server_concurrency.py` — 10 pymongo-driven stress tests
-  against one embedded `RustServer`: insert storms, `$inc` hammers, upsert
-  races, unique-index races, readers paginating (`getMore`) through churn,
-  index builds under write load, multi-collection writers, delete/insert
-  churn, client connection churn, and a change stream observing every insert
-  from four concurrent writers.
-- `tests/test_python_server_fam_concurrency.py` — pins the findAndModify
-  post-image fix on the Python server (unique, complete ticket sequence under
-  an 8-thread dispenser).
+- `tests/test_mongo_server_concurrency.py` — one pymongo-driven harness
+  parametrized over BOTH Mongo-wire servers (the pure-Python
+  `SecantusDBServer` and the embedded Rust server): insert storms, `$inc`
+  hammers, findAndModify ticket dispensers, upsert races, unique-index races,
+  readers paginating (`getMore`) through churn, index builds under write
+  load, multi-collection writers, delete/insert churn, client connection
+  churn, and a change stream observing every insert from four concurrent
+  writers. Every test runs against both servers.
 - `Storage.update_matching(..., return_post_images=True)` — returns the
   post-image of each write, captured while the statement holds the storage
   lock, so command handlers never re-read what they just wrote.
