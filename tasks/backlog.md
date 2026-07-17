@@ -252,6 +252,21 @@ These are explicit non-goals. Don't add them without a reason.
   find both the crash cause AND why sibling workers stall (shared resource?
   admin server port? WT cache pressure?). Do not deselect the test — this is
   a real defect signal in the ws tail. Pattern catalogued in /ci-check.
+  **Hit a THIRD time 2026-07-17 (PR #468 durable lane).** Mechanism candidate
+  (from reading `src/secantus/admin/routers/changestream.py`): the tail loop is
+  `while True: await asyncio.to_thread(stream.try_next)`. On websocket
+  disconnect the awaiting coroutine is cancelled, but a thread-pool thread
+  already blocked *inside* `stream.try_next()` (a blocking getMore on the
+  tailable cursor) cannot be interrupted — it returns only when the getMore
+  does (the server's 1s default awaitData wait, or longer under CI load). If
+  the sibling SecantusDB server thread's parked `wait_for_oplog` isn't woken,
+  that getMore — and its pool thread — can hang until the executor is torn down
+  at worker shutdown, crossing the 25-min watchdog. Candidate fix (needs a
+  repro to validate, do NOT blind-apply): bound the getMore wait
+  (`max_await_time_ms` on `watch()`) so `try_next` always returns promptly, and
+  ensure the `finally` `stream.close()` interrupts a parked cursor. A
+  first-attempt faulthandler dump would confirm whether the wedged thread is
+  this `try_next` pool thread.
 
 
 Subtler than the above; these may bite specific test suites.
@@ -1066,7 +1081,13 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   (JS code / symbol compare as text; DBPointer / undefined no-match), and a
   **Decimal128-valued `$mod` field on the Rust server** (`int(Decimal)` is exact
   to 34 digits, which an `f64` truncation can't reproduce — the standing
-  Decimal128 precision-parity deferral; the Python engine handles it). (The
+  Decimal128 precision-parity deferral; the Python engine handles it).
+  **`$size` argument validation fixed** (2026-07-17, same R8 triage): a
+  negative `$size` now errors (was a silent no-match), a bool is rejected (was
+  accepted as 1), and an integer-valued float `2.0` is accepted as `2` (was
+  rejected) — mongod's three parse-error stems ("Expected a number" / "an
+  integer" / "a non-negative number", code 2) reproduced on the Python server
+  and mapped to BadValue on the Rust server; three-way mongod-verified. (The
   retired in-process "flip `query.matches` default to Rust" item is gone — the
   two-server model has no per-call engine selection; `_secantus_core` is only
   the parity-test vehicle now.)

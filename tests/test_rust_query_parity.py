@@ -262,6 +262,11 @@ CURATED = [
     ({"tags": [1, 2, 3]}, {"tags": {"$size": 3}}),
     ({"tags": [1, 2]}, {"tags": {"$size": 3}}),
     ({"tags": "abc"}, {"tags": {"$size": 3}}),
+    # An integer-valued float $size is accepted (== 2). (Invalid $size args —
+    # negative / non-integer / string / bool — RAISE on both engines, so they're
+    # covered by the unit test, not the parity corpus which compares bool results.)
+    ({"tags": [1, 2]}, {"tags": {"$size": 2.0}}),
+    ({"tags": [1]}, {"tags": {"$size": 2.0}}),
     ({"n": 12}, {"n": {"$mod": [4, 0]}}),
     ({"n": 13}, {"n": {"$mod": [4, 1]}}),
     ({"n": 13}, {"n": {"$mod": [4, 0]}}),

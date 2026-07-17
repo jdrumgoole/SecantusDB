@@ -4273,3 +4273,17 @@ def test_query_mod_truncation_and_bool(coll) -> None:
     assert sorted(d["_id"] for d in coll.find({"a": {"$mod": [2, 1]}})) == [1, 2, 4]
     assert sorted(d["_id"] for d in coll.find({"a": {"$mod": [2, 0]}})) == [6]
     assert sorted(d["_id"] for d in coll.find({"a": {"$mod": [2.5, 0]}})) == [6]
+
+
+def test_query_size_validation(coll) -> None:
+    """$size over the wire: an integer-valued float is accepted; a negative /
+    non-integer / string / bool argument is a parse error (code 2), not a
+    silent empty result."""
+    import pymongo
+
+    coll.insert_many([{"_id": 1, "a": [1, 2]}, {"_id": 2, "a": [1]}])
+    assert [d["_id"] for d in coll.find({"a": {"$size": 2.0}})] == [1]
+    for bad in (-1, 2.5, "2", True):
+        with pytest.raises(pymongo.errors.OperationFailure) as exc:
+            list(coll.find({"a": {"$size": bad}}))
+        assert exc.value.code == 2, bad

@@ -1085,9 +1085,33 @@ def _op_type(values: list[Any], type_spec: Any) -> bool:
 
 
 def _op_size(values: list[Any], size: Any) -> bool:
-    if not isinstance(size, int):
-        raise QueryError("$size requires an integer")
-    return any(isinstance(v, list) and len(v) == size for v in values)
+    # mongod validates $size strictly (probed 7.0.12): it must be a number
+    # (bool and string are rejected), integer-valued (2.0 is accepted as 2, 2.5
+    # is not), and non-negative. Each failure is a distinct parse error, not a
+    # silent no-match.
+    if isinstance(size, bool) or not isinstance(size, (int, float, Decimal128)):
+        raise QueryError(f"Failed to parse $size. Expected a number in: $size: {size!r}")
+    if isinstance(size, Decimal128):
+        try:
+            dec = size.to_decimal()
+        except (InvalidOperation, ValueError):
+            raise QueryError(
+                f"Failed to parse $size. Expected a number in: $size: {size!r}"
+            ) from None
+        if dec != dec.to_integral_value():
+            raise QueryError(f"Failed to parse $size. Expected an integer: $size: {size!r}")
+        n = int(dec)
+    elif isinstance(size, float):
+        if not size.is_integer():
+            raise QueryError(f"Failed to parse $size. Expected an integer: $size: {size!r}")
+        n = int(size)
+    else:
+        n = size
+    if n < 0:
+        raise QueryError(
+            f"Failed to parse $size. Expected a non-negative number in: $size: {size!r}"
+        )
+    return any(isinstance(v, list) and len(v) == n for v in values)
 
 
 def _op_all(values: list[Any], required: Any) -> bool:

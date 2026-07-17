@@ -1434,10 +1434,17 @@ fn op_size(values: &[Option<&Bson>], size: &Bson) -> R {
     let n = match size {
         Bson::Int32(n) => *n as i64,
         Bson::Int64(n) => *n,
-        _ => return Err(Fallback), // Python raises QueryError -> Python
+        // An integer-valued double is accepted (mongod: `$size: 2.0` == 2). A
+        // non-integer double, and any non-number (bool / string / …), are parse
+        // errors mongod rejects — defer so the Rust server surfaces BadValue
+        // (code 2, matching mongod's code) rather than a silent no-match.
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
+        _ => return Err(Fallback),
     };
     if n < 0 {
-        return Ok(false);
+        // mongod: "Expected a non-negative number" (code 2) — error, not
+        // no-match. Fallback -> BadValue on the Rust server.
+        return Err(Fallback);
     }
     let n = n as usize;
     for v in values {
