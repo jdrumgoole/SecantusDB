@@ -768,6 +768,176 @@ fn unique_items_key(value: &Bson) -> Result<Vec<u8>, Fallback> {
     Ok(out)
 }
 
+/// Every $jsonSchema keyword mongod 7.0 accepts (title / description are
+/// accepted-and-ignored metadata). Mirrors `query._JSON_SCHEMA_KEYWORDS`.
+const JSON_SCHEMA_KEYWORDS: &[&str] = &[
+    "additionalItems",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "bsonType",
+    "dependencies",
+    "description",
+    "enum",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "items",
+    "maxItems",
+    "maxLength",
+    "maxProperties",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minProperties",
+    "minimum",
+    "multipleOf",
+    "not",
+    "oneOf",
+    "pattern",
+    "patternProperties",
+    "properties",
+    "required",
+    "title",
+    "type",
+    "uniqueItems",
+];
+const JSON_SCHEMA_UNSUPPORTED: &[&str] =
+    &["$ref", "$schema", "default", "definitions", "format", "id"];
+
+/// Parse-time $jsonSchema keyword validation, recursing into every sub-schema.
+/// Mirrors `query._check_json_schema_keywords`; codes and messages are
+/// verbatim from a mongod 7.0 probe. Returns `Some((code, codeName, errmsg))`
+/// for the first violation, `None` for a clean schema. The command layer runs
+/// this up-front (mongod rejects the whole query before matching a document).
+pub fn json_schema_keyword_error(schema: &Bson) -> Option<(i32, &'static str, String)> {
+    let Bson::Document(sch) = schema else {
+        return Some((14, "TypeMismatch", "$jsonSchema must be an object".into()));
+    };
+    for (kw, arg) in sch.iter() {
+        let kw = kw.as_str();
+        if JSON_SCHEMA_UNSUPPORTED.contains(&kw) {
+            return Some((
+                9,
+                "FailedToParse",
+                format!("$jsonSchema keyword '{kw}' is not currently supported"),
+            ));
+        }
+        if !JSON_SCHEMA_KEYWORDS.contains(&kw) {
+            return Some((
+                9,
+                "FailedToParse",
+                format!("Unknown $jsonSchema keyword: {kw}"),
+            ));
+        }
+        if (kw == "title" || kw == "description") && !matches!(arg, Bson::String(_)) {
+            return Some((
+                14,
+                "TypeMismatch",
+                format!("$jsonSchema keyword '{kw}' must be of type string"),
+            ));
+        }
+        if kw == "multipleOf" {
+            let m = match arg {
+                Bson::Int32(n) => *n as f64,
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                _ => {
+                    return Some((
+                        14,
+                        "TypeMismatch",
+                        "$jsonSchema keyword 'multipleOf' must be a number".into(),
+                    ))
+                }
+            };
+            if m <= 0.0 {
+                return Some((
+                    9,
+                    "FailedToParse",
+                    "$jsonSchema keyword 'multipleOf' must have a positive value".into(),
+                ));
+            }
+        }
+        if kw == "exclusiveMinimum" || kw == "exclusiveMaximum" {
+            if !matches!(arg, Bson::Boolean(_)) {
+                return Some((
+                    14,
+                    "TypeMismatch",
+                    format!("$jsonSchema keyword '{kw}' must be a boolean"),
+                ));
+            }
+            let bound = if kw == "exclusiveMinimum" {
+                "minimum"
+            } else {
+                "maximum"
+            };
+            if !sch.contains_key(bound) {
+                return Some((
+                    9,
+                    "FailedToParse",
+                    format!("$jsonSchema keyword '{bound}' must be a present if {kw} is present"),
+                ));
+            }
+        }
+        // Recurse into sub-schemas.
+        match kw {
+            "properties" | "patternProperties" => {
+                if let Bson::Document(map) = arg {
+                    for sub in map.values() {
+                        if let Some(e) = json_schema_keyword_error(sub) {
+                            return Some(e);
+                        }
+                    }
+                }
+            }
+            "additionalProperties" | "additionalItems" => {
+                if matches!(arg, Bson::Document(_)) {
+                    if let Some(e) = json_schema_keyword_error(arg) {
+                        return Some(e);
+                    }
+                }
+            }
+            "not" => {
+                if let Some(e) = json_schema_keyword_error(arg) {
+                    return Some(e);
+                }
+            }
+            "items" => {
+                let subs: Vec<&Bson> = match arg {
+                    Bson::Array(a) => a.iter().collect(),
+                    single => vec![single],
+                };
+                for sub in subs {
+                    if let Some(e) = json_schema_keyword_error(sub) {
+                        return Some(e);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" => {
+                if let Bson::Array(a) = arg {
+                    for sub in a {
+                        if let Some(e) = json_schema_keyword_error(sub) {
+                            return Some(e);
+                        }
+                    }
+                }
+            }
+            "dependencies" => {
+                if let Bson::Document(map) = arg {
+                    for dep in map.values() {
+                        if matches!(dep, Bson::Document(_)) {
+                            if let Some(e) = json_schema_keyword_error(dep) {
+                                return Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
     let Bson::Document(sch) = schema else {
         return Ok(false); // Python: `not isinstance(schema, Mapping)` -> False
@@ -819,21 +989,41 @@ fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
         }
     }
     // Numeric bounds — only for int/double values (Python: `int/float and not
-    // bool`; Decimal128 is excluded there too).
+    // bool`; Decimal128 is excluded there too). Draft-4 semantics, matching
+    // mongod (probed 2026-07-17): exclusiveMinimum / exclusiveMaximum are
+    // BOOLEANS sharpening minimum / maximum to a strict bound (the numeric
+    // draft-6 form is rejected at parse time by the keyword validation).
     if matches!(value, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) {
-        for (kw, reject) in [
-            ("minimum", &[Ordering::Less][..]),
-            ("maximum", &[Ordering::Greater][..]),
-            ("exclusiveMinimum", &[Ordering::Less, Ordering::Equal][..]),
-            (
-                "exclusiveMaximum",
-                &[Ordering::Greater, Ordering::Equal][..],
-            ),
-        ] {
-            if let Some(bound) = sch.get(kw) {
-                if reject.contains(&numeric_order(value, bound)?) {
-                    return Ok(false);
-                }
+        if let Some(bound) = sch.get("minimum") {
+            let ord = numeric_order(value, bound)?;
+            let exclusive = sch.get("exclusiveMinimum") == Some(&Bson::Boolean(true));
+            if ord == Ordering::Less || (exclusive && ord == Ordering::Equal) {
+                return Ok(false);
+            }
+        }
+        if let Some(bound) = sch.get("maximum") {
+            let ord = numeric_order(value, bound)?;
+            let exclusive = sch.get("exclusiveMaximum") == Some(&Bson::Boolean(true));
+            if ord == Ordering::Greater || (exclusive && ord == Ordering::Equal) {
+                return Ok(false);
+            }
+        }
+        // multipleOf — Python `math.fmod(value, m) != 0`.
+        if let Some(m) = sch.get("multipleOf") {
+            let m = match m {
+                Bson::Int32(n) => *n as f64,
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                _ => return Err(Fallback), // rejected at parse time server-side
+            };
+            let v = match value {
+                Bson::Int32(n) => *n as f64,
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                _ => unreachable!(),
+            };
+            if (v % m) != 0.0 {
+                return Ok(false);
             }
         }
     }
@@ -871,9 +1061,37 @@ fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
             }
         }
         if let Some(items) = sch.get("items") {
-            for item in arr {
-                if !validate_json_schema(item, items)? {
-                    return Ok(false);
+            match items {
+                // Tuple validation: position i validates against items[i];
+                // elements past the tuple validate against additionalItems
+                // (false = none allowed; a schema = each must match; absent =
+                // anything goes). Matches the mongod probe.
+                Bson::Array(tuple) => {
+                    let extra = sch.get("additionalItems");
+                    for (i, item) in arr.iter().enumerate() {
+                        if i < tuple.len() {
+                            if !validate_json_schema(item, &tuple[i])? {
+                                return Ok(false);
+                            }
+                        } else {
+                            match extra {
+                                Some(Bson::Boolean(false)) => return Ok(false),
+                                Some(sub @ Bson::Document(_))
+                                    if !validate_json_schema(item, sub)? =>
+                                {
+                                    return Ok(false);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                single => {
+                    for item in arr {
+                        if !validate_json_schema(item, single)? {
+                            return Ok(false);
+                        }
+                    }
                 }
             }
         }

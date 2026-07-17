@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import re
 from collections.abc import Callable, Mapping
 from decimal import Decimal, InvalidOperation
@@ -30,7 +31,17 @@ MISSING: Any = _Missing()
 
 
 class QueryError(Exception):
-    pass
+    """An invalid query the server rejects at parse time.
+
+    ``code`` / ``code_name`` default to mongod's generic ``2 BadValue``;
+    operators with a documented distinct code (``$jsonSchema``'s keyword
+    validation: 9 FailedToParse / 14 TypeMismatch) set their own.
+    """
+
+    def __init__(self, message: str, *, code: int = 2, code_name: str = "BadValue") -> None:
+        super().__init__(message)
+        self.code = code
+        self.code_name = code_name
 
 
 def matches(
@@ -91,6 +102,7 @@ def _match_clause(
     if key == "$comment":
         return True
     if key == "$jsonSchema":
+        _check_json_schema_keywords(condition)
         return _validate_json_schema(doc, condition)
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
@@ -119,6 +131,119 @@ def _unique_items_key(value: Any) -> Any:
     return ("s", type(value).__name__, value)
 
 
+# Every $jsonSchema keyword mongod 7.0 accepts (title / description are
+# accepted-and-ignored metadata). Verified against a real mongod probe
+# (2026-07-17): an unknown keyword is `9 FailedToParse "Unknown $jsonSchema
+# keyword: <kw>"`; a known-but-unsupported JSON-Schema keyword is
+# `9 FailedToParse "$jsonSchema keyword '<kw>' is not currently supported"`.
+_JSON_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "allOf",
+        "anyOf",
+        "bsonType",
+        "dependencies",
+        "description",
+        "enum",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "items",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "minimum",
+        "multipleOf",
+        "not",
+        "oneOf",
+        "pattern",
+        "patternProperties",
+        "properties",
+        "required",
+        "title",
+        "type",
+        "uniqueItems",
+    }
+)
+_JSON_SCHEMA_UNSUPPORTED = frozenset({"$ref", "$schema", "default", "definitions", "format", "id"})
+
+
+def _check_json_schema_keywords(schema: Any) -> None:
+    """Parse-time $jsonSchema validation, recursing into every sub-schema —
+    mongod rejects the whole query before matching a single document. Codes and
+    messages are verbatim from a mongod 7.0 probe (including the grammar quirk
+    in the exclusive-bound message)."""
+    if not isinstance(schema, Mapping):
+        raise QueryError("$jsonSchema must be an object", code=14, code_name="TypeMismatch")
+    for kw, arg in schema.items():
+        if kw in _JSON_SCHEMA_UNSUPPORTED:
+            raise QueryError(
+                f"$jsonSchema keyword '{kw}' is not currently supported",
+                code=9,
+                code_name="FailedToParse",
+            )
+        if kw not in _JSON_SCHEMA_KEYWORDS:
+            raise QueryError(
+                f"Unknown $jsonSchema keyword: {kw}", code=9, code_name="FailedToParse"
+            )
+        if kw in ("title", "description") and not isinstance(arg, str):
+            raise QueryError(
+                f"$jsonSchema keyword '{kw}' must be of type string",
+                code=14,
+                code_name="TypeMismatch",
+            )
+        if kw == "multipleOf":
+            if isinstance(arg, bool) or not isinstance(arg, (int, float)):
+                raise QueryError(
+                    "$jsonSchema keyword 'multipleOf' must be a number",
+                    code=14,
+                    code_name="TypeMismatch",
+                )
+            if arg <= 0:
+                raise QueryError(
+                    "$jsonSchema keyword 'multipleOf' must have a positive value",
+                    code=9,
+                    code_name="FailedToParse",
+                )
+        if kw in ("exclusiveMinimum", "exclusiveMaximum"):
+            if not isinstance(arg, bool):
+                raise QueryError(
+                    f"$jsonSchema keyword '{kw}' must be a boolean",
+                    code=14,
+                    code_name="TypeMismatch",
+                )
+            bound = "minimum" if kw == "exclusiveMinimum" else "maximum"
+            if bound not in schema:
+                raise QueryError(
+                    f"$jsonSchema keyword '{bound}' must be a present if {kw} is present",
+                    code=9,
+                    code_name="FailedToParse",
+                )
+        # Recurse into sub-schemas.
+        if kw in ("properties", "patternProperties") and isinstance(arg, Mapping):
+            for sub in arg.values():
+                _check_json_schema_keywords(sub)
+        elif kw in ("additionalProperties", "additionalItems"):
+            if isinstance(arg, Mapping):
+                _check_json_schema_keywords(arg)
+        elif kw == "not":
+            _check_json_schema_keywords(arg)
+        elif kw == "items":
+            for sub in arg if isinstance(arg, list) else [arg]:
+                _check_json_schema_keywords(sub)
+        elif kw in ("allOf", "anyOf", "oneOf") and isinstance(arg, list):
+            for sub in arg:
+                _check_json_schema_keywords(sub)
+        elif kw == "dependencies" and isinstance(arg, Mapping):
+            for dep in arg.values():
+                if isinstance(dep, Mapping):
+                    _check_json_schema_keywords(dep)
+
+
 def _validate_json_schema(value: Any, schema: Any) -> bool:
     if not isinstance(schema, Mapping):
         return False
@@ -137,13 +262,18 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
     if "enum" in schema and value not in schema["enum"]:
         return False
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if "minimum" in schema and value < schema["minimum"]:
-            return False
-        if "maximum" in schema and value > schema["maximum"]:
-            return False
-        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
-            return False
-        if "exclusiveMaximum" in schema and value >= schema["exclusiveMaximum"]:
+        # Draft-4 semantics, matching mongod: exclusiveMinimum / exclusiveMaximum
+        # are BOOLEANS that sharpen minimum / maximum to a strict bound (the
+        # draft-6 numeric form is rejected at parse time).
+        if "minimum" in schema:
+            m = schema["minimum"]
+            if value < m or (schema.get("exclusiveMinimum") is True and value == m):
+                return False
+        if "maximum" in schema:
+            m = schema["maximum"]
+            if value > m or (schema.get("exclusiveMaximum") is True and value == m):
+                return False
+        if "multipleOf" in schema and math.fmod(value, schema["multipleOf"]) != 0:
             return False
     if isinstance(value, str):
         if "minLength" in schema and len(value) < schema["minLength"]:
@@ -159,9 +289,26 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
         if "maxItems" in schema and len(value) > schema["maxItems"]:
             return False
         if "items" in schema:
-            for item in value:
-                if not _validate_json_schema(item, schema["items"]):
-                    return False
+            items = schema["items"]
+            if isinstance(items, list):
+                # Tuple validation: position i validates against items[i];
+                # elements past the tuple validate against additionalItems
+                # (False = none allowed; a schema = each must match; absent =
+                # anything goes). Matches the mongod probe.
+                for i, item in enumerate(value):
+                    if i < len(items):
+                        if not _validate_json_schema(item, items[i]):
+                            return False
+                    else:
+                        extra = schema.get("additionalItems")
+                        if extra is False:
+                            return False
+                        if isinstance(extra, Mapping) and not _validate_json_schema(item, extra):
+                            return False
+            else:
+                for item in value:
+                    if not _validate_json_schema(item, items):
+                        return False
         if schema.get("uniqueItems") is True:
             # Every element must be distinct under MongoDB value equality, which
             # bridges cross-type-equal numerics (int/long/double/Decimal128 by

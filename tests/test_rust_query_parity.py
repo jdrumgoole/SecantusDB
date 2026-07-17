@@ -466,6 +466,52 @@ CURATED = [
     ({"n": 5.0}, {"$jsonSchema": {"properties": {"n": {"type": "number"}}}}),
     ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),
     ({"n": 5.5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),  # double !integer
+    # Draft-4 exclusive bounds (booleans sharpening minimum/maximum, per mongod).
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}}),
+    ({"n": 7}, {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}}),
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": False}}}}),
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"maximum": 6, "exclusiveMaximum": True}}}}),
+    ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"maximum": 6, "exclusiveMaximum": True}}}}),
+    # multipleOf (fmod semantics, incl. a fractional divisor).
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"multipleOf": 3}}}}),
+    ({"n": 7}, {"$jsonSchema": {"properties": {"n": {"multipleOf": 3}}}}),
+    ({"n": 7.5}, {"$jsonSchema": {"properties": {"n": {"multipleOf": 2.5}}}}),
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"multipleOf": 2.5}}}}),
+    # Tuple-form items + additionalItems (false / schema / absent).
+    ({"a": [1, "x"]}, {"$jsonSchema": {"properties": {"a": {"items": [{"bsonType": "int"}]}}}}),
+    (
+        {"a": [1, "x"]},
+        {
+            "$jsonSchema": {
+                "properties": {"a": {"items": [{"bsonType": "int"}], "additionalItems": False}}
+            }
+        },
+    ),
+    (
+        {"a": [1, "x"]},
+        {
+            "$jsonSchema": {
+                "properties": {
+                    "a": {"items": [{"bsonType": "int"}], "additionalItems": {"bsonType": "string"}}
+                }
+            }
+        },
+    ),
+    (
+        {"a": [1, True]},
+        {
+            "$jsonSchema": {
+                "properties": {
+                    "a": {"items": [{"bsonType": "int"}], "additionalItems": {"bsonType": "string"}}
+                }
+            }
+        },
+    ),
+    # title / description are accepted-and-ignored metadata.
+    (
+        {"n": 5},
+        {"$jsonSchema": {"title": "t", "description": "d", "properties": {"n": {"minimum": 1}}}},
+    ),
     # required + top-level.
     ({"a": 1, "b": 2}, {"$jsonSchema": {"required": ["a", "b"]}}),
     ({"a": 1}, {"$jsonSchema": {"required": ["a", "b"]}}),  # missing b -> False
@@ -473,8 +519,16 @@ CURATED = [
     # numeric bounds (min/max/exclusive) — only apply to numeric values.
     ({"age": 30}, {"$jsonSchema": {"properties": {"age": {"minimum": 0, "maximum": 120}}}}),
     ({"age": -1}, {"$jsonSchema": {"properties": {"age": {"minimum": 0}}}}),  # below min
-    ({"age": 5}, {"$jsonSchema": {"properties": {"age": {"exclusiveMinimum": 5}}}}),  # == excl
-    ({"age": 5}, {"$jsonSchema": {"properties": {"age": {"exclusiveMaximum": 10}}}}),
+    # (Draft-6 numeric exclusive bounds are rejected at parse time now — the
+    # draft-4 boolean form mongod implements is covered above.)
+    (
+        {"age": 5},
+        {"$jsonSchema": {"properties": {"age": {"minimum": 5, "exclusiveMinimum": True}}}},
+    ),
+    (
+        {"age": 5},
+        {"$jsonSchema": {"properties": {"age": {"maximum": 10, "exclusiveMaximum": True}}}},
+    ),
     # string length + pattern.
     ({"s": "abc"}, {"$jsonSchema": {"properties": {"s": {"minLength": 2, "maxLength": 4}}}}),
     ({"s": "a"}, {"$jsonSchema": {"properties": {"s": {"minLength": 2}}}}),  # too short

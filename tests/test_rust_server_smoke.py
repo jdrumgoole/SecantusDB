@@ -827,3 +827,55 @@ def test_embedded_handle_wiredtiger_knobs(tmp_path) -> None:
         assert coll.find_one({"_id": 7})["v"] == 7
     finally:
         srv.stop()
+
+
+def test_json_schema_keyword_validation(tmp_path) -> None:
+    """$jsonSchema keyword validation on the Rust server, matching the Python
+    server and a mongod 7.0 probe: metadata keywords accepted; unsupported /
+    unknown keywords rejected at parse time (9 FailedToParse, even before any
+    document is scanned); draft-4 exclusive bounds and multipleOf /
+    tuple-items semantics."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": 1, "n": 6, "arr": [1, "x"]}, {"_id": 2, "n": 7.5, "arr": [1]}])
+
+        assert len(list(coll.find({"$jsonSchema": {"title": "t", "description": "d"}}))) == 2
+        got = [
+            d["_id"]
+            for d in coll.find(
+                {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}}
+            )
+        ]
+        assert got == [2]
+        assert [
+            d["_id"] for d in coll.find({"$jsonSchema": {"properties": {"n": {"multipleOf": 2.5}}}})
+        ] == [2]
+        assert [
+            d["_id"]
+            for d in coll.find(
+                {
+                    "$jsonSchema": {
+                        "properties": {
+                            "arr": {"items": [{"bsonType": "int"}], "additionalItems": False}
+                        }
+                    }
+                }
+            )
+        ] == [2]
+
+        for schema, code, frag in [
+            ({"$ref": "#/x"}, 9, "not currently supported"),
+            ({"notakeyword": 1}, 9, "Unknown $jsonSchema keyword: notakeyword"),
+            ({"properties": {"n": {"notakeyword": 1}}}, 9, "Unknown $jsonSchema keyword"),
+            ({"minimum": 5, "exclusiveMinimum": 6}, 14, "must be a boolean"),
+            ({"exclusiveMinimum": True}, 9, "must be a present if"),
+            ({"multipleOf": 0}, 9, "positive value"),
+            ({"title": 5}, 14, "must be of type string"),
+        ]:
+            with pytest.raises(pymongo.errors.OperationFailure) as exc:
+                list(coll.find({"$jsonSchema": schema}))
+            assert exc.value.code == code, schema
+            assert frag in exc.value.details["errmsg"], schema
+    finally:
+        srv.stop()
