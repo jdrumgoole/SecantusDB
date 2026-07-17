@@ -4332,14 +4332,6 @@ recorded in that slice's changelog fragment. Still open:
   plain `update` that never reads it (the Python side gates on
   `return_post_images`). Plumb a `want_post_image` flag, or let the raw-BSON
   serving-path refactor (tasks/rust-perf-findings.md) subsume it.
-- [ ] **The Rust params of `tests/test_mongo_server_concurrency.py` never run
-  in CI** — the test lane has no storage-engine build, so they importorskip;
-  wire the suite into the `storage-engine` CI job so the Rust server's
-  exactly-one-winner invariants are continuously enforced.
-- [ ] **findAndModify re-pick loops have no telemetry** — unbounded retry is
-  mongod-correct, but once Rust writes stop serializing (lock split below)
-  steal-retries become possible; add the periodic-warning pattern from
-  `_retry_write_conflicts` so a steal-storm is visible in server logs.
 
 ## CI build cost
 

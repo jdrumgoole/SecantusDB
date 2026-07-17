@@ -1765,6 +1765,22 @@ jobs:
           python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
           -o addopts= -p no:cacheprovider -q
 
+      - name: Rust-server concurrency invariants (#451 stress suite)
+        # The Rust params of the concurrency stress suite: exactly-one-winner
+        # races, exact final counts, typed-errors-only, per-collection-lock
+        # scaling. They importorskip in every other test lane because no other
+        # job builds `_secantus_server`; this is the only lane that does, so
+        # it's where these invariants get continuously enforced. `-k rust`
+        # selects only the `[rust]` parametrization — the `[python]` params
+        # need the SWIG `wiredtiger` binding this storage-flavoured wheel
+        # doesn't ship, and are already covered by the main test lanes.
+        shell: bash
+        run: >-
+          uv run --no-project --with pymongo --with pytest
+          --with "$(ls dist-storage/*.whl)"
+          python -m pytest tests/test_mongo_server_concurrency.py
+          -k rust -o addopts= -p no:cacheprovider -q
+
       - name: Build + smoke the standalone secantusd-rs binary (R7)
         # The bin crate links the SAME vendored WiredTiger the wheel build above
         # produced under build/*/wt-build (scikit-build-core's build-dir), via

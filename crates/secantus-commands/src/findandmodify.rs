@@ -129,7 +129,31 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // `new: true` post-image comes from the write itself
     // (`UpdateOutcome::post_image`), never from a re-`find` a concurrent
     // writer could land in front of.
+    //
+    // The loop is unbounded (mongod's predicate re-evaluation is too), so a
+    // steal storm — many concurrent findAndModify contending for the same
+    // job-queue document — is only visible if we say so. Log a warning every
+    // few seconds of continuous re-picking, mirroring the storage layer's
+    // write-conflict retry telemetry, so a livelock shows up in the server
+    // log instead of as silent CPU.
+    let repick_started = std::time::Instant::now();
+    let mut repick_last_log = repick_started;
+    let mut repick_count: u64 = 0;
     loop {
+        if repick_count > 0 {
+            let now = std::time::Instant::now();
+            if now.duration_since(repick_last_log) >= std::time::Duration::from_secs(5) {
+                repick_last_log = now;
+                eprintln!(
+                    "secantus: findAndModify on {}.{} re-picking for {:.1}s \
+                     ({repick_count} steals) — concurrent writers keep taking \
+                     the matched document",
+                    ctx.db_name,
+                    coll,
+                    now.duration_since(repick_started).as_secs_f64(),
+                );
+            }
+        }
         // Find the target (first match in sort order).
         let candidates = storage
             .find_collated(
@@ -229,6 +253,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             if deleted == 0 {
                 // A concurrent writer removed or changed the doc first — the
                 // pre-image in hand was never ours to claim. Re-pick.
+                repick_count += 1;
                 continue;
             }
             let value = project_value(matched_doc, fields, &query)?;
@@ -305,6 +330,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         };
         if outcome.matched == 0 {
             // Lost the race — the doc no longer satisfies the query. Re-pick.
+            repick_count += 1;
             continue;
         }
 
