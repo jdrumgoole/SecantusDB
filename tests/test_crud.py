@@ -4233,3 +4233,24 @@ def test_median_and_percentile_over_the_wire(coll) -> None:
             )
         )
     assert exc.value.code == 7750303
+
+
+def test_range_orders_embedded_documents(coll) -> None:
+    """$gt/$lt over an embedded-document bound orders documents field-by-field
+    (mongod 7.0.12); a document-valued field never matches a scalar bound.
+    Regression for a bug where both servers returned nothing for a doc bound."""
+    coll.insert_many(
+        [
+            {"_id": 1, "a": {"x": 2}},
+            {"_id": 2, "a": {"x": 0}},
+            {"_id": 3, "a": {"x": 1}},
+            {"_id": 4, "a": {"x": 1, "y": 9}},
+            {"_id": 5, "a": {"y": 1}},
+            {"_id": 6, "a": 5},  # scalar — different bracket
+        ]
+    )
+    assert sorted(d["_id"] for d in coll.find({"a": {"$gt": {"x": 1}}})) == [1, 4, 5]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$gte": {"x": 1}}})) == [1, 3, 4, 5]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$lt": {"x": 1}}})) == [2]
+    # A scalar field never matches a document bound.
+    assert 6 not in [d["_id"] for d in coll.find({"a": {"$gt": {"x": 1}}})]

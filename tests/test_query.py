@@ -452,6 +452,25 @@ def test_lte_decimal128_vs_float() -> None:
     assert not matches({"x": Decimal128("4.1")}, {"x": {"$lte": 4.0}})
 
 
+def test_range_orders_embedded_documents() -> None:
+    """Two embedded documents order field-by-field under range operators
+    (mongod 7.0.12-probed): first differing key compares as a string, else
+    recurse into the value, else the shorter document sorts first. Previously
+    both servers returned no-match (Python's ``operator.gt`` raises on dicts).
+    Cross-bracket (document vs scalar) still no-matches."""
+    assert matches({"a": {"x": 2}}, {"a": {"$gt": {"x": 1}}})
+    assert matches({"a": {"x": 1, "y": 9}}, {"a": {"$gt": {"x": 1}}})  # longer wins on tie
+    assert matches({"a": {"y": 1}}, {"a": {"$gt": {"x": 1}}})  # key "y" > "x"
+    assert not matches({"a": {"x": 1}}, {"a": {"$gt": {"x": 1}}})  # equal
+    assert matches({"a": {"x": 1}}, {"a": {"$gte": {"x": 1}}})
+    assert matches({"a": {"x": 0}}, {"a": {"$lt": {"x": 1}}})
+    assert matches({"a": {"x": 1}}, {"a": {"$lt": {"x": 1, "y": 5}}})  # shorter sorts first
+    # Type bracket: a document field vs a scalar bound, and a scalar field vs a
+    # document bound, both no-match.
+    assert not matches({"a": {"x": 1}}, {"a": {"$gt": 2}})
+    assert not matches({"a": 2}, {"a": {"$gt": {"x": 1}}})
+
+
 def test_embedded_document_equality_is_ordered_and_exact() -> None:
     """Full embedded-document equality is field-ORDER-sensitive and
     exact (no subset), recursively — a mongod gotcha. Oracle-pinned
