@@ -835,6 +835,16 @@ def _try_cmp(
 
         c = -1 if _bson_lt(a, b) else (1 if _bson_lt(b, a) else 0)
         return bool(op(c, 0))
+    # Two arrays order element-by-element under range operators, but each
+    # element pair compares by *full* BSON order (type rank first) — mongod
+    # ranks a string element above a number element, so `[1, "x"] > [1, 2]`.
+    # Python's native `[..] < [..]` raises TypeError on such a cross-type
+    # element pair (swallowed to a no-match), so route through `_bson_lt`.
+    if isinstance(a, list) and isinstance(b, list):
+        from secantus.ordering import _bson_lt
+
+        c = -1 if _bson_lt(a, b) else (1 if _bson_lt(b, a) else 0)
+        return bool(op(c, 0))
     a, b = _coerce_numeric(a, b)
     a, b = _coerce_datetime(a, b)
     try:
