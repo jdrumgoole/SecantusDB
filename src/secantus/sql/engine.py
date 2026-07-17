@@ -9,9 +9,11 @@ and ``SHOW`` / ``SET`` resolve against real state.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import datetime as _dt
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,16 +61,40 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
     if pubsub is not None:
         return [pubsub]
     catalog = Catalog(storage)
-    # Two-phase commit (#139) is handled before sqlglot: it cannot parse
-    # ``COMMIT PREPARED`` / ``ROLLBACK PREPARED`` at all, and ``PREPARE
-    # TRANSACTION`` collides with the SQL-level ``PREPARE name AS`` (#121).
-    two_phase = _maybe_two_phase(sql, storage, db, catalog, session)
-    if two_phase is not None:
-        return [two_phase]
-    results: list[SQLResult] = []
-    for stmt in planner.parse(sql):
-        results.append(_normalize_result(_dispatch(stmt, storage, db, catalog, session)))
-    return results
+    with _storage_conflicts_as_sqlstate():
+        # Two-phase commit (#139) is handled before sqlglot: it cannot parse
+        # ``COMMIT PREPARED`` / ``ROLLBACK PREPARED`` at all, and ``PREPARE
+        # TRANSACTION`` collides with the SQL-level ``PREPARE name AS`` (#121).
+        two_phase = _maybe_two_phase(sql, storage, db, catalog, session)
+        if two_phase is not None:
+            return [two_phase]
+        results: list[SQLResult] = []
+        for stmt in planner.parse(sql):
+            results.append(_normalize_result(_dispatch(stmt, storage, db, catalog, session)))
+        return results
+
+
+@contextlib.contextmanager
+def _storage_conflicts_as_sqlstate() -> Iterator[None]:
+    """Map a storage-level write-write conflict to SQLSTATE 40001.
+
+    WiredTiger is first-updater-wins: a statement (or COMMIT) that loses a race
+    with a concurrent writer raises ``WriteConflictError`` / ``WT_ROLLBACK``.
+    Without this mapping the loser escaped as an unhandled exception and the
+    wire layer sent the generic ``XX000 internal error`` — a real Postgres
+    reports ``40001 serialization_failure``, the retriable signal drivers and
+    ORMs key their retry loops on. Imported lazily so the engine keeps no
+    module-level dependency on the storage implementation."""
+    try:
+        yield
+    except errors.SQLError:
+        raise
+    except Exception as exc:
+        from secantus.storage import WriteConflictError, _is_wt_rollback
+
+        if isinstance(exc, WriteConflictError) or _is_wt_rollback(exc):
+            raise errors.serialization_failure() from exc
+        raise
 
 
 def _normalize_result(result: SQLResult) -> SQLResult:
@@ -1118,7 +1144,8 @@ def run_statement(
     """
     if catalog is None:
         catalog = Catalog(storage)
-    return _normalize_result(_dispatch(stmt, storage, db, catalog, session))
+    with _storage_conflicts_as_sqlstate():
+        return _normalize_result(_dispatch(stmt, storage, db, catalog, session))
 
 
 def describe_statement(

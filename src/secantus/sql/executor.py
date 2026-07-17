@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import functools
 import operator
+import threading
+import weakref
 from typing import Any
 
 import bson
@@ -18,6 +20,43 @@ from secantus.paths import get_path, has_path
 from secantus.sql import errors, planner, typemap
 from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
+
+# One write-statement lock per shared ``Storage``. A DML statement is a
+# read-modify-write spanning several storage calls (constraint probes,
+# post-image computation, the write itself); the storage ``RLock`` only
+# serializes each *call*, so two connections interleaving between the probe
+# and the write could both pass a UNIQUE check or both derive a post-image
+# from the same pre-image (lost update). Postgres serializes these with row
+# locks; we serialize the whole statement — writers on one storage already
+# serialize inside WiredTiger, so this costs no real concurrency. RLock so a
+# write nested inside another's enforcement (FK cascades) re-enters.
+_write_locks: weakref.WeakKeyDictionary[Any, threading.RLock] = weakref.WeakKeyDictionary()
+_write_locks_guard = threading.Lock()
+_fallback_write_lock = threading.RLock()  # storage objects that refuse weakrefs
+
+
+def _write_lock(storage: Any) -> threading.RLock:
+    with _write_locks_guard:
+        try:
+            lock = _write_locks.get(storage)
+            if lock is None:
+                lock = threading.RLock()
+                _write_locks[storage] = lock
+            return lock
+        except TypeError:
+            return _fallback_write_lock
+
+
+def _serialized_write(fn: Any) -> Any:
+    """Run a ``(plan, storage, db, ...)`` write executor under the storage's
+    statement-write lock."""
+
+    @functools.wraps(fn)
+    def wrapper(plan: Any, storage: Any, db: str, *args: Any, **kwargs: Any) -> Any:
+        with _write_lock(storage):
+            return fn(plan, storage, db, *args, **kwargs)
+
+    return wrapper
 
 
 def _pg_sort(items: list[Any], key_of: Any, specs: list[tuple[int, bool]]) -> None:
@@ -594,6 +633,7 @@ def _returning_result(
     return SQLResult(command_tag=command_tag, columns=columns, rows=rows, rowcount=rowcount)
 
 
+@_serialized_write
 def execute_insert(
     plan: planner.InsertPlan,
     storage: Any,
@@ -1721,6 +1761,7 @@ def execute_evaluated_select(
     )
 
 
+@_serialized_write
 def execute_update(
     plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:
@@ -2144,6 +2185,7 @@ def _enforce_fk_on_parent_update(
                 storage.update_matching(db, child.collection, filt, {"$set": clear}, multi=True)
 
 
+@_serialized_write
 def execute_delete(
     plan: planner.DeletePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:

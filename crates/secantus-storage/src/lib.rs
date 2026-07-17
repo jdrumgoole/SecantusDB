@@ -190,6 +190,13 @@ pub struct UpdateOutcome {
     pub modified: usize,
     /// The `_id` inserted by an `upsert` when nothing matched, else `None`.
     pub upserted_id: Option<Bson>,
+    /// The post-image of the written document for a single-doc
+    /// (`multi == false`) update or an upsert, captured while the statement
+    /// holds the storage lock. `findAndModify {new: true}` returns this —
+    /// a post-write re-`find` is a separate call a concurrent writer can land
+    /// in front of, handing two clients the same "new" document. `None` for
+    /// `multi` updates and when nothing matched.
+    pub post_image: Option<Document>,
 }
 
 /// A stored index, with the options the write / lookup paths care about,
@@ -5107,6 +5114,7 @@ impl Storage {
 
         let mut matched = 0usize;
         let mut modified = 0usize;
+        let mut post_image: Option<Document> = None;
         let mut oplog_entries: Vec<Document> = Vec::new();
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
 
@@ -5120,6 +5128,12 @@ impl Storage {
             }
             matched += 1;
             let new = transform(&doc, false)?;
+            if !multi {
+                // Captured before the oplog branch below moves `new`; the
+                // post-image is the applied doc even when the update was a
+                // no-op (`new == doc`), matching mongod's fam reply.
+                post_image = Some(new.clone());
+            }
             if new != doc {
                 // Collection validator on the post-apply doc (mongod rejects an
                 // update that would leave a document failing validation). A
@@ -5230,6 +5244,7 @@ impl Storage {
             self.write_index_entries(&session, db, coll, &new, &descs, Some(&new_id_key))?;
             self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
             self.write_nat_entry(&session, db, coll, &new_id_key)?;
+            post_image = Some(new.clone());
             if oplog_on {
                 let mut o2 = Document::new();
                 o2.insert("_id", id.clone());
@@ -5253,6 +5268,7 @@ impl Storage {
             matched,
             modified,
             upserted_id,
+            post_image,
         })
     }
 

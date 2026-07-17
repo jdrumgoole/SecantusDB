@@ -4061,6 +4061,7 @@ class Storage:
         collation: Any = None,
         validator: dict[str, Any] | None = None,
         journal: bool = False,
+        return_post_images: bool = False,
     ) -> dict[str, Any]:
         from secantus.collation import parse as _parse_collation
 
@@ -4076,6 +4077,11 @@ class Storage:
         modified = 0
         upserted_id: Any = None
         did_upsert = False
+        # The post-image of each write, captured while the statement still
+        # holds the lock. ``findAndModify new:true`` reads it from here — a
+        # post-write re-``find`` is a separate call a concurrent writer can
+        # land in front of, handing two clients the same "new" document.
+        post_images: list[dict[str, Any]] | None = [] if return_post_images else None
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
@@ -4193,6 +4199,8 @@ class Storage:
                             }
                         )
                         pre_images.append(bson.encode(doc) if preimages_on else None)
+                if post_images is not None:
+                    post_images.append(new)
                 if not multi:
                     break
             if matched == 0 and upsert:
@@ -4260,12 +4268,17 @@ class Storage:
                 pre_images.extend(cap_pre)
             if oplog_entries:
                 self._emit_oplog(oplog_entries, pre_images)
-        return {
+        result = {
             "matched": matched,
             "modified": modified,
             "upserted_id": upserted_id,
             "did_upsert": did_upsert,
         }
+        if post_images is not None:
+            if did_upsert:
+                post_images.append(new)
+            result["post_images"] = post_images
+        return result
 
     @_retry_write_conflicts
     def delete_matching(

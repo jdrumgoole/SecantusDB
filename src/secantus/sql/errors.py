@@ -71,5 +71,13 @@ def foreign_key_violation(message: str) -> SQLError:
     return SQLError("23503", message)
 
 
+def serialization_failure() -> SQLError:
+    """SQLSTATE 40001 — the statement (or its COMMIT) lost a write-write race
+    with a concurrent transaction. WiredTiger is first-updater-wins, so the
+    loser surfaces the same retriable error a SERIALIZABLE Postgres would;
+    the client's correct response is ROLLBACK + retry."""
+    return SQLError("40001", "could not serialize access due to concurrent update")
+
+
 def datatype_mismatch(message: str) -> SQLError:
     return SQLError("42804", message)

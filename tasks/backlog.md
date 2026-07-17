@@ -3581,3 +3581,27 @@ When you fix one of these, delete the line. When you discover a new one, add it 
   documented in docs/concurrency.md; lifting it is the
   tasks/wt-concurrency-plan.md end-game (and the Rust server's global
   write mutex is the equivalent lever there).
+
+## Concurrency races (found by the concurrent stress suites, 2026-07-16)
+
+Found by the two concurrency harnesses — `tests/test_mongo_server_concurrency.py`
+(pymongo vs the Python AND Rust servers, one parametrized suite) and
+`tests/test_pgserver_concurrency.py` (psycopg vs the PG server); fixed items are
+recorded in that slice's changelog fragment. Still open:
+
+- [ ] **SQL UNIQUE constraints race across open transactions.** Statement-time
+  constraint probes read the session's snapshot, so two *open transactions* that
+  each insert the same UNIQUE value both pass the probe and both commit (the docs
+  have different `_id`s, so WiredTiger sees no write-write conflict). Real
+  Postgres blocks the second inserter on the index entry until the first commits.
+  The autocommit-vs-autocommit race is closed (the per-storage statement-write
+  lock in `sql/executor.py`); the cross-transaction case needs either commit-time
+  re-validation against committed state or storage-level unique indexes backing
+  SQL UNIQUE constraints.
+- [ ] **SQL advisory locks provide no cross-connection exclusion** (§ "Advisory
+  locks landed", #135): `pg_advisory_lock` is per-`Session` bookkeeping that always
+  grants, so two connections can hold the same exclusive lock concurrently — apps
+  using advisory locks for leader election / migration fencing (alembic, cron
+  fencing) get no mutual exclusion. A truthful implementation needs a server-wide
+  lock table (like `NotifyHub` / `PreparedXactRegistry`) with blocking waits and
+  deadlock detection.
