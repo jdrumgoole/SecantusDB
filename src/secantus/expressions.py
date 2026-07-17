@@ -2490,3 +2490,34 @@ _OPS = {
     "$degreesToRadians": _op_degrees_to_radians,
     "$radiansToDegrees": _op_radians_to_degrees,
 }
+
+
+def _op_median_expr(arg: Any, ctx: _Ctx) -> Any:
+    return _percentile_expr(arg, ctx, op="$median")
+
+
+def _op_percentile_expr(arg: Any, ctx: _Ctx) -> Any:
+    return _percentile_expr(arg, ctx, op="$percentile")
+
+
+def _percentile_expr(arg: Any, ctx: _Ctx, *, op: str) -> Any:
+    """Expression-form ``$median`` / ``$percentile`` over an array input —
+    mongod's discrete percentile (``sorted[max(0, ceil(p*n) - 1)]`` as a
+    double), sharing spec validation and value filtering with the group
+    accumulators. Probed against mongod 7.0.12."""
+    from secantus.aggregate import _percentile_rank, _percentile_spec, _percentile_value
+
+    input_expr, ps = _percentile_spec(arg, op)
+    raw = _eval(input_expr, ctx)
+    values = sorted(
+        v
+        for v in (_percentile_value(x) for x in (raw if isinstance(raw, list) else [raw]))
+        if v is not None
+    )
+    if ps is None:  # $median
+        return _percentile_rank(values, 0.5)
+    return [_percentile_rank(values, p) for p in ps]
+
+
+_OPS["$median"] = _op_median_expr
+_OPS["$percentile"] = _op_percentile_expr

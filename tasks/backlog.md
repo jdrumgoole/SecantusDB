@@ -1385,18 +1385,20 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   are exact. Found by the three-way differential sweep 2026-07-14. (The `$log10`
   operator itself is now native on the Rust server; previously it errored with a
   generic `BadValue` even for valid input.)
-- [ ] **`$group` accumulators absent from both servers** (a differential probe
-  2026-07-06 found these error on *both* — a dual-server gap, not Rust-only):
-  `$median` / `$percentile` (t-digest accumulators). Remaining **expression** forms
-  still absent from both: `$median` / `$percentile` over an array (t-digest /
-  approximate — parity-risky), and the hashing family (`$toHashedIndexKey` —
-  mongod-specific hash). Each would need porting on **both** servers (Python module +
-  Rust `secantus-core`) with a parity corpus. (The **trig family** shipped — see
-  below; the anticipated libm last-ULP risk did not materialise, Rust `f64` and
-  CPython `math` share the platform libm.) **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot`
-  as `$group` accumulators**
-  remain a follow-on (their *expression* forms shipped — see below; MongoDB 6.3+, so
-  not validatable against the local mongod 6.0).
+- [ ] **`$group` accumulator gaps — `$median`/`$percentile` SHIPPED on both
+  servers (2026-07-17).** Both the group-accumulator and expression forms now
+  run on Python and Rust, pinned by a live mongod **7.0.12** probe: the
+  "approximate" method on bounded data is mongod's discrete percentile
+  (`sorted[max(0, ceil(p*n) - 1)]`, doubles out; bool/NaN excluded, Decimal128
+  included; empty → null / per-p nulls), so no t-digest is needed and the two
+  engines agree exactly (curated parity cases). Spec validation carries
+  mongod's verbatim codes (40414 missing `method`/`input`/`p`; 2 non-approximate
+  method; 7750301 non-array `p`; 7750303 out-of-range `p`). Still absent from
+  both: the hashing family (`$toHashedIndexKey` — mongod-specific hash), and
+  **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot` as `$group` accumulators** (their
+  *expression* forms shipped — see below; MongoDB 6.3+; now validatable against
+  the local mongod 7.0.12 tarball at
+  `/usr/local/mongodb-macos-aarch64-7.0.12/bin/mongod`).
   **Sort-layer edge (pre-existing, not $topN-specific):** SecantusDB's sort treats a
   *missing* field as equal to explicit `null`, whereas mongod sorts missing just
   *above* null — so `$top`/`$bottom`/`$topN`/`$bottomN` (and `$sort`) can order docs

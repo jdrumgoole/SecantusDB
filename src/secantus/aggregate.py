@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
+from bson import Decimal128
+
 from secantus.expressions import (
     MISSING,
     ExpressionError,
@@ -804,6 +806,8 @@ def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
             bucket[k] = _nelem_finalize(v)
         elif isinstance(v, dict) and "_topn_items" in v:
             bucket[k] = _topn_finalize(v)
+        elif isinstance(v, dict) and "_pct_vals" in v:
+            bucket[k] = _percentile_finalize(v)
     return bucket
 
 
@@ -961,6 +965,125 @@ def _acc_std(
         state = {"_std_vals": [], "_std_pop": pop}
         bucket[field] = state
     state["_std_vals"].append(v)
+
+
+def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
+    """Validate a ``$median`` / ``$percentile`` accumulator/expression spec and
+    return ``(input_expr, ps)`` (``ps`` is None for $median). Codes and messages
+    are verbatim from a mongod 7.0.12 probe."""
+    if not isinstance(arg, Mapping):
+        raise AggregateError(
+            f"specification must be an object; found {op}: {arg!r}",
+            code=7429703,
+            code_name="Location7429703",
+        )
+    if "method" not in arg:
+        raise AggregateError(
+            f"BSON field '{op}.method' is missing but a required field",
+            code=40414,
+            code_name="Location40414",
+        )
+    if arg["method"] != "approximate":
+        raise AggregateError(
+            "Currently only 'approximate' can be used as percentile 'method'.",
+            code=2,
+            code_name="BadValue",
+        )
+    if "input" not in arg:
+        raise AggregateError(
+            f"BSON field '{op}.input' is missing but a required field",
+            code=40414,
+            code_name="Location40414",
+        )
+    if op == "$median":
+        return arg["input"], None
+    if "p" not in arg:
+        raise AggregateError(
+            "BSON field '$percentile.p' is missing but a required field",
+            code=40414,
+            code_name="Location40414",
+        )
+    ps = arg["p"]
+    if not isinstance(ps, list):
+        raise AggregateError(
+            "The $percentile 'p' field must be an array of numbers from "
+            f"[0.0, 1.0], but found: {ps}",
+            code=7750301,
+            code_name="Location7750301",
+        )
+    out: list[float] = []
+    for p in ps:
+        if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0.0 <= p <= 1.0:
+            raise AggregateError(
+                "The $percentile 'p' field must be an array of numbers from "
+                f"[0.0, 1.0], but found: {p}",
+                code=7750303,
+                code_name="Location7750303",
+            )
+        out.append(float(p))
+    return arg["input"], out
+
+
+def _percentile_value(v: Any) -> float | None:
+    """The double a value contributes to a percentile computation, or None to
+    skip it. mongod (probed): int / long / double / Decimal128 count (as
+    doubles), bool and NaN are excluded, everything else is skipped."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        f = float(v)
+        return None if math.isnan(f) else f
+    if isinstance(v, Decimal128):
+        f = float(v.to_decimal())
+        return None if math.isnan(f) else f
+    return None
+
+
+def _percentile_rank(values: list[float], p: float) -> float | None:
+    """mongod's discrete percentile: ``sorted[max(0, ceil(p*n) - 1)]``."""
+    if not values:
+        return None
+    idx = max(0, math.ceil(p * len(values)) - 1)
+    return values[min(idx, len(values) - 1)]
+
+
+def _acc_percentile(
+    bucket: dict[str, Any],
+    field: str,
+    arg: Any,
+    doc: Mapping[str, Any],
+    vars: dict[str, Any],
+    *,
+    op: str,
+) -> None:
+    input_expr, ps = _percentile_spec(arg, op)
+    state = bucket.get(field)
+    if not isinstance(state, dict) or "_pct_vals" not in state:
+        state = {"_pct_vals": [], "_pct_ps": ps}
+        bucket[field] = state
+    v = _percentile_value(evaluate_or_missing(input_expr, doc, vars))
+    if v is not None:
+        state["_pct_vals"].append(v)
+
+
+def _percentile_finalize(state: dict[str, Any]) -> Any:
+    values = sorted(state["_pct_vals"])
+    ps = state["_pct_ps"]
+    if ps is None:  # $median
+        return _percentile_rank(values, 0.5)
+    return [_percentile_rank(values, p) for p in ps]
+
+
+def _acc_median(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_percentile(bucket, field, arg, doc, vars, op="$median")
+
+
+def _acc_percentile_op(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_percentile(bucket, field, arg, doc, vars, op="$percentile")
 
 
 def _acc_std_pop(
@@ -1166,6 +1289,8 @@ _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$bottom": _acc_bottom,
     "$topN": _acc_top_n,
     "$bottomN": _acc_bottom_n,
+    "$median": _acc_median,
+    "$percentile": _acc_percentile_op,
 }
 
 
