@@ -62,6 +62,19 @@ oplog grows. Two independent fixes, both cheap:
 This alone should move the insert workload meaningfully toward mongod
 (prune is ~68% of `Storage::insert` time in the capture).
 
+**Status (2026-07-17): shipped** (rust-oplog-hotpath slice) — both fixes as
+described (raw `ts` peek via `bson::RawDocument`, early-stop at the first
+in-window row, keys-only for the remainder), plus the same raw peek in
+`find_seq_for_ts` and a single-`prev()` tail read in oplog-meta recovery.
+The slice also took `current_cluster_time`'s per-`hello` meta persist (and
+its global-lock hold) off the hot path entirely — the Python endgame ported:
+meta persists at close (`Drop`), recovery clamps counters up past the table
+maxima and bumps the cluster clock +1s. Semantics pinned by the existing
+prune tests plus three new recovery tests in `tests/oplog.rs`; a literal
+O(pruned) cost pin isn't practical without decode instrumentation, so the
+cost claim rests on the code shape (no decode after the first in-window
+row).
+
 ## Non-finding
 
 The large `__gettimeofday` counts in the insert capture are WiredTiger's
@@ -91,7 +104,11 @@ a structural one:
    atomic + micro-lock (Python's `_oplog_seq_lock` shape); stop persisting
    oplog meta under the lock — adopt the Python endgame verbatim: persist
    only on close/prune, recover by table-scan clamp plus the +1s cluster
-   clock bump.
+   clock bump. *(Meta half shipped 2026-07-17 with the finding-3 slice:
+   persist at close only, clamp + bump on recovery, `current_cluster_time`
+   lock-free of the global mutex. Seq/ts minting already lives under the
+   dedicated `oplog` mutex, which the condvar pairing requires — no atomic
+   demotion possible or needed.)*
 4. **Commit-time conflict handling (port of #444/#447).** Once writers
    overlap, WT can mark a transaction rollback-only with the conflict
    surfacing only at `commit` (bare EINVAL, reason cleared by the

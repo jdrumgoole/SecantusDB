@@ -1285,9 +1285,9 @@ fn now_secs() -> i64 {
     now_millis() / 1000
 }
 
-/// Recover the oplog counters on open: prefer the persisted meta row, else scan
-/// the oplog table for the max seq and its timestamp. Mirrors
-/// `storage._load_oplog_meta`.
+/// Recover the oplog counters on open: the persisted meta row clamped UP to
+/// what the tables actually contain, else reconstruct from the newest oplog
+/// row. Mirrors `storage._load_oplog_meta`.
 fn load_oplog_meta(session: &Session) -> Result<OplogState> {
     let c = session.open_cursor(OPLOG_META_TABLE, None)?;
     c.set_key_s("state");
@@ -1300,40 +1300,41 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                         .ok()
                         .or_else(|| st.get_i32(k).ok().map(i64::from))
                 };
+                // The persisted counters are a *hint*, not the source of
+                // truth: the meta row is written at close, not per emit, so
+                // after a crash its `next_seq` / `next_nat_seq` lag the
+                // tables. Trusting a stale value would re-mint an
+                // already-used seq — a duplicate oplog key (lost change
+                // events) or a nat-entry collision that corrupts
+                // capped-collection FIFO eviction. Clamp each counter UP to
+                // the table maxima; the hint only ever saves a scan, never
+                // lowers us.
                 return Ok(OplogState {
-                    next_seq: g("next_seq").unwrap_or(1),
+                    next_seq: g("next_seq")
+                        .unwrap_or(1)
+                        .max(scan_max_oplog_seq(session) + 1),
                     last_ts_secs: g("last_ts_secs").unwrap_or(0),
                     last_ts_ord: g("last_ts_ord").unwrap_or(0),
-                    // Absent in legacy / oplog-disabled rows — recover by scanning
-                    // the natural index so minted seqs stay strictly greater.
                     next_nat_seq: g("next_nat_seq")
-                        .unwrap_or_else(|| scan_max_nat_seq(session) + 1),
+                        .unwrap_or(1)
+                        .max(scan_max_nat_seq(session) + 1),
                     emit_count: 0,
                 });
             }
         }
     }
-    // Fallback: reconstruct from the highest oplog row.
+    // Fallback: reconstruct from the newest oplog row (the table is keyed on
+    // the bare seq, so a single prev() from the end lands on the maximum).
     let oc = session.open_cursor(OPLOG_TABLE, None)?;
     let mut last_seq = 0i64;
     let mut last_secs = 0i64;
     let mut last_ord = 0i64;
-    let mut more = oc.next()?;
-    while more {
-        let seq = oc.get_key_q()?;
-        if seq > last_seq {
-            last_seq = seq;
-            let blob = oc.get_value_u()?;
-            if !blob.is_empty() {
-                if let Ok(entry) = decode_doc(&blob) {
-                    if let Some(Bson::Timestamp(ts)) = entry.get("ts") {
-                        last_secs = i64::from(ts.time);
-                        last_ord = i64::from(ts.increment);
-                    }
-                }
-            }
+    if oc.prev()? {
+        last_seq = oc.get_key_q()?;
+        if let Some(ts) = peek_entry_ts(&oc.get_value_u()?) {
+            last_secs = i64::from(ts.time);
+            last_ord = i64::from(ts.increment);
         }
-        more = oc.next()?;
     }
     Ok(OplogState {
         next_seq: last_seq + 1,
@@ -1342,6 +1343,34 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         next_nat_seq: scan_max_nat_seq(session) + 1,
         emit_count: 0,
     })
+}
+
+/// Largest `seq` present in the oplog table (0 if empty). Cheap: the table is
+/// keyed on the bare seq (`key_format=q`), so a single `prev()` from the end
+/// yields the global maximum. Used to clamp the recovered `next_seq` past any
+/// stale persisted hint so a reopen can never re-mint an already-used oplog
+/// seq. Mirrors `storage._scan_max_oplog_seq`.
+fn scan_max_oplog_seq(session: &Session) -> i64 {
+    let Ok(c) = session.open_cursor(OPLOG_TABLE, None) else {
+        return 0;
+    };
+    if c.prev().unwrap_or(false) {
+        c.get_key_q().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// Peek the `ts` Timestamp out of a raw oplog-entry blob without materialising
+/// the whole document. The prune / recovery / `startAtOperationTime` scans
+/// touch every row and need only this one field; a full `decode_doc` per row
+/// is the dominant cost of those walks (tasks/rust-perf-findings.md).
+fn peek_entry_ts(blob: &[u8]) -> Option<bson::Timestamp> {
+    let raw = bson::RawDocument::from_bytes(blob).ok()?;
+    match raw.get("ts") {
+        Ok(Some(bson::RawBsonRef::Timestamp(ts))) => Some(ts),
+        _ => None,
+    }
 }
 
 /// Largest insertion `seq` present in `NAT_TABLE` (0 if empty) — used to recover
@@ -1482,6 +1511,33 @@ pub fn extract_backup_archive_ex(
     Ok((abs_target, abs_archive, count))
 }
 
+impl Drop for Storage {
+    /// Persist the oplog meta row on teardown — the Rust analogue of
+    /// `storage.close`'s `_persist_oplog_meta`. Recovery clamps against the
+    /// tables anyway (`load_oplog_meta`), so a failure here costs only a
+    /// tail-row scan plus a 1s clock bump on the next open — but it is still
+    /// logged, never silent: in a database a close-time write error is a
+    /// durability signal.
+    fn drop(&mut self) {
+        let meta = {
+            let st = self.oplog.lock().unwrap();
+            (
+                st.next_seq,
+                st.last_ts_secs,
+                st.last_ts_ord,
+                st.next_nat_seq,
+            )
+        };
+        let persisted = match self.conn.open_session() {
+            Ok(session) => self.persist_oplog_meta(&session, meta),
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = persisted {
+            eprintln!("secantus-storage: failed to persist oplog meta during close: {e:?}");
+        }
+    }
+}
+
 impl Storage {
     /// Open (creating if needed) an on-disk database at `home` with the default
     /// SecantusDB WiredTiger config, bootstrapping the table schema.
@@ -1493,7 +1549,7 @@ impl Storage {
     /// ephemeral database).
     pub fn open_with_config(home: &str, config: &str) -> Result<Storage> {
         let conn = Connection::open(home, config)?;
-        let state = {
+        let mut state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
                 boot.create(name, fmt)?;
@@ -1502,6 +1558,18 @@ impl Storage {
             // reconstruct them by scanning the oplog table.
             load_oplog_meta(&boot)?
         };
+        // Cluster-time mints are not persisted per call (see
+        // `current_cluster_time`), so the recovered (last_ts_secs, last_ts_ord)
+        // can lag mints issued right before a crash. Bump one full second past
+        // everything recovered: any unpersisted mint carried the wall-clock
+        // second it was issued in, which is <= max(recovered, now) — so +1s is
+        // strictly greater than all of them. Costs at most a 1s forward jump of
+        // the (already logical) cluster clock per restart; never applied to a
+        // virgin store. Mirrors `storage.__init__`'s recovery bump.
+        if state.last_ts_secs > 0 {
+            state.last_ts_secs = state.last_ts_secs.max(now_secs()) + 1;
+            state.last_ts_ord = 0;
+        }
         Ok(Storage {
             conn,
             home: home.to_string(),
@@ -1670,33 +1738,23 @@ impl Storage {
     }
 
     /// A strictly-monotonic `Timestamp` advancing the cluster clock (used for
-    /// `hello`'s `lastWrite` / the `aggregate` reply's `operationTime`). Persists
-    /// the recovered meta so the counter survives a restart. Mirrors
-    /// `storage.current_cluster_time`.
+    /// `hello`'s `lastWrite` / the `aggregate` reply's `operationTime`).
+    /// Deliberately does NOT persist the oplog meta row: this runs on every
+    /// `hello` reply under the replica-set persona (driver heartbeats) and on
+    /// change-stream high-water-mark minting, so a per-call meta write is a
+    /// single-row WT hotspot every concurrent writer contends on. Restart
+    /// monotonicity is guaranteed structurally instead: recovery bumps the
+    /// clock one second past everything it can see (see `open_with_config`),
+    /// which covers any mint that was never persisted; the meta row itself is
+    /// written at close (`Drop`). Mirrors `storage.current_cluster_time`.
     pub fn current_cluster_time(&self) -> Result<bson::Timestamp> {
-        let _g = self.lock.lock().unwrap();
-        // Mint the next timestamp and snapshot the recovery meta in a SINGLE
-        // oplog-mutex hold, instead of locking to mint and locking again inside
-        // `persist_oplog_meta` to read the same fields back. (The seq counter
-        // can't be demoted to a bare `AtomicI64`: `wait_for_oplog` pairs
-        // `next_seq` with `oplog_cv`, and the condvar's lost-wakeup guarantee
-        // requires the counter to be read under the same mutex as the wait.)
-        let (ts, meta) = {
-            let mut st = self.oplog.lock().unwrap();
-            let ts = Self::mint_ts(&mut st);
-            (
-                ts,
-                (
-                    st.next_seq,
-                    st.last_ts_secs,
-                    st.last_ts_ord,
-                    st.next_nat_seq,
-                ),
-            )
-        };
-        let session = self.conn.open_session()?;
-        self.persist_oplog_meta(&session, meta)?;
-        Ok(ts)
+        // The seq counter can't be demoted to a bare `AtomicI64`:
+        // `wait_for_oplog` pairs `next_seq` with `oplog_cv`, and the condvar's
+        // lost-wakeup guarantee requires the counter to be read under the same
+        // mutex as the wait. Minting under the dedicated oplog mutex alone is
+        // enough — no WT access, so the global lock adds nothing here.
+        let mut st = self.oplog.lock().unwrap();
+        Ok(Self::mint_ts(&mut st))
     }
 
     /// The last minted cluster time WITHOUT advancing the clock. Reply gossip
@@ -2172,18 +2230,24 @@ impl Storage {
         let oc = session.open_cursor(OPLOG_TABLE, None)?;
         let mut all_seqs: Vec<i64> = Vec::new();
         let mut doomed: Vec<i64> = Vec::new();
+        // Entry `ts` values are monotone in seq (mint order == append order),
+        // so the out-of-retention rows form a prefix of the walk. Peek each
+        // row's ts (raw, no full document decode) only until the first
+        // in-window row; from there the walk is key-only — the cap trim in
+        // phase 2 needs bare seqs, never values. This runs on the write path
+        // (every `OPLOG_PRUNE_INTERVAL` emits, under the caller's lock), so an
+        // O(entire-oplog) decode here stalls every concurrent writer. A row
+        // with a missing/unreadable ts conservatively ends the doomed prefix —
+        // keep, never prune, what we can't date.
+        let mut in_window = false;
         let mut more = oc.next()?;
         while more {
             let seq = oc.get_key_q()?;
             all_seqs.push(seq);
-            let blob = oc.get_value_u()?;
-            if !blob.is_empty() {
-                if let Ok(entry) = decode_doc(&blob) {
-                    if let Some(Bson::Timestamp(ts)) = entry.get("ts") {
-                        if i64::from(ts.time) < cutoff {
-                            doomed.push(seq);
-                        }
-                    }
+            if !in_window {
+                match peek_entry_ts(&oc.get_value_u()?) {
+                    Some(ts) if i64::from(ts.time) < cutoff => doomed.push(seq),
+                    _ => in_window = true,
                 }
             }
             more = oc.next()?;
@@ -2269,14 +2333,9 @@ impl Storage {
         let mut more = c.next()?;
         while more {
             let seq = c.get_key_q()?;
-            let blob = c.get_value_u()?;
-            if !blob.is_empty() {
-                if let Ok(entry) = decode_doc(&blob) {
-                    if let Some(Bson::Timestamp(e)) = entry.get("ts") {
-                        if e.time > ts.time || (e.time == ts.time && e.increment >= ts.increment) {
-                            return Ok(seq);
-                        }
-                    }
+            if let Some(e) = peek_entry_ts(&c.get_value_u()?) {
+                if e.time > ts.time || (e.time == ts.time && e.increment >= ts.increment) {
+                    return Ok(seq);
                 }
             }
             more = c.next()?;
