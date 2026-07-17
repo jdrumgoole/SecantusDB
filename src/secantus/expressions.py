@@ -438,7 +438,16 @@ def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
     import math
 
     v = _eval(arg, ctx)
-    return math.sqrt(v) if v is not None and v >= 0 else None
+    if v is None:
+        return None
+    # mongod's domain error (probed 7.0.12): Location28714, not a null result.
+    if isinstance(v, (int, float)) and v < 0:
+        raise ExpressionError(
+            f"$sqrt's argument must be greater than or equal to 0, but is {v}",
+            code=28714,
+            code_name="Location28714",
+        )
+    return math.sqrt(v)
 
 
 def _op_pow(arg: Any, ctx: _Ctx) -> Any:
@@ -461,7 +470,16 @@ def _op_ln(arg: Any, ctx: _Ctx) -> Any:
     import math
 
     v = _eval(arg, ctx)
-    return math.log(v) if v is not None and v > 0 else None
+    if v is None:
+        return None
+    # mongod's domain error (probed 7.0.12): Location28766, not a null result.
+    if isinstance(v, (int, float)) and v <= 0:
+        raise ExpressionError(
+            f"$ln's argument must be a positive number, but is {v}",
+            code=28766,
+            code_name="Location28766",
+        )
+    return math.log(v)
 
 
 def _op_log(arg: Any, ctx: _Ctx) -> Any:
@@ -470,8 +488,21 @@ def _op_log(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, list) or len(arg) != 2:
         raise ExpressionError("$log requires [number, base]")
     n, base = _eval(arg[0], ctx), _eval(arg[1], ctx)
-    if n is None or base is None or n <= 0 or base <= 0 or base == 1:
+    if n is None or base is None:
         return None
+    # mongod's domain errors (probed 7.0.12): Location28758 / 28759.
+    if isinstance(n, (int, float)) and n <= 0:
+        raise ExpressionError(
+            f"$log's argument must be a positive number, but is {n}",
+            code=28758,
+            code_name="Location28758",
+        )
+    if isinstance(base, (int, float)) and (base <= 0 or base == 1):
+        raise ExpressionError(
+            f"$log's base must be a positive number not equal to 1, but is {base}",
+            code=28759,
+            code_name="Location28759",
+        )
     return math.log(n, base)
 
 
@@ -479,7 +510,16 @@ def _op_log10(arg: Any, ctx: _Ctx) -> Any:
     import math
 
     v = _eval(arg, ctx)
-    return math.log10(v) if v is not None and v > 0 else None
+    if v is None:
+        return None
+    # mongod's domain error (probed 7.0.12): Location28761, not a null result.
+    if isinstance(v, (int, float)) and v <= 0:
+        raise ExpressionError(
+            f"$log10's argument must be a positive number, but is {v}",
+            code=28761,
+            code_name="Location28761",
+        )
+    return math.log10(v)
 
 
 def _trig_coerce(name: str, v: Any, code: int = 28765) -> float:

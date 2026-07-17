@@ -441,7 +441,7 @@ CURATED = [
     ({"$ceil": -3.7}, {}),
     ({"$sqrt": 16}, {}),
     ({"$sqrt": 2}, {}),
-    ({"$sqrt": "$n"}, {"n": -1}),  # negative -> null
+    ({"$sqrt": "$n"}, {"n": -1}),  # negative -> defers (Python raises 28714)
     ({"$sqrt": 0}, {}),
     # $exp / $ln / $log (libm: Rust f64 and CPython math share the platform libm,
     # so the bits agree; the test asserts rust == py, not a literal).
@@ -450,17 +450,17 @@ CURATED = [
     ({"$exp": "$x"}, {}),  # missing -> null
     ({"$ln": 1}, {}),
     ({"$ln": "$n"}, {"n": 2.5}),
-    ({"$ln": 0}, {}),  # <= 0 -> null
-    ({"$ln": -3}, {}),  # -> null
+    ({"$ln": 0}, {}),  # <= 0 -> defers (Python raises 28766)
+    ({"$ln": -3}, {}),  # -> defers
     ({"$log": [8, 2]}, {}),
     ({"$log": [100, 10]}, {}),
-    ({"$log": [8, 1]}, {}),  # base 1 -> null
+    ({"$log": [8, 1]}, {}),  # base 1 -> defers (Python raises 28759)
     ({"$log": [None, 2]}, {}),  # null arg -> null
     ({"$log10": 100}, {}),
     ({"$log10": 1000}, {}),
     ({"$log10": "$n"}, {"n": 2.5}),
-    ({"$log10": 0}, {}),  # <= 0 -> null
-    ({"$log10": -5}, {}),  # -> null
+    ({"$log10": 0}, {}),  # <= 0 -> defers (Python raises 28761)
+    ({"$log10": -5}, {}),  # -> defers
     ({"$log10": "$missing"}, {}),  # missing -> null
     # $pow: int**non-neg-int -> int; float operand / negative exp -> double.
     ({"$pow": [2, 10]}, {}),
