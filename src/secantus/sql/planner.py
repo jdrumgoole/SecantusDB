@@ -454,6 +454,19 @@ def _enum_type_name(datatype: exp.Expression) -> str | None:
     return None
 
 
+def _enum_array_element_name(datatype: exp.Expression) -> str | None:
+    """The user-defined element type name of an ``ARRAY`` column declaration
+    (``mood[]`` — a candidate enum-array column), or None."""
+    if (
+        isinstance(datatype, exp.DataType)
+        and datatype.this
+        and datatype.this.name == "ARRAY"
+        and datatype.expressions
+    ):
+        return _enum_type_name(datatype.expressions[0])
+    return None
+
+
 def _identity_spec(coldef: exp.ColumnDef) -> dict[str, Any] | None:
     """Parse a ``GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(START WITH n
     INCREMENT BY n)]`` column constraint into ``{mode, start, increment}``, or
@@ -1498,6 +1511,14 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 # a declared enum, execute_create_table raises 42704.
                 enum_name = named
                 tag = "text"
+            else:
+                # ``mood[]`` — an array of a user-defined type is a candidate
+                # enum-array column: stored as a text array, each element
+                # validated against the enum's labels at write time.
+                arr_elem = _enum_array_element_name(coldef.args["kind"])
+                if arr_elem is not None and typemap.builtin_tag_for_name(arr_elem) is None:
+                    enum_name = arr_elem
+                    tag = "text[]"
         if tag is None:
             raise errors.feature_not_supported(
                 f"unsupported column type for {coldef.name}: {coldef.args['kind'].sql()}"
@@ -2436,6 +2457,14 @@ def _constant_composite_extra_override(
     target = e.this if isinstance(e, exp.Alias) else e
     if isinstance(target, exp.Array) and target.expressions:
         elems = target.expressions
+        if all(isinstance(el, exp.Cast) for el in elems):
+            elem_enum_oid = scalar.enum_cast_oid(elems[0].to, ctx)
+            if elem_enum_oid is not None and all(
+                scalar.enum_cast_oid(el.to, ctx) == elem_enum_oid for el in elems
+            ):
+                # ``array['sad'::mood, …]`` — the minted array companion oid,
+                # tag text[] so the labels render as an array literal.
+                return ("text[]", elem_enum_oid + USER_TYPE_ARRAY_OID_OFFSET)
         if all(
             isinstance(el, exp.Cast) and scalar._composite_cast_target(el.to, ctx) is not None
             for el in elems
@@ -3234,6 +3263,10 @@ class PipelineSelectPlan:
     base_filter: dict[str, Any]
     pipeline: list[dict[str, Any]]
     out_columns: list[tuple[str, str]]  # (output_name, type_tag)
+    # Output positions whose value is a user enum: index -> enum type name. The
+    # string tag stays "text" (labels are stored as text); the executor/Describe
+    # resolve the minted enum OID from this map for RowDescription.
+    out_enum_types: dict[int, str] = field(default_factory=dict)
     derived: list[DerivedTable] = field(default_factory=list)
     # A WHERE that references the outer row (EXISTS / correlated subquery) can't
     # lower to a Mongo ``$match``; it's carried here and evaluated in Python by the
@@ -3271,6 +3304,7 @@ class EvaluatedSelectPlan:
     distinct: bool
     limit: int
     skip: int
+    out_enum_types: dict[int, str] = field(default_factory=dict)  # see PipelineSelectPlan
     derived: list[DerivedTable] = field(default_factory=list)
     # A correlated / EXISTS WHERE that couldn't lower to a ``$match`` — evaluated
     # per joined row (via ``resolve`` as the outer scope) after the pipeline.
@@ -4069,6 +4103,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
     else:
         base_filter = _where_filter(stmt, table)
     out_columns: list[tuple[str, str]] = []
+    out_enum_types: dict[int, str] = {}
     out_exprs: list[exp.Expression] = []
     alias_exprs: dict[str, exp.Expression] = {}
     names = _NameAllocator()
@@ -4077,10 +4112,15 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         inner = e.this if isinstance(e, exp.Alias) else e
         if isinstance(inner, exp.Star):
             for col in table.columns:
+                if col.enum_type is not None:
+                    out_enum_types[len(out_columns)] = col.enum_type
                 out_columns.append((names.fresh(col.name), col.type_tag))
                 out_exprs.append(exp.column(col.name))
             continue
         name = alias or (_column_name(inner) if isinstance(inner, exp.Column) else "?column?")
+        enum_name = _projected_enum_type(inner, table)
+        if enum_name is not None:
+            out_enum_types[len(out_columns)] = enum_name
         out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
         if alias is not None:
@@ -4117,6 +4157,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         base_filter=base_filter,
         pipeline=[],
         out_columns=out_columns,
+        out_enum_types=out_enum_types,
         out_exprs=out_exprs,
         resolve=resolve,
         where=residual_where,
@@ -4140,12 +4181,26 @@ def _distinct_on(stmt: exp.Select) -> list[exp.Expression]:
     return []
 
 
+def _projected_enum_type(inner: exp.Expression, table: TableDef | None) -> str | None:
+    """The enum type name when ``inner`` is a plain projection of an enum column.
+
+    Feeds ``out_enum_types`` on the pipeline/evaluated plans: the string type
+    tag stays ``text`` (labels are stored as text), so the enum identity must
+    travel separately for RowDescription to report the minted OID.
+    """
+    if table is None or not isinstance(inner, exp.Column):
+        return None
+    col = table.column(inner.name)
+    return col.enum_type if col is not None else None
+
+
 def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     """A single-table ``SELECT DISTINCT`` → project the columns, then dedup."""
     base_filter = _where_filter(stmt, table)
     resolve = table_resolver(table)
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
+    out_enum_types: dict[int, str] = {}
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -4154,16 +4209,23 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
             for col in table.columns:
                 nm = names.fresh(col.name)
                 project[nm] = f"${col.field}"
+                if col.enum_type is not None:
+                    out_enum_types[len(out_columns)] = col.enum_type
                 out_columns.append((nm, col.type_tag))
             continue
         path, tag = _field(inner, resolve)
         nm = names.fresh(alias or _column_name(inner))
         project[nm] = f"${path}"
+        enum_name = _projected_enum_type(inner, table)
+        if enum_name is not None:
+            out_enum_types[len(out_columns)] = enum_name
         out_columns.append((nm, tag))
     pipeline: list[dict[str, Any]] = [{"$project": project}]
     _append_distinct(pipeline, out_columns)
     _append_sort_limit(pipeline, stmt, out_columns, table)
-    return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
+    return PipelineSelectPlan(
+        table.collection, base_filter, pipeline, out_columns, out_enum_types=out_enum_types
+    )
 
 
 def _accumulator_for(
@@ -4941,6 +5003,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
+    out_enum_types: dict[int, str] = {}
     post_aggregates: list[tuple[str, str, float | None]] = []
     names = _NameAllocator()
     agg_fields: dict[tuple[str, str | None, bool], str] = {}
@@ -5104,6 +5167,9 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                 )
             out_name = names.fresh(alias or col)
             project[out_name] = f"$_id.{col}"
+            enum_name = _projected_enum_type(inner, table)
+            if enum_name is not None:
+                out_enum_types[len(out_columns)] = enum_name
             out_columns.append((out_name, table.type_for(col)))
 
     # Resolve HAVING first — it may register hidden accumulators that must be
@@ -5143,6 +5209,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         base_filter,
         pipeline,
         out_columns,
+        out_enum_types=out_enum_types,
         residual_where=residual,
         residual_resolve=table_resolver(table) if residual is not None else None,
         post_aggregates=post_aggregates,
@@ -6881,6 +6948,7 @@ def _plan_join_select(
 
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
+    out_enum_types: dict[int, str] = {}
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -6890,14 +6958,21 @@ def _plan_join_select(
                 for c in tdef.columns:
                     name = names.fresh(c.name)
                     project[name] = f"${c.field if role == 'base' else f'{a}.{c.field}'}"
+                    if c.enum_type is not None:
+                        out_enum_types[len(out_columns)] = c.enum_type
                     out_columns.append((name, c.type_tag))
             continue
         path, tag = resolve(inner)
         name = names.fresh(alias or _column_name(inner))
         project[name] = f"${path}"
+        src_col = _column_for_order_node(inner, amap)
+        if src_col is not None and src_col.enum_type is not None:
+            out_enum_types[len(out_columns)] = src_col.enum_type
         out_columns.append((name, tag))
     _append_join_tail(pipeline, stmt, resolve, project, out_columns, amap)
-    return PipelineSelectPlan(base.collection, {}, pipeline, out_columns, derived=derived)
+    return PipelineSelectPlan(
+        base.collection, {}, pipeline, out_columns, out_enum_types=out_enum_types, derived=derived
+    )
 
 
 def _join_aggregate_of(
@@ -7017,6 +7092,7 @@ def _plan_join_group_select(
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
+    out_enum_types: dict[int, str] = {}
     post_aggregates: list[tuple[str, str, float | None]] = []
     names = _NameAllocator()
     agg_fields: dict[str, str] = {}
@@ -7151,6 +7227,9 @@ def _plan_join_group_select(
                 )
             out_name = names.fresh(alias or colname)
             project[out_name] = f"$_id.{keyname}"
+            src_col = _column_for_order_node(inner, amap)
+            if src_col is not None and src_col.enum_type is not None:
+                out_enum_types[len(out_columns)] = src_col.enum_type
             out_columns.append((out_name, key_tag[keyname]))
 
     having = stmt.args.get("having")
@@ -7183,6 +7262,7 @@ def _plan_join_group_select(
         {},
         pipeline,
         out_columns,
+        out_enum_types=out_enum_types,
         derived=derived,
         residual_where=residual,
         residual_resolve=resolve if residual is not None else None,
@@ -8848,6 +8928,7 @@ def _build_evaluated_join(
     derived: list[DerivedTable],
 ) -> EvaluatedSelectPlan:
     out_columns: list[tuple[str, str]] = []
+    out_enum_types: dict[int, str] = {}
     out_exprs: list[exp.Expression] = []
     names = _NameAllocator()
     for e in stmt.expressions:
@@ -8856,6 +8937,8 @@ def _build_evaluated_join(
         if isinstance(inner, exp.Star):
             for a, (_role, tdef) in amap.items():
                 for c in tdef.columns:
+                    if c.enum_type is not None:
+                        out_enum_types[len(out_columns)] = c.enum_type
                     out_columns.append((names.fresh(c.name), c.type_tag))
                     out_exprs.append(exp.column(c.name, table=a))
             continue
@@ -8863,6 +8946,9 @@ def _build_evaluated_join(
             name = alias or _column_name(inner)
         else:
             name = alias or "?column?"
+        src_col = _column_for_order_node(inner, amap)
+        if src_col is not None and src_col.enum_type is not None:
+            out_enum_types[len(out_columns)] = src_col.enum_type
         out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
 
@@ -8888,6 +8974,7 @@ def _build_evaluated_join(
         base_filter={},
         pipeline=pipeline,
         out_columns=out_columns,
+        out_enum_types=out_enum_types,
         out_exprs=out_exprs,
         resolve=resolve,
         order=order,

@@ -1,8 +1,8 @@
 # psycopg conformance report
 
-- SecantusDB (Python server) 0.5.4b235
+- SecantusDB (Python server) 0.5.4b236
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-07-17 00:17 UTC
+- generated: 2026-07-17 01:11 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -14,14 +14,14 @@
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
 | test_copy.py | 87 | 24 | 1 | 112 | 78.4% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
-| test_cursor_client.py | 26 | 2 | 0 | 28 | 92.9% |
+| test_cursor_client.py | 25 | 3 | 0 | 28 | 89.3% |
 | test_cursor_common.py | 277 | 3 | 8 | 288 | 98.9% |
 | test_cursor_raw.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_server.py | 89 | 21 | 0 | 110 | 80.9% |
 | test_encodings.py | 17 | 0 | 0 | 17 | 100.0% |
 | test_errors.py | 21 | 10 | 0 | 31 | 67.7% |
 | test_generators.py | 3 | 2 | 1 | 6 | 60.0% |
-| test_prepared.py | 19 | 11 | 1 | 31 | 63.3% |
+| test_prepared.py | 21 | 9 | 1 | 31 | 70.0% |
 | test_psycopg_dbapi20.py | 70 | 10 | 0 | 80 | 87.5% |
 | test_query.py | 44 | 0 | 0 | 44 | 100.0% |
 | test_rows.py | 18 | 0 | 0 | 18 | 100.0% |
@@ -45,9 +45,9 @@
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 110 | 24 | 1 | 135 | 82.1% |
 | types/test_uuid.py | 21 | 5 | 0 | 26 | 80.8% |
-| **total** | **3764** | **362** | **112** | **4238** | **91.2%** |
+| **total** | **3765** | **361** | **112** | **4238** | **91.3%** |
 
-## Failures (362)
+## Failures (361)
 
 - `tests/test_adapt.py::test_no_cast_needed[b]`
 - `tests/test_adapt.py::test_no_cast_needed[s]`
@@ -146,8 +146,9 @@
 - `tests/test_copy.py::test_subclass_adapter[1]`
 - `tests/test_copy.py::test_subclass_nulling_dumper[1]`
 - `tests/test_copy.py::test_worker_life[1-sample_binary]`
-- `tests/test_cursor_client.py::test_leak[asyncio-dict_row-many]`
-- `tests/test_cursor_client.py::test_leak[asyncio-namedtuple_row-all]`
+- `tests/test_cursor_client.py::test_leak[asyncio-dict_row-iter]`
+- `tests/test_cursor_client.py::test_leak[asyncio-namedtuple_row-one]`
+- `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-many]`
 - `tests/test_cursor_common.py::test_stream_badquery[asyncio-ClientCursor-copy (select 1) to stdout]`
 - `tests/test_cursor_common.py::test_stream_badquery[asyncio-Cursor-copy (select 1) to stdout]`
 - `tests/test_cursor_common.py::test_stream_badquery[asyncio-RawCursor-copy (select 1) to stdout]`
@@ -185,8 +186,6 @@
 - `tests/test_generators.py::test_cancel`
 - `tests/test_generators.py::test_pipeline_communicate_abort`
 - `tests/test_prepared.py::test_change_type`
-- `tests/test_prepared.py::test_change_type_execute`
-- `tests/test_prepared.py::test_change_type_executemany`
 - `tests/test_prepared.py::test_change_type_savepoint`
 - `tests/test_prepared.py::test_different_types`
 - `tests/test_prepared.py::test_evict_lru`

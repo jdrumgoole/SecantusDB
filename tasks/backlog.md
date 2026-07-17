@@ -1601,6 +1601,12 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
 - [ ] **`numeric` beyond 34 significant digits.** Stored as Decimal128, which caps at
   34 digits; wider values round into range (Postgres keeps them exact). Exact
   storage would need a text/dual representation for `numeric`.
+- [ ] **`test_leak[asyncio-*]` flapping on `FeatureNotSupported: unsupported value
+  expression`.** psycopg's `test_cursor_client.py::test_leak` asyncio variants flip
+  parametrizations in every deterministic gauge run pair around one persistent
+  unsupported-value-expression error in `test_leak`'s random probe queries; a single
+  dedicated diagnosis (find which value expression the ClientCursor emits that the
+  planner rejects) would stabilise ~5 tests at once.
 - [ ] **Coercion errors in one extended-protocol path surface as `XX000` internal
   error instead of `22P02`.** The declared-OID text-param conversion raises 22P02
   correctly; some column-coercion failures during Execute still fall through the
