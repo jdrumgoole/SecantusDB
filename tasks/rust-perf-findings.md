@@ -68,17 +68,47 @@ The large `__gettimeofday` counts in the insert capture are WiredTiger's
 internal service threads computing absolute deadlines for timed condition
 waits — wait-adjacent, not our code, not actionable.
 
-## The other axis: concurrency
+## The other axis: concurrency — the design
 
-Unchanged from `docs/concurrency.md`: all writes serialize behind the
-single global `Mutex<()>` in `secantus-storage`, giving flat ~0.5×
-scaling. The Python server's per-collection-lock split is the ported
-design; the `wt_poc` pure-C ceiling (~1.3× aggregate) bounds the prize at
-roughly **0.5× → 1.2–1.3× under 4–8 writers (~2.5× throughput)**. The
-Rust `wait_for_oplog` loop is already commit-conflict-correct, but the
-Python split's lesson list applies (commit-time conflict mapping,
-oplog-meta hotspot — the Rust emit currently persists meta under the
-global lock, which becomes a hotspot the moment the lock splits).
+`crates/secantus-storage` has 51 `self.lock.lock()` sites, and they include
+**pure reads** (`find_by_id`, `scan_collection`) — today concurrent readers
+serialize too, not just writers. That splits the work into a cheap step and
+a structural one:
+
+1. **Reads off the lock (cheap, first).** WiredTiger MVCC + per-thread
+   sessions make lock-free reads safe; drop the mutex from the read-only
+   methods (each already opens/uses its own session). No conflict machinery
+   needed. Wins on every mixed workload immediately and shrinks writer
+   convoy pressure.
+2. **Per-collection write locks (the port of Python Phase 2).** Registry of
+   `(db, coll) → lock` (as `_coll_locks` in Python); the global mutex
+   remains only for DDL, multi-collection writes (`$out` / `$merge`,
+   `renameCollection`), and registry mutation. `std::Mutex` is not
+   reentrant (the code already works around this in `prune`), so either
+   restructure call chains to never re-enter or use a reentrant lock for
+   the per-collection slots.
+3. **Global counters off the write path.** Oplog seq/ts minting to an
+   atomic + micro-lock (Python's `_oplog_seq_lock` shape); stop persisting
+   oplog meta under the lock — adopt the Python endgame verbatim: persist
+   only on close/prune, recover by table-scan clamp plus the +1s cluster
+   clock bump.
+4. **Commit-time conflict handling (port of #444/#447).** Once writers
+   overlap, WT can mark a transaction rollback-only with the conflict
+   surfacing only at `commit` (bare EINVAL, reason cleared by the
+   auto-rollback). Add the Rust equivalent of `_commit_batch_transaction`'s
+   mapping plus an unbounded `writeConflictRetry` wrapper with periodic
+   warnings. `wait_for_oplog` is already conflict-correct.
+5. **Gates.** `tests/test_mongo_server_concurrency.py`'s Rust params (the
+   #451 suite: exactly-one-winner, exact counts, typed-errors-only) are the
+   correctness harness; `bench.concurrency --server rust` is the measure.
+   Do this after the raw-BSON work — critical-section lengths are about to
+   change shape, and the split should be tuned against the new profile.
+
+**Expected outcome**: flat 0.5× → ~1.2–1.3× aggregate at 4–8 writers (the
+measured `wt_poc` pure-C ceiling), i.e. **~2.5× write throughput under
+load**, plus whatever the read-path unlock buys mixed workloads — which is
+currently unmeasured because the harness is write-only (add a mixed
+readers+writers phase to `bench.concurrency` when step 1 lands).
 
 ## Recommended sequence
 

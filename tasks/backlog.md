@@ -3599,3 +3599,19 @@ recorded in that slice's changelog fragment. Still open:
   fencing) get no mutual exclusion. A truthful implementation needs a server-wide
   lock table (like `NotifyHub` / `PreparedXactRegistry`) with blocking waits and
   deadlock detection.
+
+## Follow-ups from the #451 (concurrency stress suites) review, 2026-07-17
+
+- [ ] **Rust `UpdateOutcome::post_image` is cloned unconditionally** — every
+  single-doc update pays a full `Document` clone even when the caller is a
+  plain `update` that never reads it (the Python side gates on
+  `return_post_images`). Plumb a `want_post_image` flag, or let the raw-BSON
+  serving-path refactor (tasks/rust-perf-findings.md) subsume it.
+- [ ] **The Rust params of `tests/test_mongo_server_concurrency.py` never run
+  in CI** — the test lane has no storage-engine build, so they importorskip;
+  wire the suite into the `storage-engine` CI job so the Rust server's
+  exactly-one-winner invariants are continuously enforced.
+- [ ] **findAndModify re-pick loops have no telemetry** — unbounded retry is
+  mongod-correct, but once Rust writes stop serializing (lock split below)
+  steal-retries become possible; add the periodic-warning pattern from
+  `_retry_write_conflicts` so a steal-storm is visible in server logs.
