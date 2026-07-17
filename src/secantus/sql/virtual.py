@@ -1599,6 +1599,30 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typarray": oid + USER_TYPE_ARRAY_OID_OFFSET,
             }
         )
+    # User-declared range types (typtype 'r') and their auto-created companion
+    # multirange types (typtype 'm').
+    range_lister = getattr(catalog, "list_range_types", None)
+    for doc in range_lister(db) if range_lister is not None else []:
+        for key, oid_key, typtype in (("range", "oid", "r"), ("multirange", "multirange_oid", "m")):
+            tname = doc.get(key)
+            toid = doc.get(oid_key)
+            if not tname or not toid:
+                continue
+            typname, nsoid = _split_user_type_name(tname, schema_oids)
+            rows.append(
+                {
+                    "oid": toid,
+                    "typname": typname,
+                    "typcollation": 0,
+                    "typnamespace": nsoid,
+                    "typbasetype": 0,
+                    "typtypmod": -1,
+                    "typnotnull": False,
+                    "typdefault": None,
+                    "typtype": typtype,
+                    "typarray": toid + USER_TYPE_ARRAY_OID_OFFSET,
+                }
+            )
     # User-declared domain types (typtype 'd') carry their base type's oid in
     # typbasetype and the domain's NOT NULL in typnotnull.
     getter = getattr(catalog, "get_domain", None)
@@ -1651,10 +1675,22 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
     return rows
 
 
+def _range_type_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    """Range AND companion multirange names -> minted oids."""
+    lister = getattr(catalog, "list_range_types", None)
+    out: dict[str, int] = {}
+    for doc in lister(db) if lister is not None else []:
+        out[doc["range"]] = doc["oid"]
+        if doc.get("multirange") and doc.get("multirange_oid"):
+            out[doc["multirange"]] = doc["multirange_oid"]
+    return out
+
+
 def user_type_name(db: str, catalog: Catalog, oid: int) -> str | None:
-    """The name of a user-declared type (enum / domain / composite) by oid, or
-    None — the ``oid::regtype`` tail for oids the built-in tables don't know."""
-    for lookup in (_enum_oids, _domain_oids, _composite_oids):
+    """The name of a user-declared type (enum / domain / composite / range) by
+    oid, or None — the ``oid::regtype`` tail for oids the built-in tables don't
+    know."""
+    for lookup in (_enum_oids, _domain_oids, _composite_oids, _range_type_oids):
         for name, type_oid in lookup(db, catalog).items():
             if type_oid == oid:
                 return name
@@ -1776,7 +1812,7 @@ def user_type_oid(db: str, catalog: Catalog, name: str) -> int | None:
     text = fold_type_name(name)
     if text.lower().startswith("public."):
         text = text[len("public.") :]
-    for lookup in (_enum_oids, _domain_oids, _composite_oids):
+    for lookup in (_enum_oids, _domain_oids, _composite_oids, _range_type_oids):
         oid = lookup(db, catalog).get(text)
         if oid is not None:
             return oid
@@ -1802,7 +1838,7 @@ def _pg_range(db: str, session: Session, storage: Any, catalog: Catalog) -> list
     ``rngmultitypid`` too."""
     from secantus.sql.ranges import RANGE_TO_MULTIRANGE
 
-    return [
+    rows = [
         {
             "rngtypid": typemap.PG_OID[range_tag],
             "rngsubtype": typemap.PG_OID[elem_tag],
@@ -1812,6 +1848,17 @@ def _pg_range(db: str, session: Session, storage: Any, catalog: Catalog) -> list
         for range_tag, elem_tag in _RANGE_SUBTYPE.items()
         if range_tag in typemap.PG_OID
     ]
+    lister = getattr(catalog, "list_range_types", None)
+    for doc in lister(db) if lister is not None else []:
+        rows.append(
+            {
+                "rngtypid": doc["oid"],
+                "rngsubtype": typemap.PG_OID.get(doc.get("subtype_tag", ""), 25),
+                "rngmultitypid": doc.get("multirange_oid", 0),
+                "rngcollation": 0,
+            }
+        )
+    return rows
 
 
 def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:

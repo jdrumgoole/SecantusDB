@@ -47,7 +47,9 @@ def _step(tag: str, value: Any) -> Any:
     return value + 1
 
 
-def make_range(lower: Any, upper: Any, bounds: str, tag: str) -> dict[str, Any]:
+def make_range(
+    lower: Any, upper: Any, bounds: str, tag: str, *, custom_elem: str | None = None
+) -> dict[str, Any]:
     """Build a normalised range subdocument from bounds + a ``[)`` / ``(]`` / ``[]``
     / ``()`` spec. Discrete types canonicalise to ``[)``. An empty range (lower ==
     upper with an exclusive side, or lower > upper) collapses to ``{empty: True}``."""
@@ -55,7 +57,7 @@ def make_range(lower: Any, upper: Any, bounds: str, tag: str) -> dict[str, Any]:
         raise RangeError(f"invalid range bound flags: {bounds!r}")
     lower_inc = bounds[0] == "["
     upper_inc = bounds[1] == "]"
-    _elem, discrete = RANGE_TYPES[tag]
+    _elem, discrete = (custom_elem, False) if custom_elem is not None else RANGE_TYPES[tag]
     # Bounds store in the subtype's canonical form regardless of how they
     # arrived (a ``daterange(date, date)`` constructor bound must match the
     # text-cast path's ISO-text bound).
@@ -384,14 +386,16 @@ def render_multirange(mr: Any, tag: str | None = None) -> str:
     return "{" + ",".join(render(r, range_tag) for r in multirange_members(mr)) + "}"
 
 
-def parse_multirange(text: str, tag: str, coerce: Any) -> dict[str, Any]:
+def parse_multirange(
+    text: str, tag: str, coerce: Any, *, custom_elem: str | None = None
+) -> dict[str, Any]:
     """Parse a multirange text literal ``{[1,5), [10,20)}`` into a normalised
     subdocument. ``tag`` is the multirange type; each member parses as its range."""
     s = text.strip()
     if not (s.startswith("{") and s.endswith("}")):
         raise RangeError(f"malformed multirange literal: {text!r}")
     body = s[1:-1].strip()
-    range_tag = MULTIRANGE_TYPES[tag]
+    range_tag = MULTIRANGE_TYPES[tag] if custom_elem is None else tag
     if not body:
         return {"multirange": []}
     # Split on commas that sit between a closing bound and the next opening bound.
@@ -407,11 +411,17 @@ def parse_multirange(text: str, tag: str, coerce: Any) -> dict[str, Any]:
             parts.append(body[start:i])
             start = i + 1
     parts.append(body[start:])
-    rngs = [parse_literal(p.strip(), range_tag, coerce) for p in parts if p.strip()]
+    rngs = [
+        parse_literal(p.strip(), range_tag, coerce, custom_elem=custom_elem)
+        for p in parts
+        if p.strip()
+    ]
     return make_multirange(rngs)
 
 
-def parse_literal(text: str, tag: str, coerce: Any) -> dict[str, Any]:
+def parse_literal(
+    text: str, tag: str, coerce: Any, *, custom_elem: str | None = None
+) -> dict[str, Any]:
     """Parse a range text literal (``[1,10)`` / ``(1,10]`` / ``empty``) into a
     normalised subdocument. ``coerce`` converts a bound token to the element type."""
     s = text.strip()
@@ -427,7 +437,7 @@ def parse_literal(text: str, tag: str, coerce: Any) -> dict[str, Any]:
     lo_s, hi_s = body.split(",", 1)
     lo = coerce(lo_s.strip().strip('"')) if lo_s.strip() else None
     hi = coerce(hi_s.strip().strip('"')) if hi_s.strip() else None
-    return make_range(lo, hi, bounds, tag)
+    return make_range(lo, hi, bounds, tag, custom_elem=custom_elem)
 
 
 def _canonical_bound(v: Any) -> Any:

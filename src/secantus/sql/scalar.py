@@ -1490,6 +1490,30 @@ def enum_cast_target(datatype: exp.Expression | None, ctx: ScalarContext | None)
     return getter(ctx.db, name) if getter is not None else None
 
 
+def _range_type_cast_target(
+    datatype: exp.Expression | None, ctx: ScalarContext | None
+) -> tuple[Any, str] | None:
+    """(range-type doc, subtype tag) when ``datatype`` is a USERDEFINED cast
+    target naming a declared range type (or its companion multirange)."""
+    if ctx is None or getattr(ctx, "catalog", None) is None or getattr(ctx, "db", None) is None:
+        return None
+    if not (
+        isinstance(datatype, exp.DataType)
+        and datatype.this
+        and getattr(datatype.this, "name", None) == "USERDEFINED"
+    ):
+        return None
+    from secantus.sql.catalog import fold_type_name
+
+    getter = getattr(ctx.catalog, "get_range_type", None)
+    if getter is None:
+        return None
+    doc = getter(ctx.db, fold_type_name(datatype.sql(dialect="postgres")))
+    if doc is None:
+        return None
+    return (doc, doc.get("subtype_tag", "text"))
+
+
 def _composite_cast_target(
     datatype: exp.Expression | None, ctx: ScalarContext | None
 ) -> list | None:
@@ -1620,6 +1644,25 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             return None
         items = value if isinstance(value, list) else typemap._parse_pg_array_literal(str(value))
         return [validate_enum_label(elem_doc, v) for v in items]
+    # ``'[a,b)'::testrange`` / ``'{[a,b)}'::testmultirange`` — casts to a
+    # user-declared range type (or its companion multirange) parse the literal
+    # with the declared subtype's coercion.
+    rng_type = _range_type_cast_target(node.to, ctx)
+    if rng_type is not None:
+        if value is None or isinstance(value, dict):
+            return value
+        from secantus.sql import ranges as _ranges
+        from secantus.sql.catalog import fold_type_name
+
+        doc, elem_tag = rng_type
+        bound = lambda s: typemap.coerce(s, elem_tag)  # noqa: E731
+        cast_name = fold_type_name(node.to.sql(dialect="postgres"))
+        try:
+            if cast_name == doc.get("multirange"):
+                return _ranges.parse_multirange(str(value), cast_name, bound, custom_elem=elem_tag)
+            return _ranges.parse_literal(str(value), cast_name, bound, custom_elem=elem_tag)
+        except _ranges.RangeError as e:
+            raise errors.SQLError("22P02", f"malformed range literal: {str(value)[:80]!r}") from e
     # ``'(foo,42)'::testcomp`` — a cast to a declared composite type parses the
     # record literal into the typed, field-named subdocument.
     comp_fields = _composite_cast_target(node.to, ctx)
@@ -2199,6 +2242,21 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         from secantus.sql import ranges as _ranges
 
         return _ranges.make_multirange([a for a in args if a is not None])
+    if ctx is not None and getattr(ctx, "catalog", None) is not None and ctx.db:
+        # ``testrange(lo, hi [, bounds])`` / ``testmultirange(r1, …)`` — the
+        # constructor a user-declared range type gets, like the built-ins.
+        getter = getattr(ctx.catalog, "get_range_type", None)
+        doc = getter(ctx.db, name) if getter is not None else None
+        if doc is not None:
+            from secantus.sql import ranges as _ranges
+
+            elem = doc.get("subtype_tag", "text")
+            if name == doc.get("multirange"):
+                return _ranges.make_multirange([a for a in args if a is not None])
+            lo = args[0] if args else None
+            hi = args[1] if len(args) > 1 else None
+            bounds = _as_text(args[2]) if len(args) > 2 else "[)"
+            return _ranges.make_range(lo, hi, bounds, name, custom_elem=elem)
     if name == "range_merge":
         from secantus.sql import ranges as _ranges
 

@@ -176,7 +176,7 @@ def _decode_range(raw: bytes, elem_oid: int) -> str:
     flags = raw[0]
     if flags & _RANGE_EMPTY:
         return "empty"
-    decoder = _BINARY[elem_oid]
+    decoder = (lambda b: b.decode("utf-8")) if elem_oid in (0, 25, 1043) else _BINARY[elem_oid]
     off = 1
     bounds: list[str] = []
     for inf_flag in (_RANGE_LB_INF, _RANGE_UB_INF):
@@ -592,6 +592,12 @@ def _encode_value(
     if (oid == 2249 or tag == "composite") and isinstance(value, dict):
         # Anonymous record (2249) or a declared composite under its minted oid.
         return _encode_record(value, encoding)
+    if isinstance(value, dict) and "multirange" in value:
+        # A user-declared multirange under its minted oid (built-ins matched
+        # _OUT_BINARY above).
+        return _encode_multirange_generic(value, encoding)
+    if isinstance(value, dict) and ("empty" in value or ("lower" in value and "upper" in value)):
+        return _encode_range_generic(value, encoding)
     # text / varchar / unknown: the binary form equals the (client-encoded) text bytes.
     return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b""
 
@@ -654,6 +660,41 @@ def _encode_record(value: dict, encoding: str | None = "utf-8") -> bytes:
         oid, tag = _py_value_field_oid(v)
         b = _encode_value(v, oid, tag, encoding) or b""
         out += struct.pack("!ii", oid, len(b)) + b
+    return bytes(out)
+
+
+def _encode_range_generic(rng: dict, encoding: str | None = "utf-8") -> bytes:
+    """PG binary range for a user-declared range type — bounds encode in their
+    Python value's natural binary form (the client's registered subtype loader
+    expects exactly that)."""
+    if rng.get("empty"):
+        return bytes([_RANGE_EMPTY])
+    flags = 0
+    lo, hi = rng.get("lower"), rng.get("upper")
+    if rng.get("lower_inc"):
+        flags |= _RANGE_LB_INC
+    if rng.get("upper_inc"):
+        flags |= _RANGE_UB_INC
+    if lo is None:
+        flags |= _RANGE_LB_INF
+    if hi is None:
+        flags |= _RANGE_UB_INF
+    out = bytearray([flags])
+    for bound in (lo, hi):
+        if bound is None:
+            continue
+        b_oid, b_tag = _py_value_field_oid(bound)
+        b = _encode_value(bound, b_oid, b_tag, encoding) or b""
+        out += struct.pack("!i", len(b)) + b
+    return bytes(out)
+
+
+def _encode_multirange_generic(mr: dict, encoding: str | None = "utf-8") -> bytes:
+    rngs = mr.get("multirange", [])
+    out = bytearray(struct.pack("!i", len(rngs)))
+    for r in rngs:
+        b = _encode_range_generic(r, encoding)
+        out += struct.pack("!i", len(b)) + b
     return bytes(out)
 
 
@@ -901,6 +942,26 @@ class ExtendedSession:
         if self.catalog.get_composite(db, name) is not None:
             if isinstance(value, bytes):
                 value = _binary_record_to_text(value, self.session.wire_encoding)
+            return typemap.TaggedText(str(value), virtual.quote_type_name(name))
+        rng = getattr(self.catalog, "get_range_type", None)
+        rng_doc = rng(db, name) if rng is not None else None
+        if rng_doc is not None:
+            if isinstance(value, bytes):
+                # Binary custom range: PG's range wire layout with the declared
+                # subtype's bound encoding (multirange when the oid names the
+                # companion type).
+                elem_oid = typemap.PG_OID.get(rng_doc.get("subtype_tag", "text"), 25)
+                if name == rng_doc.get("multirange"):
+                    (count,) = struct.unpack_from("!i", value, 0)
+                    off, parts = 4, []
+                    for _ in range(count):
+                        (length,) = struct.unpack_from("!i", value, off)
+                        off += 4
+                        parts.append(_decode_range(value[off : off + length], elem_oid))
+                        off += length
+                    value = "{" + ",".join(parts) + "}"
+                else:
+                    value = _decode_range(value, elem_oid)
             return typemap.TaggedText(str(value), virtual.quote_type_name(name))
         if isinstance(value, bytes):  # unknown user type: best-effort text
             return pgwire.decode_text(value, self.session.wire_encoding)

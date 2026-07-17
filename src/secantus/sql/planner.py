@@ -2353,8 +2353,18 @@ def plan_constant_select(
             tag = udf.get("return_tag") or _infer_scalar_tag(target, _const_scope)
             columns.append((alias or _udf_call_name(target), tag, value))
         elif functions.is_scalar_function(target):
-            fname, value, tag = functions.evaluate_scalar(target, session)
-            columns.append((alias or fname, tag, value))
+            try:
+                fname, value, tag = functions.evaluate_scalar(target, session)
+                columns.append((alias or fname, tag, value))
+            except errors.SQLError as exc:
+                if exc.sqlstate != "0A000":
+                    raise
+                # Not a session/info function after all (e.g. a user-declared
+                # range type's constructor) — the full scalar evaluator decides.
+                value = scalar.evaluate(target, _const_scope, ctx)
+                columns.append(
+                    (alias or "?column?", _infer_scalar_tag(target, _const_scope), value)
+                )
         else:
             value = scalar.evaluate(target, _const_scope, ctx)
             columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
@@ -2400,6 +2410,15 @@ def _constant_enum_override(e: exp.Expression, ctx: Any) -> tuple[str | None, in
         oid = virtual._composite_oids(ctx.db, ctx.catalog).get(name)
         if oid is not None:
             return ("composite", oid)
+    rng = scalar._range_type_cast_target(target.to, ctx)
+    if rng is not None:
+        from secantus.sql.catalog import fold_type_name
+
+        doc, _elem = rng
+        name = fold_type_name(target.to.sql(dialect="postgres"))
+        oid = doc.get("multirange_oid") if name == doc.get("multirange") else doc.get("oid")
+        if oid:
+            return (None, oid)
     return None
 
 
