@@ -1486,29 +1486,49 @@ fn as_int(b: &Bson) -> Option<i64> {
     }
 }
 
+/// The integer a value contributes to `$mod` (truncated toward zero), or None
+/// if it isn't `$mod`-eligible. mongod (probed 7.0.12) truncates int / long /
+/// double toward zero and **excludes bool** (bool is not a number for `$mod`).
+/// Decimal128 defers to Python — `int(Decimal(...))` is exact to 34 digits,
+/// which an `f64` truncation can't reproduce (the project's standing
+/// Decimal128 precision-parity deferral).
+fn mod_int(val: &Bson) -> Result<Option<i64>, Fallback> {
+    Ok(match val {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d) => {
+            if d.is_nan() || d.is_infinite() {
+                None
+            } else {
+                Some(d.trunc() as i64)
+            }
+        }
+        Bson::Decimal128(_) => return Err(Fallback),
+        // bool and every non-numeric type: not eligible (no match), not an error.
+        _ => None,
+    })
+}
+
 fn op_mod(values: &[Option<&Bson>], spec: &Bson) -> R {
     let arr = spec.as_array().ok_or(Fallback)?;
-    if arr.len() != 2 {
-        return Err(Fallback);
+    if arr.len() < 2 {
+        return Err(Fallback); // "malformed mod, not enough elements" (code 2)
     }
-    let (Some(div), Some(rem)) = (as_int(&arr[0]), as_int(&arr[1])) else {
-        return Err(Fallback); // float divisor/remainder -> Python
+    // The divisor is truncated toward zero too (mongod: `[2.5, 0]` divides by 2).
+    let Some(div) = mod_int(&arr[0])? else {
+        return Err(Fallback); // non-numeric divisor -> malformed (code 2)
     };
-    if div <= 0 {
-        return Err(Fallback); // div==0 / negative modulo semantics -> Python
+    if div == 0 {
+        return Err(Fallback); // "divisor cannot be 0" (code 2)
     }
+    let rem = as_int(&arr[1]);
     let check = |val: &Bson| -> Result<Option<bool>, Fallback> {
-        match val {
-            Bson::Int32(_) | Bson::Int64(_) => {
-                let n = as_int(val).unwrap();
-                Ok(Some(n.rem_euclid(div) == rem))
-            }
-            // Python computes `bool % div` (bool is an int subclass): True->1,
-            // False->0, so a bool value DOES participate in $mod.
-            Bson::Boolean(b) => Ok(Some(i64::from(*b).rem_euclid(div) == rem)),
-            // Python would compute float/decimal mod; we don't -> Python.
-            Bson::Double(_) | Bson::Decimal128(_) => Err(Fallback),
-            _ => Ok(None), // non-numeric: Python's `v % div` raises -> no match
+        match mod_int(val)? {
+            // Rust's `%` on i64 is C-style truncated modulo (sign of the
+            // dividend), matching mongod — `-5 % 2 == -1`. `rem == None` (a
+            // float remainder in the spec) can't equal an integer result.
+            Some(iv) => Ok(Some(rem.is_some() && iv % div == rem.unwrap())),
+            None => Ok(None),
         }
     };
     for v in values {

@@ -1057,8 +1057,16 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   nothing before (Python's list `<` raises str-vs-int). Fixed via `_bson_lt` /
   `order::bson_lt` element-wise; the stale
   `array_vs_array_cross_type_element_no_match` unit test that pinned the bug is
-  corrected. **Still deferred where faithful:** the exotic BSON types (JS code /
-  symbol compare as text; DBPointer / undefined no-match). (The
+  corrected. **`$mod` fidelity fixed** (2026-07-17, same R8 triage): both
+  servers now truncate the value AND divisor toward zero to integers, exclude
+  bool, and use C-style truncated modulo — the Rust server previously *errored*
+  (`BadValue`) on a double-valued field and both servers wrongly matched a bool
+  field; three-way mongod-verified, with the zero-divisor / malformed-spec
+  errors reproduced. **Still deferred where faithful:** the exotic BSON types
+  (JS code / symbol compare as text; DBPointer / undefined no-match), and a
+  **Decimal128-valued `$mod` field on the Rust server** (`int(Decimal)` is exact
+  to 34 digits, which an `f64` truncation can't reproduce — the standing
+  Decimal128 precision-parity deferral; the Python engine handles it). (The
   retired in-process "flip `query.matches` default to Rust" item is gone — the
   two-server model has no per-call engine selection; `_secantus_core` is only
   the parity-test vehicle now.)

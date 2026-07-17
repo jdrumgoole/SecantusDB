@@ -1132,27 +1132,55 @@ def _op_all(values: list[Any], required: Any) -> bool:
     return any(all(_required_satisfied(v, r) for r in required) for v in values)
 
 
+def _mod_int(v: Any) -> int | None:
+    """The integer a value contributes to ``$mod`` (truncated toward zero), or
+    None if it isn't a `$mod`-eligible number. mongod (probed 7.0.12) truncates
+    int / long / double / Decimal128 toward zero and **excludes bool** (bool is
+    not a number for `$mod`, unlike Python where ``True % 2`` evaluates)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return None if (math.isnan(v) or math.isinf(v)) else int(v)  # trunc toward zero
+    if isinstance(v, Decimal128):
+        try:
+            d = v.to_decimal()
+        except (InvalidOperation, ValueError):
+            return None
+        return int(d) if d.is_finite() else None
+    return None
+
+
 def _op_mod(values: list[Any], mod_spec: Any) -> bool:
-    if not (isinstance(mod_spec, (list, tuple)) and len(mod_spec) == 2):
-        raise QueryError("$mod requires [divisor, remainder]")
-    divisor, remainder = mod_spec
+    if not isinstance(mod_spec, (list, tuple)) or len(mod_spec) < 2:
+        raise QueryError("malformed mod, not enough elements")
+    div = _mod_int(mod_spec[0])
+    if div is None:
+        raise QueryError("malformed mod, divisor not a number")
+    if div == 0:
+        raise QueryError("divisor cannot be 0")
+    remainder = mod_spec[1]
     for v in values:
         if v is MISSING:
             continue
-        if _try_mod(v, divisor, remainder):
+        if _try_mod(v, div, remainder):
             return True
         if isinstance(v, list):
             for elem in v:
-                if _try_mod(elem, divisor, remainder):
+                if _try_mod(elem, div, remainder):
                     return True
     return False
 
 
-def _try_mod(v: Any, divisor: Any, remainder: Any) -> bool:
-    try:
-        return bool(v % divisor == remainder)
-    except (TypeError, ZeroDivisionError):
+def _try_mod(v: Any, div: int, remainder: Any) -> bool:
+    """``v`` (truncated to an int) mod ``div`` equals ``remainder``. Uses C-style
+    truncated modulo (``math.fmod``, sign of the dividend) to match mongod —
+    Python's ``%`` takes the sign of the divisor, so ``-5 % 2`` diverges."""
+    iv = _mod_int(v)
+    if iv is None:
         return False
+    return int(math.fmod(iv, div)) == remainder
 
 
 def _op_elem_match(values: list[Any], condition: Any) -> bool:
