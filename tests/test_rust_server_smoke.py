@@ -775,3 +775,55 @@ def test_aggregate_stage_name_validation_against_rust_server(tmp_path) -> None:
         assert got == [(0, 2), (1, 2), (2, 2)]
     finally:
         srv.stop()
+
+
+def test_unknown_expression_operator_error_codes(tmp_path) -> None:
+    """Context-specific unknown-operator codes on the Rust server, matching the
+    Python server and mongod 6.0: 168 InvalidPipelineOperator for a query
+    ``$expr``; Location31325 inside an aggregation ``$project``. A
+    projection-only operator ($slice/$elemMatch/$meta shape) is never
+    mislabeled as an unknown expression."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "a": 5, "arr": [1, 2, 3]})
+
+        with pytest.raises(pymongo.errors.OperationFailure) as expr_exc:
+            list(coll.find({"$expr": {"$notreal": [1, 2]}}))
+        assert expr_exc.value.code == 168
+
+        with pytest.raises(pymongo.errors.OperationFailure) as proj_exc:
+            list(coll.aggregate([{"$project": {"y": {"$notreal": ["$a"]}}}]))
+        assert proj_exc.value.code == 31325
+        assert "Unknown expression $notreal" in proj_exc.value.details["errmsg"]
+
+        # Nested unknown operator is found too.
+        with pytest.raises(pymongo.errors.OperationFailure) as nested_exc:
+            list(coll.aggregate([{"$project": {"y": {"$add": [1, {"$bogus": 2}]}}}]))
+        assert nested_exc.value.code == 31325
+
+        # $slice in its projection-only shape still projects (not an expression).
+        got = list(coll.aggregate([{"$project": {"arr": {"$slice": ["$arr", 2]}}}]))
+        assert got[0]["arr"] == [1, 2]
+    finally:
+        srv.stop()
+
+
+def test_embedded_handle_wiredtiger_knobs(tmp_path) -> None:
+    """The embedded handle exposes the daemon's WiredTiger knobs: cache_size /
+    session_max / sync_on_commit thread into wt_config, and a server opened
+    with non-default values works end-to-end."""
+    srv = _server.RustServer(
+        str(tmp_path / "wt"),
+        0,
+        cache_size="256M",
+        session_max=100,
+        sync_on_commit=True,
+    )
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": i, "v": i} for i in range(20)])
+        assert coll.count_documents({}) == 20
+        assert coll.find_one({"_id": 7})["v"] == 7
+    finally:
+        srv.stop()

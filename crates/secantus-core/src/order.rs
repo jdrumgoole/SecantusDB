@@ -127,6 +127,103 @@ fn array_cmp(a: &[Bson], b: &[Bson]) -> Ordering {
     a.len().cmp(&b.len())
 }
 
+/// `ordering._bson_lt`'s rank, extending [`type_rank`] with the ranks the
+/// *decoded* Python values carry: pymongo hands the Python engine `str` for a
+/// BSON Symbol and the str-subclass `Code` for JS code (rank 4), and `None`
+/// for undefined (rank 2). A DBPointer decodes to an unranked object (default
+/// rank 5) — [`bson_lt`] defers it rather than reproduce Python's
+/// type-*name* tiebreak.
+fn lt_rank(v: &Bson) -> u8 {
+    match v {
+        Bson::Symbol(_) | Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => 4,
+        Bson::Undefined => 2,
+        _ => type_rank(v),
+    }
+}
+
+/// The text a rank-4 value compares by: Python sees plain `str` for String /
+/// Symbol / JS code (`Code` is a str subclass; a with-scope Code compares by
+/// its code string, scope ignored).
+fn lt_text(v: &Bson) -> Option<&str> {
+    match v {
+        Bson::String(s) | Bson::Symbol(s) | Bson::JavaScriptCode(s) => Some(s),
+        Bson::JavaScriptCodeWithScope(c) => Some(&c.code),
+        _ => None,
+    }
+}
+
+/// Python's `ordering._bson_lt(a, b)` — BSON-order strict-less as a single
+/// relation. Unlike [`cmp`], this needs no transitivity (it backs `$min` /
+/// `$max`, one comparison per write, not a sort), so it covers the types
+/// [`is_sortable`] must bar: bool (own rank, `False < True`), Decimal128
+/// (unified numeric), NaN (`<` is False both ways), Binary (bytes), Timestamp,
+/// Regex (Python `TypeError` → equal type names → False), Min/MaxKey, and the
+/// decoded exotic text types. `None` defers (DBPointer's type-name tiebreak;
+/// a Decimal128 that fails to classify).
+pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
+    if matches!(a, Bson::DbPointer(_)) || matches!(b, Bson::DbPointer(_)) {
+        return None;
+    }
+    let (ra, rb) = (lt_rank(a), lt_rank(b));
+    if ra != rb {
+        return Some(ra < rb);
+    }
+    // Same rank. Null / undefined (both decode to None): `None < None` is a
+    // TypeError in Python… but `_bson_lt` short-circuits `a is None or b is
+    // None` to False first.
+    if matches!(a, Bson::Null | Bson::Undefined) || matches!(b, Bson::Null | Bson::Undefined) {
+        return Some(false);
+    }
+    match (a, b) {
+        (Bson::Boolean(x), Bson::Boolean(y)) => Some(x < y),
+        (Bson::DateTime(x), Bson::DateTime(y)) => Some(x.timestamp_millis() < y.timestamp_millis()),
+        (Bson::Timestamp(x), Bson::Timestamp(y)) => {
+            Some((x.time, x.increment) < (y.time, y.increment))
+        }
+        (Bson::ObjectId(x), Bson::ObjectId(y)) => Some(x.bytes() < y.bytes()),
+        (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes < y.bytes),
+        // Two regexes: Python `<` raises TypeError → equal type names → False.
+        (Bson::RegularExpression(_), Bson::RegularExpression(_)) => Some(false),
+        (Bson::MinKey, Bson::MinKey) | (Bson::MaxKey, Bson::MaxKey) => Some(false),
+        (Bson::Document(x), Bson::Document(y)) => {
+            for ((ak, av), (bk, bv)) in x.iter().zip(y.iter()) {
+                if ak != bk {
+                    return Some(ak < bk);
+                }
+                if bson_lt(av, bv)? {
+                    return Some(true);
+                }
+                if bson_lt(bv, av)? {
+                    return Some(false);
+                }
+            }
+            Some(x.len() < y.len())
+        }
+        (Bson::Array(x), Bson::Array(y)) => {
+            for (av, bv) in x.iter().zip(y.iter()) {
+                if bson_lt(av, bv)? {
+                    return Some(true);
+                }
+                if bson_lt(bv, av)? {
+                    return Some(false);
+                }
+            }
+            Some(x.len() < y.len())
+        }
+        _ => {
+            if let Some(x) = lt_text(a) {
+                return Some(x < lt_text(b)?);
+            }
+            // Rank 3: the unified numeric type (int / long / double /
+            // Decimal128). NaN is unordered → Python `<` is False.
+            match (numeric::classify(a), numeric::classify(b)) {
+                (Some(na), Some(nb)) => Some(numeric::cmp(&na, &nb) == Some(Ordering::Less)),
+                _ => None,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

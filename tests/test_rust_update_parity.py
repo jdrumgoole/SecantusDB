@@ -117,6 +117,22 @@ CURATED = [
     ({"a": None}, {"$max": {"a": 9}}, False),  # 9 > null -> set
     ({"a": None}, {"$min": {"a": 9}}, False),  # null < 9 -> keep null
     ({"a": 5}, {"$max": {"a": 9}}, False),
+    # $min / $max over the previously-deferred types, now computed via the
+    # `order::bson_lt` port: bool (own rank above numbers), Decimal128 (unified
+    # numeric), NaN (unordered -> `<` False both ways), Binary bytes,
+    # Timestamp, and regex (Python type-name tie -> no set).
+    ({"a": 5}, {"$max": {"a": True}}, False),  # bool rank 9 > number -> set
+    ({"a": True}, {"$min": {"a": 5}}, False),  # number rank 3 < bool -> set
+    ({"a": False}, {"$max": {"a": True}}, False),  # False < True -> set
+    ({"a": 3}, {"$min": {"a": bson.Decimal128("2.5")}}, False),  # 2.5 < 3 -> set
+    ({"a": bson.Decimal128("2.5")}, {"$max": {"a": 3}}, False),  # 3 > 2.5 -> set
+    # (A NaN-valued *field* also keeps its NaN on both engines, but the parity
+    # assert can't equality-compare a NaN payload, so only the NaN-operand
+    # direction is pinned here.)
+    ({"a": 5}, {"$max": {"a": float("nan")}}, False),  # 5 < nan False -> keep
+    ({"a": b"ab"}, {"$max": {"a": b"ac"}}, False),  # bytes compare -> set
+    ({"a": bson.Timestamp(5, 1)}, {"$min": {"a": bson.Timestamp(4, 9)}}, False),
+    ({"a": bson.Regex("a")}, {"$max": {"a": bson.Regex("b")}}, False),  # tie -> keep
     ({"a": True}, {"$max": {"a": 2}}, False),  # bool current -> Rust defers (skip)
     ({"a": "m"}, {"$min": {"a": "a"}}, False),  # string compare
     ({"a": 2}, {"$min": {"a": 1.5}}, False),  # int/float cross-numeric

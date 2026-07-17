@@ -7,9 +7,11 @@
 //! Handled: replacement-style updates, `$set`, `$setOnInsert`, `$unset`,
 //! `$inc`, `$mul`, `$push` (incl. the `$each` modifier form with `$position` /
 //! `$slice` / `$sort` — `1`/`-1` whole-element or `{field: dir}`, BSON-order),
-//! `$pop`, `$rename`, `$bit`, `$min`/`$max` (BSON cross-type order over the
-//! sortable subset via `order::cmp` — null / number / string / objectId / date /
-//! doc / array; a missing field is set, an explicit-null is compared as rank 2),
+//! `$pop`, `$rename`, `$bit`, `$min`/`$max` (full BSON cross-type order via
+//! `order::bson_lt` — the direct `_bson_lt` port, covering bool / Decimal128 /
+//! NaN / Binary / Timestamp / Regex / Min-MaxKey and the decoded exotic text
+//! types; a missing field is set, an explicit-null is compared as rank 2; only
+//! a DBPointer operand still defers),
 //! `$addToSet` (incl. `$each`), `$pull` (query semantics: element-value predicate /
 //! sub-document match / equality, via `query::matches`), `$pullAll` (literal
 //! equality via `expressions::py_eq`), plus `_id` immutability.
@@ -20,7 +22,6 @@
 //! order Python's `_bson_lt` handles), Decimal128 / non-numeric arithmetic, and
 //! every error condition (so Python raises the exact `UpdateError`).
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use bson::{doc, Bson, Document};
@@ -536,25 +537,25 @@ fn apply_op(
             for (path, value) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
                     // A *missing* field is set unconditionally; a present field
-                    // (incl. an explicit null, rank 2) is compared by MongoDB's BSON
-                    // cross-type order. `order::cmp` covers the sortable subset
-                    // (null / number / string / objectId / date / doc / array); a
-                    // bool / Decimal128 / NaN / exotic operand isn't in it, so defer
-                    // to Python (whose `_bson_lt` handles the full order).
+                    // (incl. an explicit null, rank 2) is compared by MongoDB's
+                    // BSON cross-type order via `order::bson_lt` — the direct
+                    // `_bson_lt` port, which (unlike the `$sort` comparator)
+                    // needs no transitivity and so covers bool / Decimal128 /
+                    // NaN / Binary / Timestamp / Regex / Min-MaxKey and the
+                    // decoded exotic text types. Only a DBPointer (Python's
+                    // type-name tiebreak) still defers.
                     let should_set = match get_path(result, &cpath) {
                         None => true,
                         Some(current) => {
-                            if !crate::order::is_sortable(current)
-                                || !crate::order::is_sortable(value)
-                            {
-                                return Err(Fallback);
-                            }
-                            let ord = if want_less {
-                                crate::order::cmp(value, current) // value < current
+                            let lt = if want_less {
+                                crate::order::bson_lt(value, current) // value < current
                             } else {
-                                crate::order::cmp(current, value) // current < value
+                                crate::order::bson_lt(current, value) // current < value
                             };
-                            ord == Ordering::Less
+                            match lt {
+                                Some(l) => l,
+                                None => return Err(Fallback),
+                            }
                         }
                     };
                     if should_set {
@@ -793,8 +794,23 @@ mod tests {
             apply_update(&doc! {"a": 1}, &doc! {"$min": {"a": "x"}}, false).unwrap(),
             doc! {"a": 1}
         );
-        // A non-sortable operand (bool) still defers so Python's _bson_lt handles it.
-        assert!(apply_update(&doc! {"a": 5}, &doc! {"$max": {"a": true}}, false).is_err());
+        // A bool operand now computes via `order::bson_lt` (bool ranks above
+        // numbers in BSON order, so $max sets it), matching Python's _bson_lt.
+        assert_eq!(
+            apply_update(&doc! {"a": 5}, &doc! {"$max": {"a": true}}, false).unwrap(),
+            doc! {"a": true}
+        );
+        // Decimal128 joins the unified numeric compare: 2.5 < 3 -> $min sets it.
+        let d: bson::Decimal128 = "2.5".parse().unwrap();
+        assert_eq!(
+            apply_update(&doc! {"a": 3}, &doc! {"$min": {"a": d}}, false).unwrap(),
+            doc! {"a": d}
+        );
+        // NaN is unordered: Python's `5 < nan` is False, so $max keeps 5.
+        assert_eq!(
+            apply_update(&doc! {"a": 5}, &doc! {"$max": {"a": f64::NAN}}, false).unwrap(),
+            doc! {"a": 5}
+        );
         // Bare `apply_update` (no positional_matches) can't resolve `$` -> defer.
         assert!(apply_update(&doc! {"a": [1]}, &doc! {"$set": {"a.$": 9}}, false).is_err());
         // $inc / $mul on an explicit-null field -> defer so Python raises the

@@ -1500,18 +1500,18 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
     clean no-match, not a `Fallback`. Pinned by curated parity cases +
     `array_vs_array_lexicographic_range` / `array_vs_array_cross_type_element_no_match`
     unit tests.
-  - **Remaining residue (Rust *server* only, rare):** the **exotic** BSON types
-    (JS code / symbol / dbpointer / undefined) as a range operand still defer
-    (`Fallback` → `BadValue` on the Rust server); vanishingly rare, the Python
-    server handles them.
-  (The **`$min`/`$max` UPDATE** operators had the same
-  cross-type gap plus a Python `TypeError` traceback leak — **fixed 2026-07-13**:
-  Python now compares by BSON order via `ordering._bson_lt` (no leak, cross-type
-  matches mongod, explicit-null distinguished from missing); the Rust engine uses
-  `order::cmp` over the sortable subset and defers only a **bool / Decimal128 /
-  NaN / exotic** operand — that residual bool/Decimal128 defer on the Rust *server*
-  is the one remaining piece, and it needs the same non-sortable-order work as the
-  query matcher above.)
+  - **Exotic-type range operands — FIXED (Rust matcher).** JS code / symbol
+    compare as text (mirroring pymongo's decode: Symbol → `str`, `Code` is a
+    str subclass, with-scope Code compares by its code string); a DBPointer or
+    undefined operand is a clean no-match. Under a collation the exotic-text
+    combination still defers to Python. Pinned by curated query-parity cases.
+  (The **`$min`/`$max` UPDATE** operators are now on the full `_bson_lt` port —
+  `order::bson_lt`, a single strict-less that needs none of `$sort`'s
+  transitivity guarantees — so bool / Decimal128 / NaN / Binary / Timestamp /
+  Regex / Min-MaxKey and the decoded exotic text types all compute on the Rust
+  engine; only a **DBPointer** operand still defers, because Python resolves it
+  with a type-*name* tiebreak not worth reproducing. Pinned by curated
+  update-parity cases.)
 - [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
   servers).**
   **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but
@@ -1536,26 +1536,15 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   both. `uniqueItems` uses MongoDB value equality, bridging cross-type-equal
   numerics recursively inside document/array elements — `[{a: 1}, {a: 1.0}]` and
   `[1, 1.0]` are both correctly treated as duplicates.)
-- [ ] **Error-code — unrecognized expression operator: mostly FIXED 2026-07-13;
-  one Rust-server residue.** For a genuinely nonexistent expression operator,
-  mongod returns a context-specific code. Now matched:
-  - **Query `$expr`** (`find({$expr: {$notreal: [...]}})`) → `168
-    InvalidPipelineOperator` "Unrecognized expression '$notreal'" on **both**
-    servers (was `14 TypeMismatch` on Python, generic `2 BadValue` on Rust). The
-    Rust side is an up-front parse-time check in `find.rs` driven by
-    `expressions::first_unknown_expr_operator` (a `KNOWN_EXPR_OPS` catalog pinned
-    to `apply_op` by a unit test), so only a truly-unknown `$`-operator is
-    flagged — a recognised-but-deferred operator still defers to Python.
-  - **Aggregation `$project`** (`{$project: {x: {$notreal: [...]}}}`) →
-    `Location31325` "Invalid $project :: caused by :: Unknown expression $notreal"
-    on the **Python server** (was `14 TypeMismatch`). **Rust residue:** the Rust
-    server still returns generic `2 BadValue` here — a faithful `$project` check
-    must distinguish the projection-only operators (`$slice` / `$elemMatch` /
-    `$meta`, which are valid inside `$project` and are NOT expression operators)
-    from genuine expressions, so a blanket `first_unknown_expr_operator` scan of a
-    `$project` spec would mislabel them. Deferred as the remaining piece; both
-    servers reject the query either way (no correctness/data issue). Confirmed by
-    three-way probe 2026-07-13.
+- [x] **Error-code — unrecognized expression operator: FIXED on both servers.**
+  Query `$expr` → `168 InvalidPipelineOperator` on both (find.rs parse-time
+  check via `expressions::first_unknown_expr_operator`); aggregation
+  `$project` → `Location31325` on both — the Rust server now runs a parse-time
+  `validate_project_exprs` scan that skips single-key projection-only
+  operators (`$slice` / `$elemMatch` / `$meta`) so they are never mislabeled,
+  and flags only a truly-unknown `$`-operator (a recognised-but-deferred one
+  still defers to Python). Pinned by
+  `test_rust_server_smoke.py::test_unknown_expression_operator_error_codes`.
 
 ### 7.6 Standalone `secantusdb` binary: CLI-flag conformance shipped (beta.96)
 
@@ -1570,15 +1559,9 @@ Storage knobs flow through `secantus_storage::wt_config(cache_size, session_max,
 sync_on_commit)` into `Storage::open_with_config`; oplog knobs via the existing
 setters; `--noop-heartbeat-seconds` and `[storage] ttl_sweep_seconds` drive
 background maintenance threads that observe a shutdown flag and are joined before
-teardown. Remaining, worth tracking:
-
-- [ ] **Embedded `RustServer` handle doesn't expose the WiredTiger knobs.** The
-  default cache now matches the rest of the stack (1G, via `wt_config(...)` in the
-  embedded constructor — beta.130), but the PyO3 lifecycle handle
-  (`crates/secantus-server-py`) still doesn't thread `cache_size` / `session_max` /
-  `sync_on_commit` through as constructor parameters, so a test that wants a
-  non-default cache via the embedded handle can't set it. Add the params when the
-  handle grows a config surface.
+teardown. (The embedded `RustServer` handle now exposes the same knobs —
+`cache_size` / `session_max` / `sync_on_commit` constructor parameters
+threading into `wt_config`.)
 ## SQL / PostgreSQL interface — P0 spike limitations
 
 - [ ] **Cross-type comparisons evaluate to false instead of erroring.** A per-row

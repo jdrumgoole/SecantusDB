@@ -601,10 +601,28 @@ fn compare_values(
         (Bson::Array(_), _) | (_, Bson::Array(_)) => return Ok(None),
         _ => {}
     }
-    // The exotic BSON types (JS code, symbol, dbpointer, undefined) aren't
-    // reproduced here — defer to the Python oracle.
+    // Exotic BSON types under a range operator. pymongo hands the Python
+    // engine plain `str` for a Symbol and the str-subclass `Code` for JS code
+    // (scope ignored), so the Python oracle compares those as strings —
+    // including cross Symbol/Code/String pairs. A DBPointer has no ordering in
+    // Python (TypeError) and undefined decodes to None: not comparable, clean
+    // no-match. Under a collation the string path above would have applied
+    // folding the exotic text skips, so defer that combination to Python.
     if is_exotic(a) || is_exotic(b) {
-        return Err(Fallback);
+        if coll.is_some() {
+            return Err(Fallback);
+        }
+        fn text_of(v: &Bson) -> Option<&str> {
+            match v {
+                Bson::String(s) | Bson::Symbol(s) | Bson::JavaScriptCode(s) => Some(s),
+                Bson::JavaScriptCodeWithScope(c) => Some(&c.code),
+                _ => None,
+            }
+        }
+        return Ok(match (text_of(a), text_of(b)) {
+            (Some(x), Some(y)) => Some(x.cmp(y)),
+            _ => None,
+        });
     }
     Ok(match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
