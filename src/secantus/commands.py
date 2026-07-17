@@ -2754,6 +2754,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                     collation=collation,
                     validator=validator_up,
                     journal=_wants_journal(doc),
+                    return_post_images=True,
                 )
             except DocumentValidationError as exc:
                 return {
@@ -2788,9 +2789,11 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             upserted_id = result["upserted_id"]
             value: Any = None
             if return_new and result["did_upsert"]:
-                new_docs = ctx.storage.find_matching(ctx.db_name, coll, {"_id": upserted_id})
+                # The post-image captured by the write itself — a re-``find``
+                # here races concurrent writers to the same doc.
+                new_docs = result.get("post_images") or []
                 if new_docs:
-                    value = new_docs[0]
+                    value = new_docs[-1]
                     if fields:
                         value = apply_projection(value, fields)
             return {
@@ -2858,7 +2861,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                 return verr
 
     try:
-        ctx.storage.update_matching(
+        update_result = ctx.storage.update_matching(
             ctx.db_name,
             coll,
             {"_id": matched_id},
@@ -2867,6 +2870,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             array_filters=array_filters,
             let=let,
             journal=_wants_journal(doc),
+            return_post_images=True,
         )
     except IndexConflict as exc:
         reply2: dict[str, Any] = {
@@ -2889,8 +2893,13 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
         }
 
     if return_new:
-        new_docs = ctx.storage.find_matching(ctx.db_name, coll, {"_id": matched_id})
-        value = new_docs[0] if new_docs else None
+        # Use the post-image the write itself produced (captured under the
+        # storage lock). A separate re-``find`` opens a race where a
+        # concurrent findAndModify's update lands in between and two clients
+        # are handed the same "new" document — fatal for the ticket-dispenser
+        # pattern findAndModify exists to serve.
+        post = update_result.get("post_images") or []
+        value = post[-1] if post else None
     else:
         value = matched_doc
 

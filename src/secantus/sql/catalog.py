@@ -565,7 +565,18 @@ class Catalog:
     def sequence_nextval(self, db: str, name: str) -> int:
         """Advance ``name`` and return its new value. The first ``nextval`` returns
         the sequence's ``start``; subsequent calls add ``increment`` (raising on
-        overflow past ``max_value`` unless ``cycle``, when it wraps to the bound)."""
+        overflow past ``max_value`` unless ``cycle``, when it wraps to the bound).
+
+        Serialized under the storage's statement-write lock: the read-advance-
+        persist below spans two storage calls, and a bare ``SELECT nextval(…)``
+        runs outside the DML executors, so two connections could otherwise draw
+        the same value. Lazy import — executor already imports this module."""
+        from secantus.sql.executor import _write_lock
+
+        with _write_lock(self._storage):
+            return self._sequence_nextval_locked(db, name)
+
+    def _sequence_nextval_locked(self, db: str, name: str) -> int:
         doc = self.get_sequence(db, name)
         if doc is None:
             raise errors.SQLError("42P01", f'relation "{name}" does not exist')

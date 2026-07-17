@@ -3581,3 +3581,46 @@ When you fix one of these, delete the line. When you discover a new one, add it 
   documented in docs/concurrency.md; lifting it is the
   tasks/wt-concurrency-plan.md end-game (and the Rust server's global
   write mutex is the equivalent lever there).
+
+## Concurrency races (found by the concurrent stress suites, 2026-07-16)
+
+Found by `tests/test_pgserver_concurrency.py` / `tests/test_rust_server_concurrency.py`
+/ `tests/test_python_server_fam_concurrency.py`; fixed items are recorded in that
+slice's changelog fragment. Still open:
+
+- [ ] **Rust findAndModify is not atomic across storage calls.** The command
+  layer composes find → update-by-`_id` → re-`find` (module caveat in
+  `crates/secantus-commands/src/findandmodify.rs`); a concurrent writer between
+  the update and the post-image re-read hands two clients the same `new: true`
+  document (measured: duplicate tickets under an 8-thread `$inc` dispenser —
+  `test_findandmodify_tickets_are_unique_and_complete` is xfail(strict=False)
+  until this lands). The Python server fixed the same race with
+  `Storage.update_matching(..., return_post_images=True)` (post-image captured
+  while the statement holds the storage lock); the Rust storage needs the same
+  primitive (extend `UpdateOutcome` with the post-image from
+  `update_matching_core`). The remove path has the sibling race: `delete_matching`'s
+  deleted-count is ignored, so two fam-removes can both claim the same pre-image.
+- [ ] **fam target selection doesn't re-assert the query at write time (both
+  servers).** findAndModify picks its target with a find, then updates/deletes by
+  bare `{_id}` — the original query is not re-checked under the write lock, so in
+  the job-queue pattern (`query: {state: "new"}, update: {$set: {state: "taken"}}`)
+  two clients can both "take" the same job (each update is a no-op for the query
+  but both see n:1). mongod re-evaluates the predicate when it acquires the write.
+  Fix: key the write on `{_id, $and: [query]}` and loop back to re-find on
+  matched=0. Same shape as the post-image fix; needs the retry loop.
+- [ ] **SQL UNIQUE constraints race across open transactions.** Statement-time
+  constraint probes read the session's snapshot, so two *open transactions* that
+  each insert the same UNIQUE value both pass the probe and both commit (the docs
+  have different `_id`s, so WiredTiger sees no write-write conflict). Real
+  Postgres blocks the second inserter on the index entry until the first commits.
+  The autocommit-vs-autocommit race is closed (the per-storage statement-write
+  lock in `sql/executor.py`); the cross-transaction case needs either commit-time
+  re-validation against committed state or storage-level unique indexes backing
+  SQL UNIQUE constraints.
+- [ ] **SQL advisory locks provide no cross-connection exclusion** (§ "Advisory
+  locks landed", #135): `pg_advisory_lock` is per-`Session` bookkeeping that always
+  grants, so two connections can hold the same exclusive lock concurrently — apps
+  using advisory locks for leader election / migration fencing (alembic, cron
+  fencing) get no mutual exclusion. A truthful implementation needs a server-wide
+  lock table (like `NotifyHub` / `PreparedXactRegistry`) with blocking waits and
+  deadlock detection.
