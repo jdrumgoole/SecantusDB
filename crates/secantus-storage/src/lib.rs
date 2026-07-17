@@ -1214,14 +1214,31 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
     Some((eq_fields, of, operator_ops.unwrap_or_default()))
 }
 
-/// WiredTiger-backed storage. A global lock serialises public methods, matching
-/// `storage.py`'s serialize-everything `RLock` discipline (the WiredTiger C-level
-/// concurrency story is unchanged; see `tasks/wt-bindings-plan.md`).
+/// `(index name, packed entry key)` pairs an update must insert or remove.
+type EntryOps = Vec<(String, Vec<u8>)>;
+
+/// WiredTiger-backed storage. A global lock serialises the public *write* and
+/// DDL methods (matching `storage.py`'s write discipline); read-only methods
+/// run lock-free — see `lock`'s invariants below.
 pub struct Storage {
     conn: Connection,
     /// The WiredTiger home (on-disk data) directory. Kept so `create_archive`
     /// can tar the consistent file set the `backup:` cursor enumerates.
     home: String,
+    /// Serialises writes and DDL. Read-only methods (`find_by_id`,
+    /// `find_matching_with`, the listers, planners and stats) deliberately do
+    /// NOT take it: they touch no shared Rust state (all mutable state lives
+    /// in WiredTiger tables, or under the dedicated `oplog` mutex), and each
+    /// call's own session gets a consistent MVCC view without blocking
+    /// writers. This is safe because (a) the storage schema is a FIXED set of
+    /// shared WT tables — DDL deletes rows, never drops tables, so a reader's
+    /// cursor can't have its table dropped out from under it; (b) index-routed
+    /// candidates are always re-verified by the exact matcher and doc fetches
+    /// tolerate not-found, so a write landing between an index walk and its
+    /// doc fetches can narrow but never corrupt a result (mongod's own
+    /// yield-and-refresh collscan semantics). A read method that starts
+    /// writing (e.g. anything calling `ensure_collection`) must take the lock
+    /// again — `collection_uuid` does.
     lock: Mutex<()>,
     /// Whether writes emit oplog entries (and the oplog tables are live). Mirrors
     /// `storage.enable_oplog`. Default `true`.
@@ -2119,7 +2136,7 @@ impl Storage {
     /// collection — change streams need it for `fullDocument: required` /
     /// `whenAvailable` (post-image) and `fullDocumentBeforeChange`.
     pub fn pre_post_images_enabled(&self, db: &str, coll: &str) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         pre_post_images_enabled(&session, db, coll)
     }
@@ -2670,7 +2687,7 @@ impl Storage {
 
     /// Fetch a document by `_id`. Returns its BSON bytes, or `None`.
     pub fn find_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<Option<Vec<u8>>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let key = id_key(id)?;
         let session = self.op_session()?;
         let cur = session.open_cursor(DOC_TABLE, None)?;
@@ -2684,7 +2701,7 @@ impl Storage {
 
     /// All documents of a collection in natural (`_id`) order, as BSON bytes.
     pub fn scan_collection(&self, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.op_session()?;
         let cur = session.open_cursor(DOC_TABLE, None)?;
         let mut out = Vec::new();
@@ -2753,14 +2770,16 @@ impl Storage {
         cur.set_value_u(&blob);
         cur.update()?;
 
-        // Maintain secondary indexes: retract the old doc's entries, write the
-        // new, and lazily flag any index the new doc makes multikey (sticky —
-        // the old doc's array-ness is never cleared).
+        // Maintain secondary indexes as a set diff (additions first, removals
+        // last — see `index_entry_diff` for why lock-free readers need that
+        // order), and lazily flag any index the new doc makes multikey
+        // (sticky — the old doc's array-ness is never cleared).
         if !descs.is_empty() {
             // `update_by_id` is a bare-`_id` path (not used for timeseries), so the
             // key is the canonical `id_key(_id)` — let the helper recompute it.
-            self.delete_index_entries(&session, db, coll, &old_doc, &descs, None)?;
-            self.write_index_entries(&session, db, coll, &doc, &descs, None)?;
+            let (additions, removals) = self.index_entry_diff(&old_doc, &doc, &descs, None)?;
+            self.insert_index_entries(&session, db, coll, &additions)?;
+            self.remove_index_entries(&session, db, coll, &removals)?;
             self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
         }
         // Oplog: a full-document replacement is op "u" with `o` = the new doc
@@ -2876,8 +2895,10 @@ impl Storage {
             if !expired {
                 continue;
             }
-            self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
-            self.delete_nat_entry(&session, db, coll, &id_k)?;
+            // Doc row first, entries after: a lock-free reader hitting a stale
+            // index/nat entry skips the not-found doc, whereas removing the
+            // entries first would make an index-routed read miss a still-live
+            // doc.
             doc_cur.reset()?;
             doc_cur.set_key_ssu(db, coll, &id_k);
             match doc_cur.remove() {
@@ -2885,6 +2906,8 @@ impl Storage {
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
             }
+            self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
+            self.delete_nat_entry(&session, db, coll, &id_k)?;
             pruned += 1;
         }
         Ok(pruned)
@@ -2919,7 +2942,7 @@ impl Storage {
     }
 
     pub fn collection_exists(&self, db: &str, coll: &str) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(COLL_TABLE, None)?;
         cur.set_key_ss(db, coll);
@@ -2932,7 +2955,7 @@ impl Storage {
 
     /// Collection names registered under `db`, in registry order.
     pub fn list_collections(&self, db: &str) -> Result<Vec<String>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(COLL_TABLE, None)?;
         let mut out = Vec::new();
@@ -2963,7 +2986,7 @@ impl Storage {
     /// when the oplog is enabled (mongod always exposes it). Sorted. Mirrors
     /// `storage.list_databases`.
     pub fn list_databases(&self) -> Result<Vec<String>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(COLL_TABLE, None)?;
         let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -3256,7 +3279,7 @@ impl Storage {
             o.insert("max", self.oplog_max_entries as i64);
             return Ok(o);
         }
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         Ok(coll_options(&session, db, coll)?.unwrap_or_default())
     }
@@ -3269,7 +3292,7 @@ impl Storage {
         if self.is_oplog_rs(db, coll) {
             return Ok(true);
         }
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         Ok(coll_options(&session, db, coll)?
             .map(|o| o.get_bool("capped").unwrap_or(false))
@@ -3280,7 +3303,7 @@ impl Storage {
     /// `dataSize` `collStats` reports). Best-effort — excludes WT block
     /// overhead. Mirrors `storage.collection_data_size`.
     pub fn collection_data_size(&self, db: &str, coll: &str) -> Result<i64> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let mut total = 0i64;
         for (_id_k, blob) in self.scan_docs(&session, db, coll)? {
@@ -3293,7 +3316,7 @@ impl Storage {
     /// `id_key` length over the doc table; each secondary index is its summed
     /// packed-entry length. Mirrors `storage.index_sizes`.
     pub fn index_sizes(&self, db: &str, coll: &str) -> Result<Document> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let mut out = Document::new();
         let mut id_size = 0i64;
@@ -3321,7 +3344,7 @@ impl Storage {
         coll: &str,
         after: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let rows = self.scan_docs(&session, db, coll)?;
         Ok(match after {
@@ -3338,7 +3361,7 @@ impl Storage {
     /// returned has been evicted (min `id_key` now exceeds the cursor's anchor),
     /// mongod kills the cursor with `CappedPositionLost`.
     pub fn collection_min_id_key(&self, db: &str, coll: &str) -> Result<Option<Vec<u8>>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let rows = self.scan_docs(&session, db, coll)?;
         Ok(rows.into_iter().map(|(k, _)| k).min())
@@ -3397,7 +3420,7 @@ impl Storage {
     /// defaulting to mongod's `level 0 / slowms 100 / sampleRate 1.0` when
     /// unset. Mirrors `storage.get_profile`.
     pub fn get_profile(&self, db: &str) -> Result<Document> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(PROFILE_TABLE, None)?;
         cur.set_key_s(db);
@@ -3743,11 +3766,12 @@ impl Storage {
         payload_doc.insert("options", Bson::Document(stored_options));
         let payload = encode_doc(&payload_doc)?;
 
-        c.reset()?;
-        c.set_key_sss(db, coll, name);
-        c.set_value_u(&payload);
-        c.insert()?;
-
+        // Backfill the entry rows BEFORE the registry row: lock-free readers
+        // route through an index the moment its registry row is visible, so
+        // the registry insert must be the commit point of a fully-built
+        // index — the reverse order let a reader route through a half-backfilled
+        // index and miss matching documents. (`drop_index` is the mirror
+        // image: registry row out first, then the entries.)
         let ec = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for (kb, id_k) in &entries {
             let packed = pack_entry(kb, id_k);
@@ -3756,6 +3780,11 @@ impl Storage {
             ec.set_value_u(b"");
             ec.insert()?;
         }
+
+        c.reset()?;
+        c.set_key_sss(db, coll, name);
+        c.set_value_u(&payload);
+        c.insert()?;
         // Oplog: a DDL `op: "c"` `createIndexes` entry so a `showExpandedEvents`
         // change stream surfaces a `createIndexes` event (the projector reads
         // `o.createIndexes` + `o.indexes[].{v,key,name}`).
@@ -3782,7 +3811,7 @@ impl Storage {
     /// `_id_` index first, then stored indexes), sorted by name. Empty when the
     /// collection doesn't exist. Mirrors `storage.list_indexes`.
     pub fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         if !collection_registered(&session, db, coll)? {
             return Ok(Vec::new());
@@ -3889,7 +3918,7 @@ impl Storage {
         coll: &str,
         name: &str,
     ) -> Result<Vec<Vec<Bson>>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let descs = self.index_descs(&session, db, coll)?;
         let desc = match descs.iter().find(|d| d.name == name) {
@@ -4344,8 +4373,8 @@ impl Storage {
                 break;
             }
             let doc = decode_doc(&blob)?;
-            self.delete_index_entries(session, db, coll, &doc, descs, Some(&id_k))?;
-            self.delete_nat_entry(session, db, coll, &id_k)?;
+            // Doc row first, entries after — see prune_ttl for the lock-free
+            // reader ordering rationale.
             doc_cur.reset()?;
             doc_cur.set_key_ssu(db, coll, &id_k);
             match doc_cur.remove() {
@@ -4353,6 +4382,8 @@ impl Storage {
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
             }
+            self.delete_index_entries(session, db, coll, &doc, descs, Some(&id_k))?;
+            self.delete_nat_entry(session, db, coll, &id_k)?;
             total -= blob.len() as i64;
             count -= 1;
             if oplog_on {
@@ -4419,6 +4450,42 @@ impl Storage {
     }
 
     /// Write `doc`'s index entries for every index in `indexes`.
+    /// Every packed entry key `doc` contributes to `desc` (2d cell, 2dsphere
+    /// covering cells, or the regular sparse/partial-gated key variants). The
+    /// single source of truth for write / delete / diff maintenance — writing
+    /// and retracting MUST enumerate identically or entries leak.
+    fn packed_entry_keys(
+        &self,
+        doc: &Document,
+        desc: &IndexDesc,
+        id_k: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        // 2d geo index: one cell entry per point-valued field (point-only).
+        if let Some(geo) = &desc.geo_2d {
+            if let Some(kb) = get_path(doc, &geo.field).and_then(|v| geo.cell_kb(v)) {
+                out.push(pack_entry(&kb, id_k));
+            }
+            return Ok(out);
+        }
+        // 2dsphere S2 index: covering cells + ancestors per geometry field.
+        if let Some(gs) = &desc.geo_sphere {
+            if let Some(v) = get_path(doc, &gs.field) {
+                for kb in gs.cell_kbs(v) {
+                    out.push(pack_entry(&kb, id_k));
+                }
+            }
+            return Ok(out);
+        }
+        if !self.doc_in_partial(doc, desc)? {
+            return Ok(out);
+        }
+        for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
+            out.push(pack_entry(&kb, id_k));
+        }
+        Ok(out)
+    }
+
     fn write_index_entries(
         &self,
         session: &Session,
@@ -4436,35 +4503,7 @@ impl Storage {
         let id_k = doc_table_key(doc, id_key_override)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
-            // 2d geo index: one cell entry per point-valued field (point-only).
-            if let Some(geo) = &desc.geo_2d {
-                if let Some(kb) = get_path(doc, &geo.field).and_then(|v| geo.cell_kb(v)) {
-                    let packed = pack_entry(&kb, &id_k);
-                    cur.reset()?;
-                    cur.set_key_sssu(db, coll, &desc.name, &packed);
-                    cur.set_value_u(b"");
-                    cur.insert()?;
-                }
-                continue;
-            }
-            // 2dsphere S2 index: covering cells + ancestors per geometry field.
-            if let Some(gs) = &desc.geo_sphere {
-                if let Some(v) = get_path(doc, &gs.field) {
-                    for kb in gs.cell_kbs(v) {
-                        let packed = pack_entry(&kb, &id_k);
-                        cur.reset()?;
-                        cur.set_key_sssu(db, coll, &desc.name, &packed);
-                        cur.set_value_u(b"");
-                        cur.insert()?;
-                    }
-                }
-                continue;
-            }
-            if !self.doc_in_partial(doc, desc)? {
-                continue;
-            }
-            for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
-                let packed = pack_entry(&kb, &id_k);
+            for packed in self.packed_entry_keys(doc, desc, &id_k)? {
                 cur.reset()?;
                 cur.set_key_sssu(db, coll, &desc.name, &packed);
                 cur.set_value_u(b"");
@@ -4492,39 +4531,7 @@ impl Storage {
         let id_k = doc_table_key(doc, id_key_override)?;
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
-            if let Some(geo) = &desc.geo_2d {
-                if let Some(kb) = get_path(doc, &geo.field).and_then(|v| geo.cell_kb(v)) {
-                    let packed = pack_entry(&kb, &id_k);
-                    cur.reset()?;
-                    cur.set_key_sssu(db, coll, &desc.name, &packed);
-                    match cur.remove() {
-                        Ok(()) => {}
-                        Err(e) if e.is_not_found() => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                continue;
-            }
-            if let Some(gs) = &desc.geo_sphere {
-                if let Some(v) = get_path(doc, &gs.field) {
-                    for kb in gs.cell_kbs(v) {
-                        let packed = pack_entry(&kb, &id_k);
-                        cur.reset()?;
-                        cur.set_key_sssu(db, coll, &desc.name, &packed);
-                        match cur.remove() {
-                            Ok(()) => {}
-                            Err(e) if e.is_not_found() => {}
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                }
-                continue;
-            }
-            if !self.doc_in_partial(doc, desc)? {
-                continue;
-            }
-            for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
-                let packed = pack_entry(&kb, &id_k);
+            for packed in self.packed_entry_keys(doc, desc, &id_k)? {
                 cur.reset()?;
                 cur.set_key_sssu(db, coll, &desc.name, &packed);
                 match cur.remove() {
@@ -4532,6 +4539,92 @@ impl Storage {
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Index maintenance for an update: the set difference between the old and
+    /// new doc's packed entry keys, per index. Unchanged keys get NO WT
+    /// operations — which is both the fast path (a `$set` of an unindexed
+    /// field touches no entries at all) and the correctness path for
+    /// lock-free readers: the old delete-everything-then-rewrite scheme
+    /// opened a window where a doc vanished from an index whose value the
+    /// update never changed. Callers insert `additions` before or right after
+    /// the doc-row write and remove `removals` last, so an interleaving
+    /// reader only ever sees a superset (deduped and re-verified by the
+    /// matcher), never a missing entry for a committed doc.
+    fn index_entry_diff(
+        &self,
+        old_doc: &Document,
+        new_doc: &Document,
+        descs: &[IndexDesc],
+        id_key_override: Option<&[u8]>,
+    ) -> Result<(EntryOps, EntryOps)> {
+        let mut additions = Vec::new();
+        let mut removals = Vec::new();
+        if descs.is_empty() {
+            return Ok((additions, removals));
+        }
+        let old_k = doc_table_key(old_doc, id_key_override)?;
+        let new_k = doc_table_key(new_doc, id_key_override)?;
+        for desc in descs {
+            let old_keys: HashSet<Vec<u8>> = self
+                .packed_entry_keys(old_doc, desc, &old_k)?
+                .into_iter()
+                .collect();
+            let new_keys: HashSet<Vec<u8>> = self
+                .packed_entry_keys(new_doc, desc, &new_k)?
+                .into_iter()
+                .collect();
+            for packed in new_keys.difference(&old_keys) {
+                additions.push((desc.name.clone(), packed.clone()));
+            }
+            for packed in old_keys.difference(&new_keys) {
+                removals.push((desc.name.clone(), packed.clone()));
+            }
+        }
+        Ok((additions, removals))
+    }
+
+    fn insert_index_entries(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        items: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (name, packed) in items {
+            cur.reset()?;
+            cur.set_key_sssu(db, coll, name, packed);
+            cur.set_value_u(b"");
+            cur.insert()?;
+        }
+        Ok(())
+    }
+
+    fn remove_index_entries(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        items: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (name, packed) in items {
+            cur.reset()?;
+            cur.set_key_sssu(db, coll, name, packed);
+            match cur.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(())
@@ -4824,7 +4917,7 @@ impl Storage {
         coll: &str,
         name: &str,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         scan.set_key_sssu(db, coll, name, b"");
@@ -4885,7 +4978,7 @@ impl Storage {
         if self.is_oplog_rs(db, coll) {
             return self.find_oplog_rs(filter, sort, coll_opt, vars);
         }
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.op_session()?;
         let (sort_field, sort_dir) = single_sort_spec(sort);
         let mut in_sort_order = false;
@@ -5034,7 +5127,7 @@ impl Storage {
                 .find_oplog_rs(filter, None, coll_opt, &Document::new())?
                 .len());
         }
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.op_session()?;
         if filter.is_empty() {
             return Ok(self.scan_docs(&session, db, coll)?.len());
@@ -5243,13 +5336,18 @@ impl Storage {
                 }
                 modified += 1;
                 // The doc stays at its existing key (`id_k`, suffixed for
-                // timeseries), so retract/write entries against that exact key.
-                self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
+                // timeseries). Entry maintenance is a set diff: additions land
+                // before the doc-row write and removals after, so a lock-free
+                // reader interleaving here sees at worst a superset (see
+                // `index_entry_diff`), never a missing entry for this doc.
+                let (additions, removals) =
+                    self.index_entry_diff(&doc, &new, &descs, Some(&id_k))?;
+                self.insert_index_entries(&session, db, coll, &additions)?;
                 let cur = session.open_cursor(DOC_TABLE, None)?;
                 cur.set_key_ssu(db, coll, &id_k);
                 cur.set_value_u(&new_blob);
                 cur.update()?;
-                self.write_index_entries(&session, db, coll, &new, &descs, Some(&id_k))?;
+                self.remove_index_entries(&session, db, coll, &removals)?;
                 self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
                 if oplog_on {
                     let o_field = if is_replacement {
@@ -5401,11 +5499,13 @@ impl Storage {
             {
                 continue;
             }
-            self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
-            self.delete_nat_entry(&session, db, coll, &id_k)?;
+            // Doc row first, entries after — see prune_ttl for the lock-free
+            // reader ordering rationale.
             let cur = session.open_cursor(DOC_TABLE, None)?;
             cur.set_key_ssu(db, coll, &id_k);
             cur.remove()?;
+            self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
+            self.delete_nat_entry(&session, db, coll, &id_k)?;
             deleted += 1;
             if oplog_on {
                 let mut o = Document::new();
@@ -5453,7 +5553,7 @@ impl Storage {
         sort: Option<&Document>,
         hint: Option<&Hint>,
     ) -> Result<ExplainPlan> {
-        let _g = self.lock.lock().unwrap();
+        // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let (sort_field, sort_dir) = single_sort_spec(sort);
 
