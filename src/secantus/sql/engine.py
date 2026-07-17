@@ -1198,10 +1198,9 @@ def _describe_statement(
                 query.set("expressions", [exp.column(tdef.columns[0].name)])
             if planner._stmt_needs_evaluation(query):
                 eval_plan = planner._build_evaluated_single(query, tdef)
-                return [
-                    ColumnDesc(name, tag, typemap.PG_OID.get(tag, 25))
-                    for name, tag in eval_plan.out_columns
-                ]
+                return executor._tagged_out_column_descs(
+                    eval_plan.out_columns, eval_plan.out_enum_types, storage, db
+                )
             srf_plan = planner.plan_select(query, tdef)
         except (errors.SQLError, TypeError, ValueError):
             return None
@@ -1217,7 +1216,9 @@ def _describe_statement(
         ]
     if planner.select_needs_pipeline(stmt):
         pplan = planner.plan_pipeline_select(stmt, db, catalog, storage)
-        return [ColumnDesc(n, t, typemap.PG_OID.get(t, 25)) for n, t in pplan.out_columns]
+        return executor._tagged_out_column_descs(
+            pplan.out_columns, pplan.out_enum_types, storage, db
+        )
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None
     vtable = virtual.lookup(schema_name, table_node.name)

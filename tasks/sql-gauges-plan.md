@@ -561,6 +561,25 @@ transaction characteristics 14, untyped-binary Parse-time inference ~10,
 plus residual edges (custom-range quoting ×3, composite binary samples ×4,
 suite-order singles).
 
+**Sixth round: enum OIDs through every plan shape + enum-array columns.**
+The pipeline/evaluated planners flatten output columns to string type tags,
+so GROUP BY keys, JOIN projections, DISTINCT, and per-row-evaluated selects
+described enum columns as text (25); the enum identity now travels in a
+parallel `out_enum_types` position map (populated by the DISTINCT / group /
+join / evaluated builders, resolved by a shared `_tagged_out_column_descs`
+in both Execute and Describe). `array['sad'::mood, …]` constructors report
+the array-companion OID; `mood[]` table columns (previously rejected as
+`unsupported column type`) store text arrays with per-element 22P02 label
+validation and describe with the array OID. Full-gauge deterministic A/B:
+**3764 / 91.2% → 3765 / 91.3%** — the visible fixes are
+`test_prepared.py::test_change_type_execute{,many}` (they exercise enum-array
+table columns); the plan-shape OID work is correctness beyond the gauge's
+coverage (registered psycopg loaders now fire on grouped/joined results).
+Gauge-runner observation for a future round: the `test_cursor_client.py::
+test_leak[asyncio-*]` family flips parametrizations every run around a
+persistent `FeatureNotSupported: unsupported value expression` — one
+dedicated investigation would stabilise ~5 flapping tests.
+
 **Second slice (same day, PR pending): 19/26 → 22/26.** HAVING grew
 `IS [NOT] NULL` (bare / aggregate / computed group-key operands, exact under
 any NOT nesting), three-valued `[NOT] IN` over group keys, and always-unknown
