@@ -142,6 +142,20 @@ def test_size() -> None:
     assert not matches({"tags": "abc"}, {"tags": {"$size": 3}})
 
 
+def test_size_argument_validation() -> None:
+    """$size validates its argument like mongod 7.0.12: an integer-valued float
+    is accepted (2.0 == 2); a non-integer float, a negative value, a string, or
+    a bool each raise a parse error (previously a negative silently no-matched,
+    a bool was accepted as 1, and 2.0 was wrongly rejected)."""
+    # Integer-valued float accepted.
+    assert matches({"a": [1, 2]}, {"a": {"$size": 2.0}})
+    assert not matches({"a": [1]}, {"a": {"$size": 2.0}})
+    # Each invalid argument raises.
+    for bad in (-1, 2.5, "2", True):
+        with pytest.raises(QueryError):
+            matches({"a": [1, 2]}, {"a": {"$size": bad}})
+
+
 def test_all() -> None:
     assert matches({"tags": ["a", "b", "c"]}, {"tags": {"$all": ["a", "b"]}})
     assert not matches({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}})
