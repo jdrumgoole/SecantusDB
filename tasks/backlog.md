@@ -1103,7 +1103,16 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   Python). Parity pinned by `tests/test_rust_update_parity.py` (curated +
   6000-case fuzz).
 - [ ] **Widen the Rust update operators (Rust server)** — remaining defers where
-  faithful. **Done (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
+  faithful. **`$inc`/`$mul` non-number operand fixed** (2026-07-18, found by the
+  R8 update-op triage): both servers wrongly COMPUTED with a bool operand
+  (`5 + True = 6`, `5 * False = 0` — the recurring `bool`-is-`int` root cause)
+  and Python raw-raised `ValueError`/`TypeError` on a string/null operand.
+  Both now reject a non-number operand: the Python server raises mongod's exact
+  `code 14 "Cannot increment/multiply with non-numeric argument: {field: value}"`;
+  the Rust server surfaces `BadValue` (the standing update error-code gap — the
+  pure core returns a code-less `Fallback`, same as null-field `$inc`), but the
+  correctness contract (reject, don't compute) now holds on both, three-way
+  mongod-verified. **Done (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and
   structural equality via `expressions::py_eq`); `$bit`, `$each` (for `$push` /

@@ -204,6 +204,15 @@ use crate::paths::unset_path;
 
 /// `current <op> operand` with Python's numeric semantics. `mul=false` adds.
 fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
+    // A bool `$inc`/`$mul` argument is NOT a number for mongod (it errors with
+    // "Cannot increment/multiply with non-numeric argument", code 14) — but
+    // `as_int_like` treats bool as 0/1, which would silently compute. Defer so
+    // the operand is rejected instead. (The Python server raises code 14; the
+    // Rust server surfaces a generic BadValue — the standing update error-code
+    // gap. String / null operands already fall through to Fallback below.)
+    if matches!(operand, Bson::Boolean(_)) {
+        return Err(Fallback);
+    }
     // Decimal128 has no Python arithmetic support (raises) -> defer.
     if matches!(current, Bson::Decimal128(_)) || matches!(operand, Bson::Decimal128(_)) {
         return Err(Fallback);

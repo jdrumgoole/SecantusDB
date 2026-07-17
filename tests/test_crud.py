@@ -4287,3 +4287,21 @@ def test_query_size_validation(coll) -> None:
         with pytest.raises(pymongo.errors.OperationFailure) as exc:
             list(coll.find({"a": {"$size": bad}}))
         assert exc.value.code == 2, bad
+
+
+def test_update_inc_mul_non_numeric_operand(coll) -> None:
+    """$inc / $mul by a non-number is rejected (code 14) over the wire on the
+    Python server, matching mongod — not silently computed."""
+    import pymongo
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for op in ("$inc", "$mul"):
+        for operand in (True, "x", None):
+            with pytest.raises(pymongo.errors.OperationFailure) as exc:
+                coll.update_one({"_id": 1}, {op: {"n": operand}})
+            assert exc.value.code == 14, (op, operand)
+    # The document is untouched by the rejected updates.
+    assert coll.find_one({"_id": 1})["n"] == 5
+    # A valid $inc still applies.
+    coll.update_one({"_id": 1}, {"$inc": {"n": 3}})
+    assert coll.find_one({"_id": 1})["n"] == 8

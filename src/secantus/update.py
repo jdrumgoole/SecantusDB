@@ -15,6 +15,36 @@ class UpdateError(Exception):
         self.code = code
 
 
+def _render_bson_scalar(v: Any) -> str:
+    """A mongod-ish rendering of a scalar for an error message: ``true`` /
+    ``false`` / ``null`` lowercase, strings double-quoted, else ``str()``."""
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if v is None:
+        return "null"
+    if isinstance(v, str):
+        return f'"{v}"'
+    return str(v)
+
+
+def _require_numeric_operand(verb: str, path: str, value: Any) -> None:
+    """mongod rejects ``$inc``/``$mul`` by a non-number with code 14, e.g.
+    ``Cannot increment with non-numeric argument: {n: true}``. bool is NOT a
+    number here (Python's ``bool`` is an ``int`` subclass, so ``5 + True`` would
+    otherwise compute); string / null / etc. also error rather than raising a
+    raw ``ValueError``/``TypeError`` from the arithmetic. Probed vs mongod
+    7.0.12."""
+    from bson import Decimal128
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal128)):
+        raise UpdateError(
+            f"Cannot {verb} with non-numeric argument: {{{path}: {_render_bson_scalar(value)}}}",
+            code=14,
+        )
+
+
 # The update modifiers ``_apply_op`` knows how to apply. Used by
 # ``validate_update_doc`` to reject an unknown modifier at parse time
 # (mongod validates the update before matching any documents, so an
@@ -413,6 +443,7 @@ def _apply_op(
                 raise UpdateError(f"$currentDate option for {path!r} not understood")
     elif op == "$inc":
         for path, delta in payload.items():
+            _require_numeric_operand("increment", path, delta)
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 # A missing field is treated as 0 (mongod applies the delta),
                 # but a field present with an explicit ``null`` (or any other
@@ -435,6 +466,7 @@ def _apply_op(
                 set_path(doc, concrete, bson_add(current, delta))
     elif op == "$mul":
         for path, factor in payload.items():
+            _require_numeric_operand("multiply", path, factor)
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 if not has_path(doc, concrete):
                     current = 0
