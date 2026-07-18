@@ -18,13 +18,20 @@ on:
       - 'LICENSE*'
       - 'docs/**'
   # Weekly full-matrix run: every Monday 06:00 UTC, exercises all
-  # supported CPython versions (3.10–3.13) across Linux/Windows.
+  # supported CPython versions (3.10–3.13) across Linux/Windows, PLUS macOS.
   # Push/PR runs only test 3.10 on each OS to keep latency tight; this
   # cron catches version-specific regressions before they accumulate.
-  # macOS is intentionally excluded from this CI workflow — its runners
-  # build vendored WiredTiger from source on a slow, contended pool (10–40+
-  # min, occasionally hanging), which is too costly to gate every push/PR on.
-  # macOS wheels are still built and validated at release time (publish.yml).
+  #
+  # macOS is CRON-ONLY, never push/PR. Its runners build vendored WiredTiger
+  # from source on a slow, contended pool (10–40+ min, occasionally hanging),
+  # which is too costly to gate every push/PR on — it would be the critical
+  # path several times over. Note that is a BUILD-cost problem, not a test
+  # problem: 9e16e49 removed macOS for runner cost, not for any macOS test
+  # failure. Weekly is nearly free and covers what daily macOS development does
+  # NOT: the durable/checkpoint path (local dev runs under
+  # SECANTUS_TEST_FAST_STORAGE=1) and the mongosh / node / java CLI-tool tests
+  # (which skip wherever the toolchain is absent, including a normal Mac).
+  # macOS wheels are additionally built and validated at release (publish.yml).
   schedule:
     - cron: '0 6 * * 1'
   # Manual full-matrix trigger from the Actions tab. Same effect as the
@@ -44,16 +51,15 @@ permissions:
 
 jobs:
   test:
-    # The Linux lane. Windows runs as the sharded ``test-windows`` job below;
-    # macOS is excluded from CI entirely — built at release only (see
-    # top-of-file note).
-    runs-on: ubuntu-latest
+    # The Linux lane on push / PR. Windows runs as the sharded ``test-windows``
+    # job below; macOS joins THIS job's matrix on the weekly cron only (see the
+    # ``os`` matrix entry).
+    runs-on: ${{ matrix.os }}
     # The whole suite runs in ~4 min locally; 30 min is generous for CI. Without
     # this, a hung run (a daemon/thread not reaped — historically a rust-server
     # stop() / change-stream-tail wedge, see the faulthandler watchdog in
     # tests/conftest.py) blocks the runner until GitHub's 6-hour kill with no
-    # diagnostics. macOS is dropped from this matrix for the same flakiness
-    # (9e16e49); the cap also protects the release-time macOS run.
+    # diagnostics. The cap also protects the release-time macOS run.
     # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
     # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
     # (3.12); without it, a bare `uv run` after the sync re-resolves against
@@ -62,17 +68,55 @@ jobs:
     # same mechanism that made every matrix cell silently test 3.12 before.
     env:
       UV_PYTHON: ${{ matrix.python-version }}
-    timeout-minutes: 30
+    # 30 min suffices for Linux, but a macOS cell builds vendored WiredTiger
+    # from source on a contended pool (10-40+ min per 9e16e49) BEFORE it runs a
+    # test, so the cron cells need a much larger cap.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 90 || 30 }}
     strategy:
       fail-fast: false
       matrix:
         # Push / PR: 3.10 only (fast feedback). Schedule / workflow_dispatch:
         # full version sweep.
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
+        # macOS runs on the WEEKLY CRON ONLY, never on push / PR. It was dropped
+        # from continuous CI in 9e16e49 because its runners build vendored
+        # WiredTiger from source on a scarce, contended pool — routinely 10-40+
+        # min and occasionally hanging. That is a BUILD-cost problem, not a test
+        # problem: no macOS test failure motivated the removal. Gating every PR
+        # on a 10-40 min build is still not worth it (it would be the critical
+        # path several times over), but running it weekly is nearly free and
+        # closes two gaps that "we develop on macOS" does NOT cover:
+        #
+        #   * durability — local dev runs under SECANTUS_TEST_FAST_STORAGE=1, so
+        #     the checkpoint path is never exercised on macOS by anyone.
+        #   * toolchain-dependent tests — the mongosh / node / java smokes skip
+        #     wherever the toolchain is absent, which includes a normal Mac.
+        #
+        # Release-time wheel builds don't cover either: they build and smoke the
+        # wheel, they don't run the durable suite.
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","macos-14"]' || '["ubuntu-latest"]') }}
         # Sharded two ways for the same reason ``test-windows`` is (see that
         # job): unsharded, this lane's ~15 min pytest step was the whole
         # workflow's critical path. Same complete-by-construction split.
         shard: [sql, core]
+        exclude:
+          # macOS runs on ONE interpreter, not the full sweep. The gap macOS
+          # closes is OS-specific (durability, filesystem semantics, CLI-tool
+          # toolchain) — none of it interacts with the CPython version, so the
+          # other three cells would pay a 10-40 min source build each to re-prove
+          # the same thing. Dropping them takes the cron from 16 macOS cells to 4,
+          # which also keeps it inside the free tier's macOS concurrency cap.
+          #
+          # 3.12 rather than the lane's usual 3.10: it is the repo's pinned dev
+          # interpreter (.python-version), so a macOS cron failure reproduces
+          # directly on a developer's Mac with no version juggling.
+          # No-ops on push / PR, where macos-14 is not in the matrix at all.
+          - os: macos-14
+            python-version: "3.10"
+          - os: macos-14
+            python-version: "3.11"
+          - os: macos-14
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
@@ -87,6 +131,12 @@ jobs:
           git submodule update --init vendor/wiredtiger
 
       - name: Start disk reclaim (background)
+        # Linux-only: the paths below are the GitHub ubuntu image's preinstalled
+        # toolchains, and the macOS runner has neither them nor the same disk
+        # pressure. Gating matters — the paired barrier step below waits on this
+        # step's sentinel, so leaving it ungated would make every macOS cell
+        # block for the full 180s timeout and then fail.
+        if: runner.os == 'Linux'
         # The durable-storage lane (ubuntu only) keeps thousands of on-disk
         # WiredTiger homes for the whole session — tmp_path_retention_policy is
         # pinned to "all" because deleting a passed test's WT home mid-session
@@ -113,7 +163,7 @@ jobs:
           ' > /tmp/disk-reclaim.log 2>&1 &
           echo "reclaim detached as pid $!"
 
-      - name: Install toolchain and MongoDB CLI tools
+      - name: Install toolchain and MongoDB CLI tools (Linux)
         # swig (for the vendored WT build) plus mongosh + Database Tools so the
         # CLI-tool conformance tests (tests/test_mongosh.py,
         # test_mongodump_restore.py, test_mongoimport_export.py,
@@ -126,11 +176,35 @@ jobs:
         # Registering the MongoDB repo BEFORE the single ``apt-get update``
         # merges what used to be two separate update+install steps — the second
         # ``apt-get update`` was re-fetching every index for no new information.
+        if: runner.os == 'Linux'
         run: |
           curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
           echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
           sudo apt-get update
           sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
+
+      - name: Install toolchain and MongoDB CLI tools (macOS)
+        # The macOS half of the step above. Installing mongosh + Database Tools
+        # here is the POINT of the cron macOS cell, not incidental: those CLI
+        # conformance tests skip on a bare Mac, so they are exactly the coverage
+        # a developer's local run does not provide.
+        #
+        # clang comes from the Xcode command line tools already on the runner;
+        # swig is what the vendored WT build needs on top.
+        if: runner.os == 'macOS'
+        run: |
+          brew install swig
+          brew tap mongodb/brew
+          # Homebrew now refuses to load formulae from an untrusted third-party
+          # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
+          # from untrusted tap"), which fails the step outright. Trust the two
+          # formulae we actually use, NOT the whole tap: `brew trust mongodb/brew`
+          # would also bless every future formula the tap ever ships. The
+          # HOMEBREW_NO_REQUIRE_TAP_TRUST=1 escape hatch is wider still and brew
+          # itself flags it as not recommended.
+          brew trust --formula mongodb/brew/mongosh
+          brew trust --formula mongodb/brew/mongodb-database-tools
+          brew install mongosh mongodb-database-tools
 
       - name: Install uv
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
@@ -155,13 +229,14 @@ jobs:
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
       # Lint / format are platform- AND shard-independent: pin them to the
-      # ``core`` shard so sharding doesn't run them twice per push.
+      # ``core`` shard on Linux so neither sharding nor the cron's extra OS /
+      # python cells re-run them.
       - name: Lint
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core' && runner.os == 'Linux'
         run: uv run ruff check src tests
 
       - name: Format check
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core' && runner.os == 'Linux'
         run: uv run ruff format --check src tests
 
       - name: Wait for disk reclaim
@@ -170,6 +245,11 @@ jobs:
         # whatever is left of it (usually nothing; the apt/uv/sync steps have
         # already covered the ~87s). Fail loudly rather than starting a suite
         # that would die with "No space left on device" halfway through.
+        #
+        # Must carry the SAME Linux gate as the step that arms the sentinel;
+        # otherwise a macOS cell waits the full 180s for a file that is never
+        # written and then fails the job.
+        if: runner.os == 'Linux'
         run: |
           for _ in $(seq 1 180); do
             [ -f /tmp/disk-reclaim.done ] && break
@@ -319,7 +399,7 @@ jobs:
   # job boundary moved. Setup cost (~3 min) is paid once more in exchange for
   # taking ~11 min off the workflow's critical path.
   test-durable:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     # Make EVERY uv invocation in the job (sync + each `uv run`) resolve the
     # MATRIX interpreter. UV_PYTHON outranks the repo's `.python-version` pin
     # (3.12); without it, a bare `uv run` after the sync re-resolves against
@@ -328,16 +408,32 @@ jobs:
     # same mechanism that made every matrix cell silently test 3.12 before.
     env:
       UV_PYTHON: ${{ matrix.python-version }}
-    timeout-minutes: 30
+    # See the ``test`` job: the cron's macOS cells pay a 10-40 min source build
+    # of vendored WiredTiger before the first test runs.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 90 || 30 }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
+        # macOS on the weekly cron only — see the ``test`` job's ``os`` entry for
+        # the full rationale. THIS lane is the one that matters most for the
+        # macOS gap: it is the only place the checkpoint-durability path runs at
+        # all (local dev is SECANTUS_TEST_FAST_STORAGE=1), so without it macOS
+        # durability behaviour is exercised by nobody, anywhere.
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","macos-14"]' || '["ubuntu-latest"]') }}
         # Sharded for the same reason the ``test`` job is — the durable pass
         # re-runs the whole suite, so unsharded it was the second-longest job
         # (~12 min of pytest) and would have become the critical path the
         # moment ``test`` was split.
         shard: [sql, core]
+        exclude:
+          # macOS on one interpreter only — see the ``test`` job's twin block.
+          - os: macos-14
+            python-version: "3.10"
+          - os: macos-14
+            python-version: "3.11"
+          - os: macos-14
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
@@ -349,6 +445,9 @@ jobs:
           git submodule update --init vendor/wiredtiger
 
       - name: Start disk reclaim (background)
+        # Linux-only — see the ``test`` job's twin step for why the gate is
+        # load-bearing (the barrier below waits on this step's sentinel).
+        if: runner.os == 'Linux'
         # The durable lane keeps thousands of on-disk WiredTiger homes for the
         # whole session (tmp_path_retention_policy is pinned to "all" — see the
         # ``test`` job's twin step and tests/conftest.py) and tipped over the
@@ -364,16 +463,34 @@ jobs:
           ' > /tmp/disk-reclaim.log 2>&1 &
           echo "reclaim detached as pid $!"
 
-      - name: Install toolchain and MongoDB CLI tools
+      - name: Install toolchain and MongoDB CLI tools (Linux)
         # Same rationale as the ``test`` job: without mongosh + Database Tools
         # the CLI-tool conformance tests skip, and the durable pass must cover
         # exactly what the fast pass covers. Single ``apt-get update`` for the
         # same reason too.
+        if: runner.os == 'Linux'
         run: |
           curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
           echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
           sudo apt-get update
           sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
+
+      - name: Install toolchain and MongoDB CLI tools (macOS)
+        # macOS half — see the ``test`` job's twin.
+        if: runner.os == 'macOS'
+        run: |
+          brew install swig
+          brew tap mongodb/brew
+          # Homebrew now refuses to load formulae from an untrusted third-party
+          # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
+          # from untrusted tap"), which fails the step outright. Trust the two
+          # formulae we actually use, NOT the whole tap: `brew trust mongodb/brew`
+          # would also bless every future formula the tap ever ships. The
+          # HOMEBREW_NO_REQUIRE_TAP_TRUST=1 escape hatch is wider still and brew
+          # itself flags it as not recommended.
+          brew trust --formula mongodb/brew/mongosh
+          brew trust --formula mongodb/brew/mongodb-database-tools
+          brew install mongosh mongodb-database-tools
 
       - name: Install uv
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
@@ -390,7 +507,9 @@ jobs:
       - name: Slow tests
         # Long-running stress / scaling tests carry ``@pytest.mark.slow`` and are
         # excluded from the default suite (addopts ``-m 'not ... slow'``) to keep
-        # the inner loop fast. Run them here — once, on Linux — so the races they guard (the xdist-worker-crash
+        # the inner loop fast. Run them here — once per OS in the matrix, so
+        # Linux on every push and macOS additionally on the weekly cron — so the
+        # races they guard (the xdist-worker-crash
         # teardown drain in test_server_shutdown; the WT concurrency-ceiling
         # benchmark in test_concurrency) stay covered instead of running nowhere.
         # A command-line ``-m slow`` overrides the addopts marker filter while
@@ -403,7 +522,9 @@ jobs:
         run: uv run python -m pytest -m slow --timeout=120 --timeout-method=thread --max-worker-restart=3
 
       - name: Wait for disk reclaim
-        # Barrier for the backgrounded reclaim — see the ``test`` job's twin.
+        # Barrier for the backgrounded reclaim — see the ``test`` job's twin,
+        # including why this carries the same Linux gate as the arming step.
+        if: runner.os == 'Linux'
         run: |
           for _ in $(seq 1 180); do
             [ -f /tmp/disk-reclaim.done ] && break
@@ -599,11 +720,21 @@ jobs:
   # `test` matrix and wheels.yml.
   storage-engine:
     runs-on: ${{ matrix.os }}
+    # Previously uncapped, so a wedged job could burn the runner until GitHub's
+    # 6-hour kill. That mattered little at ~12 min on Linux/Windows, but the
+    # cron's macOS cell builds WiredTiger from source on a pool where hangs are
+    # exactly the documented failure mode (9e16e49), so cap it explicitly.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        # macOS excluded — built at release only (see top-of-file note).
-        os: [ubuntu-latest, windows-latest]
+        # macOS joins on the weekly cron only — see the ``test`` job's ``os``
+        # entry. This lane bundles the Rust storage engine behind the build
+        # flag, so it is the heaviest source build of the three; keeping it off
+        # the push/PR path is what makes the macOS coverage affordable. The
+        # ``Install toolchain (macOS)`` step below exists for exactly these
+        # cells (it was unreachable while this matrix was Linux + Windows only).
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || '["ubuntu-latest","windows-latest"]') }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
