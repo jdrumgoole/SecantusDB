@@ -39,18 +39,20 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   null/missing instead of raising. Both engines. (Rust min/max over mixed types now
   computes via `order::bson_lt` rather than deferring.)
 - **Uncaught Python exceptions leak (`code=None`)** — surface as generic errors, not
-  mongod's BadValue: `$pow:[2,"x"]` (TypeError), `$pow:[0,-1]` (ZeroDivisionError),
-  `$abs`/`$ceil`/`$floor`/`$sqrt`/`$exp` on string (TypeError), `$split` empty-sep
-  (ValueError), `$in`/`$nin` non-array (TypeError), `$regex` non-string `$options`
-  (ValueError), `$rename` non-string target (AttributeError), `$bucket output:5`
-  (AttributeError), `$facet {a:[5]}` (TypeError), `$densify unit:'day'` on numeric
-  (TypeError), `$sort {v:'asc'}` (ValueError).
+  mongod's BadValue. `$pow` (TypeError/ZeroDivisionError) FIXED (#483); the unary math
+  ops `$abs`/`$ceil`/`$floor`/`$sqrt`/`$exp`/`$ln`/`$log10`/`$round`/`$trunc` on
+  string/bool FIXED (#492, → 28765 / 51081). Still leaking: `$log:['x',2]` (TypeError)
+  + `$log:[true,2]` (coerces), `$split` empty-sep (ValueError), `$in`/`$nin` non-array
+  (TypeError), `$regex` non-string `$options` (ValueError), `$rename` non-string target
+  (AttributeError), `$bucket output:5` (AttributeError), `$facet {a:[5]}` (TypeError),
+  `$densify unit:'day'` on numeric (TypeError), `$sort {v:'asc'}` (ValueError).
 
 ## Tier 2 — silent-accept of invalid input / missing type guards
 
-- **Math-unary bool + non-numeric**: `$abs`/`$ceil`/`$floor`/`$sqrt`/`$exp`/`$ln`/
-  `$log`/`$round`/`$trunc`/`$pow` compute on `true` (→1) instead of mongod's
-  28765/28756/51081/28762. (expressions)
+- ~~**Math-unary bool + non-numeric**~~ mostly **FIXED** (`$abs`/`$ceil`/`$floor`/
+  `$sqrt`/`$exp`/`$ln`/`$log10`/`$round`/`$trunc` → #492 [28765/51081], `$pow` → #483
+  [28762/28763/28764]). Remaining: **`$log`** (2-arg) still computes on `true` / leaks
+  on string — needs 28765 on both args. (expressions)
 - **Array/string type guards**: `$concat:["a",5]`→"a5" (mongod 16702); non-array to
   `$reverseArray`/`$concatArrays`/`$map`/`$filter`/`$reduce`/`$first`/`$last`/`$slice`
   → `None` (mongod 34435/…); `$trim`/`$ltrim`/`$rtrim {chars:5}` → unchanged (50700);

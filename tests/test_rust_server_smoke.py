@@ -1495,3 +1495,24 @@ def test_group_accumulator_mixed_types(tmp_path) -> None:
         assert b["mx"] is True
     finally:
         srv.stop()
+
+
+def test_unary_math_rejects_non_numeric(tmp_path) -> None:
+    """The Rust server rejects a string/bool operand to the unary math ops
+    (defer -> BadValue) instead of coercing a bool or erroring internally; a
+    whole-double operand still computes."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "s": "x", "n": 4.0})
+        for op in ("$abs", "$ceil", "$floor", "$sqrt", "$exp", "$ln", "$log10", "$trunc", "$round"):
+            arg = ["$s", 0] if op in ("$trunc", "$round") else "$s"
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": {op: arg}}}]))
+            with pytest.raises(pymongo.errors.OperationFailure):
+                bad = [True, 0] if op in ("$trunc", "$round") else True
+                list(coll.aggregate([{"$project": {"r": {op: bad}}}]))
+        got = list(coll.aggregate([{"$project": {"_id": 0, "a": {"$abs": "$n"}}}]))
+        assert got == [{"a": 4.0}]
+    finally:
+        srv.stop()

@@ -423,9 +423,25 @@ def _op_to_upper(arg: Any, ctx: _Ctx) -> Any:
     return value.upper() if isinstance(value, str) else value
 
 
+def _require_math_numeric(v: Any, op: str, code: int = 28765) -> None:
+    """mongod's type guard for the unary math operators: a non-numeric operand is
+    rejected (Location28765 for most, 51081 for $round / $trunc), rather than
+    computing on a coerced bool or leaking a Python TypeError. A null operand is
+    handled by the caller (returns null) before this is reached."""
+    if not _is_numeric(v):
+        raise ExpressionError(
+            f"{op} only supports numeric types, not {_bson_type_name(v)}",
+            code=code,
+            code_name=f"Location{code}",
+        )
+
+
 def _op_abs(arg: Any, ctx: _Ctx) -> Any:
     v = _eval(arg, ctx)
-    return abs(v) if v is not None else None
+    if v is None:
+        return None
+    _require_math_numeric(v, "$abs")
+    return abs(v)
 
 
 def _op_round(arg: Any, ctx: _Ctx) -> Any:
@@ -439,6 +455,7 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
         place = 0
     if n is None:
         return None
+    _require_math_numeric(n, "$round", 51081)
     if isinstance(place, bool):
         raise ExpressionError("can't convert from BSON type bool to long", code=16004)
     if isinstance(place, float):
@@ -456,14 +473,20 @@ def _op_floor(arg: Any, ctx: _Ctx) -> Any:
     import math
 
     v = _eval(arg, ctx)
-    return math.floor(v) if v is not None else None
+    if v is None:
+        return None
+    _require_math_numeric(v, "$floor")
+    return math.floor(v)
 
 
 def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
     import math
 
     v = _eval(arg, ctx)
-    return math.ceil(v) if v is not None else None
+    if v is None:
+        return None
+    _require_math_numeric(v, "$ceil")
+    return math.ceil(v)
 
 
 def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
@@ -472,6 +495,7 @@ def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
     v = _eval(arg, ctx)
     if v is None:
         return None
+    _require_math_numeric(v, "$sqrt")
     # mongod's domain error (probed 7.0.12): Location28714, not a null result.
     if isinstance(v, (int, float)) and v < 0:
         raise ExpressionError(
@@ -510,7 +534,10 @@ def _op_exp(arg: Any, ctx: _Ctx) -> Any:
     import math
 
     v = _eval(arg, ctx)
-    return math.exp(v) if v is not None else None
+    if v is None:
+        return None
+    _require_math_numeric(v, "$exp")
+    return math.exp(v)
 
 
 def _op_ln(arg: Any, ctx: _Ctx) -> Any:
@@ -519,6 +546,7 @@ def _op_ln(arg: Any, ctx: _Ctx) -> Any:
     v = _eval(arg, ctx)
     if v is None:
         return None
+    _require_math_numeric(v, "$ln")
     # mongod's domain error (probed 7.0.12): Location28766, not a null result.
     if isinstance(v, (int, float)) and v <= 0:
         raise ExpressionError(
@@ -559,6 +587,7 @@ def _op_log10(arg: Any, ctx: _Ctx) -> Any:
     v = _eval(arg, ctx)
     if v is None:
         return None
+    _require_math_numeric(v, "$log10")
     # mongod's domain error (probed 7.0.12): Location28761, not a null result.
     if isinstance(v, (int, float)) and v <= 0:
         raise ExpressionError(
@@ -644,6 +673,7 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
         place = 0
     if n is None:
         return None
+    _require_math_numeric(n, "$trunc", 51081)
     if isinstance(place, bool):
         raise ExpressionError("can't convert from BSON type bool to long", code=16004)
     if isinstance(place, float):
