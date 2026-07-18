@@ -4534,3 +4534,21 @@ def test_rename_validation_no_corruption(coll) -> None:
     coll.update_one({"_id": 1}, {"$rename": {"a": "z"}})
     doc = coll.find_one({"_id": 1})
     assert doc.get("z") == 5 and "a" not in doc
+
+
+def test_bucket_validation_no_data_loss(coll) -> None:
+    """$bucket errors on an out-of-range value with no default (was silent data
+    loss) and validates its spec, over the wire. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i, "v": i} for i in range(6)])
+    r = list(coll.aggregate([{"$bucket": {"groupBy": "$v", "boundaries": [0, 3, 6]}}]))
+    assert [(b["_id"], b["count"]) for b in r] == [(0, 3), (3, 3)]
+    for spec, code in [
+        ({"groupBy": "$v", "boundaries": [0, 3]}, 7158303),
+        ({"groupBy": "$v", "boundaries": [0, 5, 2]}, 40194),
+        ({"boundaries": [0, 6]}, 40198),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$bucket": spec}]))
+        assert exc.value.code == code, spec

@@ -223,6 +223,12 @@ CURATED = [
     # $bucket — default, custom output, empty buckets
     [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10, 20, 30]}}],
     [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10, 20], "default": "other"}}],
+    # $bucket validation: invalid specs (out-of-range w/o default, unsorted,
+    # missing groupBy, non-doc output) raise on Python and defer on Rust.
+    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10]}}],  # 15/25 out of range
+    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 20, 10]}}],  # unsorted
+    [{"$bucket": {"boundaries": [0, 30]}}],  # missing groupBy
+    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 30], "output": 5}}],  # non-doc output
     [
         {
             "$bucket": {

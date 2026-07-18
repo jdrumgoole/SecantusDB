@@ -1506,3 +1506,30 @@ def test_sample_size_validation() -> None:
     with pytest.raises(AggregateError) as nexc:
         apply_pipeline(docs, [{"$sample": {"size": -1}}])
     assert nexc.value.code == 28747
+
+
+def test_bucket_validation_and_no_silent_data_loss() -> None:
+    """$bucket validates its spec like mongod and errors on an out-of-range value
+    with no default (was silent data loss) instead of dropping the document."""
+    docs = [{"_id": i, "v": i} for i in range(6)]
+
+    def counts(spec):
+        r = apply_pipeline(docs, [{"$bucket": spec}])
+        return [(b["_id"], b.get("count")) for b in r]
+
+    assert counts({"groupBy": "$v", "boundaries": [0, 3, 6]}) == [(0, 3), (3, 3)]
+    assert counts({"groupBy": "$v", "boundaries": [0, 3], "default": "x"}) == [(0, 3), ("x", 3)]
+    for spec, code in [
+        ({"groupBy": "$v", "boundaries": [0, 3]}, 7158303),  # out-of-range, no default
+        ({"groupBy": "$v", "boundaries": [0, 5, 2]}, 40194),  # unsorted
+        ({"groupBy": "$v", "boundaries": [0, "x", 5]}, 40193),  # mixed type
+        ({"groupBy": "$v", "boundaries": [0, 3, 3, 6]}, 40194),  # duplicate
+        ({"groupBy": "$v", "boundaries": [0, 6], "default": 1}, 40199),  # default in range
+        ({"boundaries": [0, 6]}, 40198),  # missing groupBy
+        ({"groupBy": "$v", "boundaries": 5}, 40200),  # non-array
+        ({"groupBy": "$v", "boundaries": [0]}, 40192),  # < 2 values
+        ({"groupBy": "$v", "boundaries": [0, 6], "output": 5}, 40196),  # non-doc output
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(docs, [{"$bucket": spec}])
+        assert exc.value.code == code, spec

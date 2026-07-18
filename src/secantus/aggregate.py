@@ -1674,21 +1674,81 @@ def _stage_facet(
     return [out]
 
 
+_BUCKET_NUMERIC_NAMES = frozenset({"int", "long", "double", "decimal"})
+
+
+def _bucket_ctype(v: Any) -> str:
+    """Canonical type name for $bucket boundary comparison — the numeric BSON
+    types collapse to one bracket (mongod requires all boundaries the same type)."""
+    name = _bson_type_name(v)
+    return "number" if name in _BUCKET_NUMERIC_NAMES else name
+
+
 def _stage_bucket(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    from secantus.ordering import _SortKey
+
     if not isinstance(spec, Mapping):
         raise AggregateError("$bucket requires a document spec")
     group_by = spec.get("groupBy")
     boundaries = spec.get("boundaries")
+    # mongod validates the whole spec before bucketing — several of these were
+    # silently accepted, and an out-of-range value with no default silently
+    # DROPPED the document.
+    if group_by is None or boundaries is None:
+        raise AggregateError(
+            "$bucket requires 'groupBy' and 'boundaries' to be specified.", code=40198
+        )
+    if not isinstance(boundaries, list):
+        raise AggregateError(
+            f"The $bucket 'boundaries' field must be an array, but found type: "
+            f"{_bson_type_name(boundaries)}",
+            code=40200,
+        )
+    if len(boundaries) < 2:
+        raise AggregateError(
+            "The $bucket 'boundaries' field must have at least 2 values, but found "
+            f"{len(boundaries)}.",
+            code=40192,
+        )
+    ctype0 = _bucket_ctype(boundaries[0])
+    for i in range(len(boundaries) - 1):
+        if _bucket_ctype(boundaries[i + 1]) != ctype0:
+            raise AggregateError(
+                "All values in the the 'boundaries' option to $bucket must have the "
+                f"same type. Found conflicting types {ctype0} and "
+                f"{_bucket_ctype(boundaries[i + 1])}.",
+                code=40193,
+            )
+        if not _SortKey(boundaries[i]) < _SortKey(boundaries[i + 1]):
+            raise AggregateError(
+                "The 'boundaries' option to $bucket must be sorted, but elements "
+                f"{i} and {i + 1} are not in ascending order.",
+                code=40194,
+            )
     default = spec.get("default")
-    output_spec = spec.get("output") or {"count": {"$sum": 1}}
-    if not isinstance(boundaries, list) or len(boundaries) < 2:
-        raise AggregateError("$bucket requires boundaries array of >=2 values")
+    output_spec = spec.get("output")
+    if output_spec is not None and not isinstance(output_spec, Mapping):
+        raise AggregateError(
+            f"The $bucket 'output' field must be an object, but found type: "
+            f"{_bson_type_name(output_spec)}",
+            code=40196,
+        )
+    if output_spec is None:
+        output_spec = {"count": {"$sum": 1}}
+    if default is not None:
+        dk, lo0, hi0 = _SortKey(default), _SortKey(boundaries[0]), _SortKey(boundaries[-1])
+        if not dk < lo0 and dk < hi0:  # default lies within [first, last) -> invalid
+            raise AggregateError(
+                "The $bucket 'default' field must be less than the lowest boundary or "
+                "greater than or equal to the highest boundary.",
+                code=40199,
+            )
 
     buckets: dict[Any, list[dict[str, Any]]] = {b: [] for b in boundaries[:-1]}
     if default is not None:
-        buckets[default] = []
+        buckets.setdefault(default, [])
 
     for d in docs:
         value = evaluate(group_by, d, ctx.vars)
@@ -1702,7 +1762,13 @@ def _stage_bucket(
                     break
             except TypeError:
                 continue
-        if not placed and default is not None:
+        if not placed:
+            if default is None:
+                raise AggregateError(
+                    "$switch could not find a matching branch for an input, and no "
+                    "default was specified.",
+                    code=7158303,
+                )
             buckets[default].append(d)
 
     result: list[dict[str, Any]] = []
