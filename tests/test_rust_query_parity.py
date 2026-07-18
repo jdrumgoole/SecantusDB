@@ -318,6 +318,18 @@ CURATED = [
     ({"flags": 0b0110}, {"flags": {"$bitsAllSet": 6.0}}),
     ({"flags": 0b0110}, {"flags": {"$bitsAllSet": [1.0, 2.0]}}),
     ({"flags": 0b0110}, {"flags": {"$bitsAnyClear": 8.0}}),
+    # $gte/$lte: null match null + missing (like $eq: null); $gt: null nothing.
+    ({"f": None}, {"f": {"$gte": None}}),
+    ({}, {"f": {"$gte": None}}),
+    ({"f": 5}, {"f": {"$gte": None}}),
+    ({"f": None}, {"f": {"$lte": None}}),
+    ({"f": 5}, {"f": {"$gt": None}}),
+    # $exists mongod truthiness: empty string / array / doc are truthy.
+    ({"f": 5}, {"f": {"$exists": ""}}),
+    ({"f": 5}, {"f": {"$exists": []}}),
+    ({"f": 5}, {"f": {"$exists": {}}}),
+    ({}, {"f": {"$exists": 0}}),
+    ({"f": 5}, {"f": {"$exists": 1}}),
     ({"x": Decimal128("5")}, {"x": 5}),
     ({"x": 5}, {"x": Decimal128("5")}),
     ({"x": Decimal128("3.5")}, {"x": 3.5}),

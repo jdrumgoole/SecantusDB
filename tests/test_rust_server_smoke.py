@@ -1355,3 +1355,24 @@ def test_pow_domain_validation(tmp_path) -> None:
                 list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
     finally:
         srv.stop()
+
+
+def test_gte_lte_null_and_exists_truthiness(tmp_path) -> None:
+    """The Rust server matches null+missing for $gte/$lte: null and uses mongod
+    truthiness for $exists (empty string/array truthy), matching the Python server."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": 1, "f": None}, {"_id": 2, "f": 5}, {"_id": 3}])
+
+        def ids(q):
+            return sorted(d["_id"] for d in coll.find(q))
+
+        assert ids({"f": {"$gte": None}}) == [1, 3]
+        assert ids({"f": {"$lte": None}}) == [1, 3]
+        assert ids({"f": {"$gt": None}}) == []
+        assert ids({"f": {"$exists": ""}}) == [1, 2]
+        assert ids({"f": {"$exists": []}}) == [1, 2]
+        assert ids({"f": {"$exists": 0}}) == [3]
+    finally:
+        srv.stop()

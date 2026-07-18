@@ -4496,3 +4496,19 @@ def test_pow_domain_validation(coll) -> None:
         with pytest.raises(OperationFailure) as exc:
             list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
         assert exc.value.code == code, expr
+
+
+def test_gte_lte_null_and_exists_truthiness(coll) -> None:
+    """$gte/$lte: null match null + missing; $exists uses mongod truthiness.
+    mongod 7.0.12-verified over the wire."""
+    coll.insert_many([{"_id": 1, "f": None}, {"_id": 2, "f": 5}, {"_id": 3}])
+
+    def ids(q):
+        return sorted(d["_id"] for d in coll.find(q))
+
+    assert ids({"f": {"$gte": None}}) == [1, 3]
+    assert ids({"f": {"$lte": None}}) == [1, 3]
+    assert ids({"f": {"$gt": None}}) == []
+    assert ids({"f": {"$exists": ""}}) == [1, 2]
+    assert ids({"f": {"$exists": []}}) == [1, 2]
+    assert ids({"f": {"$exists": 0}}) == [3]

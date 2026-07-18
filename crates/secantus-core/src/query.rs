@@ -308,8 +308,12 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
         "$eq" => eq_with_array(values, arg, coll),
         "$ne" => Ok(!eq_with_array(values, arg, coll)?),
         "$gt" => cmp_op(values, arg, coll, |o| o == Ordering::Greater),
+        // `$gte`/`$lte: null` match null + missing (like `$eq: null`); a plain
+        // BSON-order compare against null would spuriously match everything.
+        "$gte" if matches!(arg, Bson::Null) => eq_with_array(values, arg, coll),
         "$gte" => cmp_op(values, arg, coll, |o| o != Ordering::Less),
         "$lt" => cmp_op(values, arg, coll, |o| o == Ordering::Less),
+        "$lte" if matches!(arg, Bson::Null) => eq_with_array(values, arg, coll),
         "$lte" => cmp_op(values, arg, coll, |o| o != Ordering::Greater),
         "$in" => {
             let arr = arg.as_array().ok_or(Fallback)?;
@@ -671,9 +675,8 @@ fn truthy(arg: &Bson) -> Result<bool, Fallback> {
         Bson::Int64(n) => *n != 0,
         Bson::Double(d) => *d != 0.0, // NaN -> true (matches Python bool(nan))
         Bson::Null => false,
-        Bson::String(s) => !s.is_empty(),
-        Bson::Array(a) => !a.is_empty(),
-        Bson::Document(d) => !d.is_empty(),
+        // mongod truthiness: only false / 0 / null are falsy. An empty string,
+        // array, or document is TRUTHY (unlike Python's bool()).
         // Decimal128 truthiness in Python keys on object identity (always
         // true), but $exists: Decimal128(0) is pathological — defer.
         Bson::Decimal128(_) => return Err(Fallback),

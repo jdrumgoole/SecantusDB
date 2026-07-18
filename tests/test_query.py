@@ -647,3 +647,24 @@ def test_bits_numeric_arg_validation() -> None:
         with pytest.raises(QueryError) as exc:
             matches({"n": 6}, query)
         assert exc.value.code == code, query
+
+
+def test_gte_lte_null_and_exists_truthiness() -> None:
+    """$gte/$lte: null match null + missing (like $eq: null); $exists uses mongod
+    truthiness (only false/0/null are falsy). mongod 7.0.12-verified."""
+    docs = [{"_id": 1, "f": None}, {"_id": 2, "f": 5}, {"_id": 3}]
+
+    def ids(q):
+        return sorted(d["_id"] for d in docs if matches(d, q))
+
+    assert ids({"f": {"$gte": None}}) == [1, 3]  # null + missing (was [])
+    assert ids({"f": {"$lte": None}}) == [1, 3]
+    assert ids({"f": {"$gt": None}}) == []  # nothing strictly above null
+    assert ids({"f": {"$eq": None}}) == [1, 3]
+    # mongod truthiness: empty string / array / doc are TRUTHY (Python's aren't)
+    assert ids({"f": {"$exists": ""}}) == [1, 2]
+    assert ids({"f": {"$exists": []}}) == [1, 2]
+    assert ids({"f": {"$exists": {}}}) == [1, 2]
+    assert ids({"f": {"$exists": 0}}) == [3]
+    assert ids({"f": {"$exists": False}}) == [3]
+    assert ids({"f": {"$exists": 1}}) == [1, 2]
