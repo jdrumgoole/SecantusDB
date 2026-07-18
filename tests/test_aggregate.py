@@ -384,6 +384,26 @@ def test_facet_runs_parallel_pipelines() -> None:
     assert out == [{"all": [{"n": 4}], "big": [{"n": 2}]}]
 
 
+def test_facet_validation_codes() -> None:
+    # mongod codes: empty/non-object spec 40169, non-array sub-pipeline 40170,
+    # non-object stage element 40171, nested $facet 40600.
+    docs = [{"v": 1}, {"v": 2}]
+    for spec, code in [
+        ({}, 40169),
+        ({"a": 5}, 40170),
+        ({"a": [5]}, 40171),
+        ({"a": [{}]}, 40171),
+        ({"a": [{"$facet": {"b": [{"$match": {"v": 1}}]}}]}, 40600),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$facet": spec}])
+        assert exc.value.code == code, spec
+    # An empty sub-pipeline is valid (yields the input docs unchanged).
+    assert apply_pipeline([dict(d) for d in docs], [{"$facet": {"a": []}}]) == [
+        {"a": [{"v": 1}, {"v": 2}]}
+    ]
+
+
 def test_bucket_basic_ranges() -> None:
     docs = [{"v": 1}, {"v": 5}, {"v": 12}, {"v": 25}, {"v": 99}]
     out = apply_pipeline(

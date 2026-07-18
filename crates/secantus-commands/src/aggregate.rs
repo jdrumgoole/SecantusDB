@@ -854,14 +854,50 @@ fn apply_facet(
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
+    // mongod validates the spec before running: a non-empty object (40169), each
+    // value an array (40170), each stage a non-empty object (40171), and no nested
+    // $facet (40600).
     let s = spec
         .and_then(Bson::as_document)
-        .ok_or_else(|| bad_value("$facet requires a document spec"))?;
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| {
+            CommandError::new(
+                40169,
+                "Location40169",
+                "the $facet specification must be a non-empty object",
+            )
+        })?;
     let mut out = Document::new();
     for (name, sub) in s.iter() {
-        let sub_pipeline = sub
-            .as_array()
-            .ok_or_else(|| bad_value("$facet sub-pipeline must be an array"))?;
+        let sub_pipeline = sub.as_array().ok_or_else(|| {
+            CommandError::new(
+                40170,
+                "Location40170",
+                format!("arguments to $facet must be arrays, {name} is not an array"),
+            )
+        })?;
+        for stage in sub_pipeline {
+            match stage {
+                Bson::Document(d) if d.contains_key("$facet") => {
+                    return Err(CommandError::new(
+                        40600,
+                        "Location40600",
+                        "$facet is not allowed to be used within a $facet stage",
+                    ));
+                }
+                Bson::Document(d) if !d.is_empty() => {}
+                _ => {
+                    return Err(CommandError::new(
+                        40171,
+                        "Location40171",
+                        format!(
+                            "elements of arrays in $facet spec must be non-empty objects, \
+                             {name} argument contained an invalid element"
+                        ),
+                    ));
+                }
+            }
+        }
         // Each sub-pipeline runs over its own copy of the input docs.
         let res = run_segmented(
             docs.clone(),

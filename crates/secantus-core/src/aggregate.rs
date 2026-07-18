@@ -210,12 +210,23 @@ fn facet_stage(
     let Bson::Document(s) = spec else {
         return Err(Fallback);
     };
+    if s.is_empty() {
+        return Err(Fallback); // Python raises 40169 (must be a non-empty object)
+    }
     let n = s.len();
     let mut out = Document::new();
     for (i, (name, sub)) in s.iter().enumerate() {
         let Bson::Array(sub_pipeline) = sub else {
-            return Err(Fallback); // Python raises (entry must be a pipeline array)
+            return Err(Fallback); // Python raises 40170 (entry must be an array)
         };
+        // Each stage must be a non-empty object and not a nested $facet — else
+        // defer so Python raises 40171 / 40600.
+        for stage in sub_pipeline {
+            match stage {
+                Bson::Document(d) if !d.is_empty() && !d.contains_key("$facet") => {}
+                _ => return Err(Fallback),
+            }
+        }
         // The last sub-pipeline can consume the input docs directly; earlier
         // ones each need their own copy.
         let input = if i + 1 == n {

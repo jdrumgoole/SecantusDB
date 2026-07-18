@@ -38,16 +38,14 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   `0` / `null`; `$min`/`$max` order mixed types by BSON cross-type order and skip
   null/missing instead of raising. Both engines. (Rust min/max over mixed types now
   computes via `order::bson_lt` rather than deferring.)
-- **Uncaught Python exceptions leak (`code=None`)** — surface as generic errors, not
-  mongod's BadValue. `$pow` (TypeError/ZeroDivisionError) FIXED (#483); the unary math
-  ops `$abs`/`$ceil`/`$floor`/`$sqrt`/`$exp`/`$ln`/`$log10`/`$round`/`$trunc` on
-  string/bool FIXED (#492, → 28765 / 51081); `$log` (2-arg) FIXED (#493, → 28756 /
-  28757); `$in`/`$nin` non-array + nested-`$` FIXED (#494, → BadValue); `$regex`/
-  `$options` validation FIXED (#496, → 51108 / BadValue); `$not`/`$elemMatch` arg
-  FIXED (#497, → BadValue); `$split` empty-sep + type/arity FIXED (#500, → 40085/
-  40086/40087/16020); `$sort` stage direction FIXED (#502, → 15974/15975/15976);
-  `$densify` unit-on-numeric + step/bounds FIXED (#504, → 6053600/14/5733401/5946802/
-  5733403/5733402). Still leaking: `$facet {a:[5]}` (TypeError).
+- ~~**Uncaught Python exceptions leak (`code=None`)**~~ **ALL FIXED** — every listed
+  operator now raises mongod's code on both engines instead of leaking a Python
+  exception. `$pow` (#483); unary math `$abs`/`$ceil`/`$floor`/`$sqrt`/`$exp`/`$ln`/
+  `$log10`/`$round`/`$trunc` (#492, → 28765/51081); `$log` (#493, → 28756/28757);
+  `$in`/`$nin` (#494); `$regex`/`$options` (#496, → 51108/BadValue); `$not`/
+  `$elemMatch` (#497); `$split` (#500, → 40085/40086/40087/16020); `$sort` stage
+  (#502, → 15974/15975/15976); `$densify` (#504, → 6053600/14/5733401/5946802/
+  5733403/5733402); `$facet` (#505, → 40169/40170/40171/40600).
 
 ## Tier 2 — silent-accept of invalid input / missing type guards
 
@@ -85,8 +83,9 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   14/5946802/5733403/5733402/6053600; `{step:1.5}` is mongod-valid, now computes);
   `$unwind {includeArrayIndex:5/true/'$i'}`, bare `path:'a'` (no `$`), non-bool
   `preserveNullAndEmptyArrays` accepted (28810/28818/28809/28822); `$sortByCount`
-  number/non-expr-doc/no-`$` accepted (40149/40147/40148); nested `$facet` (40600);
-  `$count` ''/dotted/`$`-prefixed/`_id` accepted (40157/40160/40158/15948); `$sort`
+  number/non-expr-doc/no-`$` accepted (40149/40147/40148); `$facet` empty/non-array/
+  non-object-stage/nested FIXED (#505, → 40169/40170/40171/40600); `$count`
+  ''/dotted/`$`-prefixed/`_id` accepted (40157/40160/40158/15948); `$sort`
   bad-ordering/empty/`{v:true}` FIXED (#502, → 15975/15976/15974); `$project {}`
   empty accepted (51272). (aggregate.py)
 
