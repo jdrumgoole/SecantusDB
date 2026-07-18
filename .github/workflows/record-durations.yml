@@ -10,12 +10,27 @@ name: Record test durations
 #
 #   * Recording needs the WHOLE suite in ONE job. The test lanes are sharded, so
 #     each one only ever sees its own slice and could not produce a full file.
-#   * Durations are PER-PLATFORM and the difference is not cosmetic. The
-#     cross-driver smoke tests (mongosh / node / java) are skipped wherever the
-#     toolchain is absent, so the same test file costs minutes on a runner with
-#     mongosh installed and ~0 on one without. A durations file recorded on the
-#     wrong OS mis-packs the shards in the wrong direction — worse than having
-#     no file at all, which at least degrades to an even split.
+#   * Durations are PER-PLATFORM and the difference is not cosmetic. Measured:
+#     the sql/core balance INVERTS between platforms. A macOS recording ranks
+#     sql as the heavy half (4109s vs 2555s of recorded work, 1.61x), while
+#     Linux CI ran sql as the LIGHT half (5m11 vs core's 11m11). A durations
+#     file recorded on the wrong OS therefore packs the shards in the wrong
+#     direction — worse than having no file at all, which at least degrades to
+#     an even split.
+#
+#     The MECHANISM behind that inversion is not established. An earlier version
+#     of this comment blamed the cross-driver smokes (mongosh / node / java)
+#     skipping where the toolchain is absent; that was checked and is FALSE —
+#     with the toolchain installed locally all 80 of them run on macOS (175s of
+#     recorded time), so skipping does not explain it. Plausible remaining
+#     candidates are per-platform I/O cost (the WT-heavy core tests against
+#     macOS' SSD vs the runner's disk) and CPU-vs-I/O mix, but nobody has
+#     measured which dominates.
+#
+#     That the cause is UNKNOWN is precisely why the numbers must be recorded on
+#     each platform rather than extrapolated from one: we have a reproducible
+#     inversion we cannot yet predict from first principles, so any model of it
+#     would be a guess where a measurement is cheap.
 #   * They only need re-recording when the suite's shape shifts materially
 #     (a big new module, a slow test cluster added or removed), not per push.
 #
