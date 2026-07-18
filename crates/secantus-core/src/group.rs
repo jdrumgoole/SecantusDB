@@ -10,12 +10,13 @@
 //!   canonicalise without a fidelity risk (Decimal128, NaN, Binary/Timestamp/
 //!   Regex/Min/MaxKey, exotic) defer the whole stage to Python.
 //!
-//! * **Accumulators** reproduce Python's exact numeric and raise-on-mixed-type
-//!   semantics: `$sum`/`$avg` accumulate with Python `+` (int stays int, any
-//!   float widens — non-numeric operands `TypeError` → defer); `$min`/`$max`
-//!   use native `<`/`>` (via `expressions::py_order`, which raises/`None`s on
-//!   the cross-type cases) and so defer rather than guess; `$addToSet`
-//!   membership uses Python `==` (`expressions::py_eq`).
+//! * **Accumulators** reproduce mongod's exact numeric semantics: `$sum`/`$avg`
+//!   accumulate only numeric operands (int stays int, any float widens; string
+//!   / bool / null / missing are ignored, Decimal128 → defer); an all-non-numeric
+//!   `$sum` is `0`, `$avg` is null. `$min`/`$max` ignore null / missing and order
+//!   every other value by BSON cross-type order (`order::bson_lt`, the relation
+//!   `ordering._SortKey` uses). `$addToSet` membership uses Python `==`
+//!   (`expressions::py_eq`).
 //!
 //! Any unported / deferring construct returns `Err(())` and the pure-Python
 //! `$group` runs instead.
@@ -150,7 +151,7 @@ impl Num {
 pub(crate) enum Acc {
     Sum(Num),
     Count(i64),
-    Avg(Option<(Num, i64)>), // None until the first non-null value (field stays absent)
+    Avg(Option<(Num, i64)>), // None until the first numeric value (finalises to null)
     Min(Option<Bson>),       // None == "unset or null-equivalent"
     Max(Option<Bson>),
     First(Option<Bson>), // None == not yet seen any doc
@@ -347,34 +348,41 @@ fn percentile_finalize(is_median: bool, ps: Option<Vec<f64>>, mut values: Vec<f6
     }
 }
 
-/// `arg == 1` in Python — true for int 1, float 1.0, and bool True.
+/// `arg == 1 and not isinstance(arg, bool)` in Python — the literal-count
+/// fast path. A bool operand is *not* one here (mongod ignores it in `$sum`).
 fn arg_is_one(arg: &Bson) -> bool {
-    matches!(arg, Bson::Int32(1) | Bson::Int64(1) | Bson::Boolean(true))
-        || matches!(arg, Bson::Double(d) if *d == 1.0)
+    matches!(arg, Bson::Int32(1) | Bson::Int64(1)) || matches!(arg, Bson::Double(d) if *d == 1.0)
 }
 
 pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()> {
     match acc {
         Acc::Sum(running) => {
-            // `1 if arg == 1 else evaluate(arg)`, then None -> 0.
+            // mongod sums only numeric operands (int / long / double); string /
+            // bool / null / missing / array / doc are ignored. Decimal128 -> Python.
             if arg_is_one(arg) {
                 *running = running.add(&Bson::Int32(1))?;
             } else {
-                let v = eval(arg, doc, vars)?;
-                if !is_null(&v) {
-                    *running = running.add(&v)?;
+                match eval(arg, doc, vars)? {
+                    v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) => {
+                        *running = running.add(&v)?;
+                    }
+                    Bson::Decimal128(_) => return Err(()),
+                    _ => {}
                 }
             }
         }
         Acc::Count(n) => *n += 1,
         Acc::Avg(state) => {
-            let v = eval(arg, doc, vars)?;
-            if !is_null(&v) {
-                let (total, count) = match state.take() {
-                    Some(s) => s,
-                    None => (Num::Int { v: 0, wide: false }, 0),
-                };
-                *state = Some((total.add(&v)?, count + 1));
+            // Averages only numeric values (Decimal128 -> Python); an all-non-
+            // numeric group finalises to null.
+            match eval(arg, doc, vars)? {
+                v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) => {
+                    let (total, count) =
+                        state.take().unwrap_or((Num::Int { v: 0, wide: false }, 0));
+                    *state = Some((total.add(&v)?, count + 1));
+                }
+                Bson::Decimal128(_) => return Err(()),
+                _ => {}
             }
         }
         Acc::Min(cur) => update_extreme(cur, eval(arg, doc, vars)?, Ordering::Less)?,
@@ -661,20 +669,28 @@ fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
     Some(var.sqrt())
 }
 
-/// `$min` / `$max`: `cur is None or (v is not None and v <cmp> cur)`. Uses
-/// Python's native `<`/`>` (via `py_order`), which raises on cross-type — so an
-/// unorderable pair defers the whole stage rather than guessing.
+/// `$min` / `$max`: ignore null / missing and order every other value by BSON
+/// cross-type order (`order::bson_lt`, the same relation `ordering._SortKey`
+/// uses — bool > string > number > …). `None` defers only a genuinely
+/// unorderable pair (DBPointer, an unclassifiable Decimal128).
 fn update_extreme(cur: &mut Option<Bson>, v: Bson, want: Ordering) -> R<()> {
     if is_null(&v) {
         return Ok(()); // null never updates and never "unsets"
     }
     match cur {
         None => *cur = Some(v),
-        Some(existing) => match expressions::py_order(&v, existing).map_err(|_| ())? {
-            Some(ord) if ord == want => *cur = Some(v),
-            Some(_) => {}
-            None => return Err(()), // Python's `v > cur` would TypeError -> defer
-        },
+        Some(existing) => {
+            // $max replaces when existing < v; $min when v < existing.
+            let replace = match want {
+                Ordering::Greater => crate::order::bson_lt(existing, &v),
+                _ => crate::order::bson_lt(&v, existing),
+            };
+            match replace {
+                Some(true) => *cur = Some(v),
+                Some(false) => {}
+                None => return Err(()),
+            }
+        }
     }
     Ok(())
 }
@@ -691,19 +707,24 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 out.insert(field.to_string(), int_to_bson(n as i128).ok_or(())?);
             }
             Acc::Avg(state) => {
-                // Field absent when no non-null value was seen (matches Python,
-                // where the bucket key is never created).
-                if let Some((total, count)) = state {
-                    let tf = match total {
-                        Num::Int { v: a, .. } => {
-                            if a.unsigned_abs() > (1u128 << 53) {
-                                return Err(()); // precision: defer to Python int/int divide
+                // All-non-numeric group -> null (mongod), matching Python's
+                // always-created avg state finalising to null.
+                match state {
+                    Some((total, count)) => {
+                        let tf = match total {
+                            Num::Int { v: a, .. } => {
+                                if a.unsigned_abs() > (1u128 << 53) {
+                                    return Err(()); // precision: defer to Python int/int divide
+                                }
+                                a as f64
                             }
-                            a as f64
-                        }
-                        Num::Float(f) => f,
-                    };
-                    out.insert(field.to_string(), Bson::Double(tf / count as f64));
+                            Num::Float(f) => f,
+                        };
+                        out.insert(field.to_string(), Bson::Double(tf / count as f64));
+                    }
+                    None => {
+                        out.insert(field.to_string(), Bson::Null);
+                    }
                 }
             }
             Acc::Min(v) | Acc::Max(v) => {
@@ -1170,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn avg_is_double_and_absent_when_all_null() {
+    fn avg_is_double_and_null_when_no_numeric() {
         let out = g(
             bson::bson!({"_id": Bson::Null, "a": {"$avg": "$v"}}),
             vec![doc! {"v": 2i32}, doc! {"v": 4i32}],
@@ -1180,7 +1201,7 @@ mod tests {
             bson::bson!({"_id": Bson::Null, "a": {"$avg": "$missing"}}),
             vec![doc! {"v": 2i32}],
         );
-        assert!(out2[0].get("a").is_none()); // field absent
+        assert_eq!(out2[0].get("a"), Some(&Bson::Null)); // mongod: null, not absent
     }
 
     #[test]
@@ -1313,13 +1334,51 @@ mod tests {
     }
 
     #[test]
-    fn min_cross_type_defers() {
-        assert!(group_stage(
-            &bson::bson!({"_id": Bson::Null, "m": {"$min": "$v"}}),
-            &[doc! {"v": 1i32}, doc! {"v": "x"}],
-            &Document::new()
+    fn min_max_cross_type_bson_order() {
+        // mongod orders every non-null value by BSON cross-type order
+        // (number < string < bool), no longer deferring a mixed group.
+        let docs = [
+            doc! {"v": 10i32},
+            doc! {"v": "x"},
+            doc! {"v": true},
+            doc! {"v": Bson::Null},
+        ];
+        let out = group_stage(
+            &bson::bson!({"_id": Bson::Null, "mn": {"$min": "$v"}, "mx": {"$max": "$v"}}),
+            &docs,
+            &Document::new(),
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(out[0].get("mn"), Some(&Bson::Int32(10))); // smallest = number
+        assert_eq!(out[0].get("mx"), Some(&Bson::Boolean(true))); // largest = bool
+    }
+
+    #[test]
+    fn sum_avg_ignore_non_numeric() {
+        let docs = [
+            doc! {"v": 10i32},
+            doc! {"v": "hi"},
+            doc! {"v": true},
+            doc! {"v": Bson::Null},
+            doc! {"v": 2.5f64},
+        ];
+        let out = group_stage(
+            &bson::bson!({"_id": Bson::Null, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}}),
+            &docs,
+            &Document::new(),
+        )
+        .unwrap();
+        assert_eq!(out[0].get("s"), Some(&Bson::Double(12.5))); // 10 + 2.5
+        assert_eq!(out[0].get("a"), Some(&Bson::Double(6.25))); // (10 + 2.5) / 2
+                                                                // An all-non-numeric group: $sum -> 0, $avg -> null.
+        let out2 = group_stage(
+            &bson::bson!({"_id": Bson::Null, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}}),
+            &[doc! {"v": "x"}, doc! {"v": true}],
+            &Document::new(),
+        )
+        .unwrap();
+        assert_eq!(out2[0].get("s"), Some(&Bson::Int32(0)));
+        assert_eq!(out2[0].get("a"), Some(&Bson::Null));
     }
 
     #[test]

@@ -813,6 +813,26 @@ def test_sort_mixed_types(direction):
     assert rust == py, f"rust={rust} pure={py}"
 
 
+@pytest.mark.parametrize(
+    "acc",
+    [
+        {"$sum": "$k"},
+        {"$avg": "$k"},
+        {"$min": "$k"},
+        {"$max": "$k"},
+    ],
+)
+def test_group_accumulator_mixed_types(acc):
+    # $sum/$avg ignore non-numeric; $min/$max order by BSON cross-type. The Rust
+    # core computes these over the mixed corpus rather than deferring.
+    docs = bson.decode(bson.encode({"d": SORT_DOCS}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$group": {"_id": None, "r": acc}}]}))["p"]
+    rust = _rust_pipeline(docs, pipeline)
+    assert rust is not None, f"expected the Rust $group to handle {acc} over mixed types"
+    py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert rust == py, f"rust={rust} pure={py}"
+
+
 @pytest.mark.parametrize("pipeline", CURATED)
 def test_curated_parity(pipeline):
     docs = bson.decode(bson.encode({"d": DOCS}))["d"]
