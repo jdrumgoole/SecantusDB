@@ -540,6 +540,23 @@ def test_abs_round_floor_ceil() -> None:
     assert evaluate({"$ceil": 3.2}, {}) == 4
 
 
+def test_unary_math_rejects_non_numeric() -> None:
+    # mongod: a string / bool operand is rejected (28765 for most, 51081 for
+    # $round / $trunc), not coerced or leaked as a Python error; null -> null.
+    for op in ("$abs", "$ceil", "$floor", "$sqrt", "$exp", "$ln", "$log10"):
+        for bad in ("x", True):
+            with pytest.raises(ExpressionError) as exc:
+                evaluate({op: bad}, {})
+            assert exc.value.code == 28765, f"{op}({bad!r})"
+        assert evaluate({op: None}, {}) is None
+    for op in ("$round", "$trunc"):
+        for bad in ("x", True):
+            with pytest.raises(ExpressionError) as exc:
+                evaluate({op: [bad, 0]}, {})
+            assert exc.value.code == 51081, f"{op}({bad!r})"
+        assert evaluate({op: None}, {}) is None
+
+
 def test_sqrt_pow() -> None:
     assert evaluate({"$sqrt": 9}, {}) == 3
     # Out-of-domain now raises mongod's Location28714 (was null).

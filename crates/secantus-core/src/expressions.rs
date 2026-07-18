@@ -2995,14 +2995,24 @@ fn op_regex_find_all(arg: &Bson, ctx: &Ctx) -> R {
 
 // --- math ---------------------------------------------------------------
 
+/// The f64 for a unary math operator, deferring bool *and* non-numeric to Python
+/// (which raises Location28765 / 51081 rather than coercing a bool or computing
+/// on a string). Real numbers only; null is handled by the caller.
+fn math_float(v: &Bson) -> Result<f64, Fallback> {
+    if matches!(v, Bson::Boolean(_)) {
+        return Err(Fallback);
+    }
+    as_float_like(v).ok_or(Fallback)
+}
+
 fn op_abs(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         Bson::Int32(n) => int_to_bson((n as i128).abs()).ok_or(Fallback),
         Bson::Int64(n) => int_to_bson((n as i128).abs()).ok_or(Fallback),
-        Bson::Boolean(b) => Ok(Bson::Int32(i32::from(b))),
         Bson::Double(d) => Ok(Bson::Double(d.abs())),
-        _ => Err(Fallback), // Decimal128 / non-numeric: Python abs() raises
+        // bool / Decimal128 / non-numeric: Python raises 28765 -> defer.
+        _ => Err(Fallback),
     }
 }
 
@@ -3011,7 +3021,6 @@ fn op_floor_ceil(arg: &Bson, ctx: &Ctx, ceil: bool) -> R {
         Bson::Null => Ok(Bson::Null),
         // math.floor/ceil of an int returns it unchanged.
         v @ (Bson::Int32(_) | Bson::Int64(_)) => Ok(v),
-        Bson::Boolean(b) => Ok(Bson::Int32(i32::from(b))),
         Bson::Double(d) => {
             if !d.is_finite() {
                 return Err(Fallback); // math.floor(nan/inf) raises
@@ -3030,11 +3039,9 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            let Some(f) = as_float_like(&v) else {
-                return Err(Fallback); // Decimal128 / non-numeric -> Python
-            };
-            // A negative argument is mongod's Location28714 — defer so
-            // Python raises it (NaN passes through as sqrt(nan) = nan).
+            let f = math_float(&v)?; // bool / Decimal128 / non-numeric -> Python
+                                     // A negative argument is mongod's Location28714 — defer so
+                                     // Python raises it (NaN passes through as sqrt(nan) = nan).
             if f < 0.0 {
                 Err(Fallback)
             } else {
@@ -3044,14 +3051,12 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
-// `$exp`: e**x. Numeric (incl. bool) -> Double; null -> null; Decimal128 /
-// non-numeric -> Python (matches `expressions._op_exp`, which calls math.exp).
+// `$exp`: e**x. Numeric -> Double; null -> null; bool / Decimal128 / non-numeric
+// -> Python (which raises 28765). Mirrors `expressions._op_exp`.
 fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
-        v => as_float_like(&v)
-            .map(|f| Bson::Double(f.exp()))
-            .ok_or(Fallback),
+        v => Ok(Bson::Double(math_float(&v)?.exp())),
     }
 }
 
@@ -3062,7 +3067,7 @@ fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            let f = as_float_like(&v).ok_or(Fallback)?;
+            let f = math_float(&v)?;
             if f <= 0.0 {
                 Err(Fallback)
             } else {
@@ -3076,7 +3081,7 @@ fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            let f = as_float_like(&v).ok_or(Fallback)?;
+            let f = math_float(&v)?;
             // A non-positive argument is mongod's Location28761 — defer so
             // Python raises it (NaN passes through as log10(nan) = nan).
             if f <= 0.0 {
@@ -3213,7 +3218,7 @@ fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
     match n {
         Bson::Null => Ok(Bson::Null),
         _ => {
-            let nf = as_float_like(&n).ok_or(Fallback)?;
+            let nf = math_float(&n)?; // bool / non-numeric -> Python (51081)
             let factor = 10f64.powi(place);
             Ok(Bson::Double((nf * factor).trunc() / factor))
         }

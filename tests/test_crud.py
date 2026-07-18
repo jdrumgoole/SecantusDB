@@ -4567,6 +4567,27 @@ def test_pow_domain_validation(coll) -> None:
         assert exc.value.code == code, expr
 
 
+def test_unary_math_rejects_non_numeric_via_pymongo(coll) -> None:
+    """$abs/$ceil/$floor/$sqrt/$exp/$ln/$log10 reject a string/bool operand
+    (28765), $round/$trunc (51081); null passes through. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "s": "x", "n": 4.0})
+    for op in ("$abs", "$ceil", "$floor", "$sqrt", "$exp", "$ln", "$log10"):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: "$s"}}}]))
+        assert exc.value.code == 28765, op
+    for op in ("$round", "$trunc"):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: ["$s", 0]}}}]))
+        assert exc.value.code == 51081, op
+    # A whole-double operand still computes; a null field yields null.
+    got = list(
+        coll.aggregate([{"$project": {"_id": 0, "a": {"$abs": "$n"}, "m": {"$abs": "$gone"}}}])
+    )
+    assert got == [{"a": 4.0, "m": None}]
+
+
 def test_gte_lte_null_and_exists_truthiness(coll) -> None:
     """$gte/$lte: null match null + missing; $exists uses mongod truthiness.
     mongod 7.0.12-verified over the wire."""

@@ -441,6 +441,20 @@ CURATED = [
     ({"$abs": "$n"}, {"n": -5.5}),
     ({"$abs": -(2**31)}, {}),  # -> int64
     ({"$abs": "$x"}, {}),  # missing -> null
+    # Non-numeric operands defer (Rust None; Python raises 28765 / 51081). If the
+    # Rust core ever computed one, the harness would evaluate Python and surface
+    # the raise — so these pin "reject, don't coerce" on both engines.
+    ({"$abs": "$s"}, {"s": "x"}),  # string -> defer
+    ({"$abs": True}, {}),  # bool -> defer (no coercion to 1)
+    ({"$ceil": True}, {}),
+    ({"$floor": "$s"}, {"s": "x"}),
+    ({"$sqrt": True}, {}),
+    ({"$exp": True}, {}),
+    ({"$ln": "$s"}, {"s": "x"}),
+    ({"$log10": True}, {}),
+    ({"$trunc": True}, {}),
+    ({"$trunc": "$s"}, {"s": "x"}),
+    ({"$round": True}, {}),
     ({"$floor": 3.7}, {}),
     ({"$floor": -3.2}, {}),
     ({"$floor": 5}, {}),
