@@ -172,6 +172,19 @@ CURATED = [
     ({"$last": "$a"}, {"a": [1, 2]}),
     ({"$concatArrays": [[1, 2], [3]]}, {}),
     ({"$reverseArray": [1, 2, 3]}, {}),
+    # Non-array input: Rust defers (None), Python raises the per-op code; null /
+    # missing input yields null on both.
+    ({"$first": 5}, {}),
+    ({"$last": "$a"}, {"a": "x"}),
+    ({"$first": "$x"}, {}),  # missing -> null
+    ({"$reverseArray": 5}, {}),
+    ({"$reverseArray": None}, {}),  # null -> null
+    ({"$concatArrays": [[1], 5]}, {}),
+    ({"$concatArrays": [[1], None]}, {}),  # null operand -> null
+    ({"$map": {"input": 5, "in": "$$this"}}, {}),
+    ({"$map": {"input": None, "in": "$$this"}}, {}),  # null -> null
+    ({"$filter": {"input": 5, "cond": True}}, {}),
+    ({"$reduce": {"input": 5, "initialValue": 0, "in": "$$value"}}, {}),
     # $sortArray. Int form: homogeneous / numeric scalars (Python's native sort
     # raises on docs or incomparable mixes, so the corpus avoids those). Doc form
     # uses BSON sort order on the named fields.
