@@ -459,6 +459,19 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
     return _eq_with_array(values, condition, collation)
 
 
+def _validate_in_arg(op: str, arg: Any) -> None:
+    """mongod parse-time validation for ``$in`` / ``$nin`` (BadValue, code 2): the
+    argument must be an array, and no element may be a document with a
+    ``$``-prefixed key (``{$regex: …}`` / ``{$x: 1}`` — "cannot nest $ under $in").
+    A BSON ``Regex`` literal is fine. Without this a non-array leaks a Python
+    ``TypeError`` and a nested-``$`` doc silently matches nothing."""
+    if not isinstance(arg, list):
+        raise QueryError(f"{op} needs an array")
+    for element in arg:
+        if isinstance(element, Mapping) and any(str(k).startswith("$") for k in element):
+            raise QueryError("cannot nest $ under $in")
+
+
 def _in_candidate_matches(
     values: list[Any], candidate: Any, collation: Collation | None = None
 ) -> bool:
@@ -558,8 +571,10 @@ def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | Non
             return _eq_with_array(values, None, collation)
         return _cmp(values, arg, lambda a, b: a <= b, collation)
     if op == "$in":
+        _validate_in_arg("$in", arg)
         return any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$nin":
+        _validate_in_arg("$nin", arg)
         return not any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$exists":
         # mongod uses its own truthiness for the argument (only false / 0 / null

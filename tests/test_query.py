@@ -53,6 +53,22 @@ def test_in_and_nin() -> None:
     assert matches({"a": 4}, {"a": {"$nin": [1, 2, 3]}})
 
 
+def test_in_nin_argument_validation() -> None:
+    # mongod: $in/$nin need an array (else BadValue), and no element may be a
+    # document with a $-prefixed key ("cannot nest $ under $in").
+    for op in ("$in", "$nin"):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": 5}, {"a": {op: 5}})
+        assert exc.value.code == 2 and "needs an array" in str(exc.value)
+    for bad in ({"$regex": "x"}, {"$x": 1}):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": 5}, {"a": {"$in": [1, bad]}})
+        assert exc.value.code == 2 and "cannot nest $ under $in" in str(exc.value)
+    # A plain subdocument element and a regex literal are still valid.
+    assert not matches({"a": 5}, {"a": {"$in": [{"x": 1}]}})
+    assert matches({"a": "hi"}, {"a": {"$in": [Regex("^h")]}})
+
+
 def test_exists() -> None:
     assert matches({"a": None}, {"a": {"$exists": True}})
     assert matches({}, {"a": {"$exists": False}})

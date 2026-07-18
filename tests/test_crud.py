@@ -371,6 +371,20 @@ def test_query_with_in_operator(coll) -> None:
     assert ids == [1, 3]
 
 
+def test_in_nin_argument_validation_via_pymongo(coll) -> None:
+    """$in/$nin need an array (BadValue); a nested $-prefixed doc element is
+    rejected ("cannot nest $ under $in"). mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for q in ({"n": {"$in": 5}}, {"n": {"$nin": "x"}}, {"n": {"$in": [{"$x": 1}]}}):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find(q))
+        assert exc.value.code == 2, q
+    # Valid array (incl. a plain subdoc element) still works.
+    assert [d["_id"] for d in coll.find({"n": {"$in": [5, 9]}})] == [1]
+
+
 def test_sort_ascending(coll) -> None:
     coll.insert_many([{"n": 3}, {"n": 1}, {"n": 2}])
     result = [d["n"] for d in coll.find().sort("n", 1)]
