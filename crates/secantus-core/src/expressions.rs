@@ -1052,6 +1052,19 @@ fn slice_int(b: &Bson) -> Option<i64> {
     as_int_like(b).map(|x| x as i64)
 }
 
+/// Coerce a numeric arg to i64, truncating a finite double toward zero -- the
+/// `$substrBytes` semantics (mongod accepts any double there, unlike `$substrCP`
+/// which rejects a fractional one). `None` for a non-finite double / non-number
+/// (the caller defers to the Python oracle).
+fn trunc_index(b: &Bson) -> Option<i64> {
+    match b {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d) if d.is_finite() => Some(d.trunc() as i64),
+        _ => None,
+    }
+}
+
 /// Outcome of coercing a numeric aggregation index argument to `i64`, the way
 /// mongod does: an int (or a whole-number double) is the index; a double with a
 /// fractional part is rejected (Python raises the op's per-arg code, so the Rust
@@ -3678,7 +3691,8 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     if matches!(start_v, Bson::Boolean(_)) || matches!(length_v, Bson::Boolean(_)) {
         return Err(Fallback); // Python raises 16034 / 16035
     }
-    let (Some(start), Some(length)) = (slice_int(&start_v), slice_int(&length_v)) else {
+    // $substrBytes truncates a double toward zero (not reject-fractional).
+    let (Some(start), Some(length)) = (trunc_index(&start_v), trunc_index(&length_v)) else {
         return Err(Fallback);
     };
     let bytes = s.as_bytes();

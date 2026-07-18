@@ -1255,3 +1255,21 @@ def test_substr_negative_index_rejected(tmp_path) -> None:
         assert got == [{"r": "bcde"}]
     finally:
         srv.stop()
+
+
+def test_substr_bytes_truncates_double_index(tmp_path) -> None:
+    """The Rust server truncates a $substrBytes double index toward zero
+    (computing, matching the Python server), not defer."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        for expr, want in [
+            ({"$substrBytes": ["abcde", 1.7, 2]}, "bc"),
+            ({"$substrBytes": ["abcde", 0.9, 3]}, "abc"),
+            ({"$substrBytes": ["abcde", 1, 2.9]}, "bc"),
+        ]:
+            got = list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+            assert got == [{"r": want}], expr
+    finally:
+        srv.stop()

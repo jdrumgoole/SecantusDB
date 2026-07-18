@@ -4407,3 +4407,16 @@ def test_substr_negative_index_rejected(coll) -> None:
         assert exc.value.code == code, expr
     got = list(coll.aggregate([{"$project": {"r": {"$substrBytes": ["abcde", 1, -1]}, "_id": 0}}]))
     assert got == [{"r": "bcde"}]
+
+
+def test_substr_bytes_truncates_double_index(coll) -> None:
+    """$substrBytes truncates a double index toward zero (mongod-faithful),
+    unlike $substrCP which rejects a fractional double. mongod 7.0.12-verified."""
+    coll.insert_one({"_id": 1})
+    for expr, want in [
+        ({"$substrBytes": ["abcde", 1.7, 2]}, "bc"),
+        ({"$substrBytes": ["abcde", 0.9, 3]}, "abc"),
+        ({"$substrBytes": ["abcde", 1, 2.9]}, "bc"),
+    ]:
+        got = list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert got == [{"r": want}], expr
