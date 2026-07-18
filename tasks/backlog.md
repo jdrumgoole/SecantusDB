@@ -1130,13 +1130,21 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   28725 / 28727 / 2942507 / 34450 / 34452 / 40096), the Rust core defers →
   `BadValue`. `$range` (34443/34445/34447) and `$sortArray` already deferred on the
   Rust side (`range_int` / the `_ => Fallback` sortBy arm); three-way mongod
-  7.0.12-verified. **Follow-ups discovered (NOT fixed — separate slices):** (1)
+  7.0.12-verified. **`$substrBytes` / `$substr` bool-argument cluster fixed**
+  (2026-07-18): `$substrBytes` rejected a bool with mongod's codes (16034 start /
+  16035 length, note the verbatim double-space message); and `$substr` — which
+  mongod treats as a deprecated *byte-based* alias of `$substrBytes` — was
+  mis-aliased to code-point `$substrCP` on both servers, so it diverged on
+  multi-byte strings and reported the wrong bool code (34450 vs 16034). `$substr`
+  now aliases `$substrBytes` on both servers; three-way mongod-verified.
+  **Follow-ups still open (NOT fixed — separate slices):** (1)
   these operators reject a *float* index too (`$arrayElemAt: [[..], 2.0]`), but
   mongod *accepts* a whole-number double and truncates it — a distinct
   float-truncation divergence needing its own mongod probe of the rounding rule.
-  (2) `$substrBytes` / `$substr` (deprecated) almost certainly share the bool
-  divergence but were not probed against mongod, so their guard/codes are
-  unverified — verify + fix as a sibling. **Done
+  (2) `$substrBytes` / `$substr` cutting **mid-UTF8-character** (e.g.
+  `$substrBytes: ["héllo", 0, 2]`) — mongod errors 28657, but both SecantusDB
+  servers decode with `errors="replace"` and return a replacement char; verify +
+  fix as a sibling. **Done
   (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and

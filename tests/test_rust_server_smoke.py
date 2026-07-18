@@ -1162,6 +1162,8 @@ def test_aggregation_expr_bool_argument_rejected(tmp_path) -> None:
             {"$slice": [[1, 2, 3, 4], 1, True]},
             {"$sortArray": {"input": [3, 1, 2], "sortBy": True}},
             {"$substrCP": ["hello", True, 2]},
+            {"$substrBytes": ["hello", True, 2]},
+            {"$substr": ["hello", True, 2]},
             {"$range": [0, True]},
             {"$indexOfArray": [[1, 2, 3], 2, True]},
         ):

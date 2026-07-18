@@ -4323,6 +4323,10 @@ def test_aggregation_expr_bool_argument_rejected(coll) -> None:
         ({"$sortArray": {"input": [3, 1, 2], "sortBy": True}}, 2942507),
         ({"$substrCP": ["hello", True, 2]}, 34450),
         ({"$substrCP": ["hello", 1, True]}, 34452),
+        ({"$substrBytes": ["hello", True, 2]}, 16034),
+        ({"$substrBytes": ["hello", 1, True]}, 16035),
+        ({"$substr": ["hello", True, 2]}, 16034),  # $substr aliases $substrBytes
+        ({"$substr": ["hello", 1, True]}, 16035),
         ({"$range": [True, 5]}, 34443),
         ({"$range": [0, True]}, 34445),
         ({"$range": [0, 5, True]}, 34447),
