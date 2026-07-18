@@ -1209,3 +1209,26 @@ def test_aggregation_whole_double_index_accepted(tmp_path) -> None:
                 list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
     finally:
         srv.stop()
+
+
+def test_substr_bytes_split_utf8_rejected(tmp_path) -> None:
+    """The Rust server rejects a $substrBytes range that splits a UTF-8
+    character (its byte slice isn't valid UTF-8, so the core defers to BadValue)
+    rather than returning a replacement char. Clean boundaries still compute."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        for expr in (
+            {"$substrBytes": ["héllo", 0, 2]},
+            {"$substrBytes": ["héllo", 2, 3]},
+            {"$substr": ["héllo", 0, 2]},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        got = list(
+            coll.aggregate([{"$project": {"r": {"$substrBytes": ["héllo", 0, 3]}, "_id": 0}}])
+        )
+        assert got == [{"r": "hé"}]
+    finally:
+        srv.stop()

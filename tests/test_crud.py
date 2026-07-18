@@ -4369,3 +4369,22 @@ def test_aggregation_whole_double_index_accepted(coll) -> None:
         with pytest.raises(OperationFailure) as exc:
             list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
         assert exc.value.code == code, expr
+
+
+def test_substr_bytes_split_utf8_rejected(coll) -> None:
+    """$substrBytes rejects a range that splits a UTF-8 character (mongod codes
+    28656 start / 28657 end) over the wire. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$substrBytes": ["héllo", 0, 2]}, 28657),
+        ({"$substrBytes": ["héllo", 2, 3]}, 28656),
+        ({"$substr": ["héllo", 0, 2]}, 28657),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+    # Clean boundary still computes.
+    got = list(coll.aggregate([{"$project": {"r": {"$substrBytes": ["héllo", 0, 3]}, "_id": 0}}]))
+    assert got == [{"r": "hé"}]

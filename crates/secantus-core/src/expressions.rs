@@ -3680,6 +3680,24 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     };
     let bytes = s.as_bytes();
     let blen = bytes.len() as i64;
+    // mongod rejects a byte range whose start is a UTF-8 continuation byte, or
+    // whose end splits a character -- even for an empty (length 0) range, which
+    // the from_utf8 check below would miss. Python raises 28656 / 28657 here;
+    // the core defers. Only for a non-negative start (a negative start keeps the
+    // legacy slice semantics, matched on both engines).
+    if start >= 0 {
+        if start < blen && (bytes[start as usize] & 0xC0) == 0x80 {
+            return Err(Fallback); // Python raises 28656
+        }
+        let end = if length < 0 {
+            blen
+        } else {
+            start.saturating_add(length)
+        };
+        if (0..blen).contains(&end) && (bytes[end as usize] & 0xC0) == 0x80 {
+            return Err(Fallback); // Python raises 28657
+        }
+    }
     let stop = if length < 0 {
         blen
     } else {
