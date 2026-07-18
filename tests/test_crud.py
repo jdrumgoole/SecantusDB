@@ -814,6 +814,26 @@ def test_aggregate_sort_stage_validation_via_pymongo(coll) -> None:
     assert [d["_id"] for d in coll.aggregate([{"$sort": {"n": 1.0}}])] == [2, 1]
 
 
+def test_facet_validation_via_pymongo(coll) -> None:
+    """$facet: empty/non-object spec 40169, non-array sub-pipeline 40170,
+    non-object stage 40171, nested $facet 40600. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 2}])
+    for spec, code in [
+        ({}, 40169),
+        ({"a": 5}, 40170),
+        ({"a": [5]}, 40171),
+        ({"a": [{"$facet": {"b": [{"$match": {"v": 1}}]}}]}, 40600),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$facet": spec}]))
+        assert exc.value.code == code, spec
+    # A valid $facet still runs its sub-pipelines.
+    out = list(coll.aggregate([{"$facet": {"n": [{"$count": "c"}]}}]))
+    assert out == [{"n": [{"c": 2}]}]
+
+
 def test_densify_validation_via_pymongo(coll) -> None:
     """$densify: date unit on numeric 6053600, bool step 14, non-positive step
     5733401, bad bounds string 5946802, wrong-length array 5733403, descending

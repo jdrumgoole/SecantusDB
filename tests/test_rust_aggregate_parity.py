@@ -887,6 +887,26 @@ def test_densify_invalid_defers_and_raises(rng, code):
     assert exc.value.code == code
 
 
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        ({}, 40169),
+        ({"a": 5}, 40170),
+        ({"a": [5]}, 40171),
+        ({"a": [{}]}, 40171),
+        ({"a": [{"$facet": {"b": [{"$match": {"v": 1}}]}}]}, 40600),
+    ],
+)
+def test_facet_invalid_defers_and_raises(spec, code):
+    # Invalid $facet: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$facet": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
 def _rand_scalar(rng):
     r = rng.random()
     if r < 0.3:

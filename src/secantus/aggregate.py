@@ -1792,12 +1792,40 @@ def _stage_sort_by_count(
 def _stage_facet(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    if not isinstance(spec, Mapping):
-        raise AggregateError("$facet requires a document of {name: pipeline}")
+    # mongod validates the $facet spec before running any sub-pipeline: a
+    # non-empty object (40169), each value an array (40170), each stage a
+    # non-empty object (40171), and no nested $facet (40600). Without this a
+    # non-object stage element (`{a: [5]}`) leaks a Python TypeError.
+    if not isinstance(spec, Mapping) or not spec:
+        raise AggregateError(
+            f"the $facet specification must be a non-empty object, but found: $facet: {spec!r}",
+            code=40169,
+            code_name="Location40169",
+        )
     out: dict[str, Any] = {}
     for name, sub_pipeline in spec.items():
         if not isinstance(sub_pipeline, list):
-            raise AggregateError(f"$facet entry {name!r} must be a pipeline array")
+            raise AggregateError(
+                "arguments to $facet must be arrays, "
+                f"{name} is type {_bson_type_name(sub_pipeline)}",
+                code=40170,
+                code_name="Location40170",
+            )
+        for i, stage in enumerate(sub_pipeline):
+            if not isinstance(stage, Mapping) or not stage:
+                raise AggregateError(
+                    "elements of arrays in $facet spec must be non-empty objects, "
+                    f"{name} argument contained an element of type "
+                    f"{_bson_type_name(stage)}: {i}: {stage!r}",
+                    code=40171,
+                    code_name="Location40171",
+                )
+            if "$facet" in stage:
+                raise AggregateError(
+                    "$facet is not allowed to be used within a $facet stage",
+                    code=40600,
+                    code_name="Location40600",
+                )
         out[name] = apply_pipeline(list(docs), sub_pipeline, ctx)
     return [out]
 
