@@ -302,6 +302,11 @@ jobs:
         # its own, and the split stays CORRECT regardless — a wrong durations
         # file mis-balances the groups but can never drop or duplicate a test.
         # Cron latency is not worth a second recording job.
+        # ``shell: bash`` is required: windows-latest defaults to PowerShell,
+        # where the backslash line-continuations below are a ParserError. The
+        # sql/core body this replaced carried it for glob expansion; dropping it
+        # broke all three Windows groups while Linux (bash by default) passed.
+        shell: bash
         run: |
           uv run python -m pytest \
             --splits 3 --group ${{ matrix.group }} \
@@ -400,6 +405,11 @@ jobs:
         # ``sql`` shard is the SQL engine + PG-wire suites; ``core`` is
         # everything else. git-bash expands the globs.
         # See the ``test`` job for why the seed is pinned.
+        # ``shell: bash`` is required: windows-latest defaults to PowerShell,
+        # where the backslash line-continuations below are a ParserError. The
+        # sql/core body this replaced carried it for glob expansion; dropping it
+        # broke all three Windows groups while Linux (bash by default) passed.
+        shell: bash
         run: |
           uv run python -m pytest \
             --splits 3 --group ${{ matrix.group }} \
@@ -571,6 +581,11 @@ jobs:
         env:
           SECANTUS_FORCE_DURABLE: "1"
         # See the ``test`` job for why the seed is pinned.
+        # ``shell: bash`` is required: windows-latest defaults to PowerShell,
+        # where the backslash line-continuations below are a ParserError. The
+        # sql/core body this replaced carried it for glob expansion; dropping it
+        # broke all three Windows groups while Linux (bash by default) passed.
+        shell: bash
         run: |
           uv run python -m pytest \
             --splits 3 --group ${{ matrix.group }} \
