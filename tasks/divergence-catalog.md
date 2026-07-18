@@ -11,8 +11,12 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 
 ## Tier 1 — crash / data-corruption / silent-wrong-results (highest value)
 
-- **`$pow` returns a Python complex** (`$pow: [-2, 0.5]`) → crashes BSON encode
-  (`InvalidDocument`). mongod → `NaN`. **Verified.** (expressions.py / .rs)
+- ~~**`$pow` returns a Python complex**~~ **FIXED (#483):** returns NaN + operand
+  validation (28762/28763/28764).
+- ~~**`$gte`/`$lte: null`** doesn't match null+missing~~ **FIXED (#484):** routes to
+  `$eq: null` semantics, both engines.
+- ~~**`$exists` Python-truthiness**~~ **FIXED (#484):** uses mongod truthiness
+  (empty string/array/doc truthy), both engines.
 - **`$rename` data corruption**: same-field (`{a:'a'}` → mongod ERR 2), array-element
   source/dest (`{'arr.0':'b'}` corrupts `arr=[None,2,3]`; `{a:'arr.0'}` writes into
   the array), empty target (ERR 56). SecantusDB silently corrupts. Non-string target

@@ -545,18 +545,27 @@ def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | Non
     if op == "$gt":
         return _cmp(values, arg, lambda a, b: a > b, collation)
     if op == "$gte":
+        # `$gte: null` (like `$lte: null`) matches null and missing — the same
+        # set as `$eq: null` — because null only orders equal to null. `$gt`/`$lt`
+        # null match nothing (a value is never strictly above/below null).
+        if arg is None:
+            return _eq_with_array(values, None, collation)
         return _cmp(values, arg, lambda a, b: a >= b, collation)
     if op == "$lt":
         return _cmp(values, arg, lambda a, b: a < b, collation)
     if op == "$lte":
+        if arg is None:
+            return _eq_with_array(values, None, collation)
         return _cmp(values, arg, lambda a, b: a <= b, collation)
     if op == "$in":
         return any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$nin":
         return not any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$exists":
+        # mongod uses its own truthiness for the argument (only false / 0 / null
+        # are falsy — an empty string / array / document is truthy), NOT Python's.
         present = any(v is not MISSING for v in values)
-        return present == bool(arg)
+        return present == _truthy(arg)
     if op == "$not":
         return not _field_matches(values, arg, collation)
     if op == "$type":
