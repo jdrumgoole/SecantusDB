@@ -488,7 +488,22 @@ def _op_pow(arg: Any, ctx: _Ctx) -> Any:
     base, exponent = _eval(arg[0], ctx), _eval(arg[1], ctx)
     if base is None or exponent is None:
         return None
-    return base**exponent
+    if not _is_numeric(base):
+        raise ExpressionError(
+            f"$pow's base must be numeric, not {_bson_type_name(base)}", code=28762
+        )
+    if not _is_numeric(exponent):
+        raise ExpressionError(
+            f"$pow's exponent must be numeric, not {_bson_type_name(exponent)}", code=28763
+        )
+    if base == 0 and exponent < 0:
+        raise ExpressionError("$pow cannot take a base of 0 and a negative exponent", code=28764)
+    result = base**exponent
+    # A negative base with a fractional exponent yields a Python complex, which
+    # is unencodable (crashes BSON) — mongod returns NaN instead.
+    if isinstance(result, complex):
+        return float("nan")
+    return result
 
 
 def _op_exp(arg: Any, ctx: _Ctx) -> Any:

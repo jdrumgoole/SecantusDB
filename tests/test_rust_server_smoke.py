@@ -1334,3 +1334,24 @@ def test_bits_numeric_arg_validation(tmp_path) -> None:
                 coll.count_documents(query)
     finally:
         srv.stop()
+
+
+def test_pow_domain_validation(tmp_path) -> None:
+    """The Rust server returns NaN for a negative base + fractional exponent
+    (matching Python, not a crash) and rejects bad operands (defer -> BadValue)."""
+    import math
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        got = list(coll.aggregate([{"$project": {"r": {"$pow": [-2, 0.5]}, "_id": 0}}]))
+        assert len(got) == 1 and math.isnan(got[0]["r"])
+        assert (
+            list(coll.aggregate([{"$project": {"r": {"$pow": [-2, 3]}, "_id": 0}}]))[0]["r"] == -8
+        )
+        for expr in ({"$pow": ["x", 2]}, {"$pow": [2, True]}, {"$pow": [0, -1]}):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+    finally:
+        srv.stop()

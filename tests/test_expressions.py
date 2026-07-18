@@ -1223,3 +1223,27 @@ def test_substr_bytes_truncates_double_index() -> None:
     with pytest.raises(ExpressionError) as exc:
         evaluate({"$substrBytes": ["abcde", -1.7, 2]}, {}, None)
     assert exc.value.code == 50752
+
+
+def test_pow_domain_and_type_validation() -> None:
+    """$pow: a negative base with a fractional exponent returns NaN (not an
+    unencodable Python complex), and a non-numeric operand / bool / a zero base
+    with a negative exponent raise mongod's codes. mongod 7.0.12-verified."""
+    import bson
+
+    r = evaluate({"$pow": [-2, 0.5]}, {}, None)
+    assert isinstance(r, float) and math.isnan(r)
+    bson.encode({"r": r})  # must be encodable (regression: was a complex -> crash)
+    assert evaluate({"$pow": [-2, 3]}, {}, None) == -8
+    assert evaluate({"$pow": [2, 10]}, {}, None) == 1024
+    assert evaluate({"$pow": ["$missing", 2]}, {}, None) is None
+    for expr, code in [
+        ({"$pow": ["x", 2]}, 28762),
+        ({"$pow": [True, 2]}, 28762),
+        ({"$pow": [2, "x"]}, 28763),
+        ({"$pow": [2, True]}, 28763),
+        ({"$pow": [0, -1]}, 28764),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr
