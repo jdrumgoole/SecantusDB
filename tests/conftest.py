@@ -166,8 +166,17 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     _last_progress_at = time.monotonic()
 
 
+@pytest.hookimpl(optionalhook=True)
 def pytest_testnodedown(node: object, error: object) -> None:
     """Controller-side hook: an xdist worker went down.
+
+    ``optionalhook=True`` is load-bearing, not decoration. This hook is defined
+    by pytest-xdist, so without that plugin installed pluggy rejects the whole
+    conftest with ``PluginValidationError: unknown hook 'pytest_testnodedown'``
+    — taking every test in the suite down with it, not just this watchdog. That
+    is not hypothetical: the ``storage-engine`` lane smoke-tests the built wheel
+    under a bare ``--with pytest`` environment with no xdist, and it failed
+    exactly this way. The flag tells pluggy to skip the unknown-hook check.
 
     Called with a truthy ``error`` exactly where xdist prints
     ``[gwN] node down: <error>``. A crash on its own is survivable — xdist may
