@@ -207,6 +207,24 @@ def test_all_with_elemmatch() -> None:
     assert not matches({"a": [5, 10]}, q2)  # nothing < 2
 
 
+def test_all_argument_validation() -> None:
+    # mongod: $all needs an array; if any element is a $-expression it must be an
+    # all-$elemMatch form — a mixed or other $-op element is "no $ expressions".
+    with pytest.raises(QueryError) as exc:
+        matches({"a": [1, 2]}, {"a": {"$all": 5}})
+    assert exc.value.code == 2 and "needs an array" in str(exc.value)
+    for bad in (
+        {"a": {"$all": [1, {"$elemMatch": {"x": 1}}]}},  # mixed
+        {"a": {"$all": [{"$gt": 1}]}},  # non-elemMatch $-doc
+    ):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": [1, 2]}, bad)
+        assert exc.value.code == 2 and "no $ expressions in $all" in str(exc.value)
+    # A pure-scalar form and an all-$elemMatch form remain valid.
+    assert matches({"a": [1, 2, 3]}, {"a": {"$all": [1, 2]}})
+    assert matches({"a": [1, 2, 3]}, {"a": {"$all": [{"$elemMatch": {"$gt": 2}}]}})
+
+
 def test_in_with_regex() -> None:
     # A regex candidate matches string values by pattern (not by equality).
     assert matches({"s": "hello"}, {"s": {"$in": [Regex("^h", "i")]}})

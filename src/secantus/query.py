@@ -1229,7 +1229,21 @@ def _op_size(values: list[Any], size: Any) -> bool:
 
 def _op_all(values: list[Any], required: Any) -> bool:
     if not isinstance(required, list):
-        raise QueryError("$all requires an array")
+        raise QueryError("$all needs an array")
+
+    # mongod: if any element is a $-expression document, EVERY element must be a
+    # {$elemMatch: …} clause (the all-$elemMatch form). Mixing $elemMatch with a
+    # scalar, or using any other $-operator doc, is "no $ expressions in $all".
+    def _is_elemmatch_clause(e: Any) -> bool:
+        return isinstance(e, Mapping) and list(e.keys()) == ["$elemMatch"]
+
+    def _has_dollar_key(e: Any) -> bool:
+        return isinstance(e, Mapping) and any(str(k).startswith("$") for k in e)
+
+    if any(_has_dollar_key(e) for e in required) and not all(
+        _is_elemmatch_clause(e) for e in required
+    ):
+        raise QueryError("no $ expressions in $all")
 
     def _elem_matches_required(elem: Any, r: Any) -> bool:
         # Regex elements in the ``$all`` array match as patterns, not by

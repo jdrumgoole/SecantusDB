@@ -65,8 +65,8 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 - **Query operator validation**: `$in`/`$nin` non-array + `$`-doc element FIXED (#494,
   → 2); `$regex` bad `$options` / `$options`-without-`$regex` / non-string `$regex`
   FIXED (#496, → 51108 / 2); `$elemMatch` non-doc (query) + `$not` invalid arg
-  FIXED (#497, → 2). Remaining: `$elemMatch` non-doc in *projection* (proj→31274);
-  `$all` mixed `$elemMatch`+scalar matches (mongod 2). (query.py)
+  FIXED (#497, → 2); `$all` non-array + mixed/non-`$elemMatch` `$`-doc FIXED (#498,
+  → 2). Remaining: `$elemMatch` non-doc in *projection* (proj→31274). (query.py)
 - **Projection `$slice`**: bool/string → mongod 28667; `[bad,limit]`/3-elem/`[skip,
   neg-limit]` → mongod 28724; SecantusDB silently returns full/wrong array. (projection.py)
 - **`$type` validation**: unknown alias / fractional code / bool / bad code silently

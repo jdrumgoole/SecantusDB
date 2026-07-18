@@ -391,7 +391,8 @@ CURATED = [
         {"a": [1, 5, 10]},
         {"a": {"$all": [{"$elemMatch": {"$gt": 4}}, {"$elemMatch": {"$lt": 2}}]}},
     ),
-    ({"a": [1, 2, 3]}, {"a": {"$all": [2, {"$elemMatch": {"$gt": 2}}]}}),  # mixed
+    # (A mixed $all — scalar + $elemMatch — is now rejected by both engines;
+    # covered by test_all_invalid_defers_and_raises, not here.)
     # $in / $nin with a regex candidate — matches string values by pattern.
     ({"s": "hello"}, {"s": {"$in": [Regex("^h", "i")]}}),
     ({"s": "World"}, {"s": {"$in": [Regex("^h", "i")]}}),  # no match
@@ -779,6 +780,24 @@ def test_in_nin_invalid_defers_and_raises(query):
 )
 def test_not_elemmatch_invalid_defers_and_raises(query):
     # Invalid $not/$elemMatch: Rust defers (None), pure engine raises BadValue.
+    doc = bson.decode(bson.encode({"a": [1, 2, 3]}))
+    query = bson.decode(bson.encode({"q": query}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"a": {"$all": 5}},  # non-array
+        {"a": {"$all": [1, {"$elemMatch": {"x": 1}}]}},  # mixed elemMatch + scalar
+        {"a": {"$all": [{"$gt": 1}]}},  # non-elemMatch $-doc
+    ],
+)
+def test_all_invalid_defers_and_raises(query):
+    # Invalid $all: Rust defers (None), pure engine raises BadValue.
     doc = bson.decode(bson.encode({"a": [1, 2, 3]}))
     query = bson.decode(bson.encode({"q": query}))["q"]
     assert _rust_match(doc, query) is None

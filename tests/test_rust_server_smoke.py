@@ -1578,3 +1578,23 @@ def test_not_elemmatch_validation(tmp_path) -> None:
         assert [d["_id"] for d in coll.find({"arr": {"$elemMatch": {"$gt": 2}}})] == [1]
     finally:
         srv.stop()
+
+
+def test_all_argument_validation(tmp_path) -> None:
+    """The Rust server rejects a non-array $all and a mixed/non-$elemMatch
+    $-expression element (defer -> BadValue); valid forms still match."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "a": [1, 2, 3]})
+        for q in (
+            {"a": {"$all": 5}},
+            {"a": {"$all": [1, {"$elemMatch": {"x": 1}}]}},
+            {"a": {"$all": [{"$gt": 1}]}},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.find(q))
+        assert [d["_id"] for d in coll.find({"a": {"$all": [1, 2]}})] == [1]
+        assert [d["_id"] for d in coll.find({"a": {"$all": [{"$elemMatch": {"$gt": 2}}]}})] == [1]
+    finally:
+        srv.stop()
