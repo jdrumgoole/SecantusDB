@@ -1312,3 +1312,25 @@ def test_sample_size_validation(tmp_path) -> None:
                 list(coll.aggregate([{"$sample": {"size": size}}]))
     finally:
         srv.stop()
+
+
+def test_bits_numeric_arg_validation(tmp_path) -> None:
+    """The Rust server accepts a whole-double $bits* mask/position (computing,
+    matching the Python server) and rejects fractional / negative / bool (the
+    core defers to BadValue)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "n": 6})
+        assert coll.count_documents({"n": {"$bitsAllSet": 6.0}}) == 1
+        assert coll.count_documents({"n": {"$bitsAllSet": [1.0, 2.0]}}) == 1
+        for query in (
+            {"n": {"$bitsAllSet": 2.5}},
+            {"n": {"$bitsAllSet": -1}},
+            {"n": {"$bitsAllSet": [1.5]}},
+            {"n": {"$bitsAllSet": [-1]}},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                coll.count_documents(query)
+    finally:
+        srv.stop()
