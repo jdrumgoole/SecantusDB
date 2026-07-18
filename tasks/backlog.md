@@ -3865,3 +3865,27 @@ recorded in that slice's changelog fragment. Still open:
   mongod-correct, but once Rust writes stop serializing (lock split below)
   steal-retries become possible; add the periodic-warning pattern from
   `_retry_write_conflicts` so a steal-storm is visible in server logs.
+
+## CI build cost
+
+- [ ] **Vendored WiredTiger is rebuilt from source in every CI job** (~100 s x 13
+  jobs) and on every *local* `uv sync`, despite `BUILD_ALWAYS OFF`. Root cause
+  found: ExternalProject records `PATCH_COMMAND` / `CMAKE_ARGS` verbatim and
+  both named `${Python3_EXECUTABLE}`, which under a PEP 517 build is the
+  isolated build env's interpreter — a fresh temp path on every build — so the
+  patch and configure stamps were invalidated every time. Local half is fixed
+  (interpreter passed by file + `REALPATH`; rebuild 37 s -> 1.3 s). CI still
+  pays it in full because every job starts from a fresh checkout with no build
+  dir; that needs a build-dir cache, whose design and the source-patching
+  hazard it must avoid are in `tasks/wt-build-cache-plan.md`. Windows is still
+  unstabilised there (venv pythons are copies, so `REALPATH` is a no-op).
+- [ ] **`test_await_data_blocks_then_wakes_on_insert` still flakes under CI load.**
+  Seen on PR #512's run (`test-durable (3.10, ubuntu-latest, 4)`): `assert
+  len(events) == 1` got 0, i.e. the drain window closed before the awaited
+  insert surfaced. Passed on rerun of the same commit, so it is timing, not a
+  regression — but the test already carries a comment describing a previous fix
+  for exactly this failure mode (the per-getMore await window was dropped to 1s
+  under a 5s drain so pymongo re-polls), which means that fix narrowed the
+  window without closing it. Flaky is failing: either widen the drain bound or
+  make the wake deterministic (e.g. have the test observe the oplog write
+  directly rather than racing a wall-clock deadline).
