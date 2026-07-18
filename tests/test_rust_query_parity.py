@@ -259,6 +259,10 @@ CURATED = [
     ({"a": 1.5}, {"a": {"$type": ["string", "int"]}}),
     ({"a": Int64(5)}, {"a": {"$type": "long"}}),
     ({"a": 5}, {"a": {"$type": "int"}}),
+    ({"a": 5}, {"a": {"$type": 16}}),  # numeric code
+    ({"a": 5}, {"a": {"$type": 2.0}}),  # whole-double code now computes on both
+    ({"a": 5}, {"a": {"$type": 16.0}}),  # whole-double int code -> matches
+    ({"a": 5}, {"a": {"$type": -1}}),  # minKey code (valid, no match)
     ({"tags": [1, 2, 3]}, {"tags": {"$size": 3}}),
     ({"tags": [1, 2]}, {"tags": {"$size": 3}}),
     ({"tags": "abc"}, {"tags": {"$size": 3}}),
@@ -804,6 +808,27 @@ def test_all_invalid_defers_and_raises(query):
     with pytest.raises(_pure.QueryError) as exc:
         _pure.matches(doc, query)
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "t,code",
+    [
+        ("notatype", 2),  # unknown alias
+        (0, 2),  # invalid code
+        (100, 2),  # out-of-range code
+        (2.5, 2),  # fractional code
+        (True, 14),  # bool
+        (["int", "notatype"], 2),  # array with a bad element
+    ],
+)
+def test_type_invalid_defers_and_raises(t, code):
+    # Invalid $type: Rust defers (None), pure engine raises the mongod code.
+    doc = bson.decode(bson.encode({"a": 5}))
+    query = bson.decode(bson.encode({"q": {"a": {"$type": t}}}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == code
 
 
 @pytest.mark.parametrize(

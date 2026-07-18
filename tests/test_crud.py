@@ -411,6 +411,21 @@ def test_not_elemmatch_validation_via_pymongo(coll) -> None:
     assert [d["_id"] for d in coll.find({"arr": {"$elemMatch": {"$gt": 2}}})] == [1]
 
 
+def test_type_argument_validation_via_pymongo(coll) -> None:
+    """$type: unknown alias / out-of-range / fractional code -> 2, bool -> 14;
+    a whole-double code still matches. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 5})
+    for t, code in [("notatype", 2), (0, 2), (100, 2), (2.5, 2), (True, 14)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find({"a": {"$type": t}}))
+        assert exc.value.code == code, t
+    # Valid: alias, numeric code, and whole-double code.
+    assert [d["_id"] for d in coll.find({"a": {"$type": "int"}})] == [1]
+    assert [d["_id"] for d in coll.find({"a": {"$type": 16.0}})] == [1]
+
+
 def test_in_nin_argument_validation_via_pymongo(coll) -> None:
     """$in/$nin need an array (BadValue); a nested $-prefixed doc element is
     rejected ("cannot nest $ under $in"). mongod 7.0.12-verified."""

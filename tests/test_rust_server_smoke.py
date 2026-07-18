@@ -1708,3 +1708,20 @@ def test_projection_slice_validation(tmp_path) -> None:
         assert coll.find_one({}, {"_id": 0, "a": {"$slice": [1, 2]}})["a"] == [2, 3]
     finally:
         srv.stop()
+
+
+def test_type_argument_validation(tmp_path) -> None:
+    """The Rust server rejects an invalid $type (unknown alias, out-of-range /
+    fractional code, bool) instead of silently no-matching, and accepts a valid
+    alias / numeric / whole-double code."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "a": 5})
+        for t in ("notatype", 0, 100, 2.5, True):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.find({"a": {"$type": t}}))
+        assert [d["_id"] for d in coll.find({"a": {"$type": "int"}})] == [1]
+        assert [d["_id"] for d in coll.find({"a": {"$type": 16.0}})] == [1]
+    finally:
+        srv.stop()
