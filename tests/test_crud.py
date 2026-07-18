@@ -4339,3 +4339,29 @@ def test_aggregation_expr_bool_argument_rejected(coll) -> None:
     # An int argument still computes.
     out = list(coll.aggregate([{"$project": {"r": {"$arrayElemAt": [[10, 20, 30], 1]}, "_id": 0}}]))
     assert out == [{"r": 20}]
+
+
+def test_aggregation_whole_double_index_accepted(coll) -> None:
+    """mongod accepts a whole-number double where an int index is expected and
+    rejects a fractional double. Both hold over the wire. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    got = list(
+        coll.aggregate([{"$project": {"r": {"$arrayElemAt": [[10, 20, 30], 2.0]}, "_id": 0}}])
+    )
+    assert got == [{"r": 30}]
+    got = list(
+        coll.aggregate([{"$project": {"r": {"$slice": [[1, 2, 3, 4], 1.0, 2.0]}, "_id": 0}}])
+    )
+    assert got == [{"r": [2, 3]}]
+
+    for expr, code in [
+        ({"$arrayElemAt": [[10, 20, 30], 2.7]}, 28691),
+        ({"$slice": [[1, 2, 3, 4], 2.7]}, 28726),
+        ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, 28728),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 40096),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr

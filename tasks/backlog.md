@@ -1138,10 +1138,28 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   multi-byte strings and reported the wrong bool code (34450 vs 16034). `$substr`
   now aliases `$substrBytes` on both servers; three-way mongod-verified.
   **Follow-ups still open (NOT fixed — separate slices):** (1)
-  these operators reject a *float* index too (`$arrayElemAt: [[..], 2.0]`), but
-  mongod *accepts* a whole-number double and truncates it — a distinct
-  float-truncation divergence needing its own mongod probe of the rounding rule.
-  (2) `$substrBytes` / `$substr` cutting **mid-UTF8-character** (e.g.
+  **whole-number-double index** — these operators reject *all* float indices, but
+  mongod *accepts a whole-number double* (`$arrayElemAt: [[..], 2.0]` → element 2;
+  `-1.0` → last) and *rejects a fractional* one with a per-op code, NOT truncation.
+  Fully probed against mongod 7.0.12 (2026-07-18): `$arrayElemAt` frac → **28691**,
+  `$slice` → **28726**, `$substrCP` → **34451**, `$indexOfArray` → **40096** (same as
+  bool), `$range` → **34446**, `$round` place → **51082** ("precision argument to
+  $round must be a integral value", double-space verbatim). **Exception:**
+  `$substrBytes` (and thus `$substr`) *accepts any double and truncates* (`1.7` →
+  same as `1.0`) — no fractional rejection. Fix = accept int-or-whole-double
+  (coerce to int), reject fractional with the per-op code (except substrBytes
+  truncates); needs a shared `_as_int_index` helper on both engines. Best split by
+  operator family (array indices first — the common case). **Array operators done
+  (2026-07-18):** `$arrayElemAt` / `$slice` / `$indexOfArray` accept a whole-number
+  double (coerce to int, compute on *both* servers) and reject a fractional one
+  with the per-op code (28691 / 28726 / 28728 / 40096) — via `_int_index` /
+  `_FractionalIndex` (Python) + the `IdxCoerce` enum (Rust). **Still open:**
+  `$substrCP` (34451) start/length, `$range` (34443/34445/34447→actually 34444/
+  34446/34448 for the "not representable" variant — re-probe), and `$round` place
+  (51082) whole-double acceptance; plus a *huge* whole double (> 2^31) is accepted
+  here but mongod rejects it (32-bit-representable check) — a narrow edge, both
+  SecantusDB engines stay mutually consistent (both null). (2) `$substrBytes` /
+  `$substr` cutting **mid-UTF8-character** (e.g.
   `$substrBytes: ["héllo", 0, 2]`) — mongod errors 28657, but both SecantusDB
   servers decode with `errors="replace"` and return a replacement char; verify +
   fix as a sibling. **Done

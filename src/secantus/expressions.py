@@ -191,6 +191,30 @@ def _is_numeric(v: Any) -> bool:
     return isinstance(v, (int, float, Decimal128)) and not isinstance(v, bool)
 
 
+def _fmt_double(v: float) -> str:
+    """Render a double the way mongod prints it in an error message: a
+    shortest round-trip form (Python's `repr` matches for the values that
+    reach these paths — small fractionals like `2.7`)."""
+    return repr(v)
+
+
+class _FractionalIndex(Exception):
+    """Signal: a double index arg has a fractional part (mongod rejects it)."""
+
+
+def _int_index(v: Any) -> Any:
+    """Coerce a numeric aggregation index arg to `int`, mongod-style: an `int`
+    passes through, a whole-number `float` becomes `int`, a fractional `float`
+    raises `_FractionalIndex` (the caller turns it into the operator's exact
+    error code). Any other type is returned unchanged for the caller's own
+    non-numeric handling. `bool` must be rejected by the caller first."""
+    if isinstance(v, float):
+        if v.is_integer():
+            return int(v)
+        raise _FractionalIndex
+    return v
+
+
 def _fold_numeric(values: list[Any], *, mul: bool) -> Any:
     """Sum or product over validated numeric operands. Mixing in a
     Decimal128 promotes the whole fold to decimal, like mongod's
@@ -1474,6 +1498,22 @@ def _op_index_of_array(arg: Any, ctx: _Ctx) -> Any:
             f"type: bool, with value: {'true' if end else 'false'}",
             code=40096,
         )
+    try:
+        start = _int_index(start)
+    except _FractionalIndex:
+        raise ExpressionError(
+            "$indexOfArrayrequires an integral starting index, found a value of "
+            f"type: double, with value: {_fmt_double(start)}",
+            code=40096,
+        ) from None
+    try:
+        end = _int_index(end)
+    except _FractionalIndex:
+        raise ExpressionError(
+            "$indexOfArrayrequires an integral ending index, found a value of "
+            f"type: double, with value: {_fmt_double(end)}",
+            code=40096,
+        ) from None
     if not isinstance(start, int) or not isinstance(end, int):
         return -1
     for i in range(max(0, start), min(len(arr), end)):
@@ -1838,6 +1878,14 @@ def _op_array_elem_at(arg: Any, ctx: _Ctx) -> Any:
             "$arrayElemAt's second argument must be a numeric value, but is bool",
             code=28690,
         )
+    try:
+        idx = _int_index(idx)
+    except _FractionalIndex:
+        raise ExpressionError(
+            "$arrayElemAt's second argument must be representable as a 32-bit "
+            f"integer: {_fmt_double(idx)}",
+            code=28691,
+        ) from None
     if not isinstance(arr, list) or not isinstance(idx, int):
         return None
     if -len(arr) <= idx < len(arr):
@@ -1967,6 +2015,14 @@ def _op_slice(arg: Any, ctx: _Ctx) -> Any:
                 "Second argument to $slice must be a numeric value, but is of type: bool",
                 code=28725,
             )
+        try:
+            n = _int_index(n)
+        except _FractionalIndex:
+            raise ExpressionError(
+                "Second argument to $slice can't be represented as a 32-bit "
+                f"integer: {_fmt_double(n)}",
+                code=28726,
+            ) from None
         if not isinstance(n, int):
             return None
         return arr[:n] if n >= 0 else arr[n:]
@@ -1982,6 +2038,21 @@ def _op_slice(arg: Any, ctx: _Ctx) -> Any:
             "Third argument to $slice must be numeric, but is of type: bool",
             code=28727,
         )
+    try:
+        position = _int_index(position)
+    except _FractionalIndex:
+        raise ExpressionError(
+            "Second argument to $slice can't be represented as a 32-bit "
+            f"integer: {_fmt_double(position)}",
+            code=28726,
+        ) from None
+    try:
+        n = _int_index(n)
+    except _FractionalIndex:
+        raise ExpressionError(
+            f"Third argument to $slice can't be represented as a 32-bit integer: {_fmt_double(n)}",
+            code=28728,
+        ) from None
     if not isinstance(position, int) or not isinstance(n, int):
         return None
     return arr[position : position + n]
