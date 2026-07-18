@@ -3865,3 +3865,17 @@ recorded in that slice's changelog fragment. Still open:
   mongod-correct, but once Rust writes stop serializing (lock split below)
   steal-retries become possible; add the periodic-warning pattern from
   `_retry_write_conflicts` so a steal-storm is visible in server logs.
+
+## CI build cost
+
+- [ ] **Vendored WiredTiger is rebuilt from source in every CI job** (~100 s x 13
+  jobs) and on every *local* `uv sync`, despite `BUILD_ALWAYS OFF`. Root cause
+  found: ExternalProject records `PATCH_COMMAND` / `CMAKE_ARGS` verbatim and
+  both named `${Python3_EXECUTABLE}`, which under a PEP 517 build is the
+  isolated build env's interpreter — a fresh temp path on every build — so the
+  patch and configure stamps were invalidated every time. Local half is fixed
+  (interpreter passed by file + `REALPATH`; rebuild 37 s -> 1.3 s). CI still
+  pays it in full because every job starts from a fresh checkout with no build
+  dir; that needs a build-dir cache, whose design and the source-patching
+  hazard it must avoid are in `tasks/wt-build-cache-plan.md`. Windows is still
+  unstabilised there (venv pythons are copies, so `REALPATH` is a no-op).
