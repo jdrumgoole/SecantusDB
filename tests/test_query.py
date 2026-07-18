@@ -219,6 +219,26 @@ def test_in_with_regex() -> None:
     assert not matches({"s": "hello"}, {"s": {"$nin": [Regex("^h")]}})
 
 
+def test_regex_options_validation() -> None:
+    # mongod: bad flag -> 51108; non-string $options -> 2; $options without
+    # $regex -> 2; non-string $regex -> 2. Valid flags imsxu still work.
+    with pytest.raises(QueryError) as exc:
+        matches({"s": "hi"}, {"s": {"$regex": "h", "$options": "z"}})
+    assert exc.value.code == 51108 and "invalid flag" in str(exc.value)
+    for q in (
+        {"s": {"$regex": "h", "$options": 5}},
+        {"s": {"$options": "i"}},
+        {"s": {"$regex": 5}},
+        {"s": {"$regex": None}},
+    ):
+        with pytest.raises(QueryError) as exc:
+            matches({"s": "hi"}, q)
+        assert exc.value.code == 2, q
+    # Valid options and an empty option string are accepted.
+    assert matches({"s": "Hello"}, {"s": {"$regex": "^h", "$options": "i"}})
+    assert matches({"s": "hello"}, {"s": {"$regex": "^h", "$options": ""}})
+
+
 def test_mod() -> None:
     assert matches({"n": 12}, {"n": {"$mod": [4, 0]}})
     assert matches({"n": 13}, {"n": {"$mod": [4, 1]}})

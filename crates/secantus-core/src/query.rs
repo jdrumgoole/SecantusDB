@@ -222,15 +222,38 @@ pub fn first_unknown_operator(filter: &Document) -> Option<String> {
     None
 }
 
+/// mongod's `$regex` `$options` validation: a string of only `imsxu`. A
+/// non-string or an unknown flag defers so the pure engine raises the exact
+/// error (BadValue "$options has to be a string" / Location51108).
+fn regex_options_ok(arg: &Bson) -> Result<(), Fallback> {
+    let Bson::String(s) = arg else {
+        return Err(Fallback);
+    };
+    if s.chars().any(|c| !matches!(c, 'i' | 'm' | 's' | 'x' | 'u')) {
+        return Err(Fallback);
+    }
+    Ok(())
+}
+
 fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>) -> R {
     match cond {
         // A bare BSON regex literal: `{field: /pat/flags}` matches as a pattern.
         Bson::RegularExpression(_) => op_regex(values, cond, None),
         Bson::Document(d) if is_operator_dict(d) => {
+            // Validate the $regex/$options pair up front (mongod parse-time),
+            // before any operator can short-circuit the match — mirrors the pure
+            // engine. A bad flag / non-string $options / $options-without-$regex
+            // defers so Python raises Location51108 / BadValue.
+            if let Some(opts) = d.get("$options") {
+                if !d.contains_key("$regex") {
+                    return Err(Fallback);
+                }
+                regex_options_ok(opts)?;
+            }
             for (op, arg) in d.iter() {
                 match op.as_str() {
-                    // `$options` is a sibling modifier of `$regex`, consumed below.
-                    "$options" if d.contains_key("$regex") => continue,
+                    // `$options` is a sibling modifier of `$regex`, validated above.
+                    "$options" => continue,
                     "$regex" => {
                         if !op_regex(values, arg, d.get("$options"))? {
                             return Ok(false);

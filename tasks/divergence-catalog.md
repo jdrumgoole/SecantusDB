@@ -42,9 +42,9 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   mongod's BadValue. `$pow` (TypeError/ZeroDivisionError) FIXED (#483); the unary math
   ops `$abs`/`$ceil`/`$floor`/`$sqrt`/`$exp`/`$ln`/`$log10`/`$round`/`$trunc` on
   string/bool FIXED (#492, → 28765 / 51081); `$log` (2-arg) FIXED (#493, → 28756 /
-  28757); `$in`/`$nin` non-array + nested-`$` FIXED (#494, → BadValue). Still leaking:
-  `$split` empty-sep (ValueError), `$regex` non-string `$options` (ValueError),
-  `$rename` non-string target
+  28757); `$in`/`$nin` non-array + nested-`$` FIXED (#494, → BadValue); `$regex`/
+  `$options` validation FIXED (#495, → 51108 / BadValue). Still leaking: `$split`
+  empty-sep (ValueError), `$rename` non-string target
   (AttributeError), `$bucket output:5` (AttributeError), `$facet {a:[5]}` (TypeError),
   `$densify unit:'day'` on numeric (TypeError), `$sort {v:'asc'}` (ValueError).
 
@@ -63,10 +63,10 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   `$dateTrunc {binSize:2.0}` over-reject valid whole doubles; `amount:true`/`binSize:true`
   compute (mongod 5166405/5439017). `$toLong: 2.7` rejects valid (mongod truncates→2).
 - **Query operator validation**: `$in`/`$nin` non-array + `$`-doc element FIXED (#494,
-  → 2). Remaining: `$elemMatch` non-doc (query→2, proj→31274) silently drops/no-matches;
-  `$all` mixed `$elemMatch`+scalar matches (mongod 2); `$regex` bad `$options` letter
-  matches (51108) / `$options` without `$regex` matches (2); `$not` invalid arg
-  (5/"x"/[]/{}) silently accepts (mongod 2). (query.py)
+  → 2); `$regex` bad `$options` / `$options`-without-`$regex` / non-string `$regex`
+  FIXED (#495, → 51108 / 2). Remaining: `$elemMatch` non-doc (query→2, proj→31274)
+  silently drops/no-matches; `$all` mixed `$elemMatch`+scalar matches (mongod 2);
+  `$not` invalid arg (5/"x"/[]/{}) silently accepts (mongod 2). (query.py)
 - **Projection `$slice`**: bool/string → mongod 28667; `[bad,limit]`/3-elem/`[skip,
   neg-limit]` → mongod 28724; SecantusDB silently returns full/wrong array. (projection.py)
 - **`$type` validation**: unknown alias / fractional code / bool / bad code silently
