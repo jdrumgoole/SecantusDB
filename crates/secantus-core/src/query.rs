@@ -1431,6 +1431,16 @@ fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
     if required.is_empty() {
         return Ok(false);
     }
+    // mongod: if any element is a $-expression doc, EVERY element must be a
+    // {$elemMatch: …} clause; a mixed form or any other $-op doc is "no $
+    // expressions in $all" -> defer so Python raises.
+    let has_dollar =
+        |e: &Bson| matches!(e, Bson::Document(d) if d.keys().any(|k| k.starts_with('$')));
+    let is_elemmatch =
+        |e: &Bson| matches!(e, Bson::Document(d) if d.len() == 1 && d.contains_key("$elemMatch"));
+    if required.iter().any(has_dollar) && !required.iter().all(is_elemmatch) {
+        return Err(Fallback);
+    }
     // A regex element matches as a *pattern* (not by equality), mirroring
     // `query._op_all`; a non-regex element matches by `py_eq`. A regex the
     // engine can't compile still defers via `op_regex`. mongod treats a scalar

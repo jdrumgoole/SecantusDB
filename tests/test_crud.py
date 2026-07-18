@@ -371,6 +371,25 @@ def test_query_with_in_operator(coll) -> None:
     assert ids == [1, 3]
 
 
+def test_all_argument_validation_via_pymongo(coll) -> None:
+    """$all needs an array; mixing $elemMatch with a scalar or using another
+    $-op doc is "no $ expressions in $all" (BadValue). mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": [1, 2, 3]})
+    for q in (
+        {"a": {"$all": 5}},
+        {"a": {"$all": [1, {"$elemMatch": {"x": 1}}]}},
+        {"a": {"$all": [{"$gt": 1}]}},
+    ):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find(q))
+        assert exc.value.code == 2, q
+    # Valid scalar + all-$elemMatch forms still work.
+    assert [d["_id"] for d in coll.find({"a": {"$all": [1, 2]}})] == [1]
+    assert [d["_id"] for d in coll.find({"a": {"$all": [{"$elemMatch": {"$gt": 2}}]}})] == [1]
+
+
 def test_not_elemmatch_validation_via_pymongo(coll) -> None:
     """$not needs a regex or a non-empty document; $elemMatch needs an Object —
     else BadValue. mongod 7.0.12-verified."""
