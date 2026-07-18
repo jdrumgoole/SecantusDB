@@ -232,11 +232,54 @@ def _stage_skip(
     return docs[n:]
 
 
+def _sort_val_repr(v: Any) -> str:
+    """mongod renders the offending value in the Location15974 message as
+    shell/JSON (`"asc"`, `true`, `null`), not Python repr."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return f'"{v}"'
+    if v is None:
+        return "null"
+    return str(v)
+
+
+def _validate_sort_spec(spec: Any) -> None:
+    """mongod's `$sort` stage validation: at least one key (15976); each direction
+    is 1 / -1 as an int or whole double, else a non-numeric value is "Illegal key"
+    (15974) and a numeric non-±1 is "must be 1 … or -1" (15975)."""
+    if not isinstance(spec, Mapping) or not spec:
+        raise AggregateError(
+            "$sort stage must have at least one sort key",
+            code=15976,
+            code_name="Location15976",
+        )
+    for key, direction in spec.items():
+        if isinstance(direction, Mapping):
+            continue  # {$meta: …} — text-score / indexKey sort, out of scope here
+        if isinstance(direction, bool) or not isinstance(direction, (int, float)):
+            raise AggregateError(
+                f"Illegal key in $sort specification: {key}: {_sort_val_repr(direction)}",
+                code=15974,
+                code_name="Location15974",
+            )
+        if (isinstance(direction, float) and not direction.is_integer()) or int(direction) not in (
+            1,
+            -1,
+        ):
+            raise AggregateError(
+                "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
+                code=15975,
+                code_name="Location15975",
+            )
+
+
 def _stage_sort(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     from secantus.ordering import sort_docs
 
+    _validate_sort_spec(spec)
     return sort_docs(list(docs), spec)
 
 

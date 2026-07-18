@@ -85,6 +85,24 @@ def test_sort_pipeline_stage() -> None:
     docs = [{"x": 3}, {"x": 1}, {"x": 2}]
     out = apply_pipeline(docs, [{"$sort": {"x": 1}}])
     assert [d["x"] for d in out] == [1, 2, 3]
+    # A whole-double direction is accepted (1.0 == ascending).
+    assert [d["x"] for d in apply_pipeline(docs, [{"$sort": {"x": 1.0}}])] == [1, 2, 3]
+
+
+def test_sort_stage_validation() -> None:
+    # mongod: non-numeric direction 15974, numeric non-±1 15975, empty spec 15976.
+    docs = [{"x": 1}]
+    for spec, code in [
+        ({"x": "asc"}, 15974),
+        ({"x": True}, 15974),
+        ({"x": 0}, 15975),
+        ({"x": 2}, 15975),
+        ({"x": 1.5}, 15975),
+        ({}, 15976),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(docs, [{"$sort": spec}])
+        assert exc.value.code == code, spec
 
 
 def test_project_inclusion_keeps_id_by_default() -> None:

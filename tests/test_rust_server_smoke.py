@@ -1627,3 +1627,19 @@ def test_split_argument_validation(tmp_path) -> None:
         assert got == [{"a": ["a", "b", "c"], "n": None}]
     finally:
         srv.stop()
+
+
+def test_sort_stage_validation(tmp_path) -> None:
+    """The Rust server rejects an invalid $sort stage (non-numeric / non-±1
+    direction, empty spec) instead of coercing a bool or leaking; a whole-double
+    direction still sorts."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": 1, "n": 3}, {"_id": 2, "n": 1}])
+        for spec in ({"n": "asc"}, {"n": True}, {"n": 0}, {"n": 2}, {}):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$sort": spec}]))
+        assert [d["_id"] for d in coll.aggregate([{"$sort": {"n": 1.0}}])] == [2, 1]
+    finally:
+        srv.stop()
