@@ -75,12 +75,15 @@ fn apply_stage(
             Ok(out)
         }
         "$limit" => {
-            let n = positive_int(spec)?;
+            let n = stage_nonneg_int(spec)?;
+            if n == 0 {
+                return Err(Fallback); // Python raises 15958 "the limit must be positive"
+            }
             docs.truncate(n);
             Ok(docs)
         }
         "$skip" => {
-            let n = positive_int(spec)?;
+            let n = stage_nonneg_int(spec)?;
             Ok(if n >= docs.len() {
                 Vec::new()
             } else {
@@ -376,11 +379,21 @@ fn spec_doc(spec: &Bson) -> R<&Document> {
 
 /// `int(spec)` for $limit/$skip, restricted to non-negative integers (negative
 /// values hit Python's slice semantics — deferred; floats also defer).
-fn positive_int(spec: &Bson) -> R<usize> {
-    match as_int_like(spec) {
-        Some(n) if n >= 0 => Ok(n as usize),
-        _ => Err(Fallback),
+/// A `$limit` / `$skip` argument, mongod-style: an int or a whole-number double
+/// is the count; a bool / non-number, a fractional double, or a negative value
+/// defers to the Python oracle (which raises mongod's 5107201 / 5107200). `$limit`
+/// additionally rejects zero at the call site (15958).
+fn stage_nonneg_int(spec: &Bson) -> R<usize> {
+    let n = match spec {
+        Bson::Int32(n) => *n as i64,
+        Bson::Int64(n) => *n,
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
+        _ => return Err(Fallback), // bool / fractional / non-number
+    };
+    if n < 0 {
+        return Err(Fallback); // Python raises "Expected a non-negative number"
     }
+    Ok(n as usize)
 }
 
 fn unset_paths(spec: &Bson) -> R<Vec<String>> {

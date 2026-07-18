@@ -88,6 +88,19 @@ CURATED = [
     [{"$match": {"b": "y"}}],
     [{"$limit": 2}],
     [{"$skip": 1}],
+    # $limit / $skip numeric-arg fidelity: a whole double computes on both
+    # engines; bool / fractional / negative / (for $limit) zero are rejected —
+    # Python raises the mongod code, the Rust core defers (skipped in this loop).
+    [{"$limit": 2.0}],
+    [{"$limit": 2.7}],
+    [{"$limit": True}],
+    [{"$limit": 0}],
+    [{"$limit": -1}],
+    [{"$skip": 3.0}],
+    [{"$skip": 0}],
+    [{"$skip": 3.7}],
+    [{"$skip": True}],
+    [{"$skip": -1}],
     [{"$count": "n"}],
     [{"$project": {"a": 1}}],
     [{"$project": {"a": 1, "_id": 0}}],

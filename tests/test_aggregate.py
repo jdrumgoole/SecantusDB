@@ -1471,3 +1471,24 @@ def test_median_and_percentile_accumulators() -> None:
         with pytest.raises(AggregateError) as exc:
             apply_pipeline([{"x": 1}], [{"$group": {"_id": None, "v": acc}}], None)
         assert exc.value.code == code, acc
+
+
+def test_limit_skip_numeric_arg_validation() -> None:
+    """$limit / $skip accept a whole-number double but reject a bool, a fractional
+    double, and a negative value with mongod's codes; $limit also rejects zero."""
+    docs = [{"_id": i} for i in range(10)]
+    assert len(apply_pipeline(docs, [{"$limit": 2.0}])) == 2
+    assert len(apply_pipeline(docs, [{"$skip": 3.0}])) == 7
+    assert len(apply_pipeline(docs, [{"$skip": 0}])) == 10
+    for pipe, code in [
+        ([{"$limit": 2.7}], 5107201),
+        ([{"$limit": True}], 5107201),
+        ([{"$limit": -1}], 5107201),
+        ([{"$limit": 0}], 15958),
+        ([{"$skip": 3.7}], 5107200),
+        ([{"$skip": True}], 5107200),
+        ([{"$skip": -1}], 5107200),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(docs, pipe)
+        assert exc.value.code == code, pipe

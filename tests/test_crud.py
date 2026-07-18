@@ -4420,3 +4420,24 @@ def test_substr_bytes_truncates_double_index(coll) -> None:
     ]:
         got = list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
         assert got == [{"r": want}], expr
+
+
+def test_limit_skip_numeric_arg_validation(coll) -> None:
+    """$limit / $skip accept a whole-number double but reject bool / fractional /
+    negative (5107201 / 5107200), and $limit rejects zero (15958), over the wire.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i} for i in range(10)])
+    assert len(list(coll.aggregate([{"$limit": 2.0}]))) == 2
+    assert len(list(coll.aggregate([{"$skip": 3.0}]))) == 7
+    for pipe, code in [
+        ([{"$limit": 2.7}], 5107201),
+        ([{"$limit": True}], 5107201),
+        ([{"$limit": 0}], 15958),
+        ([{"$skip": 3.7}], 5107200),
+        ([{"$skip": -1}], 5107200),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate(pipe))
+        assert exc.value.code == code, pipe
