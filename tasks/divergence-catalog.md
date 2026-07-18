@@ -46,7 +46,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   `$options` validation FIXED (#496, → 51108 / BadValue); `$not`/`$elemMatch` arg
   FIXED (#497, → BadValue); `$split` empty-sep + type/arity FIXED (#500, → 40085/
   40086/40087/16020); `$sort` stage direction FIXED (#502, → 15974/15975/15976);
-  `$densify` unit-on-numeric + step/bounds FIXED (#503, → 6053600/14/5733401/5946802/
+  `$densify` unit-on-numeric + step/bounds FIXED (#504, → 6053600/14/5733401/5946802/
   5733403/5733402). Still leaking: `$facet {a:[5]}` (TypeError).
 
 ## Tier 2 — silent-accept of invalid input / missing type guards
@@ -81,7 +81,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 - **Stages**: `$bucket` unsorted/mixed/dup boundaries, default-in-range, missing groupBy
   (40194/40193/40199/40198) accepted; `$bucketAuto {buckets:2.0}` rejects valid,
   `{buckets:true}`/`granularity:'BOGUS'` accepted (40241/40257); `$densify`
-  `{step:true}`/`bounds:'partial'`/`[0]`/`[5,0]`/unit-on-numeric FIXED (#503, →
+  `{step:true}`/`bounds:'partial'`/`[0]`/`[5,0]`/unit-on-numeric FIXED (#504, →
   14/5946802/5733403/5733402/6053600; `{step:1.5}` is mongod-valid, now computes);
   `$unwind {includeArrayIndex:5/true/'$i'}`, bare `path:'a'` (no `$`), non-bool
   `preserveNullAndEmptyArrays` accepted (28810/28818/28809/28822); `$sortByCount`
