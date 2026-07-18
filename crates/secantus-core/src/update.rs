@@ -284,6 +284,11 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
     match m.get("$position") {
         None => arr.extend(each.iter().cloned()),
         Some(p) => {
+            // A bool $position is a parse error in mongod (code 2), not index 1
+            // — `as_int_like` would coerce it, so guard first.
+            if matches!(p, Bson::Boolean(_)) {
+                return Err(Fallback);
+            }
             let n = as_int_like(p).ok_or(Fallback)?;
             let idx = if n >= 0 {
                 (n as usize).min(arr.len())
@@ -300,6 +305,10 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
         push_sort(arr, spec)?;
     }
     if let Some(s) = m.get("$slice") {
+        // A bool $slice is a parse error in mongod (code 2), not "keep 1".
+        if matches!(s, Bson::Boolean(_)) {
+            return Err(Fallback);
+        }
         let n = as_int_like(s).ok_or(Fallback)?;
         if n == 0 {
             arr.clear();
@@ -461,6 +470,14 @@ fn apply_op(
                             continue;
                         }
                         let mut a = a.clone();
+                        // A bool direction is "not a number" and any value other
+                        // than ±1 is "$pop expects 1 or -1" — both mongod errors
+                        // (code 9). `as_int_like` would coerce `true` to 1, and
+                        // the old `_ => continue` silently no-op'd a bad value;
+                        // defer so the Python oracle raises the exact error.
+                        if matches!(dir, Bson::Boolean(_)) {
+                            return Err(Fallback);
+                        }
                         match as_int_like(dir) {
                             Some(1) => {
                                 a.pop();
@@ -468,7 +485,7 @@ fn apply_op(
                             Some(-1) => {
                                 a.remove(0);
                             }
-                            _ => continue, // other direction -> no change
+                            _ => return Err(Fallback),
                         }
                         set_path(result, &cpath, Bson::Array(a))?;
                     }

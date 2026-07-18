@@ -15,6 +15,31 @@ class UpdateError(Exception):
         self.code = code
 
 
+def _bson_type_name(v: Any) -> str:
+    """mongod's type vocabulary for update parse-error messages."""
+    from bson import Decimal128, Int64
+
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, Int64):
+        return "long"
+    if isinstance(v, int):
+        return "int" if -(2**31) <= v < 2**31 else "long"
+    if isinstance(v, float):
+        return "double"
+    if isinstance(v, Decimal128):
+        return "decimal"
+    if isinstance(v, str):
+        return "string"
+    if v is None:
+        return "null"
+    if isinstance(v, Mapping):
+        return "object"
+    if isinstance(v, (list, tuple)):
+        return "array"
+    return type(v).__name__
+
+
 def _render_bson_scalar(v: Any) -> str:
     """A mongod-ish rendering of a scalar for an error message: ``true`` /
     ``false`` / ``null`` lowercase, strings double-quoted, else ``str()``."""
@@ -96,7 +121,11 @@ def _apply_push(arr: list[Any], value: Any) -> list[Any]:
     position = value.get("$position")
     if position is not None:
         if not isinstance(position, int) or isinstance(position, bool):
-            raise UpdateError("$position must be an integer")
+            raise UpdateError(
+                "The value for $position must be an integer value, not of type: "
+                f"{_bson_type_name(position)}",
+                code=2,
+            )
         idx = position if position >= 0 else max(len(arr) + position, 0)
         arr[idx:idx] = each
     else:
@@ -129,7 +158,11 @@ def _push_sort(arr: list[Any], spec: Any) -> list[Any]:
 def _push_slice(arr: list[Any], n: Any) -> list[Any]:
     """`$push` `$slice`: keep the first `n` (n≥0), the last `|n|` (n<0), or none."""
     if not isinstance(n, int) or isinstance(n, bool):
-        raise UpdateError("$slice must be an integer")
+        raise UpdateError(
+            "The value for $slice must be an integer value but was given "
+            f"type: {_bson_type_name(n)}",
+            code=2,
+        )
     if n == 0:
         return []
     return arr[:n] if n > 0 else arr[n:]
@@ -546,12 +579,24 @@ def _apply_op(
                     arr[:] = [e for e in arr if not any(e == v for v in values)]
     elif op == "$pop":
         for path, direction in payload.items():
+            # mongod validates the $pop argument (probed 7.0.12): a bool is
+            # "not a number" (code 9), and a number other than ±1 is
+            # "$pop expects 1 or -1" (code 9). Python's bool-is-int would treat
+            # `True` as `1` (pop last) without this guard.
+            if isinstance(direction, bool) or not isinstance(direction, (int, float)):
+                raise UpdateError(
+                    f"Expected a number in: {path}: {_render_bson_scalar(direction)}", code=9
+                )
+            if direction not in (1, -1):
+                raise UpdateError(
+                    f"$pop expects 1 or -1, found: {_render_bson_scalar(direction)}", code=9
+                )
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
                 if isinstance(arr, list) and arr:
                     if direction == 1:
                         arr.pop()
-                    elif direction == -1:
+                    else:  # direction == -1
                         arr.pop(0)
     elif op == "$rename":
         for old, new in payload.items():
@@ -586,7 +631,11 @@ def _apply_op(
                 if bit_op not in ("and", "or", "xor"):
                     raise UpdateError(f"$bit unsupported sub-op: {bit_op}")
                 if not isinstance(mask, int) or isinstance(mask, bool):
-                    raise UpdateError("$bit mask must be an integer")
+                    raise UpdateError(
+                        "The $bit modifier field must be an Integer(32/64 bit); a "
+                        f"'{_bson_type_name(mask)}' is not supported here.",
+                        code=2,
+                    )
                 parsed_ops.append((bit_op, mask))
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 current = get_path(doc, concrete, default=0) or 0

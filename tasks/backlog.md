@@ -1112,7 +1112,17 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   the Rust server surfaces `BadValue` (the standing update error-code gap — the
   pure core returns a code-less `Fallback`, same as null-field `$inc`), but the
   correctness contract (reject, don't compute) now holds on both, three-way
-  mongod-verified. **Done (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
+  mongod-verified. **`$pop`/`$position`/`$slice`/`$bit` bool-argument cluster
+  fixed** (2026-07-18, same triage sweep): `$pop: true` computed (True as 1, pop
+  last) on *both* servers, and `$push` `$position`/`$slice: true` computed on the
+  Rust server — all now reject a bool argument. The Python server reports
+  mongod's exact codes (9 for `$pop`, 2 for `$position`/`$slice`/`$bit`) and
+  messages; the Rust server surfaces `BadValue` (code 2 for all — matching mongod
+  for `$position`/`$slice`/`$bit`, the error-code gap only for `$pop`). `$pop`
+  also now errors on a non-±1 number (was a silent no-op). Four of the seven
+  R8-triage bugs share the root cause: Python's `bool` being an `int` subclass
+  sneaking through `isinstance(int)` / `as_int_like` numeric checks. **Done
+  (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and
   structural equality via `expressions::py_eq`); `$bit`, `$each` (for `$push` /
