@@ -1492,3 +1492,17 @@ def test_limit_skip_numeric_arg_validation() -> None:
         with pytest.raises(AggregateError) as exc:
             apply_pipeline(docs, pipe)
         assert exc.value.code == code, pipe
+
+
+def test_sample_size_validation() -> None:
+    """$sample size must be a number (bool -> 28746) and non-negative (28747); a
+    fractional double is accepted and truncated (unlike $limit/$skip)."""
+    docs = [{"_id": i} for i in range(10)]
+    assert len(apply_pipeline(docs, [{"$sample": {"size": 3}}])) == 3
+    assert len(apply_pipeline(docs, [{"$sample": {"size": 2.7}}])) == 2
+    with pytest.raises(AggregateError) as bexc:
+        apply_pipeline(docs, [{"$sample": {"size": True}}])
+    assert bexc.value.code == 28746
+    with pytest.raises(AggregateError) as nexc:
+        apply_pipeline(docs, [{"$sample": {"size": -1}}])
+    assert nexc.value.code == 28747

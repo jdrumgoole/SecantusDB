@@ -1192,11 +1192,12 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   None for a double) while coercing bool→1. Now both accept a whole double and
   reject bool/fractional/negative (`$limit` 5107201, `$skip` 5107200; zero-`$limit`
   15958) — Python raises the code, the Rust core defers via the new
-  `stage_nonneg_int`. **Still open — `$sample` size:** mongod rejects a bool
-  (28746) and a negative (28747) but *accepts a fractional* double (truncates);
-  currently the Python engine coerces via `int()` (so bool→1, no error) — needs the
-  same treatment, but `$sample` isn't a Rust-core stage (it defers / is
-  storage-backed and non-deterministic), so its parity story differs. **Done
+  `stage_nonneg_int`. **`$sample` size — FIXED (2026-07-18):** the Python server
+  now rejects a bool size (28746) and a negative size (28747) and truncates a
+  fractional double; the Rust server already validated (its `$sample` lives in the
+  server crate, not the deferring core), so this was a Python-only fix. **With this
+  the aggregation numeric-argument trio (`$limit` / `$skip` / `$sample`) matches
+  mongod on both servers.** **Done
   (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and
