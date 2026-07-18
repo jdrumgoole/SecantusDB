@@ -437,10 +437,17 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
         # iterating; pull them in below when their parent op runs.
         _SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
         has_near = "$near" in condition or "$nearSphere" in condition
+        # mongod validates the $regex / $options pair at parse time (BadValue /
+        # 51108), before matching. $options is a sibling modifier of $regex.
+        if "$options" in condition:
+            if "$regex" not in condition:
+                raise QueryError("$options needs a $regex")
+            _validate_regex_options(condition["$options"])
         for op, arg in condition.items():
             if op in _SIBLING_MODIFIERS:
                 continue
             if op == "$regex":
+                _validate_regex_pattern(arg)
                 if not _op_regex(values, arg, condition.get("$options", "")):
                     return False
             elif op in ("$near", "$nearSphere") and has_near:
@@ -1006,6 +1013,28 @@ def _compile_regex(pattern: str | bytes, flags: int) -> re.Pattern:
             f"regex pattern of {len(pattern)} chars exceeds the {_MAX_REGEX_PATTERN_LEN}-char cap"
         )
     return re.compile(pattern, flags)
+
+
+_VALID_REGEX_FLAGS = frozenset("imsxu")
+
+
+def _validate_regex_options(options: Any) -> None:
+    """mongod's ``$options`` validation: it must be a string (else BadValue) of
+    only the flags ``imsxu`` (an unknown letter is Location51108)."""
+    if not isinstance(options, str):
+        raise QueryError("$options has to be a string")
+    for c in options:
+        if c not in _VALID_REGEX_FLAGS:
+            raise QueryError(
+                f"invalid flag in regex options: {c}", code=51108, code_name="Location51108"
+            )
+
+
+def _validate_regex_pattern(pattern: Any) -> None:
+    """mongod's ``$regex`` value must be a string or a regex literal (else
+    BadValue): a number / null / other type is rejected."""
+    if not isinstance(pattern, (str, bytes, Regex)):
+        raise QueryError("$regex has to be a string")
 
 
 def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:

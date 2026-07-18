@@ -562,6 +562,23 @@ def test_query_regex_string_form(coll) -> None:
     assert names == ["alex", "alice"]
 
 
+def test_regex_options_validation_via_pymongo(coll) -> None:
+    """Bad flag -> 51108; non-string $options / $options-without-$regex /
+    non-string $regex -> BadValue. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "s": "Hello"})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.find({"s": {"$regex": "h", "$options": "z"}}))
+    assert exc.value.code == 51108
+    for q in ({"s": {"$options": "i"}}, {"s": {"$regex": 5}}):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find(q))
+        assert exc.value.code == 2, q
+    # A valid case-insensitive regex still matches.
+    assert [d["_id"] for d in coll.find({"s": {"$regex": "^h", "$options": "i"}})] == [1]
+
+
 def test_query_regex_compiled_pattern(coll) -> None:
     import re
 

@@ -765,6 +765,26 @@ def test_in_nin_invalid_defers_and_raises(query):
     assert exc.value.code == 2
 
 
+@pytest.mark.parametrize(
+    "query,code",
+    [
+        ({"s": {"$regex": "h", "$options": "z"}}, 51108),  # bad flag
+        ({"s": {"$regex": "h", "$options": 5}}, 2),  # non-string options
+        ({"s": {"$options": "i"}}, 2),  # $options without $regex
+        ({"s": {"$regex": 5}}, 2),  # non-string pattern
+    ],
+)
+def test_regex_options_invalid_defers_and_raises(query, code):
+    # Invalid $regex/$options: the Rust core defers (None) and the pure engine
+    # raises the mongod code — agreeing on "reject" via the defer contract.
+    doc = bson.decode(bson.encode({"s": "hello"}))
+    query = bson.decode(bson.encode({"q": query}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == code
+
+
 def _rand_scalar(rng):
     return rng.choice(
         [

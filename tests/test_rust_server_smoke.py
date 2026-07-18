@@ -1535,3 +1535,24 @@ def test_in_nin_argument_validation(tmp_path) -> None:
         assert [d["_id"] for d in coll.find({"n": {"$in": [5, 9]}})] == [1]
     finally:
         srv.stop()
+
+
+def test_regex_options_validation(tmp_path) -> None:
+    """The Rust server rejects a bad $regex flag / non-string $options /
+    $options-without-$regex / non-string $regex (defer -> BadValue) instead of
+    silently ignoring; a valid case-insensitive regex still matches."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "s": "Hello"})
+        for q in (
+            {"s": {"$regex": "h", "$options": "z"}},
+            {"s": {"$regex": "h", "$options": 5}},
+            {"s": {"$options": "i"}},
+            {"s": {"$regex": 5}},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.find(q))
+        assert [d["_id"] for d in coll.find({"s": {"$regex": "^h", "$options": "i"}})] == [1]
+    finally:
+        srv.stop()
