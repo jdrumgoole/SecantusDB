@@ -1297,6 +1297,51 @@ def test_aggregate_group_with_avg(coll) -> None:
     assert out == [{"_id": "a", "avg": 3.0}, {"_id": "b", "avg": 10.0}]
 
 
+def test_aggregate_group_accumulator_mixed_types(coll) -> None:
+    """$sum/$avg ignore non-numeric values; $min/$max order by BSON cross-type
+    (bool > string > number) and skip null/missing — matching mongod."""
+    from bson.int64 import Int64
+
+    coll.insert_many(
+        [
+            {"_id": 1, "v": 10},
+            {"_id": 2, "v": "hi"},
+            {"_id": 3, "v": True},
+            {"_id": 4, "v": None},
+            {"_id": 5},
+            {"_id": 6, "v": 2.5},
+            {"_id": 7, "v": Int64(3)},
+        ]
+    )
+    [b] = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": None,
+                        "s": {"$sum": "$v"},
+                        "a": {"$avg": "$v"},
+                        "mn": {"$min": "$v"},
+                        "mx": {"$max": "$v"},
+                    }
+                }
+            ]
+        )
+    )
+    assert b["s"] == 15.5
+    assert b["a"] == 15.5 / 3
+    assert b["mn"] == 2.5
+    assert b["mx"] is True
+    # All-non-numeric group: $sum -> 0, $avg -> null.
+    coll.delete_many({})
+    coll.insert_many([{"v": "x"}, {"v": "y"}])
+    [b2] = list(
+        coll.aggregate([{"$group": {"_id": None, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}}}])
+    )
+    assert b2["s"] == 0
+    assert b2["a"] is None
+
+
 def test_aggregate_push_addtoset_skip_missing(coll) -> None:
     """$push / $addToSet skip a missing field value (mongod semantics), keep null."""
     coll.insert_many(

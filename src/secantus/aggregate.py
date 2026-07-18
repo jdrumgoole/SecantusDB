@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import decimal as _decimal
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -882,16 +883,27 @@ def _std_dev(values: list[Any], *, pop: bool) -> float | None:
 _AccHandler = Callable[[dict[str, Any], str, Any, Mapping[str, Any], dict[str, Any]], None]
 
 
+def _is_acc_number(v: Any) -> bool:
+    """A numeric value that ``$sum`` / ``$avg`` accumulate. mongod ignores
+    everything else (string / bool / null / missing / array / …); a bool is *not*
+    numeric here (``$sum`` over ``true`` adds nothing). ``decimal.Decimal`` is
+    included for the SQL engine, whose ``numeric`` columns compile SUM/AVG through
+    ``$sum`` / ``$avg`` with Python decimals (not ``bson.Decimal128``)."""
+    return isinstance(v, (int, float, Decimal128, _decimal.Decimal)) and not isinstance(v, bool)
+
+
 def _acc_sum(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    increment = 1 if arg == 1 else evaluate(arg, doc, vars)
-    if increment is None:
-        increment = 0
+    # $sum always yields at least 0 (int32) — even an all-non-numeric group.
+    bucket.setdefault(field, 0)
+    increment = 1 if (arg == 1 and not isinstance(arg, bool)) else evaluate(arg, doc, vars)
+    if not _is_acc_number(increment):
+        return  # mongod ignores non-numeric operands
     # bson_add preserves the BSON numeric type (int32 < int64 < double <
     # decimal128) so a $sum over Int64 values stays Int64 rather than
     # narrowing to int32 on the wire.
-    bucket[field] = bson_add(bucket.get(field, 0), increment)
+    bucket[field] = bson_add(bucket[field], increment)
 
 
 def _acc_count(
@@ -903,13 +915,15 @@ def _acc_count(
 def _acc_avg(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    v = evaluate(arg, doc, vars)
-    if v is None:
-        return
+    # Always create the running state so an all-non-numeric group finalises to
+    # null (mongod), rather than dropping the field.
     state = bucket.get(field)
     if not isinstance(state, dict) or "_avg_total" not in state:
         state = {"_avg_total": 0, "_avg_n": 0}
         bucket[field] = state
+    v = evaluate(arg, doc, vars)
+    if not _is_acc_number(v):
+        return  # mongod averages only numeric values
     state["_avg_total"] += v
     state["_avg_n"] += 1
 
@@ -917,18 +931,30 @@ def _acc_avg(
 def _acc_max(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    v = evaluate(arg, doc, vars)
-    cur = bucket.get(field)
-    if cur is None or (v is not None and v > cur):
+    # mongod $max ignores null / missing and orders every other value by BSON
+    # cross-type order (bool > string > number > …); all-null/missing -> null.
+    from secantus.ordering import _SortKey
+
+    bucket.setdefault(field, None)
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is MISSING or v is None:
+        return
+    cur = bucket[field]
+    if cur is None or _SortKey(v) > _SortKey(cur):
         bucket[field] = v
 
 
 def _acc_min(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    v = evaluate(arg, doc, vars)
-    cur = bucket.get(field)
-    if cur is None or (v is not None and v < cur):
+    from secantus.ordering import _SortKey
+
+    bucket.setdefault(field, None)
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is MISSING or v is None:
+        return
+    cur = bucket[field]
+    if cur is None or _SortKey(v) < _SortKey(cur):
         bucket[field] = v
 
 

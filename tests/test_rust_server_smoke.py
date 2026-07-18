@@ -1454,3 +1454,44 @@ def test_to_int_convert_overflow(tmp_path) -> None:
         assert r == [{"n": -1}]
     finally:
         srv.stop()
+
+
+def test_group_accumulator_mixed_types(tmp_path) -> None:
+    """The Rust server's $group ignores non-numeric in $sum/$avg and orders
+    $min/$max by BSON cross-type (bool > string > number), matching mongod —
+    no longer deferring/erroring on a mixed-type group."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many(
+            [
+                {"_id": 1, "v": 10},
+                {"_id": 2, "v": "hi"},
+                {"_id": 3, "v": True},
+                {"_id": 4, "v": None},
+                {"_id": 5},
+                {"_id": 6, "v": 2.5},
+                {"_id": 7, "v": bson.Int64(3)},
+            ]
+        )
+        [b] = list(
+            coll.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "s": {"$sum": "$v"},
+                            "a": {"$avg": "$v"},
+                            "mn": {"$min": "$v"},
+                            "mx": {"$max": "$v"},
+                        }
+                    }
+                ]
+            )
+        )
+        assert b["s"] == 15.5
+        assert b["a"] == 15.5 / 3
+        assert b["mn"] == 2.5
+        assert b["mx"] is True
+    finally:
+        srv.stop()

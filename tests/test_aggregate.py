@@ -188,6 +188,56 @@ def test_group_avg() -> None:
     assert out == [{"_id": None, "avg": 4.0}]
 
 
+def test_group_accumulators_ignore_non_numeric() -> None:
+    # mongod: $sum/$avg ignore string/bool/null/missing; $min/$max order all
+    # non-null values by BSON cross-type (bool > string > number) and skip null.
+    docs = [
+        {"g": 1, "v": 10},
+        {"g": 1, "v": "hi"},
+        {"g": 1, "v": True},
+        {"g": 1, "v": None},
+        {"g": 1},
+        {"g": 1, "v": 2.5},
+        {"g": 1, "v": Int64(3)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$group": {
+                    "_id": "$g",
+                    "s": {"$sum": "$v"},
+                    "a": {"$avg": "$v"},
+                    "mn": {"$min": "$v"},
+                    "mx": {"$max": "$v"},
+                }
+            }
+        ],
+    )
+    [b] = out
+    assert b["s"] == 15.5  # 10 + 2.5 + 3, non-numeric ignored
+    assert b["a"] == 15.5 / 3  # only 3 numeric values counted
+    assert b["mn"] == 2.5  # smallest number
+    assert b["mx"] is True  # bool sorts above string / number
+
+
+def test_group_all_non_numeric_defaults() -> None:
+    # $sum over no numeric value -> 0; $avg -> null. $max still picks the bool
+    # (non-null values are ordered, only null/missing are skipped).
+    docs = [{"v": "x"}, {"v": True}, {"v": None}]
+    out = apply_pipeline(
+        docs,
+        [{"$group": {"_id": None, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}, "mx": {"$max": "$v"}}}],
+    )
+    assert out == [{"_id": None, "s": 0, "a": None, "mx": True}]
+    # $min / $max over only null / missing -> null.
+    out2 = apply_pipeline(
+        [{"v": None}, {}],
+        [{"$group": {"_id": None, "mn": {"$min": "$v"}, "mx": {"$max": "$v"}}}],
+    )
+    assert out2 == [{"_id": None, "mn": None, "mx": None}]
+
+
 def test_group_min_max_first_last_push_addtoset() -> None:
     docs = [{"x": 3}, {"x": 1}, {"x": 2}, {"x": 1}]
     out = apply_pipeline(
