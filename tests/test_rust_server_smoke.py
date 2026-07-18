@@ -1556,3 +1556,25 @@ def test_regex_options_validation(tmp_path) -> None:
         assert [d["_id"] for d in coll.find({"s": {"$regex": "^h", "$options": "i"}})] == [1]
     finally:
         srv.stop()
+
+
+def test_not_elemmatch_validation(tmp_path) -> None:
+    """The Rust server rejects an invalid $not (non-regex/doc, empty doc) and a
+    non-object $elemMatch (defer -> BadValue); valid forms still match."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "a": 5, "arr": [1, 2, 3]})
+        for q in (
+            {"a": {"$not": 5}},
+            {"a": {"$not": {}}},
+            {"a": {"$not": True}},
+            {"arr": {"$elemMatch": 5}},
+            {"arr": {"$elemMatch": "x"}},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.find(q))
+        assert [d["_id"] for d in coll.find({"a": {"$not": {"$gt": 9}}})] == [1]
+        assert [d["_id"] for d in coll.find({"arr": {"$elemMatch": {"$gt": 2}}})] == [1]
+    finally:
+        srv.stop()

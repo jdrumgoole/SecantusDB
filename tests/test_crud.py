@@ -371,6 +371,27 @@ def test_query_with_in_operator(coll) -> None:
     assert ids == [1, 3]
 
 
+def test_not_elemmatch_validation_via_pymongo(coll) -> None:
+    """$not needs a regex or a non-empty document; $elemMatch needs an Object —
+    else BadValue. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 5, "arr": [1, 2, 3]})
+    for q in (
+        {"a": {"$not": 5}},
+        {"a": {"$not": {}}},
+        {"a": {"$not": True}},
+        {"arr": {"$elemMatch": 5}},
+        {"arr": {"$elemMatch": "x"}},
+    ):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find(q))
+        assert exc.value.code == 2, q
+    # Valid forms still work.
+    assert [d["_id"] for d in coll.find({"a": {"$not": {"$gt": 9}}})] == [1]
+    assert [d["_id"] for d in coll.find({"arr": {"$elemMatch": {"$gt": 2}}})] == [1]
+
+
 def test_in_nin_argument_validation_via_pymongo(coll) -> None:
     """$in/$nin need an array (BadValue); a nested $-prefixed doc element is
     rejected ("cannot nest $ under $in"). mongod 7.0.12-verified."""
