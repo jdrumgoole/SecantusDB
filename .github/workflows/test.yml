@@ -103,7 +103,7 @@ jobs:
         # modelled 7-8 min. Balancing by recorded time packs the groups evenly
         # and makes completeness STRUCTURAL: pytest-split partitions the
         # collected set, so no test can fall through a gap between globs.
-        group: [1, 2, 3]
+        group: [1, 2, 3, 4]
         exclude:
           # macOS runs on ONE interpreter, not the full sweep. The gap macOS
           # closes is OS-specific (durability, filesystem semantics, CLI-tool
@@ -266,7 +266,7 @@ jobs:
             exit 1
           fi
 
-      - name: Tests (group ${{ matrix.group }}/3)
+      - name: Tests (group ${{ matrix.group }}/4)
         # ``--timeout=120 --timeout-method=thread`` catches deadline-
         # exceeded hangs (test body busy-loops or blocks on a stuck
         # producer) — independently of worker restarts.
@@ -309,7 +309,7 @@ jobs:
         shell: bash
         run: |
           uv run python -m pytest \
-            --splits 3 --group ${{ matrix.group }} \
+            --splits 4 --group ${{ matrix.group }} \
             --durations-path=ci/durations/linux.json \
             --randomly-seed=${{ github.run_id }} \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
@@ -340,7 +340,7 @@ jobs:
         # Same 3-way duration split as the ``test`` job. Windows was the
         # workflow's pole after #486 (sql 13m39), so balancing HERE is what
         # actually moves the critical path.
-        group: [1, 2, 3]
+        group: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
@@ -400,7 +400,7 @@ jobs:
         # bundles the IANA data.
         run: uv pip install tzdata
 
-      - name: Tests (group ${{ matrix.group }}/3)
+      - name: Tests (group ${{ matrix.group }}/4)
         # Same pytest flags as the ``test`` job (see the comments there). The
         # ``sql`` shard is the SQL engine + PG-wire suites; ``core`` is
         # everything else. git-bash expands the globs.
@@ -412,7 +412,7 @@ jobs:
         shell: bash
         run: |
           uv run python -m pytest \
-            --splits 3 --group ${{ matrix.group }} \
+            --splits 4 --group ${{ matrix.group }} \
             --durations-path=ci/durations/windows.json \
             --randomly-seed=${{ github.run_id }} \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
@@ -455,7 +455,7 @@ jobs:
         # modelled 7-8 min. Balancing by recorded time packs the groups evenly
         # and makes completeness STRUCTURAL: pytest-split partitions the
         # collected set, so no test can fall through a gap between globs.
-        group: [1, 2, 3]
+        group: [1, 2, 3, 4]
         exclude:
           # macOS on one interpreter only — see the ``test`` job's twin block.
           - os: macos-14
@@ -566,7 +566,7 @@ jobs:
             exit 1
           fi
 
-      - name: Durable-storage tests (group ${{ matrix.group }}/3)
+      - name: Durable-storage tests (group ${{ matrix.group }}/4)
         # The default suite above runs FAST (the test conftest sets
         # ``SECANTUS_TEST_FAST_STORAGE=1``: journal on, close-checkpoint skipped),
         # so it does NOT exercise the checkpoint-durability path. Re-run the whole
@@ -588,7 +588,7 @@ jobs:
         shell: bash
         run: |
           uv run python -m pytest \
-            --splits 3 --group ${{ matrix.group }} \
+            --splits 4 --group ${{ matrix.group }} \
             --durations-path=ci/durations/linux.json \
             --randomly-seed=${{ github.run_id }} \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
