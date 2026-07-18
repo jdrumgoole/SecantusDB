@@ -4305,3 +4305,33 @@ def test_update_inc_mul_non_numeric_operand(coll) -> None:
     # A valid $inc still applies.
     coll.update_one({"_id": 1}, {"$inc": {"n": 3}})
     assert coll.find_one({"_id": 1})["n"] == 8
+
+
+def test_aggregation_expr_bool_argument_rejected(coll) -> None:
+    """A bool where an aggregation operator expects a numeric (int) argument is
+    a parse error in mongod (bool is not a number) — SecantusDB surfaces the
+    exact error code over the wire. Three-way mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$round": [1.5, True]}, 16004),
+        ({"$trunc": [1.5, True]}, 16004),
+        ({"$arrayElemAt": [[10, 20, 30], True]}, 28690),
+        ({"$slice": [[1, 2, 3, 4], True]}, 28725),
+        ({"$slice": [[1, 2, 3, 4], 1, True]}, 28727),
+        ({"$sortArray": {"input": [3, 1, 2], "sortBy": True}}, 2942507),
+        ({"$substrCP": ["hello", True, 2]}, 34450),
+        ({"$substrCP": ["hello", 1, True]}, 34452),
+        ({"$range": [True, 5]}, 34443),
+        ({"$range": [0, True]}, 34445),
+        ({"$range": [0, 5, True]}, 34447),
+        ({"$indexOfArray": [[1, 2, 3], 2, True]}, 40096),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+
+    # An int argument still computes.
+    out = list(coll.aggregate([{"$project": {"r": {"$arrayElemAt": [[10, 20, 30], 1]}, "_id": 0}}]))
+    assert out == [{"r": 20}]

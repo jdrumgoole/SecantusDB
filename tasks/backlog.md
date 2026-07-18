@@ -1121,7 +1121,22 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   for `$position`/`$slice`/`$bit`, the error-code gap only for `$pop`). `$pop`
   also now errors on a non-±1 number (was a silent no-op). Four of the seven
   R8-triage bugs share the root cause: Python's `bool` being an `int` subclass
-  sneaking through `isinstance(int)` / `as_int_like` numeric checks. **Done
+  sneaking through `isinstance(int)` / `as_int_like` numeric checks.
+  **Aggregation-expression bool-argument cluster fixed** (2026-07-18, same
+  root cause): `$round`/`$trunc` (place), `$arrayElemAt`/`$slice`/`$indexOfArray`/
+  `$substrCP` (index), and `$sortArray` (sortBy) all *computed* a bool argument
+  (`as_int_like(Boolean) → 0/1`) instead of rejecting it. Both servers now reject:
+  the Python server carries mongod's exact per-op codes (16004 / 28690 /
+  28725 / 28727 / 2942507 / 34450 / 34452 / 40096), the Rust core defers →
+  `BadValue`. `$range` (34443/34445/34447) and `$sortArray` already deferred on the
+  Rust side (`range_int` / the `_ => Fallback` sortBy arm); three-way mongod
+  7.0.12-verified. **Follow-ups discovered (NOT fixed — separate slices):** (1)
+  these operators reject a *float* index too (`$arrayElemAt: [[..], 2.0]`), but
+  mongod *accepts* a whole-number double and truncates it — a distinct
+  float-truncation divergence needing its own mongod probe of the rounding rule.
+  (2) `$substrBytes` / `$substr` (deprecated) almost certainly share the bool
+  divergence but were not probed against mongod, so their guard/codes are
+  unverified — verify + fix as a sibling. **Done
   (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and

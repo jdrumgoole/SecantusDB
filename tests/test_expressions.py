@@ -1103,3 +1103,31 @@ def test_log_family_domain_errors() -> None:
     assert evaluate({"$ln": "$missing"}, {}, None) is None
     assert evaluate({"$sqrt": 0}, {}, None) == 0.0
     assert math.isnan(evaluate({"$ln": float("nan")}, {}, None))
+
+
+def test_bool_argument_rejected_where_int_expected() -> None:
+    # mongod rejects a bool where an aggregation operator expects a numeric
+    # (int) argument — bool is not a number. Each carries mongod's exact code.
+    for expr, code in [
+        ({"$round": [1.5, True]}, 16004),
+        ({"$trunc": [1.5, True]}, 16004),
+        ({"$arrayElemAt": [[10, 20, 30], True]}, 28690),
+        ({"$slice": [[1, 2, 3, 4], True]}, 28725),
+        ({"$slice": [[1, 2, 3, 4], True, 2]}, 28725),
+        ({"$slice": [[1, 2, 3, 4], 1, True]}, 28727),
+        ({"$sortArray": {"input": [3, 1, 2], "sortBy": True}}, 2942507),
+        ({"$substrCP": ["hello", True, 2]}, 34450),
+        ({"$substrCP": ["hello", 1, True]}, 34452),
+        ({"$range": [True, 5]}, 34443),
+        ({"$range": [0, True]}, 34445),
+        ({"$range": [0, 5, True]}, 34447),
+        ({"$indexOfArray": [[1, 2, 3], 2, True]}, 40096),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0, True]}, 40096),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr
+
+    # A plain int argument still computes (the guard is bool-specific).
+    assert evaluate({"$arrayElemAt": [[10, 20, 30], 1]}, {}, None) == 20
+    assert evaluate({"$slice": [[1, 2, 3, 4], 2]}, {}, None) == [1, 2]

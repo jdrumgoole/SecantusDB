@@ -1142,3 +1142,34 @@ def test_update_bool_argument_cluster_rejected(tmp_path) -> None:
         assert coll.find_one({"_id": 1})["a"] == [1, 2]
     finally:
         srv.stop()
+
+
+def test_aggregation_expr_bool_argument_rejected(tmp_path) -> None:
+    """A bool where an aggregation expression expects a numeric argument is
+    rejected on the Rust server (the core defers → BadValue) rather than
+    computing a wrong value. Matches mongod's reject-don't-compute contract; the
+    Rust error-code gap means BadValue rather than mongod's per-op Location code.
+    A valid int argument still computes."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        for expr in (
+            {"$round": [1.5, True]},
+            {"$trunc": [1.5, True]},
+            {"$arrayElemAt": [[10, 20, 30], True]},
+            {"$slice": [[1, 2, 3, 4], True]},
+            {"$slice": [[1, 2, 3, 4], 1, True]},
+            {"$sortArray": {"input": [3, 1, 2], "sortBy": True}},
+            {"$substrCP": ["hello", True, 2]},
+            {"$range": [0, True]},
+            {"$indexOfArray": [[1, 2, 3], 2, True]},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        out = list(
+            coll.aggregate([{"$project": {"r": {"$arrayElemAt": [[10, 20, 30], 1]}, "_id": 0}}])
+        )
+        assert out == [{"r": 20}]
+    finally:
+        srv.stop()
