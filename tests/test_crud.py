@@ -4743,6 +4743,33 @@ def test_bits_numeric_arg_validation(coll) -> None:
         assert exc.value.code == code, query
 
 
+def test_concat_type_validation_via_pymongo(coll) -> None:
+    """$concat: a non-string operand is 16702; a null / missing operand yields
+    null. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "s": "b"})
+    for expr in ({"$concat": ["a", 5]}, {"$concat": ["a", True]}, {"$concat": [["x"]]}):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == 16702, expr
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "ok": {"$concat": ["a", "$s"]},
+                        "n": {"$concat": ["a", None]},
+                        "m": {"$concat": ["a", "$gone"]},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"ok": "ab", "n": None, "m": None}]
+
+
 def test_pow_domain_validation(coll) -> None:
     """$pow: negative base + fractional exponent returns NaN (not a server crash),
     and bad operands raise mongod's codes over the wire. mongod 7.0.12-verified."""

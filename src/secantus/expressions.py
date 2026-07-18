@@ -153,9 +153,22 @@ def _bool(value: Any) -> bool:
     return True
 
 
-def _op_concat(arg: Any, ctx: _Ctx) -> str:
-    parts = _eval_args(arg, ctx)
-    return "".join("" if p is None else str(p) for p in parts)
+def _op_concat(arg: Any, ctx: _Ctx) -> Any:
+    # mongod: every operand must be a string; a null / missing operand short-
+    # circuits to a null result (left-to-right), and a non-string operand is
+    # Location16702 — no silent str() coercion.
+    parts = []
+    for p in _eval_args(arg, ctx):
+        if p is None:
+            return None
+        if not isinstance(p, str):
+            raise ExpressionError(
+                f"$concat only supports strings, not {_bson_type_name(p)}",
+                code=16702,
+                code_name="Location16702",
+            )
+        parts.append(p)
+    return "".join(parts)
 
 
 def _bson_type_name(v: Any) -> str:

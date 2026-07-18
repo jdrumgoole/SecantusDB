@@ -93,7 +93,24 @@ def test_arithmetic_date_semantics() -> None:
 
 def test_concat() -> None:
     assert evaluate({"$concat": ["hello", " ", "world"]}, {}) == "hello world"
-    assert evaluate({"$concat": ["x=", "$x"]}, {"x": 5}) == "x=5"
+    assert evaluate({"$concat": ["a", "$s"]}, {"s": "b"}) == "ab"
+
+
+def test_concat_type_validation() -> None:
+    # mongod: a non-string operand is Location16702 (no str() coercion); a null /
+    # missing operand short-circuits to a null result, left-to-right.
+    for bad in ([("x=", 5)], [("x=", True)], [(5,)], [("a", ["b"])]):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({"$concat": list(bad[0])}, {})
+        assert exc.value.code == 16702, bad
+    assert evaluate({"$concat": ["a", None, "b"]}, {}) is None
+    assert evaluate({"$concat": ["a", "$missing", "b"]}, {}) is None
+    # Left-to-right: a non-string before a null still raises.
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$concat": [5, None]}, {})
+    assert exc.value.code == 16702
+    # A null before a non-string short-circuits to null.
+    assert evaluate({"$concat": [None, 5]}, {}) is None
 
 
 def test_comparisons() -> None:
