@@ -95,10 +95,15 @@ jobs:
         # Release-time wheel builds don't cover either: they build and smoke the
         # wheel, they don't run the durable suite.
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","macos-14"]' || '["ubuntu-latest"]') }}
-        # Sharded two ways for the same reason ``test-windows`` is (see that
-        # job): unsharded, this lane's ~15 min pytest step was the whole
-        # workflow's critical path. Same complete-by-construction split.
-        shard: [sql, core]
+        # Duration-balanced split (pytest-split) against the per-platform files
+        # in ci/durations/, recorded by .github/workflows/record-durations.yml.
+        # REPLACES the sql/core path split, which was badly imbalanced and in
+        # OPPOSITE directions per platform (Linux ran sql 5m11 vs core 11m11;
+        # Windows ran sql 13m39 vs core 8m20), so #486 bought only 4m18 of a
+        # modelled 7-8 min. Balancing by recorded time packs the groups evenly
+        # and makes completeness STRUCTURAL: pytest-split partitions the
+        # collected set, so no test can fall through a gap between globs.
+        group: [1, 2, 3]
         exclude:
           # macOS runs on ONE interpreter, not the full sweep. The gap macOS
           # closes is OS-specific (durability, filesystem semantics, CLI-tool
@@ -232,11 +237,11 @@ jobs:
       # ``core`` shard on Linux so neither sharding nor the cron's extra OS /
       # python cells re-run them.
       - name: Lint
-        if: matrix.shard == 'core' && runner.os == 'Linux'
+        if: matrix.group == 1 && runner.os == 'Linux'
         run: uv run ruff check src tests
 
       - name: Format check
-        if: matrix.shard == 'core' && runner.os == 'Linux'
+        if: matrix.group == 1 && runner.os == 'Linux'
         run: uv run ruff format --check src tests
 
       - name: Wait for disk reclaim
@@ -261,7 +266,7 @@ jobs:
             exit 1
           fi
 
-      - name: Tests (${{ matrix.shard }} shard)
+      - name: Tests (group ${{ matrix.group }}/3)
         # ``--timeout=120 --timeout-method=thread`` catches deadline-
         # exceeded hangs (test body busy-loops or blocks on a stuck
         # producer) — independently of worker restarts.
@@ -282,16 +287,27 @@ jobs:
         # The ``sql`` shard is the SQL engine + PG-wire suites; ``core`` is
         # everything else — the same split ``test-windows`` uses, so a new test
         # file always lands in exactly one shard.
-        shell: bash
+        # ``--randomly-seed=${{ github.run_id }}`` is REQUIRED, not cosmetic.
+        # pytest-randomly is in the dev extra and active by default, so every
+        # run collects in a DIFFERENT order; pytest-split partitions the ORDERED
+        # collected list, so groups computed from different orderings neither
+        # cover nor partition the suite. Measured with unpinned seeds: 783 tests
+        # ran TWICE and 1042 ran NOWHERE — with CI still green, so the loss is
+        # silent. Pinning to the run id gives every group in a run one identical
+        # ordering while still varying run-to-run, so cross-test-leakage
+        # detection survives. Verified pinned: groups are disjoint and their
+        # union is exactly the collected suite (2155 + 2512 = 4667, overlap 0).
+        #
+        # macOS (weekly cron only) rides the Linux durations: it has no file of
+        # its own, and the split stays CORRECT regardless — a wrong durations
+        # file mis-balances the groups but can never drop or duplicate a test.
+        # Cron latency is not worth a second recording job.
         run: |
-          if [ "${{ matrix.shard }}" = "sql" ]; then
-            uv run python -m pytest tests/test_sql_*.py tests/test_pgserver*.py \
-              --timeout=120 --timeout-method=thread --max-worker-restart=3
-          else
-            uv run python -m pytest \
-              --ignore-glob='tests/test_sql_*.py' --ignore-glob='tests/test_pgserver*.py' \
-              --timeout=120 --timeout-method=thread --max-worker-restart=3
-          fi
+          uv run python -m pytest \
+            --splits 3 --group ${{ matrix.group }} \
+            --durations-path=ci/durations/linux.json \
+            --randomly-seed=${{ github.run_id }} \
+            --timeout=120 --timeout-method=thread --max-worker-restart=3
 
 
   # The Windows lane, split from the ``test`` job and sharded two ways so the
@@ -316,7 +332,10 @@ jobs:
       matrix:
         # Push / PR: 3.10 only. Schedule / workflow_dispatch: full sweep.
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
-        shard: [sql, core]
+        # Same 3-way duration split as the ``test`` job. Windows was the
+        # workflow's pole after #486 (sql 13m39), so balancing HERE is what
+        # actually moves the critical path.
+        group: [1, 2, 3]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
@@ -376,20 +395,17 @@ jobs:
         # bundles the IANA data.
         run: uv pip install tzdata
 
-      - name: Tests (${{ matrix.shard }} shard)
+      - name: Tests (group ${{ matrix.group }}/3)
         # Same pytest flags as the ``test`` job (see the comments there). The
         # ``sql`` shard is the SQL engine + PG-wire suites; ``core`` is
         # everything else. git-bash expands the globs.
-        shell: bash
+        # See the ``test`` job for why the seed is pinned.
         run: |
-          if [ "${{ matrix.shard }}" = "sql" ]; then
-            uv run python -m pytest tests/test_sql_*.py tests/test_pgserver*.py \
-              --timeout=120 --timeout-method=thread --max-worker-restart=3
-          else
-            uv run python -m pytest \
-              --ignore-glob='tests/test_sql_*.py' --ignore-glob='tests/test_pgserver*.py' \
-              --timeout=120 --timeout-method=thread --max-worker-restart=3
-          fi
+          uv run python -m pytest \
+            --splits 3 --group ${{ matrix.group }} \
+            --durations-path=ci/durations/windows.json \
+            --randomly-seed=${{ github.run_id }} \
+            --timeout=120 --timeout-method=thread --max-worker-restart=3
 
   # The slow + durable lanes, split out of the ``test`` matrix job so they run
   # in PARALLEL with the fast suite instead of serially after it: the durable
@@ -421,11 +437,15 @@ jobs:
         # all (local dev is SECANTUS_TEST_FAST_STORAGE=1), so without it macOS
         # durability behaviour is exercised by nobody, anywhere.
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","macos-14"]' || '["ubuntu-latest"]') }}
-        # Sharded for the same reason the ``test`` job is — the durable pass
-        # re-runs the whole suite, so unsharded it was the second-longest job
-        # (~12 min of pytest) and would have become the critical path the
-        # moment ``test`` was split.
-        shard: [sql, core]
+        # Duration-balanced split (pytest-split) against the per-platform files
+        # in ci/durations/, recorded by .github/workflows/record-durations.yml.
+        # REPLACES the sql/core path split, which was badly imbalanced and in
+        # OPPOSITE directions per platform (Linux ran sql 5m11 vs core 11m11;
+        # Windows ran sql 13m39 vs core 8m20), so #486 bought only 4m18 of a
+        # modelled 7-8 min. Balancing by recorded time packs the groups evenly
+        # and makes completeness STRUCTURAL: pytest-split partitions the
+        # collected set, so no test can fall through a gap between globs.
+        group: [1, 2, 3]
         exclude:
           # macOS on one interpreter only — see the ``test`` job's twin block.
           - os: macos-14
@@ -518,7 +538,7 @@ jobs:
         # Pinned to the ``core`` shard: this selects by MARKER across the whole
         # tree, not by path, so it is not shardable by the sql/core file split —
         # running it in both shards would just duplicate it.
-        if: matrix.shard == 'core'
+        if: matrix.group == 1
         run: uv run python -m pytest -m slow --timeout=120 --timeout-method=thread --max-worker-restart=3
 
       - name: Wait for disk reclaim
@@ -536,7 +556,7 @@ jobs:
             exit 1
           fi
 
-      - name: Durable-storage tests (${{ matrix.shard }} shard)
+      - name: Durable-storage tests (group ${{ matrix.group }}/3)
         # The default suite above runs FAST (the test conftest sets
         # ``SECANTUS_TEST_FAST_STORAGE=1``: journal on, close-checkpoint skipped),
         # so it does NOT exercise the checkpoint-durability path. Re-run the whole
@@ -550,16 +570,13 @@ jobs:
         # union of the two shards is still the whole suite.
         env:
           SECANTUS_FORCE_DURABLE: "1"
-        shell: bash
+        # See the ``test`` job for why the seed is pinned.
         run: |
-          if [ "${{ matrix.shard }}" = "sql" ]; then
-            uv run python -m pytest tests/test_sql_*.py tests/test_pgserver*.py \
-              --timeout=120 --timeout-method=thread --max-worker-restart=3
-          else
-            uv run python -m pytest \
-              --ignore-glob='tests/test_sql_*.py' --ignore-glob='tests/test_pgserver*.py' \
-              --timeout=120 --timeout-method=thread --max-worker-restart=3
-          fi
+          uv run python -m pytest \
+            --splits 3 --group ${{ matrix.group }} \
+            --durations-path=ci/durations/linux.json \
+            --randomly-seed=${{ github.run_id }} \
+            --timeout=120 --timeout-method=thread --max-worker-restart=3
 
   # The matrix above runs the pure-Python server. This job builds the Rust core
   # (``_secantus_core``) and pins each Rust engine byte-for-byte against its
