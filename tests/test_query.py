@@ -152,6 +152,27 @@ def test_type_list_of_aliases() -> None:
     assert not matches({"a": 1.5}, {"a": {"$type": ["string", "int"]}})
 
 
+def test_type_argument_validation() -> None:
+    # mongod: unknown alias / out-of-range / fractional code -> 2, bool -> 14.
+    for t in ("notatype", 0, 100, 2.5):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": 5}, {"a": {"$type": t}})
+        assert exc.value.code == 2, t
+    with pytest.raises(QueryError) as exc:
+        matches({"a": 5}, {"a": {"$type": True}})
+    assert exc.value.code == 14
+    # code 0 carries the $exists hint; an array validates each element.
+    with pytest.raises(QueryError) as exc:
+        matches({"a": 5}, {"a": {"$type": 0}})
+    assert "Instead use {$exists:false}" in str(exc.value)
+    with pytest.raises(QueryError):
+        matches({"a": 5}, {"a": {"$type": ["int", "notatype"]}})
+    # Valid numeric codes (incl. a whole double and minKey -1) are accepted.
+    assert matches({"a": 5}, {"a": {"$type": 16}})
+    assert matches({"a": 5.0}, {"a": {"$type": 1.0}})  # double code -> matches double
+    assert not matches({"a": 5}, {"a": {"$type": -1}})  # minKey: valid, no match
+
+
 def test_size() -> None:
     assert matches({"tags": [1, 2, 3]}, {"tags": {"$size": 3}})
     assert not matches({"tags": [1, 2]}, {"tags": {"$size": 3}})

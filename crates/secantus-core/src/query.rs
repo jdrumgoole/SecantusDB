@@ -748,6 +748,7 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
     let code: Option<i64> = match spec {
         Bson::Int32(n) => Some(*n as i64),
         Bson::Int64(n) => Some(*n),
+        Bson::Double(d) if d.fract() == 0.0 => Some(*d as i64), // whole-double code
         _ => None,
     };
     let is = |names: &[&str], codes: &[i64], hit: bool| -> bool {
@@ -1388,6 +1389,44 @@ fn as_schema_int(b: &Bson) -> Result<i64, Fallback> {
     }
 }
 
+/// A valid mongod $type argument: a known alias, or a numeric code in
+/// {-1, 1..19, 127} (a whole double counts). Anything else -> defer so Python
+/// raises the exact error (BadValue / TypeMismatch).
+fn type_spec_valid(spec: &Bson) -> bool {
+    const ALIASES: [&str; 22] = [
+        "double",
+        "string",
+        "object",
+        "array",
+        "binData",
+        "undefined",
+        "objectId",
+        "bool",
+        "date",
+        "null",
+        "regex",
+        "dbPointer",
+        "javascript",
+        "symbol",
+        "javascriptWithScope",
+        "int",
+        "timestamp",
+        "long",
+        "decimal",
+        "minKey",
+        "maxKey",
+        "number",
+    ];
+    let valid_code = |c: i64| c == -1 || c == 127 || (1..=19).contains(&c);
+    match spec {
+        Bson::String(s) => ALIASES.contains(&s.as_str()),
+        Bson::Int32(n) => valid_code(*n as i64),
+        Bson::Int64(n) => valid_code(*n),
+        Bson::Double(d) if d.fract() == 0.0 => valid_code(*d as i64),
+        _ => false,
+    }
+}
+
 fn op_type(values: &[Option<&Bson>], spec: &Bson) -> R {
     // spec is a single alias/code or an array of them. A non-alias/code spec
     // element (e.g. a float code) is pathological -> Python.
@@ -1396,8 +1435,8 @@ fn op_type(values: &[Option<&Bson>], spec: &Bson) -> R {
         single => vec![single],
     };
     for s in &specs {
-        if !matches!(s, Bson::String(_) | Bson::Int32(_) | Bson::Int64(_)) {
-            return Err(Fallback);
+        if !type_spec_valid(s) {
+            return Err(Fallback); // bad alias / code / bool / fractional -> Python raises
         }
     }
     for v in values {

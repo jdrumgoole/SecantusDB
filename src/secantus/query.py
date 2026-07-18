@@ -1183,8 +1183,70 @@ def _matches_type(value: Any, type_spec: Any) -> bool:
     return bool(pred(value)) if pred else False
 
 
+# Every BSON type alias mongod's $type accepts (incl. the deprecated ones and the
+# "number" meta-alias) and the valid numeric codes: 1..19, minKey (-1), maxKey (127).
+_VALID_TYPE_ALIASES = frozenset(
+    {
+        "double",
+        "string",
+        "object",
+        "array",
+        "binData",
+        "undefined",
+        "objectId",
+        "bool",
+        "date",
+        "null",
+        "regex",
+        "dbPointer",
+        "javascript",
+        "symbol",
+        "javascriptWithScope",
+        "int",
+        "timestamp",
+        "long",
+        "decimal",
+        "minKey",
+        "maxKey",
+        "number",
+    }
+)
+_VALID_TYPE_CODES = frozenset({-1, 127} | set(range(1, 20)))
+
+
+def _validate_type_arg(t: Any) -> None:
+    """mongod's $type argument validation: a known string alias, or a numeric code
+    in {-1, 1..19, 127} (a whole double is accepted). A bool / other type is
+    TypeMismatch (14); an unknown alias or an out-of-range / fractional code is
+    BadValue (2), with a special hint for code 0."""
+    if isinstance(t, bool):
+        raise QueryError(
+            "type must be represented as a number or a string", code=14, code_name="TypeMismatch"
+        )
+    if isinstance(t, str):
+        if t not in _VALID_TYPE_ALIASES:
+            raise QueryError(f"Unknown type name alias: {t}")
+        return
+    if isinstance(t, (int, float)):
+        if isinstance(t, float):
+            if not t.is_integer():
+                raise QueryError(f"Invalid numerical type code: {t}")
+            code = int(t)
+        else:
+            code = t
+        if code not in _VALID_TYPE_CODES:
+            suffix = ". Instead use {$exists:false}." if code == 0 else ""
+            raise QueryError(f"Invalid numerical type code: {code}{suffix}")
+        return
+    raise QueryError(
+        "type must be represented as a number or a string", code=14, code_name="TypeMismatch"
+    )
+
+
 def _op_type(values: list[Any], type_spec: Any) -> bool:
     types = type_spec if isinstance(type_spec, list) else [type_spec]
+    for t in types:
+        _validate_type_arg(t)
     for v in values:
         if v is MISSING:
             continue

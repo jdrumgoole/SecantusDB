@@ -69,10 +69,10 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 - ~~**Projection `$slice`**~~ **FIXED (#506):** non-number scalar / short / long
   array → 28667; 2/3-elem array not `[skip, positive-limit]` → 28724. Both engines
   (Rust core defers). (projection.py)
-- **`$type` validation**: unknown alias / fractional code / bool / bad code silently
-  no-match (mongod: unknown-alias 2, bad-code 2 [special code-0 msg], bool 14); Rust
-  also rejects valid whole-double codes. Valid alias set = 22 incl. deprecated; valid
-  code set = {-1,1..19,127}. **Ground-truth captured.** (query.py / .rs)
+- ~~**`$type` validation**~~ **FIXED (#507):** unknown alias / out-of-range / fractional
+  code → 2 (code-0 hint), bool → 14; the Rust engine now computes valid whole-double
+  codes instead of deferring. Valid alias set = 22, code set = {-1,1..19,127}. Both
+  engines. (query.py / .rs)
 - **Update `$push $sort`** bad spec (int/`{x:2}`) sorts anyway (mongod 2); scalar+doc-spec
   and mixed scalar/doc sort order wrong. `$pull`/`$pullAll` on a non-array field no-op
   (mongod 2). `arrayFilters` unused (mongod 9) / bad identifier (2) / empty (9) accepted.
