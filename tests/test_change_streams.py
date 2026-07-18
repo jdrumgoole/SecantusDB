@@ -293,7 +293,13 @@ def test_await_data_blocks_then_wakes_on_insert(client: MongoClient) -> None:
     db = client["csdb_block"]
     coll = db["c"]
     db.create_collection("c")
-    cs = coll.watch(max_await_time_ms=5000)
+    # Keep the per-getMore await window (1s) well under the _drain timeout (5s)
+    # below, so pymongo re-polls several times within the drain window. With
+    # them equal (both 5s) a single full-window getMore under heavy CI load
+    # collided with the drain deadline and the test saw 0 events even though the
+    # insert was already in the oplog — a re-poll (mongod's awaitData behaviour)
+    # surfaces it well inside the window.
+    cs = coll.watch(max_await_time_ms=1000)
     time.sleep(0.3)
 
     delay = 0.6
