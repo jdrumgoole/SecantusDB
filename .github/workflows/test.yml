@@ -195,6 +195,15 @@ jobs:
         run: |
           brew install swig
           brew tap mongodb/brew
+          # Homebrew now refuses to load formulae from an untrusted third-party
+          # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
+          # from untrusted tap"), which fails the step outright. Trust the two
+          # formulae we actually use, NOT the whole tap: `brew trust mongodb/brew`
+          # would also bless every future formula the tap ever ships. The
+          # HOMEBREW_NO_REQUIRE_TAP_TRUST=1 escape hatch is wider still and brew
+          # itself flags it as not recommended.
+          brew trust --formula mongodb/brew/mongosh
+          brew trust --formula mongodb/brew/mongodb-database-tools
           brew install mongosh mongodb-database-tools
 
       - name: Install uv
@@ -472,6 +481,15 @@ jobs:
         run: |
           brew install swig
           brew tap mongodb/brew
+          # Homebrew now refuses to load formulae from an untrusted third-party
+          # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
+          # from untrusted tap"), which fails the step outright. Trust the two
+          # formulae we actually use, NOT the whole tap: `brew trust mongodb/brew`
+          # would also bless every future formula the tap ever ships. The
+          # HOMEBREW_NO_REQUIRE_TAP_TRUST=1 escape hatch is wider still and brew
+          # itself flags it as not recommended.
+          brew trust --formula mongodb/brew/mongosh
+          brew trust --formula mongodb/brew/mongodb-database-tools
           brew install mongosh mongodb-database-tools
 
       - name: Install uv
