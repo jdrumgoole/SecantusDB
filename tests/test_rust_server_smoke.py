@@ -1520,3 +1520,18 @@ def test_unary_math_rejects_non_numeric(tmp_path) -> None:
         assert got == [{"a": 4.0}]
     finally:
         srv.stop()
+
+
+def test_in_nin_argument_validation(tmp_path) -> None:
+    """The Rust server rejects a non-array $in/$nin and a nested $-prefixed doc
+    element (defer -> BadValue) instead of leaking / silently no-matching."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "n": 5})
+        for q in ({"n": {"$in": 5}}, {"n": {"$nin": "x"}}, {"n": {"$in": [{"$x": 1}]}}):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.find(q))
+        assert [d["_id"] for d in coll.find({"n": {"$in": [5, 9]}})] == [1]
+    finally:
+        srv.stop()

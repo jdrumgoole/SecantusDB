@@ -317,6 +317,7 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
         "$lte" => cmp_op(values, arg, coll, |o| o != Ordering::Greater),
         "$in" => {
             let arr = arg.as_array().ok_or(Fallback)?;
+            in_elements_ok(arr)?;
             for cand in arr {
                 if in_candidate_matches(values, cand, coll)? {
                     return Ok(true);
@@ -326,6 +327,7 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
         }
         "$nin" => {
             let arr = arg.as_array().ok_or(Fallback)?;
+            in_elements_ok(arr)?;
             for cand in arr {
                 if in_candidate_matches(values, cand, coll)? {
                     return Ok(false);
@@ -378,6 +380,20 @@ fn is_exotic(b: &Bson) -> bool {
 /// pattern (mongod semantics — bare equality would silently match nothing);
 /// everything else is array-aware, collation-aware equality. Mirrors
 /// `query._in_candidate_matches`.
+/// mongod rejects a `$in` / `$nin` element that is a document with a
+/// `$`-prefixed key ("cannot nest $ under $in", BadValue) — defer so Python
+/// raises it. A BSON regex literal is fine (handled in `in_candidate_matches`).
+fn in_elements_ok(arr: &[Bson]) -> Result<(), Fallback> {
+    for el in arr {
+        if let Bson::Document(d) = el {
+            if d.keys().any(|k| k.starts_with('$')) {
+                return Err(Fallback);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn in_candidate_matches(values: &[Option<&Bson>], cand: &Bson, coll: Option<&Collation>) -> R {
     if matches!(cand, Bson::RegularExpression(_)) {
         op_regex(values, cand, None)

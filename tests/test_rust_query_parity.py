@@ -745,6 +745,26 @@ def test_curated_parity(doc, query):
         assert rust == py, f"rust={rust} pure={py} for query={query} doc={doc}"
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"a": {"$in": 5}},  # non-array
+        {"a": {"$nin": "x"}},  # non-array
+        {"a": {"$in": [{"$regex": "x"}]}},  # nested $ doc element
+        {"a": {"$in": [{"$x": 1}]}},  # nested $ key
+    ],
+)
+def test_in_nin_invalid_defers_and_raises(query):
+    # An invalid $in/$nin: the Rust core defers (None) and the pure engine raises
+    # BadValue — the two agree on "reject", so parity holds via the defer contract.
+    doc = bson.decode(bson.encode({"a": 5}))
+    query = bson.decode(bson.encode({"q": query}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == 2
+
+
 def _rand_scalar(rng):
     return rng.choice(
         [
