@@ -1421,8 +1421,18 @@ def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
         ) from None
     if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
         raise ExpressionError("$substrCP requires string + ints")
+    # Unlike $substrBytes, mongod rejects a negative start *and* a negative
+    # length for $substrCP (distinct codes/messages, verbatim).
+    if start < 0:
+        raise ExpressionError(
+            "$substrCP: the starting index must be nonnegative integer.",
+            code=34455,
+        )
     if length < 0:
-        return s[start:]
+        raise ExpressionError(
+            "$substrCP: length must be a nonnegative integer.",
+            code=34454,
+        )
     return s[start : start + length]
 
 
@@ -1497,23 +1507,26 @@ def _op_substr_bytes(arg: Any, ctx: _Ctx) -> Any:
         raise ExpressionError("$substrBytes requires string + ints")
     encoded = s.encode("utf-8")
     n = len(encoded)
+    # mongod rejects a negative start (a negative length is fine — it means
+    # "to the end"). Message includes the value, with a verbatim double space.
+    if start < 0:
+        raise ExpressionError(
+            f"$substrBytes:  starting index must be non-negative (got: {start})",
+            code=50752,
+        )
     # mongod rejects a byte range that splits a UTF-8 character rather than
-    # returning a replacement char (verbatim double-space messages). Only
-    # meaningful for a non-negative start; a negative start keeps the
-    # pre-existing Python slice semantics (matched by the Rust core), which is a
-    # separate divergence outside this fix's scope.
-    if start >= 0:
-        if start < n and (encoded[start] & 0xC0) == 0x80:
-            raise ExpressionError(
-                "$substrBytes:  Invalid range, starting index is a UTF-8 continuation byte.",
-                code=28656,
-            )
-        end = n if length < 0 else start + length
-        if 0 <= end < n and (encoded[end] & 0xC0) == 0x80:
-            raise ExpressionError(
-                "$substrBytes:  Invalid range, ending index is in the middle of a UTF-8 character.",
-                code=28657,
-            )
+    # returning a replacement char (verbatim double-space messages).
+    if start < n and (encoded[start] & 0xC0) == 0x80:
+        raise ExpressionError(
+            "$substrBytes:  Invalid range, starting index is a UTF-8 continuation byte.",
+            code=28656,
+        )
+    end = n if length < 0 else start + length
+    if 0 <= end < n and (encoded[end] & 0xC0) == 0x80:
+        raise ExpressionError(
+            "$substrBytes:  Invalid range, ending index is in the middle of a UTF-8 character.",
+            code=28657,
+        )
     if length < 0:
         return encoded[start:].decode("utf-8", errors="replace")
     return encoded[start : start + length].decode("utf-8", errors="replace")

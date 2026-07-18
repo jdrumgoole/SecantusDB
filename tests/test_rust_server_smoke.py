@@ -1232,3 +1232,26 @@ def test_substr_bytes_split_utf8_rejected(tmp_path) -> None:
         assert got == [{"r": "hé"}]
     finally:
         srv.stop()
+
+
+def test_substr_negative_index_rejected(tmp_path) -> None:
+    """The Rust server rejects a negative $substr* start / negative $substrCP
+    length (the core defers to BadValue), while $substrBytes negative length
+    still means "to end"."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        for expr in (
+            {"$substrBytes": ["abcde", -1, 2]},
+            {"$substrCP": ["abcde", -1, 2]},
+            {"$substrCP": ["abcde", 1, -1]},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        got = list(
+            coll.aggregate([{"$project": {"r": {"$substrBytes": ["abcde", 1, -1]}, "_id": 0}}])
+        )
+        assert got == [{"r": "bcde"}]
+    finally:
+        srv.stop()

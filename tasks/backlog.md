@@ -1170,11 +1170,17 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   empty (length 0) range*, which the Rust core's `std::str::from_utf8` slice check
   missed (an empty slice is valid UTF-8) — so **both** engines got an explicit
   boundary check (a negative start keeps legacy slice semantics on both).
-  Three-way mongod 7.0.12-verified. **Note:** `$substrBytes` still rejects a
-  *float* start/length
-  where mongod truncates any double — a separate remaining divergence (the
-  whole-double sweep covered `$substrCP`, not `$substrBytes`, since mongod's
-  substrBytes truncation semantics differ). **Done
+  Three-way mongod 7.0.12-verified. **`$substr*` negative-index rejection — FIXED
+  (2026-07-18):** a negative start (`$substrBytes`/`$substr` → 50752;
+  `$substrCP` → 34455) and a negative `$substrCP` length (34454) now raise mongod's
+  codes on the Python server and defer → `BadValue` on the Rust server, instead of
+  a Python-style negative-index slice; a negative `$substrBytes` length is still
+  "to end" (mongod-correct). **Still open — `$substrBytes` float truncation:**
+  `$substrBytes` rejects a *positive float* start/length where mongod *truncates
+  toward zero* (`1.7`→1, `2.9`→2, `0.9`→0). Unlike `$substrCP` (which rejects
+  fractional), substrBytes accepts any double, so the fix must make *both* engines
+  compute the truncated result (Rust must truncate-and-compute, not defer) — the
+  one substr numeric case left. **Done
   (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and

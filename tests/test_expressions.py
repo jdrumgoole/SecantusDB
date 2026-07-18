@@ -1194,3 +1194,19 @@ def test_substr_bytes_rejects_split_utf8_character() -> None:
     assert evaluate({"$substrBytes": ["héllo", 3, 2]}, {}, None) == "ll"
     assert evaluate({"$substrBytes": ["héllo", 3, 99]}, {}, None) == "llo"
     assert evaluate({"$substrBytes": ["héllo", 99, 0]}, {}, None) == ""
+
+
+def test_substr_negative_index_rejected() -> None:
+    # mongod rejects a negative start for both $substr* ops, and a negative
+    # length for $substrCP (a negative length is fine for $substrBytes).
+    for expr, code in [
+        ({"$substrBytes": ["abcde", -1, 2]}, 50752),
+        ({"$substr": ["abcde", -1, 2]}, 50752),
+        ({"$substrCP": ["abcde", -1, 2]}, 34455),
+        ({"$substrCP": ["abcde", 1, -1]}, 34454),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr
+    # $substrBytes negative length still means "to the end".
+    assert evaluate({"$substrBytes": ["abcde", 1, -1]}, {}, None) == "bcde"

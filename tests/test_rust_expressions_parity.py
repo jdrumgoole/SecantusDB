@@ -856,6 +856,12 @@ CURATED = [
     ({"$substrBytes": ["éa😀ézé", 1, 0]}, {}),
     ({"$substrBytes": ["héllo", 1, 0]}, {}),
     ({"$substrBytes": ["héllo", 99, 0]}, {}),
+    # negative start rejected on both ops (50752 / 34455); negative length
+    # rejected on $substrCP (34454) but fine on $substrBytes (to end).
+    ({"$substrBytes": ["abcde", -1, 2]}, {}),
+    ({"$substrBytes": ["abcde", 1, -1]}, {}),
+    ({"$substrCP": ["abcde", -1, 2]}, {}),
+    ({"$substrCP": ["abcde", 1, -1]}, {}),
 ]
 
 
