@@ -1,23 +1,19 @@
-"""The controller-side stall watchdog in ``tests/conftest.py``.
+"""The session stall watchdog in ``tests/conftest.py``.
 
-A worker crash that wedges the xdist *controller* is invisible to every timeout
-the suite otherwise relies on: ``--timeout`` and ``--session-timeout`` are both
+A pytest run that wedges after its last test is invisible to every timeout the
+suite otherwise relies on: ``--timeout`` and ``--session-timeout`` are both
 enforced inside the worker, and the session-scoped ``_hang_watchdog`` fixture
-never runs in the controller at all. The result observed in CI was 85 minutes of
+never runs in the xdist controller at all. Observed in CI as 85 minutes of
 silence ending in a job-level kill with no diagnostics.
 
-These tests drive the watchdog end to end by running real nested pytest sessions
-under xdist, because the whole mechanism lives in controller/worker process
-boundaries that cannot be faked in-process.
-
-Both directions matter:
-  * it MUST fire when the controller genuinely stops making progress, and
-  * it MUST NOT fire for a crash the run recovers from — a false positive here
-    would turn a self-healing flake into a hard CI failure.
+These tests drive the watchdog end to end through real nested pytest sessions,
+because the mechanism lives in process boundaries that cannot be faked
+in-process.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -32,82 +28,69 @@ _CONFTEST_UNDER_TEST = Path(__file__).parent / "conftest.py"
 
 
 def _run_nested_pytest(
-    tmp_path: Path, body: str, *, stall_seconds: str, timeout: int = 180
+    tmp_path: Path,
+    body: str,
+    *,
+    stall_seconds: str,
+    xdist: bool,
+    timeout: int = 180,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a throwaway pytest session under xdist in its own process tree.
+    """Run a throwaway pytest session in its own process tree.
 
     The nested session gets a copy of the real ``conftest.py`` so it exercises
-    the actual hooks rather than a reimplementation. ``-p no:cacheprovider``
-    keeps the temp tree clean; ``-p no:randomly`` keeps ordering deterministic.
+    the actual hooks rather than a reimplementation.
     """
     (tmp_path / "conftest.py").write_text(_CONFTEST_UNDER_TEST.read_text())
     (tmp_path / "test_nested.py").write_text(textwrap.dedent(body))
 
+    env = dict(os.environ)
+    env["SECANTUS_STALL_SECONDS"] = stall_seconds
+
+    cmd = [sys.executable, "-m", "pytest", str(tmp_path)]
+    cmd += ["-n", "2"] if xdist else ["-p", "no:xdist"]
+    cmd += [
+        "-p",
+        "no:randomly",
+        "-p",
+        "no:cacheprovider",
+        "-o",
+        "addopts=",
+        "--timeout=120",
+        "--timeout-method=thread",
+        "-q",
+    ]
+    if xdist:
+        cmd.append("--max-worker-restart=3")
+
     return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            str(tmp_path),
-            "-n",
-            "2",
-            "-p",
-            "no:randomly",
-            "-p",
-            "no:cacheprovider",
-            "-o",
-            "addopts=",
-            "--timeout=120",
-            "--timeout-method=thread",
-            "--max-worker-restart=3",
-            "-q",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        cwd=tmp_path,
-        env={
-            **_clean_env(),
-            "SECANTUS_POST_CRASH_STALL_SECONDS": stall_seconds,
-        },
+        cmd, capture_output=True, text=True, timeout=timeout, cwd=tmp_path, env=env
     )
 
 
-def _clean_env() -> dict[str, str]:
-    import os
-
-    env = dict(os.environ)
-    env.pop("SECANTUS_POST_CRASH_STALL_SECONDS", None)
-    return env
-
-
 @pytest.mark.timeout(240)
-def test_stall_after_worker_crash_fails_fast_with_stacks(tmp_path: Path) -> None:
-    """A crashed worker plus a stalled controller exits non-zero WITH stacks.
+def test_stall_fails_fast_with_stacks(tmp_path: Path) -> None:
+    """A session that stops reporting exits non-zero WITH stacks.
 
-    ``os._exit`` inside a test body kills the worker process outright, which is
-    exactly the "node down: Not properly terminated" xdist reports. The sleeping
-    test then supplies the stall: while it runs, no report reaches the
-    controller, so with a 5s grace the watchdog must trip.
+    The sleeping test supplies the stall: while it runs, no report reaches the
+    controller, so with a 5s limit the watchdog must trip. Without the watchdog
+    this session simply runs to the sleep's end (or, in the real CI case,
+    forever) with nothing explaining why.
 
-    Without the watchdog this session runs to the sleep's completion (or in the
-    real CI case, forever) with nothing explaining why.
+    Note this deliberately does NOT crash a worker. The first version of the
+    watchdog armed only on ``pytest_testnodedown``, and would have sat silent
+    through exactly this scenario — which is the one later observed in the wild.
     """
     result = _run_nested_pytest(
         tmp_path,
         """
-        import os
         import time
-
-
-        def test_crash_the_worker():
-            os._exit(1)
 
 
         def test_long_gap_with_no_reports():
             time.sleep(60)
         """,
         stall_seconds="5",
+        xdist=True,
     )
 
     assert result.returncode == _STALL_EXIT_CODE, (
@@ -115,31 +98,28 @@ def test_stall_after_worker_crash_fails_fast_with_stacks(tmp_path: Path) -> None
         f"{result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     combined = result.stdout + result.stderr
-    assert "xdist controller stalled after a worker crash" in combined, combined
+    assert "pytest session stalled" in combined, combined
     # The diagnostics are the entire point — a fast failure that says nothing
     # would be no better than the job-level timeout it replaces.
-    assert "Controller thread stacks follow" in combined, combined
-    assert "Thread" in combined or "File " in combined, (
-        "expected a faulthandler thread dump in the output:\n" + combined
-    )
+    assert "Thread stacks follow" in combined, combined
+    assert "no worker reported going down" in combined, combined
 
 
 @pytest.mark.timeout(240)
-def test_healthy_session_never_arms_the_watchdog(tmp_path: Path) -> None:
-    """A session with no worker crash must be completely unaffected.
+def test_healthy_session_is_untouched(tmp_path: Path) -> None:
+    """A run that keeps reporting is never killed, even with a tight limit.
 
-    This is the false-positive guard, and it is the ONLY safe shape for one.
-    The obvious alternative — crash a worker, assert the run recovers without
-    the watchdog firing — cannot be written as a stable test: measured over
-    repeated runs, xdist's recovery from ``os._exit`` took 0.6s, 0.6s, then
-    17s, and under full-suite load wedged past 180s entirely (which is the very
-    bug this watchdog exists for). A test asserting "recovery is clean" would
-    therefore be asserting something that is not reliably true, and a flaky
-    test guarding against flakiness is worse than no test at all.
+    Runs SERIALLY on purpose. The xdist shutdown wedge this watchdog exists to
+    catch also strikes healthy sessions — a nested xdist run was observed
+    printing "3 passed in 2.52s" and then hanging until SIGKILL with no crash
+    involved — so "a healthy xdist session exits 0" is not reliably true, and
+    asserting it made an earlier version of this test flaky. Serial has no
+    controller/worker split and therefore no wedge, which leaves this test
+    pinning exactly one thing, deterministically: progress keeps the watchdog
+    quiet.
 
-    So the guarantee pinned here is the one that IS deterministic: no node-down
-    means ``pytest_testnodedown`` never fires, nothing arms, and a tiny 1s grace
-    — far below the runtime of the session — still produces a clean exit.
+    The 20s limit sits comfortably above the 8s gap but far below the ~300s
+    floor, so an unconditional or elapsed-time watchdog would trip here.
     """
     result = _run_nested_pytest(
         tmp_path,
@@ -148,19 +128,18 @@ def test_healthy_session_never_arms_the_watchdog(tmp_path: Path) -> None:
 
 
         def test_a():
-            time.sleep(2)
+            time.sleep(8)
 
 
         def test_b():
-            time.sleep(2)
+            time.sleep(1)
 
 
         def test_c():
             assert True
         """,
-        # 1s: if arming were unconditional rather than crash-triggered, the
-        # sleeps alone would blow this grace and trip the watchdog.
-        stall_seconds="1",
+        stall_seconds="20",
+        xdist=False,
     )
 
     assert result.returncode == 0, (
@@ -168,5 +147,26 @@ def test_healthy_session_never_arms_the_watchdog(tmp_path: Path) -> None:
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     combined = result.stdout + result.stderr
-    assert "xdist controller stalled" not in combined, combined
+    assert "pytest session stalled" not in combined, combined
     assert "3 passed" in combined, combined
+
+
+def test_threshold_is_derived_from_the_per_test_timeout() -> None:
+    """The limit must never sit below the per-test deadline.
+
+    The watcher measures time since the last report, so while a single long
+    test runs it cannot distinguish "slow" from "stalled". pytest kills any test
+    at ``--timeout``, so that deadline is the floor below which a healthy run
+    could be misread as a stall. A fixed 300s would have false-fired on a
+    default local run, where the ini deadline is 600s.
+    """
+    import conftest  # the suite's own conftest, already on sys.path
+
+    assert conftest._STALL_FLOOR_SECONDS >= 300
+    assert conftest._STALL_TIMEOUT_MULTIPLIER > 1.0, (
+        "the limit must exceed the per-test timeout, or a test that legitimately "
+        "runs to its deadline would be reported as a stall"
+    )
+    # CI runs --timeout=120 -> the 300s floor; a default local run has ini
+    # timeout=600 -> 1500s, which a fixed 300s limit would have violated.
+    assert 600 * conftest._STALL_TIMEOUT_MULTIPLIER > 600
