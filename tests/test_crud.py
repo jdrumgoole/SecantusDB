@@ -814,6 +814,31 @@ def test_aggregate_sort_stage_validation_via_pymongo(coll) -> None:
     assert [d["_id"] for d in coll.aggregate([{"$sort": {"n": 1.0}}])] == [2, 1]
 
 
+def test_densify_validation_via_pymongo(coll) -> None:
+    """$densify: date unit on numeric 6053600, bool step 14, non-positive step
+    5733401, bad bounds string 5946802, wrong-length array 5733403, descending
+    array 5733402. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 5}])
+    for rng, code in [
+        ({"step": 1, "unit": "day", "bounds": "full"}, 6053600),
+        ({"step": True, "bounds": "full"}, 14),
+        ({"step": 0, "bounds": "full"}, 5733401),
+        ({"step": 1, "bounds": "partial"}, 5946802),
+        ({"step": 1, "bounds": [0]}, 5733403),
+        ({"step": 1, "bounds": [5, 0]}, 5733402),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$densify": {"field": "v", "range": rng}}]))
+        assert exc.value.code == code, rng
+    # A valid numeric densify still fills the gap.
+    out = list(
+        coll.aggregate([{"$densify": {"field": "v", "range": {"step": 1, "bounds": "full"}}}])
+    )
+    assert sorted(d["v"] for d in out) == [1, 2, 3, 4, 5]
+
+
 def test_aggregate_project_with_computed_field(coll) -> None:
     coll.insert_many([{"_id": 1, "x": 3, "y": 4}])
     out = list(coll.aggregate([{"$project": {"_id": 0, "sum": {"$add": ["$x", "$y"]}}}]))

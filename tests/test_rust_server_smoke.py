@@ -1643,3 +1643,29 @@ def test_sort_stage_validation(tmp_path) -> None:
         assert [d["_id"] for d in coll.aggregate([{"$sort": {"n": 1.0}}])] == [2, 1]
     finally:
         srv.stop()
+
+
+def test_densify_validation(tmp_path) -> None:
+    """The Rust server rejects an invalid $densify (date unit on numeric, bool
+    step, non-positive step, bad/wrong-length/descending bounds) instead of
+    coercing or leaking; a valid numeric densify still fills the gap."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 5}])
+        for rng in (
+            {"step": 1, "unit": "day", "bounds": "full"},
+            {"step": True, "bounds": "full"},
+            {"step": 0, "bounds": "full"},
+            {"step": 1, "bounds": "partial"},
+            {"step": 1, "bounds": [0]},
+            {"step": 1, "bounds": [5, 0]},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$densify": {"field": "v", "range": rng}}]))
+        out = list(
+            coll.aggregate([{"$densify": {"field": "v", "range": {"step": 1, "bounds": "full"}}}])
+        )
+        assert sorted(d["v"] for d in out) == [1, 2, 3, 4, 5]
+    finally:
+        srv.stop()

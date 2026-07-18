@@ -468,8 +468,19 @@ def _stage_densify(
     if not isinstance(range_spec, Mapping):
         raise AggregateError("$densify requires range")
     raw_step = range_spec.get("step")
-    if not isinstance(raw_step, (int, float)) or raw_step <= 0:
-        raise AggregateError("$densify step must be a positive number")
+    if isinstance(raw_step, bool) or not isinstance(raw_step, (int, float)):
+        raise AggregateError(
+            f"BSON field '$densify.range.step' is the wrong type '{_bson_type_name(raw_step)}', "
+            "expected types '[int, decimal, double, long']",
+            code=14,
+            code_name="TypeMismatch",
+        )
+    if raw_step <= 0:
+        raise AggregateError(
+            "The step parameter in a range statement must be a strictly positive numeric value",
+            code=5733401,
+            code_name="Location5733401",
+        )
     unit = range_spec.get("unit")
     if unit is not None:
         if not isinstance(unit, str):
@@ -489,6 +500,54 @@ def _stage_densify(
         step = raw_step
     bounds = range_spec.get("bounds")
     partition_fields = list(spec.get("partitionByFields") or [])
+
+    # A date-unit step requires date field values (mongod 6053600) — a numeric
+    # value with a date step would otherwise leak a Python TypeError.
+    if unit is not None:
+        for d in docs:
+            fv = get_path(d, field)
+            if isinstance(fv, (int, float)) and not isinstance(fv, bool):
+                raise AggregateError(
+                    "Encountered numeric densify value in collection when step has a date unit.",
+                    code=6053600,
+                    code_name="Location6053600",
+                )
+
+    # bounds must be the string "full"/"partition" or a strictly-ascending
+    # two-element array of two numbers or two dates (mongod 5946802/5733403/5733402).
+    if isinstance(bounds, str):
+        if bounds not in ("full", "partition"):
+            raise AggregateError(
+                "Bounds string must either be 'full' or 'partition'",
+                code=5946802,
+                code_name="Location5946802",
+            )
+    elif isinstance(bounds, list):
+        if len(bounds) != 2:
+            raise AggregateError(
+                "A bounding array in a range statement must have exactly two elements",
+                code=5733403,
+                code_name="Location5733403",
+            )
+        lo_b, hi_b = bounds
+        both_num = all(isinstance(b, (int, float)) and not isinstance(b, bool) for b in bounds)
+        both_date = all(isinstance(b, _dt.datetime) for b in bounds)
+        try:
+            ascending = lo_b < hi_b
+        except TypeError:
+            ascending = False
+        if not (both_num or both_date) or not ascending:
+            raise AggregateError(
+                "A bounding array must be an ascending array of either two dates or two numbers",
+                code=5733402,
+                code_name="Location5733402",
+            )
+    elif bounds is not None:
+        raise AggregateError(
+            "Bounds string must either be 'full' or 'partition'",
+            code=5946802,
+            code_name="Location5946802",
+        )
 
     # Hard cap on filler-doc count per partition. Without this, an
     # explicit `bounds: [0, 10**15]` with `step: 1` materialises 10**15
