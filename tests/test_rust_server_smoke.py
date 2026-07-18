@@ -1792,3 +1792,22 @@ def test_trim_argument_validation(tmp_path) -> None:
         assert list(coll.aggregate([{"$project": proj}])) == [{"t": "x", "n": None}]
     finally:
         srv.stop()
+
+
+def test_index_of_start_end_validation(tmp_path) -> None:
+    """The Rust server rejects a fractional / bool / non-numeric / negative
+    $indexOf start or end (defer -> BadValue) and accepts a whole double."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        for op in ("$indexOfBytes", "$indexOfCP"):
+            for bad in (2.5, True, "x", -1):
+                with pytest.raises(pymongo.errors.OperationFailure):
+                    list(
+                        coll.aggregate([{"$project": {"r": {op: ["abcabc", "b", bad]}, "_id": 0}}])
+                    )
+        proj = {"_id": 0, "i": {"$indexOfBytes": ["abcabc", "b", 2.0]}}
+        assert list(coll.aggregate([{"$project": proj}])) == [{"i": 4}]
+    finally:
+        srv.stop()

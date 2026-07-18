@@ -1558,6 +1558,36 @@ def _op_str_len_cp(arg: Any, ctx: _Ctx) -> Any:
     return len(s)
 
 
+def _index_of_pos(op: str, which: str, v: Any) -> int:
+    """Validate a ``$indexOf*`` start / end index. mongod accepts an int or whole
+    double; a fractional double / bool / non-numeric is Location40096 (note its
+    verbatim missing space after the operator name), and a negative index is
+    Location40097."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ExpressionError(
+            f"{op}requires an integral {which} index, found a value of type: "
+            f"{_bson_type_name(v)}, with value: {_mongo_val_repr(v)}",
+            code=40096,
+            code_name="Location40096",
+        )
+    if isinstance(v, float):
+        if not v.is_integer():
+            raise ExpressionError(
+                f"{op}requires an integral {which} index, found a value of type: "
+                f"{_bson_type_name(v)}, with value: {_mongo_val_repr(v)}",
+                code=40096,
+                code_name="Location40096",
+            )
+        v = int(v)
+    if v < 0:
+        raise ExpressionError(
+            f"{op} requires a nonnegative {which} index, found: {v}",
+            code=40097,
+            code_name="Location40097",
+        )
+    return v
+
+
 def _op_index_of_cp(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, list) or not 2 <= len(arg) <= 4:
         raise ExpressionError("$indexOfCP requires [string, search, start?, end?]")
@@ -1567,10 +1597,8 @@ def _op_index_of_cp(arg: Any, ctx: _Ctx) -> Any:
         return None
     if not isinstance(s, str) or not isinstance(needle, str):
         raise ExpressionError("$indexOfCP requires string operands")
-    start = _eval(arg[2], ctx) if len(arg) >= 3 else 0
-    end = _eval(arg[3], ctx) if len(arg) >= 4 else len(s)
-    if not isinstance(start, int) or not isinstance(end, int):
-        return -1
+    start = _index_of_pos("$indexOfCP", "starting", _eval(arg[2], ctx)) if len(arg) >= 3 else 0
+    end = _index_of_pos("$indexOfCP", "ending", _eval(arg[3], ctx)) if len(arg) >= 4 else len(s)
     return s.find(needle, start, end)
 
 
@@ -1583,11 +1611,13 @@ def _op_index_of_bytes(arg: Any, ctx: _Ctx) -> Any:
         return None
     if not isinstance(s, str) or not isinstance(needle, str):
         raise ExpressionError("$indexOfBytes requires string operands")
-    start = _eval(arg[2], ctx) if len(arg) >= 3 else 0
-    end = _eval(arg[3], ctx) if len(arg) >= 4 else len(s.encode("utf-8"))
-    if not isinstance(start, int) or not isinstance(end, int):
-        return -1
+    start = _index_of_pos("$indexOfBytes", "starting", _eval(arg[2], ctx)) if len(arg) >= 3 else 0
     haystack = s.encode("utf-8")
+    end = (
+        _index_of_pos("$indexOfBytes", "ending", _eval(arg[3], ctx))
+        if len(arg) >= 4
+        else len(haystack)
+    )
     needle_b = needle.encode("utf-8")
     return haystack.find(needle_b, start, end)
 

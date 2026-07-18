@@ -736,6 +736,14 @@ CURATED = [
     ({"$indexOfCP": ["$s", "x"]}, {}),  # missing -> null
     ({"$indexOfBytes": ["héllo", "llo"]}, {}),  # byte index 3 (é is 2 bytes)
     ({"$indexOfBytes": ["abcabc", "c", 3, 6]}, {}),
+    ({"$indexOfBytes": ["abcabc", "b", 2.0]}, {}),  # whole-double start now computes
+    ({"$indexOfCP": ["abcabc", "b", 2.0]}, {}),
+    # Invalid start/end: Rust defers (None); Python raises 40096 / 40097.
+    ({"$indexOfBytes": ["abcabc", "b", 2.5]}, {}),  # fractional -> 40096
+    ({"$indexOfBytes": ["abcabc", "b", True]}, {}),  # bool -> 40096
+    ({"$indexOfBytes": ["abcabc", "b", -1]}, {}),  # negative -> 40097
+    ({"$indexOfCP": ["abcabc", "b", "x"]}, {}),  # non-numeric -> 40096
+    ({"$indexOfBytes": ["abcabc", "b", 0, -1]}, {}),  # negative end -> 40097
     ({"$substrBytes": ["hello", 1, 3]}, {}),
     ({"$substrBytes": ["héllo", 0, 1]}, {}),  # "h"
     ({"$substrBytes": ["héllo", 1, 1]}, {}),  # splits é -> invalid utf8 -> defer

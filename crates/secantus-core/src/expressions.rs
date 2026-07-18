@@ -1053,10 +1053,6 @@ fn norm_index(i: i64, len: i64) -> i64 {
     }
 }
 
-fn slice_int(b: &Bson) -> Option<i64> {
-    as_int_like(b).map(|x| x as i64)
-}
-
 /// Coerce a numeric arg to i64, truncating a finite double toward zero -- the
 /// `$substrBytes` semantics (mongod accepts any double there, unlike `$substrCP`
 /// which rejects a fractional one). `None` for a non-finite double / non-number
@@ -3690,16 +3686,25 @@ fn op_index_of(arg: &Bson, ctx: &Ctx, bytes: bool) -> R {
         return Err(Fallback); // non-string operands -> Python raises
     };
     let len = if bytes { s.len() } else { s.chars().count() } as i64;
-    // start/end: Python isinstance(int) (incl bool); non-int -> -1.
-    let bound = |idx: usize, default: i64, ctx: &Ctx| -> Result<Option<i64>, Fallback> {
+    // start/end must be a non-negative int or whole double (mongod). A fractional
+    // double / bool / non-numeric (40096) or a negative index (40097) defers so
+    // Python raises the exact error.
+    let bound = |idx: usize, default: i64, ctx: &Ctx| -> Result<i64, Fallback> {
         if a.len() <= idx {
-            return Ok(Some(default));
+            return Ok(default);
         }
-        Ok(slice_int(&eval(&a[idx], ctx)?))
+        let n = match eval(&a[idx], ctx)? {
+            Bson::Int32(n) => n as i64,
+            Bson::Int64(n) => n,
+            Bson::Double(d) if d.fract() == 0.0 => d as i64,
+            _ => return Err(Fallback), // fractional / bool / non-numeric -> 40096
+        };
+        if n < 0 {
+            return Err(Fallback); // negative -> 40097
+        }
+        Ok(n)
     };
-    let (Some(start), Some(end)) = (bound(2, 0, ctx)?, bound(3, len, ctx)?) else {
-        return Ok(Bson::Int32(-1));
-    };
+    let (start, end) = (bound(2, 0, ctx)?, bound(3, len, ctx)?);
     let idx = if bytes {
         index_of_window(s.as_bytes(), needle.as_bytes(), start, end)
     } else {
