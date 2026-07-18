@@ -17,8 +17,29 @@ include(ExternalProject)
 include(GNUInstallDirs)
 
 set(WT_SOURCE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/wiredtiger)
+# The tree we actually patch and build: a private copy inside the build dir.
+# The patch scripts rewrite files in place, so patching WT_SOURCE_DIR left the
+# submodule permanently dirty in every developer's checkout and coupled patch
+# state (source tree) to the ExternalProject stamps (build dir) — see
+# cmake/copy_wt_source.cmake for why that coupling is worth removing.
+set(WT_WORK_DIR    ${CMAKE_CURRENT_BINARY_DIR}/wt-src)
 set(WT_BINARY_DIR  ${CMAKE_CURRENT_BINARY_DIR}/wt-build)
 set(WT_INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/wt-install)
+
+# The vendored commit, embedded in the download command so a submodule bump
+# invalidates the staged copy (and, through step ordering, the patch and
+# configure steps). Falls back to a marker when git is unavailable — an sdist
+# has no repo, and there the source cannot change under us anyway.
+execute_process(
+    COMMAND git -C ${WT_SOURCE_DIR} rev-parse HEAD
+    OUTPUT_VARIABLE WT_SRC_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE WT_SRC_SHA_RC
+    ERROR_QUIET
+)
+if(NOT WT_SRC_SHA_RC EQUAL 0 OR WT_SRC_SHA STREQUAL "")
+    set(WT_SRC_SHA "nogit")
+endif()
 
 # mongodb-7.0.33's CMake adds -Werror at the WT-target level (cmake/strict/
 # strict_flags_helpers.cmake). Modern Clang (>= 21) added several warnings
@@ -30,13 +51,13 @@ set(WT_INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/wt-install)
 # script). The real warnings still print; they just don't fail the build.
 
 set(WT_PATCH_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_strict.py)
-set(WT_STRICT_HELPERS ${WT_SOURCE_DIR}/cmake/strict/strict_flags_helpers.cmake)
+set(WT_STRICT_HELPERS ${WT_WORK_DIR}/cmake/strict/strict_flags_helpers.cmake)
 set(WT_PATCH_PYTHON_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_python.py)
-set(WT_PYTHON_CMAKE ${WT_SOURCE_DIR}/lang/python/CMakeLists.txt)
+set(WT_PYTHON_CMAKE ${WT_WORK_DIR}/lang/python/CMakeLists.txt)
 set(WT_PATCH_HELPERS_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_helpers.py)
-set(WT_HELPERS_CMAKE ${WT_SOURCE_DIR}/cmake/helpers.cmake)
+set(WT_HELPERS_CMAKE ${WT_WORK_DIR}/cmake/helpers.cmake)
 set(WT_PATCH_MUSL_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_musl.py)
-set(WT_OS_FS_C ${WT_SOURCE_DIR}/src/os_posix/os_fs.c)
+set(WT_OS_FS_C ${WT_WORK_DIR}/src/os_posix/os_fs.c)
 
 # The interpreter that runs the patch scripts, handed to the patch step via a
 # FILE rather than as a command argument. See the PATCH_COMMAND comment on the
@@ -59,7 +80,27 @@ set(WT_OS_FS_C ${WT_SOURCE_DIR}/src/os_posix/os_fs.c)
 # version is unchanged. (On Windows venv pythons are copies rather than
 # symlinks, so REALPATH is a no-op there and that platform keeps rebuilding —
 # see the note in the ExternalProject below.)
-get_filename_component(WT_PY_REAL "${Python3_EXECUTABLE}" REALPATH)
+# Ask the interpreter for its BASE interpreter. Under a PEP 517 build
+# Python3_EXECUTABLE points into the isolated build environment, whose path
+# changes on every build; ``sys._base_executable`` is the stable interpreter
+# that venv was created from. This supersedes a plain REALPATH, which only
+# worked on POSIX: a Windows venv python is a COPY, not a symlink, so REALPATH
+# resolved to the volatile temp path and that platform kept rebuilding.
+# REALPATH stays as the fallback for anything that cannot answer.
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c
+            "import sys; print(sys._base_executable or sys.executable)"
+    OUTPUT_VARIABLE WT_PY_BASE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE WT_PY_BASE_RC
+    ERROR_QUIET
+)
+if(WT_PY_BASE_RC EQUAL 0 AND EXISTS "${WT_PY_BASE}")
+    set(WT_PY_REAL "${WT_PY_BASE}")
+else()
+    get_filename_component(WT_PY_REAL "${Python3_EXECUTABLE}" REALPATH)
+endif()
+message(STATUS "WT patch/configure interpreter: ${WT_PY_REAL}")
 
 set(WT_PATCH_PY_FILE ${CMAKE_CURRENT_BINARY_DIR}/wt_patch_python.txt)
 file(WRITE ${WT_PATCH_PY_FILE} "${WT_PY_REAL}")
@@ -74,7 +115,16 @@ else()
 endif()
 
 ExternalProject_Add(wiredtiger_ext
-    SOURCE_DIR        ${WT_SOURCE_DIR}
+    SOURCE_DIR        ${WT_WORK_DIR}
+    # Stage the copy as the DOWNLOAD step so it is stamped and runs once. The
+    # vendored commit is in the command text on purpose: bumping the submodule
+    # changes the recorded command, which re-copies and — because later steps
+    # depend on this one — re-patches and re-configures.
+    DOWNLOAD_COMMAND ${CMAKE_COMMAND}
+        -DSRC=${WT_SOURCE_DIR}
+        -DDST=${WT_WORK_DIR}
+        -DWT_SHA=${WT_SRC_SHA}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_wt_source.cmake
     BINARY_DIR        ${WT_BINARY_DIR}
     INSTALL_DIR       ${WT_INSTALL_DIR}
     # ExternalProject inherits the parent generator unless CMAKE_GENERATOR is
@@ -95,7 +145,7 @@ ExternalProject_Add(wiredtiger_ext
     PATCH_COMMAND ${CMAKE_COMMAND}
         -DPY_FILE=${WT_PATCH_PY_FILE}
         -DSCRIPT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/cmake
-        -DWT_SOURCE_DIR=${WT_SOURCE_DIR}
+        -DWT_SOURCE_DIR=${WT_WORK_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_wt_patches.cmake
     CMAKE_ARGS
         -DCMAKE_BUILD_TYPE=Release
@@ -155,7 +205,7 @@ install(FILES
     DESTINATION wiredtiger
     OPTIONAL
 )
-install(DIRECTORY ${WT_SOURCE_DIR}/lang/python/wiredtiger/
+install(DIRECTORY ${WT_WORK_DIR}/lang/python/wiredtiger/
     DESTINATION wiredtiger
     FILES_MATCHING
         PATTERN "*.py"
