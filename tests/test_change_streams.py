@@ -37,7 +37,20 @@ def client(server: SecantusDBServer) -> Iterator[MongoClient]:
         mc.close()
 
 
-def _drain(cs, target: int, timeout: float = 8.0) -> list[dict[str, Any]]:
+def _drain(
+    cs,
+    target: int,
+    timeout: float = 8.0,
+    arrivals: list[float] | None = None,
+) -> list[dict[str, Any]]:
+    """Collect ``target`` events, or give up after ``timeout``.
+
+    ``arrivals``, if given, receives the monotonic timestamp at which each
+    event was observed. Callers timing a wake need that instant, not the time
+    this helper returns: the poll loop below only notices a new event within
+    its 0.05s tick and then joins the runner for up to 0.5s, which is noise on
+    the scale of a sub-second wake bound.
+    """
     events: list[dict[str, Any]] = []
     deadline = time.monotonic() + timeout
     err: list[BaseException] = []
@@ -46,6 +59,8 @@ def _drain(cs, target: int, timeout: float = 8.0) -> list[dict[str, Any]]:
         try:
             for ev in cs:
                 events.append(ev)
+                if arrivals is not None:
+                    arrivals.append(time.monotonic())
                 if len(events) >= target:
                     return
         except BaseException as exc:
@@ -290,34 +305,75 @@ def test_invalidate_on_rename(client: MongoClient) -> None:
 
 
 def test_await_data_blocks_then_wakes_on_insert(client: MongoClient) -> None:
+    """awaitData must block on an idle stream and wake when a write lands.
+
+    Timing here is split in two ON PURPOSE, because conflating the halves is
+    what made this test flake under CI load (seen on #512: 0 events instead of
+    1, passing on rerun of the same commit).
+
+    What this test pins is that a stream idling in awaitData still SURFACES a
+    later write. Everything before the wake (starting a thread, its sleep, the
+    insert round-trip) is setup, and on a loaded CI runner — four xdist workers
+    sharing four vCPUs, each insert paying a journal + checkpoint fsync in the
+    durable lane — that setup can take seconds. The previous version measured
+    one budget from thread start and asserted both halves against it, so
+    scheduling and fsync noise was charged against CORRECTNESS: the drain
+    deadline could expire before the inserting thread had even run, and the
+    failure read as "the event never arrived" rather than "the box was busy".
+
+    The latency bound below is a loose sanity check, not the promptness proof:
+    with max_await_time_ms=1000 pymongo re-polls, so an event surfaces within a
+    window or two even if nothing woke early. ``test_await_data_write_between_
+    drain_and_wait_wakes_promptly`` is the test that pins prompt-wake
+    semantics, and it does so deterministically via a monkeypatched drain
+    rather than by racing a clock.
+
+    So: the drain gets a deliberately generous ceiling (it returns in ~1s when
+    healthy, and only a genuine failure to wake spends it), while the latency
+    bound is measured from the instant the insert actually COMPLETED — which
+    the inserting thread records — to the instant the event arrived.
+    """
     db = client["csdb_block"]
     coll = db["c"]
     db.create_collection("c")
-    # Keep the per-getMore await window (1s) well under the _drain timeout (5s)
-    # below, so pymongo re-polls several times within the drain window. With
-    # them equal (both 5s) a single full-window getMore under heavy CI load
-    # collided with the drain deadline and the test saw 0 events even though the
-    # insert was already in the oplog — a re-poll (mongod's awaitData behaviour)
-    # surfaces it well inside the window.
+    # Per-getMore await window well under the drain ceiling, so pymongo
+    # re-polls several times rather than staking everything on one window.
     cs = coll.watch(max_await_time_ms=1000)
     time.sleep(0.3)
 
-    delay = 0.6
+    insert_done_at: list[float] = []
+    insert_err: list[BaseException] = []
 
     def insert_after_delay() -> None:
-        time.sleep(delay)
-        coll.insert_one({"_id": 1, "x": 1})
+        try:
+            time.sleep(0.6)
+            coll.insert_one({"_id": 1, "x": 1})
+            insert_done_at.append(time.monotonic())
+        except BaseException as exc:  # surfaced below, not swallowed
+            insert_err.append(exc)
 
     inserter = threading.Thread(target=insert_after_delay, daemon=True)
-    start = time.monotonic()
+    arrivals: list[float] = []
     inserter.start()
-    events = _drain(cs, target=1, timeout=5.0)
-    elapsed = time.monotonic() - start
+    events = _drain(cs, target=1, timeout=30.0, arrivals=arrivals)
     cs.close()
-    inserter.join(timeout=2.0)
-    assert len(events) == 1
-    # Should wake within ~2 * delay of the insert; rough bound.
-    assert elapsed < delay + 2.5
+    inserter.join(timeout=10.0)
+
+    if insert_err:
+        raise AssertionError(f"the inserting thread failed: {insert_err[0]!r}")
+    # Distinguish "the write never happened" from "the stream never woke" —
+    # the old assertion reported both as `0 == 1`.
+    assert insert_done_at, "the inserting thread never completed its write"
+    assert len(events) == 1, (
+        f"awaitData did not surface the insert within 30s "
+        f"(insert completed {time.monotonic() - insert_done_at[0]:.1f}s ago)"
+    )
+
+    wake_latency = arrivals[0] - insert_done_at[0]
+    # Worst case the write lands just after a poll opened, so one full
+    # max_await_time_ms (1s) plus a round trip; 5s leaves generous headroom for
+    # a loaded runner while still failing a stream that slept its whole window.
+    assert wake_latency < 5.0, f"woke {wake_latency:.1f}s after the insert"
 
 
 def test_await_data_write_between_drain_and_wait_wakes_promptly(

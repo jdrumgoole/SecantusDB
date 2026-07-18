@@ -3879,13 +3879,3 @@ recorded in that slice's changelog fragment. Still open:
   dir; that needs a build-dir cache, whose design and the source-patching
   hazard it must avoid are in `tasks/wt-build-cache-plan.md`. Windows is still
   unstabilised there (venv pythons are copies, so `REALPATH` is a no-op).
-- [ ] **`test_await_data_blocks_then_wakes_on_insert` still flakes under CI load.**
-  Seen on PR #512's run (`test-durable (3.10, ubuntu-latest, 4)`): `assert
-  len(events) == 1` got 0, i.e. the drain window closed before the awaited
-  insert surfaced. Passed on rerun of the same commit, so it is timing, not a
-  regression — but the test already carries a comment describing a previous fix
-  for exactly this failure mode (the per-getMore await window was dropped to 1s
-  under a 5s drain so pymongo re-polls), which means that fix narrowed the
-  window without closing it. Flaky is failing: either widen the drain bound or
-  make the wake deterministic (e.g. have the test observe the oplog write
-  directly rather than racing a wall-clock deadline).
