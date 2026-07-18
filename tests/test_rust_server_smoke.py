@@ -1116,3 +1116,29 @@ def test_inc_mul_reject_non_numeric_operand(tmp_path) -> None:
         assert coll.find_one({"_id": 1})["n"] == 8
     finally:
         srv.stop()
+
+
+def test_update_bool_argument_cluster_rejected(tmp_path) -> None:
+    """A bool argument to $pop / $push $position / $push $slice / $bit is
+    rejected on the Rust server rather than silently treated as 1 (each
+    previously either computed or the Rust server errored inconsistently). The
+    Rust server surfaces BadValue (the update error-code gap); the correctness
+    contract — reject, don't compute — holds. Valid arguments still apply."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "a": [1, 2, 3]})
+        for upd in (
+            {"$pop": {"a": True}},
+            {"$pop": {"a": 2}},
+            {"$push": {"a": {"$each": [9], "$position": True}}},
+            {"$push": {"a": {"$each": [], "$slice": True}}},
+            {"$bit": {"a": {"and": True}}},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                coll.update_one({"_id": 1}, upd)
+        assert coll.find_one({"_id": 1})["a"] == [1, 2, 3]  # untouched
+        coll.update_one({"_id": 1}, {"$pop": {"a": 1}})
+        assert coll.find_one({"_id": 1})["a"] == [1, 2]
+    finally:
+        srv.stop()

@@ -361,3 +361,31 @@ def test_inc_mul_reject_non_numeric_operand() -> None:
     # Valid numeric operands still apply.
     assert apply_update({"n": 5}, {"$inc": {"n": 3}}) == {"n": 8}
     assert apply_update({"n": 5}, {"$mul": {"n": 2.5}}) == {"n": 12.5}
+
+
+def test_pop_position_slice_bit_reject_bool() -> None:
+    """The update-operator bool-as-int cluster (probed vs mongod 7.0.12): a bool
+    argument to $pop / $push $position / $push $slice / $bit is a parse error,
+    not silently treated as 1. $pop's codes: bool / non-±1 both code 9;
+    $position / $slice / $bit code 2."""
+    # $pop: bool and non-±1 both error (code 9).
+    with pytest.raises(UpdateError) as e:
+        apply_update({"a": [1, 2, 3]}, {"$pop": {"a": True}})
+    assert e.value.code == 9
+    with pytest.raises(UpdateError) as e:
+        apply_update({"a": [1, 2, 3]}, {"$pop": {"a": 2}})
+    assert e.value.code == 9
+    # $position / $slice / $bit bool -> code 2.
+    for upd in (
+        {"$push": {"a": {"$each": [9], "$position": True}}},
+        {"$push": {"a": {"$each": [], "$slice": True}}},
+        {"$bit": {"a": {"and": True}}},
+    ):
+        with pytest.raises(UpdateError) as e:
+            apply_update({"a": [1, 2, 3]}, upd)
+        assert e.value.code == 2, upd
+    # Valid arguments still apply.
+    assert apply_update({"a": [1, 2, 3]}, {"$pop": {"a": 1}}) == {"a": [1, 2]}
+    assert apply_update({"a": [1, 2]}, {"$push": {"a": {"$each": [9], "$position": 1}}}) == {
+        "a": [1, 9, 2]
+    }
