@@ -20,7 +20,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 - ~~**`$rename` data corruption**~~ **FIXED (#485):** rejects array-element source/
   dest, same-field, same-path, empty target (56), and non-string target — no more
   silent corruption / AttributeError leak. Both engines.
-- ~~**`$toInt`/`$convert` int32/int64 overflow**~~ **FIXED (#488):** `$toInt` /
+- ~~**`$toInt`/`$convert` int32/int64 overflow**~~ **FIXED (#489):** `$toInt` /
   `$convert` (int/long) error on out-of-range / non-finite (241, `onError`-caught)
   instead of returning an unbounded / silently-widened int; `$toInt` narrows int64
   input to int32 like mongod. Both engines. (`$toLong` is still unimplemented — a
