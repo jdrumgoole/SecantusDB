@@ -441,6 +441,12 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
         return None
     if isinstance(place, bool):
         raise ExpressionError("can't convert from BSON type bool to long", code=16004)
+    if isinstance(place, float):
+        if not place.is_integer():
+            raise ExpressionError(
+                "precision argument to  $round must be a integral value", code=51082
+            )
+        place = int(place)
     if not isinstance(place, int):
         place = 0
     return round(n, place)
@@ -625,6 +631,12 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
         return None
     if isinstance(place, bool):
         raise ExpressionError("can't convert from BSON type bool to long", code=16004)
+    if isinstance(place, float):
+        if not place.is_integer():
+            raise ExpressionError(
+                "precision argument to  $trunc must be a integral value", code=51082
+            )
+        place = int(place)
     if not isinstance(place, int):
         place = 0
     factor = 10**place
@@ -1391,6 +1403,22 @@ def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
             "$substrCP: length must be a numeric type (is BSON type bool)",
             code=34452,
         )
+    try:
+        start = _int_index(start)
+    except _FractionalIndex:
+        raise ExpressionError(
+            "$substrCP: starting index cannot be represented as a 32-bit "
+            f"integral value: {_fmt_double(start)}",
+            code=34451,
+        ) from None
+    try:
+        length = _int_index(length)
+    except _FractionalIndex:
+        raise ExpressionError(
+            "$substrCP: length cannot be represented as a 32-bit integral "
+            f"value: {_fmt_double(length)}",
+            code=34453,
+        ) from None
     if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
         raise ExpressionError("$substrCP requires string + ints")
     if length < 0:
@@ -1564,6 +1592,32 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
             "$range requires a numeric step value, found value of type:bool",
             code=34447,
         )
+    # A whole-number double is accepted (coerced to int); a fractional one is
+    # rejected with mongod's per-arg "32-bit integer" code.
+    try:
+        start = _int_index(start)
+    except _FractionalIndex:
+        raise ExpressionError(
+            "$range requires a starting value that can be represented as a "
+            f"32-bit integer, found value: {_fmt_double(start)}",
+            code=34444,
+        ) from None
+    try:
+        end = _int_index(end)
+    except _FractionalIndex:
+        raise ExpressionError(
+            "$range requires an ending value that can be represented as a "
+            f"32-bit integer, found value: {_fmt_double(end)}",
+            code=34446,
+        ) from None
+    try:
+        step = _int_index(step)
+    except _FractionalIndex:
+        raise ExpressionError(
+            "$range requires a step value that can be represented as a 32-bit "
+            f"integer, found value: {_fmt_double(step)}",
+            code=34448,
+        ) from None
     if not all(isinstance(v, int) for v in (start, end, step)):
         raise ExpressionError("$range requires integer arguments")
     if step == 0:

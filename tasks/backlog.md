@@ -1153,12 +1153,16 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   (2026-07-18):** `$arrayElemAt` / `$slice` / `$indexOfArray` accept a whole-number
   double (coerce to int, compute on *both* servers) and reject a fractional one
   with the per-op code (28691 / 28726 / 28728 / 40096) — via `_int_index` /
-  `_FractionalIndex` (Python) + the `IdxCoerce` enum (Rust). **Still open:**
-  `$substrCP` (34451) start/length, `$range` (34443/34445/34447→actually 34444/
-  34446/34448 for the "not representable" variant — re-probe), and `$round` place
-  (51082) whole-double acceptance; plus a *huge* whole double (> 2^31) is accepted
-  here but mongod rejects it (32-bit-representable check) — a narrow edge, both
-  SecantusDB engines stay mutually consistent (both null). (2) `$substrBytes` /
+  `_FractionalIndex` (Python) + the `IdxCoerce` enum (Rust). **String/range/round
+  operators done (2026-07-18):** `$substrCP` (start 34451 / length 34453), `$range`
+  (start 34444 / end 34446 / step 34448), and `$round`/`$trunc` precision (51082)
+  accept a whole-number double and reject a fractional one — same helpers, three-way
+  mongod 7.0.12-verified. (`$substrBytes`/`$substr` already accept any double and
+  truncate — mongod-correct, left as-is.) So the whole-double-index sweep is
+  **complete** across the aggregation surface. Remaining edge: a *huge* whole double
+  (> 2^31) is accepted here but mongod rejects it (32-bit-representable check) — a
+  narrow case; both SecantusDB engines stay mutually consistent (both null/whole).
+  (2) `$substrBytes` /
   `$substr` cutting **mid-UTF8-character** (e.g.
   `$substrBytes: ["héllo", 0, 2]`) — mongod errors 28657, but both SecantusDB
   servers decode with `errors="replace"` and return a replacement char; verify +

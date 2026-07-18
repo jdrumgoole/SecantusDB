@@ -830,6 +830,18 @@ CURATED = [
     ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, {}),
     ({"$indexOfArray": [[1, 2, 3], 2, 0.0]}, {}),
     ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, {}),
+    # whole-double acceptance extends to substrCP / range / round / trunc.
+    ({"$substrCP": ["hello", 1.0, 2]}, {}),
+    ({"$substrCP": ["hello", 1.7, 2]}, {}),
+    ({"$substrCP": ["hello", 1, 1.7]}, {}),
+    ({"$range": [0.0, 5.0, 1.0]}, {}),
+    ({"$range": [0.7, 5]}, {}),
+    ({"$range": [0, 5.7]}, {}),
+    ({"$range": [0, 5, 1.7]}, {}),
+    ({"$round": [3.14159, 2.0]}, {}),
+    ({"$round": [3.14159, 2.7]}, {}),
+    ({"$trunc": [3.14159, 2.0]}, {}),
+    ({"$trunc": [3.14159, 2.7]}, {}),
 ]
 
 
