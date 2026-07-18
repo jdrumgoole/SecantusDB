@@ -69,6 +69,10 @@ jobs:
         # Push / PR: 3.10 only (fast feedback). Schedule / workflow_dispatch:
         # full version sweep.
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
+        # Sharded two ways for the same reason ``test-windows`` is (see that
+        # job): unsharded, this lane's ~15 min pytest step was the whole
+        # workflow's critical path. Same complete-by-construction split.
+        shard: [sql, core]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
@@ -82,7 +86,7 @@ jobs:
           git submodule update --init --depth 1 vendor/wiredtiger ||
           git submodule update --init vendor/wiredtiger
 
-      - name: Free up disk space
+      - name: Start disk reclaim (background)
         # The durable-storage lane (ubuntu only) keeps thousands of on-disk
         # WiredTiger homes for the whole session — tmp_path_retention_policy is
         # pinned to "all" because deleting a passed test's WT home mid-session
@@ -92,28 +96,41 @@ jobs:
         # with "No space left on device". Reclaim ~15-20 GB of preinstalled
         # toolchains this build never uses (kept: the hostedtoolcache that
         # setup-python reads). See tasks/backlog.md.
+        #
+        # Run it in the BACKGROUND: the ``rm -rf`` walks hundreds of thousands
+        # of files and cost ~87s of blocking critical path, but nothing needs
+        # the space until the pytest step. Detaching it overlaps the reclaim
+        # with the apt / uv / sync steps that follow. Each ``run:`` is its own
+        # shell, so ``wait`` can't reach it from a later step — the paired
+        # "Wait for disk reclaim" step below polls a sentinel file instead.
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
-          df -h /
+          sudo rm -f /tmp/disk-reclaim.done
+          nohup sudo bash -c '
+            rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+              /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            df -h /
+            touch /tmp/disk-reclaim.done
+          ' > /tmp/disk-reclaim.log 2>&1 &
+          echo "reclaim detached as pid $!"
 
-      - name: Install swig
-        run: sudo apt-get update && sudo apt-get install -y swig
-
-      - name: Install MongoDB CLI tools
-        # mongosh + Database Tools so the CLI-tool conformance tests
-        # (tests/test_mongosh.py, test_mongodump_restore.py,
-        # test_mongoimport_export.py, test_mongofiles.py,
-        # test_mongostat_mongotop.py) run instead of skipping — they
-        # skipif the binaries are absent. Windows is intentionally
-        # omitted: the mongosh tests skip on win32 by design
-        # (PowerShell --eval quoting), leaving only marginal coverage
-        # for a slow, flake-prone choco install.
+      - name: Install toolchain and MongoDB CLI tools
+        # swig (for the vendored WT build) plus mongosh + Database Tools so the
+        # CLI-tool conformance tests (tests/test_mongosh.py,
+        # test_mongodump_restore.py, test_mongoimport_export.py,
+        # test_mongofiles.py, test_mongostat_mongotop.py) run instead of
+        # skipping — they skipif the binaries are absent. Windows is
+        # intentionally omitted: the mongosh tests skip on win32 by design
+        # (PowerShell --eval quoting), leaving only marginal coverage for a
+        # slow, flake-prone choco install.
+        #
+        # Registering the MongoDB repo BEFORE the single ``apt-get update``
+        # merges what used to be two separate update+install steps — the second
+        # ``apt-get update`` was re-fetching every index for no new information.
         run: |
           curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
           echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
           sudo apt-get update
-          sudo apt-get install -y mongodb-mongosh mongodb-database-tools
+          sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
 
       - name: Install uv
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
@@ -137,13 +154,34 @@ jobs:
         # aren't exercised by pytest and would just slow CI down.
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
+      # Lint / format are platform- AND shard-independent: pin them to the
+      # ``core`` shard so sharding doesn't run them twice per push.
       - name: Lint
+        if: matrix.shard == 'core'
         run: uv run ruff check src tests
 
       - name: Format check
+        if: matrix.shard == 'core'
         run: uv run ruff format --check src tests
 
-      - name: Tests
+      - name: Wait for disk reclaim
+        # Barrier for the backgrounded reclaim above — the pytest step is the
+        # first thing that actually needs the space, so this is where we pay
+        # whatever is left of it (usually nothing; the apt/uv/sync steps have
+        # already covered the ~87s). Fail loudly rather than starting a suite
+        # that would die with "No space left on device" halfway through.
+        run: |
+          for _ in $(seq 1 180); do
+            [ -f /tmp/disk-reclaim.done ] && break
+            sleep 1
+          done
+          cat /tmp/disk-reclaim.log || true
+          if [ ! -f /tmp/disk-reclaim.done ]; then
+            echo "::error::disk reclaim did not finish within 180s"
+            exit 1
+          fi
+
+      - name: Tests (${{ matrix.shard }} shard)
         # ``--timeout=120 --timeout-method=thread`` catches deadline-
         # exceeded hangs (test body busy-loops or blocks on a stuck
         # producer) — independently of worker restarts.
@@ -160,7 +198,20 @@ jobs:
         # set to avoid a silent "hang at 97%" where the parent waited forever
         # on a dead worker — but that hang mode is now caught by the
         # ``--timeout`` above regardless, so the restart budget is safe.
-        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
+        #
+        # The ``sql`` shard is the SQL engine + PG-wire suites; ``core`` is
+        # everything else — the same split ``test-windows`` uses, so a new test
+        # file always lands in exactly one shard.
+        shell: bash
+        run: |
+          if [ "${{ matrix.shard }}" = "sql" ]; then
+            uv run python -m pytest tests/test_sql_*.py tests/test_pgserver*.py \
+              --timeout=120 --timeout-method=thread --max-worker-restart=3
+          else
+            uv run python -m pytest \
+              --ignore-glob='tests/test_sql_*.py' --ignore-glob='tests/test_pgserver*.py' \
+              --timeout=120 --timeout-method=thread --max-worker-restart=3
+          fi
 
 
   # The Windows lane, split from the ``test`` job and sharded two ways so the
@@ -282,6 +333,11 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.10","3.11","3.12","3.13"]' || '["3.10"]') }}
+        # Sharded for the same reason the ``test`` job is — the durable pass
+        # re-runs the whole suite, so unsharded it was the second-longest job
+        # (~12 min of pytest) and would have become the critical path the
+        # moment ``test`` was split.
+        shard: [sql, core]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
@@ -292,28 +348,32 @@ jobs:
           git submodule update --init --depth 1 vendor/wiredtiger ||
           git submodule update --init vendor/wiredtiger
 
-      - name: Free up disk space
+      - name: Start disk reclaim (background)
         # The durable lane keeps thousands of on-disk WiredTiger homes for the
         # whole session (tmp_path_retention_policy is pinned to "all" — see the
         # ``test`` job's twin step and tests/conftest.py) and tipped over the
-        # runner's ~21 GB free without this.
+        # runner's ~21 GB free without this. Backgrounded and barriered before
+        # pytest exactly as in the ``test`` job — same rationale, same sentinel.
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
-          df -h /
+          sudo rm -f /tmp/disk-reclaim.done
+          nohup sudo bash -c '
+            rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+              /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            df -h /
+            touch /tmp/disk-reclaim.done
+          ' > /tmp/disk-reclaim.log 2>&1 &
+          echo "reclaim detached as pid $!"
 
-      - name: Install swig
-        run: sudo apt-get update && sudo apt-get install -y swig
-
-      - name: Install MongoDB CLI tools
+      - name: Install toolchain and MongoDB CLI tools
         # Same rationale as the ``test`` job: without mongosh + Database Tools
         # the CLI-tool conformance tests skip, and the durable pass must cover
-        # exactly what the fast pass covers.
+        # exactly what the fast pass covers. Single ``apt-get update`` for the
+        # same reason too.
         run: |
           curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
           echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
           sudo apt-get update
-          sudo apt-get install -y mongodb-mongosh mongodb-database-tools
+          sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
 
       - name: Install uv
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
@@ -335,9 +395,27 @@ jobs:
         # benchmark in test_concurrency) stay covered instead of running nowhere.
         # A command-line ``-m slow`` overrides the addopts marker filter while
         # ``-n auto``/``--dist=loadgroup`` from addopts are retained.
+        #
+        # Pinned to the ``core`` shard: this selects by MARKER across the whole
+        # tree, not by path, so it is not shardable by the sql/core file split —
+        # running it in both shards would just duplicate it.
+        if: matrix.shard == 'core'
         run: uv run python -m pytest -m slow --timeout=120 --timeout-method=thread --max-worker-restart=3
 
-      - name: Durable-storage tests
+      - name: Wait for disk reclaim
+        # Barrier for the backgrounded reclaim — see the ``test`` job's twin.
+        run: |
+          for _ in $(seq 1 180); do
+            [ -f /tmp/disk-reclaim.done ] && break
+            sleep 1
+          done
+          cat /tmp/disk-reclaim.log || true
+          if [ ! -f /tmp/disk-reclaim.done ]; then
+            echo "::error::disk reclaim did not finish within 180s"
+            exit 1
+          fi
+
+      - name: Durable-storage tests (${{ matrix.shard }} shard)
         # The default suite above runs FAST (the test conftest sets
         # ``SECANTUS_TEST_FAST_STORAGE=1``: journal on, close-checkpoint skipped),
         # so it does NOT exercise the checkpoint-durability path. Re-run the whole
@@ -346,9 +424,21 @@ jobs:
         # durability behaviour (schema, persistence, close-and-reopen, PITR /
         # backup) is exercised on every push. Once, on Linux. This is the
         # "real durable disk testing" path.
+        #
+        # Sharded on the same sql/core file split as everywhere else, so the
+        # union of the two shards is still the whole suite.
         env:
           SECANTUS_FORCE_DURABLE: "1"
-        run: uv run python -m pytest --timeout=120 --timeout-method=thread --max-worker-restart=3
+        shell: bash
+        run: |
+          if [ "${{ matrix.shard }}" = "sql" ]; then
+            uv run python -m pytest tests/test_sql_*.py tests/test_pgserver*.py \
+              --timeout=120 --timeout-method=thread --max-worker-restart=3
+          else
+            uv run python -m pytest \
+              --ignore-glob='tests/test_sql_*.py' --ignore-glob='tests/test_pgserver*.py' \
+              --timeout=120 --timeout-method=thread --max-worker-restart=3
+          fi
 
   # The matrix above runs the pure-Python server. This job builds the Rust core
   # (``_secantus_core``) and pins each Rust engine byte-for-byte against its
