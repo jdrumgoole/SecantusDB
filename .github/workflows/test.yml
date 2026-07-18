@@ -226,12 +226,63 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
+      # --- WiredTiger build cache -------------------------------------
+      # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
+      # now (and was not before) because #516 moved patching out of the source
+      # tree: patch state lives in build/ beside the ExternalProject stamps
+      # that describe it, so a restored dir can no longer pair "already
+      # patched" stamps with an unpatched checkout — which would have compiled
+      # unpatched source (musl off64_t, strict -Werror, the Windows .pyd
+      # suffix) into a subtly wrong artifact rather than a red build.
+      #
+      # Measured prerequisite: ExternalProject re-runs a step when its RECORDED
+      # command text changes, so a restore only helps if that text is identical
+      # across jobs. Probed on both platforms with two independent jobs each —
+      # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
+      # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Compute WiredTiger build-cache key
+        id: wtkey
+        shell: bash
+        run: |
+          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # Everything that shapes the build. Any change here must produce a
+          # cold rebuild rather than reuse objects built under other settings.
+          if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
+          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | $H | cut -c1-16)
+          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the WiredTiger build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build
+          # NO restore-keys, deliberately. A partial hit is fine for the cargo
+          # cache (it seeds dependency crates) but here a near-miss is exactly
+          # the stale state to forbid: exact key or cold build. ImageVersion is
+          # in the key so a runner-image toolchain bump cannot reuse objects
+          # built by a different compiler.
+          key: wtbuild-${{ runner.os }}-${{ env.ImageVersion }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+
       - name: Sync dependencies
         # ``--extra admin`` brings in httpx / fastapi / uvicorn used by
         # tests/test_admin_*.py; without it those tests error at import
         # time. ``website`` is intentionally excluded — pelican / boto3
         # aren't exercised by pytest and would just slow CI down.
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+
+      - name: Verify the WiredTiger build is real
+        # Fail closed on a bad cache hit. tests/conftest.py installs a STUB
+        # wiredtiger module when the extension is missing, so a bare
+        # `import wiredtiger` would pass against a broken build — assert the
+        # real extension's symbols and version instead.
+        shell: bash
+        run: |
+          uv run python -c "
+          import wiredtiger
+          v = wiredtiger.wiredtiger_version()
+          assert hasattr(wiredtiger, 'wiredtiger_open'), 'stub module, not the real extension'
+          assert 'WiredTiger' in v[0], v
+          print('WiredTiger OK:', v[0])
+          "
 
       # Lint / format are platform- AND shard-independent: pin them to the
       # ``core`` shard on Linux so neither sharding nor the cron's extra OS /
@@ -390,8 +441,59 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
+      # --- WiredTiger build cache -------------------------------------
+      # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
+      # now (and was not before) because #516 moved patching out of the source
+      # tree: patch state lives in build/ beside the ExternalProject stamps
+      # that describe it, so a restored dir can no longer pair "already
+      # patched" stamps with an unpatched checkout — which would have compiled
+      # unpatched source (musl off64_t, strict -Werror, the Windows .pyd
+      # suffix) into a subtly wrong artifact rather than a red build.
+      #
+      # Measured prerequisite: ExternalProject re-runs a step when its RECORDED
+      # command text changes, so a restore only helps if that text is identical
+      # across jobs. Probed on both platforms with two independent jobs each —
+      # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
+      # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Compute WiredTiger build-cache key
+        id: wtkey
+        shell: bash
+        run: |
+          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # Everything that shapes the build. Any change here must produce a
+          # cold rebuild rather than reuse objects built under other settings.
+          if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
+          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | $H | cut -c1-16)
+          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the WiredTiger build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build
+          # NO restore-keys, deliberately. A partial hit is fine for the cargo
+          # cache (it seeds dependency crates) but here a near-miss is exactly
+          # the stale state to forbid: exact key or cold build. ImageVersion is
+          # in the key so a runner-image toolchain bump cannot reuse objects
+          # built by a different compiler.
+          key: wtbuild-${{ runner.os }}-${{ env.ImageVersion }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+
       - name: Sync dependencies
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+
+      - name: Verify the WiredTiger build is real
+        # Fail closed on a bad cache hit. tests/conftest.py installs a STUB
+        # wiredtiger module when the extension is missing, so a bare
+        # `import wiredtiger` would pass against a broken build — assert the
+        # real extension's symbols and version instead.
+        shell: bash
+        run: |
+          uv run python -c "
+          import wiredtiger
+          v = wiredtiger.wiredtiger_version()
+          assert hasattr(wiredtiger, 'wiredtiger_open'), 'stub module, not the real extension'
+          assert 'WiredTiger' in v[0], v
+          print('WiredTiger OK:', v[0])
+          "
 
       - name: Install tzdata
         # Windows ships no IANA timezone database; Python's
@@ -531,8 +633,59 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
+      # --- WiredTiger build cache -------------------------------------
+      # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
+      # now (and was not before) because #516 moved patching out of the source
+      # tree: patch state lives in build/ beside the ExternalProject stamps
+      # that describe it, so a restored dir can no longer pair "already
+      # patched" stamps with an unpatched checkout — which would have compiled
+      # unpatched source (musl off64_t, strict -Werror, the Windows .pyd
+      # suffix) into a subtly wrong artifact rather than a red build.
+      #
+      # Measured prerequisite: ExternalProject re-runs a step when its RECORDED
+      # command text changes, so a restore only helps if that text is identical
+      # across jobs. Probed on both platforms with two independent jobs each —
+      # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
+      # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Compute WiredTiger build-cache key
+        id: wtkey
+        shell: bash
+        run: |
+          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # Everything that shapes the build. Any change here must produce a
+          # cold rebuild rather than reuse objects built under other settings.
+          if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
+          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | $H | cut -c1-16)
+          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the WiredTiger build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build
+          # NO restore-keys, deliberately. A partial hit is fine for the cargo
+          # cache (it seeds dependency crates) but here a near-miss is exactly
+          # the stale state to forbid: exact key or cold build. ImageVersion is
+          # in the key so a runner-image toolchain bump cannot reuse objects
+          # built by a different compiler.
+          key: wtbuild-${{ runner.os }}-${{ env.ImageVersion }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+
       - name: Sync dependencies
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
+
+      - name: Verify the WiredTiger build is real
+        # Fail closed on a bad cache hit. tests/conftest.py installs a STUB
+        # wiredtiger module when the extension is missing, so a bare
+        # `import wiredtiger` would pass against a broken build — assert the
+        # real extension's symbols and version instead.
+        shell: bash
+        run: |
+          uv run python -c "
+          import wiredtiger
+          v = wiredtiger.wiredtiger_version()
+          assert hasattr(wiredtiger, 'wiredtiger_open'), 'stub module, not the real extension'
+          assert 'WiredTiger' in v[0], v
+          print('WiredTiger OK:', v[0])
+          "
 
       - name: Slow tests
         # Long-running stress / scaling tests carry ``@pytest.mark.slow`` and are
@@ -634,8 +787,59 @@ jobs:
       - name: Set up Python 3.12
         run: uv python install 3.12
 
+      # --- WiredTiger build cache -------------------------------------
+      # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
+      # now (and was not before) because #516 moved patching out of the source
+      # tree: patch state lives in build/ beside the ExternalProject stamps
+      # that describe it, so a restored dir can no longer pair "already
+      # patched" stamps with an unpatched checkout — which would have compiled
+      # unpatched source (musl off64_t, strict -Werror, the Windows .pyd
+      # suffix) into a subtly wrong artifact rather than a red build.
+      #
+      # Measured prerequisite: ExternalProject re-runs a step when its RECORDED
+      # command text changes, so a restore only helps if that text is identical
+      # across jobs. Probed on both platforms with two independent jobs each —
+      # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
+      # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Compute WiredTiger build-cache key
+        id: wtkey
+        shell: bash
+        run: |
+          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # Everything that shapes the build. Any change here must produce a
+          # cold rebuild rather than reuse objects built under other settings.
+          if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
+          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | $H | cut -c1-16)
+          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the WiredTiger build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build
+          # NO restore-keys, deliberately. A partial hit is fine for the cargo
+          # cache (it seeds dependency crates) but here a near-miss is exactly
+          # the stale state to forbid: exact key or cold build. ImageVersion is
+          # in the key so a runner-image toolchain bump cannot reuse objects
+          # built by a different compiler.
+          key: wtbuild-${{ runner.os }}-${{ env.ImageVersion }}-py3.12-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+
       - name: Sync dependencies
         run: uv sync --extra dev --extra admin  # also builds vendored WT
+
+      - name: Verify the WiredTiger build is real
+        # Fail closed on a bad cache hit. tests/conftest.py installs a STUB
+        # wiredtiger module when the extension is missing, so a bare
+        # `import wiredtiger` would pass against a broken build — assert the
+        # real extension's symbols and version instead.
+        shell: bash
+        run: |
+          uv run python -c "
+          import wiredtiger
+          v = wiredtiger.wiredtiger_version()
+          assert hasattr(wiredtiger, 'wiredtiger_open'), 'stub module, not the real extension'
+          assert 'WiredTiger' in v[0], v
+          print('WiredTiger OK:', v[0])
+          "
 
       - name: Cargo fmt / clippy / unit tests
         # Run across the whole Rust workspace (the pure-engine `secantus-core`
@@ -703,10 +907,61 @@ jobs:
       - name: Set up Python 3.12
         run: uv python install 3.12
 
+      # --- WiredTiger build cache -------------------------------------
+      # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
+      # now (and was not before) because #516 moved patching out of the source
+      # tree: patch state lives in build/ beside the ExternalProject stamps
+      # that describe it, so a restored dir can no longer pair "already
+      # patched" stamps with an unpatched checkout — which would have compiled
+      # unpatched source (musl off64_t, strict -Werror, the Windows .pyd
+      # suffix) into a subtly wrong artifact rather than a red build.
+      #
+      # Measured prerequisite: ExternalProject re-runs a step when its RECORDED
+      # command text changes, so a restore only helps if that text is identical
+      # across jobs. Probed on both platforms with two independent jobs each —
+      # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
+      # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Compute WiredTiger build-cache key
+        id: wtkey
+        shell: bash
+        run: |
+          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # Everything that shapes the build. Any change here must produce a
+          # cold rebuild rather than reuse objects built under other settings.
+          if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
+          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | $H | cut -c1-16)
+          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the WiredTiger build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build
+          # NO restore-keys, deliberately. A partial hit is fine for the cargo
+          # cache (it seeds dependency crates) but here a near-miss is exactly
+          # the stale state to forbid: exact key or cold build. ImageVersion is
+          # in the key so a runner-image toolchain bump cannot reuse objects
+          # built by a different compiler.
+          key: wtbuild-${{ runner.os }}-${{ env.ImageVersion }}-py3.12-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+
       - name: Sync dependencies
         # Builds the vendored WiredTiger into build/<wheel_tag>/wt-build
         # (scikit-build-core's build-dir), the same output the wheel ships.
         run: uv sync --extra dev
+
+      - name: Verify the WiredTiger build is real
+        # Fail closed on a bad cache hit. tests/conftest.py installs a STUB
+        # wiredtiger module when the extension is missing, so a bare
+        # `import wiredtiger` would pass against a broken build — assert the
+        # real extension's symbols and version instead.
+        shell: bash
+        run: |
+          uv run python -c "
+          import wiredtiger
+          v = wiredtiger.wiredtiger_version()
+          assert hasattr(wiredtiger, 'wiredtiger_open'), 'stub module, not the real extension'
+          assert 'WiredTiger' in v[0], v
+          print('WiredTiger OK:', v[0])
+          "
 
       - name: Point secantus-wt at the vendored WiredTiger
         # Resolve the build-dir WT output explicitly rather than relying on
@@ -880,6 +1135,42 @@ jobs:
             cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}-
             cargo-${{ matrix.os }}-
 
+      # --- WiredTiger build cache -------------------------------------
+      # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
+      # now (and was not before) because #516 moved patching out of the source
+      # tree: patch state lives in build/ beside the ExternalProject stamps
+      # that describe it, so a restored dir can no longer pair "already
+      # patched" stamps with an unpatched checkout — which would have compiled
+      # unpatched source (musl off64_t, strict -Werror, the Windows .pyd
+      # suffix) into a subtly wrong artifact rather than a red build.
+      #
+      # Measured prerequisite: ExternalProject re-runs a step when its RECORDED
+      # command text changes, so a restore only helps if that text is identical
+      # across jobs. Probed on both platforms with two independent jobs each —
+      # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
+      # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Compute WiredTiger build-cache key
+        id: wtkey
+        shell: bash
+        run: |
+          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # Everything that shapes the build. Any change here must produce a
+          # cold rebuild rather than reuse objects built under other settings.
+          if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
+          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | $H | cut -c1-16)
+          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the WiredTiger build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build
+          # NO restore-keys, deliberately. A partial hit is fine for the cargo
+          # cache (it seeds dependency crates) but here a near-miss is exactly
+          # the stale state to forbid: exact key or cold build. ImageVersion is
+          # in the key so a runner-image toolchain bump cannot reuse objects
+          # built by a different compiler.
+          key: wtbuild-${{ runner.os }}-${{ env.ImageVersion }}-py3.12-engineon-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+
       - name: Build the secantus wheel with the storage engine ON
         # scikit-build-core forwards SKBUILD_CMAKE_DEFINE entries as -D defines,
         # so this flips the CMake option ON for this build only. The cargo build
@@ -887,6 +1178,20 @@ jobs:
         env:
           SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
         run: uv build --wheel --out-dir dist-storage
+
+      - name: Verify the staged WiredTiger build is real
+        # Same fail-closed check as the other lanes, against the build tree the
+        # wheel was produced from (the wheel's own contents are asserted by the
+        # steps below).
+        shell: bash
+        run: |
+          wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+          if [ -z "$wt" ] || [ ! -f "$wt/libwiredtiger.a" ]; then
+            echo "::error::no WiredTiger build under build/*/wt-build" >&2
+            ls -R build 2>/dev/null | head -30 >&2 || true
+            exit 1
+          fi
+          echo "WiredTiger static lib present: $wt/libwiredtiger.a"
 
       - name: Assert the extensions are bundled in the wheel
         # importorskip in the smoke tests would silently pass if an extension
