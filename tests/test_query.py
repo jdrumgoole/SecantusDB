@@ -219,6 +219,30 @@ def test_in_with_regex() -> None:
     assert not matches({"s": "hello"}, {"s": {"$nin": [Regex("^h")]}})
 
 
+def test_not_argument_validation() -> None:
+    # mongod: $not needs a regex or a non-empty document; scalar/array/bool ->
+    # "needs a regex or a document", empty doc -> "cannot be empty" (both code 2).
+    for bad in (5, "x", [], True):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": 5}, {"a": {"$not": bad}})
+        assert exc.value.code == 2 and "needs a regex or a document" in str(exc.value)
+    with pytest.raises(QueryError) as exc:
+        matches({"a": 5}, {"a": {"$not": {}}})
+    assert exc.value.code == 2 and "cannot be empty" in str(exc.value)
+    # A regex and an operator document are valid.
+    assert matches({"a": 5}, {"a": {"$not": Regex("x")}})
+    assert not matches({"a": 5}, {"a": {"$not": {"$gt": 3}}})
+
+
+def test_elemmatch_argument_validation() -> None:
+    # mongod: $elemMatch needs an Object; a scalar/array is BadValue.
+    for bad in (5, "x", [1, 2]):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": [1, 2, 3]}, {"a": {"$elemMatch": bad}})
+        assert exc.value.code == 2 and "needs an Object" in str(exc.value)
+    assert matches({"a": [1, 2, 3]}, {"a": {"$elemMatch": {"$gt": 2}}})
+
+
 def test_regex_options_validation() -> None:
     # mongod: bad flag -> 51108; non-string $options -> 2; $options without
     # $regex -> 2; non-string $regex -> 2. Valid flags imsxu still work.

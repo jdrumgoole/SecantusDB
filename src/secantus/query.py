@@ -466,6 +466,19 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
     return _eq_with_array(values, condition, collation)
 
 
+def _validate_not_arg(arg: Any) -> None:
+    """mongod's ``$not`` argument must be a regex or a non-empty document of
+    operators (BadValue): a scalar / array / bool is "$not needs a regex or a
+    document", an empty document is "$not cannot be empty". Without this a bare
+    ``{$not: 5}`` silently degrades to "not equal to 5"."""
+    if isinstance(arg, Regex):
+        return
+    if not isinstance(arg, Mapping):
+        raise QueryError("$not needs a regex or a document")
+    if not arg:
+        raise QueryError("$not cannot be empty")
+
+
 def _validate_in_arg(op: str, arg: Any) -> None:
     """mongod parse-time validation for ``$in`` / ``$nin`` (BadValue, code 2): the
     argument must be an array, and no element may be a document with a
@@ -589,6 +602,7 @@ def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | Non
         present = any(v is not MISSING for v in values)
         return present == _truthy(arg)
     if op == "$not":
+        _validate_not_arg(arg)
         return not _field_matches(values, arg, collation)
     if op == "$type":
         return _op_type(values, arg)
@@ -599,6 +613,8 @@ def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | Non
     if op == "$mod":
         return _op_mod(values, arg)
     if op == "$elemMatch":
+        if not isinstance(arg, Mapping):
+            raise QueryError("$elemMatch needs an Object")
         return _op_elem_match(values, arg)
     if op == "$bitsAllSet":
         return _op_bitwise(values, arg, lambda v, m: (v & m) == m, op)

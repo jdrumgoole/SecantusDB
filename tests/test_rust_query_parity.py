@@ -766,6 +766,28 @@ def test_in_nin_invalid_defers_and_raises(query):
 
 
 @pytest.mark.parametrize(
+    "query",
+    [
+        {"a": {"$not": 5}},  # scalar
+        {"a": {"$not": "x"}},  # string
+        {"a": {"$not": []}},  # array
+        {"a": {"$not": {}}},  # empty doc
+        {"a": {"$not": True}},  # bool
+        {"a": {"$elemMatch": 5}},  # non-object
+        {"a": {"$elemMatch": "x"}},  # non-object
+    ],
+)
+def test_not_elemmatch_invalid_defers_and_raises(query):
+    # Invalid $not/$elemMatch: Rust defers (None), pure engine raises BadValue.
+    doc = bson.decode(bson.encode({"a": [1, 2, 3]}))
+    query = bson.decode(bson.encode({"q": query}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
     "query,code",
     [
         ({"s": {"$regex": "h", "$options": "z"}}, 51108),  # bad flag

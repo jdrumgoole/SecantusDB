@@ -362,11 +362,26 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
             let present = values.iter().any(|v| v.is_some());
             Ok(present == truthy(arg)?)
         }
-        "$not" => Ok(!field_matches(values, arg, coll)?),
+        "$not" => {
+            // mongod: $not needs a regex or a non-empty document (else BadValue).
+            // A scalar / array / bool / empty doc defers so Python raises.
+            match arg {
+                Bson::RegularExpression(_) => {}
+                Bson::Document(d) if !d.is_empty() => {}
+                _ => return Err(Fallback),
+            }
+            Ok(!field_matches(values, arg, coll)?)
+        }
         "$type" => op_type(values, arg),
         "$size" => op_size(values, arg),
         "$all" => op_all(values, arg),
-        "$elemMatch" => op_elem_match(values, arg),
+        "$elemMatch" => {
+            // mongod: $elemMatch needs an Object (else BadValue) -> defer.
+            if !matches!(arg, Bson::Document(_)) {
+                return Err(Fallback);
+            }
+            op_elem_match(values, arg)
+        }
         "$mod" => op_mod(values, arg),
         "$bitsAllSet" => op_bits(values, arg, |v, m| v & m == m),
         "$bitsAnySet" => op_bits(values, arg, |v, m| v & m != 0),
