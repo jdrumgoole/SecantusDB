@@ -824,6 +824,62 @@ jobs:
       - name: Set up Python 3.12
         run: uv python install 3.12
 
+      # --- cargo caching -------------------------------------------------
+      # This job became the workflow's critical path once the test lanes were
+      # duration-balanced (#501): 11m37, of which the wheel build is 561s on
+      # Windows. Instrumenting that build shows cargo is ~445s of it (469
+      # crates), against ~100s for the C / WiredTiger build — so the cargo
+      # artifacts are the thing worth caching, not the C objects.
+      #
+      # Reuses the EXISTING documented knob rather than inventing one:
+      # CMakeLists.txt honours SECANTUS_CARGO_TARGET as the cargo target root
+      # (defaulting to the per-build-tag build dir, which is why nothing is
+      # reused today), and wheels.yml / publish.yml already point it at a
+      # cached directory. Note ccache is deliberately NOT used here: it is
+      # skipped on Windows repo-wide, whereas a cargo target dir is just a
+      # directory and caches on every platform.
+      - name: Compute WT submodule SHA
+        id: wt-sha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+
+      - name: Point cargo at a cacheable target dir
+        # The path is OS-specific ON PURPOSE. Under git-bash on Windows $HOME
+        # is a POSIX path (/c/Users/runneradmin), which CMake does not accept;
+        # pyproject.toml's cibuildwheel config uses a native 'C:/cargo-target'
+        # for the same reason, and notes that a backslash form (C:\...) gets
+        # eaten as an escape when the path flows through CMake. Forward slashes
+        # are accepted by CMake, cargo and clang-sys alike.
+        id: cargodir
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            dir='C:/cargo-target'
+          else
+            dir="$HOME/.cargo-target"
+          fi
+          echo "SECANTUS_CARGO_TARGET=$dir" >> "$GITHUB_ENV"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "cargo target root: $dir"
+
+      - name: Restore cargo target + registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ${{ steps.cargodir.outputs.dir }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          # Cargo.lock pins the dependency graph, so a lock change must not
+          # reuse stale artifacts. The WT sha is in the key because
+          # secantus-wt's bindgen output is derived from the vendored WT
+          # headers — a WT bump invalidates those crates even with an unchanged
+          # lock. restore-keys let an near-miss still seed the dependency
+          # crates, which are the bulk of the 469.
+          key: cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}-wt-${{ steps.wt-sha.outputs.sha }}
+          restore-keys: |
+            cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            cargo-${{ matrix.os }}-
+
       - name: Build the secantus wheel with the storage engine ON
         # scikit-build-core forwards SKBUILD_CMAKE_DEFINE entries as -D defines,
         # so this flips the CMake option ON for this build only. The cargo build
