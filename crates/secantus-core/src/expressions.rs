@@ -3117,6 +3117,11 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
+    // A bool operand defers (Python raises 28762 base / 28763 exponent);
+    // as_float_like would otherwise coerce it to 1.0.
+    if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
+        return Err(Fallback);
+    }
     if let (b @ (Bson::Int32(_) | Bson::Int64(_)), e @ (Bson::Int32(_) | Bson::Int64(_))) =
         (&vals[0], &vals[1])
     {
@@ -3136,6 +3141,11 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
     let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
         return Err(Fallback);
     };
+    if a == 0.0 && b < 0.0 {
+        return Err(Fallback); // Python raises 28764 (base 0, negative exponent)
+    }
+    // f64::powf already yields NaN for a negative base with a fractional
+    // exponent (matching mongod / the Python complex->NaN guard).
     Ok(Bson::Double(a.powf(b)))
 }
 

@@ -4475,3 +4475,24 @@ def test_bits_numeric_arg_validation(coll) -> None:
         with pytest.raises(OperationFailure) as exc:
             coll.count_documents(query)
         assert exc.value.code == code, query
+
+
+def test_pow_domain_validation(coll) -> None:
+    """$pow: negative base + fractional exponent returns NaN (not a server crash),
+    and bad operands raise mongod's codes over the wire. mongod 7.0.12-verified."""
+    import math
+
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    got = list(coll.aggregate([{"$project": {"r": {"$pow": [-2, 0.5]}, "_id": 0}}]))
+    assert len(got) == 1 and math.isnan(got[0]["r"])  # regression: used to crash BSON encode
+    assert list(coll.aggregate([{"$project": {"r": {"$pow": [-2, 3]}, "_id": 0}}]))[0]["r"] == -8
+    for expr, code in [
+        ({"$pow": ["x", 2]}, 28762),
+        ({"$pow": [2, True]}, 28763),
+        ({"$pow": [0, -1]}, 28764),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr

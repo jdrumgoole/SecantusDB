@@ -868,6 +868,16 @@ CURATED = [
     ({"$substrBytes": ["abcde", 1, 2.9]}, {}),
     ({"$substrBytes": ["abcde", 1, -1.7]}, {}),
     ({"$substrBytes": ["abcde", -1.7, 2]}, {}),
+    # $pow: integer/whole-double compute on both engines; non-numeric / bool /
+    # zero-base-negative-exponent raise on Python and defer on Rust. (The
+    # negative-base-fractional NaN case is excluded — NaN != NaN breaks the
+    # equality assert; it's covered in the unit/integration tests via isnan.)
+    ({"$pow": [-2, 3]}, {}),
+    ({"$pow": [2.0, 3]}, {}),
+    ({"$pow": [2, 10]}, {}),
+    ({"$pow": ["x", 2]}, {}),
+    ({"$pow": [2, True]}, {}),
+    ({"$pow": [0, -1]}, {}),
 ]
 
 
