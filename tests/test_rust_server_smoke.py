@@ -1691,3 +1691,20 @@ def test_facet_validation(tmp_path) -> None:
         assert out == [{"n": [{"c": 2}]}]
     finally:
         srv.stop()
+
+
+def test_projection_slice_validation(tmp_path) -> None:
+    """The Rust server rejects an invalid projection $slice (non-number scalar,
+    empty/bad array) instead of silently returning the array; a valid $slice
+    still reshapes it."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "a": [1, 2, 3, 4, 5]})
+        for sl in ("x", [], [1, -2], [1, 2, 3], ["x", 2]):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.find({}, {"a": {"$slice": sl}}))
+        assert coll.find_one({}, {"_id": 0, "a": {"$slice": 2}})["a"] == [1, 2]
+        assert coll.find_one({}, {"_id": 0, "a": {"$slice": [1, 2]}})["a"] == [2, 3]
+    finally:
+        srv.stop()

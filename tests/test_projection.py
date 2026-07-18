@@ -120,6 +120,28 @@ def test_slice_with_explicit_truthy_id_flips_to_inclusion() -> None:
     }
 
 
+def test_slice_argument_validation() -> None:
+    # mongod: a non-number scalar / empty array / <2 or >3-element array is 28667;
+    # a 2/3-element array that isn't [skip, positive-limit] is 28724.
+    doc = {"_id": 1, "a": [1, 2, 3, 4, 5]}
+    for sl, code in [
+        ("x", 28667),
+        (True, 28667),
+        ([], 28667),
+        ([1, -2], 28724),
+        ([1, 2, 3], 28724),
+        (["x", 2], 28724),
+    ]:
+        with pytest.raises(ProjectionError) as exc:
+            apply_projection(dict(doc), {"a": {"$slice": sl}})
+        assert exc.value.code == code, sl
+    # Valid forms still slice: a number, and [skip, positive-limit] (skip may be <0).
+    assert apply_projection(dict(doc), {"a": {"$slice": 2}})["a"] == [1, 2]
+    assert apply_projection(dict(doc), {"a": {"$slice": -2}})["a"] == [4, 5]
+    assert apply_projection(dict(doc), {"a": {"$slice": [1, 2]}})["a"] == [2, 3]
+    assert apply_projection(dict(doc), {"a": {"$slice": [-3, 2]}})["a"] == [3, 4]
+
+
 def test_inclusion_fans_over_arrays() -> None:
     """Dotted inclusion paths map over array elements: doc elements
     project (possibly to {}), scalar elements drop. Oracle-pinned."""

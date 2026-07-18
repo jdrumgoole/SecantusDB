@@ -125,6 +125,27 @@ def test_curated_parity(doc, spec):
     assert rust == py, f"rust={rust} pure={py} spec={spec}"
 
 
+@pytest.mark.parametrize(
+    "sl,code",
+    [
+        ("x", 28667),  # non-number scalar
+        (True, 28667),  # bool
+        ([], 28667),  # empty array
+        ([1, -2], 28724),  # [skip, non-positive limit]
+        ([1, 2, 3], 28724),  # 3-element array
+        (["x", 2], 28724),  # first element not a number
+    ],
+)
+def test_slice_invalid_defers_and_raises(sl, code):
+    # Invalid projection $slice: Rust defers (None), pure engine raises the code.
+    doc = bson.decode(bson.encode({"_id": 1, "a": [1, 2, 3, 4, 5]}))
+    spec = bson.decode(bson.encode({"s": {"a": {"$slice": sl}}}))["s"]
+    assert _rust_proj(doc, spec) is None
+    with pytest.raises(_pure.ProjectionError) as exc:
+        _pure.apply_projection(doc, spec)
+    assert exc.value.code == code
+
+
 # Positional `arr.$` projection — needs the query (filter) to resolve which
 # element matched. (doc, spec, query).
 POSITIONAL_CURATED = [
