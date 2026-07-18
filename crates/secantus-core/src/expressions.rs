@@ -203,8 +203,9 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$toUpper" => op_to_case(arg, ctx, true),
         "$strLenCP" => op_str_len_cp(arg, ctx),
         "$split" => op_split(arg, ctx),
-        "$substrCP" | "$substr" => op_substr_cp(arg, ctx),
-        "$substrBytes" => op_substr_bytes(arg, ctx),
+        "$substrCP" => op_substr_cp(arg, ctx),
+        // mongod: $substr is a deprecated alias of $substrBytes (byte-based).
+        "$substrBytes" | "$substr" => op_substr_bytes(arg, ctx),
         "$indexOfCP" => op_index_of(arg, ctx, false),
         "$indexOfBytes" => op_index_of(arg, ctx, true),
         "$trim" => op_trim(arg, ctx, TrimSide::Both),
@@ -3621,9 +3622,12 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::String(s) = s else {
         return Err(Fallback);
     };
-    let (Some(start), Some(length)) =
-        (slice_int(&eval(&a[1], ctx)?), slice_int(&eval(&a[2], ctx)?))
-    else {
+    let start_v = eval(&a[1], ctx)?;
+    let length_v = eval(&a[2], ctx)?;
+    if matches!(start_v, Bson::Boolean(_)) || matches!(length_v, Bson::Boolean(_)) {
+        return Err(Fallback); // Python raises 16034 / 16035
+    }
+    let (Some(start), Some(length)) = (slice_int(&start_v), slice_int(&length_v)) else {
         return Err(Fallback);
     };
     let bytes = s.as_bytes();

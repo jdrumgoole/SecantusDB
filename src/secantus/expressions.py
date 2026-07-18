@@ -1430,6 +1430,17 @@ def _op_substr_bytes(arg: Any, ctx: _Ctx) -> Any:
     length = _eval(arg[2], ctx)
     if s is None:
         return ""
+    # mongod's message has a verbatim double space after "$substrBytes:".
+    if isinstance(start, bool):
+        raise ExpressionError(
+            "$substrBytes:  starting index must be a numeric type (is BSON type bool)",
+            code=16034,
+        )
+    if isinstance(length, bool):
+        raise ExpressionError(
+            "$substrBytes:  length must be a numeric type (is BSON type bool)",
+            code=16035,
+        )
     if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
         raise ExpressionError("$substrBytes requires string + ints")
     encoded = s.encode("utf-8")
@@ -2545,7 +2556,7 @@ _OPS = {
     "$trim": _op_trim,
     "$ltrim": _op_ltrim,
     "$rtrim": _op_rtrim,
-    "$substr": _op_substr_cp,
+    "$substr": _op_substr_bytes,  # mongod: $substr is a deprecated alias of $substrBytes
     "$substrCP": _op_substr_cp,
     "$strLenCP": _op_str_len_cp,
     "$indexOfCP": _op_index_of_cp,

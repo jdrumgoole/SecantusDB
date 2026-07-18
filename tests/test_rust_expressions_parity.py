@@ -807,6 +807,12 @@ CURATED = [
     ({"$sortArray": {"input": [3, 1, 2], "sortBy": True}}, {}),
     ({"$substrCP": ["hello", True, 2]}, {}),
     ({"$substrCP": ["hello", 1, True]}, {}),
+    ({"$substrBytes": ["hello", True, 2]}, {}),
+    ({"$substrBytes": ["hello", 1, True]}, {}),
+    ({"$substr": ["hello", True, 2]}, {}),
+    ({"$substr": ["hello", 1, True]}, {}),
+    # $substr aliases $substrBytes (byte-based) on both engines — ASCII computes.
+    ({"$substr": ["hello", 1, 3]}, {}),
     ({"$range": [0, True]}, {}),
     ({"$range": [True, 5]}, {}),
     ({"$range": [0, 5, True]}, {}),
