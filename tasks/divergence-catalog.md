@@ -69,7 +69,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 - ~~**Projection `$slice`**~~ **FIXED (#506):** non-number scalar / short / long
   array → 28667; 2/3-elem array not `[skip, positive-limit]` → 28724. Both engines
   (Rust core defers). (projection.py)
-- ~~**`$type` validation**~~ **FIXED (#507):** unknown alias / out-of-range / fractional
+- ~~**`$type` validation**~~ **FIXED (#508):** unknown alias / out-of-range / fractional
   code → 2 (code-0 hint), bool → 14; the Rust engine now computes valid whole-double
   codes instead of deferring. Valid alias set = 22, code set = {-1,1..19,127}. Both
   engines. (query.py / .rs)
