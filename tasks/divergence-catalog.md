@@ -33,7 +33,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   → wrong query results. **Verified.** (query.py / .rs)
 - **`$exists` Python-truthiness** (`""`/`[]`/`{}` treated falsy; mongod: only
   `false`/`0`/`null` are falsy) → wrong results. **Verified.** (query.py / .rs)
-- ~~**`$group` accumulator coerces string→number**~~ **FIXED (#490):** `$sum`/`$avg`
+- ~~**`$group` accumulator coerces string→number**~~ **FIXED (#491):** `$sum`/`$avg`
   ignore non-numeric operands (string/bool/null/missing) — all-non-numeric group →
   `0` / `null`; `$min`/`$max` order mixed types by BSON cross-type order and skip
   null/missing instead of raising. Both engines. (Rust min/max over mixed types now
