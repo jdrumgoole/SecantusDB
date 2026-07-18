@@ -1512,6 +1512,10 @@ def test_unary_math_rejects_non_numeric(tmp_path) -> None:
             with pytest.raises(pymongo.errors.OperationFailure):
                 bad = [True, 0] if op in ("$trunc", "$round") else True
                 list(coll.aggregate([{"$project": {"r": {op: bad}}}]))
+        # $log rejects a non-numeric argument / base too.
+        for expr in ({"$log": ["$s", 2]}, {"$log": [8, "$s"]}, {"$log": [True, 2]}):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": expr}}]))
         got = list(coll.aggregate([{"$project": {"_id": 0, "a": {"$abs": "$n"}}}]))
         assert got == [{"a": 4.0}]
     finally:

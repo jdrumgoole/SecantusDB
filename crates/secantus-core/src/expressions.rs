@@ -3104,7 +3104,9 @@ fn op_log(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
-    let (Some(n), Some(base)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
+    // bool / non-numeric argument or base is mongod's Location28756 / 28757 —
+    // defer so Python raises them (math_float rejects bool, unlike as_float_like).
+    let (Ok(n), Ok(base)) = (math_float(&vals[0]), math_float(&vals[1])) else {
         return Err(Fallback);
     };
     // Out-of-domain args are mongod's Location28758 (argument) / 28759

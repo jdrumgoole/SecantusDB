@@ -565,6 +565,20 @@ def _op_log(arg: Any, ctx: _Ctx) -> Any:
     n, base = _eval(arg[0], ctx), _eval(arg[1], ctx)
     if n is None or base is None:
         return None
+    # mongod's type errors (probed 7.0.12): Location28756 / 28757 — a non-numeric
+    # (incl. bool) argument or base is rejected before the domain check.
+    if not _is_numeric(n):
+        raise ExpressionError(
+            f"$log's argument must be numeric, not {_bson_type_name(n)}",
+            code=28756,
+            code_name="Location28756",
+        )
+    if not _is_numeric(base):
+        raise ExpressionError(
+            f"$log's base must be numeric, not {_bson_type_name(base)}",
+            code=28757,
+            code_name="Location28757",
+        )
     # mongod's domain errors (probed 7.0.12): Location28758 / 28759.
     if isinstance(n, (int, float)) and n <= 0:
         raise ExpressionError(

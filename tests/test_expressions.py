@@ -1140,6 +1140,11 @@ def test_log_family_domain_errors() -> None:
         ({"$log": [8, -2]}, 28759),
         ({"$sqrt": -1}, 28714),
         ({"$sqrt": -0.5}, 28714),
+        # $log type errors (28756 argument / 28757 base) precede the domain check.
+        ({"$log": ["x", 2]}, 28756),
+        ({"$log": [True, 2]}, 28756),
+        ({"$log": [8, "y"]}, 28757),
+        ({"$log": [8, True]}, 28757),
     ]:
         with pytest.raises(ExpressionError) as exc:
             evaluate(expr, {}, None)
