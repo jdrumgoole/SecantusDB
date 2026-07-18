@@ -1273,3 +1273,26 @@ def test_substr_bytes_truncates_double_index(tmp_path) -> None:
             assert got == [{"r": want}], expr
     finally:
         srv.stop()
+
+
+def test_limit_skip_numeric_arg_validation(tmp_path) -> None:
+    """The Rust server accepts a whole-double $limit/$skip (computing, matching
+    the Python server) and rejects bool / fractional / negative / zero-$limit
+    (the core defers to BadValue)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": i} for i in range(10)])
+        assert len(list(coll.aggregate([{"$limit": 2.0}]))) == 2
+        assert len(list(coll.aggregate([{"$skip": 3.0}]))) == 7
+        for pipe in (
+            [{"$limit": 2.7}],
+            [{"$limit": True}],
+            [{"$limit": 0}],
+            [{"$skip": 3.7}],
+            [{"$skip": -1}],
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate(pipe))
+    finally:
+        srv.stop()

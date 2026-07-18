@@ -1183,7 +1183,20 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   double substring agrees on both servers; a truncated-negative start still hits
   50752. **With this, `$substrBytes` / `$substrCP` numeric-argument handling fully
   matches mongod** (bool, byte-vs-codepoint aliasing, whole-double / fractional /
-  truncation, UTF-8-split, negative indices). **Done
+  truncation, UTF-8-split, negative indices). **Aggregation-stage numeric-arg
+  fidelity (`$limit` / `$skip`) — FIXED (2026-07-18):** both stages coerced their
+  arg with a naive `int(spec)`, so `$limit: 0` returned nothing (mongod: 15958
+  "the limit must be positive"), `$limit: -1` negative-sliced, and bool/fractional
+  were silently coerced; the Rust server had the mirror bug — it *rejected a valid
+  whole-double `$limit: 2.0`* (its `positive_int` used `as_int_like`, which returns
+  None for a double) while coercing bool→1. Now both accept a whole double and
+  reject bool/fractional/negative (`$limit` 5107201, `$skip` 5107200; zero-`$limit`
+  15958) — Python raises the code, the Rust core defers via the new
+  `stage_nonneg_int`. **Still open — `$sample` size:** mongod rejects a bool
+  (28746) and a negative (28747) but *accepts a fractional* double (truncates);
+  currently the Python engine coerces via `int()` (so bool→1, no error) — needs the
+  same treatment, but `$sample` isn't a Rust-core stage (it defers / is
+  storage-backed and non-deterministic), so its parity story differs. **Done
   (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and

@@ -181,16 +181,54 @@ def _stage_count(
     return [{spec: len(docs)}]
 
 
+def _fmt_stage_val(v: Any) -> str:
+    """Render a $limit/$skip argument the way mongod prints it in the error."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return repr(v) if isinstance(v, float) else str(v)
+
+
+def _stage_nonneg_int(spec: Any, stage: str, code: int) -> int:
+    """Validate a $limit/$skip argument like mongod: a whole-number double is
+    accepted (coerced to int); a bool / non-number, a fractional double, and a
+    negative value each raise `code` with mongod's exact per-case message."""
+    if isinstance(spec, bool) or not isinstance(spec, (int, float)):
+        raise AggregateError(
+            f"invalid argument to {stage} stage: Expected a number in: "
+            f"{stage}: {_fmt_stage_val(spec)}",
+            code=code,
+        )
+    if isinstance(spec, float):
+        if not spec.is_integer():
+            raise AggregateError(
+                f"invalid argument to {stage} stage: Expected an integer: "
+                f"{stage}: {_fmt_stage_val(spec)}",
+                code=code,
+            )
+        spec = int(spec)
+    if spec < 0:
+        raise AggregateError(
+            f"invalid argument to {stage} stage: Expected a non-negative number in: "
+            f"{stage}: {spec}",
+            code=code,
+        )
+    return spec
+
+
 def _stage_limit(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    return docs[: int(spec)]
+    n = _stage_nonneg_int(spec, "$limit", 5107201)
+    if n == 0:
+        raise AggregateError("the limit must be positive", code=15958)
+    return docs[:n]
 
 
 def _stage_skip(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    return docs[int(spec) :]
+    n = _stage_nonneg_int(spec, "$skip", 5107200)
+    return docs[n:]
 
 
 def _stage_sort(
