@@ -866,6 +866,27 @@ def test_sort_stage_invalid_defers_and_raises(spec, code):
     assert exc.value.code == code
 
 
+@pytest.mark.parametrize(
+    "rng,code",
+    [
+        ({"step": 1, "unit": "day", "bounds": "full"}, 6053600),
+        ({"step": True, "bounds": "full"}, 14),
+        ({"step": 0, "bounds": "full"}, 5733401),
+        ({"step": 1, "bounds": "partial"}, 5946802),
+        ({"step": 1, "bounds": [0]}, 5733403),
+        ({"step": 1, "bounds": [5, 0]}, 5733402),
+    ],
+)
+def test_densify_invalid_defers_and_raises(rng, code):
+    # Invalid $densify: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}, {"_id": 2, "v": 5}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$densify": {"field": "v", "range": rng}}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
 def _rand_scalar(rng):
     r = rng.random()
     if r < 0.3:

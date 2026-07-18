@@ -108,20 +108,37 @@ pub fn densify_stage(spec: &Bson, docs: &[Document]) -> R<Vec<Document>> {
     {
         return Err(());
     }
+    // A bool step is "wrong type" (Python raises 14) — don't let num_of coerce it.
+    if matches!(range_spec.get("step"), Some(Bson::Boolean(_))) {
+        return Err(());
+    }
     let Some(step) = range_spec.get("step").and_then(num_of) else {
         return Err(());
     };
     if cmp(step, Num::Int(0)) != Some(Ordering::Greater) {
-        return Err(()); // step must be > 0 (Python raises otherwise)
+        return Err(()); // step must be > 0 (Python raises 5733401)
     }
 
-    // bounds: a numeric [lo, hi] pair, else "full"/"partition"/absent.
+    // bounds: the string "full"/"partition", or a strictly-ascending two-element
+    // numeric array; every other shape defers (Python raises 5946802/5733403/5733402).
     let bounds_pair: Option<(Num, Num)> = match range_spec.get("bounds") {
-        Some(Bson::Array(a)) if a.len() == 2 => match (num_of(&a[0]), num_of(&a[1])) {
-            (Some(lo), Some(hi)) => Some((lo, hi)),
-            _ => return Err(()), // non-numeric explicit bounds -> Python compare raises
-        },
-        _ => None,
+        None | Some(Bson::Null) => None,
+        Some(Bson::String(s)) if s == "full" || s == "partition" => None,
+        Some(Bson::Array(a)) if a.len() == 2 => {
+            if a.iter().any(|b| matches!(b, Bson::Boolean(_))) {
+                return Err(()); // bool bounds element -> Python 5733402
+            }
+            match (num_of(&a[0]), num_of(&a[1])) {
+                (Some(lo), Some(hi)) => {
+                    if cmp(lo, hi) != Some(Ordering::Less) {
+                        return Err(()); // not strictly ascending -> Python 5733402
+                    }
+                    Some((lo, hi))
+                }
+                _ => return Err(()), // non-numeric (date/other) bounds -> Python
+            }
+        }
+        _ => return Err(()), // bad string / wrong-length array / other type -> Python
     };
 
     // 1M filler cap on explicit numeric bounds (Python raises -> defer).

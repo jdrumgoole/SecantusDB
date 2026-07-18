@@ -736,6 +736,30 @@ def test_densify_invalid_step_raises() -> None:
         )
 
 
+def test_densify_validation_codes() -> None:
+    # mongod codes: date unit on numeric 6053600, bool step 14, non-positive step
+    # 5733401, bad bounds string 5946802, wrong-length array 5733403, descending
+    # array 5733402.
+    docs = [{"v": 1}, {"v": 5}]
+    for rng, code in [
+        ({"step": 1, "unit": "day", "bounds": "full"}, 6053600),
+        ({"step": True, "bounds": "full"}, 14),
+        ({"step": 0, "bounds": "full"}, 5733401),
+        ({"step": -1, "bounds": "full"}, 5733401),
+        ({"step": 1, "bounds": "partial"}, 5946802),
+        ({"step": 1, "bounds": [0]}, 5733403),
+        ({"step": 1, "bounds": [5, 0]}, 5733402),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$densify": {"field": "v", "range": rng}}])
+        assert exc.value.code == code, rng
+    # A fractional step and the "partition" bounds string are accepted.
+    assert apply_pipeline(
+        [dict(d) for d in docs],
+        [{"$densify": {"field": "v", "range": {"step": 1.5, "bounds": "full"}}}],
+    )
+
+
 def test_densify_date_unit_day_fills_gaps() -> None:
     """Date densify with ``unit: "day"``: fillers carry the densify
     field as a real ``datetime`` at every step between adjacent
