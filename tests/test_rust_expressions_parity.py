@@ -200,7 +200,12 @@ CURATED = [
     # String / array / object ops (now handled).
     ({"$concat": ["a", "b", "c"]}, {}),
     ({"$concat": ["x", "$a", "y"]}, {"a": "MID"}),
-    ({"$concat": ["a", None, "b"]}, {}),  # None -> ""
+    ({"$concat": ["a", None, "b"]}, {}),  # null operand -> null result
+    ({"$concat": ["a", "$nope", "b"]}, {}),  # missing -> null
+    # Non-string operand: Rust defers (None); Python raises 16702.
+    ({"$concat": ["a", 5]}, {}),
+    ({"$concat": ["a", True]}, {}),
+    ({"$concat": [5, None]}, {}),  # left-to-right: non-string before null -> raise
     ({"$toUpper": "$a"}, {"a": "hi"}),
     ({"$toLower": "HELLO"}, {}),
     ({"$toUpper": "$a"}, {"a": 123}),  # non-string passes through

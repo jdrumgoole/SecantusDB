@@ -1725,3 +1725,20 @@ def test_type_argument_validation(tmp_path) -> None:
         assert [d["_id"] for d in coll.find({"a": {"$type": 16.0}})] == [1]
     finally:
         srv.stop()
+
+
+def test_concat_type_validation(tmp_path) -> None:
+    """The Rust server rejects a non-string $concat operand (defer -> BadValue)
+    instead of coercing it; a null / missing operand yields null."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "s": "b"})
+        for expr in ({"$concat": ["a", 5]}, {"$concat": ["a", True]}):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        proj = {"_id": 0, "ok": {"$concat": ["a", "$s"]}, "n": {"$concat": ["a", None]}}
+        out = list(coll.aggregate([{"$project": proj}]))
+        assert out == [{"ok": "ab", "n": None}]
+    finally:
+        srv.stop()

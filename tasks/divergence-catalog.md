@@ -53,11 +53,12 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   `$exp`/`$ln`/`$log10`/`$round`/`$trunc` → #492 [28765/51081], `$pow` → #483
   [28762/28763/28764], `$log` → #493 [28756/28757]). Whole math-operator family now
   type-guards both engines. (expressions)
-- **Array/string type guards**: `$concat:["a",5]`→"a5" (mongod 16702); non-array to
-  `$reverseArray`/`$concatArrays`/`$map`/`$filter`/`$reduce`/`$first`/`$last`/`$slice`
-  → `None` (mongod 34435/…); `$trim`/`$ltrim`/`$rtrim {chars:5}` → unchanged (50700);
-  `$indexOfBytes`/`$indexOfCP` whole-double start ignored (→-1) and bool start coerced
-  (mongod 40096); `$toDate` on int/bool accepts (mongod 241). (expressions)
+- **Array/string type guards**: `$concat` non-string operand FIXED (#509, → 16702;
+  null/missing → null). Remaining: non-array to `$reverseArray`/`$concatArrays`/`$map`/
+  `$filter`/`$reduce`/`$first`/`$last`/`$slice` → `None` (mongod 34435/…);
+  `$trim`/`$ltrim`/`$rtrim {chars:5}` → unchanged (50700); `$indexOfBytes`/`$indexOfCP`
+  whole-double start ignored (→-1) and bool start coerced (mongod 40096); `$toDate` on
+  int/bool accepts (mongod 241). (expressions)
 - **Date-arg whole-double / bool**: `$dateAdd`/`$dateSubtract {amount:2.0}` and
   `$dateTrunc {binSize:2.0}` over-reject valid whole doubles; `amount:true`/`binSize:true`
   compute (mongod 5166405/5439017). `$toLong: 2.7` rejects valid (mongod truncates→2).

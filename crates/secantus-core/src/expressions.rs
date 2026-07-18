@@ -1202,10 +1202,11 @@ fn op_concat(arg: &Bson, ctx: &Ctx) -> R {
     let mut out = String::new();
     for p in eval_args(arg, ctx)? {
         match p {
-            Bson::Null => {}
+            // A null / missing operand short-circuits to a null result (mongod),
+            // left-to-right.
+            Bson::Null => return Ok(Bson::Null),
             Bson::String(s) => out.push_str(&s),
-            // Python str()-coerces non-strings; the formatting (esp. floats)
-            // is risky to reproduce, so defer.
+            // A non-string operand is Location16702 -> defer so Python raises it.
             _ => return Err(Fallback),
         }
     }
