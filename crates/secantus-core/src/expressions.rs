@@ -3799,8 +3799,11 @@ fn op_trim(arg: &Bson, ctx: &Ctx, side: TrimSide) -> R {
         Some(e) => eval(e, ctx)?,
         None => return Err(Fallback),
     };
+    if is_null(&chars) {
+        return Ok(Bson::Null); // chars: null -> null result (mongod)
+    }
     let Bson::String(chars) = chars else {
-        return Err(Fallback);
+        return Err(Fallback); // non-string chars -> Python raises 50700
     };
     let pat = |c: char| chars.contains(c);
     let trimmed = match side {

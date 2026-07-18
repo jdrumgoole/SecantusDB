@@ -474,6 +474,23 @@ def test_ltrim_rtrim() -> None:
     assert evaluate({"$rtrim": {"input": "  hi  "}}, {}) == "  hi"
 
 
+def test_trim_argument_validation() -> None:
+    # mongod: non-string input -> 50699, non-string chars -> 50700; a null input
+    # or null chars yields null.
+    for op in ("$trim", "$ltrim", "$rtrim"):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: {"input": 5}}, {})
+        assert exc.value.code == 50699, op
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: {"input": "x", "chars": 5}}, {})
+        assert exc.value.code == 50700, op
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: {"input": "x", "chars": True}}, {})
+        assert exc.value.code == 50700, op
+        assert evaluate({op: {"input": None}}, {}) is None
+        assert evaluate({op: {"input": "--x--", "chars": None}}, {}) is None
+
+
 def test_substr_cp() -> None:
     assert evaluate({"$substrCP": ["hello world", 6, 5]}, {}) == "world"
     assert evaluate({"$substrCP": ["hello world", 0, 5]}, {}) == "hello"

@@ -1766,3 +1766,29 @@ def test_array_operators_reject_non_array(tmp_path) -> None:
         assert out == [{"n": None}]
     finally:
         srv.stop()
+
+
+def test_trim_argument_validation(tmp_path) -> None:
+    """The Rust server rejects a non-string $trim input / chars (defer ->
+    BadValue) and returns null for a null chars; a valid chars still trims."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        for op in ("$trim", "$ltrim", "$rtrim"):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": {op: {"input": 5}}, "_id": 0}}]))
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(
+                    coll.aggregate(
+                        [{"$project": {"r": {op: {"input": "x", "chars": 5}}, "_id": 0}}]
+                    )
+                )
+        proj = {
+            "_id": 0,
+            "t": {"$trim": {"input": "--x--", "chars": "-"}},
+            "n": {"$trim": {"input": "x", "chars": None}},
+        }
+        assert list(coll.aggregate([{"$project": proj}])) == [{"t": "x", "n": None}]
+    finally:
+        srv.stop()
