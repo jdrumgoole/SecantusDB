@@ -1397,14 +1397,37 @@ def _op_array_to_object(arg: Any, ctx: _Ctx) -> Any:
 
 
 def _op_split(arg: Any, ctx: _Ctx) -> Any:
+    # mongod: exactly 2 args (16020); a null string/separator -> null; a
+    # non-string first/second arg -> 40085/40086; an empty separator -> 40087.
     if not isinstance(arg, list) or len(arg) != 2:
-        raise ExpressionError("$split requires [string, separator]")
+        n = len(arg) if isinstance(arg, list) else 1
+        raise ExpressionError(
+            f"Expression $split takes exactly 2 arguments. {n} were passed in.",
+            code=16020,
+            code_name="Location16020",
+        )
     s = _eval(arg[0], ctx)
     sep = _eval(arg[1], ctx)
     if s is None or sep is None:
         return None
-    if not isinstance(s, str) or not isinstance(sep, str):
-        raise ExpressionError("$split requires string operands")
+    if not isinstance(s, str):
+        raise ExpressionError(
+            "$split requires an expression that evaluates to a string as a first "
+            f"argument, found: {_bson_type_name(s)}",
+            code=40085,
+            code_name="Location40085",
+        )
+    if not isinstance(sep, str):
+        raise ExpressionError(
+            "$split requires an expression that evaluates to a string as a second "
+            f"argument, found: {_bson_type_name(sep)}",
+            code=40086,
+            code_name="Location40086",
+        )
+    if sep == "":
+        raise ExpressionError(
+            "$split requires a non-empty separator", code=40087, code_name="Location40087"
+        )
     return s.split(sep)
 
 

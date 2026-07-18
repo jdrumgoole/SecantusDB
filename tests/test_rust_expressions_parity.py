@@ -207,6 +207,13 @@ CURATED = [
     ({"$strLenCP": "hello"}, {}),
     ({"$split": ["a,b,c", ","]}, {}),
     ({"$split": ["$a", "-"]}, {"a": "1-2-3"}),
+    # Invalid $split: Rust defers (None); Python raises 40085/40086/40087/16020.
+    ({"$split": ["a,b", ""]}, {}),  # empty sep
+    ({"$split": [5, ","]}, {}),  # non-string first
+    ({"$split": ["a,b", 5]}, {}),  # non-string second
+    ({"$split": ["a,b"]}, {}),  # wrong arg count
+    ({"$split": [None, ","]}, {}),  # null string -> null (both compute)
+    ({"$split": ["a,b", None]}, {}),  # null sep -> null
     ({"$substrCP": ["hello", 1, 3]}, {}),
     ({"$substrCP": ["hello", 2, -1]}, {}),  # negative length -> to end
     ({"$substrCP": ["hello", 10, 2]}, {}),  # start past end -> ""

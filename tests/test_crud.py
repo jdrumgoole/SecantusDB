@@ -4511,6 +4511,37 @@ def test_aggregation_whole_double_index_accepted(coll) -> None:
         assert exc.value.code == code, expr
 
 
+def test_split_argument_validation_via_pymongo(coll) -> None:
+    """$split: empty separator 40087, non-string first/second 40085/40086, wrong
+    arg count 16020; a null string / separator yields null. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$split": ["a,b", ""]}, 40087),
+        ({"$split": [5, ","]}, 40085),
+        ({"$split": ["a,b", 5]}, 40086),
+        ({"$split": ["a,b"]}, 16020),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+    got = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "a": {"$split": ["a,b,c", ","]},
+                        "n": {"$split": [None, ","]},
+                    }
+                }
+            ]
+        )
+    )
+    assert got == [{"a": ["a", "b", "c"], "n": None}]
+
+
 def test_substr_bytes_split_utf8_rejected(coll) -> None:
     """$substrBytes rejects a range that splits a UTF-8 character (mongod codes
     28656 start / 28657 end) over the wire. mongod 7.0.12-verified."""

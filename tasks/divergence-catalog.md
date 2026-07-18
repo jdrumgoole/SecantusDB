@@ -44,9 +44,9 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   string/bool FIXED (#492, → 28765 / 51081); `$log` (2-arg) FIXED (#493, → 28756 /
   28757); `$in`/`$nin` non-array + nested-`$` FIXED (#494, → BadValue); `$regex`/
   `$options` validation FIXED (#496, → 51108 / BadValue); `$not`/`$elemMatch` arg
-  FIXED (#497, → BadValue). Still leaking: `$split` empty-sep (ValueError),
-  `$facet {a:[5]}` (TypeError), `$densify unit:'day'` on numeric (TypeError),
-  `$sort {v:'asc'}` (ValueError).
+  FIXED (#497, → BadValue); `$split` empty-sep + type/arity FIXED (#500, → 40085/
+  40086/40087/16020). Still leaking: `$facet {a:[5]}` (TypeError), `$densify
+  unit:'day'` on numeric (TypeError), `$sort {v:'asc'}` (ValueError).
 
 ## Tier 2 — silent-accept of invalid input / missing type guards
 
