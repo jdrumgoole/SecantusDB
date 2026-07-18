@@ -477,6 +477,10 @@ CURATED = [
     ({"$log": [100, 10]}, {}),
     ({"$log": [8, 1]}, {}),  # base 1 -> defers (Python raises 28759)
     ({"$log": [None, 2]}, {}),  # null arg -> null
+    ({"$log": ["$s", 2]}, {"s": "x"}),  # non-numeric arg -> defer (28756)
+    ({"$log": [8, "$s"]}, {"s": "x"}),  # non-numeric base -> defer (28757)
+    ({"$log": [True, 2]}, {}),  # bool arg -> defer (no coercion)
+    ({"$log": [8, True]}, {}),  # bool base -> defer
     ({"$log10": 100}, {}),
     ({"$log10": 1000}, {}),
     ({"$log10": "$n"}, {"n": 2.5}),

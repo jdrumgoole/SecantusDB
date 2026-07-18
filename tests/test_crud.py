@@ -4581,6 +4581,13 @@ def test_unary_math_rejects_non_numeric_via_pymongo(coll) -> None:
         with pytest.raises(OperationFailure) as exc:
             list(coll.aggregate([{"$project": {"r": {op: ["$s", 0]}}}]))
         assert exc.value.code == 51081, op
+    # $log: a non-numeric argument (28756) / base (28757).
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"r": {"$log": ["$s", 2]}}}]))
+    assert exc.value.code == 28756
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"r": {"$log": [8, "$s"]}}}]))
+    assert exc.value.code == 28757
     # A whole-double operand still computes; a null field yields null.
     got = list(
         coll.aggregate([{"$project": {"_id": 0, "a": {"$abs": "$n"}, "m": {"$abs": "$gone"}}}])
