@@ -38,6 +38,32 @@ set(WT_HELPERS_CMAKE ${WT_SOURCE_DIR}/cmake/helpers.cmake)
 set(WT_PATCH_MUSL_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_musl.py)
 set(WT_OS_FS_C ${WT_SOURCE_DIR}/src/os_posix/os_fs.c)
 
+# The interpreter that runs the patch scripts, handed to the patch step via a
+# FILE rather than as a command argument. See the PATCH_COMMAND comment on the
+# ExternalProject below: naming ${Python3_EXECUTABLE} in the command made
+# ExternalProject's recorded patch text change on every build (PEP 517 isolated
+# build envs live in a fresh temp dir each time), which re-ran the patch step
+# and rebuilt all of WiredTiger every time. The file's CONTENTS may change
+# freely — only the command text is compared — and the patches are idempotent
+# text edits whose result does not depend on which interpreter applied them.
+# Resolve the interpreter through any symlinks. Under a PEP 517 build
+# Python3_EXECUTABLE points into the isolated build environment — e.g.
+# ~/.cache/uv/builds-v0/.tmp8zUBBH/bin/python — a path that is DIFFERENT on
+# every build. On POSIX that is a symlink to the real interpreter
+# (~/.pyenv/versions/3.12.7/bin/python3.12), which is stable, so REALPATH gives
+# a value that can be embedded in ExternalProject's recorded commands without
+# invalidating them every time.
+#
+# Building against the resolved base interpreter is equivalent: a venv carries
+# no headers or libs of its own, it shares the base interpreter's ABI, and the
+# version is unchanged. (On Windows venv pythons are copies rather than
+# symlinks, so REALPATH is a no-op there and that platform keeps rebuilding —
+# see the note in the ExternalProject below.)
+get_filename_component(WT_PY_REAL "${Python3_EXECUTABLE}" REALPATH)
+
+set(WT_PATCH_PY_FILE ${CMAKE_CURRENT_BINARY_DIR}/wt_patch_python.txt)
+file(WRITE ${WT_PATCH_PY_FILE} "${WT_PY_REAL}")
+
 # Python C extension filename: .so on POSIX, .pyd on Windows. WT only sets the
 # Darwin SUFFIX itself; the Windows branch is added by patch_wt_python.py so
 # Python's import machinery (which only looks for .pyd) can find the module.
@@ -57,10 +83,20 @@ ExternalProject_Add(wiredtiger_ext
     # build outputs under a per-config subdir (lang/python/Release/...) and
     # breaks our install paths. Force Ninja everywhere for a uniform layout.
     CMAKE_GENERATOR   Ninja
-    PATCH_COMMAND     ${Python3_EXECUTABLE} ${WT_PATCH_SCRIPT} ${WT_STRICT_HELPERS}
-              COMMAND ${Python3_EXECUTABLE} ${WT_PATCH_PYTHON_SCRIPT} ${WT_PYTHON_CMAKE}
-              COMMAND ${Python3_EXECUTABLE} ${WT_PATCH_HELPERS_SCRIPT} ${WT_HELPERS_CMAKE}
-              COMMAND ${Python3_EXECUTABLE} ${WT_PATCH_MUSL_SCRIPT} ${WT_OS_FS_C}
+    # Every argument here MUST be stable across builds. ExternalProject records
+    # this command verbatim and re-runs the patch step — cascading into
+    # configure and a full WiredTiger rebuild — whenever the recorded text
+    # differs. Naming ${Python3_EXECUTABLE} directly used to do exactly that:
+    # under a PEP 517 build it is the isolated build env's interpreter
+    # (~/.cache/uv/builds-v0/.tmpXXXX/bin/python), a fresh temp path on EVERY
+    # build, so WT recompiled from scratch every time despite BUILD_ALWAYS OFF.
+    # The interpreter is now passed by file (see WT_PATCH_PY_FILE below) so it
+    # can vary without invalidating the stamp.
+    PATCH_COMMAND ${CMAKE_COMMAND}
+        -DPY_FILE=${WT_PATCH_PY_FILE}
+        -DSCRIPT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/cmake
+        -DWT_SOURCE_DIR=${WT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_wt_patches.cmake
     CMAKE_ARGS
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_INSTALL_PREFIX=${WT_INSTALL_DIR}
@@ -72,7 +108,12 @@ ExternalProject_Add(wiredtiger_ext
         # Belt-and-braces with BUILD_COMMAND below; ENABLE_CPPSUITE=OFF
         # also short-circuits the configure-time SWIG/Catch2 lookups.
         -DENABLE_CPPSUITE=OFF
-        -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
+        # WT_PY_REAL, not Python3_EXECUTABLE: the raw value is a per-build
+        # temp path, and ExternalProject re-runs the CONFIGURE step (then the
+        # build) whenever the configure command text changes. Fixing only the
+        # PATCH_COMMAND was not enough — the patch stamp then held, but
+        # configure still churned through this argument.
+        -DPython3_EXECUTABLE=${WT_PY_REAL}
     # Build only the SWIG Python module (CMake pulls in wiredtiger_static
     # and the compression-extension shared libs via target dependencies).
     # WT's tests, benchmarks, examples, and simulator targets stay unbuilt.
