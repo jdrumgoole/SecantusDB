@@ -10,27 +10,34 @@ name: Record test durations
 #
 #   * Recording needs the WHOLE suite in ONE job. The test lanes are sharded, so
 #     each one only ever sees its own slice and could not produce a full file.
-#   * Durations are PER-PLATFORM and the difference is not cosmetic. Measured:
-#     the sql/core balance INVERTS between platforms. A macOS recording ranks
-#     sql as the heavy half (4109s vs 2555s of recorded work, 1.61x), while
-#     Linux CI ran sql as the LIGHT half (5m11 vs core's 11m11). A durations
-#     file recorded on the wrong OS therefore packs the shards in the wrong
-#     direction — worse than having no file at all, which at least degrades to
-#     an even split.
+#   * Durations are PER-PLATFORM and the difference is not cosmetic. Measured
+#     from real CI recordings, the sql/core balance genuinely INVERTS between
+#     platforms:
 #
-#     The MECHANISM behind that inversion is not established. An earlier version
-#     of this comment blamed the cross-driver smokes (mongosh / node / java)
-#     skipping where the toolchain is absent; that was checked and is FALSE —
-#     with the toolchain installed locally all 80 of them run on macOS (175s of
-#     recorded time), so skipping does not explain it. Plausible remaining
-#     candidates are per-platform I/O cost (the WT-heavy core tests against
-#     macOS' SSD vs the runner's disk) and CPU-vs-I/O mix, but nobody has
-#     measured which dominates.
+#         Linux CI    sql= 687s  core=2398s   -> core heavier, 3.49x
+#         Windows CI  sql=2552s  core=1256s   -> sql  heavier, 2.03x
 #
-#     That the cause is UNKNOWN is precisely why the numbers must be recorded on
-#     each platform rather than extrapolated from one: we have a reproducible
-#     inversion we cannot yet predict from first principles, so any model of it
-#     would be a guess where a measurement is cheap.
+#     Same suite, same commit, opposite heavy half. That is why the old
+#     path-based sql/core split could not be balanced for both at once, and it
+#     is why a durations file recorded on the wrong OS packs the groups in the
+#     wrong direction.
+#
+#     The MECHANISM is still unmeasured. A plausible hypothesis is process /
+#     connection setup cost — the sql + pgserver suites open many short-lived
+#     connections and subprocesses, which are markedly more expensive on
+#     Windows — but nobody has profiled it, so treat that as a guess.
+#
+#     Two earlier explanations in this file were WRONG and are recorded here so
+#     they are not re-derived: (1) that the cross-driver smokes skip where the
+#     toolchain is absent — they do not, all 80 run on macOS with it installed;
+#     (2) that the inversion was purely a local-measurement artifact — the CI
+#     numbers above show it is real between Linux and Windows. What IS suspect
+#     is macOS-local recording: 12 xdist workers on 12 cores inflates wall time
+#     unevenly, which is a further reason to record on CI rather than a laptop.
+#
+#     Note the split stays CORRECT regardless of which file is used: a wrong
+#     durations file mis-balances the groups but can never drop or duplicate a
+#     test, because pytest-split partitions the collected set.
 #   * They only need re-recording when the suite's shape shifts materially
 #     (a big new module, a slow test cluster added or removed), not per push.
 #
@@ -78,6 +85,25 @@ jobs:
         shell: pwsh
         run: Set-MpPreference -DisableRealtimeMonitoring $true
         continue-on-error: true
+
+      - name: Put temp files on the runner work disk (Windows)
+        # MUST mirror the ``test-windows`` job's twin step. pytest's tmp_path
+        # (→ every WT home) follows TMP/TEMP, which points at the small OS-disk
+        # profile temp dir; RUNNER_TEMP is on the work disk provisioned for
+        # build I/O.
+        #
+        # Omitting this killed the first recording run: this job runs the WHOLE
+        # suite UNSHARDED, so it retains roughly double a shard's tmp_path
+        # footprint, filled the OS disk, and took the runner down hard at
+        # ~22 min — the job reported failure with its later steps still
+        # "pending" and NO logs uploaded at all (a blob-not-found), which is the
+        # signature of a runner death rather than a failing step. Sharded lanes
+        # never hit it because each holds only half the tree.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # MUST match the ``test`` job's toolchain exactly. The whole point of a
