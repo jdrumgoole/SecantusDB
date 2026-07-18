@@ -57,7 +57,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   to `$reverseArray`/`$concatArrays`/`$map`/`$filter`/`$reduce`/`$first`/`$last`/`$slice`
   FIXED (#513, → 34435/28664/16883/28651/40080/28689/28724; null → null); `$trim`/
   `$ltrim`/`$rtrim` non-string input/chars FIXED (#515, → 50699/50700; chars:null →
-  null); `$indexOfBytes`/`$indexOfCP` start/end FIXED (#516, → 40096/40097; whole
+  null); `$indexOfBytes`/`$indexOfCP` start/end FIXED (#518, → 40096/40097; whole
   double accepted). Remaining: `$toDate` on int/bool accepts (mongod 241).
   (expressions)
 - **Date-arg whole-double / bool**: `$dateAdd`/`$dateSubtract {amount:2.0}` and
