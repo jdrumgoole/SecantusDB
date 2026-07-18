@@ -4455,3 +4455,23 @@ def test_sample_size_validation(coll) -> None:
         with pytest.raises(OperationFailure) as exc:
             list(coll.aggregate([{"$sample": {"size": size}}]))
         assert exc.value.code == code, size
+
+
+def test_bits_numeric_arg_validation(coll) -> None:
+    """$bits* accept a whole-double mask/position and reject fractional / negative
+    / bool with mongod's codes (position 2, non-array mask 9) over the wire.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 6})
+    assert coll.count_documents({"n": {"$bitsAllSet": 6.0}}) == 1
+    assert coll.count_documents({"n": {"$bitsAllSet": [1.0, 2.0]}}) == 1
+    for query, code in [
+        ({"n": {"$bitsAllSet": 2.5}}, 9),
+        ({"n": {"$bitsAllSet": -1}}, 9),
+        ({"n": {"$bitsAllSet": [1.5]}}, 2),
+        ({"n": {"$bitsAllSet": [-1]}}, 2),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            coll.count_documents(query)
+        assert exc.value.code == code, query

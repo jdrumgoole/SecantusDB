@@ -313,6 +313,11 @@ CURATED = [
     ({"flags": 0b1010}, {"flags": {"$bitsAnyClear": 0b1011}}),
     ({"flags": "abc"}, {"flags": {"$bitsAllSet": 0b1}}),
     ({"flags": True}, {"flags": {"$bitsAllSet": 0b1}}),
+    # whole-number-double mask / bit positions compute on both engines (mongod
+    # accepts them, truncating) — the case the Rust core used to wrongly defer.
+    ({"flags": 0b0110}, {"flags": {"$bitsAllSet": 6.0}}),
+    ({"flags": 0b0110}, {"flags": {"$bitsAllSet": [1.0, 2.0]}}),
+    ({"flags": 0b0110}, {"flags": {"$bitsAnyClear": 8.0}}),
     ({"x": Decimal128("5")}, {"x": 5}),
     ({"x": 5}, {"x": Decimal128("5")}),
     ({"x": Decimal128("3.5")}, {"x": 3.5}),

@@ -1557,19 +1557,28 @@ fn op_mod(values: &[Option<&Bson>], spec: &Bson) -> R {
 // --- $bits* -------------------------------------------------------------
 
 fn resolve_bitmask(arg: &Bson) -> Result<u64, Fallback> {
+    // mongod accepts a whole-number double mask / bit position (truncated);
+    // fractional / negative / bool defer to the Python oracle (which raises the
+    // exact code -- mask 9, position 2).
     match arg {
         Bson::Boolean(_) => Err(Fallback),
         Bson::Int32(n) if *n >= 0 => Ok(*n as u64),
         Bson::Int64(n) if *n >= 0 => Ok(*n as u64),
-        Bson::Int32(_) | Bson::Int64(_) => Err(Fallback), // negative mask -> Python
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 && *d >= 0.0 => Ok(*d as u64),
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => Err(Fallback),
         Bson::Array(a) => {
             let mut mask = 0u64;
             for bit in a {
-                match bit {
-                    Bson::Int32(p) if (0..64).contains(p) => mask |= 1 << *p,
-                    Bson::Int64(p) if (0..64).contains(p) => mask |= 1 << *p,
+                let p = match bit {
+                    Bson::Int32(p) => *p as i64,
+                    Bson::Int64(p) => *p,
+                    Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
                     _ => return Err(Fallback),
+                };
+                if !(0..64).contains(&p) {
+                    return Err(Fallback);
                 }
+                mask |= 1 << p;
             }
             Ok(mask)
         }

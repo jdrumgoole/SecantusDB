@@ -570,13 +570,13 @@ def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | Non
     if op == "$elemMatch":
         return _op_elem_match(values, arg)
     if op == "$bitsAllSet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == m)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == m, op)
     if op == "$bitsAnySet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0, op)
     if op == "$bitsAllClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0, op)
     if op == "$bitsAnyClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != m)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != m, op)
     if op == "$geoWithin":
         return _op_geo_within(values, arg)
     if op == "$geoIntersects":
@@ -764,23 +764,67 @@ def _opt_number(value: Any, label: str) -> float | None:
     return float(value)
 
 
-def _resolve_bitmask(arg: Any) -> int:
+def _resolve_bitmask(arg: Any, op: str) -> int:
+    """Build the bitmask for a `$bits*` query, mongod-style. The argument is an
+    array of bit positions or a non-negative integer / whole-number-double mask.
+    A whole double is accepted (truncated); a fractional double, a bool, or a
+    negative value is rejected — a bad *position* with code 2, a bad non-array
+    *mask* with code 9 (a bool mask with code 2). Codes verified vs mongod 7.0.12."""
     if isinstance(arg, bool):
-        raise QueryError("bitwise mask cannot be a boolean")
-    if isinstance(arg, int):
+        raise QueryError(
+            f"n takes an Array, a number, or a BinData but received: {op}: "
+            f"{'true' if arg else 'false'}",
+            code=2,
+        )
+    if isinstance(arg, (int, float)):
+        if isinstance(arg, float):
+            if not arg.is_integer():
+                raise QueryError(
+                    f"Expected an integer: {op}: {arg!r}", code=9, code_name="FailedToParse"
+                )
+            arg = int(arg)
+        if arg < 0:
+            raise QueryError(
+                f"Expected a non-negative number in: {op}: {arg}",
+                code=9,
+                code_name="FailedToParse",
+            )
         return arg
     if isinstance(arg, list):
         mask = 0
-        for bit in arg:
-            if not isinstance(bit, int) or isinstance(bit, bool):
-                raise QueryError("bitwise mask positions must be integers")
+        for i, bit in enumerate(arg):
+            if isinstance(bit, bool):
+                raise QueryError(
+                    f"Failed to parse bit position. Expected a number in: {i}: "
+                    f"{'true' if bit else 'false'}",
+                    code=2,
+                )
+            if isinstance(bit, float):
+                if not bit.is_integer():
+                    raise QueryError(
+                        f"Failed to parse bit position. Expected an integer: {i}: {bit!r}",
+                        code=2,
+                    )
+                bit = int(bit)
+            if not isinstance(bit, int):
+                raise QueryError(
+                    f"Failed to parse bit position. Expected a number in: {i}: {bit!r}",
+                    code=2,
+                )
+            if bit < 0:
+                raise QueryError(
+                    f"Failed to parse bit position. Expected a non-negative number in: {i}: {bit}",
+                    code=2,
+                )
             mask |= 1 << bit
         return mask
-    raise QueryError("bitwise operator requires an int or list of bit positions")
+    raise QueryError(f"n takes an Array, a number, or a BinData but received: {op}", code=2)
 
 
-def _op_bitwise(values: list[Any], arg: Any, predicate: Callable[[int, int], bool]) -> bool:
-    mask = _resolve_bitmask(arg)
+def _op_bitwise(
+    values: list[Any], arg: Any, predicate: Callable[[int, int], bool], op: str
+) -> bool:
+    mask = _resolve_bitmask(arg, op)
     for v in values:
         if isinstance(v, int) and not isinstance(v, bool) and predicate(v, mask):
             return True

@@ -626,3 +626,24 @@ def test_json_schema_draft4_bounds_multipleof_and_tuple_items() -> None:
     # Metadata keywords are accepted and ignored, top-level and nested.
     meta = {"title": "t", "description": "d", "properties": {"n": {"title": "x", "minimum": 1}}}
     assert matches({"n": 5}, {"$jsonSchema": meta})
+
+
+def test_bits_numeric_arg_validation() -> None:
+    """$bits* accept a whole-number-double mask / bit position (truncated), and
+    reject a fractional / negative / bool one — a bad position with code 2, a bad
+    non-array mask with code 9. mongod 7.0.12-verified."""
+    assert matches({"n": 6}, {"n": {"$bitsAllSet": 6.0}}) is True
+    assert matches({"n": 6}, {"n": {"$bitsAllSet": [1.0, 2.0]}}) is True
+    for query, code in [
+        ({"n": {"$bitsAllSet": 2.5}}, 9),
+        ({"n": {"$bitsAllSet": -1}}, 9),
+        ({"n": {"$bitsAllSet": True}}, 2),
+        ({"n": {"$bitsAllSet": [1.5]}}, 2),
+        ({"n": {"$bitsAllSet": [-1]}}, 2),  # was an uncaught ValueError (code None)
+        ({"n": {"$bitsAllSet": [True]}}, 2),
+        ({"n": {"$bitsAnyClear": 2.5}}, 9),
+        ({"n": {"$bitsAllClear": [-1]}}, 2),
+    ]:
+        with pytest.raises(QueryError) as exc:
+            matches({"n": 6}, query)
+        assert exc.value.code == code, query
