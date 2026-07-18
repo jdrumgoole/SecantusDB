@@ -122,9 +122,11 @@ CURATED = [
     [{"$match": {"a": {"$gte": 10}}}, {"$project": {"a": 1, "_id": 0}}],
     [{"$addFields": {"big": {"$gt": ["$a", 20]}}}, {"$match": {"big": True}}],
     [{"$skip": 1}, {"$limit": 1}, {"$count": "n"}],
-    # $sort — single + multi-field, both directions
+    # $sort — single + multi-field, both directions (incl. whole-double ±1.0)
     [{"$sort": {"a": 1}}],
     [{"$sort": {"a": -1}}],
+    [{"$sort": {"a": 1.0}}],
+    [{"$sort": {"a": -1.0}}],
     [{"$sort": {"b": 1, "a": -1}}],
     # $unwind — string form, doc form, includeArrayIndex, preserve
     [{"$unwind": "$tags"}],
@@ -842,6 +844,26 @@ def test_curated_parity(pipeline):
         return
     py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
     assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
+
+
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        ({"v": "asc"}, 15974),  # non-numeric direction
+        ({"v": True}, 15974),  # bool direction
+        ({"v": 0}, 15975),  # numeric non-±1
+        ({"v": 2}, 15975),
+        ({}, 15976),  # empty spec
+    ],
+)
+def test_sort_stage_invalid_defers_and_raises(spec, code):
+    # Invalid $sort stage: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$sort": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
 
 
 def _rand_scalar(rng):

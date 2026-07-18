@@ -242,14 +242,22 @@ fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
         return Err(Fallback);
     };
     if d.is_empty() {
-        return Err(Fallback); // empty spec is a no-op in Python; let it handle it
+        return Err(Fallback); // Python raises 15976 (must have at least one key)
     }
     let mut out = Vec::with_capacity(d.len());
     for (field, dir) in d {
-        let n = as_int_like(dir).ok_or(Fallback)?;
+        // mongod accepts int/long ±1 or a whole double ±1.0. A bool is "Illegal
+        // key" (15974), not 1/-1 (so don't let as_int_like coerce true -> 1); a
+        // numeric non-±1 defers so Python raises 15975; non-numeric -> 15974.
+        let n = match dir {
+            Bson::Boolean(_) => None,
+            Bson::Int32(_) | Bson::Int64(_) => as_int_like(dir),
+            Bson::Double(f) if f.fract() == 0.0 => Some(*f as i128),
+            _ => None,
+        };
         match n {
-            1 => out.push((field.clone(), false)),
-            -1 => out.push((field.clone(), true)),
+            Some(1) => out.push((field.clone(), false)),
+            Some(-1) => out.push((field.clone(), true)),
             _ => return Err(Fallback),
         }
     }

@@ -794,6 +794,26 @@ def test_aggregate_sort_stage(coll) -> None:
     assert [d["_id"] for d in out] == [2, 3, 1]
 
 
+def test_aggregate_sort_stage_validation_via_pymongo(coll) -> None:
+    """$sort: non-numeric direction 15974, numeric non-±1 15975, empty spec 15976.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1, "n": 3}, {"_id": 2, "n": 1}])
+    for spec, code in [
+        ({"n": "asc"}, 15974),
+        ({"n": True}, 15974),
+        ({"n": 0}, 15975),
+        ({"n": 2}, 15975),
+        ({}, 15976),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$sort": spec}]))
+        assert exc.value.code == code, spec
+    # A whole-double direction still sorts.
+    assert [d["_id"] for d in coll.aggregate([{"$sort": {"n": 1.0}}])] == [2, 1]
+
+
 def test_aggregate_project_with_computed_field(coll) -> None:
     coll.insert_many([{"_id": 1, "x": 3, "y": 4}])
     out = list(coll.aggregate([{"$project": {"_id": 0, "sum": {"$add": ["$x", "$y"]}}}]))

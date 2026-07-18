@@ -45,8 +45,9 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   28757); `$in`/`$nin` non-array + nested-`$` FIXED (#494, → BadValue); `$regex`/
   `$options` validation FIXED (#496, → 51108 / BadValue); `$not`/`$elemMatch` arg
   FIXED (#497, → BadValue); `$split` empty-sep + type/arity FIXED (#500, → 40085/
-  40086/40087/16020). Still leaking: `$facet {a:[5]}` (TypeError), `$densify
-  unit:'day'` on numeric (TypeError), `$sort {v:'asc'}` (ValueError).
+  40086/40087/16020); `$sort` stage direction FIXED (#501, → 15974/15975/15976).
+  Still leaking: `$facet {a:[5]}` (TypeError), `$densify unit:'day'` on numeric
+  (TypeError).
 
 ## Tier 2 — silent-accept of invalid input / missing type guards
 
@@ -85,8 +86,8 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   `preserveNullAndEmptyArrays` accepted (28810/28818/28809/28822); `$sortByCount`
   number/non-expr-doc/no-`$` accepted (40149/40147/40148); nested `$facet` (40600);
   `$count` ''/dotted/`$`-prefixed/`_id` accepted (40157/40160/40158/15948); `$sort`
-  bad-ordering/empty/`{v:true}` accepted (15975/15976/15974); `$project {}` empty
-  accepted (51272). (aggregate.py)
+  bad-ordering/empty/`{v:true}` FIXED (#501, → 15975/15976/15974); `$project {}`
+  empty accepted (51272). (aggregate.py)
 
 ## Tier 3 — wrong error code (both error; SecantusDB returns 14 or None vs a Location code)
 
