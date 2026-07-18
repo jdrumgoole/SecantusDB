@@ -79,6 +79,25 @@ jobs:
         run: Set-MpPreference -DisableRealtimeMonitoring $true
         continue-on-error: true
 
+      - name: Put temp files on the runner work disk (Windows)
+        # MUST mirror the ``test-windows`` job's twin step. pytest's tmp_path
+        # (→ every WT home) follows TMP/TEMP, which points at the small OS-disk
+        # profile temp dir; RUNNER_TEMP is on the work disk provisioned for
+        # build I/O.
+        #
+        # Omitting this killed the first recording run: this job runs the WHOLE
+        # suite UNSHARDED, so it retains roughly double a shard's tmp_path
+        # footprint, filled the OS disk, and took the runner down hard at
+        # ~22 min — the job reported failure with its later steps still
+        # "pending" and NO logs uploaded at all (a blob-not-found), which is the
+        # signature of a runner death rather than a failing step. Sharded lanes
+        # never hit it because each holds only half the tree.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # MUST match the ``test`` job's toolchain exactly. The whole point of a
         # per-platform durations file is that it reflects what actually runs on
