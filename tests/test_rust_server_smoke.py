@@ -1296,3 +1296,19 @@ def test_limit_skip_numeric_arg_validation(tmp_path) -> None:
                 list(coll.aggregate(pipe))
     finally:
         srv.stop()
+
+
+def test_sample_size_validation(tmp_path) -> None:
+    """The Rust server already rejects a bool / negative $sample size (regression
+    guard) and accepts a whole / fractional one."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": i} for i in range(10)])
+        assert len(list(coll.aggregate([{"$sample": {"size": 3}}]))) == 3
+        assert len(list(coll.aggregate([{"$sample": {"size": 2.7}}]))) == 2
+        for size in (True, -1):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$sample": {"size": size}}]))
+    finally:
+        srv.stop()

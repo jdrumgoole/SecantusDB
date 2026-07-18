@@ -4441,3 +4441,17 @@ def test_limit_skip_numeric_arg_validation(coll) -> None:
         with pytest.raises(OperationFailure) as exc:
             list(coll.aggregate(pipe))
         assert exc.value.code == code, pipe
+
+
+def test_sample_size_validation(coll) -> None:
+    """$sample rejects a bool size (28746) and a negative size (28747) over the
+    wire, and truncates a fractional size. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i} for i in range(10)])
+    assert len(list(coll.aggregate([{"$sample": {"size": 3}}]))) == 3
+    assert len(list(coll.aggregate([{"$sample": {"size": 2.7}}]))) == 2
+    for size, code in [(True, 28746), (-1, 28747)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$sample": {"size": size}}]))
+        assert exc.value.code == code, size

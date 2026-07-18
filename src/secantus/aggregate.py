@@ -1639,7 +1639,14 @@ def _stage_sample(
 
     if not isinstance(spec, Mapping) or "size" not in spec:
         raise AggregateError("$sample requires {size: N}")
-    size = int(spec["size"])
+    size_raw = spec["size"]
+    # mongod: size must be a number (bool rejected) and non-negative; a
+    # fractional double is accepted and truncated (unlike $limit/$skip).
+    if isinstance(size_raw, bool) or not isinstance(size_raw, (int, float)):
+        raise AggregateError("size argument to $sample must be a number", code=28746)
+    if size_raw < 0:
+        raise AggregateError("size argument to $sample must not be negative", code=28747)
+    size = int(size_raw)
     if size >= len(docs):
         return list(docs)
     rng = _SAMPLE_RNG if _SAMPLE_RNG is not None else random
