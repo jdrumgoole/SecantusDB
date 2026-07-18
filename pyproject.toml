@@ -39,6 +39,10 @@ dev = [
     "pytest-benchmark>=4.0",  # for tests/test_perf_regression.py
     "pytest-timeout>=2.4",  # per-test deadline; names hung tests instead of letting CI hang at 97%
     "pytest-asyncio>=0.24",  # drives pymongo's async test suite in the validate-pymongo-async gauge
+    # Duration-balanced CI sharding. The test lanes split the suite with
+    # ``--splits N --group K`` against the per-platform files in ci/durations/;
+    # see .github/workflows/record-durations.yml for how those are produced.
+    "pytest-split>=0.10",
     "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
     "sqlglot>=25",  # SQL parser for the secantus.sql tests (mirrors the [sql] extra)
     "pg8000>=1.31",  # pure-Python Postgres driver: real-driver gauge for the SQL server
