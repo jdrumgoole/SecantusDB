@@ -842,6 +842,20 @@ CURATED = [
     ({"$round": [3.14159, 2.7]}, {}),
     ({"$trunc": [3.14159, 2.0]}, {}),
     ({"$trunc": [3.14159, 2.7]}, {}),
+    # $substrBytes splitting a UTF-8 char: Python raises 28656/28657, the Rust
+    # core defers (its slice isn't valid UTF-8). Clean boundaries compute equally.
+    ({"$substrBytes": ["héllo", 0, 2]}, {}),
+    ({"$substrBytes": ["héllo", 2, 3]}, {}),
+    ({"$substr": ["héllo", 0, 2]}, {}),
+    ({"$substrBytes": ["héllo", 0, 3]}, {}),
+    ({"$substrBytes": ["héllo", 3, 2]}, {}),
+    # continuation-byte start / end-split rejected even for an empty range: the
+    # core must defer (not return "") — the case a fuzz run surfaced.
+    ({"$substrBytes": ["héllo", 2, 0]}, {}),
+    ({"$substrBytes": ["héllo", 1, 1]}, {}),
+    ({"$substrBytes": ["éa😀ézé", 1, 0]}, {}),
+    ({"$substrBytes": ["héllo", 1, 0]}, {}),
+    ({"$substrBytes": ["héllo", 99, 0]}, {}),
 ]
 
 

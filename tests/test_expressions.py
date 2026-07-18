@@ -1168,3 +1168,29 @@ def test_whole_number_double_index_accepted_fractional_rejected() -> None:
         with pytest.raises(ExpressionError) as exc:
             evaluate(expr, {}, None)
         assert exc.value.code == code, expr
+
+
+def test_substr_bytes_rejects_split_utf8_character() -> None:
+    # mongod rejects a $substrBytes range that splits a UTF-8 character rather
+    # than returning a replacement char. "héllo": é is bytes 1-2.
+    with pytest.raises(ExpressionError) as end_exc:
+        evaluate({"$substrBytes": ["héllo", 0, 2]}, {}, None)  # ends inside é
+    assert end_exc.value.code == 28657
+    with pytest.raises(ExpressionError) as start_exc:
+        evaluate({"$substrBytes": ["héllo", 2, 3]}, {}, None)  # starts inside é
+    assert start_exc.value.code == 28656
+    # $substr is the byte-based alias — same rejection.
+    with pytest.raises(ExpressionError) as alias_exc:
+        evaluate({"$substr": ["héllo", 0, 2]}, {}, None)
+    assert alias_exc.value.code == 28657
+    # A continuation-byte start is rejected even for an empty (length 0) range.
+    with pytest.raises(ExpressionError) as empty_exc:
+        evaluate({"$substrBytes": ["héllo", 2, 0]}, {}, None)
+    assert empty_exc.value.code == 28656
+    # Clean boundaries and clamped/past-end ranges still compute (byte 1 is é's
+    # lead byte — a valid boundary — so [1, 0] is an empty slice, not an error).
+    assert evaluate({"$substrBytes": ["héllo", 1, 0]}, {}, None) == ""
+    assert evaluate({"$substrBytes": ["héllo", 0, 3]}, {}, None) == "hé"
+    assert evaluate({"$substrBytes": ["héllo", 3, 2]}, {}, None) == "ll"
+    assert evaluate({"$substrBytes": ["héllo", 3, 99]}, {}, None) == "llo"
+    assert evaluate({"$substrBytes": ["héllo", 99, 0]}, {}, None) == ""

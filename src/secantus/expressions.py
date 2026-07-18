@@ -1496,6 +1496,24 @@ def _op_substr_bytes(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
         raise ExpressionError("$substrBytes requires string + ints")
     encoded = s.encode("utf-8")
+    n = len(encoded)
+    # mongod rejects a byte range that splits a UTF-8 character rather than
+    # returning a replacement char (verbatim double-space messages). Only
+    # meaningful for a non-negative start; a negative start keeps the
+    # pre-existing Python slice semantics (matched by the Rust core), which is a
+    # separate divergence outside this fix's scope.
+    if start >= 0:
+        if start < n and (encoded[start] & 0xC0) == 0x80:
+            raise ExpressionError(
+                "$substrBytes:  Invalid range, starting index is a UTF-8 continuation byte.",
+                code=28656,
+            )
+        end = n if length < 0 else start + length
+        if 0 <= end < n and (encoded[end] & 0xC0) == 0x80:
+            raise ExpressionError(
+                "$substrBytes:  Invalid range, ending index is in the middle of a UTF-8 character.",
+                code=28657,
+            )
     if length < 0:
         return encoded[start:].decode("utf-8", errors="replace")
     return encoded[start : start + length].decode("utf-8", errors="replace")

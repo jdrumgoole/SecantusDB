@@ -1162,11 +1162,19 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   **complete** across the aggregation surface. Remaining edge: a *huge* whole double
   (> 2^31) is accepted here but mongod rejects it (32-bit-representable check) — a
   narrow case; both SecantusDB engines stay mutually consistent (both null/whole).
-  (2) `$substrBytes` /
-  `$substr` cutting **mid-UTF8-character** (e.g.
-  `$substrBytes: ["héllo", 0, 2]`) — mongod errors 28657, but both SecantusDB
-  servers decode with `errors="replace"` and return a replacement char; verify +
-  fix as a sibling. **Done
+  (2) **`$substrBytes` / `$substr` mid-UTF8-character — FIXED (2026-07-18).**
+  A byte range that splits a UTF-8 char now raises mongod's codes on the Python
+  server (28656 start-on-continuation-byte / 28657 end-mid-character, verbatim
+  double-space messages) and defers → `BadValue` on the Rust server. A fuzz run
+  surfaced the subtlety: mongod rejects a continuation-byte start *even for an
+  empty (length 0) range*, which the Rust core's `std::str::from_utf8` slice check
+  missed (an empty slice is valid UTF-8) — so **both** engines got an explicit
+  boundary check (a negative start keeps legacy slice semantics on both).
+  Three-way mongod 7.0.12-verified. **Note:** `$substrBytes` still rejects a
+  *float* start/length
+  where mongod truncates any double — a separate remaining divergence (the
+  whole-double sweep covered `$substrCP`, not `$substrBytes`, since mongod's
+  substrBytes truncation semantics differ). **Done
   (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and
