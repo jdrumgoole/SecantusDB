@@ -935,22 +935,63 @@ fn accumulate_into(
 /// `expressions::py_order`, so cross-type / Decimal128 / array-doc boundaries
 /// defer rather than guess), falling to `default` when unplaced, then run the
 /// `output` accumulators per bucket.
+/// Canonical type name for a `$bucket` boundary — the numeric BSON types collapse
+/// to one bracket (mongod requires all boundaries the same type).
+fn bucket_ctype(v: &Bson) -> &'static str {
+    match v {
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => "number",
+        other => crate::query::bson_type_name(other),
+    }
+}
+
 pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
         return Err(());
     };
-    let group_by = s.get("groupBy").cloned().unwrap_or(Bson::Null);
+    let group_by = match s.get("groupBy") {
+        None | Some(Bson::Null) => return Err(()), // missing groupBy -> Python raises 40198
+        Some(v) => v.clone(),
+    };
     let Some(Bson::Array(boundaries)) = s.get("boundaries") else {
         return Err(()); // missing / non-array boundaries -> Python raises
     };
     if boundaries.len() < 2 {
         return Err(());
     }
+    // Boundaries must all be the same canonical type (40193) and strictly
+    // ascending (40194) -- previously unsorted/mixed boundaries were accepted.
+    let ct0 = bucket_ctype(&boundaries[0]);
+    for w in boundaries.windows(2) {
+        if bucket_ctype(&w[1]) != ct0 {
+            return Err(());
+        }
+        if !matches!(
+            expressions::py_order(&w[0], &w[1]).map_err(|_| ())?,
+            Some(Ordering::Less)
+        ) {
+            return Err(());
+        }
+    }
     // `default is not None` — an explicit null default counts as absent.
     let default = match s.get("default") {
         None | Some(Bson::Null) => None,
         Some(v) => Some(v.clone()),
     };
+    if let Some(dv) = &default {
+        // default must lie outside [first, last) -- below the first boundary or
+        // >= the last (mongod 40199).
+        let below = matches!(
+            expressions::py_order(dv, &boundaries[0]).map_err(|_| ())?,
+            Some(Ordering::Less)
+        );
+        let below_last = matches!(
+            expressions::py_order(dv, &boundaries[boundaries.len() - 1]).map_err(|_| ())?,
+            Some(Ordering::Less)
+        );
+        if !below && below_last {
+            return Err(());
+        }
+    }
     let default_output = bson::doc! {"count": {"$sum": 1i32}};
     let output_spec: &Document = match s.get("output") {
         Some(Bson::Document(d)) if !d.is_empty() => d,
@@ -1004,8 +1045,11 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
             }
         }
         if !put {
-            if let Some(di) = default_idx {
-                placed[di].push(d);
+            match default_idx {
+                Some(di) => placed[di].push(d),
+                // No matching bucket and no default: mongod errors (Python raises
+                // 7158303). Previously the document was silently DROPPED.
+                None => return Err(()),
             }
         }
     }

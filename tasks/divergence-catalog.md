@@ -20,8 +20,10 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 - ~~**`$rename` data corruption**~~ **FIXED (#485):** rejects array-element source/
   dest, same-field, same-path, empty target (56), and non-string target — no more
   silent corruption / AttributeError leak. Both engines.
-- **`$bucket` silent data loss**: `[0,3]` boundaries, no `default`, a doc out of
-  range → mongod ERR 7158303; SecantusDB silently DROPS the doc. (aggregate.py)
+- ~~**`$bucket` silent data loss**~~ **FIXED (#486):** out-of-range value with no
+  default now errors (7158303) instead of dropping the doc; full spec validation
+  added (40192-40200). Both engines. (The `$bucketAuto` / unsorted-etc. Tier-2
+  `$bucket` rows below are also covered.)
 - **`$gte`/`$lte: null`** doesn't match null+missing (mongod matches, like `$eq:null`)
   → wrong query results. **Verified.** (query.py / .rs)
 - **`$exists` Python-truthiness** (`""`/`[]`/`{}` treated falsy; mongod: only

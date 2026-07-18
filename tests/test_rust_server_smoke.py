@@ -1398,3 +1398,23 @@ def test_rename_validation_no_corruption(tmp_path) -> None:
         assert coll.find_one({"_id": 1}).get("z") == 5
     finally:
         srv.stop()
+
+
+def test_bucket_validation_no_data_loss(tmp_path) -> None:
+    """The Rust server errors (defer -> BadValue) on an out-of-range $bucket value
+    with no default instead of silently dropping the document."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": i, "v": i} for i in range(6)])
+        r = list(coll.aggregate([{"$bucket": {"groupBy": "$v", "boundaries": [0, 3, 6]}}]))
+        assert [(b["_id"], b["count"]) for b in r] == [(0, 3), (3, 3)]
+        for spec in (
+            {"groupBy": "$v", "boundaries": [0, 3]},  # out of range, no default
+            {"groupBy": "$v", "boundaries": [0, 5, 2]},  # unsorted
+            {"boundaries": [0, 6]},  # missing groupBy
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$bucket": spec}]))
+    finally:
+        srv.stop()
