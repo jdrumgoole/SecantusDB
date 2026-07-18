@@ -1175,3 +1175,30 @@ def test_aggregation_expr_bool_argument_rejected(tmp_path) -> None:
         assert out == [{"r": 20}]
     finally:
         srv.stop()
+
+
+def test_aggregation_whole_double_index_accepted(tmp_path) -> None:
+    """The Rust server accepts a whole-number double index (computes, matching
+    the Python server) and rejects a fractional double. Prevents the two servers
+    diverging on a valid whole-double index."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        got = list(
+            coll.aggregate([{"$project": {"r": {"$arrayElemAt": [[10, 20, 30], 2.0]}, "_id": 0}}])
+        )
+        assert got == [{"r": 30}]
+        got = list(
+            coll.aggregate([{"$project": {"r": {"$slice": [[1, 2, 3, 4], 1.0, 2.0]}, "_id": 0}}])
+        )
+        assert got == [{"r": [2, 3]}]
+        for expr in (
+            {"$arrayElemAt": [[10, 20, 30], 2.7]},
+            {"$slice": [[1, 2, 3, 4], 2.7]},
+            {"$indexOfArray": [[1, 2, 3], 2, 0.7]},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+    finally:
+        srv.stop()

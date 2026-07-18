@@ -898,7 +898,12 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     if matches!(idx, Bson::Boolean(_)) {
         return Err(Fallback); // Python raises 28690
     }
-    let (Bson::Array(a), Some(i)) = (&arr, as_int_like(&idx)) else {
+    let i = match coerce_index(&idx) {
+        IdxCoerce::Int(i) => i as i128,
+        IdxCoerce::Fractional => return Err(Fallback), // Python raises 28691
+        IdxCoerce::NotNumber => return Ok(Bson::Null),
+    };
+    let Bson::Array(a) = &arr else {
         return Ok(Bson::Null);
     };
     let len = a.len() as i128;
@@ -1047,6 +1052,32 @@ fn slice_int(b: &Bson) -> Option<i64> {
     as_int_like(b).map(|x| x as i64)
 }
 
+/// Outcome of coercing a numeric aggregation index argument to `i64`, the way
+/// mongod does: an int (or a whole-number double) is the index; a double with a
+/// fractional part is rejected (Python raises the op's per-arg code, so the Rust
+/// core defers); anything else is a non-number the caller handles (null / -1).
+/// `bool` is handled by the caller's own guard before this is reached.
+enum IdxCoerce {
+    Int(i64),
+    Fractional,
+    NotNumber,
+}
+
+fn coerce_index(b: &Bson) -> IdxCoerce {
+    match b {
+        Bson::Int32(n) => IdxCoerce::Int(*n as i64),
+        Bson::Int64(n) => IdxCoerce::Int(*n),
+        Bson::Double(d) => {
+            if d.is_finite() && d.fract() == 0.0 {
+                IdxCoerce::Int(*d as i64)
+            } else {
+                IdxCoerce::Fractional
+            }
+        }
+        _ => IdxCoerce::NotNumber,
+    }
+}
+
 fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Array(a) = arg else {
         return Err(Fallback);
@@ -1063,8 +1094,10 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
         if matches!(n_v, Bson::Boolean(_)) {
             return Err(Fallback); // Python raises 28725
         }
-        let Some(n) = slice_int(&n_v) else {
-            return Ok(Bson::Null);
+        let n = match coerce_index(&n_v) {
+            IdxCoerce::Int(n) => n,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 28726
+            IdxCoerce::NotNumber => return Ok(Bson::Null),
         };
         if n >= 0 {
             (0, n)
@@ -1077,8 +1110,15 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
         if matches!(pos_v, Bson::Boolean(_)) || matches!(n_v, Bson::Boolean(_)) {
             return Err(Fallback); // Python raises 28725 / 28727
         }
-        let (Some(pos), Some(n)) = (slice_int(&pos_v), slice_int(&n_v)) else {
-            return Ok(Bson::Null);
+        let pos = match coerce_index(&pos_v) {
+            IdxCoerce::Int(p) => p,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 28726
+            IdxCoerce::NotNumber => return Ok(Bson::Null),
+        };
+        let n = match coerce_index(&n_v) {
+            IdxCoerce::Int(n) => n,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 28728
+            IdxCoerce::NotNumber => return Ok(Bson::Null),
         };
         (pos, pos.saturating_add(n))
     };
@@ -1111,9 +1151,10 @@ fn op_index_of_array(arg: &Bson, ctx: &Ctx) -> R {
         if matches!(sv, Bson::Boolean(_)) {
             return Err(Fallback); // Python raises 40096
         }
-        match slice_int(&sv) {
-            Some(x) => x,
-            None => return Ok(Bson::Int32(-1)),
+        match coerce_index(&sv) {
+            IdxCoerce::Int(x) => x,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 40096
+            IdxCoerce::NotNumber => return Ok(Bson::Int32(-1)),
         }
     } else {
         0
@@ -1123,9 +1164,10 @@ fn op_index_of_array(arg: &Bson, ctx: &Ctx) -> R {
         if matches!(ev, Bson::Boolean(_)) {
             return Err(Fallback); // Python raises 40096
         }
-        match slice_int(&ev) {
-            Some(x) => x,
-            None => return Ok(Bson::Int32(-1)),
+        match coerce_index(&ev) {
+            IdxCoerce::Int(x) => x,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 40096
+            IdxCoerce::NotNumber => return Ok(Bson::Int32(-1)),
         }
     } else {
         len

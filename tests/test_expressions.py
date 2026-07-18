@@ -1135,3 +1135,25 @@ def test_bool_argument_rejected_where_int_expected() -> None:
     # A plain int argument still computes (the guard is bool-specific).
     assert evaluate({"$arrayElemAt": [[10, 20, 30], 1]}, {}, None) == 20
     assert evaluate({"$slice": [[1, 2, 3, 4], 2]}, {}, None) == [1, 2]
+
+
+def test_whole_number_double_index_accepted_fractional_rejected() -> None:
+    # mongod accepts a whole-number double where an int index is expected
+    # (coerced to int) and rejects a fractional double with a per-op code.
+    assert evaluate({"$arrayElemAt": [[10, 20, 30], 2.0]}, {}, None) == 30
+    assert evaluate({"$arrayElemAt": [[10, 20, 30], -1.0]}, {}, None) == 30
+    assert evaluate({"$slice": [[1, 2, 3, 4], 2.0]}, {}, None) == [1, 2]
+    assert evaluate({"$slice": [[1, 2, 3, 4], 1.0, 2.0]}, {}, None) == [2, 3]
+    assert evaluate({"$indexOfArray": [[1, 2, 3], 2, 0.0]}, {}, None) == 1
+
+    for expr, code in [
+        ({"$arrayElemAt": [[10, 20, 30], 2.7]}, 28691),
+        ({"$slice": [[1, 2, 3, 4], 2.7]}, 28726),
+        ({"$slice": [[1, 2, 3, 4], 1.7, 2]}, 28726),
+        ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, 28728),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 40096),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0, 0.7]}, 40096),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr

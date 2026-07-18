@@ -818,6 +818,18 @@ CURATED = [
     ({"$range": [0, 5, True]}, {}),
     ({"$indexOfArray": [[1, 2, 3], 2, True]}, {}),
     ({"$indexOfArray": [[1, 2, 3], 2, 0, True]}, {}),
+    # whole-number double index: mongod (and now both engines) accept it and
+    # compute; a fractional double is rejected (Python raises, Rust defers).
+    ({"$arrayElemAt": [[10, 20, 30], 2.0]}, {}),
+    ({"$arrayElemAt": [[10, 20, 30], -1.0]}, {}),
+    ({"$arrayElemAt": [[10, 20, 30], 2.7]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 2.0]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 2.7]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 1.0, 2.0]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 1.7, 2]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, {}),
+    ({"$indexOfArray": [[1, 2, 3], 2, 0.0]}, {}),
+    ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, {}),
 ]
 
 
