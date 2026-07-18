@@ -4388,3 +4388,22 @@ def test_substr_bytes_split_utf8_rejected(coll) -> None:
     # Clean boundary still computes.
     got = list(coll.aggregate([{"$project": {"r": {"$substrBytes": ["héllo", 0, 3]}, "_id": 0}}]))
     assert got == [{"r": "hé"}]
+
+
+def test_substr_negative_index_rejected(coll) -> None:
+    """$substr* reject a negative start (50752 / 34455); $substrCP also rejects a
+    negative length (34454), while $substrBytes treats it as "to end". mongod
+    7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$substrBytes": ["abcde", -1, 2]}, 50752),
+        ({"$substrCP": ["abcde", -1, 2]}, 34455),
+        ({"$substrCP": ["abcde", 1, -1]}, 34454),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+    got = list(coll.aggregate([{"$project": {"r": {"$substrBytes": ["abcde", 1, -1]}, "_id": 0}}]))
+    assert got == [{"r": "bcde"}]
