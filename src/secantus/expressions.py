@@ -1444,40 +1444,60 @@ def _op_split(arg: Any, ctx: _Ctx) -> Any:
     return s.split(sep)
 
 
-def _op_trim(arg: Any, ctx: _Ctx) -> Any:
+def _mongo_val_repr(v: Any) -> str:
+    """The way mongod renders a value in a "got <v> (of type <t>)" message."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return f'"{v}"'
+    return str(v)
+
+
+def _trim_impl(op: str, side: str, arg: Any, ctx: _Ctx) -> Any:
+    # mongod: input must be a string (50699) — a null / missing input yields null;
+    # if `chars` is present it must be a string (50700), and a null `chars` yields
+    # a null result (not the whitespace default).
     if not isinstance(arg, Mapping):
-        raise ExpressionError("$trim requires {input, chars?}")
+        raise ExpressionError(f"{op} requires {{input, chars?}}")
     s = _eval(arg.get("input"), ctx)
     if s is None:
         return None
     if not isinstance(s, str):
-        raise ExpressionError("$trim input must be a string")
-    chars = _eval(arg.get("chars"), ctx) if "chars" in arg else None
-    return s.strip(chars) if isinstance(chars, str) else s.strip()
+        raise ExpressionError(
+            f"{op} requires its input to be a string, got {_mongo_val_repr(s)} "
+            f"(of type {_bson_type_name(s)})",
+            code=50699,
+            code_name="Location50699",
+        )
+    chars: Any = None
+    if "chars" in arg:
+        chars = _eval(arg["chars"], ctx)
+        if chars is None:
+            return None
+        if not isinstance(chars, str):
+            raise ExpressionError(
+                f"{op} requires 'chars' to be a string, got {_mongo_val_repr(chars)} "
+                f"(of type {_bson_type_name(chars)})",
+                code=50700,
+                code_name="Location50700",
+            )
+    if side == "l":
+        return s.lstrip(chars) if chars else s.lstrip()
+    if side == "r":
+        return s.rstrip(chars) if chars else s.rstrip()
+    return s.strip(chars) if chars else s.strip()
+
+
+def _op_trim(arg: Any, ctx: _Ctx) -> Any:
+    return _trim_impl("$trim", "b", arg, ctx)
 
 
 def _op_ltrim(arg: Any, ctx: _Ctx) -> Any:
-    if not isinstance(arg, Mapping):
-        raise ExpressionError("$ltrim requires {input, chars?}")
-    s = _eval(arg.get("input"), ctx)
-    if s is None:
-        return None
-    if not isinstance(s, str):
-        raise ExpressionError("$ltrim input must be a string")
-    chars = _eval(arg.get("chars"), ctx) if "chars" in arg else None
-    return s.lstrip(chars) if isinstance(chars, str) else s.lstrip()
+    return _trim_impl("$ltrim", "l", arg, ctx)
 
 
 def _op_rtrim(arg: Any, ctx: _Ctx) -> Any:
-    if not isinstance(arg, Mapping):
-        raise ExpressionError("$rtrim requires {input, chars?}")
-    s = _eval(arg.get("input"), ctx)
-    if s is None:
-        return None
-    if not isinstance(s, str):
-        raise ExpressionError("$rtrim input must be a string")
-    chars = _eval(arg.get("chars"), ctx) if "chars" in arg else None
-    return s.rstrip(chars) if isinstance(chars, str) else s.rstrip()
+    return _trim_impl("$rtrim", "r", arg, ctx)
 
 
 def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:

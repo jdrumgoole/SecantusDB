@@ -4766,6 +4766,35 @@ def test_array_operators_reject_non_array_via_pymongo(coll) -> None:
     assert out == [{"n": None}]
 
 
+def test_trim_argument_validation_via_pymongo(coll) -> None:
+    """$trim/$ltrim/$rtrim: non-string input -> 50699, non-string chars -> 50700;
+    a null chars yields null. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for op in ("$trim", "$ltrim", "$rtrim"):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: {"input": 5}}, "_id": 0}}]))
+        assert exc.value.code == 50699, op
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: {"input": "x", "chars": 5}}, "_id": 0}}]))
+        assert exc.value.code == 50700, op
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "t": {"$trim": {"input": "--x--", "chars": "-"}},
+                        "n": {"$trim": {"input": "x", "chars": None}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"t": "x", "n": None}]
+
+
 def test_concat_type_validation_via_pymongo(coll) -> None:
     """$concat: a non-string operand is 16702; a null / missing operand yields
     null. mongod 7.0.12-verified."""

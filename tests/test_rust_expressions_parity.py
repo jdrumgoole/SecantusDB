@@ -745,6 +745,10 @@ CURATED = [
     ({"$rtrim": {"input": "hixx", "chars": "x"}}, {}),
     ({"$trim": {"input": "$s"}}, {"s": "  hi  "}),  # default whitespace -> defer
     ({"$trim": {"input": "$s", "chars": " "}}, {"s": None}),  # null input -> null
+    ({"$trim": {"input": "--x--", "chars": None}}, {}),  # null chars -> null (both)
+    ({"$trim": {"input": "x", "chars": 5}}, {}),  # non-string chars -> defer (50700)
+    ({"$ltrim": {"input": "x", "chars": True}}, {}),  # bool chars -> defer
+    ({"$rtrim": {"input": 5, "chars": "x"}}, {}),  # non-string input -> defer (50699)
     # $getField / $setField / $zip.
     ({"$getField": "x"}, {"x": 5}),
     ({"$getField": "missing"}, {}),  # absent -> MISSING marker -> Rust defers
