@@ -299,6 +299,35 @@ def test_to_int_conversions() -> None:
     assert evaluate({"$toInt": True}, {}) == 1
 
 
+def test_to_int_overflow() -> None:
+    from bson.int64 import Int64
+
+    # int32 target: values outside [-2^31, 2^31-1] overflow (mongod 241).
+    for bad in (3e9, 1e30, Int64(2**40), float("inf"), float("nan")):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({"$toInt": bad}, {})
+        assert exc.value.code == 241
+    # A long that fits int32 downcasts to a plain int (int32 on the wire).
+    result = evaluate({"$toInt": Int64(5)}, {})
+    assert result == 5 and not isinstance(result, Int64)
+    # int32 boundaries are accepted.
+    assert evaluate({"$toInt": 2147483647.0}, {}) == 2147483647
+    assert evaluate({"$toInt": -2147483648.0}, {}) == -2147483648
+
+
+def test_convert_int_long_overflow() -> None:
+    # $convert to int/long range-checks and raises 241 (caught by onError).
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$convert": {"input": 3e9, "to": "int"}}, {})
+    assert exc.value.code == 241
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$convert": {"input": 9.3e18, "to": "long"}}, {})
+    assert exc.value.code == 241
+    assert evaluate({"$convert": {"input": 1e30, "to": "int", "onError": "oops"}}, {}) == "oops"
+    # In-range values convert normally.
+    assert evaluate({"$convert": {"input": 5.0, "to": "long"}}, {}) == 5
+
+
 def test_to_double_conversions() -> None:
     assert evaluate({"$toDouble": 3}, {}) == 3.0
     assert evaluate({"$toDouble": "3.14"}, {}) == 3.14

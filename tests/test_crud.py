@@ -1512,6 +1512,30 @@ def test_aggregate_with_to_int_conversion(coll) -> None:
     assert out == [{"_id": None, "total": 60}]
 
 
+def test_aggregate_to_int_overflow_via_pymongo(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"v": 3_000_000_000.0})  # > int32 max
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"n": {"$toInt": "$v"}}}]))
+    assert exc.value.code == 241
+
+    # $convert with onError catches the overflow instead of erroring.
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "n": {"$convert": {"input": "$v", "to": "int", "onError": -1}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"n": -1}]
+
+
 def test_create_index_listed_via_pymongo(coll) -> None:
     coll.insert_one({"x": 1})
     coll.create_index("x")
