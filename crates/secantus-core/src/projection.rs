@@ -95,41 +95,54 @@ fn as_slice_int(v: &Bson) -> Option<i64> {
     }
 }
 
+/// A valid projection `$slice` argument (mongod): a number, or a `[skip, limit]`
+/// pair with a positive numeric limit. Returns `Some((skip, limit))` for the pair
+/// form, `Some((n, i64::MIN))` sentinel for the scalar form, else `None` (Python
+/// raises 28667 / 28724). The scalar sentinel keeps the two forms distinguishable.
+fn slice_bounds(slice_arg: &Bson) -> Option<(i64, i64)> {
+    if let Some(n) = as_slice_int(slice_arg) {
+        return Some((n, i64::MIN));
+    }
+    if let Bson::Array(args) = slice_arg {
+        if args.len() == 2 {
+            if let (Some(skip), Some(limit)) = (as_slice_int(&args[0]), as_slice_int(&args[1])) {
+                if limit > 0 {
+                    return Some((skip, limit));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn apply_slice(value: Bson, slice_arg: &Bson) -> R<Bson> {
+    // Validate the argument shape up front (mongod parse-time) so an invalid
+    // $slice on a non-array field also defers to Python.
+    let Some((first, limit)) = slice_bounds(slice_arg) else {
+        return Err(Fallback);
+    };
     let Bson::Array(a) = &value else {
         return Ok(value); // non-array passes through unchanged
     };
     let len = a.len() as i64;
-    if let Some(n) = as_slice_int(slice_arg) {
-        let out = if n >= 0 {
-            a[..n.min(len).max(0) as usize].to_vec()
+    if limit == i64::MIN {
+        // Scalar form: first / last `first` elements.
+        let out = if first >= 0 {
+            a[..first.min(len).max(0) as usize].to_vec()
         } else {
-            a[(len + n).max(0) as usize..].to_vec()
+            a[(len + first).max(0) as usize..].to_vec()
         };
         return Ok(Bson::Array(out));
     }
-    if let Bson::Array(args) = slice_arg {
-        if args.len() == 2 {
-            let (Some(raw_skip), Some(limit)) = (as_slice_int(&args[0]), as_slice_int(&args[1]))
-            else {
-                return Err(Fallback);
-            };
-            let skip = if raw_skip < 0 {
-                (len + raw_skip).max(0)
-            } else {
-                raw_skip.min(len)
-            };
-            let tail = &a[skip as usize..];
-            let tlen = tail.len() as i64;
-            let out = if limit >= 0 {
-                tail[..limit.min(tlen).max(0) as usize].to_vec()
-            } else {
-                tail[(tlen + limit).max(0) as usize..].to_vec()
-            };
-            return Ok(Bson::Array(out));
-        }
-    }
-    Err(Fallback) // unrecognised $slice argument shape -> Python
+    // [skip, limit] with a positive limit.
+    let skip = if first < 0 {
+        (len + first).max(0)
+    } else {
+        first.min(len)
+    };
+    let tail = &a[skip as usize..];
+    let out = tail[..(limit as usize).min(tail.len())].to_vec();
+    Ok(Bson::Array(out))
 }
 
 /// Build the per-element predicate a positional `arr.$` projects against, from the

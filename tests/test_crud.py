@@ -540,6 +540,21 @@ def test_projection_dotted_inclusion(coll) -> None:
     assert doc == {"addr": {"city": "Dublin"}}
 
 
+def test_projection_slice_validation_via_pymongo(coll) -> None:
+    """Projection $slice: a non-number scalar / empty / bad array is 28667, a
+    2/3-element array that isn't [skip, positive-limit] is 28724. A valid $slice
+    still reshapes the array. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": [1, 2, 3, 4, 5]})
+    for sl, code in [("x", 28667), ([], 28667), ([1, -2], 28724), ([1, 2, 3], 28724)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find({}, {"a": {"$slice": sl}}))
+        assert exc.value.code == code, sl
+    assert coll.find_one({}, {"_id": 0, "a": {"$slice": 2}})["a"] == [1, 2]
+    assert coll.find_one({}, {"_id": 0, "a": {"$slice": [1, 2]}})["a"] == [2, 3]
+
+
 def test_projection_meta_textscore_without_text_is_40218(coll) -> None:
     from pymongo.errors import OperationFailure
 

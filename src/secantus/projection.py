@@ -191,6 +191,65 @@ def _is_slice_spec(value: Any) -> bool:
     return isinstance(value, Mapping) and len(value) == 1 and "$slice" in value
 
 
+def _slice_type_name(v: Any) -> str:
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, int):
+        return "int" if -(2**31) <= v < 2**31 else "long"
+    if isinstance(v, float):
+        return "double"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, Mapping):
+        return "object"
+    if isinstance(v, (list, tuple)):
+        return "array"
+    if v is None:
+        return "null"
+    return type(v).__name__
+
+
+def _validate_slice_arg(slice_arg: Any) -> None:
+    """mongod's projection ``$slice`` validation. Valid forms are a number
+    (first / last n) or ``[skip, limit]`` with a positive numeric limit. Any
+    other shape is evaluated as the aggregation ``$slice`` *expression*, which
+    errors: a scalar or an array of fewer than 2 / more than 3 elements is
+    ``Location28667`` (wrong argument count); a 2- or 3-element array whose first
+    element isn't an array is ``Location28724``."""
+    if isinstance(slice_arg, (int, float)) and not isinstance(slice_arg, bool):
+        return
+    if isinstance(slice_arg, (list, tuple)):
+        n = len(slice_arg)
+        if n == 2:
+            skip, limit = slice_arg
+            numeric = (
+                isinstance(skip, (int, float))
+                and not isinstance(skip, bool)
+                and isinstance(limit, (int, float))
+                and not isinstance(limit, bool)
+            )
+            if numeric and limit > 0:
+                return
+        if n < 2 or n > 3:
+            raise ProjectionError(
+                f"Expression $slice takes at least 2 arguments, and at most 3, but {n} "
+                "were passed in.",
+                code=28667,
+                code_name="Location28667",
+            )
+        raise ProjectionError(
+            "First argument to $slice must be an array, but is of type: "
+            f"{_slice_type_name(slice_arg[0])}",
+            code=28724,
+            code_name="Location28724",
+        )
+    raise ProjectionError(
+        "Expression $slice takes at least 2 arguments, and at most 3, but 1 were passed in.",
+        code=28667,
+        code_name="Location28667",
+    )
+
+
 def _apply_slice(arr: Any, slice_arg: Any) -> Any:
     """Apply a ``$slice`` projection operator argument to an array value.
 
@@ -276,6 +335,7 @@ def apply_projection(
     spec_main: dict[str, Any] = {}
     for k, v in spec.items():
         if _is_slice_spec(v):
+            _validate_slice_arg(v["$slice"])
             slice_specs[k] = v["$slice"]
         elif _is_positional_key(k):
             positional_specs[k] = v

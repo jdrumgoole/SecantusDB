@@ -66,8 +66,9 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   FIXED (#496, → 51108 / 2); `$elemMatch` non-doc (query) + `$not` invalid arg
   FIXED (#497, → 2); `$all` non-array + mixed/non-`$elemMatch` `$`-doc FIXED (#499,
   → 2). Remaining: `$elemMatch` non-doc in *projection* (proj→31274). (query.py)
-- **Projection `$slice`**: bool/string → mongod 28667; `[bad,limit]`/3-elem/`[skip,
-  neg-limit]` → mongod 28724; SecantusDB silently returns full/wrong array. (projection.py)
+- ~~**Projection `$slice`**~~ **FIXED (#506):** non-number scalar / short / long
+  array → 28667; 2/3-elem array not `[skip, positive-limit]` → 28724. Both engines
+  (Rust core defers). (projection.py)
 - **`$type` validation**: unknown alias / fractional code / bool / bad code silently
   no-match (mongod: unknown-alias 2, bad-code 2 [special code-0 msg], bool 14); Rust
   also rejects valid whole-double codes. Valid alias set = 22 incl. deprecated; valid
