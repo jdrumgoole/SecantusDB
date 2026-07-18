@@ -4743,6 +4743,29 @@ def test_bits_numeric_arg_validation(coll) -> None:
         assert exc.value.code == code, query
 
 
+def test_array_operators_reject_non_array_via_pymongo(coll) -> None:
+    """$first/$last (28689), $reverseArray (34435), $concatArrays (28664),
+    $slice (28724), $map (16883), $filter (28651), $reduce (40080) reject a
+    non-array input; a null / missing input yields null. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$first": 5}, 28689),
+        ({"$reverseArray": 5}, 34435),
+        ({"$concatArrays": [[1], 5]}, 28664),
+        ({"$slice": [5, 2]}, 28724),
+        ({"$map": {"input": 5, "in": "$$this"}}, 16883),
+        ({"$filter": {"input": 5, "cond": True}}, 28651),
+        ({"$reduce": {"input": 5, "initialValue": 0, "in": "$$value"}}, 40080),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+    out = list(coll.aggregate([{"$project": {"_id": 0, "n": {"$first": "$gone"}}}]))
+    assert out == [{"n": None}]
+
+
 def test_concat_type_validation_via_pymongo(coll) -> None:
     """$concat: a non-string operand is 16702; a null / missing operand yields
     null. mongod 7.0.12-verified."""

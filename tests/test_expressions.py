@@ -305,6 +305,28 @@ def test_concat_arrays() -> None:
     assert out == [1, 2, 3, 4, 5]
 
 
+def test_array_operators_reject_non_array_input() -> None:
+    # mongod codes for a non-array (non-null) input to each array operator.
+    for expr, code in [
+        ({"$first": 5}, 28689),
+        ({"$last": "x"}, 28689),
+        ({"$reverseArray": 5}, 34435),
+        ({"$concatArrays": [[1], 5]}, 28664),
+        ({"$slice": [5, 2]}, 28724),
+        ({"$map": {"input": 5, "in": "$$this"}}, 16883),
+        ({"$filter": {"input": 5, "cond": True}}, 28651),
+        ({"$reduce": {"input": 5, "initialValue": 0, "in": "$$value"}}, 40080),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    # A null / missing input yields null (no error) for each.
+    assert evaluate({"$first": None}, {}) is None
+    assert evaluate({"$reverseArray": "$gone"}, {}) is None
+    assert evaluate({"$map": {"input": None, "in": "$$this"}}, {}) is None
+    assert evaluate({"$concatArrays": [[1], None]}, {}) is None
+
+
 def test_in_operator_in_expressions() -> None:
     assert evaluate({"$in": ["b", ["a", "b", "c"]]}, {}) is True
     assert evaluate({"$in": ["x", ["a", "b", "c"]]}, {}) is False

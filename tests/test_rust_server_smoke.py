@@ -1742,3 +1742,27 @@ def test_concat_type_validation(tmp_path) -> None:
         assert out == [{"ok": "ab", "n": None}]
     finally:
         srv.stop()
+
+
+def test_array_operators_reject_non_array(tmp_path) -> None:
+    """The Rust server rejects a non-array input to the array operators (defer ->
+    BadValue) instead of silently yielding null; a null / missing input still
+    yields null."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        for expr in (
+            {"$first": 5},
+            {"$reverseArray": 5},
+            {"$concatArrays": [[1], 5]},
+            {"$map": {"input": 5, "in": "$$this"}},
+            {"$filter": {"input": 5, "cond": True}},
+            {"$reduce": {"input": 5, "initialValue": 0, "in": "$$value"}},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        out = list(coll.aggregate([{"$project": {"_id": 0, "n": {"$first": "$gone"}}}]))
+        assert out == [{"n": None}]
+    finally:
+        srv.stop()

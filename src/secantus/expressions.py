@@ -2081,13 +2081,28 @@ def _op_array_elem_at(arg: Any, ctx: _Ctx) -> Any:
     return None
 
 
+def _reject_non_array(v: Any, message: str, code: int) -> None:
+    """mongod's 'input must be an array' guard for the array operators. A null /
+    missing value is the caller's concern (returns null); a non-array, non-null
+    value raises the operator's specific Location error instead of silently
+    yielding null."""
+    if v is not None and not isinstance(v, list):
+        raise ExpressionError(message, code=code, code_name=f"Location{code}")
+
+
 def _op_first(arg: Any, ctx: _Ctx) -> Any:
     arr = _eval(arg, ctx)
+    _reject_non_array(
+        arr, f"$first's argument must be an array, but is {_bson_type_name(arr)}", 28689
+    )
     return arr[0] if isinstance(arr, list) and arr else None
 
 
 def _op_last(arg: Any, ctx: _Ctx) -> Any:
     arr = _eval(arg, ctx)
+    _reject_non_array(
+        arr, f"$last's argument must be an array, but is {_bson_type_name(arr)}", 28689
+    )
     return arr[-1] if isinstance(arr, list) and arr else None
 
 
@@ -2194,6 +2209,9 @@ def _op_slice(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, list) or len(arg) not in (2, 3):
         raise ExpressionError("$slice requires [array, n] or [array, position, n]")
     arr = _eval(arg[0], ctx)
+    _reject_non_array(
+        arr, f"First argument to $slice must be an array, but is {_bson_type_name(arr)}", 28724
+    )
     if not isinstance(arr, list):
         return None
     if len(arg) == 2:
@@ -2247,17 +2265,23 @@ def _op_slice(arg: Any, ctx: _Ctx) -> Any:
 
 
 def _op_concat_arrays(arg: Any, ctx: _Ctx) -> Any:
-    parts = [_eval(a, ctx) for a in arg]
     out: list[Any] = []
-    for p in parts:
-        if not isinstance(p, list):
-            return None
+    for a in arg:
+        p = _eval(a, ctx)
+        if p is None:
+            return None  # a null / missing operand -> null result
+        _reject_non_array(p, f"$concatArrays only supports arrays, not {_bson_type_name(p)}", 28664)
         out.extend(p)
     return out
 
 
 def _op_reverse_array(arg: Any, ctx: _Ctx) -> Any:
     arr = _eval(arg, ctx)
+    _reject_non_array(
+        arr,
+        f"The argument to $reverseArray must be an array, but was of type: {_bson_type_name(arr)}",
+        34435,
+    )
     return list(reversed(arr)) if isinstance(arr, list) else None
 
 
@@ -2508,6 +2532,7 @@ def _op_filter(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$filter requires a document spec")
     arr = _eval(arg.get("input"), ctx)
+    _reject_non_array(arr, f"input to $filter must be an array not {_bson_type_name(arr)}", 28651)
     if not isinstance(arr, list):
         return None
     var_name = arg.get("as", "this")
@@ -2527,6 +2552,7 @@ def _op_map(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$map requires a document spec")
     arr = _eval(arg.get("input"), ctx)
+    _reject_non_array(arr, f"input to $map must be an array not {_bson_type_name(arr)}", 16883)
     if not isinstance(arr, list):
         return None
     var_name = arg.get("as", "this")
@@ -2538,6 +2564,9 @@ def _op_reduce(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$reduce requires a document spec")
     arr = _eval(arg.get("input"), ctx)
+    _reject_non_array(
+        arr, f"$reduce requires that 'input' be an array, found: {_nelem_render(arr)}", 40080
+    )
     if not isinstance(arr, list):
         return None
     accumulator = _eval(arg.get("initialValue"), ctx)

@@ -917,12 +917,15 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
 
 fn op_first_last(arg: &Bson, ctx: &Ctx, first: bool) -> R {
     match eval(arg, ctx)? {
-        Bson::Array(a) if !a.is_empty() => Ok(if first {
+        Bson::Null => Ok(Bson::Null),
+        Bson::Array(a) => Ok(if a.is_empty() {
+            Bson::Null
+        } else if first {
             a[0].clone()
         } else {
             a[a.len() - 1].clone()
         }),
-        _ => Ok(Bson::Null),
+        _ => Err(Fallback), // non-array -> Python raises 28689
     }
 }
 
@@ -1001,7 +1004,8 @@ fn op_concat_arrays(arg: &Bson, ctx: &Ctx) -> R {
     for p in parts {
         match eval(p, ctx)? {
             Bson::Array(a) => out.extend(a),
-            _ => return Ok(Bson::Null), // any non-array part -> null
+            Bson::Null => return Ok(Bson::Null), // null operand -> null result
+            _ => return Err(Fallback),           // non-array -> Python raises 28664
         }
     }
     Ok(Bson::Array(out))
@@ -1009,11 +1013,12 @@ fn op_concat_arrays(arg: &Bson, ctx: &Ctx) -> R {
 
 fn op_reverse_array(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
         Bson::Array(mut a) => {
             a.reverse();
             Ok(Bson::Array(a))
         }
-        _ => Ok(Bson::Null),
+        _ => Err(Fallback), // non-array -> Python raises 34435
     }
 }
 
@@ -1098,8 +1103,10 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     if a.len() != 2 && a.len() != 3 {
         return Err(Fallback);
     }
-    let Bson::Array(arr) = eval(&a[0], ctx)? else {
-        return Ok(Bson::Null); // non-array input -> null
+    let arr = match eval(&a[0], ctx)? {
+        Bson::Array(v) => v,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array input -> Python raises 28724
     };
     let len = arr.len() as i64;
     let (start, stop) = if a.len() == 2 {
@@ -1599,8 +1606,10 @@ fn op_map(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
-    let Bson::Array(arr) = eval_opt(d.get("input"), ctx)? else {
-        return Ok(Bson::Null); // non-array input -> null
+    let arr = match eval_opt(d.get("input"), ctx)? {
+        Bson::Array(a) => a,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array input -> Python raises 16883
     };
     let var = as_var_name(d.get("as"))?;
     let null = Bson::Null;
@@ -1616,8 +1625,10 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
-    let Bson::Array(arr) = eval_opt(d.get("input"), ctx)? else {
-        return Ok(Bson::Null);
+    let arr = match eval_opt(d.get("input"), ctx)? {
+        Bson::Array(a) => a,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array input -> Python raises 28651
     };
     let var = as_var_name(d.get("as"))?;
     let null = Bson::Null;
@@ -1645,8 +1656,10 @@ fn op_reduce(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
-    let Bson::Array(arr) = eval_opt(d.get("input"), ctx)? else {
-        return Ok(Bson::Null);
+    let arr = match eval_opt(d.get("input"), ctx)? {
+        Bson::Array(a) => a,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array input -> Python raises 40080
     };
     let mut acc = eval_opt(d.get("initialValue"), ctx)?;
     let null = Bson::Null;
