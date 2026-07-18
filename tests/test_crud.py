@@ -4361,6 +4361,10 @@ def test_aggregation_whole_double_index_accepted(coll) -> None:
         ({"$slice": [[1, 2, 3, 4], 2.7]}, 28726),
         ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, 28728),
         ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 40096),
+        ({"$substrCP": ["hello", 1.7, 2]}, 34451),
+        ({"$range": [0, 5.7]}, 34446),
+        ({"$round": [3.14159, 2.7]}, 51082),
+        ({"$trunc": [3.14159, 2.7]}, 51082),
     ]:
         with pytest.raises(OperationFailure) as exc:
             list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))

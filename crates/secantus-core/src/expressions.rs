@@ -1267,7 +1267,11 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
     if matches!(start_v, Bson::Boolean(_)) || matches!(length_v, Bson::Boolean(_)) {
         return Err(Fallback); // Python raises 34450 / 34452
     }
-    let (Some(start), Some(length)) = (slice_int(&start_v), slice_int(&length_v)) else {
+    // Whole-number double coerces to int; fractional (34451/34453) and
+    // non-numeric both defer to the Python oracle.
+    let (IdxCoerce::Int(start), IdxCoerce::Int(length)) =
+        (coerce_index(&start_v), coerce_index(&length_v))
+    else {
         return Err(Fallback);
     };
     let chars: Vec<char> = s.chars().collect();
@@ -3131,6 +3135,8 @@ fn round_trunc_args(arg: &Bson, ctx: &Ctx) -> Result<(Bson, i32), Fallback> {
                     Bson::Boolean(_) => return Err(Fallback), // Python raises 16004
                     Bson::Int32(i) => i,
                     Bson::Int64(i) => i as i32,
+                    Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => d as i32,
+                    Bson::Double(_) => return Err(Fallback), // fractional -> Python raises 51082
                     _ => 0,
                 }
             } else {
@@ -3531,10 +3537,10 @@ fn op_replace(arg: &Bson, ctx: &Ctx, all: bool) -> R {
 const MAX_RANGE_SIZE: i128 = 100_000;
 
 fn range_int(b: &Bson) -> Result<i64, Fallback> {
-    // Python requires int and not bool.
-    match b {
-        Bson::Int32(n) => Ok(*n as i64),
-        Bson::Int64(n) => Ok(*n),
+    // int or whole-number double is the value; bool / fractional double /
+    // non-number all defer to the Python oracle (which raises 34443-34448).
+    match coerce_index(b) {
+        IdxCoerce::Int(i) => Ok(i),
         _ => Err(Fallback),
     }
 }

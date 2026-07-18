@@ -1193,10 +1193,17 @@ def test_aggregation_whole_double_index_accepted(tmp_path) -> None:
             coll.aggregate([{"$project": {"r": {"$slice": [[1, 2, 3, 4], 1.0, 2.0]}, "_id": 0}}])
         )
         assert got == [{"r": [2, 3]}]
+        # whole-double computes on the Rust server too (parity with Python).
+        assert list(
+            coll.aggregate([{"$project": {"r": {"$range": [0.0, 5.0, 1.0]}, "_id": 0}}])
+        ) == [{"r": [0, 1, 2, 3, 4]}]
         for expr in (
             {"$arrayElemAt": [[10, 20, 30], 2.7]},
             {"$slice": [[1, 2, 3, 4], 2.7]},
             {"$indexOfArray": [[1, 2, 3], 2, 0.7]},
+            {"$substrCP": ["hello", 1.7, 2]},
+            {"$range": [0, 5.7]},
+            {"$round": [3.14159, 2.7]},
         ):
             with pytest.raises(pymongo.errors.OperationFailure):
                 list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))

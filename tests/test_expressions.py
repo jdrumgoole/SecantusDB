@@ -1145,6 +1145,10 @@ def test_whole_number_double_index_accepted_fractional_rejected() -> None:
     assert evaluate({"$slice": [[1, 2, 3, 4], 2.0]}, {}, None) == [1, 2]
     assert evaluate({"$slice": [[1, 2, 3, 4], 1.0, 2.0]}, {}, None) == [2, 3]
     assert evaluate({"$indexOfArray": [[1, 2, 3], 2, 0.0]}, {}, None) == 1
+    assert evaluate({"$substrCP": ["hello", 1.0, 2]}, {}, None) == "el"
+    assert evaluate({"$range": [0.0, 5.0, 1.0]}, {}, None) == [0, 1, 2, 3, 4]
+    assert evaluate({"$round": [3.14159, 2.0]}, {}, None) == 3.14
+    assert evaluate({"$trunc": [3.14159, 2.0]}, {}, None) == 3.14
 
     for expr, code in [
         ({"$arrayElemAt": [[10, 20, 30], 2.7]}, 28691),
@@ -1153,6 +1157,13 @@ def test_whole_number_double_index_accepted_fractional_rejected() -> None:
         ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, 28728),
         ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 40096),
         ({"$indexOfArray": [[1, 2, 3], 2, 0, 0.7]}, 40096),
+        ({"$substrCP": ["hello", 1.7, 2]}, 34451),
+        ({"$substrCP": ["hello", 1, 1.7]}, 34453),
+        ({"$range": [0.7, 5]}, 34444),
+        ({"$range": [0, 5.7]}, 34446),
+        ({"$range": [0, 5, 1.7]}, 34448),
+        ({"$round": [3.14159, 2.7]}, 51082),
+        ({"$trunc": [3.14159, 2.7]}, 51082),
     ]:
         with pytest.raises(ExpressionError) as exc:
             evaluate(expr, {}, None)
