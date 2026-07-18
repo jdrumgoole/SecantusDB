@@ -1210,3 +1210,16 @@ def test_substr_negative_index_rejected() -> None:
         assert exc.value.code == code, expr
     # $substrBytes negative length still means "to the end".
     assert evaluate({"$substrBytes": ["abcde", 1, -1]}, {}, None) == "bcde"
+
+
+def test_substr_bytes_truncates_double_index() -> None:
+    # Unlike $substrCP, mongod's $substrBytes accepts any double and truncates
+    # toward zero (then the usual negative-start / to-end rules apply).
+    assert evaluate({"$substrBytes": ["abcde", 1.7, 2]}, {}, None) == "bc"
+    assert evaluate({"$substrBytes": ["abcde", 0.9, 3]}, {}, None) == "abc"
+    assert evaluate({"$substrBytes": ["abcde", 1, 2.9]}, {}, None) == "bc"
+    assert evaluate({"$substrBytes": ["abcde", 1, -1.7]}, {}, None) == "bcde"
+    # A truncated-negative start is still rejected (−1.7 → −1 → 50752).
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$substrBytes": ["abcde", -1.7, 2]}, {}, None)
+    assert exc.value.code == 50752

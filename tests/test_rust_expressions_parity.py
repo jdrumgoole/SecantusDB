@@ -862,6 +862,12 @@ CURATED = [
     ({"$substrBytes": ["abcde", 1, -1]}, {}),
     ({"$substrCP": ["abcde", -1, 2]}, {}),
     ({"$substrCP": ["abcde", 1, -1]}, {}),
+    # $substrBytes truncates a double toward zero -- both engines compute equally.
+    ({"$substrBytes": ["abcde", 1.7, 2]}, {}),
+    ({"$substrBytes": ["abcde", 0.9, 3]}, {}),
+    ({"$substrBytes": ["abcde", 1, 2.9]}, {}),
+    ({"$substrBytes": ["abcde", 1, -1.7]}, {}),
+    ({"$substrBytes": ["abcde", -1.7, 2]}, {}),
 ]
 
 

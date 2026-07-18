@@ -1503,6 +1503,14 @@ def _op_substr_bytes(arg: Any, ctx: _Ctx) -> Any:
             "$substrBytes:  length must be a numeric type (is BSON type bool)",
             code=16035,
         )
+    # Unlike $substrCP (which rejects a fractional double), mongod's $substrBytes
+    # accepts any double and truncates toward zero (1.7 -> 1, -1.7 -> -1, then the
+    # negative-start check below rejects it). Non-finite falls through to the
+    # generic type error.
+    if isinstance(start, float) and math.isfinite(start):
+        start = int(start)
+    if isinstance(length, float) and math.isfinite(length):
+        length = int(length)
     if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
         raise ExpressionError("$substrBytes requires string + ints")
     encoded = s.encode("utf-8")
