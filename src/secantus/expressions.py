@@ -2208,6 +2208,11 @@ def _safe_int_from_str(value: str, op_name: str) -> int:
         raise ExpressionError(f"{op_name} cannot convert {value!r}") from exc
 
 
+_INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
+_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
+_OVERFLOW_MSG = "Conversion would overflow target type in $convert"
+
+
 def _op_to_int(arg: Any, ctx: _Ctx) -> Any:
     value = _eval(arg, ctx)
     if value is None:
@@ -2215,14 +2220,21 @@ def _op_to_int(arg: Any, ctx: _Ctx) -> Any:
     if isinstance(value, bool):
         return 1 if value else 0
     if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, Decimal128):
-        return int(value.to_decimal())
-    if isinstance(value, str):
-        return _safe_int_from_str(value, "$toInt")
-    raise ExpressionError(f"$toInt cannot convert {type(value).__name__}")
+        result = int(value)  # strip Int64 -> plain int (int32 on the wire)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ExpressionError(_OVERFLOW_MSG, code=241)
+        result = int(value)  # truncates toward zero
+    elif isinstance(value, Decimal128):
+        result = int(value.to_decimal())
+    elif isinstance(value, str):
+        result = _safe_int_from_str(value, "$toInt")
+    else:
+        raise ExpressionError(f"$toInt cannot convert {type(value).__name__}")
+    # mongod: an int32 target must fit [-2^31, 2^31-1], else overflow (241).
+    if not _INT32_MIN <= result <= _INT32_MAX:
+        raise ExpressionError(_OVERFLOW_MSG, code=241)
+    return result
 
 
 def _op_to_double(arg: Any, ctx: _Ctx) -> Any:
@@ -2327,6 +2339,10 @@ def _convert_value(value: Any, target: Any) -> Any:
         # preserves the int32/int64 distinction by type, and ``$convert``
         # must respect the requested target type.
         def _wrap(n: int) -> int:
+            # int32 (16) / int64 (18) targets range-check like mongod (241).
+            lo, hi = (_INT64_MIN, _INT64_MAX) if code == 18 else (_INT32_MIN, _INT32_MAX)
+            if not lo <= n <= hi:
+                raise ExpressionError(_OVERFLOW_MSG, code=241)
             return Int64(n) if code == 18 else int(n)
 
         if isinstance(value, bool):
@@ -2334,6 +2350,8 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, int):
             return _wrap(int(value))
         if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ExpressionError(_OVERFLOW_MSG, code=241)
             return _wrap(int(value))
         if isinstance(value, Decimal128):
             return _wrap(int(value.to_decimal()))
@@ -2370,6 +2388,10 @@ def _op_convert(arg: Any, ctx: _Ctx) -> Any:
     except (ValueError, TypeError, InvalidOperation, ExpressionError) as exc:
         if "onError" in arg:
             return _eval(arg["onError"], ctx)
+        # Preserve the overflow code (mongod 241); other failures stay the
+        # generic $convert error.
+        if isinstance(exc, ExpressionError) and exc.code == 241:
+            raise
         raise ExpressionError(f"$convert failed: {exc}") from exc
 
 

@@ -27,6 +27,7 @@ import pytest
 
 _server = pytest.importorskip("_secantus_server")
 pymongo = pytest.importorskip("pymongo")
+bson = pytest.importorskip("bson")
 
 
 def _client(srv):
@@ -1416,5 +1417,40 @@ def test_bucket_validation_no_data_loss(tmp_path) -> None:
         ):
             with pytest.raises(pymongo.errors.OperationFailure):
                 list(coll.aggregate([{"$bucket": spec}]))
+    finally:
+        srv.stop()
+
+
+def test_to_int_convert_overflow(tmp_path) -> None:
+    """The Rust server rejects an int32/int64 overflow in $toInt / $convert
+    (defer -> BadValue) and downcasts an in-range long to int32; $convert
+    onError still catches the overflow."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "big": 3_000_000_000.0, "small": bson.Int64(5)})
+        with pytest.raises(pymongo.errors.OperationFailure):
+            list(coll.aggregate([{"$project": {"n": {"$toInt": "$big"}}}]))
+        with pytest.raises(pymongo.errors.OperationFailure):
+            list(
+                coll.aggregate([{"$project": {"n": {"$convert": {"input": "$big", "to": "int"}}}}])
+            )
+        # in-range long -> int32
+        r = list(coll.aggregate([{"$project": {"_id": 0, "n": {"$toInt": "$small"}}}]))
+        assert r == [{"n": 5}]
+        # onError catches the overflow
+        r = list(
+            coll.aggregate(
+                [
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "n": {"$convert": {"input": "$big", "to": "int", "onError": -1}},
+                        }
+                    }
+                ]
+            )
+        )
+        assert r == [{"n": -1}]
     finally:
         srv.stop()

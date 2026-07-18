@@ -20,7 +20,12 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 - ~~**`$rename` data corruption**~~ **FIXED (#485):** rejects array-element source/
   dest, same-field, same-path, empty target (56), and non-string target — no more
   silent corruption / AttributeError leak. Both engines.
-- ~~**`$bucket` silent data loss**~~ **FIXED (#486):** out-of-range value with no
+- ~~**`$toInt`/`$convert` int32/int64 overflow**~~ **FIXED (#488):** `$toInt` /
+  `$convert` (int/long) error on out-of-range / non-finite (241, `onError`-caught)
+  instead of returning an unbounded / silently-widened int; `$toInt` narrows int64
+  input to int32 like mongod. Both engines. (`$toLong` is still unimplemented — a
+  separate missing-operator item, see Tier 2.)
+- ~~**`$bucket` silent data loss**~~ **FIXED (#487):** out-of-range value with no
   default now errors (7158303) instead of dropping the doc; full spec validation
   added (40192-40200). Both engines. (The `$bucketAuto` / unsorted-etc. Tier-2
   `$bucket` rows below are also covered.)
@@ -30,8 +35,6 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   `false`/`0`/`null` are falsy) → wrong results. **Verified.** (query.py / .rs)
 - **`$group` accumulator coerces string→number** (`$sum: "$s"` with string `s` →
   numeric; mongod ignores non-numeric → 0). (aggregate.py)
-- **`$toInt`/`$toLong`/`$convert` no int32/int64 overflow bounds** (`$toInt: 1e30` →
-  unbounded Python int; mongod ERR 241 / `onError`). **Verified.** (expressions)
 - **Uncaught Python exceptions leak (`code=None`)** — surface as generic errors, not
   mongod's BadValue: `$pow:[2,"x"]` (TypeError), `$pow:[0,-1]` (ZeroDivisionError),
   `$abs`/`$ceil`/`$floor`/`$sqrt`/`$exp` on string (TypeError), `$split` empty-sep

@@ -340,8 +340,12 @@ CURATED = [
     ({"$toInt": 3.9}, {}),
     ({"$toInt": "$n"}, {"n": -3.9}),
     ({"$toInt": True}, {}),
-    ({"$toInt": "$n"}, {"n": Int64(5)}),  # int64 returned unchanged
+    ({"$toInt": "$n"}, {"n": Int64(5)}),  # int64 -> int32 (mongod always yields int)
     ({"$toInt": "$x"}, {}),  # missing -> null
+    ({"$toInt": 3e9}, {}),  # > int32 max -> overflow (both defer)
+    ({"$toInt": "$n"}, {"n": Int64(2**40)}),  # int64 > int32 -> overflow
+    ({"$toInt": 2147483647.0}, {}),  # int32 max exactly -> ok
+    ({"$toInt": float("inf")}, {}),  # non-finite -> overflow (both defer)
     ({"$toDouble": 5}, {}),
     ({"$toDouble": False}, {}),
     ({"$toDouble": "$n"}, {"n": Int64(7)}),
@@ -379,6 +383,9 @@ CURATED = [
     ({"$convert": {"input": True, "to": "int"}}, {}),
     ({"$convert": {"input": 7.9, "to": "int"}}, {}),  # truncates
     ({"$convert": {"input": 5, "to": "long"}}, {}),  # -> Int64
+    ({"$convert": {"input": 3e9, "to": "int"}}, {}),  # > int32 -> overflow (defer)
+    ({"$convert": {"input": 9.3e18, "to": "long"}}, {}),  # > int64 -> overflow (defer)
+    ({"$convert": {"input": 1e30, "to": "int", "onError": "oops"}}, {}),  # overflow -> onError
     ({"$convert": {"input": "1234.5678", "to": "decimal"}}, {}),
     ({"$convert": {"input": 5, "to": "decimal"}}, {}),
     ({"$convert": {"input": 4.125, "to": "decimal"}}, {}),

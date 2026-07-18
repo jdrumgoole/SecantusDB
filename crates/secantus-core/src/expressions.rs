@@ -2659,25 +2659,29 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
 // --- type conversions ---------------------------------------------------
 
 fn op_to_int(arg: &Bson, ctx: &Ctx) -> R {
-    match eval(arg, ctx)? {
-        Bson::Null => Ok(Bson::Null),
-        // Python returns an already-int value unchanged (preserving int32 vs
-        // int64), rather than re-widening.
-        v @ (Bson::Int32(_) | Bson::Int64(_)) => Ok(v),
-        Bson::Boolean(b) => Ok(Bson::Int32(i32::from(b))),
+    // $toInt targets int32: an int64 or a double outside [i32::MIN, i32::MAX]
+    // overflows (Python raises 241). Non-finite / Decimal128 / string -> Python.
+    let n: i64 = match eval(arg, ctx)? {
+        Bson::Null => return Ok(Bson::Null),
+        Bson::Int32(v) => v as i64,
+        Bson::Int64(v) => v,
+        Bson::Boolean(b) => i64::from(b),
         Bson::Double(d) => {
             if !d.is_finite() {
-                return Err(Fallback); // Python int(nan/inf) raises
-            }
-            let t = d.trunc();
-            if t < i64::MIN as f64 || t > i64::MAX as f64 {
                 return Err(Fallback);
             }
-            int_to_bson(t as i128).ok_or(Fallback)
+            let t = d.trunc();
+            if t < i32::MIN as f64 || t > i32::MAX as f64 {
+                return Err(Fallback);
+            }
+            t as i64
         }
-        // Decimal128 / string parsing -> Python (edge-case-prone).
-        _ => Err(Fallback),
+        _ => return Err(Fallback),
+    };
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&n) {
+        return Err(Fallback); // overflow int32 -> Python raises 241
     }
+    Ok(Bson::Int32(n as i32))
 }
 
 fn op_to_double(arg: &Bson, ctx: &Ctx) -> R {
@@ -2852,17 +2856,20 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
 }
 
 fn wrap_int(n: i128, code: i32) -> Conv {
-    if code == 18 {
-        if (i64::MIN as i128..=i64::MAX as i128).contains(&n) {
-            Conv::Ok(Bson::Int64(n as i64))
-        } else {
-            Conv::Failed
-        }
+    // int (16) targets int32, long (18) targets int64; out of range overflows
+    // (Python raises 241 -> onError, else "$convert failed").
+    let (lo, hi) = if code == 18 {
+        (i64::MIN as i128, i64::MAX as i128)
     } else {
-        match int_to_bson(n) {
-            Some(v) => Conv::Ok(v),
-            None => Conv::Failed,
-        }
+        (i32::MIN as i128, i32::MAX as i128)
+    };
+    if !(lo..=hi).contains(&n) {
+        return Conv::Failed;
+    }
+    if code == 18 {
+        Conv::Ok(Bson::Int64(n as i64))
+    } else {
+        Conv::Ok(Bson::Int32(n as i32))
     }
 }
 
