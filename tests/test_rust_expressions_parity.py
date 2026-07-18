@@ -796,6 +796,22 @@ CURATED = [
     # Null still propagates BEFORE type checks (both engines return null).
     ({"$multiply": [None, "$s"]}, {"s": "nope"}),
     ({"$add": [None, True]}, {}),
+    # bool where an int is expected: mongod rejects (bool is not a number),
+    # Python raises the exact code, Rust must defer (a Rust VALUE = divergence).
+    ({"$round": [1.5, True]}, {}),
+    ({"$trunc": [1.5, True]}, {}),
+    ({"$arrayElemAt": [[10, 20, 30], True]}, {}),
+    ({"$slice": [[1, 2, 3, 4], True]}, {}),
+    ({"$slice": [[1, 2, 3, 4], True, 2]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 1, True]}, {}),
+    ({"$sortArray": {"input": [3, 1, 2], "sortBy": True}}, {}),
+    ({"$substrCP": ["hello", True, 2]}, {}),
+    ({"$substrCP": ["hello", 1, True]}, {}),
+    ({"$range": [0, True]}, {}),
+    ({"$range": [True, 5]}, {}),
+    ({"$range": [0, 5, True]}, {}),
+    ({"$indexOfArray": [[1, 2, 3], 2, True]}, {}),
+    ({"$indexOfArray": [[1, 2, 3], 2, 0, True]}, {}),
 ]
 
 

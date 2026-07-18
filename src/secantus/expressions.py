@@ -415,6 +415,8 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
         place = 0
     if n is None:
         return None
+    if isinstance(place, bool):
+        raise ExpressionError("can't convert from BSON type bool to long", code=16004)
     if not isinstance(place, int):
         place = 0
     return round(n, place)
@@ -597,6 +599,8 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
         place = 0
     if n is None:
         return None
+    if isinstance(place, bool):
+        raise ExpressionError("can't convert from BSON type bool to long", code=16004)
     if not isinstance(place, int):
         place = 0
     factor = 10**place
@@ -1353,6 +1357,16 @@ def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
     length = _eval(arg[2], ctx)
     if s is None:
         return ""
+    if isinstance(start, bool):
+        raise ExpressionError(
+            "$substrCP: starting index must be a numeric type (is BSON type bool)",
+            code=34450,
+        )
+    if isinstance(length, bool):
+        raise ExpressionError(
+            "$substrCP: length must be a numeric type (is BSON type bool)",
+            code=34452,
+        )
     if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
         raise ExpressionError("$substrCP requires string + ints")
     if length < 0:
@@ -1435,6 +1449,20 @@ def _op_index_of_array(arg: Any, ctx: _Ctx) -> Any:
     needle = _eval(arg[1], ctx)
     start = _eval(arg[2], ctx) if len(arg) >= 3 else 0
     end = _eval(arg[3], ctx) if len(arg) >= 4 else len(arr)
+    # mongod's message text is verbatim, including the missing space in
+    # "$indexOfArrayrequires" (a real mongod quirk) so a surrogate matches.
+    if isinstance(start, bool):
+        raise ExpressionError(
+            "$indexOfArrayrequires an integral starting index, found a value of "
+            f"type: bool, with value: {'true' if start else 'false'}",
+            code=40096,
+        )
+    if isinstance(end, bool):
+        raise ExpressionError(
+            "$indexOfArrayrequires an integral ending index, found a value of "
+            f"type: bool, with value: {'true' if end else 'false'}",
+            code=40096,
+        )
     if not isinstance(start, int) or not isinstance(end, int):
         return -1
     for i in range(max(0, start), min(len(arr), end)):
@@ -1468,7 +1496,24 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
     start = _eval(arg[0], ctx)
     end = _eval(arg[1], ctx)
     step = _eval(arg[2], ctx) if len(arg) == 3 else 1
-    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (start, end, step)):
+    # Per-arg bool rejection with mongod's exact codes/messages (the step
+    # message's "type:bool" missing space is verbatim from mongod).
+    if isinstance(start, bool):
+        raise ExpressionError(
+            "$range requires a numeric starting value, found value of type: bool",
+            code=34443,
+        )
+    if isinstance(end, bool):
+        raise ExpressionError(
+            "$range requires a numeric ending value, found value of type: bool",
+            code=34445,
+        )
+    if isinstance(step, bool):
+        raise ExpressionError(
+            "$range requires a numeric step value, found value of type:bool",
+            code=34447,
+        )
+    if not all(isinstance(v, int) for v in (start, end, step)):
         raise ExpressionError("$range requires integer arguments")
     if step == 0:
         raise ExpressionError("$range step cannot be zero")
@@ -1521,6 +1566,12 @@ def _op_sort_array(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arr, list):
         raise ExpressionError("$sortArray input must be an array")
     sort_by = arg["sortBy"]
+    if isinstance(sort_by, bool):
+        raise ExpressionError(
+            "The $sort is invalid: use 1/-1 to sort the whole element, or "
+            "{field:1/-1} to sort embedded fields",
+            code=2942507,
+        )
     if isinstance(sort_by, int):
         return sorted(arr, reverse=(sort_by == -1))
     if not isinstance(sort_by, Mapping):
@@ -1771,6 +1822,11 @@ def _op_array_elem_at(arg: Any, ctx: _Ctx) -> Any:
     arr_expr, idx_expr = arg
     arr = _eval(arr_expr, ctx)
     idx = _eval(idx_expr, ctx)
+    if isinstance(idx, bool):
+        raise ExpressionError(
+            "$arrayElemAt's second argument must be a numeric value, but is bool",
+            code=28690,
+        )
     if not isinstance(arr, list) or not isinstance(idx, int):
         return None
     if -len(arr) <= idx < len(arr):
@@ -1895,11 +1951,26 @@ def _op_slice(arg: Any, ctx: _Ctx) -> Any:
         return None
     if len(arg) == 2:
         n = _eval(arg[1], ctx)
+        if isinstance(n, bool):
+            raise ExpressionError(
+                "Second argument to $slice must be a numeric value, but is of type: bool",
+                code=28725,
+            )
         if not isinstance(n, int):
             return None
         return arr[:n] if n >= 0 else arr[n:]
     position = _eval(arg[1], ctx)
     n = _eval(arg[2], ctx)
+    if isinstance(position, bool):
+        raise ExpressionError(
+            "Second argument to $slice must be a numeric value, but is of type: bool",
+            code=28725,
+        )
+    if isinstance(n, bool):
+        raise ExpressionError(
+            "Third argument to $slice must be numeric, but is of type: bool",
+            code=28727,
+        )
     if not isinstance(position, int) or not isinstance(n, int):
         return None
     return arr[position : position + n]

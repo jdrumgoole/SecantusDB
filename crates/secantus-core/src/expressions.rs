@@ -894,6 +894,9 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     }
     let arr = eval(&pair[0], ctx)?;
     let idx = eval(&pair[1], ctx)?;
+    if matches!(idx, Bson::Boolean(_)) {
+        return Err(Fallback); // Python raises 28690
+    }
     let (Bson::Array(a), Some(i)) = (&arr, as_int_like(&idx)) else {
         return Ok(Bson::Null);
     };
@@ -1055,7 +1058,11 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     };
     let len = arr.len() as i64;
     let (start, stop) = if a.len() == 2 {
-        let Some(n) = slice_int(&eval(&a[1], ctx)?) else {
+        let n_v = eval(&a[1], ctx)?;
+        if matches!(n_v, Bson::Boolean(_)) {
+            return Err(Fallback); // Python raises 28725
+        }
+        let Some(n) = slice_int(&n_v) else {
             return Ok(Bson::Null);
         };
         if n >= 0 {
@@ -1064,8 +1071,12 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
             (n, len)
         }
     } else {
-        let (Some(pos), Some(n)) = (slice_int(&eval(&a[1], ctx)?), slice_int(&eval(&a[2], ctx)?))
-        else {
+        let pos_v = eval(&a[1], ctx)?;
+        let n_v = eval(&a[2], ctx)?;
+        if matches!(pos_v, Bson::Boolean(_)) || matches!(n_v, Bson::Boolean(_)) {
+            return Err(Fallback); // Python raises 28725 / 28727
+        }
+        let (Some(pos), Some(n)) = (slice_int(&pos_v), slice_int(&n_v)) else {
             return Ok(Bson::Null);
         };
         (pos, pos.saturating_add(n))
@@ -1095,7 +1106,11 @@ fn op_index_of_array(arg: &Bson, ctx: &Ctx) -> R {
     let needle = eval(&a[1], ctx)?;
     let len = arr.len() as i64;
     let start = if a.len() >= 3 {
-        match slice_int(&eval(&a[2], ctx)?) {
+        let sv = eval(&a[2], ctx)?;
+        if matches!(sv, Bson::Boolean(_)) {
+            return Err(Fallback); // Python raises 40096
+        }
+        match slice_int(&sv) {
             Some(x) => x,
             None => return Ok(Bson::Int32(-1)),
         }
@@ -1103,7 +1118,11 @@ fn op_index_of_array(arg: &Bson, ctx: &Ctx) -> R {
         0
     };
     let end = if a.len() >= 4 {
-        match slice_int(&eval(&a[3], ctx)?) {
+        let ev = eval(&a[3], ctx)?;
+        if matches!(ev, Bson::Boolean(_)) {
+            return Err(Fallback); // Python raises 40096
+        }
+        match slice_int(&ev) {
             Some(x) => x,
             None => return Ok(Bson::Int32(-1)),
         }
@@ -1200,9 +1219,12 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::String(s) = s else {
         return Err(Fallback);
     };
-    let (Some(start), Some(length)) =
-        (slice_int(&eval(&a[1], ctx)?), slice_int(&eval(&a[2], ctx)?))
-    else {
+    let start_v = eval(&a[1], ctx)?;
+    let length_v = eval(&a[2], ctx)?;
+    if matches!(start_v, Bson::Boolean(_)) || matches!(length_v, Bson::Boolean(_)) {
+        return Err(Fallback); // Python raises 34450 / 34452
+    }
+    let (Some(start), Some(length)) = (slice_int(&start_v), slice_int(&length_v)) else {
         return Err(Fallback);
     };
     let chars: Vec<char> = s.chars().collect();
@@ -3063,6 +3085,7 @@ fn round_trunc_args(arg: &Bson, ctx: &Ctx) -> Result<(Bson, i32), Fallback> {
             let n = eval(&a[0], ctx)?;
             let place = if a.len() > 1 {
                 match eval(&a[1], ctx)? {
+                    Bson::Boolean(_) => return Err(Fallback), // Python raises 16004
                     Bson::Int32(i) => i,
                     Bson::Int64(i) => i as i32,
                     _ => 0,
