@@ -405,6 +405,23 @@ def test_split() -> None:
     assert evaluate({"$split": ["abc", ","]}, {}) == ["abc"]
 
 
+def test_split_argument_validation() -> None:
+    # mongod codes: empty separator 40087, non-string first/second 40085/40086,
+    # wrong arg count 16020; a null string / separator -> null.
+    for expr, code in [
+        ({"$split": ["a,b", ""]}, 40087),
+        ({"$split": [5, ","]}, 40085),
+        ({"$split": ["a,b", 5]}, 40086),
+        ({"$split": ["a,b"]}, 16020),
+        ({"$split": ["a,b", ",", "x"]}, 16020),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    assert evaluate({"$split": [None, ","]}, {}) is None
+    assert evaluate({"$split": ["a,b", None]}, {}) is None
+
+
 def test_trim_default_whitespace() -> None:
     assert evaluate({"$trim": {"input": "  hi  "}}, {}) == "hi"
 

@@ -1598,3 +1598,32 @@ def test_all_argument_validation(tmp_path) -> None:
         assert [d["_id"] for d in coll.find({"a": {"$all": [{"$elemMatch": {"$gt": 2}}]}})] == [1]
     finally:
         srv.stop()
+
+
+def test_split_argument_validation(tmp_path) -> None:
+    """The Rust server rejects an invalid $split (empty separator, non-string
+    operand, wrong arg count) instead of leaking; valid $split still computes and
+    a null operand yields null."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        for expr in ({"$split": ["a,b", ""]}, {"$split": [5, ","]}, {"$split": ["a,b"]}):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        got = list(
+            coll.aggregate(
+                [
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "a": {"$split": ["a,b,c", ","]},
+                            "n": {"$split": [None, ","]},
+                        }
+                    }
+                ]
+            )
+        )
+        assert got == [{"a": ["a", "b", "c"], "n": None}]
+    finally:
+        srv.stop()
