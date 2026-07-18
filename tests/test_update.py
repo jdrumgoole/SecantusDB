@@ -389,3 +389,35 @@ def test_pop_position_slice_bit_reject_bool() -> None:
     assert apply_update({"a": [1, 2]}, {"$push": {"a": {"$each": [9], "$position": 1}}}) == {
         "a": [1, 9, 2]
     }
+
+
+def test_rename_validation_and_no_corruption() -> None:
+    """$rename validates its spec like mongod instead of silently corrupting the
+    document or leaking a raw exception. mongod 7.0.12-verified."""
+    import copy
+
+    base = {"_id": 1, "a": 5, "arr": [1, 2, 3], "b": 9}
+    # Valid renames still apply.
+    assert apply_update(copy.deepcopy(base), {"$rename": {"a": "z"}})["z"] == 5
+    assert apply_update(copy.deepcopy(base), {"$rename": {"a": "x.y"}})["x"] == {"y": 5}
+    assert "a" in apply_update(
+        copy.deepcopy(base), {"$rename": {"gone": "z"}}
+    )  # missing src: no-op
+    # Invalid specs raise (were silent corruption / an AttributeError leak).
+    for upd, code in [
+        ({"$rename": {"a": "a"}}, 2),  # same field
+        ({"$rename": {"arr.0": "x"}}, 2),  # source is an array element (was corruption)
+        ({"$rename": {"a": "arr.0"}}, 2),  # dest is an array element
+        ({"$rename": {"a": "a.b"}}, 2),  # same path
+        ({"$rename": {"a": ""}}, 56),  # empty target
+        ({"$rename": {"a": 5}}, 2),  # non-string target (was AttributeError leak)
+        ({"$rename": {"a": True}}, 2),
+    ]:
+        with pytest.raises(UpdateError) as exc:
+            apply_update(copy.deepcopy(base), upd)
+        assert exc.value.code == code, upd
+    # The document is untouched when the update is rejected.
+    d = copy.deepcopy(base)
+    with pytest.raises(UpdateError):
+        apply_update(d, {"$rename": {"arr.0": "x"}})
+    assert d["arr"] == [1, 2, 3]

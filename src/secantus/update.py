@@ -440,6 +440,31 @@ def _expand(
     return _expand_path(doc, path, array_filters, positional_matches)
 
 
+def _rename_same_path(a: str, b: str) -> bool:
+    """True if two dotted `$rename` paths are equal or one is an ancestor of the
+    other (mongod: source and target must not be on the same path)."""
+    ap, bp = a.split("."), b.split(".")
+    n = min(len(ap), len(bp))
+    return ap[:n] == bp[:n]
+
+
+def _rename_traverses_array(doc: dict[str, Any], path: str) -> bool:
+    """True if the *literal* `path` indexes into an array with a numeric index
+    (e.g. `arr.0`) — the "array element" mongod forbids in a $rename source /
+    destination (it silently corrupted the array here). A positional token
+    (`$` / `$[]` / `$[id]`) into an array is NOT flagged: those are a SecantusDB
+    $rename extension resolved element-wise elsewhere."""
+    cur: Any = doc
+    for part in path.split("."):
+        if isinstance(cur, list):
+            return part.isdigit()
+        if isinstance(cur, Mapping) and part in cur:
+            cur = cur[part]
+        else:
+            return False
+    return False
+
+
 def _apply_op(
     doc: dict[str, Any],
     op: str,
@@ -600,6 +625,39 @@ def _apply_op(
                         arr.pop(0)
     elif op == "$rename":
         for old, new in payload.items():
+            # mongod validates the whole $rename spec before touching the doc —
+            # otherwise several of these silently corrupt data or leak a raw
+            # Python exception (e.g. a non-string target hit `new.split`).
+            if not isinstance(new, str):
+                tgt = "true" if new is True else "false" if new is False else str(new)
+                raise UpdateError(
+                    f"The 'to' field for $rename must be a string: {old}: {tgt}", code=2
+                )
+            if old == "" or new == "":
+                raise UpdateError("An empty update path is not valid.", code=56)
+            if old == new:
+                raise UpdateError(
+                    f'The source and target field for $rename must differ: {old}: "{new}"',
+                    code=2,
+                )
+            if _rename_same_path(old, new):
+                raise UpdateError(
+                    "The source and target field for $rename must not be on the same "
+                    f'path: {old}: "{new}"',
+                    code=2,
+                )
+            if _rename_traverses_array(doc, old):
+                raise UpdateError(
+                    f"The source field cannot be an array element, '{old}' in doc "
+                    f"with _id: {doc.get('_id')} has an array field",
+                    code=2,
+                )
+            if _rename_traverses_array(doc, new):
+                raise UpdateError(
+                    f"The destination field cannot be an array element, '{new}' in doc "
+                    f"with _id: {doc.get('_id')} has an array field",
+                    code=2,
+                )
             old_paths = _expand(doc, old, array_filters, positional_matches)
             new_paths = _expand(doc, new, array_filters, positional_matches)
             if len(old_paths) != len(new_paths):

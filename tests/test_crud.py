@@ -4512,3 +4512,25 @@ def test_gte_lte_null_and_exists_truthiness(coll) -> None:
     assert ids({"f": {"$exists": ""}}) == [1, 2]
     assert ids({"f": {"$exists": []}}) == [1, 2]
     assert ids({"f": {"$exists": 0}}) == [3]
+
+
+def test_rename_validation_no_corruption(coll) -> None:
+    """$rename rejects an array-element / same-field / empty / non-string spec
+    (was silent data corruption / a leaked exception) over the wire, and a valid
+    rename still applies. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 5, "arr": [1, 2, 3]})
+    for upd in (
+        {"$rename": {"a": "a"}},
+        {"$rename": {"arr.0": "x"}},
+        {"$rename": {"a": "arr.0"}},
+        {"$rename": {"a": ""}},
+        {"$rename": {"a": 5}},
+    ):
+        with pytest.raises(OperationFailure):
+            coll.update_one({"_id": 1}, upd)
+    assert coll.find_one({"_id": 1})["arr"] == [1, 2, 3]  # not corrupted
+    coll.update_one({"_id": 1}, {"$rename": {"a": "z"}})
+    doc = coll.find_one({"_id": 1})
+    assert doc.get("z") == 5 and "a" not in doc
