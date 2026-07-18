@@ -17,10 +17,9 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   `$eq: null` semantics, both engines.
 - ~~**`$exists` Python-truthiness**~~ **FIXED (#484):** uses mongod truthiness
   (empty string/array/doc truthy), both engines.
-- **`$rename` data corruption**: same-field (`{a:'a'}` → mongod ERR 2), array-element
-  source/dest (`{'arr.0':'b'}` corrupts `arr=[None,2,3]`; `{a:'arr.0'}` writes into
-  the array), empty target (ERR 56). SecantusDB silently corrupts. Non-string target
-  leaks `AttributeError: 'int' has no attribute 'split'`. (update.py)
+- ~~**`$rename` data corruption**~~ **FIXED (#485):** rejects array-element source/
+  dest, same-field, same-path, empty target (56), and non-string target — no more
+  silent corruption / AttributeError leak. Both engines.
 - **`$bucket` silent data loss**: `[0,3]` boundaries, no `default`, a doc out of
   range → mongod ERR 7158303; SecantusDB silently DROPS the doc. (aggregate.py)
 - **`$gte`/`$lte: null`** doesn't match null+missing (mongod matches, like `$eq:null`)

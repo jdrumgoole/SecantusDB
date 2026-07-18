@@ -101,6 +101,16 @@ CURATED = [
     ({"a": []}, {"$pop": {"a": 1}}, False),
     ({"a": 1}, {"$rename": {"a": "b"}}, False),
     ({"a": {"b": 1}}, {"$rename": {"a.b": "a.c"}}, False),
+    # $rename validation: valid renames compute on both engines; an array-element
+    # source/dest, same-field, same-path, empty, or non-string target raise on
+    # Python and defer on Rust (which the server renders as BadValue).
+    ({"a": 5, "arr": [1, 2, 3]}, {"$rename": {"a": "z"}}, False),
+    ({"a": 5, "arr": [1, 2, 3]}, {"$rename": {"arr.0": "x"}}, False),
+    ({"a": 5, "arr": [1, 2, 3]}, {"$rename": {"a": "arr.0"}}, False),
+    ({"a": 5}, {"$rename": {"a": "a"}}, False),
+    ({"a": 5}, {"$rename": {"a": "a.b"}}, False),
+    ({"a": 5}, {"$rename": {"a": ""}}, False),
+    ({"a": 5}, {"$rename": {"a": 5}}, False),
     ({"_id": 1, "a": 1, "b": 2}, {"x": 99}, False),
     ({"_id": 1, "n": 5}, {"$setOnInsert": {"created": True}}, False),
     ({}, {"$setOnInsert": {"created": True}}, True),

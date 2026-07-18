@@ -43,6 +43,44 @@ fn has_positional(path: &str) -> bool {
     path.split('.').any(is_positional_token)
 }
 
+/// Two dotted `$rename` paths are equal or one is an ancestor of the other
+/// (mongod: source and target must not be on the same path). Mirrors
+/// `update._rename_same_path`.
+fn rename_same_path(a: &str, b: &str) -> bool {
+    let ap: Vec<&str> = a.split('.').collect();
+    let bp: Vec<&str> = b.split('.').collect();
+    let n = ap.len().min(bp.len());
+    ap[..n] == bp[..n]
+}
+
+/// True if walking `path` against `doc` passes through an array element — mongod
+/// forbids a `$rename` source/destination from being an array element (this
+/// previously silently corrupted the array). Mirrors
+/// `update._rename_traverses_array`.
+fn rename_traverses_array(doc: &Document, path: &str) -> bool {
+    let mut parts = path.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(mut cur) = doc.get(first) else {
+        return false;
+    };
+    for part in parts {
+        match cur {
+            // Only a numeric index into an array is the forbidden "array
+            // element"; a positional token ($ / $[] / $[id]) is not (and is
+            // already deferred above via has_positional).
+            Bson::Array(_) => return !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()),
+            Bson::Document(d) => match d.get(part) {
+                Some(v) => cur = v,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
+}
+
 // --- positional / arrayFilters path expansion ---------------------------
 //
 // Mirrors `update._expand_path` / `_walk_positional` / `_index_array_filters` /
@@ -505,6 +543,18 @@ fn apply_op(
                 }
                 if old == "_id" || new == "_id" {
                     return Err(Fallback); // immutable _id -> Python raises
+                }
+                // mongod validation (Python raises 56 / 2; the Rust server renders
+                // BadValue). These previously silently corrupted the array or
+                // created a bad field.
+                if old.is_empty() || new.is_empty() {
+                    return Err(Fallback); // empty path -> Python raises 56
+                }
+                if old == new || rename_same_path(old, new) {
+                    return Err(Fallback); // differ / same path -> Python raises 2
+                }
+                if rename_traverses_array(result, old) || rename_traverses_array(result, new) {
+                    return Err(Fallback); // array element -> Python raises 2
                 }
                 if has_path(result, old) {
                     let value = get_path(result, old).unwrap().clone();
