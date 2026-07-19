@@ -215,6 +215,31 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # Two settings, both needed, that fix a cache that has never worked.
+          #
+          # THE KEY. setup-uv derives its key from the interpreter present at
+          # ITS step — the runner default (3.12.x) — not from UV_PYTHON, which
+          # this workflow sets later per matrix cell. So every job on an OS
+          # shared ONE key while installing for different interpreters. Python
+          # wheels are ABI-specific (numpy-cp310 != numpy-cp312), so whichever
+          # job saved first won the key and the rest restored a cache full of
+          # wheels they could not use: a "hit" that still re-downloads
+          # everything. Verified from CI logs — the 3.10 and 3.12 lanes printed
+          # byte-identical keys. cache-suffix splits them per interpreter.
+          #
+          # THE CONTENT. setup-uv also runs `uv cache prune --ci` before saving,
+          # which drops pre-built wheels on the theory they are cheap to
+          # re-fetch; that left ~2 MB cached and the whole dependency set
+          # re-downloaded each run. Measured locally, a full cache is worth it:
+          # a deps-only sync goes 23s cold -> 1.9s warm, and 0.36s from a cache
+          # that was tarred and restored (so it survives the round trip GitHub
+          # Actions puts it through).
+          #
+          # cache-python is deliberately NOT set: restoring uv's managed
+          # python-dir fails on NTFS (os error 267, see #524), and Windows takes
+          # its interpreter from the runner tool cache instead.
+          prune-cache: false
+          cache-suffix: py${{ matrix.python-version }}
           # Default ``cache-dependency-glob`` is ``**/uv.lock``; on
           # Windows the recursive walk trips over deep paths under
           # vendor/mongo-ruby-driver (EPERM at .evergreen/atlas).
@@ -462,6 +487,31 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # Two settings, both needed, that fix a cache that has never worked.
+          #
+          # THE KEY. setup-uv derives its key from the interpreter present at
+          # ITS step — the runner default (3.12.x) — not from UV_PYTHON, which
+          # this workflow sets later per matrix cell. So every job on an OS
+          # shared ONE key while installing for different interpreters. Python
+          # wheels are ABI-specific (numpy-cp310 != numpy-cp312), so whichever
+          # job saved first won the key and the rest restored a cache full of
+          # wheels they could not use: a "hit" that still re-downloads
+          # everything. Verified from CI logs — the 3.10 and 3.12 lanes printed
+          # byte-identical keys. cache-suffix splits them per interpreter.
+          #
+          # THE CONTENT. setup-uv also runs `uv cache prune --ci` before saving,
+          # which drops pre-built wheels on the theory they are cheap to
+          # re-fetch; that left ~2 MB cached and the whole dependency set
+          # re-downloaded each run. Measured locally, a full cache is worth it:
+          # a deps-only sync goes 23s cold -> 1.9s warm, and 0.36s from a cache
+          # that was tarred and restored (so it survives the round trip GitHub
+          # Actions puts it through).
+          #
+          # cache-python is deliberately NOT set: restoring uv's managed
+          # python-dir fails on NTFS (os error 267, see #524), and Windows takes
+          # its interpreter from the runner tool cache instead.
+          prune-cache: false
+          cache-suffix: py${{ matrix.python-version }}
           # Same narrow glob as the ``test`` job: one lock file at the repo
           # root, and the default recursive walk trips on deep vendor paths.
           cache-dependency-glob: uv.lock
@@ -684,6 +734,31 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # Two settings, both needed, that fix a cache that has never worked.
+          #
+          # THE KEY. setup-uv derives its key from the interpreter present at
+          # ITS step — the runner default (3.12.x) — not from UV_PYTHON, which
+          # this workflow sets later per matrix cell. So every job on an OS
+          # shared ONE key while installing for different interpreters. Python
+          # wheels are ABI-specific (numpy-cp310 != numpy-cp312), so whichever
+          # job saved first won the key and the rest restored a cache full of
+          # wheels they could not use: a "hit" that still re-downloads
+          # everything. Verified from CI logs — the 3.10 and 3.12 lanes printed
+          # byte-identical keys. cache-suffix splits them per interpreter.
+          #
+          # THE CONTENT. setup-uv also runs `uv cache prune --ci` before saving,
+          # which drops pre-built wheels on the theory they are cheap to
+          # re-fetch; that left ~2 MB cached and the whole dependency set
+          # re-downloaded each run. Measured locally, a full cache is worth it:
+          # a deps-only sync goes 23s cold -> 1.9s warm, and 0.36s from a cache
+          # that was tarred and restored (so it survives the round trip GitHub
+          # Actions puts it through).
+          #
+          # cache-python is deliberately NOT set: restoring uv's managed
+          # python-dir fails on NTFS (os error 267, see #524), and Windows takes
+          # its interpreter from the runner tool cache instead.
+          prune-cache: false
+          cache-suffix: py${{ matrix.python-version }}
           cache-dependency-glob: uv.lock
 
       # Windows uses actions/setup-python (the runner tool cache) rather than a
@@ -866,6 +941,31 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # Two settings, both needed, that fix a cache that has never worked.
+          #
+          # THE KEY. setup-uv derives its key from the interpreter present at
+          # ITS step — the runner default (3.12.x) — not from UV_PYTHON, which
+          # this workflow sets later per matrix cell. So every job on an OS
+          # shared ONE key while installing for different interpreters. Python
+          # wheels are ABI-specific (numpy-cp310 != numpy-cp312), so whichever
+          # job saved first won the key and the rest restored a cache full of
+          # wheels they could not use: a "hit" that still re-downloads
+          # everything. Verified from CI logs — the 3.10 and 3.12 lanes printed
+          # byte-identical keys. cache-suffix splits them per interpreter.
+          #
+          # THE CONTENT. setup-uv also runs `uv cache prune --ci` before saving,
+          # which drops pre-built wheels on the theory they are cheap to
+          # re-fetch; that left ~2 MB cached and the whole dependency set
+          # re-downloaded each run. Measured locally, a full cache is worth it:
+          # a deps-only sync goes 23s cold -> 1.9s warm, and 0.36s from a cache
+          # that was tarred and restored (so it survives the round trip GitHub
+          # Actions puts it through).
+          #
+          # cache-python is deliberately NOT set: restoring uv's managed
+          # python-dir fails on NTFS (os error 267, see #524), and Windows takes
+          # its interpreter from the runner tool cache instead.
+          prune-cache: false
+          cache-suffix: py3.12
           cache-dependency-glob: uv.lock
 
       # See the matrix jobs: Windows uses the runner tool cache (no NTFS
@@ -1006,6 +1106,31 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # Two settings, both needed, that fix a cache that has never worked.
+          #
+          # THE KEY. setup-uv derives its key from the interpreter present at
+          # ITS step — the runner default (3.12.x) — not from UV_PYTHON, which
+          # this workflow sets later per matrix cell. So every job on an OS
+          # shared ONE key while installing for different interpreters. Python
+          # wheels are ABI-specific (numpy-cp310 != numpy-cp312), so whichever
+          # job saved first won the key and the rest restored a cache full of
+          # wheels they could not use: a "hit" that still re-downloads
+          # everything. Verified from CI logs — the 3.10 and 3.12 lanes printed
+          # byte-identical keys. cache-suffix splits them per interpreter.
+          #
+          # THE CONTENT. setup-uv also runs `uv cache prune --ci` before saving,
+          # which drops pre-built wheels on the theory they are cheap to
+          # re-fetch; that left ~2 MB cached and the whole dependency set
+          # re-downloaded each run. Measured locally, a full cache is worth it:
+          # a deps-only sync goes 23s cold -> 1.9s warm, and 0.36s from a cache
+          # that was tarred and restored (so it survives the round trip GitHub
+          # Actions puts it through).
+          #
+          # cache-python is deliberately NOT set: restoring uv's managed
+          # python-dir fails on NTFS (os error 267, see #524), and Windows takes
+          # its interpreter from the runner tool cache instead.
+          prune-cache: false
+          cache-suffix: py3.12
           cache-dependency-glob: uv.lock
 
       # See the matrix jobs: Windows uses the runner tool cache (no NTFS
@@ -1198,6 +1323,31 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # Two settings, both needed, that fix a cache that has never worked.
+          #
+          # THE KEY. setup-uv derives its key from the interpreter present at
+          # ITS step — the runner default (3.12.x) — not from UV_PYTHON, which
+          # this workflow sets later per matrix cell. So every job on an OS
+          # shared ONE key while installing for different interpreters. Python
+          # wheels are ABI-specific (numpy-cp310 != numpy-cp312), so whichever
+          # job saved first won the key and the rest restored a cache full of
+          # wheels they could not use: a "hit" that still re-downloads
+          # everything. Verified from CI logs — the 3.10 and 3.12 lanes printed
+          # byte-identical keys. cache-suffix splits them per interpreter.
+          #
+          # THE CONTENT. setup-uv also runs `uv cache prune --ci` before saving,
+          # which drops pre-built wheels on the theory they are cheap to
+          # re-fetch; that left ~2 MB cached and the whole dependency set
+          # re-downloaded each run. Measured locally, a full cache is worth it:
+          # a deps-only sync goes 23s cold -> 1.9s warm, and 0.36s from a cache
+          # that was tarred and restored (so it survives the round trip GitHub
+          # Actions puts it through).
+          #
+          # cache-python is deliberately NOT set: restoring uv's managed
+          # python-dir fails on NTFS (os error 267, see #524), and Windows takes
+          # its interpreter from the runner tool cache instead.
+          prune-cache: false
+          cache-suffix: py3.12
           cache-dependency-glob: uv.lock
 
       # See the matrix jobs: Windows uses the runner tool cache (no NTFS
