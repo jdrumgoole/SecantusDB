@@ -1,0 +1,58 @@
+name: Docs
+
+# Builds both Sphinx trees with warnings-as-errors.
+#
+# This workflow exists because nothing else covers the docs. `test.yml` and the
+# two wheel workflows all carry `paths-ignore: ['**.md', 'LICENSE*', 'docs/**']`,
+# so a docs-only commit skips CI entirely by design — which is correct for the
+# test matrix and is exactly how the docs build came to be broken on `main`
+# without anyone noticing: eleven validation-report pages had been missing from
+# the toctree, and `sphinx-build -W` had been failing, through many green pushes.
+#
+# There is deliberately NO `paths` filter here. Filtering to `docs/**` would
+# reproduce the same class of blind spot in reverse: `docs/conf.py` runs autodoc
+# over `secantus.cli` / `cursors` / `server` / `storage`, so a malformed
+# docstring in a *code-only* commit can fail this build. Running unconditionally
+# is the only trigger that catches both directions, and it is affordable —
+# `invoke docs` is WT-free (`uv run --no-project` with the compiled `wiredtiger`
+# mocked via `autodoc_mock_imports`), so this job compiles nothing and needs no
+# submodule checkout. It is by far the cheapest workflow in the repo.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Per-ref lane, matching the other workflows. On `main` the run is allowed to
+# finish rather than being cancelled by the next merge, so every commit on the
+# default branch gets a real answer.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Least privilege: this job only checks out the repo and builds HTML.
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        # No submodules: the docs build never touches vendor/wiredtiger.
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Build the main docs tree (-W)
+        # ./inv runs `uv run --no-sync --with invoke`, which works in a checkout
+        # that was never built — the whole point of the wrapper.
+        run: ./inv docs --clean
+
+      - name: Build the Rust-server docs tree (-W)
+        # Separate pure-markdown tree under docs-rust/; no autodoc, no import.
+        run: ./inv docs-rust --clean
