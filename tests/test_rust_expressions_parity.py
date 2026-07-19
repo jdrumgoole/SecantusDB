@@ -435,6 +435,7 @@ CURATED = [
     ({"$toDate": "$n"}, {"n": Int64(1700000000000)}),  # int64 millis -> defer
     ({"$toDate": "$s"}, {"s": "2026-04-28T12:00:00"}),  # ISO string -> defer
     ({"$toDate": "$o"}, {"o": ObjectId("507f1f77bcf86cd799439011")}),  # objectId -> defer
+    ({"$toDate": True}, {}),  # bool -> defer (Python raises 241)
     # $regexMatch / $regexFind / $regexFindAll — ASCII patterns (byte offset ==
     # code-point idx), simple captures. The linear `regex` crate's leftmost-first
     # semantics align with Python `re` here.

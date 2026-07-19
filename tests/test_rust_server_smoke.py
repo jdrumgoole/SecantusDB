@@ -1811,3 +1811,18 @@ def test_index_of_start_end_validation(tmp_path) -> None:
         assert list(coll.aggregate([{"$project": proj}])) == [{"i": 4}]
     finally:
         srv.stop()
+
+
+def test_to_date_rejects_bool(tmp_path) -> None:
+    """The Rust server rejects $toDate on a bool (defer -> BadValue) instead of
+    coercing it to a date; $convert onError still catches it."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1})
+        with pytest.raises(pymongo.errors.OperationFailure):
+            list(coll.aggregate([{"$project": {"r": {"$toDate": True}, "_id": 0}}]))
+        proj = {"_id": 0, "r": {"$convert": {"input": True, "to": "date", "onError": "x"}}}
+        assert list(coll.aggregate([{"$project": proj}])) == [{"r": "x"}]
+    finally:
+        srv.stop()

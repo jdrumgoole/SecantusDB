@@ -1078,6 +1078,18 @@ def test_to_date_null_is_null() -> None:
     assert evaluate({"$toDate": None}, {}) is None
 
 
+def test_to_date_rejects_bool() -> None:
+    # mongod: bool -> date is ConversionFailure (241), not an int coercion. The
+    # same holds through $convert (whose onError still catches it).
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$toDate": True}, {})
+    assert exc.value.code == 241
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$convert": {"input": True, "to": "date"}}, {})
+    assert exc.value.code == 241
+    assert evaluate({"$convert": {"input": True, "to": "date", "onError": "x"}}, {}) == "x"
+
+
 def test_trig_basic() -> None:
     assert evaluate({"$sin": 0}, {}) == 0.0
     assert evaluate({"$cos": 0}, {}) == 1.0

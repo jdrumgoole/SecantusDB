@@ -2481,6 +2481,13 @@ def _convert_value(value: Any, target: Any) -> Any:
             return len(value) > 0
         return True
     elif code == 9:
+        # mongod rejects bool -> date (no int coercion): ConversionFailure (241).
+        if isinstance(value, bool):
+            raise ExpressionError(
+                "Unsupported conversion from bool to date in $convert with no onError value",
+                code=241,
+                code_name="ConversionFailure",
+            )
         if isinstance(value, _dt.datetime):
             return value
         if isinstance(value, str):
@@ -2575,6 +2582,9 @@ def _op_to_date(arg: Any, ctx: _Ctx) -> Any:
     try:
         return _convert_value(value, "date")
     except (ValueError, TypeError, InvalidOperation, ExpressionError) as exc:
+        # Preserve mongod's ConversionFailure code (241, e.g. bool -> date).
+        if isinstance(exc, ExpressionError) and exc.code == 241:
+            raise
         raise ExpressionError(f"$toDate cannot convert {type(value).__name__}") from exc
 
 

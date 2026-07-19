@@ -2850,6 +2850,9 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
         // builds a *tz-aware* datetime for the numeric path, which wouldn't
         // compare equal to a bson-decoded naive datetime, so we defer it.
         9 => match value {
+            // bool -> date is a *supported-but-failed* conversion (mongod 241), so
+            // `$convert`'s onError applies; without onError, Python raises 241.
+            Bson::Boolean(_) => Conv::Failed,
             Bson::DateTime(_) => Conv::Ok(value.clone()),
             // int / long / double: milliseconds since the Unix epoch -> date.
             Bson::Int32(n) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*n as i64))),
