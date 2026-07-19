@@ -255,6 +255,22 @@ CURATED = [
             }
         }
     ],
+    # $bucketAuto granularity — preferred-number rounding (Rust computes natively)
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "R5"}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "R20"}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 3, "granularity": "E6"}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "1-2-5"}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "POWERSOF2"}}],
+    [
+        {
+            "$bucketAuto": {
+                "groupBy": "$a",
+                "buckets": 2,
+                "granularity": "R10",
+                "output": {"n": {"$sum": 1}, "mx": {"$max": "$a"}},
+            }
+        }
+    ],
     # $redact — descend, pruning a nested sub-doc by content ($$PRUNE/$$DESCEND).
     [{"$redact": {"$cond": {"if": {"$eq": ["$k", 9]}, "then": "$$PRUNE", "else": "$$DESCEND"}}}],
     [{"$redact": "$$KEEP"}],
@@ -847,6 +863,89 @@ def test_curated_parity(pipeline):
     assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
 
 
+_GRANULARITIES = [
+    "R5",
+    "R10",
+    "R20",
+    "R40",
+    "R80",
+    "1-2-5",
+    "E6",
+    "E12",
+    "E24",
+    "E48",
+    "E96",
+    "E192",
+    "POWERSOF2",
+]
+
+
+def test_bucket_auto_granularity_fuzz():
+    """Rust $bucketAuto granularity must equal pure-Python bit-for-bit (Python is
+    itself pinned hex-exact to mongod 7.0.12 in test_crud). Broad random corpus
+    over every series, bucket count, and decade scale."""
+    rng = random.Random(0xB0CCE7)
+    handled = 0
+    for _ in range(400):
+        gran = rng.choice(_GRANULARITIES)
+        n = rng.randint(1, 40)
+        scale = rng.choice([0.001, 0.1, 1, 4, 10, 100, 1000])
+        vals = sorted(round(rng.uniform(0.5, 19) * scale, 6) for _ in range(n))
+        docs = [
+            {"_id": i, "a": (int(v) if rng.random() < 0.2 and v == int(v) else v)}
+            for i, v in enumerate(vals)
+        ]
+        nb = rng.randint(1, 8)
+        pipeline = [{"$bucketAuto": {"groupBy": "$a", "buckets": nb, "granularity": gran}}]
+        docs_b = bson.decode(bson.encode({"d": docs}))["d"]
+        pipeline_b = bson.decode(bson.encode({"p": pipeline}))["p"]
+        rust = _rust_pipeline(docs_b, pipeline_b)
+        assert rust is not None, f"Rust must handle granularity {gran}: {docs}"
+        py = _pure.apply_pipeline(docs_b, pipeline_b, _PipelineContext())
+        assert rust == py, f"gran={gran} rust={rust} pure={py} docs={docs} b={nb}"
+        handled += 1
+    assert handled == 400
+
+
+@pytest.mark.parametrize(
+    "values,code",
+    [
+        ([-5.0, 1.0, 2.0], 40260),  # negative -> non-negative only
+        ([1.0, 2.0, "x"], 40258),  # non-numeric value
+        ([float("nan"), 1.0], 40259),  # NaN
+        ([None, 1.0, 2.0], 40258),  # null is non-numeric
+        ([bson.Decimal128("1.5"), bson.Decimal128("2.5")], 2),  # Decimal128 deferral
+    ],
+)
+def test_bucket_auto_granularity_value_defers_and_raises(values, code):
+    docs = [{"_id": i, "a": v} for i, v in enumerate(values)]
+    pipeline = [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "R5"}}]
+    docs_b = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline_b = bson.decode(bson.encode({"p": pipeline}))["p"]
+    assert _rust_pipeline(docs_b, pipeline_b) is None  # Rust defers
+    with pytest.raises(Exception) as exc:
+        _pure.apply_pipeline(docs_b, pipeline_b, _PipelineContext())
+    assert getattr(exc.value, "code", None) == code
+
+
+@pytest.mark.parametrize(
+    "granularity,code",
+    [
+        ("R7", 40257),  # unknown series
+        (5, 40261),  # non-string granularity
+    ],
+)
+def test_bucket_auto_granularity_name_defers_and_raises(granularity, code):
+    docs = [{"_id": 1, "a": 1.0}, {"_id": 2, "a": 2.0}]
+    pipeline = [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": granularity}}]
+    docs_b = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline_b = bson.decode(bson.encode({"p": pipeline}))["p"]
+    assert _rust_pipeline(docs_b, pipeline_b) is None  # Rust defers
+    with pytest.raises(Exception) as exc:
+        _pure.apply_pipeline(docs_b, pipeline_b, _PipelineContext())
+    assert getattr(exc.value, "code", None) == code
+
+
 @pytest.mark.parametrize(
     "spec,code",
     [
@@ -997,24 +1096,6 @@ def test_bucket_auto_invalid_defers_and_raises(spec, code):
     # Invalid $bucketAuto buckets: Rust defers (None), pure engine raises the code.
     docs = bson.decode(bson.encode({"d": [{"_id": i, "v": i} for i in range(6)]}))["d"]
     pipeline = bson.decode(bson.encode({"p": [{"$bucketAuto": spec}]}))["p"]
-    assert _rust_pipeline(docs, pipeline) is None
-    with pytest.raises(_pure.AggregateError) as exc:
-        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
-    assert exc.value.code == code
-
-
-@pytest.mark.parametrize(
-    "gran,code",
-    [(5, 40261), ("BOGUS", 40257), ("R5", 2), ("POWERSOF2", 2)],
-)
-def test_bucket_auto_granularity_defers_and_raises(gran, code):
-    # $bucketAuto with any `granularity`: Rust defers (None) so the pure engine
-    # raises — a non-string (40261) / unknown (40257) code, or the unsupported
-    # error (2) for a valid-but-unimplemented series.
-    docs = bson.decode(bson.encode({"d": [{"_id": i, "v": i} for i in range(6)]}))["d"]
-    pipeline = bson.decode(
-        bson.encode({"p": [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}]})
-    )["p"]
     assert _rust_pipeline(docs, pipeline) is None
     with pytest.raises(_pure.AggregateError) as exc:
         _pure.apply_pipeline(docs, pipeline, _PipelineContext())

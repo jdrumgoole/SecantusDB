@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from bson import Int64
+from bson import Decimal128, Int64
 
 from secantus.aggregate import AggregateError, apply_pipeline
 
@@ -549,9 +549,7 @@ def test_bucket_auto_buckets_validation_codes() -> None:
 
 
 def test_bucket_auto_granularity_validation() -> None:
-    # mongod: a non-string granularity -> 40261, an unknown one -> 40257. A
-    # *valid* series (rounding unimplemented) is rejected as unsupported (code 2)
-    # rather than silently producing unrounded boundaries.
+    # mongod: a non-string granularity -> 40261, an unknown one -> 40257.
     docs = [{"v": i} for i in range(6)]
     for gran, code in [(5, 40261), (True, 40261), ("BOGUS", 40257), ("r5", 40257)]:
         with pytest.raises(AggregateError) as exc:
@@ -560,13 +558,53 @@ def test_bucket_auto_granularity_validation() -> None:
                 [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}],
             )
         assert exc.value.code == code, gran
-    for gran in ("R5", "POWERSOF2", "1-2-5", "E12"):
+
+
+def test_bucket_auto_granularity_value_errors() -> None:
+    # mongod: a granularity groupBy value must be a non-negative number: a
+    # non-numeric value -> 40258, a NaN -> 40259, a negative number -> 40260.
+    for values, code in [
+        ([-5.0, 1.0, 2.0], 40260),
+        ([1.0, 2.0, "x"], 40258),
+        ([None, 1.0, 2.0], 40258),
+        ([float("nan"), 1.0, 2.0], 40259),
+    ]:
         with pytest.raises(AggregateError) as exc:
             apply_pipeline(
-                [dict(d) for d in docs],
-                [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}],
+                [{"v": v} for v in values],
+                [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}],
             )
-        assert exc.value.code == 2, gran
+        assert exc.value.code == code, values
+
+
+def test_bucket_auto_granularity_boundaries() -> None:
+    # Preferred-number rounding: first bucket min = roundDown(dataMin), every
+    # other boundary = roundUp(chunkMax). Exact f64s verified against mongod
+    # 7.0.12 (note the non-standard ULP 6.300000000000001 = 63 * 0.1).
+    def bounds(values, n, gran):
+        out = apply_pipeline(
+            [{"v": v} for v in values],
+            [{"$bucketAuto": {"groupBy": "$v", "buckets": n, "granularity": gran}}],
+        )
+        return [(b["_id"]["min"], b["_id"]["max"], b["count"]) for b in out]
+
+    assert bounds([1, 2, 3, 4, 5, 6, 7, 8], 2, "R5") == [
+        (0.63, 6.300000000000001, 6),
+        (6.300000000000001, 10.0, 2),
+    ]
+    assert bounds([1, 2, 3, 4, 5, 6, 7, 8], 2, "POWERSOF2") == [
+        (0.5, 8.0, 7),
+        (8.0, 16.0, 1),
+    ]
+    assert bounds([1, 10, 100, 1000], 2, "1-2-5") == [(0.5, 20.0, 2), (20.0, 2000.0, 2)]
+    assert bounds([3, 7, 15, 44, 90], 2, "E6") == [(2.2, 22.0, 3), (22.0, 100.0, 2)]
+    # Decimal128 boundaries are deferred (the standing precision deferral).
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline(
+            [{"v": Decimal128("1.5")}, {"v": Decimal128("2.5")}],
+            [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}],
+        )
+    assert exc.value.code == 2
 
 
 def test_lookup_requires_storage_context() -> None:

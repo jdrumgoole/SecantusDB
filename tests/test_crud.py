@@ -939,9 +939,8 @@ def test_bucket_auto_validation_via_pymongo(coll) -> None:
     # A whole-double buckets is accepted.
     out = list(coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2.0}}]))
     assert len(out) == 2
-    # granularity: non-string -> 40261, unknown -> 40257; a valid series is
-    # rejected as unsupported (rounding unimplemented) rather than silently wrong.
-    for gran, code in [(5, 40261), ("BOGUS", 40257), ("R5", 2)]:
+    # granularity name validation: non-string -> 40261, unknown -> 40257.
+    for gran, code in [(5, 40261), ("BOGUS", 40257)]:
         with pytest.raises(OperationFailure) as exc:
             list(
                 coll.aggregate(
@@ -949,6 +948,44 @@ def test_bucket_auto_validation_via_pymongo(coll) -> None:
                 )
             )
         assert exc.value.code == code, gran
+
+
+def test_bucket_auto_granularity_via_pymongo(coll) -> None:
+    """$bucketAuto `granularity` preferred-number rounding over the wire: exact
+    boundaries (incl. mongod's non-standard ULP 63*0.1 = 6.300000000000001) and
+    the value-error codes. Boundaries verified hex-exact against mongod 7.0.12."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i, "v": i + 1} for i in range(8)])  # v = 1..8
+    out = list(
+        coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}])
+    )
+    assert [(b["_id"]["min"], b["_id"]["max"], b["count"]) for b in out] == [
+        (0.63, 6.300000000000001, 6),
+        (6.300000000000001, 10.0, 2),
+    ]
+    out = list(
+        coll.aggregate(
+            [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "POWERSOF2"}}]
+        )
+    )
+    assert [(b["_id"]["min"], b["_id"]["max"]) for b in out] == [(0.5, 8.0), (8.0, 16.0)]
+
+    # value must be a non-negative number: non-numeric 40258, NaN 40259, negative 40260
+    for values, code in [
+        ([-1.0, 2.0, 3.0], 40260),
+        ([1.0, 2.0, "s"], 40258),
+        ([float("nan"), 1.0], 40259),
+    ]:
+        coll.delete_many({})
+        coll.insert_many([{"_id": i, "v": v} for i, v in enumerate(values)])
+        with pytest.raises(OperationFailure) as exc:
+            list(
+                coll.aggregate(
+                    [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}]
+                )
+            )
+        assert exc.value.code == code, values
 
 
 def test_projection_elem_match_non_document_via_pymongo(coll) -> None:

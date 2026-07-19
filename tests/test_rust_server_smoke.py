@@ -1480,9 +1480,10 @@ def test_bucket_auto_elem_match_pull_validation(tmp_path) -> None:
                 list(coll.aggregate([{"$bucketAuto": spec}]))
         # A whole-double buckets is accepted.
         assert len(list(coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2.0}}]))) == 2
-        # Any `granularity` errors (defer -> BadValue): invalid names and a valid
-        # series (rounding unimplemented) alike, rather than silently unrounded.
-        for gran in (5, "BOGUS", "R5"):
+        # An invalid `granularity` name errors (defer -> BadValue): a non-string or
+        # an unknown series. A valid series now computes (see the dedicated
+        # test_bucket_auto_granularity_against_rust_server).
+        for gran in (5, "BOGUS"):
             with pytest.raises(pymongo.errors.OperationFailure):
                 list(
                     coll.aggregate(
@@ -2172,5 +2173,41 @@ def test_unwind_validation(tmp_path) -> None:
             with pytest.raises(pymongo.errors.OperationFailure):
                 list(coll.aggregate([{"$unwind": spec}]))
         assert len(list(coll.aggregate([{"$unwind": "$a"}]))) == 3
+    finally:
+        srv.stop()
+
+
+def test_bucket_auto_granularity_against_rust_server(tmp_path) -> None:
+    """$bucketAuto `granularity` preferred-number rounding on the Rust server:
+    exact boundaries (incl. mongod's ULP 63*0.1 = 6.300000000000001) and the
+    non-negative-number value errors (40258/40259/40260)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": i, "v": i + 1} for i in range(8)])  # v = 1..8
+        out = list(
+            coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}])
+        )
+        assert [(b["_id"]["min"], b["_id"]["max"], b["count"]) for b in out] == [
+            (0.63, 6.300000000000001, 6),
+            (6.300000000000001, 10.0, 2),
+        ]
+        out = list(
+            coll.aggregate(
+                [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "POWERSOF2"}}]
+            )
+        )
+        assert [(b["_id"]["min"], b["_id"]["max"]) for b in out] == [(0.5, 8.0), (8.0, 16.0)]
+
+        # negative value -> error (the Rust server renders BadValue; correctness =
+        # it rejects rather than computing a wrong boundary).
+        coll.delete_many({})
+        coll.insert_many([{"_id": 0, "v": -1.0}, {"_id": 1, "v": 2.0}])
+        with pytest.raises(pymongo.errors.OperationFailure):
+            list(
+                coll.aggregate(
+                    [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}]
+                )
+            )
     finally:
         srv.stop()

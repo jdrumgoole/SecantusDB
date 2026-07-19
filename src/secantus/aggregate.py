@@ -2382,14 +2382,605 @@ _BUCKET_AUTO_GRANULARITIES = frozenset(
 )
 
 
+# The preferred-number series mongod rounds $bucketAuto boundaries to. Stored
+# exactly as mongod stores them (integer-valued doubles, e.g. R5 = {10,16,25,
+# 40,63}, NOT normalised `0.63`-style literals) so that `series_element *
+# multiplier` reproduces mongod's non-standard ULPs bit-for-bit — verified
+# hex-exact against real mongod 7.0.12. See `granularity_rounder_preferred_numbers.cpp`.
+_BUCKET_AUTO_SERIES: dict[str, list[float]] = {
+    "R5": [10, 16, 25, 40, 63],
+    "R10": [100, 125, 160, 200, 250, 315, 400, 500, 630, 800],
+    "R20": [
+        100,
+        112,
+        125,
+        140,
+        160,
+        180,
+        200,
+        224,
+        250,
+        280,
+        315,
+        355,
+        400,
+        450,
+        500,
+        560,
+        630,
+        710,
+        800,
+        900,
+    ],
+    "R40": [
+        100,
+        106,
+        112,
+        118,
+        125,
+        132,
+        140,
+        150,
+        160,
+        170,
+        180,
+        190,
+        200,
+        212,
+        224,
+        236,
+        250,
+        265,
+        280,
+        300,
+        315,
+        355,
+        375,
+        400,
+        425,
+        450,
+        475,
+        500,
+        530,
+        560,
+        600,
+        630,
+        670,
+        710,
+        750,
+        800,
+        850,
+        900,
+        950,
+    ],
+    "R80": [
+        103,
+        109,
+        115,
+        122,
+        128,
+        136,
+        145,
+        155,
+        165,
+        175,
+        185,
+        195,
+        206,
+        218,
+        230,
+        243,
+        258,
+        272,
+        290,
+        307,
+        325,
+        345,
+        365,
+        387,
+        412,
+        437,
+        462,
+        487,
+        515,
+        545,
+        575,
+        615,
+        650,
+        690,
+        730,
+        775,
+        825,
+        875,
+        925,
+        975,
+    ],
+    "1-2-5": [10, 20, 50],
+    "E6": [10, 15, 22, 33, 47, 68],
+    "E12": [10, 12, 15, 18, 22, 27, 33, 39, 47, 56, 68, 82],
+    "E24": [
+        10,
+        11,
+        12,
+        13,
+        15,
+        16,
+        18,
+        20,
+        22,
+        24,
+        27,
+        30,
+        33,
+        36,
+        39,
+        43,
+        47,
+        51,
+        56,
+        62,
+        68,
+        75,
+        82,
+        91,
+    ],
+    "E48": [
+        100,
+        105,
+        110,
+        115,
+        121,
+        127,
+        133,
+        140,
+        147,
+        154,
+        162,
+        169,
+        178,
+        187,
+        196,
+        205,
+        215,
+        226,
+        237,
+        249,
+        261,
+        274,
+        287,
+        301,
+        316,
+        332,
+        348,
+        365,
+        383,
+        402,
+        422,
+        442,
+        464,
+        487,
+        511,
+        536,
+        562,
+        590,
+        619,
+        649,
+        681,
+        715,
+        750,
+        787,
+        825,
+        866,
+        909,
+        953,
+    ],
+    "E96": [
+        100,
+        102,
+        105,
+        107,
+        110,
+        113,
+        115,
+        118,
+        121,
+        124,
+        127,
+        130,
+        133,
+        137,
+        140,
+        143,
+        147,
+        150,
+        154,
+        158,
+        162,
+        165,
+        169,
+        174,
+        178,
+        182,
+        187,
+        191,
+        196,
+        200,
+        205,
+        210,
+        215,
+        221,
+        226,
+        232,
+        237,
+        243,
+        249,
+        255,
+        261,
+        267,
+        274,
+        280,
+        287,
+        294,
+        301,
+        309,
+        316,
+        324,
+        332,
+        340,
+        348,
+        357,
+        365,
+        374,
+        383,
+        392,
+        402,
+        412,
+        422,
+        432,
+        442,
+        453,
+        464,
+        475,
+        487,
+        499,
+        511,
+        523,
+        536,
+        549,
+        562,
+        576,
+        590,
+        604,
+        619,
+        634,
+        649,
+        665,
+        681,
+        698,
+        715,
+        732,
+        750,
+        768,
+        787,
+        806,
+        825,
+        845,
+        866,
+        887,
+        909,
+        931,
+        953,
+        976,
+    ],
+    "E192": [
+        100,
+        101,
+        102,
+        104,
+        105,
+        106,
+        107,
+        109,
+        110,
+        111,
+        113,
+        114,
+        115,
+        117,
+        118,
+        120,
+        121,
+        123,
+        124,
+        126,
+        127,
+        129,
+        130,
+        132,
+        133,
+        135,
+        137,
+        138,
+        140,
+        142,
+        143,
+        145,
+        147,
+        149,
+        150,
+        152,
+        154,
+        156,
+        158,
+        160,
+        162,
+        164,
+        165,
+        167,
+        169,
+        172,
+        174,
+        176,
+        178,
+        180,
+        182,
+        184,
+        187,
+        189,
+        191,
+        193,
+        196,
+        198,
+        200,
+        203,
+        205,
+        208,
+        210,
+        213,
+        215,
+        218,
+        221,
+        223,
+        226,
+        229,
+        232,
+        234,
+        237,
+        240,
+        243,
+        246,
+        249,
+        252,
+        255,
+        258,
+        261,
+        264,
+        267,
+        271,
+        274,
+        277,
+        280,
+        284,
+        287,
+        291,
+        294,
+        298,
+        301,
+        305,
+        309,
+        312,
+        316,
+        320,
+        324,
+        328,
+        332,
+        336,
+        340,
+        344,
+        348,
+        352,
+        357,
+        361,
+        365,
+        370,
+        374,
+        379,
+        383,
+        388,
+        392,
+        397,
+        402,
+        407,
+        412,
+        417,
+        422,
+        427,
+        432,
+        437,
+        442,
+        448,
+        453,
+        459,
+        464,
+        470,
+        475,
+        481,
+        487,
+        493,
+        499,
+        505,
+        511,
+        517,
+        523,
+        530,
+        536,
+        542,
+        549,
+        556,
+        562,
+        569,
+        576,
+        583,
+        590,
+        597,
+        604,
+        612,
+        619,
+        626,
+        634,
+        642,
+        649,
+        657,
+        665,
+        673,
+        681,
+        690,
+        698,
+        706,
+        715,
+        723,
+        732,
+        741,
+        750,
+        759,
+        768,
+        777,
+        787,
+        796,
+        806,
+        816,
+        825,
+        835,
+        845,
+        856,
+        866,
+        876,
+        887,
+        898,
+        909,
+        920,
+        931,
+        942,
+        953,
+        965,
+        976,
+        988,
+    ],
+}
+_BUCKET_AUTO_SERIES = {k: [float(x) for x in v] for k, v in _BUCKET_AUTO_SERIES.items()}
+
+
+def _round_up_series(number: float, series: list[float]) -> float:
+    """mongod `GranularityRounderPreferredNumbers::roundUp` (double path),
+    ported verbatim so the `series_element * multiplier` arithmetic matches
+    mongod's f64 result bit-for-bit."""
+    if number == 0.0 or number == math.inf:
+        return number
+    multiplier = 1.0
+    while number >= series[-1] * multiplier:
+        multiplier *= 10.0
+    while number < series[0] * multiplier:
+        previous_min = series[0] * multiplier
+        multiplier /= 10.0
+        if number >= series[-1] * multiplier:
+            return previous_min
+    # smallest series element with number < series*multiplier (strict upper bound)
+    idx = _bisect_right([s * multiplier for s in series], number)
+    return series[idx] * multiplier
+
+
+def _round_down_series(number: float, series: list[float]) -> float:
+    """mongod `GranularityRounderPreferredNumbers::roundDown` (double path)."""
+    if number == 0.0 or number == math.inf:
+        return number
+    multiplier = 1.0
+    while number <= series[0] * multiplier:
+        multiplier /= 10.0
+    if multiplier == 0:
+        return 0.0
+    while number > series[-1] * multiplier:
+        previous_max = series[-1] * multiplier
+        multiplier *= 10.0
+        if number <= series[0] * multiplier:
+            return previous_max
+    idx = _bisect_left([s * multiplier for s in series], number)
+    return series[idx - 1] * multiplier
+
+
+def _round_up_pow2(v: float) -> float:
+    """mongod `GranularityRounderPowersOfTwo::roundUp` (double path)."""
+    if v == 0.0 or v == math.inf:
+        return v
+    return 2.0 ** (math.floor(math.log2(v)) + 1)
+
+
+def _round_down_pow2(v: float) -> float:
+    """mongod `GranularityRounderPowersOfTwo::roundDown` (double path)."""
+    if v == 0.0 or v == math.inf:
+        return v
+    return 2.0 ** (math.ceil(math.log2(v)) - 1)
+
+
+def _bisect_right(a: list[float], x: float) -> int:
+    lo, hi = 0, len(a)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if x < a[mid]:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def _bisect_left(a: list[float], x: float) -> int:
+    lo, hi = 0, len(a)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if a[mid] < x:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _granularity_coerce(v: Any) -> float:
+    """Coerce a groupBy value to the double mongod's rounder operates on, or
+    raise mongod's granularity error. Decimal128 is deferred (the standing
+    Decimal128 precision deferral) rather than approximated in f64."""
+    if isinstance(v, Decimal128):
+        raise AggregateError(
+            "$bucketAuto 'granularity' over Decimal128 boundaries is not yet "
+            "supported by SecantusDB (the double-valued series ships hex-exact; "
+            "Decimal128 rounding is the standing precision deferral)",
+            code=2,
+        )
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise AggregateError(
+            "$bucketAuto can specify a 'granularity' with numeric boundaries "
+            f"only, but found a value with type: {_bson_type_name(v)}",
+            code=40258,
+            code_name="Location40258",
+        )
+    f = float(v)
+    if math.isnan(f):
+        raise AggregateError(
+            "$bucketAuto can specify a 'granularity' with numeric boundaries only, but found a NaN",
+            code=40259,
+            code_name="Location40259",
+        )
+    if f < 0:
+        raise AggregateError(
+            "$bucketAuto can specify a 'granularity' with non-negative numbers "
+            "only, but found a negative number",
+            code=40260,
+            code_name="Location40260",
+        )
+    return f
+
+
 def _validate_bucket_auto_granularity(granularity: Any) -> None:
     """mongod: `granularity` must be a string (else 40261) naming a known
-    preferred-number series (else 40257). A *valid* series is then rejected as
-    unsupported rather than silently producing count-chunked (unrounded)
-    boundaries: matching mongod's rounding would require its exact internal
-    float series constants (e.g. its "6.3" is the f64 `6.3000000000000007`, not
-    `float("6.3")`), which can't be recovered by black-box probing — see
-    tasks/backlog.md. A faithful error beats a silently-wrong result."""
+    preferred-number series (else 40257)."""
     if not isinstance(granularity, str):
         raise AggregateError(
             "The $bucketAuto 'granularity' field must be a string, but found type: "
@@ -2403,11 +2994,85 @@ def _validate_bucket_auto_granularity(granularity: Any) -> None:
             code=40257,
             code_name="Location40257",
         )
-    raise AggregateError(
-        f"$bucketAuto 'granularity' ({granularity!r}) is not yet supported by SecantusDB: "
-        "boundary rounding to the preferred-number series is unimplemented",
-        code=2,
-    )
+
+
+def _bucket_auto_granular(
+    pairs: list[tuple[Any, dict[str, Any]]],
+    n_buckets: int,
+    granularity: str,
+    output_spec: Mapping[str, Any],
+    ctx: PipelineContext,
+) -> list[dict[str, Any]]:
+    """mongod `DocumentSourceBucketAuto::populateNextBucket` with a granularity
+    rounder: first bucket min = roundDown(dataMin); every other boundary =
+    roundUp(chunkMax), absorbing values that fall below the rounded boundary so
+    boundaries strictly increase. Ported to match mongod 7.0.12 hex-exact."""
+    values = [_granularity_coerce(v) for v, _ in pairs]
+    docs = [d for _, d in pairs]
+    if granularity == "POWERSOF2":
+        rup, rdn = _round_up_pow2, _round_down_pow2
+    else:
+        series = _BUCKET_AUTO_SERIES[granularity]
+        rup = lambda x: _round_up_series(x, series)  # noqa: E731
+        rdn = lambda x: _round_down_series(x, series)  # noqa: E731
+
+    n = len(pairs)
+    approx = math.floor(n / n_buckets + 0.5)  # std::round (positive) — fixed for all buckets
+    if approx < 1:
+        approx = 1
+
+    out: list[dict[str, Any]] = []
+    idx = 0
+    previous_max: float | None = None
+    carry: int | None = None  # index of the value carried as the next bucket's min
+    bucket_num = 0
+    while True:
+        bucket_num += 1
+        if carry is None and idx >= n:
+            break
+        if carry is not None:
+            cur_i = carry
+        else:
+            cur_i = idx
+            idx += 1
+        cur_min = previous_max if previous_max is not None else rdn(values[cur_i])
+        cur_max = values[cur_i]
+        chunk: list[int] = [cur_i]
+        is_last = bucket_num == n_buckets
+        i = 1
+        while idx < n and (i < approx or is_last):
+            cur_max = values[idx]
+            chunk.append(idx)
+            idx += 1
+            i += 1
+        # adjustBoundariesAndGetMinForNextBucket
+        next_i: int | None = None
+        if idx < n:
+            next_i = idx
+            idx += 1
+        boundary = rup(cur_max)
+        # Absorb values that now fall below the rounded boundary (mongod fixes
+        # boundaryValue once, then pulls those docs into this bucket).
+        while next_i is not None and boundary > values[next_i]:
+            chunk.append(next_i)
+            next_i = None
+            if idx < n:
+                next_i = idx
+                idx += 1
+        if float(boundary) == 0.0 and next_i is not None:
+            bucket_max: float = rdn(values[next_i])
+        else:
+            bucket_max = boundary
+        bucket: dict[str, Any] = {"_id": {"min": cur_min, "max": bucket_max}}
+        for field_name, accumulator in output_spec.items():
+            for ci in chunk:
+                _accumulate(bucket, field_name, accumulator, docs[ci], ctx.vars)
+        out.append(_finalize(bucket))
+        previous_max = bucket_max
+        carry = next_i
+        if carry is None and idx >= n:
+            break
+    return out
 
 
 def _stage_bucket_auto(
@@ -2451,8 +3116,9 @@ def _stage_bucket_auto(
             code=40243,
             code_name="Location40243",
         )
-    if "granularity" in spec:
-        _validate_bucket_auto_granularity(spec["granularity"])
+    granularity = spec.get("granularity")
+    if granularity is not None:
+        _validate_bucket_auto_granularity(granularity)
     output_spec = spec.get("output") or {"count": {"$sum": 1}}
 
     from secantus.storage import _SortKey
@@ -2461,6 +3127,8 @@ def _stage_bucket_auto(
     pairs.sort(key=lambda p: _SortKey(p[0]))
     if not pairs:
         return []
+    if granularity is not None:
+        return _bucket_auto_granular(pairs, n_buckets, granularity, output_spec, ctx)
     bucket_size = max(1, len(pairs) // n_buckets)
     out: list[dict[str, Any]] = []
     i = 0
