@@ -5,12 +5,32 @@
 
 mod common;
 
-use bson::{doc, Bson};
+use bson::{doc, Bson, Document};
 use common::with_wt;
 use secantus_commands::{dispatch, CommandContext};
 
 fn count(c: &mut CommandContext) -> i32 {
     dispatch(&doc! {"count": "c"}, c).get_i32("n").unwrap()
+}
+
+/// A `find` reply's cursor batch as `Bson` docs. A no-projection `find` now
+/// hands its batch to the server as pre-encoded blobs via `ctx.pending_batch`
+/// (the raw-BSON reply fast path) rather than a `firstBatch` array in the reply
+/// document; read whichever the handler produced.
+fn fb(reply: &Document, c: &CommandContext) -> Vec<Bson> {
+    match &c.pending_batch {
+        Some(pb) => pb
+            .batch
+            .iter()
+            .map(|b| Bson::Document(Document::from_reader(&mut &b[..]).unwrap()))
+            .collect(),
+        None => reply
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .clone(),
+    }
 }
 
 #[test]
@@ -30,11 +50,7 @@ fn capped_eviction_is_fifo_with_non_monotonic_ids() {
         // max=2: after inserting 1 (the 3rd), the oldest (_id 5, first inserted)
         // is evicted — FIFO. id_key order would have wrongly evicted _id 1.
         let reply = dispatch(&doc! {"find": "c", "sort": {"_id": 1}}, c);
-        let ids: Vec<i32> = reply
-            .get_document("cursor")
-            .unwrap()
-            .get_array("firstBatch")
-            .unwrap()
+        let ids: Vec<i32> = fb(&reply, c)
             .iter()
             .map(|b| b.as_document().unwrap().get_i32("_id").unwrap())
             .collect();
@@ -355,11 +371,7 @@ fn find_returns_insertion_order_for_mixed_id_types() {
             c,
         );
         let found = dispatch(&doc! {"find": "c"}, c);
-        let xs: Vec<i32> = found
-            .get_document("cursor")
-            .unwrap()
-            .get_array("firstBatch")
-            .unwrap()
+        let xs: Vec<i32> = fb(&found, c)
             .iter()
             .map(|b| b.as_document().unwrap().get_i32("x").unwrap())
             .collect();
@@ -398,15 +410,7 @@ fn find_on_symbol_and_code_values() {
         ] {
             let r = dispatch(&doc! {"find": "c", "filter": filter.clone()}, c);
             assert_eq!(r.get_f64("ok").unwrap(), 1.0, "{filter:?}");
-            assert_eq!(
-                r.get_document("cursor")
-                    .unwrap()
-                    .get_array("firstBatch")
-                    .unwrap()
-                    .len(),
-                1,
-                "{filter:?}"
-            );
+            assert_eq!(fb(&r, c).len(), 1, "{filter:?}");
         }
     });
 }
@@ -428,15 +432,7 @@ fn update_set_code_value() {
         assert_eq!(r.get_f64("ok").unwrap(), 1.0, "update reply: {r:?}");
         assert_eq!(r.get_i32("nModified").unwrap(), 1);
         let found = dispatch(&doc! {"find": "c"}, c);
-        let f = found
-            .get_document("cursor")
-            .unwrap()
-            .get_array("firstBatch")
-            .unwrap()[0]
-            .as_document()
-            .unwrap()
-            .get("f")
-            .cloned();
+        let f = fb(&found, c)[0].as_document().unwrap().get("f").cloned();
         assert_eq!(f, Some(f2));
     });
 }
@@ -475,11 +471,7 @@ fn update_bit_operator() {
         );
         assert_eq!(r.get_i32("nModified").unwrap(), 1);
         let found = dispatch(&doc! {"find": "c"}, c);
-        let b = found
-            .get_document("cursor")
-            .unwrap()
-            .get_array("firstBatch")
-            .unwrap()[0]
+        let b = fb(&found, c)[0]
             .as_document()
             .unwrap()
             .get_i32("b")
@@ -567,12 +559,7 @@ fn update_valid_pipeline_applies_via_storage() {
         assert_eq!(reply.get_i32("nModified").unwrap(), 2);
         // Verify via a real read: every doc now has a == 1.
         let found = dispatch(&doc! {"find": "c"}, c);
-        for b in found
-            .get_document("cursor")
-            .unwrap()
-            .get_array("firstBatch")
-            .unwrap()
-        {
+        for b in fb(&found, c) {
             assert_eq!(b.as_document().unwrap().get("a"), Some(&Bson::Int32(1)));
         }
     });

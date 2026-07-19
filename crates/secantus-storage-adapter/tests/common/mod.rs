@@ -6,9 +6,38 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use secantus_commands::{CommandContext, CursorRegistry, Storage as CmdStorage};
+use bson::{Bson, Document};
+use secantus_commands::{dispatch, CommandContext, CursorRegistry, Storage as CmdStorage};
 use secantus_storage::Storage as WtStorage;
 use secantus_storage_adapter::StorageAdapter;
+
+/// Dispatch a command and, when the handler produced a raw-BSON cursor batch via
+/// `ctx.pending_batch` (a no-projection `find`'s `firstBatch` or a non-tailable
+/// `getMore`'s `nextBatch`), merge that batch back into the reply's
+/// `cursor.<field>` — so command-layer tests can read it inline as before. The
+/// real server splices those pre-encoded blobs straight onto the wire instead
+/// (`secantus_wire::encode_cursor_reply`); this just reconstructs the document
+/// form for in-process assertions. A non-cursor reply passes through unchanged.
+#[allow(dead_code)]
+pub fn dispatch_full(cmd: &Document, c: &mut CommandContext) -> Document {
+    let mut reply = dispatch(cmd, c);
+    if let Some(pb) = c.pending_batch.take() {
+        let arr: Vec<Bson> = pb
+            .batch
+            .iter()
+            .map(|b| Bson::Document(Document::from_reader(&mut &b[..]).unwrap()))
+            .collect();
+        if let Ok(cursor) = reply.get_document_mut("cursor") {
+            let mut rebuilt = Document::new();
+            rebuilt.insert(pb.batch_field, arr);
+            for (k, v) in cursor.iter() {
+                rebuilt.insert(k, v.clone());
+            }
+            *cursor = rebuilt;
+        }
+    }
+    reply
+}
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 

@@ -502,20 +502,32 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         projection = None;
     }
 
-    // The `firstBatch` goes straight onto the wire reply, so produce it as
-    // `Bson` directly and only encode the cursor *remainder* (which the registry
-    // stores as bytes). This avoids the round-trip the projection path otherwise
-    // pays — encoding the projected docs to bytes only to decode them right back
-    // for the reply. The no-projection path stays in storage bytes end-to-end
-    // and decodes just the firstBatch.
-    let (first_batch, cursor_id): (Vec<Bson>, i64) = match projection {
+    // Two reply shapes:
+    //   * projection — decode+project every firstBatch doc into an owned
+    //     `Bson::Document` (projection inherently materialises); embed directly.
+    //   * no projection — the firstBatch stays as pre-encoded storage blobs; hand
+    //     them to the server via `ctx.pending_batch` so it splices them onto the
+    //     wire (`encode_cursor_reply`) with no decode→re-encode round-trip. The
+    //     reply then carries only the cursor envelope (`{ cursor: { id, ns } }`).
+    // In both cases only the cursor *remainder* (stored as bytes in the registry)
+    // is ever re-encoded.
+    match projection {
         Some(spec) => {
             let projected = project_to_docs(docs, spec, &filter)?;
-            if single_batch {
+            let (first_batch, cursor_id): (Vec<Bson>, i64) = if single_batch {
                 (projected.into_iter().map(Bson::Document).collect(), 0)
             } else {
                 split_docs_into_cursor(projected, batch_size, &ns, cursors)?
-            }
+            };
+            Ok(doc! {
+                "cursor": {
+                    "firstBatch": first_batch,
+                    // Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
+                    "id": Bson::Int64(cursor_id),
+                    "ns": ns,
+                },
+                "ok": 1.0,
+            })
         }
         None => {
             let (first, cursor_id) = if single_batch {
@@ -523,19 +535,19 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             } else {
                 split_into_cursor(docs, batch_size, &ns, cursors)?
             };
-            (docs_to_bson(first)?, cursor_id)
+            ctx.pending_batch = Some(crate::PendingBatch {
+                batch_field: "firstBatch",
+                batch: first,
+            });
+            Ok(doc! {
+                "cursor": {
+                    "id": Bson::Int64(cursor_id),
+                    "ns": ns,
+                },
+                "ok": 1.0,
+            })
         }
-    };
-
-    Ok(doc! {
-        "cursor": {
-            "firstBatch": first_batch,
-            // Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
-            "id": Bson::Int64(cursor_id),
-            "ns": ns,
-        },
-        "ok": 1.0,
-    })
+    }
 }
 
 /// Split the ordered result into `firstBatch` + a registered cursor for the

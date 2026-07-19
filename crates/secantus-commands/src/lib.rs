@@ -136,6 +136,24 @@ pub struct CommandContext {
     /// server wires one in (and in unit-test contexts) — `getLog` then reports an
     /// empty log.
     pub logs: Option<Arc<logbuf::LogBuffer>>,
+    /// Set by a cursor-producing handler (`find` / `getMore`) to hand the
+    /// server the reply's document batch as **pre-encoded blobs** instead of an
+    /// owned `Bson::Array` inside the reply document. The reply the handler
+    /// returns then carries `cursor: { id, ns }` *without* the batch; the server
+    /// splices the blobs onto the wire via `secantus_wire::encode_cursor_reply`,
+    /// skipping the decode→re-encode round-trip that materialising them into the
+    /// reply document would cost (`tasks/rust-perf-findings.md`, Phase 1).
+    /// Out-of-band like `close_connection`. `None` for every non-cursor reply.
+    pub pending_batch: Option<PendingBatch>,
+}
+
+/// A cursor reply's document batch as pre-encoded BSON blobs, plus which field
+/// (`"firstBatch"` for `find`, `"nextBatch"` for `getMore`) it splices into
+/// `cursor`. See `CommandContext::pending_batch`.
+#[derive(Clone)]
+pub struct PendingBatch {
+    pub batch_field: &'static str,
+    pub batch: Vec<Vec<u8>>,
 }
 
 impl CommandContext {
@@ -161,6 +179,7 @@ impl CommandContext {
             close_connection: false,
             conn_killer: None,
             logs: None,
+            pending_batch: None,
         }
     }
 

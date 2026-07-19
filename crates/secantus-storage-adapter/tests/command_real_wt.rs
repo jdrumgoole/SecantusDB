@@ -12,12 +12,36 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use bson::{doc, Bson};
+use bson::{doc, Bson, Document};
 use secantus_commands::{dispatch, CommandContext, CursorRegistry, Storage as CmdStorage};
 use secantus_storage::Storage as WtStorage;
 use secantus_storage_adapter::StorageAdapter;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Dispatch, then merge any raw-BSON cursor batch (`ctx.pending_batch`, set by a
+/// no-projection `find` / non-tailable `getMore`) back into the reply's
+/// `cursor.<field>` so in-process tests can read it inline. The real server
+/// splices those blobs onto the wire instead.
+fn dispatch_full(cmd: &Document, c: &mut CommandContext) -> Document {
+    let mut reply = dispatch(cmd, c);
+    if let Some(pb) = c.pending_batch.take() {
+        let arr: Vec<Bson> = pb
+            .batch
+            .iter()
+            .map(|b| Bson::Document(Document::from_reader(&mut &b[..]).unwrap()))
+            .collect();
+        if let Ok(cursor) = reply.get_document_mut("cursor") {
+            let mut rebuilt = Document::new();
+            rebuilt.insert(pb.batch_field, arr);
+            for (k, v) in cursor.iter() {
+                rebuilt.insert(k, v.clone());
+            }
+            *cursor = rebuilt;
+        }
+    }
+    reply
+}
 
 fn temp_home() -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -64,7 +88,7 @@ fn long_db_name_invalid_namespace_real_wt() {
 fn find_non_numeric_batch_size_is_type_mismatch_real_wt() {
     with_wt(|c| {
         dispatch(&doc! {"insert": "c", "documents": [{"_id": 1}]}, c);
-        let r = dispatch(&doc! {"find": "c", "batchSize": "foo"}, c);
+        let r = dispatch_full(&doc! {"find": "c", "batchSize": "foo"}, c);
         assert_eq!(r.get_f64("ok").unwrap(), 0.0);
         assert_eq!(r.get_i32("code").unwrap(), 14);
     });
@@ -78,7 +102,7 @@ fn decimal128_batch_size_opens_cursor_real_wt() {
             c,
         );
         let bs = Bson::Decimal128(bson::Decimal128::from_str("2").unwrap());
-        let r = dispatch(&doc! {"find": "c", "batchSize": bs}, c);
+        let r = dispatch_full(&doc! {"find": "c", "batchSize": bs}, c);
         let cur = r.get_document("cursor").unwrap();
         assert_eq!(cur.get_array("firstBatch").unwrap().len(), 2);
         assert_ne!(cur.get_i64("id").unwrap(), 0, "remaining doc ⇒ live cursor");
@@ -113,12 +137,12 @@ fn drop_kills_open_cursor_real_wt() {
             ]},
             c,
         );
-        let r = dispatch(&doc! {"find": "c", "batchSize": 2}, c);
+        let r = dispatch_full(&doc! {"find": "c", "batchSize": 2}, c);
         let cid = r.get_document("cursor").unwrap().get_i64("id").unwrap();
         assert_ne!(cid, 0);
         dispatch(&doc! {"drop": "c"}, c);
         // The dropped collection's cursor is gone ⇒ getMore is CursorNotFound (43).
-        let r = dispatch(&doc! {"getMore": cid, "collection": "c"}, c);
+        let r = dispatch_full(&doc! {"getMore": cid, "collection": "c"}, c);
         assert_eq!(r.get_i32("code").unwrap(), 43);
     });
 }
