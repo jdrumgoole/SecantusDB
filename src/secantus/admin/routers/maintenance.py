@@ -19,6 +19,7 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from secantus.admin import capabilities
 from secantus.admin.client import MongoError
 
 router = APIRouter()
@@ -80,6 +81,10 @@ def post_prune_oplog(request: Request) -> HTMLResponse:
     try:
         n = request.app.state.mongo.prune_oplog()
     except MongoError as exc:
+        # The target told us it has no such command — stop offering the
+        # button rather than guessing ahead of time (see capabilities).
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "native_prune")
         return _render(request, error=str(exc))
     return _render(request, flash={"kind": "ok", "msg": f"pruned {n} oplog row(s)"})
 
@@ -89,6 +94,8 @@ def post_prune_ttl(request: Request) -> HTMLResponse:
     try:
         n = request.app.state.mongo.prune_ttl()
     except MongoError as exc:
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "native_prune")
         return _render(request, error=str(exc))
     return _render(request, flash={"kind": "ok", "msg": f"pruned {n} TTL doc(s)"})
 

@@ -351,6 +351,9 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 ### P2 — polish
 
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
+- [ ] **No admin surface for `collMod` / `createCollection` / validators / `renameCollection` / custom-role creation.** All ship server-side; the only way to reach them is hand-typing into `/query`'s `runCommand` box, so they're undiscoverable. Not wrong, just missing — add panels as the need shows up.
+- [ ] **Change-stream page has no resume-token / `fullDocument` controls.** `/changestream` tails by scope only; `resumeAfter` / `startAfter` / `fullDocument` / `fullDocumentBeforeChange` and pipeline filters all ship on both servers but aren't reachable from the UI.
+- [ ] **The SQL / PostgreSQL-wire server has no admin UI at all**, and this is now an explicit scoping decision rather than an accident: `client.check_supported_uri` rejects a `postgresql://` target with a message saying so. If a SQL admin surface is ever wanted it needs its own console — every page here is pymongo-driven.
 - [ ] **`StarletteDeprecationWarning` from fastapi's testclient import** — the six
   admin websocket tests each emit "Using `httpx` with `starlette.testclient` is
   deprecated; install `httpx2`" from fastapi's own import shim. The last warnings

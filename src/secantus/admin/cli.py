@@ -80,6 +80,17 @@ def main(argv: list[str] | None = None) -> int:
 
     set_process_name("SecantusDB admin")
 
+    # Fail fast on a URI this console can't drive (most usefully a
+    # postgresql:// one aimed at SecantusDB's SQL server), before we
+    # generate a token or bring up a window.
+    from secantus.admin.client import check_supported_uri
+
+    try:
+        check_supported_uri(args.uri)
+    except ValueError as exc:
+        sys.stderr.write(f"\n{exc}\n\n")
+        return 2
+
     token = _resolve_token(override=args.token, token_path=Path(args.token_path))
 
     # Lazy imports — the launcher pulls in fastapi / uvicorn / pywebview,

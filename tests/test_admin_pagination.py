@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import uuid
+
 import pytest
 from bson import ObjectId
+from bson.binary import Binary
+from bson.decimal128 import Decimal128
 
 from secantus.admin.pagination import (
     PageCursor,
@@ -39,7 +45,85 @@ def test_detect_id_type_rejects_float() -> None:
         detect_id_type(3.14)
 
 
+def test_detect_id_type_decimal128() -> None:
+    assert detect_id_type(Decimal128("1.50")) == "dec"
+
+
+def test_detect_id_type_uuid() -> None:
+    assert detect_id_type(uuid.uuid4()) == "uuid"
+
+
+def test_detect_id_type_binary() -> None:
+    assert detect_id_type(Binary(b"\x00\x01\xff", 0)) == "bin"
+
+
+def test_detect_id_type_rejects_document() -> None:
+    with pytest.raises(ValueError):
+        detect_id_type({"a": 1})
+
+
 # ---- encode/decode round-trip ---------------------------------------------
+
+
+def test_roundtrip_decimal128_preserves_exact_form() -> None:
+    # "1.50" must not collapse to "1.5" — the cursor has to compare equal
+    # to the stored value, and Decimal128 keeps coefficient + exponent.
+    original = Decimal128("1.50")
+    token = encode_cursor(PageCursor(after=original, type_tag="dec"))
+    restored = decode_cursor(token)
+    assert restored is not None
+    assert str(restored.after) == "1.50"
+    assert restored.after == original
+
+
+def test_roundtrip_uuid() -> None:
+    original = uuid.uuid4()
+    token = encode_cursor(PageCursor(after=original, type_tag="uuid"))
+    restored = decode_cursor(token)
+    assert restored is not None
+    assert restored.after == original
+
+
+@pytest.mark.parametrize("subtype", [0, 3, 4])
+def test_roundtrip_binary_preserves_subtype(subtype: int) -> None:
+    original = Binary(b"\x00\x01\xff\xfe", subtype)
+    token = encode_cursor(PageCursor(after=original, type_tag="bin"))
+    restored = decode_cursor(token)
+    assert restored is not None
+    assert restored.after == original
+    assert restored.after.subtype == subtype
+
+
+def _forge_token(after: str, type_tag: str) -> str:
+    """Build a cursor token directly, bypassing _serialize.
+
+    Lets a test hand-craft the tampered tokens a user could produce by
+    editing ``?after=`` in the URL bar.
+    """
+    raw = json.dumps({"after": after, "type": type_tag}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+@pytest.mark.parametrize(
+    ("after", "type_tag"),
+    [
+        # bson raises InvalidId, not ValueError.
+        ("not-an-oid", "oid"),
+        # decimal raises InvalidOperation, not ValueError.
+        ("garbage", "dec"),
+        ("not-a-uuid", "uuid"),
+        # binary payloads carry a "<subtype-hex>:<base64>" shape.
+        ("no-subtype-separator", "bin"),
+        ("zz:!!!!", "bin"),
+        ("00:!!!!not-base64", "bin"),
+        ("nope", "no_such_type"),
+    ],
+)
+def test_decode_tampered_token_raises_value_error(after: str, type_tag: str) -> None:
+    # A hand-edited ?after= must surface as a 400-shaped ValueError, never
+    # an uncaught 500 from a bson constructor.
+    with pytest.raises(ValueError):
+        decode_cursor(_forge_token(after, type_tag))
 
 
 @pytest.mark.parametrize(

@@ -14,20 +14,26 @@ Limitations of this v1:
   collide with the cursor's range). Custom-sort + filter-on-``_id``
   pagination needs real-pymongo-cursor pagination, which lands in a
   later slice.
-* Only ``_id`` types we encode round-trippably are ``ObjectId``,
-  ``int``, and ``str``. ``Decimal128`` / ``UUID`` / ``Binary`` ``_id``s
-  raise ``ValueError`` at cursor-encode time, before the response ships.
+* ``_id`` values must be of a type this module can round-trip through a
+  URL token. That covers ``ObjectId``, ``int``, ``str``, ``Decimal128``,
+  ``UUID``, and ``Binary``; anything else (a document or array ``_id``,
+  say) raises ``ValueError`` at cursor-encode time, before the response
+  ships.
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
 import json
+import uuid as _uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from bson import ObjectId
+from bson.binary import Binary
+from bson.decimal128 import Decimal128
 
 
 @dataclass(frozen=True)
@@ -35,7 +41,7 @@ class PageCursor:
     """The opaque resume position for skip-ID pagination."""
 
     after: Any
-    type_tag: str  # "oid" | "int" | "str"
+    type_tag: str  # "oid" | "int" | "str" | "dec" | "uuid" | "bin"
 
 
 def detect_id_type(v: Any) -> str:
@@ -47,8 +53,18 @@ def detect_id_type(v: Any) -> str:
         raise ValueError("bool _id is not supported for skip-ID pagination")
     if isinstance(v, int):
         return "int"
+    # Binary *before* str/bytes: bson.Binary subclasses bytes, and we need
+    # to preserve its subtype across the round trip.
+    if isinstance(v, Binary):
+        return "bin"
     if isinstance(v, str):
         return "str"
+    if isinstance(v, Decimal128):
+        return "dec"
+    if isinstance(v, _uuid.UUID):
+        return "uuid"
+    if isinstance(v, bytes):
+        return "bin"
     raise ValueError(f"unsupported _id type for pagination: {type(v).__name__}")
 
 
@@ -59,6 +75,18 @@ def _serialize(v: Any, type_tag: str) -> str:
         return str(int(v))
     if type_tag == "str":
         return v
+    if type_tag == "dec":
+        # Decimal128's str form is exact — it round-trips the coefficient
+        # and exponent, so "1.50" does not collapse to "1.5" and the
+        # cursor keeps comparing equal to the stored value.
+        return str(v)
+    if type_tag == "uuid":
+        return str(v)
+    if type_tag == "bin":
+        # subtype is part of the value's identity for a bson Binary, so
+        # carry it alongside the payload.
+        subtype = getattr(v, "subtype", 0)
+        return f"{subtype:02x}:{base64.b64encode(bytes(v)).decode('ascii')}"
     raise ValueError(f"unknown cursor type: {type_tag}")
 
 
@@ -69,6 +97,18 @@ def _deserialize(s: str, type_tag: str) -> Any:
         return int(s)
     if type_tag == "str":
         return s
+    if type_tag == "dec":
+        return Decimal128(s)
+    if type_tag == "uuid":
+        return _uuid.UUID(s)
+    if type_tag == "bin":
+        head, sep, payload = s.partition(":")
+        if not sep:
+            raise ValueError("malformed binary cursor value")
+        try:
+            return Binary(base64.b64decode(payload.encode("ascii")), int(head, 16))
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("malformed binary cursor value") from exc
     raise ValueError(f"unknown cursor type: {type_tag}")
 
 
@@ -103,7 +143,18 @@ def decode_cursor(token: str | None) -> PageCursor | None:
     after_raw = payload.get("after")
     if not isinstance(type_tag, str) or after_raw is None:
         raise ValueError("malformed page cursor")
-    return PageCursor(after=_deserialize(str(after_raw), type_tag), type_tag=type_tag)
+    try:
+        after = _deserialize(str(after_raw), type_tag)
+    except ValueError:
+        raise
+    except Exception as exc:
+        # The bson constructors don't all raise ValueError on bad input —
+        # ObjectId raises bson.errors.InvalidId and Decimal128 raises
+        # decimal.InvalidOperation, neither of which is a ValueError. A
+        # hand-edited ?after= in the URL must be a 400-shaped ValueError
+        # per this function's contract, not an uncaught 500.
+        raise ValueError("malformed page cursor") from exc
+    return PageCursor(after=after, type_tag=type_tag)
 
 
 def build_page_filter(

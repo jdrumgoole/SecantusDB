@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from secantus.admin import capabilities
 from secantus.admin.client import MongoError
 
 router = APIRouter()
@@ -139,6 +140,8 @@ def kill_connection(request: Request, conn_id: int) -> HTMLResponse:
     try:
         request.app.state.mongo.kill_connection(conn_id)
     except MongoError as exc:
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "kill_op")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return HTMLResponse("", headers={"HX-Trigger": "connection-killed"})
 

@@ -31,6 +31,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from secantus.admin import backup as backup_lib
+from secantus.admin import capabilities
 from secantus.admin.client import MongoError
 
 router = APIRouter()
@@ -42,6 +43,17 @@ def _templates(request: Request) -> Jinja2Templates:
 
 def _backup_root(request: Request) -> Path:
     return getattr(request.app.state, "backup_root", backup_lib.DEFAULT_BACKUP_ROOT)
+
+
+def _pitr_archive_dir(request: Request) -> Path:
+    """Default PITR archive directory offered in the form.
+
+    A sibling of the backup root rather than a subdirectory: the server
+    is normally started with ``--oplog-archive-dir`` pointing here, and
+    nesting it under the backup root would put pruned-oplog segments in
+    the same tree the archive listing walks.
+    """
+    return _backup_root(request).parent / "pitr-archive"
 
 
 def _humanize_bytes(n: int | float | None) -> str:
@@ -60,6 +72,7 @@ def _render(
     *,
     flash: dict[str, str] | None = None,
     last_result: backup_lib.BackupResult | None = None,
+    pitr_flash: dict[str, str] | None = None,
 ) -> HTMLResponse:
     pre = backup_lib.preflight()
     backups = backup_lib.list_backups(_backup_root(request))
@@ -84,6 +97,8 @@ def _render(
             "rows": rows,
             "flash": flash,
             "last_result": last_result,
+            "pitr_archive_dir": str(_pitr_archive_dir(request)),
+            "pitr_flash": pitr_flash,
         },
     )
 
@@ -126,6 +141,8 @@ def post_archive(request: Request) -> HTMLResponse:
     try:
         result = request.app.state.mongo.backup_archive(str(archive))
     except MongoError as exc:
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "native_backup_archive")
         flash = {"kind": "err", "msg": f"backupArchive failed: {exc}"}
         return _render(request, flash=flash)
     elapsed_ms = int((_time.monotonic() - started) * 1000)
@@ -197,6 +214,8 @@ def post_restore_archive(
     try:
         result = request.app.state.mongo.restore_archive(str(archive), target)
     except MongoError as exc:
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "native_restore_archive")
         flash = {"kind": "err", "msg": f"restoreArchive failed: {exc}"}
         return _render(request, flash=flash)
     flash = {
@@ -208,3 +227,111 @@ def post_restore_archive(
         ),
     }
     return _render(request, flash=flash)
+
+
+# ---- PITR (point-in-time recovery) ------------------------------------------
+#
+# Two commands, both server-side and both offline-shaped like
+# restoreArchive: the running server's own storage is never modified, so
+# a recovery produces a directory the operator points a *new* SecantusDB
+# process at. The UI mirrors that — every success message says what to
+# start next rather than implying the live server changed.
+
+
+@router.post("/backup/pitr/snapshot", response_class=HTMLResponse)
+def post_pitr_snapshot(
+    request: Request,
+    archive_dir: str = Form(""),
+) -> HTMLResponse:
+    """Take a PITR base snapshot into the archive directory."""
+    target = (archive_dir or "").strip() or str(_pitr_archive_dir(request))
+    if ".." in target:
+        return _render(
+            request,
+            pitr_flash={"kind": "err", "msg": f"invalid archive directory: {archive_dir!r}"},
+        )
+    try:
+        result = request.app.state.mongo.archive_base_snapshot(target)
+    except MongoError as exc:
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "native_pitr")
+        return _render(
+            request,
+            pitr_flash={"kind": "err", "msg": f"archiveBaseSnapshot failed: {exc}"},
+        )
+    return _render(
+        request,
+        pitr_flash={
+            "kind": "ok",
+            "msg": (
+                f"Base snapshot → {result.get('path')} "
+                f"({_humanize_bytes(result.get('sizeBytes', 0))}, "
+                f"headSeq {result.get('headSeq')})."
+            ),
+        },
+    )
+
+
+@router.post("/backup/pitr/restore", response_class=HTMLResponse)
+def post_pitr_restore(
+    request: Request,
+    source: str = Form(...),
+    target_dir: str = Form(...),
+    to_time: str = Form(""),
+    preserve_oplog: bool = Form(False),
+) -> HTMLResponse:
+    """Replay an archive up to a wall-clock point into a fresh directory."""
+    src = (source or "").strip()
+    target = (target_dir or "").strip()
+    if not src or ".." in src:
+        return _render(request, pitr_flash={"kind": "err", "msg": f"invalid source: {source!r}"})
+    if not target or ".." in target:
+        return _render(
+            request,
+            pitr_flash={"kind": "err", "msg": f"invalid target directory: {target_dir!r}"},
+        )
+
+    parsed_time: _dt.datetime | None = None
+    if to_time.strip():
+        try:
+            # datetime-local inputs arrive as "YYYY-MM-DDTHH:MM[:SS]".
+            parsed_time = _dt.datetime.fromisoformat(to_time.strip())
+        except ValueError:
+            return _render(
+                request,
+                pitr_flash={
+                    "kind": "err",
+                    "msg": (
+                        f"Could not parse recovery time {to_time!r}. "
+                        f"Expected an ISO-8601 value like 2026-07-19T14:30:00."
+                    ),
+                },
+            )
+
+    try:
+        result = request.app.state.mongo.restore_to_timestamp(
+            src,
+            target,
+            to_time=parsed_time,
+            preserve_oplog=preserve_oplog,
+        )
+    except MongoError as exc:
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "native_pitr")
+        return _render(
+            request,
+            pitr_flash={"kind": "err", "msg": f"restoreToTimestamp failed: {exc}"},
+        )
+
+    when = "the end of the oplog" if parsed_time is None else str(result.get("lastWall") or to_time)
+    return _render(
+        request,
+        pitr_flash={
+            "kind": "ok",
+            "msg": (
+                f"Recovered to {when} → {result.get('opsApplied')} op(s) applied of "
+                f"{result.get('entriesSeen')} seen, in {result.get('targetDir')}. "
+                f"Start SecantusDB with --storage-path {result.get('targetDir')} to use it."
+            ),
+        },
+    )

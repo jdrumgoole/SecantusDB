@@ -18,6 +18,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from secantus.admin import embedded as embedded_lib
 from secantus.admin.client import display_uri
 from secantus.admin.swap import SwapError, swap_target
 
@@ -66,6 +67,7 @@ def _render(
             "pending_uri": pending_uri,
             "embedded": request.app.state.embedded.status(),
             "embedded_default_path": str(request.app.state.embedded.default_storage_path),
+            "embedded_flavours": embedded_lib.available_flavours(),
             "embedded_flash": embedded_flash,
             "embedded_error": embedded_error,
             "pending_storage": pending_storage,
@@ -121,11 +123,15 @@ def post_forget(
 def post_embedded_start(
     request: Request,
     storage_path: str = Form(""),
+    flavour: str = Form(embedded_lib.DEFAULT_FLAVOUR),
 ) -> HTMLResponse:
     path = storage_path.strip() or None
     try:
-        uri = request.app.state.embedded.start(storage_path=path)
-    except OSError as exc:
+        uri = request.app.state.embedded.start(storage_path=path, flavour=flavour)
+    except (OSError, ValueError, RuntimeError) as exc:
+        # ValueError = unknown flavour, RuntimeError = Rust extension not
+        # installed. Both are user-fixable, so surface the message rather
+        # than a 500.
         return _render(
             request,
             embedded_error=f"Could not start embedded server: {exc}",

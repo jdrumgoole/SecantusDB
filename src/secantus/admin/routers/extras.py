@@ -21,6 +21,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from secantus.admin import capabilities
 from secantus.admin.client import MongoError
 from secantus.admin.schema import summarize
 
@@ -93,6 +94,8 @@ def logs_partial(request: Request) -> HTMLResponse:
         lines = list(out.get("log") or [])
         total = int(out.get("totalLinesWritten", 0) or 0)
     except MongoError as exc:
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "server_log")
         error = str(exc)
     fetched_at = _dt.datetime.now().strftime("%H:%M:%S")
     templates = _templates(request)

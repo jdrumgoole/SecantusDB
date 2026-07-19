@@ -2,7 +2,7 @@
 {% block content %}
 {% set caps = request.app.state.capabilities %}
 {% if not caps.profiling %}
-  <div class="flash flash-warn">{{ caps.label }} records the profiling level but doesn't capture slow operations — the profile table will stay empty.</div>
+  <div class="flash flash-warn">{{ caps.label }} reported no <code>profile</code> command, so profiling settings can't be applied here.</div>
 {% endif %}
 <nav class="breadcrumb">
   <span>Database</span>

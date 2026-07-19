@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from secantus.admin._dbfile import secure_sqlite_file
+
 MAX_TARGETS = 20
 
 
@@ -46,6 +48,10 @@ class TargetStore:
         self._time = time_func
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
+        # This table stores target URIs verbatim, credentials included
+        # (see ``record``), so the file is a plaintext credential store
+        # and must not be left world-readable.
+        secure_sqlite_file(self.path)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
