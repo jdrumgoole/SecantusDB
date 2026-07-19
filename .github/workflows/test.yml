@@ -315,6 +315,14 @@ jobs:
           # built by a different compiler.
           key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
 
+
+      - name: PROBE — state BEFORE sync
+        shell: bash
+        run: |
+          echo "PRE exists_wtbuild=$(ls -d build/*/wt-build 2>/dev/null | head -1 || echo NONE)"
+          echo "PRE libwt_mtime=$(stat -c %Y build/*/wt-build/libwiredtiger.a 2>/dev/null || echo NONE)"
+          echo "PRE cmake_home=$(grep -h '^CMAKE_HOME_DIRECTORY' build/*/wt-build/CMakeCache.txt 2>/dev/null || echo NONE)"
+          echo "PRE wt_src=$(ls -d build/*/wt-src 2>/dev/null | head -1 || echo NONE)"
       - name: Sync dependencies
         # ``--extra admin`` brings in httpx / fastapi / uvicorn used by
         # tests/test_admin_*.py; without it those tests error at import
@@ -339,6 +347,7 @@ jobs:
             printf "PROBE %s = " "$(basename "$f")"
             sha256sum "$f" | cut -c1-16
           done
+          echo "POST cmake_home=$(grep -h '^CMAKE_HOME_DIRECTORY' build/*/wt-build/CMakeCache.txt 2>/dev/null || echo NONE)"
           echo -n "PROBE libwiredtiger mtime = "
           stat -c '%Y' build/*/wt-build/libwiredtiger.a 2>/dev/null || echo none
 
