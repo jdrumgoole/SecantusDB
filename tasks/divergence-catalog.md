@@ -61,7 +61,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   double accepted); `$toDate` bool → 241 FIXED (#519; onError-catchable, both
   engines). **Array/string type-guard cluster complete.** (expressions)
 - **Date-arg whole-double / bool**: `$dateAdd`/`$dateSubtract` amount + `$dateTrunc`
-  binSize FIXED (#520, → whole-double accepted; fractional/bool → 5166405/5439017;
+  binSize FIXED (#521, → whole-double accepted; fractional/bool → 5166405/5439017;
   binSize <1 → 5439018). Remaining: `$toLong` unimplemented (mongod truncates 2.7→2;
   a separate missing-operator item — could alias `$convert to:long`).
 - **Query operator validation**: `$in`/`$nin` non-array + `$`-doc element FIXED (#494,
