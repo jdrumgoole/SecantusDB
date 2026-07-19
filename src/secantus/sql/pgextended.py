@@ -76,9 +76,12 @@ def _decode_numeric(b: bytes) -> Decimal:
         return Decimal("-Infinity")
     s = "".join(f"{d:04d}" for d in digits) or "0"
     # The first digit group sits at base-10000 position ``weight``; give the
-    # context enough precision for arbitrarily wide values (the default 28
-    # significant digits silently rounds — or refuses to quantize — wide numerics).
-    dctx = decimal.Context(prec=max(len(s) + dscale + 4, 40))
+    # context enough precision for arbitrarily wide values — the integer span
+    # is ``(weight+1)*4`` digits, plus ``dscale`` fractional. The default 28
+    # significant digits silently rounds, and an under-sized context makes the
+    # final quantize raise InvalidOperation on a wide value.
+    span = max((weight + 1) * 4, len(s)) + dscale + 4
+    dctx = decimal.Context(prec=max(span, 40))
     value = dctx.scaleb(Decimal(s), (weight - (ndigits - 1)) * 4) if digits else Decimal(0)
     if sign == 0x4000:
         value = value.copy_negate()  # context-free: ``-value`` rounds to context prec
