@@ -25,6 +25,7 @@ import secrets
 import signal
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -69,6 +70,55 @@ DEFAULT_MAX_CONNECTIONS = 1000
 #: client — leaking it could disclose internal paths, types, or data values.
 #: Mirrors the Mongo dispatch's generic-error discipline. (security review §I17)
 _INTERNAL_ERROR_MSG = "internal error"
+
+# The fixed 11-byte binary-COPY signature (PGCOPY\n\377\r\n\0).
+_PGCOPY_SIGNATURE = b"PGCOPY\n\xff\r\n\x00"
+
+
+def _parse_binary_copy(
+    data: bytes, col_oids: list[int], ncols: int, encoding: str | None
+) -> list[list]:
+    """Parse a binary COPY FROM stream into rows of typed Python cells.
+
+    Layout: 11-byte signature, int32 flags, int32 header-extension length (+
+    that many bytes), then per row an int16 field count and per field an int32
+    length (-1 = NULL) + the field's binary value; an int16 -1 trailer ends
+    the stream."""
+    from secantus.sql import pgextended
+
+    if not data.startswith(_PGCOPY_SIGNATURE):
+        raise errors.SQLError("22P04", "COPY file signature not recognized")
+    off = len(_PGCOPY_SIGNATURE)
+    try:
+        _flags, ext_len = struct.unpack_from("!ii", data, off)
+        off += 8 + ext_len
+        rows: list[list] = []
+        while True:
+            if off >= len(data):
+                break  # missing trailer — accept the rows we have, like PG's lenient readers
+            (nfields,) = struct.unpack_from("!h", data, off)
+            off += 2
+            if nfields == -1:
+                break
+            if nfields != ncols:
+                raise errors.SQLError(
+                    "22P04", f"extra or missing columns for COPY (expected {ncols})"
+                )
+            cells: list = []
+            for i in range(nfields):
+                (length,) = struct.unpack_from("!i", data, off)
+                off += 4
+                if length < 0:
+                    cells.append(None)
+                    continue
+                raw = data[off : off + length]
+                off += length
+                oid = col_oids[i] if i < len(col_oids) else 0
+                cells.append(pgextended._decode_param(raw, 1, oid, encoding))
+            rows.append(cells)
+        return rows
+    except struct.error:
+        raise errors.SQLError("22P04", "incomplete binary COPY data") from None
 
 
 class SecantusPGServer:
@@ -530,7 +580,8 @@ class SecantusPGServer:
             conn.sendall(pgwire.ready_for_query(session.txn_status()))
 
     def _copy_in(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
-        conn.sendall(pgwire.copy_in_response(len(plan.columns)))
+        binary = plan.fmt == "binary"
+        conn.sendall(pgwire.copy_in_response(len(plan.columns), binary=binary))
         chunks: list[bytes] = []
         while True:
             msg = pgwire.read_message(conn)
@@ -549,20 +600,25 @@ class SecantusPGServer:
                 return
             else:  # pragma: no cover - client desync
                 break
-        try:
-            data = pgwire.decode_text(b"".join(chunks), session.wire_encoding)
-        except UnicodeDecodeError:
-            # Binary/garbage COPY payloads must surface as a faithful SQL
-            # error, not an internal one.
-            raise errors.SQLError(
-                "22021", f'invalid byte sequence for encoding "{session.wire_encoding}"'
-            ) from None
-        if plan.fmt == "csv":
-            rows = copyfmt.parse_csv(
-                data, delimiter=plan.delimiter, null=plan.null, header=plan.header
+        if binary:
+            rows = _parse_binary_copy(
+                b"".join(chunks), plan.col_oids, len(plan.columns), session.wire_encoding
             )
         else:
-            rows = copyfmt.parse_text(data, delimiter=plan.delimiter, null=plan.null)
+            try:
+                data = pgwire.decode_text(b"".join(chunks), session.wire_encoding)
+            except UnicodeDecodeError:
+                # Garbage COPY payloads must surface as a faithful SQL error,
+                # not an internal one.
+                raise errors.SQLError(
+                    "22021", f'invalid byte sequence for encoding "{session.wire_encoding}"'
+                ) from None
+            if plan.fmt == "csv":
+                rows = copyfmt.parse_csv(
+                    data, delimiter=plan.delimiter, null=plan.null, header=plan.header
+                )
+            else:
+                rows = copyfmt.parse_text(data, delimiter=plan.delimiter, null=plan.null)
         try:
             with self._txn_scope(session):
                 n = sql_engine.copy_insert(
@@ -578,6 +634,9 @@ class SecantusPGServer:
         conn.sendall(pgwire.ready_for_query(session.txn_status()))
 
     def _copy_out(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
+        if plan.fmt == "binary":
+            self._copy_out_binary(conn, session, plan)
+            return
         with self._txn_scope(session):
             rows = sql_engine.copy_extract(self.storage, session.database, catalog, session, plan)
         conn.sendall(pgwire.copy_out_response(len(plan.columns)))
@@ -608,6 +667,39 @@ class SecantusPGServer:
                 if chunk:
                     out += pgwire.copy_data(pgwire.encode_text(chunk, session.wire_encoding))
             conn.sendall(bytes(out))
+        conn.sendall(pgwire.copy_done())
+        conn.sendall(pgwire.command_complete(f"COPY {len(rows)}"))
+        conn.sendall(pgwire.ready_for_query(session.txn_status()))
+
+    def _copy_out_binary(self, conn: socket.socket, session: Session, plan: Any) -> None:
+        """``COPY … TO STDOUT (FORMAT binary)`` — PGCOPY signature + flags +
+        extension header, one CopyData per row (int16 field count, per-field
+        int32 length + binary value), int16 -1 trailer."""
+        from secantus.sql import pgextended
+
+        with self._txn_scope(session):
+            rows = sql_engine.copy_extract_raw(self.storage, session.database, plan)
+        conn.sendall(pgwire.copy_out_response(len(plan.columns), binary=True))
+        out = bytearray()
+        # Real PG bundles the PGCOPY header with the FIRST row in one CopyData
+        # (psycopg's copy.read() row framing depends on it); each later row is
+        # its own message and the int16 -1 trailer ends the stream.
+        pending = bytearray(_PGCOPY_SIGNATURE + struct.pack("!ii", 0, 0))
+        for row in rows:
+            buf = bytearray(struct.pack("!h", len(plan.columns)))
+            for value, oid, tag in zip(row, plan.col_oids, plan.col_tags, strict=True):
+                if value is None:
+                    buf += struct.pack("!i", -1)
+                    continue
+                b = pgextended._encode_value(value, oid, tag, session.wire_encoding) or b""
+                buf += struct.pack("!i", len(b)) + b
+            pending += buf
+            out += pgwire.copy_data(bytes(pending))
+            pending = bytearray()
+        if pending:  # zero rows — the header still has to go out
+            out += pgwire.copy_data(bytes(pending))
+        out += pgwire.copy_data(struct.pack("!h", -1))
+        conn.sendall(bytes(out))
         conn.sendall(pgwire.copy_done())
         conn.sendall(pgwire.command_complete(f"COPY {len(rows)}"))
         conn.sendall(pgwire.ready_for_query(session.txn_status()))

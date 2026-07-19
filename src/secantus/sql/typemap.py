@@ -115,6 +115,11 @@ PG_OID: dict[str, int] = {
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
     "int2vector": 22,
     "oidvector": 30,
+    # aclitem — loaded as raw text (psycopg has no loader; it only needs the
+    # faithful oid pair to classify the array type).
+    "aclitem": 1033,
+    # name — the 63-byte identifier type (values travel as text).
+    "name": 19,
 }
 
 # Full-text search type tags — stored as subdocuments, rendered as their PG text.
@@ -176,6 +181,8 @@ SQL_TYPE_NAME: dict[str, str] = {
     "money": "money",
     "hstore": "hstore",
     "citext": "citext",
+    "aclitem": "aclitem",
+    "name": "name",
     "xml": "xml",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
@@ -390,6 +397,10 @@ _ARRAY_PG_OID: dict[str, int] = {
     # Full-text search types.
     "tsvector": 3643,
     "tsquery": 3645,
+    # aclitem.
+    "aclitem": 1034,
+    # name.
+    "name": 1003,
     # Range types.
     "int4range": 3905,
     "numrange": 3907,
@@ -534,7 +545,11 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
             # A quoted built-in element spelling (``"cidr"[]``) parses as a
             # user-defined element type — resolve it like the bare-name case.
             elem = builtin_tag_for_name(inner[0].sql(dialect="postgres"))
-        return f"{elem}[]" if elem is not None else None
+        if elem is None:
+            return None
+        # ``int[][]`` is the same type as ``int[]`` in Postgres — the bracket
+        # count is decorative; dimensionality lives in the value.
+        return elem if is_array_tag(elem) else f"{elem}[]"
     tag = _DATATYPE_TAGS.get(datatype.this)
     if tag is not None:
         return tag
@@ -564,6 +579,10 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return base
     if base == "citext":
         return "citext"
+    if base == "aclitem":
+        return "aclitem"
+    if base == "name":
+        return "name"
     # ``oid`` parses as an ``exp.ObjectIdentifier`` (whose ``.sql()`` is "OID"),
     # not a DataType enum member — match on the rendered name.
     if base == "oid":
@@ -625,6 +644,11 @@ def cast_type_identity(datatype: exp.DataType) -> tuple[int, int] | None:
         return None
     # ``datatype.this`` is a plain string for some spellings (``::oid`` parses
     # via ObjectIdentifier) — those never carry a modifier.
+    # ``::json`` keeps the plain-json identity (114) — our ``json`` tag maps to
+    # jsonb (3802), whose binary form carries a version byte plain json lacks;
+    # a client's json loader would choke on the prefix (and vice versa).
+    if getattr(datatype.this, "name", None) == "JSON":
+        return (114, -1)
     entry = _TYPMOD_KINDS.get(getattr(datatype.this, "name", None))
     if entry is None:
         ud = _userdefined_typmod_kind(datatype)
@@ -693,46 +717,83 @@ def normalize_result_value(value: Any, tag: str | None) -> Any:
     return value
 
 
+# Postgres' whitespace set for array literals — NOT Python str.strip()'s:
+# \x1c-\x1f (and NBSP/NEL) are isspace() to Python but data to Postgres.
+_PG_ARRAY_WS = " \t\n\r\v\f"
+
+
 def _parse_pg_array_literal(text: str) -> list:
-    """Parse a Postgres array *string* literal (``{1,2,3}`` / ``{a,"b,c",NULL}``)
-    into a Python list (a bare ``NULL`` element is None). One level deep."""
-    s = text.strip()
-    if not (s.startswith("{") and s.endswith("}")):
+    """Parse a Postgres array *string* literal into a (possibly nested) Python
+    list, following PG's grammar: an optional ``[l:u]…=`` dimension-bounds
+    prefix, nested ``{}`` sub-arrays, double-quoted elements with ``\\X``
+    escapes, backslash escapes in bare elements, and a bare unquoted ``NULL``
+    as None."""
+    s = text.strip(_PG_ARRAY_WS)
+    # ``[0:1]={a,b}`` — dimension bounds; the values follow the ``=``.
+    if s.startswith("["):
+        depth_end = s.find("=")
+        if depth_end == -1:
+            raise ValueError(f"malformed array literal: {text!r}")
+        s = s[depth_end + 1 :].strip(_PG_ARRAY_WS)
+    if not s.startswith("{"):
         raise ValueError(f"malformed array literal: {text!r}")
-    body = s[1:-1]
-    if body.strip() == "":
-        return []
+    value, i = _parse_pg_array_body(s, 0)
+    if s[i:].strip(_PG_ARRAY_WS):
+        raise ValueError(f"malformed array literal: {text!r}")
+    return value
+
+
+def _parse_pg_array_body(s: str, i: int) -> tuple[list, int]:
+    """Parse one ``{…}`` (sub-)array starting at ``i`` (which must point at the
+    opening brace); returns ``(elements, next_index)``."""
+    assert s[i] == "{"
+    i += 1
+    n = len(s)
     out: list = []
-    i, n = 0, len(body)
-    # Postgres' whitespace set for array literals — NOT Python str.strip()'s:
-    # \x1c-\x1f are isspace() to Python but data to Postgres.
-    pg_ws = " \t\n\r\v\f"
-    while i < n:
-        while i < n and body[i] in pg_ws:
+    while True:
+        while i < n and s[i] in _PG_ARRAY_WS:
             i += 1
-        if i < n and body[i] == '"':  # quoted element (keeps commas / literal NULL)
+        if i >= n:
+            raise ValueError(f"malformed array literal: {s!r}")
+        if s[i] == "}" and not out:
+            return out, i + 1  # empty array
+        if s[i] == "{":
+            sub, i = _parse_pg_array_body(s, i)
+            out.append(sub)
+        elif s[i] == '"':  # quoted element (keeps commas / literal NULL)
             i += 1
             buf: list[str] = []
-            while i < n and body[i] != '"':
-                if body[i] == "\\" and i + 1 < n:
-                    buf.append(body[i + 1])
+            while i < n and s[i] != '"':
+                if s[i] == "\\" and i + 1 < n:
+                    buf.append(s[i + 1])
                     i += 2
                 else:
-                    buf.append(body[i])
+                    buf.append(s[i])
                     i += 1
+            if i >= n:
+                raise ValueError(f"malformed array literal: {s!r}")
             i += 1  # closing quote
             out.append("".join(buf))
-            while i < n and body[i] != ",":  # skip to the separator
-                i += 1
-            i += 1  # consume the comma
-        else:  # unquoted element up to the next comma
-            j = body.find(",", i)
-            if j == -1:
-                j = n
-            token = body[i:j].strip(pg_ws)
+        else:  # bare element up to the next separator / close, with \X escapes
+            buf = []
+            while i < n and s[i] not in ",}":
+                if s[i] == "\\" and i + 1 < n:
+                    buf.append(s[i + 1])
+                    i += 2
+                else:
+                    buf.append(s[i])
+                    i += 1
+            token = "".join(buf).strip(_PG_ARRAY_WS)
             out.append(None if token.upper() == "NULL" else token)
-            i = j + 1
-    return out
+        while i < n and s[i] in _PG_ARRAY_WS:
+            i += 1
+        if i >= n:
+            raise ValueError(f"malformed array literal: {s!r}")
+        if s[i] == "}":
+            return out, i + 1
+        if s[i] != ",":
+            raise ValueError(f"malformed array literal: {s!r}")
+        i += 1
 
 
 def _coercion_error(tag: str, value: Any) -> Exception:
@@ -766,8 +827,21 @@ def coerce(value: Any, tag: str) -> Any:
         return None
     if is_array_tag(tag):
         elem = array_element_tag(tag)
+        if elem == "box" and not isinstance(value, (list, tuple)):
+            # box[] is the one built-in whose array delimiter is ``;`` (a box's
+            # own text form contains commas).
+            body = str(value).strip(_PG_ARRAY_WS)
+            if not (body.startswith("{") and body.endswith("}")):
+                raise ValueError(f"malformed array literal: {value!r}")
+            return [
+                coerce(t.strip(_PG_ARRAY_WS), "box")
+                for t in body[1:-1].split(";")
+                if t.strip(_PG_ARRAY_WS)
+            ]
         items = value if isinstance(value, (list, tuple)) else _parse_pg_array_literal(str(value))
-        return [coerce(v, elem) for v in items]
+        # Multi-dimensional literals nest lists; coerce each leaf to the
+        # element type, preserving the nesting.
+        return [coerce(v, tag) if isinstance(v, (list, tuple)) else coerce(v, elem) for v in items]
     if tag == "any":
         # Schema-on-read (reflected tables): keep the literal's natural Python
         # type so it compares against the stored BSON value as-is.
@@ -1218,8 +1292,10 @@ def infer_elem_tag(items: Any) -> str:
 
 def _render_pg_array(items: Any, elem_tag: str) -> str:
     """Render a Python list as a Postgres array text literal ``{a,b,c}``, quoting
-    an element only when it needs it (empty, NULL-looking, or containing a comma /
-    brace / quote / whitespace)."""
+    an element only when it needs it (empty, NULL-looking, or containing the
+    delimiter / brace / quote / whitespace). ``box`` is the one built-in whose
+    array delimiter is ``;`` (its own text form contains commas)."""
+    delim = ";" if elem_tag == "box" else ","
     parts: list[str] = []
     for v in items:
         if v is None:
@@ -1230,6 +1306,11 @@ def _render_pg_array(items: Any, elem_tag: str) -> str:
             else:
                 parts.append("NULL")
             continue
+        if isinstance(v, (list, tuple)) and elem_tag != "json":
+            # A nested sub-array renders as bare nested braces, not a quoted
+            # element (multi-dimensional array literals).
+            parts.append(_render_pg_array(v, elem_tag))
+            continue
         rendered = to_pg_text(v, elem_tag)
         text = rendered.decode("utf-8") if rendered is not None else ""
         # Quote on ANY whitespace (str.isspace covers \n, \r, \x1c-\x1f, …) —
@@ -1237,11 +1318,11 @@ def _render_pg_array(items: Any, elem_tag: str) -> str:
         if (
             text == ""
             or text.upper() == "NULL"
-            or any(c in text for c in ',{}"\\')
+            or any(c in text for c in delim + '{}"\\')
             or any(ch.isspace() for ch in text)
         ):
             escaped = text.replace("\\", "\\\\").replace('"', '\\"')
             parts.append(f'"{escaped}"')
         else:
             parts.append(text)
-    return "{" + ",".join(parts) + "}"
+    return "{" + delim.join(parts) + "}"

@@ -943,6 +943,46 @@ def test_transaction_characteristics(server):
         assert conn.execute("select current_setting('transaction_read_only')").fetchone() == ("on",)
 
 
+def test_binary_copy_roundtrip(server):
+    """``COPY … (FORMAT binary)`` both directions: OUT emits the PGCOPY stream
+    (header bundled with the first row, per-row CopyData, int16 -1 trailer)
+    with per-type binary field encodings; IN parses the same layout and decodes
+    each field by the target column's type."""
+    with connect(server, autocommit=True) as conn:
+        conn.execute(
+            "CREATE TABLE bc (id int primary key, n int, t text, f float8, "
+            "b bool, by bytea, ts timestamptz)"
+        )
+        when = _dt.datetime(2021, 3, 4, 5, 6, 7, tzinfo=_dt.timezone.utc)
+        rows = [
+            (1, 42, "hello", 3.5, True, b"\x00\x01", when),
+            (2, None, None, None, None, None, None),
+        ]
+        cur = conn.cursor()
+        with cur.copy("COPY bc FROM STDIN (FORMAT binary)") as copy:
+            copy.set_types(["int4", "int4", "text", "float8", "bool", "bytea", "timestamptz"])
+            for row in rows:
+                copy.write_row(row)
+        got = []
+        with cur.copy("COPY bc TO STDOUT (FORMAT binary)") as copy:
+            copy.set_types(["int4", "int4", "text", "float8", "bool", "bytea", "timestamptz"])
+            for row in copy.rows():
+                got.append(row)
+        assert got == rows
+        # Query-form binary COPY OUT rides the same encoders.
+        with cur.copy("COPY (SELECT n FROM bc WHERE id = 1) TO STDOUT (FORMAT binary)") as copy:
+            copy.set_types(["int4"])
+            assert list(copy.rows()) == [(42,)]
+
+
+def test_group_by_ordinal_over_wire(server):
+    with connect(server, autocommit=True) as conn:
+        conn.execute("CREATE TABLE g (id int primary key, k text)")
+        conn.execute("INSERT INTO g VALUES (1, 'a'), (2, 'a'), (3, 'b')")
+        rows = conn.execute("SELECT k, count(*) FROM g GROUP BY 1 ORDER BY 1").fetchall()
+        assert rows == [("a", 2), ("b", 1)]
+
+
 def test_jsonb_roundtrip_and_navigation(server):
     """jsonb values parse at ingress: a cast or Json/Jsonb-wrapped parameter
     loads back as a Python dict/list (not double-encoded text), ``->>``

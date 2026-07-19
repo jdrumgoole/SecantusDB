@@ -76,6 +76,18 @@ def _table_oids(db: str, catalog: Catalog) -> dict[str, int]:
     return {t.name: 16384 + i for i, t in enumerate(_user_tables(db, catalog))}
 
 
+# Table row types (typtype 'c'): pg_type oids derived from the table's
+# pg_class oid, with the paired array oid one offset above.
+_ROWTYPE_OID_BASE = 250000
+_ROWTYPE_ARRAY_OID_OFFSET = 100000
+
+
+def _table_rowtype_oids(db: str, catalog: Catalog) -> dict[str, int]:
+    return {
+        name: _ROWTYPE_OID_BASE + (toid - 16384) for name, toid in _table_oids(db, catalog).items()
+    }
+
+
 _VIEW_OID_BASE = 50000
 _SEQUENCE_OID_BASE = 55000
 _ROLE_OID_BASE = 60000
@@ -1576,6 +1588,27 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         }
         for tag, typname in typemap.PG_TYPENAME.items()
     ]
+    # Every table has a composite row type (typtype 'c') like real Postgres —
+    # psycopg's ``TypeInfo.fetch(conn, "<table>")`` resolves it (and its
+    # ``typarray``) to register the table-row array loader.
+    table_oids = _table_oids(db, catalog)
+    for tname, rowtype_oid in _table_rowtype_oids(db, catalog).items():
+        rows.append(
+            {
+                "oid": rowtype_oid,
+                "typname": tname,
+                "typcollation": 0,
+                "typnamespace": _NS_OIDS["public"],
+                "typbasetype": 0,
+                "typtypmod": -1,
+                "typnotnull": False,
+                "typdefault": None,
+                "typtype": "c",
+                "typrelid": table_oids.get(tname, 0),
+                "typarray": rowtype_oid + _ROWTYPE_ARRAY_OID_OFFSET,
+                "typdelim": ",",
+            }
+        )
     # User-declared enum types (typtype 'e') live in their schema's namespace
     # (public unless created schema-qualified).
     schema_oids = _schema_oids(db, catalog)
@@ -1694,6 +1727,9 @@ def user_type_name(db: str, catalog: Catalog, oid: int) -> str | None:
         for name, type_oid in lookup(db, catalog).items():
             if type_oid == oid:
                 return name
+    for name, type_oid in _table_rowtype_oids(db, catalog).items():
+        if type_oid == oid:
+            return name
     return None
 
 
@@ -1816,6 +1852,10 @@ def user_type_oid(db: str, catalog: Catalog, name: str) -> int | None:
         oid = lookup(db, catalog).get(text)
         if oid is not None:
             return oid
+    # A table's name resolves to its composite row type, like real Postgres.
+    rowtype = _table_rowtype_oids(db, catalog).get(text)
+    if rowtype is not None:
+        return rowtype
     return None
 
 

@@ -151,6 +151,11 @@ class Column:
     # onto the named fields and ``(col).field`` access can type its result.
     composite_type: str | None = None
     composite_fields: tuple[tuple[str, str], ...] | None = None
+    # True for a column declared ``json`` (not ``jsonb``): the value behaviour
+    # is identical (both store parsed JSON under type_tag "json") but the wire
+    # identity differs — RowDescription/COPY report oid 114, whose binary form
+    # has no jsonb version byte.
+    json_plain: bool = False
 
 
 @dataclass(frozen=True)
@@ -300,6 +305,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "generated": c.generated,
                 "composite_type": c.composite_type,
                 "composite_fields": _ser_composite_fields(c.composite_fields),
+                "json_plain": c.json_plain,
             }
             for c in table.columns
         ],
@@ -364,6 +370,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 generated=c.get("generated"),
                 composite_type=c.get("composite_type"),
                 composite_fields=_deser_composite_fields(c.get("composite_fields")),
+                json_plain=bool(c.get("json_plain", False)),
             )
             for c in doc["columns"]
         ],
