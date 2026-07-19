@@ -1082,10 +1082,16 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   bool, and use C-style truncated modulo — the Rust server previously *errored*
   (`BadValue`) on a double-valued field and both servers wrongly matched a bool
   field; three-way mongod-verified, with the zero-divisor / malformed-spec
-  errors reproduced. **Still deferred where faithful:** the exotic BSON types
-  (JS code / symbol compare as text; DBPointer / undefined no-match), and a
-  **Decimal128-valued `$mod` field on the Rust server** (`int(Decimal)` is exact
-  to 34 digits, which an `f64` truncation can't reproduce — the standing
+  errors reproduced. **Exotic-type comparison is handled natively now (verified
+  2026-07-19, NOT deferred — the earlier "still deferred" wording was stale):**
+  `query::compare_values` compares JS code / symbol / with-scope code as text and
+  no-matches DBPointer / undefined itself (the 2026-07-13 cross-type range slice),
+  so a top-level exotic scalar under a range op resolves on the Rust server without
+  a Python round-trip. **Still deferred where faithful:** an exotic-text value
+  *under a collation* (ICU folding), a **DBPointer nested inside an array/document**
+  being range-compared (`order::bson_lt` → `None`, Python's type-*name* tiebreak),
+  and a **Decimal128-valued `$mod` field on the Rust server** (`int(Decimal)` is
+  exact to 34 digits, which an `f64` truncation can't reproduce — the standing
   Decimal128 precision-parity deferral; the Python engine handles it).
   **`$size` argument validation fixed** (2026-07-17, same R8 triage): a
   negative `$size` now errors (was a silent no-match), a bool is rejected (was
@@ -1210,10 +1216,22 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   `$addToSet`, incl. `$push` `$position` / `$slice`; `$sort` defers) were already
   native. **Positional operators (`$` / `$[]` / `$[id]`) and `arrayFilters` work
   on the Rust *server*** via the storage layer (`update_matching_array_filters`),
-  even though the pure `secantus-core` engine defers them. **Still deferred (real
-  Rust-server capability gaps — a defer surfaces as `BadValue` there):** pipeline
-  (array) updates, `$push` `$sort` (BSON-order array sort), and a `$min`/`$max`
-  comparison Python's `<` raises on. **`$inc` / `$mul` on a Decimal128 field**
+  even though the pure `secantus-core` engine defers them. **Done since this entry
+  (verified 2026-07-19 against the running Rust server — the three items below were
+  stale, all now work):** (1) **pipeline (array) updates** run on the Rust *server*
+  via `crud.rs` → `Storage::update_matching_pipeline` → `aggregate::apply_pipeline`
+  (allowed-stage set `$set`/`$addFields`/`$unset`/`$project`/`$replaceRoot`/
+  `$replaceWith`, `_id`-preservation; smoke-verified: a computed `$set`+`$unset`, a
+  `$replaceWith` that reroots a sub-doc while preserving `_id`, and a disallowed
+  `$match` stage rejected with mongod's "stage $match not allowed in pipeline
+  updates"); (2) **`$push` `$sort`** sorts whole-elements (`1`/`-1`) or `{field:dir}`
+  in BSON order (`update::push_sort` via `order::cmp`); (3) **`$min`/`$max`** compute
+  the full cross-type order via `order::bson_lt`. **Still deferred where faithful:**
+  a `$push` `$sort` over an element outside `is_sortable`'s transitive subset
+  (bool / NaN / Binary / Timestamp / Regex / Min-MaxKey / Decimal128 / exotic — the
+  deliberate Timsort-parity defer, since a non-transitive comparator would diverge
+  from Python's stable sort), and a `$min`/`$max` **DBPointer** operand (`bson_lt`
+  → `None`, type-name tiebreak). **`$inc` / `$mul` on a Decimal128 field**
   (verified: Python computes `5.5 + 1.5 = 7.0`; the Rust server errors) is a
   **parity-risk deferral, not a coverage oversight** — the Python oracle does the
   arithmetic in `decimal.Decimal`'s 28-significant-digit `ROUND_HALF_EVEN`
@@ -1705,8 +1723,9 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
   both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
   bit-for-bit despite CPython 3.12's compensated `sum()`).
-- [ ] **Cross-type range comparison — mostly FIXED 2026-07-13; small Rust-server
-  residue remains (`$gt`/`$gte`/`$lt`/`$lte`).** mongod's range operators are
+- [ ] **Cross-type range comparison — FIXED 2026-07-13 on both servers; only a
+  DBPointer operand nested in an array/document still defers (`$gt`/`$gte`/`$lt`/
+  `$lte`). All four sub-items below are done (verified 2026-07-19).** mongod's range operators are
   **type-bracketed** (verified with a three-way probe against real `mongod` 6.0):
   a scalar bound only matches values in the same BSON type bracket — `{a: {$gt: 2}}`
   does **not** match a document- or string-valued `a`, only numbers (plus array
