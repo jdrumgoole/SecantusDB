@@ -151,11 +151,22 @@ def _hang_watchdog():
 # false-fired on a slow test. ``SECANTUS_STALL_SECONDS`` overrides for tests.
 _STALL_FLOOR_SECONDS = 300.0
 _STALL_TIMEOUT_MULTIPLIER = 2.5
+# Once a worker has gone down ("node down"), the run has lost a worker and may
+# crawl (2 workers grinding the whole shard) or wedge (controller waiting on a
+# dead node). The idle-based stall check above does NOT catch a crawl, because
+# the surviving workers keep reporting — which is exactly how the macOS `core`
+# shard once ran 90 min (its dispatch-event job cap) after a worker crashed at
+# ~3.5 min. Cap the time we allow past the FIRST crash so the run fails fast
+# with a diagnostic instead of burning to the job cap. Generous (a healthy run
+# is minutes), env-overridable for tests.
+_POST_CRASH_DEADLINE_SECONDS = 1200.0
 
 _stall_seconds = _STALL_FLOOR_SECONDS
+_post_crash_deadline = _POST_CRASH_DEADLINE_SECONDS
 _last_progress_at = time.monotonic()
 _stall_watch_armed = False
 _node_down: list[str] = []
+_first_node_down_at: float | None = None
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
@@ -181,11 +192,59 @@ def pytest_testnodedown(node: object, error: object) -> None:
     exactly that way.
 
     A crash alone is survivable — xdist may restart the node, which is what
-    ``--max-worker-restart`` budgets for — so this does not fail the run. It
-    only annotates the diagnostics if a stall follows.
+    ``--max-worker-restart`` budgets for — so this does not fail the run here.
+    But it DUMPS the crash reason immediately: a worker that goes down "Not
+    properly terminated" has crashed (WT_PANIC / segfault / abort), and ``error``
+    carries its last frames — which is the one piece of evidence a silent 90-min
+    crawl never surfaces (the surviving workers keep reporting, so the stall
+    watcher never trips). The ``_watch`` loop then bounds the post-crash run.
     """
-    if error:
-        _node_down.append(f"{node!r}: {error!r}")
+    global _first_node_down_at
+    if not error:
+        return
+    reason = f"{node!r}: {error!r}"
+    _node_down.append(reason)
+    if _first_node_down_at is None:
+        _first_node_down_at = time.monotonic()
+    # Immediate capture — always in the CI log, whether or not a stall follows.
+    sys.stderr.write(
+        f"\n=== xdist worker went down ({len(_node_down)} total) ===\n{reason}\n"
+        "The crashed worker's own stack died with it; its `error` above carries\n"
+        "the last frames. Controller thread stacks follow.\n\n"
+    )
+    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    sys.stderr.flush()
+
+
+def _stall_trigger(
+    now: float,
+    last_progress_at: float,
+    stall_seconds: float,
+    first_node_down_at: float | None,
+    post_crash_deadline: float,
+) -> str | None:
+    """Pure decision for the stall watchdog — return a reason to fire, else None.
+
+    Two independent triggers:
+      1. **idle stall** — no test report in ``stall_seconds`` (a wedge where no
+         surviving worker makes progress; the controller sits waiting).
+      2. **post-crash overrun** — a worker went down and the run is STILL going
+         ``post_crash_deadline`` later. The idle check can't see this: after a
+         crash the surviving workers keep reporting, so ``last_progress_at``
+         keeps advancing and idle stays low — which is exactly how a crashed
+         macOS shard once crawled to its 90-min job cap unnoticed.
+    """
+    if first_node_down_at is not None:
+        since_crash = now - first_node_down_at
+        if since_crash > post_crash_deadline:
+            return (
+                f"post-crash overrun: a worker went down {since_crash:.0f}s ago "
+                f"(limit {post_crash_deadline:.0f}s) and the run is still going"
+            )
+    idle = now - last_progress_at
+    if idle >= stall_seconds:
+        return f"no test report in {idle:.0f}s (limit {stall_seconds:.0f}s)"
+    return None
 
 
 def _arm_stall_watchdog(config: pytest.Config) -> None:
@@ -194,10 +253,14 @@ def _arm_stall_watchdog(config: pytest.Config) -> None:
     Workers already carry ``_hang_watchdog``; this covers the controller (and a
     plain serial run, where there is no worker at all).
     """
-    global _stall_watch_armed, _stall_seconds
+    global _stall_watch_armed, _stall_seconds, _post_crash_deadline
     if _stall_watch_armed or hasattr(config, "workerinput"):
         return
     _stall_watch_armed = True
+
+    pc_override = os.environ.get("SECANTUS_POST_CRASH_SECONDS")
+    if pc_override:
+        _post_crash_deadline = float(pc_override)
 
     override = os.environ.get("SECANTUS_STALL_SECONDS")
     if override:
@@ -224,12 +287,18 @@ def _arm_stall_watchdog(config: pytest.Config) -> None:
             # last report, when the run has already printed [100%] but never
             # exits. A daemon thread dies with a healthy process, so watching to
             # the very end costs nothing on a normal run.
-            idle = time.monotonic() - _last_progress_at
-            if idle < _stall_seconds:
+            trigger = _stall_trigger(
+                time.monotonic(),
+                _last_progress_at,
+                _stall_seconds,
+                _first_node_down_at,
+                _post_crash_deadline,
+            )
+            if trigger is None:
                 continue
             sys.stderr.write(
                 "\n=== pytest session stalled ===\n"
-                f"no test report in {idle:.0f}s (limit {_stall_seconds:.0f}s).\n"
+                f"{trigger}.\n"
                 + (
                     f"workers that went down earlier: {_node_down}\n"
                     if _node_down

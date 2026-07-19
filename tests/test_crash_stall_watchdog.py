@@ -151,6 +151,71 @@ def test_healthy_session_is_untouched(tmp_path: Path) -> None:
     assert "3 passed" in combined, combined
 
 
+def test_stall_trigger_decision_logic() -> None:
+    """The pure watchdog decision distinguishes all four cases in-process.
+
+    The key new case is the last one: a worker crashed and the run is STILL
+    going past the post-crash deadline even though progress is *recent* (the
+    surviving workers keep reporting). The idle check alone returns quiet there —
+    which is exactly how a crashed macOS shard crawled to its 90-min job cap.
+    """
+    import conftest  # the suite's own conftest, already on sys.path
+
+    now = 10_000.0
+    # Healthy: recent progress, no crash -> quiet.
+    assert conftest._stall_trigger(now, now - 1, 300, None, 1200) is None
+    # Idle stall: no report past the limit, no crash -> fires with the idle reason.
+    idle_reason = conftest._stall_trigger(now, now - 301, 300, None, 1200)
+    assert idle_reason is not None and "no test report" in idle_reason
+    # Crashed but still WITHIN the post-crash deadline, progress recent ->
+    # survivable (xdist may restart), stay quiet.
+    assert conftest._stall_trigger(now, now - 1, 300, now - 100, 1200) is None
+    # Crashed AND past the deadline with recent progress -> post-crash overrun
+    # fires (the case the idle check alone misses).
+    overrun = conftest._stall_trigger(now, now - 1, 300, now - 1201, 1200)
+    assert overrun is not None and "post-crash overrun" in overrun
+
+
+@pytest.mark.timeout(240)
+def test_worker_crash_is_captured_immediately(tmp_path: Path) -> None:
+    """A crashed xdist worker dumps its reason at once — not only if a stall follows.
+
+    The first version recorded the crash but printed nothing unless the idle
+    stall watcher later tripped; when the survivors kept reporting it never did,
+    so a 90-min crawl carried zero evidence of *why* a worker died. A crash must
+    surface in the log the moment it happens.
+    """
+    result = _run_nested_pytest(
+        tmp_path,
+        """
+        import os
+
+
+        def test_crash_the_worker():
+            # A marker makes the crash happen exactly once: the restarted worker
+            # re-runs this test, sees the marker, and passes — so the session
+            # finishes instead of exhausting the restart budget.
+            marker = os.path.join(os.path.dirname(__file__), ".crashed")
+            if not os.path.exists(marker):
+                open(marker, "w").close()
+                os._exit(1)
+
+
+        def test_a():
+            assert True
+
+
+        def test_b():
+            assert True
+        """,
+        stall_seconds="120",
+        xdist=True,
+    )
+    combined = result.stdout + result.stderr
+    assert "xdist worker went down" in combined, combined
+    assert "Controller thread stacks follow" in combined, combined
+
+
 def test_threshold_is_derived_from_the_per_test_timeout() -> None:
     """The limit must never sit below the per-test deadline.
 
