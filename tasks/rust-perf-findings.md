@@ -150,6 +150,38 @@ Phase 6 changes the aggregate materialization costs before deciding whether
 the cursor-batch lever is worth a separate slice. Scoping:
 `tasks/rust-phase6-streaming-agg-scoping.md`.
 
+**Phase 6a shipped — `$group` field-reference pushdown (`rawbson-group`
+branch).** `secantus_core::referenced_top_level_fields` walks a `$group` spec
+and returns the top-level fields its `_id` + accumulators read (bailing on
+`$$ROOT`/`$$CURRENT`, computed-field access, and non-simple accumulators like
+`$top`/`$topN` whose `sortBy` names a field by bare key). When the first
+heavier stage of a pipeline is such a `$group`, the command layer decodes only
+those fields from each survivor (`decode_docs_minimal` over `bson::RawDocument`)
+and feeds the **unchanged** `group_stage` — so `eval("$k", minimal)` is
+byte-identical to `eval("$k", full)`. Pinned by `test_rust_group_field_pushdown`
+(`apply_pipeline(minimal) == apply_pipeline(full)` over curated + fuzz, plus the
+exact field-sets and bail set).
+
+Measured **same-environment A/B in the worktree** (both server builds and both
+`compare-servers --count 10000 --reps 5` runs in `SecantusDB-rawbson-group`, so
+the `×mongod` is self-normalizing and the unaffected controls cancel run-to-run
+variance):
+
+| Workload | Baseline (rs ×mongod) | 6a (rs ×mongod) | Note |
+|---|:---:|:---:|---|
+| **aggregate_group** | 3.1× (18.10 ms) | **2.4× (13.85 ms)** | **≈1.31× faster** — the target |
+| find_all | 2.7× | 3.1× | control (untouched; run variance) |
+| insert | 1.5× | 1.6× | control |
+| find_indexed_range | 1.6× | 1.7× | control |
+| update_many_half | 1.6× | 1.7× | control |
+| delete_many_half | 1.7× | 1.7× | control |
+
+So `$group` moved **3.1× → 2.4×** of mongod (~24% faster) on the benchmark's
+7-field documents reading 2 fields — proportional to (doc width)/(fields read),
+as scoped; wider documents win more. This is the raw-decode lever (6a); the
+heavier `$group`/`$sort` execution model (streaming, 6b) stays deferred behind a
+multi-stage workload measurement, per the scoping doc.
+
 ## Finding 3 — the oplog prune is an O(entire-oplog) full-decode sweep
 
 The single biggest insert-path consumer is not the insert:
