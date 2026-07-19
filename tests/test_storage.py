@@ -10,8 +10,16 @@ from secantus.storage import Storage
 
 
 @pytest.fixture
-def storage(tmp_path) -> Storage:
-    return Storage(str(tmp_path))
+def storage(tmp_path):
+    # close() in teardown is load-bearing: a never-closed Storage abandons its
+    # WiredTiger connection (~2.5 MB + ~17 fds each), so a worker running many
+    # of these leaks memory / fds until it dies "not properly terminated" with
+    # no output. See tasks/backlog.md #275.
+    s = Storage(str(tmp_path))
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def test_insert_assigns_object_id(storage: Storage) -> None:

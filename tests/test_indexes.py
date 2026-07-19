@@ -6,14 +6,24 @@ from secantus.storage import IndexConflict, Storage
 
 
 @pytest.fixture
-def storage(tmp_path) -> Storage:
+def storage(tmp_path):
     # ttl_sweep_seconds=0 disables the background sweeper. The TTL
     # tests below drive expiry deterministically by passing
     # ``now=...`` to ``prune_ttl``; a parallel sweeper thread would
     # only add nondeterminism (a sweep firing mid-test could prune
     # docs the assertions depend on) without exercising any path
     # the explicit calls don't already.
-    return Storage(str(tmp_path), ttl_sweep_seconds=0)
+    #
+    # ``close()`` in teardown is load-bearing, not tidiness: a `return`-ed
+    # (never-closed) Storage abandons its WiredTiger connection — ~2.5 MB and
+    # ~17 fds each — and this fixture backs 161 tests, so a worker leaks
+    # hundreds of MB / thousands of fds and dies "not properly terminated" with
+    # no output once it hits the RSS or fd ceiling. See tasks/backlog.md #275.
+    s = Storage(str(tmp_path), ttl_sweep_seconds=0)
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def test_create_and_list_simple_index(storage: Storage) -> None:
