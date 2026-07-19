@@ -122,7 +122,9 @@ def _resolve_var(name: str, ctx: _Ctx) -> Any:
         # only legal return values from the stage's expression.
         value = f"$${base}"
     else:
-        raise ExpressionError(f"system variable $${base} is not defined")
+        raise ExpressionError(
+            f"Use of undefined variable: {base}", code=17276, code_name="Location17276"
+        )
     if not rest:
         return value
     if not isinstance(value, Mapping):
@@ -403,7 +405,12 @@ def _op_cond(arg: Any, ctx: _Ctx) -> Any:
 
 def _op_if_null(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, list) or len(arg) < 2:
-        raise ExpressionError("$ifNull requires an array of at least two expressions")
+        n = len(arg) if isinstance(arg, list) else 1
+        raise ExpressionError(
+            f"$ifNull needs at least two arguments, had: {n}",
+            code=1257300,
+            code_name="Location1257300",
+        )
     *checks, fallback = arg
     for check in checks:
         v = _eval(check, ctx)
@@ -768,7 +775,12 @@ def _op_set_field(arg: Any, ctx: _Ctx) -> Any:
         raise ExpressionError("$setField requires field, input, value")
     field = _eval(field_expr, ctx)
     if not isinstance(field, str):
-        raise ExpressionError("$setField field must evaluate to a string")
+        raise ExpressionError(
+            "$setField requires 'field' to evaluate to type String, but got "
+            f"{_bson_type_name(field)}",
+            code=4161107,
+            code_name="Location4161107",
+        )
     input_doc = _eval(input_expr, ctx)
     if input_doc is None:
         return None
@@ -804,7 +816,12 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
             raise ExpressionError("$getField requires a field")
         field = _eval(field_expr, ctx)
         if not isinstance(field, str):
-            raise ExpressionError("$getField field must evaluate to a string")
+            raise ExpressionError(
+                "$getField requires 'field' to evaluate to type String, but got "
+                f"{_bson_type_name(field)}",
+                code=5654602,
+                code_name="Location5654602",
+            )
     else:
         raise ExpressionError("$getField requires a string or {field, input} document")
     # Evaluate ``input`` in a missing-aware way so we can tell an input that
@@ -841,6 +858,10 @@ def _op_switch(arg: Any, ctx: _Ctx) -> Any:
     branches = arg.get("branches")
     if not isinstance(branches, list):
         raise ExpressionError("$switch branches must be an array")
+    if not branches:
+        raise ExpressionError(
+            "$switch requires at least one branch", code=40068, code_name="Location40068"
+        )
     for branch in branches:
         if not isinstance(branch, Mapping) or "case" not in branch or "then" not in branch:
             raise ExpressionError("each $switch branch needs case and then")
@@ -946,7 +967,7 @@ def _shift_date(d: _dt.datetime, unit: str, amount: int) -> _dt.datetime:
         return d + _dt.timedelta(seconds=amount)
     if unit == "millisecond":
         return d + _dt.timedelta(milliseconds=amount)
-    raise ExpressionError(f"unsupported date unit: {unit!r}")
+    raise ExpressionError(f"unknown time unit value: {unit}", code=9, code_name="FailedToParse")
 
 
 def _date_int(v: Any) -> int | None:
@@ -1068,17 +1089,15 @@ def _op_date_trunc(arg: Any, ctx: _Ctx) -> Any:
         ms = date.microsecond // 1000
         ms -= ms % bin_size
         return date.replace(microsecond=ms * 1000)
-    raise ExpressionError(f"unsupported $dateTrunc unit: {unit!r}")
+    raise ExpressionError(f"unknown time unit value: {unit}", code=9, code_name="FailedToParse")
 
 
 def _op_date_to_parts(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateToParts requires a document spec")
-    date = _eval(arg.get("date"), ctx)
+    date = _coerce_extractor_date(_eval(arg.get("date"), ctx))
     if date is None:
         return None
-    if not isinstance(date, _dt.datetime):
-        raise ExpressionError("$dateToParts date must be a datetime")
     tz = _resolve_timezone(arg.get("timezone"))
     if tz is not None:
         # Naive input is treated as UTC (BSON Date semantics); shift into the zone
@@ -1391,6 +1410,13 @@ def _op_date_from_parts(arg: Any, ctx: _Ctx) -> Any:
 def _op_date_diff(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateDiff requires a document spec")
+    # A missing required *parameter* (key absent) is a mongod parse error, distinct
+    # from a present parameter that evaluates to null (which yields null).
+    for param, code in (("startDate", 5166303), ("endDate", 5166304), ("unit", 5166305)):
+        if param not in arg:
+            raise ExpressionError(
+                f"Missing '{param}' parameter to $dateDiff", code=code, code_name=f"Location{code}"
+            )
     start = _eval(arg.get("startDate"), ctx)
     end = _eval(arg.get("endDate"), ctx)
     unit = _eval(arg.get("unit"), ctx)
@@ -1979,7 +2005,12 @@ def _op_sort_array(arg: Any, ctx: _Ctx) -> Any:
     if isinstance(sort_by, int):
         return sorted(arr, reverse=(sort_by == -1))
     if not isinstance(sort_by, Mapping):
-        raise ExpressionError("$sortArray sortBy must be int or document")
+        raise ExpressionError(
+            "The $sort is invalid: use 1/-1 to sort the whole element, or "
+            "{field:1/-1} to sort embedded fields",
+            code=2942507,
+            code_name="Location2942507",
+        )
 
     def _key(elem: Any) -> tuple[Any, ...]:
         from secantus.storage import _SortKey
@@ -2170,7 +2201,12 @@ def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
     if raw is None:
         return _eval(arg["onNull"], ctx) if "onNull" in arg else None
     if not isinstance(raw, str):
-        raise ExpressionError("$dateFromString dateString must be a string")
+        raise ExpressionError(
+            "$dateFromString requires that 'dateString' be a string, found: "
+            f"{_bson_type_name(raw)}",
+            code=241,
+            code_name="ConversionFailure",
+        )
     fmt = arg.get("format")
     tz = _resolve_timezone(arg.get("timezone"))
     try:
@@ -2190,7 +2226,8 @@ def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
 def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateToString requires {date, format}")
-    d = _ensure_datetime(_eval(arg["date"], ctx))
+    # A non-date, non-null 'date' is mongod Location16006 (was silently null).
+    d = _coerce_extractor_date(_eval(arg["date"], ctx))
     if d is None:
         return None
     fmt = arg.get("format", "%Y-%m-%dT%H:%M:%S.%LZ")
@@ -2697,8 +2734,13 @@ def _convert_value(value: Any, target: Any) -> Any:
 
 
 def _op_convert(arg: Any, ctx: _Ctx) -> Any:
-    if not isinstance(arg, Mapping) or "input" not in arg or "to" not in arg:
+    if not isinstance(arg, Mapping):
         raise ExpressionError("$convert requires {input, to}")
+    for param in ("input", "to"):
+        if param not in arg:
+            raise ExpressionError(
+                f"Missing '{param}' parameter to $convert", code=9, code_name="FailedToParse"
+            )
     value = _eval(arg["input"], ctx)
     target = _eval(arg["to"], ctx)
     # An unknown target type name is a query-compile error (code 2) that mongod

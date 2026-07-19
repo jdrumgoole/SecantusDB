@@ -2184,7 +2184,8 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback)?;
     let millis = match eval(spec.get("date").ok_or(Fallback)?, ctx)? {
         Bson::DateTime(dt) => dt.timestamp_millis(),
-        _ => return Ok(Bson::Null), // `_ensure_datetime(non-datetime)` -> None -> null
+        Bson::Null => return Ok(Bson::Null), // null date -> null
+        _ => return Err(Fallback),           // non-date -> Python raises Location16006
     };
     // A `timezone` shifts the wall clock before rendering (naive input is UTC,
     // matching BSON Date semantics); see `timezone_offset_ms` for the fixed-offset
@@ -2551,6 +2552,13 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
+    // A missing required *parameter* (key absent) is a mongod parse error
+    // (Location5166303/4/5) -> Python raises; a present-but-null one yields null.
+    for param in ["startDate", "endDate", "unit"] {
+        if !d.contains_key(param) {
+            return Err(Fallback);
+        }
+    }
     let start = eval_opt(d.get("startDate"), ctx)?;
     let end = eval_opt(d.get("endDate"), ctx)?;
     if is_null(&start) || is_null(&end) {

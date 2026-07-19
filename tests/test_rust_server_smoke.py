@@ -1612,6 +1612,32 @@ def test_to_int_convert_overflow(tmp_path) -> None:
         srv.stop()
 
 
+def test_date_misc_typeguard_validation(tmp_path) -> None:
+    """The Rust server errors (defer -> BadValue) on $dateToString with a non-date
+    and $dateDiff with a missing endDate — both previously silent accepts — and on
+    an unknown $dateTrunc unit. A valid $dateToString still computes."""
+    import datetime
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "n": 5, "d": datetime.datetime(2020, 1, 1)})
+        for expr in (
+            {"$dateToString": {"date": "$n"}},  # was a silent null
+            {"$dateDiff": {"startDate": "$d"}},  # missing endDate, was a silent null
+            {"$dateTrunc": {"date": "$d", "unit": "bogus"}},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"v": expr}}]))
+        # A valid $dateToString still computes.
+        got = list(
+            coll.aggregate([{"$project": {"_id": 0, "s": {"$dateToString": {"date": "$d"}}}}])
+        )
+        assert got == [{"s": "2020-01-01T00:00:00.000Z"}]
+    finally:
+        srv.stop()
+
+
 def test_array_set_typeguard_validation(tmp_path) -> None:
     """The Rust server errors (defer -> BadValue) on a non-array/non-object
     argument to array/set operators — including $in and $arrayElemAt, which

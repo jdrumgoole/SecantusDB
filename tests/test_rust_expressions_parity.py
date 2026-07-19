@@ -1387,3 +1387,32 @@ def test_string_typeguard_defers_and_raises(expr, code):
     with pytest.raises(_pure.ExpressionError) as exc:
         _pure.evaluate(expr, doc)
     assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "expr,code",
+    [
+        ({"$dateToString": {"date": "x"}}, 16006),
+        ({"$dateToParts": {"date": "x"}}, 16006),
+        ({"$dateFromString": {"dateString": 5}}, 241),
+        ({"$let": {"vars": {}, "in": "$$x"}}, 17276),
+        ({"$switch": {"branches": []}}, 40068),
+        ({"$ifNull": [1]}, 1257300),
+        ({"$getField": {"field": 5, "input": {}}}, 5654602),
+        ({"$setField": {"field": 5, "input": {}, "value": 1}}, 4161107),
+        ({"$sortArray": {"input": [1], "sortBy": "x"}}, 2942507),
+        ({"$convert": {"input": 5}}, 9),
+        ({"$dateDiff": {"startDate": _DT}}, 5166304),
+    ],
+)
+def test_date_misc_typeguard_defers_and_raises(expr, code):
+    # Date/misc operator error cases: Rust must defer (raw evaluate None) so the
+    # pure engine raises mongod's exact code. $dateToString and $dateDiff missing
+    # endDate were silent accepts.
+    doc = bson.decode(bson.encode({"_id": 1}))
+    expr = bson.decode(bson.encode({"e": expr}))["e"]
+    raw = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode({}))
+    assert raw is None
+    with pytest.raises(_pure.ExpressionError) as exc:
+        _pure.evaluate(expr, doc)
+    assert exc.value.code == code

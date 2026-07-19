@@ -381,7 +381,9 @@ CURATED = [
     ({"a": 5, "b": 3, "name": "x"}, {"name": "x", "$expr": {"$gt": ["$a", "$b"]}}),
     ({}, {"$expr": "$missing"}),  # falsy
     ({"x": None}, {"$expr": "$x"}),  # falsy
-    ({"a": 5}, {"$expr": {"$dateToString": {"date": "$a"}}}),  # unported op -> defer
+    # $dateToString inside $expr on a real date (a non-date now correctly raises
+    # Location16006 on both engines — see test_date_misc_typeguard_defers_and_raises).
+    ({"a": datetime.datetime(2026, 1, 1)}, {"$expr": {"$dateToString": {"date": "$a"}}}),
     # $all — now handled in Rust (element equality via Python ==).
     ({"tags": ["a", "b", "c"]}, {"tags": {"$all": ["a", "b"]}}),
     ({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}}),
