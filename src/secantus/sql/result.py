@@ -17,6 +17,10 @@ class ColumnDesc:
     name: str
     type_tag: str
     pg_oid: int
+    # PG type modifier (``atttypmod``): n+4 for varchar(n)/bpchar(n),
+    # ((p<<16)|(s&0x7FF))+4 for numeric(p,s), the bare length/precision for
+    # bit/varbit/time-family types, -1 when the type carries none.
+    typmod: int = -1
 
 
 @dataclass

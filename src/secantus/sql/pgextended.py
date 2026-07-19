@@ -504,6 +504,11 @@ _ARRAY_ELEM_BY_OID: dict[int, tuple[int, str]] = {
 # json[] (199 → json 114) — our ``json`` tag maps to jsonb (3802/3807), but a
 # client can still bind an array parameter with the plain-json OIDs.
 _ARRAY_ELEM_BY_OID[199] = (114, "json")
+# varchar[]/bpchar[] — no internal tag of their own (values are text), but
+# result columns report the real array oids (1015/1014) now that varchar/
+# bpchar keep their type identity, so the binary encoder must know them.
+_ARRAY_ELEM_BY_OID[1015] = (1043, "text")
+_ARRAY_ELEM_BY_OID[1014] = (1042, "text")
 
 # A user type's paired array oid is its own oid + USER_TYPE_ARRAY_OID_OFFSET
 # (see catalog.py); everything at or above this floor is a user-type array whose
@@ -1096,7 +1101,9 @@ class ExtendedSession:
         if cols is None:
             return pgwire.no_data()
         return pgwire.row_description(
-            [(c.name, c.pg_oid) for c in cols], formats, encoding=self.session.wire_encoding
+            [(c.name, c.pg_oid, c.typmod) for c in cols],
+            formats,
+            encoding=self.session.wire_encoding,
         )
 
 

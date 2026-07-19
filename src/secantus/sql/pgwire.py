@@ -344,21 +344,24 @@ _TYPLEN: dict[int, int] = {
 
 
 def row_description(
-    columns: list[tuple[str, int]],
+    columns: list[tuple[str, int] | tuple[str, int, int]],
     formats: list[int] | None = None,
     encoding: str | None = None,
 ) -> bytes:
-    """``columns`` is a list of (name, type_oid); ``formats`` the per-column result
-    format codes (0=text, 1=binary), defaulting to all-text. Column names encode
-    in the client's ``client_encoding`` (``encoding``; UTF-8 when None)."""
+    """``columns`` is a list of (name, type_oid[, typmod]); ``formats`` the
+    per-column result format codes (0=text, 1=binary), defaulting to all-text.
+    Column names encode in the client's ``client_encoding`` (``encoding``;
+    UTF-8 when None). A missing typmod emits -1 (no modifier)."""
     payload = bytearray(_INT16.pack(len(columns)))
-    for i, (name, type_oid) in enumerate(columns):
+    for i, col in enumerate(columns):
+        name, type_oid = col[0], col[1]
+        typmod = col[2] if len(col) > 2 else -1
         payload += name.encode(encoding or "utf-8", errors="replace") + b"\x00"
         payload += _INT32.pack(0)  # table OID (unknown)
         payload += _INT16.pack(0)  # column attribute number
         payload += _INT32.pack(type_oid)
         payload += _INT16.pack(_TYPLEN.get(type_oid, -1))  # type size
-        payload += _INT32.pack(-1)  # type modifier
+        payload += _INT32.pack(typmod)  # type modifier
         payload += _INT16.pack(formats[i] if formats is not None else 0)  # 0=text, 1=binary
     return _msg("T", bytes(payload))
 

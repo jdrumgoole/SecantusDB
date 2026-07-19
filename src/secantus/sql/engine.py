@@ -301,7 +301,7 @@ def _dispatch(
     ends (Postgres' aborted-transaction semantics).
     """
     if isinstance(stmt, exp.Transaction):
-        return _begin_txn(storage, session)
+        return _begin_txn(storage, session, stmt.args.get("modes") or [])
     if isinstance(stmt, exp.Commit):
         return _commit_txn(storage, db, catalog, session)
     if isinstance(stmt, exp.Rollback):
@@ -340,14 +340,47 @@ def _dispatch(
     return _run_statement(stmt, storage, db, catalog, session)
 
 
-def _begin_txn(storage: Any, session: Session) -> SQLResult:
+def _begin_txn(storage: Any, session: Session, modes: list | None = None) -> SQLResult:
     # A nested BEGIN is a no-op in Postgres (it warns and stays in the block).
     if session.txn_handle is None:
         session.txn_handle = storage.begin_user_transaction()
         session.txn_failed = False
         session.savepoints = []
         session.reset_deferred()
+        # ``BEGIN ISOLATION LEVEL x / READ ONLY / DEFERRABLE`` — apply the
+        # characteristics for this transaction only (the SET LOCAL mechanism
+        # reverts them at COMMIT/ROLLBACK). Single-node: the isolation level is
+        # tracked and reported but every transaction runs on WiredTiger's
+        # snapshot isolation regardless.
+        for name, value in _parse_txn_characteristics(
+            " ".join(str(m) for m in (modes or []))
+        ).items():
+            session.set_local(name, value)
     return SQLResult(command_tag="BEGIN")
+
+
+_TXN_ISOLATION_RE = re.compile(
+    r"isolation\s+level\s+(read\s+uncommitted|read\s+committed|repeatable\s+read|serializable)",
+    re.IGNORECASE,
+)
+
+
+def _parse_txn_characteristics(tail: str) -> dict[str, str]:
+    """Map a transaction-characteristics tail (from BEGIN / START TRANSACTION /
+    SET TRANSACTION) to the ``transaction_*`` GUC values it sets."""
+    out: dict[str, str] = {}
+    m = _TXN_ISOLATION_RE.search(tail)
+    if m is not None:
+        out["transaction_isolation"] = re.sub(r"\s+", " ", m.group(1).lower())
+    if re.search(r"\bread\s+only\b", tail, re.IGNORECASE):
+        out["transaction_read_only"] = "on"
+    elif re.search(r"\bread\s+write\b", tail, re.IGNORECASE):
+        out["transaction_read_only"] = "off"
+    if re.search(r"\bnot\s+deferrable\b", tail, re.IGNORECASE):
+        out["transaction_deferrable"] = "off"
+    elif re.search(r"\bdeferrable\b", tail, re.IGNORECASE):
+        out["transaction_deferrable"] = "on"
+    return out
 
 
 def _commit_txn(storage: Any, db: str, catalog: Catalog, session: Session) -> SQLResult:
@@ -1237,9 +1270,10 @@ def _describe_statement(
     if table_node is None:
         plan = planner.plan_constant_select(stmt, session, storage, catalog, db)
         oids = plan.pg_oids or [None] * len(plan.columns)
+        typmods = plan.typmods or [-1] * len(plan.columns)
         return [
-            ColumnDesc(n, t, oid if oid is not None else typemap.PG_OID.get(t, 25))
-            for (n, t, _), oid in zip(plan.columns, oids, strict=True)
+            ColumnDesc(n, t, oid if oid is not None else typemap.PG_OID.get(t, 25), typmod)
+            for (n, t, _), oid, typmod in zip(plan.columns, oids, typmods, strict=True)
         ]
     if planner.select_needs_pipeline(stmt):
         pplan = planner.plan_pipeline_select(stmt, db, catalog, storage)
@@ -3945,12 +3979,16 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
     reported: list[tuple[str, str]] = []
     for item in stmt.expressions:
         # SET TRANSACTION [ISOLATION LEVEL ...|READ ONLY|READ WRITE|DEFERRABLE]:
-        # accepted as a no-op — SecantusDB is single-node, so isolation/read-only
-        # characteristics don't change behaviour.
+        # applies the characteristics to the current transaction (reported via
+        # the transaction_* GUCs; single-node, so behaviour doesn't change).
         if (
             isinstance(item, exp.SetItem)
             and str(item.args.get("kind") or "").upper() == "TRANSACTION"
         ):
+            if session.txn_handle is not None:
+                chars = _parse_txn_characteristics(item.this.sql() if item.this else item.sql())
+                for cname, cvalue in chars.items():
+                    session.set_local(cname, cvalue)
             continue
         inner = item.this if isinstance(item, exp.SetItem) else item
         if not isinstance(inner, exp.EQ):
@@ -4123,6 +4161,22 @@ def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
         reported = [(name, session.get_setting(name))] if name in REPORTABLE_GUCS else []
         return SQLResult(command_tag="RESET", parameter_status=reported)
     if verb == "SET":
+        # SET TRANSACTION <chars> — applies to the open transaction only.
+        m_txn = re.match(r"(?is)^transaction\s+(?P<tail>.+?)\s*;?\s*$", name)
+        if m_txn is not None:
+            if session.txn_handle is not None:
+                for cname, cvalue in _parse_txn_characteristics(m_txn.group("tail")).items():
+                    session.set_local(cname, cvalue)
+            return SQLResult(command_tag="SET")
+        # SET SESSION CHARACTERISTICS AS TRANSACTION <chars> — sets the
+        # session-default transaction characteristics (default_transaction_*).
+        m_chars = re.match(
+            r"(?is)^session\s+characteristics\s+as\s+transaction\s+(?P<tail>.+?)\s*;?\s*$", name
+        )
+        if m_chars is not None:
+            for cname, cvalue in _parse_txn_characteristics(m_chars.group("tail")).items():
+                session.settings[f"default_{cname}"] = cvalue
+            return SQLResult(command_tag="SET")
         # ``SET name = v1, v2`` (DateStyle's two-part value) parses as a raw
         # Command, not exp.Set — store and report it like the structured path.
         m_set = _SET_MULTI_RE.match(name)

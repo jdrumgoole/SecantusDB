@@ -139,6 +139,9 @@ class ConstantSelectPlan:
     # stays ``text`` (the value form IS the label text) but the descriptor must
     # report the minted enum oid or a client's registered loader won't fire.
     pg_oids: list[int | None] = field(default_factory=list)
+    # Per-column PG type modifiers, parallel to ``columns`` (-1 = none).
+    # ``select null::varchar(42)`` describes with typmod 46 like real PG.
+    typmods: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -247,6 +250,13 @@ def _literal(node: exp.Expression) -> Any:
         return float(text) if ("." in text or "e" in text.lower()) else int(text)
     if isinstance(node, exp.BitString):  # ``B'1010'`` -> the canonical '0'/'1' string
         return str(node.this)
+    if isinstance(node, exp.ByteString):
+        # ``E'…'`` escape-string literal (psycopg's ClientCursor emits it for
+        # any string containing a backslash) — sqlglot's postgres dialect lexes
+        # it as a ByteString and keeps the escapes raw.
+        from secantus.sql.scalar import _unescape_estring
+
+        return _unescape_estring(str(node.this))
     if isinstance(node, exp.Interval):  # ``interval '1 day'`` -> an interval subdoc
         from secantus.sql import intervals as _intervals
 
@@ -2390,6 +2400,7 @@ def plan_constant_select(
             value = scalar.evaluate(target, _const_scope, ctx)
             columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
     pg_oids: list[int | None] = [None] * len(columns)
+    typmods: list[int] = [-1] * len(columns)
     for i, e in enumerate(stmt.expressions):
         override = _constant_enum_override(e, ctx) or _constant_composite_extra_override(e, ctx)
         if override is not None:
@@ -2398,7 +2409,15 @@ def plan_constant_select(
             if tag is not None:
                 name, _old_tag, value = columns[i]
                 columns[i] = (name, tag, value)
-    return ConstantSelectPlan(columns=columns, emit=emit, pg_oids=pg_oids)
+            continue
+        # ``null::varchar(42)`` — a modifier-bearing cast target describes with
+        # its distinct oid + typmod (varchar/bpchar differ from text even bare).
+        target = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(target, exp.Cast):
+            identity = typemap.cast_type_identity(target.to)
+            if identity is not None:
+                pg_oids[i], typmods[i] = identity
+    return ConstantSelectPlan(columns=columns, emit=emit, pg_oids=pg_oids, typmods=typmods)
 
 
 def _constant_enum_override(e: exp.Expression, ctx: Any) -> tuple[str | None, int] | None:
@@ -9291,6 +9310,29 @@ _COPY_BARE_OPTIONS_RE = re.compile(
 )
 
 
+# A ``::numeric(p,-s)`` cast — the only spot Postgres syntax allows a negative
+# scale. Anchored on the ``::`` cast so a matching text inside a string literal
+# isn't touched.
+_NEGSCALE_RE = re.compile(r"(::\s*(?:numeric|decimal)\s*\(\s*\d+\s*,\s*)-\s*(\d+)(\s*\))", re.I)
+
+# ``BEGIN`` / ``START TRANSACTION`` with transaction characteristics — sqlglot
+# parses some spellings (``BEGIN ISOLATION LEVEL x``) but not others (``BEGIN
+# READ ONLY``, the comma-separated ``START TRANSACTION a, b``). The tail is
+# pure keywords (letters/commas/whitespace), so a compound statement never
+# matches and falls through to sqlglot.
+_BEGIN_CHARACTERISTICS_RE = re.compile(
+    r"^\s*(?:BEGIN|START\s+TRANSACTION)(?:\s+(?:WORK|TRANSACTION))?\s+"
+    r"(?P<tail>(?:ISOLATION|READ|NOT|DEFERRABLE)[A-Za-z,\s]*?)\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+# ``SET TRANSACTION <characteristics>`` — the keyword tail, like BEGIN's.
+_SET_TRANSACTION_RE = re.compile(
+    r"^\s*SET\s+TRANSACTION\s+(?P<tail>(?:ISOLATION|READ|NOT|DEFERRABLE)[A-Za-z,\s]*?)\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+
 #: Reject a statement string longer than this before handing it to sqlglot. 1 MB
 #: is far larger than any real query yet small enough that a flood of oversized
 #: statements can't pin the parser.
@@ -9309,6 +9351,19 @@ def parse(sql: str) -> list[exp.Expression]:
     move = _MOVE_RE.match(sql)
     if move is not None:
         return [exp.Command(this="MOVE", expression=exp.Literal.string(move.group("tail")))]
+    begin = _BEGIN_CHARACTERISTICS_RE.match(sql)
+    if begin is not None:
+        return [exp.Transaction(modes=[begin.group("tail")])]
+    # ``SET TRANSACTION <characteristics>`` — sqlglot rejects some spellings
+    # (``SET TRANSACTION DEFERRABLE``); route every form to the Command SET
+    # handler, which applies the characteristics to the open transaction.
+    set_txn = _SET_TRANSACTION_RE.match(sql)
+    if set_txn is not None:
+        return [
+            exp.Command(
+                this="SET", expression=exp.Literal.string(f"TRANSACTION {set_txn.group('tail')}")
+            )
+        ]
     # sqlglot parses ``RELEASE x`` but not the equivalent ``RELEASE SAVEPOINT x``
     # (the standard form SQLAlchemy / psycopg emit) — drop the redundant keyword.
     # Savepoint commands are standalone, so this can't touch a string literal.
@@ -9323,6 +9378,12 @@ def parse(sql: str) -> list[exp.Expression]:
     sql = _COMMENT_NULL_RE.sub(lambda m: f"{m.group(1)}'{UNCOMMENT_SENTINEL}'{m.group(2)}", sql)
     # ``COPY … TO STDOUT (FORMAT csv)`` — insert the WITH sqlglot requires.
     sql = _COPY_BARE_OPTIONS_RE.sub(r"\1 WITH (", sql)
+    # sqlglot can't parse a negative numeric scale (``::numeric(2,-3)``) —
+    # rewrite it to a sentinel value the typmod encoder undoes (the cast
+    # evaluator ignores precision/scale, so only the descriptor sees it).
+    sql = _NEGSCALE_RE.sub(
+        lambda m: f"{m.group(1)}{typemap.NEGSCALE_SENTINEL + int(m.group(2))}{m.group(3)}", sql
+    )
     try:
         return [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
     except sqlglot.errors.ParseError as exc:

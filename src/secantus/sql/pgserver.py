@@ -638,7 +638,9 @@ def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None
     for name, value in status:
         out += pgwire.parameter_status(name, value)
     if res.columns or res.command_tag.startswith("SELECT"):
-        out += pgwire.row_description([(c.name, c.pg_oid) for c in res.columns], encoding=encoding)
+        out += pgwire.row_description(
+            [(c.name, c.pg_oid, c.typmod) for c in res.columns], encoding=encoding
+        )
         tags = [c.type_tag for c in res.columns]
         for row in res.rows:
             out += pgwire.data_row(

@@ -1862,13 +1862,6 @@ The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike
   SCHEMA and schema-qualified user *types* landed; tables in a user schema
   still raise. Needs the (db, coll) storage key to carry the schema (or a
   dotted-collection mapping like the types take).
-- [ ] **User-defined range types** (`CREATE TYPE t AS RANGE (subtype = …)`)
-  — psycopg's testrange/testmultirange fixtures create them; needs a range
-  registry + codec plumbing keyed by the minted oid. Note sqlglot can't parse
-  the statement (falls to `exp.Command` → intercept the raw text in
-  `engine._run_command`); worth `virtual.pg_range` rows + stable minted oids
-  (like `Catalog.enum_type_oids`) so psycopg's `RangeInfo.fetch` works.
-  Blocks ~36 psycopg range/multirange outcomes (5 failures + 31 errors).
 - [ ] **Untyped binary parameters need Parse-time type inference.** psycopg
   dumps a bound-less `Range(empty=True)` (and lists of them) with oid 0 in
   BINARY format; real PG infers `$1`'s type from the statement context at
