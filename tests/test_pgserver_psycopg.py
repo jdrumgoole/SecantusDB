@@ -169,7 +169,13 @@ def test_idle_in_transaction_session_timeout(server):
         conn.execute("SET idle_in_transaction_session_timeout = 100")
         conn.execute("SELECT 1")  # opens the transaction block
         time.sleep(0.6)
-        with pytest.raises(psycopg.errors.IdleInTransactionSessionTimeout):
+        # The typed IdleInTransactionSessionTimeout on platforms that deliver
+        # the FATAL message before the close; on Windows the socket abort can
+        # race it, surfacing a plain OperationalError (same as psycopg's own
+        # test_right_exception_on_session_timeout win32 branch).
+        with pytest.raises(
+            (psycopg.errors.IdleInTransactionSessionTimeout, psycopg.OperationalError)
+        ):
             conn.execute("SELECT 1")
     finally:
         with contextlib.suppress(psycopg.Error):
