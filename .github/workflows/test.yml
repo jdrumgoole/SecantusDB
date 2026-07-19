@@ -225,8 +225,13 @@ jobs:
           # gate the workflow.
           prune-cache: false
           # ...and the managed interpreter is not cached by default either, so
-          # each job also pulled cpython-3.x (28 MB) fresh.
-          cache-python: true
+          # each job also pulled cpython-3.x (28 MB) fresh. Windows is excluded:
+          # restoring uv's cached python-dir there fails in "Set up Python" with
+          # `Failed to create Python minor version link directory ... The
+          # directory name is invalid. (os error 267)` — the junction/link dir
+          # doesn't round-trip through the GitHub cache on NTFS. Keep the cache
+          # on Linux/macOS (the 28 MB win); skip it on Windows.
+          cache-python: ${{ runner.os != 'Windows' }}
           # Default ``cache-dependency-glob`` is ``**/uv.lock``; on
           # Windows the recursive walk trips over deep paths under
           # vendor/mongo-ruby-driver (EPERM at .evergreen/atlas).
@@ -235,8 +240,25 @@ jobs:
           # filesystem traversal on every runner.
           cache-dependency-glob: uv.lock
 
+      # Windows uses actions/setup-python (the runner tool cache) rather than a
+      # uv-managed interpreter: uv's cache-python can't restore the python-dir
+      # junction on NTFS ("Set up Python" fails with os error 267), and the tool
+      # cache supplies the interpreter without the 28 MB re-download. UV_PYTHON is
+      # then repointed from the matrix version string at that interpreter's path
+      # so every subsequent `uv` command uses it. Non-Windows keeps uv-managed.
       - name: Set up Python ${{ matrix.python-version }}
+        if: runner.os != 'Windows'
         run: uv python install ${{ matrix.python-version }}
+      - name: Set up Python ${{ matrix.python-version }} (Windows tool cache)
+        if: runner.os == 'Windows'
+        id: setup-python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Point uv at the tool-cached interpreter (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
 
       # --- WiredTiger build cache -------------------------------------
       # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
@@ -462,14 +484,36 @@ jobs:
           # gate the workflow.
           prune-cache: false
           # ...and the managed interpreter is not cached by default either, so
-          # each job also pulled cpython-3.x (28 MB) fresh.
-          cache-python: true
+          # each job also pulled cpython-3.x (28 MB) fresh. Windows is excluded:
+          # restoring uv's cached python-dir there fails in "Set up Python" with
+          # `Failed to create Python minor version link directory ... The
+          # directory name is invalid. (os error 267)` — the junction/link dir
+          # doesn't round-trip through the GitHub cache on NTFS. Keep the cache
+          # on Linux/macOS (the 28 MB win); skip it on Windows.
+          cache-python: ${{ runner.os != 'Windows' }}
           # Same narrow glob as the ``test`` job: one lock file at the repo
           # root, and the default recursive walk trips on deep vendor paths.
           cache-dependency-glob: uv.lock
 
+      # Windows uses actions/setup-python (the runner tool cache) rather than a
+      # uv-managed interpreter: uv's cache-python can't restore the python-dir
+      # junction on NTFS ("Set up Python" fails with os error 267), and the tool
+      # cache supplies the interpreter without the 28 MB re-download. UV_PYTHON is
+      # then repointed from the matrix version string at that interpreter's path
+      # so every subsequent `uv` command uses it. Non-Windows keeps uv-managed.
       - name: Set up Python ${{ matrix.python-version }}
+        if: runner.os != 'Windows'
         run: uv python install ${{ matrix.python-version }}
+      - name: Set up Python ${{ matrix.python-version }} (Windows tool cache)
+        if: runner.os == 'Windows'
+        id: setup-python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Point uv at the tool-cached interpreter (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
 
       # --- WiredTiger build cache -------------------------------------
       # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
@@ -674,12 +718,34 @@ jobs:
           # gate the workflow.
           prune-cache: false
           # ...and the managed interpreter is not cached by default either, so
-          # each job also pulled cpython-3.x (28 MB) fresh.
-          cache-python: true
+          # each job also pulled cpython-3.x (28 MB) fresh. Windows is excluded:
+          # restoring uv's cached python-dir there fails in "Set up Python" with
+          # `Failed to create Python minor version link directory ... The
+          # directory name is invalid. (os error 267)` — the junction/link dir
+          # doesn't round-trip through the GitHub cache on NTFS. Keep the cache
+          # on Linux/macOS (the 28 MB win); skip it on Windows.
+          cache-python: ${{ runner.os != 'Windows' }}
           cache-dependency-glob: uv.lock
 
+      # Windows uses actions/setup-python (the runner tool cache) rather than a
+      # uv-managed interpreter: uv's cache-python can't restore the python-dir
+      # junction on NTFS ("Set up Python" fails with os error 267), and the tool
+      # cache supplies the interpreter without the 28 MB re-download. UV_PYTHON is
+      # then repointed from the matrix version string at that interpreter's path
+      # so every subsequent `uv` command uses it. Non-Windows keeps uv-managed.
       - name: Set up Python ${{ matrix.python-version }}
+        if: runner.os != 'Windows'
         run: uv python install ${{ matrix.python-version }}
+      - name: Set up Python ${{ matrix.python-version }} (Windows tool cache)
+        if: runner.os == 'Windows'
+        id: setup-python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Point uv at the tool-cached interpreter (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
 
       # --- WiredTiger build cache -------------------------------------
       # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
@@ -846,12 +912,31 @@ jobs:
           # gate the workflow.
           prune-cache: false
           # ...and the managed interpreter is not cached by default either, so
-          # each job also pulled cpython-3.x (28 MB) fresh.
-          cache-python: true
+          # each job also pulled cpython-3.x (28 MB) fresh. Windows is excluded:
+          # restoring uv's cached python-dir there fails in "Set up Python" with
+          # `Failed to create Python minor version link directory ... The
+          # directory name is invalid. (os error 267)` — the junction/link dir
+          # doesn't round-trip through the GitHub cache on NTFS. Keep the cache
+          # on Linux/macOS (the 28 MB win); skip it on Windows.
+          cache-python: ${{ runner.os != 'Windows' }}
           cache-dependency-glob: uv.lock
 
+      # See the matrix jobs: Windows uses the runner tool cache (no NTFS
+      # python-dir junction to restore, no 28 MB re-download); UV_PYTHON is
+      # repointed at that interpreter. Non-Windows keeps the uv-managed 3.12.
       - name: Set up Python 3.12
+        if: runner.os != 'Windows'
         run: uv python install 3.12
+      - name: Set up Python 3.12 (Windows tool cache)
+        if: runner.os == 'Windows'
+        id: setup-python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Point uv at the tool-cached interpreter (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
 
       # --- WiredTiger build cache -------------------------------------
       # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
@@ -984,12 +1069,31 @@ jobs:
           # gate the workflow.
           prune-cache: false
           # ...and the managed interpreter is not cached by default either, so
-          # each job also pulled cpython-3.x (28 MB) fresh.
-          cache-python: true
+          # each job also pulled cpython-3.x (28 MB) fresh. Windows is excluded:
+          # restoring uv's cached python-dir there fails in "Set up Python" with
+          # `Failed to create Python minor version link directory ... The
+          # directory name is invalid. (os error 267)` — the junction/link dir
+          # doesn't round-trip through the GitHub cache on NTFS. Keep the cache
+          # on Linux/macOS (the 28 MB win); skip it on Windows.
+          cache-python: ${{ runner.os != 'Windows' }}
           cache-dependency-glob: uv.lock
 
+      # See the matrix jobs: Windows uses the runner tool cache (no NTFS
+      # python-dir junction to restore, no 28 MB re-download); UV_PYTHON is
+      # repointed at that interpreter. Non-Windows keeps the uv-managed 3.12.
       - name: Set up Python 3.12
+        if: runner.os != 'Windows'
         run: uv python install 3.12
+      - name: Set up Python 3.12 (Windows tool cache)
+        if: runner.os == 'Windows'
+        id: setup-python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Point uv at the tool-cached interpreter (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
 
       # --- WiredTiger build cache -------------------------------------
       # The vendored WiredTiger C build is ~100s in EVERY job. It is cacheable
@@ -1174,12 +1278,31 @@ jobs:
           # gate the workflow.
           prune-cache: false
           # ...and the managed interpreter is not cached by default either, so
-          # each job also pulled cpython-3.x (28 MB) fresh.
-          cache-python: true
+          # each job also pulled cpython-3.x (28 MB) fresh. Windows is excluded:
+          # restoring uv's cached python-dir there fails in "Set up Python" with
+          # `Failed to create Python minor version link directory ... The
+          # directory name is invalid. (os error 267)` — the junction/link dir
+          # doesn't round-trip through the GitHub cache on NTFS. Keep the cache
+          # on Linux/macOS (the 28 MB win); skip it on Windows.
+          cache-python: ${{ runner.os != 'Windows' }}
           cache-dependency-glob: uv.lock
 
+      # See the matrix jobs: Windows uses the runner tool cache (no NTFS
+      # python-dir junction to restore, no 28 MB re-download); UV_PYTHON is
+      # repointed at that interpreter. Non-Windows keeps the uv-managed 3.12.
       - name: Set up Python 3.12
+        if: runner.os != 'Windows'
         run: uv python install 3.12
+      - name: Set up Python 3.12 (Windows tool cache)
+        if: runner.os == 'Windows'
+        id: setup-python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Point uv at the tool-cached interpreter (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
 
       # --- cargo caching -------------------------------------------------
       # This job became the workflow's critical path once the test lanes were

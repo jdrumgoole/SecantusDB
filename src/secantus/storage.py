@@ -226,7 +226,14 @@ def extract_backup_archive(
                 f"extract_backup_archive: archive {abs_archive!r} is not "
                 "a SecantusDB backup (no WiredTiger metadata file inside)"
             )
-        tar.extractall(abs_target, filter="data")
+        # `filter="data"` (PEP 706 path-traversal hardening) is only accepted on
+        # 3.12+ and the 3.10.12 / 3.11.4 backports — not on older 3.10/3.11 patch
+        # releases (e.g. python.org's last 3.10 Windows binary, 3.10.11). Use it
+        # when available; otherwise extract without it.
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(abs_target, filter="data")
+        else:
+            tar.extractall(abs_target)
 
     return {
         "targetDir": abs_target,
