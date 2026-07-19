@@ -323,10 +323,17 @@ def rust_server_build(c: Context) -> None:
     ``RustServer`` from this extension, so a stale build silently measures old
     code. Rebuilds the WiredTiger-linking storage engine and reinstalls the
     editable package. WiredTiger / libclang prerequisites as ``rust-wt-test``.
+
+    ``--inexact`` is load-bearing: this task's job is to rebuild ONE package,
+    but a bare ``uv sync --extra dev --extra admin`` also *prunes* everything
+    outside that extra set. That silently removed pelican / boto3 (breaking the
+    website publish) and ``secantus-core`` (making the parity suite skip) for
+    anyone who also had the sql / rust / website extras installed. ``--inexact``
+    leaves extraneous packages alone so the rebuild is purely additive.
     """
     c.run(
         "SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON "
-        "uv sync --extra dev --extra admin --reinstall-package secantusdb",
+        "uv sync --inexact --extra dev --extra admin --reinstall-package secantusdb",
         pty=True,
         env=_rust_env(),
     )
