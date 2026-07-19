@@ -2131,6 +2131,29 @@ def test_string_typeguard_codes_via_pymongo(coll) -> None:
         assert exc.value.code == code, expr
 
 
+def test_expression_accumulators_via_pymongo(coll) -> None:
+    """$sum/$avg/$max/$min work as expression operators (MongoDB 5.0+) over the
+    wire, not just as group accumulators. mongod 7.0.12-verified."""
+    coll.insert_one({"_id": 1, "arr": [1, 2, 3], "n": 5})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "s": {"$sum": "$arr"},
+                        "a": {"$avg": "$arr"},
+                        "mx": {"$max": "$arr"},
+                        "mn": {"$min": "$arr"},
+                        "sn": {"$sum": "$n"},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"s": 6, "a": 2.0, "mx": 3, "mn": 1, "sn": 5}]
+
+
 def test_date_misc_typeguard_codes_via_pymongo(coll) -> None:
     """Date/misc operators match mongod's error codes over the wire (incl. the
     previously-silent $dateToString non-date and $dateDiff missing endDate).

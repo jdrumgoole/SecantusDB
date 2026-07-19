@@ -451,6 +451,29 @@ def test_string_typeguard_error_codes() -> None:
     assert evaluate({"$binarySize": "abc"}, {}) == 3
 
 
+def test_expression_accumulators() -> None:
+    # MongoDB 5.0+ $sum/$avg/$max/$min as *expression* operators (not just group
+    # accumulators): an array argument reduces over its elements, a scalar is a
+    # single value, a missing/absent argument contributes nothing, non-numeric
+    # elements are ignored by $sum/$avg, and $max/$min order by BSON cross-type
+    # order ignoring null. Verified against mongod 7.0.12.
+    assert evaluate({"$sum": "$arr"}, {"arr": [1, 2, 3]}) == 6
+    assert evaluate({"$sum": "$n"}, {"n": 5}) == 5
+    assert evaluate({"$sum": [1, 2, 3]}, {}) == 6
+    assert evaluate({"$sum": ["$n", 10, "skip"]}, {"n": 5}) == 15  # non-numeric ignored
+    assert evaluate({"$avg": "$arr"}, {"arr": [1, 2, 3]}) == 2.0
+    assert evaluate({"$avg": "$n"}, {"n": 5}) == 5.0
+    assert evaluate({"$max": "$arr"}, {"arr": [1, 2, 3]}) == 3
+    assert evaluate({"$min": "$arr"}, {"arr": [1, 2, 3]}) == 1
+    assert evaluate({"$max": "$n"}, {"n": 5}) == 5
+    # Empty / missing edges: $sum -> 0, $avg/$max/$min -> null.
+    assert evaluate({"$sum": []}, {}) == 0
+    assert evaluate({"$avg": []}, {}) is None
+    assert evaluate({"$max": []}, {}) is None
+    assert evaluate({"$sum": "$missing"}, {}) == 0
+    assert evaluate({"$max": "$missing"}, {}) is None
+
+
 def test_date_misc_typeguard_error_codes() -> None:
     import datetime
 
