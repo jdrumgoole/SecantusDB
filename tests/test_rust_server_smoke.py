@@ -1458,6 +1458,55 @@ def test_count_project_sort_by_count_stage_validation(tmp_path) -> None:
         srv.stop()
 
 
+def test_bucket_auto_elem_match_pull_validation(tmp_path) -> None:
+    """The Rust server errors (defer -> BadValue) on an invalid $bucketAuto
+    'buckets' argument, a non-document $elemMatch projection argument, or a
+    $pull/$pullAll against a present non-array field — instead of silently
+    accepting bad input or corrupting/dropping data. Valid forms still run and a
+    valid $pull removes the matching element."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": i, "v": i} for i in range(6)])
+        for spec in (
+            {"groupBy": "$v", "buckets": True},
+            {"groupBy": "$v", "buckets": "x"},
+            {"groupBy": "$v", "buckets": 2.5},
+            {"groupBy": "$v", "buckets": 0},
+            {"groupBy": "$v"},
+            {"buckets": 2},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$bucketAuto": spec}]))
+        # A whole-double buckets is accepted.
+        assert len(list(coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2.0}}]))) == 2
+
+        # Non-document $elemMatch projection argument.
+        for arg in (5, "x", [1]):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.find({}, {"v": {"$elemMatch": arg}}))
+
+        # $pull / $pullAll against a present non-array field errors, no data loss.
+        coll.drop()
+        coll.insert_one({"_id": 1, "num": 5, "nul": None, "arr": [1, 2, 3]})
+        for upd in (
+            {"$pull": {"num": 1}},
+            {"$pullAll": {"num": [1]}},
+            {"$pull": {"nul": 1}},
+            {"$pullAll": {"nul": [1]}},
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                coll.update_one({"_id": 1}, upd)
+        # The document is untouched by the failed updates.
+        assert coll.find_one({"_id": 1}) == {"_id": 1, "num": 5, "nul": None, "arr": [1, 2, 3]}
+        # A missing field is a no-op; a valid array pull removes the element.
+        coll.update_one({"_id": 1}, {"$pull": {"nope": 1}})
+        coll.update_one({"_id": 1}, {"$pull": {"arr": 2}})
+        assert coll.find_one({"_id": 1})["arr"] == [1, 3]
+    finally:
+        srv.stop()
+
+
 def test_to_int_convert_overflow(tmp_path) -> None:
     """The Rust server rejects an int32/int64 overflow in $toInt / $convert
     (defer -> BadValue) and downcasts an in-range long to int32; $convert

@@ -1112,9 +1112,13 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
     let Some(group_by) = s.get("groupBy") else {
         return Err(());
     };
+    // buckets: a positive integer, or a whole double (mongod accepts 2.0). Any
+    // other value (bool, fractional double, non-positive, non-number, missing)
+    // defers so Python raises the exact code (40241/40242/40243/40246).
     let n_buckets = match s.get("buckets") {
         Some(Bson::Int32(n)) if *n >= 1 => *n as usize,
         Some(Bson::Int64(n)) if *n >= 1 => *n as usize,
+        Some(Bson::Double(d)) if d.fract() == 0.0 && *d >= 1.0 => *d as usize,
         _ => return Err(()),
     };
     let default_output = bson::doc! {"count": {"$sum": 1i32}};

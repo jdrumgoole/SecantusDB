@@ -594,6 +594,10 @@ def _apply_op(
                 arr = get_path(doc, concrete, default=None)
                 if isinstance(arr, list):
                     arr[:] = [e for e in arr if not _pull_matches(matches, e, criterion)]
+                elif has_path(doc, concrete):
+                    # mongod: a present but non-array target errors; a missing
+                    # field is a silent no-op.
+                    raise UpdateError("Cannot apply $pull to a non-array value", code=2)
     elif op == "$pullAll":
         for path, values in payload.items():
             if not isinstance(values, list):
@@ -602,6 +606,8 @@ def _apply_op(
                 arr = get_path(doc, concrete, default=None)
                 if isinstance(arr, list):
                     arr[:] = [e for e in arr if not any(e == v for v in values)]
+                elif has_path(doc, concrete):
+                    raise UpdateError("Cannot apply $pull to a non-array value", code=2)
     elif op == "$pop":
         for path, direction in payload.items():
             # mongod validates the $pop argument (probed 7.0.12): a bool is

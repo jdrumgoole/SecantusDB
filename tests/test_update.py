@@ -97,6 +97,21 @@ def test_pull_query_equality_types() -> None:
     assert apply_update({"a": [1, 1.0, 2]}, {"$pull": {"a": 1}}) == {"a": [2]}
 
 
+def test_pull_pullall_on_non_array_raises() -> None:
+    # mongod: $pull / $pullAll on a present but non-array field (scalar or null)
+    # is code 2; a missing field is a silent no-op.
+    for upd in ({"$pull": {"n": 1}}, {"$pullAll": {"n": [1]}}):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"n": 5}, upd)
+        assert exc.value.code == 2, upd
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"n": None}, upd)
+        assert exc.value.code == 2, upd
+    # Missing field: no-op (document unchanged).
+    assert apply_update({"other": 1}, {"$pull": {"nope": 1}}) == {"other": 1}
+    assert apply_update({"other": 1}, {"$pullAll": {"nope": [1]}}) == {"other": 1}
+
+
 def test_pullall_removes_listed_values() -> None:
     assert apply_update({"a": [1, 2, 3, 2, 1]}, {"$pullAll": {"a": [1, 2]}}) == {"a": [3]}
     assert apply_update({"a": [1, 2, 3]}, {"$pullAll": {"a": [9]}}) == {"a": [1, 2, 3]}

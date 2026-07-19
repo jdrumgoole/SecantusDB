@@ -146,6 +146,18 @@ def test_slice_invalid_defers_and_raises(sl, code):
     assert exc.value.code == code
 
 
+@pytest.mark.parametrize("arg", [5, "x", [1]])
+def test_elem_match_non_document_defers_and_raises(arg):
+    # A non-document $elemMatch projection argument: Rust defers (None), pure
+    # engine raises Location31274.
+    doc = bson.decode(bson.encode({"_id": 1, "arr": [1, 2, 3]}))
+    spec = bson.decode(bson.encode({"s": {"arr": {"$elemMatch": arg}}}))["s"]
+    assert _rust_proj(doc, spec) is None
+    with pytest.raises(_pure.ProjectionError) as exc:
+        _pure.apply_projection(doc, spec)
+    assert exc.value.code == 31274
+
+
 # Positional `arr.$` projection — needs the query (filter) to resolve which
 # element matched. (doc, spec, query).
 POSITIONAL_CURATED = [

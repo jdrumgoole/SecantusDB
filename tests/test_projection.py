@@ -81,6 +81,15 @@ def test_elem_match_combined_with_other_inclusions() -> None:
     assert out == {"name": "a", "items": [{"qty": 5}]}
 
 
+def test_elem_match_non_document_argument_raises() -> None:
+    # mongod: the $elemMatch projection argument must be an object (Location31274).
+    src = {"_id": 1, "arr": [1, 2, 3]}
+    for arg in (5, "x", [1]):
+        with pytest.raises(ProjectionError) as exc:
+            apply_projection(src, {"arr": {"$elemMatch": arg}})
+        assert exc.value.code == 31274, arg
+
+
 def test_id_only_truthy_spec_is_inclusion() -> None:
     """{"_id": 1} (and any non-zero value) is an inclusion projection:
     only _id survives. Oracle-pinned against real mongod."""

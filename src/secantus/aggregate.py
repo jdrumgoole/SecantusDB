@@ -16,6 +16,7 @@ from secantus.expressions import (
     ExpressionError,
     UnknownExpressionOperatorError,
     _bson_type_name,
+    _fmt_double,
     evaluate,
     evaluate_or_missing,
 )
@@ -2366,10 +2367,42 @@ def _stage_bucket_auto(
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$bucketAuto requires a document spec")
+    # mongod: both groupBy and buckets must be present (40246); buckets must be
+    # a non-bool numeric value (40241), representable as a 32-bit integer —
+    # a whole double is accepted, a fractional double is not (40242) — and
+    # strictly greater than 0 (40243).
+    if "groupBy" not in spec or "buckets" not in spec:
+        raise AggregateError(
+            "$bucketAuto requires 'groupBy' and 'buckets' to be specified",
+            code=40246,
+            code_name="Location40246",
+        )
     group_by = spec.get("groupBy")
-    n_buckets = spec.get("buckets")
-    if group_by is None or not isinstance(n_buckets, int) or n_buckets < 1:
-        raise AggregateError("$bucketAuto requires groupBy and a positive buckets int")
+    n_raw = spec["buckets"]
+    if isinstance(n_raw, bool) or not isinstance(n_raw, (int, float)):
+        raise AggregateError(
+            "The $bucketAuto 'buckets' field must be a numeric value, but found type: "
+            f"{_bson_type_name(n_raw)}",
+            code=40241,
+            code_name="Location40241",
+        )
+    if isinstance(n_raw, float):
+        if not n_raw.is_integer():
+            raise AggregateError(
+                "The $bucketAuto 'buckets' field must be representable as a 32-bit "
+                f"integer, but found {_fmt_double(n_raw)}",
+                code=40242,
+                code_name="Location40242",
+            )
+        n_buckets = int(n_raw)
+    else:
+        n_buckets = n_raw
+    if n_buckets <= 0:
+        raise AggregateError(
+            f"The $bucketAuto 'buckets' field must be greater than 0, but found: {n_buckets}",
+            code=40243,
+            code_name="Location40243",
+        )
     output_spec = spec.get("output") or {"count": {"$sum": 1}}
 
     from secantus.storage import _SortKey

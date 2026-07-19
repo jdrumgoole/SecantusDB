@@ -917,6 +917,62 @@ def test_sort_by_count_validation_via_pymongo(coll) -> None:
     ]
 
 
+def test_bucket_auto_validation_via_pymongo(coll) -> None:
+    """$bucketAuto: non-numeric/bool buckets 40241, fractional 40242, non-positive
+    40243, missing groupBy/buckets 40246; a whole-double buckets computes.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i, "v": i} for i in range(6)])
+    for spec, code in [
+        ({"groupBy": "$v", "buckets": True}, 40241),
+        ({"groupBy": "$v", "buckets": "x"}, 40241),
+        ({"groupBy": "$v", "buckets": 2.5}, 40242),
+        ({"groupBy": "$v", "buckets": 0}, 40243),
+        ({"groupBy": "$v", "buckets": -1}, 40243),
+        ({"groupBy": "$v"}, 40246),
+        ({"buckets": 2}, 40246),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$bucketAuto": spec}]))
+        assert exc.value.code == code, spec
+    # A whole-double buckets is accepted.
+    out = list(coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2.0}}]))
+    assert len(out) == 2
+
+
+def test_projection_elem_match_non_document_via_pymongo(coll) -> None:
+    """A non-document $elemMatch projection argument is Location31274.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "arr": [1, 2, 3]})
+    for arg in (5, "x", [1]):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find({}, {"arr": {"$elemMatch": arg}}))
+        assert exc.value.code == 31274, arg
+
+
+def test_pull_pullall_non_array_via_pymongo(coll) -> None:
+    """$pull / $pullAll on a present but non-array field is code 2; a missing
+    field is a silent no-op. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "num": 5, "nul": None, "arr": [1, 2, 3]})
+    for upd in ({"$pull": {"num": 1}}, {"$pullAll": {"num": [1]}}):
+        with pytest.raises(OperationFailure) as exc:
+            coll.update_one({"_id": 1}, upd)
+        assert exc.value.code == 2, upd
+    for upd in ({"$pull": {"nul": 1}}, {"$pullAll": {"nul": [1]}}):
+        with pytest.raises(OperationFailure) as exc:
+            coll.update_one({"_id": 1}, upd)
+        assert exc.value.code == 2, upd
+    # Missing field: no-op. Valid array pull still works.
+    coll.update_one({"_id": 1}, {"$pull": {"nope": 1}})
+    coll.update_one({"_id": 1}, {"$pull": {"arr": 2}})
+    assert coll.find_one({"_id": 1})["arr"] == [1, 3]
+
+
 def test_densify_validation_via_pymongo(coll) -> None:
     """$densify: date unit on numeric 6053600, bool step 14, non-positive step
     5733401, bad bounds string 5946802, wrong-length array 5733403, descending

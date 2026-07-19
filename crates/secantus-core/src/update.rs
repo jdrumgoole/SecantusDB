@@ -676,16 +676,21 @@ fn apply_op(
             for (path, criterion) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
                     // Remove elements matching the criterion under query semantics
-                    // (element-value predicate / sub-document match / equality); a
-                    // non-array field is a no-op.
-                    if let Some(Bson::Array(a)) = get_path(result, &cpath).cloned() {
-                        let mut kept = Vec::with_capacity(a.len());
-                        for e in a {
-                            if !pull_matches(&e, criterion)? {
-                                kept.push(e);
+                    // (element-value predicate / sub-document match / equality). A
+                    // missing field is a no-op; a present but non-array target
+                    // defers so Python raises code 2.
+                    match get_path(result, &cpath).cloned() {
+                        Some(Bson::Array(a)) => {
+                            let mut kept = Vec::with_capacity(a.len());
+                            for e in a {
+                                if !pull_matches(&e, criterion)? {
+                                    kept.push(e);
+                                }
                             }
+                            set_path(result, &cpath, Bson::Array(kept))?;
                         }
-                        set_path(result, &cpath, Bson::Array(kept))?;
+                        Some(_) => return Err(Fallback),
+                        None => {}
                     }
                 }
             }
@@ -697,22 +702,27 @@ fn apply_op(
                 };
                 for cpath in expand_path(result, path, filters, pos)? {
                     // Remove every element equal to any listed value (literal
-                    // equality, not predicates); non-array field is a no-op.
-                    if let Some(Bson::Array(a)) = get_path(result, &cpath).cloned() {
-                        let mut kept = Vec::with_capacity(a.len());
-                        for e in a {
-                            let mut drop = false;
-                            for v in vals {
-                                if expressions::py_eq(&e, v).map_err(|_| Fallback)? {
-                                    drop = true;
-                                    break;
+                    // equality, not predicates). Missing field: no-op; present
+                    // non-array target defers so Python raises code 2.
+                    match get_path(result, &cpath).cloned() {
+                        Some(Bson::Array(a)) => {
+                            let mut kept = Vec::with_capacity(a.len());
+                            for e in a {
+                                let mut drop = false;
+                                for v in vals {
+                                    if expressions::py_eq(&e, v).map_err(|_| Fallback)? {
+                                        drop = true;
+                                        break;
+                                    }
+                                }
+                                if !drop {
+                                    kept.push(e);
                                 }
                             }
-                            if !drop {
-                                kept.push(e);
-                            }
+                            set_path(result, &cpath, Bson::Array(kept))?;
                         }
-                        set_path(result, &cpath, Bson::Array(kept))?;
+                        Some(_) => return Err(Fallback),
+                        None => {}
                     }
                 }
             }

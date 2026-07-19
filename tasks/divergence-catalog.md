@@ -68,7 +68,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   → 2); `$regex` bad `$options` / `$options`-without-`$regex` / non-string `$regex`
   FIXED (#496, → 51108 / 2); `$elemMatch` non-doc (query) + `$not` invalid arg
   FIXED (#497, → 2); `$all` non-array + mixed/non-`$elemMatch` `$`-doc FIXED (#499,
-  → 2). Remaining: `$elemMatch` non-doc in *projection* (proj→31274). (query.py)
+  → 2). `$elemMatch` non-doc in *projection* FIXED (#526, → 31274). (query.py)
 - ~~**Projection `$slice`**~~ **FIXED (#506):** non-number scalar / short / long
   array → 28667; 2/3-elem array not `[skip, positive-limit]` → 28724. Both engines
   (Rust core defers). (projection.py)
@@ -77,12 +77,15 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   codes instead of deferring. Valid alias set = 22, code set = {-1,1..19,127}. Both
   engines. (query.py / .rs)
 - **Update `$push $sort`** bad spec (int/`{x:2}`) sorts anyway (mongod 2); scalar+doc-spec
-  and mixed scalar/doc sort order wrong. `$pull`/`$pullAll` on a non-array field no-op
-  (mongod 2). `arrayFilters` unused (mongod 9) / bad identifier (2) / empty (9) accepted.
-  `$currentDate: {d:false}` rejected (mongod OK). (update.py)
+  and mixed scalar/doc sort order wrong. `$pull`/`$pullAll` on a present non-array field
+  FIXED (#526, → 2; missing field stays a no-op). `arrayFilters` unused (mongod 9) /
+  bad identifier (2) / empty (9) accepted. `$currentDate: {d:false}` rejected (mongod OK).
+  (update.py)
 - **Stages**: `$bucket` unsorted/mixed/dup boundaries, default-in-range, missing groupBy
-  (40194/40193/40199/40198) accepted; `$bucketAuto {buckets:2.0}` rejects valid,
-  `{buckets:true}`/`granularity:'BOGUS'` accepted (40241/40257); `$densify`
+  (40194/40193/40199/40198) accepted; `$bucketAuto` buckets bool/non-numeric/fractional/
+  non-positive/missing FIXED (#526, → 40241/40242/40243/40246; whole-double accepted) —
+  `granularity` validation/rounding still unimplemented (`'BOGUS'` accepted; needs a
+  dedicated slice, see backlog); `$densify`
   `{step:true}`/`bounds:'partial'`/`[0]`/`[5,0]`/unit-on-numeric FIXED (#504, →
   14/5946802/5733403/5733402/6053600; `{step:1.5}` is mongod-valid, now computes);
   `$unwind` path/includeArrayIndex/preserve FIXED (#523, → 28808/28818/28810/28822/
