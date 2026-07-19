@@ -124,7 +124,8 @@ var (17276), `$switch` no-branches (40068), `$ifNull` 1-arg (1257300), `$getFiel
 (#515/#500). **A discovery sweep (three passes, ~120 operator error cases) showed the
 divergences were bounded (~dozens, not hundreds); the named type-guard rows are now all
 cleared (#525–#536). `$sum`/`$avg`/`$max`/`$min` as *expression* operators (5.0+ feature)
-implemented on the Python server — #537 (Rust-server port backlogged). Remaining: `$meta`
+implemented on **both** engines — #537 (Python) + #538 (Rust core, reusing the group
+accumulator `Num` width logic; parity-verified). Remaining: `$meta`
 bad arg (17308 — `$meta` isn't an expression operator in SecantusDB, gives 168) and
 `$strcasecmp` numeric coercion (sec is stricter than mongod — mongod coerces to string) —
 two small feature-gaps, not error-code nits. The rest is per-message text only.**

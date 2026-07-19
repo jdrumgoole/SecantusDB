@@ -115,8 +115,9 @@ pub(crate) enum Num {
 
 impl Num {
     /// Python `self + v`. `Err(())` if `v` isn't numeric (Python `int + str`
-    /// etc. raises -> defer).
-    fn add(self, v: &Bson) -> R<Num> {
+    /// etc. raises -> defer). `pub(crate)` so the expression-form `$sum`/`$avg`
+    /// accumulators (`expressions.rs`) reuse the exact width logic for parity.
+    pub(crate) fn add(self, v: &Bson) -> R<Num> {
         match v {
             Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(_) => {
                 let n = as_int_like(v).unwrap();
@@ -136,7 +137,7 @@ impl Num {
         }
     }
 
-    fn to_bson(self) -> R<Bson> {
+    pub(crate) fn to_bson(self) -> R<Bson> {
         match self {
             Num::Int { v, wide } => int_promoted_to_bson(v, wide).ok_or(()),
             Num::Float(f) => Ok(Bson::Double(f)),

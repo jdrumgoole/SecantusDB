@@ -197,6 +197,11 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$in" => op_in(arg, ctx),
         "$slice" => op_slice(arg, ctx),
         "$indexOfArray" => op_index_of_array(arg, ctx),
+        // $sum/$avg/$max/$min as expression operators (MongoDB 5.0+)
+        "$sum" => op_expr_sum(arg, ctx),
+        "$avg" => op_expr_avg(arg, ctx),
+        "$max" => op_expr_max(arg, ctx),
+        "$min" => op_expr_min(arg, ctx),
         // strings
         "$concat" => op_concat(arg, ctx),
         "$toLower" => op_to_case(arg, ctx, false),
@@ -369,6 +374,10 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$in",
     "$slice",
     "$indexOfArray",
+    "$sum",
+    "$avg",
+    "$max",
+    "$min",
     "$concat",
     "$toLower",
     "$toUpper",
@@ -1149,6 +1158,95 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     } else {
         arr[s as usize..e as usize].to_vec()
     }))
+}
+
+/// The values an expression-form `$sum`/`$avg`/`$max`/`$min` reduces over: an
+/// array argument contributes its elements, a null/absent argument contributes
+/// nothing, and any other value is a single element. Mirrors
+/// `_expr_acc_values`.
+fn expr_acc_values(arg: &Bson, ctx: &Ctx) -> Result<Vec<Bson>, Fallback> {
+    match eval(arg, ctx)? {
+        Bson::Array(a) => Ok(a),
+        Bson::Null => Ok(Vec::new()),
+        other => Ok(vec![other]),
+    }
+}
+
+fn op_expr_sum(arg: &Bson, ctx: &Ctx) -> R {
+    // Reuses the group-accumulator `Num` width logic (int32 < int64 < double);
+    // a Decimal128 element defers to Python; non-numeric elements are ignored.
+    let mut running = crate::group::Num::Int { v: 0, wide: false };
+    for v in expr_acc_values(arg, ctx)? {
+        match v {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+                running = running.add(&v).map_err(|_| Fallback)?;
+            }
+            Bson::Decimal128(_) => return Err(Fallback),
+            _ => {} // bool / string / null / doc / array -> ignored
+        }
+    }
+    running.to_bson().map_err(|_| Fallback)
+}
+
+fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
+    let mut total = crate::group::Num::Int { v: 0, wide: false };
+    let mut count: i64 = 0;
+    for v in expr_acc_values(arg, ctx)? {
+        match v {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+                total = total.add(&v).map_err(|_| Fallback)?;
+                count += 1;
+            }
+            Bson::Decimal128(_) => return Err(Fallback),
+            _ => {}
+        }
+    }
+    if count == 0 {
+        return Ok(Bson::Null);
+    }
+    let tf = match total {
+        crate::group::Num::Int { v, .. } => {
+            if v.unsigned_abs() > (1u128 << 53) {
+                return Err(Fallback); // precision: defer to Python int/int divide
+            }
+            v as f64
+        }
+        crate::group::Num::Float(f) => f,
+    };
+    Ok(Bson::Double(tf / count as f64))
+}
+
+fn op_expr_extreme(arg: &Bson, ctx: &Ctx, want_max: bool) -> R {
+    let mut best: Option<Bson> = None;
+    for v in expr_acc_values(arg, ctx)? {
+        if matches!(v, Bson::Null) {
+            continue; // null never updates
+        }
+        match &best {
+            None => best = Some(v),
+            Some(cur) => {
+                let replace = if want_max {
+                    crate::order::bson_lt(cur, &v)
+                } else {
+                    crate::order::bson_lt(&v, cur)
+                };
+                match replace {
+                    Some(true) => best = Some(v),
+                    Some(false) => {}
+                    None => return Err(Fallback), // unorderable -> Python
+                }
+            }
+        }
+    }
+    Ok(best.unwrap_or(Bson::Null))
+}
+
+fn op_expr_max(arg: &Bson, ctx: &Ctx) -> R {
+    op_expr_extreme(arg, ctx, true)
+}
+
+fn op_expr_min(arg: &Bson, ctx: &Ctx) -> R {
+    op_expr_extreme(arg, ctx, false)
 }
 
 fn op_index_of_array(arg: &Bson, ctx: &Ctx) -> R {

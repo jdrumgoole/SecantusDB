@@ -1678,6 +1678,37 @@ def test_array_set_typeguard_validation(tmp_path) -> None:
         srv.stop()
 
 
+def test_expression_accumulators(tmp_path) -> None:
+    """The Rust server computes $sum/$avg/$max/$min as expression operators
+    (MongoDB 5.0+) — over an array or a scalar — with the same numeric widths and
+    cross-type ordering as the Python server."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "arr": [3, 1, 2], "n": 5})
+        got = list(
+            coll.aggregate(
+                [
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "s": {"$sum": "$arr"},
+                            "a": {"$avg": "$arr"},
+                            "mx": {"$max": "$arr"},
+                            "mn": {"$min": "$arr"},
+                            "sn": {"$sum": "$n"},
+                            "se": {"$sum": []},  # empty -> 0
+                            "ae": {"$avg": []},  # empty -> null
+                        }
+                    }
+                ]
+            )
+        )
+        assert got == [{"s": 6, "a": 2.0, "mx": 3, "mn": 1, "sn": 5, "se": 0, "ae": None}]
+    finally:
+        srv.stop()
+
+
 def test_to_long_conversion(tmp_path) -> None:
     """The Rust server computes $toLong (truncating toward zero, yielding a 64-bit
     long that can exceed int32) and rejects an int64 overflow (defer -> BadValue)."""
