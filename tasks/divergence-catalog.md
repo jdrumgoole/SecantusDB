@@ -123,10 +123,11 @@ var (17276), `$switch` no-branches (40068), `$ifNull` 1-arg (1257300), `$getFiel
 `$trim`/`$ltrim`/`$rtrim` (50699) and `$split` (40085/40086/40087) already matched
 (#515/#500). **A discovery sweep (three passes, ~120 operator error cases) showed the
 divergences were bounded (~dozens, not hundreds); the named type-guard rows are now all
-cleared (#525–#536). Remaining: `$meta` bad arg (17308 — `$meta` isn't an expression
-operator in SecantusDB, gives 168), `$sum`/`$avg`/`$max`/`$min` as *expression* operators
-(a 5.0+ feature, currently 168), and `$strcasecmp` numeric coercion (sec is stricter than
-mongod) — small feature-gaps, not error-code nits. The rest is per-message text only.**
+cleared (#525–#536). `$sum`/`$avg`/`$max`/`$min` as *expression* operators (5.0+ feature)
+implemented on the Python server — #537 (Rust-server port backlogged). Remaining: `$meta`
+bad arg (17308 — `$meta` isn't an expression operator in SecantusDB, gives 168) and
+`$strcasecmp` numeric coercion (sec is stricter than mongod — mongod coerces to string) —
+two small feature-gaps, not error-code nits. The rest is per-message text only.**
 
 ## Minor / out-of-scope
 - `$where` unsupported (SecantusDB rejects; mongod runs JS — intentionally out of scope).

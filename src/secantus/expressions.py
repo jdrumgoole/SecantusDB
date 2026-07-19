@@ -3091,7 +3091,72 @@ def _op_bit_not(arg: Any, ctx: _Ctx) -> Any:
     return _bit_result(~n, is_long)
 
 
+def _expr_acc_values(arg: Any, ctx: _Ctx) -> list[Any]:
+    """The values an expression-form accumulator (`$sum`/`$avg`/`$max`/`$min`)
+    reduces over: an array argument contributes its elements, a missing/absent
+    argument contributes nothing, and any other value is a single element.
+    Mirrors mongod's MongoDB-5.0+ expression-accumulator semantics."""
+    v = _eval(arg, ctx)
+    if isinstance(v, list):
+        return v
+    if v is None:
+        return []
+    return [v]
+
+
+def _expr_is_number(v: Any) -> bool:
+    return isinstance(v, (int, float, Decimal128)) and not isinstance(v, bool)
+
+
+def _op_expr_sum(arg: Any, ctx: _Ctx) -> Any:
+    from secantus.numerics import bson_add
+
+    total: Any = 0
+    for x in _expr_acc_values(arg, ctx):
+        if _expr_is_number(x):
+            total = bson_add(total, x)
+    return total
+
+
+def _op_expr_avg(arg: Any, ctx: _Ctx) -> Any:
+    total: Any = 0
+    n = 0
+    for x in _expr_acc_values(arg, ctx):
+        if _expr_is_number(x):
+            total += x
+            n += 1
+    return (total / n) if n else None
+
+
+def _op_expr_max(arg: Any, ctx: _Ctx) -> Any:
+    from secantus.ordering import _SortKey
+
+    best: Any = None
+    for x in _expr_acc_values(arg, ctx):
+        if x is None:
+            continue
+        if best is None or _SortKey(x) > _SortKey(best):
+            best = x
+    return best
+
+
+def _op_expr_min(arg: Any, ctx: _Ctx) -> Any:
+    from secantus.ordering import _SortKey
+
+    best: Any = None
+    for x in _expr_acc_values(arg, ctx):
+        if x is None:
+            continue
+        if best is None or _SortKey(x) < _SortKey(best):
+            best = x
+    return best
+
+
 _OPS = {
+    "$sum": _op_expr_sum,
+    "$avg": _op_expr_avg,
+    "$max": _op_expr_max,
+    "$min": _op_expr_min,
     "$concat": _op_concat,
     "$add": _op_add,
     "$subtract": _op_subtract,
