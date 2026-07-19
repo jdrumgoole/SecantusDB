@@ -1025,9 +1025,9 @@ def test_composite_type_via_driver(server):
     cur.execute("SELECT (home).street, (home).zip FROM people")
     assert cur.fetchone() == ["Main St", 90210]  # zip is a real int, not '90210'
     cur.execute("SELECT home FROM people")
-    # We send the RECORD OID (2249) with the ``("Main St",90210)`` text literal;
-    # pg8000 decodes an anonymous record into a tuple of (untyped) text fields.
-    assert cur.fetchone() == [("Main St", "90210")]
+    # The column reports the composite's MINTED oid (like real PG); pg8000
+    # doesn't know user oids, so the value arrives as the record text literal.
+    assert cur.fetchone() == ['("Main St",90210)']
     conn.close()
 
 

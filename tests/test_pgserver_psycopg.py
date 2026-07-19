@@ -1064,10 +1064,13 @@ def test_composite_registration_roundtrip(server):
             7,
         )
         # Anonymous records: psycopg's text loader yields strings; the binary
-        # record layout carries per-field oids, so fields come back typed.
+        # record layout carries per-field oids — an int literal comes back
+        # typed and an UNTYPED string literal is unknown (705), which psycopg
+        # loads as bytes, exactly like real Postgres.
         assert conn.execute("select row(1, 'a')").fetchone()[0] == ("1", "a")
         with conn.cursor(binary=True) as bcur:
-            assert bcur.execute("select row(1, 'a')").fetchone()[0] == (1, "a")
+            assert bcur.execute("select row(1, 'a')").fetchone()[0] == (1, b"a")
+            assert bcur.execute("select row(1, 'a'::text)").fetchone()[0] == (1, "a")
 
 
 def test_create_type_as_range(server):

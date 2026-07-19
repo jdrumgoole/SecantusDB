@@ -1962,6 +1962,19 @@ def _composite_value(raw: Any, col: Column) -> dict[str, Any]:
 def _build_composite(raw: Any, fields: Any, type_name: str) -> dict[str, Any]:
     """Build a composite subdocument from a positional ``ROW`` / list, or an
     already-named dict, against ``fields`` (``(name, tag, subfields)`` entries)."""
+    if isinstance(raw, str):
+        # A record text literal (``'("(foo,10)",20)'`` — a registered psycopg
+        # composite dumper's text form) parses into positional tokens; a nested
+        # composite field arrives as a string and recurses through the same
+        # parse below.
+        try:
+            raw = typemap.parse_pg_record_literal(raw)
+        except ValueError:
+            raise errors.SQLError(
+                "22P02", f'malformed record literal for type "{type_name}"'
+            ) from None
+        if not fields and raw in ([], [None]):
+            raw = []  # ``'()'`` for a zero-field composite type
     if isinstance(raw, dict):
         pairs = [(_field_parts(f)[0], raw.get(_field_parts(f)[0])) for f in fields]
     elif isinstance(raw, (list, tuple)):
@@ -2300,6 +2313,12 @@ def _infer_value_tag(value: Any) -> str:
         return "float8"
     if isinstance(value, dict) and "interval" in value:
         return "interval"
+    if isinstance(value, typemap.RecordValue) or (
+        isinstance(value, dict) and value and all(k == f"f{i + 1}" for i, k in enumerate(value))
+    ):
+        # A ``row(…)`` anonymous record — describes as RECORD (2249) and
+        # renders as the ``(a,b)`` record literal, like the SELECT path.
+        return "composite"
     return "text"
 
 
@@ -3222,6 +3241,16 @@ def _value_to_node(value: Any) -> exp.Expression:
             this=exp.Literal.string("\\x" + bytes(value).hex()),
             to=exp.DataType.build("bytea", dialect="postgres"),
         )
+    if isinstance(value, typemap.TypedList):
+        # A typed array parameter (a text-format int2[]/inet[]/… decoded at
+        # Bind) — the ``::tag[]`` cast re-parses the literal into a typed list
+        # so equality against ``array[…]`` values compares element-wise.
+        literal = typemap._render_pg_array(value, value.elem_tag)
+        try:
+            dtype = exp.DataType.build(f"{value.elem_tag}[]", dialect="postgres")
+        except Exception:  # noqa: BLE001 — non-keyword element names (cidr) need udt
+            dtype = exp.DataType.build(f"{value.elem_tag}[]", dialect="postgres", udt=True)
+        return exp.Cast(this=exp.Literal.string(literal), to=dtype)
     if isinstance(value, (list, tuple)):
         # A binary array parameter decodes to a Python list; carry it as the
         # Postgres array text literal (str() would embed the Python repr).
@@ -3813,6 +3842,31 @@ def _jsonb_object_agg_project(fname: str, fcond: Any) -> Any:
     if fcond is not None:
         src = {"$filter": {"input": f"${fname}", "as": "e", "cond": {"$ne": ["$$e", None]}}}
     return {"$arrayToObject": src}
+
+
+def _array_agg_out_tag(arr_arg: exp.Expression, resolve: Resolve) -> str:
+    """The output tag of ``array_agg(x)`` — the element's array type when the
+    element tag is known (``text`` → ``text[]``/1009, so psycopg loads a real
+    list and ``coalesce(array_agg(…), '{}')`` over an empty group parses as an
+    empty ARRAY, not JSON text — CompositeInfo.fetch of a zero-field type
+    depends on it). ``json`` element (or unknown) keeps the jsonb rendering."""
+    value_node, _terms = _agg_order_spec(arr_arg)
+    try:
+        elem = _infer_scalar_tag(value_node, resolve)
+    except Exception:  # noqa: BLE001 — inference failure keeps the old shape
+        return "json"
+    if elem and not typemap.is_array_tag(elem) and f"{elem}[]" in typemap.PG_OID:
+        return f"{elem}[]"
+    return "json"
+
+
+def _is_true_array_agg(e: exp.Expression) -> bool:
+    """True for ``array_agg`` proper — ``jsonb_agg``/``json_agg`` share the
+    ``$push`` machinery but must keep the json output type."""
+    inner = e.this if isinstance(e, exp.Alias) else e
+    if isinstance(inner, exp.Filter):
+        inner = inner.this
+    return isinstance(inner, exp.ArrayAgg)
 
 
 def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
@@ -4901,7 +4955,14 @@ def _grouping_set_branch(
                     "$push": _push_filtered(_agg_arg_to_expr(arr_arg, table), fcond, wrap=True)
                 }
                 project[fname] = _array_agg_project(fname, fcond)
-            out_columns.append((fname, "json"))
+            out_columns.append(
+                (
+                    fname,
+                    _array_agg_out_tag(arr_arg, table_resolver(table))
+                    if _is_true_array_agg(e)
+                    else "json",
+                )
+            )
         elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
             accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table, fcond)
@@ -5277,7 +5338,14 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                     "$push": _push_filtered(_agg_arg_to_expr(arr_arg, table), fcond, wrap=True)
                 }
                 project[fname] = _array_agg_project(fname, fcond)
-            out_columns.append((fname, "json"))
+            out_columns.append(
+                (
+                    fname,
+                    _array_agg_out_tag(arr_arg, table_resolver(table))
+                    if _is_true_array_agg(e)
+                    else "json",
+                )
+            )
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
             value_node, terms = _agg_order_spec(sagg[0])
@@ -8614,6 +8682,13 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     composite_tag = _composite_field_tag(node, resolve)
     if composite_tag is not None:
         return composite_tag
+    # ``array[x::inet, …]`` — a bare array constructor types as its elements'
+    # array type when an element's tag is knowable (a cast or nested literal).
+    if isinstance(node, exp.Array) and node.expressions:
+        first = next((e for e in node.expressions if isinstance(e, exp.Cast)), None)
+        elem_tag = typemap.type_tag_for_sql(first.to) if first is not None else None
+        if elem_tag and not typemap.is_array_tag(elem_tag) and f"{elem_tag}[]" in typemap.PG_OID:
+            return f"{elem_tag}[]"
     # A user-defined function call (CREATE FUNCTION) types as its RETURNS type; the
     # catalog rides the planning ``_pipeline_subctx`` in the evaluated-select path.
     if isinstance(node, (exp.Anonymous, exp.Dot)):

@@ -639,6 +639,18 @@ def _encode_value(
         return _encode_multirange_generic(value, encoding)
     if isinstance(value, dict) and ("empty" in value or ("lower" in value and "upper" in value)):
         return _encode_range_generic(value, encoding)
+    if oid == 114:  # plain json: binary form is the bare JSON text (no header)
+        return pgwire.transcode_out(typemap.to_pg_text(value, "json"), encoding) or b""
+    if (
+        isinstance(value, dict)
+        and tag != "json"
+        and not any(k in value for k in ("hstore", "interval", "tsvector", "tsquery"))
+    ):
+        # A residual dict is a composite record (an array-of-composite element
+        # reaches here with the element's minted oid) — ranges / multiranges /
+        # jsonb and the tagged subdoc types were all matched above. JSON text
+        # would blow up psycopg's binary record parser.
+        return _encode_record(value, encoding)
     # text / varchar / unknown: the binary form equals the (client-encoded) text bytes.
     return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b""
 
@@ -656,14 +668,22 @@ def _py_value_field_oid(v: Any) -> tuple[int, str]:
         return (1700, "numeric")
     if isinstance(v, _dt.datetime):
         return (1184, "timestamptz") if v.tzinfo is not None else (1114, "timestamp")
+    if isinstance(v, (bytes, bytearray, memoryview, bson.Binary)):
+        return (17, "bytea")
     if isinstance(v, dict):
         return (2249, "composite")
     return (25, "text")
 
 
-def _binary_record_to_text(raw: bytes, encoding: str | None = "utf-8") -> str:
+def _binary_record_to_text(
+    raw: bytes, encoding: str | None = "utf-8", *, is_composite_oid: Any = None
+) -> str:
     """Decode a PG binary record parameter into its record TEXT literal (fields
-    decoded per their embedded oids), which rides the composite text parser."""
+    decoded per their embedded oids), which rides the composite text parser.
+    ``is_composite_oid`` (an ``oid -> bool`` predicate, when catalog context is
+    available) lets a nested field embedded with a USER composite oid — not the
+    generic 2249 — recurse instead of being text-decoded (its payload is raw
+    binary and blows up UTF-8 decoding)."""
     (n,) = struct.unpack_from("!i", raw, 0)
     off = 4
     parts: list[str] = []
@@ -678,8 +698,8 @@ def _binary_record_to_text(raw: bytes, encoding: str | None = "utf-8") -> str:
         decoder = None if oid in (0, 25, 1043) else _BINARY.get(oid)
         if decoder is not None:
             val = decoder(payload)
-        elif oid == 2249:
-            val = _binary_record_to_text(payload, encoding)
+        elif oid == 2249 or (is_composite_oid is not None and is_composite_oid(oid)):
+            val = _binary_record_to_text(payload, encoding, is_composite_oid=is_composite_oid)
         else:
             val = pgwire.decode_text(payload, encoding)
         rendered = typemap.to_pg_text(val, typemap.OID_TO_TAG.get(oid))
@@ -692,13 +712,24 @@ def _binary_record_to_text(raw: bytes, encoding: str | None = "utf-8") -> str:
 
 def _encode_record(value: dict, encoding: str | None = "utf-8") -> bytes:
     """PG binary record: int32 nfields, then per field int32 type oid +
-    int32 length (-1 NULL) + data."""
+    int32 length (-1 NULL) + data. A ``RecordValue`` carries its fields'
+    declared SQL oids (``row('x')`` embeds unknown/705, ``row('x'::text)``
+    25); otherwise the oid derives from the Python value."""
+    declared = getattr(value, "field_oids", ())
     out = bytearray(struct.pack("!i", len(value)))
-    for v in value.values():
+    for i, v in enumerate(value.values()):
         if v is None:
             out += struct.pack("!ii", 25, -1)
             continue
         oid, tag = _py_value_field_oid(v)
+        if i < len(declared) and declared[i]:
+            oid = declared[i]
+            if oid == 705:
+                # unknown — the value travels as its raw text bytes.
+                b = pgwire.transcode_out(typemap.to_pg_text(v, "text"), encoding) or b""
+                out += struct.pack("!ii", oid, len(b)) + b
+                continue
+            tag = _TAG_BY_OID.get(oid, tag)
         b = _encode_value(v, oid, tag, encoding) or b""
         out += struct.pack("!ii", oid, len(b)) + b
     return bytes(out)
@@ -804,6 +835,12 @@ def _text_param_bytea(s: str) -> bytes:
     return _bytea.parse(s)
 
 
+def _text_param_uuid(s: str) -> str:
+    from secantus.sql import uuidtype as _uuidtype
+
+    return _uuidtype.normalize(s)
+
+
 _TEXT_PARAM = {
     16: lambda s: s.strip().lower() in ("t", "true", "y", "yes", "on", "1"),  # bool
     17: _text_param_bytea,  # bytea — ``\x…`` hex (or escape) text form -> bytes
@@ -823,6 +860,11 @@ _TEXT_PARAM = {
     1184: _text_param_timestamp("timestamptz"),  # -> aware datetime
     1186: _text_param_interval,  # -> interval subdoc
     1266: _text_param_timetz,  # timetz -> canonical text
+    2950: _text_param_uuid,  # uuid -> canonical hyphenated (psycopg dumps bare hex)
+    # Network types -> the stored canonical form (a bare host inet gets /32).
+    869: lambda s: typemap.coerce(s, "inet"),
+    650: lambda s: typemap.coerce(s, "cidr"),
+    829: lambda s: typemap.coerce(s, "macaddr"),
 }
 
 
@@ -840,13 +882,16 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
             # Range / multirange (or arrays of them): carried as text with the
             # declared tag so substitution casts it into the structured value.
             return typemap.TaggedText(text, range_tag)
-        if oid == 1001:
-            # bytea[] — parse the array literal into a list of bytes so the
-            # substitution's ``::bytea[]`` cast path fires (a raw text literal
-            # compares text-vs-list and is silently false).
+        arr = _ARRAY_ELEM_BY_OID.get(oid)
+        if arr is not None and arr[1] not in ("text", "citext", "json"):
+            # A typed array param (int2[]/bytea[]/inet[]/…) — parse the array
+            # literal into a typed list so the substitution's ``::tag[]`` cast
+            # path fires (a raw text literal compares text-vs-list and is
+            # silently false). text[] stays raw text: its literal form is
+            # already what the text machinery expects.
             try:
-                return typemap.coerce(text, "bytea[]")
-            except ValueError:
+                return typemap.TypedList(typemap.coerce(text, f"{arr[1]}[]"), arr[1])
+            except (ValueError, TypeError):
                 return text
         conv = _TEXT_PARAM.get(oid)
         if conv is None:
@@ -880,7 +925,13 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
         # A user-type array oid (a registered enum's array dumper binds with the
         # minted array oid); the embedded element oid is unknown to _BINARY, so
         # elements fall back to text — which IS an enum's value form.
-        return _decode_array(raw, encoding)
+        items = _decode_array(raw, encoding)
+        arr = _ARRAY_ELEM_BY_OID.get(oid)
+        if arr is not None and arr[1] not in ("text", "citext", "json"):
+            # Typed binary arrays substitute through a ``::tag[]`` cast so
+            # equality against ``array[…]`` values compares element-wise.
+            return typemap.TypedList(items, arr[1])
+        return items
     return raw.decode(encoding or "utf-8", "replace")
 
 
@@ -907,12 +958,18 @@ class ExtendedSession:
         if msg_type == "H":  # Flush — we send eagerly, nothing to flush
             return b""
         try:
-            if msg_type == "P":
-                return self._parse(payload)
-            if msg_type == "B":
-                return self._bind(payload)
-            if msg_type == "D":
-                return self._describe(payload)
+            # Parse/Bind/Describe read the catalog (pg_typeof rewrites, minted
+            # user-type oid resolution, RowDescription) — inside an open
+            # transaction block they must see the block's UNCOMMITTED DDL (a
+            # type created two statements ago), so they run in the same storage
+            # transaction Execute does.
+            with self._txn_read_scope():
+                if msg_type == "P":
+                    return self._parse(payload)
+                if msg_type == "B":
+                    return self._bind(payload)
+                if msg_type == "D":
+                    return self._describe(payload)
             if msg_type == "E":
                 return self._execute(payload)
             if msg_type == "C":
@@ -930,6 +987,14 @@ class ExtendedSession:
             # Generic wire message; full detail stays in the server log — don't
             # leak the raw Python exception text to the client. (§I17)
             return pgwire.error_response("XX000", "internal error")
+
+    def _txn_read_scope(self) -> Any:
+        """The open transaction's storage scope (or a no-op outside a block)."""
+        import contextlib
+
+        if self.session.txn_handle is not None and not self.session.txn_failed:
+            return self.storage.use_user_transaction(self.session.txn_handle)
+        return contextlib.nullcontext()
 
     # -- handlers ----------------------------------------------------------- #
 
@@ -1006,7 +1071,16 @@ class ExtendedSession:
             return scalar.validate_enum_label(enum, value)
         if self.catalog.get_composite(db, name) is not None:
             if isinstance(value, bytes):
-                value = _binary_record_to_text(value, self.session.wire_encoding)
+                # A nested composite field embeds ITS composite's user oid —
+                # the predicate lets the decoder recurse instead of trying to
+                # UTF-8-decode raw binary record bytes.
+                def _is_composite(field_oid: int) -> bool:
+                    fname = virtual.user_type_name(db, self.catalog, field_oid)
+                    return fname is not None and self.catalog.get_composite(db, fname) is not None
+
+                value = _binary_record_to_text(
+                    value, self.session.wire_encoding, is_composite_oid=_is_composite
+                )
             return typemap.TaggedText(str(value), virtual.quote_type_name(name))
         rng = getattr(self.catalog, "get_range_type", None)
         rng_doc = rng(db, name) if rng is not None else None
