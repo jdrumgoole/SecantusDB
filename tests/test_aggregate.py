@@ -523,6 +523,31 @@ def test_bucket_auto_with_output() -> None:
     assert sum(b["total_n"] for b in out) == sum(d["n"] for d in docs)
 
 
+def test_bucket_auto_buckets_validation_codes() -> None:
+    # mongod: buckets must be a non-bool numeric value (40241), representable as
+    # a 32-bit integer — a whole double is accepted, a fractional one is not
+    # (40242) — and strictly > 0 (40243); groupBy and buckets are required
+    # (40246). A whole double computes.
+    docs = [{"v": i} for i in range(6)]
+    for spec, code in [
+        ({"groupBy": "$v", "buckets": True}, 40241),
+        ({"groupBy": "$v", "buckets": "x"}, 40241),
+        ({"groupBy": "$v", "buckets": 2.5}, 40242),
+        ({"groupBy": "$v", "buckets": 0}, 40243),
+        ({"groupBy": "$v", "buckets": -1}, 40243),
+        ({"groupBy": "$v"}, 40246),
+        ({"buckets": 2}, 40246),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$bucketAuto": spec}])
+        assert exc.value.code == code, spec
+    # A whole-double buckets is accepted (coerced to int).
+    out = apply_pipeline(
+        [dict(d) for d in docs], [{"$bucketAuto": {"groupBy": "$v", "buckets": 2.0}}]
+    )
+    assert len(out) == 2
+
+
 def test_lookup_requires_storage_context() -> None:
     with pytest.raises(AggregateError):
         apply_pipeline(

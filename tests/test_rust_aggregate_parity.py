@@ -243,6 +243,7 @@ CURATED = [
     ],
     # $bucketAuto — count-chunking (equal values still split), custom output
     [{"$bucketAuto": {"groupBy": "$a", "buckets": 2}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2.0}}],  # whole double accepted
     [{"$bucketAuto": {"groupBy": "$a", "buckets": 3}}],
     [{"$sort": {"_id": 1}}, {"$bucketAuto": {"groupBy": "$_id", "buckets": 4}}],
     [
@@ -974,6 +975,28 @@ def test_sort_by_count_invalid_defers_and_raises(spec, code):
     # Invalid $sortByCount: Rust defers (None), pure engine raises the mongod code.
     docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}]}))["d"]
     pipeline = bson.decode(bson.encode({"p": [{"$sortByCount": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        ({"groupBy": "$v", "buckets": True}, 40241),
+        ({"groupBy": "$v", "buckets": "x"}, 40241),
+        ({"groupBy": "$v", "buckets": 2.5}, 40242),
+        ({"groupBy": "$v", "buckets": 0}, 40243),
+        ({"groupBy": "$v", "buckets": -1}, 40243),
+        ({"groupBy": "$v"}, 40246),
+        ({"buckets": 2}, 40246),
+    ],
+)
+def test_bucket_auto_invalid_defers_and_raises(spec, code):
+    # Invalid $bucketAuto buckets: Rust defers (None), pure engine raises the code.
+    docs = bson.decode(bson.encode({"d": [{"_id": i, "v": i} for i in range(6)]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$bucketAuto": spec}]}))["p"]
     assert _rust_pipeline(docs, pipeline) is None
     with pytest.raises(_pure.AggregateError) as exc:
         _pure.apply_pipeline(docs, pipeline, _PipelineContext())

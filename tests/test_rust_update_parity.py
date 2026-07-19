@@ -401,3 +401,24 @@ def test_batch_apply_parity():
         py = [_pure.apply_update(d, update, is_upsert=upsert) for d in docs]
         assert rust == py, f"batch divergence: rust={rust} pure={py} update={update}"
     assert handled > 500, f"expected many handled batches, only {handled}"
+
+
+@pytest.mark.parametrize(
+    "doc,update",
+    [
+        ({"n": 5}, {"$pull": {"n": 1}}),
+        ({"n": None}, {"$pull": {"n": 1}}),
+        ({"n": 5}, {"$pullAll": {"n": [1]}}),
+        ({"n": None}, {"$pullAll": {"n": [1]}}),
+    ],
+)
+def test_pull_non_array_defers_and_raises(doc, update):
+    # $pull / $pullAll on a present but non-array field: Rust defers (None), the
+    # pure engine raises code 2. A missing field is a no-op both sides (covered
+    # by the curated/fuzz parity), not here.
+    doc = bson.decode(bson.encode(doc))
+    update = bson.decode(bson.encode(update))
+    assert _rust_apply(doc, update) is None
+    with pytest.raises(_pure.UpdateError) as exc:
+        _pure.apply_update(doc, update)
+    assert exc.value.code == 2

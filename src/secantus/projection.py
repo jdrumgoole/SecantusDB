@@ -4,6 +4,7 @@ import copy
 from collections.abc import Mapping
 from typing import Any
 
+from secantus.expressions import _bson_type_name
 from secantus.paths import get_path, has_path, set_path
 from secantus.query import matches
 
@@ -340,6 +341,14 @@ def apply_projection(
         elif _is_positional_key(k):
             positional_specs[k] = v
         else:
+            if _is_elem_match_spec(v) and not isinstance(v["$elemMatch"], Mapping):
+                # mongod: the $elemMatch projection argument must be an object.
+                raise ProjectionError(
+                    "elemMatch: Invalid argument, object required, but got "
+                    f"{_bson_type_name(v['$elemMatch'])}",
+                    code=31274,
+                    code_name="Location31274",
+                )
             spec_main[k] = v
 
     if positional_specs:
