@@ -5,7 +5,7 @@
 //! inclusion/exclusion which Python raises on, nested-document specs, unusual
 //! `$slice` argument types, or a `$elemMatch` sub-filter the matcher defers).
 
-use bson::{Bson, Document};
+use bson::{Bson, Document, RawDocument};
 
 use crate::{paths, query};
 
@@ -13,6 +13,70 @@ use crate::{paths, query};
 pub struct Fallback;
 
 type R<T> = Result<T, Fallback>;
+
+/// Raw-BSON projection fast path for the common case: a **pure top-level
+/// inclusion** spec (`{a: 1, b: 1}`, optionally with `_id: 0`) — no dotted
+/// paths, no operators (`$slice` / `$elemMatch` / `$meta`), no positional, no
+/// exclusion. For that shape the output has only `_id` (unless dropped) plus the
+/// included fields, so we decode ONLY those from `raw` instead of materialising
+/// the whole document (the return-path materialization,
+/// `tasks/rust-perf-findings.md`). The result is byte-identical to
+/// `apply_projection(&raw.to_document(), spec, None)` — including field order:
+/// `_id` first, then the included fields in sorted order (`apply_projection`'s
+/// inclusion path emits them through a `BTreeMap`). Returns `None` for any spec
+/// this fast path doesn't cover, so the caller falls back to the full
+/// `apply_projection` on a decoded document.
+pub fn apply_projection_raw(raw: &RawDocument, spec: &Document) -> Option<Document> {
+    if spec.is_empty() {
+        return None; // whole-doc copy — caller/splice handles it
+    }
+    let mut include_fields: Vec<&str> = Vec::new();
+    let mut include_id = true;
+    for (k, v) in spec {
+        if k.contains('.') || k.ends_with(".$") {
+            return None; // dotted / positional -> full projection
+        }
+        // Only canonical inclusion scalars; a document value is an operator
+        // ($slice/$elemMatch/$meta), and a string / null / exotic `_id` spec has
+        // special rules — defer all of those.
+        let truthy = match v {
+            Bson::Int32(n) => *n != 0,
+            Bson::Int64(n) => *n != 0,
+            Bson::Double(d) => *d != 0.0,
+            Bson::Boolean(b) => *b,
+            _ => return None,
+        };
+        if k == "_id" {
+            include_id = truthy;
+        } else if truthy {
+            include_fields.push(k.as_str());
+        } else {
+            return None; // exclusion of a real field -> not pure inclusion
+        }
+    }
+    if include_fields.is_empty() {
+        return None; // `_id`-only / degenerate specs -> let the full path handle
+    }
+    // Match `apply_projection`'s inclusion order: `_id` first (when kept and
+    // present), then the included fields sorted (its SpecTree is a BTreeMap).
+    include_fields.sort_unstable();
+    include_fields.dedup();
+
+    let mut out = Document::new();
+    if include_id {
+        if let Ok(Some(v)) = raw.get("_id") {
+            out.insert("_id".to_string(), Bson::try_from(v).ok()?);
+        }
+    }
+    for f in include_fields {
+        // A field absent from the document is simply omitted (matching
+        // `include_doc`'s `doc.get(key)` guard).
+        if let Ok(Some(v)) = raw.get(f) {
+            out.insert(f.to_string(), Bson::try_from(v).ok()?);
+        }
+    }
+    Some(out)
+}
 
 fn elem_match_spec(v: &Bson) -> Option<&Bson> {
     if let Bson::Document(d) = v {
@@ -629,7 +693,53 @@ mod tests {
     use bson::doc;
 
     fn proj(d: Document, s: Document) -> Document {
-        apply_projection(&d, &s, None).expect("should not fall back")
+        let owned = apply_projection(&d, &s, None).expect("should not fall back");
+        // Wherever the raw fast path claims a spec, it must produce the
+        // byte-identical document — every inclusion projection test below thus
+        // doubles as an apply_projection_raw parity check.
+        let bytes = bson::to_vec(&d).unwrap();
+        let raw = RawDocument::from_bytes(&bytes).unwrap();
+        if let Some(fast) = apply_projection_raw(raw, &s) {
+            assert_eq!(
+                fast, owned,
+                "apply_projection_raw != apply_projection for doc={d:?} spec={s:?}"
+            );
+        }
+        owned
+    }
+
+    fn raw_of(d: &Document) -> Vec<u8> {
+        bson::to_vec(d).unwrap()
+    }
+
+    #[test]
+    fn raw_fast_path_activates_only_for_pure_inclusion() {
+        let d = doc! {"_id": 1, "a": 10, "b": 20, "c": 30};
+        let b = raw_of(&d);
+        let raw = RawDocument::from_bytes(&b).unwrap();
+        // Pure top-level inclusion -> fast path, byte-identical to owned.
+        for spec in [
+            doc! {"a": 1},
+            doc! {"b": 1, "a": 1},
+            doc! {"a": 1, "_id": 0},
+        ] {
+            let fast = apply_projection_raw(raw, &spec).expect("inclusion should fast-path");
+            assert_eq!(fast, apply_projection(&d, &spec, None).unwrap());
+        }
+        // Everything else must defer (None) so the owned path runs.
+        for spec in [
+            doc! {"a": 0},             // exclusion
+            doc! {"a": 1, "b": 0},     // mixed
+            doc! {"a.x": 1},           // dotted
+            doc! {"a": {"$slice": 1}}, // operator
+            doc! {"_id": 1},           // _id-only
+            doc! {},                   // empty
+        ] {
+            assert!(
+                apply_projection_raw(raw, &spec).is_none(),
+                "spec should defer: {spec:?}"
+            );
+        }
     }
 
     #[test]

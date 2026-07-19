@@ -845,6 +845,16 @@ fn project_to_docs(
     };
     docs.iter()
         .map(|bytes| {
+            // Fast path: a pure top-level inclusion spec projects straight off
+            // the raw BSON, decoding only the included fields (not the whole
+            // document). Anything else — exclusion, dotted, operators,
+            // positional — falls back to the full decode + `apply_projection`.
+            if let Ok(raw) = bson::RawDocument::from_bytes(bytes) {
+                if let Some(projected) = secantus_core::projection::apply_projection_raw(raw, spec)
+                {
+                    return Ok(projected);
+                }
+            }
             let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
                 CommandError::new(
                     1,
