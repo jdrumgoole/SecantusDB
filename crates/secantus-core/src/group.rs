@@ -1106,6 +1106,280 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
 /// `aggregate._stage_bucket_auto`: a pure count-chunking — documents that share a
 /// boundary value are *not* coalesced into one bucket (so N equal values still
 /// split across buckets), matching the Python server.
+// mongod's preferred-number rounding series for $bucketAuto `granularity`,
+// stored exactly as mongod stores them (integer-valued doubles) so that
+// `series_element * multiplier` reproduces mongod's f64 boundaries bit-for-bit.
+// Mirrors `secantus.aggregate._BUCKET_AUTO_SERIES`; verified hex-exact against
+// mongod 7.0.12. See `granularity_rounder_preferred_numbers.cpp`.
+fn series_for(name: &str) -> Option<&'static [f64]> {
+    Some(match name {
+        "R5" => &[10.0, 16.0, 25.0, 40.0, 63.0],
+        "R10" => &[
+            100.0, 125.0, 160.0, 200.0, 250.0, 315.0, 400.0, 500.0, 630.0, 800.0,
+        ],
+        "R20" => &[
+            100.0, 112.0, 125.0, 140.0, 160.0, 180.0, 200.0, 224.0, 250.0, 280.0, 315.0, 355.0,
+            400.0, 450.0, 500.0, 560.0, 630.0, 710.0, 800.0, 900.0,
+        ],
+        "R40" => &[
+            100.0, 106.0, 112.0, 118.0, 125.0, 132.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0,
+            200.0, 212.0, 224.0, 236.0, 250.0, 265.0, 280.0, 300.0, 315.0, 355.0, 375.0, 400.0,
+            425.0, 450.0, 475.0, 500.0, 530.0, 560.0, 600.0, 630.0, 670.0, 710.0, 750.0, 800.0,
+            850.0, 900.0, 950.0,
+        ],
+        "R80" => &[
+            103.0, 109.0, 115.0, 122.0, 128.0, 136.0, 145.0, 155.0, 165.0, 175.0, 185.0, 195.0,
+            206.0, 218.0, 230.0, 243.0, 258.0, 272.0, 290.0, 307.0, 325.0, 345.0, 365.0, 387.0,
+            412.0, 437.0, 462.0, 487.0, 515.0, 545.0, 575.0, 615.0, 650.0, 690.0, 730.0, 775.0,
+            825.0, 875.0, 925.0, 975.0,
+        ],
+        "1-2-5" => &[10.0, 20.0, 50.0],
+        "E6" => &[10.0, 15.0, 22.0, 33.0, 47.0, 68.0],
+        "E12" => &[
+            10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 39.0, 47.0, 56.0, 68.0, 82.0,
+        ],
+        "E24" => &[
+            10.0, 11.0, 12.0, 13.0, 15.0, 16.0, 18.0, 20.0, 22.0, 24.0, 27.0, 30.0, 33.0, 36.0,
+            39.0, 43.0, 47.0, 51.0, 56.0, 62.0, 68.0, 75.0, 82.0, 91.0,
+        ],
+        "E48" => &[
+            100.0, 105.0, 110.0, 115.0, 121.0, 127.0, 133.0, 140.0, 147.0, 154.0, 162.0, 169.0,
+            178.0, 187.0, 196.0, 205.0, 215.0, 226.0, 237.0, 249.0, 261.0, 274.0, 287.0, 301.0,
+            316.0, 332.0, 348.0, 365.0, 383.0, 402.0, 422.0, 442.0, 464.0, 487.0, 511.0, 536.0,
+            562.0, 590.0, 619.0, 649.0, 681.0, 715.0, 750.0, 787.0, 825.0, 866.0, 909.0, 953.0,
+        ],
+        "E96" => &[
+            100.0, 102.0, 105.0, 107.0, 110.0, 113.0, 115.0, 118.0, 121.0, 124.0, 127.0, 130.0,
+            133.0, 137.0, 140.0, 143.0, 147.0, 150.0, 154.0, 158.0, 162.0, 165.0, 169.0, 174.0,
+            178.0, 182.0, 187.0, 191.0, 196.0, 200.0, 205.0, 210.0, 215.0, 221.0, 226.0, 232.0,
+            237.0, 243.0, 249.0, 255.0, 261.0, 267.0, 274.0, 280.0, 287.0, 294.0, 301.0, 309.0,
+            316.0, 324.0, 332.0, 340.0, 348.0, 357.0, 365.0, 374.0, 383.0, 392.0, 402.0, 412.0,
+            422.0, 432.0, 442.0, 453.0, 464.0, 475.0, 487.0, 499.0, 511.0, 523.0, 536.0, 549.0,
+            562.0, 576.0, 590.0, 604.0, 619.0, 634.0, 649.0, 665.0, 681.0, 698.0, 715.0, 732.0,
+            750.0, 768.0, 787.0, 806.0, 825.0, 845.0, 866.0, 887.0, 909.0, 931.0, 953.0, 976.0,
+        ],
+        "E192" => &[
+            100.0, 101.0, 102.0, 104.0, 105.0, 106.0, 107.0, 109.0, 110.0, 111.0, 113.0, 114.0,
+            115.0, 117.0, 118.0, 120.0, 121.0, 123.0, 124.0, 126.0, 127.0, 129.0, 130.0, 132.0,
+            133.0, 135.0, 137.0, 138.0, 140.0, 142.0, 143.0, 145.0, 147.0, 149.0, 150.0, 152.0,
+            154.0, 156.0, 158.0, 160.0, 162.0, 164.0, 165.0, 167.0, 169.0, 172.0, 174.0, 176.0,
+            178.0, 180.0, 182.0, 184.0, 187.0, 189.0, 191.0, 193.0, 196.0, 198.0, 200.0, 203.0,
+            205.0, 208.0, 210.0, 213.0, 215.0, 218.0, 221.0, 223.0, 226.0, 229.0, 232.0, 234.0,
+            237.0, 240.0, 243.0, 246.0, 249.0, 252.0, 255.0, 258.0, 261.0, 264.0, 267.0, 271.0,
+            274.0, 277.0, 280.0, 284.0, 287.0, 291.0, 294.0, 298.0, 301.0, 305.0, 309.0, 312.0,
+            316.0, 320.0, 324.0, 328.0, 332.0, 336.0, 340.0, 344.0, 348.0, 352.0, 357.0, 361.0,
+            365.0, 370.0, 374.0, 379.0, 383.0, 388.0, 392.0, 397.0, 402.0, 407.0, 412.0, 417.0,
+            422.0, 427.0, 432.0, 437.0, 442.0, 448.0, 453.0, 459.0, 464.0, 470.0, 475.0, 481.0,
+            487.0, 493.0, 499.0, 505.0, 511.0, 517.0, 523.0, 530.0, 536.0, 542.0, 549.0, 556.0,
+            562.0, 569.0, 576.0, 583.0, 590.0, 597.0, 604.0, 612.0, 619.0, 626.0, 634.0, 642.0,
+            649.0, 657.0, 665.0, 673.0, 681.0, 690.0, 698.0, 706.0, 715.0, 723.0, 732.0, 741.0,
+            750.0, 759.0, 768.0, 777.0, 787.0, 796.0, 806.0, 816.0, 825.0, 835.0, 845.0, 856.0,
+            866.0, 876.0, 887.0, 898.0, 909.0, 920.0, 931.0, 942.0, 953.0, 965.0, 976.0, 988.0,
+        ],
+        _ => return None,
+    })
+}
+
+fn is_valid_granularity(name: &str) -> bool {
+    name == "POWERSOF2" || series_for(name).is_some()
+}
+
+/// mongod `GranularityRounderPreferredNumbers::roundUp` (double path).
+fn round_up_series(number: f64, series: &[f64]) -> f64 {
+    if number == 0.0 || number == f64::INFINITY {
+        return number;
+    }
+    let mut multiplier = 1.0;
+    while number >= series[series.len() - 1] * multiplier {
+        multiplier *= 10.0;
+    }
+    while number < series[0] * multiplier {
+        let previous_min = series[0] * multiplier;
+        multiplier /= 10.0;
+        if number >= series[series.len() - 1] * multiplier {
+            return previous_min;
+        }
+    }
+    // smallest series element with number < series*multiplier (strict upper bound)
+    for &s in series {
+        if number < s * multiplier {
+            return s * multiplier;
+        }
+    }
+    series[series.len() - 1] * multiplier
+}
+
+/// mongod `GranularityRounderPreferredNumbers::roundDown` (double path).
+fn round_down_series(number: f64, series: &[f64]) -> f64 {
+    if number == 0.0 || number == f64::INFINITY {
+        return number;
+    }
+    let mut multiplier = 1.0;
+    while number <= series[0] * multiplier {
+        multiplier /= 10.0;
+    }
+    if multiplier == 0.0 {
+        return 0.0;
+    }
+    while number > series[series.len() - 1] * multiplier {
+        let previous_max = series[series.len() - 1] * multiplier;
+        multiplier *= 10.0;
+        if number <= series[0] * multiplier {
+            return previous_max;
+        }
+    }
+    // largest series element with series*multiplier < number (strict)
+    let mut prev = series[0] * multiplier;
+    for &s in &series[1..] {
+        let scaled = s * multiplier;
+        if scaled >= number {
+            return prev;
+        }
+        prev = scaled;
+    }
+    prev
+}
+
+/// mongod `GranularityRounderPowersOfTwo` (double path).
+fn round_up_pow2(v: f64) -> f64 {
+    if v == 0.0 || v == f64::INFINITY {
+        return v;
+    }
+    2.0_f64.powf(v.log2().floor() + 1.0)
+}
+
+fn round_down_pow2(v: f64) -> f64 {
+    if v == 0.0 || v == f64::INFINITY {
+        return v;
+    }
+    2.0_f64.powf(v.log2().ceil() - 1.0)
+}
+
+/// Coerce a groupBy value to the double mongod's rounder works on, or `Err(())`
+/// (defer) for a value mongod would reject (non-numeric / NaN / negative) or a
+/// Decimal128 (the standing precision deferral). The Python engine raises the
+/// exact 40258 / 40259 / 40260; on the Rust server a defer surfaces as BadValue.
+fn granularity_coerce(v: &Bson) -> R<f64> {
+    let f = match v {
+        Bson::Int32(n) => *n as f64,
+        Bson::Int64(n) => *n as f64,
+        Bson::Double(d) => *d,
+        _ => return Err(()),
+    };
+    if f.is_nan() || f < 0.0 {
+        return Err(());
+    }
+    Ok(f)
+}
+
+/// mongod `DocumentSourceBucketAuto::populateNextBucket` with a granularity
+/// rounder. Mirrors `secantus.aggregate._bucket_auto_granular`; hex-exact vs
+/// mongod 7.0.12.
+fn bucket_auto_granular(
+    keyed: &[(Vec<u8>, Bson, &Document)],
+    n_buckets: usize,
+    granularity: &str,
+    output_spec: &Document,
+    vars: &Document,
+) -> R<Vec<Document>> {
+    let n = keyed.len();
+    let mut values: Vec<f64> = Vec::with_capacity(n);
+    for (_, v, _) in keyed {
+        values.push(granularity_coerce(v)?);
+    }
+    let is_pow2 = granularity == "POWERSOF2";
+    let series: &[f64] = if is_pow2 {
+        &[]
+    } else {
+        series_for(granularity).ok_or(())?
+    };
+    let rup = |x: f64| {
+        if is_pow2 {
+            round_up_pow2(x)
+        } else {
+            round_up_series(x, series)
+        }
+    };
+    let rdn = |x: f64| {
+        if is_pow2 {
+            round_down_pow2(x)
+        } else {
+            round_down_series(x, series)
+        }
+    };
+
+    let mut approx = (n as f64 / n_buckets as f64 + 0.5).floor() as i64; // std::round (positive)
+    if approx < 1 {
+        approx = 1;
+    }
+
+    let mut out: Vec<Document> = Vec::new();
+    let mut idx = 0usize;
+    let mut previous_max: Option<f64> = None;
+    let mut carry: Option<usize> = None;
+    let mut bucket_num = 0usize;
+    loop {
+        bucket_num += 1;
+        if carry.is_none() && idx >= n {
+            break;
+        }
+        let cur_i = if let Some(c) = carry {
+            c
+        } else {
+            let c = idx;
+            idx += 1;
+            c
+        };
+        let cur_min = previous_max.unwrap_or_else(|| rdn(values[cur_i]));
+        let mut cur_max = values[cur_i];
+        let mut chunk: Vec<usize> = vec![cur_i];
+        let is_last = bucket_num == n_buckets;
+        let mut i = 1i64;
+        while idx < n && (i < approx || is_last) {
+            cur_max = values[idx];
+            chunk.push(idx);
+            idx += 1;
+            i += 1;
+        }
+        let mut next_i: Option<usize> = if idx < n {
+            let c = idx;
+            idx += 1;
+            Some(c)
+        } else {
+            None
+        };
+        let boundary = rup(cur_max);
+        // Absorb values that now fall below the rounded boundary (boundary fixed).
+        while let Some(ni) = next_i {
+            if boundary > values[ni] {
+                chunk.push(ni);
+                next_i = if idx < n {
+                    let c = idx;
+                    idx += 1;
+                    Some(c)
+                } else {
+                    None
+                };
+            } else {
+                break;
+            }
+        }
+        let bucket_max = match next_i {
+            Some(ni) if boundary == 0.0 => rdn(values[ni]),
+            _ => boundary,
+        };
+        let id = Bson::Document(bson::doc! { "min": cur_min, "max": bucket_max });
+        let chunk_docs: Vec<&Document> = chunk.iter().map(|&ci| keyed[ci].2).collect();
+        out.push(accumulate_into(id, output_spec, &chunk_docs, vars)?);
+        previous_max = Some(bucket_max);
+        carry = next_i;
+        if carry.is_none() && idx >= n {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
         return Err(());
@@ -1113,12 +1387,6 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
     let Some(group_by) = s.get("groupBy") else {
         return Err(());
     };
-    // `granularity` (preferred-number rounding) is validated / rejected by
-    // Python (unknown -> 40257, non-string -> 40261, valid -> unsupported), so
-    // defer the whole stage whenever it's present.
-    if s.contains_key("granularity") {
-        return Err(());
-    }
     // buckets: a positive integer, or a whole double (mongod accepts 2.0). Any
     // other value (bool, fractional double, non-positive, non-number, missing)
     // defers so Python raises the exact code (40241/40242/40243/40246).
@@ -1132,6 +1400,12 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
     let output_spec: &Document = match s.get("output") {
         Some(Bson::Document(d)) if !d.is_empty() => d,
         None | Some(Bson::Document(_)) => &default_output,
+        Some(_) => return Err(()),
+    };
+    // A non-string / unknown granularity defers so Python raises 40261 / 40257.
+    let granularity: Option<&str> = match s.get("granularity") {
+        None => None,
+        Some(Bson::String(g)) if is_valid_granularity(g) => Some(g.as_str()),
         Some(_) => return Err(()),
     };
 
@@ -1150,6 +1424,10 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     if keyed.is_empty() {
         return Ok(Vec::new());
+    }
+
+    if let Some(gran) = granularity {
+        return bucket_auto_granular(&keyed, n_buckets, gran, output_spec, vars);
     }
 
     let bucket_size = std::cmp::max(1, keyed.len() / n_buckets);
