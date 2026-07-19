@@ -215,6 +215,18 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # setup-uv runs `uv cache prune --ci` before saving, which DELETES the
+          # pre-built wheels on the theory that they are cheap to re-download.
+          # Measured here that assumption does not hold: the saved cache was
+          # ~2 MB and every job then re-downloaded the dependency set (numpy
+          # 16 MB, mypy 14.5 MB, ruff 11 MB, babel 9.7 MB, sphinx, sqlalchemy,
+          # cryptography, ...). Dependency install, not the WiredTiger build,
+          # is what the sync step actually spends its ~83s on in the lanes that
+          # gate the workflow.
+          prune-cache: false
+          # ...and the managed interpreter is not cached by default either, so
+          # each job also pulled cpython-3.x (28 MB) fresh.
+          cache-python: true
           # Default ``cache-dependency-glob`` is ``**/uv.lock``; on
           # Windows the recursive walk trips over deep paths under
           # vendor/mongo-ruby-driver (EPERM at .evergreen/atlas).
@@ -440,6 +452,18 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # setup-uv runs `uv cache prune --ci` before saving, which DELETES the
+          # pre-built wheels on the theory that they are cheap to re-download.
+          # Measured here that assumption does not hold: the saved cache was
+          # ~2 MB and every job then re-downloaded the dependency set (numpy
+          # 16 MB, mypy 14.5 MB, ruff 11 MB, babel 9.7 MB, sphinx, sqlalchemy,
+          # cryptography, ...). Dependency install, not the WiredTiger build,
+          # is what the sync step actually spends its ~83s on in the lanes that
+          # gate the workflow.
+          prune-cache: false
+          # ...and the managed interpreter is not cached by default either, so
+          # each job also pulled cpython-3.x (28 MB) fresh.
+          cache-python: true
           # Same narrow glob as the ``test`` job: one lock file at the repo
           # root, and the default recursive walk trips on deep vendor paths.
           cache-dependency-glob: uv.lock
@@ -640,6 +664,18 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # setup-uv runs `uv cache prune --ci` before saving, which DELETES the
+          # pre-built wheels on the theory that they are cheap to re-download.
+          # Measured here that assumption does not hold: the saved cache was
+          # ~2 MB and every job then re-downloaded the dependency set (numpy
+          # 16 MB, mypy 14.5 MB, ruff 11 MB, babel 9.7 MB, sphinx, sqlalchemy,
+          # cryptography, ...). Dependency install, not the WiredTiger build,
+          # is what the sync step actually spends its ~83s on in the lanes that
+          # gate the workflow.
+          prune-cache: false
+          # ...and the managed interpreter is not cached by default either, so
+          # each job also pulled cpython-3.x (28 MB) fresh.
+          cache-python: true
           cache-dependency-glob: uv.lock
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -800,6 +836,18 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # setup-uv runs `uv cache prune --ci` before saving, which DELETES the
+          # pre-built wheels on the theory that they are cheap to re-download.
+          # Measured here that assumption does not hold: the saved cache was
+          # ~2 MB and every job then re-downloaded the dependency set (numpy
+          # 16 MB, mypy 14.5 MB, ruff 11 MB, babel 9.7 MB, sphinx, sqlalchemy,
+          # cryptography, ...). Dependency install, not the WiredTiger build,
+          # is what the sync step actually spends its ~83s on in the lanes that
+          # gate the workflow.
+          prune-cache: false
+          # ...and the managed interpreter is not cached by default either, so
+          # each job also pulled cpython-3.x (28 MB) fresh.
+          cache-python: true
           cache-dependency-glob: uv.lock
 
       - name: Set up Python 3.12
@@ -926,6 +974,18 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # setup-uv runs `uv cache prune --ci` before saving, which DELETES the
+          # pre-built wheels on the theory that they are cheap to re-download.
+          # Measured here that assumption does not hold: the saved cache was
+          # ~2 MB and every job then re-downloaded the dependency set (numpy
+          # 16 MB, mypy 14.5 MB, ruff 11 MB, babel 9.7 MB, sphinx, sqlalchemy,
+          # cryptography, ...). Dependency install, not the WiredTiger build,
+          # is what the sync step actually spends its ~83s on in the lanes that
+          # gate the workflow.
+          prune-cache: false
+          # ...and the managed interpreter is not cached by default either, so
+          # each job also pulled cpython-3.x (28 MB) fresh.
+          cache-python: true
           cache-dependency-glob: uv.lock
 
       - name: Set up Python 3.12
@@ -1104,6 +1164,18 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
+          # setup-uv runs `uv cache prune --ci` before saving, which DELETES the
+          # pre-built wheels on the theory that they are cheap to re-download.
+          # Measured here that assumption does not hold: the saved cache was
+          # ~2 MB and every job then re-downloaded the dependency set (numpy
+          # 16 MB, mypy 14.5 MB, ruff 11 MB, babel 9.7 MB, sphinx, sqlalchemy,
+          # cryptography, ...). Dependency install, not the WiredTiger build,
+          # is what the sync step actually spends its ~83s on in the lanes that
+          # gate the workflow.
+          prune-cache: false
+          # ...and the managed interpreter is not cached by default either, so
+          # each job also pulled cpython-3.x (28 MB) fresh.
+          cache-python: true
           cache-dependency-glob: uv.lock
 
       - name: Set up Python 3.12
