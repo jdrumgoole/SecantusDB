@@ -296,11 +296,45 @@ jobs:
       # across jobs. Probed on both platforms with two independent jobs each —
       # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
       # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Pin the build interpreter so the cache can actually be reused
+        # Without this the WiredTiger build cache restores and is then thrown
+        # away. scikit-build-core writes Python3_EXECUTABLE into the top-level
+        # CMakeCache, and under PEP 517 that is the isolated build env — a
+        # FRESH temp directory every build. A changed cache variable forces a
+        # reconfigure which takes the WiredTiger ExternalProject with it: every
+        # stamp regenerates, including `mkdir`, so the prefix is recreated and
+        # WiredTiger recompiles from scratch on a cache HIT.
+        #
+        # Reproduced locally: a second `uv sync` rebuilt WT in 37.9s under 3.10
+        # and skipped it in 1.3s under 3.12 — uv reuses a cached build env for
+        # the pinned .python-version (3.12) but mints fresh ones for 3.10.
+        # That is exactly why the 3.10 test lanes rebuilt (73.6s build phase)
+        # while the 3.12 rust lanes did not (4.0s), both on a cache hit.
+        #
+        # It has to be set HERE rather than inside CMakeLists.txt: scikit-build
+        # passes -DPython3_EXECUTABLE on the command line, so CMake has already
+        # seen the changed value by the time project code could override it.
+        # Substituting the interpreter is ABI-safe — verified by building a
+        # wheel with and without the pin and diffing: same name, same 170
+        # entries, same tag (cp310-cp310-...).
+        id: pybuild
+        shell: bash
+        run: |
+          p=$(uv python find ${{ matrix.python-version }} 2>/dev/null || uv python find)
+          echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+          echo "pinned build interpreter: $p"
+
       - name: Compute WiredTiger build-cache key
         id: wtkey
         shell: bash
         run: |
           echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # The pinned interpreter is part of the build's identity: if it moves,
+          # the cached tree would reconfigure anyway, so take a cold key instead
+          # of restoring something that cannot be reused.
+          if command -v sha256sum >/dev/null; then PH="sha256sum"; else PH="shasum -a 256"; fi
+          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | $PH | cut -c1-12)" >> "$GITHUB_OUTPUT"
           # Everything that shapes the build. Any change here must produce a
           # cold rebuild rather than reuse objects built under other settings.
           if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
@@ -322,7 +356,7 @@ jobs:
           # the stale state to forbid: exact key or cold build. ImageVersion is
           # in the key so a runner-image toolchain bump cannot reuse objects
           # built by a different compiler.
-          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
 
       - name: Sync dependencies
         # ``--extra admin`` brings in httpx / fastapi / uvicorn used by
@@ -564,11 +598,45 @@ jobs:
       # across jobs. Probed on both platforms with two independent jobs each —
       # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
       # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Pin the build interpreter so the cache can actually be reused
+        # Without this the WiredTiger build cache restores and is then thrown
+        # away. scikit-build-core writes Python3_EXECUTABLE into the top-level
+        # CMakeCache, and under PEP 517 that is the isolated build env — a
+        # FRESH temp directory every build. A changed cache variable forces a
+        # reconfigure which takes the WiredTiger ExternalProject with it: every
+        # stamp regenerates, including `mkdir`, so the prefix is recreated and
+        # WiredTiger recompiles from scratch on a cache HIT.
+        #
+        # Reproduced locally: a second `uv sync` rebuilt WT in 37.9s under 3.10
+        # and skipped it in 1.3s under 3.12 — uv reuses a cached build env for
+        # the pinned .python-version (3.12) but mints fresh ones for 3.10.
+        # That is exactly why the 3.10 test lanes rebuilt (73.6s build phase)
+        # while the 3.12 rust lanes did not (4.0s), both on a cache hit.
+        #
+        # It has to be set HERE rather than inside CMakeLists.txt: scikit-build
+        # passes -DPython3_EXECUTABLE on the command line, so CMake has already
+        # seen the changed value by the time project code could override it.
+        # Substituting the interpreter is ABI-safe — verified by building a
+        # wheel with and without the pin and diffing: same name, same 170
+        # entries, same tag (cp310-cp310-...).
+        id: pybuild
+        shell: bash
+        run: |
+          p=$(uv python find ${{ matrix.python-version }} 2>/dev/null || uv python find)
+          echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+          echo "pinned build interpreter: $p"
+
       - name: Compute WiredTiger build-cache key
         id: wtkey
         shell: bash
         run: |
           echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # The pinned interpreter is part of the build's identity: if it moves,
+          # the cached tree would reconfigure anyway, so take a cold key instead
+          # of restoring something that cannot be reused.
+          if command -v sha256sum >/dev/null; then PH="sha256sum"; else PH="shasum -a 256"; fi
+          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | $PH | cut -c1-12)" >> "$GITHUB_OUTPUT"
           # Everything that shapes the build. Any change here must produce a
           # cold rebuild rather than reuse objects built under other settings.
           if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
@@ -590,7 +658,7 @@ jobs:
           # the stale state to forbid: exact key or cold build. ImageVersion is
           # in the key so a runner-image toolchain bump cannot reuse objects
           # built by a different compiler.
-          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
 
       - name: Sync dependencies
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
@@ -809,11 +877,45 @@ jobs:
       # across jobs. Probed on both platforms with two independent jobs each —
       # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
       # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Pin the build interpreter so the cache can actually be reused
+        # Without this the WiredTiger build cache restores and is then thrown
+        # away. scikit-build-core writes Python3_EXECUTABLE into the top-level
+        # CMakeCache, and under PEP 517 that is the isolated build env — a
+        # FRESH temp directory every build. A changed cache variable forces a
+        # reconfigure which takes the WiredTiger ExternalProject with it: every
+        # stamp regenerates, including `mkdir`, so the prefix is recreated and
+        # WiredTiger recompiles from scratch on a cache HIT.
+        #
+        # Reproduced locally: a second `uv sync` rebuilt WT in 37.9s under 3.10
+        # and skipped it in 1.3s under 3.12 — uv reuses a cached build env for
+        # the pinned .python-version (3.12) but mints fresh ones for 3.10.
+        # That is exactly why the 3.10 test lanes rebuilt (73.6s build phase)
+        # while the 3.12 rust lanes did not (4.0s), both on a cache hit.
+        #
+        # It has to be set HERE rather than inside CMakeLists.txt: scikit-build
+        # passes -DPython3_EXECUTABLE on the command line, so CMake has already
+        # seen the changed value by the time project code could override it.
+        # Substituting the interpreter is ABI-safe — verified by building a
+        # wheel with and without the pin and diffing: same name, same 170
+        # entries, same tag (cp310-cp310-...).
+        id: pybuild
+        shell: bash
+        run: |
+          p=$(uv python find ${{ matrix.python-version }} 2>/dev/null || uv python find)
+          echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+          echo "pinned build interpreter: $p"
+
       - name: Compute WiredTiger build-cache key
         id: wtkey
         shell: bash
         run: |
           echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # The pinned interpreter is part of the build's identity: if it moves,
+          # the cached tree would reconfigure anyway, so take a cold key instead
+          # of restoring something that cannot be reused.
+          if command -v sha256sum >/dev/null; then PH="sha256sum"; else PH="shasum -a 256"; fi
+          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | $PH | cut -c1-12)" >> "$GITHUB_OUTPUT"
           # Everything that shapes the build. Any change here must produce a
           # cold rebuild rather than reuse objects built under other settings.
           if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
@@ -835,7 +937,7 @@ jobs:
           # the stale state to forbid: exact key or cold build. ImageVersion is
           # in the key so a runner-image toolchain bump cannot reuse objects
           # built by a different compiler.
-          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py${{ matrix.python-version }}-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
 
       - name: Sync dependencies
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
@@ -1008,11 +1110,45 @@ jobs:
       # across jobs. Probed on both platforms with two independent jobs each —
       # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
       # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Pin the build interpreter so the cache can actually be reused
+        # Without this the WiredTiger build cache restores and is then thrown
+        # away. scikit-build-core writes Python3_EXECUTABLE into the top-level
+        # CMakeCache, and under PEP 517 that is the isolated build env — a
+        # FRESH temp directory every build. A changed cache variable forces a
+        # reconfigure which takes the WiredTiger ExternalProject with it: every
+        # stamp regenerates, including `mkdir`, so the prefix is recreated and
+        # WiredTiger recompiles from scratch on a cache HIT.
+        #
+        # Reproduced locally: a second `uv sync` rebuilt WT in 37.9s under 3.10
+        # and skipped it in 1.3s under 3.12 — uv reuses a cached build env for
+        # the pinned .python-version (3.12) but mints fresh ones for 3.10.
+        # That is exactly why the 3.10 test lanes rebuilt (73.6s build phase)
+        # while the 3.12 rust lanes did not (4.0s), both on a cache hit.
+        #
+        # It has to be set HERE rather than inside CMakeLists.txt: scikit-build
+        # passes -DPython3_EXECUTABLE on the command line, so CMake has already
+        # seen the changed value by the time project code could override it.
+        # Substituting the interpreter is ABI-safe — verified by building a
+        # wheel with and without the pin and diffing: same name, same 170
+        # entries, same tag (cp310-cp310-...).
+        id: pybuild
+        shell: bash
+        run: |
+          p=$(uv python find ${{ matrix.python-version }} 2>/dev/null || uv python find)
+          echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+          echo "pinned build interpreter: $p"
+
       - name: Compute WiredTiger build-cache key
         id: wtkey
         shell: bash
         run: |
           echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # The pinned interpreter is part of the build's identity: if it moves,
+          # the cached tree would reconfigure anyway, so take a cold key instead
+          # of restoring something that cannot be reused.
+          if command -v sha256sum >/dev/null; then PH="sha256sum"; else PH="shasum -a 256"; fi
+          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | $PH | cut -c1-12)" >> "$GITHUB_OUTPUT"
           # Everything that shapes the build. Any change here must produce a
           # cold rebuild rather than reuse objects built under other settings.
           if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
@@ -1034,7 +1170,7 @@ jobs:
           # the stale state to forbid: exact key or cold build. ImageVersion is
           # in the key so a runner-image toolchain bump cannot reuse objects
           # built by a different compiler.
-          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py3.12-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py3.12-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
 
       - name: Sync dependencies
         run: uv sync --extra dev --extra admin  # also builds vendored WT
@@ -1173,11 +1309,45 @@ jobs:
       # across jobs. Probed on both platforms with two independent jobs each —
       # fingerprints matched exactly (Linux b1aa5e9d…, Windows ef1fda60…), with
       # the interpreter resolving deterministically under RUNNER_TEMP.
+      - name: Pin the build interpreter so the cache can actually be reused
+        # Without this the WiredTiger build cache restores and is then thrown
+        # away. scikit-build-core writes Python3_EXECUTABLE into the top-level
+        # CMakeCache, and under PEP 517 that is the isolated build env — a
+        # FRESH temp directory every build. A changed cache variable forces a
+        # reconfigure which takes the WiredTiger ExternalProject with it: every
+        # stamp regenerates, including `mkdir`, so the prefix is recreated and
+        # WiredTiger recompiles from scratch on a cache HIT.
+        #
+        # Reproduced locally: a second `uv sync` rebuilt WT in 37.9s under 3.10
+        # and skipped it in 1.3s under 3.12 — uv reuses a cached build env for
+        # the pinned .python-version (3.12) but mints fresh ones for 3.10.
+        # That is exactly why the 3.10 test lanes rebuilt (73.6s build phase)
+        # while the 3.12 rust lanes did not (4.0s), both on a cache hit.
+        #
+        # It has to be set HERE rather than inside CMakeLists.txt: scikit-build
+        # passes -DPython3_EXECUTABLE on the command line, so CMake has already
+        # seen the changed value by the time project code could override it.
+        # Substituting the interpreter is ABI-safe — verified by building a
+        # wheel with and without the pin and diffing: same name, same 170
+        # entries, same tag (cp310-cp310-...).
+        id: pybuild
+        shell: bash
+        run: |
+          p=$(uv python find ${{ matrix.python-version }} 2>/dev/null || uv python find)
+          echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+          echo "pinned build interpreter: $p"
+
       - name: Compute WiredTiger build-cache key
         id: wtkey
         shell: bash
         run: |
           echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          # The pinned interpreter is part of the build's identity: if it moves,
+          # the cached tree would reconfigure anyway, so take a cold key instead
+          # of restoring something that cannot be reused.
+          if command -v sha256sum >/dev/null; then PH="sha256sum"; else PH="shasum -a 256"; fi
+          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | $PH | cut -c1-12)" >> "$GITHUB_OUTPUT"
           # Everything that shapes the build. Any change here must produce a
           # cold rebuild rather than reuse objects built under other settings.
           if command -v sha256sum >/dev/null; then H="sha256sum"; else H="shasum -a 256"; fi
@@ -1199,7 +1369,7 @@ jobs:
           # the stale state to forbid: exact key or cold build. ImageVersion is
           # in the key so a runner-image toolchain bump cannot reuse objects
           # built by a different compiler.
-          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py3.12-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}
+          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py3.12-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
 
       - name: Sync dependencies
         # Builds the vendored WiredTiger into build/<wheel_tag>/wt-build
