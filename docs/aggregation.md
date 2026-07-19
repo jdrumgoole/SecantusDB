@@ -39,8 +39,19 @@ applied in order; each stage gets the documents emitted by the previous one.
 ### `$group` accumulators
 
 `$sum`, `$count`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`,
-`$addToSet`. Group buckets are emitted in first-seen order (matches
-unsharded MongoDB; sharded behaviour isn't modelled).
+`$addToSet`, `$median`, `$percentile`. Group buckets are emitted in
+first-seen order (matches unsharded MongoDB; sharded behaviour isn't
+modelled).
+
+`$median` and `$percentile` take mongod's `{input, method: "approximate"}`
+form (`$percentile` additionally takes `p: [<fractions>]`). Values are
+computed exactly over the collected input rather than via a t-digest —
+the answers land inside mongod's approximation contract, and no sketch
+state is kept.
+
+`$sum`, `$avg`, `$min`, and `$max` also work as **expression** operators
+outside `$group` — e.g. `{$project: {total: {$sum: "$scores"}}}` — taking
+either an array-valued expression or a variadic argument list.
 
 ## Expression operators
 
@@ -111,9 +122,11 @@ Unknown timezone names raise an error (no silent misinterpretation).
 
 ### Type checks and conversions
 
-`$type`, `$convert`, `$toInt`, `$toDouble`, `$toBool`, `$toDecimal`,
-`$toString`, `$toDate` (`$toLong` / `$toObjectId` are not implemented —
-use `$convert` where a supported target type fits). The `$type` operator returns the
+`$type`, `$convert`, `$toInt`, `$toLong`, `$toDouble`, `$toBool`,
+`$toDecimal`, `$toString`, `$toDate` (`$toObjectId` is not implemented —
+use `$convert` where a supported target type fits). `$toInt` and
+`$convert` enforce int32 / int64 overflow bounds rather than silently
+wrapping. The `$type` operator returns the
 BSON type alias for a value; the int32-vs-int64 distinction depends on
 Python value range rather than the original BSON tag (which we throw away
 on decode).
