@@ -4,12 +4,14 @@ SecantusDB ships an optional local web UI — a FastAPI app served behind
 a [pywebview](https://pywebview.flowrl.com) window — for browsing
 collections, watching live metrics, managing users, tailing change
 streams, profiling slow queries, running maintenance, and taking
-backups against any SecantusDB (or any MongoDB-wire-compatible) server
-the user already has running.
+backups — including point-in-time recovery — against any SecantusDB (or
+any MongoDB-wire-compatible) server the user already has running.
 
 It's **dev-tool shaped**, not a production console. The window connects
-over loopback to one target server per launch, gates HTTP access with a
-fixed local token, and never makes outbound network calls of its own.
+over loopback, gates HTTP access with a fixed local token, and never
+makes outbound network calls of its own. `--uri` picks the target it
+opens against; from there the [Server page](#server-server) can switch
+targets without a restart.
 
 ## Install
 
@@ -57,7 +59,7 @@ holds the process open until you close the window (or hit `Ctrl-C`).
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--uri` | `mongodb://127.0.0.1:27017` | Target server. Any URI a `pymongo.MongoClient` accepts works — including credentials for an `--auth` server (`mongodb://user:pass@host:port/?authSource=admin`). |
+| `--uri` | `mongodb://127.0.0.1:27017` | Target server. Any URI a `pymongo.MongoClient` accepts works — including credentials for an `--auth` server (`mongodb://user:pass@host:port/?authSource=admin`). Must be `mongodb://` or `mongodb+srv://`; a `postgresql://` URI aimed at SecantusDB's SQL server is refused at startup with an explanation. |
 | `--port` | `0` (OS-assigned) | Local HTTP port for the FastAPI app. Bound to `127.0.0.1` only. |
 | `--no-window` | off | Run headless without opening pywebview. Used in CI and tests; the same URL works in any browser. |
 | `--token` | unset | Override the auth token for this launch. |
@@ -105,13 +107,12 @@ process on a machine has full local trust.
 The admin app is a plain pymongo client, so a single build can drive any
 of the three MongoDB-wire servers — the SecantusDB **Python** server, the
 SecantusDB **Rust** server, or a real **`mongod`**. They don't implement
-the same command surface, though: the four proprietary `secantusAdmin.*`
-maintenance / backup commands exist only on SecantusDB (no `mongod` has
-them), and the Rust server hasn't yet ported a handful of standard admin
-commands. Rather than let you click a button that returns
-`CommandNotFound`, the app **probes the target once at connect** (and
-again on every target swap) and gates its feature buttons to what that
-server actually supports.
+quite the same command surface: the proprietary `secantusAdmin.*`
+maintenance / backup / PITR commands exist only on SecantusDB, and no
+`mongod` will ever have them. Rather than let you click a button that
+returns `CommandNotFound`, the app **probes the target once at connect**
+(and again on every target swap) and gates its feature buttons to what
+that server actually supports.
 
 Detection reads the server's own self-identification — no configuration,
 no guessing:
@@ -122,31 +123,67 @@ no guessing:
 
 The detected server type shows as a pill next to the target badge in the
 page header (**SecantusDB (Python)**, **SecantusDB (Rust)**, or
-**MongoDB `<version>`**). Unsupported actions are rendered **disabled**
-with a tooltip explaining why, and pages that would simply come back
-empty (Logs, Profiler on the Rust server) carry an info banner. An
-unreachable or not-yet-probed target stays **fully permissive** — nothing
-is hidden until the app positively knows the server can't do it, so a
-transiently-down server never hides a working button.
+**MongoDB `<version>`**).
 
-What gets gated, by target:
+### Why there is no per-server feature table
 
-| Feature (page) | Wire command | Python | Rust | `mongod` |
-|---|---|:--:|:--:|:--:|
-| Native checkpoint backup (`/backup`) | `secantusAdmin.backupArchive` | ✅ | ✅ | — |
-| Native archive restore (`/backup`) | `secantusAdmin.restoreArchive` | ✅ | — | — |
-| Prune oplog / TTL (`/maintenance`) | `secantusAdmin.pruneOplog` / `.pruneTtl` | ✅ | — | — |
-| Edit user roles (`/users`) | `grantRolesToUser` / `revokeRolesFromUser` | ✅ | — | ✅ |
-| Kill connection (`/connections`) | `killOp` | ✅ | — | ✅ |
-| Logs (`/logs`) | `getLog` | ✅ | banner | ✅ |
-| Profiler (`/profiler`) | `profile` | ✅ | banner | ✅ |
+There used to be one — a hardcoded list of what the Rust server "hadn't
+ported yet". It is worth explaining why it's gone, because the failure
+mode is instructive and the temptation to add one back is real.
+
+The table went stale within days of being written. The Rust server grew
+`restoreArchive`, oplog and TTL pruning, role grant/revoke, `killOp`, a
+real `getLog` ring buffer and real slow-op profiling — and the table went
+on claiming otherwise for months. The console dutifully hid all six
+behind disabled buttons, on a server that implements every one of them.
+That is the exact inverse of the failure this machinery exists to
+prevent, and nothing surfaced it, because a hidden button raises no
+error. Worse, the tests asserted the table's values, so the suite stayed
+green the whole time.
+
+So capability knowledge is now **positive-only**:
+
+* **SecantusDB targets start fully permissive.** The two servers track
+  each other's command surface closely. Assuming parity and being
+  occasionally wrong costs one honest `CommandNotFound` you can see;
+  assuming a gap that has since closed silently removes working
+  functionality with no signal to anyone.
+* **A feature is withdrawn only on evidence.** When a gated command
+  actually comes back `CommandNotFound` (code 59), the button disappears
+  for the rest of the session. Negative knowledge is learned from the
+  live server, never hardcoded, so the console cannot drift out of step
+  with either server again. Switching targets re-probes and resets.
+* **`mongod` keeps a static profile**, because its negatives are
+  *definitional* rather than a snapshot of a moving target: no `mongod`
+  implements `secantusAdmin.*`, and the standard admin commands it does
+  implement are stable.
+
+An unreachable or not-yet-probed target is likewise fully permissive, so
+a transiently-down server never hides a working button.
+
+What that means per target:
+
+| Feature (page) | Wire command | SecantusDB | `mongod` |
+|---|---|:--:|:--:|
+| Native checkpoint backup (`/backup`) | `secantusAdmin.backupArchive` | offered | — |
+| Native archive restore (`/backup`) | `secantusAdmin.restoreArchive` | offered | — |
+| Point-in-time recovery (`/backup`) | `secantusAdmin.archiveBaseSnapshot` / `.restoreToTimestamp` | offered | — |
+| Prune oplog / TTL (`/maintenance`) | `secantusAdmin.pruneOplog` / `.pruneTtl` | offered | — |
+| Edit user roles (`/users`) | `grantRolesToUser` / `revokeRolesFromUser` | offered | ✅ |
+| Kill connection (`/connections`) | `killOp` | offered | ✅ |
+| Logs (`/logs`) | `getLog` | offered | ✅ |
+| Profiler (`/profiler`) | `profile` | offered | ✅ |
+
+"Offered" means exactly that — the control is shown, and it disappears
+only if that specific server answers `CommandNotFound` when you use it.
+Both SecantusDB servers currently implement every row above; the column
+is deliberately not split by flavour, because splitting it is how the
+stale table happened.
 
 `mongodump` / `mongorestore` backups (`/backup`) and every other page go
 through standard wire commands and work against all three. The gate is
-UI-only — if a command ever does slip through it still returns a clean
-error, never a traceback. The Rust server's gaps are tracked upstream and
-close over time; when the target is a real `mongod`, only the
-SecantusDB-only `secantusAdmin.*` actions are hidden.
+UI-only — a command that slips through still returns a clean error, never
+a traceback.
 
 ## Page tour
 
@@ -182,9 +219,13 @@ inspectors: **Indexes**, **Explain plan**, **Schema**, and **Geo**.
 ### Indexes & explain (`/db/{db}/{coll}/indexes`, `/explain`)
 
 * Index list with badges for `unique`, `sparse`, `multikey`, `partial`,
-  `TTL Ns`, `2dsphere`, `2d`, `hashed`. Create form takes a key spec
-  (Extended JSON) plus optional `unique` / `sparse` / partial filter
-  expression / TTL. Drop button gated by typed-confirm; the `_id_`
+  `TTL Ns`, `collation <locale>/<strength>`, `2dsphere`, `2d`, `hashed`.
+  Create form takes a key spec (Extended JSON) plus optional `unique` /
+  `sparse` / partial filter expression / TTL / collation. Collation is a
+  JSON document and must carry a `locale` — e.g.
+  `{"locale": "en", "strength": 2}` for case-insensitive matching; a
+  missing locale is rejected in the form rather than producing a murkier
+  server-side error. Drop button gated by typed-confirm; the `_id_`
   index can never be dropped.
 * Explain visualizer renders the `winningPlan` as a depth-indented
   tree — `FETCH > IXSCAN { indexName, keyPattern, direction }` when an
@@ -215,17 +256,29 @@ switchable via the inline picker). Per-row actions:
 
 * **Password** — typed-confirm modal that runs `updateUser` with the
   new `pwd`.
-* **Roles** — checkbox grid of every built-in role bound to the
-  current home db or `admin`; submit diffs against the user's
-  current bindings and emits `grantRolesToUser` /
-  `revokeRolesFromUser` as needed.
+* **Roles** — checkbox grid of the roles bound to the current home db
+  or `admin`; submit diffs against the user's current bindings and
+  emits `grantRolesToUser` / `revokeRolesFromUser` as needed.
 * **Drop** — typed-confirm modal (must type the username) that runs
   `dropUser`.
 
-`/roles` is read-only — the table reflects `secantus.rbac.BUILT_IN_ROLES`
-exactly. Each row shows the role's action set as inline pills plus
-flag badges (`any_db`, `cluster`, `admin_only`). Custom roles are
-deferred — see [Compatibility](compatibility.md).
+The role list comes from the **connected target**, via `rolesInfo` with
+built-in roles included, unioned with the names in
+`secantus.rbac.BUILT_IN_ROLES` as a floor so a target that can't answer
+still renders a usable picker. That matters because the console can point
+at the Rust server or a real `mongod`, either of which may recognise
+roles this package's own table doesn't list — a custom role created with
+`createRole`, most obviously. For the same reason the submitted names
+aren't filtered against the local table: the server is the authority, so
+an unknown role comes back as an honest `RoleNotFound` rather than being
+silently dropped from the request.
+
+`/roles` is read-only. Each row shows the role's action set as inline
+pills plus flag badges (`any_db`, `cluster`, `admin_only`); a role the
+target reports but this package has no action table for is listed with a
+`custom` badge and no pills, rather than inventing privileges that
+haven't been read. Creating and editing custom roles is deferred — see
+[Compatibility](compatibility.md).
 
 ### Change-stream tail (`/changestream`)
 
@@ -281,6 +334,12 @@ Target-switching plus the embedded server's lifecycle:
   server. Optional `storage_path` selects an on-disk directory;
   blank defaults to a per-launch tempdir. Starting it switches
   the admin app's target to the embedded URI automatically.
+  A **Server** dropdown picks the flavour — *Python server* or
+  *Rust server* — and appears only when the compiled Rust extension
+  (`_secantus_server`) is installed, since a plain `pip install` may
+  not carry it. Asking for the Rust server without it says so rather
+  than failing obscurely. The running flavour is shown next to the
+  URI; stop the server before starting the other one.
 * **Switch to a new target** — accepts any URI the CLI's
   `--uri` flag would accept, credentials inline.
   Open WebSocket clients (dashboard metrics, change-stream tail)
@@ -411,6 +470,36 @@ secantus-restore-archive --archive PATH.tar.gz --target-dir PATH
 Same validation, no wire-protocol round-trip. Pass
 `--allow-existing` to overlay into a non-empty target dir.
 
+#### Point-in-time recovery
+
+A backup archive captures one instant. **PITR** stitches a *base
+snapshot* together with the oplog segments written after it, so you can
+recover to any moment inside the archived window rather than only to the
+moment a backup happened to run.
+
+It needs one piece of server-side setup: start SecantusDB with
+`--oplog-archive-dir <dir>` so the oplog rows that pruning would
+otherwise discard are archived into `<dir>` as segments. The panel's two
+actions then work against that same directory:
+
+* **Take base snapshot** — issues `secantusAdmin.archiveBaseSnapshot`,
+  writing `base-<headSeq>.tar.gz` into the archive directory. There is
+  **no background scheduler**: something has to call this periodically,
+  whether that's you clicking the button or a cron job. Recovery can only
+  reach back as far as the oldest base snapshot still present.
+* **Recover** — issues `secantusAdmin.restoreToTimestamp`. The *source*
+  can be a PITR archive directory, a `.tar.gz` from a native checkpoint
+  backup, or a stopped server's data directory. Leave **Recover to**
+  blank to replay the whole oplog, or give an ISO-8601 wall-clock time to
+  stop there. Tick **preserve oplog** to carry the replayed oplog onto
+  the restored directory, which lets a change stream resume across the
+  restore point; the default is a fresh timeline, like `mongorestore`.
+
+Recovery is **offline-shaped**, exactly like archive extract: it writes a
+new directory and never touches the running server's storage. The success
+message tells you what to start — `--storage-path <target>` — and the
+form rejects `..` in either path.
+
 ## Files written to disk
 
 The UI persists three small artifacts in `~/.secantus/`:
@@ -418,7 +507,7 @@ The UI persists three small artifacts in `~/.secantus/`:
 | Path | Format | Purpose |
 |---|---|---|
 | `~/.secantus/admin-token` | UTF-8 string | URL-safe token, mode `0600`. Generated on first launch. |
-| `~/.secantus/admin.db` | SQLite | Console query history (per-URI ring, 50 entries each). |
+| `~/.secantus/admin.db` | SQLite | Console query history (per-URI ring, 50 entries each) **and** recent target URIs. Mode `0600`, in a `0700` directory — see below. |
 | `~/.secantus/backups/<UTC-stamp>/` | mongodump output | One directory per `mongodump` run. |
 | `~/.secantus/backups/archive-<UTC-stamp>.tar.gz` | gzipped tar | One archive per native-checkpoint-backup run. |
 
@@ -426,20 +515,46 @@ Everything else lives in process memory. The token file is the only
 thing you need to remove if you want a clean slate (`rm
 ~/.secantus/admin-token`); next launch will generate a fresh one.
 
+**`admin.db` holds credentials.** The recent-targets table stores each
+target URI *verbatim*, password included — deliberately, because the
+"switch to this target" buttons have to be able to reconnect and a
+scrubbed URI can't authenticate. (Console *history* is scrubbed through
+`display_uri` before it's written; the target list can't be.) The file is
+therefore created mode `0600` inside a `0700` directory, matching the
+token beside it — the directory too, because SQLite's `-wal` / `-journal`
+sidecars are created on demand and would otherwise land at the process
+umask. Treat the file as a secret: it is one.
+
 ## Limitations
 
-These are the gaps a /CONNECTING_USER_NEEDS_TO_KNOW level. Full
-backlog at `tasks/backlog.md`.
+The gaps worth knowing about before you rely on a page. Full backlog at
+`tasks/backlog.md`.
 
 * **Hot in-place restore** isn't supported — restore extracts the
   archive into a target directory the operator then points a *new*
   SecantusDB process at. The running server's storage is never
   modified. Real mongod restore tooling works the same way
   ("stop mongod, swap dbpath, start mongod") so this matches what
-  ops scripts expect.
-* **Saved-connections / settings page** is deferred. The CLI takes a
-  single `--uri` per launch, so saved bookmarks are low-value until
-  the launcher gains hot-swap support.
+  ops scripts expect. Point-in-time recovery is offline-shaped for the
+  same reason.
+* **No PITR scheduler.** Base snapshots are taken only when something
+  asks for one. A recovery window exists only for the period covered by
+  archived oplog segments *after* a base snapshot that still exists.
+* **The SQL / PostgreSQL-wire server has no admin UI**, and this is a
+  deliberate scoping decision rather than an oversight: every page here
+  is a pymongo client. Pointing `--uri` at a `postgresql://` target is
+  rejected at startup with an explanation rather than an opaque pymongo
+  parse error.
+* **Collection browsing needs a sortable scalar `_id`.** Pagination is
+  skip-ID based, and round-trips `ObjectId`, `int`, `str`, `Decimal128`,
+  `UUID` and `Binary`. A document- or array-valued `_id` can't be encoded
+  into a page cursor. The filter box also can't contain `_id` while
+  paginating, since a user `_id` clause collides with the cursor's own
+  range clause.
+* **Some server features are reachable only through `/query`'s
+  `runCommand` box** — `collMod`, `createCollection` and validators,
+  `renameCollection`, and custom-role creation all ship server-side but
+  have no dedicated panel yet.
 * **Profiler entries** populate the mongod-faithful subset (`ts`,
   `op`, `ns`, `command`, `millis`, `ok`, `client`, `user`, `errMsg` /
   `errCode`). The `planSummary` / `keysExamined` / `docsExamined` /
