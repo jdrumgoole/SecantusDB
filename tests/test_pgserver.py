@@ -124,6 +124,33 @@ def test_startup_sends_parameter_status_and_ready(server):
         c.close()
 
 
+def test_startup_reports_interval_style(server):
+    """``IntervalStyle`` is in the startup set, like real postgres.
+
+    It's one of postgres's ``GUC_REPORT`` parameters, and a client that
+    decodes intervals itself reads the style from here rather than
+    assuming one. psycopg's pure-Python backend does exactly that: with
+    the parameter absent it sees a style of ``unknown`` and raises
+    ``NotImplementedError`` on any ``interval`` result, while its C
+    backend papers over the gap because libpq tracks the value
+    internally. Asserted at the wire level so the guarantee doesn't
+    depend on which psycopg implementation happens to be installed —
+    the binary backend is what's pinned, and it would not catch a
+    regression here.
+    """
+    host, port = server.address
+    c = PGClient(host, port)
+    try:
+        params = {}
+        for m in c.startup():
+            if m.type == "S":
+                name, value, _ = m.payload.split(b"\x00", 2)
+                params[name.decode()] = value.decode()
+        assert params["IntervalStyle"] == "postgres"
+    finally:
+        c.close()
+
+
 def test_select_one(client):
     out = parse_results(client.query("SELECT 1"))
     assert out["results"][0]["tag"] == "SELECT 1"
