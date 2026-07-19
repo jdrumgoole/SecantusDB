@@ -266,6 +266,19 @@ ARRAY_FILTER_CASES = [
     ),
     # no-op: identifier matches nothing
     ({"g": [1, 2]}, {"$set": {"g.$[e]": 9}}, [{"e": {"$gt": 100}}], {}),
+    # single identifier nested inside $and / $or resolves and applies
+    (
+        {"a": [{"g": 1, "h": 1}, {"g": 5, "h": 9}]},
+        {"$set": {"a.$[x].g": 9}},
+        [{"$and": [{"x.g": {"$gt": 3}}, {"x.h": {"$gt": 0}}]}],
+        {},
+    ),
+    (
+        {"a": [{"g": 1}, {"g": 5}]},
+        {"$set": {"a.$[x].g": 9}},
+        [{"$or": [{"x.g": {"$gt": 3}}, {"x.g": {"$lt": 0}}]}],
+        {},
+    ),
 ]
 
 
@@ -457,6 +470,9 @@ def test_push_sort_invalid_defers_and_raises(spec):
         ([{"X": {"$gt": 0}}], 2),  # bad identifier (uppercase start)
         ([{"x": {"$gt": 0}}, {"x": {"$lt": 9}}], 9),  # duplicate identifier
         ([{"x": {"$gt": 0}}, {"y": {"$gt": 0}}], 9),  # 'y' unused
+        ([{"x": {"$gt": 0}, "y": {"$gt": 0}}], 9),  # two identifiers in one filter
+        ([{"$and": [{"x": {"$gt": 0}}, {"y": {"$gt": 0}}]}], 9),  # two, nested
+        ([{"$expr": {"$gt": ["$g", 0]}}], 224),  # $expr, no identifier
     ],
 )
 def test_array_filters_invalid_defers_and_raises(af, code):

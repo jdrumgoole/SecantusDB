@@ -12,6 +12,38 @@ from secantus.paths import get_path, has_path, set_path, unset_path
 _ARRAY_FILTER_TOKEN = re.compile(r"\$\[([^\]]*)\]")
 # An arrayFilter identifier: begins with a lowercase letter, then alphanumeric.
 _ARRAY_FILTER_IDENT = re.compile(r"^[a-z][a-zA-Z0-9]*$")
+# Logical operators whose sub-clauses an arrayFilter identifier can nest inside.
+_ARRAY_FILTER_LOGICAL = ("$and", "$or", "$nor")
+
+
+def _extract_af_identifiers(f: Mapping[str, Any]) -> tuple[list[str], bool]:
+    """The ordered, de-duplicated arrayFilter identifiers referenced by a filter
+    — the top-level field name (before the first ``.``) of each non-``$`` key,
+    recursing through ``$and`` / ``$or`` / ``$nor`` sub-clauses — plus whether a
+    ``$expr`` was seen (which mongod rejects in this context). Mirrors mongod's
+    single-identifier extraction."""
+    idents: list[str] = []
+    seen: set[str] = set()
+    saw_expr = False
+
+    def walk(m: Mapping[str, Any]) -> None:
+        nonlocal saw_expr
+        for key, value in m.items():
+            if key == "$expr":
+                saw_expr = True
+            elif key in _ARRAY_FILTER_LOGICAL:
+                if isinstance(value, list):
+                    for sub in value:
+                        if isinstance(sub, Mapping):
+                            walk(sub)
+            elif not key.startswith("$"):
+                ident = key.split(".", 1)[0]
+                if ident not in seen:
+                    seen.add(ident)
+                    idents.append(ident)
+
+    walk(f)
+    return idents, saw_expr
 
 
 class UpdateError(Exception):
@@ -351,12 +383,11 @@ def _render_update_for_error(update: Mapping[str, Any]) -> str:
 
 def _validate_array_filters(filters: list[Mapping[str, Any]], update: Mapping[str, Any]) -> None:
     """mongod validates arrayFilters before applying: each must be an object
-    (14), have a top-level identifier (empty → 9), whose name is alphanumeric
-    beginning with a lowercase letter (2), unique across filters (9), and used by
-    a ``$[<id>]`` path in the update (9). A filter whose only top-level keys are
-    ``$``-operators (e.g. ``{$and: [{x: ...}]}``) carries a *nested* identifier
-    that SecantusDB doesn't extract yet — it's left unvalidated rather than
-    wrongly rejected (see tasks/backlog.md)."""
+    (14) referencing exactly one identifier — the top-level field name, which may
+    nest inside ``$and`` / ``$or`` / ``$nor`` (none → 9 / 224 for ``$expr``; two
+    or more distinct → 9); the name must be alphanumeric beginning with a
+    lowercase letter (2), unique across filters (9), and used by a ``$[<id>]``
+    path in the update (9)."""
     if not filters:
         return
     seen: set[str] = set()
@@ -368,15 +399,25 @@ def _validate_array_filters(filters: list[Mapping[str, Any]], update: Mapping[st
                 f"'{_bson_type_name(f)}', expected type 'object'",
                 code=14,
             )
-        top = [k.split(".", 1)[0] for k in f if not k.startswith("$")]
-        if not top:
-            if not f:
+        found, saw_expr = _extract_af_identifiers(f)
+        if not found:
+            if saw_expr:
                 raise UpdateError(
-                    "Cannot use an expression without a top-level field name in arrayFilters",
-                    code=9,
+                    "Error parsing array filter :: caused by :: $expr is not allowed "
+                    "in this context",
+                    code=224,
                 )
-            continue  # nested identifier under $and/$or/… — left unvalidated
-        ident = top[0]
+            raise UpdateError(
+                "Cannot use an expression without a top-level field name in arrayFilters",
+                code=9,
+            )
+        if len(found) > 1:
+            raise UpdateError(
+                "Error parsing array filter :: caused by :: Expected a single top-level "
+                f"field name, found '{found[0]}' and '{found[1]}'",
+                code=9,
+            )
+        ident = found[0]
         if not _ARRAY_FILTER_IDENT.match(ident):
             raise UpdateError(
                 "Error parsing array filter :: caused by :: The top-level field name "
@@ -408,8 +449,8 @@ def _index_array_filters(
     for f in filters:
         if not isinstance(f, Mapping):
             raise UpdateError("each arrayFilter must be a document")
-        for key in f:
-            name = key.split(".", 1)[0]
+        # The identifier may nest inside $and/$or/$nor (validated already).
+        for name in _extract_af_identifiers(f)[0]:
             out.setdefault(name, f)
     return out
 

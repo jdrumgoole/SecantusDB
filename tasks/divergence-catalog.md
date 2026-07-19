@@ -81,8 +81,8 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   field FIXED (#526, → 2; missing field stays a no-op). `$currentDate: {d:false}` FIXED
   (#527, → accepts bool false as set-Date; bad scalar / bad `$type` → 2). `arrayFilters`
   non-object (14) / empty (9) / bad identifier (2) / duplicate (9) / unused (9) FIXED
-  (#528, both engines; a nested `$and`/`$or` identifier is left unvalidated — see backlog).
-  (update.py)
+  (#528); nested-`$and`/`$or`/`$nor` identifier extraction + single-identifier rule
+  (two idents → 9, `$expr` → 224) FIXED (#531, both engines). (update.py)
 - **Stages**: `$bucketAuto` buckets bool/non-numeric/fractional/
   non-positive/missing FIXED (#526, → 40241/40242/40243/40246; whole-double accepted);
   `granularity` non-string/unknown FIXED (#530, → 40261/40257; a valid series is rejected
