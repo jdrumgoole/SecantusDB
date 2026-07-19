@@ -347,6 +347,11 @@ class SecantusPGServer:
             ("server_encoding", "UTF8"),
             ("client_encoding", session.get_setting("client_encoding")),
             ("DateStyle", "ISO, MDY"),
+            # Real postgres reports IntervalStyle in the startup set, and
+            # psycopg selects its interval parser from it: without the
+            # ParameterStatus the client sees IntervalStyle "unknown" and
+            # raises NotImplementedError rather than decoding an interval.
+            ("IntervalStyle", session.get_setting("IntervalStyle")),
             ("integer_datetimes", "on"),
             ("standard_conforming_strings", "on"),
             ("TimeZone", "UTC"),
