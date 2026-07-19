@@ -397,6 +397,68 @@ pub fn build_op_msg_reply(
     out
 }
 
+/// Serialize a cursor-command reply *body* (the kind-0 BSON document that
+/// [`build_op_msg_reply`] then frames), splicing the pre-encoded document blobs
+/// into `cursor.<batch_field>` as a BSON array **without decoding them**.
+///
+/// `envelope` is the reply document the handler produced *minus* the batch —
+/// `{ cursor: { id, ns }, ok: 1.0, <gossip…> }`. Each element of `batch` is an
+/// already-encoded BSON document (a stored blob or a cursor-registry entry).
+/// The output is byte-identical to building
+/// `{ cursor: { <batch_field>: [<docs>], id, ns }, ok, … }` as an owned
+/// `Document` and serializing it — but it skips the decode→`IndexMap`→re-encode
+/// round-trip that `docs_to_bson` + `Document::to_writer` otherwise pay for
+/// every served document (the reply-path hot spot in
+/// `tasks/rust-perf-findings.md`). The blobs are memcpy'd in as array elements.
+///
+/// The batch field is emitted first inside `cursor` so the layout matches the
+/// old `doc!{ "cursor": { "firstBatch"/"nextBatch": …, "id": …, "ns": … } }`
+/// ordering exactly (asserted byte-for-byte by the unit test).
+pub fn encode_cursor_reply(
+    envelope: &bson::Document,
+    batch_field: &str,
+    batch: &[Vec<u8>],
+) -> Result<Vec<u8>, WireError> {
+    use bson::{RawArrayBuf, RawDocument, RawDocumentBuf};
+
+    let internal = |m: String| WireError::Protocol(format!("encode_cursor_reply: {m}"));
+
+    // Encode the small envelope once, then re-read it raw so every top-level
+    // element (ok, $clusterTime, operationTime, writeConcernError, …) is copied
+    // through byte-wise, in order, without decoding.
+    let mut env_bytes = Vec::new();
+    envelope
+        .to_writer(&mut env_bytes)
+        .map_err(|e| internal(e.to_string()))?;
+    let env = RawDocument::from_bytes(&env_bytes).map_err(|e| internal(e.to_string()))?;
+
+    let mut out = RawDocumentBuf::new();
+    for pair in env.iter() {
+        let (key, val) = pair.map_err(|e| internal(e.to_string()))?;
+        if key == "cursor" {
+            let cursor = val
+                .as_document()
+                .ok_or_else(|| internal("reply `cursor` field is not a document".into()))?;
+            let mut cur = RawDocumentBuf::new();
+            // Batch first, then copy the handler's `id` / `ns` in their order.
+            let mut arr = RawArrayBuf::new();
+            for blob in batch {
+                let rd = RawDocument::from_bytes(blob).map_err(|e| internal(e.to_string()))?;
+                arr.push(bson::RawBsonRef::Document(rd).to_raw_bson());
+            }
+            cur.append(batch_field, arr);
+            for cp in cursor.iter() {
+                let (ck, cv) = cp.map_err(|e| internal(e.to_string()))?;
+                cur.append(ck, cv.to_raw_bson());
+            }
+            out.append("cursor", cur);
+        } else {
+            out.append(key, val.to_raw_bson());
+        }
+    }
+    Ok(out.into_bytes())
+}
+
 /// Build a legacy `OP_REPLY` frame for the `OP_QUERY` handshake. Port of
 /// `wire.py::build_op_reply`; `documents` are already BSON-encoded.
 pub fn build_op_reply(
@@ -499,6 +561,67 @@ mod tests {
         let mut v = Vec::new();
         d.to_writer(&mut v).unwrap();
         v
+    }
+
+    /// The whole point of `encode_cursor_reply`: its spliced output must be
+    /// byte-for-byte identical to building the same reply as an owned
+    /// `Document` (with the batch decoded into a `Bson::Array`) and serializing
+    /// it. If this holds, no driver can tell the fast path from the old one.
+    fn assert_splice_matches(envelope: bson::Document, batch_field: &str, docs: &[bson::Document]) {
+        let blobs: Vec<Vec<u8>> = docs.iter().map(enc).collect();
+
+        // The old path: decode the blobs into `Bson::Document`s, insert the
+        // array into `cursor.<batch_field>` (first, as the handlers did), and
+        // serialize the whole owned document.
+        let mut owned = envelope.clone();
+        let cursor = owned.get_document_mut("cursor").unwrap();
+        let arr: Vec<bson::Bson> = docs.iter().cloned().map(bson::Bson::Document).collect();
+        // Rebuild `cursor` with the batch field first to match the splice order.
+        let mut rebuilt = bson::Document::new();
+        rebuilt.insert(batch_field, arr);
+        for (k, v) in cursor.iter() {
+            rebuilt.insert(k, v.clone());
+        }
+        *cursor = rebuilt;
+        let expected = enc(&owned);
+
+        let got = encode_cursor_reply(&envelope, batch_field, &blobs).unwrap();
+        assert_eq!(
+            got, expected,
+            "spliced reply body must byte-match the owned reply"
+        );
+    }
+
+    #[test]
+    fn encode_cursor_reply_byte_matches_owned() {
+        // find firstBatch, multiple docs, with gossip fields after `cursor`.
+        assert_splice_matches(
+            doc! {
+                "cursor": { "id": 0i64, "ns": "db.coll" },
+                "ok": 1.0,
+                "$clusterTime": { "clusterTime": bson::Timestamp { time: 5, increment: 1 } },
+                "operationTime": bson::Timestamp { time: 5, increment: 1 },
+            },
+            "firstBatch",
+            &[
+                doc! { "_id": 1, "x": "a" },
+                doc! { "_id": 2, "x": "b", "nested": { "y": [1, 2, 3] } },
+            ],
+        );
+
+        // getMore nextBatch with a live cursor id.
+        assert_splice_matches(
+            doc! { "cursor": { "id": 987654321i64, "ns": "db.coll" }, "ok": 1.0 },
+            "nextBatch",
+            &[doc! { "_id": 3 }],
+        );
+
+        // Empty batch (batchSize:0 / drained cursor) — array must still frame.
+        assert_splice_matches(
+            doc! { "cursor": { "id": 0i64, "ns": "db.coll" }, "ok": 1.0 },
+            "firstBatch",
+            &[],
+        );
     }
 
     #[test]

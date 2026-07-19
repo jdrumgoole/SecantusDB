@@ -31,9 +31,26 @@ fn seed(c: &mut CommandContext, coll: &str, docs: Vec<Document>) {
     );
 }
 
+/// The cursor batch as decoded docs. A no-projection `find` hands its batch to
+/// the server as pre-encoded blobs via `ctx.pending_batch` (the raw-BSON reply
+/// fast path) rather than a `firstBatch` array in the reply document; aggregate
+/// and projected-find replies still carry `firstBatch` inline. Read whichever
+/// the handler produced.
+fn batch_docs(reply: &Document, c: &CommandContext) -> Vec<Document> {
+    match &c.pending_batch {
+        Some(pb) => pb
+            .batch
+            .iter()
+            .map(|b| Document::from_reader(&mut &b[..]).unwrap())
+            .collect(),
+        None => docs_of(reply),
+    }
+}
+
 /// All docs in `coll`, read back through a real `find`.
 fn read_all(c: &mut CommandContext, coll: &str) -> Vec<Document> {
-    docs_of(&dispatch(&doc! {"find": coll}, c))
+    let reply = dispatch(&doc! {"find": coll}, c);
+    batch_docs(&reply, c)
 }
 
 #[test]
