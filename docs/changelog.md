@@ -68,7 +68,8 @@ stress suites found and fixed real races.
   semantics.
 - Rust server: clears all thirteen driver-conformance gauges; MONGODB-X509
   auth; per-collection write locks, lock-free reads, oplog off the write
-  path, and raw-BSON scan / match / projection / reply paths.
+  path, raw-BSON scan / match / projection / reply paths, and `$group`
+  field pushdown so wide documents decode only what the stage reads.
 - New operators: `$median`, `$percentile`, `$toLong`, `$sum` / `$avg` /
   `$max` / `$min` as expressions, full `$jsonSchema` keyword surface,
   `$bucketAuto` preferred-number granularity.
@@ -78,6 +79,28 @@ stress suites found and fixed real races.
   modifiers, `idle_in_transaction_session_timeout`.
 - Tooling: concurrency stress suites (and the races they caught),
   benchmark charts, a three-server admin console, and a green docs build.
+
+### The Rust server decodes only the fields a `$group` actually reads
+
+The `aggregate_group` workload was the worst of the six in the
+post-raw-BSON profile (3.1× of mongod) for a structural reason: `$group`
+received fully-decoded documents while reading only its `_id` and
+accumulator-argument fields, so input materialization survived into the
+heavy stage. `secantus_core::referenced_top_level_fields` now walks a
+`$group` spec and returns the top-level fields it reads, and the command
+layer pushes that field set down into the fetch when the first heavier
+stage of a pipeline is such a `$group`. Wide documents no longer pay to
+materialize fields the pipeline never looks at.
+
+The analysis bails to a full decode wherever the referenced set can't be
+determined statically — `$$ROOT` / `$$CURRENT`, computed-field access,
+and non-simple accumulators like `$top` / `$topN` whose `sortBy` names a
+field by bare key.
+
+#### Changed
+
+- Rust server: a leading `$group` pushes its referenced top-level field
+  set into the fetch, decoding only those fields from wide documents.
 
 ### Admin console docs catch up, and the docs build goes green again
 
