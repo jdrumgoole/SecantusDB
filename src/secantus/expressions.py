@@ -415,7 +415,11 @@ def _op_if_null(arg: Any, ctx: _Ctx) -> Any:
 def _op_size(arg: Any, ctx: _Ctx) -> int:
     value = _eval(arg, ctx)
     if not isinstance(value, list):
-        raise ExpressionError("$size requires an array")
+        raise ExpressionError(
+            f"The argument to $size must be an array, but was of type: {_bson_type_name(value)}",
+            code=17124,
+            code_name="Location17124",
+        )
     return len(value)
 
 
@@ -723,7 +727,12 @@ def _op_merge_objects(arg: Any, ctx: _Ctx) -> Any:
         if v is None:
             continue
         if not isinstance(v, Mapping):
-            raise ExpressionError("$mergeObjects requires document-valued arguments")
+            raise ExpressionError(
+                f"$mergeObjects requires object inputs, but input {v} is of type "
+                f"{_bson_type_name(v)}",
+                code=40400,
+                code_name="Location40400",
+            )
         result.update(v)
     return result
 
@@ -878,8 +887,12 @@ def _op_regex_match(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$regexMatch requires {input, regex, options?}")
     s = _eval(arg.get("input"), ctx)
-    if not isinstance(s, str):
+    if s is None:
         return False
+    if not isinstance(s, str):
+        raise ExpressionError(
+            "$regexMatch needs 'input' to be of type string", code=51104, code_name="Location51104"
+        )
     pattern, flags = _resolve_regex(arg, ctx)
     return bool(_re.compile(pattern, flags).search(s))
 
@@ -890,8 +903,12 @@ def _op_regex_find(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$regexFind requires {input, regex, options?}")
     s = _eval(arg.get("input"), ctx)
-    if not isinstance(s, str):
+    if s is None:
         return None
+    if not isinstance(s, str):
+        raise ExpressionError(
+            "$regexFind needs 'input' to be of type string", code=51104, code_name="Location51104"
+        )
     pattern, flags = _resolve_regex(arg, ctx)
     m = _re.compile(pattern, flags).search(s)
     if m is None:
@@ -1417,8 +1434,14 @@ def _op_regex_find_all(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$regexFindAll requires {input, regex, options?}")
     s = _eval(arg.get("input"), ctx)
-    if not isinstance(s, str):
+    if s is None:
         return []
+    if not isinstance(s, str):
+        raise ExpressionError(
+            "$regexFindAll needs 'input' to be of type string",
+            code=51104,
+            code_name="Location51104",
+        )
     pattern, flags = _resolve_regex(arg, ctx)
     out: list[dict[str, Any]] = []
     for m in _re.compile(pattern, flags).finditer(s):
@@ -1665,8 +1688,19 @@ def _op_index_of_bytes(arg: Any, ctx: _Ctx) -> Any:
     needle = _eval(arg[1], ctx)
     if s is None:
         return None
-    if not isinstance(s, str) or not isinstance(needle, str):
-        raise ExpressionError("$indexOfBytes requires string operands")
+    if not isinstance(s, str):
+        raise ExpressionError(
+            f"$indexOfBytes requires a string as the first argument, found: {_bson_type_name(s)}",
+            code=40091,
+            code_name="Location40091",
+        )
+    if not isinstance(needle, str):
+        raise ExpressionError(
+            "$indexOfBytes requires a string as the second argument, found: "
+            f"{_bson_type_name(needle)}",
+            code=40092,
+            code_name="Location40092",
+        )
     start = _index_of_pos("$indexOfBytes", "starting", _eval(arg[2], ctx)) if len(arg) >= 3 else 0
     haystack = s.encode("utf-8")
     end = (
@@ -1752,7 +1786,11 @@ def _op_index_of_array(arg: Any, ctx: _Ctx) -> Any:
     if arr is None:
         return None
     if not isinstance(arr, list):
-        raise ExpressionError("$indexOfArray first argument must be an array")
+        raise ExpressionError(
+            f"$indexOfArray requires an array as a first argument, found: {_bson_type_name(arr)}",
+            code=40090,
+            code_name="Location40090",
+        )
     needle = _eval(arg[1], ctx)
     start = _eval(arg[2], ctx) if len(arg) >= 3 else 0
     end = _eval(arg[3], ctx) if len(arg) >= 4 else len(arr)
@@ -1821,19 +1859,20 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
     step = _eval(arg[2], ctx) if len(arg) == 3 else 1
     # Per-arg bool rejection with mongod's exact codes/messages (the step
     # message's "type:bool" missing space is verbatim from mongod).
-    if isinstance(start, bool):
+    if isinstance(start, bool) or not isinstance(start, (int, float)):
         raise ExpressionError(
-            "$range requires a numeric starting value, found value of type: bool",
+            "$range requires a numeric starting value, found value of type: "
+            f"{_bson_type_name(start)}",
             code=34443,
         )
-    if isinstance(end, bool):
+    if isinstance(end, bool) or not isinstance(end, (int, float)):
         raise ExpressionError(
-            "$range requires a numeric ending value, found value of type: bool",
+            f"$range requires a numeric ending value, found value of type: {_bson_type_name(end)}",
             code=34445,
         )
-    if isinstance(step, bool):
+    if isinstance(step, bool) or not isinstance(step, (int, float)):
         raise ExpressionError(
-            "$range requires a numeric step value, found value of type:bool",
+            f"$range requires a numeric step value, found value of type:{_bson_type_name(step)}",
             code=34447,
         )
     # A whole-number double is accepted (coerced to int); a fractional one is
@@ -2200,6 +2239,9 @@ def _op_array_elem_at(arg: Any, ctx: _Ctx) -> Any:
             f"integer: {_fmt_double(idx)}",
             code=28691,
         ) from None
+    _reject_non_array(
+        arr, f"$arrayElemAt's first argument must be an array, but is {_bson_type_name(arr)}", 28689
+    )
     if not isinstance(arr, list) or not isinstance(idx, int):
         return None
     if -len(arr) <= idx < len(arr):
@@ -2414,7 +2456,11 @@ def _op_reverse_array(arg: Any, ctx: _Ctx) -> Any:
 def _op_in(arg: Any, ctx: _Ctx) -> bool:
     needle, haystack = _eval(arg[0], ctx), _eval(arg[1], ctx)
     if not isinstance(haystack, list):
-        return False
+        raise ExpressionError(
+            f"$in requires an array as a second argument, found: {_bson_type_name(haystack)}",
+            code=40081,
+            code_name="Location40081",
+        )
     return needle in haystack
 
 
@@ -2779,14 +2825,36 @@ def _set_dedup_sorted(items: list[Any]) -> list[Any]:
     return out
 
 
+_SET_OP_CODES = {
+    "$setUnion": 17043,
+    "$setIntersection": 17047,
+    "$setDifference": 17048,
+    "$setIsSubset": 17046,
+    "$setEquals": 17044,
+}
+
+
 def _set_arrays(op: str, arg: Any, ctx: _Ctx, *, n: int | None = None) -> list[list[Any]]:
-    """Evaluate a set operator's array arguments, validating each is an array."""
+    """Evaluate a set operator's array arguments, validating each is an array
+    (mongod's per-operator Location code, not a generic TypeMismatch)."""
     vals = _eval_args(arg, ctx)
     if n is not None and len(vals) != n:
         raise ExpressionError(f"{op} requires {n} arguments")
-    for v in vals:
+    code = _SET_OP_CODES.get(op, 14)
+    for i, v in enumerate(vals):
         if not isinstance(v, list):
-            raise ExpressionError(f"{op} requires array arguments")
+            if op in ("$setDifference", "$setIsSubset"):
+                which = "First" if i == 0 else "Second"
+                msg = (
+                    f"both operands of {op} must be arrays. {which} argument is of type: "
+                    f"{_bson_type_name(v)}"
+                )
+            else:
+                msg = (
+                    f"All operands of {op} must be arrays. One argument is of type: "
+                    f"{_bson_type_name(v)}"
+                )
+            raise ExpressionError(msg, code=code, code_name=f"Location{code}")
     return vals
 
 
@@ -2834,14 +2902,22 @@ def _op_set_is_subset(arg: Any, ctx: _Ctx) -> bool:
 def _op_all_elements_true(arg: Any, ctx: _Ctx) -> bool:
     arr = _eval_args(arg, ctx)[0]
     if not isinstance(arr, list):
-        raise ExpressionError("$allElementsTrue requires an array")
+        raise ExpressionError(
+            f"$allElementsTrue's argument must be an array, but is {_bson_type_name(arr)}",
+            code=17040,
+            code_name="Location17040",
+        )
     return all(_bool(x) for x in arr)
 
 
 def _op_any_element_true(arg: Any, ctx: _Ctx) -> bool:
     arr = _eval_args(arg, ctx)[0]
     if not isinstance(arr, list):
-        raise ExpressionError("$anyElementTrue requires an array")
+        raise ExpressionError(
+            f"$anyElementTrue's argument must be an array, but is {_bson_type_name(arr)}",
+            code=17041,
+            code_name="Location17041",
+        )
     return any(_bool(x) for x in arr)
 
 
@@ -2865,7 +2941,11 @@ def _op_binary_size(arg: Any, ctx: _Ctx) -> Any:
         return len(v.encode("utf-8"))
     if isinstance(v, (bytes, bson.Binary)):
         return len(v)
-    raise ExpressionError("$binarySize requires a string or binData")
+    raise ExpressionError(
+        f"$binarySize requires a string or BinData argument, found: {_bson_type_name(v)}",
+        code=51276,
+        code_name="Location51276",
+    )
 
 
 def _op_bson_size(arg: Any, ctx: _Ctx) -> Any:
@@ -2874,7 +2954,11 @@ def _op_bson_size(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     if not isinstance(v, Mapping):
-        raise ExpressionError("$bsonSize requires a document")
+        raise ExpressionError(
+            f"$bsonSize requires a document input, found: {_bson_type_name(v)}",
+            code=31393,
+            code_name="Location31393",
+        )
     return len(bson.encode(dict(v)))
 
 

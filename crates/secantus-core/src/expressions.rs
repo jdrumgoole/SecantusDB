@@ -905,8 +905,10 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
         IdxCoerce::Fractional => return Err(Fallback), // Python raises 28691
         IdxCoerce::NotNumber => return Ok(Bson::Null),
     };
-    let Bson::Array(a) = &arr else {
-        return Ok(Bson::Null);
+    let a = match &arr {
+        Bson::Array(a) => a,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array first arg -> Python raises 28689
     };
     let len = a.len() as i128;
     let resolved = if i < 0 { i + len } else { i };
@@ -1033,7 +1035,8 @@ fn op_in(arg: &Bson, ctx: &Ctx) -> R {
     }
     let needle = eval(&pair[0], ctx)?;
     let Bson::Array(hay) = eval(&pair[1], ctx)? else {
-        return Ok(Bson::Boolean(false));
+        // A non-array second argument is mongod Location40081 -> Python raises.
+        return Err(Fallback);
     };
     for elem in &hay {
         if py_eq(&needle, elem)? {
@@ -2993,7 +2996,9 @@ fn regex_input(spec: &Document, ctx: &Ctx) -> Result<Option<String>, Fallback> {
     };
     Ok(match input {
         Bson::String(s) => Some(s),
-        _ => None,
+        Bson::Null => None,
+        // A non-string, non-null input is mongod Location51104 -> Python raises.
+        _ => return Err(Fallback),
     })
 }
 

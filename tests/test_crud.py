@@ -2092,6 +2092,45 @@ def test_conversion_error_codes_via_pymongo(coll) -> None:
         assert exc.value.code == code, expr
 
 
+def test_array_set_typeguard_codes_via_pymongo(coll) -> None:
+    """Array/set operators reject non-array/non-object arguments with mongod's
+    exact codes over the wire (incl. the previously-silent $arrayElemAt/$in).
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for expr, code in [
+        ({"$size": "$n"}, 17124),
+        ({"$arrayElemAt": ["$n", 0]}, 28689),
+        ({"$in": [1, "$n"]}, 40081),
+        ({"$setUnion": ["$n"]}, 17043),
+        ({"$mergeObjects": ["$n"]}, 40400),
+        ({"$anyElementTrue": "$n"}, 17041),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
+
+
+def test_string_typeguard_codes_via_pymongo(coll) -> None:
+    """String/binary operators reject non-string arguments with mongod's exact
+    codes over the wire (incl. the previously-silent $regexMatch/$regexFind/
+    $regexFindAll). mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for expr, code in [
+        ({"$regexMatch": {"input": "$n", "regex": "a"}}, 51104),
+        ({"$regexFind": {"input": "$n", "regex": "a"}}, 51104),
+        ({"$indexOfBytes": ["$n", "a"]}, 40091),
+        ({"$binarySize": "$n"}, 51276),
+        ({"$bsonSize": "$n"}, 31393),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
+
+
 def test_more_expression_error_codes_via_pymongo(coll) -> None:
     """More mongod-specific expression error codes over the wire: $zip (34461/
     34468), $arrayToObject (40386), $objectToArray (40390), $replaceOne per-arg
