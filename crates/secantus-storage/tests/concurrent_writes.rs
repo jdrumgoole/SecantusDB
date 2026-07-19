@@ -250,5 +250,11 @@ fn user_txn_statement_conflict_surfaces_write_conflict() {
 
     let blob = st.find_by_id("app", "c", &Bson::Int32(1)).unwrap().unwrap();
     assert_eq!(decode(&blob).get_i32("n").unwrap(), 1);
+    // Close the WiredTiger connection (final checkpoint + background-thread join)
+    // BEFORE removing its data dir. Without this, WT's log/eviction/close-checkpoint
+    // threads operate on a deleted directory and WT_PANIC ("WiredTigerHS.wt: No such
+    // file"); the assertions above still pass, so it only shows as teardown log
+    // noise. The other tests in this file already do `drop(st)` first.
+    drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
