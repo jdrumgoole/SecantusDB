@@ -3895,3 +3895,28 @@ recorded in that slice's changelog fragment. Still open:
   dir; that needs a build-dir cache, whose design and the source-patching
   hazard it must avoid are in `tasks/wt-build-cache-plan.md`. Windows is still
   unstabilised there (venv pythons are copies, so `REALPATH` is a no-op).
+- [ ] **The WiredTiger build cache restores but the test lanes rebuild anyway
+  (~70s x 12 cells).** `rust` / `rust-storage` get the full benefit from the
+  same cache (build phase 4.0s), while `test (3.10, ...)` takes 73.6s with a
+  confirmed `Cache restored from key: wtbuild-...` in the same run. Probed in
+  CI (throwaway branch, since deleted): the restored tree is complete
+  (`wt-build` and `wt-src` both present), `CMAKE_HOME_DIRECTORY` already points
+  at the right `wt-src` so the #520 stale-dir guard does NOT fire, and the
+  ExternalProject recorded commands are byte-identical run to run
+  (`patch-info=37d65639…`, `update-info=b50e078a…`) — yet `libwiredtiger.a`'s
+  mtime changes across runs, so it is genuinely recompiled.
+
+  Eliminated locally, each tested rather than reasoned about: mtime skew from a
+  fresh checkout (touching `vendor/wiredtiger` → no rebuild); mtime skew on the
+  patch scripts (touching `CMakeLists.txt` + `cmake/*.py` + `cmake/*.cmake` →
+  no rebuild); cache incompleteness (local `build/` is 40 MB → ~11 MB
+  compressed vs CI's 8 MB, so the tree is captured); and the archive/restore
+  round trip (`tar` → delete → extract → sync = 1.4s, no rebuild). The local
+  build reproduces none of it.
+
+  The one structural difference not yet ruled out is the interpreter: the fast
+  lane is 3.12 and the slow lanes 3.10. Worth checking whether something in the
+  3.10 build path (a differently-resolved `Python3_EXECUTABLE`, or SWIG output
+  keyed to the ABI) invalidates a step the fingerprints do not cover. Prize is
+  ~70s on each of 12 cells; the cache is harmless meanwhile (it is a real win
+  on the two rust lanes), so this is an optimisation, not a defect.
