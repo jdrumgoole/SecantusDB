@@ -39,9 +39,18 @@ on:
   # versions on demand without waiting for Monday.
   workflow_dispatch:
 
+# Per-ref lane: a newer push to the same ref cancels that ref's stale run, but
+# distinct refs never cancel each other (one feature branch per session = one CI
+# lane per session).
+#
+# Cancellation is disabled on `main`, where every merge lands on the same ref:
+# with unconditional cancel-in-progress, a run of merges cancels each other's
+# post-merge matrix, so the default branch goes long stretches with no completed
+# result and a breakage can't be attributed to the commit that caused it. On
+# `main` runs now queue and each completes; PR branches keep newest-push-wins.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: these jobs only check out the repo, restore caches, and run
 # the test suite — none of which need write access to repo contents. Declaring
