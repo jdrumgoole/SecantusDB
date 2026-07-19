@@ -451,6 +451,19 @@ def test_string_typeguard_error_codes() -> None:
     assert evaluate({"$binarySize": "abc"}, {}) == 3
 
 
+def test_strcasecmp_coercion() -> None:
+    # mongod $toString-coerces $strcasecmp operands (null -> ""), rejecting only
+    # bool (Location16007) — SecantusDB previously rejected any non-string (14).
+    assert evaluate({"$strcasecmp": [5, "a"]}, {}) == -1  # "5" < "a"
+    assert evaluate({"$strcasecmp": ["a", 5]}, {}) == 1
+    assert evaluate({"$strcasecmp": [5, 10]}, {}) == 1  # "5" > "10"
+    assert evaluate({"$strcasecmp": [None, "a"]}, {}) == -1  # "" < "a"
+    assert evaluate({"$strcasecmp": ["ABC", "abc"]}, {}) == 0  # case-insensitive
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$strcasecmp": [True, "a"]}, {})
+    assert exc.value.code == 16007
+
+
 def test_expression_accumulators() -> None:
     # MongoDB 5.0+ $sum/$avg/$max/$min as *expression* operators (not just group
     # accumulators): an array argument reduces over its elements, a scalar is a

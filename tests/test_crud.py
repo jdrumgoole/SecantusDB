@@ -2131,6 +2131,31 @@ def test_string_typeguard_codes_via_pymongo(coll) -> None:
         assert exc.value.code == code, expr
 
 
+def test_strcasecmp_coercion_via_pymongo(coll) -> None:
+    """$strcasecmp coerces its operands to string (null -> ""), rejecting only
+    bool (16007), over the wire. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "a": {"$strcasecmp": ["$n", "a"]},
+                        "b": {"$strcasecmp": [5, 10]},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"a": -1, "b": 1}]
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"v": {"$strcasecmp": [True, "a"]}}}]))
+    assert exc.value.code == 16007
+
+
 def test_expression_accumulators_via_pymongo(coll) -> None:
     """$sum/$avg/$max/$min work as expression operators (MongoDB 5.0+) over the
     wire, not just as group accumulators. mongod 7.0.12-verified."""

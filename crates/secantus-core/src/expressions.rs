@@ -3698,6 +3698,11 @@ fn op_strcasecmp(arg: &Bson, ctx: &Ctx) -> R {
         match v {
             Bson::Null => Ok(String::new()),
             Bson::String(s) if s.is_ascii() => Ok(s.to_ascii_uppercase()),
+            // mongod $toString-coerces an operand; an integer matches Python's
+            // `str(int)`. Double / date / Decimal128 / bool defer (double string
+            // formatting + bool -> Location16007 are Python's).
+            Bson::Int32(n) => Ok(n.to_string()),
+            Bson::Int64(n) => Ok(n.to_string()),
             _ => Err(Fallback),
         }
     };
