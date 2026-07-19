@@ -2010,6 +2010,50 @@ def test_aggregate_to_int_overflow_via_pymongo(coll) -> None:
     assert out == [{"n": -1}]
 
 
+def test_aggregate_to_long_via_pymongo(coll) -> None:
+    """$toLong truncates toward zero, parses strings, and yields a 64-bit long
+    (values beyond int32 are fine); overflow beyond int64 raises 241. mongod
+    7.0.12-verified."""
+    from bson.int64 import Int64
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "d": 2.7, "s": "42", "big": 9_000_000_000.0})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "a": {"$toLong": "$d"},
+                        "b": {"$toLong": "$s"},
+                        "c": {"$toLong": "$big"},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"a": 2, "b": 42, "c": 9_000_000_000}]
+    assert all(isinstance(out[0][k], Int64) for k in ("a", "b", "c"))
+    # Overflow beyond int64 -> 241, and onError catches it.
+    coll.update_one({"_id": 1}, {"$set": {"huge": "99999999999999999999"}})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"n": {"$toLong": "$huge"}}}]))
+    assert exc.value.code == 241
+    got = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "n": {"$convert": {"input": "$huge", "to": "long", "onError": -1}},
+                    }
+                }
+            ]
+        )
+    )
+    assert got == [{"n": -1}]
+
+
 def test_create_index_listed_via_pymongo(coll) -> None:
     coll.insert_one({"x": 1})
     coll.create_index("x")

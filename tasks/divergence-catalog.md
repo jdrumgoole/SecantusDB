@@ -23,7 +23,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 - ~~**`$toInt`/`$convert` int32/int64 overflow**~~ **FIXED (#489):** `$toInt` /
   `$convert` (int/long) error on out-of-range / non-finite (241, `onError`-caught)
   instead of returning an unbounded / silently-widened int; `$toInt` narrows int64
-  input to int32 like mongod. Both engines. (`$toLong` is still unimplemented — a
+  input to int32 like mongod. Both engines. (`$toLong` shipped in #529 — a
   separate missing-operator item, see Tier 2.)
 - ~~**`$bucket` silent data loss**~~ **FIXED (#487):** out-of-range value with no
   default now errors (7158303) instead of dropping the doc; full spec validation
@@ -62,8 +62,8 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   engines). **Array/string type-guard cluster complete.** (expressions)
 - **Date-arg whole-double / bool**: `$dateAdd`/`$dateSubtract` amount + `$dateTrunc`
   binSize FIXED (#521, → whole-double accepted; fractional/bool → 5166405/5439017;
-  binSize <1 → 5439018). Remaining: `$toLong` unimplemented (mongod truncates 2.7→2;
-  a separate missing-operator item — could alias `$convert to:long`).
+  binSize <1 → 5439018). `$toLong` FIXED (#529, → implemented as the int64
+  counterpart of `$toInt`; truncates 2.7→2, parses strings, overflow → 241).
 - **Query operator validation**: `$in`/`$nin` non-array + `$`-doc element FIXED (#494,
   → 2); `$regex` bad `$options` / `$options`-without-`$regex` / non-string `$regex`
   FIXED (#496, → 51108 / 2); `$elemMatch` non-doc (query) + `$not` invalid arg

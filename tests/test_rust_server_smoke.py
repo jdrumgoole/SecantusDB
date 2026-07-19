@@ -1596,6 +1596,28 @@ def test_to_int_convert_overflow(tmp_path) -> None:
         srv.stop()
 
 
+def test_to_long_conversion(tmp_path) -> None:
+    """The Rust server computes $toLong (truncating toward zero, yielding a 64-bit
+    long that can exceed int32) and rejects an int64 overflow (defer -> BadValue)."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "d": 2.7, "big": 9_000_000_000.0})
+        r = list(
+            coll.aggregate(
+                [{"$project": {"_id": 0, "a": {"$toLong": "$d"}, "b": {"$toLong": "$big"}}}]
+            )
+        )
+        assert r == [{"a": 2, "b": 9_000_000_000}]
+        assert all(isinstance(r[0][k], bson.Int64) for k in ("a", "b"))
+        # Overflow beyond int64 errors.
+        coll.update_one({"_id": 1}, {"$set": {"huge": "99999999999999999999"}})
+        with pytest.raises(pymongo.errors.OperationFailure):
+            list(coll.aggregate([{"$project": {"n": {"$toLong": "$huge"}}}]))
+    finally:
+        srv.stop()
+
+
 def test_group_accumulator_mixed_types(tmp_path) -> None:
     """The Rust server's $group ignores non-numeric in $sum/$avg and orders
     $min/$max by BSON cross-type (bool > string > number), matching mongod —

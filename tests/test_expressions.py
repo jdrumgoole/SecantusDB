@@ -354,6 +354,30 @@ def test_to_int_overflow() -> None:
     assert evaluate({"$toInt": -2147483648.0}, {}) == -2147483648
 
 
+def test_to_long_conversions() -> None:
+    from bson.int64 import Int64
+
+    # Truncates toward zero, parses strings, bool -> 0/1, and always yields Int64.
+    for arg, want in ((3.7, 3), (-3.9, -3), ("42", 42), (True, 1), (5, 5)):
+        result = evaluate({"$toLong": arg}, {})
+        assert result == want and isinstance(result, Int64), arg
+    # A value beyond int32 (but within int64) is fine for $toLong.
+    result = evaluate({"$toLong": 9_000_000_000.0}, {})
+    assert result == 9_000_000_000 and isinstance(result, Int64)
+    # Int64 passes through.
+    assert evaluate({"$toLong": Int64(2**40)}, {}) == 2**40
+    # Missing / null -> null.
+    assert evaluate({"$toLong": "$x"}, {}) is None
+
+
+def test_to_long_overflow() -> None:
+    # Beyond [-2^63, 2^63-1] or non-finite -> overflow (mongod 241).
+    for bad in (1e30, float("inf"), float("nan"), "99999999999999999999"):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({"$toLong": bad}, {})
+        assert exc.value.code == 241
+
+
 def test_convert_int_long_overflow() -> None:
     # $convert to int/long range-checks and raises 241 (caught by onError).
     with pytest.raises(ExpressionError) as exc:
