@@ -378,6 +378,30 @@ def test_to_long_overflow() -> None:
         assert exc.value.code == 241
 
 
+def test_conversion_error_codes() -> None:
+    # mongod-specific error codes (previously a generic TypeMismatch 14):
+    # an unparseable numeric string -> ConversionFailure 241; an unknown
+    # $convert target type -> 2 (uncatchable by onError); $sortArray non-array
+    # -> 2942504; $strLenCP / $strLenBytes non-string -> 34471 / 34473.
+    for op in ("$toInt", "$toLong", "$toDouble", "$toDecimal"):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: "abc"}, {})
+        assert exc.value.code == 241, op
+    for expr, code in [
+        ({"$convert": {"input": 5, "to": "bogus"}}, 2),
+        ({"$convert": {"input": 5, "to": "bogus", "onError": -1}}, 2),  # not caught by onError
+        ({"$sortArray": {"input": 5, "sortBy": 1}}, 2942504),
+        ({"$strLenCP": 5}, 34471),
+        ({"$strLenBytes": 5}, 34473),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    # Valid conversions and a caught bad-number onError still work.
+    assert evaluate({"$toLong": "42"}, {}) == 42
+    assert evaluate({"$convert": {"input": "abc", "to": "int", "onError": -1}}, {}) == -1
+
+
 def test_convert_int_long_overflow() -> None:
     # $convert to int/long range-checks and raises 241 (caught by onError).
     with pytest.raises(ExpressionError) as exc:
