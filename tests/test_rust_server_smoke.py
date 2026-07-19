@@ -1507,6 +1507,34 @@ def test_bucket_auto_elem_match_pull_validation(tmp_path) -> None:
         srv.stop()
 
 
+def test_push_sort_and_current_date_validation(tmp_path) -> None:
+    """The Rust server rejects an invalid $push $sort direction (defer -> BadValue)
+    without corrupting the array, accepts a valid ±1 sort, and — matching the
+    Python fix — accepts a boolean-false $currentDate as the set-Date form."""
+    import datetime
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "a": [{"s": 3}, {"s": 1}]})
+        # A valid ±1 sort works.
+        coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [{"s": 2}], "$sort": 1}}})
+        assert [e["s"] for e in coll.find_one({"_id": 1})["a"]] == [1, 2, 3]
+        # An invalid sort direction errors and leaves the array untouched.
+        for spec in (2, {"s": 2}, "x"):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [{"s": 9}], "$sort": spec}}})
+        assert [e["s"] for e in coll.find_one({"_id": 1})["a"]] == [1, 2, 3]
+
+        # $currentDate: a boolean (true OR false) sets the current Date.
+        coll.update_one({"_id": 1}, {"$currentDate": {"d": True}})
+        assert isinstance(coll.find_one({"_id": 1})["d"], datetime.datetime)
+        coll.update_one({"_id": 1}, {"$currentDate": {"d": False}})
+        assert isinstance(coll.find_one({"_id": 1})["d"], datetime.datetime)
+    finally:
+        srv.stop()
+
+
 def test_to_int_convert_overflow(tmp_path) -> None:
     """The Rust server rejects an int32/int64 overflow in $toInt / $convert
     (defer -> BadValue) and downcasts an in-range long to int32; $convert

@@ -186,6 +186,13 @@ CURATED = [
     # $push $sort — 1/-1 whole-element and {field: dir} sorts (BSON order).
     ({"a": [1, 2]}, {"$push": {"a": {"$each": [4, 3], "$sort": 1}}}, False),
     ({"a": [3, 1, 2]}, {"$push": {"a": {"$each": [], "$sort": -1}}}, False),
+    # Whole-double ±1 direction (int or {field: dir}) is accepted (both engines).
+    ({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": 1.0}}}, False),
+    (
+        {"a": [{"s": 3}, {"s": 1}]},
+        {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1.0}}}},
+        False,
+    ),
     (
         {"a": [{"s": 3}, {"s": 1}]},
         {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1}}}},
@@ -418,6 +425,24 @@ def test_pull_non_array_defers_and_raises(doc, update):
     # by the curated/fuzz parity), not here.
     doc = bson.decode(bson.encode(doc))
     update = bson.decode(bson.encode(update))
+    assert _rust_apply(doc, update) is None
+    with pytest.raises(_pure.UpdateError) as exc:
+        _pure.apply_update(doc, update)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [2, -2, 1.5, "x", True, [1], {"s": 2}, {"s": True}, {"s": "x"}],
+)
+def test_push_sort_invalid_defers_and_raises(spec):
+    # An invalid $push $sort spec: Rust defers (None), the pure engine raises
+    # code 2. Valid ±1 (int or whole double) sorts are covered by the curated
+    # parity corpus.
+    doc = bson.decode(bson.encode({"a": [{"s": 3}, {"s": 1}]}))
+    update = bson.decode(
+        bson.encode({"u": {"$push": {"a": {"$each": [{"s": 2}], "$sort": spec}}}})
+    )["u"]
     assert _rust_apply(doc, update) is None
     with pytest.raises(_pure.UpdateError) as exc:
         _pure.apply_update(doc, update)

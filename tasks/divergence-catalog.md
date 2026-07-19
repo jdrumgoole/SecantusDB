@@ -76,13 +76,14 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   code → 2 (code-0 hint), bool → 14; the Rust engine now computes valid whole-double
   codes instead of deferring. Valid alias set = 22, code set = {-1,1..19,127}. Both
   engines. (query.py / .rs)
-- **Update `$push $sort`** bad spec (int/`{x:2}`) sorts anyway (mongod 2); scalar+doc-spec
-  and mixed scalar/doc sort order wrong. `$pull`/`$pullAll` on a present non-array field
-  FIXED (#526, → 2; missing field stays a no-op). `arrayFilters` unused (mongod 9) /
-  bad identifier (2) / empty (9) accepted. `$currentDate: {d:false}` rejected (mongod OK).
-  (update.py)
-- **Stages**: `$bucket` unsorted/mixed/dup boundaries, default-in-range, missing groupBy
-  (40194/40193/40199/40198) accepted; `$bucketAuto` buckets bool/non-numeric/fractional/
+- **Update `$push $sort`** bad spec (scalar not ±1 / `{field: bad}` / non-numeric) FIXED
+  (#527, → 2; whole-double ±1 now accepted). `$pull`/`$pullAll` on a present non-array
+  field FIXED (#526, → 2; missing field stays a no-op). `$currentDate: {d:false}` FIXED
+  (#527, → accepts bool false as set-Date; bad scalar / bad `$type` → 2). Remaining:
+  `arrayFilters` unused (mongod 9) / bad identifier (2) / empty (9) accepted — needs its
+  own slice (identifier extraction incl. `$and`/`$or` nesting + unused-detection over the
+  update paths). (update.py)
+- **Stages**: `$bucketAuto` buckets bool/non-numeric/fractional/
   non-positive/missing FIXED (#526, → 40241/40242/40243/40246; whole-double accepted) —
   `granularity` validation/rounding still unimplemented (`'BOGUS'` accepted; needs a
   dedicated slice, see backlog); `$densify`
