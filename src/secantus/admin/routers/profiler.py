@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pymongo.errors import PyMongoError
 
+from secantus.admin import capabilities
 from secantus.admin.client import MongoError, friendly_error
 
 router = APIRouter()
@@ -109,6 +110,8 @@ def update_profiler(
     try:
         request.app.state.mongo.set_profile(db, level=level, slowms=slowms, sample_rate=sample_rate)
     except MongoError as exc:
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "profiling")
         return _render(request, db=db, error=str(exc), status_code=400)
     return _render(
         request,

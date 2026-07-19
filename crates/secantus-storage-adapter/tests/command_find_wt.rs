@@ -3,6 +3,7 @@
 //! order, exactly as the handler-plumbing tests expect.
 
 mod common;
+use common::dispatch_full;
 
 use bson::doc;
 use common::with_wt;
@@ -28,7 +29,7 @@ fn seed(c: &mut secantus_commands::CommandContext, docs: Vec<bson::Document>) {
 fn find_all_single_batch() {
     with_wt(|c| {
         seed(c, (0..3).map(|i| doc! {"_id": i}).collect());
-        let reply = dispatch(&doc! {"find": "c"}, c);
+        let reply = dispatch_full(&doc! {"find": "c"}, c);
         let cur = reply.get_document("cursor").unwrap();
         assert_eq!(cur.get_i64("id").unwrap(), 0, "all fit ⇒ no cursor");
         assert_eq!(cur.get_str("ns").unwrap(), "t.c");
@@ -40,12 +41,12 @@ fn find_all_single_batch() {
 fn find_non_numeric_batch_size_is_type_mismatch() {
     with_wt(|c| {
         seed(c, vec![doc! {"_id": 1}]);
-        let reply = dispatch(&doc! {"find": "c", "batchSize": "foo"}, c);
+        let reply = dispatch_full(&doc! {"find": "c", "batchSize": "foo"}, c);
         assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
         assert_eq!(reply.get_i32("code").unwrap(), 14);
         assert_eq!(reply.get_str("codeName").unwrap(), "TypeMismatch");
         // A numeric batchSize still works.
-        let reply = dispatch(&doc! {"find": "c", "batchSize": 5i32}, c);
+        let reply = dispatch_full(&doc! {"find": "c", "batchSize": 5i32}, c);
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     });
 }
@@ -54,7 +55,7 @@ fn find_non_numeric_batch_size_is_type_mismatch() {
 fn find_skip_and_limit() {
     with_wt(|c| {
         seed(c, (0..5).map(|i| doc! {"_id": i}).collect());
-        let reply = dispatch(&doc! {"find": "c", "skip": 1, "limit": 2}, c);
+        let reply = dispatch_full(&doc! {"find": "c", "skip": 1, "limit": 2}, c);
         let cur = reply.get_document("cursor").unwrap();
         assert_eq!(batch_ids(cur, "firstBatch"), vec![1, 2]);
     });
@@ -64,7 +65,7 @@ fn find_skip_and_limit() {
 fn find_sort_descending() {
     with_wt(|c| {
         seed(c, (0..3).map(|i| doc! {"_id": i}).collect());
-        let reply = dispatch(&doc! {"find": "c", "sort": {"_id": -1}}, c);
+        let reply = dispatch_full(&doc! {"find": "c", "sort": {"_id": -1}}, c);
         let cur = reply.get_document("cursor").unwrap();
         assert_eq!(batch_ids(cur, "firstBatch"), vec![2, 1, 0]);
     });
@@ -80,7 +81,7 @@ fn find_return_key_and_show_record_id() {
                 .collect(),
         );
         // returnKey (+ showRecordId, which it suppresses): only the sort key field.
-        let reply = dispatch(
+        let reply = dispatch_full(
             &doc! {"find": "c", "sort": {"_id": 1}, "returnKey": true, "showRecordId": true},
             c,
         );
@@ -99,7 +100,7 @@ fn find_return_key_and_show_record_id() {
         }
         assert_eq!(batch.len(), 3);
         // showRecordId alone: full doc plus a $recordId.
-        let reply = dispatch(
+        let reply = dispatch_full(
             &doc! {"find": "c", "sort": {"_id": 1}, "showRecordId": true},
             c,
         );
@@ -120,18 +121,18 @@ fn find_return_key_and_show_record_id() {
 fn find_batched_opens_cursor_and_getmore_drains() {
     with_wt(|c| {
         seed(c, (0..5).map(|i| doc! {"_id": i}).collect());
-        let reply = dispatch(&doc! {"find": "c", "batchSize": 2}, c);
+        let reply = dispatch_full(&doc! {"find": "c", "batchSize": 2}, c);
         let cur = reply.get_document("cursor").unwrap();
         assert_eq!(batch_ids(cur, "firstBatch"), vec![0, 1]);
         let cid = cur.get_i64("id").unwrap();
         assert_ne!(cid, 0, "remaining docs ⇒ live cursor");
 
-        let reply = dispatch(&doc! {"getMore": cid, "collection": "c", "batchSize": 2}, c);
+        let reply = dispatch_full(&doc! {"getMore": cid, "collection": "c", "batchSize": 2}, c);
         let cur = reply.get_document("cursor").unwrap();
         assert_eq!(batch_ids(cur, "nextBatch"), vec![2, 3]);
         assert_eq!(cur.get_i64("id").unwrap(), cid);
 
-        let reply = dispatch(&doc! {"getMore": cid, "collection": "c", "batchSize": 2}, c);
+        let reply = dispatch_full(&doc! {"getMore": cid, "collection": "c", "batchSize": 2}, c);
         let cur = reply.get_document("cursor").unwrap();
         assert_eq!(batch_ids(cur, "nextBatch"), vec![4]);
         assert_eq!(cur.get_i64("id").unwrap(), 0, "exhausted");
@@ -142,7 +143,7 @@ fn find_batched_opens_cursor_and_getmore_drains() {
 fn find_batch_size_zero_empty_first_batch() {
     with_wt(|c| {
         seed(c, (0..2).map(|i| doc! {"_id": i}).collect());
-        let reply = dispatch(&doc! {"find": "c", "batchSize": 0}, c);
+        let reply = dispatch_full(&doc! {"find": "c", "batchSize": 0}, c);
         let cur = reply.get_document("cursor").unwrap();
         assert!(cur.get_array("firstBatch").unwrap().is_empty());
         assert_ne!(cur.get_i64("id").unwrap(), 0);
@@ -153,7 +154,7 @@ fn find_batch_size_zero_empty_first_batch() {
 fn find_single_batch_never_opens_cursor() {
     with_wt(|c| {
         seed(c, (0..5).map(|i| doc! {"_id": i}).collect());
-        let reply = dispatch(&doc! {"find": "c", "batchSize": 2, "singleBatch": true}, c);
+        let reply = dispatch_full(&doc! {"find": "c", "batchSize": 2, "singleBatch": true}, c);
         let cur = reply.get_document("cursor").unwrap();
         // singleBatch overrides batchSize splitting: all docs, id 0.
         assert_eq!(batch_ids(cur, "firstBatch").len(), 5);
@@ -165,7 +166,7 @@ fn find_single_batch_never_opens_cursor() {
 fn find_projection_includes_fields() {
     with_wt(|c| {
         seed(c, vec![doc! {"_id": 1, "a": 10, "b": 20}]);
-        let reply = dispatch(&doc! {"find": "c", "projection": {"a": 1}}, c);
+        let reply = dispatch_full(&doc! {"find": "c", "projection": {"a": 1}}, c);
         let cur = reply.get_document("cursor").unwrap();
         let first = cur.get_array("firstBatch").unwrap()[0]
             .as_document()
@@ -182,7 +183,7 @@ fn find_mixed_projection_is_rejected() {
     // mongod's per-field 31254 / 31253 — mongo-node-driver projection-error tests.
     with_wt(|c| {
         seed(c, vec![doc! {"_id": 1, "a": 1, "b": 2}]);
-        let r = dispatch(&doc! {"find": "c", "projection": {"a": 1, "b": 0}}, c);
+        let r = dispatch_full(&doc! {"find": "c", "projection": {"a": 1, "b": 0}}, c);
         assert_eq!(r.get_f64("ok").unwrap(), 0.0);
         assert_eq!(r.get_i32("code").unwrap(), 31254);
         assert!(r
@@ -190,10 +191,10 @@ fn find_mixed_projection_is_rejected() {
             .unwrap()
             .contains("Cannot do exclusion on field b in inclusion projection"));
         // Exclusion mode + an inclusion field → 31253.
-        let r = dispatch(&doc! {"find": "c", "projection": {"a": 0, "b": 1}}, c);
+        let r = dispatch_full(&doc! {"find": "c", "projection": {"a": 0, "b": 1}}, c);
         assert_eq!(r.get_i32("code").unwrap(), 31253);
         // `_id` is exempt: {_id: 0, a: 1} is a valid inclusion projection.
-        let r = dispatch(&doc! {"find": "c", "projection": {"_id": 0, "a": 1}}, c);
+        let r = dispatch_full(&doc! {"find": "c", "projection": {"_id": 0, "a": 1}}, c);
         assert_eq!(r.get_f64("ok").unwrap(), 1.0);
     });
 }
@@ -215,7 +216,7 @@ fn find_all_with_regex_elements() {
                 options: String::new(),
             })
         };
-        let r = dispatch(
+        let r = dispatch_full(
             &doc! {"find": "c", "filter": {"keywords": {"$all": [
                 re("ser"), re("test"), re("seg"), re("fault"), re("nat")
             ]}}},
@@ -231,7 +232,7 @@ fn find_all_with_regex_elements() {
             1
         );
         // A regex that matches nothing → no result.
-        let r = dispatch(
+        let r = dispatch_full(
             &doc! {"find": "c", "filter": {"keywords": {"$all": [re("zzz")]}}},
             c,
         );
@@ -268,19 +269,19 @@ fn find_geo_center_near_nearsphere() {
             batch_ids(r.get_document("cursor").unwrap(), "firstBatch")
         };
         // $geoWithin $center [[2,2], 4] -> points 1 and 3 (within dist 4 of (2,2)).
-        let r = dispatch(
+        let r = dispatch_full(
             &doc! {"find": "c", "filter": {"geo": {"$geoWithin": {"$center": [[2.0, 2.0], 4.0]}}}, "sort": {"_id": 1}},
             c,
         );
         assert_eq!(ids(&r), vec![1, 3], "$center {r:?}");
         // legacy 2d $near with sibling $maxDistance -> only point 1.
-        let r = dispatch(
+        let r = dispatch_full(
             &doc! {"find": "c", "filter": {"geo": {"$near": [1.01, 1.01], "$maxDistance": 0.1, "$minDistance": 0.0}}, "sort": {"_id": 1}},
             c,
         );
         assert_eq!(ids(&r), vec![1], "$near {r:?}");
         // $nearSphere (radians bound 0.1) -> points 1 and 3.
-        let r = dispatch(
+        let r = dispatch_full(
             &doc! {"find": "c", "filter": {"geo": {"$nearSphere": [1.01, 1.01], "$maxDistance": 0.1, "$minDistance": 0.0}}, "sort": {"_id": 1}},
             c,
         );
@@ -299,7 +300,7 @@ fn find_filter_matches_subset() {
                 doc! {"_id": 3, "x": 1},
             ],
         );
-        let reply = dispatch(&doc! {"find": "c", "filter": {"x": 1}}, c);
+        let reply = dispatch_full(&doc! {"find": "c", "filter": {"x": 1}}, c);
         let cur = reply.get_document("cursor").unwrap();
         assert_eq!(batch_ids(cur, "firstBatch"), vec![1, 3]);
     });

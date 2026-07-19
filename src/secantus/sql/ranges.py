@@ -183,11 +183,12 @@ def _fmt(value: Any, tag: str | None = None) -> str:
 def _quote_bound(text: str) -> str:
     """Double-quote a rendered bound the way Postgres does when it contains
     characters that would confuse the range literal grammar."""
-    if text and not any(ch in text for ch in ' ,"\\[]()'):
+    if text and not any(ch in text for ch in ' ,"\\[](){}'):
         return text
     if text == "":
         return '""'
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    # Postgres doubles embedded quotes and backslashes inside a quoted bound.
+    return '"' + text.replace("\\", "\\\\").replace('"', '""') + '"'
 
 
 def render(rng: Any, tag: str | None = None) -> str:
@@ -398,18 +399,31 @@ def parse_multirange(
     range_tag = MULTIRANGE_TYPES[tag] if custom_elem is None else tag
     if not body:
         return {"multirange": []}
-    # Split on commas that sit between a closing bound and the next opening bound.
+    # Split on commas that sit between a closing bound and the next opening
+    # bound — skipping quoted sections so a `","` bound never splits a member.
     parts: list[str] = []
     depth = 0
     start = 0
-    for i, ch in enumerate(body):
-        if ch in "[(":
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == '"':
+            i += 1
+            while i < len(body):
+                if body[i] == "\\":
+                    i += 2
+                    continue
+                if body[i] == '"':
+                    break
+                i += 1
+        elif ch in "[(":
             depth += 1
         elif ch in ")]":
             depth -= 1
         elif ch == "," and depth == 0:
             parts.append(body[start:i])
             start = i + 1
+        i += 1
     parts.append(body[start:])
     rngs = [
         parse_literal(p.strip(), range_tag, coerce, custom_elem=custom_elem)
@@ -419,24 +433,78 @@ def parse_multirange(
     return make_multirange(rngs)
 
 
+# Postgres' range/array literal parser treats only ASCII whitespace as
+# trimmable around bounds — Python's ``str.strip()`` also eats NBSP / NEL /
+# the \x1c-\x1f separators, which are legitimate bound characters.
+_ASCII_WS = " \t\n\r\v\f"
+
+
+def _parse_bound_token(body: str, i: int) -> tuple[str | None, int]:
+    """Parse one bound token starting at ``i``: a double-quoted token (with
+    ``""`` and ``\\X`` escapes) or a bare token up to the next comma (with
+    ``\\X`` escapes, ASCII-trimmed). Returns ``(value, next_index)`` where a
+    missing bare token is None (an infinite bound) but ``""`` is the empty
+    string."""
+    n = len(body)
+    while i < n and body[i] in _ASCII_WS:
+        i += 1
+    out: list[str] = []
+    if i < n and body[i] == '"':
+        i += 1
+        while i < n:
+            c = body[i]
+            if c == "\\" and i + 1 < n:
+                out.append(body[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                if i + 1 < n and body[i + 1] == '"':
+                    out.append('"')
+                    i += 2
+                    continue
+                i += 1
+                break
+            out.append(c)
+            i += 1
+        while i < n and body[i] in _ASCII_WS:
+            i += 1
+        return "".join(out), i
+    while i < n and body[i] != ",":
+        c = body[i]
+        if c == "\\" and i + 1 < n:
+            out.append(body[i + 1])
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    while out and out[-1] in _ASCII_WS:
+        out.pop()
+    return ("".join(out) or None), i
+
+
 def parse_literal(
     text: str, tag: str, coerce: Any, *, custom_elem: str | None = None
 ) -> dict[str, Any]:
     """Parse a range text literal (``[1,10)`` / ``(1,10]`` / ``empty``) into a
-    normalised subdocument. ``coerce`` converts a bound token to the element type."""
-    s = text.strip()
+    normalised subdocument. ``coerce`` converts a bound token to the element
+    type. Bounds follow Postgres' quoting rules: double-quoted tokens keep
+    special characters (comma, brackets, whitespace) with ``""``/``\\X``
+    escapes; a missing token is an infinite bound."""
+    s = text.strip(_ASCII_WS)
     if s.lower() == "empty":
         return {"empty": True}
     if len(s) < 2 or s[0] not in "[(" or s[-1] not in ")]":
         raise RangeError(f"malformed range literal: {text!r}")
     bounds = s[0] + s[-1]
     body = s[1:-1]
-    # Split on the first top-level comma (bounds are scalar tokens here).
-    if "," not in body:
+    lo_s, i = _parse_bound_token(body, 0)
+    if i >= len(body) or body[i] != ",":
         raise RangeError(f"malformed range literal: {text!r}")
-    lo_s, hi_s = body.split(",", 1)
-    lo = coerce(lo_s.strip().strip('"')) if lo_s.strip() else None
-    hi = coerce(hi_s.strip().strip('"')) if hi_s.strip() else None
+    hi_s, i = _parse_bound_token(body, i + 1)
+    if i < len(body):
+        raise RangeError(f"malformed range literal: {text!r}")
+    lo = coerce(lo_s) if lo_s is not None else None
+    hi = coerce(hi_s) if hi_s is not None else None
     return make_range(lo, hi, bounds, tag, custom_elem=custom_elem)
 
 

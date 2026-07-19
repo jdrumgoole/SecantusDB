@@ -16,6 +16,7 @@ These commands accept the request and return a wire-valid response, but the resp
 
 These work end-to-end but cut corners.
 
+- [ ] **`$bucketAuto` `granularity` rounding — SHIPPED, hex-exact on both servers (2026-07-19).** The prior "1-ULP blocker" was a wrong-constants artifact: mongod stores each preferred-number series as **integer-valued doubles** (R5 = `{10,16,25,40,63}`, not normalised `0.63`-style literals) and computes `series_element * multiplier` (multiplier a power of 10), which reproduces its non-standard ULPs (`63 * 0.1 = 6.300000000000001`) bit-for-bit in Python and Rust f64. Ported `roundUp` / `roundDown` (double path) verbatim from `granularity_rounder_preferred_numbers.cpp` + the `populateNextBucket` boundary walk (first min = `roundDown(dataMin)`, every other boundary = `roundUp(chunkMax)` with the absorb-below-boundary loop; `std::round(nDocs/nBuckets)` bucket size), plus the POWERSOF2 rounder. Both engines: `secantus.aggregate._bucket_auto_granular` (`_BUCKET_AUTO_SERIES` + `_round_up/down_series` + `_round_up/down_pow2`) and `secantus-core` `group::bucket_auto_granular`. **Verified hex-exact vs a live mongod 7.0.12 oracle** (1200+ cases across all 13 granularities × scales × bucket counts, incl. edges: zeros, exact-boundary values, +inf, single bucket); Rust pinned to Python by a 400-case parity fuzz. Value validation reproduces mongod's codes on the Python server — non-numeric 40258, NaN 40259, negative 40260 (name errors 40261/40257 already shipped) — and defers on the Rust server (BadValue, the standing error-code gap). **Remaining sub-limitation:** a **Decimal128**-valued groupBy defers/rejects (code 2) rather than running mongod's separate Decimal128 rounder — the standing Decimal128 precision deferral; the double/int path (the common case) is complete.
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
 - [ ] **`top` counters are always zero** — the command returns the mongod shape (one `totals` entry per namespace, `total`/`readLock`/`writeLock`/per-op sections) and mongotop renders it like an idle server, but SecantusDB doesn't instrument per-namespace operation timing, so every `{time, count}` is `0`. Real counters would need per-ns accounting in `Metrics` threaded through dispatch.
 - ~~**`renameCollection` cross-process safety**~~ structurally guaranteed by WiredTiger (b34). Within-process atomicity is the storage `RLock`. Cross-process exclusion is `WiredTiger.lock` — a second `wiredtiger_open` on the same path fails with ``WT_ERROR Resource busy`` before any state is touched, so concurrent writers across processes / worktrees can't exist in the first place. See `tests/test_storage_exclusion.py`.
@@ -238,9 +239,40 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **ws-changes xdist worker crash (Linux CI, recurring).**
+  `tests/test_admin_skeleton.py::test_ws_changes_streams_collection_event`
+  intermittently hard-crashes its Linux xdist worker ("Not properly
+  terminated", ~11-12 min into the lane) and the REMAINING workers' progress
+  freezes at the same moment until the 25-min conftest watchdog kills them,
+  blaming bystander tests. Hit twice on 2026-07-17 (PR #451 durable lane, PR
+  #456 test lane — unrelated branches); reruns pass. Same suspect as the
+  macOS 6-hour-hang entry below: the admin UI websocket change-stream tail
+  (a previous occurrence pinned a core for 15+ minutes). Needs a root-cause
+  slice: reproduce under CPU starvation (the local box under parallel-session
+  load may do it), get the faulthandler dump from a first-attempt log, and
+  find both the crash cause AND why sibling workers stall (shared resource?
+  admin server port? WT cache pressure?). Do not deselect the test — this is
+  a real defect signal in the ws tail. Pattern catalogued in /ci-check.
+  **Hit a THIRD time 2026-07-17 (PR #468 durable lane).** Mechanism candidate
+  (from reading `src/secantus/admin/routers/changestream.py`): the tail loop is
+  `while True: await asyncio.to_thread(stream.try_next)`. On websocket
+  disconnect the awaiting coroutine is cancelled, but a thread-pool thread
+  already blocked *inside* `stream.try_next()` (a blocking getMore on the
+  tailable cursor) cannot be interrupted — it returns only when the getMore
+  does (the server's 1s default awaitData wait, or longer under CI load). If
+  the sibling SecantusDB server thread's parked `wait_for_oplog` isn't woken,
+  that getMore — and its pool thread — can hang until the executor is torn down
+  at worker shutdown, crossing the 25-min watchdog. Candidate fix (needs a
+  repro to validate, do NOT blind-apply): bound the getMore wait
+  (`max_await_time_ms` on `watch()`) so `try_next` always returns promptly, and
+  ensure the `finally` `stream.close()` interrupts a parked cursor. A
+  first-attempt faulthandler dump would confirm whether the wedged thread is
+  this `try_next` pool thread.
+
+
 Subtler than the above; these may bite specific test suites.
 
-- [ ] **macOS CI test job hangs to the 6-hour kill (root cause unconfirmed).** The `test (macos-latest, 3.10)` job hit GitHub's 6-hour job timeout repeatedly (≥3× across unrelated PRs, including a *tooling-only* one), while passing in ~4 min on Linux/Windows and locally on macOS. Mitigated, not fixed: `9e16e49` dropped macOS from the continuous (push/PR) matrix, so it now runs **only at release time** (`publish.yml` / scheduled sweep) — where the hang can still bite. The per-test `timeout` (pytest-timeout, 600s) does **not** cover the wedge because it only guards a test's own body, not collection / session-scoped fixtures / xdist worker *shutdown*. **Prime suspect:** a daemon/thread not reaped on macOS keeping the worker process alive after its tests "finish" — most likely the Rust server's `stop()` / accept-thread join or a parked change-stream tailable `getMore` (the same shape as the *Python* `SecantusDBServer.stop()` use-after-free fixed in 0.5.3b5, below; `test_rust_server_stress.py` / `test_rust_pitr_cross_server.py` exercise the Rust lifecycle). **Diagnostics added** (`ci-macos-hang-guard`): a `timeout-minutes: 30` cap on the test job + a `faulthandler` session watchdog in `tests/conftest.py` that dumps every thread's stack and exits at 25 min — so the next occurrence names the wedged thread/test instead of dying silent. Close once a stack identifies the culprit and the lifecycle leak is fixed.
+- [x] **macOS CI test job hangs to the 6-hour kill — RESOLVED + CONFIRMED 2026-07-19: an fd/memory leak from unclosed `Storage` test fixtures (fixed #563); macOS re-enabled on continuous CI and confirmed green (#567). Investigation detail below.** The `test (macos-latest, 3.10)` job hit GitHub's 6-hour job timeout repeatedly (≥3× across unrelated PRs, including a *tooling-only* one), while passing in ~4 min on Linux/Windows and locally on macOS. Mitigated, not fixed: `9e16e49` dropped macOS from the continuous (push/PR) matrix, so it now runs **only at release time** (`publish.yml` / scheduled sweep) — where the hang can still bite. The per-test `timeout` (pytest-timeout, 600s) does **not** cover the wedge because it only guards a test's own body, not collection / session-scoped fixtures / xdist worker *shutdown*. **Prime suspect:** a daemon/thread not reaped on macOS keeping the worker process alive after its tests "finish" — most likely the Rust server's `stop()` / accept-thread join or a parked change-stream tailable `getMore` (the same shape as the *Python* `SecantusDBServer.stop()` use-after-free fixed in 0.5.3b5, below; `test_rust_server_stress.py` / `test_rust_pitr_cross_server.py` exercise the Rust lifecycle). **Diagnostics added** (`ci-macos-hang-guard`): a `timeout-minutes: 30` cap on the test job + a `faulthandler` session watchdog in `tests/conftest.py` that dumps every thread's stack and exits at 25 min — so the next occurrence names the wedged thread/test instead of dying silent. Close once a stack identifies the culprit and the lifecycle leak is fixed. **Reframed 2026-07-19 (investigation):** it is NOT a thread leak — it is an early *worker-process crash*. The 2026-07-18 full-matrix dispatch run reproduced it: `test (3.12, macos-14, core)` ran 90 min (its dispatch-event `timeout-minutes` cap is 90, not 30) while every other macOS job finished in 4–6 min, and its worker `gw0` went **"node down: Not properly terminated" at ~3.5 min** — a subprocess crash (WT_PANIC / segfault / abort), not a lingering thread at shutdown. The prime suspect (Rust `stop()`) is **ruled out**: it has been bounded (10s drain, `RunningServer::Drop`→`stop()`) since beta.48 (2026-06-21), which *predates* the macOS-drop (9e16e49, 2026-06-29) by 8 days; all Python server threads are daemon. Local audits (single-process AND 3-worker xdist, thread + native `faulthandler` dumps) of every suspect file leave zero leaked threads / no crash — the crash is macOS-timing-specific and does not reproduce on a newer local macOS. The 25-min watchdog did not fire in that run because after the crash the surviving workers kept reporting, so the idle-based check never tripped and the shard crawled to the cap. **Fixed the diagnostic gap so the next occurrence self-diagnoses:** `pytest_testnodedown` now dumps the crash reason (`error`, carrying the dead worker's last frames) the moment a worker goes down, and the controller watchdog gained a *post-crash overrun* trigger (`_stall_trigger`) that fails fast with a stack dump if the run is still going `_POST_CRASH_DEADLINE_SECONDS` (20 min, `SECANTUS_POST_CRASH_SECONDS`-overridable) after the first crash — the idle check alone can't see a crawl. **ROOT CAUSE FOUND + FIXED 2026-07-19:** it is a **file-descriptor / memory leak from test fixtures that create a `Storage` but never `close()` it.** A returned-but-never-closed `Storage` abandons its WiredTiger connection — measured at **~2.5 MB and ~17 fds each** (150 leaks → 419 MB, 2571 fds, both linear/unbounded). Three offenders: `tests/test_indexes.py`'s `storage` fixture (`return Storage(...)`, backing **161 tests**), `tests/test_storage.py`'s `storage` fixture, and `tests/test_aggregate.py`'s `_setup_lookup_storage` helper (6 tests). A worker running many of these exhausts its fd limit (`ulimit -n`, ~1024 on CI) or RSS late in the run → the process dies hard with no clean error → xdist reports "node down: Not properly terminated" (the crashed worker's stderr, incl. any WT_PANIC, is lost). Intermittent because it depends on how many leaky tests a worker draws under the random split; late (~92%) because the leak accumulates. Fixed all three to `try: yield s finally: s.close()` / `request.addfinalizer(s.close)` — verified fds stay flat (12→12 over 221 tests, was ~17/test) and a broad sweep (471 tests) shows zero remaining fd growth. **Confirmed closed (#567):** macOS was re-enabled on the push/PR matrix for the `test` and `test-durable` lanes via a matrix `include` of `macos-14` + the dev interpreter (3.12) for each shard group (the include merges with the existing cron cross-product, so no extra weekly-cron cells). On that PR's own CI run **all 8 macOS shards** (`test` ×4 + `test-durable` ×4 — the exact lanes that used to hang) passed green, proving the fix holds on macOS. Any future regression is bounded to a fast, self-diagnosing failure by the #555 crash-capture + 30-min job cap. (`storage-engine` stays cron-only — heaviest source build, and it covers the Rust engine, not the fd-leak surface.)
 - ~~**Intermittent pytest-xdist worker crash at ~97% of full suite (post-b18).**~~ Fixed (0.5.3b5). Root cause: `SecantusDBServer.stop()` joined only the accept thread, then closed WiredTiger while per-connection daemon threads could still be mid-WT-operation (e.g. a change-stream tailable `getMore` reading the oplog) — a use-after-free that surfaced as the native worker crash ("node down: Not properly terminated"). `stop()` now closes connection sockets, wakes parked tailable getMores (`Storage.signal_shutdown`), and waits for the active-connection count to drain to zero before `storage.close()`. Reproduced deterministically (a connection thread in a tight WT-read loop vs `storage.close()` raised `Cursor_reset ... is None`, the Python-surfaced form of the same use-after-close); a 200-iteration stress now runs clean. Regression guard: `tests/test_server_shutdown.py`.
 - ~~**Rust server `WT_PANIC` under concurrent start/stop (cross-server PITR flake).**~~ Fixed (Rust 0.5.3-beta.48). Root cause was the Rust analogue of the Python shutdown bug above: `RunningServer::stop()` signalled the flag and joined only the accept loop — the detached per-connection threads (each holding an `Arc<Storage>`) weren't waited for, so the WiredTiger connection didn't close until one of them later exited, and that connection's final close-checkpoint then raced the caller removing / reopening the data dir (`WiredTigerHS.wt: stat: No such file` → "the checkpoint failed, the system must restart: WT_PANIC"). `stop()` now drains a live-connection counter (`Shared.active`, an independent `Arc<AtomicUsize>` so a thread releases its storage ref *before* decrementing) to zero — bounded by a 10s deadline — before returning, making teardown synchronous and the data dir quiescent. Reproduced deterministically with the new `bench/wt_stress.py` (`invoke rust-stress` — 24 of 64 concurrent cycles panicked before, 0 after). Regression guard: `tests/test_rust_server_stress.py`; the previously-deselected `tests/test_rust_pitr_cross_server.py` cross-server tests now pass under `-n auto`.
 - ~~**`$type: "int"` / `"long"`**~~ fixed (b29). `_TYPE_PREDS` keys on `isinstance(v, bson.Int64)` rather than Python value range — pymongo's BSON decoder preserves the int32/int64 distinction by class (int32 → plain `int`, int64 → `Int64`), so a doc inserted as `Int64(5)` now matches `$type: "long"` (not `"int"`). `$convert: {to: "long"}` returns `Int64` so its output round-trips correctly through the type predicate.
@@ -319,6 +351,9 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 ### P2 — polish
 
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
+- [ ] **No admin surface for `collMod` / `createCollection` / validators / `renameCollection` / custom-role creation.** All ship server-side; the only way to reach them is hand-typing into `/query`'s `runCommand` box, so they're undiscoverable. Not wrong, just missing — add panels as the need shows up.
+- [ ] **Change-stream page has no resume-token / `fullDocument` controls.** `/changestream` tails by scope only; `resumeAfter` / `startAfter` / `fullDocument` / `fullDocumentBeforeChange` and pipeline filters all ship on both servers but aren't reachable from the UI.
+- [ ] **The SQL / PostgreSQL-wire server has no admin UI at all**, and this is now an explicit scoping decision rather than an accident: `client.check_supported_uri` rejects a `postgresql://` target with a message saying so. If a SQL admin surface is ever wanted it needs its own console — every page here is pymongo-driven.
 - [ ] **`StarletteDeprecationWarning` from fastapi's testclient import** — the six
   admin websocket tests each emit "Using `httpx` with `starlette.testclient` is
   deprecated; install `httpx2`" from fastapi's own import shim. The last warnings
@@ -457,13 +492,46 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   reduces re-downloads within a job; cargo vendoring / a registry mirror would
   remove the risk entirely.
 **Deferred / not yet ported:**
-- [ ] **R7 tail** — a Windows standalone binary (`secantus-wt`'s `build.rs`
-  probes `libwiredtiger.a/.so`; the MSVC wheel build produces neither name, so
-  the bin builds only where the .a exists — wheel-bundled `_secantus_server`
-  covers Windows); the Python CLI's TOML config layer + tuning flags
-  (`--log-level` / `--cache-size` / `--session-max` / `--sync-on-commit` /
-  oplog retention / noop heartbeat) pending matching `Storage::open` knobs.
-- [ ] **R8 tail** — only the pymongo gauge runs against the Rust server
+- [ ] **R7 tail — probe fixed, Windows-binary CI verification pending**
+  (2026-07-17). `secantus-wt`'s `build.rs` now also probes MSVC's
+  `wiredtiger.lib` (and `.dylib`), so the standalone binary can resolve WT on
+  Windows; still to do: a Windows lane in the `secantusdb-v*` release-binaries
+  matrix to prove the end-to-end build (no local Windows to verify against).
+  The entry's second half was stale: the CLI's TOML config layer + tuning
+  flags shipped in §7.6 (beta.96, `config.rs` + `wt_config` knobs).
+- [~] **R8 tail — ALL THIRTEEN driver gauges now run against the Rust server**
+  (2026-07-17 sweep; reports committed as `docs/validation-report-*-rust-server.md`).
+  The Rust server is at effective conformance parity with the Python server —
+  two perfect scores, nothing below 98%, and every failure is either a known
+  out-of-scope gap (text/hashed indexes, `$where`, transactions/sessions on a
+  single node, Atlas search-index management, IPv6) or a documented driver-side /
+  harness artifact — **no new Rust-specific divergence surfaced**:
+
+  | gauge | passed/failed/skipped | pass % | failures |
+  |---|---|---|---|
+  | rust-driver | 101 / 0 / 0 | **100.0%** | — |
+  | dotnet | 202 / 0 / 26 | **100.0%** | — |
+  | kotlin | 294 / 0 / 244 | **100.0%** | — |
+  | php-ext | 670 / 1 / 41 | 99.9% | tailable-collection-dropped edge |
+  | node | 358 / 1 / 5 | 99.7% | text-search sort (out of scope) |
+  | java | 445 / 2 / 453 | 99.6% | mapReduce (legacy) ×2 |
+  | pymongo | 1019 / 6 / 475 | 99.4% | known set (text/hashed/$where/CSOT) |
+  | go | 398 / 3 / 52 | 99.3% | `try_next` harness artifact (accepted) |
+  | php-lib | 3048 / 43 / 39 | 98.6% | ~37 txn/session (out of scope) + 4 to triage |
+  | pymongo-async | 919 / 13 / 491 | 98.6% | sync set + 6 read_concern harness-isolation |
+  | ruby | 289 / 5 / 24 | 98.3% | documented ruby artifacts + session cases |
+  | c | 718 / 15 / 69 | 98.0% | documented C set (ipv6/lastWriteDate/select_server/search) |
+  | cxx | 885 / 3 / 9 | 99.7% | change-stream resume-token tracking, client-metadata handshake ×2 |
+
+  Follow-up triage (not blockers, no data risk): the php-lib "4 real" assertion
+  failures (change-stream resume-token type, session-freed, findOneAndReplace
+  BSON-type-map field order, 2dsphere index-version) and the pymongo-async
+  6× `test_read_concern` (shared `CollectionInvalid: collection already exists`
+  — likely async-harness test-isolation) should be diffed against the Python-server
+  runs of the same gauges to confirm none is Rust-specific. The remaining CI
+  wiring — adding the other-language `--server rust` gauge lanes to
+  `validate.yml` (only pymongo-rust-server runs weekly today) — is the last piece.
+  Original: only the pymongo gauge runs against the Rust server
   (`invoke validate --server rust` / the `pymongo-rust-server` entry in
   `validate.yml`). The Go/Node/Java/Ruby/Rust-driver gauges still gauge the
   Python server only: their runners spawn `python -m secantus` as the daemon,
@@ -605,7 +673,18 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   by CMake and smoke-tested via pymongo across Linux/macOS/Windows. `RustServer`
   auto-creates the storage dir. **Follow-ups:** a Python `secantus`-package
   wrapper for `SecantusDBServer`-style ergonomics; an `invoke rust-server-py` task.
-- [ ] **R4 tail — TLS / mTLS** (`rustls`) + `peer_cert_dn` threading for X509.
+- [x] **R4 tail — TLS / mTLS + MONGODB-X509: SHIPPED and now verified end-to-end
+  (2026-07-17).** Server-side TLS, mTLS client-cert verification, and
+  `peer_cert_dn` threading were already implemented; the new Rust-server
+  e2e test (`test_rust_server_smoke.py::test_tls_and_x509_auth_end_to_end`,
+  the Python suite's two-stage bootstrap flow) exposed that
+  `cert_subject_dn` used x509-parser's raw `Display` — least-specific-first
+  with `", "` separators — so the extracted DN NEVER matched a provisioned
+  user record and X509 auth always failed with AuthenticationFailed. It now
+  emits the mongod-style RFC 4514 form (most-specific-first, bare commas,
+  short OID names, value escaping) byte-identical to
+  `secantus.auth.subject_dn_from_peercert`, so a user provisioned against
+  either server authenticates on the other.
 - [~] **`update` options** — DONE: pipeline-form `u` (`[...]`) via
   `update_matching_pipeline` (diff-style oplog → change streams see
   `operationType: "update"`); **positional operators (`$` / `$[]` / `$[ident]`)
@@ -649,14 +728,19 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
 - [ ] **`find` edges** — empty-collection/empty-result filter validation DONE:
   when nothing matched, the filter is re-run once against an empty document so an
   invalid / unsupported filter surfaces `BadValue` (consistent with the
-  non-empty storage-scan path) instead of an empty cursor. Still deferred:
-  `tailable: true` capped-collection poll. (Tracked in `find.rs` module docs.)
+  non-empty storage-scan path) instead of an empty cursor. The `tailable: true`
+  capped-collection poll SHIPPED since (find.rs's tailable producer, mirroring
+  `_find_tailable`) — verified live and pinned by
+  `test_rust_server_smoke.py::test_tailable_cursor_on_capped_collection`
+  (2026-07-17 audit).
 - [x] **R2c — `update` command.** Document-, replacement-, and pipeline-form `u`
   all apply; positional operators + `arrayFilters` + `let` + `collation` done;
   sort-rejection (9) + pipeline-stage validation (9 / 168) pre-checks done.
   `validator` still deferred (see "update options" above).
-- [ ] **`find` command** — lands with R3 (cursor registry) + `secantus-core`
-  projection; first-batch + `getMore`/`killCursors`.
+- [x] **`find` command — SHIPPED** (R3 landed long since: first-batch +
+  `getMore`/`killCursors`, cursor registry, `secantus-core` projection; the
+  Rust-server smoke suite and the pymongo gauge exercise all of it). Entry was
+  stale (2026-07-17 audit).
 - [x] **`collMod` + collection options + `validator` (insert).** `collMod` is now
   a registered command (`secantus-commands::admin::coll_mod`): merges recognised
   options (`validator` / `validationLevel` / `validationAction` /
@@ -882,14 +966,25 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   Rust equivalent of `storage._oplog_cv`; `oplog_tail_seq_nolock` subsumed. 4
   cross-thread WT-backed tests (`tests/condvar.rs`) + threaded smoke. `commands.py`
   refactor off the raw `_oplog_cv` onto this method pair lands with the adapter.
-- [ ] **Phase 4 sub-phase 5e — remaining gaps + adapter.** Remaining gaps:
+- [x] **Phase 4 sub-phase 5e — SUPERSEDED by the two-server model**
+  (`tasks/rust-server-plan.md`; 2026-07-17 audit). The `secantus.engine`
+  storage-selection + Python-`Storage`-adapter-over-`RustStorage` +
+  `SECANTUS_ENGINE=rust` gauge this entry planned is exactly the retired
+  in-process model; its goal — the full Rust storage validated by the pymongo
+  gauge — is delivered by the Rust *server* (99.4%, identical failure set to
+  the Python server). Original scope for reference: Remaining gaps:
   `checkpoint`/`close`/`create_archive` (admin/`fsync`/backup — none block the core
   conformance suites; `close` handled adapter-side). Then the `secantus.engine`
   storage-selection + Python `Storage` adapter over `RustStorage` (BSON seam,
   `EngineFallback` → Python-operators-over-Rust-docs, E11000/`BadHint` translation,
   `commands.py` getMore refactored onto `wait_for_oplog`/`notify_oplog_waiters`),
   then `test_storage.py`/`test_crud.py` + pymongo gauge under `SECANTUS_ENGINE=rust`.
-- [ ] **Phase 4 — storage keystone (continued).** Remaining: (a) wire
+- [x] **Phase 4 — storage keystone: (a) SUPERSEDED, (b) DONE** (2026-07-17
+  audit). (a) `secantus.engine` selection is the retired in-process model —
+  the Rust storage serves the Rust server instead. (b) the shipping
+  `wheels.yml` cibuildwheel matrix already builds with
+  `SECANTUS_BUILD_STORAGE_ENGINE=ON` (lines ~113-130), so the flag-flip this
+  entry was waiting on happened. Original scope: (a) wire
   `secantus.engine` storage selection so `SecantusDBServer` can use the Rust
   `Storage` under `SECANTUS_ENGINE=rust` — **gated on porting the rest of the
   `Storage` surface** (the server needs `find_matching`/indexes/oplog/etc., not
@@ -909,13 +1004,22 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   once engine-selection makes the Rust storage engine selectable, flip the flag on
   in the shipping `wheels.yml` / cibuildwheel matrix (and add the abi3 storage
   extension to the wheel's repair/tag handling there).
-- [ ] **Toward a standalone Rust package (continued).** With the lib/bindings
+- [ ] **Toward a standalone Rust package — (b) DONE, (a) needs a crates.io
+  decision** (2026-07-17 audit). (b) the `secantusdb` binary crate exists and
+  ships (`secantusd-rs`, the `secantusdb-v*` release-binaries track). (a)
+  flipping `publish = false` and publishing `secantus-core` to crates.io needs
+  Joe's crates.io account + a public-API freeze decision — flagged. Original: With the lib/bindings
   split done, the remaining steps to "ultimately a Rust package": (a) settle the
   `secantus-core` lib's public API and flip `publish = false` → publish to
   crates.io; (b) add a `secantusdb` **binary crate** (a thin `main` over the
   engines + storage) — gated on the storage keystone (Phase 4 above), since a
   standalone server also needs storage in Rust, not just the operator engines.
-- [ ] **Make Rust the *recommended* default (Python stays available).**
+- [ ] **Make Rust the *recommended* default — a product/docs decision for
+  Joe** (2026-07-17 audit). The byte-seam overhead rationale below is moot
+  under the two-server model (the Rust server has no per-call seam); what
+  remains is the positioning call (docs/README recommending `secantusd-rs` /
+  the embedded Rust handle as the default) plus the R8 gauge evidence.
+  Original:
   Currently every component defaults to Python; `SECANTUS_ENGINE=rust` opts in.
   With the optional package now shipping (above), recommending Rust by default
   for installs that have the extension still wants: a decision on the byte seam's
@@ -949,14 +1053,54 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
 - [ ] **Widen the Rust query matcher (Rust server)** — the matcher backs the
   Rust server directly; there is no Python fallback in that path, so an unported
   construct surfaces as `BadValue`. **Done:** `$all` (element equality via
-  `expressions::py_eq`; regex elements still defer); structural array/doc
-  *equality* (`array_eq` / `doc_eq`); bool-as-int `$gt`/`$lt`/`$gte`/`$lte`
-  comparison (0.5.3-beta.119 — numeric vs int/long/double, no-match vs any other
-  type, matching Python's `<`). **Still deferred where faithful:** regex array
-  elements in `$all`, structural array/doc *ordering* under `$gt`/`$lt`, and the
-  exotic BSON types. (The retired in-process "flip `query.matches` default to
-  Rust" item is gone — the two-server model has no per-call engine selection;
-  `_secantus_core` is only the parity-test vehicle now.)
+  `expressions::py_eq`, **regex elements via `op_regex`**, and — fixed 2026-07-17
+  — a **scalar** field value matched like a one-element array, plus `$all: []`
+  matching nothing; this was a real dual-server correctness bug found by the R8
+  gauge triage: `{tags: {$all: ["red"]}}` silently missed scalar `tags: "red"`
+  on *both* servers, verified against mongod 7.0.12 and fixed in `query._op_all`
+  + `query::op_all` with three-way parity); structural array/doc *equality*
+  (`array_eq` / `doc_eq`); bool-as-int `$gt`/`$lt`/`$gte`/`$lte` comparison
+  (0.5.3-beta.119 — numeric vs int/long/double, no-match vs any other type,
+  matching Python's `<`). **Structural ordering under `$gt`/`$lt` now done:**
+  array-vs-array lexicographic range (2026-07-13) and — fixed 2026-07-17 —
+  **doc-vs-doc ordering** (field-by-field: key string compare, else recurse,
+  else shorter-first), another dual-server bug found by the R8 triage:
+  `{a: {$gt: {x: 1}}}` returned nothing on *both* servers (Python's
+  `operator.gt` raises on dicts → swallowed no-match), where mongod orders
+  embedded documents. Fixed in `query._try_cmp` (via `ordering._bson_lt`) and
+  `query::compare_values` (via `order::bson_lt`), three-way mongod-verified; the
+  document-vs-scalar type bracket still no-matches correctly. **Array-vs-array
+  cross-type element ordering also done** (2026-07-17, same R8 triage): array
+  elements order by *full* BSON order (type rank first), so `{a: {$gt: [1,2]}}`
+  matches `a: [1,"x"]` (string element outranks number) — both servers returned
+  nothing before (Python's list `<` raises str-vs-int). Fixed via `_bson_lt` /
+  `order::bson_lt` element-wise; the stale
+  `array_vs_array_cross_type_element_no_match` unit test that pinned the bug is
+  corrected. **`$mod` fidelity fixed** (2026-07-17, same R8 triage): both
+  servers now truncate the value AND divisor toward zero to integers, exclude
+  bool, and use C-style truncated modulo — the Rust server previously *errored*
+  (`BadValue`) on a double-valued field and both servers wrongly matched a bool
+  field; three-way mongod-verified, with the zero-divisor / malformed-spec
+  errors reproduced. **Exotic-type comparison is handled natively now (verified
+  2026-07-19, NOT deferred — the earlier "still deferred" wording was stale):**
+  `query::compare_values` compares JS code / symbol / with-scope code as text and
+  no-matches DBPointer / undefined itself (the 2026-07-13 cross-type range slice),
+  so a top-level exotic scalar under a range op resolves on the Rust server without
+  a Python round-trip. **Still deferred where faithful:** an exotic-text value
+  *under a collation* (ICU folding), a **DBPointer nested inside an array/document**
+  being range-compared (`order::bson_lt` → `None`, Python's type-*name* tiebreak),
+  and a **Decimal128-valued `$mod` field on the Rust server** (`int(Decimal)` is
+  exact to 34 digits, which an `f64` truncation can't reproduce — the standing
+  Decimal128 precision-parity deferral; the Python engine handles it).
+  **`$size` argument validation fixed** (2026-07-17, same R8 triage): a
+  negative `$size` now errors (was a silent no-match), a bool is rejected (was
+  accepted as 1), and an integer-valued float `2.0` is accepted as `2` (was
+  rejected) — mongod's three parse-error stems ("Expected a number" / "an
+  integer" / "a non-negative number", code 2) reproduced on the Python server
+  and mapped to BadValue on the Rust server; three-way mongod-verified. (The
+  retired in-process "flip `query.matches` default to Rust" item is gone — the
+  two-server model has no per-call engine selection; `_secantus_core` is only
+  the parity-test vehicle now.)
 - [x] **Phase 1, leaf engine #3: `update.apply_update`** — the common
   deterministic operators ported to Rust (`crates/secantus-core/src/update.rs`,
   with the `secantus.paths` dotted-path helpers): replacement-style, `$set`,
@@ -969,17 +1113,124 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   Python). Parity pinned by `tests/test_rust_update_parity.py` (curated +
   6000-case fuzz).
 - [ ] **Widen the Rust update operators (Rust server)** — remaining defers where
-  faithful. **Done (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
+  faithful. **`$inc`/`$mul` non-number operand fixed** (2026-07-18, found by the
+  R8 update-op triage): both servers wrongly COMPUTED with a bool operand
+  (`5 + True = 6`, `5 * False = 0` — the recurring `bool`-is-`int` root cause)
+  and Python raw-raised `ValueError`/`TypeError` on a string/null operand.
+  Both now reject a non-number operand: the Python server raises mongod's exact
+  `code 14 "Cannot increment/multiply with non-numeric argument: {field: value}"`;
+  the Rust server surfaces `BadValue` (the standing update error-code gap — the
+  pure core returns a code-less `Fallback`, same as null-field `$inc`), but the
+  correctness contract (reject, don't compute) now holds on both, three-way
+  mongod-verified. **`$pop`/`$position`/`$slice`/`$bit` bool-argument cluster
+  fixed** (2026-07-18, same triage sweep): `$pop: true` computed (True as 1, pop
+  last) on *both* servers, and `$push` `$position`/`$slice: true` computed on the
+  Rust server — all now reject a bool argument. The Python server reports
+  mongod's exact codes (9 for `$pop`, 2 for `$position`/`$slice`/`$bit`) and
+  messages; the Rust server surfaces `BadValue` (code 2 for all — matching mongod
+  for `$position`/`$slice`/`$bit`, the error-code gap only for `$pop`). `$pop`
+  also now errors on a non-±1 number (was a silent no-op). Four of the seven
+  R8-triage bugs share the root cause: Python's `bool` being an `int` subclass
+  sneaking through `isinstance(int)` / `as_int_like` numeric checks.
+  **Aggregation-expression bool-argument cluster fixed** (2026-07-18, same
+  root cause): `$round`/`$trunc` (place), `$arrayElemAt`/`$slice`/`$indexOfArray`/
+  `$substrCP` (index), and `$sortArray` (sortBy) all *computed* a bool argument
+  (`as_int_like(Boolean) → 0/1`) instead of rejecting it. Both servers now reject:
+  the Python server carries mongod's exact per-op codes (16004 / 28690 /
+  28725 / 28727 / 2942507 / 34450 / 34452 / 40096), the Rust core defers →
+  `BadValue`. `$range` (34443/34445/34447) and `$sortArray` already deferred on the
+  Rust side (`range_int` / the `_ => Fallback` sortBy arm); three-way mongod
+  7.0.12-verified. **`$substrBytes` / `$substr` bool-argument cluster fixed**
+  (2026-07-18): `$substrBytes` rejected a bool with mongod's codes (16034 start /
+  16035 length, note the verbatim double-space message); and `$substr` — which
+  mongod treats as a deprecated *byte-based* alias of `$substrBytes` — was
+  mis-aliased to code-point `$substrCP` on both servers, so it diverged on
+  multi-byte strings and reported the wrong bool code (34450 vs 16034). `$substr`
+  now aliases `$substrBytes` on both servers; three-way mongod-verified.
+  **Follow-ups still open (NOT fixed — separate slices):** (1)
+  **whole-number-double index** — these operators reject *all* float indices, but
+  mongod *accepts a whole-number double* (`$arrayElemAt: [[..], 2.0]` → element 2;
+  `-1.0` → last) and *rejects a fractional* one with a per-op code, NOT truncation.
+  Fully probed against mongod 7.0.12 (2026-07-18): `$arrayElemAt` frac → **28691**,
+  `$slice` → **28726**, `$substrCP` → **34451**, `$indexOfArray` → **40096** (same as
+  bool), `$range` → **34446**, `$round` place → **51082** ("precision argument to
+  $round must be a integral value", double-space verbatim). **Exception:**
+  `$substrBytes` (and thus `$substr`) *accepts any double and truncates* (`1.7` →
+  same as `1.0`) — no fractional rejection. Fix = accept int-or-whole-double
+  (coerce to int), reject fractional with the per-op code (except substrBytes
+  truncates); needs a shared `_as_int_index` helper on both engines. Best split by
+  operator family (array indices first — the common case). **Array operators done
+  (2026-07-18):** `$arrayElemAt` / `$slice` / `$indexOfArray` accept a whole-number
+  double (coerce to int, compute on *both* servers) and reject a fractional one
+  with the per-op code (28691 / 28726 / 28728 / 40096) — via `_int_index` /
+  `_FractionalIndex` (Python) + the `IdxCoerce` enum (Rust). **String/range/round
+  operators done (2026-07-18):** `$substrCP` (start 34451 / length 34453), `$range`
+  (start 34444 / end 34446 / step 34448), and `$round`/`$trunc` precision (51082)
+  accept a whole-number double and reject a fractional one — same helpers, three-way
+  mongod 7.0.12-verified. (`$substrBytes`/`$substr` already accept any double and
+  truncate — mongod-correct, left as-is.) So the whole-double-index sweep is
+  **complete** across the aggregation surface. Remaining edge: a *huge* whole double
+  (> 2^31) is accepted here but mongod rejects it (32-bit-representable check) — a
+  narrow case; both SecantusDB engines stay mutually consistent (both null/whole).
+  (2) **`$substrBytes` / `$substr` mid-UTF8-character — FIXED (2026-07-18).**
+  A byte range that splits a UTF-8 char now raises mongod's codes on the Python
+  server (28656 start-on-continuation-byte / 28657 end-mid-character, verbatim
+  double-space messages) and defers → `BadValue` on the Rust server. A fuzz run
+  surfaced the subtlety: mongod rejects a continuation-byte start *even for an
+  empty (length 0) range*, which the Rust core's `std::str::from_utf8` slice check
+  missed (an empty slice is valid UTF-8) — so **both** engines got an explicit
+  boundary check (a negative start keeps legacy slice semantics on both).
+  Three-way mongod 7.0.12-verified. **`$substr*` negative-index rejection — FIXED
+  (2026-07-18):** a negative start (`$substrBytes`/`$substr` → 50752;
+  `$substrCP` → 34455) and a negative `$substrCP` length (34454) now raise mongod's
+  codes on the Python server and defer → `BadValue` on the Rust server, instead of
+  a Python-style negative-index slice; a negative `$substrBytes` length is still
+  "to end" (mongod-correct). **`$substrBytes` float truncation — FIXED
+  (2026-07-18):** `$substrBytes` now accepts any double start/length and truncates
+  toward zero (`1.7`→1, `2.9`→2, `0.9`→0), matching mongod (unlike `$substrCP`,
+  which rejects fractional). Both engines *compute* the truncated result — the Rust
+  core via a new `trunc_index` helper (`d.trunc() as i64`), not defer — so a valid
+  double substring agrees on both servers; a truncated-negative start still hits
+  50752. **With this, `$substrBytes` / `$substrCP` numeric-argument handling fully
+  matches mongod** (bool, byte-vs-codepoint aliasing, whole-double / fractional /
+  truncation, UTF-8-split, negative indices). **Aggregation-stage numeric-arg
+  fidelity (`$limit` / `$skip`) — FIXED (2026-07-18):** both stages coerced their
+  arg with a naive `int(spec)`, so `$limit: 0` returned nothing (mongod: 15958
+  "the limit must be positive"), `$limit: -1` negative-sliced, and bool/fractional
+  were silently coerced; the Rust server had the mirror bug — it *rejected a valid
+  whole-double `$limit: 2.0`* (its `positive_int` used `as_int_like`, which returns
+  None for a double) while coercing bool→1. Now both accept a whole double and
+  reject bool/fractional/negative (`$limit` 5107201, `$skip` 5107200; zero-`$limit`
+  15958) — Python raises the code, the Rust core defers via the new
+  `stage_nonneg_int`. **`$sample` size — FIXED (2026-07-18):** the Python server
+  now rejects a bool size (28746) and a negative size (28747) and truncates a
+  fractional double; the Rust server already validated (its `$sample` lives in the
+  server crate, not the deferring core), so this was a Python-only fix. **With this
+  the aggregation numeric-argument trio (`$limit` / `$skip` / `$sample`) matches
+  mongod on both servers.** **Done
+  (0.5.3-beta.118):** `$min`/`$max` (Python `<` for numeric /
   string / date pairs, bool-as-int; a cross-type comparison Python would raise on
   defers), `$pull`/`$addToSet` (Python `==` membership incl. bool-as-int and
   structural equality via `expressions::py_eq`); `$bit`, `$each` (for `$push` /
   `$addToSet`, incl. `$push` `$position` / `$slice`; `$sort` defers) were already
   native. **Positional operators (`$` / `$[]` / `$[id]`) and `arrayFilters` work
   on the Rust *server*** via the storage layer (`update_matching_array_filters`),
-  even though the pure `secantus-core` engine defers them. **Still deferred (real
-  Rust-server capability gaps — a defer surfaces as `BadValue` there):** pipeline
-  (array) updates, `$push` `$sort` (BSON-order array sort), and a `$min`/`$max`
-  comparison Python's `<` raises on. **`$inc` / `$mul` on a Decimal128 field**
+  even though the pure `secantus-core` engine defers them. **Done since this entry
+  (verified 2026-07-19 against the running Rust server — the three items below were
+  stale, all now work):** (1) **pipeline (array) updates** run on the Rust *server*
+  via `crud.rs` → `Storage::update_matching_pipeline` → `aggregate::apply_pipeline`
+  (allowed-stage set `$set`/`$addFields`/`$unset`/`$project`/`$replaceRoot`/
+  `$replaceWith`, `_id`-preservation; smoke-verified: a computed `$set`+`$unset`, a
+  `$replaceWith` that reroots a sub-doc while preserving `_id`, and a disallowed
+  `$match` stage rejected with mongod's "stage $match not allowed in pipeline
+  updates"); (2) **`$push` `$sort`** sorts whole-elements (`1`/`-1`) or `{field:dir}`
+  in BSON order (`update::push_sort` via `order::cmp`); (3) **`$min`/`$max`** compute
+  the full cross-type order via `order::bson_lt`. **Still deferred where faithful:**
+  a `$push` `$sort` over an element outside `is_sortable`'s transitive subset
+  (bool / NaN / Binary / Timestamp / Regex / Min-MaxKey / Decimal128 / exotic — the
+  deliberate Timsort-parity defer, since a non-transitive comparator would diverge
+  from Python's stable sort), and a `$min`/`$max` **DBPointer** operand (`bson_lt`
+  → `None`, type-name tiebreak). **`$inc` / `$mul` on a Decimal128 field**
   (verified: Python computes `5.5 + 1.5 = 7.0`; the Rust server errors) is a
   **parity-risk deferral, not a coverage oversight** — the Python oracle does the
   arithmetic in `decimal.Decimal`'s 28-significant-digit `ROUND_HALF_EVEN`
@@ -1373,30 +1624,32 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `timezone_offset_ms` helper; previously both ignored it). Fractional seconds stay
   deferred (BSON is millisecond-only). The Python server already supports the
   remaining `$dateFromString`/`$dateToString` directive edges.
-- [ ] **Log-family domain errors diverge from mongod (both servers).** For an
-  out-of-domain argument (`$log10`/`$ln` of a non-positive number, `$log` with a
-  non-positive value/base or base 1, `$sqrt` of a negative number) mongod raises a
-  Location error (e.g. `28761` "$log10's argument must be a positive number"),
-  whereas both SecantusDB servers return **`null`** (Python's `math.*` guarded by
-  `if v > 0`, faithfully mirrored in Rust). Both servers agree with each other; only
-  the mongod error is not reproduced. A faithful fix raises the per-op Location code
-  on **both** engines (Python module + Rust `secantus-core`) and updates the
-  expression parity corpus. Low priority — no data/correctness issue, valid inputs
-  are exact. Found by the three-way differential sweep 2026-07-14. (The `$log10`
-  operator itself is now native on the Rust server; previously it errored with a
-  generic `BadValue` even for valid input.)
-- [ ] **`$group` accumulators absent from both servers** (a differential probe
-  2026-07-06 found these error on *both* — a dual-server gap, not Rust-only):
-  `$median` / `$percentile` (t-digest accumulators). Remaining **expression** forms
-  still absent from both: `$median` / `$percentile` over an array (t-digest /
-  approximate — parity-risky), and the hashing family (`$toHashedIndexKey` —
-  mongod-specific hash). Each would need porting on **both** servers (Python module +
-  Rust `secantus-core`) with a parity corpus. (The **trig family** shipped — see
-  below; the anticipated libm last-ULP risk did not materialise, Rust `f64` and
-  CPython `math` share the platform libm.) **`$bitAnd`/`$bitOr`/`$bitXor`/`$bitNot`
-  as `$group` accumulators**
-  remain a follow-on (their *expression* forms shipped — see below; MongoDB 6.3+, so
-  not validatable against the local mongod 6.0).
+- [x] **Log-family domain errors — FIXED (2026-07-17, probed against mongod
+  7.0.12).** Out-of-domain args now raise mongod's Location codes on the Python
+  engine (`$ln` ≤ 0 → 28766, `$log10` ≤ 0 → 28761, `$log` argument → 28758 /
+  base → 28759, `$sqrt` < 0 → 28714, verbatim messages incl. ", but is X");
+  the Rust engine defers those cases so both servers surface the same errors
+  (the arithmetic-error precedent). NaN now propagates as nan (IEEE, matching
+  mongod) instead of null; null/missing still yield null. Parity-corpus
+  comments updated; pinned by `test_expressions.py::
+  test_log_family_domain_errors`.
+- [ ] **`$group` accumulator gaps — `$median`/`$percentile` SHIPPED on both
+  servers (2026-07-17).** Both the group-accumulator and expression forms now
+  run on Python and Rust, pinned by a live mongod **7.0.12** probe: the
+  "approximate" method on bounded data is mongod's discrete percentile
+  (`sorted[max(0, ceil(p*n) - 1)]`, doubles out; bool/NaN excluded, Decimal128
+  included; empty → null / per-p nulls), so no t-digest is needed and the two
+  engines agree exactly (curated parity cases). Spec validation carries
+  mongod's verbatim codes (40414 missing `method`/`input`/`p`; 2 non-approximate
+  method; 7750301 non-array `p`; 7750303 out-of-range `p`). Still absent from
+  both: the hashing family (`$toHashedIndexKey` — mongod-specific hash), and
+  **`$bitAnd`/`$bitOr`/`$bitXor` as `$group` accumulators** (their
+  *expression* forms shipped — see below). NOT validatable locally: a
+  2026-07-17 probe against the mongod 7.0.12 tarball
+  (`/usr/local/mongodb-macos-aarch64-7.0.12/bin/mongod`) rejects
+  `{$group: {a: {$bitAnd: ...}}}` with `15952 unknown group operator` — the
+  accumulator form needs a newer mongod (docs say 6.3, reality says newer);
+  implement only once a mongod that accepts it is available to probe.
   **Sort-layer edge (pre-existing, not $topN-specific):** SecantusDB's sort treats a
   *missing* field as equal to explicit `null`, whereas mongod sorts missing just
   *above* null — so `$top`/`$bottom`/`$topN`/`$bottomN` (and `$sort`) can order docs
@@ -1469,8 +1722,9 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
   both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
   bit-for-bit despite CPython 3.12's compensated `sum()`).
-- [ ] **Cross-type range comparison — mostly FIXED 2026-07-13; small Rust-server
-  residue remains (`$gt`/`$gte`/`$lt`/`$lte`).** mongod's range operators are
+- [ ] **Cross-type range comparison — FIXED 2026-07-13 on both servers; only a
+  DBPointer operand nested in an array/document still defers (`$gt`/`$gte`/`$lt`/
+  `$lte`). All four sub-items below are done (verified 2026-07-19).** mongod's range operators are
   **type-bracketed** (verified with a three-way probe against real `mongod` 6.0):
   a scalar bound only matches values in the same BSON type bracket — `{a: {$gt: 2}}`
   does **not** match a document- or string-valued `a`, only numbers (plus array
@@ -1500,18 +1754,18 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
     clean no-match, not a `Fallback`. Pinned by curated parity cases +
     `array_vs_array_lexicographic_range` / `array_vs_array_cross_type_element_no_match`
     unit tests.
-  - **Remaining residue (Rust *server* only, rare):** the **exotic** BSON types
-    (JS code / symbol / dbpointer / undefined) as a range operand still defer
-    (`Fallback` → `BadValue` on the Rust server); vanishingly rare, the Python
-    server handles them.
-  (The **`$min`/`$max` UPDATE** operators had the same
-  cross-type gap plus a Python `TypeError` traceback leak — **fixed 2026-07-13**:
-  Python now compares by BSON order via `ordering._bson_lt` (no leak, cross-type
-  matches mongod, explicit-null distinguished from missing); the Rust engine uses
-  `order::cmp` over the sortable subset and defers only a **bool / Decimal128 /
-  NaN / exotic** operand — that residual bool/Decimal128 defer on the Rust *server*
-  is the one remaining piece, and it needs the same non-sortable-order work as the
-  query matcher above.)
+  - **Exotic-type range operands — FIXED (Rust matcher).** JS code / symbol
+    compare as text (mirroring pymongo's decode: Symbol → `str`, `Code` is a
+    str subclass, with-scope Code compares by its code string); a DBPointer or
+    undefined operand is a clean no-match. Under a collation the exotic-text
+    combination still defers to Python. Pinned by curated query-parity cases.
+  (The **`$min`/`$max` UPDATE** operators are now on the full `_bson_lt` port —
+  `order::bson_lt`, a single strict-less that needs none of `$sort`'s
+  transitivity guarantees — so bool / Decimal128 / NaN / Binary / Timestamp /
+  Regex / Min-MaxKey and the decoded exotic text types all compute on the Rust
+  engine; only a **DBPointer** operand still defers, because Python resolves it
+  with a type-*name* tiebreak not worth reproducing. Pinned by curated
+  update-parity cases.)
 - [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
   servers).**
   **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but
@@ -1528,34 +1782,32 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `Location40218`, an unknown `$meta` arg → `Location17308`. Found alongside the
   positional-`$` projection fix by the three-way projection differential
   (2026-07-12).
-- [ ] **Query operator:** `$jsonSchema` exotic keywords absent from both servers
-  (`$ref`-style refs / `title`/`description` metadata / ...) — would need porting
-  on **both** servers. (`bsonType`/`type`/`enum`/bounds/length/`pattern`/counts/
-  `items`/`uniqueItems`/`required`/`properties`/`additionalProperties`/
-  `patternProperties`/`dependencies`/`allOf`/`anyOf`/`oneOf`/`not` all ship on
-  both. `uniqueItems` uses MongoDB value equality, bridging cross-type-equal
-  numerics recursively inside document/array elements — `[{a: 1}, {a: 1.0}]` and
-  `[1, 1.0]` are both correctly treated as duplicates.)
-- [ ] **Error-code — unrecognized expression operator: mostly FIXED 2026-07-13;
-  one Rust-server residue.** For a genuinely nonexistent expression operator,
-  mongod returns a context-specific code. Now matched:
-  - **Query `$expr`** (`find({$expr: {$notreal: [...]}})`) → `168
-    InvalidPipelineOperator` "Unrecognized expression '$notreal'" on **both**
-    servers (was `14 TypeMismatch` on Python, generic `2 BadValue` on Rust). The
-    Rust side is an up-front parse-time check in `find.rs` driven by
-    `expressions::first_unknown_expr_operator` (a `KNOWN_EXPR_OPS` catalog pinned
-    to `apply_op` by a unit test), so only a truly-unknown `$`-operator is
-    flagged — a recognised-but-deferred operator still defers to Python.
-  - **Aggregation `$project`** (`{$project: {x: {$notreal: [...]}}}`) →
-    `Location31325` "Invalid $project :: caused by :: Unknown expression $notreal"
-    on the **Python server** (was `14 TypeMismatch`). **Rust residue:** the Rust
-    server still returns generic `2 BadValue` here — a faithful `$project` check
-    must distinguish the projection-only operators (`$slice` / `$elemMatch` /
-    `$meta`, which are valid inside `$project` and are NOT expression operators)
-    from genuine expressions, so a blanket `first_unknown_expr_operator` scan of a
-    `$project` spec would mislabel them. Deferred as the remaining piece; both
-    servers reject the query either way (no correctness/data issue). Confirmed by
-    three-way probe 2026-07-13.
+- [x] **Query operator: `$jsonSchema` keyword surface — COMPLETE on both
+  servers (2026-07-17, probed against real mongod 7.0).** Every mongod-accepted
+  keyword now ships on both engines, including the previously-missing
+  `multipleOf` (fmod semantics), tuple-form `items` + `additionalItems`, and
+  the `title`/`description` metadata (accepted-and-ignored, type-checked).
+  Exclusive bounds moved to mongod's **draft-4** semantics (`exclusiveMinimum`/
+  `exclusiveMaximum` are booleans sharpening `minimum`/`maximum`; the draft-6
+  numeric form is a parse error — the old numeric treatment was a divergence).
+  Keyword *validation* is parse-time and recursive on both servers with
+  mongod's verbatim codes/messages: unknown keyword / known-but-unsupported
+  (`$ref`/`$schema`/`default`/`definitions`/`format`/`id`) → `9 FailedToParse`;
+  type violations (`multipleOf` non-number, exclusive-bound non-boolean,
+  non-string metadata, non-object schema) → `14 TypeMismatch`. Python:
+  `query._check_json_schema_keywords` (QueryError now carries code/codeName);
+  Rust: `secantus_core::query::json_schema_keyword_error` + the find-command
+  parse-time check. (`type: "integer"` acceptance remains a small known
+  divergence — mongod rejects the alias; both our servers accept it.)
+- [x] **Error-code — unrecognized expression operator: FIXED on both servers.**
+  Query `$expr` → `168 InvalidPipelineOperator` on both (find.rs parse-time
+  check via `expressions::first_unknown_expr_operator`); aggregation
+  `$project` → `Location31325` on both — the Rust server now runs a parse-time
+  `validate_project_exprs` scan that skips single-key projection-only
+  operators (`$slice` / `$elemMatch` / `$meta`) so they are never mislabeled,
+  and flags only a truly-unknown `$`-operator (a recognised-but-deferred one
+  still defers to Python). Pinned by
+  `test_rust_server_smoke.py::test_unknown_expression_operator_error_codes`.
 
 ### 7.6 Standalone `secantusdb` binary: CLI-flag conformance shipped (beta.96)
 
@@ -1570,15 +1822,9 @@ Storage knobs flow through `secantus_storage::wt_config(cache_size, session_max,
 sync_on_commit)` into `Storage::open_with_config`; oplog knobs via the existing
 setters; `--noop-heartbeat-seconds` and `[storage] ttl_sweep_seconds` drive
 background maintenance threads that observe a shutdown flag and are joined before
-teardown. Remaining, worth tracking:
-
-- [ ] **Embedded `RustServer` handle doesn't expose the WiredTiger knobs.** The
-  default cache now matches the rest of the stack (1G, via `wt_config(...)` in the
-  embedded constructor — beta.130), but the PyO3 lifecycle handle
-  (`crates/secantus-server-py`) still doesn't thread `cache_size` / `session_max` /
-  `sync_on_commit` through as constructor parameters, so a test that wants a
-  non-default cache via the embedded handle can't set it. Add the params when the
-  handle grows a config surface.
+teardown. (The embedded `RustServer` handle now exposes the same knobs —
+`cache_size` / `session_max` / `sync_on_commit` constructor parameters
+threading into `wt_config`.)
 ## SQL / PostgreSQL interface — P0 spike limitations
 
 - [ ] **Cross-type comparisons evaluate to false instead of erroring.** A per-row
@@ -1592,45 +1838,56 @@ teardown. Remaining, worth tracking:
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
 `tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
 
-- [ ] **Sub-millisecond timestamp fidelity.** `timestamp`/`timestamptz` (and ts/tstz
-  ranges + multiranges) truncate to milliseconds — BSON datetime is an int64 of
-  millis. Operations succeed; round-trips differ by <1ms. Exact microseconds need a
-  storage-representation change (ISO-text or a micros sidecar) that touches
-  comparisons, scalar functions, and sorting. Found by psycopg's full-type faker
-  (`validate-psycopg`, the only fidelity failures left in `test_leak`'s probe set).
-- [ ] **`numeric` beyond 34 significant digits.** Stored as Decimal128, which caps at
-  34 digits; wider values round into range (Postgres keeps them exact). Exact
+The psycopg conformance gauge stands at **99.5%** (4104/4126 ran) after the
+2026-07 slice series (PRs #543 #548 #552 #558 #561 #564 + the idle-timeout
+slice). The remaining ~22 failures fall into these buckets, which are the
+honest edge of what the Postgres front-end can reach WITHOUT changing the
+shared storage engine or building large new protocol subsystems:
+
+- [ ] **Sub-millisecond timestamp fidelity (~11 gauge tests).** `timestamp`/
+  `timestamptz` (and ts/tstz ranges) truncate to milliseconds — BSON datetime
+  is an int64 of millis, the SAME representation the Mongo side uses, so this
+  isn't a SQL-layer bug but a shared-storage constraint. Exact microseconds
+  need a storage-representation change (ISO-text or a micros sidecar) that
+  touches `typemap.coerce`/`to_py`, `scalar._eval_compare`, `sortkey`
+  encoding, and every scalar datetime function — and would diverge SQL
+  timestamp storage from the Mongo BSON datetimes that the dual-protocol
+  reflected-table path reads. The failing tests are psycopg's random-data
+  faker suites (`test_adapt::test_random`, `test_copy::test_copy_from_leaks`/
+  `test_copy_table_across`) that assert exact round-trips, so they flap on
+  whether a random draw's microseconds land on a whole millisecond.
+- [ ] **`numeric` beyond 34 significant digits.** Stored as Decimal128, which
+  caps at 34 digits (same shared constraint); wider *stored* values round.
+  The binary wire codec now round-trips arbitrarily wide values (PR #564), so
+  the param-only `test_dump_numeric_exhaustive` passes; only values that
+  actually persist through Decimal128 storage lose precision. Exact wide
   storage would need a text/dual representation for `numeric`.
-- [ ] **`test_leak[asyncio-*]` flapping on `FeatureNotSupported: unsupported value
-  expression`.** psycopg's `test_cursor_client.py::test_leak` asyncio variants flip
-  parametrizations in every deterministic gauge run pair around one persistent
-  unsupported-value-expression error in `test_leak`'s random probe queries; a single
-  dedicated diagnosis (find which value expression the ClientCursor emits that the
-  planner rejects) would stabilise ~5 tests at once.
-- [ ] **Coercion errors in one extended-protocol path surface as `XX000` internal
-  error instead of `22P02`.** The declared-OID text-param conversion raises 22P02
-  correctly; some column-coercion failures during Execute still fall through the
-  generic handler. Map `ValueError`-class coercion failures to 22P02 there too.
+- [ ] **Query pipelining (`test_generators::test_pipeline_communicate_abort`).**
+  psycopg's pipeline mode batches many extended-protocol messages before a
+  Sync; the server processes each `Sync` synchronously rather than tracking a
+  pipeline-abort boundary. A real feature (its own subsystem), not a bug.
+- [ ] **CancelRequest handling (`test_generators::test_cancel`, and the
+  environmental `test_cancel_safe_*` "proxy didn't start listening: Errno 22"
+  harness failures).** The v3 CancelRequest startup packet is parsed but not
+  acted on (statements run synchronously, so there is no mid-query cancel
+  point to interrupt). The `test_cancel_safe_*` failures are a psycopg
+  test-harness socket-proxy issue on this machine, not a server behaviour.
+- [ ] **Reject connections to non-existent databases (`test_pgconn_error`,
+  `test_connect_bad`).** SecantusDB creates a database on demand (the
+  ephemeral-db model shared with the Mongo server), so connecting to
+  `dbname=nosuchdb` succeeds where real PG raises. A deliberate divergence —
+  rejecting unknown dbs would break the in-process test-db ergonomic.
+- [ ] **Streaming COPY OUT abort (`test_copy_out_error_with_copy_not_finished`).**
+  COPY OUT materializes the whole result and sends it in one burst, so a
+  client that reads one row and aborts finds the copy already finished
+  (transaction stays INTRANS instead of INERROR). Needs interleaved
+  client-abort detection during a streamed COPY OUT.
+- [ ] **`test_return_untyped[b]` / DatatypeMismatch.** A binary untyped
+  parameter used in a context that PG rejects with 42804 — niche.
 - [ ] **Schema-qualified tables** (`CREATE TABLE testschema.t (…)`) — CREATE
   SCHEMA and schema-qualified user *types* landed; tables in a user schema
   still raise. Needs the (db, coll) storage key to carry the schema (or a
   dotted-collection mapping like the types take).
-- [ ] **User-defined range types** (`CREATE TYPE t AS RANGE (subtype = …)`)
-  — psycopg's testrange/testmultirange fixtures create them; needs a range
-  registry + codec plumbing keyed by the minted oid. Note sqlglot can't parse
-  the statement (falls to `exp.Command` → intercept the raw text in
-  `engine._run_command`); worth `virtual.pg_range` rows + stable minted oids
-  (like `Catalog.enum_type_oids`) so psycopg's `RangeInfo.fetch` works.
-  Blocks ~36 psycopg range/multirange outcomes (5 failures + 31 errors).
-- [ ] **Untyped binary parameters need Parse-time type inference.** psycopg
-  dumps a bound-less `Range(empty=True)` (and lists of them) with oid 0 in
-  BINARY format; real PG infers `$1`'s type from the statement context at
-  parse analysis, then decodes the binary payload with that type. We decode
-  eagerly at Bind with no context, so the payload arrives as garbage text
-  (`'\x01'`). ~10 psycopg range/multirange tests
-  (`test_dump_builtin_empty[b-*]`, `test_dump_builtin_range[b-*-None-None]`,
-  `test_dump_builtin_multirange[b-*]`). Fix: infer `$N` types from the AST
-  (comparison/cast context) at Parse, store on `Prepared.param_oids`.
 - [ ] **HAVING general-shape residual**: the HAVING lowerers now cover
   comparisons, `IS [NOT] NULL` (incl. computed group-key operands),
   `[NOT] IN` over group keys, and always-unknown NULL-operand folds — but any
@@ -3579,5 +3836,100 @@ When you fix one of these, delete the line. When you discover a new one, add it 
   in the retry wrapper and check WT eviction statistics. Multi-writer
   THROUGHPUT scaling itself remains capped by the WT-binding/GIL ceiling
   documented in docs/concurrency.md; lifting it is the
-  tasks/wt-concurrency-plan.md end-game (and the Rust server's global
-  write mutex is the equivalent lever there).
+  tasks/wt-concurrency-plan.md end-game. (The Rust server's equivalent
+  lever — the global write mutex — was pulled 2026-07-17: per-collection
+  write locks + per-statement WT snapshot transactions + the conflict
+  machinery, the rust-coll-locks slice. Re-measure with
+  `bench.concurrency --server rust` and refresh docs/concurrency.md.)
+
+- Rust DDL paths (create/drop index, create/drop/rename collection) run
+  autocommit-per-operation under the global+collection locks — a crash
+  mid-DDL can leave orphan index-entry rows (invisible to readers, since
+  the registry row is the commit point, but a space leak). CRUD statements
+  are transactional since the rust-coll-locks slice; wrapping DDL the same
+  way is the remaining piece.
+
+## Concurrency races (found by the concurrent stress suites, 2026-07-16)
+
+Found by the two concurrency harnesses — `tests/test_mongo_server_concurrency.py`
+(pymongo vs the Python AND Rust servers, one parametrized suite) and
+`tests/test_pgserver_concurrency.py` (psycopg vs the PG server); fixed items are
+recorded in that slice's changelog fragment. Still open:
+
+- [ ] **SQL UNIQUE constraints race across open transactions.** Statement-time
+  constraint probes read the session's snapshot, so two *open transactions* that
+  each insert the same UNIQUE value both pass the probe and both commit (the docs
+  have different `_id`s, so WiredTiger sees no write-write conflict). Real
+  Postgres blocks the second inserter on the index entry until the first commits.
+  The autocommit-vs-autocommit race is closed (the per-storage statement-write
+  lock in `sql/executor.py`); the cross-transaction case needs either commit-time
+  re-validation against committed state or storage-level unique indexes backing
+  SQL UNIQUE constraints.
+- [ ] **SQL advisory locks provide no cross-connection exclusion** (§ "Advisory
+  locks landed", #135): `pg_advisory_lock` is per-`Session` bookkeeping that always
+  grants, so two connections can hold the same exclusive lock concurrently — apps
+  using advisory locks for leader election / migration fencing (alembic, cron
+  fencing) get no mutual exclusion. A truthful implementation needs a server-wide
+  lock table (like `NotifyHub` / `PreparedXactRegistry`) with blocking waits and
+  deadlock detection.
+
+## Rust lock-free reads: DDL-vs-scan wobble (2026-07-17)
+
+- A `renameCollection` / `dropCollection` / `dropDatabase` racing a
+  lock-free read can yield a partial result set (the reader walks shared
+  tables while the DDL is mid-copy/mid-delete). Real mongod kills open
+  cursors on drop and errors them; we return the partial page instead. No
+  wrong documents are ever served (every candidate is re-verified) — the
+  divergence is result-set completeness during a concurrent namespace-level
+  DDL. Fix would be a namespace-generation check (bump a counter on DDL,
+  re-check before returning) or reader-visible kill markers.
+
+## Follow-ups from the #451 (concurrency stress suites) review, 2026-07-17
+
+- [ ] **Rust `UpdateOutcome::post_image` is cloned unconditionally** — every
+  single-doc update pays a full `Document` clone even when the caller is a
+  plain `update` that never reads it (the Python side gates on
+  `return_post_images`). Plumb a `want_post_image` flag, or let the raw-BSON
+  serving-path refactor (tasks/rust-perf-findings.md) subsume it.
+- [ ] **The Rust params of `tests/test_mongo_server_concurrency.py` never run
+  in CI** — the test lane has no storage-engine build, so they importorskip;
+  wire the suite into the `storage-engine` CI job so the Rust server's
+  exactly-one-winner invariants are continuously enforced.
+- [ ] **findAndModify re-pick loops have no telemetry** — unbounded retry is
+  mongod-correct, but once Rust writes stop serializing (lock split below)
+  steal-retries become possible; add the periodic-warning pattern from
+  `_retry_write_conflicts` so a steal-storm is visible in server logs.
+
+## CI build cost
+
+- [ ] **Vendored WiredTiger is rebuilt from source in every CI job** (~100 s x 13
+  jobs) and on every *local* `uv sync`, despite `BUILD_ALWAYS OFF`. Root cause
+  found: ExternalProject records `PATCH_COMMAND` / `CMAKE_ARGS` verbatim and
+  both named `${Python3_EXECUTABLE}`, which under a PEP 517 build is the
+  isolated build env's interpreter — a fresh temp path on every build — so the
+  patch and configure stamps were invalidated every time. Local half is fixed
+  (interpreter passed by file + `REALPATH`; rebuild 37 s -> 1.3 s). CI still
+  pays it in full because every job starts from a fresh checkout with no build
+  dir; that needs a build-dir cache, whose design and the source-patching
+  hazard it must avoid are in `tasks/wt-build-cache-plan.md`. Windows is still
+  unstabilised there (venv pythons are copies, so `REALPATH` is a no-op).
+- [x] ~~**The WiredTiger build cache restores but the test lanes rebuild anyway.**~~
+  ANSWERED and fixed (#562). scikit-build-core writes `Python3_EXECUTABLE` into
+  the TOP-LEVEL CMakeCache, and under PEP 517 that is the isolated build env — a
+  fresh temp dir every build. The changed cache variable forces a reconfigure
+  that takes the WiredTiger ExternalProject with it: every stamp regenerates,
+  including `mkdir`, so the prefix is recreated and WT recompiles on a cache
+  HIT. The 3.10/3.12 split was uv reusing a cached build env for the pinned
+  `.python-version` (3.12) while minting fresh ones for 3.10.
+  The pin must come from the CALLER — setting it inside CMakeLists.txt is too
+  late, since scikit-build passes `-DPython3_EXECUTABLE` on the command line
+  (tried and measured: still rebuilt). CI now exports
+  `SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$(uv python find <ver>)` and folds
+  that path into the wtbuild cache key. Measured cold -> warm on the 3.10 test
+  lanes: sync 86s/81s/83s/83s -> 3s/5s/5s/5s.
+  Still open, smaller: LOCAL builds do not get the pin (it lives in the
+  workflow), so a developer on 3.10 still pays the full ~38s WT rebuild per
+  `uv sync`; the workaround is to export the same variable. And the workflow's
+  critical path is now `storage-engine (windows-latest)`, which is excluded
+  from the WT cache because `uv build --wheel` leaves no reusable build dir on
+  Windows.

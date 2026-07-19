@@ -2,17 +2,109 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import re
 from collections.abc import Mapping
 from typing import Any
 
 from secantus.numerics import bson_add, bson_mul
 from secantus.paths import get_path, has_path, set_path, unset_path
 
+_ARRAY_FILTER_TOKEN = re.compile(r"\$\[([^\]]*)\]")
+# An arrayFilter identifier: begins with a lowercase letter, then alphanumeric.
+_ARRAY_FILTER_IDENT = re.compile(r"^[a-z][a-zA-Z0-9]*$")
+# Logical operators whose sub-clauses an arrayFilter identifier can nest inside.
+_ARRAY_FILTER_LOGICAL = ("$and", "$or", "$nor")
+
+
+def _extract_af_identifiers(f: Mapping[str, Any]) -> tuple[list[str], bool]:
+    """The ordered, de-duplicated arrayFilter identifiers referenced by a filter
+    — the top-level field name (before the first ``.``) of each non-``$`` key,
+    recursing through ``$and`` / ``$or`` / ``$nor`` sub-clauses — plus whether a
+    ``$expr`` was seen (which mongod rejects in this context). Mirrors mongod's
+    single-identifier extraction."""
+    idents: list[str] = []
+    seen: set[str] = set()
+    saw_expr = False
+
+    def walk(m: Mapping[str, Any]) -> None:
+        nonlocal saw_expr
+        for key, value in m.items():
+            if key == "$expr":
+                saw_expr = True
+            elif key in _ARRAY_FILTER_LOGICAL:
+                if isinstance(value, list):
+                    for sub in value:
+                        if isinstance(sub, Mapping):
+                            walk(sub)
+            elif not key.startswith("$"):
+                ident = key.split(".", 1)[0]
+                if ident not in seen:
+                    seen.add(ident)
+                    idents.append(ident)
+
+    walk(f)
+    return idents, saw_expr
+
 
 class UpdateError(Exception):
     def __init__(self, message: str, *, code: int | None = None) -> None:
         super().__init__(message)
         self.code = code
+
+
+def _bson_type_name(v: Any) -> str:
+    """mongod's type vocabulary for update parse-error messages."""
+    from bson import Decimal128, Int64
+
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, Int64):
+        return "long"
+    if isinstance(v, int):
+        return "int" if -(2**31) <= v < 2**31 else "long"
+    if isinstance(v, float):
+        return "double"
+    if isinstance(v, Decimal128):
+        return "decimal"
+    if isinstance(v, str):
+        return "string"
+    if v is None:
+        return "null"
+    if isinstance(v, Mapping):
+        return "object"
+    if isinstance(v, (list, tuple)):
+        return "array"
+    return type(v).__name__
+
+
+def _render_bson_scalar(v: Any) -> str:
+    """A mongod-ish rendering of a scalar for an error message: ``true`` /
+    ``false`` / ``null`` lowercase, strings double-quoted, else ``str()``."""
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if v is None:
+        return "null"
+    if isinstance(v, str):
+        return f'"{v}"'
+    return str(v)
+
+
+def _require_numeric_operand(verb: str, path: str, value: Any) -> None:
+    """mongod rejects ``$inc``/``$mul`` by a non-number with code 14, e.g.
+    ``Cannot increment with non-numeric argument: {n: true}``. bool is NOT a
+    number here (Python's ``bool`` is an ``int`` subclass, so ``5 + True`` would
+    otherwise compute); string / null / etc. also error rather than raising a
+    raw ``ValueError``/``TypeError`` from the arithmetic. Probed vs mongod
+    7.0.12."""
+    from bson import Decimal128
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal128)):
+        raise UpdateError(
+            f"Cannot {verb} with non-numeric argument: {{{path}: {_render_bson_scalar(value)}}}",
+            code=14,
+        )
 
 
 # The update modifiers ``_apply_op`` knows how to apply. Used by
@@ -66,7 +158,11 @@ def _apply_push(arr: list[Any], value: Any) -> list[Any]:
     position = value.get("$position")
     if position is not None:
         if not isinstance(position, int) or isinstance(position, bool):
-            raise UpdateError("$position must be an integer")
+            raise UpdateError(
+                "The value for $position must be an integer value, not of type: "
+                f"{_bson_type_name(position)}",
+                code=2,
+            )
         idx = position if position >= 0 else max(len(arr) + position, 0)
         arr[idx:idx] = each
     else:
@@ -80,26 +176,46 @@ def _apply_push(arr: list[Any], value: Any) -> list[Any]:
 
 def _push_sort(arr: list[Any], spec: Any) -> list[Any]:
     """`$push` `$sort`: `1`/`-1` sorts whole elements (BSON order); a `{field: dir}`
-    document sorts (stably, field-by-field) by those paths."""
+    document sorts (stably, field-by-field) by those paths. mongod validates the
+    spec: a numeric whole-element sort must be exactly ±1 (a whole double is
+    accepted), each document direction must be ±1, and anything else (string,
+    bool, array) is rejected."""
     from secantus.storage import _SortKey
 
-    if isinstance(spec, int) and not isinstance(spec, bool):
+    if not isinstance(spec, bool) and isinstance(spec, (int, float)):
+        if spec != 1 and spec != -1:
+            raise UpdateError("The $sort element value must be either 1 or -1", code=2)
         return sorted(arr, key=_SortKey, reverse=(spec == -1))
     if isinstance(spec, Mapping):
+        for direction in spec.values():
+            if (
+                isinstance(direction, bool)
+                or not isinstance(direction, (int, float))
+                or (direction != 1 and direction != -1)
+            ):
+                raise UpdateError("The sort element value must be either 1 or -1", code=2)
         result = list(arr)
         for field, direction in reversed(list(spec.items())):
             result.sort(
                 key=lambda e, f=field: _SortKey(get_path(e, f) if isinstance(e, Mapping) else e),
-                reverse=(int(direction) == -1),
+                reverse=(direction == -1),
             )
         return result
-    raise UpdateError("$sort requires 1, -1, or a document")
+    raise UpdateError(
+        "The $sort is invalid: use 1/-1 to sort the whole element, or "
+        "{field:1/-1} to sort embedded fields",
+        code=2,
+    )
 
 
 def _push_slice(arr: list[Any], n: Any) -> list[Any]:
     """`$push` `$slice`: keep the first `n` (n≥0), the last `|n|` (n<0), or none."""
     if not isinstance(n, int) or isinstance(n, bool):
-        raise UpdateError("$slice must be an integer")
+        raise UpdateError(
+            "The value for $slice must be an integer value but was given "
+            f"type: {_bson_type_name(n)}",
+            code=2,
+        )
     if n == 0:
         return []
     return arr[:n] if n > 0 else arr[n:]
@@ -176,6 +292,7 @@ def apply_update(
         return copy.deepcopy(doc)
     keys = list(update.keys())
     has_op = any(k.startswith("$") for k in keys)
+    _validate_array_filters(array_filters or [], update)
     filter_map = _index_array_filters(array_filters or [])
     pos = dict(positional_matches) if positional_matches else {}
     if has_op:
@@ -230,6 +347,101 @@ def find_positional_matches(doc: Mapping[str, Any], filter_: Mapping[str, Any]) 
     return out
 
 
+def _array_filter_referenced_identifiers(update: Mapping[str, Any]) -> set[str]:
+    """Every arrayFilter identifier referenced by a ``$[<id>]`` token in any
+    update-operator field path (e.g. ``a.$[x].b`` references ``x``)."""
+    out: set[str] = set()
+    for payload in update.values():
+        if isinstance(payload, Mapping):
+            for path in payload:
+                out.update(_ARRAY_FILTER_TOKEN.findall(path))
+    return out
+
+
+def _render_update_for_error(update: Mapping[str, Any]) -> str:
+    """Render an operator update the way mongod prints it in the unused-array-filter
+    error, e.g. ``{ $set: { a.$[x]: 9 } }``."""
+
+    def val(v: Any) -> str:
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, str):
+            return f'"{v}"'
+        if v is None:
+            return "null"
+        return str(v)
+
+    parts: list[str] = []
+    for op, payload in update.items():
+        if isinstance(payload, Mapping):
+            inner = ", ".join(f"{k}: {val(x)}" for k, x in payload.items())
+            parts.append(f"{op}: {{ {inner} }}")
+        else:
+            parts.append(f"{op}: {val(payload)}")
+    return "{ " + ", ".join(parts) + " }"
+
+
+def _validate_array_filters(filters: list[Mapping[str, Any]], update: Mapping[str, Any]) -> None:
+    """mongod validates arrayFilters before applying: each must be an object
+    (14) referencing exactly one identifier — the top-level field name, which may
+    nest inside ``$and`` / ``$or`` / ``$nor`` (none → 9 / 224 for ``$expr``; two
+    or more distinct → 9); the name must be alphanumeric beginning with a
+    lowercase letter (2), unique across filters (9), and used by a ``$[<id>]``
+    path in the update (9)."""
+    if not filters:
+        return
+    seen: set[str] = set()
+    identifiers: list[str] = []
+    for i, f in enumerate(filters):
+        if not isinstance(f, Mapping):
+            raise UpdateError(
+                f"BSON field 'update.updates.arrayFilters.{i}' is the wrong type "
+                f"'{_bson_type_name(f)}', expected type 'object'",
+                code=14,
+            )
+        found, saw_expr = _extract_af_identifiers(f)
+        if not found:
+            if saw_expr:
+                raise UpdateError(
+                    "Error parsing array filter :: caused by :: $expr is not allowed "
+                    "in this context",
+                    code=224,
+                )
+            raise UpdateError(
+                "Cannot use an expression without a top-level field name in arrayFilters",
+                code=9,
+            )
+        if len(found) > 1:
+            raise UpdateError(
+                "Error parsing array filter :: caused by :: Expected a single top-level "
+                f"field name, found '{found[0]}' and '{found[1]}'",
+                code=9,
+            )
+        ident = found[0]
+        if not _ARRAY_FILTER_IDENT.match(ident):
+            raise UpdateError(
+                "Error parsing array filter :: caused by :: The top-level field name "
+                "must be an alphanumeric string beginning with a lowercase letter, "
+                f"found '{ident}'",
+                code=2,
+            )
+        if ident in seen:
+            raise UpdateError(
+                f"Found multiple array filters with the same top-level field name {ident}",
+                code=9,
+            )
+        seen.add(ident)
+        identifiers.append(ident)
+    referenced = _array_filter_referenced_identifiers(update)
+    for ident in identifiers:
+        if ident not in referenced:
+            raise UpdateError(
+                f"The array filter for identifier '{ident}' was not used in the update "
+                f"{_render_update_for_error(update)}",
+                code=9,
+            )
+
+
 def _index_array_filters(
     filters: list[Mapping[str, Any]],
 ) -> dict[str, Mapping[str, Any]]:
@@ -237,8 +449,8 @@ def _index_array_filters(
     for f in filters:
         if not isinstance(f, Mapping):
             raise UpdateError("each arrayFilter must be a document")
-        for key in f:
-            name = key.split(".", 1)[0]
+        # The identifier may nest inside $and/$or/$nor (validated already).
+        for name in _extract_af_identifiers(f)[0]:
             out.setdefault(name, f)
     return out
 
@@ -377,6 +589,31 @@ def _expand(
     return _expand_path(doc, path, array_filters, positional_matches)
 
 
+def _rename_same_path(a: str, b: str) -> bool:
+    """True if two dotted `$rename` paths are equal or one is an ancestor of the
+    other (mongod: source and target must not be on the same path)."""
+    ap, bp = a.split("."), b.split(".")
+    n = min(len(ap), len(bp))
+    return ap[:n] == bp[:n]
+
+
+def _rename_traverses_array(doc: dict[str, Any], path: str) -> bool:
+    """True if the *literal* `path` indexes into an array with a numeric index
+    (e.g. `arr.0`) — the "array element" mongod forbids in a $rename source /
+    destination (it silently corrupted the array here). A positional token
+    (`$` / `$[]` / `$[id]`) into an array is NOT flagged: those are a SecantusDB
+    $rename extension resolved element-wise elsewhere."""
+    cur: Any = doc
+    for part in path.split("."):
+        if isinstance(cur, list):
+            return part.isdigit()
+        if isinstance(cur, Mapping) and part in cur:
+            cur = cur[part]
+        else:
+            return False
+    return False
+
+
 def _apply_op(
     doc: dict[str, Any],
     op: str,
@@ -394,25 +631,38 @@ def _apply_op(
                 unset_path(doc, concrete)
     elif op == "$currentDate":
         for path, opts in payload.items():
+            # mongod: the argument is a boolean (true OR false — both set the
+            # current Date) or a `{$type: "date"|"timestamp"}` object. A non-bool
+            # scalar and a bad/missing $type are both code 2.
+            if isinstance(opts, bool):
+                stamp: Any = _dt.datetime.now(_dt.timezone.utc)
+            elif isinstance(opts, Mapping):
+                kind = opts.get("$type")
+                if kind == "date":
+                    stamp = _dt.datetime.now(_dt.timezone.utc)
+                elif kind == "timestamp":
+                    import time as _time
+
+                    import bson as _bson
+
+                    stamp = _bson.Timestamp(int(_time.time()), 0)
+                else:
+                    raise UpdateError(
+                        "The '$type' string field is required to be 'date' or 'timestamp': "
+                        "{$currentDate: {field : {$type: 'date'}}}",
+                        code=2,
+                    )
+            else:
+                raise UpdateError(
+                    f"{_bson_type_name(opts)} is not valid type for $currentDate. Please use "
+                    "a boolean ('true') or a $type expression ({$type: 'timestamp/date'}).",
+                    code=2,
+                )
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                if opts is True:
-                    set_path(doc, concrete, _dt.datetime.now(_dt.timezone.utc))
-                    continue
-                if isinstance(opts, Mapping):
-                    kind = opts.get("$type")
-                    if kind == "date":
-                        set_path(doc, concrete, _dt.datetime.now(_dt.timezone.utc))
-                        continue
-                    if kind == "timestamp":
-                        import time as _time
-
-                        import bson as _bson
-
-                        set_path(doc, concrete, _bson.Timestamp(int(_time.time()), 0))
-                        continue
-                raise UpdateError(f"$currentDate option for {path!r} not understood")
+                set_path(doc, concrete, stamp)
     elif op == "$inc":
         for path, delta in payload.items():
+            _require_numeric_operand("increment", path, delta)
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 # A missing field is treated as 0 (mongod applies the delta),
                 # but a field present with an explicit ``null`` (or any other
@@ -435,6 +685,7 @@ def _apply_op(
                 set_path(doc, concrete, bson_add(current, delta))
     elif op == "$mul":
         for path, factor in payload.items():
+            _require_numeric_operand("multiply", path, factor)
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 if not has_path(doc, concrete):
                     current = 0
@@ -504,6 +755,10 @@ def _apply_op(
                 arr = get_path(doc, concrete, default=None)
                 if isinstance(arr, list):
                     arr[:] = [e for e in arr if not _pull_matches(matches, e, criterion)]
+                elif has_path(doc, concrete):
+                    # mongod: a present but non-array target errors; a missing
+                    # field is a silent no-op.
+                    raise UpdateError("Cannot apply $pull to a non-array value", code=2)
     elif op == "$pullAll":
         for path, values in payload.items():
             if not isinstance(values, list):
@@ -512,17 +767,64 @@ def _apply_op(
                 arr = get_path(doc, concrete, default=None)
                 if isinstance(arr, list):
                     arr[:] = [e for e in arr if not any(e == v for v in values)]
+                elif has_path(doc, concrete):
+                    raise UpdateError("Cannot apply $pull to a non-array value", code=2)
     elif op == "$pop":
         for path, direction in payload.items():
+            # mongod validates the $pop argument (probed 7.0.12): a bool is
+            # "not a number" (code 9), and a number other than ±1 is
+            # "$pop expects 1 or -1" (code 9). Python's bool-is-int would treat
+            # `True` as `1` (pop last) without this guard.
+            if isinstance(direction, bool) or not isinstance(direction, (int, float)):
+                raise UpdateError(
+                    f"Expected a number in: {path}: {_render_bson_scalar(direction)}", code=9
+                )
+            if direction not in (1, -1):
+                raise UpdateError(
+                    f"$pop expects 1 or -1, found: {_render_bson_scalar(direction)}", code=9
+                )
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
                 if isinstance(arr, list) and arr:
                     if direction == 1:
                         arr.pop()
-                    elif direction == -1:
+                    else:  # direction == -1
                         arr.pop(0)
     elif op == "$rename":
         for old, new in payload.items():
+            # mongod validates the whole $rename spec before touching the doc —
+            # otherwise several of these silently corrupt data or leak a raw
+            # Python exception (e.g. a non-string target hit `new.split`).
+            if not isinstance(new, str):
+                tgt = "true" if new is True else "false" if new is False else str(new)
+                raise UpdateError(
+                    f"The 'to' field for $rename must be a string: {old}: {tgt}", code=2
+                )
+            if old == "" or new == "":
+                raise UpdateError("An empty update path is not valid.", code=56)
+            if old == new:
+                raise UpdateError(
+                    f'The source and target field for $rename must differ: {old}: "{new}"',
+                    code=2,
+                )
+            if _rename_same_path(old, new):
+                raise UpdateError(
+                    "The source and target field for $rename must not be on the same "
+                    f'path: {old}: "{new}"',
+                    code=2,
+                )
+            if _rename_traverses_array(doc, old):
+                raise UpdateError(
+                    f"The source field cannot be an array element, '{old}' in doc "
+                    f"with _id: {doc.get('_id')} has an array field",
+                    code=2,
+                )
+            if _rename_traverses_array(doc, new):
+                raise UpdateError(
+                    f"The destination field cannot be an array element, '{new}' in doc "
+                    f"with _id: {doc.get('_id')} has an array field",
+                    code=2,
+                )
             old_paths = _expand(doc, old, array_filters, positional_matches)
             new_paths = _expand(doc, new, array_filters, positional_matches)
             if len(old_paths) != len(new_paths):
@@ -554,7 +856,11 @@ def _apply_op(
                 if bit_op not in ("and", "or", "xor"):
                     raise UpdateError(f"$bit unsupported sub-op: {bit_op}")
                 if not isinstance(mask, int) or isinstance(mask, bool):
-                    raise UpdateError("$bit mask must be an integer")
+                    raise UpdateError(
+                        "The $bit modifier field must be an Integer(32/64 bit); a "
+                        f"'{_bson_type_name(mask)}' is not supported here.",
+                        code=2,
+                    )
                 parsed_ops.append((bit_op, mask))
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 current = get_path(doc, concrete, default=0) or 0

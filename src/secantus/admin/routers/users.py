@@ -21,12 +21,14 @@ Endpoints:
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from secantus.admin import capabilities
 from secantus.admin.client import MongoError
 from secantus.rbac import BUILT_IN_ROLES
 
@@ -37,8 +39,23 @@ def _templates(request: Request) -> Jinja2Templates:
     return Jinja2Templates(directory=request.app.state.templates_dir)
 
 
-def _all_role_names() -> list[str]:
-    return sorted(BUILT_IN_ROLES.keys())
+def _all_role_names(request: Request | None = None, db: str = "admin") -> list[str]:
+    """Role names to offer in the picker.
+
+    Sourced from the *connected target* (``rolesInfo``) rather than this
+    package's own table: the admin UI can point at the Rust server or a
+    real ``mongod``, either of which may recognise roles the Python
+    server's ``BUILT_IN_ROLES`` doesn't list — most obviously custom
+    roles created with ``createRole``. The built-in names are unioned in
+    as a floor so a target that can't answer ``rolesInfo`` still renders
+    a usable picker instead of an empty one.
+    """
+    names = set(BUILT_IN_ROLES.keys())
+    if request is not None:
+        # Target can't answer rolesInfo — the built-in floor stands.
+        with contextlib.suppress(MongoError):
+            names.update(request.app.state.mongo.list_role_names(db))
+    return sorted(names)
 
 
 def _normalise_roles(payload: list[str] | None, default_db: str) -> list[dict[str, str]]:
@@ -46,6 +63,14 @@ def _normalise_roles(payload: list[str] | None, default_db: str) -> list[dict[st
 
     The form sends each binding as a string of the form ``"<role>@<db>"``.
     Empty strings are dropped so unchecked rows don't sneak through.
+
+    Role *names* are passed through without being checked against this
+    package's ``BUILT_IN_ROLES``. The target server is the authority on
+    which roles exist — it may be a ``mongod``, or any server with custom
+    roles — and filtering here against a local table silently discarded
+    valid bindings, leaving the user staring at a role that refused to
+    stick with no error. An unknown role now reaches the server and comes
+    back as an honest ``RoleNotFound``.
     """
     out: list[dict[str, str]] = []
     for entry in payload or []:
@@ -55,8 +80,7 @@ def _normalise_roles(payload: list[str] | None, default_db: str) -> list[dict[st
         if not role or not db:
             role = entry
             db = default_db
-        if role in BUILT_IN_ROLES:
-            out.append({"role": role, "db": db})
+        out.append({"role": role, "db": db})
     return out
 
 
@@ -87,7 +111,7 @@ def users_page(request: Request) -> HTMLResponse:
             "active": "users",
             "db_name": db,
             "users": users,
-            "all_roles": _all_role_names(),
+            "all_roles": _all_role_names(request, db),
             "error": error,
         },
     )
@@ -174,7 +198,7 @@ def roles_modal(request: Request, db: str, username: str) -> HTMLResponse:
         raise HTTPException(status_code=404, detail="user not found")
     current = _user_role_set(user)
     targets: set[str] = set()
-    for role in _all_role_names():
+    for role in _all_role_names(request, db):
         # In mongod, *AnyDatabase roles must bind to admin; the rest can
         # bind to any database. Surface a candidate per-db option that
         # makes sense for that role.
@@ -222,6 +246,8 @@ async def update_roles(request: Request, db: str, username: str) -> HTMLResponse
         if to_revoke_pairs:
             request.app.state.mongo.revoke_roles(db, username, to_revoke_pairs)
     except MongoError as exc:
+        if capabilities.is_command_not_found(exc):
+            capabilities.record_unsupported(request.app, "grant_revoke_roles")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return HTMLResponse(
         "",
@@ -254,8 +280,15 @@ def drop_user(request: Request, db: str, username: str) -> HTMLResponse:
 @router.get("/roles", response_class=HTMLResponse)
 def roles_page(request: Request) -> HTMLResponse:
     rows: list[dict[str, Any]] = []
-    for name in _all_role_names():
-        spec = BUILT_IN_ROLES[name]
+    for name in _all_role_names(request):
+        spec = BUILT_IN_ROLES.get(name)
+        if spec is None:
+            # A role the target recognises but this package has no action
+            # table for — a custom role created with ``createRole``. Show
+            # it so the catalogue matches the target, but don't invent
+            # privileges we haven't read.
+            rows.append({"name": name, "actions": [], "flags": ["custom"]})
+            continue
         flags: list[str] = []
         if getattr(spec, "any_db", False):
             flags.append("any_db")

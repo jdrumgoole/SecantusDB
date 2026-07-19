@@ -88,6 +88,19 @@ CURATED = [
     [{"$match": {"b": "y"}}],
     [{"$limit": 2}],
     [{"$skip": 1}],
+    # $limit / $skip numeric-arg fidelity: a whole double computes on both
+    # engines; bool / fractional / negative / (for $limit) zero are rejected —
+    # Python raises the mongod code, the Rust core defers (skipped in this loop).
+    [{"$limit": 2.0}],
+    [{"$limit": 2.7}],
+    [{"$limit": True}],
+    [{"$limit": 0}],
+    [{"$limit": -1}],
+    [{"$skip": 3.0}],
+    [{"$skip": 0}],
+    [{"$skip": 3.7}],
+    [{"$skip": True}],
+    [{"$skip": -1}],
     [{"$count": "n"}],
     [{"$project": {"a": 1}}],
     [{"$project": {"a": 1, "_id": 0}}],
@@ -109,9 +122,11 @@ CURATED = [
     [{"$match": {"a": {"$gte": 10}}}, {"$project": {"a": 1, "_id": 0}}],
     [{"$addFields": {"big": {"$gt": ["$a", 20]}}}, {"$match": {"big": True}}],
     [{"$skip": 1}, {"$limit": 1}, {"$count": "n"}],
-    # $sort — single + multi-field, both directions
+    # $sort — single + multi-field, both directions (incl. whole-double ±1.0)
     [{"$sort": {"a": 1}}],
     [{"$sort": {"a": -1}}],
+    [{"$sort": {"a": 1.0}}],
+    [{"$sort": {"a": -1.0}}],
     [{"$sort": {"b": 1, "a": -1}}],
     # $unwind — string form, doc form, includeArrayIndex, preserve
     [{"$unwind": "$tags"}],
@@ -137,6 +152,36 @@ CURATED = [
     [{"$group": {"_id": None, "m": {"$mergeObjects": "$nested"}}}],
     [{"$group": {"_id": "$b", "m": {"$mergeObjects": "$nested"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": None, "m": {"$mergeObjects": "$nope"}}}],  # all missing -> {}
+    # $median / $percentile — mongod's discrete percentile (probed 7.0.12):
+    # sorted[max(0, ceil(p*n) - 1)] as a double; bool/NaN excluded; empty ->
+    # null / per-p nulls. Both group-accumulator and expression forms.
+    [
+        {
+            "$group": {
+                "_id": None,
+                "m": {"$median": {"input": "$a", "method": "approximate"}},
+                "p": {
+                    "$percentile": {
+                        "input": "$a",
+                        "p": [0.1, 0.25, 0.5, 0.75, 0.9, 1.0],
+                        "method": "approximate",
+                    }
+                },
+            }
+        }
+    ],
+    [
+        {"$group": {"_id": "$b", "m": {"$median": {"input": "$a", "method": "approximate"}}}},
+        {"$sort": {"_id": 1}},
+    ],
+    [
+        {
+            "$project": {
+                "m": {"$median": {"input": [3.5, 1, 2], "method": "approximate"}},
+                "p": {"$percentile": {"input": [2, 4], "p": [0.5, 1.0], "method": "approximate"}},
+            }
+        }
+    ],
     # $stdDevPop / $stdDevSamp — pop is 0 for a single value, samp is null for <2.
     [{"$group": {"_id": "$b", "sd": {"$stdDevPop": "$a"}}}, {"$sort": {"_id": 1}}],
     [{"$group": {"_id": "$b", "sd": {"$stdDevSamp": "$a"}}}, {"$sort": {"_id": 1}}],
@@ -180,6 +225,12 @@ CURATED = [
     # $bucket — default, custom output, empty buckets
     [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10, 20, 30]}}],
     [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10, 20], "default": "other"}}],
+    # $bucket validation: invalid specs (out-of-range w/o default, unsorted,
+    # missing groupBy, non-doc output) raise on Python and defer on Rust.
+    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 10]}}],  # 15/25 out of range
+    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 20, 10]}}],  # unsorted
+    [{"$bucket": {"boundaries": [0, 30]}}],  # missing groupBy
+    [{"$bucket": {"groupBy": "$a", "boundaries": [0, 30], "output": 5}}],  # non-doc output
     [
         {
             "$bucket": {
@@ -192,6 +243,7 @@ CURATED = [
     ],
     # $bucketAuto — count-chunking (equal values still split), custom output
     [{"$bucketAuto": {"groupBy": "$a", "buckets": 2}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2.0}}],  # whole double accepted
     [{"$bucketAuto": {"groupBy": "$a", "buckets": 3}}],
     [{"$sort": {"_id": 1}}, {"$bucketAuto": {"groupBy": "$_id", "buckets": 4}}],
     [
@@ -200,6 +252,22 @@ CURATED = [
                 "groupBy": "$a",
                 "buckets": 2,
                 "output": {"n": {"$sum": 1}, "av": {"$avg": "$a"}},
+            }
+        }
+    ],
+    # $bucketAuto granularity — preferred-number rounding (Rust computes natively)
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "R5"}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "R20"}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 3, "granularity": "E6"}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "1-2-5"}}],
+    [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "POWERSOF2"}}],
+    [
+        {
+            "$bucketAuto": {
+                "groupBy": "$a",
+                "buckets": 2,
+                "granularity": "R10",
+                "output": {"n": {"$sum": 1}, "mx": {"$max": "$a"}},
             }
         }
     ],
@@ -764,6 +832,26 @@ def test_sort_mixed_types(direction):
     assert rust == py, f"rust={rust} pure={py}"
 
 
+@pytest.mark.parametrize(
+    "acc",
+    [
+        {"$sum": "$k"},
+        {"$avg": "$k"},
+        {"$min": "$k"},
+        {"$max": "$k"},
+    ],
+)
+def test_group_accumulator_mixed_types(acc):
+    # $sum/$avg ignore non-numeric; $min/$max order by BSON cross-type. The Rust
+    # core computes these over the mixed corpus rather than deferring.
+    docs = bson.decode(bson.encode({"d": SORT_DOCS}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$group": {"_id": None, "r": acc}}]}))["p"]
+    rust = _rust_pipeline(docs, pipeline)
+    assert rust is not None, f"expected the Rust $group to handle {acc} over mixed types"
+    py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert rust == py, f"rust={rust} pure={py}"
+
+
 @pytest.mark.parametrize("pipeline", CURATED)
 def test_curated_parity(pipeline):
     docs = bson.decode(bson.encode({"d": DOCS}))["d"]
@@ -773,6 +861,245 @@ def test_curated_parity(pipeline):
         return
     py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
     assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
+
+
+_GRANULARITIES = [
+    "R5",
+    "R10",
+    "R20",
+    "R40",
+    "R80",
+    "1-2-5",
+    "E6",
+    "E12",
+    "E24",
+    "E48",
+    "E96",
+    "E192",
+    "POWERSOF2",
+]
+
+
+def test_bucket_auto_granularity_fuzz():
+    """Rust $bucketAuto granularity must equal pure-Python bit-for-bit (Python is
+    itself pinned hex-exact to mongod 7.0.12 in test_crud). Broad random corpus
+    over every series, bucket count, and decade scale."""
+    rng = random.Random(0xB0CCE7)
+    handled = 0
+    for _ in range(400):
+        gran = rng.choice(_GRANULARITIES)
+        n = rng.randint(1, 40)
+        scale = rng.choice([0.001, 0.1, 1, 4, 10, 100, 1000])
+        vals = sorted(round(rng.uniform(0.5, 19) * scale, 6) for _ in range(n))
+        docs = [
+            {"_id": i, "a": (int(v) if rng.random() < 0.2 and v == int(v) else v)}
+            for i, v in enumerate(vals)
+        ]
+        nb = rng.randint(1, 8)
+        pipeline = [{"$bucketAuto": {"groupBy": "$a", "buckets": nb, "granularity": gran}}]
+        docs_b = bson.decode(bson.encode({"d": docs}))["d"]
+        pipeline_b = bson.decode(bson.encode({"p": pipeline}))["p"]
+        rust = _rust_pipeline(docs_b, pipeline_b)
+        assert rust is not None, f"Rust must handle granularity {gran}: {docs}"
+        py = _pure.apply_pipeline(docs_b, pipeline_b, _PipelineContext())
+        assert rust == py, f"gran={gran} rust={rust} pure={py} docs={docs} b={nb}"
+        handled += 1
+    assert handled == 400
+
+
+@pytest.mark.parametrize(
+    "values,code",
+    [
+        ([-5.0, 1.0, 2.0], 40260),  # negative -> non-negative only
+        ([1.0, 2.0, "x"], 40258),  # non-numeric value
+        ([float("nan"), 1.0], 40259),  # NaN
+        ([None, 1.0, 2.0], 40258),  # null is non-numeric
+        ([bson.Decimal128("1.5"), bson.Decimal128("2.5")], 2),  # Decimal128 deferral
+    ],
+)
+def test_bucket_auto_granularity_value_defers_and_raises(values, code):
+    docs = [{"_id": i, "a": v} for i, v in enumerate(values)]
+    pipeline = [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "R5"}}]
+    docs_b = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline_b = bson.decode(bson.encode({"p": pipeline}))["p"]
+    assert _rust_pipeline(docs_b, pipeline_b) is None  # Rust defers
+    with pytest.raises(Exception) as exc:
+        _pure.apply_pipeline(docs_b, pipeline_b, _PipelineContext())
+    assert getattr(exc.value, "code", None) == code
+
+
+@pytest.mark.parametrize(
+    "granularity,code",
+    [
+        ("R7", 40257),  # unknown series
+        (5, 40261),  # non-string granularity
+    ],
+)
+def test_bucket_auto_granularity_name_defers_and_raises(granularity, code):
+    docs = [{"_id": 1, "a": 1.0}, {"_id": 2, "a": 2.0}]
+    pipeline = [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": granularity}}]
+    docs_b = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline_b = bson.decode(bson.encode({"p": pipeline}))["p"]
+    assert _rust_pipeline(docs_b, pipeline_b) is None  # Rust defers
+    with pytest.raises(Exception) as exc:
+        _pure.apply_pipeline(docs_b, pipeline_b, _PipelineContext())
+    assert getattr(exc.value, "code", None) == code
+
+
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        ({"v": "asc"}, 15974),  # non-numeric direction
+        ({"v": True}, 15974),  # bool direction
+        ({"v": 0}, 15975),  # numeric non-±1
+        ({"v": 2}, 15975),
+        ({}, 15976),  # empty spec
+    ],
+)
+def test_sort_stage_invalid_defers_and_raises(spec, code):
+    # Invalid $sort stage: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$sort": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "rng,code",
+    [
+        ({"step": 1, "unit": "day", "bounds": "full"}, 6053600),
+        ({"step": True, "bounds": "full"}, 14),
+        ({"step": 0, "bounds": "full"}, 5733401),
+        ({"step": 1, "bounds": "partial"}, 5946802),
+        ({"step": 1, "bounds": [0]}, 5733403),
+        ({"step": 1, "bounds": [5, 0]}, 5733402),
+    ],
+)
+def test_densify_invalid_defers_and_raises(rng, code):
+    # Invalid $densify: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}, {"_id": 2, "v": 5}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$densify": {"field": "v", "range": rng}}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        ({}, 40169),
+        ({"a": 5}, 40170),
+        ({"a": [5]}, 40171),
+        ({"a": [{}]}, 40171),
+        ({"a": [{"$facet": {"b": [{"$match": {"v": 1}}]}}]}, 40600),
+    ],
+)
+def test_facet_invalid_defers_and_raises(spec, code):
+    # Invalid $facet: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$facet": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        ({"path": "a"}, 28818),  # bare path (no $)
+        ({"path": 5}, 28808),  # non-string path
+        ({"path": "$a", "includeArrayIndex": 5}, 28810),  # non-string index
+        ({"path": "$a", "includeArrayIndex": ""}, 28810),  # empty index
+        ({"path": "$a", "includeArrayIndex": "$i"}, 28822),  # $-prefixed index
+        ({"path": "$a", "preserveNullAndEmptyArrays": 5}, 28809),  # non-bool preserve
+        ("a", 28818),  # bare string form
+    ],
+)
+def test_unwind_invalid_defers_and_raises(spec, code):
+    # Invalid $unwind: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "a": [1, 2, 3]}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$unwind": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        (5, 40156),
+        ("", 40157),
+        ("$n", 40158),
+        ("a.b", 40160),
+        ("_id", 15948),
+    ],
+)
+def test_count_invalid_defers_and_raises(spec, code):
+    # Invalid $count: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1}, {"_id": 2}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$count": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
+def test_project_empty_defers_and_raises():
+    # Empty $project: Rust defers (None), pure engine raises Location51272.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$project": {}}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == 51272
+
+
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        (5, 40149),
+        (True, 40149),
+        ([1], 40149),
+        (None, 40149),
+        ("v", 40148),
+        ({"a": 1}, 40147),
+    ],
+)
+def test_sort_by_count_invalid_defers_and_raises(spec, code):
+    # Invalid $sortByCount: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$sortByCount": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        ({"groupBy": "$v", "buckets": True}, 40241),
+        ({"groupBy": "$v", "buckets": "x"}, 40241),
+        ({"groupBy": "$v", "buckets": 2.5}, 40242),
+        ({"groupBy": "$v", "buckets": 0}, 40243),
+        ({"groupBy": "$v", "buckets": -1}, 40243),
+        ({"groupBy": "$v"}, 40246),
+        ({"buckets": 2}, 40246),
+    ],
+)
+def test_bucket_auto_invalid_defers_and_raises(spec, code):
+    # Invalid $bucketAuto buckets: Rust defers (None), pure engine raises the code.
+    docs = bson.decode(bson.encode({"d": [{"_id": i, "v": i} for i in range(6)]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$bucketAuto": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
 
 
 def _rand_scalar(rng):

@@ -257,6 +257,7 @@ impl CmdStorage for StorageAdapter {
             matched: o.matched,
             modified: o.modified,
             upserted_id: o.upserted_id,
+            post_image: o.post_image,
         })
     }
 
@@ -293,6 +294,7 @@ impl CmdStorage for StorageAdapter {
             matched: o.matched,
             modified: o.modified,
             upserted_id: o.upserted_id,
+            post_image: o.post_image,
         })
     }
 
@@ -319,6 +321,7 @@ impl CmdStorage for StorageAdapter {
             matched: o.matched,
             modified: o.modified,
             upserted_id: o.upserted_id,
+            post_image: o.post_image,
         })
     }
 

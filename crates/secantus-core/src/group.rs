@@ -10,12 +10,13 @@
 //!   canonicalise without a fidelity risk (Decimal128, NaN, Binary/Timestamp/
 //!   Regex/Min/MaxKey, exotic) defer the whole stage to Python.
 //!
-//! * **Accumulators** reproduce Python's exact numeric and raise-on-mixed-type
-//!   semantics: `$sum`/`$avg` accumulate with Python `+` (int stays int, any
-//!   float widens — non-numeric operands `TypeError` → defer); `$min`/`$max`
-//!   use native `<`/`>` (via `expressions::py_order`, which raises/`None`s on
-//!   the cross-type cases) and so defer rather than guess; `$addToSet`
-//!   membership uses Python `==` (`expressions::py_eq`).
+//! * **Accumulators** reproduce mongod's exact numeric semantics: `$sum`/`$avg`
+//!   accumulate only numeric operands (int stays int, any float widens; string
+//!   / bool / null / missing are ignored, Decimal128 → defer); an all-non-numeric
+//!   `$sum` is `0`, `$avg` is null. `$min`/`$max` ignore null / missing and order
+//!   every other value by BSON cross-type order (`order::bson_lt`, the relation
+//!   `ordering._SortKey` uses). `$addToSet` membership uses Python `==`
+//!   (`expressions::py_eq`).
 //!
 //! Any unported / deferring construct returns `Err(())` and the pure-Python
 //! `$group` runs instead.
@@ -114,8 +115,9 @@ pub(crate) enum Num {
 
 impl Num {
     /// Python `self + v`. `Err(())` if `v` isn't numeric (Python `int + str`
-    /// etc. raises -> defer).
-    fn add(self, v: &Bson) -> R<Num> {
+    /// etc. raises -> defer). `pub(crate)` so the expression-form `$sum`/`$avg`
+    /// accumulators (`expressions.rs`) reuse the exact width logic for parity.
+    pub(crate) fn add(self, v: &Bson) -> R<Num> {
         match v {
             Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(_) => {
                 let n = as_int_like(v).unwrap();
@@ -135,7 +137,7 @@ impl Num {
         }
     }
 
-    fn to_bson(self) -> R<Bson> {
+    pub(crate) fn to_bson(self) -> R<Bson> {
         match self {
             Num::Int { v, wide } => int_promoted_to_bson(v, wide).ok_or(()),
             Num::Float(f) => Ok(Bson::Double(f)),
@@ -150,7 +152,7 @@ impl Num {
 pub(crate) enum Acc {
     Sum(Num),
     Count(i64),
-    Avg(Option<(Num, i64)>), // None until the first non-null value (field stays absent)
+    Avg(Option<(Num, i64)>), // None until the first numeric value (finalises to null)
     Min(Option<Bson>),       // None == "unset or null-equivalent"
     Max(Option<Bson>),
     First(Option<Bson>), // None == not yet seen any doc
@@ -177,6 +179,17 @@ pub(crate) enum Acc {
         kind: NElemKind,
         n: Option<usize>,
         vals: Vec<Bson>,
+    },
+    // `$median` / `$percentile`: collect numeric values (int / long / double /
+    // Decimal128 as f64; bool and NaN excluded — mongod-probed 7.0.12), then
+    // compute mongod's discrete percentile (`sorted[max(0, ceil(p*n) - 1)]`,
+    // returned as a double; null / per-p nulls when no value was seen) at
+    // finalize. `ps` parses from the spec on the first apply (None = $median).
+    // An invalid spec defers to Python, which raises mongod's exact error.
+    Percentile {
+        is_median: bool,
+        ps: Option<Vec<f64>>,
+        values: Vec<f64>,
     },
     // `$top` / `$bottom` / `$topN` / `$bottomN`: collect `(sortBy-values, output)`
     // per doc; at finalize stable-sort by the `sortBy` directions and take the
@@ -275,6 +288,16 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
             dirs: Vec::new(),
             items: Vec::new(),
         },
+        "$median" => Acc::Percentile {
+            is_median: true,
+            ps: None,
+            values: Vec::new(),
+        },
+        "$percentile" => Acc::Percentile {
+            is_median: false,
+            ps: None,
+            values: Vec::new(),
+        },
         _ => return Err(()), // unsupported accumulator -> Python (raises or handles)
     })
 }
@@ -283,34 +306,84 @@ fn is_null(b: &Bson) -> bool {
     matches!(b, Bson::Null)
 }
 
-/// `arg == 1` in Python — true for int 1, float 1.0, and bool True.
+/// The f64 a value contributes to `$median` / `$percentile`, or None to skip
+/// it. mongod-probed: int / long / double / Decimal128 count (as doubles),
+/// bool and NaN are excluded, everything else is skipped. The Decimal128 →
+/// f64 path is `str::parse` on the decimal string — the same correctly-rounded
+/// conversion as Python's `float(Decimal(...))`.
+pub(crate) fn percentile_f64(v: &Bson) -> Option<f64> {
+    let f = match v {
+        Bson::Int32(n) => *n as f64,
+        Bson::Int64(n) => *n as f64,
+        Bson::Double(d) => *d,
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    (!f.is_nan()).then_some(f)
+}
+
+/// mongod's discrete percentile over sorted values:
+/// `sorted[max(0, ceil(p*n) - 1)]` as a double; null when no value was seen.
+pub(crate) fn percentile_rank(sorted_values: &[f64], p: f64) -> Bson {
+    if sorted_values.is_empty() {
+        return Bson::Null;
+    }
+    let idx = ((p * sorted_values.len() as f64).ceil() as i64 - 1).max(0) as usize;
+    Bson::Double(sorted_values[idx.min(sorted_values.len() - 1)])
+}
+
+/// Shared `$median` / `$percentile` finalize: sort (no NaN was collected) and
+/// rank; a percentile with no parsed `ps` (impossible for a non-empty group)
+/// yields an empty array.
+fn percentile_finalize(is_median: bool, ps: Option<Vec<f64>>, mut values: Vec<f64>) -> Bson {
+    values.sort_by(|a, b| a.partial_cmp(b).expect("NaN excluded at collect"));
+    if is_median {
+        percentile_rank(&values, 0.5)
+    } else {
+        Bson::Array(
+            ps.unwrap_or_default()
+                .iter()
+                .map(|p| percentile_rank(&values, *p))
+                .collect(),
+        )
+    }
+}
+
+/// `arg == 1 and not isinstance(arg, bool)` in Python — the literal-count
+/// fast path. A bool operand is *not* one here (mongod ignores it in `$sum`).
 fn arg_is_one(arg: &Bson) -> bool {
-    matches!(arg, Bson::Int32(1) | Bson::Int64(1) | Bson::Boolean(true))
-        || matches!(arg, Bson::Double(d) if *d == 1.0)
+    matches!(arg, Bson::Int32(1) | Bson::Int64(1)) || matches!(arg, Bson::Double(d) if *d == 1.0)
 }
 
 pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()> {
     match acc {
         Acc::Sum(running) => {
-            // `1 if arg == 1 else evaluate(arg)`, then None -> 0.
+            // mongod sums only numeric operands (int / long / double); string /
+            // bool / null / missing / array / doc are ignored. Decimal128 -> Python.
             if arg_is_one(arg) {
                 *running = running.add(&Bson::Int32(1))?;
             } else {
-                let v = eval(arg, doc, vars)?;
-                if !is_null(&v) {
-                    *running = running.add(&v)?;
+                match eval(arg, doc, vars)? {
+                    v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) => {
+                        *running = running.add(&v)?;
+                    }
+                    Bson::Decimal128(_) => return Err(()),
+                    _ => {}
                 }
             }
         }
         Acc::Count(n) => *n += 1,
         Acc::Avg(state) => {
-            let v = eval(arg, doc, vars)?;
-            if !is_null(&v) {
-                let (total, count) = match state.take() {
-                    Some(s) => s,
-                    None => (Num::Int { v: 0, wide: false }, 0),
-                };
-                *state = Some((total.add(&v)?, count + 1));
+            // Averages only numeric values (Decimal128 -> Python); an all-non-
+            // numeric group finalises to null.
+            match eval(arg, doc, vars)? {
+                v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) => {
+                    let (total, count) =
+                        state.take().unwrap_or((Num::Int { v: 0, wide: false }, 0));
+                    *state = Some((total.add(&v)?, count + 1));
+                }
+                Bson::Decimal128(_) => return Err(()),
+                _ => {}
             }
         }
         Acc::Min(cur) => update_extreme(cur, eval(arg, doc, vars)?, Ordering::Less)?,
@@ -367,6 +440,42 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             let v = eval(arg, doc, vars)?;
             if !is_null(&v) {
                 values.push(numeric_f64(&v).ok_or(())?);
+            }
+        }
+        Acc::Percentile {
+            is_median,
+            ps,
+            values,
+        } => {
+            let Bson::Document(spec) = arg else {
+                return Err(()); // Python raises 7429703 / 40414
+            };
+            if spec.get_str("method") != Ok("approximate") {
+                return Err(()); // missing (40414) or non-approximate (BadValue)
+            }
+            let input = spec.get("input").ok_or(())?;
+            if !*is_median && ps.is_none() {
+                let Some(Bson::Array(raw)) = spec.get("p") else {
+                    return Err(()); // missing (40414) or non-array (7750301)
+                };
+                let mut parsed = Vec::with_capacity(raw.len());
+                for p in raw {
+                    let f = match p {
+                        Bson::Int32(n) => *n as f64,
+                        Bson::Int64(n) => *n as f64,
+                        Bson::Double(d) => *d,
+                        _ => return Err(()), // Python raises 7750303
+                    };
+                    if !(0.0..=1.0).contains(&f) {
+                        return Err(());
+                    }
+                    parsed.push(f);
+                }
+                *ps = Some(parsed);
+            }
+            let v = eval(input, doc, vars)?;
+            if let Some(f) = percentile_f64(&v) {
+                values.push(f);
             }
         }
         Acc::NElem { n, vals, .. } => {
@@ -561,20 +670,28 @@ fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
     Some(var.sqrt())
 }
 
-/// `$min` / `$max`: `cur is None or (v is not None and v <cmp> cur)`. Uses
-/// Python's native `<`/`>` (via `py_order`), which raises on cross-type — so an
-/// unorderable pair defers the whole stage rather than guessing.
+/// `$min` / `$max`: ignore null / missing and order every other value by BSON
+/// cross-type order (`order::bson_lt`, the same relation `ordering._SortKey`
+/// uses — bool > string > number > …). `None` defers only a genuinely
+/// unorderable pair (DBPointer, an unclassifiable Decimal128).
 fn update_extreme(cur: &mut Option<Bson>, v: Bson, want: Ordering) -> R<()> {
     if is_null(&v) {
         return Ok(()); // null never updates and never "unsets"
     }
     match cur {
         None => *cur = Some(v),
-        Some(existing) => match expressions::py_order(&v, existing).map_err(|_| ())? {
-            Some(ord) if ord == want => *cur = Some(v),
-            Some(_) => {}
-            None => return Err(()), // Python's `v > cur` would TypeError -> defer
-        },
+        Some(existing) => {
+            // $max replaces when existing < v; $min when v < existing.
+            let replace = match want {
+                Ordering::Greater => crate::order::bson_lt(existing, &v),
+                _ => crate::order::bson_lt(&v, existing),
+            };
+            match replace {
+                Some(true) => *cur = Some(v),
+                Some(false) => {}
+                None => return Err(()),
+            }
+        }
     }
     Ok(())
 }
@@ -591,19 +708,24 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 out.insert(field.to_string(), int_to_bson(n as i128).ok_or(())?);
             }
             Acc::Avg(state) => {
-                // Field absent when no non-null value was seen (matches Python,
-                // where the bucket key is never created).
-                if let Some((total, count)) = state {
-                    let tf = match total {
-                        Num::Int { v: a, .. } => {
-                            if a.unsigned_abs() > (1u128 << 53) {
-                                return Err(()); // precision: defer to Python int/int divide
+                // All-non-numeric group -> null (mongod), matching Python's
+                // always-created avg state finalising to null.
+                match state {
+                    Some((total, count)) => {
+                        let tf = match total {
+                            Num::Int { v: a, .. } => {
+                                if a.unsigned_abs() > (1u128 << 53) {
+                                    return Err(()); // precision: defer to Python int/int divide
+                                }
+                                a as f64
                             }
-                            a as f64
-                        }
-                        Num::Float(f) => f,
-                    };
-                    out.insert(field.to_string(), Bson::Double(tf / count as f64));
+                            Num::Float(f) => f,
+                        };
+                        out.insert(field.to_string(), Bson::Double(tf / count as f64));
+                    }
+                    None => {
+                        out.insert(field.to_string(), Bson::Null);
+                    }
                 }
             }
             Acc::Min(v) | Acc::Max(v) => {
@@ -629,6 +751,16 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                     let v = std_dev(&values, pop).map_or(Bson::Null, Bson::Double);
                     out.insert(field.to_string(), v);
                 }
+            }
+            Acc::Percentile {
+                is_median,
+                ps,
+                values,
+            } => {
+                out.insert(
+                    field.to_string(),
+                    percentile_finalize(is_median, ps, values),
+                );
             }
             Acc::NElem { kind, n, vals } => {
                 out.insert(
@@ -687,6 +819,11 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
         Acc::MergeObjects(merged) => Bson::Document(merged),
         // A window writes a value into every row: empty / degenerate -> null.
         Acc::StdDev { values, pop } => std_dev(&values, pop).map_or(Bson::Null, Bson::Double),
+        Acc::Percentile {
+            is_median,
+            ps,
+            values,
+        } => percentile_finalize(is_median, ps, values),
         Acc::NElem { kind, n, vals } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
         Acc::TopN {
             kind,
@@ -695,6 +832,120 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
             items,
         } => topn_result(kind, n.unwrap_or(1), &dirs, items)?,
     })
+}
+
+/// Accumulator ops that take a **single expression argument** and reach no
+/// document field except through `$path` strings inside that argument. For
+/// these, walking the argument with [`collect_fields`] yields a complete set of
+/// the top-level fields the accumulator reads. Deliberately excludes
+/// `$top`/`$topN`/`$bottom`/`$bottomN` — those carry a `sortBy: {field: 1}`
+/// whose field is a bare *key*, not a `$field` string, so a field walk would
+/// miss it. Anything not listed defers to a full decode (correct, just no raw
+/// speedup); new accumulators default to that safe path.
+const SIMPLE_ACCUMULATORS: &[&str] = &[
+    "$sum",
+    "$avg",
+    "$min",
+    "$max",
+    "$first",
+    "$last",
+    "$push",
+    "$addToSet",
+    "$mergeObjects",
+    "$stdDevPop",
+    "$stdDevSamp",
+    "$count",
+];
+
+/// The set of top-level document fields a `$group` spec reads — or `None` when
+/// an expression references the whole document (`$$ROOT`/`$$CURRENT`), accesses
+/// a field by computed/implicit name (`$getField`/`$setField`/`$unsetField`),
+/// or uses an accumulator outside [`SIMPLE_ACCUMULATORS`]. When `Some(fields)`,
+/// decoding **only** `fields` from each input document and running the ordinary
+/// [`group_stage`] on the result is byte-identical to running it on the fully
+/// decoded documents, because every field path the evaluator can reach is
+/// present with its original value (an absent field decodes to the same
+/// "missing" either way). This is the pushdown that lets the command layer skip
+/// materializing untouched fields of wide documents ahead of a `$group`.
+pub fn referenced_top_level_fields(spec: &Bson) -> Option<std::collections::BTreeSet<String>> {
+    let Bson::Document(s) = spec else {
+        return None;
+    };
+    // No `_id` → `group_stage` errors and defers anyway; don't special-case it.
+    s.get("_id")?;
+    let mut fields = std::collections::BTreeSet::new();
+    for (k, v) in s {
+        if k == "_id" {
+            if !collect_fields(v, &mut fields) {
+                return None;
+            }
+        } else {
+            // Accumulator: must be a single-op doc `{$op: arg}`.
+            let Bson::Document(acc) = v else {
+                return None;
+            };
+            if acc.len() != 1 {
+                return None;
+            }
+            let (op, arg) = acc.iter().next().unwrap();
+            if !SIMPLE_ACCUMULATORS.contains(&op.as_str()) {
+                return None;
+            }
+            if !collect_fields(arg, &mut fields) {
+                return None;
+            }
+        }
+    }
+    Some(fields)
+}
+
+/// Walk an aggregation expression, inserting the top-level component of every
+/// `$field.path` string into `out`. Returns `false` to signal the caller must
+/// full-decode: a `$$ROOT`/`$$CURRENT`/`$$REMOVE` whole-document reference, or a
+/// `$getField`/`$setField`/`$unsetField`/`$function`/`$accumulator` operator
+/// that can read a field by a name not expressed as a `$path` string. Local
+/// variables (`$$this`, `$$value`, `$let` bindings, `$map`/`$filter` `as`) are
+/// ignored: they resolve to array elements or already-evaluated values, never
+/// to a top-level document field, and the arrays/values they range over are
+/// themselves reached through `$path` strings collected here.
+fn collect_fields(expr: &Bson, out: &mut std::collections::BTreeSet<String>) -> bool {
+    match expr {
+        Bson::String(s) => {
+            if let Some(var) = s.strip_prefix("$$") {
+                let base = var.split('.').next().unwrap_or(var);
+                // Whole-doc / field-removal system vars can't be bounded.
+                !matches!(base, "ROOT" | "CURRENT" | "REMOVE")
+            } else if let Some(path) = s.strip_prefix('$') {
+                if !path.is_empty() {
+                    let top = path.split('.').next().unwrap_or(path);
+                    out.insert(top.to_string());
+                }
+                true
+            } else {
+                true // plain string constant
+            }
+        }
+        Bson::Array(a) => a.iter().all(|e| collect_fields(e, out)),
+        Bson::Document(d) => {
+            if d.len() == 1 {
+                let (k, v) = d.iter().next().unwrap();
+                if k == "$literal" {
+                    return true; // argument is opaque data, never a field path
+                }
+                if matches!(
+                    k.as_str(),
+                    "$getField" | "$setField" | "$unsetField" | "$function" | "$accumulator"
+                ) {
+                    return false; // computed / implicit-CURRENT field access
+                }
+                if k.starts_with('$') {
+                    return collect_fields(v, out);
+                }
+            }
+            d.values().all(|v| collect_fields(v, out))
+        }
+        _ => true,
+    }
 }
 
 /// Compile the accumulator specs (each must be a single-op doc) and run the
@@ -773,6 +1024,15 @@ pub fn group_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Doc
 /// `count` descending (ties keep group insertion order, matching Python's
 /// `list.sort(reverse=True)` stability).
 pub fn sort_by_count_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+    // mongod: a $-prefixed path string, or a single-`$`-key expression object;
+    // anything else (number/bool/array/null -> 40149, bare string -> 40148,
+    // non-expression object -> 40147) defers so Python raises the exact code.
+    match spec {
+        Bson::String(s) if s.starts_with('$') => {}
+        Bson::Document(d)
+            if d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$')) => {}
+        _ => return Err(()),
+    }
     let count_acc = bson::doc! {"$sum": 1i32};
     let accumulators = vec![("count".to_string(), Bson::Document(count_acc))];
     let mut grouped = run_group(spec, &accumulators, docs, vars)?;
@@ -820,22 +1080,63 @@ fn accumulate_into(
 /// `expressions::py_order`, so cross-type / Decimal128 / array-doc boundaries
 /// defer rather than guess), falling to `default` when unplaced, then run the
 /// `output` accumulators per bucket.
+/// Canonical type name for a `$bucket` boundary — the numeric BSON types collapse
+/// to one bracket (mongod requires all boundaries the same type).
+fn bucket_ctype(v: &Bson) -> &'static str {
+    match v {
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => "number",
+        other => crate::query::bson_type_name(other),
+    }
+}
+
 pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
         return Err(());
     };
-    let group_by = s.get("groupBy").cloned().unwrap_or(Bson::Null);
+    let group_by = match s.get("groupBy") {
+        None | Some(Bson::Null) => return Err(()), // missing groupBy -> Python raises 40198
+        Some(v) => v.clone(),
+    };
     let Some(Bson::Array(boundaries)) = s.get("boundaries") else {
         return Err(()); // missing / non-array boundaries -> Python raises
     };
     if boundaries.len() < 2 {
         return Err(());
     }
+    // Boundaries must all be the same canonical type (40193) and strictly
+    // ascending (40194) -- previously unsorted/mixed boundaries were accepted.
+    let ct0 = bucket_ctype(&boundaries[0]);
+    for w in boundaries.windows(2) {
+        if bucket_ctype(&w[1]) != ct0 {
+            return Err(());
+        }
+        if !matches!(
+            expressions::py_order(&w[0], &w[1]).map_err(|_| ())?,
+            Some(Ordering::Less)
+        ) {
+            return Err(());
+        }
+    }
     // `default is not None` — an explicit null default counts as absent.
     let default = match s.get("default") {
         None | Some(Bson::Null) => None,
         Some(v) => Some(v.clone()),
     };
+    if let Some(dv) = &default {
+        // default must lie outside [first, last) -- below the first boundary or
+        // >= the last (mongod 40199).
+        let below = matches!(
+            expressions::py_order(dv, &boundaries[0]).map_err(|_| ())?,
+            Some(Ordering::Less)
+        );
+        let below_last = matches!(
+            expressions::py_order(dv, &boundaries[boundaries.len() - 1]).map_err(|_| ())?,
+            Some(Ordering::Less)
+        );
+        if !below && below_last {
+            return Err(());
+        }
+    }
     let default_output = bson::doc! {"count": {"$sum": 1i32}};
     let output_spec: &Document = match s.get("output") {
         Some(Bson::Document(d)) if !d.is_empty() => d,
@@ -889,8 +1190,11 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
             }
         }
         if !put {
-            if let Some(di) = default_idx {
-                placed[di].push(d);
+            match default_idx {
+                Some(di) => placed[di].push(d),
+                // No matching bucket and no default: mongod errors (Python raises
+                // 7158303). Previously the document was silently DROPPED.
+                None => return Err(()),
             }
         }
     }
@@ -916,6 +1220,280 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
 /// `aggregate._stage_bucket_auto`: a pure count-chunking — documents that share a
 /// boundary value are *not* coalesced into one bucket (so N equal values still
 /// split across buckets), matching the Python server.
+// mongod's preferred-number rounding series for $bucketAuto `granularity`,
+// stored exactly as mongod stores them (integer-valued doubles) so that
+// `series_element * multiplier` reproduces mongod's f64 boundaries bit-for-bit.
+// Mirrors `secantus.aggregate._BUCKET_AUTO_SERIES`; verified hex-exact against
+// mongod 7.0.12. See `granularity_rounder_preferred_numbers.cpp`.
+fn series_for(name: &str) -> Option<&'static [f64]> {
+    Some(match name {
+        "R5" => &[10.0, 16.0, 25.0, 40.0, 63.0],
+        "R10" => &[
+            100.0, 125.0, 160.0, 200.0, 250.0, 315.0, 400.0, 500.0, 630.0, 800.0,
+        ],
+        "R20" => &[
+            100.0, 112.0, 125.0, 140.0, 160.0, 180.0, 200.0, 224.0, 250.0, 280.0, 315.0, 355.0,
+            400.0, 450.0, 500.0, 560.0, 630.0, 710.0, 800.0, 900.0,
+        ],
+        "R40" => &[
+            100.0, 106.0, 112.0, 118.0, 125.0, 132.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0,
+            200.0, 212.0, 224.0, 236.0, 250.0, 265.0, 280.0, 300.0, 315.0, 355.0, 375.0, 400.0,
+            425.0, 450.0, 475.0, 500.0, 530.0, 560.0, 600.0, 630.0, 670.0, 710.0, 750.0, 800.0,
+            850.0, 900.0, 950.0,
+        ],
+        "R80" => &[
+            103.0, 109.0, 115.0, 122.0, 128.0, 136.0, 145.0, 155.0, 165.0, 175.0, 185.0, 195.0,
+            206.0, 218.0, 230.0, 243.0, 258.0, 272.0, 290.0, 307.0, 325.0, 345.0, 365.0, 387.0,
+            412.0, 437.0, 462.0, 487.0, 515.0, 545.0, 575.0, 615.0, 650.0, 690.0, 730.0, 775.0,
+            825.0, 875.0, 925.0, 975.0,
+        ],
+        "1-2-5" => &[10.0, 20.0, 50.0],
+        "E6" => &[10.0, 15.0, 22.0, 33.0, 47.0, 68.0],
+        "E12" => &[
+            10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 39.0, 47.0, 56.0, 68.0, 82.0,
+        ],
+        "E24" => &[
+            10.0, 11.0, 12.0, 13.0, 15.0, 16.0, 18.0, 20.0, 22.0, 24.0, 27.0, 30.0, 33.0, 36.0,
+            39.0, 43.0, 47.0, 51.0, 56.0, 62.0, 68.0, 75.0, 82.0, 91.0,
+        ],
+        "E48" => &[
+            100.0, 105.0, 110.0, 115.0, 121.0, 127.0, 133.0, 140.0, 147.0, 154.0, 162.0, 169.0,
+            178.0, 187.0, 196.0, 205.0, 215.0, 226.0, 237.0, 249.0, 261.0, 274.0, 287.0, 301.0,
+            316.0, 332.0, 348.0, 365.0, 383.0, 402.0, 422.0, 442.0, 464.0, 487.0, 511.0, 536.0,
+            562.0, 590.0, 619.0, 649.0, 681.0, 715.0, 750.0, 787.0, 825.0, 866.0, 909.0, 953.0,
+        ],
+        "E96" => &[
+            100.0, 102.0, 105.0, 107.0, 110.0, 113.0, 115.0, 118.0, 121.0, 124.0, 127.0, 130.0,
+            133.0, 137.0, 140.0, 143.0, 147.0, 150.0, 154.0, 158.0, 162.0, 165.0, 169.0, 174.0,
+            178.0, 182.0, 187.0, 191.0, 196.0, 200.0, 205.0, 210.0, 215.0, 221.0, 226.0, 232.0,
+            237.0, 243.0, 249.0, 255.0, 261.0, 267.0, 274.0, 280.0, 287.0, 294.0, 301.0, 309.0,
+            316.0, 324.0, 332.0, 340.0, 348.0, 357.0, 365.0, 374.0, 383.0, 392.0, 402.0, 412.0,
+            422.0, 432.0, 442.0, 453.0, 464.0, 475.0, 487.0, 499.0, 511.0, 523.0, 536.0, 549.0,
+            562.0, 576.0, 590.0, 604.0, 619.0, 634.0, 649.0, 665.0, 681.0, 698.0, 715.0, 732.0,
+            750.0, 768.0, 787.0, 806.0, 825.0, 845.0, 866.0, 887.0, 909.0, 931.0, 953.0, 976.0,
+        ],
+        "E192" => &[
+            100.0, 101.0, 102.0, 104.0, 105.0, 106.0, 107.0, 109.0, 110.0, 111.0, 113.0, 114.0,
+            115.0, 117.0, 118.0, 120.0, 121.0, 123.0, 124.0, 126.0, 127.0, 129.0, 130.0, 132.0,
+            133.0, 135.0, 137.0, 138.0, 140.0, 142.0, 143.0, 145.0, 147.0, 149.0, 150.0, 152.0,
+            154.0, 156.0, 158.0, 160.0, 162.0, 164.0, 165.0, 167.0, 169.0, 172.0, 174.0, 176.0,
+            178.0, 180.0, 182.0, 184.0, 187.0, 189.0, 191.0, 193.0, 196.0, 198.0, 200.0, 203.0,
+            205.0, 208.0, 210.0, 213.0, 215.0, 218.0, 221.0, 223.0, 226.0, 229.0, 232.0, 234.0,
+            237.0, 240.0, 243.0, 246.0, 249.0, 252.0, 255.0, 258.0, 261.0, 264.0, 267.0, 271.0,
+            274.0, 277.0, 280.0, 284.0, 287.0, 291.0, 294.0, 298.0, 301.0, 305.0, 309.0, 312.0,
+            316.0, 320.0, 324.0, 328.0, 332.0, 336.0, 340.0, 344.0, 348.0, 352.0, 357.0, 361.0,
+            365.0, 370.0, 374.0, 379.0, 383.0, 388.0, 392.0, 397.0, 402.0, 407.0, 412.0, 417.0,
+            422.0, 427.0, 432.0, 437.0, 442.0, 448.0, 453.0, 459.0, 464.0, 470.0, 475.0, 481.0,
+            487.0, 493.0, 499.0, 505.0, 511.0, 517.0, 523.0, 530.0, 536.0, 542.0, 549.0, 556.0,
+            562.0, 569.0, 576.0, 583.0, 590.0, 597.0, 604.0, 612.0, 619.0, 626.0, 634.0, 642.0,
+            649.0, 657.0, 665.0, 673.0, 681.0, 690.0, 698.0, 706.0, 715.0, 723.0, 732.0, 741.0,
+            750.0, 759.0, 768.0, 777.0, 787.0, 796.0, 806.0, 816.0, 825.0, 835.0, 845.0, 856.0,
+            866.0, 876.0, 887.0, 898.0, 909.0, 920.0, 931.0, 942.0, 953.0, 965.0, 976.0, 988.0,
+        ],
+        _ => return None,
+    })
+}
+
+fn is_valid_granularity(name: &str) -> bool {
+    name == "POWERSOF2" || series_for(name).is_some()
+}
+
+/// mongod `GranularityRounderPreferredNumbers::roundUp` (double path).
+fn round_up_series(number: f64, series: &[f64]) -> f64 {
+    if number == 0.0 || number == f64::INFINITY {
+        return number;
+    }
+    let mut multiplier = 1.0;
+    while number >= series[series.len() - 1] * multiplier {
+        multiplier *= 10.0;
+    }
+    while number < series[0] * multiplier {
+        let previous_min = series[0] * multiplier;
+        multiplier /= 10.0;
+        if number >= series[series.len() - 1] * multiplier {
+            return previous_min;
+        }
+    }
+    // smallest series element with number < series*multiplier (strict upper bound)
+    for &s in series {
+        if number < s * multiplier {
+            return s * multiplier;
+        }
+    }
+    series[series.len() - 1] * multiplier
+}
+
+/// mongod `GranularityRounderPreferredNumbers::roundDown` (double path).
+fn round_down_series(number: f64, series: &[f64]) -> f64 {
+    if number == 0.0 || number == f64::INFINITY {
+        return number;
+    }
+    let mut multiplier = 1.0;
+    while number <= series[0] * multiplier {
+        multiplier /= 10.0;
+    }
+    if multiplier == 0.0 {
+        return 0.0;
+    }
+    while number > series[series.len() - 1] * multiplier {
+        let previous_max = series[series.len() - 1] * multiplier;
+        multiplier *= 10.0;
+        if number <= series[0] * multiplier {
+            return previous_max;
+        }
+    }
+    // largest series element with series*multiplier < number (strict)
+    let mut prev = series[0] * multiplier;
+    for &s in &series[1..] {
+        let scaled = s * multiplier;
+        if scaled >= number {
+            return prev;
+        }
+        prev = scaled;
+    }
+    prev
+}
+
+/// mongod `GranularityRounderPowersOfTwo` (double path).
+fn round_up_pow2(v: f64) -> f64 {
+    if v == 0.0 || v == f64::INFINITY {
+        return v;
+    }
+    2.0_f64.powf(v.log2().floor() + 1.0)
+}
+
+fn round_down_pow2(v: f64) -> f64 {
+    if v == 0.0 || v == f64::INFINITY {
+        return v;
+    }
+    2.0_f64.powf(v.log2().ceil() - 1.0)
+}
+
+/// Coerce a groupBy value to the double mongod's rounder works on, or `Err(())`
+/// (defer) for a value mongod would reject (non-numeric / NaN / negative) or a
+/// Decimal128 (the standing precision deferral). The Python engine raises the
+/// exact 40258 / 40259 / 40260; on the Rust server a defer surfaces as BadValue.
+fn granularity_coerce(v: &Bson) -> R<f64> {
+    let f = match v {
+        Bson::Int32(n) => *n as f64,
+        Bson::Int64(n) => *n as f64,
+        Bson::Double(d) => *d,
+        _ => return Err(()),
+    };
+    if f.is_nan() || f < 0.0 {
+        return Err(());
+    }
+    Ok(f)
+}
+
+/// mongod `DocumentSourceBucketAuto::populateNextBucket` with a granularity
+/// rounder. Mirrors `secantus.aggregate._bucket_auto_granular`; hex-exact vs
+/// mongod 7.0.12.
+fn bucket_auto_granular(
+    keyed: &[(Vec<u8>, Bson, &Document)],
+    n_buckets: usize,
+    granularity: &str,
+    output_spec: &Document,
+    vars: &Document,
+) -> R<Vec<Document>> {
+    let n = keyed.len();
+    let mut values: Vec<f64> = Vec::with_capacity(n);
+    for (_, v, _) in keyed {
+        values.push(granularity_coerce(v)?);
+    }
+    let is_pow2 = granularity == "POWERSOF2";
+    let series: &[f64] = if is_pow2 {
+        &[]
+    } else {
+        series_for(granularity).ok_or(())?
+    };
+    let rup = |x: f64| {
+        if is_pow2 {
+            round_up_pow2(x)
+        } else {
+            round_up_series(x, series)
+        }
+    };
+    let rdn = |x: f64| {
+        if is_pow2 {
+            round_down_pow2(x)
+        } else {
+            round_down_series(x, series)
+        }
+    };
+
+    let mut approx = (n as f64 / n_buckets as f64 + 0.5).floor() as i64; // std::round (positive)
+    if approx < 1 {
+        approx = 1;
+    }
+
+    let mut out: Vec<Document> = Vec::new();
+    let mut idx = 0usize;
+    let mut previous_max: Option<f64> = None;
+    let mut carry: Option<usize> = None;
+    let mut bucket_num = 0usize;
+    loop {
+        bucket_num += 1;
+        if carry.is_none() && idx >= n {
+            break;
+        }
+        let cur_i = if let Some(c) = carry {
+            c
+        } else {
+            let c = idx;
+            idx += 1;
+            c
+        };
+        let cur_min = previous_max.unwrap_or_else(|| rdn(values[cur_i]));
+        let mut cur_max = values[cur_i];
+        let mut chunk: Vec<usize> = vec![cur_i];
+        let is_last = bucket_num == n_buckets;
+        let mut i = 1i64;
+        while idx < n && (i < approx || is_last) {
+            cur_max = values[idx];
+            chunk.push(idx);
+            idx += 1;
+            i += 1;
+        }
+        let mut next_i: Option<usize> = if idx < n {
+            let c = idx;
+            idx += 1;
+            Some(c)
+        } else {
+            None
+        };
+        let boundary = rup(cur_max);
+        // Absorb values that now fall below the rounded boundary (boundary fixed).
+        while let Some(ni) = next_i {
+            if boundary > values[ni] {
+                chunk.push(ni);
+                next_i = if idx < n {
+                    let c = idx;
+                    idx += 1;
+                    Some(c)
+                } else {
+                    None
+                };
+            } else {
+                break;
+            }
+        }
+        let bucket_max = match next_i {
+            Some(ni) if boundary == 0.0 => rdn(values[ni]),
+            _ => boundary,
+        };
+        let id = Bson::Document(bson::doc! { "min": cur_min, "max": bucket_max });
+        let chunk_docs: Vec<&Document> = chunk.iter().map(|&ci| keyed[ci].2).collect();
+        out.push(accumulate_into(id, output_spec, &chunk_docs, vars)?);
+        previous_max = Some(bucket_max);
+        carry = next_i;
+        if carry.is_none() && idx >= n {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
         return Err(());
@@ -923,15 +1501,25 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
     let Some(group_by) = s.get("groupBy") else {
         return Err(());
     };
+    // buckets: a positive integer, or a whole double (mongod accepts 2.0). Any
+    // other value (bool, fractional double, non-positive, non-number, missing)
+    // defers so Python raises the exact code (40241/40242/40243/40246).
     let n_buckets = match s.get("buckets") {
         Some(Bson::Int32(n)) if *n >= 1 => *n as usize,
         Some(Bson::Int64(n)) if *n >= 1 => *n as usize,
+        Some(Bson::Double(d)) if d.fract() == 0.0 && *d >= 1.0 => *d as usize,
         _ => return Err(()),
     };
     let default_output = bson::doc! {"count": {"$sum": 1i32}};
     let output_spec: &Document = match s.get("output") {
         Some(Bson::Document(d)) if !d.is_empty() => d,
         None | Some(Bson::Document(_)) => &default_output,
+        Some(_) => return Err(()),
+    };
+    // A non-string / unknown granularity defers so Python raises 40261 / 40257.
+    let granularity: Option<&str> = match s.get("granularity") {
+        None => None,
+        Some(Bson::String(g)) if is_valid_granularity(g) => Some(g.as_str()),
         Some(_) => return Err(()),
     };
 
@@ -950,6 +1538,10 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     if keyed.is_empty() {
         return Ok(Vec::new());
+    }
+
+    if let Some(gran) = granularity {
+        return bucket_auto_granular(&keyed, n_buckets, gran, output_spec, vars);
     }
 
     let bucket_size = std::cmp::max(1, keyed.len() / n_buckets);
@@ -1011,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn avg_is_double_and_absent_when_all_null() {
+    fn avg_is_double_and_null_when_no_numeric() {
         let out = g(
             bson::bson!({"_id": Bson::Null, "a": {"$avg": "$v"}}),
             vec![doc! {"v": 2i32}, doc! {"v": 4i32}],
@@ -1021,7 +1613,7 @@ mod tests {
             bson::bson!({"_id": Bson::Null, "a": {"$avg": "$missing"}}),
             vec![doc! {"v": 2i32}],
         );
-        assert!(out2[0].get("a").is_none()); // field absent
+        assert_eq!(out2[0].get("a"), Some(&Bson::Null)); // mongod: null, not absent
     }
 
     #[test]
@@ -1154,13 +1746,51 @@ mod tests {
     }
 
     #[test]
-    fn min_cross_type_defers() {
-        assert!(group_stage(
-            &bson::bson!({"_id": Bson::Null, "m": {"$min": "$v"}}),
-            &[doc! {"v": 1i32}, doc! {"v": "x"}],
-            &Document::new()
+    fn min_max_cross_type_bson_order() {
+        // mongod orders every non-null value by BSON cross-type order
+        // (number < string < bool), no longer deferring a mixed group.
+        let docs = [
+            doc! {"v": 10i32},
+            doc! {"v": "x"},
+            doc! {"v": true},
+            doc! {"v": Bson::Null},
+        ];
+        let out = group_stage(
+            &bson::bson!({"_id": Bson::Null, "mn": {"$min": "$v"}, "mx": {"$max": "$v"}}),
+            &docs,
+            &Document::new(),
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(out[0].get("mn"), Some(&Bson::Int32(10))); // smallest = number
+        assert_eq!(out[0].get("mx"), Some(&Bson::Boolean(true))); // largest = bool
+    }
+
+    #[test]
+    fn sum_avg_ignore_non_numeric() {
+        let docs = [
+            doc! {"v": 10i32},
+            doc! {"v": "hi"},
+            doc! {"v": true},
+            doc! {"v": Bson::Null},
+            doc! {"v": 2.5f64},
+        ];
+        let out = group_stage(
+            &bson::bson!({"_id": Bson::Null, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}}),
+            &docs,
+            &Document::new(),
+        )
+        .unwrap();
+        assert_eq!(out[0].get("s"), Some(&Bson::Double(12.5))); // 10 + 2.5
+        assert_eq!(out[0].get("a"), Some(&Bson::Double(6.25))); // (10 + 2.5) / 2
+                                                                // An all-non-numeric group: $sum -> 0, $avg -> null.
+        let out2 = group_stage(
+            &bson::bson!({"_id": Bson::Null, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}}),
+            &[doc! {"v": "x"}, doc! {"v": true}],
+            &Document::new(),
+        )
+        .unwrap();
+        assert_eq!(out2[0].get("s"), Some(&Bson::Int32(0)));
+        assert_eq!(out2[0].get("a"), Some(&Bson::Null));
     }
 
     #[test]

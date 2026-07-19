@@ -344,21 +344,24 @@ _TYPLEN: dict[int, int] = {
 
 
 def row_description(
-    columns: list[tuple[str, int]],
+    columns: list[tuple[str, int] | tuple[str, int, int]],
     formats: list[int] | None = None,
     encoding: str | None = None,
 ) -> bytes:
-    """``columns`` is a list of (name, type_oid); ``formats`` the per-column result
-    format codes (0=text, 1=binary), defaulting to all-text. Column names encode
-    in the client's ``client_encoding`` (``encoding``; UTF-8 when None)."""
+    """``columns`` is a list of (name, type_oid[, typmod]); ``formats`` the
+    per-column result format codes (0=text, 1=binary), defaulting to all-text.
+    Column names encode in the client's ``client_encoding`` (``encoding``;
+    UTF-8 when None). A missing typmod emits -1 (no modifier)."""
     payload = bytearray(_INT16.pack(len(columns)))
-    for i, (name, type_oid) in enumerate(columns):
+    for i, col in enumerate(columns):
+        name, type_oid = col[0], col[1]
+        typmod = col[2] if len(col) > 2 else -1
         payload += name.encode(encoding or "utf-8", errors="replace") + b"\x00"
         payload += _INT32.pack(0)  # table OID (unknown)
         payload += _INT16.pack(0)  # column attribute number
         payload += _INT32.pack(type_oid)
         payload += _INT16.pack(_TYPLEN.get(type_oid, -1))  # type size
-        payload += _INT32.pack(-1)  # type modifier
+        payload += _INT32.pack(typmod)  # type modifier
         payload += _INT16.pack(formats[i] if formats is not None else 0)  # 0=text, 1=binary
     return _msg("T", bytes(payload))
 
@@ -388,11 +391,45 @@ def empty_query_response() -> bytes:
 
 
 def error_response(
-    sqlstate: str, message: str, severity: str = "ERROR", encoding: str | None = "utf-8"
+    sqlstate: str,
+    message: str,
+    severity: str = "ERROR",
+    encoding: str | None = "utf-8",
+    *,
+    diag: dict[str, str] | None = None,
+    position: int | None = None,
 ) -> bytes:
     # ErrorResponse is a sequence of (field-type byte, value cstring), ending
     # with a single NUL. S/V severity, C SQLSTATE, M human message are the
-    # minimum libpq surfaces.
+    # minimum libpq surfaces; ``diag`` adds the optional identity fields
+    # (s=schema, t=table, c=column, n=constraint, d=datatype) and ``position``
+    # the 1-based statement position (clients render the LINE context from it).
+    payload = bytearray(
+        b"S"
+        + _cstr(severity)
+        + b"V"
+        + _cstr(severity)
+        + b"C"
+        + _cstr(sqlstate)
+        + b"M"
+        + encode_text(message, encoding, lossy=True)
+        + b"\x00"
+    )
+    for key, value in (diag or {}).items():
+        if value:
+            payload += key.encode("ascii") + encode_text(str(value), encoding, lossy=True) + b"\x00"
+    if position is not None and position > 0:
+        payload += b"P" + _cstr(str(position))
+    payload += b"\x00"
+    return _msg("E", bytes(payload))
+
+
+def notice_response(
+    message: str,
+    severity: str = "NOTICE",
+    sqlstate: str = "00000",
+    encoding: str | None = "utf-8",
+) -> bytes:
     payload = (
         b"S"
         + _cstr(severity)
@@ -405,11 +442,6 @@ def error_response(
         + b"\x00"
         + b"\x00"
     )
-    return _msg("E", payload)
-
-
-def notice_response(message: str) -> bytes:
-    payload = b"S" + _cstr("NOTICE") + b"M" + _cstr(message) + b"\x00"
     return _msg("N", payload)
 
 

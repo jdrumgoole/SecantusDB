@@ -79,6 +79,25 @@ def _mkdate(ms):
 
 # (expr, doc) pairs over the ported operator core.
 CURATED = [
+    # $sum/$avg/$max/$min as expression operators (MongoDB 5.0+) — Rust must
+    # compute the SAME value + numeric width as Python (int32/int64/double).
+    ({"$sum": "$arr"}, {"arr": [1, 2, 3]}),  # int32 result
+    ({"$sum": "$arr"}, {"arr": [1, Int64(2), 3]}),  # int64-widened result
+    ({"$sum": "$arr"}, {"arr": [1, 2.5, 3]}),  # double result
+    ({"$sum": "$n"}, {"n": 5}),  # scalar
+    ({"$sum": ["$n", 10, "skip", True]}, {"n": 5}),  # ignore non-numeric + bool
+    ({"$sum": "$x"}, {}),  # missing -> 0
+    ({"$sum": "$arr"}, {"arr": []}),  # empty -> 0
+    ({"$avg": "$arr"}, {"arr": [1, 2, 3]}),  # -> 2.0 (double)
+    ({"$avg": "$arr"}, {"arr": [2, 4]}),
+    ({"$avg": "$arr"}, {"arr": []}),  # empty -> null
+    ({"$avg": "$s"}, {"s": "x"}),  # non-numeric -> null
+    ({"$max": "$arr"}, {"arr": [3, 1, 2]}),
+    ({"$min": "$arr"}, {"arr": [3, 1, 2]}),
+    ({"$max": "$arr"}, {"arr": [1, "a", True]}),  # cross-type BSON order
+    ({"$min": "$arr"}, {"arr": [3, None, 1]}),  # null ignored
+    ({"$max": "$arr"}, {"arr": []}),  # empty -> null
+    ({"$max": "$n"}, {"n": 5}),  # scalar
     # Bitwise ($bitAnd/$bitOr/$bitXor/$bitNot) — int/long, empty-list identity,
     # null propagation, mixed int/long result width. Non-int operands defer.
     ({"$bitAnd": ["$a", "$b"]}, {"a": 12, "b": 10}),
@@ -172,6 +191,19 @@ CURATED = [
     ({"$last": "$a"}, {"a": [1, 2]}),
     ({"$concatArrays": [[1, 2], [3]]}, {}),
     ({"$reverseArray": [1, 2, 3]}, {}),
+    # Non-array input: Rust defers (None), Python raises the per-op code; null /
+    # missing input yields null on both.
+    ({"$first": 5}, {}),
+    ({"$last": "$a"}, {"a": "x"}),
+    ({"$first": "$x"}, {}),  # missing -> null
+    ({"$reverseArray": 5}, {}),
+    ({"$reverseArray": None}, {}),  # null -> null
+    ({"$concatArrays": [[1], 5]}, {}),
+    ({"$concatArrays": [[1], None]}, {}),  # null operand -> null
+    ({"$map": {"input": 5, "in": "$$this"}}, {}),
+    ({"$map": {"input": None, "in": "$$this"}}, {}),  # null -> null
+    ({"$filter": {"input": 5, "cond": True}}, {}),
+    ({"$reduce": {"input": 5, "initialValue": 0, "in": "$$value"}}, {}),
     # $sortArray. Int form: homogeneous / numeric scalars (Python's native sort
     # raises on docs or incomparable mixes, so the corpus avoids those). Doc form
     # uses BSON sort order on the named fields.
@@ -200,13 +232,25 @@ CURATED = [
     # String / array / object ops (now handled).
     ({"$concat": ["a", "b", "c"]}, {}),
     ({"$concat": ["x", "$a", "y"]}, {"a": "MID"}),
-    ({"$concat": ["a", None, "b"]}, {}),  # None -> ""
+    ({"$concat": ["a", None, "b"]}, {}),  # null operand -> null result
+    ({"$concat": ["a", "$nope", "b"]}, {}),  # missing -> null
+    # Non-string operand: Rust defers (None); Python raises 16702.
+    ({"$concat": ["a", 5]}, {}),
+    ({"$concat": ["a", True]}, {}),
+    ({"$concat": [5, None]}, {}),  # left-to-right: non-string before null -> raise
     ({"$toUpper": "$a"}, {"a": "hi"}),
     ({"$toLower": "HELLO"}, {}),
     ({"$toUpper": "$a"}, {"a": 123}),  # non-string passes through
     ({"$strLenCP": "hello"}, {}),
     ({"$split": ["a,b,c", ","]}, {}),
     ({"$split": ["$a", "-"]}, {"a": "1-2-3"}),
+    # Invalid $split: Rust defers (None); Python raises 40085/40086/40087/16020.
+    ({"$split": ["a,b", ""]}, {}),  # empty sep
+    ({"$split": [5, ","]}, {}),  # non-string first
+    ({"$split": ["a,b", 5]}, {}),  # non-string second
+    ({"$split": ["a,b"]}, {}),  # wrong arg count
+    ({"$split": [None, ","]}, {}),  # null string -> null (both compute)
+    ({"$split": ["a,b", None]}, {}),  # null sep -> null
     ({"$substrCP": ["hello", 1, 3]}, {}),
     ({"$substrCP": ["hello", 2, -1]}, {}),  # negative length -> to end
     ({"$substrCP": ["hello", 10, 2]}, {}),  # start past end -> ""
@@ -340,8 +384,22 @@ CURATED = [
     ({"$toInt": 3.9}, {}),
     ({"$toInt": "$n"}, {"n": -3.9}),
     ({"$toInt": True}, {}),
-    ({"$toInt": "$n"}, {"n": Int64(5)}),  # int64 returned unchanged
+    ({"$toInt": "$n"}, {"n": Int64(5)}),  # int64 -> int32 (mongod always yields int)
     ({"$toInt": "$x"}, {}),  # missing -> null
+    ({"$toInt": 3e9}, {}),  # > int32 max -> overflow (both defer)
+    ({"$toInt": "$n"}, {"n": Int64(2**40)}),  # int64 > int32 -> overflow
+    ({"$toInt": 2147483647.0}, {}),  # int32 max exactly -> ok
+    ({"$toInt": float("inf")}, {}),  # non-finite -> overflow (both defer)
+    # $toLong — int64 target: computes numeric cases, defers string/Decimal128/overflow.
+    ({"$toLong": 3.9}, {}),
+    ({"$toLong": "$n"}, {"n": -3.9}),
+    ({"$toLong": True}, {}),
+    ({"$toLong": 9_000_000_000.0}, {}),  # > int32, within int64 -> ok
+    ({"$toLong": "$n"}, {"n": Int64(2**40)}),  # int64 passes through
+    ({"$toLong": "$x"}, {}),  # missing -> null
+    ({"$toLong": 1e30}, {}),  # > int64 max -> overflow (both defer)
+    ({"$toLong": float("inf")}, {}),  # non-finite -> defer
+    ({"$toLong": "42"}, {}),  # string parse -> defer
     ({"$toDouble": 5}, {}),
     ({"$toDouble": False}, {}),
     ({"$toDouble": "$n"}, {"n": Int64(7)}),
@@ -379,6 +437,9 @@ CURATED = [
     ({"$convert": {"input": True, "to": "int"}}, {}),
     ({"$convert": {"input": 7.9, "to": "int"}}, {}),  # truncates
     ({"$convert": {"input": 5, "to": "long"}}, {}),  # -> Int64
+    ({"$convert": {"input": 3e9, "to": "int"}}, {}),  # > int32 -> overflow (defer)
+    ({"$convert": {"input": 9.3e18, "to": "long"}}, {}),  # > int64 -> overflow (defer)
+    ({"$convert": {"input": 1e30, "to": "int", "onError": "oops"}}, {}),  # overflow -> onError
     ({"$convert": {"input": "1234.5678", "to": "decimal"}}, {}),
     ({"$convert": {"input": 5, "to": "decimal"}}, {}),
     ({"$convert": {"input": 4.125, "to": "decimal"}}, {}),
@@ -403,6 +464,7 @@ CURATED = [
     ({"$toDate": "$n"}, {"n": Int64(1700000000000)}),  # int64 millis -> defer
     ({"$toDate": "$s"}, {"s": "2026-04-28T12:00:00"}),  # ISO string -> defer
     ({"$toDate": "$o"}, {"o": ObjectId("507f1f77bcf86cd799439011")}),  # objectId -> defer
+    ({"$toDate": True}, {}),  # bool -> defer (Python raises 241)
     # $regexMatch / $regexFind / $regexFindAll — ASCII patterns (byte offset ==
     # code-point idx), simple captures. The linear `regex` crate's leftmost-first
     # semantics align with Python `re` here.
@@ -434,6 +496,20 @@ CURATED = [
     ({"$abs": "$n"}, {"n": -5.5}),
     ({"$abs": -(2**31)}, {}),  # -> int64
     ({"$abs": "$x"}, {}),  # missing -> null
+    # Non-numeric operands defer (Rust None; Python raises 28765 / 51081). If the
+    # Rust core ever computed one, the harness would evaluate Python and surface
+    # the raise — so these pin "reject, don't coerce" on both engines.
+    ({"$abs": "$s"}, {"s": "x"}),  # string -> defer
+    ({"$abs": True}, {}),  # bool -> defer (no coercion to 1)
+    ({"$ceil": True}, {}),
+    ({"$floor": "$s"}, {"s": "x"}),
+    ({"$sqrt": True}, {}),
+    ({"$exp": True}, {}),
+    ({"$ln": "$s"}, {"s": "x"}),
+    ({"$log10": True}, {}),
+    ({"$trunc": True}, {}),
+    ({"$trunc": "$s"}, {"s": "x"}),
+    ({"$round": True}, {}),
     ({"$floor": 3.7}, {}),
     ({"$floor": -3.2}, {}),
     ({"$floor": 5}, {}),
@@ -441,7 +517,7 @@ CURATED = [
     ({"$ceil": -3.7}, {}),
     ({"$sqrt": 16}, {}),
     ({"$sqrt": 2}, {}),
-    ({"$sqrt": "$n"}, {"n": -1}),  # negative -> null
+    ({"$sqrt": "$n"}, {"n": -1}),  # negative -> defers (Python raises 28714)
     ({"$sqrt": 0}, {}),
     # $exp / $ln / $log (libm: Rust f64 and CPython math share the platform libm,
     # so the bits agree; the test asserts rust == py, not a literal).
@@ -450,17 +526,21 @@ CURATED = [
     ({"$exp": "$x"}, {}),  # missing -> null
     ({"$ln": 1}, {}),
     ({"$ln": "$n"}, {"n": 2.5}),
-    ({"$ln": 0}, {}),  # <= 0 -> null
-    ({"$ln": -3}, {}),  # -> null
+    ({"$ln": 0}, {}),  # <= 0 -> defers (Python raises 28766)
+    ({"$ln": -3}, {}),  # -> defers
     ({"$log": [8, 2]}, {}),
     ({"$log": [100, 10]}, {}),
-    ({"$log": [8, 1]}, {}),  # base 1 -> null
+    ({"$log": [8, 1]}, {}),  # base 1 -> defers (Python raises 28759)
     ({"$log": [None, 2]}, {}),  # null arg -> null
+    ({"$log": ["$s", 2]}, {"s": "x"}),  # non-numeric arg -> defer (28756)
+    ({"$log": [8, "$s"]}, {"s": "x"}),  # non-numeric base -> defer (28757)
+    ({"$log": [True, 2]}, {}),  # bool arg -> defer (no coercion)
+    ({"$log": [8, True]}, {}),  # bool base -> defer
     ({"$log10": 100}, {}),
     ({"$log10": 1000}, {}),
     ({"$log10": "$n"}, {"n": 2.5}),
-    ({"$log10": 0}, {}),  # <= 0 -> null
-    ({"$log10": -5}, {}),  # -> null
+    ({"$log10": 0}, {}),  # <= 0 -> defers (Python raises 28761)
+    ({"$log10": -5}, {}),  # -> defers
     ({"$log10": "$missing"}, {}),  # missing -> null
     # $pow: int**non-neg-int -> int; float operand / negative exp -> double.
     ({"$pow": [2, 10]}, {}),
@@ -551,6 +631,12 @@ CURATED = [
     ({"$strcasecmp": ["b", "a"]}, {}),
     ({"$strcasecmp": ["$n", "a"]}, {"n": None}),
     ({"$strcasecmp": ["café", "CAFÉ"]}, {}),  # non-ASCII -> defer
+    # mongod $toString-coerces operands: an int matches Python str(int) on both
+    # engines; null -> "". (double/date/bool coercion defers to Python.)
+    ({"$strcasecmp": [5, "a"]}, {}),
+    ({"$strcasecmp": ["a", 5]}, {}),
+    ({"$strcasecmp": [5, 10]}, {}),
+    ({"$strcasecmp": ["$n", "a"]}, {"n": 42}),
     # $replaceOne / $replaceAll.
     ({"$replaceOne": {"input": "abcabc", "find": "bc", "replacement": "X"}}, {}),
     ({"$replaceAll": {"input": "abcabc", "find": "bc", "replacement": "X"}}, {}),
@@ -686,6 +772,14 @@ CURATED = [
     ({"$indexOfCP": ["$s", "x"]}, {}),  # missing -> null
     ({"$indexOfBytes": ["héllo", "llo"]}, {}),  # byte index 3 (é is 2 bytes)
     ({"$indexOfBytes": ["abcabc", "c", 3, 6]}, {}),
+    ({"$indexOfBytes": ["abcabc", "b", 2.0]}, {}),  # whole-double start now computes
+    ({"$indexOfCP": ["abcabc", "b", 2.0]}, {}),
+    # Invalid start/end: Rust defers (None); Python raises 40096 / 40097.
+    ({"$indexOfBytes": ["abcabc", "b", 2.5]}, {}),  # fractional -> 40096
+    ({"$indexOfBytes": ["abcabc", "b", True]}, {}),  # bool -> 40096
+    ({"$indexOfBytes": ["abcabc", "b", -1]}, {}),  # negative -> 40097
+    ({"$indexOfCP": ["abcabc", "b", "x"]}, {}),  # non-numeric -> 40096
+    ({"$indexOfBytes": ["abcabc", "b", 0, -1]}, {}),  # negative end -> 40097
     ({"$substrBytes": ["hello", 1, 3]}, {}),
     ({"$substrBytes": ["héllo", 0, 1]}, {}),  # "h"
     ({"$substrBytes": ["héllo", 1, 1]}, {}),  # splits é -> invalid utf8 -> defer
@@ -695,6 +789,10 @@ CURATED = [
     ({"$rtrim": {"input": "hixx", "chars": "x"}}, {}),
     ({"$trim": {"input": "$s"}}, {"s": "  hi  "}),  # default whitespace -> defer
     ({"$trim": {"input": "$s", "chars": " "}}, {"s": None}),  # null input -> null
+    ({"$trim": {"input": "--x--", "chars": None}}, {}),  # null chars -> null (both)
+    ({"$trim": {"input": "x", "chars": 5}}, {}),  # non-string chars -> defer (50700)
+    ({"$ltrim": {"input": "x", "chars": True}}, {}),  # bool chars -> defer
+    ({"$rtrim": {"input": 5, "chars": "x"}}, {}),  # non-string input -> defer (50699)
     # $getField / $setField / $zip.
     ({"$getField": "x"}, {"x": 5}),
     ({"$getField": "missing"}, {}),  # absent -> MISSING marker -> Rust defers
@@ -775,6 +873,17 @@ CURATED = [
     ({"$dateTrunc": {"date": "$d", "unit": "week"}}, {"d": _DT}),
     ({"$dateTrunc": {"date": "$d", "unit": "year", "binSize": 5}}, {"d": _DT}),
     ({"$dateTrunc": {"date": "$d", "unit": "minute", "binSize": 15}}, {"d": _DT}),
+    # Whole-double amount / binSize now computes on both engines.
+    ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 5.0}}, {"d": _DT}),
+    ({"$dateSubtract": {"startDate": "$d", "unit": "hour", "amount": 3.0}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "year", "binSize": 2.0}}, {"d": _DT}),
+    # Invalid amount / binSize: Rust defers (None); Python raises 5166405 / 5439017.
+    ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 2.5}}, {"d": _DT}),
+    ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": True}}, {"d": _DT}),
+    ({"$dateSubtract": {"startDate": "$d", "unit": "day", "amount": True}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "day", "binSize": True}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "day", "binSize": 2.5}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "day", "binSize": -1}}, {"d": _DT}),
     # Cases that should defer (rust None -> skipped):
     ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
@@ -796,6 +905,88 @@ CURATED = [
     # Null still propagates BEFORE type checks (both engines return null).
     ({"$multiply": [None, "$s"]}, {"s": "nope"}),
     ({"$add": [None, True]}, {}),
+    # bool where an int is expected: mongod rejects (bool is not a number),
+    # Python raises the exact code, Rust must defer (a Rust VALUE = divergence).
+    ({"$round": [1.5, True]}, {}),
+    ({"$trunc": [1.5, True]}, {}),
+    ({"$arrayElemAt": [[10, 20, 30], True]}, {}),
+    ({"$slice": [[1, 2, 3, 4], True]}, {}),
+    ({"$slice": [[1, 2, 3, 4], True, 2]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 1, True]}, {}),
+    ({"$sortArray": {"input": [3, 1, 2], "sortBy": True}}, {}),
+    ({"$substrCP": ["hello", True, 2]}, {}),
+    ({"$substrCP": ["hello", 1, True]}, {}),
+    ({"$substrBytes": ["hello", True, 2]}, {}),
+    ({"$substrBytes": ["hello", 1, True]}, {}),
+    ({"$substr": ["hello", True, 2]}, {}),
+    ({"$substr": ["hello", 1, True]}, {}),
+    # $substr aliases $substrBytes (byte-based) on both engines — ASCII computes.
+    ({"$substr": ["hello", 1, 3]}, {}),
+    ({"$range": [0, True]}, {}),
+    ({"$range": [True, 5]}, {}),
+    ({"$range": [0, 5, True]}, {}),
+    ({"$indexOfArray": [[1, 2, 3], 2, True]}, {}),
+    ({"$indexOfArray": [[1, 2, 3], 2, 0, True]}, {}),
+    # whole-number double index: mongod (and now both engines) accept it and
+    # compute; a fractional double is rejected (Python raises, Rust defers).
+    ({"$arrayElemAt": [[10, 20, 30], 2.0]}, {}),
+    ({"$arrayElemAt": [[10, 20, 30], -1.0]}, {}),
+    ({"$arrayElemAt": [[10, 20, 30], 2.7]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 2.0]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 2.7]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 1.0, 2.0]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 1.7, 2]}, {}),
+    ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, {}),
+    ({"$indexOfArray": [[1, 2, 3], 2, 0.0]}, {}),
+    ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, {}),
+    # whole-double acceptance extends to substrCP / range / round / trunc.
+    ({"$substrCP": ["hello", 1.0, 2]}, {}),
+    ({"$substrCP": ["hello", 1.7, 2]}, {}),
+    ({"$substrCP": ["hello", 1, 1.7]}, {}),
+    ({"$range": [0.0, 5.0, 1.0]}, {}),
+    ({"$range": [0.7, 5]}, {}),
+    ({"$range": [0, 5.7]}, {}),
+    ({"$range": [0, 5, 1.7]}, {}),
+    ({"$round": [3.14159, 2.0]}, {}),
+    ({"$round": [3.14159, 2.7]}, {}),
+    ({"$trunc": [3.14159, 2.0]}, {}),
+    ({"$trunc": [3.14159, 2.7]}, {}),
+    # $substrBytes splitting a UTF-8 char: Python raises 28656/28657, the Rust
+    # core defers (its slice isn't valid UTF-8). Clean boundaries compute equally.
+    ({"$substrBytes": ["héllo", 0, 2]}, {}),
+    ({"$substrBytes": ["héllo", 2, 3]}, {}),
+    ({"$substr": ["héllo", 0, 2]}, {}),
+    ({"$substrBytes": ["héllo", 0, 3]}, {}),
+    ({"$substrBytes": ["héllo", 3, 2]}, {}),
+    # continuation-byte start / end-split rejected even for an empty range: the
+    # core must defer (not return "") — the case a fuzz run surfaced.
+    ({"$substrBytes": ["héllo", 2, 0]}, {}),
+    ({"$substrBytes": ["héllo", 1, 1]}, {}),
+    ({"$substrBytes": ["éa😀ézé", 1, 0]}, {}),
+    ({"$substrBytes": ["héllo", 1, 0]}, {}),
+    ({"$substrBytes": ["héllo", 99, 0]}, {}),
+    # negative start rejected on both ops (50752 / 34455); negative length
+    # rejected on $substrCP (34454) but fine on $substrBytes (to end).
+    ({"$substrBytes": ["abcde", -1, 2]}, {}),
+    ({"$substrBytes": ["abcde", 1, -1]}, {}),
+    ({"$substrCP": ["abcde", -1, 2]}, {}),
+    ({"$substrCP": ["abcde", 1, -1]}, {}),
+    # $substrBytes truncates a double toward zero -- both engines compute equally.
+    ({"$substrBytes": ["abcde", 1.7, 2]}, {}),
+    ({"$substrBytes": ["abcde", 0.9, 3]}, {}),
+    ({"$substrBytes": ["abcde", 1, 2.9]}, {}),
+    ({"$substrBytes": ["abcde", 1, -1.7]}, {}),
+    ({"$substrBytes": ["abcde", -1.7, 2]}, {}),
+    # $pow: integer/whole-double compute on both engines; non-numeric / bool /
+    # zero-base-negative-exponent raise on Python and defer on Rust. (The
+    # negative-base-fractional NaN case is excluded — NaN != NaN breaks the
+    # equality assert; it's covered in the unit/integration tests via isnan.)
+    ({"$pow": [-2, 3]}, {}),
+    ({"$pow": [2.0, 3]}, {}),
+    ({"$pow": [2, 10]}, {}),
+    ({"$pow": ["x", 2]}, {}),
+    ({"$pow": [2, True]}, {}),
+    ({"$pow": [0, -1]}, {}),
 ]
 
 
@@ -1165,3 +1356,88 @@ def test_randomised_fuzz_parity():
         handled += 1
         assert rust == py, f"divergence: rust={rust!r} pure={py!r} expr={expr} doc={doc}"
     assert handled > 1000, f"expected many handled cases, only {handled}"
+
+
+@pytest.mark.parametrize(
+    "expr,code",
+    [
+        ({"$size": 5}, 17124),
+        ({"$arrayElemAt": [5, 0]}, 28689),
+        ({"$in": [1, 5]}, 40081),
+        ({"$indexOfArray": [5, 1]}, 40090),
+        ({"$setUnion": [5]}, 17043),
+        ({"$setIntersection": [5]}, 17047),
+        ({"$setDifference": [5, 6]}, 17048),
+        ({"$setIsSubset": [5, 6]}, 17046),
+        ({"$anyElementTrue": 5}, 17041),
+        ({"$allElementsTrue": 5}, 17040),
+        ({"$mergeObjects": [5]}, 40400),
+        ({"$range": ["a", "b"]}, 34443),
+    ],
+)
+def test_array_set_typeguard_defers_and_raises(expr, code):
+    # A non-array/non-object argument to these operators: Rust must *defer* (the
+    # raw evaluate returns None) so the pure engine raises mongod's exact
+    # Location code — checking the raw result, not `_rust_eval`, because a
+    # computed BSON null would also decode to Python None and hide a silent
+    # accept (as it did for $arrayElemAt before the Rust fix).
+    doc = bson.decode(bson.encode({"_id": 1}))
+    expr = bson.decode(bson.encode({"e": expr}))["e"]
+    raw = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode({}))
+    assert raw is None
+    with pytest.raises(_pure.ExpressionError) as exc:
+        _pure.evaluate(expr, doc)
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "expr,code",
+    [
+        ({"$regexMatch": {"input": 5, "regex": "a"}}, 51104),
+        ({"$regexFind": {"input": 5, "regex": "a"}}, 51104),
+        ({"$regexFindAll": {"input": 5, "regex": "a"}}, 51104),
+        ({"$indexOfBytes": [5, "a"]}, 40091),
+        ({"$binarySize": 5}, 51276),
+        ({"$bsonSize": 5}, 31393),
+    ],
+)
+def test_string_typeguard_defers_and_raises(expr, code):
+    # Non-string argument to these operators: Rust must defer (raw evaluate None)
+    # so the pure engine raises mongod's exact code. The regex ops previously
+    # silently returned false/null/[] on both engines.
+    doc = bson.decode(bson.encode({"_id": 1}))
+    expr = bson.decode(bson.encode({"e": expr}))["e"]
+    raw = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode({}))
+    assert raw is None
+    with pytest.raises(_pure.ExpressionError) as exc:
+        _pure.evaluate(expr, doc)
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "expr,code",
+    [
+        ({"$dateToString": {"date": "x"}}, 16006),
+        ({"$dateToParts": {"date": "x"}}, 16006),
+        ({"$dateFromString": {"dateString": 5}}, 241),
+        ({"$let": {"vars": {}, "in": "$$x"}}, 17276),
+        ({"$switch": {"branches": []}}, 40068),
+        ({"$ifNull": [1]}, 1257300),
+        ({"$getField": {"field": 5, "input": {}}}, 5654602),
+        ({"$setField": {"field": 5, "input": {}, "value": 1}}, 4161107),
+        ({"$sortArray": {"input": [1], "sortBy": "x"}}, 2942507),
+        ({"$convert": {"input": 5}}, 9),
+        ({"$dateDiff": {"startDate": _DT}}, 5166304),
+    ],
+)
+def test_date_misc_typeguard_defers_and_raises(expr, code):
+    # Date/misc operator error cases: Rust must defer (raw evaluate None) so the
+    # pure engine raises mongod's exact code. $dateToString and $dateDiff missing
+    # endDate were silent accepts.
+    doc = bson.decode(bson.encode({"_id": 1}))
+    expr = bson.decode(bson.encode({"e": expr}))["e"]
+    raw = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode({}))
+    assert raw is None
+    with pytest.raises(_pure.ExpressionError) as exc:
+        _pure.evaluate(expr, doc)
+    assert exc.value.code == code

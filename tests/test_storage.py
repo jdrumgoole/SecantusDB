@@ -10,8 +10,16 @@ from secantus.storage import Storage
 
 
 @pytest.fixture
-def storage(tmp_path) -> Storage:
-    return Storage(str(tmp_path))
+def storage(tmp_path):
+    # close() in teardown is load-bearing: a never-closed Storage abandons its
+    # WiredTiger connection (~2.5 MB + ~17 fds each), so a worker running many
+    # of these leaks memory / fds until it dies "not properly terminated" with
+    # no output. See tasks/backlog.md #275.
+    s = Storage(str(tmp_path))
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def test_insert_assigns_object_id(storage: Storage) -> None:
@@ -682,7 +690,9 @@ def test_create_archive_round_trips_inserts(tmp_path) -> None:
 
     dst.mkdir()
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(dst, filter="data")
+        # trusted test archive — extract without the `filter` kwarg, which older
+        # 3.10/3.11 patch releases (e.g. 3.10.11) don't accept.
+        tar.extractall(dst)
     s2 = Storage(str(dst))
     try:
         rows = sorted(s2.find_matching("appdb", "things"), key=lambda d: d["_id"])

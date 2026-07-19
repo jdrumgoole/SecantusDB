@@ -13,11 +13,10 @@
 //! embedded Python lifecycle handle (R6) wraps: `bind` → an address pymongo
 //! connects to, `stop` → clean shutdown.
 //!
-//! **Deferred (tracked in `tasks/rust-server-plan.md`):** TLS / mTLS (R4 tail),
-//! auth state + `peer_cert_dn` threading (R5), metrics / sessions / failpoints /
-//! connection registry (their command slices), and sourcing `cluster_time` from
-//! storage (the command `Storage` trait doesn't expose `current_cluster_time`
-//! yet — `hello`'s replica-set `lastWrite` uses a zero timestamp until then).
+//! TLS / mTLS (rustls), auth state + `peer_cert_dn` threading (MONGODB-X509,
+//! mongod-form RFC 4514 DNs), metrics / sessions / failpoints, and the
+//! connection registry all ship here; see `tasks/rust-server-plan.md` for the
+//! phase history.
 
 pub mod args;
 pub mod config;
@@ -35,7 +34,8 @@ use std::time::{Duration, Instant};
 use bson::{doc, Bson, Document};
 use secantus_commands::logbuf::LogBuffer;
 use secantus_commands::{
-    dispatch, CommandContext, ConnectionAuth, ConnectionKiller, CursorRegistry, Storage,
+    dispatch, CommandContext, ConnectionAuth, ConnectionKiller, CursorRegistry, PendingBatch,
+    Storage,
 };
 use secantus_wire::{
     build_op_msg_reply, build_op_reply, Header, Op, OpMsg, WireError, HEADER_SIZE,
@@ -565,7 +565,7 @@ fn serve<S: Read + Write>(
                         continue;
                     }
                 };
-                let (reply, close_conn) =
+                let (mut reply, close_conn, pending) =
                     run_dispatch(&request, conn_id, shared, conn_auth, &peer_cert_dn);
                 // A `closeConnection` failpoint drops the socket without replying,
                 // so the driver observes a network error.
@@ -584,6 +584,12 @@ fn serve<S: Read + Write>(
                     && request.contains_key("getMore")
                     && matches!(reply.get("cursor"), Some(Bson::Document(_)))
                 {
+                    // The exhaust streamer reframes the batch array in the reply
+                    // document, so materialise the pending blobs back into it
+                    // (the normal path below splices them straight onto the wire).
+                    if let Some(pb) = pending {
+                        materialize_batch(&mut reply, pb);
+                    }
                     if !stream_exhaust_getmore(
                         stream,
                         &header,
@@ -619,7 +625,7 @@ fn serve<S: Read + Write>(
                         return Ok(());
                     }
                 } else {
-                    write_op_msg(stream, &header, shared, &reply)?;
+                    write_op_msg(stream, &header, shared, &reply, pending.as_ref())?;
                 }
             }
             Ok(Op::Query(query)) => {
@@ -706,10 +712,73 @@ fn load_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>>
 
 /// Extract a peer certificate's subject DN as an RFC 4514 string
 /// (most-specific-first, short OID names), for `MONGODB-X509`.
+/// The verified client cert's subject as a mongod-style RFC 4514 DN string:
+/// most-specific-first (CN before OU before O …), comma-separated with NO
+/// space, short OID names, and the RFC 4514 value escaping — byte-for-byte
+/// the string `secantus.auth.subject_dn_from_peercert` produces on the
+/// Python server, so a user record provisioned against either server
+/// authenticates on the other. (x509-parser's own `Display` is
+/// least-specific-first with `", "` separators — the raw certificate order —
+/// which never matches the stored DN username.)
 fn cert_subject_dn(der: &[u8]) -> Option<String> {
     use x509_parser::prelude::FromDer;
     let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
-    Some(cert.subject().to_string())
+    let mut rdn_strs: Vec<String> = Vec::new();
+    // Iterate in reverse so the resulting string is most-specific-first.
+    let rdns: Vec<_> = cert.subject().iter().collect();
+    for rdn in rdns.into_iter().rev() {
+        let mut attrs: Vec<String> = Vec::new();
+        for attr in rdn.iter() {
+            let oid = attr.attr_type().to_id_string();
+            let short = dn_short_name(&oid);
+            let value = attr.as_str().map(str::to_string).unwrap_or_else(|_| {
+                // Non-UTF8 / unusual encodings: fall back to lossy bytes,
+                // mirroring Python's str() of whatever ssl decoded.
+                String::from_utf8_lossy(attr.attr_value().data).into_owned()
+            });
+            attrs.push(format!("{short}={}", escape_dn_value(&value)));
+        }
+        rdn_strs.push(attrs.join("+"));
+    }
+    if rdn_strs.is_empty() {
+        return None;
+    }
+    Some(rdn_strs.join(","))
+}
+
+/// RFC 4514 short names for the common subject attribute OIDs — the same set
+/// `secantus.auth._DN_SHORT_NAMES` maps (an unknown OID keeps its dotted id).
+fn dn_short_name(oid: &str) -> &str {
+    match oid {
+        "2.5.4.3" => "CN",
+        "2.5.4.10" => "O",
+        "2.5.4.11" => "OU",
+        "2.5.4.7" => "L",
+        "2.5.4.8" => "ST",
+        "2.5.4.6" => "C",
+        "2.5.4.9" => "STREET",
+        "0.9.2342.19200300.100.1.25" => "DC",
+        "0.9.2342.19200300.100.1.1" => "UID",
+        "2.5.4.5" => "serialNumber",
+        "1.2.840.113549.1.9.1" => "emailAddress",
+        other => other,
+    }
+}
+
+/// RFC 4514 value escaping, mirroring `secantus.auth._escape_dn_value`.
+fn escape_dn_value(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    for (i, ch) in chars.iter().enumerate() {
+        let special = matches!(ch, ',' | '+' | '"' | '\\' | '<' | '>' | ';' | '=' | '#')
+            || (i == 0 && *ch == ' ')
+            || (i == chars.len() - 1 && *ch == ' ');
+        if special {
+            out.push('\\');
+        }
+        out.push(*ch);
+    }
+    out
 }
 
 /// Build the request document: the kind-0 body with each kind-1 document
@@ -737,7 +806,7 @@ fn run_dispatch(
     shared: &Arc<Shared>,
     conn_auth: &Arc<Mutex<ConnectionAuth>>,
     peer_cert_dn: &Option<String>,
-) -> (Document, bool) {
+) -> (Document, bool, Option<PendingBatch>) {
     let mut ctx = make_context(conn_id, shared, conn_auth, peer_cert_dn);
     if let Ok(db) = request.get_str("$db") {
         ctx.db_name = db.to_string();
@@ -758,7 +827,38 @@ fn run_dispatch(
                 d.insert("codeName", "InternalError");
                 d
             });
-    (reply, ctx.close_connection)
+    // `pending_batch` is set by `find` / `getMore` to hand the reply's document
+    // batch to the wire as pre-encoded blobs (spliced by `write_op_msg` /
+    // `materialize_batch`) instead of an owned `Bson::Array` in the reply.
+    (reply, ctx.close_connection, ctx.pending_batch.take())
+}
+
+/// Decode a `pending_batch`'s blobs into `reply.cursor.<field>` as an owned
+/// `Bson::Array` — the old `docs_to_bson` behaviour, relocated. Used by the
+/// exhaust-getMore streamer, whose framing logic inspects the batch array in the
+/// reply document (the normal reply path splices the blobs straight onto the
+/// wire and never materialises them). A blob that fails to decode is corruption
+/// (`this is a database`); log it loudly and drop that element rather than
+/// panicking mid-stream.
+fn materialize_batch(reply: &mut Document, pending: PendingBatch) {
+    let mut arr: Vec<Bson> = Vec::with_capacity(pending.batch.len());
+    for blob in &pending.batch {
+        match Document::from_reader(&mut &blob[..]) {
+            Ok(d) => arr.push(Bson::Document(d)),
+            Err(e) => {
+                eprintln!("secantus-server: cursor batch blob failed to decode (corruption?): {e}")
+            }
+        }
+    }
+    if let Ok(cursor) = reply.get_document_mut("cursor") {
+        // Batch field first, matching the handler's original layout.
+        let mut rebuilt = Document::new();
+        rebuilt.insert(pending.batch_field, arr);
+        for (k, v) in cursor.iter() {
+            rebuilt.insert(k, v.clone());
+        }
+        *cursor = rebuilt;
+    }
 }
 
 fn make_context(
@@ -800,13 +900,30 @@ fn write_op_msg<S: Write>(
     header: &Header,
     shared: &Arc<Shared>,
     reply: &Document,
+    batch: Option<&PendingBatch>,
 ) -> io::Result<()> {
-    let mut body_bytes = Vec::with_capacity(256);
-    reply
-        .to_writer(&mut body_bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let body_bytes = cursor_or_plain_body(reply, batch)?;
     let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, 0);
     stream.write_all(&frame)
+}
+
+/// The reply body bytes: when a `PendingBatch` is present the batch blobs are
+/// spliced into `cursor.<field>` without decoding (`encode_cursor_reply`);
+/// otherwise the reply document is serialized as-is.
+fn cursor_or_plain_body(reply: &Document, batch: Option<&PendingBatch>) -> io::Result<Vec<u8>> {
+    match batch {
+        Some(pending) => {
+            secantus_wire::encode_cursor_reply(reply, pending.batch_field, &pending.batch)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+        }
+        None => {
+            let mut body_bytes = Vec::with_capacity(256);
+            reply
+                .to_writer(&mut body_bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(body_bytes)
+        }
+    }
 }
 
 /// Write one OP_MSG reply with the given flag bits (e.g. `moreToCome` for an
@@ -913,7 +1030,12 @@ fn stream_exhaust_getmore<S: Write>(
         if let Some(mt) = request.get("maxTimeMS") {
             getmore.insert("maxTimeMS", mt.clone());
         }
-        let (reply, _close) = run_dispatch(&getmore, conn_id, shared, conn_auth, peer_cert_dn);
+        let (mut reply, _close, pending) =
+            run_dispatch(&getmore, conn_id, shared, conn_auth, peer_cert_dn);
+        // Reframe the next batch into the reply document for the exhaust streamer.
+        if let Some(pb) = pending {
+            materialize_batch(&mut reply, pb);
+        }
         doc = reply;
     }
 }
@@ -1002,7 +1124,9 @@ fn stream_awaitable_hello<S: Read + Write>(
                 Err(_) => return Ok(false), // socket error: drop
             }
         }
-        let (reply, _close) = run_dispatch(request, conn_id, shared, conn_auth, peer_cert_dn);
+        // Streaming `hello` never sets `pending_batch` (no cursor), so ignore it.
+        let (reply, _close, _pending) =
+            run_dispatch(request, conn_id, shared, conn_auth, peer_cert_dn);
         if write_op_msg_flags(stream, header, shared, &reply, OP_MSG_FLAG_MORE_TO_COME).is_err() {
             return Ok(false);
         }
@@ -1045,7 +1169,7 @@ fn send_bad_value<S: Write>(
         "code": 2,
         "codeName": "BadValue",
     };
-    write_op_msg(stream, header, shared, &reply)
+    write_op_msg(stream, header, shared, &reply, None)
 }
 
 enum ReadOutcome {

@@ -19,6 +19,2334 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b0] — 2026-07-19
+
+### Say no like mongod: an operator-fidelity sweep, and a Rust server that clears every gauge
+
+The single largest theme in this release is learning to fail correctly.
+Roughly sixty slices went through the query, update, and aggregation
+operators asking one question of each: when the argument is wrong, does
+SecantusDB raise the same error, with the same code, that `mongod`
+raises? Very often it did not — `$all` silently mis-matched a bad
+argument, `$rename` could corrupt a document, `$concat` quietly coerced
+non-strings, `$bucket` dropped out-of-range documents on the floor, and
+a long tail of operators leaked a raw Python exception to the wire.
+Those are now mongod-shaped errors with mongod's codes. Alongside the
+rejections, numeric fidelity got the same treatment: whole-number
+doubles are accepted where mongod accepts them, `$toInt` and `$convert`
+enforce int32/int64 overflow bounds, `$mod` matches on floats and bools,
+and `$substrBytes` is genuinely byte-based — including refusing a range
+that would split a UTF-8 character.
+
+The Rust server crossed its headline milestone: it now clears **all
+thirteen driver-conformance gauges**, the same unmodified upstream suites
+the Python server runs. Getting there took both correctness work
+(MONGODB-X509 authentication, `$project` error fidelity, full `$min`/`$max`
+ordering) and a sustained performance push — writers no longer queue
+behind each other, reads no longer queue behind writers, oplog bookkeeping
+came off the write path, and four separate paths (scanning, filtering,
+projection, and the wire reply) now work over raw BSON instead of
+decoding whole documents just to re-encode them.
+
+New surface landed too. `$median` and `$percentile` ship on both servers
+without a t-digest; `$sum` / `$avg` / `$max` / `$min` work as expression
+operators, not just accumulators; `$toLong` joins the conversion family;
+`$jsonSchema` grew mongod's full keyword surface; and expanded
+change-stream events now match mongod field-for-field. The SQL server
+kept its own pace with binary `COPY`, composite records end to end,
+binary and scrollable server-side cursors, `DO` blocks, savepoint
+rollback that reverts DDL, type modifiers on the wire, and
+`idle_in_transaction_session_timeout`. The admin console caught up with
+all three servers, the benchmark pages gained charts, and new concurrency
+stress suites found and fixed real races.
+
+#### Highlights
+
+- Operator fidelity: ~60 slices aligning argument validation and error
+  codes with `mongod` across query, update, and aggregation operators —
+  rejections, numeric coercion rules, and byte-vs-codepoint string
+  semantics.
+- Rust server: clears all thirteen driver-conformance gauges; MONGODB-X509
+  auth; per-collection write locks, lock-free reads, oplog off the write
+  path, raw-BSON scan / match / projection / reply paths, and `$group`
+  field pushdown so wide documents decode only what the stage reads.
+- New operators: `$median`, `$percentile`, `$toLong`, `$sum` / `$avg` /
+  `$max` / `$min` as expressions, full `$jsonSchema` keyword surface,
+  `$bucketAuto` preferred-number granularity.
+- Change streams: expanded events match mongod field-for-field.
+- SQL server: binary `COPY`, composite records, binary + scrollable
+  server-side cursors, `DO` blocks, savepoint DDL rollback, wire type
+  modifiers, `idle_in_transaction_session_timeout`.
+- Tooling: concurrency stress suites (and the races they caught),
+  benchmark charts, a three-server admin console, and a green docs build.
+
+### The Rust server decodes only the fields a `$group` actually reads
+
+The `aggregate_group` workload was the worst of the six in the
+post-raw-BSON profile (3.1× of mongod) for a structural reason: `$group`
+received fully-decoded documents while reading only its `_id` and
+accumulator-argument fields, so input materialization survived into the
+heavy stage. `secantus_core::referenced_top_level_fields` now walks a
+`$group` spec and returns the top-level fields it reads, and the command
+layer pushes that field set down into the fetch when the first heavier
+stage of a pipeline is such a `$group`. Wide documents no longer pay to
+materialize fields the pipeline never looks at.
+
+The analysis bails to a full decode wherever the referenced set can't be
+determined statically — `$$ROOT` / `$$CURRENT`, computed-field access,
+and non-simple accumulators like `$top` / `$topN` whose `sortBy` names a
+field by bare key.
+
+#### Changed
+
+- Rust server: a leading `$group` pushes its referenced top-level field
+  set into the fetch, decoding only those fields from wide documents.
+
+### Admin console docs catch up, and the docs build goes green again
+
+The admin web UI documentation still described the console as it was
+before the Rust server and the SQL server existed. Most conspicuously it
+carried a per-server feature table asserting that the Rust server lacked
+archive restore, oplog and TTL pruning, role grant/revoke, `killOp`,
+logs, and profiling — a table that had been wrong for months, and whose
+in-code counterpart has since been removed. The page now explains why
+there is no such table any more, and what replaced it: SecantusDB
+targets start permissive, and a feature is withdrawn only when the
+server itself reports the command missing.
+
+The rest of the page caught up with what shipped alongside that —
+point-in-time recovery, launching the Rust server from the embedded
+control, index collation, target-sourced roles, the wider set of `_id`
+types the collection browser can paginate, and the fact that `admin.db`
+is a credential store and is now permissioned like one. Several stale
+claims went with it, including a "one target server per launch" line that
+predated the target hot-swap, and a limitations entry for a saved-
+connections page that has since shipped.
+
+Separately, `invoke docs` had been failing. Eleven Rust-server driver
+validation reports were never added to the toctree, and since docs-only
+commits are deliberately skipped by CI, nothing caught it. All thirteen
+reports are now listed and the build is clean again.
+
+#### Fixed
+
+- `invoke docs` builds warning-free. Eleven `validation-report-*-rust-server`
+  pages were missing from the toctree, failing the warnings-as-errors build.
+
+#### Changed
+
+- The admin UI docs describe the current capability model, the PITR panel,
+  the Rust embedded-server option, index collation, target-sourced roles,
+  `admin.db` permissions, and the supported `_id` types for pagination.
+
+### The admin console catches up with three servers
+
+The admin console was written when SecantusDB had one server. Since then a
+Rust server and a PostgreSQL-wire SQL server shipped, and the console
+quietly fell behind: a hardcoded table of "what the Rust server can't do
+yet" went stale within days of being written and spent months hiding six
+feature groups — archive restore, oplog and TTL pruning, role
+grant/revoke, `killOp`, the server log, and profiling — behind disabled
+buttons, on a server that implements every one of them.
+
+That table is gone. Only a real `mongod` keeps a static capability
+profile, because its negatives are definitional rather than a snapshot of
+a moving target: no `mongod` will ever serve the proprietary
+`secantusAdmin.*` commands. Both SecantusDB servers now start fully
+permissive, and a feature is withdrawn only when the target itself
+answers `CommandNotFound` — negative knowledge learned from the live
+server instead of guessed in advance, so the console cannot drift out of
+step with either server again.
+
+The same review closed the rest of the gap. Point-in-time recovery, the
+largest shipped subsystem with no interface at all, gets a panel on the
+backup page. The embedded-server button can start the Rust server, not
+just the Python one. The role picker asks the connected target what roles
+exist rather than consulting the Python server's own table. Collections
+keyed by `Decimal128`, `UUID`, or `Binary` `_id` can be browsed at last,
+and a tampered pagination cursor now returns a clean error instead of an
+unhandled crash.
+
+#### Added
+
+- Point-in-time recovery on `/backup`: take a base snapshot, and recover
+  an archive to a wall-clock moment into a fresh directory.
+- The embedded-server control can launch either the Python or the Rust
+  server; the picker appears when the Rust extension is installed.
+- Collation input on the index-create form, and a collation badge in the
+  index list.
+- `Decimal128`, `UUID`, and `Binary` `_id` values are supported by the
+  collection browser's pagination cursor, `Binary` round-tripping its
+  subtype.
+
+#### Changed
+
+- Capability detection no longer keeps a per-flavour feature table for
+  SecantusDB servers. Features are hidden only after the target reports
+  `CommandNotFound`.
+- The role picker and `/roles` catalogue are sourced from the connected
+  target via `rolesInfo`, falling back to the built-in names. Role names
+  submitted from the form are no longer filtered against a local table,
+  so a valid custom role is no longer silently discarded.
+
+#### Fixed
+
+- `~/.secantus/admin.db`, which stores target URIs verbatim including
+  credentials, is created `0600` with its directory `0700`. Previously it
+  was left at the process umask while the token file beside it was
+  already locked down.
+- A malformed pagination cursor returns a `ValueError`-shaped error
+  rather than an unhandled `InvalidId` / `InvalidOperation` from a bson
+  constructor.
+- Pointing the console at a `postgresql://` URI explains that the SQL
+  server has no admin UI, instead of failing with an opaque pymongo
+  parse error.
+
+### $all validates its argument instead of silently mis-matching
+
+`$all` accepted a malformed argument. A non-array leaked / mis-parsed, and a
+`$`-expression element that wasn't the all-`$elemMatch` form — mixing `$elemMatch`
+with a scalar, or using another `$`-operator document — was silently treated as an
+equality clause (matching nothing) rather than erroring. mongod rejects both with
+`BadValue`: "$all needs an array" and "no $ expressions in $all". Both servers now
+match.
+
+A pure-scalar `$all`, an all-`$elemMatch` form, regex elements, and plain
+subdocument elements remain valid. The Python server carries mongod's `BadValue`;
+the Rust core defers these cases so the Rust server rejects them too. Three-way
+mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$all` rejects a non-array argument ("needs an array") and a `$`-expression
+  element outside the all-`$elemMatch` form ("no $ expressions in $all") with
+  `BadValue`, instead of silently mis-matching (both servers).
+
+### $all against a scalar field now matches, like mongod
+
+The `$all` array query operator silently missed documents whose field held a
+*scalar* value rather than an array — `{tags: {$all: ["red"]}}` matched
+`{tags: ["red", ...]}` but not `{tags: "red"}`, on both the Python and Rust
+servers. mongod treats a scalar field like a one-element array for `$all`
+(equality and regex elements alike), so those documents should have matched.
+This dual-server correctness bug was found while triaging the driver-gauge
+results and is verified fixed against a live mongod 7.0.12 probe (three-way:
+Python == Rust == mongod). In the same fix, `$all: []` now correctly matches
+nothing (it previously matched every array-valued document), and `$elemMatch`
+clauses inside `$all` still correctly require an actual array.
+
+#### Fixed
+
+- `$all` matches a scalar field value like a one-element array (both servers).
+- `$all: []` matches nothing rather than every array-valued document.
+
+### Range operators order array elements by full BSON type order, like mongod
+
+A third comparison bug from the driver-gauge triage: `$gt` / `$lt` against an
+array bound compared elements pairwise, but a *cross-type* element pair made
+both servers return no match — `{a: {$gt: [1, 2]}}` skipped `{a: [1, "x"]}`
+even though mongod matches it (a string element outranks a number element in
+BSON order, so `[1, "x"] > [1, 2]`). Python's native list comparison raises
+`TypeError` on `"x" > 2` (swallowed to a no-match) and the Rust matcher
+returned no-match on any incomparable element pair. Both now order array
+elements by full BSON order (type rank first) via the shared `_bson_lt`
+comparator, verified three-way against a live mongod 7.0.12 probe.
+
+#### Fixed
+
+- Range operators order two arrays element-by-element in full BSON order, so a
+  cross-type element pair still orders instead of silently no-matching (both
+  servers).
+
+### Array operators reject a non-array input instead of silently yielding null
+
+`$first`, `$last`, `$reverseArray`, `$concatArrays`, `$slice`, `$map`, `$filter`,
+and `$reduce` all silently returned `null` when their input wasn't an array.
+mongod errors on a non-array (non-null) input, each with its own code: `$first` /
+`$last` `28689`, `$reverseArray` `34435`, `$concatArrays` `28664`, `$slice`
+`28724`, `$map` `16883`, `$filter` `28651`, `$reduce` `40080`. A null or missing
+input still yields `null`. Both servers now match.
+
+The Python server carries mongod's codes; the Rust core defers a non-array input
+(so the Rust server rejects it) and now distinguishes a null input (→ null) from a
+non-array one. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$first` / `$last` / `$reverseArray` / `$concatArrays` / `$slice` / `$map` /
+  `$filter` / `$reduce` reject a non-array input with the operator's mongod code,
+  instead of silently returning `null`; a null / missing input still yields `null`
+  (both servers).
+
+### Array / set / string operator type-guards match mongod's error codes (and stop silently accepting)
+
+A discovery sweep of ~120 aggregation-operator error cases against real mongod
+7.0.12 found a bounded set of type-guard divergences, several of them **silent
+accepts** — operators that returned a value where mongod errors. They now match
+mongod: `$arrayElemAt`, `$in`, and `$regexMatch`/`$regexFind`/`$regexFindAll`
+were silently returning `null`/`false`/`[]` on a bad argument and now error, and
+the rest returned a generic `TypeMismatch` (14) where mongod uses a specific
+`Location` code. Both the Python and Rust servers are fixed (the Rust core defers
+each case — `$in`, `$arrayElemAt`, and the regex ops needed Rust-side fixes to
+stop computing a value), verified against real mongod.
+
+#### Fixed
+
+- **Silent accepts, now errors (both engines):** `$arrayElemAt` non-array →
+  `Location28689`; `$in` non-array second argument → `Location40081`;
+  `$regexMatch` / `$regexFind` / `$regexFindAll` non-string `input` →
+  `Location51104` (a `null`/missing input stays valid — `false`/`null`/`[]`).
+- **Generic `TypeMismatch` (14) → mongod's `Location` code:** `$size` (17124),
+  `$indexOfArray` (40090), `$setUnion` (17043), `$setIntersection` (17047),
+  `$setDifference` (17048), `$setIsSubset` (17046), `$anyElementTrue` (17041),
+  `$allElementsTrue` (17040), `$mergeObjects` (40400), `$range` non-numeric bound
+  (34443), `$indexOfBytes` non-string (40091/40092), `$binarySize` (51276),
+  `$bsonSize` (31393).
+
+### `arrayFilters` nested-identifier extraction
+
+`arrayFilters` identifiers are now extracted recursively through `$and` / `$or`
+/ `$nor`, completing the arrayFilters validation. A filter like
+`{$and: [{"x.a": {…}}, {"x.b": {…}}]}` correctly resolves the single identifier
+`x` (so a `$[x]` update path applies to the matching elements), and mongod's
+"exactly one identifier per filter" rule is now enforced: a filter carrying two
+distinct identifiers — top-level or nested — is rejected, as is a bare `$expr`.
+Both the Python and Rust servers behave identically, verified against real
+mongod 7.0.12.
+
+#### Fixed
+
+- A single arrayFilter identifier nested inside `$and`/`$or`/`$nor` (e.g.
+  `{$and: [{"x.score": {$lt: 50}}]}` for `$[x]`) is now extracted and applied,
+  instead of failing with "arrayFilters has no entry for identifier x".
+- An arrayFilter referencing two or more distinct identifiers now raises code 9
+  ("Expected a single top-level field name, found 'x' and 'y'") — previously a
+  second top-level identifier was silently ignored.
+- An arrayFilter that is a bare `$expr` (no field identifier) now raises code 224
+  ("$expr is not allowed in this context").
+
+### `arrayFilters` validation
+
+`arrayFilters` (the `$[<identifier>]` filter documents passed to an update) are
+now validated the way real mongod validates them, instead of silently accepting
+malformed input. A filter that isn't an object, is empty, carries an
+identifier that isn't a lowercase-letter-led alphanumeric name, repeats an
+identifier, or isn't actually referenced by any `$[<id>]` path in the update is
+rejected with mongod's exact error code. Covered on both the Python and Rust
+servers (the Rust core defers each invalid case), verified against real mongod
+7.0.12.
+
+#### Fixed
+
+- A non-object array filter now raises code 14 ("BSON field
+  'update.updates.arrayFilters.N' is the wrong type …, expected type 'object'").
+- An empty array filter (`{}`) now raises code 9 ("Cannot use an expression
+  without a top-level field name in arrayFilters").
+- An identifier that isn't an alphanumeric string beginning with a lowercase
+  letter (e.g. `1x`, `X`) now raises code 2 ("Error parsing array filter …").
+- Two array filters with the same top-level identifier now raise code 9
+  ("Found multiple array filters with the same top-level field name …").
+- An array-filter identifier that no `$[<id>]` path in the update references now
+  raises code 9 ("The array filter for identifier '<id>' was not used in the
+  update …").
+
+#### Notes
+
+- An array filter whose only top-level keys are `$`-operators (e.g.
+  `{$and: [{x: …}]}`) carries a *nested* identifier that SecantusDB doesn't
+  extract yet; such a filter is left unvalidated rather than wrongly rejected
+  (tracked in `tasks/backlog.md`).
+
+### $bitsAllSet / $bitsAllClear / $bitsAnySet / $bitsAnyClear validate their argument, like mongod
+
+The bitwise query operators mishandled several non-integer arguments. A negative
+bit position (`$bitsAllSet: [-1]`) raised an *uncaught* `ValueError` (from
+`1 << -1`) that surfaced without a code, a negative or fractional non-array
+bitmask was silently accepted or reported the wrong code, and the Rust server
+*rejected a valid whole-number-double* mask/position (`$bitsAllSet: 6.0`) because
+its coercion didn't accept doubles.
+
+All four operators now match mongod on both servers: a whole-number double is
+accepted (truncated), and a fractional double, a bool, or a negative value is
+rejected — a bad *bit position* with code 2, a bad non-array *mask* with code 9 —
+on the Python server with mongod's messages, the Rust core deferring to
+`BadValue`. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$bits*` accept a whole-number-double mask / bit position and reject a
+  fractional / negative / bool one with mongod's exact code, instead of raising
+  an uncaught `ValueError` on a negative position, silently accepting a negative
+  mask (Python), or rejecting a valid `6.0` (Rust server).
+
+### $bucket errors on an out-of-range value instead of silently dropping the document
+
+`$bucket` did almost no validation. Worst of all, a document whose `groupBy` value
+fell outside every bucket and had no `default` was **silently dropped** — silent
+data loss. mongod errors (7158303). It now does too, on both servers.
+
+`$bucket` also now validates the rest of its spec like mongod, instead of
+silently accepting it: missing `groupBy` (40198), non-array `boundaries` (40200),
+fewer than two boundaries (40192), boundaries of mixed type (40193) or not
+strictly ascending / duplicated (40194), a `default` that falls inside the bucket
+range (40199), and a non-document `output` (40196). The Python server carries
+mongod's codes; the Rust core defers those cases to `BadValue`. Valid buckets are
+unaffected. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$bucket` errors (7158303) on an out-of-range value with no `default` instead
+  of silently dropping the document, and rejects an invalid spec (missing
+  groupBy, bad/unsorted/mixed boundaries, in-range default, non-doc output) with
+  mongod's codes instead of silently accepting it (both servers).
+
+### Argument validation for `$bucketAuto`, projection `$elemMatch`, and `$pull` / `$pullAll`
+
+Three more type-guard divergences from real mongod are closed. `$bucketAuto`
+now validates its `buckets` argument (a bool or non-numeric value, a fractional
+double, a non-positive count, or a missing `groupBy`/`buckets` each raise
+mongod's exact code, while a whole-double count is accepted); a non-document
+`$elemMatch` projection argument is rejected; and `$pull` / `$pullAll` against a
+field that is present but not an array now errors instead of silently doing
+nothing. All three are covered on both the Python and Rust servers (the Rust
+core defers each invalid case) and verified against real mongod 7.0.12.
+
+#### Fixed
+
+- `$bucketAuto` `buckets` now raises `Location40241` (non-numeric or bool),
+  `Location40242` (fractional double — not representable as a 32-bit integer),
+  `Location40243` (not greater than 0), and `Location40246` (missing `groupBy`
+  or `buckets`) instead of silently accepting `buckets: true` or leaking an
+  uncoded error. A whole-double `buckets` (e.g. `2.0`) is accepted, matching
+  mongod.
+- A non-document `$elemMatch` projection argument (e.g. `{arr: {$elemMatch: 5}}`)
+  now raises `Location31274` instead of being silently accepted.
+- `$pull` / `$pullAll` on a field that exists but is not an array (a scalar or
+  `null`) now raises code 2 ("Cannot apply $pull to a non-array value") instead
+  of silently doing nothing. A missing field remains a no-op.
+
+### `$bucketAuto` `granularity` validation
+
+The optional `granularity` argument to `$bucketAuto` is now validated against
+real mongod's rules instead of being silently ignored. A non-string value
+raises code 40261, and an unknown series name raises 40257 — both matching
+mongod 7.0.12 exactly. A *valid* preferred-number series (`R5`, `R10`, …,
+`POWERSOF2`, `1-2-5`, `E6`, …) is rejected as not-yet-supported (code 2) rather
+than silently producing count-chunked, unrounded boundaries: reproducing
+mongod's boundary rounding byte-for-byte would require its exact internal
+float series constants (its `6.3` is the f64 `6.3000000000000007`, not
+`float("6.3")`), which aren't recoverable by black-box probing — so a faithful
+error is preferred over a silently-divergent result (see `tasks/backlog.md`).
+Both the Python and Rust servers behave identically.
+
+#### Fixed
+
+- `$bucketAuto` with a non-string `granularity` now raises `Location40261`, and
+  with an unknown series name `Location40257`, instead of accepting them.
+
+#### Changed
+
+- `$bucketAuto` with a valid but unsupported `granularity` series now raises an
+  explicit "not yet supported" error (code 2) instead of silently ignoring the
+  field and returning unrounded boundaries.
+
+### $bucketAuto `granularity` rounds boundaries to preferred-number series
+
+`$bucketAuto` now honours the `granularity` option (`R5`/`R10`/`R20`/`R40`/`R80`,
+`E6`/`E12`/`E24`/`E48`/`E96`/`E192`, `1-2-5`, and `POWERSOF2`), rounding bucket
+boundaries to the ISO preferred-number series exactly as mongod does — instead of
+rejecting a valid series as unsupported. The rounding is **hex-exact against real
+mongod 7.0.12**, including mongod's non-standard floating-point results (its `R5`
+boundary at 6.3 is the double `6.300000000000001`, i.e. `63 * 0.1`).
+
+The rounder and the boundary walk were ported verbatim from mongod's
+`granularity_rounder_preferred_numbers.cpp` and `document_source_bucket_auto.cpp`
+to both the Python server and the Rust core (which backs the Rust server), so the
+two agree bit-for-bit and both match mongod. A `granularity` groupBy value must be
+a non-negative number: a non-numeric value, a `NaN`, or a negative number is
+rejected (mongod codes 40258 / 40259 / 40260 on the Python server). A
+Decimal128-valued groupBy is deferred (the standing Decimal128 precision
+limitation); the int/double path is complete.
+
+#### Added
+
+- `$bucketAuto` `granularity` boundary rounding for every preferred-number series
+  and `POWERSOF2`, hex-exact to mongod 7.0.12 on both the Python and Rust servers.
+
+#### Fixed
+
+- A `$bucketAuto` `granularity` groupBy value that is non-numeric (40258), `NaN`
+  (40259), or negative (40260) is now rejected with mongod's code instead of the
+  previous blanket "unsupported" error.
+
+### CI stops cancelling its own answers
+
+Two blind spots on the same theme — checks that quietly produced no result,
+so a breakage could sit on `main` looking green.
+
+The docs had no CI at all. `test.yml` and both wheel workflows carry
+`paths-ignore: ['**.md', 'LICENSE*', 'docs/**']`, which is right for a test
+matrix but means a docs-only commit skips CI entirely — and that is exactly
+how the Sphinx build came to be failing on `main` through many green pushes.
+A new `Docs` workflow builds both trees with warnings-as-errors. It has no
+`paths` filter on purpose: `conf.py` runs autodoc over the package, so a
+malformed docstring in a code-only commit can break the docs build, and
+filtering to `docs/**` would recreate the same blind spot facing the other
+way. The build compiles nothing — the WiredTiger extension is mocked — so
+running it on everything is the cheapest job in the repo.
+
+The second was subtler. All three of `Tests`, `Build wheels` and `Build
+secantus-core wheels` cancelled in-progress runs per ref. On a feature branch
+that is what you want, since the newest push should win. On `main` every
+merge lands on the same ref, so on a busy day each merge cancelled the
+previous commit's post-merge run: several consecutive merges each showed
+`cancelled`, meaning the default branch went long stretches with no completed
+result and a wheel-only regression would not have surfaced until a release
+tag. Cancellation is now disabled on `main` only, so those runs queue and
+each finishes, while pull requests keep newest-push-wins.
+
+#### Added
+
+- A `Docs` workflow building `docs/` and `docs-rust/` with `sphinx-build -W`,
+  covering the gap left by every other workflow's `paths-ignore`.
+
+#### Fixed
+
+- `Tests`, `Build wheels` and `Build secantus-core wheels` no longer cancel
+  their own post-merge runs on `main`. Runs on the default branch queue and
+  complete; pull-request branches still cancel superseded runs.
+
+### $concat rejects non-string operands instead of coercing them
+
+`$concat` silently `str()`-coerced any operand — `{$concat: ["x=", 5]}` produced
+`"x=5"` — and treated a null / missing operand as an empty string. mongod requires
+every operand to be a string: a non-string operand is `Location16702` ("$concat
+only supports strings, not <type>"), and a null or missing operand short-circuits
+the whole expression to `null` (evaluated left-to-right, so a non-string that
+precedes a null still errors). Both servers now match.
+
+The Python server carries mongod's code; the Rust core defers a non-string operand
+(so the Rust server rejects it) and now returns `null` on a null operand rather
+than skipping it. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$concat` rejects a non-string operand with `Location16702` and returns `null`
+  for a null / missing operand, instead of `str()`-coercing operands or treating
+  null as an empty string (both servers).
+
+### Concurrency stress suites hammer the servers — and the races they caught are fixed
+
+Two new concurrency harnesses hammer the servers with barrier-synchronized
+thread storms — one drives the Mongo-wire servers (the Python server and the
+embedded Rust server, every test parametrized over both) through real pymongo
+clients, the other drives the PostgreSQL-wire server through psycopg —
+same-key insert races, transactional increment hammers, bank-transfer
+invariants under concurrent readers, findAndModify ticket dispensers, unique-
+index races, DDL churn against live writers, and connection churn under load.
+Every test asserts a hard integrity invariant (exact counts, exactly one race
+winner, a conserved total) plus error hygiene: the only errors a loser may see
+are the typed, retriable signals a real server would send.
+
+The harnesses caught five real concurrency bugs, now fixed on every affected
+server. A SQL write-write conflict escaped as a generic `XX000 internal
+error`; it now surfaces as SQLSTATE `40001 serialization_failure`, the
+retriable signal drivers key their retry loops on, and the losing connection
+stays fully usable. SQL DML statements are read-modify-write sequences
+spanning several storage calls, so concurrent inserts could double-satisfy a
+`UNIQUE` constraint (134 rows landed for 30 distinct values in the
+reproducer) and concurrent `SET n = n + 1` updates lost increments (83 of 400
+survived); DML statements — and bare `nextval()` draws — now serialize per
+shared storage, closing both. `findAndModify {new: true}` on both Mongo-wire
+servers re-found the document after updating it, so two concurrent callers
+could be handed the same post-image (8 duplicate tickets in 400 measured);
+the write now captures its own post-image while it holds the storage lock,
+on the Python server and the Rust server alike. And findAndModify's write
+now re-asserts the original query (keyed by the matched `_id`, in a re-pick
+loop) on both servers, so job-queue claims and fam removes are exclusive —
+two workers can no longer both "take" the same document.
+
+#### Added
+
+- `tests/test_pgserver_concurrency.py` — 11 psycopg-driven stress tests:
+  autocommit insert storms, same-PK and UNIQUE-constraint races (exactly one
+  winner, losers see `23505`), transactional and autocommit increment hammers,
+  a deterministic two-transaction `40001` conflict, bank transfers conserving
+  the total under concurrent readers, concurrent `nextval()`, DDL churn
+  alongside DML, connection churn under write load, extended-protocol prepared
+  statements across threads, and a bounded txn-vs-autocommit stall check.
+- `tests/test_mongo_server_concurrency.py` — one pymongo-driven harness
+  parametrized over BOTH Mongo-wire servers (the pure-Python
+  `SecantusDBServer` and the embedded Rust server): insert storms, `$inc`
+  hammers, findAndModify ticket dispensers, upsert races, unique-index races,
+  readers paginating (`getMore`) through churn, index builds under write
+  load, multi-collection writers, delete/insert churn, client connection
+  churn, and a change stream observing every insert from four concurrent
+  writers, plus job-queue claim-exclusivity and remove-exclusivity storms.
+  Every test runs against both servers.
+- `Storage.update_matching(..., return_post_images=True)` — returns the
+  post-image of each write, captured while the statement holds the storage
+  lock, so command handlers never re-read what they just wrote.
+
+#### Fixed
+
+- SQL: a storage-level write-write conflict (`WriteConflictError` /
+  `WT_ROLLBACK`) now maps to SQLSTATE `40001 serialization_failure` on both
+  the simple and extended protocol paths, instead of escaping as `XX000
+  internal error`; the losing connection survives, `ROLLBACK` works, and
+  retry converges.
+- SQL: DML statements serialize per shared storage, so concurrent inserts can
+  no longer double-satisfy a `UNIQUE` constraint and concurrent computed
+  updates (`SET n = n + 1`) no longer lose increments. Bare
+  `SELECT nextval('seq')` draws are serialized the same way and never repeat
+  a value.
+- `findAndModify {new: true}` — on BOTH Mongo-wire servers — returns the
+  post-image of its own write instead of a racy re-read, so concurrent
+  callers can no longer be handed the same ticket. Python captures it via
+  `Storage.update_matching(..., return_post_images=True)`; the Rust storage
+  grew the matching primitive (`UpdateOutcome::post_image`). The upsert path
+  returns the upserted document from the write itself.
+- findAndModify (both servers) re-asserts the original query at write time —
+  the update/delete is keyed by the matched `_id` *plus* the query, in a
+  re-pick loop — so the job-queue pattern (`{state: "new"}` →
+  `{$set: {state: "taken"}}`) can no longer double-claim a document, and a
+  fam remove checks its deleted-count so two removes can never both claim
+  the same pre-image. This mirrors mongod re-evaluating the predicate when
+  it acquires the document write.
+
+### mongod-specific error codes for conversion / string-length / sort expressions
+
+Several aggregation expressions raised a generic `TypeMismatch` (code 14) where
+real mongod returns a specific error code. They now match mongod 7.0.12, so a
+`pymongo` client sees the same `code` on a failed operation. This is a Python
+server refinement — the Rust server already surfaced `BadValue` for these.
+
+#### Fixed
+
+- `$toInt` / `$toLong` / `$toDouble` / `$toDecimal` on an unparseable numeric
+  string now raise `ConversionFailure` (241) instead of 14.
+- `$convert` with an unknown target type name now raises code 2
+  ("Unknown type name: …") and is **not** swallowed by `onError` (a query-compile
+  error, matching mongod), instead of 14.
+- `$sortArray` on a non-array input now raises `Location2942504` instead of 14.
+- `$strLenCP` / `$strLenBytes` on a non-string argument now raise
+  `Location34471` / `Location34473` instead of 14.
+
+### $toInt and $convert enforce int32 / int64 overflow bounds
+
+`$toInt` and `$convert` (to `int` / `long`) never range-checked their result:
+`$toInt: 1e30` returned an unbounded Python integer, and a value larger than the
+target type silently widened instead of overflowing. mongod errors (241,
+"Conversion would overflow target type in $convert") — or routes to `$convert`'s
+`onError`. SecantusDB now does the same on both servers.
+
+`$toInt` also now yields an int32 (a plain int on the wire) rather than
+preserving an int64 input's type, matching mongod, which always narrows to int.
+Non-finite doubles (`inf` / `nan`) overflow rather than raising an uncaught
+Python error. The Python server carries mongod's 241 code; the Rust core defers
+the overflow cases to `BadValue`. Valid in-range conversions are unaffected.
+Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$toInt` / `$convert` (int/long) error on an out-of-range or non-finite value
+  (mongod 241, caught by `$convert`'s `onError`) instead of returning an
+  unbounded / silently-widened integer, and `$toInt` narrows an int64 input to
+  int32 like mongod (both servers).
+
+### Expanded change-stream events now match mongod field-for-field
+
+`showExpandedEvents` change streams now reproduce mongod 7.0.12's event
+shapes exactly, on both servers. Expanded update events always carry
+`disambiguatedPaths` — an empty document when nothing was ambiguous — and
+plain streams never do. `dropIndexes` events describe the dropped index in
+full (`{v, key, name}`, with the key spec captured at drop time), matching
+`createIndexes`. And the Rust server now emits `dropIndexes` events on the
+`dropIndexes: "*"` path at all — its `drop_all_indexes` previously skipped
+the oplog, so `drop_indexes()` from a driver produced no event.
+
+#### Fixed
+
+- Expanded update events carry `disambiguatedPaths` (both servers); the key
+  is correctly absent without `showExpandedEvents`.
+- `dropIndexes` events describe the dropped index in full on both servers,
+  and the Rust server emits them for `dropIndexes: "*"`.
+
+### $dateAdd / $dateSubtract / $dateTrunc validate their integer arguments
+
+The date-arithmetic operators mishandled a non-integer `amount` / `binSize`: a
+whole double (`2.0`) was over-rejected, and a bool was silently coerced to `1`.
+mongod accepts an integer or a whole double, and rejects everything else: a
+fractional double / bool / non-numeric `amount` is `Location5166405` ("$dateAdd
+expects integer amount of time units"), a non-integer `binSize` is
+`Location5439017`, and a non-positive `binSize` is `Location5439018`. Both servers
+now match.
+
+The Python server carries mongod's codes; the Rust core (via a new `date_int`
+helper) now accepts a whole-double argument rather than deferring — so the Rust
+server no longer rejects a valid `amount: 2.0` — and defers the invalid cases.
+Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$dateAdd` / `$dateSubtract` accept a whole-double `amount` and reject a
+  fractional / bool / non-numeric one (`Location5166405`); `$dateTrunc` accepts a
+  whole-double `binSize` and rejects a non-integer (`Location5439017`) or
+  non-positive (`Location5439018`) one (both servers).
+
+### Date and misc aggregation operators match mongod's error codes
+
+Continuing the operator error-code sweep, a set of date and miscellaneous
+aggregation operators now raise mongod 7.0.12's exact error code instead of a
+generic `TypeMismatch` (14) — and two more **silent accepts** are closed
+(`$dateToString` on a non-date, and `$dateDiff` with a missing `endDate`
+parameter, both of which returned a value where mongod errors). Both the Python
+and Rust servers are fixed (the Rust core defers each case — `$dateToString`
+and `$dateDiff` needed Rust-side fixes to stop computing `null`).
+
+#### Fixed
+
+- `$dateToString` / `$dateToParts` on a non-date `date` → `Location16006`
+  (`$dateToString` was a silent `null`; a `null`/missing date stays valid).
+- `$dateFromString` with a non-string `dateString` → `ConversionFailure` (241).
+- `$dateAdd` / `$dateSubtract` / `$dateTrunc` with an unknown `unit` → code 9
+  ("unknown time unit value").
+- `$dateDiff` with a missing `startDate`/`endDate`/`unit` **parameter** →
+  `Location5166303`/`5166304`/`5166305` (was a silent `null` for a missing
+  `endDate`; a present-but-null parameter still yields `null`).
+- `$let` referencing an undefined variable → `Location17276`.
+- `$switch` with no branches → `Location40068`.
+- `$ifNull` with fewer than two arguments → `Location1257300`.
+- `$getField` / `$setField` with a non-string `field` → `Location5654602` /
+  `Location4161107`.
+- `$sortArray` with an invalid `sortBy` → `Location2942507`.
+- `$convert` with a missing `input`/`to` parameter → code 9.
+
+### $densify validates its range spec
+
+The `$densify` stage didn't validate its `range`. A date `unit` applied to a
+numeric field leaked a raw Python `TypeError` (adding a `timedelta` to an int), a
+bool `step` was silently coerced to `1`, a non-positive `step` and malformed
+`bounds` (a bad string, a wrong-length array, a descending array) were quietly
+accepted or mis-handled. mongod rejects each with a specific code: a numeric value
+under a date unit is `6053600`, a bool step is `14`, a non-positive step is
+`5733401`, a bounds string that isn't `"full"` / `"partition"` is `5946802`, a
+bounds array that isn't exactly two elements is `5733403`, and a non-ascending
+bounds array is `5733402`. A fractional `step` (`1.5`) is still accepted. Both
+servers now match.
+
+The Python server carries mongod's codes; the Rust core defers every invalid case
+(bool step included) so the Rust server rejects them too. Three-way mongod
+7.0.12-verified.
+
+#### Fixed
+
+- `$densify` rejects a date unit on a numeric value (`6053600`), a bool step
+  (`14`), a non-positive step (`5733401`), and a malformed `bounds` string /
+  array (`5946802` / `5733403` / `5733402`), instead of leaking a Python
+  `TypeError`, coercing a bool, or silently mis-handling the range (both servers).
+
+### Range operators now order embedded documents, like mongod
+
+`$gt` / `$gte` / `$lt` / `$lte` against an embedded-document bound returned
+*nothing* on both the Python and Rust servers — `{a: {$gt: {x: 1}}}` matched
+no documents at all — because Python's `operator.gt` raises `TypeError` on two
+dicts (swallowed to a silent no-match) and the Rust matcher treated any
+document operand as an unconditional no-match. mongod orders embedded
+documents field-by-field (first differing key compares as a string, else
+recurse into the value, else the shorter document sorts first), so those
+queries should have matched. Found while triaging the driver-gauge results and
+verified against a live mongod 7.0.12 probe; now three-way parity (Python ==
+Rust == mongod). The type bracket is preserved — a document-valued field still
+never matches a scalar bound, and vice versa.
+
+#### Fixed
+
+- Range operators order two embedded documents field-by-field (both servers)
+  instead of matching nothing.
+
+### Docs: the benchmark pages get charts
+
+`docs/benchmark.md` and `docs/concurrency.md` now open their result
+sections with inline SVG charts — grouped latency-multiplier bars against
+a mongod = 1x reference, and the three-server concurrency-scaling lines —
+theme-aware for furo's light and dark modes (palette validated for both
+surfaces), with native tooltips and the tables kept as the data view.
+Matches the charts on secantusdb.com/performance.html.
+
+### Aggregation expressions reject a bool where a number is expected, like mongod
+
+The bool-as-int cluster reaches the aggregation expression engine. Because
+Python's `bool` is an `int` subclass (and the Rust core mapped `Boolean`
+straight to 0/1), a bool argument slipped through the numeric checks of eight
+operators and was *computed* instead of *rejected*: `$round`/`$trunc` treated
+`true` as a decimal place, `$arrayElemAt`/`$slice`/`$indexOfArray`/`$substrCP`
+treated it as an index, and `$sortArray` as a sort direction. Every one is a
+parse error in real mongod — a bool is not a number — and both servers now say
+so.
+
+The Python server reports mongod's exact per-operator codes (`$round`/`$trunc`
+16004, `$arrayElemAt` 28690, `$slice` 28725/28727, `$sortArray` 2942507,
+`$substrCP` 34450/34452, `$range` 34443/34445/34447, `$indexOfArray` 40096) and
+messages; the Rust server surfaces `BadValue`. Found while sweeping the
+aggregation surface for the same root cause as the `$inc`/`$mul` and
+`$pop`/`$position`/`$slice`/`$bit` clusters; three-way mongod 7.0.12-verified.
+`$range` already rejected a bool (with a generic code) and now carries mongod's
+per-argument code.
+
+#### Fixed
+
+- `$round`, `$trunc`, `$arrayElemAt`, `$slice`, `$sortArray`, `$substrCP`,
+  `$range`, and `$indexOfArray` reject a bool argument with mongod's exact
+  error code instead of coercing it to 0/1 (both servers).
+
+### `$sum` / `$avg` / `$max` / `$min` as expression operators
+
+MongoDB 5.0 made `$sum`, `$avg`, `$max`, and `$min` usable as ordinary
+expression operators — over an array or a single value, anywhere an expression
+is accepted (e.g. inside `$project`/`$addFields`), not only as `$group`
+accumulators. SecantusDB previously rejected these as unknown expression
+operators (code 168); they now compute, matching real mongod 7.0.12.
+
+#### Added
+
+- `$sum` / `$avg` / `$max` / `$min` as expression operators. An array argument
+  reduces over its elements; a scalar is a single value; a missing/absent
+  argument contributes nothing. `$sum`/`$avg` ignore non-numeric elements
+  (`$sum` of an empty/all-non-numeric input is `0`, `$avg` is `null`);
+  `$max`/`$min` order by BSON cross-type order and ignore `null` (empty →
+  `null`).
+
+#### Notes
+
+- Implemented on the Python server (the pymongo conformance target). The Rust
+  core defers these to Python, so the embedded Rust server does not yet compute
+  them — tracked in `tasks/backlog.md`.
+
+### $facet validates its spec instead of leaking on a malformed sub-pipeline
+
+The `$facet` stage didn't validate its spec. A sub-pipeline element that wasn't a
+stage document (`{a: [5]}`) leaked a raw Python `TypeError`, an empty `{}` spec and
+a nested `$facet` were silently accepted, and a non-array sub-pipeline gave a
+generic error. mongod rejects each: an empty / non-object spec is `40169`, a
+non-array sub-pipeline is `40170`, a non-object stage element is `40171`, and a
+`$facet` nested inside a `$facet` is `40600`. Both servers now match.
+
+An empty sub-pipeline (`{a: []}`) remains valid. The Python server carries mongod's
+codes; the Rust core defers every invalid case (empty spec and nested `$facet`
+included) so the Rust server rejects them too. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$facet` rejects an empty / non-object spec (`40169`), a non-array sub-pipeline
+  (`40170`), a non-object stage element (`40171`), and a nested `$facet` (`40600`),
+  instead of leaking a Python `TypeError` or silently accepting the malformed spec
+  (both servers).
+
+### Array-index operators accept a whole-number double, like mongod
+
+`$arrayElemAt`, `$slice`, and `$indexOfArray` rejected *every* non-integer index,
+but mongod accepts a **whole-number double** (`$arrayElemAt: [[...], 2.0]` →
+element 2; `-1.0` → last element) and rejects only a *fractional* one. SecantusDB
+now matches: a whole double is coerced to the integer index (so both servers
+compute the same element), and a fractional double raises mongod's per-operator
+code — `$arrayElemAt` 28691, `$slice` 28726 (second arg) / 28728 (third arg),
+`$indexOfArray` 40096.
+
+This mattered beyond fidelity: the fix had to land on both servers together —
+had only the Python engine learned to accept `2.0`, the two servers would have
+*disagreed* on a valid index (Python returning the element, the Rust server
+erroring). Ground truth probed against mongod 7.0.12; three-way verified.
+
+#### Fixed
+
+- `$arrayElemAt`, `$slice`, and `$indexOfArray` accept a whole-number double
+  index (coerced to int) instead of returning null/-1, and reject a fractional
+  double with mongod's exact per-operator error code (both servers).
+
+### Whole-number-double acceptance completed for $substrCP, $range, and $round/$trunc
+
+Finishes the whole-number-double sweep begun for the array-index operators. Like
+mongod, `$substrCP` (start/length), `$range` (start/end/step), and the precision
+argument of `$round`/`$trunc` now accept a whole-number double (coerced to the
+integer) and reject a *fractional* one with mongod's exact per-argument code
+rather than rejecting every non-integer. So `$range: [0.0, 5.0, 1.0]` yields
+`[0,1,2,3,4]` on both servers, while `$range: [0, 5.7]` raises 34446.
+
+The Python server carries mongod's codes — `$substrCP` 34451/34453, `$range`
+34444/34446/34448, `$round`/`$trunc` place 51082 — and the Rust core coerces the
+whole double (computing the same result) or defers the fractional case to
+`BadValue`. As with the array operators, the coercion had to land on both engines
+together so they never disagree on a valid whole-double argument. Three-way
+mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$substrCP`, `$range`, and `$round`/`$trunc` (precision) accept a whole-number
+  double argument (coerced to int) and reject a fractional one with mongod's
+  exact error code, instead of rejecting all non-integer values (both servers).
+
+### $group accumulators stop coercing non-numeric values
+
+`$sum` and `$avg` accumulated whatever the input expression produced — a bool
+folded in as `1`, and other non-numeric values either coerced or leaked a Python
+error. mongod ignores non-numeric operands entirely: `$sum` of a group with no
+numeric value is `0`, `$avg` is `null`. Both servers now match.
+
+`$min` and `$max` compared values with Python's native `<` / `>`, which raises
+on a cross-type pair (a number vs a string) — so a mixed-type field errored
+where mongod returns a real extreme. They now ignore null / missing and order
+every other value by BSON cross-type order (number < string < bool < …), so
+`$max` over `[10, "hi", true]` is `true`, matching mongod. On the Rust server
+these mixed-type groups previously deferred to a `BadValue`; they now compute.
+Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$sum` / `$avg` ignore non-numeric operands (string / bool / null / missing)
+  instead of coercing or erroring — an all-non-numeric group yields `0` / `null`
+  like mongod (both servers).
+- `$min` / `$max` order mixed-type values by BSON cross-type order and skip
+  null / missing, instead of raising on a cross-type comparison (both servers).
+
+### $in / $nin validate their argument instead of leaking or silently no-matching
+
+`$in` and `$nin` never checked their argument. A non-array (`{a: {$in: 5}}`)
+leaked a raw Python `TypeError`, and an array element that was a document with a
+`$`-prefixed key (`{$regex: …}` or `{$x: 1}`) silently matched nothing. mongod
+rejects both with `BadValue`: "$in needs an array" and "cannot nest $ under $in".
+Both servers now do the same.
+
+A BSON regex *literal* (`/x/`) and a plain subdocument element remain valid. The
+Python server carries mongod's `BadValue`; the Rust core defers these cases so
+the Rust server rejects them too. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$in` / `$nin` reject a non-array argument ("needs an array") and an array
+  element that is a document with a `$`-prefixed key ("cannot nest $ under $in")
+  with `BadValue`, instead of leaking a Python `TypeError` or silently matching
+  nothing (both servers).
+
+### $inc / $mul reject a non-numeric argument, like mongod
+
+`$inc` and `$mul` silently computed with a bool argument — `{$inc: {n: true}}`
+added 1 and `{$mul: {n: false}}` multiplied by 0, because Python's `bool` is an
+`int` subclass — and the Python engine raw-raised a `ValueError`/`TypeError`
+on a string or null argument instead of a clean coded error. mongod rejects
+any non-number argument with `Cannot increment with non-numeric argument:
+{field: value}` (code 14). Both servers now reject it: the Python server
+raises mongod's exact message and code; the Rust server surfaces `BadValue`
+(the standing update error-code gap), but neither silently computes a wrong
+result. Found while triaging the driver-gauge update operators; three-way
+mongod-verified.
+
+#### Fixed
+
+- `$inc` / `$mul` by a bool, string, or null argument is rejected instead of
+  computing a wrong value (both servers); the Python server reports mongod's
+  code 14 and message.
+
+### $indexOfBytes / $indexOfCP validate their start / end index
+
+The `$indexOfBytes` and `$indexOfCP` operators mishandled a non-integer start /
+end index: a whole double (`2.0`) was silently ignored (the whole expression
+returned `-1`), and a bool was coerced to an integer. mongod accepts an integer or
+a whole double, and rejects everything else: a fractional double, a bool, or a
+non-numeric index is `Location40096` ("requires an integral … index"), and a
+negative index is `Location40097` ("requires a nonnegative … index"). Both servers
+now match.
+
+The Python server carries mongod's codes (reproducing its verbatim missing-space
+message quirk); the Rust core defers the invalid cases and now computes a
+whole-double index rather than returning `-1`. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$indexOfBytes` / `$indexOfCP` accept a whole-double start / end index and reject
+  a fractional / bool / non-numeric index (`Location40096`) or a negative one
+  (`Location40097`), instead of silently returning `-1` or coercing a bool (both
+  servers).
+
+### $jsonSchema grows mongod's full keyword surface — and rejects what mongod rejects
+
+The `$jsonSchema` query operator now covers every keyword real mongod accepts,
+on both servers, with semantics pinned by a live probe against mongod 7.0:
+`multipleOf` (fmod semantics, fractional divisors included), tuple-form
+`items` with `additionalItems` (false / schema / absent), and the `title` /
+`description` metadata keywords (accepted and ignored, with mongod's string
+type check). Exclusive bounds move to the draft-4 semantics mongod actually
+implements — `exclusiveMinimum` / `exclusiveMaximum` are booleans that
+sharpen `minimum` / `maximum` to a strict bound, and the draft-6 numeric form
+is rejected at parse time (the previous numeric treatment was a silent
+divergence).
+
+Just as important is what gets rejected: schema keywords are now validated at
+parse time, recursively through every sub-schema, with mongod's verbatim
+codes and messages — an unknown keyword or a known-but-unsupported one
+(`$ref`, `$schema`, `default`, `definitions`, `format`, `id`) is
+`9 FailedToParse`, and a type violation (non-number `multipleOf`, non-boolean
+exclusive bound, non-string metadata, non-object schema) is
+`14 TypeMismatch` — before a single document is scanned, even on an empty
+collection. Previously both servers silently ignored anything they didn't
+recognise, so a typo'd keyword matched everything.
+
+#### Added
+
+- `$jsonSchema` keywords `multipleOf`, tuple-form `items` +
+  `additionalItems`, and `title` / `description`, on both servers, with
+  curated parity coverage.
+- Parse-time recursive keyword validation on both servers
+  (`query._check_json_schema_keywords` / `secantus_core::query::
+  json_schema_keyword_error`), with mongod's verbatim errors.
+- `QueryError` carries a `code` / `code_name` (default `2 BadValue`), so
+  parse-time errors with documented distinct codes surface faithfully
+  through find, update, and delete write-error paths.
+
+#### Changed
+
+- `$jsonSchema` exclusive bounds follow draft-4 (boolean) semantics, matching
+  mongod; the draft-6 numeric form now errors instead of silently applying.
+
+#### Fixed
+
+- A `$jsonSchema` with a mistyped or unsupported keyword no longer silently
+  matches every document — it errors exactly as mongod does.
+
+### $limit and $skip validate their argument like mongod
+
+The `$limit` and `$skip` stages coerced their argument naively (`int(spec)`), so a
+range of invalid inputs silently produced wrong results instead of the error
+mongod raises: `$limit: 0` returned nothing (mongod: "the limit must be
+positive"), `$limit: -1` did a Python negative-slice, and a bool or fractional
+double was quietly truncated/coerced. The Rust server had the mirror-image bug —
+it *rejected a valid whole-number double* (`$limit: 2.0`) because its integer
+coercion didn't accept doubles, while still coercing a bool to 1.
+
+Both stages now match mongod: a whole-number double is accepted (coerced to the
+count), and a bool, a fractional double, or a negative value is rejected — the
+Python server with mongod's exact codes (`$limit` 5107201, `$skip` 5107200,
+plus 15958 for a zero `$limit`), the Rust core deferring to `BadValue`. `$skip: 0`
+stays valid. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$limit` / `$skip` accept a whole-number double and reject a bool / fractional /
+  negative argument (and `$limit` a zero) with mongod's exact error code, instead
+  of silently coercing it (Python) or rejecting a valid `2.0` (Rust).
+
+### Log-family domain errors now match mongod
+
+An out-of-domain argument to the log family — `$ln` or `$log10` of a
+non-positive number, `$log` with a non-positive argument or a base that is
+non-positive or 1, `$sqrt` of a negative number — now raises mongod's exact
+Location error (28766 / 28761 / 28758 / 28759 / 28714, messages verbatim from
+a mongod 7.0.12 probe) on both servers, instead of silently returning null.
+NaN inputs now propagate as NaN (IEEE, matching mongod); null and missing
+still yield null.
+
+#### Fixed
+
+- `$ln` / `$log` / `$log10` / `$sqrt` out-of-domain arguments error exactly
+  as mongod does, on both servers (the Rust engine defers those cases so the
+  Python error surfaces).
+
+### $log rejects a non-numeric argument or base
+
+`$log` type-checked neither of its operands: a string argument or base leaked a
+raw Python `TypeError`, and a bool was silently coerced to `1` / `0`. mongod
+rejects both — a non-numeric argument is `Location28756`, a non-numeric base is
+`Location28757` — before the positive-domain check, while `null` still passes
+through as `null`. Both servers now match, completing the math-operator type-guard
+family (the unary ops landed in the previous slice).
+
+The Python server carries mongod's codes; the Rust core defers these cases (bool
+included, reusing the `math_float` helper) so the Rust server rejects them too.
+Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$log` rejects a non-numeric (incl. bool) argument (`Location28756`) or base
+  (`Location28757`) instead of coercing a bool or leaking a Python `TypeError`
+  (both servers).
+
+### $median and $percentile land on both servers — no t-digest required
+
+The `$median` and `$percentile` group accumulators — and their expression
+forms over arrays — now run on both the Python and Rust servers, with
+semantics pinned by a live probe against real mongod 7.0.12. On bounded data
+mongod's "approximate" method resolves to a discrete percentile —
+`sorted[max(0, ceil(p·n) − 1)]`, returned as a double — so no approximate
+t-digest sketch is needed and the two engines agree exactly: values collect
+from int, long, double, and Decimal128 inputs (as doubles), bool and NaN are
+excluded, and an empty input yields null (median) or per-`p` nulls
+(percentile), all exactly as mongod behaves.
+
+Spec validation carries mongod's verbatim codes and messages: a missing
+`method` / `input` / `p` field is `40414`, a method other than
+`"approximate"` is rejected with mongod's exact wording, a non-array `p` is
+`7750301`, and an out-of-range `p` value is `7750303`.
+
+#### Added
+
+- `$median` / `$percentile` as `$group` accumulators and as expression
+  operators, on both servers, with curated parity coverage, unit tests, and
+  wire tests against each server.
+
+### $mod matches mongod on floats, bools, and error cases
+
+A fourth query-operator bug from the driver-gauge triage, this time in `$mod`.
+mongod truncates both the field value and the divisor toward zero to integers,
+excludes bool (bool is not a number for `$mod`), and uses C-style truncated
+modulo (sign of the dividend). Both servers diverged: they matched a bool
+field (`{a: {$mod: [2, 1]}}` wrongly matched `a: true`), didn't truncate
+non-integer floats, and Python's floored `%` disagreed on negatives — and the
+Rust server outright errored (`BadValue`) on a double-valued field, aborting
+the whole query. Now both engines truncate value and divisor, exclude bool,
+compute C-style modulo, and raise mongod's errors for a zero divisor and a
+malformed spec — verified three-way against a live mongod 7.0.12 probe.
+
+#### Fixed
+
+- `$mod` truncates float values and divisors toward zero, excludes bool, and
+  uses C-style (truncated) modulo, matching mongod on both servers.
+- The Rust server no longer errors on a `$mod` query against a double-valued
+  field.
+- `$mod` with a zero divisor or a malformed spec raises like mongod.
+
+### More mongod error codes for `$zip` / `$arrayToObject` / `$replaceOne` / `$dateDiff`
+
+A second batch of aggregation expressions that raised a generic `TypeMismatch`
+(code 14) now return mongod 7.0.12's specific error code, so a `pymongo` client
+sees the same `code`. This clears the named-operator error-code rows from the
+divergence catalog's Tier 3. Python-server refinement (the Rust core already
+defers each case, so the Rust server surfaced `BadValue` — unchanged).
+
+#### Fixed
+
+- `$zip` with a non-array `inputs` now raises `Location34461`, and with a
+  non-array element inside `inputs` `Location34468`, instead of 14.
+- `$arrayToObject` on a non-array input now raises `Location40386`, and
+  `$objectToArray` on a non-document input `Location40390`, instead of 14.
+- `$replaceOne` / `$replaceAll` with a non-string argument now raise mongod's
+  per-argument code — `input` → 51746, `find` → 51745, `replacement` → 51744 —
+  instead of a single generic 51745.
+- `$dateDiff` with an unknown `unit` now raises code 9 ("unknown time unit
+  value: …") instead of 14.
+
+### $not and $elemMatch validate their arguments
+
+`$not` accepted any argument: `{$not: 5}` silently degraded to "not equal to 5"
+instead of erroring, and an empty `{$not: {}}` was accepted. `$elemMatch` accepted
+a non-object argument and mis-parsed it. mongod rejects both with `BadValue`: `$not`
+"needs a regex or a document" (a non-empty one — an empty document is "cannot be
+empty"), and `$elemMatch` "needs an Object". Both servers now match.
+
+A regex or an operator document under `$not`, and an object under `$elemMatch`,
+remain valid. The Python server carries mongod's `BadValue`; the Rust core defers
+these cases so the Rust server rejects them too. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$not` rejects a scalar / array / bool / empty-document argument ("needs a regex
+  or a document" / "cannot be empty"), and `$elemMatch` rejects a non-object
+  argument ("needs an Object"), with `BadValue` — instead of silently degrading to
+  an equality check or mis-parsing (both servers).
+
+### The SQL server reports IntervalStyle at startup
+
+`IntervalStyle` is one of postgres's `GUC_REPORT` parameters — a real
+server announces it in the startup `ParameterStatus` set so clients that
+decode intervals themselves know which style to parse. SecantusDB's SQL
+server tracked the setting internally, defaulting to `postgres`, but
+never announced it.
+
+That gap is invisible to psycopg's binary backend, because libpq keeps
+its own copy of the value, which is why the pinned test configuration
+never noticed. psycopg's pure-Python backend trusts the server instead:
+with the parameter absent it sees a style of `unknown` and raises
+`NotImplementedError` on any query returning an `interval`, so a client
+configuration that works against real postgres failed against
+SecantusDB. Anywhere psycopg falls back to the pure-Python
+implementation — a platform with no binary wheel, or an explicit
+`psycopg` install without the `[binary]` extra — hit it.
+
+The server now sends `IntervalStyle`, and the guarantee is pinned at the
+wire level rather than through a client, so it holds regardless of which
+psycopg implementation is installed.
+
+#### Fixed
+
+- The SQL server reports `IntervalStyle` in its startup
+  `ParameterStatus`, as real postgres does. Without it, psycopg's
+  pure-Python backend could not decode an `interval` value and raised
+  `NotImplementedError`.
+
+### $pow no longer crashes on a negative base with a fractional exponent
+
+`$pow` with a negative base and a fractional exponent (e.g. `$pow: [-2, 0.5]`)
+produced a Python **complex** number, which is unencodable — it crashed BSON
+serialization of the response. It now returns `NaN`, matching mongod. `$pow` also
+now validates its operands like mongod: a non-numeric base raises 28762, a
+non-numeric exponent (including a bool) raises 28763, and a zero base with a
+negative exponent raises 28764 — instead of silently coercing a bool, or leaking
+a raw Python `TypeError`/`ZeroDivisionError`. Both servers; the Rust core already
+returned `NaN` for the complex case (`f64::powf`) and now defers the bool /
+zero-negative-exponent cases so both servers agree. Three-way mongod 7.0.12-verified.
+
+This is the first fix from a **parallel divergence sweep** (recorded in
+`tasks/divergence-catalog.md`) that probed the full operator surface against real
+mongod and turned up a queue of type-coercion / argument-validation gaps.
+
+#### Fixed
+
+- `$pow` returns `NaN` for a negative base with a fractional exponent instead of
+  crashing BSON encode, and rejects a non-numeric / bool operand (28762 / 28763)
+  or a zero base with a negative exponent (28764) instead of coercing or leaking
+  a raw Python exception (both servers).
+
+### Projection $slice validates its argument
+
+A projection `$slice` silently accepted a malformed argument and returned the
+full or a wrong array. mongod validates it: the valid forms are a number
+(first / last n) or `[skip, limit]` with a **positive** limit; anything else is
+evaluated as the aggregation `$slice` *expression* and errors. A non-number
+scalar or an array with fewer than two / more than three elements is
+`Location28667` (wrong argument count); a two- or three-element array whose first
+element isn't a number is `Location28724`. A negative `[skip, limit]` limit and a
+three-element array are rejected the same way. Both servers now match.
+
+Valid forms — a number, and `[skip, limit]` with a positive limit (the skip may be
+negative) — are unaffected. The Python server carries mongod's codes; the Rust
+core defers the invalid shapes so the Rust server rejects them too. Three-way
+mongod 7.0.12-verified.
+
+#### Fixed
+
+- A projection `$slice` rejects a non-number scalar / short / long array
+  (`Location28667`) and a two/three-element array that isn't `[skip, positive
+  limit]` (`Location28724`), instead of silently returning the full or a wrong
+  array (both servers).
+
+### `$push` `$sort` direction validation and `$currentDate` boolean acceptance
+
+Two more update-operator divergences from real mongod are closed. A `$push`
+with a `$sort` modifier now rejects any direction that isn't exactly `1` or
+`-1` (previously an out-of-range value such as `2` silently sorted anyway), and
+`$currentDate` now accepts a boolean `false` (like `true`, it sets the current
+Date) instead of wrongly rejecting it. Both are verified against real mongod
+7.0.12.
+
+#### Fixed
+
+- `$push` `$sort` now raises code 2 when the whole-element sort direction is a
+  number other than `±1` ("The $sort element value must be either 1 or -1"),
+  when a `{field: dir}` direction is not `±1` ("The sort element value must be
+  either 1 or -1"), or when the spec is a non-numeric value such as a string,
+  bool, or array ("The $sort is invalid: use 1/-1 …"). A whole-double `±1`
+  (e.g. `1.0`, or `{field: 1.0}`) is accepted and sorts, matching mongod —
+  previously a whole-double scalar sort was wrongly rejected.
+- `$currentDate: {field: false}` now sets the current Date (a boolean `false`
+  is the same set-Date form as `true`) instead of raising. A non-boolean scalar
+  argument and a bad or missing `{$type: …}` now raise code 2 with mongod's exact
+  message instead of an uncoded "not understood" error.
+
+### $gte/$lte: null and $exists match mongod's semantics
+
+Two query-match correctness bugs that silently returned the wrong documents (no
+error): a range comparison against null and `$exists`'s argument truthiness.
+
+`{f: {$gte: null}}` (and `$lte: null`) matched nothing; mongod matches documents
+where `f` is null **or missing** — the same set as `$eq: null` — because null only
+orders equal to null. Both now do. (`$gt`/`$lt: null` correctly match nothing.)
+
+`$exists` used Python's truthiness for its argument, so `{$exists: ""}` /
+`{$exists: []}` / `{$exists: {}}` were read as `$exists: false`. mongod uses its
+own truthiness — only `false`, `0`, and `null` are falsy; an empty string, array,
+or document is truthy — so those all mean `$exists: true`. Both servers now match
+(the Rust `truthy` no longer treats empty containers as falsy, and its comparison
+routes `$gte`/`$lte: null` to null-equality). Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$gte`/`$lte: null` match null and missing (like `$eq: null`) instead of nothing.
+- `$exists` uses mongod's argument truthiness (empty string/array/document are
+  truthy), not Python's, so `{$exists: ""}` means exists-true (both servers).
+
+### The Rust server clears all thirteen driver-conformance gauges
+
+Every one of SecantusDB's thirteen driver-conformance gauges now runs against
+the Rust server, not just pymongo — pymongo (sync + async), the mongo-go /
+node / java / kotlin / ruby / rust / php-library / php-driver / c / c++ / .NET
+drivers — and the Rust server reaches effective conformance parity with the
+mature Python server across every ecosystem. Three gauges pass perfectly
+(mongo-rust-driver, .NET, kotlin at 100%), nothing scores below 98%, and no
+failure is a new Rust-specific divergence: each one traces to a gap that is
+already out of scope for a single-node surrogate (text / hashed indexes,
+`$where`, multi-node transactions and sessions, Atlas search-index
+management, IPv6) or to a documented driver-side or test-harness artifact the
+Python server exhibits too. The per-gauge scoreboard and the follow-up triage
+notes (a handful of assertion failures to diff against the Python-server runs)
+live in `tasks/backlog.md` under the R8 entry; each run's full report is
+committed as `docs/validation-report-<driver>-rust-server.md`.
+
+#### Added
+
+- Committed Rust-server conformance reports for all thirteen gauges under
+  `docs/`, and a full-sweep scoreboard in the backlog's R8 entry.
+
+### $regex / $options validate their arguments instead of silently ignoring
+
+A `$regex` / `$options` query condition wasn't validated. An unknown option flag
+(`{$options: "z"}`) was silently ignored, a non-string `$options` was interpreted
+as raw regex flags, `$options` with no sibling `$regex` silently matched, and a
+non-string `$regex` value leaked a Python error. mongod rejects each: an unknown
+flag is `Location51108` ("invalid flag in regex options: X"), and the other three
+are `BadValue` ("$options has to be a string" / "$options needs a $regex" /
+"$regex has to be a string"). Both servers now match.
+
+Valid flags (`imsxu`), an empty option string, a plain `$regex` string, and a BSON
+regex literal are all unaffected. The Python server carries mongod's codes; the
+Rust core defers these cases so the Rust server rejects them too. Three-way mongod
+7.0.12-verified.
+
+#### Fixed
+
+- A `$regex` query validates its options: an unknown flag is rejected with
+  `Location51108`, and a non-string `$options`, an `$options` without a sibling
+  `$regex`, or a non-string `$regex` value with `BadValue` — instead of silently
+  ignoring the flag, coercing, matching, or leaking a Python error (both servers).
+
+### $rename validates its spec instead of corrupting the document
+
+`$rename` performed no validation, so several invalid specs silently corrupted
+data or leaked a raw Python exception rather than raising mongod's error:
+
+- `{$rename: {"arr.0": "x"}}` (source is an array element) rewrote the array to
+  `[null, 2, 3]`; `{a: "arr.0"}` (destination an array element) wrote into the
+  array. mongod rejects both (code 2) — the field cannot be an array element.
+- `{a: "a"}` (same field) and `{a: "a.b"}` (source/target on the same path) were
+  applied; mongod rejects both (code 2).
+- `{a: ""}` (empty target) created a field named `""`; mongod → code 56.
+- `{a: 5}` / `{a: true}` (non-string target) leaked an `AttributeError`
+  (`'int' object has no attribute 'split'`); mongod → code 2.
+
+All now raise mongod's codes on the Python server (2 for the field/path/type
+cases, 56 for the empty path) and defer to `BadValue` on the Rust server — the
+document is left untouched. Valid renames (including into a new nested path) are
+unaffected. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$rename` rejects an array-element source/destination, a same-field or
+  same-path rename, an empty target, and a non-string target — instead of
+  silently corrupting the document or leaking a Python exception (both servers).
+
+### The Rust server's writers stop queueing behind each other
+
+Writes on the Rust server now serialise per collection instead of per
+server. Each collection gets its own write lock (created on first
+reference, stable across drop-and-recreate); inserts, updates, deletes,
+replaces and TTL prunes take only their collection's lock, so writers to
+different collections run in parallel where previously every write in the
+process queued on one global mutex — the flat ~0.5× concurrency scaling
+the three-way benchmark measured. DDL (index builds, create/drop/rename,
+collMod) takes the global lock plus the affected collection lock(s), so an
+index build excludes in-flight writes on its namespace — which the Rust
+server genuinely needs, because its write path is autocommit per operation
+and WiredTiger would not surface a DDL-vs-write overlap as a conflict the
+way the Python server's per-statement transactions do.
+
+Getting the exactness guarantees right under real overlap took two more
+pieces, both ported from the Python server's concurrency work. Every write
+statement now runs inside its own WiredTiger snapshot transaction —
+without one, an update could read a document in one implicit transaction
+and write it in another, and a competitor committing in between was
+silently overwritten with a value computed from the stale read (a lost
+update the new stress tests catch reliably). The statement transaction
+also makes each write atomic: document row, index entries, natural-order
+rows and oplog rows commit or vanish together, closing a
+crash-mid-statement window that could previously leave a dangling index
+entry. And a write that loses a race retries: statement-level WT_ROLLBACK
+and the bare-EINVAL commit-time conflict (a competitor marking the
+transaction rollback-only after its last operation) both map to the typed
+WriteConflict, which plain writes retry unbounded — matching mongod's
+writeConflictRetry, with a warning logged every few seconds of continuous
+retrying — while statements inside a user transaction surface it
+immediately so the client sees mongod's statement-time WriteConflict with
+the TransientTransactionError label.
+
+#### Changed
+
+- Rust server: CRUD writes serialise per collection (own lock per
+  namespace); DDL takes the global lock plus the affected collection
+  lock(s); the opportunistic oplog prune moved to its own mutex so the
+  write path never takes the global lock. Lock-order rules are documented
+  on the storage struct.
+- Rust server: every write statement runs in its own WiredTiger snapshot
+  transaction — statement atomicity (doc row + index entries +
+  natural-order rows + oplog rows commit together) and write-conflict
+  detection across the statement's read-modify-write.
+- Rust server: tailable change-stream waiters are woken after the
+  statement (or user-transaction) commit makes the oplog rows visible,
+  not at emit time inside the still-open transaction.
+
+#### Fixed
+
+- Rust server: a plain write racing a multi-document transaction on the
+  same document can no longer be lost to a stale-snapshot read-modify-
+  write — the statement transaction turns it into a detected conflict and
+  the write retries to completion, so both increments land.
+- Rust server: a commit-time transaction conflict (bare EINVAL from
+  WiredTiger after a competitor marked the transaction rollback-only)
+  now surfaces as the retriable WriteConflict instead of a generic
+  internal error, matching the Python server's #444 mapping.
+- Rust server: two callers racing the lazy collection-UUID mint can no
+  longer mint different UUIDs for the same namespace — the mint runs
+  under the collection write lock with a double-check, and the
+  already-minted fast path is a lock-free read.
+
+#### Added
+
+- `crates/secantus-storage/tests/concurrent_writes.rs` — cross-collection
+  writer storms (exact counts), same-collection `$inc` hammers (exact
+  final value), unique-index races (exactly one winner, typed loser
+  errors), `createIndex` under write load (index-routed reads must reach
+  every document), a plain-write-vs-transaction race (retries to
+  completion, both effects land), and a transaction-vs-transaction
+  statement conflict (typed WriteConflict, no retry inside the
+  transaction).
+
+### `$sum` / `$avg` / `$max` / `$min` expression operators on the Rust server
+
+The expression-operator forms of `$sum`, `$avg`, `$max`, and `$min` (added to the
+Python server in the previous release) now also compute on the embedded Rust
+server, so both servers support the MongoDB 5.0+ feature. The Rust
+implementation reuses the group-accumulator numeric-width logic (int32 → int64 →
+double promotion) and BSON cross-type ordering, so its result — value *and* type
+— is byte-for-byte identical to the Python server (pinned by the parity suite).
+
+#### Added
+
+- `$sum` / `$avg` / `$max` / `$min` as expression operators in the Rust core.
+  An array argument reduces over its elements, a scalar is a single value, and a
+  missing/absent argument contributes nothing; a `Decimal128` element or an
+  extreme that isn't BSON-orderable still defers to Python.
+
+### The Rust server's reads stop queueing behind writers
+
+Every read the Rust server served used to take the same global storage lock
+as every write — concurrent readers serialised not just against writers but
+against each other. Read-only storage methods (`find`, `count`, the `_id`
+point lookup, collection scans, listers, planners and stats) now run
+lock-free: each call's own WiredTiger session gets a consistent MVCC view
+without blocking, so reads no longer queue behind a bulk insert and a mixed
+read/write workload stops paying the writer's lock hold. All mutable Rust
+state lives in WiredTiger tables or under the dedicated oplog mutex, so the
+lock was buying readers nothing — correctness under concurrency is carried
+by the storage schema instead (a fixed set of shared tables that DDL never
+drops) plus the invariant that index-routed candidates are always
+re-verified by the exact matcher and doc fetches tolerate not-found.
+
+Making that invariant airtight surfaced three write-ordering fixes worth
+having on their own. Index maintenance for updates is now a set diff — an
+update inserts only the entry keys the new document adds and removes only
+the ones it drops, so a `$set` of an unindexed field performs zero
+index-table operations (the old scheme deleted and rewrote every entry,
+opening a window where a document vanished from an index whose value the
+update never touched). `createIndex` backfills its entry rows before
+writing the registry row, so a reader can never route through a
+half-built index and miss documents. And every delete-shaped path (delete,
+TTL prune, capped eviction) removes the document row first and its index
+entries after, so a stale entry resolves to a skipped not-found rather
+than an index miss of a still-live document.
+
+#### Changed
+
+- Rust server: read-only storage methods no longer take the global storage
+  lock — reads run concurrently with writes and with each other under
+  WiredTiger MVCC. The lock now serialises only writes and DDL.
+- Rust server: update index maintenance writes the set *difference* of
+  entry keys (additions before the doc-row write, removals after) instead
+  of delete-all-then-rewrite; updates that don't change indexed values do
+  no index writes at all.
+
+#### Fixed
+
+- Rust server: `createIndex` now makes the index-registry row the commit
+  point of a fully-backfilled index (entries first, registry last), so a
+  concurrent reader can no longer route through a half-built index and
+  return incomplete results.
+- Rust server: delete-shaped writes (delete, TTL prune, capped-collection
+  eviction) remove the doc row before its index/natural-order entries, so
+  a concurrent index-routed read can no longer miss a document that is
+  still live.
+
+#### Added
+
+- `crates/secantus-storage/tests/concurrent_reads.rs` — four reader
+  threads hammer `find` / `findOne` / scans / counts / `listIndexes`
+  against a live writer doing replaces, delete/re-insert churn and
+  drop/recreate index churn; every served document must decode and match
+  the filter it was returned for.
+
+### The Rust server's oplog bookkeeping gets off the write path
+
+The Rust server's oplog housekeeping no longer taxes the hot paths. The
+opportunistic oplog prune that runs on the write path (every 1000 emits,
+under the writer's lock) used to decode every oplog row in full just to read
+its timestamp — an O(entire-oplog) stall for every concurrent writer each
+time it fired. The retention scan now peeks the timestamp out of the raw
+BSON bytes without materialising the document, stops dating rows at the
+first in-window entry (timestamps are monotone in seq, so the expired rows
+form a prefix), and walks the rest keys-only. `hello` replies stopped
+writing to storage entirely: the per-call oplog-meta persist that every
+driver heartbeat used to pay — a single-row WiredTiger hotspot every
+concurrent writer contended on — is gone, matching the cure the Python
+server shipped in 0.5.4b236.
+
+Crash recovery got structurally safer at the same time. The oplog meta row
+is now written once at close, and recovery treats it as a hint, not the
+truth: the recovered counters are clamped up past what the oplog and
+natural-index tables actually contain, so a crash can never lead to a
+re-minted (duplicate) oplog seq — previously a stale meta row could
+overwrite live oplog rows after an unclean shutdown. Restart monotonicity of
+the cluster clock is guaranteed the same way the Python server does it:
+recovery bumps the clock one full second past everything it can see, which
+covers any `hello`-minted timestamp that was never persisted.
+
+#### Changed
+
+- Rust server: `current_cluster_time` (every `hello` reply under the
+  replica-set persona) no longer persists the oplog meta row, and no longer
+  takes the global storage lock — it is a pure in-memory mint under the
+  dedicated oplog mutex.
+- Rust server: the write-path opportunistic oplog prune peeks timestamps
+  from raw BSON (no full-document decode), early-stops at the first
+  in-retention row, and collects the remainder of the walk keys-only;
+  `startAtOperationTime` seq resolution uses the same raw peek.
+- Rust server: oplog-meta recovery reconstructs from the newest oplog row
+  with a single reverse cursor step instead of a full-table decode walk.
+
+#### Fixed
+
+- Rust server: a stale oplog-meta row (the on-disk state a crash leaves
+  behind, since the meta snapshot is written at close, not per emit) can no
+  longer rewind `next_seq` / `next_nat_seq` — recovery clamps both counters
+  up past the table maxima, so a reopen can never re-mint an already-used
+  oplog seq (which would silently overwrite a live oplog row) or collide a
+  natural-order entry.
+- Rust server: the cluster clock can no longer step backwards across an
+  unclean restart — recovery bumps it one second past the recovered
+  timestamp, the wall clock, and the oplog tail, covering mints that were
+  never persisted.
+
+### The Rust server thins aggregation input before decoding it
+
+The aggregation pipeline fetched its input, then decoded **every** document
+into an owned `bson::Document` before the pipeline ran — even documents a
+leading `$skip` / `$limit` / `$match` was about to drop. A pipeline that
+narrows its input early (a limit-then-group, a sample, a second filter after
+the lifted one) paid to materialize rows it never used.
+
+The leading pass-through prefix of a pipeline — `$skip`, `$limit`, and a
+non-leading `$match` — now runs over the raw BSON before anything is decoded
+(`$match` via the same `query::matches_raw` `find` uses), so only the survivors
+that actually reach the first heavier stage (`$group` / `$sort` / computed
+`$project` / `$unwind` / …) are decoded. On a 5000-row scan of wide documents
+feeding `[{$limit: 50}, {$group: …}]`, that measured ~4× faster (it decoded 50 rows instead of 5000). The result is
+identical to decoding everything and running the same stages — the prefix is
+order-preserving and reuses the parity-pinned matcher — and any stage the
+prefix doesn't handle (or a `$match` filter the raw matcher defers on) flows
+through the full decode-and-run path unchanged. The heavier stages themselves
+still materialize; accelerating those is separate, larger work.
+
+#### Changed
+
+- Rust server: an aggregation pipeline's leading `$skip` / `$limit` / `$match`
+  prefix is applied over raw BSON before `decode_docs`, so the heavier stages
+  decode only the documents that survive the prefix.
+
+### The Rust server projects simple field lists without decoding whole documents
+
+Phase 3 of the raw-BSON serving-path work takes the return path off
+materialization for the common projection shape. A `find` with a projection
+still decoded every returned document into an owned `bson::Document` before
+projecting it — the last big materialization site now that projection-free
+`find` and `count` run fully on raw BSON.
+
+A pure top-level inclusion projection (`{a: 1, b: 1}`, optionally with
+`_id: 0`) now projects straight off the raw document, decoding **only the
+included fields** rather than the whole thing. On a 5000-row scan of wide
+documents projecting two of twelve fields, that measured **~2× faster**. The
+fast path is byte-identical to the full projection — same fields, same order
+— so no result changes; anything it doesn't cover (exclusion, dotted paths,
+`$slice` / `$elemMatch` / `$meta`, positional, mixed inclusion/exclusion)
+transparently falls back to the full projection on a decoded document.
+
+#### Changed
+
+- Rust server: a pure top-level inclusion projection is applied over raw BSON
+  (`projection::apply_projection_raw`), decoding only the projected fields
+  instead of the whole document. All other projection shapes fall back to the
+  full decode + `apply_projection` unchanged.
+
+#### Added
+
+- `secantus_core::projection::apply_projection_raw(&RawDocument, spec)` — the
+  raw-BSON inclusion-projection fast path, exposed to the parity harness as
+  `_secantus_core.apply_projection_raw` and cross-checked byte-for-byte
+  against `apply_projection` on every projection parity case.
+
+### The Rust server stops decoding documents just to re-encode them for the wire
+
+The Rust server used to decode every document it served into an owned
+`bson::Document` purely to build the wire reply — then immediately
+re-encode it. The storage scan and the cursor registry already speak raw
+BSON bytes end-to-end, so a `find`'s `firstBatch` and every `getMore`'s
+`nextBatch` were round-tripping through a decode→`IndexMap`→re-encode step
+that produced exactly the bytes they started from. That reply-path
+materialization was one of the two dominant hot spots the profiler found
+(`tasks/rust-perf-findings.md`).
+
+Cursor replies now splice the pre-encoded document blobs straight onto the
+wire. A new `secantus_wire::encode_cursor_reply` assembles the
+`cursor.firstBatch` / `cursor.nextBatch` BSON array from the stored blobs
+without decoding them, and the `find` (no-projection) and non-tailable
+`getMore` handlers hand their batches to the server as raw bytes instead
+of an owned array. The output is byte-for-byte identical to the old path
+(pinned by a unit test), so no driver can tell the difference — the work
+saved is pure overhead. This is Phase 1 of the raw-BSON serving-path plan;
+the change-stream (tailable) path, projected `find`, and exhaust-cursor
+streaming keep their existing behaviour for now.
+
+#### Changed
+
+- Rust server: `find` (without a projection) and non-tailable `getMore`
+  no longer materialize their document batch into the reply — the
+  pre-encoded blobs are spliced onto the wire by
+  `secantus_wire::encode_cursor_reply`, eliminating the reply-path
+  decode→re-encode round-trip. The batch is carried to the server
+  out-of-band via `CommandContext::pending_batch` (the same idiom as
+  `close_connection`); the exhaust-getMore streamer reconstructs the
+  batch it needs to reframe.
+
+### The Rust server stops decoding whole documents just to filter them
+
+Phase 2 of the raw-BSON serving-path work takes the scan path off owned-BSON
+materialization. The Rust server's collection scan used to decode every
+candidate document into an owned `bson::Document` — a heap allocation per
+field — purely to run the query filter over it, then throw that document
+away for any document the filter rejected. For a selective filter over wide
+documents that is almost all wasted work: the profiler put this scan-side
+materialization (with the reply-path decode fixed in the previous release)
+at the larger share of the serving path's on-CPU time.
+
+The filter now runs over the raw BSON bytes. A new
+`secantus_core::query::matches_raw` walks the document by field name and
+decodes **only the fields the filter actually reaches** — a filter on one
+field of a ten-field document never touches the other nine — reusing every
+existing operator unchanged. Documents the filter rejects are never fully
+decoded, and a filter-only find (no in-memory sort) decodes nothing at all;
+only the matched documents of a post-sorted find are decoded, for their
+sort keys. The raw matcher is pinned bool-for-bool to the owned matcher (and
+transitively to the pure-Python matcher) across the entire curated + fuzz +
+regex + collation parity corpus, so no query answers change.
+
+A selective filter over wide documents that this optimizes — a `count` or
+`find` that scans many rows and keeps few — measured **~2.8× faster** on a
+5000-row collection scan (one filter field of eleven, rejecting 99.8%).
+
+#### Changed
+
+- Rust server: `find` and `count` scan filtering runs over raw BSON
+  (`query::matches_raw`) instead of materialising each candidate into an
+  owned `Document`. Selective filters over wide documents skip decoding the
+  fields they don't touch; rejected documents and no-sort finds skip the
+  owned-document build entirely. (The update/delete candidate scans still
+  materialise, since a matched document is needed for the write — a later
+  phase.)
+
+#### Added
+
+- `secantus_core::query::matches_raw(&RawDocument, …)` — the raw-BSON query
+  matcher, exposed to the parity harness as `_secantus_core.query_matches_raw`
+  and cross-checked against `query_matches` on every parity case.
+
+### The Rust server matches update/delete candidates over raw BSON too
+
+Completing the raw-BSON match work: `update` and `delete` scanned their
+candidate documents by decoding each one in full to run the filter, then
+discarded that document for every candidate the filter rejected — the same
+waste `find` and `count` already avoid. Both now match candidates over raw
+BSON (`query::matches_raw`, decoding only the filter's fields) and decode the
+full document only for a candidate that actually matches (which the write
+needs anyway). A selective `update` / `delete` over a collection scan of wide
+documents no longer decodes the rows it isn't going to touch.
+
+On a 5000-row collection scan of wide documents (11 fields) updating the ~10
+that match one unindexed filter field, this measured **~4× faster** — the
+baseline decoded all 5000 candidates to update ten. This reuses the same
+matcher `find` and `count` use, already pinned bool-for-bool to the owned
+matcher (and pure Python) across the query parity corpus — so no query
+semantics change.
+
+#### Changed
+
+- Rust server: `update` and `delete` candidate scans filter over raw BSON
+  (`query::matches_raw`) instead of decoding every candidate; only a matched
+  candidate is fully decoded (for the write / oplog). Every scan-matching
+  path — `find`, `count`, `update`, `delete` — now skips decoding the
+  documents a selective filter rejects.
+
+### Rust-server residues closed: $project error fidelity, WT knobs, full $min/$max order
+
+Three long-tracked Rust-server gaps from the rewrite backlog are closed. An
+unknown expression operator inside an aggregation `$project` now reports
+mongod's stage-specific `Location31325` on the Rust server too (a parse-time
+scan that never mislabels the projection-only `$slice` / `$elemMatch` /
+`$meta` shapes), completing the context-specific unknown-operator codes on
+both servers. The embedded `RustServer` handle grew the WiredTiger knobs the
+daemons already exposed — `cache_size`, `session_max`, and `sync_on_commit`
+constructor parameters — so tests can drive non-default storage configs
+in-process. And the Rust engine's `$min`/`$max` update operators moved onto a
+direct port of Python's `_bson_lt` (`order::bson_lt`), a single strict-less
+relation that needs none of the `$sort` comparator's transitivity guarantees:
+bool, Decimal128, NaN, Binary, Timestamp, Regex, Min/MaxKey, and the decoded
+exotic text types all compute natively now, with only a DBPointer operand
+still deferring. Range operators accept the exotic text types the same way
+(Symbol / JS code compare as strings, mirroring pymongo's decode), so
+otherwise-fine queries no longer error with `BadValue` on the Rust server.
+
+#### Added
+
+- `RustServer(..., cache_size=, session_max=, sync_on_commit=)` — the
+  embedded handle's WiredTiger knobs, threading into `wt_config` exactly like
+  `secantusd-rs`'s `--cache-size` / `--session-max` / `--sync-on-commit`.
+- `order::bson_lt` in `secantus-core` — the direct `ordering._bson_lt` port
+  backing `$min`/`$max`, covering the types `is_sortable` must bar from sorts.
+
+#### Fixed
+
+- Rust server: an unknown expression operator inside `$project` reports
+  `Location31325` ("Invalid $project :: caused by :: Unknown expression $op")
+  instead of a generic `2 BadValue`, matching the Python server and mongod.
+- Rust matcher: JS code / Symbol range operands compare as text and DBPointer
+  / undefined operands are a clean no-match, instead of erroring `BadValue`.
+- Rust engine: `$min`/`$max` with bool / Decimal128 / NaN / Binary /
+  Timestamp / Regex operands compute instead of deferring; curated parity
+  cases pin every newly-computed shape.
+- `invoke rust-parity` installs `shapely` / `s2sphere` / `python-dateutil`
+  into its isolated environment, so the geo curated cases run instead of
+  erroring with `ModuleNotFoundError`.
+
+### Rust server: MONGODB-X509 authentication actually works now
+
+The Rust server's TLS, mTLS, and MONGODB-X509 machinery was in place, but the
+first end-to-end test showed the peer-certificate DN was extracted in
+x509-parser's raw display form — least-specific-first with comma-space
+separators — so the identity a client's certificate asserted never matched
+the user record provisioned for it, and X509 authentication always failed.
+The extraction now produces the mongod-style RFC 4514 string
+(most-specific-first, bare commas, short OID names, value escaping),
+byte-identical to the Python server's conversion, so a user provisioned
+against either server authenticates on the other. A full two-stage
+bootstrap-then-authenticate test now runs against the Rust server, mirroring
+the Python suite.
+
+#### Fixed
+
+- Rust server: the MONGODB-X509 peer DN matches mongod's RFC 4514 form; X509
+  auth verified end-to-end (TLS handshake, mTLS client-cert requirement, DN
+  identity, and the no-client-cert refusal path).
+- Rust server: tailable cursors on capped collections verified live and
+  pinned by a smoke test (the shipped `find.rs` producer had outlived its
+  "still deferred" note).
+- `secantus-wt`'s build probe also accepts MSVC's `wiredtiger.lib` (and
+  `.dylib`), unblocking the standalone `secantusd-rs` build on Windows.
+
+#### Changed
+
+- A 2026-07-17 backlog audit closed five stale Rust-rewrite entries: the
+  `find` command entry (shipped long since), Phase-4 sub-phase 5e and the
+  storage-keystone engine-selection half (superseded by the two-server
+  model), the keystone wheel-flag flip (already ON in the shipping matrix),
+  and the standalone-binary half of the Rust-package entry (`secantusd-rs`
+  ships). The crates.io publish and the "recommend Rust by default" call are
+  explicitly flagged as product decisions.
+- R8: the mongo-go-driver gauge now runs against the Rust server — 398
+  passed / 3 failed / 52 skipped (99.3%), unified suite 42/42; the single
+  real failure is the documented, accepted go-harness `try_next` load-timing
+  artifact. Report at `docs/validation-report-go-rust-server.md`.
+
+### $sample validates its size argument, like mongod
+
+The Python server's `$sample` stage coerced its `size` with a naive `int()`, so a
+bool size was treated as 1 and a negative size crashed with a raw `ValueError`.
+mongod rejects both — a non-number size with 28746 ("size argument to $sample
+must be a number") and a negative size with 28747 ("must not be negative") — while
+accepting a fractional double and truncating it. The Python server now matches;
+the Rust server already rejected these (its `$sample` lives in the server crate and
+validated), so this closes the gap on the Python side.
+
+With this, the aggregation numeric-argument trio — `$limit`, `$skip`, and
+`$sample` — matches mongod on both servers.
+
+#### Fixed
+
+- `$sample` rejects a bool `size` (28746) and a negative `size` (28747) instead of
+  coercing the bool to 1 or crashing on the negative (Python server).
+
+### $size validates its argument like mongod
+
+`$size` accepted or silently ignored arguments mongod rejects: a negative size
+returned no match instead of erroring, a bool was accepted as `1` (Python's
+`bool` is an `int`), and an integer-valued float like `2.0` was wrongly
+rejected even though mongod accepts it as `2`. Both engines now validate the
+argument the way mongod 7.0.12 does — it must be a number, integer-valued, and
+non-negative — raising the corresponding parse error (code 2) otherwise, and
+accepting an integer-valued float. Found while triaging the driver-gauge
+results; three-way mongod-verified.
+
+#### Fixed
+
+- `$size` errors on a negative, non-integer, string, or bool argument (code 2)
+  instead of silently matching nothing or accepting a bool, and accepts an
+  integer-valued float — on both servers.
+
+### $sort stage validates its direction values
+
+The `$sort` aggregation stage didn't validate its spec. A string direction
+(`{v: "asc"}`) leaked a raw Python `ValueError`, a bool was silently coerced to
+ascending, a numeric value other than ±1 (`0`, `2`) was treated as ascending, and
+an empty `{}` spec was a silent no-op. mongod rejects each: a non-numeric
+direction is `Location15974` ("Illegal key in $sort specification"), a numeric
+non-±1 is `Location15975` ("must be 1 … or -1"), and an empty spec is
+`Location15976` ("must have at least one sort key"). A whole double (`1.0`) is
+still accepted as ±1. Both servers now match.
+
+The Python server carries mongod's codes; the Rust core defers these cases (bool
+included — it no longer coerces `true` to `1`) so the Rust server rejects them too.
+Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- The `$sort` stage rejects a non-numeric direction (`15974`), a numeric non-±1
+  direction (`15975`), and an empty spec (`15976`), instead of leaking a Python
+  `ValueError`, coercing a bool, or silently no-op-ing (both servers).
+
+### $split validates its arguments instead of leaking a Python error
+
+`$split` with an empty separator leaked a raw Python `ValueError` (`empty
+separator`), and its type / arity errors surfaced with a generic code. mongod
+rejects each with a specific Location code: an empty separator is `40087`, a
+non-string first / second argument is `40085` / `40086`, and the wrong number of
+arguments is `16020`; a null string or separator still yields `null`. The Python
+server now carries these codes; the Rust core already defers every invalid case,
+so the Rust server rejects them too. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$split` reports mongod's Location codes — empty separator `40087`, non-string
+  first / second argument `40085` / `40086`, wrong arity `16020` — instead of
+  leaking a Python `ValueError` or using a generic code (both servers).
+
+### SQL server: binary COPY, Parse-time inference, full array-literal grammar
+
+`COPY … (FORMAT binary)` works in both directions: COPY OUT emits the PGCOPY
+stream (signature/flags header bundled with the first row the way real PG
+frames it, one CopyData per row, int16 -1 trailer) with each field encoded by
+its column type through the existing binary result encoders, and COPY IN
+parses the same layout, decoding fields by the target column's type.
+
+Untyped parameters get real Parse-analysis type inference — a client that
+binds a value in binary format with no declared type (psycopg's
+`Range(empty=True)` dump sends OID 0) takes its type from the AST (a cast on
+the parameter, a cast or range-constructor operand it's compared with) — and
+an untyped parameter fed straight to a VARIADIC "any" function (`concat`)
+raises 42P18 like real Postgres.
+
+The array machinery reaches PG's full literal grammar: nested `{{…}}`
+multi-dimensional arrays parse, render, and encode/decode in binary
+(row-major with per-dimension headers), `[l:u]=` bounds prefixes parse,
+`box[]`'s `;` delimiter is honoured both ways, `int[][][]` collapses to the
+one array type like PG, `'{a,b}'::text[]` casts materialise real lists (so
+subscripting and `unnest` work), array concatenation `||` concatenates
+lists, and `= any('{1,2}')` accepts array-literal operands. E-string
+literals are now decoded by the engine *before* sqlglot parses (sqlglot's
+half-decoding was lossy for `E'\\x5c'`), `json` and `jsonb` columns carry
+their distinct OIDs (114/3802 — plain json's binary form has no version
+byte), table row types appear in `pg_type` (typtype `c`, with `typarray`,
+resolvable via regtype so psycopg's `TypeInfo.fetch(conn, "<table>")`
+works), and the `name`/`aclitem` types exist with their real OID pairs.
+
+Range text literals follow PG's quoting rules exactly: quoted bound tokens
+with `""`/`\X` escapes parse, embedded quotes/backslashes double on render,
+ASCII-only whitespace trimming (Python's unicode-aware `.strip()` corrupted
+NBSP/NEL bounds), and a user-declared range constructor result describes
+with its minted OID. psycopg's range, multirange, json, array, and string
+suites all pass.
+
+#### Added
+
+- `GROUP BY 1` positional references resolve to the select-list expression
+  (42P10 when out of range); computed GROUP BY keys beyond the aggregation
+  engine's operators (`GROUP BY col = ascii(x)`, `substr(…)`) evaluate
+  per-doc in Python before the pipeline, typed from the source expression.
+- bytea params substitute through `::bytea` / `::bytea[]` casts so equality
+  against computed bytea values compares bytes (text-format arrays decode at
+  Bind); `(x::box[])::text` renders with the element's rules.
+
+#### Fixed
+
+- Multi-statement `COPY` strings raise 42601 (ProgrammingError), bytea cast
+  failures 22P02 (was XX000), and the binary array encoder covers
+  varchar[]/bpchar[] (1015/1014).
+
+### SQL server: composite records end to end, typed array parameters, NaN semantics
+
+The composite/record machinery closes its remaining conformance gaps.
+Array-of-composite elements binary-encode as real records (not JSON), a
+binary composite parameter with a NESTED composite field recurses by the
+field's minted OID instead of crashing, a registered dumper's record text
+literal (`'("(foo,10)",20)'::"-x-€"`) parses on INSERT — including nested
+and zero-field (`'()'`) types — and a declared-composite table column
+reports its minted OID so a registered psycopg loader parses nested fields
+by their reflected types. Anonymous `row(…)` records now carry each field's
+SQL type OID from the source expression: an untyped literal embeds
+unknown (705, loads as bytes like real PG), `::text` embeds 25, `::bytea`
+17 with real binary bytea, and int literals type int4. `VALUES` rows of
+records describe as RECORD, and `array_agg` types as the element's real
+array type (jsonb_agg/json_agg keep json) — psycopg's
+`CompositeInfo.fetch` of a zero-field type depends on it. Parse, Bind, and
+Describe now run inside the open transaction's storage scope, so a type
+created earlier in an uncommitted block is visible to parameter-OID
+resolution.
+
+Typed array parameters generalize: a text- or binary-format array param
+with a known array OID (int2[]/numeric[]/inet[]/bytea[]/…) decodes into a
+typed list and substitutes through a `::tag[]` cast, so equality against
+`array[…]` constructor values compares element-wise (this closed the numpy,
+uuid, and network dump/load clusters wholesale). Array casts coerce LIST
+values to the element's canonical form, bare `array[x::inet, …]`
+constructors describe as the element's array type, uuid/inet/cidr/macaddr
+text parameters canonicalise at Bind (psycopg dumps uuids as bare hex), and
+`NaN = NaN` is true like Postgres. psycopg's composite, numpy, uuid, net,
+and numeric suites now pass (numeric's exhaustive wide-digit test remains —
+the Decimal128 34-digit cap).
+
+### SQL server: DO blocks, backend termination, richer diagnostics, typed-param polish
+
+A batch of protocol-conformance closers across the psycopg gauge's error,
+connection, prepared-statement, cursor, and adapter suites.
+
+`DO $$ … $$` blocks run through a minimal plpgsql interpreter: `RAISE
+NOTICE`/`WARNING`/`INFO` surface as NoticeResponse messages (via the new
+`SQLResult.notices`), `RAISE EXCEPTION` raises with its `USING ERRCODE`
+(default P0001), and `EXECUTE format(…)` runs dynamic SQL whose errors keep
+their real SQLSTATE. `pg_terminate_backend` / `pg_cancel_backend` close the
+target connection through the live-session registry. ErrorResponse now
+carries the optional diagnostic identity fields (schema/table/column/
+constraint) and a statement position, so a CHECK violation reports its
+constraint name and a name error renders the `LINE 1: …` caret context.
+
+Typed parameters and introspection sharpen: `pg_prepared_statements`
+reports each statement's original query text, real prepare time, and
+regtype parameter names (with array typing); `DEALLOCATE ALL` clears the
+extended-protocol registry; INSERT parameters infer their type from the
+target column at Parse (so an untyped `%s` into a jsonb column types
+correctly); `->`/`#>` type as jsonb and `->>`/`#>>` as text, and integer
+JSON subscripts (`-> 1`) index arrays. `numeric` renders in plain
+positional form (`1.1E+2` → `110`, matching `numeric_out`), `NaN = NaN`
+holds, `generate_series(…)::int4` casts each element, the East-Asian client
+encodings Python can convert are accepted, `format('%s/%I/%L', …)` works,
+and `max_prepared_transactions` reports non-zero so drivers' 2PC probes
+pass.
+
+#### Added
+
+- `pgwire.error_response` diagnostic fields + statement position;
+  `notice_response` full severity/sqlstate.
+- `errors.SQLError` carries `diag` / `position`.
+- `SQLResult.notices`, rendered as NoticeResponse in both protocols.
+- `TableDef.temp` (CREATE TEMP TABLE — reflected in error schema).
+
+### SQL server: idle_in_transaction_session_timeout
+
+A connection left idle inside an open transaction block longer than the
+`idle_in_transaction_session_timeout` GUC (milliseconds; 0 = disabled, the
+default) is now terminated with a FATAL `25P03` — the connection's blocked
+read for the next command is bounded by the timeout, and exceeding it aborts
+the open transaction and closes the socket, exactly as Postgres does.
+psycopg's `test_right_exception_on_session_timeout` (which sets the GUC,
+sleeps, and expects `IdleInTransactionSessionTimeout`) passes.
+
+#### Added
+
+- `idle_in_transaction_session_timeout` GUC (default 0); the wire loop bounds
+  the next-command read by it while a transaction is open and terminates on
+  timeout.
+
+### SQL server: savepoint rollback reverts DDL; wide binary numerics round-trip
+
+`ROLLBACK TO SAVEPOINT` now undoes schema changes made after the savepoint,
+not just data writes. A `CREATE TYPE` / `CREATE TABLE` / `DROP` / `ALTER`
+inside a savepoint snapshots every catalog collection (they're tiny), so the
+rollback restores the pre-savepoint schema — a re-`CREATE` of the same type
+then succeeds, and a `DROP` is undone. Previously only DML target
+collections were snapshotted, so the catalog change leaked past the abort
+(psycopg's `test_change_type_savepoint`, which creates and rolls back an enum
+three times, hit "type already exists").
+
+The binary `numeric` decoder handles arbitrarily wide values: a wide
+integral magnitude combined with a large declared scale sized the Decimal
+context too small and made the final quantize raise `InvalidOperation`
+(surfacing to the client as an internal error). The context now spans the
+full integer + fractional digit count, so `test_dump_numeric_exhaustive`'s
+50-plus-digit values round-trip.
+
+#### Added
+
+- `catalog.ALL_CATALOG_COLLECTIONS`; `engine._is_ddl` drives the catalog
+  snapshot for savepoint rollback.
+
+#### Fixed
+
+- `pgextended._decode_numeric` context precision spans the whole value.
+
+### SQL server: binary and scrollable server-side cursors
+
+psycopg's `ServerCursor` / `RawServerCursor` (DECLARE … CURSOR / FETCH /
+MOVE over the wire) work in binary as well as text, and honour scroll
+semantics. A binary `FETCH … FROM <name>` rides the extended protocol, so
+Describe on the FETCH portal now reports the cursor's columns instead of
+NoData — previously the server sent DataRows with no prior RowDescription, a
+protocol violation the client rejected. `DECLARE … NO SCROLL` is enforced
+(backward movement raises 55000, a psycopg `OperationalError`) and `SCROLL`
+allows it; a negative bare count (`FETCH -2`, `MOVE -1`) scans backward in
+the default direction, `FORWARD -n` / `BACKWARD -n` flip direction, and
+`MOVE ABSOLUTE 0` repositions before the first row (not at the end) like
+Postgres. A DECLARE body that isn't a row-returning query (`wat`, a DDL
+statement) raises 42601 (ProgrammingError) rather than 0A000. psycopg's
+`test_cursor_server.py` goes from 15 failed / 7 errored to 0.
+
+#### Added
+
+- `_Cursor.scrollable` (SCROLL / NO SCROLL); `_moves_backward` gates NO
+  SCROLL cursors.
+- `describe_statement` reports a FETCH portal's columns (binary server
+  cursors) and NoData for MOVE.
+
+#### Fixed
+
+- Negative FETCH/MOVE counts scan backward; `MOVE ABSOLUTE 0` positions
+  before-first; a non-query DECLARE body is a syntax error.
+
+### SQL server: type modifiers on the wire, E-string fidelity, transaction characteristics
+
+RowDescription now carries real PG type modifiers: `select null::varchar(42)`
+describes with typmod 46 (and varchar/bpchar keep their distinct OIDs
+1043/1042 instead of folding onto text), `numeric(p,s)` packs precision and
+scale — including negative scales, which sqlglot can't parse and the engine
+now pre-rewrites through a sentinel — and the bit/varbit/time-family
+precisions all flow through, so psycopg's `Column.display_size` /
+`precision` / `scale` / `type_display` report like real Postgres. psycopg's
+`test_column.py` goes 35 failed → 0.
+
+Two more conformance holes close alongside. `E'…'` escape strings
+interpolated by psycopg's ClientCursor (any string containing a backslash)
+were double-unescaped — sqlglot already decodes the simple escapes, and the
+second pass corrupted `\\b` into a backspace or raised 0A000 in the INSERT
+value path; the decoder now finishes only the octal/hex/unicode forms
+sqlglot leaves raw. And transaction characteristics are honoured end to end:
+`BEGIN ISOLATION LEVEL … / READ ONLY / DEFERRABLE` (every spelling,
+including the ones sqlglot rejects), `SET TRANSACTION`, and `SET SESSION
+CHARACTERISTICS AS TRANSACTION` apply to the transaction (via the SET LOCAL
+revert machinery) or the session defaults, and the `transaction_*` GUCs
+mirror their `default_transaction_*` values until overridden — psycopg's
+`set_isolation_level` / `set_read_only` / `set_deferrable` suite goes 13
+failed → 0.
+
+#### Added
+
+- `result.py` / `pgwire.py`: `ColumnDesc.typmod` carried through both the
+  simple-query and extended-protocol RowDescription emitters.
+- `typemap.py`: `cast_type_identity` — (oid, typmod) for modifier-bearing
+  cast targets, including arrays (element typmod with the array OID).
+- `engine.py`: `_parse_txn_characteristics` shared by BEGIN / SET
+  TRANSACTION / SET SESSION CHARACTERISTICS; `session.get_setting` falls
+  back dynamically from `transaction_*` to `default_transaction_*`.
+
+#### Fixed
+
+- `scalar._unescape_estring` no longer re-decodes escapes sqlglot already
+  resolved (the `test_leak` corruption); `planner._literal` accepts
+  ByteString values in INSERT position.
+
+### Aggregation stage-argument validation for `$count`, `$project`, and `$sortByCount`
+
+Three more aggregation stages now reject malformed arguments with mongod's exact
+error code instead of silently computing a wrong result. `$count` enforces that
+its field is a non-empty string that is neither `$`-prefixed, dotted, nor the
+reserved `_id`; an empty `$project` specification is rejected up front; and
+`$sortByCount` requires a `$`-prefixed path string or a single-`$`-key expression
+object. Both the Python and Rust servers are covered (the Rust core defers each
+invalid case so the exact code is raised), and each is verified against real
+mongod 7.0.12.
+
+#### Fixed
+
+- `$count` now raises `Location40156` (non-string field), `Location40157`
+  (empty), `Location40158` (`$`-prefixed), `Location40160` (contains `.`), and
+  `Location15948` (`_id`) instead of accepting the malformed field name.
+- `$project` with an empty specification now raises `Location51272`
+  ("projection specification must have at least one field") instead of returning
+  the input documents unchanged.
+- `$sortByCount` now raises `Location40149` (non-string/non-object argument),
+  `Location40148` (bare, non-`$` path string), and `Location40147`
+  (non-expression object) instead of grouping on a constant.
+
+### `$strcasecmp` coerces its operands like mongod
+
+`$strcasecmp` previously required both operands to be strings and raised a
+generic `TypeMismatch` (14) otherwise. Real mongod `$toString`-coerces each
+operand first — a number becomes its string form, `null` becomes the empty
+string — and rejects only a boolean. SecantusDB now does the same, matching
+mongod 7.0.12.
+
+#### Fixed
+
+- `$strcasecmp` now coerces a non-string operand to a string (`null` → `""`,
+  numbers → their string form) instead of raising, so `{$strcasecmp: [5, "a"]}`
+  returns `-1` like mongod. A boolean operand raises `Location16007` (mongod's
+  code). Integer coercion computes on both the Python and Rust servers; the
+  Rust core defers double/date coercion to Python.
+
+### $substrBytes rejects a bool index, and $substr is byte-based like mongod
+
+Completing the aggregation bool-as-int sweep: `$substrBytes` computed a bool
+start/length index (`as_int_like(Boolean) → 0/1`) instead of rejecting it. Both
+servers now reject — the Python server with mongod's exact codes (16034 for the
+starting index, 16035 for the length), the Rust core defers to `BadValue`.
+
+While verifying against mongod, `$substr` turned out to be mis-aliased: mongod
+treats `$substr` as a deprecated alias of `$substrBytes` (byte-based), but
+SecantusDB routed it to `$substrCP` (code-point-based). On multi-byte strings
+the two diverge, and a bool index reported the wrong code (34450 instead of
+16034). `$substr` now aliases `$substrBytes` on both servers, fixing the byte
+semantics and the bool code together. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$substrBytes` rejects a bool start/length argument with mongod's codes
+  (16034 / 16035) instead of coercing it to 0/1 (both servers).
+- `$substr` is now a byte-based alias of `$substrBytes` (matching mongod),
+  rather than code-point-based `$substrCP`.
+
+### $substrBytes rejects a byte range that splits a UTF-8 character
+
+A `$substrBytes` (or its `$substr` alias) range whose start or end falls inside a
+multi-byte UTF-8 character used to return a Unicode replacement character (Python
+server) or an empty string (Rust server) rather than the error mongod raises. Both
+servers now reject: the Python server with mongod's exact codes — 28656 when the
+starting index is a UTF-8 continuation byte, 28657 when the ending index lands in
+the middle of a character — and the Rust core defers to `BadValue`.
+
+The subtlety a fuzz run surfaced: mongod rejects a continuation-byte start *even
+for an empty (length 0) range*, which the Rust core's "is the slice valid UTF-8?"
+check missed (an empty slice is always valid), so both engines needed an explicit
+boundary check. A negative start keeps the legacy slice semantics on both engines.
+Clean character boundaries and clamped past-the-end ranges still compute. Three-way
+mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$substrBytes` / `$substr` reject a byte range that splits a UTF-8 character
+  (mongod's 28656 / 28657 on the Python server, `BadValue` on the Rust server),
+  including an empty range that starts on a continuation byte, instead of
+  returning a replacement character or empty string.
+
+### $substrBytes truncates a double index, completing substr numeric fidelity
+
+`$substrBytes` rejected a non-integer start/length, but mongod accepts any double
+there and truncates it toward zero (`1.7`→1, `2.9`→2, `0.9`→0) — unlike
+`$substrCP`, which rejects a fractional double. Both servers now truncate and
+compute the same substring; a truncated-negative start (`-1.7`→-1) still falls
+into the negative-start rejection (50752), and a negative length still means "to
+the end".
+
+With this, `$substrBytes` / `$substrCP` numeric-argument handling matches mongod
+across the board — bool rejection, byte-vs-code-point aliasing, whole-double /
+fractional / truncation semantics, UTF-8-split rejection, and negative indices.
+Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$substrBytes` accepts a double start/length and truncates it toward zero
+  (matching mongod), instead of rejecting all non-integer values (both servers).
+
+### $substr* reject a negative index, like mongod
+
+A negative start (or, for `$substrCP`, a negative length) silently produced a
+Python-style negative-index slice — usually an empty or wrong substring — instead
+of the error mongod raises. Both servers now reject: the Python server with
+mongod's exact codes, the Rust core defers to `BadValue`.
+
+- `$substrBytes` / `$substr` negative start → **50752** ("starting index must be
+  non-negative"). A negative *length* is still fine — it means "to the end".
+- `$substrCP` negative start → **34455**, negative length → **34454**.
+
+This completes `$substrBytes` / `$substrCP` numeric-argument fidelity (bool
+rejection, byte-vs-code-point aliasing, whole-double / fractional handling,
+UTF-8-split rejection, and now negative indices). Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$substrBytes` / `$substr` / `$substrCP` reject a negative start (and
+  `$substrCP` a negative length) with mongod's exact error code instead of
+  returning a Python-style negative-index slice (both servers).
+
+### $toDate rejects a bool instead of coercing it to a date
+
+`$toDate` (and `$convert` to `date`) silently coerced a bool to a date by treating
+it as `1` / `0` milliseconds. mongod rejects it: a bool is a `ConversionFailure`
+(241, "Unsupported conversion from bool to date"), which `$convert`'s `onError`
+still catches. Every other supported source (int / long / double / string /
+objectId / decimal → date, null → null) is unchanged. Both servers now match.
+
+The Python server carries mongod's 241 code (through `$toDate`, which previously
+re-wrapped it as a generic error); the Rust core now classifies bool → date as a
+supported-but-failed conversion so `$convert`'s `onError` applies on the Rust
+server too. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$toDate` / `$convert` to `date` reject a bool with `ConversionFailure` (241)
+  instead of coercing it to a date, and `$convert`'s `onError` handles the failure
+  (both servers).
+
+### `$toLong` aggregation operator
+
+The `$toLong` conversion operator is now implemented, completing the `$to*`
+conversion family (`$toInt` / `$toDouble` / `$toDecimal` / `$toBool` /
+`$toString` / `$toDate` were already present, and `$convert: {to: "long"}` too).
+It converts numbers (truncating a double toward zero), numeric strings, and
+booleans to a 64-bit `long`, matching real mongod 7.0.12 — so a value beyond the
+32-bit range that `$toInt` rejects converts cleanly, while a value beyond the
+64-bit range overflows (code 241, catchable by `$convert`'s `onError`). Covered
+on both the Python and Rust servers (the Rust core computes the numeric cases
+and defers string / Decimal128 parsing to Python).
+
+#### Added
+
+- `$toLong` — previously an unrecognized expression operator (code 168), now
+  converts int / long / double (truncating toward zero) / bool / numeric string
+  to a BSON `long`; a result outside `[-2^63, 2^63-1]`, or a non-finite double,
+  overflows with code 241.
+
+### $trim / $ltrim / $rtrim validate their input and chars arguments
+
+The trim operators silently ignored a non-string `chars` argument (falling back to
+whitespace trimming) and reported a non-string `input` with a generic error.
+mongod validates both: a non-string `input` is `Location50699` and a non-string
+`chars` is `Location50700` (each message names the offending value and type). A
+null / missing `input` yields `null`, and — unlike the whitespace default — an
+explicit `chars: null` also yields `null`. Both servers now match.
+
+The Python server carries mongod's codes; the Rust core defers the non-string
+cases (so the Rust server rejects them) and now returns `null` for a `chars: null`
+rather than deferring. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$trim` / `$ltrim` / `$rtrim` reject a non-string `input` (`Location50699`) or
+  `chars` (`Location50700`) instead of erroring generically or silently ignoring
+  `chars`, and yield `null` for a `chars: null` (both servers).
+
+### $type validates its argument and accepts whole-double codes
+
+The `$type` query operator didn't validate its argument: an unknown alias, an
+out-of-range or fractional numeric code, and a bool all silently matched nothing
+instead of erroring, and the Rust engine additionally rejected a valid whole-double
+code (`{$type: 2.0}`) that mongod accepts. mongod validates it: a known alias or a
+numeric code in `{-1, 1..19, 127}` (a whole double counts) is valid; an unknown
+alias or an out-of-range / fractional code is `BadValue` (2, with a `{$exists:
+false}` hint for code `0`), and a bool / other type is `TypeMismatch` (14). Both
+servers now match.
+
+The Python server carries mongod's codes; the Rust core defers the invalid cases
+so the Rust server rejects them too, and now computes whole-double codes rather
+than deferring (so the Rust server no longer rejects a valid `{$type: 2.0}`). All
+22 aliases (including the deprecated ones and `number`) are recognised. Three-way
+mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$type` rejects an unknown alias / out-of-range / fractional code (`BadValue`)
+  and a bool (`TypeMismatch`) instead of silently no-matching, and accepts a valid
+  whole-double numeric code on both servers (previously the Rust server rejected
+  it).
+
+### Unary math operators reject non-numeric operands instead of coercing or crashing
+
+`$abs`, `$ceil`, `$floor`, `$sqrt`, `$exp`, `$ln`, `$log10`, `$round`, and
+`$trunc` never type-checked their operand. A string leaked a raw Python
+`TypeError` (surfacing as a generic error, not a clean server error), and a bool
+was silently coerced to `1` / `0` and computed on. mongod rejects both: a
+non-numeric operand is `Location28765` (`$round` / `$trunc` use `51081`), while
+`null` still passes through as `null`. Both servers now match.
+
+The Python server carries mongod's exact codes; the Rust core defers these cases
+to `BadValue` (so the Rust server rejects them too, rather than coercing a bool).
+Whole-double operands and every valid numeric input are unaffected. Three-way
+mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$abs` / `$ceil` / `$floor` / `$sqrt` / `$exp` / `$ln` / `$log10` reject a
+  string or bool operand with `Location28765`, and `$round` / `$trunc` with
+  `51081`, instead of coercing a bool to `1`/`0` or leaking a Python `TypeError`
+  (both servers).
+
+### $unwind validates its path, includeArrayIndex, and preserveNullAndEmptyArrays
+
+The `$unwind` stage silently accepted a malformed spec: a non-`$`-prefixed `path`,
+a non-string `path`, a non-string / empty / `$`-prefixed `includeArrayIndex`, and a
+non-bool `preserveNullAndEmptyArrays` (which it coerced with Python's `bool()`).
+mongod rejects each: a non-string path is `Location28808`, a bare path is
+`Location28818`, a non-string / empty `includeArrayIndex` is `Location28810`, a
+`$`-prefixed one is `Location28822`, and a non-bool `preserveNullAndEmptyArrays` is
+`Location28809`. Both servers now match.
+
+The Python server carries mongod's codes (including its verbatim double-space
+message quirk for `28810`); the Rust core defers the invalid cases so the Rust
+server rejects them too. Three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$unwind` rejects a non-string / bare `path` (`28808` / `28818`), a non-string /
+  empty / `$`-prefixed `includeArrayIndex` (`28810` / `28822`), and a non-bool
+  `preserveNullAndEmptyArrays` (`28809`), instead of silently accepting or coercing
+  them (both servers).
+
+### $pop / $position / $slice / $bit reject a bool argument, like mongod
+
+A cluster of update-operator bugs from the same root cause as `$inc`/`$mul`:
+Python's `bool` being an `int` subclass. `$pop: true` was treated as `$pop: 1`
+(pop the last element) on both servers, and `$push` with `$position: true` or
+`$slice: true` computed on the Rust server (insert at index 1 / keep 1) — all
+of these are parse errors in mongod. Every one now rejects a bool argument:
+the Python server reports mongod's exact codes (9 for `$pop`, 2 for
+`$position` / `$slice` / `$bit`) and messages, and the Rust server surfaces
+`BadValue`. `$pop` now also errors on a number other than ±1 (it silently did
+nothing before). Found while triaging the driver-gauge update operators;
+three-way mongod 7.0.12-verified.
+
+#### Fixed
+
+- `$pop`, `$push` `$position` / `$slice`, and `$bit` reject a bool argument
+  instead of coercing it to 1 (both servers); `$pop` errors on a non-±1 value.
+
 ## [0.5.4b237] — 2026-07-17
 
 ### SQL: user-defined range types, and enum OIDs in every plan shape

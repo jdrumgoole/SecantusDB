@@ -17,11 +17,21 @@ on:
 
 # Keyed on the ref so each branch / PR is its own lane: a newer push to the same
 # ref cancels that ref's stale build, but distinct refs never cancel each other.
-# (Several sessions pushing the same ref — e.g. main — still collide; the project
-# convention is one feature branch per session, merged via PR.)
+#
+# Cancellation is disabled on `main`. Every merge lands on the same ref, so with
+# unconditional cancel-in-progress a busy day cancels nearly every post-merge
+# build before it finishes — observed repeatedly: several consecutive merge
+# commits each showed `Build wheels: cancelled`, so the wheel matrix effectively
+# never ran against the default branch and a wheel-only regression would have
+# surfaced at release-tag time instead. On `main` the runs now queue and each
+# completes; on a PR branch the newest push still cancels the stale one, which
+# is what you want there.
+#
+# Trade-off: on a high-merge-rate day the `main` queue can lag behind the tip.
+# That is the intended cost — a late-but-real answer beats a fast "cancelled".
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: the build jobs only check out the repo, restore ccache, and
 # upload build artifacts — none of which need write access to repo contents.

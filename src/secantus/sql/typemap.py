@@ -115,6 +115,11 @@ PG_OID: dict[str, int] = {
     # (SQLAlchemy's _SpaceVector) sees "1 2", not a JSON/array decoding.
     "int2vector": 22,
     "oidvector": 30,
+    # aclitem — loaded as raw text (psycopg has no loader; it only needs the
+    # faithful oid pair to classify the array type).
+    "aclitem": 1033,
+    # name — the 63-byte identifier type (values travel as text).
+    "name": 19,
 }
 
 # Full-text search type tags — stored as subdocuments, rendered as their PG text.
@@ -176,6 +181,8 @@ SQL_TYPE_NAME: dict[str, str] = {
     "money": "money",
     "hstore": "hstore",
     "citext": "citext",
+    "aclitem": "aclitem",
+    "name": "name",
     "xml": "xml",
     **{t: t for t in _RANGE_TAGS},
     **{t: t for t in _MULTIRANGE_TAGS},
@@ -390,6 +397,10 @@ _ARRAY_PG_OID: dict[str, int] = {
     # Full-text search types.
     "tsvector": 3643,
     "tsquery": 3645,
+    # aclitem.
+    "aclitem": 1034,
+    # name.
+    "name": 1003,
     # Range types.
     "int4range": 3905,
     "numrange": 3907,
@@ -510,6 +521,26 @@ class TaggedText(str):
         return obj
 
 
+class TypedList(list):
+    """A list parameter that knows its element tag — substituted through a
+    ``::tag[]`` cast so it compares as a typed array, not raw literal text."""
+
+    elem_tag: str = "text"
+
+    def __init__(self, items: Any = (), elem_tag: str = "text") -> None:
+        super().__init__(items)
+        self.elem_tag = elem_tag
+
+
+class RecordValue(dict):
+    """An anonymous ``row(…)`` record value: an f1..fN dict that ALSO carries
+    each field's SQL type oid (0 = derive from the Python value). The binary
+    record encoder embeds per-field oids, and only the source expression can
+    distinguish an untyped literal (705) from ``::text`` (25) or ``::bytea``."""
+
+    field_oids: tuple[int, ...] = ()
+
+
 class DateText(str):
     """Canonical date text from a parameter declared ``date`` (oid 1082) —
     substituted as a ``::date`` cast so expressions type as date (``$1 + 1`` is
@@ -534,7 +565,11 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
             # A quoted built-in element spelling (``"cidr"[]``) parses as a
             # user-defined element type — resolve it like the bare-name case.
             elem = builtin_tag_for_name(inner[0].sql(dialect="postgres"))
-        return f"{elem}[]" if elem is not None else None
+        if elem is None:
+            return None
+        # ``int[][]`` is the same type as ``int[]`` in Postgres — the bracket
+        # count is decorative; dimensionality lives in the value.
+        return elem if is_array_tag(elem) else f"{elem}[]"
     tag = _DATATYPE_TAGS.get(datatype.this)
     if tag is not None:
         return tag
@@ -564,10 +599,110 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return base
     if base == "citext":
         return "citext"
+    if base == "aclitem":
+        return "aclitem"
+    if base == "name":
+        return "name"
     # ``oid`` parses as an ``exp.ObjectIdentifier`` (whose ``.sql()`` is "OID"),
     # not a DataType enum member — match on the rendered name.
     if base == "oid":
         return "oid"
+    return None
+
+
+#: Cast targets whose PG identity carries a length/precision modifier:
+#: DataType.Type name -> (oid, array_oid, modifier kind). ``char`` encodes
+#: n+4, ``numeric`` packs ((p<<16)|(s&0x7FF))+4, ``bit`` stores n bare, and
+#: ``time`` stores the precision bare — matching how psycopg decodes fmod.
+_TYPMOD_KINDS: dict[str, tuple[int, int, str]] = {
+    "VARCHAR": (1043, 1015, "char"),
+    "NVARCHAR": (1043, 1015, "char"),
+    "CHAR": (1042, 1014, "char"),
+    "NCHAR": (1042, 1014, "char"),
+    "BPCHAR": (1042, 1014, "char"),
+    "DECIMAL": (1700, 1231, "numeric"),
+    "BIT": (1560, 1561, "bit"),
+    "TIME": (1083, 1183, "time"),
+    "TIMETZ": (1266, 1270, "time"),
+    "TIMESTAMP": (1114, 1115, "time"),
+    "TIMESTAMPTZ": (1184, 1185, "time"),
+    "INTERVAL": (1186, 1187, "time"),
+}
+
+#: Sentinel offset for negative numeric scales: sqlglot can't parse
+#: ``numeric(2,-3)``, so the engine pre-rewrites ``-s`` to ``NEGSCALE + s``
+#: before parsing and the typmod encoder undoes it (real scales cap at 1000,
+#: so the ranges never overlap).
+NEGSCALE_SENTINEL = 5000
+
+
+def _typmod_param(node: exp.Expression) -> int | None:
+    try:
+        return int(node.name)
+    except (TypeError, ValueError):
+        return None
+
+
+def cast_type_identity(datatype: exp.DataType) -> tuple[int, int] | None:
+    """``(pg_oid, typmod)`` for a cast target that carries a PG type modifier
+    (``varchar(42)`` → (1043, 46), ``numeric(10,3)`` → (1700, ((10<<16)|3)+4),
+    ``time(2)`` → (1083, 2)) — or a bare ``varchar``/``bpchar``, whose identity
+    alone differs from the ``text`` oid we'd otherwise report. An array target
+    reports the element's typmod with the array oid, matching PG. None when
+    the target isn't a modifier-bearing type."""
+    if datatype.this == exp.DataType.Type.ARRAY:
+        inner = datatype.args.get("expressions") or []
+        if inner and isinstance(inner[0], exp.DataType):
+            elem = cast_type_identity(inner[0])
+            if elem is not None:
+                _oid, typmod = elem
+                kinds = _TYPMOD_KINDS.get(getattr(inner[0].this, "name", None))
+                if kinds is None:  # varbit via USERDEFINED
+                    kinds = _userdefined_typmod_kind(inner[0])
+                if kinds is not None:
+                    return (kinds[1], typmod)
+        return None
+    # ``datatype.this`` is a plain string for some spellings (``::oid`` parses
+    # via ObjectIdentifier) — those never carry a modifier.
+    # ``::json`` keeps the plain-json identity (114) — our ``json`` tag maps to
+    # jsonb (3802), whose binary form carries a version byte plain json lacks;
+    # a client's json loader would choke on the prefix (and vice versa).
+    if getattr(datatype.this, "name", None) == "JSON":
+        return (114, -1)
+    entry = _TYPMOD_KINDS.get(getattr(datatype.this, "name", None))
+    if entry is None:
+        ud = _userdefined_typmod_kind(datatype)
+        if ud is None:
+            return None
+        entry = ud
+    oid, _array_oid, kind = entry
+    params = [p for p in (datatype.args.get("expressions") or []) if _typmod_param(p) is not None]
+    if not params:
+        # Bare varchar/bpchar still need their distinct oid; the other kinds
+        # already report the right oid elsewhere, so a bare form changes nothing.
+        return (oid, -1) if kind == "char" else None
+    n = _typmod_param(params[0]) or 0
+    if kind == "char":
+        return (oid, n + 4)
+    if kind == "bit":
+        return (oid, n)
+    if kind == "time":
+        return (oid, n)
+    # numeric(p[,s]) — a missing scale is 0; undo the negative-scale sentinel.
+    s = _typmod_param(params[1]) if len(params) > 1 else 0
+    s = s if s is not None else 0
+    if s > NEGSCALE_SENTINEL - 1001:
+        s = -(s - NEGSCALE_SENTINEL)
+    return (oid, ((n << 16) | (s & 0x7FF)) + 4)
+
+
+def _userdefined_typmod_kind(datatype: exp.DataType) -> tuple[int, int, str] | None:
+    """``varbit(n)`` parses as USERDEFINED — resolve it by rendered name."""
+    if datatype.this != exp.DataType.Type.USERDEFINED:
+        return None
+    name = datatype.sql(dialect="postgres").lower().split("(", 1)[0].strip().strip('"')
+    if name in ("varbit", "bit varying"):
+        return (1562, 1563, "bit")
     return None
 
 
@@ -602,46 +737,83 @@ def normalize_result_value(value: Any, tag: str | None) -> Any:
     return value
 
 
+# Postgres' whitespace set for array literals — NOT Python str.strip()'s:
+# \x1c-\x1f (and NBSP/NEL) are isspace() to Python but data to Postgres.
+_PG_ARRAY_WS = " \t\n\r\v\f"
+
+
 def _parse_pg_array_literal(text: str) -> list:
-    """Parse a Postgres array *string* literal (``{1,2,3}`` / ``{a,"b,c",NULL}``)
-    into a Python list (a bare ``NULL`` element is None). One level deep."""
-    s = text.strip()
-    if not (s.startswith("{") and s.endswith("}")):
+    """Parse a Postgres array *string* literal into a (possibly nested) Python
+    list, following PG's grammar: an optional ``[l:u]…=`` dimension-bounds
+    prefix, nested ``{}`` sub-arrays, double-quoted elements with ``\\X``
+    escapes, backslash escapes in bare elements, and a bare unquoted ``NULL``
+    as None."""
+    s = text.strip(_PG_ARRAY_WS)
+    # ``[0:1]={a,b}`` — dimension bounds; the values follow the ``=``.
+    if s.startswith("["):
+        depth_end = s.find("=")
+        if depth_end == -1:
+            raise ValueError(f"malformed array literal: {text!r}")
+        s = s[depth_end + 1 :].strip(_PG_ARRAY_WS)
+    if not s.startswith("{"):
         raise ValueError(f"malformed array literal: {text!r}")
-    body = s[1:-1]
-    if body.strip() == "":
-        return []
+    value, i = _parse_pg_array_body(s, 0)
+    if s[i:].strip(_PG_ARRAY_WS):
+        raise ValueError(f"malformed array literal: {text!r}")
+    return value
+
+
+def _parse_pg_array_body(s: str, i: int) -> tuple[list, int]:
+    """Parse one ``{…}`` (sub-)array starting at ``i`` (which must point at the
+    opening brace); returns ``(elements, next_index)``."""
+    assert s[i] == "{"
+    i += 1
+    n = len(s)
     out: list = []
-    i, n = 0, len(body)
-    # Postgres' whitespace set for array literals — NOT Python str.strip()'s:
-    # \x1c-\x1f are isspace() to Python but data to Postgres.
-    pg_ws = " \t\n\r\v\f"
-    while i < n:
-        while i < n and body[i] in pg_ws:
+    while True:
+        while i < n and s[i] in _PG_ARRAY_WS:
             i += 1
-        if i < n and body[i] == '"':  # quoted element (keeps commas / literal NULL)
+        if i >= n:
+            raise ValueError(f"malformed array literal: {s!r}")
+        if s[i] == "}" and not out:
+            return out, i + 1  # empty array
+        if s[i] == "{":
+            sub, i = _parse_pg_array_body(s, i)
+            out.append(sub)
+        elif s[i] == '"':  # quoted element (keeps commas / literal NULL)
             i += 1
             buf: list[str] = []
-            while i < n and body[i] != '"':
-                if body[i] == "\\" and i + 1 < n:
-                    buf.append(body[i + 1])
+            while i < n and s[i] != '"':
+                if s[i] == "\\" and i + 1 < n:
+                    buf.append(s[i + 1])
                     i += 2
                 else:
-                    buf.append(body[i])
+                    buf.append(s[i])
                     i += 1
+            if i >= n:
+                raise ValueError(f"malformed array literal: {s!r}")
             i += 1  # closing quote
             out.append("".join(buf))
-            while i < n and body[i] != ",":  # skip to the separator
-                i += 1
-            i += 1  # consume the comma
-        else:  # unquoted element up to the next comma
-            j = body.find(",", i)
-            if j == -1:
-                j = n
-            token = body[i:j].strip(pg_ws)
+        else:  # bare element up to the next separator / close, with \X escapes
+            buf = []
+            while i < n and s[i] not in ",}":
+                if s[i] == "\\" and i + 1 < n:
+                    buf.append(s[i + 1])
+                    i += 2
+                else:
+                    buf.append(s[i])
+                    i += 1
+            token = "".join(buf).strip(_PG_ARRAY_WS)
             out.append(None if token.upper() == "NULL" else token)
-            i = j + 1
-    return out
+        while i < n and s[i] in _PG_ARRAY_WS:
+            i += 1
+        if i >= n:
+            raise ValueError(f"malformed array literal: {s!r}")
+        if s[i] == "}":
+            return out, i + 1
+        if s[i] != ",":
+            raise ValueError(f"malformed array literal: {s!r}")
+        i += 1
 
 
 def _coercion_error(tag: str, value: Any) -> Exception:
@@ -675,8 +847,21 @@ def coerce(value: Any, tag: str) -> Any:
         return None
     if is_array_tag(tag):
         elem = array_element_tag(tag)
+        if elem == "box" and not isinstance(value, (list, tuple)):
+            # box[] is the one built-in whose array delimiter is ``;`` (a box's
+            # own text form contains commas).
+            body = str(value).strip(_PG_ARRAY_WS)
+            if not (body.startswith("{") and body.endswith("}")):
+                raise ValueError(f"malformed array literal: {value!r}")
+            return [
+                coerce(t.strip(_PG_ARRAY_WS), "box")
+                for t in body[1:-1].split(";")
+                if t.strip(_PG_ARRAY_WS)
+            ]
         items = value if isinstance(value, (list, tuple)) else _parse_pg_array_literal(str(value))
-        return [coerce(v, elem) for v in items]
+        # Multi-dimensional literals nest lists; coerce each leaf to the
+        # element type, preserving the nesting.
+        return [coerce(v, tag) if isinstance(v, (list, tuple)) else coerce(v, elem) for v in items]
     if tag == "any":
         # Schema-on-read (reflected tables): keep the literal's natural Python
         # type so it compares against the stored BSON value as-is.
@@ -992,10 +1177,22 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
             return _ranges.render(value).encode("utf-8")
         return _render_json(value).encode("utf-8")
     if isinstance(value, bson.Decimal128):
-        return str(value.to_decimal()).encode("utf-8")
+        return _render_pg_numeric(value.to_decimal()).encode("utf-8")
+    if isinstance(value, Decimal):
+        return _render_pg_numeric(value).encode("utf-8")
     if isinstance(value, float):
         return _render_pg_float(value).encode("ascii")
     return str(value).encode("utf-8")
+
+
+def _render_pg_numeric(value: Decimal) -> str:
+    """Postgres ``numeric_out`` text: plain positional notation, never
+    exponent form (``Decimal('1.1E+2')`` prints ``110``, not ``1.1E+2``)."""
+    if not value.is_finite():
+        if value.is_nan():
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    return format(value, "f")
 
 
 def _render_pg_float(value: float) -> str:
@@ -1127,8 +1324,10 @@ def infer_elem_tag(items: Any) -> str:
 
 def _render_pg_array(items: Any, elem_tag: str) -> str:
     """Render a Python list as a Postgres array text literal ``{a,b,c}``, quoting
-    an element only when it needs it (empty, NULL-looking, or containing a comma /
-    brace / quote / whitespace)."""
+    an element only when it needs it (empty, NULL-looking, or containing the
+    delimiter / brace / quote / whitespace). ``box`` is the one built-in whose
+    array delimiter is ``;`` (its own text form contains commas)."""
+    delim = ";" if elem_tag == "box" else ","
     parts: list[str] = []
     for v in items:
         if v is None:
@@ -1139,6 +1338,11 @@ def _render_pg_array(items: Any, elem_tag: str) -> str:
             else:
                 parts.append("NULL")
             continue
+        if isinstance(v, (list, tuple)) and elem_tag != "json":
+            # A nested sub-array renders as bare nested braces, not a quoted
+            # element (multi-dimensional array literals).
+            parts.append(_render_pg_array(v, elem_tag))
+            continue
         rendered = to_pg_text(v, elem_tag)
         text = rendered.decode("utf-8") if rendered is not None else ""
         # Quote on ANY whitespace (str.isspace covers \n, \r, \x1c-\x1f, …) —
@@ -1146,11 +1350,11 @@ def _render_pg_array(items: Any, elem_tag: str) -> str:
         if (
             text == ""
             or text.upper() == "NULL"
-            or any(c in text for c in ',{}"\\')
+            or any(c in text for c in delim + '{}"\\')
             or any(ch.isspace() for ch in text)
         ):
             escaped = text.replace("\\", "\\\\").replace('"', '\\"')
             parts.append(f'"{escaped}"')
         else:
             parts.append(text)
-    return "{" + ",".join(parts) + "}"
+    return "{" + delim.join(parts) + "}"

@@ -52,7 +52,18 @@ _pure = _load_pure_projection()
 
 def _rust_proj(doc, spec, query=None):
     qb = bson.encode(query) if query else None
-    res = _rust.apply_projection(bson.encode(doc), bson.encode(spec), qb)
+    db, sb = bson.encode(doc), bson.encode(spec)
+    res = _rust.apply_projection(db, sb, qb)
+    # Wherever the raw fast path claims a spec, it must produce the identical
+    # projected document as the full apply_projection (and never claim a spec
+    # the full path defers on) — every projection parity case thus also pins
+    # apply_projection_raw.
+    raw = _rust.apply_projection_raw(db, sb)
+    if raw is not None:
+        assert res is not None, f"raw fast-pathed but apply_projection deferred: spec={spec}"
+        assert bson.decode(raw) == bson.decode(res), (
+            f"apply_projection_raw != apply_projection doc={doc} spec={spec}"
+        )
     return None if res is None else bson.decode(res)
 
 
@@ -123,6 +134,39 @@ def test_curated_parity(doc, spec):
         return
     py = _pure.apply_projection(doc, spec)
     assert rust == py, f"rust={rust} pure={py} spec={spec}"
+
+
+@pytest.mark.parametrize(
+    "sl,code",
+    [
+        ("x", 28667),  # non-number scalar
+        (True, 28667),  # bool
+        ([], 28667),  # empty array
+        ([1, -2], 28724),  # [skip, non-positive limit]
+        ([1, 2, 3], 28724),  # 3-element array
+        (["x", 2], 28724),  # first element not a number
+    ],
+)
+def test_slice_invalid_defers_and_raises(sl, code):
+    # Invalid projection $slice: Rust defers (None), pure engine raises the code.
+    doc = bson.decode(bson.encode({"_id": 1, "a": [1, 2, 3, 4, 5]}))
+    spec = bson.decode(bson.encode({"s": {"a": {"$slice": sl}}}))["s"]
+    assert _rust_proj(doc, spec) is None
+    with pytest.raises(_pure.ProjectionError) as exc:
+        _pure.apply_projection(doc, spec)
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize("arg", [5, "x", [1]])
+def test_elem_match_non_document_defers_and_raises(arg):
+    # A non-document $elemMatch projection argument: Rust defers (None), pure
+    # engine raises Location31274.
+    doc = bson.decode(bson.encode({"_id": 1, "arr": [1, 2, 3]}))
+    spec = bson.decode(bson.encode({"s": {"arr": {"$elemMatch": arg}}}))["s"]
+    assert _rust_proj(doc, spec) is None
+    with pytest.raises(_pure.ProjectionError) as exc:
+        _pure.apply_projection(doc, spec)
+    assert exc.value.code == 31274
 
 
 # Positional `arr.$` projection — needs the query (filter) to resolve which

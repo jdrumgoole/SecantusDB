@@ -120,6 +120,30 @@ fn query_matches(
     Ok(py.allow_threads(|| query::matches(&doc, &query, &vars, coll.as_ref()).ok()))
 }
 
+/// `query.matches_raw` — the raw-BSON matcher, over the same BSON bytes. The
+/// document bytes are matched WITHOUT being materialised into an owned
+/// `Document` (only the filter's reached fields are decoded). Result must be
+/// identical to [`query_matches`] for every input; the parity suite pins
+/// `matches_raw == matches == pure Python`. Returns `None` to defer, same
+/// contract as `query_matches`.
+#[pyfunction]
+fn query_matches_raw(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    query_bytes: &[u8],
+    vars_bytes: &[u8],
+    collation_bytes: &[u8],
+) -> PyResult<Option<bool>> {
+    let query: Document = bson::from_slice(query_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
+    let vars: Document = bson::from_slice(vars_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
+    let coll = parse_collation(collation_bytes)?;
+    let raw = bson::RawDocument::from_bytes(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    Ok(py.allow_threads(|| query::matches_raw(raw, &query, &vars, coll.as_ref()).ok()))
+}
+
 /// Batched `query.matches`: one call filters a whole candidate list under a
 /// single GIL release, amortising the per-call seam + GIL handoff that makes
 /// per-doc matching scale poorly under concurrency (see `benchmarks/`).
@@ -334,6 +358,48 @@ fn apply_projection(
     Ok(out.map(|b| to_pybytes(py, b)))
 }
 
+/// `projection.apply_projection` raw-BSON fast path over the same bytes. Returns
+/// `Some(projected bytes)` for the pure top-level inclusion shape it handles
+/// (projecting straight off the raw document), or `None` to signal the caller
+/// must run the full `apply_projection`. Result must be byte-identical to
+/// `apply_projection` for every spec it claims; the parity suite pins it. The
+/// GIL is held (the `RawDocument` borrows the Python buffer and the op is
+/// small), unlike the batched projection which releases it.
+#[pyfunction]
+fn apply_projection_raw(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    spec_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let spec: Document = bson::from_slice(spec_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
+    let raw = bson::RawDocument::from_bytes(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    match projection::apply_projection_raw(raw, &spec) {
+        Some(doc) => {
+            let bytes = encode_doc(&doc).map_err(PyValueError::new_err)?;
+            Ok(Some(to_pybytes(py, bytes)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// `secantus_core::referenced_top_level_fields` — the `$group` field-reference
+/// pushdown. Given a `$group` spec, returns the sorted top-level field names the
+/// group reads, or `None` when the group must run on fully-decoded documents
+/// (whole-doc / computed-field / non-simple-accumulator shapes). The parity
+/// suite pins the property that decoding only these fields yields byte-identical
+/// `$group` output.
+#[pyfunction]
+fn group_referenced_fields(spec_bytes: &[u8]) -> PyResult<Option<Vec<String>>> {
+    let spec: Document = bson::from_slice(spec_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
+    Ok(
+        secantus_core::referenced_top_level_fields(&Bson::Document(spec))
+            .map(|s| s.into_iter().collect()),
+    )
+}
+
 /// Decode an optional `query` filter (empty / absent -> `None`), used by the
 /// projection bindings to resolve a positional `arr.$` projection.
 fn decode_optional_query(query_bytes: Option<&[u8]>) -> PyResult<Option<Document>> {
@@ -499,15 +565,18 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
+    m.add_function(wrap_pyfunction!(query_matches_raw, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches_batch, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update_with, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update_batch, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate, m)?)?;
     m.add_function(wrap_pyfunction!(apply_projection, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_projection_raw, m)?)?;
     m.add_function(wrap_pyfunction!(apply_projection_batch, m)?)?;
     m.add_function(wrap_pyfunction!(compute_update_description, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update_description, m)?)?;
     m.add_function(wrap_pyfunction!(apply_pipeline, m)?)?;
+    m.add_function(wrap_pyfunction!(group_referenced_fields, m)?)?;
     Ok(())
 }

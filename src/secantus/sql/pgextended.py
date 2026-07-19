@@ -39,6 +39,10 @@ class Prepared:
     stmt: exp.Expression | None  # None for an empty query string
     param_oids: list[int]
     param_count: int
+    # The original query text and creation time — pg_prepared_statements
+    # reports both (psycopg's prepared-statement cache matches on the text).
+    query: str = ""
+    created: Any = None
 
 
 @dataclass
@@ -72,9 +76,12 @@ def _decode_numeric(b: bytes) -> Decimal:
         return Decimal("-Infinity")
     s = "".join(f"{d:04d}" for d in digits) or "0"
     # The first digit group sits at base-10000 position ``weight``; give the
-    # context enough precision for arbitrarily wide values (the default 28
-    # significant digits silently rounds — or refuses to quantize — wide numerics).
-    dctx = decimal.Context(prec=max(len(s) + dscale + 4, 40))
+    # context enough precision for arbitrarily wide values — the integer span
+    # is ``(weight+1)*4`` digits, plus ``dscale`` fractional. The default 28
+    # significant digits silently rounds, and an under-sized context makes the
+    # final quantize raise InvalidOperation on a wide value.
+    span = max((weight + 1) * 4, len(s)) + dscale + 4
+    dctx = decimal.Context(prec=max(span, 40))
     value = dctx.scaleb(Decimal(s), (weight - (ndigits - 1)) * 4) if digits else Decimal(0)
     if sign == 0x4000:
         value = value.copy_negate()  # context-free: ``-value`` rounds to context prec
@@ -504,6 +511,11 @@ _ARRAY_ELEM_BY_OID: dict[int, tuple[int, str]] = {
 # json[] (199 → json 114) — our ``json`` tag maps to jsonb (3802/3807), but a
 # client can still bind an array parameter with the plain-json OIDs.
 _ARRAY_ELEM_BY_OID[199] = (114, "json")
+# varchar[]/bpchar[] — no internal tag of their own (values are text), but
+# result columns report the real array oids (1015/1014) now that varchar/
+# bpchar keep their type identity, so the binary encoder must know them.
+_ARRAY_ELEM_BY_OID[1015] = (1043, "text")
+_ARRAY_ELEM_BY_OID[1014] = (1042, "text")
 
 # A user type's paired array oid is its own oid + USER_TYPE_ARRAY_OID_OFFSET
 # (see catalog.py); everything at or above this floor is a user-type array whose
@@ -520,21 +532,47 @@ def _array_elem_info(arr_oid: int) -> tuple[int, str]:
     return (arr_oid - USER_TYPE_ARRAY_OID_OFFSET, "text")
 
 
+def _array_dims(items: Any, elem_tag: str | None) -> list[int]:
+    """The dimension lengths of a (possibly nested) array value. A list element
+    is a sub-array only outside json[] (a JSON array IS a value there)."""
+    dims: list[int] = []
+    node = items
+    while isinstance(node, (list, tuple)):
+        dims.append(len(node))
+        if (
+            elem_tag != "json"
+            and node
+            and all(isinstance(v, (list, tuple)) for v in node)
+            and len({len(v) for v in node}) == 1
+        ):
+            node = node[0]
+        else:
+            break
+    return dims
+
+
 def _encode_array(
     value: Any, arr_oid: int, tag: str | None, encoding: str | None = "utf-8"
 ) -> bytes:
-    """Binary-encode a one-dimensional array result (ndim/hasnull/elemoid header,
-    one per-dim {len, lbound} pair, then length-prefixed elements)."""
+    """Binary-encode an array result (ndim/hasnull/elemoid header, per-dim
+    {len, lbound} pairs, then length-prefixed elements in row-major order).
+    Nested lists encode as multi-dimensional arrays."""
     elem_oid, elem_tag = _array_elem_info(arr_oid)
     if isinstance(value, (list, tuple)):
         items = value
     else:
         items = typemap._parse_pg_array_literal(str(value))
-    has_null = any(v is None for v in items)
-    out = bytearray(struct.pack("!iii", 1 if items else 0, int(has_null), elem_oid))
-    if items:
-        out += struct.pack("!ii", len(items), 1)
-        for v in items:
+    dims = _array_dims(items, elem_tag)
+    flat: list[Any] = list(items)
+    for _ in range(len(dims) - 1):
+        flat = [v for sub in flat for v in (sub if isinstance(sub, (list, tuple)) else [sub])]
+    has_null = any(v is None for v in flat)
+    ndim = len(dims) if flat or len(dims) > 1 else 0
+    out = bytearray(struct.pack("!iii", ndim, int(has_null), elem_oid))
+    if ndim:
+        for d in dims:
+            out += struct.pack("!ii", d, 1)
+        for v in flat:
             if v is None:
                 out += struct.pack("!i", -1)
                 continue
@@ -553,15 +591,22 @@ def _encode_array(
 
 
 def _decode_array(raw: bytes, encoding: str | None = "utf-8") -> list:
-    """Decode a binary array parameter to a Python list (one dimension)."""
+    """Decode a binary array parameter to a (possibly nested) Python list."""
     ndim, _has_null, elem_oid = struct.unpack_from("!iii", raw, 0)
     if ndim == 0:
         return []
-    n, _lbound = struct.unpack_from("!ii", raw, 12)
+    dims = []
+    off = 12
+    for _ in range(ndim):
+        n, _lbound = struct.unpack_from("!ii", raw, off)
+        dims.append(n)
+        off += 8
     decoder = None if elem_oid in (0, 25, 1043) else _BINARY.get(elem_oid)
+    total = 1
+    for d in dims:
+        total *= d
     items: list = []
-    off = 20
-    for _ in range(n):
+    for _ in range(total):
         (length,) = struct.unpack_from("!i", raw, off)
         off += 4
         if length < 0:
@@ -570,6 +615,9 @@ def _decode_array(raw: bytes, encoding: str | None = "utf-8") -> list:
         b = raw[off : off + length]
         off += length
         items.append(decoder(b) if decoder is not None else pgwire.decode_text(b, encoding))
+    # Rebuild the nesting from the inside out.
+    for d in reversed(dims[1:]):
+        items = [items[i : i + d] for i in range(0, len(items), d)]
     return items
 
 
@@ -598,6 +646,18 @@ def _encode_value(
         return _encode_multirange_generic(value, encoding)
     if isinstance(value, dict) and ("empty" in value or ("lower" in value and "upper" in value)):
         return _encode_range_generic(value, encoding)
+    if oid == 114:  # plain json: binary form is the bare JSON text (no header)
+        return pgwire.transcode_out(typemap.to_pg_text(value, "json"), encoding) or b""
+    if (
+        isinstance(value, dict)
+        and tag != "json"
+        and not any(k in value for k in ("hstore", "interval", "tsvector", "tsquery"))
+    ):
+        # A residual dict is a composite record (an array-of-composite element
+        # reaches here with the element's minted oid) — ranges / multiranges /
+        # jsonb and the tagged subdoc types were all matched above. JSON text
+        # would blow up psycopg's binary record parser.
+        return _encode_record(value, encoding)
     # text / varchar / unknown: the binary form equals the (client-encoded) text bytes.
     return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding) or b""
 
@@ -615,14 +675,22 @@ def _py_value_field_oid(v: Any) -> tuple[int, str]:
         return (1700, "numeric")
     if isinstance(v, _dt.datetime):
         return (1184, "timestamptz") if v.tzinfo is not None else (1114, "timestamp")
+    if isinstance(v, (bytes, bytearray, memoryview, bson.Binary)):
+        return (17, "bytea")
     if isinstance(v, dict):
         return (2249, "composite")
     return (25, "text")
 
 
-def _binary_record_to_text(raw: bytes, encoding: str | None = "utf-8") -> str:
+def _binary_record_to_text(
+    raw: bytes, encoding: str | None = "utf-8", *, is_composite_oid: Any = None
+) -> str:
     """Decode a PG binary record parameter into its record TEXT literal (fields
-    decoded per their embedded oids), which rides the composite text parser."""
+    decoded per their embedded oids), which rides the composite text parser.
+    ``is_composite_oid`` (an ``oid -> bool`` predicate, when catalog context is
+    available) lets a nested field embedded with a USER composite oid — not the
+    generic 2249 — recurse instead of being text-decoded (its payload is raw
+    binary and blows up UTF-8 decoding)."""
     (n,) = struct.unpack_from("!i", raw, 0)
     off = 4
     parts: list[str] = []
@@ -637,8 +705,8 @@ def _binary_record_to_text(raw: bytes, encoding: str | None = "utf-8") -> str:
         decoder = None if oid in (0, 25, 1043) else _BINARY.get(oid)
         if decoder is not None:
             val = decoder(payload)
-        elif oid == 2249:
-            val = _binary_record_to_text(payload, encoding)
+        elif oid == 2249 or (is_composite_oid is not None and is_composite_oid(oid)):
+            val = _binary_record_to_text(payload, encoding, is_composite_oid=is_composite_oid)
         else:
             val = pgwire.decode_text(payload, encoding)
         rendered = typemap.to_pg_text(val, typemap.OID_TO_TAG.get(oid))
@@ -651,13 +719,24 @@ def _binary_record_to_text(raw: bytes, encoding: str | None = "utf-8") -> str:
 
 def _encode_record(value: dict, encoding: str | None = "utf-8") -> bytes:
     """PG binary record: int32 nfields, then per field int32 type oid +
-    int32 length (-1 NULL) + data."""
+    int32 length (-1 NULL) + data. A ``RecordValue`` carries its fields'
+    declared SQL oids (``row('x')`` embeds unknown/705, ``row('x'::text)``
+    25); otherwise the oid derives from the Python value."""
+    declared = getattr(value, "field_oids", ())
     out = bytearray(struct.pack("!i", len(value)))
-    for v in value.values():
+    for i, v in enumerate(value.values()):
         if v is None:
             out += struct.pack("!ii", 25, -1)
             continue
         oid, tag = _py_value_field_oid(v)
+        if i < len(declared) and declared[i]:
+            oid = declared[i]
+            if oid == 705:
+                # unknown — the value travels as its raw text bytes.
+                b = pgwire.transcode_out(typemap.to_pg_text(v, "text"), encoding) or b""
+                out += struct.pack("!ii", oid, len(b)) + b
+                continue
+            tag = _TAG_BY_OID.get(oid, tag)
         b = _encode_value(v, oid, tag, encoding) or b""
         out += struct.pack("!ii", oid, len(b)) + b
     return bytes(out)
@@ -757,8 +836,21 @@ def _text_param_timetz(s: str) -> Any:
     return typemap.TimeTzText(_datetimes.parse_timetz(s))
 
 
+def _text_param_bytea(s: str) -> bytes:
+    from secantus.sql import bytea as _bytea
+
+    return _bytea.parse(s)
+
+
+def _text_param_uuid(s: str) -> str:
+    from secantus.sql import uuidtype as _uuidtype
+
+    return _uuidtype.normalize(s)
+
+
 _TEXT_PARAM = {
     16: lambda s: s.strip().lower() in ("t", "true", "y", "yes", "on", "1"),  # bool
+    17: _text_param_bytea,  # bytea — ``\x…`` hex (or escape) text form -> bytes
     20: int,  # int8
     21: int,  # int2
     23: int,  # int4
@@ -775,6 +867,11 @@ _TEXT_PARAM = {
     1184: _text_param_timestamp("timestamptz"),  # -> aware datetime
     1186: _text_param_interval,  # -> interval subdoc
     1266: _text_param_timetz,  # timetz -> canonical text
+    2950: _text_param_uuid,  # uuid -> canonical hyphenated (psycopg dumps bare hex)
+    # Network types -> the stored canonical form (a bare host inet gets /32).
+    869: lambda s: typemap.coerce(s, "inet"),
+    650: lambda s: typemap.coerce(s, "cidr"),
+    829: lambda s: typemap.coerce(s, "macaddr"),
 }
 
 
@@ -792,6 +889,17 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
             # Range / multirange (or arrays of them): carried as text with the
             # declared tag so substitution casts it into the structured value.
             return typemap.TaggedText(text, range_tag)
+        arr = _ARRAY_ELEM_BY_OID.get(oid)
+        if arr is not None and arr[1] not in ("text", "citext", "json"):
+            # A typed array param (int2[]/bytea[]/inet[]/…) — parse the array
+            # literal into a typed list so the substitution's ``::tag[]`` cast
+            # path fires (a raw text literal compares text-vs-list and is
+            # silently false). text[] stays raw text: its literal form is
+            # already what the text machinery expects.
+            try:
+                return typemap.TypedList(typemap.coerce(text, f"{arr[1]}[]"), arr[1])
+            except (ValueError, TypeError):
+                return text
         conv = _TEXT_PARAM.get(oid)
         if conv is None:
             return text
@@ -824,7 +932,13 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
         # A user-type array oid (a registered enum's array dumper binds with the
         # minted array oid); the embedded element oid is unknown to _BINARY, so
         # elements fall back to text — which IS an enum's value form.
-        return _decode_array(raw, encoding)
+        items = _decode_array(raw, encoding)
+        arr = _ARRAY_ELEM_BY_OID.get(oid)
+        if arr is not None and arr[1] not in ("text", "citext", "json"):
+            # Typed binary arrays substitute through a ``::tag[]`` cast so
+            # equality against ``array[…]`` values compares element-wise.
+            return typemap.TypedList(items, arr[1])
+        return items
     return raw.decode(encoding or "utf-8", "replace")
 
 
@@ -851,12 +965,18 @@ class ExtendedSession:
         if msg_type == "H":  # Flush — we send eagerly, nothing to flush
             return b""
         try:
-            if msg_type == "P":
-                return self._parse(payload)
-            if msg_type == "B":
-                return self._bind(payload)
-            if msg_type == "D":
-                return self._describe(payload)
+            # Parse/Bind/Describe read the catalog (pg_typeof rewrites, minted
+            # user-type oid resolution, RowDescription) — inside an open
+            # transaction block they must see the block's UNCOMMITTED DDL (a
+            # type created two statements ago), so they run in the same storage
+            # transaction Execute does.
+            with self._txn_read_scope():
+                if msg_type == "P":
+                    return self._parse(payload)
+                if msg_type == "B":
+                    return self._bind(payload)
+                if msg_type == "D":
+                    return self._describe(payload)
             if msg_type == "E":
                 return self._execute(payload)
             if msg_type == "C":
@@ -866,7 +986,11 @@ class ExtendedSession:
         except errors.SQLError as exc:
             self.skip_until_sync = True
             return pgwire.error_response(
-                exc.sqlstate, exc.message, encoding=self.session.wire_encoding
+                exc.sqlstate,
+                exc.message,
+                encoding=self.session.wire_encoding,
+                diag=getattr(exc, "diag", None),
+                position=getattr(exc, "position", None),
             )
         except Exception:  # pragma: no cover - defensive
             logger.exception("error in extended protocol")
@@ -874,6 +998,14 @@ class ExtendedSession:
             # Generic wire message; full detail stays in the server log — don't
             # leak the raw Python exception text to the client. (§I17)
             return pgwire.error_response("XX000", "internal error")
+
+    def _txn_read_scope(self) -> Any:
+        """The open transaction's storage scope (or a no-op outside a block)."""
+        import contextlib
+
+        if self.session.txn_handle is not None and not self.session.txn_failed:
+            return self.storage.use_user_transaction(self.session.txn_handle)
+        return contextlib.nullcontext()
 
     # -- handlers ----------------------------------------------------------- #
 
@@ -899,7 +1031,20 @@ class ExtendedSession:
                     self.session.database, self.catalog, oid
                 ),
             )
-        self.prepared[name] = Prepared(name, stmt, oids, count)
+        # Parse-analysis type inference: a parameter the client left untyped
+        # (oid 0) takes its type from the AST context (a cast on it, or a cast
+        # operand it's compared with) so Bind can decode a BINARY payload.
+        oids = planner.infer_parameter_types(
+            stmt, list(oids), catalog=self.catalog, db=self.session.database
+        )
+        # An untyped parameter fed straight to a VARIADIC "any" function can't
+        # be typed at all — PG rejects the Parse with 42P18.
+        bad = planner.indeterminate_parameter(stmt, oids)
+        if bad is not None:
+            raise errors.SQLError("42P18", f"could not determine data type of parameter ${bad}")
+        self.prepared[name] = Prepared(
+            name, stmt, oids, count, query=query, created=_dt.datetime.now(_dt.timezone.utc)
+        )
         return pgwire.parse_complete()
 
     def _bind(self, payload: bytes) -> bytes:
@@ -941,7 +1086,16 @@ class ExtendedSession:
             return scalar.validate_enum_label(enum, value)
         if self.catalog.get_composite(db, name) is not None:
             if isinstance(value, bytes):
-                value = _binary_record_to_text(value, self.session.wire_encoding)
+                # A nested composite field embeds ITS composite's user oid —
+                # the predicate lets the decoder recurse instead of trying to
+                # UTF-8-decode raw binary record bytes.
+                def _is_composite(field_oid: int) -> bool:
+                    fname = virtual.user_type_name(db, self.catalog, field_oid)
+                    return fname is not None and self.catalog.get_composite(db, fname) is not None
+
+                value = _binary_record_to_text(
+                    value, self.session.wire_encoding, is_composite_oid=_is_composite
+                )
             return typemap.TaggedText(str(value), virtual.quote_type_name(name))
         rng = getattr(self.catalog, "get_range_type", None)
         rng_doc = rng(db, name) if rng is not None else None
@@ -1033,6 +1187,13 @@ class ExtendedSession:
             portal.offset = 0
         res = portal.result
         out = bytearray()
+        for severity, message in getattr(res, "notices", ()) or ():
+            out += pgwire.notice_response(
+                message,
+                severity=severity,
+                sqlstate="01000" if severity == "WARNING" else "00000",
+                encoding=self.session.wire_encoding,
+            )
         status = list(res.parameter_status)
         if self.session.pending_parameter_status:
             status += self.session.pending_parameter_status
@@ -1096,7 +1257,9 @@ class ExtendedSession:
         if cols is None:
             return pgwire.no_data()
         return pgwire.row_description(
-            [(c.name, c.pg_oid) for c in cols], formats, encoding=self.session.wire_encoding
+            [(c.name, c.pg_oid, c.typmod) for c in cols],
+            formats,
+            encoding=self.session.wire_encoding,
         )
 
 

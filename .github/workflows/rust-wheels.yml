@@ -36,11 +36,15 @@ on:
 
 # Keyed on the ref so each branch / PR is its own lane: a newer push to the same
 # ref cancels that ref's stale build, but distinct refs never cancel each other.
-# (Several sessions pushing the same ref — e.g. main — still collide; the project
-# convention is one feature branch per session, merged via PR.)
+#
+# Cancellation is disabled on `main` for the same reason as wheels.yml: every
+# merge lands on the same ref, so unconditional cancel-in-progress meant
+# consecutive merges cancelled each other's post-merge build and the default
+# branch rarely got a completed answer. Runs on `main` now queue; PR branches
+# keep newest-push-wins.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build:

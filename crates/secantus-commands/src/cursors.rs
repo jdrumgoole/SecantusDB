@@ -595,9 +595,17 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Ok(x) => x,
         Err(_) => return Ok(cursor_not_found(cursor_id)),
     };
+    // The registry already holds the batch as pre-encoded blobs; hand them to
+    // the server (`ctx.pending_batch`) to splice onto the wire without the
+    // decode→re-encode round-trip `docs_to_bson` would cost. The reply carries
+    // only the cursor envelope. (The tailable branch above keeps materialising
+    // because it computes a `postBatchResumeToken` from the decoded batch.)
+    ctx.pending_batch = Some(crate::PendingBatch {
+        batch_field: "nextBatch",
+        batch,
+    });
     Ok(doc! {
         "cursor": {
-            "nextBatch": docs_to_bson(batch)?,
             "id": Bson::Int64(if exhausted { 0 } else { cursor_id }),
             "ns": ns,
         },
@@ -860,12 +868,25 @@ mod tests {
         let mut c = ctx_with_cursors(reg);
         c.db_name = "t".into();
 
+        // Non-tailable getMore hands the batch to the server via
+        // `ctx.pending_batch` (pre-encoded blobs, spliced onto the wire) rather
+        // than an owned `nextBatch` array in the reply; the reply carries only
+        // the cursor envelope (`id` / `ns`).
         let reply = dispatch(
             &doc! {"getMore": id, "collection": "c", "batchSize": 2},
             &mut c,
         );
         let cur = reply.get_document("cursor").unwrap();
-        assert_eq!(cur.get_array("nextBatch").unwrap().len(), 2);
+        assert!(
+            !cur.contains_key("nextBatch"),
+            "batch goes to pending_batch"
+        );
+        let pending = c
+            .pending_batch
+            .as_ref()
+            .expect("getMore sets pending_batch");
+        assert_eq!(pending.batch_field, "nextBatch");
+        assert_eq!(pending.batch.len(), 2);
         assert_eq!(
             cur.get_i64("id").unwrap(),
             id,
@@ -878,7 +899,7 @@ mod tests {
             &mut c,
         );
         let cur = reply.get_document("cursor").unwrap();
-        assert_eq!(cur.get_array("nextBatch").unwrap().len(), 1);
+        assert_eq!(c.pending_batch.as_ref().unwrap().batch.len(), 1);
         assert_eq!(cur.get_i64("id").unwrap(), 0, "exhausted ⇒ id 0");
     }
 

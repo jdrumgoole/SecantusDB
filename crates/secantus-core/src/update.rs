@@ -7,9 +7,11 @@
 //! Handled: replacement-style updates, `$set`, `$setOnInsert`, `$unset`,
 //! `$inc`, `$mul`, `$push` (incl. the `$each` modifier form with `$position` /
 //! `$slice` / `$sort` — `1`/`-1` whole-element or `{field: dir}`, BSON-order),
-//! `$pop`, `$rename`, `$bit`, `$min`/`$max` (BSON cross-type order over the
-//! sortable subset via `order::cmp` — null / number / string / objectId / date /
-//! doc / array; a missing field is set, an explicit-null is compared as rank 2),
+//! `$pop`, `$rename`, `$bit`, `$min`/`$max` (full BSON cross-type order via
+//! `order::bson_lt` — the direct `_bson_lt` port, covering bool / Decimal128 /
+//! NaN / Binary / Timestamp / Regex / Min-MaxKey and the decoded exotic text
+//! types; a missing field is set, an explicit-null is compared as rank 2; only
+//! a DBPointer operand still defers),
 //! `$addToSet` (incl. `$each`), `$pull` (query semantics: element-value predicate /
 //! sub-document match / equality, via `query::matches`), `$pullAll` (literal
 //! equality via `expressions::py_eq`), plus `_id` immutability.
@@ -20,7 +22,6 @@
 //! order Python's `_bson_lt` handles), Decimal128 / non-numeric arithmetic, and
 //! every error condition (so Python raises the exact `UpdateError`).
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use bson::{doc, Bson, Document};
@@ -42,6 +43,44 @@ fn has_positional(path: &str) -> bool {
     path.split('.').any(is_positional_token)
 }
 
+/// Two dotted `$rename` paths are equal or one is an ancestor of the other
+/// (mongod: source and target must not be on the same path). Mirrors
+/// `update._rename_same_path`.
+fn rename_same_path(a: &str, b: &str) -> bool {
+    let ap: Vec<&str> = a.split('.').collect();
+    let bp: Vec<&str> = b.split('.').collect();
+    let n = ap.len().min(bp.len());
+    ap[..n] == bp[..n]
+}
+
+/// True if walking `path` against `doc` passes through an array element — mongod
+/// forbids a `$rename` source/destination from being an array element (this
+/// previously silently corrupted the array). Mirrors
+/// `update._rename_traverses_array`.
+fn rename_traverses_array(doc: &Document, path: &str) -> bool {
+    let mut parts = path.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(mut cur) = doc.get(first) else {
+        return false;
+    };
+    for part in parts {
+        match cur {
+            // Only a numeric index into an array is the forbidden "array
+            // element"; a positional token ($ / $[] / $[id]) is not (and is
+            // already deferred above via has_positional).
+            Bson::Array(_) => return !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()),
+            Bson::Document(d) => match d.get(part) {
+                Some(v) => cur = v,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
+}
+
 // --- positional / arrayFilters path expansion ---------------------------
 //
 // Mirrors `update._expand_path` / `_walk_positional` / `_index_array_filters` /
@@ -49,13 +88,103 @@ fn has_positional(path: &str) -> bool {
 // (`$`, `$[]`, `$[ident]`) is expanded against the current document into the
 // concrete index paths the operator then writes to.
 
-/// Map each arrayFilter identifier (`{"x.score": {...}}` → `x`) to its filter
-/// document. First entry wins per identifier, as in Python.
+/// An arrayFilter identifier: begins with a lowercase ASCII letter, then ASCII
+/// alphanumerics (mirrors Python's `^[a-z][a-zA-Z0-9]*$`).
+fn is_valid_af_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Every arrayFilter identifier referenced by a `$[<id>]` token in an update
+/// path (mirrors `_array_filter_referenced_identifiers`).
+fn referenced_af_identifiers(update: &Document) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for value in update.values() {
+        if let Bson::Document(payload) = value {
+            for path in payload.keys() {
+                let mut rest = path.as_str();
+                while let Some(start) = rest.find("$[") {
+                    let after = &rest[start + 2..];
+                    if let Some(end) = after.find(']') {
+                        out.insert(after[..end].to_string());
+                        rest = &after[end + 1..];
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The ordered, de-duplicated arrayFilter identifiers a filter references — the
+/// top-level field name (before the first `.`) of each non-`$` key, recursing
+/// through `$and`/`$or`/`$nor` sub-clauses. Mirrors `_extract_af_identifiers`
+/// (the `$expr`/no-identifier distinction only matters for Python's exact error
+/// code, so the bool isn't tracked here — an empty result defers regardless).
+fn extract_af_identifiers(f: &Document) -> Vec<String> {
+    fn walk(m: &Document, idents: &mut Vec<String>, seen: &mut std::collections::HashSet<String>) {
+        for (key, value) in m {
+            if key == "$and" || key == "$or" || key == "$nor" {
+                if let Bson::Array(subs) = value {
+                    for sub in subs {
+                        if let Bson::Document(d) = sub {
+                            walk(d, idents, seen);
+                        }
+                    }
+                }
+            } else if !key.starts_with('$') {
+                let ident = key.split('.').next().unwrap_or(key).to_string();
+                if seen.insert(ident.clone()) {
+                    idents.push(ident);
+                }
+            }
+        }
+    }
+    let mut idents = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    walk(f, &mut idents, &mut seen);
+    idents
+}
+
+/// Whether the arrayFilters are valid per mongod (mirrors
+/// `_validate_array_filters`): each references exactly one identifier (empty /
+/// `$expr` / two-or-more all defer), well-formed (bad name defers), unique (dup
+/// defers), and used by a `$[id]` path (unused defers). Invalid → the whole
+/// update defers so Python raises the exact code. The identifier may nest inside
+/// `$and`/`$or`/`$nor`, matching mongod.
+fn array_filters_valid(filters: &[Document], update: &Document) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut identifiers: Vec<String> = Vec::new();
+    for f in filters {
+        let found = extract_af_identifiers(f);
+        if found.len() != 1 {
+            return false; // 0 (empty/$expr) or >=2 distinct -> Python raises (9/224)
+        }
+        let ident = &found[0];
+        if !is_valid_af_ident(ident) {
+            return false; // bad identifier -> Python raises code 2
+        }
+        if !seen.insert(ident.clone()) {
+            return false; // duplicate identifier -> Python raises code 9
+        }
+        identifiers.push(ident.clone());
+    }
+    let referenced = referenced_af_identifiers(update);
+    identifiers.iter().all(|id| referenced.contains(id))
+}
+
+/// Map each arrayFilter identifier to its filter document (the identifier may
+/// nest inside `$and`/`$or`/`$nor`). First entry wins per identifier, as in Python.
 fn index_array_filters(filters: &[Document]) -> HashMap<String, &Document> {
     let mut out: HashMap<String, &Document> = HashMap::new();
     for f in filters {
-        for key in f.keys() {
-            let name = key.split('.').next().unwrap_or(key).to_string();
+        for name in extract_af_identifiers(f) {
             out.entry(name).or_insert(f);
         }
     }
@@ -203,6 +332,15 @@ use crate::paths::unset_path;
 
 /// `current <op> operand` with Python's numeric semantics. `mul=false` adds.
 fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
+    // A bool `$inc`/`$mul` argument is NOT a number for mongod (it errors with
+    // "Cannot increment/multiply with non-numeric argument", code 14) — but
+    // `as_int_like` treats bool as 0/1, which would silently compute. Defer so
+    // the operand is rejected instead. (The Python server raises code 14; the
+    // Rust server surfaces a generic BadValue — the standing update error-code
+    // gap. String / null operands already fall through to Fallback below.)
+    if matches!(operand, Bson::Boolean(_)) {
+        return Err(Fallback);
+    }
     // Decimal128 has no Python arithmetic support (raises) -> defer.
     if matches!(current, Bson::Decimal128(_)) || matches!(operand, Bson::Decimal128(_)) {
         return Err(Fallback);
@@ -274,6 +412,11 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
     match m.get("$position") {
         None => arr.extend(each.iter().cloned()),
         Some(p) => {
+            // A bool $position is a parse error in mongod (code 2), not index 1
+            // — `as_int_like` would coerce it, so guard first.
+            if matches!(p, Bson::Boolean(_)) {
+                return Err(Fallback);
+            }
             let n = as_int_like(p).ok_or(Fallback)?;
             let idx = if n >= 0 {
                 (n as usize).min(arr.len())
@@ -290,6 +433,10 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
         push_sort(arr, spec)?;
     }
     if let Some(s) = m.get("$slice") {
+        // A bool $slice is a parse error in mongod (code 2), not "keep 1".
+        if matches!(s, Bson::Boolean(_)) {
+            return Err(Fallback);
+        }
         let n = as_int_like(s).ok_or(Fallback)?;
         if n == 0 {
             arr.clear();
@@ -320,9 +467,22 @@ fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
             other => other.clone(),
         }
     }
+    // A valid sort direction is exactly 1 or -1, as an int or a whole double
+    // (mongod accepts `1.0`); a bool, a fractional double, or any other value
+    // defers so Python raises code 2. (`as_int_like` treats bool as 0/1, which
+    // would wrongly sort a `{field: true}` direction — so use this stricter form.)
+    fn dir_pm1(b: &Bson) -> Option<i128> {
+        let v = match b {
+            Bson::Int32(n) => *n as i128,
+            Bson::Int64(n) => *n as i128,
+            Bson::Double(d) if d.fract() == 0.0 => *d as i128,
+            _ => return None,
+        };
+        (v == 1 || v == -1).then_some(v)
+    }
     match spec {
-        Bson::Int32(_) | Bson::Int64(_) => {
-            let dir = as_int_like(spec).ok_or(Fallback)?;
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+            let dir = dir_pm1(spec).ok_or(Fallback)?;
             if !arr.iter().all(crate::order::is_sortable) {
                 return Err(Fallback);
             }
@@ -335,7 +495,7 @@ fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
         Bson::Document(spec_doc) => {
             let fields: Vec<(&String, i128)> = spec_doc
                 .iter()
-                .map(|(f, d)| as_int_like(d).map(|di| (f, di)).ok_or(Fallback))
+                .map(|(f, d)| dir_pm1(d).map(|di| (f, di)).ok_or(Fallback))
                 .collect::<R<Vec<_>>>()?;
             for (field, _) in &fields {
                 if !arr
@@ -451,6 +611,14 @@ fn apply_op(
                             continue;
                         }
                         let mut a = a.clone();
+                        // A bool direction is "not a number" and any value other
+                        // than ±1 is "$pop expects 1 or -1" — both mongod errors
+                        // (code 9). `as_int_like` would coerce `true` to 1, and
+                        // the old `_ => continue` silently no-op'd a bad value;
+                        // defer so the Python oracle raises the exact error.
+                        if matches!(dir, Bson::Boolean(_)) {
+                            return Err(Fallback);
+                        }
                         match as_int_like(dir) {
                             Some(1) => {
                                 a.pop();
@@ -458,7 +626,7 @@ fn apply_op(
                             Some(-1) => {
                                 a.remove(0);
                             }
-                            _ => continue, // other direction -> no change
+                            _ => return Err(Fallback),
                         }
                         set_path(result, &cpath, Bson::Array(a))?;
                     }
@@ -478,6 +646,18 @@ fn apply_op(
                 }
                 if old == "_id" || new == "_id" {
                     return Err(Fallback); // immutable _id -> Python raises
+                }
+                // mongod validation (Python raises 56 / 2; the Rust server renders
+                // BadValue). These previously silently corrupted the array or
+                // created a bad field.
+                if old.is_empty() || new.is_empty() {
+                    return Err(Fallback); // empty path -> Python raises 56
+                }
+                if old == new || rename_same_path(old, new) {
+                    return Err(Fallback); // differ / same path -> Python raises 2
+                }
+                if rename_traverses_array(result, old) || rename_traverses_array(result, new) {
+                    return Err(Fallback); // array element -> Python raises 2
                 }
                 if has_path(result, old) {
                     let value = get_path(result, old).unwrap().clone();
@@ -536,25 +716,25 @@ fn apply_op(
             for (path, value) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
                     // A *missing* field is set unconditionally; a present field
-                    // (incl. an explicit null, rank 2) is compared by MongoDB's BSON
-                    // cross-type order. `order::cmp` covers the sortable subset
-                    // (null / number / string / objectId / date / doc / array); a
-                    // bool / Decimal128 / NaN / exotic operand isn't in it, so defer
-                    // to Python (whose `_bson_lt` handles the full order).
+                    // (incl. an explicit null, rank 2) is compared by MongoDB's
+                    // BSON cross-type order via `order::bson_lt` — the direct
+                    // `_bson_lt` port, which (unlike the `$sort` comparator)
+                    // needs no transitivity and so covers bool / Decimal128 /
+                    // NaN / Binary / Timestamp / Regex / Min-MaxKey and the
+                    // decoded exotic text types. Only a DBPointer (Python's
+                    // type-name tiebreak) still defers.
                     let should_set = match get_path(result, &cpath) {
                         None => true,
                         Some(current) => {
-                            if !crate::order::is_sortable(current)
-                                || !crate::order::is_sortable(value)
-                            {
-                                return Err(Fallback);
-                            }
-                            let ord = if want_less {
-                                crate::order::cmp(value, current) // value < current
+                            let lt = if want_less {
+                                crate::order::bson_lt(value, current) // value < current
                             } else {
-                                crate::order::cmp(current, value) // current < value
+                                crate::order::bson_lt(current, value) // current < value
                             };
-                            ord == Ordering::Less
+                            match lt {
+                                Some(l) => l,
+                                None => return Err(Fallback),
+                            }
                         }
                     };
                     if should_set {
@@ -599,16 +779,21 @@ fn apply_op(
             for (path, criterion) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
                     // Remove elements matching the criterion under query semantics
-                    // (element-value predicate / sub-document match / equality); a
-                    // non-array field is a no-op.
-                    if let Some(Bson::Array(a)) = get_path(result, &cpath).cloned() {
-                        let mut kept = Vec::with_capacity(a.len());
-                        for e in a {
-                            if !pull_matches(&e, criterion)? {
-                                kept.push(e);
+                    // (element-value predicate / sub-document match / equality). A
+                    // missing field is a no-op; a present but non-array target
+                    // defers so Python raises code 2.
+                    match get_path(result, &cpath).cloned() {
+                        Some(Bson::Array(a)) => {
+                            let mut kept = Vec::with_capacity(a.len());
+                            for e in a {
+                                if !pull_matches(&e, criterion)? {
+                                    kept.push(e);
+                                }
                             }
+                            set_path(result, &cpath, Bson::Array(kept))?;
                         }
-                        set_path(result, &cpath, Bson::Array(kept))?;
+                        Some(_) => return Err(Fallback),
+                        None => {}
                     }
                 }
             }
@@ -620,22 +805,27 @@ fn apply_op(
                 };
                 for cpath in expand_path(result, path, filters, pos)? {
                     // Remove every element equal to any listed value (literal
-                    // equality, not predicates); non-array field is a no-op.
-                    if let Some(Bson::Array(a)) = get_path(result, &cpath).cloned() {
-                        let mut kept = Vec::with_capacity(a.len());
-                        for e in a {
-                            let mut drop = false;
-                            for v in vals {
-                                if expressions::py_eq(&e, v).map_err(|_| Fallback)? {
-                                    drop = true;
-                                    break;
+                    // equality, not predicates). Missing field: no-op; present
+                    // non-array target defers so Python raises code 2.
+                    match get_path(result, &cpath).cloned() {
+                        Some(Bson::Array(a)) => {
+                            let mut kept = Vec::with_capacity(a.len());
+                            for e in a {
+                                let mut drop = false;
+                                for v in vals {
+                                    if expressions::py_eq(&e, v).map_err(|_| Fallback)? {
+                                        drop = true;
+                                        break;
+                                    }
+                                }
+                                if !drop {
+                                    kept.push(e);
                                 }
                             }
-                            if !drop {
-                                kept.push(e);
-                            }
+                            set_path(result, &cpath, Bson::Array(kept))?;
                         }
-                        set_path(result, &cpath, Bson::Array(kept))?;
+                        Some(_) => return Err(Fallback),
+                        None => {}
                     }
                 }
             }
@@ -666,6 +856,9 @@ pub fn apply_update_with(
 ) -> R<Document> {
     if update.is_empty() {
         return Ok(doc.clone());
+    }
+    if !array_filters_valid(array_filters, update) {
+        return Err(Fallback); // invalid arrayFilters -> Python raises the exact code
     }
     let has_op = update.keys().any(|k| k.starts_with('$'));
     if has_op {
@@ -793,8 +986,23 @@ mod tests {
             apply_update(&doc! {"a": 1}, &doc! {"$min": {"a": "x"}}, false).unwrap(),
             doc! {"a": 1}
         );
-        // A non-sortable operand (bool) still defers so Python's _bson_lt handles it.
-        assert!(apply_update(&doc! {"a": 5}, &doc! {"$max": {"a": true}}, false).is_err());
+        // A bool operand now computes via `order::bson_lt` (bool ranks above
+        // numbers in BSON order, so $max sets it), matching Python's _bson_lt.
+        assert_eq!(
+            apply_update(&doc! {"a": 5}, &doc! {"$max": {"a": true}}, false).unwrap(),
+            doc! {"a": true}
+        );
+        // Decimal128 joins the unified numeric compare: 2.5 < 3 -> $min sets it.
+        let d: bson::Decimal128 = "2.5".parse().unwrap();
+        assert_eq!(
+            apply_update(&doc! {"a": 3}, &doc! {"$min": {"a": d}}, false).unwrap(),
+            doc! {"a": d}
+        );
+        // NaN is unordered: Python's `5 < nan` is False, so $max keeps 5.
+        assert_eq!(
+            apply_update(&doc! {"a": 5}, &doc! {"$max": {"a": f64::NAN}}, false).unwrap(),
+            doc! {"a": 5}
+        );
         // Bare `apply_update` (no positional_matches) can't resolve `$` -> defer.
         assert!(apply_update(&doc! {"a": [1]}, &doc! {"$set": {"a.$": 9}}, false).is_err());
         // $inc / $mul on an explicit-null field -> defer so Python raises the

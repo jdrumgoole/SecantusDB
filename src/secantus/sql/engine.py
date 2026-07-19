@@ -9,10 +9,12 @@ and ``SHOW`` / ``SET`` resolve against real state.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import datetime as _dt
 import re
-from dataclasses import dataclass
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import sqlglot
@@ -32,7 +34,7 @@ from secantus.sql import (
 )
 from secantus.sql import explain as explain_mod
 from secantus.sql import session as sql_session
-from secantus.sql.catalog import Catalog, Column, TableDef
+from secantus.sql.catalog import ALL_CATALOG_COLLECTIONS, Catalog, Column, TableDef
 from secantus.sql.result import ColumnDesc, SQLResult
 from secantus.sql.session import (
     REPORTABLE_GUCS,
@@ -59,16 +61,40 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
     if pubsub is not None:
         return [pubsub]
     catalog = Catalog(storage)
-    # Two-phase commit (#139) is handled before sqlglot: it cannot parse
-    # ``COMMIT PREPARED`` / ``ROLLBACK PREPARED`` at all, and ``PREPARE
-    # TRANSACTION`` collides with the SQL-level ``PREPARE name AS`` (#121).
-    two_phase = _maybe_two_phase(sql, storage, db, catalog, session)
-    if two_phase is not None:
-        return [two_phase]
-    results: list[SQLResult] = []
-    for stmt in planner.parse(sql):
-        results.append(_normalize_result(_dispatch(stmt, storage, db, catalog, session)))
-    return results
+    with _storage_conflicts_as_sqlstate():
+        # Two-phase commit (#139) is handled before sqlglot: it cannot parse
+        # ``COMMIT PREPARED`` / ``ROLLBACK PREPARED`` at all, and ``PREPARE
+        # TRANSACTION`` collides with the SQL-level ``PREPARE name AS`` (#121).
+        two_phase = _maybe_two_phase(sql, storage, db, catalog, session)
+        if two_phase is not None:
+            return [two_phase]
+        results: list[SQLResult] = []
+        for stmt in planner.parse(sql):
+            results.append(_normalize_result(_dispatch(stmt, storage, db, catalog, session)))
+        return results
+
+
+@contextlib.contextmanager
+def _storage_conflicts_as_sqlstate() -> Iterator[None]:
+    """Map a storage-level write-write conflict to SQLSTATE 40001.
+
+    WiredTiger is first-updater-wins: a statement (or COMMIT) that loses a race
+    with a concurrent writer raises ``WriteConflictError`` / ``WT_ROLLBACK``.
+    Without this mapping the loser escaped as an unhandled exception and the
+    wire layer sent the generic ``XX000 internal error`` — a real Postgres
+    reports ``40001 serialization_failure``, the retriable signal drivers and
+    ORMs key their retry loops on. Imported lazily so the engine keeps no
+    module-level dependency on the storage implementation."""
+    try:
+        yield
+    except errors.SQLError:
+        raise
+    except Exception as exc:
+        from secantus.storage import WriteConflictError, _is_wt_rollback
+
+        if isinstance(exc, WriteConflictError) or _is_wt_rollback(exc):
+            raise errors.serialization_failure() from exc
+        raise
 
 
 def _normalize_result(result: SQLResult) -> SQLResult:
@@ -275,7 +301,7 @@ def _dispatch(
     ends (Postgres' aborted-transaction semantics).
     """
     if isinstance(stmt, exp.Transaction):
-        return _begin_txn(storage, session)
+        return _begin_txn(storage, session, stmt.args.get("modes") or [])
     if isinstance(stmt, exp.Commit):
         return _commit_txn(storage, db, catalog, session)
     if isinstance(stmt, exp.Rollback):
@@ -314,14 +340,47 @@ def _dispatch(
     return _run_statement(stmt, storage, db, catalog, session)
 
 
-def _begin_txn(storage: Any, session: Session) -> SQLResult:
+def _begin_txn(storage: Any, session: Session, modes: list | None = None) -> SQLResult:
     # A nested BEGIN is a no-op in Postgres (it warns and stays in the block).
     if session.txn_handle is None:
         session.txn_handle = storage.begin_user_transaction()
         session.txn_failed = False
         session.savepoints = []
         session.reset_deferred()
+        # ``BEGIN ISOLATION LEVEL x / READ ONLY / DEFERRABLE`` — apply the
+        # characteristics for this transaction only (the SET LOCAL mechanism
+        # reverts them at COMMIT/ROLLBACK). Single-node: the isolation level is
+        # tracked and reported but every transaction runs on WiredTiger's
+        # snapshot isolation regardless.
+        for name, value in _parse_txn_characteristics(
+            " ".join(str(m) for m in (modes or []))
+        ).items():
+            session.set_local(name, value)
     return SQLResult(command_tag="BEGIN")
+
+
+_TXN_ISOLATION_RE = re.compile(
+    r"isolation\s+level\s+(read\s+uncommitted|read\s+committed|repeatable\s+read|serializable)",
+    re.IGNORECASE,
+)
+
+
+def _parse_txn_characteristics(tail: str) -> dict[str, str]:
+    """Map a transaction-characteristics tail (from BEGIN / START TRANSACTION /
+    SET TRANSACTION) to the ``transaction_*`` GUC values it sets."""
+    out: dict[str, str] = {}
+    m = _TXN_ISOLATION_RE.search(tail)
+    if m is not None:
+        out["transaction_isolation"] = re.sub(r"\s+", " ", m.group(1).lower())
+    if re.search(r"\bread\s+only\b", tail, re.IGNORECASE):
+        out["transaction_read_only"] = "on"
+    elif re.search(r"\bread\s+write\b", tail, re.IGNORECASE):
+        out["transaction_read_only"] = "off"
+    if re.search(r"\bnot\s+deferrable\b", tail, re.IGNORECASE):
+        out["transaction_deferrable"] = "off"
+    elif re.search(r"\bdeferrable\b", tail, re.IGNORECASE):
+        out["transaction_deferrable"] = "on"
+    return out
 
 
 def _commit_txn(storage: Any, db: str, catalog: Catalog, session: Session) -> SQLResult:
@@ -456,16 +515,36 @@ def _capture_savepoint_snapshots(
     collection to its establishment state (nothing wrote to it in between)."""
     if not session.savepoints:
         return
-    coll = _write_target_collection(stmt, catalog, db, storage)
-    if coll is None:
-        return
-    snap: list | None = None
-    for fr in session.savepoints:
-        if coll in fr.snapshots:
-            continue
-        if snap is None:
-            snap = [copy.deepcopy(d) for d in storage.find_matching(db, coll, {})]
-        fr.snapshots[coll] = snap
+    # A DDL statement snapshots every catalog collection (they're tiny) so the
+    # schema change is reverted by ROLLBACK TO SAVEPOINT; a DML statement
+    # snapshots only its target collection.
+    if _is_ddl(stmt):
+        colls: tuple[str, ...] = ALL_CATALOG_COLLECTIONS
+    else:
+        target = _write_target_collection(stmt, catalog, db, storage)
+        if target is None:
+            return
+        colls = (target,)
+    for coll in colls:
+        snap: list | None = None
+        for fr in session.savepoints:
+            if coll in fr.snapshots:
+                continue
+            if snap is None:
+                snap = [copy.deepcopy(d) for d in storage.find_matching(db, coll, {})]
+            fr.snapshots[coll] = snap
+
+
+def _is_ddl(stmt: exp.Expression) -> bool:
+    """Whether ``stmt`` changes catalog state (CREATE / DROP / ALTER / COMMENT /
+    a CREATE TYPE-style Command) — those need their catalog collections
+    snapshotted for savepoint rollback."""
+    if isinstance(stmt, (exp.Create, exp.Drop, exp.Alter, exp.Comment)):
+        return True
+    if isinstance(stmt, exp.Command):
+        verb = str(stmt.this).upper()
+        return verb in ("CREATE", "DROP", "ALTER", "COMMENT")
+    return False
 
 
 def _write_target_collection(
@@ -535,9 +614,22 @@ def _declare_cursor(
             f"too many open cursors (limit {MAX_CURSORS_PER_SESSION}); CLOSE some first"
         )
     hold = re.search(r"\bWITH\s+HOLD\b", opts, re.IGNORECASE) is not None
+    if re.search(r"\bNO\s+SCROLL\b", opts, re.IGNORECASE):
+        scrollable: bool | None = False
+    elif re.search(r"\bSCROLL\b", opts, re.IGNORECASE):
+        scrollable = True
+    else:
+        scrollable = None
     stmts = planner.parse(m.group("query"))
     if len(stmts) != 1:
         raise errors.syntax_error("DECLARE CURSOR expects a single query")
+    if not isinstance(stmts[0], (exp.Select, exp.SetOperation, exp.Values)) and not (
+        isinstance(stmts[0], exp.Command) and str(stmts[0].this).upper() in ("WITH", "SELECT")
+    ):
+        # A DECLARE body must be a row-returning query — a bare identifier
+        # (``wat``) or a DDL/DML statement is a syntax error (42601 →
+        # ProgrammingError), not 0A000.
+        raise errors.syntax_error("DECLARE CURSOR must specify a SELECT query")
     result = _run_query(stmts[0], storage, db, catalog, session)
     rows = list(result.rows)
     # Cap the materialized row set a single cursor retains (SecantusDB cursors
@@ -553,6 +645,7 @@ def _declare_cursor(
         rows=rows,
         pos=-1,
         hold=hold,
+        scrollable=scrollable,
         statement=f"DECLARE {tail}",
         created=_dt.datetime.now(_dt.timezone.utc),
     )
@@ -591,7 +684,12 @@ def _parse_fetch(tail: str) -> tuple[str, int | None, str]:
         return "forward", 1, name  # bare FETCH cursor → next row
     head = spec[0]
     if head not in _FETCH_DIRECTIONS:
-        return "forward", as_count(spec), name  # FETCH n / FETCH ALL
+        # ``FETCH n`` / ``FETCH ALL`` — a NEGATIVE bare count scans backward
+        # ``abs(n)`` rows in the default direction (Postgres semantics).
+        cnt = as_count(spec)
+        if cnt is not None and cnt < 0:
+            return "backward", -cnt, name
+        return "forward", cnt, name
     rest = spec[1:]
     if head == "NEXT":
         return "forward", 1, name
@@ -601,14 +699,20 @@ def _parse_fetch(tail: str) -> tuple[str, int | None, str]:
         return "absolute", 1, name
     if head == "LAST":
         return "absolute", -1, name
-    if head == "FORWARD":
-        return "forward", as_count(rest), name
-    if head == "BACKWARD":
-        return "backward", as_count(rest), name
-    # ABSOLUTE / RELATIVE require a count.
+    if head in ("FORWARD", "BACKWARD"):
+        cnt = as_count(rest)
+        base = "forward" if head == "FORWARD" else "backward"
+        if cnt is not None and cnt < 0:  # a signed count flips the direction
+            return ("backward" if base == "forward" else "forward"), -cnt, name
+        return base, cnt, name
+    # ABSOLUTE / RELATIVE require a count. FORWARD/BACKWARD with a negative
+    # count reverse direction (``FORWARD -1`` == ``BACKWARD 1``).
     if not rest:
         raise errors.syntax_error(f"{head} requires a count")
-    return head.lower(), int(rest[0]), name
+    cnt = int(rest[0])
+    if head in ("FORWARD", "BACKWARD") and cnt < 0:
+        return ("backward" if head == "FORWARD" else "forward"), -cnt, name
+    return head.lower(), cnt, name
 
 
 def _cursor_slice(cur: Any, kind: str, count: int | None) -> list:
@@ -627,6 +731,10 @@ def _cursor_slice(cur: Any, kind: str, count: int | None) -> list:
         cur.pos = idxs[-1] if idxs else -1
         return [cur.rows[i] for i in idxs]
     if kind == "absolute":
+        if count == 0:
+            # ``MOVE ABSOLUTE 0`` positions BEFORE the first row (not at end).
+            cur.pos = -1
+            return []
         target = count - 1 if count > 0 else n + count  # 1-based; negatives from end
         if 0 <= target < n:
             cur.pos = target
@@ -642,6 +750,22 @@ def _cursor_slice(cur: Any, kind: str, count: int | None) -> list:
     return []
 
 
+def _moves_backward(cur: Any, kind: str, count: int | None) -> bool:
+    """Whether a ``(kind, count)`` movement scans backward from ``cur.pos`` —
+    the check a NO SCROLL cursor rejects."""
+    if kind == "backward":
+        return count is None or count > 0
+    if kind == "absolute":
+        n = len(cur.rows)
+        if count is None:
+            return False
+        target = -1 if count == 0 else (count - 1 if count > 0 else n + count)
+        return target < cur.pos
+    if kind == "relative":
+        return (count or 0) < 0
+    return False
+
+
 def _fetch_cursor(stmt: exp.Command, session: Session, *, move: bool = False) -> SQLResult:
     """``FETCH`` returns the moved-over rows; ``MOVE`` performs the same
     positioning but returns only the count (no result set)."""
@@ -649,6 +773,9 @@ def _fetch_cursor(stmt: exp.Command, session: Session, *, move: bool = False) ->
     cur = session.cursors.get(name)
     if cur is None:
         raise errors.SQLError("34000", f'cursor "{name}" does not exist')
+    # A NO SCROLL cursor rejects any movement that would scan backward.
+    if cur.scrollable is False and _moves_backward(cur, kind, count):
+        raise errors.SQLError("55000", f'cursor "{name}" can only scan forward', position=None)
     rows = _cursor_slice(cur, kind, count)
     verb = "MOVE" if move else "FETCH"
     if move:
@@ -1118,7 +1245,8 @@ def run_statement(
     """
     if catalog is None:
         catalog = Catalog(storage)
-    return _normalize_result(_dispatch(stmt, storage, db, catalog, session))
+    with _storage_conflicts_as_sqlstate():
+        return _normalize_result(_dispatch(stmt, storage, db, catalog, session))
 
 
 def describe_statement(
@@ -1140,6 +1268,18 @@ def describe_statement(
 def _describe_statement(
     storage: Any, db: str, stmt: exp.Expression, session: Session, catalog: Catalog
 ) -> list[ColumnDesc] | None:
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "FETCH":
+        # A binary server cursor's ``FETCH … FROM <name>`` rides the extended
+        # protocol; Describe must report the cursor's columns (else Execute
+        # sends DataRows without a prior RowDescription — a protocol violation).
+        try:
+            _kind, _count, cname = _parse_fetch(_command_tail(stmt))
+        except errors.SQLError:
+            return None
+        cur = session.cursors.get(cname)
+        return list(cur.columns) if cur is not None else None
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "MOVE":
+        return None  # MOVE returns no rows
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "SHOW":
         oid = typemap.PG_OID["text"]
         if _show_name(stmt).upper() == "ALL":
@@ -1210,9 +1350,10 @@ def _describe_statement(
     if table_node is None:
         plan = planner.plan_constant_select(stmt, session, storage, catalog, db)
         oids = plan.pg_oids or [None] * len(plan.columns)
+        typmods = plan.typmods or [-1] * len(plan.columns)
         return [
-            ColumnDesc(n, t, oid if oid is not None else typemap.PG_OID.get(t, 25))
-            for (n, t, _), oid in zip(plan.columns, oids, strict=True)
+            ColumnDesc(n, t, oid if oid is not None else typemap.PG_OID.get(t, 25), typmod)
+            for (n, t, _), oid, typmod in zip(plan.columns, oids, typmods, strict=True)
         ]
     if planner.select_needs_pipeline(stmt):
         pplan = planner.plan_pipeline_select(stmt, db, catalog, storage)
@@ -1263,13 +1404,19 @@ class CopyPlan:
     table: Any
     columns: list[str]  # target column SQL names (or query output names)
     to_stdout: bool  # True = COPY TO STDOUT, False = COPY FROM STDIN
-    fmt: str  # "text" | "csv"
+    fmt: str  # "text" | "csv" | "binary"
     delimiter: str
     null: str
     header: bool
     # For ``COPY (SELECT …) TO STDOUT``: the pre-rendered copy-stream cells of the
     # query result (query-form COPY is dump-only; ``table`` is None).
     query_rows: list[list] | None = None
+    # Per-column type tags + oids (parallel to ``columns``) — the binary format
+    # encodes/decodes each field by its type instead of rendering text.
+    col_tags: list[str] = field(default_factory=list)
+    col_oids: list[int] = field(default_factory=list)
+    # Raw (unrendered) query-form values, kept for binary COPY OUT.
+    query_raw_rows: list | None = None
 
 
 def copy_plan(
@@ -1294,8 +1441,22 @@ def copy_plan(
         if not to_stdout:
             raise errors.syntax_error("COPY (query) must be COPY … TO, not FROM")
         select = this.this if isinstance(this, exp.Subquery) else this
-        columns, query_rows = _copy_query_rows(select, storage, db, catalog, session)
-        return CopyPlan(None, columns, True, fmt, delimiter, null, header, query_rows=query_rows)
+        columns, query_rows, raw_rows, tags, oids = _copy_query_rows(
+            select, storage, db, catalog, session, render_text=(fmt != "binary")
+        )
+        return CopyPlan(
+            None,
+            columns,
+            True,
+            fmt,
+            delimiter,
+            null,
+            header,
+            query_rows=query_rows,
+            query_raw_rows=raw_rows,
+            col_tags=tags,
+            col_oids=oids,
+        )
 
     if isinstance(this, exp.Schema):
         tname = this.this.name
@@ -1311,17 +1472,48 @@ def copy_plan(
         if not to_stdout:  # a generated column can't be copied in
             cols = [c for c in cols if c.generated is None and c.identity != "always"]
         columns = [c.name for c in cols]
-    return CopyPlan(table, columns, to_stdout, fmt, delimiter, null, header)
+    col_tags = []
+    col_oids = []
+    for name in columns:
+        col = table.column(name)
+        tag = col.type_tag if col is not None else "any"
+        col_tags.append(tag)
+        if col is not None and getattr(col, "json_plain", False):
+            col_oids.append(114)  # plain json: binary form has no version byte
+        else:
+            col_oids.append(typemap.PG_OID.get(tag, 25))
+    return CopyPlan(
+        table,
+        columns,
+        to_stdout,
+        fmt,
+        delimiter,
+        null,
+        header,
+        col_tags=col_tags,
+        col_oids=col_oids,
+    )
 
 
 def _copy_query_rows(
-    select: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session | None
-) -> tuple[list[str], list[list]]:
-    """Run a ``COPY (SELECT …) TO`` query and render its result as copy-stream
-    cells (string / None), returning ``(column_names, rows)``."""
+    select: exp.Expression,
+    storage: Any,
+    db: str,
+    catalog: Catalog,
+    session: Session | None,
+    *,
+    render_text: bool = True,
+) -> tuple[list[str], list[list] | None, list | None, list[str], list[int]]:
+    """Run a ``COPY (SELECT …) TO`` query, returning ``(column_names,
+    text_cells_or_None, raw_rows_or_None, type_tags, pg_oids)``. Text/CSV COPY
+    renders each cell to its text form up front; binary COPY keeps the raw
+    values so the per-type binary encoders see native values."""
     result = _run_query(select, storage, db, catalog, session or Session(database=db))
     columns = [c.name for c in result.columns]
     tags = [c.type_tag for c in result.columns]
+    oids = [c.pg_oid for c in result.columns]
+    if not render_text:
+        return columns, None, list(result.rows), tags, oids
     rows: list[list] = []
     for row in result.rows:
         cells: list = []
@@ -1332,7 +1524,7 @@ def _copy_query_rows(
                 rendered = typemap.to_pg_text(value, tag)
                 cells.append(rendered.decode() if rendered is not None else None)
         rows.append(cells)
-    return columns, rows
+    return columns, rows, None, tags, oids
 
 
 def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool]:
@@ -1383,7 +1575,9 @@ def copy_insert(
                 converted.append(None)
                 continue
             col = plan.table.column(name)
-            if col is not None and col.type_tag == "bool":
+            # Binary COPY decodes cells to typed Python values already; the
+            # text coercion only applies to string cells from text/CSV.
+            if col is not None and col.type_tag == "bool" and isinstance(cell, str):
                 converted.append(_parse_bool_text(cell))
             else:
                 converted.append(cell)
@@ -1416,6 +1610,24 @@ def copy_extract(
             else:
                 rendered = typemap.to_pg_text(value, tag)
                 cells.append(rendered.decode() if rendered is not None else None)
+        out.append(cells)
+    return out
+
+
+def copy_extract_raw(storage: Any, db: str, plan: CopyPlan) -> list[list]:
+    """Read the COPY TO source as raw (unrendered) values for binary COPY —
+    the per-type binary encoders need native values, not text cells."""
+    from secantus.paths import get_path
+
+    if plan.query_raw_rows is not None:  # COPY (SELECT …) TO
+        return [list(row) for row in plan.query_raw_rows]
+    out: list[list] = []
+    for doc in storage.find_matching(db, plan.table.collection, {}):
+        cells: list = []
+        for name in plan.columns:
+            col = plan.table.column(name)
+            field = col.field if col is not None else name
+            cells.append(get_path(doc, field))
         out.append(cells)
     return out
 
@@ -1597,7 +1809,7 @@ def _run_statement(
             # via pg_auth_members (#138); other privilege grants that fell back to a
             # Command (e.g. ``GRANT USAGE ON SCHEMA``) aren't enforced — accept no-op.
             return _run_role_membership(verb, stmt, db, catalog, session)
-        return _run_command(stmt, session)
+        return _run_command(stmt, session, storage, db, catalog)
 
     if isinstance(stmt, exp.Grant):
         return _run_grant(stmt, storage, db, catalog, revoke=False)
@@ -1626,6 +1838,14 @@ def _run_statement(
         # not a statement — Postgres raises a syntax error, and clients map
         # 42601 to ProgrammingError (0A000 maps to NotSupportedError).
         raise errors.SQLError("42601", f'syntax error at or near "{stmt.sql()[:40]}"')
+    if isinstance(stmt, exp.Copy):
+        # COPY reaching the generic dispatcher means it wasn't the sole
+        # statement of a wire-level copy() (a multi-statement string) or came
+        # through the embedded API — real PG rejects it as a ProgrammingError-
+        # class condition, not a NotSupported one.
+        raise errors.SQLError(
+            "42601", "COPY ... TO/FROM STDIN/STDOUT must be a standalone statement"
+        )
     raise errors.feature_not_supported(f"unsupported statement: {type(stmt).__name__}")
 
 
@@ -1760,10 +1980,19 @@ def _deallocate_statement(target: str, session: Session) -> SQLResult:
     """``DEALLOCATE name`` forgets one prepared statement; ``DEALLOCATE ALL`` clears
     them all. Unlike Postgres, deallocating an unknown name is a silent no-op here
     (libpq/psycopg fire speculative DEALLOCATEs during connection cleanup)."""
+    wire = getattr(session, "wire_prepared", None)
     if target.upper() == "ALL":
         session.prepared.clear()
+        if wire is not None:
+            # The extended protocol's server-side prepared statements clear
+            # too — psycopg sends DEALLOCATE ALL after DDL to invalidate its
+            # cache, and pg_prepared_statements must reflect it.
+            wire.clear()
     else:
-        session.prepared.pop(_unquote_ident(target), None)
+        name = _unquote_ident(target)
+        session.prepared.pop(name, None)
+        if wire is not None:
+            wire.pop(name, None)
     return SQLResult(command_tag="DEALLOCATE")
 
 
@@ -3918,12 +4147,16 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
     reported: list[tuple[str, str]] = []
     for item in stmt.expressions:
         # SET TRANSACTION [ISOLATION LEVEL ...|READ ONLY|READ WRITE|DEFERRABLE]:
-        # accepted as a no-op — SecantusDB is single-node, so isolation/read-only
-        # characteristics don't change behaviour.
+        # applies the characteristics to the current transaction (reported via
+        # the transaction_* GUCs; single-node, so behaviour doesn't change).
         if (
             isinstance(item, exp.SetItem)
             and str(item.args.get("kind") or "").upper() == "TRANSACTION"
         ):
+            if session.txn_handle is not None:
+                chars = _parse_txn_characteristics(item.this.sql() if item.this else item.sql())
+                for cname, cvalue in chars.items():
+                    session.set_local(cname, cvalue)
             continue
         inner = item.this if isinstance(item, exp.SetItem) else item
         if not isinstance(inner, exp.EQ):
@@ -4049,8 +4282,119 @@ _SET_MULTI_RE = re.compile(
 )
 
 
-def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
+# ``RAISE level 'fmt'[, arg…] [USING option = 'value', …];`` inside a DO body.
+_RAISE_RE = re.compile(
+    r"(?is)\braise\s+(?P<level>debug|log|info|notice|warning|exception)\s+"
+    r"'(?P<fmt>(?:[^']|'')*)'\s*(?P<args>(?:,[^;]*?)?)\s*"
+    r"(?:using\s+(?P<using>[^;]*?))?\s*;"
+)
+
+
+def _run_do_block(
+    body: str,
+    session: Session,
+    storage: Any = None,
+    db: str | None = None,
+    catalog: Catalog | None = None,
+) -> SQLResult:
+    """A minimal plpgsql interpreter for ``DO`` blocks: executes each ``RAISE``
+    statement in the body — notices/warnings collect on the result (the wire
+    layer sends NoticeResponse messages), an EXCEPTION raises with its USING
+    ERRCODE (default P0001 raise_exception). Anything else in the body is
+    ignored (BEGIN/END scaffolding)."""
+    from secantus.sql import scalar
+
+    notices: list[tuple[str, str]] = []
+    ctx = scalar.ScalarContext(storage=None, catalog=None, db=session.database, session=session)
+    # ``EXECUTE <string expr>;`` — dynamic SQL: evaluate the expression
+    # (``format('insert into "%s" …', chr(8364))``) and run the result, so
+    # errors from the dynamic statement surface with their real SQLSTATE.
+    if storage is not None and db is not None:
+        for em in re.finditer(r"(?is)\bexecute\s+(?P<expr>[^;]+);", body):
+            try:
+                node = sqlglot.parse_one(f"SELECT {em.group('expr')}", read="postgres").expressions[
+                    0
+                ]
+                dyn_sql = scalar.evaluate(node, planner._const_scope, ctx)
+            except errors.SQLError:
+                raise
+            except Exception:  # noqa: BLE001 — unevaluable EXECUTE arg
+                continue
+            if dyn_sql:
+                run_sql(storage, db, str(dyn_sql), session=session)
+    for m in _RAISE_RE.finditer(body):
+        level = m.group("level").upper()
+        fmt = m.group("fmt").replace("''", "'")
+        args_text = (m.group("args") or "").lstrip(",").strip()
+        arg_values: list[str] = []
+        if args_text:
+            for part in _split_top_level_commas(args_text):
+                try:
+                    node = sqlglot.parse_one(f"SELECT {part}", read="postgres").expressions[0]
+                    val = scalar.evaluate(node, planner._const_scope, ctx)
+                except Exception:  # noqa: BLE001 — a bad arg renders as its text
+                    val = part
+                arg_values.append("" if val is None else str(val))
+        message = fmt
+        for val in arg_values:
+            message = message.replace("%", val, 1)
+        if level == "EXCEPTION":
+            errcode = "P0001"  # raise_exception
+            using = m.group("using") or ""
+            code_m = re.search(r"(?i)errcode\s*=\s*'([^']+)'", using)
+            if code_m is not None:
+                errcode = code_m.group(1)
+            raise errors.SQLError(errcode, message)
+        if level in ("NOTICE", "WARNING", "INFO"):
+            notices.append((level, message))
+        # DEBUG/LOG stay server-side, like PG's default client_min_messages.
+    return SQLResult(command_tag="DO", notices=notices)
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    parts, depth, buf = [], 0, []
+    in_str = False
+    for ch in text:
+        if in_str:
+            buf.append(ch)
+            if ch == "'":
+                in_str = False
+            continue
+        if ch == "'":
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf).strip())
+    return parts
+
+
+def _run_command(
+    stmt: exp.Command,
+    session: Session,
+    storage: Any = None,
+    db: str | None = None,
+    catalog: Catalog | None = None,
+) -> SQLResult:
     verb = str(stmt.this).upper()
+    if verb == "DO":
+        raw = stmt.expression.this if isinstance(stmt.expression, exp.Literal) else ""
+        return _run_do_block(str(raw), session, storage, db, catalog)
+    if verb == "PUBSUB":
+        # LISTEN / NOTIFY / UNLISTEN routed through parse() (the extended
+        # protocol's Parse path — run_sql intercepts them before parsing).
+        raw = stmt.expression.this if isinstance(stmt.expression, exp.Literal) else ""
+        handled = _maybe_pubsub(str(raw), session)
+        if handled is not None:
+            return handled
+        raise errors.syntax_error(f'syntax error at or near "{str(raw)[:40]}"')
     arg = stmt.expression
     if isinstance(arg, exp.Literal):
         name = arg.this
@@ -4096,6 +4440,22 @@ def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
         reported = [(name, session.get_setting(name))] if name in REPORTABLE_GUCS else []
         return SQLResult(command_tag="RESET", parameter_status=reported)
     if verb == "SET":
+        # SET TRANSACTION <chars> — applies to the open transaction only.
+        m_txn = re.match(r"(?is)^transaction\s+(?P<tail>.+?)\s*;?\s*$", name)
+        if m_txn is not None:
+            if session.txn_handle is not None:
+                for cname, cvalue in _parse_txn_characteristics(m_txn.group("tail")).items():
+                    session.set_local(cname, cvalue)
+            return SQLResult(command_tag="SET")
+        # SET SESSION CHARACTERISTICS AS TRANSACTION <chars> — sets the
+        # session-default transaction characteristics (default_transaction_*).
+        m_chars = re.match(
+            r"(?is)^session\s+characteristics\s+as\s+transaction\s+(?P<tail>.+?)\s*;?\s*$", name
+        )
+        if m_chars is not None:
+            for cname, cvalue in _parse_txn_characteristics(m_chars.group("tail")).items():
+                session.settings[f"default_{cname}"] = cvalue
+            return SQLResult(command_tag="SET")
         # ``SET name = v1, v2`` (DateStyle's two-part value) parses as a raw
         # Command, not exp.Set — store and report it like the structured path.
         m_set = _SET_MULTI_RE.match(name)

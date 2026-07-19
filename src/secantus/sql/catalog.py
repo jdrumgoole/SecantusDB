@@ -51,6 +51,29 @@ POLICY_COLLECTION = "__sql_policies__"
 RLS_COLLECTION = "__sql_rls__"
 COLUMN_GRANT_COLLECTION = "__sql_column_grants__"
 
+#: Every catalog collection DDL can touch — snapshotted together before a DDL
+#: statement inside a savepoint so ``ROLLBACK TO SAVEPOINT`` reverts the schema
+#: change (a CREATE TYPE / CREATE TABLE / … undone by the enclosing savepoint).
+ALL_CATALOG_COLLECTIONS = (
+    CATALOG_COLLECTION,
+    VIEW_COLLECTION,
+    MATVIEW_COLLECTION,
+    SEQUENCE_COLLECTION,
+    ROLE_COLLECTION,
+    ROLE_MEMBER_COLLECTION,
+    GRANT_COLLECTION,
+    SCHEMA_COLLECTION,
+    ENUM_COLLECTION,
+    ENUM_META_COLLECTION,
+    RANGE_TYPE_COLLECTION,
+    DOMAIN_COLLECTION,
+    COMPOSITE_COLLECTION,
+    FUNCTION_COLLECTION,
+    POLICY_COLLECTION,
+    RLS_COLLECTION,
+    COLUMN_GRANT_COLLECTION,
+)
+
 
 def fold_type_name(name: str) -> str:
     """Normalize a user-type name as Postgres resolves identifiers: each dotted
@@ -151,6 +174,11 @@ class Column:
     # onto the named fields and ``(col).field`` access can type its result.
     composite_type: str | None = None
     composite_fields: tuple[tuple[str, str], ...] | None = None
+    # True for a column declared ``json`` (not ``jsonb``): the value behaviour
+    # is identical (both store parsed JSON under type_tag "json") but the wire
+    # identity differs — RowDescription/COPY report oid 114, whose binary form
+    # has no jsonb version byte.
+    json_plain: bool = False
 
 
 @dataclass(frozen=True)
@@ -216,6 +244,8 @@ class TableDef:
     # resolves to a field of the same name, and an un-sampled column reads as
     # the permissive ``any`` type rather than erroring.
     reflected: bool = False
+    # CREATE TEMP TABLE — reflected in error diagnostics (schema pg_temp_1).
+    temp: bool = False
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     check_constraints: list[CheckConstraint] = field(default_factory=list)
     unique_constraints: list[UniqueConstraint] = field(default_factory=list)
@@ -300,10 +330,12 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "generated": c.generated,
                 "composite_type": c.composite_type,
                 "composite_fields": _ser_composite_fields(c.composite_fields),
+                "json_plain": c.json_plain,
             }
             for c in table.columns
         ],
         "comment": table.comment,
+        "temp": table.temp,
         "foreign_keys": [
             {
                 "name": fk.name,
@@ -364,10 +396,12 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 generated=c.get("generated"),
                 composite_type=c.get("composite_type"),
                 composite_fields=_deser_composite_fields(c.get("composite_fields")),
+                json_plain=bool(c.get("json_plain", False)),
             )
             for c in doc["columns"]
         ],
         comment=doc.get("comment"),
+        temp=bool(doc.get("temp", False)),
         foreign_keys=[
             ForeignKey(
                 name=fk["name"],
@@ -565,7 +599,18 @@ class Catalog:
     def sequence_nextval(self, db: str, name: str) -> int:
         """Advance ``name`` and return its new value. The first ``nextval`` returns
         the sequence's ``start``; subsequent calls add ``increment`` (raising on
-        overflow past ``max_value`` unless ``cycle``, when it wraps to the bound)."""
+        overflow past ``max_value`` unless ``cycle``, when it wraps to the bound).
+
+        Serialized under the storage's statement-write lock: the read-advance-
+        persist below spans two storage calls, and a bare ``SELECT nextval(…)``
+        runs outside the DML executors, so two connections could otherwise draw
+        the same value. Lazy import — executor already imports this module."""
+        from secantus.sql.executor import _write_lock
+
+        with _write_lock(self._storage):
+            return self._sequence_nextval_locked(db, name)
+
+    def _sequence_nextval_locked(self, db: str, name: str) -> int:
         doc = self.get_sequence(db, name)
         if doc is None:
             raise errors.SQLError("42P01", f'relation "{name}" does not exist')

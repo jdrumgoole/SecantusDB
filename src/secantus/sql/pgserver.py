@@ -25,6 +25,7 @@ import secrets
 import signal
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -69,6 +70,80 @@ DEFAULT_MAX_CONNECTIONS = 1000
 #: client — leaking it could disclose internal paths, types, or data values.
 #: Mirrors the Mongo dispatch's generic-error discipline. (security review §I17)
 _INTERNAL_ERROR_MSG = "internal error"
+
+# The fixed 11-byte binary-COPY signature (PGCOPY\n\377\r\n\0).
+_PGCOPY_SIGNATURE = b"PGCOPY\n\xff\r\n\x00"
+
+
+def _idle_in_txn_timeout_ms(session: Any) -> int:
+    """The session's ``idle_in_transaction_session_timeout`` in milliseconds
+    (0 = disabled), parsed from the GUC value (PG accepts a bare-ms integer or
+    a value with a unit suffix)."""
+    raw = session.get_setting("idle_in_transaction_session_timeout")
+    if not raw:
+        return 0
+    m = __import__("re").match(r"\s*(\d+)\s*(ms|s|min)?\s*$", str(raw))
+    if m is None:
+        return 0
+    n = int(m.group(1))
+    return {"s": n * 1000, "min": n * 60_000}.get(m.group(2) or "ms", n)
+
+
+def _error_position(exc: Any, sql: str) -> int | None:
+    """A best-effort 1-based statement position for a name error: the offset of
+    the quoted identifier the message cites (clients render the ``LINE 1: …``
+    context from it, like real PG's parse-analysis errors)."""
+    m = __import__("re").search(r'"([^"]+)"', getattr(exc, "message", "") or "")
+    if m is None:
+        return None
+    idx = sql.find(m.group(1))
+    return idx + 1 if idx >= 0 else None
+
+
+def _parse_binary_copy(
+    data: bytes, col_oids: list[int], ncols: int, encoding: str | None
+) -> list[list]:
+    """Parse a binary COPY FROM stream into rows of typed Python cells.
+
+    Layout: 11-byte signature, int32 flags, int32 header-extension length (+
+    that many bytes), then per row an int16 field count and per field an int32
+    length (-1 = NULL) + the field's binary value; an int16 -1 trailer ends
+    the stream."""
+    from secantus.sql import pgextended
+
+    if not data.startswith(_PGCOPY_SIGNATURE):
+        raise errors.SQLError("22P04", "COPY file signature not recognized")
+    off = len(_PGCOPY_SIGNATURE)
+    try:
+        _flags, ext_len = struct.unpack_from("!ii", data, off)
+        off += 8 + ext_len
+        rows: list[list] = []
+        while True:
+            if off >= len(data):
+                break  # missing trailer — accept the rows we have, like PG's lenient readers
+            (nfields,) = struct.unpack_from("!h", data, off)
+            off += 2
+            if nfields == -1:
+                break
+            if nfields != ncols:
+                raise errors.SQLError(
+                    "22P04", f"extra or missing columns for COPY (expected {ncols})"
+                )
+            cells: list = []
+            for i in range(nfields):
+                (length,) = struct.unpack_from("!i", data, off)
+                off += 4
+                if length < 0:
+                    cells.append(None)
+                    continue
+                raw = data[off : off + length]
+                off += length
+                oid = col_oids[i] if i < len(col_oids) else 0
+                cells.append(pgextended._decode_param(raw, 1, oid, encoding))
+            rows.append(cells)
+        return rows
+    except struct.error:
+        raise errors.SQLError("22P04", "incomplete binary COPY data") from None
 
 
 class SecantusPGServer:
@@ -326,6 +401,20 @@ class SecantusPGServer:
         session.activity_registry = self._activity
         session.prepared_xacts = self._prepared_xacts
         session.backend_start = _dt.datetime.now(_dt.timezone.utc)
+
+        def _terminate(sock: socket.socket = conn) -> None:
+            # pg_terminate_backend: shut the target socket down for BOTH
+            # directions. A blocked recv in the target's handler returns EOF
+            # (cross-backend kill), and if the caller is terminating its OWN
+            # backend the handler's subsequent send fails — either way the
+            # target's ``with conn:`` block closes the fd and the connection
+            # ends. shutdown (not close) is the portable wake: closing the fd
+            # from this foreign thread crashes Winsock when the other thread
+            # has a pending recv.
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+
+        session.terminate_cb = _terminate
         if self._authz_active:
             session.authz_active = True
             session.roles = self._users.roles_for(user)
@@ -347,6 +436,11 @@ class SecantusPGServer:
             ("server_encoding", "UTF8"),
             ("client_encoding", session.get_setting("client_encoding")),
             ("DateStyle", "ISO, MDY"),
+            # Real postgres reports IntervalStyle in the startup set, and
+            # psycopg selects its interval parser from it: without the
+            # ParameterStatus the client sees IntervalStyle "unknown" and
+            # raises NotImplementedError rather than decoding an interval.
+            ("IntervalStyle", session.get_setting("IntervalStyle")),
             ("integer_datetimes", "on"),
             ("standard_conforming_strings", "on"),
             ("TimeZone", "UTC"),
@@ -395,8 +489,32 @@ class SecantusPGServer:
         # Per-connection extended-protocol state (prepared statements + portals).
         ext = ExtendedSession(self.storage, session)
         while not self._stop_event.is_set():
+            # idle_in_transaction_session_timeout: while a transaction is open,
+            # bound the wait for the next command; exceeding it aborts the
+            # transaction and terminates the connection (25P03), like PG.
+            idle_ms = _idle_in_txn_timeout_ms(session)
+            if idle_ms and session.txn_handle is not None:
+                conn.settimeout(idle_ms / 1000.0)
+            else:
+                conn.settimeout(None)
             try:
                 msg = pgwire.read_message(conn)
+            except TimeoutError:
+                if session.txn_handle is not None:
+                    with contextlib.suppress(Exception):
+                        self.storage.abort_user_transaction(session.txn_handle)
+                    session.txn_handle = None
+                    session.txn_failed = True
+                with contextlib.suppress(OSError):
+                    conn.settimeout(None)
+                    conn.sendall(
+                        pgwire.error_response(
+                            "25P03",
+                            "terminating connection due to idle-in-transaction timeout",
+                            severity="FATAL",
+                        )
+                    )
+                return
             except pgwire.PGProtocolError:
                 # A framing error (implausible length) desyncs the byte stream —
                 # unrecoverable. Send a FATAL protocol-violation ErrorResponse
@@ -478,7 +596,13 @@ class SecantusPGServer:
                 for res in results:
                     out += _render_result(res, session.wire_encoding, session)
         except errors.SQLError as exc:
-            out += pgwire.error_response(exc.sqlstate, exc.message, encoding=session.wire_encoding)
+            out += pgwire.error_response(
+                exc.sqlstate,
+                exc.message,
+                encoding=session.wire_encoding,
+                diag=getattr(exc, "diag", None),
+                position=getattr(exc, "position", None) or _error_position(exc, sql),
+            )
         except Exception:  # pragma: no cover - defensive
             logger.exception("error executing SQL")
             # Don't leak the raw Python exception text to the wire client — the
@@ -530,7 +654,8 @@ class SecantusPGServer:
             conn.sendall(pgwire.ready_for_query(session.txn_status()))
 
     def _copy_in(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
-        conn.sendall(pgwire.copy_in_response(len(plan.columns)))
+        binary = plan.fmt == "binary"
+        conn.sendall(pgwire.copy_in_response(len(plan.columns), binary=binary))
         chunks: list[bytes] = []
         while True:
             msg = pgwire.read_message(conn)
@@ -549,20 +674,25 @@ class SecantusPGServer:
                 return
             else:  # pragma: no cover - client desync
                 break
-        try:
-            data = pgwire.decode_text(b"".join(chunks), session.wire_encoding)
-        except UnicodeDecodeError:
-            # Binary/garbage COPY payloads must surface as a faithful SQL
-            # error, not an internal one.
-            raise errors.SQLError(
-                "22021", f'invalid byte sequence for encoding "{session.wire_encoding}"'
-            ) from None
-        if plan.fmt == "csv":
-            rows = copyfmt.parse_csv(
-                data, delimiter=plan.delimiter, null=plan.null, header=plan.header
+        if binary:
+            rows = _parse_binary_copy(
+                b"".join(chunks), plan.col_oids, len(plan.columns), session.wire_encoding
             )
         else:
-            rows = copyfmt.parse_text(data, delimiter=plan.delimiter, null=plan.null)
+            try:
+                data = pgwire.decode_text(b"".join(chunks), session.wire_encoding)
+            except UnicodeDecodeError:
+                # Garbage COPY payloads must surface as a faithful SQL error,
+                # not an internal one.
+                raise errors.SQLError(
+                    "22021", f'invalid byte sequence for encoding "{session.wire_encoding}"'
+                ) from None
+            if plan.fmt == "csv":
+                rows = copyfmt.parse_csv(
+                    data, delimiter=plan.delimiter, null=plan.null, header=plan.header
+                )
+            else:
+                rows = copyfmt.parse_text(data, delimiter=plan.delimiter, null=plan.null)
         try:
             with self._txn_scope(session):
                 n = sql_engine.copy_insert(
@@ -578,6 +708,9 @@ class SecantusPGServer:
         conn.sendall(pgwire.ready_for_query(session.txn_status()))
 
     def _copy_out(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
+        if plan.fmt == "binary":
+            self._copy_out_binary(conn, session, plan)
+            return
         with self._txn_scope(session):
             rows = sql_engine.copy_extract(self.storage, session.database, catalog, session, plan)
         conn.sendall(pgwire.copy_out_response(len(plan.columns)))
@@ -612,6 +745,39 @@ class SecantusPGServer:
         conn.sendall(pgwire.command_complete(f"COPY {len(rows)}"))
         conn.sendall(pgwire.ready_for_query(session.txn_status()))
 
+    def _copy_out_binary(self, conn: socket.socket, session: Session, plan: Any) -> None:
+        """``COPY … TO STDOUT (FORMAT binary)`` — PGCOPY signature + flags +
+        extension header, one CopyData per row (int16 field count, per-field
+        int32 length + binary value), int16 -1 trailer."""
+        from secantus.sql import pgextended
+
+        with self._txn_scope(session):
+            rows = sql_engine.copy_extract_raw(self.storage, session.database, plan)
+        conn.sendall(pgwire.copy_out_response(len(plan.columns), binary=True))
+        out = bytearray()
+        # Real PG bundles the PGCOPY header with the FIRST row in one CopyData
+        # (psycopg's copy.read() row framing depends on it); each later row is
+        # its own message and the int16 -1 trailer ends the stream.
+        pending = bytearray(_PGCOPY_SIGNATURE + struct.pack("!ii", 0, 0))
+        for row in rows:
+            buf = bytearray(struct.pack("!h", len(plan.columns)))
+            for value, oid, tag in zip(row, plan.col_oids, plan.col_tags, strict=True):
+                if value is None:
+                    buf += struct.pack("!i", -1)
+                    continue
+                b = pgextended._encode_value(value, oid, tag, session.wire_encoding) or b""
+                buf += struct.pack("!i", len(b)) + b
+            pending += buf
+            out += pgwire.copy_data(bytes(pending))
+            pending = bytearray()
+        if pending:  # zero rows — the header still has to go out
+            out += pgwire.copy_data(bytes(pending))
+        out += pgwire.copy_data(struct.pack("!h", -1))
+        conn.sendall(bytes(out))
+        conn.sendall(pgwire.copy_done())
+        conn.sendall(pgwire.command_complete(f"COPY {len(rows)}"))
+        conn.sendall(pgwire.ready_for_query(session.txn_status()))
+
     # -- context manager ---------------------------------------------------- #
 
     def __enter__(self) -> Self:
@@ -630,6 +796,13 @@ class SecantusPGServer:
 def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None) -> bytes:
     """Serialise one ``SQLResult`` to its backend messages."""
     out = bytearray()
+    for severity, message in getattr(res, "notices", ()) or ():
+        out += pgwire.notice_response(
+            message,
+            severity=severity,
+            sqlstate="01000" if severity == "WARNING" else "00000",
+            encoding=encoding,
+        )
     status = list(res.parameter_status)
     if session is not None and session.pending_parameter_status:
         # Reportable GUCs changed mid-statement by set_config().
@@ -638,7 +811,9 @@ def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None
     for name, value in status:
         out += pgwire.parameter_status(name, value)
     if res.columns or res.command_tag.startswith("SELECT"):
-        out += pgwire.row_description([(c.name, c.pg_oid) for c in res.columns], encoding=encoding)
+        out += pgwire.row_description(
+            [(c.name, c.pg_oid, c.typmod) for c in res.columns], encoding=encoding
+        )
         tags = [c.type_tag for c in res.columns]
         for row in res.rows:
             out += pgwire.data_row(

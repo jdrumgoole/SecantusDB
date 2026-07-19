@@ -139,6 +139,9 @@ class ConstantSelectPlan:
     # stays ``text`` (the value form IS the label text) but the descriptor must
     # report the minted enum oid or a client's registered loader won't fire.
     pg_oids: list[int | None] = field(default_factory=list)
+    # Per-column PG type modifiers, parallel to ``columns`` (-1 = none).
+    # ``select null::varchar(42)`` describes with typmod 46 like real PG.
+    typmods: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -247,6 +250,13 @@ def _literal(node: exp.Expression) -> Any:
         return float(text) if ("." in text or "e" in text.lower()) else int(text)
     if isinstance(node, exp.BitString):  # ``B'1010'`` -> the canonical '0'/'1' string
         return str(node.this)
+    if isinstance(node, exp.ByteString):
+        # ``E'…'`` escape-string literal (psycopg's ClientCursor emits it for
+        # any string containing a backslash) — sqlglot's postgres dialect lexes
+        # it as a ByteString and keeps the escapes raw.
+        from secantus.sql.scalar import _unescape_estring
+
+        return _unescape_estring(str(node.this))
     if isinstance(node, exp.Interval):  # ``interval '1 day'`` -> an interval subdoc
         from secantus.sql import intervals as _intervals
 
@@ -690,9 +700,15 @@ def _is_field_node(node: exp.Expression) -> bool:
 
 
 def _json_keys(expr: exp.Expression) -> list[str]:
-    """Extract the path keys from a ->/#> right-hand side."""
+    """Extract the path keys from a ->/#> right-hand side. Integer subscripts
+    (``-> 1`` — a JSON array index) come back as their digit strings; the
+    evaluator's array branch converts them."""
     if isinstance(expr, exp.JSONPath):
-        return [p.this for p in expr.expressions if isinstance(p, exp.JSONPathKey)]
+        return [
+            str(p.this)
+            for p in expr.expressions
+            if isinstance(p, (exp.JSONPathKey, exp.JSONPathSubscript))
+        ]
     if isinstance(expr, exp.Literal):
         # ``#> '{a,b}'`` — a Postgres text[] path literal.
         return [k for k in str(expr.this).strip("{}").split(",") if k]
@@ -724,15 +740,37 @@ def _field(node: exp.Expression, resolve: Resolve) -> tuple[str, str]:
 
 
 def _array_elements(node: exp.Expression) -> list[exp.Expression]:
-    """Unwrap an ``ARRAY[...]`` (possibly parenthesised) to its element nodes."""
+    """Unwrap an ``ARRAY[...]`` (possibly parenthesised) to its element nodes.
+    An array *literal* string (a substituted list parameter — ``= any(%s)``)
+    parses into literal element nodes."""
     if isinstance(node, exp.Paren):
         return _array_elements(node.this)
     if isinstance(node, exp.Array):
         return list(node.expressions)
+    if isinstance(node, exp.Cast):
+        return _array_elements(node.this)
+    if isinstance(node, exp.Literal) and node.is_string and str(node.this).startswith("{"):
+        try:
+            items = typemap._parse_pg_array_literal(str(node.this))
+        except ValueError:
+            raise errors.feature_not_supported(f"unsupported array operand: {node.sql()}") from None
+        out: list[exp.Expression] = []
+        for v in items:
+            if v is None:
+                out.append(exp.Null())
+            elif isinstance(v, str) and _NUMERIC_TOKEN_RE.fullmatch(v):
+                out.append(exp.Literal.number(v))
+            else:
+                out.append(exp.Literal.string(str(v)))
+        return out
     raise errors.feature_not_supported(f"unsupported array operand: {node.sql()}")
 
 
 _LITERAL_SENTINEL = object()
+
+# A bare numeric array-literal element (``{1,2}``) — becomes a number node so
+# ``id = any('{1,2}')`` compares numerically.
+_NUMERIC_TOKEN_RE = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?")
 
 
 def _try_literal(node: exp.Expression) -> Any:
@@ -1555,6 +1593,8 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 identity=(identity["mode"] if identity else None),
                 enum_type=enum_name,
                 generated=_generated_expr(coldef),
+                # ``json`` (not ``jsonb``): same stored shape, oid 114 on the wire.
+                json_plain=(tag == "json" and coldef.args["kind"].this == exp.DataType.Type.JSON),
             )
         )
     if not pk_seen:
@@ -1563,6 +1603,8 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         pass
     fks = _extract_foreign_keys(schema, table_name)
     checks, uniques = _extract_constraints(schema, table_name)
+    props = stmt.args.get("properties")
+    is_temp = bool(props) and any(isinstance(p, exp.TemporaryProperty) for p in props.expressions)
     table = TableDef(
         name=table_name,
         collection=table_name,
@@ -1570,6 +1612,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         foreign_keys=fks,
         check_constraints=checks,
         unique_constraints=uniques,
+        temp=is_temp,
     )
     return CreateTablePlan(
         table=table, if_not_exists=bool(stmt.args.get("exists")), sequences=seq_plans
@@ -1718,10 +1761,13 @@ def _extract_constraints(
         if isinstance(coldef, exp.ColumnDef):  # column-level
             for con in coldef.args.get("constraints") or []:
                 kind = con.kind
+                # ``data int CONSTRAINT chk_eq1 CHECK (…)`` — the declared name
+                # rides the ColumnConstraint node.
+                declared = con.this.name if getattr(con, "this", None) is not None else None
                 if isinstance(kind, exp.CheckColumnConstraint):
-                    checks.append(make_check_constraint(kind, table_name, None, coldef.name))
+                    checks.append(make_check_constraint(kind, table_name, declared, coldef.name))
                 elif isinstance(kind, exp.UniqueColumnConstraint):
-                    uniques.append(make_unique_constraint(kind, table_name, None, coldef.name))
+                    uniques.append(make_unique_constraint(kind, table_name, declared, coldef.name))
         elif isinstance(coldef, exp.Constraint):  # CONSTRAINT <name> CHECK/UNIQUE (...)
             name = coldef.this.name if coldef.this else None
             for inner in coldef.args.get("expressions") or []:
@@ -1928,6 +1974,19 @@ def _composite_value(raw: Any, col: Column) -> dict[str, Any]:
 def _build_composite(raw: Any, fields: Any, type_name: str) -> dict[str, Any]:
     """Build a composite subdocument from a positional ``ROW`` / list, or an
     already-named dict, against ``fields`` (``(name, tag, subfields)`` entries)."""
+    if isinstance(raw, str):
+        # A record text literal (``'("(foo,10)",20)'`` — a registered psycopg
+        # composite dumper's text form) parses into positional tokens; a nested
+        # composite field arrives as a string and recurses through the same
+        # parse below.
+        try:
+            raw = typemap.parse_pg_record_literal(raw)
+        except ValueError:
+            raise errors.SQLError(
+                "22P02", f'malformed record literal for type "{type_name}"'
+            ) from None
+        if not fields and raw in ([], [None]):
+            raw = []  # ``'()'`` for a zero-field composite type
     if isinstance(raw, dict):
         pairs = [(_field_parts(f)[0], raw.get(_field_parts(f)[0])) for f in fields]
     elif isinstance(raw, (list, tuple)):
@@ -2266,6 +2325,12 @@ def _infer_value_tag(value: Any) -> str:
         return "float8"
     if isinstance(value, dict) and "interval" in value:
         return "interval"
+    if isinstance(value, typemap.RecordValue) or (
+        isinstance(value, dict) and value and all(k == f"f{i + 1}" for i, k in enumerate(value))
+    ):
+        # A ``row(…)`` anonymous record — describes as RECORD (2249) and
+        # renders as the ``(a,b)`` record literal, like the SELECT path.
+        return "composite"
     return "text"
 
 
@@ -2390,6 +2455,7 @@ def plan_constant_select(
             value = scalar.evaluate(target, _const_scope, ctx)
             columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
     pg_oids: list[int | None] = [None] * len(columns)
+    typmods: list[int] = [-1] * len(columns)
     for i, e in enumerate(stmt.expressions):
         override = _constant_enum_override(e, ctx) or _constant_composite_extra_override(e, ctx)
         if override is not None:
@@ -2398,7 +2464,15 @@ def plan_constant_select(
             if tag is not None:
                 name, _old_tag, value = columns[i]
                 columns[i] = (name, tag, value)
-    return ConstantSelectPlan(columns=columns, emit=emit, pg_oids=pg_oids)
+            continue
+        # ``null::varchar(42)`` — a modifier-bearing cast target describes with
+        # its distinct oid + typmod (varchar/bpchar differ from text even bare).
+        target = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(target, exp.Cast):
+            identity = typemap.cast_type_identity(target.to)
+            if identity is not None:
+                pg_oids[i], typmods[i] = identity
+    return ConstantSelectPlan(columns=columns, emit=emit, pg_oids=pg_oids, typmods=typmods)
 
 
 def _constant_enum_override(e: exp.Expression, ctx: Any) -> tuple[str | None, int] | None:
@@ -2455,6 +2529,31 @@ def _constant_composite_extra_override(
     from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET, fold_type_name
 
     target = e.this if isinstance(e, exp.Alias) else e
+    if isinstance(target, exp.Cast):
+        # A cast to a table's row type (``'(foo)'::mytype`` / ``::mytype[]``)
+        # describes with the rowtype's pg_type oid (its array with the paired
+        # array oid) so psycopg's registered TypeInfo loaders fire.
+        dt = target.to
+        is_arr = isinstance(dt, exp.DataType) and dt.this == exp.DataType.Type.ARRAY
+        inner_dt = (dt.args.get("expressions") or [dt])[0] if is_arr else dt
+        if isinstance(inner_dt, exp.DataType) and inner_dt.this == exp.DataType.Type.USERDEFINED:
+            tname = fold_type_name(inner_dt.sql(dialect="postgres"))
+            if getattr(ctx.catalog, "get", None) is not None and ctx.catalog.get(ctx.db, tname):
+                rowtype = virtual._table_rowtype_oids(ctx.db, ctx.catalog).get(tname)
+                if rowtype is not None:
+                    if is_arr:
+                        return (None, rowtype + virtual._ROWTYPE_ARRAY_OID_OFFSET)
+                    return (None, rowtype)
+    if isinstance(target, exp.Anonymous):
+        # A user-declared range type's constructor (``testrange(lo, hi)``) —
+        # describe with the minted oid so a registered loader fires.
+        fname = str(target.this).lower()
+        getter = getattr(ctx.catalog, "get_range_type", None)
+        doc = getter(ctx.db, fname) if getter is not None else None
+        if doc is not None:
+            oid = doc.get("multirange_oid") if fname == doc.get("multirange") else doc.get("oid")
+            if oid:
+                return (None, oid)
     if isinstance(target, exp.Array) and target.expressions:
         elems = target.expressions
         if all(isinstance(el, exp.Cast) for el in elems):
@@ -3147,9 +3246,23 @@ def _value_to_node(value: Any) -> exp.Expression:
         target = "timetz" if value.tzinfo is not None else "time"
         return exp.Cast(this=exp.Literal.string(value.isoformat()), to=exp.DataType.build(target))
     if isinstance(value, (bytes, bytearray, memoryview)):
-        # A binary ``bytea`` parameter — carry it as the ``\x…`` hex text literal
-        # (str() would embed the Python ``b'…'`` repr).
-        return exp.Literal.string("\\x" + bytes(value).hex())
+        # A ``bytea`` parameter — the ``::bytea`` cast re-parses the hex text
+        # into bytes so equality against another bytea value compares bytes,
+        # not text-vs-bytes (a bare literal broke ``$1 = set_byte(…)``).
+        return exp.Cast(
+            this=exp.Literal.string("\\x" + bytes(value).hex()),
+            to=exp.DataType.build("bytea", dialect="postgres"),
+        )
+    if isinstance(value, typemap.TypedList):
+        # A typed array parameter (a text-format int2[]/inet[]/… decoded at
+        # Bind) — the ``::tag[]`` cast re-parses the literal into a typed list
+        # so equality against ``array[…]`` values compares element-wise.
+        literal = typemap._render_pg_array(value, value.elem_tag)
+        try:
+            dtype = exp.DataType.build(f"{value.elem_tag}[]", dialect="postgres")
+        except Exception:  # noqa: BLE001 — non-keyword element names (cidr) need udt
+            dtype = exp.DataType.build(f"{value.elem_tag}[]", dialect="postgres", udt=True)
+        return exp.Cast(this=exp.Literal.string(literal), to=dtype)
     if isinstance(value, (list, tuple)):
         # A binary array parameter decodes to a Python list; carry it as the
         # Postgres array text literal (str() would embed the Python repr).
@@ -3170,6 +3283,16 @@ def _value_to_node(value: Any) -> exp.Expression:
             # exactly like a client's own text dump of the same array.
             parsed = [None if v is None else json.loads(str(v)) for v in value]
             return exp.Literal.string(typemap._render_pg_array(parsed, "json"))
+        if isinstance(elem, (bytes, bytearray, memoryview)):
+            # bytea[] param — the ::bytea[] cast re-parses each hex element to
+            # bytes (same reasoning as the scalar bytea cast above).
+            literal = typemap._render_pg_array(
+                ["\\x" + bytes(v).hex() if v is not None else None for v in value], "text"
+            )
+            return exp.Cast(
+                this=exp.Literal.string(literal),
+                to=exp.DataType.build("bytea[]", dialect="postgres"),
+            )
         return exp.Literal.string(typemap._render_pg_array(value, _py_elem_tag(elem)))
     return exp.Literal.string(str(value))
 
@@ -3219,6 +3342,129 @@ def parameter_count(stmt: exp.Expression) -> int:
         except (TypeError, ValueError):
             continue
     return max(indices, default=0)
+
+
+_COMPARISON_NODES = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
+
+# Functions taking VARIADIC "any" — an untyped parameter passed directly can't
+# be resolved by parse analysis (PG raises 42P18 indeterminate_datatype).
+_VARIADIC_ANY_FUNCS = frozenset({"concat", "concat_ws", "format"})
+
+
+def indeterminate_parameter(stmt: exp.Expression | None, oids: list[int]) -> int | None:
+    """The 1-based index of an untyped parameter passed directly to a VARIADIC
+    "any" function (``concat($1, $2)`` with no declared type), or None. Real
+    Postgres rejects the Parse with 42P18."""
+    if stmt is None:
+        return None
+    calls: list[exp.Expression] = [
+        c for c in stmt.find_all(exp.Anonymous) if str(c.this).lower() in _VARIADIC_ANY_FUNCS
+    ]
+    calls += list(stmt.find_all(exp.Concat, exp.ConcatWs))
+    for call in calls:
+        for arg in call.expressions:
+            if isinstance(arg, exp.Parameter):
+                try:
+                    idx = int(arg.name)
+                except (TypeError, ValueError):
+                    continue
+                if idx >= 1 and (idx > len(oids) or not oids[idx - 1]):
+                    return idx
+    return None
+
+
+def infer_parameter_types(
+    stmt: exp.Expression | None,
+    declared: list[int],
+    *,
+    catalog: Any = None,
+    db: str | None = None,
+) -> list[int]:
+    """Fill in undeclared (oid 0) parameter types from the statement's AST at
+    Parse time, the way real Postgres' parse analysis does. A client that binds
+    a value in BINARY format with no declared type (psycopg's ``Range(empty=
+    True)`` dump) needs the server to know the type before Bind decodes the
+    payload. Two sound contexts: the parameter under an explicit cast
+    (``$1::int4range``), and the parameter compared against a cast operand
+    (``'empty'::int4range = $1``). Everything else stays 0 (→ text)."""
+    if stmt is None:
+        return declared
+    count = parameter_count(stmt)
+    oids = list(declared) + [0] * (count - len(declared))
+    # INSERT: an untyped parameter in a VALUES cell takes the target column's
+    # type, like PG's parse analysis (``insert into t (j) values ($1)`` with a
+    # jsonb column types $1 jsonb).
+    if isinstance(stmt, exp.Insert) and catalog is not None and db is not None:
+        schema = stmt.this
+        colnames: list[str] | None = None
+        tname = None
+        if isinstance(schema, exp.Schema):
+            tname = schema.this.name
+            colnames = [c.name for c in schema.expressions]
+        elif isinstance(schema, exp.Table):
+            tname = schema.name
+        table = catalog.get(db, tname) if tname else None
+        values = stmt.expression
+        if table is not None and isinstance(values, exp.Values):
+            if colnames is None:
+                colnames = [c.name for c in table.columns]
+            for tup in values.expressions:
+                cells = tup.expressions if isinstance(tup, exp.Tuple) else [tup]
+                for i, cell in enumerate(cells):
+                    while isinstance(cell, exp.Paren):
+                        cell = cell.this
+                    if not isinstance(cell, exp.Parameter) or i >= len(colnames):
+                        continue
+                    try:
+                        idx = int(cell.name) - 1
+                    except (TypeError, ValueError):
+                        continue
+                    if not 0 <= idx < count or oids[idx]:
+                        continue
+                    col = table.column(colnames[i])
+                    if col is not None:
+                        oids[idx] = (
+                            114
+                            if getattr(col, "json_plain", False)
+                            else typemap.PG_OID.get(col.type_tag, 0)
+                        )
+    for param in stmt.find_all(exp.Parameter):
+        try:
+            idx = int(param.name) - 1
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= idx < count or oids[idx]:
+            continue
+        node: exp.Expression = param
+        # Unwrap parens between the parameter and its typing context.
+        while isinstance(node.parent, exp.Paren):
+            node = node.parent
+        parent = node.parent
+        target: exp.DataType | None = None
+        if isinstance(parent, exp.Cast) and parent.this is node:
+            target = parent.to
+        elif isinstance(parent, _COMPARISON_NODES):
+            other = parent.expression if parent.this is node else parent.this
+            if isinstance(other, exp.Paren):
+                other = other.this
+            if isinstance(other, exp.Cast):
+                target = other.to
+            elif isinstance(other, exp.Anonymous):
+                # A range/multirange constructor operand types the parameter
+                # (``int8range($1, $2) = $3``).
+                fname = str(other.this).lower()
+                if fname in typemap._RANGE_TAGS or fname in typemap._MULTIRANGE_TAGS:
+                    oids[idx] = typemap.PG_OID[fname]
+                    continue
+        if target is None:
+            continue
+        tag = typemap.type_tag_for_sql(target)
+        oid = typemap.PG_OID.get(tag) if tag is not None else None
+        if oid is None and typemap.is_array_tag(tag):
+            oid = typemap._ARRAY_PG_OID.get(typemap.array_element_tag(tag))
+        if oid:
+            oids[idx] = oid
+    return oids
 
 
 # ---------------------------------------------------------------------------
@@ -3277,6 +3523,12 @@ class PipelineSelectPlan:
     residual_where: exp.Expression | None = None
     residual_resolve: Resolve | None = None
     residual_split: int = 0
+    # Computed GROUP BY keys the aggregation engine can't lower (``GROUP BY
+    # col = ascii(x)``): synthetic field name -> the scalar AST, evaluated in
+    # Python per base doc before the pipeline runs. ``pre_eval_resolve`` maps
+    # its column refs to doc field paths.
+    pre_eval_fields: dict[str, exp.Expression] = field(default_factory=dict)
+    pre_eval_resolve: Resolve | None = None
     # Ordered-set aggregates (percentile_cont / percentile_disc / mode) collect
     # their ORDER BY values via a ``$push`` accumulator, then the executor computes
     # the scalar in Python (the aggregation engine has no ``$sortArray``). Each
@@ -3647,6 +3899,31 @@ def _jsonb_object_agg_project(fname: str, fcond: Any) -> Any:
     return {"$arrayToObject": src}
 
 
+def _array_agg_out_tag(arr_arg: exp.Expression, resolve: Resolve) -> str:
+    """The output tag of ``array_agg(x)`` — the element's array type when the
+    element tag is known (``text`` → ``text[]``/1009, so psycopg loads a real
+    list and ``coalesce(array_agg(…), '{}')`` over an empty group parses as an
+    empty ARRAY, not JSON text — CompositeInfo.fetch of a zero-field type
+    depends on it). ``json`` element (or unknown) keeps the jsonb rendering."""
+    value_node, _terms = _agg_order_spec(arr_arg)
+    try:
+        elem = _infer_scalar_tag(value_node, resolve)
+    except Exception:  # noqa: BLE001 — inference failure keeps the old shape
+        return "json"
+    if elem and not typemap.is_array_tag(elem) and f"{elem}[]" in typemap.PG_OID:
+        return f"{elem}[]"
+    return "json"
+
+
+def _is_true_array_agg(e: exp.Expression) -> bool:
+    """True for ``array_agg`` proper — ``jsonb_agg``/``json_agg`` share the
+    ``$push`` machinery but must keep the json output type."""
+    inner = e.this if isinstance(e, exp.Alias) else e
+    if isinstance(inner, exp.Filter):
+        inner = inner.this
+    return isinstance(inner, exp.ArrayAgg)
+
+
 def _array_agg_arg(node: exp.Expression) -> exp.Expression | None:
     """If ``node`` is ``array_agg(<arg>)`` — or ``jsonb_agg`` / ``json_agg``, which
     build the same ``$push`` array and are likewise typed ``json`` here — return its
@@ -4008,9 +4285,11 @@ def _plan_pipeline_select(
     # ``$addFields`` so the bare-column group machinery handles SELECT / HAVING /
     # ORDER BY. Works for plain GROUP BY and GROUPING SETS / ROLLUP / CUBE alike.
     group_addfields: dict[str, Any] | None = None
+    group_pyfields: dict[str, exp.Expression] = {}
+    group_pyresolve: Resolve | None = None
     rewrite = _rewrite_computed_group_keys(stmt, table)
     if rewrite is not None:
-        stmt, table, group_addfields = rewrite
+        stmt, table, group_addfields, group_pyfields, group_pyresolve = rewrite
 
     has_aggregate = any(
         _aggregate_of(e) is not None
@@ -4055,6 +4334,18 @@ def _plan_pipeline_select(
         plan = _plan_distinct_select(stmt, table)
     else:
         plan = _plan_plain_select(stmt, table)
+    if group_pyfields:
+        # Keys the aggregation engine can't lower are evaluated in Python per
+        # base doc — only the pipeline plan's executor supports that hook
+        # (grouping-sets $unionWith branches re-read the collection and the
+        # evaluated planners never see base docs).
+        if not isinstance(plan, PipelineSelectPlan):
+            raise errors.feature_not_supported(
+                "unsupported computed GROUP BY key: "
+                + ", ".join(k.sql() for k in group_pyfields.values())
+            )
+        plan.pre_eval_fields = group_pyfields
+        plan.pre_eval_resolve = group_pyresolve
     if group_addfields:
         # Compute the synthetic GROUP BY key fields before the $group stage reads them.
         plan.pipeline.insert(0, {"$addFields": group_addfields})
@@ -4418,8 +4709,12 @@ def _has_grouping_sets(stmt: exp.Select) -> bool:
 
 
 def _lower_computed_group_keys(
-    computed: list[exp.Expression], resolve: Resolve, taken: set[str]
-) -> tuple[dict[str, str], dict[str, Any]]:
+    computed: list[exp.Expression],
+    resolve: Resolve,
+    taken: set[str],
+    *,
+    allow_python: bool = False,
+) -> tuple[dict[str, str], dict[str, Any], dict[str, exp.Expression]]:
     """Lower each computed GROUP BY key to a Mongo aggregation expression and mint a
     synthetic ``__gkeyN`` field name for it (avoiding names in ``taken``).
 
@@ -4429,24 +4724,33 @@ def _lower_computed_group_keys(
     key uses a function the aggregation engine can't evaluate (→ ``0A000``)."""
     targets: dict[str, str] = {}
     addfields: dict[str, Any] = {}
+    pyfields: dict[str, exp.Expression] = {}
     counter = 0
     for key in computed:
         srepr = key.sql()
         if srepr in targets:
             continue
+        mongo: Any = None
+        lowered = True
         try:
             mongo = _to_agg_expr(key, resolve)
-        except Exception as exc:  # noqa: BLE001 — any lowering failure → clean 0A000
-            raise errors.feature_not_supported(
-                f"unsupported computed GROUP BY key: {srepr}"
-            ) from exc
+        except Exception as exc:  # noqa: BLE001 — any lowering failure
+            if not allow_python:
+                raise errors.feature_not_supported(
+                    f"unsupported computed GROUP BY key: {srepr}"
+                ) from exc
+            lowered = False
         while (fname := f"__gkey{counter}") in taken:
             counter += 1
         counter += 1
         taken.add(fname)
-        addfields[fname] = mongo
+        if lowered:
+            addfields[fname] = mongo
+        else:
+            # The scalar evaluator computes it per doc before the pipeline.
+            pyfields[fname] = key.copy()
         targets[srepr] = fname
-    return targets, addfields
+    return targets, addfields, pyfields
 
 
 def _apply_group_key_rewrite(stmt: exp.Select, targets: dict[str, str]) -> exp.Select:
@@ -4516,7 +4820,7 @@ def _computed_group_keys(group_node: exp.Group | None) -> list[exp.Expression]:
 
 def _rewrite_computed_group_keys(
     stmt: exp.Select, table: TableDef
-) -> tuple[exp.Select, TableDef, dict[str, Any]] | None:
+) -> tuple[exp.Select, TableDef, dict[str, Any], dict[str, exp.Expression], Resolve] | None:
     """Rewrite non-column GROUP BY keys (``GROUP BY lower(name)``, ``GROUP BY x + 1``)
     into synthetic bare columns.
 
@@ -4534,14 +4838,29 @@ def _rewrite_computed_group_keys(
         return None
     resolve = table_resolver(table)
     existing = {c.name for c in table.columns}
-    targets, addfields = _lower_computed_group_keys(computed, resolve, existing)
+    targets, addfields, pyfields = _lower_computed_group_keys(
+        computed, resolve, existing, allow_python=True
+    )
+    # Type each synthetic key column from its source expression so the grouped
+    # output describes (and renders) as bool/int/…, not raw text.
+    key_tag_by_name = {
+        targets[key.sql()]: _infer_scalar_tag(key, resolve)
+        for key in computed
+        if key.sql() in targets
+    }
     synth = [
-        Column(name=fname, type_tag="any", field=fname, pk=False, nullable=True)
-        for fname in addfields
+        Column(
+            name=fname,
+            type_tag=key_tag_by_name.get(fname, "any"),
+            field=fname,
+            pk=False,
+            nullable=True,
+        )
+        for fname in [*addfields, *pyfields]
     ]
     new_stmt = _apply_group_key_rewrite(stmt, targets)
     new_table = replace(table, columns=[*table.columns, *synth])
-    return new_stmt, new_table, addfields
+    return new_stmt, new_table, addfields, pyfields, resolve
 
 
 def _grouping_args(e: exp.Expression) -> list[str] | None:
@@ -4691,7 +5010,14 @@ def _grouping_set_branch(
                     "$push": _push_filtered(_agg_arg_to_expr(arr_arg, table), fcond, wrap=True)
                 }
                 project[fname] = _array_agg_project(fname, fcond)
-            out_columns.append((fname, "json"))
+            out_columns.append(
+                (
+                    fname,
+                    _array_agg_out_tag(arr_arg, table_resolver(table))
+                    if _is_true_array_agg(e)
+                    else "json",
+                )
+            )
         elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
             accumulators[fname] = _jsonb_object_agg_push(oagg[0], oagg[1], table, fcond)
@@ -5067,7 +5393,14 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                     "$push": _push_filtered(_agg_arg_to_expr(arr_arg, table), fcond, wrap=True)
                 }
                 project[fname] = _array_agg_project(fname, fcond)
-            out_columns.append((fname, "json"))
+            out_columns.append(
+                (
+                    fname,
+                    _array_agg_out_tag(arr_arg, table_resolver(table))
+                    if _is_true_array_agg(e)
+                    else "json",
+                )
+            )
         elif sagg is not None:
             fname = names.fresh(alias or "string_agg")
             value_node, terms = _agg_order_spec(sagg[0])
@@ -7060,7 +7393,7 @@ def _plan_join_group_select(
     gkey_fields: dict[str, Any] = {}
     computed = _computed_group_keys(stmt.args.get("group"))
     if computed:
-        targets, gkey_fields = _lower_computed_group_keys(computed, resolve, set())
+        targets, gkey_fields, _pyfields = _lower_computed_group_keys(computed, resolve, set())
         stmt = _apply_group_key_rewrite(stmt, targets)
         pipeline.append({"$addFields": gkey_fields})
 
@@ -7444,7 +7777,7 @@ def _lower_join_group_keys(
     computed = _computed_group_keys(stmt.args.get("group"))
     if not computed:
         return stmt, {}
-    targets, gkey_fields = _lower_computed_group_keys(computed, resolve, set())
+    targets, gkey_fields, _pyfields = _lower_computed_group_keys(computed, resolve, set())
     stmt = _apply_group_key_rewrite(stmt, targets)
     join_prefix.append({"$addFields": gkey_fields})
     return stmt, gkey_fields
@@ -8404,6 +8737,13 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     composite_tag = _composite_field_tag(node, resolve)
     if composite_tag is not None:
         return composite_tag
+    # ``array[x::inet, …]`` — a bare array constructor types as its elements'
+    # array type when an element's tag is knowable (a cast or nested literal).
+    if isinstance(node, exp.Array) and node.expressions:
+        first = next((e for e in node.expressions if isinstance(e, exp.Cast)), None)
+        elem_tag = typemap.type_tag_for_sql(first.to) if first is not None else None
+        if elem_tag and not typemap.is_array_tag(elem_tag) and f"{elem_tag}[]" in typemap.PG_OID:
+            return f"{elem_tag}[]"
     # A user-defined function call (CREATE FUNCTION) types as its RETURNS type; the
     # catalog rides the planning ``_pipeline_subctx`` in the evaluated-select path.
     if isinstance(node, (exp.Anonymous, exp.Dot)):
@@ -8504,6 +8844,11 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         node, resolve
     ):
         return "text"
+    # ``->`` / ``#>`` keep jsonb; ``->>`` / ``#>>`` return text.
+    if isinstance(node, exp.JSONExtractScalar):
+        return "text"
+    if isinstance(node, exp.JSONExtract):
+        return "json"
     if isinstance(node, exp.DPipe) and _has_hstore_operand(node, resolve):
         return "hstore"
     # Postgres array operators: ``@>`` / ``<@`` / ``&&`` over an array operand -> bool.
@@ -8552,6 +8897,13 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         ),
     ) and _has_bit_operand(node, resolve):
         return "varbit"
+    # ``array || array`` (or array || element) concatenation types as the
+    # array operand's tag — text ``||`` stays below.
+    if isinstance(node, exp.DPipe):
+        for side in (node.this, node.expression):
+            side_tag = _infer_scalar_tag(side, resolve)
+            if typemap.is_array_tag(side_tag):
+                return side_tag
     # Integer bitwise ``&`` / ``|`` / ``#`` / ``~`` (not the bit-string, net, or
     # concat forms handled above) -> int4.
     if isinstance(node, (exp.BitwiseAnd, exp.BitwiseOr, exp.BitwiseXor, exp.BitwiseNot)):
@@ -8597,6 +8949,8 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
                 "citext",
                 "xml",
                 "json",
+                "aclitem",
+                "name",
             )
             or _mapped in typemap._GEO_TAGS
         ):
@@ -9291,10 +9645,187 @@ _COPY_BARE_OPTIONS_RE = re.compile(
 )
 
 
+# A ``::numeric(p,-s)`` cast — the only spot Postgres syntax allows a negative
+# scale. Anchored on the ``::`` cast so a matching text inside a string literal
+# isn't touched.
+_NEGSCALE_RE = re.compile(r"(::\s*(?:numeric|decimal)\s*\(\s*\d+\s*,\s*)-\s*(\d+)(\s*\))", re.I)
+
+# ``BEGIN`` / ``START TRANSACTION`` with transaction characteristics — sqlglot
+# parses some spellings (``BEGIN ISOLATION LEVEL x``) but not others (``BEGIN
+# READ ONLY``, the comma-separated ``START TRANSACTION a, b``). The tail is
+# pure keywords (letters/commas/whitespace), so a compound statement never
+# matches and falls through to sqlglot.
+_BEGIN_CHARACTERISTICS_RE = re.compile(
+    r"^\s*(?:BEGIN|START\s+TRANSACTION)(?:\s+(?:WORK|TRANSACTION))?\s+"
+    r"(?P<tail>(?:ISOLATION|READ|NOT|DEFERRABLE)[A-Za-z,\s]*?)\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+# ``SET TRANSACTION <characteristics>`` — the keyword tail, like BEGIN's.
+_SET_TRANSACTION_RE = re.compile(
+    r"^\s*SET\s+TRANSACTION\s+(?P<tail>(?:ISOLATION|READ|NOT|DEFERRABLE)[A-Za-z,\s]*?)\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+# A LISTEN / NOTIFY / UNLISTEN statement head (single statement only).
+_PUBSUB_HEAD_RE = re.compile(r"^\s*(?:LISTEN|UNLISTEN|NOTIFY)\b[^;]*;?\s*$", re.IGNORECASE)
+
+# ``DO $tag$ body $tag$ [LANGUAGE plpgsql]`` — the dollar-quoted body.
+_DO_BLOCK_RE = re.compile(
+    r"(?is)^\s*DO\s+(?:LANGUAGE\s+\w+\s+)?\$(?P<tag>[A-Za-z_]*)\$(?P<body>.*?)\$(?P=tag)\$"
+    r"(?:\s+LANGUAGE\s+\w+)?\s*;?\s*$"
+)
+
+
 #: Reject a statement string longer than this before handing it to sqlglot. 1 MB
 #: is far larger than any real query yet small enough that a flood of oversized
 #: statements can't pin the parser.
 MAX_SQL_LENGTH = 1_000_000
+
+
+def _resolve_group_by_ordinals(root: exp.Expression) -> None:
+    """Rewrite ``GROUP BY 1, 2`` positional references to the select-list
+    expressions they name, like Postgres' parse analysis (an alias target
+    groups by its inner expression). An out-of-range ordinal is 42P10."""
+    for sel in root.find_all(exp.Select):
+        group = sel.args.get("group")
+        if group is None:
+            continue
+        exprs = sel.expressions
+        new: list[exp.Expression] = []
+        for g in group.expressions:
+            if isinstance(g, exp.Literal) and not g.is_string and str(g.this).isdigit():
+                i = int(g.this)
+                if not 1 <= i <= len(exprs):
+                    raise errors.SQLError("42P10", f"GROUP BY position {i} is not in select list")
+                target = exprs[i - 1]
+                inner = target.this if isinstance(target, exp.Alias) else target
+                new.append(inner.copy())
+            else:
+                new.append(g)
+        group.set("expressions", new)
+
+
+_ESTRING_SIMPLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _decode_estrings(sql: str) -> str:
+    """Rewrite every ``E'…'`` escape-string literal into an equivalent standard
+    literal BEFORE sqlglot parses.
+
+    sqlglot's tokenizer half-decodes E-strings (simple escapes and ``\\\\``),
+    which loses the distinction between ``E'\\x5c'`` (a backslash byte) and
+    ``E'\\\\x5c'`` (the four characters ``\\x5c``) — decoding here with PG's
+    full escape grammar (simple controls, 1-3 digit octal, ``\\xHH``,
+    ``\\uXXXX``/``\\UXXXXXXXX``, any other escaped char standing for itself)
+    keeps the exact value. Comments, quoted identifiers, dollar-quoted bodies,
+    and plain literals pass through untouched."""
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "-" and sql[i : i + 2] == "--":  # line comment
+            j = sql.find("\n", i)
+            j = n if j == -1 else j + 1
+            out.append(sql[i:j])
+            i = j
+        elif c == "/" and sql[i : i + 2] == "/*":  # block comment
+            j = sql.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            out.append(sql[i:j])
+            i = j
+        elif c == '"':  # quoted identifier
+            j = i + 1
+            while j < n:
+                if sql[j] == '"':
+                    if sql[j + 1 : j + 2] == '"':
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+        elif c == "$" and (m := re.match(r"\$[A-Za-z_]*\$", sql[i:])):  # dollar quote
+            tag = m.group(0)
+            j = sql.find(tag, i + len(tag))
+            j = n if j == -1 else j + len(tag)
+            out.append(sql[i:j])
+            i = j
+        elif c == "'":  # plain literal — skip over '' doubling
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if sql[j + 1 : j + 2] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+        elif (
+            c in "eE"
+            and sql[i + 1 : i + 2] == "'"
+            and not (i and (sql[i - 1].isalnum() or sql[i - 1] in "_$\"'"))
+        ):
+            value, i = _consume_estring(sql, i + 2)
+            out.append("'" + value.replace("'", "''") + "'")
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _consume_estring(sql: str, i: int) -> tuple[str, int]:
+    """Decode the body of an ``E'…'`` literal starting after the opening quote;
+    returns ``(decoded_value, index_after_closing_quote)``."""
+    n = len(sql)
+    buf: list[str] = []
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            if sql[i + 1 : i + 2] == "'":  # doubled quote
+                buf.append("'")
+                i += 2
+                continue
+            return "".join(buf), i + 1
+        if c != "\\" or i + 1 >= n:
+            buf.append(c)
+            i += 1
+            continue
+        nxt = sql[i + 1]
+        if nxt in _ESTRING_SIMPLE:
+            buf.append(_ESTRING_SIMPLE[nxt])
+            i += 2
+        elif nxt in "01234567":
+            j = i + 1
+            while j < min(i + 4, n) and sql[j] in "01234567":
+                j += 1
+            buf.append(chr(int(sql[i + 1 : j], 8)))
+            i = j
+        elif nxt in "xX":
+            j = i + 2
+            while j < min(i + 4, n) and sql[j] in "0123456789abcdefABCDEF":
+                j += 1
+            if j == i + 2:
+                buf.append(nxt)
+                i += 2
+            else:
+                buf.append(chr(int(sql[i + 2 : j], 16)))
+                i = j
+        elif nxt in "uU":
+            width = 4 if nxt == "u" else 8
+            digits = sql[i + 2 : i + 2 + width]
+            if len(digits) == width and all(d in "0123456789abcdefABCDEF" for d in digits):
+                buf.append(chr(int(digits, 16)))
+                i += 2 + width
+            else:
+                raise errors.SQLError("22025", "invalid Unicode escape value")
+        else:
+            buf.append(nxt)
+            i += 2
+    return "".join(buf), i  # unterminated — sqlglot will raise the syntax error
 
 
 def parse(sql: str) -> list[exp.Expression]:
@@ -9309,6 +9840,29 @@ def parse(sql: str) -> list[exp.Expression]:
     move = _MOVE_RE.match(sql)
     if move is not None:
         return [exp.Command(this="MOVE", expression=exp.Literal.string(move.group("tail")))]
+    begin = _BEGIN_CHARACTERISTICS_RE.match(sql)
+    if begin is not None:
+        return [exp.Transaction(modes=[begin.group("tail")])]
+    # LISTEN / NOTIFY / UNLISTEN — sqlglot mis-parses these; carry the raw text
+    # as a Command the engine's pubsub handler executes. (run_sql intercepts
+    # them pre-parse; this covers the extended-protocol Parse path.)
+    if _PUBSUB_HEAD_RE.match(sql):
+        return [exp.Command(this="PUBSUB", expression=exp.Literal.string(sql))]
+    # ``DO $$ … $$ [language plpgsql]`` — the body is handled by the engine's
+    # minimal plpgsql interpreter (RAISE notices/exceptions).
+    do_m = _DO_BLOCK_RE.match(sql)
+    if do_m is not None:
+        return [exp.Command(this="DO", expression=exp.Literal.string(do_m.group("body")))]
+    # ``SET TRANSACTION <characteristics>`` — sqlglot rejects some spellings
+    # (``SET TRANSACTION DEFERRABLE``); route every form to the Command SET
+    # handler, which applies the characteristics to the open transaction.
+    set_txn = _SET_TRANSACTION_RE.match(sql)
+    if set_txn is not None:
+        return [
+            exp.Command(
+                this="SET", expression=exp.Literal.string(f"TRANSACTION {set_txn.group('tail')}")
+            )
+        ]
     # sqlglot parses ``RELEASE x`` but not the equivalent ``RELEASE SAVEPOINT x``
     # (the standard form SQLAlchemy / psycopg emit) — drop the redundant keyword.
     # Savepoint commands are standalone, so this can't touch a string literal.
@@ -9323,9 +9877,21 @@ def parse(sql: str) -> list[exp.Expression]:
     sql = _COMMENT_NULL_RE.sub(lambda m: f"{m.group(1)}'{UNCOMMENT_SENTINEL}'{m.group(2)}", sql)
     # ``COPY … TO STDOUT (FORMAT csv)`` — insert the WITH sqlglot requires.
     sql = _COPY_BARE_OPTIONS_RE.sub(r"\1 WITH (", sql)
+    # sqlglot can't parse a negative numeric scale (``::numeric(2,-3)``) —
+    # rewrite it to a sentinel value the typmod encoder undoes (the cast
+    # evaluator ignores precision/scale, so only the descriptor sees it).
+    sql = _NEGSCALE_RE.sub(
+        lambda m: f"{m.group(1)}{typemap.NEGSCALE_SENTINEL + int(m.group(2))}{m.group(3)}", sql
+    )
+    # Decode E'…' escape strings ourselves — sqlglot's half-decoding is lossy.
+    if "e'" in sql or "E'" in sql:
+        sql = _decode_estrings(sql)
     try:
-        return [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
-    except sqlglot.errors.ParseError as exc:
+        stmts = [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
+        for s in stmts:
+            _resolve_group_by_ordinals(s)
+        return stmts
+    except (sqlglot.errors.ParseError, sqlglot.errors.TokenError) as exc:
         raise errors.syntax_error(str(exc).splitlines()[0]) from exc
     except RecursionError as exc:
         # A deeply-nested statement (e.g. hundreds of parentheses) blows Python's

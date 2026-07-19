@@ -115,10 +115,42 @@ pub(crate) fn query_filter_error(filter: &Document) -> CommandError {
             format!("Unrecognized expression '{op}'"),
         );
     }
+    // An invalid `$jsonSchema` keyword carries mongod's own code (9
+    // FailedToParse / 14 TypeMismatch), not the generic BadValue.
+    if let Some((code, name, msg)) = json_schema_error_in_filter(filter) {
+        return CommandError::new(code, name, msg);
+    }
     match secantus_core::query::first_unknown_operator(filter) {
         Some(op) => CommandError::new(2, "BadValue", format!("unsupported query operator: {op}")),
         None => CommandError::new(2, "BadValue", "unsupported or invalid query filter"),
     }
+}
+
+/// The first invalid `$jsonSchema` keyword violation anywhere in `filter`
+/// (recursing through `$and`/`$or`/`$nor`), as mongod's (code, codeName,
+/// errmsg). mongod validates schema keywords at parse time, so the command
+/// entry points check this up-front — even against an empty collection.
+pub(crate) fn json_schema_error_in_filter(
+    filter: &Document,
+) -> Option<(i32, &'static str, String)> {
+    for (k, v) in filter.iter() {
+        if k == "$jsonSchema" {
+            if let Some(e) = secantus_core::query::json_schema_keyword_error(v) {
+                return Some(e);
+            }
+        } else if (k == "$and" || k == "$or" || k == "$nor") && matches!(v, Bson::Array(_)) {
+            if let Bson::Array(arr) = v {
+                for sub in arr {
+                    if let Bson::Document(d) = sub {
+                        if let Some(e) = json_schema_error_in_filter(d) {
+                            return Some(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The first unrecognised expression operator reachable through a `$expr`
@@ -226,6 +258,12 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("Unrecognized expression '{op}'"),
         )
         .into_reply());
+    }
+    // Same parse-time treatment for an invalid `$jsonSchema` keyword: mongod
+    // rejects it (9 FailedToParse / 14 TypeMismatch) before any scan, even on
+    // an empty collection — the per-doc path would silently ignore it.
+    if let Some((code, name, msg)) = json_schema_error_in_filter(&filter) {
+        return Ok(CommandError::new(code, name, msg).into_reply());
     }
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0).max(0) as usize;
     let limit = doc.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize; // 0 ⇒ no limit
@@ -464,20 +502,32 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         projection = None;
     }
 
-    // The `firstBatch` goes straight onto the wire reply, so produce it as
-    // `Bson` directly and only encode the cursor *remainder* (which the registry
-    // stores as bytes). This avoids the round-trip the projection path otherwise
-    // pays — encoding the projected docs to bytes only to decode them right back
-    // for the reply. The no-projection path stays in storage bytes end-to-end
-    // and decodes just the firstBatch.
-    let (first_batch, cursor_id): (Vec<Bson>, i64) = match projection {
+    // Two reply shapes:
+    //   * projection — decode+project every firstBatch doc into an owned
+    //     `Bson::Document` (projection inherently materialises); embed directly.
+    //   * no projection — the firstBatch stays as pre-encoded storage blobs; hand
+    //     them to the server via `ctx.pending_batch` so it splices them onto the
+    //     wire (`encode_cursor_reply`) with no decode→re-encode round-trip. The
+    //     reply then carries only the cursor envelope (`{ cursor: { id, ns } }`).
+    // In both cases only the cursor *remainder* (stored as bytes in the registry)
+    // is ever re-encoded.
+    match projection {
         Some(spec) => {
             let projected = project_to_docs(docs, spec, &filter)?;
-            if single_batch {
+            let (first_batch, cursor_id): (Vec<Bson>, i64) = if single_batch {
                 (projected.into_iter().map(Bson::Document).collect(), 0)
             } else {
                 split_docs_into_cursor(projected, batch_size, &ns, cursors)?
-            }
+            };
+            Ok(doc! {
+                "cursor": {
+                    "firstBatch": first_batch,
+                    // Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
+                    "id": Bson::Int64(cursor_id),
+                    "ns": ns,
+                },
+                "ok": 1.0,
+            })
         }
         None => {
             let (first, cursor_id) = if single_batch {
@@ -485,19 +535,19 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             } else {
                 split_into_cursor(docs, batch_size, &ns, cursors)?
             };
-            (docs_to_bson(first)?, cursor_id)
+            ctx.pending_batch = Some(crate::PendingBatch {
+                batch_field: "firstBatch",
+                batch: first,
+            });
+            Ok(doc! {
+                "cursor": {
+                    "id": Bson::Int64(cursor_id),
+                    "ns": ns,
+                },
+                "ok": 1.0,
+            })
         }
-    };
-
-    Ok(doc! {
-        "cursor": {
-            "firstBatch": first_batch,
-            // Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
-            "id": Bson::Int64(cursor_id),
-            "ns": ns,
-        },
-        "ok": 1.0,
-    })
+    }
 }
 
 /// Split the ordered result into `firstBatch` + a registered cursor for the
@@ -795,6 +845,16 @@ fn project_to_docs(
     };
     docs.iter()
         .map(|bytes| {
+            // Fast path: a pure top-level inclusion spec projects straight off
+            // the raw BSON, decoding only the included fields (not the whole
+            // document). Anything else — exclusion, dotted, operators,
+            // positional — falls back to the full decode + `apply_projection`.
+            if let Ok(raw) = bson::RawDocument::from_bytes(bytes) {
+                if let Some(projected) = secantus_core::projection::apply_projection_raw(raw, spec)
+                {
+                    return Ok(projected);
+                }
+            }
             let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
                 CommandError::new(
                     1,

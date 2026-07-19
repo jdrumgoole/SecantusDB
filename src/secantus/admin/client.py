@@ -15,6 +15,7 @@ A thin facade over ``pymongo.MongoClient`` that:
 
 from __future__ import annotations
 
+import datetime as _dt
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -93,6 +94,46 @@ def display_uri(uri: str) -> str:
     # status badge.
     path = parts.path.rstrip("/")
     return urlunsplit((parts.scheme, netloc, path, "", ""))
+
+
+# Schemes pymongo understands. Anything else can't be administered here.
+_MONGO_SCHEMES = ("mongodb://", "mongodb+srv://")
+
+# Schemes we can name specifically in the error, because a user pointing
+# the admin console at one is making an understandable mistake rather
+# than a typo.
+_KNOWN_FOREIGN_SCHEMES = {
+    "postgres": "PostgreSQL",
+    "postgresql": "PostgreSQL",
+}
+
+
+def check_supported_uri(uri: str) -> None:
+    """Raise ``ValueError`` if ``uri`` isn't something this console can drive.
+
+    SecantusDB also ships a PostgreSQL-wire SQL server, and it is a
+    reasonable guess that the admin console can administer it. It cannot:
+    every page here speaks the MongoDB wire protocol through pymongo.
+    Without this check a ``postgresql://`` URI reaches pymongo and fails
+    with an opaque parse error that doesn't explain the real problem, so
+    say it plainly at the boundary instead.
+    """
+    candidate = (uri or "").strip()
+    if not candidate:
+        raise ValueError("URI is required")
+    if candidate.startswith(_MONGO_SCHEMES):
+        return
+    scheme = candidate.split("://", 1)[0].lower() if "://" in candidate else ""
+    friendly = _KNOWN_FOREIGN_SCHEMES.get(scheme)
+    if friendly:
+        raise ValueError(
+            f"This is a {friendly} URI. The admin console speaks the MongoDB "
+            f"wire protocol only — SecantusDB's SQL server has no admin UI. "
+            f"Use a mongodb:// URI for the MongoDB-wire server."
+        )
+    raise ValueError(
+        f"Unsupported URI scheme {scheme or candidate!r}. Expected mongodb:// or mongodb+srv://."
+    )
 
 
 class MongoError(Exception):
@@ -315,6 +356,7 @@ class MongoFacade:
         sparse: bool = False,
         partial_filter_expression: Mapping[str, Any] | None = None,
         expire_after_seconds: int | None = None,
+        collation: Mapping[str, Any] | None = None,
     ) -> str:
         """Create an index. Returns the resulting index name."""
         kwargs: dict[str, Any] = {"unique": unique, "sparse": sparse}
@@ -324,6 +366,12 @@ class MongoFacade:
             kwargs["partialFilterExpression"] = dict(partial_filter_expression)
         if expire_after_seconds is not None:
             kwargs["expireAfterSeconds"] = int(expire_after_seconds)
+        if collation is not None:
+            # Passed through as a plain mapping rather than a
+            # ``pymongo.collation.Collation``: the server validates the
+            # document, and wrapping it here would reject keys pymongo's
+            # helper doesn't know about but the target does.
+            kwargs["collation"] = dict(collation)
         try:
             return self._get_client()[db][coll].create_index(key, **kwargs)
         except OperationFailure as exc:
@@ -416,6 +464,32 @@ class MongoFacade:
             raise MongoError(friendly_error(exc), code=exc.code) from exc
         except PyMongoError as exc:
             raise MongoError(friendly_error(exc)) from exc
+
+    def list_role_names(self, db: str) -> list[str]:
+        """Role names the *connected target* recognises, via ``rolesInfo``.
+
+        The admin UI must not present its own idea of the role catalogue:
+        the target is the authority on what roles exist, and it may be a
+        SecantusDB server, or a ``mongod`` with custom roles defined. Asks
+        for built-ins too, since those are what the picker mostly offers.
+
+        Returns an empty list when the target doesn't support the command
+        or the reply is shaped unexpectedly; the caller falls back to the
+        built-in names rather than rendering an empty picker.
+        """
+        try:
+            reply = self._get_client()[db].command("rolesInfo", 1, showBuiltinRoles=True)
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+        names: list[str] = []
+        for entry in reply.get("roles") or []:
+            if isinstance(entry, dict):
+                name = entry.get("role")
+                if isinstance(name, str) and name:
+                    names.append(name)
+        return names
 
     def grant_roles(
         self,
@@ -626,6 +700,66 @@ class MongoFacade:
                 self._get_client().admin.command(
                     "secantusAdmin.backupArchive", outputPath=str(output_path)
                 )
+            )
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+
+    def archive_base_snapshot(self, archive_dir: str) -> dict[str, Any]:
+        """Issue ``secantusAdmin.archiveBaseSnapshot`` against the target.
+
+        Writes a PITR base snapshot (``base-<headSeq>.tar.gz``) into the
+        server-side ``archive_dir``. Pair with a server started with
+        ``--oplog-archive-dir <archive_dir>`` so pruned oplog rows land
+        in the same directory as segments; recovery then stitches the
+        newest base at-or-before T with the segments after it.
+
+        There is no background scheduler on the server, so this is the
+        call an operator (or a cron) has to make periodically.
+        Returns ``{path, sizeBytes, headSeq, ok}``.
+        """
+        try:
+            return dict(
+                self._get_client().admin.command(
+                    "secantusAdmin.archiveBaseSnapshot", archiveDir=str(archive_dir)
+                )
+            )
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+
+    def restore_to_timestamp(
+        self,
+        source: str,
+        target_dir: str,
+        *,
+        to_time: _dt.datetime | None = None,
+        preserve_oplog: bool = False,
+    ) -> dict[str, Any]:
+        """Issue ``secantusAdmin.restoreToTimestamp`` against the target.
+
+        ``source`` is a PITR archive directory, a ``.tar.gz`` from
+        ``backupArchive``, or a stopped server's data directory. With no
+        ``to_time`` the whole oplog is replayed; otherwise recovery stops
+        at that wall-clock point.
+
+        Offline-shaped like :meth:`restore_archive`: the running server's
+        own storage is never touched — the operator points a *new*
+        SecantusDB at ``target_dir``. Returns the replay stats.
+        """
+        kwargs: dict[str, Any] = {
+            "source": str(source),
+            "targetDir": str(target_dir),
+        }
+        if to_time is not None:
+            kwargs["toTime"] = to_time
+        if preserve_oplog:
+            kwargs["preserveOplog"] = True
+        try:
+            return dict(
+                self._get_client().admin.command("secantusAdmin.restoreToTimestamp", **kwargs)
             )
         except OperationFailure as exc:
             raise MongoError(friendly_error(exc), code=exc.code) from exc

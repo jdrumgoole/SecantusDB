@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from secantus.admin._dbfile import secure_sqlite_file
+
 MAX_PER_URI = 50
 
 VALID_KINDS = ("find", "aggregate", "runCommand")
@@ -56,6 +58,10 @@ class HistoryStore:
         self._time = time_func
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
+        # Console payloads routinely contain real document data, and the
+        # sister table in this same file holds credentialed URIs. Lock the
+        # file down to the owner like the admin token beside it.
+        secure_sqlite_file(self.path)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)

@@ -51,7 +51,8 @@ def server(tmp_path):
 def _extract(archive: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(target, filter="data")
+        # trusted test archive — no `filter` kwarg (older 3.10/3.11 reject it).
+        tar.extractall(target)
 
 
 def _take_backup(client: MongoClient, archive: Path) -> dict[str, Any]:

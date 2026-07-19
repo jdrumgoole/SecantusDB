@@ -37,7 +37,45 @@ def client(server: SecantusDBServer) -> Iterator[MongoClient]:
         mc.close()
 
 
-def _drain(cs, target: int, timeout: float = 8.0) -> list[dict[str, Any]]:
+def _open(cs):
+    """Force a lazily-created change stream to actually open, and return it.
+
+    pymongo's ``ChangeStream.__init__`` does NOT contact the server: the
+    ``aggregate`` that fixes the stream's start position runs on the FIRST
+    iteration. So ``coll.watch(...)`` followed by ``time.sleep(...)``
+    establishes nothing — the start position is captured whenever something
+    first pulls on the cursor, which may be after writes the test intends the
+    stream to observe.
+
+    When that happens the miss is PERMANENT, not slow: the server sets
+    ``start_seq = oplog_tail_seq() + 1`` at aggregate time, so an earlier write
+    is excluded from the stream forever and no amount of polling surfaces it.
+    That is what CI showed — "awaitData did not surface the insert within 30s
+    (insert completed 29.9s ago)", i.e. ~30 poll cycles against an event the
+    stream had already been told to skip.
+
+    ``try_next()`` drives the aggregate and returns None when nothing is
+    pending, which is exactly the "stream is now open and positioned" barrier
+    these tests assumed ``watch()`` gave them.
+    """
+    assert cs.try_next() is None, "stream had events before the test wrote any"
+    return cs
+
+
+def _drain(
+    cs,
+    target: int,
+    timeout: float = 8.0,
+    arrivals: list[float] | None = None,
+) -> list[dict[str, Any]]:
+    """Collect ``target`` events, or give up after ``timeout``.
+
+    ``arrivals``, if given, receives the monotonic timestamp at which each
+    event was observed. Callers timing a wake need that instant, not the time
+    this helper returns: the poll loop below only notices a new event within
+    its 0.05s tick and then joins the runner for up to 0.5s, which is noise on
+    the scale of a sub-second wake bound.
+    """
     events: list[dict[str, Any]] = []
     deadline = time.monotonic() + timeout
     err: list[BaseException] = []
@@ -46,6 +84,8 @@ def _drain(cs, target: int, timeout: float = 8.0) -> list[dict[str, Any]]:
         try:
             for ev in cs:
                 events.append(ev)
+                if arrivals is not None:
+                    arrivals.append(time.monotonic())
                 if len(events) >= target:
                     return
         except BaseException as exc:
@@ -90,8 +130,7 @@ def test_db_watch_sees_all_collections(client: MongoClient) -> None:
     db.create_collection("a")
     db.create_collection("b")
 
-    cs = db.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(db.watch(max_await_time_ms=2000))
 
     db["a"].insert_one({"_id": 1})
     db["b"].insert_one({"_id": 2})
@@ -105,8 +144,7 @@ def test_db_watch_sees_all_collections(client: MongoClient) -> None:
 def test_cluster_watch_sees_all_databases(client: MongoClient) -> None:
     client["csdb_cluster_a"].create_collection("c")
     client["csdb_cluster_b"].create_collection("c")
-    cs = client.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(client.watch(max_await_time_ms=2000))
 
     client["csdb_cluster_a"]["c"].insert_one({"_id": 1})
     client["csdb_cluster_b"]["c"].insert_one({"_id": 2})
@@ -122,8 +160,7 @@ def test_resume_after_token_picks_up_subsequent_events(client: MongoClient) -> N
     coll = db["c"]
     db.create_collection("c")
 
-    cs1 = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs1 = _open(coll.watch(max_await_time_ms=2000))
     coll.insert_one({"_id": 1})
     coll.insert_one({"_id": 2})
     events1 = _drain(cs1, target=2)
@@ -156,8 +193,7 @@ def test_resumed_open_returns_backlog_in_first_batch(
     coll = db["c"]
     db.create_collection("c")
 
-    cs1 = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs1 = _open(coll.watch(max_await_time_ms=2000))
     coll.insert_one({"_id": 0})
     resume_point = _drain(cs1, target=1)[-1]["_id"]
     cs1.close()
@@ -211,8 +247,7 @@ def test_full_document_update_lookup_returns_post_state(client: MongoClient) -> 
     coll = db["c"]
     db.create_collection("c")
     coll.insert_one({"_id": 1, "x": 0})
-    cs = coll.watch(full_document="updateLookup", max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(full_document="updateLookup", max_await_time_ms=2000))
     coll.update_one({"_id": 1}, {"$set": {"x": 5}})
     events = _drain(cs, target=1)
     cs.close()
@@ -225,8 +260,7 @@ def test_full_document_update_lookup_after_delete_is_none(client: MongoClient) -
     coll = db["c"]
     db.create_collection("c")
     coll.insert_one({"_id": 1, "x": 0})
-    cs = coll.watch(full_document="updateLookup", max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(full_document="updateLookup", max_await_time_ms=2000))
     coll.update_one({"_id": 1}, {"$set": {"x": 5}})
     coll.delete_one({"_id": 1})
     events = _drain(cs, target=2)
@@ -260,8 +294,7 @@ def test_invalidate_on_drop_collection(client: MongoClient) -> None:
     db = client["csdb_inv"]
     coll = db["c"]
     db.create_collection("c")
-    cs = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000))
     coll.insert_one({"_id": 1})
     coll.drop()
     events = _drain(cs, target=3)
@@ -290,28 +323,74 @@ def test_invalidate_on_rename(client: MongoClient) -> None:
 
 
 def test_await_data_blocks_then_wakes_on_insert(client: MongoClient) -> None:
+    """awaitData must block on an idle stream and wake when a write lands.
+
+    Timing here is split in two ON PURPOSE, because conflating the halves is
+    what made this test flake under CI load (seen on #512: 0 events instead of
+    1, passing on rerun of the same commit).
+
+    What this test pins is that a stream idling in awaitData still SURFACES a
+    later write. Everything before the wake (starting a thread, its sleep, the
+    insert round-trip) is setup, and on a loaded CI runner — four xdist workers
+    sharing four vCPUs, each insert paying a journal + checkpoint fsync in the
+    durable lane — that setup can take seconds. The previous version measured
+    one budget from thread start and asserted both halves against it, so
+    scheduling and fsync noise was charged against CORRECTNESS: the drain
+    deadline could expire before the inserting thread had even run, and the
+    failure read as "the event never arrived" rather than "the box was busy".
+
+    The latency bound below is a loose sanity check, not the promptness proof:
+    with max_await_time_ms=1000 pymongo re-polls, so an event surfaces within a
+    window or two even if nothing woke early. ``test_await_data_write_between_
+    drain_and_wait_wakes_promptly`` is the test that pins prompt-wake
+    semantics, and it does so deterministically via a monkeypatched drain
+    rather than by racing a clock.
+
+    So: the drain gets a deliberately generous ceiling (it returns in ~1s when
+    healthy, and only a genuine failure to wake spends it), while the latency
+    bound is measured from the instant the insert actually COMPLETED — which
+    the inserting thread records — to the instant the event arrived.
+    """
     db = client["csdb_block"]
     coll = db["c"]
     db.create_collection("c")
-    cs = coll.watch(max_await_time_ms=5000)
-    time.sleep(0.3)
+    # Per-getMore await window well under the drain ceiling, so pymongo
+    # re-polls several times rather than staking everything on one window.
+    cs = _open(coll.watch(max_await_time_ms=1000))
 
-    delay = 0.6
+    insert_done_at: list[float] = []
+    insert_err: list[BaseException] = []
 
     def insert_after_delay() -> None:
-        time.sleep(delay)
-        coll.insert_one({"_id": 1, "x": 1})
+        try:
+            time.sleep(0.6)
+            coll.insert_one({"_id": 1, "x": 1})
+            insert_done_at.append(time.monotonic())
+        except BaseException as exc:  # surfaced below, not swallowed
+            insert_err.append(exc)
 
     inserter = threading.Thread(target=insert_after_delay, daemon=True)
-    start = time.monotonic()
+    arrivals: list[float] = []
     inserter.start()
-    events = _drain(cs, target=1, timeout=5.0)
-    elapsed = time.monotonic() - start
+    events = _drain(cs, target=1, timeout=30.0, arrivals=arrivals)
     cs.close()
-    inserter.join(timeout=2.0)
-    assert len(events) == 1
-    # Should wake within ~2 * delay of the insert; rough bound.
-    assert elapsed < delay + 2.5
+    inserter.join(timeout=10.0)
+
+    if insert_err:
+        raise AssertionError(f"the inserting thread failed: {insert_err[0]!r}")
+    # Distinguish "the write never happened" from "the stream never woke" —
+    # the old assertion reported both as `0 == 1`.
+    assert insert_done_at, "the inserting thread never completed its write"
+    assert len(events) == 1, (
+        f"awaitData did not surface the insert within 30s "
+        f"(insert completed {time.monotonic() - insert_done_at[0]:.1f}s ago)"
+    )
+
+    wake_latency = arrivals[0] - insert_done_at[0]
+    # Worst case the write lands just after a poll opened, so one full
+    # max_await_time_ms (1s) plus a round trip; 5s leaves generous headroom for
+    # a loaded runner while still failing a stream that slept its whole window.
+    assert wake_latency < 5.0, f"woke {wake_latency:.1f}s after the insert"
 
 
 def test_await_data_write_between_drain_and_wait_wakes_promptly(
@@ -361,8 +440,7 @@ def test_resume_after_pruned_token_raises_history_lost(server, client) -> None:
     coll = db["c"]
     db.create_collection("c")
     coll.insert_one({"_id": 1})
-    cs = coll.watch(max_await_time_ms=1000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=1000))
     coll.insert_one({"_id": 2})
     events = _drain(cs, target=1)
     cs.close()
@@ -400,8 +478,7 @@ def test_replace_emits_replace_operation_type(client: MongoClient) -> None:
     db.create_collection("c")
     coll.insert_one({"_id": 7, "x": 1})
 
-    cs = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000))
 
     coll.replace_one({"_id": 7}, {"_id": 7, "x": 99, "y": "added"})
 
@@ -462,8 +539,7 @@ def test_create_indexes_emits_change_event(client: MongoClient) -> None:
     coll = db["c"]
     db.create_collection("c")
 
-    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000, show_expanded_events=True))
     coll.create_index([("x", 1)])
 
     events = _drain(cs, target=1)
@@ -487,8 +563,7 @@ def test_drop_indexes_emits_change_event(client: MongoClient) -> None:
     db.create_collection("c")
     coll.create_index([("x", 1)])  # one index to drop
 
-    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000, show_expanded_events=True))
     coll.drop_index("x_1")
 
     events = _drain(cs, target=1)
@@ -497,7 +572,9 @@ def test_drop_indexes_emits_change_event(client: MongoClient) -> None:
     e = events[0]
     assert e["operationType"] == "dropIndexes"
     assert e["ns"] == {"db": "csdb_drop_idx", "coll": "c"}
-    assert e["operationDescription"]["indexes"] == [{"name": "x_1"}]
+    # Full index description since the showExpandedEvents-shape fix (mongod
+    # 7.0.12-probed): {v, key, name}, not just the name.
+    assert e["operationDescription"]["indexes"] == [{"v": 2, "key": {"x": 1}, "name": "x_1"}]
 
 
 def test_create_collection_emits_change_event(client: MongoClient) -> None:
@@ -505,8 +582,7 @@ def test_create_collection_emits_change_event(client: MongoClient) -> None:
     on a db-scoped stream WHEN show_expanded_events is set."""
     db = client["csdb_create_coll"]
     db.create_collection("seed")  # ensure the db exists before watching
-    cs = db.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(db.watch(max_await_time_ms=2000, show_expanded_events=True))
     db.create_collection("foo")
 
     events = _drain(cs, target=1)
@@ -524,8 +600,7 @@ def test_collmod_emits_modify_change_event(client: MongoClient) -> None:
     coll = db["c"]
     db.create_collection("c")
 
-    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000, show_expanded_events=True))
     db.command({"collMod": "c"})
 
     events = _drain(cs, target=1)
@@ -546,8 +621,7 @@ def test_rename_event_has_operation_description_and_collection_uuid(
     db.create_collection("c")
     db.create_collection("dst")  # rename target to drop
 
-    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000, show_expanded_events=True))
     coll.insert_one({"a": 1})
     coll.rename("dst", dropTarget=True)
 
@@ -570,8 +644,7 @@ def test_create_and_modify_suppressed_without_show_expanded_events(
     DDL events — only the stable v1 event set surfaces."""
     db = client["csdb_no_expand_ddl"]
     db.create_collection("seed")
-    cs = db.watch(max_await_time_ms=1000)
-    time.sleep(0.3)
+    cs = _open(db.watch(max_await_time_ms=1000))
     db.create_collection("foo")  # would be a create event if expanded
     db.command({"collMod": "foo"})  # would be a modify event if expanded
     db["seed"].insert_one({"_id": 1})  # the only event a default stream sees
@@ -593,8 +666,7 @@ def test_create_indexes_suppressed_without_show_expanded_events(client: MongoCli
     coll = db["c"]
     db.create_collection("c")
 
-    cs = coll.watch(max_await_time_ms=1000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=1000))
     coll.create_index([("x", 1)])
     # Insert one real event so _drain has something to find — otherwise
     # the await blocks for the full timeout.
@@ -614,8 +686,7 @@ def test_index_lifecycle_at_database_scope(client: MongoClient) -> None:
     db.create_collection("a")
     db.create_collection("b")
 
-    cs = db.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(db.watch(max_await_time_ms=2000, show_expanded_events=True))
     db["a"].create_index([("x", 1)])
     db["b"].create_index([("y", 1)])
 
@@ -662,8 +733,7 @@ def test_split_large_change_stream_events_omitted_by_default(client: MongoClient
     coll = db["c"]
     db.create_collection("c")
 
-    cs = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000))
     coll.insert_one({"_id": 1})
 
     events = _drain(cs, target=1)
@@ -683,8 +753,7 @@ def test_pipeline_update_is_update_event_with_truncated_arrays(client: MongoClie
     coll = db["c"]
     db.create_collection("c")
     coll.insert_one({"_id": 1, "a": 1, "array": ["foo", {"a": "bar"}, 1, 2, 3]})
-    cs = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000))
     coll.update_one({"_id": 1}, [{"$set": {"array": ["foo", {"a": "bar"}]}}])
     events = _drain(cs, target=1)
     cs.close()
@@ -731,3 +800,48 @@ def test_resume_token_tracks_per_event_with_batch_size_one(client: MongoClient) 
     assert cs.try_next() is None
     assert cs.resume_token == tokens[2]
     cs.close()
+
+
+def test_expanded_events_match_mongod_shapes(client: MongoClient) -> None:
+    """showExpandedEvents shapes, verbatim from a mongod 7.0.12 probe:
+    createIndexes / dropIndexes events carry the full index description
+    ({v, key, name} — dropIndexes included, via the key spec captured at drop
+    time), and expanded update events always carry ``disambiguatedPaths``
+    (an empty document when nothing was ambiguous) while unexpanded ones
+    never do."""
+    import time
+
+    db = client["csx"]
+    db.c.insert_one({"_id": 0})
+    cs = db.c.watch(show_expanded_events=True, max_await_time_ms=300)
+    db.c.create_index([("x", 1)])
+    db.c.update_one({"_id": 0}, {"$set": {"a-c": 2}})
+    db.c.drop_indexes()
+    events = []
+    deadline = time.time() + 15
+    while time.time() < deadline and len(events) < 3:
+        ev = cs.try_next()
+        if ev is not None:
+            events.append(ev)
+    cs.close()
+    assert [e["operationType"] for e in events] == ["createIndexes", "update", "dropIndexes"]
+    create_ev, update_ev, drop_ev = events
+    assert create_ev["operationDescription"] == {
+        "indexes": [{"v": 2, "key": {"x": 1}, "name": "x_1"}]
+    }
+    assert update_ev["updateDescription"]["disambiguatedPaths"] == {}
+    assert drop_ev["operationDescription"] == {
+        "indexes": [{"v": 2, "key": {"x": 1}, "name": "x_1"}]
+    }
+
+    # Without the flag: no DDL events, and no disambiguatedPaths key.
+    cs = db.c.watch(max_await_time_ms=300)
+    db.c.create_index([("y", 1)])
+    db.c.update_one({"_id": 0}, {"$set": {"n": 1}})
+    plain = None
+    deadline = time.time() + 15
+    while time.time() < deadline and plain is None:
+        plain = cs.try_next()
+    cs.close()
+    assert plain["operationType"] == "update"
+    assert "disambiguatedPaths" not in plain["updateDescription"]

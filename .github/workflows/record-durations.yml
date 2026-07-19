@@ -1,0 +1,172 @@
+name: Record test durations
+
+# Records per-test wall-clock durations for pytest-split's duration-balanced
+# sharding (see the ``test`` / ``test-windows`` / ``test-durable`` jobs in
+# test.yml) and uploads them as artifacts to be committed into
+# ``ci/durations/``.
+#
+# Why this is a separate, manually-triggered workflow rather than a step in the
+# normal test lanes:
+#
+#   * Recording needs the WHOLE suite in ONE job. The test lanes are sharded, so
+#     each one only ever sees its own slice and could not produce a full file.
+#   * Durations are PER-PLATFORM and the difference is not cosmetic. Measured
+#     from real CI recordings, the sql/core balance genuinely INVERTS between
+#     platforms:
+#
+#         Linux CI    sql= 687s  core=2398s   -> core heavier, 3.49x
+#         Windows CI  sql=2552s  core=1256s   -> sql  heavier, 2.03x
+#
+#     Same suite, same commit, opposite heavy half. That is why the old
+#     path-based sql/core split could not be balanced for both at once, and it
+#     is why a durations file recorded on the wrong OS packs the groups in the
+#     wrong direction.
+#
+#     The MECHANISM is still unmeasured. A plausible hypothesis is process /
+#     connection setup cost — the sql + pgserver suites open many short-lived
+#     connections and subprocesses, which are markedly more expensive on
+#     Windows — but nobody has profiled it, so treat that as a guess.
+#
+#     Two earlier explanations in this file were WRONG and are recorded here so
+#     they are not re-derived: (1) that the cross-driver smokes skip where the
+#     toolchain is absent — they do not, all 80 run on macOS with it installed;
+#     (2) that the inversion was purely a local-measurement artifact — the CI
+#     numbers above show it is real between Linux and Windows. What IS suspect
+#     is macOS-local recording: 12 xdist workers on 12 cores inflates wall time
+#     unevenly, which is a further reason to record on CI rather than a laptop.
+#
+#     Note the split stays CORRECT regardless of which file is used: a wrong
+#     durations file mis-balances the groups but can never drop or duplicate a
+#     test, because pytest-split partitions the collected set.
+#   * They only need re-recording when the suite's shape shifts materially
+#     (a big new module, a slow test cluster added or removed), not per push.
+#
+# Re-record with:  gh workflow run record-durations.yml
+# Then download the artifacts and commit them under ci/durations/.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: windows-latest
+            name: windows
+    runs-on: ${{ matrix.os }}
+    # Unsharded, so this is roughly the pre-sharding single-lane wall time
+    # (~18 min) plus setup. 45 gives headroom on the slower Windows runner.
+    timeout-minutes: 45
+    env:
+      UV_PYTHON: "3.10"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Checkout the WiredTiger submodule
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
+
+      - name: Free up disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+          df -h /
+
+      - name: Disable Defender real-time scanning (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+        continue-on-error: true
+
+      - name: Put temp files on the runner work disk (Windows)
+        # MUST mirror the ``test-windows`` job's twin step. pytest's tmp_path
+        # (→ every WT home) follows TMP/TEMP, which points at the small OS-disk
+        # profile temp dir; RUNNER_TEMP is on the work disk provisioned for
+        # build I/O.
+        #
+        # Omitting this killed the first recording run: this job runs the WHOLE
+        # suite UNSHARDED, so it retains roughly double a shard's tmp_path
+        # footprint, filled the OS disk, and took the runner down hard at
+        # ~22 min — the job reported failure with its later steps still
+        # "pending" and NO logs uploaded at all (a blob-not-found), which is the
+        # signature of a runner death rather than a failing step. Sharded lanes
+        # never hit it because each holds only half the tree.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install toolchain and MongoDB CLI tools (Linux)
+        # MUST match the ``test`` job's toolchain exactly. The whole point of a
+        # per-platform durations file is that it reflects what actually runs on
+        # that platform — if mongosh were missing here but present in the test
+        # lane, every cross-driver smoke would record as a ~0s skip and the
+        # shards would be packed as though those minutes did not exist.
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+          sudo apt-get update
+          sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
+
+      - name: Install swig (Windows)
+        if: runner.os == 'Windows'
+        run: choco install swig --yes --no-progress
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.10
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra admin
+
+      - name: Install tzdata (Windows)
+        if: runner.os == 'Windows'
+        run: uv pip install tzdata
+
+      - name: Record durations
+        # ``-p no:randomly`` pins collection order for the recording run. The
+        # order does not affect the recorded numbers, but pytest-randomly is in
+        # the dev extra and active by default, and a stable order keeps the
+        # emitted JSON diffable against the previous recording.
+        shell: bash
+        run: |
+          mkdir -p ci/durations
+          uv run python -m pytest \
+            -p no:randomly \
+            --store-durations \
+            --durations-path=ci/durations/${{ matrix.name }}.json \
+            --timeout=120 --timeout-method=thread --max-worker-restart=3
+
+      - name: Summarise
+        shell: bash
+        run: |
+          uv run python - <<'PY'
+          import json, os
+          p = f"ci/durations/{os.environ['NAME']}.json"
+          d = json.load(open(p))
+          tot = sum(d.values())
+          print(f"{p}: {len(d)} tests, {tot:.0f}s total, median {sorted(d.values())[len(d)//2]:.2f}s")
+          PY
+        env:
+          NAME: ${{ matrix.name }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: durations-${{ matrix.name }}
+          path: ci/durations/${{ matrix.name }}.json
+          if-no-files-found: error

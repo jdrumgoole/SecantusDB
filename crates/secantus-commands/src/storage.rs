@@ -37,6 +37,11 @@ pub struct UpdateOutcome {
     pub modified: usize,
     /// The `_id` an `upsert` inserted when nothing matched, else `None`.
     pub upserted_id: Option<Bson>,
+    /// The post-image of a single-doc (`multi == false`) update / upsert,
+    /// captured inside the storage write. `findAndModify {new: true}` must
+    /// return this rather than re-`find`ing — the re-read races concurrent
+    /// writers and can hand two clients the same "new" document.
+    pub post_image: Option<Document>,
 }
 
 /// An E11000 duplicate-key conflict's payload (boxed in [`StorageError`] to keep

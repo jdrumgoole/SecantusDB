@@ -75,12 +75,15 @@ fn apply_stage(
             Ok(out)
         }
         "$limit" => {
-            let n = positive_int(spec)?;
+            let n = stage_nonneg_int(spec)?;
+            if n == 0 {
+                return Err(Fallback); // Python raises 15958 "the limit must be positive"
+            }
             docs.truncate(n);
             Ok(docs)
         }
         "$skip" => {
-            let n = positive_int(spec)?;
+            let n = stage_nonneg_int(spec)?;
             Ok(if n >= docs.len() {
                 Vec::new()
             } else {
@@ -89,8 +92,12 @@ fn apply_stage(
         }
         "$count" => {
             let Bson::String(field) = spec else {
-                return Err(Fallback); // Python raises on non-string
+                return Err(Fallback); // Python raises on non-string (40156)
             };
+            // empty (40157) / $-prefixed (40158) / dotted (40160) / "_id" (15948).
+            if field.is_empty() || field.starts_with('$') || field.contains('.') || field == "_id" {
+                return Err(Fallback);
+            }
             let mut out = Document::new();
             out.insert(
                 field.clone(),
@@ -98,7 +105,13 @@ fn apply_stage(
             );
             Ok(vec![out])
         }
-        "$project" => map_docs(docs, |d| project_one(&d, spec_doc(spec)?, vars)),
+        "$project" => {
+            let sd = spec_doc(spec)?;
+            if sd.is_empty() {
+                return Err(Fallback); // Python raises 51272 (needs >= 1 field)
+            }
+            map_docs(docs, |d| project_one(&d, sd, vars))
+        }
         "$addFields" | "$set" => map_docs(docs, |d| add_fields_one(d, spec_doc(spec)?, vars)),
         "$unset" => {
             let paths_list = unset_paths(spec)?;
@@ -207,12 +220,23 @@ fn facet_stage(
     let Bson::Document(s) = spec else {
         return Err(Fallback);
     };
+    if s.is_empty() {
+        return Err(Fallback); // Python raises 40169 (must be a non-empty object)
+    }
     let n = s.len();
     let mut out = Document::new();
     for (i, (name, sub)) in s.iter().enumerate() {
         let Bson::Array(sub_pipeline) = sub else {
-            return Err(Fallback); // Python raises (entry must be a pipeline array)
+            return Err(Fallback); // Python raises 40170 (entry must be an array)
         };
+        // Each stage must be a non-empty object and not a nested $facet — else
+        // defer so Python raises 40171 / 40600.
+        for stage in sub_pipeline {
+            match stage {
+                Bson::Document(d) if !d.is_empty() && !d.contains_key("$facet") => {}
+                _ => return Err(Fallback),
+            }
+        }
         // The last sub-pipeline can consume the input docs directly; earlier
         // ones each need their own copy.
         let input = if i + 1 == n {
@@ -239,14 +263,22 @@ fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
         return Err(Fallback);
     };
     if d.is_empty() {
-        return Err(Fallback); // empty spec is a no-op in Python; let it handle it
+        return Err(Fallback); // Python raises 15976 (must have at least one key)
     }
     let mut out = Vec::with_capacity(d.len());
     for (field, dir) in d {
-        let n = as_int_like(dir).ok_or(Fallback)?;
+        // mongod accepts int/long ±1 or a whole double ±1.0. A bool is "Illegal
+        // key" (15974), not 1/-1 (so don't let as_int_like coerce true -> 1); a
+        // numeric non-±1 defers so Python raises 15975; non-numeric -> 15974.
+        let n = match dir {
+            Bson::Boolean(_) => None,
+            Bson::Int32(_) | Bson::Int64(_) => as_int_like(dir),
+            Bson::Double(f) if f.fract() == 0.0 => Some(*f as i128),
+            _ => None,
+        };
         match n {
-            1 => out.push((field.clone(), false)),
-            -1 => out.push((field.clone(), true)),
+            Some(1) => out.push((field.clone(), false)),
+            Some(-1) => out.push((field.clone(), true)),
             _ => return Err(Fallback),
         }
     }
@@ -288,20 +320,28 @@ fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
 
 fn unwind_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     let (path, preserve_null, include_index) = match spec {
-        Bson::String(s) => (s.trim_start_matches('$').to_string(), false, None),
+        Bson::String(s) => {
+            if !s.starts_with('$') {
+                return Err(Fallback); // bare path -> Python raises 28818
+            }
+            (s.trim_start_matches('$').to_string(), false, None)
+        }
         Bson::Document(d) => {
             let Some(Bson::String(raw)) = d.get("path") else {
-                return Err(Fallback); // non-string path -> Python raises
+                return Err(Fallback); // non-string path -> Python raises 28808
             };
+            if !raw.starts_with('$') {
+                return Err(Fallback); // bare path -> Python raises 28818
+            }
             let preserve = match d.get("preserveNullAndEmptyArrays") {
                 None => false,
                 Some(Bson::Boolean(b)) => *b,
-                // Python's `bool(...)` of arbitrary values -> defer the odd cases.
-                _ => return Err(Fallback),
+                _ => return Err(Fallback), // non-bool -> Python raises 28809
             };
             let include = match d.get("includeArrayIndex") {
                 None | Some(Bson::Null) => None,
-                Some(Bson::String(s)) => Some(s.clone()),
+                // A non-empty, non-`$`-prefixed string; else defer (28810 / 28822).
+                Some(Bson::String(s)) if !s.is_empty() && !s.starts_with('$') => Some(s.clone()),
                 _ => return Err(Fallback),
             };
             (raw.trim_start_matches('$').to_string(), preserve, include)
@@ -376,11 +416,21 @@ fn spec_doc(spec: &Bson) -> R<&Document> {
 
 /// `int(spec)` for $limit/$skip, restricted to non-negative integers (negative
 /// values hit Python's slice semantics — deferred; floats also defer).
-fn positive_int(spec: &Bson) -> R<usize> {
-    match as_int_like(spec) {
-        Some(n) if n >= 0 => Ok(n as usize),
-        _ => Err(Fallback),
+/// A `$limit` / `$skip` argument, mongod-style: an int or a whole-number double
+/// is the count; a bool / non-number, a fractional double, or a negative value
+/// defers to the Python oracle (which raises mongod's 5107201 / 5107200). `$limit`
+/// additionally rejects zero at the call site (15958).
+fn stage_nonneg_int(spec: &Bson) -> R<usize> {
+    let n = match spec {
+        Bson::Int32(n) => *n as i64,
+        Bson::Int64(n) => *n,
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
+        _ => return Err(Fallback), // bool / fractional / non-number
+    };
+    if n < 0 {
+        return Err(Fallback); // Python raises "Expected a non-negative number"
     }
+    Ok(n as usize)
 }
 
 fn unset_paths(spec: &Bson) -> R<Vec<String>> {

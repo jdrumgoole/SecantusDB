@@ -53,6 +53,22 @@ def test_in_and_nin() -> None:
     assert matches({"a": 4}, {"a": {"$nin": [1, 2, 3]}})
 
 
+def test_in_nin_argument_validation() -> None:
+    # mongod: $in/$nin need an array (else BadValue), and no element may be a
+    # document with a $-prefixed key ("cannot nest $ under $in").
+    for op in ("$in", "$nin"):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": 5}, {"a": {op: 5}})
+        assert exc.value.code == 2 and "needs an array" in str(exc.value)
+    for bad in ({"$regex": "x"}, {"$x": 1}):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": 5}, {"a": {"$in": [1, bad]}})
+        assert exc.value.code == 2 and "cannot nest $ under $in" in str(exc.value)
+    # A plain subdocument element and a regex literal are still valid.
+    assert not matches({"a": 5}, {"a": {"$in": [{"x": 1}]}})
+    assert matches({"a": "hi"}, {"a": {"$in": [Regex("^h")]}})
+
+
 def test_exists() -> None:
     assert matches({"a": None}, {"a": {"$exists": True}})
     assert matches({}, {"a": {"$exists": False}})
@@ -136,15 +152,70 @@ def test_type_list_of_aliases() -> None:
     assert not matches({"a": 1.5}, {"a": {"$type": ["string", "int"]}})
 
 
+def test_type_argument_validation() -> None:
+    # mongod: unknown alias / out-of-range / fractional code -> 2, bool -> 14.
+    for t in ("notatype", 0, 100, 2.5):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": 5}, {"a": {"$type": t}})
+        assert exc.value.code == 2, t
+    with pytest.raises(QueryError) as exc:
+        matches({"a": 5}, {"a": {"$type": True}})
+    assert exc.value.code == 14
+    # code 0 carries the $exists hint; an array validates each element.
+    with pytest.raises(QueryError) as exc:
+        matches({"a": 5}, {"a": {"$type": 0}})
+    assert "Instead use {$exists:false}" in str(exc.value)
+    with pytest.raises(QueryError):
+        matches({"a": 5}, {"a": {"$type": ["int", "notatype"]}})
+    # Valid numeric codes (incl. a whole double and minKey -1) are accepted.
+    assert matches({"a": 5}, {"a": {"$type": 16}})
+    assert matches({"a": 5.0}, {"a": {"$type": 1.0}})  # double code -> matches double
+    assert not matches({"a": 5}, {"a": {"$type": -1}})  # minKey: valid, no match
+
+
 def test_size() -> None:
     assert matches({"tags": [1, 2, 3]}, {"tags": {"$size": 3}})
     assert not matches({"tags": [1, 2]}, {"tags": {"$size": 3}})
     assert not matches({"tags": "abc"}, {"tags": {"$size": 3}})
 
 
+def test_size_argument_validation() -> None:
+    """$size validates its argument like mongod 7.0.12: an integer-valued float
+    is accepted (2.0 == 2); a non-integer float, a negative value, a string, or
+    a bool each raise a parse error (previously a negative silently no-matched,
+    a bool was accepted as 1, and 2.0 was wrongly rejected)."""
+    # Integer-valued float accepted.
+    assert matches({"a": [1, 2]}, {"a": {"$size": 2.0}})
+    assert not matches({"a": [1]}, {"a": {"$size": 2.0}})
+    # Each invalid argument raises.
+    for bad in (-1, 2.5, "2", True):
+        with pytest.raises(QueryError):
+            matches({"a": [1, 2]}, {"a": {"$size": bad}})
+
+
 def test_all() -> None:
     assert matches({"tags": ["a", "b", "c"]}, {"tags": {"$all": ["a", "b"]}})
     assert not matches({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}})
+
+
+def test_all_scalar_field_and_empty() -> None:
+    """mongod treats a *scalar* field like a one-element array for ``$all``
+    (verified against mongod 7.0.12): ``{tags: {$all: ["red"]}}`` matches both
+    ``tags: ["red", ...]`` and scalar ``tags: "red"`` — previously the scalar
+    was silently missed. Regex elements match the scalar as a pattern too. An
+    empty ``$all`` matches nothing (not everything), and ``$elemMatch`` clauses
+    still require an actual array."""
+    from bson import Regex
+
+    assert matches({"tags": "red"}, {"tags": {"$all": ["red"]}})
+    assert matches({"tags": "red"}, {"tags": {"$all": [Regex("^red$")]}})
+    assert not matches({"tags": "red"}, {"tags": {"$all": ["red", "blue"]}})
+    # $all: [] matches nothing.
+    assert not matches({"tags": ["a", "b"]}, {"tags": {"$all": []}})
+    assert not matches({"tags": "red"}, {"tags": {"$all": []}})
+    # $elemMatch requires an array — a scalar never satisfies it.
+    assert not matches({"tags": "red"}, {"tags": {"$all": [{"$elemMatch": {"$eq": "red"}}]}})
+    assert matches({"tags": ["red"]}, {"tags": {"$all": [{"$elemMatch": {"$eq": "red"}}]}})
 
 
 def test_all_with_elemmatch() -> None:
@@ -155,6 +226,24 @@ def test_all_with_elemmatch() -> None:
     q2 = {"a": {"$all": [{"$elemMatch": {"$gt": 4}}, {"$elemMatch": {"$lt": 2}}]}}
     assert matches({"a": [1, 5, 10]}, q2)
     assert not matches({"a": [5, 10]}, q2)  # nothing < 2
+
+
+def test_all_argument_validation() -> None:
+    # mongod: $all needs an array; if any element is a $-expression it must be an
+    # all-$elemMatch form — a mixed or other $-op element is "no $ expressions".
+    with pytest.raises(QueryError) as exc:
+        matches({"a": [1, 2]}, {"a": {"$all": 5}})
+    assert exc.value.code == 2 and "needs an array" in str(exc.value)
+    for bad in (
+        {"a": {"$all": [1, {"$elemMatch": {"x": 1}}]}},  # mixed
+        {"a": {"$all": [{"$gt": 1}]}},  # non-elemMatch $-doc
+    ):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": [1, 2]}, bad)
+        assert exc.value.code == 2 and "no $ expressions in $all" in str(exc.value)
+    # A pure-scalar form and an all-$elemMatch form remain valid.
+    assert matches({"a": [1, 2, 3]}, {"a": {"$all": [1, 2]}})
+    assert matches({"a": [1, 2, 3]}, {"a": {"$all": [{"$elemMatch": {"$gt": 2}}]}})
 
 
 def test_in_with_regex() -> None:
@@ -169,10 +258,81 @@ def test_in_with_regex() -> None:
     assert not matches({"s": "hello"}, {"s": {"$nin": [Regex("^h")]}})
 
 
+def test_not_argument_validation() -> None:
+    # mongod: $not needs a regex or a non-empty document; scalar/array/bool ->
+    # "needs a regex or a document", empty doc -> "cannot be empty" (both code 2).
+    for bad in (5, "x", [], True):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": 5}, {"a": {"$not": bad}})
+        assert exc.value.code == 2 and "needs a regex or a document" in str(exc.value)
+    with pytest.raises(QueryError) as exc:
+        matches({"a": 5}, {"a": {"$not": {}}})
+    assert exc.value.code == 2 and "cannot be empty" in str(exc.value)
+    # A regex and an operator document are valid.
+    assert matches({"a": 5}, {"a": {"$not": Regex("x")}})
+    assert not matches({"a": 5}, {"a": {"$not": {"$gt": 3}}})
+
+
+def test_elemmatch_argument_validation() -> None:
+    # mongod: $elemMatch needs an Object; a scalar/array is BadValue.
+    for bad in (5, "x", [1, 2]):
+        with pytest.raises(QueryError) as exc:
+            matches({"a": [1, 2, 3]}, {"a": {"$elemMatch": bad}})
+        assert exc.value.code == 2 and "needs an Object" in str(exc.value)
+    assert matches({"a": [1, 2, 3]}, {"a": {"$elemMatch": {"$gt": 2}}})
+
+
+def test_regex_options_validation() -> None:
+    # mongod: bad flag -> 51108; non-string $options -> 2; $options without
+    # $regex -> 2; non-string $regex -> 2. Valid flags imsxu still work.
+    with pytest.raises(QueryError) as exc:
+        matches({"s": "hi"}, {"s": {"$regex": "h", "$options": "z"}})
+    assert exc.value.code == 51108 and "invalid flag" in str(exc.value)
+    for q in (
+        {"s": {"$regex": "h", "$options": 5}},
+        {"s": {"$options": "i"}},
+        {"s": {"$regex": 5}},
+        {"s": {"$regex": None}},
+    ):
+        with pytest.raises(QueryError) as exc:
+            matches({"s": "hi"}, q)
+        assert exc.value.code == 2, q
+    # Valid options and an empty option string are accepted.
+    assert matches({"s": "Hello"}, {"s": {"$regex": "^h", "$options": "i"}})
+    assert matches({"s": "hello"}, {"s": {"$regex": "^h", "$options": ""}})
+
+
 def test_mod() -> None:
     assert matches({"n": 12}, {"n": {"$mod": [4, 0]}})
     assert matches({"n": 13}, {"n": {"$mod": [4, 1]}})
     assert not matches({"n": 13}, {"n": {"$mod": [4, 0]}})
+
+
+def test_mod_truncation_bool_and_errors() -> None:
+    """$mod fidelity, pinned against mongod 7.0.12: value AND divisor truncate
+    toward zero to integers; bool is excluded (not a number); C-style
+    (truncated) modulo, so -5 % 2 == -1; Decimal128 counts on the Python
+    engine; divisor 0 and a malformed spec raise."""
+    from bson import Decimal128
+
+    # Double values truncate toward zero (previously the Rust server errored).
+    assert matches({"n": 5.0}, {"n": {"$mod": [2, 1]}})
+    assert matches({"n": 5.5}, {"n": {"$mod": [2, 1]}})  # trunc 5
+    assert matches({"n": 4.9}, {"n": {"$mod": [2, 0]}})  # trunc 4
+    # The divisor truncates too: [2.5, 0] divides by 2.
+    assert matches({"n": 4.9}, {"n": {"$mod": [2.5, 0]}})
+    # bool is excluded (Python's True % 2 would have matched).
+    assert not matches({"n": True}, {"n": {"$mod": [2, 1]}})
+    # C-style modulo: -5 % 2 == -1, not 1.
+    assert not matches({"n": -5}, {"n": {"$mod": [2, 1]}})
+    assert matches({"n": -5}, {"n": {"$mod": [2, -1]}})
+    # Decimal128 counts (Python engine).
+    assert matches({"n": Decimal128("5")}, {"n": {"$mod": [2, 1]}})
+    # Errors.
+    with pytest.raises(QueryError):
+        matches({"n": 5}, {"n": {"$mod": [0, 1]}})
+    with pytest.raises(QueryError):
+        matches({"n": 5}, {"n": {"$mod": [2]}})
 
 
 def test_mod_on_array_element() -> None:
@@ -432,6 +592,38 @@ def test_lte_decimal128_vs_float() -> None:
     assert not matches({"x": Decimal128("4.1")}, {"x": {"$lte": 4.0}})
 
 
+def test_range_orders_embedded_documents() -> None:
+    """Two embedded documents order field-by-field under range operators
+    (mongod 7.0.12-probed): first differing key compares as a string, else
+    recurse into the value, else the shorter document sorts first. Previously
+    both servers returned no-match (Python's ``operator.gt`` raises on dicts).
+    Cross-bracket (document vs scalar) still no-matches."""
+    assert matches({"a": {"x": 2}}, {"a": {"$gt": {"x": 1}}})
+    assert matches({"a": {"x": 1, "y": 9}}, {"a": {"$gt": {"x": 1}}})  # longer wins on tie
+    assert matches({"a": {"y": 1}}, {"a": {"$gt": {"x": 1}}})  # key "y" > "x"
+    assert not matches({"a": {"x": 1}}, {"a": {"$gt": {"x": 1}}})  # equal
+    assert matches({"a": {"x": 1}}, {"a": {"$gte": {"x": 1}}})
+    assert matches({"a": {"x": 0}}, {"a": {"$lt": {"x": 1}}})
+    assert matches({"a": {"x": 1}}, {"a": {"$lt": {"x": 1, "y": 5}}})  # shorter sorts first
+    # Type bracket: a document field vs a scalar bound, and a scalar field vs a
+    # document bound, both no-match.
+    assert not matches({"a": {"x": 1}}, {"a": {"$gt": 2}})
+    assert not matches({"a": 2}, {"a": {"$gt": {"x": 1}}})
+
+
+def test_range_orders_arrays_by_full_bson_order() -> None:
+    """Two arrays order element-by-element under range, but each element pair
+    compares by FULL BSON order (type rank first) — mongod ranks a string
+    element above a number, so ``[1, "x"] > [1, 2]``. Previously both servers
+    no-matched a cross-type element pair (Python's list ``<`` raises str vs
+    int). Verified against mongod 7.0.12."""
+    assert matches({"a": [1, "x"]}, {"a": {"$gt": [1, 2]}})  # "x"(str) > 2(num)
+    assert not matches({"a": [1, "x"]}, {"a": {"$lt": [1, 2]}})
+    assert matches({"a": [2, "x"]}, {"a": {"$gt": [1, 2]}})  # decisive first elem
+    assert matches({"a": ["x", 1]}, {"a": {"$gt": [1, 2]}})  # str first > num first
+    assert matches({"a": [1]}, {"a": {"$lt": [1, 2]}})  # shorter prefix sorts first
+
+
 def test_embedded_document_equality_is_ordered_and_exact() -> None:
     """Full embedded-document equality is field-ORDER-sensitive and
     exact (no subset), recursively — a mongod gotcha. Oracle-pinned
@@ -474,3 +666,104 @@ def test_datetime_naive_aware_equality_same_instant():
     # A different instant (offset shifts it) must NOT match.
     other = dt.datetime(2020, 1, 2, 3, 4, 5, tzinfo=dt.timezone(dt.timedelta(hours=2)))
     assert not matches({"at": naive}, {"at": other})
+
+
+def test_json_schema_keyword_validation_errors() -> None:
+    """Parse-time $jsonSchema keyword validation, verbatim from a mongod 7.0
+    probe: unknown keyword / unsupported keyword / draft-4 exclusive-bound
+    rules / multipleOf typing, each with mongod's code."""
+    import pytest
+
+    from secantus.query import QueryError
+
+    for schema, code, frag in [
+        ({"$ref": "#/x"}, 9, "not currently supported"),
+        ({"$schema": "x"}, 9, "not currently supported"),
+        ({"format": "email"}, 9, "not currently supported"),
+        ({"notakeyword": 1}, 9, "Unknown $jsonSchema keyword: notakeyword"),
+        ({"properties": {"n": {"notakeyword": 1}}}, 9, "Unknown $jsonSchema keyword"),
+        ({"items": {"notakeyword": 1}}, 9, "Unknown $jsonSchema keyword"),
+        ({"allOf": [{"notakeyword": 1}]}, 9, "Unknown $jsonSchema keyword"),
+        ({"minimum": 5, "exclusiveMinimum": 6}, 14, "must be a boolean"),
+        ({"exclusiveMinimum": True}, 9, "'minimum' must be a present if"),
+        ({"exclusiveMaximum": True}, 9, "'maximum' must be a present if"),
+        ({"multipleOf": 0}, 9, "must have a positive value"),
+        ({"multipleOf": -2}, 9, "must have a positive value"),
+        ({"multipleOf": "x"}, 14, "must be a number"),
+        ({"multipleOf": True}, 14, "must be a number"),
+        ({"title": 5}, 14, "must be of type string"),
+        (5, 14, "$jsonSchema must be an object"),
+    ]:
+        with pytest.raises(QueryError) as exc:
+            matches({}, {"$jsonSchema": schema})
+        assert exc.value.code == code, schema
+        assert frag in str(exc.value), schema
+
+
+def test_json_schema_draft4_bounds_multipleof_and_tuple_items() -> None:
+    """The newly-implemented keywords match mongod's probed semantics."""
+    ex_min = {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}
+    assert not matches({"n": 6}, {"$jsonSchema": ex_min})
+    assert matches({"n": 7}, {"$jsonSchema": ex_min})
+    assert matches({"n": 6}, {"$jsonSchema": {"properties": {"n": {"minimum": 6}}}})
+
+    mof = {"properties": {"n": {"multipleOf": 2.5}}}
+    assert matches({"n": 7.5}, {"$jsonSchema": mof})
+    assert not matches({"n": 6}, {"$jsonSchema": mof})
+
+    tup = {"properties": {"a": {"items": [{"bsonType": "int"}], "additionalItems": False}}}
+    assert matches({"a": [1]}, {"$jsonSchema": tup})
+    assert not matches({"a": [1, "x"]}, {"$jsonSchema": tup})
+    tup_schema = {
+        "properties": {
+            "a": {"items": [{"bsonType": "int"}], "additionalItems": {"bsonType": "string"}}
+        }
+    }
+    assert matches({"a": [1, "x"]}, {"$jsonSchema": tup_schema})
+    assert not matches({"a": [1, True]}, {"$jsonSchema": tup_schema})
+
+    # Metadata keywords are accepted and ignored, top-level and nested.
+    meta = {"title": "t", "description": "d", "properties": {"n": {"title": "x", "minimum": 1}}}
+    assert matches({"n": 5}, {"$jsonSchema": meta})
+
+
+def test_bits_numeric_arg_validation() -> None:
+    """$bits* accept a whole-number-double mask / bit position (truncated), and
+    reject a fractional / negative / bool one — a bad position with code 2, a bad
+    non-array mask with code 9. mongod 7.0.12-verified."""
+    assert matches({"n": 6}, {"n": {"$bitsAllSet": 6.0}}) is True
+    assert matches({"n": 6}, {"n": {"$bitsAllSet": [1.0, 2.0]}}) is True
+    for query, code in [
+        ({"n": {"$bitsAllSet": 2.5}}, 9),
+        ({"n": {"$bitsAllSet": -1}}, 9),
+        ({"n": {"$bitsAllSet": True}}, 2),
+        ({"n": {"$bitsAllSet": [1.5]}}, 2),
+        ({"n": {"$bitsAllSet": [-1]}}, 2),  # was an uncaught ValueError (code None)
+        ({"n": {"$bitsAllSet": [True]}}, 2),
+        ({"n": {"$bitsAnyClear": 2.5}}, 9),
+        ({"n": {"$bitsAllClear": [-1]}}, 2),
+    ]:
+        with pytest.raises(QueryError) as exc:
+            matches({"n": 6}, query)
+        assert exc.value.code == code, query
+
+
+def test_gte_lte_null_and_exists_truthiness() -> None:
+    """$gte/$lte: null match null + missing (like $eq: null); $exists uses mongod
+    truthiness (only false/0/null are falsy). mongod 7.0.12-verified."""
+    docs = [{"_id": 1, "f": None}, {"_id": 2, "f": 5}, {"_id": 3}]
+
+    def ids(q):
+        return sorted(d["_id"] for d in docs if matches(d, q))
+
+    assert ids({"f": {"$gte": None}}) == [1, 3]  # null + missing (was [])
+    assert ids({"f": {"$lte": None}}) == [1, 3]
+    assert ids({"f": {"$gt": None}}) == []  # nothing strictly above null
+    assert ids({"f": {"$eq": None}}) == [1, 3]
+    # mongod truthiness: empty string / array / doc are TRUTHY (Python's aren't)
+    assert ids({"f": {"$exists": ""}}) == [1, 2]
+    assert ids({"f": {"$exists": []}}) == [1, 2]
+    assert ids({"f": {"$exists": {}}}) == [1, 2]
+    assert ids({"f": {"$exists": 0}}) == [3]
+    assert ids({"f": {"$exists": False}}) == [3]
+    assert ids({"f": {"$exists": 1}}) == [1, 2]

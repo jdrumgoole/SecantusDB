@@ -11,6 +11,7 @@ bugs: binary ``timestamptz``/``numeric`` parameters weren't decoded, and the
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 from decimal import Decimal
 
@@ -156,6 +157,34 @@ def test_group_by_and_join(server):
             "SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY region"
         ).fetchall()
         assert rows == [("e", 30), ("w", 30)]
+
+
+def test_idle_in_transaction_session_timeout(server):
+    """A connection left idle inside a transaction longer than
+    idle_in_transaction_session_timeout is terminated with 25P03."""
+    import time
+
+    conn = connect(server)  # autocommit off; closed manually (it dies mid-test)
+    try:
+        conn.execute("SET idle_in_transaction_session_timeout = 100")
+        conn.execute("SELECT 1")  # opens the transaction block
+        time.sleep(0.6)
+        # The typed IdleInTransactionSessionTimeout on platforms that deliver
+        # the FATAL message before the close; on Windows the socket abort can
+        # race it, surfacing a plain OperationalError (same as psycopg's own
+        # test_right_exception_on_session_timeout win32 branch).
+        with pytest.raises(
+            (psycopg.errors.IdleInTransactionSessionTimeout, psycopg.OperationalError)
+        ):
+            conn.execute("SELECT 1")
+    finally:
+        with contextlib.suppress(psycopg.Error):
+            conn.close()
+    # A zero (default) timeout leaves an idle transaction alone.
+    with connect(server) as conn:
+        conn.execute("SELECT 1")
+        time.sleep(0.3)
+        assert conn.execute("SELECT 2").fetchone() == (2,)
 
 
 def test_transaction_commit_and_rollback(server):
@@ -861,6 +890,171 @@ def test_enum_oid_through_plan_shapes_and_enum_arrays(server):
             conn.execute("INSERT INTO people VALUES ('c', 'ok', '{furious}')")
 
 
+def test_typmod_in_row_description(server):
+    """A modifier-bearing cast describes with its PG type modifier: psycopg's
+    ``cursor.description`` derives ``display_size``/``precision``/``scale`` and
+    ``type_display`` from the wire typmod, and varchar/bpchar keep their
+    distinct oids (1043/1042) instead of folding onto text's 25."""
+    with connect(server, autocommit=True) as conn:
+        c = conn.execute("SELECT null::varchar(42)").description[0]
+        assert (c.type_code, c.display_size) == (1043, 42)
+        assert c.type_display == "varchar(42)"
+        c = conn.execute("SELECT null::varchar").description[0]
+        assert (c.type_code, c.display_size) == (1043, None)
+        c = conn.execute("SELECT 3.14::numeric(10,2)").description[0]
+        assert (c.precision, c.scale) == (10, 2)
+        c = conn.execute("SELECT null::numeric(2,-3)").description[0]
+        assert (c.precision, c.scale) == (2, -3)
+        c = conn.execute("SELECT null::numeric(10,3)[]").description[0]
+        assert c.type_display == "numeric(10,3)[]"
+        c = conn.execute("SELECT null::timestamptz(6)").description[0]
+        assert (c.type_code, c.precision) == (1184, 6)
+        c = conn.execute("SELECT null::bit(8)").description[0]
+        assert (c.type_code, c.display_size) == (1560, 8)
+        c = conn.execute("SELECT null::varbit(9)").description[0]
+        assert (c.type_code, c.display_size) == (1562, 9)
+        # Extended protocol (Describe) reports the same modifier.
+        c = conn.execute("SELECT null::varchar(7) WHERE 1 = %s", [1]).description[0]
+        assert (c.type_code, c.display_size) == (1043, 7)
+
+
+def test_escape_string_literal_in_insert(server):
+    """psycopg's ClientCursor interpolates any string containing a backslash as
+    an ``E'…'`` escape-string literal; sqlglot lexes that as a ByteString, which
+    the INSERT value path must unescape (it previously raised 0A000 -- the
+    test_leak flap)."""
+    with connect(server, autocommit=True, cursor_factory=psycopg.ClientCursor) as conn:
+        conn.execute("CREATE TABLE esc (id int primary key, t text)")
+        conn.execute("INSERT INTO esc VALUES (%s, %s)", [1, "a\\b\nc"])
+        conn.execute("INSERT INTO esc VALUES (2, E'x\\\\y')")
+        assert conn.execute("SELECT t FROM esc ORDER BY id").fetchall() == [
+            ("a\\b\nc",),
+            ("x\\y",),
+        ]
+
+
+def test_transaction_characteristics(server):
+    """BEGIN/SET TRANSACTION characteristics apply for the transaction and are
+    reported via the transaction_* GUCs, which mirror their session defaults
+    (default_transaction_*) until overridden; psycopg's set_isolation_level /
+    set_read_only / set_deferrable drive exactly this machinery."""
+    with connect(server) as conn:
+        conn.set_isolation_level(psycopg.IsolationLevel.SERIALIZABLE)
+        conn.set_read_only(True)
+        cur = conn.execute(
+            "select current_setting('transaction_isolation'),"
+            " current_setting('transaction_read_only')"
+        )
+        assert cur.fetchone() == ("serializable", "on")
+        conn.rollback()
+        conn.set_isolation_level(None)
+        conn.set_read_only(None)
+        # Characteristics revert at transaction end; defaults mirror through.
+        conn.execute("select set_config('default_transaction_isolation', 'repeatable read', false)")
+        conn.commit()
+        cur = conn.execute("select current_setting('transaction_isolation')")
+        assert cur.fetchone() == ("repeatable read",)
+        conn.rollback()
+    with connect(server, autocommit=True) as conn:
+        conn.execute("BEGIN ISOLATION LEVEL READ UNCOMMITTED READ WRITE")
+        assert conn.execute("select current_setting('transaction_isolation')").fetchone() == (
+            "read uncommitted",
+        )
+        conn.execute("SET TRANSACTION DEFERRABLE")
+        assert conn.execute("select current_setting('transaction_deferrable')").fetchone() == (
+            "on",
+        )
+        conn.execute("ROLLBACK")
+        assert conn.execute("select current_setting('transaction_deferrable')").fetchone() == (
+            "off",
+        )
+        conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        assert conn.execute("select current_setting('transaction_read_only')").fetchone() == ("on",)
+
+
+def test_binary_copy_roundtrip(server):
+    """``COPY … (FORMAT binary)`` both directions: OUT emits the PGCOPY stream
+    (header bundled with the first row, per-row CopyData, int16 -1 trailer)
+    with per-type binary field encodings; IN parses the same layout and decodes
+    each field by the target column's type."""
+    with connect(server, autocommit=True) as conn:
+        conn.execute(
+            "CREATE TABLE bc (id int primary key, n int, t text, f float8, "
+            "b bool, by bytea, ts timestamptz)"
+        )
+        when = _dt.datetime(2021, 3, 4, 5, 6, 7, tzinfo=_dt.timezone.utc)
+        rows = [
+            (1, 42, "hello", 3.5, True, b"\x00\x01", when),
+            (2, None, None, None, None, None, None),
+        ]
+        cur = conn.cursor()
+        with cur.copy("COPY bc FROM STDIN (FORMAT binary)") as copy:
+            copy.set_types(["int4", "int4", "text", "float8", "bool", "bytea", "timestamptz"])
+            for row in rows:
+                copy.write_row(row)
+        got = []
+        with cur.copy("COPY bc TO STDOUT (FORMAT binary)") as copy:
+            copy.set_types(["int4", "int4", "text", "float8", "bool", "bytea", "timestamptz"])
+            for row in copy.rows():
+                got.append(row)
+        assert got == rows
+        # Query-form binary COPY OUT rides the same encoders.
+        with cur.copy("COPY (SELECT n FROM bc WHERE id = 1) TO STDOUT (FORMAT binary)") as copy:
+            copy.set_types(["int4"])
+            assert list(copy.rows()) == [(42,)]
+
+
+def test_group_by_ordinal_over_wire(server):
+    with connect(server, autocommit=True) as conn:
+        conn.execute("CREATE TABLE g (id int primary key, k text)")
+        conn.execute("INSERT INTO g VALUES (1, 'a'), (2, 'a'), (3, 'b')")
+        rows = conn.execute("SELECT k, count(*) FROM g GROUP BY 1 ORDER BY 1").fetchall()
+        assert rows == [("a", 2), ("b", 1)]
+
+
+def test_do_block_raise_and_notices(server):
+    """Minimal plpgsql DO blocks: RAISE NOTICE/WARNING surface as psycopg
+    notices, RAISE EXCEPTION raises with its USING ERRCODE, and EXECUTE
+    format(…) runs dynamic SQL whose errors keep their real SQLSTATE."""
+    with connect(server, autocommit=True) as conn:
+        messages = []
+        conn.add_notice_handler(lambda d: messages.append((d.severity, d.message_primary)))
+        conn.execute("do $$begin raise notice 'hello %', 42; end$$ language plpgsql")
+        assert ("NOTICE", "hello 42") in messages
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute("do $$begin raise exception 'boom'; end$$ language plpgsql")
+        with pytest.raises(psycopg.Error) as ei:
+            conn.execute("do $$begin raise exception 'custom' using errcode = 'PXX99'; end$$")
+        assert ei.value.sqlstate == "PXX99"
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            conn.execute("do $$begin execute format('insert into %I values (1)', 'nope'); end$$")
+
+
+def test_pg_terminate_backend_via_wire(server):
+    # The kill effect (socket teardown) is exercised by the gauge's
+    # isolated-subprocess connection tests; here we pin the deterministic
+    # return-value logic (a live backend -> True, a bogus pid -> False),
+    # which is race-free in the in-process shared-worker fixture.
+    with connect(server, autocommit=True) as victim, connect(server, autocommit=True) as killer:
+        pid = victim.execute("select pg_backend_pid()").fetchone()[0]
+        assert killer.execute(f"select pg_terminate_backend({pid})").fetchone() == (True,)
+        assert killer.execute("select pg_terminate_backend(999999)").fetchone() == (False,)
+
+
+def test_prepared_statement_introspection(server):
+    """pg_prepared_statements reports the ORIGINAL query text, real
+    prepare_time, and the parameter types; DEALLOCATE ALL clears the
+    wire-prepared registry."""
+    with connect(server, autocommit=True) as conn:
+        conn.execute("select %s::date", ("2021-01-01",), prepare=True)
+        rows = conn.execute(
+            "select statement, parameter_types from pg_prepared_statements"
+        ).fetchall()
+        assert rows == [("select %s::date".replace("%s", "$1"), ["date"])]
+        conn.execute("deallocate all")
+        assert conn.execute("select count(*) from pg_prepared_statements").fetchone() == (0,)
+
+
 def test_jsonb_roundtrip_and_navigation(server):
     """jsonb values parse at ingress: a cast or Json/Jsonb-wrapped parameter
     loads back as a Python dict/list (not double-encoded text), ``->>``
@@ -942,10 +1136,13 @@ def test_composite_registration_roundtrip(server):
             7,
         )
         # Anonymous records: psycopg's text loader yields strings; the binary
-        # record layout carries per-field oids, so fields come back typed.
+        # record layout carries per-field oids — an int literal comes back
+        # typed and an UNTYPED string literal is unknown (705), which psycopg
+        # loads as bytes, exactly like real Postgres.
         assert conn.execute("select row(1, 'a')").fetchone()[0] == ("1", "a")
         with conn.cursor(binary=True) as bcur:
-            assert bcur.execute("select row(1, 'a')").fetchone()[0] == (1, "a")
+            assert bcur.execute("select row(1, 'a')").fetchone()[0] == (1, b"a")
+            assert bcur.execute("select row(1, 'a'::text)").fetchone()[0] == (1, "a")
 
 
 def test_create_type_as_range(server):

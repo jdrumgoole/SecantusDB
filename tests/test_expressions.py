@@ -93,7 +93,24 @@ def test_arithmetic_date_semantics() -> None:
 
 def test_concat() -> None:
     assert evaluate({"$concat": ["hello", " ", "world"]}, {}) == "hello world"
-    assert evaluate({"$concat": ["x=", "$x"]}, {"x": 5}) == "x=5"
+    assert evaluate({"$concat": ["a", "$s"]}, {"s": "b"}) == "ab"
+
+
+def test_concat_type_validation() -> None:
+    # mongod: a non-string operand is Location16702 (no str() coercion); a null /
+    # missing operand short-circuits to a null result, left-to-right.
+    for bad in ([("x=", 5)], [("x=", True)], [(5,)], [("a", ["b"])]):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({"$concat": list(bad[0])}, {})
+        assert exc.value.code == 16702, bad
+    assert evaluate({"$concat": ["a", None, "b"]}, {}) is None
+    assert evaluate({"$concat": ["a", "$missing", "b"]}, {}) is None
+    # Left-to-right: a non-string before a null still raises.
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$concat": [5, None]}, {})
+    assert exc.value.code == 16702
+    # A null before a non-string short-circuits to null.
+    assert evaluate({"$concat": [None, 5]}, {}) is None
 
 
 def test_comparisons() -> None:
@@ -288,6 +305,28 @@ def test_concat_arrays() -> None:
     assert out == [1, 2, 3, 4, 5]
 
 
+def test_array_operators_reject_non_array_input() -> None:
+    # mongod codes for a non-array (non-null) input to each array operator.
+    for expr, code in [
+        ({"$first": 5}, 28689),
+        ({"$last": "x"}, 28689),
+        ({"$reverseArray": 5}, 34435),
+        ({"$concatArrays": [[1], 5]}, 28664),
+        ({"$slice": [5, 2]}, 28724),
+        ({"$map": {"input": 5, "in": "$$this"}}, 16883),
+        ({"$filter": {"input": 5, "cond": True}}, 28651),
+        ({"$reduce": {"input": 5, "initialValue": 0, "in": "$$value"}}, 40080),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    # A null / missing input yields null (no error) for each.
+    assert evaluate({"$first": None}, {}) is None
+    assert evaluate({"$reverseArray": "$gone"}, {}) is None
+    assert evaluate({"$map": {"input": None, "in": "$$this"}}, {}) is None
+    assert evaluate({"$concatArrays": [[1], None]}, {}) is None
+
+
 def test_in_operator_in_expressions() -> None:
     assert evaluate({"$in": ["b", ["a", "b", "c"]]}, {}) is True
     assert evaluate({"$in": ["x", ["a", "b", "c"]]}, {}) is False
@@ -297,6 +336,235 @@ def test_to_int_conversions() -> None:
     assert evaluate({"$toInt": 3.7}, {}) == 3
     assert evaluate({"$toInt": "42"}, {}) == 42
     assert evaluate({"$toInt": True}, {}) == 1
+
+
+def test_to_int_overflow() -> None:
+    from bson.int64 import Int64
+
+    # int32 target: values outside [-2^31, 2^31-1] overflow (mongod 241).
+    for bad in (3e9, 1e30, Int64(2**40), float("inf"), float("nan")):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({"$toInt": bad}, {})
+        assert exc.value.code == 241
+    # A long that fits int32 downcasts to a plain int (int32 on the wire).
+    result = evaluate({"$toInt": Int64(5)}, {})
+    assert result == 5 and not isinstance(result, Int64)
+    # int32 boundaries are accepted.
+    assert evaluate({"$toInt": 2147483647.0}, {}) == 2147483647
+    assert evaluate({"$toInt": -2147483648.0}, {}) == -2147483648
+
+
+def test_to_long_conversions() -> None:
+    from bson.int64 import Int64
+
+    # Truncates toward zero, parses strings, bool -> 0/1, and always yields Int64.
+    for arg, want in ((3.7, 3), (-3.9, -3), ("42", 42), (True, 1), (5, 5)):
+        result = evaluate({"$toLong": arg}, {})
+        assert result == want and isinstance(result, Int64), arg
+    # A value beyond int32 (but within int64) is fine for $toLong.
+    result = evaluate({"$toLong": 9_000_000_000.0}, {})
+    assert result == 9_000_000_000 and isinstance(result, Int64)
+    # Int64 passes through.
+    assert evaluate({"$toLong": Int64(2**40)}, {}) == 2**40
+    # Missing / null -> null.
+    assert evaluate({"$toLong": "$x"}, {}) is None
+
+
+def test_to_long_overflow() -> None:
+    # Beyond [-2^63, 2^63-1] or non-finite -> overflow (mongod 241).
+    for bad in (1e30, float("inf"), float("nan"), "99999999999999999999"):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({"$toLong": bad}, {})
+        assert exc.value.code == 241
+
+
+def test_conversion_error_codes() -> None:
+    # mongod-specific error codes (previously a generic TypeMismatch 14):
+    # an unparseable numeric string -> ConversionFailure 241; an unknown
+    # $convert target type -> 2 (uncatchable by onError); $sortArray non-array
+    # -> 2942504; $strLenCP / $strLenBytes non-string -> 34471 / 34473.
+    for op in ("$toInt", "$toLong", "$toDouble", "$toDecimal"):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: "abc"}, {})
+        assert exc.value.code == 241, op
+    for expr, code in [
+        ({"$convert": {"input": 5, "to": "bogus"}}, 2),
+        ({"$convert": {"input": 5, "to": "bogus", "onError": -1}}, 2),  # not caught by onError
+        ({"$sortArray": {"input": 5, "sortBy": 1}}, 2942504),
+        ({"$strLenCP": 5}, 34471),
+        ({"$strLenBytes": 5}, 34473),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    # Valid conversions and a caught bad-number onError still work.
+    assert evaluate({"$toLong": "42"}, {}) == 42
+    assert evaluate({"$convert": {"input": "abc", "to": "int", "onError": -1}}, {}) == -1
+
+
+def test_array_set_typeguard_error_codes() -> None:
+    # Array/set operators reject a non-array/non-object argument with mongod's
+    # exact Location code (previously a silent accept for $arrayElemAt/$in, or a
+    # generic TypeMismatch 14 for the rest).
+    for expr, code in [
+        ({"$size": 5}, 17124),
+        ({"$arrayElemAt": [5, 0]}, 28689),
+        ({"$in": [1, 5]}, 40081),
+        ({"$indexOfArray": [5, 1]}, 40090),
+        ({"$setUnion": [5]}, 17043),
+        ({"$setIntersection": [5]}, 17047),
+        ({"$setDifference": [5, 6]}, 17048),
+        ({"$setIsSubset": [5, 6]}, 17046),
+        ({"$anyElementTrue": 5}, 17041),
+        ({"$allElementsTrue": 5}, 17040),
+        ({"$mergeObjects": [5]}, 40400),
+        ({"$range": ["a", "b"]}, 34443),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    # Valid forms still compute.
+    assert evaluate({"$size": [1, 2, 3]}, {}) == 3
+    assert evaluate({"$in": [2, [1, 2, 3]]}, {}) is True
+    assert evaluate({"$arrayElemAt": [[10, 20], 1]}, {}) == 20
+    assert evaluate({"$mergeObjects": [{"a": 1}, {"b": 2}]}, {}) == {"a": 1, "b": 2}
+
+
+def test_string_typeguard_error_codes() -> None:
+    # String/binary operators reject a non-string argument with mongod's exact
+    # code. $regexMatch/$regexFind/$regexFindAll previously silently accepted a
+    # non-string input (returning false/null/[]); a null input stays valid.
+    for expr, code in [
+        ({"$regexMatch": {"input": 5, "regex": "a"}}, 51104),
+        ({"$regexFind": {"input": 5, "regex": "a"}}, 51104),
+        ({"$regexFindAll": {"input": 5, "regex": "a"}}, 51104),
+        ({"$indexOfBytes": [5, "a"]}, 40091),
+        ({"$binarySize": 5}, 51276),
+        ({"$bsonSize": 5}, 31393),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    # Null input is not an error for the regex operators.
+    assert evaluate({"$regexMatch": {"input": None, "regex": "a"}}, {}) is False
+    assert evaluate({"$regexMatch": {"input": "abc", "regex": "b"}}, {}) is True
+    assert evaluate({"$binarySize": "abc"}, {}) == 3
+
+
+def test_strcasecmp_coercion() -> None:
+    # mongod $toString-coerces $strcasecmp operands (null -> ""), rejecting only
+    # bool (Location16007) — SecantusDB previously rejected any non-string (14).
+    assert evaluate({"$strcasecmp": [5, "a"]}, {}) == -1  # "5" < "a"
+    assert evaluate({"$strcasecmp": ["a", 5]}, {}) == 1
+    assert evaluate({"$strcasecmp": [5, 10]}, {}) == 1  # "5" > "10"
+    assert evaluate({"$strcasecmp": [None, "a"]}, {}) == -1  # "" < "a"
+    assert evaluate({"$strcasecmp": ["ABC", "abc"]}, {}) == 0  # case-insensitive
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$strcasecmp": [True, "a"]}, {})
+    assert exc.value.code == 16007
+
+
+def test_expression_accumulators() -> None:
+    # MongoDB 5.0+ $sum/$avg/$max/$min as *expression* operators (not just group
+    # accumulators): an array argument reduces over its elements, a scalar is a
+    # single value, a missing/absent argument contributes nothing, non-numeric
+    # elements are ignored by $sum/$avg, and $max/$min order by BSON cross-type
+    # order ignoring null. Verified against mongod 7.0.12.
+    assert evaluate({"$sum": "$arr"}, {"arr": [1, 2, 3]}) == 6
+    assert evaluate({"$sum": "$n"}, {"n": 5}) == 5
+    assert evaluate({"$sum": [1, 2, 3]}, {}) == 6
+    assert evaluate({"$sum": ["$n", 10, "skip"]}, {"n": 5}) == 15  # non-numeric ignored
+    assert evaluate({"$avg": "$arr"}, {"arr": [1, 2, 3]}) == 2.0
+    assert evaluate({"$avg": "$n"}, {"n": 5}) == 5.0
+    assert evaluate({"$max": "$arr"}, {"arr": [1, 2, 3]}) == 3
+    assert evaluate({"$min": "$arr"}, {"arr": [1, 2, 3]}) == 1
+    assert evaluate({"$max": "$n"}, {"n": 5}) == 5
+    # Empty / missing edges: $sum -> 0, $avg/$max/$min -> null.
+    assert evaluate({"$sum": []}, {}) == 0
+    assert evaluate({"$avg": []}, {}) is None
+    assert evaluate({"$max": []}, {}) is None
+    assert evaluate({"$sum": "$missing"}, {}) == 0
+    assert evaluate({"$max": "$missing"}, {}) is None
+
+
+def test_date_misc_typeguard_error_codes() -> None:
+    import datetime
+
+    d = {"$literal": datetime.datetime(2020, 1, 1)}
+    # Date/misc operators match mongod's error codes. $dateToString on a non-date
+    # (and $dateDiff missing endDate) previously silently returned a value.
+    for expr, code in [
+        ({"$dateToString": {"date": "x"}}, 16006),
+        ({"$dateToParts": {"date": "x"}}, 16006),
+        ({"$dateFromString": {"dateString": 5}}, 241),
+        ({"$dateAdd": {"startDate": d, "unit": "bogus", "amount": 1}}, 9),
+        ({"$dateTrunc": {"date": d, "unit": "bogus"}}, 9),
+        ({"$let": {"vars": {}, "in": "$$x"}}, 17276),
+        ({"$switch": {"branches": []}}, 40068),
+        ({"$ifNull": [1]}, 1257300),
+        ({"$getField": {"field": 5, "input": {}}}, 5654602),
+        ({"$setField": {"field": 5, "input": {}, "value": 1}}, 4161107),
+        ({"$sortArray": {"input": [1], "sortBy": "x"}}, 2942507),
+        ({"$convert": {"input": 5}}, 9),
+        ({"$dateDiff": {"startDate": d}}, 5166304),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {"_id": 1})
+        assert exc.value.code == code, expr
+    # Valid forms still compute.
+    assert evaluate({"$ifNull": [None, 7]}, {}) == 7
+    assert evaluate({"$let": {"vars": {"a": 5}, "in": "$$a"}}, {}) == 5
+    assert evaluate({"$switch": {"branches": [{"case": True, "then": 9}]}}, {}) == 9
+
+
+def test_more_expression_error_codes() -> None:
+    import datetime
+
+    # More mongod-specific codes (previously generic 14): $zip non-array inputs /
+    # element (34461/34468); $arrayToObject non-array (40386); $objectToArray
+    # non-document (40390); $replaceOne/$replaceAll per-argument (51746/51745/
+    # 51744); $dateDiff unknown unit (9).
+    for expr, code in [
+        ({"$zip": {"inputs": 5}}, 34461),
+        ({"$zip": {"inputs": [5]}}, 34468),
+        ({"$arrayToObject": 5}, 40386),
+        ({"$objectToArray": 5}, 40390),
+        ({"$replaceOne": {"input": 5, "find": "a", "replacement": "b"}}, 51746),
+        ({"$replaceOne": {"input": "a", "find": 5, "replacement": "b"}}, 51745),
+        ({"$replaceAll": {"input": "a", "find": "a", "replacement": 5}}, 51744),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    d1, d2 = datetime.datetime(2020, 1, 1), datetime.datetime(2021, 1, 1)
+    with pytest.raises(ExpressionError) as exc:
+        evaluate(
+            {
+                "$dateDiff": {
+                    "startDate": {"$literal": d1},
+                    "endDate": {"$literal": d2},
+                    "unit": "bogus",
+                }
+            },
+            {},
+        )
+    assert exc.value.code == 9
+    # Valid forms still work.
+    assert evaluate({"$zip": {"inputs": [[1, 2], [3, 4]]}}, {}) == [[1, 3], [2, 4]]
+    assert evaluate({"$replaceOne": {"input": "aXa", "find": "X", "replacement": "-"}}, {}) == "a-a"
+
+
+def test_convert_int_long_overflow() -> None:
+    # $convert to int/long range-checks and raises 241 (caught by onError).
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$convert": {"input": 3e9, "to": "int"}}, {})
+    assert exc.value.code == 241
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$convert": {"input": 9.3e18, "to": "long"}}, {})
+    assert exc.value.code == 241
+    assert evaluate({"$convert": {"input": 1e30, "to": "int", "onError": "oops"}}, {}) == "oops"
+    # In-range values convert normally.
+    assert evaluate({"$convert": {"input": 5.0, "to": "long"}}, {}) == 5
 
 
 def test_to_double_conversions() -> None:
@@ -376,6 +644,23 @@ def test_split() -> None:
     assert evaluate({"$split": ["abc", ","]}, {}) == ["abc"]
 
 
+def test_split_argument_validation() -> None:
+    # mongod codes: empty separator 40087, non-string first/second 40085/40086,
+    # wrong arg count 16020; a null string / separator -> null.
+    for expr, code in [
+        ({"$split": ["a,b", ""]}, 40087),
+        ({"$split": [5, ","]}, 40085),
+        ({"$split": ["a,b", 5]}, 40086),
+        ({"$split": ["a,b"]}, 16020),
+        ({"$split": ["a,b", ",", "x"]}, 16020),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    assert evaluate({"$split": [None, ","]}, {}) is None
+    assert evaluate({"$split": ["a,b", None]}, {}) is None
+
+
 def test_trim_default_whitespace() -> None:
     assert evaluate({"$trim": {"input": "  hi  "}}, {}) == "hi"
 
@@ -387,6 +672,23 @@ def test_trim_with_chars() -> None:
 def test_ltrim_rtrim() -> None:
     assert evaluate({"$ltrim": {"input": "  hi  "}}, {}) == "hi  "
     assert evaluate({"$rtrim": {"input": "  hi  "}}, {}) == "  hi"
+
+
+def test_trim_argument_validation() -> None:
+    # mongod: non-string input -> 50699, non-string chars -> 50700; a null input
+    # or null chars yields null.
+    for op in ("$trim", "$ltrim", "$rtrim"):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: {"input": 5}}, {})
+        assert exc.value.code == 50699, op
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: {"input": "x", "chars": 5}}, {})
+        assert exc.value.code == 50700, op
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: {"input": "x", "chars": True}}, {})
+        assert exc.value.code == 50700, op
+        assert evaluate({op: {"input": None}}, {}) is None
+        assert evaluate({op: {"input": "--x--", "chars": None}}, {}) is None
 
 
 def test_substr_cp() -> None:
@@ -402,6 +704,23 @@ def test_index_of_cp() -> None:
     assert evaluate({"$indexOfCP": ["hello", "ll"]}, {}) == 2
     assert evaluate({"$indexOfCP": ["hello", "z"]}, {}) == -1
     assert evaluate({"$indexOfCP": ["hellohello", "ll", 4]}, {}) == 7
+
+
+def test_index_of_start_end_validation() -> None:
+    # mongod: a fractional / bool / non-numeric start or end is 40096, a negative
+    # one is 40097; a whole double is accepted.
+    for op in ("$indexOfBytes", "$indexOfCP"):
+        assert evaluate({op: ["abcabc", "b", 2.0]}, {}) == 4  # whole double -> 2
+        for bad in (2.5, True, "x"):
+            with pytest.raises(ExpressionError) as exc:
+                evaluate({op: ["abcabc", "b", bad]}, {})
+            assert exc.value.code == 40096, (op, bad)
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: ["abcabc", "b", -1]}, {})
+        assert exc.value.code == 40097, op
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: ["abcabc", "b", 0, -1]}, {})
+        assert exc.value.code == 40097, op
 
 
 def test_date_from_string_iso() -> None:
@@ -511,9 +830,28 @@ def test_abs_round_floor_ceil() -> None:
     assert evaluate({"$ceil": 3.2}, {}) == 4
 
 
+def test_unary_math_rejects_non_numeric() -> None:
+    # mongod: a string / bool operand is rejected (28765 for most, 51081 for
+    # $round / $trunc), not coerced or leaked as a Python error; null -> null.
+    for op in ("$abs", "$ceil", "$floor", "$sqrt", "$exp", "$ln", "$log10"):
+        for bad in ("x", True):
+            with pytest.raises(ExpressionError) as exc:
+                evaluate({op: bad}, {})
+            assert exc.value.code == 28765, f"{op}({bad!r})"
+        assert evaluate({op: None}, {}) is None
+    for op in ("$round", "$trunc"):
+        for bad in ("x", True):
+            with pytest.raises(ExpressionError) as exc:
+                evaluate({op: [bad, 0]}, {})
+            assert exc.value.code == 51081, f"{op}({bad!r})"
+        assert evaluate({op: None}, {}) is None
+
+
 def test_sqrt_pow() -> None:
     assert evaluate({"$sqrt": 9}, {}) == 3
-    assert evaluate({"$sqrt": -1}, {}) is None
+    # Out-of-domain now raises mongod's Location28714 (was null).
+    with pytest.raises(ExpressionError):
+        evaluate({"$sqrt": -1}, {})
     assert evaluate({"$pow": [2, 8]}, {}) == 256
 
 
@@ -523,7 +861,10 @@ def test_log_family() -> None:
     assert evaluate({"$ln": math.e}, {}) == pytest.approx(1)
     assert evaluate({"$log": [100, 10]}, {}) == pytest.approx(2)
     assert evaluate({"$log10": 1000}, {}) == pytest.approx(3)
-    assert evaluate({"$ln": -1}, {}) is None
+    # Out-of-domain now raises mongod's Location28766 (was null) — see
+    # test_log_family_domain_errors for the full matrix.
+    with pytest.raises(ExpressionError):
+        evaluate({"$ln": -1}, {})
 
 
 def test_trunc() -> None:
@@ -616,6 +957,33 @@ def test_date_add_days() -> None:
     base = dt.datetime(2026, 4, 28, 12, 0, 0)
     out = evaluate({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 7}}, {"d": base})
     assert out == dt.datetime(2026, 5, 5, 12, 0, 0)
+
+
+def test_date_arg_validation() -> None:
+    import datetime as dt
+
+    d = dt.datetime(2021, 1, 1)
+    # Whole-double amount / binSize is accepted (coerced to int).
+    assert evaluate(
+        {"$dateAdd": {"startDate": d, "unit": "day", "amount": 2.0}}, {}
+    ) == dt.datetime(2021, 1, 3)
+    assert evaluate({"$dateTrunc": {"date": d, "unit": "year", "binSize": 2.0}}, {}) == dt.datetime(
+        2021, 1, 1
+    )
+    # $dateAdd / $dateSubtract amount: fractional / bool / non-numeric -> 5166405.
+    for op in ("$dateAdd", "$dateSubtract"):
+        for bad in (2.5, True, "x"):
+            with pytest.raises(ExpressionError) as exc:
+                evaluate({op: {"startDate": d, "unit": "day", "amount": bad}}, {})
+            assert exc.value.code == 5166405, (op, bad)
+    # $dateTrunc binSize: non-integer -> 5439017, non-positive -> 5439018.
+    for bad in (2.5, True):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({"$dateTrunc": {"date": d, "unit": "day", "binSize": bad}}, {})
+        assert exc.value.code == 5439017, bad
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$dateTrunc": {"date": d, "unit": "day", "binSize": -1}}, {})
+    assert exc.value.code == 5439018
 
 
 def test_date_add_months_with_day_clamp() -> None:
@@ -937,6 +1305,18 @@ def test_to_date_null_is_null() -> None:
     assert evaluate({"$toDate": None}, {}) is None
 
 
+def test_to_date_rejects_bool() -> None:
+    # mongod: bool -> date is ConversionFailure (241), not an int coercion. The
+    # same holds through $convert (whose onError still catches it).
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$toDate": True}, {})
+    assert exc.value.code == 241
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$convert": {"input": True, "to": "date"}}, {})
+    assert exc.value.code == 241
+    assert evaluate({"$convert": {"input": True, "to": "date", "onError": "x"}}, {}) == "x"
+
+
 def test_trig_basic() -> None:
     assert evaluate({"$sin": 0}, {}) == 0.0
     assert evaluate({"$cos": 0}, {}) == 1.0
@@ -1065,3 +1445,185 @@ def test_project_remove_sentinel_is_omitted() -> None:
     ctx = PipelineContext(storage=None, db_name="t", vars={})  # type: ignore[arg-type]
     out = apply_pipeline([{"_id": 1, "a": 1}], [{"$project": {"r": "$$REMOVE"}}], ctx)
     assert out == [{"_id": 1}]
+
+
+def test_log_family_domain_errors() -> None:
+    """Out-of-domain log/sqrt args raise mongod's Location codes (probed
+    against mongod 7.0.12) instead of returning null; null/missing still pass
+    through as null, and NaN propagates as nan."""
+    import math
+
+    import pytest
+
+    from secantus.expressions import ExpressionError, evaluate
+
+    for expr, code in [
+        ({"$ln": 0}, 28766),
+        ({"$ln": -1}, 28766),
+        ({"$log10": 0}, 28761),
+        ({"$log10": -2.5}, 28761),
+        ({"$log": [0, 2]}, 28758),
+        ({"$log": [-1, 2]}, 28758),
+        ({"$log": [8, 0]}, 28759),
+        ({"$log": [8, 1]}, 28759),
+        ({"$log": [8, -2]}, 28759),
+        ({"$sqrt": -1}, 28714),
+        ({"$sqrt": -0.5}, 28714),
+        # $log type errors (28756 argument / 28757 base) precede the domain check.
+        ({"$log": ["x", 2]}, 28756),
+        ({"$log": [True, 2]}, 28756),
+        ({"$log": [8, "y"]}, 28757),
+        ({"$log": [8, True]}, 28757),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr
+
+    assert evaluate({"$ln": None}, {}, None) is None
+    assert evaluate({"$ln": "$missing"}, {}, None) is None
+    assert evaluate({"$sqrt": 0}, {}, None) == 0.0
+    assert math.isnan(evaluate({"$ln": float("nan")}, {}, None))
+
+
+def test_bool_argument_rejected_where_int_expected() -> None:
+    # mongod rejects a bool where an aggregation operator expects a numeric
+    # (int) argument — bool is not a number. Each carries mongod's exact code.
+    for expr, code in [
+        ({"$round": [1.5, True]}, 16004),
+        ({"$trunc": [1.5, True]}, 16004),
+        ({"$arrayElemAt": [[10, 20, 30], True]}, 28690),
+        ({"$slice": [[1, 2, 3, 4], True]}, 28725),
+        ({"$slice": [[1, 2, 3, 4], True, 2]}, 28725),
+        ({"$slice": [[1, 2, 3, 4], 1, True]}, 28727),
+        ({"$sortArray": {"input": [3, 1, 2], "sortBy": True}}, 2942507),
+        ({"$substrCP": ["hello", True, 2]}, 34450),
+        ({"$substrCP": ["hello", 1, True]}, 34452),
+        ({"$substrBytes": ["hello", True, 2]}, 16034),
+        ({"$substrBytes": ["hello", 1, True]}, 16035),
+        ({"$substr": ["hello", True, 2]}, 16034),  # $substr aliases $substrBytes
+        ({"$substr": ["hello", 1, True]}, 16035),
+        ({"$range": [True, 5]}, 34443),
+        ({"$range": [0, True]}, 34445),
+        ({"$range": [0, 5, True]}, 34447),
+        ({"$indexOfArray": [[1, 2, 3], 2, True]}, 40096),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0, True]}, 40096),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr
+
+    # A plain int argument still computes (the guard is bool-specific).
+    assert evaluate({"$arrayElemAt": [[10, 20, 30], 1]}, {}, None) == 20
+    assert evaluate({"$slice": [[1, 2, 3, 4], 2]}, {}, None) == [1, 2]
+
+
+def test_whole_number_double_index_accepted_fractional_rejected() -> None:
+    # mongod accepts a whole-number double where an int index is expected
+    # (coerced to int) and rejects a fractional double with a per-op code.
+    assert evaluate({"$arrayElemAt": [[10, 20, 30], 2.0]}, {}, None) == 30
+    assert evaluate({"$arrayElemAt": [[10, 20, 30], -1.0]}, {}, None) == 30
+    assert evaluate({"$slice": [[1, 2, 3, 4], 2.0]}, {}, None) == [1, 2]
+    assert evaluate({"$slice": [[1, 2, 3, 4], 1.0, 2.0]}, {}, None) == [2, 3]
+    assert evaluate({"$indexOfArray": [[1, 2, 3], 2, 0.0]}, {}, None) == 1
+    assert evaluate({"$substrCP": ["hello", 1.0, 2]}, {}, None) == "el"
+    assert evaluate({"$range": [0.0, 5.0, 1.0]}, {}, None) == [0, 1, 2, 3, 4]
+    assert evaluate({"$round": [3.14159, 2.0]}, {}, None) == 3.14
+    assert evaluate({"$trunc": [3.14159, 2.0]}, {}, None) == 3.14
+
+    for expr, code in [
+        ({"$arrayElemAt": [[10, 20, 30], 2.7]}, 28691),
+        ({"$slice": [[1, 2, 3, 4], 2.7]}, 28726),
+        ({"$slice": [[1, 2, 3, 4], 1.7, 2]}, 28726),
+        ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, 28728),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 40096),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0, 0.7]}, 40096),
+        ({"$substrCP": ["hello", 1.7, 2]}, 34451),
+        ({"$substrCP": ["hello", 1, 1.7]}, 34453),
+        ({"$range": [0.7, 5]}, 34444),
+        ({"$range": [0, 5.7]}, 34446),
+        ({"$range": [0, 5, 1.7]}, 34448),
+        ({"$round": [3.14159, 2.7]}, 51082),
+        ({"$trunc": [3.14159, 2.7]}, 51082),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr
+
+
+def test_substr_bytes_rejects_split_utf8_character() -> None:
+    # mongod rejects a $substrBytes range that splits a UTF-8 character rather
+    # than returning a replacement char. "héllo": é is bytes 1-2.
+    with pytest.raises(ExpressionError) as end_exc:
+        evaluate({"$substrBytes": ["héllo", 0, 2]}, {}, None)  # ends inside é
+    assert end_exc.value.code == 28657
+    with pytest.raises(ExpressionError) as start_exc:
+        evaluate({"$substrBytes": ["héllo", 2, 3]}, {}, None)  # starts inside é
+    assert start_exc.value.code == 28656
+    # $substr is the byte-based alias — same rejection.
+    with pytest.raises(ExpressionError) as alias_exc:
+        evaluate({"$substr": ["héllo", 0, 2]}, {}, None)
+    assert alias_exc.value.code == 28657
+    # A continuation-byte start is rejected even for an empty (length 0) range.
+    with pytest.raises(ExpressionError) as empty_exc:
+        evaluate({"$substrBytes": ["héllo", 2, 0]}, {}, None)
+    assert empty_exc.value.code == 28656
+    # Clean boundaries and clamped/past-end ranges still compute (byte 1 is é's
+    # lead byte — a valid boundary — so [1, 0] is an empty slice, not an error).
+    assert evaluate({"$substrBytes": ["héllo", 1, 0]}, {}, None) == ""
+    assert evaluate({"$substrBytes": ["héllo", 0, 3]}, {}, None) == "hé"
+    assert evaluate({"$substrBytes": ["héllo", 3, 2]}, {}, None) == "ll"
+    assert evaluate({"$substrBytes": ["héllo", 3, 99]}, {}, None) == "llo"
+    assert evaluate({"$substrBytes": ["héllo", 99, 0]}, {}, None) == ""
+
+
+def test_substr_negative_index_rejected() -> None:
+    # mongod rejects a negative start for both $substr* ops, and a negative
+    # length for $substrCP (a negative length is fine for $substrBytes).
+    for expr, code in [
+        ({"$substrBytes": ["abcde", -1, 2]}, 50752),
+        ({"$substr": ["abcde", -1, 2]}, 50752),
+        ({"$substrCP": ["abcde", -1, 2]}, 34455),
+        ({"$substrCP": ["abcde", 1, -1]}, 34454),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr
+    # $substrBytes negative length still means "to the end".
+    assert evaluate({"$substrBytes": ["abcde", 1, -1]}, {}, None) == "bcde"
+
+
+def test_substr_bytes_truncates_double_index() -> None:
+    # Unlike $substrCP, mongod's $substrBytes accepts any double and truncates
+    # toward zero (then the usual negative-start / to-end rules apply).
+    assert evaluate({"$substrBytes": ["abcde", 1.7, 2]}, {}, None) == "bc"
+    assert evaluate({"$substrBytes": ["abcde", 0.9, 3]}, {}, None) == "abc"
+    assert evaluate({"$substrBytes": ["abcde", 1, 2.9]}, {}, None) == "bc"
+    assert evaluate({"$substrBytes": ["abcde", 1, -1.7]}, {}, None) == "bcde"
+    # A truncated-negative start is still rejected (−1.7 → −1 → 50752).
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$substrBytes": ["abcde", -1.7, 2]}, {}, None)
+    assert exc.value.code == 50752
+
+
+def test_pow_domain_and_type_validation() -> None:
+    """$pow: a negative base with a fractional exponent returns NaN (not an
+    unencodable Python complex), and a non-numeric operand / bool / a zero base
+    with a negative exponent raise mongod's codes. mongod 7.0.12-verified."""
+    import bson
+
+    r = evaluate({"$pow": [-2, 0.5]}, {}, None)
+    assert isinstance(r, float) and math.isnan(r)
+    bson.encode({"r": r})  # must be encodable (regression: was a complex -> crash)
+    assert evaluate({"$pow": [-2, 3]}, {}, None) == -8
+    assert evaluate({"$pow": [2, 10]}, {}, None) == 1024
+    assert evaluate({"$pow": ["$missing", 2]}, {}, None) is None
+    for expr, code in [
+        ({"$pow": ["x", 2]}, 28762),
+        ({"$pow": [True, 2]}, 28762),
+        ({"$pow": [2, "x"]}, 28763),
+        ({"$pow": [2, True]}, 28763),
+        ({"$pow": [0, -1]}, 28764),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {}, None)
+        assert exc.value.code == code, expr

@@ -25,7 +25,8 @@
           <code>{{ embedded.uri }}</code>
         </div>
         <div class="tile-hint">
-          Storage at <code>{{ embedded.storage_path }}</code> ·
+          {% if embedded.flavour_label %}{{ embedded.flavour_label }} ·{% endif %}
+          storage at <code>{{ embedded.storage_path }}</code> ·
           the admin app is connected to it.
         </div>
       {% else %}
@@ -43,6 +44,16 @@
         </form>
       {% else %}
         <form method="post" action="/embedded/start" class="filter-form embedded-form">
+          {% if embedded_flavours | length > 1 %}
+            <label class="filter-label">
+              Server
+              <select name="flavour">
+                {% for f in embedded_flavours %}
+                  <option value="{{ f.value }}">{{ f.label }}</option>
+                {% endfor %}
+              </select>
+            </label>
+          {% endif %}
           <label class="filter-label">
             Storage path (optional)
             <input

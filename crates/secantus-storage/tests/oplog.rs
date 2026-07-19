@@ -128,8 +128,8 @@ fn reopen_recovers_seq_counter() {
         assert_eq!(st.oplog_tail_seq(), 3);
     }
     {
-        // No meta row was persisted (current_cluster_time was never called), so
-        // recovery falls back to scanning the oplog table for the max seq.
+        // The clean drop persisted the meta row; recovery reads it clamped
+        // against the tables and continues past the last minted seq.
         let st = Storage::open(home.to_str().unwrap()).unwrap();
         assert_eq!(st.oplog_tail_seq(), 3);
         st.insert_one("app", "c", &enc(&doc! {"_id": 4})).unwrap();
@@ -380,4 +380,99 @@ fn find_seq_for_ts_locates_entry() {
         };
         assert_eq!(st.find_seq_for_ts(beyond).unwrap(), 4);
     });
+}
+
+#[test]
+fn reopen_clamps_stale_meta_next_seq() {
+    let home = temp_home();
+    {
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        for i in 1..=3 {
+            st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
+        }
+    } // clean drop persists meta {next_seq: 4, ...}
+    {
+        // Rewrite the meta row with a stale hint — the on-disk state a crash
+        // leaves behind when emits outran the last persisted snapshot.
+        let conn = secantus_wt::Connection::open(home.to_str().unwrap(), "create").unwrap();
+        let session = conn.open_session().unwrap();
+        let cur = session
+            .open_cursor("table:secantus_oplog_meta", None)
+            .unwrap();
+        let stale = bson::to_vec(&doc! {
+            "next_seq": 2i64, "last_ts_secs": 1i64,
+            "last_ts_ord": 1i64, "next_nat_seq": 2i64,
+        })
+        .unwrap();
+        cur.set_key_s("state");
+        cur.set_value_u(&stale);
+        cur.insert().unwrap();
+    }
+    {
+        // The stale hint (next_seq 2) must be clamped past the table max (3):
+        // re-minting seq 2 would overwrite a live oplog row.
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 4})).unwrap();
+        let rows = st.read_oplog(1, 10).unwrap();
+        assert_eq!(
+            rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn reopen_without_meta_row_recovers_from_oplog_tail() {
+    let home = temp_home();
+    {
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        for i in 1..=3 {
+            st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
+        }
+    }
+    {
+        // Delete the meta row so recovery exercises the fallback: a single
+        // prev() onto the newest oplog row.
+        let conn = secantus_wt::Connection::open(home.to_str().unwrap(), "create").unwrap();
+        let session = conn.open_session().unwrap();
+        let cur = session
+            .open_cursor("table:secantus_oplog_meta", None)
+            .unwrap();
+        cur.set_key_s("state");
+        cur.remove().unwrap();
+    }
+    {
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        assert_eq!(st.oplog_tail_seq(), 3);
+        st.insert_one("app", "c", &enc(&doc! {"_id": 4})).unwrap();
+        assert_eq!(st.read_oplog(4, 10).unwrap()[0].0, 4);
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn cluster_time_monotonic_across_reopen() {
+    let home = temp_home();
+    let before = {
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1})).unwrap();
+        let mut last = st.current_cluster_time().unwrap();
+        for _ in 0..3 {
+            last = st.current_cluster_time().unwrap();
+        }
+        last
+    };
+    // Cluster-time mints are never persisted per call; recovery instead bumps
+    // the clock one full second past everything it can see, so post-reopen
+    // mints are strictly greater even when the reopen happens within the same
+    // wall second as the last pre-close mint.
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    let after = st.current_cluster_time().unwrap();
+    assert!((after.time, after.increment) > (before.time, before.increment));
+    // Close WT before removing its data dir (see concurrent_writes.rs). This
+    // reopened handle does no writes, so it doesn't panic today — but the
+    // remove-before-drop ordering is the same latent bug, so keep it correct.
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
 }

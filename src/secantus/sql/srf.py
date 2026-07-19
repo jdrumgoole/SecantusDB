@@ -121,7 +121,12 @@ def fromless_projection(stmt: exp.Select) -> SrfSource | None:
     # Record SRFs (``jsonb_each`` …) return a two-column set; a base-less
     # ``SELECT jsonb_each(x)`` would yield a single *composite* column in Postgres,
     # which we don't model — only the ``FROM jsonb_each(x)`` table form is supported.
-    if not _is_srf_node(target) or _is_record_srf(target):
+    # ``generate_series(1, 2)::int4`` — a cast wrapping the SRF applies to each
+    # generated element; unwrapped here so the SRF machinery sees the call
+    # (the cast tag is re-applied per element in ``_values_and_tag``).
+    if not _is_srf_node(target.this if isinstance(target, exp.Cast) else target) or _is_record_srf(
+        target.this if isinstance(target, exp.Cast) else target
+    ):
         return None
     return SrfSource(target, False, None, [alias] if alias else [])
 
@@ -132,6 +137,8 @@ def fromless_projection(stmt: exp.Select) -> SrfSource | None:
 
 
 def _default_name(node: exp.Expression) -> str:
+    if isinstance(node, exp.Cast):
+        return _default_name(node.this)
     if isinstance(node, exp.ExplodingGenerateSeries):
         return "generate_series"
     if isinstance(node, (exp.Unnest, exp.Explode)):
@@ -144,7 +151,15 @@ def _default_name(node: exp.Expression) -> str:
 
 def _values_and_tag(node: exp.Expression, ctx: Any) -> tuple[list[Any], str]:
     """Generate the SRF's element values plus the value column's type tag."""
-    from secantus.sql import scalar
+    from secantus.sql import scalar, typemap
+
+    if isinstance(node, exp.Cast):
+        # ``srf(...)::tag`` — generate, then coerce each element to the target.
+        values, _tag = _values_and_tag(node.this, ctx)
+        cast_tag = typemap.type_tag_for_sql(node.to)
+        if cast_tag is None:
+            return values, "any"
+        return [v if v is None else typemap.coerce(v, cast_tag) for v in values], cast_tag
 
     def ev(n: exp.Expression | None) -> Any:
         return scalar.evaluate(n, _empty_scope, ctx) if n is not None else None

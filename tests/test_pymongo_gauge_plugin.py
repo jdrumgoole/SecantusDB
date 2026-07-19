@@ -34,6 +34,10 @@ def test_unknown_mode_is_rejected(tmp_path: Path) -> None:
     importlib.util.find_spec("_secantus_server") is not None,
     reason="_secantus_server is installed; the lazy-import contract is moot",
 )
+@pytest.mark.skipif(
+    importlib.util.find_spec("_secantus_server") is not None,
+    reason="only meaningful without the _secantus_server extension installed",
+)
 def test_rust_mode_requires_the_extension(tmp_path: Path) -> None:
     # Rust mode imports _secantus_server lazily so python-mode gauge runs
     # don't need the WT-linking extension. Without it, the failure must be

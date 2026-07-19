@@ -17,6 +17,10 @@ class ColumnDesc:
     name: str
     type_tag: str
     pg_oid: int
+    # PG type modifier (``atttypmod``): n+4 for varchar(n)/bpchar(n),
+    # ((p<<16)|(s&0x7FF))+4 for numeric(p,s), the bare length/precision for
+    # bit/varbit/time-family types, -1 when the type carries none.
+    typmod: int = -1
 
 
 @dataclass
@@ -37,3 +41,6 @@ class SQLResult:
     # GUCs to echo back as ParameterStatus messages (set by ``SET`` on a
     # reportable parameter). Empty for everything else.
     parameter_status: list[tuple[str, str]] = field(default_factory=list)
+    # NOTICE/WARNING messages to send ahead of the result (``DO $$ … RAISE
+    # NOTICE …$$``): ``(severity, message)`` pairs.
+    notices: list[tuple[str, str]] = field(default_factory=list)

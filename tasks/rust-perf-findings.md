@@ -31,6 +31,47 @@ storage scan above WiredTiger is, to within noise, *only* BSON
 materialization: every stored blob becomes an owned `Document` (an
 `IndexMap` with per-key allocations) before matching/projection see it.
 
+**Finding 1 fixed for the match path — Phase 2 shipped (2026-07-19,
+`rawbson-scan` branch).** `secantus_core::query::matches_raw` filters over
+`bson::RawDocument`, decoding only the fields the filter reaches;
+`find_matching_with` and `count_matching` now use it, so a rejected candidate
+is never fully decoded. Measured on a 5000-row collection scan, wide docs
+(11 fields), selective filter (one field, rejects 99.8%): **~84 → ~237
+scans/s, ≈2.8×**. Pinned bool-for-bool to the owned matcher (and pure Python)
+across the whole query parity corpus. Still materializing (later phases): the
+sort-key extraction of a post-sorted find (decodes matched rows only), and the
+update/delete candidate scans (a matched row is needed for the write).
+
+**Return path (projection) — Phase 3 shipped (2026-07-19, `rawbson-proj`
+branch).** A `find` *with* a projection decoded every returned document before
+projecting. `secantus_core::projection::apply_projection_raw` now handles the
+common shape — a pure top-level inclusion (`{a:1,b:1}`, optionally `_id:0`) —
+by decoding only the included fields off the raw document, byte-identical to
+`apply_projection` (`_id` first, then included fields sorted). Everything else
+(exclusion, dotted, `$slice`/`$elemMatch`/`$meta`, positional, mixed) falls
+back to the full projection. Measured on a 5000-row scan of wide docs (12
+fields) projecting 2: **~44 → ~87 scans/s, ≈2.0×**. Still materializing: the
+exclusion / dotted / operator projection shapes (fall back), and the raw
+document that a non-projected find *returns* is spliced onto the wire already
+(Phase 1) so it's never decoded server-side — the remaining server-side read
+materialization is now just those fallback projection shapes and the
+aggregation pipeline (Finding 4 territory).
+
+**Write-path match + aggregation prefix shipped (2026-07-19).** The
+`update` / `delete` candidate scans also match over raw BSON now
+(`rawbson-write` branch) — rejected candidates skip the full decode, only a
+matched row is decoded for the write — measured **≈4.1×** on a selective
+`updateMany` COLLSCAN of wide docs. And an aggregation pipeline's leading
+`$skip` / `$limit` / `$match` prefix is reduced over the raw fetched blobs
+before `decode_docs` (`rawbson-agg` branch, `reduce_raw_prefix`), so the
+heavier stages decode only the survivors — measured **≈4.3×** on
+`[{$limit:50},{$group}]` over 5000 wide docs. Every scan-*match* path (find /
+count / update / delete) is now raw. **Still fully materializing:** the
+heavier aggregation stages themselves (`$group` / `$sort` / computed
+`$project` / `$unwind`) — each would need a raw stage matching its owned
+semantics, or a streaming/slot execution model. That (plus the fallback
+projection shapes) is the remaining server-side read materialization.
+
 ## Finding 2 — the reply path materializes them again
 
 `get_more` 4,315 → `util::docs_to_bson` 4,199 → `Document::from_reader`
@@ -40,6 +81,106 @@ served to a client is fully decoded (at least) twice.
 
 Combined, findings 1+2 put **~65% of the serving path's on-CPU time in
 materialization** for scan-shaped workloads.
+
+**Finding 2 fixed — Phase 1 shipped (2026-07-19, `rawbson-reply` branch).**
+`secantus_wire::encode_cursor_reply` splices the pre-encoded document blobs
+straight into `cursor.firstBatch` / `cursor.nextBatch` (RawArrayBuf memcpy,
+no decode), and the no-projection `find` + non-tailable `getMore` handlers
+hand their batch to the server as raw blobs (`CommandContext::pending_batch`)
+instead of an owned `Bson::Array`. Byte-identical to the old reply (unit
+test), so no driver-visible change. Measured before/after (baseline
+`a2a61595` vs the branch, embedded server, 2000×~220B docs, client-observed
+throughput — the pymongo client-side decode cost is the *same* on both sides,
+so the server-side gain is larger than these end-to-end numbers show):
+
+| Read workload | Before | After | Speedup |
+|---|---:|---:|---:|
+| Single-batch (large `firstBatch`, no getMore) | ~511k docs/s | ~673k docs/s | **1.32×** |
+| getMore-heavy (batchSize 50, ~40 round-trips/scan) | ~273k docs/s | ~305k docs/s | **1.12×** |
+
+The firstBatch case wins most (a big batch decodes the most documents); the
+getMore case gains less because per-batch round-trip overhead dilutes the
+per-document decode saving. Still deferred (later phases): projected `find`,
+the tailable/change-stream reply, aggregate `firstBatch`, and exhaust-cursor
+streaming — plus Finding 1 (the *scan-side* materialization), the larger
+remaining lever.
+
+## Post-raw-BSON three-way re-profile (2026-07-19, pinned `9f87edf3`)
+
+After Phases 1–5 landed (reply splice #545, raw scan match #551, raw
+projection #556, raw update/delete match #560, aggregation prefix #566), the
+end-to-end three-way benchmark (`./inv compare-servers --count 10000 --reps 5`,
+on-disk WiredTiger via pymongo, median of 5, mongod baseline spawned from
+`/opt/homebrew/bin/mongod`). Extension rebuilt against the pin;
+`git rev-parse HEAD` verified unchanged before and after the run.
+
+| Workload | mongod | SecantusDB-rs | ×mongod | SecantusDB (Py) | ×mongod |
+|---|---:|---:|:---:|---:|:---:|
+| insert | 57.29 ms | 86.82 ms | 1.5× | 335.59 ms | 5.9× |
+| find_indexed_range | 4.39 ms | 6.49 ms | 1.5× | 29.14 ms | 6.6× |
+| find_all (full scan) | 7.73 ms | 18.90 ms | **2.4×** | 95.19 ms | 12.3× |
+| update_many_half | 34.84 ms | 52.93 ms | 1.5× | 499.43 ms | 14.3× |
+| **aggregate_group** | 5.72 ms | 17.81 ms | **3.1×** | 136.08 ms | 23.8× |
+| delete_many_half | 20.94 ms | 35.64 ms | 1.7× | 314.39 ms | 15.0× |
+
+**The raw-BSON roadmap closed the bulk of the gap.** The pre-work baseline
+was 2.1×–4.5× of mongod across the board (`docs/benchmark.md`); four of six
+workloads now sit at ~1.5×, near the WT/wire floor where further raw-BSON
+serving work has diminishing returns.
+
+**The residual gap is concentrated in two workloads, and it is materialization
+the raw-BSON phases deliberately do not touch:**
+
+- **`aggregate_group` — 3.1× (the standout).** This is `$group`, a
+  *materializing* stage. Phase 5's `reduce_raw_prefix` only streams the
+  *pass-through* prefix (`$skip`/`$limit`/`$match`) over raw blobs and hands
+  the survivors to `decode_docs`; the group itself still builds a fully-typed
+  `Vec<Document>` and threads owned `Bson` between accumulators. Profiled cause
+  is Finding 1's materialization surviving into the heavy stage, exactly as
+  noted at the end of the Finding-1 write-path block above.
+- **`find_all` — 2.4×.** Full scan. Phases 1+2 already made both the scan-match
+  and the reply splice raw, so this is closer to the cursor-batching / wire
+  floor than to a decode hotspot — a smaller, separate lever (batch cursor
+  efficiency) than the aggregate gap.
+
+**Conclusion → Phase 6 (streaming / slot-based aggregation) is the next lever.**
+The profile confirms empirically that the remaining gap lives in aggregate
+materialization, not projection or planning. Re-measure `find_all` after
+Phase 6 changes the aggregate materialization costs before deciding whether
+the cursor-batch lever is worth a separate slice. Scoping:
+`tasks/rust-phase6-streaming-agg-scoping.md`.
+
+**Phase 6a shipped — `$group` field-reference pushdown (`rawbson-group`
+branch).** `secantus_core::referenced_top_level_fields` walks a `$group` spec
+and returns the top-level fields its `_id` + accumulators read (bailing on
+`$$ROOT`/`$$CURRENT`, computed-field access, and non-simple accumulators like
+`$top`/`$topN` whose `sortBy` names a field by bare key). When the first
+heavier stage of a pipeline is such a `$group`, the command layer decodes only
+those fields from each survivor (`decode_docs_minimal` over `bson::RawDocument`)
+and feeds the **unchanged** `group_stage` — so `eval("$k", minimal)` is
+byte-identical to `eval("$k", full)`. Pinned by `test_rust_group_field_pushdown`
+(`apply_pipeline(minimal) == apply_pipeline(full)` over curated + fuzz, plus the
+exact field-sets and bail set).
+
+Measured **same-environment A/B in the worktree** (both server builds and both
+`compare-servers --count 10000 --reps 5` runs in `SecantusDB-rawbson-group`, so
+the `×mongod` is self-normalizing and the unaffected controls cancel run-to-run
+variance):
+
+| Workload | Baseline (rs ×mongod) | 6a (rs ×mongod) | Note |
+|---|:---:|:---:|---|
+| **aggregate_group** | 3.1× (18.10 ms) | **2.4× (13.85 ms)** | **≈1.31× faster** — the target |
+| find_all | 2.7× | 3.1× | control (untouched; run variance) |
+| insert | 1.5× | 1.6× | control |
+| find_indexed_range | 1.6× | 1.7× | control |
+| update_many_half | 1.6× | 1.7× | control |
+| delete_many_half | 1.7× | 1.7× | control |
+
+So `$group` moved **3.1× → 2.4×** of mongod (~24% faster) on the benchmark's
+7-field documents reading 2 fields — proportional to (doc width)/(fields read),
+as scoped; wider documents win more. This is the raw-decode lever (6a); the
+heavier `$group`/`$sort` execution model (streaming, 6b) stays deferred behind a
+multi-stage workload measurement, per the scoping doc.
 
 ## Finding 3 — the oplog prune is an O(entire-oplog) full-decode sweep
 
@@ -62,23 +203,86 @@ oplog grows. Two independent fixes, both cheap:
 This alone should move the insert workload meaningfully toward mongod
 (prune is ~68% of `Storage::insert` time in the capture).
 
+**Status (2026-07-17): shipped** (rust-oplog-hotpath slice) — both fixes as
+described (raw `ts` peek via `bson::RawDocument`, early-stop at the first
+in-window row, keys-only for the remainder), plus the same raw peek in
+`find_seq_for_ts` and a single-`prev()` tail read in oplog-meta recovery.
+The slice also took `current_cluster_time`'s per-`hello` meta persist (and
+its global-lock hold) off the hot path entirely — the Python endgame ported:
+meta persists at close (`Drop`), recovery clamps counters up past the table
+maxima and bumps the cluster clock +1s. Semantics pinned by the existing
+prune tests plus three new recovery tests in `tests/oplog.rs`; a literal
+O(pruned) cost pin isn't practical without decode instrumentation, so the
+cost claim rests on the code shape (no decode after the first in-window
+row).
+
 ## Non-finding
 
 The large `__gettimeofday` counts in the insert capture are WiredTiger's
 internal service threads computing absolute deadlines for timed condition
 waits — wait-adjacent, not our code, not actionable.
 
-## The other axis: concurrency
+## The other axis: concurrency — the design
 
-Unchanged from `docs/concurrency.md`: all writes serialize behind the
-single global `Mutex<()>` in `secantus-storage`, giving flat ~0.5×
-scaling. The Python server's per-collection-lock split is the ported
-design; the `wt_poc` pure-C ceiling (~1.3× aggregate) bounds the prize at
-roughly **0.5× → 1.2–1.3× under 4–8 writers (~2.5× throughput)**. The
-Rust `wait_for_oplog` loop is already commit-conflict-correct, but the
-Python split's lesson list applies (commit-time conflict mapping,
-oplog-meta hotspot — the Rust emit currently persists meta under the
-global lock, which becomes a hotspot the moment the lock splits).
+`crates/secantus-storage` has 51 `self.lock.lock()` sites, and they include
+**pure reads** (`find_by_id`, `scan_collection`) — today concurrent readers
+serialize too, not just writers. That splits the work into a cheap step and
+a structural one:
+
+1. **Reads off the lock (cheap, first).** WiredTiger MVCC + per-thread
+   sessions make lock-free reads safe; drop the mutex from the read-only
+   methods (each already opens/uses its own session). No conflict machinery
+   needed. Wins on every mixed workload immediately and shrinks writer
+   convoy pressure. *(Shipped 2026-07-17, rust-lockfree-reads slice: 19
+   read methods unlocked; three write-ordering fixes make the reader
+   invariants airtight — diff-based update index maintenance,
+   entries-before-registry createIndex, doc-row-first deletes. Residual
+   known wobble: rename/dropCollection racing a scan can yield a partial
+   result set, the moral equivalent of mongod killing cursors on drop —
+   noted in tasks/backlog.md.)*
+2. **Per-collection write locks (the port of Python Phase 2).** Registry of
+   `(db, coll) → lock` (as `_coll_locks` in Python); the global mutex
+   remains only for DDL, multi-collection writes (`$out` / `$merge`,
+   `renameCollection`), and registry mutation. `std::Mutex` is not
+   reentrant (the code already works around this in `prune`), so either
+   restructure call chains to never re-enter or use a reentrant lock for
+   the per-collection slots.
+   *(Shipped 2026-07-17, rust-coll-locks slice — plus per-statement WT
+   snapshot transactions, which the split immediately proved necessary:
+   the first stress run caught a lost update from a stale-snapshot
+   read-modify-write across autocommit ops. No reentrant locks needed —
+   call chains acquire once at the public method.)*
+3. **Global counters off the write path.** Oplog seq/ts minting to an
+   atomic + micro-lock (Python's `_oplog_seq_lock` shape); stop persisting
+   oplog meta under the lock — adopt the Python endgame verbatim: persist
+   only on close/prune, recover by table-scan clamp plus the +1s cluster
+   clock bump. *(Meta half shipped 2026-07-17 with the finding-3 slice:
+   persist at close only, clamp + bump on recovery, `current_cluster_time`
+   lock-free of the global mutex. Seq/ts minting already lives under the
+   dedicated `oplog` mutex, which the condvar pairing requires — no atomic
+   demotion possible or needed.)*
+4. **Commit-time conflict handling (port of #444/#447).** Once writers
+   overlap, WT can mark a transaction rollback-only with the conflict
+   surfacing only at `commit` (bare EINVAL, reason cleared by the
+   auto-rollback). Add the Rust equivalent of `_commit_batch_transaction`'s
+   mapping plus an unbounded `writeConflictRetry` wrapper with periodic
+   warnings. `wait_for_oplog` is already conflict-correct.
+   *(Shipped 2026-07-17 with the same slice: EINVAL/WT_ROLLBACK → typed
+   WriteConflict at both statement and commit time (the Rust binding
+   carries the raw errno, so no message matching); unbounded retry with
+   5s-interval warnings outside user transactions; immediate surface
+   inside them.)*
+5. **Gates.** `tests/test_mongo_server_concurrency.py`'s Rust params (the
+   #451 suite: exactly-one-winner, exact counts, typed-errors-only) are the
+   correctness harness; `bench.concurrency --server rust` is the measure.
+   Do this after the raw-BSON work — critical-section lengths are about to
+   change shape, and the split should be tuned against the new profile.
+
+**Expected outcome**: flat 0.5× → ~1.2–1.3× aggregate at 4–8 writers (the
+measured `wt_poc` pure-C ceiling), i.e. **~2.5× write throughput under
+load**, plus whatever the read-path unlock buys mixed workloads — which is
+currently unmeasured because the harness is write-only (add a mixed
+readers+writers phase to `bench.concurrency` when step 1 lands).
 
 ## Recommended sequence
 

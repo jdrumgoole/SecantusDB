@@ -197,14 +197,20 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$in" => op_in(arg, ctx),
         "$slice" => op_slice(arg, ctx),
         "$indexOfArray" => op_index_of_array(arg, ctx),
+        // $sum/$avg/$max/$min as expression operators (MongoDB 5.0+)
+        "$sum" => op_expr_sum(arg, ctx),
+        "$avg" => op_expr_avg(arg, ctx),
+        "$max" => op_expr_max(arg, ctx),
+        "$min" => op_expr_min(arg, ctx),
         // strings
         "$concat" => op_concat(arg, ctx),
         "$toLower" => op_to_case(arg, ctx, false),
         "$toUpper" => op_to_case(arg, ctx, true),
         "$strLenCP" => op_str_len_cp(arg, ctx),
         "$split" => op_split(arg, ctx),
-        "$substrCP" | "$substr" => op_substr_cp(arg, ctx),
-        "$substrBytes" => op_substr_bytes(arg, ctx),
+        "$substrCP" => op_substr_cp(arg, ctx),
+        // mongod: $substr is a deprecated alias of $substrBytes (byte-based).
+        "$substrBytes" | "$substr" => op_substr_bytes(arg, ctx),
         "$indexOfCP" => op_index_of(arg, ctx, false),
         "$indexOfBytes" => op_index_of(arg, ctx, true),
         "$trim" => op_trim(arg, ctx, TrimSide::Both),
@@ -212,6 +218,8 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$rtrim" => op_trim(arg, ctx, TrimSide::Right),
         // objects
         "$mergeObjects" => op_merge_objects(arg, ctx),
+        "$median" => op_percentile_expr(arg, ctx, true),
+        "$percentile" => op_percentile_expr(arg, ctx, false),
         "$objectToArray" => op_object_to_array(arg, ctx),
         "$getField" => op_get_field(arg, ctx),
         "$setField" => op_set_field(arg, ctx),
@@ -257,6 +265,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         // type conversions (safe subset; Decimal128 / string-parse / float
         // str() defer to Python)
         "$toInt" => op_to_int(arg, ctx),
+        "$toLong" => op_to_long(arg, ctx),
         "$toDouble" => op_to_double(arg, ctx),
         "$toDecimal" => op_to_decimal(arg, ctx),
         "$toDate" => op_to_date(arg, ctx),
@@ -365,6 +374,10 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$in",
     "$slice",
     "$indexOfArray",
+    "$sum",
+    "$avg",
+    "$max",
+    "$min",
     "$concat",
     "$toLower",
     "$toUpper",
@@ -378,7 +391,9 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$trim",
     "$ltrim",
     "$rtrim",
+    "$median",
     "$mergeObjects",
+    "$percentile",
     "$objectToArray",
     "$getField",
     "$setField",
@@ -417,6 +432,7 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$dateDiff",
     "$dateTrunc",
     "$toInt",
+    "$toLong",
     "$toDouble",
     "$toDecimal",
     "$toDate",
@@ -890,8 +906,18 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     }
     let arr = eval(&pair[0], ctx)?;
     let idx = eval(&pair[1], ctx)?;
-    let (Bson::Array(a), Some(i)) = (&arr, as_int_like(&idx)) else {
-        return Ok(Bson::Null);
+    if matches!(idx, Bson::Boolean(_)) {
+        return Err(Fallback); // Python raises 28690
+    }
+    let i = match coerce_index(&idx) {
+        IdxCoerce::Int(i) => i as i128,
+        IdxCoerce::Fractional => return Err(Fallback), // Python raises 28691
+        IdxCoerce::NotNumber => return Ok(Bson::Null),
+    };
+    let a = match &arr {
+        Bson::Array(a) => a,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array first arg -> Python raises 28689
     };
     let len = a.len() as i128;
     let resolved = if i < 0 { i + len } else { i };
@@ -904,12 +930,15 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
 
 fn op_first_last(arg: &Bson, ctx: &Ctx, first: bool) -> R {
     match eval(arg, ctx)? {
-        Bson::Array(a) if !a.is_empty() => Ok(if first {
+        Bson::Null => Ok(Bson::Null),
+        Bson::Array(a) => Ok(if a.is_empty() {
+            Bson::Null
+        } else if first {
             a[0].clone()
         } else {
             a[a.len() - 1].clone()
         }),
-        _ => Ok(Bson::Null),
+        _ => Err(Fallback), // non-array -> Python raises 28689
     }
 }
 
@@ -988,7 +1017,8 @@ fn op_concat_arrays(arg: &Bson, ctx: &Ctx) -> R {
     for p in parts {
         match eval(p, ctx)? {
             Bson::Array(a) => out.extend(a),
-            _ => return Ok(Bson::Null), // any non-array part -> null
+            Bson::Null => return Ok(Bson::Null), // null operand -> null result
+            _ => return Err(Fallback),           // non-array -> Python raises 28664
         }
     }
     Ok(Bson::Array(out))
@@ -996,11 +1026,12 @@ fn op_concat_arrays(arg: &Bson, ctx: &Ctx) -> R {
 
 fn op_reverse_array(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
+        Bson::Null => Ok(Bson::Null),
         Bson::Array(mut a) => {
             a.reverse();
             Ok(Bson::Array(a))
         }
-        _ => Ok(Bson::Null),
+        _ => Err(Fallback), // non-array -> Python raises 34435
     }
 }
 
@@ -1013,7 +1044,8 @@ fn op_in(arg: &Bson, ctx: &Ctx) -> R {
     }
     let needle = eval(&pair[0], ctx)?;
     let Bson::Array(hay) = eval(&pair[1], ctx)? else {
-        return Ok(Bson::Boolean(false));
+        // A non-array second argument is mongod Location40081 -> Python raises.
+        return Err(Fallback);
     };
     for elem in &hay {
         if py_eq(&needle, elem)? {
@@ -1035,8 +1067,43 @@ fn norm_index(i: i64, len: i64) -> i64 {
     }
 }
 
-fn slice_int(b: &Bson) -> Option<i64> {
-    as_int_like(b).map(|x| x as i64)
+/// Coerce a numeric arg to i64, truncating a finite double toward zero -- the
+/// `$substrBytes` semantics (mongod accepts any double there, unlike `$substrCP`
+/// which rejects a fractional one). `None` for a non-finite double / non-number
+/// (the caller defers to the Python oracle).
+fn trunc_index(b: &Bson) -> Option<i64> {
+    match b {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d) if d.is_finite() => Some(d.trunc() as i64),
+        _ => None,
+    }
+}
+
+/// Outcome of coercing a numeric aggregation index argument to `i64`, the way
+/// mongod does: an int (or a whole-number double) is the index; a double with a
+/// fractional part is rejected (Python raises the op's per-arg code, so the Rust
+/// core defers); anything else is a non-number the caller handles (null / -1).
+/// `bool` is handled by the caller's own guard before this is reached.
+enum IdxCoerce {
+    Int(i64),
+    Fractional,
+    NotNumber,
+}
+
+fn coerce_index(b: &Bson) -> IdxCoerce {
+    match b {
+        Bson::Int32(n) => IdxCoerce::Int(*n as i64),
+        Bson::Int64(n) => IdxCoerce::Int(*n),
+        Bson::Double(d) => {
+            if d.is_finite() && d.fract() == 0.0 {
+                IdxCoerce::Int(*d as i64)
+            } else {
+                IdxCoerce::Fractional
+            }
+        }
+        _ => IdxCoerce::NotNumber,
+    }
 }
 
 fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
@@ -1046,13 +1113,21 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     if a.len() != 2 && a.len() != 3 {
         return Err(Fallback);
     }
-    let Bson::Array(arr) = eval(&a[0], ctx)? else {
-        return Ok(Bson::Null); // non-array input -> null
+    let arr = match eval(&a[0], ctx)? {
+        Bson::Array(v) => v,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array input -> Python raises 28724
     };
     let len = arr.len() as i64;
     let (start, stop) = if a.len() == 2 {
-        let Some(n) = slice_int(&eval(&a[1], ctx)?) else {
-            return Ok(Bson::Null);
+        let n_v = eval(&a[1], ctx)?;
+        if matches!(n_v, Bson::Boolean(_)) {
+            return Err(Fallback); // Python raises 28725
+        }
+        let n = match coerce_index(&n_v) {
+            IdxCoerce::Int(n) => n,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 28726
+            IdxCoerce::NotNumber => return Ok(Bson::Null),
         };
         if n >= 0 {
             (0, n)
@@ -1060,9 +1135,20 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
             (n, len)
         }
     } else {
-        let (Some(pos), Some(n)) = (slice_int(&eval(&a[1], ctx)?), slice_int(&eval(&a[2], ctx)?))
-        else {
-            return Ok(Bson::Null);
+        let pos_v = eval(&a[1], ctx)?;
+        let n_v = eval(&a[2], ctx)?;
+        if matches!(pos_v, Bson::Boolean(_)) || matches!(n_v, Bson::Boolean(_)) {
+            return Err(Fallback); // Python raises 28725 / 28727
+        }
+        let pos = match coerce_index(&pos_v) {
+            IdxCoerce::Int(p) => p,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 28726
+            IdxCoerce::NotNumber => return Ok(Bson::Null),
+        };
+        let n = match coerce_index(&n_v) {
+            IdxCoerce::Int(n) => n,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 28728
+            IdxCoerce::NotNumber => return Ok(Bson::Null),
         };
         (pos, pos.saturating_add(n))
     };
@@ -1072,6 +1158,95 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     } else {
         arr[s as usize..e as usize].to_vec()
     }))
+}
+
+/// The values an expression-form `$sum`/`$avg`/`$max`/`$min` reduces over: an
+/// array argument contributes its elements, a null/absent argument contributes
+/// nothing, and any other value is a single element. Mirrors
+/// `_expr_acc_values`.
+fn expr_acc_values(arg: &Bson, ctx: &Ctx) -> Result<Vec<Bson>, Fallback> {
+    match eval(arg, ctx)? {
+        Bson::Array(a) => Ok(a),
+        Bson::Null => Ok(Vec::new()),
+        other => Ok(vec![other]),
+    }
+}
+
+fn op_expr_sum(arg: &Bson, ctx: &Ctx) -> R {
+    // Reuses the group-accumulator `Num` width logic (int32 < int64 < double);
+    // a Decimal128 element defers to Python; non-numeric elements are ignored.
+    let mut running = crate::group::Num::Int { v: 0, wide: false };
+    for v in expr_acc_values(arg, ctx)? {
+        match v {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+                running = running.add(&v).map_err(|_| Fallback)?;
+            }
+            Bson::Decimal128(_) => return Err(Fallback),
+            _ => {} // bool / string / null / doc / array -> ignored
+        }
+    }
+    running.to_bson().map_err(|_| Fallback)
+}
+
+fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
+    let mut total = crate::group::Num::Int { v: 0, wide: false };
+    let mut count: i64 = 0;
+    for v in expr_acc_values(arg, ctx)? {
+        match v {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+                total = total.add(&v).map_err(|_| Fallback)?;
+                count += 1;
+            }
+            Bson::Decimal128(_) => return Err(Fallback),
+            _ => {}
+        }
+    }
+    if count == 0 {
+        return Ok(Bson::Null);
+    }
+    let tf = match total {
+        crate::group::Num::Int { v, .. } => {
+            if v.unsigned_abs() > (1u128 << 53) {
+                return Err(Fallback); // precision: defer to Python int/int divide
+            }
+            v as f64
+        }
+        crate::group::Num::Float(f) => f,
+    };
+    Ok(Bson::Double(tf / count as f64))
+}
+
+fn op_expr_extreme(arg: &Bson, ctx: &Ctx, want_max: bool) -> R {
+    let mut best: Option<Bson> = None;
+    for v in expr_acc_values(arg, ctx)? {
+        if matches!(v, Bson::Null) {
+            continue; // null never updates
+        }
+        match &best {
+            None => best = Some(v),
+            Some(cur) => {
+                let replace = if want_max {
+                    crate::order::bson_lt(cur, &v)
+                } else {
+                    crate::order::bson_lt(&v, cur)
+                };
+                match replace {
+                    Some(true) => best = Some(v),
+                    Some(false) => {}
+                    None => return Err(Fallback), // unorderable -> Python
+                }
+            }
+        }
+    }
+    Ok(best.unwrap_or(Bson::Null))
+}
+
+fn op_expr_max(arg: &Bson, ctx: &Ctx) -> R {
+    op_expr_extreme(arg, ctx, true)
+}
+
+fn op_expr_min(arg: &Bson, ctx: &Ctx) -> R {
+    op_expr_extreme(arg, ctx, false)
 }
 
 fn op_index_of_array(arg: &Bson, ctx: &Ctx) -> R {
@@ -1091,17 +1266,27 @@ fn op_index_of_array(arg: &Bson, ctx: &Ctx) -> R {
     let needle = eval(&a[1], ctx)?;
     let len = arr.len() as i64;
     let start = if a.len() >= 3 {
-        match slice_int(&eval(&a[2], ctx)?) {
-            Some(x) => x,
-            None => return Ok(Bson::Int32(-1)),
+        let sv = eval(&a[2], ctx)?;
+        if matches!(sv, Bson::Boolean(_)) {
+            return Err(Fallback); // Python raises 40096
+        }
+        match coerce_index(&sv) {
+            IdxCoerce::Int(x) => x,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 40096
+            IdxCoerce::NotNumber => return Ok(Bson::Int32(-1)),
         }
     } else {
         0
     };
     let end = if a.len() >= 4 {
-        match slice_int(&eval(&a[3], ctx)?) {
-            Some(x) => x,
-            None => return Ok(Bson::Int32(-1)),
+        let ev = eval(&a[3], ctx)?;
+        if matches!(ev, Bson::Boolean(_)) {
+            return Err(Fallback); // Python raises 40096
+        }
+        match coerce_index(&ev) {
+            IdxCoerce::Int(x) => x,
+            IdxCoerce::Fractional => return Err(Fallback), // Python raises 40096
+            IdxCoerce::NotNumber => return Ok(Bson::Int32(-1)),
         }
     } else {
         len
@@ -1123,10 +1308,11 @@ fn op_concat(arg: &Bson, ctx: &Ctx) -> R {
     let mut out = String::new();
     for p in eval_args(arg, ctx)? {
         match p {
-            Bson::Null => {}
+            // A null / missing operand short-circuits to a null result (mongod),
+            // left-to-right.
+            Bson::Null => return Ok(Bson::Null),
             Bson::String(s) => out.push_str(&s),
-            // Python str()-coerces non-strings; the formatting (esp. floats)
-            // is risky to reproduce, so defer.
+            // A non-string operand is Location16702 -> defer so Python raises it.
             _ => return Err(Fallback),
         }
     }
@@ -1196,11 +1382,21 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::String(s) = s else {
         return Err(Fallback);
     };
-    let (Some(start), Some(length)) =
-        (slice_int(&eval(&a[1], ctx)?), slice_int(&eval(&a[2], ctx)?))
+    let start_v = eval(&a[1], ctx)?;
+    let length_v = eval(&a[2], ctx)?;
+    if matches!(start_v, Bson::Boolean(_)) || matches!(length_v, Bson::Boolean(_)) {
+        return Err(Fallback); // Python raises 34450 / 34452
+    }
+    // Whole-number double coerces to int; fractional (34451/34453) and
+    // non-numeric both defer to the Python oracle.
+    let (IdxCoerce::Int(start), IdxCoerce::Int(length)) =
+        (coerce_index(&start_v), coerce_index(&length_v))
     else {
         return Err(Fallback);
     };
+    if start < 0 || length < 0 {
+        return Err(Fallback); // Python raises 34455 (start) / 34454 (length)
+    }
     let chars: Vec<char> = s.chars().collect();
     let clen = chars.len() as i64;
     let stop = if length < 0 {
@@ -1218,6 +1414,61 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
 }
 
 // --- objects ------------------------------------------------------------
+
+/// Expression-form `$median` / `$percentile` over an array input — mongod's
+/// discrete percentile (`sorted[max(0, ceil(p*n) - 1)]` as a double), sharing
+/// the value filter and rank math with the group accumulators. An invalid
+/// spec defers to Python, which raises mongod's exact error.
+fn op_percentile_expr(arg: &Bson, ctx: &Ctx, is_median: bool) -> R {
+    let Bson::Document(spec) = arg else {
+        return Err(Fallback);
+    };
+    if spec.get_str("method") != Ok("approximate") {
+        return Err(Fallback);
+    }
+    let input = spec.get("input").ok_or(Fallback)?;
+    let ps: Option<Vec<f64>> = if is_median {
+        None
+    } else {
+        let Some(Bson::Array(raw)) = spec.get("p") else {
+            return Err(Fallback);
+        };
+        let mut parsed = Vec::with_capacity(raw.len());
+        for p in raw {
+            let f = match p {
+                Bson::Int32(n) => *n as f64,
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                _ => return Err(Fallback),
+            };
+            if !(0.0..=1.0).contains(&f) {
+                return Err(Fallback);
+            }
+            parsed.push(f);
+        }
+        Some(parsed)
+    };
+    let raw = eval(input, ctx)?;
+    let items: Vec<&Bson> = match &raw {
+        Bson::Array(a) => a.iter().collect(),
+        other => vec![other],
+    };
+    let mut values: Vec<f64> = items
+        .into_iter()
+        .filter_map(crate::group::percentile_f64)
+        .collect();
+    values.sort_by(|a, b| a.partial_cmp(b).expect("NaN excluded at collect"));
+    Ok(if is_median {
+        crate::group::percentile_rank(&values, 0.5)
+    } else {
+        Bson::Array(
+            ps.unwrap_or_default()
+                .iter()
+                .map(|p| crate::group::percentile_rank(&values, *p))
+                .collect(),
+        )
+    })
+}
 
 fn op_merge_objects(arg: &Bson, ctx: &Ctx) -> R {
     let items: Vec<&Bson> = match arg {
@@ -1454,8 +1705,10 @@ fn op_map(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
-    let Bson::Array(arr) = eval_opt(d.get("input"), ctx)? else {
-        return Ok(Bson::Null); // non-array input -> null
+    let arr = match eval_opt(d.get("input"), ctx)? {
+        Bson::Array(a) => a,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array input -> Python raises 16883
     };
     let var = as_var_name(d.get("as"))?;
     let null = Bson::Null;
@@ -1471,8 +1724,10 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
-    let Bson::Array(arr) = eval_opt(d.get("input"), ctx)? else {
-        return Ok(Bson::Null);
+    let arr = match eval_opt(d.get("input"), ctx)? {
+        Bson::Array(a) => a,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array input -> Python raises 28651
     };
     let var = as_var_name(d.get("as"))?;
     let null = Bson::Null;
@@ -1500,8 +1755,10 @@ fn op_reduce(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
-    let Bson::Array(arr) = eval_opt(d.get("input"), ctx)? else {
-        return Ok(Bson::Null);
+    let arr = match eval_opt(d.get("input"), ctx)? {
+        Bson::Array(a) => a,
+        Bson::Null => return Ok(Bson::Null),
+        _ => return Err(Fallback), // non-array input -> Python raises 40080
     };
     let mut acc = eval_opt(d.get("initialValue"), ctx)?;
     let null = Bson::Null;
@@ -2025,7 +2282,8 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback)?;
     let millis = match eval(spec.get("date").ok_or(Fallback)?, ctx)? {
         Bson::DateTime(dt) => dt.timestamp_millis(),
-        _ => return Ok(Bson::Null), // `_ensure_datetime(non-datetime)` -> None -> null
+        Bson::Null => return Ok(Bson::Null), // null date -> null
+        _ => return Err(Fallback),           // non-date -> Python raises Location16006
     };
     // A `timezone` shifts the wall clock before rendering (naive input is UTC,
     // matching BSON Date semantics); see `timezone_offset_ms` for the fixed-offset
@@ -2355,6 +2613,18 @@ fn shift_date(start: i64, unit: &str, amount: i128) -> R {
 }
 
 /// `$dateAdd` (sign +1) / `$dateSubtract` (sign -1).
+/// An integer date argument (amount / binSize): an int or a whole double; a
+/// fractional double / bool / non-numeric -> None (defer so Python raises the
+/// mongod error rather than coercing a bool or rejecting a valid whole double).
+fn date_int(v: &Bson) -> Option<i128> {
+    match v {
+        Bson::Int32(n) => Some(*n as i128),
+        Bson::Int64(n) => Some(*n as i128),
+        Bson::Double(d) if d.fract() == 0.0 => Some(*d as i128),
+        _ => None,
+    }
+}
+
 fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
@@ -2370,8 +2640,8 @@ fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     let Bson::String(unit) = eval_opt(d.get("unit"), ctx)? else {
         return Err(Fallback); // unit must be a string
     };
-    let Some(amount) = as_int_like(&amount_v) else {
-        return Err(Fallback); // amount must be an integer
+    let Some(amount) = date_int(&amount_v) else {
+        return Err(Fallback); // fractional / bool / non-numeric -> Python raises 5166405
     };
     shift_date(start_dt.timestamp_millis(), &unit, sign * amount)
 }
@@ -2380,6 +2650,13 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
+    // A missing required *parameter* (key absent) is a mongod parse error
+    // (Location5166303/4/5) -> Python raises; a present-but-null one yields null.
+    for param in ["startDate", "endDate", "unit"] {
+        if !d.contains_key(param) {
+            return Err(Fallback);
+        }
+    }
     let start = eval_opt(d.get("startDate"), ctx)?;
     let end = eval_opt(d.get("endDate"), ctx)?;
     if is_null(&start) || is_null(&end) {
@@ -2446,9 +2723,10 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback);
     };
     let bin: i64 = match d.get("binSize") {
-        Some(e) => match as_int_like(&eval(e, ctx)?) {
+        Some(e) => match date_int(&eval(e, ctx)?) {
             Some(n) if n >= 1 => n as i64,
-            _ => return Err(Fallback), // binSize must be a positive integer
+            // fractional / bool / non-numeric (5439017) or < 1 (5439018) -> Python.
+            _ => return Err(Fallback),
         },
         None => 1,
     };
@@ -2515,25 +2793,53 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
 // --- type conversions ---------------------------------------------------
 
 fn op_to_int(arg: &Bson, ctx: &Ctx) -> R {
-    match eval(arg, ctx)? {
-        Bson::Null => Ok(Bson::Null),
-        // Python returns an already-int value unchanged (preserving int32 vs
-        // int64), rather than re-widening.
-        v @ (Bson::Int32(_) | Bson::Int64(_)) => Ok(v),
-        Bson::Boolean(b) => Ok(Bson::Int32(i32::from(b))),
+    // $toInt targets int32: an int64 or a double outside [i32::MIN, i32::MAX]
+    // overflows (Python raises 241). Non-finite / Decimal128 / string -> Python.
+    let n: i64 = match eval(arg, ctx)? {
+        Bson::Null => return Ok(Bson::Null),
+        Bson::Int32(v) => v as i64,
+        Bson::Int64(v) => v,
+        Bson::Boolean(b) => i64::from(b),
         Bson::Double(d) => {
             if !d.is_finite() {
-                return Err(Fallback); // Python int(nan/inf) raises
-            }
-            let t = d.trunc();
-            if t < i64::MIN as f64 || t > i64::MAX as f64 {
                 return Err(Fallback);
             }
-            int_to_bson(t as i128).ok_or(Fallback)
+            let t = d.trunc();
+            if t < i32::MIN as f64 || t > i32::MAX as f64 {
+                return Err(Fallback);
+            }
+            t as i64
         }
-        // Decimal128 / string parsing -> Python (edge-case-prone).
-        _ => Err(Fallback),
+        _ => return Err(Fallback),
+    };
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&n) {
+        return Err(Fallback); // overflow int32 -> Python raises 241
     }
+    Ok(Bson::Int32(n as i32))
+}
+
+fn op_to_long(arg: &Bson, ctx: &Ctx) -> R {
+    // $toLong targets int64: a double is truncated toward zero (out of i64 range
+    // -> Python raises 241). Non-finite / Decimal128 / string -> Python.
+    let n: i64 = match eval(arg, ctx)? {
+        Bson::Null => return Ok(Bson::Null),
+        Bson::Int32(v) => v as i64,
+        Bson::Int64(v) => v,
+        Bson::Boolean(b) => i64::from(b),
+        Bson::Double(d) => {
+            if !d.is_finite() {
+                return Err(Fallback);
+            }
+            let t = d.trunc();
+            // [-2^63, 2^63): a double at or beyond 2^63 can't be an i64.
+            if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t) {
+                return Err(Fallback); // overflow int64 -> Python raises 241
+            }
+            t as i64
+        }
+        _ => return Err(Fallback),
+    };
+    Ok(Bson::Int64(n))
 }
 
 fn op_to_double(arg: &Bson, ctx: &Ctx) -> R {
@@ -2692,6 +2998,9 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
         // builds a *tz-aware* datetime for the numeric path, which wouldn't
         // compare equal to a bson-decoded naive datetime, so we defer it.
         9 => match value {
+            // bool -> date is a *supported-but-failed* conversion (mongod 241), so
+            // `$convert`'s onError applies; without onError, Python raises 241.
+            Bson::Boolean(_) => Conv::Failed,
             Bson::DateTime(_) => Conv::Ok(value.clone()),
             // int / long / double: milliseconds since the Unix epoch -> date.
             Bson::Int32(n) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*n as i64))),
@@ -2708,17 +3017,20 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
 }
 
 fn wrap_int(n: i128, code: i32) -> Conv {
-    if code == 18 {
-        if (i64::MIN as i128..=i64::MAX as i128).contains(&n) {
-            Conv::Ok(Bson::Int64(n as i64))
-        } else {
-            Conv::Failed
-        }
+    // int (16) targets int32, long (18) targets int64; out of range overflows
+    // (Python raises 241 -> onError, else "$convert failed").
+    let (lo, hi) = if code == 18 {
+        (i64::MIN as i128, i64::MAX as i128)
     } else {
-        match int_to_bson(n) {
-            Some(v) => Conv::Ok(v),
-            None => Conv::Failed,
-        }
+        (i32::MIN as i128, i32::MAX as i128)
+    };
+    if !(lo..=hi).contains(&n) {
+        return Conv::Failed;
+    }
+    if code == 18 {
+        Conv::Ok(Bson::Int64(n as i64))
+    } else {
+        Conv::Ok(Bson::Int32(n as i32))
     }
 }
 
@@ -2790,7 +3102,9 @@ fn regex_input(spec: &Document, ctx: &Ctx) -> Result<Option<String>, Fallback> {
     };
     Ok(match input {
         Bson::String(s) => Some(s),
-        _ => None,
+        Bson::Null => None,
+        // A non-string, non-null input is mongod Location51104 -> Python raises.
+        _ => return Err(Fallback),
     })
 }
 
@@ -2844,14 +3158,24 @@ fn op_regex_find_all(arg: &Bson, ctx: &Ctx) -> R {
 
 // --- math ---------------------------------------------------------------
 
+/// The f64 for a unary math operator, deferring bool *and* non-numeric to Python
+/// (which raises Location28765 / 51081 rather than coercing a bool or computing
+/// on a string). Real numbers only; null is handled by the caller.
+fn math_float(v: &Bson) -> Result<f64, Fallback> {
+    if matches!(v, Bson::Boolean(_)) {
+        return Err(Fallback);
+    }
+    as_float_like(v).ok_or(Fallback)
+}
+
 fn op_abs(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         Bson::Int32(n) => int_to_bson((n as i128).abs()).ok_or(Fallback),
         Bson::Int64(n) => int_to_bson((n as i128).abs()).ok_or(Fallback),
-        Bson::Boolean(b) => Ok(Bson::Int32(i32::from(b))),
         Bson::Double(d) => Ok(Bson::Double(d.abs())),
-        _ => Err(Fallback), // Decimal128 / non-numeric: Python abs() raises
+        // bool / Decimal128 / non-numeric: Python raises 28765 -> defer.
+        _ => Err(Fallback),
     }
 }
 
@@ -2860,7 +3184,6 @@ fn op_floor_ceil(arg: &Bson, ctx: &Ctx, ceil: bool) -> R {
         Bson::Null => Ok(Bson::Null),
         // math.floor/ceil of an int returns it unchanged.
         v @ (Bson::Int32(_) | Bson::Int64(_)) => Ok(v),
-        Bson::Boolean(b) => Ok(Bson::Int32(i32::from(b))),
         Bson::Double(d) => {
             if !d.is_finite() {
                 return Err(Fallback); // math.floor(nan/inf) raises
@@ -2879,42 +3202,40 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            let Some(f) = as_float_like(&v) else {
-                return Err(Fallback); // Decimal128 / non-numeric -> Python
-            };
-            // Python: math.sqrt(v) if v >= 0 else None. NaN >= 0 is false -> None.
-            if f >= 0.0 {
-                Ok(Bson::Double(f.sqrt()))
+            let f = math_float(&v)?; // bool / Decimal128 / non-numeric -> Python
+                                     // A negative argument is mongod's Location28714 — defer so
+                                     // Python raises it (NaN passes through as sqrt(nan) = nan).
+            if f < 0.0 {
+                Err(Fallback)
             } else {
-                Ok(Bson::Null)
+                Ok(Bson::Double(f.sqrt()))
             }
         }
     }
 }
 
-// `$exp`: e**x. Numeric (incl. bool) -> Double; null -> null; Decimal128 /
-// non-numeric -> Python (matches `expressions._op_exp`, which calls math.exp).
+// `$exp`: e**x. Numeric -> Double; null -> null; bool / Decimal128 / non-numeric
+// -> Python (which raises 28765). Mirrors `expressions._op_exp`.
 fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
-        v => as_float_like(&v)
-            .map(|f| Bson::Double(f.exp()))
-            .ok_or(Fallback),
+        v => Ok(Bson::Double(math_float(&v)?.exp())),
     }
 }
 
-// `$ln`: natural log. Python returns null for v <= 0 (incl. NaN, since NaN > 0 is
-// false). Mirrors `expressions._op_ln`.
+// `$ln`: natural log. A non-positive argument is mongod's Location28766 —
+// defer so Python raises it (NaN passes through as ln(nan) = nan). Mirrors
+// `expressions._op_ln`.
 fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            let f = as_float_like(&v).ok_or(Fallback)?;
-            Ok(if f > 0.0 {
-                Bson::Double(f.ln())
+            let f = math_float(&v)?;
+            if f <= 0.0 {
+                Err(Fallback)
             } else {
-                Bson::Null
-            })
+                Ok(Bson::Double(f.ln()))
+            }
         }
     }
 }
@@ -2923,18 +3244,21 @@ fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            let f = as_float_like(&v).ok_or(Fallback)?;
-            Ok(if f > 0.0 {
-                Bson::Double(f.log10())
+            let f = math_float(&v)?;
+            // A non-positive argument is mongod's Location28761 — defer so
+            // Python raises it (NaN passes through as log10(nan) = nan).
+            if f <= 0.0 {
+                Err(Fallback)
             } else {
-                Bson::Null
-            })
+                Ok(Bson::Double(f.log10()))
+            }
         }
     }
 }
 
-// `$log`: [number, base] -> log_base(number). Null if any arg null or out of
-// domain (n <= 0, base <= 0, base == 1). Mirrors `expressions._op_log`.
+// `$log`: [number, base] -> log_base(number). Null if any arg is null; an
+// out-of-domain arg (n <= 0, base <= 0, base == 1) defers so Python raises
+// mongod's Location28758/28759. Mirrors `expressions._op_log`.
 fn op_log(arg: &Bson, ctx: &Ctx) -> R {
     let vals = eval_args(arg, ctx)?;
     if vals.len() != 2 {
@@ -2943,11 +3267,15 @@ fn op_log(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
-    let (Some(n), Some(base)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
+    // bool / non-numeric argument or base is mongod's Location28756 / 28757 —
+    // defer so Python raises them (math_float rejects bool, unlike as_float_like).
+    let (Ok(n), Ok(base)) = (math_float(&vals[0]), math_float(&vals[1])) else {
         return Err(Fallback);
     };
+    // Out-of-domain args are mongod's Location28758 (argument) / 28759
+    // (base) — defer so Python raises them (NaN passes through as nan).
     if n <= 0.0 || base <= 0.0 || base == 1.0 {
-        return Ok(Bson::Null);
+        return Err(Fallback);
     }
     // CPython's math.log(n, base) is log(n)/log(base); same operations -> same
     // result under the shared platform libm.
@@ -2965,6 +3293,11 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
     }
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
+    }
+    // A bool operand defers (Python raises 28762 base / 28763 exponent);
+    // as_float_like would otherwise coerce it to 1.0.
+    if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
+        return Err(Fallback);
     }
     if let (b @ (Bson::Int32(_) | Bson::Int64(_)), e @ (Bson::Int32(_) | Bson::Int64(_))) =
         (&vals[0], &vals[1])
@@ -2985,6 +3318,11 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
     let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
         return Err(Fallback);
     };
+    if a == 0.0 && b < 0.0 {
+        return Err(Fallback); // Python raises 28764 (base 0, negative exponent)
+    }
+    // f64::powf already yields NaN for a negative base with a fractional
+    // exponent (matching mongod / the Python complex->NaN guard).
     Ok(Bson::Double(a.powf(b)))
 }
 
@@ -2997,8 +3335,11 @@ fn round_trunc_args(arg: &Bson, ctx: &Ctx) -> Result<(Bson, i32), Fallback> {
             let n = eval(&a[0], ctx)?;
             let place = if a.len() > 1 {
                 match eval(&a[1], ctx)? {
+                    Bson::Boolean(_) => return Err(Fallback), // Python raises 16004
                     Bson::Int32(i) => i,
                     Bson::Int64(i) => i as i32,
+                    Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => d as i32,
+                    Bson::Double(_) => return Err(Fallback), // fractional -> Python raises 51082
                     _ => 0,
                 }
             } else {
@@ -3042,7 +3383,7 @@ fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
     match n {
         Bson::Null => Ok(Bson::Null),
         _ => {
-            let nf = as_float_like(&n).ok_or(Fallback)?;
+            let nf = math_float(&n)?; // bool / non-numeric -> Python (51081)
             let factor = 10f64.powi(place);
             Ok(Bson::Double((nf * factor).trunc() / factor))
         }
@@ -3357,6 +3698,11 @@ fn op_strcasecmp(arg: &Bson, ctx: &Ctx) -> R {
         match v {
             Bson::Null => Ok(String::new()),
             Bson::String(s) if s.is_ascii() => Ok(s.to_ascii_uppercase()),
+            // mongod $toString-coerces an operand; an integer matches Python's
+            // `str(int)`. Double / date / Decimal128 / bool defer (double string
+            // formatting + bool -> Location16007 are Python's).
+            Bson::Int32(n) => Ok(n.to_string()),
+            Bson::Int64(n) => Ok(n.to_string()),
             _ => Err(Fallback),
         }
     };
@@ -3399,10 +3745,10 @@ fn op_replace(arg: &Bson, ctx: &Ctx, all: bool) -> R {
 const MAX_RANGE_SIZE: i128 = 100_000;
 
 fn range_int(b: &Bson) -> Result<i64, Fallback> {
-    // Python requires int and not bool.
-    match b {
-        Bson::Int32(n) => Ok(*n as i64),
-        Bson::Int64(n) => Ok(*n),
+    // int or whole-number double is the value; bool / fractional double /
+    // non-number all defer to the Python oracle (which raises 34443-34448).
+    match coerce_index(b) {
+        IdxCoerce::Int(i) => Ok(i),
         _ => Err(Fallback),
     }
 }
@@ -3498,16 +3844,25 @@ fn op_index_of(arg: &Bson, ctx: &Ctx, bytes: bool) -> R {
         return Err(Fallback); // non-string operands -> Python raises
     };
     let len = if bytes { s.len() } else { s.chars().count() } as i64;
-    // start/end: Python isinstance(int) (incl bool); non-int -> -1.
-    let bound = |idx: usize, default: i64, ctx: &Ctx| -> Result<Option<i64>, Fallback> {
+    // start/end must be a non-negative int or whole double (mongod). A fractional
+    // double / bool / non-numeric (40096) or a negative index (40097) defers so
+    // Python raises the exact error.
+    let bound = |idx: usize, default: i64, ctx: &Ctx| -> Result<i64, Fallback> {
         if a.len() <= idx {
-            return Ok(Some(default));
+            return Ok(default);
         }
-        Ok(slice_int(&eval(&a[idx], ctx)?))
+        let n = match eval(&a[idx], ctx)? {
+            Bson::Int32(n) => n as i64,
+            Bson::Int64(n) => n,
+            Bson::Double(d) if d.fract() == 0.0 => d as i64,
+            _ => return Err(Fallback), // fractional / bool / non-numeric -> 40096
+        };
+        if n < 0 {
+            return Err(Fallback); // negative -> 40097
+        }
+        Ok(n)
     };
-    let (Some(start), Some(end)) = (bound(2, 0, ctx)?, bound(3, len, ctx)?) else {
-        return Ok(Bson::Int32(-1));
-    };
+    let (start, end) = (bound(2, 0, ctx)?, bound(3, len, ctx)?);
     let idx = if bytes {
         index_of_window(s.as_bytes(), needle.as_bytes(), start, end)
     } else {
@@ -3532,13 +3887,37 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::String(s) = s else {
         return Err(Fallback);
     };
-    let (Some(start), Some(length)) =
-        (slice_int(&eval(&a[1], ctx)?), slice_int(&eval(&a[2], ctx)?))
-    else {
+    let start_v = eval(&a[1], ctx)?;
+    let length_v = eval(&a[2], ctx)?;
+    if matches!(start_v, Bson::Boolean(_)) || matches!(length_v, Bson::Boolean(_)) {
+        return Err(Fallback); // Python raises 16034 / 16035
+    }
+    // $substrBytes truncates a double toward zero (not reject-fractional).
+    let (Some(start), Some(length)) = (trunc_index(&start_v), trunc_index(&length_v)) else {
         return Err(Fallback);
     };
     let bytes = s.as_bytes();
     let blen = bytes.len() as i64;
+    // mongod rejects a negative start (Python raises 50752); a negative length
+    // is fine (means "to the end").
+    if start < 0 {
+        return Err(Fallback);
+    }
+    // mongod rejects a byte range whose start is a UTF-8 continuation byte, or
+    // whose end splits a character -- even for an empty (length 0) range, which
+    // the from_utf8 check below would miss. Python raises 28656 / 28657 here;
+    // the core defers.
+    if start < blen && (bytes[start as usize] & 0xC0) == 0x80 {
+        return Err(Fallback); // Python raises 28656
+    }
+    let end = if length < 0 {
+        blen
+    } else {
+        start.saturating_add(length)
+    };
+    if (0..blen).contains(&end) && (bytes[end as usize] & 0xC0) == 0x80 {
+        return Err(Fallback); // Python raises 28657
+    }
     let stop = if length < 0 {
         blen
     } else {
@@ -3583,8 +3962,11 @@ fn op_trim(arg: &Bson, ctx: &Ctx, side: TrimSide) -> R {
         Some(e) => eval(e, ctx)?,
         None => return Err(Fallback),
     };
+    if is_null(&chars) {
+        return Ok(Bson::Null); // chars: null -> null result (mongod)
+    }
     let Bson::String(chars) = chars else {
-        return Err(Fallback);
+        return Err(Fallback); // non-string chars -> Python raises 50700
     };
     let pat = |c: char| chars.contains(c);
     let trimmed = match side {

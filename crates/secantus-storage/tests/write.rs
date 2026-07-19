@@ -5,7 +5,7 @@
 //! real WiredTiger.
 
 use bson::{doc, Bson, Document};
-use secantus_storage::{Storage, UpdateOutcome};
+use secantus_storage::Storage;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -67,14 +67,10 @@ fn update_operator_single_match() {
                 None,
             )
             .unwrap();
-        assert_eq!(
-            out,
-            UpdateOutcome {
-                matched: 1,
-                modified: 1,
-                upserted_id: None,
-            }
-        );
+        assert_eq!((out.matched, out.modified, out.upserted_id), (1, 1, None));
+        // The single-doc write captures its own post-image (fam's new:true).
+        let post = out.post_image.expect("post_image for a single-doc update");
+        assert_eq!(post.get("y"), Some(&Bson::Int32(9)));
         // Exactly one of the two got y=9 (single, not multi).
         let with_y = (1..=2)
             .filter(|i| get_doc(st, *i).contains_key("y"))

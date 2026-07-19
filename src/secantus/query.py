@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import re
 from collections.abc import Callable, Mapping
 from decimal import Decimal, InvalidOperation
@@ -30,7 +31,17 @@ MISSING: Any = _Missing()
 
 
 class QueryError(Exception):
-    pass
+    """An invalid query the server rejects at parse time.
+
+    ``code`` / ``code_name`` default to mongod's generic ``2 BadValue``;
+    operators with a documented distinct code (``$jsonSchema``'s keyword
+    validation: 9 FailedToParse / 14 TypeMismatch) set their own.
+    """
+
+    def __init__(self, message: str, *, code: int = 2, code_name: str = "BadValue") -> None:
+        super().__init__(message)
+        self.code = code
+        self.code_name = code_name
 
 
 def matches(
@@ -91,6 +102,7 @@ def _match_clause(
     if key == "$comment":
         return True
     if key == "$jsonSchema":
+        _check_json_schema_keywords(condition)
         return _validate_json_schema(doc, condition)
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
@@ -119,6 +131,119 @@ def _unique_items_key(value: Any) -> Any:
     return ("s", type(value).__name__, value)
 
 
+# Every $jsonSchema keyword mongod 7.0 accepts (title / description are
+# accepted-and-ignored metadata). Verified against a real mongod probe
+# (2026-07-17): an unknown keyword is `9 FailedToParse "Unknown $jsonSchema
+# keyword: <kw>"`; a known-but-unsupported JSON-Schema keyword is
+# `9 FailedToParse "$jsonSchema keyword '<kw>' is not currently supported"`.
+_JSON_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "allOf",
+        "anyOf",
+        "bsonType",
+        "dependencies",
+        "description",
+        "enum",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "items",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "minimum",
+        "multipleOf",
+        "not",
+        "oneOf",
+        "pattern",
+        "patternProperties",
+        "properties",
+        "required",
+        "title",
+        "type",
+        "uniqueItems",
+    }
+)
+_JSON_SCHEMA_UNSUPPORTED = frozenset({"$ref", "$schema", "default", "definitions", "format", "id"})
+
+
+def _check_json_schema_keywords(schema: Any) -> None:
+    """Parse-time $jsonSchema validation, recursing into every sub-schema —
+    mongod rejects the whole query before matching a single document. Codes and
+    messages are verbatim from a mongod 7.0 probe (including the grammar quirk
+    in the exclusive-bound message)."""
+    if not isinstance(schema, Mapping):
+        raise QueryError("$jsonSchema must be an object", code=14, code_name="TypeMismatch")
+    for kw, arg in schema.items():
+        if kw in _JSON_SCHEMA_UNSUPPORTED:
+            raise QueryError(
+                f"$jsonSchema keyword '{kw}' is not currently supported",
+                code=9,
+                code_name="FailedToParse",
+            )
+        if kw not in _JSON_SCHEMA_KEYWORDS:
+            raise QueryError(
+                f"Unknown $jsonSchema keyword: {kw}", code=9, code_name="FailedToParse"
+            )
+        if kw in ("title", "description") and not isinstance(arg, str):
+            raise QueryError(
+                f"$jsonSchema keyword '{kw}' must be of type string",
+                code=14,
+                code_name="TypeMismatch",
+            )
+        if kw == "multipleOf":
+            if isinstance(arg, bool) or not isinstance(arg, (int, float)):
+                raise QueryError(
+                    "$jsonSchema keyword 'multipleOf' must be a number",
+                    code=14,
+                    code_name="TypeMismatch",
+                )
+            if arg <= 0:
+                raise QueryError(
+                    "$jsonSchema keyword 'multipleOf' must have a positive value",
+                    code=9,
+                    code_name="FailedToParse",
+                )
+        if kw in ("exclusiveMinimum", "exclusiveMaximum"):
+            if not isinstance(arg, bool):
+                raise QueryError(
+                    f"$jsonSchema keyword '{kw}' must be a boolean",
+                    code=14,
+                    code_name="TypeMismatch",
+                )
+            bound = "minimum" if kw == "exclusiveMinimum" else "maximum"
+            if bound not in schema:
+                raise QueryError(
+                    f"$jsonSchema keyword '{bound}' must be a present if {kw} is present",
+                    code=9,
+                    code_name="FailedToParse",
+                )
+        # Recurse into sub-schemas.
+        if kw in ("properties", "patternProperties") and isinstance(arg, Mapping):
+            for sub in arg.values():
+                _check_json_schema_keywords(sub)
+        elif kw in ("additionalProperties", "additionalItems"):
+            if isinstance(arg, Mapping):
+                _check_json_schema_keywords(arg)
+        elif kw == "not":
+            _check_json_schema_keywords(arg)
+        elif kw == "items":
+            for sub in arg if isinstance(arg, list) else [arg]:
+                _check_json_schema_keywords(sub)
+        elif kw in ("allOf", "anyOf", "oneOf") and isinstance(arg, list):
+            for sub in arg:
+                _check_json_schema_keywords(sub)
+        elif kw == "dependencies" and isinstance(arg, Mapping):
+            for dep in arg.values():
+                if isinstance(dep, Mapping):
+                    _check_json_schema_keywords(dep)
+
+
 def _validate_json_schema(value: Any, schema: Any) -> bool:
     if not isinstance(schema, Mapping):
         return False
@@ -137,13 +262,18 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
     if "enum" in schema and value not in schema["enum"]:
         return False
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if "minimum" in schema and value < schema["minimum"]:
-            return False
-        if "maximum" in schema and value > schema["maximum"]:
-            return False
-        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
-            return False
-        if "exclusiveMaximum" in schema and value >= schema["exclusiveMaximum"]:
+        # Draft-4 semantics, matching mongod: exclusiveMinimum / exclusiveMaximum
+        # are BOOLEANS that sharpen minimum / maximum to a strict bound (the
+        # draft-6 numeric form is rejected at parse time).
+        if "minimum" in schema:
+            m = schema["minimum"]
+            if value < m or (schema.get("exclusiveMinimum") is True and value == m):
+                return False
+        if "maximum" in schema:
+            m = schema["maximum"]
+            if value > m or (schema.get("exclusiveMaximum") is True and value == m):
+                return False
+        if "multipleOf" in schema and math.fmod(value, schema["multipleOf"]) != 0:
             return False
     if isinstance(value, str):
         if "minLength" in schema and len(value) < schema["minLength"]:
@@ -159,9 +289,26 @@ def _validate_json_schema(value: Any, schema: Any) -> bool:
         if "maxItems" in schema and len(value) > schema["maxItems"]:
             return False
         if "items" in schema:
-            for item in value:
-                if not _validate_json_schema(item, schema["items"]):
-                    return False
+            items = schema["items"]
+            if isinstance(items, list):
+                # Tuple validation: position i validates against items[i];
+                # elements past the tuple validate against additionalItems
+                # (False = none allowed; a schema = each must match; absent =
+                # anything goes). Matches the mongod probe.
+                for i, item in enumerate(value):
+                    if i < len(items):
+                        if not _validate_json_schema(item, items[i]):
+                            return False
+                    else:
+                        extra = schema.get("additionalItems")
+                        if extra is False:
+                            return False
+                        if isinstance(extra, Mapping) and not _validate_json_schema(item, extra):
+                            return False
+            else:
+                for item in value:
+                    if not _validate_json_schema(item, items):
+                        return False
         if schema.get("uniqueItems") is True:
             # Every element must be distinct under MongoDB value equality, which
             # bridges cross-type-equal numerics (int/long/double/Decimal128 by
@@ -290,10 +437,17 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
         # iterating; pull them in below when their parent op runs.
         _SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
         has_near = "$near" in condition or "$nearSphere" in condition
+        # mongod validates the $regex / $options pair at parse time (BadValue /
+        # 51108), before matching. $options is a sibling modifier of $regex.
+        if "$options" in condition:
+            if "$regex" not in condition:
+                raise QueryError("$options needs a $regex")
+            _validate_regex_options(condition["$options"])
         for op, arg in condition.items():
             if op in _SIBLING_MODIFIERS:
                 continue
             if op == "$regex":
+                _validate_regex_pattern(arg)
                 if not _op_regex(values, arg, condition.get("$options", "")):
                     return False
             elif op in ("$near", "$nearSphere") and has_near:
@@ -310,6 +464,32 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
                 return False
         return True
     return _eq_with_array(values, condition, collation)
+
+
+def _validate_not_arg(arg: Any) -> None:
+    """mongod's ``$not`` argument must be a regex or a non-empty document of
+    operators (BadValue): a scalar / array / bool is "$not needs a regex or a
+    document", an empty document is "$not cannot be empty". Without this a bare
+    ``{$not: 5}`` silently degrades to "not equal to 5"."""
+    if isinstance(arg, Regex):
+        return
+    if not isinstance(arg, Mapping):
+        raise QueryError("$not needs a regex or a document")
+    if not arg:
+        raise QueryError("$not cannot be empty")
+
+
+def _validate_in_arg(op: str, arg: Any) -> None:
+    """mongod parse-time validation for ``$in`` / ``$nin`` (BadValue, code 2): the
+    argument must be an array, and no element may be a document with a
+    ``$``-prefixed key (``{$regex: …}`` / ``{$x: 1}`` — "cannot nest $ under $in").
+    A BSON ``Regex`` literal is fine. Without this a non-array leaks a Python
+    ``TypeError`` and a nested-``$`` doc silently matches nothing."""
+    if not isinstance(arg, list):
+        raise QueryError(f"{op} needs an array")
+    for element in arg:
+        if isinstance(element, Mapping) and any(str(k).startswith("$") for k in element):
+            raise QueryError("cannot nest $ under $in")
 
 
 def _in_candidate_matches(
@@ -398,19 +578,31 @@ def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | Non
     if op == "$gt":
         return _cmp(values, arg, lambda a, b: a > b, collation)
     if op == "$gte":
+        # `$gte: null` (like `$lte: null`) matches null and missing — the same
+        # set as `$eq: null` — because null only orders equal to null. `$gt`/`$lt`
+        # null match nothing (a value is never strictly above/below null).
+        if arg is None:
+            return _eq_with_array(values, None, collation)
         return _cmp(values, arg, lambda a, b: a >= b, collation)
     if op == "$lt":
         return _cmp(values, arg, lambda a, b: a < b, collation)
     if op == "$lte":
+        if arg is None:
+            return _eq_with_array(values, None, collation)
         return _cmp(values, arg, lambda a, b: a <= b, collation)
     if op == "$in":
+        _validate_in_arg("$in", arg)
         return any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$nin":
+        _validate_in_arg("$nin", arg)
         return not any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
     if op == "$exists":
+        # mongod uses its own truthiness for the argument (only false / 0 / null
+        # are falsy — an empty string / array / document is truthy), NOT Python's.
         present = any(v is not MISSING for v in values)
-        return present == bool(arg)
+        return present == _truthy(arg)
     if op == "$not":
+        _validate_not_arg(arg)
         return not _field_matches(values, arg, collation)
     if op == "$type":
         return _op_type(values, arg)
@@ -421,15 +613,17 @@ def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | Non
     if op == "$mod":
         return _op_mod(values, arg)
     if op == "$elemMatch":
+        if not isinstance(arg, Mapping):
+            raise QueryError("$elemMatch needs an Object")
         return _op_elem_match(values, arg)
     if op == "$bitsAllSet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == m)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == m, op)
     if op == "$bitsAnySet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0, op)
     if op == "$bitsAllClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0, op)
     if op == "$bitsAnyClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != m)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != m, op)
     if op == "$geoWithin":
         return _op_geo_within(values, arg)
     if op == "$geoIntersects":
@@ -617,23 +811,67 @@ def _opt_number(value: Any, label: str) -> float | None:
     return float(value)
 
 
-def _resolve_bitmask(arg: Any) -> int:
+def _resolve_bitmask(arg: Any, op: str) -> int:
+    """Build the bitmask for a `$bits*` query, mongod-style. The argument is an
+    array of bit positions or a non-negative integer / whole-number-double mask.
+    A whole double is accepted (truncated); a fractional double, a bool, or a
+    negative value is rejected — a bad *position* with code 2, a bad non-array
+    *mask* with code 9 (a bool mask with code 2). Codes verified vs mongod 7.0.12."""
     if isinstance(arg, bool):
-        raise QueryError("bitwise mask cannot be a boolean")
-    if isinstance(arg, int):
+        raise QueryError(
+            f"n takes an Array, a number, or a BinData but received: {op}: "
+            f"{'true' if arg else 'false'}",
+            code=2,
+        )
+    if isinstance(arg, (int, float)):
+        if isinstance(arg, float):
+            if not arg.is_integer():
+                raise QueryError(
+                    f"Expected an integer: {op}: {arg!r}", code=9, code_name="FailedToParse"
+                )
+            arg = int(arg)
+        if arg < 0:
+            raise QueryError(
+                f"Expected a non-negative number in: {op}: {arg}",
+                code=9,
+                code_name="FailedToParse",
+            )
         return arg
     if isinstance(arg, list):
         mask = 0
-        for bit in arg:
-            if not isinstance(bit, int) or isinstance(bit, bool):
-                raise QueryError("bitwise mask positions must be integers")
+        for i, bit in enumerate(arg):
+            if isinstance(bit, bool):
+                raise QueryError(
+                    f"Failed to parse bit position. Expected a number in: {i}: "
+                    f"{'true' if bit else 'false'}",
+                    code=2,
+                )
+            if isinstance(bit, float):
+                if not bit.is_integer():
+                    raise QueryError(
+                        f"Failed to parse bit position. Expected an integer: {i}: {bit!r}",
+                        code=2,
+                    )
+                bit = int(bit)
+            if not isinstance(bit, int):
+                raise QueryError(
+                    f"Failed to parse bit position. Expected a number in: {i}: {bit!r}",
+                    code=2,
+                )
+            if bit < 0:
+                raise QueryError(
+                    f"Failed to parse bit position. Expected a non-negative number in: {i}: {bit}",
+                    code=2,
+                )
             mask |= 1 << bit
         return mask
-    raise QueryError("bitwise operator requires an int or list of bit positions")
+    raise QueryError(f"n takes an Array, a number, or a BinData but received: {op}", code=2)
 
 
-def _op_bitwise(values: list[Any], arg: Any, predicate: Callable[[int, int], bool]) -> bool:
-    mask = _resolve_bitmask(arg)
+def _op_bitwise(
+    values: list[Any], arg: Any, predicate: Callable[[int, int], bool], op: str
+) -> bool:
+    mask = _resolve_bitmask(arg, op)
     for v in values:
         if isinstance(v, int) and not isinstance(v, bool) and predicate(v, mask):
             return True
@@ -677,6 +915,27 @@ def _try_cmp(
     # separately). Both-bool falls through to a normal (correct) bool compare.
     if isinstance(a, bool) != isinstance(b, bool):
         return False
+    # Two embedded documents order field-by-field under range operators
+    # (mongod: first differing key compares as a string, else recurse into the
+    # value, else the shorter document sorts first). Python's ``operator.gt``
+    # raises ``TypeError`` on two dicts, which the ``except`` below swallows to
+    # a silent no-match — so ``{a: {$gt: {x: 1}}}`` wrongly matched nothing.
+    # Route through the BSON-order comparator (same one ``$sort`` uses).
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        from secantus.ordering import _bson_lt
+
+        c = -1 if _bson_lt(a, b) else (1 if _bson_lt(b, a) else 0)
+        return bool(op(c, 0))
+    # Two arrays order element-by-element under range operators, but each
+    # element pair compares by *full* BSON order (type rank first) — mongod
+    # ranks a string element above a number element, so `[1, "x"] > [1, 2]`.
+    # Python's native `[..] < [..]` raises TypeError on such a cross-type
+    # element pair (swallowed to a no-match), so route through `_bson_lt`.
+    if isinstance(a, list) and isinstance(b, list):
+        from secantus.ordering import _bson_lt
+
+        c = -1 if _bson_lt(a, b) else (1 if _bson_lt(b, a) else 0)
+        return bool(op(c, 0))
     a, b = _coerce_numeric(a, b)
     a, b = _coerce_datetime(a, b)
     try:
@@ -770,6 +1029,28 @@ def _compile_regex(pattern: str | bytes, flags: int) -> re.Pattern:
             f"regex pattern of {len(pattern)} chars exceeds the {_MAX_REGEX_PATTERN_LEN}-char cap"
         )
     return re.compile(pattern, flags)
+
+
+_VALID_REGEX_FLAGS = frozenset("imsxu")
+
+
+def _validate_regex_options(options: Any) -> None:
+    """mongod's ``$options`` validation: it must be a string (else BadValue) of
+    only the flags ``imsxu`` (an unknown letter is Location51108)."""
+    if not isinstance(options, str):
+        raise QueryError("$options has to be a string")
+    for c in options:
+        if c not in _VALID_REGEX_FLAGS:
+            raise QueryError(
+                f"invalid flag in regex options: {c}", code=51108, code_name="Location51108"
+            )
+
+
+def _validate_regex_pattern(pattern: Any) -> None:
+    """mongod's ``$regex`` value must be a string or a regex literal (else
+    BadValue): a number / null / other type is rejected."""
+    if not isinstance(pattern, (str, bytes, Regex)):
+        raise QueryError("$regex has to be a string")
 
 
 def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
@@ -902,8 +1183,70 @@ def _matches_type(value: Any, type_spec: Any) -> bool:
     return bool(pred(value)) if pred else False
 
 
+# Every BSON type alias mongod's $type accepts (incl. the deprecated ones and the
+# "number" meta-alias) and the valid numeric codes: 1..19, minKey (-1), maxKey (127).
+_VALID_TYPE_ALIASES = frozenset(
+    {
+        "double",
+        "string",
+        "object",
+        "array",
+        "binData",
+        "undefined",
+        "objectId",
+        "bool",
+        "date",
+        "null",
+        "regex",
+        "dbPointer",
+        "javascript",
+        "symbol",
+        "javascriptWithScope",
+        "int",
+        "timestamp",
+        "long",
+        "decimal",
+        "minKey",
+        "maxKey",
+        "number",
+    }
+)
+_VALID_TYPE_CODES = frozenset({-1, 127} | set(range(1, 20)))
+
+
+def _validate_type_arg(t: Any) -> None:
+    """mongod's $type argument validation: a known string alias, or a numeric code
+    in {-1, 1..19, 127} (a whole double is accepted). A bool / other type is
+    TypeMismatch (14); an unknown alias or an out-of-range / fractional code is
+    BadValue (2), with a special hint for code 0."""
+    if isinstance(t, bool):
+        raise QueryError(
+            "type must be represented as a number or a string", code=14, code_name="TypeMismatch"
+        )
+    if isinstance(t, str):
+        if t not in _VALID_TYPE_ALIASES:
+            raise QueryError(f"Unknown type name alias: {t}")
+        return
+    if isinstance(t, (int, float)):
+        if isinstance(t, float):
+            if not t.is_integer():
+                raise QueryError(f"Invalid numerical type code: {t}")
+            code = int(t)
+        else:
+            code = t
+        if code not in _VALID_TYPE_CODES:
+            suffix = ". Instead use {$exists:false}." if code == 0 else ""
+            raise QueryError(f"Invalid numerical type code: {code}{suffix}")
+        return
+    raise QueryError(
+        "type must be represented as a number or a string", code=14, code_name="TypeMismatch"
+    )
+
+
 def _op_type(values: list[Any], type_spec: Any) -> bool:
     types = type_spec if isinstance(type_spec, list) else [type_spec]
+    for t in types:
+        _validate_type_arg(t)
     for v in values:
         if v is MISSING:
             continue
@@ -917,14 +1260,52 @@ def _op_type(values: list[Any], type_spec: Any) -> bool:
 
 
 def _op_size(values: list[Any], size: Any) -> bool:
-    if not isinstance(size, int):
-        raise QueryError("$size requires an integer")
-    return any(isinstance(v, list) and len(v) == size for v in values)
+    # mongod validates $size strictly (probed 7.0.12): it must be a number
+    # (bool and string are rejected), integer-valued (2.0 is accepted as 2, 2.5
+    # is not), and non-negative. Each failure is a distinct parse error, not a
+    # silent no-match.
+    if isinstance(size, bool) or not isinstance(size, (int, float, Decimal128)):
+        raise QueryError(f"Failed to parse $size. Expected a number in: $size: {size!r}")
+    if isinstance(size, Decimal128):
+        try:
+            dec = size.to_decimal()
+        except (InvalidOperation, ValueError):
+            raise QueryError(
+                f"Failed to parse $size. Expected a number in: $size: {size!r}"
+            ) from None
+        if dec != dec.to_integral_value():
+            raise QueryError(f"Failed to parse $size. Expected an integer: $size: {size!r}")
+        n = int(dec)
+    elif isinstance(size, float):
+        if not size.is_integer():
+            raise QueryError(f"Failed to parse $size. Expected an integer: $size: {size!r}")
+        n = int(size)
+    else:
+        n = size
+    if n < 0:
+        raise QueryError(
+            f"Failed to parse $size. Expected a non-negative number in: $size: {size!r}"
+        )
+    return any(isinstance(v, list) and len(v) == n for v in values)
 
 
 def _op_all(values: list[Any], required: Any) -> bool:
     if not isinstance(required, list):
-        raise QueryError("$all requires an array")
+        raise QueryError("$all needs an array")
+
+    # mongod: if any element is a $-expression document, EVERY element must be a
+    # {$elemMatch: …} clause (the all-$elemMatch form). Mixing $elemMatch with a
+    # scalar, or using any other $-operator doc, is "no $ expressions in $all".
+    def _is_elemmatch_clause(e: Any) -> bool:
+        return isinstance(e, Mapping) and list(e.keys()) == ["$elemMatch"]
+
+    def _has_dollar_key(e: Any) -> bool:
+        return isinstance(e, Mapping) and any(str(k).startswith("$") for k in e)
+
+    if any(_has_dollar_key(e) for e in required) and not all(
+        _is_elemmatch_clause(e) for e in required
+    ):
+        raise QueryError("no $ expressions in $all")
 
     def _elem_matches_required(elem: Any, r: Any) -> bool:
         # Regex elements in the ``$all`` array match as patterns, not by
@@ -944,41 +1325,75 @@ def _op_all(values: list[Any], required: Any) -> bool:
             return False
         return elem == r
 
-    def _required_satisfied(v: list[Any], r: Any) -> bool:
+    def _required_satisfied(v: Any, r: Any) -> bool:
         # A `{$elemMatch: {...}}` clause requires *some* element of the array to
-        # match the sub-query (mongod's `$all` + `$elemMatch` form); every other
-        # clause requires some element to equal / pattern-match it.
+        # match the sub-query (mongod's `$all` + `$elemMatch` form) — a scalar
+        # field can never satisfy it. Every other clause matches if the field is
+        # an array containing a matching element, OR a scalar that itself
+        # equals / pattern-matches the clause (mongod treats a scalar field like
+        # a one-element array for `$all`, verified against mongod 7.0.12).
         if isinstance(r, Mapping) and list(r.keys()) == ["$elemMatch"]:
-            return _op_elem_match([v], r["$elemMatch"])
-        return any(_elem_matches_required(elem, r) for elem in v)
+            return isinstance(v, list) and _op_elem_match([v], r["$elemMatch"])
+        if isinstance(v, list):
+            return any(_elem_matches_required(elem, r) for elem in v)
+        return _elem_matches_required(v, r)
 
-    for v in values:
-        if isinstance(v, list) and all(_required_satisfied(v, r) for r in required):
-            return True
-    return False
+    # `$all: []` matches nothing (mongod), not everything — guard the vacuous
+    # `all(...)` that would otherwise be True for every value.
+    if not required:
+        return False
+    return any(all(_required_satisfied(v, r) for r in required) for v in values)
+
+
+def _mod_int(v: Any) -> int | None:
+    """The integer a value contributes to ``$mod`` (truncated toward zero), or
+    None if it isn't a `$mod`-eligible number. mongod (probed 7.0.12) truncates
+    int / long / double / Decimal128 toward zero and **excludes bool** (bool is
+    not a number for `$mod`, unlike Python where ``True % 2`` evaluates)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return None if (math.isnan(v) or math.isinf(v)) else int(v)  # trunc toward zero
+    if isinstance(v, Decimal128):
+        try:
+            d = v.to_decimal()
+        except (InvalidOperation, ValueError):
+            return None
+        return int(d) if d.is_finite() else None
+    return None
 
 
 def _op_mod(values: list[Any], mod_spec: Any) -> bool:
-    if not (isinstance(mod_spec, (list, tuple)) and len(mod_spec) == 2):
-        raise QueryError("$mod requires [divisor, remainder]")
-    divisor, remainder = mod_spec
+    if not isinstance(mod_spec, (list, tuple)) or len(mod_spec) < 2:
+        raise QueryError("malformed mod, not enough elements")
+    div = _mod_int(mod_spec[0])
+    if div is None:
+        raise QueryError("malformed mod, divisor not a number")
+    if div == 0:
+        raise QueryError("divisor cannot be 0")
+    remainder = mod_spec[1]
     for v in values:
         if v is MISSING:
             continue
-        if _try_mod(v, divisor, remainder):
+        if _try_mod(v, div, remainder):
             return True
         if isinstance(v, list):
             for elem in v:
-                if _try_mod(elem, divisor, remainder):
+                if _try_mod(elem, div, remainder):
                     return True
     return False
 
 
-def _try_mod(v: Any, divisor: Any, remainder: Any) -> bool:
-    try:
-        return bool(v % divisor == remainder)
-    except (TypeError, ZeroDivisionError):
+def _try_mod(v: Any, div: int, remainder: Any) -> bool:
+    """``v`` (truncated to an int) mod ``div`` equals ``remainder``. Uses C-style
+    truncated modulo (``math.fmod``, sign of the dividend) to match mongod —
+    Python's ``%`` takes the sign of the divisor, so ``-5 % 2`` diverges."""
+    iv = _mod_int(v)
+    if iv is None:
         return False
+    return int(math.fmod(iv, div)) == remainder
 
 
 def _op_elem_match(values: list[Any], condition: Any) -> bool:

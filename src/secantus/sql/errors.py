@@ -18,10 +18,22 @@ class SQLError(Exception):
     message is user-facing — it is what a real ``psql`` session would print.
     """
 
-    def __init__(self, sqlstate: str, message: str) -> None:
+    def __init__(
+        self,
+        sqlstate: str,
+        message: str,
+        *,
+        diag: dict[str, str] | None = None,
+        position: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.sqlstate = sqlstate
         self.message = message
+        # Optional ErrorResponse identity fields (s=schema, t=table, c=column,
+        # n=constraint, d=datatype) and the 1-based statement position —
+        # clients surface them via the error Diagnostics / LINE context.
+        self.diag = diag or {}
+        self.position = position
 
 
 # A curated set of the SQLSTATEs this layer raises. Names mirror the Postgres
@@ -69,6 +81,14 @@ def unique_violation(message: str) -> SQLError:
 
 def foreign_key_violation(message: str) -> SQLError:
     return SQLError("23503", message)
+
+
+def serialization_failure() -> SQLError:
+    """SQLSTATE 40001 — the statement (or its COMMIT) lost a write-write race
+    with a concurrent transaction. WiredTiger is first-updater-wins, so the
+    loser surfaces the same retriable error a SERIALIZABLE Postgres would;
+    the client's correct response is ROLLBACK + retry."""
+    return SQLError("40001", "could not serialize access due to concurrent update")
 
 
 def datatype_mismatch(message: str) -> SQLError:

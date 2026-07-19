@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import functools
 import operator
+import threading
+import weakref
 from typing import Any
 
 import bson
@@ -18,6 +20,43 @@ from secantus.paths import get_path, has_path
 from secantus.sql import errors, planner, typemap
 from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
+
+# One write-statement lock per shared ``Storage``. A DML statement is a
+# read-modify-write spanning several storage calls (constraint probes,
+# post-image computation, the write itself); the storage ``RLock`` only
+# serializes each *call*, so two connections interleaving between the probe
+# and the write could both pass a UNIQUE check or both derive a post-image
+# from the same pre-image (lost update). Postgres serializes these with row
+# locks; we serialize the whole statement — writers on one storage already
+# serialize inside WiredTiger, so this costs no real concurrency. RLock so a
+# write nested inside another's enforcement (FK cascades) re-enters.
+_write_locks: weakref.WeakKeyDictionary[Any, threading.RLock] = weakref.WeakKeyDictionary()
+_write_locks_guard = threading.Lock()
+_fallback_write_lock = threading.RLock()  # storage objects that refuse weakrefs
+
+
+def _write_lock(storage: Any) -> threading.RLock:
+    with _write_locks_guard:
+        try:
+            lock = _write_locks.get(storage)
+            if lock is None:
+                lock = threading.RLock()
+                _write_locks[storage] = lock
+            return lock
+        except TypeError:
+            return _fallback_write_lock
+
+
+def _serialized_write(fn: Any) -> Any:
+    """Run a ``(plan, storage, db, ...)`` write executor under the storage's
+    statement-write lock."""
+
+    @functools.wraps(fn)
+    def wrapper(plan: Any, storage: Any, db: str, *args: Any, **kwargs: Any) -> Any:
+        with _write_lock(storage):
+            return fn(plan, storage, db, *args, **kwargs)
+
+    return wrapper
 
 
 def _pg_sort(items: list[Any], key_of: Any, specs: list[tuple[int, bool]]) -> None:
@@ -516,6 +555,21 @@ def _out_column_descs(
     out: list[ColumnDesc] = []
     for name, col in cols:
         oid = typemap.PG_OID.get(col.type_tag, 25)
+        if getattr(col, "json_plain", False):
+            oid = 114  # a ``json`` (not jsonb) column keeps the plain-json oid
+        if (
+            getattr(col, "composite_type", None) is not None
+            and storage is not None
+            and db is not None
+        ):
+            # A declared-composite column reports its type's MINTED oid (not
+            # generic RECORD/2249) so a registered psycopg loader fires and
+            # parses nested fields by their reflected types.
+            from secantus.sql import virtual
+
+            minted = virtual._composite_oids(db, Catalog(storage)).get(col.composite_type)
+            if minted is not None:
+                oid = minted
         if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:
             if enum_oids is None:
                 enum_oids = Catalog(storage).enum_type_oids(db)
@@ -594,6 +648,7 @@ def _returning_result(
     return SQLResult(command_tag=command_tag, columns=columns, rows=rows, rowcount=rowcount)
 
 
+@_serialized_write
 def execute_insert(
     plan: planner.InsertPlan,
     storage: Any,
@@ -672,6 +727,7 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
                 "23502",
                 f'null value in column "{col.name}" of relation "{table.name}" '
                 "violates not-null constraint",
+                diag={"s": _table_schema(table), "t": table.name, "c": col.name},
             )
     if not table.check_constraints:
         return
@@ -686,7 +742,12 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
             raise errors.SQLError(
                 "23514",
                 f'new row for relation "{table.name}" violates check constraint "{ck.name}"',
+                diag={"s": _table_schema(table), "t": table.name, "n": ck.name},
             )
+
+
+def _table_schema(table: Any) -> str:
+    return "pg_temp_1" if getattr(table, "temp", False) else "public"
 
 
 def _validate_check_option(
@@ -1145,9 +1206,10 @@ def _apply_conflict_update(
 
 def execute_constant_select(plan: planner.ConstantSelectPlan) -> SQLResult:
     oids = plan.pg_oids or [None] * len(plan.columns)
+    typmods = plan.typmods or [-1] * len(plan.columns)
     columns = [
-        ColumnDesc(name, tag, oid if oid is not None else typemap.PG_OID.get(tag, 25))
-        for (name, tag, _), oid in zip(plan.columns, oids, strict=True)
+        ColumnDesc(name, tag, oid if oid is not None else typemap.PG_OID.get(tag, 25), typmod)
+        for (name, tag, _), oid, typmod in zip(plan.columns, oids, typmods, strict=True)
     ]
     rows = [tuple(value for _, _, value in plan.columns)] if plan.emit else []
     return SQLResult(
@@ -1514,6 +1576,19 @@ def _pipeline_input_docs(
     from secantus.sql import scalar
 
     docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
+    if getattr(plan, "pre_eval_fields", None):
+        # Materialize computed GROUP BY keys the aggregation engine can't
+        # lower — evaluated per doc by the scalar engine before the pipeline.
+        resolve = plan.pre_eval_resolve
+        sc0 = sctx or _scalar_ctx(storage, db, None)
+        docs = [dict(d) for d in docs]
+        for doc in docs:
+
+            def scope(node: Any, _doc: dict[str, Any] = doc) -> Any:
+                return get_path(_doc, resolve(node)[0])
+
+            for fname, ast in plan.pre_eval_fields.items():
+                doc[fname] = scalar.evaluate(ast, scope, sc0)
     if plan.residual_where is None:
         return docs, plan.pipeline
     if plan.residual_split:
@@ -1721,6 +1796,7 @@ def execute_evaluated_select(
     )
 
 
+@_serialized_write
 def execute_update(
     plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:
@@ -2144,6 +2220,7 @@ def _enforce_fk_on_parent_update(
                 storage.update_matching(db, child.collection, filt, {"$set": clear}, multi=True)
 
 
+@_serialized_write
 def execute_delete(
     plan: planner.DeletePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:

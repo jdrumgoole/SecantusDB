@@ -36,6 +36,33 @@ def _num(text: str) -> Any:
     return float(text) if ("." in text or "e" in text.lower()) else int(text)
 
 
+def terminate_backend(args: list, session: Session) -> bool:
+    """``pg_terminate_backend`` / ``pg_cancel_backend``: find the target
+    backend in the server's live-session registry and close its connection
+    (cancel ≈ terminate here — statements run to completion synchronously, so
+    there is no mid-query cancel point). False when the pid isn't live."""
+    pid = int(args[0]) if args and args[0] is not None else -1
+    registry = getattr(session, "activity_registry", None)
+    target = None
+    if registry is not None:
+        target = next((s for s in registry.snapshot() if s.backend_pid == pid), None)
+    terminate = getattr(target, "terminate_cb", None) if target is not None else None
+    if terminate is not None:
+        terminate()
+        return True
+    return False
+
+
+def evaluate_scalar_by_name(name: str, args: list, session: Session) -> Any:
+    """Session-function dispatch by bare name + evaluated args — the scalar
+    evaluator's escape hatch for calls that appear in non-constant contexts."""
+    if name in ("pg_terminate_backend", "pg_cancel_backend"):
+        return terminate_backend(args, session)
+    if name == "pg_backend_pid":
+        return session.backend_pid
+    raise errors.feature_not_supported(f"function {name}() is not supported in this context")
+
+
 def evaluate_scalar(node: exp.Expression, session: Session) -> tuple[str, Any, str]:
     if isinstance(node, exp.Paren):
         return evaluate_scalar(node.this, session)
@@ -118,6 +145,8 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
         return ("pg_sleep", "", "text")
     if name in ("pg_is_in_recovery",):
         return (name, False, "bool")
+    if name in ("pg_terminate_backend", "pg_cancel_backend"):
+        return (name, terminate_backend(args, session), "bool")
     if name in ("jsonb_build_object", "json_build_object"):
         out: dict[str, Any] = {}
         for i in range(0, len(args) - 1, 2):

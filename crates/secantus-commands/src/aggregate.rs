@@ -55,7 +55,8 @@ use bson::{doc, Bson, Document};
 
 use crate::find::split_docs_into_cursor;
 use crate::util::{
-    as_i64, bool_field, collation_of, command_error, decode_docs, encode_docs, resolve_let_vars,
+    as_i64, bool_field, collation_of, command_error, decode_docs, decode_docs_minimal, encode_docs,
+    resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 use secantus_core::collation::Collation;
@@ -76,6 +77,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // unrecognised stage is Location40324, an Atlas-only stage is
     // CommandNotSupported (115) — not the generic "unsupported" BadValue.
     if let Err(e) = validate_stage_names(&pipeline) {
+        return Ok(e.into_reply());
+    }
+    // A genuinely unknown expression operator inside a `$project` spec is
+    // mongod's stage-specific Location31325, not the generic BadValue the
+    // engine fallback produces. Parse-time, like the stage-name check.
+    if let Err(e) = validate_project_exprs(&pipeline) {
         return Ok(e.into_reply());
     }
 
@@ -203,7 +210,27 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         &vars,
                     )
                     .map_err(command_error)?;
-                (ns, decode_docs(bytes)?, rest)
+                // Reduce the leading $skip/$limit/$match prefix over raw BSON so
+                // only the survivors that reach the first heavier stage are
+                // decoded (tasks/rust-perf-findings.md).
+                let (reduced, remaining) =
+                    reduce_raw_prefix(bytes, &rest, &vars, collation.as_ref());
+                // If the first heavier stage is a `$group`, decode only the
+                // top-level fields its `_id` + accumulators read from each
+                // survivor, not the whole (often wide) document
+                // (tasks/rust-phase6-streaming-agg-scoping.md, 6a). Any group
+                // shape the collector can't bound falls back to a full decode.
+                let group_fields = remaining
+                    .first()
+                    .and_then(Bson::as_document)
+                    .filter(|d| d.len() == 1)
+                    .and_then(|d| d.get("$group"))
+                    .and_then(secantus_core::referenced_top_level_fields);
+                let input = match group_fields {
+                    Some(fields) => decode_docs_minimal(reduced, &fields)?,
+                    None => decode_docs(reduced)?,
+                };
+                (ns, input, remaining)
             }
         }
         // Collectionless aggregate (e.g. `{aggregate: 1, pipeline: [{$documents: …}]}`).
@@ -367,6 +394,49 @@ fn recognized_stage(name: &str) -> bool {
 /// an unrecognised single-key stage → `Location40324`. Malformed stage shapes
 /// (non-document / empty / multi-key) are left to the engine path. Mirrors
 /// `aggregate.validate_stage_names`.
+/// Parse-time check for a genuinely unknown expression operator inside a
+/// `$project` stage — mongod reports `Location31325` ("Invalid $project ::
+/// caused by :: Unknown expression $op") where the engine-fallback path would
+/// give a generic `2 BadValue`. Mirrors `aggregate._stage_project`'s
+/// `UnknownExpressionOperatorError` wrap on the Python server.
+///
+/// Only values that would route to the expression evaluator are scanned: a
+/// single-key document whose key is a projection-only operator (`$slice` /
+/// `$elemMatch` / `$meta` — valid inside `$project`, NOT expression operators)
+/// is skipped, so it is never mislabeled. `first_unknown_expr_operator`
+/// recurses through nested documents/arrays and flags only a truly-unknown
+/// `$`-operator — a recognised-but-deferred operator still defers to Python.
+fn validate_project_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
+    const PROJECTION_ONLY_OPS: [&str; 3] = ["$slice", "$elemMatch", "$meta"];
+    for stage in pipeline {
+        let Some(spec) = stage
+            .as_document()
+            .and_then(|d| d.get("$project"))
+            .and_then(Bson::as_document)
+        else {
+            continue;
+        };
+        for (_field, value) in spec.iter() {
+            if let Bson::Document(d) = value {
+                if d.len() == 1 {
+                    let key = d.keys().next().map(String::as_str).unwrap_or_default();
+                    if PROJECTION_ONLY_OPS.contains(&key) {
+                        continue;
+                    }
+                }
+            }
+            if let Some(op) = secantus_core::expressions::first_unknown_expr_operator(value) {
+                return Err(CommandError::new(
+                    31325,
+                    "Location31325",
+                    format!("Invalid $project :: caused by :: Unknown expression {op}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
     for stage in pipeline {
         let Some(d) = stage.as_document() else {
@@ -805,14 +875,50 @@ fn apply_facet(
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
+    // mongod validates the spec before running: a non-empty object (40169), each
+    // value an array (40170), each stage a non-empty object (40171), and no nested
+    // $facet (40600).
     let s = spec
         .and_then(Bson::as_document)
-        .ok_or_else(|| bad_value("$facet requires a document spec"))?;
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| {
+            CommandError::new(
+                40169,
+                "Location40169",
+                "the $facet specification must be a non-empty object",
+            )
+        })?;
     let mut out = Document::new();
     for (name, sub) in s.iter() {
-        let sub_pipeline = sub
-            .as_array()
-            .ok_or_else(|| bad_value("$facet sub-pipeline must be an array"))?;
+        let sub_pipeline = sub.as_array().ok_or_else(|| {
+            CommandError::new(
+                40170,
+                "Location40170",
+                format!("arguments to $facet must be arrays, {name} is not an array"),
+            )
+        })?;
+        for stage in sub_pipeline {
+            match stage {
+                Bson::Document(d) if d.contains_key("$facet") => {
+                    return Err(CommandError::new(
+                        40600,
+                        "Location40600",
+                        "$facet is not allowed to be used within a $facet stage",
+                    ));
+                }
+                Bson::Document(d) if !d.is_empty() => {}
+                _ => {
+                    return Err(CommandError::new(
+                        40171,
+                        "Location40171",
+                        format!(
+                            "elements of arrays in $facet spec must be non-empty objects, \
+                             {name} argument contained an invalid element"
+                        ),
+                    ));
+                }
+            }
+        }
         // Each sub-pipeline runs over its own copy of the input docs.
         let res = run_segmented(
             docs.clone(),
@@ -1711,4 +1817,85 @@ fn lift_leading_match(pipeline: &[Bson]) -> (Document, Vec<Bson>) {
         }
     }
     (Document::new(), pipeline.to_vec())
+}
+
+/// Process the leading **pass-through prefix** of a pipeline over the fetched
+/// RAW blobs, before `decode_docs` materialises them. `$skip` / `$limit` drop or
+/// truncate whole documents and a (non-leading) `$match` filters via
+/// `query::matches_raw` (decoding only the filter's fields) — none of these
+/// inspect a document beyond the filter's fields or its position, so a limiting
+/// or selective prefix shrinks the set that the heavier stages (`$group` /
+/// `$sort` / computed `$project` / `$unwind` / …) must decode. Order-preserving,
+/// so the reduced-then-decoded input is identical to decoding everything and
+/// running the same stages through `apply_pipeline`. Stops at the first stage it
+/// doesn't handle (or a `$match` whose filter the raw matcher defers on),
+/// returning the reduced blobs and the remaining pipeline for the normal
+/// decode + run path.
+fn reduce_raw_prefix(
+    mut bytes: Vec<Vec<u8>>,
+    pipeline: &[Bson],
+    vars: &Document,
+    collation: Option<&Collation>,
+) -> (Vec<Vec<u8>>, Vec<Bson>) {
+    let mut consumed = 0;
+    for stage in pipeline {
+        let Some(sd) = stage.as_document() else { break };
+        if sd.len() != 1 {
+            break;
+        }
+        let Some((name, arg)) = sd.iter().next() else {
+            break;
+        };
+        match name.as_str() {
+            // Only fast-path a clearly-valid INTEGER argument. A whole double
+            // (`$limit: 2.0`) is valid but a fractional / bool / negative /
+            // zero-`$limit` argument must raise — deferring every non-integer
+            // arg to the full engine keeps its validation intact (it accepts the
+            // whole double and computes it; it raises on the rest).
+            "$skip" => match arg {
+                Bson::Int32(n) if *n >= 0 => {
+                    let n = (*n as usize).min(bytes.len());
+                    bytes.drain(..n);
+                }
+                Bson::Int64(n) if *n >= 0 => {
+                    let n = (*n as usize).min(bytes.len());
+                    bytes.drain(..n);
+                }
+                _ => break,
+            },
+            "$limit" => match arg {
+                Bson::Int32(n) if *n > 0 => bytes.truncate(*n as usize),
+                Bson::Int64(n) if *n > 0 => bytes.truncate(*n as usize),
+                _ => break,
+            },
+            "$match" => {
+                let Some(filter) = arg.as_document() else {
+                    break;
+                };
+                let mut kept = Vec::with_capacity(bytes.len());
+                let mut deferred = false;
+                for blob in &bytes {
+                    let Ok(raw) = bson::RawDocument::from_bytes(blob) else {
+                        deferred = true;
+                        break;
+                    };
+                    match secantus_core::query::matches_raw(raw, filter, vars, collation) {
+                        Ok(true) => kept.push(blob.clone()),
+                        Ok(false) => {}
+                        Err(_) => {
+                            deferred = true;
+                            break;
+                        }
+                    }
+                }
+                if deferred {
+                    break; // a filter the raw matcher can't do -> full engine
+                }
+                bytes = kept;
+            }
+            _ => break, // first heavier stage — stop
+        }
+        consumed += 1;
+    }
+    (bytes, pipeline[consumed..].to_vec())
 }

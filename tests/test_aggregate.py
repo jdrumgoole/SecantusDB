@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from bson import Int64
+from bson import Decimal128, Int64
 
 from secantus.aggregate import AggregateError, apply_pipeline
 
@@ -85,6 +85,24 @@ def test_sort_pipeline_stage() -> None:
     docs = [{"x": 3}, {"x": 1}, {"x": 2}]
     out = apply_pipeline(docs, [{"$sort": {"x": 1}}])
     assert [d["x"] for d in out] == [1, 2, 3]
+    # A whole-double direction is accepted (1.0 == ascending).
+    assert [d["x"] for d in apply_pipeline(docs, [{"$sort": {"x": 1.0}}])] == [1, 2, 3]
+
+
+def test_sort_stage_validation() -> None:
+    # mongod: non-numeric direction 15974, numeric non-±1 15975, empty spec 15976.
+    docs = [{"x": 1}]
+    for spec, code in [
+        ({"x": "asc"}, 15974),
+        ({"x": True}, 15974),
+        ({"x": 0}, 15975),
+        ({"x": 2}, 15975),
+        ({"x": 1.5}, 15975),
+        ({}, 15976),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(docs, [{"$sort": spec}])
+        assert exc.value.code == code, spec
 
 
 def test_project_inclusion_keeps_id_by_default() -> None:
@@ -141,6 +159,26 @@ def test_unwind_with_index() -> None:
     assert [(d["tags"], d["i"]) for d in out] == [("x", 0), ("y", 1)]
 
 
+def test_unwind_argument_validation() -> None:
+    # mongod: bare path 28818, non-string path 28808, non-string/empty index 28810,
+    # $-prefixed index 28822, non-bool preserve 28809.
+    docs = [{"a": [1, 2, 3]}]
+    for spec, code in [
+        ({"path": "a"}, 28818),
+        ("a", 28818),
+        ({"path": 5}, 28808),
+        ({"path": "$a", "includeArrayIndex": 5}, 28810),
+        ({"path": "$a", "includeArrayIndex": ""}, 28810),
+        ({"path": "$a", "includeArrayIndex": "$i"}, 28822),
+        ({"path": "$a", "preserveNullAndEmptyArrays": 5}, 28809),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$unwind": spec}])
+        assert exc.value.code == code, spec
+    # Valid forms still unwind.
+    assert len(apply_pipeline([dict(d) for d in docs], [{"$unwind": "$a"}])) == 3
+
+
 def test_unwind_empty_array_drops_doc_by_default() -> None:
     docs = [{"_id": 1, "tags": []}, {"_id": 2, "tags": ["x"]}]
     out = apply_pipeline(docs, [{"$unwind": "$tags"}])
@@ -186,6 +224,56 @@ def test_group_avg() -> None:
     docs = [{"x": 2}, {"x": 4}, {"x": 6}]
     out = apply_pipeline(docs, [{"$group": {"_id": None, "avg": {"$avg": "$x"}}}])
     assert out == [{"_id": None, "avg": 4.0}]
+
+
+def test_group_accumulators_ignore_non_numeric() -> None:
+    # mongod: $sum/$avg ignore string/bool/null/missing; $min/$max order all
+    # non-null values by BSON cross-type (bool > string > number) and skip null.
+    docs = [
+        {"g": 1, "v": 10},
+        {"g": 1, "v": "hi"},
+        {"g": 1, "v": True},
+        {"g": 1, "v": None},
+        {"g": 1},
+        {"g": 1, "v": 2.5},
+        {"g": 1, "v": Int64(3)},
+    ]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$group": {
+                    "_id": "$g",
+                    "s": {"$sum": "$v"},
+                    "a": {"$avg": "$v"},
+                    "mn": {"$min": "$v"},
+                    "mx": {"$max": "$v"},
+                }
+            }
+        ],
+    )
+    [b] = out
+    assert b["s"] == 15.5  # 10 + 2.5 + 3, non-numeric ignored
+    assert b["a"] == 15.5 / 3  # only 3 numeric values counted
+    assert b["mn"] == 2.5  # smallest number
+    assert b["mx"] is True  # bool sorts above string / number
+
+
+def test_group_all_non_numeric_defaults() -> None:
+    # $sum over no numeric value -> 0; $avg -> null. $max still picks the bool
+    # (non-null values are ordered, only null/missing are skipped).
+    docs = [{"v": "x"}, {"v": True}, {"v": None}]
+    out = apply_pipeline(
+        docs,
+        [{"$group": {"_id": None, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}, "mx": {"$max": "$v"}}}],
+    )
+    assert out == [{"_id": None, "s": 0, "a": None, "mx": True}]
+    # $min / $max over only null / missing -> null.
+    out2 = apply_pipeline(
+        [{"v": None}, {}],
+        [{"$group": {"_id": None, "mn": {"$min": "$v"}, "mx": {"$max": "$v"}}}],
+    )
+    assert out2 == [{"_id": None, "mn": None, "mx": None}]
 
 
 def test_group_min_max_first_last_push_addtoset() -> None:
@@ -316,6 +404,77 @@ def test_facet_runs_parallel_pipelines() -> None:
     assert out == [{"all": [{"n": 4}], "big": [{"n": 2}]}]
 
 
+def test_facet_validation_codes() -> None:
+    # mongod codes: empty/non-object spec 40169, non-array sub-pipeline 40170,
+    # non-object stage element 40171, nested $facet 40600.
+    docs = [{"v": 1}, {"v": 2}]
+    for spec, code in [
+        ({}, 40169),
+        ({"a": 5}, 40170),
+        ({"a": [5]}, 40171),
+        ({"a": [{}]}, 40171),
+        ({"a": [{"$facet": {"b": [{"$match": {"v": 1}}]}}]}, 40600),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$facet": spec}])
+        assert exc.value.code == code, spec
+    # An empty sub-pipeline is valid (yields the input docs unchanged).
+    assert apply_pipeline([dict(d) for d in docs], [{"$facet": {"a": []}}]) == [
+        {"a": [{"v": 1}, {"v": 2}]}
+    ]
+
+
+def test_count_validation_codes() -> None:
+    # mongod: the count field must be a non-empty string (40156/40157), not
+    # $-prefixed (40158), without a '.' (40160), and not "_id" (15948).
+    docs = [{"v": 1}, {"v": 2}, {"v": 3}]
+    for spec, code in [
+        (5, 40156),
+        ("", 40157),
+        ("$n", 40158),
+        ("a.b", 40160),
+        ("_id", 15948),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$count": spec}])
+        assert exc.value.code == code, spec
+    assert apply_pipeline([dict(d) for d in docs], [{"$count": "n"}]) == [{"n": 3}]
+
+
+def test_project_empty_spec_raises() -> None:
+    # mongod: a $project with no fields is Location51272.
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline([{"v": 1}], [{"$project": {}}])
+    assert exc.value.code == 51272
+
+
+def test_sort_by_count_validation_codes() -> None:
+    # mongod: a $-prefixed path string (40148) or a single-`$`-key expression
+    # object (40147); anything else (number/bool/array/null) is 40149.
+    docs = [{"v": 1}, {"v": 1}, {"v": 2}]
+    for spec, code in [
+        (5, 40149),
+        (True, 40149),
+        ([1], 40149),
+        (None, 40149),
+        ("v", 40148),
+        ({"a": 1}, 40147),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$sortByCount": spec}])
+        assert exc.value.code == code, spec
+    # A $-prefixed path string is valid.
+    assert apply_pipeline([dict(d) for d in docs], [{"$sortByCount": "$v"}]) == [
+        {"_id": 1, "count": 2},
+        {"_id": 2, "count": 1},
+    ]
+    # A single-`$`-key expression object is valid too.
+    assert apply_pipeline([dict(d) for d in docs], [{"$sortByCount": {"$add": ["$v", 1]}}]) == [
+        {"_id": 2, "count": 2},
+        {"_id": 3, "count": 1},
+    ]
+
+
 def test_bucket_basic_ranges() -> None:
     docs = [{"v": 1}, {"v": 5}, {"v": 12}, {"v": 25}, {"v": 99}]
     out = apply_pipeline(
@@ -364,6 +523,90 @@ def test_bucket_auto_with_output() -> None:
     assert sum(b["total_n"] for b in out) == sum(d["n"] for d in docs)
 
 
+def test_bucket_auto_buckets_validation_codes() -> None:
+    # mongod: buckets must be a non-bool numeric value (40241), representable as
+    # a 32-bit integer — a whole double is accepted, a fractional one is not
+    # (40242) — and strictly > 0 (40243); groupBy and buckets are required
+    # (40246). A whole double computes.
+    docs = [{"v": i} for i in range(6)]
+    for spec, code in [
+        ({"groupBy": "$v", "buckets": True}, 40241),
+        ({"groupBy": "$v", "buckets": "x"}, 40241),
+        ({"groupBy": "$v", "buckets": 2.5}, 40242),
+        ({"groupBy": "$v", "buckets": 0}, 40243),
+        ({"groupBy": "$v", "buckets": -1}, 40243),
+        ({"groupBy": "$v"}, 40246),
+        ({"buckets": 2}, 40246),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$bucketAuto": spec}])
+        assert exc.value.code == code, spec
+    # A whole-double buckets is accepted (coerced to int).
+    out = apply_pipeline(
+        [dict(d) for d in docs], [{"$bucketAuto": {"groupBy": "$v", "buckets": 2.0}}]
+    )
+    assert len(out) == 2
+
+
+def test_bucket_auto_granularity_validation() -> None:
+    # mongod: a non-string granularity -> 40261, an unknown one -> 40257.
+    docs = [{"v": i} for i in range(6)]
+    for gran, code in [(5, 40261), (True, 40261), ("BOGUS", 40257), ("r5", 40257)]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(
+                [dict(d) for d in docs],
+                [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}],
+            )
+        assert exc.value.code == code, gran
+
+
+def test_bucket_auto_granularity_value_errors() -> None:
+    # mongod: a granularity groupBy value must be a non-negative number: a
+    # non-numeric value -> 40258, a NaN -> 40259, a negative number -> 40260.
+    for values, code in [
+        ([-5.0, 1.0, 2.0], 40260),
+        ([1.0, 2.0, "x"], 40258),
+        ([None, 1.0, 2.0], 40258),
+        ([float("nan"), 1.0, 2.0], 40259),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(
+                [{"v": v} for v in values],
+                [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}],
+            )
+        assert exc.value.code == code, values
+
+
+def test_bucket_auto_granularity_boundaries() -> None:
+    # Preferred-number rounding: first bucket min = roundDown(dataMin), every
+    # other boundary = roundUp(chunkMax). Exact f64s verified against mongod
+    # 7.0.12 (note the non-standard ULP 6.300000000000001 = 63 * 0.1).
+    def bounds(values, n, gran):
+        out = apply_pipeline(
+            [{"v": v} for v in values],
+            [{"$bucketAuto": {"groupBy": "$v", "buckets": n, "granularity": gran}}],
+        )
+        return [(b["_id"]["min"], b["_id"]["max"], b["count"]) for b in out]
+
+    assert bounds([1, 2, 3, 4, 5, 6, 7, 8], 2, "R5") == [
+        (0.63, 6.300000000000001, 6),
+        (6.300000000000001, 10.0, 2),
+    ]
+    assert bounds([1, 2, 3, 4, 5, 6, 7, 8], 2, "POWERSOF2") == [
+        (0.5, 8.0, 7),
+        (8.0, 16.0, 1),
+    ]
+    assert bounds([1, 10, 100, 1000], 2, "1-2-5") == [(0.5, 20.0, 2), (20.0, 2000.0, 2)]
+    assert bounds([3, 7, 15, 44, 90], 2, "E6") == [(2.2, 22.0, 3), (22.0, 100.0, 2)]
+    # Decimal128 boundaries are deferred (the standing precision deferral).
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline(
+            [{"v": Decimal128("1.5")}, {"v": Decimal128("2.5")}],
+            [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}],
+        )
+    assert exc.value.code == 2
+
+
 def test_lookup_requires_storage_context() -> None:
     with pytest.raises(AggregateError):
         apply_pipeline(
@@ -385,22 +628,26 @@ def test_lookup_requires_storage_context() -> None:
 # $lookup hash-join correctness, especially for array-valued fields.
 
 
-def _setup_lookup_storage(tmp_path, outer_docs, foreign_docs, foreign_coll="f"):
+def _setup_lookup_storage(request, tmp_path, outer_docs, foreign_docs, foreign_coll="f"):
     from secantus.aggregate import PipelineContext
     from secantus.storage import Storage
 
     storage = Storage(str(tmp_path))
+    # Close the WT connection at teardown. A returned-but-never-closed Storage
+    # abandons its connection (~2.5 MB + ~17 fds each); leaked across these
+    # lookup tests it exhausts a worker's fds / memory. See tasks/backlog.md #275.
+    request.addfinalizer(storage.close)
     storage.insert("db", foreign_coll, foreign_docs)
     ctx = PipelineContext(storage=storage, db_name="db")
     return storage, ctx
 
 
-def test_lookup_simple_form_hash_join_correctness(tmp_path) -> None:
+def test_lookup_simple_form_hash_join_correctness(request, tmp_path) -> None:
     foreign = [
         {"_id": "abc", "stock": 100},
         {"_id": "xyz", "stock": 50},
     ]
-    storage, ctx = _setup_lookup_storage(tmp_path, [], foreign, foreign_coll="inv")
+    storage, ctx = _setup_lookup_storage(request, tmp_path, [], foreign, foreign_coll="inv")
     docs = [
         {"_id": 1, "item": "abc"},
         {"_id": 2, "item": "xyz"},
@@ -427,13 +674,13 @@ def test_lookup_simple_form_hash_join_correctness(tmp_path) -> None:
     ]
 
 
-def test_lookup_foreign_field_is_array_each_element_matches(tmp_path) -> None:
+def test_lookup_foreign_field_is_array_each_element_matches(request, tmp_path) -> None:
     """Foreign doc with an array foreign_field matches against any element."""
     foreign = [
         {"_id": "x", "tags": ["python", "go"]},
         {"_id": "y", "tags": ["rust"]},
     ]
-    storage, ctx = _setup_lookup_storage(tmp_path, [], foreign, foreign_coll="f")
+    storage, ctx = _setup_lookup_storage(request, tmp_path, [], foreign, foreign_coll="f")
     docs = [{"_id": 1, "want": "python"}, {"_id": 2, "want": "rust"}]
     out = apply_pipeline(
         docs,
@@ -453,13 +700,13 @@ def test_lookup_foreign_field_is_array_each_element_matches(tmp_path) -> None:
     assert [fd["_id"] for fd in out[1]["j"]] == ["y"]
 
 
-def test_lookup_local_field_is_array_each_element_lookups(tmp_path) -> None:
+def test_lookup_local_field_is_array_each_element_lookups(request, tmp_path) -> None:
     foreign = [
         {"_id": "py", "lang": "python"},
         {"_id": "go", "lang": "go"},
         {"_id": "rs", "lang": "rust"},
     ]
-    storage, ctx = _setup_lookup_storage(tmp_path, [], foreign, foreign_coll="f")
+    storage, ctx = _setup_lookup_storage(request, tmp_path, [], foreign, foreign_coll="f")
     docs = [{"_id": 1, "wants": ["python", "rust"]}]
     out = apply_pipeline(
         docs,
@@ -479,13 +726,13 @@ def test_lookup_local_field_is_array_each_element_lookups(tmp_path) -> None:
     assert found == ["py", "rs"]
 
 
-def test_lookup_both_sides_arrays_intersection_match(tmp_path) -> None:
+def test_lookup_both_sides_arrays_intersection_match(request, tmp_path) -> None:
     foreign = [
         {"_id": "x", "tags": ["a", "b"]},
         {"_id": "y", "tags": ["c", "d"]},
         {"_id": "z", "tags": ["b", "c"]},
     ]
-    storage, ctx = _setup_lookup_storage(tmp_path, [], foreign, foreign_coll="f")
+    storage, ctx = _setup_lookup_storage(request, tmp_path, [], foreign, foreign_coll="f")
     docs = [{"_id": 1, "want": ["a", "c"]}]
     out = apply_pipeline(
         docs,
@@ -507,13 +754,13 @@ def test_lookup_both_sides_arrays_intersection_match(tmp_path) -> None:
 
 
 def test_lookup_hash_join_does_not_call_lookup_match_for_hashable_values(
-    monkeypatch, tmp_path
+    request, monkeypatch, tmp_path
 ) -> None:
     """O(N+M) hash-join: per-pair _lookup_match should not fire for hashable scalars."""
     import secantus.aggregate as agg
 
     foreign = [{"_id": i, "k": i} for i in range(50)]
-    storage, ctx = _setup_lookup_storage(tmp_path, [], foreign, foreign_coll="f")
+    storage, ctx = _setup_lookup_storage(request, tmp_path, [], foreign, foreign_coll="f")
     docs = [{"_id": j, "k": j % 50} for j in range(20)]
 
     call_count = [0]
@@ -543,10 +790,10 @@ def test_lookup_hash_join_does_not_call_lookup_match_for_hashable_values(
     assert call_count[0] == 0
 
 
-def test_lookup_pipeline_form_simple_prefilter_hash_join(tmp_path) -> None:
+def test_lookup_pipeline_form_simple_prefilter_hash_join(request, tmp_path) -> None:
     """Pipeline form with localField+foreignField also hash-joins the prefilter."""
     foreign = [{"_id": i, "user_id": i % 5, "v": i} for i in range(20)]
-    storage, ctx = _setup_lookup_storage(tmp_path, [], foreign, foreign_coll="orders")
+    storage, ctx = _setup_lookup_storage(request, tmp_path, [], foreign, foreign_coll="orders")
     docs = [{"_id": "u3", "uid": 3}]
     out = apply_pipeline(
         docs,
@@ -666,6 +913,30 @@ def test_densify_invalid_step_raises() -> None:
             [{"n": 1}],
             [{"$densify": {"field": "n", "range": {"bounds": "full", "step": 0}}}],
         )
+
+
+def test_densify_validation_codes() -> None:
+    # mongod codes: date unit on numeric 6053600, bool step 14, non-positive step
+    # 5733401, bad bounds string 5946802, wrong-length array 5733403, descending
+    # array 5733402.
+    docs = [{"v": 1}, {"v": 5}]
+    for rng, code in [
+        ({"step": 1, "unit": "day", "bounds": "full"}, 6053600),
+        ({"step": True, "bounds": "full"}, 14),
+        ({"step": 0, "bounds": "full"}, 5733401),
+        ({"step": -1, "bounds": "full"}, 5733401),
+        ({"step": 1, "bounds": "partial"}, 5946802),
+        ({"step": 1, "bounds": [0]}, 5733403),
+        ({"step": 1, "bounds": [5, 0]}, 5733402),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$densify": {"field": "v", "range": rng}}])
+        assert exc.value.code == code, rng
+    # A fractional step and the "partition" bounds string are accepted.
+    assert apply_pipeline(
+        [dict(d) for d in docs],
+        [{"$densify": {"field": "v", "range": {"step": 1.5, "bounds": "full"}}}],
+    )
 
 
 def test_densify_date_unit_day_fills_gaps() -> None:
@@ -1401,3 +1672,135 @@ def test_now_system_variable() -> None:
     assert out[0]["t"] == out[1]["t"]
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     assert abs((now - out[0]["t"].replace(tzinfo=None)).total_seconds()) < 60
+
+
+def test_median_and_percentile_accumulators() -> None:
+    """mongod's discrete percentile (probed against 7.0.12):
+    sorted[max(0, ceil(p*n) - 1)] as a double; bool/NaN excluded, Decimal128
+    included; empty -> null / per-p nulls; verbatim error shapes."""
+    import pytest
+    from bson import Decimal128
+
+    from secantus.aggregate import AggregateError, apply_pipeline
+
+    docs = [{"x": v} for v in [3.5, 1, 2]]
+    out = apply_pipeline(
+        docs,
+        [
+            {
+                "$group": {
+                    "_id": None,
+                    "m": {"$median": {"input": "$x", "method": "approximate"}},
+                    "p": {
+                        "$percentile": {
+                            "input": "$x",
+                            "p": [0.1, 0.5, 0.75, 1.0],
+                            "method": "approximate",
+                        }
+                    },
+                }
+            }
+        ],
+        None,
+    )
+    assert out[0]["m"] == 2.0
+    assert out[0]["p"] == [1.0, 2.0, 3.5, 3.5]
+
+    # bool/NaN excluded, Decimal128 included (as double).
+    docs = [{"x": v} for v in [float("nan"), 2, 1, Decimal128("3.5"), True]]
+    out = apply_pipeline(
+        docs,
+        [{"$group": {"_id": None, "m": {"$median": {"input": "$x", "method": "approximate"}}}}],
+        None,
+    )
+    assert out[0]["m"] == 2.0
+
+    # All-missing -> null (median) / per-p nulls (percentile).
+    out = apply_pipeline(
+        [{"y": 1}],
+        [
+            {
+                "$group": {
+                    "_id": None,
+                    "m": {"$median": {"input": "$x", "method": "approximate"}},
+                    "p": {"$percentile": {"input": "$x", "p": [0.5, 0.9], "method": "approximate"}},
+                }
+            }
+        ],
+        None,
+    )
+    assert out[0]["m"] is None
+    assert out[0]["p"] == [None, None]
+
+    for acc, code in [
+        ({"$median": {"input": "$x"}}, 40414),  # missing method
+        ({"$median": {"input": "$x", "method": "exact"}}, 2),  # bad method
+        ({"$percentile": {"input": "$x", "p": [1.5], "method": "approximate"}}, 7750303),
+        ({"$percentile": {"input": "$x", "p": 0.5, "method": "approximate"}}, 7750301),
+        ({"$percentile": {"input": "$x", "method": "approximate"}}, 40414),  # missing p
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([{"x": 1}], [{"$group": {"_id": None, "v": acc}}], None)
+        assert exc.value.code == code, acc
+
+
+def test_limit_skip_numeric_arg_validation() -> None:
+    """$limit / $skip accept a whole-number double but reject a bool, a fractional
+    double, and a negative value with mongod's codes; $limit also rejects zero."""
+    docs = [{"_id": i} for i in range(10)]
+    assert len(apply_pipeline(docs, [{"$limit": 2.0}])) == 2
+    assert len(apply_pipeline(docs, [{"$skip": 3.0}])) == 7
+    assert len(apply_pipeline(docs, [{"$skip": 0}])) == 10
+    for pipe, code in [
+        ([{"$limit": 2.7}], 5107201),
+        ([{"$limit": True}], 5107201),
+        ([{"$limit": -1}], 5107201),
+        ([{"$limit": 0}], 15958),
+        ([{"$skip": 3.7}], 5107200),
+        ([{"$skip": True}], 5107200),
+        ([{"$skip": -1}], 5107200),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(docs, pipe)
+        assert exc.value.code == code, pipe
+
+
+def test_sample_size_validation() -> None:
+    """$sample size must be a number (bool -> 28746) and non-negative (28747); a
+    fractional double is accepted and truncated (unlike $limit/$skip)."""
+    docs = [{"_id": i} for i in range(10)]
+    assert len(apply_pipeline(docs, [{"$sample": {"size": 3}}])) == 3
+    assert len(apply_pipeline(docs, [{"$sample": {"size": 2.7}}])) == 2
+    with pytest.raises(AggregateError) as bexc:
+        apply_pipeline(docs, [{"$sample": {"size": True}}])
+    assert bexc.value.code == 28746
+    with pytest.raises(AggregateError) as nexc:
+        apply_pipeline(docs, [{"$sample": {"size": -1}}])
+    assert nexc.value.code == 28747
+
+
+def test_bucket_validation_and_no_silent_data_loss() -> None:
+    """$bucket validates its spec like mongod and errors on an out-of-range value
+    with no default (was silent data loss) instead of dropping the document."""
+    docs = [{"_id": i, "v": i} for i in range(6)]
+
+    def counts(spec):
+        r = apply_pipeline(docs, [{"$bucket": spec}])
+        return [(b["_id"], b.get("count")) for b in r]
+
+    assert counts({"groupBy": "$v", "boundaries": [0, 3, 6]}) == [(0, 3), (3, 3)]
+    assert counts({"groupBy": "$v", "boundaries": [0, 3], "default": "x"}) == [(0, 3), ("x", 3)]
+    for spec, code in [
+        ({"groupBy": "$v", "boundaries": [0, 3]}, 7158303),  # out-of-range, no default
+        ({"groupBy": "$v", "boundaries": [0, 5, 2]}, 40194),  # unsorted
+        ({"groupBy": "$v", "boundaries": [0, "x", 5]}, 40193),  # mixed type
+        ({"groupBy": "$v", "boundaries": [0, 3, 3, 6]}, 40194),  # duplicate
+        ({"groupBy": "$v", "boundaries": [0, 6], "default": 1}, 40199),  # default in range
+        ({"boundaries": [0, 6]}, 40198),  # missing groupBy
+        ({"groupBy": "$v", "boundaries": 5}, 40200),  # non-array
+        ({"groupBy": "$v", "boundaries": [0]}, 40192),  # < 2 values
+        ({"groupBy": "$v", "boundaries": [0, 6], "output": 5}, 40196),  # non-doc output
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(docs, [{"$bucket": spec}])
+        assert exc.value.code == code, spec

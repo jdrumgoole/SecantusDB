@@ -371,6 +371,75 @@ def test_query_with_in_operator(coll) -> None:
     assert ids == [1, 3]
 
 
+def test_all_argument_validation_via_pymongo(coll) -> None:
+    """$all needs an array; mixing $elemMatch with a scalar or using another
+    $-op doc is "no $ expressions in $all" (BadValue). mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": [1, 2, 3]})
+    for q in (
+        {"a": {"$all": 5}},
+        {"a": {"$all": [1, {"$elemMatch": {"x": 1}}]}},
+        {"a": {"$all": [{"$gt": 1}]}},
+    ):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find(q))
+        assert exc.value.code == 2, q
+    # Valid scalar + all-$elemMatch forms still work.
+    assert [d["_id"] for d in coll.find({"a": {"$all": [1, 2]}})] == [1]
+    assert [d["_id"] for d in coll.find({"a": {"$all": [{"$elemMatch": {"$gt": 2}}]}})] == [1]
+
+
+def test_not_elemmatch_validation_via_pymongo(coll) -> None:
+    """$not needs a regex or a non-empty document; $elemMatch needs an Object —
+    else BadValue. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 5, "arr": [1, 2, 3]})
+    for q in (
+        {"a": {"$not": 5}},
+        {"a": {"$not": {}}},
+        {"a": {"$not": True}},
+        {"arr": {"$elemMatch": 5}},
+        {"arr": {"$elemMatch": "x"}},
+    ):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find(q))
+        assert exc.value.code == 2, q
+    # Valid forms still work.
+    assert [d["_id"] for d in coll.find({"a": {"$not": {"$gt": 9}}})] == [1]
+    assert [d["_id"] for d in coll.find({"arr": {"$elemMatch": {"$gt": 2}}})] == [1]
+
+
+def test_type_argument_validation_via_pymongo(coll) -> None:
+    """$type: unknown alias / out-of-range / fractional code -> 2, bool -> 14;
+    a whole-double code still matches. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 5})
+    for t, code in [("notatype", 2), (0, 2), (100, 2), (2.5, 2), (True, 14)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find({"a": {"$type": t}}))
+        assert exc.value.code == code, t
+    # Valid: alias, numeric code, and whole-double code.
+    assert [d["_id"] for d in coll.find({"a": {"$type": "int"}})] == [1]
+    assert [d["_id"] for d in coll.find({"a": {"$type": 16.0}})] == [1]
+
+
+def test_in_nin_argument_validation_via_pymongo(coll) -> None:
+    """$in/$nin need an array (BadValue); a nested $-prefixed doc element is
+    rejected ("cannot nest $ under $in"). mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for q in ({"n": {"$in": 5}}, {"n": {"$nin": "x"}}, {"n": {"$in": [{"$x": 1}]}}):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find(q))
+        assert exc.value.code == 2, q
+    # Valid array (incl. a plain subdoc element) still works.
+    assert [d["_id"] for d in coll.find({"n": {"$in": [5, 9]}})] == [1]
+
+
 def test_sort_ascending(coll) -> None:
     coll.insert_many([{"n": 3}, {"n": 1}, {"n": 2}])
     result = [d["n"] for d in coll.find().sort("n", 1)]
@@ -486,6 +555,21 @@ def test_projection_dotted_inclusion(coll) -> None:
     assert doc == {"addr": {"city": "Dublin"}}
 
 
+def test_projection_slice_validation_via_pymongo(coll) -> None:
+    """Projection $slice: a non-number scalar / empty / bad array is 28667, a
+    2/3-element array that isn't [skip, positive-limit] is 28724. A valid $slice
+    still reshapes the array. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": [1, 2, 3, 4, 5]})
+    for sl, code in [("x", 28667), ([], 28667), ([1, -2], 28724), ([1, 2, 3], 28724)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find({}, {"a": {"$slice": sl}}))
+        assert exc.value.code == code, sl
+    assert coll.find_one({}, {"_id": 0, "a": {"$slice": 2}})["a"] == [1, 2]
+    assert coll.find_one({}, {"_id": 0, "a": {"$slice": [1, 2]}})["a"] == [2, 3]
+
+
 def test_projection_meta_textscore_without_text_is_40218(coll) -> None:
     from pymongo.errors import OperationFailure
 
@@ -548,6 +632,23 @@ def test_query_regex_string_form(coll) -> None:
     assert names == ["alex", "alice"]
 
 
+def test_regex_options_validation_via_pymongo(coll) -> None:
+    """Bad flag -> 51108; non-string $options / $options-without-$regex /
+    non-string $regex -> BadValue. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "s": "Hello"})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.find({"s": {"$regex": "h", "$options": "z"}}))
+    assert exc.value.code == 51108
+    for q in ({"s": {"$options": "i"}}, {"s": {"$regex": 5}}):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find(q))
+        assert exc.value.code == 2, q
+    # A valid case-insensitive regex still matches.
+    assert [d["_id"] for d in coll.find({"s": {"$regex": "^h", "$options": "i"}})] == [1]
+
+
 def test_query_regex_compiled_pattern(coll) -> None:
     import re
 
@@ -588,6 +689,24 @@ def test_query_all(coll) -> None:
     )
     ids = sorted(d["_id"] for d in coll.find({"tags": {"$all": ["a", "b"]}}))
     assert ids == [1, 3]
+
+
+def test_query_all_scalar_field(coll) -> None:
+    """$all against a scalar field value matches like a one-element array
+    (mongod 7.0.12); an empty $all matches nothing. Regression for a bug where
+    both servers silently missed scalar-field docs."""
+    from bson import Regex
+
+    coll.insert_many(
+        [
+            {"_id": 1, "tags": ["red", "blue"]},
+            {"_id": 2, "tags": "red"},  # scalar field
+            {"_id": 3, "tags": "green"},
+        ]
+    )
+    assert sorted(d["_id"] for d in coll.find({"tags": {"$all": ["red"]}})) == [1, 2]
+    assert sorted(d["_id"] for d in coll.find({"tags": {"$all": [Regex("^red$")]}})) == [1, 2]
+    assert list(coll.find({"tags": {"$all": []}})) == []
 
 
 def test_query_all_with_elemmatch(coll) -> None:
@@ -703,6 +822,294 @@ def test_aggregate_sort_stage(coll) -> None:
     coll.insert_many([{"_id": 1, "n": 3}, {"_id": 2, "n": 1}, {"_id": 3, "n": 2}])
     out = list(coll.aggregate([{"$sort": {"n": 1}}]))
     assert [d["_id"] for d in out] == [2, 3, 1]
+
+
+def test_aggregate_sort_stage_validation_via_pymongo(coll) -> None:
+    """$sort: non-numeric direction 15974, numeric non-±1 15975, empty spec 15976.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1, "n": 3}, {"_id": 2, "n": 1}])
+    for spec, code in [
+        ({"n": "asc"}, 15974),
+        ({"n": True}, 15974),
+        ({"n": 0}, 15975),
+        ({"n": 2}, 15975),
+        ({}, 15976),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$sort": spec}]))
+        assert exc.value.code == code, spec
+    # A whole-double direction still sorts.
+    assert [d["_id"] for d in coll.aggregate([{"$sort": {"n": 1.0}}])] == [2, 1]
+
+
+def test_facet_validation_via_pymongo(coll) -> None:
+    """$facet: empty/non-object spec 40169, non-array sub-pipeline 40170,
+    non-object stage 40171, nested $facet 40600. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 2}])
+    for spec, code in [
+        ({}, 40169),
+        ({"a": 5}, 40170),
+        ({"a": [5]}, 40171),
+        ({"a": [{"$facet": {"b": [{"$match": {"v": 1}}]}}]}, 40600),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$facet": spec}]))
+        assert exc.value.code == code, spec
+    # A valid $facet still runs its sub-pipelines.
+    out = list(coll.aggregate([{"$facet": {"n": [{"$count": "c"}]}}]))
+    assert out == [{"n": [{"c": 2}]}]
+
+
+def test_count_stage_validation_via_pymongo(coll) -> None:
+    """$count: non-string 40156, empty 40157, $-prefixed 40158, dotted 40160,
+    "_id" 15948. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
+    for spec, code in [
+        (5, 40156),
+        ("", 40157),
+        ("$n", 40158),
+        ("a.b", 40160),
+        ("_id", 15948),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$count": spec}]))
+        assert exc.value.code == code, spec
+    assert list(coll.aggregate([{"$count": "n"}])) == [{"n": 3}]
+
+
+def test_project_empty_spec_via_pymongo(coll) -> None:
+    """An empty $project spec is Location51272. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "v": 1})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {}}]))
+    assert exc.value.code == 51272
+
+
+def test_sort_by_count_validation_via_pymongo(coll) -> None:
+    """$sortByCount: number/bool/array/null 40149, bare string 40148, non-`$`
+    object 40147. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 1}, {"_id": 3, "v": 2}])
+    for spec, code in [
+        (5, 40149),
+        (True, 40149),
+        ([1], 40149),
+        (None, 40149),
+        ("v", 40148),
+        ({"a": 1}, 40147),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$sortByCount": spec}]))
+        assert exc.value.code == code, spec
+    # A $-prefixed path and a single-op expression object are both valid.
+    assert list(coll.aggregate([{"$sortByCount": "$v"}])) == [
+        {"_id": 1, "count": 2},
+        {"_id": 2, "count": 1},
+    ]
+
+
+def test_bucket_auto_validation_via_pymongo(coll) -> None:
+    """$bucketAuto: non-numeric/bool buckets 40241, fractional 40242, non-positive
+    40243, missing groupBy/buckets 40246; a whole-double buckets computes.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i, "v": i} for i in range(6)])
+    for spec, code in [
+        ({"groupBy": "$v", "buckets": True}, 40241),
+        ({"groupBy": "$v", "buckets": "x"}, 40241),
+        ({"groupBy": "$v", "buckets": 2.5}, 40242),
+        ({"groupBy": "$v", "buckets": 0}, 40243),
+        ({"groupBy": "$v", "buckets": -1}, 40243),
+        ({"groupBy": "$v"}, 40246),
+        ({"buckets": 2}, 40246),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$bucketAuto": spec}]))
+        assert exc.value.code == code, spec
+    # A whole-double buckets is accepted.
+    out = list(coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2.0}}]))
+    assert len(out) == 2
+    # granularity name validation: non-string -> 40261, unknown -> 40257.
+    for gran, code in [(5, 40261), ("BOGUS", 40257)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(
+                coll.aggregate(
+                    [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}]
+                )
+            )
+        assert exc.value.code == code, gran
+
+
+def test_bucket_auto_granularity_via_pymongo(coll) -> None:
+    """$bucketAuto `granularity` preferred-number rounding over the wire: exact
+    boundaries (incl. mongod's non-standard ULP 63*0.1 = 6.300000000000001) and
+    the value-error codes. Boundaries verified hex-exact against mongod 7.0.12."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i, "v": i + 1} for i in range(8)])  # v = 1..8
+    out = list(
+        coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}])
+    )
+    assert [(b["_id"]["min"], b["_id"]["max"], b["count"]) for b in out] == [
+        (0.63, 6.300000000000001, 6),
+        (6.300000000000001, 10.0, 2),
+    ]
+    out = list(
+        coll.aggregate(
+            [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "POWERSOF2"}}]
+        )
+    )
+    assert [(b["_id"]["min"], b["_id"]["max"]) for b in out] == [(0.5, 8.0), (8.0, 16.0)]
+
+    # value must be a non-negative number: non-numeric 40258, NaN 40259, negative 40260
+    for values, code in [
+        ([-1.0, 2.0, 3.0], 40260),
+        ([1.0, 2.0, "s"], 40258),
+        ([float("nan"), 1.0], 40259),
+    ]:
+        coll.delete_many({})
+        coll.insert_many([{"_id": i, "v": v} for i, v in enumerate(values)])
+        with pytest.raises(OperationFailure) as exc:
+            list(
+                coll.aggregate(
+                    [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}]
+                )
+            )
+        assert exc.value.code == code, values
+
+
+def test_projection_elem_match_non_document_via_pymongo(coll) -> None:
+    """A non-document $elemMatch projection argument is Location31274.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "arr": [1, 2, 3]})
+    for arg in (5, "x", [1]):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.find({}, {"arr": {"$elemMatch": arg}}))
+        assert exc.value.code == 31274, arg
+
+
+def test_pull_pullall_non_array_via_pymongo(coll) -> None:
+    """$pull / $pullAll on a present but non-array field is code 2; a missing
+    field is a silent no-op. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "num": 5, "nul": None, "arr": [1, 2, 3]})
+    for upd in ({"$pull": {"num": 1}}, {"$pullAll": {"num": [1]}}):
+        with pytest.raises(OperationFailure) as exc:
+            coll.update_one({"_id": 1}, upd)
+        assert exc.value.code == 2, upd
+    for upd in ({"$pull": {"nul": 1}}, {"$pullAll": {"nul": [1]}}):
+        with pytest.raises(OperationFailure) as exc:
+            coll.update_one({"_id": 1}, upd)
+        assert exc.value.code == 2, upd
+    # Missing field: no-op. Valid array pull still works.
+    coll.update_one({"_id": 1}, {"$pull": {"nope": 1}})
+    coll.update_one({"_id": 1}, {"$pull": {"arr": 2}})
+    assert coll.find_one({"_id": 1})["arr"] == [1, 3]
+
+
+def test_push_sort_validation_via_pymongo(coll) -> None:
+    """$push $sort: a numeric whole-element sort must be ±1, a document direction
+    must be ±1, and a non-numeric spec is code 2; a whole-double ±1 is accepted.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": [{"s": 3}, {"s": 1}]})
+    for spec in (2, 1.5, "x", True, {"s": 2}, {"s": True}):
+        with pytest.raises(OperationFailure) as exc:
+            coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [{"s": 2}], "$sort": spec}}})
+        assert exc.value.code == 2, spec
+    # A whole-double ±1 direction is accepted and sorts.
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1.0}}}})
+    assert [e["s"] for e in coll.find_one({"_id": 1})["a"]] == [1, 2, 3]
+
+
+def test_current_date_bool_false_via_pymongo(coll) -> None:
+    """$currentDate accepts a boolean (true OR false) as the set-Date form, and a
+    {$type} object; a non-bool scalar / bad $type is code 2. mongod 7.0.12-verified."""
+    import datetime
+
+    from bson import Timestamp
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    coll.update_one({"_id": 1}, {"$currentDate": {"d": False}})
+    assert isinstance(coll.find_one({"_id": 1})["d"], datetime.datetime)
+    coll.update_one({"_id": 1}, {"$currentDate": {"ts": {"$type": "timestamp"}}})
+    assert isinstance(coll.find_one({"_id": 1})["ts"], Timestamp)
+    for opt in (5, "x", {"$type": "bogus"}):
+        with pytest.raises(OperationFailure) as exc:
+            coll.update_one({"_id": 1}, {"$currentDate": {"bad": opt}})
+        assert exc.value.code == 2, opt
+
+
+def test_array_filters_validation_via_pymongo(coll) -> None:
+    """arrayFilters: a non-object filter (14), an empty filter (9), a bad
+    identifier (2), a duplicate identifier (9), and an unused identifier (9) are
+    rejected; a valid filter updates the matching elements. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure, WriteError
+
+    coll.insert_one({"_id": 1, "a": [{"g": 1}, {"g": 5}]})
+    upd = {"$set": {"a.$[x].g": 9}}
+    for af, code in [
+        (["x"], 14),
+        ([{}], 9),
+        ([{"1x": {"$gt": 0}}], 2),
+        ([{"X": {"$gt": 0}}], 2),
+        ([{"x": {"$gt": 0}}, {"x": {"$lt": 9}}], 9),
+        ([{"x": {"$gt": 0}}, {"y": {"$gt": 0}}], 9),
+        ([{"x": {"$gt": 0}, "y": {"$gt": 0}}], 9),  # two identifiers in one filter
+        ([{"$and": [{"x": {"$gt": 0}}, {"y": {"$gt": 0}}]}], 9),  # two, nested
+        ([{"$expr": {"$gt": ["$g", 0]}}], 224),  # $expr, no identifier
+    ]:
+        with pytest.raises((OperationFailure, WriteError)) as exc:
+            coll.update_one({"_id": 1}, upd, array_filters=af)
+        assert exc.value.code == code, af
+    # A valid filter updates the matching elements.
+    coll.update_one({"_id": 1}, upd, array_filters=[{"x.g": {"$gt": 3}}])
+    assert [e["g"] for e in coll.find_one({"_id": 1})["a"]] == [1, 9]
+    # A single identifier nested inside $and resolves and applies to the match.
+    coll.update_one(
+        {"_id": 1}, {"$set": {"a.$[x].g": 7}}, array_filters=[{"$and": [{"x.g": {"$gt": 8}}]}]
+    )
+    assert [e["g"] for e in coll.find_one({"_id": 1})["a"]] == [1, 7]
+
+
+def test_densify_validation_via_pymongo(coll) -> None:
+    """$densify: date unit on numeric 6053600, bool step 14, non-positive step
+    5733401, bad bounds string 5946802, wrong-length array 5733403, descending
+    array 5733402. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 5}])
+    for rng, code in [
+        ({"step": 1, "unit": "day", "bounds": "full"}, 6053600),
+        ({"step": True, "bounds": "full"}, 14),
+        ({"step": 0, "bounds": "full"}, 5733401),
+        ({"step": 1, "bounds": "partial"}, 5946802),
+        ({"step": 1, "bounds": [0]}, 5733403),
+        ({"step": 1, "bounds": [5, 0]}, 5733402),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$densify": {"field": "v", "range": rng}}]))
+        assert exc.value.code == code, rng
+    # A valid numeric densify still fills the gap.
+    out = list(
+        coll.aggregate([{"$densify": {"field": "v", "range": {"step": 1, "bounds": "full"}}}])
+    )
+    assert sorted(d["v"] for d in out) == [1, 2, 3, 4, 5]
 
 
 def test_aggregate_project_with_computed_field(coll) -> None:
@@ -944,6 +1351,82 @@ def test_aggregate_to_date(coll) -> None:
             "from_missing": None,
         }
     ]
+
+
+def test_date_arg_validation_via_pymongo(coll) -> None:
+    """$dateAdd/$dateSubtract amount and $dateTrunc binSize: whole double accepted,
+    fractional/bool -> 5166405 / 5439017, non-positive binSize -> 5439018. mongod
+    7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "d": dt.datetime(2021, 1, 1)})
+    for op in ("$dateAdd", "$dateSubtract"):
+        for bad in (2.5, True):
+            with pytest.raises(OperationFailure) as exc:
+                list(
+                    coll.aggregate(
+                        [
+                            {
+                                "$project": {
+                                    "r": {op: {"startDate": "$d", "unit": "day", "amount": bad}}
+                                }
+                            }
+                        ]
+                    )
+                )
+            assert exc.value.code == 5166405, (op, bad)
+    for bad, code in [(2.5, 5439017), (True, 5439017), (-1, 5439018)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(
+                coll.aggregate(
+                    [
+                        {
+                            "$project": {
+                                "r": {"$dateTrunc": {"date": "$d", "unit": "day", "binSize": bad}}
+                            }
+                        }
+                    ]
+                )
+            )
+        assert exc.value.code == code, bad
+    # A whole-double amount still computes.
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "r": {"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 2.0}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"r": dt.datetime(2021, 1, 3)}]
+
+
+def test_to_date_rejects_bool_via_pymongo(coll) -> None:
+    """$toDate: a bool is ConversionFailure (241), not coerced to a date; $convert
+    with onError catches it. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"r": {"$toDate": True}, "_id": 0}}]))
+    assert exc.value.code == 241
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "r": {"$convert": {"input": True, "to": "date", "onError": "x"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"r": "x"}]
 
 
 def test_aggregate_date_extractor_timezone(coll) -> None:
@@ -1264,6 +1747,25 @@ def test_aggregate_unwind_stage(coll) -> None:
     assert [d["tags"] for d in out] == ["a", "b", "c"]
 
 
+def test_aggregate_unwind_validation_via_pymongo(coll) -> None:
+    """$unwind: bare path 28818, non-string path 28808, non-string/empty index
+    28810, $-prefixed index 28822, non-bool preserve 28809. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": [1, 2, 3]})
+    for spec, code in [
+        ({"path": "a"}, 28818),
+        ({"path": 5}, 28808),
+        ({"path": "$a", "includeArrayIndex": 5}, 28810),
+        ({"path": "$a", "includeArrayIndex": "$i"}, 28822),
+        ({"path": "$a", "preserveNullAndEmptyArrays": 5}, 28809),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$unwind": spec}]))
+        assert exc.value.code == code, spec
+    assert len(list(coll.aggregate([{"$unwind": "$a"}]))) == 3
+
+
 def test_aggregate_group_with_avg(coll) -> None:
     coll.insert_many(
         [
@@ -1277,6 +1779,51 @@ def test_aggregate_group_with_avg(coll) -> None:
         key=lambda d: d["_id"],
     )
     assert out == [{"_id": "a", "avg": 3.0}, {"_id": "b", "avg": 10.0}]
+
+
+def test_aggregate_group_accumulator_mixed_types(coll) -> None:
+    """$sum/$avg ignore non-numeric values; $min/$max order by BSON cross-type
+    (bool > string > number) and skip null/missing — matching mongod."""
+    from bson.int64 import Int64
+
+    coll.insert_many(
+        [
+            {"_id": 1, "v": 10},
+            {"_id": 2, "v": "hi"},
+            {"_id": 3, "v": True},
+            {"_id": 4, "v": None},
+            {"_id": 5},
+            {"_id": 6, "v": 2.5},
+            {"_id": 7, "v": Int64(3)},
+        ]
+    )
+    [b] = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": None,
+                        "s": {"$sum": "$v"},
+                        "a": {"$avg": "$v"},
+                        "mn": {"$min": "$v"},
+                        "mx": {"$max": "$v"},
+                    }
+                }
+            ]
+        )
+    )
+    assert b["s"] == 15.5
+    assert b["a"] == 15.5 / 3
+    assert b["mn"] == 2.5
+    assert b["mx"] is True
+    # All-non-numeric group: $sum -> 0, $avg -> null.
+    coll.delete_many({})
+    coll.insert_many([{"v": "x"}, {"v": "y"}])
+    [b2] = list(
+        coll.aggregate([{"$group": {"_id": None, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}}}])
+    )
+    assert b2["s"] == 0
+    assert b2["a"] is None
 
 
 def test_aggregate_push_addtoset_skip_missing(coll) -> None:
@@ -1492,6 +2039,226 @@ def test_aggregate_with_to_int_conversion(coll) -> None:
         )
     )
     assert out == [{"_id": None, "total": 60}]
+
+
+def test_aggregate_to_int_overflow_via_pymongo(coll) -> None:
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"v": 3_000_000_000.0})  # > int32 max
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"n": {"$toInt": "$v"}}}]))
+    assert exc.value.code == 241
+
+    # $convert with onError catches the overflow instead of erroring.
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "n": {"$convert": {"input": "$v", "to": "int", "onError": -1}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"n": -1}]
+
+
+def test_aggregate_to_long_via_pymongo(coll) -> None:
+    """$toLong truncates toward zero, parses strings, and yields a 64-bit long
+    (values beyond int32 are fine); overflow beyond int64 raises 241. mongod
+    7.0.12-verified."""
+    from bson.int64 import Int64
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "d": 2.7, "s": "42", "big": 9_000_000_000.0})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "a": {"$toLong": "$d"},
+                        "b": {"$toLong": "$s"},
+                        "c": {"$toLong": "$big"},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"a": 2, "b": 42, "c": 9_000_000_000}]
+    assert all(isinstance(out[0][k], Int64) for k in ("a", "b", "c"))
+    # Overflow beyond int64 -> 241, and onError catches it.
+    coll.update_one({"_id": 1}, {"$set": {"huge": "99999999999999999999"}})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"n": {"$toLong": "$huge"}}}]))
+    assert exc.value.code == 241
+    got = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "n": {"$convert": {"input": "$huge", "to": "long", "onError": -1}},
+                    }
+                }
+            ]
+        )
+    )
+    assert got == [{"n": -1}]
+
+
+def test_conversion_error_codes_via_pymongo(coll) -> None:
+    """mongod-specific expression error codes over the wire: unparseable numeric
+    string -> 241, unknown $convert target -> 2, $sortArray non-array -> 2942504,
+    $strLenCP/$strLenBytes non-string -> 34471/34473. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "s": "abc", "n": 5})
+    for expr, code in [
+        ({"$toInt": "$s"}, 241),
+        ({"$toDouble": "$s"}, 241),
+        ({"$convert": {"input": "$n", "to": "bogus"}}, 2),
+        ({"$sortArray": {"input": "$n", "sortBy": 1}}, 2942504),
+        ({"$strLenCP": "$n"}, 34471),
+        ({"$strLenBytes": "$n"}, 34473),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
+
+
+def test_array_set_typeguard_codes_via_pymongo(coll) -> None:
+    """Array/set operators reject non-array/non-object arguments with mongod's
+    exact codes over the wire (incl. the previously-silent $arrayElemAt/$in).
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for expr, code in [
+        ({"$size": "$n"}, 17124),
+        ({"$arrayElemAt": ["$n", 0]}, 28689),
+        ({"$in": [1, "$n"]}, 40081),
+        ({"$setUnion": ["$n"]}, 17043),
+        ({"$mergeObjects": ["$n"]}, 40400),
+        ({"$anyElementTrue": "$n"}, 17041),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
+
+
+def test_string_typeguard_codes_via_pymongo(coll) -> None:
+    """String/binary operators reject non-string arguments with mongod's exact
+    codes over the wire (incl. the previously-silent $regexMatch/$regexFind/
+    $regexFindAll). mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for expr, code in [
+        ({"$regexMatch": {"input": "$n", "regex": "a"}}, 51104),
+        ({"$regexFind": {"input": "$n", "regex": "a"}}, 51104),
+        ({"$indexOfBytes": ["$n", "a"]}, 40091),
+        ({"$binarySize": "$n"}, 51276),
+        ({"$bsonSize": "$n"}, 31393),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
+
+
+def test_strcasecmp_coercion_via_pymongo(coll) -> None:
+    """$strcasecmp coerces its operands to string (null -> ""), rejecting only
+    bool (16007), over the wire. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "a": {"$strcasecmp": ["$n", "a"]},
+                        "b": {"$strcasecmp": [5, 10]},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"a": -1, "b": 1}]
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"v": {"$strcasecmp": [True, "a"]}}}]))
+    assert exc.value.code == 16007
+
+
+def test_expression_accumulators_via_pymongo(coll) -> None:
+    """$sum/$avg/$max/$min work as expression operators (MongoDB 5.0+) over the
+    wire, not just as group accumulators. mongod 7.0.12-verified."""
+    coll.insert_one({"_id": 1, "arr": [1, 2, 3], "n": 5})
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "s": {"$sum": "$arr"},
+                        "a": {"$avg": "$arr"},
+                        "mx": {"$max": "$arr"},
+                        "mn": {"$min": "$arr"},
+                        "sn": {"$sum": "$n"},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"s": 6, "a": 2.0, "mx": 3, "mn": 1, "sn": 5}]
+
+
+def test_date_misc_typeguard_codes_via_pymongo(coll) -> None:
+    """Date/misc operators match mongod's error codes over the wire (incl. the
+    previously-silent $dateToString non-date and $dateDiff missing endDate).
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for expr, code in [
+        ({"$dateToString": {"date": "$n"}}, 16006),
+        ({"$dateFromString": {"dateString": "$n"}}, 241),
+        ({"$switch": {"branches": []}}, 40068),
+        ({"$ifNull": ["$n"]}, 1257300),
+        ({"$getField": {"field": "$n", "input": {}}}, 5654602),
+        ({"$dateDiff": {"startDate": "$$NOW"}}, 5166304),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
+
+
+def test_more_expression_error_codes_via_pymongo(coll) -> None:
+    """More mongod-specific expression error codes over the wire: $zip (34461/
+    34468), $arrayToObject (40386), $objectToArray (40390), $replaceOne per-arg
+    (51746/51745/51744), $dateDiff unknown unit (9). mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5, "d": "2020-01-01"})
+    for expr, code in [
+        ({"$zip": {"inputs": "$n"}}, 34461),
+        ({"$zip": {"inputs": ["$n"]}}, 34468),
+        ({"$arrayToObject": "$n"}, 40386),
+        ({"$objectToArray": "$n"}, 40390),
+        ({"$replaceOne": {"input": "$n", "find": "a", "replacement": "b"}}, 51746),
+        ({"$replaceOne": {"input": "x", "find": "$n", "replacement": "b"}}, 51745),
+        ({"$replaceAll": {"input": "x", "find": "y", "replacement": "$n"}}, 51744),
+        (
+            {"$dateDiff": {"startDate": "$$NOW", "endDate": "$$NOW", "unit": "bogus"}},
+            9,
+        ),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
 
 
 def test_create_index_listed_via_pymongo(coll) -> None:
@@ -3594,7 +4361,8 @@ def test_backup_archive_via_pymongo_round_trips_data(server, tmp_path) -> None:
     restored_dir = tmp_path / "restored"
     restored_dir.mkdir()
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(restored_dir, filter="data")
+        # trusted test archive — no `filter` kwarg (older 3.10/3.11 reject it).
+        tar.extractall(restored_dir)
 
     with SecantusDBServer(port=0, storage_path=str(restored_dir)) as restored:
         client2 = MongoClient(restored.uri, serverSelectionTimeoutMS=2000)
@@ -4100,3 +4868,593 @@ def test_pull_predicate_and_pullall(coll) -> None:
     coll.update_one({"_id": 1}, {"$set": {"a": [1, 2, 3, 2, 1]}})
     coll.update_one({"_id": 1}, {"$pullAll": {"a": [1, 2]}})
     assert coll.find_one({"_id": 1})["a"] == [3]
+
+
+def test_json_schema_keyword_validation_wire(coll) -> None:
+    """$jsonSchema keyword validation over the wire, verbatim from a mongod 7.0
+    probe: metadata keywords accepted; unsupported keywords 9 FailedToParse;
+    unknown keywords 9 (nested schemas included); draft-4 exclusive bounds and
+    multipleOf / tuple-items semantics."""
+    import pymongo
+
+    coll.insert_many([{"_id": 1, "n": 6, "arr": [1, "x"]}, {"_id": 2, "n": 7.5, "arr": [1]}])
+
+    assert len(list(coll.find({"$jsonSchema": {"title": "t", "description": "d"}}))) == 2
+    got = [
+        d["_id"]
+        for d in coll.find(
+            {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}}
+        )
+    ]
+    assert got == [2]
+    assert [
+        d["_id"] for d in coll.find({"$jsonSchema": {"properties": {"n": {"multipleOf": 2.5}}}})
+    ] == [2]
+    assert [
+        d["_id"]
+        for d in coll.find(
+            {
+                "$jsonSchema": {
+                    "properties": {
+                        "arr": {"items": [{"bsonType": "int"}], "additionalItems": False}
+                    }
+                }
+            }
+        )
+    ] == [2]
+
+    for schema, code, frag in [
+        ({"$ref": "#/x"}, 9, "not currently supported"),
+        ({"notakeyword": 1}, 9, "Unknown $jsonSchema keyword: notakeyword"),
+        ({"properties": {"n": {"notakeyword": 1}}}, 9, "Unknown $jsonSchema keyword"),
+        ({"minimum": 5, "exclusiveMinimum": 6}, 14, "must be a boolean"),
+        ({"exclusiveMinimum": True}, 9, "must be a present if"),
+        ({"multipleOf": 0}, 9, "positive value"),
+        ({"title": 5}, 14, "must be of type string"),
+    ]:
+        with pytest.raises(pymongo.errors.OperationFailure) as exc:
+            list(coll.find({"$jsonSchema": schema}))
+        assert exc.value.code == code, schema
+        assert frag in exc.value.details["errmsg"], schema
+
+
+def test_median_and_percentile_over_the_wire(coll) -> None:
+    """$median / $percentile group accumulators + expression forms, matching a
+    mongod 7.0.12 probe (discrete percentile, doubles out, verbatim errors)."""
+    import pymongo
+
+    coll.insert_many([{"x": v} for v in [10, 20, 30, 40]])
+    r = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": None,
+                        "med": {"$median": {"input": "$x", "method": "approximate"}},
+                        "pct": {
+                            "$percentile": {
+                                "input": "$x",
+                                "p": [0.1, 0.5, 0.75, 0.9],
+                                "method": "approximate",
+                            }
+                        },
+                    }
+                }
+            ]
+        )
+    )[0]
+    assert r["med"] == 20.0
+    assert r["pct"] == [10.0, 20.0, 30.0, 40.0]
+
+    r = list(
+        coll.aggregate(
+            [
+                {"$limit": 1},
+                {
+                    "$project": {
+                        "m": {"$median": {"input": [1, 2, 3, 4], "method": "approximate"}},
+                    }
+                },
+            ]
+        )
+    )[0]
+    assert r["m"] == 2.0
+
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        list(coll.aggregate([{"$group": {"_id": None, "m": {"$median": {"input": "$x"}}}}]))
+    assert exc.value.code == 40414
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        list(
+            coll.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "p": {
+                                "$percentile": {
+                                    "input": "$x",
+                                    "p": [1.5],
+                                    "method": "approximate",
+                                }
+                            },
+                        }
+                    }
+                ]
+            )
+        )
+    assert exc.value.code == 7750303
+
+
+def test_range_orders_embedded_documents(coll) -> None:
+    """$gt/$lt over an embedded-document bound orders documents field-by-field
+    (mongod 7.0.12); a document-valued field never matches a scalar bound.
+    Regression for a bug where both servers returned nothing for a doc bound."""
+    coll.insert_many(
+        [
+            {"_id": 1, "a": {"x": 2}},
+            {"_id": 2, "a": {"x": 0}},
+            {"_id": 3, "a": {"x": 1}},
+            {"_id": 4, "a": {"x": 1, "y": 9}},
+            {"_id": 5, "a": {"y": 1}},
+            {"_id": 6, "a": 5},  # scalar — different bracket
+        ]
+    )
+    assert sorted(d["_id"] for d in coll.find({"a": {"$gt": {"x": 1}}})) == [1, 4, 5]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$gte": {"x": 1}}})) == [1, 3, 4, 5]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$lt": {"x": 1}}})) == [2]
+    # A scalar field never matches a document bound.
+    assert 6 not in [d["_id"] for d in coll.find({"a": {"$gt": {"x": 1}}})]
+
+
+def test_query_mod_truncation_and_bool(coll) -> None:
+    """$mod over the wire: double values (and the divisor) truncate toward
+    zero, bool is excluded, C-style modulo. Regression for a bug where the Rust
+    server errored on a double-valued field and both servers matched bool."""
+    coll.insert_many(
+        [
+            {"_id": 1, "a": 5},
+            {"_id": 2, "a": 5.0},
+            {"_id": 3, "a": True},
+            {"_id": 4, "a": 5.5},
+            {"_id": 5, "a": -5},
+            {"_id": 6, "a": 4.9},
+        ]
+    )
+    assert sorted(d["_id"] for d in coll.find({"a": {"$mod": [2, 1]}})) == [1, 2, 4]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$mod": [2, 0]}})) == [6]
+    assert sorted(d["_id"] for d in coll.find({"a": {"$mod": [2.5, 0]}})) == [6]
+
+
+def test_query_size_validation(coll) -> None:
+    """$size over the wire: an integer-valued float is accepted; a negative /
+    non-integer / string / bool argument is a parse error (code 2), not a
+    silent empty result."""
+    import pymongo
+
+    coll.insert_many([{"_id": 1, "a": [1, 2]}, {"_id": 2, "a": [1]}])
+    assert [d["_id"] for d in coll.find({"a": {"$size": 2.0}})] == [1]
+    for bad in (-1, 2.5, "2", True):
+        with pytest.raises(pymongo.errors.OperationFailure) as exc:
+            list(coll.find({"a": {"$size": bad}}))
+        assert exc.value.code == 2, bad
+
+
+def test_update_inc_mul_non_numeric_operand(coll) -> None:
+    """$inc / $mul by a non-number is rejected (code 14) over the wire on the
+    Python server, matching mongod — not silently computed."""
+    import pymongo
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for op in ("$inc", "$mul"):
+        for operand in (True, "x", None):
+            with pytest.raises(pymongo.errors.OperationFailure) as exc:
+                coll.update_one({"_id": 1}, {op: {"n": operand}})
+            assert exc.value.code == 14, (op, operand)
+    # The document is untouched by the rejected updates.
+    assert coll.find_one({"_id": 1})["n"] == 5
+    # A valid $inc still applies.
+    coll.update_one({"_id": 1}, {"$inc": {"n": 3}})
+    assert coll.find_one({"_id": 1})["n"] == 8
+
+
+def test_aggregation_expr_bool_argument_rejected(coll) -> None:
+    """A bool where an aggregation operator expects a numeric (int) argument is
+    a parse error in mongod (bool is not a number) — SecantusDB surfaces the
+    exact error code over the wire. Three-way mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$round": [1.5, True]}, 16004),
+        ({"$trunc": [1.5, True]}, 16004),
+        ({"$arrayElemAt": [[10, 20, 30], True]}, 28690),
+        ({"$slice": [[1, 2, 3, 4], True]}, 28725),
+        ({"$slice": [[1, 2, 3, 4], 1, True]}, 28727),
+        ({"$sortArray": {"input": [3, 1, 2], "sortBy": True}}, 2942507),
+        ({"$substrCP": ["hello", True, 2]}, 34450),
+        ({"$substrCP": ["hello", 1, True]}, 34452),
+        ({"$substrBytes": ["hello", True, 2]}, 16034),
+        ({"$substrBytes": ["hello", 1, True]}, 16035),
+        ({"$substr": ["hello", True, 2]}, 16034),  # $substr aliases $substrBytes
+        ({"$substr": ["hello", 1, True]}, 16035),
+        ({"$range": [True, 5]}, 34443),
+        ({"$range": [0, True]}, 34445),
+        ({"$range": [0, 5, True]}, 34447),
+        ({"$indexOfArray": [[1, 2, 3], 2, True]}, 40096),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+
+    # An int argument still computes.
+    out = list(coll.aggregate([{"$project": {"r": {"$arrayElemAt": [[10, 20, 30], 1]}, "_id": 0}}]))
+    assert out == [{"r": 20}]
+
+
+def test_aggregation_whole_double_index_accepted(coll) -> None:
+    """mongod accepts a whole-number double where an int index is expected and
+    rejects a fractional double. Both hold over the wire. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    got = list(
+        coll.aggregate([{"$project": {"r": {"$arrayElemAt": [[10, 20, 30], 2.0]}, "_id": 0}}])
+    )
+    assert got == [{"r": 30}]
+    got = list(
+        coll.aggregate([{"$project": {"r": {"$slice": [[1, 2, 3, 4], 1.0, 2.0]}, "_id": 0}}])
+    )
+    assert got == [{"r": [2, 3]}]
+
+    for expr, code in [
+        ({"$arrayElemAt": [[10, 20, 30], 2.7]}, 28691),
+        ({"$slice": [[1, 2, 3, 4], 2.7]}, 28726),
+        ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, 28728),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 40096),
+        ({"$substrCP": ["hello", 1.7, 2]}, 34451),
+        ({"$range": [0, 5.7]}, 34446),
+        ({"$round": [3.14159, 2.7]}, 51082),
+        ({"$trunc": [3.14159, 2.7]}, 51082),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+
+
+def test_split_argument_validation_via_pymongo(coll) -> None:
+    """$split: empty separator 40087, non-string first/second 40085/40086, wrong
+    arg count 16020; a null string / separator yields null. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$split": ["a,b", ""]}, 40087),
+        ({"$split": [5, ","]}, 40085),
+        ({"$split": ["a,b", 5]}, 40086),
+        ({"$split": ["a,b"]}, 16020),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+    got = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "a": {"$split": ["a,b,c", ","]},
+                        "n": {"$split": [None, ","]},
+                    }
+                }
+            ]
+        )
+    )
+    assert got == [{"a": ["a", "b", "c"], "n": None}]
+
+
+def test_substr_bytes_split_utf8_rejected(coll) -> None:
+    """$substrBytes rejects a range that splits a UTF-8 character (mongod codes
+    28656 start / 28657 end) over the wire. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$substrBytes": ["héllo", 0, 2]}, 28657),
+        ({"$substrBytes": ["héllo", 2, 3]}, 28656),
+        ({"$substr": ["héllo", 0, 2]}, 28657),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+    # Clean boundary still computes.
+    got = list(coll.aggregate([{"$project": {"r": {"$substrBytes": ["héllo", 0, 3]}, "_id": 0}}]))
+    assert got == [{"r": "hé"}]
+
+
+def test_substr_negative_index_rejected(coll) -> None:
+    """$substr* reject a negative start (50752 / 34455); $substrCP also rejects a
+    negative length (34454), while $substrBytes treats it as "to end". mongod
+    7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$substrBytes": ["abcde", -1, 2]}, 50752),
+        ({"$substrCP": ["abcde", -1, 2]}, 34455),
+        ({"$substrCP": ["abcde", 1, -1]}, 34454),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+    got = list(coll.aggregate([{"$project": {"r": {"$substrBytes": ["abcde", 1, -1]}, "_id": 0}}]))
+    assert got == [{"r": "bcde"}]
+
+
+def test_substr_bytes_truncates_double_index(coll) -> None:
+    """$substrBytes truncates a double index toward zero (mongod-faithful),
+    unlike $substrCP which rejects a fractional double. mongod 7.0.12-verified."""
+    coll.insert_one({"_id": 1})
+    for expr, want in [
+        ({"$substrBytes": ["abcde", 1.7, 2]}, "bc"),
+        ({"$substrBytes": ["abcde", 0.9, 3]}, "abc"),
+        ({"$substrBytes": ["abcde", 1, 2.9]}, "bc"),
+    ]:
+        got = list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert got == [{"r": want}], expr
+
+
+def test_limit_skip_numeric_arg_validation(coll) -> None:
+    """$limit / $skip accept a whole-number double but reject bool / fractional /
+    negative (5107201 / 5107200), and $limit rejects zero (15958), over the wire.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i} for i in range(10)])
+    assert len(list(coll.aggregate([{"$limit": 2.0}]))) == 2
+    assert len(list(coll.aggregate([{"$skip": 3.0}]))) == 7
+    for pipe, code in [
+        ([{"$limit": 2.7}], 5107201),
+        ([{"$limit": True}], 5107201),
+        ([{"$limit": 0}], 15958),
+        ([{"$skip": 3.7}], 5107200),
+        ([{"$skip": -1}], 5107200),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate(pipe))
+        assert exc.value.code == code, pipe
+
+
+def test_sample_size_validation(coll) -> None:
+    """$sample rejects a bool size (28746) and a negative size (28747) over the
+    wire, and truncates a fractional size. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i} for i in range(10)])
+    assert len(list(coll.aggregate([{"$sample": {"size": 3}}]))) == 3
+    assert len(list(coll.aggregate([{"$sample": {"size": 2.7}}]))) == 2
+    for size, code in [(True, 28746), (-1, 28747)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$sample": {"size": size}}]))
+        assert exc.value.code == code, size
+
+
+def test_bits_numeric_arg_validation(coll) -> None:
+    """$bits* accept a whole-double mask/position and reject fractional / negative
+    / bool with mongod's codes (position 2, non-array mask 9) over the wire.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 6})
+    assert coll.count_documents({"n": {"$bitsAllSet": 6.0}}) == 1
+    assert coll.count_documents({"n": {"$bitsAllSet": [1.0, 2.0]}}) == 1
+    for query, code in [
+        ({"n": {"$bitsAllSet": 2.5}}, 9),
+        ({"n": {"$bitsAllSet": -1}}, 9),
+        ({"n": {"$bitsAllSet": [1.5]}}, 2),
+        ({"n": {"$bitsAllSet": [-1]}}, 2),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            coll.count_documents(query)
+        assert exc.value.code == code, query
+
+
+def test_array_operators_reject_non_array_via_pymongo(coll) -> None:
+    """$first/$last (28689), $reverseArray (34435), $concatArrays (28664),
+    $slice (28724), $map (16883), $filter (28651), $reduce (40080) reject a
+    non-array input; a null / missing input yields null. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for expr, code in [
+        ({"$first": 5}, 28689),
+        ({"$reverseArray": 5}, 34435),
+        ({"$concatArrays": [[1], 5]}, 28664),
+        ({"$slice": [5, 2]}, 28724),
+        ({"$map": {"input": 5, "in": "$$this"}}, 16883),
+        ({"$filter": {"input": 5, "cond": True}}, 28651),
+        ({"$reduce": {"input": 5, "initialValue": 0, "in": "$$value"}}, 40080),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+    out = list(coll.aggregate([{"$project": {"_id": 0, "n": {"$first": "$gone"}}}]))
+    assert out == [{"n": None}]
+
+
+def test_index_of_start_end_validation_via_pymongo(coll) -> None:
+    """$indexOfBytes/$indexOfCP: a fractional / bool / non-numeric start or end is
+    40096, a negative one is 40097; a whole double is accepted. mongod
+    7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for op in ("$indexOfBytes", "$indexOfCP"):
+        for bad, code in [(2.5, 40096), (True, 40096), ("x", 40096), (-1, 40097)]:
+            with pytest.raises(OperationFailure) as exc:
+                list(coll.aggregate([{"$project": {"r": {op: ["abcabc", "b", bad]}, "_id": 0}}]))
+            assert exc.value.code == code, (op, bad)
+    got = list(
+        coll.aggregate([{"$project": {"_id": 0, "i": {"$indexOfBytes": ["abcabc", "b", 2.0]}}}])
+    )
+    assert got == [{"i": 4}]
+
+
+def test_trim_argument_validation_via_pymongo(coll) -> None:
+    """$trim/$ltrim/$rtrim: non-string input -> 50699, non-string chars -> 50700;
+    a null chars yields null. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for op in ("$trim", "$ltrim", "$rtrim"):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: {"input": 5}}, "_id": 0}}]))
+        assert exc.value.code == 50699, op
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: {"input": "x", "chars": 5}}, "_id": 0}}]))
+        assert exc.value.code == 50700, op
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "t": {"$trim": {"input": "--x--", "chars": "-"}},
+                        "n": {"$trim": {"input": "x", "chars": None}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"t": "x", "n": None}]
+
+
+def test_concat_type_validation_via_pymongo(coll) -> None:
+    """$concat: a non-string operand is 16702; a null / missing operand yields
+    null. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "s": "b"})
+    for expr in ({"$concat": ["a", 5]}, {"$concat": ["a", True]}, {"$concat": [["x"]]}):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == 16702, expr
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "ok": {"$concat": ["a", "$s"]},
+                        "n": {"$concat": ["a", None]},
+                        "m": {"$concat": ["a", "$gone"]},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"ok": "ab", "n": None, "m": None}]
+
+
+def test_pow_domain_validation(coll) -> None:
+    """$pow: negative base + fractional exponent returns NaN (not a server crash),
+    and bad operands raise mongod's codes over the wire. mongod 7.0.12-verified."""
+    import math
+
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    got = list(coll.aggregate([{"$project": {"r": {"$pow": [-2, 0.5]}, "_id": 0}}]))
+    assert len(got) == 1 and math.isnan(got[0]["r"])  # regression: used to crash BSON encode
+    assert list(coll.aggregate([{"$project": {"r": {"$pow": [-2, 3]}, "_id": 0}}]))[0]["r"] == -8
+    for expr, code in [
+        ({"$pow": ["x", 2]}, 28762),
+        ({"$pow": [2, True]}, 28763),
+        ({"$pow": [0, -1]}, 28764),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
+        assert exc.value.code == code, expr
+
+
+def test_unary_math_rejects_non_numeric_via_pymongo(coll) -> None:
+    """$abs/$ceil/$floor/$sqrt/$exp/$ln/$log10 reject a string/bool operand
+    (28765), $round/$trunc (51081); null passes through. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "s": "x", "n": 4.0})
+    for op in ("$abs", "$ceil", "$floor", "$sqrt", "$exp", "$ln", "$log10"):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: "$s"}}}]))
+        assert exc.value.code == 28765, op
+    for op in ("$round", "$trunc"):
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"r": {op: ["$s", 0]}}}]))
+        assert exc.value.code == 51081, op
+    # $log: a non-numeric argument (28756) / base (28757).
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"r": {"$log": ["$s", 2]}}}]))
+    assert exc.value.code == 28756
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"r": {"$log": [8, "$s"]}}}]))
+    assert exc.value.code == 28757
+    # A whole-double operand still computes; a null field yields null.
+    got = list(
+        coll.aggregate([{"$project": {"_id": 0, "a": {"$abs": "$n"}, "m": {"$abs": "$gone"}}}])
+    )
+    assert got == [{"a": 4.0, "m": None}]
+
+
+def test_gte_lte_null_and_exists_truthiness(coll) -> None:
+    """$gte/$lte: null match null + missing; $exists uses mongod truthiness.
+    mongod 7.0.12-verified over the wire."""
+    coll.insert_many([{"_id": 1, "f": None}, {"_id": 2, "f": 5}, {"_id": 3}])
+
+    def ids(q):
+        return sorted(d["_id"] for d in coll.find(q))
+
+    assert ids({"f": {"$gte": None}}) == [1, 3]
+    assert ids({"f": {"$lte": None}}) == [1, 3]
+    assert ids({"f": {"$gt": None}}) == []
+    assert ids({"f": {"$exists": ""}}) == [1, 2]
+    assert ids({"f": {"$exists": []}}) == [1, 2]
+    assert ids({"f": {"$exists": 0}}) == [3]
+
+
+def test_rename_validation_no_corruption(coll) -> None:
+    """$rename rejects an array-element / same-field / empty / non-string spec
+    (was silent data corruption / a leaked exception) over the wire, and a valid
+    rename still applies. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": 5, "arr": [1, 2, 3]})
+    for upd in (
+        {"$rename": {"a": "a"}},
+        {"$rename": {"arr.0": "x"}},
+        {"$rename": {"a": "arr.0"}},
+        {"$rename": {"a": ""}},
+        {"$rename": {"a": 5}},
+    ):
+        with pytest.raises(OperationFailure):
+            coll.update_one({"_id": 1}, upd)
+    assert coll.find_one({"_id": 1})["arr"] == [1, 2, 3]  # not corrupted
+    coll.update_one({"_id": 1}, {"$rename": {"a": "z"}})
+    doc = coll.find_one({"_id": 1})
+    assert doc.get("z") == 5 and "a" not in doc
+
+
+def test_bucket_validation_no_data_loss(coll) -> None:
+    """$bucket errors on an out-of-range value with no default (was silent data
+    loss) and validates its spec, over the wire. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": i, "v": i} for i in range(6)])
+    r = list(coll.aggregate([{"$bucket": {"groupBy": "$v", "boundaries": [0, 3, 6]}}]))
+    assert [(b["_id"], b["count"]) for b in r] == [(0, 3), (3, 3)]
+    for spec, code in [
+        ({"groupBy": "$v", "boundaries": [0, 3]}, 7158303),
+        ({"groupBy": "$v", "boundaries": [0, 5, 2]}, 40194),
+        ({"boundaries": [0, 6]}, 40198),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$bucket": spec}]))
+        assert exc.value.code == code, spec

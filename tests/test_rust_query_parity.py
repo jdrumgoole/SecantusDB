@@ -58,9 +58,19 @@ _pure = _load_pure_query()
 
 
 def _rust_match(doc, query, collation=None):
-    return _rust.query_matches(
-        bson.encode(doc), bson.encode(query), bson.encode({}), bson.encode(collation or {})
+    dw, qw, vw, cw = (
+        bson.encode(doc),
+        bson.encode(query),
+        bson.encode({}),
+        bson.encode(collation or {}),
     )
+    owned = _rust.query_matches(dw, qw, vw, cw)
+    # The raw-BSON matcher must agree with the owned matcher bool-for-bool AND
+    # defer (None) on exactly the same inputs — the two-sided contract. Every
+    # curated / fuzz / regex / collation case below thus also pins matches_raw.
+    raw = _rust.query_matches_raw(dw, qw, vw, cw)
+    assert raw == owned, f"matches_raw={raw} != matches={owned} query={query} doc={doc}"
+    return owned
 
 
 _Collation = sys.modules["secantus.collation"].Collation
@@ -140,9 +150,28 @@ CURATED = [
     ({"f": Code("function () {}")}, {"f": Code("function () {}")}),
     ({"f": Code("function () {}")}, {"f": Code("other")}),
     ({"f": Code("c", {"a": 55})}, {"f": Code("c", {"a": 55})}),
+    # JS-Code under range operators — pymongo's Code is a str subclass, so the
+    # Python engine compares it as a plain string (scope ignored); the Rust
+    # matcher now mirrors that instead of deferring.
+    ({"f": Code("b")}, {"f": {"$gt": Code("a")}}),
+    ({"f": Code("a")}, {"f": {"$gt": Code("b")}}),
+    ({"f": Code("b")}, {"f": {"$gte": Code("b")}}),
+    ({"f": Code("b")}, {"f": {"$lt": "c"}}),  # Code vs plain string
+    ({"f": "b"}, {"f": {"$gt": Code("a")}}),  # string field vs Code bound
+    ({"f": Code("b", {"s": 1})}, {"f": {"$gt": Code("a")}}),  # scope ignored
+    ({"f": Code("b")}, {"f": {"$gt": 5}}),  # cross-bracket -> no match
+    ({"f": 5}, {"f": {"$lt": Code("a")}}),  # cross-bracket -> no match
     # $all with regex elements matches array elements as patterns.
     ({"k": ["serialization", "test", "x"]}, {"k": {"$all": [Regex("ser"), Regex("test")]}}),
     ({"k": ["abc", "def"]}, {"k": {"$all": [Regex("zzz")]}}),
+    # $all against a SCALAR field (mongod treats it like a one-element array):
+    # equality and regex elements both match; $all: [] matches nothing.
+    ({"k": "red"}, {"k": {"$all": ["red"]}}),
+    ({"k": "red"}, {"k": {"$all": [Regex("^red$")]}}),
+    ({"k": "red"}, {"k": {"$all": ["red", "blue"]}}),
+    ({"k": ["a", "b"]}, {"k": {"$all": []}}),
+    ({"k": "red"}, {"k": {"$all": []}}),
+    ({"k": "red"}, {"k": {"$all": [{"$elemMatch": {"$eq": "red"}}]}}),
     # Embedded-document equality is order-sensitive + exact (Rust defers
     # on Document/Array expected values; Python is the oracle).
     ({"s": {"h": 14, "w": 21}}, {"s": {"h": 14, "w": 21}}),
@@ -159,6 +188,26 @@ CURATED = [
     ({"age": 30}, {"age": {"$gte": 30}}),
     ({"age": 30}, {"age": {"$lt": 31}}),
     ({"age": 30}, {"age": {"$lt": 30}}),
+    # Range against an embedded-document bound: order field-by-field (key
+    # compare, else recurse, else shorter-first); a document field vs a scalar
+    # bound and a scalar field vs a document bound both no-match (type bracket).
+    ({"a": {"x": 2}}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"x": 1}}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"x": 1}}, {"a": {"$gte": {"x": 1}}}),
+    ({"a": {"x": 1, "y": 9}}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"y": 1}}, {"a": {"$gt": {"x": 1}}}),
+    ({"a": {"x": 0}}, {"a": {"$lt": {"x": 1}}}),
+    ({"a": {"x": 1}}, {"a": {"$lt": {"x": 1, "y": 5}}}),
+    ({"a": {"x": 1}}, {"a": {"$gt": 2}}),
+    ({"a": 2}, {"a": {"$gt": {"x": 1}}}),
+    # Array-vs-array range: elements order by full BSON order (type rank), so a
+    # cross-type element pair still orders (string element > number element).
+    ({"a": [1, "x"]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1, "x"]}, {"a": {"$lt": [1, 2]}}),
+    ({"a": ["x", 1]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [2, "x"]}, {"a": {"$gt": [1, 2]}}),
+    ({"a": [1]}, {"a": {"$lt": [1, 2]}}),
+    ({"a": [1, 2]}, {"a": {"$gte": [1, 2]}}),
     # Range operators against an array-valued (multikey) field: match when any
     # element satisfies the bound; the array-as-a-whole is never compared to the
     # scalar bound (an array out-ranks a number in BSON type order).
@@ -220,13 +269,32 @@ CURATED = [
     ({"a": 1.5}, {"a": {"$type": ["string", "int"]}}),
     ({"a": Int64(5)}, {"a": {"$type": "long"}}),
     ({"a": 5}, {"a": {"$type": "int"}}),
+    ({"a": 5}, {"a": {"$type": 16}}),  # numeric code
+    ({"a": 5}, {"a": {"$type": 2.0}}),  # whole-double code now computes on both
+    ({"a": 5}, {"a": {"$type": 16.0}}),  # whole-double int code -> matches
+    ({"a": 5}, {"a": {"$type": -1}}),  # minKey code (valid, no match)
     ({"tags": [1, 2, 3]}, {"tags": {"$size": 3}}),
     ({"tags": [1, 2]}, {"tags": {"$size": 3}}),
     ({"tags": "abc"}, {"tags": {"$size": 3}}),
+    # An integer-valued float $size is accepted (== 2). (Invalid $size args —
+    # negative / non-integer / string / bool — RAISE on both engines, so they're
+    # covered by the unit test, not the parity corpus which compares bool results.)
+    ({"tags": [1, 2]}, {"tags": {"$size": 2.0}}),
+    ({"tags": [1]}, {"tags": {"$size": 2.0}}),
     ({"n": 12}, {"n": {"$mod": [4, 0]}}),
     ({"n": 13}, {"n": {"$mod": [4, 1]}}),
     ({"n": 13}, {"n": {"$mod": [4, 0]}}),
     ({"vals": [3, 7, 12]}, {"vals": {"$mod": [4, 0]}}),
+    # $mod: double values truncate toward zero, divisor truncates too, bool is
+    # excluded, C-style modulo (-5 % 2 == -1). (Decimal128 defers on the Rust
+    # side — parity harness skips a defer.)
+    ({"n": 5.0}, {"n": {"$mod": [2, 1]}}),
+    ({"n": 5.5}, {"n": {"$mod": [2, 1]}}),
+    ({"n": 4.9}, {"n": {"$mod": [2, 0]}}),
+    ({"n": 4.9}, {"n": {"$mod": [2.5, 0]}}),
+    ({"n": True}, {"n": {"$mod": [2, 1]}}),
+    ({"n": -5}, {"n": {"$mod": [2, 1]}}),
+    ({"n": -5}, {"n": {"$mod": [2, -1]}}),
     (
         {"items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 5}]},
         {"items": {"$elemMatch": {"sku": "b", "qty": {"$gte": 5}}}},
@@ -259,6 +327,23 @@ CURATED = [
     ({"flags": 0b1010}, {"flags": {"$bitsAnyClear": 0b1011}}),
     ({"flags": "abc"}, {"flags": {"$bitsAllSet": 0b1}}),
     ({"flags": True}, {"flags": {"$bitsAllSet": 0b1}}),
+    # whole-number-double mask / bit positions compute on both engines (mongod
+    # accepts them, truncating) — the case the Rust core used to wrongly defer.
+    ({"flags": 0b0110}, {"flags": {"$bitsAllSet": 6.0}}),
+    ({"flags": 0b0110}, {"flags": {"$bitsAllSet": [1.0, 2.0]}}),
+    ({"flags": 0b0110}, {"flags": {"$bitsAnyClear": 8.0}}),
+    # $gte/$lte: null match null + missing (like $eq: null); $gt: null nothing.
+    ({"f": None}, {"f": {"$gte": None}}),
+    ({}, {"f": {"$gte": None}}),
+    ({"f": 5}, {"f": {"$gte": None}}),
+    ({"f": None}, {"f": {"$lte": None}}),
+    ({"f": 5}, {"f": {"$gt": None}}),
+    # $exists mongod truthiness: empty string / array / doc are truthy.
+    ({"f": 5}, {"f": {"$exists": ""}}),
+    ({"f": 5}, {"f": {"$exists": []}}),
+    ({"f": 5}, {"f": {"$exists": {}}}),
+    ({}, {"f": {"$exists": 0}}),
+    ({"f": 5}, {"f": {"$exists": 1}}),
     ({"x": Decimal128("5")}, {"x": 5}),
     ({"x": 5}, {"x": Decimal128("5")}),
     ({"x": Decimal128("3.5")}, {"x": 3.5}),
@@ -306,7 +391,9 @@ CURATED = [
     ({"a": 5, "b": 3, "name": "x"}, {"name": "x", "$expr": {"$gt": ["$a", "$b"]}}),
     ({}, {"$expr": "$missing"}),  # falsy
     ({"x": None}, {"$expr": "$x"}),  # falsy
-    ({"a": 5}, {"$expr": {"$dateToString": {"date": "$a"}}}),  # unported op -> defer
+    # $dateToString inside $expr on a real date (a non-date now correctly raises
+    # Location16006 on both engines — see test_date_misc_typeguard_defers_and_raises).
+    ({"a": datetime.datetime(2026, 1, 1)}, {"$expr": {"$dateToString": {"date": "$a"}}}),
     # $all — now handled in Rust (element equality via Python ==).
     ({"tags": ["a", "b", "c"]}, {"tags": {"$all": ["a", "b"]}}),
     ({"tags": ["a"]}, {"tags": {"$all": ["a", "b"]}}),
@@ -320,7 +407,8 @@ CURATED = [
         {"a": [1, 5, 10]},
         {"a": {"$all": [{"$elemMatch": {"$gt": 4}}, {"$elemMatch": {"$lt": 2}}]}},
     ),
-    ({"a": [1, 2, 3]}, {"a": {"$all": [2, {"$elemMatch": {"$gt": 2}}]}}),  # mixed
+    # (A mixed $all — scalar + $elemMatch — is now rejected by both engines;
+    # covered by test_all_invalid_defers_and_raises, not here.)
     # $in / $nin with a regex candidate — matches string values by pattern.
     ({"s": "hello"}, {"s": {"$in": [Regex("^h", "i")]}}),
     ({"s": "World"}, {"s": {"$in": [Regex("^h", "i")]}}),  # no match
@@ -455,6 +543,52 @@ CURATED = [
     ({"n": 5.0}, {"$jsonSchema": {"properties": {"n": {"type": "number"}}}}),
     ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),
     ({"n": 5.5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),  # double !integer
+    # Draft-4 exclusive bounds (booleans sharpening minimum/maximum, per mongod).
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}}),
+    ({"n": 7}, {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}}),
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": False}}}}),
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"maximum": 6, "exclusiveMaximum": True}}}}),
+    ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"maximum": 6, "exclusiveMaximum": True}}}}),
+    # multipleOf (fmod semantics, incl. a fractional divisor).
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"multipleOf": 3}}}}),
+    ({"n": 7}, {"$jsonSchema": {"properties": {"n": {"multipleOf": 3}}}}),
+    ({"n": 7.5}, {"$jsonSchema": {"properties": {"n": {"multipleOf": 2.5}}}}),
+    ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"multipleOf": 2.5}}}}),
+    # Tuple-form items + additionalItems (false / schema / absent).
+    ({"a": [1, "x"]}, {"$jsonSchema": {"properties": {"a": {"items": [{"bsonType": "int"}]}}}}),
+    (
+        {"a": [1, "x"]},
+        {
+            "$jsonSchema": {
+                "properties": {"a": {"items": [{"bsonType": "int"}], "additionalItems": False}}
+            }
+        },
+    ),
+    (
+        {"a": [1, "x"]},
+        {
+            "$jsonSchema": {
+                "properties": {
+                    "a": {"items": [{"bsonType": "int"}], "additionalItems": {"bsonType": "string"}}
+                }
+            }
+        },
+    ),
+    (
+        {"a": [1, True]},
+        {
+            "$jsonSchema": {
+                "properties": {
+                    "a": {"items": [{"bsonType": "int"}], "additionalItems": {"bsonType": "string"}}
+                }
+            }
+        },
+    ),
+    # title / description are accepted-and-ignored metadata.
+    (
+        {"n": 5},
+        {"$jsonSchema": {"title": "t", "description": "d", "properties": {"n": {"minimum": 1}}}},
+    ),
     # required + top-level.
     ({"a": 1, "b": 2}, {"$jsonSchema": {"required": ["a", "b"]}}),
     ({"a": 1}, {"$jsonSchema": {"required": ["a", "b"]}}),  # missing b -> False
@@ -462,8 +596,16 @@ CURATED = [
     # numeric bounds (min/max/exclusive) — only apply to numeric values.
     ({"age": 30}, {"$jsonSchema": {"properties": {"age": {"minimum": 0, "maximum": 120}}}}),
     ({"age": -1}, {"$jsonSchema": {"properties": {"age": {"minimum": 0}}}}),  # below min
-    ({"age": 5}, {"$jsonSchema": {"properties": {"age": {"exclusiveMinimum": 5}}}}),  # == excl
-    ({"age": 5}, {"$jsonSchema": {"properties": {"age": {"exclusiveMaximum": 10}}}}),
+    # (Draft-6 numeric exclusive bounds are rejected at parse time now — the
+    # draft-4 boolean form mongod implements is covered above.)
+    (
+        {"age": 5},
+        {"$jsonSchema": {"properties": {"age": {"minimum": 5, "exclusiveMinimum": True}}}},
+    ),
+    (
+        {"age": 5},
+        {"$jsonSchema": {"properties": {"age": {"maximum": 10, "exclusiveMaximum": True}}}},
+    ),
     # string length + pattern.
     ({"s": "abc"}, {"$jsonSchema": {"properties": {"s": {"minLength": 2, "maxLength": 4}}}}),
     ({"s": "a"}, {"$jsonSchema": {"properties": {"s": {"minLength": 2}}}}),  # too short
@@ -618,6 +760,107 @@ def test_curated_parity(doc, query):
     py = _pure.matches(doc, query)
     if rust is not None:
         assert rust == py, f"rust={rust} pure={py} for query={query} doc={doc}"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"a": {"$in": 5}},  # non-array
+        {"a": {"$nin": "x"}},  # non-array
+        {"a": {"$in": [{"$regex": "x"}]}},  # nested $ doc element
+        {"a": {"$in": [{"$x": 1}]}},  # nested $ key
+    ],
+)
+def test_in_nin_invalid_defers_and_raises(query):
+    # An invalid $in/$nin: the Rust core defers (None) and the pure engine raises
+    # BadValue — the two agree on "reject", so parity holds via the defer contract.
+    doc = bson.decode(bson.encode({"a": 5}))
+    query = bson.decode(bson.encode({"q": query}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"a": {"$not": 5}},  # scalar
+        {"a": {"$not": "x"}},  # string
+        {"a": {"$not": []}},  # array
+        {"a": {"$not": {}}},  # empty doc
+        {"a": {"$not": True}},  # bool
+        {"a": {"$elemMatch": 5}},  # non-object
+        {"a": {"$elemMatch": "x"}},  # non-object
+    ],
+)
+def test_not_elemmatch_invalid_defers_and_raises(query):
+    # Invalid $not/$elemMatch: Rust defers (None), pure engine raises BadValue.
+    doc = bson.decode(bson.encode({"a": [1, 2, 3]}))
+    query = bson.decode(bson.encode({"q": query}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"a": {"$all": 5}},  # non-array
+        {"a": {"$all": [1, {"$elemMatch": {"x": 1}}]}},  # mixed elemMatch + scalar
+        {"a": {"$all": [{"$gt": 1}]}},  # non-elemMatch $-doc
+    ],
+)
+def test_all_invalid_defers_and_raises(query):
+    # Invalid $all: Rust defers (None), pure engine raises BadValue.
+    doc = bson.decode(bson.encode({"a": [1, 2, 3]}))
+    query = bson.decode(bson.encode({"q": query}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "t,code",
+    [
+        ("notatype", 2),  # unknown alias
+        (0, 2),  # invalid code
+        (100, 2),  # out-of-range code
+        (2.5, 2),  # fractional code
+        (True, 14),  # bool
+        (["int", "notatype"], 2),  # array with a bad element
+    ],
+)
+def test_type_invalid_defers_and_raises(t, code):
+    # Invalid $type: Rust defers (None), pure engine raises the mongod code.
+    doc = bson.decode(bson.encode({"a": 5}))
+    query = bson.decode(bson.encode({"q": {"a": {"$type": t}}}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "query,code",
+    [
+        ({"s": {"$regex": "h", "$options": "z"}}, 51108),  # bad flag
+        ({"s": {"$regex": "h", "$options": 5}}, 2),  # non-string options
+        ({"s": {"$options": "i"}}, 2),  # $options without $regex
+        ({"s": {"$regex": 5}}, 2),  # non-string pattern
+    ],
+)
+def test_regex_options_invalid_defers_and_raises(query, code):
+    # Invalid $regex/$options: the Rust core defers (None) and the pure engine
+    # raises the mongod code — agreeing on "reject" via the defer contract.
+    doc = bson.decode(bson.encode({"s": "hello"}))
+    query = bson.decode(bson.encode({"q": query}))["q"]
+    assert _rust_match(doc, query) is None
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches(doc, query)
+    assert exc.value.code == code
 
 
 def _rand_scalar(rng):

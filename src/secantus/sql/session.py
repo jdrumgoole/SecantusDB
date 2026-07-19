@@ -35,6 +35,12 @@ GUC_DEFAULTS: dict[str, str] = {
     "is_superuser": "off",
     # Transaction characteristics — single-node, so these are honest constants
     # (SET TRANSACTION is a no-op) but ``current_setting`` must report them.
+    # Two-phase commit is supported (#139); a real PG defaults this to 0 but a
+    # zero here reads as "2PC disabled" to drivers' capability probes.
+    "max_prepared_transactions": "100",
+    # 0 = disabled (PG default); a positive value (ms) terminates a connection
+    # left idle in a transaction block that long.
+    "idle_in_transaction_session_timeout": "0",
     "transaction_isolation": "read committed",
     "transaction_read_only": "off",
     "transaction_deferrable": "off",
@@ -61,6 +67,14 @@ _PG_ENCODINGS: dict[str, str | None] = {
     "WIN1251": "cp1251",
     "WIN1252": "cp1252",
     "SQLASCII": None,
+    "EUCJP": "euc_jp",
+    "EUCKR": "euc_kr",
+    "EUCCN": "gb2312",
+    "SJIS": "shift_jis",
+    "BIG5": "big5",
+    "GBK": "gbk",
+    "EUCTW": None,  # no Python codec — pass-through bytes
+    "MULEINTERNAL": None,
 }
 
 # Canonical PG spelling for the ParameterStatus / SHOW value.
@@ -78,6 +92,19 @@ _PG_ENCODING_CANONICAL: dict[str, str] = {
     "WIN1251": "WIN1251",
     "WIN1252": "WIN1252",
     "SQLASCII": "SQL_ASCII",
+    # East-Asian encodings Python can convert.
+    "EUCJP": "EUC_JP",
+    "EUCKR": "EUC_KR",
+    "EUCCN": "EUC_CN",
+    "SJIS": "SJIS",
+    "SHIFTJIS": "SJIS",
+    "BIG5": "BIG5",
+    "GBK": "GBK",
+    # Real PG encodings Python has NO codec for — accepted (a client's own
+    # capability check may still reject them; psycopg raises client-side for
+    # EUC_TW) with pass-through bytes like SQL_ASCII.
+    "EUCTW": "EUC_TW",
+    "MULEINTERNAL": "MULE_INTERNAL",
 }
 
 
@@ -140,6 +167,10 @@ class _Cursor:
     rows: list = field(default_factory=list)
     pos: int = -1
     hold: bool = False
+    # SCROLL / NO SCROLL: True = explicit SCROLL, False = NO SCROLL (backward
+    # movement rejected), None = default (backward allowed since rows are
+    # materialized). For pg_cursors reflection.
+    scrollable: bool | None = None
     # For pg_cursors: the DECLARE's query text and the creation instant.
     statement: str = ""
     created: Any = None
@@ -308,6 +339,9 @@ class Session:
     current_query: str = ""
     query_start: Any = None
     activity_registry: Any = None
+    # pg_terminate_backend / pg_cancel_backend: closes this session's socket
+    # (set by the wire server; None for the embedded API).
+    terminate_cb: Any = None
     # SET LOCAL (#136): GUCs set with ``SET LOCAL`` inside a transaction, mapped to
     # the value to restore at transaction end (the pre-``SET LOCAL`` session value,
     # or None if it wasn't set). Reverted in ``engine._end_txn_state``.
@@ -456,7 +490,13 @@ class Session:
 
     def get_setting(self, name: str) -> str:
         key = canonical_guc_name(name)
-        return self.settings.get(key, GUC_DEFAULTS.get(key, ""))
+        if key in self.settings:
+            return self.settings[key]
+        # The per-transaction characteristics mirror their session defaults
+        # until a BEGIN/SET TRANSACTION overrides them (like real Postgres).
+        if key in ("transaction_isolation", "transaction_read_only", "transaction_deferrable"):
+            return self.get_setting(f"default_{key}")
+        return GUC_DEFAULTS.get(key, "")
 
     @property
     def wire_encoding(self) -> str | None:

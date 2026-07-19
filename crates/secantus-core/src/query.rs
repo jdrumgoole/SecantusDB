@@ -31,7 +31,7 @@
 
 use std::cmp::Ordering;
 
-use bson::{Bson, Document};
+use bson::{Bson, Document, RawBsonRef, RawDocument};
 
 use crate::collation::{self, Collation};
 use crate::{expressions, numeric, regexutil};
@@ -52,6 +52,120 @@ pub fn matches(doc: &Document, query: &Document, vars: &Document, coll: Option<&
         }
     }
     Ok(true)
+}
+
+/// Raw-BSON entry point: match `query` against `raw` **without** materialising
+/// the whole document into an owned `Document`. Only the fields the filter
+/// actually reaches are decoded (`resolve_path_raw` converts just those leaves
+/// to owned `Bson`), so a selective filter over a wide document skips decoding
+/// every sibling field — the scan-path materialization tax
+/// (`tasks/rust-perf-findings.md`, Finding 1). Result is identical to
+/// `matches(&raw.to_document(), ...)`; the parity suite pins it bool-for-bool
+/// against the owned matcher. `$expr` / `$jsonSchema` need the whole document,
+/// so those single clauses fall back to a full decode. Any raw-parse hiccup
+/// signals `Fallback` (defer to the pure-Python matcher), never a wrong answer.
+pub fn matches_raw(
+    raw: &RawDocument,
+    query: &Document,
+    vars: &Document,
+    coll: Option<&Collation>,
+) -> R {
+    for (k, v) in query.iter() {
+        if !match_clause_raw(raw, k, v, vars, coll)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn match_clause_raw(
+    raw: &RawDocument,
+    key: &str,
+    cond: &Bson,
+    vars: &Document,
+    coll: Option<&Collation>,
+) -> R {
+    match key {
+        "$and" => {
+            for c in cond.as_array().ok_or(Fallback)? {
+                if !matches_raw(raw, as_doc(c)?, vars, coll)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        "$or" => {
+            for c in cond.as_array().ok_or(Fallback)? {
+                if matches_raw(raw, as_doc(c)?, vars, coll)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        "$nor" => {
+            for c in cond.as_array().ok_or(Fallback)? {
+                if matches_raw(raw, as_doc(c)?, vars, coll)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        "$comment" => Ok(true),
+        // These operators inspect the whole document, so there's nothing to save
+        // by staying raw — decode once and delegate this clause to the owned
+        // matcher.
+        "$expr" | "$jsonSchema" => {
+            let doc: Document = raw.try_into().map_err(|_| Fallback)?;
+            match_clause(&doc, key, cond, vars, coll)
+        }
+        // $where, $text, ... -> Python.
+        _ if key.starts_with('$') => Err(Fallback),
+        _ => {
+            let reached = resolve_path_raw(raw, key)?;
+            let refs: Vec<Option<&Bson>> = reached.iter().map(Option::as_ref).collect();
+            field_matches(&refs, cond, coll)
+        }
+    }
+}
+
+/// Raw-BSON [`resolve_path`]: the same dotted-path walk (into sub-documents by
+/// key, into arrays by numeric index, fanning out over array elements for
+/// non-index parts) over a [`RawDocument`], decoding **only** the reached values
+/// into owned `Bson`. Returns `Fallback` on a raw-parse error so the caller
+/// defers rather than guessing.
+fn resolve_path_raw(raw: &RawDocument, path: &str) -> Result<Vec<Option<Bson>>, Fallback> {
+    let mut parts = path.split('.');
+    let first = parts.next().unwrap_or("");
+    let mut current: Vec<Option<RawBsonRef>> = vec![raw.get(first).map_err(|_| Fallback)?];
+    for part in parts {
+        let mut nxt: Vec<Option<RawBsonRef>> = Vec::new();
+        for cur in current.iter().copied() {
+            match cur {
+                Some(RawBsonRef::Document(d)) => nxt.push(d.get(part).map_err(|_| Fallback)?),
+                Some(RawBsonRef::Array(arr)) => {
+                    if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+                        let idx: usize = part.parse().map_err(|_| Fallback)?;
+                        nxt.push(arr.get(idx).map_err(|_| Fallback)?);
+                    } else {
+                        for elem in arr {
+                            if let RawBsonRef::Document(ed) = elem.map_err(|_| Fallback)? {
+                                nxt.push(ed.get(part).map_err(|_| Fallback)?);
+                            }
+                        }
+                    }
+                }
+                _ => nxt.push(None),
+            }
+        }
+        current = nxt;
+    }
+    current
+        .into_iter()
+        .map(|o| match o {
+            Some(rbr) => Bson::try_from(rbr).map(Some).map_err(|_| Fallback),
+            None => Ok(None),
+        })
+        .collect()
 }
 
 fn as_doc(b: &Bson) -> Result<&Document, Fallback> {
@@ -222,15 +336,38 @@ pub fn first_unknown_operator(filter: &Document) -> Option<String> {
     None
 }
 
+/// mongod's `$regex` `$options` validation: a string of only `imsxu`. A
+/// non-string or an unknown flag defers so the pure engine raises the exact
+/// error (BadValue "$options has to be a string" / Location51108).
+fn regex_options_ok(arg: &Bson) -> Result<(), Fallback> {
+    let Bson::String(s) = arg else {
+        return Err(Fallback);
+    };
+    if s.chars().any(|c| !matches!(c, 'i' | 'm' | 's' | 'x' | 'u')) {
+        return Err(Fallback);
+    }
+    Ok(())
+}
+
 fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>) -> R {
     match cond {
         // A bare BSON regex literal: `{field: /pat/flags}` matches as a pattern.
         Bson::RegularExpression(_) => op_regex(values, cond, None),
         Bson::Document(d) if is_operator_dict(d) => {
+            // Validate the $regex/$options pair up front (mongod parse-time),
+            // before any operator can short-circuit the match — mirrors the pure
+            // engine. A bad flag / non-string $options / $options-without-$regex
+            // defers so Python raises Location51108 / BadValue.
+            if let Some(opts) = d.get("$options") {
+                if !d.contains_key("$regex") {
+                    return Err(Fallback);
+                }
+                regex_options_ok(opts)?;
+            }
             for (op, arg) in d.iter() {
                 match op.as_str() {
-                    // `$options` is a sibling modifier of `$regex`, consumed below.
-                    "$options" if d.contains_key("$regex") => continue,
+                    // `$options` is a sibling modifier of `$regex`, validated above.
+                    "$options" => continue,
                     "$regex" => {
                         if !op_regex(values, arg, d.get("$options"))? {
                             return Ok(false);
@@ -308,11 +445,16 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
         "$eq" => eq_with_array(values, arg, coll),
         "$ne" => Ok(!eq_with_array(values, arg, coll)?),
         "$gt" => cmp_op(values, arg, coll, |o| o == Ordering::Greater),
+        // `$gte`/`$lte: null` match null + missing (like `$eq: null`); a plain
+        // BSON-order compare against null would spuriously match everything.
+        "$gte" if matches!(arg, Bson::Null) => eq_with_array(values, arg, coll),
         "$gte" => cmp_op(values, arg, coll, |o| o != Ordering::Less),
         "$lt" => cmp_op(values, arg, coll, |o| o == Ordering::Less),
+        "$lte" if matches!(arg, Bson::Null) => eq_with_array(values, arg, coll),
         "$lte" => cmp_op(values, arg, coll, |o| o != Ordering::Greater),
         "$in" => {
             let arr = arg.as_array().ok_or(Fallback)?;
+            in_elements_ok(arr)?;
             for cand in arr {
                 if in_candidate_matches(values, cand, coll)? {
                     return Ok(true);
@@ -322,6 +464,7 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
         }
         "$nin" => {
             let arr = arg.as_array().ok_or(Fallback)?;
+            in_elements_ok(arr)?;
             for cand in arr {
                 if in_candidate_matches(values, cand, coll)? {
                     return Ok(false);
@@ -333,11 +476,26 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
             let present = values.iter().any(|v| v.is_some());
             Ok(present == truthy(arg)?)
         }
-        "$not" => Ok(!field_matches(values, arg, coll)?),
+        "$not" => {
+            // mongod: $not needs a regex or a non-empty document (else BadValue).
+            // A scalar / array / bool / empty doc defers so Python raises.
+            match arg {
+                Bson::RegularExpression(_) => {}
+                Bson::Document(d) if !d.is_empty() => {}
+                _ => return Err(Fallback),
+            }
+            Ok(!field_matches(values, arg, coll)?)
+        }
         "$type" => op_type(values, arg),
         "$size" => op_size(values, arg),
         "$all" => op_all(values, arg),
-        "$elemMatch" => op_elem_match(values, arg),
+        "$elemMatch" => {
+            // mongod: $elemMatch needs an Object (else BadValue) -> defer.
+            if !matches!(arg, Bson::Document(_)) {
+                return Err(Fallback);
+            }
+            op_elem_match(values, arg)
+        }
         "$mod" => op_mod(values, arg),
         "$bitsAllSet" => op_bits(values, arg, |v, m| v & m == m),
         "$bitsAnySet" => op_bits(values, arg, |v, m| v & m != 0),
@@ -374,6 +532,20 @@ fn is_exotic(b: &Bson) -> bool {
 /// pattern (mongod semantics — bare equality would silently match nothing);
 /// everything else is array-aware, collation-aware equality. Mirrors
 /// `query._in_candidate_matches`.
+/// mongod rejects a `$in` / `$nin` element that is a document with a
+/// `$`-prefixed key ("cannot nest $ under $in", BadValue) — defer so Python
+/// raises it. A BSON regex literal is fine (handled in `in_candidate_matches`).
+fn in_elements_ok(arr: &[Bson]) -> Result<(), Fallback> {
+    for el in arr {
+        if let Bson::Document(d) = el {
+            if d.keys().any(|k| k.starts_with('$')) {
+                return Err(Fallback);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn in_candidate_matches(values: &[Option<&Bson>], cand: &Bson, coll: Option<&Collation>) -> R {
     if matches!(cand, Bson::RegularExpression(_)) {
         op_regex(values, cand, None)
@@ -577,22 +749,45 @@ fn compare_values(
     // this is what lets `$elemMatch: {$gt: n}` over an array of sub-documents, or a
     // plain `{a: {$gt: n}}` against a document-valued `a`, no-match cleanly on the
     // Rust server instead of erroring on an otherwise-fine cross-type query.
-    if matches!(a, Bson::Document(_)) || matches!(b, Bson::Document(_)) {
-        return Ok(None);
+    match (a, b) {
+        // Two embedded documents order field-by-field under range operators
+        // (mongod: first differing key compares as a string, else recurse into
+        // the value, else the shorter document sorts first). `order::bson_lt`
+        // is exactly that comparator; `None` from it means a DBPointer sub-value
+        // Python resolves with a type-name tiebreak — defer that rare case.
+        (Bson::Document(_), Bson::Document(_)) => {
+            let ord = if crate::order::bson_lt(a, b).ok_or(Fallback)? {
+                Ordering::Less
+            } else if crate::order::bson_lt(b, a).ok_or(Fallback)? {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            };
+            return Ok(Some(ord));
+        }
+        // A document vs a non-document is a different BSON type bracket, so a
+        // document-valued field never satisfies a scalar bound (and vice versa):
+        // a clean no-match, not an error.
+        (Bson::Document(_), _) | (_, Bson::Document(_)) => return Ok(None),
+        _ => {}
     }
     // Structural array ordering: Python compares lists element-wise /
     // lexicographically (`list < list`), which mongod's range operators mirror.
     match (a, b) {
         (Bson::Array(xs), Bson::Array(ys)) => {
             for (ea, eb) in xs.iter().zip(ys.iter()) {
-                match compare_values(ea, eb, coll)? {
-                    Some(Ordering::Equal) => continue,
-                    Some(o) => return Ok(Some(o)),
-                    // An incomparable element pair: all earlier pairs were equal,
-                    // so this is where Python's `<` would raise TypeError — i.e.
-                    // the whole comparison is not comparable (no match).
-                    None => return Ok(None),
+                // Array elements compare by FULL BSON order (type rank first),
+                // NOT the type-bracketed scalar compare above — mongod ranks a
+                // string element above a number element, so `[1,"x"] > [1,2]`.
+                // `order::bson_lt` is that full order (a DBPointer element
+                // defers, via `None`).
+                if crate::order::bson_lt(ea, eb).ok_or(Fallback)? {
+                    return Ok(Some(Ordering::Less));
                 }
+                if crate::order::bson_lt(eb, ea).ok_or(Fallback)? {
+                    return Ok(Some(Ordering::Greater));
+                }
+                // Equal — continue to the next element pair.
             }
             // One array is a prefix of the other: the shorter sorts first.
             return Ok(Some(xs.len().cmp(&ys.len())));
@@ -601,10 +796,28 @@ fn compare_values(
         (Bson::Array(_), _) | (_, Bson::Array(_)) => return Ok(None),
         _ => {}
     }
-    // The exotic BSON types (JS code, symbol, dbpointer, undefined) aren't
-    // reproduced here — defer to the Python oracle.
+    // Exotic BSON types under a range operator. pymongo hands the Python
+    // engine plain `str` for a Symbol and the str-subclass `Code` for JS code
+    // (scope ignored), so the Python oracle compares those as strings —
+    // including cross Symbol/Code/String pairs. A DBPointer has no ordering in
+    // Python (TypeError) and undefined decodes to None: not comparable, clean
+    // no-match. Under a collation the string path above would have applied
+    // folding the exotic text skips, so defer that combination to Python.
     if is_exotic(a) || is_exotic(b) {
-        return Err(Fallback);
+        if coll.is_some() {
+            return Err(Fallback);
+        }
+        fn text_of(v: &Bson) -> Option<&str> {
+            match v {
+                Bson::String(s) | Bson::Symbol(s) | Bson::JavaScriptCode(s) => Some(s),
+                Bson::JavaScriptCodeWithScope(c) => Some(&c.code),
+                _ => None,
+            }
+        }
+        return Ok(match (text_of(a), text_of(b)) {
+            (Some(x), Some(y)) => Some(x.cmp(y)),
+            _ => None,
+        });
     }
     Ok(match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
@@ -630,9 +843,8 @@ fn truthy(arg: &Bson) -> Result<bool, Fallback> {
         Bson::Int64(n) => *n != 0,
         Bson::Double(d) => *d != 0.0, // NaN -> true (matches Python bool(nan))
         Bson::Null => false,
-        Bson::String(s) => !s.is_empty(),
-        Bson::Array(a) => !a.is_empty(),
-        Bson::Document(d) => !d.is_empty(),
+        // mongod truthiness: only false / 0 / null are falsy. An empty string,
+        // array, or document is TRUTHY (unlike Python's bool()).
         // Decimal128 truthiness in Python keys on object identity (always
         // true), but $exists: Decimal128(0) is pathological — defer.
         Bson::Decimal128(_) => return Err(Fallback),
@@ -650,6 +862,7 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
     let code: Option<i64> = match spec {
         Bson::Int32(n) => Some(*n as i64),
         Bson::Int64(n) => Some(*n),
+        Bson::Double(d) if d.fract() == 0.0 => Some(*d as i64), // whole-double code
         _ => None,
     };
     let is = |names: &[&str], codes: &[i64], hit: bool| -> bool {
@@ -750,6 +963,176 @@ fn unique_items_key(value: &Bson) -> Result<Vec<u8>, Fallback> {
     Ok(out)
 }
 
+/// Every $jsonSchema keyword mongod 7.0 accepts (title / description are
+/// accepted-and-ignored metadata). Mirrors `query._JSON_SCHEMA_KEYWORDS`.
+const JSON_SCHEMA_KEYWORDS: &[&str] = &[
+    "additionalItems",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "bsonType",
+    "dependencies",
+    "description",
+    "enum",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "items",
+    "maxItems",
+    "maxLength",
+    "maxProperties",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minProperties",
+    "minimum",
+    "multipleOf",
+    "not",
+    "oneOf",
+    "pattern",
+    "patternProperties",
+    "properties",
+    "required",
+    "title",
+    "type",
+    "uniqueItems",
+];
+const JSON_SCHEMA_UNSUPPORTED: &[&str] =
+    &["$ref", "$schema", "default", "definitions", "format", "id"];
+
+/// Parse-time $jsonSchema keyword validation, recursing into every sub-schema.
+/// Mirrors `query._check_json_schema_keywords`; codes and messages are
+/// verbatim from a mongod 7.0 probe. Returns `Some((code, codeName, errmsg))`
+/// for the first violation, `None` for a clean schema. The command layer runs
+/// this up-front (mongod rejects the whole query before matching a document).
+pub fn json_schema_keyword_error(schema: &Bson) -> Option<(i32, &'static str, String)> {
+    let Bson::Document(sch) = schema else {
+        return Some((14, "TypeMismatch", "$jsonSchema must be an object".into()));
+    };
+    for (kw, arg) in sch.iter() {
+        let kw = kw.as_str();
+        if JSON_SCHEMA_UNSUPPORTED.contains(&kw) {
+            return Some((
+                9,
+                "FailedToParse",
+                format!("$jsonSchema keyword '{kw}' is not currently supported"),
+            ));
+        }
+        if !JSON_SCHEMA_KEYWORDS.contains(&kw) {
+            return Some((
+                9,
+                "FailedToParse",
+                format!("Unknown $jsonSchema keyword: {kw}"),
+            ));
+        }
+        if (kw == "title" || kw == "description") && !matches!(arg, Bson::String(_)) {
+            return Some((
+                14,
+                "TypeMismatch",
+                format!("$jsonSchema keyword '{kw}' must be of type string"),
+            ));
+        }
+        if kw == "multipleOf" {
+            let m = match arg {
+                Bson::Int32(n) => *n as f64,
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                _ => {
+                    return Some((
+                        14,
+                        "TypeMismatch",
+                        "$jsonSchema keyword 'multipleOf' must be a number".into(),
+                    ))
+                }
+            };
+            if m <= 0.0 {
+                return Some((
+                    9,
+                    "FailedToParse",
+                    "$jsonSchema keyword 'multipleOf' must have a positive value".into(),
+                ));
+            }
+        }
+        if kw == "exclusiveMinimum" || kw == "exclusiveMaximum" {
+            if !matches!(arg, Bson::Boolean(_)) {
+                return Some((
+                    14,
+                    "TypeMismatch",
+                    format!("$jsonSchema keyword '{kw}' must be a boolean"),
+                ));
+            }
+            let bound = if kw == "exclusiveMinimum" {
+                "minimum"
+            } else {
+                "maximum"
+            };
+            if !sch.contains_key(bound) {
+                return Some((
+                    9,
+                    "FailedToParse",
+                    format!("$jsonSchema keyword '{bound}' must be a present if {kw} is present"),
+                ));
+            }
+        }
+        // Recurse into sub-schemas.
+        match kw {
+            "properties" | "patternProperties" => {
+                if let Bson::Document(map) = arg {
+                    for sub in map.values() {
+                        if let Some(e) = json_schema_keyword_error(sub) {
+                            return Some(e);
+                        }
+                    }
+                }
+            }
+            "additionalProperties" | "additionalItems" => {
+                if matches!(arg, Bson::Document(_)) {
+                    if let Some(e) = json_schema_keyword_error(arg) {
+                        return Some(e);
+                    }
+                }
+            }
+            "not" => {
+                if let Some(e) = json_schema_keyword_error(arg) {
+                    return Some(e);
+                }
+            }
+            "items" => {
+                let subs: Vec<&Bson> = match arg {
+                    Bson::Array(a) => a.iter().collect(),
+                    single => vec![single],
+                };
+                for sub in subs {
+                    if let Some(e) = json_schema_keyword_error(sub) {
+                        return Some(e);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" => {
+                if let Bson::Array(a) = arg {
+                    for sub in a {
+                        if let Some(e) = json_schema_keyword_error(sub) {
+                            return Some(e);
+                        }
+                    }
+                }
+            }
+            "dependencies" => {
+                if let Bson::Document(map) = arg {
+                    for dep in map.values() {
+                        if matches!(dep, Bson::Document(_)) {
+                            if let Some(e) = json_schema_keyword_error(dep) {
+                                return Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
     let Bson::Document(sch) = schema else {
         return Ok(false); // Python: `not isinstance(schema, Mapping)` -> False
@@ -801,21 +1184,41 @@ fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
         }
     }
     // Numeric bounds — only for int/double values (Python: `int/float and not
-    // bool`; Decimal128 is excluded there too).
+    // bool`; Decimal128 is excluded there too). Draft-4 semantics, matching
+    // mongod (probed 2026-07-17): exclusiveMinimum / exclusiveMaximum are
+    // BOOLEANS sharpening minimum / maximum to a strict bound (the numeric
+    // draft-6 form is rejected at parse time by the keyword validation).
     if matches!(value, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) {
-        for (kw, reject) in [
-            ("minimum", &[Ordering::Less][..]),
-            ("maximum", &[Ordering::Greater][..]),
-            ("exclusiveMinimum", &[Ordering::Less, Ordering::Equal][..]),
-            (
-                "exclusiveMaximum",
-                &[Ordering::Greater, Ordering::Equal][..],
-            ),
-        ] {
-            if let Some(bound) = sch.get(kw) {
-                if reject.contains(&numeric_order(value, bound)?) {
-                    return Ok(false);
-                }
+        if let Some(bound) = sch.get("minimum") {
+            let ord = numeric_order(value, bound)?;
+            let exclusive = sch.get("exclusiveMinimum") == Some(&Bson::Boolean(true));
+            if ord == Ordering::Less || (exclusive && ord == Ordering::Equal) {
+                return Ok(false);
+            }
+        }
+        if let Some(bound) = sch.get("maximum") {
+            let ord = numeric_order(value, bound)?;
+            let exclusive = sch.get("exclusiveMaximum") == Some(&Bson::Boolean(true));
+            if ord == Ordering::Greater || (exclusive && ord == Ordering::Equal) {
+                return Ok(false);
+            }
+        }
+        // multipleOf — Python `math.fmod(value, m) != 0`.
+        if let Some(m) = sch.get("multipleOf") {
+            let m = match m {
+                Bson::Int32(n) => *n as f64,
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                _ => return Err(Fallback), // rejected at parse time server-side
+            };
+            let v = match value {
+                Bson::Int32(n) => *n as f64,
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                _ => unreachable!(),
+            };
+            if (v % m) != 0.0 {
+                return Ok(false);
             }
         }
     }
@@ -853,9 +1256,37 @@ fn validate_json_schema(value: &Bson, schema: &Bson) -> R {
             }
         }
         if let Some(items) = sch.get("items") {
-            for item in arr {
-                if !validate_json_schema(item, items)? {
-                    return Ok(false);
+            match items {
+                // Tuple validation: position i validates against items[i];
+                // elements past the tuple validate against additionalItems
+                // (false = none allowed; a schema = each must match; absent =
+                // anything goes). Matches the mongod probe.
+                Bson::Array(tuple) => {
+                    let extra = sch.get("additionalItems");
+                    for (i, item) in arr.iter().enumerate() {
+                        if i < tuple.len() {
+                            if !validate_json_schema(item, &tuple[i])? {
+                                return Ok(false);
+                            }
+                        } else {
+                            match extra {
+                                Some(Bson::Boolean(false)) => return Ok(false),
+                                Some(sub @ Bson::Document(_))
+                                    if !validate_json_schema(item, sub)? =>
+                                {
+                                    return Ok(false);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                single => {
+                    for item in arr {
+                        if !validate_json_schema(item, single)? {
+                            return Ok(false);
+                        }
+                    }
                 }
             }
         }
@@ -1072,6 +1503,44 @@ fn as_schema_int(b: &Bson) -> Result<i64, Fallback> {
     }
 }
 
+/// A valid mongod $type argument: a known alias, or a numeric code in
+/// {-1, 1..19, 127} (a whole double counts). Anything else -> defer so Python
+/// raises the exact error (BadValue / TypeMismatch).
+fn type_spec_valid(spec: &Bson) -> bool {
+    const ALIASES: [&str; 22] = [
+        "double",
+        "string",
+        "object",
+        "array",
+        "binData",
+        "undefined",
+        "objectId",
+        "bool",
+        "date",
+        "null",
+        "regex",
+        "dbPointer",
+        "javascript",
+        "symbol",
+        "javascriptWithScope",
+        "int",
+        "timestamp",
+        "long",
+        "decimal",
+        "minKey",
+        "maxKey",
+        "number",
+    ];
+    let valid_code = |c: i64| c == -1 || c == 127 || (1..=19).contains(&c);
+    match spec {
+        Bson::String(s) => ALIASES.contains(&s.as_str()),
+        Bson::Int32(n) => valid_code(*n as i64),
+        Bson::Int64(n) => valid_code(*n),
+        Bson::Double(d) if d.fract() == 0.0 => valid_code(*d as i64),
+        _ => false,
+    }
+}
+
 fn op_type(values: &[Option<&Bson>], spec: &Bson) -> R {
     // spec is a single alias/code or an array of them. A non-alias/code spec
     // element (e.g. a float code) is pathological -> Python.
@@ -1080,8 +1549,8 @@ fn op_type(values: &[Option<&Bson>], spec: &Bson) -> R {
         single => vec![single],
     };
     for s in &specs {
-        if !matches!(s, Bson::String(_) | Bson::Int32(_) | Bson::Int64(_)) {
-            return Err(Fallback);
+        if !type_spec_valid(s) {
+            return Err(Fallback); // bad alias / code / bool / fractional -> Python raises
         }
     }
     for v in values {
@@ -1110,20 +1579,47 @@ fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
     let Bson::Array(required) = required else {
         return Err(Fallback); // Python raises QueryError on a non-array $all
     };
-    // A regex element matches array elements as a *pattern* (not by equality),
-    // mirroring `query._op_all`; a non-regex element matches by `py_eq`. A regex
-    // the engine can't compile still defers via `op_regex`.
+    // `$all: []` matches nothing (mongod), not everything — the vacuous
+    // all-clauses-satisfied below would otherwise be true for every value.
+    if required.is_empty() {
+        return Ok(false);
+    }
+    // mongod: if any element is a $-expression doc, EVERY element must be a
+    // {$elemMatch: …} clause; a mixed form or any other $-op doc is "no $
+    // expressions in $all" -> defer so Python raises.
+    let has_dollar =
+        |e: &Bson| matches!(e, Bson::Document(d) if d.keys().any(|k| k.starts_with('$')));
+    let is_elemmatch =
+        |e: &Bson| matches!(e, Bson::Document(d) if d.len() == 1 && d.contains_key("$elemMatch"));
+    if required.iter().any(has_dollar) && !required.iter().all(is_elemmatch) {
+        return Err(Fallback);
+    }
+    // A regex element matches as a *pattern* (not by equality), mirroring
+    // `query._op_all`; a non-regex element matches by `py_eq`. A regex the
+    // engine can't compile still defers via `op_regex`. mongod treats a scalar
+    // field value like a one-element array for `$all` (only `$elemMatch`
+    // clauses require an actual array) — verified against mongod 7.0.12.
     for v in values {
-        let Some(Bson::Array(arr)) = v else { continue };
+        let Some(field) = v else { continue };
+        // The elements to match each required clause against: the array's own
+        // elements, or the scalar itself as a single element.
+        let elems: &[Bson] = match field {
+            Bson::Array(arr) => arr,
+            scalar => std::slice::from_ref(scalar),
+        };
+        let is_array = matches!(field, Bson::Array(_));
         let mut all_present = true;
         for r in required {
-            // A `{$elemMatch: {...}}` clause requires *some* element of the array
-            // to match the sub-query (mongod's `$all` + `$elemMatch` form).
+            // A `{$elemMatch: {...}}` clause requires *some* element of an actual
+            // array to match the sub-query — a scalar field never satisfies it.
             if let Bson::Document(rd) = r {
                 if rd.len() == 1 {
                     if let Some(sub) = rd.get("$elemMatch") {
-                        let arr_bson = Bson::Array(arr.clone());
-                        if !op_elem_match(&[Some(&arr_bson)], sub)? {
+                        let ok = is_array && {
+                            let arr_bson = Bson::Array(elems.to_vec());
+                            op_elem_match(&[Some(&arr_bson)], sub)?
+                        };
+                        if !ok {
                             all_present = false;
                             break;
                         }
@@ -1132,7 +1628,7 @@ fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
                 }
             }
             let mut found = false;
-            for e in arr {
+            for e in elems {
                 let matched = match r {
                     Bson::RegularExpression(_) => op_regex(&[Some(e)], r, None)?,
                     _ => expressions::py_eq(e, r).map_err(|_| Fallback)?,
@@ -1158,10 +1654,17 @@ fn op_size(values: &[Option<&Bson>], size: &Bson) -> R {
     let n = match size {
         Bson::Int32(n) => *n as i64,
         Bson::Int64(n) => *n,
-        _ => return Err(Fallback), // Python raises QueryError -> Python
+        // An integer-valued double is accepted (mongod: `$size: 2.0` == 2). A
+        // non-integer double, and any non-number (bool / string / …), are parse
+        // errors mongod rejects — defer so the Rust server surfaces BadValue
+        // (code 2, matching mongod's code) rather than a silent no-match.
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
+        _ => return Err(Fallback),
     };
     if n < 0 {
-        return Ok(false);
+        // mongod: "Expected a non-negative number" (code 2) — error, not
+        // no-match. Fallback -> BadValue on the Rust server.
+        return Err(Fallback);
     }
     let n = n as usize;
     for v in values {
@@ -1210,29 +1713,49 @@ fn as_int(b: &Bson) -> Option<i64> {
     }
 }
 
+/// The integer a value contributes to `$mod` (truncated toward zero), or None
+/// if it isn't `$mod`-eligible. mongod (probed 7.0.12) truncates int / long /
+/// double toward zero and **excludes bool** (bool is not a number for `$mod`).
+/// Decimal128 defers to Python — `int(Decimal(...))` is exact to 34 digits,
+/// which an `f64` truncation can't reproduce (the project's standing
+/// Decimal128 precision-parity deferral).
+fn mod_int(val: &Bson) -> Result<Option<i64>, Fallback> {
+    Ok(match val {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d) => {
+            if d.is_nan() || d.is_infinite() {
+                None
+            } else {
+                Some(d.trunc() as i64)
+            }
+        }
+        Bson::Decimal128(_) => return Err(Fallback),
+        // bool and every non-numeric type: not eligible (no match), not an error.
+        _ => None,
+    })
+}
+
 fn op_mod(values: &[Option<&Bson>], spec: &Bson) -> R {
     let arr = spec.as_array().ok_or(Fallback)?;
-    if arr.len() != 2 {
-        return Err(Fallback);
+    if arr.len() < 2 {
+        return Err(Fallback); // "malformed mod, not enough elements" (code 2)
     }
-    let (Some(div), Some(rem)) = (as_int(&arr[0]), as_int(&arr[1])) else {
-        return Err(Fallback); // float divisor/remainder -> Python
+    // The divisor is truncated toward zero too (mongod: `[2.5, 0]` divides by 2).
+    let Some(div) = mod_int(&arr[0])? else {
+        return Err(Fallback); // non-numeric divisor -> malformed (code 2)
     };
-    if div <= 0 {
-        return Err(Fallback); // div==0 / negative modulo semantics -> Python
+    if div == 0 {
+        return Err(Fallback); // "divisor cannot be 0" (code 2)
     }
+    let rem = as_int(&arr[1]);
     let check = |val: &Bson| -> Result<Option<bool>, Fallback> {
-        match val {
-            Bson::Int32(_) | Bson::Int64(_) => {
-                let n = as_int(val).unwrap();
-                Ok(Some(n.rem_euclid(div) == rem))
-            }
-            // Python computes `bool % div` (bool is an int subclass): True->1,
-            // False->0, so a bool value DOES participate in $mod.
-            Bson::Boolean(b) => Ok(Some(i64::from(*b).rem_euclid(div) == rem)),
-            // Python would compute float/decimal mod; we don't -> Python.
-            Bson::Double(_) | Bson::Decimal128(_) => Err(Fallback),
-            _ => Ok(None), // non-numeric: Python's `v % div` raises -> no match
+        match mod_int(val)? {
+            // Rust's `%` on i64 is C-style truncated modulo (sign of the
+            // dividend), matching mongod — `-5 % 2 == -1`. `rem == None` (a
+            // float remainder in the spec) can't equal an integer result.
+            Some(iv) => Ok(Some(rem.is_some() && iv % div == rem.unwrap())),
+            None => Ok(None),
         }
     };
     for v in values {
@@ -1254,19 +1777,28 @@ fn op_mod(values: &[Option<&Bson>], spec: &Bson) -> R {
 // --- $bits* -------------------------------------------------------------
 
 fn resolve_bitmask(arg: &Bson) -> Result<u64, Fallback> {
+    // mongod accepts a whole-number double mask / bit position (truncated);
+    // fractional / negative / bool defer to the Python oracle (which raises the
+    // exact code -- mask 9, position 2).
     match arg {
         Bson::Boolean(_) => Err(Fallback),
         Bson::Int32(n) if *n >= 0 => Ok(*n as u64),
         Bson::Int64(n) if *n >= 0 => Ok(*n as u64),
-        Bson::Int32(_) | Bson::Int64(_) => Err(Fallback), // negative mask -> Python
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 && *d >= 0.0 => Ok(*d as u64),
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => Err(Fallback),
         Bson::Array(a) => {
             let mut mask = 0u64;
             for bit in a {
-                match bit {
-                    Bson::Int32(p) if (0..64).contains(p) => mask |= 1 << *p,
-                    Bson::Int64(p) if (0..64).contains(p) => mask |= 1 << *p,
+                let p = match bit {
+                    Bson::Int32(p) => *p as i64,
+                    Bson::Int64(p) => *p,
+                    Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
                     _ => return Err(Fallback),
+                };
+                if !(0..64).contains(&p) {
+                    return Err(Fallback);
                 }
+                mask |= 1 << p;
             }
             Ok(mask)
         }
@@ -1298,7 +1830,19 @@ mod tests {
     use bson::doc;
 
     fn m(doc: Document, query: Document) -> bool {
-        matches(&doc, &query, &Document::new(), None).expect("should not fall back")
+        let owned = matches(&doc, &query, &Document::new(), None).expect("should not fall back");
+        // The raw-BSON matcher must agree with the owned one bool-for-bool
+        // wherever the owned matcher succeeds — every query test here doubles as
+        // a `matches_raw` parity check.
+        let bytes = bson::to_vec(&doc).unwrap();
+        let raw = RawDocument::from_bytes(&bytes).unwrap();
+        let raw_res = matches_raw(raw, &query, &Document::new(), None)
+            .expect("matches_raw fell back where matches succeeded");
+        assert_eq!(
+            raw_res, owned,
+            "matches_raw disagreed with matches for doc={doc:?} query={query:?}"
+        );
+        owned
     }
 
     #[test]
@@ -1363,14 +1907,23 @@ mod tests {
     #[test]
     fn range_against_document_no_matches() {
         // mongod's range operators are type-bracketed: a document-valued field
-        // never satisfies a scalar bound, and a document bound never matches a
-        // scalar field. Python's native `<` on dicts raises TypeError (no match);
-        // the Rust matcher mirrors that with a clean no-match rather than a
-        // Fallback — so these evaluate here instead of deferring / erroring.
+        // never satisfies a *scalar* bound, and a scalar field never matches a
+        // *document* bound (a clean no-match, not an error).
         assert!(!m(doc! {"a": {"x": 1}}, doc! {"a": {"$gt": 2}}));
         assert!(!m(doc! {"a": {"x": 1}}, doc! {"a": {"$lt": 2}}));
         assert!(!m(doc! {"a": 2}, doc! {"a": {"$gt": {"x": 1}}}));
-        assert!(!m(doc! {"a": {"x": 2}}, doc! {"a": {"$gt": {"x": 1}}}));
+        // Two documents in the SAME bracket DO order, field-by-field (verified
+        // against mongod 7.0.12): {x:2} > {x:1}; {x:1,y:9} > {x:1} (longer wins
+        // on a value tie); {y:1} > {x:1} (key "y" > "x"); {x:1} is not > {x:1}.
+        assert!(m(doc! {"a": {"x": 2}}, doc! {"a": {"$gt": {"x": 1}}}));
+        assert!(m(
+            doc! {"a": {"x": 1, "y": 9}},
+            doc! {"a": {"$gt": {"x": 1}}}
+        ));
+        assert!(m(doc! {"a": {"y": 1}}, doc! {"a": {"$gt": {"x": 1}}}));
+        assert!(!m(doc! {"a": {"x": 1}}, doc! {"a": {"$gt": {"x": 1}}}));
+        assert!(m(doc! {"a": {"x": 1}}, doc! {"a": {"$gte": {"x": 1}}}));
+        assert!(m(doc! {"a": {"x": 0}}, doc! {"a": {"$lt": {"x": 1}}}));
         // The differential case: $elemMatch: {$gt: n} over an array of
         // sub-documents. Each element is a document, so every element no-matches
         // the scalar bound — the whole predicate is false, not an error.
@@ -1420,14 +1973,15 @@ mod tests {
     }
 
     #[test]
-    fn array_vs_array_cross_type_element_no_match() {
-        // A cross-type element pair (after equal leading elements) is where
-        // Python's list `<` would raise TypeError -> no match. The Rust matcher
-        // returns a clean false (Ok), never an Err(Fallback)/BadValue.
-        assert!(!m(doc! {"a": [1, "x"]}, doc! {"a": {"$gt": [1, 2]}}));
+    fn array_vs_array_cross_type_element_ordering() {
+        // Array elements order by FULL BSON order (type rank first), so a
+        // cross-type element pair still orders — verified against mongod
+        // 7.0.12: `[1, "x"]` has a string (rank 4) where `[1, 2]` has a number
+        // (rank 3), so `[1, "x"] > [1, 2]`. (Previously both servers no-matched
+        // this — Python's list `<` raises on str-vs-int.)
+        assert!(m(doc! {"a": [1, "x"]}, doc! {"a": {"$gt": [1, 2]}}));
         assert!(!m(doc! {"a": [1, "x"]}, doc! {"a": {"$lt": [1, 2]}}));
-        // A decisive difference before the cross-type element still orders:
-        // [2, "x"] vs [1, 2] -> first pair 2 > 1 is decisive (Greater).
+        // A decisive difference before the cross-type element still orders.
         assert!(m(doc! {"a": [2, "x"]}, doc! {"a": {"$gt": [1, 2]}}));
     }
 

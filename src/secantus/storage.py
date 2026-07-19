@@ -226,7 +226,14 @@ def extract_backup_archive(
                 f"extract_backup_archive: archive {abs_archive!r} is not "
                 "a SecantusDB backup (no WiredTiger metadata file inside)"
             )
-        tar.extractall(abs_target, filter="data")
+        # `filter="data"` (PEP 706 path-traversal hardening) is only accepted on
+        # 3.12+ and the 3.10.12 / 3.11.4 backports — not on older 3.10/3.11 patch
+        # releases (e.g. python.org's last 3.10 Windows binary, 3.10.11). Use it
+        # when available; otherwise extract without it.
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(abs_target, filter="data")
+        else:
+            tar.extractall(abs_target)
 
     return {
         "targetDir": abs_target,
@@ -4061,6 +4068,7 @@ class Storage:
         collation: Any = None,
         validator: dict[str, Any] | None = None,
         journal: bool = False,
+        return_post_images: bool = False,
     ) -> dict[str, Any]:
         from secantus.collation import parse as _parse_collation
 
@@ -4076,6 +4084,11 @@ class Storage:
         modified = 0
         upserted_id: Any = None
         did_upsert = False
+        # The post-image of each write, captured while the statement still
+        # holds the lock. ``findAndModify new:true`` reads it from here — a
+        # post-write re-``find`` is a separate call a concurrent writer can
+        # land in front of, handing two clients the same "new" document.
+        post_images: list[dict[str, Any]] | None = [] if return_post_images else None
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
@@ -4193,6 +4206,8 @@ class Storage:
                             }
                         )
                         pre_images.append(bson.encode(doc) if preimages_on else None)
+                if post_images is not None:
+                    post_images.append(new)
                 if not multi:
                     break
             if matched == 0 and upsert:
@@ -4260,12 +4275,17 @@ class Storage:
                 pre_images.extend(cap_pre)
             if oplog_entries:
                 self._emit_oplog(oplog_entries, pre_images)
-        return {
+        result = {
             "matched": matched,
             "modified": modified,
             "upserted_id": upserted_id,
             "did_upsert": did_upsert,
         }
+        if post_images is not None:
+            if did_upsert:
+                post_images.append(new)
+            result["post_images"] = post_images
+        return result
 
     @_retry_write_conflicts
     def delete_matching(
@@ -4900,6 +4920,11 @@ class Storage:
             c.set_key(db, coll, name)
             if c.search() != 0:
                 return False
+            # Capture the spec before removal: mongod's showExpandedEvents
+            # ``dropIndexes`` event describes the dropped index in full
+            # (``{v, key, name}``, probed 7.0.12), not just its name.
+            dropped = bson.decode(bytes(c.get_value()))
+            key_spec = dict(dropped.get("key", {}))
             c.remove()
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll, name))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
@@ -4910,7 +4935,7 @@ class Storage:
                         "op": "c",
                         "ns": f"{db}.$cmd",
                         "ui": bson.Binary(ui.bytes, subtype=4),
-                        "o": {"dropIndexes": coll, "index": name},
+                        "o": {"dropIndexes": coll, "index": name, "key": key_spec},
                     }
                 ]
             )
@@ -5006,11 +5031,14 @@ class Storage:
             # (the gauge's drop-then-reinsert E11000 cluster).
             self._refresh_read_snapshot()
             rows = self._collect_prefix(_IDX_TABLE, (db, coll))
-            names = [k[2] for k, _ in rows]
+            # Capture each index's key spec before deletion: mongod's
+            # showExpandedEvents ``dropIndexes`` event describes the dropped
+            # index in full (``{v, key, name}``, probed 7.0.12).
+            dropped = [(k[2], dict(bson.decode(bytes(v)).get("key", {}))) for k, v in rows]
             self._delete_keys(_IDX_TABLE, [k for k, _ in rows])
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
-            if names:
+            if dropped:
                 ui = self._collection_uuid(db, coll)
                 self._emit_oplog(
                     [
@@ -5018,9 +5046,9 @@ class Storage:
                             "op": "c",
                             "ns": f"{db}.$cmd",
                             "ui": bson.Binary(ui.bytes, subtype=4),
-                            "o": {"dropIndexes": coll, "index": n},
+                            "o": {"dropIndexes": coll, "index": n, "key": key},
                         }
-                        for n in names
+                        for n, key in dropped
                     ]
                 )
             return len(rows)

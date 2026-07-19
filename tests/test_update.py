@@ -97,6 +97,21 @@ def test_pull_query_equality_types() -> None:
     assert apply_update({"a": [1, 1.0, 2]}, {"$pull": {"a": 1}}) == {"a": [2]}
 
 
+def test_pull_pullall_on_non_array_raises() -> None:
+    # mongod: $pull / $pullAll on a present but non-array field (scalar or null)
+    # is code 2; a missing field is a silent no-op.
+    for upd in ({"$pull": {"n": 1}}, {"$pullAll": {"n": [1]}}):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"n": 5}, upd)
+        assert exc.value.code == 2, upd
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"n": None}, upd)
+        assert exc.value.code == 2, upd
+    # Missing field: no-op (document unchanged).
+    assert apply_update({"other": 1}, {"$pull": {"nope": 1}}) == {"other": 1}
+    assert apply_update({"other": 1}, {"$pullAll": {"nope": [1]}}) == {"other": 1}
+
+
 def test_pullall_removes_listed_values() -> None:
     assert apply_update({"a": [1, 2, 3, 2, 1]}, {"$pullAll": {"a": [1, 2]}}) == {"a": [3]}
     assert apply_update({"a": [1, 2, 3]}, {"$pullAll": {"a": [9]}}) == {"a": [1, 2, 3]}
@@ -118,6 +133,60 @@ def test_push_sort_modifier() -> None:
         {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1}}}},
     )
     assert out == {"a": [{"s": 1}, {"s": 2}, {"s": 3}]}
+    # A whole-double scalar / direction is accepted (coerces like ±1).
+    assert apply_update({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": 1.0}}}) == {
+        "a": [1, 2, 3]
+    }
+    assert apply_update(
+        {"a": [{"s": 3}]}, {"$push": {"a": {"$each": [{"s": 1}], "$sort": {"s": 1.0}}}}
+    ) == {"a": [{"s": 1}, {"s": 3}]}
+
+
+def test_push_sort_invalid_spec_raises() -> None:
+    # mongod: a numeric whole-element $sort must be exactly ±1 (else code 2), a
+    # document direction must be ±1 (else code 2), and a non-numeric spec
+    # (string/bool/array) is code 2 with the "invalid" message.
+    for spec in (2, -2, 1.5):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": spec}}})
+        assert exc.value.code == 2, spec
+    for spec in ({"s": 2}, {"s": True}, {"s": "x"}):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"a": [{"s": 1}]}, {"$push": {"a": {"$each": [{"s": 2}], "$sort": spec}}})
+        assert exc.value.code == 2, spec
+    for spec in ("x", True, [1]):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": spec}}})
+        assert exc.value.code == 2, spec
+
+
+def test_current_date_bool_and_type_validation() -> None:
+    import datetime
+
+    import bson
+
+    # A boolean (true OR false) sets the current Date.
+    for flag in (True, False):
+        out = apply_update({"_id": 1}, {"$currentDate": {"d": flag}})
+        assert isinstance(out["d"], datetime.datetime), flag
+    # {$type: "date"} / {$type: "timestamp"} set the right BSON type.
+    assert isinstance(
+        apply_update({"_id": 1}, {"$currentDate": {"d": {"$type": "date"}}})["d"],
+        datetime.datetime,
+    )
+    assert isinstance(
+        apply_update({"_id": 1}, {"$currentDate": {"d": {"$type": "timestamp"}}})["d"],
+        bson.Timestamp,
+    )
+    # A non-bool scalar and a bad/missing $type are code 2.
+    for opt in (5, "x", [1]):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"_id": 1}, {"$currentDate": {"d": opt}})
+        assert exc.value.code == 2, opt
+    for opt in ({"$type": "bogus"}, {"$type": 5}, {}):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"_id": 1}, {"$currentDate": {"d": opt}})
+        assert exc.value.code == 2, opt
 
 
 def test_addtoset_dedupes() -> None:
@@ -287,6 +356,47 @@ def test_positional_with_unknown_filter_name_raises() -> None:
         )
 
 
+def test_array_filters_validation() -> None:
+    # mongod: a non-object filter (14), an empty filter (9), a bad identifier
+    # (2), a duplicate identifier (9), and an identifier not used by any
+    # `$[id]` path (9) are all rejected before the update is applied.
+    doc = {"a": [{"g": 1}, {"g": 5}]}
+    upd = {"$set": {"a.$[x].g": 9}}
+    for af, code in [
+        (["x"], 14),  # non-object filter
+        ([{}], 9),  # empty filter
+        ([{"1x": {"$gt": 0}}], 2),  # identifier starts with a digit
+        ([{"X": {"$gt": 0}}], 2),  # identifier starts uppercase
+        ([{"x": {"$gt": 0}}, {"x": {"$lt": 9}}], 9),  # duplicate identifier
+        ([{"x": {"$gt": 0}}, {"y": {"$gt": 0}}], 9),  # 'y' unused
+        ([{"x": {"$gt": 0}, "y": {"$gt": 0}}], 9),  # two identifiers in one filter
+        ([{"$and": [{"x": {"$gt": 0}}, {"y": {"$gt": 0}}]}], 9),  # two, nested
+        ([{"$expr": {"$gt": ["$g", 0]}}], 224),  # $expr, no identifier
+    ]:
+        with pytest.raises(UpdateError) as exc:
+            apply_update(dict(doc), upd, array_filters=af)
+        assert exc.value.code == code, af
+    # Valid: an identifier used by the update path (a dotted filter key on the
+    # element's sub-field). All elements match here; a stricter filter matches one.
+    assert apply_update(dict(doc), upd, array_filters=[{"x.g": {"$gt": 0}}]) == {
+        "a": [{"g": 9}, {"g": 9}]
+    }
+    assert apply_update(dict(doc), upd, array_filters=[{"x.g": {"$gt": 3}}]) == {
+        "a": [{"g": 1}, {"g": 9}]
+    }
+    # A single identifier nested inside $and / $or resolves and applies.
+    assert apply_update(
+        {"a": [{"g": 1, "h": 1}, {"g": 5, "h": 9}]},
+        upd,
+        array_filters=[{"$and": [{"x.g": {"$gt": 3}}, {"x.h": {"$gt": 0}}]}],
+    ) == {"a": [{"g": 1, "h": 1}, {"g": 9, "h": 9}]}
+    assert apply_update(
+        {"a": [{"g": 1}, {"g": 5}]},
+        upd,
+        array_filters=[{"$or": [{"x.g": {"$gt": 3}}, {"x.g": {"$lt": 0}}]}],
+    ) == {"a": [{"g": 1}, {"g": 9}]}
+
+
 def test_positional_dollar_sets_first_match() -> None:
     out = apply_update(
         {"_id": 1, "items": [{"qty": 1}, {"qty": 5}, {"qty": 5}]},
@@ -344,3 +454,80 @@ def test_bit_on_missing_field_treats_as_zero() -> None:
 def test_bit_on_non_int_raises() -> None:
     with pytest.raises(UpdateError):
         apply_update({"f": "abc"}, {"$bit": {"f": {"or": 1}}})
+
+
+def test_inc_mul_reject_non_numeric_operand() -> None:
+    """$inc / $mul by a non-number raise code 14 with mongod's message
+    (probed 7.0.12). bool is not a number here (Python's bool is an int, so
+    5 + True would otherwise compute); string / null also error instead of
+    raising a raw ValueError/TypeError from the arithmetic. Valid numeric
+    operands still apply."""
+    for op, verb in [("$inc", "increment"), ("$mul", "multiply")]:
+        for operand in (True, False, "x", None):
+            with pytest.raises(UpdateError) as exc:
+                apply_update({"n": 5}, {op: {"n": operand}})
+            assert exc.value.code == 14
+            assert f"Cannot {verb} with non-numeric argument" in str(exc.value)
+    # Valid numeric operands still apply.
+    assert apply_update({"n": 5}, {"$inc": {"n": 3}}) == {"n": 8}
+    assert apply_update({"n": 5}, {"$mul": {"n": 2.5}}) == {"n": 12.5}
+
+
+def test_pop_position_slice_bit_reject_bool() -> None:
+    """The update-operator bool-as-int cluster (probed vs mongod 7.0.12): a bool
+    argument to $pop / $push $position / $push $slice / $bit is a parse error,
+    not silently treated as 1. $pop's codes: bool / non-±1 both code 9;
+    $position / $slice / $bit code 2."""
+    # $pop: bool and non-±1 both error (code 9).
+    with pytest.raises(UpdateError) as e:
+        apply_update({"a": [1, 2, 3]}, {"$pop": {"a": True}})
+    assert e.value.code == 9
+    with pytest.raises(UpdateError) as e:
+        apply_update({"a": [1, 2, 3]}, {"$pop": {"a": 2}})
+    assert e.value.code == 9
+    # $position / $slice / $bit bool -> code 2.
+    for upd in (
+        {"$push": {"a": {"$each": [9], "$position": True}}},
+        {"$push": {"a": {"$each": [], "$slice": True}}},
+        {"$bit": {"a": {"and": True}}},
+    ):
+        with pytest.raises(UpdateError) as e:
+            apply_update({"a": [1, 2, 3]}, upd)
+        assert e.value.code == 2, upd
+    # Valid arguments still apply.
+    assert apply_update({"a": [1, 2, 3]}, {"$pop": {"a": 1}}) == {"a": [1, 2]}
+    assert apply_update({"a": [1, 2]}, {"$push": {"a": {"$each": [9], "$position": 1}}}) == {
+        "a": [1, 9, 2]
+    }
+
+
+def test_rename_validation_and_no_corruption() -> None:
+    """$rename validates its spec like mongod instead of silently corrupting the
+    document or leaking a raw exception. mongod 7.0.12-verified."""
+    import copy
+
+    base = {"_id": 1, "a": 5, "arr": [1, 2, 3], "b": 9}
+    # Valid renames still apply.
+    assert apply_update(copy.deepcopy(base), {"$rename": {"a": "z"}})["z"] == 5
+    assert apply_update(copy.deepcopy(base), {"$rename": {"a": "x.y"}})["x"] == {"y": 5}
+    assert "a" in apply_update(
+        copy.deepcopy(base), {"$rename": {"gone": "z"}}
+    )  # missing src: no-op
+    # Invalid specs raise (were silent corruption / an AttributeError leak).
+    for upd, code in [
+        ({"$rename": {"a": "a"}}, 2),  # same field
+        ({"$rename": {"arr.0": "x"}}, 2),  # source is an array element (was corruption)
+        ({"$rename": {"a": "arr.0"}}, 2),  # dest is an array element
+        ({"$rename": {"a": "a.b"}}, 2),  # same path
+        ({"$rename": {"a": ""}}, 56),  # empty target
+        ({"$rename": {"a": 5}}, 2),  # non-string target (was AttributeError leak)
+        ({"$rename": {"a": True}}, 2),
+    ]:
+        with pytest.raises(UpdateError) as exc:
+            apply_update(copy.deepcopy(base), upd)
+        assert exc.value.code == code, upd
+    # The document is untouched when the update is rejected.
+    d = copy.deepcopy(base)
+    with pytest.raises(UpdateError):
+        apply_update(d, {"$rename": {"arr.0": "x"}})
+    assert d["arr"] == [1, 2, 3]

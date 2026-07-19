@@ -101,6 +101,16 @@ CURATED = [
     ({"a": []}, {"$pop": {"a": 1}}, False),
     ({"a": 1}, {"$rename": {"a": "b"}}, False),
     ({"a": {"b": 1}}, {"$rename": {"a.b": "a.c"}}, False),
+    # $rename validation: valid renames compute on both engines; an array-element
+    # source/dest, same-field, same-path, empty, or non-string target raise on
+    # Python and defer on Rust (which the server renders as BadValue).
+    ({"a": 5, "arr": [1, 2, 3]}, {"$rename": {"a": "z"}}, False),
+    ({"a": 5, "arr": [1, 2, 3]}, {"$rename": {"arr.0": "x"}}, False),
+    ({"a": 5, "arr": [1, 2, 3]}, {"$rename": {"a": "arr.0"}}, False),
+    ({"a": 5}, {"$rename": {"a": "a"}}, False),
+    ({"a": 5}, {"$rename": {"a": "a.b"}}, False),
+    ({"a": 5}, {"$rename": {"a": ""}}, False),
+    ({"a": 5}, {"$rename": {"a": 5}}, False),
     ({"_id": 1, "a": 1, "b": 2}, {"x": 99}, False),
     ({"_id": 1, "n": 5}, {"$setOnInsert": {"created": True}}, False),
     ({}, {"$setOnInsert": {"created": True}}, True),
@@ -117,6 +127,22 @@ CURATED = [
     ({"a": None}, {"$max": {"a": 9}}, False),  # 9 > null -> set
     ({"a": None}, {"$min": {"a": 9}}, False),  # null < 9 -> keep null
     ({"a": 5}, {"$max": {"a": 9}}, False),
+    # $min / $max over the previously-deferred types, now computed via the
+    # `order::bson_lt` port: bool (own rank above numbers), Decimal128 (unified
+    # numeric), NaN (unordered -> `<` False both ways), Binary bytes,
+    # Timestamp, and regex (Python type-name tie -> no set).
+    ({"a": 5}, {"$max": {"a": True}}, False),  # bool rank 9 > number -> set
+    ({"a": True}, {"$min": {"a": 5}}, False),  # number rank 3 < bool -> set
+    ({"a": False}, {"$max": {"a": True}}, False),  # False < True -> set
+    ({"a": 3}, {"$min": {"a": bson.Decimal128("2.5")}}, False),  # 2.5 < 3 -> set
+    ({"a": bson.Decimal128("2.5")}, {"$max": {"a": 3}}, False),  # 3 > 2.5 -> set
+    # (A NaN-valued *field* also keeps its NaN on both engines, but the parity
+    # assert can't equality-compare a NaN payload, so only the NaN-operand
+    # direction is pinned here.)
+    ({"a": 5}, {"$max": {"a": float("nan")}}, False),  # 5 < nan False -> keep
+    ({"a": b"ab"}, {"$max": {"a": b"ac"}}, False),  # bytes compare -> set
+    ({"a": bson.Timestamp(5, 1)}, {"$min": {"a": bson.Timestamp(4, 9)}}, False),
+    ({"a": bson.Regex("a")}, {"$max": {"a": bson.Regex("b")}}, False),  # tie -> keep
     ({"a": True}, {"$max": {"a": 2}}, False),  # bool current -> Rust defers (skip)
     ({"a": "m"}, {"$min": {"a": "a"}}, False),  # string compare
     ({"a": 2}, {"$min": {"a": 1.5}}, False),  # int/float cross-numeric
@@ -160,6 +186,13 @@ CURATED = [
     # $push $sort — 1/-1 whole-element and {field: dir} sorts (BSON order).
     ({"a": [1, 2]}, {"$push": {"a": {"$each": [4, 3], "$sort": 1}}}, False),
     ({"a": [3, 1, 2]}, {"$push": {"a": {"$each": [], "$sort": -1}}}, False),
+    # Whole-double ±1 direction (int or {field: dir}) is accepted (both engines).
+    ({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": 1.0}}}, False),
+    (
+        {"a": [{"s": 3}, {"s": 1}]},
+        {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1.0}}}},
+        False,
+    ),
     (
         {"a": [{"s": 3}, {"s": 1}]},
         {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1}}}},
@@ -233,6 +266,19 @@ ARRAY_FILTER_CASES = [
     ),
     # no-op: identifier matches nothing
     ({"g": [1, 2]}, {"$set": {"g.$[e]": 9}}, [{"e": {"$gt": 100}}], {}),
+    # single identifier nested inside $and / $or resolves and applies
+    (
+        {"a": [{"g": 1, "h": 1}, {"g": 5, "h": 9}]},
+        {"$set": {"a.$[x].g": 9}},
+        [{"$and": [{"x.g": {"$gt": 3}}, {"x.h": {"$gt": 0}}]}],
+        {},
+    ),
+    (
+        {"a": [{"g": 1}, {"g": 5}]},
+        {"$set": {"a.$[x].g": 9}},
+        [{"$or": [{"x.g": {"$gt": 3}}, {"x.g": {"$lt": 0}}]}],
+        {},
+    ),
 ]
 
 
@@ -375,3 +421,67 @@ def test_batch_apply_parity():
         py = [_pure.apply_update(d, update, is_upsert=upsert) for d in docs]
         assert rust == py, f"batch divergence: rust={rust} pure={py} update={update}"
     assert handled > 500, f"expected many handled batches, only {handled}"
+
+
+@pytest.mark.parametrize(
+    "doc,update",
+    [
+        ({"n": 5}, {"$pull": {"n": 1}}),
+        ({"n": None}, {"$pull": {"n": 1}}),
+        ({"n": 5}, {"$pullAll": {"n": [1]}}),
+        ({"n": None}, {"$pullAll": {"n": [1]}}),
+    ],
+)
+def test_pull_non_array_defers_and_raises(doc, update):
+    # $pull / $pullAll on a present but non-array field: Rust defers (None), the
+    # pure engine raises code 2. A missing field is a no-op both sides (covered
+    # by the curated/fuzz parity), not here.
+    doc = bson.decode(bson.encode(doc))
+    update = bson.decode(bson.encode(update))
+    assert _rust_apply(doc, update) is None
+    with pytest.raises(_pure.UpdateError) as exc:
+        _pure.apply_update(doc, update)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [2, -2, 1.5, "x", True, [1], {"s": 2}, {"s": True}, {"s": "x"}],
+)
+def test_push_sort_invalid_defers_and_raises(spec):
+    # An invalid $push $sort spec: Rust defers (None), the pure engine raises
+    # code 2. Valid ±1 (int or whole double) sorts are covered by the curated
+    # parity corpus.
+    doc = bson.decode(bson.encode({"a": [{"s": 3}, {"s": 1}]}))
+    update = bson.decode(
+        bson.encode({"u": {"$push": {"a": {"$each": [{"s": 2}], "$sort": spec}}}})
+    )["u"]
+    assert _rust_apply(doc, update) is None
+    with pytest.raises(_pure.UpdateError) as exc:
+        _pure.apply_update(doc, update)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "af,code",
+    [
+        ([{}], 9),  # empty filter
+        ([{"1x": {"$gt": 0}}], 2),  # bad identifier (starts with a digit)
+        ([{"X": {"$gt": 0}}], 2),  # bad identifier (uppercase start)
+        ([{"x": {"$gt": 0}}, {"x": {"$lt": 9}}], 9),  # duplicate identifier
+        ([{"x": {"$gt": 0}}, {"y": {"$gt": 0}}], 9),  # 'y' unused
+        ([{"x": {"$gt": 0}, "y": {"$gt": 0}}], 9),  # two identifiers in one filter
+        ([{"$and": [{"x": {"$gt": 0}}, {"y": {"$gt": 0}}]}], 9),  # two, nested
+        ([{"$expr": {"$gt": ["$g", 0]}}], 224),  # $expr, no identifier
+    ],
+)
+def test_array_filters_invalid_defers_and_raises(af, code):
+    # Invalid arrayFilters: Rust defers (None) so the pure engine raises the
+    # exact code. Valid arrayFilters still compute (covered by the fuzz corpus).
+    doc = bson.decode(bson.encode({"a": [{"g": 1}, {"g": 5}]}))
+    update = bson.decode(bson.encode({"u": {"$set": {"a.$[x].g": 9}}}))["u"]
+    af = [bson.decode(bson.encode(f)) for f in af]
+    assert _rust_apply_with(doc, update, af) is None
+    with pytest.raises(_pure.UpdateError) as exc:
+        _pure.apply_update(doc, update, array_filters=af)
+    assert exc.value.code == code

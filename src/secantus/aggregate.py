@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import decimal as _decimal
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
+from bson import Decimal128
+
 from secantus.expressions import (
     MISSING,
     ExpressionError,
     UnknownExpressionOperatorError,
     _bson_type_name,
+    _fmt_double,
     evaluate,
     evaluate_or_missing,
 )
@@ -174,21 +178,121 @@ def _stage_match(
 def _stage_count(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    # mongod: the count field must be a non-empty string (40156/40157), not
+    # $-prefixed (40158), without a '.' (40160), and not "_id" (15948).
     if not isinstance(spec, str):
-        raise AggregateError("$count requires a field name string")
+        raise AggregateError(
+            "the count field must be a non-empty string", code=40156, code_name="Location40156"
+        )
+    if not spec:
+        raise AggregateError(
+            "the count field must be a non-empty string", code=40157, code_name="Location40157"
+        )
+    if spec.startswith("$"):
+        raise AggregateError(
+            "the count field cannot be a $-prefixed path", code=40158, code_name="Location40158"
+        )
+    if "." in spec:
+        raise AggregateError(
+            "the count field cannot contain '.'", code=40160, code_name="Location40160"
+        )
+    if spec == "_id":
+        raise AggregateError(
+            "a group's _id may only be specified once", code=15948, code_name="Location15948"
+        )
     return [{spec: len(docs)}]
+
+
+def _fmt_stage_val(v: Any) -> str:
+    """Render a $limit/$skip argument the way mongod prints it in the error."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return repr(v) if isinstance(v, float) else str(v)
+
+
+def _stage_nonneg_int(spec: Any, stage: str, code: int) -> int:
+    """Validate a $limit/$skip argument like mongod: a whole-number double is
+    accepted (coerced to int); a bool / non-number, a fractional double, and a
+    negative value each raise `code` with mongod's exact per-case message."""
+    if isinstance(spec, bool) or not isinstance(spec, (int, float)):
+        raise AggregateError(
+            f"invalid argument to {stage} stage: Expected a number in: "
+            f"{stage}: {_fmt_stage_val(spec)}",
+            code=code,
+        )
+    if isinstance(spec, float):
+        if not spec.is_integer():
+            raise AggregateError(
+                f"invalid argument to {stage} stage: Expected an integer: "
+                f"{stage}: {_fmt_stage_val(spec)}",
+                code=code,
+            )
+        spec = int(spec)
+    if spec < 0:
+        raise AggregateError(
+            f"invalid argument to {stage} stage: Expected a non-negative number in: "
+            f"{stage}: {spec}",
+            code=code,
+        )
+    return spec
 
 
 def _stage_limit(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    return docs[: int(spec)]
+    n = _stage_nonneg_int(spec, "$limit", 5107201)
+    if n == 0:
+        raise AggregateError("the limit must be positive", code=15958)
+    return docs[:n]
 
 
 def _stage_skip(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    return docs[int(spec) :]
+    n = _stage_nonneg_int(spec, "$skip", 5107200)
+    return docs[n:]
+
+
+def _sort_val_repr(v: Any) -> str:
+    """mongod renders the offending value in the Location15974 message as
+    shell/JSON (`"asc"`, `true`, `null`), not Python repr."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return f'"{v}"'
+    if v is None:
+        return "null"
+    return str(v)
+
+
+def _validate_sort_spec(spec: Any) -> None:
+    """mongod's `$sort` stage validation: at least one key (15976); each direction
+    is 1 / -1 as an int or whole double, else a non-numeric value is "Illegal key"
+    (15974) and a numeric non-±1 is "must be 1 … or -1" (15975)."""
+    if not isinstance(spec, Mapping) or not spec:
+        raise AggregateError(
+            "$sort stage must have at least one sort key",
+            code=15976,
+            code_name="Location15976",
+        )
+    for key, direction in spec.items():
+        if isinstance(direction, Mapping):
+            continue  # {$meta: …} — text-score / indexKey sort, out of scope here
+        if isinstance(direction, bool) or not isinstance(direction, (int, float)):
+            raise AggregateError(
+                f"Illegal key in $sort specification: {key}: {_sort_val_repr(direction)}",
+                code=15974,
+                code_name="Location15974",
+            )
+        if (isinstance(direction, float) and not direction.is_integer()) or int(direction) not in (
+            1,
+            -1,
+        ):
+            raise AggregateError(
+                "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
+                code=15975,
+                code_name="Location15975",
+            )
 
 
 def _stage_sort(
@@ -196,6 +300,7 @@ def _stage_sort(
 ) -> list[dict[str, Any]]:
     from secantus.ordering import sort_docs
 
+    _validate_sort_spec(spec)
     return sort_docs(list(docs), spec)
 
 
@@ -204,6 +309,12 @@ def _stage_project(
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$project requires a document spec")
+    if not spec:
+        raise AggregateError(
+            "projection specification must have at least one field",
+            code=51272,
+            code_name="Location51272",
+        )
     try:
         return [_project_one(d, spec, ctx.vars) for d in docs]
     except UnknownExpressionOperatorError as exc:
@@ -384,8 +495,19 @@ def _stage_densify(
     if not isinstance(range_spec, Mapping):
         raise AggregateError("$densify requires range")
     raw_step = range_spec.get("step")
-    if not isinstance(raw_step, (int, float)) or raw_step <= 0:
-        raise AggregateError("$densify step must be a positive number")
+    if isinstance(raw_step, bool) or not isinstance(raw_step, (int, float)):
+        raise AggregateError(
+            f"BSON field '$densify.range.step' is the wrong type '{_bson_type_name(raw_step)}', "
+            "expected types '[int, decimal, double, long']",
+            code=14,
+            code_name="TypeMismatch",
+        )
+    if raw_step <= 0:
+        raise AggregateError(
+            "The step parameter in a range statement must be a strictly positive numeric value",
+            code=5733401,
+            code_name="Location5733401",
+        )
     unit = range_spec.get("unit")
     if unit is not None:
         if not isinstance(unit, str):
@@ -405,6 +527,54 @@ def _stage_densify(
         step = raw_step
     bounds = range_spec.get("bounds")
     partition_fields = list(spec.get("partitionByFields") or [])
+
+    # A date-unit step requires date field values (mongod 6053600) — a numeric
+    # value with a date step would otherwise leak a Python TypeError.
+    if unit is not None:
+        for d in docs:
+            fv = get_path(d, field)
+            if isinstance(fv, (int, float)) and not isinstance(fv, bool):
+                raise AggregateError(
+                    "Encountered numeric densify value in collection when step has a date unit.",
+                    code=6053600,
+                    code_name="Location6053600",
+                )
+
+    # bounds must be the string "full"/"partition" or a strictly-ascending
+    # two-element array of two numbers or two dates (mongod 5946802/5733403/5733402).
+    if isinstance(bounds, str):
+        if bounds not in ("full", "partition"):
+            raise AggregateError(
+                "Bounds string must either be 'full' or 'partition'",
+                code=5946802,
+                code_name="Location5946802",
+            )
+    elif isinstance(bounds, list):
+        if len(bounds) != 2:
+            raise AggregateError(
+                "A bounding array in a range statement must have exactly two elements",
+                code=5733403,
+                code_name="Location5733403",
+            )
+        lo_b, hi_b = bounds
+        both_num = all(isinstance(b, (int, float)) and not isinstance(b, bool) for b in bounds)
+        both_date = all(isinstance(b, _dt.datetime) for b in bounds)
+        try:
+            ascending = lo_b < hi_b
+        except TypeError:
+            ascending = False
+        if not (both_num or both_date) or not ascending:
+            raise AggregateError(
+                "A bounding array must be an ascending array of either two dates or two numbers",
+                code=5733402,
+                code_name="Location5733402",
+            )
+    elif bounds is not None:
+        raise AggregateError(
+            "Bounds string must either be 'full' or 'partition'",
+            code=5946802,
+            code_name="Location5946802",
+        )
 
     # Hard cap on filler-doc count per partition. Without this, an
     # explicit `bounds: [0, 10**15]` with `step: 1` materialises 10**15
@@ -508,19 +678,52 @@ def _densify_canon(value: Any) -> Any:
 def _stage_unwind(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    include_index: str | None = None
     if isinstance(spec, str):
-        path = spec.lstrip("$")
+        raw_path: Any = spec
         preserve_null = False
-        include_index: str | None = None
     elif isinstance(spec, Mapping):
         raw_path = spec.get("path")
-        if not isinstance(raw_path, str):
-            raise AggregateError("$unwind requires a path string")
-        path = raw_path.lstrip("$")
-        preserve_null = bool(spec.get("preserveNullAndEmptyArrays", False))
+        preserve_raw = spec.get("preserveNullAndEmptyArrays", False)
+        if not isinstance(preserve_raw, bool):
+            raise AggregateError(
+                "expected a boolean for the preserveNullAndEmptyArrays option to "
+                f"$unwind stage, got {_bson_type_name(preserve_raw)}",
+                code=28809,
+                code_name="Location28809",
+            )
+        preserve_null = preserve_raw
         include_index = spec.get("includeArrayIndex")
+        if include_index is not None:
+            if not isinstance(include_index, str) or not include_index:
+                raise AggregateError(
+                    "expected a non-empty string for the includeArrayIndex  option to "
+                    f"$unwind stage, got {_bson_type_name(include_index)}",
+                    code=28810,
+                    code_name="Location28810",
+                )
+            if include_index.startswith("$"):
+                raise AggregateError(
+                    "includeArrayIndex option to $unwind stage should not be prefixed "
+                    f"with a '$': {include_index}",
+                    code=28822,
+                    code_name="Location28822",
+                )
     else:
         raise AggregateError("$unwind requires a path string or document spec")
+    if not isinstance(raw_path, str):
+        raise AggregateError(
+            f"expected a string as the path for $unwind stage, got {_bson_type_name(raw_path)}",
+            code=28808,
+            code_name="Location28808",
+        )
+    if not raw_path.startswith("$"):
+        raise AggregateError(
+            f"path option to $unwind stage should be prefixed with a '$': {raw_path}",
+            code=28818,
+            code_name="Location28818",
+        )
+    path = raw_path.lstrip("$")
 
     result: list[dict[str, Any]] = []
     for doc in docs:
@@ -804,6 +1007,8 @@ def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
             bucket[k] = _nelem_finalize(v)
         elif isinstance(v, dict) and "_topn_items" in v:
             bucket[k] = _topn_finalize(v)
+        elif isinstance(v, dict) and "_pct_vals" in v:
+            bucket[k] = _percentile_finalize(v)
     return bucket
 
 
@@ -840,16 +1045,27 @@ def _std_dev(values: list[Any], *, pop: bool) -> float | None:
 _AccHandler = Callable[[dict[str, Any], str, Any, Mapping[str, Any], dict[str, Any]], None]
 
 
+def _is_acc_number(v: Any) -> bool:
+    """A numeric value that ``$sum`` / ``$avg`` accumulate. mongod ignores
+    everything else (string / bool / null / missing / array / …); a bool is *not*
+    numeric here (``$sum`` over ``true`` adds nothing). ``decimal.Decimal`` is
+    included for the SQL engine, whose ``numeric`` columns compile SUM/AVG through
+    ``$sum`` / ``$avg`` with Python decimals (not ``bson.Decimal128``)."""
+    return isinstance(v, (int, float, Decimal128, _decimal.Decimal)) and not isinstance(v, bool)
+
+
 def _acc_sum(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    increment = 1 if arg == 1 else evaluate(arg, doc, vars)
-    if increment is None:
-        increment = 0
+    # $sum always yields at least 0 (int32) — even an all-non-numeric group.
+    bucket.setdefault(field, 0)
+    increment = 1 if (arg == 1 and not isinstance(arg, bool)) else evaluate(arg, doc, vars)
+    if not _is_acc_number(increment):
+        return  # mongod ignores non-numeric operands
     # bson_add preserves the BSON numeric type (int32 < int64 < double <
     # decimal128) so a $sum over Int64 values stays Int64 rather than
     # narrowing to int32 on the wire.
-    bucket[field] = bson_add(bucket.get(field, 0), increment)
+    bucket[field] = bson_add(bucket[field], increment)
 
 
 def _acc_count(
@@ -861,13 +1077,15 @@ def _acc_count(
 def _acc_avg(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    v = evaluate(arg, doc, vars)
-    if v is None:
-        return
+    # Always create the running state so an all-non-numeric group finalises to
+    # null (mongod), rather than dropping the field.
     state = bucket.get(field)
     if not isinstance(state, dict) or "_avg_total" not in state:
         state = {"_avg_total": 0, "_avg_n": 0}
         bucket[field] = state
+    v = evaluate(arg, doc, vars)
+    if not _is_acc_number(v):
+        return  # mongod averages only numeric values
     state["_avg_total"] += v
     state["_avg_n"] += 1
 
@@ -875,18 +1093,30 @@ def _acc_avg(
 def _acc_max(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    v = evaluate(arg, doc, vars)
-    cur = bucket.get(field)
-    if cur is None or (v is not None and v > cur):
+    # mongod $max ignores null / missing and orders every other value by BSON
+    # cross-type order (bool > string > number > …); all-null/missing -> null.
+    from secantus.ordering import _SortKey
+
+    bucket.setdefault(field, None)
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is MISSING or v is None:
+        return
+    cur = bucket[field]
+    if cur is None or _SortKey(v) > _SortKey(cur):
         bucket[field] = v
 
 
 def _acc_min(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
-    v = evaluate(arg, doc, vars)
-    cur = bucket.get(field)
-    if cur is None or (v is not None and v < cur):
+    from secantus.ordering import _SortKey
+
+    bucket.setdefault(field, None)
+    v = evaluate_or_missing(arg, doc, vars)
+    if v is MISSING or v is None:
+        return
+    cur = bucket[field]
+    if cur is None or _SortKey(v) < _SortKey(cur):
         bucket[field] = v
 
 
@@ -961,6 +1191,125 @@ def _acc_std(
         state = {"_std_vals": [], "_std_pop": pop}
         bucket[field] = state
     state["_std_vals"].append(v)
+
+
+def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
+    """Validate a ``$median`` / ``$percentile`` accumulator/expression spec and
+    return ``(input_expr, ps)`` (``ps`` is None for $median). Codes and messages
+    are verbatim from a mongod 7.0.12 probe."""
+    if not isinstance(arg, Mapping):
+        raise AggregateError(
+            f"specification must be an object; found {op}: {arg!r}",
+            code=7429703,
+            code_name="Location7429703",
+        )
+    if "method" not in arg:
+        raise AggregateError(
+            f"BSON field '{op}.method' is missing but a required field",
+            code=40414,
+            code_name="Location40414",
+        )
+    if arg["method"] != "approximate":
+        raise AggregateError(
+            "Currently only 'approximate' can be used as percentile 'method'.",
+            code=2,
+            code_name="BadValue",
+        )
+    if "input" not in arg:
+        raise AggregateError(
+            f"BSON field '{op}.input' is missing but a required field",
+            code=40414,
+            code_name="Location40414",
+        )
+    if op == "$median":
+        return arg["input"], None
+    if "p" not in arg:
+        raise AggregateError(
+            "BSON field '$percentile.p' is missing but a required field",
+            code=40414,
+            code_name="Location40414",
+        )
+    ps = arg["p"]
+    if not isinstance(ps, list):
+        raise AggregateError(
+            "The $percentile 'p' field must be an array of numbers from "
+            f"[0.0, 1.0], but found: {ps}",
+            code=7750301,
+            code_name="Location7750301",
+        )
+    out: list[float] = []
+    for p in ps:
+        if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0.0 <= p <= 1.0:
+            raise AggregateError(
+                "The $percentile 'p' field must be an array of numbers from "
+                f"[0.0, 1.0], but found: {p}",
+                code=7750303,
+                code_name="Location7750303",
+            )
+        out.append(float(p))
+    return arg["input"], out
+
+
+def _percentile_value(v: Any) -> float | None:
+    """The double a value contributes to a percentile computation, or None to
+    skip it. mongod (probed): int / long / double / Decimal128 count (as
+    doubles), bool and NaN are excluded, everything else is skipped."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        f = float(v)
+        return None if math.isnan(f) else f
+    if isinstance(v, Decimal128):
+        f = float(v.to_decimal())
+        return None if math.isnan(f) else f
+    return None
+
+
+def _percentile_rank(values: list[float], p: float) -> float | None:
+    """mongod's discrete percentile: ``sorted[max(0, ceil(p*n) - 1)]``."""
+    if not values:
+        return None
+    idx = max(0, math.ceil(p * len(values)) - 1)
+    return values[min(idx, len(values) - 1)]
+
+
+def _acc_percentile(
+    bucket: dict[str, Any],
+    field: str,
+    arg: Any,
+    doc: Mapping[str, Any],
+    vars: dict[str, Any],
+    *,
+    op: str,
+) -> None:
+    input_expr, ps = _percentile_spec(arg, op)
+    state = bucket.get(field)
+    if not isinstance(state, dict) or "_pct_vals" not in state:
+        state = {"_pct_vals": [], "_pct_ps": ps}
+        bucket[field] = state
+    v = _percentile_value(evaluate_or_missing(input_expr, doc, vars))
+    if v is not None:
+        state["_pct_vals"].append(v)
+
+
+def _percentile_finalize(state: dict[str, Any]) -> Any:
+    values = sorted(state["_pct_vals"])
+    ps = state["_pct_ps"]
+    if ps is None:  # $median
+        return _percentile_rank(values, 0.5)
+    return [_percentile_rank(values, p) for p in ps]
+
+
+def _acc_median(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_percentile(bucket, field, arg, doc, vars, op="$median")
+
+
+def _acc_percentile_op(
+    bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
+) -> None:
+    _acc_percentile(bucket, field, arg, doc, vars, op="$percentile")
 
 
 def _acc_std_pop(
@@ -1166,6 +1515,8 @@ _ACC_DISPATCH: dict[str, _AccHandler] = {
     "$bottom": _acc_bottom,
     "$topN": _acc_top_n,
     "$bottomN": _acc_bottom_n,
+    "$median": _acc_median,
+    "$percentile": _acc_percentile_op,
 }
 
 
@@ -1476,16 +1827,53 @@ def _stage_sample(
 
     if not isinstance(spec, Mapping) or "size" not in spec:
         raise AggregateError("$sample requires {size: N}")
-    size = int(spec["size"])
+    size_raw = spec["size"]
+    # mongod: size must be a number (bool rejected) and non-negative; a
+    # fractional double is accepted and truncated (unlike $limit/$skip).
+    if isinstance(size_raw, bool) or not isinstance(size_raw, (int, float)):
+        raise AggregateError("size argument to $sample must be a number", code=28746)
+    if size_raw < 0:
+        raise AggregateError("size argument to $sample must not be negative", code=28747)
+    size = int(size_raw)
     if size >= len(docs):
         return list(docs)
     rng = _SAMPLE_RNG if _SAMPLE_RNG is not None else random
     return rng.sample(list(docs), size)
 
 
+def _validate_sort_by_count_arg(spec: Any) -> None:
+    """mongod: the $sortByCount argument is a $-prefixed path string (40148) or an
+    expression object — a single `$`-prefixed key (40147); anything else (number,
+    bool, array, null) is 40149."""
+    if isinstance(spec, str):
+        if not spec.startswith("$"):
+            raise AggregateError(
+                "the sortByCount field must be defined as a $-prefixed path or an "
+                "expression inside an object",
+                code=40148,
+                code_name="Location40148",
+            )
+        return
+    if isinstance(spec, Mapping):
+        if len(spec) == 1 and str(next(iter(spec))).startswith("$"):
+            return
+        raise AggregateError(
+            "the sortByCount field must be defined as a $-prefixed path or an "
+            "expression inside an object",
+            code=40147,
+            code_name="Location40147",
+        )
+    raise AggregateError(
+        "the sortByCount field must be specified as a string or as an object",
+        code=40149,
+        code_name="Location40149",
+    )
+
+
 def _stage_sort_by_count(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    _validate_sort_by_count_arg(spec)
     grouped = _stage_group({"_id": spec, "count": {"$sum": 1}}, docs, ctx)
     grouped.sort(key=lambda d: d.get("count", 0), reverse=True)
     return grouped
@@ -1494,31 +1882,119 @@ def _stage_sort_by_count(
 def _stage_facet(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    if not isinstance(spec, Mapping):
-        raise AggregateError("$facet requires a document of {name: pipeline}")
+    # mongod validates the $facet spec before running any sub-pipeline: a
+    # non-empty object (40169), each value an array (40170), each stage a
+    # non-empty object (40171), and no nested $facet (40600). Without this a
+    # non-object stage element (`{a: [5]}`) leaks a Python TypeError.
+    if not isinstance(spec, Mapping) or not spec:
+        raise AggregateError(
+            f"the $facet specification must be a non-empty object, but found: $facet: {spec!r}",
+            code=40169,
+            code_name="Location40169",
+        )
     out: dict[str, Any] = {}
     for name, sub_pipeline in spec.items():
         if not isinstance(sub_pipeline, list):
-            raise AggregateError(f"$facet entry {name!r} must be a pipeline array")
+            raise AggregateError(
+                "arguments to $facet must be arrays, "
+                f"{name} is type {_bson_type_name(sub_pipeline)}",
+                code=40170,
+                code_name="Location40170",
+            )
+        for i, stage in enumerate(sub_pipeline):
+            if not isinstance(stage, Mapping) or not stage:
+                raise AggregateError(
+                    "elements of arrays in $facet spec must be non-empty objects, "
+                    f"{name} argument contained an element of type "
+                    f"{_bson_type_name(stage)}: {i}: {stage!r}",
+                    code=40171,
+                    code_name="Location40171",
+                )
+            if "$facet" in stage:
+                raise AggregateError(
+                    "$facet is not allowed to be used within a $facet stage",
+                    code=40600,
+                    code_name="Location40600",
+                )
         out[name] = apply_pipeline(list(docs), sub_pipeline, ctx)
     return [out]
+
+
+_BUCKET_NUMERIC_NAMES = frozenset({"int", "long", "double", "decimal"})
+
+
+def _bucket_ctype(v: Any) -> str:
+    """Canonical type name for $bucket boundary comparison — the numeric BSON
+    types collapse to one bracket (mongod requires all boundaries the same type)."""
+    name = _bson_type_name(v)
+    return "number" if name in _BUCKET_NUMERIC_NAMES else name
 
 
 def _stage_bucket(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    from secantus.ordering import _SortKey
+
     if not isinstance(spec, Mapping):
         raise AggregateError("$bucket requires a document spec")
     group_by = spec.get("groupBy")
     boundaries = spec.get("boundaries")
+    # mongod validates the whole spec before bucketing — several of these were
+    # silently accepted, and an out-of-range value with no default silently
+    # DROPPED the document.
+    if group_by is None or boundaries is None:
+        raise AggregateError(
+            "$bucket requires 'groupBy' and 'boundaries' to be specified.", code=40198
+        )
+    if not isinstance(boundaries, list):
+        raise AggregateError(
+            f"The $bucket 'boundaries' field must be an array, but found type: "
+            f"{_bson_type_name(boundaries)}",
+            code=40200,
+        )
+    if len(boundaries) < 2:
+        raise AggregateError(
+            "The $bucket 'boundaries' field must have at least 2 values, but found "
+            f"{len(boundaries)}.",
+            code=40192,
+        )
+    ctype0 = _bucket_ctype(boundaries[0])
+    for i in range(len(boundaries) - 1):
+        if _bucket_ctype(boundaries[i + 1]) != ctype0:
+            raise AggregateError(
+                "All values in the the 'boundaries' option to $bucket must have the "
+                f"same type. Found conflicting types {ctype0} and "
+                f"{_bucket_ctype(boundaries[i + 1])}.",
+                code=40193,
+            )
+        if not _SortKey(boundaries[i]) < _SortKey(boundaries[i + 1]):
+            raise AggregateError(
+                "The 'boundaries' option to $bucket must be sorted, but elements "
+                f"{i} and {i + 1} are not in ascending order.",
+                code=40194,
+            )
     default = spec.get("default")
-    output_spec = spec.get("output") or {"count": {"$sum": 1}}
-    if not isinstance(boundaries, list) or len(boundaries) < 2:
-        raise AggregateError("$bucket requires boundaries array of >=2 values")
+    output_spec = spec.get("output")
+    if output_spec is not None and not isinstance(output_spec, Mapping):
+        raise AggregateError(
+            f"The $bucket 'output' field must be an object, but found type: "
+            f"{_bson_type_name(output_spec)}",
+            code=40196,
+        )
+    if output_spec is None:
+        output_spec = {"count": {"$sum": 1}}
+    if default is not None:
+        dk, lo0, hi0 = _SortKey(default), _SortKey(boundaries[0]), _SortKey(boundaries[-1])
+        if not dk < lo0 and dk < hi0:  # default lies within [first, last) -> invalid
+            raise AggregateError(
+                "The $bucket 'default' field must be less than the lowest boundary or "
+                "greater than or equal to the highest boundary.",
+                code=40199,
+            )
 
     buckets: dict[Any, list[dict[str, Any]]] = {b: [] for b in boundaries[:-1]}
     if default is not None:
-        buckets[default] = []
+        buckets.setdefault(default, [])
 
     for d in docs:
         value = evaluate(group_by, d, ctx.vars)
@@ -1532,7 +2008,13 @@ def _stage_bucket(
                     break
             except TypeError:
                 continue
-        if not placed and default is not None:
+        if not placed:
+            if default is None:
+                raise AggregateError(
+                    "$switch could not find a matching branch for an input, and no "
+                    "default was specified.",
+                    code=7158303,
+                )
             buckets[default].append(d)
 
     result: list[dict[str, Any]] = []
@@ -1880,15 +2362,763 @@ def _stage_current_op(
     return [entry]
 
 
+# mongod's preferred-number rounding series for $bucketAuto `granularity`.
+_BUCKET_AUTO_GRANULARITIES = frozenset(
+    {
+        "R5",
+        "R10",
+        "R20",
+        "R40",
+        "R80",
+        "1-2-5",
+        "E6",
+        "E12",
+        "E24",
+        "E48",
+        "E96",
+        "E192",
+        "POWERSOF2",
+    }
+)
+
+
+# The preferred-number series mongod rounds $bucketAuto boundaries to. Stored
+# exactly as mongod stores them (integer-valued doubles, e.g. R5 = {10,16,25,
+# 40,63}, NOT normalised `0.63`-style literals) so that `series_element *
+# multiplier` reproduces mongod's non-standard ULPs bit-for-bit — verified
+# hex-exact against real mongod 7.0.12. See `granularity_rounder_preferred_numbers.cpp`.
+_BUCKET_AUTO_SERIES: dict[str, list[float]] = {
+    "R5": [10, 16, 25, 40, 63],
+    "R10": [100, 125, 160, 200, 250, 315, 400, 500, 630, 800],
+    "R20": [
+        100,
+        112,
+        125,
+        140,
+        160,
+        180,
+        200,
+        224,
+        250,
+        280,
+        315,
+        355,
+        400,
+        450,
+        500,
+        560,
+        630,
+        710,
+        800,
+        900,
+    ],
+    "R40": [
+        100,
+        106,
+        112,
+        118,
+        125,
+        132,
+        140,
+        150,
+        160,
+        170,
+        180,
+        190,
+        200,
+        212,
+        224,
+        236,
+        250,
+        265,
+        280,
+        300,
+        315,
+        355,
+        375,
+        400,
+        425,
+        450,
+        475,
+        500,
+        530,
+        560,
+        600,
+        630,
+        670,
+        710,
+        750,
+        800,
+        850,
+        900,
+        950,
+    ],
+    "R80": [
+        103,
+        109,
+        115,
+        122,
+        128,
+        136,
+        145,
+        155,
+        165,
+        175,
+        185,
+        195,
+        206,
+        218,
+        230,
+        243,
+        258,
+        272,
+        290,
+        307,
+        325,
+        345,
+        365,
+        387,
+        412,
+        437,
+        462,
+        487,
+        515,
+        545,
+        575,
+        615,
+        650,
+        690,
+        730,
+        775,
+        825,
+        875,
+        925,
+        975,
+    ],
+    "1-2-5": [10, 20, 50],
+    "E6": [10, 15, 22, 33, 47, 68],
+    "E12": [10, 12, 15, 18, 22, 27, 33, 39, 47, 56, 68, 82],
+    "E24": [
+        10,
+        11,
+        12,
+        13,
+        15,
+        16,
+        18,
+        20,
+        22,
+        24,
+        27,
+        30,
+        33,
+        36,
+        39,
+        43,
+        47,
+        51,
+        56,
+        62,
+        68,
+        75,
+        82,
+        91,
+    ],
+    "E48": [
+        100,
+        105,
+        110,
+        115,
+        121,
+        127,
+        133,
+        140,
+        147,
+        154,
+        162,
+        169,
+        178,
+        187,
+        196,
+        205,
+        215,
+        226,
+        237,
+        249,
+        261,
+        274,
+        287,
+        301,
+        316,
+        332,
+        348,
+        365,
+        383,
+        402,
+        422,
+        442,
+        464,
+        487,
+        511,
+        536,
+        562,
+        590,
+        619,
+        649,
+        681,
+        715,
+        750,
+        787,
+        825,
+        866,
+        909,
+        953,
+    ],
+    "E96": [
+        100,
+        102,
+        105,
+        107,
+        110,
+        113,
+        115,
+        118,
+        121,
+        124,
+        127,
+        130,
+        133,
+        137,
+        140,
+        143,
+        147,
+        150,
+        154,
+        158,
+        162,
+        165,
+        169,
+        174,
+        178,
+        182,
+        187,
+        191,
+        196,
+        200,
+        205,
+        210,
+        215,
+        221,
+        226,
+        232,
+        237,
+        243,
+        249,
+        255,
+        261,
+        267,
+        274,
+        280,
+        287,
+        294,
+        301,
+        309,
+        316,
+        324,
+        332,
+        340,
+        348,
+        357,
+        365,
+        374,
+        383,
+        392,
+        402,
+        412,
+        422,
+        432,
+        442,
+        453,
+        464,
+        475,
+        487,
+        499,
+        511,
+        523,
+        536,
+        549,
+        562,
+        576,
+        590,
+        604,
+        619,
+        634,
+        649,
+        665,
+        681,
+        698,
+        715,
+        732,
+        750,
+        768,
+        787,
+        806,
+        825,
+        845,
+        866,
+        887,
+        909,
+        931,
+        953,
+        976,
+    ],
+    "E192": [
+        100,
+        101,
+        102,
+        104,
+        105,
+        106,
+        107,
+        109,
+        110,
+        111,
+        113,
+        114,
+        115,
+        117,
+        118,
+        120,
+        121,
+        123,
+        124,
+        126,
+        127,
+        129,
+        130,
+        132,
+        133,
+        135,
+        137,
+        138,
+        140,
+        142,
+        143,
+        145,
+        147,
+        149,
+        150,
+        152,
+        154,
+        156,
+        158,
+        160,
+        162,
+        164,
+        165,
+        167,
+        169,
+        172,
+        174,
+        176,
+        178,
+        180,
+        182,
+        184,
+        187,
+        189,
+        191,
+        193,
+        196,
+        198,
+        200,
+        203,
+        205,
+        208,
+        210,
+        213,
+        215,
+        218,
+        221,
+        223,
+        226,
+        229,
+        232,
+        234,
+        237,
+        240,
+        243,
+        246,
+        249,
+        252,
+        255,
+        258,
+        261,
+        264,
+        267,
+        271,
+        274,
+        277,
+        280,
+        284,
+        287,
+        291,
+        294,
+        298,
+        301,
+        305,
+        309,
+        312,
+        316,
+        320,
+        324,
+        328,
+        332,
+        336,
+        340,
+        344,
+        348,
+        352,
+        357,
+        361,
+        365,
+        370,
+        374,
+        379,
+        383,
+        388,
+        392,
+        397,
+        402,
+        407,
+        412,
+        417,
+        422,
+        427,
+        432,
+        437,
+        442,
+        448,
+        453,
+        459,
+        464,
+        470,
+        475,
+        481,
+        487,
+        493,
+        499,
+        505,
+        511,
+        517,
+        523,
+        530,
+        536,
+        542,
+        549,
+        556,
+        562,
+        569,
+        576,
+        583,
+        590,
+        597,
+        604,
+        612,
+        619,
+        626,
+        634,
+        642,
+        649,
+        657,
+        665,
+        673,
+        681,
+        690,
+        698,
+        706,
+        715,
+        723,
+        732,
+        741,
+        750,
+        759,
+        768,
+        777,
+        787,
+        796,
+        806,
+        816,
+        825,
+        835,
+        845,
+        856,
+        866,
+        876,
+        887,
+        898,
+        909,
+        920,
+        931,
+        942,
+        953,
+        965,
+        976,
+        988,
+    ],
+}
+_BUCKET_AUTO_SERIES = {k: [float(x) for x in v] for k, v in _BUCKET_AUTO_SERIES.items()}
+
+
+def _round_up_series(number: float, series: list[float]) -> float:
+    """mongod `GranularityRounderPreferredNumbers::roundUp` (double path),
+    ported verbatim so the `series_element * multiplier` arithmetic matches
+    mongod's f64 result bit-for-bit."""
+    if number == 0.0 or number == math.inf:
+        return number
+    multiplier = 1.0
+    while number >= series[-1] * multiplier:
+        multiplier *= 10.0
+    while number < series[0] * multiplier:
+        previous_min = series[0] * multiplier
+        multiplier /= 10.0
+        if number >= series[-1] * multiplier:
+            return previous_min
+    # smallest series element with number < series*multiplier (strict upper bound)
+    idx = _bisect_right([s * multiplier for s in series], number)
+    return series[idx] * multiplier
+
+
+def _round_down_series(number: float, series: list[float]) -> float:
+    """mongod `GranularityRounderPreferredNumbers::roundDown` (double path)."""
+    if number == 0.0 or number == math.inf:
+        return number
+    multiplier = 1.0
+    while number <= series[0] * multiplier:
+        multiplier /= 10.0
+    if multiplier == 0:
+        return 0.0
+    while number > series[-1] * multiplier:
+        previous_max = series[-1] * multiplier
+        multiplier *= 10.0
+        if number <= series[0] * multiplier:
+            return previous_max
+    idx = _bisect_left([s * multiplier for s in series], number)
+    return series[idx - 1] * multiplier
+
+
+def _round_up_pow2(v: float) -> float:
+    """mongod `GranularityRounderPowersOfTwo::roundUp` (double path)."""
+    if v == 0.0 or v == math.inf:
+        return v
+    return 2.0 ** (math.floor(math.log2(v)) + 1)
+
+
+def _round_down_pow2(v: float) -> float:
+    """mongod `GranularityRounderPowersOfTwo::roundDown` (double path)."""
+    if v == 0.0 or v == math.inf:
+        return v
+    return 2.0 ** (math.ceil(math.log2(v)) - 1)
+
+
+def _bisect_right(a: list[float], x: float) -> int:
+    lo, hi = 0, len(a)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if x < a[mid]:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def _bisect_left(a: list[float], x: float) -> int:
+    lo, hi = 0, len(a)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if a[mid] < x:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _granularity_coerce(v: Any) -> float:
+    """Coerce a groupBy value to the double mongod's rounder operates on, or
+    raise mongod's granularity error. Decimal128 is deferred (the standing
+    Decimal128 precision deferral) rather than approximated in f64."""
+    if isinstance(v, Decimal128):
+        raise AggregateError(
+            "$bucketAuto 'granularity' over Decimal128 boundaries is not yet "
+            "supported by SecantusDB (the double-valued series ships hex-exact; "
+            "Decimal128 rounding is the standing precision deferral)",
+            code=2,
+        )
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise AggregateError(
+            "$bucketAuto can specify a 'granularity' with numeric boundaries "
+            f"only, but found a value with type: {_bson_type_name(v)}",
+            code=40258,
+            code_name="Location40258",
+        )
+    f = float(v)
+    if math.isnan(f):
+        raise AggregateError(
+            "$bucketAuto can specify a 'granularity' with numeric boundaries only, but found a NaN",
+            code=40259,
+            code_name="Location40259",
+        )
+    if f < 0:
+        raise AggregateError(
+            "$bucketAuto can specify a 'granularity' with non-negative numbers "
+            "only, but found a negative number",
+            code=40260,
+            code_name="Location40260",
+        )
+    return f
+
+
+def _validate_bucket_auto_granularity(granularity: Any) -> None:
+    """mongod: `granularity` must be a string (else 40261) naming a known
+    preferred-number series (else 40257)."""
+    if not isinstance(granularity, str):
+        raise AggregateError(
+            "The $bucketAuto 'granularity' field must be a string, but found type: "
+            f"{_bson_type_name(granularity)}",
+            code=40261,
+            code_name="Location40261",
+        )
+    if granularity not in _BUCKET_AUTO_GRANULARITIES:
+        raise AggregateError(
+            f"Unknown rounding granularity '{granularity}'",
+            code=40257,
+            code_name="Location40257",
+        )
+
+
+def _bucket_auto_granular(
+    pairs: list[tuple[Any, dict[str, Any]]],
+    n_buckets: int,
+    granularity: str,
+    output_spec: Mapping[str, Any],
+    ctx: PipelineContext,
+) -> list[dict[str, Any]]:
+    """mongod `DocumentSourceBucketAuto::populateNextBucket` with a granularity
+    rounder: first bucket min = roundDown(dataMin); every other boundary =
+    roundUp(chunkMax), absorbing values that fall below the rounded boundary so
+    boundaries strictly increase. Ported to match mongod 7.0.12 hex-exact."""
+    values = [_granularity_coerce(v) for v, _ in pairs]
+    docs = [d for _, d in pairs]
+    if granularity == "POWERSOF2":
+        rup, rdn = _round_up_pow2, _round_down_pow2
+    else:
+        series = _BUCKET_AUTO_SERIES[granularity]
+        rup = lambda x: _round_up_series(x, series)  # noqa: E731
+        rdn = lambda x: _round_down_series(x, series)  # noqa: E731
+
+    n = len(pairs)
+    approx = math.floor(n / n_buckets + 0.5)  # std::round (positive) — fixed for all buckets
+    if approx < 1:
+        approx = 1
+
+    out: list[dict[str, Any]] = []
+    idx = 0
+    previous_max: float | None = None
+    carry: int | None = None  # index of the value carried as the next bucket's min
+    bucket_num = 0
+    while True:
+        bucket_num += 1
+        if carry is None and idx >= n:
+            break
+        if carry is not None:
+            cur_i = carry
+        else:
+            cur_i = idx
+            idx += 1
+        cur_min = previous_max if previous_max is not None else rdn(values[cur_i])
+        cur_max = values[cur_i]
+        chunk: list[int] = [cur_i]
+        is_last = bucket_num == n_buckets
+        i = 1
+        while idx < n and (i < approx or is_last):
+            cur_max = values[idx]
+            chunk.append(idx)
+            idx += 1
+            i += 1
+        # adjustBoundariesAndGetMinForNextBucket
+        next_i: int | None = None
+        if idx < n:
+            next_i = idx
+            idx += 1
+        boundary = rup(cur_max)
+        # Absorb values that now fall below the rounded boundary (mongod fixes
+        # boundaryValue once, then pulls those docs into this bucket).
+        while next_i is not None and boundary > values[next_i]:
+            chunk.append(next_i)
+            next_i = None
+            if idx < n:
+                next_i = idx
+                idx += 1
+        if float(boundary) == 0.0 and next_i is not None:
+            bucket_max: float = rdn(values[next_i])
+        else:
+            bucket_max = boundary
+        bucket: dict[str, Any] = {"_id": {"min": cur_min, "max": bucket_max}}
+        for field_name, accumulator in output_spec.items():
+            for ci in chunk:
+                _accumulate(bucket, field_name, accumulator, docs[ci], ctx.vars)
+        out.append(_finalize(bucket))
+        previous_max = bucket_max
+        carry = next_i
+        if carry is None and idx >= n:
+            break
+    return out
+
+
 def _stage_bucket_auto(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$bucketAuto requires a document spec")
+    # mongod: both groupBy and buckets must be present (40246); buckets must be
+    # a non-bool numeric value (40241), representable as a 32-bit integer —
+    # a whole double is accepted, a fractional double is not (40242) — and
+    # strictly greater than 0 (40243).
+    if "groupBy" not in spec or "buckets" not in spec:
+        raise AggregateError(
+            "$bucketAuto requires 'groupBy' and 'buckets' to be specified",
+            code=40246,
+            code_name="Location40246",
+        )
     group_by = spec.get("groupBy")
-    n_buckets = spec.get("buckets")
-    if group_by is None or not isinstance(n_buckets, int) or n_buckets < 1:
-        raise AggregateError("$bucketAuto requires groupBy and a positive buckets int")
+    n_raw = spec["buckets"]
+    if isinstance(n_raw, bool) or not isinstance(n_raw, (int, float)):
+        raise AggregateError(
+            "The $bucketAuto 'buckets' field must be a numeric value, but found type: "
+            f"{_bson_type_name(n_raw)}",
+            code=40241,
+            code_name="Location40241",
+        )
+    if isinstance(n_raw, float):
+        if not n_raw.is_integer():
+            raise AggregateError(
+                "The $bucketAuto 'buckets' field must be representable as a 32-bit "
+                f"integer, but found {_fmt_double(n_raw)}",
+                code=40242,
+                code_name="Location40242",
+            )
+        n_buckets = int(n_raw)
+    else:
+        n_buckets = n_raw
+    if n_buckets <= 0:
+        raise AggregateError(
+            f"The $bucketAuto 'buckets' field must be greater than 0, but found: {n_buckets}",
+            code=40243,
+            code_name="Location40243",
+        )
+    granularity = spec.get("granularity")
+    if granularity is not None:
+        _validate_bucket_auto_granularity(granularity)
     output_spec = spec.get("output") or {"count": {"$sum": 1}}
 
     from secantus.storage import _SortKey
@@ -1897,6 +3127,8 @@ def _stage_bucket_auto(
     pairs.sort(key=lambda p: _SortKey(p[0]))
     if not pairs:
         return []
+    if granularity is not None:
+        return _bucket_auto_granular(pairs, n_buckets, granularity, output_spec, ctx)
     bucket_size = max(1, len(pairs) // n_buckets)
     out: list[dict[str, Any]] = []
     i = 0
