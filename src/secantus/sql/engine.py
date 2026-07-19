@@ -34,7 +34,7 @@ from secantus.sql import (
 )
 from secantus.sql import explain as explain_mod
 from secantus.sql import session as sql_session
-from secantus.sql.catalog import Catalog, Column, TableDef
+from secantus.sql.catalog import ALL_CATALOG_COLLECTIONS, Catalog, Column, TableDef
 from secantus.sql.result import ColumnDesc, SQLResult
 from secantus.sql.session import (
     REPORTABLE_GUCS,
@@ -515,16 +515,36 @@ def _capture_savepoint_snapshots(
     collection to its establishment state (nothing wrote to it in between)."""
     if not session.savepoints:
         return
-    coll = _write_target_collection(stmt, catalog, db, storage)
-    if coll is None:
-        return
-    snap: list | None = None
-    for fr in session.savepoints:
-        if coll in fr.snapshots:
-            continue
-        if snap is None:
-            snap = [copy.deepcopy(d) for d in storage.find_matching(db, coll, {})]
-        fr.snapshots[coll] = snap
+    # A DDL statement snapshots every catalog collection (they're tiny) so the
+    # schema change is reverted by ROLLBACK TO SAVEPOINT; a DML statement
+    # snapshots only its target collection.
+    if _is_ddl(stmt):
+        colls: tuple[str, ...] = ALL_CATALOG_COLLECTIONS
+    else:
+        target = _write_target_collection(stmt, catalog, db, storage)
+        if target is None:
+            return
+        colls = (target,)
+    for coll in colls:
+        snap: list | None = None
+        for fr in session.savepoints:
+            if coll in fr.snapshots:
+                continue
+            if snap is None:
+                snap = [copy.deepcopy(d) for d in storage.find_matching(db, coll, {})]
+            fr.snapshots[coll] = snap
+
+
+def _is_ddl(stmt: exp.Expression) -> bool:
+    """Whether ``stmt`` changes catalog state (CREATE / DROP / ALTER / COMMENT /
+    a CREATE TYPE-style Command) — those need their catalog collections
+    snapshotted for savepoint rollback."""
+    if isinstance(stmt, (exp.Create, exp.Drop, exp.Alter, exp.Comment)):
+        return True
+    if isinstance(stmt, exp.Command):
+        verb = str(stmt.this).upper()
+        return verb in ("CREATE", "DROP", "ALTER", "COMMENT")
+    return False
 
 
 def _write_target_collection(

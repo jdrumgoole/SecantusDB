@@ -51,6 +51,29 @@ POLICY_COLLECTION = "__sql_policies__"
 RLS_COLLECTION = "__sql_rls__"
 COLUMN_GRANT_COLLECTION = "__sql_column_grants__"
 
+#: Every catalog collection DDL can touch — snapshotted together before a DDL
+#: statement inside a savepoint so ``ROLLBACK TO SAVEPOINT`` reverts the schema
+#: change (a CREATE TYPE / CREATE TABLE / … undone by the enclosing savepoint).
+ALL_CATALOG_COLLECTIONS = (
+    CATALOG_COLLECTION,
+    VIEW_COLLECTION,
+    MATVIEW_COLLECTION,
+    SEQUENCE_COLLECTION,
+    ROLE_COLLECTION,
+    ROLE_MEMBER_COLLECTION,
+    GRANT_COLLECTION,
+    SCHEMA_COLLECTION,
+    ENUM_COLLECTION,
+    ENUM_META_COLLECTION,
+    RANGE_TYPE_COLLECTION,
+    DOMAIN_COLLECTION,
+    COMPOSITE_COLLECTION,
+    FUNCTION_COLLECTION,
+    POLICY_COLLECTION,
+    RLS_COLLECTION,
+    COLUMN_GRANT_COLLECTION,
+)
+
 
 def fold_type_name(name: str) -> str:
     """Normalize a user-type name as Postgres resolves identifiers: each dotted

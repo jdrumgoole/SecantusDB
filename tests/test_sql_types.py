@@ -150,6 +150,14 @@ def test_binary_decode_numeric_long_precision():
     assert pgextended._decode_numeric(pgextended._encode_numeric(d)) == d
 
 
+def test_binary_numeric_roundtrip_wide_integral_and_fractional():
+    # A wide integral value with a large declared scale used to make the
+    # decoder's quantize raise InvalidOperation (an under-sized context).
+    for s in ("1" + "0" * 50, "9" * 60, "1" + "0" * 50 + "." + "0" * 50, "0." + "0" * 45 + "1"):
+        d = Decimal(s)
+        assert pgextended._decode_numeric(pgextended._encode_numeric(d)) == d
+
+
 def test_binary_range_and_multirange_roundtrip():
     r = ranges.make_range(1, 5, "[)", "int4range")
     rb = pgextended._encode_range(r, 3904)

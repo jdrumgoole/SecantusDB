@@ -178,3 +178,30 @@ def test_full_rollback_clears_savepoints(storage, session):
         q(storage, session, "ROLLBACK TO SAVEPOINT sp")
     assert ei.value.sqlstate == "3B001"
     q(storage, session, "ROLLBACK")
+
+
+def test_rollback_to_savepoint_undoes_create_type(storage, session):
+    # Catalog DDL (CREATE TYPE / CREATE TABLE) is snapshotted too, so a
+    # savepoint rollback reverts the schema change — a re-CREATE then succeeds.
+    q(storage, session, "BEGIN")
+    for _ in range(3):
+        q(storage, session, "SAVEPOINT sp")
+        q(storage, session, "CREATE TYPE mood AS ENUM ('sad', 'ok')")
+        q(storage, session, "CREATE TABLE moody (id int PRIMARY KEY, m mood)")
+        q(storage, session, "ROLLBACK TO SAVEPOINT sp")
+        # The type and table are gone after each rollback.
+        assert q(storage, session, "SELECT count(*) FROM pg_type WHERE typname = 'mood'").rows == [
+            (0,)
+        ]
+    q(storage, session, "COMMIT")
+
+
+def test_rollback_to_savepoint_restores_dropped_type(storage, session):
+    run_sql(storage, DB, "CREATE TYPE hue AS ENUM ('r', 'g')", session=session)
+    q(storage, session, "BEGIN")
+    q(storage, session, "SAVEPOINT sp")
+    q(storage, session, "DROP TYPE hue")
+    q(storage, session, "ROLLBACK TO SAVEPOINT sp")
+    # The dropped type is back.
+    assert q(storage, session, "SELECT count(*) FROM pg_type WHERE typname = 'hue'").rows == [(1,)]
+    q(storage, session, "COMMIT")
