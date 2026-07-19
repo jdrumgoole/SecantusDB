@@ -1535,6 +1535,32 @@ def test_push_sort_and_current_date_validation(tmp_path) -> None:
         srv.stop()
 
 
+def test_array_filters_validation(tmp_path) -> None:
+    """The Rust server rejects invalid arrayFilters (defer -> BadValue) without
+    touching the document, and still applies a valid filter to the matching
+    array elements."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "a": [{"g": 1}, {"g": 5}]})
+        upd = {"$set": {"a.$[x].g": 9}}
+        for af in (
+            [{}],  # empty filter
+            [{"1x": {"$gt": 0}}],  # bad identifier
+            [{"x": {"$gt": 0}}, {"x": {"$lt": 9}}],  # duplicate identifier
+            [{"x": {"$gt": 0}}, {"y": {"$gt": 0}}],  # 'y' unused
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                coll.update_one({"_id": 1}, upd, array_filters=af)
+        # The document is untouched by the failed updates.
+        assert coll.find_one({"_id": 1})["a"] == [{"g": 1}, {"g": 5}]
+        # A valid filter updates only the matching element.
+        coll.update_one({"_id": 1}, upd, array_filters=[{"x.g": {"$gt": 3}}])
+        assert [e["g"] for e in coll.find_one({"_id": 1})["a"]] == [1, 9]
+    finally:
+        srv.stop()
+
+
 def test_to_int_convert_overflow(tmp_path) -> None:
     """The Rust server rejects an int32/int64 overflow in $toInt / $convert
     (defer -> BadValue) and downcasts an in-range long to int32; $convert

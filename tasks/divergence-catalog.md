@@ -79,10 +79,10 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 - **Update `$push $sort`** bad spec (scalar not ±1 / `{field: bad}` / non-numeric) FIXED
   (#527, → 2; whole-double ±1 now accepted). `$pull`/`$pullAll` on a present non-array
   field FIXED (#526, → 2; missing field stays a no-op). `$currentDate: {d:false}` FIXED
-  (#527, → accepts bool false as set-Date; bad scalar / bad `$type` → 2). Remaining:
-  `arrayFilters` unused (mongod 9) / bad identifier (2) / empty (9) accepted — needs its
-  own slice (identifier extraction incl. `$and`/`$or` nesting + unused-detection over the
-  update paths). (update.py)
+  (#527, → accepts bool false as set-Date; bad scalar / bad `$type` → 2). `arrayFilters`
+  non-object (14) / empty (9) / bad identifier (2) / duplicate (9) / unused (9) FIXED
+  (#528, both engines; a nested `$and`/`$or` identifier is left unvalidated — see backlog).
+  (update.py)
 - **Stages**: `$bucketAuto` buckets bool/non-numeric/fractional/
   non-positive/missing FIXED (#526, → 40241/40242/40243/40246; whole-double accepted) —
   `granularity` validation/rounding still unimplemented (`'BOGUS'` accepted; needs a

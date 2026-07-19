@@ -356,6 +356,33 @@ def test_positional_with_unknown_filter_name_raises() -> None:
         )
 
 
+def test_array_filters_validation() -> None:
+    # mongod: a non-object filter (14), an empty filter (9), a bad identifier
+    # (2), a duplicate identifier (9), and an identifier not used by any
+    # `$[id]` path (9) are all rejected before the update is applied.
+    doc = {"a": [{"g": 1}, {"g": 5}]}
+    upd = {"$set": {"a.$[x].g": 9}}
+    for af, code in [
+        (["x"], 14),  # non-object filter
+        ([{}], 9),  # empty filter
+        ([{"1x": {"$gt": 0}}], 2),  # identifier starts with a digit
+        ([{"X": {"$gt": 0}}], 2),  # identifier starts uppercase
+        ([{"x": {"$gt": 0}}, {"x": {"$lt": 9}}], 9),  # duplicate identifier
+        ([{"x": {"$gt": 0}}, {"y": {"$gt": 0}}], 9),  # 'y' unused
+    ]:
+        with pytest.raises(UpdateError) as exc:
+            apply_update(dict(doc), upd, array_filters=af)
+        assert exc.value.code == code, af
+    # Valid: an identifier used by the update path (a dotted filter key on the
+    # element's sub-field). All elements match here; a stricter filter matches one.
+    assert apply_update(dict(doc), upd, array_filters=[{"x.g": {"$gt": 0}}]) == {
+        "a": [{"g": 9}, {"g": 9}]
+    }
+    assert apply_update(dict(doc), upd, array_filters=[{"x.g": {"$gt": 3}}]) == {
+        "a": [{"g": 1}, {"g": 9}]
+    }
+
+
 def test_positional_dollar_sets_first_match() -> None:
     out = apply_update(
         {"_id": 1, "items": [{"qty": 1}, {"qty": 5}, {"qty": 5}]},
