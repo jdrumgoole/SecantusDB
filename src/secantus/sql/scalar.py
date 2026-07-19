@@ -56,13 +56,18 @@ _OID_TO_TYPENAME: dict[int, str] = {
 }
 
 
-_ESTRING_SIMPLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
-
-
 def _unescape_estring(raw: str) -> str:
-    """Decode a Postgres ``E'…'`` escape string: ``\\n``-style controls, 1-3
-    digit octal, ``\\xHH`` hex, ``\\uXXXX`` / ``\\UXXXXXXXX`` unicode; any other
-    escaped character stands for itself (``\\\\`` -> ``\\``, ``\\'`` -> ``'``)."""
+    """Finish decoding an ``E'…'`` escape string sqlglot already half-decoded.
+
+    sqlglot's postgres tokenizer resolves the simple control escapes (``\\n``,
+    ``\\t``, …) and collapses ``\\\\`` to ``\\`` in a ByteString's ``this``, but
+    leaves octal (``\\101``), hex (``\\x41``) and unicode (``\\uXXXX`` /
+    ``\\UXXXXXXXX``) escapes raw. Decode ONLY those remaining forms here — any
+    other backslash sequence in the half-decoded text came from a doubled
+    backslash (``E'a\\\\b'`` → ``a\\b``) and must stand as-is; re-decoding it
+    was the ``test_leak`` corruption (``\\b`` → backspace)."""
+    if "\\" not in raw:
+        return raw
     out: list[str] = []
     i, n = 0, len(raw)
     while i < n:
@@ -72,10 +77,7 @@ def _unescape_estring(raw: str) -> str:
             i += 1
             continue
         nxt = raw[i + 1]
-        if nxt in _ESTRING_SIMPLE:
-            out.append(_ESTRING_SIMPLE[nxt])
-            i += 2
-        elif nxt in "01234567":
+        if nxt in "01234567":
             j = i + 1
             while j < min(i + 4, n) and raw[j] in "01234567":
                 j += 1
@@ -86,8 +88,8 @@ def _unescape_estring(raw: str) -> str:
             while j < min(i + 4, n) and raw[j] in "0123456789abcdefABCDEF":
                 j += 1
             if j == i + 2:
-                out.append(nxt)
-                i += 2
+                out.append(c)
+                i += 1
             else:
                 out.append(chr(int(raw[i + 2 : j], 16)))
                 i = j
@@ -100,8 +102,8 @@ def _unescape_estring(raw: str) -> str:
             else:
                 raise errors.SQLError("22025", "invalid Unicode escape value")
         else:
-            out.append(nxt)
-            i += 2
+            out.append(c)
+            i += 1
     return "".join(out)
 
 

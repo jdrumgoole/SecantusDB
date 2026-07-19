@@ -861,6 +861,88 @@ def test_enum_oid_through_plan_shapes_and_enum_arrays(server):
             conn.execute("INSERT INTO people VALUES ('c', 'ok', '{furious}')")
 
 
+def test_typmod_in_row_description(server):
+    """A modifier-bearing cast describes with its PG type modifier: psycopg's
+    ``cursor.description`` derives ``display_size``/``precision``/``scale`` and
+    ``type_display`` from the wire typmod, and varchar/bpchar keep their
+    distinct oids (1043/1042) instead of folding onto text's 25."""
+    with connect(server, autocommit=True) as conn:
+        c = conn.execute("SELECT null::varchar(42)").description[0]
+        assert (c.type_code, c.display_size) == (1043, 42)
+        assert c.type_display == "varchar(42)"
+        c = conn.execute("SELECT null::varchar").description[0]
+        assert (c.type_code, c.display_size) == (1043, None)
+        c = conn.execute("SELECT 3.14::numeric(10,2)").description[0]
+        assert (c.precision, c.scale) == (10, 2)
+        c = conn.execute("SELECT null::numeric(2,-3)").description[0]
+        assert (c.precision, c.scale) == (2, -3)
+        c = conn.execute("SELECT null::numeric(10,3)[]").description[0]
+        assert c.type_display == "numeric(10,3)[]"
+        c = conn.execute("SELECT null::timestamptz(6)").description[0]
+        assert (c.type_code, c.precision) == (1184, 6)
+        c = conn.execute("SELECT null::bit(8)").description[0]
+        assert (c.type_code, c.display_size) == (1560, 8)
+        c = conn.execute("SELECT null::varbit(9)").description[0]
+        assert (c.type_code, c.display_size) == (1562, 9)
+        # Extended protocol (Describe) reports the same modifier.
+        c = conn.execute("SELECT null::varchar(7) WHERE 1 = %s", [1]).description[0]
+        assert (c.type_code, c.display_size) == (1043, 7)
+
+
+def test_escape_string_literal_in_insert(server):
+    """psycopg's ClientCursor interpolates any string containing a backslash as
+    an ``E'…'`` escape-string literal; sqlglot lexes that as a ByteString, which
+    the INSERT value path must unescape (it previously raised 0A000 -- the
+    test_leak flap)."""
+    with connect(server, autocommit=True, cursor_factory=psycopg.ClientCursor) as conn:
+        conn.execute("CREATE TABLE esc (id int primary key, t text)")
+        conn.execute("INSERT INTO esc VALUES (%s, %s)", [1, "a\\b\nc"])
+        conn.execute("INSERT INTO esc VALUES (2, E'x\\\\y')")
+        assert conn.execute("SELECT t FROM esc ORDER BY id").fetchall() == [
+            ("a\\b\nc",),
+            ("x\\y",),
+        ]
+
+
+def test_transaction_characteristics(server):
+    """BEGIN/SET TRANSACTION characteristics apply for the transaction and are
+    reported via the transaction_* GUCs, which mirror their session defaults
+    (default_transaction_*) until overridden; psycopg's set_isolation_level /
+    set_read_only / set_deferrable drive exactly this machinery."""
+    with connect(server) as conn:
+        conn.set_isolation_level(psycopg.IsolationLevel.SERIALIZABLE)
+        conn.set_read_only(True)
+        cur = conn.execute(
+            "select current_setting('transaction_isolation'),"
+            " current_setting('transaction_read_only')"
+        )
+        assert cur.fetchone() == ("serializable", "on")
+        conn.rollback()
+        conn.set_isolation_level(None)
+        conn.set_read_only(None)
+        # Characteristics revert at transaction end; defaults mirror through.
+        conn.execute("select set_config('default_transaction_isolation', 'repeatable read', false)")
+        conn.commit()
+        cur = conn.execute("select current_setting('transaction_isolation')")
+        assert cur.fetchone() == ("repeatable read",)
+        conn.rollback()
+    with connect(server, autocommit=True) as conn:
+        conn.execute("BEGIN ISOLATION LEVEL READ UNCOMMITTED READ WRITE")
+        assert conn.execute("select current_setting('transaction_isolation')").fetchone() == (
+            "read uncommitted",
+        )
+        conn.execute("SET TRANSACTION DEFERRABLE")
+        assert conn.execute("select current_setting('transaction_deferrable')").fetchone() == (
+            "on",
+        )
+        conn.execute("ROLLBACK")
+        assert conn.execute("select current_setting('transaction_deferrable')").fetchone() == (
+            "off",
+        )
+        conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        assert conn.execute("select current_setting('transaction_read_only')").fetchone() == ("on",)
+
+
 def test_jsonb_roundtrip_and_navigation(server):
     """jsonb values parse at ingress: a cast or Json/Jsonb-wrapped parameter
     loads back as a Python dict/list (not double-encoded text), ``->>``

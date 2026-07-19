@@ -1185,9 +1185,10 @@ def _apply_conflict_update(
 
 def execute_constant_select(plan: planner.ConstantSelectPlan) -> SQLResult:
     oids = plan.pg_oids or [None] * len(plan.columns)
+    typmods = plan.typmods or [-1] * len(plan.columns)
     columns = [
-        ColumnDesc(name, tag, oid if oid is not None else typemap.PG_OID.get(tag, 25))
-        for (name, tag, _), oid in zip(plan.columns, oids, strict=True)
+        ColumnDesc(name, tag, oid if oid is not None else typemap.PG_OID.get(tag, 25), typmod)
+        for (name, tag, _), oid, typmod in zip(plan.columns, oids, typmods, strict=True)
     ]
     rows = [tuple(value for _, _, value in plan.columns)] if plan.emit else []
     return SQLResult(

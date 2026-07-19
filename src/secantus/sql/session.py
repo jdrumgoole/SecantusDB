@@ -456,7 +456,13 @@ class Session:
 
     def get_setting(self, name: str) -> str:
         key = canonical_guc_name(name)
-        return self.settings.get(key, GUC_DEFAULTS.get(key, ""))
+        if key in self.settings:
+            return self.settings[key]
+        # The per-transaction characteristics mirror their session defaults
+        # until a BEGIN/SET TRANSACTION overrides them (like real Postgres).
+        if key in ("transaction_isolation", "transaction_read_only", "transaction_deferrable"):
+            return self.get_setting(f"default_{key}")
+        return GUC_DEFAULTS.get(key, "")
 
     @property
     def wire_encoding(self) -> str | None:

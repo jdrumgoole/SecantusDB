@@ -571,6 +571,97 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     return None
 
 
+#: Cast targets whose PG identity carries a length/precision modifier:
+#: DataType.Type name -> (oid, array_oid, modifier kind). ``char`` encodes
+#: n+4, ``numeric`` packs ((p<<16)|(s&0x7FF))+4, ``bit`` stores n bare, and
+#: ``time`` stores the precision bare — matching how psycopg decodes fmod.
+_TYPMOD_KINDS: dict[str, tuple[int, int, str]] = {
+    "VARCHAR": (1043, 1015, "char"),
+    "NVARCHAR": (1043, 1015, "char"),
+    "CHAR": (1042, 1014, "char"),
+    "NCHAR": (1042, 1014, "char"),
+    "BPCHAR": (1042, 1014, "char"),
+    "DECIMAL": (1700, 1231, "numeric"),
+    "BIT": (1560, 1561, "bit"),
+    "TIME": (1083, 1183, "time"),
+    "TIMETZ": (1266, 1270, "time"),
+    "TIMESTAMP": (1114, 1115, "time"),
+    "TIMESTAMPTZ": (1184, 1185, "time"),
+    "INTERVAL": (1186, 1187, "time"),
+}
+
+#: Sentinel offset for negative numeric scales: sqlglot can't parse
+#: ``numeric(2,-3)``, so the engine pre-rewrites ``-s`` to ``NEGSCALE + s``
+#: before parsing and the typmod encoder undoes it (real scales cap at 1000,
+#: so the ranges never overlap).
+NEGSCALE_SENTINEL = 5000
+
+
+def _typmod_param(node: exp.Expression) -> int | None:
+    try:
+        return int(node.name)
+    except (TypeError, ValueError):
+        return None
+
+
+def cast_type_identity(datatype: exp.DataType) -> tuple[int, int] | None:
+    """``(pg_oid, typmod)`` for a cast target that carries a PG type modifier
+    (``varchar(42)`` → (1043, 46), ``numeric(10,3)`` → (1700, ((10<<16)|3)+4),
+    ``time(2)`` → (1083, 2)) — or a bare ``varchar``/``bpchar``, whose identity
+    alone differs from the ``text`` oid we'd otherwise report. An array target
+    reports the element's typmod with the array oid, matching PG. None when
+    the target isn't a modifier-bearing type."""
+    if datatype.this == exp.DataType.Type.ARRAY:
+        inner = datatype.args.get("expressions") or []
+        if inner and isinstance(inner[0], exp.DataType):
+            elem = cast_type_identity(inner[0])
+            if elem is not None:
+                _oid, typmod = elem
+                kinds = _TYPMOD_KINDS.get(getattr(inner[0].this, "name", None))
+                if kinds is None:  # varbit via USERDEFINED
+                    kinds = _userdefined_typmod_kind(inner[0])
+                if kinds is not None:
+                    return (kinds[1], typmod)
+        return None
+    # ``datatype.this`` is a plain string for some spellings (``::oid`` parses
+    # via ObjectIdentifier) — those never carry a modifier.
+    entry = _TYPMOD_KINDS.get(getattr(datatype.this, "name", None))
+    if entry is None:
+        ud = _userdefined_typmod_kind(datatype)
+        if ud is None:
+            return None
+        entry = ud
+    oid, _array_oid, kind = entry
+    params = [p for p in (datatype.args.get("expressions") or []) if _typmod_param(p) is not None]
+    if not params:
+        # Bare varchar/bpchar still need their distinct oid; the other kinds
+        # already report the right oid elsewhere, so a bare form changes nothing.
+        return (oid, -1) if kind == "char" else None
+    n = _typmod_param(params[0]) or 0
+    if kind == "char":
+        return (oid, n + 4)
+    if kind == "bit":
+        return (oid, n)
+    if kind == "time":
+        return (oid, n)
+    # numeric(p[,s]) — a missing scale is 0; undo the negative-scale sentinel.
+    s = _typmod_param(params[1]) if len(params) > 1 else 0
+    s = s if s is not None else 0
+    if s > NEGSCALE_SENTINEL - 1001:
+        s = -(s - NEGSCALE_SENTINEL)
+    return (oid, ((n << 16) | (s & 0x7FF)) + 4)
+
+
+def _userdefined_typmod_kind(datatype: exp.DataType) -> tuple[int, int, str] | None:
+    """``varbit(n)`` parses as USERDEFINED — resolve it by rendered name."""
+    if datatype.this != exp.DataType.Type.USERDEFINED:
+        return None
+    name = datatype.sql(dialect="postgres").lower().split("(", 1)[0].strip().strip('"')
+    if name in ("varbit", "bit varying"):
+        return (1562, 1563, "bit")
+    return None
+
+
 def is_array_tag(tag: str | None) -> bool:
     return isinstance(tag, str) and tag.endswith("[]")
 
