@@ -864,6 +864,59 @@ def test_facet_validation_via_pymongo(coll) -> None:
     assert out == [{"n": [{"c": 2}]}]
 
 
+def test_count_stage_validation_via_pymongo(coll) -> None:
+    """$count: non-string 40156, empty 40157, $-prefixed 40158, dotted 40160,
+    "_id" 15948. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
+    for spec, code in [
+        (5, 40156),
+        ("", 40157),
+        ("$n", 40158),
+        ("a.b", 40160),
+        ("_id", 15948),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$count": spec}]))
+        assert exc.value.code == code, spec
+    assert list(coll.aggregate([{"$count": "n"}])) == [{"n": 3}]
+
+
+def test_project_empty_spec_via_pymongo(coll) -> None:
+    """An empty $project spec is Location51272. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "v": 1})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {}}]))
+    assert exc.value.code == 51272
+
+
+def test_sort_by_count_validation_via_pymongo(coll) -> None:
+    """$sortByCount: number/bool/array/null 40149, bare string 40148, non-`$`
+    object 40147. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 1}, {"_id": 3, "v": 2}])
+    for spec, code in [
+        (5, 40149),
+        (True, 40149),
+        ([1], 40149),
+        (None, 40149),
+        ("v", 40148),
+        ({"a": 1}, 40147),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$sortByCount": spec}]))
+        assert exc.value.code == code, spec
+    # A $-prefixed path and a single-op expression object are both valid.
+    assert list(coll.aggregate([{"$sortByCount": "$v"}])) == [
+        {"_id": 1, "count": 2},
+        {"_id": 2, "count": 1},
+    ]
+
+
 def test_densify_validation_via_pymongo(coll) -> None:
     """$densify: date unit on numeric 6053600, bool step 14, non-positive step
     5733401, bad bounds string 5946802, wrong-length array 5733403, descending

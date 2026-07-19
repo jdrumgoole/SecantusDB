@@ -1421,6 +1421,43 @@ def test_bucket_validation_no_data_loss(tmp_path) -> None:
         srv.stop()
 
 
+def test_count_project_sort_by_count_stage_validation(tmp_path) -> None:
+    """The Rust server errors (defer -> BadValue) on an invalid $count field, an
+    empty $project spec, or a non-expression $sortByCount argument instead of
+    silently computing a wrong (or corrupt-field-named) result. Valid forms of
+    each still run."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 1}, {"_id": 3, "v": 2}])
+        for pipeline in (
+            [{"$count": 5}],  # non-string
+            [{"$count": ""}],  # empty
+            [{"$count": "$n"}],  # $-prefixed
+            [{"$count": "a.b"}],  # dotted
+            [{"$count": "_id"}],  # reserved _id
+            [{"$project": {}}],  # empty projection
+            [{"$sortByCount": 5}],  # non-expression scalar
+            [{"$sortByCount": "v"}],  # bare (non-$) path
+            [{"$sortByCount": {"a": 1}}],  # non-$ object
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate(pipeline))
+        # Valid forms still run.
+        assert list(coll.aggregate([{"$count": "n"}])) == [{"n": 3}]
+        assert list(coll.aggregate([{"$project": {"_id": 0, "v": 1}}])) == [
+            {"v": 1},
+            {"v": 1},
+            {"v": 2},
+        ]
+        assert list(coll.aggregate([{"$sortByCount": "$v"}])) == [
+            {"_id": 1, "count": 2},
+            {"_id": 2, "count": 1},
+        ]
+    finally:
+        srv.stop()
+
+
 def test_to_int_convert_overflow(tmp_path) -> None:
     """The Rust server rejects an int32/int64 overflow in $toInt / $convert
     (defer -> BadValue) and downcasts an in-range long to int32; $convert

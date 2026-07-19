@@ -909,6 +909,15 @@ pub fn group_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Doc
 /// `count` descending (ties keep group insertion order, matching Python's
 /// `list.sort(reverse=True)` stability).
 pub fn sort_by_count_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+    // mongod: a $-prefixed path string, or a single-`$`-key expression object;
+    // anything else (number/bool/array/null -> 40149, bare string -> 40148,
+    // non-expression object -> 40147) defers so Python raises the exact code.
+    match spec {
+        Bson::String(s) if s.starts_with('$') => {}
+        Bson::Document(d)
+            if d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$')) => {}
+        _ => return Err(()),
+    }
     let count_acc = bson::doc! {"$sum": 1i32};
     let accumulators = vec![("count".to_string(), Bson::Document(count_acc))];
     let mut grouped = run_group(spec, &accumulators, docs, vars)?;
