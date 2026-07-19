@@ -1709,6 +1709,31 @@ def test_expression_accumulators(tmp_path) -> None:
         srv.stop()
 
 
+def test_strcasecmp_coercion(tmp_path) -> None:
+    """The Rust server $toString-coerces integer $strcasecmp operands (matching
+    mongod / the Python server) instead of erroring."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "n": 5})
+        got = list(
+            coll.aggregate(
+                [
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "a": {"$strcasecmp": ["$n", "a"]},
+                            "b": {"$strcasecmp": [5, 10]},
+                        }
+                    }
+                ]
+            )
+        )
+        assert got == [{"a": -1, "b": 1}]
+    finally:
+        srv.stop()
+
+
 def test_to_long_conversion(tmp_path) -> None:
     """The Rust server computes $toLong (truncating toward zero, yielding a 64-bit
     long that can exceed int32) and rejects an int64 overflow (defer -> BadValue)."""

@@ -1329,16 +1329,31 @@ def _op_is_array(arg: Any, ctx: _Ctx) -> bool:
     return isinstance(_eval(arg, ctx), list)
 
 
+def _strcasecmp_coerce(v: Any) -> str:
+    """Coerce a `$strcasecmp` operand to a string the way mongod does: null →
+    the empty string, a string stays, and any other value is `$toString`-coerced
+    (numbers → their string form, dates → their string form). A bool is the one
+    type mongod refuses to coerce → Location16007."""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        raise ExpressionError(
+            "$strcasecmp only takes strings and numbers, not bool",
+            code=16007,
+            code_name="Location16007",
+        )
+    return _convert_value(v, "string")
+
+
 def _op_strcasecmp(arg: Any, ctx: _Ctx) -> int:
-    """``$strcasecmp``: case-insensitive comparison of two strings → -1 / 0 / 1.
-    A null / missing operand is treated as the empty string."""
+    """``$strcasecmp``: case-insensitive comparison of two operands → -1 / 0 / 1.
+    mongod coerces each operand to a string (null → ""), rejecting only bool."""
     vals = _eval_args(arg, ctx)
     if len(vals) != 2:
         raise ExpressionError("$strcasecmp requires two arguments")
-    a, b = ("" if vals[0] is None else vals[0]), ("" if vals[1] is None else vals[1])
-    if not isinstance(a, str) or not isinstance(b, str):
-        raise ExpressionError("$strcasecmp requires string operands")
-    au, bu = a.upper(), b.upper()
+    au, bu = _strcasecmp_coerce(vals[0]).upper(), _strcasecmp_coerce(vals[1]).upper()
     return -1 if au < bu else (1 if au > bu else 0)
 
 

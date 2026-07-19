@@ -125,10 +125,12 @@ var (17276), `$switch` no-branches (40068), `$ifNull` 1-arg (1257300), `$getFiel
 divergences were bounded (~dozens, not hundreds); the named type-guard rows are now all
 cleared (#525–#536). `$sum`/`$avg`/`$max`/`$min` as *expression* operators (5.0+ feature)
 implemented on **both** engines — #537 (Python) + #538 (Rust core, reusing the group
-accumulator `Num` width logic; parity-verified). Remaining: `$meta`
-bad arg (17308 — `$meta` isn't an expression operator in SecantusDB, gives 168) and
-`$strcasecmp` numeric coercion (sec is stricter than mongod — mongod coerces to string) —
-two small feature-gaps, not error-code nits. The rest is per-message text only.**
+accumulator `Num` width logic; parity-verified). `$strcasecmp` now `$toString`-coerces
+its operands (bool → 16007) instead of rejecting non-strings — #539.
+**Only `$meta` as an *expression* remains: it returns text-search metadata (textScore,
+etc.) that SecantusDB has no source for, so it's intentionally out of scope (bad-arg
+17308 vs sec's 168 is moot); the projection-side `$meta` is handled at the command layer.
+Everything else in the catalog is cleared.**
 
 ## Minor / out-of-scope
 - `$where` unsupported (SecantusDB rejects; mongod runs JS — intentionally out of scope).

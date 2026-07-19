@@ -631,6 +631,12 @@ CURATED = [
     ({"$strcasecmp": ["b", "a"]}, {}),
     ({"$strcasecmp": ["$n", "a"]}, {"n": None}),
     ({"$strcasecmp": ["café", "CAFÉ"]}, {}),  # non-ASCII -> defer
+    # mongod $toString-coerces operands: an int matches Python str(int) on both
+    # engines; null -> "". (double/date/bool coercion defers to Python.)
+    ({"$strcasecmp": [5, "a"]}, {}),
+    ({"$strcasecmp": ["a", 5]}, {}),
+    ({"$strcasecmp": [5, 10]}, {}),
+    ({"$strcasecmp": ["$n", "a"]}, {"n": 42}),
     # $replaceOne / $replaceAll.
     ({"$replaceOne": {"input": "abcabc", "find": "bc", "replacement": "X"}}, {}),
     ({"$replaceAll": {"input": "abcabc", "find": "bc", "replacement": "X"}}, {}),
