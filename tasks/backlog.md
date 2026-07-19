@@ -3933,3 +3933,30 @@ recorded in that slice's changelog fragment. Still open:
   critical path is now `storage-engine (windows-latest)`, which is excluded
   from the WT cache because `uv build --wheel` leaves no reusable build dir on
   Windows.
+
+## pymongo-async gauge: xdist worker crash on `test_numerous_inserts` (2026-07-20)
+
+`vendor/pymongo-tests/test/asynchronous/test_collection.py::AsyncTestCollection::test_numerous_inserts`
+fails the pymongo-async gauge with `worker 'gw0' crashed while running ...` —
+the xdist worker process dies rather than the test asserting. Observed on a
+**serial** `invoke validate-pymongo-async` run (so it is not `--jobs 4` CPU
+contention), and reproduced across both that run and the parallel
+`validate-all` run that preceded it.
+
+Note there are two same-named tests; the crashing one is `test_collection.py::
+AsyncTestCollection`, NOT `test_bulk.py::AsyncTestBulk`. Both pass in
+isolation via `invoke validate-one` (6.8s and 12.4s respectively), so this is
+a cross-test interaction in the full-suite run, not a defect the test exercises
+on its own.
+
+No `WT_PANIC` / segfault / OOM text is captured in the gauge log — the worker's
+stderr isn't surfaced by the runner, which is the first gap to close when
+picking this up. Shape resembles the leaked-`Storage`-fixture worker crash
+fixed in e233fe61 ("close leaked Storage fixtures"), so suspect fd/handle or
+memory exhaustion accumulated by earlier tests in the same worker.
+
+Next steps: capture worker stderr (`-p no:cacheprovider --tb=long`, or run the
+gauge with `-n0` to get an in-process traceback), then bisect which preceding
+test leaves the state that kills the worker. Until diagnosed this inflates the
+published pymongo-async failure count by one (39 vs 38 at the previous
+release's artifacts).
