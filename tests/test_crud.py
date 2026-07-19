@@ -1130,6 +1130,30 @@ def test_aggregate_to_date(coll) -> None:
     ]
 
 
+def test_to_date_rejects_bool_via_pymongo(coll) -> None:
+    """$toDate: a bool is ConversionFailure (241), not coerced to a date; $convert
+    with onError catches it. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"r": {"$toDate": True}, "_id": 0}}]))
+    assert exc.value.code == 241
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "r": {"$convert": {"input": True, "to": "date", "onError": "x"}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"r": "x"}]
+
+
 def test_aggregate_date_extractor_timezone(coll) -> None:
     # 2023-01-15T16:30Z: UTC hour 16; America/New_York is EST (-05:00) -> hour 11,
     # still the 15th. The {date, timezone} object form is mongod's timezone-aware
