@@ -377,9 +377,22 @@ fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
             other => other.clone(),
         }
     }
+    // A valid sort direction is exactly 1 or -1, as an int or a whole double
+    // (mongod accepts `1.0`); a bool, a fractional double, or any other value
+    // defers so Python raises code 2. (`as_int_like` treats bool as 0/1, which
+    // would wrongly sort a `{field: true}` direction — so use this stricter form.)
+    fn dir_pm1(b: &Bson) -> Option<i128> {
+        let v = match b {
+            Bson::Int32(n) => *n as i128,
+            Bson::Int64(n) => *n as i128,
+            Bson::Double(d) if d.fract() == 0.0 => *d as i128,
+            _ => return None,
+        };
+        (v == 1 || v == -1).then_some(v)
+    }
     match spec {
-        Bson::Int32(_) | Bson::Int64(_) => {
-            let dir = as_int_like(spec).ok_or(Fallback)?;
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+            let dir = dir_pm1(spec).ok_or(Fallback)?;
             if !arr.iter().all(crate::order::is_sortable) {
                 return Err(Fallback);
             }
@@ -392,7 +405,7 @@ fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
         Bson::Document(spec_doc) => {
             let fields: Vec<(&String, i128)> = spec_doc
                 .iter()
-                .map(|(f, d)| as_int_like(d).map(|di| (f, di)).ok_or(Fallback))
+                .map(|(f, d)| dir_pm1(d).map(|di| (f, di)).ok_or(Fallback))
                 .collect::<R<Vec<_>>>()?;
             for (field, _) in &fields {
                 if !arr

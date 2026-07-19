@@ -667,7 +667,9 @@ fn resolve_current_date(update: &Document) -> Result<Document> {
     };
     for (path, opts) in cd {
         let value = match opts {
-            Bson::Boolean(true) => date.clone(),
+            // A boolean (true OR false) sets the current Date, matching mongod
+            // and the Python `$currentDate` branch.
+            Bson::Boolean(_) => date.clone(),
             Bson::Document(o) => match o.get_str("$type") {
                 Ok("date") => date.clone(),
                 Ok("timestamp") => ts.clone(),
@@ -7344,8 +7346,14 @@ mod tests {
         // Unrecognised option → error (mirrors mongod / update.py rejecting it).
         let bad = doc! {"$currentDate": {"x": {"$type": "nope"}}};
         assert!(resolve_current_date(&bad).is_err());
-        let bad2 = doc! {"$currentDate": {"x": false}};
-        assert!(resolve_current_date(&bad2).is_err());
+        // A boolean `false` sets the current Date, just like `true` (mongod /
+        // update.py accept it as the set-Date form).
+        let false_form = doc! {"$currentDate": {"x": false}};
+        let out2 = resolve_current_date(&false_form).unwrap();
+        assert!(matches!(
+            out2.get_document("$set").unwrap().get("x"),
+            Some(Bson::DateTime(_))
+        ));
     }
 
     #[test]

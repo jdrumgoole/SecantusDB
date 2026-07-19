@@ -973,6 +973,41 @@ def test_pull_pullall_non_array_via_pymongo(coll) -> None:
     assert coll.find_one({"_id": 1})["arr"] == [1, 3]
 
 
+def test_push_sort_validation_via_pymongo(coll) -> None:
+    """$push $sort: a numeric whole-element sort must be ±1, a document direction
+    must be ±1, and a non-numeric spec is code 2; a whole-double ±1 is accepted.
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": [{"s": 3}, {"s": 1}]})
+    for spec in (2, 1.5, "x", True, {"s": 2}, {"s": True}):
+        with pytest.raises(OperationFailure) as exc:
+            coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [{"s": 2}], "$sort": spec}}})
+        assert exc.value.code == 2, spec
+    # A whole-double ±1 direction is accepted and sorts.
+    coll.update_one({"_id": 1}, {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1.0}}}})
+    assert [e["s"] for e in coll.find_one({"_id": 1})["a"]] == [1, 2, 3]
+
+
+def test_current_date_bool_false_via_pymongo(coll) -> None:
+    """$currentDate accepts a boolean (true OR false) as the set-Date form, and a
+    {$type} object; a non-bool scalar / bad $type is code 2. mongod 7.0.12-verified."""
+    import datetime
+
+    from bson import Timestamp
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    coll.update_one({"_id": 1}, {"$currentDate": {"d": False}})
+    assert isinstance(coll.find_one({"_id": 1})["d"], datetime.datetime)
+    coll.update_one({"_id": 1}, {"$currentDate": {"ts": {"$type": "timestamp"}}})
+    assert isinstance(coll.find_one({"_id": 1})["ts"], Timestamp)
+    for opt in (5, "x", {"$type": "bogus"}):
+        with pytest.raises(OperationFailure) as exc:
+            coll.update_one({"_id": 1}, {"$currentDate": {"bad": opt}})
+        assert exc.value.code == 2, opt
+
+
 def test_densify_validation_via_pymongo(coll) -> None:
     """$densify: date unit on numeric 6053600, bool step 14, non-positive step
     5733401, bad bounds string 5946802, wrong-length array 5733403, descending

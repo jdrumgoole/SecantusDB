@@ -133,6 +133,60 @@ def test_push_sort_modifier() -> None:
         {"$push": {"a": {"$each": [{"s": 2}], "$sort": {"s": 1}}}},
     )
     assert out == {"a": [{"s": 1}, {"s": 2}, {"s": 3}]}
+    # A whole-double scalar / direction is accepted (coerces like ±1).
+    assert apply_update({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": 1.0}}}) == {
+        "a": [1, 2, 3]
+    }
+    assert apply_update(
+        {"a": [{"s": 3}]}, {"$push": {"a": {"$each": [{"s": 1}], "$sort": {"s": 1.0}}}}
+    ) == {"a": [{"s": 1}, {"s": 3}]}
+
+
+def test_push_sort_invalid_spec_raises() -> None:
+    # mongod: a numeric whole-element $sort must be exactly ±1 (else code 2), a
+    # document direction must be ±1 (else code 2), and a non-numeric spec
+    # (string/bool/array) is code 2 with the "invalid" message.
+    for spec in (2, -2, 1.5):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": spec}}})
+        assert exc.value.code == 2, spec
+    for spec in ({"s": 2}, {"s": True}, {"s": "x"}):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"a": [{"s": 1}]}, {"$push": {"a": {"$each": [{"s": 2}], "$sort": spec}}})
+        assert exc.value.code == 2, spec
+    for spec in ("x", True, [1]):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"a": [3, 1]}, {"$push": {"a": {"$each": [2], "$sort": spec}}})
+        assert exc.value.code == 2, spec
+
+
+def test_current_date_bool_and_type_validation() -> None:
+    import datetime
+
+    import bson
+
+    # A boolean (true OR false) sets the current Date.
+    for flag in (True, False):
+        out = apply_update({"_id": 1}, {"$currentDate": {"d": flag}})
+        assert isinstance(out["d"], datetime.datetime), flag
+    # {$type: "date"} / {$type: "timestamp"} set the right BSON type.
+    assert isinstance(
+        apply_update({"_id": 1}, {"$currentDate": {"d": {"$type": "date"}}})["d"],
+        datetime.datetime,
+    )
+    assert isinstance(
+        apply_update({"_id": 1}, {"$currentDate": {"d": {"$type": "timestamp"}}})["d"],
+        bson.Timestamp,
+    )
+    # A non-bool scalar and a bad/missing $type are code 2.
+    for opt in (5, "x", [1]):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"_id": 1}, {"$currentDate": {"d": opt}})
+        assert exc.value.code == 2, opt
+    for opt in ({"$type": "bogus"}, {"$type": 5}, {}):
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"_id": 1}, {"$currentDate": {"d": opt}})
+        assert exc.value.code == 2, opt
 
 
 def test_addtoset_dedupes() -> None:

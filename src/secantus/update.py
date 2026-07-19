@@ -139,20 +139,36 @@ def _apply_push(arr: list[Any], value: Any) -> list[Any]:
 
 def _push_sort(arr: list[Any], spec: Any) -> list[Any]:
     """`$push` `$sort`: `1`/`-1` sorts whole elements (BSON order); a `{field: dir}`
-    document sorts (stably, field-by-field) by those paths."""
+    document sorts (stably, field-by-field) by those paths. mongod validates the
+    spec: a numeric whole-element sort must be exactly ±1 (a whole double is
+    accepted), each document direction must be ±1, and anything else (string,
+    bool, array) is rejected."""
     from secantus.storage import _SortKey
 
-    if isinstance(spec, int) and not isinstance(spec, bool):
+    if not isinstance(spec, bool) and isinstance(spec, (int, float)):
+        if spec != 1 and spec != -1:
+            raise UpdateError("The $sort element value must be either 1 or -1", code=2)
         return sorted(arr, key=_SortKey, reverse=(spec == -1))
     if isinstance(spec, Mapping):
+        for direction in spec.values():
+            if (
+                isinstance(direction, bool)
+                or not isinstance(direction, (int, float))
+                or (direction != 1 and direction != -1)
+            ):
+                raise UpdateError("The sort element value must be either 1 or -1", code=2)
         result = list(arr)
         for field, direction in reversed(list(spec.items())):
             result.sort(
                 key=lambda e, f=field: _SortKey(get_path(e, f) if isinstance(e, Mapping) else e),
-                reverse=(int(direction) == -1),
+                reverse=(direction == -1),
             )
         return result
-    raise UpdateError("$sort requires 1, -1, or a document")
+    raise UpdateError(
+        "The $sort is invalid: use 1/-1 to sort the whole element, or "
+        "{field:1/-1} to sort embedded fields",
+        code=2,
+    )
 
 
 def _push_slice(arr: list[Any], n: Any) -> list[Any]:
@@ -482,23 +498,35 @@ def _apply_op(
                 unset_path(doc, concrete)
     elif op == "$currentDate":
         for path, opts in payload.items():
+            # mongod: the argument is a boolean (true OR false — both set the
+            # current Date) or a `{$type: "date"|"timestamp"}` object. A non-bool
+            # scalar and a bad/missing $type are both code 2.
+            if isinstance(opts, bool):
+                stamp: Any = _dt.datetime.now(_dt.timezone.utc)
+            elif isinstance(opts, Mapping):
+                kind = opts.get("$type")
+                if kind == "date":
+                    stamp = _dt.datetime.now(_dt.timezone.utc)
+                elif kind == "timestamp":
+                    import time as _time
+
+                    import bson as _bson
+
+                    stamp = _bson.Timestamp(int(_time.time()), 0)
+                else:
+                    raise UpdateError(
+                        "The '$type' string field is required to be 'date' or 'timestamp': "
+                        "{$currentDate: {field : {$type: 'date'}}}",
+                        code=2,
+                    )
+            else:
+                raise UpdateError(
+                    f"{_bson_type_name(opts)} is not valid type for $currentDate. Please use "
+                    "a boolean ('true') or a $type expression ({$type: 'timestamp/date'}).",
+                    code=2,
+                )
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                if opts is True:
-                    set_path(doc, concrete, _dt.datetime.now(_dt.timezone.utc))
-                    continue
-                if isinstance(opts, Mapping):
-                    kind = opts.get("$type")
-                    if kind == "date":
-                        set_path(doc, concrete, _dt.datetime.now(_dt.timezone.utc))
-                        continue
-                    if kind == "timestamp":
-                        import time as _time
-
-                        import bson as _bson
-
-                        set_path(doc, concrete, _bson.Timestamp(int(_time.time()), 0))
-                        continue
-                raise UpdateError(f"$currentDate option for {path!r} not understood")
+                set_path(doc, concrete, stamp)
     elif op == "$inc":
         for path, delta in payload.items():
             _require_numeric_operand("increment", path, delta)
