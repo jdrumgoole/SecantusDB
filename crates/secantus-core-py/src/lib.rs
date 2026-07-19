@@ -120,6 +120,30 @@ fn query_matches(
     Ok(py.allow_threads(|| query::matches(&doc, &query, &vars, coll.as_ref()).ok()))
 }
 
+/// `query.matches_raw` — the raw-BSON matcher, over the same BSON bytes. The
+/// document bytes are matched WITHOUT being materialised into an owned
+/// `Document` (only the filter's reached fields are decoded). Result must be
+/// identical to [`query_matches`] for every input; the parity suite pins
+/// `matches_raw == matches == pure Python`. Returns `None` to defer, same
+/// contract as `query_matches`.
+#[pyfunction]
+fn query_matches_raw(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    query_bytes: &[u8],
+    vars_bytes: &[u8],
+    collation_bytes: &[u8],
+) -> PyResult<Option<bool>> {
+    let query: Document = bson::from_slice(query_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
+    let vars: Document = bson::from_slice(vars_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
+    let coll = parse_collation(collation_bytes)?;
+    let raw = bson::RawDocument::from_bytes(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    Ok(py.allow_threads(|| query::matches_raw(raw, &query, &vars, coll.as_ref()).ok()))
+}
+
 /// Batched `query.matches`: one call filters a whole candidate list under a
 /// single GIL release, amortising the per-call seam + GIL handoff that makes
 /// per-doc matching scale poorly under concurrency (see `benchmarks/`).
@@ -499,6 +523,7 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
+    m.add_function(wrap_pyfunction!(query_matches_raw, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches_batch, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update_with, m)?)?;

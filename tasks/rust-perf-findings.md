@@ -31,6 +31,18 @@ storage scan above WiredTiger is, to within noise, *only* BSON
 materialization: every stored blob becomes an owned `Document` (an
 `IndexMap` with per-key allocations) before matching/projection see it.
 
+**Finding 1 fixed for the match path — Phase 2 shipped (2026-07-19,
+`rawbson-scan` branch).** `secantus_core::query::matches_raw` filters over
+`bson::RawDocument`, decoding only the fields the filter reaches;
+`find_matching_with` and `count_matching` now use it, so a rejected candidate
+is never fully decoded. Measured on a 5000-row collection scan, wide docs
+(11 fields), selective filter (one field, rejects 99.8%): **~84 → ~237
+scans/s, ≈2.8×**. Pinned bool-for-bool to the owned matcher (and pure Python)
+across the whole query parity corpus. Still materializing (later phases): the
+*return* path (projection / reply decode of the matched rows), the sort-key
+extraction of a post-sorted find (decodes matched rows only), and the
+update/delete candidate scans (a matched row is needed for the write).
+
 ## Finding 2 — the reply path materializes them again
 
 `get_more` 4,315 → `util::docs_to_bson` 4,199 → `Document::from_reader`
