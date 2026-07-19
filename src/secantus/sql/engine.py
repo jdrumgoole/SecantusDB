@@ -14,7 +14,7 @@ import copy
 import datetime as _dt
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import sqlglot
@@ -1324,13 +1324,19 @@ class CopyPlan:
     table: Any
     columns: list[str]  # target column SQL names (or query output names)
     to_stdout: bool  # True = COPY TO STDOUT, False = COPY FROM STDIN
-    fmt: str  # "text" | "csv"
+    fmt: str  # "text" | "csv" | "binary"
     delimiter: str
     null: str
     header: bool
     # For ``COPY (SELECT …) TO STDOUT``: the pre-rendered copy-stream cells of the
     # query result (query-form COPY is dump-only; ``table`` is None).
     query_rows: list[list] | None = None
+    # Per-column type tags + oids (parallel to ``columns``) — the binary format
+    # encodes/decodes each field by its type instead of rendering text.
+    col_tags: list[str] = field(default_factory=list)
+    col_oids: list[int] = field(default_factory=list)
+    # Raw (unrendered) query-form values, kept for binary COPY OUT.
+    query_raw_rows: list | None = None
 
 
 def copy_plan(
@@ -1355,8 +1361,22 @@ def copy_plan(
         if not to_stdout:
             raise errors.syntax_error("COPY (query) must be COPY … TO, not FROM")
         select = this.this if isinstance(this, exp.Subquery) else this
-        columns, query_rows = _copy_query_rows(select, storage, db, catalog, session)
-        return CopyPlan(None, columns, True, fmt, delimiter, null, header, query_rows=query_rows)
+        columns, query_rows, raw_rows, tags, oids = _copy_query_rows(
+            select, storage, db, catalog, session, render_text=(fmt != "binary")
+        )
+        return CopyPlan(
+            None,
+            columns,
+            True,
+            fmt,
+            delimiter,
+            null,
+            header,
+            query_rows=query_rows,
+            query_raw_rows=raw_rows,
+            col_tags=tags,
+            col_oids=oids,
+        )
 
     if isinstance(this, exp.Schema):
         tname = this.this.name
@@ -1372,17 +1392,48 @@ def copy_plan(
         if not to_stdout:  # a generated column can't be copied in
             cols = [c for c in cols if c.generated is None and c.identity != "always"]
         columns = [c.name for c in cols]
-    return CopyPlan(table, columns, to_stdout, fmt, delimiter, null, header)
+    col_tags = []
+    col_oids = []
+    for name in columns:
+        col = table.column(name)
+        tag = col.type_tag if col is not None else "any"
+        col_tags.append(tag)
+        if col is not None and getattr(col, "json_plain", False):
+            col_oids.append(114)  # plain json: binary form has no version byte
+        else:
+            col_oids.append(typemap.PG_OID.get(tag, 25))
+    return CopyPlan(
+        table,
+        columns,
+        to_stdout,
+        fmt,
+        delimiter,
+        null,
+        header,
+        col_tags=col_tags,
+        col_oids=col_oids,
+    )
 
 
 def _copy_query_rows(
-    select: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session | None
-) -> tuple[list[str], list[list]]:
-    """Run a ``COPY (SELECT …) TO`` query and render its result as copy-stream
-    cells (string / None), returning ``(column_names, rows)``."""
+    select: exp.Expression,
+    storage: Any,
+    db: str,
+    catalog: Catalog,
+    session: Session | None,
+    *,
+    render_text: bool = True,
+) -> tuple[list[str], list[list] | None, list | None, list[str], list[int]]:
+    """Run a ``COPY (SELECT …) TO`` query, returning ``(column_names,
+    text_cells_or_None, raw_rows_or_None, type_tags, pg_oids)``. Text/CSV COPY
+    renders each cell to its text form up front; binary COPY keeps the raw
+    values so the per-type binary encoders see native values."""
     result = _run_query(select, storage, db, catalog, session or Session(database=db))
     columns = [c.name for c in result.columns]
     tags = [c.type_tag for c in result.columns]
+    oids = [c.pg_oid for c in result.columns]
+    if not render_text:
+        return columns, None, list(result.rows), tags, oids
     rows: list[list] = []
     for row in result.rows:
         cells: list = []
@@ -1393,7 +1444,7 @@ def _copy_query_rows(
                 rendered = typemap.to_pg_text(value, tag)
                 cells.append(rendered.decode() if rendered is not None else None)
         rows.append(cells)
-    return columns, rows
+    return columns, rows, None, tags, oids
 
 
 def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool]:
@@ -1444,7 +1495,9 @@ def copy_insert(
                 converted.append(None)
                 continue
             col = plan.table.column(name)
-            if col is not None and col.type_tag == "bool":
+            # Binary COPY decodes cells to typed Python values already; the
+            # text coercion only applies to string cells from text/CSV.
+            if col is not None and col.type_tag == "bool" and isinstance(cell, str):
                 converted.append(_parse_bool_text(cell))
             else:
                 converted.append(cell)
@@ -1477,6 +1530,24 @@ def copy_extract(
             else:
                 rendered = typemap.to_pg_text(value, tag)
                 cells.append(rendered.decode() if rendered is not None else None)
+        out.append(cells)
+    return out
+
+
+def copy_extract_raw(storage: Any, db: str, plan: CopyPlan) -> list[list]:
+    """Read the COPY TO source as raw (unrendered) values for binary COPY —
+    the per-type binary encoders need native values, not text cells."""
+    from secantus.paths import get_path
+
+    if plan.query_raw_rows is not None:  # COPY (SELECT …) TO
+        return [list(row) for row in plan.query_raw_rows]
+    out: list[list] = []
+    for doc in storage.find_matching(db, plan.table.collection, {}):
+        cells: list = []
+        for name in plan.columns:
+            col = plan.table.column(name)
+            field = col.field if col is not None else name
+            cells.append(get_path(doc, field))
         out.append(cells)
     return out
 
@@ -1687,6 +1758,14 @@ def _run_statement(
         # not a statement — Postgres raises a syntax error, and clients map
         # 42601 to ProgrammingError (0A000 maps to NotSupportedError).
         raise errors.SQLError("42601", f'syntax error at or near "{stmt.sql()[:40]}"')
+    if isinstance(stmt, exp.Copy):
+        # COPY reaching the generic dispatcher means it wasn't the sole
+        # statement of a wire-level copy() (a multi-statement string) or came
+        # through the embedded API — real PG rejects it as a ProgrammingError-
+        # class condition, not a NotSupported one.
+        raise errors.SQLError(
+            "42601", "COPY ... TO/FROM STDIN/STDOUT must be a standalone statement"
+        )
     raise errors.feature_not_supported(f"unsupported statement: {type(stmt).__name__}")
 
 

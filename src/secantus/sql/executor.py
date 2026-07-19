@@ -555,6 +555,8 @@ def _out_column_descs(
     out: list[ColumnDesc] = []
     for name, col in cols:
         oid = typemap.PG_OID.get(col.type_tag, 25)
+        if getattr(col, "json_plain", False):
+            oid = 114  # a ``json`` (not jsonb) column keeps the plain-json oid
         if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:
             if enum_oids is None:
                 enum_oids = Catalog(storage).enum_type_oids(db)
@@ -1555,6 +1557,19 @@ def _pipeline_input_docs(
     from secantus.sql import scalar
 
     docs = storage.find_matching(db, plan.base_collection, plan.base_filter)
+    if getattr(plan, "pre_eval_fields", None):
+        # Materialize computed GROUP BY keys the aggregation engine can't
+        # lower — evaluated per doc by the scalar engine before the pipeline.
+        resolve = plan.pre_eval_resolve
+        sc0 = sctx or _scalar_ctx(storage, db, None)
+        docs = [dict(d) for d in docs]
+        for doc in docs:
+
+            def scope(node: Any, _doc: dict[str, Any] = doc) -> Any:
+                return get_path(_doc, resolve(node)[0])
+
+            for fname, ast in plan.pre_eval_fields.items():
+                doc[fname] = scalar.evaluate(ast, scope, sc0)
     if plan.residual_where is None:
         return docs, plan.pipeline
     if plan.residual_split:

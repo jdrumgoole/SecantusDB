@@ -294,6 +294,11 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         # ``bytea || bytea`` concatenates the raw bytes; anything else is text.
         if isinstance(left, (bytes, bytearray)) and isinstance(right, (bytes, bytearray)):
             return bytes(left) + bytes(right)
+        # ``array || array`` / ``array || elem`` concatenates lists.
+        if isinstance(left, list) or isinstance(right, list):
+            lval = left if isinstance(left, list) else [left]
+            rval = right if isinstance(right, list) else [right]
+            return [*lval, *rval]
         # ``hstore || hstore`` merges (right wins).
         from secantus.sql import hstore as _hstore
 
@@ -1631,6 +1636,14 @@ def _yields_json(node: exp.Expression) -> bool:
     return isinstance(node, _JSONB_NAV)
 
 
+def _operand_is_json(node: exp.Expression) -> bool:
+    """True when ``node`` is itself a json/jsonb cast (possibly parenthesised) —
+    its evaluated value is already JSON-decoded."""
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return isinstance(node, exp.Cast) and typemap.type_tag_for_sql(node.to) == "json"
+
+
 def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
     # ``'ok'::mood`` — a cast to a declared enum validates the label (22P02) and
@@ -1732,6 +1745,11 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         # and rendering see a dict/list, not raw text (which would double-encode).
         if isinstance(value, (dict, list, bool, int, float)):
             return value
+        if isinstance(value, str) and _operand_is_json(node.this):
+            # Already decoded by an inner json cast (a JsonText parameter's
+            # substituted ``::jsonb`` under the statement's own ``::json``) —
+            # a JSON string value must not be re-parsed as JSON text.
+            return value
         try:
             return typemap.coerce(value, "json")
         except ValueError as e:
@@ -1754,10 +1772,33 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import pggeo as _pggeo
 
         return _pggeo.canonical(value, to_tag_early)
+    if to_tag_early == "text" and isinstance(value, list):
+        # ``(x::box[])::text`` — render the array literal NOW with the inner
+        # cast's element rules (box's ``;`` delimiter); by output time the
+        # column tag is plain text and the element identity is gone.
+        inner = node.this
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        elem = "text"
+        if isinstance(inner, exp.Cast):
+            inner_tag = typemap.type_tag_for_sql(inner.to)
+            if typemap.is_array_tag(inner_tag):
+                elem = typemap.array_element_tag(inner_tag)
+        elif isinstance(inner, exp.Array):
+            # ``array[x::json]::text`` — the element casts type the rendering.
+            first = next((el for el in inner.expressions if isinstance(el, exp.Cast)), None)
+            if first is not None:
+                elem = typemap.type_tag_for_sql(first.to) or "text"
+        return typemap._render_pg_array(value, elem)
     if value is not None and to_tag_early == "bytea":
         from secantus.sql import bytea as _bytea
 
-        return _bytea.parse(value)
+        try:
+            return _bytea.parse(value)
+        except (ValueError, TypeError) as e:
+            raise errors.SQLError(
+                "22P02", f"invalid input syntax for type bytea: {str(value)[:60]!r}"
+            ) from e
     if value is not None and to_tag_early == "hstore":
         from secantus.sql import hstore as _hstore
 
@@ -1837,6 +1878,12 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         elem_tag = typemap.array_element_tag(to)
         if elem_tag in typemap._RANGE_TAGS or elem_tag in typemap._MULTIRANGE_TAGS:
             return typemap.coerce(value, to)
+        # An array-literal string cast (``'{a,b,c}'::text[]``) materialises the
+        # Python list — subscripting and ``unnest`` need elements, not text.
+        # Coerce by the canonical tag (``to`` is the rendered SQL spelling:
+        # ``int[]``, whose element name isn't an internal tag).
+        if isinstance(value, str):
+            return typemap.coerce(value, to_tag_early if to_tag_early is not None else to)
     # Bit-string casts: ``::bit(n)`` / ``::varbit`` (from a '0'/'1' string or an
     # integer) and ``bit::int``.
     to_tag = typemap.type_tag_for_sql(node.to) if node.to is not None else None

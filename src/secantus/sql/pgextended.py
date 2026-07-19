@@ -525,21 +525,47 @@ def _array_elem_info(arr_oid: int) -> tuple[int, str]:
     return (arr_oid - USER_TYPE_ARRAY_OID_OFFSET, "text")
 
 
+def _array_dims(items: Any, elem_tag: str | None) -> list[int]:
+    """The dimension lengths of a (possibly nested) array value. A list element
+    is a sub-array only outside json[] (a JSON array IS a value there)."""
+    dims: list[int] = []
+    node = items
+    while isinstance(node, (list, tuple)):
+        dims.append(len(node))
+        if (
+            elem_tag != "json"
+            and node
+            and all(isinstance(v, (list, tuple)) for v in node)
+            and len({len(v) for v in node}) == 1
+        ):
+            node = node[0]
+        else:
+            break
+    return dims
+
+
 def _encode_array(
     value: Any, arr_oid: int, tag: str | None, encoding: str | None = "utf-8"
 ) -> bytes:
-    """Binary-encode a one-dimensional array result (ndim/hasnull/elemoid header,
-    one per-dim {len, lbound} pair, then length-prefixed elements)."""
+    """Binary-encode an array result (ndim/hasnull/elemoid header, per-dim
+    {len, lbound} pairs, then length-prefixed elements in row-major order).
+    Nested lists encode as multi-dimensional arrays."""
     elem_oid, elem_tag = _array_elem_info(arr_oid)
     if isinstance(value, (list, tuple)):
         items = value
     else:
         items = typemap._parse_pg_array_literal(str(value))
-    has_null = any(v is None for v in items)
-    out = bytearray(struct.pack("!iii", 1 if items else 0, int(has_null), elem_oid))
-    if items:
-        out += struct.pack("!ii", len(items), 1)
-        for v in items:
+    dims = _array_dims(items, elem_tag)
+    flat: list[Any] = list(items)
+    for _ in range(len(dims) - 1):
+        flat = [v for sub in flat for v in (sub if isinstance(sub, (list, tuple)) else [sub])]
+    has_null = any(v is None for v in flat)
+    ndim = len(dims) if flat or len(dims) > 1 else 0
+    out = bytearray(struct.pack("!iii", ndim, int(has_null), elem_oid))
+    if ndim:
+        for d in dims:
+            out += struct.pack("!ii", d, 1)
+        for v in flat:
             if v is None:
                 out += struct.pack("!i", -1)
                 continue
@@ -558,15 +584,22 @@ def _encode_array(
 
 
 def _decode_array(raw: bytes, encoding: str | None = "utf-8") -> list:
-    """Decode a binary array parameter to a Python list (one dimension)."""
+    """Decode a binary array parameter to a (possibly nested) Python list."""
     ndim, _has_null, elem_oid = struct.unpack_from("!iii", raw, 0)
     if ndim == 0:
         return []
-    n, _lbound = struct.unpack_from("!ii", raw, 12)
+    dims = []
+    off = 12
+    for _ in range(ndim):
+        n, _lbound = struct.unpack_from("!ii", raw, off)
+        dims.append(n)
+        off += 8
     decoder = None if elem_oid in (0, 25, 1043) else _BINARY.get(elem_oid)
+    total = 1
+    for d in dims:
+        total *= d
     items: list = []
-    off = 20
-    for _ in range(n):
+    for _ in range(total):
         (length,) = struct.unpack_from("!i", raw, off)
         off += 4
         if length < 0:
@@ -575,6 +608,9 @@ def _decode_array(raw: bytes, encoding: str | None = "utf-8") -> list:
         b = raw[off : off + length]
         off += length
         items.append(decoder(b) if decoder is not None else pgwire.decode_text(b, encoding))
+    # Rebuild the nesting from the inside out.
+    for d in reversed(dims[1:]):
+        items = [items[i : i + d] for i in range(0, len(items), d)]
     return items
 
 
@@ -762,8 +798,15 @@ def _text_param_timetz(s: str) -> Any:
     return typemap.TimeTzText(_datetimes.parse_timetz(s))
 
 
+def _text_param_bytea(s: str) -> bytes:
+    from secantus.sql import bytea as _bytea
+
+    return _bytea.parse(s)
+
+
 _TEXT_PARAM = {
     16: lambda s: s.strip().lower() in ("t", "true", "y", "yes", "on", "1"),  # bool
+    17: _text_param_bytea,  # bytea — ``\x…`` hex (or escape) text form -> bytes
     20: int,  # int8
     21: int,  # int2
     23: int,  # int4
@@ -797,6 +840,14 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
             # Range / multirange (or arrays of them): carried as text with the
             # declared tag so substitution casts it into the structured value.
             return typemap.TaggedText(text, range_tag)
+        if oid == 1001:
+            # bytea[] — parse the array literal into a list of bytes so the
+            # substitution's ``::bytea[]`` cast path fires (a raw text literal
+            # compares text-vs-list and is silently false).
+            try:
+                return typemap.coerce(text, "bytea[]")
+            except ValueError:
+                return text
         conv = _TEXT_PARAM.get(oid)
         if conv is None:
             return text
@@ -904,6 +955,15 @@ class ExtendedSession:
                     self.session.database, self.catalog, oid
                 ),
             )
+        # Parse-analysis type inference: a parameter the client left untyped
+        # (oid 0) takes its type from the AST context (a cast on it, or a cast
+        # operand it's compared with) so Bind can decode a BINARY payload.
+        oids = planner.infer_parameter_types(stmt, list(oids))
+        # An untyped parameter fed straight to a VARIADIC "any" function can't
+        # be typed at all — PG rejects the Parse with 42P18.
+        bad = planner.indeterminate_parameter(stmt, oids)
+        if bad is not None:
+            raise errors.SQLError("42P18", f"could not determine data type of parameter ${bad}")
         self.prepared[name] = Prepared(name, stmt, oids, count)
         return pgwire.parse_complete()
 

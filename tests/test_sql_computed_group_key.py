@@ -176,15 +176,29 @@ def test_computed_key_with_expression_over_aggregate(storage, session):
 # -- unsupported function ---------------------------------------------------- #
 
 
-def test_group_by_unsupported_function_rejected(storage, session):
+def test_group_by_key_beyond_pipeline_evaluates_in_python(storage, session):
+    # A key the aggregation engine can't lower (substr's Mongo lowering isn't
+    # mapped) falls back to per-doc Python evaluation before the pipeline.
     _t(storage, session)
-    with pytest.raises(SQLError) as ei:
-        run(
-            storage,
-            session,
-            "SELECT substr(name, 1, 1) AS g, count(*) FROM t GROUP BY substr(name, 1, 1)",
-        )
-    assert ei.value.sqlstate == "0A000"
+    res = run(
+        storage,
+        session,
+        "SELECT substr(name, 1, 1) AS g, count(*) FROM t GROUP BY substr(name, 1, 1)",
+    )
+    assert sorted(res.rows) == [("A", 1), ("B", 1), ("a", 1), ("b", 1)]
+
+
+def test_group_by_comparison_key_and_ordinal(storage, session):
+    # ``GROUP BY 1`` resolves the ordinal to the select expression, and a
+    # comparison-shaped key groups (typed bool) via the Python pre-eval path.
+    _t(storage, session)
+    res = run(
+        storage,
+        session,
+        "SELECT name = 'alice' AS is_alice, count(*) FROM t GROUP BY 1 ORDER BY 1",
+    )
+    assert res.rows == [(False, 3), (True, 1)]
+    assert res.columns[0].type_tag == "bool"
 
 
 # -- computed keys over a JOIN (#169) ---------------------------------------- #

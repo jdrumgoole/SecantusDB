@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.5.4b237
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-07-19 12:30 UTC
+- generated: 2026-07-19 14:30 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -12,10 +12,10 @@
 | test_connection.py | 93 | 9 | 2 | 104 | 91.2% |
 | test_connection_info.py | 32 | 5 | 3 | 40 | 86.5% |
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
-| test_copy.py | 88 | 23 | 1 | 112 | 79.3% |
+| test_copy.py | 105 | 6 | 1 | 112 | 94.6% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
-| test_cursor_client.py | 27 | 1 | 0 | 28 | 96.4% |
-| test_cursor_common.py | 277 | 3 | 8 | 288 | 98.9% |
+| test_cursor_client.py | 28 | 0 | 0 | 28 | 100.0% |
+| test_cursor_common.py | 280 | 0 | 8 | 288 | 100.0% |
 | test_cursor_raw.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_server.py | 89 | 21 | 0 | 110 | 80.9% |
 | test_encodings.py | 17 | 0 | 0 | 17 | 100.0% |
@@ -29,25 +29,25 @@
 | test_transaction.py | 83 | 1 | 1 | 85 | 98.8% |
 | test_typeinfo.py | 85 | 1 | 0 | 86 | 98.8% |
 | test_typing.py | 125 | 0 | 0 | 125 | 100.0% |
-| types/test_array.py | 125 | 33 | 0 | 158 | 79.1% |
+| types/test_array.py | 158 | 0 | 0 | 158 | 100.0% |
 | types/test_bool.py | 15 | 0 | 0 | 15 | 100.0% |
 | types/test_composite.py | 62 | 17 | 0 | 79 | 78.5% |
 | types/test_datetime.py | 558 | 0 | 9 | 567 | 100.0% |
 | types/test_enum.py | 197 | 0 | 0 | 197 | 100.0% |
 | types/test_hstore.py | 24 | 0 | 15 | 39 | 100.0% |
 | types/test_json.py | 258 | 0 | 0 | 258 | 100.0% |
-| types/test_multirange.py | 203 | 2 | 12 | 217 | 99.0% |
+| types/test_multirange.py | 205 | 0 | 12 | 217 | 100.0% |
 | types/test_net.py | 3 | 30 | 0 | 33 | 9.1% |
 | types/test_none.py | 1 | 0 | 0 | 1 | 100.0% |
 | types/test_numeric.py | 366 | 4 | 0 | 370 | 98.9% |
 | types/test_numpy.py | 88 | 78 | 6 | 172 | 53.0% |
-| types/test_range.py | 264 | 11 | 12 | 287 | 96.0% |
+| types/test_range.py | 275 | 0 | 12 | 287 | 100.0% |
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
-| types/test_string.py | 104 | 30 | 1 | 135 | 77.6% |
+| types/test_string.py | 134 | 0 | 1 | 135 | 100.0% |
 | types/test_uuid.py | 21 | 5 | 0 | 26 | 80.8% |
-| **total** | **3811** | **315** | **112** | **4238** | **92.4%** |
+| **total** | **3908** | **218** | **112** | **4238** | **94.7%** |
 
-## Failures (315)
+## Failures (218)
 
 - `tests/test_adapt.py::test_no_cast_needed[b]`
 - `tests/test_adapt.py::test_no_cast_needed[s]`
@@ -73,33 +73,12 @@
 - `tests/test_connection_info.py::test_normalize_encoding[euc-jp-EUC_JP-euc_jp]`
 - `tests/test_connection_info.py::test_normalize_encoding[eucjp-EUC_JP-euc_jp]`
 - `tests/test_connection_info.py::test_set_encoding_unsupported`
-- `tests/test_copy.py::test_binary_partial_row`
-- `tests/test_copy.py::test_connection_writer[1-sample_binary]`
-- `tests/test_copy.py::test_copy_bad_result`
+- `tests/test_copy.py::test_copy_from_leaks[0-False]`
 - `tests/test_copy.py::test_copy_from_leaks[0-True]`
 - `tests/test_copy.py::test_copy_from_leaks[1-True]`
-- `tests/test_copy.py::test_copy_in_allchars`
-- `tests/test_copy.py::test_copy_in_buffers[1-sample_binary]`
-- `tests/test_copy.py::test_copy_in_error`
-- `tests/test_copy.py::test_copy_out_allchars[0]`
-- `tests/test_copy.py::test_copy_out_allchars[1]`
 - `tests/test_copy.py::test_copy_out_error_with_copy_not_finished`
-- `tests/test_copy.py::test_copy_out_iter[dict_row-1]`
-- `tests/test_copy.py::test_copy_out_iter[namedtuple_row-1]`
-- `tests/test_copy.py::test_copy_out_iter[tuple_row-1]`
-- `tests/test_copy.py::test_copy_out_read[1]`
-- `tests/test_copy.py::test_copy_table_across[binary]`
 - `tests/test_copy.py::test_copy_table_across[block]`
 - `tests/test_copy.py::test_copy_table_across[row]`
-- `tests/test_copy.py::test_read_row_notypes[1]`
-- `tests/test_copy.py::test_rows_notypes[1]`
-- `tests/test_copy.py::test_subclass_adapter[1]`
-- `tests/test_copy.py::test_subclass_nulling_dumper[1]`
-- `tests/test_copy.py::test_worker_life[1-sample_binary]`
-- `tests/test_cursor_client.py::test_leak[asyncio-tuple_row-one]`
-- `tests/test_cursor_common.py::test_stream_badquery[asyncio-ClientCursor-copy (select 1) to stdout]`
-- `tests/test_cursor_common.py::test_stream_badquery[asyncio-Cursor-copy (select 1) to stdout]`
-- `tests/test_cursor_common.py::test_stream_badquery[asyncio-RawCursor-copy (select 1) to stdout]`
 - `tests/test_cursor_server.py::test_binary_cursor_execute[asyncio-RawServerCursor]`
 - `tests/test_cursor_server.py::test_binary_cursor_execute[asyncio-ServerCursor]`
 - `tests/test_cursor_server.py::test_binary_cursor_text_override[asyncio-RawServerCursor]`
@@ -154,39 +133,6 @@
 - `tests/test_psycopg_dbapi20.py::PsycopgTPCTests::test_xid`
 - `tests/test_transaction.py::test_context_inerror_rollback_no_clobber[asyncio-pipeline=off]`
 - `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-IDLE-text]`
-- `tests/types/test_array.py::test_all_chars[1-s]`
-- `tests/types/test_array.py::test_all_chars[1-t]`
-- `tests/types/test_array.py::test_all_chars_with_bounds[0]`
-- `tests/types/test_array.py::test_all_chars_with_bounds[1]`
-- `tests/types/test_array.py::test_array_of_unknown_builtin`
-- `tests/types/test_array.py::test_array_register`
-- `tests/types/test_array.py::test_array_with_bounds['[0:1]={a,b}'::text[]-want0-1]`
-- `tests/types/test_array.py::test_array_with_bounds['[1:1][-2:-1][3:5]={{{1,2,3},{4,5,6}}}'::int[]-want1-1]`
-- `tests/types/test_array.py::test_dump_list_int[obj1-{10,null,30}]`
-- `tests/types/test_array.py::test_dump_list_no_comma_separator`
-- `tests/types/test_array.py::test_dump_list_str[obj0-{{{{{{a}}}}}}-b]`
-- `tests/types/test_array.py::test_dump_list_str[obj2-{{{{{{"NULL"}}}}}}-b]`
-- `tests/types/test_array.py::test_dump_list_str[obj4-{foo,null,baz}-b]`
-- `tests/types/test_array.py::test_dump_list_str[obj4-{foo,null,baz}-s]`
-- `tests/types/test_array.py::test_dump_list_str[obj4-{foo,null,baz}-t]`
-- `tests/types/test_array.py::test_dump_list_str[obj6-{{foo,bar},{baz,qux},{quux,quuux}}-b]`
-- `tests/types/test_array.py::test_dump_list_str[obj7-{{{"fo{o","ba}r"},{"ba\\"z",qu\\'x},{"qu ux"," "}}}-b]`
-- `tests/types/test_array.py::test_dump_list_str[obj7-{{{"fo{o","ba}r"},{"ba\\"z",qu\\'x},{"qu ux"," "}}}-s]`
-- `tests/types/test_array.py::test_dump_list_str[obj7-{{{"fo{o","ba}r"},{"ba\\"z",qu\\'x},{"qu ux"," "}}}-t]`
-- `tests/types/test_array.py::test_empty_list[b]`
-- `tests/types/test_array.py::test_empty_list[s]`
-- `tests/types/test_array.py::test_empty_list[t]`
-- `tests/types/test_array.py::test_load_list_int[want1-{10,null,30}-0]`
-- `tests/types/test_array.py::test_load_list_int[want1-{10,null,30}-1]`
-- `tests/types/test_array.py::test_load_list_int[want2-{{10,20},{30,40}}-1]`
-- `tests/types/test_array.py::test_load_list_str[want0-{{{{{{a}}}}}}-1]`
-- `tests/types/test_array.py::test_load_list_str[want1-{{{{{{NULL}}}}}}-1]`
-- `tests/types/test_array.py::test_load_list_str[want2-{{{{{{"NULL"}}}}}}-1]`
-- `tests/types/test_array.py::test_load_list_str[want4-{foo,null,baz}-0]`
-- `tests/types/test_array.py::test_load_list_str[want6-{{foo,bar},{baz,qux},{quux,quuux}}-1]`
-- `tests/types/test_array.py::test_load_list_str[want7-{{{"fo{o","ba}r"},{"ba\\"z",qu\\'x},{"qu ux"," "}}}-1]`
-- `tests/types/test_array.py::test_load_nested_array[0]`
-- `tests/types/test_array.py::test_load_nested_array[1]`
 - `tests/types/test_composite.py::test_dump_builtin_empty_range[b]`
 - `tests/types/test_composite.py::test_dump_builtin_empty_range[s]`
 - `tests/types/test_composite.py::test_dump_builtin_empty_range[t]`
@@ -204,8 +150,6 @@
 - `tests/types/test_composite.py::test_load_record_binary[42,'foo','ba,r','ba''z','qu"x'-want4]`
 - `tests/types/test_composite.py::test_load_record_binary[null, ''-want3]`
 - `tests/types/test_composite.py::test_load_recursive_composite[1]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int4multirange-ranges0]`
-- `tests/types/test_multirange.py::test_dump_builtin_multirange[b-int8multirange-ranges2]`
 - `tests/types/test_net.py::test_address_dump[192.168.0.1-b]`
 - `tests/types/test_net.py::test_address_dump[192.168.0.1-s]`
 - `tests/types/test_net.py::test_address_dump[192.168.0.1-t]`
@@ -318,47 +262,6 @@
 - `tests/types/test_numpy.py::test_dump_int[t-uint8-255-'255'::int2]`
 - `tests/types/test_numpy.py::test_dump_int[t-ulonglong-0-'0'::numeric]`
 - `tests/types/test_numpy.py::test_dump_int[t-ulonglong-18446744073709551615-'18446744073709551615'::numeric]`
-- `tests/types/test_range.py::test_dump_builtin_empty[b-daterange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[b-int4range]`
-- `tests/types/test_range.py::test_dump_builtin_empty[b-int8range]`
-- `tests/types/test_range.py::test_dump_builtin_empty[b-numrange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[b-tsrange]`
-- `tests/types/test_range.py::test_dump_builtin_empty[b-tstzrange]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-int4range-None-None-()]`
-- `tests/types/test_range.py::test_dump_builtin_range[b-int8range-None-None-()]`
-- `tests/types/test_range.py::test_dump_quoting`
-- `tests/types/test_range.py::test_load_quoting[0]`
-- `tests/types/test_range.py::test_load_quoting[1]`
-- `tests/types/test_string.py::test_dump_1byte[Binary-b]`
-- `tests/types/test_string.py::test_dump_1byte[Binary-s]`
-- `tests/types/test_string.py::test_dump_1byte[Binary-t]`
-- `tests/types/test_string.py::test_dump_1byte[bytearray-b]`
-- `tests/types/test_string.py::test_dump_1byte[bytearray-s]`
-- `tests/types/test_string.py::test_dump_1byte[bytearray-t]`
-- `tests/types/test_string.py::test_dump_1byte[bytes-b]`
-- `tests/types/test_string.py::test_dump_1byte[bytes-s]`
-- `tests/types/test_string.py::test_dump_1byte[bytes-t]`
-- `tests/types/test_string.py::test_dump_1byte[memoryview-b]`
-- `tests/types/test_string.py::test_dump_1byte[memoryview-s]`
-- `tests/types/test_string.py::test_dump_1byte[memoryview-t]`
-- `tests/types/test_string.py::test_dump_text_oid[s]`
-- `tests/types/test_string.py::test_dump_text_oid[t]`
-- `tests/types/test_string.py::test_quote_1byte[Binary-off]`
-- `tests/types/test_string.py::test_quote_1byte[bytearray-off]`
-- `tests/types/test_string.py::test_quote_1byte[bytes-off]`
-- `tests/types/test_string.py::test_quote_1byte[memoryview-off]`
-- `tests/types/test_string.py::test_text_array[bpchar-1-b]`
-- `tests/types/test_string.py::test_text_array[bpchar-1-s]`
-- `tests/types/test_string.py::test_text_array[bpchar-1-t]`
-- `tests/types/test_string.py::test_text_array[name-0-b]`
-- `tests/types/test_string.py::test_text_array[name-0-s]`
-- `tests/types/test_string.py::test_text_array[name-0-t]`
-- `tests/types/test_string.py::test_text_array[name-1-b]`
-- `tests/types/test_string.py::test_text_array[name-1-s]`
-- `tests/types/test_string.py::test_text_array[name-1-t]`
-- `tests/types/test_string.py::test_text_array[varchar-1-b]`
-- `tests/types/test_string.py::test_text_array[varchar-1-s]`
-- `tests/types/test_string.py::test_text_array[varchar-1-t]`
 - `tests/types/test_uuid.py::test_uuid_dump[01234567-89ab-cdef-0123-456789abcdef-t]`
 - `tests/types/test_uuid.py::test_uuid_dump[0123456789abcdef0123456789abcdef-t]`
 - `tests/types/test_uuid.py::test_uuid_dump[12345678-1234-5678-1234-567812345679-t]`
