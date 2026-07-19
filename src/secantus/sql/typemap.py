@@ -1177,10 +1177,22 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
             return _ranges.render(value).encode("utf-8")
         return _render_json(value).encode("utf-8")
     if isinstance(value, bson.Decimal128):
-        return str(value.to_decimal()).encode("utf-8")
+        return _render_pg_numeric(value.to_decimal()).encode("utf-8")
+    if isinstance(value, Decimal):
+        return _render_pg_numeric(value).encode("utf-8")
     if isinstance(value, float):
         return _render_pg_float(value).encode("ascii")
     return str(value).encode("utf-8")
+
+
+def _render_pg_numeric(value: Decimal) -> str:
+    """Postgres ``numeric_out`` text: plain positional notation, never
+    exponent form (``Decimal('1.1E+2')`` prints ``110``, not ``1.1E+2``)."""
+    if not value.is_finite():
+        if value.is_nan():
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    return format(value, "f")
 
 
 def _render_pg_float(value: float) -> str:

@@ -39,6 +39,10 @@ class Prepared:
     stmt: exp.Expression | None  # None for an empty query string
     param_oids: list[int]
     param_count: int
+    # The original query text and creation time — pg_prepared_statements
+    # reports both (psycopg's prepared-statement cache matches on the text).
+    query: str = ""
+    created: Any = None
 
 
 @dataclass
@@ -979,7 +983,11 @@ class ExtendedSession:
         except errors.SQLError as exc:
             self.skip_until_sync = True
             return pgwire.error_response(
-                exc.sqlstate, exc.message, encoding=self.session.wire_encoding
+                exc.sqlstate,
+                exc.message,
+                encoding=self.session.wire_encoding,
+                diag=getattr(exc, "diag", None),
+                position=getattr(exc, "position", None),
             )
         except Exception:  # pragma: no cover - defensive
             logger.exception("error in extended protocol")
@@ -1023,13 +1031,17 @@ class ExtendedSession:
         # Parse-analysis type inference: a parameter the client left untyped
         # (oid 0) takes its type from the AST context (a cast on it, or a cast
         # operand it's compared with) so Bind can decode a BINARY payload.
-        oids = planner.infer_parameter_types(stmt, list(oids))
+        oids = planner.infer_parameter_types(
+            stmt, list(oids), catalog=self.catalog, db=self.session.database
+        )
         # An untyped parameter fed straight to a VARIADIC "any" function can't
         # be typed at all — PG rejects the Parse with 42P18.
         bad = planner.indeterminate_parameter(stmt, oids)
         if bad is not None:
             raise errors.SQLError("42P18", f"could not determine data type of parameter ${bad}")
-        self.prepared[name] = Prepared(name, stmt, oids, count)
+        self.prepared[name] = Prepared(
+            name, stmt, oids, count, query=query, created=_dt.datetime.now(_dt.timezone.utc)
+        )
         return pgwire.parse_complete()
 
     def _bind(self, payload: bytes) -> bytes:
@@ -1172,6 +1184,13 @@ class ExtendedSession:
             portal.offset = 0
         res = portal.result
         out = bytearray()
+        for severity, message in getattr(res, "notices", ()) or ():
+            out += pgwire.notice_response(
+                message,
+                severity=severity,
+                sqlstate="01000" if severity == "WARNING" else "00000",
+                encoding=self.session.wire_encoding,
+            )
         status = list(res.parameter_status)
         if self.session.pending_parameter_status:
             status += self.session.pending_parameter_status

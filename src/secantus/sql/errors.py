@@ -18,10 +18,22 @@ class SQLError(Exception):
     message is user-facing — it is what a real ``psql`` session would print.
     """
 
-    def __init__(self, sqlstate: str, message: str) -> None:
+    def __init__(
+        self,
+        sqlstate: str,
+        message: str,
+        *,
+        diag: dict[str, str] | None = None,
+        position: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.sqlstate = sqlstate
         self.message = message
+        # Optional ErrorResponse identity fields (s=schema, t=table, c=column,
+        # n=constraint, d=datatype) and the 1-based statement position —
+        # clients surface them via the error Diagnostics / LINE context.
+        self.diag = diag or {}
+        self.position = position
 
 
 # A curated set of the SQLSTATEs this layer raises. Names mirror the Postgres
