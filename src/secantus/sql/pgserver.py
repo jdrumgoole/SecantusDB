@@ -389,12 +389,14 @@ class SecantusPGServer:
         session.backend_start = _dt.datetime.now(_dt.timezone.utc)
 
         def _terminate(sock: socket.socket = conn) -> None:
-            # pg_terminate_backend: hard-close the target connection's socket;
-            # its handler thread unwinds on the next read.
+            # pg_terminate_backend: signal the target connection's blocked
+            # recv to return by shutting the socket down for reading. The
+            # target's OWN handler thread then unwinds and closes the fd (its
+            # ``with conn:`` block) — closing the socket from this foreign
+            # thread is unsafe on Windows (a pending recv in the other thread
+            # can crash Winsock).
             with contextlib.suppress(OSError):
-                sock.shutdown(socket.SHUT_RDWR)
-            with contextlib.suppress(OSError):
-                sock.close()
+                sock.shutdown(socket.SHUT_RD)
 
         session.terminate_cb = _terminate
         if self._authz_active:
