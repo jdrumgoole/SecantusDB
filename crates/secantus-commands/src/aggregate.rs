@@ -209,7 +209,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         &vars,
                     )
                     .map_err(command_error)?;
-                (ns, decode_docs(bytes)?, rest)
+                // Reduce the leading $skip/$limit/$match prefix over raw BSON so
+                // only the survivors that reach the first heavier stage are
+                // decoded (tasks/rust-perf-findings.md).
+                let (reduced, remaining) =
+                    reduce_raw_prefix(bytes, &rest, &vars, collation.as_ref());
+                (ns, decode_docs(reduced)?, remaining)
             }
         }
         // Collectionless aggregate (e.g. `{aggregate: 1, pipeline: [{$documents: …}]}`).
@@ -1796,4 +1801,85 @@ fn lift_leading_match(pipeline: &[Bson]) -> (Document, Vec<Bson>) {
         }
     }
     (Document::new(), pipeline.to_vec())
+}
+
+/// Process the leading **pass-through prefix** of a pipeline over the fetched
+/// RAW blobs, before `decode_docs` materialises them. `$skip` / `$limit` drop or
+/// truncate whole documents and a (non-leading) `$match` filters via
+/// `query::matches_raw` (decoding only the filter's fields) — none of these
+/// inspect a document beyond the filter's fields or its position, so a limiting
+/// or selective prefix shrinks the set that the heavier stages (`$group` /
+/// `$sort` / computed `$project` / `$unwind` / …) must decode. Order-preserving,
+/// so the reduced-then-decoded input is identical to decoding everything and
+/// running the same stages through `apply_pipeline`. Stops at the first stage it
+/// doesn't handle (or a `$match` whose filter the raw matcher defers on),
+/// returning the reduced blobs and the remaining pipeline for the normal
+/// decode + run path.
+fn reduce_raw_prefix(
+    mut bytes: Vec<Vec<u8>>,
+    pipeline: &[Bson],
+    vars: &Document,
+    collation: Option<&Collation>,
+) -> (Vec<Vec<u8>>, Vec<Bson>) {
+    let mut consumed = 0;
+    for stage in pipeline {
+        let Some(sd) = stage.as_document() else { break };
+        if sd.len() != 1 {
+            break;
+        }
+        let Some((name, arg)) = sd.iter().next() else {
+            break;
+        };
+        match name.as_str() {
+            // Only fast-path a clearly-valid INTEGER argument. A whole double
+            // (`$limit: 2.0`) is valid but a fractional / bool / negative /
+            // zero-`$limit` argument must raise — deferring every non-integer
+            // arg to the full engine keeps its validation intact (it accepts the
+            // whole double and computes it; it raises on the rest).
+            "$skip" => match arg {
+                Bson::Int32(n) if *n >= 0 => {
+                    let n = (*n as usize).min(bytes.len());
+                    bytes.drain(..n);
+                }
+                Bson::Int64(n) if *n >= 0 => {
+                    let n = (*n as usize).min(bytes.len());
+                    bytes.drain(..n);
+                }
+                _ => break,
+            },
+            "$limit" => match arg {
+                Bson::Int32(n) if *n > 0 => bytes.truncate(*n as usize),
+                Bson::Int64(n) if *n > 0 => bytes.truncate(*n as usize),
+                _ => break,
+            },
+            "$match" => {
+                let Some(filter) = arg.as_document() else {
+                    break;
+                };
+                let mut kept = Vec::with_capacity(bytes.len());
+                let mut deferred = false;
+                for blob in &bytes {
+                    let Ok(raw) = bson::RawDocument::from_bytes(blob) else {
+                        deferred = true;
+                        break;
+                    };
+                    match secantus_core::query::matches_raw(raw, filter, vars, collation) {
+                        Ok(true) => kept.push(blob.clone()),
+                        Ok(false) => {}
+                        Err(_) => {
+                            deferred = true;
+                            break;
+                        }
+                    }
+                }
+                if deferred {
+                    break; // a filter the raw matcher can't do -> full engine
+                }
+                bytes = kept;
+            }
+            _ => break, // first heavier stage — stop
+        }
+        consumed += 1;
+    }
+    (bytes, pipeline[consumed..].to_vec())
 }

@@ -57,6 +57,21 @@ document that a non-projected find *returns* is spliced onto the wire already
 materialization is now just those fallback projection shapes and the
 aggregation pipeline (Finding 4 territory).
 
+**Write-path match + aggregation prefix shipped (2026-07-19).** The
+`update` / `delete` candidate scans also match over raw BSON now
+(`rawbson-write` branch) — rejected candidates skip the full decode, only a
+matched row is decoded for the write — measured **≈4.1×** on a selective
+`updateMany` COLLSCAN of wide docs. And an aggregation pipeline's leading
+`$skip` / `$limit` / `$match` prefix is reduced over the raw fetched blobs
+before `decode_docs` (`rawbson-agg` branch, `reduce_raw_prefix`), so the
+heavier stages decode only the survivors — measured **≈4.3×** on
+`[{$limit:50},{$group}]` over 5000 wide docs. Every scan-*match* path (find /
+count / update / delete) is now raw. **Still fully materializing:** the
+heavier aggregation stages themselves (`$group` / `$sort` / computed
+`$project` / `$unwind`) — each would need a raw stage matching its owned
+semantics, or a streaming/slot execution model. That (plus the fallback
+projection shapes) is the remaining server-side read materialization.
+
 ## Finding 2 — the reply path materializes them again
 
 `get_more` 4,315 → `util::docs_to_bson` 4,199 → `Document::from_reader`
