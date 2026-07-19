@@ -733,7 +733,11 @@ def _op_object_to_array(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     if not isinstance(v, Mapping):
-        raise ExpressionError("$objectToArray requires a document")
+        raise ExpressionError(
+            f"$objectToArray requires a document input, found: {_bson_type_name(v)}",
+            code=40390,
+            code_name="Location40390",
+        )
     return [{"k": k, "v": val} for k, val in v.items()]
 
 
@@ -1305,7 +1309,8 @@ def _op_strcasecmp(arg: Any, ctx: _Ctx) -> int:
 def _op_replace(arg: Any, ctx: _Ctx, *, count: int) -> Any:
     """``$replaceOne`` (count 1) / ``$replaceAll`` (count -1): replace occurrence(s)
     of ``find`` in ``input`` with ``replacement``. Any null input/find/replacement
-    → null; a non-string one raises ``Location51745``."""
+    → null; a non-string one raises mongod's per-argument code (input → 51746,
+    find → 51745, replacement → 51744)."""
     op = "$replaceOne" if count == 1 else "$replaceAll"
     if not isinstance(arg, Mapping) or not {"input", "find", "replacement"} <= set(arg):
         raise ExpressionError(f"{op} requires 'input', 'find' and 'replacement'")
@@ -1314,9 +1319,13 @@ def _op_replace(arg: Any, ctx: _Ctx, *, count: int) -> Any:
     rep = _eval(arg["replacement"], ctx)
     if inp is None or find is None or rep is None:
         return None
-    for v, name in ((inp, "input"), (find, "find"), (rep, "replacement")):
+    for v, name, code in (
+        (inp, "input", 51746),
+        (find, "find", 51745),
+        (rep, "replacement", 51744),
+    ):
         if not isinstance(v, str):
-            raise ExpressionError(f"{op} requires that '{name}' be a string", code=51745)
+            raise ExpressionError(f"{op} requires that '{name}' be a string, found: {v}", code=code)
     return inp.replace(find, rep) if count == -1 else inp.replace(find, rep, 1)
 
 
@@ -1399,7 +1408,7 @@ def _op_date_diff(arg: Any, ctx: _Ctx) -> Any:
         return int(delta.total_seconds())
     if unit == "millisecond":
         return int(delta.total_seconds() * 1000)
-    raise ExpressionError(f"unsupported date unit: {unit!r}")
+    raise ExpressionError(f"unknown time unit value: {unit}", code=9, code_name="FailedToParse")
 
 
 def _op_regex_find_all(arg: Any, ctx: _Ctx) -> Any:
@@ -1436,7 +1445,11 @@ def _op_array_to_object(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     if not isinstance(v, list):
-        raise ExpressionError("$arrayToObject requires an array")
+        raise ExpressionError(
+            f"$arrayToObject requires an array input, found: {_bson_type_name(v)}",
+            code=40386,
+            code_name="Location40386",
+        )
     out: dict[str, Any] = {}
     for entry in v:
         if isinstance(entry, Mapping) and "k" in entry and "v" in entry:
@@ -1871,8 +1884,19 @@ def _op_zip(arg: Any, ctx: _Ctx) -> Any:
     inputs = _eval(arg["inputs"], ctx)
     if inputs is None:
         return None
-    if not isinstance(inputs, list) or not all(isinstance(a, list) for a in inputs):
-        raise ExpressionError("$zip inputs must be an array of arrays")
+    if not isinstance(inputs, list):
+        raise ExpressionError(
+            f"inputs must be an array of expressions, found {_bson_type_name(inputs)}",
+            code=34461,
+            code_name="Location34461",
+        )
+    for a in inputs:
+        if not isinstance(a, list):
+            raise ExpressionError(
+                f"$zip found a non-array expression in input: {a}",
+                code=34468,
+                code_name="Location34468",
+            )
     use_longest = bool(arg.get("useLongestLength"))
     defaults = arg.get("defaults") or [None] * len(inputs)
     if not isinstance(defaults, list):

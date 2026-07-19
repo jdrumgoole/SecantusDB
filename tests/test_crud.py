@@ -2092,6 +2092,31 @@ def test_conversion_error_codes_via_pymongo(coll) -> None:
         assert exc.value.code == code, expr
 
 
+def test_more_expression_error_codes_via_pymongo(coll) -> None:
+    """More mongod-specific expression error codes over the wire: $zip (34461/
+    34468), $arrayToObject (40386), $objectToArray (40390), $replaceOne per-arg
+    (51746/51745/51744), $dateDiff unknown unit (9). mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5, "d": "2020-01-01"})
+    for expr, code in [
+        ({"$zip": {"inputs": "$n"}}, 34461),
+        ({"$zip": {"inputs": ["$n"]}}, 34468),
+        ({"$arrayToObject": "$n"}, 40386),
+        ({"$objectToArray": "$n"}, 40390),
+        ({"$replaceOne": {"input": "$n", "find": "a", "replacement": "b"}}, 51746),
+        ({"$replaceOne": {"input": "x", "find": "$n", "replacement": "b"}}, 51745),
+        ({"$replaceAll": {"input": "x", "find": "y", "replacement": "$n"}}, 51744),
+        (
+            {"$dateDiff": {"startDate": "$$NOW", "endDate": "$$NOW", "unit": "bogus"}},
+            9,
+        ),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
+
+
 def test_create_index_listed_via_pymongo(coll) -> None:
     coll.insert_one({"x": 1})
     coll.create_index("x")

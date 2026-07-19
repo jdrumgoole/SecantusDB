@@ -402,6 +402,43 @@ def test_conversion_error_codes() -> None:
     assert evaluate({"$convert": {"input": "abc", "to": "int", "onError": -1}}, {}) == -1
 
 
+def test_more_expression_error_codes() -> None:
+    import datetime
+
+    # More mongod-specific codes (previously generic 14): $zip non-array inputs /
+    # element (34461/34468); $arrayToObject non-array (40386); $objectToArray
+    # non-document (40390); $replaceOne/$replaceAll per-argument (51746/51745/
+    # 51744); $dateDiff unknown unit (9).
+    for expr, code in [
+        ({"$zip": {"inputs": 5}}, 34461),
+        ({"$zip": {"inputs": [5]}}, 34468),
+        ({"$arrayToObject": 5}, 40386),
+        ({"$objectToArray": 5}, 40390),
+        ({"$replaceOne": {"input": 5, "find": "a", "replacement": "b"}}, 51746),
+        ({"$replaceOne": {"input": "a", "find": 5, "replacement": "b"}}, 51745),
+        ({"$replaceAll": {"input": "a", "find": "a", "replacement": 5}}, 51744),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    d1, d2 = datetime.datetime(2020, 1, 1), datetime.datetime(2021, 1, 1)
+    with pytest.raises(ExpressionError) as exc:
+        evaluate(
+            {
+                "$dateDiff": {
+                    "startDate": {"$literal": d1},
+                    "endDate": {"$literal": d2},
+                    "unit": "bogus",
+                }
+            },
+            {},
+        )
+    assert exc.value.code == 9
+    # Valid forms still work.
+    assert evaluate({"$zip": {"inputs": [[1, 2], [3, 4]]}}, {}) == [[1, 3], [2, 4]]
+    assert evaluate({"$replaceOne": {"input": "aXa", "find": "X", "replacement": "-"}}, {}) == "a-a"
+
+
 def test_convert_int_long_overflow() -> None:
     # $convert to int/long range-checks and raises 241 (caught by onError).
     with pytest.raises(ExpressionError) as exc:
