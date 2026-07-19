@@ -41,6 +41,29 @@ served to a client is fully decoded (at least) twice.
 Combined, findings 1+2 put **~65% of the serving path's on-CPU time in
 materialization** for scan-shaped workloads.
 
+**Finding 2 fixed — Phase 1 shipped (2026-07-19, `rawbson-reply` branch).**
+`secantus_wire::encode_cursor_reply` splices the pre-encoded document blobs
+straight into `cursor.firstBatch` / `cursor.nextBatch` (RawArrayBuf memcpy,
+no decode), and the no-projection `find` + non-tailable `getMore` handlers
+hand their batch to the server as raw blobs (`CommandContext::pending_batch`)
+instead of an owned `Bson::Array`. Byte-identical to the old reply (unit
+test), so no driver-visible change. Measured before/after (baseline
+`a2a61595` vs the branch, embedded server, 2000×~220B docs, client-observed
+throughput — the pymongo client-side decode cost is the *same* on both sides,
+so the server-side gain is larger than these end-to-end numbers show):
+
+| Read workload | Before | After | Speedup |
+|---|---:|---:|---:|
+| Single-batch (large `firstBatch`, no getMore) | ~511k docs/s | ~673k docs/s | **1.32×** |
+| getMore-heavy (batchSize 50, ~40 round-trips/scan) | ~273k docs/s | ~305k docs/s | **1.12×** |
+
+The firstBatch case wins most (a big batch decodes the most documents); the
+getMore case gains less because per-batch round-trip overhead dilutes the
+per-document decode saving. Still deferred (later phases): projected `find`,
+the tailable/change-stream reply, aggregate `firstBatch`, and exhaust-cursor
+streaming — plus Finding 1 (the *scan-side* materialization), the larger
+remaining lever.
+
 ## Finding 3 — the oplog prune is an O(entire-oplog) full-decode sweep
 
 The single biggest insert-path consumer is not the insert:
