@@ -470,5 +470,9 @@ fn cluster_time_monotonic_across_reopen() {
     let st = Storage::open(home.to_str().unwrap()).unwrap();
     let after = st.current_cluster_time().unwrap();
     assert!((after.time, after.increment) > (before.time, before.increment));
+    // Close WT before removing its data dir (see concurrent_writes.rs). This
+    // reopened handle does no writes, so it doesn't panic today — but the
+    // remove-before-drop ordering is the same latent bug, so keep it correct.
+    drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
