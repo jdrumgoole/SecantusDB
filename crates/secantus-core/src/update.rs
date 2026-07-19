@@ -119,13 +119,42 @@ fn referenced_af_identifiers(update: &Document) -> std::collections::HashSet<Str
     out
 }
 
+/// The ordered, de-duplicated arrayFilter identifiers a filter references — the
+/// top-level field name (before the first `.`) of each non-`$` key, recursing
+/// through `$and`/`$or`/`$nor` sub-clauses. Mirrors `_extract_af_identifiers`
+/// (the `$expr`/no-identifier distinction only matters for Python's exact error
+/// code, so the bool isn't tracked here — an empty result defers regardless).
+fn extract_af_identifiers(f: &Document) -> Vec<String> {
+    fn walk(m: &Document, idents: &mut Vec<String>, seen: &mut std::collections::HashSet<String>) {
+        for (key, value) in m {
+            if key == "$and" || key == "$or" || key == "$nor" {
+                if let Bson::Array(subs) = value {
+                    for sub in subs {
+                        if let Bson::Document(d) = sub {
+                            walk(d, idents, seen);
+                        }
+                    }
+                }
+            } else if !key.starts_with('$') {
+                let ident = key.split('.').next().unwrap_or(key).to_string();
+                if seen.insert(ident.clone()) {
+                    idents.push(ident);
+                }
+            }
+        }
+    }
+    let mut idents = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    walk(f, &mut idents, &mut seen);
+    idents
+}
+
 /// Whether the arrayFilters are valid per mongod (mirrors
-/// `_validate_array_filters`): each has a top-level identifier (empty defers),
-/// well-formed (bad name defers), unique (dup defers), and used by a `$[id]`
-/// path (unused defers). Invalid → the whole update defers so Python raises the
-/// exact code. A filter whose only top-level keys are `$`-operators carries a
-/// nested identifier SecantusDB doesn't extract; it's left for the apply path
-/// (which defers if the identifier is then unresolved), matching Python.
+/// `_validate_array_filters`): each references exactly one identifier (empty /
+/// `$expr` / two-or-more all defer), well-formed (bad name defers), unique (dup
+/// defers), and used by a `$[id]` path (unused defers). Invalid → the whole
+/// update defers so Python raises the exact code. The identifier may nest inside
+/// `$and`/`$or`/`$nor`, matching mongod.
 fn array_filters_valid(filters: &[Document], update: &Document) -> bool {
     if filters.is_empty() {
         return true;
@@ -133,37 +162,29 @@ fn array_filters_valid(filters: &[Document], update: &Document) -> bool {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut identifiers: Vec<String> = Vec::new();
     for f in filters {
-        let top: Vec<&str> = f
-            .keys()
-            .filter(|k| !k.starts_with('$'))
-            .map(|k| k.split('.').next().unwrap_or(k))
-            .collect();
-        if top.is_empty() {
-            if f.is_empty() {
-                return false; // empty {} -> Python raises code 9
-            }
-            continue; // nested $-op identifier -> left for the apply path
+        let found = extract_af_identifiers(f);
+        if found.len() != 1 {
+            return false; // 0 (empty/$expr) or >=2 distinct -> Python raises (9/224)
         }
-        let ident = top[0];
+        let ident = &found[0];
         if !is_valid_af_ident(ident) {
             return false; // bad identifier -> Python raises code 2
         }
-        if !seen.insert(ident.to_string()) {
+        if !seen.insert(ident.clone()) {
             return false; // duplicate identifier -> Python raises code 9
         }
-        identifiers.push(ident.to_string());
+        identifiers.push(ident.clone());
     }
     let referenced = referenced_af_identifiers(update);
     identifiers.iter().all(|id| referenced.contains(id))
 }
 
-/// Map each arrayFilter identifier (`{"x.score": {...}}` → `x`) to its filter
-/// document. First entry wins per identifier, as in Python.
+/// Map each arrayFilter identifier to its filter document (the identifier may
+/// nest inside `$and`/`$or`/`$nor`). First entry wins per identifier, as in Python.
 fn index_array_filters(filters: &[Document]) -> HashMap<String, &Document> {
     let mut out: HashMap<String, &Document> = HashMap::new();
     for f in filters {
-        for key in f.keys() {
-            let name = key.split('.').next().unwrap_or(key).to_string();
+        for name in extract_af_identifiers(f) {
             out.entry(name).or_insert(f);
         }
     }

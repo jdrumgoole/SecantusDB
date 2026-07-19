@@ -369,6 +369,9 @@ def test_array_filters_validation() -> None:
         ([{"X": {"$gt": 0}}], 2),  # identifier starts uppercase
         ([{"x": {"$gt": 0}}, {"x": {"$lt": 9}}], 9),  # duplicate identifier
         ([{"x": {"$gt": 0}}, {"y": {"$gt": 0}}], 9),  # 'y' unused
+        ([{"x": {"$gt": 0}, "y": {"$gt": 0}}], 9),  # two identifiers in one filter
+        ([{"$and": [{"x": {"$gt": 0}}, {"y": {"$gt": 0}}]}], 9),  # two, nested
+        ([{"$expr": {"$gt": ["$g", 0]}}], 224),  # $expr, no identifier
     ]:
         with pytest.raises(UpdateError) as exc:
             apply_update(dict(doc), upd, array_filters=af)
@@ -381,6 +384,17 @@ def test_array_filters_validation() -> None:
     assert apply_update(dict(doc), upd, array_filters=[{"x.g": {"$gt": 3}}]) == {
         "a": [{"g": 1}, {"g": 9}]
     }
+    # A single identifier nested inside $and / $or resolves and applies.
+    assert apply_update(
+        {"a": [{"g": 1, "h": 1}, {"g": 5, "h": 9}]},
+        upd,
+        array_filters=[{"$and": [{"x.g": {"$gt": 3}}, {"x.h": {"$gt": 0}}]}],
+    ) == {"a": [{"g": 1, "h": 1}, {"g": 9, "h": 9}]}
+    assert apply_update(
+        {"a": [{"g": 1}, {"g": 5}]},
+        upd,
+        array_filters=[{"$or": [{"x.g": {"$gt": 3}}, {"x.g": {"$lt": 0}}]}],
+    ) == {"a": [{"g": 1}, {"g": 9}]}
 
 
 def test_positional_dollar_sets_first_match() -> None:

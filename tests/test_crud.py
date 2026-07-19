@@ -1033,6 +1033,9 @@ def test_array_filters_validation_via_pymongo(coll) -> None:
         ([{"X": {"$gt": 0}}], 2),
         ([{"x": {"$gt": 0}}, {"x": {"$lt": 9}}], 9),
         ([{"x": {"$gt": 0}}, {"y": {"$gt": 0}}], 9),
+        ([{"x": {"$gt": 0}, "y": {"$gt": 0}}], 9),  # two identifiers in one filter
+        ([{"$and": [{"x": {"$gt": 0}}, {"y": {"$gt": 0}}]}], 9),  # two, nested
+        ([{"$expr": {"$gt": ["$g", 0]}}], 224),  # $expr, no identifier
     ]:
         with pytest.raises((OperationFailure, WriteError)) as exc:
             coll.update_one({"_id": 1}, upd, array_filters=af)
@@ -1040,6 +1043,11 @@ def test_array_filters_validation_via_pymongo(coll) -> None:
     # A valid filter updates the matching elements.
     coll.update_one({"_id": 1}, upd, array_filters=[{"x.g": {"$gt": 3}}])
     assert [e["g"] for e in coll.find_one({"_id": 1})["a"]] == [1, 9]
+    # A single identifier nested inside $and resolves and applies to the match.
+    coll.update_one(
+        {"_id": 1}, {"$set": {"a.$[x].g": 7}}, array_filters=[{"$and": [{"x.g": {"$gt": 8}}]}]
+    )
+    assert [e["g"] for e in coll.find_one({"_id": 1})["a"]] == [1, 7]
 
 
 def test_densify_validation_via_pymongo(coll) -> None:

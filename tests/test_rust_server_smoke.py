@@ -1558,6 +1558,8 @@ def test_array_filters_validation(tmp_path) -> None:
             [{"1x": {"$gt": 0}}],  # bad identifier
             [{"x": {"$gt": 0}}, {"x": {"$lt": 9}}],  # duplicate identifier
             [{"x": {"$gt": 0}}, {"y": {"$gt": 0}}],  # 'y' unused
+            [{"$and": [{"x": {"$gt": 0}}, {"y": {"$gt": 0}}]}],  # two idents nested
+            [{"$expr": {"$gt": ["$g", 0]}}],  # $expr, no identifier
         ):
             with pytest.raises(pymongo.errors.OperationFailure):
                 coll.update_one({"_id": 1}, upd, array_filters=af)
@@ -1566,6 +1568,11 @@ def test_array_filters_validation(tmp_path) -> None:
         # A valid filter updates only the matching element.
         coll.update_one({"_id": 1}, upd, array_filters=[{"x.g": {"$gt": 3}}])
         assert [e["g"] for e in coll.find_one({"_id": 1})["a"]] == [1, 9]
+        # A single identifier nested inside $and resolves and applies.
+        coll.update_one(
+            {"_id": 1}, {"$set": {"a.$[x].g": 7}}, array_filters=[{"$and": [{"x.g": {"$gt": 8}}]}]
+        )
+        assert [e["g"] for e in coll.find_one({"_id": 1})["a"]] == [1, 7]
     finally:
         srv.stop()
 
