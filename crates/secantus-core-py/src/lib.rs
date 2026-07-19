@@ -358,6 +358,32 @@ fn apply_projection(
     Ok(out.map(|b| to_pybytes(py, b)))
 }
 
+/// `projection.apply_projection` raw-BSON fast path over the same bytes. Returns
+/// `Some(projected bytes)` for the pure top-level inclusion shape it handles
+/// (projecting straight off the raw document), or `None` to signal the caller
+/// must run the full `apply_projection`. Result must be byte-identical to
+/// `apply_projection` for every spec it claims; the parity suite pins it. The
+/// GIL is held (the `RawDocument` borrows the Python buffer and the op is
+/// small), unlike the batched projection which releases it.
+#[pyfunction]
+fn apply_projection_raw(
+    py: Python<'_>,
+    doc_bytes: &[u8],
+    spec_bytes: &[u8],
+) -> PyResult<Option<Py<PyBytes>>> {
+    let spec: Document = bson::from_slice(spec_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
+    let raw = bson::RawDocument::from_bytes(doc_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
+    match projection::apply_projection_raw(raw, &spec) {
+        Some(doc) => {
+            let bytes = encode_doc(&doc).map_err(PyValueError::new_err)?;
+            Ok(Some(to_pybytes(py, bytes)))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Decode an optional `query` filter (empty / absent -> `None`), used by the
 /// projection bindings to resolve a positional `arr.$` projection.
 fn decode_optional_query(query_bytes: Option<&[u8]>) -> PyResult<Option<Document>> {
@@ -530,6 +556,7 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(apply_update_batch, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate, m)?)?;
     m.add_function(wrap_pyfunction!(apply_projection, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_projection_raw, m)?)?;
     m.add_function(wrap_pyfunction!(apply_projection_batch, m)?)?;
     m.add_function(wrap_pyfunction!(compute_update_description, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update_description, m)?)?;

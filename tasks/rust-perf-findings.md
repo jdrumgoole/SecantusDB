@@ -39,9 +39,23 @@ is never fully decoded. Measured on a 5000-row collection scan, wide docs
 (11 fields), selective filter (one field, rejects 99.8%): **~84 → ~237
 scans/s, ≈2.8×**. Pinned bool-for-bool to the owned matcher (and pure Python)
 across the whole query parity corpus. Still materializing (later phases): the
-*return* path (projection / reply decode of the matched rows), the sort-key
-extraction of a post-sorted find (decodes matched rows only), and the
+sort-key extraction of a post-sorted find (decodes matched rows only), and the
 update/delete candidate scans (a matched row is needed for the write).
+
+**Return path (projection) — Phase 3 shipped (2026-07-19, `rawbson-proj`
+branch).** A `find` *with* a projection decoded every returned document before
+projecting. `secantus_core::projection::apply_projection_raw` now handles the
+common shape — a pure top-level inclusion (`{a:1,b:1}`, optionally `_id:0`) —
+by decoding only the included fields off the raw document, byte-identical to
+`apply_projection` (`_id` first, then included fields sorted). Everything else
+(exclusion, dotted, `$slice`/`$elemMatch`/`$meta`, positional, mixed) falls
+back to the full projection. Measured on a 5000-row scan of wide docs (12
+fields) projecting 2: **~44 → ~87 scans/s, ≈2.0×**. Still materializing: the
+exclusion / dotted / operator projection shapes (fall back), and the raw
+document that a non-projected find *returns* is spliced onto the wire already
+(Phase 1) so it's never decoded server-side — the remaining server-side read
+materialization is now just those fallback projection shapes and the
+aggregation pipeline (Finding 4 territory).
 
 ## Finding 2 — the reply path materializes them again
 

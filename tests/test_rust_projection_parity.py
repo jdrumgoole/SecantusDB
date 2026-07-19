@@ -52,7 +52,18 @@ _pure = _load_pure_projection()
 
 def _rust_proj(doc, spec, query=None):
     qb = bson.encode(query) if query else None
-    res = _rust.apply_projection(bson.encode(doc), bson.encode(spec), qb)
+    db, sb = bson.encode(doc), bson.encode(spec)
+    res = _rust.apply_projection(db, sb, qb)
+    # Wherever the raw fast path claims a spec, it must produce the identical
+    # projected document as the full apply_projection (and never claim a spec
+    # the full path defers on) — every projection parity case thus also pins
+    # apply_projection_raw.
+    raw = _rust.apply_projection_raw(db, sb)
+    if raw is not None:
+        assert res is not None, f"raw fast-pathed but apply_projection deferred: spec={spec}"
+        assert bson.decode(raw) == bson.decode(res), (
+            f"apply_projection_raw != apply_projection doc={doc} spec={spec}"
+        )
     return None if res is None else bson.decode(res)
 
 
