@@ -30,15 +30,34 @@ set(WT_INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/wt-install)
 # invalidates the staged copy (and, through step ordering, the patch and
 # configure steps). Falls back to a marker when git is unavailable — an sdist
 # has no repo, and there the source cannot change under us anyway.
+# ``-C`` into a directory that is not itself a repository makes git walk UP to
+# the enclosing one, so with the submodule un-checked-out this silently
+# returned the PARENT project's HEAD — a value that changes on every commit,
+# which would re-copy and rebuild WiredTiger on each one. Confirm the toplevel
+# really is the submodule before trusting the answer.
 execute_process(
-    COMMAND git -C ${WT_SOURCE_DIR} rev-parse HEAD
-    OUTPUT_VARIABLE WT_SRC_SHA
+    COMMAND git -C ${WT_SOURCE_DIR} rev-parse --show-toplevel
+    OUTPUT_VARIABLE WT_SRC_TOPLEVEL
     OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE WT_SRC_SHA_RC
+    RESULT_VARIABLE WT_SRC_TOP_RC
     ERROR_QUIET
 )
-if(NOT WT_SRC_SHA_RC EQUAL 0 OR WT_SRC_SHA STREQUAL "")
-    set(WT_SRC_SHA "nogit")
+set(WT_SRC_SHA "nogit")
+if(WT_SRC_TOP_RC EQUAL 0)
+    get_filename_component(_wt_top "${WT_SRC_TOPLEVEL}" REALPATH)
+    get_filename_component(_wt_src "${WT_SOURCE_DIR}" REALPATH)
+    if(_wt_top STREQUAL _wt_src)
+        execute_process(
+            COMMAND git -C ${WT_SOURCE_DIR} rev-parse HEAD
+            OUTPUT_VARIABLE _wt_sha
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _wt_sha_rc
+            ERROR_QUIET
+        )
+        if(_wt_sha_rc EQUAL 0 AND NOT _wt_sha STREQUAL "")
+            set(WT_SRC_SHA "${_wt_sha}")
+        endif()
+    endif()
 endif()
 
 # mongodb-7.0.33's CMake adds -Werror at the WT-target level (cmake/strict/
