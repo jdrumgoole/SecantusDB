@@ -177,8 +177,28 @@ def _stage_match(
 def _stage_count(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    # mongod: the count field must be a non-empty string (40156/40157), not
+    # $-prefixed (40158), without a '.' (40160), and not "_id" (15948).
     if not isinstance(spec, str):
-        raise AggregateError("$count requires a field name string")
+        raise AggregateError(
+            "the count field must be a non-empty string", code=40156, code_name="Location40156"
+        )
+    if not spec:
+        raise AggregateError(
+            "the count field must be a non-empty string", code=40157, code_name="Location40157"
+        )
+    if spec.startswith("$"):
+        raise AggregateError(
+            "the count field cannot be a $-prefixed path", code=40158, code_name="Location40158"
+        )
+    if "." in spec:
+        raise AggregateError(
+            "the count field cannot contain '.'", code=40160, code_name="Location40160"
+        )
+    if spec == "_id":
+        raise AggregateError(
+            "a group's _id may only be specified once", code=15948, code_name="Location15948"
+        )
     return [{spec: len(docs)}]
 
 
@@ -288,6 +308,12 @@ def _stage_project(
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise AggregateError("$project requires a document spec")
+    if not spec:
+        raise AggregateError(
+            "projection specification must have at least one field",
+            code=51272,
+            code_name="Location51272",
+        )
     try:
         return [_project_one(d, spec, ctx.vars) for d in docs]
     except UnknownExpressionOperatorError as exc:
@@ -1814,9 +1840,39 @@ def _stage_sample(
     return rng.sample(list(docs), size)
 
 
+def _validate_sort_by_count_arg(spec: Any) -> None:
+    """mongod: the $sortByCount argument is a $-prefixed path string (40148) or an
+    expression object — a single `$`-prefixed key (40147); anything else (number,
+    bool, array, null) is 40149."""
+    if isinstance(spec, str):
+        if not spec.startswith("$"):
+            raise AggregateError(
+                "the sortByCount field must be defined as a $-prefixed path or an "
+                "expression inside an object",
+                code=40148,
+                code_name="Location40148",
+            )
+        return
+    if isinstance(spec, Mapping):
+        if len(spec) == 1 and str(next(iter(spec))).startswith("$"):
+            return
+        raise AggregateError(
+            "the sortByCount field must be defined as a $-prefixed path or an "
+            "expression inside an object",
+            code=40147,
+            code_name="Location40147",
+        )
+    raise AggregateError(
+        "the sortByCount field must be specified as a string or as an object",
+        code=40149,
+        code_name="Location40149",
+    )
+
+
 def _stage_sort_by_count(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    _validate_sort_by_count_arg(spec)
     grouped = _stage_group({"_id": spec, "count": {"$sum": 1}}, docs, ctx)
     grouped.sort(key=lambda d: d.get("count", 0), reverse=True)
     return grouped

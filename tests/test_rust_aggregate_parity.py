@@ -929,6 +929,57 @@ def test_unwind_invalid_defers_and_raises(spec, code):
     assert exc.value.code == code
 
 
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        (5, 40156),
+        ("", 40157),
+        ("$n", 40158),
+        ("a.b", 40160),
+        ("_id", 15948),
+    ],
+)
+def test_count_invalid_defers_and_raises(spec, code):
+    # Invalid $count: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1}, {"_id": 2}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$count": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
+def test_project_empty_defers_and_raises():
+    # Empty $project: Rust defers (None), pure engine raises Location51272.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$project": {}}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == 51272
+
+
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        (5, 40149),
+        (True, 40149),
+        ([1], 40149),
+        (None, 40149),
+        ("v", 40148),
+        ({"a": 1}, 40147),
+    ],
+)
+def test_sort_by_count_invalid_defers_and_raises(spec, code):
+    # Invalid $sortByCount: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "v": 1}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$sortByCount": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
 def _rand_scalar(rng):
     r = rng.random()
     if r < 0.3:

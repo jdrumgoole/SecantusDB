@@ -87,11 +87,11 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   14/5946802/5733403/5733402/6053600; `{step:1.5}` is mongod-valid, now computes);
   `$unwind` path/includeArrayIndex/preserve FIXED (#523, → 28808/28818/28810/28822/
   28809); `$sortByCount`
-  number/non-expr-doc/no-`$` accepted (40149/40147/40148); `$facet` empty/non-array/
+  number/non-expr-doc/no-`$` FIXED (#525, → 40149/40147/40148); `$facet` empty/non-array/
   non-object-stage/nested FIXED (#505, → 40169/40170/40171/40600); `$count`
-  ''/dotted/`$`-prefixed/`_id` accepted (40157/40160/40158/15948); `$sort`
-  bad-ordering/empty/`{v:true}` FIXED (#502, → 15975/15976/15974); `$project {}`
-  empty accepted (51272). (aggregate.py)
+  ''/dotted/`$`-prefixed/`_id`/non-string FIXED (#525, → 40157/40160/40158/15948/40156);
+  `$sort` bad-ordering/empty/`{v:true}` FIXED (#502, → 15975/15976/15974); `$project {}`
+  empty FIXED (#525, → 51272). (aggregate.py)
 
 ## Tier 3 — wrong error code (both error; SecantusDB returns 14 or None vs a Location code)
 

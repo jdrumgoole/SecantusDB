@@ -92,8 +92,12 @@ fn apply_stage(
         }
         "$count" => {
             let Bson::String(field) = spec else {
-                return Err(Fallback); // Python raises on non-string
+                return Err(Fallback); // Python raises on non-string (40156)
             };
+            // empty (40157) / $-prefixed (40158) / dotted (40160) / "_id" (15948).
+            if field.is_empty() || field.starts_with('$') || field.contains('.') || field == "_id" {
+                return Err(Fallback);
+            }
             let mut out = Document::new();
             out.insert(
                 field.clone(),
@@ -101,7 +105,13 @@ fn apply_stage(
             );
             Ok(vec![out])
         }
-        "$project" => map_docs(docs, |d| project_one(&d, spec_doc(spec)?, vars)),
+        "$project" => {
+            let sd = spec_doc(spec)?;
+            if sd.is_empty() {
+                return Err(Fallback); // Python raises 51272 (needs >= 1 field)
+            }
+            map_docs(docs, |d| project_one(&d, sd, vars))
+        }
         "$addFields" | "$set" => map_docs(docs, |d| add_fields_one(d, spec_doc(spec)?, vars)),
         "$unset" => {
             let paths_list = unset_paths(spec)?;

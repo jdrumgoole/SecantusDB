@@ -424,6 +424,57 @@ def test_facet_validation_codes() -> None:
     ]
 
 
+def test_count_validation_codes() -> None:
+    # mongod: the count field must be a non-empty string (40156/40157), not
+    # $-prefixed (40158), without a '.' (40160), and not "_id" (15948).
+    docs = [{"v": 1}, {"v": 2}, {"v": 3}]
+    for spec, code in [
+        (5, 40156),
+        ("", 40157),
+        ("$n", 40158),
+        ("a.b", 40160),
+        ("_id", 15948),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$count": spec}])
+        assert exc.value.code == code, spec
+    assert apply_pipeline([dict(d) for d in docs], [{"$count": "n"}]) == [{"n": 3}]
+
+
+def test_project_empty_spec_raises() -> None:
+    # mongod: a $project with no fields is Location51272.
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline([{"v": 1}], [{"$project": {}}])
+    assert exc.value.code == 51272
+
+
+def test_sort_by_count_validation_codes() -> None:
+    # mongod: a $-prefixed path string (40148) or a single-`$`-key expression
+    # object (40147); anything else (number/bool/array/null) is 40149.
+    docs = [{"v": 1}, {"v": 1}, {"v": 2}]
+    for spec, code in [
+        (5, 40149),
+        (True, 40149),
+        ([1], 40149),
+        (None, 40149),
+        ("v", 40148),
+        ({"a": 1}, 40147),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$sortByCount": spec}])
+        assert exc.value.code == code, spec
+    # A $-prefixed path string is valid.
+    assert apply_pipeline([dict(d) for d in docs], [{"$sortByCount": "$v"}]) == [
+        {"_id": 1, "count": 2},
+        {"_id": 2, "count": 1},
+    ]
+    # A single-`$`-key expression object is valid too.
+    assert apply_pipeline([dict(d) for d in docs], [{"$sortByCount": {"$add": ["$v", 1]}}]) == [
+        {"_id": 2, "count": 2},
+        {"_id": 3, "count": 1},
+    ]
+
+
 def test_bucket_basic_ranges() -> None:
     docs = [{"v": 1}, {"v": 5}, {"v": 12}, {"v": 25}, {"v": 99}]
     out = apply_pipeline(
