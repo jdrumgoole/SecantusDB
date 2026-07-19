@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import re
 from collections.abc import Mapping
 from typing import Any
 
 from secantus.numerics import bson_add, bson_mul
 from secantus.paths import get_path, has_path, set_path, unset_path
+
+_ARRAY_FILTER_TOKEN = re.compile(r"\$\[([^\]]*)\]")
+# An arrayFilter identifier: begins with a lowercase letter, then alphanumeric.
+_ARRAY_FILTER_IDENT = re.compile(r"^[a-z][a-zA-Z0-9]*$")
 
 
 class UpdateError(Exception):
@@ -255,6 +260,7 @@ def apply_update(
         return copy.deepcopy(doc)
     keys = list(update.keys())
     has_op = any(k.startswith("$") for k in keys)
+    _validate_array_filters(array_filters or [], update)
     filter_map = _index_array_filters(array_filters or [])
     pos = dict(positional_matches) if positional_matches else {}
     if has_op:
@@ -307,6 +313,92 @@ def find_positional_matches(doc: Mapping[str, Any], filter_: Mapping[str, Any]) 
                 out[path] = i
                 break
     return out
+
+
+def _array_filter_referenced_identifiers(update: Mapping[str, Any]) -> set[str]:
+    """Every arrayFilter identifier referenced by a ``$[<id>]`` token in any
+    update-operator field path (e.g. ``a.$[x].b`` references ``x``)."""
+    out: set[str] = set()
+    for payload in update.values():
+        if isinstance(payload, Mapping):
+            for path in payload:
+                out.update(_ARRAY_FILTER_TOKEN.findall(path))
+    return out
+
+
+def _render_update_for_error(update: Mapping[str, Any]) -> str:
+    """Render an operator update the way mongod prints it in the unused-array-filter
+    error, e.g. ``{ $set: { a.$[x]: 9 } }``."""
+
+    def val(v: Any) -> str:
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, str):
+            return f'"{v}"'
+        if v is None:
+            return "null"
+        return str(v)
+
+    parts: list[str] = []
+    for op, payload in update.items():
+        if isinstance(payload, Mapping):
+            inner = ", ".join(f"{k}: {val(x)}" for k, x in payload.items())
+            parts.append(f"{op}: {{ {inner} }}")
+        else:
+            parts.append(f"{op}: {val(payload)}")
+    return "{ " + ", ".join(parts) + " }"
+
+
+def _validate_array_filters(filters: list[Mapping[str, Any]], update: Mapping[str, Any]) -> None:
+    """mongod validates arrayFilters before applying: each must be an object
+    (14), have a top-level identifier (empty → 9), whose name is alphanumeric
+    beginning with a lowercase letter (2), unique across filters (9), and used by
+    a ``$[<id>]`` path in the update (9). A filter whose only top-level keys are
+    ``$``-operators (e.g. ``{$and: [{x: ...}]}``) carries a *nested* identifier
+    that SecantusDB doesn't extract yet — it's left unvalidated rather than
+    wrongly rejected (see tasks/backlog.md)."""
+    if not filters:
+        return
+    seen: set[str] = set()
+    identifiers: list[str] = []
+    for i, f in enumerate(filters):
+        if not isinstance(f, Mapping):
+            raise UpdateError(
+                f"BSON field 'update.updates.arrayFilters.{i}' is the wrong type "
+                f"'{_bson_type_name(f)}', expected type 'object'",
+                code=14,
+            )
+        top = [k.split(".", 1)[0] for k in f if not k.startswith("$")]
+        if not top:
+            if not f:
+                raise UpdateError(
+                    "Cannot use an expression without a top-level field name in arrayFilters",
+                    code=9,
+                )
+            continue  # nested identifier under $and/$or/… — left unvalidated
+        ident = top[0]
+        if not _ARRAY_FILTER_IDENT.match(ident):
+            raise UpdateError(
+                "Error parsing array filter :: caused by :: The top-level field name "
+                "must be an alphanumeric string beginning with a lowercase letter, "
+                f"found '{ident}'",
+                code=2,
+            )
+        if ident in seen:
+            raise UpdateError(
+                f"Found multiple array filters with the same top-level field name {ident}",
+                code=9,
+            )
+        seen.add(ident)
+        identifiers.append(ident)
+    referenced = _array_filter_referenced_identifiers(update)
+    for ident in identifiers:
+        if ident not in referenced:
+            raise UpdateError(
+                f"The array filter for identifier '{ident}' was not used in the update "
+                f"{_render_update_for_error(update)}",
+                code=9,
+            )
 
 
 def _index_array_filters(

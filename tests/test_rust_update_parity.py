@@ -447,3 +447,25 @@ def test_push_sort_invalid_defers_and_raises(spec):
     with pytest.raises(_pure.UpdateError) as exc:
         _pure.apply_update(doc, update)
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "af,code",
+    [
+        ([{}], 9),  # empty filter
+        ([{"1x": {"$gt": 0}}], 2),  # bad identifier (starts with a digit)
+        ([{"X": {"$gt": 0}}], 2),  # bad identifier (uppercase start)
+        ([{"x": {"$gt": 0}}, {"x": {"$lt": 9}}], 9),  # duplicate identifier
+        ([{"x": {"$gt": 0}}, {"y": {"$gt": 0}}], 9),  # 'y' unused
+    ],
+)
+def test_array_filters_invalid_defers_and_raises(af, code):
+    # Invalid arrayFilters: Rust defers (None) so the pure engine raises the
+    # exact code. Valid arrayFilters still compute (covered by the fuzz corpus).
+    doc = bson.decode(bson.encode({"a": [{"g": 1}, {"g": 5}]}))
+    update = bson.decode(bson.encode({"u": {"$set": {"a.$[x].g": 9}}}))["u"]
+    af = [bson.decode(bson.encode(f)) for f in af]
+    assert _rust_apply_with(doc, update, af) is None
+    with pytest.raises(_pure.UpdateError) as exc:
+        _pure.apply_update(doc, update, array_filters=af)
+    assert exc.value.code == code

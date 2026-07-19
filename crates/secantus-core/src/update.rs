@@ -88,6 +88,75 @@ fn rename_traverses_array(doc: &Document, path: &str) -> bool {
 // (`$`, `$[]`, `$[ident]`) is expanded against the current document into the
 // concrete index paths the operator then writes to.
 
+/// An arrayFilter identifier: begins with a lowercase ASCII letter, then ASCII
+/// alphanumerics (mirrors Python's `^[a-z][a-zA-Z0-9]*$`).
+fn is_valid_af_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Every arrayFilter identifier referenced by a `$[<id>]` token in an update
+/// path (mirrors `_array_filter_referenced_identifiers`).
+fn referenced_af_identifiers(update: &Document) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for value in update.values() {
+        if let Bson::Document(payload) = value {
+            for path in payload.keys() {
+                let mut rest = path.as_str();
+                while let Some(start) = rest.find("$[") {
+                    let after = &rest[start + 2..];
+                    if let Some(end) = after.find(']') {
+                        out.insert(after[..end].to_string());
+                        rest = &after[end + 1..];
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether the arrayFilters are valid per mongod (mirrors
+/// `_validate_array_filters`): each has a top-level identifier (empty defers),
+/// well-formed (bad name defers), unique (dup defers), and used by a `$[id]`
+/// path (unused defers). Invalid → the whole update defers so Python raises the
+/// exact code. A filter whose only top-level keys are `$`-operators carries a
+/// nested identifier SecantusDB doesn't extract; it's left for the apply path
+/// (which defers if the identifier is then unresolved), matching Python.
+fn array_filters_valid(filters: &[Document], update: &Document) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut identifiers: Vec<String> = Vec::new();
+    for f in filters {
+        let top: Vec<&str> = f
+            .keys()
+            .filter(|k| !k.starts_with('$'))
+            .map(|k| k.split('.').next().unwrap_or(k))
+            .collect();
+        if top.is_empty() {
+            if f.is_empty() {
+                return false; // empty {} -> Python raises code 9
+            }
+            continue; // nested $-op identifier -> left for the apply path
+        }
+        let ident = top[0];
+        if !is_valid_af_ident(ident) {
+            return false; // bad identifier -> Python raises code 2
+        }
+        if !seen.insert(ident.to_string()) {
+            return false; // duplicate identifier -> Python raises code 9
+        }
+        identifiers.push(ident.to_string());
+    }
+    let referenced = referenced_af_identifiers(update);
+    identifiers.iter().all(|id| referenced.contains(id))
+}
+
 /// Map each arrayFilter identifier (`{"x.score": {...}}` → `x`) to its filter
 /// document. First entry wins per identifier, as in Python.
 fn index_array_filters(filters: &[Document]) -> HashMap<String, &Document> {
@@ -766,6 +835,9 @@ pub fn apply_update_with(
 ) -> R<Document> {
     if update.is_empty() {
         return Ok(doc.clone());
+    }
+    if !array_filters_valid(array_filters, update) {
+        return Err(Fallback); // invalid arrayFilters -> Python raises the exact code
     }
     let has_op = update.keys().any(|k| k.starts_with('$'));
     if has_op {

@@ -1008,6 +1008,30 @@ def test_current_date_bool_false_via_pymongo(coll) -> None:
         assert exc.value.code == 2, opt
 
 
+def test_array_filters_validation_via_pymongo(coll) -> None:
+    """arrayFilters: a non-object filter (14), an empty filter (9), a bad
+    identifier (2), a duplicate identifier (9), and an unused identifier (9) are
+    rejected; a valid filter updates the matching elements. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure, WriteError
+
+    coll.insert_one({"_id": 1, "a": [{"g": 1}, {"g": 5}]})
+    upd = {"$set": {"a.$[x].g": 9}}
+    for af, code in [
+        (["x"], 14),
+        ([{}], 9),
+        ([{"1x": {"$gt": 0}}], 2),
+        ([{"X": {"$gt": 0}}], 2),
+        ([{"x": {"$gt": 0}}, {"x": {"$lt": 9}}], 9),
+        ([{"x": {"$gt": 0}}, {"y": {"$gt": 0}}], 9),
+    ]:
+        with pytest.raises((OperationFailure, WriteError)) as exc:
+            coll.update_one({"_id": 1}, upd, array_filters=af)
+        assert exc.value.code == code, af
+    # A valid filter updates the matching elements.
+    coll.update_one({"_id": 1}, upd, array_filters=[{"x.g": {"$gt": 3}}])
+    assert [e["g"] for e in coll.find_one({"_id": 1})["a"]] == [1, 9]
+
+
 def test_densify_validation_via_pymongo(coll) -> None:
     """$densify: date unit on numeric 6053600, bool step 14, non-positive step
     5733401, bad bounds string 5946802, wrong-length array 5733403, descending
