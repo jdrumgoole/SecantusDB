@@ -1850,3 +1850,27 @@ def test_date_arg_validation(tmp_path) -> None:
         assert list(coll.aggregate([{"$project": proj}])) == [{"r": _dt.datetime(2021, 1, 3)}]
     finally:
         srv.stop()
+
+
+def test_unwind_validation(tmp_path) -> None:
+    """The Rust server rejects an invalid $unwind (bare path, non-string / empty /
+    $-prefixed includeArrayIndex, non-bool preserve) instead of computing; a valid
+    $unwind still expands the array."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "a": [1, 2, 3]})
+        for spec in (
+            {"path": "a"},
+            {"path": 5},
+            {"path": "$a", "includeArrayIndex": 5},
+            {"path": "$a", "includeArrayIndex": ""},
+            {"path": "$a", "includeArrayIndex": "$i"},
+            {"path": "$a", "preserveNullAndEmptyArrays": 5},
+            "a",
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$unwind": spec}]))
+        assert len(list(coll.aggregate([{"$unwind": "$a"}]))) == 3
+    finally:
+        srv.stop()

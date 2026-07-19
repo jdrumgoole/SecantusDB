@@ -1524,6 +1524,25 @@ def test_aggregate_unwind_stage(coll) -> None:
     assert [d["tags"] for d in out] == ["a", "b", "c"]
 
 
+def test_aggregate_unwind_validation_via_pymongo(coll) -> None:
+    """$unwind: bare path 28818, non-string path 28808, non-string/empty index
+    28810, $-prefixed index 28822, non-bool preserve 28809. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "a": [1, 2, 3]})
+    for spec, code in [
+        ({"path": "a"}, 28818),
+        ({"path": 5}, 28808),
+        ({"path": "$a", "includeArrayIndex": 5}, 28810),
+        ({"path": "$a", "includeArrayIndex": "$i"}, 28822),
+        ({"path": "$a", "preserveNullAndEmptyArrays": 5}, 28809),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$unwind": spec}]))
+        assert exc.value.code == code, spec
+    assert len(list(coll.aggregate([{"$unwind": "$a"}]))) == 3
+
+
 def test_aggregate_group_with_avg(coll) -> None:
     coll.insert_many(
         [

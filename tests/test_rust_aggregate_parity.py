@@ -907,6 +907,28 @@ def test_facet_invalid_defers_and_raises(spec, code):
     assert exc.value.code == code
 
 
+@pytest.mark.parametrize(
+    "spec,code",
+    [
+        ({"path": "a"}, 28818),  # bare path (no $)
+        ({"path": 5}, 28808),  # non-string path
+        ({"path": "$a", "includeArrayIndex": 5}, 28810),  # non-string index
+        ({"path": "$a", "includeArrayIndex": ""}, 28810),  # empty index
+        ({"path": "$a", "includeArrayIndex": "$i"}, 28822),  # $-prefixed index
+        ({"path": "$a", "preserveNullAndEmptyArrays": 5}, 28809),  # non-bool preserve
+        ("a", 28818),  # bare string form
+    ],
+)
+def test_unwind_invalid_defers_and_raises(spec, code):
+    # Invalid $unwind: Rust defers (None), pure engine raises the mongod code.
+    docs = bson.decode(bson.encode({"d": [{"_id": 1, "a": [1, 2, 3]}]}))["d"]
+    pipeline = bson.decode(bson.encode({"p": [{"$unwind": spec}]}))["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
 def _rand_scalar(rng):
     r = rng.random()
     if r < 0.3:
