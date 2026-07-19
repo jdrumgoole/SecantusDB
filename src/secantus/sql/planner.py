@@ -700,9 +700,15 @@ def _is_field_node(node: exp.Expression) -> bool:
 
 
 def _json_keys(expr: exp.Expression) -> list[str]:
-    """Extract the path keys from a ->/#> right-hand side."""
+    """Extract the path keys from a ->/#> right-hand side. Integer subscripts
+    (``-> 1`` — a JSON array index) come back as their digit strings; the
+    evaluator's array branch converts them."""
     if isinstance(expr, exp.JSONPath):
-        return [p.this for p in expr.expressions if isinstance(p, exp.JSONPathKey)]
+        return [
+            str(p.this)
+            for p in expr.expressions
+            if isinstance(p, (exp.JSONPathKey, exp.JSONPathSubscript))
+        ]
     if isinstance(expr, exp.Literal):
         # ``#> '{a,b}'`` — a Postgres text[] path literal.
         return [k for k in str(expr.this).strip("{}").split(",") if k]
@@ -1597,6 +1603,8 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         pass
     fks = _extract_foreign_keys(schema, table_name)
     checks, uniques = _extract_constraints(schema, table_name)
+    props = stmt.args.get("properties")
+    is_temp = bool(props) and any(isinstance(p, exp.TemporaryProperty) for p in props.expressions)
     table = TableDef(
         name=table_name,
         collection=table_name,
@@ -1604,6 +1612,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         foreign_keys=fks,
         check_constraints=checks,
         unique_constraints=uniques,
+        temp=is_temp,
     )
     return CreateTablePlan(
         table=table, if_not_exists=bool(stmt.args.get("exists")), sequences=seq_plans
@@ -1752,10 +1761,13 @@ def _extract_constraints(
         if isinstance(coldef, exp.ColumnDef):  # column-level
             for con in coldef.args.get("constraints") or []:
                 kind = con.kind
+                # ``data int CONSTRAINT chk_eq1 CHECK (…)`` — the declared name
+                # rides the ColumnConstraint node.
+                declared = con.this.name if getattr(con, "this", None) is not None else None
                 if isinstance(kind, exp.CheckColumnConstraint):
-                    checks.append(make_check_constraint(kind, table_name, None, coldef.name))
+                    checks.append(make_check_constraint(kind, table_name, declared, coldef.name))
                 elif isinstance(kind, exp.UniqueColumnConstraint):
-                    uniques.append(make_unique_constraint(kind, table_name, None, coldef.name))
+                    uniques.append(make_unique_constraint(kind, table_name, declared, coldef.name))
         elif isinstance(coldef, exp.Constraint):  # CONSTRAINT <name> CHECK/UNIQUE (...)
             name = coldef.this.name if coldef.this else None
             for inner in coldef.args.get("expressions") or []:
@@ -3361,7 +3373,13 @@ def indeterminate_parameter(stmt: exp.Expression | None, oids: list[int]) -> int
     return None
 
 
-def infer_parameter_types(stmt: exp.Expression | None, declared: list[int]) -> list[int]:
+def infer_parameter_types(
+    stmt: exp.Expression | None,
+    declared: list[int],
+    *,
+    catalog: Any = None,
+    db: str | None = None,
+) -> list[int]:
     """Fill in undeclared (oid 0) parameter types from the statement's AST at
     Parse time, the way real Postgres' parse analysis does. A client that binds
     a value in BINARY format with no declared type (psycopg's ``Range(empty=
@@ -3373,6 +3391,43 @@ def infer_parameter_types(stmt: exp.Expression | None, declared: list[int]) -> l
         return declared
     count = parameter_count(stmt)
     oids = list(declared) + [0] * (count - len(declared))
+    # INSERT: an untyped parameter in a VALUES cell takes the target column's
+    # type, like PG's parse analysis (``insert into t (j) values ($1)`` with a
+    # jsonb column types $1 jsonb).
+    if isinstance(stmt, exp.Insert) and catalog is not None and db is not None:
+        schema = stmt.this
+        colnames: list[str] | None = None
+        tname = None
+        if isinstance(schema, exp.Schema):
+            tname = schema.this.name
+            colnames = [c.name for c in schema.expressions]
+        elif isinstance(schema, exp.Table):
+            tname = schema.name
+        table = catalog.get(db, tname) if tname else None
+        values = stmt.expression
+        if table is not None and isinstance(values, exp.Values):
+            if colnames is None:
+                colnames = [c.name for c in table.columns]
+            for tup in values.expressions:
+                cells = tup.expressions if isinstance(tup, exp.Tuple) else [tup]
+                for i, cell in enumerate(cells):
+                    while isinstance(cell, exp.Paren):
+                        cell = cell.this
+                    if not isinstance(cell, exp.Parameter) or i >= len(colnames):
+                        continue
+                    try:
+                        idx = int(cell.name) - 1
+                    except (TypeError, ValueError):
+                        continue
+                    if not 0 <= idx < count or oids[idx]:
+                        continue
+                    col = table.column(colnames[i])
+                    if col is not None:
+                        oids[idx] = (
+                            114
+                            if getattr(col, "json_plain", False)
+                            else typemap.PG_OID.get(col.type_tag, 0)
+                        )
     for param in stmt.find_all(exp.Parameter):
         try:
             idx = int(param.name) - 1
@@ -8789,6 +8844,11 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         node, resolve
     ):
         return "text"
+    # ``->`` / ``#>`` keep jsonb; ``->>`` / ``#>>`` return text.
+    if isinstance(node, exp.JSONExtractScalar):
+        return "text"
+    if isinstance(node, exp.JSONExtract):
+        return "json"
     if isinstance(node, exp.DPipe) and _has_hstore_operand(node, resolve):
         return "hstore"
     # Postgres array operators: ``@>`` / ``<@`` / ``&&`` over an array operand -> bool.
@@ -9607,6 +9667,15 @@ _SET_TRANSACTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A LISTEN / NOTIFY / UNLISTEN statement head (single statement only).
+_PUBSUB_HEAD_RE = re.compile(r"^\s*(?:LISTEN|UNLISTEN|NOTIFY)\b[^;]*;?\s*$", re.IGNORECASE)
+
+# ``DO $tag$ body $tag$ [LANGUAGE plpgsql]`` — the dollar-quoted body.
+_DO_BLOCK_RE = re.compile(
+    r"(?is)^\s*DO\s+(?:LANGUAGE\s+\w+\s+)?\$(?P<tag>[A-Za-z_]*)\$(?P<body>.*?)\$(?P=tag)\$"
+    r"(?:\s+LANGUAGE\s+\w+)?\s*;?\s*$"
+)
+
 
 #: Reject a statement string longer than this before handing it to sqlglot. 1 MB
 #: is far larger than any real query yet small enough that a flood of oversized
@@ -9774,6 +9843,16 @@ def parse(sql: str) -> list[exp.Expression]:
     begin = _BEGIN_CHARACTERISTICS_RE.match(sql)
     if begin is not None:
         return [exp.Transaction(modes=[begin.group("tail")])]
+    # LISTEN / NOTIFY / UNLISTEN — sqlglot mis-parses these; carry the raw text
+    # as a Command the engine's pubsub handler executes. (run_sql intercepts
+    # them pre-parse; this covers the extended-protocol Parse path.)
+    if _PUBSUB_HEAD_RE.match(sql):
+        return [exp.Command(this="PUBSUB", expression=exp.Literal.string(sql))]
+    # ``DO $$ … $$ [language plpgsql]`` — the body is handled by the engine's
+    # minimal plpgsql interpreter (RAISE notices/exceptions).
+    do_m = _DO_BLOCK_RE.match(sql)
+    if do_m is not None:
+        return [exp.Command(this="DO", expression=exp.Literal.string(do_m.group("body")))]
     # ``SET TRANSACTION <characteristics>`` — sqlglot rejects some spellings
     # (``SET TRANSACTION DEFERRABLE``); route every form to the Command SET
     # handler, which applies the characteristics to the open transaction.
@@ -9812,7 +9891,7 @@ def parse(sql: str) -> list[exp.Expression]:
         for s in stmts:
             _resolve_group_by_ordinals(s)
         return stmts
-    except sqlglot.errors.ParseError as exc:
+    except (sqlglot.errors.ParseError, sqlglot.errors.TokenError) as exc:
         raise errors.syntax_error(str(exc).splitlines()[0]) from exc
     except RecursionError as exc:
         # A deeply-nested statement (e.g. hundreds of parentheses) blows Python's

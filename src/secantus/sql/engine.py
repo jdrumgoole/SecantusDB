@@ -1729,7 +1729,7 @@ def _run_statement(
             # via pg_auth_members (#138); other privilege grants that fell back to a
             # Command (e.g. ``GRANT USAGE ON SCHEMA``) aren't enforced — accept no-op.
             return _run_role_membership(verb, stmt, db, catalog, session)
-        return _run_command(stmt, session)
+        return _run_command(stmt, session, storage, db, catalog)
 
     if isinstance(stmt, exp.Grant):
         return _run_grant(stmt, storage, db, catalog, revoke=False)
@@ -1900,10 +1900,19 @@ def _deallocate_statement(target: str, session: Session) -> SQLResult:
     """``DEALLOCATE name`` forgets one prepared statement; ``DEALLOCATE ALL`` clears
     them all. Unlike Postgres, deallocating an unknown name is a silent no-op here
     (libpq/psycopg fire speculative DEALLOCATEs during connection cleanup)."""
+    wire = getattr(session, "wire_prepared", None)
     if target.upper() == "ALL":
         session.prepared.clear()
+        if wire is not None:
+            # The extended protocol's server-side prepared statements clear
+            # too — psycopg sends DEALLOCATE ALL after DDL to invalidate its
+            # cache, and pg_prepared_statements must reflect it.
+            wire.clear()
     else:
-        session.prepared.pop(_unquote_ident(target), None)
+        name = _unquote_ident(target)
+        session.prepared.pop(name, None)
+        if wire is not None:
+            wire.pop(name, None)
     return SQLResult(command_tag="DEALLOCATE")
 
 
@@ -4193,8 +4202,119 @@ _SET_MULTI_RE = re.compile(
 )
 
 
-def _run_command(stmt: exp.Command, session: Session) -> SQLResult:
+# ``RAISE level 'fmt'[, arg…] [USING option = 'value', …];`` inside a DO body.
+_RAISE_RE = re.compile(
+    r"(?is)\braise\s+(?P<level>debug|log|info|notice|warning|exception)\s+"
+    r"'(?P<fmt>(?:[^']|'')*)'\s*(?P<args>(?:,[^;]*?)?)\s*"
+    r"(?:using\s+(?P<using>[^;]*?))?\s*;"
+)
+
+
+def _run_do_block(
+    body: str,
+    session: Session,
+    storage: Any = None,
+    db: str | None = None,
+    catalog: Catalog | None = None,
+) -> SQLResult:
+    """A minimal plpgsql interpreter for ``DO`` blocks: executes each ``RAISE``
+    statement in the body — notices/warnings collect on the result (the wire
+    layer sends NoticeResponse messages), an EXCEPTION raises with its USING
+    ERRCODE (default P0001 raise_exception). Anything else in the body is
+    ignored (BEGIN/END scaffolding)."""
+    from secantus.sql import scalar
+
+    notices: list[tuple[str, str]] = []
+    ctx = scalar.ScalarContext(storage=None, catalog=None, db=session.database, session=session)
+    # ``EXECUTE <string expr>;`` — dynamic SQL: evaluate the expression
+    # (``format('insert into "%s" …', chr(8364))``) and run the result, so
+    # errors from the dynamic statement surface with their real SQLSTATE.
+    if storage is not None and db is not None:
+        for em in re.finditer(r"(?is)\bexecute\s+(?P<expr>[^;]+);", body):
+            try:
+                node = sqlglot.parse_one(f"SELECT {em.group('expr')}", read="postgres").expressions[
+                    0
+                ]
+                dyn_sql = scalar.evaluate(node, planner._const_scope, ctx)
+            except errors.SQLError:
+                raise
+            except Exception:  # noqa: BLE001 — unevaluable EXECUTE arg
+                continue
+            if dyn_sql:
+                run_sql(storage, db, str(dyn_sql), session=session)
+    for m in _RAISE_RE.finditer(body):
+        level = m.group("level").upper()
+        fmt = m.group("fmt").replace("''", "'")
+        args_text = (m.group("args") or "").lstrip(",").strip()
+        arg_values: list[str] = []
+        if args_text:
+            for part in _split_top_level_commas(args_text):
+                try:
+                    node = sqlglot.parse_one(f"SELECT {part}", read="postgres").expressions[0]
+                    val = scalar.evaluate(node, planner._const_scope, ctx)
+                except Exception:  # noqa: BLE001 — a bad arg renders as its text
+                    val = part
+                arg_values.append("" if val is None else str(val))
+        message = fmt
+        for val in arg_values:
+            message = message.replace("%", val, 1)
+        if level == "EXCEPTION":
+            errcode = "P0001"  # raise_exception
+            using = m.group("using") or ""
+            code_m = re.search(r"(?i)errcode\s*=\s*'([^']+)'", using)
+            if code_m is not None:
+                errcode = code_m.group(1)
+            raise errors.SQLError(errcode, message)
+        if level in ("NOTICE", "WARNING", "INFO"):
+            notices.append((level, message))
+        # DEBUG/LOG stay server-side, like PG's default client_min_messages.
+    return SQLResult(command_tag="DO", notices=notices)
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    parts, depth, buf = [], 0, []
+    in_str = False
+    for ch in text:
+        if in_str:
+            buf.append(ch)
+            if ch == "'":
+                in_str = False
+            continue
+        if ch == "'":
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf).strip())
+    return parts
+
+
+def _run_command(
+    stmt: exp.Command,
+    session: Session,
+    storage: Any = None,
+    db: str | None = None,
+    catalog: Catalog | None = None,
+) -> SQLResult:
     verb = str(stmt.this).upper()
+    if verb == "DO":
+        raw = stmt.expression.this if isinstance(stmt.expression, exp.Literal) else ""
+        return _run_do_block(str(raw), session, storage, db, catalog)
+    if verb == "PUBSUB":
+        # LISTEN / NOTIFY / UNLISTEN routed through parse() (the extended
+        # protocol's Parse path — run_sql intercepts them before parsing).
+        raw = stmt.expression.this if isinstance(stmt.expression, exp.Literal) else ""
+        handled = _maybe_pubsub(str(raw), session)
+        if handled is not None:
+            return handled
+        raise errors.syntax_error(f'syntax error at or near "{str(raw)[:40]}"')
     arg = stmt.expression
     if isinstance(arg, exp.Literal):
         name = arg.this

@@ -2061,6 +2061,13 @@ def _column_name_of(node: exp.Expression) -> str:
 
 def _eval_typed_func(node: exp.Func, scope: Scope, ctx: ScalarContext) -> Any:
     name = node.sql_name().lower()
+    if name == "format":
+        # sqlglot models ``format(fmt, args…)`` as exp.Format (fmt in .this,
+        # the rest in .expressions) — reassemble the full arg list.
+        args = [evaluate(node.this, scope, ctx)] + [
+            evaluate(a, scope, ctx) for a in node.expressions if isinstance(a, exp.Expression)
+        ]
+        return _call_func("format", args, ctx)
     args = [evaluate(a, scope, ctx) for a in node.expressions if isinstance(a, exp.Expression)]
     return _call_func(name, args, ctx)
 
@@ -2595,6 +2602,43 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         udf = ctx.catalog.get_function(ctx.db, name, len(args))
         if udf is not None:
             return _invoke_udf(udf, args, ctx)
+    if name == "format" and args:
+        # ``format('%s / %I / %L', …)`` — PG's string-format function (used by
+        # dynamic-SQL DO blocks); %I quotes an identifier, %L a literal.
+        fmt = _as_text(args[0])
+        rest = list(args[1:])
+        out: list[str] = []
+        i = 0
+        while i < len(fmt):
+            c = fmt[i]
+            if c == "%" and i + 1 < len(fmt):
+                spec = fmt[i + 1]
+                if spec == "%":
+                    out.append("%")
+                    i += 2
+                    continue
+                if spec in "sIL":
+                    val = rest.pop(0) if rest else None
+                    if spec == "s":
+                        out.append("" if val is None else _as_text(val))
+                    elif spec == "I":
+                        ident = "" if val is None else _as_text(val)
+                        out.append('"' + ident.replace('"', '""') + '"')
+                    else:
+                        out.append(
+                            "NULL" if val is None else "'" + _as_text(val).replace("'", "''") + "'"
+                        )
+                    i += 2
+                    continue
+            out.append(c)
+            i += 1
+        return "".join(out)
+    if name in ("pg_terminate_backend", "pg_cancel_backend", "pg_backend_pid") and ctx is not None:
+        # Works in any expression context (``select pg_terminate_backend(pid)
+        # from pg_stat_activity where …``), not just the constant path.
+        from secantus.sql import functions as _functions
+
+        return _functions.evaluate_scalar_by_name(name, args, ctx.session)
     raise errors.feature_not_supported(f"function {name}() is not supported in this context")
 
 

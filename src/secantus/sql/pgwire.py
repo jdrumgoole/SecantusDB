@@ -391,11 +391,45 @@ def empty_query_response() -> bytes:
 
 
 def error_response(
-    sqlstate: str, message: str, severity: str = "ERROR", encoding: str | None = "utf-8"
+    sqlstate: str,
+    message: str,
+    severity: str = "ERROR",
+    encoding: str | None = "utf-8",
+    *,
+    diag: dict[str, str] | None = None,
+    position: int | None = None,
 ) -> bytes:
     # ErrorResponse is a sequence of (field-type byte, value cstring), ending
     # with a single NUL. S/V severity, C SQLSTATE, M human message are the
-    # minimum libpq surfaces.
+    # minimum libpq surfaces; ``diag`` adds the optional identity fields
+    # (s=schema, t=table, c=column, n=constraint, d=datatype) and ``position``
+    # the 1-based statement position (clients render the LINE context from it).
+    payload = bytearray(
+        b"S"
+        + _cstr(severity)
+        + b"V"
+        + _cstr(severity)
+        + b"C"
+        + _cstr(sqlstate)
+        + b"M"
+        + encode_text(message, encoding, lossy=True)
+        + b"\x00"
+    )
+    for key, value in (diag or {}).items():
+        if value:
+            payload += key.encode("ascii") + encode_text(str(value), encoding, lossy=True) + b"\x00"
+    if position is not None and position > 0:
+        payload += b"P" + _cstr(str(position))
+    payload += b"\x00"
+    return _msg("E", bytes(payload))
+
+
+def notice_response(
+    message: str,
+    severity: str = "NOTICE",
+    sqlstate: str = "00000",
+    encoding: str | None = "utf-8",
+) -> bytes:
     payload = (
         b"S"
         + _cstr(severity)
@@ -408,11 +442,6 @@ def error_response(
         + b"\x00"
         + b"\x00"
     )
-    return _msg("E", payload)
-
-
-def notice_response(message: str) -> bytes:
-    payload = b"S" + _cstr("NOTICE") + b"M" + _cstr(message) + b"\x00"
     return _msg("N", payload)
 
 

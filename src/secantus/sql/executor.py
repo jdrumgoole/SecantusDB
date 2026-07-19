@@ -727,6 +727,7 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
                 "23502",
                 f'null value in column "{col.name}" of relation "{table.name}" '
                 "violates not-null constraint",
+                diag={"s": _table_schema(table), "t": table.name, "c": col.name},
             )
     if not table.check_constraints:
         return
@@ -741,7 +742,12 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
             raise errors.SQLError(
                 "23514",
                 f'new row for relation "{table.name}" violates check constraint "{ck.name}"',
+                diag={"s": _table_schema(table), "t": table.name, "n": ck.name},
             )
+
+
+def _table_schema(table: Any) -> str:
+    return "pg_temp_1" if getattr(table, "temp", False) else "public"
 
 
 def _validate_check_option(

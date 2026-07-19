@@ -41,3 +41,6 @@ class SQLResult:
     # GUCs to echo back as ParameterStatus messages (set by ``SET`` on a
     # reportable parameter). Empty for everything else.
     parameter_status: list[tuple[str, str]] = field(default_factory=list)
+    # NOTICE/WARNING messages to send ahead of the result (``DO $$ … RAISE
+    # NOTICE …$$``): ``(severity, message)`` pairs.
+    notices: list[tuple[str, str]] = field(default_factory=list)

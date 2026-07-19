@@ -221,6 +221,8 @@ class TableDef:
     # resolves to a field of the same name, and an un-sampled column reads as
     # the permissive ``any`` type rather than erroring.
     reflected: bool = False
+    # CREATE TEMP TABLE — reflected in error diagnostics (schema pg_temp_1).
+    temp: bool = False
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     check_constraints: list[CheckConstraint] = field(default_factory=list)
     unique_constraints: list[UniqueConstraint] = field(default_factory=list)
@@ -310,6 +312,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
             for c in table.columns
         ],
         "comment": table.comment,
+        "temp": table.temp,
         "foreign_keys": [
             {
                 "name": fk.name,
@@ -375,6 +378,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
             for c in doc["columns"]
         ],
         comment=doc.get("comment"),
+        temp=bool(doc.get("temp", False)),
         foreign_keys=[
             ForeignKey(
                 name=fk["name"],

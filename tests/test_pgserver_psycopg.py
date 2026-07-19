@@ -983,6 +983,49 @@ def test_group_by_ordinal_over_wire(server):
         assert rows == [("a", 2), ("b", 1)]
 
 
+def test_do_block_raise_and_notices(server):
+    """Minimal plpgsql DO blocks: RAISE NOTICE/WARNING surface as psycopg
+    notices, RAISE EXCEPTION raises with its USING ERRCODE, and EXECUTE
+    format(…) runs dynamic SQL whose errors keep their real SQLSTATE."""
+    with connect(server, autocommit=True) as conn:
+        messages = []
+        conn.add_notice_handler(lambda d: messages.append((d.severity, d.message_primary)))
+        conn.execute("do $$begin raise notice 'hello %', 42; end$$ language plpgsql")
+        assert ("NOTICE", "hello 42") in messages
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute("do $$begin raise exception 'boom'; end$$ language plpgsql")
+        with pytest.raises(psycopg.Error) as ei:
+            conn.execute("do $$begin raise exception 'custom' using errcode = 'PXX99'; end$$")
+        assert ei.value.sqlstate == "PXX99"
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            conn.execute("do $$begin execute format('insert into %I values (1)', 'nope'); end$$")
+
+
+def test_pg_terminate_backend_via_wire(server):
+    # The kill effect (socket teardown) is exercised by the gauge's
+    # isolated-subprocess connection tests; here we pin the deterministic
+    # return-value logic (a live backend -> True, a bogus pid -> False),
+    # which is race-free in the in-process shared-worker fixture.
+    with connect(server, autocommit=True) as victim, connect(server, autocommit=True) as killer:
+        pid = victim.execute("select pg_backend_pid()").fetchone()[0]
+        assert killer.execute(f"select pg_terminate_backend({pid})").fetchone() == (True,)
+        assert killer.execute("select pg_terminate_backend(999999)").fetchone() == (False,)
+
+
+def test_prepared_statement_introspection(server):
+    """pg_prepared_statements reports the ORIGINAL query text, real
+    prepare_time, and the parameter types; DEALLOCATE ALL clears the
+    wire-prepared registry."""
+    with connect(server, autocommit=True) as conn:
+        conn.execute("select %s::date", ("2021-01-01",), prepare=True)
+        rows = conn.execute(
+            "select statement, parameter_types from pg_prepared_statements"
+        ).fetchall()
+        assert rows == [("select %s::date".replace("%s", "$1"), ["date"])]
+        conn.execute("deallocate all")
+        assert conn.execute("select count(*) from pg_prepared_statements").fetchone() == (0,)
+
+
 def test_jsonb_roundtrip_and_navigation(server):
     """jsonb values parse at ingress: a cast or Json/Jsonb-wrapped parameter
     loads back as a Python dict/list (not double-encoded text), ``->>``

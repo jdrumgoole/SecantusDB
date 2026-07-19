@@ -75,6 +75,17 @@ _INTERNAL_ERROR_MSG = "internal error"
 _PGCOPY_SIGNATURE = b"PGCOPY\n\xff\r\n\x00"
 
 
+def _error_position(exc: Any, sql: str) -> int | None:
+    """A best-effort 1-based statement position for a name error: the offset of
+    the quoted identifier the message cites (clients render the ``LINE 1: …``
+    context from it, like real PG's parse-analysis errors)."""
+    m = __import__("re").search(r'"([^"]+)"', getattr(exc, "message", "") or "")
+    if m is None:
+        return None
+    idx = sql.find(m.group(1))
+    return idx + 1 if idx >= 0 else None
+
+
 def _parse_binary_copy(
     data: bytes, col_oids: list[int], ncols: int, encoding: str | None
 ) -> list[list]:
@@ -376,6 +387,18 @@ class SecantusPGServer:
         session.activity_registry = self._activity
         session.prepared_xacts = self._prepared_xacts
         session.backend_start = _dt.datetime.now(_dt.timezone.utc)
+
+        def _terminate(sock: socket.socket = conn) -> None:
+            # pg_terminate_backend: signal the target connection's blocked
+            # recv to return by shutting the socket down for reading. The
+            # target's OWN handler thread then unwinds and closes the fd (its
+            # ``with conn:`` block) — closing the socket from this foreign
+            # thread is unsafe on Windows (a pending recv in the other thread
+            # can crash Winsock).
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RD)
+
+        session.terminate_cb = _terminate
         if self._authz_active:
             session.authz_active = True
             session.roles = self._users.roles_for(user)
@@ -533,7 +556,13 @@ class SecantusPGServer:
                 for res in results:
                     out += _render_result(res, session.wire_encoding, session)
         except errors.SQLError as exc:
-            out += pgwire.error_response(exc.sqlstate, exc.message, encoding=session.wire_encoding)
+            out += pgwire.error_response(
+                exc.sqlstate,
+                exc.message,
+                encoding=session.wire_encoding,
+                diag=getattr(exc, "diag", None),
+                position=getattr(exc, "position", None) or _error_position(exc, sql),
+            )
         except Exception:  # pragma: no cover - defensive
             logger.exception("error executing SQL")
             # Don't leak the raw Python exception text to the wire client — the
@@ -727,6 +756,13 @@ class SecantusPGServer:
 def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None) -> bytes:
     """Serialise one ``SQLResult`` to its backend messages."""
     out = bytearray()
+    for severity, message in getattr(res, "notices", ()) or ():
+        out += pgwire.notice_response(
+            message,
+            severity=severity,
+            sqlstate="01000" if severity == "WARNING" else "00000",
+            encoding=encoding,
+        )
     status = list(res.parameter_status)
     if session is not None and session.pending_parameter_status:
         # Reportable GUCs changed mid-statement by set_config().

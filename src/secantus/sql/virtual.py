@@ -1460,6 +1460,12 @@ def _pg_prepared_statements(
 ) -> list[dict]:
     """``pg_catalog.pg_prepared_statements`` — SQL-level ``PREPARE``d statements
     plus this connection's wire-level (extended Parse) ones."""
+
+    def _regtype_names(oids: Any) -> list[str]:
+        # An unresolved (0) parameter reports ``text`` — PG's parse analysis
+        # defaults unknowns to text by Describe time.
+        return [typemap.regtype_from_oid(o or 25) or "text" for o in (oids or [])]
+
     rows = []
     for name, entry in (getattr(session, "prepared", None) or {}).items():
         stmt = entry[0] if isinstance(entry, tuple) else entry
@@ -1468,8 +1474,8 @@ def _pg_prepared_statements(
             {
                 "name": name,
                 "statement": f"PREPARE {name} AS {text}",
-                "prepare_time": None,
-                "parameter_types": None,
+                "prepare_time": getattr(session, "backend_start", None),
+                "parameter_types": [],
                 "from_sql": True,
             }
         )
@@ -1477,12 +1483,18 @@ def _pg_prepared_statements(
         if not name:
             continue  # the unnamed statement isn't listed
         stmt = getattr(prep, "stmt", None)
+        # The ORIGINAL query text, exactly as parsed (psycopg matches its own
+        # cache keys against it; a re-render changes keyword case).
+        text = getattr(prep, "query", "") or (
+            stmt.sql(dialect="postgres") if stmt is not None else ""
+        )
         rows.append(
             {
                 "name": name,
-                "statement": stmt.sql(dialect="postgres") if stmt is not None else "",
-                "prepare_time": None,
-                "parameter_types": None,
+                "statement": text,
+                "prepare_time": getattr(prep, "created", None)
+                or getattr(session, "backend_start", None),
+                "parameter_types": _regtype_names(getattr(prep, "param_oids", ())),
                 "from_sql": False,
             }
         )
@@ -2455,7 +2467,7 @@ _register(
         ("name", "text"),
         ("statement", "text"),
         ("prepare_time", "timestamptz"),
-        ("parameter_types", "text"),
+        ("parameter_types", "text[]"),
         ("from_sql", "bool"),
     ],
     _pg_prepared_statements,
