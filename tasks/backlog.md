@@ -3960,3 +3960,24 @@ gauge with `-n0` to get an in-process traceback), then bisect which preceding
 test leaves the state that kills the worker. Until diagnosed this inflates the
 published pymongo-async failure count by one (39 vs 38 at the previous
 release's artifacts).
+
+## `validate-all` runs the java and kotlin gauges concurrently (2026-07-20)
+
+Both gauges drive Gradle in the **same** vendored monorepo
+(`vendor/mongo-java-driver` — the Kotlin driver ships inside the Java driver's
+repo). At the default `--jobs 4` they are scheduled concurrently, and the two
+Gradle builds contend on the shared project directory / build outputs. Observed
+2026-07-20: `validate-all --jobs 4` reported `kotlin FAILED (rc=1)` with
+`no JUnit XML written (gradle exit 1; build error?)` — a build failure, not test
+failures. Re-running `invoke validate-kotlin` serially immediately afterwards
+gave `294 passed, 0 failed, 244 skipped` and `BUILD SUCCESSFUL`.
+
+The runner already special-cases `validate-cxx` (must stay serial because
+mongocxx hard-wires port 27017). java + kotlin need the same treatment, but for
+a different reason: shared Gradle project state rather than a port. Fix is to
+make the two mutually exclusive in the thread-pool scheduling (a shared lock
+keyed on the vendored repo) so the pair can still run alongside other gauges but
+never alongside each other.
+
+Until then, a `kotlin FAILED` from `validate-all` should be re-checked serially
+before it is believed — and the same caveat applies to `java`.

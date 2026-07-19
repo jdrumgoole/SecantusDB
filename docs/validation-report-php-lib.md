@@ -1,6 +1,6 @@
 # mongo-php-library Validation Report
 
-Generated 2026-07-16 — SecantusDB 0.5.4b234 vs mongo-php-library 12e56461166d (`vendor/mongo-php-library/`).
+Generated 2026-07-19 — SecantusDB 0.6.0b0 vs mongo-php-library 12e56461166d (`vendor/mongo-php-library/`).
 
 Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges for the official high-level PHP library — the `mongodb/mongodb` package Laravel + Symfony applications build on.
 
@@ -9,18 +9,18 @@ Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the 
 | Category | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `tests/Builder` | 732 | 0 | 0 | 732 | 100.0% |
-| `tests/Collection` | 125 | 34 | 1 | 160 | 78.6% |
+| `tests/Collection` | 124 | 35 | 1 | 160 | 78.0% |
 | `tests/Command` | 53 | 0 | 0 | 53 | 100.0% |
 | `tests/Comparator` | 31 | 0 | 0 | 31 | 100.0% |
 | `tests/Database` | 70 | 0 | 0 | 70 | 100.0% |
 | `tests/Functions` | 0 | 2 | 2 | 4 | 0.0% |
 | `tests/Model` | 141 | 1 | 0 | 142 | 99.3% |
 | `tests/Operation` | 1898 | 4 | 36 | 1938 | 99.8% |
-| **Overall** | **3050** | **41** | **39** | **3130** | **98.7%** |
+| **Overall** | **3049** | **42** | **39** | **3130** | **98.6%** |
 
-Run time: 4.60s.
+Run time: 3.08s.
 
-## Failures (41)
+## Failures (42)
 
 First 30 failed cases for triage:
 
@@ -29,6 +29,7 @@ tests/Operation :: MongoDB\Tests\Operation\AggregateFunctionalTest::testReadPref
 tests/Operation :: MongoDB\Tests\Operation\FindFunctionalTest::testMaxAwaitTimeMS
 tests/Operation :: MongoDB\Tests\Operation\FindFunctionalTest::testReadPreferenceWithinTransaction
 tests/Operation :: MongoDB\Tests\Operation\WatchFunctionalTest::testResumeTokenInvalidTypeServerSideError
+tests/Collection :: MongoDB\Tests\Collection\CodecCollectionFunctionalTest::testFindOneAndReplace with data set "BSON type map"
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testAggregateWithinTransaction
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testFindWithinTransaction
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "read-only aggregate"
@@ -54,9 +55,8 @@ tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMetho
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "findOneAndReplace"
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "findOneAndUpdate"
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "insertMany"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "insertOne"
 ```
-... and 11 more (see JUnit XML).
+... and 12 more (see JUnit XML).
 
 ## How this is generated
 

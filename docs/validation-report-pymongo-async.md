@@ -1,6 +1,6 @@
 # pymongo async Validation Report
 
-Generated 2026-07-16 — SecantusDB 0.5.4b234 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
+Generated 2026-07-20 — SecantusDB 0.6.0b0 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
 
 Run `uv run python -m invoke validate-pymongo-async` to refresh. This is the async sibling of the headline pymongo gauge: it drives pymongo's native `AsyncMongoClient` API (the async/await wire path that replaced Motor) over the same in-scope CRUD / cursor / change-stream / command-monitoring surface. A gap versus `docs/validation-report.md` means the async code path exercises something the sync path doesn't.
 
@@ -8,10 +8,10 @@ Run `uv run python -m invoke validate-pymongo-async` to refresh. This is the asy
 
 | Test file | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
-| `test_bulk.py` | 33 | 1 | 0 | 4 | 38 | 97.1% |
+| `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
 | `test_change_stream.py` | 97 | 0 | 0 | 58 | 155 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
-| `test_collection.py` | 85 | 2 | 0 | 4 | 91 | 97.7% |
+| `test_collection.py` | 84 | 3 | 0 | 4 | 91 | 96.6% |
 | `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
 | `test_command_monitoring.py` | 31 | 0 | 0 | 7 | 38 | 100.0% |
@@ -35,13 +35,13 @@ Run `uv run python -m invoke validate-pymongo-async` to refresh. This is the asy
 First 30 failure node-ids for manual triage:
 
 ```
-vendor/pymongo-tests/test/asynchronous/test_bulk.py::AsyncTestBulk::test_numerous_inserts
 vendor/pymongo-tests/test/asynchronous/test_collection.py::AsyncTestCollection::test_index_hashed
 vendor/pymongo-tests/test/asynchronous/test_collection.py::AsyncTestCollection::test_index_text
+vendor/pymongo-tests/test/asynchronous/test_collection.py::AsyncTestCollection::test_numerous_inserts
 vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_maxtime_ms_message
 vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_to_list_csot_applied
+vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_to_list_length
 vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_where
-vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestRawBatchCursor::test_collation
 vendor/pymongo-tests/test/asynchronous/test_logger.py::TestLogger::test_default_truncation_limit
 vendor/pymongo-tests/test/asynchronous/test_read_preferences.py::TestMongosAndReadPreference::test_read_preference_hedge_deprecated
 ```

@@ -1,6 +1,6 @@
 # mongo-kotlin-driver Validation Report
 
-Generated 2026-07-16 — SecantusDB 0.5.4b234 vs mongo-kotlin-driver cb45be6bb147 (`vendor/mongo-java-driver/driver-kotlin-sync/`).
+Generated 2026-07-20 — SecantusDB 0.6.0b0 vs mongo-kotlin-driver cb45be6bb147 (`vendor/mongo-java-driver/driver-kotlin-sync/`).
 
 Run `uv run python -m invoke validate-kotlin` to refresh. This is the official MongoDB **Kotlin** driver gauge — the Kotlin sync client (which ships in the mongo-java-driver monorepo) exercised end-to-end against a standalone SecantusDB daemon.
 

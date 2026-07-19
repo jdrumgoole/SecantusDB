@@ -1,6 +1,6 @@
 # mongo-node-driver Validation Report
 
-Generated 2026-07-16 — SecantusDB 0.5.4b234 vs mongo-node-driver 7e53685952f2 (`vendor/node-mongodb-native/`).
+Generated 2026-07-19 — SecantusDB 0.6.0b0 vs mongo-node-driver 7e53685952f2 (`vendor/node-mongodb-native/`).
 
 Run `uv run python -m invoke validate-node` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver gauges for the official Node.js driver — the same driver `mongosh` and the JavaScript ecosystem build on.
 
