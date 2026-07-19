@@ -2072,6 +2072,26 @@ def test_aggregate_to_long_via_pymongo(coll) -> None:
     assert got == [{"n": -1}]
 
 
+def test_conversion_error_codes_via_pymongo(coll) -> None:
+    """mongod-specific expression error codes over the wire: unparseable numeric
+    string -> 241, unknown $convert target -> 2, $sortArray non-array -> 2942504,
+    $strLenCP/$strLenBytes non-string -> 34471/34473. mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "s": "abc", "n": 5})
+    for expr, code in [
+        ({"$toInt": "$s"}, 241),
+        ({"$toDouble": "$s"}, 241),
+        ({"$convert": {"input": "$n", "to": "bogus"}}, 2),
+        ({"$sortArray": {"input": "$n", "sortBy": 1}}, 2942504),
+        ({"$strLenCP": "$n"}, 34471),
+        ({"$strLenBytes": "$n"}, 34473),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
+
+
 def test_create_index_listed_via_pymongo(coll) -> None:
     coll.insert_one({"x": 1})
     coll.create_index("x")

@@ -1593,7 +1593,11 @@ def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
 def _op_str_len_cp(arg: Any, ctx: _Ctx) -> Any:
     s = _eval(arg, ctx)
     if not isinstance(s, str):
-        raise ExpressionError("$strLenCP requires a string")
+        raise ExpressionError(
+            f"$strLenCP requires a string argument, found: {_bson_type_name(s)}",
+            code=34471,
+            code_name="Location34471",
+        )
     return len(s)
 
 
@@ -1664,7 +1668,11 @@ def _op_index_of_bytes(arg: Any, ctx: _Ctx) -> Any:
 def _op_str_len_bytes(arg: Any, ctx: _Ctx) -> Any:
     s = _eval(arg, ctx)
     if not isinstance(s, str):
-        raise ExpressionError("$strLenBytes requires a string")
+        raise ExpressionError(
+            f"$strLenBytes requires a string argument, found: {_bson_type_name(s)}",
+            code=34473,
+            code_name="Location34473",
+        )
     return len(s.encode("utf-8"))
 
 
@@ -1892,7 +1900,12 @@ def _op_sort_array(arg: Any, ctx: _Ctx) -> Any:
     if arr is None:
         return None
     if not isinstance(arr, list):
-        raise ExpressionError("$sortArray input must be an array")
+        raise ExpressionError(
+            "The input argument to $sortArray must be an array, but was of type: "
+            f"{_bson_type_name(arr)}",
+            code=2942504,
+            code_name="Location2942504",
+        )
     sort_by = arg["sortBy"]
     if isinstance(sort_by, bool):
         raise ExpressionError(
@@ -2398,7 +2411,14 @@ def _safe_int_from_str(value: str, op_name: str) -> int:
     try:
         return int(value)
     except ValueError as exc:
-        raise ExpressionError(f"{op_name} cannot convert {value!r}") from exc
+        # mongod routes $toInt/$toLong/$convert(int/long) through $convert and
+        # reports an unparseable string as ConversionFailure (241), not the
+        # generic TypeMismatch (14).
+        raise ExpressionError(
+            f"Failed to parse number {value!r} in {op_name} with no onError value",
+            code=241,
+            code_name="ConversionFailure",
+        ) from exc
 
 
 _INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
@@ -2470,7 +2490,11 @@ def _op_to_double(arg: Any, ctx: _Ctx) -> Any:
         try:
             return float(value)
         except ValueError as exc:
-            raise ExpressionError(f"$toDouble cannot convert {value!r}") from exc
+            raise ExpressionError(
+                f"Failed to parse number {value!r} in $convert with no onError value",
+                code=241,
+                code_name="ConversionFailure",
+            ) from exc
     raise ExpressionError(f"$toDouble cannot convert {type(value).__name__}")
 
 
@@ -2514,7 +2538,7 @@ def _convert_value(value: Any, target: Any) -> Any:
 
     code = _CONVERT_TARGETS.get(target)
     if code is None:
-        raise ExpressionError(f"$convert unsupported target type {target!r}")
+        raise ExpressionError(f"Unknown type name: {target}", code=2)
     if code == 1:
         if isinstance(value, bool):
             return 1.0 if value else 0.0
@@ -2607,6 +2631,10 @@ def _op_convert(arg: Any, ctx: _Ctx) -> Any:
         raise ExpressionError("$convert requires {input, to}")
     value = _eval(arg["input"], ctx)
     target = _eval(arg["to"], ctx)
+    # An unknown target type name is a query-compile error (code 2) that mongod
+    # raises before conversion — `onError` does NOT catch it.
+    if target is not None and _CONVERT_TARGETS.get(target) is None:
+        raise ExpressionError(f"Unknown type name: {target}", code=2)
     if value is None:
         return _eval(arg["onNull"], ctx) if "onNull" in arg else None
     try:
@@ -2633,7 +2661,11 @@ def _op_to_decimal(arg: Any, ctx: _Ctx) -> Any:
         try:
             return Decimal128(value)
         except (InvalidOperation, ValueError) as exc:
-            raise ExpressionError(f"$toDecimal cannot convert {value!r}") from exc
+            raise ExpressionError(
+                f"Failed to parse number {value!r} in $convert with no onError value",
+                code=241,
+                code_name="ConversionFailure",
+            ) from exc
     raise ExpressionError(f"$toDecimal cannot convert {type(value).__name__}")
 
 

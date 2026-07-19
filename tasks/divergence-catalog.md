@@ -101,13 +101,15 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
 
 Large, low-value count. Python raises but with code 14 (TypeMismatch) or None where
 mongod uses a specific Location code — the Rust server already renders BadValue for
-all of these (the standing error-code gap). Examples: `$strLenBytes`/`$strLenCP`
-(34473/34471), `$split` (40085/40086/40087), `$trim` (50699), `$dateDiff` bad unit (9),
-`$zip` (34461/34468), `$arrayToObject`/`$objectToArray` (40386/…), `$sortArray` non-array
-(2942504), `$toInt`/`$toDouble`/`$toDecimal`/`$toDate` non-numeric string (241),
-`$toLong` string (241), `$convert to:bad` (2), `$replaceOne`/`$replaceAll` (51746/51744),
-plus the many update/stage missing-code (None) rows. **Recommend: defer as a batch, or
-skip — the numeric CODE rarely gates a driver test and the Rust gap makes it moot there.**
+all of these (the standing error-code gap). Fixed on the Python server (#532):
+`$strLenBytes`/`$strLenCP` non-string (34473/34471), `$sortArray` non-array (2942504),
+`$toInt`/`$toDouble`/`$toDecimal`/`$toLong` non-numeric string (241), `$convert to:bad` (2,
+uncatchable by `onError`). Remaining low-value rows: `$split` (40085/40086/40087 — already
+FIXED in #500), `$trim` (50699), `$dateDiff` bad unit (9), `$zip` (34461/34468),
+`$arrayToObject`/`$objectToArray` (40386/…), `$replaceOne`/`$replaceAll` (51746/51744),
+plus the many update/stage missing-code (None) rows. **Recommend: defer or skip the
+remainder — the numeric CODE rarely gates a driver test and the Rust gap makes it moot
+there.**
 
 ## Minor / out-of-scope
 - `$where` unsupported (SecantusDB rejects; mongod runs JS — intentionally out of scope).
