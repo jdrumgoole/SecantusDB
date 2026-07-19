@@ -2,14 +2,14 @@
 
 - SecantusDB (Python server) 0.5.4b237
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-07-19 16:57 UTC
+- generated: 2026-07-19 17:53 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
 | test_adapt.py | 52 | 7 | 0 | 59 | 88.1% |
 | test_capabilities.py | 12 | 0 | 9 | 21 | 100.0% |
 | test_column.py | 53 | 0 | 0 | 53 | 100.0% |
-| test_connection.py | 97 | 5 | 2 | 104 | 95.1% |
+| test_connection.py | 96 | 6 | 2 | 104 | 94.1% |
 | test_connection_info.py | 37 | 0 | 3 | 40 | 100.0% |
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
 | test_copy.py | 104 | 7 | 1 | 112 | 93.7% |
@@ -17,7 +17,7 @@
 | test_cursor_client.py | 28 | 0 | 0 | 28 | 100.0% |
 | test_cursor_common.py | 280 | 0 | 8 | 288 | 100.0% |
 | test_cursor_raw.py | 78 | 0 | 0 | 78 | 100.0% |
-| test_cursor_server.py | 91 | 19 | 0 | 110 | 82.7% |
+| test_cursor_server.py | 110 | 0 | 0 | 110 | 100.0% |
 | test_encodings.py | 17 | 0 | 0 | 17 | 100.0% |
 | test_errors.py | 29 | 2 | 0 | 31 | 93.5% |
 | test_generators.py | 3 | 2 | 1 | 6 | 60.0% |
@@ -27,7 +27,7 @@
 | test_rows.py | 18 | 0 | 0 | 18 | 100.0% |
 | test_sql.py | 119 | 0 | 5 | 124 | 100.0% |
 | test_transaction.py | 84 | 0 | 1 | 85 | 100.0% |
-| test_typeinfo.py | 85 | 1 | 0 | 86 | 98.8% |
+| test_typeinfo.py | 86 | 0 | 0 | 86 | 100.0% |
 | test_typing.py | 125 | 0 | 0 | 125 | 100.0% |
 | types/test_array.py | 158 | 0 | 0 | 158 | 100.0% |
 | types/test_bool.py | 15 | 0 | 0 | 15 | 100.0% |
@@ -45,9 +45,9 @@
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 134 | 0 | 1 | 135 | 100.0% |
 | types/test_uuid.py | 26 | 0 | 0 | 26 | 100.0% |
-| **total** | **4081** | **45** | **112** | **4238** | **98.9%** |
+| **total** | **4100** | **26** | **112** | **4238** | **99.4%** |
 
-## Failures (45)
+## Failures (26)
 
 - `tests/test_adapt.py::test_random[0-b]`
 - `tests/test_adapt.py::test_random[0-s]`
@@ -56,6 +56,7 @@
 - `tests/test_adapt.py::test_random[1-s]`
 - `tests/test_adapt.py::test_random[1-t]`
 - `tests/test_adapt.py::test_return_untyped[b]`
+- `tests/test_connection.py::test_broken_connection`
 - `tests/test_connection.py::test_cancel_safe_error`
 - `tests/test_connection.py::test_cancel_safe_timeout`
 - `tests/test_connection.py::test_connect_bad`
@@ -68,29 +69,9 @@
 - `tests/test_copy.py::test_copy_table_across[binary]`
 - `tests/test_copy.py::test_copy_table_across[block]`
 - `tests/test_copy.py::test_copy_table_across[row]`
-- `tests/test_cursor_server.py::test_binary_cursor_execute[asyncio-RawServerCursor]`
-- `tests/test_cursor_server.py::test_binary_cursor_execute[asyncio-ServerCursor]`
-- `tests/test_cursor_server.py::test_binary_cursor_text_override[asyncio-RawServerCursor]`
-- `tests/test_cursor_server.py::test_binary_cursor_text_override[asyncio-ServerCursor]`
-- `tests/test_cursor_server.py::test_cursor_close_fetchone[asyncio-RawServerCursor]`
-- `tests/test_cursor_server.py::test_execute_binary[asyncio-RawServerCursor]`
-- `tests/test_cursor_server.py::test_execute_binary[asyncio-ServerCursor]`
-- `tests/test_cursor_server.py::test_execute_error[asyncio-RawServerCursor-create table ssc ()]`
-- `tests/test_cursor_server.py::test_execute_error[asyncio-RawServerCursor-wat]`
-- `tests/test_cursor_server.py::test_execute_error[asyncio-ServerCursor-create table ssc ()]`
-- `tests/test_cursor_server.py::test_execute_error[asyncio-ServerCursor-select 1; select 2]`
-- `tests/test_cursor_server.py::test_execute_error[asyncio-ServerCursor-wat]`
-- `tests/test_cursor_server.py::test_hold[asyncio-ServerCursor]`
-- `tests/test_cursor_server.py::test_non_scrollable[asyncio-RawServerCursor]`
-- `tests/test_cursor_server.py::test_non_scrollable[asyncio-ServerCursor]`
-- `tests/test_cursor_server.py::test_row_factory[asyncio-RawServerCursor]`
-- `tests/test_cursor_server.py::test_row_factory[asyncio-ServerCursor]`
-- `tests/test_cursor_server.py::test_scrollable[asyncio-RawServerCursor]`
-- `tests/test_cursor_server.py::test_scrollable[asyncio-ServerCursor]`
 - `tests/test_errors.py::test_pgconn_error`
 - `tests/test_errors.py::test_pgconn_error_pickle`
 - `tests/test_generators.py::test_cancel`
 - `tests/test_generators.py::test_pipeline_communicate_abort`
 - `tests/test_prepared.py::test_change_type_savepoint`
-- `tests/test_typeinfo.py::test_fetch_async[asyncio-sql_ascii-IDLE-text]`
 - `tests/types/test_numeric.py::test_dump_numeric_exhaustive[b]`

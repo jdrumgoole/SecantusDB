@@ -594,9 +594,22 @@ def _declare_cursor(
             f"too many open cursors (limit {MAX_CURSORS_PER_SESSION}); CLOSE some first"
         )
     hold = re.search(r"\bWITH\s+HOLD\b", opts, re.IGNORECASE) is not None
+    if re.search(r"\bNO\s+SCROLL\b", opts, re.IGNORECASE):
+        scrollable: bool | None = False
+    elif re.search(r"\bSCROLL\b", opts, re.IGNORECASE):
+        scrollable = True
+    else:
+        scrollable = None
     stmts = planner.parse(m.group("query"))
     if len(stmts) != 1:
         raise errors.syntax_error("DECLARE CURSOR expects a single query")
+    if not isinstance(stmts[0], (exp.Select, exp.SetOperation, exp.Values)) and not (
+        isinstance(stmts[0], exp.Command) and str(stmts[0].this).upper() in ("WITH", "SELECT")
+    ):
+        # A DECLARE body must be a row-returning query — a bare identifier
+        # (``wat``) or a DDL/DML statement is a syntax error (42601 →
+        # ProgrammingError), not 0A000.
+        raise errors.syntax_error("DECLARE CURSOR must specify a SELECT query")
     result = _run_query(stmts[0], storage, db, catalog, session)
     rows = list(result.rows)
     # Cap the materialized row set a single cursor retains (SecantusDB cursors
@@ -612,6 +625,7 @@ def _declare_cursor(
         rows=rows,
         pos=-1,
         hold=hold,
+        scrollable=scrollable,
         statement=f"DECLARE {tail}",
         created=_dt.datetime.now(_dt.timezone.utc),
     )
@@ -650,7 +664,12 @@ def _parse_fetch(tail: str) -> tuple[str, int | None, str]:
         return "forward", 1, name  # bare FETCH cursor → next row
     head = spec[0]
     if head not in _FETCH_DIRECTIONS:
-        return "forward", as_count(spec), name  # FETCH n / FETCH ALL
+        # ``FETCH n`` / ``FETCH ALL`` — a NEGATIVE bare count scans backward
+        # ``abs(n)`` rows in the default direction (Postgres semantics).
+        cnt = as_count(spec)
+        if cnt is not None and cnt < 0:
+            return "backward", -cnt, name
+        return "forward", cnt, name
     rest = spec[1:]
     if head == "NEXT":
         return "forward", 1, name
@@ -660,14 +679,20 @@ def _parse_fetch(tail: str) -> tuple[str, int | None, str]:
         return "absolute", 1, name
     if head == "LAST":
         return "absolute", -1, name
-    if head == "FORWARD":
-        return "forward", as_count(rest), name
-    if head == "BACKWARD":
-        return "backward", as_count(rest), name
-    # ABSOLUTE / RELATIVE require a count.
+    if head in ("FORWARD", "BACKWARD"):
+        cnt = as_count(rest)
+        base = "forward" if head == "FORWARD" else "backward"
+        if cnt is not None and cnt < 0:  # a signed count flips the direction
+            return ("backward" if base == "forward" else "forward"), -cnt, name
+        return base, cnt, name
+    # ABSOLUTE / RELATIVE require a count. FORWARD/BACKWARD with a negative
+    # count reverse direction (``FORWARD -1`` == ``BACKWARD 1``).
     if not rest:
         raise errors.syntax_error(f"{head} requires a count")
-    return head.lower(), int(rest[0]), name
+    cnt = int(rest[0])
+    if head in ("FORWARD", "BACKWARD") and cnt < 0:
+        return ("backward" if head == "FORWARD" else "forward"), -cnt, name
+    return head.lower(), cnt, name
 
 
 def _cursor_slice(cur: Any, kind: str, count: int | None) -> list:
@@ -686,6 +711,10 @@ def _cursor_slice(cur: Any, kind: str, count: int | None) -> list:
         cur.pos = idxs[-1] if idxs else -1
         return [cur.rows[i] for i in idxs]
     if kind == "absolute":
+        if count == 0:
+            # ``MOVE ABSOLUTE 0`` positions BEFORE the first row (not at end).
+            cur.pos = -1
+            return []
         target = count - 1 if count > 0 else n + count  # 1-based; negatives from end
         if 0 <= target < n:
             cur.pos = target
@@ -701,6 +730,22 @@ def _cursor_slice(cur: Any, kind: str, count: int | None) -> list:
     return []
 
 
+def _moves_backward(cur: Any, kind: str, count: int | None) -> bool:
+    """Whether a ``(kind, count)`` movement scans backward from ``cur.pos`` —
+    the check a NO SCROLL cursor rejects."""
+    if kind == "backward":
+        return count is None or count > 0
+    if kind == "absolute":
+        n = len(cur.rows)
+        if count is None:
+            return False
+        target = -1 if count == 0 else (count - 1 if count > 0 else n + count)
+        return target < cur.pos
+    if kind == "relative":
+        return (count or 0) < 0
+    return False
+
+
 def _fetch_cursor(stmt: exp.Command, session: Session, *, move: bool = False) -> SQLResult:
     """``FETCH`` returns the moved-over rows; ``MOVE`` performs the same
     positioning but returns only the count (no result set)."""
@@ -708,6 +753,9 @@ def _fetch_cursor(stmt: exp.Command, session: Session, *, move: bool = False) ->
     cur = session.cursors.get(name)
     if cur is None:
         raise errors.SQLError("34000", f'cursor "{name}" does not exist')
+    # A NO SCROLL cursor rejects any movement that would scan backward.
+    if cur.scrollable is False and _moves_backward(cur, kind, count):
+        raise errors.SQLError("55000", f'cursor "{name}" can only scan forward', position=None)
     rows = _cursor_slice(cur, kind, count)
     verb = "MOVE" if move else "FETCH"
     if move:
@@ -1200,6 +1248,18 @@ def describe_statement(
 def _describe_statement(
     storage: Any, db: str, stmt: exp.Expression, session: Session, catalog: Catalog
 ) -> list[ColumnDesc] | None:
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "FETCH":
+        # A binary server cursor's ``FETCH … FROM <name>`` rides the extended
+        # protocol; Describe must report the cursor's columns (else Execute
+        # sends DataRows without a prior RowDescription — a protocol violation).
+        try:
+            _kind, _count, cname = _parse_fetch(_command_tail(stmt))
+        except errors.SQLError:
+            return None
+        cur = session.cursors.get(cname)
+        return list(cur.columns) if cur is not None else None
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "MOVE":
+        return None  # MOVE returns no rows
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "SHOW":
         oid = typemap.PG_OID["text"]
         if _show_name(stmt).upper() == "ALL":
