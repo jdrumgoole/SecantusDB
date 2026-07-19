@@ -17,7 +17,12 @@ import logging
 from typing import Any
 
 from secantus.admin import capabilities
-from secantus.admin.client import MongoError, MongoFacade, display_uri
+from secantus.admin.client import (
+    MongoError,
+    MongoFacade,
+    check_supported_uri,
+    display_uri,
+)
 from secantus.admin.sampler import Sampler
 
 logger = logging.getLogger(__name__)
@@ -49,6 +54,13 @@ def swap_target(app: Any, new_uri: str, *, ping: bool = True) -> None:
     new_uri = (new_uri or "").strip()
     if not new_uri:
         raise SwapError("URI is required")
+
+    # Reject a non-MongoDB URI here, where we can explain why, rather than
+    # letting pymongo fail with an opaque parse error.
+    try:
+        check_supported_uri(new_uri)
+    except ValueError as exc:
+        raise SwapError(str(exc)) from exc
 
     try:
         new_facade = MongoFacade(new_uri)

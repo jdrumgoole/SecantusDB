@@ -65,6 +65,13 @@ def _index_badges(idx: dict[str, Any]) -> list[str]:
     ttl = idx.get("expireAfterSeconds")
     if isinstance(ttl, (int, float)):
         badges.append(f"TTL {int(ttl)}s")
+    collation = idx.get("collation")
+    if isinstance(collation, dict) and collation.get("locale"):
+        strength = collation.get("strength")
+        label = f"collation {collation['locale']}"
+        if strength is not None:
+            label = f"{label}/{strength}"
+        badges.append(label)
     key = idx.get("key") or {}
     for v in key.values():
         if v == "2dsphere":
@@ -145,6 +152,7 @@ def create_index(
     sparse: bool = Form(False),
     partial: str = Form(""),
     ttl_seconds: str = Form(""),
+    collation: str = Form(""),
 ) -> HTMLResponse:
     parsed_key, key_err = _parse_key_form(key)
     if key_err is not None:
@@ -175,6 +183,24 @@ def create_index(
                 detail="TTL must be a non-negative integer (seconds).",
             ) from exc
 
+    collation_doc: dict[str, Any] | None = None
+    if collation.strip():
+        try:
+            parsed_collation = json_util.loads(collation)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Collation is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(parsed_collation, dict):
+            raise HTTPException(status_code=400, detail="Collation must be a JSON object.")
+        if not parsed_collation.get("locale"):
+            # mongod requires it, and omitting it produces a much less
+            # obvious server-side error than saying so here.
+            raise HTTPException(
+                status_code=400, detail='Collation must include a "locale" (e.g. "en").'
+            )
+        collation_doc = parsed_collation
+
     try:
         request.app.state.mongo.create_index(
             db,
@@ -185,6 +211,7 @@ def create_index(
             sparse=sparse,
             partial_filter_expression=partial_doc,
             expire_after_seconds=ttl_int,
+            collation=collation_doc,
         )
     except MongoError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

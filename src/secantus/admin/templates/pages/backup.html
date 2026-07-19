@@ -158,4 +158,70 @@
     <pre class="doc-body">{{ last_result.stderr }}</pre>
   {% endif %}
 {% endif %}
+
+<h2 class="section-title">Point-in-time recovery</h2>
+{% if pitr_flash %}
+  <div class="flash flash-{{ pitr_flash.kind }}">{{ pitr_flash.msg }}</div>
+{% endif %}
+{% if caps.native_pitr %}
+<p class="modal-meta">
+  PITR stitches a <strong>base snapshot</strong> with the oplog segments
+  written after it, so you can recover to any moment inside the archived
+  window. Start the server with
+  <code>--oplog-archive-dir {{ pitr_archive_dir }}</code> so pruned oplog
+  rows are archived there, and take a base snapshot periodically — there
+  is no background scheduler. Recovery is offline-shaped: it writes a new
+  directory and never touches the running server's storage.
+</p>
+
+<div class="filter-controls">
+  <form method="post" action="/backup/pitr/snapshot" class="filter-form">
+    <label class="filter-label">
+      Archive directory
+      <input type="text" name="archive_dir" value="{{ pitr_archive_dir }}" autocomplete="off" />
+    </label>
+    <div class="modal-actions">
+      <button type="submit">Take base snapshot</button>
+    </div>
+  </form>
+</div>
+
+<h3 class="section-title">Recover to a point in time</h3>
+<form method="post" action="/backup/pitr/restore" class="filter-form">
+  <label class="filter-label">
+    Source
+    <input
+      type="text"
+      name="source"
+      value="{{ pitr_archive_dir }}"
+      placeholder="archive dir, a backupArchive .tar.gz, or a stopped server's data dir"
+      autocomplete="off"
+    />
+  </label>
+  <label class="filter-label">
+    Restore into (must be a fresh directory)
+    <input type="text" name="target_dir" placeholder="/path/to/restored-data" autocomplete="off" />
+  </label>
+  <div class="filter-controls">
+    <label>
+      Recover to (optional — blank replays the whole oplog)
+      <input type="datetime-local" name="to_time" step="1" />
+    </label>
+    <label class="checkbox-label">
+      <input type="checkbox" name="preserve_oplog" value="true" />
+      preserve oplog (lets a change stream resume across the restore point)
+    </label>
+  </div>
+  <div class="modal-actions">
+    <button type="submit">Recover</button>
+  </div>
+</form>
+{% else %}
+<p class="modal-meta">
+  Point-in-time recovery uses the SecantusDB-only
+  <code>secantusAdmin.archiveBaseSnapshot</code> /
+  <code>secantusAdmin.restoreToTimestamp</code> commands, which
+  {{ caps.label }} doesn't serve.
+</p>
+{% endif %}
 {% endblock %}

@@ -31,32 +31,34 @@ def test_classify_python_full_surface() -> None:
         assert getattr(caps, flag) is True
 
 
-def test_classify_rust_gaps() -> None:
+def test_classify_rust_is_permissive() -> None:
+    # A SecantusDB target is never gated by a hardcoded per-flavour table.
+    # The previous table claimed the Rust server lacked restoreArchive /
+    # prune / grant-revoke / killOp / getLog / profile long after it had
+    # implemented all six, which silently hid working buttons. Anything
+    # the server genuinely lacks is learned from a live CommandNotFound
+    # (see test_record_unsupported_*), never assumed up front.
     caps = capabilities.classify(
         {"secantusVersion": "0.5.2-beta.101"},
         {"secantus": {"server": "rust"}},
     )
     assert caps.kind == "rust"
     assert "Rust" in caps.label
-    # Ported on Rust:
-    assert caps.native_backup_archive is True
-    # Not yet ported on Rust:
-    assert caps.native_restore_archive is False
-    assert caps.native_prune is False
-    assert caps.grant_revoke_roles is False
-    assert caps.kill_op is False
-    assert caps.server_log is False
-    assert caps.profiling is False
+    for flag in capabilities._FLAGS:
+        assert getattr(caps, flag) is True, f"{flag} must not be assumed missing"
 
 
 def test_classify_mongodb_no_native_commands() -> None:
     caps = capabilities.classify({"version": "7.0.5"}, {})
     assert caps.kind == "mongodb"
     assert caps.label == "MongoDB 7.0.5"
-    # No secantusAdmin.* proprietary commands on a real mongod:
+    # No secantusAdmin.* proprietary commands on a real mongod. These
+    # negatives are definitional, not a porting snapshot, so they are the
+    # one place a static profile is still correct.
     assert caps.native_backup_archive is False
     assert caps.native_restore_archive is False
     assert caps.native_prune is False
+    assert caps.native_pitr is False
     # But every standard admin command is available:
     assert caps.grant_revoke_roles is True
     assert caps.kill_op is True
@@ -120,6 +122,56 @@ def test_probe_raises_when_both_fail() -> None:
     facade = _FakeFacade(fail=("build_info", "server_status"))
     with pytest.raises(MongoError):
         capabilities.probe(facade)
+
+
+# ---- unit: learned unsupported ----------------------------------------------
+
+
+class _FakeApp:
+    """Stands in for the FastAPI app — record_unsupported only needs .state."""
+
+    def __init__(self, caps):
+        self.state = type("S", (), {"capabilities": caps})()
+
+
+def _RUST_CAPS():
+    return capabilities.classify({"secantusVersion": "1"}, {"secantus": {"server": "rust"}})
+
+
+def test_without_clears_one_flag() -> None:
+    caps = capabilities.classify({"secantusVersion": "1"}, {"secantus": {"server": "rust"}})
+    demoted = caps.without("native_prune")
+    assert demoted.native_prune is False
+    # Everything else survives, and the original is untouched (frozen).
+    assert demoted.kill_op is True
+    assert caps.native_prune is True
+
+
+def test_without_rejects_unknown_flag() -> None:
+    with pytest.raises(ValueError):
+        capabilities.UNKNOWN.without("no_such_flag")
+
+
+def test_record_unsupported_clears_flag_on_app() -> None:
+    app = _FakeApp(_RUST_CAPS())
+    assert app.state.capabilities.kill_op is True
+    capabilities.record_unsupported(app, "kill_op")
+    assert app.state.capabilities.kill_op is False
+
+
+def test_record_unsupported_is_idempotent() -> None:
+    app = _FakeApp(_RUST_CAPS())
+    capabilities.record_unsupported(app, "server_log")
+    first = app.state.capabilities
+    capabilities.record_unsupported(app, "server_log")
+    # Already cleared — no pointless object churn.
+    assert app.state.capabilities is first
+
+
+def test_is_command_not_found_only_matches_59() -> None:
+    assert capabilities.is_command_not_found(MongoError("nope", code=59)) is True
+    assert capabilities.is_command_not_found(MongoError("auth", code=13)) is False
+    assert capabilities.is_command_not_found(MongoError("no code")) is False
 
 
 # ---- integration: template gating -------------------------------------------
@@ -200,8 +252,22 @@ async def test_backup_native_button_shown_when_unknown(app, http: AsyncClient) -
     assert 'action="/backup/archive"' in r.text
 
 
-async def test_maintenance_prune_hidden_on_rust(app, http: AsyncClient) -> None:
+async def test_maintenance_prune_shown_on_rust(app, http: AsyncClient) -> None:
+    # Regression: the Rust server implements pruneOplog / pruneTtl, but a
+    # stale hardcoded capability table claimed otherwise and hid both
+    # buttons. A SecantusDB target must never have a feature hidden on
+    # assumption alone.
     app.state.capabilities = _RUST
+    r = await http.get("/maintenance", headers=_AUTH)
+    assert r.status_code == 200
+    assert 'action="/maintenance/prune-oplog"' in r.text
+    assert 'action="/maintenance/prune-ttl"' in r.text
+    assert "Prune oplog / TTL unavailable" not in r.text
+
+
+async def test_maintenance_prune_hidden_on_mongodb(app, http: AsyncClient) -> None:
+    # A real mongod definitionally has no secantusAdmin.* commands.
+    app.state.capabilities = _MONGODB
     r = await http.get("/maintenance", headers=_AUTH)
     assert r.status_code == 200
     assert 'action="/maintenance/prune-oplog"' not in r.text
