@@ -37,6 +37,31 @@ def client(server: SecantusDBServer) -> Iterator[MongoClient]:
         mc.close()
 
 
+def _open(cs):
+    """Force a lazily-created change stream to actually open, and return it.
+
+    pymongo's ``ChangeStream.__init__`` does NOT contact the server: the
+    ``aggregate`` that fixes the stream's start position runs on the FIRST
+    iteration. So ``coll.watch(...)`` followed by ``time.sleep(...)``
+    establishes nothing — the start position is captured whenever something
+    first pulls on the cursor, which may be after writes the test intends the
+    stream to observe.
+
+    When that happens the miss is PERMANENT, not slow: the server sets
+    ``start_seq = oplog_tail_seq() + 1`` at aggregate time, so an earlier write
+    is excluded from the stream forever and no amount of polling surfaces it.
+    That is what CI showed — "awaitData did not surface the insert within 30s
+    (insert completed 29.9s ago)", i.e. ~30 poll cycles against an event the
+    stream had already been told to skip.
+
+    ``try_next()`` drives the aggregate and returns None when nothing is
+    pending, which is exactly the "stream is now open and positioned" barrier
+    these tests assumed ``watch()`` gave them.
+    """
+    assert cs.try_next() is None, "stream had events before the test wrote any"
+    return cs
+
+
 def _drain(
     cs,
     target: int,
@@ -105,8 +130,7 @@ def test_db_watch_sees_all_collections(client: MongoClient) -> None:
     db.create_collection("a")
     db.create_collection("b")
 
-    cs = db.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(db.watch(max_await_time_ms=2000))
 
     db["a"].insert_one({"_id": 1})
     db["b"].insert_one({"_id": 2})
@@ -120,8 +144,7 @@ def test_db_watch_sees_all_collections(client: MongoClient) -> None:
 def test_cluster_watch_sees_all_databases(client: MongoClient) -> None:
     client["csdb_cluster_a"].create_collection("c")
     client["csdb_cluster_b"].create_collection("c")
-    cs = client.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(client.watch(max_await_time_ms=2000))
 
     client["csdb_cluster_a"]["c"].insert_one({"_id": 1})
     client["csdb_cluster_b"]["c"].insert_one({"_id": 2})
@@ -137,8 +160,7 @@ def test_resume_after_token_picks_up_subsequent_events(client: MongoClient) -> N
     coll = db["c"]
     db.create_collection("c")
 
-    cs1 = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs1 = _open(coll.watch(max_await_time_ms=2000))
     coll.insert_one({"_id": 1})
     coll.insert_one({"_id": 2})
     events1 = _drain(cs1, target=2)
@@ -171,8 +193,7 @@ def test_resumed_open_returns_backlog_in_first_batch(
     coll = db["c"]
     db.create_collection("c")
 
-    cs1 = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs1 = _open(coll.watch(max_await_time_ms=2000))
     coll.insert_one({"_id": 0})
     resume_point = _drain(cs1, target=1)[-1]["_id"]
     cs1.close()
@@ -226,8 +247,7 @@ def test_full_document_update_lookup_returns_post_state(client: MongoClient) -> 
     coll = db["c"]
     db.create_collection("c")
     coll.insert_one({"_id": 1, "x": 0})
-    cs = coll.watch(full_document="updateLookup", max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(full_document="updateLookup", max_await_time_ms=2000))
     coll.update_one({"_id": 1}, {"$set": {"x": 5}})
     events = _drain(cs, target=1)
     cs.close()
@@ -240,8 +260,7 @@ def test_full_document_update_lookup_after_delete_is_none(client: MongoClient) -
     coll = db["c"]
     db.create_collection("c")
     coll.insert_one({"_id": 1, "x": 0})
-    cs = coll.watch(full_document="updateLookup", max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(full_document="updateLookup", max_await_time_ms=2000))
     coll.update_one({"_id": 1}, {"$set": {"x": 5}})
     coll.delete_one({"_id": 1})
     events = _drain(cs, target=2)
@@ -275,8 +294,7 @@ def test_invalidate_on_drop_collection(client: MongoClient) -> None:
     db = client["csdb_inv"]
     coll = db["c"]
     db.create_collection("c")
-    cs = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000))
     coll.insert_one({"_id": 1})
     coll.drop()
     events = _drain(cs, target=3)
@@ -338,8 +356,7 @@ def test_await_data_blocks_then_wakes_on_insert(client: MongoClient) -> None:
     db.create_collection("c")
     # Per-getMore await window well under the drain ceiling, so pymongo
     # re-polls several times rather than staking everything on one window.
-    cs = coll.watch(max_await_time_ms=1000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=1000))
 
     insert_done_at: list[float] = []
     insert_err: list[BaseException] = []
@@ -423,8 +440,7 @@ def test_resume_after_pruned_token_raises_history_lost(server, client) -> None:
     coll = db["c"]
     db.create_collection("c")
     coll.insert_one({"_id": 1})
-    cs = coll.watch(max_await_time_ms=1000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=1000))
     coll.insert_one({"_id": 2})
     events = _drain(cs, target=1)
     cs.close()
@@ -462,8 +478,7 @@ def test_replace_emits_replace_operation_type(client: MongoClient) -> None:
     db.create_collection("c")
     coll.insert_one({"_id": 7, "x": 1})
 
-    cs = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000))
 
     coll.replace_one({"_id": 7}, {"_id": 7, "x": 99, "y": "added"})
 
@@ -524,8 +539,7 @@ def test_create_indexes_emits_change_event(client: MongoClient) -> None:
     coll = db["c"]
     db.create_collection("c")
 
-    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000, show_expanded_events=True))
     coll.create_index([("x", 1)])
 
     events = _drain(cs, target=1)
@@ -549,8 +563,7 @@ def test_drop_indexes_emits_change_event(client: MongoClient) -> None:
     db.create_collection("c")
     coll.create_index([("x", 1)])  # one index to drop
 
-    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000, show_expanded_events=True))
     coll.drop_index("x_1")
 
     events = _drain(cs, target=1)
@@ -569,8 +582,7 @@ def test_create_collection_emits_change_event(client: MongoClient) -> None:
     on a db-scoped stream WHEN show_expanded_events is set."""
     db = client["csdb_create_coll"]
     db.create_collection("seed")  # ensure the db exists before watching
-    cs = db.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(db.watch(max_await_time_ms=2000, show_expanded_events=True))
     db.create_collection("foo")
 
     events = _drain(cs, target=1)
@@ -588,8 +600,7 @@ def test_collmod_emits_modify_change_event(client: MongoClient) -> None:
     coll = db["c"]
     db.create_collection("c")
 
-    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000, show_expanded_events=True))
     db.command({"collMod": "c"})
 
     events = _drain(cs, target=1)
@@ -610,8 +621,7 @@ def test_rename_event_has_operation_description_and_collection_uuid(
     db.create_collection("c")
     db.create_collection("dst")  # rename target to drop
 
-    cs = coll.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000, show_expanded_events=True))
     coll.insert_one({"a": 1})
     coll.rename("dst", dropTarget=True)
 
@@ -634,8 +644,7 @@ def test_create_and_modify_suppressed_without_show_expanded_events(
     DDL events — only the stable v1 event set surfaces."""
     db = client["csdb_no_expand_ddl"]
     db.create_collection("seed")
-    cs = db.watch(max_await_time_ms=1000)
-    time.sleep(0.3)
+    cs = _open(db.watch(max_await_time_ms=1000))
     db.create_collection("foo")  # would be a create event if expanded
     db.command({"collMod": "foo"})  # would be a modify event if expanded
     db["seed"].insert_one({"_id": 1})  # the only event a default stream sees
@@ -657,8 +666,7 @@ def test_create_indexes_suppressed_without_show_expanded_events(client: MongoCli
     coll = db["c"]
     db.create_collection("c")
 
-    cs = coll.watch(max_await_time_ms=1000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=1000))
     coll.create_index([("x", 1)])
     # Insert one real event so _drain has something to find — otherwise
     # the await blocks for the full timeout.
@@ -678,8 +686,7 @@ def test_index_lifecycle_at_database_scope(client: MongoClient) -> None:
     db.create_collection("a")
     db.create_collection("b")
 
-    cs = db.watch(max_await_time_ms=2000, show_expanded_events=True)
-    time.sleep(0.3)
+    cs = _open(db.watch(max_await_time_ms=2000, show_expanded_events=True))
     db["a"].create_index([("x", 1)])
     db["b"].create_index([("y", 1)])
 
@@ -726,8 +733,7 @@ def test_split_large_change_stream_events_omitted_by_default(client: MongoClient
     coll = db["c"]
     db.create_collection("c")
 
-    cs = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000))
     coll.insert_one({"_id": 1})
 
     events = _drain(cs, target=1)
@@ -747,8 +753,7 @@ def test_pipeline_update_is_update_event_with_truncated_arrays(client: MongoClie
     coll = db["c"]
     db.create_collection("c")
     coll.insert_one({"_id": 1, "a": 1, "array": ["foo", {"a": "bar"}, 1, 2, 3]})
-    cs = coll.watch(max_await_time_ms=2000)
-    time.sleep(0.3)
+    cs = _open(coll.watch(max_await_time_ms=2000))
     coll.update_one({"_id": 1}, [{"$set": {"array": ["foo", {"a": "bar"}]}}])
     events = _drain(cs, target=1)
     cs.close()
