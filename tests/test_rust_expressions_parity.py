@@ -79,6 +79,25 @@ def _mkdate(ms):
 
 # (expr, doc) pairs over the ported operator core.
 CURATED = [
+    # $sum/$avg/$max/$min as expression operators (MongoDB 5.0+) — Rust must
+    # compute the SAME value + numeric width as Python (int32/int64/double).
+    ({"$sum": "$arr"}, {"arr": [1, 2, 3]}),  # int32 result
+    ({"$sum": "$arr"}, {"arr": [1, Int64(2), 3]}),  # int64-widened result
+    ({"$sum": "$arr"}, {"arr": [1, 2.5, 3]}),  # double result
+    ({"$sum": "$n"}, {"n": 5}),  # scalar
+    ({"$sum": ["$n", 10, "skip", True]}, {"n": 5}),  # ignore non-numeric + bool
+    ({"$sum": "$x"}, {}),  # missing -> 0
+    ({"$sum": "$arr"}, {"arr": []}),  # empty -> 0
+    ({"$avg": "$arr"}, {"arr": [1, 2, 3]}),  # -> 2.0 (double)
+    ({"$avg": "$arr"}, {"arr": [2, 4]}),
+    ({"$avg": "$arr"}, {"arr": []}),  # empty -> null
+    ({"$avg": "$s"}, {"s": "x"}),  # non-numeric -> null
+    ({"$max": "$arr"}, {"arr": [3, 1, 2]}),
+    ({"$min": "$arr"}, {"arr": [3, 1, 2]}),
+    ({"$max": "$arr"}, {"arr": [1, "a", True]}),  # cross-type BSON order
+    ({"$min": "$arr"}, {"arr": [3, None, 1]}),  # null ignored
+    ({"$max": "$arr"}, {"arr": []}),  # empty -> null
+    ({"$max": "$n"}, {"n": 5}),  # scalar
     # Bitwise ($bitAnd/$bitOr/$bitXor/$bitNot) — int/long, empty-list identity,
     # null propagation, mixed int/long result width. Non-int operands defer.
     ({"$bitAnd": ["$a", "$b"]}, {"a": 12, "b": 10}),
