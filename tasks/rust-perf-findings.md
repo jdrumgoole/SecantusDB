@@ -182,6 +182,54 @@ as scoped; wider documents win more. This is the raw-decode lever (6a); the
 heavier `$group`/`$sort` execution model (streaming, 6b) stays deferred behind a
 multi-stage workload measurement, per the scoping doc.
 
+## Multi-stage aggregate re-profile — is 6b (streaming) justified? (2026-07-19, pinned `73b1790b`)
+
+The scoping doc's precondition for committing to 6b: add a **multi-stage**
+aggregate workload to the benchmark (the single-stage `aggregate_group` can't
+show inter-stage buffering) and measure whether it's a real gap. Added
+`aggregate_multistage` to `bench/compare_servers.py`: `[{$match: active}, {$unwind:
+"$tags"}, {$group: {_id: "$tags", total: {$sum: "$v"}, n: {$sum: 1}}}, {$sort:
+{total: -1}}]` over a separate 3-element-array collection (populated untimed), so
+`$unwind` fans each survivor out ~3× and ~15k documents flow into `$group`. The
+leading `$match` lifts into the fetch; the first *heavier* stage is `$unwind`, so
+6a's field pushdown does **not** apply — this measures the multi-stage path
+cleanly. Pinned worktree at `73b1790b` (origin/main, with 6a); `git rev-parse
+HEAD` unchanged across both runs.
+
+**The write-workload `×mongod` this session is contaminated** — the machine was
+under sustained load (insert/update/delete showed mongod at 3–4× its usual time,
+Rust nominally "beating" mongod, which is impossible). Disregard the write rows.
+The **aggregate** rows were stable and sensible across two independent runs and
+are the reliable signal:
+
+| Aggregate workload | mongod | Rust | ×mongod (2 runs) |
+|---|---:|---:|:---:|
+| `aggregate_group` (single-stage) | 6.2–6.3 ms | 14.0–14.2 ms | **2.2–2.3×** |
+| `aggregate_multistage` (`$unwind`→`$group`→`$sort`) | 7.7 ms | 20.6–21.1 ms | **2.7×** |
+
+**The delta-of-deltas isolates the inter-stage cost.** Adding the three stages
+costs **mongod +1.5 ms** (6.2 → 7.7) but **Rust +6.5 ms** (14.0 → 20.6). So
+~5 ms of the ~20 ms multi-stage time (≈25%) is Rust paying to fully materialize
+the ~15k-document `$unwind→$group` intermediate as an owned `Vec<Document>` where
+mongod streams it. This is exactly the cost 6b (streaming / slot execution)
+would target, and the multi-stage pipeline does sit worse relative to mongod
+(2.7×) than the single-stage group (2.2×).
+
+**Conclusion: 6b's target is real but modest — recommend deferring it.** The
+inter-stage buffering gap is measurable (~5 ms, ~0.5× of ratio) but small in
+absolute terms, and 6b is the roadmap's largest lift (a rewrite of
+`secantus_core::aggregate`'s execution model behind `apply_pipeline` + a full
+parity re-pin of every stage's ordering and error timing). The payoff — moving
+multi-stage aggregates from ~2.7× toward the ~2.2× single-stage band — is
+incremental, not transformative. After the raw-BSON phases (1–6a) brought every
+workload to ~1.5–2.7× of mongod, the remaining levers (6b streaming, `find_all`
+cursor-batching) are diminishing returns. **Recommend treating the raw-BSON
+roadmap as substantially complete** and picking up 6b only if aggregate-heavy
+multi-stage pipelines become a stated priority — at which point this workload is
+already in the benchmark to measure against. (Re-confirm the write-workload
+`×mongod` on an unloaded machine before any future baseline; this session's
+aggregate deltas stand because they were internally consistent across two runs.)
+
 ## Finding 3 — the oplog prune is an O(entire-oplog) full-decode sweep
 
 The single biggest insert-path consumer is not the insert:
