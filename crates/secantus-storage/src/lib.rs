@@ -5598,12 +5598,17 @@ impl Storage {
                 let candidates =
                     self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?;
                 for (id_k, blob) in candidates {
-                    let doc = decode_doc(&blob)?;
-                    if !query_matches(&doc, filter, vars, coll_opt)
+                    // Match over raw BSON first (decodes only the filter's fields);
+                    // a rejected candidate skips the full document decode. A
+                    // matched candidate is then decoded for the update transform.
+                    let raw = bson::RawDocument::from_bytes(&blob)
+                        .map_err(|_| StorageError::QueryUnsupported)?;
+                    if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
                         .map_err(|_| StorageError::QueryUnsupported)?
                     {
                         continue;
                     }
+                    let doc = decode_doc(&blob)?;
                     matched += 1;
                     let new = transform(&doc, false)?;
                     if !multi {
@@ -5796,12 +5801,17 @@ impl Storage {
                 let candidates =
                     self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?;
                 for (id_k, blob) in candidates {
-                    let doc = decode_doc(&blob)?;
-                    if !query_matches(&doc, filter, let_vars, coll_opt)
+                    // Match over raw BSON first (decodes only the filter's fields);
+                    // a rejected candidate skips the full decode. A matched
+                    // candidate is decoded for the delete's oplog `o2` / pre-image.
+                    let raw = bson::RawDocument::from_bytes(&blob)
+                        .map_err(|_| StorageError::QueryUnsupported)?;
+                    if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
                         .map_err(|_| StorageError::QueryUnsupported)?
                     {
                         continue;
                     }
+                    let doc = decode_doc(&blob)?;
                     // Doc row first, entries after — see prune_ttl for the lock-free
                     // reader ordering rationale.
                     let cur = session.open_cursor(DOC_TABLE, None)?;
