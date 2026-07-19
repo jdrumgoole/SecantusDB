@@ -1312,6 +1312,13 @@ def _coerce_untyped_range_operand(left: Any, right: Any) -> tuple[Any, Any]:
     return left, right
 
 
+def _is_nan(v: Any) -> bool:
+    try:
+        return isinstance(v, (float, Decimal)) and math.isnan(v)
+    except (TypeError, ValueError):
+        return False
+
+
 def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     left = evaluate(node.this, scope, ctx)
     right = evaluate(node.expression, scope, ctx)
@@ -1351,6 +1358,14 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
             left = left.replace(tzinfo=_dt.timezone.utc)
         else:
             right = right.replace(tzinfo=_dt.timezone.utc)
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        # Arrays compare element-wise with the scalar rules — a Decimal128
+        # element from one construction path must equal a Decimal from another.
+        left = [_unwrap_decimal(v) for v in left]
+        right = [_unwrap_decimal(v) for v in right]
+    if _is_nan(left) and _is_nan(right):
+        # Postgres treats NaN as equal to NaN (and greater than every number).
+        return isinstance(node, (exp.EQ, exp.GTE, exp.LTE))
     if isinstance(node, exp.EQ):
         return left == right
     if isinstance(node, exp.NEQ):
@@ -1551,6 +1566,8 @@ def _composite_from_seq(values: Any, fields: list, type_name: str) -> dict:
     """Positional record values (raw text fields, a ``row(…)`` result's values,
     or nested subdocs) -> a typed subdocument keyed by the composite's fields."""
     values = list(values)
+    if not fields and values in ([], [None]):
+        return {}  # ``'()'`` for a zero-field composite type
     if len(values) != len(fields):
         raise errors.SQLError(
             "22P02",
@@ -1880,9 +1897,11 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             return typemap.coerce(value, to)
         # An array-literal string cast (``'{a,b,c}'::text[]``) materialises the
         # Python list — subscripting and ``unnest`` need elements, not text.
-        # Coerce by the canonical tag (``to`` is the rendered SQL spelling:
-        # ``int[]``, whose element name isn't an internal tag).
-        if isinstance(value, str):
+        # A LIST value coerces its elements to the target's canonical form
+        # (``array['192.168.0.1']::inet[]`` must compare equal to a canonical
+        # inet[] param). Coerce by the canonical tag (``to`` is the rendered
+        # SQL spelling: ``int[]``, whose element name isn't an internal tag).
+        if isinstance(value, (str, list, tuple)):
             return typemap.coerce(value, to_tag_early if to_tag_early is not None else to)
     # Bit-string casts: ``::bit(n)`` / ``::varbit`` (from a '0'/'1' string or an
     # integer) and ``bit::int``.
@@ -1997,7 +2016,41 @@ def _eval_func(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> Any:
             pairs.append((label, evaluate(inner, scope, ctx)))
         return _xmltype.forest(pairs)
     args = [evaluate(a, scope, ctx) for a in node.expressions]
+    if name == "row":
+        # An anonymous record keeps each field's SQL type oid (derived from the
+        # argument AST) — the binary record encoding embeds per-field oids, and
+        # PG types an untyped literal as unknown (705), an explicit ``::text``
+        # as 25, ``::bytea`` as 17, and so on. Reconstructing oids from Python
+        # values can't make those distinctions.
+        rec = typemap.RecordValue((f"f{i + 1}", v) for i, v in enumerate(args))
+        rec.field_oids = tuple(_row_field_oid(a) for a in node.expressions)
+        return rec
     return _call_func(name, args, ctx)
+
+
+def _row_field_oid(arg: exp.Expression) -> int:
+    """The SQL type oid a ``row(…)`` argument carries into the record, or 0
+    when it must be derived from the runtime value."""
+    node = arg
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Cast):
+        tag = typemap.type_tag_for_sql(node.to)
+        if tag is not None:
+            return typemap.PG_OID.get(tag, 0)
+        return 0
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return 705  # untyped string literal — unknown, loads as bytes
+        text = str(node.this)
+        if "." in text or "e" in text.lower():
+            return 1700  # numeric constant
+        return 23 if -(2**31) <= int(text) < 2**31 else 20
+    if isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal):
+        return _row_field_oid(node.this)
+    if isinstance(node, exp.Boolean):
+        return 16
+    return 0
 
 
 def _column_name_of(node: exp.Expression) -> str:

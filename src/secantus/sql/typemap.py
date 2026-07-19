@@ -521,6 +521,26 @@ class TaggedText(str):
         return obj
 
 
+class TypedList(list):
+    """A list parameter that knows its element tag — substituted through a
+    ``::tag[]`` cast so it compares as a typed array, not raw literal text."""
+
+    elem_tag: str = "text"
+
+    def __init__(self, items: Any = (), elem_tag: str = "text") -> None:
+        super().__init__(items)
+        self.elem_tag = elem_tag
+
+
+class RecordValue(dict):
+    """An anonymous ``row(…)`` record value: an f1..fN dict that ALSO carries
+    each field's SQL type oid (0 = derive from the Python value). The binary
+    record encoder embeds per-field oids, and only the source expression can
+    distinguish an untyped literal (705) from ``::text`` (25) or ``::bytea``."""
+
+    field_oids: tuple[int, ...] = ()
+
+
 class DateText(str):
     """Canonical date text from a parameter declared ``date`` (oid 1082) —
     substituted as a ``::date`` cast so expressions type as date (``$1 + 1`` is

@@ -557,6 +557,19 @@ def _out_column_descs(
         oid = typemap.PG_OID.get(col.type_tag, 25)
         if getattr(col, "json_plain", False):
             oid = 114  # a ``json`` (not jsonb) column keeps the plain-json oid
+        if (
+            getattr(col, "composite_type", None) is not None
+            and storage is not None
+            and db is not None
+        ):
+            # A declared-composite column reports its type's MINTED oid (not
+            # generic RECORD/2249) so a registered psycopg loader fires and
+            # parses nested fields by their reflected types.
+            from secantus.sql import virtual
+
+            minted = virtual._composite_oids(db, Catalog(storage)).get(col.composite_type)
+            if minted is not None:
+                oid = minted
         if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:
             if enum_oids is None:
                 enum_oids = Catalog(storage).enum_type_oids(db)
