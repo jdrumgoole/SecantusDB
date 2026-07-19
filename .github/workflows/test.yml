@@ -322,6 +322,26 @@ jobs:
         # aren't exercised by pytest and would just slow CI down.
         run: uv sync --extra dev --extra admin  # also builds vendored WT via scikit-build-core
 
+      - name: PROBE — why did the build run?
+        # Throwaway. The WT cache is HIT in this lane yet the project build
+        # still takes ~74s, while the rust lane (same hit) takes 4s. Print the
+        # inputs ExternalProject compares, so a second run can be diffed
+        # against this one: if the recorded text differs between runs, the
+        # cache is being invalidated rather than ignored.
+        shell: bash
+        run: |
+          echo "PROBE lane=${{ matrix.python-version }}-${{ matrix.group }}"
+          uv run python -c "import sys; print('PROBE base_exe =', sys._base_executable)"
+          stamp=$(ls -d build/*/wiredtiger_ext-prefix/src/wiredtiger_ext-stamp 2>/dev/null | head -1)
+          echo "PROBE stampdir = $stamp"
+          for f in "$stamp"/*-info.txt; do
+            [ -f "$f" ] || continue
+            printf "PROBE %s = " "$(basename "$f")"
+            sha256sum "$f" | cut -c1-16
+          done
+          echo -n "PROBE libwiredtiger mtime = "
+          stat -c '%Y' build/*/wt-build/libwiredtiger.a 2>/dev/null || echo none
+
       - name: Verify the WiredTiger build is real
         # Fail closed on a bad cache hit. tests/conftest.py installs a STUB
         # wiredtiger module when the extension is missing, so a bare
