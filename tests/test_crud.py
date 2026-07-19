@@ -1130,6 +1130,58 @@ def test_aggregate_to_date(coll) -> None:
     ]
 
 
+def test_date_arg_validation_via_pymongo(coll) -> None:
+    """$dateAdd/$dateSubtract amount and $dateTrunc binSize: whole double accepted,
+    fractional/bool -> 5166405 / 5439017, non-positive binSize -> 5439018. mongod
+    7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "d": dt.datetime(2021, 1, 1)})
+    for op in ("$dateAdd", "$dateSubtract"):
+        for bad in (2.5, True):
+            with pytest.raises(OperationFailure) as exc:
+                list(
+                    coll.aggregate(
+                        [
+                            {
+                                "$project": {
+                                    "r": {op: {"startDate": "$d", "unit": "day", "amount": bad}}
+                                }
+                            }
+                        ]
+                    )
+                )
+            assert exc.value.code == 5166405, (op, bad)
+    for bad, code in [(2.5, 5439017), (True, 5439017), (-1, 5439018)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(
+                coll.aggregate(
+                    [
+                        {
+                            "$project": {
+                                "r": {"$dateTrunc": {"date": "$d", "unit": "day", "binSize": bad}}
+                            }
+                        }
+                    ]
+                )
+            )
+        assert exc.value.code == code, bad
+    # A whole-double amount still computes.
+    out = list(
+        coll.aggregate(
+            [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "r": {"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 2.0}},
+                    }
+                }
+            ]
+        )
+    )
+    assert out == [{"r": dt.datetime(2021, 1, 3)}]
+
+
 def test_to_date_rejects_bool_via_pymongo(coll) -> None:
     """$toDate: a bool is ConversionFailure (241), not coerced to a date; $convert
     with onError catches it. mongod 7.0.12-verified."""
