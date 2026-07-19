@@ -11,6 +11,7 @@ bugs: binary ``timestamptz``/``numeric`` parameters weren't decoded, and the
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 from decimal import Decimal
 
@@ -156,6 +157,34 @@ def test_group_by_and_join(server):
             "SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY region"
         ).fetchall()
         assert rows == [("e", 30), ("w", 30)]
+
+
+def test_idle_in_transaction_session_timeout(server):
+    """A connection left idle inside a transaction longer than
+    idle_in_transaction_session_timeout is terminated with 25P03."""
+    import time
+
+    conn = connect(server)  # autocommit off; closed manually (it dies mid-test)
+    try:
+        conn.execute("SET idle_in_transaction_session_timeout = 100")
+        conn.execute("SELECT 1")  # opens the transaction block
+        time.sleep(0.6)
+        # The typed IdleInTransactionSessionTimeout on platforms that deliver
+        # the FATAL message before the close; on Windows the socket abort can
+        # race it, surfacing a plain OperationalError (same as psycopg's own
+        # test_right_exception_on_session_timeout win32 branch).
+        with pytest.raises(
+            (psycopg.errors.IdleInTransactionSessionTimeout, psycopg.OperationalError)
+        ):
+            conn.execute("SELECT 1")
+    finally:
+        with contextlib.suppress(psycopg.Error):
+            conn.close()
+    # A zero (default) timeout leaves an idle transaction alone.
+    with connect(server) as conn:
+        conn.execute("SELECT 1")
+        time.sleep(0.3)
+        assert conn.execute("SELECT 2").fetchone() == (2,)
 
 
 def test_transaction_commit_and_rollback(server):

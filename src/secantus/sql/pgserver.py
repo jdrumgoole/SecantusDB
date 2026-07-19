@@ -75,6 +75,20 @@ _INTERNAL_ERROR_MSG = "internal error"
 _PGCOPY_SIGNATURE = b"PGCOPY\n\xff\r\n\x00"
 
 
+def _idle_in_txn_timeout_ms(session: Any) -> int:
+    """The session's ``idle_in_transaction_session_timeout`` in milliseconds
+    (0 = disabled), parsed from the GUC value (PG accepts a bare-ms integer or
+    a value with a unit suffix)."""
+    raw = session.get_setting("idle_in_transaction_session_timeout")
+    if not raw:
+        return 0
+    m = __import__("re").match(r"\s*(\d+)\s*(ms|s|min)?\s*$", str(raw))
+    if m is None:
+        return 0
+    n = int(m.group(1))
+    return {"s": n * 1000, "min": n * 60_000}.get(m.group(2) or "ms", n)
+
+
 def _error_position(exc: Any, sql: str) -> int | None:
     """A best-effort 1-based statement position for a name error: the offset of
     the quoted identifier the message cites (clients render the ``LINE 1: …``
@@ -475,8 +489,32 @@ class SecantusPGServer:
         # Per-connection extended-protocol state (prepared statements + portals).
         ext = ExtendedSession(self.storage, session)
         while not self._stop_event.is_set():
+            # idle_in_transaction_session_timeout: while a transaction is open,
+            # bound the wait for the next command; exceeding it aborts the
+            # transaction and terminates the connection (25P03), like PG.
+            idle_ms = _idle_in_txn_timeout_ms(session)
+            if idle_ms and session.txn_handle is not None:
+                conn.settimeout(idle_ms / 1000.0)
+            else:
+                conn.settimeout(None)
             try:
                 msg = pgwire.read_message(conn)
+            except TimeoutError:
+                if session.txn_handle is not None:
+                    with contextlib.suppress(Exception):
+                        self.storage.abort_user_transaction(session.txn_handle)
+                    session.txn_handle = None
+                    session.txn_failed = True
+                with contextlib.suppress(OSError):
+                    conn.settimeout(None)
+                    conn.sendall(
+                        pgwire.error_response(
+                            "25P03",
+                            "terminating connection due to idle-in-transaction timeout",
+                            severity="FATAL",
+                        )
+                    )
+                return
             except pgwire.PGProtocolError:
                 # A framing error (implausible length) desyncs the byte stream —
                 # unrecoverable. Send a FATAL protocol-violation ErrorResponse
