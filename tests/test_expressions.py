@@ -759,6 +759,33 @@ def test_date_add_days() -> None:
     assert out == dt.datetime(2026, 5, 5, 12, 0, 0)
 
 
+def test_date_arg_validation() -> None:
+    import datetime as dt
+
+    d = dt.datetime(2021, 1, 1)
+    # Whole-double amount / binSize is accepted (coerced to int).
+    assert evaluate(
+        {"$dateAdd": {"startDate": d, "unit": "day", "amount": 2.0}}, {}
+    ) == dt.datetime(2021, 1, 3)
+    assert evaluate({"$dateTrunc": {"date": d, "unit": "year", "binSize": 2.0}}, {}) == dt.datetime(
+        2021, 1, 1
+    )
+    # $dateAdd / $dateSubtract amount: fractional / bool / non-numeric -> 5166405.
+    for op in ("$dateAdd", "$dateSubtract"):
+        for bad in (2.5, True, "x"):
+            with pytest.raises(ExpressionError) as exc:
+                evaluate({op: {"startDate": d, "unit": "day", "amount": bad}}, {})
+            assert exc.value.code == 5166405, (op, bad)
+    # $dateTrunc binSize: non-integer -> 5439017, non-positive -> 5439018.
+    for bad in (2.5, True):
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({"$dateTrunc": {"date": d, "unit": "day", "binSize": bad}}, {})
+        assert exc.value.code == 5439017, bad
+    with pytest.raises(ExpressionError) as exc:
+        evaluate({"$dateTrunc": {"date": d, "unit": "day", "binSize": -1}}, {})
+    assert exc.value.code == 5439018
+
+
 def test_date_add_months_with_day_clamp() -> None:
     import datetime as dt
 

@@ -60,9 +60,10 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   null); `$indexOfBytes`/`$indexOfCP` start/end FIXED (#518, → 40096/40097; whole
   double accepted); `$toDate` bool → 241 FIXED (#519; onError-catchable, both
   engines). **Array/string type-guard cluster complete.** (expressions)
-- **Date-arg whole-double / bool**: `$dateAdd`/`$dateSubtract {amount:2.0}` and
-  `$dateTrunc {binSize:2.0}` over-reject valid whole doubles; `amount:true`/`binSize:true`
-  compute (mongod 5166405/5439017). `$toLong: 2.7` rejects valid (mongod truncates→2).
+- **Date-arg whole-double / bool**: `$dateAdd`/`$dateSubtract` amount + `$dateTrunc`
+  binSize FIXED (#520, → whole-double accepted; fractional/bool → 5166405/5439017;
+  binSize <1 → 5439018). Remaining: `$toLong` unimplemented (mongod truncates 2.7→2;
+  a separate missing-operator item — could alias `$convert to:long`).
 - **Query operator validation**: `$in`/`$nin` non-array + `$`-doc element FIXED (#494,
   → 2); `$regex` bad `$options` / `$options`-without-`$regex` / non-string `$regex`
   FIXED (#496, → 51108 / 2); `$elemMatch` non-doc (query) + `$not` invalid arg

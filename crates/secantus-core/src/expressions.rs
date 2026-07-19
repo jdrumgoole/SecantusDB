@@ -2509,6 +2509,18 @@ fn shift_date(start: i64, unit: &str, amount: i128) -> R {
 }
 
 /// `$dateAdd` (sign +1) / `$dateSubtract` (sign -1).
+/// An integer date argument (amount / binSize): an int or a whole double; a
+/// fractional double / bool / non-numeric -> None (defer so Python raises the
+/// mongod error rather than coercing a bool or rejecting a valid whole double).
+fn date_int(v: &Bson) -> Option<i128> {
+    match v {
+        Bson::Int32(n) => Some(*n as i128),
+        Bson::Int64(n) => Some(*n as i128),
+        Bson::Double(d) if d.fract() == 0.0 => Some(*d as i128),
+        _ => None,
+    }
+}
+
 fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
@@ -2524,8 +2536,8 @@ fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     let Bson::String(unit) = eval_opt(d.get("unit"), ctx)? else {
         return Err(Fallback); // unit must be a string
     };
-    let Some(amount) = as_int_like(&amount_v) else {
-        return Err(Fallback); // amount must be an integer
+    let Some(amount) = date_int(&amount_v) else {
+        return Err(Fallback); // fractional / bool / non-numeric -> Python raises 5166405
     };
     shift_date(start_dt.timestamp_millis(), &unit, sign * amount)
 }
@@ -2600,9 +2612,10 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback);
     };
     let bin: i64 = match d.get("binSize") {
-        Some(e) => match as_int_like(&eval(e, ctx)?) {
+        Some(e) => match date_int(&eval(e, ctx)?) {
             Some(n) if n >= 1 => n as i64,
-            _ => return Err(Fallback), // binSize must be a positive integer
+            // fractional / bool / non-numeric (5439017) or < 1 (5439018) -> Python.
+            _ => return Err(Fallback),
         },
         None => 1,
     };

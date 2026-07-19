@@ -928,6 +928,19 @@ def _shift_date(d: _dt.datetime, unit: str, amount: int) -> _dt.datetime:
     raise ExpressionError(f"unsupported date unit: {unit!r}")
 
 
+def _date_int(v: Any) -> int | None:
+    """An integer date argument (mongod amount / binSize): an int or a whole
+    double coerces to int; a fractional double / bool / non-numeric returns None
+    for the caller to reject."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return None
+
+
 def _op_date_add(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateAdd requires a document spec")
@@ -938,9 +951,16 @@ def _op_date_add(arg: Any, ctx: _Ctx) -> Any:
         return None
     if not isinstance(start, _dt.datetime):
         raise ExpressionError("$dateAdd startDate must be a datetime")
-    if not isinstance(unit, str) or not isinstance(amount, int):
-        raise ExpressionError("$dateAdd needs string unit and integer amount")
-    return _shift_date(start, unit, amount)
+    if not isinstance(unit, str):
+        raise ExpressionError("$dateAdd needs a string unit")
+    n = _date_int(amount)
+    if n is None:
+        raise ExpressionError(
+            "$dateAdd expects integer amount of time units",
+            code=5166405,
+            code_name="Location5166405",
+        )
+    return _shift_date(start, unit, n)
 
 
 def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
@@ -953,9 +973,16 @@ def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
         return None
     if not isinstance(start, _dt.datetime):
         raise ExpressionError("$dateSubtract startDate must be a datetime")
-    if not isinstance(unit, str) or not isinstance(amount, int):
-        raise ExpressionError("$dateSubtract needs string unit and integer amount")
-    return _shift_date(start, unit, -amount)
+    if not isinstance(unit, str):
+        raise ExpressionError("$dateSubtract needs a string unit")
+    n = _date_int(amount)
+    if n is None:
+        raise ExpressionError(
+            "$dateSubtract expects integer amount of time units",
+            code=5166405,
+            code_name="Location5166405",
+        )
+    return _shift_date(start, unit, -n)
 
 
 def _op_date_trunc(arg: Any, ctx: _Ctx) -> Any:
@@ -969,9 +996,21 @@ def _op_date_trunc(arg: Any, ctx: _Ctx) -> Any:
     unit = _eval(arg.get("unit"), ctx)
     if not isinstance(unit, str):
         raise ExpressionError("$dateTrunc unit must be a string")
-    bin_size = _eval(arg.get("binSize"), ctx) if "binSize" in arg else 1
-    if not isinstance(bin_size, int) or bin_size < 1:
-        raise ExpressionError("$dateTrunc binSize must be a positive integer")
+    raw_bin = _eval(arg.get("binSize"), ctx) if "binSize" in arg else 1
+    bin_size = _date_int(raw_bin)
+    if bin_size is None:
+        raise ExpressionError(
+            f"$dateTrunc requires 'binSize' to be a 64-bit integer, but got value "
+            f"'{_mongo_val_repr(raw_bin)}' of type {_bson_type_name(raw_bin)}",
+            code=5439017,
+            code_name="Location5439017",
+        )
+    if bin_size < 1:
+        raise ExpressionError(
+            f"$dateTrunc requires 'binSize' to be greater than 0, but got value {bin_size}",
+            code=5439018,
+            code_name="Location5439018",
+        )
     if unit == "year":
         new_year = date.year - ((date.year - 1) % bin_size)
         return _dt.datetime(new_year, 1, 1, tzinfo=date.tzinfo)

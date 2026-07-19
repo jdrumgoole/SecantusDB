@@ -1826,3 +1826,27 @@ def test_to_date_rejects_bool(tmp_path) -> None:
         assert list(coll.aggregate([{"$project": proj}])) == [{"r": "x"}]
     finally:
         srv.stop()
+
+
+def test_date_arg_validation(tmp_path) -> None:
+    """The Rust server rejects a fractional / bool $dateAdd amount / $dateTrunc
+    binSize (defer -> BadValue) and computes a whole-double one."""
+    import datetime as _dt
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "d": _dt.datetime(2021, 1, 1)})
+        for op, key, sub in (
+            ("$dateAdd", "amount", "startDate"),
+            ("$dateSubtract", "amount", "startDate"),
+            ("$dateTrunc", "binSize", "date"),
+        ):
+            for bad in (2.5, True):
+                spec = {sub: "$d", "unit": "day", key: bad}
+                with pytest.raises(pymongo.errors.OperationFailure):
+                    list(coll.aggregate([{"$project": {"r": {op: spec}}}]))
+        proj = {"_id": 0, "r": {"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 2.0}}}
+        assert list(coll.aggregate([{"$project": proj}])) == [{"r": _dt.datetime(2021, 1, 3)}]
+    finally:
+        srv.stop()

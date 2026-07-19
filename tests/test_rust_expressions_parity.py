@@ -838,6 +838,17 @@ CURATED = [
     ({"$dateTrunc": {"date": "$d", "unit": "week"}}, {"d": _DT}),
     ({"$dateTrunc": {"date": "$d", "unit": "year", "binSize": 5}}, {"d": _DT}),
     ({"$dateTrunc": {"date": "$d", "unit": "minute", "binSize": 15}}, {"d": _DT}),
+    # Whole-double amount / binSize now computes on both engines.
+    ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 5.0}}, {"d": _DT}),
+    ({"$dateSubtract": {"startDate": "$d", "unit": "hour", "amount": 3.0}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "year", "binSize": 2.0}}, {"d": _DT}),
+    # Invalid amount / binSize: Rust defers (None); Python raises 5166405 / 5439017.
+    ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 2.5}}, {"d": _DT}),
+    ({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": True}}, {"d": _DT}),
+    ({"$dateSubtract": {"startDate": "$d", "unit": "day", "amount": True}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "day", "binSize": True}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "day", "binSize": 2.5}}, {"d": _DT}),
+    ({"$dateTrunc": {"date": "$d", "unit": "day", "binSize": -1}}, {"d": _DT}),
     # Cases that should defer (rust None -> skipped):
     ({"$toUpper": "café"}, {}),  # non-ASCII
     ({"$dateToString": {"date": "$d", "format": "%Y"}}, {"d": "x"}),
