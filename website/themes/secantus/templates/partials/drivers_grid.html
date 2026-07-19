@@ -10,7 +10,7 @@
     </div>
     <p class="counts"><strong>1019</strong> tests passed &middot; <strong>7</strong> failed</p>
     <p class="note">The official MongoDB Python driver, and the deepest suite we run &mdash; so it surfaces the long tail. The remaining failures are features outside a single node's scope (text / hashed indexes, server-side <code>$where</code> JavaScript), tests that assume a multi-node cluster, and a few driver-side harness artifacts &mdash; not gaps in the CRUD, aggregation, or change-stream surface that test and dev rely on. We run pymongo's own tests, unmodified, against an embedded SecantusDB.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -24,7 +24,7 @@
     </div>
     <p class="counts"><strong>446</strong> tests passed &middot; <strong>1</strong> known divergence</p>
     <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run a curated subset of <code>driver-sync/src/test/functional/</code> &mdash; integration tests that open a real connection to a SecantusDB daemon (the driver's own BSON codec unit tests are run but not counted here; they never touch the server). Type-strict decoders catch wire-shape divergences pymongo's permissive client accepts silently.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -38,7 +38,7 @@
     </div>
     <p class="counts"><strong>358</strong> tests passed &middot; <strong>1</strong> known divergence</p>
     <p class="note">The official Node driver, and the same driver <code>mongosh</code> and the JavaScript ecosystem build on. We run a curated <code>test/integration/</code> spec set via <code>mocha --config test/mocha_mongodb.js</code> &mdash; real wire commands against an embedded SecantusDB daemon.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-node.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-node.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -52,7 +52,7 @@
     </div>
     <p class="counts"><strong>401</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. We run <code>./internal/integration/...</code> &mdash; the package that opens real <code>mongo.Client</code> instances and exchanges wire commands. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -66,7 +66,7 @@
     </div>
     <p class="counts"><strong>258</strong> tests passed &middot; <strong>1</strong> known divergence</p>
     <p class="note">The official MongoDB Ruby driver (mongo + bson 5.x), the gem the Rails / Sinatra ecosystem builds on. We run a curated set of integration spec files end-to-end against an embedded SecantusDB daemon &mdash; every test opens a real <code>Mongo::Client</code>, SCRAM-authenticates as a pre-provisioned <code>root-user</code>, and exchanges wire commands.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-ruby.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-ruby.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -80,7 +80,7 @@
     </div>
     <p class="counts"><strong>101</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The official MongoDB Rust driver &mdash; the basis for Tokio-async MongoDB consumers in Rust. We run a curated set of <code>driver/src/test/</code> in-tree tests via <code>cargo test --lib -p mongodb</code> with <code>MONGODB_URI</code> explicitly overridden in the subprocess env, so the rust driver's fallback chain (<code>$MONGODB_URI</code> &rarr; <code>~/.mongodb_uri</code> &rarr; <code>localhost:27017</code>) can't accidentally route to a real mongod.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-rust.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-rust.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -94,7 +94,7 @@
     </div>
     <p class="counts"><strong>2145</strong> tests passed &middot; <strong>39</strong> failed</p>
     <p class="note">The official high-level PHP library &mdash; the <code>mongodb/mongodb</code> package Laravel and Symfony applications build on. We run its PHPUnit functional suite (<code>Operation</code> / <code>Collection</code> / <code>Database</code> / <code>Command</code>) end-to-end against an embedded SecantusDB daemon; the pure-code query-builder and BSON-comparator units are run but not counted here, since they never touch the server.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-php-lib.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-php-lib.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -108,7 +108,7 @@
     </div>
     <p class="counts"><strong>247</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The low-level PHP extension &mdash; the C-based PECL <code>ext-mongodb</code> that wraps libmongoc and underpins the library above. We run its <code>.phpt</code> wire-protocol suite via PHP's <code>run-tests.php</code> against an embedded SecantusDB daemon (the pure BSON-serialization tests are run but not counted). Alongside Go, the strictest wire-shape check we run &mdash; type divergences pymongo accepts silently fail here.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-php-ext.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-php-ext.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -122,7 +122,7 @@
     </div>
     <p class="counts"><strong>723</strong> tests passed &middot; <strong>2</strong> failed</p>
     <p class="note">The official MongoDB <strong>C</strong> driver (<code>libmongoc</code>) &mdash; the lowest-level official client, the one the PHP, Ruby (bson), and PyMongo C-extensions ultimately wrap. We build its <code>test-libmongoc</code> suite from source and run a curated set of wire-protocol prefixes (CRUD / cursor / aggregate / command / GridFS / index management) against an embedded SecantusDB daemon via <code>MONGOC_TEST_URI</code>. A strict C client &mdash; type and wire-shape divergences surface here that permissive clients accept.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-c.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-c.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -136,7 +136,7 @@
     </div>
     <p class="counts"><strong>890</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The official MongoDB <strong>C++</strong> driver (<code>mongocxx</code>), built on libmongoc. We build its Catch2 <code>test_driver</code> suite from source and run it (CRUD / cursor / aggregate / GridFS / commands) against an embedded SecantusDB daemon. mongocxx's tests hard-wire the driver default port, so the gauge serves them on <code>127.0.0.1:27017</code>.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-cxx.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-cxx.html" rel="noopener">Read the report &rarr;</a>
   </article>
 
   <article class="driver">
@@ -150,7 +150,7 @@
     </div>
     <p class="counts"><strong>202</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The official MongoDB <strong>C# / .NET</strong> driver — the one the .NET / Unity / Xamarin ecosystem builds on. We run its xUnit CRUD specification suite (<code>MongoDB.Driver.Tests.Specifications.crud</code>) via <code>dotnet test</code> against an embedded SecantusDB daemon, with <code>MONGODB_URI</code> pointed at it. The driver's <code>[RequireServer]</code> attribute self-skips version- and topology-gated cases.</p>
-    <a class="report" href="https://secantusdb.readthedocs.io/en/latest/validation-report-dotnet.html" rel="noopener">Read the report &rarr;</a>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-dotnet.html" rel="noopener">Read the report &rarr;</a>
   </article>
 </div>
 
