@@ -58,9 +58,19 @@ _pure = _load_pure_query()
 
 
 def _rust_match(doc, query, collation=None):
-    return _rust.query_matches(
-        bson.encode(doc), bson.encode(query), bson.encode({}), bson.encode(collation or {})
+    dw, qw, vw, cw = (
+        bson.encode(doc),
+        bson.encode(query),
+        bson.encode({}),
+        bson.encode(collation or {}),
     )
+    owned = _rust.query_matches(dw, qw, vw, cw)
+    # The raw-BSON matcher must agree with the owned matcher bool-for-bool AND
+    # defer (None) on exactly the same inputs — the two-sided contract. Every
+    # curated / fuzz / regex / collation case below thus also pins matches_raw.
+    raw = _rust.query_matches_raw(dw, qw, vw, cw)
+    assert raw == owned, f"matches_raw={raw} != matches={owned} query={query} doc={doc}"
+    return owned
 
 
 _Collation = sys.modules["secantus.collation"].Collation

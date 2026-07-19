@@ -31,7 +31,7 @@
 
 use std::cmp::Ordering;
 
-use bson::{Bson, Document};
+use bson::{Bson, Document, RawBsonRef, RawDocument};
 
 use crate::collation::{self, Collation};
 use crate::{expressions, numeric, regexutil};
@@ -52,6 +52,120 @@ pub fn matches(doc: &Document, query: &Document, vars: &Document, coll: Option<&
         }
     }
     Ok(true)
+}
+
+/// Raw-BSON entry point: match `query` against `raw` **without** materialising
+/// the whole document into an owned `Document`. Only the fields the filter
+/// actually reaches are decoded (`resolve_path_raw` converts just those leaves
+/// to owned `Bson`), so a selective filter over a wide document skips decoding
+/// every sibling field — the scan-path materialization tax
+/// (`tasks/rust-perf-findings.md`, Finding 1). Result is identical to
+/// `matches(&raw.to_document(), ...)`; the parity suite pins it bool-for-bool
+/// against the owned matcher. `$expr` / `$jsonSchema` need the whole document,
+/// so those single clauses fall back to a full decode. Any raw-parse hiccup
+/// signals `Fallback` (defer to the pure-Python matcher), never a wrong answer.
+pub fn matches_raw(
+    raw: &RawDocument,
+    query: &Document,
+    vars: &Document,
+    coll: Option<&Collation>,
+) -> R {
+    for (k, v) in query.iter() {
+        if !match_clause_raw(raw, k, v, vars, coll)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn match_clause_raw(
+    raw: &RawDocument,
+    key: &str,
+    cond: &Bson,
+    vars: &Document,
+    coll: Option<&Collation>,
+) -> R {
+    match key {
+        "$and" => {
+            for c in cond.as_array().ok_or(Fallback)? {
+                if !matches_raw(raw, as_doc(c)?, vars, coll)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        "$or" => {
+            for c in cond.as_array().ok_or(Fallback)? {
+                if matches_raw(raw, as_doc(c)?, vars, coll)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        "$nor" => {
+            for c in cond.as_array().ok_or(Fallback)? {
+                if matches_raw(raw, as_doc(c)?, vars, coll)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        "$comment" => Ok(true),
+        // These operators inspect the whole document, so there's nothing to save
+        // by staying raw — decode once and delegate this clause to the owned
+        // matcher.
+        "$expr" | "$jsonSchema" => {
+            let doc: Document = raw.try_into().map_err(|_| Fallback)?;
+            match_clause(&doc, key, cond, vars, coll)
+        }
+        // $where, $text, ... -> Python.
+        _ if key.starts_with('$') => Err(Fallback),
+        _ => {
+            let reached = resolve_path_raw(raw, key)?;
+            let refs: Vec<Option<&Bson>> = reached.iter().map(Option::as_ref).collect();
+            field_matches(&refs, cond, coll)
+        }
+    }
+}
+
+/// Raw-BSON [`resolve_path`]: the same dotted-path walk (into sub-documents by
+/// key, into arrays by numeric index, fanning out over array elements for
+/// non-index parts) over a [`RawDocument`], decoding **only** the reached values
+/// into owned `Bson`. Returns `Fallback` on a raw-parse error so the caller
+/// defers rather than guessing.
+fn resolve_path_raw(raw: &RawDocument, path: &str) -> Result<Vec<Option<Bson>>, Fallback> {
+    let mut parts = path.split('.');
+    let first = parts.next().unwrap_or("");
+    let mut current: Vec<Option<RawBsonRef>> = vec![raw.get(first).map_err(|_| Fallback)?];
+    for part in parts {
+        let mut nxt: Vec<Option<RawBsonRef>> = Vec::new();
+        for cur in current.iter().copied() {
+            match cur {
+                Some(RawBsonRef::Document(d)) => nxt.push(d.get(part).map_err(|_| Fallback)?),
+                Some(RawBsonRef::Array(arr)) => {
+                    if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+                        let idx: usize = part.parse().map_err(|_| Fallback)?;
+                        nxt.push(arr.get(idx).map_err(|_| Fallback)?);
+                    } else {
+                        for elem in arr {
+                            if let RawBsonRef::Document(ed) = elem.map_err(|_| Fallback)? {
+                                nxt.push(ed.get(part).map_err(|_| Fallback)?);
+                            }
+                        }
+                    }
+                }
+                _ => nxt.push(None),
+            }
+        }
+        current = nxt;
+    }
+    current
+        .into_iter()
+        .map(|o| match o {
+            Some(rbr) => Bson::try_from(rbr).map(Some).map_err(|_| Fallback),
+            None => Ok(None),
+        })
+        .collect()
 }
 
 fn as_doc(b: &Bson) -> Result<&Document, Fallback> {
@@ -1716,7 +1830,19 @@ mod tests {
     use bson::doc;
 
     fn m(doc: Document, query: Document) -> bool {
-        matches(&doc, &query, &Document::new(), None).expect("should not fall back")
+        let owned = matches(&doc, &query, &Document::new(), None).expect("should not fall back");
+        // The raw-BSON matcher must agree with the owned one bool-for-bool
+        // wherever the owned matcher succeeds — every query test here doubles as
+        // a `matches_raw` parity check.
+        let bytes = bson::to_vec(&doc).unwrap();
+        let raw = RawDocument::from_bytes(&bytes).unwrap();
+        let raw_res = matches_raw(raw, &query, &Document::new(), None)
+            .expect("matches_raw fell back where matches succeeded");
+        assert_eq!(
+            raw_res, owned,
+            "matches_raw disagreed with matches for doc={doc:?} query={query:?}"
+        );
+        owned
     }
 
     #[test]

@@ -5328,30 +5328,37 @@ impl Storage {
             self.scan_blobs_natural(&session, db, coll)?
         };
 
-        // Decode + filter; keep the doc alongside the blob for the post-sort.
+        // Filter over RAW BSON: `matches_raw` decodes only the fields the filter
+        // reaches, so a selective filter over wide documents never materialises
+        // the sibling fields (Finding 1, tasks/rust-perf-findings.md). Unmatched
+        // documents are never fully decoded; a no-sort find never decodes at all.
         // `vars` carries command `let` bindings for `$expr` in the filter.
-        let mut out: Vec<(Document, Vec<u8>)> = Vec::new();
+        let mut out: Vec<Vec<u8>> = Vec::new();
         for blob in blobs {
-            let d = decode_doc(&blob)?;
-            if query_matches(&d, filter, vars, coll_opt)
+            let raw =
+                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
+            if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
                 .map_err(|_| StorageError::QueryUnsupported)?
             {
-                out.push((d, blob));
+                out.push(blob);
             }
         }
         if !in_sort_order {
             if let Some(spec) = multi_sort_spec(sort) {
-                // Decorate-sort-undecorate on the byte-sortable compound key
-                // (collation-folded when a collation is active).
+                // A post-sort needs the sort-field values, so decode the *matched*
+                // documents only (the filter already discarded the rest). Decorate
+                // -sort-undecorate on the byte-sortable compound key (collation-
+                // folded when a collation is active).
                 let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(out.len());
-                for (d, blob) in out {
+                for blob in out {
+                    let d = decode_doc(&blob)?;
                     keyed.push((sort_key(&d, &spec, coll_opt)?, blob));
                 }
                 keyed.sort_by(|a, b| a.0.cmp(&b.0));
                 return Ok(keyed.into_iter().map(|(_, b)| b).collect());
             }
         }
-        Ok(out.into_iter().map(|(_, b)| b).collect())
+        Ok(out)
     }
 
     /// Candidate `(id_key, blob)` pairs for `filter`: index-routed (deduped) when
@@ -5417,8 +5424,12 @@ impl Storage {
         let vars = Document::new();
         let mut n = 0usize;
         for (_id_k, blob) in self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())? {
-            let d = decode_doc(&blob)?;
-            if query_matches(&d, filter, &vars, coll_opt)
+            // Match over raw BSON — count never returns the documents, so a
+            // selective filter over wide documents decodes only the filter's
+            // fields, nothing else (matches `find_matching_with`).
+            let raw =
+                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
+            if secantus_core::query::matches_raw(raw, filter, &vars, coll_opt)
                 .map_err(|_| StorageError::QueryUnsupported)?
             {
                 n += 1;
