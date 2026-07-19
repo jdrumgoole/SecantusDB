@@ -310,20 +310,28 @@ fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
 
 fn unwind_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     let (path, preserve_null, include_index) = match spec {
-        Bson::String(s) => (s.trim_start_matches('$').to_string(), false, None),
+        Bson::String(s) => {
+            if !s.starts_with('$') {
+                return Err(Fallback); // bare path -> Python raises 28818
+            }
+            (s.trim_start_matches('$').to_string(), false, None)
+        }
         Bson::Document(d) => {
             let Some(Bson::String(raw)) = d.get("path") else {
-                return Err(Fallback); // non-string path -> Python raises
+                return Err(Fallback); // non-string path -> Python raises 28808
             };
+            if !raw.starts_with('$') {
+                return Err(Fallback); // bare path -> Python raises 28818
+            }
             let preserve = match d.get("preserveNullAndEmptyArrays") {
                 None => false,
                 Some(Bson::Boolean(b)) => *b,
-                // Python's `bool(...)` of arbitrary values -> defer the odd cases.
-                _ => return Err(Fallback),
+                _ => return Err(Fallback), // non-bool -> Python raises 28809
             };
             let include = match d.get("includeArrayIndex") {
                 None | Some(Bson::Null) => None,
-                Some(Bson::String(s)) => Some(s.clone()),
+                // A non-empty, non-`$`-prefixed string; else defer (28810 / 28822).
+                Some(Bson::String(s)) if !s.is_empty() && !s.starts_with('$') => Some(s.clone()),
                 _ => return Err(Fallback),
             };
             (raw.trim_start_matches('$').to_string(), preserve, include)

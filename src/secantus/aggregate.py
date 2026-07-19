@@ -651,19 +651,52 @@ def _densify_canon(value: Any) -> Any:
 def _stage_unwind(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    include_index: str | None = None
     if isinstance(spec, str):
-        path = spec.lstrip("$")
+        raw_path: Any = spec
         preserve_null = False
-        include_index: str | None = None
     elif isinstance(spec, Mapping):
         raw_path = spec.get("path")
-        if not isinstance(raw_path, str):
-            raise AggregateError("$unwind requires a path string")
-        path = raw_path.lstrip("$")
-        preserve_null = bool(spec.get("preserveNullAndEmptyArrays", False))
+        preserve_raw = spec.get("preserveNullAndEmptyArrays", False)
+        if not isinstance(preserve_raw, bool):
+            raise AggregateError(
+                "expected a boolean for the preserveNullAndEmptyArrays option to "
+                f"$unwind stage, got {_bson_type_name(preserve_raw)}",
+                code=28809,
+                code_name="Location28809",
+            )
+        preserve_null = preserve_raw
         include_index = spec.get("includeArrayIndex")
+        if include_index is not None:
+            if not isinstance(include_index, str) or not include_index:
+                raise AggregateError(
+                    "expected a non-empty string for the includeArrayIndex  option to "
+                    f"$unwind stage, got {_bson_type_name(include_index)}",
+                    code=28810,
+                    code_name="Location28810",
+                )
+            if include_index.startswith("$"):
+                raise AggregateError(
+                    "includeArrayIndex option to $unwind stage should not be prefixed "
+                    f"with a '$': {include_index}",
+                    code=28822,
+                    code_name="Location28822",
+                )
     else:
         raise AggregateError("$unwind requires a path string or document spec")
+    if not isinstance(raw_path, str):
+        raise AggregateError(
+            f"expected a string as the path for $unwind stage, got {_bson_type_name(raw_path)}",
+            code=28808,
+            code_name="Location28808",
+        )
+    if not raw_path.startswith("$"):
+        raise AggregateError(
+            f"path option to $unwind stage should be prefixed with a '$': {raw_path}",
+            code=28818,
+            code_name="Location28818",
+        )
+    path = raw_path.lstrip("$")
 
     result: list[dict[str, Any]] = []
     for doc in docs:

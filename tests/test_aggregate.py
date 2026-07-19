@@ -159,6 +159,26 @@ def test_unwind_with_index() -> None:
     assert [(d["tags"], d["i"]) for d in out] == [("x", 0), ("y", 1)]
 
 
+def test_unwind_argument_validation() -> None:
+    # mongod: bare path 28818, non-string path 28808, non-string/empty index 28810,
+    # $-prefixed index 28822, non-bool preserve 28809.
+    docs = [{"a": [1, 2, 3]}]
+    for spec, code in [
+        ({"path": "a"}, 28818),
+        ("a", 28818),
+        ({"path": 5}, 28808),
+        ({"path": "$a", "includeArrayIndex": 5}, 28810),
+        ({"path": "$a", "includeArrayIndex": ""}, 28810),
+        ({"path": "$a", "includeArrayIndex": "$i"}, 28822),
+        ({"path": "$a", "preserveNullAndEmptyArrays": 5}, 28809),
+    ]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline([dict(d) for d in docs], [{"$unwind": spec}])
+        assert exc.value.code == code, spec
+    # Valid forms still unwind.
+    assert len(apply_pipeline([dict(d) for d in docs], [{"$unwind": "$a"}])) == 3
+
+
 def test_unwind_empty_array_drops_doc_by_default() -> None:
     docs = [{"_id": 1, "tags": []}, {"_id": 2, "tags": ["x"]}]
     out = apply_pipeline(docs, [{"$unwind": "$tags"}])
