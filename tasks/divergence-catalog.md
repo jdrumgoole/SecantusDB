@@ -85,7 +85,7 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   `{buckets:true}`/`granularity:'BOGUS'` accepted (40241/40257); `$densify`
   `{step:true}`/`bounds:'partial'`/`[0]`/`[5,0]`/unit-on-numeric FIXED (#504, →
   14/5946802/5733403/5733402/6053600; `{step:1.5}` is mongod-valid, now computes);
-  `$unwind` path/includeArrayIndex/preserve FIXED (#522, → 28808/28818/28810/28822/
+  `$unwind` path/includeArrayIndex/preserve FIXED (#523, → 28808/28818/28810/28822/
   28809); `$sortByCount`
   number/non-expr-doc/no-`$` accepted (40149/40147/40148); `$facet` empty/non-array/
   non-object-stage/nested FIXED (#505, → 40169/40170/40171/40600); `$count`
