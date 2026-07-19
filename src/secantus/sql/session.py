@@ -38,6 +38,9 @@ GUC_DEFAULTS: dict[str, str] = {
     # Two-phase commit is supported (#139); a real PG defaults this to 0 but a
     # zero here reads as "2PC disabled" to drivers' capability probes.
     "max_prepared_transactions": "100",
+    # 0 = disabled (PG default); a positive value (ms) terminates a connection
+    # left idle in a transaction block that long.
+    "idle_in_transaction_session_timeout": "0",
     "transaction_isolation": "read committed",
     "transaction_read_only": "off",
     "transaction_deferrable": "off",

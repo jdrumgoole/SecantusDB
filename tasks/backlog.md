@@ -1838,38 +1838,56 @@ threading into `wt_config`.)
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
 `tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
 
-- [ ] **Sub-millisecond timestamp fidelity.** `timestamp`/`timestamptz` (and ts/tstz
-  ranges + multiranges) truncate to milliseconds — BSON datetime is an int64 of
-  millis. Operations succeed; round-trips differ by <1ms. Exact microseconds need a
-  storage-representation change (ISO-text or a micros sidecar) that touches
-  comparisons, scalar functions, and sorting. Found by psycopg's full-type faker
-  (`validate-psycopg`, the only fidelity failures left in `test_leak`'s probe set).
-- [ ] **`numeric` beyond 34 significant digits.** Stored as Decimal128, which caps at
-  34 digits; wider values round into range (Postgres keeps them exact). Exact
+The psycopg conformance gauge stands at **99.5%** (4104/4126 ran) after the
+2026-07 slice series (PRs #543 #548 #552 #558 #561 #564 + the idle-timeout
+slice). The remaining ~22 failures fall into these buckets, which are the
+honest edge of what the Postgres front-end can reach WITHOUT changing the
+shared storage engine or building large new protocol subsystems:
+
+- [ ] **Sub-millisecond timestamp fidelity (~11 gauge tests).** `timestamp`/
+  `timestamptz` (and ts/tstz ranges) truncate to milliseconds — BSON datetime
+  is an int64 of millis, the SAME representation the Mongo side uses, so this
+  isn't a SQL-layer bug but a shared-storage constraint. Exact microseconds
+  need a storage-representation change (ISO-text or a micros sidecar) that
+  touches `typemap.coerce`/`to_py`, `scalar._eval_compare`, `sortkey`
+  encoding, and every scalar datetime function — and would diverge SQL
+  timestamp storage from the Mongo BSON datetimes that the dual-protocol
+  reflected-table path reads. The failing tests are psycopg's random-data
+  faker suites (`test_adapt::test_random`, `test_copy::test_copy_from_leaks`/
+  `test_copy_table_across`) that assert exact round-trips, so they flap on
+  whether a random draw's microseconds land on a whole millisecond.
+- [ ] **`numeric` beyond 34 significant digits.** Stored as Decimal128, which
+  caps at 34 digits (same shared constraint); wider *stored* values round.
+  The binary wire codec now round-trips arbitrarily wide values (PR #564), so
+  the param-only `test_dump_numeric_exhaustive` passes; only values that
+  actually persist through Decimal128 storage lose precision. Exact wide
   storage would need a text/dual representation for `numeric`.
-- [ ] **`test_leak[asyncio-*]` flapping on `FeatureNotSupported: unsupported value
-  expression`.** psycopg's `test_cursor_client.py::test_leak` asyncio variants flip
-  parametrizations in every deterministic gauge run pair around one persistent
-  unsupported-value-expression error in `test_leak`'s random probe queries; a single
-  dedicated diagnosis (find which value expression the ClientCursor emits that the
-  planner rejects) would stabilise ~5 tests at once.
-- [ ] **Coercion errors in one extended-protocol path surface as `XX000` internal
-  error instead of `22P02`.** The declared-OID text-param conversion raises 22P02
-  correctly; some column-coercion failures during Execute still fall through the
-  generic handler. Map `ValueError`-class coercion failures to 22P02 there too.
+- [ ] **Query pipelining (`test_generators::test_pipeline_communicate_abort`).**
+  psycopg's pipeline mode batches many extended-protocol messages before a
+  Sync; the server processes each `Sync` synchronously rather than tracking a
+  pipeline-abort boundary. A real feature (its own subsystem), not a bug.
+- [ ] **CancelRequest handling (`test_generators::test_cancel`, and the
+  environmental `test_cancel_safe_*` "proxy didn't start listening: Errno 22"
+  harness failures).** The v3 CancelRequest startup packet is parsed but not
+  acted on (statements run synchronously, so there is no mid-query cancel
+  point to interrupt). The `test_cancel_safe_*` failures are a psycopg
+  test-harness socket-proxy issue on this machine, not a server behaviour.
+- [ ] **Reject connections to non-existent databases (`test_pgconn_error`,
+  `test_connect_bad`).** SecantusDB creates a database on demand (the
+  ephemeral-db model shared with the Mongo server), so connecting to
+  `dbname=nosuchdb` succeeds where real PG raises. A deliberate divergence —
+  rejecting unknown dbs would break the in-process test-db ergonomic.
+- [ ] **Streaming COPY OUT abort (`test_copy_out_error_with_copy_not_finished`).**
+  COPY OUT materializes the whole result and sends it in one burst, so a
+  client that reads one row and aborts finds the copy already finished
+  (transaction stays INTRANS instead of INERROR). Needs interleaved
+  client-abort detection during a streamed COPY OUT.
+- [ ] **`test_return_untyped[b]` / DatatypeMismatch.** A binary untyped
+  parameter used in a context that PG rejects with 42804 — niche.
 - [ ] **Schema-qualified tables** (`CREATE TABLE testschema.t (…)`) — CREATE
   SCHEMA and schema-qualified user *types* landed; tables in a user schema
   still raise. Needs the (db, coll) storage key to carry the schema (or a
   dotted-collection mapping like the types take).
-- [ ] **Untyped binary parameters need Parse-time type inference.** psycopg
-  dumps a bound-less `Range(empty=True)` (and lists of them) with oid 0 in
-  BINARY format; real PG infers `$1`'s type from the statement context at
-  parse analysis, then decodes the binary payload with that type. We decode
-  eagerly at Bind with no context, so the payload arrives as garbage text
-  (`'\x01'`). ~10 psycopg range/multirange tests
-  (`test_dump_builtin_empty[b-*]`, `test_dump_builtin_range[b-*-None-None]`,
-  `test_dump_builtin_multirange[b-*]`). Fix: infer `$N` types from the AST
-  (comparison/cast context) at Parse, store on `Prepared.param_oids`.
 - [ ] **HAVING general-shape residual**: the HAVING lowerers now cover
   comparisons, `IS [NOT] NULL` (incl. computed group-key operands),
   `[NOT] IN` over group keys, and always-unknown NULL-operand folds — but any
