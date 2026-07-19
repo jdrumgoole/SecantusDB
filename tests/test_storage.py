@@ -682,7 +682,9 @@ def test_create_archive_round_trips_inserts(tmp_path) -> None:
 
     dst.mkdir()
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(dst, filter="data")
+        # trusted test archive — extract without the `filter` kwarg, which older
+        # 3.10/3.11 patch releases (e.g. 3.10.11) don't accept.
+        tar.extractall(dst)
     s2 = Storage(str(dst))
     try:
         rows = sorted(s2.find_matching("appdb", "things"), key=lambda d: d["_id"])
