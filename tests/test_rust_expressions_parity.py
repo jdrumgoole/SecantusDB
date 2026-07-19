@@ -371,6 +371,16 @@ CURATED = [
     ({"$toInt": "$n"}, {"n": Int64(2**40)}),  # int64 > int32 -> overflow
     ({"$toInt": 2147483647.0}, {}),  # int32 max exactly -> ok
     ({"$toInt": float("inf")}, {}),  # non-finite -> overflow (both defer)
+    # $toLong — int64 target: computes numeric cases, defers string/Decimal128/overflow.
+    ({"$toLong": 3.9}, {}),
+    ({"$toLong": "$n"}, {"n": -3.9}),
+    ({"$toLong": True}, {}),
+    ({"$toLong": 9_000_000_000.0}, {}),  # > int32, within int64 -> ok
+    ({"$toLong": "$n"}, {"n": Int64(2**40)}),  # int64 passes through
+    ({"$toLong": "$x"}, {}),  # missing -> null
+    ({"$toLong": 1e30}, {}),  # > int64 max -> overflow (both defer)
+    ({"$toLong": float("inf")}, {}),  # non-finite -> defer
+    ({"$toLong": "42"}, {}),  # string parse -> defer
     ({"$toDouble": 5}, {}),
     ({"$toDouble": False}, {}),
     ({"$toDouble": "$n"}, {"n": Int64(7)}),

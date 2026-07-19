@@ -260,6 +260,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         // type conversions (safe subset; Decimal128 / string-parse / float
         // str() defer to Python)
         "$toInt" => op_to_int(arg, ctx),
+        "$toLong" => op_to_long(arg, ctx),
         "$toDouble" => op_to_double(arg, ctx),
         "$toDecimal" => op_to_decimal(arg, ctx),
         "$toDate" => op_to_date(arg, ctx),
@@ -422,6 +423,7 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$dateDiff",
     "$dateTrunc",
     "$toInt",
+    "$toLong",
     "$toDouble",
     "$toDecimal",
     "$toDate",
@@ -2705,6 +2707,30 @@ fn op_to_int(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback); // overflow int32 -> Python raises 241
     }
     Ok(Bson::Int32(n as i32))
+}
+
+fn op_to_long(arg: &Bson, ctx: &Ctx) -> R {
+    // $toLong targets int64: a double is truncated toward zero (out of i64 range
+    // -> Python raises 241). Non-finite / Decimal128 / string -> Python.
+    let n: i64 = match eval(arg, ctx)? {
+        Bson::Null => return Ok(Bson::Null),
+        Bson::Int32(v) => v as i64,
+        Bson::Int64(v) => v,
+        Bson::Boolean(b) => i64::from(b),
+        Bson::Double(d) => {
+            if !d.is_finite() {
+                return Err(Fallback);
+            }
+            let t = d.trunc();
+            // [-2^63, 2^63): a double at or beyond 2^63 can't be an i64.
+            if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t) {
+                return Err(Fallback); // overflow int64 -> Python raises 241
+            }
+            t as i64
+        }
+        _ => return Err(Fallback),
+    };
+    Ok(Bson::Int64(n))
 }
 
 fn op_to_double(arg: &Bson, ctx: &Ctx) -> R {

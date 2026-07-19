@@ -2430,6 +2430,32 @@ def _op_to_int(arg: Any, ctx: _Ctx) -> Any:
     return result
 
 
+def _op_to_long(arg: Any, ctx: _Ctx) -> Any:
+    # Mirrors `_op_to_int` but targets int64: a double truncates toward zero, a
+    # string parses, bool -> 0/1, and the result is wrapped as `Int64` so it
+    # renders as `$type: "long"`. An out-of-[-2^63, 2^63-1] result overflows (241).
+    value = _eval(arg, ctx)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return Int64(1 if value else 0)
+    if isinstance(value, int):
+        result = int(value)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ExpressionError(_OVERFLOW_MSG, code=241)
+        result = int(value)  # truncates toward zero
+    elif isinstance(value, Decimal128):
+        result = int(value.to_decimal())
+    elif isinstance(value, str):
+        result = _safe_int_from_str(value, "$toLong")
+    else:
+        raise ExpressionError(f"$toLong cannot convert {type(value).__name__}")
+    if not _INT64_MIN <= result <= _INT64_MAX:
+        raise ExpressionError(_OVERFLOW_MSG, code=241)
+    return Int64(result)
+
+
 def _op_to_double(arg: Any, ctx: _Ctx) -> Any:
     value = _eval(arg, ctx)
     if value is None:
@@ -3000,6 +3026,7 @@ _OPS = {
     "$reverseArray": _op_reverse_array,
     "$in": _op_in,
     "$toInt": _op_to_int,
+    "$toLong": _op_to_long,
     "$toDouble": _op_to_double,
     "$toBool": _op_to_bool,
     "$toDecimal": _op_to_decimal,
