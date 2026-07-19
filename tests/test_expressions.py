@@ -451,6 +451,36 @@ def test_string_typeguard_error_codes() -> None:
     assert evaluate({"$binarySize": "abc"}, {}) == 3
 
 
+def test_date_misc_typeguard_error_codes() -> None:
+    import datetime
+
+    d = {"$literal": datetime.datetime(2020, 1, 1)}
+    # Date/misc operators match mongod's error codes. $dateToString on a non-date
+    # (and $dateDiff missing endDate) previously silently returned a value.
+    for expr, code in [
+        ({"$dateToString": {"date": "x"}}, 16006),
+        ({"$dateToParts": {"date": "x"}}, 16006),
+        ({"$dateFromString": {"dateString": 5}}, 241),
+        ({"$dateAdd": {"startDate": d, "unit": "bogus", "amount": 1}}, 9),
+        ({"$dateTrunc": {"date": d, "unit": "bogus"}}, 9),
+        ({"$let": {"vars": {}, "in": "$$x"}}, 17276),
+        ({"$switch": {"branches": []}}, 40068),
+        ({"$ifNull": [1]}, 1257300),
+        ({"$getField": {"field": 5, "input": {}}}, 5654602),
+        ({"$setField": {"field": 5, "input": {}, "value": 1}}, 4161107),
+        ({"$sortArray": {"input": [1], "sortBy": "x"}}, 2942507),
+        ({"$convert": {"input": 5}}, 9),
+        ({"$dateDiff": {"startDate": d}}, 5166304),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {"_id": 1})
+        assert exc.value.code == code, expr
+    # Valid forms still compute.
+    assert evaluate({"$ifNull": [None, 7]}, {}) == 7
+    assert evaluate({"$let": {"vars": {"a": 5}, "in": "$$a"}}, {}) == 5
+    assert evaluate({"$switch": {"branches": [{"case": True, "then": 9}]}}, {}) == 9
+
+
 def test_more_expression_error_codes() -> None:
     import datetime
 

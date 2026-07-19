@@ -114,15 +114,19 @@ array/set type-guards `$size`/`$arrayElemAt`/`$in`/`$indexOfArray`/`$setUnion`/
 (51104)/`$indexOfBytes` (40091/40092)/`$binarySize` (51276)/`$bsonSize` (31393) — with
 `$arrayElemAt`+`$in`+the `$regex*` ops being **silent accepts** fixed on both engines — #535.
 `$trim`/`$ltrim`/`$rtrim` (50699) and `$split` (40085/40086/40087) already matched
+(#515/#500). Date/misc type-guards `$dateToString`/`$dateToParts` non-date (16006), `$dateFromString`
+non-string (241), `$dateAdd`/`$dateSubtract`/`$dateTrunc` bad unit (9), `$let` undefined
+var (17276), `$switch` no-branches (40068), `$ifNull` 1-arg (1257300), `$getField`/
+`$setField` non-string field (5654602/4161107), `$sortArray` bad sortBy (2942507),
+`$convert` missing input/to (9), `$dateDiff` missing param (5166303/4/5) — with
+`$dateToString`+`$dateDiff` being **silent accepts** fixed both engines — #536.
+`$trim`/`$ltrim`/`$rtrim` (50699) and `$split` (40085/40086/40087) already matched
 (#515/#500). **A discovery sweep (three passes, ~120 operator error cases) showed the
-divergences are bounded (~dozens, not hundreds), several are genuine silent-accepts.
-Remaining named rows for a follow-on batch: date type-guards ($dateToString/$dateToParts
-non-date → 16006, $dateFromString → 241, $dateAdd/$dateSubtract/$dateTrunc bad unit → 9),
-$let undefined var (17276), $switch no-branches (40068), $ifNull 1-arg (1257300),
-$getField/$setField non-string field (5654602/4161107), $sortArray bad sortBy (2942507),
-$meta bad arg (17308), $convert missing 'to' (9), $dateDiff missing endDate (5166304),
-plus $sum/$avg/$max/$min as expression operators (5.0+ feature, currently 168) and
-$strcasecmp numeric coercion. The rest is per-message text only.**
+divergences were bounded (~dozens, not hundreds); the named type-guard rows are now all
+cleared (#525–#536). Remaining: `$meta` bad arg (17308 — `$meta` isn't an expression
+operator in SecantusDB, gives 168), `$sum`/`$avg`/`$max`/`$min` as *expression* operators
+(a 5.0+ feature, currently 168), and `$strcasecmp` numeric coercion (sec is stricter than
+mongod) — small feature-gaps, not error-code nits. The rest is per-message text only.**
 
 ## Minor / out-of-scope
 - `$where` unsupported (SecantusDB rejects; mongod runs JS — intentionally out of scope).

@@ -2131,6 +2131,26 @@ def test_string_typeguard_codes_via_pymongo(coll) -> None:
         assert exc.value.code == code, expr
 
 
+def test_date_misc_typeguard_codes_via_pymongo(coll) -> None:
+    """Date/misc operators match mongod's error codes over the wire (incl. the
+    previously-silent $dateToString non-date and $dateDiff missing endDate).
+    mongod 7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1, "n": 5})
+    for expr, code in [
+        ({"$dateToString": {"date": "$n"}}, 16006),
+        ({"$dateFromString": {"dateString": "$n"}}, 241),
+        ({"$switch": {"branches": []}}, 40068),
+        ({"$ifNull": ["$n"]}, 1257300),
+        ({"$getField": {"field": "$n", "input": {}}}, 5654602),
+        ({"$dateDiff": {"startDate": "$$NOW"}}, 5166304),
+    ]:
+        with pytest.raises(OperationFailure) as exc:
+            list(coll.aggregate([{"$project": {"v": expr}}]))
+        assert exc.value.code == code, expr
+
+
 def test_more_expression_error_codes_via_pymongo(coll) -> None:
     """More mongod-specific expression error codes over the wire: $zip (34461/
     34468), $arrayToObject (40386), $objectToArray (40390), $replaceOne per-arg
