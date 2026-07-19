@@ -55,6 +55,7 @@ WORKLOADS = (
     "find_all",
     "update_many_half",
     "aggregate_group",
+    "aggregate_multistage",
     "delete_many_half",
 )
 
@@ -186,6 +187,43 @@ def _run_workloads(client: pymongo.MongoClient, n: int) -> dict[str, float]:
         )
     )
     t["aggregate_group"] = time.perf_counter() - start
+
+    # Multi-stage pipeline over a separate array-bearing collection. `$match`
+    # (lifted into the fetch) -> `$unwind` (fans each doc out ~3x) -> `$group`
+    # -> `$sort`: the ~3n/2 documents flowing out of `$unwind` into `$group`
+    # are the large *inter-stage* intermediate a streaming execution model
+    # (Phase 6b) would avoid materializing. The single-stage `aggregate_group`
+    # above can't show that cost, and 6a's field pushdown doesn't apply here
+    # (the first heavier stage is `$unwind`, not `$group`). The collection is
+    # populated untimed so only the pipeline is measured.
+    cm = client["perf"]["cm"]
+    cm.drop()
+    cm.insert_many(
+        [
+            {
+                "_id": i,
+                "g": i % 50,
+                "v": i * 2,
+                "active": i % 2 == 0,
+                "tags": [i % 10, (i + 1) % 10, (i + 2) % 10],
+            }
+            for i in range(n)
+        ],
+        ordered=True,
+    )
+    start = time.perf_counter()
+    _ = list(
+        cm.aggregate(
+            [
+                {"$match": {"active": True}},
+                {"$unwind": "$tags"},
+                {"$group": {"_id": "$tags", "total": {"$sum": "$v"}, "n": {"$sum": 1}}},
+                {"$sort": {"total": -1}},
+            ]
+        )
+    )
+    t["aggregate_multistage"] = time.perf_counter() - start
+    cm.drop()
 
     start = time.perf_counter()
     coll.delete_many({"active": False})
