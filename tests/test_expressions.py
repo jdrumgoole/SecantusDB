@@ -402,6 +402,55 @@ def test_conversion_error_codes() -> None:
     assert evaluate({"$convert": {"input": "abc", "to": "int", "onError": -1}}, {}) == -1
 
 
+def test_array_set_typeguard_error_codes() -> None:
+    # Array/set operators reject a non-array/non-object argument with mongod's
+    # exact Location code (previously a silent accept for $arrayElemAt/$in, or a
+    # generic TypeMismatch 14 for the rest).
+    for expr, code in [
+        ({"$size": 5}, 17124),
+        ({"$arrayElemAt": [5, 0]}, 28689),
+        ({"$in": [1, 5]}, 40081),
+        ({"$indexOfArray": [5, 1]}, 40090),
+        ({"$setUnion": [5]}, 17043),
+        ({"$setIntersection": [5]}, 17047),
+        ({"$setDifference": [5, 6]}, 17048),
+        ({"$setIsSubset": [5, 6]}, 17046),
+        ({"$anyElementTrue": 5}, 17041),
+        ({"$allElementsTrue": 5}, 17040),
+        ({"$mergeObjects": [5]}, 40400),
+        ({"$range": ["a", "b"]}, 34443),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    # Valid forms still compute.
+    assert evaluate({"$size": [1, 2, 3]}, {}) == 3
+    assert evaluate({"$in": [2, [1, 2, 3]]}, {}) is True
+    assert evaluate({"$arrayElemAt": [[10, 20], 1]}, {}) == 20
+    assert evaluate({"$mergeObjects": [{"a": 1}, {"b": 2}]}, {}) == {"a": 1, "b": 2}
+
+
+def test_string_typeguard_error_codes() -> None:
+    # String/binary operators reject a non-string argument with mongod's exact
+    # code. $regexMatch/$regexFind/$regexFindAll previously silently accepted a
+    # non-string input (returning false/null/[]); a null input stays valid.
+    for expr, code in [
+        ({"$regexMatch": {"input": 5, "regex": "a"}}, 51104),
+        ({"$regexFind": {"input": 5, "regex": "a"}}, 51104),
+        ({"$regexFindAll": {"input": 5, "regex": "a"}}, 51104),
+        ({"$indexOfBytes": [5, "a"]}, 40091),
+        ({"$binarySize": 5}, 51276),
+        ({"$bsonSize": 5}, 31393),
+    ]:
+        with pytest.raises(ExpressionError) as exc:
+            evaluate(expr, {})
+        assert exc.value.code == code, expr
+    # Null input is not an error for the regex operators.
+    assert evaluate({"$regexMatch": {"input": None, "regex": "a"}}, {}) is False
+    assert evaluate({"$regexMatch": {"input": "abc", "regex": "b"}}, {}) is True
+    assert evaluate({"$binarySize": "abc"}, {}) == 3
+
+
 def test_more_expression_error_codes() -> None:
     import datetime
 

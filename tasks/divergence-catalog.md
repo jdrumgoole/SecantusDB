@@ -106,11 +106,23 @@ all of these (the standing error-code gap). Fixed on the Python server:
 `$toInt`/`$toDouble`/`$toDecimal`/`$toLong` non-numeric string (241), `$convert to:bad` (2,
 uncatchable by `onError`) — #532; `$zip` non-array inputs/element (34461/34468),
 `$arrayToObject` non-array (40386), `$objectToArray` non-document (40390), `$replaceOne`/
-`$replaceAll` per-argument (51746/51745/51744), `$dateDiff` unknown unit (9) — #533.
+`$replaceAll` per-argument (51746/51745/51744), `$dateDiff` unknown unit (9) — #533;
+array/set type-guards `$size`/`$arrayElemAt`/`$in`/`$indexOfArray`/`$setUnion`/
+`$setIntersection`/`$setDifference`/`$setIsSubset`/`$anyElementTrue`/`$allElementsTrue`/
+`$mergeObjects`/`$range` (17124/28689/40081/40090/17043/17047/17048/17046/17041/17040/
+40400/34443) and string/binary type-guards `$regexMatch`/`$regexFind`/`$regexFindAll`
+(51104)/`$indexOfBytes` (40091/40092)/`$binarySize` (51276)/`$bsonSize` (31393) — with
+`$arrayElemAt`+`$in`+the `$regex*` ops being **silent accepts** fixed on both engines — #535.
 `$trim`/`$ltrim`/`$rtrim` (50699) and `$split` (40085/40086/40087) already matched
-(#515/#500). **The named operator error-code rows are now cleared; only the diffuse
-"update/stage missing-code (None)" long tail remains — recommend skip (the numeric CODE
-rarely gates a driver test and the Rust server renders BadValue for all of them anyway).**
+(#515/#500). **A discovery sweep (three passes, ~120 operator error cases) showed the
+divergences are bounded (~dozens, not hundreds), several are genuine silent-accepts.
+Remaining named rows for a follow-on batch: date type-guards ($dateToString/$dateToParts
+non-date → 16006, $dateFromString → 241, $dateAdd/$dateSubtract/$dateTrunc bad unit → 9),
+$let undefined var (17276), $switch no-branches (40068), $ifNull 1-arg (1257300),
+$getField/$setField non-string field (5654602/4161107), $sortArray bad sortBy (2942507),
+$meta bad arg (17308), $convert missing 'to' (9), $dateDiff missing endDate (5166304),
+plus $sum/$avg/$max/$min as expression operators (5.0+ feature, currently 168) and
+$strcasecmp numeric coercion. The rest is per-message text only.**
 
 ## Minor / out-of-scope
 - `$where` unsupported (SecantusDB rejects; mongod runs JS — intentionally out of scope).

@@ -1612,6 +1612,46 @@ def test_to_int_convert_overflow(tmp_path) -> None:
         srv.stop()
 
 
+def test_array_set_typeguard_validation(tmp_path) -> None:
+    """The Rust server errors (defer -> BadValue) on a non-array/non-object
+    argument to array/set operators — including $in and $arrayElemAt, which
+    previously silently returned a value — instead of computing a wrong result.
+    Valid forms still compute."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_one({"_id": 1, "n": 5})
+        for expr in (
+            {"$size": "$n"},
+            {"$arrayElemAt": ["$n", 0]},
+            {"$in": [1, "$n"]},
+            {"$setUnion": ["$n"]},
+            {"$mergeObjects": ["$n"]},
+            {"$regexMatch": {"input": "$n", "regex": "a"}},  # was a silent accept
+            {"$regexFindAll": {"input": "$n", "regex": "a"}},  # was a silent accept
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(coll.aggregate([{"$project": {"v": expr}}]))
+        # Valid forms still compute (incl. a null regex input -> false).
+        got = list(
+            coll.aggregate(
+                [
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "s": {"$size": [1, 2, 3]},
+                            "i": {"$in": [2, [1, 2]]},
+                            "r": {"$regexMatch": {"input": "abc", "regex": "b"}},
+                        }
+                    }
+                ]
+            )
+        )
+        assert got == [{"s": 3, "i": True, "r": True}]
+    finally:
+        srv.stop()
+
+
 def test_to_long_conversion(tmp_path) -> None:
     """The Rust server computes $toLong (truncating toward zero, yielding a 64-bit
     long that can exceed int32) and rejects an int64 overflow (defer -> BadValue)."""

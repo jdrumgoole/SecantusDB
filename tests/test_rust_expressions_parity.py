@@ -1331,3 +1331,59 @@ def test_randomised_fuzz_parity():
         handled += 1
         assert rust == py, f"divergence: rust={rust!r} pure={py!r} expr={expr} doc={doc}"
     assert handled > 1000, f"expected many handled cases, only {handled}"
+
+
+@pytest.mark.parametrize(
+    "expr,code",
+    [
+        ({"$size": 5}, 17124),
+        ({"$arrayElemAt": [5, 0]}, 28689),
+        ({"$in": [1, 5]}, 40081),
+        ({"$indexOfArray": [5, 1]}, 40090),
+        ({"$setUnion": [5]}, 17043),
+        ({"$setIntersection": [5]}, 17047),
+        ({"$setDifference": [5, 6]}, 17048),
+        ({"$setIsSubset": [5, 6]}, 17046),
+        ({"$anyElementTrue": 5}, 17041),
+        ({"$allElementsTrue": 5}, 17040),
+        ({"$mergeObjects": [5]}, 40400),
+        ({"$range": ["a", "b"]}, 34443),
+    ],
+)
+def test_array_set_typeguard_defers_and_raises(expr, code):
+    # A non-array/non-object argument to these operators: Rust must *defer* (the
+    # raw evaluate returns None) so the pure engine raises mongod's exact
+    # Location code — checking the raw result, not `_rust_eval`, because a
+    # computed BSON null would also decode to Python None and hide a silent
+    # accept (as it did for $arrayElemAt before the Rust fix).
+    doc = bson.decode(bson.encode({"_id": 1}))
+    expr = bson.decode(bson.encode({"e": expr}))["e"]
+    raw = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode({}))
+    assert raw is None
+    with pytest.raises(_pure.ExpressionError) as exc:
+        _pure.evaluate(expr, doc)
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "expr,code",
+    [
+        ({"$regexMatch": {"input": 5, "regex": "a"}}, 51104),
+        ({"$regexFind": {"input": 5, "regex": "a"}}, 51104),
+        ({"$regexFindAll": {"input": 5, "regex": "a"}}, 51104),
+        ({"$indexOfBytes": [5, "a"]}, 40091),
+        ({"$binarySize": 5}, 51276),
+        ({"$bsonSize": 5}, 31393),
+    ],
+)
+def test_string_typeguard_defers_and_raises(expr, code):
+    # Non-string argument to these operators: Rust must defer (raw evaluate None)
+    # so the pure engine raises mongod's exact code. The regex ops previously
+    # silently returned false/null/[] on both engines.
+    doc = bson.decode(bson.encode({"_id": 1}))
+    expr = bson.decode(bson.encode({"e": expr}))["e"]
+    raw = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode({}))
+    assert raw is None
+    with pytest.raises(_pure.ExpressionError) as exc:
+        _pure.evaluate(expr, doc)
+    assert exc.value.code == code
