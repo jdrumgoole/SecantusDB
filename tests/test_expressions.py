@@ -506,6 +506,23 @@ def test_index_of_cp() -> None:
     assert evaluate({"$indexOfCP": ["hellohello", "ll", 4]}, {}) == 7
 
 
+def test_index_of_start_end_validation() -> None:
+    # mongod: a fractional / bool / non-numeric start or end is 40096, a negative
+    # one is 40097; a whole double is accepted.
+    for op in ("$indexOfBytes", "$indexOfCP"):
+        assert evaluate({op: ["abcabc", "b", 2.0]}, {}) == 4  # whole double -> 2
+        for bad in (2.5, True, "x"):
+            with pytest.raises(ExpressionError) as exc:
+                evaluate({op: ["abcabc", "b", bad]}, {})
+            assert exc.value.code == 40096, (op, bad)
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: ["abcabc", "b", -1]}, {})
+        assert exc.value.code == 40097, op
+        with pytest.raises(ExpressionError) as exc:
+            evaluate({op: ["abcabc", "b", 0, -1]}, {})
+        assert exc.value.code == 40097, op
+
+
 def test_date_from_string_iso() -> None:
     import datetime as dt
 

@@ -4766,6 +4766,24 @@ def test_array_operators_reject_non_array_via_pymongo(coll) -> None:
     assert out == [{"n": None}]
 
 
+def test_index_of_start_end_validation_via_pymongo(coll) -> None:
+    """$indexOfBytes/$indexOfCP: a fractional / bool / non-numeric start or end is
+    40096, a negative one is 40097; a whole double is accepted. mongod
+    7.0.12-verified."""
+    from pymongo.errors import OperationFailure
+
+    coll.insert_one({"_id": 1})
+    for op in ("$indexOfBytes", "$indexOfCP"):
+        for bad, code in [(2.5, 40096), (True, 40096), ("x", 40096), (-1, 40097)]:
+            with pytest.raises(OperationFailure) as exc:
+                list(coll.aggregate([{"$project": {"r": {op: ["abcabc", "b", bad]}, "_id": 0}}]))
+            assert exc.value.code == code, (op, bad)
+    got = list(
+        coll.aggregate([{"$project": {"_id": 0, "i": {"$indexOfBytes": ["abcabc", "b", 2.0]}}}])
+    )
+    assert got == [{"i": 4}]
+
+
 def test_trim_argument_validation_via_pymongo(coll) -> None:
     """$trim/$ltrim/$rtrim: non-string input -> 50699, non-string chars -> 50700;
     a null chars yields null. mongod 7.0.12-verified."""
