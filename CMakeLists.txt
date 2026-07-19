@@ -133,6 +133,36 @@ else()
     set(WT_PYEXT_NAME "_wiredtiger.so")
 endif()
 
+# Migration guard for build dirs created before the out-of-source switch.
+#
+# WiredTiger used to be configured with SOURCE_DIR = vendor/wiredtiger; it is
+# now the private copy under this build dir. CMake records the source directory
+# in the sub-build's cache, and refuses to reconfigure when it changes:
+#
+#   CMake Error: The current CMakeCache.txt is different than the one used to
+#   generate it ... The source "..." does not match the source "..."
+#
+# Anyone whose build dir predates that switch therefore hits a hard error whose
+# only remedy is deleting build/ — a papercut we can just remove. The WT build
+# tree is a derived artifact, so dropping a mismatched one is safe; the cost is
+# the rebuild that a stale tree was going to force anyway.
+if(EXISTS ${WT_BINARY_DIR}/CMakeCache.txt)
+    file(STRINGS ${WT_BINARY_DIR}/CMakeCache.txt _wt_home
+         REGEX "^CMAKE_HOME_DIRECTORY:INTERNAL=")
+    if(_wt_home)
+        string(REPLACE "CMAKE_HOME_DIRECTORY:INTERNAL=" "" _wt_home "${_wt_home}")
+        get_filename_component(_wt_home_real "${_wt_home}" REALPATH)
+        get_filename_component(_wt_work_real "${WT_WORK_DIR}" REALPATH)
+        if(NOT _wt_home_real STREQUAL _wt_work_real)
+            message(STATUS
+                "WiredTiger build dir was configured for '${_wt_home}', now "
+                "'${WT_WORK_DIR}' — removing the stale tree so it reconfigures")
+            file(REMOVE_RECURSE ${WT_BINARY_DIR})
+            file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/wiredtiger_ext-prefix)
+        endif()
+    endif()
+endif()
+
 ExternalProject_Add(wiredtiger_ext
     SOURCE_DIR        ${WT_WORK_DIR}
     # Stage the copy as the DOWNLOAD step so it is stamped and runs once. The
