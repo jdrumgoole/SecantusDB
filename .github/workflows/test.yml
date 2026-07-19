@@ -60,9 +60,8 @@ permissions:
 
 jobs:
   test:
-    # The Linux lane on push / PR. Windows runs as the sharded ``test-windows``
-    # job below; macOS joins THIS job's matrix on the weekly cron only (see the
-    # ``os`` matrix entry).
+    # The Linux + macOS lane on push / PR (macOS re-enabled 2026-07-19, see the
+    # ``os`` matrix entry). Windows runs as the sharded ``test-windows`` job below.
     runs-on: ${{ matrix.os }}
     # The whole suite runs in ~4 min locally; 30 min is generous for CI. Without
     # this, a hung run (a daemon/thread not reaped — historically a rust-server
@@ -131,6 +130,27 @@ jobs:
             python-version: "3.11"
           - os: macos-14
             python-version: "3.13"
+        include:
+          # macOS re-enabled on push / PR (2026-07-19) on the dev interpreter
+          # (3.12): the "6-hour hang" it was dropped for was root-caused to an
+          # fd/memory leak from unclosed `Storage` test fixtures (#563), and the
+          # run is now bounded regardless by the 30-min cap + the conftest
+          # crash/stall watchdog (#555). These (os, python, group) cells already
+          # exist on the schedule/dispatch cron (cross-product), so `include`
+          # MERGES there (no extra cron cells); on push / PR, where os is
+          # ubuntu-only, it ADDS the four macOS groups.
+          - os: macos-14
+            python-version: "3.12"
+            group: 1
+          - os: macos-14
+            python-version: "3.12"
+            group: 2
+          - os: macos-14
+            python-version: "3.12"
+            group: 3
+          - os: macos-14
+            python-version: "3.12"
+            group: 4
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
@@ -749,6 +769,27 @@ jobs:
             python-version: "3.11"
           - os: macos-14
             python-version: "3.13"
+        include:
+          # macOS re-enabled on push / PR (2026-07-19) on the dev interpreter
+          # (3.12): the "6-hour hang" it was dropped for was root-caused to an
+          # fd/memory leak from unclosed `Storage` test fixtures (#563), and the
+          # run is now bounded regardless by the 30-min cap + the conftest
+          # crash/stall watchdog (#555). These (os, python, group) cells already
+          # exist on the schedule/dispatch cron (cross-product), so `include`
+          # MERGES there (no extra cron cells); on push / PR, where os is
+          # ubuntu-only, it ADDS the four macOS groups.
+          - os: macos-14
+            python-version: "3.12"
+            group: 1
+          - os: macos-14
+            python-version: "3.12"
+            group: 2
+          - os: macos-14
+            python-version: "3.12"
+            group: 3
+          - os: macos-14
+            python-version: "3.12"
+            group: 4
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Checkout the WiredTiger submodule
