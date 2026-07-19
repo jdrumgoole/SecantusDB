@@ -116,6 +116,44 @@ pub(crate) fn decode_docs(batch: Vec<Vec<u8>>) -> Result<Vec<Document>, CommandE
         .collect()
 }
 
+fn minimal_decode_err(e: impl std::fmt::Display) -> CommandError {
+    CommandError::new(
+        1,
+        "InternalError",
+        format!("failed to decode document: {e}"),
+    )
+}
+
+/// Decode only the given top-level `fields` from each stored blob, skipping the
+/// bytes of every other field. Used to feed a `$group` whose field references
+/// have been collected by `secantus_core::referenced_top_level_fields`: a wide
+/// document ahead of a `$group` that reads two fields is materialized as a
+/// two-field document, not fully. The per-field decode goes through the same
+/// `Bson` conversion `decode_docs` would apply, so the group sees byte-identical
+/// values for the fields it reads (and an absent field is absent either way).
+pub(crate) fn decode_docs_minimal(
+    batch: Vec<Vec<u8>>,
+    fields: &std::collections::BTreeSet<String>,
+) -> Result<Vec<Document>, CommandError> {
+    batch
+        .iter()
+        .map(|b| {
+            let raw = bson::RawDocument::from_bytes(b).map_err(minimal_decode_err)?;
+            let mut out = Document::new();
+            for elem in raw {
+                let (key, val) = elem.map_err(minimal_decode_err)?;
+                if fields.contains(key) {
+                    out.insert(
+                        key.to_string(),
+                        Bson::try_from(val).map_err(minimal_decode_err)?,
+                    );
+                }
+            }
+            Ok(out)
+        })
+        .collect()
+}
+
 /// Encode owned `Document`s back to bytes (for the cursor / storage seam).
 pub(crate) fn encode_docs(docs: Vec<Document>) -> Result<Vec<Vec<u8>>, CommandError> {
     docs.iter()

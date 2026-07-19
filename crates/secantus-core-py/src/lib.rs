@@ -384,6 +384,22 @@ fn apply_projection_raw(
     }
 }
 
+/// `secantus_core::referenced_top_level_fields` — the `$group` field-reference
+/// pushdown. Given a `$group` spec, returns the sorted top-level field names the
+/// group reads, or `None` when the group must run on fully-decoded documents
+/// (whole-doc / computed-field / non-simple-accumulator shapes). The parity
+/// suite pins the property that decoding only these fields yields byte-identical
+/// `$group` output.
+#[pyfunction]
+fn group_referenced_fields(spec_bytes: &[u8]) -> PyResult<Option<Vec<String>>> {
+    let spec: Document = bson::from_slice(spec_bytes)
+        .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
+    Ok(
+        secantus_core::referenced_top_level_fields(&Bson::Document(spec))
+            .map(|s| s.into_iter().collect()),
+    )
+}
+
 /// Decode an optional `query` filter (empty / absent -> `None`), used by the
 /// projection bindings to resolve a positional `arr.$` projection.
 fn decode_optional_query(query_bytes: Option<&[u8]>) -> PyResult<Option<Document>> {
@@ -561,5 +577,6 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_update_description, m)?)?;
     m.add_function(wrap_pyfunction!(apply_update_description, m)?)?;
     m.add_function(wrap_pyfunction!(apply_pipeline, m)?)?;
+    m.add_function(wrap_pyfunction!(group_referenced_fields, m)?)?;
     Ok(())
 }

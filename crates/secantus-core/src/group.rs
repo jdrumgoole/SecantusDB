@@ -834,6 +834,120 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
     })
 }
 
+/// Accumulator ops that take a **single expression argument** and reach no
+/// document field except through `$path` strings inside that argument. For
+/// these, walking the argument with [`collect_fields`] yields a complete set of
+/// the top-level fields the accumulator reads. Deliberately excludes
+/// `$top`/`$topN`/`$bottom`/`$bottomN` — those carry a `sortBy: {field: 1}`
+/// whose field is a bare *key*, not a `$field` string, so a field walk would
+/// miss it. Anything not listed defers to a full decode (correct, just no raw
+/// speedup); new accumulators default to that safe path.
+const SIMPLE_ACCUMULATORS: &[&str] = &[
+    "$sum",
+    "$avg",
+    "$min",
+    "$max",
+    "$first",
+    "$last",
+    "$push",
+    "$addToSet",
+    "$mergeObjects",
+    "$stdDevPop",
+    "$stdDevSamp",
+    "$count",
+];
+
+/// The set of top-level document fields a `$group` spec reads — or `None` when
+/// an expression references the whole document (`$$ROOT`/`$$CURRENT`), accesses
+/// a field by computed/implicit name (`$getField`/`$setField`/`$unsetField`),
+/// or uses an accumulator outside [`SIMPLE_ACCUMULATORS`]. When `Some(fields)`,
+/// decoding **only** `fields` from each input document and running the ordinary
+/// [`group_stage`] on the result is byte-identical to running it on the fully
+/// decoded documents, because every field path the evaluator can reach is
+/// present with its original value (an absent field decodes to the same
+/// "missing" either way). This is the pushdown that lets the command layer skip
+/// materializing untouched fields of wide documents ahead of a `$group`.
+pub fn referenced_top_level_fields(spec: &Bson) -> Option<std::collections::BTreeSet<String>> {
+    let Bson::Document(s) = spec else {
+        return None;
+    };
+    // No `_id` → `group_stage` errors and defers anyway; don't special-case it.
+    s.get("_id")?;
+    let mut fields = std::collections::BTreeSet::new();
+    for (k, v) in s {
+        if k == "_id" {
+            if !collect_fields(v, &mut fields) {
+                return None;
+            }
+        } else {
+            // Accumulator: must be a single-op doc `{$op: arg}`.
+            let Bson::Document(acc) = v else {
+                return None;
+            };
+            if acc.len() != 1 {
+                return None;
+            }
+            let (op, arg) = acc.iter().next().unwrap();
+            if !SIMPLE_ACCUMULATORS.contains(&op.as_str()) {
+                return None;
+            }
+            if !collect_fields(arg, &mut fields) {
+                return None;
+            }
+        }
+    }
+    Some(fields)
+}
+
+/// Walk an aggregation expression, inserting the top-level component of every
+/// `$field.path` string into `out`. Returns `false` to signal the caller must
+/// full-decode: a `$$ROOT`/`$$CURRENT`/`$$REMOVE` whole-document reference, or a
+/// `$getField`/`$setField`/`$unsetField`/`$function`/`$accumulator` operator
+/// that can read a field by a name not expressed as a `$path` string. Local
+/// variables (`$$this`, `$$value`, `$let` bindings, `$map`/`$filter` `as`) are
+/// ignored: they resolve to array elements or already-evaluated values, never
+/// to a top-level document field, and the arrays/values they range over are
+/// themselves reached through `$path` strings collected here.
+fn collect_fields(expr: &Bson, out: &mut std::collections::BTreeSet<String>) -> bool {
+    match expr {
+        Bson::String(s) => {
+            if let Some(var) = s.strip_prefix("$$") {
+                let base = var.split('.').next().unwrap_or(var);
+                // Whole-doc / field-removal system vars can't be bounded.
+                !matches!(base, "ROOT" | "CURRENT" | "REMOVE")
+            } else if let Some(path) = s.strip_prefix('$') {
+                if !path.is_empty() {
+                    let top = path.split('.').next().unwrap_or(path);
+                    out.insert(top.to_string());
+                }
+                true
+            } else {
+                true // plain string constant
+            }
+        }
+        Bson::Array(a) => a.iter().all(|e| collect_fields(e, out)),
+        Bson::Document(d) => {
+            if d.len() == 1 {
+                let (k, v) = d.iter().next().unwrap();
+                if k == "$literal" {
+                    return true; // argument is opaque data, never a field path
+                }
+                if matches!(
+                    k.as_str(),
+                    "$getField" | "$setField" | "$unsetField" | "$function" | "$accumulator"
+                ) {
+                    return false; // computed / implicit-CURRENT field access
+                }
+                if k.starts_with('$') {
+                    return collect_fields(v, out);
+                }
+            }
+            d.values().all(|v| collect_fields(v, out))
+        }
+        _ => true,
+    }
+}
+
 /// Compile the accumulator specs (each must be a single-op doc) and run the
 /// group. Shared by `$group` and `$sortByCount`.
 fn run_group(

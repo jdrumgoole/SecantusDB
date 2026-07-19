@@ -105,6 +105,83 @@ the tailable/change-stream reply, aggregate `firstBatch`, and exhaust-cursor
 streaming — plus Finding 1 (the *scan-side* materialization), the larger
 remaining lever.
 
+## Post-raw-BSON three-way re-profile (2026-07-19, pinned `9f87edf3`)
+
+After Phases 1–5 landed (reply splice #545, raw scan match #551, raw
+projection #556, raw update/delete match #560, aggregation prefix #566), the
+end-to-end three-way benchmark (`./inv compare-servers --count 10000 --reps 5`,
+on-disk WiredTiger via pymongo, median of 5, mongod baseline spawned from
+`/opt/homebrew/bin/mongod`). Extension rebuilt against the pin;
+`git rev-parse HEAD` verified unchanged before and after the run.
+
+| Workload | mongod | SecantusDB-rs | ×mongod | SecantusDB (Py) | ×mongod |
+|---|---:|---:|:---:|---:|:---:|
+| insert | 57.29 ms | 86.82 ms | 1.5× | 335.59 ms | 5.9× |
+| find_indexed_range | 4.39 ms | 6.49 ms | 1.5× | 29.14 ms | 6.6× |
+| find_all (full scan) | 7.73 ms | 18.90 ms | **2.4×** | 95.19 ms | 12.3× |
+| update_many_half | 34.84 ms | 52.93 ms | 1.5× | 499.43 ms | 14.3× |
+| **aggregate_group** | 5.72 ms | 17.81 ms | **3.1×** | 136.08 ms | 23.8× |
+| delete_many_half | 20.94 ms | 35.64 ms | 1.7× | 314.39 ms | 15.0× |
+
+**The raw-BSON roadmap closed the bulk of the gap.** The pre-work baseline
+was 2.1×–4.5× of mongod across the board (`docs/benchmark.md`); four of six
+workloads now sit at ~1.5×, near the WT/wire floor where further raw-BSON
+serving work has diminishing returns.
+
+**The residual gap is concentrated in two workloads, and it is materialization
+the raw-BSON phases deliberately do not touch:**
+
+- **`aggregate_group` — 3.1× (the standout).** This is `$group`, a
+  *materializing* stage. Phase 5's `reduce_raw_prefix` only streams the
+  *pass-through* prefix (`$skip`/`$limit`/`$match`) over raw blobs and hands
+  the survivors to `decode_docs`; the group itself still builds a fully-typed
+  `Vec<Document>` and threads owned `Bson` between accumulators. Profiled cause
+  is Finding 1's materialization surviving into the heavy stage, exactly as
+  noted at the end of the Finding-1 write-path block above.
+- **`find_all` — 2.4×.** Full scan. Phases 1+2 already made both the scan-match
+  and the reply splice raw, so this is closer to the cursor-batching / wire
+  floor than to a decode hotspot — a smaller, separate lever (batch cursor
+  efficiency) than the aggregate gap.
+
+**Conclusion → Phase 6 (streaming / slot-based aggregation) is the next lever.**
+The profile confirms empirically that the remaining gap lives in aggregate
+materialization, not projection or planning. Re-measure `find_all` after
+Phase 6 changes the aggregate materialization costs before deciding whether
+the cursor-batch lever is worth a separate slice. Scoping:
+`tasks/rust-phase6-streaming-agg-scoping.md`.
+
+**Phase 6a shipped — `$group` field-reference pushdown (`rawbson-group`
+branch).** `secantus_core::referenced_top_level_fields` walks a `$group` spec
+and returns the top-level fields its `_id` + accumulators read (bailing on
+`$$ROOT`/`$$CURRENT`, computed-field access, and non-simple accumulators like
+`$top`/`$topN` whose `sortBy` names a field by bare key). When the first
+heavier stage of a pipeline is such a `$group`, the command layer decodes only
+those fields from each survivor (`decode_docs_minimal` over `bson::RawDocument`)
+and feeds the **unchanged** `group_stage` — so `eval("$k", minimal)` is
+byte-identical to `eval("$k", full)`. Pinned by `test_rust_group_field_pushdown`
+(`apply_pipeline(minimal) == apply_pipeline(full)` over curated + fuzz, plus the
+exact field-sets and bail set).
+
+Measured **same-environment A/B in the worktree** (both server builds and both
+`compare-servers --count 10000 --reps 5` runs in `SecantusDB-rawbson-group`, so
+the `×mongod` is self-normalizing and the unaffected controls cancel run-to-run
+variance):
+
+| Workload | Baseline (rs ×mongod) | 6a (rs ×mongod) | Note |
+|---|:---:|:---:|---|
+| **aggregate_group** | 3.1× (18.10 ms) | **2.4× (13.85 ms)** | **≈1.31× faster** — the target |
+| find_all | 2.7× | 3.1× | control (untouched; run variance) |
+| insert | 1.5× | 1.6× | control |
+| find_indexed_range | 1.6× | 1.7× | control |
+| update_many_half | 1.6× | 1.7× | control |
+| delete_many_half | 1.7× | 1.7× | control |
+
+So `$group` moved **3.1× → 2.4×** of mongod (~24% faster) on the benchmark's
+7-field documents reading 2 fields — proportional to (doc width)/(fields read),
+as scoped; wider documents win more. This is the raw-decode lever (6a); the
+heavier `$group`/`$sort` execution model (streaming, 6b) stays deferred behind a
+multi-stage workload measurement, per the scoping doc.
+
 ## Finding 3 — the oplog prune is an O(entire-oplog) full-decode sweep
 
 The single biggest insert-path consumer is not the insert:

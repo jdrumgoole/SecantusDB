@@ -161,6 +161,7 @@ def rust_parity(c: Context) -> None:
         "tests/test_rust_update_parity.py tests/test_rust_expressions_parity.py "
         "tests/test_rust_projection_parity.py tests/test_rust_diff_parity.py "
         "tests/test_rust_aggregate_parity.py "
+        "tests/test_rust_group_field_pushdown.py "
         "-o addopts= -p no:cacheprovider -q",
         pty=True,
     )

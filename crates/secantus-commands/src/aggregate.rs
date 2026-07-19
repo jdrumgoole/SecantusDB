@@ -55,7 +55,8 @@ use bson::{doc, Bson, Document};
 
 use crate::find::split_docs_into_cursor;
 use crate::util::{
-    as_i64, bool_field, collation_of, command_error, decode_docs, encode_docs, resolve_let_vars,
+    as_i64, bool_field, collation_of, command_error, decode_docs, decode_docs_minimal, encode_docs,
+    resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 use secantus_core::collation::Collation;
@@ -214,7 +215,22 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // decoded (tasks/rust-perf-findings.md).
                 let (reduced, remaining) =
                     reduce_raw_prefix(bytes, &rest, &vars, collation.as_ref());
-                (ns, decode_docs(reduced)?, remaining)
+                // If the first heavier stage is a `$group`, decode only the
+                // top-level fields its `_id` + accumulators read from each
+                // survivor, not the whole (often wide) document
+                // (tasks/rust-phase6-streaming-agg-scoping.md, 6a). Any group
+                // shape the collector can't bound falls back to a full decode.
+                let group_fields = remaining
+                    .first()
+                    .and_then(Bson::as_document)
+                    .filter(|d| d.len() == 1)
+                    .and_then(|d| d.get("$group"))
+                    .and_then(secantus_core::referenced_top_level_fields);
+                let input = match group_fields {
+                    Some(fields) => decode_docs_minimal(reduced, &fields)?,
+                    None => decode_docs(reduced)?,
+                };
+                (ns, input, remaining)
             }
         }
         // Collectionless aggregate (e.g. `{aggregate: 1, pipeline: [{$documents: …}]}`).
