@@ -1112,6 +1112,12 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
     let Some(group_by) = s.get("groupBy") else {
         return Err(());
     };
+    // `granularity` (preferred-number rounding) is validated / rejected by
+    // Python (unknown -> 40257, non-string -> 40261, valid -> unsupported), so
+    // defer the whole stage whenever it's present.
+    if s.contains_key("granularity") {
+        return Err(());
+    }
     // buckets: a positive integer, or a whole double (mongod accepts 2.0). Any
     // other value (bool, fractional double, non-positive, non-number, missing)
     // defers so Python raises the exact code (40241/40242/40243/40246).

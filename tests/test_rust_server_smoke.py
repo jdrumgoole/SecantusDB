@@ -1480,6 +1480,15 @@ def test_bucket_auto_elem_match_pull_validation(tmp_path) -> None:
                 list(coll.aggregate([{"$bucketAuto": spec}]))
         # A whole-double buckets is accepted.
         assert len(list(coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2.0}}]))) == 2
+        # Any `granularity` errors (defer -> BadValue): invalid names and a valid
+        # series (rounding unimplemented) alike, rather than silently unrounded.
+        for gran in (5, "BOGUS", "R5"):
+            with pytest.raises(pymongo.errors.OperationFailure):
+                list(
+                    coll.aggregate(
+                        [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}]
+                    )
+                )
 
         # Non-document $elemMatch projection argument.
         for arg in (5, "x", [1]):

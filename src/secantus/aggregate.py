@@ -2362,6 +2362,54 @@ def _stage_current_op(
     return [entry]
 
 
+# mongod's preferred-number rounding series for $bucketAuto `granularity`.
+_BUCKET_AUTO_GRANULARITIES = frozenset(
+    {
+        "R5",
+        "R10",
+        "R20",
+        "R40",
+        "R80",
+        "1-2-5",
+        "E6",
+        "E12",
+        "E24",
+        "E48",
+        "E96",
+        "E192",
+        "POWERSOF2",
+    }
+)
+
+
+def _validate_bucket_auto_granularity(granularity: Any) -> None:
+    """mongod: `granularity` must be a string (else 40261) naming a known
+    preferred-number series (else 40257). A *valid* series is then rejected as
+    unsupported rather than silently producing count-chunked (unrounded)
+    boundaries: matching mongod's rounding would require its exact internal
+    float series constants (e.g. its "6.3" is the f64 `6.3000000000000007`, not
+    `float("6.3")`), which can't be recovered by black-box probing — see
+    tasks/backlog.md. A faithful error beats a silently-wrong result."""
+    if not isinstance(granularity, str):
+        raise AggregateError(
+            "The $bucketAuto 'granularity' field must be a string, but found type: "
+            f"{_bson_type_name(granularity)}",
+            code=40261,
+            code_name="Location40261",
+        )
+    if granularity not in _BUCKET_AUTO_GRANULARITIES:
+        raise AggregateError(
+            f"Unknown rounding granularity '{granularity}'",
+            code=40257,
+            code_name="Location40257",
+        )
+    raise AggregateError(
+        f"$bucketAuto 'granularity' ({granularity!r}) is not yet supported by SecantusDB: "
+        "boundary rounding to the preferred-number series is unimplemented",
+        code=2,
+    )
+
+
 def _stage_bucket_auto(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -2403,6 +2451,8 @@ def _stage_bucket_auto(
             code=40243,
             code_name="Location40243",
         )
+    if "granularity" in spec:
+        _validate_bucket_auto_granularity(spec["granularity"])
     output_spec = spec.get("output") or {"count": {"$sum": 1}}
 
     from secantus.storage import _SortKey

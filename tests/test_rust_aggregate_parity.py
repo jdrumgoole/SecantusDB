@@ -1003,6 +1003,24 @@ def test_bucket_auto_invalid_defers_and_raises(spec, code):
     assert exc.value.code == code
 
 
+@pytest.mark.parametrize(
+    "gran,code",
+    [(5, 40261), ("BOGUS", 40257), ("R5", 2), ("POWERSOF2", 2)],
+)
+def test_bucket_auto_granularity_defers_and_raises(gran, code):
+    # $bucketAuto with any `granularity`: Rust defers (None) so the pure engine
+    # raises — a non-string (40261) / unknown (40257) code, or the unsupported
+    # error (2) for a valid-but-unimplemented series.
+    docs = bson.decode(bson.encode({"d": [{"_id": i, "v": i} for i in range(6)]}))["d"]
+    pipeline = bson.decode(
+        bson.encode({"p": [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}]})
+    )["p"]
+    assert _rust_pipeline(docs, pipeline) is None
+    with pytest.raises(_pure.AggregateError) as exc:
+        _pure.apply_pipeline(docs, pipeline, _PipelineContext())
+    assert exc.value.code == code
+
+
 def _rand_scalar(rng):
     r = rng.random()
     if r < 0.3:

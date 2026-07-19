@@ -939,6 +939,16 @@ def test_bucket_auto_validation_via_pymongo(coll) -> None:
     # A whole-double buckets is accepted.
     out = list(coll.aggregate([{"$bucketAuto": {"groupBy": "$v", "buckets": 2.0}}]))
     assert len(out) == 2
+    # granularity: non-string -> 40261, unknown -> 40257; a valid series is
+    # rejected as unsupported (rounding unimplemented) rather than silently wrong.
+    for gran, code in [(5, 40261), ("BOGUS", 40257), ("R5", 2)]:
+        with pytest.raises(OperationFailure) as exc:
+            list(
+                coll.aggregate(
+                    [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}]
+                )
+            )
+        assert exc.value.code == code, gran
 
 
 def test_projection_elem_match_non_document_via_pymongo(coll) -> None:

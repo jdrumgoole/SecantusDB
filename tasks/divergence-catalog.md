@@ -84,9 +84,9 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   (#528, both engines; a nested `$and`/`$or` identifier is left unvalidated — see backlog).
   (update.py)
 - **Stages**: `$bucketAuto` buckets bool/non-numeric/fractional/
-  non-positive/missing FIXED (#526, → 40241/40242/40243/40246; whole-double accepted) —
-  `granularity` validation/rounding still unimplemented (`'BOGUS'` accepted; needs a
-  dedicated slice, see backlog); `$densify`
+  non-positive/missing FIXED (#526, → 40241/40242/40243/40246; whole-double accepted);
+  `granularity` non-string/unknown FIXED (#530, → 40261/40257; a valid series is rejected
+  as unsupported — byte-exact boundary rounding is fp-blocked, see backlog); `$densify`
   `{step:true}`/`bounds:'partial'`/`[0]`/`[5,0]`/unit-on-numeric FIXED (#504, →
   14/5946802/5733403/5733402/6053600; `{step:1.5}` is mongod-valid, now computes);
   `$unwind` path/includeArrayIndex/preserve FIXED (#523, → 28808/28818/28810/28822/

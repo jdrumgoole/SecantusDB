@@ -548,6 +548,27 @@ def test_bucket_auto_buckets_validation_codes() -> None:
     assert len(out) == 2
 
 
+def test_bucket_auto_granularity_validation() -> None:
+    # mongod: a non-string granularity -> 40261, an unknown one -> 40257. A
+    # *valid* series (rounding unimplemented) is rejected as unsupported (code 2)
+    # rather than silently producing unrounded boundaries.
+    docs = [{"v": i} for i in range(6)]
+    for gran, code in [(5, 40261), (True, 40261), ("BOGUS", 40257), ("r5", 40257)]:
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(
+                [dict(d) for d in docs],
+                [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}],
+            )
+        assert exc.value.code == code, gran
+    for gran in ("R5", "POWERSOF2", "1-2-5", "E12"):
+        with pytest.raises(AggregateError) as exc:
+            apply_pipeline(
+                [dict(d) for d in docs],
+                [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": gran}}],
+            )
+        assert exc.value.code == 2, gran
+
+
 def test_lookup_requires_storage_context() -> None:
     with pytest.raises(AggregateError):
         apply_pipeline(
