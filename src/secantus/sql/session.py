@@ -164,6 +164,10 @@ class _Cursor:
     rows: list = field(default_factory=list)
     pos: int = -1
     hold: bool = False
+    # SCROLL / NO SCROLL: True = explicit SCROLL, False = NO SCROLL (backward
+    # movement rejected), None = default (backward allowed since rows are
+    # materialized). For pg_cursors reflection.
+    scrollable: bool | None = None
     # For pg_cursors: the DECLARE's query text and the creation instant.
     statement: str = ""
     created: Any = None

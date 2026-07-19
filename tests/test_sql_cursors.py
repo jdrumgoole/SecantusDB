@@ -141,6 +141,42 @@ def test_fetch_unknown_cursor_errors(storage, session):
     assert ei.value.sqlstate == "34000"
 
 
+def test_negative_bare_count_scans_backward(storage, session):
+    # ``FETCH -n`` / ``MOVE -n`` move backward in the default direction (PG).
+    q(storage, session, "DECLARE c CURSOR FOR SELECT id FROM t ORDER BY id")
+    assert fetch_ids(storage, session, "FETCH 4 FROM c") == [1, 2, 3, 4]
+    assert fetch_ids(storage, session, "FETCH -2 FROM c") == [3, 2]
+    assert fetch_ids(storage, session, "FETCH FORWARD -1 c") == [1]
+
+
+def test_move_absolute_zero_repositions_before_first(storage, session):
+    q(storage, session, "DECLARE c CURSOR FOR SELECT id FROM t ORDER BY id")
+    fetch_ids(storage, session, "FETCH ALL FROM c")
+    q(storage, session, "MOVE ABSOLUTE 0 FROM c")
+    assert fetch_ids(storage, session, "FETCH ALL FROM c") == [1, 2, 3, 4, 5]
+
+
+def test_no_scroll_cursor_rejects_backward(storage, session):
+    q(storage, session, "DECLARE c NO SCROLL CURSOR FOR SELECT id FROM t ORDER BY id")
+    fetch_ids(storage, session, "FETCH 3 FROM c")
+    with pytest.raises(SQLError) as ei:
+        q(storage, session, "FETCH BACKWARD 1 FROM c")
+    assert ei.value.sqlstate == "55000"
+
+
+def test_scroll_cursor_allows_backward(storage, session):
+    q(storage, session, "DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id")
+    fetch_ids(storage, session, "FETCH 3 FROM c")
+    assert fetch_ids(storage, session, "FETCH BACKWARD 2 FROM c") == [2, 1]
+
+
+def test_declare_non_query_body_is_syntax_error(storage, session):
+    for body in ("wat", "CREATE TABLE ssc ()"):
+        with pytest.raises(SQLError) as ei:
+            q(storage, session, f"DECLARE c CURSOR FOR {body}")
+        assert ei.value.sqlstate == "42601"
+
+
 # --------------------------------------------------------------------------- #
 # Resource caps (issue #194)
 # --------------------------------------------------------------------------- #
