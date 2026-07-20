@@ -268,6 +268,23 @@ These are explicit non-goals. Don't add them without a reason.
   ensure the `finally` `stream.close()` interrupts a parked cursor. A
   first-attempt faulthandler dump would confirm whether the wedged thread is
   this `try_next` pool thread.
+  **MITIGATION LANDED (branch `ws-changes-disconnect`), NOT yet confirmed on CI.**
+  Applied the candidate fix plus proactive disconnect detection in
+  `changestream.py`: each `try_next` poll now (a) is bounded server-side with
+  `max_await_time_ms=500` so an orphaned `to_thread` poll frees within ~0.5s
+  instead of relying on the 1s default (or longer under load), and (b) races
+  against a `_wait_for_disconnect` watcher so a *quiet* stream notices a gone
+  client immediately and stops scheduling new blocking polls (the old loop
+  only detected disconnect on the next `send`, so a quiet-then-closed stream
+  looped until app shutdown). This shrinks the orphan-thread window that is
+  the suspected wedge mechanism. It is **not proven** to eliminate the CI
+  crash — the crash never reproduced locally (needs CPU starvation), so this
+  is blast-radius reduction validated by reasoning + a new quiet-disconnect
+  regression test (`test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy`),
+  not by a red→green repro. **Keep this item open** and watch for a
+  recurrence on the durable/test lanes; if it recurs, the first-attempt
+  faulthandler dump (now emitted by the #555 crash-capture) should finally
+  name the wedged thread.
 
 
 Subtler than the above; these may bite specific test suites.
