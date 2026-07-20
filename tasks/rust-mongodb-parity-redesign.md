@@ -404,6 +404,39 @@ and PITR replay. A k-way merge by seq (each shard is seq-sorted; a doc's shard i
 every event, in order, with correct resume tokens across shards). This is
 correctness-critical but now clearly justified — the win is proven.
 
+## Next lever: oplog PER-WRITE cost (the single-writer gap) — diagnosed, not yet built
+
+Sharding addressed *contention* (multi-writer) but not per-write *cost*, which is
+why single-writer stayed ~11-16k vs mongod's ~110k and the oplog-OFF A/B ceiling of
+46k. Reading `insert_one` (`crates/secantus-storage/src/lib.rs:2900`), each single
+insert with the oplog on does, under the collection lock:
+
+- **~4 WT writes**: doc table (1) + natural-order index (2: `secantus_natural` +
+  `secantus_natural_seq`) + oplog (1). mongod is ~2 (doc + oplog).
+- **~6 metadata cursor reads, every write**: `ensure_collection`, `is_timeseries`,
+  `index_descs` (a scan of the index table), `unique_conflict`, `maybe_mark_multikey`,
+  `collection_uuid`. These are catalog lookups that change only on DDL — mongod
+  caches them; we re-read them per insert.
+- **a double BSON encode of the document**: once as the doc-table value (`blob`),
+  again when `emit_oplog` re-encodes the whole entry whose `o` field IS that same
+  document.
+
+Concrete levers, each its own **measured** PR (biggest first), to run on a clean
+cool machine (this session's machine is thermally unmeasurable):
+1. **Per-(db,coll) catalog cache** — cache `index_descs` / `collection_uuid` /
+   `is_timeseries` / options, invalidated on create/drop/collMod/createIndexes.
+   Removes ~5 cursor reads per write. Highest-value, but correctness-sensitive
+   (stale-cache-after-DDL) → careful invalidation + its own test.
+2. **Splice the pre-encoded doc into the oplog entry** — build the oplog `o` value
+   from the already-encoded `blob` instead of re-encoding the moved `doc` (raw-BSON
+   write-path analogue of Phase 1's read splice). Helps large docs.
+3. **Natural-order de-amplification** — collapse the 2 nat-index writes toward 1
+   (or fold the reverse map), reducing write amplification 4→3.
+
+None of these are built. All need before/after `bench.concurrency` on an unloaded
+machine — the plan's #1 rule (measure, don't project) is why they are NOT being
+shipped blind here.
+
 ## ⚠️ CORRECTION (2026-07-20 PM): honest back-to-back A/B — it's a TRADEOFF
 
 The earlier "single-writer 16k → 28.9k (1.8×)" headline **does not reproduce** and
