@@ -26,6 +26,9 @@ permissions:
   # No id-token: write — the review authenticates via CLAUDE_CODE_OAUTH_TOKEN
   # and gh (contents/PR/issues), never OIDC. Dropping it keeps the token
   # least-privileged. (security review 2026-06-30 §I6)
+  # Holding this line requires passing `github_token` explicitly to the action
+  # below; without that input it falls back to minting an App token over OIDC
+  # and the run dies before the review starts.
 
 concurrency:
   group: security-review
@@ -51,6 +54,15 @@ jobs:
         uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342  # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Hand the action this workflow's own GITHUB_TOKEN. Without it,
+          # `setupGitHubToken` mints a GitHub App token by exchanging an OIDC
+          # token, which needs `id-token: write` — the permission this workflow
+          # deliberately withholds (see the permissions block above, §I6). That
+          # is what broke the nightly run from 2026-07-05 onward: every attempt
+          # died in getOidcToken before the review started. Passing the token
+          # explicitly keeps the OIDC path unused and the permission set
+          # unchanged.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           # The whole procedure (review → dated report → self-merging PR →
           # security issues) lives in the prompt file so it's version-
           # controlled and editable without touching this workflow.
