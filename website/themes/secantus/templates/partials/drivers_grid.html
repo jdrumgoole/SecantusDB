@@ -15,6 +15,20 @@
 
   <article class="driver">
     <header>
+      <h3>pymongo (async)</h3>
+      <span class="lang">Python / asyncio</span>
+    </header>
+    <div class="pass-rate">
+      <span class="rate">99.4%</span>
+      <span class="rate-label">pass rate</span>
+    </div>
+    <p class="counts"><strong>926</strong> tests passed &middot; <strong>6</strong> failed</p>
+    <p class="note">pymongo's native <code>AsyncMongoClient</code> suite &mdash; the async/await wire path that replaced Motor. Same unmodified upstream tests as the sync gauge, run under <code>pytest-asyncio</code> against the same embedded SecantusDB, so the non-blocking client is held to the same bar rather than assumed to follow from the sync one. Remaining failures are the same out-of-scope surfaces (text / hashed indexes, server-side <code>$where</code>) plus a few timeout-introspection tests.</p>
+    <a class="report" href="https://secantusdb.com/docs/validation-report-pymongo-async.html" rel="noopener">Read the report &rarr;</a>
+  </article>
+
+  <article class="driver">
+    <header>
       <h3>mongo-java-driver</h3>
       <span class="lang">Java</span>
     </header>
