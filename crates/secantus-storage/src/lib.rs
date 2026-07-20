@@ -1590,7 +1590,7 @@ impl Drop for Storage {
     /// durability signal.
     fn drop(&mut self) {
         let meta = {
-            let st = self.oplog.lock().unwrap();
+            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             (
                 st.next_seq,
                 st.last_ts_secs,
@@ -1690,7 +1690,7 @@ impl Storage {
     /// parallel. DDL takes the global `lock` first, then this. Mirrors
     /// `storage._coll_lock`.
     fn coll_lock(&self, db: &str, coll: &str) -> Arc<Mutex<()>> {
-        let mut reg = self.coll_locks.lock().unwrap();
+        let mut reg = self.coll_locks.lock().unwrap_or_else(|e| e.into_inner());
         reg.entry((db.to_string(), coll.to_string()))
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
@@ -1832,7 +1832,7 @@ impl Storage {
     /// Atomically reserve `n` consecutive seqs and mint `n` monotonic timestamps.
     /// Mirrors `storage._mint_oplog_seq_and_ts`.
     fn mint_seq_and_ts(&self, n: usize) -> (i64, Vec<bson::Timestamp>) {
-        let mut st = self.oplog.lock().unwrap();
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         let start = st.next_seq;
         st.next_seq += n as i64;
         let ts: Vec<bson::Timestamp> = (0..n).map(|_| Self::mint_ts(&mut st)).collect();
@@ -1888,7 +1888,7 @@ impl Storage {
         // has advanced, so a woken waiter's producer re-read sees the new events.
         // Also bump the opportunistic-prune counter under the same lock.
         let do_prune = {
-            let mut g = self.oplog.lock().unwrap();
+            let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             self.oplog_cv.notify_all();
             g.emit_count += n;
             if g.emit_count >= OPLOG_PRUNE_INTERVAL {
@@ -1921,7 +1921,7 @@ impl Storage {
     /// mutex, so there's no lost-wakeup; the wait releases that mutex so writers
     /// can still mint seqs. Used by the change-stream tailable getMore path.
     pub fn wait_for_oplog(&self, after_seq: i64, timeout_ms: u64) -> i64 {
-        let guard = self.oplog.lock().unwrap();
+        let guard = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         if guard.next_seq - 1 > after_seq {
             return guard.next_seq - 1;
         }
@@ -1936,7 +1936,7 @@ impl Storage {
     /// `killCursors`, so a blocked tailable getMore returns promptly to observe
     /// its cursor's invalidation). Mirrors `storage._oplog_cv.notify_all()`.
     pub fn notify_oplog_waiters(&self) {
-        let _g = self.oplog.lock().unwrap();
+        let _g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         self.oplog_cv.notify_all();
     }
 
@@ -1956,7 +1956,7 @@ impl Storage {
         // lost-wakeup guarantee requires the counter to be read under the same
         // mutex as the wait. Minting under the dedicated oplog mutex alone is
         // enough — no WT access, so the global lock adds nothing here.
-        let mut st = self.oplog.lock().unwrap();
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         Ok(Self::mint_ts(&mut st))
     }
 
@@ -1967,7 +1967,7 @@ impl Storage {
     /// Mirrors `storage.peek_cluster_time`.
     pub fn peek_cluster_time(&self) -> Result<bson::Timestamp> {
         {
-            let st = self.oplog.lock().unwrap();
+            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             if st.last_ts_secs != 0 {
                 return Ok(bson::Timestamp {
                     time: st.last_ts_secs as u32,
@@ -2105,14 +2105,18 @@ impl Storage {
     pub fn oplog_tail_seq(&self) -> i64 {
         // The tail counter lives under the dedicated oplog mutex; the global lock
         // adds nothing here.
-        self.oplog.lock().unwrap().next_seq - 1
+        self.oplog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_seq
+            - 1
     }
 
     /// Force a WiredTiger checkpoint (durable flush of the latest snapshot). Used
     /// by oplog replay to make the restored database durable before the target
     /// `Storage` is dropped.
     pub fn checkpoint(&self) -> Result<()> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         session.checkpoint(None)?;
         Ok(())
@@ -2125,7 +2129,7 @@ impl Storage {
     /// are identical across the two servers, so the Python restore tooling reads
     /// this archive (and vice versa).
     pub fn create_archive(&self, output_path: &str) -> Result<ArchiveInfo> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         // Durable, consistent snapshot first; the backup cursor enumerates the
         // files that make it up and WiredTiger holds them stable for the cursor's
@@ -2267,11 +2271,11 @@ impl Storage {
     /// if needed) — e.g. `{changeStreamPreAndPostImages: {enabled: true}}`.
     /// Mirrors `storage.set_collection_options`.
     pub fn set_collection_options(&self, db: &str, coll: &str, opts: &Document) -> Result<()> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
-        let _c = ns_lock.lock().unwrap();
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         ensure_collection(&session, db, coll)?;
         let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
@@ -2288,11 +2292,11 @@ impl Storage {
     /// for internal option writes such as `create`'s). Mirrors mongod's collMod
     /// oplog (`o = {collMod: <coll>, <changed fields>}`).
     pub fn coll_mod(&self, db: &str, coll: &str, opts: &Document) -> Result<()> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
-        let _c = ns_lock.lock().unwrap();
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         ensure_collection(&session, db, coll)?;
         let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
@@ -2336,7 +2340,7 @@ impl Storage {
         // one namespace; the free helper re-reads inside the lock and mints
         // only if still absent.
         let lock = self.coll_lock(db, coll);
-        let _c = lock.lock().unwrap();
+        let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
         ensure_collection(&session, db, coll)?;
         collection_uuid(&session, db, coll)
     }
@@ -2383,7 +2387,7 @@ impl Storage {
         if rows.is_empty() {
             return Ok(0);
         }
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(OPLOG_TABLE, None)?;
         let mut pre_cur: Option<Cursor> = None;
@@ -2416,7 +2420,7 @@ impl Storage {
             }
         }
         {
-            let mut st = self.oplog.lock().unwrap();
+            let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             if max_seq + 1 > st.next_seq {
                 st.next_seq = max_seq + 1;
             }
@@ -2446,7 +2450,10 @@ impl Storage {
     /// never touch the old rows doomed here; the reads that could observe a
     /// half-pruned range (`read_oplog`, resume) tolerate missing rows.
     fn prune_oplog_inner(&self, now: Option<i64>) -> Result<usize> {
-        let _p = self.oplog_prune_lock.lock().unwrap();
+        let _p = self
+            .oplog_prune_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let when = now.unwrap_or_else(now_secs);
         let cutoff = when - self.oplog_retention_seconds;
@@ -2537,7 +2544,7 @@ impl Storage {
     /// return its seq — keeps a quiet collection's resume token advancing with
     /// cluster time. Mirrors `storage.emit_noop_heartbeat`.
     pub fn emit_noop_heartbeat(&self) -> Result<i64> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let mut o = Document::new();
         o.insert("msg", "periodic noop");
@@ -2564,7 +2571,11 @@ impl Storage {
             }
             more = c.next()?;
         }
-        Ok(self.oplog.lock().unwrap().next_seq)
+        Ok(self
+            .oplog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_seq)
     }
 
     // -- user (multi-document) transactions --------------------------------
@@ -2600,7 +2611,7 @@ impl Storage {
     /// Open a dedicated WT session for a new multi-document transaction. The WT
     /// `begin_transaction` is deferred to the first `with_user_transaction`.
     pub fn begin_user_transaction(&self) -> Result<UserTransactionHandle> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         Ok(UserTransactionHandle {
             session: Some(session),
@@ -2725,7 +2736,7 @@ impl Storage {
     pub fn insert_one(&self, db: &str, coll: &str, doc_bytes: &[u8]) -> Result<Vec<u8>> {
         self.retry_write_conflicts("insert_one", || {
             let lock = self.coll_lock(db, coll);
-            let _c = lock.lock().unwrap();
+            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let mut doc = decode_doc(doc_bytes)?;
             if !doc.contains_key("_id") {
                 doc.insert("_id", Bson::ObjectId(ObjectId::new()));
@@ -2800,7 +2811,7 @@ impl Storage {
     ) -> Result<(usize, Vec<Document>)> {
         self.retry_write_conflicts("insert", || {
             let lock = self.coll_lock(db, coll);
-            let _c = lock.lock().unwrap();
+            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
                 ensure_collection(&session, db, coll)?;
@@ -2981,7 +2992,7 @@ impl Storage {
     ) -> Result<bool> {
         self.retry_write_conflicts("replace_by_id", || {
             let lock = self.coll_lock(db, coll);
-            let _c = lock.lock().unwrap();
+            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let key = id_key(id)?;
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
@@ -3057,7 +3068,7 @@ impl Storage {
     pub fn delete_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<bool> {
         self.retry_write_conflicts("delete_by_id", || {
             let lock = self.coll_lock(db, coll);
-            let _c = lock.lock().unwrap();
+            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let key = id_key(id)?;
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
@@ -3109,7 +3120,7 @@ impl Storage {
     pub fn prune_ttl(&self, db: &str, coll: &str, now: bson::DateTime) -> Result<usize> {
         self.retry_write_conflicts("prune_ttl", || {
             let lock = self.coll_lock(db, coll);
-            let _c = lock.lock().unwrap();
+            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = OpSession::Fresh(self.conn.open_session()?);
             self.with_statement_txn(&session, || {
                 // TTL indexes as (leading field, ttl seconds).
@@ -3178,7 +3189,7 @@ impl Storage {
         // Snapshot all (db, coll) under the lock, then prune each (prune_ttl
         // takes the lock itself, so it isn't held across the per-coll work).
         let pairs: Vec<(String, String)> = {
-            let _g = self.lock.lock().unwrap();
+            let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.conn.open_session()?;
             let cur = session.open_cursor(COLL_TABLE, None)?;
             let mut pairs = Vec::new();
@@ -3277,11 +3288,11 @@ impl Storage {
         coll: &str,
         options: &Document,
     ) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
-        let _c = ns_lock.lock().unwrap();
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.op_session()?;
         if collection_registered(&session, db, coll)? {
             return Ok(false);
@@ -3324,11 +3335,11 @@ impl Storage {
     /// its registry row. Returns whether it existed. Emits an `op: "c"` `drop`
     /// oplog entry when it existed. Mirrors `storage.drop_collection`.
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
-        let _c = ns_lock.lock().unwrap();
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let existed = coll_options(&session, db, coll)?.is_some();
         let ui = if existed && self.enable_oplog {
@@ -3361,7 +3372,7 @@ impl Storage {
     /// Emits one `op: "c"` `drop` per collection plus a final `dropDatabase: 1`
     /// command oplog entry (no `ui`). Mirrors `storage.drop_database`.
     pub fn drop_database(&self, db: &str) -> Result<()> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let colls = self.colls_of(&session, db)?;
         // Every existing collection's write lock (sorted registry order), so
@@ -3371,7 +3382,10 @@ impl Storage {
         // observable on real mongod too and the Python server accepts the
         // same window.
         let ns_locks: Vec<_> = colls.iter().map(|c| self.coll_lock(db, c)).collect();
-        let _ns_guards: Vec<_> = ns_locks.iter().map(|l| l.lock().unwrap()).collect();
+        let _ns_guards: Vec<_> = ns_locks
+            .iter()
+            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
         let mut ui_pairs: Vec<(String, Vec<u8>)> = Vec::new();
         if self.enable_oplog {
             for c in &colls {
@@ -3431,7 +3445,7 @@ impl Storage {
         dst_coll: &str,
         drop_target: bool,
     ) -> Result<(bool, Option<String>)> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Both namespaces' write locks, in sorted key order so two renames
         // touching the same pair can't ABBA-deadlock (global first, then
         // collection locks — see `lock`'s ordering rules).
@@ -3439,7 +3453,10 @@ impl Storage {
         ns.sort_unstable();
         ns.dedup();
         let ns_locks: Vec<_> = ns.iter().map(|(d, c)| self.coll_lock(d, c)).collect();
-        let _ns_guards: Vec<_> = ns_locks.iter().map(|l| l.lock().unwrap()).collect();
+        let _ns_guards: Vec<_> = ns_locks
+            .iter()
+            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
         let session = self.conn.open_session()?;
         if coll_options(&session, src_db, src_coll)?.is_none() {
             return Ok((
@@ -3751,7 +3768,7 @@ impl Storage {
         doc.insert("slowms", slowms);
         doc.insert("sampleRate", sample_rate);
         let blob = encode_doc(&doc)?;
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(PROFILE_TABLE, None)?;
         cur.set_key_s(db);
@@ -3784,7 +3801,7 @@ impl Storage {
         record: &[u8],
         replace: bool,
     ) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let probe = session.open_cursor(table, None)?;
         probe.set_key_ss(db, name);
@@ -3806,7 +3823,7 @@ impl Storage {
     /// Point-fetch a `(db, name)` blob from an `SS`-keyed table (`None` when
     /// absent or empty).
     fn get_ss_record(&self, table: &str, db: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Fresh session for cross-thread visibility (mirrors `get_role`).
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(table, None)?;
@@ -3823,7 +3840,7 @@ impl Storage {
 
     /// Delete a `(db, name)` row from an `SS`-keyed table (`false` if absent).
     fn drop_ss_record(&self, table: &str, db: &str, name: &str) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(table, None)?;
         cur.set_key_ss(db, name);
@@ -3851,7 +3868,7 @@ impl Storage {
         } else {
             limit
         };
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(table, None)?;
         let mut out: Vec<Vec<u8>> = Vec::new();
@@ -3893,11 +3910,11 @@ impl Storage {
         key_spec: &Document,
         options: &Document,
     ) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
-        let _c = ns_lock.lock().unwrap();
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         if name == ID_INDEX_NAME {
             return Ok(false);
         }
@@ -4136,11 +4153,11 @@ impl Storage {
         name: &str,
         expire_after_seconds: i64,
     ) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
-        let _c = ns_lock.lock().unwrap();
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(IDX_TABLE, None)?;
         cur.set_key_sss(db, coll, name);
@@ -4172,11 +4189,11 @@ impl Storage {
         name: &str,
         new_opts: &Document,
     ) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
-        let _c = ns_lock.lock().unwrap();
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(IDX_TABLE, None)?;
         cur.set_key_sss(db, coll, name);
@@ -4253,11 +4270,11 @@ impl Storage {
     /// Drop the index named `name` (and all its entries). Returns `false` if no
     /// such index, or `name == "_id_"`. Mirrors `storage.drop_index`.
     pub fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
-        let _c = ns_lock.lock().unwrap();
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         if name == ID_INDEX_NAME {
             return Ok(false);
         }
@@ -4300,11 +4317,11 @@ impl Storage {
     /// Drop every (non-`_id_`) index on `(db, coll)`. Returns how many were
     /// dropped. Mirrors `storage.drop_all_indexes` (used by drop-collection).
     pub fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize> {
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
-        let _c = ns_lock.lock().unwrap();
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let dropped: Vec<(String, Document)> = self
             .iter_indexes(&session, db, coll)?
@@ -4414,7 +4431,7 @@ impl Storage {
 
     /// Reserve the next monotonic insertion `seq`. Mirrors `storage._mint_nat_seq`.
     fn mint_nat_seq(&self) -> i64 {
-        let mut st = self.oplog.lock().unwrap();
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         let seq = st.next_nat_seq;
         st.next_nat_seq += 1;
         seq
@@ -5594,7 +5611,7 @@ impl Storage {
     ) -> Result<UpdateOutcome> {
         self.retry_write_conflicts("update_matching_core", || {
             let lock = self.coll_lock(db, coll);
-            let _c = lock.lock().unwrap();
+            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
                 ensure_collection(&session, db, coll)?;
@@ -5797,7 +5814,7 @@ impl Storage {
     ) -> Result<usize> {
         self.retry_write_conflicts("delete_matching", || {
             let lock = self.coll_lock(db, coll);
-            let _c = lock.lock().unwrap();
+            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
                 let descs = self.index_descs(&session, db, coll)?;

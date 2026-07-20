@@ -188,7 +188,7 @@ impl CursorRegistry {
     /// Register an ordinary cursor over already-fetched documents; returns its
     /// id. The remaining docs drain via `getMore`.
     pub fn register(&self, namespace: &str, remaining: Vec<Vec<u8>>) -> Result<i64, CursorError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
         if inner.cursors.len() >= self.max_cursors {
             return Err(CursorError::LimitExceeded(self.max_cursors));
@@ -224,7 +224,7 @@ impl CursorRegistry {
         producer: Box<dyn CursorProducer>,
         opts: TailableOptions,
     ) -> Result<i64, CursorError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
         if inner.cursors.len() >= self.max_cursors {
             return Err(CursorError::LimitExceeded(self.max_cursors));
@@ -255,7 +255,7 @@ impl CursorRegistry {
     /// Snapshot a cursor's routing state, bumping its `last_access`
     /// (`cursors.py::get`).
     pub fn info(&self, cursor_id: i64) -> Result<CursorInfo, CursorError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
         let now = (self.clock)();
         let e = inner
@@ -281,7 +281,7 @@ impl CursorRegistry {
         cursor_id: i64,
         batch_size: i64,
     ) -> Result<(Vec<Vec<u8>>, bool), CursorError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
         let now = (self.clock)();
         let (batch, exhausted, tailable) = {
@@ -323,7 +323,7 @@ impl CursorRegistry {
         cursor_id: i64,
         batch_size: i64,
     ) -> Result<TailableBatch, CursorError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
         let now = (self.clock)();
         let e = inner
@@ -370,7 +370,7 @@ impl CursorRegistry {
 
     /// Kill the given cursors, returning `(killed, not_found)`.
     pub fn kill(&self, cursor_ids: &[i64]) -> (Vec<i64>, Vec<i64>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
         let mut killed = Vec::new();
         let mut not_found = Vec::new();
@@ -391,7 +391,7 @@ impl CursorRegistry {
     /// the collection is gone (mongo-c-driver's `error_document/getmore` test).
     /// Mirrors `cursors.kill_namespace`.
     pub fn kill_namespace(&self, namespace: &str) -> usize {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let doomed: Vec<i64> = inner
             .cursors
             .iter()
@@ -407,7 +407,7 @@ impl CursorRegistry {
     /// Mark a cursor invalidated (a blocked tailable getMore wakes and ends).
     /// No-op if the cursor is gone.
     pub fn invalidate(&self, cursor_id: i64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = inner.cursors.get_mut(&cursor_id) {
             e.invalidated = true;
         }
@@ -415,7 +415,7 @@ impl CursorRegistry {
 
     /// Number of live cursors (after a prune pass).
     pub fn len(&self) -> usize {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
         inner.cursors.len()
     }
@@ -426,7 +426,7 @@ impl CursorRegistry {
 
     /// Describe the live cursors (for `currentOp` / admin), sorted by id.
     pub fn snapshot(&self) -> Vec<CursorSnapshot> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
         let mut out: Vec<CursorSnapshot> = inner
             .cursors
@@ -682,7 +682,10 @@ mod tests {
     fn manual_clock() -> (Arc<StdMutex<f64>>, Box<dyn Fn() -> f64 + Send + Sync>) {
         let t = Arc::new(StdMutex::new(0.0));
         let t2 = t.clone();
-        (t, Box::new(move || *t2.lock().unwrap()))
+        (
+            t,
+            Box::new(move || *t2.lock().unwrap_or_else(|e| e.into_inner())),
+        )
     }
 
     #[test]
@@ -840,7 +843,7 @@ mod tests {
         let reg = CursorRegistry::with_clock(f, 100.0, 200.0, 10_000);
         let id = reg.register("t.c", vec![enc(&doc! {"_id": 1})]).unwrap();
         // Advance past the TTL; the next operation prunes it.
-        *clock.lock().unwrap() = 1000.0;
+        *clock.lock().unwrap_or_else(|e| e.into_inner()) = 1000.0;
         assert_eq!(reg.len(), 0);
         assert_eq!(reg.next_batch(id, 1), Err(CursorError::NotFound(id)));
     }

@@ -934,7 +934,7 @@ mod tests {
             record: &[u8],
             replace: bool,
         ) -> Result<bool, crate::StorageError> {
-            let mut users = self.users.lock().unwrap();
+            let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
             let key = (db.to_string(), username.to_string());
             if users.contains_key(&key) && !replace {
                 return Ok(false);
