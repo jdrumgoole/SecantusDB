@@ -101,3 +101,4 @@ crates/secantus-server-py/Cargo.lock
 # root when capturing screenshots / DOM dumps. Always untracked, never shipped.
 .playwright-mcp/
 docs-rust/_build/
+faulthandler-dumps/
