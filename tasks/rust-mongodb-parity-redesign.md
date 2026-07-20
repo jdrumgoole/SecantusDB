@@ -428,6 +428,40 @@ Remaining to mongod: single-writer still ~4.7× off (now commit/journal-bound �
 group-commit / journal batching (the commit cost), and the write-amplification /
 double-encode items below.
 
+## After the prune fix: the write path is LEAN — remaining gap is structural
+
+Post-bounded-prune profile + code audit of the single-writer insert path: no
+redundant work remains to cut cheaply.
+- `_id_` is a **virtual** index (never stored), so index-free collections have an
+  empty `descs` → `unique_conflict` and `write_index_entries` are no-ops. No
+  redundant `_id` uniqueness probe (the doc-table `overwrite=false` insert enforces
+  it).
+- `with_statement_txn` is clean (begin / run / commit / post-commit notify); the
+  batch `insert` already commits ONCE per `insertMany` (all docs in one WT txn), so
+  the commit is already amortised across the batch.
+- The hot costs are now inherent: `__wt_txn_commit` (2212) + `__wt_btcur_insert`
+  (1046) + WAL I/O (`__posix_file_write`/`__log_fs_write`/`__posix_file_sync` ~1947)
+  + `encode_doc` (595). `transaction_sync=(enabled=false)` already avoids a
+  per-commit fsync.
+
+**The one reducible structural item: write amplification = 4 WT writes/doc** — doc
+(1) + natural-order index (2: `secantus_natural` seq→id_key + `secantus_natural_seq`
+id_key→seq) + oplog (1). The 2 nat writes exist because docs are keyed by `id_key`
+(the `_id` sort key), NOT by insertion order — so a separate index carries
+`$natural` order + capped eviction, and its reverse map makes delete O(1).
+
+**Next major lever (Phase 5, LARGE — user-sanctioned): RecordId-keyed doc tables.**
+Key the doc table by a monotonic per-collection RecordId (insertion order) instead
+of `id_key`, add an `_id → RecordId` secondary index. Then `$natural` order is the
+doc-table order for free (drops BOTH nat tables), at the cost of one `_id`-index
+write: 4 → 3 writes/doc (~25% amplification cut → est. ~15-20% single-writer, to
+be MEASURED not projected). This is mongod's own catalog model. It's a big on-disk
+format change (re-key every doc, rewrite all `_id` lookups, a migration) + the
+Python mirror — a scoped standalone effort, not a tail-of-session change. The
+smaller alternative (splice the pre-encoded doc into the oplog `o` field to avoid
+the double encode) is only ~5% and risks the change-stream oplog format — poor
+risk/reward, skipped.
+
 ## ⭐ PROFILE (2026-07-20 PM): the write-path bottleneck is the opportunistic PRUNE
 
 `sample` of a single-writer insert loop (scratchpad/profile_insert.sh, load 1.27 —
