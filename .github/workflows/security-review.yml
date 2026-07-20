@@ -89,16 +89,27 @@ jobs:
       # never surfaces it, so a failed review shows only `is_error: true` with
       # no reason. Dump it on every run — without this there is nothing to
       # diagnose from.
-      - name: Dump the Claude execution log
+      - name: Summarize the Claude execution result
         if: always()
         run: |
           f=/home/runner/work/_temp/claude-execution-output.json
-          if [ -f "$f" ]; then
-            echo "--- $f ---"
-            cat "$f"
-          else
-            echo "no execution log at $f"
-          fi
+          if [ ! -f "$f" ]; then echo "no execution log at $f"; exit 0; fi
+          # Print ONLY a curated set of structured diagnostic fields, never the
+          # full turn-by-turn transcript. The transcript can contain data the
+          # agent fetched at runtime (WebFetch responses, command output), and
+          # GitHub's log secret-masking only covers *declared* repo secrets — so
+          # `cat`-ing the whole file could print an incidentally-captured
+          # credential in the clear (security review 2026-07-20, I23). These
+          # fields — the model, the result envelope's cost/turns/error flags, and
+          # any auth-error status — are exactly what diagnosing a failed run needs
+          # (a $0 / 1-turn / is_error result is a rejected token; an
+          # api_error_status of 401 pins it) without echoing free-text content.
+          jq -r '
+            [ .. | objects
+              | select((.subtype=="init") or (has("total_cost_usd")) or (has("api_error_status")) or ((.error|type)=="string"))
+              | { model, subtype, is_error, num_turns, duration_ms, total_cost_usd, error, error_status, api_error_status }
+              | with_entries(select(.value != null)) ]
+          ' "$f" 2>/dev/null || echo "could not parse $f (structured summary unavailable)"
 
       # The action exits 0 whenever its result envelope says
       # subtype == "success", even when the same envelope carries

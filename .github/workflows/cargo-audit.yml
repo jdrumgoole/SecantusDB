@@ -1,0 +1,84 @@
+name: Cargo Audit
+
+# Standing RUSTSEC-advisory gate for the production Rust dependency tree
+# (security review 2026-07-20, I22). Before this, the Rust dependency sweep
+# happened only when the nightly security review happened to search for it;
+# this gate catches a newly-disclosed advisory against a pinned crate version
+# between review cycles — including on the weekly cron, when no code changed
+# but a new advisory landed in the RustSec database.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - '.github/workflows/cargo-audit.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - '.github/workflows/cargo-audit.yml'
+  # The point of the gate: a lockfile that was clean at merge can go
+  # vulnerable later when a new advisory is published against an unchanged
+  # pinned version. The cron re-audits on a fixed cadence to catch that.
+  schedule:
+    - cron: '17 5 * * 1' # Mondays 05:17 UTC (off the :00 fleet pileup)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit production lockfiles
+        run: |
+          set -uo pipefail
+          # Known advisories are ignored WITH a tracking reference so this gate
+          # stays green on today's dependencies but fails on any NEWLY disclosed
+          # one. Remove an ignore when its tracking issue lands the fix.
+          #
+          #   RUSTSEC-2025-0020  pyo3 <0.24.1  buffer overflow in
+          #     PyString::from_object
+          #   RUSTSEC-2026-0177  pyo3 <0.29.0  missing Sync bound on
+          #     PyCFunction::new_closure
+          # pyo3 is pinned at 0.22 in the three binding crates. NEITHER
+          # vulnerable API is called anywhere in the tree (grep is clean), so
+          # this is dependency-currency debt, not a reachable vector. The
+          # 0.22 -> 0.29 bump is a real migration, tracked in #584; drop both
+          # ignores when it lands.
+          IGNORE=(--ignore RUSTSEC-2025-0020 --ignore RUSTSEC-2026-0177)
+          # Production Rust lives under crates/. The rust/ tree is a throwaway
+          # Phase-0 spike (see rust/Cargo.toml's header) and tests/cross_driver
+          # is a gauge harness — neither ships, so neither gates here.
+          #
+          # cargo-audit exits non-zero on a *vulnerability*; unmaintained /
+          # unsound advisories are warning-class (exit 0) and are surfaced in
+          # the log without blocking (rustls-pemfile, anyhow, cgmath today).
+          shopt -s nullglob
+          rc=0
+          for lock in crates/Cargo.lock crates/*/Cargo.lock; do
+            echo "::group::cargo audit ${lock}"
+            cargo audit --file "${lock}" "${IGNORE[@]}" || rc=1
+            echo "::endgroup::"
+          done
+          if [ "${rc}" -ne 0 ]; then
+            echo "::error::cargo audit found a vulnerability that is not on the" \
+              "baselined ignore list. Triage it: if it is a new advisory, fix" \
+              "the dependency (or bump it); only add an --ignore with a tracking" \
+              "issue if the vulnerable path is provably unreachable."
+          fi
+          exit "${rc}"
