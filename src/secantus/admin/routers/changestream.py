@@ -135,10 +135,15 @@ async def ws_changes(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if disconnect_task in done:
-                # Client is gone. Detach from the in-flight poll — its
-                # thread returns within ``_MAX_AWAIT_MS`` and its result is
-                # discarded — and stop tailing.
-                poll_task.cancel()
+                # Client is gone. Wait for the in-flight poll thread to
+                # actually finish (bounded to ~``_MAX_AWAIT_MS`` by the
+                # server-side awaitData cap) before breaking — the ``finally``
+                # closes the stream from *this* thread, and pymongo cursors
+                # aren't thread-safe, so ``try_next`` and ``close`` must never
+                # overlap. Cancelling the future wouldn't stop the thread;
+                # only awaiting it does. The result/exception is discarded.
+                with contextlib.suppress(Exception):
+                    await poll_task
                 break
             event = poll_task.result()
             if event is None:
