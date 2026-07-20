@@ -281,6 +281,43 @@ These are explicit non-goals. Don't add them without a reason.
   armed *inside* the worker (not just the controller), e.g. via a low
   `--max-worker-restart` + core-dump capture, or by running the ws-changes test
   file alone under CPU starvation.
+  **Investigation 2026-07-21 (findings, no fix — the code guidance to not
+  blind-apply stands).** Read the tail loop (`admin/routers/changestream.py:99-121`):
+  `stream = await asyncio.to_thread(target.watch)` then a loop of
+  `await asyncio.to_thread(stream.try_next)`, with `finally: await
+  asyncio.to_thread(stream.close)`. Two real defects confirmed by code reading:
+  (1) **no `max_await_time_ms` on `watch()`** — each `try_next` blocks on the
+  server's ~1s default tailable await, and `asyncio.to_thread` CANNOT interrupt
+  the running pool thread on cancel, so a disconnect waits ~1s+ for the in-flight
+  `try_next` to unwind (measured: a single disconnect adds seconds of latency;
+  100 sequential iterations do not finish in 5 min). (2) **`close()` can run
+  concurrently with a still-in-flight `try_next`** on the same pymongo
+  `ChangeStream`, which pymongo documents as not thread-safe.
+  **Could NOT reproduce the crash on macOS**, which is the key negative result:
+  a direct two-thread harness (`scratchpad/repro_concurrent.py`: `try_next` loop
+  on one thread + `close()` on another against one `ChangeStream`) survived
+  **500 rounds even under 12 CPU-hog processes on a 12-core box** — zero crashes,
+  thread count flat at 10 (no leak). So the crash is **not** a macOS-reproducible
+  pymongo client-side concurrency segfault; it is Linux+load specific. Refined
+  prime suspect given WT is involved and it's Linux-only: the WT-level race
+  between the test's `SecantusDBServer` (the `server` fixture) tearing down and a
+  change-stream `getMore` still parked on that server's oplog — a server-side
+  analogue of the client `stop()` use-after-free fixed in 0.5.3b5, reachable via
+  the admin ws tail's separate `MongoClient`. **The documented candidate fix
+  (bound `max_await_time_ms`, serialize close vs try_next via a per-connection
+  single-worker executor) is correct on its own merits and would remove both
+  defects — but per the "do NOT blind-apply, needs a repro" note it is NOT
+  applied here, since I can't verify it kills the Linux crash and the change
+  touches a live path.** Concrete unblock: the fix needs a Linux repro (this box
+  is macOS). Best next step is a CI-only diagnostic — arm `faulthandler.enable()`
+  writing to a per-worker file uploaded as a CI artifact (pytest's faulthandler
+  writes to worker stderr, which xdist drops on "node down") — so the next
+  Linux occurrence dumps the faulting thread's C stack and finally names the
+  culprit. (The macOS repro harness that stayed clean: a two-thread loop —
+  `coll.watch()`, then one thread calling `stream.try_next()` repeatedly while
+  another calls `stream.close()` after a 50 ms head start — 500 rounds under 12
+  background CPU burners; trivial to re-create on a Linux box to attempt the
+  repro there.)
 
 
 Subtler than the above; these may bite specific test suites.
