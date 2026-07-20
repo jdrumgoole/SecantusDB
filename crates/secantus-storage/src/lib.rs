@@ -2105,7 +2105,11 @@ impl Storage {
     pub fn oplog_tail_seq(&self) -> i64 {
         // The tail counter lives under the dedicated oplog mutex; the global lock
         // adds nothing here.
-        self.oplog.lock().unwrap_or_else(|e| e.into_inner()).next_seq - 1
+        self.oplog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_seq
+            - 1
     }
 
     /// Force a WiredTiger checkpoint (durable flush of the latest snapshot). Used
@@ -2446,7 +2450,10 @@ impl Storage {
     /// never touch the old rows doomed here; the reads that could observe a
     /// half-pruned range (`read_oplog`, resume) tolerate missing rows.
     fn prune_oplog_inner(&self, now: Option<i64>) -> Result<usize> {
-        let _p = self.oplog_prune_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _p = self
+            .oplog_prune_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
         let when = now.unwrap_or_else(now_secs);
         let cutoff = when - self.oplog_retention_seconds;
@@ -2564,7 +2571,11 @@ impl Storage {
             }
             more = c.next()?;
         }
-        Ok(self.oplog.lock().unwrap_or_else(|e| e.into_inner()).next_seq)
+        Ok(self
+            .oplog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_seq)
     }
 
     // -- user (multi-document) transactions --------------------------------
@@ -3371,7 +3382,10 @@ impl Storage {
         // observable on real mongod too and the Python server accepts the
         // same window.
         let ns_locks: Vec<_> = colls.iter().map(|c| self.coll_lock(db, c)).collect();
-        let _ns_guards: Vec<_> = ns_locks.iter().map(|l| l.lock().unwrap_or_else(|e| e.into_inner())).collect();
+        let _ns_guards: Vec<_> = ns_locks
+            .iter()
+            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
         let mut ui_pairs: Vec<(String, Vec<u8>)> = Vec::new();
         if self.enable_oplog {
             for c in &colls {
@@ -3439,7 +3453,10 @@ impl Storage {
         ns.sort_unstable();
         ns.dedup();
         let ns_locks: Vec<_> = ns.iter().map(|(d, c)| self.coll_lock(d, c)).collect();
-        let _ns_guards: Vec<_> = ns_locks.iter().map(|l| l.lock().unwrap_or_else(|e| e.into_inner())).collect();
+        let _ns_guards: Vec<_> = ns_locks
+            .iter()
+            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
         let session = self.conn.open_session()?;
         if coll_options(&session, src_db, src_coll)?.is_none() {
             return Ok((
