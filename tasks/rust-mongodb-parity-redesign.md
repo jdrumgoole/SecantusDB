@@ -404,17 +404,53 @@ and PITR replay. A k-way merge by seq (each shard is seq-sorted; a doc's shard i
 every event, in order, with correct resume tokens across shards). This is
 correctness-critical but now clearly justified — the win is proven.
 
+## ⚠️ CORRECTION (2026-07-20 PM): honest back-to-back A/B — it's a TRADEOFF
+
+The earlier "single-writer 16k → 28.9k (1.8×)" headline **does not reproduce** and
+was a measurement artifact (cooler machine / short-run noise). A rigorous
+back-to-back A/B on ONE machine state (single-table baseline binary vs sharded
+binary, same run) gives:
+
+| | baseline (1 table) | sharded (16 btrees) | ratio |
+|---|---|---|---|
+| 1 writer | 13,525/s | 10,793/s | **0.80× — REGRESSION** |
+| 8 writers (total) | 55,000 | 92,000 | **1.67×** |
+| 8-writer scaling | 0.27× | 0.57× | improved |
+
+**Sharding is a tradeoff, not a pure win:** it relieves multi-writer append
+contention (8w throughput +67%, scaling 0.27→0.57×) but *hurts* single-writer ~20%
+— one writer has no contention to relieve, so sharding only adds routing overhead
+and scatters a batch's appends across several btrees instead of one cache-hot
+page. Whether it's worth shipping depends on the target workload (concurrent
+writers: yes; single-writer-dominated: no) — a **user decision**, not an
+autonomous one, especially given it's a correctness-critical on-disk format change.
+
+Caveat: the absolute numbers are thermally unreliable this session (baseline 8w
+scaling measured 0.60× earlier, 0.27× now). The RATIOS (back-to-back, same run)
+are the trustworthy signal; a clean cool-machine re-measure is still owed before
+any headline number is quoted.
+
 ## Implementation status (2026-07-20): sharded oplog SHIPPED end-to-end
 
 The full sharded-oplog read path is implemented in **both** storage layers and
 green on the integrity suites:
 
-- **Rust** (`crates/secantus-storage/src/lib.rs`): per-entry write routing
-  (`seq % OPLOG_SHARDS`), a k-way `read_oplog_shards` merge (shards + legacy
-  table), and every reader converted — `read_oplog`, `scan_max_oplog_seq`,
-  `oplog_floor_seq`, `find_seq_for_ts`, `prune_oplog_inner` (merge scan + delete
-  from both shard & legacy), `load_oplog_meta` recovery, `archive_doomed_oplog`,
-  and `import_oplog_segment` (restore routes to shards).
+- **Rust** (`crates/secantus-storage/src/lib.rs`): **per-batch** write routing
+  (a whole `emit_oplog` batch → one shard by `start_seq % OPLOG_SHARDS`), a k-way
+  `read_oplog_shards` merge (shards + legacy table), and every reader converted —
+  `read_oplog`, `scan_max_oplog_seq`, `oplog_floor_seq`, `find_seq_for_ts`,
+  `prune_oplog_inner` (tagged merge → delete from each seq's exact table),
+  `load_oplog_meta` recovery, `archive_doomed_oplog` (probe all tables), and
+  `import_oplog_segment` (restore → one shard).
+  - **Per-batch, NOT per-entry — measured lesson.** The first cut routed per
+    *entry* (`seq % N`) for O(1) point-lookups; it *regressed* single-writer to
+    ~8.6k docs/s (below the 16k baseline) because scattering a 100-doc batch's
+    contiguous seqs across all 16 btrees destroys sequential-append locality.
+    Per-batch keeps each batch a contiguous append to one tree (locality) while
+    concurrent writers spread across trees (scaling). The cost — a seq's shard
+    isn't derivable from the seq — is paid by the k-way merge (ordered reads) and
+    all-table probes (rare point-ops); the prune uses the merge's shard tag to
+    still delete from exactly one table.
 - **Python** (`src/secantus/storage.py`): the sharded oplog is an **on-disk
   format change**, so the Python server must READ/RECOVER/PRUNE a Rust-written
   store for cross-server PITR/backup (`test_rust_pitr_cross_server`). Python

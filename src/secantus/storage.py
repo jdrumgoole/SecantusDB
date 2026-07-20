@@ -139,13 +139,15 @@ _OPLOG_TABLE = "table:secantus_oplog"
 # The oplog is sharded across ``_OPLOG_SHARDS`` btrees in the Rust server so
 # concurrent writers don't all rendezvous on one table's rightmost append page
 # (the scaling fix; see ``tasks/rust-mongodb-parity-redesign.md`` and the Rust
-# ``OPLOG_SHARDS``). The **Python** server writes only the legacy single table
-# above (its global lock serialises everything, so sharding buys it nothing), but
-# it must still *read + recover + prune* a Rust-written store's sharded oplog for
-# cross-server PITR / backup portability — so every oplog reader here merges the
-# shard tables together with the legacy table. Routing is per-entry by
-# ``seq % _OPLOG_SHARDS``; seqs are minted monotonically, so shard k holds exactly
-# the seqs congruent to k mod N and the global order is a k-way merge.
+# ``OPLOG_SHARDS``). The Rust server routes each *batch* (one emit) to one shard
+# by ``start_seq % N`` — per-batch, not per-entry, so a batch stays a contiguous
+# sequential append (per-entry scatter destroys that locality). A seq's shard is
+# therefore NOT a function of the seq: ordered reads use a k-way merge and per-seq
+# point-ops probe every table. The **Python** server writes only the legacy single
+# table above (its global lock serialises everything, so sharding buys it
+# nothing), but it must still *read + recover + prune* a Rust-written store's
+# sharded oplog for cross-server PITR / backup portability — so every oplog reader
+# here merges the shard tables with the legacy table.
 _OPLOG_SHARDS = 16
 
 
@@ -153,11 +155,7 @@ def _oplog_shard_name(shard: int) -> str:
     return f"table:secantus_oplog_sh{shard}"
 
 
-def _oplog_shard_of(seq: int) -> str:
-    return _oplog_shard_name(seq % _OPLOG_SHARDS)
-
-
-# Every table an oplog reader must merge: the N shards + the legacy single table.
+# Every table an oplog reader / point-op must consider: the N shards + legacy.
 _OPLOG_ALL_TABLES = [_oplog_shard_name(s) for s in range(_OPLOG_SHARDS)] + [_OPLOG_TABLE]
 _PREIMAGE_TABLE = "table:secantus_preimages"
 _OPLOG_META_TABLE = "table:secantus_oplog_meta"
@@ -1194,13 +1192,13 @@ class Storage:
                     next_nat,
                 )
         # Fallback: reconstruct from the newest oplog row. Sharded — the max seq
-        # can be in any shard (or the legacy table); read that seq's ts from its
-        # owning table.
+        # can be in any shard (or the legacy table); routing is per-batch so its
+        # table isn't a function of the seq — probe each table for that seq's ts.
         last_seq = self._scan_max_oplog_seq()
         last_secs = 0
         last_ord = 0
         if last_seq > 0:
-            for table in (_oplog_shard_of(last_seq), _OPLOG_TABLE):
+            for table in _OPLOG_ALL_TABLES:
                 c2 = self._cursor(table)
                 c2.set_key(last_seq)
                 if c2.search() == 0:
@@ -2144,17 +2142,15 @@ class Storage:
         # them, so recovery can still reach a time before the new oplog floor.
         if self.oplog_archive_dir is not None:
             self._archive_doomed_oplog(sorted(doomed))
-        # Sharded delete: a doomed seq lives in its shard ``seq % N`` (Rust store)
-        # or the legacy table (Python store). Remove from BOTH unconditionally —
-        # the ``_cursor`` cursors are overwrite=True, so ``remove()`` of an absent
-        # key is a safe no-op; that's simpler and more robust than a search-first
-        # fallback (overwrite mode makes ``remove()`` succeed on a missing key, so
-        # a "did it delete?" check can't distinguish the two tables). Pre-images
-        # stay in one table.
-        legacy_del = self._cursor(_OPLOG_TABLE)
+        # Sharded delete: routing is per-batch, so a doomed seq's table isn't a
+        # function of the seq — remove from every table (all shards + legacy). The
+        # ``_cursor`` cursors are overwrite=True, so ``remove()`` of an absent key
+        # is a safe no-op; the seq is present in exactly one table (a Rust store's
+        # shard, or a Python store's legacy table). Pre-images stay in one table.
         pre_del = self._cursor(_PREIMAGE_TABLE)
         for seq in doomed:
-            for cur in (self._cursor(_oplog_shard_of(seq)), legacy_del):
+            for table in _OPLOG_ALL_TABLES:
+                cur = self._cursor(table)
                 cur.set_key(seq)
                 with contextlib.suppress(wt.WiredTigerError):
                     cur.remove()
@@ -2171,25 +2167,23 @@ class Storage:
         from ``_prune_oplog_locked`` before the rows are deleted."""
         from . import pitr_archive
 
-        legacy_cur = self._cursor(_OPLOG_TABLE)
         pre_cur = self._cursor(_PREIMAGE_TABLE)
         rows: list[tuple[int, dict[str, Any], dict[str, Any] | None]] = []
         for seq in doomed_sorted:
-            # A doomed seq lives in shard ``seq % N`` (Rust store) or the legacy
-            # table (Python store); try the shard first, then the legacy table.
-            op_cur = self._cursor(_oplog_shard_of(seq))
-            op_cur.set_key(seq)
-            found = op_cur.search() == 0
-            if not found:
-                op_cur.reset()
-                op_cur = legacy_cur
+            # Routing is per-batch, so a doomed seq's table isn't a function of the
+            # seq — probe every table (all shards + legacy) for the row.
+            blob = None
+            for table in _OPLOG_ALL_TABLES:
+                op_cur = self._cursor(table)
                 op_cur.set_key(seq)
-                found = op_cur.search() == 0
-            if not found:
+                if op_cur.search() == 0:
+                    blob = bytes(op_cur.get_value())
+                    op_cur.reset()
+                    break
                 op_cur.reset()
+            if blob is None:
                 continue
-            entry = bson.decode(bytes(op_cur.get_value()))
-            op_cur.reset()
+            entry = bson.decode(blob)
             pre = None
             pre_cur.set_key(seq)
             if pre_cur.search() == 0:
