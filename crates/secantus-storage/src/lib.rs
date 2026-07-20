@@ -412,12 +412,30 @@ pub fn wt_config(cache_size: &str, session_max: u32, sync_on_commit: bool) -> St
     )
 }
 
+// zlib block compression on the value-heavy tables (document blobs live in the
+// doc / oplog / preimage tables) — cuts the per-doc disk-write volume that bounds
+// steady-state write throughput (measured +25% single-writer and ~2× multi-writer
+// scaling on compressible data), mirroring mongod's compress-by-default. The WT
+// build links the builtin zlib extension (HAVE_BUILTIN_EXTENSION_ZLIB) on macOS +
+// Linux, where libz is present; **Windows** WT is built without it (no default
+// libz), so the compressor clause is omitted there — a `block_compressor=zlib`
+// table create would fail with "unknown compressor". Set at create time; existing
+// uncompressed tables keep their format (WT stores it in metadata).
+#[cfg(not(target_os = "windows"))]
+const DOC_TABLE_CFG: &str = "key_format=SSu,value_format=u,block_compressor=zlib";
+#[cfg(target_os = "windows")]
+const DOC_TABLE_CFG: &str = "key_format=SSu,value_format=u";
+#[cfg(not(target_os = "windows"))]
+const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=zlib";
+#[cfg(target_os = "windows")]
+const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u";
+
 // The full table set `storage.py` bootstraps. Sub-phase 1 only reads/writes the
 // collections + documents tables, but creating the rest keeps the on-disk schema
 // identical so later sub-phases don't need a migration.
 const BOOTSTRAP: &[(&str, &str)] = &[
     (COLL_TABLE, "key_format=SS,value_format=u"),
-    (DOC_TABLE, "key_format=SSu,value_format=u"),
+    (DOC_TABLE, DOC_TABLE_CFG),
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
     (
         "table:secantus_index_entries",
@@ -428,8 +446,8 @@ const BOOTSTRAP: &[(&str, &str)] = &[
         "table:secantus_natural_seq",
         "key_format=SSu,value_format=q",
     ),
-    ("table:secantus_oplog", "key_format=q,value_format=u"),
-    ("table:secantus_preimages", "key_format=q,value_format=u"),
+    ("table:secantus_oplog", QU_COMPRESSED_CFG),
+    ("table:secantus_preimages", QU_COMPRESSED_CFG),
     ("table:secantus_oplog_meta", "key_format=S,value_format=u"),
     ("table:secantus_users", "key_format=SS,value_format=u"),
     ("table:secantus_roles", "key_format=SS,value_format=u"),

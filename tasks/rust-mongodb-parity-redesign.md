@@ -136,7 +136,104 @@ each measurable in isolation via `bench.concurrency` single-writer:
 This is the highest-value latency workstream — the single-writer base is what all
 the scaling multiplies. Gate: full CRUD + concurrency integrity suites + parity.
 
+**Measured negative result (2026-07-20):** lever 1 (skip re-encode when `_id`
+present) gave **~0 improvement** (251k → 256k single-writer, within noise). So BSON
+*re-encode* is NOT the bottleneck. Reverted.
+
+**Profile verdict (`sample` on debug-symbol binary, single-writer load):** time is
+spread across WT's write machinery — `__wt_evict_thread_run`, `__wt_reconcile`,
+`__wt_block_write`, `__wt_page_in/out/swap`, cursor-cache churn — essentially **no
+`secantus_*` frames**. The bottleneck is **WT itself under cache pressure + write
+amplification**, not our Rust code, not locks, not BSON. Two levers fall out:
+
+- **Cache size — a MEASUREMENT-ARTIFACT, not a win (corrected).** A short cache A/B
+  (`load_writer --count 200000`, ~9s) showed 1G 12.1k/s → 8G 21.3k/s and I nearly
+  shipped a "+75%" auto-cache change. The honest **20s steady-state** concurrency
+  bench debunked it: 8G gives **239k/251k single-writer — flat vs 1G's 251k/257k**.
+  The short 8G run simply finished *before* WT's dirty-eviction trigger engaged
+  (transient), while the 1G run was already at steady state. **Steady-state write
+  throughput is disk-write-*volume* bound, not cache bound** — bigger cache doesn't
+  help. Change reverted. Lesson: always measure steady-state (20s), never a
+  short-count run, for write throughput.
+- **Compression — the real steady-state suspect (mongod-parity).** The bench doc is
+  `"x"*8192` — pathologically compressible — and **mongod block-compresses (snappy)
+  by default while our WT tables don't** (`DEFAULT_CONFIG` / table creates set no
+  `block_compressor`). So mongod writes ~nothing to disk per doc; we write the full
+  8KB. Since steady state is disk-volume bound, compression could be a large,
+  legitimate lever (and matches mongod). *Next experiment — verify snappy is in the
+  WT build, enable `block_compressor` on the data/index/oplog tables, measure 20s
+  steady-state.*
+- **WT-op reduction:** independently, we do ~4 WT writes/doc (doc + 2 natural-order +
+  oplog) vs mongod's ~2. The natural-order index (`write_nat_entry`) is the target —
+  fewer writes = less disk volume. Sequence after the compression result.
+
+**Compression build-integration — WIP, blocked at runtime registration (2026-07-20).**
+Wired zlib block-compression into the self-contained WT build (uncommitted on
+`mongo-parity-write-deamp`). Five sequential hurdles, four resolved:
+1. `ENABLE_SNAPPY` **finds** a system snappy (none in the wheel build) → switched to
+   zlib (`libz` is ubiquitous). *(snappy is a follow-up: bundle its source.)*
+2. `ENABLE_ZLIB` + `HAVE_BUILTIN_EXTENSION_ZLIB` are mutually exclusive → keep only
+   the builtin flag (`CMakeLists.txt`).
+3. Builtin `zlib_compress.c.o` (now in `libwiredtiger`) references `libz`'s
+   inflate/deflate → link `-lz` (`crates/secantus-wt/build.rs`, linux+macos).
+4. `block_compressor=zlib` on the doc/oplog/preimage tables
+   (`storage/src/lib.rs` BOOTSTRAP).
+5. **RESOLVED:** runtime `unknown compressor 'zlib'` was a **stale-lib link**, two
+   layers: (a) `secantus-wt/build.rs` and `_rust_env()` both prefer
+   `/tmp/wt-build` (a 3-day-old dev-sandbox WT with **no** zlib) over this
+   checkout's fresh `build/*/wt-build`; (b) passing `SECANTUS_WT_LIB` as a
+   *relative* path broke bindgen. Fix: build with **absolute**
+   `SECANTUS_WT_LIB`/`SECANTUS_WT_INCLUDE` pointing at the fresh `build/*/wt-build`
+   (the fresh lib's `conn_api.o` correctly references `zlib_extension_init`).
+   *(Merge concern: the CI/wheel build produces the fresh lib in-tree, so this is a
+   local dev-sandbox shadow only — but worth a `build.rs` note that a stale
+   `/tmp/wt-build` shadows a config change.)*
+
+**Compression WORKS — and it's the biggest lever, on BOTH axes.** Smoke: 5000×8KB
+`"x"*8192` docs → `secantus_documents.wt` **1.49 MB vs ~40 MB raw ≈ 27×**. Measured
+(20s steady-state, unloaded):
+
+| | Phase 1 | zlib compression | Δ |
+|---|---|---|---|
+| single-writer (sep) | 12.5k/s | **15.6k/s** | +25% |
+| scaling 2w / 4w / 8w (sep) | 0.62 / 0.41 / 0.33× | **0.95 / 0.70 / 0.62×** | ~2× at 8w |
+| shared 8w | 0.75× | 0.90× | +20% |
+
+**Confirms the profile:** the bottleneck is disk-write *volume* — cutting it lifts
+single-writer AND roughly doubles multi-writer scaling (less data → less disk/WT
+contention for parallel writers). Caveat: the bench doc is 27×-compressible; real
+data ~2–4×, so the real-world win is proportionally smaller but real on both axes.
+
+**To land (cross-platform build-integration concerns):**
+- The wheel build must produce a zlib-enabled WT on every target. `libz` links from
+  the macOS SDK and manylinux/musl (zlib present); **Windows** has no default `libz`
+  — the `build.rs` `-lz` is gated to linux+macos, so the Windows wheel would build
+  WT with `HAVE_BUILTIN_EXTENSION_ZLIB` but fail to link. Either gate the CMake flag
+  to non-Windows, or bundle zlib. Decide before merge.
+- On-disk format change: compressed tables must round-trip reopen/backup/PITR — WT
+  handles decompression transparently, but the durable-lane + reopen tests must be
+  green (the gate + CI durable lane cover this).
+- snappy (mongod's default, better CPU/ratio balance) is the follow-up once the
+  compressor build path is proven; needs its source bundled (WT only *finds* snappy).
+
 ### Phase 2 — Drop the per-collection CRUD lock → WT-MVCC-native *(biggest same-collection lever)*
+
+**Feasibility analysis (2026-07-20, de-risked):** the `coll_lock` does NOT protect
+the seq/ts/`next_nat_seq` counters — those mint under the dedicated `oplog` mutex
+(`lib.rs:1959`; the seq can't be a bare atomic because `wait_for_oplog` pairs it
+with `oplog_cv`). So `coll_lock` only serializes same-collection writers *across
+their WT transaction* — which WT's MVCC + the existing `WriteConflict`/
+`WT_DUPLICATE_KEY` retry (`retry_write_conflicts`) already handle. Carve-outs:
+capped-collection trim needs a **narrow** per-collection lock (avoid double
+eviction); `maybe_mark_multikey` is idempotent (benign race); unique-index races →
+`WT_DUPLICATE_KEY` (already the backstop). So the change is: drop `coll_lock` from
+the CRUD write path, add a narrow trim-only lock. **Correctness-critical** — this
+removes write serialization from a database, so it must land with the full
+`test_mongo_server_concurrency` integrity suite green *plus* extended stress
+(exactly-one-winner, no-lost-update, findAndModify exclusivity) and deserves
+focused implementation + review, not a rushed change. The gate exists; the analysis
+is done; the implementation is the next focused session's work.
+
 Stop holding `coll_lock` across the WT transaction on the CRUD write path; let
 concurrent same-collection writers run concurrent WT transactions and rely on WT
 conflict detection + the **existing** `WriteConflict` retry. Carve-outs that still
