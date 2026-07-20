@@ -432,6 +432,17 @@ def validate(c: Context, server: str = "python") -> None:
     # `-o timeout=120`: tighter than the project-wide 600s — a gauge test
     #   that blocks >2 min against SecantusDB is a conformance failure worth
     #   recording, and at 600s a handful of hangs would add hours.
+    # `-p no:randomly`: pytest-randomly is a project dev dependency and is
+    #   active by default, so it SHUFFLES these vendored suites on every run
+    #   with a fresh unrecorded seed. Upstream driver suites assume their own
+    #   ordering (shared fixtures, collections created by one test and reused
+    #   by the next), so shuffling manufactures failures that say nothing about
+    #   SecantusDB — measured on identical code, the async gauge produced 6,
+    #   9 and 16 failures on three orderings (the reordered runs adding
+    #   `CollectionInvalid: collection coll already exists` pileups and an
+    #   xdist worker crash in the bulk-insert tests). A conformance number has
+    #   to be reproducible and comparable release-to-release, so run these
+    #   suites in the order upstream wrote them.
     # `-p pymongo_validation.plugin`: load our embedded-server bootstrap (the
     #   CONTROLLER starts the server pre-conftest; workers inherit the env).
     # `--continue-on-collection-errors`: a collection failure in one file
@@ -448,7 +459,7 @@ def validate(c: Context, server: str = "python") -> None:
         "-c pyproject.toml "
         "-o addopts= -o testpaths= -o timeout=120 "
         "-n1 --max-worker-restart=200 "
-        "-p no:cacheprovider -p pymongo_validation.plugin "
+        "-p no:cacheprovider -p no:randomly -p pymongo_validation.plugin "
         "--continue-on-collection-errors "
         f"--json-report --json-report-file={raw_json} "
         f"--no-header --tb=no -q {deselect} {paths}",
@@ -490,7 +501,7 @@ def validate_one(c: Context, nodeid: str, server: str = "python") -> None:
         f"SECANTUS_GAUGE_SERVER={server} PYTHONPATH=. "
         "uv run --no-sync python -m pytest "
         "-c pyproject.toml -o addopts= -o testpaths= -o timeout=120 -n1 "
-        "-p no:cacheprovider -p pymongo_validation.plugin "
+        "-p no:cacheprovider -p no:randomly -p pymongo_validation.plugin "
         f"{ids}",
         pty=True,
         env=_rust_env(),
@@ -547,7 +558,7 @@ def validate_pymongo_async(c: Context, server: str = "python") -> None:
         "-o addopts= -o testpaths= -o timeout=120 "
         "-o asyncio_mode=auto -o asyncio_default_fixture_loop_scope=session "
         "-n1 --max-worker-restart=200 "
-        "-p no:cacheprovider -p pytest_asyncio -p pymongo_validation.plugin "
+        "-p no:cacheprovider -p no:randomly -p pytest_asyncio -p pymongo_validation.plugin "
         "--continue-on-collection-errors "
         f"--json-report --json-report-file={raw_json} "
         f"--no-header --tb=no -q {deselect} {paths}",

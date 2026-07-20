@@ -3934,32 +3934,64 @@ recorded in that slice's changelog fragment. Still open:
   from the WT cache because `uv build --wheel` leaves no reusable build dir on
   Windows.
 
-## pymongo-async gauge: xdist worker crash on `test_numerous_inserts` (2026-07-20)
+## pymongo gauges: nondeterministic ordering (FIXED) + an intermittent worker crash (OPEN) (2026-07-20)
 
-`vendor/pymongo-tests/test/asynchronous/test_collection.py::AsyncTestCollection::test_numerous_inserts`
-fails the pymongo-async gauge with `worker 'gw0' crashed while running ...` —
-the xdist worker process dies rather than the test asserting. Observed on a
-**serial** `invoke validate-pymongo-async` run (so it is not `--jobs 4` CPU
-contention), and reproduced across both that run and the parallel
-`validate-all` run that preceded it.
+**Root cause: `pytest-randomly` was shuffling the vendored upstream suites.**
+It is a project dev dependency and active by default, so every gauge run
+reordered pymongo's tests with a fresh, unrecorded seed (`--no-header` hid it).
+Those suites assume their own ordering — collections created by one test and
+reused by the next, shared class fixtures — so shuffling manufactured failures
+that said nothing about SecantusDB.
 
-Note there are two same-named tests; the crashing one is `test_collection.py::
-AsyncTestCollection`, NOT `test_bulk.py::AsyncTestBulk`. Both pass in
-isolation via `invoke validate-one` (6.8s and 12.4s respectively), so this is
-a cross-test interaction in the full-suite run, not a defect the test exercises
-on its own.
+Measured on identical code, the async gauge produced **three different results**
+purely from ordering:
 
-No `WT_PANIC` / segfault / OOM text is captured in the gauge log — the worker's
-stderr isn't surfaced by the runner, which is the first gap to close when
-picking this up. Shape resembles the leaked-`Storage`-fixture worker crash
-fixed in e233fe61 ("close leaked Storage fixtures"), so suspect fd/handle or
-memory exhaustion accumulated by earlier tests in the same worker.
+| ordering | result |
+|---|---|
+| shuffled (unrecorded seed) | 9 failed, 923 passed + xdist worker crash |
+| shuffled (`--randomly-seed=3`) | 16 failed, 916 passed + 2 worker crashes |
+| upstream order (`-p no:randomly`) | **6 failed, 926 passed**, no crash |
 
-Next steps: capture worker stderr (`-p no:cacheprovider --tb=long`, or run the
-gauge with `-n0` to get an in-process traceback), then bisect which preceding
-test leaves the state that kills the worker. Until diagnosed this inflates the
-published pymongo-async failure count by one (39 vs 38 at the previous
-release's artifacts).
+The reordered runs added a `CollectionInvalid: collection coll already exists`
+pileup across `test_read_concern.py` (leftover state from a test that upstream
+never runs first) and a `KeyError: 'data'` in `test_custom_types.py` — textbook
+test-isolation breakage, not conformance divergence.
+
+Fixed by adding `-p no:randomly` to all three pymongo gauge invocations in
+`tasks.py` (`validate`, `validate-one`, `validate-pymongo-async`). Verified: two
+consecutive runs now produce byte-identical failure sets (6 failures, all
+documented out-of-scope divergences — hashed/text indexes, `$where`, csot,
+maxtime message, hedge deprecation).
+
+**Still open — the worker crash is NOT fully explained by ordering.** Removing
+the shuffle removed the *variance*, not the crash class. With `-p no:randomly`
+in place the sync gauge still crashed once on
+`test_bulk.py::TestBulk::test_bulk_max_message_size` (6 failed / 1225 passed),
+then ran clean on the very next invocation (5 failed / 1226 passed) — so it is
+intermittent even at fixed ordering.
+
+Evidence pointing at memory/resource pressure rather than a logic bug:
+- Every test that has crashed a worker is one of the heavy ones —
+  `test_numerous_inserts`, `test_bulk_max_message_size`,
+  `test_overflow_int_w_custom_decoder`.
+- Each passes in isolation in ~2s (`invoke validate-one`), so nothing is wrong
+  with the operation itself.
+- The gauge runs the whole suite in ONE xdist worker (`-n1`); sampled worker RSS
+  peaks around **1.3 GB** by late in the run.
+- The first observation came from a `validate-all --jobs 4` run, i.e. under
+  maximum machine contention.
+
+Next step for whoever picks this up: confirm or refute OOM. The runner still
+does not surface worker stderr, so start there — capture the worker's exit
+signal (a SIGKILL from the OS points at memory; a SIGSEGV points at the
+extension). If it is memory, the fix is likely periodic worker recycling
+(`--max-worker-restart` already tolerates restarts; xdist has no built-in
+max-tests-per-worker, so this may mean splitting the heavy bulk files into their
+own gauge invocation).
+
+The original guess in this entry — leaked `Storage` fixtures, by analogy with
+e233fe61 — was wrong; nothing pointed at fixture lifetime once ordering was
+controlled.
 
 ## `validate-all` runs the java and kotlin gauges concurrently (2026-07-20)
 
