@@ -136,6 +136,29 @@ _INT64_MIN = -(2**63)  # lowest WT ``q`` key — scan a (db, coll) prefix from t
 _IDX_TABLE = "table:secantus_indexes"
 _IDX_ENTRIES_TABLE = "table:secantus_index_entries"
 _OPLOG_TABLE = "table:secantus_oplog"
+# The oplog is sharded across ``_OPLOG_SHARDS`` btrees in the Rust server so
+# concurrent writers don't all rendezvous on one table's rightmost append page
+# (the scaling fix; see ``tasks/rust-mongodb-parity-redesign.md`` and the Rust
+# ``OPLOG_SHARDS``). The **Python** server writes only the legacy single table
+# above (its global lock serialises everything, so sharding buys it nothing), but
+# it must still *read + recover + prune* a Rust-written store's sharded oplog for
+# cross-server PITR / backup portability — so every oplog reader here merges the
+# shard tables together with the legacy table. Routing is per-entry by
+# ``seq % _OPLOG_SHARDS``; seqs are minted monotonically, so shard k holds exactly
+# the seqs congruent to k mod N and the global order is a k-way merge.
+_OPLOG_SHARDS = 16
+
+
+def _oplog_shard_name(shard: int) -> str:
+    return f"table:secantus_oplog_sh{shard}"
+
+
+def _oplog_shard_of(seq: int) -> str:
+    return _oplog_shard_name(seq % _OPLOG_SHARDS)
+
+
+# Every table an oplog reader must merge: the N shards + the legacy single table.
+_OPLOG_ALL_TABLES = [_oplog_shard_name(s) for s in range(_OPLOG_SHARDS)] + [_OPLOG_TABLE]
 _PREIMAGE_TABLE = "table:secantus_preimages"
 _OPLOG_META_TABLE = "table:secantus_oplog_meta"
 _USERS_TABLE = "table:secantus_users"
@@ -1027,6 +1050,12 @@ class Storage:
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
             boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSu,value_format=u")
             boot.create(_OPLOG_TABLE, "key_format=q,value_format=u")
+            # Oplog shard tables (see ``_OPLOG_SHARDS``). Created empty here so the
+            # merge readers can open a cursor on each unconditionally; the Python
+            # write path leaves them empty (it writes the legacy table above), but
+            # a Rust-written store opened by Python has its entries in these.
+            for _s in range(_OPLOG_SHARDS):
+                boot.create(_oplog_shard_name(_s), "key_format=q,value_format=u")
             boot.create(_PREIMAGE_TABLE, "key_format=q,value_format=u")
             boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
             boot.create(_USERS_TABLE, "key_format=SS,value_format=u")
@@ -1164,38 +1193,47 @@ class Storage:
                     int(state.get("last_ts_ord", 0)),
                     next_nat,
                 )
-        # Fallback: scan oplog table for max key + reconstruct from entry.
-        c2 = self._cursor(_OPLOG_TABLE)
-        # Walk to last row.
-        last_seq = 0
+        # Fallback: reconstruct from the newest oplog row. Sharded — the max seq
+        # can be in any shard (or the legacy table); read that seq's ts from its
+        # owning table.
+        last_seq = self._scan_max_oplog_seq()
         last_secs = 0
         last_ord = 0
-        rc = c2.next()
-        while rc == 0:
-            seq = int(c2.get_key())
-            if seq > last_seq:
-                last_seq = seq
-                blob = bytes(c2.get_value())
-                if blob:
-                    entry = bson.decode(blob)
-                    ts = entry.get("ts")
-                    if isinstance(ts, Timestamp):
-                        last_secs, last_ord = ts.time, ts.inc
-            rc = c2.next()
+        if last_seq > 0:
+            for table in (_oplog_shard_of(last_seq), _OPLOG_TABLE):
+                c2 = self._cursor(table)
+                c2.set_key(last_seq)
+                if c2.search() == 0:
+                    blob = bytes(c2.get_value())
+                    c2.reset()
+                    if blob:
+                        entry = bson.decode(blob)
+                        ts = entry.get("ts")
+                        if isinstance(ts, Timestamp):
+                            last_secs, last_ord = ts.time, ts.inc
+                    break
+                c2.reset()
         return last_seq + 1, last_secs, last_ord, self._scan_max_nat_seq() + 1
 
     def _scan_max_oplog_seq(self) -> int:
-        """Largest ``seq`` present in ``_OPLOG_TABLE`` (0 if empty).
+        """Largest ``seq`` present across all oplog shards + the legacy table
+        (0 if all empty).
 
-        Cheap: the oplog table is keyed on the bare ``seq`` (``key_format=q``),
-        so a single ``prev()`` from the end yields the global maximum. Used to
-        clamp the recovered ``next_seq`` up past any stale persisted hint so a
-        reopen can never re-mint an already-used oplog seq.
+        Each table is keyed on the bare ``seq`` (``key_format=q``), so a single
+        ``prev()`` from a table's end yields its maximum; the answer is the max of
+        those. Used to clamp the recovered ``next_seq`` up past any stale persisted
+        hint so a reopen can never re-mint an already-used oplog seq — the scan
+        must include the shards or a Rust-written store's tail would be missed.
         """
-        c = self._cursor(_OPLOG_TABLE)
-        if c.prev() == 0:
-            return int(c.get_key())
-        return 0
+        max_seq = 0
+        for table in _OPLOG_ALL_TABLES:
+            c = self._cursor(table)
+            if c.prev() == 0:
+                seq = int(c.get_key())
+                if seq > max_seq:
+                    max_seq = seq
+            c.reset()
+        return max_seq
 
     def _scan_max_nat_seq(self) -> int:
         """Largest insertion ``seq`` present in ``_NAT_TABLE`` (0 if empty).
@@ -1475,27 +1513,17 @@ class Storage:
         reflects rows committed by writer threads on other connections
         (same pattern as ``read_oplog``).
         """
-        rows: list[dict[str, Any]] = []
         with self._lock:
             if self._closed:
-                return rows
+                return []
             session = self._conn.open_session()
             try:
-                c = session.open_cursor(_OPLOG_TABLE, None)
-                try:
-                    rc = c.next()
-                    while rc == 0:
-                        blob = bytes(c.get_value())
-                        if blob:
-                            rows.append(bson.decode(blob))
-                        rc = c.next()
-                finally:
-                    with contextlib.suppress(Exception):
-                        c.close()
+                # Sharded: merge every shard + the legacy table in seq order.
+                merged = self._merge_oplog_on_session(session, 0, 2**63 - 1)
+                return [entry for _seq, entry in merged]
             finally:
                 with contextlib.suppress(Exception):
                     session.close()
-        return rows
 
     def _find_oplog_rs(
         self,
@@ -1832,6 +1860,59 @@ class Storage:
             self._oplog_cv.notify_all()
         return last_seq
 
+    @staticmethod
+    def _merge_oplog_on_session(
+        session: Any,
+        start_seq: int,
+        limit: int,
+        ns_filter: Callable[[str], bool] | None = None,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """K-way merge across the oplog shards + the legacy table on ``session``,
+        yielding ``(seq, entry)`` in ascending seq order from the first seq >=
+        ``start_seq``, up to ``limit`` non-empty entries.
+
+        Each table is seq-sorted; the merge repeatedly emits the smallest head
+        seq and advances that cursor. Handles gaps (prune removes a low prefix)
+        so a missing seq can't truncate a change-stream read. Mirrors the Rust
+        ``read_oplog_shards``. Opens + closes its own cursors on ``session``.
+        """
+        out: list[tuple[int, dict[str, Any]]] = []
+        cursors: list[Any] = []
+        heads: list[int | None] = []
+        try:
+            for table in _OPLOG_ALL_TABLES:
+                c = session.open_cursor(table, None)
+                cursors.append(c)
+                c.set_key(int(start_seq))
+                rc = c.search_near()
+                if rc == wt.WT_NOTFOUND:
+                    heads.append(None)
+                elif rc < 0:
+                    heads.append(int(c.get_key()) if c.next() == 0 else None)
+                else:
+                    heads.append(int(c.get_key()))
+            while len(out) < limit:
+                best_i = None
+                best_seq = None
+                for i, h in enumerate(heads):
+                    if h is not None and (best_seq is None or h < best_seq):
+                        best_seq = h
+                        best_i = i
+                if best_i is None:
+                    break
+                c = cursors[best_i]
+                blob = bytes(c.get_value())
+                if blob:
+                    entry = bson.decode(blob)
+                    if ns_filter is None or ns_filter(str(entry.get("ns", ""))):
+                        out.append((best_seq, entry))
+                heads[best_i] = int(c.get_key()) if c.next() == 0 else None
+        finally:
+            for c in cursors:
+                with contextlib.suppress(Exception):
+                    c.close()
+        return out
+
     def read_oplog(
         self,
         *,
@@ -1839,7 +1920,7 @@ class Storage:
         limit: int,
         ns_filter: Callable[[str], bool] | None = None,
     ) -> list[tuple[int, dict[str, Any]]]:
-        """Forward-scan the oplog from ``start_seq`` (inclusive).
+        """Forward-scan the oplog from ``start_seq`` (inclusive), merging shards.
 
         Uses a private short-lived session so the read view always reflects
         rows committed by other sessions. The cached per-thread session's
@@ -1847,38 +1928,15 @@ class Storage:
         getMore polls would never observe oplog rows produced by a writer
         running on a different connection thread.
         """
-        out: list[tuple[int, dict[str, Any]]] = []
         with self._lock:
             if self._closed:
-                return out
+                return []
             session = self._conn.open_session()
             try:
-                c = session.open_cursor(_OPLOG_TABLE, None)
-                try:
-                    c.set_key(int(start_seq))
-                    rc = c.search_near()
-                    if rc == wt.WT_NOTFOUND:
-                        return out
-                    if rc < 0 and c.next() != 0:
-                        return out
-                    while True:
-                        seq = int(c.get_key())
-                        blob = bytes(c.get_value())
-                        if blob:
-                            entry = bson.decode(blob)
-                            if ns_filter is None or ns_filter(str(entry.get("ns", ""))):
-                                out.append((seq, entry))
-                        if len(out) >= limit:
-                            break
-                        if c.next() != 0:
-                            break
-                finally:
-                    with contextlib.suppress(Exception):
-                        c.close()
+                return self._merge_oplog_on_session(session, start_seq, limit, ns_filter)
             finally:
                 with contextlib.suppress(Exception):
                     session.close()
-        return out
 
     def read_preimage(self, seq: int) -> dict[str, Any] | None:
         """Return the pre-image doc for ``seq`` if one was stored, else ``None``.
@@ -1994,15 +2052,20 @@ class Storage:
                 return 0
             session = self._conn.open_session()
             try:
-                c = session.open_cursor(_OPLOG_TABLE, None)
-                try:
-                    rc = c.next()
-                    if rc != 0:
-                        return 0
-                    return int(c.get_key())
-                finally:
-                    with contextlib.suppress(Exception):
-                        c.close()
+                # Sharded: the global floor is the smallest first-key across all
+                # shards + the legacy table. Each table's ``next()`` from the start
+                # lands on its minimum.
+                floor: int | None = None
+                for table in _OPLOG_ALL_TABLES:
+                    c = session.open_cursor(table, None)
+                    try:
+                        if c.next() == 0:
+                            seq = int(c.get_key())
+                            floor = seq if floor is None else min(floor, seq)
+                    finally:
+                        with contextlib.suppress(Exception):
+                            c.close()
+                return floor or 0
             finally:
                 with contextlib.suppress(Exception):
                     session.close()
@@ -2010,32 +2073,23 @@ class Storage:
     def find_seq_for_ts(self, ts: Timestamp) -> int:
         """Smallest seq whose entry ``ts >= target``. Tail+1 if none qualify.
 
-        Uses a private session for cross-thread visibility.
+        Uses a private session for cross-thread visibility. Sharded: ts is
+        monotone in the *global* seq order, so the shard merge yields entries in
+        ts order — the first one at/after ``target`` is the answer.
         """
         with self._lock:
             if self._closed:
                 return 0
             session = self._conn.open_session()
             try:
-                c = session.open_cursor(_OPLOG_TABLE, None)
-                try:
-                    rc = c.next()
-                    while rc == 0:
-                        seq = int(c.get_key())
-                        blob = bytes(c.get_value())
-                        if blob:
-                            entry = bson.decode(blob)
-                            entry_ts = entry.get("ts")
-                            if isinstance(entry_ts, Timestamp) and (
-                                entry_ts.time > ts.time
-                                or (entry_ts.time == ts.time and entry_ts.inc >= ts.inc)
-                            ):
-                                return seq
-                        rc = c.next()
-                    return self._next_seq
-                finally:
-                    with contextlib.suppress(Exception):
-                        c.close()
+                for seq, entry in self._merge_oplog_on_session(session, 0, 2**63 - 1):
+                    entry_ts = entry.get("ts")
+                    if isinstance(entry_ts, Timestamp) and (
+                        entry_ts.time > ts.time
+                        or (entry_ts.time == ts.time and entry_ts.inc >= ts.inc)
+                    ):
+                        return seq
+                return self._next_seq
             finally:
                 with contextlib.suppress(Exception):
                     session.close()
@@ -2057,20 +2111,21 @@ class Storage:
         when = now if now is not None else self._time()
         cutoff_secs = int(when - self.oplog_retention_seconds)
         # Two-phase: collect doomed seqs, then delete (avoid mutating during scan).
+        # Sharded: walk every entry in global seq order via the shard merge on a
+        # fresh read session (the delete below uses the cached write cursors).
         doomed: list[int] = []
         all_seqs: list[int] = []
-        c = self._cursor(_OPLOG_TABLE)
-        rc = c.next()
-        while rc == 0:
-            seq = int(c.get_key())
-            blob = bytes(c.get_value())
+        scan_session = self._conn.open_session()
+        try:
+            rows = self._merge_oplog_on_session(scan_session, 0, 2**63 - 1)
+        finally:
+            with contextlib.suppress(Exception):
+                scan_session.close()
+        for seq, entry in rows:
             all_seqs.append(seq)
-            if blob:
-                entry = bson.decode(blob)
-                ts = entry.get("ts")
-                if isinstance(ts, Timestamp) and ts.time < cutoff_secs:
-                    doomed.append(seq)
-            rc = c.next()
+            ts = entry.get("ts")
+            if isinstance(ts, Timestamp) and ts.time < cutoff_secs:
+                doomed.append(seq)
         # Trim to entry cap by extending doom set to oldest entries.
         kept_count = len(all_seqs) - len(doomed)
         if kept_count > self.oplog_max_entries:
@@ -2089,13 +2144,21 @@ class Storage:
         # them, so recovery can still reach a time before the new oplog floor.
         if self.oplog_archive_dir is not None:
             self._archive_doomed_oplog(sorted(doomed))
-        op_del = self._cursor(_OPLOG_TABLE)
+        # Sharded delete: a doomed seq lives in its shard ``seq % N`` (Rust store)
+        # or the legacy table (Python store). Remove from BOTH unconditionally —
+        # the ``_cursor`` cursors are overwrite=True, so ``remove()`` of an absent
+        # key is a safe no-op; that's simpler and more robust than a search-first
+        # fallback (overwrite mode makes ``remove()`` succeed on a missing key, so
+        # a "did it delete?" check can't distinguish the two tables). Pre-images
+        # stay in one table.
+        legacy_del = self._cursor(_OPLOG_TABLE)
         pre_del = self._cursor(_PREIMAGE_TABLE)
         for seq in doomed:
-            op_del.set_key(seq)
-            with contextlib.suppress(wt.WiredTigerError):
-                op_del.remove()
-            op_del.reset()
+            for cur in (self._cursor(_oplog_shard_of(seq)), legacy_del):
+                cur.set_key(seq)
+                with contextlib.suppress(wt.WiredTigerError):
+                    cur.remove()
+                cur.reset()
             pre_del.set_key(seq)
             with contextlib.suppress(wt.WiredTigerError):
                 pre_del.remove()
@@ -2108,12 +2171,21 @@ class Storage:
         from ``_prune_oplog_locked`` before the rows are deleted."""
         from . import pitr_archive
 
-        op_cur = self._cursor(_OPLOG_TABLE)
+        legacy_cur = self._cursor(_OPLOG_TABLE)
         pre_cur = self._cursor(_PREIMAGE_TABLE)
         rows: list[tuple[int, dict[str, Any], dict[str, Any] | None]] = []
         for seq in doomed_sorted:
+            # A doomed seq lives in shard ``seq % N`` (Rust store) or the legacy
+            # table (Python store); try the shard first, then the legacy table.
+            op_cur = self._cursor(_oplog_shard_of(seq))
             op_cur.set_key(seq)
-            if op_cur.search() != 0:
+            found = op_cur.search() == 0
+            if not found:
+                op_cur.reset()
+                op_cur = legacy_cur
+                op_cur.set_key(seq)
+                found = op_cur.search() == 0
+            if not found:
                 op_cur.reset()
                 continue
             entry = bson.decode(bytes(op_cur.get_value()))

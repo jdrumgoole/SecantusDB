@@ -404,6 +404,45 @@ and PITR replay. A k-way merge by seq (each shard is seq-sorted; a doc's shard i
 every event, in order, with correct resume tokens across shards). This is
 correctness-critical but now clearly justified — the win is proven.
 
+## Implementation status (2026-07-20): sharded oplog SHIPPED end-to-end
+
+The full sharded-oplog read path is implemented in **both** storage layers and
+green on the integrity suites:
+
+- **Rust** (`crates/secantus-storage/src/lib.rs`): per-entry write routing
+  (`seq % OPLOG_SHARDS`), a k-way `read_oplog_shards` merge (shards + legacy
+  table), and every reader converted — `read_oplog`, `scan_max_oplog_seq`,
+  `oplog_floor_seq`, `find_seq_for_ts`, `prune_oplog_inner` (merge scan + delete
+  from both shard & legacy), `load_oplog_meta` recovery, `archive_doomed_oplog`,
+  and `import_oplog_segment` (restore routes to shards).
+- **Python** (`src/secantus/storage.py`): the sharded oplog is an **on-disk
+  format change**, so the Python server must READ/RECOVER/PRUNE a Rust-written
+  store for cross-server PITR/backup (`test_rust_pitr_cross_server`). Python
+  writes stay single-table (its global lock means sharding buys it nothing, and
+  Rust's merge already reads the legacy table), but every Python oplog *reader*
+  now merges shards + legacy (`_merge_oplog_on_session` + `_scan_max_oplog_seq` /
+  `oplog_floor_seq` / `find_seq_for_ts` / `_prune_oplog_locked` / `_load_oplog_meta`
+  / `_archive_doomed_oplog` / `_scan_oplog_entries`).
+
+**Two bugs found + fixed during validation** (both would have shipped silent data
+loss — exactly what the "this is a database" rule guards against):
+1. *Cross-server format*: sharding the Rust oplog broke `oplog_floor_seq()` on the
+   Python reader (it read the empty legacy table → "no oplog to replay"). Fixed by
+   making every Python reader shard-aware.
+2. *Overwrite-mode delete*: WT cursors are `overwrite=true`, so `remove()` of an
+   absent key returns Ok — the "delete from shard, else fall back to legacy" logic
+   never fell back, leaking pruned rows on a Python-written store. Fixed (both
+   servers) by deleting from **both** shard and legacy unconditionally.
+
+Gate status: Rust storage `cargo fmt`/`clippy`/`test` green (27 test binaries);
+`test_mongo_server_concurrency` (Rust concurrency + change-stream integrity),
+`test_rust_pitr_cross_server`, `test_pitr`, `test_oplog`, `test_change_streams`
+all green. The oplog **visibility-hole** race (a lower seq committing after a
+higher one is already visible) is unchanged in kind by sharding — the merge has
+identical snapshot semantics to the old single-table scan — and did not manifest
+under the concurrency suite; re-run repeatedly since sharding raises write
+parallelism.
+
 ## Success criteria (mirrors the mongod numbers we're chasing)
 - Write scaling on **distinct** collections: ≥ 2.5× at 4 writers, approaching
   mongod's ~4.1× at 8 (bounded by whatever Phase 1 shows WT can actually do here).

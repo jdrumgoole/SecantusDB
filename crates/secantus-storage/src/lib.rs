@@ -125,7 +125,128 @@ const NAT_SEQ_TABLE: &str = "table:secantus_natural_seq";
 
 // Oplog / change-stream tables (Phase 4 sub-phase 3). `q`-keyed (int64 seq) for
 // the oplog + pre-images; a single `S` key ("state") for the recovery metadata.
+/// Legacy single-table oplog name. Retained only for the pre-shard on-disk
+/// upgrade read (a store written by an older build still has its entries here);
+/// all new writes go to the shard tables. See `OPLOG_SHARDS`.
 const OPLOG_TABLE: &str = "table:secantus_oplog";
+/// The oplog is sharded across `OPLOG_SHARDS` btrees so concurrent writers don't
+/// all rendezvous on one table's rightmost append page — the A/B-proven scaling
+/// bottleneck (a single append point serialised every writer; sharding recovered
+/// 8-writer scaling 0.60x -> 2.47x and single-writer 16k -> 28.9k docs/s, both
+/// approaching the oplog-off ceiling; `tasks/rust-mongodb-parity-redesign.md`).
+///
+/// Routing is **per entry** by `seq % OPLOG_SHARDS`, so a seq's shard is
+/// recoverable from the seq alone (O(1) point lookup) and the global seq order is
+/// a k-way merge of the shards (each shard is seq-sorted; `read_oplog_shards`).
+/// seqs are minted strictly monotonically under the oplog mutex, so shard k holds
+/// exactly the seqs congruent to k mod N — the merge never has to reason about
+/// which shard a batch landed in.
+const OPLOG_SHARDS: i64 = 16;
+
+/// Shard table name for shard index `shard` (0..OPLOG_SHARDS).
+fn oplog_shard_name(shard: i64) -> String {
+    format!("table:secantus_oplog_sh{shard}")
+}
+
+/// The shard table a given `seq` lives in. `rem_euclid` keeps it correct for any
+/// i64 (seqs are always >= 1 in practice, but never route to a negative index).
+fn oplog_shard_of(seq: i64) -> String {
+    oplog_shard_name(seq.rem_euclid(OPLOG_SHARDS))
+}
+
+/// Merge-read the sharded oplog in ascending seq order, starting at the first
+/// seq >= `start_seq`, up to `limit` non-empty entries. A k-way merge across the
+/// `OPLOG_SHARDS` shard cursors (each shard is seq-sorted): repeatedly emit the
+/// smallest head seq and advance that shard. Handles gaps in the seq space
+/// (prune removes a low prefix; a rolled-back mint would leave a hole) — it never
+/// assumes contiguity, so a missing seq can't truncate a change-stream read.
+/// Empty-blob rows (defensive) are skipped but still advance, exactly like the
+/// old single-table walk.
+fn read_oplog_shards(
+    session: &Session,
+    start_seq: i64,
+    limit: usize,
+) -> Result<Vec<(i64, Vec<u8>)>> {
+    // N shard tables + the legacy single table (holds a pre-shard store's entries
+    // after upgrade; empty for a store born sharded). seq ranges are disjoint —
+    // recovery clamps new seqs strictly above any legacy seq — so a plain min-seq
+    // merge needs no dedup.
+    let tables: Vec<String> = (0..OPLOG_SHARDS)
+        .map(oplog_shard_name)
+        .chain(std::iter::once(OPLOG_TABLE.to_string()))
+        .collect();
+    let mut cursors: Vec<Cursor> = Vec::with_capacity(tables.len());
+    // Current head seq of each shard cursor, or None once exhausted.
+    let mut heads: Vec<Option<i64>> = Vec::with_capacity(tables.len());
+    for tbl in &tables {
+        let cur = session.open_cursor(tbl, None)?;
+        cur.set_key_q(start_seq);
+        let positioned = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    // search_near landed just below start_seq; step to the first >=.
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        heads.push(if positioned {
+            Some(cur.get_key_q()?)
+        } else {
+            None
+        });
+        cursors.push(cur);
+    }
+    let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
+    while out.len() < limit {
+        // Pick the shard whose head is the smallest seq.
+        let mut best: Option<usize> = None;
+        let mut best_seq = i64::MAX;
+        for (i, h) in heads.iter().enumerate() {
+            if let Some(seq) = *h {
+                if seq < best_seq {
+                    best_seq = seq;
+                    best = Some(i);
+                }
+            }
+        }
+        let Some(i) = best else { break };
+        let blob = cursors[i].get_value_u()?;
+        if !blob.is_empty() {
+            out.push((best_seq, blob));
+        }
+        heads[i] = if cursors[i].next()? {
+            Some(cursors[i].get_key_q()?)
+        } else {
+            None
+        };
+    }
+    Ok(out)
+}
+
+/// Largest seq present across all oplog shards (0 if all empty). A single
+/// `prev()` from each shard's end lands on that shard's max; the answer is the
+/// max of those. Includes the legacy single table so recovery of a pre-shard
+/// store still finds its tail.
+fn scan_max_oplog_seq(session: &Session) -> i64 {
+    let mut max = 0i64;
+    for s in 0..OPLOG_SHARDS {
+        if let Ok(c) = session.open_cursor(&oplog_shard_name(s), None) {
+            if c.prev().unwrap_or(false) {
+                max = max.max(c.get_key_q().unwrap_or(0));
+            }
+        }
+    }
+    if let Ok(c) = session.open_cursor(OPLOG_TABLE, None) {
+        if c.prev().unwrap_or(false) {
+            max = max.max(c.get_key_q().unwrap_or(0));
+        }
+    }
+    max
+}
 const PREIMAGE_TABLE: &str = "table:secantus_preimages";
 const OPLOG_META_TABLE: &str = "table:secantus_oplog_meta";
 
@@ -1393,17 +1514,26 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
             }
         }
     }
-    // Fallback: reconstruct from the newest oplog row (the table is keyed on
-    // the bare seq, so a single prev() from the end lands on the maximum).
-    let oc = session.open_cursor(OPLOG_TABLE, None)?;
-    let mut last_seq = 0i64;
+    // Fallback: reconstruct from the newest oplog row. Sharded — the max seq can
+    // be in any shard (`scan_max_oplog_seq` takes the max across shards + the
+    // legacy table); read that seq's ts from its owning shard (or the legacy
+    // table, for a pre-shard store being upgraded).
+    let last_seq = scan_max_oplog_seq(session);
     let mut last_secs = 0i64;
     let mut last_ord = 0i64;
-    if oc.prev()? {
-        last_seq = oc.get_key_q()?;
-        if let Some(ts) = peek_entry_ts(&oc.get_value_u()?) {
-            last_secs = i64::from(ts.time);
-            last_ord = i64::from(ts.increment);
+    if last_seq > 0 {
+        for tbl in [oplog_shard_of(last_seq), OPLOG_TABLE.to_string()] {
+            let Ok(oc) = session.open_cursor(&tbl, None) else {
+                continue;
+            };
+            oc.set_key_q(last_seq);
+            if oc.search().is_ok() {
+                if let Some(ts) = peek_entry_ts(&oc.get_value_u()?) {
+                    last_secs = i64::from(ts.time);
+                    last_ord = i64::from(ts.increment);
+                }
+                break;
+            }
         }
     }
     Ok(OplogState {
@@ -1413,22 +1543,6 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         next_nat_seq: scan_max_nat_seq(session) + 1,
         emit_count: 0,
     })
-}
-
-/// Largest `seq` present in the oplog table (0 if empty). Cheap: the table is
-/// keyed on the bare seq (`key_format=q`), so a single `prev()` from the end
-/// yields the global maximum. Used to clamp the recovered `next_seq` past any
-/// stale persisted hint so a reopen can never re-mint an already-used oplog
-/// seq. Mirrors `storage._scan_max_oplog_seq`.
-fn scan_max_oplog_seq(session: &Session) -> i64 {
-    let Ok(c) = session.open_cursor(OPLOG_TABLE, None) else {
-        return 0;
-    };
-    if c.prev().unwrap_or(false) {
-        c.get_key_q().unwrap_or(0)
-    } else {
-        0
-    }
 }
 
 /// Peek the `ts` Timestamp out of a raw oplog-entry blob without materialising
@@ -1623,6 +1737,12 @@ impl Storage {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
                 boot.create(name, fmt)?;
+            }
+            // The oplog is sharded across OPLOG_SHARDS btrees to spread append
+            // contention (see OPLOG_SHARDS); the legacy single table above stays
+            // in BOOTSTRAP so a pre-shard store's entries remain readable.
+            for s in 0..OPLOG_SHARDS {
+                boot.create(&oplog_shard_name(s), QU_COMPRESSED_CFG)?;
             }
             // Recover the oplog seq / timestamp counters from the meta row, or
             // reconstruct them by scanning the oplog table.
@@ -1858,7 +1978,13 @@ impl Storage {
         debug_assert_eq!(pre_images.len(), entries.len());
         let n = entries.len() as i64;
         let (start, ts) = self.mint_seq_and_ts(entries.len());
-        let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        // Route each entry to shard `seq % OPLOG_SHARDS` so concurrent writers
+        // spread across N append points instead of contending on one table's
+        // rightmost page (the scaling fix). Per-entry (not per-batch) routing
+        // keeps a seq's shard recoverable from the seq alone, so the read path is
+        // a clean k-way merge / O(1) point lookup. Shard cursors are opened
+        // lazily and cached for the batch (WT also caches them per session).
+        let mut shard_curs: Vec<Option<Cursor>> = (0..OPLOG_SHARDS).map(|_| None).collect();
         let mut pre_cur: Option<Cursor> = None;
         let wall = Bson::DateTime(bson::DateTime::from_millis(now_millis()));
         let mut last = 0i64;
@@ -1867,6 +1993,11 @@ impl Storage {
             entry.insert("ts", Bson::Timestamp(ts[i]));
             entry.insert("wall", wall.clone());
             let blob = encode_doc(&entry)?;
+            let sidx = seq.rem_euclid(OPLOG_SHARDS) as usize;
+            if shard_curs[sidx].is_none() {
+                shard_curs[sidx] = Some(session.open_cursor(&oplog_shard_name(sidx as i64), None)?);
+            }
+            let cur = shard_curs[sidx].as_ref().unwrap();
             cur.reset()?;
             cur.set_key_q(seq);
             cur.set_value_u(&blob);
@@ -2007,32 +2138,7 @@ impl Storage {
         // change-stream getMore path, so serialising it against every write
         // would needlessly throttle throughput.
         let session = self.conn.open_session()?;
-        let cur = session.open_cursor(OPLOG_TABLE, None)?;
-        cur.set_key_q(start_seq);
-        let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
-        let mut more = match cur.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    cur.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        while more {
-            let seq = cur.get_key_q()?;
-            let blob = cur.get_value_u()?;
-            if !blob.is_empty() {
-                out.push((seq, blob));
-            }
-            if out.len() >= limit {
-                break;
-            }
-            more = cur.next()?;
-        }
-        Ok(out)
+        read_oplog_shards(&session, start_seq, limit)
     }
 
     /// Whether `(db, coll)` is the synthetic `local.oplog.rs` view.
@@ -2091,13 +2197,24 @@ impl Storage {
     /// resume token must stay at or above. Mirrors `storage.oplog_floor_seq`.
     pub fn oplog_floor_seq(&self) -> Result<i64> {
         // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
+        // Sharded: the global floor is the smallest first-key across all shards
+        // (+ the legacy table). Each shard's `next()` from the start lands on its
+        // minimum.
         let session = self.conn.open_session()?;
-        let cur = session.open_cursor(OPLOG_TABLE, None)?;
-        match cur.next() {
-            Ok(true) => Ok(cur.get_key_q()?),
-            Ok(false) => Ok(0),
-            Err(e) => Err(e.into()),
+        let mut floor: Option<i64> = None;
+        for s in 0..OPLOG_SHARDS {
+            let cur = session.open_cursor(&oplog_shard_name(s), None)?;
+            if cur.next()? {
+                let seq = cur.get_key_q()?;
+                floor = Some(floor.map_or(seq, |f: i64| f.min(seq)));
+            }
         }
+        let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        if cur.next()? {
+            let seq = cur.get_key_q()?;
+            floor = Some(floor.map_or(seq, |f: i64| f.min(seq)));
+        }
+        Ok(floor.unwrap_or(0))
     }
 
     /// The highest seq emitted (`next_seq - 1`), 0 if none. Mirrors
@@ -2187,16 +2304,31 @@ impl Storage {
         archive_dir: &str,
         doomed_sorted: &[i64],
     ) -> Result<()> {
-        let op_cur = session.open_cursor(OPLOG_TABLE, None)?;
+        // Sharded: a doomed seq lives in shard `seq % N` (or the legacy table for
+        // a pre-shard store). Lazy per-shard cursor cache + a legacy fallback.
+        let mut shard_curs: Vec<Option<Cursor>> = (0..OPLOG_SHARDS).map(|_| None).collect();
+        let legacy_cur = session.open_cursor(OPLOG_TABLE, None)?;
         let pre_cur = session.open_cursor(PREIMAGE_TABLE, None)?;
         let mut rows: Vec<(i64, Document, Option<Document>)> = Vec::new();
         for &seq in doomed_sorted {
+            let sidx = seq.rem_euclid(OPLOG_SHARDS) as usize;
+            if shard_curs[sidx].is_none() {
+                shard_curs[sidx] = Some(session.open_cursor(&oplog_shard_name(sidx as i64), None)?);
+            }
+            let op_cur = shard_curs[sidx].as_ref().unwrap();
             op_cur.reset()?;
             op_cur.set_key_q(seq);
-            if op_cur.search().is_err() {
-                continue;
-            }
-            let blob = op_cur.get_value_u()?;
+            let blob = if op_cur.search().is_ok() {
+                op_cur.get_value_u()?
+            } else {
+                // Fall back to the legacy single table (pre-shard store).
+                legacy_cur.reset()?;
+                legacy_cur.set_key_q(seq);
+                if legacy_cur.search().is_err() {
+                    continue;
+                }
+                legacy_cur.get_value_u()?
+            };
             if blob.is_empty() {
                 continue;
             }
@@ -2385,12 +2517,20 @@ impl Storage {
         }
         let _g = self.lock.lock().unwrap();
         let session = self.conn.open_session()?;
-        let cur = session.open_cursor(OPLOG_TABLE, None)?;
+        // Restored rows keep their original seq identity; route each to its shard
+        // `seq % N` so a later merge-read sees them in global order alongside
+        // freshly-emitted rows. Lazy per-shard cursor cache.
+        let mut shard_curs: Vec<Option<Cursor>> = (0..OPLOG_SHARDS).map(|_| None).collect();
         let mut pre_cur: Option<Cursor> = None;
         let mut max_seq = 0i64;
         let mut best = (0i64, 0i64);
         for (seq, entry) in rows {
             let blob = encode_doc(entry)?;
+            let sidx = seq.rem_euclid(OPLOG_SHARDS) as usize;
+            if shard_curs[sidx].is_none() {
+                shard_curs[sidx] = Some(session.open_cursor(&oplog_shard_name(sidx as i64), None)?);
+            }
+            let cur = shard_curs[sidx].as_ref().unwrap();
             cur.reset()?;
             cur.set_key_q(*seq);
             cur.set_value_u(&blob);
@@ -2456,8 +2596,11 @@ impl Storage {
         // writers; prune is best-effort, so a slightly stale view is fine — and
         // writers only ever append *higher* seqs, never touch the old rows we
         // doom here.
-        let oc = session.open_cursor(OPLOG_TABLE, None)?;
-        let mut all_seqs: Vec<i64> = Vec::new();
+        // Sharded: walk every entry in global seq order via the shard merge (the
+        // ts-monotone-in-seq prefix property that makes the doomed set a prefix
+        // holds on the *merged* order, not on any one shard).
+        let rows = read_oplog_shards(&session, 0, usize::MAX)?;
+        let mut all_seqs: Vec<i64> = Vec::with_capacity(rows.len());
         let mut doomed: Vec<i64> = Vec::new();
         // Entry `ts` values are monotone in seq (mint order == append order),
         // so the out-of-retention rows form a prefix of the walk. Peek each
@@ -2469,17 +2612,14 @@ impl Storage {
         // with a missing/unreadable ts conservatively ends the doomed prefix —
         // keep, never prune, what we can't date.
         let mut in_window = false;
-        let mut more = oc.next()?;
-        while more {
-            let seq = oc.get_key_q()?;
-            all_seqs.push(seq);
+        for (seq, blob) in &rows {
+            all_seqs.push(*seq);
             if !in_window {
-                match peek_entry_ts(&oc.get_value_u()?) {
-                    Some(ts) if i64::from(ts.time) < cutoff => doomed.push(seq),
+                match peek_entry_ts(blob) {
+                    Some(ts) if i64::from(ts.time) < cutoff => doomed.push(*seq),
                     _ => in_window = true,
                 }
             }
-            more = oc.next()?;
         }
 
         // Phase 2: extend the doom set to the oldest entries over the cap.
@@ -2511,13 +2651,34 @@ impl Storage {
 
         // Phase 2: the deletes. Sweep exclusivity is already held
         // (`oplog_prune_lock`, taken at the top); no other lock is needed —
-        // concurrent writers only ever append higher seqs.
-        let op_del = session.open_cursor(OPLOG_TABLE, None)?;
+        // concurrent writers only ever append higher seqs. Sharded: each doomed
+        // seq is removed from its shard `seq % N`; a not-found there falls back to
+        // the legacy table (pre-shard store). Pre-images stay in one table.
+        let mut shard_del: Vec<Option<Cursor>> = (0..OPLOG_SHARDS).map(|_| None).collect();
+        let legacy_del = session.open_cursor(OPLOG_TABLE, None)?;
         let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
         for &seq in &doomed {
+            // A doomed seq lives in its shard `seq % N` (Rust store) or the legacy
+            // table (Python store). Remove from BOTH — WT cursors are overwrite
+            // mode, so `remove()` of an absent key returns Ok (a no-op), which is
+            // simpler and more robust than a not-found fallback (overwrite makes
+            // the shard remove succeed even when the row is really in the legacy
+            // table, so a "did it delete?" check can't tell them apart).
+            let sidx = seq.rem_euclid(OPLOG_SHARDS) as usize;
+            if shard_del[sidx].is_none() {
+                shard_del[sidx] = Some(session.open_cursor(&oplog_shard_name(sidx as i64), None)?);
+            }
+            let op_del = shard_del[sidx].as_ref().unwrap();
             op_del.reset()?;
             op_del.set_key_q(seq);
             match op_del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+            legacy_del.reset()?;
+            legacy_del.set_key_q(seq);
+            match legacy_del.remove() {
                 Ok(()) => {}
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
@@ -2552,17 +2713,16 @@ impl Storage {
     /// used to resolve `startAtOperationTime`. Mirrors `storage.find_seq_for_ts`.
     pub fn find_seq_for_ts(&self, ts: bson::Timestamp) -> Result<i64> {
         // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
+        // Sharded: ts is monotone in the *global* seq order, so the shard merge
+        // yields entries in ts order — the first one at/after `target` is the
+        // answer.
         let session = self.conn.open_session()?;
-        let c = session.open_cursor(OPLOG_TABLE, None)?;
-        let mut more = c.next()?;
-        while more {
-            let seq = c.get_key_q()?;
-            if let Some(e) = peek_entry_ts(&c.get_value_u()?) {
+        for (seq, blob) in read_oplog_shards(&session, 0, usize::MAX)? {
+            if let Some(e) = peek_entry_ts(&blob) {
                 if e.time > ts.time || (e.time == ts.time && e.increment >= ts.increment) {
                     return Ok(seq);
                 }
             }
-            more = c.next()?;
         }
         Ok(self.oplog.lock().unwrap().next_seq)
     }
