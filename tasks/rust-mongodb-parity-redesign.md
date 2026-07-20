@@ -281,6 +281,31 @@ change, funded only if 1/3 prove the shared btree is the ceiling. 6 finishes.
 Re-order on measured numbers after each phase — the wt_poc 1.3× result means we must
 verify each lever actually moves the needle before funding the next.
 
+## Post-compression re-profile (2026-07-20) — the bottleneck went distributed
+
+Re-profiled single-writer insert on the merged compression build (`8226bfcb`,
+debug-symbol, `sample`). The pre-compression profile was dominated by WT
+disk-machinery (reconcile/eviction/block-write); **compression removed that**, and
+the profile is now **distributed with no single hotspot**: BSON write-path
+round-trips (~577 samples) ≈ WT btree/eviction ops (~570 combined), plus zlib
+`deflate` (~77, the compression-CPU trade). Implications for closing the residual
+~7×:
+- **BSON write path:** the earlier "skip storage-encode when `_id` present" A/B
+  measured **~0** (WT dominated then). Post-compression a win needs the *full* raw
+  path — peek `_id` from raw input, store input bytes unchanged, AND splice raw
+  bytes into the oplog `o` (restructuring `emit_oplog`, which touches the
+  change-stream path — real risk). Expected win modest (BSON is ~4% of samples).
+- **WT-op count / scaling:** the natural-order index (1 extra WT write/doc vs
+  mongod) and the shared-btree scaling limit are **structural** (on-disk format /
+  RecordId model, Phase 5).
+- **Conclusion:** a distributed profile means each remaining lever is a *small*
+  win; the large gap is mongod's structural advantages (native C++ efficiency,
+  fewer WT ops/doc, SBE). Closing it is the Phase-5 rewrite (per-collection tables
+  + RecordId, killing the natural-order index) — genuinely multi-week, hard to
+  reverse, and requiring new concurrent-capped + reopen/migration tests. That is
+  the honest scope of "the last 7×"; the two shipped levers (config + compression)
+  were the disk-volume fruit.
+
 ## Success criteria (mirrors the mongod numbers we're chasing)
 - Write scaling on **distinct** collections: ≥ 2.5× at 4 writers, approaching
   mongod's ~4.1× at 8 (bounded by whatever Phase 1 shows WT can actually do here).
