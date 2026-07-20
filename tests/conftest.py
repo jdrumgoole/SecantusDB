@@ -98,6 +98,60 @@ def pytest_configure(config: pytest.Config) -> None:
         )
 
 
+# Held for the whole process: faulthandler writes to this fd from a signal
+# handler, so it must never be closed / garbage-collected while the process
+# lives. A module global is exactly that lifetime.
+_crash_dump_file = None
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    # Arm the crash faulthandler HERE, not in pytest_configure: pytest's own
+    # faulthandler plugin calls ``faulthandler.enable(file=<stderr>)`` in its
+    # pytest_configure (_pytest/faulthandler.py), and hook ordering let it clobber
+    # ours — the worker then dumped to (lost) stderr, not our file. sessionstart
+    # runs strictly after every pytest_configure, so our file wins and stays the
+    # fatal-signal target for the whole run.
+    _arm_crash_faulthandler(session.config)
+
+
+def _arm_crash_faulthandler(config: pytest.Config) -> None:
+    """Point faulthandler's fatal-signal handler at a per-worker FILE.
+
+    pytest already calls ``faulthandler.enable()`` — but it writes to the
+    process's stderr, and under ``pytest-xdist`` a worker that hard-crashes
+    (SIGSEGV / SIGABRT / SIGBUS, e.g. from a native WiredTiger or driver fault)
+    dies with its stderr unflushed and unforwarded, so the traceback never
+    reaches the CI log. xdist reports only "node down: Not properly terminated"
+    and the culprit stays anonymous — the ws-changes change-stream crash has
+    died that way ≥4× (see ``tasks/backlog.md``). Re-pointing the handler at a
+    file that CI uploads as an artifact makes the next crash self-diagnose: the
+    faulting thread's C/Python stack lands on disk before the process dies.
+
+    Opt-in via ``SECANTUS_FAULTHANDLER_DIR`` (CI sets it) so local runs keep
+    pytest's default stderr behaviour and drop no stray files. Runs in every
+    process ``pytest_configure`` touches — the xdist controller (``workerid``
+    absent → ``controller``) and each worker (``gw0`` …) get their own file, so
+    a crash names the exact worker.
+    """
+    global _crash_dump_file
+    out_dir = os.environ.get("SECANTUS_FAULTHANDLER_DIR")
+    if not out_dir:
+        return
+    worker = getattr(config, "workerinput", {}).get("workerid", "controller")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        # Line-buffered so a partial write still reaches disk if the crash
+        # interrupts mid-dump. faulthandler itself writes atomically per frame.
+        _crash_dump_file = open(  # noqa: SIM115 — intentionally kept open process-lifetime
+            os.path.join(out_dir, f"faulthandler-{worker}.log"), "w", buffering=1
+        )
+        faulthandler.enable(file=_crash_dump_file, all_threads=True)
+    except OSError as exc:
+        # A diagnostic must never break the run it is diagnosing. If the dir
+        # isn't writable, fall back to pytest's stderr faulthandler.
+        sys.stderr.write(f"could not arm crash faulthandler in {out_dir!r}: {exc}\n")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _hang_watchdog():
     """Dump every thread's stack and hard-exit if a worker is still alive 25 min

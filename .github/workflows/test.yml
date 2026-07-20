@@ -76,6 +76,12 @@ jobs:
     # same mechanism that made every matrix cell silently test 3.12 before.
     env:
       UV_PYTHON: ${{ matrix.python-version }}
+      # Where the crash faulthandler (tests/conftest.py) writes a per-worker
+      # stack on a fatal signal. Uploaded below on failure so a hard worker
+      # crash ("node down: Not properly terminated") finally names its thread
+      # instead of dying with its stderr — the ws-changes crash has been
+      # anonymous ≥4× for want of this (tasks/backlog.md).
+      SECANTUS_FAULTHANDLER_DIR: ${{ github.workspace }}/faulthandler-dumps
     # 30 min suffices for Linux, but a macOS cell builds vendored WiredTiger
     # from source on a contended pool (10-40+ min per 9e16e49) BEFORE it runs a
     # test, so the cron cells need a much larger cap.
@@ -481,6 +487,23 @@ jobs:
             --randomly-seed=${{ github.run_id }} \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
 
+      - name: Prune empty faulthandler dumps
+        # A clean worker leaves a 0-byte file (nothing crashed). Drop those so
+        # the artifact below materialises ONLY when a worker actually crashed —
+        # a non-crash assertion failure produces no artifact at all.
+        if: failure()
+        shell: bash
+        run: find "${{ github.workspace }}/faulthandler-dumps" -type f -empty -delete 2>/dev/null || true
+
+      - name: Upload faulthandler crash dumps
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: faulthandler-${{ matrix.os }}-py${{ matrix.python-version }}-g${{ matrix.group }}
+          path: ${{ github.workspace }}/faulthandler-dumps/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
 
   # The Windows lane, split from the ``test`` job and sharded two ways so the
   # slowest platform stops being the workflow's critical path (~20 min in one
@@ -739,6 +762,10 @@ jobs:
     # same mechanism that made every matrix cell silently test 3.12 before.
     env:
       UV_PYTHON: ${{ matrix.python-version }}
+      # Crash faulthandler dumps (see the ``test`` job's env + the conftest
+      # helper). The durable lane re-runs the whole suite under real checkpoint
+      # durability, so it exercises the same ws-changes / WT crash surface.
+      SECANTUS_FAULTHANDLER_DIR: ${{ github.workspace }}/faulthandler-dumps
     # See the ``test`` job: the cron's macOS cells pay a 10-40 min source build
     # of vendored WiredTiger before the first test runs.
     timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 90 || 30 }}
@@ -1056,6 +1083,20 @@ jobs:
             --durations-path=ci/durations/linux.json \
             --randomly-seed=${{ github.run_id }} \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
+
+      - name: Prune empty faulthandler dumps
+        if: failure()
+        shell: bash
+        run: find "${{ github.workspace }}/faulthandler-dumps" -type f -empty -delete 2>/dev/null || true
+
+      - name: Upload faulthandler crash dumps
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: faulthandler-durable-${{ matrix.os }}-py${{ matrix.python-version }}-g${{ matrix.group }}
+          path: ${{ github.workspace }}/faulthandler-dumps/*.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   # The matrix above runs the pure-Python server. This job builds the Rust core
   # (``_secantus_core``) and pins each Rust engine byte-for-byte against its

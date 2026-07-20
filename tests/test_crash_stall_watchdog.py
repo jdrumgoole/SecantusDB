@@ -235,3 +235,89 @@ def test_threshold_is_derived_from_the_per_test_timeout() -> None:
     # CI runs --timeout=120 -> the 300s floor; a default local run has ini
     # timeout=600 -> 1500s, which a fixed 300s limit would have violated.
     assert 600 * conftest._STALL_TIMEOUT_MULTIPLIER > 600
+
+
+# --- crash-capture faulthandler (SECANTUS_FAULTHANDLER_DIR) -------------------
+
+
+def _run_nested_with_fault_dir(
+    tmp_path: Path,
+    body: str,
+    *,
+    fault_dir: Path,
+    xdist: bool,
+    max_worker_restart: str = "0",
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    """Nested pytest session with ``SECANTUS_FAULTHANDLER_DIR`` armed."""
+    (tmp_path / "conftest.py").write_text(_CONFTEST_UNDER_TEST.read_text())
+    (tmp_path / "test_nested.py").write_text(textwrap.dedent(body))
+    env = dict(os.environ)
+    env["SECANTUS_FAULTHANDLER_DIR"] = str(fault_dir)
+    cmd = [sys.executable, "-m", "pytest", str(tmp_path)]
+    cmd += ["-n", "2"] if xdist else ["-p", "no:xdist"]
+    cmd += ["-p", "no:randomly", "-p", "no:cacheprovider", "-o", "addopts=", "-q"]
+    if xdist:
+        cmd += ["--max-worker-restart", max_worker_restart]
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, cwd=tmp_path, env=env
+    )
+
+
+@pytest.mark.timeout(180)
+def test_faulthandler_dir_arms_a_file_per_worker(tmp_path: Path) -> None:
+    """With the dir set, every process arms its own ``faulthandler-<id>.log``.
+
+    A clean run leaves the files empty (nothing crashed) — their existence is
+    the proof that ``_arm_crash_faulthandler`` ran in the controller AND in each
+    xdist worker, so a later crash in any of them has somewhere to dump.
+    """
+    fault_dir = tmp_path / "fh"
+    result = _run_nested_with_fault_dir(
+        tmp_path,
+        """
+        def test_ok():
+            assert True
+        """,
+        fault_dir=fault_dir,
+        xdist=True,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    names = {p.name for p in fault_dir.glob("faulthandler-*.log")}
+    assert "faulthandler-controller.log" in names, names
+    assert any(n.startswith("faulthandler-gw") for n in names), (
+        f"expected a per-worker file, got {names}"
+    )
+
+
+@pytest.mark.timeout(180)
+def test_faulthandler_dir_captures_a_worker_crash(tmp_path: Path) -> None:
+    """A hard crash (SIGSEGV) in an xdist worker leaves its stack in the file.
+
+    This is the whole point: pytest's stderr faulthandler is lost when xdist
+    reports "node down", but the file survives the dead worker. ``_sigsegv`` is
+    faulthandler's own test hook — a real fatal signal, so it exercises the
+    signal-handler path, not ``dump_traceback``.
+    """
+    fault_dir = tmp_path / "fh"
+    result = _run_nested_with_fault_dir(
+        tmp_path,
+        """
+        import faulthandler
+
+
+        def test_boom():
+            faulthandler._sigsegv()
+        """,
+        fault_dir=fault_dir,
+        xdist=True,
+    )
+    # The worker crashed; the session fails. We assert on the FILE, not the code.
+    assert result.returncode != 0
+    dumps = [p.read_text() for p in fault_dir.glob("faulthandler-gw*.log") if p.read_text().strip()]
+    assert dumps, (
+        "no worker faulthandler file captured the crash; "
+        f"dir={list(fault_dir.glob('*'))}\nstdout:\n{result.stdout}"
+    )
+    joined = "\n".join(dumps)
+    assert "Fatal Python error" in joined or "Segmentation fault" in joined, joined[:400]
