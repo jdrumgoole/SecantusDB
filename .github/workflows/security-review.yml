@@ -76,3 +76,31 @@ jobs:
           # Allow the tools the procedure needs: shell (git/gh/uv), file
           # read/write for the report, and web access for CVE lookups.
           claude_args: '--allowed-tools "Bash,Read,Grep,Glob,Write,Edit,WebSearch,WebFetch"'
+
+      # The action exits 0 whenever its result envelope says
+      # subtype == "success", even when the same envelope carries
+      # `is_error: true` — so a rejected credential, an exhausted quota, or a
+      # review that died on turn 1 all report a green check and file nothing.
+      # That is how the nightly run stayed broken from 2026-07-05 to
+      # 2026-07-20 without anyone noticing: 16 red runs nobody was paged
+      # about, then a green one that produced no report at all ($0 cost,
+      # 1 turn). Assert on the artifact instead of the exit code — the review
+      # only counts if today's report actually landed on main.
+      - name: Assert the review produced today's report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          today="$(date -u +%F)"
+          path="docs/security-reports/${today}.md"
+          # The review lands its report by squash-merging a docs-only PR into
+          # main, so check main rather than this runner's pre-review checkout.
+          if gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=main" --jq .path >/dev/null 2>&1; then
+            echo "OK: ${path} is present on main"
+          else
+            echo "::error::Security review did not produce ${path} on main. A green" \
+                 "action step is not proof the review ran — check total_cost_usd and" \
+                 "is_error in the run log; \$0 with 1 turn means the agent was rejected" \
+                 "before reading anything (usually a stale CLAUDE_CODE_OAUTH_TOKEN)."
+            exit 1
+          fi
