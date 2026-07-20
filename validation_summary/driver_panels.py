@@ -47,6 +47,7 @@ from validation_summary.generate import (
     _collect_php_ext,
     _collect_php_lib,
     _collect_pymongo,
+    _collect_pymongo_async,
     _collect_ruby,
     _collect_rust,
 )
@@ -69,6 +70,22 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "pymongo's own tests, unmodified, against an embedded SecantusDB."
         ),
         "report_url": ("https://secantusdb.com/docs/validation-report.html"),
+    },
+    "pymongo (async)": {
+        "title": "pymongo (async)",
+        "lang": "Python / asyncio",
+        "note": (
+            "pymongo's native <code>AsyncMongoClient</code> suite &mdash; the "
+            "async/await wire path that replaced Motor. Same unmodified "
+            "upstream tests as the sync gauge, run under "
+            "<code>pytest-asyncio</code> against the same embedded "
+            "SecantusDB, so the non-blocking client is held to the same bar "
+            "rather than assumed to follow from the sync one. Remaining "
+            "failures are the same out-of-scope surfaces (text / hashed "
+            "indexes, server-side <code>$where</code>) plus a few "
+            "timeout-introspection tests."
+        ),
+        "report_url": ("https://secantusdb.com/docs/validation-report-pymongo-async.html"),
     },
     "mongo-java-driver": {
         "title": "mongo-java-driver",
@@ -224,6 +241,7 @@ SMOKE_PANELS: list[dict[str, str | None]] = []
 
 _COLLECTORS = {
     "pymongo": _collect_pymongo,
+    "pymongo (async)": _collect_pymongo_async,
     "mongo-java-driver": _collect_java,
     "mongo-node-driver": _collect_node,
     "mongo-go-driver": _collect_go,

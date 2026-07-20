@@ -143,6 +143,15 @@ def _write_fake_validation_dir(d: Path) -> None:
         ),
         encoding="utf-8",
     )
+    (d / "pymongo-async-raw.json").write_text(
+        json.dumps(
+            {
+                "summary": {"passed": 80, "failed": 0, "skipped": 4},
+                "tests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     (d / "go-raw.ndjson").write_text(
         '{"Action":"pass","Test":"TestA"}\n{"Action":"pass","Test":"TestB"}\n',
         encoding="utf-8",
