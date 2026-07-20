@@ -73,6 +73,14 @@ jobs:
             report PR (leaving no branch or open PR behind), and file a `security`-labelled
             GitHub issue for each CRITICAL or WARNING finding. Do NOT fix any findings in
             this run — review, document, and file issues only.
+
+            This is a HEADLESS run: nothing will resume you after you stop. Do not
+            background any work. The Agent tool defaults to run_in_background: true, so
+            if you delegate, you MUST pass run_in_background: false and wait for each
+            result inline. Ending your turn with work still pending kills that work and
+            the review silently produces nothing — which is exactly how the 2026-07-20
+            run spent $4.70, launched 8 background agents, and wrote no report. Finish
+            the report, merge the PR, and file the issues before you stop.
           # Allow the tools the procedure needs: shell (git/gh/uv), file
           # read/write for the report, and web access for CVE lookups.
           claude_args: '--allowed-tools "Bash,Read,Grep,Glob,Write,Edit,WebSearch,WebFetch"'
