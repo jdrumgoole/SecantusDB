@@ -348,6 +348,20 @@ scaling — a genuine "approaching mongod" trajectory.
   rows): **WORSE** (single-writer 15.4→12.8k, 8w 0.64→0.36×). The oplog's cost is
   disk-write *volume*, not compression CPU — **compressing it was correct** (keep
   as merged).
+- *WT oplog-table tuning* (`leaf_page_max=1MB`, `memory_page_max=8MB`,
+  `access_pattern_hint=sequential` — hypothesis: fewer rightmost-page splits cut the
+  append contention): **WORSE** (single-writer 16→11.7k, 8w 0.60→0.54×). Bigger
+  pages add per-op cost without touching the mechanism. Reverted.
+
+**All tractable oplog levers (mutex, compression toggle, WT page tuning) are
+measurement-disproven** — the scaling collapse is NOT a config/tuning problem. The
+only remaining fix is the deep **optime-reserve + out-of-order-commit + holes**
+rearchitecture (mongod's oplog model), which decouples writers from the shared
+oplog's commit/append ordering. That is genuinely multi-day, correctness-critical
+(touches the oplog write path AND the tailable-cursor read path — readers must
+track holes), and uncertain to fully recover the oplog-off ceiling — the honest
+scope of the last ~7×. The two shipped levers (config + compression) plus this
+precise, exhaustively-narrowed diagnosis are the session's deliverables.
 
 **Therefore the residual oplog gap is structural, precisely located:**
 - *Single-writer:* the oplog is a fundamental *second* compressed ~8KB write per
