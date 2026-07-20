@@ -394,3 +394,34 @@ def test_abrupt_reset_close_is_quiet(tmp_path, caplog) -> None:
 
     errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert not errors, f"unexpected ERROR-level logs: {[r.message for r in errors]}"
+
+
+def test_recursion_error_in_parse_becomes_bad_value(monkeypatch) -> None:
+    """A ``RecursionError`` raised while parsing an OP_MSG body (a
+    pathologically deeply-nested BSON document exhausting the recursion limit)
+    is translated to ``MalformedBodyError`` — the same BadValue path as
+    ``bson.InvalidBSON`` — so the connection survives rather than the
+    ``RecursionError`` escaping the parse. (security review 2026-07-20, I1.)
+
+    At the default recursion limit a deeply-nested document is already rejected
+    as ``InvalidBSON`` by pymongo's decoder; this pins the defensive branch that
+    covers a ``RecursionError`` escaping regardless.
+    """
+    import bson
+
+    from secantus import wire
+
+    class _FakeSock:
+        def __init__(self, data: bytes) -> None:
+            self._buf = bytearray(data)
+
+        def recv(self, n: int) -> bytes:
+            chunk = bytes(self._buf[:n])
+            del self._buf[:n]
+            return chunk
+
+    monkeypatch.setattr(wire, "_parse_op_msg", lambda body: (_ for _ in ()).throw(RecursionError()))
+    frame = _build_op_msg_with_body(request_id=7, body_bytes=bson.encode({"ping": 1}))
+    with pytest.raises(wire.MalformedBodyError) as ei:
+        wire.read_message(_FakeSock(frame))
+    assert "nesting too deep" in str(ei.value)

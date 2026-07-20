@@ -88,28 +88,39 @@ def read_startup_packet(sock: socket.socket) -> StartupPacket:
     if length < 8 or length > 10_000_000:
         raise PGProtocolError(f"implausible startup length {length}")
     body = recv_exactly(sock, length - 4)
-    (code,) = _INT32.unpack_from(body, 0)
-    if code == SSL_REQUEST_CODE:
-        return SSLRequest()
-    if code == GSSENC_REQUEST_CODE:
-        return GSSENCRequest()
-    if code == CANCEL_REQUEST_CODE:
-        pid, secret = struct.unpack_from("!ii", body, 4)
-        return CancelRequest(pid=pid, secret=secret)
-    if code != PROTOCOL_VERSION_3:
-        raise PGProtocolError(f"unsupported protocol/startup code {code}")
-    # Remainder is a run of NUL-terminated key/value strings, ending with an
-    # empty key (a lone NUL).
-    params: dict[str, str] = {}
-    parts = body[4:].split(b"\x00")
-    i = 0
-    while i + 1 < len(parts):
-        key = parts[i].decode("utf-8")
-        if key == "":
-            break
-        params[key] = parts[i + 1].decode("utf-8")
-        i += 2
-    return StartupMessage(params=params)
+    # Every read below is on attacker-controlled bytes. A malformed startup
+    # packet must raise ``PGProtocolError`` (which the connection loop turns
+    # into a clean close, not a leaked traceback), never a raw ``struct.error``
+    # / ``UnicodeDecodeError``. Mirrors ``wire.py``'s BSON-framing discipline.
+    # (security review 2026-07-20, I16.)
+    try:
+        (code,) = _INT32.unpack_from(body, 0)
+        if code == SSL_REQUEST_CODE:
+            return SSLRequest()
+        if code == GSSENC_REQUEST_CODE:
+            return GSSENCRequest()
+        if code == CANCEL_REQUEST_CODE:
+            # A truncated CANCEL body (fewer than 12 bytes) makes
+            # ``unpack_from`` read past the buffer → ``struct.error``.
+            pid, secret = struct.unpack_from("!ii", body, 4)
+            return CancelRequest(pid=pid, secret=secret)
+        if code != PROTOCOL_VERSION_3:
+            raise PGProtocolError(f"unsupported protocol/startup code {code}")
+        # Remainder is a run of NUL-terminated key/value strings, ending with
+        # an empty key (a lone NUL). A key or value that isn't valid UTF-8
+        # raises ``UnicodeDecodeError``.
+        params: dict[str, str] = {}
+        parts = body[4:].split(b"\x00")
+        i = 0
+        while i + 1 < len(parts):
+            key = parts[i].decode("utf-8")
+            if key == "":
+                break
+            params[key] = parts[i + 1].decode("utf-8")
+            i += 2
+        return StartupMessage(params=params)
+    except (struct.error, UnicodeDecodeError) as exc:
+        raise PGProtocolError(f"malformed startup packet: {exc}") from exc
 
 
 @dataclass
