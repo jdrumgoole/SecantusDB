@@ -136,6 +136,37 @@ each measurable in isolation via `bench.concurrency` single-writer:
 This is the highest-value latency workstream — the single-writer base is what all
 the scaling multiplies. Gate: full CRUD + concurrency integrity suites + parity.
 
+**Measured negative result (2026-07-20):** lever 1 (skip re-encode when `_id`
+present) gave **~0 improvement** (251k → 256k single-writer, within noise). So BSON
+*re-encode* is NOT the bottleneck. Reverted.
+
+**Profile verdict (`sample` on debug-symbol binary, single-writer load):** time is
+spread across WT's write machinery — `__wt_evict_thread_run`, `__wt_reconcile`,
+`__wt_block_write`, `__wt_page_in/out/swap`, cursor-cache churn — essentially **no
+`secantus_*` frames**. The bottleneck is **WT itself under cache pressure + write
+amplification**, not our Rust code, not locks, not BSON. Two levers fall out:
+
+- **Cache size — a MEASUREMENT-ARTIFACT, not a win (corrected).** A short cache A/B
+  (`load_writer --count 200000`, ~9s) showed 1G 12.1k/s → 8G 21.3k/s and I nearly
+  shipped a "+75%" auto-cache change. The honest **20s steady-state** concurrency
+  bench debunked it: 8G gives **239k/251k single-writer — flat vs 1G's 251k/257k**.
+  The short 8G run simply finished *before* WT's dirty-eviction trigger engaged
+  (transient), while the 1G run was already at steady state. **Steady-state write
+  throughput is disk-write-*volume* bound, not cache bound** — bigger cache doesn't
+  help. Change reverted. Lesson: always measure steady-state (20s), never a
+  short-count run, for write throughput.
+- **Compression — the real steady-state suspect (mongod-parity).** The bench doc is
+  `"x"*8192` — pathologically compressible — and **mongod block-compresses (snappy)
+  by default while our WT tables don't** (`DEFAULT_CONFIG` / table creates set no
+  `block_compressor`). So mongod writes ~nothing to disk per doc; we write the full
+  8KB. Since steady state is disk-volume bound, compression could be a large,
+  legitimate lever (and matches mongod). *Next experiment — verify snappy is in the
+  WT build, enable `block_compressor` on the data/index/oplog tables, measure 20s
+  steady-state.*
+- **WT-op reduction:** independently, we do ~4 WT writes/doc (doc + 2 natural-order +
+  oplog) vs mongod's ~2. The natural-order index (`write_nat_entry`) is the target —
+  fewer writes = less disk volume. Sequence after the compression result.
+
 ### Phase 2 — Drop the per-collection CRUD lock → WT-MVCC-native *(biggest same-collection lever)*
 Stop holding `coll_lock` across the WT transaction on the CRUD write path; let
 concurrent same-collection writers run concurrent WT transactions and rely on WT
