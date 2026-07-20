@@ -4013,3 +4013,25 @@ never alongside each other.
 
 Until then, a `kotlin FAILED` from `validate-all` should be re-checked serially
 before it is believed — and the same caveat applies to `java`.
+
+## Warning-class RUSTSEC advisories (surfaced by cargo-audit, not gated) (2026-07-20)
+
+The `cargo-audit` CI gate (`.github/workflows/cargo-audit.yml`, security review
+I22) fails only on *vulnerability*-class advisories. These warning-class ones
+(unmaintained / unsound) are printed in the gate log every run but do not block,
+and are not otherwise tracked. None is a reachable exploit; all are
+dependency-hygiene items to clear opportunistically when the owning dep is next
+touched:
+
+- **RUSTSEC-2025-0134** — `rustls-pemfile` 2.2.0 unmaintained. Transitive; its
+  API folded into `rustls-pki-types`. Clears when the TLS dep chain updates.
+- **RUSTSEC-2026-0190** — `anyhow` 1.0.102 unsound (`Error::downcast_mut()`).
+  Fixed in a later 1.0.x; a plain `cargo update -p anyhow` should clear it — do
+  it next time the relevant lockfiles are regenerated.
+- **RUSTSEC-2026-0196 / -0197** — `cgmath` 0.18.0 unmaintained + `swap_columns`
+  UB. Pulled in transitively via the geo/spatial stack (`s2`). No fixed release;
+  revisit if the geo dependency is ever swapped.
+
+The two *vulnerability*-class pyo3 advisories (RUSTSEC-2025-0020 / -2026-0177) are
+tracked separately in #584 (the 0.22 -> 0.29 migration) and are the two IDs on
+the gate's `--ignore` baseline. When #584 lands, drop those ignores.
