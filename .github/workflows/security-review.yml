@@ -77,6 +77,21 @@ jobs:
           # read/write for the report, and web access for CVE lookups.
           claude_args: '--allowed-tools "Bash,Read,Grep,Glob,Write,Edit,WebSearch,WebFetch"'
 
+      # The action writes a full execution log to the runner temp dir and then
+      # never surfaces it, so a failed review shows only `is_error: true` with
+      # no reason. Dump it on every run — without this there is nothing to
+      # diagnose from.
+      - name: Dump the Claude execution log
+        if: always()
+        run: |
+          f=/home/runner/work/_temp/claude-execution-output.json
+          if [ -f "$f" ]; then
+            echo "--- $f ---"
+            cat "$f"
+          else
+            echo "no execution log at $f"
+          fi
+
       # The action exits 0 whenever its result envelope says
       # subtype == "success", even when the same envelope carries
       # `is_error: true` — so a rejected credential, an exhausted quota, or a
