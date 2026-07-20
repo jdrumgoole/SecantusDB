@@ -268,6 +268,19 @@ These are explicit non-goals. Don't add them without a reason.
   ensure the `finally` `stream.close()` interrupts a parked cursor. A
   first-attempt faulthandler dump would confirm whether the wedged thread is
   this `try_next` pool thread.
+  **Hit a FOURTH time 2026-07-20 (PR #586, `test (3.10, ubuntu-latest, 3)`).**
+  Same signature: worker `gw2` "Not properly terminated" at ~97%, sibling
+  workers froze, the controller's post-crash-overrun watchdog fired `os._exit(70)`
+  ~5 min later. The first-attempt faulthandler dump was captured but **did not**
+  confirm the `try_next` hypothesis — the crashed worker's own stack died with
+  it (`pytest_testnodedown` only carries bystander controller/execnet threads),
+  so the dump names no culprit. Rerun of the single failed shard passed clean.
+  Takeaway: `pytest_testnodedown`'s crash-reason capture doesn't recover the
+  dead worker's Python stack on Linux either — to actually pin this, the next
+  slice needs the crash reproduced under a worker running with `faulthandler`
+  armed *inside* the worker (not just the controller), e.g. via a low
+  `--max-worker-restart` + core-dump capture, or by running the ws-changes test
+  file alone under CPU starvation.
 
 
 Subtler than the above; these may bite specific test suites.
