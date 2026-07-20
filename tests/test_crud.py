@@ -3838,6 +3838,25 @@ def test_capped_collection_evicts_by_max_count(client: MongoClient) -> None:
     assert [d["i"] for d in docs] == [7, 8, 9]
 
 
+def test_capped_collection_evicts_fifo_with_nonmonotonic_ids(client: MongoClient) -> None:
+    # FIFO eviction must follow *insertion* order, not ``_id`` byte order.
+    # With non-monotonic user ``_id`` values the two disagree: the doc-table
+    # walk (``_id`` order) would evict the smallest ``_id`` first, whereas
+    # mongod evicts the oldest-inserted first. Insert 5, 1, 9, 2, 7 (in that
+    # order) into a max=3 capped collection; the survivors must be the last
+    # three *inserted* (9, 2, 7 in insertion order), not the three highest
+    # ``_id`` values (5, 7, 9).
+    db = client["capped_fifo_nonmono_db"]
+    db.create_collection("logs", capped=True, size=1_000_000, max=3)
+    coll = db["logs"]
+    insertion_order = [5, 1, 9, 2, 7]
+    for _id in insertion_order:
+        coll.insert_one({"_id": _id, "payload": "x"})
+    survivors_natural = [d["_id"] for d in coll.find().hint({"$natural": 1})]
+    assert survivors_natural == [9, 2, 7]
+    assert {d["_id"] for d in coll.find()} == {9, 2, 7}
+
+
 def test_capped_collection_evicts_by_size_budget(client: MongoClient) -> None:
     # Pick a size budget that fits about 3 docs of ~80 bytes each.
     db = client["capped_evict_size_db"]
