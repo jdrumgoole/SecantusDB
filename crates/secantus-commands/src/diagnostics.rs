@@ -230,7 +230,10 @@ mod tests {
     }
     impl crate::ConnectionKiller for FakeKiller {
         fn kill(&self, conn_id: i64) -> bool {
-            self.killed.lock().unwrap().push(conn_id);
+            self.killed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(conn_id);
             self.found
         }
     }
@@ -251,7 +254,10 @@ mod tests {
         let mut c = ctx().with_conn_killer(killer.clone());
         let reply = dispatch(&doc! {"killOp": 1, "op": 42_i64}, &mut c);
         assert_eq!(reply.get_str("info").unwrap(), "operation killed");
-        assert_eq!(*killer.killed.lock().unwrap(), vec![42]);
+        assert_eq!(
+            *killer.killed.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![42]
+        );
     }
 
     #[test]
@@ -277,7 +283,10 @@ mod tests {
         let mut c = ctx().with_conn_killer(killer.clone());
         let reply = dispatch(&doc! {"killOp": 1, "op": "7"}, &mut c);
         assert_eq!(reply.get_str("info").unwrap(), "operation killed");
-        assert_eq!(*killer.killed.lock().unwrap(), vec![7]);
+        assert_eq!(
+            *killer.killed.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![7]
+        );
     }
 
     #[test]

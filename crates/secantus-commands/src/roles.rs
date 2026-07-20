@@ -584,7 +584,7 @@ mod tests {
             record: &[u8],
             replace: bool,
         ) -> Result<bool, crate::StorageError> {
-            let mut roles = self.roles.lock().unwrap();
+            let mut roles = self.roles.lock().unwrap_or_else(|e| e.into_inner());
             let key = (db.to_string(), name.to_string());
             if roles.contains_key(&key) && !replace {
                 return Ok(false);

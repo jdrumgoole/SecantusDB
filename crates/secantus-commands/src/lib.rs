@@ -1027,7 +1027,7 @@ fn run_with_txn_envelope(
     // Create the WT transaction handle lazily at the first statement (the
     // snapshot pins here).
     {
-        let mut t = txn.lock().unwrap();
+        let mut t = txn.lock().unwrap_or_else(|e| e.into_inner());
         if t.handle.is_none() {
             match storage.begin_user_transaction() {
                 Ok(h) => t.handle = Some(h),
@@ -1038,7 +1038,7 @@ fn run_with_txn_envelope(
         }
     }
     let mut result = {
-        let mut t = txn.lock().unwrap();
+        let mut t = txn.lock().unwrap_or_else(|e| e.into_inner());
         let handle = t.handle.as_mut().expect("handle created above").as_mut();
         match storage.run_in_user_transaction(handle, &mut || run_handler(handler, doc, ctx)) {
             Ok(r) => r,
