@@ -394,7 +394,8 @@ enum ResolvedHint {
 /// The WiredTiger connection config SecantusDB uses (mirrors `storage.py`):
 /// logging on, commit-sync off by default.
 const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
-                              log=(enabled=true,file_max=10MB),\
+                              eviction=(threads_min=4,threads_max=4),\
+                              log=(enabled=true,file_max=128MB),\
                               transaction_sync=(enabled=false,method=fsync)";
 
 /// Build the WiredTiger connection config string from the tunable knobs the
@@ -406,7 +407,7 @@ const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
 /// the embedded / library default stays `256M` via [`Storage::open`].
 pub fn wt_config(cache_size: &str, session_max: u32, sync_on_commit: bool) -> String {
     format!(
-        "create,session_max={session_max},cache_size={cache_size},log=(enabled=true,file_max=10MB),transaction_sync=(enabled={},method=fsync)",
+        "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max=128MB),transaction_sync=(enabled={},method=fsync)",
         if sync_on_commit { "true" } else { "false" }
     )
 }
