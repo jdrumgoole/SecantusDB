@@ -226,9 +226,36 @@ workload to ~1.5–2.7× of mongod, the remaining levers (6b streaming, `find_al
 cursor-batching) are diminishing returns. **Recommend treating the raw-BSON
 roadmap as substantially complete** and picking up 6b only if aggregate-heavy
 multi-stage pipelines become a stated priority — at which point this workload is
-already in the benchmark to measure against. (Re-confirm the write-workload
-`×mongod` on an unloaded machine before any future baseline; this session's
-aggregate deltas stand because they were internally consistent across two runs.)
+already in the benchmark to measure against.
+
+### Clean full-benchmark baseline (2026-07-20, pinned `73b1790b`/`bedaae02`, unloaded machine)
+
+The write rows above were contaminated; re-measured on a genuinely **quiesced**
+machine — a self-gating harness (`scratchpad/wait_and_measure.sh`) that blocks
+until the 1-min load average is sustainably < 3.5 before running, then ran
+`compare-servers --count 10000 --reps 5` **twice** (both at load ≈ 1.9–2.2, HEAD
+unchanged). The two runs agree within noise, so this is the authoritative
+post-6a baseline:
+
+| Workload | mongod | SecantusDB-rs | ×mongod (run 1 / run 2) |
+|---|---:|---:|:---:|
+| insert | ~58–60 ms | ~91–95 ms | **1.6× / 1.6×** |
+| find_indexed_range | ~4.4–4.6 ms | ~6.3–6.5 ms | 1.4× / 1.5× |
+| find_all | ~7.8–8.1 ms | ~18.7–19.6 ms | 2.3× / 2.5× |
+| update_many_half | ~35.5 ms | ~50–52 ms | **1.4× / 1.5×** |
+| aggregate_group | ~5.6–5.7 ms | ~12.7–13.0 ms | 2.3× / 2.3× |
+| aggregate_multistage | ~5.8–5.9 ms | ~18.1–19.1 ms | 3.1× / 3.2× |
+| delete_many_half | ~20–21 ms | ~33–34 ms | **1.6× / 1.6×** |
+
+So on an unloaded machine the **writes sit at ~1.4–1.6× of mongod** (insert 1.6×,
+update 1.4–1.5×, delete 1.6×) — near the read/write pack, confirming the earlier
+contaminated `0.4–0.5×` were pure load artifacts. The clean mongod baseline also
+sharpens the aggregate picture: `aggregate_multistage` is **3.1–3.2×** (vs the
+noisy 2.7× estimate) against single-stage `aggregate_group` at **2.3×** — the
+extra `$unwind`→`$group`→`$sort` stages cost mongod +0.15 ms but Rust +5.3 ms,
+so ~30% of the multi-stage time is the inter-stage materialization 6b would
+target. The "6b real-but-modest, deferring recommended" conclusion stands and is
+if anything reinforced on the clean ratio.
 
 ## Finding 3 — the oplog prune is an O(entire-oplog) full-decode sweep
 
