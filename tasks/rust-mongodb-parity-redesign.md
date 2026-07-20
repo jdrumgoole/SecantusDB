@@ -306,6 +306,60 @@ round-trips (~577 samples) ≈ WT btree/eviction ops (~570 combined), plus zlib
   the honest scope of "the last 7×"; the two shipped levers (config + compression)
   were the disk-volume fruit.
 
+## ⭐ BREAKTHROUGH: the oplog is the dominant bottleneck (2026-07-20)
+
+Isolated via an experiment toggle (`SECANTUS_NO_OPLOG`) — separate-collection
+scaling, 15s, unloaded:
+
+| writers | oplog ON | oplog OFF |
+|---|---|---|
+| 1 | 16,064/s (1.00×) | **46,283/s (1.00×)** |
+| 2 | 0.92× | 1.18× |
+| 4 | 0.68× | 1.94× |
+| 8 | **0.60× (144k agg)** | **2.73× (1,898,800 agg)** |
+
+**The oplog costs ~2/3 of single-writer throughput AND nearly all the scaling
+collapse.** Oplog OFF: single-writer 16k→**46k** (2.9×; only 2.4× from mongod's
+110k, down from 7×) and 8-writer scaling 0.60→**2.73×** (near mongod's 4.55×). So
+the residual gap is NOT per-collection tables or MVCC locks — it is the **oplog**:
+every write appends to one shared oplog btree tail (page-latch contention at the
+monotonic-seq tail), takes the `oplog` mutex (seq/ts mint + condvar notify), and
+writes a full-doc entry (a second ~8KB row). This is Phase 3, and it's the #1
+lever (was mis-prioritized).
+
+**Tractable oplog optimizations to pursue (each measured, gated by the
+change-stream + concurrency suites):**
+- Raw-BSON oplog entry: splice the doc's already-encoded bytes into `o` instead of
+  re-encoding (single-writer).
+- Cache the oplog/preimage cursors per-thread (if opened per-emit — the profile
+  showed cursor-cache churn).
+- Reduce `oplog` mutex hold / contention; consider mongod's optime-reserve +
+  out-of-order-commit + holes model for the btree-tail scaling limit (the deep part).
+The oplog-off numbers are the ceiling this phase chases: ~46k single-writer, ~2.7×
+scaling — a genuine "approaching mongod" trajectory.
+
+**Micro-experiments (both measurement-disproven, reverted — the loop caught them):**
+- *Remove the per-emit second `oplog` mutex acquire* (the in-emit `notify_all` is
+  redundant — the real wake is post-commit in `with_statement_txn:1803` — and move
+  the prune counter to an atomic): **~0** (8w 0.60→0.64×, noise). So the `oplog`
+  mutex is NOT the scaling limiter. *(The redundant-notify removal is still a valid
+  cleanup for a future PR; it just isn't a perf lever.)*
+- *Un-compress the oplog/preimage tables* (hypothesis: `deflate` CPU on transient
+  rows): **WORSE** (single-writer 15.4→12.8k, 8w 0.64→0.36×). The oplog's cost is
+  disk-write *volume*, not compression CPU — **compressing it was correct** (keep
+  as merged).
+
+**Therefore the residual oplog gap is structural, precisely located:**
+- *Single-writer:* the oplog is a fundamental *second* compressed ~8KB write per
+  insert (mongod does this too; mongod wins on raw C++/WT efficiency — the
+  distributed-profile finding, not one lever).
+- *Scaling:* the **shared oplog btree tail** — all writers append monotonic-seq
+  keys to one rightmost page → WT page-latch serialization. This is THE scaling
+  limiter. The fix is mongod's model: reserve optime atomically, commit oplog rows
+  out-of-order in each writer's own txn, track "holes" so readers see a consistent
+  prefix — so writers don't rendezvous on one page. That is the focused Phase-3
+  work; the oplog-off ceiling (2.73× scaling) is what it can recover.
+
 ## Success criteria (mirrors the mongod numbers we're chasing)
 - Write scaling on **distinct** collections: ≥ 2.5× at 4 writers, approaching
   mongod's ~4.1× at 8 (bounded by whatever Phase 1 shows WT can actually do here).
