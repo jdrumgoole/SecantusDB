@@ -217,6 +217,23 @@ data ~2–4×, so the real-world win is proportionally smaller but real on both 
   compressor build path is proven; needs its source bundled (WT only *finds* snappy).
 
 ### Phase 2 — Drop the per-collection CRUD lock → WT-MVCC-native *(biggest same-collection lever)*
+
+**Feasibility analysis (2026-07-20, de-risked):** the `coll_lock` does NOT protect
+the seq/ts/`next_nat_seq` counters — those mint under the dedicated `oplog` mutex
+(`lib.rs:1959`; the seq can't be a bare atomic because `wait_for_oplog` pairs it
+with `oplog_cv`). So `coll_lock` only serializes same-collection writers *across
+their WT transaction* — which WT's MVCC + the existing `WriteConflict`/
+`WT_DUPLICATE_KEY` retry (`retry_write_conflicts`) already handle. Carve-outs:
+capped-collection trim needs a **narrow** per-collection lock (avoid double
+eviction); `maybe_mark_multikey` is idempotent (benign race); unique-index races →
+`WT_DUPLICATE_KEY` (already the backstop). So the change is: drop `coll_lock` from
+the CRUD write path, add a narrow trim-only lock. **Correctness-critical** — this
+removes write serialization from a database, so it must land with the full
+`test_mongo_server_concurrency` integrity suite green *plus* extended stress
+(exactly-one-winner, no-lost-update, findAndModify exclusivity) and deserves
+focused implementation + review, not a rushed change. The gate exists; the analysis
+is done; the implementation is the next focused session's work.
+
 Stop holding `coll_lock` across the WT transaction on the CRUD write path; let
 concurrent same-collection writers run concurrent WT transactions and rely on WT
 conflict detection + the **existing** `WriteConflict` retry. Carve-outs that still
