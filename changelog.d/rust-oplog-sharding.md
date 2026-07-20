@@ -16,9 +16,13 @@ size cap with recent entries it does a single timestamp read instead of a full
 walk, and when trimming it touches only the bounded set of oldest rows it will
 actually drop.
 
-Measured back-to-back on one machine (before vs after), single-writer insert
-throughput rose ~1.77× and eight-writer aggregate throughput ~12×, with per-writer
-scaling going from 0.27× to 1.86×. The oplog stays a single logical,
+Measured back-to-back on an idle machine (before vs after), single-writer insert
+throughput rose ~1.5× (14.5k → 22.2k docs/s). The bigger change is under
+concurrency: the old write path *lost* throughput as writers were added (it peaked
+around two writers and degraded past that), whereas the new one scales — peaking
+near 46k docs/s at four writers (~2× the single-writer rate) and holding there at
+eight, roughly 4–5× the old path's throughput at the same writer count. The oplog
+stays a single logical,
 strictly-ordered stream — change-stream ordering, resume tokens, and point-in-time
 recovery are byte-for-byte unchanged — and because the shard layout is an on-disk
 format change, the Python server also learned to read, recover, and prune a
