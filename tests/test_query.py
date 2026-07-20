@@ -767,3 +767,19 @@ def test_gte_lte_null_and_exists_truthiness() -> None:
     assert ids({"f": {"$exists": 0}}) == [3]
     assert ids({"f": {"$exists": False}}) == [3]
     assert ids({"f": {"$exists": 1}}) == [1, 2]
+
+
+def test_jsonschema_deep_nesting_raises_typed_error_not_recursion() -> None:
+    """A pathologically deeply-nested ``$jsonSchema`` recurses through every
+    sub-schema. Instead of letting the ``RecursionError`` escape ``matches`` to
+    the dispatch layer's blanket handler (a generic InternalError), it is
+    translated into a typed ``FailedToParse`` (code 9). (security review
+    2026-07-20, I21.)"""
+    schema: dict = {"bsonType": "int"}
+    for _ in range(5000):
+        schema = {"bsonType": "object", "properties": {"a": schema}}
+    with pytest.raises(QueryError) as ei:
+        matches({"a": 1}, {"$jsonSchema": schema})
+    assert ei.value.code == 9
+    assert ei.value.code_name == "FailedToParse"
+    assert "deep" in str(ei.value)

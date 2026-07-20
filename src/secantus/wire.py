@@ -142,6 +142,16 @@ def read_message(sock: socket.socket) -> Message:
         # loop can do the same rather than dropping the socket (and
         # leaking a traceback) on a malformed frame.
         raise MalformedBodyError(header, f"invalid BSON in body: {exc}") from exc
+    except RecursionError as exc:
+        # A pathologically deeply-nested BSON document exhausts the
+        # interpreter's recursion limit while ``bson.decode`` walks it.
+        # mongod caps BSON nesting depth and rejects an over-deep doc
+        # with a ``BadValue``; take the same MalformedBodyError → BadValue
+        # path so the connection survives instead of the ``RecursionError``
+        # escaping the parse and dropping the socket. (security review
+        # 2026-07-20, I1.) The message is fixed text, not ``str(exc)``,
+        # because a RecursionError's message is empty / stack-dependent.
+        raise MalformedBodyError(header, "invalid BSON in body: document nesting too deep") from exc
     raise WireProtocolError(f"unsupported op_code {header.op_code}")
 
 
