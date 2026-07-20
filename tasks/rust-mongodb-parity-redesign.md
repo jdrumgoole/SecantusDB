@@ -374,6 +374,36 @@ precise, exhaustively-narrowed diagnosis are the session's deliverables.
   prefix — so writers don't rendezvous on one page. That is the focused Phase-3
   work; the oplog-off ceiling (2.73× scaling) is what it can recover.
 
+## ⭐⭐ THE FIX: sharded oplog (2026-07-20) — recovers most of the gap
+
+The tractable single-table oplog tunings were all disproven; the fix is to **shard
+the oplog across N btrees** so concurrent writers don't rendezvous on one table's
+rightmost append page. Experiment: 16 write-shards (`secantus_oplog_sh{0..15}`,
+routed by `start_seq % 16`), read path unchanged (bench-only measurement). Measured
+(separate collections, 20s, unloaded):
+
+| writers | baseline (1 table) | **16-shard oplog** | oplog-off ceiling |
+|---|---|---|---|
+| 1 | 16k/s (1.00×) | **28.9k/s (1.00×)** | 46k |
+| 2 | 0.92× | **1.24×** | 1.18× |
+| 4 | 0.68× | **1.98×** | 1.94× |
+| 8 | **0.60×** | **2.47×** | 2.73× |
+
+Sharding recovers **single-writer 16k→28.9k (1.8×)** and **8-writer scaling
+0.60→2.47× (~4×)** — approaching the oplog-off ceiling and mongod's 4.55×. So the
+gap to mongod drops to ~3.8× single-writer / ~1.8× scaling: genuinely "approaching."
+(Single-writer improves too because one writer's consecutive batches rotate across
+shards → far less per-page append churn.)
+
+**Remaining work to ship it (the real Phase-3):** the read path must merge the N
+shards in seq order for every oplog reader — the tailable change-stream producer,
+`read_oplog`, `find_seq_for_ts`, `prune_oplog_inner`, recovery (`load_oplog_meta`),
+and PITR replay. A k-way merge by seq (each shard is seq-sorted; a doc's shard is
+`seq % N`, so a point lookup is O(1) too). Then validate against the FULL
+`test_mongo_server_concurrency` + change-stream suites (change streams must see
+every event, in order, with correct resume tokens across shards). This is
+correctness-critical but now clearly justified — the win is proven.
+
 ## Success criteria (mirrors the mongod numbers we're chasing)
 - Write scaling on **distinct** collections: ≥ 2.5× at 4 writers, approaching
   mongod's ~4.1× at 8 (bounded by whatever Phase 1 shows WT can actually do here).
