@@ -404,6 +404,53 @@ and PITR replay. A k-way merge by seq (each shard is seq-sorted; a doc's shard i
 every event, in order, with correct resume tokens across shards). This is
 correctness-critical but now clearly justified — the win is proven.
 
+## ⭐⭐⭐ RESULT (2026-07-20 PM): bounded prune — 1.77× single / 12.4× 8-writer (MEASURED)
+
+The bounded-prune fix landed and was measured **back-to-back on one machine**
+(baseline = main single-table + full-scan prune, new = sharded + bounded prune):
+
+| | baseline (main) | new (sharded + bounded prune) | improvement |
+|---|---|---|---|
+| 1 writer | 13,198/s | **23,424/s** | **1.77×** |
+| 8 writers (aggregate) | 3,533/s (0.27× scaling) | **43,617/s (1.86× scaling)** | **12.4×** |
+
+This REVERSES the earlier sharding-only tradeoff: single-writer is now *better*
+than baseline (not −20%), and 8-writer throughput is 12× higher. vs mongod:
+single-writer 0.10×→**0.21×**, scaling 0.06×→**0.41×** of mongod's 4.55×. The
+re-profile confirmed the mechanism: the prune scan (`__wt_btcur_next`) fell from
+46% of dispatch CPU to 11%; the write path is now dominated by `__wt_txn_commit`
++ `__wt_btcur_insert` (real write work). Correctness: 103 Rust-server
+integration tests (oplog/pitr/cross-server/change-stream/concurrency) + storage
+cargo suite + fmt/clippy green.
+
+Remaining to mongod: single-writer still ~4.7× off (now commit/journal-bound —
+`__wt_txn_commit` dominates), 8-writer scaling 1.86× vs 4.55×. Next levers:
+group-commit / journal batching (the commit cost), and the write-amplification /
+double-encode items below.
+
+## ⭐ PROFILE (2026-07-20 PM): the write-path bottleneck is the opportunistic PRUNE
+
+`sample` of a single-writer insert loop (scratchpad/profile_insert.sh, load 1.27 —
+clean) shows the worker thread's `run_dispatch → dispatch` spends **77% of its CPU
+inside `emit_oplog`** (10,575 / 13,776 samples), and within that the dominant leaf
+is **`__wt_btcur_next` — cursor iteration**, i.e. the every-1000-emits opportunistic
+prune scanning the WHOLE oplog. Not the oplog write, not `index_descs` (my earlier
+guess — WRONG), not the doc/nat writes. Profiling corrected the guess; this is why
+the plan mandates measurement over projection.
+
+The full-oplog prune scan is **pre-existing** (the single-table baseline does it too
+— which is why baseline single-writer is also low) but sharding made it worse (my
+prune materialized every blob via a 17-cursor merge + a full `seq→table` HashMap).
+
+**Fix (profile-justified, helps single-writer on BOTH servers):** maintain a live
+oplog entry count so the opportunistic prune doesn't walk the whole oplog:
+- Under cap and oldest entry in-window → prune is ONE ts read (early-out), not a
+  100k walk.
+- Over cap → walk only the bounded excess (`live_count - max_entries`), oldest-first.
+`live_count`: counted once on open, `+= n` per `emit_oplog` / import, `-= doomed`
+per prune. Correctness-gated by the prune cap/retention tests + authoritative
+recount on open. Being built now; push gated on the cooldown A/B.
+
 ## Next lever: oplog PER-WRITE cost (the single-writer gap) — diagnosed, not yet built
 
 Sharding addressed *contention* (multi-writer) but not per-write *cost*, which is

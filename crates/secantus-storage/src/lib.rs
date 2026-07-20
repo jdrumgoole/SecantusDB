@@ -274,6 +274,21 @@ fn scan_max_oplog_seq(session: &Session) -> i64 {
     }
     max
 }
+
+/// Total live oplog rows across all shards + the legacy table. Key-only walk (no
+/// value fetch), run once on open to seed `OplogState.live_count` so the
+/// opportunistic prune can early-out instead of re-scanning the whole oplog.
+fn count_oplog_entries(session: &Session) -> i64 {
+    let mut total = 0i64;
+    for tbl in oplog_all_tables() {
+        if let Ok(c) = session.open_cursor(&tbl, None) {
+            while c.next().unwrap_or(false) {
+                total += 1;
+            }
+        }
+    }
+    total
+}
 const PREIMAGE_TABLE: &str = "table:secantus_preimages";
 const OPLOG_META_TABLE: &str = "table:secantus_oplog_meta";
 
@@ -1481,6 +1496,11 @@ struct OplogState {
     /// Oplog rows emitted since the last opportunistic prune. In-memory only
     /// (resets on open, like `storage._oplog_emit_count`); never persisted.
     emit_count: i64,
+    /// Live oplog row count across all shards + the legacy table. Counted once on
+    /// open, `+= n` on every `emit_oplog` / import, `-= doomed` on prune. Lets the
+    /// opportunistic prune early-out (one ts read) when under the cap instead of
+    /// walking the whole oplog every 1000 emits — the write-path bottleneck.
+    live_count: i64,
 }
 
 /// Emit this many oplog rows between opportunistic `prune_oplog` sweeps on the
@@ -1488,6 +1508,13 @@ struct OplogState {
 /// bounded from writes alone, even when the noop-heartbeat sweeper is disabled
 /// (`noop_heartbeat_seconds == 0`, the default), which is the only other pruner.
 const OPLOG_PRUNE_INTERVAL: i64 = 1000;
+
+/// Upper bound on how many oldest oplog rows a single retention sweep inspects
+/// when the store is under the entry cap (so an undatable/old prefix can't force a
+/// whole-oplog walk on the write path). Comfortably above OPLOG_PRUNE_INTERVAL so
+/// a steady-state sweep still reaches every row that aged out since the last one;
+/// any excess drains on the next sweep.
+const RETENTION_SCAN_BATCH: usize = 10_000;
 
 /// Milliseconds since the Unix epoch (UTC), for oplog `wall` times.
 fn now_millis() -> i64 {
@@ -1537,6 +1564,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                         .unwrap_or(1)
                         .max(scan_max_nat_seq(session) + 1),
                     emit_count: 0,
+                    live_count: count_oplog_entries(session),
                 });
             }
         }
@@ -1569,6 +1597,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         last_ts_ord: last_ord,
         next_nat_seq: scan_max_nat_seq(session) + 1,
         emit_count: 0,
+        live_count: count_oplog_entries(session),
     })
 }
 
@@ -2043,6 +2072,7 @@ impl Storage {
             let mut g = self.oplog.lock().unwrap();
             self.oplog_cv.notify_all();
             g.emit_count += n;
+            g.live_count += n;
             if g.emit_count >= OPLOG_PRUNE_INTERVAL {
                 g.emit_count = 0;
                 true
@@ -2579,6 +2609,8 @@ impl Storage {
                 st.last_ts_secs = best.0;
                 st.last_ts_ord = best.1;
             }
+            // Imported rows are live oplog entries too — keep the prune's count honest.
+            st.live_count += rows.len() as i64;
             self.oplog_cv.notify_all();
         }
         Ok(max_seq)
@@ -2606,106 +2638,95 @@ impl Storage {
         let when = now.unwrap_or_else(now_secs);
         let cutoff = when - self.oplog_retention_seconds;
 
-        // Phase 1 (lock-free): collect every seq + the ones past the retention
-        // window. A fresh MVCC session reads consistently without blocking
-        // writers; prune is best-effort, so a slightly stale view is fine — and
-        // writers only ever append *higher* seqs, never touch the old rows we
-        // doom here.
-        // Sharded: walk every entry in global seq order via the shard merge (the
-        // ts-monotone-in-seq prefix property that makes the doomed set a prefix
-        // holds on the *merged* order, not on any one shard). The tagged merge
-        // also tells us each seq's source table (routing is per-batch, so a seq's
-        // shard isn't a function of the seq) — phase 2 deletes from that exact
-        // table.
+        // Phase 1 (lock-free): identify the doomed rows WITHOUT scanning the whole
+        // oplog — that full scan, every OPLOG_PRUNE_INTERVAL emits, was 77% of the
+        // single-writer write-path CPU (profile: scratchpad/profile_insert.sh). The
+        // live-count lets us size the sweep: `excess` is how many oldest rows must
+        // drop to get back under the entry cap; retention dooms a seq-ordered
+        // prefix on top of that. A fresh MVCC session reads consistently without
+        // blocking writers; prune is best-effort, so a slightly stale count/view is
+        // fine — writers only append *higher* seqs, never touch the old rows here.
         let tables = oplog_all_tables();
-        let rows = read_oplog_shards_tagged(&session, 0, usize::MAX)?;
-        let seq_table: HashMap<i64, usize> = rows.iter().map(|(s, t, _)| (*s, *t)).collect();
-        let mut all_seqs: Vec<i64> = Vec::with_capacity(rows.len());
-        let mut doomed: Vec<i64> = Vec::new();
-        // Entry `ts` values are monotone in seq (mint order == append order),
-        // so the out-of-retention rows form a prefix of the walk. Peek each
-        // row's ts (raw, no full document decode) only until the first
-        // in-window row; from there the walk is key-only — the cap trim in
-        // phase 2 needs bare seqs, never values. This runs on the write path
-        // (every `OPLOG_PRUNE_INTERVAL` emits), so an O(entire-oplog) decode
-        // here would stall the emitting writer for the whole sweep. A row
-        // with a missing/unreadable ts conservatively ends the doomed prefix —
-        // keep, never prune, what we can't date.
-        let mut in_window = false;
-        for (seq, _tbl, blob) in &rows {
-            all_seqs.push(*seq);
-            if !in_window {
-                match peek_entry_ts(blob) {
-                    Some(ts) if i64::from(ts.time) < cutoff => doomed.push(*seq),
-                    _ => in_window = true,
+        let live_count = self.oplog.lock().unwrap().live_count;
+        let excess = (live_count - self.oplog_max_entries as i64).max(0) as usize;
+
+        // Cheap early-out: under the cap, the only reason to prune is retention,
+        // which dooms a seq-ordered prefix — so if the OLDEST live row is still
+        // in-window, nothing is doomed. One bounded merge read of a single row
+        // replaces the whole-oplog walk in the common steady state.
+        if excess == 0 {
+            match read_oplog_shards_tagged(&session, 0, 1)?.first() {
+                None => return Ok(0),
+                Some((_, _, blob)) => {
+                    if matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) >= cutoff) {
+                        return Ok(0);
+                    }
+                    // oldest is out-of-window (or undatable) — fall through to walk.
                 }
             }
         }
 
-        // Phase 2: extend the doom set to the oldest entries over the cap.
-        let kept = all_seqs.len() - doomed.len();
-        if kept > self.oplog_max_entries {
-            let mut extra = kept - self.oplog_max_entries;
-            let doomed_set: HashSet<i64> = doomed.iter().copied().collect();
-            for &seq in &all_seqs {
-                if extra == 0 {
-                    break;
-                }
-                if !doomed_set.contains(&seq) {
-                    doomed.push(seq);
-                    extra -= 1;
-                }
+        // Bounded walk of the oldest rows only: a row is doomed if it's within the
+        // cap excess (i < excess) OR past retention (ts < cutoff). Both doom a
+        // seq-ordered prefix, so stop at the first row that is neither. The read is
+        // bounded by max(excess, RETENTION_SCAN_BATCH); any retention rows beyond
+        // that drain on later sweeps. The tagged merge carries each row's source
+        // table so phase 2 deletes from exactly that table. An undatable row ends
+        // the retention prefix (keep what we can't date) but is still cap-doomed if
+        // i < excess.
+        let limit = excess.max(RETENTION_SCAN_BATCH);
+        let rows = read_oplog_shards_tagged(&session, 0, limit)?;
+        let mut doomed: Vec<(i64, usize)> = Vec::new();
+        for (i, (seq, tbl, blob)) in rows.iter().enumerate() {
+            let past_retention =
+                matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) < cutoff);
+            if i < excess || past_retention {
+                doomed.push((*seq, *tbl));
+            } else {
+                break;
             }
         }
         if doomed.is_empty() {
             return Ok(0);
         }
-        doomed.sort_unstable();
+        let doomed_seqs: Vec<i64> = doomed.iter().map(|(s, _)| *s).collect();
 
         // PITR v2: archive the soon-to-be-dropped rows to a durable segment
         // *before* deleting them, so recovery can still reach a time before the
-        // new oplog floor. Done before the lock (rows still present).
+        // new oplog floor.
         if let Some(archive_dir) = self.oplog_archive_dir.clone() {
-            self.archive_doomed_oplog(&session, &archive_dir, &doomed)?;
+            self.archive_doomed_oplog(&session, &archive_dir, &doomed_seqs)?;
         }
 
         // Phase 2: the deletes. Sweep exclusivity is already held
         // (`oplog_prune_lock`, taken at the top); no other lock is needed —
-        // concurrent writers only ever append higher seqs. Sharded: each doomed
-        // seq is removed from its exact source table (the tag from phase 1); a seq
-        // absent from `seq_table` (a cap-trim addition that raced away, or an
-        // unreadable row) is probed against every table as a fallback. Pre-images
-        // stay in one table.
+        // concurrent writers only ever append higher seqs. Each doomed row is
+        // removed from its exact source table (the phase-1 tag). Pre-images stay
+        // in one table.
         let mut del_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
         let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
-        for &seq in &doomed {
-            // Table indices to delete from: the exact tagged table if known, else
-            // all of them (overwrite mode makes a remove of an absent key a no-op).
-            let targets: Vec<usize> = match seq_table.get(&seq) {
-                Some(&t) => vec![t],
-                None => (0..tables.len()).collect(),
-            };
-            for t in targets {
-                if del_curs[t].is_none() {
-                    del_curs[t] = Some(session.open_cursor(&tables[t], None)?);
-                }
-                let op_del = del_curs[t].as_ref().unwrap();
-                op_del.reset()?;
-                op_del.set_key_q(seq);
-                match op_del.remove() {
-                    Ok(()) => {}
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
+        for (seq, tbl) in &doomed {
+            if del_curs[*tbl].is_none() {
+                del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
+            }
+            let op_del = del_curs[*tbl].as_ref().unwrap();
+            op_del.reset()?;
+            op_del.set_key_q(*seq);
+            match op_del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
             }
             pre_del.reset()?;
-            pre_del.set_key_q(seq);
+            pre_del.set_key_q(*seq);
             match pre_del.remove() {
                 Ok(()) => {}
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
             }
         }
+        // Keep the live-count honest for the next sweep's sizing.
+        self.oplog.lock().unwrap().live_count -= doomed.len() as i64;
         Ok(doomed.len())
     }
 
