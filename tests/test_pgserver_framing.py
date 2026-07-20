@@ -99,3 +99,47 @@ def test_framing_error_sends_fatal_then_closes(server):
             pgwire.read_message(s)
     finally:
         s.close()
+
+
+def test_startup_short_cancel_packet_raises_protocol_error() -> None:
+    """A CANCEL_REQUEST startup packet whose body is truncated (no pid/secret)
+    makes ``struct.unpack_from`` read past the buffer. That raw ``struct.error``
+    must be translated into a typed ``PGProtocolError`` — the connection loop
+    turns that into a clean close, not a leaked traceback. (security review
+    2026-07-20, I16.)"""
+
+    class _FakeSock:
+        def __init__(self, data: bytes) -> None:
+            self._buf = bytearray(data)
+
+        def recv(self, n: int) -> bytes:
+            chunk = bytes(self._buf[:n])
+            del self._buf[:n]
+            return chunk
+
+    # length=8 header + the 4-byte CANCEL code, but no pid/secret follows.
+    body = struct.pack("!i", 80877102)  # CANCEL_REQUEST_CODE
+    packet = struct.pack("!i", len(body) + 4) + body
+    with pytest.raises(pgwire.PGProtocolError):
+        pgwire.read_startup_packet(_FakeSock(packet))
+
+
+def test_startup_invalid_utf8_param_raises_protocol_error() -> None:
+    """A startup packet whose parameter value isn't valid UTF-8 must raise a
+    typed ``PGProtocolError`` rather than a raw ``UnicodeDecodeError``.
+    (security review 2026-07-20, I16.)"""
+
+    class _FakeSock:
+        def __init__(self, data: bytes) -> None:
+            self._buf = bytearray(data)
+
+        def recv(self, n: int) -> bytes:
+            chunk = bytes(self._buf[:n])
+            del self._buf[:n]
+            return chunk
+
+    # protocol v3 (196608) + "user\0" + an invalid-UTF-8 value + trailing NULs.
+    body = struct.pack("!i", 196608) + b"user\x00\xff\xfe\x00\x00"
+    packet = struct.pack("!i", len(body) + 4) + body
+    with pytest.raises(pgwire.PGProtocolError):
+        pgwire.read_startup_packet(_FakeSock(packet))

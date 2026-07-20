@@ -233,7 +233,7 @@ These are explicit non-goals. Don't add them without a reason.
 - **`$where`** — runs JavaScript. We don't ship a JS runtime.
 - **`$function`, `$accumulator`** (aggregation expressions) — same reason: both evaluate user-supplied JavaScript and need an embedded JS engine + sandbox + BSON↔JS shim layer. Would also require a `--javascriptEnabled` gate (mongod gates JS behind this; many prod deployments disable it). Adding the runtime would let us implement these three operators + `mapReduce` together for ~600–1000 LOC + a heavyweight binary dep (PythonMonkey / QuickJS / V8 — each with maintenance trade-offs). Most pipelines that reach for `$function` can be expressed in the existing aggregation expression library — `$cond` / `$switch` / `$let` / `$map` / `$reduce` / `$filter` / `$regexFind` / `$concat` / `$substrCP` / `$dateToString` / etc. — which is more expressive than people often realise. **`lang: "python"` as a SecantusDB extension was considered and rejected (May 2026)**: would break the conformance contract (CLAUDE.md "pymongo cannot tell SecantusDB apart from mongod" — pipelines that work locally would explode in production with `Unrecognized lang value: 'python'`), and CPython's sandboxing story is actually worse than embedded JS engines (no per-context isolation primitives, no reliable cross-platform CPU-time interrupt, `RestrictedPython` is an AST rewriter not a true sandbox). If a real user need ever surfaces, the right escape hatch is a server-side trusted-plugin registry — `{$secantusFunction: {name: "<pre-registered>", args: [...]}}` — not user code at query time.
 - **`mapReduce`** — same JS-runtime dependency as `$where` / `$function` / `$accumulator`. Also explicitly deprecated by MongoDB (removed from the Stable API in 5.0; recommended migration path is aggregation pipelines). `commands._map_reduce` recognises the canonical `emit(this.<field>, 1)` + `values.length` "count by field" pattern (the shape mongo-java-driver's `testMapReduceWithGenerics` test exercises) and translates it to an equivalent `$group` aggregation. Non-canonical map / reduce bodies return `{results: [], ok: 1}` so wire-shape probes pass, and `out: "<coll>"` (non-inline) is rejected with FailedToParse. Anything that genuinely needs JS evaluation needs a real `mongod`.
-- ~~Capped collections~~ — implemented. `create capped: true, size, max` accepted; `Storage.insert` and `Storage.update_matching` enforce FIFO eviction by walking the doc table in natural order and evicting oldest non-fresh docs while bounds are exceeded. `listCollections` surfaces `options.{capped,size,max}`. Eviction emits oplog `op:"d"` entries (and pre-images when enabled) so change streams observe the deletes. **Known limitation (Python server only):** Python's `_enforce_capped_bounds_locked` evicts in `_id_key` order, which equals insertion order only when `_id` is monotonic (the default `ObjectId`); with user-supplied non-monotonic `_id`s the wrong docs are evicted (not strict FIFO). The Python natural-order index (`_scan_docs_natural`) exists and is used for `find`/`$natural` — the fix is to route eviction through it too (one-line: `_scan_docs` → `_scan_docs_natural` in `_enforce_capped_bounds_locked`). **The Rust server already does true FIFO** (beta.92, `scan_docs_natural` — see §7.3).
+- ~~Capped collections~~ — implemented. `create capped: true, size, max` accepted; `Storage.insert` and `Storage.update_matching` enforce FIFO eviction by walking the doc table in natural order and evicting oldest non-fresh docs while bounds are exceeded. `listCollections` surfaces `options.{capped,size,max}`. Eviction emits oplog `op:"d"` entries (and pre-images when enabled) so change streams observe the deletes. Both servers now do **true FIFO**: `_enforce_capped_bounds_locked` walks the natural-order index (`_scan_docs_natural`), so the oldest-inserted doc is evicted first regardless of `_id` monotonicity (matching mongod). Rust: beta.92, `scan_docs_natural` — see §7.3.
 - ~~Profiling~~ — implemented. `profile` command (-1 / 0 / 1 / 2 with `slowms` + `sampleRate`) sets per-database state in `secantus_profile_settings`. Dispatch wraps each non-skip command in `time.monotonic_ns` timing; if the per-DB level matches, an entry is inserted into `<db>.system.profile` (auto-created capped 10 MB). Recursion guard skips ops against `system.profile` itself + handshake / cursor-continuation / profile-itself commands. Entry shape mirrors mongod (`ts`, `op`, `ns`, `command`, `millis`, `ok`, `client`, optional `user`, `errMsg` / `errCode` on failure). Out of scope today: `planSummary` / `keysExamined` / `docsExamined` / `nreturned` (would need post-handler stats plumbing).
 - ~~Tailable / awaitData cursors~~ — implemented for change streams (see "In scope" in `CLAUDE.md`) **and** for plain capped collections + `local.oplog.rs` (`commands._find_tailable` / `_find_tailable_oplog`, blocking `getMore` on the oplog condition variable). The producer re-applies the find filter (with `let` vars + collation) to follow-up inserts, advances its watermark by `id_key`, and raises `CappedPositionLost` (136) on rollover.
 
@@ -268,23 +268,77 @@ These are explicit non-goals. Don't add them without a reason.
   ensure the `finally` `stream.close()` interrupts a parked cursor. A
   first-attempt faulthandler dump would confirm whether the wedged thread is
   this `try_next` pool thread.
-  **MITIGATION LANDED (branch `ws-changes-disconnect`), NOT yet confirmed on CI.**
-  Applied the candidate fix plus proactive disconnect detection in
-  `changestream.py`: each `try_next` poll now (a) is bounded server-side with
-  `max_await_time_ms=500` so an orphaned `to_thread` poll frees within ~0.5s
-  instead of relying on the 1s default (or longer under load), and (b) races
-  against a `_wait_for_disconnect` watcher so a *quiet* stream notices a gone
-  client immediately and stops scheduling new blocking polls (the old loop
-  only detected disconnect on the next `send`, so a quiet-then-closed stream
-  looped until app shutdown). This shrinks the orphan-thread window that is
-  the suspected wedge mechanism. It is **not proven** to eliminate the CI
-  crash — the crash never reproduced locally (needs CPU starvation), so this
-  is blast-radius reduction validated by reasoning + a new quiet-disconnect
-  regression test (`test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy`),
-  not by a red→green repro. **Keep this item open** and watch for a
-  recurrence on the durable/test lanes; if it recurs, the first-attempt
-  faulthandler dump (now emitted by the #555 crash-capture) should finally
-  name the wedged thread.
+  **Hit a FOURTH time 2026-07-20 (PR #586, `test (3.10, ubuntu-latest, 3)`).**
+  Same signature: worker `gw2` "Not properly terminated" at ~97%, sibling
+  workers froze, the controller's post-crash-overrun watchdog fired `os._exit(70)`
+  ~5 min later. The first-attempt faulthandler dump was captured but **did not**
+  confirm the `try_next` hypothesis — the crashed worker's own stack died with
+  it (`pytest_testnodedown` only carries bystander controller/execnet threads),
+  so the dump names no culprit. Rerun of the single failed shard passed clean.
+  Takeaway: `pytest_testnodedown`'s crash-reason capture doesn't recover the
+  dead worker's Python stack on Linux either — to actually pin this, the next
+  slice needs the crash reproduced under a worker running with `faulthandler`
+  armed *inside* the worker (not just the controller), e.g. via a low
+  `--max-worker-restart` + core-dump capture, or by running the ws-changes test
+  file alone under CPU starvation.
+  **Investigation 2026-07-21 (findings, no fix — the code guidance to not
+  blind-apply stands).** Read the tail loop (`admin/routers/changestream.py:99-121`):
+  `stream = await asyncio.to_thread(target.watch)` then a loop of
+  `await asyncio.to_thread(stream.try_next)`, with `finally: await
+  asyncio.to_thread(stream.close)`. Two real defects confirmed by code reading:
+  (1) **no `max_await_time_ms` on `watch()`** — each `try_next` blocks on the
+  server's ~1s default tailable await, and `asyncio.to_thread` CANNOT interrupt
+  the running pool thread on cancel, so a disconnect waits ~1s+ for the in-flight
+  `try_next` to unwind (measured: a single disconnect adds seconds of latency;
+  100 sequential iterations do not finish in 5 min). (2) **`close()` can run
+  concurrently with a still-in-flight `try_next`** on the same pymongo
+  `ChangeStream`, which pymongo documents as not thread-safe.
+  **Could NOT reproduce the crash on macOS**, which is the key negative result:
+  a direct two-thread harness (`scratchpad/repro_concurrent.py`: `try_next` loop
+  on one thread + `close()` on another against one `ChangeStream`) survived
+  **500 rounds even under 12 CPU-hog processes on a 12-core box** — zero crashes,
+  thread count flat at 10 (no leak). So the crash is **not** a macOS-reproducible
+  pymongo client-side concurrency segfault; it is Linux+load specific. Refined
+  prime suspect given WT is involved and it's Linux-only: the WT-level race
+  between the test's `SecantusDBServer` (the `server` fixture) tearing down and a
+  change-stream `getMore` still parked on that server's oplog — a server-side
+  analogue of the client `stop()` use-after-free fixed in 0.5.3b5, reachable via
+  the admin ws tail's separate `MongoClient`. **The documented candidate fix
+  (bound `max_await_time_ms`, serialize close vs try_next via a per-connection
+  single-worker executor) is correct on its own merits and would remove both
+  defects — but per the "do NOT blind-apply, needs a repro" note it is NOT
+  applied here, since I can't verify it kills the Linux crash and the change
+  touches a live path.** Concrete unblock: the fix needs a Linux repro (this box
+  is macOS). Best next step is a CI-only diagnostic — arm `faulthandler.enable()`
+  writing to a per-worker file uploaded as a CI artifact (pytest's faulthandler
+  writes to worker stderr, which xdist drops on "node down") — so the next
+  Linux occurrence dumps the faulting thread's C stack and finally names the
+  culprit. (The macOS repro harness that stayed clean: a two-thread loop —
+  `coll.watch()`, then one thread calling `stream.try_next()` repeatedly while
+  another calls `stream.close()` after a 50 ms head start — 500 rounds under 12
+  background CPU burners; trivial to re-create on a Linux box to attempt the
+  repro there.)
+  **MITIGATION APPLIED — PR #588 (branch `ws-changes-disconnect`), NOT yet
+  confirmed on CI.** The two defects the 2026-07-21 investigation confirmed by
+  code reading (no `max_await_time_ms`, and `close()` racing an in-flight
+  `try_next` on a non-thread-safe pymongo `ChangeStream`) are now both fixed in
+  `changestream.py`: (a) `watch(max_await_time_ms=500)` bounds every poll so an
+  orphaned `to_thread` frees within ~0.5s; (b) each `try_next` poll races a
+  `_wait_for_disconnect` watcher so a *quiet* stream notices a gone client
+  immediately (the old loop only detected disconnect on the next `send`, so a
+  quiet-then-closed stream looped until app shutdown); and (c) on disconnect the
+  in-flight poll is **awaited to completion** before the `finally` closes the
+  stream, so `try_next` and `close` never overlap (removing the concurrency
+  race). This is the fix that investigation called "correct on its own merits";
+  it is applied here because it is a genuine correctness fix regardless of the CI
+  crash — but per the "do NOT blind-apply, needs a repro" note it remains **not
+  proven** to kill the Linux crash (never reproduced locally / on macOS — 6×
+  parallel local runs stayed clean). Validated by reasoning + a new
+  quiet-disconnect regression test
+  (`test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy`). **Keep
+  this item open** and watch the durable/test lanes; if it recurs, the CI-only
+  per-worker `faulthandler` artifact the investigation proposed is still the
+  next step to name the culprit.
 
 
 Subtler than the above; these may bite specific test suites.

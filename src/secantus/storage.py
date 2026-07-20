@@ -3383,11 +3383,14 @@ class Storage:
     ) -> tuple[list[dict[str, Any]], list[bytes | None]]:
         """Evict oldest non-fresh docs from a capped collection until within bounds.
 
-        "Oldest" is the natural-order walk over the doc table, which matches
-        insertion order when ``_id`` is monotonic (e.g. the default
-        ObjectId). For non-monotonic ``_id`` values the eviction order
-        reflects ``_id`` byte order, not literal insertion order — capped
-        users with custom ``_id`` should not rely on FIFO semantics.
+        "Oldest" is the natural-order (insertion-order) walk via
+        ``_scan_docs_natural``, so eviction is strict FIFO regardless of
+        ``_id`` monotonicity — user-supplied non-monotonic ``_id`` values
+        are evicted in the order they were inserted, matching mongod.
+        Freshly inserted docs from the current batch carry the highest
+        ``seq`` and so sit at the natural-order tail; reaching one means
+        everything left is fresh, which is exactly the break condition
+        below.
         """
         raw = self._coll_options(db, coll) or {}
         if not raw.get("capped"):
@@ -3396,7 +3399,7 @@ class Storage:
         max_limit = raw.get("max")
         if size_limit is None and max_limit is None:
             return [], []
-        scanned = list(self._scan_docs(db, coll))
+        scanned = list(self._scan_docs_natural(db, coll))
         total = sum(len(blob) for _id_k, blob in scanned)
         count = len(scanned)
         oplog_entries: list[dict[str, Any]] = []
@@ -3408,9 +3411,10 @@ class Storage:
             if not over_size and not over_max:
                 break
             if id_k in fresh_id_keys:
-                # Don't evict docs we just inserted in this batch — they
-                # always sort to the tail with monotonic _ids, so reaching
-                # one means everything left is fresh too.
+                # Don't evict docs we just inserted in this batch — in
+                # natural (insertion) order they always sit at the tail
+                # (highest seq), so reaching one means everything left is
+                # fresh too.
                 break
             doc = bson.decode(blob)
             self._delete_index_entries(db, coll, doc, indexes, partials)

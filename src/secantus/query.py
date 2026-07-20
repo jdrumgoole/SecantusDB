@@ -102,8 +102,22 @@ def _match_clause(
     if key == "$comment":
         return True
     if key == "$jsonSchema":
-        _check_json_schema_keywords(condition)
-        return _validate_json_schema(doc, condition)
+        # Both the keyword check and the validation recurse into every
+        # sub-schema (properties / items / allOf / anyOf / oneOf / not / ...),
+        # so a pathologically deeply-nested schema can exhaust the recursion
+        # limit. Translate that into a typed FailedToParse the dispatch layer
+        # turns into a clean error reply, rather than letting the RecursionError
+        # escape to the blanket handler as a generic InternalError. (security
+        # review 2026-07-20, I21.)
+        try:
+            _check_json_schema_keywords(condition)
+            return _validate_json_schema(doc, condition)
+        except RecursionError as exc:
+            raise QueryError(
+                "$jsonSchema nesting is too deep",
+                code=9,
+                code_name="FailedToParse",
+            ) from exc
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
     return _field_matches(_resolve_path(doc, key), condition, collation)
