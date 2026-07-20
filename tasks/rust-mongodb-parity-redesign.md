@@ -428,6 +428,36 @@ Remaining to mongod: single-writer still ~4.7× off (now commit/journal-bound �
 group-commit / journal batching (the commit cost), and the write-amplification /
 double-encode items below.
 
+## ⭐ 8-WRITER PROFILE (2026-07-21): scaling is WT-internal, on the SHARED doc table
+
+Post-#582 the 8-writer curve plateaus (~46k/s at 4 writers, ~44k at 8) vs mongod's
+4.55x. Profiled the 8-writer insert path (8 load_writers → separate collections,
+1G cache, debug-symbol binary). Aggregated worker-thread hot frames:
+- `__wt_block_write` + `__posix_file_write` ~**55k** — block-write I/O (cache
+  eviction under write volume, amplified by our 4-writes/doc).
+- `_pthread_mutex_firstfit_lock_wait/slow` ~**23k** — mutex contention whose
+  callers are **WT-internal** (`__wt_block_free`, `__wt_block_write_off`,
+  `__wt_open_session`), NOT our `oplog` mutex (the mint-seq-lock hypothesis was
+  WRONG — profiled, not guessed).
+- `__wt_btcur_insert` ~41k (real inserts), `__wt_txn_commit` ~17k.
+
+**Root cause: all collections share ONE `secantus_documents` WT file**, so 8
+writers to 8 different collections still serialise on that file's block-allocation
+lock + thrash its cache. This is the block-manager contention, plus eviction I/O
+inflated by write amplification. Neither is our code — it's WT internals on the
+shared table. A bigger cache (already 1G) only absorbs the burst, not sustained
+volume (prior-session cache A/B was a short-run artifact).
+
+**Two structural levers, both LARGE on-disk-format changes, both user-sanctioned:**
+1. **Split the doc table** (one WT table per collection, or sharded like the oplog)
+   → separate block managers per collection → breaks the 8-writer contention.
+   Targets the bigger *scaling* gap. Proven pattern (oplog sharding worked).
+2. **RecordId-keyed docs** (below) → 4→3 writes/doc → ~25% less block-write I/O
+   *and* less commit cost → helps BOTH single-writer and eviction pressure.
+Both are multi-day, correctness-critical, dual-server. Profiling has now pinned
+the exact bottleneck on each axis; the remaining work is a deliberate on-disk
+re-architecture, not more tuning.
+
 ## After the prune fix: the write path is LEAN — remaining gap is structural
 
 Post-bounded-prune profile + code audit of the single-writer insert path: no
