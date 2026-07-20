@@ -81,9 +81,13 @@ fn main() {
     // CARGO_CFG_TARGET_OS is set by cargo to the *target* OS (correct under
     // cross-compilation too), unlike a host-evaluated cfg!.
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // `z` (zlib): WT is built with the builtin zlib block-compressor extension
+    // (HAVE_BUILTIN_EXTENSION_ZLIB), whose `zlib_compress.c.o` — now inside
+    // libwiredtiger_static — references libz's inflate/deflate. libz is a system
+    // library on macOS (SDK) and Linux (manylinux/musl ship zlib).
     let sys_libs: &[&str] = match target_os.as_str() {
-        "linux" => &["pthread", "rt", "dl"],
-        "macos" => &["pthread", "dl"],
+        "linux" => &["pthread", "rt", "dl", "z"],
+        "macos" => &["pthread", "dl", "z"],
         "windows" => &[],
         // Other POSIX targets (the BSDs etc.): pthread is the safe baseline.
         _ => &["pthread"],

@@ -163,6 +163,16 @@ if(EXISTS ${WT_BINARY_DIR}/CMakeCache.txt)
     endif()
 endif()
 
+# zlib block-compression is linked into WiredTiger only where libz is available
+# (macOS SDK + manylinux/musllinux). Windows has no default libz, so WT builds
+# there without the compressor (the storage layer omits the block_compressor
+# clause on Windows too — see secantus-storage BOOTSTRAP).
+if(WIN32)
+    set(WT_ZLIB_ARG "")
+else()
+    set(WT_ZLIB_ARG -DHAVE_BUILTIN_EXTENSION_ZLIB=ON)
+endif()
+
 ExternalProject_Add(wiredtiger_ext
     SOURCE_DIR        ${WT_WORK_DIR}
     # Stage the copy as the DOWNLOAD step so it is stamped and runs once. The
@@ -204,6 +214,17 @@ ExternalProject_Add(wiredtiger_ext
         -DWITH_PIC=ON
         -DENABLE_SHARED=OFF
         -DENABLE_PYTHON=ON
+        # zlib block compression, statically linked INTO libwiredtiger as a
+        # builtin extension (HAVE_BUILTIN_EXTENSION_ZLIB) so no runtime
+        # `extensions=` load is needed and `block_compressor=zlib` on a table
+        # create just works. Gated to non-Windows via ${WT_ZLIB_ARG} (below the
+        # ExternalProject) — libz ships on macOS and in the manylinux/musllinux
+        # images (self-contained), but not by default on Windows. Cuts the
+        # per-doc disk-write volume that bounds steady-state write throughput;
+        # mongod defaults to snappy, a follow-up can bundle that for the CPU win.
+        # (builtin-only — WT rejects ENABLE_ZLIB + HAVE_BUILTIN_EXTENSION_ZLIB
+        # together; the builtin flag both finds libz and statically links it.)
+        ${WT_ZLIB_ARG}
         # Belt-and-braces with BUILD_COMMAND below; ENABLE_CPPSUITE=OFF
         # also short-circuits the configure-time SWIG/Catch2 lookups.
         -DENABLE_CPPSUITE=OFF
