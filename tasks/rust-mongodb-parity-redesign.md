@@ -374,6 +374,225 @@ precise, exhaustively-narrowed diagnosis are the session's deliverables.
   prefix — so writers don't rendezvous on one page. That is the focused Phase-3
   work; the oplog-off ceiling (2.73× scaling) is what it can recover.
 
+## ⭐⭐ THE FIX: sharded oplog (2026-07-20) — recovers most of the gap
+
+The tractable single-table oplog tunings were all disproven; the fix is to **shard
+the oplog across N btrees** so concurrent writers don't rendezvous on one table's
+rightmost append page. Experiment: 16 write-shards (`secantus_oplog_sh{0..15}`,
+routed by `start_seq % 16`), read path unchanged (bench-only measurement). Measured
+(separate collections, 20s, unloaded):
+
+| writers | baseline (1 table) | **16-shard oplog** | oplog-off ceiling |
+|---|---|---|---|
+| 1 | 16k/s (1.00×) | **28.9k/s (1.00×)** | 46k |
+| 2 | 0.92× | **1.24×** | 1.18× |
+| 4 | 0.68× | **1.98×** | 1.94× |
+| 8 | **0.60×** | **2.47×** | 2.73× |
+
+Sharding recovers **single-writer 16k→28.9k (1.8×)** and **8-writer scaling
+0.60→2.47× (~4×)** — approaching the oplog-off ceiling and mongod's 4.55×. So the
+gap to mongod drops to ~3.8× single-writer / ~1.8× scaling: genuinely "approaching."
+(Single-writer improves too because one writer's consecutive batches rotate across
+shards → far less per-page append churn.)
+
+**Remaining work to ship it (the real Phase-3):** the read path must merge the N
+shards in seq order for every oplog reader — the tailable change-stream producer,
+`read_oplog`, `find_seq_for_ts`, `prune_oplog_inner`, recovery (`load_oplog_meta`),
+and PITR replay. A k-way merge by seq (each shard is seq-sorted; a doc's shard is
+`seq % N`, so a point lookup is O(1) too). Then validate against the FULL
+`test_mongo_server_concurrency` + change-stream suites (change streams must see
+every event, in order, with correct resume tokens across shards). This is
+correctness-critical but now clearly justified — the win is proven.
+
+## ⭐⭐⭐ RESULT (2026-07-20 PM): bounded prune — 1.77× single / 12.4× 8-writer (MEASURED)
+
+The bounded-prune fix landed and was measured **back-to-back on one machine**
+(baseline = main single-table + full-scan prune, new = sharded + bounded prune):
+
+| | baseline (main) | new (sharded + bounded prune) | improvement |
+|---|---|---|---|
+| 1 writer | 13,198/s | **23,424/s** | **1.77×** |
+| 8 writers (aggregate) | 3,533/s (0.27× scaling) | **43,617/s (1.86× scaling)** | **12.4×** |
+
+This REVERSES the earlier sharding-only tradeoff: single-writer is now *better*
+than baseline (not −20%), and 8-writer throughput is 12× higher. vs mongod:
+single-writer 0.10×→**0.21×**, scaling 0.06×→**0.41×** of mongod's 4.55×. The
+re-profile confirmed the mechanism: the prune scan (`__wt_btcur_next`) fell from
+46% of dispatch CPU to 11%; the write path is now dominated by `__wt_txn_commit`
++ `__wt_btcur_insert` (real write work). Correctness: 103 Rust-server
+integration tests (oplog/pitr/cross-server/change-stream/concurrency) + storage
+cargo suite + fmt/clippy green.
+
+Remaining to mongod: single-writer still ~4.7× off (now commit/journal-bound —
+`__wt_txn_commit` dominates), 8-writer scaling 1.86× vs 4.55×. Next levers:
+group-commit / journal batching (the commit cost), and the write-amplification /
+double-encode items below.
+
+## After the prune fix: the write path is LEAN — remaining gap is structural
+
+Post-bounded-prune profile + code audit of the single-writer insert path: no
+redundant work remains to cut cheaply.
+- `_id_` is a **virtual** index (never stored), so index-free collections have an
+  empty `descs` → `unique_conflict` and `write_index_entries` are no-ops. No
+  redundant `_id` uniqueness probe (the doc-table `overwrite=false` insert enforces
+  it).
+- `with_statement_txn` is clean (begin / run / commit / post-commit notify); the
+  batch `insert` already commits ONCE per `insertMany` (all docs in one WT txn), so
+  the commit is already amortised across the batch.
+- The hot costs are now inherent: `__wt_txn_commit` (2212) + `__wt_btcur_insert`
+  (1046) + WAL I/O (`__posix_file_write`/`__log_fs_write`/`__posix_file_sync` ~1947)
+  + `encode_doc` (595). `transaction_sync=(enabled=false)` already avoids a
+  per-commit fsync.
+
+**The one reducible structural item: write amplification = 4 WT writes/doc** — doc
+(1) + natural-order index (2: `secantus_natural` seq→id_key + `secantus_natural_seq`
+id_key→seq) + oplog (1). The 2 nat writes exist because docs are keyed by `id_key`
+(the `_id` sort key), NOT by insertion order — so a separate index carries
+`$natural` order + capped eviction, and its reverse map makes delete O(1).
+
+**Next major lever (Phase 5, LARGE — user-sanctioned): RecordId-keyed doc tables.**
+Key the doc table by a monotonic per-collection RecordId (insertion order) instead
+of `id_key`, add an `_id → RecordId` secondary index. Then `$natural` order is the
+doc-table order for free (drops BOTH nat tables), at the cost of one `_id`-index
+write: 4 → 3 writes/doc (~25% amplification cut → est. ~15-20% single-writer, to
+be MEASURED not projected). This is mongod's own catalog model. It's a big on-disk
+format change (re-key every doc, rewrite all `_id` lookups, a migration) + the
+Python mirror — a scoped standalone effort, not a tail-of-session change. The
+smaller alternative (splice the pre-encoded doc into the oplog `o` field to avoid
+the double encode) is only ~5% and risks the change-stream oplog format — poor
+risk/reward, skipped.
+
+## ⭐ PROFILE (2026-07-20 PM): the write-path bottleneck is the opportunistic PRUNE
+
+`sample` of a single-writer insert loop (scratchpad/profile_insert.sh, load 1.27 —
+clean) shows the worker thread's `run_dispatch → dispatch` spends **77% of its CPU
+inside `emit_oplog`** (10,575 / 13,776 samples), and within that the dominant leaf
+is **`__wt_btcur_next` — cursor iteration**, i.e. the every-1000-emits opportunistic
+prune scanning the WHOLE oplog. Not the oplog write, not `index_descs` (my earlier
+guess — WRONG), not the doc/nat writes. Profiling corrected the guess; this is why
+the plan mandates measurement over projection.
+
+The full-oplog prune scan is **pre-existing** (the single-table baseline does it too
+— which is why baseline single-writer is also low) but sharding made it worse (my
+prune materialized every blob via a 17-cursor merge + a full `seq→table` HashMap).
+
+**Fix (profile-justified, helps single-writer on BOTH servers):** maintain a live
+oplog entry count so the opportunistic prune doesn't walk the whole oplog:
+- Under cap and oldest entry in-window → prune is ONE ts read (early-out), not a
+  100k walk.
+- Over cap → walk only the bounded excess (`live_count - max_entries`), oldest-first.
+`live_count`: counted once on open, `+= n` per `emit_oplog` / import, `-= doomed`
+per prune. Correctness-gated by the prune cap/retention tests + authoritative
+recount on open. Being built now; push gated on the cooldown A/B.
+
+## Next lever: oplog PER-WRITE cost (the single-writer gap) — diagnosed, not yet built
+
+Sharding addressed *contention* (multi-writer) but not per-write *cost*, which is
+why single-writer stayed ~11-16k vs mongod's ~110k and the oplog-OFF A/B ceiling of
+46k. Reading `insert_one` (`crates/secantus-storage/src/lib.rs:2900`), each single
+insert with the oplog on does, under the collection lock:
+
+- **~4 WT writes**: doc table (1) + natural-order index (2: `secantus_natural` +
+  `secantus_natural_seq`) + oplog (1). mongod is ~2 (doc + oplog).
+- **~6 metadata cursor reads, every write**: `ensure_collection`, `is_timeseries`,
+  `index_descs` (a scan of the index table), `unique_conflict`, `maybe_mark_multikey`,
+  `collection_uuid`. These are catalog lookups that change only on DDL — mongod
+  caches them; we re-read them per insert.
+- **a double BSON encode of the document**: once as the doc-table value (`blob`),
+  again when `emit_oplog` re-encodes the whole entry whose `o` field IS that same
+  document.
+
+Concrete levers, each its own **measured** PR (biggest first), to run on a clean
+cool machine (this session's machine is thermally unmeasurable):
+1. **Per-(db,coll) catalog cache** — cache `index_descs` / `collection_uuid` /
+   `is_timeseries` / options, invalidated on create/drop/collMod/createIndexes.
+   Removes ~5 cursor reads per write. Highest-value, but correctness-sensitive
+   (stale-cache-after-DDL) → careful invalidation + its own test.
+2. **Splice the pre-encoded doc into the oplog entry** — build the oplog `o` value
+   from the already-encoded `blob` instead of re-encoding the moved `doc` (raw-BSON
+   write-path analogue of Phase 1's read splice). Helps large docs.
+3. **Natural-order de-amplification** — collapse the 2 nat-index writes toward 1
+   (or fold the reverse map), reducing write amplification 4→3.
+
+None of these are built. All need before/after `bench.concurrency` on an unloaded
+machine — the plan's #1 rule (measure, don't project) is why they are NOT being
+shipped blind here.
+
+## ⚠️ CORRECTION (2026-07-20 PM): honest back-to-back A/B — it's a TRADEOFF
+
+The earlier "single-writer 16k → 28.9k (1.8×)" headline **does not reproduce** and
+was a measurement artifact (cooler machine / short-run noise). A rigorous
+back-to-back A/B on ONE machine state (single-table baseline binary vs sharded
+binary, same run) gives:
+
+| | baseline (1 table) | sharded (16 btrees) | ratio |
+|---|---|---|---|
+| 1 writer | 13,525/s | 10,793/s | **0.80× — REGRESSION** |
+| 8 writers (total) | 55,000 | 92,000 | **1.67×** |
+| 8-writer scaling | 0.27× | 0.57× | improved |
+
+**Sharding is a tradeoff, not a pure win:** it relieves multi-writer append
+contention (8w throughput +67%, scaling 0.27→0.57×) but *hurts* single-writer ~20%
+— one writer has no contention to relieve, so sharding only adds routing overhead
+and scatters a batch's appends across several btrees instead of one cache-hot
+page. Whether it's worth shipping depends on the target workload (concurrent
+writers: yes; single-writer-dominated: no) — a **user decision**, not an
+autonomous one, especially given it's a correctness-critical on-disk format change.
+
+Caveat: the absolute numbers are thermally unreliable this session (baseline 8w
+scaling measured 0.60× earlier, 0.27× now). The RATIOS (back-to-back, same run)
+are the trustworthy signal; a clean cool-machine re-measure is still owed before
+any headline number is quoted.
+
+## Implementation status (2026-07-20): sharded oplog SHIPPED end-to-end
+
+The full sharded-oplog read path is implemented in **both** storage layers and
+green on the integrity suites:
+
+- **Rust** (`crates/secantus-storage/src/lib.rs`): **per-batch** write routing
+  (a whole `emit_oplog` batch → one shard by `start_seq % OPLOG_SHARDS`), a k-way
+  `read_oplog_shards` merge (shards + legacy table), and every reader converted —
+  `read_oplog`, `scan_max_oplog_seq`, `oplog_floor_seq`, `find_seq_for_ts`,
+  `prune_oplog_inner` (tagged merge → delete from each seq's exact table),
+  `load_oplog_meta` recovery, `archive_doomed_oplog` (probe all tables), and
+  `import_oplog_segment` (restore → one shard).
+  - **Per-batch, NOT per-entry — measured lesson.** The first cut routed per
+    *entry* (`seq % N`) for O(1) point-lookups; it *regressed* single-writer to
+    ~8.6k docs/s (below the 16k baseline) because scattering a 100-doc batch's
+    contiguous seqs across all 16 btrees destroys sequential-append locality.
+    Per-batch keeps each batch a contiguous append to one tree (locality) while
+    concurrent writers spread across trees (scaling). The cost — a seq's shard
+    isn't derivable from the seq — is paid by the k-way merge (ordered reads) and
+    all-table probes (rare point-ops); the prune uses the merge's shard tag to
+    still delete from exactly one table.
+- **Python** (`src/secantus/storage.py`): the sharded oplog is an **on-disk
+  format change**, so the Python server must READ/RECOVER/PRUNE a Rust-written
+  store for cross-server PITR/backup (`test_rust_pitr_cross_server`). Python
+  writes stay single-table (its global lock means sharding buys it nothing, and
+  Rust's merge already reads the legacy table), but every Python oplog *reader*
+  now merges shards + legacy (`_merge_oplog_on_session` + `_scan_max_oplog_seq` /
+  `oplog_floor_seq` / `find_seq_for_ts` / `_prune_oplog_locked` / `_load_oplog_meta`
+  / `_archive_doomed_oplog` / `_scan_oplog_entries`).
+
+**Two bugs found + fixed during validation** (both would have shipped silent data
+loss — exactly what the "this is a database" rule guards against):
+1. *Cross-server format*: sharding the Rust oplog broke `oplog_floor_seq()` on the
+   Python reader (it read the empty legacy table → "no oplog to replay"). Fixed by
+   making every Python reader shard-aware.
+2. *Overwrite-mode delete*: WT cursors are `overwrite=true`, so `remove()` of an
+   absent key returns Ok — the "delete from shard, else fall back to legacy" logic
+   never fell back, leaking pruned rows on a Python-written store. Fixed (both
+   servers) by deleting from **both** shard and legacy unconditionally.
+
+Gate status: Rust storage `cargo fmt`/`clippy`/`test` green (27 test binaries);
+`test_mongo_server_concurrency` (Rust concurrency + change-stream integrity),
+`test_rust_pitr_cross_server`, `test_pitr`, `test_oplog`, `test_change_streams`
+all green. The oplog **visibility-hole** race (a lower seq committing after a
+higher one is already visible) is unchanged in kind by sharding — the merge has
+identical snapshot semantics to the old single-table scan — and did not manifest
+under the concurrency suite; re-run repeatedly since sharding raises write
+parallelism.
+
 ## Success criteria (mirrors the mongod numbers we're chasing)
 - Write scaling on **distinct** collections: ≥ 2.5× at 4 writers, approaching
   mongod's ~4.1× at 8 (bounded by whatever Phase 1 shows WT can actually do here).
