@@ -450,6 +450,16 @@ These are explicit non-goals. Don't add them without a reason.
     holds the storage lock across its body with the `_closed` fence inside it,
     so `stop()`'s "close storage anyway" path is serialised against it as its
     comment claims. Neither is the leak.
+  - **SIXTH occurrence, on this very PR (#597), WITH the partial leak fix in
+    place** — `test (3.10, ubuntu-latest, 1)` again (same shard as #595), worker
+    `gw2` "Not properly terminated", rerun clean. The branch changes *only* test
+    fixtures, so this is another data point that the crash is not branch-related
+    — and it shows halving the leak (1.82 → 0.80 MB/test) does **not** on its own
+    stop the crash. That neither confirms nor refutes OOM: the residual growth is
+    still unbounded, so a long lane can still get there. To actually decide it,
+    the Linux run needs worker-RSS sampling and `dmesg` / "Killed process"
+    evidence — a single occurrence can't distinguish "OOM, still leaking enough"
+    from "not OOM at all".
 
 
 Subtler than the above; these may bite specific test suites.
