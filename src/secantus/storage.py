@@ -5033,6 +5033,19 @@ class Storage:
                 raise CreateIndexUnsupported(f"Unknown index plugin '{_spec_val}'")
         options = dict(options or {})
         with self._lock:
+            # An index build SCANS the doc table to lay down its entries, so it
+            # is a mutating scanner and needs the same snapshot refresh every
+            # other one takes (drop_index / drop_all_indexes /
+            # find_index_duplicates / prune_ttl / ...). Without it, this
+            # thread's cached WT session can hold an MVCC read snapshot that
+            # predates rows committed by OTHER connection threads — those docs
+            # are invisible to the scan, get no index entries, and the index
+            # silently under-reports them for the rest of its life while a
+            # collection scan still finds them. Building an index during
+            # concurrent writes is exactly when that happens (symptom:
+            # `test_index_build_under_write_load_stays_consistent` seeing
+            # index=38 vs scan=40 for a bucket).
+            self._refresh_read_snapshot()
             self._ensure_collection(db, coll)
             c = self._cursor(_IDX_TABLE)
             c.set_key(db, coll, name)
