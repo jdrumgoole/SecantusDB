@@ -450,6 +450,29 @@ These are explicit non-goals. Don't add them without a reason.
     holds the storage lock across its body with the `_closed` fence inside it,
     so `stop()`'s "close storage anyway" path is serialised against it as its
     comment claims. Neither is the leak.
+  - **THE "ws-changes" ATTRIBUTION IS WRONG — retitle this item.** PR #597's
+    second failure was `test-durable (3.10, ubuntu-latest, 4)`, and the CI split
+    is deterministic (`pytest-split --splits 4 --group N` off
+    `ci/durations/linux.json`). Reproduced locally: **all 113
+    `test_admin_skeleton.py` tests land in group 1**; groups 2/3/4 contain
+    **zero**. So that crash happened in a lane that never ran the admin tests or
+    the ws-changes test at all. The same is true of the FOURTH occurrence (#586,
+    `test (3.10, ubuntu-latest, 3)` → group 3, also zero admin tests). The
+    ws-changes name came from the first occurrence and was over-fitted; the real
+    signature is "a Linux xdist worker dies hard, in any lane". Check lane→group
+    membership before blaming a test again:
+    `pytest --splits 4 --group N --durations-path=ci/durations/linux.json
+    --collect-only -q | grep -c <file>`.
+  - **NO faulthandler dump is produced, and the diagnostic IS correctly wired.**
+    `test-durable` sets `SECANTUS_FAULTHANDLER_DIR` (workflow line ~768) and has
+    the prune+upload steps (~1087/1092), yet run 29858996357 uploaded
+    **0 artifacts**. `faulthandler` catches SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL
+    — so the worker is **not** dying of any of those. The remaining ways to die
+    with no dump are **SIGKILL (the OOM killer)** or an abrupt `_exit`. This is
+    the first *positive* discriminator the investigation has had, and it points
+    the same way as the measured leak. Still not proof — that needs `dmesg` /
+    "Killed process" or a worker-RSS trace — but the #590 diagnostic has now
+    returned a meaningful negative rather than nothing.
   - **SIXTH occurrence, on this very PR (#597), WITH the partial leak fix in
     place** — `test (3.10, ubuntu-latest, 1)` again (same shard as #595), worker
     `gw2` "Not properly terminated", rerun clean. The branch changes *only* test
