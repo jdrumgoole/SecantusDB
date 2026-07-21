@@ -181,7 +181,12 @@ jobs:
           # its stack before os._exit — is not discarded. That output is the
           # thing every previous occurrence lost.
           if [ "${{ inputs.mode }}" = "ws-single" ]; then
-            SELECT_ARGS="tests/test_admin_skeleton.py -p no:xdist -p no:randomly -v"
+            # `-n0`, NOT `-p no:xdist`: pyproject's addopts injects
+            # `-n auto --dist=loadgroup`, and disabling the plugin leaves those
+            # flags unparsed ("unrecognized arguments: -n --dist=loadgroup",
+            # pytest exit 4). This is called out verbatim in CLAUDE.md and cost
+            # a whole dispatch to rediscover.
+            SELECT_ARGS="tests/test_admin_skeleton.py -n0 -p no:randomly -v"
           else
             SELECT_ARGS="--splits 4 --group $group --durations-path=ci/durations/linux.json --randomly-seed=$seed --max-worker-restart=0"
           fi
@@ -270,8 +275,15 @@ jobs:
             # (Learned the hard way: run 29872332151 died in milliseconds with
             # "Failed to find executable uv" on all three attempts and the job
             # still went green saying "Not reproduced in 3 attempts".)
-            if ! grep -qE "test session starts|passed|failed|error" "$log"; then
-              echo "::error::attempt $attempt never started pytest (exit $rc) — harness failure, not a negative result"
+            # Require the session header specifically, and reject pytest's
+            # own "did not run" exit codes: 4 = usage error, 5 = no tests
+            # collected. The previous guard matched the bare word "error",
+            # which a usage error's own message contains — so a run that
+            # never collected a test still reported "Not reproduced". That is
+            # the second time this harness produced a false negative; the
+            # check now keys on positive evidence that tests actually ran.
+            if ! grep -q "test session starts" "$log" || [ "$rc" = "4" ] || [ "$rc" = "5" ]; then
+              echo "::error::attempt $attempt never ran tests (exit $rc) — harness failure, NOT a negative result"
               echo "--- attempt log ---"
               cat "$log"
               exit 1
