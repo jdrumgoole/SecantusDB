@@ -318,27 +318,67 @@ These are explicit non-goals. Don't add them without a reason.
   another calls `stream.close()` after a 50 ms head start — 500 rounds under 12
   background CPU burners; trivial to re-create on a Linux box to attempt the
   repro there.)
-  **MITIGATION APPLIED — PR #588 (branch `ws-changes-disconnect`), NOT yet
-  confirmed on CI.** The two defects the 2026-07-21 investigation confirmed by
-  code reading (no `max_await_time_ms`, and `close()` racing an in-flight
-  `try_next` on a non-thread-safe pymongo `ChangeStream`) are now both fixed in
-  `changestream.py`: (a) `watch(max_await_time_ms=500)` bounds every poll so an
-  orphaned `to_thread` frees within ~0.5s; (b) each `try_next` poll races a
-  `_wait_for_disconnect` watcher so a *quiet* stream notices a gone client
-  immediately (the old loop only detected disconnect on the next `send`, so a
-  quiet-then-closed stream looped until app shutdown); and (c) on disconnect the
-  in-flight poll is **awaited to completion** before the `finally` closes the
-  stream, so `try_next` and `close` never overlap (removing the concurrency
-  race). This is the fix that investigation called "correct on its own merits";
-  it is applied here because it is a genuine correctness fix regardless of the CI
-  crash — but per the "do NOT blind-apply, needs a repro" note it remains **not
-  proven** to kill the Linux crash (never reproduced locally / on macOS — 6×
-  parallel local runs stayed clean). Validated by reasoning + a new
-  quiet-disconnect regression test
-  (`test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy`). **Keep
-  this item open** and watch the durable/test lanes; if it recurs, the CI-only
-  per-worker `faulthandler` artifact the investigation proposed is still the
-  next step to name the culprit.
+  **MITIGATION MERGED — PR #588 (commit `f7c953b7`).** The two defects the
+  2026-07-21 investigation confirmed by code reading (no `max_await_time_ms`,
+  and `close()` racing an in-flight `try_next` on a non-thread-safe pymongo
+  `ChangeStream`) are both fixed in `changestream.py`: (a)
+  `watch(max_await_time_ms=500)` bounds every poll so an orphaned `to_thread`
+  frees within ~0.5s; (b) each `try_next` poll races a `_wait_for_disconnect`
+  watcher so a *quiet* stream notices a gone client immediately (the old loop
+  only detected disconnect on the next `send`, so a quiet-then-closed stream
+  looped until app shutdown); and (c) on disconnect the in-flight poll is
+  **awaited to completion** before the `finally` closes the stream, so
+  `try_next` and `close` never overlap (removing the concurrency race). These
+  are genuine correctness fixes — but they are **NOT the crash's cause.**
+
+  **DECISIVE NEW EVIDENCE (2026-07-21): the crash RECURRED on #588's own CI
+  with the full mitigation in place** — `test-durable (3.10, ubuntu-latest, 1)`
+  had *two* workers (`gw0`, `gw3`) go down "Not properly terminated", exit 70,
+  no test-failure names (rerun passed clean). So the admin-side defects #588
+  fixed are conclusively **ruled out** as the cause. Combined with the crash
+  recurring on branches that never touch `changestream.py` (#451/#456/#468/#586),
+  the real cause is server-/harness-side, not the admin ws tail. **Item stays
+  open; root-cause work below.**
+
+  ### Root-cause work — the real remaining fix (OPEN)
+
+  Signature is always the same: one or more Linux xdist workers "node down: Not
+  properly terminated" (a hard native process death — segfault / abort /
+  WT_PANIC whose stderr xdist discards), late in the lane, siblings then stall.
+  It does **not** reproduce on macOS (this dev box): 6× parallel ws-test runs +
+  a two-thread `try_next`/`close` harness under 12 CPU burners all stay clean.
+  Concrete next steps, in order:
+
+  1. **Get the faulting stack — the diagnostic is now armed (#590).** Per-worker
+     `faulthandler` output is captured as a CI artifact (pytest/xdist drop the
+     crashed worker's stderr on "node down", which is why every prior dump —
+     `pytest_testnodedown` — only carried bystander controller/execnet threads
+     and named no culprit). The next Linux occurrence should upload the *faulting
+     worker's own* C/Python stack. **Do not attempt another speculative fix
+     before a real stack exists** — the "do NOT blind-apply, needs a repro" note
+     has now been vindicated twice.
+  2. **Prime suspect — server-side WT teardown racing a parked `getMore`.** Same
+     "node down" signature and late timing as two already-fixed crashes: the
+     unclosed-`Storage` fd/RSS leak (#563, the resolved macOS 6-hour hang below)
+     and the 0.5.3b5 `SecantusDBServer.stop()` use-after-free. Both are fixed and
+     this recurs *after* them, so it is a **distinct residual**. Hypothesis: the
+     ws test's `server` fixture (a `SecantusDBServer`) tears down while the admin
+     UI's *separate* `MongoClient` still has a change-stream `getMore` parked on
+     that server's oplog condvar; if `stop()`'s drain doesn't wake/await *that*
+     parked getMore under Linux load, a connection thread touches WiredTiger
+     after close → native crash. Audit `SecantusDBServer.stop()` /
+     `Storage.signal_shutdown` against the admin ws teardown path; check whether
+     the admin `MongoClient` is closed *before* the server fixture stops (the
+     `app` fixture's `app.state.mongo.close()` ordering vs the `server` fixture
+     teardown).
+  3. **Also re-audit for the #563 leak class specifically on the ws/admin path.**
+     #563 fixed three fixtures; confirm no admin/ws fixture (or the embedded
+     `SecantusDBServer` the ws tests spin up) leaks a `Storage`/client/fd under
+     the durable lane, which is where the recurrence landed.
+  4. **Reproduce on Linux.** Run `tests/test_admin_skeleton.py` alone, `-n auto`,
+     under 12+ CPU burners on a Linux host, `SECANTUS_FORCE_DURABLE=1`, low
+     `--max-worker-restart`, with the #590 faulthandler artifact armed. A crash
+     there with a real stack closes the investigation; only then apply a fix.
 
 
 Subtler than the above; these may bite specific test suites.
