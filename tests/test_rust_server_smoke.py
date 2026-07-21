@@ -2211,3 +2211,37 @@ def test_bucket_auto_granularity_against_rust_server(tmp_path) -> None:
             )
     finally:
         srv.stop()
+
+
+def test_multikey_dotted_array_index_against_rust_server(tmp_path) -> None:
+    """An index on a dotted path *into* an array of subdocuments must return
+    the enclosing document from an index scan, report `isMultiKey` in explain,
+    and keep the internal flag off `listIndexes` — same contract the Python
+    server holds (tests/test_multikey_index_{find,metadata}.py), probed against
+    mongod 6.0.16.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        coll = _client(srv)["t"]["wine_prices"]
+        owner = bson.ObjectId()
+        coll.insert_one(
+            {"prices": [{"owner_id": bson.ObjectId()}, {"owner_id": owner, "price": 10.0}]}
+        )
+        coll.create_index([("prices.owner_id", 1)], name="prices_owner_id")
+
+        assert len(list(coll.find({"prices.owner_id": owner}))) == 1
+        assert len(list(coll.find({"prices.owner_id": {"$in": [owner]}}))) == 1
+
+        ix = next(i for i in coll.list_indexes() if i["name"] == "prices_owner_id")
+        assert dict(ix) == {
+            "v": 2,
+            "key": {"prices.owner_id": 1},
+            "name": "prices_owner_id",
+        }
+
+        winning = coll.find({"prices.owner_id": owner}).explain()["queryPlanner"]["winningPlan"]
+        ixscan = winning if winning["stage"] == "IXSCAN" else winning.get("inputStage", {})
+        assert ixscan.get("stage") == "IXSCAN"
+        assert ixscan.get("isMultiKey") is True
+    finally:
+        srv.stop()

@@ -46,6 +46,61 @@ pub fn has_path(doc: &Document, path: &str) -> bool {
     get_path(doc, path).is_some()
 }
 
+/// Every value reachable at `path`, descending into arrays, plus whether any
+/// component was resolved by walking array elements.
+///
+/// MongoDB's index-key generation walks a dotted path *through* an array:
+/// `prices.owner` over `{"prices": [{"owner": 1}, {"owner": 2}]}` yields
+/// `[1, 2]`, and the covering index is multikey. `get_path` deliberately
+/// doesn't do this (it reads a numeric component as a positional index), which
+/// is right for `$set` / projection and wrong for index keys.
+/// Mirrors `secantus.paths.get_path_values`.
+pub fn get_path_values<'a>(doc: &'a Document, path: &str) -> (Vec<&'a Bson>, bool) {
+    let mut current: Vec<&Bson> = Vec::new();
+    let mut descended = false;
+    let mut first = true;
+    for part in path.split('.') {
+        let mut next: Vec<&Bson> = Vec::new();
+        if first {
+            if let Some(v) = doc.get(part) {
+                next.push(v);
+            }
+            first = false;
+        } else {
+            for cur in &current {
+                match cur {
+                    Bson::Document(d) => {
+                        if let Some(v) = d.get(part) {
+                            next.push(v);
+                        }
+                    }
+                    Bson::Array(arr) => {
+                        descended = true;
+                        if is_digits(part) {
+                            if let Some(v) = part.parse::<usize>().ok().and_then(|i| arr.get(i)) {
+                                next.push(v);
+                            }
+                        }
+                        // mongod matches the component against each element
+                        // too, so `a.0` finds both the positional element and
+                        // any element carrying a literal "0" key.
+                        for elem in arr {
+                            if let Bson::Document(d) = elem {
+                                if let Some(v) = d.get(part) {
+                                    next.push(v);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        current = next;
+    }
+    (current, descended)
+}
+
 /// Hard cap on a numeric path index that would grow a list (mirrors
 /// `secantus.paths._MAX_LIST_GROW_INDEX`). Exceeding it is `Err(())` so callers
 /// can defer to Python (which raises `PathError`).

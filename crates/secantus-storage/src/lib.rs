@@ -32,9 +32,9 @@ use s2::rect::Rect;
 use s2::region::RegionCoverer;
 use secantus_core::collation::Collation;
 use secantus_core::diff::compute_update_description;
-use secantus_core::get_path;
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP};
+use secantus_core::{get_path, get_path_values};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
 pub mod changestreams;
@@ -183,6 +183,10 @@ fn migrate_legacy_docs(session: &Session) -> Result<()> {
 
 const IDX_TABLE: &str = "table:secantus_indexes";
 const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
+
+/// Ceiling on the number of keys one doc may contribute to a compound index
+/// when more than one indexed field is array-valued (the cartesian product).
+const MAX_COMPOUND_KEYS: usize = 10_000;
 
 // Natural-order (insertion) index. mongod returns an unsorted `find()` in
 // insertion (storage / RecordId) order, which equals `_id` order only for
@@ -1074,12 +1078,44 @@ fn compound_join(parts: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-/// True if any field of `key_spec` resolves to an array value in `doc` — the
-/// signal that marks an index multikey. Mirrors `storage._doc_makes_multikey`.
+/// Candidate index values for `field` in `doc`, plus whether the field makes
+/// the index multikey. Mirrors mongod's key generation: a scalar leaf gives
+/// itself; an array leaf gives one value per element *plus* the whole array
+/// (the key a whole-array equality probes); a path descending *through* an
+/// array — `prices.owner_id` over an array of subdocuments — gives one value
+/// per element's leaf and no whole-array key. A missing path indexes as null.
+/// Mirrors `storage._index_field_values`.
+fn index_field_values(doc: &Document, field: &str) -> (Vec<Bson>, bool) {
+    let (values, descended) = get_path_values(doc, field);
+    if values.is_empty() {
+        return (vec![Bson::Null], descended);
+    }
+    let mut out: Vec<Bson> = Vec::new();
+    let mut multikey = descended;
+    for v in values {
+        if let Bson::Array(arr) = v {
+            multikey = true;
+            out.extend(arr.iter().cloned());
+            out.push(v.clone());
+        } else {
+            out.push(v.clone());
+        }
+    }
+    (out, multikey)
+}
+
+/// `has_path` that descends into arrays — the sparse-index gate. A sparse index
+/// must cover `{"prices": [{"owner": x}]}` for the path `prices.owner`, which
+/// plain `has_path` reports as missing. Mirrors `storage._index_field_exists`.
+fn index_field_exists(doc: &Document, field: &str) -> bool {
+    !get_path_values(doc, field).0.is_empty()
+}
+
+/// True if any field of `key_spec` is array-valued in `doc` — either an array
+/// leaf or a dotted path descending through an array. That's the signal that
+/// marks an index multikey. Mirrors `storage._doc_makes_multikey`.
 fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
-    key_spec
-        .keys()
-        .any(|f| matches!(get_path(doc, f), Some(Bson::Array(_))))
+    key_spec.keys().any(|f| index_field_values(doc, f).1)
 }
 
 /// All byte-keys `doc` contributes to an index under `key_spec`. Scalars give
@@ -1094,28 +1130,29 @@ fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Resu
         .map(|(k, v)| (k, direction_of(v).unwrap_or(1)))
         .collect();
 
-    if sparse && fields.iter().any(|(f, _)| get_path(doc, f).is_none()) {
+    if sparse && fields.iter().any(|(f, _)| !index_field_exists(doc, f)) {
         return Ok(Vec::new());
     }
 
-    // Per-field candidate values: scalars -> [val]; arrays -> [uniq elems..., whole_array].
+    // Per-field candidate values (see `index_field_values`), deduped on their
+    // encoded bytes so a repeated array element doesn't inflate the compound
+    // cartesian product below.
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(fields.len());
     for (f, d) in &fields {
-        let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
-        if let Bson::Array(arr) = &v {
-            let mut seen: HashSet<Vec<u8>> = HashSet::new();
-            let mut uniq: Vec<Bson> = Vec::new();
-            for elem in arr {
-                let eb = enc_dir(elem, *d)?;
-                if seen.insert(eb) {
-                    uniq.push(elem.clone());
-                }
-            }
-            uniq.push(v.clone()); // whole-array key
-            per_field.push(uniq);
-        } else {
-            per_field.push(vec![v]);
+        let (cands, _multikey) = index_field_values(doc, f);
+        if cands.len() == 1 {
+            per_field.push(cands);
+            continue;
         }
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut uniq: Vec<Bson> = Vec::new();
+        for cand in cands {
+            let eb = enc_dir(&cand, *d)?;
+            if seen.insert(eb) {
+                uniq.push(cand);
+            }
+        }
+        per_field.push(uniq);
     }
 
     if fields.len() == 1 {
@@ -1132,10 +1169,9 @@ fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Resu
     }
 
     // Compound: cartesian product across the per-field candidate lists.
-    // Cap the product size to avoid exponential blowup when multiple fields are
-    // array-valued (real mongod rejects compound multikey on >1 array field;
-    // we accept it but bound the work).
-    const MAX_COMPOUND_KEYS: usize = 10_000;
+    // Capped at MAX_COMPOUND_KEYS to avoid exponential blowup when multiple
+    // fields are array-valued (real mongod rejects compound multikey on >1
+    // array field; we accept it but bound the work).
     let mut combos: Vec<Vec<&Bson>> = vec![Vec::new()];
     for cand in &per_field {
         let new_size = combos.len().saturating_mul(cand.len());
@@ -1175,28 +1211,72 @@ fn is_regex_value(v: &Bson) -> bool {
     matches!(v, Bson::RegularExpression(_))
 }
 
-/// The single canonical byte-key for `doc` under `key_spec` — one per doc
-/// regardless of array shape (array fields encode the whole array). Used by the
-/// uniqueness probe. `None` for a `sparse` index when any indexed field is
-/// missing. Mirrors `storage._index_key`.
-fn index_key(doc: &Document, key_spec: &Document, sparse: bool) -> Result<Option<Vec<u8>>> {
-    if sparse && key_spec.keys().any(|f| get_path(doc, f).is_none()) {
-        return Ok(None);
-    }
+// There is deliberately no `index_key` (canonical one-key-per-doc) helper here:
+// every caller — the uniqueness probe, the create-index pre-check, the
+// duplicate finder — works off `index_key_variants`, because a doc with an
+// array on an indexed path contributes several keys and mongod's rule is "no
+// two docs share any generated key". Python keeps `_index_key` only for
+// encoding synthetic min/max bound specs, which have no array shape.
+
+/// Per-field values behind the entry `kb` — the `keyValue` of a dup-key error.
+/// A multikey doc contributes several keys, so the conflicting one isn't
+/// necessarily what `get_path` returns for the field (for a path descending
+/// through an array it never is). Re-walks the candidate values to find the
+/// combination that encodes to `kb`, falling back to `get_path` if none does.
+/// Only called once a duplicate has been found, so the walk costs nothing on
+/// the happy path. Mirrors `storage._conflict_key_value`.
+fn conflict_key_value(doc: &Document, key_spec: &Document, kb: &[u8]) -> Document {
     let fields: Vec<(&String, i32)> = key_spec
         .iter()
         .map(|(k, v)| (k, direction_of(v).unwrap_or(1)))
         .collect();
-    if fields.len() == 1 {
-        let v = get_path(doc, fields[0].0).cloned().unwrap_or(Bson::Null);
-        return Ok(Some(enc_dir(&v, fields[0].1)?));
+    let per_field: Vec<Vec<Bson>> = fields
+        .iter()
+        .map(|(f, _)| index_field_values(doc, f).0)
+        .collect();
+    let combos = per_field.iter().try_fold(1usize, |acc, c| {
+        acc.checked_mul(c.len()).filter(|n| *n <= MAX_COMPOUND_KEYS)
+    });
+    if combos.is_some() {
+        let mut idx = vec![0usize; fields.len()];
+        'outer: loop {
+            let mut parts: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+            for (i, (_, d)) in fields.iter().enumerate() {
+                match enc_dir(&per_field[i][idx[i]], *d) {
+                    Ok(b) => parts.push(b),
+                    Err(_) => break,
+                }
+            }
+            if parts.len() == fields.len() {
+                let cand = if fields.len() == 1 {
+                    parts.remove(0)
+                } else {
+                    compound_join(&parts)
+                };
+                if cand == kb {
+                    let mut out = Document::new();
+                    for (i, (f, _)) in fields.iter().enumerate() {
+                        out.insert((*f).clone(), per_field[i][idx[i]].clone());
+                    }
+                    return out;
+                }
+            }
+            // Odometer over the per-field candidate lists.
+            for i in (0..fields.len()).rev() {
+                idx[i] += 1;
+                if idx[i] < per_field[i].len() {
+                    continue 'outer;
+                }
+                idx[i] = 0;
+            }
+            break;
+        }
     }
-    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
-    for (f, d) in &fields {
-        let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
-        parts.push(enc_dir(&v, *d)?);
+    let mut out = Document::new();
+    for f in key_spec.keys() {
+        out.insert(f.clone(), get_path(doc, f).cloned().unwrap_or(Bson::Null));
     }
-    Ok(Some(compound_join(&parts)))
+    out
 }
 
 /// Flip a range operator for a DESC field (whose stored bytes are inverted, so
@@ -4312,27 +4392,19 @@ impl Storage {
                 if !multikey && doc_makes_multikey(&d, key_spec) {
                     multikey = true;
                 }
-                if unique {
-                    if let Some(canonical) = index_key(&d, key_spec, sparse)? {
-                        if !seen.insert(canonical) {
-                            // A pre-existing doc already holds this key — can't
-                            // build a unique index over the data.
-                            let mut key_value = Document::new();
-                            for f in key_spec.keys() {
-                                key_value.insert(
-                                    f.clone(),
-                                    get_path(&d, f).cloned().unwrap_or(Bson::Null),
-                                );
-                            }
-                            return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
-                                index: name.to_string(),
-                                key_pattern: key_spec.clone(),
-                                key_value,
-                            })));
-                        }
-                    }
-                }
                 for kb in index_key_variants(&d, key_spec, sparse)? {
+                    // Uniqueness is checked against the same key variants the
+                    // entries are built from — mongod's unique-multikey rule is
+                    // "no two docs share any generated key".
+                    if unique && !seen.insert(kb.clone()) {
+                        // A pre-existing doc already holds this key — can't
+                        // build a unique index over the data.
+                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
+                            index: name.to_string(),
+                            key_pattern: key_spec.clone(),
+                            key_value: conflict_key_value(&d, key_spec, &kb),
+                        })));
+                    }
                     entries.push((kb, id_k.clone()));
                 }
             }
@@ -4419,6 +4491,25 @@ impl Storage {
                 .cmp(b.get_str("name").unwrap_or(""))
         });
         Ok(out)
+    }
+
+    /// The sticky multikey flag for index `name` (false if unknown). The `_id`
+    /// index can never be multikey — the write path rejects an array `_id`.
+    /// Mirrors `storage.index_is_multikey`.
+    pub fn index_is_multikey(&self, db: &str, coll: &str, name: &str) -> bool {
+        if name == ID_INDEX_NAME {
+            return false;
+        }
+        // Lock-free read (see the `lock` field's invariants).
+        let Ok(session) = self.conn.open_session() else {
+            return false;
+        };
+        let Ok(indexes) = self.iter_indexes(&session, db, coll) else {
+            return false;
+        };
+        indexes
+            .into_iter()
+            .any(|(n, _key_spec, opts)| n == name && opts.get_bool("multikey").unwrap_or(false))
     }
 
     /// Retune a TTL index's `expireAfterSeconds` option, resolving the index by
@@ -4518,16 +4609,17 @@ impl Storage {
         let mut groups: Vec<Vec<Bson>> = Vec::new();
         for (_id_k, blob) in self.scan_docs(&session, db, coll)? {
             let doc = decode_doc(&blob)?;
-            let kb = match index_key(&doc, &desc.key_spec, desc.sparse)? {
-                Some(k) => k,
-                None => continue, // sparse: missing key isn't a duplicate
-            };
             let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-            match index_of.get(&kb) {
-                Some(&i) => groups[i].push(id),
-                None => {
-                    index_of.insert(kb, groups.len());
-                    groups.push(vec![id]);
+            // Grouped over every key the doc contributes (sparse: none),
+            // matching what `unique_conflict` would refuse — on a multikey
+            // index two docs collide as soon as they share one generated key.
+            for kb in index_key_variants(&doc, &desc.key_spec, desc.sparse)? {
+                match index_of.get(&kb) {
+                    Some(&i) => groups[i].push(id.clone()),
+                    None => {
+                        index_of.insert(kb, groups.len());
+                        groups.push(vec![id.clone()]);
+                    }
                 }
             }
         }
@@ -5266,9 +5358,13 @@ impl Storage {
     }
 
     /// The first unique-index violation `candidate` would cause, or `None`.
-    /// Probes the entries table for an existing row with the same canonical key
-    /// belonging to a *different* doc (`exclude_id_key` skips the candidate's own
-    /// row, for replace/update). Mirrors `storage._unique_conflict`.
+    /// Probes the entries table for an existing row sharing *any* key the
+    /// candidate generates and belonging to a *different* doc (`exclude_id_key`
+    /// skips the candidate's own row, for replace/update). Every key, not just
+    /// the canonical one: on a multikey index mongod's rule is "no two docs
+    /// share a generated key", and for a path descending through an array the
+    /// canonical key isn't among the entries at all.
+    /// Mirrors `storage._unique_conflict`.
     fn unique_conflict(
         &self,
         session: &Session,
@@ -5285,51 +5381,42 @@ impl Storage {
             if (!desc.unique && !desc.prepare_unique) || !self.doc_in_partial(candidate, desc)? {
                 continue;
             }
-            let kb = match index_key(candidate, &desc.key_spec, desc.sparse)? {
-                Some(k) => k,
-                None => continue,
-            };
-            let esc_kb = escape_kb(&kb);
-            let mut seed = esc_kb.clone();
-            seed.extend_from_slice(ENTRY_SEP);
-            cur.reset()?;
-            cur.set_key_sssu(db, coll, &desc.name, &seed);
-            let mut more = match cur.search_near() {
-                Ok(cmp) => {
-                    if cmp < 0 {
-                        cur.next()?
-                    } else {
-                        true
+            for kb in index_key_variants(candidate, &desc.key_spec, desc.sparse)? {
+                let esc_kb = escape_kb(&kb);
+                let mut seed = esc_kb.clone();
+                seed.extend_from_slice(ENTRY_SEP);
+                cur.reset()?;
+                cur.set_key_sssu(db, coll, &desc.name, &seed);
+                let mut more = match cur.search_near() {
+                    Ok(cmp) => {
+                        if cmp < 0 {
+                            cur.next()?
+                        } else {
+                            true
+                        }
                     }
-                }
-                Err(e) if e.is_not_found() => continue,
-                Err(e) => return Err(e.into()),
-            };
-            while more {
-                let (d, c, n, packed) = cur.get_key_sssu()?;
-                if d != db || c != coll || n != desc.name {
-                    break;
-                }
-                let (row_esc, row_id) = unpack_entry(&packed);
-                if row_esc != esc_kb.as_slice() {
-                    break;
-                }
-                let is_self = exclude_id_key == Some(row_id);
-                if !is_self {
-                    let mut key_value = Document::new();
-                    for f in desc.key_spec.keys() {
-                        key_value.insert(
-                            f.clone(),
-                            get_path(candidate, f).cloned().unwrap_or(Bson::Null),
-                        );
+                    Err(e) if e.is_not_found() => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                while more {
+                    let (d, c, n, packed) = cur.get_key_sssu()?;
+                    if d != db || c != coll || n != desc.name {
+                        break;
                     }
-                    return Ok(Some(UniqueConflict {
-                        index: desc.name.clone(),
-                        key_pattern: desc.key_spec.clone(),
-                        key_value,
-                    }));
+                    let (row_esc, row_id) = unpack_entry(&packed);
+                    if row_esc != esc_kb.as_slice() {
+                        break;
+                    }
+                    let is_self = exclude_id_key == Some(row_id);
+                    if !is_self {
+                        return Ok(Some(UniqueConflict {
+                            index: desc.name.clone(),
+                            key_pattern: desc.key_spec.clone(),
+                            key_value: conflict_key_value(candidate, &desc.key_spec, &kb),
+                        }));
+                    }
+                    more = cur.next()?;
                 }
-                more = cur.next()?;
             }
         }
         Ok(None)

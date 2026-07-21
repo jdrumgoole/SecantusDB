@@ -592,8 +592,10 @@ async def test_indexes_page_lists_with_badges(server, http: AsyncClient) -> None
     assert "tags_1" in r.text
     assert "created_1" in r.text
     assert "unique" in r.text
-    assert "multikey" in r.text
     assert "partial" in r.text
+    # No multikey badge — the flag isn't wire-visible on mongod, and the
+    # console renders only what ``listIndexes`` reports.
+    assert "multikey" not in r.text
     # _id_ row has no Drop button.
     assert "indexes/_id_/drop-confirm" not in r.text
 

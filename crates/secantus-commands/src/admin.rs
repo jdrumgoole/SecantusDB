@@ -401,6 +401,10 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "indexName": index_name,
             "keyPattern": plan.get_document("keyPattern").cloned().unwrap_or_default(),
             "direction": plan.get_str("direction").unwrap_or("forward"),
+            // mongod always reports whether the scanned index is multikey;
+            // planners (Compass, aggregation optimisers) read it to decide
+            // what the index can be trusted for.
+            "isMultiKey": plan.get_bool("multikey").unwrap_or(false),
         };
         // mongod flags an IXSCAN over a partial index with `isPartial`.
         if !coll.is_empty() {
@@ -783,6 +787,13 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("ns does not exist: {}.{}", ctx.db_name, coll),
         )
         .into_reply());
+    }
+    // `multikey` is SecantusDB's internal catalog flag. mongod keeps the
+    // equivalent in the durable catalog and never echoes it from `listIndexes`
+    // (probed 6.0.16) — drivers see it only as explain's `isMultiKey`. Keep it
+    // off the wire. Mirrors commands.py.
+    for ix in &mut indexes {
+        ix.remove("multikey");
     }
     // A clustered collection's clustering key IS its index: mongod reports a
     // single entry carrying `clustered: true` (with the user's name) in place of

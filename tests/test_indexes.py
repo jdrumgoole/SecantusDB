@@ -1250,6 +1250,7 @@ def test_explain_plan_single_field_eq_uses_index(storage: Storage) -> None:
     plan = storage.explain_plan("db", "c", {"x": 5})
     assert plan == {
         "kind": "IXSCAN",
+        "multikey": False,
         "index_name": "x_1",
         "key_pattern": {"x": 1},
         "direction": "forward",
@@ -1282,6 +1283,8 @@ def test_exists_true_uses_sparse_index(storage: Storage) -> None:
     plan = storage.explain_plan("db", "c", {"f": {"$exists": True}})
     assert plan == {
         "kind": "IXSCAN",
+        # _id 4 holds an array on ``f``, so the index is multikey.
+        "multikey": True,
         "index_name": "f_1",
         "key_pattern": {"f": 1},
         "direction": "forward",
@@ -1315,6 +1318,7 @@ def test_explain_plan_compound_eq_uses_compound_index(storage: Storage) -> None:
     plan = storage.explain_plan("db", "c", {"a": 1, "b": 2})
     assert plan == {
         "kind": "IXSCAN",
+        "multikey": False,
         "index_name": "ab_1",
         "key_pattern": {"a": 1, "b": 1},
         "direction": "forward",
@@ -1347,6 +1351,7 @@ def test_explain_plan_hint_by_name(storage: Storage) -> None:
     plan = storage.explain_plan("db", "c", {}, hint="x_1")
     assert plan == {
         "kind": "IXSCAN",
+        "multikey": False,
         "index_name": "x_1",
         "key_pattern": {"x": 1},
         "direction": "forward",
@@ -1369,6 +1374,7 @@ def test_explain_plan_hint_id_index(storage: Storage) -> None:
     plan = storage.explain_plan("db", "c", {}, hint="_id_")
     assert plan == {
         "kind": "IXSCAN",
+        "multikey": False,
         "index_name": "_id_",
         "key_pattern": {"_id": 1},
         "direction": "forward",
@@ -1380,6 +1386,7 @@ def test_explain_plan_sort_no_filter_uses_index(storage: Storage) -> None:
     plan = storage.explain_plan("db", "c", {}, sort={"x": 1})
     assert plan == {
         "kind": "IXSCAN",
+        "multikey": False,
         "index_name": "x_1",
         "key_pattern": {"x": 1},
         "direction": "forward",

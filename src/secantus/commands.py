@@ -1798,6 +1798,10 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "indexName": plan["index_name"],
             "keyPattern": plan["key_pattern"],
             "direction": plan["direction"],
+            # mongod always reports whether the scanned index is multikey;
+            # planners (Compass, aggregation optimisers) read it to decide
+            # what the index can be trusted for.
+            "isMultiKey": bool(plan.get("multikey")),
         }
         # mongod flags an IXSCAN over a partial index with ``isPartial``.
         if coll:
@@ -3396,6 +3400,11 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 26,
             "codeName": "NamespaceNotFound",
         }
+    # ``multikey`` is SecantusDB's internal catalog flag. mongod keeps the
+    # equivalent in the durable catalog and never echoes it from
+    # ``listIndexes`` (probed 6.0.16) — drivers see it only as explain's
+    # ``isMultiKey``. Keep it off the wire.
+    indexes = [{k: v for k, v in ix.items() if k != "multikey"} for ix in indexes]
     # A clustered collection has no separate ``_id_`` index — the
     # clustering key IS the index. mongod reports a single entry for it
     # carrying ``clustered: true`` (and the user's name / unique).
