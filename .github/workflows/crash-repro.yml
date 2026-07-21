@@ -147,6 +147,13 @@ jobs:
           seed="${{ github.run_id }}"
           [ "${{ inputs.durable }}" = "true" ] && export SECANTUS_FORCE_DURABLE=1
 
+          # Absolute interpreter path — see the systemd-run comment below.
+          PYBIN="$PWD/.venv/bin/python"
+          if [ ! -x "$PYBIN" ]; then
+            echo "::error::no venv interpreter at $PYBIN — uv sync did not produce one"
+            exit 1
+          fi
+
           # Kernel ring buffer is the OOM killer's own record. Snapshot the
           # start offset so the post-run diff is just this job's kills.
           sudo dmesg -c > /dev/null 2>&1 || true
@@ -182,13 +189,19 @@ jobs:
               # A scope gives the whole pytest tree one shared MemoryMax, so the
               # kernel OOM-kills inside it exactly as it would under real memory
               # pressure — the controlled version of the CI symptom.
+              #
+              # Invoke the venv interpreter by ABSOLUTE PATH, not `uv run`:
+              # `sudo` resets PATH, so `uv` is not found inside the scope (the
+              # first attempt at this failed all three runs in milliseconds with
+              # "Failed to find executable uv" and still reported "not
+              # reproduced"). $PYBIN needs no PATH and no uv re-resolution.
               sudo systemd-run --scope --quiet \
                 -p MemoryMax="$memmax" -p MemorySwapMax=0 \
+                --working-directory="$PWD" \
                 --setenv=SECANTUS_FORCE_DURABLE="${SECANTUS_FORCE_DURABLE:-}" \
                 --setenv=SECANTUS_FAULTHANDLER_DIR="$SECANTUS_FAULTHANDLER_DIR" \
                 --setenv=SECANTUS_POST_CRASH_SECONDS="$SECANTUS_POST_CRASH_SECONDS" \
-                --setenv=UV_PYTHON="$UV_PYTHON" \
-                -- uv run python -m pytest \
+                -- "$PYBIN" -m pytest \
                      --splits 4 --group "$group" \
                      --durations-path=ci/durations/linux.json \
                      --randomly-seed="$seed" \
@@ -197,7 +210,7 @@ jobs:
                      2>&1 | tee "repro-artifacts/pytest-attempt-$attempt.log"
               rc=${PIPESTATUS[0]}
             else
-              uv run python -m pytest \
+              "$PYBIN" -m pytest \
                 --splits 4 --group "$group" \
                 --durations-path=ci/durations/linux.json \
                 --randomly-seed="$seed" \
@@ -215,12 +228,24 @@ jobs:
             sudo dmesg -T 2>/dev/null | grep -iE "killed process|out of memory|oom-kill" \
               >> repro-artifacts/dmesg-oom.txt || true
 
-            if grep -q "node down: Not properly terminated" \
-                 "repro-artifacts/pytest-attempt-$attempt.log"; then
+            log="repro-artifacts/pytest-attempt-$attempt.log"
+            if grep -q "node down: Not properly terminated" "$log"; then
               echo "::warning::REPRODUCED on attempt $attempt — worker died"
               crashed=1
               echo "crashed_attempt=$attempt" >> "$GITHUB_OUTPUT"
               break
+            fi
+            # A harness failure must NEVER read as "not reproduced". If pytest
+            # never got as far as a session header, the attempt measured
+            # nothing — fail the job loudly instead of reporting a clean run.
+            # (Learned the hard way: run 29872332151 died in milliseconds with
+            # "Failed to find executable uv" on all three attempts and the job
+            # still went green saying "Not reproduced in 3 attempts".)
+            if ! grep -qE "test session starts|passed|failed|error" "$log"; then
+              echo "::error::attempt $attempt never started pytest (exit $rc) — harness failure, not a negative result"
+              echo "--- attempt log ---"
+              cat "$log"
+              exit 1
             fi
           done
           echo "crashed=$crashed" >> "$GITHUB_OUTPUT"
