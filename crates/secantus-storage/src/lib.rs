@@ -7604,6 +7604,18 @@ mod tests {
     use super::*;
     use bson::doc;
 
+    /// `doc_shard_hash` must be byte-for-byte identical to the Python
+    /// `storage._doc_shard_hash` so a collection routes to the same documents
+    /// shard in both servers (cross-server backup / PITR portability). Values
+    /// computed by the Python FNV-1a over `db + b"\0" + coll`.
+    #[test]
+    fn doc_shard_hash_matches_python() {
+        assert_eq!(doc_shard_hash("harness", "w1"), 9941274063389089977);
+        assert_eq!(doc_shard_hash("harness", "w8"), 9941281759970487454);
+        assert_eq!(doc_shard_hash("test", "users"), 16319205138020980013);
+        assert_eq!(doc_shard_hash("", ""), 12638153115695167455);
+    }
+
     /// `wt_config` with the engine defaults must produce the exact
     /// `DEFAULT_CONFIG` string so `Storage::open` behaviour is unchanged.
     #[test]
