@@ -38,8 +38,22 @@ def app(server: SecantusDBServer, tmp_path):
         history_path=tmp_path / "history.db",
         backup_root=tmp_path / "backups",
     )
-    yield app
-    app.state.mongo.close()
+    try:
+        yield app
+    finally:
+        app.state.mongo.close()
+        # Then drop the app's heavy payload. Each test's event loop is left
+        # pinned by never-completed awaitables, and the loop pins the async
+        # fixture frames, which pin the app — so the app object itself is
+        # reachable for the rest of the session even though the test is over.
+        # Measured: 94 apps + 94 facades still live after 113 tests, ~206 MB
+        # of unbounded growth. The loop is asyncio's to keep; the ~2 MB of
+        # routes / middleware / state hanging off it is ours to release.
+        # See tasks/backlog.md "ws-changes xdist worker crash".
+        app.router.routes.clear()
+        app.user_middleware.clear()
+        app.middleware_stack = None
+        app.state._state.clear()
 
 
 @pytest.fixture
