@@ -66,8 +66,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: false
+
+      - name: Checkout the WiredTiger submodule
+        # The package builds vendored WiredTiger from source, so `uv sync`
+        # fails without this ("vendor/wiredtiger does not look like the
+        # WiredTiger source"). Shallow-init just WT — `submodules: recursive`
+        # would also clone 11 driver-gauge repos this job never reads. Mirrors
+        # the twin step in test.yml.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -82,6 +91,7 @@ jobs:
         run: uv sync --extra dev --extra admin
 
       - name: Record baseline machine state
+        id: baseline
         run: |
           mkdir -p repro-artifacts
           {
@@ -91,6 +101,16 @@ jobs:
             echo "=== ulimit -n ==="; ulimit -n
             echo "=== df -h ==="; df -h
           } | tee repro-artifacts/baseline.txt
+          # Probe the memory-cap mechanism up front. If it isn't available we
+          # still want the RSS/dmesg data, so the loop degrades to an uncapped
+          # run rather than dying after the (expensive) WiredTiger build.
+          if sudo systemd-run --scope --quiet -p MemoryMax=512M -- true 2>/dev/null; then
+            echo "systemd_run=yes" >> "$GITHUB_OUTPUT"
+            echo "memory cap available: systemd-run --scope -p MemoryMax"
+          else
+            echo "systemd_run=no" >> "$GITHUB_OUTPUT"
+            echo "::warning::systemd-run unavailable — running WITHOUT a memory cap; a green run proves little"
+          fi
 
       - name: Locate the group containing the admin tests
         # Group membership depends on the pytest-randomly seed, so compute it
@@ -158,7 +178,7 @@ jobs:
             sampler=$!
 
             set +e
-            if [ -n "$memmax" ]; then
+            if [ -n "$memmax" ] && [ "${{ steps.baseline.outputs.systemd_run }}" = "yes" ]; then
               # A scope gives the whole pytest tree one shared MemoryMax, so the
               # kernel OOM-kills inside it exactly as it would under real memory
               # pressure — the controlled version of the CI symptom.
