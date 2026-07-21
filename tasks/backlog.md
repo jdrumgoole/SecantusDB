@@ -340,6 +340,40 @@ These are explicit non-goals. Don't add them without a reason.
   the real cause is server-/harness-side, not the admin ws tail. **Item stays
   open; root-cause work below.**
 
+  ### REPRODUCED 2026-07-21 (run 29873889113) — OOM ruled OUT, culprit named
+
+  The dispatchable `crash-repro.yml` job reproduced it on **attempt 3 of 3**
+  (`[gw3] node down: Not properly terminated`), under `SECANTUS_FORCE_DURABLE=1`,
+  8 CPU burners and a 3 GB `systemd-run` MemoryMax. Four hard results:
+
+  1. **NOT an OOM kill.** `dmesg` carried **zero** OOM lines, and peak combined
+     RSS was **1218–1333 MB against the 3 GB cap** — the ceiling never bit. The
+     OOM hypothesis (from the measured admin-fixture leak + the absent
+     faulthandler dumps) is **refuted**. The leak is real and worth fixing on its
+     own merits, but it is **not** this crash.
+  2. **NOT a fatal signal.** All five faulthandler dumps were **0 bytes**,
+     including the dead worker's. So not SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL,
+     and (per 1) not SIGKILL either.
+  3. **The culprit is named, for the first time in seven occurrences:**
+     `tests/test_admin_skeleton.py::test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy`
+     (`worker 'gw3' crashed while running ...`). The admin/ws attribution was
+     right; it is now a single test rather than a whole file.
+  4. **Leading mechanism — a HANG, not a crash (inferred, not yet observed).**
+     The lanes run `--timeout=120 --timeout-method=thread`. pytest-timeout's
+     thread method writes its stack to the worker's **stderr** — which xdist
+     discards on "node down" — and then calls `os._exit()`. That is abrupt with
+     **no signal** (so faulthandler stays silent) and **no memory pressure** (so
+     dmesg stays clean): precisely the evidence pattern above, and the reason
+     every occurrence has been anonymous. The attempt ran 191 s, leaving room
+     for a 120 s timeout. **The `+++ Timeout +++` marker was NOT directly
+     observed** — confirm before treating as fact.
+
+  **Confirmation available:** dispatch `crash-repro.yml` with `mode=ws-single`,
+  which runs the admin file alone with `-p no:xdist` so nothing discards stderr
+  (optionally `timeout_method=signal`, which raises inside the test instead). If
+  the timeout stack appears, this stops being "a native worker crash" and becomes
+  "a hang in the ws quiet-stream close path" — a tractable bug in a known place.
+
   ### Root-cause work — the real remaining fix (OPEN)
 
   Signature is always the same: one or more Linux xdist workers "node down: Not

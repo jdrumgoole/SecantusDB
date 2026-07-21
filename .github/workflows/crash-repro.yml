@@ -49,6 +49,28 @@ on:
       python_version:
         description: "Interpreter to run under"
         default: "3.10"
+      mode:
+        description: >-
+          "split-group" reproduces the CI lane (xdist, 4 workers).
+          "ws-single" runs tests/test_admin_skeleton.py ALONE in ONE process
+          with no xdist — the confirmation mode: xdist discards a dead worker's
+          stderr, which is why pytest-timeout's stack dump has been invisible in
+          every occurrence. Single-process keeps stderr, so a hang shows its
+          "+++ Timeout +++" traceback verbatim.
+        type: choice
+        options: ["split-group", "ws-single"]
+        default: "split-group"
+      timeout_seconds:
+        description: "Per-test timeout (pytest-timeout). CI lanes use 120."
+        default: "120"
+      timeout_method:
+        description: >-
+          "thread" matches CI (dumps to stderr, then os._exit — no signal, so
+          faulthandler stays silent). "signal" raises inside the test instead,
+          which pytest reports normally.
+        type: choice
+        options: ["thread", "signal"]
+        default: "thread"
 
 permissions:
   contents: read
@@ -154,6 +176,18 @@ jobs:
             exit 1
           fi
 
+          # Selection args differ per mode. ws-single deliberately drops xdist
+          # (-p no:xdist) so the worker's stderr — where pytest-timeout writes
+          # its stack before os._exit — is not discarded. That output is the
+          # thing every previous occurrence lost.
+          if [ "${{ inputs.mode }}" = "ws-single" ]; then
+            SELECT_ARGS="tests/test_admin_skeleton.py -p no:xdist -p no:randomly -v"
+          else
+            SELECT_ARGS="--splits 4 --group $group --durations-path=ci/durations/linux.json --randomly-seed=$seed --max-worker-restart=0"
+          fi
+          COMMON_ARGS="--timeout=${{ inputs.timeout_seconds }} --timeout-method=${{ inputs.timeout_method }}"
+          echo "mode=${{ inputs.mode }}  select: $SELECT_ARGS"
+
           # Kernel ring buffer is the OOM killer's own record. Snapshot the
           # start offset so the post-run diff is just this job's kills.
           sudo dmesg -c > /dev/null 2>&1 || true
@@ -201,21 +235,11 @@ jobs:
                 --setenv=SECANTUS_FORCE_DURABLE="${SECANTUS_FORCE_DURABLE:-}" \
                 --setenv=SECANTUS_FAULTHANDLER_DIR="$SECANTUS_FAULTHANDLER_DIR" \
                 --setenv=SECANTUS_POST_CRASH_SECONDS="$SECANTUS_POST_CRASH_SECONDS" \
-                -- "$PYBIN" -m pytest \
-                     --splits 4 --group "$group" \
-                     --durations-path=ci/durations/linux.json \
-                     --randomly-seed="$seed" \
-                     --timeout=120 --timeout-method=thread \
-                     --max-worker-restart=0 \
+                -- "$PYBIN" -m pytest $SELECT_ARGS $COMMON_ARGS \
                      2>&1 | tee "repro-artifacts/pytest-attempt-$attempt.log"
               rc=${PIPESTATUS[0]}
             else
-              "$PYBIN" -m pytest \
-                --splits 4 --group "$group" \
-                --durations-path=ci/durations/linux.json \
-                --randomly-seed="$seed" \
-                --timeout=120 --timeout-method=thread \
-                --max-worker-restart=0 \
+              "$PYBIN" -m pytest $SELECT_ARGS $COMMON_ARGS \
                 2>&1 | tee "repro-artifacts/pytest-attempt-$attempt.log"
               rc=${PIPESTATUS[0]}
             fi
@@ -229,8 +253,13 @@ jobs:
               >> repro-artifacts/dmesg-oom.txt || true
 
             log="repro-artifacts/pytest-attempt-$attempt.log"
-            if grep -q "node down: Not properly terminated" "$log"; then
-              echo "::warning::REPRODUCED on attempt $attempt — worker died"
+            # split-group: the symptom is a dead worker. ws-single: there is no
+            # worker to die — the symptom is the hang itself, which pytest-timeout
+            # now reports in-process (that stack is the whole point of this mode).
+            if grep -qE "node down: Not properly terminated|\+\+\+ Timeout|Timeout >[0-9]" "$log"; then
+              echo "::warning::REPRODUCED on attempt $attempt"
+              grep -B 5 -A 40 -E "\+\+\+ Timeout|node down" "$log" | head -80 \
+                > "repro-artifacts/reproduction-excerpt-$attempt.txt" || true
               crashed=1
               echo "crashed_attempt=$attempt" >> "$GITHUB_OUTPUT"
               break
