@@ -1,0 +1,255 @@
+name: Crash repro (Linux worker death)
+
+# Manual-dispatch ONLY. Never runs on push/PR — it deliberately runs the suite
+# under memory pressure until a worker dies, which is not something a PR lane
+# should do.
+#
+# Purpose: close the long-running "xdist worker dies hard on Linux" item in
+# tasks/backlog.md. Six+ occurrences, always the same signature — a worker goes
+# "node down: Not properly terminated", no FAILED test lines, siblings stall,
+# the controller exits 70 ~5 min later — and the crash lands in whichever lane
+# ran tests/test_admin_skeleton.py (3 for 3 when checked with the run's own
+# pytest-randomly seed). The armed faulthandler has never produced a dump, and
+# it IS wired correctly, so the worker is not taking a fatal signal
+# (SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL). What is left is SIGKILL — the OOM
+# killer — which fits the measured unbounded memory leak in that same file.
+#
+# This job tries to turn that hypothesis into evidence:
+#   * runs the group that actually contains the admin file, under the same
+#     seed/split machinery CI uses;
+#   * samples per-worker RSS every second into a CSV artifact;
+#   * captures the kernel ring buffer, so an OOM kill is recorded verbatim;
+#   * optionally caps memory (systemd MemoryMax) to force the question — if the
+#     workers die with SIGKILL and dmesg names them, the mechanism is settled;
+#   * optionally loads the box with CPU burners, per the backlog's repro recipe;
+#   * repeats until it crashes or the attempt budget runs out.
+#
+# A green run is NOT a negative result unless memory_max was set low enough to
+# be a real test — read the RSS trace before concluding anything.
+
+on:
+  workflow_dispatch:
+    inputs:
+      attempts:
+        description: "How many times to run the lane before giving up"
+        default: "3"
+      durable:
+        description: "Run with SECANTUS_FORCE_DURABLE=1 (the lane most occurrences hit)"
+        type: boolean
+        default: true
+      memory_max:
+        description: >-
+          Memory ceiling for the pytest process tree (systemd MemoryMax, e.g.
+          "3G"). Empty = no cap. A cap is what makes an OOM kill reproducible
+          rather than lucky.
+        default: "3G"
+      cpu_burners:
+        description: "Background CPU hogs to contend with (0 = none)"
+        default: "8"
+      python_version:
+        description: "Interpreter to run under"
+        default: "3.10"
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      UV_PYTHON: ${{ inputs.python_version }}
+      SECANTUS_FAULTHANDLER_DIR: ${{ github.workspace }}/faulthandler-dumps
+      # The controller's post-crash overrun watchdog would otherwise sit for 20
+      # min after the crash we are trying to catch; we want the artifacts fast.
+      SECANTUS_POST_CRASH_SECONDS: "120"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-suffix: crash-repro-${{ inputs.python_version }}
+
+      - name: Set up Python
+        run: uv python install ${{ inputs.python_version }}
+
+      - name: Sync dependencies
+        run: uv sync --extra dev --extra admin
+
+      - name: Record baseline machine state
+        run: |
+          mkdir -p repro-artifacts
+          {
+            echo "=== nproc ==="; nproc
+            echo "=== free -m ==="; free -m
+            echo "=== /proc/meminfo (head) ==="; head -5 /proc/meminfo
+            echo "=== ulimit -n ==="; ulimit -n
+            echo "=== df -h ==="; df -h
+          } | tee repro-artifacts/baseline.txt
+
+      - name: Locate the group containing the admin tests
+        # Group membership depends on the pytest-randomly seed, so compute it
+        # with the SAME seed the run will use. Blindly assuming a group number
+        # is exactly the mistake that produced a wrong conclusion on 2026-07-21.
+        id: locate
+        run: |
+          seed="${{ github.run_id }}"
+          target="tests/test_admin_skeleton.py"
+          found=""
+          for g in 1 2 3 4; do
+            n=$(uv run python -m pytest --splits 4 --group "$g" \
+                  --durations-path=ci/durations/linux.json \
+                  --randomly-seed="$seed" --collect-only -q 2>/dev/null \
+                | grep -c "test_admin_skeleton" || true)
+            echo "group $g: $target -> $n tests"
+            if [ "$n" != "0" ]; then found="$g"; fi
+          done
+          if [ -z "$found" ]; then
+            echo "::error::could not locate $target in any group (seed $seed)"
+            exit 1
+          fi
+          echo "group=$found" >> "$GITHUB_OUTPUT"
+          echo "Running group $found (holds $target under seed $seed)"
+
+      - name: Repro loop
+        id: repro
+        run: |
+          set -u
+          attempts="${{ inputs.attempts }}"
+          burners="${{ inputs.cpu_burners }}"
+          memmax="${{ inputs.memory_max }}"
+          group="${{ steps.locate.outputs.group }}"
+          seed="${{ github.run_id }}"
+          [ "${{ inputs.durable }}" = "true" ] && export SECANTUS_FORCE_DURABLE=1
+
+          # Kernel ring buffer is the OOM killer's own record. Snapshot the
+          # start offset so the post-run diff is just this job's kills.
+          sudo dmesg -c > /dev/null 2>&1 || true
+
+          burner_pids=""
+          if [ "$burners" -gt 0 ]; then
+            for _ in $(seq 1 "$burners"); do
+              ( while :; do :; done ) &
+              burner_pids="$burner_pids $!"
+            done
+            echo "started $burners CPU burners"
+          fi
+          cleanup_burners() { [ -n "$burner_pids" ] && kill $burner_pids 2>/dev/null || true; }
+          trap cleanup_burners EXIT
+
+          crashed=0
+          for attempt in $(seq 1 "$attempts"); do
+            echo "::group::attempt $attempt/$attempts (group $group, seed $seed)"
+            rss_csv="repro-artifacts/rss-attempt-$attempt.csv"
+            echo "epoch,pid,rss_kb,command" > "$rss_csv"
+            # Sample every pytest process (controller + workers) once a second.
+            ( while :; do
+                now=$(date +%s)
+                ps -eo pid=,rss=,comm=,args= 2>/dev/null \
+                  | awk -v t="$now" '/pytest|python/ && !/awk/ {printf "%s,%s,%s,%s\n", t, $1, $2, $3}' \
+                  >> "$rss_csv"
+                sleep 1
+              done ) &
+            sampler=$!
+
+            set +e
+            if [ -n "$memmax" ]; then
+              # A scope gives the whole pytest tree one shared MemoryMax, so the
+              # kernel OOM-kills inside it exactly as it would under real memory
+              # pressure — the controlled version of the CI symptom.
+              sudo systemd-run --scope --quiet \
+                -p MemoryMax="$memmax" -p MemorySwapMax=0 \
+                --setenv=SECANTUS_FORCE_DURABLE="${SECANTUS_FORCE_DURABLE:-}" \
+                --setenv=SECANTUS_FAULTHANDLER_DIR="$SECANTUS_FAULTHANDLER_DIR" \
+                --setenv=SECANTUS_POST_CRASH_SECONDS="$SECANTUS_POST_CRASH_SECONDS" \
+                --setenv=UV_PYTHON="$UV_PYTHON" \
+                -- uv run python -m pytest \
+                     --splits 4 --group "$group" \
+                     --durations-path=ci/durations/linux.json \
+                     --randomly-seed="$seed" \
+                     --timeout=120 --timeout-method=thread \
+                     --max-worker-restart=0 \
+                     2>&1 | tee "repro-artifacts/pytest-attempt-$attempt.log"
+              rc=${PIPESTATUS[0]}
+            else
+              uv run python -m pytest \
+                --splits 4 --group "$group" \
+                --durations-path=ci/durations/linux.json \
+                --randomly-seed="$seed" \
+                --timeout=120 --timeout-method=thread \
+                --max-worker-restart=0 \
+                2>&1 | tee "repro-artifacts/pytest-attempt-$attempt.log"
+              rc=${PIPESTATUS[0]}
+            fi
+            set -e
+            kill "$sampler" 2>/dev/null || true
+            echo "attempt $attempt exit=$rc"
+            echo "::endgroup::"
+
+            # Kernel evidence for THIS attempt, whether or not pytest noticed.
+            sudo dmesg -T 2>/dev/null | grep -iE "killed process|out of memory|oom-kill" \
+              >> repro-artifacts/dmesg-oom.txt || true
+
+            if grep -q "node down: Not properly terminated" \
+                 "repro-artifacts/pytest-attempt-$attempt.log"; then
+              echo "::warning::REPRODUCED on attempt $attempt — worker died"
+              crashed=1
+              echo "crashed_attempt=$attempt" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+          echo "crashed=$crashed" >> "$GITHUB_OUTPUT"
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Crash repro result"
+            echo
+            if [ "${{ steps.repro.outputs.crashed }}" = "1" ]; then
+              echo "**REPRODUCED** on attempt ${{ steps.repro.outputs.crashed_attempt }}."
+            else
+              echo "Not reproduced in ${{ inputs.attempts }} attempt(s)."
+              echo "This is only a meaningful negative if \`memory_max\` was a real constraint —"
+              echo "check the RSS trace before drawing conclusions."
+            fi
+            echo
+            echo "Group run: ${{ steps.locate.outputs.group }} (seed ${{ github.run_id }})"
+            echo "durable=${{ inputs.durable }} memory_max='${{ inputs.memory_max }}' burners=${{ inputs.cpu_burners }}"
+            echo
+            echo "### OOM-killer evidence (dmesg)"
+            echo '```'
+            if [ -s repro-artifacts/dmesg-oom.txt ]; then
+              tail -40 repro-artifacts/dmesg-oom.txt
+            else
+              echo "(no OOM lines in the kernel ring buffer — if a worker still died,"
+              echo " it was NOT an OOM kill, which rules the hypothesis out)"
+            fi
+            echo '```'
+            echo
+            echo "### Peak RSS per attempt"
+            echo '```'
+            for f in repro-artifacts/rss-attempt-*.csv; do
+              [ -e "$f" ] || continue
+              peak=$(awk -F, 'NR>1 {s[$1]+=$3} END {m=0; for (t in s) if (s[t]>m) m=s[t]; printf "%.0f", m/1024}' "$f")
+              echo "$(basename "$f"): peak combined RSS ${peak} MB"
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-repro-${{ github.run_id }}
+          path: |
+            repro-artifacts/
+            faulthandler-dumps/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14

@@ -450,19 +450,29 @@ These are explicit non-goals. Don't add them without a reason.
     holds the storage lock across its body with the `_closed` fence inside it,
     so `stop()`'s "close storage anyway" path is serialised against it as its
     comment claims. Neither is the leak.
-  - **THE "ws-changes" ATTRIBUTION IS WRONG — retitle this item.** PR #597's
-    second failure was `test-durable (3.10, ubuntu-latest, 4)`, and the CI split
-    is deterministic (`pytest-split --splits 4 --group N` off
-    `ci/durations/linux.json`). Reproduced locally: **all 113
-    `test_admin_skeleton.py` tests land in group 1**; groups 2/3/4 contain
-    **zero**. So that crash happened in a lane that never ran the admin tests or
-    the ws-changes test at all. The same is true of the FOURTH occurrence (#586,
-    `test (3.10, ubuntu-latest, 3)` → group 3, also zero admin tests). The
-    ws-changes name came from the first occurrence and was over-fitted; the real
-    signature is "a Linux xdist worker dies hard, in any lane". Check lane→group
-    membership before blaming a test again:
+  - **THE CRASH FOLLOWS `test_admin_skeleton.py` ACROSS LANES — 3 for 3.**
+    (This corrects an earlier claim in this file that the ws/admin attribution
+    was wrong. That claim was computed with `-p no:randomly` and was **wrong**:
+    group membership is **not** fixed, because `pytest-randomly` reshuffles
+    collection per seed and `pytest-split` partitions that *ordered* list, and CI
+    pins `--randomly-seed=${{ github.run_id }}`. You must reproduce the split
+    with the run's **own** seed.) Recomputed per run:
+
+    | occurrence | crashed lane | admin file's group under that run's seed |
+    | --- | --- | --- |
+    | #595 (run 29849354713) | `test (3.10, ubuntu, 1)` | group **1** |
+    | #597 run 1 (29857900416) | `test (3.10, ubuntu, 1)` | group **1** |
+    | #597 run 2 (29858996357) | `test-durable (3.10, ubuntu, 4)` | group **4** |
+
+    The file moved from group 1 to group 4 between runs and **the crash moved
+    with it**. So the original attribution was right, and the mechanism is most
+    likely the *file's memory cost* rather than the ws test's logic — which fits
+    the measured leak (94 retained apps, ~206 MB over the file pre-fix) and the
+    no-fatal-signal evidence below. Correct command, with the seed:
     `pytest --splits 4 --group N --durations-path=ci/durations/linux.json
-    --collect-only -q | grep -c <file>`.
+    --randomly-seed=<run_id> --collect-only -q | grep -c <file>`.
+    (The earlier #586-group-3 claim was computed the same wrong way and is
+    **retracted** — unverified either way.)
   - **NO faulthandler dump is produced, and the diagnostic IS correctly wired.**
     `test-durable` sets `SECANTUS_FAULTHANDLER_DIR` (workflow line ~768) and has
     the prune+upload steps (~1087/1092), yet run 29858996357 uploaded
