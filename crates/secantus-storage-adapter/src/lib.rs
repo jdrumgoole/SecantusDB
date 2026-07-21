@@ -473,6 +473,10 @@ impl CmdStorage for StorageAdapter {
                 direction,
             } => {
                 d.insert("kind", "IXSCAN");
+                d.insert(
+                    "multikey",
+                    self.inner.index_is_multikey(db, coll, &index_name),
+                );
                 d.insert("indexName", index_name);
                 d.insert("keyPattern", Bson::Document(key_pattern));
                 d.insert("direction", direction);

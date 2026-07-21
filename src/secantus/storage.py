@@ -45,7 +45,7 @@ from secantus.geo_index import (
     s2_doc_covering,
     s2_query_covering,
 )
-from secantus.paths import get_path, has_path
+from secantus.paths import get_path, get_path_values
 from secantus.projection import apply_projection
 from secantus.query import matches
 from secantus.sortkey import COMPOUND_SEP, encode_value, encode_value_directed
@@ -411,6 +411,38 @@ def _id_point_lookup_keys(spec: Any) -> list[bytes] | None:
     return [_id_key(spec)]
 
 
+def _conflict_key_value(
+    doc: Mapping[str, Any],
+    key_spec: Mapping[str, Any],
+    kb: bytes,
+    *,
+    collation: Any = None,
+) -> dict[str, Any]:
+    """Per-field values behind the entry ``kb`` — the ``keyValue`` of a
+    dup-key error.
+
+    A multikey doc contributes several keys, so the conflicting one
+    isn't necessarily what ``get_path`` returns for the field (for a
+    path descending through an array it never is). Re-walks the
+    candidate values to find the combination that encodes to ``kb``.
+    Only called once a duplicate has been found, so the walk costs
+    nothing on the happy path.
+    """
+    from itertools import product
+
+    fields = list(key_spec)
+    per_field = [_index_field_values(doc, f)[0] for f in fields]
+    for combo in product(*per_field):
+        parts = [
+            encode_value_directed(combo[i], int(key_spec[fields[i]]), collation=collation)
+            for i in range(len(fields))
+        ]
+        cand = parts[0] if len(fields) == 1 else COMPOUND_SEP.join(parts)
+        if cand == kb:
+            return dict(zip(fields, combo, strict=True))
+    return {field: get_path(dict(doc), field, default=None) for field in fields}
+
+
 def _parse_index_collation(spec: Any) -> Any:
     """Parse an index's stored ``collation`` option into a Collation.
 
@@ -433,14 +465,61 @@ def _parse_index_collation(spec: Any) -> Any:
     return coll
 
 
-def _doc_makes_multikey(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> bool:
-    """True if any field in ``key_spec`` resolves to a list value in ``doc``.
+def _index_field_values(doc: Mapping[str, Any], field: str) -> tuple[list[Any], bool]:
+    """Candidate index values for ``field`` in ``doc``, plus multikey-ness.
 
-    Such a value is encoded as a single composite array sortkey, so a
-    later scalar-equality query against this index would silently miss
-    the doc — the index must fall back to a full scan.
+    Mirrors mongod's key generation:
+
+    * a scalar leaf contributes itself;
+    * an array-valued *leaf* contributes one value per element **plus**
+      the whole array (the key a whole-array equality query probes);
+    * a path that descends *through* an array — ``prices.owner_id``
+      against ``{"prices": [{"owner_id": x}, ...]}`` — contributes one
+      value per element's leaf, and no whole-array key (there is no
+      single array to compare against).
+
+    A missing path contributes ``None``, matching ``get_path``'s
+    default: mongod indexes a missing field as null.
+
+    The second element is True when this field makes the index
+    multikey — either because the leaf is an array or because the path
+    walked through one.
     """
-    return any(isinstance(get_path(dict(doc), field), list) for field in key_spec)
+    values, descended = get_path_values(doc, field)
+    if not values:
+        return [None], descended
+    out: list[Any] = []
+    multikey = descended
+    for v in values:
+        if isinstance(v, list):
+            multikey = True
+            out.extend(v)
+            out.append(v)
+        else:
+            out.append(v)
+    return out, multikey
+
+
+def _index_field_exists(doc: Mapping[str, Any], field: str) -> bool:
+    """``has_path`` that descends into arrays — the sparse-index gate.
+
+    A sparse index must cover ``{"prices": [{"owner_id": x}]}`` for the
+    path ``prices.owner_id``; plain :func:`has_path` reports that path
+    missing because it won't walk array elements.
+    """
+    return bool(get_path_values(doc, field)[0])
+
+
+def _doc_makes_multikey(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> bool:
+    """True if any field in ``key_spec`` is array-valued in ``doc`` — either
+    an array leaf or a dotted path that descends through an array.
+
+    Such a doc contributes more than one entry to the index, which is
+    what mongod calls multikey: it disqualifies the index from
+    sort-by-index walks (one doc → many keys breaks the natural-order
+    walk) and is reported as ``isMultiKey`` in ``explain``.
+    """
+    return any(_index_field_values(doc, field)[1] for field in key_spec)
 
 
 def _index_key(
@@ -464,15 +543,16 @@ def _index_key(
     the index's stored ``collation`` option; the writers handle
     that.
 
-    For docs whose indexed field is array-valued, this returns the
-    whole-array sortkey only — the single canonical "doc-shape" key
-    used by uniqueness probes. The full set of multikey entries
-    (per-element + whole-array) is produced by
-    :func:`_index_key_variants`.
+    One key per doc: an array-valued field encodes as the whole array,
+    and a path descending through an array resolves to null. That makes
+    this the wrong tool for anything index-entry- or uniqueness-shaped —
+    those go through :func:`_index_key_variants`, which enumerates every
+    key a doc contributes. What's left here is encoding synthetic
+    min/max bound specs, which have no array shape to lose.
     """
     if sparse:
         for field in key_spec:
-            if not has_path(dict(doc), field):
+            if not _index_field_exists(doc, field):
                 return None
     fields = list(key_spec)
     if len(fields) == 1:
@@ -496,7 +576,9 @@ def _index_key_variants(
 
     For scalar-valued fields, returns one key — same as ``_index_key``.
     For array-valued fields, returns one key per array element *and*
-    the whole-array key, mirroring real ``mongod``'s multikey index
+    the whole-array key; for a dotted path that descends *through* an
+    array (``prices.owner_id`` over an array of subdocuments) one key
+    per element's leaf value. Mirrors real ``mongod``'s multikey index
     layout. This makes:
 
     * ``{tags: "python"}`` against ``{tags: ["python", "go"]}`` light
@@ -504,6 +586,9 @@ def _index_key_variants(
     * ``{tags: ["python", "go"]}`` (whole-array equality) light up via
       the whole-array entry — without this, the equality lookup would
       false-negative.
+    * ``{"prices.owner_id": x}`` against
+      ``{prices: [{owner_id: x}, ...]}`` light up via the per-element
+      entry for ``x`` — the ODM array-of-subdocuments pattern.
     * Range / ``$in`` queries on array fields hit at least all true
       matches (the post-index ``matches()`` filter discards
       false-positives).
@@ -523,30 +608,28 @@ def _index_key_variants(
     fields = list(key_spec)
     if sparse:
         for field in fields:
-            if not has_path(dict(doc), field):
+            if not _index_field_exists(doc, field):
                 return []
 
-    # Per-field candidate values: scalars contribute [val]; arrays
-    # contribute [unique_elements..., whole_array].
+    # Per-field candidate values (see ``_index_field_values``), deduped
+    # on their encoded bytes so a repeated array element doesn't inflate
+    # the compound cartesian product below.
     per_field: list[list[Any]] = []
     for field in fields:
-        v = get_path(dict(doc), field)
-        if isinstance(v, list):
-            seen: set[bytes] = set()
-            uniq: list[Any] = []
-            d = int(key_spec[field])
-            for elem in v:
-                eb = encode_value_directed(elem, d, collation=collation)
-                if eb in seen:
-                    continue
-                seen.add(eb)
-                uniq.append(elem)
-            # Whole-array sortkey may collide with an element when the
-            # array is a single scalar repeated; the dedup below at the
-            # entry level (set of bytes) catches that.
-            per_field.append([*uniq, v])
-        else:
-            per_field.append([v])
+        cands, _multikey = _index_field_values(doc, field)
+        if len(cands) == 1:
+            per_field.append(cands)
+            continue
+        d = int(key_spec[field])
+        seen: set[bytes] = set()
+        uniq: list[Any] = []
+        for cand in cands:
+            eb = encode_value_directed(cand, d, collation=collation)
+            if eb in seen:
+                continue
+            seen.add(eb)
+            uniq.append(cand)
+        per_field.append(uniq)
 
     if len(fields) == 1:
         d = int(key_spec[fields[0]])
@@ -3949,8 +4032,41 @@ class Storage:
 
         No execution; mirrors the same routing decisions. Returns
         ``{"kind": "COLLSCAN"}`` or ``{"kind": "IXSCAN", "index_name",
-        "key_pattern", "direction"}``. ``direction`` is ``"forward"``
-        unless a sort spec inverts it relative to the chosen index.
+        "key_pattern", "direction", "multikey"}``. ``direction`` is
+        ``"forward"`` unless a sort spec inverts it relative to the
+        chosen index; ``multikey`` is the index's sticky multikey flag,
+        surfaced as ``isMultiKey`` in the command's ``winningPlan``.
+        """
+        plan = self._explain_plan_uncached(
+            db, coll, filter, sort=sort, hint=hint, collation=collation
+        )
+        if plan["kind"] == "IXSCAN":
+            plan["multikey"] = self.index_is_multikey(db, coll, plan["index_name"])
+        return plan
+
+    def index_is_multikey(self, db: str, coll: str, name: str) -> bool:
+        """The sticky multikey flag for index ``name`` (False if unknown).
+
+        The ``_id`` index can never be multikey — ``_id`` is rejected as
+        an array by the write path.
+        """
+        if name == _ID_INDEX_NAME:
+            return False
+        with self._lock:
+            opts = self._index_options_map(db, coll).get(name) or {}
+            return bool(opts.get("multikey"))
+
+    def _explain_plan_uncached(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any] | None = None,
+        *,
+        sort: Mapping[str, Any] | None = None,
+        hint: str | Mapping[str, Any] | None = None,
+        collation: Any = None,
+    ) -> dict[str, Any]:
+        """Index-selection half of :meth:`explain_plan` (no multikey annotation).
 
         ``collation``: mirrors the runtime gate — when set, only
         indexes whose stored ``collation`` matches the query's are
@@ -5001,10 +5117,11 @@ class Storage:
             else:
                 # Single doc-table walk: decode each blob once and fold all
                 # three checks (uniqueness, multikey detection, entry build)
-                # into one pass. Uniqueness is probed against the canonical
-                # whole-doc key (``_index_key``); index entries are written
-                # for every key variant (``_index_key_variants``) so per-
-                # element multikey lookups land at IXSCAN.
+                # into one pass. Index entries are written for every key
+                # variant (``_index_key_variants``) so per-element multikey
+                # lookups land at IXSCAN, and uniqueness is checked against
+                # those same variants — mongod's unique-multikey rule is
+                # "no two docs share any generated key".
                 seen: dict[bytes, Any] | None = {} if unique else None
                 multikey = False
                 entries = []
@@ -5015,15 +5132,13 @@ class Storage:
                         continue
                     if not multikey and _doc_makes_multikey(d, key_spec_dict):
                         multikey = True
-                    if seen is not None:
-                        canonical = _index_key(d, key_spec_dict, sparse=sparse, collation=coll_opt)
-                        if canonical is not None:
-                            if canonical in seen:
-                                raise IndexConflict(name, d.get("_id"), namespace=f"{db}.{coll}")
-                            seen[canonical] = d.get("_id")
                     for kb in _index_key_variants(
                         d, key_spec_dict, sparse=sparse, collation=coll_opt
                     ):
+                        if seen is not None:
+                            if kb in seen:
+                                raise IndexConflict(name, d.get("_id"), namespace=f"{db}.{coll}")
+                            seen[kb] = d.get("_id")
                         entries.append((kb, id_k))
                 if multikey:
                     options["multikey"] = True
@@ -5186,13 +5301,14 @@ class Storage:
             sparse = bool(opts.get("sparse"))
             coll_opt = _parse_index_collation(opts.get("collation"))
             blobs = [blob for _id_k, blob in self._scan_docs(db, coll)]
+        # Grouped over every key each doc contributes, matching what
+        # ``_unique_conflict`` would refuse: on a multikey index two docs
+        # violate uniqueness as soon as they share one generated key.
         groups: dict[bytes, list[Any]] = {}
         for blob in blobs:
             doc = bson.decode(blob)
-            kb = _index_key(doc, key_spec, sparse=sparse, collation=coll_opt)
-            if kb is None:
-                continue
-            groups.setdefault(kb, []).append(doc.get("_id"))
+            for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
+                groups.setdefault(kb, []).append(doc.get("_id"))
         out: list[list[Any]] = []
         for ids in groups.values():
             if len(ids) > 1:
@@ -5489,34 +5605,53 @@ class Storage:
             if pf is not None and not matches(candidate_doc, pf):
                 continue
             coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
-            kb = _index_key(candidate_doc, key_spec, sparse=sparse, collation=coll_opt)
-            if kb is None:
-                continue
-            esc_kb = _escape_kb(kb)
-            seed = esc_kb + _ENTRY_SEP
-            c.reset()
-            c.set_key(db, coll, name, seed)
-            rc = c.search_near()
-            if rc == wt.WT_NOTFOUND:
-                continue
-            if rc < 0 and c.next() != 0:
-                continue
-            while True:
-                k = c.get_key()
-                if (k[0], k[1], k[2]) != (db, coll, name):
-                    break
-                packed = bytes(k[3])
-                row_esc, row_id = _unpack_entry(packed)
-                if row_esc != esc_kb:
-                    break
-                if exclude_id_key is None or row_id != exclude_id_key:
-                    key_value = {
-                        field: get_path(candidate_doc, field, default=None) for field in key_spec
-                    }
-                    return name, dict(key_spec), key_value
-                if c.next() != 0:
-                    break
+            # Probe every key the doc contributes, not just the canonical
+            # whole-doc one: on a multikey index mongod enforces
+            # uniqueness across all generated keys, and for a path that
+            # descends through an array the canonical key isn't even
+            # among the entries the writers laid down.
+            for kb in _index_key_variants(
+                candidate_doc, key_spec, sparse=sparse, collation=coll_opt
+            ):
+                if not self._entry_taken(c, db, coll, name, kb, exclude_id_key):
+                    continue
+                return (
+                    name,
+                    dict(key_spec),
+                    _conflict_key_value(candidate_doc, key_spec, kb, collation=coll_opt),
+                )
         return None
+
+    @staticmethod
+    def _entry_taken(
+        c: Any,
+        db: str,
+        coll: str,
+        name: str,
+        kb: bytes,
+        exclude_id_key: bytes | None,
+    ) -> bool:
+        """True if index ``name`` already has an entry for key ``kb``
+        belonging to a document other than ``exclude_id_key``."""
+        esc_kb = _escape_kb(kb)
+        c.reset()
+        c.set_key(db, coll, name, esc_kb + _ENTRY_SEP)
+        rc = c.search_near()
+        if rc == wt.WT_NOTFOUND:
+            return False
+        if rc < 0 and c.next() != 0:
+            return False
+        while True:
+            k = c.get_key()
+            if (k[0], k[1], k[2]) != (db, coll, name):
+                return False
+            row_esc, row_id = _unpack_entry(bytes(k[3]))
+            if row_esc != esc_kb:
+                return False
+            if exclude_id_key is None or row_id != exclude_id_key:
+                return True
+            if c.next() != 0:
+                return False
 
     def _scan_index_for_id_keys(
         self, db: str, coll: str, name: str, kb: bytes, *, prefix: bool = False

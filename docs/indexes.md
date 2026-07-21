@@ -129,14 +129,39 @@ coll.find({"phone": {"$exists": True}}).explain()  # IXSCAN on phone_1
 > Background: Franck Pachot, ["`$exists` and non-sparse indexes in MongoDB
 > and in other DocumentDB"](https://dev.to/franckpachot/exists-and-non-sparse-indexes-in-mongodb-and-in-other-documentdb-19e3).
 
-### Multikey fallback
+### Multikey indexes
 
-SecantusDB doesn't yet support per-element multikey indexing. Instead,
-indexes are flagged `multikey: True` (sticky — never cleared) at insert /
-update / `create_index` time when any indexed field on a doc is a list, and
-the picker skips multikey-flagged indexes — `find()` falls back to a full
-scan + `matches()` so array-element queries (`{tags: "python"}` against
-`{tags: ["python", "go"]}`) return the correct rows.
+A document whose indexed field holds an array contributes several index
+entries: one per array element, plus one for the whole array. Element
+queries and whole-array equality therefore both run at IXSCAN:
+
+```python
+coll.insert_one({"tags": ["python", "go"]})
+coll.create_index("tags")
+coll.find({"tags": "python"})            # per-element entry
+coll.find({"tags": ["python", "go"]})    # whole-array entry
+```
+
+The same walk applies to a dotted path that descends *into* an array of
+subdocuments — the common ODM shape — where the keys are the leaf values
+of each element:
+
+```python
+coll.insert_one({"prices": [{"owner_id": a}, {"owner_id": b}]})
+coll.create_index("prices.owner_id")
+coll.find({"prices.owner_id": b})        # IXSCAN via b's element entry
+```
+
+Such an index is flagged multikey (sticky — never cleared) at insert /
+update / `create_index` time, and `explain` reports `isMultiKey: true` on
+the IXSCAN stage. The flag doesn't disable the index for lookups; it only
+disqualifies it from sort acceleration, because one document mapping to
+many keys breaks the natural-order walk. It is not echoed by
+`listIndexes` — mongod keeps it in the durable catalog, and so do we.
+
+Uniqueness on a multikey index follows mongod's rule: two documents
+conflict as soon as they share *any* generated key, so `{tags: ["a","b"]}`
+and `{tags: ["b","c"]}` collide on `"b"`.
 
 ## Sort acceleration
 
@@ -254,7 +279,8 @@ without `sort` walk in this order, matching `mongod`.
 | `{f: {$gt/$gte/$lt/$lte: v}}` | Range scan |
 | `{f1: v1, f2: v2, ...}` (bare-eq) | Compound prefix exact / scan |
 | `{f1: v1, f2: {$gt: v}}` | Compound prefix + trailing operator |
-| `{f: array}` against a `multikey` index | Falls back to scan |
+| `{f: array}` (whole-array equality) against a multikey index | Whole-array entry |
+| `{"arr.field": v}` into an array of subdocuments | Per-element entry |
 | `{partial_filter_keys, ...index_keys}` | Partial-index path |
 | Sort `{f: ±1}` aligned with an index leading field | B-tree walk in (reversed) order, no post-sort |
 | `hint` | Forces a specific index / `$natural` |
@@ -266,7 +292,7 @@ without `sort` walk in this order, matching `mongod`.
 | Single-field B-tree | equality / `$in` / `$gt`/`$gte`/`$lt`/`$lte` / sort | IXSCAN |
 | Compound B-tree | bare-eq prefix; eq prefix + trailing operator on the next column; ASC/DESC mix; multi-field sort that matches or exactly inverts the key spec | IXSCAN, no post-sort |
 | Partial | when the user filter implies the partial expression | IXSCAN |
-| Multikey | equality / `$in` / range on the array column; whole-array equality goes through the canonical key entry | IXSCAN (sort-acceleration skipped — multikey doesn't preserve a single natural order) |
+| Multikey | equality / `$in` / range on the array column or on a dotted path into an array of subdocuments; whole-array equality goes through the whole-array entry | IXSCAN (sort-acceleration skipped — multikey doesn't preserve a single natural order) |
 | TTL | timestamp range + prune sweeper drives expiry | IXSCAN |
 | `2dsphere` | `$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere` / `$geoNear` via S2 cell-covering scan | IXSCAN — see [Geospatial](geospatial.md) |
 | `2d` | same operators via quadtree-decomposed Z-order range scan over a bit-interleaved geohash | IXSCAN — see [Geospatial](geospatial.md) |

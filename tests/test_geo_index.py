@@ -35,7 +35,7 @@ def _pt(lng: float, lat: float) -> dict:
 # --- Index creation ---------------------------------------------------------
 
 
-def test_create_2dsphere_index(client: MongoClient) -> None:
+def test_create_2dsphere_index(server: SecantusDBServer, client: MongoClient) -> None:
     coll = client["geo_idx"]["sphere"]
     coll.insert_one({"_id": 1, "loc": _pt(0.0, 0.0)})
     name = coll.create_index([("loc", "2dsphere")])
@@ -43,8 +43,10 @@ def test_create_2dsphere_index(client: MongoClient) -> None:
     indexes = list(coll.list_indexes())
     target = next(ix for ix in indexes if ix["name"] == "loc_2dsphere")
     assert target["key"] == {"loc": "2dsphere"}
-    # Geo indexes are flagged multikey so the regular pickers skip them.
-    assert target.get("multikey") is True
+    # mongod's listIndexes carries no multikey flag (probed 6.0.16) — the
+    # internal one that makes the regular pickers skip geo indexes is
+    # catalog state, asserted at the storage layer.
+    assert server.storage.index_is_multikey("geo_idx", "sphere", "loc_2dsphere") is True
 
 
 def test_create_2d_index(client: MongoClient) -> None:

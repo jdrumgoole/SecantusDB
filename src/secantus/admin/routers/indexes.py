@@ -58,8 +58,11 @@ def _index_badges(idx: dict[str, Any]) -> list[str]:
         badges.append("unique")
     if idx.get("sparse"):
         badges.append("sparse")
-    if idx.get("multikey"):
-        badges.append("multikey")
+    # No multikey badge: the flag is catalog state that ``listIndexes``
+    # doesn't carry on mongod (probed 6.0.16) and no longer carries here.
+    # The console talks to any MongoDB over the wire, so it can only badge
+    # what the wire reports; multikey-ness shows up in the explain
+    # visualiser's ``isMultiKey`` instead.
     if idx.get("partialFilterExpression"):
         badges.append("partial")
     ttl = idx.get("expireAfterSeconds")

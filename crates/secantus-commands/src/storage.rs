@@ -377,7 +377,7 @@ pub trait Storage: Send + Sync {
 
     /// The plan `find` would use for these args, without executing — the input to
     /// `explain`'s `winningPlan`. Returns `{kind: "COLLSCAN"}` or
-    /// `{kind: "IXSCAN", indexName, keyPattern, direction}`. Default COLLSCAN; the
+    /// `{kind: "IXSCAN", indexName, keyPattern, direction, multikey}`. Default COLLSCAN; the
     /// WT adapter mirrors the storage index router.
     fn explain_plan(
         &self,

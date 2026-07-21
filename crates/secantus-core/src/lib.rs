@@ -47,7 +47,7 @@ mod windowfields;
 // how `secantus.storage` imports from `secantus.paths`. The module itself stays
 // private — its `set_path` / `unset_path` use deliberate `Result<_, ()>` "defer"
 // signals that shouldn't become public API (clippy::result_unit_err).
-pub use paths::{get_path, has_path};
+pub use paths::{get_path, get_path_values, has_path};
 
 // Re-export the `$group` field-reference pushdown (only) so the command layer
 // can decode just the top-level fields a `$group` reads from wide documents
