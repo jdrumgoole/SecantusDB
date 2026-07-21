@@ -380,6 +380,77 @@ These are explicit non-goals. Don't add them without a reason.
      `--max-worker-restart`, with the #590 faulthandler artifact armed. A crash
      there with a real stack closes the investigation; only then apply a fix.
 
+  ### Measurement session 2026-07-21 — step 3 answered NO, and a real
+  ### unbounded memory leak found in the admin fixtures (not yet proven to be
+  ### the crash cause)
+
+  Hit a **fifth** time on PR #595 (`test (3.10, ubuntu-latest, 1)`, worker `gw0`
+  "Not properly terminated" at ~78%, controller `os._exit(70)` 5m44s later,
+  rerun clean). Ran the step-3 audit with real instrumentation rather than code
+  reading. Results, all on macOS with `-n0` (the *leak* is measurable even where
+  the *crash* is not):
+
+  - **fds are FLAT — step 3 is answered, negative.** `tests/test_admin_skeleton.py`
+    (113 tests): fd count at each test's setup is 12 → 12, net **+0**; threads net
+    +2 (the asyncio default executor pool). So the #563 fd-exhaustion class is
+    **ruled out** for the admin/ws path. (Measure at *setup*, not teardown —
+    fixture finalizers run during the teardown phase, so a teardown-time sample
+    still counts the fixtures' own fds and shows a fake "+61 per test".)
+  - **RSS grows without bound: +206 MB over those 113 tests (+1.8 MB/test),
+    linear, no plateau** (130 MB at test #10 → 256 MB at #110). Control:
+    `tests/test_change_streams.py` (server fixtures, sync, no admin app)
+    **plateaus** at 84 MB (+0.38 MB/test, flat after warm-up). So the growth is
+    specific to the admin file, not to `SecantusDBServer` generally.
+  - **What is retained** (gc-reachable instance counts over the run):
+    `FastAPI` 0→94, `MongoFacade` 0→94, `AsyncClient` 0→94,
+    `_UnixSelectorEventLoop` 0→100, `Task` 0→294, `Future` 0→200,
+    `StopAsyncIteration` 0→94 — i.e. **one event loop leaked per test**, pinned
+    by never-completed awaitables, pinning the async-generator fixture frames
+    (`dict(keys=['app']) <- frame <- traceback <- StopAsyncIteration <- Future`),
+    which pin the app + facade. `Storage`/`SecantusDBServer`/`CursorRegistry`
+    leak only 6 each, so whole servers are *not* the bulk. 94 apps × ~2 MB
+    accounts for essentially all of the +206 MB.
+  - **Deterministic 60-line reproducer** (bisected; kept in the session
+    scratchpad, trivial to recreate): fixtures `server` (real `SecantusDBServer`)
+    → `app` (real `create_app`) → `http` (async `AsyncClient` over
+    `ASGITransport`), 30 parametrised `GET /healthz` tests. Retains **28 loops +
+    28 apps out of 30**. Two controls isolate it: a *trivial* ASGI payload with
+    the identical async-fixture shape retains **0** (so the async-fixture /
+    anyio pattern is innocent), and `create_app` **without** a real server
+    retains **0** (so it needs the actual mongo round-trip through the sync
+    endpoint's threadpool hop).
+  - The cycles are **collectable but never collected** during a normal run —
+    adding a `gc.collect()` at every test *setup* drops retention to 0 while RSS
+    still grows +1.51 MB/test. A single `gc.collect()` in the fixture teardown is
+    NOT enough (24/30 still retained) because the fixture frame still holds the
+    app at that moment.
+  - **Partial fix APPLIED (leak only, not the crash):** the `app` fixture now
+    releases the payload at teardown (`routes.clear()`,
+    `user_middleware.clear()`, `middleware_stack = None`,
+    `state._state.clear()` after `mongo.close()`). Measured on the real file:
+    **+206 MB → +91 MB** (1.82 → 0.80 MB/test), 113/113 still passing; on the
+    reproducer, 28→5 retained. This is landed **on its own merits as a memory-leak
+    fix** — it is explicitly **NOT** claimed to fix the worker crash, and this
+    item stays OPEN. The standing rule (no speculative *crash* fix without a
+    repro of the crash) is intact: nothing in the product changed, only test
+    fixture hygiene. The residual +0.80 MB/test is still unbounded and still
+    wants the loop-pinning root cause.
+  - **Why this is a strong candidate anyway:** an OOM-killed worker (SIGKILL)
+    leaves **no faulthandler dump**, which explains the one fact every prior
+    occurrence shares — the #590 diagnostic is armed for *fatal signals*, so a
+    SIGKILL would still name no culprit. It also explains Linux-only (the OOM
+    killer), late-in-lane (accumulation), intermittent (which files a worker
+    draws), siblings stalling (box-wide memory pressure), rerun-passes, and
+    recurrence on branches that never touch `changestream.py` — the leak is in
+    the *fixtures*, not the router. **Not proven.** Next step is unchanged
+    (Linux repro), but now with a specific thing to watch: worker RSS over time,
+    and `dmesg`/`Killed process` evidence of an OOM kill.
+  - **Also confirmed clean while here:** the ws handler's `finally` correctly
+    cancels+awaits `disconnect_task` and closes the stream, and `read_oplog`
+    holds the storage lock across its body with the `_closed` fence inside it,
+    so `stop()`'s "close storage anyway" path is serialised against it as its
+    comment claims. Neither is the leak.
+
 
 Subtler than the above; these may bite specific test suites.
 
