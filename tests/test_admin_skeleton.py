@@ -928,6 +928,37 @@ def test_ws_changes_streams_collection_event(server, tmp_path) -> None:
         assert evt["event"]["ns"]["coll"] == "c"
 
 
+def test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy(server, tmp_path) -> None:
+    """A quiet stream (no events) that the client closes must not wedge the app.
+
+    Regression for the disconnect-detection path: the tail races
+    ``try_next`` against a disconnect watcher, so a stream with no traffic
+    still notices a gone client. Open a coll-scope stream, receive only the
+    ``open`` frame, close it without any write, then open a *second* stream
+    and confirm an event still flows — proving the quiet-then-closed stream
+    left the app healthy.
+    """
+    from fastapi.testclient import TestClient
+    from pymongo import MongoClient
+
+    app = create_app(mongo_uri=server.uri, token="cs-token", history_path=tmp_path / "h.db")
+    with TestClient(app) as client:
+        # First stream: quiet, then closed without writing anything.
+        with client.websocket_connect("/ws/changes/coll?t=cs-token&db=cs_db&coll=c") as ws:
+            assert ws.receive_json()["type"] == "open"
+        # Second stream on the same app must still deliver events.
+        with client.websocket_connect("/ws/changes/coll?t=cs-token&db=cs_db&coll=c") as ws:
+            assert ws.receive_json()["type"] == "open"
+            mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+            try:
+                mc["cs_db"]["c"].insert_one({"_id": 1, "x": 1})
+            finally:
+                mc.close()
+            evt = ws.receive_json()
+            assert evt["type"] == "event"
+            assert evt["event"]["operationType"] == "insert"
+
+
 def test_ws_changes_rejects_missing_token(server, tmp_path) -> None:
     from fastapi.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect

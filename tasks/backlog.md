@@ -318,6 +318,27 @@ These are explicit non-goals. Don't add them without a reason.
   another calls `stream.close()` after a 50 ms head start — 500 rounds under 12
   background CPU burners; trivial to re-create on a Linux box to attempt the
   repro there.)
+  **MITIGATION APPLIED — PR #588 (branch `ws-changes-disconnect`), NOT yet
+  confirmed on CI.** The two defects the 2026-07-21 investigation confirmed by
+  code reading (no `max_await_time_ms`, and `close()` racing an in-flight
+  `try_next` on a non-thread-safe pymongo `ChangeStream`) are now both fixed in
+  `changestream.py`: (a) `watch(max_await_time_ms=500)` bounds every poll so an
+  orphaned `to_thread` frees within ~0.5s; (b) each `try_next` poll races a
+  `_wait_for_disconnect` watcher so a *quiet* stream notices a gone client
+  immediately (the old loop only detected disconnect on the next `send`, so a
+  quiet-then-closed stream looped until app shutdown); and (c) on disconnect the
+  in-flight poll is **awaited to completion** before the `finally` closes the
+  stream, so `try_next` and `close` never overlap (removing the concurrency
+  race). This is the fix that investigation called "correct on its own merits";
+  it is applied here because it is a genuine correctness fix regardless of the CI
+  crash — but per the "do NOT blind-apply, needs a repro" note it remains **not
+  proven** to kill the Linux crash (never reproduced locally / on macOS — 6×
+  parallel local runs stayed clean). Validated by reasoning + a new
+  quiet-disconnect regression test
+  (`test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy`). **Keep
+  this item open** and watch the durable/test lanes; if it recurs, the CI-only
+  per-worker `faulthandler` artifact the investigation proposed is still the
+  next step to name the culprit.
 
 
 Subtler than the above; these may bite specific test suites.

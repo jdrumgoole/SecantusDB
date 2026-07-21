@@ -7,10 +7,14 @@ each event to the connected admin UI client. Three scopes:
 * ``db`` — ``mc[db].watch()``
 * ``cluster`` — ``mc.watch()``
 
-PyMongo's ``ChangeStream`` is sync; we bridge to async via
-``asyncio.to_thread(stream.try_next)`` and a short sleep when no event
-is pending. The change stream itself is closed in a ``finally`` so the
-upstream cursor isn't left dangling on disconnect.
+PyMongo's ``ChangeStream`` is sync; we bridge to async by racing
+``asyncio.to_thread(stream.try_next)`` against a disconnect watcher so a
+*quiet* stream notices the client is gone instead of only discovering it
+on the next ``send``. The per-poll ``try_next`` is bounded server-side
+(``max_await_time_ms``) because ``asyncio.to_thread`` cannot be cancelled
+mid-flight — an unbounded poll left orphaned on disconnect would linger.
+The change stream itself is closed in a ``finally`` so the upstream cursor
+isn't left dangling.
 
 Frame protocol (JSON):
 
@@ -38,6 +42,31 @@ from secantus.admin.middleware import verify_websocket_token
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+# Cap the server-side awaitData wait per ``try_next`` poll. Small enough
+# that an orphaned poll thread (left behind when the client disconnects
+# mid-``to_thread``) frees quickly rather than lingering under CI load, big
+# enough that a quiet stream doesn't tight-loop.
+_MAX_AWAIT_MS = 500
+
+
+async def _wait_for_disconnect(websocket: WebSocket) -> None:
+    """Return once the client disconnects.
+
+    The admin change-stream client never sends application frames after
+    connect, so we drain ``receive()`` purely to observe the disconnect
+    message. Racing this against each ``try_next`` poll lets a quiet stream
+    notice a gone client immediately instead of looping until the next event
+    (or app shutdown) forces a ``send``.
+    """
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+    except WebSocketDisconnect:
+        return
 
 
 def _serialize_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -96,15 +125,31 @@ async def ws_changes(
     await websocket.send_json({"type": "open", "scope": scope, "namespace": namespace})
 
     stream = None
+    disconnect_task = asyncio.ensure_future(_wait_for_disconnect(websocket))
     try:
-        stream = await asyncio.to_thread(target.watch)
+        stream = await asyncio.to_thread(target.watch, max_await_time_ms=_MAX_AWAIT_MS)
         while True:
-            event = await asyncio.to_thread(stream.try_next)
+            poll_task = asyncio.ensure_future(asyncio.to_thread(stream.try_next))
+            done, _pending = await asyncio.wait(
+                {poll_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                # Client is gone. Wait for the in-flight poll thread to
+                # actually finish (bounded to ~``_MAX_AWAIT_MS`` by the
+                # server-side awaitData cap) before breaking — the ``finally``
+                # closes the stream from *this* thread, and pymongo cursors
+                # aren't thread-safe, so ``try_next`` and ``close`` must never
+                # overlap. Cancelling the future wouldn't stop the thread;
+                # only awaiting it does. The result/exception is discarded.
+                with contextlib.suppress(Exception):
+                    await poll_task
+                break
+            event = poll_task.result()
             if event is None:
-                # ``try_next`` returns None when the underlying tailable
-                # cursor has no event ready. Yield briefly so we don't
-                # tight-loop on a quiet stream.
-                await asyncio.sleep(0.5)
+                # ``try_next`` returns None when the tailable cursor had no
+                # event ready within the server's awaitData window; loop.
+                # ``_MAX_AWAIT_MS`` paces this so it isn't a tight loop.
                 continue
             await websocket.send_json({"type": "event", "event": _serialize_event(dict(event))})
     except WebSocketDisconnect:
@@ -116,6 +161,9 @@ async def ws_changes(
         with contextlib.suppress(Exception):
             await websocket.send_json({"type": "error", "message": str(exc)})
     finally:
+        disconnect_task.cancel()
+        with contextlib.suppress(Exception):
+            await disconnect_task
         if stream is not None:
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(stream.close)
