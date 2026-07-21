@@ -110,7 +110,77 @@ fn too_large_write_error(index: usize, size: usize) -> Document {
 }
 
 const COLL_TABLE: &str = "table:secantus_collections";
+/// Legacy single documents table. Retained for the on-disk upgrade read/migration
+/// (a store written by an older build has its rows here). New writes go to the
+/// per-collection shard tables — see `DOC_SHARDS` / `doc_table_for`.
 const DOC_TABLE: &str = "table:secantus_documents";
+/// The documents table is sharded across `DOC_SHARDS` WT tables, routed by a
+/// deterministic hash of `(db, coll)`. Every collection lives ENTIRELY in one
+/// shard, so per-collection ops (insert / find / scan / update / delete) touch a
+/// single shard with no merge — the point is that concurrent writers to different
+/// collections land on different WT files, and thus different block-manager locks
+/// and cache regions, instead of all serialising on one `secantus_documents` file
+/// (the 8-writer scaling bottleneck; `tasks/rust-mongodb-parity-redesign.md`).
+const DOC_SHARDS: u64 = 16;
+
+/// Deterministic FNV-1a hash of `(db, coll)` — stable across process restarts (a
+/// collection must always resolve to the same shard). `std`'s DefaultHasher is
+/// randomised per run, so it can't be used here.
+fn doc_shard_hash(db: &str, coll: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in db.bytes().chain(std::iter::once(0u8)).chain(coll.bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Shard table name for shard index `s` (0..DOC_SHARDS).
+fn doc_shard_name(s: u64) -> String {
+    format!("table:secantus_documents_sh{s}")
+}
+
+/// The documents shard table a `(db, coll)` lives in.
+fn doc_table_for(db: &str, coll: &str) -> String {
+    doc_shard_name(doc_shard_hash(db, coll) % DOC_SHARDS)
+}
+
+/// One-time migration: move every row in the legacy single `secantus_documents`
+/// table to its per-collection shard (a store written before doc-sharding). A
+/// born-sharded store's legacy table is empty, so this is a quick no-op scan on
+/// open. Runs on the bootstrap session before the connection serves requests.
+fn migrate_legacy_docs(session: &Session) -> Result<()> {
+    let src = session.open_cursor(DOC_TABLE, None)?;
+    let mut rows: Vec<(String, String, Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut more = src.next()?;
+    while more {
+        let (db, coll, id_key) = src.get_key_ssu()?;
+        let blob = src.get_value_u()?;
+        rows.push((db, coll, id_key, blob));
+        more = src.next()?;
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+    for (db, coll, id_key, blob) in &rows {
+        let dst = session.open_cursor(&doc_table_for(db, coll), None)?;
+        dst.set_key_ssu(db, coll, id_key);
+        dst.set_value_u(blob);
+        dst.insert()?;
+    }
+    let del = session.open_cursor(DOC_TABLE, None)?;
+    for (db, coll, id_key, _) in &rows {
+        del.reset()?;
+        del.set_key_ssu(db, coll, id_key);
+        match del.remove() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 const IDX_TABLE: &str = "table:secantus_indexes";
 const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
 
@@ -1800,6 +1870,15 @@ impl Storage {
             for s in 0..OPLOG_SHARDS {
                 boot.create(&oplog_shard_name(s), QU_COMPRESSED_CFG)?;
             }
+            // The documents table is sharded per collection (see DOC_SHARDS); the
+            // legacy single table above stays in BOOTSTRAP so a pre-shard store's
+            // rows remain reachable for the one-time migration below.
+            for s in 0..DOC_SHARDS {
+                boot.create(&doc_shard_name(s), DOC_TABLE_CFG)?;
+            }
+            // One-time: fold a pre-shard store's legacy documents rows into the
+            // per-collection shards (no-op for a born-sharded store).
+            migrate_legacy_docs(&boot)?;
             // Recover the oplog seq / timestamp counters from the meta row, or
             // reconstruct them by scanning the oplog table.
             load_oplog_meta(&boot)?
@@ -2957,7 +3036,7 @@ impl Storage {
                     return Err(StorageError::DuplicateKey(Box::new(c)));
                 }
                 // overwrite=false -> a pre-existing _id is a WT_DUPLICATE_KEY.
-                let cur = session.open_cursor(DOC_TABLE, Some("overwrite=false"))?;
+                let cur = session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
                 cur.set_key_ssu(db, coll, &key);
                 cur.set_value_u(&blob);
                 match cur.insert() {
@@ -3024,7 +3103,8 @@ impl Storage {
                 let mut errors: Vec<Document> = Vec::new();
                 let mut oplog_entries: Vec<Document> = Vec::new();
                 let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
-                let doc_cur = session.open_cursor(DOC_TABLE, Some("overwrite=false"))?;
+                let doc_cur =
+                    session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
                 for (index, doc_bytes) in docs.iter().enumerate() {
                     let mut doc = decode_doc(doc_bytes)?;
                     if !doc.contains_key("_id") {
@@ -3136,7 +3216,7 @@ impl Storage {
         // Lock-free read (see the `lock` field's invariants).
         let key = id_key(id)?;
         let session = self.op_session()?;
-        let cur = session.open_cursor(DOC_TABLE, None)?;
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         cur.set_key_ssu(db, coll, &key);
         match cur.search() {
             Ok(()) => Ok(Some(cur.get_value_u()?)),
@@ -3149,7 +3229,7 @@ impl Storage {
     pub fn scan_collection(&self, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.op_session()?;
-        let cur = session.open_cursor(DOC_TABLE, None)?;
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         let mut out = Vec::new();
         // Position at the first key >= (db, coll, "") then walk while the
         // (db, coll) prefix matches.
@@ -3193,7 +3273,7 @@ impl Storage {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
                 // Existence check — capture the old doc so we can retract its entries.
-                let probe = session.open_cursor(DOC_TABLE, None)?;
+                let probe = session.open_cursor(&doc_table_for(db, coll), None)?;
                 probe.set_key_ssu(db, coll, &key);
                 let old_blob = match probe.search() {
                     Ok(()) => probe.get_value_u()?,
@@ -3215,7 +3295,7 @@ impl Storage {
                     return Err(StorageError::DuplicateKey(Box::new(c)));
                 }
 
-                let cur = session.open_cursor(DOC_TABLE, None)?;
+                let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 cur.set_key_ssu(db, coll, &key);
                 cur.set_value_u(&blob);
                 cur.update()?;
@@ -3268,7 +3348,7 @@ impl Storage {
             let key = id_key(id)?;
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                let cur = session.open_cursor(DOC_TABLE, None)?;
+                let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 cur.set_key_ssu(db, coll, &key);
                 // Read the doc first so we can retract its index entries, then remove.
                 let old_blob = match cur.search() {
@@ -3344,7 +3424,7 @@ impl Storage {
                 let descs = self.index_descs(&session, db, coll)?;
                 // Snapshot candidates before mutating (no cursor walk while deleting).
                 let candidates = self.scan_docs(&session, db, coll)?;
-                let doc_cur = session.open_cursor(DOC_TABLE, None)?;
+                let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 let mut pruned = 0usize;
                 for (id_k, blob) in candidates {
                     let doc = decode_doc(&blob)?;
@@ -3697,7 +3777,9 @@ impl Storage {
         let idx_rows = self.collect_idx_rows(&session, src_db, src_coll)?;
         let entry_rows = self.collect_entry_rows(&session, src_db, src_coll)?;
         self.purge_collection_tables(&session, src_db, src_coll)?;
-        let dcur = session.open_cursor(DOC_TABLE, None)?;
+        // Sharded: dst rows go to the dst collection's shard (may differ from the
+        // src shard — the src rows were already read into `docs` and purged above).
+        let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
         for (id_k, blob) in &docs {
             dcur.reset()?;
             dcur.set_key_ssu(dst_db, dst_coll, id_k);
@@ -4598,7 +4680,7 @@ impl Storage {
         db: &str,
         coll: &str,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let cur = session.open_cursor(DOC_TABLE, None)?;
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         let mut out = Vec::new();
         cur.set_key_ssu(db, coll, b"");
         let mut more = match cur.search_near() {
@@ -4763,7 +4845,7 @@ impl Storage {
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e.into()),
         };
-        let doc = session.open_cursor(DOC_TABLE, None)?;
+        let doc = session.open_cursor(&doc_table_for(db, coll), None)?;
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut saw_any = false;
         while more {
@@ -4810,7 +4892,7 @@ impl Storage {
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e.into()),
         };
-        let doc = session.open_cursor(DOC_TABLE, None)?;
+        let doc = session.open_cursor(&doc_table_for(db, coll), None)?;
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut saw_any = false;
         while more {
@@ -4873,7 +4955,7 @@ impl Storage {
         let mut total: i64 = scanned.iter().map(|(_, b)| b.len() as i64).sum();
         let mut count = scanned.len() as i64;
         let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
-        let doc_cur = session.open_cursor(DOC_TABLE, None)?;
+        let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         for (id_k, blob) in scanned {
             let over_size = size_limit.is_some_and(|s| total > s);
             let over_max = max_limit.is_some_and(|m| count > m);
@@ -5329,7 +5411,7 @@ impl Storage {
     /// (everything except its `secantus_collections` registry row). Shared by
     /// `drop_collection` / `drop_database` / `rename_collection`.
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
-        let doc_cur = session.open_cursor(DOC_TABLE, None)?;
+        let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         for (id_k, _blob) in self.scan_docs(session, db, coll)? {
             doc_cur.reset()?;
             doc_cur.set_key_ssu(db, coll, &id_k);
@@ -5612,7 +5694,7 @@ impl Storage {
             return self.scan_docs(session, db, coll);
         }
         if let Some(id_keys) = self.try_index_id_keys(session, db, coll, filter)? {
-            let cur = session.open_cursor(DOC_TABLE, None)?;
+            let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
             let mut out = Vec::new();
             for id_k in id_keys {
@@ -5877,7 +5959,7 @@ impl Storage {
                         let (additions, removals) =
                             self.index_entry_diff(&doc, &new, &descs, Some(&id_k))?;
                         self.insert_index_entries(&session, db, coll, &additions)?;
-                        let cur = session.open_cursor(DOC_TABLE, None)?;
+                        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                         cur.set_key_ssu(db, coll, &id_k);
                         cur.set_value_u(&new_blob);
                         cur.update()?;
@@ -5957,7 +6039,7 @@ impl Storage {
                     if new_blob.len() > MAX_BSON_OBJECT_SIZE {
                         return Err(StorageError::DocumentTooLarge(new_blob.len()));
                     }
-                    let cur = session.open_cursor(DOC_TABLE, None)?;
+                    let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                     cur.set_key_ssu(db, coll, &new_id_key);
                     cur.set_value_u(&new_blob);
                     cur.insert()?;
@@ -6046,7 +6128,7 @@ impl Storage {
                     let doc = decode_doc(&blob)?;
                     // Doc row first, entries after — see prune_ttl for the lock-free
                     // reader ordering rationale.
-                    let cur = session.open_cursor(DOC_TABLE, None)?;
+                    let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                     cur.set_key_ssu(db, coll, &id_k);
                     cur.remove()?;
                     self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
@@ -7004,7 +7086,7 @@ impl Storage {
         coll: &str,
         id_keys: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>> {
-        let cur = session.open_cursor(DOC_TABLE, None)?;
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         let mut seen: HashSet<&[u8]> = HashSet::new();
         let mut out = Vec::new();
         for id_k in id_keys {
@@ -7521,6 +7603,18 @@ mod tests {
     //! `test_indexes.py` sees identical bytes. No WiredTiger needed.
     use super::*;
     use bson::doc;
+
+    /// `doc_shard_hash` must be byte-for-byte identical to the Python
+    /// `storage._doc_shard_hash` so a collection routes to the same documents
+    /// shard in both servers (cross-server backup / PITR portability). Values
+    /// computed by the Python FNV-1a over `db + b"\0" + coll`.
+    #[test]
+    fn doc_shard_hash_matches_python() {
+        assert_eq!(doc_shard_hash("harness", "w1"), 9941274063389089977);
+        assert_eq!(doc_shard_hash("harness", "w8"), 9941281759970487454);
+        assert_eq!(doc_shard_hash("test", "users"), 16319205138020980013);
+        assert_eq!(doc_shard_hash("", ""), 12638153115695167455);
+    }
 
     /// `wt_config` with the engine defaults must produce the exact
     /// `DEFAULT_CONFIG` string so `Storage::open` behaviour is unchanged.

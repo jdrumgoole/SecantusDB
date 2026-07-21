@@ -122,7 +122,80 @@ def _doc_geo_cells(
 
 
 _COLL_TABLE = "table:secantus_collections"
+# Legacy single documents table. Retained for the one-time on-open migration of a
+# pre-shard store; new rows go to the per-collection shards below.
 _DOC_TABLE = "table:secantus_documents"
+# The documents table is sharded across ``_DOC_SHARDS`` WT tables, routed by a
+# deterministic hash of ``(db, coll)`` so concurrent writers to different
+# collections land on different WT files (different block-manager locks + cache
+# regions) instead of one shared ``secantus_documents`` file — measured ~+19%
+# aggregate throughput at 4 concurrent writers (see the Rust ``DOC_SHARDS`` and
+# ``tasks/rust-mongodb-parity-redesign.md``). Every collection lives entirely in
+# one shard, so per-collection ops touch a single shard with no merge. The Python
+# and Rust servers MUST route identically (same hash) so a collection resolves to
+# the same shard in both — cross-server backup / PITR portability.
+_DOC_SHARDS = 16
+
+
+def _doc_shard_hash(db: str, coll: str) -> int:
+    """FNV-1a (64-bit) over ``db + b"\\x00" + coll`` — byte-for-byte identical to
+    the Rust ``doc_shard_hash`` so both servers route a collection to the same
+    shard. ``std``'s hash is randomised per run and cannot be used here."""
+    h = 0xCBF29CE484222325
+    for b in db.encode() + b"\x00" + coll.encode():
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def _doc_shard_name(s: int) -> str:
+    return f"table:secantus_documents_sh{s}"
+
+
+def _doc_table_for(db: str, coll: str) -> str:
+    return _doc_shard_name(_doc_shard_hash(db, coll) % _DOC_SHARDS)
+
+
+# Every documents shard table + the legacy single table (for migration / purge /
+# rename table-set operations).
+_DOC_ALL_TABLES = [_doc_shard_name(s) for s in range(_DOC_SHARDS)] + [_DOC_TABLE]
+
+
+def _migrate_legacy_docs(session: Any) -> None:
+    """One-time on-open migration: move every row in the legacy single
+    ``secantus_documents`` table to its per-collection shard (a store written
+    before doc-sharding). A born-sharded store's legacy table is empty, so this is
+    a quick no-op scan. Mirrors the Rust ``migrate_legacy_docs``."""
+    src = session.open_cursor(_DOC_TABLE, None)
+    rows: list[tuple[str, str, bytes, bytes]] = []
+    try:
+        rc = src.next()
+        while rc == 0:
+            k = src.get_key()
+            rows.append((k[0], k[1], bytes(k[2]), bytes(src.get_value())))
+            rc = src.next()
+    finally:
+        src.close()
+    if not rows:
+        return
+    for db, coll, id_key, blob in rows:
+        dst = session.open_cursor(_doc_table_for(db, coll), None)
+        try:
+            dst.set_key(db, coll, id_key)
+            dst.set_value(blob)
+            dst.insert()
+        finally:
+            dst.close()
+    delc = session.open_cursor(_DOC_TABLE, None)
+    try:
+        for db, coll, id_key, _ in rows:
+            delc.set_key(db, coll, id_key)
+            with contextlib.suppress(Exception):
+                delc.remove()
+            delc.reset()
+    finally:
+        delc.close()
+
+
 # Natural-order (insertion-order) index. mongod returns documents from an
 # unsorted ``find`` in insertion order (its RecordId store order); our doc
 # table is keyed by ``id_key`` (``_id`` sort order), which only coincides with
@@ -1043,6 +1116,10 @@ class Storage:
         try:
             boot.create(_COLL_TABLE, "key_format=SS,value_format=u")
             boot.create(_DOC_TABLE, "key_format=SSu,value_format=u")
+            # Per-collection documents shards (see ``_DOC_SHARDS``). The legacy
+            # single table above stays for the one-time migration below.
+            for _s in range(_DOC_SHARDS):
+                boot.create(_doc_shard_name(_s), "key_format=SSu,value_format=u")
             boot.create(_NAT_TABLE, "key_format=SSq,value_format=u")
             boot.create(_NAT_SEQ_TABLE, "key_format=SSu,value_format=q")
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
@@ -1059,6 +1136,9 @@ class Storage:
             boot.create(_USERS_TABLE, "key_format=SS,value_format=u")
             boot.create(_ROLES_TABLE, "key_format=SS,value_format=u")
             boot.create(_PROFILE_TABLE, "key_format=S,value_format=u")
+            # One-time: fold a pre-shard store's legacy documents rows into the
+            # per-collection shards (no-op for a born-sharded store).
+            _migrate_legacy_docs(boot)
         finally:
             boot.close()
 
@@ -1297,7 +1377,7 @@ class Storage:
         if rc == wt.WT_NOTFOUND or (rc < 0 and nat.next() != 0):
             yield from self._scan_docs(db, coll)
             return
-        doc = self._cursor(_DOC_TABLE)
+        doc = self._cursor(_doc_table_for(db, coll))
         saw_any = False
         while True:
             k = nat.get_key()
@@ -3158,7 +3238,7 @@ class Storage:
             return True
 
     def _scan_docs(self, db: str, coll: str) -> Iterable[tuple[bytes, bytes]]:
-        c = self._cursor(_DOC_TABLE)
+        c = self._cursor(_doc_table_for(db, coll))
         c.set_key(db, coll, b"")
         rc = c.search_near()
         if rc == wt.WT_NOTFOUND:
@@ -3322,7 +3402,7 @@ class Storage:
                     if ordered:
                         break
                     continue
-                doc_cur = self._cursor(_DOC_TABLE, overwrite=False)
+                doc_cur = self._cursor(_doc_table_for(db, coll), overwrite=False)
                 doc_cur.set_key(db, coll, key)
                 doc_cur.set_value(blob)
                 try:
@@ -3418,7 +3498,7 @@ class Storage:
                 break
             doc = bson.decode(blob)
             self._delete_index_entries(db, coll, doc, indexes, partials)
-            doc_cur = self._cursor(_DOC_TABLE)
+            doc_cur = self._cursor(_doc_table_for(db, coll))
             doc_cur.set_key(db, coll, id_k)
             doc_cur.remove()
             self._delete_nat_entry(db, coll, id_k)
@@ -4245,7 +4325,7 @@ class Storage:
                     self._delete_index_entries(
                         db, coll, doc, indexes, partials, id_key_override=id_k
                     )
-                    doc_cur = self._cursor(_DOC_TABLE)
+                    doc_cur = self._cursor(_doc_table_for(db, coll))
                     doc_cur[db, coll, new_id_key] = new_blob
                     self._write_index_entries(
                         db, coll, new, indexes, partials, id_key_override=id_k
@@ -4320,7 +4400,7 @@ class Storage:
                         "Plan executor error during update :: caused by :: "
                         f"Document to upsert is larger than {MAX_BSON_OBJECT_SIZE}",
                     )
-                doc_cur = self._cursor(_DOC_TABLE)
+                doc_cur = self._cursor(_doc_table_for(db, coll))
                 doc_cur[db, coll, _id_key(upserted_id)] = upsert_blob
                 self._write_index_entries(db, coll, new, indexes, partials)
                 self._write_nat_entry(db, coll, _id_key(upserted_id))
@@ -4409,7 +4489,7 @@ class Storage:
                 if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
                 self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
-                doc_cur = self._cursor(_DOC_TABLE)
+                doc_cur = self._cursor(_doc_table_for(db, coll))
                 doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
                 self._delete_nat_entry(db, coll, id_k)
@@ -4491,7 +4571,7 @@ class Storage:
                 if not expired:
                     continue
                 self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
-                doc_cur = self._cursor(_DOC_TABLE)
+                doc_cur = self._cursor(_doc_table_for(db, coll))
                 doc_cur.set_key(db, coll, id_k)
                 doc_cur.remove()
                 self._delete_nat_entry(db, coll, id_k)
@@ -4512,9 +4592,11 @@ class Storage:
 
     @staticmethod
     def _table_kf(table: str) -> str:
+        # The legacy _DOC_TABLE and every _documents_shN shard share key format SSu.
+        if table.startswith("table:secantus_documents"):
+            return "SSu"
         return {
             _COLL_TABLE: "SS",
-            _DOC_TABLE: "SSu",
             _NAT_TABLE: "SSq",
             _NAT_SEQ_TABLE: "SSu",
             _IDX_TABLE: "SSS",
@@ -4569,7 +4651,13 @@ class Storage:
             self._refresh_read_snapshot()
             existed = self._coll_options(db, coll) is not None
             ui = self._collection_uuid(db, coll) if existed else None
-            for tbl in (_DOC_TABLE, _NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+            for tbl in (
+                _doc_table_for(db, coll),
+                _NAT_TABLE,
+                _NAT_SEQ_TABLE,
+                _IDX_TABLE,
+                _IDX_ENTRIES_TABLE,
+            ):
                 rows = self._collect_prefix(tbl, (db, coll))
                 self._delete_keys(tbl, [k for k, _ in rows])
             c = self._cursor(_COLL_TABLE)
@@ -4601,8 +4689,10 @@ class Storage:
             for c_name in self.list_collections(db):
                 ui = self._collection_uuid(db, c_name)
                 colls_with_ui.append((c_name, ui))
+            # Doc table sharded: a db's collections span all shards (+ legacy), so
+            # purge every documents table for the db prefix.
             for tbl in (
-                _DOC_TABLE,
+                *_DOC_ALL_TABLES,
                 _NAT_TABLE,
                 _NAT_SEQ_TABLE,
                 _IDX_TABLE,
@@ -4650,14 +4740,31 @@ class Storage:
             if dst_existed:
                 if not drop_target:
                     return False, f"target namespace exists: {dst_db}.{dst_coll}"
-                for tbl in (_DOC_TABLE, _NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+                for tbl in (
+                    _doc_table_for(dst_db, dst_coll),
+                    _NAT_TABLE,
+                    _NAT_SEQ_TABLE,
+                    _IDX_TABLE,
+                    _IDX_ENTRIES_TABLE,
+                ):
                     rows = self._collect_prefix(tbl, (dst_db, dst_coll))
                     self._delete_keys(tbl, [k for k, _ in rows])
                 c = self._cursor(_COLL_TABLE)
                 c.set_key(dst_db, dst_coll)
                 if c.search() == 0:
                     c.remove()
-            for tbl in (_DOC_TABLE, _NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+            # Doc table sharded: src collection lives in src's shard, dst in dst's
+            # shard (may differ) — read from one, write to the other.
+            src_doc_tbl = _doc_table_for(src_db, src_coll)
+            doc_rows = self._collect_prefix(src_doc_tbl, (src_db, src_coll))
+            self._delete_keys(src_doc_tbl, [k for k, _ in doc_rows])
+            dst_doc = self._cursor(_doc_table_for(dst_db, dst_coll))
+            for k, v in doc_rows:
+                dst_doc.set_key(dst_db, dst_coll, k[2])
+                dst_doc.set_value(v)
+                dst_doc.insert()
+                dst_doc.reset()
+            for tbl in (_NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
                 rows = self._collect_prefix(tbl, (src_db, src_coll))
                 self._delete_keys(tbl, [k for k, _ in rows])
                 c = self._cursor(tbl)
@@ -5478,7 +5585,7 @@ class Storage:
     def _docs_by_id_keys(self, db: str, coll: str, id_keys: list[bytes]) -> list[dict[str, Any]]:
         if not id_keys:
             return []
-        c = self._cursor(_DOC_TABLE)
+        c = self._cursor(_doc_table_for(db, coll))
         # Two-stage: WT cursor walk first (raw bytes), then ``bson.decode``
         # outside that loop. The cursor work is what needs lock scope;
         # decode is pure CPU and benefits from running unsynchronised.
@@ -5905,7 +6012,7 @@ class Storage:
         if filter:
             id_keys = self._try_index_id_keys(db, coll, filter)
             if id_keys is not None:
-                c = self._cursor(_DOC_TABLE)
+                c = self._cursor(_doc_table_for(db, coll))
                 out: list[tuple[bytes, bytes]] = []
                 # Same dedup contract as ``_docs_by_id_keys``: multikey
                 # indexes can yield duplicate id_keys for one doc.
