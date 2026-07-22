@@ -239,7 +239,49 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **ws-changes xdist worker crash (Linux CI, recurring).**
+- [x] **ws-changes xdist worker crash (Linux CI, recurring) — ROOT-CAUSED AND
+  FIXED 2026-07-22. It was never a crash: it is an unbounded websocket receive
+  in a test.** Confirmed by a controlled repro (`crash-repro.yml`,
+  `mode=ws-single`, run 29877050313, attempt 2/3), which caught the
+  `+++ Timeout +++` stack the previous seven occurrences had all lost. The
+  chain, verified end to end:
+
+  1. `test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy` calls
+     starlette `TestClient`'s `ws.receive_json()`, which takes **no timeout** and
+     blocks forever. The dump has MainThread parked in
+     `testclient.py:receive → portal.call(self._send_rx.receive)` at
+     `tests/test_admin_skeleton.py:973`, waiting for an event that never came.
+  2. At 120 s, `--timeout-method=thread` (what every lane uses) fires. That
+     method writes its stack to the worker's **stderr** and then calls
+     `os._exit()`.
+  3. xdist **discards a dead worker's stderr**, so the stack vanished; `os._exit`
+     is not a signal, so faulthandler wrote nothing; no memory was involved, so
+     `dmesg` was clean. Net symptom: `node down: Not properly terminated`, no
+     `FAILED` line, no stack, no OOM — for seven occurrences.
+
+  **Fix:** `tests/test_admin_skeleton.py` now wraps every event-awaiting receive
+  in `_recv_json(ws, timeout=30)` (a daemon-thread pull with a deadline), so a
+  stream that produces nothing fails as a normal assertion instead of vanishing a
+  worker. Receives inside `pytest.raises(WebSocketDisconnect)` keep blocking
+  semantics deliberately — their frame is a close, which arrives promptly.
+
+  **Two hypotheses this kills, both of which had real evidence behind them:**
+  * **OOM / the admin-fixture memory leak.** Refuted by measurement: zero `dmesg`
+    OOM lines, peak RSS 1218–1333 MB against a 3 GB cap that never bit. The leak
+    is real (+206 MB per 113 tests, halved in #597) and worth fixing on its own
+    merits, but it is **not** this.
+  * **A WiredTiger / server-teardown race** (this item's prime suspect for
+    months). The storage layer is exonerated: the connection thread in the dump
+    is sitting in `_get_more`'s **bounded** `_oplog_cv.wait_for`, behaving
+    correctly on a genuinely quiet stream.
+
+  **Method note worth keeping:** the diagnostic that finally worked was removing
+  xdist (`-n0`), not adding more instrumentation — the evidence existed all along
+  and was being thrown away by the harness that collected it. When a failure is
+  persistently anonymous, suspect the collector before the code.
+
+- [ ] ~~**ws-changes xdist worker crash (Linux CI, recurring).**~~ (historical
+  investigation record for the item above; kept for the reasoning trail)
   `tests/test_admin_skeleton.py::test_ws_changes_streams_collection_event`
   intermittently hard-crashes its Linux xdist worker ("Not properly
   terminated", ~11-12 min into the lane) and the REMAINING workers' progress

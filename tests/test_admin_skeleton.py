@@ -8,6 +8,9 @@ cookie hand-off, and template rendering against a live ``serverStatus``.
 
 from __future__ import annotations
 
+import threading
+from typing import Any
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -15,6 +18,48 @@ import secantus
 from secantus import SecantusDBServer
 from secantus.admin import create_app
 from secantus.admin.middleware import COOKIE_NAME, HEADER_NAME, QUERY_NAME
+
+# starlette's TestClient websocket receive blocks FOREVER — it takes no
+# timeout. A frame that never arrives therefore wedges the whole pytest
+# process until pytest-timeout's thread method fires, and that method writes
+# its stack to stderr (which xdist discards for a dead worker) before calling
+# os._exit(). The result is an anonymous "node down: Not properly terminated"
+# with no traceback, no fatal signal and no OOM — which is exactly what the
+# recurring Linux worker-death was, across seven occurrences, chased through
+# an admin-fixture memory leak and a WiredTiger-teardown theory before a
+# controlled repro (run 29877050313) caught the timeout stack and named this
+# line. Bounding the wait turns "the worker vanished" into an ordinary,
+# diagnosable assertion failure. See tasks/backlog.md.
+_WS_RECV_TIMEOUT = 30.0
+
+
+def _recv_json(ws: Any, timeout: float = _WS_RECV_TIMEOUT) -> Any:
+    """``ws.receive_json()`` with a deadline instead of an infinite block.
+
+    The puller runs on a daemon thread so a frame that never arrives can't
+    keep the interpreter alive at exit either.
+    """
+    box: dict[str, Any] = {}
+
+    def _pull() -> None:
+        try:
+            box["value"] = ws.receive_json()
+        except BaseException as exc:  # surfaced on the calling thread below
+            box["error"] = exc
+
+    puller = threading.Thread(target=_pull, daemon=True, name="ws-recv")
+    puller.start()
+    puller.join(timeout)
+    if puller.is_alive():
+        raise AssertionError(
+            f"no websocket frame within {timeout}s — the stream produced nothing. "
+            "Bounded on purpose: an unbounded receive here used to surface as an "
+            "anonymous xdist worker death instead of this message."
+        )
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
 
 pytestmark = pytest.mark.anyio
 
@@ -747,12 +792,12 @@ def test_ws_metrics_streams_backlog_and_tick(server, tmp_path) -> None:
         app.state.sampler.tick_once()
 
         with client.websocket_connect("/ws/metrics?t=ws-token") as ws:
-            backlog = ws.receive_json()
+            backlog = _recv_json(ws)
             assert backlog["type"] == "backlog"
             assert isinstance(backlog["samples"], list)
             # Trigger another tick after subscribing, expect a streamed frame.
             app.state.sampler.tick_once()
-            tick = ws.receive_json()
+            tick = _recv_json(ws)
             assert tick["type"] == "tick"
             sample = tick["sample"]
             assert "uptime" in sample
@@ -928,7 +973,7 @@ def test_ws_changes_streams_collection_event(server, tmp_path) -> None:
         TestClient(app) as client,
         client.websocket_connect("/ws/changes/coll?t=cs-token&db=cs_db&coll=c") as ws,
     ):
-        opened = ws.receive_json()
+        opened = _recv_json(ws)
         assert opened["type"] == "open"
         assert opened["namespace"] == "cs_db.c"
         # Insert a doc; expect an "insert" event to come through.
@@ -937,7 +982,7 @@ def test_ws_changes_streams_collection_event(server, tmp_path) -> None:
             mc["cs_db"]["c"].insert_one({"_id": 1, "x": 1})
         finally:
             mc.close()
-        evt = ws.receive_json()
+        evt = _recv_json(ws)
         assert evt["type"] == "event"
         assert evt["event"]["operationType"] == "insert"
         assert evt["event"]["ns"]["db"] == "cs_db"
@@ -961,16 +1006,16 @@ def test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy(server, tm
     with TestClient(app) as client:
         # First stream: quiet, then closed without writing anything.
         with client.websocket_connect("/ws/changes/coll?t=cs-token&db=cs_db&coll=c") as ws:
-            assert ws.receive_json()["type"] == "open"
+            assert _recv_json(ws)["type"] == "open"
         # Second stream on the same app must still deliver events.
         with client.websocket_connect("/ws/changes/coll?t=cs-token&db=cs_db&coll=c") as ws:
-            assert ws.receive_json()["type"] == "open"
+            assert _recv_json(ws)["type"] == "open"
             mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
             try:
                 mc["cs_db"]["c"].insert_one({"_id": 1, "x": 1})
             finally:
                 mc.close()
-            evt = ws.receive_json()
+            evt = _recv_json(ws)
             assert evt["type"] == "event"
             assert evt["event"]["operationType"] == "insert"
 

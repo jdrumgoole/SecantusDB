@@ -122,12 +122,20 @@ async def ws_changes(
         target = client[db][coll]
         namespace = f"{db}.{coll}"
 
-    await websocket.send_json({"type": "open", "scope": scope, "namespace": namespace})
-
     stream = None
     disconnect_task = asyncio.ensure_future(_wait_for_disconnect(websocket))
     try:
+        # Establish the change stream BEFORE announcing "open". The frame is a
+        # client-visible promise that writes from here on will be observed, and
+        # ``watch()`` is a round-trip to the server (it opens a cursor). Sending
+        # "open" first leaves a window in which a client that writes the moment
+        # it sees the frame loses that event forever — the stream's start point
+        # is only fixed once ``watch()`` returns. Widen that window with CI load
+        # and it stops being theoretical: it is why the ws tests, which do
+        # exactly this (receive "open" -> insert -> await the event), waited for
+        # an event that was never coming.
         stream = await asyncio.to_thread(target.watch, max_await_time_ms=_MAX_AWAIT_MS)
+        await websocket.send_json({"type": "open", "scope": scope, "namespace": namespace})
         while True:
             poll_task = asyncio.ensure_future(asyncio.to_thread(stream.try_next))
             done, _pending = await asyncio.wait(
