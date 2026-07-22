@@ -2171,27 +2171,27 @@ threading into `wt_config`.)
 
 ### 7.7 Rust storage: no close-time checkpoint / no `durable` mode
 
-- [ ] **Rust `Storage` never checkpoints on close — no analogue of the Python
-  server's `durable` close-checkpoint.** The Python `Storage.close` forces a WT
-  checkpoint on clean shutdown when `durable` is set (bounding recovery time and
-  truncating the log), with `SECANTUS_TEST_FAST_STORAGE=1` to skip it under the
-  test suite. The Rust `impl Drop for Storage` (`crates/secantus-storage/src/lib.rs`
-  ~1920) only persists the oplog-meta row — it **never** checkpoints on close;
-  `Storage::checkpoint` is called explicitly only by admin `fsync` / backup /
-  PITR paths. So the Rust server always behaves like Python's *fast* mode: data
-  stays recoverable (logging is always on, `prealloc=false`), but a clean
-  shutdown leaves the log un-truncated, so reopen replays the full retained log
-  instead of resuming from a bounded checkpoint. **Not a correctness bug** — no
-  data loss, recovery is complete — but the two servers have **different
-  durability-on-clean-shutdown semantics and different reopen-replay cost**. If
-  we want parity (and bounded Rust reopen time), Rust needs a close-time
-  checkpoint gated by a `durable`-style knob mirroring Python's. (Surfaced
-  2026-07-23 during the WT-config divergence audit that followed the `prealloc`
-  disk fix, #609. The other config divergences — `file_max` 10MB vs 128MB
-  (#575), Rust-only `eviction` threads (#575), Rust-only `block_compressor=zlib`
-  on the value-heavy tables (#578) — are all intentional, documented perf
-  tunings and are *not* disk-exhaustion or correctness risks; zlib in fact makes
-  the Rust engine use *less* doc-data disk than Python.)
+- [x] **Rust `Storage` close-time checkpoint / `durable` mode — DONE
+  (2026-07-23).** `impl Drop for Storage` now forces a WiredTiger checkpoint on
+  clean shutdown when `durable` is set (after persisting the oplog-meta row, on
+  the same session), mirroring Python `Storage.close`. The flag is resolved on
+  open from the environment with Python's exact precedence (`resolve_durable` /
+  `resolve_durable_from_env`): `SECANTUS_FORCE_DURABLE=1` > explicit override >
+  `!SECANTUS_TEST_FAST_STORAGE`. So the shipped `secantusd-rs` daemon (no env)
+  is durable — its graceful SIGINT/SIGTERM path drains connection threads via
+  `RunningServer::stop` then drops `Storage`, so the checkpoint runs
+  single-threaded with the data dir intact (no repeat of the beta.48
+  checkpoint-vs-teardown race) — while the Python test suite (which sets
+  `SECANTUS_TEST_FAST_STORAGE=1`) gets `durable=false` and skips the checkpoint,
+  so the embedded `RustServer` gauge/tests are unchanged. Fast mode is still
+  fully recoverable (journal stays on), just not checkpoint-bounded. New
+  `open_with_config_durable(home, config, Option<bool>)` mirrors Python's
+  `durable=` argument. Guards: `resolve_durable_precedence`,
+  `durable_close_roundtrips_data_on_reopen`, `fast_close_still_recovers_via_log_replay`.
+  The remaining WT-config divergences — `file_max` 10MB vs 128MB (#575), Rust-only
+  `eviction` threads (#575), Rust-only `block_compressor=zlib` (#578) — are all
+  intentional perf tunings, not risks (zlib in fact makes the Rust engine use
+  *less* doc-data disk than Python).
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 
