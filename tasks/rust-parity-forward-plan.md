@@ -10,16 +10,47 @@ Goal (Joe): "redesign the rust server so it approaches MongoDB performance." The
 storage engine under both is the same WiredTiger 7.0.33, so every gap lives
 *above* WT.
 
+## VERDICT (2026-07-22): mongod write-parity is NOT reachable for this architecture
+
+A clean, **direct side-by-side** rust-vs-mongod A/B (both on this 12-core box, same
+run, un-throttle-verified) settles it:
+
+| writers | Rust (main, post #582+#594) | mongod | gap |
+|---|---|---|---|
+| 1 | 22,479/s | 112,274/s | **5.0×** |
+| 2 | 27,016/s | 188,637/s | 7.0× |
+| 4 | 40,989/s | 251,557/s | **6.1×** |
+| 8 | 29,500/s | 169,322/s | 5.7× |
+
+Two decisive observations:
+1. **The gap is a flat ~5–6× at every writer count** — the signature of a
+   *per-operation efficiency* gap (mongod executes each write ~5–6× cheaper), NOT a
+   scaling/contention problem. Contention fixes (sharding, RecordId) cannot close a
+   flat per-op multiple; RecordId's measured +15% moves 6.1×→~5.3× at best.
+2. **Both servers share the same scaling shape** — both peak at 4 writers on 12
+   cores (Rust 1.82×, mongod 2.24×) and *drop* at 8. So the earlier "mongod scales
+   4.55× at 8w" figure does NOT hold on this machine; the whole story is the per-op
+   multiple, which is inherent to mongod's decade-tuned C++ storage vs a
+   Rust-over-WiredTiger surrogate.
+
+Every avenue in §3 was tried and measured to its ceiling; none touches the
+per-op multiple. **Parity is a property of the execution engine, not a lever we can
+pull.** The session's wins still doubled single-writer (Phase-0 baseline 10,250 →
+22,479, ~2.2×) — real, shipped, and worthwhile — but parity is out of reach.
+
 ---
 
 ## 1. Where we are (measured, clean idle machine, 20s steady-state)
 
-| axis | Rust server (post #594) | mongod | gap |
+Superseded by the direct A/B in the VERDICT above; original approximate table kept
+for the per-writer aggregate context:
+
+| axis | Rust server (post #594) | mongod (direct A/B) | gap |
 |---|---|---|---|
-| single-writer | ~22k docs/s | ~110k | **5×** |
-| 4-writer aggregate | ~56k docs/s | ~185k | ~3.3× |
-| 8-writer aggregate | ~44k docs/s | ~500k | ~11× |
-| scaling (8w vs 1w) | ~1.9× | 4.55× | — |
+| single-writer | 22,479 docs/s | 112,274 | **5.0×** |
+| 4-writer aggregate | 40,989 docs/s | 251,557 | **6.1×** |
+| 8-writer aggregate | 29,500 docs/s | 169,322 | 5.7× |
+| scaling (peak @ 4w) | 1.82× | 2.24× | same shape |
 
 **Shipped this cycle (both merged, measured, on `main`):**
 
