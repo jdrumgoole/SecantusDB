@@ -259,11 +259,40 @@ These are explicit non-goals. Don't add them without a reason.
      `dmesg` was clean. Net symptom: `node down: Not properly terminated`, no
      `FAILED` line, no stack, no OOM — for seven occurrences.
 
+  **Second (deeper) cause — a real product bug, found because the fix above made
+  the hang visible.** Once the receive was bounded, PR #603's CI reported
+  `no websocket frame within 30.0s` instead of an anonymous death — and that named
+  a genuine event-loss race: the admin ws tail
+  (`admin/routers/changestream.py`) sent its `{"type":"open"}` frame **before**
+  calling `target.watch()`. The frame promises the client that writes from here on
+  are observed, but the stream's start point isn't fixed until `watch()` returns,
+  so any write in that window is lost — and the admin UI has the same race (open
+  the change-stream page, write immediately, miss the event). The tests do exactly
+  that (`open` → insert → await), so under CI load the insert fell in the window
+  and the awaited event never came. **Fixed (#603, second commit): establish the
+  stream first, then send `open`.** So the causality is the reverse of the whole
+  investigation's assumption — the test wasn't hanging for no reason; there was a
+  real race, and the unbounded receive is what turned it into an anonymous crash
+  instead of a visible failure.
+
   **Fix:** `tests/test_admin_skeleton.py` now wraps every event-awaiting receive
   in `_recv_json(ws, timeout=30)` (a daemon-thread pull with a deadline), so a
   stream that produces nothing fails as a normal assertion instead of vanishing a
   worker. Receives inside `pytest.raises(WebSocketDisconnect)` keep blocking
-  semantics deliberately — their frame is a close, which arrives promptly.
+  semantics deliberately — their frame is a close, which arrives promptly. Plus
+  the `open`/`watch()` reorder above.
+
+  **Same anonymous signature, a THIRD independent trigger — cross-driver build
+  timeouts (#605).** 49 tests in `test_cross_driver_features.py` /
+  `test_geo_cross_driver.py` wrap toolchain builds (`npm install`,
+  `cargo build --release`, a Maven/Gradle jar, `bundle`/`composer install`) whose
+  budgets are 300–600 s, under the lanes' `--timeout=120`. On a cold cache the
+  test that draws the build is killed → `os._exit()` → the identical anonymous
+  worker death, naming a *random smoke test that is not a bystander but the one
+  that drew the build*. Fixed with a module-level `pytest.mark.timeout(600)`. The
+  general rule (`--timeout-method=thread` + xdist discarding worker stderr turns
+  any over-long wait into an anonymous native-looking crash) is now the lead entry
+  in the `/ci-check` pattern catalog.
 
   **Two hypotheses this kills, both of which had real evidence behind them:**
   * **OOM / the admin-fixture memory leak.** Refuted by measurement: zero `dmesg`
@@ -572,6 +601,19 @@ These are explicit non-goals. Don't add them without a reason.
 
 
 Subtler than the above; these may bite specific test suites.
+
+- [ ] **`test_crash_stall_watchdog.py::test_faulthandler_dir_captures_a_worker_crash`
+  flakes in the FULL parallel suite only (seen 2026-07-22).** It spawns a nested
+  pytest that `faulthandler._sigsegv()`s a worker and asserts the per-worker fault
+  file captured the stack. **Passes cleanly in isolation, repeatedly, even under 8
+  CPU burners** — so it needs the full `-n auto` suite's scheduling contention, and
+  reproducing it standalone is a dead end (don't try). Plausible mechanism: the
+  nested pytest's own startup/crash timing loses to the outer suite's pressure, or
+  a race on the shared fault-dir glob. Notable irony worth a proper fix rather than
+  a rerun: this is the test that *guards the crash-capture diagnostic*, so a real
+  regression here would blind exactly the tooling the anonymous-worker-death class
+  (§ CI catalog) depends on. If diagnosing, run the whole suite `-n auto` with the
+  fault dir preserved; do not deselect.
 
 - [x] **macOS CI test job hangs to the 6-hour kill — RESOLVED + CONFIRMED 2026-07-19: an fd/memory leak from unclosed `Storage` test fixtures (fixed #563); macOS re-enabled on continuous CI and confirmed green (#567). Investigation detail below.** The `test (macos-latest, 3.10)` job hit GitHub's 6-hour job timeout repeatedly (≥3× across unrelated PRs, including a *tooling-only* one), while passing in ~4 min on Linux/Windows and locally on macOS. Mitigated, not fixed: `9e16e49` dropped macOS from the continuous (push/PR) matrix, so it now runs **only at release time** (`publish.yml` / scheduled sweep) — where the hang can still bite. The per-test `timeout` (pytest-timeout, 600s) does **not** cover the wedge because it only guards a test's own body, not collection / session-scoped fixtures / xdist worker *shutdown*. **Prime suspect:** a daemon/thread not reaped on macOS keeping the worker process alive after its tests "finish" — most likely the Rust server's `stop()` / accept-thread join or a parked change-stream tailable `getMore` (the same shape as the *Python* `SecantusDBServer.stop()` use-after-free fixed in 0.5.3b5, below; `test_rust_server_stress.py` / `test_rust_pitr_cross_server.py` exercise the Rust lifecycle). **Diagnostics added** (`ci-macos-hang-guard`): a `timeout-minutes: 30` cap on the test job + a `faulthandler` session watchdog in `tests/conftest.py` that dumps every thread's stack and exits at 25 min — so the next occurrence names the wedged thread/test instead of dying silent. Close once a stack identifies the culprit and the lifecycle leak is fixed. **Reframed 2026-07-19 (investigation):** it is NOT a thread leak — it is an early *worker-process crash*. The 2026-07-18 full-matrix dispatch run reproduced it: `test (3.12, macos-14, core)` ran 90 min (its dispatch-event `timeout-minutes` cap is 90, not 30) while every other macOS job finished in 4–6 min, and its worker `gw0` went **"node down: Not properly terminated" at ~3.5 min** — a subprocess crash (WT_PANIC / segfault / abort), not a lingering thread at shutdown. The prime suspect (Rust `stop()`) is **ruled out**: it has been bounded (10s drain, `RunningServer::Drop`→`stop()`) since beta.48 (2026-06-21), which *predates* the macOS-drop (9e16e49, 2026-06-29) by 8 days; all Python server threads are daemon. Local audits (single-process AND 3-worker xdist, thread + native `faulthandler` dumps) of every suspect file leave zero leaked threads / no crash — the crash is macOS-timing-specific and does not reproduce on a newer local macOS. The 25-min watchdog did not fire in that run because after the crash the surviving workers kept reporting, so the idle-based check never tripped and the shard crawled to the cap. **Fixed the diagnostic gap so the next occurrence self-diagnoses:** `pytest_testnodedown` now dumps the crash reason (`error`, carrying the dead worker's last frames) the moment a worker goes down, and the controller watchdog gained a *post-crash overrun* trigger (`_stall_trigger`) that fails fast with a stack dump if the run is still going `_POST_CRASH_DEADLINE_SECONDS` (20 min, `SECANTUS_POST_CRASH_SECONDS`-overridable) after the first crash — the idle check alone can't see a crawl. **ROOT CAUSE FOUND + FIXED 2026-07-19:** it is a **file-descriptor / memory leak from test fixtures that create a `Storage` but never `close()` it.** A returned-but-never-closed `Storage` abandons its WiredTiger connection — measured at **~2.5 MB and ~17 fds each** (150 leaks → 419 MB, 2571 fds, both linear/unbounded). Three offenders: `tests/test_indexes.py`'s `storage` fixture (`return Storage(...)`, backing **161 tests**), `tests/test_storage.py`'s `storage` fixture, and `tests/test_aggregate.py`'s `_setup_lookup_storage` helper (6 tests). A worker running many of these exhausts its fd limit (`ulimit -n`, ~1024 on CI) or RSS late in the run → the process dies hard with no clean error → xdist reports "node down: Not properly terminated" (the crashed worker's stderr, incl. any WT_PANIC, is lost). Intermittent because it depends on how many leaky tests a worker draws under the random split; late (~92%) because the leak accumulates. Fixed all three to `try: yield s finally: s.close()` / `request.addfinalizer(s.close)` — verified fds stay flat (12→12 over 221 tests, was ~17/test) and a broad sweep (471 tests) shows zero remaining fd growth. **Confirmed closed (#567):** macOS was re-enabled on the push/PR matrix for the `test` and `test-durable` lanes via a matrix `include` of `macos-14` + the dev interpreter (3.12) for each shard group (the include merges with the existing cron cross-product, so no extra weekly-cron cells). On that PR's own CI run **all 8 macOS shards** (`test` ×4 + `test-durable` ×4 — the exact lanes that used to hang) passed green, proving the fix holds on macOS. Any future regression is bounded to a fast, self-diagnosing failure by the #555 crash-capture + 30-min job cap. (`storage-engine` stays cron-only — heaviest source build, and it covers the Rust engine, not the fd-leak surface.)
 - ~~**Intermittent pytest-xdist worker crash at ~97% of full suite (post-b18).**~~ Fixed (0.5.3b5). Root cause: `SecantusDBServer.stop()` joined only the accept thread, then closed WiredTiger while per-connection daemon threads could still be mid-WT-operation (e.g. a change-stream tailable `getMore` reading the oplog) — a use-after-free that surfaced as the native worker crash ("node down: Not properly terminated"). `stop()` now closes connection sockets, wakes parked tailable getMores (`Storage.signal_shutdown`), and waits for the active-connection count to drain to zero before `storage.close()`. Reproduced deterministically (a connection thread in a tight WT-read loop vs `storage.close()` raised `Cursor_reset ... is None`, the Python-surfaced form of the same use-after-close); a 200-iteration stress now runs clean. Regression guard: `tests/test_server_shutdown.py`.
