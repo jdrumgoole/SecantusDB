@@ -30,12 +30,30 @@ from secantus import SecantusDBServer
 
 # See tests/test_cross_driver_features.py for rationale — same fcntl /
 # shell-script POSIX dependency.
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="Cross-driver smokes use fcntl.flock + POSIX shell scripts; "
-    "POSIX runners (Linux/macOS) cover the wire-protocol gaps these tests "
-    "are meant to catch.",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Cross-driver smokes use fcntl.flock + POSIX shell scripts; "
+        "POSIX runners (Linux/macOS) cover the wire-protocol gaps these tests "
+        "are meant to catch.",
+    ),
+    # These smokes shell out to toolchain builds — `npm install`, a Maven/Gradle
+    # jar, `bundle install`, `composer install`, `cargo build --release` — whose
+    # own budgets are 300-600s. CI runs pytest with `--timeout=120
+    # --timeout-method=thread`, so on a COLD cache whichever test happens to draw
+    # the build blows the pytest deadline first. That method dumps to the
+    # worker's stderr (discarded by xdist) and then calls os._exit(), so the
+    # symptom is an anonymous "node down: Not properly terminated" naming a
+    # random smoke test — the same mechanism as the ws-changes worker death
+    # (tasks/backlog.md). The pytest budget must therefore exceed the build
+    # budget it wraps, not sit under it.
+    #
+    # Trade-off accepted deliberately: a genuinely wedged test in this file now
+    # takes 10 min to fail instead of 2. Every test here is subprocess-driven,
+    # so wall-clock is dominated by the toolchain anyway, and a slow honest
+    # failure beats a fast anonymous one.
+    pytest.mark.timeout(600),
+]
 
 _HERE = Path(__file__).parent
 _CROSS_DRIVER = _HERE / "cross_driver"
