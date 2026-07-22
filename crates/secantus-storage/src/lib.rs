@@ -1647,6 +1647,24 @@ pub struct Storage {
     /// durable oplog segment in this directory first (PITR v2). Mirrors
     /// `storage.oplog_archive_dir`.
     oplog_archive_dir: Option<String>,
+    /// Whether to force a WiredTiger checkpoint on close (`Drop`). Mirrors the
+    /// Python `Storage._durable` flag. WT's connection close does NOT implicitly
+    /// checkpoint while logging is enabled, so without a close-time checkpoint a
+    /// clean shutdown leaves the log un-truncated and reopen replays the full
+    /// retained log; the checkpoint bounds recovery time and truncates the log.
+    /// Resolved from the environment on open (see `resolve_durable`): production
+    /// (the `secantusd-rs` daemon) is durable; the Python test suite sets
+    /// `SECANTUS_TEST_FAST_STORAGE=1`, which turns it off so parallel workers
+    /// don't serialise on the close fsync (the `SECANTUS_FORCE_DURABLE=1` CI lane
+    /// forces it back on). `durable=false` is safe only for ephemeral instances
+    /// whose data dir is discarded — the journal is still on, so data is
+    /// recoverable via log replay, just not checkpoint-bounded.
+    durable: bool,
+    /// True when opened with an `in_memory=true` WiredTiger config. WT's
+    /// in-memory backend rejects `checkpoint()` (noisy `__wt_inmem_unsupported_op`
+    /// log line), so the close-time checkpoint is skipped for it — mirroring
+    /// Python `Storage._in_memory`.
+    in_memory: bool,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -1681,6 +1699,33 @@ const OPLOG_PRUNE_INTERVAL: i64 = 1000;
 /// a steady-state sweep still reaches every row that aged out since the last one;
 /// any excess drains on the next sweep.
 const RETENTION_SCAN_BATCH: usize = 10_000;
+
+/// Resolve the close-time `durable` flag, mirroring Python
+/// `Storage.__init__`'s precedence exactly:
+///   1. `SECANTUS_FORCE_DURABLE=1` — always durable, overriding everything (the
+///      whole-suite real-durability CI lane).
+///   2. an explicit `Some(bool)` from the caller (the Python `durable=` arg).
+///   3. `None` — durable UNLESS `SECANTUS_TEST_FAST_STORAGE=1` is set (the test
+///      conftest sets it so the default suite runs fast; production never sets
+///      it, so the shipped daemon is fully durable).
+///
+/// Pure over its inputs so the precedence is unit-testable without mutating the
+/// process environment (which would race parallel Rust tests).
+fn resolve_durable(explicit: Option<bool>, force_durable: bool, fast_storage: bool) -> bool {
+    if force_durable {
+        true
+    } else {
+        explicit.unwrap_or(!fast_storage)
+    }
+}
+
+/// Read the two durability env vars and resolve the flag for a freshly opened
+/// store. `explicit` is the caller's override (`None` = env-driven default).
+fn resolve_durable_from_env(explicit: Option<bool>) -> bool {
+    let force = std::env::var("SECANTUS_FORCE_DURABLE").as_deref() == Ok("1");
+    let fast = std::env::var("SECANTUS_TEST_FAST_STORAGE").as_deref() == Ok("1");
+    resolve_durable(explicit, force, fast)
+}
 
 /// Milliseconds since the Unix epoch (UTC), for oplog `wall` times.
 fn now_millis() -> i64 {
@@ -1934,12 +1979,35 @@ impl Drop for Storage {
                 st.next_nat_seq,
             )
         };
-        let persisted = match self.conn.open_session() {
-            Ok(session) => self.persist_oplog_meta(&session, meta),
-            Err(e) => Err(e.into()),
-        };
-        if let Err(e) = persisted {
-            eprintln!("secantus-storage: failed to persist oplog meta during close: {e:?}");
+        match self.conn.open_session() {
+            Ok(session) => {
+                if let Err(e) = self.persist_oplog_meta(&session, meta) {
+                    eprintln!("secantus-storage: failed to persist oplog meta during close: {e:?}");
+                }
+                // Close-time checkpoint (durable mode) — the Rust analogue of
+                // Python `Storage.close`'s final checkpoint. WiredTiger's
+                // connection close does NOT implicitly checkpoint while logging
+                // is enabled, so without this a clean shutdown leaves the log
+                // un-truncated and the next open replays the full retained log.
+                // Run it AFTER persisting the oplog-meta row so that row is
+                // included in the snapshot. Skipped in fast/test mode
+                // (`durable=false`) — the journal is still on, so data stays
+                // recoverable via log replay, just not checkpoint-bounded — and
+                // for in-memory backends, which reject checkpoint(). By this
+                // point the caller (`RunningServer::stop`) has drained every
+                // connection thread, so this runs single-threaded with the data
+                // dir intact (no repeat of the beta.48 checkpoint-vs-teardown
+                // race). A checkpoint failure is logged, never silent: in a
+                // database a close-time write error is a durability signal.
+                if self.durable && !self.in_memory {
+                    if let Err(e) = session.checkpoint(None) {
+                        eprintln!("secantus-storage: final checkpoint failed during close: {e:?}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("secantus-storage: failed to open session during close: {e:?}");
+            }
         }
     }
 }
@@ -1952,8 +2020,25 @@ impl Storage {
     }
 
     /// Open with an explicit WiredTiger config (e.g. add `in_memory=true` for an
-    /// ephemeral database).
+    /// ephemeral database). The close-time `durable` flag is resolved from the
+    /// environment (see [`resolve_durable`]); use [`Storage::open_with_config_durable`]
+    /// to override it explicitly.
     pub fn open_with_config(home: &str, config: &str) -> Result<Storage> {
+        Self::open_with_config_durable(home, config, None)
+    }
+
+    /// Like [`Storage::open_with_config`], but with an explicit close-time
+    /// `durable` override. `None` = env-driven default (`SECANTUS_FORCE_DURABLE` /
+    /// `SECANTUS_TEST_FAST_STORAGE`); `Some(true)`/`Some(false)` force it, mirroring
+    /// the Python `Storage(durable=...)` argument. `SECANTUS_FORCE_DURABLE=1` still
+    /// wins over an explicit `Some(false)`, matching Python's precedence.
+    pub fn open_with_config_durable(
+        home: &str,
+        config: &str,
+        durable: Option<bool>,
+    ) -> Result<Storage> {
+        let durable = resolve_durable_from_env(durable);
+        let in_memory = config.contains("in_memory=true");
         let conn = Connection::open(home, config)?;
         let mut state = {
             let boot = conn.open_session()?;
@@ -2004,6 +2089,8 @@ impl Storage {
             oplog_max_entries: 100_000,
             ts_suffix_counter: AtomicU64::new(0),
             oplog_archive_dir: None,
+            durable,
+            in_memory,
         })
     }
 
@@ -7733,6 +7820,87 @@ mod tests {
         assert!(s.contains("cache_size=1G"));
         assert!(s.contains("session_max=200"));
         assert!(s.contains("transaction_sync=(enabled=true,method=fsync)"));
+    }
+
+    /// `resolve_durable` must match Python `Storage.__init__`'s precedence
+    /// exactly: `SECANTUS_FORCE_DURABLE` wins over everything, then an explicit
+    /// override, then `!SECANTUS_TEST_FAST_STORAGE`. Pure over its inputs so it
+    /// needs no process-env mutation (which would race parallel tests).
+    #[test]
+    fn resolve_durable_precedence() {
+        // force_durable=true overrides everything, incl. an explicit Some(false).
+        assert!(resolve_durable(Some(false), true, true));
+        assert!(resolve_durable(None, true, true));
+        // Explicit override wins when not forced.
+        assert!(resolve_durable(Some(true), false, true));
+        assert!(!resolve_durable(Some(false), false, false));
+        // Env-driven default: durable unless fast-storage is set.
+        assert!(resolve_durable(None, false, false));
+        assert!(!resolve_durable(None, false, true));
+    }
+
+    /// A durable close (`Drop` with `durable=true`) checkpoints and the data
+    /// survives a reopen. Uses the explicit `Some(true)` override so the result
+    /// is independent of the ambient `SECANTUS_TEST_FAST_STORAGE` /
+    /// `SECANTUS_FORCE_DURABLE` env.
+    #[test]
+    fn durable_close_roundtrips_data_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("db");
+        std::fs::create_dir_all(&home).unwrap();
+        {
+            let s = Storage::open_with_config_durable(
+                home.to_str().unwrap(),
+                DEFAULT_CONFIG,
+                Some(true),
+            )
+            .unwrap();
+            assert!(s.durable);
+            assert!(!s.in_memory);
+            s.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 1i32, "v": 42i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+        } // Drop here runs the close-time checkpoint.
+
+        let reopened = Storage::open(home.to_str().unwrap()).unwrap();
+        let got = reopened.find_matching("app", "c", &doc! {}).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(decode_doc(&got[0]).unwrap().get_i32("v").unwrap(), 42);
+    }
+
+    /// Fast mode (`durable=false`) skips the close checkpoint but — because the
+    /// journal stays enabled — data is still recoverable via log replay on
+    /// reopen. This is the Rust analogue of Python's fast test-storage mode.
+    #[test]
+    fn fast_close_still_recovers_via_log_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("db");
+        std::fs::create_dir_all(&home).unwrap();
+        {
+            let s = Storage::open_with_config_durable(
+                home.to_str().unwrap(),
+                DEFAULT_CONFIG,
+                Some(false),
+            )
+            .unwrap();
+            assert!(!s.durable);
+            s.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 7i32, "v": 99i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+        } // Drop here does NOT checkpoint (fast mode).
+
+        let reopened = Storage::open(home.to_str().unwrap()).unwrap();
+        let got = reopened.find_matching("app", "c", &doc! {}).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(decode_doc(&got[0]).unwrap().get_i32("v").unwrap(), 99);
     }
 
     /// Ascending sort-key bytes for a value (what an ASC single-field entry's
