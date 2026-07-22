@@ -2168,6 +2168,31 @@ background maintenance threads that observe a shutdown flag and are joined befor
 teardown. (The embedded `RustServer` handle now exposes the same knobs —
 `cache_size` / `session_max` / `sync_on_commit` constructor parameters
 threading into `wt_config`.)
+
+### 7.7 Rust storage: no close-time checkpoint / no `durable` mode
+
+- [ ] **Rust `Storage` never checkpoints on close — no analogue of the Python
+  server's `durable` close-checkpoint.** The Python `Storage.close` forces a WT
+  checkpoint on clean shutdown when `durable` is set (bounding recovery time and
+  truncating the log), with `SECANTUS_TEST_FAST_STORAGE=1` to skip it under the
+  test suite. The Rust `impl Drop for Storage` (`crates/secantus-storage/src/lib.rs`
+  ~1920) only persists the oplog-meta row — it **never** checkpoints on close;
+  `Storage::checkpoint` is called explicitly only by admin `fsync` / backup /
+  PITR paths. So the Rust server always behaves like Python's *fast* mode: data
+  stays recoverable (logging is always on, `prealloc=false`), but a clean
+  shutdown leaves the log un-truncated, so reopen replays the full retained log
+  instead of resuming from a bounded checkpoint. **Not a correctness bug** — no
+  data loss, recovery is complete — but the two servers have **different
+  durability-on-clean-shutdown semantics and different reopen-replay cost**. If
+  we want parity (and bounded Rust reopen time), Rust needs a close-time
+  checkpoint gated by a `durable`-style knob mirroring Python's. (Surfaced
+  2026-07-23 during the WT-config divergence audit that followed the `prealloc`
+  disk fix, #609. The other config divergences — `file_max` 10MB vs 128MB
+  (#575), Rust-only `eviction` threads (#575), Rust-only `block_compressor=zlib`
+  on the value-heavy tables (#578) — are all intentional, documented perf
+  tunings and are *not* disk-exhaustion or correctness risks; zlib in fact makes
+  the Rust engine use *less* doc-data disk than Python.)
+
 ## SQL / PostgreSQL interface — P0 spike limitations
 
 - [ ] **Cross-type comparisons evaluate to false instead of erroring.** A per-row
