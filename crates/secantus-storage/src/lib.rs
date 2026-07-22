@@ -630,9 +630,25 @@ enum ResolvedHint {
 
 /// The WiredTiger connection config SecantusDB uses (mirrors `storage.py`):
 /// logging on, commit-sync off by default.
+///
+/// `prealloc=false` disables WT's log-file pre-allocation. By default WT's log
+/// server keeps two `file_max`-sized `WiredTigerPreplog` files ready ahead of
+/// the active log, so with `file_max=128MB` every on-disk instance costs
+/// ~256 MB of pre-sized journal space even for a database holding a few KB.
+/// That pre-allocation is a write-latency optimisation for sustained-throughput
+/// servers; SecantusDB's instances are small and short-lived (a full test run
+/// spins up thousands), so the latency win is irrelevant and the disk cost is
+/// not — it was exhausting the small Windows CI runner disk with 128 MB
+/// `WiredTigerTmplog` files. Disabling prealloc drops each instance's idle log
+/// footprint to what it actually writes (WT grows the active segment on demand)
+/// with no durability change — recovery still replays the same log records.
+/// This matches `storage.py`, which ships `prealloc=false` in production.
+/// `file_max=128MB` is kept (see PR #575, mongod-parity Phase 1): with prealloc
+/// off, a production sustained-writer still gets 128 MB active segments while
+/// tiny test DBs cost only what they write.
 const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
                               eviction=(threads_min=4,threads_max=4),\
-                              log=(enabled=true,file_max=128MB),\
+                              log=(enabled=true,file_max=128MB,prealloc=false),\
                               transaction_sync=(enabled=false,method=fsync)";
 
 /// Build the WiredTiger connection config string from the tunable knobs the
@@ -644,7 +660,7 @@ const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
 /// the embedded / library default stays `256M` via [`Storage::open`].
 pub fn wt_config(cache_size: &str, session_max: u32, sync_on_commit: bool) -> String {
     format!(
-        "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max=128MB),transaction_sync=(enabled={},method=fsync)",
+        "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max=128MB,prealloc=false),transaction_sync=(enabled={},method=fsync)",
         if sync_on_commit { "true" } else { "false" }
     )
 }
