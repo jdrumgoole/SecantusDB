@@ -145,6 +145,15 @@ pub struct CommandContext {
     /// reply document would cost (`tasks/rust-perf-findings.md`, Phase 1).
     /// Out-of-band like `close_connection`. `None` for every non-cursor reply.
     pub pending_batch: Option<PendingBatch>,
+    /// The raw BSON byte slices of an `insert`'s kind-1 `documents` sequence,
+    /// handed in by the server **un-decoded** so the insert handler can store the
+    /// client's bytes verbatim (the raw-BSON write path) instead of paying a
+    /// merge-decode → re-encode → storage-decode round-trip per document. `None`
+    /// unless the request is an `insert` whose documents arrived as an `OP_MSG`
+    /// kind-1 sequence (the common driver shape); inline-in-body inserts and every
+    /// other command leave it `None` and take the decoded path. Consumed
+    /// (`take()`n) by the insert handler.
+    pub raw_insert_documents: Option<Vec<Vec<u8>>>,
 }
 
 /// A cursor reply's document batch as pre-encoded BSON blobs, plus which field
@@ -180,6 +189,7 @@ impl CommandContext {
             conn_killer: None,
             logs: None,
             pending_batch: None,
+            raw_insert_documents: None,
         }
     }
 
