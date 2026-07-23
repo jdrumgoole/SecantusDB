@@ -1272,6 +1272,20 @@ jobs:
           print('WiredTiger OK:', v[0])
           "
 
+      # Cache cargo's registry + `target` dir. Without this the job recompiles
+      # all ~240 third-party crates every run (bindgen / clang-sys / s2 / bson
+      # …), which is the bulk of its wall-clock — the existing `wtbuild-*` cache
+      # covers only the WiredTiger C build, not cargo. The action keys on
+      # Cargo.lock + the rustc version, so a dependency bump busts it correctly
+      # while a change to our own sources only rebuilds our own crates.
+      # `cache-on-failure` still populates it when clippy/test go red, so a
+      # red-then-fix cycle doesn't pay the full compile twice.
+      - name: Cache cargo registry + target (clean workspace)
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: crates
+          cache-on-failure: true
+
       - name: Cargo fmt / clippy / unit tests
         # Run across the whole Rust workspace (the pure-engine `secantus-core`
         # lib crate + the `secantus-core-py` PyO3 bindings crate).
@@ -1486,6 +1500,18 @@ jobs:
           echo "SECANTUS_WT_INCLUDE=$wt/include" >> "$GITHUB_ENV"
           echo "SECANTUS_WT_LIB=$wt" >> "$GITHUB_ENV"
           echo "Using WiredTiger at $wt"
+
+      # Same rationale as the `rust` job's cache. These two crates are EXCLUDED
+      # from the clean workspace (they link WiredTiger), so each has its own
+      # `target` dir — both are listed, or the second would still cold-compile.
+      # Placed after the WT probe above so `SECANTUS_WT_*` is already resolved.
+      - name: Cache cargo registry + target (WT-linked crates)
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: |
+            crates/secantus-storage
+            crates/secantus-storage-adapter
+          cache-on-failure: true
 
       - name: Cargo fmt / clippy / test (secantus-storage)
         working-directory: crates/secantus-storage
