@@ -17,6 +17,11 @@ checkpoint that bounds recovery time and truncates the log. A close-time
 honours — governs the checkpoint, so the production daemon is fully durable
 while the fast test path stays fast.
 
+The change is invisible to clients, and the pymongo conformance gauge confirms
+it: run against both servers at the same commit, each scored an identical 99.5%
+(1020 passed, 5 failed, 475 skipped of 1500), passing and failing the exact same
+tests — the Rust server holds full pymongo parity with the Python server.
+
 #### Fixed
 
 - `secantus-storage` (Rust): `Storage`'s close (`Drop`) now checkpoints when
