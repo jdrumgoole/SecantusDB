@@ -22,6 +22,10 @@ class Task:
     # multi-step tasks that emit ``==> [k/N] label`` markers (the gates). Empty
     # → progress falls back to the pytest % bar or an indeterminate bar.
     phase_labels: list[str] = field(default_factory=list)
+    # When True the UI shows a parallelism input that becomes ``--jobs N`` (for
+    # validate-all, which dispatches the gauges over a thread pool).
+    jobs_option: bool = False
+    default_jobs: int = 4  # matches validate-all's default; CLAUDE.md caps at 4
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,14 @@ PYTHON = Target(
             ["validate", "--server", "python"],
             "test",
             "pymongo conformance gauge.",
+        ),
+        Task(
+            "py-gauge-all",
+            "All gauges",
+            ["validate-all", "--server", "python"],
+            "test",
+            "All 13 driver gauges (parallel; needs each driver's toolchain).",
+            jobs_option=True,
         ),
         Task(
             "py-release-prepare",
@@ -121,6 +133,14 @@ RUST = Target(
             ["validate", "--server", "rust"],
             "test",
             "R8 conformance gate.",
+        ),
+        Task(
+            "rs-gauge-all",
+            "All gauges",
+            ["validate-all", "--server", "rust"],
+            "test",
+            "All 13 driver gauges (parallel; needs each driver's toolchain).",
+            jobs_option=True,
         ),
         Task(
             "rs-bump",

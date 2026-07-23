@@ -125,6 +125,51 @@ def test_start_unknown_task_404s(client: TestClient) -> None:
     assert r.status_code == 404
 
 
+def test_all_gauges_tasks_registered_per_server() -> None:
+    from secantus.opsboard import registry
+
+    py = registry.resolve_task("py-gauge-all")
+    rs = registry.resolve_task("rs-gauge-all")
+    assert py is not None and py[1].argv == ["validate-all", "--server", "python"]
+    assert rs is not None and rs[1].argv == ["validate-all", "--server", "rust"]
+    assert py[1].jobs_option is True and rs[1].jobs_option is True
+    # Exact argv match distinguishes the two despite sharing argv[0].
+    assert registry.find_task_by_argv(["validate-all", "--server", "rust"]).key == "rs-gauge-all"
+
+
+def test_start_all_gauges_passes_parallelism(client: TestClient) -> None:
+    client.post(
+        "/jobs/start",
+        data={"task_key": "py-gauge-all", "jobs": "6"},
+        follow_redirects=False,
+    )
+    job = client.app.state.journal.list(limit=1)[0][0]
+    assert job.argv == ["validate-all", "--server", "python", "--jobs", "6"]
+
+
+def test_parallelism_is_capped(client: TestClient) -> None:
+    client.post(
+        "/jobs/start",
+        data={"task_key": "py-gauge-all", "jobs": "999"},
+        follow_redirects=False,
+    )
+    job = client.app.state.journal.list(limit=1)[0][0]
+    assert job.argv[-2:] == ["--jobs", "16"]  # clamped to _MAX_JOBS
+
+
+def test_jobs_ignored_for_non_jobs_task(client: TestClient) -> None:
+    # A task without jobs_option must not get a stray --jobs appended.
+    client.post("/jobs/start", data={"task_key": "py-test", "jobs": "8"}, follow_redirects=False)
+    job = client.app.state.journal.list(limit=1)[0][0]
+    assert "--jobs" not in job.argv
+
+
+def test_dashboard_shows_parallelism_input(client: TestClient) -> None:
+    body = client.get("/").text
+    assert 'name="jobs"' in body
+    assert 'value="py-gauge-all"' in body
+
+
 def test_release_task_requires_confirmation(client: TestClient) -> None:
     # Without confirm=yes → rejected.
     r = client.post("/jobs/start", data={"task_key": "py-release-prepare"}, follow_redirects=False)

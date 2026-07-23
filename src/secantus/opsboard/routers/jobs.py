@@ -53,12 +53,18 @@ def jobs_page(request: Request, before: int | None = None) -> HTMLResponse:
     )
 
 
+# Hard ceiling on the parallelism factor so the UI can't dispatch an absurd
+# number of gauge daemons. CLAUDE.md recommends <= 4 (timing flakes above that).
+_MAX_JOBS = 16
+
+
 @router.post("/jobs/start")
 def start_job(
     request: Request,
     task_key: str = Form(...),
     extra: str = Form(""),
     confirm: str = Form(""),
+    jobs: str = Form(""),
 ) -> RedirectResponse:
     resolved = registry.resolve_task(task_key)
     if resolved is None:
@@ -71,6 +77,13 @@ def start_job(
             detail=f"task {task.key!r} is release-class; resubmit with confirm=yes",
         )
     argv = list(task.argv)
+    if task.jobs_option and jobs.strip():
+        try:
+            n = int(jobs)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="jobs must be an integer") from exc
+        n = max(1, min(n, _MAX_JOBS))
+        argv.extend(["--jobs", str(n)])
     if extra.strip():
         argv.extend(extra.split())
     job = request.app.state.runner.start(argv)

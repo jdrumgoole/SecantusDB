@@ -36,8 +36,17 @@ body { margin: 0; display: flex; min-height: 100vh; background: var(--bg); color
 .card-head h2 { margin: 0 0 2px; font-size: 16px; }
 .subtitle { margin: 0 0 12px; color: var(--muted); font-size: 12px; }
 .phase h3 { margin: 12px 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
-.task-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
-.task-form { margin: 0; }
+.task-buttons { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.task-form { margin: 0; display: inline-flex; align-items: center; gap: 4px; }
+.jobs-field {
+  display: inline-flex; align-items: center; gap: 3px; font-size: 12px;
+  color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 0 6px;
+}
+.jobs-input {
+  width: 40px; background: transparent; border: none; color: var(--fg);
+  font-size: 13px; font-family: inherit; text-align: right;
+}
+.jobs-input::-webkit-inner-spin-button { opacity: 1; }
 
 .btn {
   background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);

@@ -25,6 +25,12 @@
           {% else %}
           <form method="post" action="/jobs/start" class="task-form">
             <input type="hidden" name="task_key" value="{{ task.key }}" />
+            {% if task.jobs_option %}
+            <label class="jobs-field" title="Parallelism (--jobs); 4 or fewer recommended">
+              ⇉<input type="number" name="jobs" value="{{ task.default_jobs }}"
+                       min="1" max="16" class="jobs-input" />
+            </label>
+            {% endif %}
             <button type="submit" class="btn" title="{{ task.blurb }}">{{ task.label }}</button>
           </form>
           {% endif %}

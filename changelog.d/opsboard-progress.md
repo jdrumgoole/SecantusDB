@@ -24,3 +24,6 @@ as zombies.
 - `Cancel all running` control; per-job cancel now tears down the whole process
   group + escaped descendants (SIGINT→SIGTERM→SIGKILL) and reaps children.
 - `py-gate` / `rust-gate` emit `==> [k/N] label` phase-step banners.
+- **All gauges** button per server (Python / Rust) running `validate-all`, with
+  a parallelism input that sets `--jobs N` (dispatches the gauges over a thread
+  pool; capped, 4 or fewer recommended).
