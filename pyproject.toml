@@ -100,6 +100,19 @@ admin = [
     # / Activity Monitor say "SecantusDB admin" instead of "Python".
     "setproctitle>=1.3",
 ]
+opsboard = [
+    # Local FastAPI + pywebview app that drives the build/test/release cycle
+    # for all three servers. Same web stack as the admin extra; dev-only. The
+    # job-tracking core (secantus.jobkit) is pure-stdlib and needs no extra.
+    "fastapi>=0.110",
+    "starlette>=1.0.1",  # CVE-2026-48710 fix (see the admin extra note)
+    "uvicorn[standard]>=0.27",
+    "jinja2>=3.1",
+    "httpx>=0.27",
+    "pywebview>=5.0",
+    "python-multipart>=0.0.30",  # form posts from the task buttons
+    "setproctitle>=1.3",
+]
 rust = [
     # The Rust engine core (`_secantus_core`) as a separate companion wheel: the
     # reusable engines behind the Rust server + the byte-for-byte parity-test
@@ -138,6 +151,8 @@ secantusd-py-pg = "secantus.sql.pgserver:main"
 # Utility commands carry the bare `secantus` import-name prefix (they aren't
 # daemons, so the `secantusd-` prefix doesn't apply).
 secantus-admin = "secantus.admin.cli:main"
+# Ops Board: local web app to drive the build/test/release cycle (dev tool).
+secantus-opsboard = "secantus.opsboard.cli:main"
 # Offline restore tool: extract a SecantusDB backup archive into a
 # fresh directory the user then points a new `secantusd-py` at.
 secantus-restore-archive = "secantus.restore_cli:main"

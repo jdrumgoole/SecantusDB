@@ -1,0 +1,22 @@
+{% from "partials/status_pill.html" import pill %}
+{% for job in jobs %}
+<tr>
+  <td><a href="/jobs/{{ job.id }}">{{ job.id }}</a></td>
+  <td>{{ job.target }}</td>
+  <td><code>{{ job.task }}</code></td>
+  <td>{{ pill(job.status) }}</td>
+  <td>{{ job.exit_code if job.exit_code is not none else "—" }}</td>
+</tr>
+{% endfor %}
+{% if next_cursor is not none %}
+<tr id="load-more">
+  <td colspan="5">
+    <button class="btn btn-ghost"
+            hx-get="/jobs?before={{ next_cursor }}"
+            hx-target="#load-more"
+            hx-swap="outerHTML">
+      Load older
+    </button>
+  </td>
+</tr>
+{% endif %}

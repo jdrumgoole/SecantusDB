@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block body %}
+<table class="jobs-table">
+  <thead><tr><th>#</th><th>target</th><th>task</th><th>status</th><th>exit</th></tr></thead>
+  <tbody id="job-rows">
+    {% include "partials/job_rows.html" %}
+  </tbody>
+</table>
+{% endblock %}

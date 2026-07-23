@@ -1,0 +1,7 @@
+{# Replaces #logbox. While the job runs, keep the every-1s poll; once done,
+   drop the trigger so polling stops. #}
+<div id="logbox"
+     {% if not done %}hx-get="/jobs/{{ job_id }}/log" hx-trigger="every 1s" hx-swap="outerHTML"{% endif %}>
+  <pre class="log">{{ log_text }}{% if not log_text %}(no output yet){% endif %}</pre>
+  {% if done and job %}<p class="muted log-foot">{{ job.status }} · exit {{ job.exit_code if job.exit_code is not none else "—" }}</p>{% endif %}
+</div>
