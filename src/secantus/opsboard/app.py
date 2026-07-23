@@ -15,7 +15,7 @@ from fastapi.templating import Jinja2Templates
 import secantus
 from secantus.jobkit import Journal
 from secantus.opsboard.middleware import TokenAuthMiddleware
-from secantus.opsboard.routers import dashboard, health, jobs
+from secantus.opsboard.routers import dashboard, gauges, health, jobs
 from secantus.opsboard.runner import JobRunner
 
 _PKG = Path(__file__).resolve().parent
@@ -56,6 +56,7 @@ def create_app(
     app.include_router(health.router)
     app.include_router(dashboard.router)
     app.include_router(jobs.router)
+    app.include_router(gauges.router)
     return app
 
 
