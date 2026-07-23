@@ -10,7 +10,9 @@ from __future__ import annotations
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from secantus.jobkit import PASSED
 from secantus.opsboard import registry
+from secantus.opsboard.progress import parse_progress
 
 router = APIRouter()
 
@@ -21,6 +23,15 @@ _PAGE = 50
 
 def _templates(request: Request):  # noqa: ANN202
     return request.app.state.templates
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 @router.get("/jobs", response_class=HTMLResponse)
@@ -37,6 +48,7 @@ def jobs_page(request: Request, before: int | None = None) -> HTMLResponse:
             "active": "jobs",
             "jobs": jobs,
             "next_cursor": next_cursor,
+            "running_count": len(journal.running()),
         },
     )
 
@@ -78,6 +90,42 @@ def job_detail(request: Request, job_id: int) -> HTMLResponse:
     )
 
 
+@router.get("/jobs/{job_id}/view", response_class=HTMLResponse)
+def job_view(request: Request, job_id: int) -> HTMLResponse:
+    """The graphical job view: overall bar + phase stepper + collapsible log.
+
+    Self-repolls (HTMX) every second while the job runs; the partial drops the
+    poll trigger once the job is done.
+    """
+    journal = request.app.state.journal
+    job = journal.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="no such job")
+    text, _offset, done = request.app.state.runner.tail(job_id, 0)
+    task = registry.find_task_by_argv(job.argv)
+    labels = task.phase_labels if task and task.phase_labels else None
+    prog = parse_progress(
+        text,
+        known_labels=labels,
+        done=done,
+        passed=(job.status == PASSED),
+    )
+    log_text = text
+    if len(log_text) > _LOG_TAIL_BYTES:
+        log_text = "…(truncated)…\n" + log_text[-_LOG_TAIL_BYTES:]
+    return _templates(request).TemplateResponse(
+        request,
+        "partials/job_view.html",
+        {
+            "job": job,
+            "prog": prog,
+            "done": done,
+            "log_text": log_text,
+            "elapsed": _fmt_elapsed(job.duration),
+        },
+    )
+
+
 @router.get("/jobs/{job_id}/log", response_class=HTMLResponse)
 def job_log(request: Request, job_id: int) -> HTMLResponse:
     """Return the log-tail partial. Self-repolls (HTMX) only while running."""
@@ -91,6 +139,14 @@ def job_log(request: Request, job_id: int) -> HTMLResponse:
         "partials/log_box.html",
         {"job_id": job_id, "log_text": text, "done": done, "job": job},
     )
+
+
+@router.post("/jobs/cancel-all")
+def cancel_all_jobs(request: Request) -> RedirectResponse:
+    """Stop every running job (and its whole process tree)."""
+    request.app.state.runner.cancel_all()
+    token = request.app.state.token
+    return RedirectResponse(url=f"/jobs?t={token}", status_code=303)
 
 
 @router.post("/jobs/{job_id}/cancel")

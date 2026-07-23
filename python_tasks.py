@@ -219,12 +219,18 @@ def py_gate(c: Context, perf: bool = True, deselect: str = _LOCAL_DESELECT) -> N
     counterpart to ``rust-gate``; it must be green before committing
     ``src/secantus/**`` work.
     """
+    steps = 3 if perf else 2
+    # ``==> [k/N] label`` phase markers: drive the Ops Board progress stepper
+    # (secantus.opsboard.progress) and give a clear CLI banner per sub-step.
+    print(f"==> [1/{steps}] Lint", flush=True)
     lint(c)
+    print(f"==> [2/{steps}] Tests", flush=True)
     cmd = "uv run python -m pytest -q"
     for nodeid in (d for d in deselect.split(",") if d.strip()):
         cmd += f" --deselect {shlex.quote(nodeid.strip())}"
     c.run(cmd, pty=True)
     if perf:
+        print(f"==> [3/{steps}] Perf", flush=True)
         perf_task(c)
 
 

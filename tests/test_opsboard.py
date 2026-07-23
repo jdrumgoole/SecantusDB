@@ -7,6 +7,7 @@ mock. Also enforces the pywebview "no runtime CDN" rule.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -146,6 +147,52 @@ def test_job_log_tail_captures_child_output(client: TestClient) -> None:
     assert "CHILD-RAN" in r.text
     # Done → no more polling trigger emitted.
     assert "every 1s" not in r.text
+
+
+def test_job_view_renders_progress_and_stepper(client: TestClient, tmp_path: Path) -> None:
+    journal = client.app.state.journal
+    jid = journal.create(
+        target="python", task="py-gate", argv=["py-gate"], worktree="/w", host_pid=1
+    )
+    log = tmp_path / "job.log"
+    log.write_text("==> [1/3] Lint\nlinting\n==> [2/3] Tests\ntests/x PASSED [ 60%]\n")
+    journal.set_log_path(jid, str(log))
+
+    r = client.get(f"/jobs/{jid}/view")
+    assert r.status_code == 200
+    body = r.text
+    # Phase stepper with registry-supplied labels (incl. the not-yet-reached one).
+    assert "Lint" in body and "Tests" in body and "Perf" in body
+    # Determinate overall bar rendered a percentage.
+    assert "%" in body
+    # Still running → keeps polling.
+    assert "every 1s" in body
+
+
+def test_job_view_stops_polling_when_done(client: TestClient, tmp_path: Path) -> None:
+    journal = client.app.state.journal
+    jid = journal.create(target="python", task="test", argv=["test"], worktree="/w", host_pid=1)
+    log = tmp_path / "job.log"
+    log.write_text("all good [ 100%]\n")
+    journal.set_log_path(jid, str(log))
+    journal.finish(jid, 0)
+
+    r = client.get(f"/jobs/{jid}/view")
+    assert r.status_code == 200
+    assert "every 1s" not in r.text  # done → no repoll
+
+
+def test_cancel_all_endpoint_redirects(client: TestClient) -> None:
+    r = client.post("/jobs/cancel-all", follow_redirects=False)
+    assert r.status_code == 303
+    assert "/jobs" in r.headers["location"]
+
+
+def test_jobs_page_shows_cancel_all_when_running(client: TestClient) -> None:
+    journal = client.app.state.journal
+    journal.create(target="python", task="t", argv=["t"], worktree="/w", host_pid=os.getpid())
+    page = client.get("/jobs")
+    assert "Cancel all running" in page.text
 
 
 def test_jobs_pagination(client: TestClient) -> None:
