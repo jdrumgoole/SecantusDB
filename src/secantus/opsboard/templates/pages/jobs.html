@@ -1,14 +1,8 @@
 {% extends "base.html" %}
 {% block body %}
-<div class="jobs-toolbar">
-  <span class="muted">{{ running_count }} running</span>
-  {% if running_count %}
-  <form method="post" action="/jobs/cancel-all" class="inline-form"
-        onsubmit="return confirm('Stop all {{ running_count }} running job(s) and kill their process trees?')">
-    <button type="submit" class="btn btn-danger btn-sm">Cancel all running</button>
-  </form>
-  {% endif %}
-</div>
+{% include "partials/running.html" %}
+
+<h2 class="history-head">History <span class="muted">· completed jobs</span></h2>
 <table class="jobs-table">
   <thead><tr><th>#</th><th>target</th><th>task</th><th>status</th><th>exit</th></tr></thead>
   <tbody id="job-rows">

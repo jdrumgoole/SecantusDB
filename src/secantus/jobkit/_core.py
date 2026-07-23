@@ -263,7 +263,11 @@ class Journal:
         return _row_to_job(row) if row else None
 
     def list(
-        self, *, limit: int = 50, before_id: int | None = None
+        self,
+        *,
+        limit: int = 50,
+        before_id: int | None = None,
+        include_running: bool = True,
     ) -> tuple[list[Job], int | None]:
         """Newest-first page of jobs.
 
@@ -271,16 +275,22 @@ class Journal:
         ``next_cursor`` to fetch the following page). Returns
         ``(jobs, next_cursor)`` where ``next_cursor`` is ``None`` on the last
         page. Unbounded listing is never exposed — always paginate.
+
+        ``include_running=False`` excludes in-flight jobs, so a "history" view
+        can page through finished work without the currently-running rows
+        drifting in and out of the page as they complete.
         """
         limit = max(1, min(int(limit), 500))
+        where = "" if include_running else f" WHERE status != '{RUNNING}'"
+        joiner = " AND" if where else " WHERE"
         with self._connect() as conn:
             if before_id is None:
                 rows = conn.execute(
-                    "SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)
+                    f"SELECT * FROM jobs{where} ORDER BY id DESC LIMIT ?", (limit,)
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM jobs WHERE id < ? ORDER BY id DESC LIMIT ?",
+                    f"SELECT * FROM jobs{where}{joiner} id < ? ORDER BY id DESC LIMIT ?",
                     (before_id, limit),
                 ).fetchall()
         jobs = [_row_to_job(r) for r in rows]

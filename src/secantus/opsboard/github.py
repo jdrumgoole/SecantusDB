@@ -43,6 +43,25 @@ def _subprocess_runner(argv: Sequence[str], timeout: float) -> tuple[int, str, s
     return proc.returncode, proc.stdout, proc.stderr
 
 
+# Workflows whose dispatch has outward-facing consequences: publishing to PyPI
+# or cutting binary release artifacts. Matched on the workflow's display name.
+# These are gated in the UI exactly like release-class invoke tasks — a plain
+# "Run workflow" dropdown listing them beside `Tests` would be a foot-gun.
+_RELEASE_CLASS = ("publish", "release")
+
+
+@dataclass(frozen=True)
+class Workflow:
+    name: str
+    id: str
+    state: str
+
+    @property
+    def release_class(self) -> bool:
+        low = self.name.lower()
+        return any(token in low for token in _RELEASE_CLASS)
+
+
 @dataclass(frozen=True)
 class WorkflowRun:
     name: str
@@ -144,6 +163,46 @@ class GitHubClient:
         result = self._cached(f"runs:{limit}", produce)
         return list(result) if isinstance(result, list) else []
 
+    def workflows(self) -> list[Workflow]:
+        """Active workflows, flagged for whether dispatching them publishes."""
+
+        def produce() -> object:
+            data = self._gh_json(
+                ["gh", "workflow", "list", "--repo", self.repo, "--json", "name,id,state"]
+            )
+            if not isinstance(data, list):
+                return []
+            self.last_error = None
+            return [
+                Workflow(
+                    name=str(w.get("name", "")),
+                    id=str(w.get("id", "")),
+                    state=str(w.get("state", "")),
+                )
+                for w in data
+                if str(w.get("state", "")) == "active"
+            ]
+
+        result = self._cached("workflows", produce)
+        return list(result) if isinstance(result, list) else []
+
+    def dispatch(self, workflow: str, *, ref: str = "main") -> tuple[bool, str]:
+        """Start a workflow run. Returns ``(ok, message)``; never raises.
+
+        Callers are responsible for gating release-class workflows — see
+        ``Workflow.release_class``.
+        """
+        code, out, err = self._run(
+            ["gh", "workflow", "run", workflow, "--repo", self.repo, "--ref", ref],
+            self.timeout,
+        )
+        self._cache.pop("runs:20", None)  # so the list reflects the new run soon
+        if code != 0:
+            msg = (err or out or f"gh exited {code}").strip().splitlines()[0][:300]
+            self.last_error = msg
+            return False, msg
+        return True, f"dispatched {workflow} on {ref}"
+
     def available(self) -> bool:
         """Whether gh is usable (present + authenticated) — cached."""
 
@@ -156,4 +215,4 @@ class GitHubClient:
         return bool(self._cached("available", produce))
 
 
-__all__ = ["GitHubClient", "WorkflowRun", "Runner", "DEFAULT_REPO"]
+__all__ = ["GitHubClient", "WorkflowRun", "Workflow", "Runner", "DEFAULT_REPO"]
