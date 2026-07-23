@@ -53,6 +53,12 @@ pub struct ResolvedConfig {
 
     // ---- [storage] ---------------------------------------------------
     pub cache_size: String,
+    /// WiredTiger WAL log `file_max` (unit-suffixed, e.g. "2GB"). The standalone
+    /// daemon defaults to 2GB — the 128MB WT default forced constant log-file
+    /// rotation under a multi-writer write load (a measured ~+13-19% throughput
+    /// loss at 4-8 writers). 2GB is WT's hard cap; `prealloc=false` keeps the log
+    /// files sparse so a small workload still costs only what it writes.
+    pub log_file_max: String,
     pub session_max: u32,
     pub ttl_sweep_seconds: f64,
     pub sync_on_commit: bool,
@@ -78,6 +84,7 @@ impl Default for ResolvedConfig {
             oplog_archive_dir: None,
             noop_heartbeat_seconds: 0.0,
             cache_size: "1G".to_string(),
+            log_file_max: "2GB".to_string(),
             session_max: 1000,
             ttl_sweep_seconds: 60.0,
             sync_on_commit: false,
@@ -106,6 +113,7 @@ pub struct ConfigOverrides {
     pub oplog_archive_dir: Option<String>,
     pub noop_heartbeat_seconds: Option<f64>,
     pub cache_size: Option<String>,
+    pub log_file_max: Option<String>,
     pub session_max: Option<u32>,
     pub ttl_sweep_seconds: Option<f64>,
     pub sync_on_commit: Option<bool>,
@@ -147,6 +155,7 @@ impl ConfigOverrides {
         }
         set_copy!(noop_heartbeat_seconds);
         set!(cache_size);
+        set!(log_file_max);
         set_copy!(session_max);
         set_copy!(ttl_sweep_seconds);
         set_copy!(sync_on_commit);
@@ -318,6 +327,7 @@ pub fn parse_str(text: &str, label: &str) -> Result<ConfigOverrides, String> {
         for (key, val) in storage {
             match key.as_str() {
                 "cache_size" => out.cache_size = Some(as_string(val, "storage", key, label)?),
+                "log_file_max" => out.log_file_max = Some(as_string(val, "storage", key, label)?),
                 "session_max" => out.session_max = Some(as_u32(val, "storage", key, label)?),
                 "ttl_sweep_seconds" => {
                     out.ttl_sweep_seconds = Some(as_f64(val, "storage", key, label)?)

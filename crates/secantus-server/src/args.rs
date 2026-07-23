@@ -50,6 +50,7 @@ pub struct CliArgs {
     pub oplog_archive_dir: Option<String>,
     pub log_level: String,
     pub cache_size: String,
+    pub log_file_max: String,
     pub session_max: u32,
     pub sync_on_commit: bool,
     pub noop_heartbeat_seconds: f64,
@@ -94,6 +95,7 @@ impl CliArgs {
             oplog_archive_dir: cfg.oplog_archive_dir.clone(),
             log_level: cfg.log_level.clone(),
             cache_size: cfg.cache_size.clone(),
+            log_file_max: cfg.log_file_max.clone(),
             session_max: cfg.session_max,
             sync_on_commit: cfg.sync_on_commit,
             noop_heartbeat_seconds: cfg.noop_heartbeat_seconds,
@@ -235,6 +237,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 o.log_level = Some(lvl);
             }
             "--cache-size" => o.cache_size = Some(take_value("--cache-size")?),
+            "--log-file-max" => o.log_file_max = Some(take_value("--log-file-max")?),
             "--session-max" => {
                 let raw = take_value("--session-max")?;
                 o.session_max = Some(raw.parse::<u32>().map_err(|_| {
@@ -342,6 +345,10 @@ OPTIONS:
                                  topology; change streams need the default)
     --cache-size SIZE            WiredTiger cache size, unit-suffixed string like
                                  '256M', '1G', '8G' (default: 1G)
+    --log-file-max SIZE          WiredTiger WAL log file_max, unit-suffixed like
+                                 '128MB', '1GB', '2GB' (default: 2GB; 2GB is WT's
+                                 cap. Bigger = fewer log rotations under write
+                                 load = higher throughput; files are sparse.)
     --session-max N              WiredTiger session_max — concurrent WT session
                                  cap (default: 1000)
     --sync-on-commit             Fsync the WT log on every transaction commit
