@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import signal
 import sys
+import threading
 
 import bson
 import pytest
@@ -871,3 +872,69 @@ def test_fast_storage_round_trips(tmp_path) -> None:
         assert s.find_matching("db", "c", {"_id": 1}) == [{"_id": 1, "x": "hi"}]
     finally:
         s.close()
+
+
+def _ddl_crud_round(storage: Storage, db: str, coll: str, writers: int, per_writer: int) -> None:
+    """One race round: N fresh writer threads vs a concurrent index build.
+
+    Each round lives in its own function so the thread closures capture
+    parameters, never a loop variable.
+    """
+    storage.insert(db, coll, [{"_id": k, "x": k % 5} for k in range(20)])
+    barrier = threading.Barrier(writers + 1)
+    errors: list[BaseException] = []
+
+    def writer(i: int) -> None:
+        try:
+            barrier.wait()
+            base = 1000 + i * per_writer
+            for k in range(per_writer):
+                storage.insert(db, coll, [{"_id": base + k, "x": (base + k) % 5}])
+        except BaseException as exc:  # noqa: BLE001 - surfaced after join
+            errors.append(exc)
+
+    def builder() -> None:
+        try:
+            barrier.wait()
+            storage.create_index(db, coll, "x_1", {"x": 1})
+        except BaseException as exc:  # noqa: BLE001 - surfaced after join
+            errors.append(exc)
+
+    threads = [threading.Thread(target=builder)]
+    threads += [threading.Thread(target=writer, args=(i,)) for i in range(writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+        assert not t.is_alive(), (
+            "thread did not finish within 60s — deadlock between the index build "
+            "and a concurrent write (check the _coll_lock/_lock ordering)"
+        )
+    assert not errors, f"worker failures: {errors!r}"
+
+    total = 20 + writers * per_writer
+    assert storage.count_matching(db, coll, {}) == total
+    # Every doc must be reachable THROUGH THE INDEX, not merely by a scan.
+    plan = storage.explain_plan(db, coll, {"x": 3}, hint="x_1")
+    assert plan.get("kind") == "IXSCAN", f"expected IXSCAN, got {plan}"
+    via_index = {d["_id"] for d in storage.find_matching(db, coll, {"x": 3}, hint="x_1")}
+    via_scan = {d["_id"] for d in storage.find_matching(db, coll, {}) if d["x"] == 3}
+    assert via_index == via_scan, f"index lost {sorted(via_scan - via_index)}"
+
+
+def test_ddl_and_crud_never_deadlock_and_index_stays_complete(storage: Storage) -> None:
+    """Concurrent index DDL and writes must neither deadlock nor lose an entry.
+
+    Both paths can hold ``_coll_lock`` AND ``_lock``. The canonical order is
+    ``_coll_lock`` → ``_lock``; acquiring them the other way round is an AB-BA
+    deadlock. Each writer runs on a FRESH thread so it takes ``_coll_lock`` and
+    then hits ``_lock`` inside ``_session``'s first-use path — the exact order-B
+    acquisition — while ``create_index`` runs concurrently on the same
+    collection.
+
+    Guards two regressions at once: a hang (inverted lock order) fails the join
+    timeout loudly instead of wedging the suite, and a lost index entry (DDL
+    interleaving with an in-flight write) fails the index-vs-scan comparison.
+    """
+    for r in range(4):
+        _ddl_crud_round(storage, "app", f"c{r}", writers=4, per_writer=25)

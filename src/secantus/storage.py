@@ -1514,6 +1514,21 @@ class Storage:
         *other* collections proceeds in parallel. DDL on this collection
         also acquires this lock so schema changes cannot interleave with
         in-flight writes.
+
+        **LOCK ORDER — always acquire ``_coll_lock`` BEFORE ``self._lock``.**
+        There is exactly one legal order and every path must follow it. The two
+        ways a thread can end up holding both:
+
+        * CRUD (``insert`` / ``update_matching`` / ``delete_matching``) takes
+          ``_coll_lock``, then reaches ``_lock`` inside ``_session`` the first
+          time a connection thread opens its WT session.
+        * DDL that must exclude in-flight writes (``create_index``) takes
+          ``_coll_lock`` and then ``_lock`` explicitly.
+
+        Anything holding ``_lock`` must therefore NOT reach down for
+        ``_coll_lock`` — that inverted order is an AB-BA deadlock against CRUD.
+        ``_collection_uuid``'s mint path used to do exactly that and now takes
+        ``_lock`` instead; see the note there.
         """
         key = (db, coll)
         # Fast path: lock already exists — read without any mutation,
@@ -1568,9 +1583,21 @@ class Storage:
             return _uuid.UUID(bytes=bytes(existing))
         if isinstance(existing, bytes) and len(existing) == 16:
             return _uuid.UUID(bytes=existing)
-        # Mint path — take the per-coll lock; re-read after acquiring
-        # so a racer that won the mint race is observed.
-        with self._coll_lock(db, coll):
+        # Mint path — serialise the mint, then re-read after acquiring so a
+        # racer that won the mint race is observed.
+        #
+        # LOCK ORDER (see the note on ``_coll_lock``): this takes ``_lock``, NOT
+        # ``_coll_lock``. Nine DDL methods (create_collection / drop_collection /
+        # drop_database / rename_collection / record_collmod / prune_ttl /
+        # create_index / drop_index / drop_all_indexes) call this *while already
+        # holding* ``_lock``; if the mint reached down for ``_coll_lock`` those
+        # paths would run ``_lock`` → ``_coll_lock``, the exact inverse of the
+        # ``_coll_lock`` → ``_lock`` order that CRUD takes (insert / update /
+        # delete hold ``_coll_lock`` and then hit ``_lock`` inside ``_session``
+        # on a connection thread's first use). That is a textbook AB-BA
+        # deadlock. Using ``_lock`` here is reentrant for every DDL caller and
+        # keeps CRUD callers on the single canonical order.
+        with self._lock:
             opts = self._coll_options(db, coll) or {}
             existing = opts.get("uuid")
             if isinstance(existing, _uuid.UUID):
@@ -5032,7 +5059,20 @@ class Storage:
             ):
                 raise CreateIndexUnsupported(f"Unknown index plugin '{_spec_val}'")
         options = dict(options or {})
-        with self._lock:
+        # An index build is DDL that must not interleave with in-flight writes to
+        # the same collection: it scans the doc table into an entry list, writes
+        # the catalog row, then lays the entries down. A concurrent insert landing
+        # between the scan and the catalog write is invisible to BOTH halves — the
+        # scan already snapshotted, and the inserter sees no index yet — so the doc
+        # ends up with no index entry and an indexed query silently under-reports
+        # it (`test_index_build_under_write_load_stays_consistent`). Holding the
+        # per-collection lock is what `_coll_lock`'s own contract already promised
+        # for DDL; `create_index` was the one DDL path not honouring it.
+        #
+        # LOCK ORDER: `_coll_lock` BEFORE `_lock` — the single canonical order (see
+        # `_coll_lock`). Both are RLocks, so the nested `_collection_uuid` /
+        # `_emit_oplog` calls below re-enter harmlessly on this thread.
+        with self._coll_lock(db, coll), self._lock:
             # An index build SCANS the doc table to lay down its entries, so it
             # is a mutating scanner and needs the same snapshot refresh every
             # other one takes (drop_index / drop_all_indexes /
