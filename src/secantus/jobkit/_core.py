@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import select
 import signal
 import sqlite3
 import subprocess
@@ -470,7 +471,18 @@ def _run_pty(cmd: Sequence[str], *, cwd: str, log_path: Path, echo: bool) -> int
             close_fds=True,
             start_new_session=True,  # own process group → killpg reaches the tree
         )
-        os.close(slave)
+        # NOTE: the parent deliberately keeps `slave` OPEN for the whole read
+        # loop (it is closed in the `finally` below). Closing it here — so the
+        # child holds the only slave fd — makes the pty signal EOF the moment
+        # the child exits, and on macOS/BSD that `read()` returns EIO and
+        # *discards whatever is still buffered*. A child that finishes before
+        # the parent reaches its first read therefore loses ALL of its output
+        # (measured: 20/20 runs when the parent is descheduled by only 50ms,
+        # 0/20 when it wins the race — which is why this only reddened macOS CI
+        # under xdist load while Linux, which delivers buffered bytes before
+        # EIO, stayed green). Holding the slave open means the pty never sees
+        # "all writers gone", so nothing is dropped; the loop below instead
+        # terminates on child-exit + drained-buffer.
 
         def _forward(signum: int, _frame: object) -> None:
             with contextlib.suppress(ProcessLookupError):
@@ -481,22 +493,34 @@ def _run_pty(cmd: Sequence[str], *, cwd: str, log_path: Path, echo: bool) -> int
                 old_handlers[sig] = signal.signal(sig, _forward)
 
         try:
+            # Because the parent holds the slave open (above), `read()` would
+            # block forever after the child exits rather than reporting EOF —
+            # so poll for readability instead and stop once the child is gone
+            # AND the pty buffer has gone quiet. Anything the child wrote before
+            # exiting is already buffered, so a timed-out select with the child
+            # reaped means everything has been drained.
             while True:
-                try:
-                    data = os.read(master, 65536)
-                except OSError:  # master EOF once the child closes its pty end
+                readable, _, _ = select.select([master], [], [], 0.05)
+                if readable:
+                    try:
+                        data = os.read(master, 65536)
+                    except OSError:  # slave side genuinely gone
+                        break
+                    if not data:
+                        break
+                    logf.write(data)
+                    logf.flush()
+                    if echo:
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
+                    continue
+                if proc.poll() is not None:
                     break
-                if not data:
-                    break
-                logf.write(data)
-                logf.flush()
-                if echo:
-                    sys.stdout.buffer.write(data)
-                    sys.stdout.buffer.flush()
         finally:
             if on_main:
                 for sig, handler in old_handlers.items():
                     signal.signal(sig, handler)  # type: ignore[arg-type]
+            os.close(slave)
             os.close(master)
             proc.wait()
     return proc.returncode
