@@ -48,6 +48,35 @@ body { margin: 0; display: flex; min-height: 100vh; background: var(--bg); color
 }
 .jobs-input::-webkit-inner-spin-button { opacity: 1; }
 
+/* ---- per-task info dialog + estimate chip ---- */
+.task-cell { display: inline-flex; align-items: center; gap: 4px; }
+.btn-info {
+  width: 20px; height: 20px; padding: 0; border-radius: 50%; cursor: pointer;
+  background: var(--panel-2); color: var(--muted); border: 1px solid var(--border);
+  font-size: 11px; font-style: italic; font-family: Georgia, serif; line-height: 1;
+}
+.btn-info:hover { color: var(--accent); border-color: var(--accent); }
+.est-chip {
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.task-dialog {
+  max-width: 520px; width: calc(100% - 48px); border: 1px solid var(--border);
+  border-radius: 10px; background: var(--panel); color: var(--fg); padding: 20px;
+}
+.task-dialog::backdrop { background: rgba(0,0,0,.55); }
+.task-dialog h3 { margin: 0 0 8px; font-size: 16px; }
+.dialog-cmd { margin: 0 0 12px; font-size: 12px; }
+.dialog-cmd code {
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 5px; padding: 2px 6px;
+}
+.dialog-detail { margin: 0 0 12px; font-size: 13px; line-height: 1.6; color: var(--fg); }
+.dialog-est { margin: 0 0 12px; font-size: 13px; }
+.dialog-warn { margin: 0 0 12px; font-size: 12px; color: var(--fail); }
+.dialog-actions { margin: 0; display: flex; justify-content: flex-end; }
+
 .btn {
   background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
   border-radius: 6px; padding: 6px 10px; font-size: 13px; cursor: pointer;

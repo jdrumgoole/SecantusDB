@@ -15,6 +15,8 @@
         <h3>{{ phase }}</h3>
         <div class="task-buttons">
           {% for task in tasks %}
+          {% set est = estimates.get(task.key) %}
+          <span class="task-cell">
           {% if task.confirm %}
           {# Release-class: irreversible / outward-facing. Not startable from the
              dashboard — the confirm-gated Release page (Phase 5) owns these. #}
@@ -34,6 +36,30 @@
             <button type="submit" class="btn" title="{{ task.blurb }}">{{ task.label }}</button>
           </form>
           {% endif %}
+          {# Info: opens a native <dialog> with the full explanation + timing. #}
+          <button type="button" class="btn-info" aria-label="About {{ task.label }}"
+                  title="What is this? / how long does it take?"
+                  onclick="document.getElementById('dlg-{{ task.key }}').showModal()">i</button>
+          {% if est %}<span class="est-chip" title="{{ est.qualifier }}">{{ est.text }}</span>{% endif %}
+          </span>
+
+          <dialog id="dlg-{{ task.key }}" class="task-dialog">
+            <h3>{{ task.label }} <span class="muted">· {{ target.name }}</span></h3>
+            <p class="dialog-cmd"><code>./inv {{ task.argv | join(' ') }}</code></p>
+            <p class="dialog-detail">{{ task.detail or task.blurb }}</p>
+            {% if est %}
+            <p class="dialog-est">
+              <strong>Estimated time:</strong> {{ est.text }}
+              <span class="muted">({{ est.qualifier }})</span>
+            </p>
+            {% endif %}
+            {% if task.confirm %}
+            <p class="dialog-warn">⚠ Release-class: irreversible / outward-facing. Not startable here.</p>
+            {% endif %}
+            <form method="dialog" class="dialog-actions">
+              <button class="btn">Close</button>
+            </form>
+          </dialog>
           {% endfor %}
         </div>
       </div>
