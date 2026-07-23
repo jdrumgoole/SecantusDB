@@ -557,7 +557,7 @@ fn serve<S: Read + Write>(
             Ok(Op::Msg(msg)) => {
                 let more_to_come = msg.flags & OP_MSG_FLAG_MORE_TO_COME != 0;
                 let exhaust_allowed = msg.flags & OP_MSG_FLAG_EXHAUST_ALLOWED != 0;
-                let request = match merge_op_msg_body(&msg) {
+                let (request, raw_insert_docs) = match merge_op_msg_body(&msg) {
                     Ok(d) => d,
                     Err(e) => {
                         // A kind-0/kind-1 doc failed BSON validation — recoverable.
@@ -565,8 +565,14 @@ fn serve<S: Read + Write>(
                         continue;
                     }
                 };
-                let (mut reply, close_conn, pending) =
-                    run_dispatch(&request, conn_id, shared, conn_auth, &peer_cert_dn);
+                let (mut reply, close_conn, pending) = run_dispatch(
+                    &request,
+                    raw_insert_docs,
+                    conn_id,
+                    shared,
+                    conn_auth,
+                    &peer_cert_dn,
+                );
                 // A `closeConnection` failpoint drops the socket without replying,
                 // so the driver observes a network error.
                 if close_conn {
@@ -783,10 +789,29 @@ fn escape_dn_value(value: &str) -> String {
 
 /// Build the request document: the kind-0 body with each kind-1 document
 /// sequence merged in under its identifier (`server.py::_merge_op_msg_body`).
-fn merge_op_msg_body(msg: &OpMsg) -> Result<Document, WireError> {
+/// Returns the merged command document and, for the raw-BSON write path, the
+/// `insert` documents kept as un-decoded byte slices. For an `insert` whose
+/// `documents` arrived as a kind-1 sequence (the common driver shape) that
+/// sequence is **not** decoded/merged into the body — the raw slices are returned
+/// separately so the handler can store the client's bytes verbatim, skipping the
+/// merge-decode → re-encode → storage-decode round-trip. Every other command (and
+/// an insert whose docs are inline in the kind-0 body) merges as before with a
+/// `None` raw side-channel.
+/// The raw (un-decoded) BSON byte slices of an `insert`'s kind-1 `documents`
+/// sequence — the raw-BSON write side-channel.
+type RawInsertDocs = Vec<Vec<u8>>;
+
+fn merge_op_msg_body(msg: &OpMsg) -> Result<(Document, Option<RawInsertDocs>), WireError> {
     let mut body = Document::from_reader(&mut &msg.body[..])
         .map_err(|e| WireError::MalformedBody(e.to_string()))?;
+    let is_insert = body.keys().next().map(String::as_str) == Some("insert");
+    let mut raw_insert: Option<Vec<Vec<u8>>> = None;
     for seq in &msg.document_sequences {
+        if is_insert && seq.identifier == "documents" {
+            // Divert un-decoded: the insert handler stores these bytes directly.
+            raw_insert = Some(seq.documents.iter().map(|d| d.to_vec()).collect());
+            continue;
+        }
         let mut docs = Vec::with_capacity(seq.documents.len());
         for d in &seq.documents {
             let parsed = Document::from_reader(&mut &d[..])
@@ -795,19 +820,21 @@ fn merge_op_msg_body(msg: &OpMsg) -> Result<Document, WireError> {
         }
         body.insert(seq.identifier.to_string(), docs);
     }
-    Ok(body)
+    Ok((body, raw_insert))
 }
 
 /// Dispatch one request, returning the reply plus whether the connection should
 /// be dropped (a `closeConnection` failpoint fired — the reply is discarded).
 fn run_dispatch(
     request: &Document,
+    raw_insert_docs: Option<RawInsertDocs>,
     conn_id: i64,
     shared: &Arc<Shared>,
     conn_auth: &Arc<Mutex<ConnectionAuth>>,
     peer_cert_dn: &Option<String>,
 ) -> (Document, bool, Option<PendingBatch>) {
     let mut ctx = make_context(conn_id, shared, conn_auth, peer_cert_dn);
+    ctx.raw_insert_documents = raw_insert_docs;
     if let Ok(db) = request.get_str("$db") {
         ctx.db_name = db.to_string();
     }
@@ -1031,7 +1058,7 @@ fn stream_exhaust_getmore<S: Write>(
             getmore.insert("maxTimeMS", mt.clone());
         }
         let (mut reply, _close, pending) =
-            run_dispatch(&getmore, conn_id, shared, conn_auth, peer_cert_dn);
+            run_dispatch(&getmore, None, conn_id, shared, conn_auth, peer_cert_dn);
         // Reframe the next batch into the reply document for the exhaust streamer.
         if let Some(pb) = pending {
             materialize_batch(&mut reply, pb);
@@ -1126,7 +1153,7 @@ fn stream_awaitable_hello<S: Read + Write>(
         }
         // Streaming `hello` never sets `pending_batch` (no cursor), so ignore it.
         let (reply, _close, _pending) =
-            run_dispatch(request, conn_id, shared, conn_auth, peer_cert_dn);
+            run_dispatch(request, None, conn_id, shared, conn_auth, peer_cert_dn);
         if write_op_msg_flags(stream, header, shared, &reply, OP_MSG_FLAG_MORE_TO_COME).is_err() {
             return Ok(false);
         }

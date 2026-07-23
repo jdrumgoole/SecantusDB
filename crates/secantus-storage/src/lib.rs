@@ -3196,12 +3196,22 @@ impl Storage {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let mut doc = decode_doc(doc_bytes)?;
-            if !doc.contains_key("_id") {
+            let assigned_id = !doc.contains_key("_id");
+            if assigned_id {
                 doc.insert("_id", Bson::ObjectId(ObjectId::new()));
             }
             let id = doc.get("_id").expect("_id present").clone();
             let mut key = id_key(&id)?;
-            let blob = encode_doc(&doc)?;
+            // Raw-write fast path: reuse the caller's BSON verbatim when already in
+            // canonical storage form (`_id` first, none assigned) — see `insert`.
+            let id_first = doc.keys().next().map(String::as_str) == Some("_id");
+            let reencoded;
+            let blob: &[u8] = if !assigned_id && id_first {
+                doc_bytes
+            } else {
+                reencoded = encode_doc(&doc)?;
+                &reencoded
+            };
             if blob.len() > MAX_BSON_OBJECT_SIZE {
                 return Err(StorageError::DocumentTooLarge(blob.len()));
             }
@@ -3221,7 +3231,7 @@ impl Storage {
                 // overwrite=false -> a pre-existing _id is a WT_DUPLICATE_KEY.
                 let cur = session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
                 cur.set_key_ssu(db, coll, &key);
-                cur.set_value_u(&blob);
+                cur.set_value_u(blob);
                 match cur.insert() {
                     Ok(()) => {}
                     Err(e) if e.is_duplicate_key() => return Err(StorageError::DuplicateId),
@@ -3290,7 +3300,8 @@ impl Storage {
                     session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
                 for (index, doc_bytes) in docs.iter().enumerate() {
                     let mut doc = decode_doc(doc_bytes)?;
-                    if !doc.contains_key("_id") {
+                    let assigned_id = !doc.contains_key("_id");
+                    if assigned_id {
                         doc.insert("_id", Bson::ObjectId(ObjectId::new()));
                     }
                     let id = doc.get("_id").expect("_id present").clone();
@@ -3314,7 +3325,21 @@ impl Storage {
                         }
                         continue;
                     }
-                    let blob = encode_doc(&doc)?;
+                    // Raw-write fast path: reuse the caller's BSON verbatim when it
+                    // is already in mongod's canonical storage form (`_id` first, and
+                    // no `_id` assigned here). encode_doc(&doc) would reproduce these
+                    // exact bytes, so re-encoding is dead work; mongod likewise stores
+                    // the document as the client sent it. Falls back to encode_doc when
+                    // an ObjectId was assigned or `_id` is not the leading field (the
+                    // reorder case encode_doc handles).
+                    let id_first = doc.keys().next().map(String::as_str) == Some("_id");
+                    let reencoded;
+                    let blob: &[u8] = if !assigned_id && id_first {
+                        doc_bytes
+                    } else {
+                        reencoded = encode_doc(&doc)?;
+                        &reencoded
+                    };
                     if blob.len() > MAX_BSON_OBJECT_SIZE {
                         errors.push(too_large_write_error(index, blob.len()));
                         if ordered {
@@ -3324,7 +3349,7 @@ impl Storage {
                     }
                     doc_cur.reset()?;
                     doc_cur.set_key_ssu(db, coll, &key);
-                    doc_cur.set_value_u(&blob);
+                    doc_cur.set_value_u(blob);
                     match doc_cur.insert() {
                         Ok(()) => {}
                         Err(e) if e.is_duplicate_key() => {
@@ -7999,6 +8024,57 @@ mod tests {
         assert!(query_implies_partial(&doc! {"s": "x"}, &doc! {"s": "x"}));
         // missing partial-filter field in the query is never implied.
         assert!(!query_implies_partial(&doc! {"b": 1i32}, &doc! {"a": 1i32}));
+    }
+
+    #[test]
+    fn insert_stores_client_bytes_verbatim_when_id_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+
+        // `_id` already leading: the raw-write fast path stores the caller's BSON
+        // verbatim (no encode_doc round-trip), byte-for-byte.
+        let id_first = bson::to_vec(&doc! {"_id": 7i32, "x": 1i32, "s": "hi"}).unwrap();
+        s.insert("db", "c", vec![id_first.clone()], true).unwrap();
+        let stored = s.find_by_id("db", "c", &Bson::Int32(7)).unwrap().unwrap();
+        assert_eq!(stored, id_first, "id-first doc must be stored verbatim");
+
+        // `_id` NOT leading: must be reordered to mongod's canonical `_id`-first
+        // storage form (the encode_doc fallback), so the stored bytes differ from
+        // the caller's and lead with `_id`.
+        let id_last = bson::to_vec(&doc! {"x": 2i32, "_id": 8i32}).unwrap();
+        s.insert("db", "c", vec![id_last.clone()], true).unwrap();
+        let stored = s.find_by_id("db", "c", &Bson::Int32(8)).unwrap().unwrap();
+        assert_ne!(
+            stored, id_last,
+            "id-not-first must be reordered, not stored raw"
+        );
+        assert_eq!(
+            stored,
+            encode_doc(&doc! {"x": 2i32, "_id": 8i32}).unwrap(),
+            "reordered form must match encode_doc"
+        );
+        // First element's key (bytes after the 4-byte length + 1 type byte) is `_id`.
+        assert_eq!(&stored[5..8], b"_id", "stored doc must lead with _id");
+
+        // Missing `_id`: the server assigns an ObjectId and stores it leading.
+        let no_id = bson::to_vec(&doc! {"only": 1i32}).unwrap();
+        s.insert("db", "c", vec![no_id], true).unwrap();
+        let all = s.scan_collection("db", "c").unwrap();
+        let assigned = all
+            .iter()
+            .find(|b| decode_doc(b).unwrap().get("only").is_some())
+            .expect("assigned-id doc present");
+        assert_eq!(
+            &assigned[5..8],
+            b"_id",
+            "assigned-id doc must lead with _id"
+        );
+        assert!(
+            decode_doc(assigned).unwrap().get_object_id("_id").is_ok(),
+            "missing _id must be assigned an ObjectId"
+        );
     }
 
     #[test]

@@ -124,24 +124,141 @@ use crate::util::{
 };
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
+/// Build the `insert` reply from storage's outcome: remap storage's
+/// surviving-subset indices back to their original `documents` positions and
+/// prepend the command-layer pre-check errors. Shared by the decoded and the
+/// raw-BSON write paths.
+fn insert_reply(
+    inserted: usize,
+    errors: Vec<Document>,
+    pre_errors: Vec<Document>,
+    survivor_to_orig: &[usize],
+) -> HandlerResult {
+    let mut reply = doc! { "n": inserted as i32, "ok": 1.0 };
+    if !pre_errors.is_empty() || !errors.is_empty() {
+        let mut write_errors: Vec<Bson> = pre_errors.into_iter().map(Bson::Document).collect();
+        for mut err in errors {
+            if let Some(local) = err.get("index").and_then(as_i64) {
+                let orig = survivor_to_orig
+                    .get(local as usize)
+                    .copied()
+                    .unwrap_or(local as usize);
+                err.insert("index", orig as i32);
+            }
+            write_errors.push(Bson::Document(err));
+        }
+        reply.insert("writeErrors", write_errors);
+    }
+    Ok(reply)
+}
+
+/// The `_id`-may-not-contain-`$`-prefixed-fields pre-check run over raw BSON
+/// (no full decode). Mirrors the decoded path exactly: reports the `_id`
+/// sub-document's first key when *any* key is `$`-prefixed.
+fn raw_id_dollar_key_error(raw: &[u8], index: usize) -> Option<Document> {
+    let rd = bson::RawDocument::from_bytes(raw).ok()?;
+    let Ok(Some(bson::RawBsonRef::Document(idd))) = rd.get("_id") else {
+        return None;
+    };
+    let mut first_key: Option<String> = None;
+    let mut has_dollar = false;
+    for elem in idd.into_iter() {
+        let Ok((k, _)) = elem else { return None };
+        if first_key.is_none() {
+            first_key = Some(k.to_string());
+        }
+        if k.starts_with('$') {
+            has_dollar = true;
+        }
+    }
+    if !has_dollar {
+        return None;
+    }
+    let first = first_key.unwrap_or_default();
+    Some(doc! {
+        "index": index as i32,
+        "code": 2,
+        "errmsg": format!(
+            "_id fields may not contain '$'-prefixed fields: {first} is not valid for storage."
+        ),
+    })
+}
+
+/// Raw-BSON write path: store the client's insert documents verbatim (the byte
+/// slices the server handed in un-decoded) without the merge-decode → re-encode
+/// → storage-decode round-trip. Only the `_id` `$`-key pre-check runs over every
+/// document; a collection `validator` is the one case that forces a per-doc
+/// decode-and-match before the bytes go to storage.
+fn insert_raw_path(
+    db: &str,
+    coll: &str,
+    raw_docs: Vec<Vec<u8>>,
+    ordered: bool,
+    validator: Option<&Document>,
+    storage: &dyn crate::Storage,
+) -> HandlerResult {
+    if raw_docs.is_empty() {
+        return Ok(doc! {
+            "ok": 0.0,
+            "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
+            "code": 4,
+            "codeName": "InvalidLength",
+        });
+    }
+    let mut pre_errors: Vec<Document> = Vec::new();
+    let mut surviving: Vec<Vec<u8>> = Vec::new();
+    let mut survivor_to_orig: Vec<usize> = Vec::new();
+    for (index, raw) in raw_docs.into_iter().enumerate() {
+        if let Some(err) = raw_id_dollar_key_error(&raw, index) {
+            pre_errors.push(err);
+            if ordered {
+                break;
+            }
+            continue;
+        }
+        if let Some(v) = validator {
+            // The one case the raw path must decode: match against the validator.
+            // Wire-validated BSON always decodes; if it somehow doesn't, fall through
+            // and let storage surface the error rather than dropping the doc.
+            if let Ok(d) = Document::from_reader(&mut &raw[..]) {
+                if !secantus_core::query::matches(&d, v, &Document::new(), None).unwrap_or(true) {
+                    pre_errors.push(doc! {
+                        "index": index as i32,
+                        "code": 121,
+                        "errmsg": "Document failed validation",
+                        "errInfo": validation_error_info(v, &d),
+                    });
+                    if ordered {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        surviving.push(raw);
+        survivor_to_orig.push(index);
+    }
+
+    if !pre_errors.is_empty() && ordered {
+        return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
+    }
+    if surviving.is_empty() {
+        return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
+    }
+    let (inserted, errors) = storage
+        .insert(db, coll, surviving, ordered)
+        .map_err(command_error)?;
+    insert_reply(inserted, errors, pre_errors, &survivor_to_orig)
+}
+
 /// `insert` — batch document insert.
 pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "insert")?;
+    // Take the raw-BSON write side-channel first, releasing the `&mut` borrow
+    // before the immutable `storage()` / `db_name` borrows below.
+    let raw_docs = ctx.raw_insert_documents.take();
+    let db = ctx.db_name.clone();
     let storage = ctx.storage()?;
-
-    let documents = match doc.get("documents") {
-        Some(Bson::Array(a)) if !a.is_empty() => a,
-        // mongod rejects an empty/absent `documents` array with InvalidLength
-        // (4) — drivers gate command-error tests on this exact code/codeName.
-        _ => {
-            return Ok(doc! {
-                "ok": 0.0,
-                "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
-                "code": 4,
-                "codeName": "InvalidLength",
-            })
-        }
-    };
     let ordered = bool_field(doc, "ordered", true);
 
     // Document validation: a collection `validator` rejects non-matching inserts
@@ -153,13 +270,33 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         None
     } else {
         let opts = storage
-            .get_collection_options(&ctx.db_name, &coll)
+            .get_collection_options(&db, &coll)
             .map_err(command_error)?;
         let action = opts.get_str("validationAction").unwrap_or("error");
         if action == "warn" || action == "off" {
             None
         } else {
             opts.get("validator").and_then(Bson::as_document).cloned()
+        }
+    };
+
+    // Raw-BSON write fast path: documents arrived as an un-decoded kind-1 sequence.
+    if let Some(raw_docs) = raw_docs {
+        return insert_raw_path(&db, &coll, raw_docs, ordered, validator.as_ref(), storage);
+    }
+
+    // Decoded path: documents inline in the command body.
+    let documents = match doc.get("documents") {
+        Some(Bson::Array(a)) if !a.is_empty() => a,
+        // mongod rejects an empty/absent `documents` array with InvalidLength
+        // (4) — drivers gate command-error tests on this exact code/codeName.
+        _ => {
+            return Ok(doc! {
+                "ok": 0.0,
+                "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
+                "code": 4,
+                "codeName": "InvalidLength",
+            })
         }
     };
 
@@ -230,27 +367,9 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     let (inserted, errors) = storage
-        .insert(&ctx.db_name, &coll, surviving, ordered)
+        .insert(&db, &coll, surviving, ordered)
         .map_err(command_error)?;
-
-    let mut reply = doc! { "n": inserted as i32, "ok": 1.0 };
-    if !pre_errors.is_empty() || !errors.is_empty() {
-        // Remap storage's `index` (into the surviving subset) back to the
-        // original `documents` position, then concatenate after the pre-errors.
-        let mut write_errors: Vec<Bson> = pre_errors.into_iter().map(Bson::Document).collect();
-        for mut err in errors {
-            if let Some(local) = err.get("index").and_then(as_i64) {
-                let orig = survivor_to_orig
-                    .get(local as usize)
-                    .copied()
-                    .unwrap_or(local as usize);
-                err.insert("index", orig as i32);
-            }
-            write_errors.push(Bson::Document(err));
-        }
-        reply.insert("writeErrors", write_errors);
-    }
-    Ok(reply)
+    insert_reply(inserted, errors, pre_errors, &survivor_to_orig)
 }
 
 /// `delete` — batch delete, one entry per `{q, limit}` spec.
