@@ -430,8 +430,48 @@ def test_index_build_under_write_load_stays_consistent(server):
     # The index (if chosen) and a collection scan must agree for every bucket.
     for bucket in range(10):
         want = sum(1 for k in range(total) if k % 10 == bucket)
-        assert coll0.count_documents({"x": bucket}) == want
+        got = coll0.count_documents({"x": bucket})
+        if got != want:
+            raise AssertionError(_index_scan_diff(coll0, bucket, got, want))
     client.close()
+
+
+def _index_scan_diff(coll, bucket: int, got: int, want: int) -> str:
+    """Explain an index/scan disagreement by naming the documents involved.
+
+    This race is rare and has never reproduced locally (it needs real CI
+    contention), so a bare ``assert 39 == 40`` throws away the only evidence
+    the occurrence will ever produce. Diff the index against the collection and
+    report exactly which ``_id``s the index lost (or invented), plus the plan
+    that served the count — enough to tell "the build missed a concurrently
+    inserted doc" apart from "the inserter wrote a wrong/duplicate key".
+
+    Best-effort: any failure to gather detail is appended rather than raised, so
+    the diagnostic can never mask or replace the real assertion.
+    """
+    lines = [f"bucket {bucket}: count_documents({{'x': {bucket}}}) == {got}, expected {want}"]
+    try:
+        via_index = {d["_id"] for d in coll.find({"x": bucket}, hint=[("x", 1)])}
+        via_scan = {d["_id"] for d in coll.find({}) if d.get("x") == bucket}
+        missing = sorted(via_scan - via_index)
+        extra = sorted(via_index - via_scan)
+        lines.append(f"  docs the INDEX is missing : {missing}")
+        lines.append(f"  docs ONLY in the index    : {extra}")
+        lines.append(f"  index={len(via_index)} scan={len(via_scan)}")
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never mask the failure
+        lines.append(f"  (index/scan diff unavailable: {exc!r})")
+    try:
+        plan = coll.database.command(
+            "explain", {"count": coll.name, "query": {"x": bucket}}, verbosity="queryPlanner"
+        )
+        lines.append(f"  winningPlan: {plan.get('queryPlanner', {}).get('winningPlan')}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"  (explain unavailable: {exc!r})")
+    try:
+        lines.append(f"  indexes: {[ix['name'] for ix in coll.list_indexes()]}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"  (list_indexes unavailable: {exc!r})")
+    return "\n".join(lines)
 
 
 def test_parallel_writers_on_distinct_collections(server):
