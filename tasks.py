@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 import re
 import shlex
@@ -384,27 +383,43 @@ def admin(
 @task(
     help={
         "port": "Local HTTP port (0 = pick a free one).",
+        "host": "Bind host (default 127.0.0.1).",
         "no_window": "Run headless (no pywebview window). Useful for CI.",
         "token": "Override the auth token. Default: ~/.secantus/opsboard-token.",
+        "config": "Config file to read/save (default ~/.secantus/opsboard.json).",
+        "save": "Persist the resolved (non-secret) config to the config file, then run.",
     }
 )
 def opsboard(
     c: Context,
     port: int = 0,
+    host: str = "",
     no_window: bool = False,
     token: str = "",
+    config: str = "",
+    save: bool = False,
 ) -> None:
     """Launch the SecantusDB Ops Board web UI.
 
     Drives the build/test/release cycle for all three servers. Uses
     ``--extra opsboard`` so uv pulls in fastapi / uvicorn / pywebview on
     first run; the base wheel deliberately doesn't ship them.
+
+    Settings resolve CLI flag > env var > saved config > default; ``--config``
+    picks the config file and ``--save`` persists the resolved (non-secret)
+    config to it. For the full flag set, call ``secantus-opsboard`` directly.
     """
     cmd = ["uv", "run", "--extra", "opsboard", "secantus-opsboard", "--port", str(port)]
+    if host:
+        cmd.extend(["--host", host])
     if no_window:
         cmd.append("--no-window")
     if token:
         cmd.extend(["--token", token])
+    if config:
+        cmd.extend(["--config", config])
+    if save:
+        cmd.append("--save")
     c.run(" ".join(cmd), pty=True)
 
 
@@ -1652,5 +1667,3 @@ def _wait_for_pypi_version(version: str, *, timeout_s: int = 600) -> None:
         print(f"    PyPI does not list {version} yet (info.version={latest}); waiting")
         time.sleep(20)
     raise SystemExit(f"timed out after {timeout_s}s waiting for PyPI to list {version}")
-
-
