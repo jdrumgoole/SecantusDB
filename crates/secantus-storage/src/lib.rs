@@ -8,11 +8,15 @@
 //! byte-sortable `id_key` encoding). It mirrors the behaviour of the relevant
 //! slice of `src/secantus/storage.py`:
 //!
-//! * documents live at `(db, coll, id_key) -> bson(doc)` where `id_key =
-//!   sortkey.encode_value(_id)` — so iterating the table yields MongoDB's
-//!   cross-type natural order;
-//! * inserts use a non-overwriting cursor so a duplicate `_id` surfaces as a
-//!   duplicate-key error;
+//! * documents live at `(db, coll, RecordId) -> [id_key_len][id_key][bson(doc)]`
+//!   where the RecordId is a monotonic per-insertion counter — so iterating the
+//!   table yields insertion (natural / RecordId) order, and the `id_key`
+//!   (`sortkey.encode_value(_id)`, needed to maintain the `_id` + secondary
+//!   indexes and NOT reconstructable for suffixed timeseries keys) rides in-band
+//!   in the value (see `frame_doc_value`). The `_id` index (`secantus_natural_seq`:
+//!   `(db, coll, id_key) -> RecordId`) resolves an `_id` to its RecordId;
+//! * inserts write the `_id` index with a non-overwriting cursor so a duplicate
+//!   `_id` surfaces as a duplicate-key error;
 //! * a global lock serialises public methods (1:1 with `storage.py`'s `RLock`).
 //!
 //! Later sub-phases add indexes, geo, and the oplog (see
@@ -145,6 +149,42 @@ fn doc_table_for(db: &str, coll: &str) -> String {
     doc_shard_name(doc_shard_hash(db, coll) % DOC_SHARDS)
 }
 
+/// A scanned document row: `(RecordId, id_key, blob)`. The RecordId is the
+/// doc-table key; the id_key and blob are unframed from the value (see
+/// [`frame_doc_value`]).
+type ScannedDoc = (i64, Vec<u8>, Vec<u8>);
+
+/// Frame a doc-table value as `[u32-LE id_key_len][id_key bytes][blob bytes]`.
+/// The doc table is keyed by RecordId, so the `id_key` (needed to drop the doc's
+/// `_id`-index + secondary-index entries on delete, and NOT reconstructable from
+/// `_id` for timeseries docs, whose key carries a non-derivable suffix) is stored
+/// in-band alongside the blob. The value stays a single opaque `u` column — no WT
+/// schema change; the framing lives entirely in our encode/decode.
+fn frame_doc_value(id_key: &[u8], blob: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + id_key.len() + blob.len());
+    v.extend_from_slice(&(id_key.len() as u32).to_le_bytes());
+    v.extend_from_slice(id_key);
+    v.extend_from_slice(blob);
+    v
+}
+
+/// Split a framed doc-table value (see [`frame_doc_value`]) into `(id_key, blob)`.
+fn unframe_doc_value(value: &[u8]) -> Result<(&[u8], &[u8])> {
+    if value.len() < 4 {
+        return Err(StorageError::Internal(
+            "doc-table value shorter than 4-byte frame header".into(),
+        ));
+    }
+    let len = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+    let rest = &value[4..];
+    if rest.len() < len {
+        return Err(StorageError::Internal(
+            "doc-table value id_key length exceeds frame".into(),
+        ));
+    }
+    Ok((&rest[..len], &rest[len..]))
+}
+
 /// One-time migration: move every row in the legacy single `secantus_documents`
 /// table to its per-collection shard (a store written before doc-sharding). A
 /// born-sharded store's legacy table is empty, so this is a quick no-op scan on
@@ -162,11 +202,22 @@ fn migrate_legacy_docs(session: &Session) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    for (db, coll, id_key, blob) in &rows {
+    // The legacy single table predates both sharding AND RecordId keying: its rows
+    // are `(db, coll, id_key) -> raw blob`. Re-key each into its shard by a fresh
+    // RecordId (framed value carries the id_key), and write the `_id` index row
+    // (id_key -> RecordId). A global counter keeps RecordIds unique per collection;
+    // `scan_max_nat_seq` (run just after, in `load_oplog_meta`) recovers the
+    // counter from the shards so freshly minted seqs stay strictly greater.
+    let idx = session.open_cursor(NAT_SEQ_TABLE, None)?;
+    for (recordid, (db, coll, id_key, blob)) in (1i64..).zip(&rows) {
         let dst = session.open_cursor(&doc_table_for(db, coll), None)?;
-        dst.set_key_ssu(db, coll, id_key);
-        dst.set_value_u(blob);
+        dst.set_key_ssq(db, coll, recordid);
+        dst.set_value_u(&frame_doc_value(id_key, blob));
         dst.insert()?;
+        idx.reset()?;
+        idx.set_key_ssu(db, coll, id_key);
+        idx.set_value_q(recordid);
+        idx.insert()?;
     }
     let del = session.open_cursor(DOC_TABLE, None)?;
     for (db, coll, id_key, _) in &rows {
@@ -176,6 +227,54 @@ fn migrate_legacy_docs(session: &Session) -> Result<()> {
             Ok(()) => {}
             Err(e) if e.is_not_found() => {}
             Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Parse the `key_format=<fmt>` value out of a WiredTiger config / `metadata:`
+/// string (`fmt` is a simple token — `SSq`, `SSu`, … — so it stops at the next
+/// comma). Returns `None` if the string has no `key_format` clause.
+fn extract_key_format(cfg: &str) -> Option<&str> {
+    let start = cfg.find("key_format=")? + "key_format=".len();
+    let rest = &cfg[start..];
+    let end = rest.find(',').unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+/// Refuse to open a store whose document shards were written by a build BEFORE
+/// the RecordId doc-table change (see `tasks/backlog.md` §7.8). Those tables are
+/// keyed `SSu` (`(db, coll, id_key)`) with unframed blob values; this build keys
+/// them `SSq` (`(db, coll, RecordId)`) with framed values (see [`frame_doc_value`]).
+/// WiredTiger fixes a table's `key_format` at CREATE time and preserves it across
+/// reopen — the bootstrap `create` is a no-op for an existing table, which is
+/// exactly what lets [`migrate_legacy_docs`] read the legacy table as `SSu` — so
+/// the on-disk schema read here from the `metadata:` cursor is the ground truth.
+///
+/// There is deliberately **no in-place migration**: the two Rust servers are
+/// pre-1.0 beta with no upgrading users, so the correct response to an
+/// incompatible on-disk format is to refuse to open rather than silently mis-read
+/// stored data with `SSq` cursor ops against an `SSu` btree. (A pre-*shard* store
+/// is the separate, supported case — its legacy single `secantus_documents` table
+/// is folded in by [`migrate_legacy_docs`] — so only the sharded doc tables are
+/// inspected here.)
+fn reject_pre_recordid_doc_format(session: &Session) -> Result<()> {
+    let meta = session.open_cursor("metadata:", None)?;
+    for s in 0..DOC_SHARDS {
+        let name = doc_shard_name(s);
+        meta.reset()?;
+        meta.set_key_s(&name);
+        if meta.search().is_ok() {
+            let cfg = meta.get_value_s()?;
+            if extract_key_format(&cfg) == Some("SSu") {
+                return Err(StorageError::Internal(format!(
+                    "SecantusDB storage at this path was written by a build before \
+                     the RecordId doc-table change: '{name}' is keyed 'SSu' but this \
+                     build requires 'SSq'. There is no in-place upgrade (pre-1.0 \
+                     beta, no migration) — start from a fresh data directory or \
+                     downgrade to the build that wrote it."
+                )));
+            }
         }
     }
     Ok(())
@@ -679,10 +778,15 @@ pub fn wt_config(
 // libz), so the compressor clause is omitted there — a `block_compressor=zlib`
 // table create would fail with "unknown compressor". Set at create time; existing
 // uncompressed tables keep their format (WT stores it in metadata).
+// RecordId keying: the doc table is keyed by (db, coll, RecordId:i64) — the
+// monotonic per-collection insertion seq — not by id_key. This puts the table in
+// insertion order (so the `secantus_natural` forward table is dropped) and cuts
+// write amplification 4->3. `secantus_natural_seq` (id_key -> RecordId) is the
+// `_id` index. See tasks/rust-recordid-plan.md.
 #[cfg(not(target_os = "windows"))]
-const DOC_TABLE_CFG: &str = "key_format=SSu,value_format=u,block_compressor=zlib";
+const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u,block_compressor=zlib";
 #[cfg(target_os = "windows")]
-const DOC_TABLE_CFG: &str = "key_format=SSu,value_format=u";
+const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u";
 #[cfg(not(target_os = "windows"))]
 const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=zlib";
 #[cfg(target_os = "windows")]
@@ -1829,22 +1933,25 @@ fn peek_entry_ts(blob: &[u8]) -> Option<bson::Timestamp> {
     }
 }
 
-/// Largest insertion `seq` present in `NAT_TABLE` (0 if empty) — used to recover
-/// the natural-order counter on open when the persisted `next_nat_seq` is absent,
-/// so minted seqs stay strictly greater than any existing one. Mirrors
-/// `storage._scan_max_nat_seq`.
+/// Largest RecordId present across the document shard tables (0 if empty) — used
+/// to recover the natural-order counter on open, so minted RecordIds stay strictly
+/// greater than any existing doc-table key. The RecordId is now the doc-table key
+/// itself (`(db, coll, RecordId)`); the forward `NAT_TABLE` this used to scan is
+/// gone. Mirrors `storage._scan_max_nat_seq`.
 fn scan_max_nat_seq(session: &Session) -> i64 {
-    let Ok(c) = session.open_cursor(NAT_TABLE, None) else {
-        return 0;
-    };
-    // The table is keyed (db, coll, seq); the last row has the highest seq within
-    // the last (db, coll), but seqs are global-monotonic so any row's seq could be
-    // the max across collections — scan and take the max.
+    // Doc-table keys are (db, coll, RecordId); RecordIds are global-monotonic so
+    // any row's RecordId could be the max across collections/shards — scan every
+    // shard and take the max.
     let mut max_seq = 0i64;
-    while c.next().unwrap_or(false) {
-        if let Ok((_db, _coll, seq)) = c.get_key_ssq() {
-            if seq > max_seq {
-                max_seq = seq;
+    for s in 0..DOC_SHARDS {
+        let Ok(c) = session.open_cursor(&doc_shard_name(s), None) else {
+            continue;
+        };
+        while c.next().unwrap_or(false) {
+            if let Ok((_db, _coll, seq)) = c.get_key_ssq() {
+                if seq > max_seq {
+                    max_seq = seq;
+                }
             }
         }
     }
@@ -2062,6 +2169,13 @@ impl Storage {
             for s in 0..DOC_SHARDS {
                 boot.create(&doc_shard_name(s), DOC_TABLE_CFG)?;
             }
+            // Fail fast on a store whose doc shards predate the RecordId keying
+            // change (`SSu` on disk vs the `SSq` this build needs): no in-place
+            // upgrade, refuse to open rather than mis-read. WT `create` above
+            // preserves an existing table's key_format, so the on-disk schema is
+            // intact for this check. (Runs before `migrate_legacy_docs` — that
+            // path is the pre-*shard* case, which this check does not touch.)
+            reject_pre_recordid_doc_format(&boot)?;
             // One-time: fold a pre-shard store's legacy documents rows into the
             // per-collection shards (no-op for a born-sharded store).
             migrate_legacy_docs(&boot)?;
@@ -3233,20 +3347,19 @@ impl Storage {
                 if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
                     return Err(StorageError::DuplicateKey(Box::new(c)));
                 }
-                // overwrite=false -> a pre-existing _id is a WT_DUPLICATE_KEY.
-                let cur = session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
-                cur.set_key_ssu(db, coll, &key);
-                cur.set_value_u(blob);
-                match cur.insert() {
-                    Ok(()) => {}
-                    Err(e) if e.is_duplicate_key() => return Err(StorageError::DuplicateId),
-                    Err(e) => return Err(e.into()),
-                }
-                // Maintain secondary indexes: write this doc's entries, and lazily flag
-                // any index this doc makes multikey (array value on an indexed field).
+                // Mint the RecordId + write the `_id` index (id_key -> RecordId);
+                // this overwrite=false insert is where a duplicate `_id` is caught.
+                let recordid = self.write_nat_entry(&session, db, coll, &key)?;
+                // Doc table keyed by the (unique) RecordId.
+                let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                cur.set_key_ssq(db, coll, recordid);
+                cur.set_value_u(&frame_doc_value(&key, blob));
+                cur.insert()?;
+                // Maintain secondary indexes: write this doc's entries (still carrying
+                // id_key as the fetch pointer in step 1; IXSCAN resolves id_key ->
+                // RecordId -> doc), and lazily flag any index this doc makes multikey.
                 self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
                 self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
-                self.write_nat_entry(&session, db, coll, &key)?;
                 // Oplog: an insert is op "i". No pre-image (there's no prior document).
                 if self.enable_oplog {
                     let ui = collection_uuid(&session, db, coll)?;
@@ -3352,12 +3465,13 @@ impl Storage {
                         }
                         continue;
                     }
-                    doc_cur.reset()?;
-                    doc_cur.set_key_ssu(db, coll, &key);
-                    doc_cur.set_value_u(blob);
-                    match doc_cur.insert() {
-                        Ok(()) => {}
-                        Err(e) if e.is_duplicate_key() => {
+                    // Mint the RecordId + write the `_id` index (id_key -> RecordId);
+                    // a duplicate `_id` is caught here now (not by the doc-table
+                    // insert, which is keyed by the unique RecordId). WT_DUPLICATE_KEY
+                    // does not abort the transaction, so unordered inserts continue.
+                    let recordid = match self.write_nat_entry(&session, db, coll, &key) {
+                        Ok(r) => r,
+                        Err(StorageError::DuplicateId) => {
                             let ns = format!("{db}.{coll}");
                             let mut key_value = Document::new();
                             key_value.insert("_id", id.clone());
@@ -3378,11 +3492,15 @@ impl Storage {
                             }
                             continue;
                         }
-                        Err(e) => return Err(e.into()),
-                    }
+                        Err(e) => return Err(e),
+                    };
+                    // Doc table keyed by the (unique) RecordId.
+                    doc_cur.reset()?;
+                    doc_cur.set_key_ssq(db, coll, recordid);
+                    doc_cur.set_value_u(&frame_doc_value(&key, blob));
+                    doc_cur.insert()?;
                     self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
-                    self.write_nat_entry(&session, db, coll, &key)?;
                     fresh_id_keys.insert(key.clone());
                     inserted += 1;
                     if oplog_on {
@@ -3429,44 +3547,33 @@ impl Storage {
         // Lock-free read (see the `lock` field's invariants).
         let key = id_key(id)?;
         let session = self.op_session()?;
+        // Resolve `_id` -> RecordId via the `_id` index, then fetch the doc row.
+        let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
+            return Ok(None);
+        };
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        cur.set_key_ssu(db, coll, &key);
+        cur.set_key_ssq(db, coll, recordid);
         match cur.search() {
-            Ok(()) => Ok(Some(cur.get_value_u()?)),
+            Ok(()) => {
+                let value = cur.get_value_u()?;
+                let (_idk, blob) = unframe_doc_value(&value)?;
+                Ok(Some(blob.to_vec()))
+            }
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// All documents of a collection in natural (`_id`) order, as BSON bytes.
+    /// All documents of a collection in natural (insertion / RecordId) order, as
+    /// BSON bytes.
     pub fn scan_collection(&self, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.op_session()?;
-        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        let mut out = Vec::new();
-        // Position at the first key >= (db, coll, "") then walk while the
-        // (db, coll) prefix matches.
-        cur.set_key_ssu(db, coll, b"");
-        let mut more = match cur.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    cur.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false, // empty table
-            Err(e) => return Err(e.into()),
-        };
-        while more {
-            let (d, c, _id) = cur.get_key_ssu()?;
-            if d != db || c != coll {
-                break;
-            }
-            out.push(cur.get_value_u()?);
-            more = cur.next()?;
-        }
-        Ok(out)
+        Ok(self
+            .scan_docs(&session, db, coll)?
+            .into_iter()
+            .map(|(_rid, _idk, blob)| blob)
+            .collect())
     }
 
     /// Replace the document at `id` with `new_doc_bytes` (whose `_id` is forced to
@@ -3485,11 +3592,19 @@ impl Storage {
             let key = id_key(id)?;
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                // Existence check — capture the old doc so we can retract its entries.
+                // Existence check — resolve the doc's RecordId via the `_id` index,
+                // then read its row so we can retract its entries.
+                let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
+                    return Ok(false);
+                };
                 let probe = session.open_cursor(&doc_table_for(db, coll), None)?;
-                probe.set_key_ssu(db, coll, &key);
+                probe.set_key_ssq(db, coll, recordid);
                 let old_blob = match probe.search() {
-                    Ok(()) => probe.get_value_u()?,
+                    Ok(()) => {
+                        let value = probe.get_value_u()?;
+                        let (_idk, blob) = unframe_doc_value(&value)?;
+                        blob.to_vec()
+                    }
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
@@ -3509,8 +3624,8 @@ impl Storage {
                 }
 
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                cur.set_key_ssu(db, coll, &key);
-                cur.set_value_u(&blob);
+                cur.set_key_ssq(db, coll, recordid);
+                cur.set_value_u(&frame_doc_value(&key, &blob));
                 cur.update()?;
 
                 // Maintain secondary indexes as a set diff (additions first, removals
@@ -3561,11 +3676,20 @@ impl Storage {
             let key = id_key(id)?;
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
+                // Resolve `_id` -> RecordId (read-only; the `_id`-index row is removed
+                // last, by delete_nat_entry, to keep "doc row first, entries after").
+                let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
+                    return Ok(false);
+                };
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                cur.set_key_ssu(db, coll, &key);
+                cur.set_key_ssq(db, coll, recordid);
                 // Read the doc first so we can retract its index entries, then remove.
                 let old_blob = match cur.search() {
-                    Ok(()) => cur.get_value_u()?,
+                    Ok(()) => {
+                        let value = cur.get_value_u()?;
+                        let (_idk, blob) = unframe_doc_value(&value)?;
+                        blob.to_vec()
+                    }
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
@@ -3639,7 +3763,7 @@ impl Storage {
                 let candidates = self.scan_docs(&session, db, coll)?;
                 let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 let mut pruned = 0usize;
-                for (id_k, blob) in candidates {
+                for (recordid, id_k, blob) in candidates {
                     let doc = decode_doc(&blob)?;
                     let expired = ttl.iter().any(|(field, secs)| match get_path(&doc, field) {
                         Some(Bson::DateTime(v)) => {
@@ -3655,7 +3779,7 @@ impl Storage {
                     // entries first would make an index-routed read miss a still-live
                     // doc.
                     doc_cur.reset()?;
-                    doc_cur.set_key_ssu(db, coll, &id_k);
+                    doc_cur.set_key_ssq(db, coll, recordid);
                     match doc_cur.remove() {
                         Ok(()) => {}
                         Err(e) if e.is_not_found() => {}
@@ -3992,11 +4116,15 @@ impl Storage {
         self.purge_collection_tables(&session, src_db, src_coll)?;
         // Sharded: dst rows go to the dst collection's shard (may differ from the
         // src shard — the src rows were already read into `docs` and purged above).
+        // Re-mint a fresh RecordId per doc in src natural order (preserving
+        // insertion order) and write the dst `_id` index (id_key -> RecordId); the
+        // doc-table value carries the id_key in-band (framed).
         let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
-        for (id_k, blob) in &docs {
+        for (_src_rid, id_k, blob) in &docs {
+            let recordid = self.write_nat_entry(&session, dst_db, dst_coll, id_k)?;
             dcur.reset()?;
-            dcur.set_key_ssu(dst_db, dst_coll, id_k);
-            dcur.set_value_u(blob);
+            dcur.set_key_ssq(dst_db, dst_coll, recordid);
+            dcur.set_value_u(&frame_doc_value(id_k, blob));
             dcur.insert()?;
         }
         let icur = session.open_cursor(IDX_TABLE, None)?;
@@ -4095,7 +4223,7 @@ impl Storage {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let mut total = 0i64;
-        for (_id_k, blob) in self.scan_docs(&session, db, coll)? {
+        for (_rid, _id_k, blob) in self.scan_docs(&session, db, coll)? {
             total += blob.len() as i64;
         }
         Ok(total)
@@ -4109,7 +4237,7 @@ impl Storage {
         let session = self.conn.open_session()?;
         let mut out = Document::new();
         let mut id_size = 0i64;
-        for (id_k, _blob) in self.scan_docs(&session, db, coll)? {
+        for (_rid, id_k, _blob) in self.scan_docs(&session, db, coll)? {
             id_size += id_k.len() as i64;
         }
         if id_size > 0 {
@@ -4135,13 +4263,13 @@ impl Storage {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
-        let rows = self.scan_docs(&session, db, coll)?;
+        let rows = self
+            .scan_docs(&session, db, coll)?
+            .into_iter()
+            .map(|(_rid, id_k, blob)| (id_k, blob));
         Ok(match after {
-            None => rows,
-            Some(a) => rows
-                .into_iter()
-                .filter(|(id_k, _)| id_k.as_slice() > a)
-                .collect(),
+            None => rows.collect(),
+            Some(a) => rows.filter(|(id_k, _)| id_k.as_slice() > a).collect(),
         })
     }
 
@@ -4153,7 +4281,7 @@ impl Storage {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let rows = self.scan_docs(&session, db, coll)?;
-        Ok(rows.into_iter().map(|(k, _)| k).min())
+        Ok(rows.into_iter().map(|(_rid, k, _)| k).min())
     }
 
     // --- users / roles / profiling (auth + profiling surface) ---
@@ -4478,7 +4606,7 @@ impl Storage {
             // multikey so the regular (numeric) pickers skip it.
             stored_options.insert("multikey", Bson::Boolean(true));
             let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            for (id_k, blob) in self.scan_docs(&session, db, coll)? {
+            for (_rid, id_k, blob) in self.scan_docs(&session, db, coll)? {
                 let d = decode_doc(&blob)?;
                 if let Some(kb) = get_path(&d, &geo.field).and_then(|v| geo.cell_kb(v)) {
                     out.push((kb, id_k));
@@ -4490,7 +4618,7 @@ impl Storage {
             // doc. Flagged multikey (one doc → many cell entries).
             stored_options.insert("multikey", Bson::Boolean(true));
             let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            for (id_k, blob) in self.scan_docs(&session, db, coll)? {
+            for (_rid, id_k, blob) in self.scan_docs(&session, db, coll)? {
                 let d = decode_doc(&blob)?;
                 if let Some(v) = get_path(&d, &gs.field) {
                     for kb in gs.cell_kbs(v) {
@@ -4513,7 +4641,7 @@ impl Storage {
             let mut multikey = false;
             let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
-            for (id_k, blob) in self.scan_docs(&session, db, coll)? {
+            for (_rid, id_k, blob) in self.scan_docs(&session, db, coll)? {
                 let d = decode_doc(&blob)?;
                 if let Some(pf) = &partial {
                     if !query_matches(&d, pf, &Document::new(), None)
@@ -4740,7 +4868,7 @@ impl Storage {
         let mut index_of: std::collections::HashMap<Vec<u8>, usize> =
             std::collections::HashMap::new();
         let mut groups: Vec<Vec<Bson>> = Vec::new();
-        for (_id_k, blob) in self.scan_docs(&session, db, coll)? {
+        for (_rid, _id_k, blob) in self.scan_docs(&session, db, coll)? {
             let doc = decode_doc(&blob)?;
             let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             // Grouped over every key the doc contributes (sparse: none),
@@ -4898,16 +5026,15 @@ impl Storage {
         Ok(out)
     }
 
-    /// `(id_key, doc_bytes)` for every document in `(db, coll)`, natural order.
-    fn scan_docs(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    /// `(RecordId, id_key, doc_bytes)` for every document in `(db, coll)`, in
+    /// natural (insertion) order. The doc table is keyed by the monotonic RecordId
+    /// so a forward walk IS insertion order; the `id_key` and blob come from
+    /// unframing each value (see `frame_doc_value`) — no `_id` decode needed, and
+    /// it recovers a timeseries doc's non-derivable suffixed id_key too.
+    fn scan_docs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<ScannedDoc>> {
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         let mut out = Vec::new();
-        cur.set_key_ssu(db, coll, b"");
+        cur.set_key_ssq(db, coll, i64::MIN);
         let mut more = match cur.search_near() {
             Ok(cmp) => {
                 if cmp < 0 {
@@ -4920,11 +5047,13 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         while more {
-            let (d, c, idk) = cur.get_key_ssu()?;
+            let (d, c, recordid) = cur.get_key_ssq()?;
             if d != db || c != coll {
                 break;
             }
-            out.push((idk, cur.get_value_u()?));
+            let value = cur.get_value_u()?;
+            let (idk, blob) = unframe_doc_value(&value)?;
+            out.push((recordid, idk.to_vec(), blob.to_vec()));
             more = cur.next()?;
         }
         Ok(out)
@@ -4942,23 +5071,48 @@ impl Storage {
 
     /// Record a doc's insertion position: `seq -> id_key` plus the reverse
     /// `id_key -> seq`. Mirrors `storage._write_nat_entry`.
+    /// Assign the doc a RecordId (monotonic insertion seq) and write the `_id`
+    /// index row (`id_key -> RecordId`). Returns the RecordId — the caller keys
+    /// the doc table by it. The forward `NAT_TABLE` (seq -> id_key) is gone: the
+    /// doc table is itself in RecordId (= insertion) order.
     fn write_nat_entry(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
         id_key: &[u8],
-    ) -> Result<()> {
-        let seq = self.mint_nat_seq();
-        let nat = session.open_cursor(NAT_TABLE, None)?;
-        nat.set_key_ssq(db, coll, seq);
-        nat.set_value_u(id_key);
-        nat.insert()?;
+    ) -> Result<i64> {
+        let recordid = self.mint_nat_seq();
+        // overwrite=false: the `_id` index is where a duplicate `_id` is now caught
+        // (the doc table is keyed by the unique RecordId, so it can't reject dups).
+        // A wasted RecordId on the dup path is harmless — RecordIds only need to be
+        // unique + monotonic; gaps are fine.
+        let rev = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+        rev.set_key_ssu(db, coll, id_key);
+        rev.set_value_q(recordid);
+        match rev.insert() {
+            Ok(()) => Ok(recordid),
+            Err(e) if e.is_duplicate_key() => Err(StorageError::DuplicateId),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The `_id` index lookup: resolve a doc's `id_key` to its RecordId (the
+    /// doc-table key). `None` if the doc doesn't exist.
+    fn doc_recordid(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        id_key: &[u8],
+    ) -> Result<Option<i64>> {
         let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
         rev.set_key_ssu(db, coll, id_key);
-        rev.set_value_q(seq);
-        rev.insert()?;
-        Ok(())
+        match rev.search() {
+            Ok(()) => Ok(Some(rev.get_value_q()?)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Drop a doc's insertion-order entry (both directions). No-op if absent
@@ -4969,23 +5123,19 @@ impl Storage {
         db: &str,
         coll: &str,
         id_key: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<i64>> {
+        // Remove the `_id` index row and return the RecordId it mapped to, so the
+        // caller can delete the doc-table row keyed by it. (No forward NAT_TABLE
+        // row to remove — the doc table itself is in RecordId order.)
         let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
         rev.set_key_ssu(db, coll, id_key);
-        let seq = match rev.search() {
+        let recordid = match rev.search() {
             Ok(()) => rev.get_value_q()?,
-            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         rev.remove()?;
-        let nat = session.open_cursor(NAT_TABLE, None)?;
-        nat.set_key_ssq(db, coll, seq);
-        match nat.search() {
-            Ok(()) => nat.remove()?,
-            Err(e) if e.is_not_found() => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok(())
+        Ok(Some(recordid))
     }
 
     /// Drop every natural-order entry for `(db, coll)` (both directions) — called
@@ -5052,91 +5202,16 @@ impl Storage {
         Ok(())
     }
 
-    /// All doc blobs of a collection in **insertion order** via `NAT_TABLE` (seq
-    /// ascending, each fetched by `id_key`). Falls back to `id_key`-order
-    /// `scan_blobs` when the collection has no natural entries (legacy data).
-    /// Mirrors `storage._scan_docs_natural`.
+    /// All doc blobs of a collection in **insertion order**. The doc table is now
+    /// keyed by the monotonic RecordId, so a plain doc-table walk (`scan_docs`) IS
+    /// insertion order — no separate `NAT_TABLE` indirection. Mirrors
+    /// `storage._scan_docs_natural`.
     fn scan_blobs_natural(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
-        let nat = session.open_cursor(NAT_TABLE, None)?;
-        nat.set_key_ssq(db, coll, i64::MIN);
-        let mut more = match nat.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    nat.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        let doc = session.open_cursor(&doc_table_for(db, coll), None)?;
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut saw_any = false;
-        while more {
-            let (d, c, _seq) = nat.get_key_ssq()?;
-            if d != db || c != coll {
-                break;
-            }
-            let id_key = nat.get_value_u()?;
-            doc.set_key_ssu(db, coll, &id_key);
-            if doc.search().is_ok() {
-                saw_any = true;
-                out.push(doc.get_value_u()?);
-            }
-            more = nat.next()?;
-        }
-        if !saw_any {
-            // Collection has docs but no natural entries (legacy) — fall back.
-            return self.scan_blobs(session, db, coll);
-        }
-        Ok(out)
-    }
-
-    /// Like [`scan_docs`] but in natural (insertion `seq`) order, returning
-    /// `(id_key, blob)` pairs. Capped eviction uses this so FIFO holds even for
-    /// non-monotonic custom `_id`s (doc-table `id_key` order only equals insertion
-    /// order for monotonic `_id`s). Falls back to `scan_docs` (id_key order) for a
-    /// legacy collection with no natural-order entries.
-    fn scan_docs_natural(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let nat = session.open_cursor(NAT_TABLE, None)?;
-        nat.set_key_ssq(db, coll, i64::MIN);
-        let mut more = match nat.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    nat.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        let doc = session.open_cursor(&doc_table_for(db, coll), None)?;
-        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut saw_any = false;
-        while more {
-            let (d, c, _seq) = nat.get_key_ssq()?;
-            if d != db || c != coll {
-                break;
-            }
-            let id_key = nat.get_value_u()?;
-            doc.set_key_ssu(db, coll, &id_key);
-            if doc.search().is_ok() {
-                saw_any = true;
-                out.push((id_key, doc.get_value_u()?));
-            }
-            more = nat.next()?;
-        }
-        if !saw_any {
-            return self.scan_docs(session, db, coll);
-        }
-        Ok(out)
+        Ok(self
+            .scan_docs(session, db, coll)?
+            .into_iter()
+            .map(|(_rid, _idk, blob)| blob)
+            .collect())
     }
 
     /// Evict oldest non-fresh docs from a capped collection until within its
@@ -5176,12 +5251,14 @@ impl Storage {
         if size_limit.is_none() && max_limit.is_none() {
             return Ok(());
         }
-        let scanned = self.scan_docs_natural(session, db, coll)?;
-        let mut total: i64 = scanned.iter().map(|(_, b)| b.len() as i64).sum();
+        // `scan_docs` walks the doc table in RecordId (= insertion) order, so FIFO
+        // eviction holds even for non-monotonic custom `_id`s.
+        let scanned = self.scan_docs(session, db, coll)?;
+        let mut total: i64 = scanned.iter().map(|(_, _, b)| b.len() as i64).sum();
         let mut count = scanned.len() as i64;
         let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
         let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        for (id_k, blob) in scanned {
+        for (recordid, id_k, blob) in scanned {
             let over_size = size_limit.is_some_and(|s| total > s);
             let over_max = max_limit.is_some_and(|m| count > m);
             if !over_size && !over_max {
@@ -5197,7 +5274,7 @@ impl Storage {
             // Doc row first, entries after — see prune_ttl for the lock-free
             // reader ordering rationale.
             doc_cur.reset()?;
-            doc_cur.set_key_ssu(db, coll, &id_k);
+            doc_cur.set_key_ssq(db, coll, recordid);
             match doc_cur.remove() {
                 Ok(()) => {}
                 Err(e) if e.is_not_found() => {}
@@ -5632,9 +5709,9 @@ impl Storage {
     /// `drop_collection` / `drop_database` / `rename_collection`.
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
         let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        for (id_k, _blob) in self.scan_docs(session, db, coll)? {
+        for (recordid, _id_k, _blob) in self.scan_docs(session, db, coll)? {
             doc_cur.reset()?;
-            doc_cur.set_key_ssu(db, coll, &id_k);
+            doc_cur.set_key_ssq(db, coll, recordid);
             match doc_cur.remove() {
                 Ok(()) => {}
                 Err(e) if e.is_not_found() => {}
@@ -5907,13 +5984,15 @@ impl Storage {
         coll: &str,
         filter: &Document,
         force_scan: bool,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Vec<ScannedDoc>> {
         // `force_scan` (a collation is active) bypasses the collation-naive
         // indexes for a full collection scan + in-memory collation matching.
         if filter.is_empty() || force_scan {
             return self.scan_docs(session, db, coll);
         }
         if let Some(id_keys) = self.try_index_id_keys(session, db, coll, filter)? {
+            // Index entries still carry the `id_key` fetch pointer (step 1); resolve
+            // it to the RecordId via the `_id` index, then read the doc row.
             let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
             let mut out = Vec::new();
@@ -5921,10 +6000,17 @@ impl Storage {
                 if !seen.insert(id_k.clone()) {
                     continue;
                 }
+                let Some(recordid) = self.doc_recordid(session, db, coll, &id_k)? else {
+                    continue;
+                };
                 cur.reset()?;
-                cur.set_key_ssu(db, coll, &id_k);
+                cur.set_key_ssq(db, coll, recordid);
                 match cur.search() {
-                    Ok(()) => out.push((id_k, cur.get_value_u()?)),
+                    Ok(()) => {
+                        let value = cur.get_value_u()?;
+                        let (_idk, blob) = unframe_doc_value(&value)?;
+                        out.push((recordid, id_k, blob.to_vec()));
+                    }
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
                 }
@@ -5957,7 +6043,9 @@ impl Storage {
         }
         let vars = Document::new();
         let mut n = 0usize;
-        for (_id_k, blob) in self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())? {
+        for (_rid, _id_k, blob) in
+            self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
+        {
             // Match over raw BSON — count never returns the documents, so a
             // selective filter over wide documents decodes only the filter's
             // fields, nothing else (matches `find_matching_with`).
@@ -6131,7 +6219,7 @@ impl Storage {
 
                 let candidates =
                     self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?;
-                for (id_k, blob) in candidates {
+                for (recordid, id_k, blob) in candidates {
                     // Match over raw BSON first (decodes only the filter's fields);
                     // a rejected candidate skips the full document decode. A
                     // matched candidate is then decoded for the update transform.
@@ -6179,9 +6267,11 @@ impl Storage {
                         let (additions, removals) =
                             self.index_entry_diff(&doc, &new, &descs, Some(&id_k))?;
                         self.insert_index_entries(&session, db, coll, &additions)?;
+                        // The doc stays at its RecordId (unchanged — `_id` is immutable);
+                        // the framed value carries the id_key in-band.
                         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                        cur.set_key_ssu(db, coll, &id_k);
-                        cur.set_value_u(&new_blob);
+                        cur.set_key_ssq(db, coll, recordid);
+                        cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
                         cur.update()?;
                         self.remove_index_entries(&session, db, coll, &removals)?;
                         self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
@@ -6259,13 +6349,15 @@ impl Storage {
                     if new_blob.len() > MAX_BSON_OBJECT_SIZE {
                         return Err(StorageError::DocumentTooLarge(new_blob.len()));
                     }
+                    // Mint the RecordId + write the `_id` index first, then key the
+                    // doc row by that RecordId (framed value carries the id_key).
+                    let recordid = self.write_nat_entry(&session, db, coll, &new_id_key)?;
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                    cur.set_key_ssu(db, coll, &new_id_key);
-                    cur.set_value_u(&new_blob);
+                    cur.set_key_ssq(db, coll, recordid);
+                    cur.set_value_u(&frame_doc_value(&new_id_key, &new_blob));
                     cur.insert()?;
                     self.write_index_entries(&session, db, coll, &new, &descs, Some(&new_id_key))?;
                     self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
-                    self.write_nat_entry(&session, db, coll, &new_id_key)?;
                     post_image = Some(new.clone());
                     if oplog_on {
                         let mut o2 = Document::new();
@@ -6334,7 +6426,7 @@ impl Storage {
                 let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
                 let candidates =
                     self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?;
-                for (id_k, blob) in candidates {
+                for (recordid, id_k, blob) in candidates {
                     // Match over raw BSON first (decodes only the filter's fields);
                     // a rejected candidate skips the full decode. A matched
                     // candidate is decoded for the delete's oplog `o2` / pre-image.
@@ -6349,7 +6441,7 @@ impl Storage {
                     // Doc row first, entries after — see prune_ttl for the lock-free
                     // reader ordering rationale.
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                    cur.set_key_ssu(db, coll, &id_k);
+                    cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
                     self.delete_index_entries(&session, db, coll, &doc, &descs, Some(&id_k))?;
                     self.delete_nat_entry(&session, db, coll, &id_k)?;
@@ -6466,12 +6558,12 @@ impl Storage {
         Ok(ExplainPlan::CollScan)
     }
 
-    /// Raw doc blobs for `(db, coll)` in natural `_id` order.
+    /// Raw doc blobs for `(db, coll)` in natural (insertion / RecordId) order.
     fn scan_blobs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
         Ok(self
             .scan_docs(session, db, coll)?
             .into_iter()
-            .map(|(_id_k, blob)| blob)
+            .map(|(_rid, _id_k, blob)| blob)
             .collect())
     }
 
@@ -7306,6 +7398,9 @@ impl Storage {
         coll: &str,
         id_keys: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>> {
+        // Index entries carry the `id_key` fetch pointer (step 1); resolve each to
+        // its RecordId via the `_id` index, then read the doc row (unframing off the
+        // id_key prefix stored in-band).
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         let mut seen: HashSet<&[u8]> = HashSet::new();
         let mut out = Vec::new();
@@ -7313,10 +7408,17 @@ impl Storage {
             if !seen.insert(id_k.as_slice()) {
                 continue;
             }
+            let Some(recordid) = self.doc_recordid(session, db, coll, id_k)? else {
+                continue;
+            };
             cur.reset()?;
-            cur.set_key_ssu(db, coll, id_k);
+            cur.set_key_ssq(db, coll, recordid);
             match cur.search() {
-                Ok(()) => out.push(cur.get_value_u()?),
+                Ok(()) => {
+                    let value = cur.get_value_u()?;
+                    let (_idk, blob) = unframe_doc_value(&value)?;
+                    out.push(blob.to_vec());
+                }
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
             }
@@ -7841,6 +7943,54 @@ mod tests {
     #[test]
     fn wt_config_matches_default() {
         assert_eq!(wt_config("256M", 1000, false, "128MB"), DEFAULT_CONFIG);
+    }
+
+    /// `extract_key_format` pulls the format token out of a WT metadata line,
+    /// regardless of what other clauses precede it.
+    #[test]
+    fn extract_key_format_parses_the_token() {
+        assert_eq!(
+            extract_key_format("key_format=SSq,value_format=u"),
+            Some("SSq")
+        );
+        assert_eq!(
+            extract_key_format("app_metadata=(x=1),key_format=SSu,value_format=u"),
+            Some("SSu")
+        );
+        assert_eq!(extract_key_format("value_format=u"), None);
+    }
+
+    /// A store whose document shards were written before the RecordId keying
+    /// change (keyed `SSu`, unframed values) must be REFUSED at open, not
+    /// silently mis-read with `SSq` cursor ops. There is no in-place migration
+    /// (pre-1.0 beta) — see `tasks/backlog.md` §7.8.
+    #[test]
+    fn open_rejects_pre_recordid_doc_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("db");
+        std::fs::create_dir_all(&home).unwrap();
+        let home_s = home.to_str().unwrap();
+        // Fabricate the old layout: one documents shard keyed `SSu` with an
+        // unframed value, exactly what a pre-RecordId beta wrote. Same WT config
+        // `Storage` uses, so the reopen fails on our format check, not a config
+        // clash.
+        {
+            let conn = Connection::open(home_s, DEFAULT_CONFIG).unwrap();
+            let sess = conn.open_session().unwrap();
+            sess.create(&doc_shard_name(0), "key_format=SSu,value_format=u")
+                .unwrap();
+            let c = sess.open_cursor(&doc_shard_name(0), None).unwrap();
+            c.set_key_ssu("app", "c", b"\x2bid-key");
+            c.set_value_u(b"raw-unframed-blob");
+            c.insert().unwrap();
+        } // drop closes the fabrication connection before the reopen
+        match Storage::open(home_s) {
+            Err(StorageError::Internal(m)) => {
+                assert!(m.contains("RecordId"), "unexpected message: {m}")
+            }
+            Err(other) => panic!("expected Internal fatal, got: {other:?}"),
+            Ok(_) => panic!("expected open to be refused for an SSu doc shard"),
+        }
     }
 
     /// `sync_on_commit=true` flips `transaction_sync=enabled` to `true`.

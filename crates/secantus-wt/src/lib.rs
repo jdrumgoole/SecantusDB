@@ -437,6 +437,15 @@ impl Cursor {
         Ok(v)
     }
 
+    /// `value_format=S` — a single NUL-terminated string. Used by the `metadata:`
+    /// cursor, whose value is each object's schema/config string (so a caller can
+    /// read an on-disk table's `key_format`).
+    pub fn get_value_s(&self) -> Result<String> {
+        let mut a: *const c_char = ptr::null();
+        check(unsafe { cur_fn!(self, get_value)(self.ptr, &mut a) })?;
+        Ok(owned(a))
+    }
+
     // --- operations ---
 
     pub fn insert(&self) -> Result<()> {

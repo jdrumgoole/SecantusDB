@@ -40,11 +40,14 @@ def test_rust_storage_crud_roundtrip(tmp_path):
     assert bson.decode(st.find_by_id("app", "c", _wrap_id(oid)))["v"] == "obj"
     assert st.find_by_id("app", "c", _wrap_id(999)) is None
 
-    # scan is in cross-type natural order: number < string < ObjectId
+    # scan is in natural (insertion / RecordId) order — mongod's order for an
+    # unsorted find, regardless of _id type. Insertion order here was:
+    # auto-ObjectId, 1, "x", oid.
     ids = [bson.decode(b)["_id"] for b in st.scan_collection("app", "c")]
-    assert ids[0] == 1
-    assert ids[1] == "x"
-    assert all(isinstance(i, ObjectId) for i in ids[2:])
+    assert isinstance(ids[0], ObjectId)  # the auto-assigned _id, inserted first
+    assert ids[1] == 1
+    assert ids[2] == "x"
+    assert ids[3] == oid
 
     # replace (preserves _id) + delete
     assert st.replace_by_id("app", "c", _wrap_id(1), bson.encode({"v": "REPLACED"}))

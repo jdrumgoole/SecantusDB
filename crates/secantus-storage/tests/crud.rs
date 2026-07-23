@@ -106,10 +106,11 @@ fn duplicate_id_is_rejected() {
 }
 
 #[test]
-fn scan_is_in_cross_type_natural_order() {
+fn scan_is_in_natural_insertion_order() {
     with_db(|st| {
-        // BSON canonical order: numbers < strings < ObjectId; numbers sort by
-        // value across int/double.
+        // The doc table is keyed by the monotonic RecordId, so a scan is in
+        // insertion order — mongod's natural order for an unsorted find, regardless
+        // of `_id` type (an `_id`-ordered scan would need an explicit sort).
         let oid = bson::oid::ObjectId::new();
         for d in [
             doc! {"_id": "apple"},
@@ -129,13 +130,13 @@ fn scan_is_in_cross_type_natural_order() {
         assert_eq!(
             ids,
             vec![
-                Bson::Double(1.5),
-                Bson::Int32(2),
-                Bson::Int64(10),
                 Bson::String("apple".into()),
                 Bson::ObjectId(oid),
+                Bson::Int64(10),
+                Bson::Double(1.5),
+                Bson::Int32(2),
             ],
-            "numeric cross-type order, then strings, then ObjectId"
+            "docs come back in insertion order (RecordId), not _id order"
         );
     });
 }
