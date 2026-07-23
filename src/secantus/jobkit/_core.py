@@ -293,6 +293,28 @@ class Journal:
             ).fetchall()
         return [_row_to_job(r) for r in rows]
 
+    def completed_durations(self, argv: Iterable[str], *, limit: int = 20) -> list[float]:
+        """Durations (seconds) of the most recent *successful* runs of ``argv``.
+
+        Powers the Ops Board's "typical time" estimate from real history rather
+        than a hardcoded guess. Only PASSED runs count — a failed run often
+        aborts early and would skew the estimate low. Bounded by ``limit``.
+        """
+        limit = max(1, min(int(limit), 200))
+        argv_json = json.dumps(list(argv))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT started_at, ended_at FROM jobs "
+                "WHERE argv = ? AND status = ? AND ended_at IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (argv_json, PASSED, limit),
+            ).fetchall()
+        return [
+            r["ended_at"] - r["started_at"]
+            for r in rows
+            if r["ended_at"] is not None and r["ended_at"] >= r["started_at"]
+        ]
+
 
 def _row_to_job(row: sqlite3.Row) -> Job:
     return Job(

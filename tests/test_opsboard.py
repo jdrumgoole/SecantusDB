@@ -166,6 +166,46 @@ def test_jobs_ignored_for_non_jobs_task(client: TestClient) -> None:
     assert "--jobs" not in job.argv
 
 
+def test_dashboard_renders_info_dialog_per_task(client: TestClient) -> None:
+    from secantus.opsboard import registry
+
+    body = client.get("/").text
+    for target in registry.TARGETS:
+        for task in target.tasks:
+            assert f'id="dlg-{task.key}"' in body, f"no info dialog for {task.key}"
+    # The dialog carries the long-form detail and the exact command.
+    assert "pytest-xdist" in body  # py-test detail
+    assert "./inv validate-all --server python" in body
+
+
+def test_every_task_has_detail_and_estimate() -> None:
+    from secantus.opsboard import registry
+
+    for target in registry.TARGETS:
+        for task in target.tasks:
+            assert task.detail, f"{task.key} has no detail text"
+            assert task.est_seconds > 0, f"{task.key} has no fallback estimate"
+
+
+def test_dashboard_estimate_prefers_measured_history(client: TestClient) -> None:
+    journal = client.app.state.journal
+    # Record two fast successful runs of `test` — the dashboard should quote
+    # the measured median, not the registry's rough 5m figure.
+    for _ in range(3):
+        jid = journal.create(
+            target="python",
+            task="test",
+            argv=["test"],
+            worktree="/w",
+            host_pid=1,
+            started_at=1000.0,
+        )
+        journal.finish(jid, 0, ended_at=1010.0)
+
+    body = client.get("/").text
+    assert "median of the last 3 successful runs" in body
+
+
 def test_dashboard_shows_parallelism_input(client: TestClient) -> None:
     body = client.get("/").text
     assert 'name="jobs"' in body
