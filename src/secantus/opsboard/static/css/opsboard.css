@@ -77,6 +77,13 @@ body { margin: 0; display: flex; min-height: 100vh; background: var(--bg); color
 .dialog-warn { margin: 0 0 12px; font-size: 12px; color: var(--fail); }
 .dialog-actions { margin: 0; display: flex; justify-content: flex-end; }
 
+/* ---- gauge matrix ---- */
+.page-intro { max-width: 70ch; font-size: 13px; line-height: 1.6; margin: 0 0 16px; }
+.gauge-table td { vertical-align: middle; }
+.gauge-name { font-weight: 500; }
+.needs-cell { font-size: 11px; max-width: 26ch; }
+.gauge-table .task-form { margin-right: 6px; }
+
 .btn {
   background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
   border-radius: 6px; padding: 6px 10px; font-size: 13px; cursor: pointer;
