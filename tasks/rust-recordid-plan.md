@@ -48,24 +48,33 @@ must now drive the doc-table op, and their doc-table `set_key_ssu` → `set_key_
 `rename`/`drop`/`clone` doc-table sites; `drop_nat_collection` (drop only
 `natural_seq` now). Full doc-table cursor list (21 sites): `grep -n doc_table_for`.
 
-### ⚠ DESIGN FORK — must decide before the scans/eviction
+### ✅ DESIGN FORK — DECIDED (2026-07-23, Joe): option 2 (store id_key in the doc value)
 Dropping the `seq → id_key` forward table means a doc-table walk yields
-`(RecordId, blob)` with **no stored id_key**. For normal docs, reconstruct
-`id_key = encode_value(_id_from_blob)`. **But timeseries collections suffix the
-id_key** (`id_key + nanos + counter`, `timeseries_doc_suffix`) so duplicate `_id`s
-coexist — and the suffix is NOT derivable from `_id`. So a doc-table walk can't
-recover the suffixed id_key needed to delete a timeseries doc's `_id`-index +
-secondary-index entries (capped eviction, scan-based deletes). Options:
-1. **Keep a lean `RecordId → id_key` map for timeseries collections only** (or
-   always) — a partial reintroduction of the forward table, but only where needed.
-2. **Store the id_key in the doc-table value** alongside the blob (value becomes
-   `id_key_len + id_key + blob`) — every walk has the exact id_key, no 4th table,
-   but a value-format change + a few bytes/doc.
-3. **Accept a documented timeseries limitation** in step 1 (timeseries capped
-   eviction / scan-delete unsupported), fix in a follow-up.
-**Recommendation:** option 2 (store id_key in the value) — keeps the write count at
-3, no extra table, and every scan trivially has the real (suffixed) id_key; costs a
-small per-doc size + a value-format decode tweak. Decide with Joe before coding.
+`(RecordId, blob)` with **no stored id_key**. For normal docs `id_key` is
+reconstructable from `_id`, but **timeseries collections suffix the id_key**
+(`id_key + nanos + counter`, `timeseries_doc_suffix`, NOT derivable from `_id`), so
+a walk can't recover the suffixed id_key needed to delete a timeseries doc's
+`_id`-index + secondary-index entries (capped eviction / scan-delete). **Chosen:
+store the id_key IN the doc-table value alongside the blob.** (Rejected: option 1 =
+a lean RecordId→id_key map, reintroduces the table we dropped; option 3 = documented
+timeseries limitation.)
+
+**Implementation of option 2:**
+- Doc-table `value_format` stays `u` (opaque bytes) — no WT schema change; the
+  framing is in-band in *our* encode/decode. Frame the value as
+  `[u32-LE id_key_len][id_key bytes][blob bytes]`.
+- Add `frame_doc_value(id_key, blob) -> Vec<u8>` and
+  `unframe_doc_value(value) -> (&[u8] id_key, &[u8] blob)`. **Every doc-table write
+  frames; every read unframes.** `find_by_id` / point reads return `blob` only
+  (unframe, drop id_key); scans return `(RecordId, id_key, blob)` straight from the
+  unframe — **no `_id` decode needed**, and it works for timeseries (the exact
+  suffixed id_key is stored). This also removes the "reconstruct id_key from _id"
+  complexity from every scan — a net simplification.
+- Migration must re-write each legacy doc's value in the framed form (it has the
+  legacy id_key = the old doc-table key).
+- Cost: +~4 bytes + id_key length per doc (id_keys are short); zlib block
+  compression absorbs most of it. Value stays a single `u` column so index/oplog
+  machinery is untouched.
 
 ### How to resume
 ```
