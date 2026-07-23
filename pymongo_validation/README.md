@@ -21,6 +21,22 @@ uv sync --extra dev                       # adds pytest-json-report
 uv run python -m invoke validate          # run + regenerate report
 ```
 
+The gauge is serial by default, which is how the published number is
+measured. For the inner loop, `--jobs N` runs the same tests on N xdist
+workers — each with **its own** embedded server and WiredTiger store, and
+whole files distributed to workers (`--dist loadfile`) so upstream's
+within-file ordering survives:
+
+```bash
+uv run python -m invoke validate --jobs 4  # same 1707 tests, ~3x faster
+```
+
+Nothing is deselected, so the pass / fail / skip counts must come out the
+same as the serial run — if they don't, that is a bug in the parallel
+plumbing, not a coverage change. Keep `--jobs` at 4 or below: the
+change-stream `awaitData` tests measure real elapsed time and start
+flaking under CPU contention.
+
 ## What's vendored
 
 `vendor/pymongo-tests/` is a git submodule pinned to a specific pymongo
@@ -40,13 +56,18 @@ git commit -am "Bump pymongo validation target -> vX.Y.Z"
 
 1. `pymongo_validation/plugin.py` is loaded as a pytest plugin (`-p`
    flag in the invoke task).
-2. In `pytest_configure` — runs *before* test collection, *before*
-   pymongo's `helpers_shared.py` reads its env vars at import time —
-   the plugin starts an embedded `SecantusDBServer(host="127.0.0.1",
-   port=0, storage_path=<fresh tempdir>)` (real on-disk WiredTiger
-   via `tempfile.mkdtemp(prefix="secantus-pymongo-gauge-")`, never
+2. In `pytest_load_initial_conftests` — the one hook that runs *before*
+   any conftest import, and so *before* pymongo's `helpers_shared.py`
+   reads its env vars at import time — the plugin starts an embedded
+   `SecantusDBServer(host="127.0.0.1", port=0, storage_path=<fresh
+   tempdir>)` (real on-disk WiredTiger via
+   `tempfile.mkdtemp(prefix="secantus-pymongo-gauge-")`, never
    `:memory:`) and writes the bound host/port into `DB_IP` and
-   `DB_PORT`.
+   `DB_PORT`. `pytest_configure` then re-checks what the helpers
+   actually captured, and asks that address for a `serverStatus`
+   `secantus` marker, so a plumbing bug can't put a real `mongod`
+   behind the gauge. Under `--jobs N` every worker does this for its
+   own server.
 3. pytest collects from the paths in `pymongo_validation/include_paths.py`.
 4. `pytest-json-report` writes a machine-readable result to
    `.validation/raw.json`.

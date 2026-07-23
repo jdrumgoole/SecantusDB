@@ -423,6 +423,33 @@ def opsboard(
     c.run(" ".join(cmd), pty=True)
 
 
+def _gauge_parallel_flags(jobs: int) -> tuple[str, str]:
+    """Return ``(env_prefix, pytest_flags)`` for a pymongo-gauge run of *jobs*.
+
+    ``jobs=1`` (the default, and what the published number is measured with)
+    keeps the historical shape: one xdist worker, one controller-owned
+    server. ``jobs>1`` gives every worker its own embedded SecantusDB
+    (``SECANTUS_GAUGE_PER_WORKER=1``) and distributes whole FILES
+    (``--dist loadfile``) so upstream's within-file ordering survives — see
+    pymongo_validation/plugin.py for why that combination is safe.
+
+    Keep ``--jobs`` at 4 or below: the change-stream ``awaitData`` tests are
+    wall-clock timing-sensitive and start flaking under CPU contention (the
+    same ceiling ``validate-all --jobs`` documents).
+
+    One trap worth knowing if you ever hand-roll a gauge invocation: the test
+    paths must stay RELATIVE to the rootdir. A path outside it collapses the
+    file component of every nodeid to ``""``, ``--dist loadfile`` then sees a
+    single group, and the whole suite lands on one worker — a run that looks
+    parallel, reports the right numbers, and is no faster at all.
+    """
+    if jobs < 1:
+        raise SystemExit(f"--jobs must be >= 1, got {jobs}")
+    if jobs == 1:
+        return "", "-n1"
+    return "SECANTUS_GAUGE_PER_WORKER=1 ", f"-n{jobs} --dist loadfile"
+
+
 @task(
     help={
         "server": (
@@ -431,9 +458,14 @@ def opsboard(
             "'rust' (the Rust server via the _secantus_server embedded "
             "handle; the R8 conformance gate)."
         ),
+        "jobs": (
+            "Parallel xdist workers, each with its own embedded server "
+            "(default 1 = serial, which is what the published number is "
+            "measured with). 4 is the practical ceiling."
+        ),
     }
 )
-def validate(c: Context, server: str = "python") -> None:
+def validate(c: Context, server: str = "python", jobs: int = 1) -> None:
     """Run pymongo's vendored test suite against an embedded SecantusDB.
 
     Generates docs/validation-report.md with a per-category pass / fail /
@@ -447,6 +479,13 @@ def validate(c: Context, server: str = "python") -> None:
 
         SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON \\
             uv sync --extra dev --reinstall-package SecantusDB
+
+    ``--jobs N`` (N > 1) runs the same 1707 tests on N xdist workers, each
+    with its OWN embedded server and WT store, distributing whole files.
+    Nothing is deselected — coverage is identical — but wall time drops to
+    roughly the slowest single file. Use it for the inner loop; leave the
+    default serial run for the number that gets published, so the report
+    stays comparable release-to-release.
     """
     import pathlib
 
@@ -464,13 +503,18 @@ def validate(c: Context, server: str = "python") -> None:
     suffix = "" if server == "python" else "-rust-server"
     raw_json = f".validation/raw{suffix}.json"
     report = f"docs/validation-report{suffix}.md"
+    parallel_env, parallel_flags = _gauge_parallel_flags(jobs)
     # `-p no:cacheprovider`: don't pollute pymongo's tree with .pytest_cache.
-    # `-n1 -o addopts=`: pymongo's tests aren't parallel-safe (shared DBs), so
+    # `-n1 -o addopts=`: pymongo's tests aren't parallel-safe against a SHARED
+    #   server (they collide on database / collection names), so the default is
     #   exactly ONE xdist worker — serial semantics, but a pytest-timeout
     #   process kill on a hung test only takes out the worker (xdist records
     #   the crash, restarts the worker, and the json report survives). A bare
     #   no-xdist run would lose the whole report to the first hang.
     #   `--max-worker-restart=200`: don't let repeated hangs end the run.
+    #   `--jobs N` swaps this for `-nN --dist loadfile` + a per-worker embedded
+    #   server, which removes the sharing rather than the tests — same 1707
+    #   tests, ~3x faster. See `_gauge_parallel_flags` and the plugin docstring.
     # `-o timeout=120`: tighter than the project-wide 600s — a gauge test
     #   that blocks >2 min against SecantusDB is a conformance failure worth
     #   recording, and at 600s a handful of hangs would add hours.
@@ -486,7 +530,8 @@ def validate(c: Context, server: str = "python") -> None:
     #   to be reproducible and comparable release-to-release, so run these
     #   suites in the order upstream wrote them.
     # `-p pymongo_validation.plugin`: load our embedded-server bootstrap (the
-    #   CONTROLLER starts the server pre-conftest; workers inherit the env).
+    #   CONTROLLER starts the server pre-conftest; workers inherit the env,
+    #   or start their own server when --jobs > 1).
     # `--continue-on-collection-errors`: a collection failure in one file
     #   shouldn't abort the whole run — we want every category measured.
     # `-c pyproject.toml` forces pytest to use OUR config; without it pytest
@@ -496,11 +541,11 @@ def validate(c: Context, server: str = "python") -> None:
     # from our pyproject; this run uses positional paths.
     # PYTHONPATH=. so pytest can import our `pymongo_validation` plugin.
     c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
+        f"{parallel_env}SECANTUS_GAUGE_SERVER={server} "
         "PYTHONPATH=. uv run --no-sync python -m pytest "
         "-c pyproject.toml "
         "-o addopts= -o testpaths= -o timeout=120 "
-        "-n1 --max-worker-restart=200 "
+        f"{parallel_flags} --max-worker-restart=200 "
         "-p no:cacheprovider -p no:randomly -p pymongo_validation.plugin "
         "--continue-on-collection-errors "
         f"--json-report --json-report-file={raw_json} "
@@ -551,7 +596,7 @@ def validate_one(c: Context, nodeid: str, server: str = "python") -> None:
 
 
 @task(name="validate-pymongo-async")
-def validate_pymongo_async(c: Context, server: str = "python") -> None:
+def validate_pymongo_async(c: Context, server: str = "python", jobs: int = 1) -> None:
     """Run pymongo's vendored *async* test suite against an embedded SecantusDB.
 
     The async sibling of ``validate``: it drives pymongo's native
@@ -568,6 +613,10 @@ def validate_pymongo_async(c: Context, server: str = "python") -> None:
 
     ``--server rust`` runs the same suite against the Rust server and writes
     docs/validation-report-pymongo-async-rust-server.md.
+
+    ``--jobs N`` parallelises exactly as ``validate --jobs N`` does (whole
+    files across N workers, one embedded server each); the default stays
+    serial so the published number is measured the same way every release.
     """
     import pathlib
 
@@ -593,13 +642,14 @@ def validate_pymongo_async(c: Context, server: str = "python") -> None:
     # assume. The embedded-server plugin is the SAME one the sync gauge
     # loads — it sets DB_IP/DB_PORT before pymongo's conftest import, which
     # the async `AsyncClientContext` resolves from too.
+    parallel_env, parallel_flags = _gauge_parallel_flags(jobs)
     c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
+        f"{parallel_env}SECANTUS_GAUGE_SERVER={server} "
         "PYTHONPATH=. uv run --no-sync python -m pytest "
         "-c pyproject.toml "
         "-o addopts= -o testpaths= -o timeout=120 "
         "-o asyncio_mode=auto -o asyncio_default_fixture_loop_scope=session "
-        "-n1 --max-worker-restart=200 "
+        f"{parallel_flags} --max-worker-restart=200 "
         "-p no:cacheprovider -p no:randomly -p pytest_asyncio -p pymongo_validation.plugin "
         "--continue-on-collection-errors "
         f"--json-report --json-report-file={raw_json} "
