@@ -38,7 +38,10 @@ def _fmt_elapsed(seconds: float) -> str:
 def jobs_page(request: Request, before: int | None = None) -> HTMLResponse:
     journal = request.app.state.journal
     journal.reap_stale()
-    jobs, next_cursor = journal.list(limit=_PAGE, before_id=before)
+    # History excludes in-flight jobs so paging through finished work is stable
+    # — a running row would otherwise drift between pages as it completes.
+    jobs, next_cursor = journal.list(limit=_PAGE, before_id=before, include_running=False)
+    running = journal.running()
     template = "partials/job_rows.html" if before is not None else "pages/jobs.html"
     return _templates(request).TemplateResponse(
         request,
@@ -48,7 +51,8 @@ def jobs_page(request: Request, before: int | None = None) -> HTMLResponse:
             "active": "jobs",
             "jobs": jobs,
             "next_cursor": next_cursor,
-            "running_count": len(journal.running()),
+            "running": running,
+            "running_count": len(running),
             "external": discovery.scan(
                 known_pids=[j.host_pid for j in journal.running()], limit=25
             ),
@@ -92,6 +96,19 @@ def start_job(
     job = request.app.state.runner.start(argv)
     token = request.app.state.token
     return RedirectResponse(url=f"/jobs/{job.id}?t={token}", status_code=303)
+
+
+@router.get("/jobs/running", response_class=HTMLResponse)
+def running_partial(request: Request) -> HTMLResponse:
+    """The live 'Running now' block; self-repolls every 3s via HTMX."""
+    journal = request.app.state.journal
+    journal.reap_stale()
+    running = journal.running()
+    return _templates(request).TemplateResponse(
+        request,
+        "partials/running.html",
+        {"running": running, "running_count": len(running)},
+    )
 
 
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)

@@ -1,6 +1,63 @@
 {% extends "base.html" %}
 {% block body %}
 
+<section class="activity-panel">
+  <h2>Recent activity <span class="muted">· local and CI together</span></h2>
+  {% if activity %}
+  <table class="jobs-table">
+    <thead><tr><th>origin</th><th>what</th><th>state</th><th>where</th><th>when</th></tr></thead>
+    <tbody>
+      {% for a in activity %}
+      <tr>
+        <td><span class="origin origin-{{ a.origin }}">{{ 'local' if a.is_local else 'GitHub CI' }}</span></td>
+        <td>{% if a.is_local %}<a href="{{ a.url }}"><code>{{ a.label }}</code></a>
+            {%- else %}<a href="{{ a.url }}" target="_blank" rel="noreferrer">{{ a.label }}</a>{% endif %}</td>
+        <td><span class="pill pill-{{ a.state }}">{{ a.state }}</span></td>
+        <td class="muted">{{ a.detail }}</td>
+        <td class="muted">{{ a.when_text }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted small-note">
+    A <span class="origin origin-local">local</span> row ran on this machine through
+    <code>./inv</code> or this board; a <span class="origin origin-github">GitHub CI</span>
+    row ran on GitHub Actions, triggered by anyone.
+  </p>
+  {% else %}
+  <p class="muted">No activity yet.</p>
+  {% endif %}
+</section>
+
+<section class="dispatch-panel">
+  <h2>Start a CI run</h2>
+  {% if workflows %}
+  <form method="post" action="/ci/dispatch" class="dispatch-form">
+    <label class="release-field">workflow
+      <select name="workflow" class="dispatch-select">
+        {% for w in workflows %}
+        <option value="{{ w.name }}">{{ w.name }}{% if w.release_class %} ⚠ publishes{% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="release-field">ref
+      <input type="text" name="ref" value="main" autocomplete="off" />
+    </label>
+    <label class="release-field">confirm (only for ⚠ publishing workflows — type the exact name)
+      <input type="text" name="confirm" placeholder="e.g. Publish to PyPI" autocomplete="off" />
+    </label>
+    <button type="submit" class="btn">Run workflow</button>
+  </form>
+  <p class="muted small-note">
+    Runs on GitHub, not here. Workflows marked ⚠ publish to PyPI or cut release
+    artifacts and need their exact name typed to confirm.
+  </p>
+  {% else %}
+  <p class="muted">Workflow list unavailable (needs an authenticated <code>gh</code>).</p>
+  {% endif %}
+</section>
+
+
 <section class="version-panel">
   <h2>Version drift</h2>
   <table class="jobs-table">

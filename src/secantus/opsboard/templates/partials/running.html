@@ -1,0 +1,39 @@
+{# Live 'Running now' block. Repolls every 3s while anything is in flight; when
+   nothing is running it stops polling on a slower heartbeat so an idle board
+   isn't hammering the journal. #}
+<div id="running-block"
+     hx-get="/jobs/running"
+     hx-trigger="every {{ 3 if running_count else 15 }}s"
+     hx-swap="outerHTML">
+  <div class="jobs-toolbar">
+    <h2>Running now <span class="muted">· {{ running_count }}</span></h2>
+    {% if running_count %}
+    <form method="post" action="/jobs/cancel-all" class="inline-form"
+          onsubmit="return confirm('Stop all {{ running_count }} running job(s) and kill their process trees?')">
+      <button type="submit" class="btn btn-danger btn-sm">Cancel all running</button>
+    </form>
+    {% endif %}
+  </div>
+  {% if running %}
+  <table class="jobs-table running-table">
+    <thead><tr><th>#</th><th>target</th><th>task</th><th>started</th><th></th></tr></thead>
+    <tbody>
+      {% for job in running %}
+      <tr>
+        <td><a href="/jobs/{{ job.id }}">{{ job.id }}</a></td>
+        <td>{{ job.target }}</td>
+        <td><code>{{ job.task }}</code></td>
+        <td class="muted">{{ "%.0f"|format(job.duration) }}s ago</td>
+        <td>
+          <form method="post" action="/jobs/{{ job.id }}/cancel" class="inline-form">
+            <button type="submit" class="btn btn-danger btn-sm">Cancel</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted idle-note">Nothing running. Start something from the Dashboard or Gauges page, or run <code>./inv &lt;task&gt;</code> in a terminal.</p>
+  {% endif %}
+</div>
