@@ -62,8 +62,13 @@ class ExternalProcess:
 def scan(
     *, known_pids: Sequence[int] = (), runner: Runner | None = None, limit: int = 50
 ) -> list[ExternalProcess]:
-    """Untracked build/test processes, newest-first, bounded by ``limit``."""
-    if os.name == "nt":  # pragma: no cover - POSIX-only feature
+    """Untracked build/test processes, newest-first, bounded by ``limit``.
+
+    The Windows short-circuit applies only to the *real* ``ps`` (which doesn't
+    exist there). An explicitly injected runner has no platform dependency, so
+    the parsing below stays exercised on every platform.
+    """
+    if runner is None and os.name == "nt":  # pragma: no cover - POSIX-only
         return []
     run = runner or _ps
     code, out = run(["ps", "-Ao", "pid=,etime=,command="])

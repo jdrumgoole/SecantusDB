@@ -249,5 +249,16 @@ def test_scan_degrades_when_ps_fails() -> None:
     assert discovery.scan(runner=lambda argv: (1, "")) == []
 
 
+def test_scan_short_circuits_on_windows_only_for_real_ps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With the REAL ps (no runner) Windows returns nothing — `ps` doesn't exist
+    # there. With an injected runner there's no platform dependency, so parsing
+    # must still work (this is what broke the Windows CI shard).
+    monkeypatch.setattr(discovery.os, "name", "nt")
+    assert discovery.scan() == []
+    assert discovery.scan(runner=lambda argv: (0, _PS)) != []
+
+
 def test_scan_respects_limit() -> None:
     assert len(discovery.scan(runner=lambda argv: (0, _PS), limit=1)) == 1
