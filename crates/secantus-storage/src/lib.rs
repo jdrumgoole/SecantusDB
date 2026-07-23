@@ -679,10 +679,15 @@ pub fn wt_config(
 // libz), so the compressor clause is omitted there — a `block_compressor=zlib`
 // table create would fail with "unknown compressor". Set at create time; existing
 // uncompressed tables keep their format (WT stores it in metadata).
+// RecordId keying: the doc table is keyed by (db, coll, RecordId:i64) — the
+// monotonic per-collection insertion seq — not by id_key. This puts the table in
+// insertion order (so the `secantus_natural` forward table is dropped) and cuts
+// write amplification 4->3. `secantus_natural_seq` (id_key -> RecordId) is the
+// `_id` index. See tasks/rust-recordid-plan.md.
 #[cfg(not(target_os = "windows"))]
-const DOC_TABLE_CFG: &str = "key_format=SSu,value_format=u,block_compressor=zlib";
+const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u,block_compressor=zlib";
 #[cfg(target_os = "windows")]
-const DOC_TABLE_CFG: &str = "key_format=SSu,value_format=u";
+const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u";
 #[cfg(not(target_os = "windows"))]
 const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=zlib";
 #[cfg(target_os = "windows")]
@@ -3233,20 +3238,19 @@ impl Storage {
                 if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
                     return Err(StorageError::DuplicateKey(Box::new(c)));
                 }
-                // overwrite=false -> a pre-existing _id is a WT_DUPLICATE_KEY.
-                let cur = session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
-                cur.set_key_ssu(db, coll, &key);
+                // Mint the RecordId + write the `_id` index (id_key -> RecordId);
+                // this overwrite=false insert is where a duplicate `_id` is caught.
+                let recordid = self.write_nat_entry(&session, db, coll, &key)?;
+                // Doc table keyed by the (unique) RecordId.
+                let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(blob);
-                match cur.insert() {
-                    Ok(()) => {}
-                    Err(e) if e.is_duplicate_key() => return Err(StorageError::DuplicateId),
-                    Err(e) => return Err(e.into()),
-                }
-                // Maintain secondary indexes: write this doc's entries, and lazily flag
-                // any index this doc makes multikey (array value on an indexed field).
+                cur.insert()?;
+                // Maintain secondary indexes: write this doc's entries (still carrying
+                // id_key as the fetch pointer in step 1; IXSCAN resolves id_key ->
+                // RecordId -> doc), and lazily flag any index this doc makes multikey.
                 self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
                 self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
-                self.write_nat_entry(&session, db, coll, &key)?;
                 // Oplog: an insert is op "i". No pre-image (there's no prior document).
                 if self.enable_oplog {
                     let ui = collection_uuid(&session, db, coll)?;
@@ -3352,12 +3356,13 @@ impl Storage {
                         }
                         continue;
                     }
-                    doc_cur.reset()?;
-                    doc_cur.set_key_ssu(db, coll, &key);
-                    doc_cur.set_value_u(blob);
-                    match doc_cur.insert() {
-                        Ok(()) => {}
-                        Err(e) if e.is_duplicate_key() => {
+                    // Mint the RecordId + write the `_id` index (id_key -> RecordId);
+                    // a duplicate `_id` is caught here now (not by the doc-table
+                    // insert, which is keyed by the unique RecordId). WT_DUPLICATE_KEY
+                    // does not abort the transaction, so unordered inserts continue.
+                    let recordid = match self.write_nat_entry(&session, db, coll, &key) {
+                        Ok(r) => r,
+                        Err(StorageError::DuplicateId) => {
                             let ns = format!("{db}.{coll}");
                             let mut key_value = Document::new();
                             key_value.insert("_id", id.clone());
@@ -3378,11 +3383,15 @@ impl Storage {
                             }
                             continue;
                         }
-                        Err(e) => return Err(e.into()),
-                    }
+                        Err(e) => return Err(e),
+                    };
+                    // Doc table keyed by the (unique) RecordId.
+                    doc_cur.reset()?;
+                    doc_cur.set_key_ssq(db, coll, recordid);
+                    doc_cur.set_value_u(blob);
+                    doc_cur.insert()?;
                     self.write_index_entries(&session, db, coll, &doc, &descs, Some(&key))?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
-                    self.write_nat_entry(&session, db, coll, &key)?;
                     fresh_id_keys.insert(key.clone());
                     inserted += 1;
                     if oplog_on {
@@ -3429,8 +3438,12 @@ impl Storage {
         // Lock-free read (see the `lock` field's invariants).
         let key = id_key(id)?;
         let session = self.op_session()?;
+        // Resolve `_id` -> RecordId via the `_id` index, then fetch the doc row.
+        let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
+            return Ok(None);
+        };
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        cur.set_key_ssu(db, coll, &key);
+        cur.set_key_ssq(db, coll, recordid);
         match cur.search() {
             Ok(()) => Ok(Some(cur.get_value_u()?)),
             Err(e) if e.is_not_found() => Ok(None),
@@ -4942,23 +4955,48 @@ impl Storage {
 
     /// Record a doc's insertion position: `seq -> id_key` plus the reverse
     /// `id_key -> seq`. Mirrors `storage._write_nat_entry`.
+    /// Assign the doc a RecordId (monotonic insertion seq) and write the `_id`
+    /// index row (`id_key -> RecordId`). Returns the RecordId — the caller keys
+    /// the doc table by it. The forward `NAT_TABLE` (seq -> id_key) is gone: the
+    /// doc table is itself in RecordId (= insertion) order.
     fn write_nat_entry(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
         id_key: &[u8],
-    ) -> Result<()> {
-        let seq = self.mint_nat_seq();
-        let nat = session.open_cursor(NAT_TABLE, None)?;
-        nat.set_key_ssq(db, coll, seq);
-        nat.set_value_u(id_key);
-        nat.insert()?;
+    ) -> Result<i64> {
+        let recordid = self.mint_nat_seq();
+        // overwrite=false: the `_id` index is where a duplicate `_id` is now caught
+        // (the doc table is keyed by the unique RecordId, so it can't reject dups).
+        // A wasted RecordId on the dup path is harmless — RecordIds only need to be
+        // unique + monotonic; gaps are fine.
+        let rev = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+        rev.set_key_ssu(db, coll, id_key);
+        rev.set_value_q(recordid);
+        match rev.insert() {
+            Ok(()) => Ok(recordid),
+            Err(e) if e.is_duplicate_key() => Err(StorageError::DuplicateId),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The `_id` index lookup: resolve a doc's `id_key` to its RecordId (the
+    /// doc-table key). `None` if the doc doesn't exist.
+    fn doc_recordid(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        id_key: &[u8],
+    ) -> Result<Option<i64>> {
         let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
         rev.set_key_ssu(db, coll, id_key);
-        rev.set_value_q(seq);
-        rev.insert()?;
-        Ok(())
+        match rev.search() {
+            Ok(()) => Ok(Some(rev.get_value_q()?)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Drop a doc's insertion-order entry (both directions). No-op if absent
@@ -4969,23 +5007,19 @@ impl Storage {
         db: &str,
         coll: &str,
         id_key: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<i64>> {
+        // Remove the `_id` index row and return the RecordId it mapped to, so the
+        // caller can delete the doc-table row keyed by it. (No forward NAT_TABLE
+        // row to remove — the doc table itself is in RecordId order.)
         let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
         rev.set_key_ssu(db, coll, id_key);
-        let seq = match rev.search() {
+        let recordid = match rev.search() {
             Ok(()) => rev.get_value_q()?,
-            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         rev.remove()?;
-        let nat = session.open_cursor(NAT_TABLE, None)?;
-        nat.set_key_ssq(db, coll, seq);
-        match nat.search() {
-            Ok(()) => nat.remove()?,
-            Err(e) if e.is_not_found() => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok(())
+        Ok(Some(recordid))
     }
 
     /// Drop every natural-order entry for `(db, coll)` (both directions) — called
