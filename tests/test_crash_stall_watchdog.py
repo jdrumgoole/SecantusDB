@@ -247,7 +247,7 @@ def _run_nested_with_fault_dir(
     fault_dir: Path,
     xdist: bool,
     max_worker_restart: str = "0",
-    timeout: int = 120,
+    timeout: int = 300,
 ) -> subprocess.CompletedProcess[str]:
     """Nested pytest session with ``SECANTUS_FAULTHANDLER_DIR`` armed."""
     (tmp_path / "conftest.py").write_text(_CONFTEST_UNDER_TEST.read_text())
@@ -264,7 +264,16 @@ def _run_nested_with_fault_dir(
     )
 
 
-@pytest.mark.timeout(180)
+# These two tests each spawn a nested `pytest -n 2` subprocess. Under the full
+# `-n auto` suite that oversubscribes CPU, and if BOTH run at once (each spawning
+# its own nested session) the nested runs can miss their subprocess deadline and
+# get SIGKILLed — a contention artifact, not a real crash-capture failure. Pin
+# them to one xdist group so `--dist=loadgroup` serialises them onto a single
+# outer worker (never two nested sessions at once), and give the nested spawn
+# (300s) and the test deadline (360s > the spawn's) enough headroom for a slow
+# start under load. See ci-check's "crash_stall_watchdog" catalog entry.
+@pytest.mark.xdist_group("crash_watchdog_nested")
+@pytest.mark.timeout(360)
 def test_faulthandler_dir_arms_a_file_per_worker(tmp_path: Path) -> None:
     """With the dir set, every process arms its own ``faulthandler-<id>.log``.
 
@@ -290,7 +299,8 @@ def test_faulthandler_dir_arms_a_file_per_worker(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.xdist_group("crash_watchdog_nested")
+@pytest.mark.timeout(360)
 def test_faulthandler_dir_captures_a_worker_crash(tmp_path: Path) -> None:
     """A hard crash (SIGSEGV) in an xdist worker leaves its stack in the file.
 
