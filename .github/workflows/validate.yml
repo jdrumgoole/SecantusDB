@@ -61,7 +61,7 @@ jobs:
           # the cargo target dir).
           - { name: java-rust-server, task: "validate-java --server rust", report: docs/validation-report-java-rust-server.md }
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           submodules: recursive   # vendor/wiredtiger + the per-driver vendored submodule
 
@@ -80,7 +80,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
 
@@ -146,7 +146,7 @@ jobs:
       # targets net10.0.
       - name: Set up .NET SDK
         if: matrix.driver.name == 'dotnet'
-        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1  # v5.4.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
         with:
           dotnet-version: "10.0.x"
 
@@ -161,7 +161,7 @@ jobs:
 
       - name: Set up Go
         if: matrix.driver.name == 'go'
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: "1.25"
 
@@ -184,7 +184,7 @@ jobs:
 
       - name: Set up Node.js
         if: matrix.driver.name == 'node'
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: "22"
 
@@ -199,7 +199,7 @@ jobs:
 
       - name: Set up JDK
         if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server'
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a  # v5
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5
         with:
           distribution: temurin
           java-version: "21"
@@ -222,7 +222,7 @@ jobs:
 
       - name: Set up Ruby
         if: matrix.driver.name == 'ruby'
-        uses: ruby/setup-ruby@d45b1a4e94b71acab930e56e79c6aa188764e7f9  # v1
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b  # v1
         with:
           ruby-version: "3.3"
           bundler-cache: false  # gems installed via runner's bundle install
@@ -314,7 +314,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Download all report artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
@@ -361,7 +361,7 @@ jobs:
           ls .validation/
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
 
