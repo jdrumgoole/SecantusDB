@@ -18,6 +18,14 @@ class Task:
     phase: str  # "build" | "test" | "release"
     blurb: str = ""
     confirm: bool = False  # outward-facing / irreversible → typed confirmation
+    # Ordered sub-phase names for the progress stepper. Only meaningful for
+    # multi-step tasks that emit ``==> [k/N] label`` markers (the gates). Empty
+    # → progress falls back to the pytest % bar or an indeterminate bar.
+    phase_labels: list[str] = field(default_factory=list)
+    # When True the UI shows a parallelism input that becomes ``--jobs N`` (for
+    # validate-all, which dispatches the gauges over a thread pool).
+    jobs_option: bool = False
+    default_jobs: int = 4  # matches validate-all's default; CLAUDE.md caps at 4
 
 
 @dataclass(frozen=True)
@@ -37,7 +45,14 @@ PYTHON = Target(
     subtitle="pure-Python SecantusDBServer · PyPI SecantusDB",
     tasks=[
         Task("py-test", "Test suite", ["test"], "test", "Full pytest suite."),
-        Task("py-gate", "Pre-commit gate", ["py-gate"], "test", "Full Python gate."),
+        Task(
+            "py-gate",
+            "Pre-commit gate",
+            ["py-gate"],
+            "test",
+            "Full Python gate.",
+            phase_labels=["Lint", "Tests", "Perf"],
+        ),
         Task("py-perf", "Perf regression", ["perf"], "test", "Perf gates (serial)."),
         Task("py-lint", "Lint", ["lint"], "test", "ruff check + format --check."),
         Task(
@@ -46,6 +61,14 @@ PYTHON = Target(
             ["validate", "--server", "python"],
             "test",
             "pymongo conformance gauge.",
+        ),
+        Task(
+            "py-gauge-all",
+            "All gauges",
+            ["validate-all", "--server", "python"],
+            "test",
+            "All 13 driver gauges (parallel; needs each driver's toolchain).",
+            jobs_option=True,
         ),
         Task(
             "py-release-prepare",
@@ -72,7 +95,23 @@ RUST = Target(
     subtitle="secantusd-rs binary + _secantus_server · secantusdb-v tags",
     tasks=[
         Task("rs-test", "cargo test", ["rust-test"], "test", "fmt/clippy/tests."),
-        Task("rs-gate", "Pre-commit gate", ["rust-gate"], "test", "Full Rust gate."),
+        Task(
+            "rs-gate",
+            "Pre-commit gate",
+            ["rust-gate"],
+            "test",
+            "Full Rust gate.",
+            phase_labels=[
+                "cargo (clean ws)",
+                "wt crate",
+                "storage crate",
+                "adapter crate",
+                "parity",
+                "ruff check",
+                "ruff format",
+                "pytest",
+            ],
+        ),
         Task("rs-parity", "Parity suite", ["rust-parity"], "test", "Engine parity."),
         Task(
             "rs-build",
@@ -94,6 +133,14 @@ RUST = Target(
             ["validate", "--server", "rust"],
             "test",
             "R8 conformance gate.",
+        ),
+        Task(
+            "rs-gauge-all",
+            "All gauges",
+            ["validate-all", "--server", "rust"],
+            "test",
+            "All 13 driver gauges (parallel; needs each driver's toolchain).",
+            jobs_option=True,
         ),
         Task(
             "rs-bump",
@@ -141,4 +188,31 @@ def resolve_task(key: str) -> tuple[Target, Task] | None:
     return _TASK_BY_KEY.get(key)
 
 
-__all__ = ["Task", "Target", "TARGETS", "target", "resolve_task", "PYTHON", "RUST", "PG"]
+def find_task_by_argv(argv: list[str]) -> Task | None:
+    """Best match for a journal row's argv → catalog Task (for phase labels).
+
+    Prefers an exact argv match (distinguishes ``validate --server python`` from
+    ``--server rust``), falling back to the first task sharing argv[0].
+    """
+    if not argv:
+        return None
+    for _t, task in _TASK_BY_KEY.values():
+        if task.argv == argv:
+            return task
+    for _t, task in _TASK_BY_KEY.values():
+        if task.argv and task.argv[0] == argv[0]:
+            return task
+    return None
+
+
+__all__ = [
+    "Task",
+    "Target",
+    "TARGETS",
+    "target",
+    "resolve_task",
+    "find_task_by_argv",
+    "PYTHON",
+    "RUST",
+    "PG",
+]

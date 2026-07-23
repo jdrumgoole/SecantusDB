@@ -7,6 +7,7 @@ mock. Also enforces the pywebview "no runtime CDN" rule.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -93,7 +94,9 @@ def test_dashboard_renders_all_targets(client: TestClient) -> None:
 def test_no_runtime_cdn_dependencies_in_templates() -> None:
     forbidden = ("cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com", "https://")
     for tmpl in _TEMPLATES.rglob("*.html"):
-        body = tmpl.read_text()
+        # utf-8 explicitly: templates carry non-ASCII glyphs (⏱ ⇉ ✓ …) that a
+        # Windows locale (cp1252) default would fail to decode.
+        body = tmpl.read_text(encoding="utf-8")
         for needle in forbidden:
             assert needle not in body, f"{tmpl.name} references {needle}"
 
@@ -124,6 +127,51 @@ def test_start_unknown_task_404s(client: TestClient) -> None:
     assert r.status_code == 404
 
 
+def test_all_gauges_tasks_registered_per_server() -> None:
+    from secantus.opsboard import registry
+
+    py = registry.resolve_task("py-gauge-all")
+    rs = registry.resolve_task("rs-gauge-all")
+    assert py is not None and py[1].argv == ["validate-all", "--server", "python"]
+    assert rs is not None and rs[1].argv == ["validate-all", "--server", "rust"]
+    assert py[1].jobs_option is True and rs[1].jobs_option is True
+    # Exact argv match distinguishes the two despite sharing argv[0].
+    assert registry.find_task_by_argv(["validate-all", "--server", "rust"]).key == "rs-gauge-all"
+
+
+def test_start_all_gauges_passes_parallelism(client: TestClient) -> None:
+    client.post(
+        "/jobs/start",
+        data={"task_key": "py-gauge-all", "jobs": "6"},
+        follow_redirects=False,
+    )
+    job = client.app.state.journal.list(limit=1)[0][0]
+    assert job.argv == ["validate-all", "--server", "python", "--jobs", "6"]
+
+
+def test_parallelism_is_capped(client: TestClient) -> None:
+    client.post(
+        "/jobs/start",
+        data={"task_key": "py-gauge-all", "jobs": "999"},
+        follow_redirects=False,
+    )
+    job = client.app.state.journal.list(limit=1)[0][0]
+    assert job.argv[-2:] == ["--jobs", "16"]  # clamped to _MAX_JOBS
+
+
+def test_jobs_ignored_for_non_jobs_task(client: TestClient) -> None:
+    # A task without jobs_option must not get a stray --jobs appended.
+    client.post("/jobs/start", data={"task_key": "py-test", "jobs": "8"}, follow_redirects=False)
+    job = client.app.state.journal.list(limit=1)[0][0]
+    assert "--jobs" not in job.argv
+
+
+def test_dashboard_shows_parallelism_input(client: TestClient) -> None:
+    body = client.get("/").text
+    assert 'name="jobs"' in body
+    assert 'value="py-gauge-all"' in body
+
+
 def test_release_task_requires_confirmation(client: TestClient) -> None:
     # Without confirm=yes → rejected.
     r = client.post("/jobs/start", data={"task_key": "py-release-prepare"}, follow_redirects=False)
@@ -146,6 +194,52 @@ def test_job_log_tail_captures_child_output(client: TestClient) -> None:
     assert "CHILD-RAN" in r.text
     # Done → no more polling trigger emitted.
     assert "every 1s" not in r.text
+
+
+def test_job_view_renders_progress_and_stepper(client: TestClient, tmp_path: Path) -> None:
+    journal = client.app.state.journal
+    jid = journal.create(
+        target="python", task="py-gate", argv=["py-gate"], worktree="/w", host_pid=1
+    )
+    log = tmp_path / "job.log"
+    log.write_text("==> [1/3] Lint\nlinting\n==> [2/3] Tests\ntests/x PASSED [ 60%]\n")
+    journal.set_log_path(jid, str(log))
+
+    r = client.get(f"/jobs/{jid}/view")
+    assert r.status_code == 200
+    body = r.text
+    # Phase stepper with registry-supplied labels (incl. the not-yet-reached one).
+    assert "Lint" in body and "Tests" in body and "Perf" in body
+    # Determinate overall bar rendered a percentage.
+    assert "%" in body
+    # Still running → keeps polling.
+    assert "every 1s" in body
+
+
+def test_job_view_stops_polling_when_done(client: TestClient, tmp_path: Path) -> None:
+    journal = client.app.state.journal
+    jid = journal.create(target="python", task="test", argv=["test"], worktree="/w", host_pid=1)
+    log = tmp_path / "job.log"
+    log.write_text("all good [ 100%]\n")
+    journal.set_log_path(jid, str(log))
+    journal.finish(jid, 0)
+
+    r = client.get(f"/jobs/{jid}/view")
+    assert r.status_code == 200
+    assert "every 1s" not in r.text  # done → no repoll
+
+
+def test_cancel_all_endpoint_redirects(client: TestClient) -> None:
+    r = client.post("/jobs/cancel-all", follow_redirects=False)
+    assert r.status_code == 303
+    assert "/jobs" in r.headers["location"]
+
+
+def test_jobs_page_shows_cancel_all_when_running(client: TestClient) -> None:
+    journal = client.app.state.journal
+    journal.create(target="python", task="t", argv=["t"], worktree="/w", host_pid=os.getpid())
+    page = client.get("/jobs")
+    assert "Cancel all running" in page.text
 
 
 def test_jobs_pagination(client: TestClient) -> None:

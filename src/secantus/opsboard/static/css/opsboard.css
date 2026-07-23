@@ -36,8 +36,17 @@ body { margin: 0; display: flex; min-height: 100vh; background: var(--bg); color
 .card-head h2 { margin: 0 0 2px; font-size: 16px; }
 .subtitle { margin: 0 0 12px; color: var(--muted); font-size: 12px; }
 .phase h3 { margin: 12px 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
-.task-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
-.task-form { margin: 0; }
+.task-buttons { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.task-form { margin: 0; display: inline-flex; align-items: center; gap: 4px; }
+.jobs-field {
+  display: inline-flex; align-items: center; gap: 3px; font-size: 12px;
+  color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 0 6px;
+}
+.jobs-input {
+  width: 40px; background: transparent; border: none; color: var(--fg);
+  font-size: 13px; font-family: inherit; text-align: right;
+}
+.jobs-input::-webkit-inner-spin-button { opacity: 1; }
 
 .btn {
   background: var(--panel-2); color: var(--fg); border: 1px solid var(--border);
@@ -74,3 +83,53 @@ body { margin: 0; display: flex; min-height: 100vh; background: var(--bg); color
 }
 .log-foot { margin: 6px 2px 0; font-size: 12px; }
 code { font-family: "SF Mono", ui-monospace, Menlo, monospace; }
+
+/* ---- graphical job view ---- */
+.job-meta-top { margin: 0 0 14px; font-size: 12px; }
+.job-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.job-head .elapsed { font-variant-numeric: tabular-nums; }
+.inline-form { display: inline; margin: 0; }
+.btn-sm { padding: 3px 9px; font-size: 12px; }
+.jobs-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+
+.progress {
+  position: relative; height: 20px; border-radius: 10px; overflow: hidden;
+  background: var(--panel-2); border: 1px solid var(--border); margin-bottom: 16px;
+}
+.progress-fill {
+  height: 100%; background: var(--accent); border-radius: 10px 0 0 10px;
+  transition: width .4s ease;
+}
+.progress-label {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-variant-numeric: tabular-nums; color: var(--fg);
+}
+.bar-passed .progress-fill { background: var(--pass); }
+.bar-failed .progress-fill { background: var(--fail); }
+.bar-cancelled .progress-fill { background: var(--cancel); }
+/* indeterminate: a moving stripe while a task exposes no % */
+.progress.indeterminate .progress-fill {
+  border-radius: 10px; animation: ob-slide 1.2s ease-in-out infinite;
+}
+@keyframes ob-slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+
+/* phase stepper */
+.stepper { list-style: none; display: flex; flex-wrap: wrap; gap: 8px; padding: 0; margin: 0 0 16px; }
+.step {
+  display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); font-size: 12px; color: var(--muted);
+}
+.step-dot {
+  width: 16px; height: 16px; border-radius: 50%; display: inline-flex; align-items: center;
+  justify-content: center; font-size: 10px; background: var(--panel-2); color: var(--muted);
+}
+.step-done { color: var(--fg); border-color: rgba(63,185,80,.4); }
+.step-done .step-dot { background: var(--pass); color: #0a0e13; }
+.step-active { color: var(--fg); border-color: var(--accent); }
+.step-active .step-dot { background: var(--accent); color: #0a0e13; animation: ob-pulse 1s ease-in-out infinite; }
+.step-failed { color: var(--fail); border-color: rgba(248,81,73,.5); }
+.step-failed .step-dot { background: var(--fail); color: #0a0e13; }
+@keyframes ob-pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+
+.log-details { margin-top: 4px; }
+.log-details > summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-bottom: 6px; }

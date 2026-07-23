@@ -1,0 +1,46 @@
+{# Graphical job view: header + overall bar + phase stepper + collapsible log.
+   Replaces #jobview; self-repolls every 1s WHILE running, drops the trigger
+   once done. #}
+{% set indeterminate = (not prog.determinate) and job.running %}
+{% set fill = 30 if indeterminate else (prog.overall if prog.overall is not none else 100) %}
+<div id="jobview"
+     {% if not done %}hx-get="/jobs/{{ job.id }}/view" hx-trigger="every 1s" hx-swap="outerHTML"{% endif %}>
+
+  <div class="job-head">
+    <span class="pill pill-{{ job.status }}">{{ job.status }}</span>
+    <code>{{ job.task }}</code>
+    <span class="muted">{{ job.target }}</span>
+    <span class="muted elapsed">⏱ {{ elapsed }}</span>
+    {% if job.exit_code is not none %}<span class="muted">exit {{ job.exit_code }}</span>{% endif %}
+    {% if job.running %}
+    <form method="post" action="/jobs/{{ job.id }}/cancel" class="inline-form">
+      <button type="submit" class="btn btn-danger btn-sm">Cancel</button>
+    </form>
+    {% endif %}
+  </div>
+
+  <div class="progress bar-{{ job.status }}{% if indeterminate %} indeterminate{% endif %}">
+    <div class="progress-fill" style="width: {{ fill }}%"></div>
+    {% if prog.overall is not none and not indeterminate %}
+    <span class="progress-label">{{ prog.overall }}%</span>
+    {% endif %}
+  </div>
+
+  {% if prog.has_phases %}
+  <ol class="stepper">
+    {% for ph in prog.phases %}
+    <li class="step step-{{ ph.state }}">
+      <span class="step-dot">
+        {%- if ph.state == "done" %}✓{% elif ph.state == "failed" %}✕{% elif ph.state == "active" %}●{% endif -%}
+      </span>
+      <span class="step-label">{{ ph.label }}</span>
+    </li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+
+  <details class="log-details"{% if job.running and not prog.has_phases %} open{% endif %}>
+    <summary>Log</summary>
+    <pre class="log">{{ log_text }}{% if not log_text %}(no output yet){% endif %}</pre>
+  </details>
+</div>

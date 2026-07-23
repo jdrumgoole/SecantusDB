@@ -419,18 +419,29 @@ def rust_gate(c: Context, pytest: bool = True, deselect: str = "") -> None:
     the full Python suite. This is the sequence that must be green before
     committing Rust work; previously assembled by hand every time.
     """
+    steps = 8 if pytest else 7
+    # ``==> [k/N] label`` phase markers: drive the Ops Board progress stepper
+    # (secantus.opsboard.progress) and give a clear CLI banner per sub-step.
+    print(f"==> [1/{steps}] cargo (clean ws)", flush=True)
     rust_test(c)
+    print(f"==> [2/{steps}] wt crate", flush=True)
     rust_wt_test(c)
+    print(f"==> [3/{steps}] storage crate", flush=True)
     rust_storage_test(c)
+    print(f"==> [4/{steps}] adapter crate", flush=True)
     rust_adapter_test(c)
+    print(f"==> [5/{steps}] parity", flush=True)
     rust_parity(c)
     # Python lint + format — the parity suites are Python, but the cargo
     # fmt/clippy above only cover the Rust workspace, so a ruff slip in a parity
     # test (e.g. a too-long line) would pass the gate and red CI. Mirror CI's
     # `Lint` / `Format check` steps so it's caught before push.
+    print(f"==> [6/{steps}] ruff check", flush=True)
     c.run("uv run ruff check src tests", pty=True)
+    print(f"==> [7/{steps}] ruff format", flush=True)
     c.run("uv run ruff format --check src tests", pty=True)
     if pytest:
+        print(f"==> [8/{steps}] pytest", flush=True)
         cmd = "uv run --no-sync --extra dev --extra admin python -m pytest -q"
         for nodeid in (d for d in deselect.split(",") if d.strip()):
             cmd += f" --deselect {shlex.quote(nodeid.strip())}"
