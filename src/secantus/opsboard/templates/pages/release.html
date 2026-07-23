@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block body %}
+
+<section class="version-panel">
+  <h2>Readiness</h2>
+  <table class="jobs-table">
+    <thead><tr><th>check</th><th>state</th><th>detail</th></tr></thead>
+    <tbody>
+      {% for c in checks %}
+      <tr>
+        <td>{{ c.name }}{% if not c.blocking %} <span class="muted">(advisory)</span>{% endif %}</td>
+        <td><span class="pill pill-{{ 'passed' if c.state == 'ok' else ('failed' if c.state == 'bad' else 'cancelled') }}">{{ c.state }}</span></td>
+        <td class="muted">{{ c.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if blockers %}
+  <p class="release-blocked">
+    ⚠ Release blocked by: {{ blockers | map(attribute='name') | join(', ') }}.
+    Fix these, or tick the override below if you know what you're doing.
+  </p>
+  {% else %}
+  <p class="muted small-note">All blocking checks pass.</p>
+  {% endif %}
+</section>
+
+<section class="version-panel">
+  <h2>Versions</h2>
+  <table class="jobs-table">
+    <thead><tr><th>server</th><th>working tree</th><th>latest tag</th></tr></thead>
+    <tbody>
+      {% for v in versions %}
+      <tr><td>{{ v.target }}</td><td><code>{{ v.local or "—" }}</code></td><td><code>{{ v.latest_tag or "—" }}</code></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="release-panel">
+  <h2>Release actions</h2>
+  <p class="muted page-intro">
+    These are <strong>irreversible and outward-facing</strong> — <code>release-prepare</code>
+    pushes a tag that triggers publication. Each runs the project's own sanctioned
+    <code>invoke</code> task; the board never invents release mechanics. To proceed you must
+    type the exact confirmation string.
+  </p>
+
+  {% for task in tasks %}
+  <form method="post" action="/release/start" class="release-form">
+    <input type="hidden" name="task_key" value="{{ task.key }}" />
+    <h3>{{ task.label }}</h3>
+    <p class="muted release-detail">{{ task.detail or task.blurb }}</p>
+    {% set needs_version = task.key in ("py-release-prepare", "py-release-finalize") %}
+    {% if needs_version %}
+    <label class="release-field">version
+      <input type="text" name="version" placeholder="0.6.0" autocomplete="off" />
+    </label>
+    <label class="release-field">type the version to confirm
+      <input type="text" name="confirm" placeholder="0.6.0" autocomplete="off" />
+    </label>
+    {% else %}
+    <label class="release-field">type <code>{{ task.label }}</code> to confirm
+      <input type="text" name="confirm" placeholder="{{ task.label }}" autocomplete="off" />
+    </label>
+    {% endif %}
+    {% if blockers %}
+    <label class="release-field override">
+      <input type="checkbox" name="override" value="yes" />
+      override {{ blockers | length }} failing readiness check(s)
+    </label>
+    {% endif %}
+    <button type="submit" class="btn btn-danger">Run {{ task.label }}</button>
+  </form>
+  {% endfor %}
+</section>
+{% endblock %}
