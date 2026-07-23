@@ -232,6 +232,54 @@ fn migrate_legacy_docs(session: &Session) -> Result<()> {
     Ok(())
 }
 
+/// Parse the `key_format=<fmt>` value out of a WiredTiger config / `metadata:`
+/// string (`fmt` is a simple token — `SSq`, `SSu`, … — so it stops at the next
+/// comma). Returns `None` if the string has no `key_format` clause.
+fn extract_key_format(cfg: &str) -> Option<&str> {
+    let start = cfg.find("key_format=")? + "key_format=".len();
+    let rest = &cfg[start..];
+    let end = rest.find(',').unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+/// Refuse to open a store whose document shards were written by a build BEFORE
+/// the RecordId doc-table change (see `tasks/backlog.md` §7.8). Those tables are
+/// keyed `SSu` (`(db, coll, id_key)`) with unframed blob values; this build keys
+/// them `SSq` (`(db, coll, RecordId)`) with framed values (see [`frame_doc_value`]).
+/// WiredTiger fixes a table's `key_format` at CREATE time and preserves it across
+/// reopen — the bootstrap `create` is a no-op for an existing table, which is
+/// exactly what lets [`migrate_legacy_docs`] read the legacy table as `SSu` — so
+/// the on-disk schema read here from the `metadata:` cursor is the ground truth.
+///
+/// There is deliberately **no in-place migration**: the two Rust servers are
+/// pre-1.0 beta with no upgrading users, so the correct response to an
+/// incompatible on-disk format is to refuse to open rather than silently mis-read
+/// stored data with `SSq` cursor ops against an `SSu` btree. (A pre-*shard* store
+/// is the separate, supported case — its legacy single `secantus_documents` table
+/// is folded in by [`migrate_legacy_docs`] — so only the sharded doc tables are
+/// inspected here.)
+fn reject_pre_recordid_doc_format(session: &Session) -> Result<()> {
+    let meta = session.open_cursor("metadata:", None)?;
+    for s in 0..DOC_SHARDS {
+        let name = doc_shard_name(s);
+        meta.reset()?;
+        meta.set_key_s(&name);
+        if meta.search().is_ok() {
+            let cfg = meta.get_value_s()?;
+            if extract_key_format(&cfg) == Some("SSu") {
+                return Err(StorageError::Internal(format!(
+                    "SecantusDB storage at this path was written by a build before \
+                     the RecordId doc-table change: '{name}' is keyed 'SSu' but this \
+                     build requires 'SSq'. There is no in-place upgrade (pre-1.0 \
+                     beta, no migration) — start from a fresh data directory or \
+                     downgrade to the build that wrote it."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 const IDX_TABLE: &str = "table:secantus_indexes";
 const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
 
@@ -2121,6 +2169,13 @@ impl Storage {
             for s in 0..DOC_SHARDS {
                 boot.create(&doc_shard_name(s), DOC_TABLE_CFG)?;
             }
+            // Fail fast on a store whose doc shards predate the RecordId keying
+            // change (`SSu` on disk vs the `SSq` this build needs): no in-place
+            // upgrade, refuse to open rather than mis-read. WT `create` above
+            // preserves an existing table's key_format, so the on-disk schema is
+            // intact for this check. (Runs before `migrate_legacy_docs` — that
+            // path is the pre-*shard* case, which this check does not touch.)
+            reject_pre_recordid_doc_format(&boot)?;
             // One-time: fold a pre-shard store's legacy documents rows into the
             // per-collection shards (no-op for a born-sharded store).
             migrate_legacy_docs(&boot)?;
@@ -7888,6 +7943,54 @@ mod tests {
     #[test]
     fn wt_config_matches_default() {
         assert_eq!(wt_config("256M", 1000, false, "128MB"), DEFAULT_CONFIG);
+    }
+
+    /// `extract_key_format` pulls the format token out of a WT metadata line,
+    /// regardless of what other clauses precede it.
+    #[test]
+    fn extract_key_format_parses_the_token() {
+        assert_eq!(
+            extract_key_format("key_format=SSq,value_format=u"),
+            Some("SSq")
+        );
+        assert_eq!(
+            extract_key_format("app_metadata=(x=1),key_format=SSu,value_format=u"),
+            Some("SSu")
+        );
+        assert_eq!(extract_key_format("value_format=u"), None);
+    }
+
+    /// A store whose document shards were written before the RecordId keying
+    /// change (keyed `SSu`, unframed values) must be REFUSED at open, not
+    /// silently mis-read with `SSq` cursor ops. There is no in-place migration
+    /// (pre-1.0 beta) — see `tasks/backlog.md` §7.8.
+    #[test]
+    fn open_rejects_pre_recordid_doc_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("db");
+        std::fs::create_dir_all(&home).unwrap();
+        let home_s = home.to_str().unwrap();
+        // Fabricate the old layout: one documents shard keyed `SSu` with an
+        // unframed value, exactly what a pre-RecordId beta wrote. Same WT config
+        // `Storage` uses, so the reopen fails on our format check, not a config
+        // clash.
+        {
+            let conn = Connection::open(home_s, DEFAULT_CONFIG).unwrap();
+            let sess = conn.open_session().unwrap();
+            sess.create(&doc_shard_name(0), "key_format=SSu,value_format=u")
+                .unwrap();
+            let c = sess.open_cursor(&doc_shard_name(0), None).unwrap();
+            c.set_key_ssu("app", "c", b"\x2bid-key");
+            c.set_value_u(b"raw-unframed-blob");
+            c.insert().unwrap();
+        } // drop closes the fabrication connection before the reopen
+        match Storage::open(home_s) {
+            Err(StorageError::Internal(m)) => {
+                assert!(m.contains("RecordId"), "unexpected message: {m}")
+            }
+            Err(other) => panic!("expected Internal fatal, got: {other:?}"),
+            Ok(_) => panic!("expected open to be refused for an SSu doc shard"),
+        }
     }
 
     /// `sync_on_commit=true` flips `transaction_sync=enabled` to `true`.

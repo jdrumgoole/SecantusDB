@@ -2193,23 +2193,29 @@ threading into `wt_config`.)
   intentional perf tunings, not risks (zlib in fact makes the Rust engine use
   *less* doc-data disk than Python).
 
-### 7.8 RecordId keying (step 1): pre-PR sharded-store in-place upgrade not migrated
+### 7.8 RecordId keying (step 1): pre-PR sharded stores are refused at open (no migration)
 
-- [ ] **A Rust store written by a beta BEFORE the RecordId-keying PR has its doc
-  shard tables keyed `SSq`... no — keyed on the OLD `SSu` (`(db, coll, id_key)`)
-  format with UNFRAMED blob values.** The RecordId PR keys the doc table by a
-  monotonic RecordId (`SSq`) and frames the value as `[u32 id_key_len][id_key][blob]`.
-  WiredTiger fixes a table's `key_format` at CREATE time, so re-opening an old
-  store does NOT auto-convert those shard rows — the new `SSq` cursor ops would
-  mismatch the on-disk `SSu` schema. `migrate_legacy_docs` only converts the
-  pre-*sharding* single `secantus_documents` table (an even older format), not
-  pre-RecordId *sharded* rows. No test exercises this (all reopen/PITR/backup
-  tests write with current code, so their on-disk format is already `SSq`
-  framed), so it's latent. If this format lands in a beta that users upgrade
-  in place, add a shard-generation migration: read each old `SSu` shard, mint
-  RecordIds, write framed `SSq` rows into a fresh shard table generation + the
-  `_id` index, then swap. Acceptable to skip only because the two Rust servers
-  are pre-1.0 beta and this hasn't shipped to upgrading users yet.
+- [x] **A Rust store written by a build BEFORE the RecordId-keying change has its
+  doc shard tables keyed on the OLD `SSu` (`(db, coll, id_key)`) format with
+  UNFRAMED blob values; this build keys them by a monotonic RecordId (`SSq`) with
+  a framed value (`[u32 id_key_len][id_key][blob]`). RESOLVED by fail-fast, not
+  migration (2026-07-23):** WiredTiger fixes a table's `key_format` at CREATE time
+  and preserves it across reopen (the bootstrap `create` is a no-op for an
+  existing table), so `Storage::open` now reads each `secantus_documents_sh{s}`
+  table's on-disk `key_format` from the WT `metadata:` cursor
+  (`reject_pre_recordid_doc_format` + `extract_key_format`, using the new
+  `secantus-wt` `Cursor::get_value_s`) and returns a fatal `StorageError::Internal`
+  if any shard is `SSu` — the server refuses to start rather than mis-read data
+  with `SSq` cursor ops against an `SSu` btree. **Deliberately no in-place
+  migration:** the two Rust servers are pre-1.0 beta with no upgrading users, so
+  refusing an incompatible on-disk store is the correct, safe behaviour (per the
+  "never mis-read stored data" rule). `migrate_legacy_docs` still handles the
+  separate, supported pre-*shard* case (the legacy single `secantus_documents`
+  table). If RecordId ever ships to users who must upgrade in place, THEN add a
+  shard-generation migration (read each old `SSu` shard, mint RecordIds, write
+  framed `SSq` rows into a fresh shard-table generation + the `_id` index, swap).
+  Test: `open_rejects_pre_recordid_doc_shard` (fabricates an `SSu` shard, asserts
+  open is refused).
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 
