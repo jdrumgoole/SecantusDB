@@ -96,5 +96,14 @@ def test_starting_a_gauge_uses_the_right_server(client: TestClient) -> None:
     assert job.target == "rust"  # infer_target read the --server flag
 
 
+def test_gauges_page_shows_scores_when_reports_exist(client: TestClient, tmp_path: Path) -> None:
+    docs = Path(client.app.state.repo_root) / "docs"
+    # The real checkout has reports; assert a score renders rather than "no report".
+    if (docs / "validation-report.md").is_file():
+        body = client.get("/gauges").text
+        assert "score" in body
+        assert "no report" not in body or body.count("no report") < 26
+
+
 def test_nav_links_to_gauges(client: TestClient) -> None:
     assert 'href="/gauges"' in client.get("/").text

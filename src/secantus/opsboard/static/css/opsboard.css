@@ -198,3 +198,9 @@ code { font-family: "SF Mono", ui-monospace, Menlo, monospace; }
   border-radius: 8px; padding: 8px 12px; background: rgba(248,81,73,.08);
 }
 .external-panel { margin-top: 28px; }
+
+/* ---- gauge scores ---- */
+.score { font-size: 12px; font-variant-numeric: tabular-nums; margin-top: 3px; }
+.score-clean { color: var(--pass); }
+.score-dirty { color: var(--run); }
+.score-age { font-size: 10px; margin-top: 1px; }

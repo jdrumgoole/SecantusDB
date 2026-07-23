@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-from secantus.opsboard import registry
+from secantus.opsboard import registry, reports
 from secantus.opsboard.estimates import estimate_for
 
 router = APIRouter()
@@ -29,7 +29,11 @@ def gauges_page(request: Request) -> HTMLResponse:
             if task is None:  # pragma: no cover - registry is generated
                 continue
             est = estimate_for(journal.completed_durations(task.argv, limit=20), task.est_seconds)
-            per_server[server] = {"task": task, "est": est}
+            per_server[server] = {
+                "task": task,
+                "est": est,
+                "report": reports.load(request.app.state.repo_root, spec.key, server),
+            }
         rows.append({"spec": spec, "servers": per_server})
 
     return request.app.state.templates.TemplateResponse(

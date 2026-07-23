@@ -34,6 +34,15 @@
             <button type="submit" class="btn btn-sm" title="{{ cell.task.blurb }}">Run</button>
           </form>
           <span class="est-chip" title="{{ cell.est.qualifier }}">{{ cell.est.text }}</span>
+          {% if cell.report %}
+          <div class="score {{ 'score-clean' if cell.report.clean else 'score-dirty' }}"
+               title="{{ cell.report.passed }} passed, {{ cell.report.failed }} failed{% if cell.report.errored %}, {{ cell.report.errored }} errored{% endif %}, {{ cell.report.skipped }} skipped of {{ cell.report.total }} — from docs/{{ cell.report.path }}, generated {{ cell.report.generated }}">
+            {{ cell.report.summary }}
+          </div>
+          <div class="score-age muted">{{ cell.report.generated }}</div>
+          {% else %}
+          <div class="score-age muted">no report</div>
+          {% endif %}
           {% endif %}
         </td>
       {% endfor %}
