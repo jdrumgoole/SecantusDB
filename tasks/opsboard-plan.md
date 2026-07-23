@@ -4,35 +4,48 @@ A standalone FastAPI + HTMX + pywebview app (`src/secantus/opsboard`, mirroring
 `src/secantus/admin`) that drives **and** observes the **build → test → release**
 cycle for the three server deliverables from one panel.
 
-## Status
+## Status — ALL PHASES LANDED (2026-07-23)
 
-- **Phase 1 (skeleton) + Phase 2 (shared `jobkit` runner + journal + `./inv`
-  repoint + jobs UI) — LANDED** on branch `opsboard` (2026-07-23). 27 tests
-  green (`tests/test_jobkit.py`, `tests/test_opsboard.py`); ruff clean; real
-  socket boot + `./inv` tracked/untracked paths smoke-verified.
-  - `src/secantus/jobkit/` — stdlib-only `_core.py` (Journal + pty-tee
-    `run_tracked`), loaded by `./inv` by file path (import-light invariant
-    verified: `secantus` stays unimported).
-  - `./inv` repointed through jobkit; `SECANTUS_NO_TRACK=1` is the untracked
-    escape hatch; bare `uv run inv` untracked.
-  - `src/secantus/opsboard/` — FastAPI + HTMX app (dashboard cards, jobs list
-    with cursor pagination, job detail with live log-tail, cancel), token
-    middleware, `invoke opsboard` task, `[opsboard]` extra, `secantus-opsboard`
-    console script. Release-class tasks are disabled on the dashboard (they
-    await the Phase 5 confirm-gated Release page); the server-side confirm gate
-    is already enforced.
-  - `opsboard/config.py` — layered config (`OpsboardConfig`): CLI flag > env
-    var > saved JSON config (`~/.secantus/opsboard.json`, `--save`) > default.
-    Every persistable setting has an env var (`SECANTUS_OPSBOARD_HOST` / `_PORT`
-    / `_REPO_ROOT` / `_NO_WINDOW` / `_DB` / `_LOGS` / `_CONFIG`); token is a
-    secret kept out of the file (`--token` / `SECANTUS_OPSBOARD_TOKEN` /
-    `opsboard-token` file). `argparse` CLI adds `--host/--port/--repo-root/
-    --window/--no-window/--db-path/--log-dir/--config/--save/--print-config`.
-    `export_env()` propagates the journal/log locations to spawned `./inv`
-    children so the whole host agrees on where the journal lives.
-- **Phases 3–6 pending:** Build/Test pages (all gates + gauges data-driven),
-  GitHub/PyPI observation (Tier 1 tracking), Release page + Tier 3 discovery,
-  docs.
+All six phases are on `main`. Shipped in PRs #615 (skeleton + `jobkit`), #616
+(invoke task flags), #617 (progress + cancel + all-gauges), #619 (info dialogs +
+estimates) and #627 (which carried phases 3–6 together; #622 / #625 / #626 were
+its stacked ancestors and closed as superseded).
+
+- **Phase 1–2 — skeleton + shared runner.** `src/secantus/jobkit/` is a
+  stdlib-only `_core.py` (Journal + pty-tee `run_tracked`) that `./inv` loads by
+  file path, so tracking stays build-free in an unsynced worktree (the
+  import-light invariant is asserted by a test: `secantus` stays unimported).
+  `SECANTUS_NO_TRACK=1` and bare `uv run inv` are the untracked escape hatches.
+  `src/secantus/opsboard/` is the FastAPI + HTMX app (dashboard, jobs with
+  cursor pagination, job detail, cancel), token middleware, `invoke opsboard`,
+  the `[opsboard]` extra and the `secantus-opsboard` console script, plus
+  `config.py`'s layered config (CLI > env > saved JSON > default) with an env var
+  for every persistable setting and the token kept out of the file.
+- **Phase 3 — gauge matrix.** `/gauges` renders all thirteen driver gauges ×
+  both servers, generated from the declared `registry.GAUGES` catalog (not 26
+  hand-written entries), each with its required toolchain, a time estimate and
+  an info dialog.
+- **Phase 4 — CI + version drift.** `/ci` lists recent GitHub Actions runs via
+  an injectable, TTL-cached, bounded `gh` wrapper that degrades rather than
+  breaking; `versions.py` reports working-tree vs latest-tag drift for both
+  independently-versioned servers, local-only (no network).
+- **Phase 5 — release + Tier-3 discovery.** `/release` gates on a readiness
+  checklist with a **fail-safe** policy (a blocking check must be definitively
+  `ok`; `unknown` blocks too) plus a typed-version confirmation, and only ever
+  runs the project's sanctioned invoke tasks. `discovery.py` surfaces build
+  processes started outside `./inv`, honestly limited to command + elapsed.
+- **Phase 6 — docs.** `docs/opsboard.md`, in the Sphinx toctree beside `admin`.
+
+### Known gaps (deliberate, not oversights)
+
+- **Gauge report parsing** — the matrix runs gauges but does not parse
+  `docs/validation-report*.md` to show pass/fail/skip rates. This is the most
+  natural next feature.
+- **No dedicated Build page** — build tasks live on the dashboard cards.
+- **No PyPI lookup** in version drift — local tags only, so the panel never
+  depends on the network.
+- **Log streaming is HTMX polling, not SSE** — simpler and robust in WKWebView.
+- **Cancel and process discovery are POSIX-only** (process groups / `ps`).
 
 Decisions locked (2026-07-23):
 
