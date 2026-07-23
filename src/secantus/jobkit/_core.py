@@ -220,6 +220,10 @@ class Journal:
         with self._connect() as conn:
             conn.execute("UPDATE jobs SET log_path = ? WHERE id = ?", (log_path, job_id))
 
+    def set_host_pid(self, job_id: int, host_pid: int) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE jobs SET host_pid = ? WHERE id = ?", (host_pid, job_id))
+
     def finish(
         self,
         job_id: int,
@@ -367,6 +371,10 @@ def run_tracked(
     Records a row in the shared journal, tees the child's whole terminal
     output to a per-job logfile, and updates the row on exit. This is the one
     entrypoint both the CLI wrapper and the web app funnel through.
+
+    When ``SECANTUS_OPSBOARD_JOB_ID`` is set (the web app pre-creates the row so
+    it knows the id synchronously — no flaky pid-poll race), this run adopts
+    that row instead of creating a new one.
     """
     argv = list(argv)
     worktree = worktree or os.getcwd()
@@ -377,13 +385,19 @@ def run_tracked(
     log_dir = default_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    job_id = journal.create(
-        target=target,
-        task=task,
-        argv=argv,
-        worktree=worktree,
-        host_pid=os.getpid(),
-    )
+    # Pop so a nested grandchild (the invoke task) never inherits it.
+    preassigned = os.environ.pop("SECANTUS_OPSBOARD_JOB_ID", None)
+    if preassigned is not None:
+        job_id = int(preassigned)
+        journal.set_host_pid(job_id, os.getpid())
+    else:
+        job_id = journal.create(
+            target=target,
+            task=task,
+            argv=argv,
+            worktree=worktree,
+            host_pid=os.getpid(),
+        )
     log_path = log_dir / f"job-{job_id}.log"
     journal.set_log_path(job_id, str(log_path))
 

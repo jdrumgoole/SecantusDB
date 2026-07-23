@@ -13,10 +13,9 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
-from secantus.jobkit import Job, Journal
+from secantus.jobkit import Job, Journal, infer_target
 
 
 class JobRunner:
@@ -33,37 +32,39 @@ class JobRunner:
         # hosting the web app (same env → secantus + uv resolvable).
         self.python = python or sys.executable
 
-    def start(self, argv: list[str], *, wait_for_id: float = 5.0) -> Job:
-        """Spawn a tracked job detached; return its journal row once visible.
+    def start(self, argv: list[str]) -> Job:
+        """Spawn a tracked job detached; return its journal row immediately.
 
-        The child (jobkit) creates the journal row and owns the logfile, so we
-        poll the journal for the row whose ``host_pid`` is the child's pid. The
-        job keeps running even if the web window closes — it's a detached
+        The row is created HERE (so the id is known synchronously — no
+        pid-poll race, which was slow/flaky on Windows CI) and its id is passed
+        to the jobkit child via ``SECANTUS_OPSBOARD_JOB_ID``; the child adopts
+        it, records its own pid, tees the logfile, and finishes the row on exit.
+        The job keeps running even if the web window closes — it's a detached
         process writing to the shared journal + logfile.
         """
+        task = argv[0] if argv else "?"
+        job_id = self.journal.create(
+            target=infer_target(task, argv),
+            task=task,
+            argv=argv,
+            worktree=self.repo_root,
+            host_pid=os.getpid(),  # placeholder (alive); child overwrites it
+        )
+        env = os.environ.copy()
+        env["SECANTUS_OPSBOARD_JOB_ID"] = str(job_id)
         proc = subprocess.Popen(
             [self.python, "-m", "secantus.jobkit", *argv],
             cwd=self.repo_root,
-            env=os.environ.copy(),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,  # detached; survives window close
+            start_new_session=True,  # detached; survives window close (POSIX)
         )
-        deadline = time.monotonic() + wait_for_id
-        while time.monotonic() < deadline:
-            for job in self.journal.running():
-                if job.host_pid == proc.pid:
-                    return job
-            if proc.poll() is not None:
-                break  # child exited before we saw the row
-            time.sleep(0.02)
-        # Fall back to whatever the child recorded (it may already be finished
-        # for a very fast/failed task).
-        for job in reversed(self.journal.list(limit=20)[0]):
-            if job.host_pid == proc.pid:
-                return job
-        raise RuntimeError(f"job for pid {proc.pid} never appeared in the journal")
+        self.journal.set_host_pid(job_id, proc.pid)
+        job = self.journal.get(job_id)
+        assert job is not None
+        return job
 
     def cancel(self, job_id: int) -> bool:
         """Signal a running job's process group (SIGINT, escalating to TERM).
