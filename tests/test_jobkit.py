@@ -26,13 +26,22 @@ from secantus.jobkit import (
 
 # A stand-in for `uv run ... python -m invoke`: prints its argv and exits with
 # the trailing integer (so a test can force a pass/fail code deterministically).
-_FAKE_INVOKE = (
-    "import sys; "
-    "args = sys.argv[1:]; "
-    "print('CHILD-RAN', *args); "
-    "code = int(args[-1]) if args and args[-1].lstrip('-').isdigit() else 0; "
-    "sys.exit(code)"
-)
+# Written to a FILE (not python -c) so the SECANTUS_OPSBOARD_INVOKE override
+# round-trips through shlex on Windows (where -c quoting would break).
+_FAKE_INVOKE_FILE = """\
+import sys
+
+args = sys.argv[1:]
+print("CHILD-RAN", *args)
+code = int(args[-1]) if args and args[-1].lstrip("-").isdigit() else 0
+sys.exit(code)
+"""
+
+
+def _write_fake_invoke(tmp_path: Path) -> str:
+    fake = tmp_path / "fake_invoke.py"
+    fake.write_text(_FAKE_INVOKE_FILE)
+    return f"{sys.executable} {fake}"
 
 
 @pytest.fixture
@@ -44,7 +53,7 @@ def journal(tmp_path: Path) -> Journal:
 def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SECANTUS_OPSBOARD_DB", str(tmp_path / "opsboard.db"))
     monkeypatch.setenv("SECANTUS_OPSBOARD_LOGS", str(tmp_path / "logs"))
-    monkeypatch.setenv("SECANTUS_OPSBOARD_INVOKE", f"{sys.executable} -c {_FAKE_INVOKE!r}")
+    monkeypatch.setenv("SECANTUS_OPSBOARD_INVOKE", _write_fake_invoke(tmp_path))
 
 
 # --------------------------------------------------------------------------- #

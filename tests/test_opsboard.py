@@ -21,20 +21,25 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _TEMPLATES = _REPO_ROOT / "src/secantus/opsboard/templates"
 _STATIC = _REPO_ROOT / "src/secantus/opsboard/static"
 
-_FAKE_INVOKE = (
-    "import sys; "
-    "args = sys.argv[1:]; "
-    "print('CHILD-RAN', *args); "
-    "code = int(args[-1]) if args and args[-1].lstrip('-').isdigit() else 0; "
-    "sys.exit(code)"
-)
+# Written to a FILE (not python -c) so the override round-trips through shlex on
+# Windows (where -c quoting would break the split).
+_FAKE_INVOKE_FILE = """\
+import sys
+
+args = sys.argv[1:]
+print("CHILD-RAN", *args)
+code = int(args[-1]) if args and args[-1].lstrip("-").isdigit() else 0
+sys.exit(code)
+"""
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SECANTUS_OPSBOARD_DB", str(tmp_path / "opsboard.db"))
     monkeypatch.setenv("SECANTUS_OPSBOARD_LOGS", str(tmp_path / "logs"))
-    monkeypatch.setenv("SECANTUS_OPSBOARD_INVOKE", f"{sys.executable} -c {_FAKE_INVOKE!r}")
+    fake = tmp_path / "fake_invoke.py"
+    fake.write_text(_FAKE_INVOKE_FILE)
+    monkeypatch.setenv("SECANTUS_OPSBOARD_INVOKE", f"{sys.executable} {fake}")
 
 
 @pytest.fixture

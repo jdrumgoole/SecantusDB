@@ -309,6 +309,24 @@ def _row_to_job(row: sqlite3.Row) -> Job:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":  # pragma: no cover - Windows-only path
+        # os.kill(pid, 0) raises WinError 87 ("parameter is incorrect") on
+        # Windows — signal 0 isn't valid there. Probe via OpenProcess instead.
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -331,7 +349,9 @@ def _invoke_prefix() -> list[str]:
     if override:
         import shlex
 
-        return shlex.split(override)
+        # posix=False on Windows so backslash path separators in the override
+        # (e.g. C:\...\python.exe) survive the split.
+        return shlex.split(override, posix=(os.name != "nt"))
     return ["uv", "run", "--no-sync", "--with", "invoke", "python", "-m", "invoke"]
 
 
