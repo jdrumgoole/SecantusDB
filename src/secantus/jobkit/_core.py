@@ -25,7 +25,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import pty
 import signal
 import sqlite3
 import subprocess
@@ -35,6 +34,15 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+# pty (and its termios dependency) is POSIX-only. On Windows the module import
+# must still succeed — the runner falls back to a plain pipe (no colour, but
+# fully functional). The Ops Board targets macOS/Linux; this just keeps the
+# package importable and the tests collectable everywhere.
+try:
+    import pty as _pty
+except ModuleNotFoundError:  # pragma: no cover - exercised on Windows CI only
+    _pty = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Locations (overridable via env so tests never touch the real home dir).
@@ -361,7 +369,7 @@ def run_tracked(
 
     cmd = [*_invoke_prefix(), *argv]
     try:
-        code = _run_pty(cmd, cwd=worktree, log_path=log_path, echo=echo)
+        code = _run_child(cmd, cwd=worktree, log_path=log_path, echo=echo)
     except BaseException:
         journal.finish(job_id, 1)
         raise
@@ -369,15 +377,46 @@ def run_tracked(
     return code
 
 
+def _run_child(cmd: Sequence[str], *, cwd: str, log_path: Path, echo: bool) -> int:
+    """Run ``cmd``, teeing its output to ``log_path``. pty where available."""
+    if _pty is not None:
+        return _run_pty(cmd, cwd=cwd, log_path=log_path, echo=echo)
+    return _run_pipe(cmd, cwd=cwd, log_path=log_path, echo=echo)
+
+
+def _run_pipe(cmd: Sequence[str], *, cwd: str, log_path: Path, echo: bool) -> int:
+    """No-pty fallback (Windows): capture via a pipe and tee to the logfile.
+
+    Loses terminal colour but keeps the journal + live-tailable log intact.
+    """
+    with open(log_path, "wb") as logf:
+        proc = subprocess.Popen(
+            list(cmd),
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+        assert proc.stdout is not None
+        for chunk in iter(lambda: proc.stdout.read(65536), b""):
+            logf.write(chunk)
+            logf.flush()
+            if echo:
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+        proc.wait()
+    return proc.returncode
+
+
 def _run_pty(cmd: Sequence[str], *, cwd: str, log_path: Path, echo: bool) -> int:
-    """Run ``cmd`` with its stdio on a pty; tee output to ``log_path``.
+    """Run ``cmd`` with its stdout/stderr on a pty; tee output to ``log_path``.
 
     The pty makes child tools believe they're on a terminal (colour, progress
     bars), and mirrors everything to both the real stdout and the logfile the
     UI tails. SIGINT/SIGTERM are forwarded to the child's process group so a
     Ctrl-C (or a UI cancel that signals this wrapper) stops the whole tree.
     """
-    master, slave = pty.openpty()
+    master, slave = _pty.openpty()
     on_main = threading.current_thread() is threading.main_thread()
     old_handlers: dict[int, object] = {}
 

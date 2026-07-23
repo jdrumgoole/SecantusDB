@@ -187,6 +187,9 @@ sys.exit(0 if ok else 3)
 """
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="pty is POSIX-only (Windows uses the pipe fallback)"
+)
 def test_run_tracked_does_not_give_child_a_broken_pty_stdin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -203,6 +206,22 @@ def test_run_tracked_does_not_give_child_a_broken_pty_stdin(
     assert job.status == PASSED
     log = Path(job.log_path).read_text()
     assert "STDOUT_TTY True" in log  # pty still drives stdout
+
+
+def test_run_tracked_pipe_fallback_when_no_pty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Force the no-pty path (what Windows uses) and confirm it still journals +
+    # tees the child's output.
+    from secantus.jobkit import _core
+
+    monkeypatch.setattr(_core, "_pty", None)
+    journal = Journal(tmp_path / "opsboard.db")
+    code = run_tracked(["pipe", "0"], journal=journal, echo=False)
+    assert code == 0
+    job = journal.list()[0][0]
+    assert job.status == PASSED
+    assert "CHILD-RAN" in Path(job.log_path).read_text()
 
 
 def test_run_tracked_sets_started_and_ended(tmp_path: Path) -> None:
