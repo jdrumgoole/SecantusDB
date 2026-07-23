@@ -15,4 +15,23 @@
     {% include "partials/job_rows.html" %}
   </tbody>
 </table>
+
+{% if external %}
+<section class="external-panel">
+  <h2>External processes <span class="muted">· not started via <code>./inv</code></span></h2>
+  <p class="muted small-note">
+    Discovered by scanning the process table. We didn't spawn these, so there's no
+    log to attach to — command and elapsed time only. Start a build with
+    <code>./inv &lt;task&gt;</code> to get it fully tracked with a live log.
+  </p>
+  <table class="jobs-table">
+    <thead><tr><th>pid</th><th>elapsed</th><th>command</th></tr></thead>
+    <tbody>
+      {% for p in external %}
+      <tr><td>{{ p.pid }}</td><td class="muted">{{ p.elapsed }}</td><td><code>{{ p.short_command }}</code></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
 {% endblock %}

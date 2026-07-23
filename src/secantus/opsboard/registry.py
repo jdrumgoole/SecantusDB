@@ -371,9 +371,213 @@ PG = Target(
     ],
 )
 
+# --------------------------------------------------------------------------- #
+# Driver-conformance gauges.
+#
+# Thirteen upstream driver suites, run UNMODIFIED against SecantusDB. Declared
+# as data (not hand-written Task entries) so the gauge matrix page can render
+# every gauge × server combination without a hardcoded capability table.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class GaugeSpec:
+    key: str  # short id, e.g. "go"
+    label: str  # display name, e.g. "mongo-go-driver"
+    task: str  # invoke task name, e.g. "validate-go"
+    detail: str
+    needs: str = ""  # local toolchain requirement, shown in the dialog
+    est_seconds: int = 600
+
+
+GAUGES: list[GaugeSpec] = [
+    GaugeSpec(
+        "pymongo",
+        "pymongo",
+        "validate",
+        "pymongo's own vendored test suite, unmodified — the same tests "
+        "pymongo's CI runs against a real mongod. This is the honest "
+        "'MongoDB compatibility' number. Runs an embedded SecantusDB inside "
+        "the pytest process (not a daemon subprocess). Serial by default, "
+        "which is how the published figure is measured.",
+        needs="none (embedded)",
+        est_seconds=600,
+    ),
+    GaugeSpec(
+        "pymongo-async",
+        "pymongo (async)",
+        "validate-pymongo-async",
+        "pymongo's native AsyncMongoClient suite — the async/await wire path "
+        "that replaced Motor — against the same embedded server, driven by "
+        "pytest-asyncio. Scope mirrors the sync gauge's server-touching set, "
+        "restricted to files that have an asynchronous/ variant.",
+        needs="none (embedded)",
+        est_seconds=600,
+    ),
+    GaugeSpec(
+        "go",
+        "mongo-go-driver",
+        "validate-go",
+        "The Go driver's suite. Go is type-strict where pymongo is permissive "
+        "(cursor.id MUST be int64, not int32), so this catches wire-protocol "
+        "bugs the pymongo gauge cannot — one of the two strictest gauges. The "
+        "Go driver also underpins mongodump/mongorestore, so if it works here "
+        "the broader ecosystem does. Known load flake: TestIndexView / "
+        "TestChangeStream time out on a saturated machine — run it alone.",
+        needs="go 1.21+",
+        est_seconds=900,
+    ),
+    GaugeSpec(
+        "node",
+        "node-mongodb-native",
+        "validate-node",
+        "The Node driver's mocha suite (one-time npm install + bundle build). "
+        "The include set is restricted to the import-clean subset of unit "
+        "tests: v7.2.0 has 68 files using extensionless ESM imports that need "
+        "a non-trivial loader chain, and patching their .mocharc would defeat "
+        "the unmodified-submodule property — so it trades coverage for honesty.",
+        needs="Node.js >= 20",
+        est_seconds=900,
+    ),
+    GaugeSpec(
+        "java",
+        "mongo-java-driver",
+        "validate-java",
+        "Runs the driver's own Gradle modules against the daemon via "
+        "-Dorg.mongodb.test.uri, then harvests JUnit XML out of the build "
+        "tree (leaving the submodule untouched). Include set is :bson:test "
+        "(~289 BSON serialization files); the integration modules need a real "
+        "replica-set topology. Needs a JDK (javac), not just a JRE, and Gradle "
+        "8.12 can't run on JDK 24+ — the runner auto-selects openjdk@17.",
+        needs="JDK 17 (javac)",
+        est_seconds=1200,
+    ),
+    GaugeSpec(
+        "kotlin",
+        "mongo-kotlin-driver",
+        "validate-kotlin",
+        "The official Kotlin driver, which ships inside the Java monorepo, so "
+        "it reuses the same vendored submodule and JDK/Gradle toolchain. "
+        "Targets :driver-kotlin-sync:integrationTest rather than :test — the "
+        "unit tree is Mockito-mocked and never opens a socket, while the "
+        "integration tree exchanges real wire commands.",
+        needs="JDK 17 (javac)",
+        est_seconds=1200,
+    ),
+    GaugeSpec(
+        "ruby",
+        "mongo-ruby-driver",
+        "validate-ruby",
+        "The Ruby driver's rspec suite, restricted to specs that require the "
+        "'lite' spec helper. Mixing in any full-spec_helper file poisons the "
+        "run: it triggers a global authorized-client setup that fails SCRAM-256 "
+        "against our unauthenticated daemon. Results go to a file, not stdout, "
+        "because Mongo::Logger would corrupt JSON capture.",
+        needs="Ruby >= 2.7 + bundler",
+        est_seconds=900,
+    ),
+    GaugeSpec(
+        "rust",
+        "mongo-rust-driver",
+        "validate-rust",
+        "The Rust driver's test suite against a SecantusDB daemon over "
+        "MONGODB_URI. (Note: this is the Rust *driver* as a client — not the "
+        "Rust server; use the --server switch to choose which server it "
+        "tests against.)",
+        needs="cargo / rustc",
+        est_seconds=900,
+    ),
+    GaugeSpec(
+        "php-lib",
+        "mongo-php-library",
+        "validate-php-lib",
+        "The high-level mongodb/mongodb PHPUnit suite over the curated "
+        "functional directories (Operation / Collection / Database / Command "
+        "plus pure-code units). Excludes the cross-driver spec corpus, GridFS "
+        "and doc examples — they need orchestration SecantusDB can't provide.",
+        needs="PHP >= 8.1 + mongodb ext + composer",
+        est_seconds=900,
+    ),
+    GaugeSpec(
+        "php-ext",
+        "mongo-php-driver (.phpt)",
+        "validate-php-ext",
+        "The low-level PECL mongodb C extension wrapping libmongoc — the "
+        "strictest wire-protocol gauge alongside Go. Runs .phpt tests against "
+        "the ALREADY-INSTALLED extension, so the vendored submodule tag must "
+        "match the installed extension version or version-sensitive tests "
+        "diverge. Tests self-guard by topology, so RS/transaction/CSFLE "
+        "cases skip cleanly.",
+        needs="PHP >= 8.1 + mongodb ext (version-matched)",
+        est_seconds=600,
+    ),
+    GaugeSpec(
+        "c",
+        "mongo-c-driver",
+        "validate-c",
+        "libmongoc's own test-libmongoc suite, built from source. Along with "
+        "Go and the PHP extension, one of the strictest wire-protocol checks — "
+        "a C driver makes no allowances for a permissive server.",
+        needs="C toolchain + cmake (builds from source)",
+        est_seconds=1500,
+    ),
+    GaugeSpec(
+        "cxx",
+        "mongo-cxx-driver",
+        "validate-cxx",
+        "The mongocxx Catch2 test_driver, built from source. NOTE: this gauge "
+        "binds port 27017 — mongocxx's tests hard-wire the default URI with no "
+        "env override — so it can't share a host with anything else on 27017 "
+        "and must stay serial in validate-all.",
+        needs="C++ toolchain + cmake (builds from source; uses port 27017)",
+        est_seconds=1500,
+    ),
+    GaugeSpec(
+        "dotnet",
+        "mongo-csharp-driver",
+        "validate-dotnet",
+        "The C#/.NET driver's MongoDB.Driver.Tests CRUD-spec suite via "
+        "dotnet test. Needs gpg as well as the .NET SDK, because the driver's "
+        "Encryption project verifies a downloaded libmongocrypt with gpg at "
+        "build time.",
+        needs=".NET SDK + gpg",
+        est_seconds=1200,
+    ),
+]
+
+SERVERS: list[tuple[str, str]] = [("python", "Python server"), ("rust", "Rust server")]
+
+
+def _gauge_task(spec: GaugeSpec, server: str) -> Task:
+    needs = f"\n\nRequires locally: {spec.needs}." if spec.needs else ""
+    return Task(
+        key=f"gauge-{spec.key}-{server}",
+        label=spec.label,
+        argv=[spec.task, "--server", server],
+        phase="test",
+        blurb=f"{spec.label} gauge against the {server} server.",
+        detail=f"{spec.detail}{needs}",
+        est_seconds=spec.est_seconds,
+    )
+
+
+GAUGE_TASKS: list[Task] = [
+    _gauge_task(spec, server) for spec in GAUGES for server, _name in SERVERS
+]
+
+
+def gauge_task(spec_key: str, server: str) -> Task | None:
+    return _TASK_BY_KEY.get(f"gauge-{spec_key}-{server}", (None, None))[1]
+
+
 TARGETS: list[Target] = [PYTHON, RUST, PG]
 _BY_KEY = {t.key: t for t in TARGETS}
-_TASK_BY_KEY = {task.key: (t, task) for t in TARGETS for task in t.tasks}
+_TASK_BY_KEY: dict[str, tuple[Target | None, Task]] = {
+    task.key: (t, task) for t in TARGETS for task in t.tasks
+}
+# Gauge tasks are startable/resolvable too, but live on the gauge matrix page
+# rather than the dashboard cards (26 combinations would drown the cards).
+_TASK_BY_KEY.update({task.key: (None, task) for task in GAUGE_TASKS})
 
 
 def target(key: str) -> Target | None:

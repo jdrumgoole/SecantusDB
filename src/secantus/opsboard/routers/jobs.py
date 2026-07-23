@@ -11,7 +11,7 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from secantus.jobkit import PASSED
-from secantus.opsboard import registry
+from secantus.opsboard import discovery, registry
 from secantus.opsboard.progress import parse_progress
 
 router = APIRouter()
@@ -49,6 +49,9 @@ def jobs_page(request: Request, before: int | None = None) -> HTMLResponse:
             "jobs": jobs,
             "next_cursor": next_cursor,
             "running_count": len(journal.running()),
+            "external": discovery.scan(
+                known_pids=[j.host_pid for j in journal.running()], limit=25
+            ),
         },
     )
 

@@ -214,6 +214,7 @@ sql
 change-streams
 authentication
 admin
+opsboard
 recovery
 production
 concurrency
