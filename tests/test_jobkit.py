@@ -174,6 +174,37 @@ def test_run_tracked_records_failure_exit_code(tmp_path: Path) -> None:
     assert jobs[0].exit_code == 7
 
 
+_TTY_PROBE = """\
+import os, sys
+ok = True
+if os.isatty(0):
+    try:
+        os.tcgetpgrp(0)
+    except OSError:
+        ok = False  # stdin is a broken pty slave — the regression we guard
+print("STDIN_OK", ok, "STDOUT_TTY", os.isatty(1))
+sys.exit(0 if ok else 3)
+"""
+
+
+def test_run_tracked_does_not_give_child_a_broken_pty_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: stdin must be inherited, not the pty slave. A pty-slave stdin
+    # made downstream `invoke` tasks crash in os.tcgetpgrp() under CI. stdout
+    # must still be a pty (colours). The probe exits 3 if stdin is a broken pty.
+    probe = tmp_path / "tty_probe.py"
+    probe.write_text(_TTY_PROBE)
+    monkeypatch.setenv("SECANTUS_OPSBOARD_INVOKE", f"{sys.executable} {probe}")
+    journal = Journal(tmp_path / "opsboard.db")
+    code = run_tracked(["probe"], journal=journal, echo=False)
+    assert code == 0  # would be 3 if stdin were the pty slave
+    job = journal.list()[0][0]
+    assert job.status == PASSED
+    log = Path(job.log_path).read_text()
+    assert "STDOUT_TTY True" in log  # pty still drives stdout
+
+
 def test_run_tracked_sets_started_and_ended(tmp_path: Path) -> None:
     journal = Journal(tmp_path / "opsboard.db")
     before = time.time()

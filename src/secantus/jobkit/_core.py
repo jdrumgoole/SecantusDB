@@ -385,7 +385,13 @@ def _run_pty(cmd: Sequence[str], *, cwd: str, log_path: Path, echo: bool) -> int
         proc = subprocess.Popen(
             list(cmd),
             cwd=cwd,
-            stdin=slave,
+            # The pty drives stdout/stderr ONLY (so child tools believe they're
+            # on a terminal → colour/progress). stdin is INHERITED, never the
+            # pty slave: giving a downstream `invoke` task a pty-slave stdin made
+            # it think it owned a foreground tty and crash in os.tcgetpgrp()
+            # ("Inappropriate ioctl for device") under CI. Inherited stdin is a
+            # non-tty in CI (invoke skips the tty path) and the real terminal
+            # for an interactive `./inv`.
             stdout=slave,
             stderr=slave,
             close_fds=True,
