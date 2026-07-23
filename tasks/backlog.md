@@ -2193,6 +2193,24 @@ threading into `wt_config`.)
   intentional perf tunings, not risks (zlib in fact makes the Rust engine use
   *less* doc-data disk than Python).
 
+### 7.8 RecordId keying (step 1): pre-PR sharded-store in-place upgrade not migrated
+
+- [ ] **A Rust store written by a beta BEFORE the RecordId-keying PR has its doc
+  shard tables keyed `SSq`... no — keyed on the OLD `SSu` (`(db, coll, id_key)`)
+  format with UNFRAMED blob values.** The RecordId PR keys the doc table by a
+  monotonic RecordId (`SSq`) and frames the value as `[u32 id_key_len][id_key][blob]`.
+  WiredTiger fixes a table's `key_format` at CREATE time, so re-opening an old
+  store does NOT auto-convert those shard rows — the new `SSq` cursor ops would
+  mismatch the on-disk `SSu` schema. `migrate_legacy_docs` only converts the
+  pre-*sharding* single `secantus_documents` table (an even older format), not
+  pre-RecordId *sharded* rows. No test exercises this (all reopen/PITR/backup
+  tests write with current code, so their on-disk format is already `SSq`
+  framed), so it's latent. If this format lands in a beta that users upgrade
+  in place, add a shard-generation migration: read each old `SSu` shard, mint
+  RecordIds, write framed `SSq` rows into a fresh shard table generation + the
+  `_id` index, then swap. Acceptable to skip only because the two Rust servers
+  are pre-1.0 beta and this hasn't shipped to upgrading users yet.
+
 ## SQL / PostgreSQL interface — P0 spike limitations
 
 - [ ] **Cross-type comparisons evaluate to false instead of erroring.** A per-row

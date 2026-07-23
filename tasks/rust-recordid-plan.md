@@ -9,10 +9,55 @@ silent data loss.** Build incrementally; each step is its own gated PR.
 
 ## HANDOFF — current state (2026-07-23)
 
-**Branch `rust-recordid-step1` (worktree `../SecantusDB-recordid`).** Foundation of
-step 1 is implemented + tested: **23/32 storage crate tests pass** (WIP commit
-`1a195595`; this doc committed after). Core write + `_id` point-read of RecordId
-keying work. **Paused deliberately on a design fork (see "⚠ DESIGN FORK" below).**
+**Branch `rust-recordid-step1` (worktree `../SecantusDB-recordid`).**
+
+### ✅ Step-1 storage layer COMPLETE — full storage crate green
+Option 2 (id_key framed into the doc-table value) is implemented and the **entire
+`secantus-storage` crate test suite passes** (32/32 lib + every integration suite:
+crud / batch_insert / lifecycle / ttl / capped / concurrent_reads / durable-reopen /
+archive / restore / oplog-prune). `cargo fmt --check` + `cargo clippy --all-targets
+-- -D warnings` clean.
+
+What landed (all in `crates/secantus-storage/src/lib.rs`):
+- `frame_doc_value(id_key, blob)` / `unframe_doc_value(value)` — value framed as
+  `[u32-LE id_key_len][id_key][blob]`; `type ScannedDoc = (i64, Vec<u8>, Vec<u8>)`.
+- `scan_docs` walks the doc table (SSq) directly and returns `(RecordId, id_key,
+  blob)` via unframe — natural (insertion) order, no `_id` decode, timeseries-safe.
+  `scan_docs_natural` DELETED; `scan_blobs`/`scan_blobs_natural` delegate to it.
+- Every doc-table WRITE frames the value + keys by RecordId (`set_key_ssq`):
+  insert_one, batch insert, replace_by_id, update (doc stays at its RecordId), upsert
+  (mint RecordId FIRST), rename/clone (re-mint per doc in src natural order).
+- Every doc-table READ/DELETE resolves `id_key → doc_recordid → RecordId` then
+  unframes: find_by_id, scan_collection, candidate_docs (index-routed fetch),
+  docs_by_id_keys (IXSCAN), delete_by_id, delete_matching, prune_ttl,
+  enforce_capped_bounds (all keep "doc row first, entries after" — recordid read via
+  read-only `doc_recordid`, `_id`-index row dropped last by `delete_nat_entry`).
+- `scan_max_nat_seq` now scans the doc **shards** for the max RecordId (the forward
+  `NAT_TABLE` it used is gone) so `next_nat_seq` recovers correctly on reopen — this
+  fixed the reopen/restore WT_DUPLICATE_KEY + zero-count failures.
+- `migrate_legacy_docs` (pre-shard single-table path) re-frames + RecordId-keys +
+  writes the `_id` index.
+- **Behaviour change**: `scan_collection` now returns **insertion (RecordId) order**,
+  not `_id` order — this matches mongod's natural order and what `find()` already
+  returned via `scan_blobs_natural`. Test `scan_is_in_cross_type_natural_order`
+  renamed → `scan_is_in_natural_insertion_order` and updated.
+
+### Remaining before merge (wider gates — NOT yet run)
+- `./inv rust-gate` (clean workspace fmt/clippy/test — secantus-core etc. unchanged,
+  should be green) + `./inv rust-server-build` (needs `vendor/wiredtiger` submodule
+  checked out in the worktree — was being inited).
+- `./inv validate --server rust` (pymongo gauge, in a sub-agent) — must stay
+  non-regressing.
+- `tests/test_mongo_server_concurrency.py` integrity suite against the rust server.
+- A note for a real in-place upgrade of a **pre-PR sharded beta store** (doc shards
+  keyed SSu, unframed): WT fixes key_format at create time so those rows are NOT
+  auto-migrated by the current code (no test covers it; the fresh-code reopen tests
+  all pass). If we ship this to beta users mid-stream, add a shard-generation
+  migration. → add to `tasks/backlog.md` §7 before merge.
+
+### Prior foundation notes (superseded by the above)
+Core write + `_id` point-read of RecordId keying worked at 23/32; the design fork is
+now resolved and implemented — see "✅ DESIGN FORK — DECIDED" below for the design.
 
 ### Done (in `crates/secantus-storage/src/lib.rs`)
 - `DOC_TABLE_CFG` key_format `SSu` → `SSq` — doc table keyed by RecordId (i64), not
