@@ -169,7 +169,7 @@ def test_run_tracked_records_pass_and_tees_log(tmp_path: Path) -> None:
     assert job.target == "other"
     # The child's output was teed to the per-job logfile.
     assert job.log_path is not None
-    log = Path(job.log_path).read_text()
+    log = Path(job.log_path).read_text(encoding="utf-8")
     assert "CHILD-RAN" in log
     assert "greet" in log
 
@@ -213,7 +213,7 @@ def test_run_tracked_does_not_give_child_a_broken_pty_stdin(
     assert code == 0  # would be 3 if stdin were the pty slave
     job = journal.list()[0][0]
     assert job.status == PASSED
-    log = Path(job.log_path).read_text()
+    log = Path(job.log_path).read_text(encoding="utf-8")
     assert "STDOUT_TTY True" in log  # pty still drives stdout
 
 
@@ -230,7 +230,7 @@ def test_run_tracked_pipe_fallback_when_no_pty(
     assert code == 0
     job = journal.list()[0][0]
     assert job.status == PASSED
-    assert "CHILD-RAN" in Path(job.log_path).read_text()
+    assert "CHILD-RAN" in Path(job.log_path).read_text(encoding="utf-8")
 
 
 def test_run_tracked_sets_started_and_ended(tmp_path: Path) -> None:

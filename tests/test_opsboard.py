@@ -94,7 +94,9 @@ def test_dashboard_renders_all_targets(client: TestClient) -> None:
 def test_no_runtime_cdn_dependencies_in_templates() -> None:
     forbidden = ("cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com", "https://")
     for tmpl in _TEMPLATES.rglob("*.html"):
-        body = tmpl.read_text()
+        # utf-8 explicitly: templates carry non-ASCII glyphs (⏱ ⇉ ✓ …) that a
+        # Windows locale (cp1252) default would fail to decode.
+        body = tmpl.read_text(encoding="utf-8")
         for needle in forbidden:
             assert needle not in body, f"{tmpl.name} references {needle}"
 
