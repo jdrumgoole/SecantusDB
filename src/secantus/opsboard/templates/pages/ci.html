@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block body %}
+
+<section class="version-panel">
+  <h2>Version drift</h2>
+  <table class="jobs-table">
+    <thead><tr><th>server</th><th>working tree</th><th>latest tag</th><th>state</th></tr></thead>
+    <tbody>
+      {% for v in versions %}
+      <tr>
+        <td>{{ v.target }}</td>
+        <td><code>{{ v.local or "—" }}</code></td>
+        <td><code>{{ v.latest_tag or "—" }}</code></td>
+        <td><span class="pill pill-{{ 'passed' if v.drift == 'clean' else ('running' if v.drift == 'ahead' else 'cancelled') }}">{{ v.drift }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted small-note">
+    Read from the working tree and local tags — <code>git fetch</code> first if
+    another session may have pushed a tag.
+  </p>
+</section>
+
+<section class="ci-panel">
+  <h2>Recent workflow runs <span class="muted">· {{ repo }}</span></h2>
+  {% if gh_error %}
+  <p class="muted gh-error">
+    GitHub Actions data unavailable: <code>{{ gh_error }}</code><br />
+    The <code>gh</code> CLI must be installed and authenticated
+    (<code>gh auth login</code>) for this panel.
+  </p>
+  {% elif not runs %}
+  <p class="muted">No recent runs.</p>
+  {% else %}
+  <table class="jobs-table">
+    <thead><tr><th>workflow</th><th>branch</th><th>event</th><th>state</th><th>started</th></tr></thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <td>{% if run.url %}<a href="{{ run.url }}" target="_blank" rel="noreferrer">{{ run.name }}</a>{% else %}{{ run.name }}{% endif %}</td>
+        <td><code>{{ run.branch }}</code></td>
+        <td class="muted">{{ run.event }}</td>
+        <td>
+          <span class="pill pill-{{ {'running':'running','success':'passed','failure':'failed'}.get(run.bucket, 'cancelled') }}">
+            {{ run.conclusion or run.status }}
+          </span>
+        </td>
+        <td class="muted">{{ run.created_at[:16].replace("T", " ") }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted small-note">Showing the {{ limit }} most recent runs, cached briefly.</p>
+  {% endif %}
+</section>
+{% endblock %}
