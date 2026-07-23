@@ -10,7 +10,83 @@ Goal (Joe): "redesign the rust server so it approaches MongoDB performance." The
 storage engine under both is the same WiredTiger 7.0.33, so every gap lives
 *above* WT.
 
+## UPDATE (2026-07-23): the 2026-07-22 VERDICT below was measured under hidden CPU contention — partly overturned
+
+Two things invalidate the framing of the VERDICT immediately below. Read this first.
+
+### 1. The "thermal throttling" was ~24 orphaned Claude Code shells, not heat
+Every absolute number in the 2026-07-22 VERDICT (and much of §1–§3) was taken on a
+box that had **leaked `zsh` shell-snapshot processes** (PPID 1, from prior/parallel
+sessions, up to 26h old) spinning at ~50% CPU each — **11 of 12 cores gone, load
+average ~40.** They accumulated in groups over the session, so contention *varied*,
+which is why some A/B rounds read clean and others "throttled." Detection + kill
+recipe is in the `orphaned-claude-shells-eat-cpu` memory (`uptime`; kill PPID-1
+`shell-snapshots/snapshot-zsh` procs). After clearing them, **load fell 40→~3 and
+the single-writer bench baseline rose from ~13k to ~28k.**
+
+**Consequences for this doc's numbers:**
+- The **true idle single-writer baseline is ~25–28k**, not the 22,479 in the VERDICT
+  table. Ratios from *back-to-back same-contention* A/B rounds are roughly OK, but
+  every **absolute** figure and any cross-run comparison here is suspect.
+- The clean rust-vs-mongod multiple is therefore **smaller than the stated 5–6×**
+  (both sides were contention-suppressed by different amounts at different times).
+  Re-run the direct A/B on a verified-idle box (load < 4) before trusting any gap
+  figure.
+
+### 2. A per-op lever DID land — the VERDICT's core claim is wrong
+The VERDICT says "every avenue was tried… none touches the per-op multiple; parity
+is a property of the execution engine, not a lever we can pull." **Falsified.** The
+**raw-BSON write path shipped as #608** (2026-07-23, on `main` as `aa578dcc`) and
+measured, on a **verified-idle** box (load ~3, 4 alternating rounds):
+
+| writers | baseline | raw-write | Δ |
+|---|---|---|---|
+| 1 | 25,131 | 27,863 | **+10.9%** |
+| 4 | 59,709 | 63,183 | **+5.8%** |
+| 8 | 65,431 | 64,925 | −0.8% (flat) |
+
+It removes 3 of the 5 per-document BSON ser/de round-trips (merge-decode →
+crud `encode_doc` → storage `decode_doc` → storage `encode_doc` → oplog encode):
+the server diverts an insert's kind-1 `documents` un-decoded to the handler, which
+passes the client's bytes straight to storage, stored **verbatim** when `_id`
+leads. This is a genuine per-op efficiency win *above* WT — exactly the kind the
+VERDICT said didn't exist. It goes flat at 8 writers because the insert workload
+becomes **WAL/disk-bound** at high concurrency, so the saved CPU stops mattering.
+
+### 3. Threads ARE effective (corrects §-narrative)
+Un-throttled (contention cleared), the server uses **~3.8 cores at 4 writers, ~4.5
+at 8**, and scales 1→8 writers with the same sublinear shape as mongod (both flatten
+~4w). The earlier "37% CPU / threads blocked on eviction" reading was the contention
+artifact, not a threading or eviction bug.
+
+### 4. Levers re-scored on clean measurement
+- **Raw-BSON write path — SHIPPED (#608), +11%/+6%/flat.** The real win of this cycle.
+- **Raw oplog `o` splice ("increment 3")** — built + fully validated (gauge unchanged
+  99.5%, change streams 106/0/100%, `fullDocument` byte-identical) but clean A/B
+  measured **~+1% = noise**: the oplog write is **WAL/disk-bound, not encode-bound.**
+  **DROPPED**; parked on branch `rust-raw-oplog-splice`. Do not re-chase unless the
+  WAL itself is first made cheaper.
+- **WT cache size (auto-size like mongod)** — **+6% at 4w, minor** (measured; NOT the
+  "burst artifact" the old finding-6 claimed, but also NOT the gap; a CPU-utilisation
+  proxy over-predicted it — throughput is the only metric that counts). Low-risk,
+  worth shipping + fixing benchmark fairness, not a parity move.
+- **RecordId keying (Lever A)** — still the standing +15%-concurrency lever, still
+  highest-risk; re-evaluate its reward *after* a clean baseline, since a right-sized
+  cache + the raw-write path change the eviction/ser-de picture it was relieving.
+
+### 5. Standing lesson
+**Never trust a perf number on this Mac without `uptime` (load < 4) + an orphaned-
+shell check first.** The whole "parity unreachable" conclusion leaned on numbers a
+contaminated machine produced.
+
+---
+
 ## VERDICT (2026-07-22): mongod write-parity is NOT reachable for this architecture
+
+> **⚠️ Superseded in part — see the 2026-07-23 UPDATE above.** Measured under hidden
+> CPU contention; the absolute numbers are suppressed and claim #2 (no per-op lever
+> exists) is falsified by shipped #608. Kept below for the reasoning and the
+> still-valid *shape* observations (both servers peak ~4w), not the absolute gap.
 
 A clean, **direct side-by-side** rust-vs-mongod A/B (both on this 12-core box, same
 run, un-throttle-verified) settles it:
