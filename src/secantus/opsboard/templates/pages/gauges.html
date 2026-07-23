@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block body %}
+<p class="muted page-intro">
+  Thirteen upstream driver suites, run <strong>unmodified</strong> against SecantusDB.
+  The pymongo rate is the headline MongoDB-compatibility number; the other-language
+  gauges catch wire-protocol bugs pymongo's permissive client misses. Each needs its
+  driver's toolchain installed locally.
+</p>
+
+<table class="jobs-table gauge-table">
+  <thead>
+    <tr>
+      <th>gauge</th>
+      <th>requires</th>
+      {% for server, name in servers %}<th>{{ name }}</th>{% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>
+        <span class="gauge-name">{{ row.spec.label }}</span>
+        <button type="button" class="btn-info" aria-label="About {{ row.spec.label }}"
+                title="What is this gauge?"
+                onclick="document.getElementById('dlg-gauge-{{ row.spec.key }}').showModal()">i</button>
+      </td>
+      <td class="muted needs-cell">{{ row.spec.needs }}</td>
+      {% for server, _name in servers %}
+        {% set cell = row.servers.get(server) %}
+        <td>
+          {% if cell %}
+          <form method="post" action="/jobs/start" class="task-form">
+            <input type="hidden" name="task_key" value="{{ cell.task.key }}" />
+            <button type="submit" class="btn btn-sm" title="{{ cell.task.blurb }}">Run</button>
+          </form>
+          <span class="est-chip" title="{{ cell.est.qualifier }}">{{ cell.est.text }}</span>
+          {% endif %}
+        </td>
+      {% endfor %}
+    </tr>
+
+    <dialog id="dlg-gauge-{{ row.spec.key }}" class="task-dialog">
+      <h3>{{ row.spec.label }}</h3>
+      <p class="dialog-cmd"><code>./inv {{ row.spec.task }} --server &lt;python|rust&gt;</code></p>
+      <p class="dialog-detail">{{ row.spec.detail }}</p>
+      {% if row.spec.needs %}
+      <p class="dialog-est"><strong>Requires locally:</strong> {{ row.spec.needs }}</p>
+      {% endif %}
+      {% for server, name in servers %}
+        {% set cell = row.servers.get(server) %}
+        {% if cell %}
+        <p class="dialog-est">
+          <strong>{{ name }}:</strong> {{ cell.est.text }}
+          <span class="muted">({{ cell.est.qualifier }})</span>
+        </p>
+        {% endif %}
+      {% endfor %}
+      <form method="dialog" class="dialog-actions"><button class="btn">Close</button></form>
+    </dialog>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
