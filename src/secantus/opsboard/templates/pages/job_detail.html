@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% from "partials/status_pill.html" import pill %}
+{% block body %}
+<div class="job-meta">
+  <div>{{ pill(job.status) }} <code>{{ job.task }}</code> <span class="muted">({{ job.target }})</span></div>
+  <div class="muted">argv: <code>{{ job.argv | join(" ") }}</code></div>
+  <div class="muted">worktree: <code>{{ job.worktree }}</code> · pid {{ job.host_pid }}</div>
+  {% if job.running %}
+  <form method="post" action="/jobs/{{ job.id }}/cancel">
+    <button type="submit" class="btn btn-danger">Cancel</button>
+  </form>
+  {% endif %}
+</div>
+
+{# Log tail: self-repolls every second WHILE running; the partial stops
+   emitting the trigger once the job is done. #}
+<div id="logbox"
+     hx-get="/jobs/{{ job.id }}/log"
+     hx-trigger="load{% if job.running %}, every 1s{% endif %}"
+     hx-swap="outerHTML">
+  <pre class="log">loading…</pre>
+</div>
+{% endblock %}

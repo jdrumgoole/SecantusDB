@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% from "partials/status_pill.html" import pill %}
+{% block body %}
+<section class="cards">
+  {% for target in targets %}
+  <article class="card">
+    <header class="card-head">
+      <h2>{{ target.name }}</h2>
+      <p class="subtitle">{{ target.subtitle }}</p>
+    </header>
+    {% for phase in ["build", "test", "release"] %}
+      {% set tasks = target.by_phase(phase) %}
+      {% if tasks %}
+      <div class="phase">
+        <h3>{{ phase }}</h3>
+        <div class="task-buttons">
+          {% for task in tasks %}
+          {% if task.confirm %}
+          {# Release-class: irreversible / outward-facing. Not startable from the
+             dashboard — the confirm-gated Release page (Phase 5) owns these. #}
+          <button type="button" class="btn btn-danger" disabled
+                  title="{{ task.blurb }} — release page (requires confirmation)">
+            {{ task.label }} ⚠
+          </button>
+          {% else %}
+          <form method="post" action="/jobs/start" class="task-form">
+            <input type="hidden" name="task_key" value="{{ task.key }}" />
+            <button type="submit" class="btn" title="{{ task.blurb }}">{{ task.label }}</button>
+          </form>
+          {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+    {% endfor %}
+  </article>
+  {% endfor %}
+</section>
+
+<section class="recent">
+  <h2>Recent jobs <a class="muted-link" href="/jobs">view all →</a></h2>
+  {% if recent %}
+  <table class="jobs-table">
+    <thead><tr><th>#</th><th>target</th><th>task</th><th>status</th></tr></thead>
+    <tbody>
+      {% for job in recent %}
+      <tr>
+        <td><a href="/jobs/{{ job.id }}">{{ job.id }}</a></td>
+        <td>{{ job.target }}</td>
+        <td><code>{{ job.task }}</code></td>
+        <td>{{ pill(job.status) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No jobs yet. Start one from a card above, or run <code>./inv &lt;task&gt;</code> in a terminal.</p>
+  {% endif %}
+</section>
+{% endblock %}

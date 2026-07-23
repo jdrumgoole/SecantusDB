@@ -4,7 +4,7 @@
 `uv` (and the project's pinned Python) usually live in Homebrew / ~/.local/bin,
 which a bare shell may not have on PATH — so every invoke call otherwise needs an
 `export PATH=...` prefix. This script prepends those dirs (only if they exist and
-aren't already present) and execs the canonical runner.
+aren't already present) and runs the canonical runner.
 
     ./inv rust-gate
     ./inv validate-one <nodeid> --server rust
@@ -12,35 +12,77 @@ aren't already present) and execs the canonical runner.
 is equivalent to:
 
     uv run --no-sync python -m invoke rust-gate
+
+**Job tracking (Ops Board).** By default every ``./inv <task>`` is run as a
+*journaled job*: the SecantusDB jobkit records it in a shared sqlite journal
+and tees its whole terminal output to a per-job logfile, so the Ops Board web
+app — and any other session — can watch its progress live. This wrapper loads
+``src/secantus/jobkit/_core.py`` **by file path** (never ``import secantus``,
+which would drag in WiredTiger) so tracking stays build-free in an unsynced
+worktree, exactly like the pure-Python lint/fmt tasks it already supported.
+
+Set ``SECANTUS_NO_TRACK=1`` to bypass tracking and exec the plain runner
+directly (the untracked escape hatch; ``uv run inv`` is untracked too).
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 
 _EXTRA_PATH = ["/opt/homebrew/bin", os.path.expanduser("~/.local/bin")]
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_JOBKIT_CORE = os.path.join(_HERE, "src", "secantus", "jobkit", "_core.py")
 
 
-def main() -> None:
+def _fix_path() -> None:
     current = os.environ.get("PATH", "")
     parts = current.split(os.pathsep)
     prefix = [d for d in _EXTRA_PATH if os.path.isdir(d) and d not in parts]
     if prefix:
         os.environ["PATH"] = os.pathsep.join(prefix + parts)
+
+
+def _exec_untracked() -> None:
     # --no-sync: don't trigger a multi-minute CMake/WiredTiger rebuild just to
     #   run a task.
     # --with invoke: layer invoke into the run env so this works even in a fresh
-    #   git worktree whose `.venv` was never synced (it has no `invoke` yet, and
-    #   installing one would kick off the WiredTiger build). Pure-Python tasks
-    #   (lint / fmt) then run with zero project build; tasks that genuinely need
-    #   the compiled `secantus` (test / rust / validate) still require a built
-    #   `.venv` and fail with a clear ImportError if run before one exists.
+    #   git worktree whose `.venv` was never synced.
     # exec so signals (Ctrl-C) reach uv/invoke directly.
     os.execvp(
         "uv",
         ["uv", "run", "--no-sync", "--with", "invoke", "python", "-m", "invoke", *sys.argv[1:]],
     )
+
+
+def _load_jobkit_core():  # noqa: ANN202 (standalone script, no package types)
+    """Load jobkit._core standalone, WITHOUT importing the heavy secantus pkg."""
+    spec = importlib.util.spec_from_file_location("_secantus_jobkit_core", _JOBKIT_CORE)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec so ``@dataclass`` can resolve its own (stringised,
+    # PEP 563) annotations against this module's namespace.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def main() -> None:
+    _fix_path()
+    if os.environ.get("SECANTUS_NO_TRACK") or not sys.argv[1:]:
+        _exec_untracked()
+        return
+    core = None
+    try:
+        core = _load_jobkit_core()
+    except Exception:  # pragma: no cover - defensive: never let tracking break inv
+        core = None
+    if core is None:
+        _exec_untracked()
+        return
+    sys.exit(core.run_tracked(sys.argv[1:]))
 
 
 if __name__ == "__main__":

@@ -383,6 +383,33 @@ def admin(
 
 @task(
     help={
+        "port": "Local HTTP port (0 = pick a free one).",
+        "no_window": "Run headless (no pywebview window). Useful for CI.",
+        "token": "Override the auth token. Default: ~/.secantus/opsboard-token.",
+    }
+)
+def opsboard(
+    c: Context,
+    port: int = 0,
+    no_window: bool = False,
+    token: str = "",
+) -> None:
+    """Launch the SecantusDB Ops Board web UI.
+
+    Drives the build/test/release cycle for all three servers. Uses
+    ``--extra opsboard`` so uv pulls in fastapi / uvicorn / pywebview on
+    first run; the base wheel deliberately doesn't ship them.
+    """
+    cmd = ["uv", "run", "--extra", "opsboard", "secantus-opsboard", "--port", str(port)]
+    if no_window:
+        cmd.append("--no-window")
+    if token:
+        cmd.extend(["--token", token])
+    c.run(" ".join(cmd), pty=True)
+
+
+@task(
+    help={
         "server": (
             "Which SecantusDB server the gauge runs against: 'python' (the "
             "pure-Python SecantusDBServer; the headline gauge, default) or "
