@@ -7,9 +7,11 @@ dependency on ``uv``/``invoke`` being resolvable in the test env.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,6 +21,7 @@ from secantus.jobkit import (
     PASSED,
     RUNNING,
     Journal,
+    _core,
     infer_target,
     run_tracked,
     status_for_exit,
@@ -172,6 +175,41 @@ def test_run_tracked_records_pass_and_tees_log(tmp_path: Path) -> None:
     log = Path(job.log_path).read_text(encoding="utf-8")
     assert "CHILD-RAN" in log
     assert "greet" in log
+
+
+def test_run_tracked_tees_log_when_child_exits_before_first_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that finishes before the parent's first pty read keeps its output.
+
+    Regression guard for a macOS/BSD pty behaviour: when the parent closes the
+    slave so the child holds the only one, the child exiting makes ``read()`` on
+    the master return EIO and **discard whatever is still buffered** — so the job
+    log came back empty while the exit code / journal row were all correct
+    (`assert 'CHILD-RAN' in ''`). Linux delivers the buffered bytes before EIO,
+    which is why only macOS CI reddened, and only under xdist load (the parent
+    has to lose the race). Reaping the child before the read loop starts makes
+    that deterministic: pre-fix this failed every run, post-fix it passes every
+    run.
+    """
+    real_popen = subprocess.Popen
+
+    def late_popen(*args: Any, **kwargs: Any) -> Any:
+        proc = real_popen(*args, **kwargs)
+        proc.wait()  # child has exited AND closed its end of the pty
+        time.sleep(0.05)
+        return proc
+
+    monkeypatch.setattr(_core.subprocess, "Popen", late_popen)
+
+    journal = Journal(tmp_path / "opsboard.db")
+    code = run_tracked(["greet", "0"], journal=journal, echo=False)
+    assert code == 0
+
+    jobs, _ = journal.list()
+    assert jobs[0].log_path is not None
+    log = Path(jobs[0].log_path).read_text(encoding="utf-8")
+    assert "CHILD-RAN" in log, f"child output was lost; log={log!r}"
 
 
 def test_run_tracked_records_failure_exit_code(tmp_path: Path) -> None:
