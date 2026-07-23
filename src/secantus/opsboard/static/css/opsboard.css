@@ -169,3 +169,11 @@ code { font-family: "SF Mono", ui-monospace, Menlo, monospace; }
 
 .log-details { margin-top: 4px; }
 .log-details > summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+
+/* ---- CI monitor / version drift ---- */
+.version-panel, .ci-panel { margin-bottom: 28px; }
+.version-panel h2, .ci-panel h2 { font-size: 15px; margin: 0 0 8px; }
+.small-note { font-size: 11px; margin: 6px 2px 0; }
+.gh-error { font-size: 12px; line-height: 1.6; border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; background: var(--panel); }
+.ci-panel a { color: var(--accent); text-decoration: none; }
