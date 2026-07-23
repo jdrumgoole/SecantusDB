@@ -129,7 +129,12 @@ fn run(cli: CliArgs) -> Result<(), String> {
     // Open with the resolved WiredTiger knobs (--cache-size / --session-max /
     // --sync-on-commit). The daemon default is `1G` (matching the Python
     // server); the engine/library default via `Storage::open` stays `256M`.
-    let wt = wt_config(&cli.cache_size, cli.session_max, cli.sync_on_commit);
+    let wt = wt_config(
+        &cli.cache_size,
+        cli.session_max,
+        cli.sync_on_commit,
+        &cli.log_file_max,
+    );
     let mut storage = Storage::open_with_config(&cli.storage_path, &wt)
         .map_err(|e| format!("failed to open storage at {}: {e:?}", cli.storage_path))?;
     storage.set_enable_oplog(true);

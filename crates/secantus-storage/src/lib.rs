@@ -658,9 +658,14 @@ const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
 /// `false`) — see the `wt_config_matches_default` test. The `secantusdb`
 /// binary passes the resolved `cache_size` (Python's default is `"1G"`), while
 /// the embedded / library default stays `256M` via [`Storage::open`].
-pub fn wt_config(cache_size: &str, session_max: u32, sync_on_commit: bool) -> String {
+pub fn wt_config(
+    cache_size: &str,
+    session_max: u32,
+    sync_on_commit: bool,
+    log_file_max: &str,
+) -> String {
     format!(
-        "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max=128MB,prealloc=false),transaction_sync=(enabled={},method=fsync)",
+        "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max={log_file_max},prealloc=false),transaction_sync=(enabled={},method=fsync)",
         if sync_on_commit { "true" } else { "false" }
     )
 }
@@ -7835,15 +7840,16 @@ mod tests {
     /// `DEFAULT_CONFIG` string so `Storage::open` behaviour is unchanged.
     #[test]
     fn wt_config_matches_default() {
-        assert_eq!(wt_config("256M", 1000, false), DEFAULT_CONFIG);
+        assert_eq!(wt_config("256M", 1000, false, "128MB"), DEFAULT_CONFIG);
     }
 
     /// `sync_on_commit=true` flips `transaction_sync=enabled` to `true`.
     #[test]
     fn wt_config_sync_on_commit() {
-        let s = wt_config("1G", 200, true);
+        let s = wt_config("1G", 200, true, "2GB");
         assert!(s.contains("cache_size=1G"));
         assert!(s.contains("session_max=200"));
+        assert!(s.contains("log=(enabled=true,file_max=2GB,prealloc=false)"));
         assert!(s.contains("transaction_sync=(enabled=true,method=fsync)"));
     }
 

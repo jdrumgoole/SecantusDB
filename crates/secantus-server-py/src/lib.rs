@@ -97,7 +97,10 @@ impl RustServer {
         // handle so tests can exercise non-default WiredTiger configs.
         let mut storage = Storage::open_with_config(
             storage_path,
-            &wt_config(&cache_size, session_max, sync_on_commit),
+            // Embedded handle keeps the 128MB log default (many ephemeral in-process
+            // instances in a test suite must not each carry a big sparse log); the
+            // standalone daemon opts into 2GB for write throughput.
+            &wt_config(&cache_size, session_max, sync_on_commit, "128MB"),
         )
         .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
         storage.set_enable_oplog(enable_oplog);
