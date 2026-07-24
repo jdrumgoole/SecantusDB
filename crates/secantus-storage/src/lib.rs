@@ -280,6 +280,53 @@ fn reject_pre_recordid_doc_format(session: &Session) -> Result<()> {
     Ok(())
 }
 
+/// Refuse to open a store whose index entries predate the RecordId entry format
+/// (step 2). Those entries carry the doc's `id_key` in their trailing half; this
+/// build reads that half as an 8-byte RecordId. Unlike the step-1 doc-table
+/// change this is NOT visible in WiredTiger's `key_format` (still `SSSu` either
+/// way) — the difference is inside the value bytes — so the index catalog
+/// carries an explicit `options.entryFormat` marker and its absence is the
+/// signal.
+///
+/// There is deliberately **no migration**: the Rust servers are pre-1.0 beta
+/// with no upgrading users, so refusing to open beats re-packing every index
+/// entry on a path that has to be perfect. (`unpack_entry` already returns
+/// `None` for a legacy entry rather than mis-reading it, so nothing fetches the
+/// wrong document even before this fires — this turns a silent
+/// nothing-matches into a loud refusal.)
+fn reject_legacy_index_entry_format(session: &Session) -> Result<()> {
+    let c = match session.open_cursor(IDX_TABLE, None) {
+        Ok(c) => c,
+        Err(e) if e.is_not_found() => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut more = c.next()?;
+    while more {
+        let (db, coll, name) = c.get_key_sss()?;
+        let blob = c.get_value_u()?;
+        if !blob.is_empty() {
+            let d = decode_doc(&blob)?;
+            let fmt = d
+                .get_document("options")
+                .ok()
+                .and_then(|o| o.get_i32("entryFormat").ok())
+                .unwrap_or(1);
+            if fmt < ENTRY_FORMAT_RECORDID {
+                return Err(StorageError::Internal(format!(
+                    "SecantusDB storage at this path has index entries written by a \
+                     build before the RecordId index-entry change: index '{name}' on \
+                     '{db}.{coll}' is entryFormat {fmt}, but this build requires \
+                     {ENTRY_FORMAT_RECORDID}. There is no in-place upgrade (pre-1.0 \
+                     beta, no migration) — start from a fresh data directory, drop and \
+                     recreate the indexes, or downgrade to the build that wrote it."
+                )));
+            }
+        }
+        more = c.next()?;
+    }
+    Ok(())
+}
+
 const IDX_TABLE: &str = "table:secantus_indexes";
 const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
 
@@ -1153,6 +1200,14 @@ fn escape_kb(kb: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+/// On-disk index-ENTRY format version, recorded per index as
+/// `options.entryFormat` in the index catalog. 1 (implicit, absent) = step-1
+/// entries whose trailing half is the doc's `id_key`; 2 = step-2 entries whose
+/// trailing half is the 8-byte RecordId. The catalog is the only place this is
+/// visible — the WT `key_format` is `SSSu` either way — so an absent marker is
+/// how a legacy store is detected (`reject_legacy_index_entry_format`).
+const ENTRY_FORMAT_RECORDID: i32 = 2;
 
 /// Pack an index-entry payload into a single trailing `u` column:
 /// `escape(kb) + b"\x00\x00" + RecordId(8B big-endian)`. WiredTiger
@@ -2178,6 +2233,9 @@ impl Storage {
             // intact for this check. (Runs before `migrate_legacy_docs` — that
             // path is the pre-*shard* case, which this check does not touch.)
             reject_pre_recordid_doc_format(&boot)?;
+            // Same fail-fast for the index-ENTRY format (step 2). Runs after the
+            // doc-table check so the more fundamental mismatch is reported first.
+            reject_legacy_index_entry_format(&boot)?;
             // One-time: fold a pre-shard store's legacy documents rows into the
             // per-collection shards (no-op for a born-sharded store).
             migrate_legacy_docs(&boot)?;
@@ -4610,6 +4668,11 @@ impl Storage {
         }
 
         let mut stored_options = options.clone();
+        // Stamp the entry format so a later build can tell step-2 entries from
+        // step-1 ones. Not a user option: `listIndexes` strips it (like
+        // `multikey`), and the options-conflict check compares only the
+        // enumerated user-facing options, so it never provokes a false conflict.
+        stored_options.insert("entryFormat", ENTRY_FORMAT_RECORDID);
         let entries: Vec<(Vec<u8>, i64)> = if let Some(geo) = &geo {
             // 2d geo index: one geohash cell per point-valued doc. Always flagged
             // multikey so the regular (numeric) pickers skip it.
@@ -7988,6 +8051,58 @@ mod tests {
     /// change (keyed `SSu`, unframed values) must be REFUSED at open, not
     /// silently mis-read with `SSq` cursor ops. There is no in-place migration
     /// (pre-1.0 beta) — see `tasks/backlog.md` §7.8.
+    /// A store whose index entries predate the RecordId entry format must be
+    /// REFUSED at open. Unlike the doc-table change this is invisible to WT's
+    /// `key_format`, so the catalog's `entryFormat` marker is the only signal —
+    /// strip it and the store must be rejected rather than reading `id_key`
+    /// bytes as RecordIds.
+    #[test]
+    fn open_rejects_legacy_index_entry_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("db");
+        std::fs::create_dir_all(&home).unwrap();
+        let home_s = home.to_str().unwrap();
+        {
+            let st = Storage::open(home_s).unwrap();
+            st.insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 1i32, "x": 7i32}).unwrap()],
+                true,
+            )
+            .unwrap();
+            st.create_index("app", "c", "x_1", &doc! {"x": 1i32}, &Document::new())
+                .unwrap();
+        }
+        // Downgrade the catalog row to a step-1 store: same bytes, marker removed.
+        {
+            let conn = Connection::open(home_s, DEFAULT_CONFIG).unwrap();
+            let sess = conn.open_session().unwrap();
+            let c = sess.open_cursor(IDX_TABLE, None).unwrap();
+            c.set_key_sss("app", "c", "x_1");
+            c.search().unwrap();
+            let mut d = decode_doc(&c.get_value_u().unwrap()).unwrap();
+            let mut opts = d.get_document("options").cloned().unwrap_or_default();
+            assert_eq!(
+                opts.get_i32("entryFormat").ok(),
+                Some(ENTRY_FORMAT_RECORDID)
+            );
+            opts.remove("entryFormat");
+            d.insert("options", Bson::Document(opts));
+            c.reset().unwrap();
+            c.set_key_sss("app", "c", "x_1");
+            c.set_value_u(&encode_doc(&d).unwrap());
+            c.update().unwrap();
+        }
+        match Storage::open(home_s) {
+            Err(StorageError::Internal(m)) => {
+                assert!(m.contains("entryFormat"), "unexpected message: {m}")
+            }
+            Err(other) => panic!("expected Internal fatal, got: {other:?}"),
+            Ok(_) => panic!("expected open to be refused for a step-1 index entry format"),
+        }
+    }
+
     #[test]
     fn open_rejects_pre_recordid_doc_shard() {
         let dir = tempfile::tempdir().unwrap();

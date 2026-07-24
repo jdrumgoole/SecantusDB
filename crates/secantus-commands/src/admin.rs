@@ -792,8 +792,11 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // equivalent in the durable catalog and never echoes it from `listIndexes`
     // (probed 6.0.16) — drivers see it only as explain's `isMultiKey`. Keep it
     // off the wire. Mirrors commands.py.
+    // `entryFormat` is likewise internal — the on-disk index-entry layout
+    // version (see `ENTRY_FORMAT_RECORDID`). mongod has no such field.
     for ix in &mut indexes {
         ix.remove("multikey");
+        ix.remove("entryFormat");
     }
     // A clustered collection's clustering key IS its index: mongod reports a
     // single entry carrying `clustered: true` (with the user's name) in place of
