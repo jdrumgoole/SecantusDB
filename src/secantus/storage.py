@@ -1283,6 +1283,11 @@ class Storage:
             if self._last_ts_secs > 0:
                 self._last_ts_secs = max(self._last_ts_secs, int(self._time())) + 1
                 self._last_ts_ord = 0
+            # Live oplog row count, kept in memory so ``_prune_oplog_locked``
+            # never has to walk the whole oplog to decide whether the entry cap
+            # is exceeded. Seeded here by a one-time key-only count (cheap, and
+            # only on open); maintained incrementally on every emit / prune.
+            self._oplog_live_count = self._count_oplog_rows()
 
         # TTL sweeper. Real mongod runs ``ttlMonitor`` every 60s by
         # default; we mirror that. ``ttl_sweep_seconds <= 0`` disables
@@ -1395,6 +1400,58 @@ class Storage:
                     max_seq = seq
             c.reset()
         return max_seq
+
+    def _count_oplog_rows(self) -> int:
+        """Number of live rows across all oplog shards + the legacy table.
+
+        Key-only walk (never decodes a value), used once on open to seed
+        ``self._oplog_live_count``. For a Python store every row lives in the
+        legacy table; the shard tables are present-but-empty, so this is a
+        single btree traversal in the common case.
+        """
+        total = 0
+        for table in _OPLOG_ALL_TABLES:
+            c = self._cursor(table)
+            while c.next() == 0:
+                total += 1
+            c.reset()
+        return total
+
+    def _iter_oplog_oldest(self, session: Any) -> Iterable[tuple[int, dict[str, Any], str]]:
+        """Yield ``(seq, entry, table)`` in ascending seq order, decoding each
+        entry lazily and only as it is produced.
+
+        The k-way merge mirrors ``_merge_oplog_on_session`` but as a generator:
+        a consumer that ``break``s after the rows it cares about stops the walk
+        there, so a prune that deletes D rows reads ~D+1 entries rather than the
+        whole oplog. Opens its own cursors on ``session`` and closes them when
+        the generator is exhausted or the consumer stops iterating.
+        """
+        cursors: list[Any] = []
+        heads: list[int | None] = []
+        try:
+            for table in _OPLOG_ALL_TABLES:
+                c = session.open_cursor(table, None)
+                cursors.append(c)
+                heads.append(int(c.get_key()) if c.next() == 0 else None)
+            while True:
+                best_i = None
+                best_seq = None
+                for i, h in enumerate(heads):
+                    if h is not None and (best_seq is None or h < best_seq):
+                        best_seq = h
+                        best_i = i
+                if best_i is None:
+                    return
+                c = cursors[best_i]
+                blob = bytes(c.get_value())
+                entry = bson.decode(blob) if blob else {}
+                heads[best_i] = int(c.get_key()) if c.next() == 0 else None
+                yield best_seq, entry, _OPLOG_ALL_TABLES[best_i]
+        finally:
+            for c in cursors:
+                with contextlib.suppress(Exception):
+                    c.close()
 
     def _scan_max_nat_seq(self) -> int:
         """Largest insertion ``seq`` present in ``_NAT_TABLE`` (0 if empty).
@@ -2040,6 +2097,7 @@ class Storage:
         # close + on prune_oplog, both of which are rare. The seq
         # mint itself is durable because the actual oplog rows are
         # written on every emit.
+        self._oplog_live_count += len(entries)
         self._oplog_emit_count += len(entries)
         if self._oplog_emit_count >= _OPLOG_PRUNE_INTERVAL:
             self._oplog_emit_count = 0
@@ -2298,53 +2356,48 @@ class Storage:
     def _prune_oplog_locked(self, *, now: float | None = None) -> int:
         when = now if now is not None else self._time()
         cutoff_secs = int(when - self.oplog_retention_seconds)
-        # Two-phase: collect doomed seqs, then delete (avoid mutating during scan).
-        # Sharded: walk every entry in global seq order via the shard merge on a
-        # fresh read session (the delete below uses the cached write cursors).
-        doomed: list[int] = []
-        all_seqs: list[int] = []
+        # Both prune criteria act on the OLDEST entries only:
+        #   * time retention — seq is minted jointly-monotonic with ts (see
+        #     ``_mint_oplog_seq_and_ts``), so every entry older than the cutoff
+        #     is an oldest-prefix by seq; the first entry we reach that is
+        #     within retention ends the time-doom.
+        #   * entry cap — trims the oldest surplus (``live_count - max``).
+        # So we stream the oldest entries in seq order and stop at the first one
+        # that neither criterion dooms: a prune that deletes D rows reads ~D+1
+        # entries, never the whole oplog. ``_oplog_live_count`` (maintained on
+        # every emit) gives the cap decision without a counting scan.
+        live = self._oplog_live_count
+        doomed: list[tuple[int, str]] = []
         scan_session = self._conn.open_session()
         try:
-            rows = self._merge_oplog_on_session(scan_session, 0, 2**63 - 1)
+            for seq, entry, table in self._iter_oplog_oldest(scan_session):
+                ts = entry.get("ts")
+                too_old = isinstance(ts, Timestamp) and ts.time < cutoff_secs
+                over_cap = (live - len(doomed)) > self.oplog_max_entries
+                if too_old or over_cap:
+                    doomed.append((seq, table))
+                else:
+                    break
         finally:
             with contextlib.suppress(Exception):
                 scan_session.close()
-        for seq, entry in rows:
-            all_seqs.append(seq)
-            ts = entry.get("ts")
-            if isinstance(ts, Timestamp) and ts.time < cutoff_secs:
-                doomed.append(seq)
-        # Trim to entry cap by extending doom set to oldest entries.
-        kept_count = len(all_seqs) - len(doomed)
-        if kept_count > self.oplog_max_entries:
-            extra = kept_count - self.oplog_max_entries
-            doomed_set = set(doomed)
-            for seq in all_seqs:
-                if extra <= 0:
-                    break
-                if seq not in doomed_set:
-                    doomed.append(seq)
-                    doomed_set.add(seq)
-                    extra -= 1
         if not doomed:
             return 0
+        self._oplog_live_count = live - len(doomed)
         # PITR v2: archive the doomed rows to a durable segment *before* deleting
         # them, so recovery can still reach a time before the new oplog floor.
         if self.oplog_archive_dir is not None:
-            self._archive_doomed_oplog(sorted(doomed))
-        # Sharded delete: routing is per-batch, so a doomed seq's table isn't a
-        # function of the seq — remove from every table (all shards + legacy). The
-        # ``_cursor`` cursors are overwrite=True, so ``remove()`` of an absent key
-        # is a safe no-op; the seq is present in exactly one table (a Rust store's
-        # shard, or a Python store's legacy table). Pre-images stay in one table.
+            self._archive_doomed_oplog(sorted(seq for seq, _ in doomed))
+        # The oldest-first walk already told us which table each doomed seq lives
+        # in, so we delete straight from that one table (not all 17). Pre-images
+        # live in a single table keyed by the same seq.
         pre_del = self._cursor(_PREIMAGE_TABLE)
-        for seq in doomed:
-            for table in _OPLOG_ALL_TABLES:
-                cur = self._cursor(table)
-                cur.set_key(seq)
-                with contextlib.suppress(wt.WiredTigerError):
-                    cur.remove()
-                cur.reset()
+        for seq, table in doomed:
+            cur = self._cursor(table)
+            cur.set_key(seq)
+            with contextlib.suppress(wt.WiredTigerError):
+                cur.remove()
+            cur.reset()
             pre_del.set_key(seq)
             with contextlib.suppress(wt.WiredTigerError):
                 pre_del.remove()

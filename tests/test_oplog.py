@@ -91,6 +91,58 @@ def test_prune_oplog_respects_count_cap(tmp_path) -> None:
     s.close()
 
 
+def test_live_count_tracks_emits_and_prunes(tmp_path) -> None:
+    s = Storage(str(tmp_path), oplog_max_entries=3, oplog_retention_seconds=10_000.0)
+    for _ in range(10):
+        s._emit_oplog([{"op": "n", "ns": "a.b"}])
+    assert s._oplog_live_count == 10
+    s.prune_oplog()
+    # Cap trims to the newest 3, and the in-memory count matches reality.
+    assert s._oplog_live_count == 3
+    assert len(s.read_oplog(start_seq=1, limit=100)) == 3
+    s.close()
+
+
+def test_live_count_is_reseeded_on_reopen(tmp_path) -> None:
+    path = str(tmp_path / "wt-home")
+    s1 = Storage(path)
+    for _ in range(7):
+        s1._emit_oplog([{"op": "n", "ns": "a.b"}])
+    s1.close()
+    # A fresh instance must recover the live count from the persisted rows,
+    # not start at zero — otherwise the first prune's cap decision is wrong.
+    s2 = Storage(path, oplog_max_entries=2, oplog_retention_seconds=10_000.0)
+    try:
+        assert s2._oplog_live_count == 7
+        s2.prune_oplog()
+        assert s2._oplog_live_count == 2
+        assert len(s2.read_oplog(start_seq=1, limit=100)) == 2
+    finally:
+        s2.close()
+
+
+def test_prune_reads_only_the_doomed_prefix(tmp_path) -> None:
+    # The whole point of the rewrite: a prune that deletes D rows must read
+    # ~D+1 entries, never the whole oplog. Spy on the oldest-first generator.
+    s = Storage(str(tmp_path), oplog_max_entries=500, oplog_retention_seconds=10_000.0)
+    for _ in range(600):
+        s._emit_oplog([{"op": "n", "ns": "a.b"}])
+    yielded = [0]
+    real_iter = s._iter_oplog_oldest
+
+    def counting_iter(session):
+        for item in real_iter(session):
+            yielded[0] += 1
+            yield item
+
+    s._iter_oplog_oldest = counting_iter
+    pruned = s.prune_oplog()  # cap surplus = 600 - 500 = 100
+    assert pruned == 100
+    # Reads the 100 doomed + the one entry that ends the walk — nowhere near 600.
+    assert yielded[0] <= 102
+    s.close()
+
+
 def test_prune_oplog_drops_paired_preimages(tmp_path) -> None:
     import bson
 
