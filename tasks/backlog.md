@@ -203,9 +203,28 @@ unused preinstalled toolchains (android/dotnet/ghc/boost/swift/powershell)
 before the build. If the durable lane keeps growing, the next lever is a smaller
 per-instance footprint (not a mid-session delete — that reintroduces the panic).
 
+**Shipped — oplog prune is O(deleted), not O(oplog size) (2026-07-24).**
+`_prune_oplog_locked` used to decode every oplog entry on every run (once per
+1000 writes) to find the few to drop; once a workload filled the oplog to the
+100k cap (one big bulk insert does it) each prune wasted ~0.9s decoding rows it
+then kept, and the tax landed on every later write in the session. Now it keeps
+an in-memory live-row count (seeded by a key-only walk on open) and streams only
+the oldest entries, stopping at the first the retention/cap criteria spare — a
+prune that drops D rows reads ~D+1. One prune over a full oplog: 0.86s → 0.002s;
+~27s off the serial pymongo gauge. See PR (branch `oplog-prune-scaling`).
+
 Deferred, low value / risk — revisit only if inner-loop wall becomes a real
 pain point again:
 
+- **Python-server raw insert throughput (WT pure-Python packing).** After the
+  oplog-prune fix above, `test_bulk::test_numerous_inserts` (200k inserts) is
+  ~14.9s and now bottlenecked on the storage insert itself: profiling 100k
+  inserts (6.5s) shows `wiredtiger/packing.py` + `intpacking.py` — the
+  pure-Python `SSu`/`SSq` cursor-key packing, run several times per insert (doc
+  table + nat + nat-seq + oplog) — dominating at ~2.9s cumulative. This is the
+  known "use the Rust server for throughput" gap (§7); shaving it means touching
+  the per-op cursor-key path for every write, which is high-risk for a modest
+  win on a server whose throughput story is the Rust server. Not worth it now.
 - **I2b — module-scoped server fixtures.** Convert the ~30 function-scoped
   `server(tmp_path)` fixtures to module scope (unique db/collection per test) to
   cut the *number* of WT open/close cycles. Modest upside (scaling curve shows
