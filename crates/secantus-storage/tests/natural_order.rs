@@ -171,3 +171,73 @@ fn natural_hint_walks_insertion_order() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The tailable capped-cursor primitives follow **insertion (RecordId) order**,
+/// not `_id`/`id_key` order — the step-3 fix. Regression guard for the bug step 1
+/// introduced: a capped tailable cursor tracked position by `id_key`, so on a
+/// collection with custom **non-monotonic** `_id`s a later insert carrying a
+/// smaller `_id` sorted *before* the watermark and was silently dropped. The
+/// RecordId-ordered scan cannot drop it: RecordId is the monotonic insertion
+/// counter regardless of `_id` value.
+#[test]
+fn tailable_recordid_scan_follows_insertion_order_for_nonmonotonic_ids() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    // Insert with DESCENDING _ids so id_key order is the REVERSE of insertion.
+    for id in [50i32, 40, 30, 20, 10] {
+        st.insert("app", "c", vec![enc(&doc! {"_id": id})], false)
+            .unwrap();
+    }
+    // Whole-collection RecordId scan = insertion order (50,40,30,20,10), NOT
+    // _id-ascending (10,20,30,40,50) that an id_key scan would give.
+    let all: Vec<i32> = st
+        .scan_docs_after_recordid("app", "c", None)
+        .unwrap()
+        .iter()
+        .map(|(_rid, b)| dec(b).get_i32("_id").unwrap())
+        .collect();
+    assert_eq!(
+        all,
+        vec![50, 40, 30, 20, 10],
+        "scan must be insertion order"
+    );
+
+    // Anchor at the 3rd doc's RecordId; the tail is the LATER inserts (20,10) —
+    // both have SMALLER _ids than the anchor's, so an id_key `> after` filter
+    // would have dropped them. RecordId order keeps them.
+    let after_third = st.scan_docs_after_recordid("app", "c", None).unwrap()[2].0;
+    let tail: Vec<i32> = st
+        .scan_docs_after_recordid("app", "c", Some(after_third))
+        .unwrap()
+        .iter()
+        .map(|(_rid, b)| dec(b).get_i32("_id").unwrap())
+        .collect();
+    assert_eq!(
+        tail,
+        vec![20, 10],
+        "tail must follow inserts, not _id order"
+    );
+
+    // min/max RecordId bound the collection (first/last inserted).
+    let min = st.collection_min_recordid("app", "c").unwrap().unwrap();
+    let max = st.collection_max_recordid("app", "c").unwrap().unwrap();
+    assert!(min < max);
+    assert_eq!(
+        st.scan_docs_after_recordid("app", "c", Some(max))
+            .unwrap()
+            .len(),
+        0,
+        "nothing sorts after the max RecordId"
+    );
+    // A capped eviction removes the OLDEST-inserted (_id 50, the min RecordId);
+    // after that, min RecordId advances past a cursor anchored at it → rollover.
+    st.delete_by_id("app", "c", &Bson::Int32(50)).unwrap();
+    let new_min = st.collection_min_recordid("app", "c").unwrap().unwrap();
+    assert!(
+        new_min > min,
+        "min RecordId advances when the oldest is evicted"
+    );
+
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}

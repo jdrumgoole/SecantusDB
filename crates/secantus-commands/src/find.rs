@@ -36,14 +36,18 @@ use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
 /// Producer for a tailable cursor on a capped collection (`find` with
 /// `tailable: true`). Each `produce` scans the collection for documents whose
-/// `id_key` sorts after the last one returned. If the cursor's anchor has been
-/// evicted by capped rollover (the collection's min `id_key` now exceeds it),
-/// it surfaces `CappedPositionLost` (136). Mirrors `commands.py::_find_tailable`.
+/// **RecordId** sorts after the last one returned — insertion order, which is
+/// what mongod's tailable cursors follow and what capped FIFO eviction uses
+/// (`id_key` order only coincides for monotonic `_id`s). If the cursor's anchor
+/// has been evicted by capped rollover (the collection's min RecordId now
+/// exceeds it), it surfaces `CappedPositionLost` (136). Mirrors
+/// `commands.py::_find_tailable` (whose Python server is still `id_key`-keyed, so
+/// there id_key IS insertion order — this RecordId form is the Rust-server fix).
 struct TailableFindProducer {
     storage: Arc<dyn Storage>,
     db: String,
     coll: String,
-    after: Option<Vec<u8>>,
+    after: Option<i64>,
     fatal: Option<CommandError>,
 }
 
@@ -54,9 +58,9 @@ impl CursorProducer for TailableFindProducer {
         }
         // Capped rollover: if the doc we last returned has been evicted, the
         // cursor is lapped — mongod kills it with CappedPositionLost.
-        if let Some(after) = &self.after {
-            match self.storage.collection_min_id_key(&self.db, &self.coll) {
-                Ok(Some(min)) if min.as_slice() > after.as_slice() => {
+        if let Some(after) = self.after {
+            match self.storage.collection_min_recordid(&self.db, &self.coll) {
+                Ok(Some(min)) if min > after => {
                     self.fatal = Some(capped_position_lost());
                     return Vec::new();
                 }
@@ -69,11 +73,11 @@ impl CursorProducer for TailableFindProducer {
         }
         match self
             .storage
-            .scan_docs_after_id_key(&self.db, &self.coll, self.after.as_deref())
+            .scan_docs_after_recordid(&self.db, &self.coll, self.after)
         {
             Ok(rows) if !rows.is_empty() => {
-                self.after = Some(rows[rows.len() - 1].0.clone());
-                rows.into_iter().map(|(_id_k, doc)| doc).collect()
+                self.after = Some(rows[rows.len() - 1].0);
+                rows.into_iter().map(|(_rid, doc)| doc).collect()
             }
             _ => Vec::new(),
         }
@@ -405,18 +409,15 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .as_ref()
             .ok_or_else(|| CommandError::new(1, "InternalError", "storage backend not configured"))?
             .clone();
-        // Watermark = id_key of the last matched doc, so the producer continues
-        // strictly after what we've already handed out. None for an empty match.
-        let after = match docs.last() {
-            Some(bytes) => {
-                let d = Document::from_reader(&mut bytes.as_slice())
-                    .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
-                d.get("_id").map(|id| {
-                    secantus_core::sortkey::encode_value(id, collation.as_ref()).unwrap_or_default()
-                })
-            }
-            None => None,
-        };
+        // Watermark = the collection's current max RecordId, so the producer
+        // follows only docs inserted after this find — insertion order, aligned
+        // with capped FIFO eviction. (Was the last matched doc's `id_key`, which
+        // only tracks insertion order for monotonic `_id`s; a capped collection
+        // with custom non-monotonic `_id`s would then drop follow-up inserts.)
+        // `None` for an empty collection.
+        let after = storage_arc
+            .collection_max_recordid(&ctx.db_name, &coll)
+            .map_err(command_error)?;
         let bs = batch_size.max(0) as usize;
         let split = bs.min(docs.len());
         let first_batch = docs[..split].to_vec();

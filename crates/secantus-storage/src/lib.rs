@@ -4351,6 +4351,69 @@ impl Storage {
         Ok(rows.into_iter().map(|(_rid, k, _)| k).min())
     }
 
+    /// Doc blobs whose **RecordId** is greater than `after` (or all, `after=None`),
+    /// in RecordId (insertion) order, each paired with its RecordId. This is the
+    /// tailable capped-cursor scan: the doc table is keyed by the monotonic
+    /// RecordId, so insertion order — the order mongod's tailable cursors follow —
+    /// IS RecordId order. (`scan_docs_after_id_key` filters by `id_key` instead,
+    /// which only coincides with insertion order for monotonic `_id`s — wrong for
+    /// a capped collection with custom non-monotonic `_id`s, where a later insert
+    /// can carry a smaller `id_key`. That method stays for its non-tailable
+    /// callers; tailable follows this one.)
+    pub fn scan_docs_after_recordid(
+        &self,
+        db: &str,
+        coll: &str,
+        after: Option<i64>,
+    ) -> Result<Vec<(i64, Vec<u8>)>> {
+        // Lock-free read (see the `lock` field's invariants).
+        let session = self.conn.open_session()?;
+        let rows = self
+            .scan_docs(&session, db, coll)?
+            .into_iter()
+            .map(|(rid, _id_k, blob)| (rid, blob));
+        Ok(match after {
+            None => rows.collect(),
+            Some(a) => rows.filter(|(rid, _)| *rid > a).collect(),
+        })
+    }
+
+    /// The smallest **RecordId** currently in a collection, or `None` if empty. A
+    /// tailable cursor uses this to detect capped rollover: capped eviction is
+    /// FIFO by RecordId (`enforce_capped_bounds`), so if the min RecordId now
+    /// exceeds the cursor's RecordId anchor, the doc it last returned has been
+    /// evicted and mongod kills the cursor with `CappedPositionLost`. (The
+    /// `id_key`-based `collection_min_id_key` mis-detects this for non-monotonic
+    /// `_id`s, since the evicted doc need not hold the min `id_key`.)
+    pub fn collection_min_recordid(&self, db: &str, coll: &str) -> Result<Option<i64>> {
+        // Lock-free read (see the `lock` field's invariants).
+        let session = self.conn.open_session()?;
+        // `scan_docs` yields RecordId-ascending, so the first row is the minimum.
+        Ok(self
+            .scan_docs(&session, db, coll)?
+            .into_iter()
+            .next()
+            .map(|(rid, _idk, _blob)| rid))
+    }
+
+    /// The largest **RecordId** currently in a collection (`None` if empty). A
+    /// tailable cursor seeds its watermark with this: after the initial find hands
+    /// out the current contents, the producer follows only docs inserted
+    /// afterward — i.e. with a RecordId strictly greater than the collection's max
+    /// at setup. This is where mongod positions a tailable cursor (end of the
+    /// initial scan), and for a monotonic-`_id` capped collection it equals the
+    /// last-returned doc's position, so existing behaviour is unchanged.
+    pub fn collection_max_recordid(&self, db: &str, coll: &str) -> Result<Option<i64>> {
+        // Lock-free read (see the `lock` field's invariants).
+        let session = self.conn.open_session()?;
+        // `scan_docs` yields RecordId-ascending, so the last row is the maximum.
+        Ok(self
+            .scan_docs(&session, db, coll)?
+            .into_iter()
+            .next_back()
+            .map(|(rid, _idk, _blob)| rid))
+    }
+
     // --- users / roles / profiling (auth + profiling surface) ---
 
     /// Persist a user record (opaque BSON blob). Returns `true` if added,
