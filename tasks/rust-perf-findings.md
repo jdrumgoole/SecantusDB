@@ -7,7 +7,9 @@ sustained single-client load — five 30-second phases (insert / indexed find
 / full scan / `$group` aggregate / update+delete) driven through `pymongo`
 against on-disk WiredTiger, 20-second capture each. Context: the three-way
 benchmark has the Rust server at 2.1×–4.5× of mongod per operation
-(`docs/benchmark.md`) and flat ~0.5× concurrency scaling
+(`docs/benchmark.md`) and — pre-RecordId — flat ~0.5× concurrency scaling
+(re-baselined 2026-07-24 to positive-to-4-writers-then-a-cliff; see the bottom
+of this doc)
 (`docs/concurrency.md`).
 
 ## Headline
@@ -353,7 +355,9 @@ a structural one:
    Do this after the raw-BSON work — critical-section lengths are about to
    change shape, and the split should be tuned against the new profile.
 
-**Expected outcome**: flat 0.5× → ~1.2–1.3× aggregate at 4–8 writers (the
+**Expected outcome (as forecast in 2026-07; the slice SHIPPED — see the
+2026-07-24 re-baseline at the bottom, which found the residual ceiling is
+WiredTiger, not a Rust lock)**: flat 0.5× → ~1.2–1.3× aggregate at 4–8 writers (the
 measured `wt_poc` pure-C ceiling), i.e. **~2.5× write throughput under
 load**, plus whatever the read-path unlock buys mixed workloads — which is
 currently unmeasured because the harness is write-only (add a mixed
@@ -375,3 +379,48 @@ readers+writers phase to `bench.concurrency` when step 1 lands).
 Raw capture files: `sample-{insert,find_range,find_all,aggregate,update_delete}.txt`
 (session scratchpad; regenerate with `bench/profile_driver`-style loops +
 `sample <pid> 20` against a `CARGO_PROFILE_RELEASE_DEBUG=true` build).
+
+## Concurrency re-baseline after RecordId step 1+2 (2026-07-24, pinned `940a25b4`)
+
+The "flat ~0.5× concurrency scaling" line at the top of this doc is **stale** —
+that was pre-RecordId. Re-measured on the step-2 tip (`bench.concurrency`,
+per-writer collections, 30s/count, batch 100), machine quiesced to load < 2
+before the run (the 8-writer figure re-confirmed on a separately-quiesced focused
+run; mongod as the control scaled cleanly through 8 in the same run, so the rust
+shape is real server contention, not oversubscription):
+
+| writers | Rust docs/s | Rust scaling | mongod docs/s | mongod scaling |
+|---|---|---|---|---|
+| 1 | 25,750 | 1.00× | 105,930 | 1.00× |
+| 4 | **68,195** | **2.65×** (peak) | 368,361 | 3.48× |
+| 6 | 48,105 | 1.87× | 459,619 | 4.34× |
+| 8 | 33,581 | 1.30× | 494,595 | 4.67× |
+
+(Python, same run, has NEGATIVE scaling — 2,300 → 167 docs/s at 1→8 writers — the
+GIL; nothing to do there, it is why the Rust server exists.)
+
+**Two corrections to the record:**
+
+1. **RecordId lifted low/moderate concurrency.** Rust now shows genuinely positive
+   scaling to 4 writers (2.65×), not "flat 0.5×". The write-amp reduction (4→3, then
+   the step-2 read-hop removal) is why. Update the top-of-doc characterisation.
+
+2. **The remaining cliff is WiredTiger, NOT a splittable Rust lock — the lock-split
+   is DONE.** All four steps of "The other axis: concurrency — the design" above
+   shipped 2026-07-17 (lock-free reads, per-collection write locks, counters off the
+   write path, commit-time conflict handling / the #444/#447 port). Verified against
+   the current code: CRUD `insert`/`update`/`delete` take only `coll_lock` (per
+   collection — so per-writer-collections hits no shared Rust write lock), and
+   `mint_seq_and_ts` holds the oplog mutex only for cheap arithmetic (no I/O). So the
+   monotonic 4→6→8 decline (68k→48k→34k) is **WiredTiger-internal** — WAL log
+   serialisation / cache eviction / checkpoint pressure in a single-process embedded
+   WT — exactly what `docs/concurrency.md` states ("the ceiling is in WiredTiger
+   itself"). mongod scales through the same range (4.67×) because it is a
+   purpose-built WT host tuned for it; the same WiredTiger, configured differently.
+   Per the `rust-write-gap-is-wt-cache` finding, WT cache tuning is only a ~+6–7%
+   lever, nowhere near this gap. **There is no cheap Rust-level concurrency win left
+   — the ceiling is architectural (embedded WT vs a tuned mongod), and the honest
+   guidance for multi-writer-scaling workloads remains "run a real mongod."** Do not
+   re-scope the lock-split: it exists. If concurrency is ever revisited, the only
+   real lever is WT-host tuning (cache size, eviction threads, dedicated log volume,
+   checkpoint cadence), each individually small and each trading memory/durability.
