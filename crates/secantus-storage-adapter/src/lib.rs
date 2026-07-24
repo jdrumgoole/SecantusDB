@@ -648,6 +648,29 @@ impl CmdStorage for StorageAdapter {
         self.inner.collection_min_id_key(db, coll).map_err(map_err)
     }
 
+    fn scan_docs_after_recordid(
+        &self,
+        db: &str,
+        coll: &str,
+        after: Option<i64>,
+    ) -> Result<Vec<(i64, Vec<u8>)>, StorageError> {
+        self.inner
+            .scan_docs_after_recordid(db, coll, after)
+            .map_err(map_err)
+    }
+
+    fn collection_min_recordid(&self, db: &str, coll: &str) -> Result<Option<i64>, StorageError> {
+        self.inner
+            .collection_min_recordid(db, coll)
+            .map_err(map_err)
+    }
+
+    fn collection_max_recordid(&self, db: &str, coll: &str) -> Result<Option<i64>, StorageError> {
+        self.inner
+            .collection_max_recordid(db, coll)
+            .map_err(map_err)
+    }
+
     fn collection_data_size(&self, db: &str, coll: &str) -> Result<i64, StorageError> {
         self.inner.collection_data_size(db, coll).map_err(map_err)
     }

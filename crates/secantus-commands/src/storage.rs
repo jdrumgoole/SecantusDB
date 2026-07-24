@@ -649,6 +649,33 @@ pub trait Storage: Send + Sync {
         Ok(None)
     }
 
+    /// Documents whose **RecordId** is strictly greater than `after` (all when
+    /// `None`), as `(recordid, bson)` pairs in insertion order — the tailable-find
+    /// producer polls this. RecordId order is mongod's tailable (insertion) order,
+    /// unlike `scan_docs_after_id_key`, which only matches it for monotonic `_id`s.
+    fn scan_docs_after_recordid(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _after: Option<i64>,
+    ) -> Result<Vec<(i64, Vec<u8>)>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// The smallest **RecordId** currently in the collection (`None` if empty) —
+    /// the tailable cursor uses it to detect capped rollover (`CappedPositionLost`),
+    /// aligned with the FIFO (RecordId-order) eviction.
+    fn collection_min_recordid(&self, _db: &str, _coll: &str) -> Result<Option<i64>, StorageError> {
+        Ok(None)
+    }
+
+    /// The largest **RecordId** in the collection (`None` if empty) — the
+    /// tailable cursor seeds its watermark with this (position at end of the
+    /// initial scan, mongod's tailable start point).
+    fn collection_max_recordid(&self, _db: &str, _coll: &str) -> Result<Option<i64>, StorageError> {
+        Ok(None)
+    }
+
     /// Total size in bytes of the collection's documents.
     fn collection_data_size(&self, _db: &str, _coll: &str) -> Result<i64, StorageError> {
         Ok(0)
