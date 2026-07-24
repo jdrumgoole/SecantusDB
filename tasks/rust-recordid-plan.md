@@ -198,6 +198,47 @@ this commit vs its parent) — and keep step 1's *gains* (scan / aggregate / del
 below), which come from the doc table being in RecordId order and must not regress
 while chasing the read number.
 
+### Step 2 — IN PROGRESS (handoff, 2026-07-24)
+Branch `rust-recordid-step2`. **Does not compile yet — this is a deliberate
+checkpoint, not a working tree.**
+
+Done:
+- `pack_entry(kb, recordid: i64)` / `unpack_entry -> (&[u8], Option<i64>)` now carry
+  the **RecordId** (8-byte big-endian) instead of the `id_key`. BE is deliberate:
+  entries stay ordered by RecordId (insertion order) within one key, and the
+  fixed width means the trailing half needs no escaping (`unpack_entry` splits at
+  the FIRST separator and the escaped `kb` half cannot contain one). A trailing
+  half that isn't exactly 8 bytes is a step-1 entry → `None`, never silently
+  mis-read.
+
+Remaining — the compiler enumerates it exactly; build with
+`SECANTUS_WT_INCLUDE=<main>/build/*/wt-build/include SECANTUS_WT_LIB=<main>/build/*/wt-build
+cargo check --manifest-path crates/secantus-storage/Cargo.toml` (a fresh worktree
+has no WT; reuse the main checkout's build):
+1. **4 write sites** (`~4706`, `~5381`, `~5389`, `~5398`) — pass the RecordId. The
+   central one is `packed_entry_keys(doc, desc, id_k)`: change that parameter to
+   `recordid: i64` and the rest follows. `insert` already mints it; `update` /
+   `delete` must resolve `id_key → RecordId` **once** up front (not per entry).
+2. **5 read sites** (`~5851`, `~6707`, `~7252`, `~7329`, `~7401`) — they collect the
+   trailing half; it is now an `i64`, so the candidate sets become RecordIds.
+3. **1 uniqueness comparison** (`~5636`).
+4. `docs_by_id_keys` → `docs_by_recordids`: **delete the `doc_recordid` call** — that
+   is the hop this step exists to remove. 6 `doc_recordid` callers total; only the
+   IXSCAN-fetch one goes away.
+5. Uniqueness (`unique_conflict`, `find_index_duplicates`, `conflict_key_value`)
+   compare/extract the trailing half — `conflict_key_value` recovers the value
+   behind a conflicting key and will need the RecordId → doc path.
+6. **Fail-fast on a step-1-format store (decided: NO migration, no users).** Unlike
+   step 1 this is NOT visible in WT's `key_format` (still `SSSu`) — the change is
+   inside the value bytes — so it needs an explicit marker: write
+   `options.entryFormat = 2` in the index catalog row from `create_index`, and
+   refuse at open if any index row lacks it. Mirror `reject_pre_recordid_doc_format`.
+   **Strip `entryFormat` from `listIndexes`** exactly as `multikey` already is —
+   mongod does not carry it.
+7. Gates: `./inv rust-gate`, the pymongo gauge, and the **A/B** — target
+   `find_indexed_range` back to ≈7.1 ms (from 8.19 ms), without regressing step 1's
+   scan/aggregate/delete gains. See "Measured — step 1".
+
 ## Step 3 — capped-collection eviction + `$natural` hint on doc-table order.
 ## Step 4 — Python mirror (`src/secantus/storage.py`), byte-identical RecordId scheme.
 ## Step 5 — folded into step 1's migration if landable, else a dedicated pass.

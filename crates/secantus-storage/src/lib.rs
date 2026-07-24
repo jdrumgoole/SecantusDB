@@ -1169,24 +1169,40 @@ fn escape_kb(kb: &[u8]) -> Vec<u8> {
 }
 
 /// Pack an index-entry payload into a single trailing `u` column:
-/// `escape(kb) + b"\x00\x00" + id_key`. WiredTiger length-prefixes non-trailing
-/// `u` columns, which would break lexicographic order — so both halves live in
-/// one column and the B-tree sorts by `escape(kb)` first, then `id_key`.
-/// Mirrors `storage._pack_entry`.
-fn pack_entry(kb: &[u8], id_key: &[u8]) -> Vec<u8> {
+/// `escape(kb) + b"\x00\x00" + RecordId(8B big-endian)`. WiredTiger
+/// length-prefixes non-trailing `u` columns, which would break lexicographic
+/// order — so both halves live in one column and the B-tree sorts by
+/// `escape(kb)` first, then by RecordId.
+///
+/// **Step 2 format (`ENTRY_FORMAT_RECORDID`).** The trailing half used to be the
+/// doc's `id_key`, which made an IXSCAN fetch pay `id_key → _id index → RecordId
+/// → doc`. Storing the RecordId directly drops that hop (measured at +14.7% on
+/// `find_indexed_range` — see `tasks/rust-recordid-plan.md`). Big-endian is
+/// deliberate: it keeps the B-tree ordering within one key in RecordId
+/// (insertion) order, and it is fixed-width so the trailing half needs no
+/// escaping even though a RecordId's bytes may themselves contain `\x00\x00`
+/// (`unpack_entry` splits at the FIRST separator, and the escaped `kb` half
+/// cannot contain one).
+fn pack_entry(kb: &[u8], recordid: i64) -> Vec<u8> {
     let mut out = escape_kb(kb);
     out.extend_from_slice(ENTRY_SEP);
-    out.extend_from_slice(id_key);
+    out.extend_from_slice(&recordid.to_be_bytes());
     out
 }
 
-/// Split a packed entry into `(escaped_kb, id_key)` at the FIRST `\x00\x00`.
+/// Split a packed entry into `(escaped_kb, RecordId)` at the FIRST `\x00\x00`.
 /// Correct because the `kb` half is escaped (no bare `\x00\x00` can occur in
-/// it). Mirrors `storage._unpack_entry`.
-fn unpack_entry(packed: &[u8]) -> (&[u8], &[u8]) {
+/// it). A trailing half that is not exactly 8 bytes is a step-1-format entry;
+/// callers must never see one (`reject_legacy_index_entry_format` refuses such a
+/// store at open), so it is reported as `None` rather than silently mis-read.
+fn unpack_entry(packed: &[u8]) -> (&[u8], Option<i64>) {
     match packed.windows(2).position(|w| w == ENTRY_SEP) {
-        Some(i) => (&packed[..i], &packed[i + 2..]),
-        None => (packed, &[]),
+        Some(i) => {
+            let tail = &packed[i + 2..];
+            let rid = <[u8; 8]>::try_from(tail).ok().map(i64::from_be_bytes);
+            (&packed[..i], rid)
+        }
+        None => (packed, None),
     }
 }
 
