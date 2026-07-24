@@ -1097,6 +1097,50 @@ def test_tailable_cursor_on_capped_collection(tmp_path) -> None:
         srv.stop()
 
 
+def test_tailable_capped_follows_inserts_with_nonmonotonic_ids(tmp_path) -> None:
+    """A tailable cursor on a capped collection with NON-MONOTONIC custom ``_id``s
+    must still surface documents inserted after the drain — in insertion order,
+    like mongod (RecordId step 3).
+
+    Regression guard for the bug step 1 introduced: the tailable producer tracked
+    position by ``id_key`` (``_id`` sort order), so a follow-up insert carrying a
+    ``_id`` SMALLER than the last one already returned sorted *before* the
+    watermark and was silently dropped from the stream. Here every follow-up
+    ``_id`` is smaller than the initial batch's, so the pre-fix producer would
+    hand back nothing; the RecordId-anchored producer follows insertion order and
+    returns them. mongod behaves the same — tailable follows insertion order, not
+    ``_id``."""
+    import time
+
+    from pymongo.cursor import CursorType
+
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        db.create_collection("log", capped=True, size=65536)
+        # Initial batch: LARGE _ids.
+        db.log.insert_many([{"_id": i} for i in (500, 400, 300)])
+        cur = db.log.find(cursor_type=CursorType.TAILABLE)
+        got = [d["_id"] for d in cur]
+        assert got == [500, 400, 300], "initial batch in insertion order"
+        # Follow-up inserts with SMALLER _ids than anything drained — an id_key
+        # watermark would exclude all of these.
+        for new_id in (20, 10):
+            db.log.insert_one({"_id": new_id})
+        deadline = time.time() + 10
+        while len(got) < 5 and time.time() < deadline:
+            try:
+                got.append(next(cur)["_id"])
+            except StopIteration:
+                time.sleep(0.1)
+        assert got == [500, 400, 300, 20, 10], (
+            f"tailable must follow insertion order, not _id order; got {got}"
+        )
+        cur.close()
+    finally:
+        srv.stop()
+
+
 def test_inc_mul_reject_non_numeric_operand(tmp_path) -> None:
     """$inc / $mul by a non-number (bool / string / null) is REJECTED on the
     Rust server rather than silently computed (bool previously computed as
