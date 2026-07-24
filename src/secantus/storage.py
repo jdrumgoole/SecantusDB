@@ -266,6 +266,31 @@ def _unpack_entry(packed: bytes) -> tuple[bytes, bytes]:
     return packed[:sep], packed[sep + 2 :]
 
 
+def _frame_doc_value(id_key: bytes, blob: bytes) -> bytes:
+    """Frame a doc-table value as ``[u32-LE id_key_len][id_key][blob]``.
+
+    RecordId step 4a: the doc table is keyed by the monotonic RecordId, not the
+    ``id_key``, so the ``id_key`` (which a scan / delete still needs — and which a
+    timeseries doc carries suffixed, not derivable from ``_id``) is stored *in* the
+    value alongside the BSON blob. Byte-identical to the Rust server's
+    ``frame_doc_value`` (``crates/secantus-storage/src/lib.rs``) so a store written
+    by one server reads on the other — cross-server backup / PITR portability.
+    """
+    return len(id_key).to_bytes(4, "little") + id_key + blob
+
+
+def _unframe_doc_value(value: bytes) -> tuple[bytes, bytes]:
+    """Split a framed doc-table value into ``(id_key, blob)``. Inverse of
+    [`_frame_doc_value`]; mirrors the Rust ``unframe_doc_value``."""
+    if len(value) < 4:
+        raise ValueError("doc-table value shorter than 4-byte frame header")
+    n = int.from_bytes(value[:4], "little")
+    rest = value[4:]
+    if len(rest) < n:
+        raise ValueError("doc-table value id_key length exceeds frame")
+    return rest[:n], rest[n:]
+
+
 def extract_backup_archive(
     archive_path: str,
     target_dir: str,

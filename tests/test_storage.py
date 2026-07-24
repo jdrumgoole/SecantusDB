@@ -7,7 +7,7 @@ import threading
 import bson
 import pytest
 
-from secantus.storage import Storage
+from secantus.storage import Storage, _frame_doc_value, _unframe_doc_value
 
 
 @pytest.fixture
@@ -938,3 +938,32 @@ def test_ddl_and_crud_never_deadlock_and_index_stays_complete(storage: Storage) 
     """
     for r in range(4):
         _ddl_crud_round(storage, "app", f"c{r}", writers=4, per_writer=25)
+
+
+def test_frame_doc_value_layout_and_roundtrip() -> None:
+    """The doc-table value frame is ``[u32-LE id_key_len][id_key][blob]`` — byte
+    for byte what the Rust server writes (RecordId step 4a), so a store written by
+    one server reads on the other. Pins the exact bytes, not just the round-trip."""
+    framed = _frame_doc_value(b"ID", b"blob")
+    assert framed == b"\x02\x00\x00\x00ID blob".replace(b" ", b"")  # \x02000 + ID + blob
+    assert framed == bytes([2, 0, 0, 0]) + b"ID" + b"blob"
+    assert _unframe_doc_value(framed) == (b"ID", b"blob")
+    # An id_key can itself contain NULs / the frame separator bytes — the length
+    # prefix makes the split exact regardless.
+    idk = b"\x00\x00\x01\xff"
+    blob = b"\x00\x00payload\x00"
+    assert _unframe_doc_value(_frame_doc_value(idk, blob)) == (idk, blob)
+    # Empty blob is legal; empty id_key too.
+    assert _unframe_doc_value(_frame_doc_value(b"k", b"")) == (b"k", b"")
+    assert _unframe_doc_value(_frame_doc_value(b"", b"v")) == (b"", b"v")
+
+
+def test_unframe_doc_value_rejects_malformed() -> None:
+    """A value shorter than the 4-byte header, or whose declared id_key length
+    overruns the buffer, is a corrupt frame — raise, never silently mis-split."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        _unframe_doc_value(b"\x01\x02")  # < 4 bytes
+    with _pytest.raises(ValueError):
+        _unframe_doc_value(bytes([9, 0, 0, 0]) + b"xy")  # declares 9, has 2
