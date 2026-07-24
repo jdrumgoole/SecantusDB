@@ -161,6 +161,9 @@ orphaned shells first — [[orphaned-claude-shells-eat-cpu]]) to confirm the +15
 Keep the **index-entry format unchanged** (still `id_key`); IXSCAN fetch becomes
 `id_key → _id index → RecordId → doc` (one extra hop, optimised away in step 2).
 
+**Measured cost of that hop: +14.7% on `find_indexed_range`** (7.14 ms → 8.19 ms).
+See "Measured — step 1" below; that is the number step 2 has to give back.
+
 Concrete edits (`crates/secantus-storage/src/lib.rs`):
 1. Doc-table key: every `doc_cur.set_key_ssu(db,coll,id_key)` / `get_key_ssu` on the
    doc table → `set_key_ssq(db,coll,recordid)`. Doc-table CFG `key_format=SSu`→`SSq`.
@@ -188,6 +191,13 @@ backup round-trips, the storage crate's reopen + capped + nat-order tests,
 `RecordId → doc` (drops the extra hop). Migration re-packs existing index entries.
 The biggest sub-step. Own PR + gates.
 
+**Target — recover the hop:** `find_indexed_range` should return to **≈7.1 ms**
+(pre-RecordId) from step 1's **8.19 ms**; anything ≥ 7.6 ms means the hop is still
+being paid somewhere. Verify with the same A/B recipe below (`--no-mongod --reps 9`,
+this commit vs its parent) — and keep step 1's *gains* (scan / aggregate / delete,
+below), which come from the doc table being in RecordId order and must not regress
+while chasing the read number.
+
 ## Step 3 — capped-collection eviction + `$natural` hint on doc-table order.
 ## Step 4 — Python mirror (`src/secantus/storage.py`), byte-identical RecordId scheme.
 ## Step 5 — folded into step 1's migration if landable, else a dedicated pass.
@@ -196,3 +206,32 @@ The biggest sub-step. Own PR + gates.
 Clean idle-machine A/B (load < 4; check for orphaned shells first —
 [[orphaned-claude-shells-eat-cpu]]) at 1/2/4/8 writers, per step, vs the parent
 commit. Expect +15% concurrency by the end.
+
+### Measured — step 1 (2026-07-24)
+A/B of `b90b5490` (step 1) vs its parent `397b03aa`, both built and run **back to
+back in one detached worktree** on an idle machine (load < 2 before each leg;
+`./inv compare-servers --no-mongod --reps 9`, n=10000). Rust-server medians:
+
+| workload | parent | step 1 | Δ |
+|---|---|---|---|
+| **find_indexed_range** | 7.14 ms | **8.19 ms** | **+14.7%** ← the extra hop |
+| find_all (scan) | 20.28 ms | 17.71 ms | −12.7% |
+| aggregate `$group` | 12.55 ms | 10.44 ms | −16.8% |
+| aggregate multistage | 17.45 ms | 15.36 ms | −12.0% |
+| delete_many_half | 32.51 ms | 29.89 ms | −8.1% |
+| insert | 82.07 ms | 79.55 ms | −3.1% |
+| update_many_half | 49.89 ms | 51.39 ms | +3.0% (noise) |
+
+**Noise floor ≈ ±3%**, established by the *Python* server in the same runs: step 1
+is Rust-only, so Python is an untouched control and it moved 0.7–2.7% across the
+two legs. That is what makes +14.7% a real regression and +3.0% not.
+
+Net: step 1 is **positive overall** — everything that walks the doc table
+sequentially (scan, both aggregates, delete) got 8–17% faster because the table is
+now in RecordId (insertion) order; only the indexed-read path pays the hop.
+
+Against `mongod` the Rust server measured **1.4×–2.6×** after step 1 (was 1.5×–2.5×
+at the 2026-07-20 baseline): writes improved, `find_indexed_range` moved 1.5× → 1.8×.
+**`docs/benchmark.md` and the other published figures were NOT refreshed** — step 2
+moves the read number again, so publish once after it lands rather than twice (the
+numbers live in five places that must agree — [[benchmark-numbers-alignment]]).
