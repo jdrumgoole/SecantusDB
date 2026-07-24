@@ -198,6 +198,62 @@ this commit vs its parent) — and keep step 1's *gains* (scan / aggregate / del
 below), which come from the doc table being in RecordId order and must not regress
 while chasing the read number.
 
+### Step 2 — IN PROGRESS (handoff, 2026-07-24)
+Branch `rust-recordid-step2`. **Does not compile yet — this is a deliberate
+checkpoint, not a working tree.**
+
+Done (second pass — the compiler-driven fanout):
+- **All write paths threaded.** `packed_entry_keys` / `write_index_entries` /
+  `delete_index_entries` / `index_entry_diff` take `recordid: i64`. The old
+  `id_key_override` / `doc_table_key` plumbing is **gone** — it existed only to
+  compute the entry's trailing half. `index_entry_diff` needs ONE RecordId, not
+  two, because `_id` is immutable so an update keeps its RecordId. Every caller
+  already had `recordid` in scope (they had just done `set_key_ssq(db, coll,
+  recordid)`), so no new lookups were introduced on the write path.
+- **`create_index` backfill** (regular + `2d` + `2dsphere`) uses the RecordId
+  `scan_docs` already yields — no `id_key → RecordId` lookup during a build.
+- **Uniqueness**: `unique_conflict`'s `exclude_id_key: Option<&[u8]>` →
+  `exclude_recordid: Option<i64>`; a `None` trailing half (step-1 entry) is treated
+  as "not me" rather than silently matching.
+- **Scanners return RecordIds**: `collect_entry_rows`, `walk_index_in_order`,
+  `scan_index_for_id_keys`, `range_scan_index`, `range_scan_index_leading`.
+- **THE HOP IS GONE**: `docs_by_id_keys` → `docs_by_recordids(&[i64])`, and the
+  `doc_recordid` call inside it is deleted — an IXSCAN fetch now reads the doc row
+  straight from the index entry. This is the change step 2 exists for.
+
+Still failing to compile: **~25 errors, all in the consumer chain** downstream of
+the scanners (candidate iteration / filter / sort paths that still assume
+`Vec<Vec<u8>>` id_keys). Mechanical — the types name every site. After that:
+
+- `pack_entry(kb, recordid: i64)` / `unpack_entry -> (&[u8], Option<i64>)` carry
+  the **RecordId** (8-byte big-endian) instead of the `id_key`. BE is deliberate:
+  entries stay ordered by RecordId (insertion order) within one key, and the
+  fixed width means the trailing half needs no escaping (`unpack_entry` splits at
+  the FIRST separator and the escaped `kb` half cannot contain one). A trailing
+  half that isn't exactly 8 bytes is a step-1 entry → `None`, never silently
+  mis-read.
+
+Remaining — the compiler enumerates it exactly; build with
+`SECANTUS_WT_INCLUDE=<main>/build/*/wt-build/include SECANTUS_WT_LIB=<main>/build/*/wt-build
+cargo check --manifest-path crates/secantus-storage/Cargo.toml` (a fresh worktree
+has no WT; reuse the main checkout's):
+1. **Finish the consumer chain (~25 errors).** Everything downstream of the
+   scanners still types candidates as `Vec<Vec<u8>>` id_keys; they are RecordIds
+   now. Purely mechanical — follow the compiler.
+2. `conflict_key_value` recovers the value behind a conflicting key; it needs the
+   RecordId → doc path now that entries no longer carry the `id_key`.
+3. **Fail-fast on a step-1-format store (decided: NO migration, no users).** Unlike
+   step 1 this is NOT visible in WT's `key_format` (still `SSSu`) — the change is
+   inside the value bytes — so it needs an explicit marker: write
+   `options.entryFormat = 2` in the index catalog row from `create_index`, and
+   refuse at open if any index row lacks it. Mirror `reject_pre_recordid_doc_format`.
+   **Strip `entryFormat` from `listIndexes`** exactly as `multikey` already is —
+   mongod does not carry it. Note `unpack_entry` already returns `None` for a
+   step-1 entry, so nothing mis-reads even before the refusal lands.
+4. Gates: `./inv rust-gate`, the pymongo gauge, and the **A/B** — target
+   `find_indexed_range` back to ≈7.1 ms (from 8.19 ms), without regressing step 1's
+   scan/aggregate/delete gains. See "Measured — step 1".
+
 ## Step 3 — capped-collection eviction + `$natural` hint on doc-table order.
 ## Step 4 — Python mirror (`src/secantus/storage.py`), byte-identical RecordId scheme.
 ## Step 5 — folded into step 1's migration if landable, else a dedicated pass.
