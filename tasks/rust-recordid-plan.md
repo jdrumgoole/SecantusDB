@@ -280,8 +280,9 @@ with a cross-server test (write with one server, read with the other) where feas
   write. `_scan_docs` walks the doc table directly (RecordId order); `_scan_docs_natural`
   delegates to it; DELETE the forward-`_NAT_TABLE` scan. Every doc-table READ/DELETE
   resolves `id_key → _doc_recordid → RecordId`. On-open migration of legacy `SSu` docs
-  (or the step-1 fail-fast refusal — Python has users? if the PyPI package has shipped
-  the old format, a migration is needed, NOT a refusal; decide per the changelog).
+  **DECIDED 2026-07-24 (Joe): FAIL-FAST refusal, no migration** — mirror the Rust
+  side exactly (`_reject_pre_recordid_doc_format` analog), even though the Python
+  server is the shipped package. No in-place upgrade; an old-format store is refused.
 - **4b (= Rust step 2, #637).** Index entries carry the RecordId (8-byte big-endian)
   instead of the id_key; `_pack_entry`/`_unpack_entry`; IXSCAN fetch reads the doc row
   directly (drop the `id_key→RecordId` hop); `options.entryFormat=2` marker + open-time
@@ -294,13 +295,12 @@ with a cross-server test (write with one server, read with the other) where feas
   so the id_key tailable is CORRECT there — 4c only makes sense AFTER 4a/4b, and is where
   the Python `scan_docs_after_id_key` becomes wrong (same divergence #640 fixed in Rust).
 
-**Users question that gates the migration-vs-refusal choice:** the Rust servers are
-pre-1.0 beta with no users → fail-fast, no migration. The **Python server is the
-shipped PyPI package** (`SecantusDB`), so an existing user's on-disk store IS the old
-`SSu`/id_key format. 4a/4b therefore likely need a real on-open **migration** (re-frame
-+ re-key each doc, rebuild the `_id` index and index entries), NOT the Rust fail-fast.
-Confirm against `docs/changelog.md` whether any released version persisted user data in
-a format that must be upgraded; if persistence shipped, the migration is mandatory.
+**Migration vs refusal — DECIDED 2026-07-24 (Joe): FAIL-FAST, no migration**, for
+BOTH 4a and 4b, mirroring the Rust `_reject_pre_recordid_doc_format` /
+`reject_legacy_index_entry_format`. Even though the Python server is the shipped PyPI
+package, an old-format store is refused at open with a clear error rather than
+migrated. This keeps 4a/4b a straight mirror of the Rust steps and off the risky
+open-path-migration surface.
 ## Step 5 — folded into step 1's migration if landable, else a dedicated pass.
 
 ## Measurement
