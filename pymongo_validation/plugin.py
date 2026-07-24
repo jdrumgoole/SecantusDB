@@ -24,6 +24,32 @@ now carries a tripwire instead: if the imported helpers hold anything
 other than the embedded server's address, the run aborts rather than
 measuring the wrong server.
 
+Parallel mode (``SECANTUS_GAUGE_PER_WORKER``, set by ``invoke validate
+--jobs N`` for N > 1)
+----------------------------------------------------------------------
+The gauge is serial by default because pymongo's tests share database
+and collection names — two of them running concurrently against ONE
+server trample each other. That is a property of the shared server, not
+of the tests: give every xdist worker **its own** embedded SecantusDB
+(its own WT store, its own port) and the collision disappears, because
+no two workers can see each other's databases.
+
+With ``SECANTUS_GAUGE_PER_WORKER=1`` each worker starts a server in this
+same pre-conftest hook and overwrites the inherited DB_IP/DB_PORT with
+its own address, so pymongo's helpers freeze the *worker's* server. The
+controller still starts one (idle) server so its ``pytest_configure``
+tripwire — including the serverStatus identity probe — runs exactly as
+in serial mode; every process therefore verifies its own target.
+
+The task pairs this with ``--dist loadfile`` so a whole test file stays
+on one worker: upstream's within-file ordering (shared fixtures,
+collections created by one test and read by the next — the same reason
+``-p no:randomly`` is passed) is preserved. Coverage is identical; only
+the file→process assignment changes. One behavioural difference worth
+knowing: if pytest-timeout kills a worker, its restart gets a *fresh*
+server, so server-side state from the killed worker's earlier tests is
+gone (in serial mode the controller's server outlived the restart).
+
 Server selection (``SECANTUS_GAUGE_SERVER``, default ``python``):
 
 * ``python`` — the original pure-Python ``SecantusDBServer`` (the headline
@@ -88,18 +114,27 @@ def _start_server(mode: str, storage_dir: str) -> tuple[Any, str, int]:
     raise ValueError(f"SECANTUS_GAUGE_SERVER={mode!r} not recognised (expected 'python' or 'rust')")
 
 
+def per_worker_servers() -> bool:
+    """True when each xdist worker runs against its own embedded server.
+
+    Set by ``invoke validate --jobs N`` (N > 1). See the module docstring.
+    """
+    return os.environ.get("SECANTUS_GAUGE_PER_WORKER", "") not in ("", "0")
+
+
 def pytest_load_initial_conftests(early_config: Any, parser: Any, args: Any) -> None:
     # MUST run before pymongo's conftest is imported — see module docstring.
     global _server, _storage_dir, _address
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        # Under xdist (the gauge runs -n1 so a pytest-timeout process kill
-        # only takes out the worker, not the report), the CONTROLLER owns
-        # the server; workers inherit DB_IP/DB_PORT through the environment.
-        # Starting another server here would waste a WT store per worker
-        # and lose server-side state on every worker restart.
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker and not per_worker_servers():
+        # Serial gauge (-n1): the CONTROLLER owns the one server and the
+        # single worker inherits DB_IP/DB_PORT through the environment.
+        # Starting another server here would waste a WT store and lose
+        # server-side state on every worker restart.
         return
     mode = os.environ.get("SECANTUS_GAUGE_SERVER", "python")
-    _storage_dir = tempfile.mkdtemp(prefix=f"secantus-pymongo-gauge-{mode}-")
+    suffix = f"-{worker}" if worker else ""
+    _storage_dir = tempfile.mkdtemp(prefix=f"secantus-pymongo-gauge-{mode}{suffix}-")
     _server, host, port = _start_server(mode, _storage_dir)
     _address = (host, port)
     os.environ["DB_IP"] = host
@@ -111,8 +146,9 @@ def pytest_load_initial_conftests(early_config: Any, parser: Any, args: Any) -> 
     os.environ.setdefault("DB_USER", "user")
     os.environ.setdefault("DB_PASSWORD", "password")
     _logger.info(
-        "pymongo-validation: embedded SecantusDB (%s server) on %s:%d (storage=%s)",
+        "pymongo-validation: embedded SecantusDB (%s server%s) on %s:%d (storage=%s)",
         mode,
+        f", worker {worker}" if worker else "",
         host,
         port,
         _storage_dir,

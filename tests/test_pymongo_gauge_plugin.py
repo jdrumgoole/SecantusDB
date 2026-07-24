@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 from pymongo import MongoClient
-from pymongo_validation.plugin import _start_server
+from pymongo_validation.plugin import _start_server, per_worker_servers
+from tasks import _gauge_parallel_flags
 
 
 def test_python_mode_starts_a_reachable_server(tmp_path: Path) -> None:
@@ -62,3 +63,65 @@ def test_rust_mode_starts_a_reachable_server(tmp_path: Path) -> None:
         client.close()
     finally:
         server.stop()
+
+
+def test_per_worker_servers_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SECANTUS_GAUGE_PER_WORKER", raising=False)
+    assert per_worker_servers() is False
+
+
+@pytest.mark.parametrize("value", ["", "0"])
+def test_per_worker_servers_off_for_empty_and_zero(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("SECANTUS_GAUGE_PER_WORKER", value)
+    assert per_worker_servers() is False
+
+
+@pytest.mark.parametrize("value", ["1", "yes", "true"])
+def test_per_worker_servers_on_for_truthy_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("SECANTUS_GAUGE_PER_WORKER", value)
+    assert per_worker_servers() is True
+
+
+def test_serial_gauge_flags_are_unchanged() -> None:
+    # The published number is measured with --jobs 1; that invocation must
+    # stay byte-identical to the pre-parallel one (no per-worker env, -n1,
+    # no --dist override).
+    assert _gauge_parallel_flags(1) == ("", "-n1")
+
+
+def test_parallel_gauge_flags_distribute_whole_files() -> None:
+    env, flags = _gauge_parallel_flags(4)
+    assert env == "SECANTUS_GAUGE_PER_WORKER=1 "
+    # loadfile is load-bearing: it keeps upstream's within-file ordering,
+    # which the vendored suites depend on.
+    assert flags == "-n4 --dist loadfile"
+
+
+def test_zero_jobs_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        _gauge_parallel_flags(0)
+
+
+def test_two_embedded_servers_do_not_share_state(tmp_path: Path) -> None:
+    # The premise of --jobs N: workers can reuse the same database and
+    # collection names because each has its own server and WT store.
+    a, a_host, a_port = _start_server("python", str(tmp_path / "a"))
+    b, b_host, b_port = _start_server("python", str(tmp_path / "b"))
+    try:
+        assert (a_host, a_port) != (b_host, b_port)
+        ca: MongoClient = MongoClient(a_host, a_port, serverSelectionTimeoutMS=5000)
+        cb: MongoClient = MongoClient(b_host, b_port, serverSelectionTimeoutMS=5000)
+        try:
+            ca.pymongo_test.coll.insert_one({"_id": 1, "worker": "a"})
+            assert cb.pymongo_test.coll.find_one({"_id": 1}) is None
+            assert "pymongo_test" not in cb.list_database_names()
+        finally:
+            ca.close()
+            cb.close()
+    finally:
+        a.stop()
+        b.stop()
