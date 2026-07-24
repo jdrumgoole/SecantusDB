@@ -218,3 +218,79 @@ fn list_databases_includes_local_with_oplog() {
         assert_eq!(dbs, sorted);
     });
 }
+
+/// A renamed collection's secondary indexes must still find every document
+/// THROUGH THE INDEX. Regression guard for RecordId step 2: rename re-mints
+/// every doc's RecordId in the destination, and index entries carry the
+/// RecordId — so copying the source's entry rows verbatim (as pre-step-2 code
+/// did) would leave every entry pointing at a RecordId that does not exist in
+/// the destination, and an indexed query would silently return nothing while a
+/// collection scan still saw the docs. `rename_collection` must REBUILD the
+/// entries against the new RecordIds.
+///
+/// The check forces an IXSCAN (hint) and compares it against a collection scan:
+/// a broken rename passes the scan and fails the index, so comparing the two is
+/// what catches it (comparing an index to itself would not).
+#[test]
+fn rename_keeps_secondary_index_reachable_through_the_index() {
+    use secantus_storage::{ExplainPlan, Hint};
+    with_db(|st| {
+        let n = 60;
+        let docs: Vec<Vec<u8>> = (0..n).map(|k| enc(&doc! {"_id": k, "x": k % 6})).collect();
+        st.insert("app", "src", docs, false).unwrap();
+        st.create_index("app", "src", "x_1", &doc! {"x": 1}, &Document::new())
+            .unwrap();
+
+        let (renamed, _) = st
+            .rename_collection("app", "src", "app", "dst", false)
+            .unwrap();
+        assert!(renamed);
+
+        // The index must have moved with the collection and be an IXSCAN target.
+        assert!(
+            st.list_indexes("app", "dst")
+                .unwrap()
+                .iter()
+                .any(|ix| ix.get_str("name").unwrap_or("") == "x_1"),
+            "x_1 index did not survive the rename"
+        );
+        match st.explain_plan("app", "dst", &doc! {"x": 3}).unwrap() {
+            ExplainPlan::IxScan { index_name, .. } => assert_eq!(index_name, "x_1"),
+            other => panic!("expected IXSCAN on the renamed index, got {other:?}"),
+        }
+
+        // For every bucket: the IXSCAN result must equal the collection scan.
+        let hint = Hint::Name("x_1".to_string());
+        for bucket in 0..6 {
+            let via_index: Vec<i32> = st
+                .find_matching_with(
+                    "app",
+                    "dst",
+                    &doc! {"x": bucket},
+                    None,
+                    Some(&hint),
+                    None,
+                    &Document::new(),
+                )
+                .unwrap()
+                .iter()
+                .map(|b| decode(b).get_i32("_id").unwrap())
+                .collect();
+            let via_scan: Vec<i32> = st
+                .find_matching("app", "dst", &Document::new())
+                .unwrap()
+                .iter()
+                .map(|b| decode(b))
+                .filter(|d| d.get_i32("x").unwrap() == bucket)
+                .map(|d| d.get_i32("_id").unwrap())
+                .collect();
+            let (mut a, mut b) = (via_index.clone(), via_scan.clone());
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "bucket {bucket}: index != scan after rename");
+            assert_eq!(a.len(), 10, "bucket {bucket}: expected 10 docs");
+        }
+        // The source is gone.
+        assert!(!st.collection_exists("app", "src").unwrap());
+    });
+}
