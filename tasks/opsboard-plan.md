@@ -36,11 +36,22 @@ its stacked ancestors and closed as superseded).
   processes started outside `./inv`, honestly limited to command + elapsed.
 - **Phase 6 — docs.** `docs/opsboard.md`, in the Sphinx toctree beside `admin`.
 
+### Post-plan follow-ups (also landed)
+
+Features added after the six phases, on request:
+
+- **Gauge scores** (#630) — the matrix parses `docs/validation-report*.md`
+  (`reports.py`, handling all three table shapes) and shows each driver's
+  passed/ran and pass rate per server.
+- **Origin flags + CI dispatch + running/history split** (#631) — `activity.py`
+  merges local jobs and GitHub runs into one feed tagged `local` / `GitHub CI`;
+  `GitHubClient.workflows()` / `.dispatch()` start CI runs (release-class
+  workflows confirm-gated); `Journal.list(include_running=False)` powers a
+  Jobs page split into a self-refreshing "Running now" block and a history
+  table of finished jobs.
+
 ### Known gaps (deliberate, not oversights)
 
-- **Gauge report parsing** — the matrix runs gauges but does not parse
-  `docs/validation-report*.md` to show pass/fail/skip rates. This is the most
-  natural next feature.
 - **No dedicated Build page** — build tasks live on the dashboard cards.
 - **No PyPI lookup** in version drift — local tags only, so the panel never
   depends on the network.

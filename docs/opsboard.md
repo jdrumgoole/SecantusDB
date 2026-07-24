@@ -103,6 +103,14 @@ process group *and* any descendant that escaped it, such as a shell,
 reaped so they don't linger as zombies. Process-group teardown is POSIX;
 the board targets macOS and Linux.
 
+### Running now vs history
+
+The Jobs page separates what's **running now** from the **history** of
+finished jobs. The running block refreshes itself — quickly while work is
+in flight, slowly when idle — and carries the cancel controls; the history
+table below pages through completed jobs only, so a row can't drift
+between pages as it finishes.
+
 ## Gauges
 
 The **Gauges** page lists all thirteen driver-conformance suites —
@@ -111,6 +119,14 @@ and extension), C, C++ and C#/.NET — with a Run button for each server,
 so a single gauge can be pointed at either the Python or the Rust server.
 Each row shows the local toolchain that gauge requires and an expected
 duration, and its info dialog explains what that particular suite proves.
+
+Each row also shows **how the gauge last scored** — passed-of-ran and the
+pass rate, green when clean and amber when anything failed, with the
+report date beneath and the full passed/failed/errored/skipped breakdown
+on hover. Those numbers are read from the report each gauge itself
+generates (`docs/validation-report*.md`), so they can't drift from what
+was measured; a gauge that has never been run here says so rather than
+showing a misleading zero.
 
 The dashboard additionally offers **All gauges** per server
 (`validate-all`) with a parallelism field that sets `--jobs N`. Four or
@@ -140,6 +156,19 @@ parallel worktree's session, a cron, a release tag — appears here with no
 opt-in, because GitHub is the shared source of truth. It needs the `gh`
 CLI installed and authenticated; without it the page explains that rather
 than failing.
+
+Local jobs and GitHub runs are also shown together in one **activity
+feed**, newest first, with each row tagged `local` or `GitHub CI` — so
+"did this build run on my machine or on CI?" is answered by the row
+rather than by which page you opened. GitHub's states are normalised to
+the same passed / failed / running words the local jobs use.
+
+You can also **start** a CI run from here: pick a workflow that accepts a
+manual dispatch and a ref, and the board triggers it on GitHub (it runs
+there, not locally). Workflows that publish — to PyPI, or that cut
+release binaries — are flagged and require their exact name typed as
+confirmation, the same gate the [Release](#releases) page applies, since
+dispatching one is just as outward-facing.
 
 The same page shows **version drift** for the two independently-versioned
 servers: what the working tree carries versus the most recent matching
