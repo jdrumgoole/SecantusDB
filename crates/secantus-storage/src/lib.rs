@@ -1064,20 +1064,6 @@ fn resolve_current_date(update: &Document) -> Result<Document> {
     Ok(out)
 }
 
-/// The doc-table key for `doc`: the caller-supplied override (timeseries rows
-/// carry a suffixed key) when present, else `id_key(doc["_id"])`.
-fn doc_table_key(doc: &Document, override_key: Option<&[u8]>) -> Result<Vec<u8>> {
-    match override_key {
-        Some(k) => Ok(k.to_vec()),
-        None => {
-            let id = doc
-                .get("_id")
-                .ok_or_else(|| StorageError::Bson("document missing _id".into()))?;
-            id_key(id)
-        }
-    }
-}
-
 // --- index-key construction (mirrors `storage.py`, byte-for-byte) ---
 
 /// The per-field sort direction of a `key_spec` value: `Some(1)`/`Some(-1)` for
@@ -4128,7 +4114,6 @@ impl Storage {
         // Collect every src row, drop the src tables, then re-key into dst.
         let docs = self.scan_docs(&session, src_db, src_coll)?;
         let idx_rows = self.collect_idx_rows(&session, src_db, src_coll)?;
-        let entry_rows = self.collect_entry_rows(&session, src_db, src_coll)?;
         self.purge_collection_tables(&session, src_db, src_coll)?;
         // Sharded: dst rows go to the dst collection's shard (may differ from the
         // src shard — the src rows were already read into `docs` and purged above).
@@ -4136,12 +4121,16 @@ impl Storage {
         // insertion order) and write the dst `_id` index (id_key -> RecordId); the
         // doc-table value carries the id_key in-band (framed).
         let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
+        // Remember each doc against the RecordId it was RE-MINTED under in the
+        // destination — the source RecordIds do not carry over.
+        let mut moved: Vec<(i64, Document)> = Vec::with_capacity(docs.len());
         for (_src_rid, id_k, blob) in &docs {
             let recordid = self.write_nat_entry(&session, dst_db, dst_coll, id_k)?;
             dcur.reset()?;
             dcur.set_key_ssq(dst_db, dst_coll, recordid);
             dcur.set_value_u(&frame_doc_value(id_k, blob));
             dcur.insert()?;
+            moved.push((recordid, decode_doc(blob)?));
         }
         let icur = session.open_cursor(IDX_TABLE, None)?;
         for (name, payload) in &idx_rows {
@@ -4150,12 +4139,16 @@ impl Storage {
             icur.set_value_u(payload);
             icur.insert()?;
         }
-        let ecur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        for (name, packed) in &entry_rows {
-            ecur.reset()?;
-            ecur.set_key_sssu(dst_db, dst_coll, name, packed);
-            ecur.set_value_u(b"");
-            ecur.insert()?;
+        // REBUILD the index entries rather than copying the source's packed rows.
+        // Step-2 entries carry the RecordId, and rename re-mints every RecordId, so
+        // copied entries would point at rows that do not exist in the destination —
+        // silently breaking every index on the renamed collection. (Under step 1
+        // entries carried the `id_key`, which survives a rename, so the copy was
+        // safe then.) The index catalog rows are written above, so `index_descs`
+        // sees the destination's indexes here.
+        let dst_descs = self.index_descs(&session, dst_db, dst_coll)?;
+        for (recordid, doc) in &moved {
+            self.write_index_entries(&session, dst_db, dst_coll, doc, &dst_descs, *recordid)?;
         }
         ensure_collection(&session, dst_db, dst_coll)?;
         let rc = session.open_cursor(COLL_TABLE, None)?;
@@ -5794,7 +5787,7 @@ impl Storage {
         session: &Session,
         db: &str,
         coll: &str,
-    ) -> Result<Vec<(String, i64)>> {
+    ) -> Result<Vec<(String, Vec<u8>)>> {
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         let mut out = Vec::new();
         cur.set_key_sssu(db, coll, "", b"");
@@ -5823,12 +5816,7 @@ impl Storage {
     /// Introspection: the entries of index `name` as `(escaped_kb, id_key)`
     /// pairs in WiredTiger (sorted) order. Primarily for tests and explain-style
     /// inspection; the lookup paths in later slices read entries directly.
-    pub fn index_entries(
-        &self,
-        db: &str,
-        coll: &str,
-        name: &str,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn index_entries(&self, db: &str, coll: &str, name: &str) -> Result<Vec<(Vec<u8>, i64)>> {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
@@ -5851,7 +5839,9 @@ impl Storage {
                 break;
             }
             let (kb, idk) = unpack_entry(&packed);
-            if let Some(rid) = idk { out.push((kb.to_vec(), rid)); }
+            if let Some(rid) = idk {
+                out.push((kb.to_vec(), rid));
+            }
             more = scan.next()?;
         }
         Ok(out)
@@ -6009,26 +5999,25 @@ impl Storage {
         if filter.is_empty() || force_scan {
             return self.scan_docs(session, db, coll);
         }
-        if let Some(id_keys) = self.try_index_id_keys(session, db, coll, filter)? {
-            // Index entries still carry the `id_key` fetch pointer (step 1); resolve
-            // it to the RecordId via the `_id` index, then read the doc row.
+        if let Some(recordids) = self.try_index_id_keys(session, db, coll, filter)? {
+            // Index entries carry the RecordId (step 2), so this reads the doc row
+            // directly — no `id_key -> _id index -> RecordId` hop. The doc's own
+            // id_key comes back from the framed value, which is what the callers
+            // (delete / update maintenance) need it for.
             let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let mut seen: HashSet<i64> = HashSet::new();
             let mut out = Vec::new();
-            for id_k in id_keys {
-                if !seen.insert(id_k.clone()) {
+            for recordid in recordids {
+                if !seen.insert(recordid) {
                     continue;
                 }
-                let Some(recordid) = self.doc_recordid(session, db, coll, &id_k)? else {
-                    continue;
-                };
                 cur.reset()?;
                 cur.set_key_ssq(db, coll, recordid);
                 match cur.search() {
                     Ok(()) => {
                         let value = cur.get_value_u()?;
-                        let (_idk, blob) = unframe_doc_value(&value)?;
-                        out.push((recordid, id_k, blob.to_vec()));
+                        let (idk, blob) = unframe_doc_value(&value)?;
+                        out.push((recordid, idk.to_vec(), blob.to_vec()));
                     }
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
@@ -6686,10 +6675,10 @@ impl Storage {
         coll: &str,
         name: &str,
         reverse: bool,
-    ) -> Result<Vec<i64>> {
+    ) -> Result<Vec<Vec<u8>>> {
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         cur.set_key_sssu(db, coll, name, b"");
-        let mut id_keys: Vec<Vec<u8>> = Vec::new();
+        let mut recordids: Vec<i64> = Vec::new();
         let mut more = match cur.search_near() {
             Ok(cmp) => {
                 if cmp < 0 {
@@ -6707,13 +6696,15 @@ impl Storage {
                 break;
             }
             let (_esc, row_id) = unpack_entry(&packed);
-            if let Some(rid) = row_id { id_keys.push(rid); }
+            if let Some(rid) = row_id {
+                recordids.push(rid);
+            }
             more = cur.next()?;
         }
         if reverse {
-            id_keys.reverse();
+            recordids.reverse();
         }
-        self.docs_by_recordids(session, db, coll, &id_keys)
+        self.docs_by_recordids(session, db, coll, &recordids)
     }
 
     /// A compound index whose key spec exactly matches `sort_fields` (forward) or
@@ -6762,7 +6753,7 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<Vec<i64>>> {
         if filter.is_empty() {
             return Ok(None);
         }
@@ -6776,7 +6767,17 @@ impl Storage {
         if filter.len() == 1 && !self.is_timeseries(session, db, coll)? {
             if let Some(spec) = filter.get("_id") {
                 if let Some(id_keys) = id_point_lookup_keys(spec)? {
-                    return Ok(Some(id_keys));
+                    // Callers want RecordIds. For an `_id` lookup the `_id` index IS
+                    // the primary access path (not the secondary-index hop step 2
+                    // removed), so resolve each key through it; a key with no row
+                    // simply matches nothing.
+                    let mut rids = Vec::with_capacity(id_keys.len());
+                    for id_k in &id_keys {
+                        if let Some(rid) = self.doc_recordid(session, db, coll, id_k)? {
+                            rids.push(rid);
+                        }
+                    }
+                    return Ok(Some(rids));
                 }
             }
         }
@@ -6848,7 +6849,7 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<Vec<i64>>> {
         if filter.len() != 1 {
             return Ok(None);
         }
@@ -6916,7 +6917,7 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<Vec<i64>>> {
         if filter.len() != 1 {
             return Ok(None);
         }
@@ -6936,12 +6937,12 @@ impl Storage {
             Some(b) => b,
             None => return Ok(None),
         };
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut out: Vec<i64> = Vec::new();
+        let mut seen: HashSet<i64> = HashSet::new();
         for cid in s2_cells_for_bbox(min_x, min_y, max_x, max_y) {
             let kb = secantus_core::geo::encode_cell(cid);
             for id_k in self.scan_index_for_id_keys(session, db, coll, &name, &kb, false)? {
-                if seen.insert(id_k.clone()) {
+                if seen.insert(id_k) {
                     out.push(id_k);
                 }
             }
@@ -7076,7 +7077,7 @@ impl Storage {
         coll: &str,
         idx: &(String, i32, bool),
         value: &Bson,
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<Vec<i64>>> {
         let (name, direction, is_compound) = (idx.0.as_str(), idx.1, idx.2);
         let opdoc = match value {
             Bson::Document(d) => d,
@@ -7106,14 +7107,14 @@ impl Storage {
                 Some(Bson::Array(a)) => a,
                 _ => return Ok(None),
             };
-            let mut seen: HashSet<Vec<u8>> = HashSet::new();
-            let mut out: Vec<Vec<u8>> = Vec::new();
+            let mut seen: HashSet<i64> = HashSet::new();
+            let mut out: Vec<i64> = Vec::new();
             for v in vals {
                 if matches!(v, Bson::Document(_)) {
                     return Ok(None);
                 }
                 for id_k in self.eq_id_keys(session, db, coll, name, direction, is_compound, v)? {
-                    if seen.insert(id_k.clone()) {
+                    if seen.insert(id_k) {
                         out.push(id_k);
                     }
                 }
@@ -7194,7 +7195,7 @@ impl Storage {
         direction: i32,
         is_compound: bool,
         value: &Bson,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<i64>> {
         let kb = enc_dir(value, direction)?;
         if is_compound {
             let mut seed = kb;
@@ -7252,7 +7253,9 @@ impl Storage {
             } else if row_esc != esc_kb.as_slice() {
                 break;
             }
-            if let Some(rid) = row_id { out.push(rid); }
+            if let Some(rid) = row_id {
+                out.push(rid);
+            }
             more = cur.next()?;
         }
         Ok(out)
@@ -7329,7 +7332,9 @@ impl Storage {
                     break;
                 }
             }
-            if let Some(rid) = row_id { out.push(rid); }
+            if let Some(rid) = row_id {
+                out.push(rid);
+            }
             more = cur.next()?;
         }
         Ok(out)
@@ -7401,7 +7406,9 @@ impl Storage {
                     break;
                 }
             }
-            if let Some(rid) = row_id { out.push(rid); }
+            if let Some(rid) = row_id {
+                out.push(rid);
+            }
             more = cur.next()?;
         }
         Ok(out)
@@ -7620,7 +7627,7 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<Vec<i64>>> {
         let (name, key_spec) = match self.pick_compound_eq_index(session, db, coll, filter)? {
             Some(p) => p,
             None => return Ok(None),
@@ -7718,7 +7725,7 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<Vec<i64>>> {
         let (eq_fields, operator_field, operator_ops) =
             match partition_compound_range_filter(filter) {
                 Some(p) => p,
@@ -7758,8 +7765,8 @@ impl Storage {
                 Some(Bson::Array(a)) => a,
                 _ => return Ok(None),
             };
-            let mut seen: HashSet<Vec<u8>> = HashSet::new();
-            let mut out: Vec<Vec<u8>> = Vec::new();
+            let mut seen: HashSet<i64> = HashSet::new();
+            let mut out: Vec<i64> = Vec::new();
             for v in vals {
                 if matches!(v, Bson::Document(_)) {
                     return Ok(None);
@@ -7768,7 +7775,7 @@ impl Storage {
                 for id_k in
                     self.scan_index_for_id_keys(session, db, coll, &name, &inner, use_prefix)?
                 {
-                    if seen.insert(id_k.clone()) {
+                    if seen.insert(id_k) {
                         out.push(id_k);
                     }
                 }
@@ -8667,24 +8674,51 @@ mod tests {
 
     #[test]
     fn pack_entry_layout_and_unpack_roundtrip() {
-        let (kb, id) = (b"\x01\x00\x02".as_slice(), b"ID".as_slice());
-        let packed = pack_entry(kb, id);
-        assert_eq!(packed, vec![0x01, 0x00, 0xff, 0x02, 0x00, 0x00, b'I', b'D']);
-        let (esc_kb, idk) = unpack_entry(&packed);
+        // `escape(kb) + \x00\x00 + RecordId(8B big-endian)` (step 2).
+        let kb = b"\x01\x00\x02".as_slice();
+        let packed = pack_entry(kb, 1);
+        assert_eq!(
+            packed,
+            vec![0x01, 0x00, 0xff, 0x02, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+        let (esc_kb, rid) = unpack_entry(&packed);
         assert_eq!(esc_kb, escape_kb(kb).as_slice());
-        assert_eq!(idk, id);
+        assert_eq!(rid, Some(1));
     }
 
     #[test]
     fn unpack_splits_on_first_separator() {
-        // The id_key half may itself contain `\x00\x00`; the split must land at
-        // the FIRST separator — correct because the escaped kb half can't
-        // contain a bare `\x00\x00`.
-        let (kb, id) = (b"\x00".as_slice(), b"\x00\x00tail".as_slice());
-        let packed = pack_entry(kb, id);
-        let (esc_kb, idk) = unpack_entry(&packed);
+        // A RecordId's big-endian bytes routinely contain `\x00\x00` (every small
+        // id does), so the split MUST land at the FIRST separator — correct
+        // because the escaped kb half can never contain a bare `\x00\x00`, and
+        // safe because the trailing half is fixed-width and taken whole.
+        let kb = b"\x00".as_slice();
+        let packed = pack_entry(kb, 1);
+        let (esc_kb, rid) = unpack_entry(&packed);
         assert_eq!(esc_kb, vec![0x00, 0xff].as_slice());
-        assert_eq!(idk, id);
+        assert_eq!(rid, Some(1));
+    }
+
+    #[test]
+    fn pack_entry_orders_by_recordid_within_a_key() {
+        // Big-endian keeps the B-tree ordered by RecordId (insertion order)
+        // within one index key — little-endian would scramble it.
+        let kb = b"k".as_slice();
+        assert!(pack_entry(kb, 1) < pack_entry(kb, 2));
+        assert!(pack_entry(kb, 2) < pack_entry(kb, 300));
+        assert!(pack_entry(kb, 300) < pack_entry(kb, i64::MAX));
+    }
+
+    #[test]
+    fn unpack_rejects_a_step1_entry() {
+        // A step-1 entry's trailing half is an `id_key`, not an 8-byte RecordId.
+        // It must report None rather than reinterpreting those bytes as a
+        // RecordId — that would silently fetch the wrong document.
+        let mut packed = escape_kb(b"k");
+        packed.extend_from_slice(ENTRY_SEP);
+        packed.extend_from_slice(b"an-id-key");
+        let (_esc, rid) = unpack_entry(&packed);
+        assert_eq!(rid, None);
     }
 
     #[test]
