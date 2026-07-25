@@ -45,17 +45,36 @@ The oplog write no longer happens in the writer's transaction. Instead:
    a complete oplog (clean-restart durability preserved).
 
 ## Measured (8 writers, per-writer collections, embedded Rust, interleaved,
-## stable regime — all reps tight)
+## clean orphan-guarded runs — all reps tight)
 
-| arm | docs/s | scaling vs 1-writer (~25.7k) | penalty vs off |
-|---|---:|:---:|:---:|
-| sync oplog (current default) | 46,677 | 1.8× | 3.08× |
-| **async oplog (prototype)** | **102,832** | **4.0×** | **1.40×** |
-| no oplog (ceiling) | 144,375 | 5.6× | 1.00× |
+| async-ON config | docs/s | ×sync (~46–53k) | note |
+|---|---:|:---:|---|
+| **128 MB cap — bounded / SUSTAINABLE** | **~71.4k** | **1.35×** | the real number |
+| unbounded cap — transient | ~103k | 2.28× | **not sustainable** (queue grows toward OOM) |
+| no oplog (ceiling) | ~144–150k | 3.1× | data-only scaling |
 
-**async is 2.20× the synchronous throughput at 8 writers** and moves scaling from
-1.8× to 4.0× — approaching mongod's 4.67× and 71% of the no-oplog ceiling.
-(`scratchpad/conc_async_ab.py`.)
+**The sustainable async win is ~1.35× at 8 writers** (single drainer + the 128 MB
+backpressure cap). The earlier "2.2× / 4.0×-scaling" reading was the *unbounded*
+transient: with no cap, writers produce ~103k/s while the **single drainer thread
+sustains only ~71k/s**, so the queue grows ~30k entries/s (toward OOM over a long
+run) — the 103k is writers outrunning the drainer, not a sustainable rate. Proven
+by an A/B on the cap: a 10 GB (effectively unbounded) cap reproduces ~103k, the
+128 MB cap settles at ~71k, and the backpressure mutex is *not* the cost (the
+unbounded run has the same mutex). So **the drainer's single-thread write
+throughput (~71k/s) is the new bottleneck** — see "Next lever" below.
+(`scratchpad/conc_async_ab.py`; the cap is `SECANTUS_OPLOG_ASYNC_CAP_BYTES`.)
+
+## Next lever: a parallel drainer
+
+To make the higher rate *sustainable* the drainer must out-run the writers. A
+single thread caps oplog writes at ~71k/s; a **pool of drainers** (e.g. one per
+oplog shard, so writes spread across cores as the sharding intends) would raise
+aggregate drain throughput toward the ~103k writer rate — at which point the queue
+stays small and async approaches the no-oplog ceiling *sustainably*. The added
+complexity is the `written_seq` watermark: with concurrent drainers, completion is
+out of order, so the contiguous-prefix computation moves from the current
+single-thread `next_expected` into a shared completion tracker (a BTreeMap of
+finished seq ranges whose contiguous prefix is the watermark). Flagged, not built.
 
 ## Correctness validated
 
@@ -82,12 +101,27 @@ benchmark's standalone mongod (no oplog at all). Appropriate for SecantusDB's
 ephemeral-test audience; it is opt-in precisely because it changes a durability
 property.
 
+## Backpressure (implemented)
+
+The drainer is fed through a **byte budget** (`Backpressure`, same shape as the
+server's `AllocBudget`): a just-committed writer reserves its batch's bytes before
+enqueuing and blocks while more than `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (default
+128 MB) is queued-but-not-yet-persisted (channel + reorder buffer); the drainer
+releases each batch's reservation after it lands. A lone batch larger than the cap
+still proceeds (never deadlocks). So a sustained writer burst that outpaces the
+drainer blocks at the enqueue point instead of growing memory without bound.
+Validated: with an 8 KB cap, 4 writers × 400 inserts (~720 KB of oplog) are all
+delivered to a change stream exactly once — zero loss, no deadlock — the queue
+never exceeding 8 KB (`scratchpad/conc_backpressure.py`). At the default 128 MB cap
+the 8-writer async rate settles at the drainer's sustainable ~71k/s (1.35× sync);
+this is not backpressure *overhead* (an unbounded cap has the same mutex and hits
+~103k) but backpressure correctly bounding the queue to the single drainer's real
+throughput — see the Measured section.
+
 ## Remaining work before this is more than a prototype
 
-- **Backpressure.** The drainer channel is unbounded — a sustained writer burst that
-  outpaces the drainer grows memory without bound. Add a bounded queue (blocking
-  enqueue) or a high-water-mark that briefly stalls writers.
-- **Config surface.** Currently an env flag (`SECANTUS_OPLOG_ASYNC`). Promote to an
+- **Config surface.** Currently an env flag (`SECANTUS_OPLOG_ASYNC`) + an env cap
+  override (`SECANTUS_OPLOG_ASYNC_CAP_BYTES`). Promote to an
   explicit `RustServer(oplog_async=…)` / `secantusd-rs --async-oplog` option with the
   durability trade documented at the call site.
 - **Read-after-write oplog reads.** Direct `read_oplog` / `oplog_tail_seq` callers

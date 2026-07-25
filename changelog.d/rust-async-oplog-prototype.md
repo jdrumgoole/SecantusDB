@@ -8,9 +8,13 @@ and WiredTiger's WAL, collapsing eight-writer scaling to ~1.8×. This ships a wo
 opt-in prototype that takes the oplog write off the writer's critical path: a
 committed write's entries are minted a sequence number and handed to a background
 drainer thread that persists them in order, while change-stream tailers wait on the
-drainer's durable watermark. On eight writers this measured **2.2× the synchronous
-throughput** (46.7k → 102.8k docs/s), lifting scaling from 1.8× to **4.0×** —
-approaching mongod's 4.67×.
+drainer's durable watermark. On eight writers this sustainably measured **~1.35× the
+synchronous throughput** (~52k → ~71k docs/s), bounded by the backpressure budget to
+the single drainer's real write throughput — a background pool of drainers (a follow-
+up) would raise that toward the ~103k rate writers can produce and the ~145k no-oplog
+ceiling. (Without the memory bound the queue grows unboundedly and momentarily hits
+~2.3×, but that is writers outrunning the drainer, not a sustainable rate — see
+`tasks/rust-async-oplog-prototype.md`.)
 
 It is **off by default** (`SECANTUS_OPLOG_ASYNC=1` to enable) because it changes a
 durability property: the oplog is no longer atomic with the data and a hard crash
