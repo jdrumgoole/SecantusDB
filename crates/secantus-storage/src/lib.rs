@@ -842,10 +842,24 @@ pub fn wt_config(
     sync_on_commit: bool,
     log_file_max: &str,
 ) -> String {
-    format!(
+    let mut cfg = format!(
         "create,session_max={session_max},cache_size={cache_size},eviction=(threads_min=4,threads_max=4),log=(enabled=true,file_max={log_file_max},prealloc=false),transaction_sync=(enabled={},method=fsync)",
         if sync_on_commit { "true" } else { "false" }
-    )
+    );
+    // `SECANTUS_WT_CONFIG_EXTRA` appends raw WiredTiger connection config — a
+    // tuning / experiment hook (e.g. `eviction=(threads_min=8,threads_max=8)` or
+    // `cache_size=4G`). WiredTiger's parser takes the LAST occurrence of a
+    // duplicated key, so an appended clause overrides the corresponding default.
+    if let Some(extra) = std::env::var_os("SECANTUS_WT_CONFIG_EXTRA") {
+        if let Some(extra) = extra.to_str() {
+            let extra = extra.trim();
+            if !extra.is_empty() {
+                cfg.push(',');
+                cfg.push_str(extra);
+            }
+        }
+    }
+    cfg
 }
 
 // zlib block compression on the value-heavy tables (document blobs live in the
