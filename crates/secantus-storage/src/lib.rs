@@ -22,9 +22,11 @@
 //! Later sub-phases add indexes, geo, and the oplog (see
 //! `tasks/rust-rewrite-phase4-scoping.md`).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use bson::oid::ObjectId;
@@ -1779,7 +1781,10 @@ type CollLocks = HashMap<(String, String), Arc<Mutex<()>>>;
 /// affected collection lock(s); read-only methods run lock-free — see
 /// `lock`'s invariants below.
 pub struct Storage {
-    conn: Connection,
+    /// Shared so the async-oplog drainer thread can open its own WT session from
+    /// the same connection (`Arc<Connection>` derefs to `Connection`, so every
+    /// `self.conn.open_session()` call site is unchanged).
+    conn: Arc<Connection>,
     /// The WiredTiger home (on-disk data) directory. Kept so `create_archive`
     /// can tar the consistent file set the `backup:` cursor enumerates.
     home: String,
@@ -1832,13 +1837,15 @@ pub struct Storage {
     /// Oplog recovery counters (next seq + last minted timestamp), guarded by a
     /// tiny dedicated mutex — `storage._oplog_seq_lock`. Held only for the
     /// microsecond seq/ts reservation, never across the WT cursor writes.
-    oplog: Mutex<OplogState>,
+    /// `Arc` so the async-oplog drainer can advance `written_seq` under it.
+    oplog: Arc<Mutex<OplogState>>,
     /// Change-stream tailable-wait condition, paired with the `oplog` mutex (the
     /// tail seq is `oplog.next_seq - 1`). `emit_oplog` notifies it after writing,
     /// `notify_oplog_waiters` wakes it on cursor kill; `wait_for_oplog` blocks on
     /// it. Mirrors `storage._oplog_cv` — a dedicated condition, *not* the storage
     /// `lock`, so a waiting tailable getMore can't ABBA-deadlock the write path.
-    oplog_cv: Condvar,
+    /// `Arc` so the drainer can notify it after advancing `written_seq`.
+    oplog_cv: Arc<Condvar>,
     /// Retention window (seconds) and hard entry cap for `prune_oplog`. Mirrors
     /// `storage.oplog_retention_seconds` / `oplog_max_entries`.
     oplog_retention_seconds: i64,
@@ -1869,6 +1876,16 @@ pub struct Storage {
     /// log line), so the close-time checkpoint is skipped for it — mirroring
     /// Python `Storage._in_memory`.
     in_memory: bool,
+    /// PROTOTYPE (opt-in via `SECANTUS_OPLOG_ASYNC=1`): when `Some`, oplog entries
+    /// are NOT written inside the write's transaction. Instead the committed
+    /// write's entries are minted a seq and handed to a background drainer thread
+    /// that persists them off the writer's critical path — so concurrent writers
+    /// stop contending on the shared oplog btrees/WAL (`tasks/rust-perf-findings.md`
+    /// Finding 5). Trade: the oplog is no longer atomic with the data and a hard
+    /// crash loses entries the drainer had not yet written (data stays durable;
+    /// clean close flushes the drainer before the checkpoint). `None` = the
+    /// synchronous, atomic default.
+    async_oplog: Option<Arc<AsyncOplog>>,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -1889,6 +1906,210 @@ struct OplogState {
     /// opportunistic prune early-out (one ts read) when under the cap instead of
     /// walking the whole oplog every 1000 emits — the write-path bottleneck.
     live_count: i64,
+    /// Async-oplog visibility watermark: the highest seq the background drainer
+    /// has durably committed to the oplog tables. In synchronous mode this stays
+    /// `next_seq - 1` (writes land inline). In async mode change-stream tailers
+    /// (`wait_for_oplog`) block on this, NOT the minted `next_seq`, so a tailer
+    /// never reads past what the drainer has actually written. Advanced by the
+    /// drainer under the `oplog` mutex, paired with `oplog_cv`.
+    written_seq: i64,
+}
+
+// --- async oplog (prototype) ---------------------------------------------
+
+thread_local! {
+    /// Oplog entries emitted during the current write statement, buffered until
+    /// the statement's transaction commits (async mode only). `with_statement_txn`
+    /// drains + enqueues them on a successful commit and clears them on
+    /// rollback/retry — so a rolled-back or retried write never mints a seq or
+    /// enqueues an entry (no gaps in the seq space, no duplicate change events).
+    /// Empty (and untouched) in the synchronous default.
+    static PENDING_OPLOG: RefCell<Vec<(OplogEntry, Option<Vec<u8>>)>> =
+        const { RefCell::new(Vec::new()) };
+
+    /// Set by `with_statement_txn` for the duration of an autocommit write
+    /// statement in async mode. `emit_oplog_entries` buffers only when this is
+    /// true, so paths NOT wrapped by `with_statement_txn` (the noop heartbeat,
+    /// any un-wrapped emit) keep writing the oplog synchronously — their entries
+    /// are never left stranded in `PENDING_OPLOG`.
+    static IN_ASYNC_STMT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A contiguous run of oplog entries (one minted seq range, one shard) handed to
+/// the drainer. The blobs are fully built (ts/wall already stamped) — only the
+/// WiredTiger write remains.
+struct DrainBatch {
+    start_seq: i64,
+    shard: String,
+    blobs: Vec<Vec<u8>>,
+    preimages: Vec<Option<Vec<u8>>>,
+}
+
+enum DrainMsg {
+    Batch(DrainBatch),
+    /// Flush everything buffered/queued and exit (clean shutdown).
+    Shutdown,
+}
+
+/// Handle to the background oplog drainer: the channel a committed write sends
+/// its entries down, plus the drainer's join handle (joined on `Storage` drop
+/// after a `Shutdown`, so a clean close persists every entry before the
+/// close-time checkpoint).
+struct AsyncOplog {
+    tx: mpsc::Sender<DrainMsg>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Shared state the drainer advances so change-stream tailers can observe its
+/// progress: the `oplog` mutex (for `written_seq`) + its condvar.
+struct DrainerShared {
+    conn: Arc<Connection>,
+    oplog: Arc<Mutex<OplogState>>,
+    oplog_cv: Arc<Condvar>,
+}
+
+/// Spawn the background oplog drainer and return the handle a committed write
+/// sends its entries to.
+fn spawn_oplog_drainer(shared: DrainerShared) -> Arc<AsyncOplog> {
+    let (tx, rx) = mpsc::channel::<DrainMsg>();
+    let join = thread::spawn(move || drainer_loop(shared, rx));
+    Arc::new(AsyncOplog {
+        tx,
+        join: Mutex::new(Some(join)),
+    })
+}
+
+/// Write one contiguous batch of oplog entries (+ pre-images) to its shard, in a
+/// single WT transaction so a partial batch never becomes visible.
+fn write_drain_batch(session: &Session, batch: &DrainBatch) -> Result<()> {
+    session.begin_transaction(None)?;
+    let res = (|| -> Result<()> {
+        let cur = session.open_cursor(&batch.shard, None)?;
+        let mut pre_cur: Option<Cursor> = None;
+        for (i, blob) in batch.blobs.iter().enumerate() {
+            let seq = batch.start_seq + i as i64;
+            cur.reset()?;
+            cur.set_key_q(seq);
+            cur.set_value_u(blob);
+            cur.insert()?;
+            if let Some(pre) = &batch.preimages[i] {
+                if pre_cur.is_none() {
+                    pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
+                }
+                let pc = pre_cur.as_ref().unwrap();
+                pc.reset()?;
+                pc.set_key_q(seq);
+                pc.set_value_u(pre);
+                pc.insert()?;
+            }
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => session.commit_transaction(None).map_err(Into::into),
+        Err(e) => {
+            let _ = session.rollback_transaction(None);
+            Err(e)
+        }
+    }
+}
+
+/// Write every batch buffered contiguously from `next_expected`, advancing the
+/// `written_seq` watermark and waking change-stream tailers once the run lands.
+fn drain_contiguous(
+    session: &Session,
+    shared: &DrainerShared,
+    buffer: &mut BTreeMap<i64, DrainBatch>,
+    next_expected: &mut i64,
+) {
+    let mut last_written = *next_expected - 1;
+    let mut wrote_any = false;
+    while let Some(batch) = buffer.remove(next_expected) {
+        let n = batch.blobs.len() as i64;
+        if let Err(e) = write_drain_batch(session, &batch) {
+            // A drainer write failure is a durability signal, never silent. Put
+            // the batch back and stop advancing; the next message re-attempts.
+            eprintln!(
+                "secantus-storage: async oplog drainer write failed at seq {}: {e:?}",
+                batch.start_seq
+            );
+            buffer.insert(batch.start_seq, batch);
+            break;
+        }
+        *next_expected += n;
+        last_written = *next_expected - 1;
+        wrote_any = true;
+    }
+    if wrote_any {
+        {
+            let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
+            if last_written > st.written_seq {
+                st.written_seq = last_written;
+            }
+        }
+        shared.oplog_cv.notify_all();
+    }
+}
+
+/// The drainer thread: receive committed writes' oplog batches, persist them in
+/// seq order (buffering to reorder concurrent arrivals), advance `written_seq`.
+/// On `Shutdown` it drains everything still queued/buffered before returning so
+/// a clean close checkpoints a complete oplog.
+fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
+    let session = match shared.conn.open_session() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("secantus-storage: async oplog drainer failed to open session: {e:?}");
+            return;
+        }
+    };
+    // The first seq that will be minted; every batch's start_seq >= this.
+    let mut next_expected = {
+        let st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        st.written_seq + 1
+    };
+    let mut buffer: BTreeMap<i64, DrainBatch> = BTreeMap::new();
+    let mut shutting_down = false;
+    loop {
+        let msg = if shutting_down {
+            rx.try_recv().ok()
+        } else {
+            rx.recv().ok()
+        };
+        match msg {
+            Some(DrainMsg::Batch(b)) => {
+                buffer.insert(b.start_seq, b);
+                drain_contiguous(&session, &shared, &mut buffer, &mut next_expected);
+            }
+            Some(DrainMsg::Shutdown) => shutting_down = true,
+            // recv error (sender dropped) or, while shutting down, queue drained.
+            None => break,
+        }
+    }
+    // Final flush: everything queued has been buffered; write the contiguous run.
+    drain_contiguous(&session, &shared, &mut buffer, &mut next_expected);
+    if !buffer.is_empty() {
+        // A non-contiguous leftover means a minted seq was never enqueued — a bug,
+        // surfaced loudly (this is a database). Persist what we have anyway so no
+        // committed write's event is silently dropped.
+        eprintln!(
+            "secantus-storage: async oplog drainer shut down with {} non-contiguous \
+             batch(es) buffered (expected seq {next_expected}); flushing best-effort",
+            buffer.len()
+        );
+        let leftovers = std::mem::take(&mut buffer);
+        let mut max_written = next_expected - 1;
+        for (_s, b) in leftovers {
+            let last = b.start_seq + b.blobs.len() as i64 - 1;
+            if write_drain_batch(&session, &b).is_ok() {
+                max_written = max_written.max(last);
+            }
+        }
+        let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        if max_written > st.written_seq {
+            st.written_seq = max_written;
+        }
+    }
 }
 
 /// Emit this many oplog rows between opportunistic `prune_oplog` sweeps on the
@@ -1980,6 +2201,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                         .max(scan_max_nat_seq(session) + 1),
                     emit_count: 0,
                     live_count: count_oplog_entries(session),
+                    written_seq: 0, // set to next_seq-1 by the caller (open)
                 });
             }
         }
@@ -2013,6 +2235,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         next_nat_seq: scan_max_nat_seq(session) + 1,
         emit_count: 0,
         live_count: count_oplog_entries(session),
+        written_seq: 0, // set to next_seq-1 by the caller (open)
     })
 }
 
@@ -2177,6 +2400,22 @@ impl Drop for Storage {
     /// logged, never silent: in a database a close-time write error is a
     /// durability signal.
     fn drop(&mut self) {
+        // Async oplog: flush the drainer BEFORE persisting meta / checkpointing,
+        // so every committed write's oplog entry is on disk when the checkpoint
+        // snapshots the tables (clean-close durability is preserved — only a hard
+        // crash loses undrained entries). Send Shutdown and join the thread; it
+        // drains its queue + buffer, then exits.
+        if let Some(async_h) = &self.async_oplog {
+            let _ = async_h.tx.send(DrainMsg::Shutdown);
+            if let Some(handle) = async_h
+                .join
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let _ = handle.join();
+            }
+        }
         let meta = {
             let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -2246,7 +2485,7 @@ impl Storage {
     ) -> Result<Storage> {
         let durable = resolve_durable_from_env(durable);
         let in_memory = config.contains("in_memory=true");
-        let conn = Connection::open(home, config)?;
+        let conn = Arc::new(Connection::open(home, config)?);
         let mut state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
@@ -2293,6 +2532,22 @@ impl Storage {
             state.last_ts_secs = state.last_ts_secs.max(now_secs()) + 1;
             state.last_ts_ord = 0;
         }
+        // The async drainer starts caught up to the recovered tail: nothing is
+        // in flight yet, so every seq < next_seq is already durably on disk.
+        state.written_seq = state.next_seq - 1;
+        let oplog = Arc::new(Mutex::new(state));
+        let oplog_cv = Arc::new(Condvar::new());
+        // PROTOTYPE opt-in: spawn the background drainer when SECANTUS_OPLOG_ASYNC
+        // is set. The synchronous, atomic path is the default (`None`).
+        let async_oplog = if std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some() {
+            Some(spawn_oplog_drainer(DrainerShared {
+                conn: conn.clone(),
+                oplog: oplog.clone(),
+                oplog_cv: oplog_cv.clone(),
+            }))
+        } else {
+            None
+        };
         Ok(Storage {
             conn,
             home: home.to_string(),
@@ -2300,14 +2555,15 @@ impl Storage {
             coll_locks: Mutex::new(HashMap::new()),
             oplog_prune_lock: Mutex::new(()),
             enable_oplog: true,
-            oplog: Mutex::new(state),
-            oplog_cv: Condvar::new(),
+            oplog,
+            oplog_cv,
             oplog_retention_seconds: 3600,
             oplog_max_entries: 100_000,
             ts_suffix_counter: AtomicU64::new(0),
             oplog_archive_dir: None,
             durable,
             in_memory,
+            async_oplog,
         })
     }
 
@@ -2440,26 +2696,51 @@ impl Storage {
         if matches!(session, OpSession::Txn(_)) {
             return f();
         }
+        // Async oplog: mark this statement so `emit_oplog_entries` buffers its
+        // entries instead of writing them in-transaction. The buffer is minted +
+        // handed to the drainer only on a successful commit (below), and cleared
+        // on rollback/retry — so a rolled-back write neither mints a seq (no gap)
+        // nor enqueues an entry (no duplicate change event).
+        let async_mode = self.async_oplog.is_some();
+        if async_mode {
+            IN_ASYNC_STMT.with(|f| f.set(true));
+            PENDING_OPLOG.with(|p| p.borrow_mut().clear());
+        }
         session.begin_transaction(None)?;
         match f() {
             Ok(v) => {
                 if let Err(e) = session.commit_transaction(None) {
                     let _ = session.rollback_transaction(None);
+                    if async_mode {
+                        IN_ASYNC_STMT.with(|f| f.set(false));
+                        PENDING_OPLOG.with(|p| p.borrow_mut().clear());
+                    }
                     const EINVAL: i32 = 22;
                     if e.is_rollback() || e.code == EINVAL {
                         return Err(StorageError::WriteConflict);
                     }
                     return Err(e.into());
                 }
-                // Wake tailable change-stream waiters only now that the rows
-                // are visible to their fresh-session reads (the in-statement
-                // notify fires before commit, which a waiter's re-read can
-                // miss).
-                self.notify_oplog_waiters();
+                if async_mode {
+                    // Committed: mint seqs for the buffered entries and hand them
+                    // to the drainer (which persists them + wakes tailers).
+                    IN_ASYNC_STMT.with(|f| f.set(false));
+                    self.drain_pending_oplog();
+                } else {
+                    // Sync: wake tailable change-stream waiters only now that the
+                    // rows are visible to their fresh-session reads (the
+                    // in-statement notify fires before commit, which a waiter's
+                    // re-read can miss).
+                    self.notify_oplog_waiters();
+                }
                 Ok(v)
             }
             Err(e) => {
                 let _ = session.rollback_transaction(None);
+                if async_mode {
+                    IN_ASYNC_STMT.with(|f| f.set(false));
+                    PENDING_OPLOG.with(|p| p.borrow_mut().clear());
+                }
                 Err(e)
             }
         }
@@ -2561,6 +2842,27 @@ impl Storage {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
+        // Async oplog (prototype): inside an autocommit write statement, buffer
+        // the entries instead of writing them in this transaction. They are minted
+        // a seq and handed to the drainer by `with_statement_txn` after the data
+        // transaction commits (`drain_pending_oplog`). In async mode ALL emission
+        // must go through the drainer: a synchronous WT write here would mint a
+        // seq the drainer never sees, leaving a permanent hole in its contiguous
+        // `written_seq` run (a stall). So an emit outside a wrapped statement
+        // (IN_ASYNC_STMT false — e.g. the noop heartbeat) buffers and drains
+        // immediately, treating itself as its own committed unit.
+        if self.async_oplog.is_some() {
+            PENDING_OPLOG.with(|p| {
+                let mut p = p.borrow_mut();
+                for pair in entries.into_iter().zip(pre_images) {
+                    p.push(pair);
+                }
+            });
+            if !IN_ASYNC_STMT.with(|f| f.get()) {
+                self.drain_pending_oplog();
+            }
+            return Ok(0);
+        }
         let n = entries.len() as i64;
         let (start, ts) = self.mint_seq_and_ts(entries.len());
         // Route the WHOLE batch to one shard (`start % OPLOG_SHARDS`) so concurrent
@@ -2642,6 +2944,73 @@ impl Storage {
         Ok(last)
     }
 
+    /// Async oplog (prototype): mint seqs + timestamps for this thread's buffered
+    /// entries (from a write that just committed) and hand them to the drainer as
+    /// one contiguous batch. Minting here — AFTER the data commit — is what keeps
+    /// the seq space gapless: a rolled-back/retried write cleared its buffer
+    /// before reaching this point, so it never minted. `wait_for_oplog` waits on
+    /// the drainer's `written_seq`, so a tailer never reads past what is on disk.
+    fn drain_pending_oplog(&self) {
+        let Some(async_h) = self.async_oplog.clone() else {
+            return;
+        };
+        let pending: Vec<(OplogEntry, Option<Vec<u8>>)> =
+            PENDING_OPLOG.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        if pending.is_empty() {
+            return;
+        }
+        let n = pending.len();
+        let (start, ts) = self.mint_seq_and_ts(n);
+        let wall_millis = now_millis();
+        let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut preimages: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+        for (i, (entry, pre)) in pending.into_iter().enumerate() {
+            let blob = match entry {
+                OplogEntry::Doc(mut d) => {
+                    d.insert("ts", Bson::Timestamp(ts[i]));
+                    d.insert(
+                        "wall",
+                        Bson::DateTime(bson::DateTime::from_millis(wall_millis)),
+                    );
+                    // A failed oplog encode is a bug (our own docs); keep the seq
+                    // filled with a valid empty document so the drainer's
+                    // contiguity (and thus every later entry) is never stalled.
+                    encode_doc(&d).unwrap_or_else(|e| {
+                        eprintln!("secantus-storage: async oplog encode failed: {e:?}");
+                        vec![5, 0, 0, 0, 0]
+                    })
+                }
+                OplogEntry::Raw(mut buf) => {
+                    buf.append("ts", bson::RawBsonRef::Timestamp(ts[i]).to_raw_bson());
+                    buf.append(
+                        "wall",
+                        bson::RawBsonRef::DateTime(bson::DateTime::from_millis(wall_millis))
+                            .to_raw_bson(),
+                    );
+                    buf.into_bytes()
+                }
+            };
+            blobs.push(blob);
+            preimages.push(pre);
+        }
+        {
+            let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+            g.live_count += n as i64;
+            g.emit_count += n as i64;
+        }
+        let batch = DrainBatch {
+            start_seq: start,
+            shard: oplog_shard_for_batch(start),
+            blobs,
+            preimages,
+        };
+        if async_h.tx.send(DrainMsg::Batch(batch)).is_err() {
+            eprintln!(
+                "secantus-storage: async oplog drainer gone; {n} committed entries not persisted"
+            );
+        }
+    }
+
     /// Block until the oplog tail seq exceeds `after_seq` (a new entry landed),
     /// or `timeout_ms` elapses, or a waiter is woken (`notify_oplog_waiters`).
     /// Returns the current tail seq. One bounded wait — a spurious wake returns
@@ -2650,15 +3019,45 @@ impl Storage {
     /// mutex, so there's no lost-wakeup; the wait releases that mutex so writers
     /// can still mint seqs. Used by the change-stream tailable getMore path.
     pub fn wait_for_oplog(&self, after_seq: i64, timeout_ms: u64) -> i64 {
+        // In async mode the visible tail is what the drainer has DURABLY written
+        // (`written_seq`), not the minted `next_seq` — a tailer must never read
+        // past a not-yet-persisted entry. In sync mode `written_seq` tracks
+        // `next_seq - 1`, so the same expression is exact there too.
+        let async_mode = self.async_oplog.is_some();
+        let tail = |st: &OplogState| {
+            if async_mode {
+                st.written_seq
+            } else {
+                st.next_seq - 1
+            }
+        };
         let guard = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.next_seq - 1 > after_seq {
-            return guard.next_seq - 1;
+        if tail(&guard) > after_seq {
+            return tail(&guard);
         }
         let (guard, _timed_out) = self
             .oplog_cv
             .wait_timeout(guard, Duration::from_millis(timeout_ms))
             .unwrap();
-        guard.next_seq - 1
+        tail(&guard)
+    }
+
+    /// Async oplog: block until the drainer has durably persisted every entry
+    /// minted so far (`written_seq == next_seq - 1`). No-op in synchronous mode
+    /// (where the two are always equal). Gives a caller read-after-write oplog
+    /// visibility — a consistency checkpoint, a test, or a drain before backup.
+    pub fn flush_oplog(&self) {
+        if self.async_oplog.is_none() {
+            return;
+        }
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        while st.written_seq < st.next_seq - 1 {
+            let (g, _timed_out) = self
+                .oplog_cv
+                .wait_timeout(st, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
+            st = g;
+        }
     }
 
     /// Wake every `wait_for_oplog` waiter without advancing the oplog (e.g. on
