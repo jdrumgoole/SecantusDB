@@ -544,3 +544,44 @@ Harnesses: `scratchpad/conc_oplog_interleaved.py` (interleaved ON/OFF, load-robu
 `scratchpad/conc_on_only.py` (single-arm best-case). The single-writer oplog-encode
 win (Finding 4, PR #642) also shaves per-write CPU under the collection lock, a small
 independent concurrency helper.
+
+## Finding 6 — WT write-ceiling tuning sweep: modest, quantified (2026-07-25)
+
+Finding 5 pinned the multi-writer oplog ceiling to WiredTiger's aggregate write
+throughput (the no-oplog 8-writer rate) and named WT-host tuning as the only
+remaining lever. Swept it directly: raw WT connection config appended via a new
+`SECANTUS_WT_CONFIG_EXTRA` env hook (WiredTiger takes the last occurrence of a
+duplicated key, so an appended clause overrides the default), measuring the no-oplog
+ceiling + sync-ON + async-ON at 8 writers on a quiesced box
+(`scratchpad/conc_wt_sweep.py`, 3 reps, orphan-guarded):
+
+| WT config | ceiling (no-oplog) | sync-ON | async-ON |
+|---|---:|---:|---:|
+| baseline (128MB log, evict 4, cache 1G) | 148k | 51k | 69k |
+| `cache_size=4G` | 151k (1.02×) | **65k (1.27×)** | 72k |
+| `eviction=(threads_min=8,threads_max=8)` | 148k (1.00×) | 51k | 69k |
+| `log=(file_max=512MB,prealloc=true)` | **161k (1.08×)** | 54k | 73k |
+| all three combined | **162k (1.09×)** | 62k | **79k (1.14×)** |
+
+Conclusions, each modest and each a resource trade — confirming Finding 5's "the
+ceiling is architectural, remaining levers are individually small":
+
+- **Log pre-allocation is the biggest write-ceiling lever (~+8%).** `prealloc=false`
+  (the default, chosen to keep tiny ephemeral test instances' log footprint small —
+  see `wt_config`) makes writers stall on log-file creation under load; `prealloc=true`
+  removes that stall. Cost: WT keeps ~2× `file_max` of pre-sized log ready, so at the
+  daemon's 2GB `file_max` that's ~4GB of prealloc'd journal — real disk, appropriate
+  for a sustained-writer daemon, not for a test instance.
+- **A bigger cache barely moves the data-only ceiling (~+2%) but lifts sync writes
+  ~+27%** — the read-modify-write path (update/delete reading the doc + index pages)
+  is cache-sensitive where a pure-insert ceiling is write-bound. Cost: RAM. Already a
+  daemon flag (`--cache-size`, default 1G).
+- **Eviction threads: 4 is already enough** (8 = no change).
+- **Combined ~+9% ceiling / +14% async / +23% sync.** Real but not transformative.
+
+Shipped: the `SECANTUS_WT_CONFIG_EXTRA` escape hatch (tune WT without recompiling;
+default unchanged, an invalid key fails loudly at open). Daemon defaults are left as
+they are — the levers each cost disk or memory, so bumping them is a deployment
+decision the hatch now makes easy, not a silent default change. Net honest guidance
+for multi-writer-scaling workloads is unchanged: WT tuning buys ~10%, and beyond that
+"run a real mongod" (or drop the oplog for ~2× via `enable_oplog=False`).
