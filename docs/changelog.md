@@ -19,6 +19,204 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b1] — 2026-07-25
+
+### Faster Rust-server writes, a decoupled oplog, and an Ops Board to drive releases
+
+This release is largely a Rust-server write-performance push plus a new tool for
+running the project. The oplog — the write every change stream, point-in-time
+recovery, and `local.oplog.rs` read depends on, and which a bare standalone
+`mongod` doesn't keep at all — stopped re-encoding documents it had already
+serialized for the collection write. That one change brought single-writer inserts
+to within ~10% of a real `mongod` (1.1×) and updates and deletes to ~1.3×, on the
+same WiredTiger engine `mongod` ships.
+
+For concurrent writers there's a new **opt-in async oplog** (`SECANTUS_OPLOG_ASYNC=1`):
+it moves the oplog write off the writer's critical path onto a background drainer,
+lifting multi-writer write throughput ~1.4× while keeping change streams correct —
+validated exactly-once under concurrent writers. The investigation behind it pinned
+the remaining multi-writer ceiling squarely to WiredTiger's own aggregate write
+rate: a parallel drainer pool (also shipped) does not beat it, and neither does WT
+config tuning beyond ~10%, so the honest guidance for sustained concurrent-write
+workloads stays "run a real `mongod`, or drop the oplog if you don't need change
+streams." The trade for the async path is that the oplog is no longer atomic with
+the data — a hard crash loses drainer-queued entries (the data itself stays fully
+durable; a clean shutdown flushes) — which is why it is off by default.
+
+The other headline is the **Ops Board**: a local web app that drives the whole
+build / test / release / validate cycle from one place — a matrix of all thirteen
+driver-conformance gauges with per-driver scores, a CI monitor with version-drift
+detection and startable runs, graphical job progress with full-tree cancel, a
+confirm-gated release page, and per-task explanations and time estimates. Alongside
+these, a batch of correctness fixes brought more edges in line with `mongod`:
+capped collections now evict in true FIFO order, indexes on arrays of subdocuments
+actually get used, malformed wire frames surface as typed errors instead of raw
+exceptions, and a panic in one collection can no longer wedge it until restart.
+
+#### Added
+- `invoke validate --jobs N` / `invoke validate-pymongo-async --jobs N`: run
+  the gauge on N xdist workers, each with its own embedded server
+  (`--dist loadfile`, so files stay whole). Default `1` — unchanged serial
+  behaviour and an unchanged published number.
+- `pymongo_validation/plugin.py`: `SECANTUS_GAUGE_PER_WORKER` makes each xdist
+  worker start (and tear down) its own embedded server and overwrite
+  `DB_IP` / `DB_PORT` with its own address before pymongo's conftest import.
+  The controller still runs the full identity tripwire, so every process
+  verifies the server it is about to measure.
+- `explain` reports `isMultiKey` on the `IXSCAN` stage, on both servers.
+- `/ci` page: recent workflow runs (bounded, cached) plus per-server version
+  drift.
+- `secantus.opsboard.github`: read-only `gh` wrapper with an injectable runner,
+  TTL cache, bounded limits and graceful degradation.
+- `secantus.opsboard.versions`: local version + latest-tag reader for both
+  servers (no network).
+- `/gauges` page: 13 gauges × 2 servers, data-driven from `registry.GAUGES`,
+  with per-gauge toolchain requirements, time estimates and info dialogs.
+- `secantus.opsboard.reports`: validation-report parser + gauge/server filename
+  mapping, handling all three report shapes.
+- Per-gauge, per-server scores on the `/gauges` matrix.
+- `secantus.opsboard.activity`: merged local + CI feed with an explicit origin.
+- `GitHubClient.workflows()` / `.dispatch()` and a confirm-gated `/ci/dispatch`.
+- `Journal.list(include_running=False)` and a self-refreshing running block.
+- `secantus.opsboard.progress`: log→progress parser (phase markers + pytest %)
+  driving an overall bar + phase stepper in the job view.
+- `Cancel all running` control; per-job cancel now tears down the whole process
+  group + escaped descendants (SIGINT→SIGTERM→SIGKILL) and reaps children.
+- `py-gate` / `rust-gate` emit `==> [k/N] label` phase-step banners.
+- **All gauges** button per server (Python / Rust) running `validate-all`, with
+  a parallelism input that sets `--jobs N` (dispatches the gauges over a thread
+  pool; capped, 4 or fewer recommended).
+- `/release` page: readiness checklist (fail-safe — unknown blocks), version +
+  typed-confirmation gate, explicit override for blocking checks.
+- `secantus.opsboard.readiness`: local git/changelog checks with an advisory CI
+  check that never blocks.
+- `secantus.opsboard.discovery`: Tier-3 process-table scan for untracked build
+  processes, filtered against journal-tracked pids.
+- Per-task info dialogs on the dashboard with long-form detail, the exact
+  command, an irreversibility warning for release-class tasks, and a time
+  estimate.
+- `secantus.opsboard.estimates`: median-of-past-successful-runs estimation with
+  an explicit `measured` / `rough` / `unknown` provenance shown in the UI.
+- `Journal.completed_durations()`: bounded, exact-argv duration history
+  (successful runs only, so an early-aborting failure can't skew the estimate).
+- `secantus.jobkit`: shared job runner + sqlite journal (cursor-paginated) with
+  a pty-tee `run_tracked`; the `./inv` wrapper routes through it (import-light,
+  `SECANTUS_NO_TRACK=1` to bypass).
+- `secantus.opsboard`: FastAPI + HTMX + pywebview app — dashboard cards per
+  server, job history, live log tail, cancel; token middleware; `invoke
+  opsboard` task; `opsboard` extra; `secantus-opsboard` console script.
+- `secantus.opsboard.config`: layered configuration (CLI > env > saved
+  `~/.secantus/opsboard.json` > default) with an env var for every persistable
+  setting and `--save` / `--print-config`.
+- `SECANTUS_OPLOG_ASYNC=1` (Rust server, opt-in, prototype): oplog entries are
+  persisted by a background drainer off the writer's transaction. `Storage::flush_oplog`
+  blocks until the drainer has caught up (read-after-write oplog visibility).
+- `secantusd-rs --log-file-max SIZE` and `[storage] log_file_max` in the config
+  file (unit-suffixed, e.g. `128MB` / `1GB` / `2GB`), threaded into the WiredTiger
+  connection config. Daemon default: `2GB`.
+- `SECANTUS_WT_CONFIG_EXTRA` (Rust server / daemon): raw WiredTiger connection-config
+  appended to the built config string, overriding defaults via last-key-wins.
+
+#### Changed
+- `listIndexes` no longer echoes the internal `multikey` catalog flag, matching
+  mongod. The admin console's multikey badge is gone with it — the flag isn't
+  wire-visible, and the console reports what the wire says; `isMultiKey` in the
+  explain visualiser carries the same information.
+- `secantus/storage.py`: `_prune_oplog_locked` streams only the oldest oplog
+  entries and stops early instead of scanning and decoding the entire oplog;
+  a new in-memory `_oplog_live_count` (seeded by a one-time key-only count on
+  open) drives the entry-cap decision without a counting scan. Doomed rows are
+  deleted from the one table the oldest-first walk found them in, not probed
+  across all shard tables.
+- The Rust `Storage` holds its `Connection` / oplog state behind `Arc` so the drainer
+  thread can share them; `wait_for_oplog` blocks on the drainer's `written_seq`
+  watermark in async mode and on `next_seq - 1` (unchanged) in the synchronous
+  default.
+- The daemon's WiredTiger WAL `log=(file_max=...)` defaults to 2GB instead of
+  128MB. `wt_config` takes the value as a parameter; the embedded `RustServer`
+  handle and `Storage::open`'s test-default config are unchanged at 128MB.
+- `Storage::emit_oplog` (Rust) takes an `OplogEntry` that is either an owned
+  `Document` (the rare DDL / noop / `findAndModify` paths, encoded as before) or a
+  pre-assembled raw `RawDocumentBuf` (the hot `insert` / `update` / `delete` /
+  capped-eviction paths). The raw builder writes `op` / `ns` / `ui` / `o` / `o2` in
+  mongod field order and splices the pre-encoded `o` / `o2` bytes, so the document
+  body is never re-serialised; `ts` and `wall` are appended last, matching the
+  historical byte layout.
+- `secantus_core::diff::compute_update_description` walks the pre-/post-images
+  directly (`walk_docs`) instead of wrapping each in an owned `Bson::Document`
+  clone.
+- `Storage::find_matching` short-circuits an empty filter (`find({})`) instead of
+  running a foregone `RawDocument::from_bytes` + `matches_raw` per document, and the
+  read-only collection scan (`scan_blobs_natural`) reuses each value's allocation
+  rather than cloning the blob a second time.
+- Rust server oplog persisted across sixteen shard tables
+  (`secantus_oplog_sh0..15`), each write batch routed to one shard by its start
+  sequence; all oplog readers merge the shards (plus the legacy single table) in
+  seq order via a k-way merge.
+- Opportunistic oplog prune bounded via a maintained live-entry count: an early-out
+  (one timestamp read) when under the cap with the oldest row still in-window, and a
+  bounded walk of only the doomed rows otherwise — replacing the full-oplog scan
+  that dominated the single-writer write path.
+- Python `Storage` oplog readers (`read_oplog`, `oplog_floor_seq`,
+  `find_seq_for_ts`, prune, recovery, PITR archive) merge the sharded oplog so the
+  Python server can read/recover/prune a Rust-written store; Python writes stay on
+  the legacy single table.
+- The Rust server routes an `insert`'s `OP_MSG` kind-1 `documents` sequence to the
+  handler as un-decoded byte slices (a new `CommandContext.raw_insert_documents`
+  side-channel), skipping the merge-decode and the command-layer re-encode. The
+  handler pre-checks `_id` `$`-prefixed keys over `RawDocument` and passes the raw
+  bytes to storage; documents inline in the command body, and collections with a
+  `validator`, still take the decoded path.
+- `Storage::insert` / `Storage::insert_one` (Rust) store the caller's BSON verbatim
+  when `_id` already leads the document, skipping the `encode_doc` re-serialisation;
+  they fall back to `encode_doc` when an `ObjectId` is assigned or `_id` must be
+  reordered to the front. Stored bytes are unchanged in every case (verified
+  byte-for-byte against the client-sent encoding across ObjectId / string / int
+  `_id`, nested documents, arrays, Decimal128, dates, and binary), and the pymongo
+  conformance gauge is non-regressing (1020/1500, 99.5%).
+
+#### Fixed
+- Python server: capped-collection eviction is now strict FIFO
+  (insertion order) even for non-monotonic user `_id` values, matching
+  mongod, instead of evicting in `_id` byte order.
+- Rust server: per-collection write locks, the cursor registry, and
+  per-statement transaction locks are poison-tolerant, so a panic inside a
+  critical section no longer leaves the collection, cursor, or transaction
+  permanently unusable.
+- `paths.py` / `secantus-core`: new `get_path_values` resolves a dotted path
+  through arrays, returning every reachable value plus whether an array was
+  traversed.
+- `storage.py` / `secantus-storage`: index-key generation, the multikey flag, and
+  the sparse-index gate all use that walk, so a path descending into an array is
+  indexed per element.
+- `storage.py` / `secantus-storage`: unique enforcement (`_unique_conflict`, the
+  `createIndexes` pre-check, and `find_index_duplicates`) probes every key a
+  document contributes instead of one canonical key, and a duplicate-key error
+  reports the value actually behind the conflicting key.
+- `$jsonSchema` with pathological schema nesting returns `FailedToParse`
+  (code 9) rather than a generic internal error (security review I21).
+- A malformed PostgreSQL startup packet (short `CANCEL`, non-UTF-8
+  parameter) surfaces as `PGProtocolError` instead of a raw
+  `struct.error` / `UnicodeDecodeError` (I16).
+- The Mongo wire framing translates a `RecursionError` during body parse
+  into a `BadValue` reply, keeping the connection alive (I1).
+- `secantus-storage` (Rust): `Storage`'s close (`Drop`) now checkpoints when
+  `durable` is set, mirroring Python `Storage.close`; the flag is resolved on
+  open via `resolve_durable` with Python's precedence. Adds
+  `Storage::open_with_config_durable` for an explicit override.
+- Oplog retention prune deletes each doomed row from its exact source table
+  (WiredTiger cursors are overwrite-mode, so a `remove()` of an absent key silently
+  succeeds — a shard-then-legacy fallback would have leaked pruned rows on a
+  Python-written store).
+- `secantus-storage` (Rust): WiredTiger connection config now sets
+  `log=(prealloc=false)`, eliminating the ~256 MB per-instance pre-allocated
+  journal that was exhausting CI runner disks.
+- Admin UI: the change-stream tail stops polling and releases its cursor as
+  soon as the client disconnects, instead of only on the next event send.
+- Bounded the per-poll awaitData wait so an orphaned poll thread left behind
+  on disconnect frees promptly, hardening against an intermittent CI worker
+  crash under load.
+
 ## [0.6.0b0] — 2026-07-19
 
 ### Say no like mongod: an operator-fidelity sweep, and a Rust server that clears every gauge
