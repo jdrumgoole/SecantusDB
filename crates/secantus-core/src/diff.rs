@@ -53,30 +53,35 @@ fn child_path(path: &str, key: &str) -> String {
     }
 }
 
+/// Diff two documents field-by-field. Split out from [`walk`] so the top-level
+/// call (and the nested doc-vs-doc case) operate on `&Document` directly, without
+/// wrapping each side in an owned `Bson::Document` clone.
+fn walk_docs(a: &Document, b: &Document, path: &str, segments: &[Bson], acc: &mut Acc) -> R<()> {
+    // sorted union of keys (Python `sorted(pre_keys | post_keys)`)
+    let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    for key in keys {
+        let cp = child_path(path, key);
+        let mut cs = segments.to_vec();
+        cs.push(Bson::String(key.clone()));
+        match (a.get(key), b.get(key)) {
+            (Some(_), None) => {
+                acc.removed.push(Bson::String(cp.clone()));
+                record_ambiguous(&cp, &cs, acc);
+            }
+            (None, Some(bv)) => {
+                acc.updated.insert(cp.clone(), bv.clone());
+                record_ambiguous(&cp, &cs, acc);
+            }
+            (Some(av), Some(bv)) => walk(av, bv, &cp, &cs, acc)?,
+            (None, None) => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
 fn walk(pre: &Bson, post: &Bson, path: &str, segments: &[Bson], acc: &mut Acc) -> R<()> {
     match (pre, post) {
-        (Bson::Document(a), Bson::Document(b)) => {
-            // sorted union of keys (Python `sorted(pre_keys | post_keys)`)
-            let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
-            for key in keys {
-                let cp = child_path(path, key);
-                let mut cs = segments.to_vec();
-                cs.push(Bson::String(key.clone()));
-                match (a.get(key), b.get(key)) {
-                    (Some(_), None) => {
-                        acc.removed.push(Bson::String(cp.clone()));
-                        record_ambiguous(&cp, &cs, acc);
-                    }
-                    (None, Some(bv)) => {
-                        acc.updated.insert(cp.clone(), bv.clone());
-                        record_ambiguous(&cp, &cs, acc);
-                    }
-                    (Some(av), Some(bv)) => walk(av, bv, &cp, &cs, acc)?,
-                    (None, None) => unreachable!(),
-                }
-            }
-            Ok(())
-        }
+        (Bson::Document(a), Bson::Document(b)) => walk_docs(a, b, path, segments, acc),
         (Bson::Array(a), Bson::Array(b)) => {
             if eq(pre, post)? {
                 return Ok(());
@@ -121,13 +126,7 @@ pub fn compute_update_description(pre: &Document, post: &Document) -> R<Document
         truncated: Vec::new(),
         disambiguated: Document::new(),
     };
-    walk(
-        &Bson::Document(pre.clone()),
-        &Bson::Document(post.clone()),
-        "",
-        &[],
-        &mut acc,
-    )?;
+    walk_docs(pre, post, "", &[], &mut acc)?;
     let mut out = Document::new();
     out.insert("updatedFields".to_string(), Bson::Document(acc.updated));
     out.insert("removedFields".to_string(), Bson::Array(acc.removed));

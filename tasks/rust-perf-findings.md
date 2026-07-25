@@ -293,6 +293,61 @@ O(pruned) cost pin isn't practical without decode instrumentation, so the
 cost claim rests on the code shape (no decode after the first in-window
 row).
 
+## Finding 4 — the write-path gap to standalone mongod IS the oplog, and its cost is CPU entry-encoding, not the WT write (2026-07-25)
+
+The three-way benchmark spawns a **standalone** `mongod` (no `--replSet`), which
+keeps **no oplog**. The Rust server always writes one (change streams /
+`local.oplog.rs` / PITR need it). Measured the asymmetry directly by running the
+write workloads against a `RustServer(enable_oplog=True)` vs
+`RustServer(enable_oplog=False)`, interleaved per rep so machine load cancels
+(`scratchpad/oplog_ab.py`):
+
+| workload | oplog ON | oplog OFF | oplog is |
+|---|---:|---:|:---:|
+| insert | 79.7 ms | 59.2 ms | **26%** |
+| update_many_half | 44.6 ms | 23.5 ms | **47%** |
+| delete_many_half | 30.7 ms | 20.5 ms | **33%** |
+
+**With the oplog off, the Rust server already matches standalone mongod on writes**
+(insert ≈ mongod, update / delete *beat* it) — so the entire write-path gap to the
+benchmark's mongod is the oplog. Decomposing the oplog cost into "build + encode the
+entry document" vs "WT-insert the entry" (env hook that built+encoded but skipped
+the `cursor.insert()`, `scratchpad/oplog_decomp.py`) was the key result: the
+**WT insert is essentially free** (≈0, within noise, across all three workloads) —
+the entry is already in the batch's open transaction, so appending one more small
+row to an in-cache btree page costs nothing measurable. **The whole oplog cost is
+CPU: allocating the entry `Document`(s) and BSON-encoding them** — and for an insert
+that meant serialising the full document a *second* time (its `o` field) when the
+identical bytes had just been encoded for the collection table.
+
+**Fix (rust-oplog-cheap slice, shipped):** assemble each CRUD oplog entry as raw
+BSON (`RawDocumentBuf`, mongod field order) and **splice the document body through
+un-re-encoded** — an insert's `o` reuses the stored blob, a replacement update's `o`
+reuses the already-computed `new_blob`, and only the tiny `o2` / `{$v:2, diff}`
+pieces are encoded fresh. `emit_oplog` takes an `OplogEntry::{Doc,Raw}` so the rare
+DDL / noop / findAndModify paths keep the owned-`Document` form. Also dropped the two
+full-document clones in `compute_update_description` (walk the images directly). No
+durability trade-off (the WT write was never the cost) and byte-identical entries
+(the whole oplog + change-stream suites pass untouched).
+
+Measured old-vs-new, **mongod interleaved as the load normalizer**
+(`scratchpad/write_ab.py`, the two runs' mongod columns agree within ~1%, so the
+ratios are directly comparable):
+
+| workload | before ×mongod | after ×mongod |
+|---|:---:|:---:|
+| insert | 1.17× | **1.02×** (parity) |
+| update_many_half | 2.09× | 1.86× |
+| delete_many_half | 1.43× | **1.28×** |
+
+Insert reaches standalone-mongod parity; delete closes most of the gap. Update gains
+least because its residual oplog cost is the inherent `$v:2` diff walk, not entry
+encoding — and that diff is exactly what standalone mongod does not compute at all.
+A small read-scan follow-on landed in the same slice (an empty `find({})` skips the
+foregone per-doc raw match; the read-only scan reuses each value's allocation instead
+of cloning the blob twice) — correct and free, but the full-drain read benchmarks are
+at the eager-scan floor, so it is not a measurable mover there.
+
 ## Non-finding
 
 The large `__gettimeofday` counts in the insert capture are WiredTiger's

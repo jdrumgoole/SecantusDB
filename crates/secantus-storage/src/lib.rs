@@ -154,6 +154,16 @@ fn doc_table_for(db: &str, coll: &str) -> String {
 /// [`frame_doc_value`]).
 type ScannedDoc = (i64, Vec<u8>, Vec<u8>);
 
+/// One entry to persist to the oplog, before `ts` / `wall` are stamped on.
+/// The hot CRUD paths build [`OplogEntry::Raw`] (op / ns / ui / o / o2 already
+/// serialized, the document body spliced in without re-encoding — the oplog
+/// hot-path win); the rarer DDL / noop / findAndModify paths pass an owned
+/// [`OplogEntry::Doc`] that is encoded the historical way.
+enum OplogEntry {
+    Doc(Document),
+    Raw(bson::RawDocumentBuf),
+}
+
 /// Frame a doc-table value as `[u32-LE id_key_len][id_key bytes][blob bytes]`.
 /// The doc table is keyed by RecordId, so the `id_key` (needed to drop the doc's
 /// `_id`-index + secondary-index entries on delete, and NOT reconstructable from
@@ -166,6 +176,26 @@ fn frame_doc_value(id_key: &[u8], blob: &[u8]) -> Vec<u8> {
     v.extend_from_slice(id_key);
     v.extend_from_slice(blob);
     v
+}
+
+/// Byte offset where the blob begins in a framed doc-table value (see
+/// [`frame_doc_value`]): `4 + id_key_len`. Lets a read-only scan strip the frame
+/// prefix in place (reusing the value's allocation) instead of re-copying the
+/// blob out.
+fn frame_prefix_len(value: &[u8]) -> Result<usize> {
+    if value.len() < 4 {
+        return Err(StorageError::Internal(
+            "doc-table value shorter than 4-byte frame header".into(),
+        ));
+    }
+    let len = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+    let prefix = 4 + len;
+    if value.len() < prefix {
+        return Err(StorageError::Internal(
+            "doc-table value id_key length exceeds frame".into(),
+        ));
+    }
+    Ok(prefix)
 }
 
 /// Split a framed doc-table value (see [`frame_doc_value`]) into `(id_key, blob)`.
@@ -1007,6 +1037,14 @@ fn encode_doc(doc: &Document) -> Result<Vec<u8>> {
 fn decode_doc(bytes: &[u8]) -> Result<Document> {
     Document::from_reader(&mut std::io::Cursor::new(bytes))
         .map_err(|e| StorageError::Bson(e.to_string()))
+}
+
+/// Encode a `{_id: <id>}` document — the oplog `o2` for every CRUD op (and the
+/// `o` of a `delete`, which mongod records as just the deleted doc's `_id`).
+fn encode_id_doc(id: &Bson) -> Result<Vec<u8>> {
+    let mut d = Document::new();
+    d.insert("_id", id.clone());
+    encode_doc(&d)
 }
 
 /// `id_key = sortkey.encode_value(_id)` — the byte-sortable key for the `_id`.
@@ -2456,6 +2494,56 @@ impl Storage {
         (start, ts)
     }
 
+    /// Build a CRUD oplog entry as raw BSON — `{op, ns, (ui,) o, o2}` in mongod
+    /// field order — splicing the pre-encoded `o` / `o2` document bytes so the
+    /// document body is never re-serialized (the oplog-encode hot path: for an
+    /// insert `o` is the full stored blob, for a replacement update it's the
+    /// already-computed new blob). `ts` + `wall` are appended later by
+    /// [`Self::emit_oplog_entries`]. Byte-equivalent to the owned-`Document` form.
+    fn oplog_entry_crud(
+        op: &str,
+        ns: &str,
+        ui: Option<&[u8]>,
+        o: &[u8],
+        o2: &[u8],
+    ) -> Result<bson::RawDocumentBuf> {
+        let mut buf = bson::RawDocumentBuf::new();
+        buf.append("op", bson::RawBsonRef::String(op).to_raw_bson());
+        buf.append("ns", bson::RawBsonRef::String(ns).to_raw_bson());
+        if let Some(u) = ui {
+            buf.append(
+                "ui",
+                bson::RawBsonRef::Binary(bson::raw::RawBinaryRef {
+                    subtype: BinarySubtype::Uuid,
+                    bytes: u,
+                })
+                .to_raw_bson(),
+            );
+        }
+        let o_raw =
+            bson::RawDocument::from_bytes(o).map_err(|e| StorageError::Bson(e.to_string()))?;
+        let o2_raw =
+            bson::RawDocument::from_bytes(o2).map_err(|e| StorageError::Bson(e.to_string()))?;
+        buf.append("o", bson::RawBsonRef::Document(o_raw).to_raw_bson());
+        buf.append("o2", bson::RawBsonRef::Document(o2_raw).to_raw_bson());
+        Ok(buf)
+    }
+
+    /// Owned-`Document` oplog entries (the rare DDL / noop / findAndModify paths).
+    /// Wraps each as [`OplogEntry::Doc`] and defers to [`Self::emit_oplog_entries`].
+    fn emit_oplog(
+        &self,
+        session: &Session,
+        entries: Vec<Document>,
+        pre_images: Vec<Option<Vec<u8>>>,
+    ) -> Result<i64> {
+        self.emit_oplog_entries(
+            session,
+            entries.into_iter().map(OplogEntry::Doc).collect(),
+            pre_images,
+        )
+    }
+
     /// Append `entries` to the oplog table, stamping each with its minted `ts`
     /// and a `wall` time, and return the highest seq written (0 if disabled or
     /// empty). `pre_images` is parallel to `entries`; a `Some(bytes)` element is
@@ -2463,10 +2551,10 @@ impl Storage {
     /// write lock (the collection lock for CRUD, the global lock for DDL /
     /// admin paths); concurrent emitters are safe regardless — each writes only
     /// its own freshly-minted seqs. Mirrors `storage._emit_oplog`.
-    fn emit_oplog(
+    fn emit_oplog_entries(
         &self,
         session: &Session,
-        entries: Vec<Document>,
+        entries: Vec<OplogEntry>,
         pre_images: Vec<Option<Vec<u8>>>,
     ) -> Result<i64> {
         if !self.enable_oplog || entries.is_empty() {
@@ -2482,13 +2570,31 @@ impl Storage {
         // (the locality that per-entry scatter destroyed). One cursor for the run.
         let cur = session.open_cursor(&oplog_shard_for_batch(start), None)?;
         let mut pre_cur: Option<Cursor> = None;
-        let wall = Bson::DateTime(bson::DateTime::from_millis(now_millis()));
+        let wall_millis = now_millis();
+        let wall = Bson::DateTime(bson::DateTime::from_millis(wall_millis));
         let mut last = 0i64;
-        for (i, mut entry) in entries.into_iter().enumerate() {
+        for (i, entry) in entries.into_iter().enumerate() {
             let seq = start + i as i64;
-            entry.insert("ts", Bson::Timestamp(ts[i]));
-            entry.insert("wall", wall.clone());
-            let blob = encode_doc(&entry)?;
+            // Stamp `ts` + `wall` (appended last, matching the historical field
+            // order `[…, o2, ts, wall]`) and produce the entry's BSON bytes. The
+            // `Raw` path splices the pre-encoded body straight through; the `Doc`
+            // path re-encodes the owned document as before.
+            let blob = match entry {
+                OplogEntry::Doc(mut d) => {
+                    d.insert("ts", Bson::Timestamp(ts[i]));
+                    d.insert("wall", wall.clone());
+                    encode_doc(&d)?
+                }
+                OplogEntry::Raw(mut buf) => {
+                    buf.append("ts", bson::RawBsonRef::Timestamp(ts[i]).to_raw_bson());
+                    buf.append(
+                        "wall",
+                        bson::RawBsonRef::DateTime(bson::DateTime::from_millis(wall_millis))
+                            .to_raw_bson(),
+                    );
+                    buf.into_bytes()
+                }
+            };
             cur.reset()?;
             cur.set_key_q(seq);
             cur.set_value_u(&blob);
@@ -3472,7 +3578,7 @@ impl Storage {
                 };
                 let mut inserted = 0usize;
                 let mut errors: Vec<Document> = Vec::new();
-                let mut oplog_entries: Vec<Document> = Vec::new();
+                let mut oplog_entries: Vec<OplogEntry> = Vec::new();
                 let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
                 let doc_cur =
                     session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
@@ -3564,16 +3670,17 @@ impl Storage {
                     fresh_id_keys.insert(key.clone());
                     inserted += 1;
                     if oplog_on {
-                        let mut o2 = Document::new();
-                        o2.insert("_id", id.clone());
-                        let mut entry = Document::new();
-                        entry.insert("op", "i");
-                        entry.insert("ns", ns.clone());
-                        entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
-                        // `doc` isn't used after this iteration — move it in.
-                        entry.insert("o", Bson::Document(doc));
-                        entry.insert("o2", Bson::Document(o2));
-                        oplog_entries.push(entry);
+                        // `o` splices the stored doc bytes (`blob`) verbatim — no
+                        // re-encode of the document body (the oplog hot-path win);
+                        // `o2` is the tiny `{_id}`. `doc` is not used afterward.
+                        let o2 = encode_id_doc(&id)?;
+                        oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                            "i",
+                            &ns,
+                            Some(ui.as_ref().unwrap()),
+                            blob,
+                            &o2,
+                        )?));
                     }
                 }
                 // Capped-collection eviction: drop oldest non-fresh docs until within
@@ -3595,7 +3702,7 @@ impl Storage {
                     )?;
                 }
                 if oplog_on && !oplog_entries.is_empty() {
-                    self.emit_oplog(&session, oplog_entries, pre_images)?;
+                    self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
                 }
                 Ok((inserted, errors))
             })
@@ -5344,11 +5451,40 @@ impl Storage {
     /// insertion order — no separate `NAT_TABLE` indirection. Mirrors
     /// `storage._scan_docs_natural`.
     fn scan_blobs_natural(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
-        Ok(self
-            .scan_docs(session, db, coll)?
-            .into_iter()
-            .map(|(_rid, _idk, blob)| blob)
-            .collect())
+        // The read path only needs the document blobs, so walk the doc table
+        // directly and clone just the blob — `scan_docs` additionally clones each
+        // row's `id_key` (for the write/index paths), a per-document allocation
+        // wasted on a full scan of N documents.
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        let mut out = Vec::new();
+        cur.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, _recordid) = cur.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            // Reuse the value's own allocation: `get_value_u` already copied
+            // WiredTiger's bytes into an owned `Vec`, so drain the frame prefix
+            // (`[u32 id_key_len][id_key]`) in place to leave just the blob —
+            // avoiding the second allocation a `blob.to_vec()` would make.
+            let mut value = cur.get_value_u()?;
+            let prefix = frame_prefix_len(&value)?;
+            value.drain(..prefix);
+            out.push(value);
+            more = cur.next()?;
+        }
+        Ok(out)
     }
 
     /// Evict oldest non-fresh docs from a capped collection until within its
@@ -5368,7 +5504,7 @@ impl Storage {
         oplog_on: bool,
         ns: &str,
         ui: Option<&[u8]>,
-        oplog_entries: &mut Vec<Document>,
+        oplog_entries: &mut Vec<OplogEntry>,
         pre_images: &mut Vec<Option<Vec<u8>>>,
     ) -> Result<()> {
         let opts = match coll_options(session, db, coll)? {
@@ -5423,17 +5559,11 @@ impl Storage {
             count -= 1;
             if oplog_on {
                 let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-                let mut o = Document::new();
-                o.insert("_id", id);
-                let mut entry = Document::new();
-                entry.insert("op", "d");
-                entry.insert("ns", ns);
-                if let Some(u) = ui {
-                    entry.insert("ui", uuid_binary(u));
-                }
-                entry.insert("o", Bson::Document(o.clone()));
-                entry.insert("o2", Bson::Document(o));
-                oplog_entries.push(entry);
+                // A delete records `{_id}` in both `o` and `o2` — encode it once.
+                let id_doc = encode_id_doc(&id)?;
+                oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                    "d", ns, ui, &id_doc, &id_doc,
+                )?));
                 pre_images.push(if preimages_on {
                     Some(encode_doc(&doc)?)
                 } else {
@@ -6079,16 +6209,26 @@ impl Storage {
         // the sibling fields (Finding 1, tasks/rust-perf-findings.md). Unmatched
         // documents are never fully decoded; a no-sort find never decodes at all.
         // `vars` carries command `let` bindings for `$expr` in the filter.
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        for blob in blobs {
-            let raw =
-                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
-            if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                .map_err(|_| StorageError::QueryUnsupported)?
-            {
-                out.push(blob);
+        //
+        // An empty filter (`find({})`) matches every document, so skip the per-doc
+        // raw-match entirely — the whole `blobs` vector is the result set (a full
+        // scan of N documents would otherwise pay N `RawDocument::from_bytes` +
+        // `matches_raw` calls for a foregone `true`).
+        let out: Vec<Vec<u8>> = if filter.is_empty() {
+            blobs
+        } else {
+            let mut out = Vec::new();
+            for blob in blobs {
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
+                    .map_err(|_| StorageError::QueryUnsupported)?
+                {
+                    out.push(blob);
+                }
             }
-        }
+            out
+        };
         if !in_sort_order {
             if let Some(spec) = multi_sort_spec(sort) {
                 // A post-sort needs the sort-field values, so decode the *matched*
@@ -6348,7 +6488,7 @@ impl Storage {
                 let mut matched = 0usize;
                 let mut modified = 0usize;
                 let mut post_image: Option<Document> = None;
-                let mut oplog_entries: Vec<Document> = Vec::new();
+                let mut oplog_entries: Vec<OplogEntry> = Vec::new();
                 let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
 
                 let candidates =
@@ -6410,10 +6550,13 @@ impl Storage {
                         self.remove_index_entries(&session, db, coll, &removals)?;
                         self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
                         if oplog_on {
-                            let o_field = if is_replacement {
-                                // Replacement oplog `o` is the whole new doc; the diff
-                                // branch borrows it instead, so this move is safe.
-                                Bson::Document(new)
+                            // Replacement `o` is the whole new doc — reuse the
+                            // `new_blob` we already encoded for the doc-table write
+                            // (no second serialize). Operator `o` is the small
+                            // `{$v:2, diff}`, encoded fresh.
+                            let o_owned: Vec<u8>;
+                            let o_bytes: &[u8] = if is_replacement {
+                                &new_blob
                             } else {
                                 let mut o = Document::new();
                                 o.insert("$v", 2i32);
@@ -6424,17 +6567,17 @@ impl Storage {
                                             .map_err(|_| StorageError::QueryUnsupported)?,
                                     ),
                                 );
-                                Bson::Document(o)
+                                o_owned = encode_doc(&o)?;
+                                &o_owned
                             };
-                            let mut o2 = Document::new();
-                            o2.insert("_id", doc.get("_id").cloned().unwrap_or(Bson::Null));
-                            let mut entry = Document::new();
-                            entry.insert("op", "u");
-                            entry.insert("ns", ns.clone());
-                            entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
-                            entry.insert("o", o_field);
-                            entry.insert("o2", Bson::Document(o2));
-                            oplog_entries.push(entry);
+                            let o2 = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
+                            oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                                "u",
+                                &ns,
+                                Some(ui.as_ref().unwrap()),
+                                o_bytes,
+                                &o2,
+                            )?));
                             pre_images.push(if preimages_on {
                                 Some(encode_doc(&doc)?)
                             } else {
@@ -6494,23 +6637,23 @@ impl Storage {
                     self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
                     post_image = Some(new.clone());
                     if oplog_on {
-                        let mut o2 = Document::new();
-                        o2.insert("_id", id.clone());
-                        let mut entry = Document::new();
-                        entry.insert("op", "i");
-                        entry.insert("ns", ns.clone());
-                        entry.insert("ui", uuid_binary(ui.as_ref().unwrap()));
-                        // `new` isn't used after the upsert block — move it in.
-                        entry.insert("o", Bson::Document(new));
-                        entry.insert("o2", Bson::Document(o2));
-                        oplog_entries.push(entry);
+                        // The upserted doc is recorded as an insert; splice the
+                        // `new_blob` we already encoded for the doc-table write.
+                        let o2 = encode_id_doc(&id)?;
+                        oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                            "i",
+                            &ns,
+                            Some(ui.as_ref().unwrap()),
+                            &new_blob,
+                            &o2,
+                        )?));
                         pre_images.push(None);
                     }
                     upserted_id = Some(id);
                 }
 
                 if oplog_on && !oplog_entries.is_empty() {
-                    self.emit_oplog(&session, oplog_entries, pre_images)?;
+                    self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
                 }
                 Ok(UpdateOutcome {
                     matched,
@@ -6556,7 +6699,7 @@ impl Storage {
                 };
 
                 let mut deleted = 0usize;
-                let mut oplog_entries: Vec<Document> = Vec::new();
+                let mut oplog_entries: Vec<OplogEntry> = Vec::new();
                 let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
                 let candidates =
                     self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?;
@@ -6581,17 +6724,15 @@ impl Storage {
                     self.delete_nat_entry(&session, db, coll, &id_k)?;
                     deleted += 1;
                     if oplog_on {
-                        let mut o = Document::new();
-                        o.insert("_id", doc.get("_id").cloned().unwrap_or(Bson::Null));
-                        let mut entry = Document::new();
-                        entry.insert("op", "d");
-                        entry.insert("ns", ns.clone());
-                        if let Some(u) = &ui {
-                            entry.insert("ui", uuid_binary(u));
-                        }
-                        entry.insert("o", Bson::Document(o.clone()));
-                        entry.insert("o2", Bson::Document(o));
-                        oplog_entries.push(entry);
+                        // `o` and `o2` are both `{_id}` — encode once, splice twice.
+                        let id_doc = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
+                        oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                            "d",
+                            &ns,
+                            ui.as_deref(),
+                            &id_doc,
+                            &id_doc,
+                        )?));
                         pre_images.push(if preimages_on {
                             Some(encode_doc(&doc)?)
                         } else {
@@ -6603,7 +6744,7 @@ impl Storage {
                     }
                 }
                 if oplog_on && !oplog_entries.is_empty() {
-                    self.emit_oplog(&session, oplog_entries, pre_images)?;
+                    self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
                 }
                 Ok(deleted)
             })
