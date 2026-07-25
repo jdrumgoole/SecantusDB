@@ -479,3 +479,68 @@ GIL; nothing to do there, it is why the Rust server exists.)
    re-scope the lock-split: it exists. If concurrency is ever revisited, the only
    real lever is WT-host tuning (cache size, eviction threads, dedicated log volume,
    checkpoint cadence), each individually small and each trading memory/durability.
+
+## Finding 5 — the concurrency ceiling is specifically the SHARED OPLOG, not generic WiredTiger (2026-07-25)
+
+The 2026-07-24 re-baseline above attributed the 4→8-writer decline to
+"WiredTiger-internal (WAL / eviction / checkpoint)" and concluded "no cheap
+Rust-level concurrency win left." Measurement refines this materially: the ceiling
+is **specifically the shared oplog**, and **WiredTiger itself scales fine**.
+
+Method: the embedded Rust server, 8 external `bench.load_writer` processes, each on
+its **own collection** (so data writes go to separate per-collection btrees — no
+shared data lock; the oplog shards are the *only* shared write target), oplog ON vs
+OFF, interleaved per rep so machine load cancels. The box was heavily / variably
+loaded this session (a parallel test suite + macOS spotlight/syspolicy; the oplog-OFF
+control swung 8k↔137k docs/s purely by load regime), so numbers are from the
+**uncrushed windows** — best-effort, not a quiesced-box measurement:
+
+| 8 writers (uncrushed) | oplog-ON | oplog-OFF | ON/OFF | scaling vs 1-writer (~25.7k) |
+|---|---:|---:|:---:|:---:|
+| logged oplog (shipped) | ~48.2k | ~124.6k | 2.58× | ON **1.9×** / OFF **4.8×** |
+| non-logged oplog tables | ~59.9k | ~135.8k | 2.27× | ON **2.3×** |
+
+**Two conclusions:**
+
+1. **The Rust architecture + WiredTiger scale ~4.8× at 8 writers with the oplog off
+   — matching mongod's 4.67×.** The lock-split / per-collection-btree design is not
+   the ceiling and neither is generic WT; the *entire* 4→8 concurrency gap to mongod
+   is the oplog (which the benchmark's standalone mongod does not maintain). This is
+   the concurrency analogue of Finding 4's single-writer result.
+
+2. **The oplog's concurrency cost decomposes, and the WAL log is the *minor* part.**
+   Making the oplog + preimage tables non-logged (`log=(enabled=false)`) — WT 7.0
+   *does* permit a transaction spanning the logged data table and the non-logged
+   oplog table; the full oplog + change-stream suites pass, and only *hard-crash*
+   oplog recovery changes (data stays fully logged; clean close checkpoints the
+   oplog; WT MVCC keeps committed oplog entries visible to change streams regardless
+   of logging) — lifted 8-writer throughput only **~+14–24%** (2.58× → 2.27× penalty;
+   an earlier "2.5×" reading was a best-case-single-rep artifact under load, corrected
+   by the multi-rep uncrushed runs above). So WAL log volume is a real but modest
+   slice. The **majority** of the oplog penalty — oplog-ON retains only ~40% of the
+   no-oplog throughput even when non-logged — is the **inherent 2× write / eviction
+   pressure**: every CRUD write appends a full oplog entry (an insert's `o` is the
+   whole document) to shared oplog btrees, doubling the dirty-page / eviction load a
+   standalone mongod never carries. That cost cannot be removed without dropping the
+   oplog.
+
+**Levers, by payoff (both unshipped — the box was too load-unstable to validate a
+durability-affecting change, and the safe one is modest):**
+
+- **Non-logged oplog tables (modest, safe-ish).** ~+14–24% at 8 writers, as an opt-in
+  config (default stays logged/durable). Trade: the oplog becomes checkpoint-durable
+  only — a hard crash loses its un-checkpointed tail (change-stream events / PITR
+  granularity since the last checkpoint), data unaffected. Reasonable for the
+  ephemeral-test audience; a real durability-contract change, so opt-in.
+- **Async / decoupled oplog (transformative, risky).** Let writers commit *data only*
+  (which scales ~4.8×) and hand pre-built, pre-seq'd oplog entries to a background
+  drainer that batch-persists them; `wait_for_oplog` wakes on the drainer's commit.
+  Could approach the 4.8× data-only ceiling. Cost: a real rewrite of the emit path
+  with ordering, backpressure, change-stream-visibility-latency, and crash-window
+  semantics to get right — and it needs a quiesced box to measure. Flagged for a
+  future slice, not attempted here.
+
+Harnesses: `scratchpad/conc_oplog_interleaved.py` (interleaved ON/OFF, load-robust),
+`scratchpad/conc_on_only.py` (single-arm best-case). The single-writer oplog-encode
+win (Finding 4, PR #642) also shaves per-write CPU under the collection lock, a small
+independent concurrency helper.
