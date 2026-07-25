@@ -1911,8 +1911,31 @@ struct OplogState {
     /// `next_seq - 1` (writes land inline). In async mode change-stream tailers
     /// (`wait_for_oplog`) block on this, NOT the minted `next_seq`, so a tailer
     /// never reads past what the drainer has actually written. Advanced by the
-    /// drainer under the `oplog` mutex, paired with `oplog_cv`.
+    /// drainer(s) under the `oplog` mutex, paired with `oplog_cv`.
     written_seq: i64,
+    /// Async-oplog completion tracker: persisted-but-not-yet-contiguous seq ranges
+    /// (`start -> end_exclusive`) reported by the parallel drainers. With a pool of
+    /// shard-affine drainers, batches finish out of global seq order; a range that
+    /// begins exactly at `written_seq + 1` (and any that chain onto it) is absorbed
+    /// to advance `written_seq`, so the watermark still only ever covers a gapless
+    /// prefix. Empty in synchronous mode. See [`advance_written_seq`].
+    done_ranges: BTreeMap<i64, i64>,
+}
+
+/// Record that the seq range `[start, start + n)` is durably persisted and advance
+/// `written_seq` over any newly-contiguous prefix. Returns `true` if the watermark
+/// moved (the caller then notifies `oplog_cv`). Caller holds the `oplog` mutex.
+fn advance_written_seq(st: &mut OplogState, start: i64, n: i64) -> bool {
+    st.done_ranges.insert(start, start + n);
+    let mut advanced = false;
+    // Absorb the range beginning at `written_seq + 1`, then any that chain onto it.
+    while let Some(&end) = st.done_ranges.get(&(st.written_seq + 1)) {
+        let next = st.written_seq + 1;
+        st.written_seq = end - 1;
+        st.done_ranges.remove(&next);
+        advanced = true;
+    }
+    advanced
 }
 
 // --- async oplog (prototype) ---------------------------------------------
@@ -1990,19 +2013,35 @@ impl Backpressure {
     }
 }
 
-/// Handle to the background oplog drainer: the channel a committed write sends
-/// its entries down, the shared [`Backpressure`] budget, plus the drainer's join
-/// handle (joined on `Storage` drop after a `Shutdown`, so a clean close persists
-/// every entry before the close-time checkpoint).
-struct AsyncOplog {
-    tx: mpsc::Sender<DrainMsg>,
-    backpressure: Arc<Backpressure>,
-    join: Mutex<Option<JoinHandle<()>>>,
+/// Number of background oplog drainer threads. A single drainer's write
+/// throughput (~71k entries/s here) caps sustainable async throughput below the
+/// rate concurrent writers can produce (~103k/s); a pool spreads oplog writes
+/// across cores (each drainer owns a disjoint set of the `OPLOG_SHARDS` btrees, so
+/// no two ever write the same tree) so the drainers out-run the writers and the
+/// queue stays small. Overridable via `SECANTUS_OPLOG_ASYNC_DRAINERS`.
+const ASYNC_OPLOG_DRAINERS: usize = 4;
+
+/// The drainer index that owns the shard a batch starting at `start_seq` routes to
+/// (`shard % num_drainers`) — a fixed mapping, so each shard is written by exactly
+/// one drainer and concurrent drainers never contend on the same btree.
+fn drainer_for_batch(start_seq: i64, num_drainers: usize) -> usize {
+    (start_seq.rem_euclid(OPLOG_SHARDS) as usize) % num_drainers
 }
 
-/// Shared state the drainer advances so change-stream tailers can observe its
-/// progress: the `oplog` mutex (for `written_seq`) + its condvar, plus the
-/// [`Backpressure`] budget it releases as batches land.
+/// Handle to the background oplog drainer pool: a per-drainer channel a committed
+/// write routes its entries to (by shard), the shared [`Backpressure`] budget, and
+/// the drainers' join handles (joined on `Storage` drop after `Shutdown`, so a
+/// clean close persists every entry before the close-time checkpoint).
+struct AsyncOplog {
+    txs: Vec<mpsc::Sender<DrainMsg>>,
+    backpressure: Arc<Backpressure>,
+    joins: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// Shared state a drainer advances so change-stream tailers can observe progress:
+/// the `oplog` mutex (for `written_seq` + the completion tracker) + its condvar,
+/// plus the [`Backpressure`] budget it releases as batches land.
+#[derive(Clone)]
 struct DrainerShared {
     conn: Arc<Connection>,
     oplog: Arc<Mutex<OplogState>>,
@@ -2010,15 +2049,14 @@ struct DrainerShared {
     backpressure: Arc<Backpressure>,
 }
 
-/// Spawn the background oplog drainer and return the handle a committed write
-/// sends its entries to. `shared_ctor` receives the shared [`Backpressure`] so the
-/// same budget is on both the writer (enqueue) and drainer (release) sides.
+/// Spawn the background oplog drainer pool and return the handle committed writes
+/// route their entries to. The [`Backpressure`] budget is shared across all
+/// drainers (one global cap on queued bytes).
 fn spawn_oplog_drainer(
     conn: Arc<Connection>,
     oplog: Arc<Mutex<OplogState>>,
     oplog_cv: Arc<Condvar>,
 ) -> Arc<AsyncOplog> {
-    let (tx, rx) = mpsc::channel::<DrainMsg>();
     // The cap is overridable via `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (tuning + tests
     // that force backpressure with a tiny cap); a 0/invalid value keeps the default.
     let cap = std::env::var("SECANTUS_OPLOG_ASYNC_CAP_BYTES")
@@ -2026,6 +2064,13 @@ fn spawn_oplog_drainer(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(ASYNC_OPLOG_MAX_PENDING_BYTES);
+    let num_drainers = std::env::var("SECANTUS_OPLOG_ASYNC_DRAINERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(ASYNC_OPLOG_DRAINERS)
+        // Never more drainers than shards (a shard is owned by one drainer).
+        .min(OPLOG_SHARDS as usize);
     let backpressure = Arc::new(Backpressure {
         used: Mutex::new(0),
         available: Condvar::new(),
@@ -2037,11 +2082,18 @@ fn spawn_oplog_drainer(
         oplog_cv,
         backpressure: backpressure.clone(),
     };
-    let join = thread::spawn(move || drainer_loop(shared, rx));
+    let mut txs = Vec::with_capacity(num_drainers);
+    let mut joins = Vec::with_capacity(num_drainers);
+    for _ in 0..num_drainers {
+        let (tx, rx) = mpsc::channel::<DrainMsg>();
+        let s = shared.clone();
+        txs.push(tx);
+        joins.push(thread::spawn(move || drainer_loop(s, rx)));
+    }
     Arc::new(AsyncOplog {
-        tx,
+        txs,
         backpressure,
-        join: Mutex::new(Some(join)),
+        joins: Mutex::new(joins),
     })
 }
 
@@ -2080,51 +2132,43 @@ fn write_drain_batch(session: &Session, batch: &DrainBatch) -> Result<()> {
     }
 }
 
-/// Write every batch buffered contiguously from `next_expected`, advancing the
-/// `written_seq` watermark and waking change-stream tailers once the run lands.
-fn drain_contiguous(
+/// Persist one batch and record its completion. On success: release the batch's
+/// backpressure reservation and advance `written_seq` over any now-contiguous
+/// prefix (waking tailers). On failure: return the batch so the caller retries it
+/// (a drainer write failure is a durability signal, never silently dropped — the
+/// watermark simply doesn't advance past the hole until it succeeds).
+fn persist_and_record(
     session: &Session,
     shared: &DrainerShared,
-    buffer: &mut BTreeMap<i64, DrainBatch>,
-    next_expected: &mut i64,
-) {
-    let mut last_written = *next_expected - 1;
-    let mut wrote_any = false;
-    while let Some(batch) = buffer.remove(next_expected) {
-        let n = batch.blobs.len() as i64;
-        let bytes = batch.bytes;
-        if let Err(e) = write_drain_batch(session, &batch) {
-            // A drainer write failure is a durability signal, never silent. Put
-            // the batch back and stop advancing; the next message re-attempts.
-            eprintln!(
-                "secantus-storage: async oplog drainer write failed at seq {}: {e:?}",
-                batch.start_seq
-            );
-            buffer.insert(batch.start_seq, batch);
-            break;
-        }
-        // Persisted: release this batch's backpressure reservation so blocked
-        // writers can enqueue more.
-        shared.backpressure.release(bytes);
-        *next_expected += n;
-        last_written = *next_expected - 1;
-        wrote_any = true;
+    batch: DrainBatch,
+) -> Option<DrainBatch> {
+    let start = batch.start_seq;
+    let n = batch.blobs.len() as i64;
+    let bytes = batch.bytes;
+    if let Err(e) = write_drain_batch(session, &batch) {
+        eprintln!(
+            "secantus-storage: async oplog drainer write failed at seq {start}: {e:?} (will retry)"
+        );
+        return Some(batch);
     }
-    if wrote_any {
-        {
-            let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
-            if last_written > st.written_seq {
-                st.written_seq = last_written;
-            }
-        }
+    shared.backpressure.release(bytes);
+    let advanced = {
+        let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        advance_written_seq(&mut st, start, n)
+    };
+    if advanced {
         shared.oplog_cv.notify_all();
     }
+    None
 }
 
-/// The drainer thread: receive committed writes' oplog batches, persist them in
-/// seq order (buffering to reorder concurrent arrivals), advance `written_seq`.
-/// On `Shutdown` it drains everything still queued/buffered before returning so
-/// a clean close checkpoints a complete oplog.
+/// One drainer thread of the pool. It owns a disjoint subset of the oplog shards
+/// (routing guarantees it only receives batches for its shards), so it writes each
+/// batch immediately — no reorder needed; global seq contiguity is reconstructed
+/// across all drainers by `advance_written_seq`'s completion tracker. A batch whose
+/// write fails is retried on the next iteration (bounded in-thread buffer). On
+/// `Shutdown` it drains everything still queued before returning, so a clean close
+/// checkpoints a complete oplog.
 fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
     let session = match shared.conn.open_session() {
         Ok(s) => s,
@@ -2133,14 +2177,20 @@ fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
             return;
         }
     };
-    // The first seq that will be minted; every batch's start_seq >= this.
-    let mut next_expected = {
-        let st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        st.written_seq + 1
-    };
-    let mut buffer: BTreeMap<i64, DrainBatch> = BTreeMap::new();
+    // Batches whose write failed, retried before processing new messages.
+    let mut retry: Vec<DrainBatch> = Vec::new();
     let mut shutting_down = false;
     loop {
+        // Retry any previously-failed batches first (durability before progress).
+        if !retry.is_empty() {
+            let mut still: Vec<DrainBatch> = Vec::new();
+            for b in std::mem::take(&mut retry) {
+                if let Some(b) = persist_and_record(&session, &shared, b) {
+                    still.push(b);
+                }
+            }
+            retry = still;
+        }
         let msg = if shutting_down {
             rx.try_recv().ok()
         } else {
@@ -2148,39 +2198,19 @@ fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
         };
         match msg {
             Some(DrainMsg::Batch(b)) => {
-                buffer.insert(b.start_seq, b);
-                drain_contiguous(&session, &shared, &mut buffer, &mut next_expected);
+                if let Some(b) = persist_and_record(&session, &shared, b) {
+                    retry.push(b);
+                }
             }
             Some(DrainMsg::Shutdown) => shutting_down = true,
             // recv error (sender dropped) or, while shutting down, queue drained.
             None => break,
         }
     }
-    // Final flush: everything queued has been buffered; write the contiguous run.
-    drain_contiguous(&session, &shared, &mut buffer, &mut next_expected);
-    if !buffer.is_empty() {
-        // A non-contiguous leftover means a minted seq was never enqueued — a bug,
-        // surfaced loudly (this is a database). Persist what we have anyway so no
-        // committed write's event is silently dropped.
-        eprintln!(
-            "secantus-storage: async oplog drainer shut down with {} non-contiguous \
-             batch(es) buffered (expected seq {next_expected}); flushing best-effort",
-            buffer.len()
-        );
-        let leftovers = std::mem::take(&mut buffer);
-        let mut max_written = next_expected - 1;
-        for (_s, b) in leftovers {
-            let last = b.start_seq + b.blobs.len() as i64 - 1;
-            let bytes = b.bytes;
-            if write_drain_batch(&session, &b).is_ok() {
-                max_written = max_written.max(last);
-            }
-            shared.backpressure.release(bytes);
-        }
-        let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        if max_written > st.written_seq {
-            st.written_seq = max_written;
-        }
+    // Final flush: retry anything still failing (best-effort — a persistent failure
+    // is a storage fault, surfaced by write_drain_batch's log).
+    for b in std::mem::take(&mut retry) {
+        let _ = persist_and_record(&session, &shared, b);
     }
 }
 
@@ -2274,6 +2304,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                     emit_count: 0,
                     live_count: count_oplog_entries(session),
                     written_seq: 0, // set to next_seq-1 by the caller (open)
+                    done_ranges: BTreeMap::new(),
                 });
             }
         }
@@ -2308,6 +2339,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         emit_count: 0,
         live_count: count_oplog_entries(session),
         written_seq: 0, // set to next_seq-1 by the caller (open)
+        done_ranges: BTreeMap::new(),
     })
 }
 
@@ -2472,19 +2504,18 @@ impl Drop for Storage {
     /// logged, never silent: in a database a close-time write error is a
     /// durability signal.
     fn drop(&mut self) {
-        // Async oplog: flush the drainer BEFORE persisting meta / checkpointing,
+        // Async oplog: flush the drainer pool BEFORE persisting meta / checkpointing,
         // so every committed write's oplog entry is on disk when the checkpoint
         // snapshots the tables (clean-close durability is preserved — only a hard
-        // crash loses undrained entries). Send Shutdown and join the thread; it
-        // drains its queue + buffer, then exits.
+        // crash loses undrained entries). Signal Shutdown to every drainer and join
+        // them all; each drains its queue, then exits.
         if let Some(async_h) = &self.async_oplog {
-            let _ = async_h.tx.send(DrainMsg::Shutdown);
-            if let Some(handle) = async_h
-                .join
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
+            for tx in &async_h.txs {
+                let _ = tx.send(DrainMsg::Shutdown);
+            }
+            let handles =
+                std::mem::take(&mut *async_h.joins.lock().unwrap_or_else(|e| e.into_inner()));
+            for handle in handles {
                 let _ = handle.join();
             }
         }
@@ -3083,12 +3114,15 @@ impl Storage {
             bytes,
         };
         // Backpressure: reserve this batch's bytes before enqueuing. If the
-        // drainer has fallen behind and too much is already in flight, this blocks
-        // the committing writer until the drainer catches up — bounding memory
-        // rather than letting the queue grow without limit. Reserve BEFORE send so
-        // the in-flight budget always covers what's queued.
+        // drainers have fallen behind and too much is already in flight, this blocks
+        // the committing writer until they catch up — bounding memory rather than
+        // letting the queue grow without limit. Reserve BEFORE send so the in-flight
+        // budget always covers what's queued.
         async_h.backpressure.acquire(bytes);
-        if async_h.tx.send(DrainMsg::Batch(batch)).is_err() {
+        // Route to the drainer that owns this batch's shard (fixed mapping — the
+        // shard is written by exactly one drainer, so drainers never collide).
+        let d = drainer_for_batch(start, async_h.txs.len());
+        if async_h.txs[d].send(DrainMsg::Batch(batch)).is_err() {
             // Drainer gone (shutdown race): release the reservation we just took
             // so the budget doesn't leak, and report the dropped entries loudly.
             async_h.backpressure.release(bytes);

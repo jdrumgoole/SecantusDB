@@ -8,13 +8,18 @@ and WiredTiger's WAL, collapsing eight-writer scaling to ~1.8×. This ships a wo
 opt-in prototype that takes the oplog write off the writer's critical path: a
 committed write's entries are minted a sequence number and handed to a background
 drainer thread that persists them in order, while change-stream tailers wait on the
-drainer's durable watermark. On eight writers this sustainably measured **~1.35× the
-synchronous throughput** (~52k → ~71k docs/s), bounded by the backpressure budget to
-the single drainer's real write throughput — a background pool of drainers (a follow-
-up) would raise that toward the ~103k rate writers can produce and the ~145k no-oplog
-ceiling. (Without the memory bound the queue grows unboundedly and momentarily hits
-~2.3×, but that is writers outrunning the drainer, not a sustainable rate — see
-`tasks/rust-async-oplog-prototype.md`.)
+drainer's durable watermark. On eight writers this sustainably measured **~1.35–1.4× the
+synchronous throughput** (~52k → ~71k docs/s). A pool of shard-affine drainers is
+built too (`SECANTUS_OPLOG_ASYNC_DRAINERS`), but measurement is decisive that more
+drainers do **not** help (1 ≈ 2 ≈ 4 ≈ 71k): the bottleneck is WiredTiger's aggregate
+write throughput (~146k small writes/s), shared across all threads and btrees, and a
+logical write needs a data **and** an oplog write, so async caps at ~146k/2 ≈ 73k —
+which a single drainer already reaches. So ~1.4× is the honest sustainable ceiling
+for oplog-backed multi-writer throughput on embedded WiredTiger, whether the oplog
+write is inline, decoupled, or decoupled + sharded; going faster means dropping the
+oplog or raising WT's own write ceiling. (Without the memory bound the queue grows
+unboundedly and momentarily hits ~2.3×, but that is writers outrunning the drainer,
+not sustainable — see `tasks/rust-async-oplog-prototype.md`.)
 
 It is **off by default** (`SECANTUS_OPLOG_ASYNC=1` to enable) because it changes a
 durability property: the oplog is no longer atomic with the data and a hard crash

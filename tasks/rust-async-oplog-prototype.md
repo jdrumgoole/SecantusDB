@@ -64,17 +64,43 @@ unbounded run has the same mutex). So **the drainer's single-thread write
 throughput (~71k/s) is the new bottleneck** — see "Next lever" below.
 (`scratchpad/conc_async_ab.py`; the cap is `SECANTUS_OPLOG_ASYNC_CAP_BYTES`.)
 
-## Next lever: a parallel drainer
+## Parallel drainer — built, and a decisive NEGATIVE result
 
-To make the higher rate *sustainable* the drainer must out-run the writers. A
-single thread caps oplog writes at ~71k/s; a **pool of drainers** (e.g. one per
-oplog shard, so writes spread across cores as the sharding intends) would raise
-aggregate drain throughput toward the ~103k writer rate — at which point the queue
-stays small and async approaches the no-oplog ceiling *sustainably*. The added
-complexity is the `written_seq` watermark: with concurrent drainers, completion is
-out of order, so the contiguous-prefix computation moves from the current
-single-thread `next_expected` into a shared completion tracker (a BTreeMap of
-finished seq ranges whose contiguous prefix is the watermark). Flagged, not built.
+Built a pool of shard-affine drainers (each owns a disjoint subset of the
+`OPLOG_SHARDS` btrees, so no two ever write the same tree; `SECANTUS_OPLOG_ASYNC_DRAINERS`,
+default 4), with the `written_seq` watermark reconstructed across threads by a
+shared completion tracker (`OplogState.done_ranges` + `advance_written_seq`: each
+drainer records its persisted `[start,end)` range, and the contiguous prefix from
+`written_seq+1` is absorbed to advance the watermark). Correctness holds — the
+exactly-once concurrent change-stream test and the backpressure test both pass with
+the pool.
+
+**But more drainers do not raise throughput** (8 writers, clean, orphan-guarded):
+
+| async drainers | docs/s | ×sync |
+|---:|---:|:---:|
+| 1 | ~71.8k | 1.37× |
+| 2 | ~70.4k | 1.35× |
+| 4 | ~70.7k | 1.35× |
+
+1 ≈ 2 ≈ 4. The drainer thread was never the bottleneck — **WiredTiger's aggregate
+write throughput is**, and it is shared across all threads and btrees. The numbers
+fit a simple model: WT sustains ~146k small writes/s total (= the no-oplog rate); a
+logical write needs a data write **and** an oplog write, so async caps at ~146k/2 ≈
+73k logical writes/s — which a *single* drainer already reaches. Sharding the oplog
+across more drainer threads cannot beat a ceiling that is shared regardless of
+shard or thread — the same WT-internal ceiling that caps multi-writer sync
+(`docs/concurrency.md` / Finding 5). So **the sustainable async win is ~1.35–1.4×,
+and one drainer suffices**; the pool is retained (correct, env-tunable) for a
+hypothetical future where WT write throughput is raised (bigger cache / more log
+bandwidth / dedicated log volume), at which point it would begin to matter.
+
+The honest ceiling for multi-writer oplog-backed throughput on embedded WT is
+therefore ~1.4× of sync (~half the no-oplog rate), whether the oplog write is
+inline (sync), decoupled (async single drainer), or decoupled + sharded (async
+pool). To go materially faster you either drop the oplog (`enable_oplog=False`,
+which is what a standalone `mongod` effectively does) or raise WT's own write
+ceiling — not restructure the oplog write path further.
 
 ## Correctness validated
 
