@@ -32,10 +32,11 @@ server unchanged — same `OP_MSG` handshake, same commands, same error
 codes, same on-disk WiredTiger semantics.
 
 And it is fast: on the six-workload benchmark the Rust server runs at
-**1.1×–2.1× of real `mongod`** per operation (writes within ~10–30% —
-insert 1.1×, update / delete 1.3×) — roughly 4×–10× faster than the
-Python server workload-for-workload — measured end-to-end through
-`pymongo` on on-disk WiredTiger. Numbers and methodology:
+**~0.9×–2.1× of real `mongod`** per operation (writes at or just under
+`mongod` parity — insert 1.0×, update 0.9×, delete 1.0× — after a mimalloc
+allocator + LTO cut the BSON-materialization allocation cost) — roughly
+4×–14× faster than the Python server workload-for-workload — measured
+end-to-end through `pymongo` on on-disk WiredTiger. Numbers and methodology:
 [Benchmark](https://secantusdb.com/docs/benchmark.html).
 
 ## Where this fits
