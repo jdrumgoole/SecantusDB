@@ -258,9 +258,9 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [x] **ws-changes xdist worker crash (Linux CI, recurring) — ROOT-CAUSED AND
-  FIXED 2026-07-22. It was never a crash: it is an unbounded websocket receive
-  in a test.** Confirmed by a controlled repro (`crash-repro.yml`,
+- [x] **ws-changes flake — THREE causes, all now fixed (2026-07-22 / 2026-07-26).
+  Two lived in the test and the admin router; the third was silent event loss in
+  the server itself.** Confirmed by a controlled repro (`crash-repro.yml`,
   `mode=ws-single`, run 29877050313, attempt 2/3), which caught the
   `+++ Timeout +++` stack the previous seven occurrences had all lost. The
   chain, verified end to end:
@@ -322,6 +322,38 @@ These are explicit non-goals. Don't add them without a reason.
     months). The storage layer is exonerated: the connection thread in the dump
     is sitting in `_get_more`'s **bounded** `_oplog_cv.wait_for`, behaving
     correctly on a genuinely quiet stream.
+
+  **THIRD cause — the server was throwing the event away (fixed 2026-07-26,
+  #667).** After the two fixes above the test still failed intermittently, now on
+  Windows lanes, with the honest message the bounded receive gives us: `no
+  websocket frame within 30.0s`. The traceback names the *second* receive, so
+  `open` had arrived — the stream was established and the insert still never
+  came. Not a websocket bug at all.
+
+  `commands.py`'s change-stream producer skips the cursor to the oplog tail when
+  a poll finds nothing for the watched namespace (so a quiet collection's PBRT
+  can move past unrelated activity). That skip was bounded by
+  `storage.oplog_tail_seq()`, read *after* the scan, which loses writes two ways:
+  one committing between the scan and the tail read is counted by the tail but
+  was never examined; and the tail is the highest seq **minted**, which a writer
+  takes before committing its batch without holding `_lock`, so it can name an
+  entry no reader can see yet. `position_seq` only moves forward, so either way
+  the event is gone permanently — no later poll returns it.
+
+  Fixed by bounding the skip with what the poll actually examined:
+  `_merge_oplog_on_session` reports `scan_high` (highest seq walked, including
+  filter-rejected entries), exposed as `Storage.read_oplog_scan`. Note that
+  snapshotting the tail *before* the scan is NOT sufficient — it closes the first
+  gap but not the minted-uncommitted one. **The Rust server never had this**: its
+  `change_stream_poll` reads unfiltered and advances only over scanned rows.
+  Regression: `test_change_streams.py::test_empty_poll_cannot_skip_a_write_that_
+  lands_mid_scan`, which commits a write from inside the producer's own storage
+  calls and fails (times out) on pre-fix code.
+
+  **Lesson for the next one of these:** two plausible root causes had already
+  been found and fixed, and both were real — which made it easy to read the next
+  recurrence as "the same flake again". It wasn't. A test that keeps failing
+  after a correct fix deserves the same suspicion the first failure got.
 
   **Method note worth keeping:** the diagnostic that finally worked was removing
   xdist (`-n0`), not adding more instrumentation — the evidence existed all along
