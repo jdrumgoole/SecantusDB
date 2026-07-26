@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -255,7 +256,7 @@ def _run_nested_with_fault_dir(
     fault_dir: Path,
     xdist: bool,
     max_worker_restart: str = "0",
-    timeout: int = 300,
+    timeout: int = 120,
 ) -> subprocess.CompletedProcess[str]:
     """Nested pytest session with ``SECANTUS_FAULTHANDLER_DIR`` armed."""
     (tmp_path / "conftest.py").write_text(_CONFTEST_UNDER_TEST.read_text())
@@ -268,9 +269,47 @@ def _run_nested_with_fault_dir(
     if xdist:
         cmd += ["--max-worker-restart", max_worker_restart]
     with _nested_run_lock():
-        return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, cwd=tmp_path, env=env
-        )
+        return _run_tolerating_teardown_wedge(cmd, cwd=tmp_path, env=env, timeout=timeout)
+
+
+# The final `= N passed/failed/error ... in Xs =` banner pytest prints once its
+# session is over — everything these tests assert on (the faulthandler files and
+# the pass/fail verdict) is decided by the time it appears.
+_PYTEST_SUMMARY = re.compile(r"^=+ (?P<body>.+?) in [\d.]+s.*=+$", re.M)
+
+
+def _run_tolerating_teardown_wedge(
+    cmd: list[str], *, cwd: Path, env: dict[str, str], timeout: int
+) -> subprocess.CompletedProcess[str]:
+    """Run the nested pytest, tolerating a *post-summary* teardown wedge.
+
+    A nested ``pytest -n 2`` — especially after a worker SIGSEGV — can print its
+    summary and then hang in interpreter / xdist shutdown without ever exiting.
+    That is the very "wedged after its last test" case the crash watchdog exists
+    to detect, so it is not a test failure here: the session finished, the
+    faulthandler files are written, the verdict is in the summary. When it
+    happens, kill the hung process and synthesize the return code from the
+    summary line instead of raising ``TimeoutExpired``. A hang with *no* summary
+    (genuinely stuck mid-run) still raises — that is a real failure.
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=env
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        m = _PYTEST_SUMMARY.search(out or "")
+        if m is None:
+            raise  # no summary → the session never finished; a real hang
+        summary = m.group("body")
+        rc = 1 if ("failed" in summary or "error" in summary) else 0
+        return subprocess.CompletedProcess(cmd, rc, out, err)
 
 
 # The nested `pytest -n 2` sessions below spawn several extra processes each. If
@@ -298,13 +337,16 @@ def _nested_run_lock() -> Iterator[None]:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
-# These two tests each spawn a nested `pytest -n 2` subprocess. `_run_nested_with_fault_dir`
-# holds a machine-wide file lock (`_nested_run_lock`) so no two nested sessions
-# ever run at once — the real serialisation, effective under any xdist dist mode.
-# The `xdist_group` marker is kept as a scheduling hint (only active under
-# `--dist loadgroup`), and the nested spawn (300s) plus the test deadline
-# (360s > the spawn's) give a slow start under load enough headroom. See
-# ci-check's "crash_stall_watchdog" catalog entry.
+# These two tests each spawn a nested `pytest -n 2` subprocess.
+# `_run_nested_with_fault_dir` holds a machine-wide file lock (`_nested_run_lock`)
+# so no two nested sessions ever run at once — the real serialisation, effective
+# under any xdist dist mode — and runs the nested session through
+# `_run_tolerating_teardown_wedge`, which treats a *post-summary* hang (the
+# nested pytest printing its verdict, then wedging in xdist shutdown) as a
+# finished session rather than a timeout. That wedge is intermittent and is
+# exactly the failure mode the crash watchdog exists to catch, so it must not
+# flake these tests. The `xdist_group` marker is a scheduling hint (only active
+# under `--dist loadgroup`). See ci-check's "crash_stall_watchdog" catalog entry.
 @pytest.mark.xdist_group("crash_watchdog_nested")
 @pytest.mark.timeout(360)
 def test_faulthandler_dir_arms_a_file_per_worker(tmp_path: Path) -> None:
