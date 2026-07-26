@@ -339,6 +339,90 @@ def rust_server_build(c: Context) -> None:
     )
 
 
+def _llvm_profdata() -> str:
+    """Locate ``llvm-profdata`` from the active Rust toolchain (llvm-tools-preview)."""
+    from shutil import which
+
+    sysroot = subprocess.run(
+        ["rustc", "--print", "sysroot"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    for p in glob.glob(f"{sysroot}/lib/rustlib/*/bin/llvm-profdata"):
+        return p
+    found = which("llvm-profdata")
+    if found:
+        return found
+    raise SystemExit(
+        "llvm-profdata not found — run: rustup component add llvm-tools-preview"
+    )
+
+
+@task(name="rust-pgo-refresh")
+def rust_pgo_refresh(c: Context) -> None:
+    """Regenerate the committed PGO profile for the embedded ``_secantus_server``.
+
+    Two-stage profile-guided optimization (the checked-in-profile half of the
+    PGO split): build the extension instrumented, drive the six-workload
+    benchmark against it to collect a profile, merge it ``--sparse``, and commit
+    it as ``crates/pgo/_secantus_server.profdata.tar.gz``. CMake feeds that
+    profile to the normal release build via ``-Cprofile-use`` (see the server-ext
+    block in ``CMakeLists.txt``). Measured ~12-19% on the write/aggregate paths
+    over thin-LTO alone (``tasks/rust-perf-findings.md`` Finding 8).
+
+    Re-run when the Rust hot paths change materially — the profile is only a
+    hint (unmatched functions are ignored via ``-pgo-warn-missing-function``), so
+    a stale profile is safe, just less optimal. Needs ``llvm-tools-preview``
+    (``rustup component add llvm-tools-preview``) plus the WiredTiger / libclang
+    build env (auto-filled like ``rust-server-build``).
+    """
+    import tarfile
+    import tempfile
+
+    profdata_tool = _llvm_profdata()
+    committed = pathlib.Path("crates/pgo/_secantus_server.profdata.tar.gz")
+    committed.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="secantus-pgo-") as tmp:
+        prof_dir = pathlib.Path(tmp)
+
+        print("=== PGO stage 1: instrumented build (profile-generate) ===")
+        env1 = _rust_env()
+        env1["SECANTUS_PGO_GENERATE"] = str(prof_dir)
+        c.run(
+            "SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON "
+            "uv sync --inexact --extra dev --extra admin --reinstall-package secantusdb",
+            pty=True,
+            env=env1,
+        )
+
+        print("=== PGO stage 2: collecting the profile (benchmark workloads) ===")
+        env2 = _rust_env()
+        env2["LLVM_PROFILE_FILE"] = str(prof_dir / "pgo-%p-%m.profraw")
+        c.run(
+            "uv run --no-sync python -m bench.compare_servers --n 10000 --reps 5 --no-mongod",
+            pty=True,
+            env=env2,
+        )
+
+        raws = glob.glob(str(prof_dir / "*.profraw"))
+        if not raws:
+            raise SystemExit(
+                "PGO: no .profraw produced — the instrumented build may not have run."
+            )
+        merged = prof_dir / "merged.profdata"
+        print(f"=== PGO: merging {len(raws)} profraw → sparse profdata ===")
+        c.run(
+            f"{shlex.quote(profdata_tool)} merge --sparse "
+            f"-o {shlex.quote(str(merged))} "
+            + " ".join(shlex.quote(r) for r in raws)
+        )
+        with tarfile.open(committed, "w:gz") as tf:
+            tf.add(merged, arcname="_secantus_server.profdata")
+        print(f"=== PGO: wrote {committed} ({committed.stat().st_size // 1024} KiB) ===")
+
+    print("=== PGO stage 3: rebuild the shipped extension with -Cprofile-use ===")
+    rust_server_build(c)
+
+
 @task(
     name="rust-stress",
     help={
