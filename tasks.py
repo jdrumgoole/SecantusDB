@@ -1139,12 +1139,33 @@ def validate_cxx(c: Context, server: str = "python") -> None:
         c.run("git submodule update --init vendor/mongo-c-driver", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
+    # Drop any previous run's JUnit up front so it cannot be mistaken for this
+    # run's output below. (The runner also clears it, but only *after* its
+    # pre-flight checks — and it is exactly the pre-flight bail that used to
+    # leave a stale file behind.)
+    raw = pathlib.Path(f".validation/cxx-raw{suffix}.xml")
+    raw.unlink(missing_ok=True)
     c.run(
         f"SECANTUS_GAUGE_SERVER={server} "
         "PYTHONPATH=. uv run --no-sync python -m cxx_validation.runner",
         pty=True,
         warn=True,
     )
+    # Only regenerate the report from results this invocation actually produced.
+    # The gauge refuses to start when something already holds port 27017 (see the
+    # note above); before this check that refusal still fell through to
+    # generate_report, which re-rendered the PREVIOUS run's numbers under
+    # today's date — a stale conformance figure wearing a fresh timestamp. The
+    # test binary writes JUnit whether the tests pass or fail, so a missing file
+    # means the gauge never ran, not that it ran badly.
+    if not raw.is_file() or raw.stat().st_size == 0:
+        raise SystemExit(
+            f"cxx_validation produced no results ({raw} missing or empty); not "
+            f"regenerating docs/validation-report-cxx{suffix}.md, which would "
+            "otherwise restamp the previous run's numbers as if they were "
+            "current. See the runner output above — port 27017 already being in "
+            "use is the usual cause."
+        )
     c.run(
         "uv run --no-sync python -m cxx_validation.generate_report "
         f".validation/cxx-raw{suffix}.xml docs/validation-report-cxx{suffix}.md",
