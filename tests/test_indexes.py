@@ -1877,18 +1877,26 @@ def test_find_no_sort_objectid_insertion_order(storage: Storage) -> None:
 
 
 def test_update_multi_false_updates_natural_first_match(storage: Storage) -> None:
-    """multi=False updates the first doc in natural (insertion-numeric) order."""
+    """multi=False updates the first doc in natural (INSERTION) order.
+
+    mongod's COLLSCAN plan visits documents in RecordId (insertion) order, so an
+    unindexed ``multi=False`` update modifies the oldest-inserted match — not the
+    smallest ``_id``. Since the doc table is keyed by RecordId the candidate scan
+    is in that order too; before then it walked ``_id`` order and picked the
+    smallest ``_id``, which diverged from mongod for non-monotonic ``_id``s.
+    """
     import random
 
     rng = random.Random(7)
     ids = list(range(10))
     rng.shuffle(ids)
+    assert ids[0] != min(ids), "shuffle must not put the smallest _id first, or this proves nothing"
     storage.insert("db", "c", [{"_id": i, "tag": "a"} for i in ids])
     result = storage.update_matching("db", "c", {"tag": "a"}, {"$set": {"tag": "b"}}, multi=False)
     assert result["modified"] == 1
-    # The doc that flipped to "b" is the one with the smallest _id (natural-first).
+    # The doc that flipped to "b" is the one inserted FIRST, not the smallest _id.
     [updated] = storage.find_matching("db", "c", {"tag": "b"})
-    assert updated["_id"] == 0
+    assert updated["_id"] == ids[0]
 
 
 def test_id_uniqueness_still_collides_int_float_decimal(storage: Storage) -> None:

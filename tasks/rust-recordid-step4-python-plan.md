@@ -42,7 +42,48 @@ frame layout and the 8-byte-BE entry against the Rust unit tests' exact bytes
 
 ---
 
-## 4a — doc-table RecordId keying (mirror of Rust #613 `b90b5490`)
+## 4a — doc-table RecordId keying (mirror of Rust #613 `b90b5490`) — **DONE**
+
+All eight steps below are implemented in `src/secantus/storage.py`. Notes from the
+pass, for 4b/4c:
+
+- `_scan_docs` now yields `(RecordId, id_key, blob)`; ~20 call sites updated.
+  `_scan_docs_natural` is a thin alias (kept for call-site readability).
+- `_write_nat_entry` returns the RecordId, or `None` for a duplicate `_id` — the
+  insert path shapes the 11000 error from that, so no new exception type crosses
+  the storage boundary. A WT rollback still surfaces as `WriteConflictError`.
+- `_delete_doc_row(db, coll, recordid)` is the single doc-row delete used by
+  `delete_matching`, capped eviction and `prune_ttl`.
+- Two methods were pinned to their old contract in 4a because they are
+  *documented* as id_key-ordered: `scan_docs_after_id_key` sorted its result by
+  `id_key`, and `collection_min_id_key` took the `min` across the scan rather than
+  the first row. Both were tailable-cursor-only and **4c deleted them.**
+- The `hint: "_id_"` path sorts the scan by `id_key` (it used to rely on the doc
+  table already being in that order).
+- `rename_collection` needs no change: it copies doc rows *and* `_NAT_SEQ_TABLE`
+  rows verbatim, so RecordIds are preserved rather than re-minted (this is where
+  the Rust side had to rebuild index entries — Python doesn't).
+**Byte-parity VERIFIED against the shipped Rust storage** (2026-07-25, the
+`_secantus_storage` extension built from `main`, one process per open — WT allows
+only one open of a home dir per process):
+
+| direction | result |
+|---|---|
+| Rust writes 3 docs (non-monotonic `_id`s) → Python `Storage` opens it | reads all 3 **in insertion order**, `_id` point-lookup works |
+| Python appends to that store → Rust reopens | Rust sees all 4 and finds the Python-written doc by `_id` |
+| Python writes a fresh store (no secondary index) → Rust opens | reads all docs, filtered lookup works |
+| Python writes a fresh store **with a secondary index** → Rust opens | **refused**: `index 'x_1' … is entryFormat 1, but this build requires 2` |
+
+That last row is **expected and is exactly what 4b closes** — Python still writes
+step-1-format index entries (id_key in the trailing half, no `entryFormat`
+marker). The doc-table half of the format is complete and portable both ways; the
+index-entry half is 4b's job.
+
+- Fixed as a side effect: `update_matching(multi=False)` / `delete_matching` now
+  visit candidates in insertion order, so they pick the oldest match like mongod
+  (backlog divergence deleted; `tests/test_indexes.py::test_update_multi_false_
+  updates_natural_first_match` rewritten to assert the mongod behaviour — it fails
+  on pre-change code).
 
 **Python functions in play:** `_write_nat_entry` (1479), `_delete_nat_entry`
 (1489), `_scan_docs_natural` (1505), `_scan_docs` (3403), `_mint_nat_seq` (1473),
@@ -86,6 +127,7 @@ a "refuse an SSu store" test (fabricate an SSu doc shard, assert open raises).
 
 ## 4b — index entries carry the RecordId (mirror of Rust #637 `4af58aae`)
 
+
 **Python functions:** `_pack_entry` (253), `_unpack_entry` (263),
 `_write_index_entries` (5552), `_delete_index_entries` (5588), `create_index`
 (5079), the IXSCAN fetch (`_docs_by_id_keys` / candidate paths), uniqueness probes,
@@ -115,6 +157,8 @@ store" test and a rename-keeps-index-reachable test (mirror the Rust
 collection scan — and verify it FAILS on a verbatim-copy rename before trusting it).
 
 ## 4c — tailable capped cursor tracks RecordId (mirror of Rust #640 `6f3a8e05`)
+
+
 
 **Only after 4a/4b** — until the Python doc table is RecordId-keyed, its natural
 order IS id_key order and the current id_key tailable is correct.

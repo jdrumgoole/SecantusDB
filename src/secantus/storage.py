@@ -160,6 +160,12 @@ def _doc_table_for(db: str, coll: str) -> str:
 _DOC_ALL_TABLES = [_doc_shard_name(s) for s in range(_DOC_SHARDS)] + [_DOC_TABLE]
 
 
+class IncompatibleStorageFormatError(RuntimeError):
+    """The on-disk store was written by a build with an incompatible format and
+    cannot be opened. Raised at ``Storage.__init__`` — there is deliberately no
+    in-place migration (see ``_reject_pre_recordid_doc_format``)."""
+
+
 def _migrate_legacy_docs(session: Any) -> None:
     """One-time on-open migration: move every row in the legacy single
     ``secantus_documents`` table to its per-collection shard (a store written
@@ -177,14 +183,28 @@ def _migrate_legacy_docs(session: Any) -> None:
         src.close()
     if not rows:
         return
-    for db, coll, id_key, blob in rows:
-        dst = session.open_cursor(_doc_table_for(db, coll), None)
-        try:
-            dst.set_key(db, coll, id_key)
-            dst.set_value(blob)
-            dst.insert()
-        finally:
-            dst.close()
+    # The legacy single table predates both sharding AND RecordId keying: its rows
+    # are ``(db, coll, id_key) -> raw blob``. Re-key each into its shard by a fresh
+    # RecordId (the framed value carries the id_key), and write the ``_id`` index
+    # row (id_key -> RecordId). ``_scan_max_nat_seq`` (run just after, from
+    # ``_load_oplog_meta``) recovers the counter from the shards so freshly minted
+    # RecordIds stay strictly greater.
+    idx = session.open_cursor(_NAT_SEQ_TABLE, None)
+    try:
+        for recordid, (db, coll, id_key, blob) in enumerate(rows, start=1):
+            dst = session.open_cursor(_doc_table_for(db, coll), None)
+            try:
+                dst.set_key(db, coll, recordid)
+                dst.set_value(_frame_doc_value(id_key, blob))
+                dst.insert()
+            finally:
+                dst.close()
+            idx.reset()
+            idx.set_key(db, coll, id_key)
+            idx.set_value(recordid)
+            idx.insert()
+    finally:
+        idx.close()
     delc = session.open_cursor(_DOC_TABLE, None)
     try:
         for db, coll, id_key, _ in rows:
@@ -194,6 +214,60 @@ def _migrate_legacy_docs(session: Any) -> None:
             delc.reset()
     finally:
         delc.close()
+
+
+def _extract_key_format(cfg: str) -> str | None:
+    """Parse the ``key_format=<fmt>`` clause out of a WiredTiger config /
+    ``metadata:`` string (``fmt`` is a simple token — ``SSq``, ``SSu``, … — so it
+    stops at the next comma). ``None`` if the string has no ``key_format``.
+    Mirrors the Rust ``extract_key_format``."""
+    marker = "key_format="
+    start = cfg.find(marker)
+    if start < 0:
+        return None
+    rest = cfg[start + len(marker) :]
+    end = rest.find(",")
+    return (rest if end < 0 else rest[:end]).strip()
+
+
+def _reject_pre_recordid_doc_format(session: Any) -> None:
+    """Refuse to open a store whose document shards were written by a build BEFORE
+    the RecordId doc-table change. Those tables are keyed ``SSu``
+    (``(db, coll, id_key)``) with unframed blob values; this build keys them
+    ``SSq`` (``(db, coll, RecordId)``) with framed values (see
+    ``_frame_doc_value``). WiredTiger fixes a table's ``key_format`` at CREATE
+    time and preserves it across reopen — the bootstrap ``create`` is a no-op for
+    an existing table, which is exactly what lets ``_migrate_legacy_docs`` read
+    the legacy table as ``SSu`` — so the on-disk schema read here from the
+    ``metadata:`` cursor is the ground truth.
+
+    There is deliberately **no in-place migration** (decision on record,
+    2026-07-24): SecantusDB is pre-1.0 beta, so the correct response to an
+    incompatible on-disk format is to refuse to open rather than silently
+    mis-read stored data with ``SSq`` cursor ops against an ``SSu`` btree. Mirrors
+    the Rust ``reject_pre_recordid_doc_format``. (A pre-*shard* store is the
+    separate, supported case — its legacy single ``secantus_documents`` table is
+    folded in by ``_migrate_legacy_docs`` — so only the sharded doc tables are
+    inspected here.)
+    """
+    meta = session.open_cursor("metadata:", None)
+    try:
+        for s in range(_DOC_SHARDS):
+            name = _doc_shard_name(s)
+            meta.reset()
+            meta.set_key(name)
+            if meta.search() != 0:
+                continue
+            if _extract_key_format(str(meta.get_value())) == "SSu":
+                raise IncompatibleStorageFormatError(
+                    f"SecantusDB storage at this path was written by a build before "
+                    f"the RecordId doc-table change: '{name}' is keyed 'SSu' but this "
+                    f"build requires 'SSq'. There is no in-place upgrade (pre-1.0 "
+                    f"beta, no migration) — start from a fresh data directory or "
+                    f"downgrade to the build that wrote it."
+                )
+    finally:
+        meta.close()
 
 
 # Natural-order (insertion-order) index. mongod returns documents from an
@@ -780,6 +854,15 @@ class WriteConflictError(Exception):
     """
 
 
+def _is_wt_duplicate_key(exc: BaseException) -> bool:
+    """True when a ``WiredTigerError`` is the WT_DUPLICATE_KEY signal from an
+    ``overwrite=false`` insert. Distinguishing it matters: every other WT error
+    on that path (rollback, I/O, panic) is a storage failure, and reporting one
+    as a duplicate-key write error would tell the client its data was rejected
+    when in fact the write broke."""
+    return "WT_DUPLICATE_KEY" in str(exc)
+
+
 def _is_wt_rollback(exc: BaseException) -> bool:
     """True when a ``WiredTigerError`` is the WT_ROLLBACK conflict signal
     (as opposed to e.g. WT_DUPLICATE_KEY). The SWIG binding raises a
@@ -1226,8 +1309,11 @@ class Storage:
             boot.create(_DOC_TABLE, "key_format=SSu,value_format=u")
             # Per-collection documents shards (see ``_DOC_SHARDS``). The legacy
             # single table above stays for the one-time migration below.
+            # Keyed ``SSq`` — (db, coll, RecordId) — so a forward walk IS
+            # insertion order and the doc row is written once per insert
+            # (RecordId step 4a; byte-identical to the Rust ``DOC_TABLE_CFG``).
             for _s in range(_DOC_SHARDS):
-                boot.create(_doc_shard_name(_s), "key_format=SSu,value_format=u")
+                boot.create(_doc_shard_name(_s), "key_format=SSq,value_format=u")
             boot.create(_NAT_TABLE, "key_format=SSq,value_format=u")
             boot.create(_NAT_SEQ_TABLE, "key_format=SSu,value_format=q")
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
@@ -1244,11 +1330,28 @@ class Storage:
             boot.create(_USERS_TABLE, "key_format=SS,value_format=u")
             boot.create(_ROLES_TABLE, "key_format=SS,value_format=u")
             boot.create(_PROFILE_TABLE, "key_format=S,value_format=u")
+            # Fail fast on a store whose doc shards predate the RecordId keying
+            # change (``SSu`` on disk vs the ``SSq`` this build needs): no
+            # in-place upgrade, refuse to open rather than mis-read. The
+            # ``create`` above preserves an existing table's key_format, so the
+            # on-disk schema is intact for this check. (Runs before
+            # ``_migrate_legacy_docs`` — that path is the pre-*shard* case, which
+            # this check does not touch.)
+            _reject_pre_recordid_doc_format(boot)
             # One-time: fold a pre-shard store's legacy documents rows into the
             # per-collection shards (no-op for a born-sharded store).
             _migrate_legacy_docs(boot)
-        finally:
+        except IncompatibleStorageFormatError:
+            # Refusing to open: tear the connection down rather than leave a live
+            # WT handle (and its home-directory lock) behind for a Storage that
+            # never comes into existence.
             boot.close()
+            with contextlib.suppress(Exception):
+                self._conn.close()
+            raise
+        finally:
+            with contextlib.suppress(Exception):
+                boot.close()
 
         # Oplog state — durable across restart via _OPLOG_META_TABLE.
         self.oplog_retention_seconds = float(oplog_retention_seconds)
@@ -1479,20 +1582,24 @@ class Storage:
                     c.close()
 
     def _scan_max_nat_seq(self) -> int:
-        """Largest insertion ``seq`` present in ``_NAT_TABLE`` (0 if empty).
+        """Largest RecordId present across the document shards (0 if empty).
 
         Used to recover the insertion counter on reopen when the persisted
         ``next_nat_seq`` is absent (legacy DBs / runs with the oplog disabled),
-        so minted seqs stay strictly greater than any existing one.
+        so minted RecordIds stay strictly greater than any existing doc-table
+        key. RecordIds are global-monotonic, so any row in any shard could hold
+        the max — scan every shard. Mirrors the Rust ``scan_max_nat_seq``.
         """
-        c = self._cursor(_NAT_TABLE)
-        rc = c.prev()  # last row = highest (db, coll, seq)
         max_seq = 0
-        while rc == 0:
-            seq = int(c.get_key()[2])
-            if seq > max_seq:
-                max_seq = seq
-            rc = c.prev()
+        for s in range(_DOC_SHARDS):
+            c = self._cursor(_doc_shard_name(s))
+            c.reset()
+            rc = c.prev()  # last row = highest (db, coll, RecordId) in this shard
+            while rc == 0:
+                seq = int(c.get_key()[2])
+                if seq > max_seq:
+                    max_seq = seq
+                rc = c.prev()
         return max_seq
 
     def _mint_nat_seq(self) -> int:
@@ -1501,64 +1608,79 @@ class Storage:
             self._next_nat_seq += 1
             return seq
 
-    def _write_nat_entry(self, db: str, coll: str, id_key: bytes) -> None:
-        """Record a doc's insertion position: seq -> id_key (+ reverse)."""
-        seq = self._mint_nat_seq()
-        nat = self._cursor(_NAT_TABLE)
-        nat.reset()
-        nat[db, coll, seq] = id_key
-        rev = self._cursor(_NAT_SEQ_TABLE)
-        rev.reset()
-        rev[db, coll, id_key] = seq
+    def _write_nat_entry(self, db: str, coll: str, id_key: bytes) -> int | None:
+        """Assign the doc a RecordId and write the ``_id`` index row
+        (``id_key -> RecordId``). Returns the RecordId — the caller keys the doc
+        table by it — or ``None`` when the ``_id`` is already present (a duplicate
+        key), which is where dup-``_id`` is now caught: the doc table is keyed by
+        the unique RecordId, so it can no longer reject a dup itself.
 
-    def _delete_nat_entry(self, db: str, coll: str, id_key: bytes) -> None:
-        """Drop a doc's insertion-order entry (both directions). No-op if absent
-        (legacy docs inserted before this index existed)."""
+        The forward ``_NAT_TABLE`` row (seq -> id_key) is gone: the doc table is
+        itself in RecordId (= insertion) order, which is the 4->3 write-amp cut.
+        Mirrors the Rust ``write_nat_entry``.
+        """
+        recordid = self._mint_nat_seq()
+        # overwrite=False so a second write of the same ``_id`` fails instead of
+        # silently replacing the first doc's RecordId. A RecordId wasted on the
+        # dup path is harmless — they only need to be unique + monotonic.
+        rev = self._cursor(_NAT_SEQ_TABLE, overwrite=False)
+        rev.reset()
+        rev.set_key(db, coll, id_key)
+        rev.set_value(recordid)
+        try:
+            rev.insert()
+        except wt.WiredTigerError as exc:
+            if _is_wt_rollback(exc):
+                raise WriteConflictError(str(exc)) from exc
+            if _is_wt_duplicate_key(exc):
+                return None
+            # Any other storage error is a real failure — never dress it up as a
+            # duplicate key, which would tell the client its document was
+            # rejected when the write actually broke.
+            raise
+        return recordid
+
+    def _doc_recordid(self, db: str, coll: str, id_key: bytes) -> int | None:
+        """The ``_id`` index lookup: resolve a doc's ``id_key`` to its RecordId
+        (the doc-table key). ``None`` if the doc doesn't exist. Mirrors the Rust
+        ``doc_recordid``."""
         rev = self._cursor(_NAT_SEQ_TABLE)
         rev.reset()
         rev.set_key(db, coll, id_key)
         if rev.search() != 0:
-            return
-        seq = int(rev.get_value())
+            return None
+        return int(rev.get_value())
+
+    def _delete_nat_entry(self, db: str, coll: str, id_key: bytes) -> int | None:
+        """Remove the doc's ``_id``-index row and return the RecordId it mapped
+        to, so the caller can delete the doc-table row keyed by it. ``None`` if
+        absent. Mirrors the Rust ``delete_nat_entry``."""
+        rev = self._cursor(_NAT_SEQ_TABLE)
+        rev.reset()
+        rev.set_key(db, coll, id_key)
+        if rev.search() != 0:
+            return None
+        recordid = int(rev.get_value())
         rev.remove()
-        nat = self._cursor(_NAT_TABLE)
-        nat.reset()
-        nat.set_key(db, coll, seq)
-        if nat.search() == 0:
-            nat.remove()
+        return recordid
 
-    def _scan_docs_natural(self, db: str, coll: str) -> Iterable[tuple[bytes, bytes]]:
-        """Yield ``(id_key, blob)`` in **insertion order** via ``_NAT_TABLE``.
+    def _delete_doc_row(self, db: str, coll: str, recordid: int) -> None:
+        """Remove the doc-table row for ``recordid``. No-op if already gone."""
+        doc_cur = self._cursor(_doc_table_for(db, coll))
+        doc_cur.reset()
+        doc_cur.set_key(db, coll, recordid)
+        if doc_cur.search() == 0:
+            doc_cur.remove()
 
-        Walks the natural-order index (seq ascending) and fetches each doc by
-        ``id_key`` from the doc table. Falls back to the plain ``id_key``-order
-        ``_scan_docs`` when the collection has no natural-order entries (legacy
-        data written before this index existed), so order is best-effort there
-        rather than empty.
+    def _scan_docs_natural(self, db: str, coll: str) -> Iterable[tuple[int, bytes, bytes]]:
+        """Yield ``(recordid, id_key, blob)`` in **insertion order**.
+
+        The doc table is keyed by the monotonic RecordId, so a forward walk of it
+        IS insertion order — this is now just ``_scan_docs``. Kept as a named
+        alias because the capped-eviction / unsorted-``find`` call sites read
+        better spelled "natural".
         """
-        nat = self._cursor(_NAT_TABLE)
-        nat.set_key(db, coll, _INT64_MIN)
-        rc = nat.search_near()
-        if rc == wt.WT_NOTFOUND or (rc < 0 and nat.next() != 0):
-            yield from self._scan_docs(db, coll)
-            return
-        doc = self._cursor(_doc_table_for(db, coll))
-        saw_any = False
-        while True:
-            k = nat.get_key()
-            if k[0] != db or k[1] != coll:
-                break
-            id_key = bytes(nat.get_value())
-            doc.reset()
-            doc.set_key(db, coll, id_key)
-            if doc.search() == 0:
-                saw_any = True
-                yield id_key, bytes(doc.get_value())
-            if nat.next() != 0:
-                break
-        if not saw_any:
-            # Collection has docs but no nat entries (legacy) — fall back.
-            yield from self._scan_docs(db, coll)
+        return self._scan_docs(db, coll)
 
     def _persist_oplog_meta(self) -> None:
         c = self._cursor(_OPLOG_META_TABLE)
@@ -3425,9 +3547,18 @@ class Storage:
             )
             return True
 
-    def _scan_docs(self, db: str, coll: str) -> Iterable[tuple[bytes, bytes]]:
+    def _scan_docs(self, db: str, coll: str) -> Iterable[tuple[int, bytes, bytes]]:
+        """Yield ``(recordid, id_key, blob)`` for every doc in ``(db, coll)``, in
+        natural (insertion) order.
+
+        The doc table is keyed by the monotonic RecordId so a forward walk IS
+        insertion order; the ``id_key`` and blob come from unframing each value
+        (see ``_frame_doc_value``) — no ``_id`` decode needed, and it recovers a
+        timeseries doc's non-derivable suffixed ``id_key`` too. Mirrors the Rust
+        ``scan_docs``.
+        """
         c = self._cursor(_doc_table_for(db, coll))
-        c.set_key(db, coll, b"")
+        c.set_key(db, coll, _INT64_MIN)
         rc = c.search_near()
         if rc == wt.WT_NOTFOUND:
             return
@@ -3437,7 +3568,8 @@ class Storage:
             k = c.get_key()
             if k[0] != db or k[1] != coll:
                 return
-            yield bytes(k[2]), bytes(c.get_value())
+            id_key, blob = _unframe_doc_value(bytes(c.get_value()))
+            yield int(k[2]), id_key, blob
             if c.next() != 0:
                 return
 
@@ -3447,12 +3579,12 @@ class Storage:
         # whole decode loop. Lock owns the WT cursor walk; decode
         # happens after release.
         with self._lock:
-            blobs = [blob for _id_k, blob in self._scan_docs(db, coll)]
+            blobs = [blob for _rid, _id_k, blob in self._scan_docs(db, coll)]
         return [bson.decode(blob) for blob in blobs]
 
     def _all_docs_with_id_key(self, db: str, coll: str) -> list[tuple[dict[str, Any], bytes]]:
         with self._lock:
-            raw = [(id_k, blob) for id_k, blob in self._scan_docs(db, coll)]
+            raw = [(id_k, blob) for _rid, id_k, blob in self._scan_docs(db, coll)]
         return [(bson.decode(blob), id_k) for id_k, blob in raw]
 
     def scan_docs_after_id_key(
@@ -3468,12 +3600,20 @@ class Storage:
         returned ``id_key`` for the next poll.
         """
         # Two-stage: collect raw bytes under the lock, decode after.
+        # ``_scan_docs`` walks in RecordId (insertion) order since the RecordId
+        # keying change, so sort by ``id_key`` to keep this method's documented
+        # id_key-ordered contract — callers use the last row as their watermark.
+        # (RecordId step 4c replaces this method's callers with a RecordId
+        # watermark, which is the order they actually want.)
         with self._lock:
-            raw: list[tuple[bytes, bytes]] = [
-                (id_k, blob)
-                for id_k, blob in self._scan_docs(db, coll)
-                if after is None or id_k > after
-            ]
+            raw: list[tuple[bytes, bytes]] = sorted(
+                (
+                    (id_k, blob)
+                    for _rid, id_k, blob in self._scan_docs(db, coll)
+                    if after is None or id_k > after
+                ),
+                key=lambda row: row[0],
+            )
         return [(id_k, bson.decode(blob)) for id_k, blob in raw]
 
     def collection_min_id_key(self, db: str, coll: str) -> bytes | None:
@@ -3483,13 +3623,12 @@ class Storage:
         Used to detect capped-collection rollover for tailable cursors: if a
         cursor's last-returned ``id_key`` is below this, the document it was
         anchored on has been evicted, and mongod kills the cursor with
-        ``CappedPositionLost``. ``_scan_docs`` yields in ``id_key`` order, so
-        the first row is the minimum — we stop after it.
+        ``CappedPositionLost``. ``_scan_docs`` yields in RecordId (insertion)
+        order since the RecordId keying change, so take the minimum across the
+        scan rather than the first row.
         """
         with self._lock:
-            for id_k, _blob in self._scan_docs(db, coll):
-                return bytes(id_k)
-            return None
+            return min((id_k for _rid, id_k, _blob in self._scan_docs(db, coll)), default=None)
 
     def collection_is_capped(self, db: str, coll: str) -> bool:
         """Public predicate: does the collection have ``capped: true`` set?
@@ -3590,17 +3729,12 @@ class Storage:
                     if ordered:
                         break
                     continue
-                doc_cur = self._cursor(_doc_table_for(db, coll), overwrite=False)
-                doc_cur.set_key(db, coll, key)
-                doc_cur.set_value(blob)
-                try:
-                    doc_cur.insert()
-                except wt.WiredTigerError as exc:
-                    if _is_wt_rollback(exc):
-                        # Concurrency conflict, not a duplicate key —
-                        # surface for transaction/retry handling instead
-                        # of lying with an E11000.
-                        raise WriteConflictError(str(exc)) from exc
+                # ``_id`` index first: it mints the RecordId the doc row is keyed
+                # by, and it is where a duplicate ``_id`` is now caught (the doc
+                # table keys by the unique RecordId, so it can't reject dups).
+                # A WT rollback surfaces as WriteConflictError from inside.
+                recordid = self._write_nat_entry(db, coll, key)
+                if recordid is None:
                     errors.append(
                         {
                             "index": index,
@@ -3615,8 +3749,16 @@ class Storage:
                     if ordered:
                         break
                     continue
+                doc_cur = self._cursor(_doc_table_for(db, coll), overwrite=False)
+                doc_cur.set_key(db, coll, recordid)
+                doc_cur.set_value(_frame_doc_value(key, blob))
+                try:
+                    doc_cur.insert()
+                except wt.WiredTigerError as exc:
+                    # The RecordId is freshly minted and unique, so the only
+                    # failure left here is a concurrency conflict.
+                    raise WriteConflictError(str(exc)) from exc
                 self._write_index_entries(db, coll, doc, indexes, partials, id_key_override=key)
-                self._write_nat_entry(db, coll, key)
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
                 if oplog_on:
@@ -3668,12 +3810,12 @@ class Storage:
         if size_limit is None and max_limit is None:
             return [], []
         scanned = list(self._scan_docs_natural(db, coll))
-        total = sum(len(blob) for _id_k, blob in scanned)
+        total = sum(len(blob) for _rid, _id_k, blob in scanned)
         count = len(scanned)
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
-        for id_k, blob in scanned:
+        for recordid, id_k, blob in scanned:
             over_size = size_limit is not None and total > size_limit
             over_max = max_limit is not None and count > max_limit
             if not over_size and not over_max:
@@ -3685,10 +3827,8 @@ class Storage:
                 # fresh too.
                 break
             doc = bson.decode(blob)
-            self._delete_index_entries(db, coll, doc, indexes, partials)
-            doc_cur = self._cursor(_doc_table_for(db, coll))
-            doc_cur.set_key(db, coll, id_k)
-            doc_cur.remove()
+            self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
+            self._delete_doc_row(db, coll, recordid)
             self._delete_nat_entry(db, coll, id_k)
             total -= len(blob)
             count -= 1
@@ -3832,7 +3972,7 @@ class Storage:
                     # natural-order index. (When a sort is applied the post-sort
                     # below reorders anyway, and feeding it insertion order makes
                     # equal-key ties break like mongod's RecordId order.)
-                    raw_blobs = [b for _, b in self._scan_docs_natural(db, coll)]
+                    raw_blobs = [b for _rid, _idk, b in self._scan_docs_natural(db, coll)]
         if candidates is None:
             assert raw_blobs is not None
             candidates = [bson.decode(b) for b in raw_blobs]
@@ -3964,11 +4104,18 @@ class Storage:
         """
         if resolved == "$natural":
             # $natural == insertion order (mongod's RecordId store order).
-            return [bson.decode(b) for _, b in self._scan_docs_natural(db, coll)], False
+            return [bson.decode(b) for _rid, _idk, b in self._scan_docs_natural(db, coll)], False
         if resolved == _ID_INDEX_NAME:
-            # The doc table is keyed by id_key; iterating it gives entries
-            # sorted by encoded _id, which matches the _id_ index walk.
-            docs = [bson.decode(b) for _, b in self._scan_docs(db, coll)]
+            # The doc table is keyed by RecordId (insertion order), so sort the
+            # scan by ``id_key`` to reproduce an ``_id_`` index walk — the
+            # ``_id`` index (``_NAT_SEQ_TABLE``) is in exactly that order.
+            docs = [
+                bson.decode(b)
+                for _idk, b in sorted(
+                    ((idk, b) for _rid, idk, b in self._scan_docs(db, coll)),
+                    key=lambda row: row[0],
+                )
+            ]
             in_order = sort_field == "_id"
             if in_order and sort_dir == -1:
                 docs = list(reversed(docs))
@@ -4397,7 +4544,7 @@ class Storage:
         Best-effort estimate — doesn't include WT block overhead.
         """
         with self._lock:
-            return sum(len(blob) for _id_k, blob in self._scan_docs(db, coll))
+            return sum(len(blob) for _rid, _id_k, blob in self._scan_docs(db, coll))
 
     def index_sizes(self, db: str, coll: str) -> dict[str, int]:
         """Map of index name → sum of packed entry-key bytes.
@@ -4414,7 +4561,7 @@ class Storage:
             # (the gauge's drop-then-reinsert E11000 cluster).
             self._refresh_read_snapshot()
             sizes: dict[str, int] = {}
-            id_size = sum(len(id_k) for id_k, _blob in self._scan_docs(db, coll))
+            id_size = sum(len(id_k) for _rid, id_k, _blob in self._scan_docs(db, coll))
             if id_size:
                 sizes[_ID_INDEX_NAME] = id_size
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll))
@@ -4491,7 +4638,7 @@ class Storage:
                 candidates = list(self._scan_docs(db, coll))
             else:
                 candidates = self._candidates_iter(db, coll, filter)
-            for id_k, blob in candidates:
+            for recordid, id_k, blob in candidates:
                 doc = bson.decode(blob)
                 if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
@@ -4512,11 +4659,10 @@ class Storage:
                     # (``bypassDocumentValidation: true``).
                     if validator is not None and not matches(new, validator):
                         raise DocumentValidationError(new.get("_id"))
-                    # _id is immutable, so the row's actual key is the right
-                    # write target. For ordinary collections that equals
-                    # _id_key(new["_id"]); for timeseries the row key carries
-                    # a uniqueness suffix that a recompute would drop —
-                    # writing at the recomputed key would strand the old row.
+                    # _id is immutable, so the row's RecordId is the right write
+                    # target and its id_key is unchanged. For timeseries the
+                    # id_key carries a uniqueness suffix that a recompute would
+                    # drop — it comes back from the scan, framed in the value.
                     new_id_key = id_k
                     conflict = self._unique_conflict(
                         db, coll, new, indexes, exclude_id_key=id_k, partials=partials
@@ -4547,7 +4693,7 @@ class Storage:
                         db, coll, doc, indexes, partials, id_key_override=id_k
                     )
                     doc_cur = self._cursor(_doc_table_for(db, coll))
-                    doc_cur[db, coll, new_id_key] = new_blob
+                    doc_cur[db, coll, recordid] = _frame_doc_value(new_id_key, new_blob)
                     self._write_index_entries(
                         db, coll, new, indexes, partials, id_key_override=id_k
                     )
@@ -4621,10 +4767,22 @@ class Storage:
                         "Plan executor error during update :: caused by :: "
                         f"Document to upsert is larger than {MAX_BSON_OBJECT_SIZE}",
                     )
+                upsert_id_key = _id_key(upserted_id)
+                # ``_id`` index first — it mints the RecordId the doc row is
+                # keyed by (and would catch a dup, though the no-match branch
+                # means there isn't one).
+                upsert_recordid = self._write_nat_entry(db, coll, upsert_id_key)
+                if upsert_recordid is None:
+                    raise IndexConflict(
+                        _ID_INDEX_NAME,
+                        upserted_id,
+                        key_pattern={"_id": 1},
+                        key_value={"_id": upserted_id},
+                        namespace=f"{db}.{coll}",
+                    )
                 doc_cur = self._cursor(_doc_table_for(db, coll))
-                doc_cur[db, coll, _id_key(upserted_id)] = upsert_blob
+                doc_cur[db, coll, upsert_recordid] = _frame_doc_value(upsert_id_key, upsert_blob)
                 self._write_index_entries(db, coll, new, indexes, partials)
-                self._write_nat_entry(db, coll, _id_key(upserted_id))
                 self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
                 if oplog_on:
                     oplog_entries.append(
@@ -4705,14 +4863,12 @@ class Storage:
                 candidates = list(self._scan_docs(db, coll))
             else:
                 candidates = self._candidates_iter(db, coll, filter)
-            for id_k, blob in candidates:
+            for recordid, id_k, blob in candidates:
                 doc = bson.decode(blob)
                 if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
                 self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
-                doc_cur = self._cursor(_doc_table_for(db, coll))
-                doc_cur.set_key(db, coll, id_k)
-                doc_cur.remove()
+                self._delete_doc_row(db, coll, recordid)
                 self._delete_nat_entry(db, coll, id_k)
                 deleted += 1
                 if oplog_on:
@@ -4778,7 +4934,7 @@ class Storage:
             indexes = self._all_indexes(db, coll)
             partials = self._partial_filters(db, coll)
             candidates = list(self._scan_docs(db, coll))
-            for id_k, blob in candidates:
+            for recordid, id_k, blob in candidates:
                 doc = bson.decode(blob)
                 expired = False
                 for _name, field, ttl_seconds in ttl_indexes:
@@ -4792,9 +4948,7 @@ class Storage:
                 if not expired:
                     continue
                 self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
-                doc_cur = self._cursor(_doc_table_for(db, coll))
-                doc_cur.set_key(db, coll, id_k)
-                doc_cur.remove()
+                self._delete_doc_row(db, coll, recordid)
                 self._delete_nat_entry(db, coll, id_k)
                 pruned += 1
                 entry: dict[str, Any] = {
@@ -4813,9 +4967,12 @@ class Storage:
 
     @staticmethod
     def _table_kf(table: str) -> str:
-        # The legacy _DOC_TABLE and every _documents_shN shard share key format SSu.
-        if table.startswith("table:secantus_documents"):
+        # The documents shards are keyed (db, coll, RecordId); only the legacy
+        # pre-shard single table is still (db, coll, id_key).
+        if table == _DOC_TABLE:
             return "SSu"
+        if table.startswith("table:secantus_documents"):
+            return "SSq"
         return {
             _COLL_TABLE: "SS",
             _NAT_TABLE: "SSq",
@@ -5230,7 +5387,7 @@ class Storage:
                 # regular pickers skip the index for non-geo queries.
                 options["multikey"] = True
                 entries: list[tuple[bytes, bytes]] = []
-                for id_k, blob in self._scan_docs(db, coll):
+                for _rid, id_k, blob in self._scan_docs(db, coll):
                     d = bson.decode(blob)
                     if partial_filter is not None and not matches(d, partial_filter):
                         continue
@@ -5257,7 +5414,7 @@ class Storage:
                 multikey = False
                 entries = []
                 coll_opt = _parse_index_collation(options.get("collation"))
-                for id_k, blob in self._scan_docs(db, coll):
+                for _rid, id_k, blob in self._scan_docs(db, coll):
                     d = bson.decode(blob)
                     if partial_filter is not None and not matches(d, partial_filter):
                         continue
@@ -5431,7 +5588,7 @@ class Storage:
             key_spec, opts = spec
             sparse = bool(opts.get("sparse"))
             coll_opt = _parse_index_collation(opts.get("collation"))
-            blobs = [blob for _id_k, blob in self._scan_docs(db, coll)]
+            blobs = [blob for _rid, _id_k, blob in self._scan_docs(db, coll)]
         # Grouped over every key each doc contributes, matching what
         # ``_unique_conflict`` would refuse: on a multikey index two docs
         # violate uniqueness as soon as they share one generated key.
@@ -5860,10 +6017,16 @@ class Storage:
         # multiple elements. Dedupe while preserving order.
         raw: list[bytes] = []
         for id_k in dict.fromkeys(id_keys):
+            # The doc table is keyed by RecordId, so resolve through the ``_id``
+            # index first. (RecordId step 4b drops this hop by putting the
+            # RecordId in the index entry itself.)
+            recordid = self._doc_recordid(db, coll, id_k)
+            if recordid is None:
+                continue
             c.reset()
-            c.set_key(db, coll, id_k)
+            c.set_key(db, coll, recordid)
             if c.search() == 0:
-                raw.append(bytes(c.get_value()))
+                raw.append(_unframe_doc_value(bytes(c.get_value()))[1])
         return [bson.decode(b) for b in raw]
 
     _RANGE_OPS: tuple[str, ...] = ("$eq", "$gt", "$gte", "$lt", "$lte", "$in")
@@ -6266,27 +6429,37 @@ class Storage:
 
     def _candidates_iter(
         self, db: str, coll: str, filter: dict[str, Any] | None
-    ) -> list[tuple[bytes, bytes]]:
-        """Return (id_key, blob) pairs that the write paths should consider.
-        If an index covers the filter, only the indexed candidates are
+    ) -> list[tuple[int, bytes, bytes]]:
+        """Return (RecordId, id_key, blob) triples that the write paths should
+        consider. If an index covers the filter, only the indexed candidates are
         fetched; otherwise the full doc table is scanned. Either way,
         BSON decode is left to the caller so non-matching docs don't pay
         for it. Caller still applies ``matches()`` to the decoded doc —
         index lookups can produce false-positive candidates for partial
         scans (multikey, prefix overlap, etc).
+
+        The RecordId comes back with each row because the doc table is keyed by
+        it — a write path needs it to rewrite / remove the row. (Index entries
+        still carry the ``id_key``, so this resolves each through the ``_id``
+        index; RecordId step 4b puts the RecordId in the entry itself and drops
+        that hop.)
         """
         if filter:
             id_keys = self._try_index_id_keys(db, coll, filter)
             if id_keys is not None:
                 c = self._cursor(_doc_table_for(db, coll))
-                out: list[tuple[bytes, bytes]] = []
+                out: list[tuple[int, bytes, bytes]] = []
                 # Same dedup contract as ``_docs_by_id_keys``: multikey
                 # indexes can yield duplicate id_keys for one doc.
                 for id_k in dict.fromkeys(id_keys):
+                    recordid = self._doc_recordid(db, coll, id_k)
+                    if recordid is None:
+                        continue
                     c.reset()
-                    c.set_key(db, coll, id_k)
+                    c.set_key(db, coll, recordid)
                     if c.search() == 0:
-                        out.append((id_k, bytes(c.get_value())))
+                        _idk, blob = _unframe_doc_value(bytes(c.get_value()))
+                        out.append((recordid, id_k, blob))
                 return out
         return list(self._scan_docs(db, coll))
 
