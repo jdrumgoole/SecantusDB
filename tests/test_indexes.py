@@ -2100,3 +2100,119 @@ def test_ttl_sweeper_disabled_when_interval_zero(tmp_path) -> None:
         assert storage._ttl_thread is None
     finally:
         storage.close()
+
+
+def test_index_entry_layout_pins_the_recordid_bytes() -> None:
+    """A packed entry is ``escape(kb) + b"\\x00\\x00" + RecordId (8B big-endian)``.
+
+    Pins the exact bytes the Rust ``pack_entry`` writes — the entries table is
+    part of the on-disk format both servers must agree on. Big-endian is
+    load-bearing twice over: it orders entries within one key by RecordId
+    (insertion order), and being fixed-width it needs no escaping even when the
+    RecordId's own bytes contain the separator.
+    """
+    from secantus.storage import _escape_kb, _pack_entry, _unpack_entry
+
+    packed = _pack_entry(b"key", 258)
+    assert packed == b"key" + b"\x00\x00" + bytes([0, 0, 0, 0, 0, 0, 1, 2])
+    assert _unpack_entry(packed) == (b"key", 258)
+
+    # A kb containing NULs is escaped, so the FIRST separator is still the split
+    # point even though the RecordId's bytes are full of NULs themselves.
+    kb = b"a\x00b"
+    packed = _pack_entry(kb, 1)
+    assert packed.startswith(_escape_kb(kb) + b"\x00\x00")
+    assert _unpack_entry(packed) == (_escape_kb(kb), 1)
+
+    # Within one key, byte order == RecordId order (what an index walk relies on).
+    assert _pack_entry(b"k", 1) < _pack_entry(b"k", 2) < _pack_entry(b"k", 300)
+
+
+def test_unpack_entry_reports_a_pre_recordid_entry_as_none() -> None:
+    """A trailing half that isn't exactly 8 bytes is a pre-RecordId entry. Report
+    it as ``None`` — never mis-read it as some other document's RecordId (which
+    would silently return the WRONG document from an index scan)."""
+    from secantus.storage import _unpack_entry
+
+    legacy = b"key" + b"\x00\x00" + b"\x1e\x05"  # old form: an id_key, 2 bytes
+    assert _unpack_entry(legacy) == (b"key", None)
+    assert _unpack_entry(b"no-separator") == (b"no-separator", None)
+
+
+def test_created_index_records_the_entry_format(storage: Storage) -> None:
+    """Every index we create is stamped ``entryFormat: 2`` in the catalog — the
+    only on-disk signal of the entry layout (the WT key_format is ``SSSu`` either
+    way) — and that internal marker never reaches a client."""
+    from secantus.storage import _ENTRY_FORMAT_RECORDID
+
+    storage.insert("db", "c", [{"x": 1}])
+    storage.create_index("db", "c", "x_1", {"x": 1}, {})
+    for _name, _key_spec, opts in storage._iter_indexes("db", "c"):
+        assert opts.get("entryFormat") == _ENTRY_FORMAT_RECORDID
+    # list_indexes is the storage-level view; the wire-level strip is in
+    # commands._list_indexes (tested there).
+    assert all(
+        "entryFormat" not in ix or ix["name"] != "_id_" for ix in storage.list_indexes("db", "c")
+    )
+
+
+def test_open_refuses_pre_recordid_index_entries(tmp_path) -> None:
+    """An index whose catalog row predates the RecordId entry format has entries
+    carrying an id_key where this build reads an 8-byte RecordId. Opening such a
+    store must fail loudly rather than return wrong (or no) documents."""
+    import bson
+
+    from secantus.storage import _IDX_TABLE, IncompatibleStorageFormatError
+
+    s = Storage(str(tmp_path), ttl_sweep_seconds=0)
+    try:
+        s.insert("db", "c", [{"x": 1}])
+        s.create_index("db", "c", "x_1", {"x": 1}, {})
+        # Rewrite the catalog row as a pre-change build would have left it.
+        with s._lock:
+            c = s._cursor(_IDX_TABLE)
+            c.set_key("db", "c", "x_1")
+            assert c.search() == 0
+            payload = bson.decode(bytes(c.get_value()))
+            payload["options"].pop("entryFormat", None)
+            c.reset()
+            c["db", "c", "x_1"] = bson.encode(payload)
+    finally:
+        s.close()
+
+    with pytest.raises(IncompatibleStorageFormatError) as exc:
+        Storage(str(tmp_path), ttl_sweep_seconds=0)
+    assert "x_1" in str(exc.value) and "entryFormat" in str(exc.value)
+
+
+def test_rename_keeps_secondary_index_reachable(storage: Storage) -> None:
+    """After a rename, an index scan on the destination finds the same documents
+    a collection scan does.
+
+    Index entries point at RecordIds, so a rename that re-minted them (or copied
+    entries pointing at the source's) would leave every entry aimed at a
+    non-existent row: the hinted lookup would return nothing while ``$natural``
+    still returned everything. Python's rename copies the doc rows and the ``_id``
+    index verbatim, preserving RecordIds — this guards that invariant.
+
+    Verified as a real guard by mutation: re-minting the destination's RecordIds
+    after the rename (what a copy-then-reinsert rename does, the bug the Rust
+    side hit) makes the index return ``[]`` while the scan still returns
+    ``[1, 4, 7]`` — i.e. these assertions fail.
+    """
+    storage.insert("db", "src", [{"_id": i, "x": i % 3} for i in range(9)])
+    storage.create_index("db", "src", "x_1", {"x": 1}, {})
+    ok, err = storage.rename_collection("db", "src", "db", "dst")
+    assert ok, err
+
+    via_index = storage.find_matching("db", "dst", {"x": 1}, hint="x_1")
+    via_scan = [d for d in storage.find_matching("db", "dst", {}, hint="$natural") if d["x"] == 1]
+    assert sorted(d["_id"] for d in via_index) == sorted(d["_id"] for d in via_scan) == [1, 4, 7]
+    # And the destination is still writable through the index.
+    storage.insert("db", "dst", [{"_id": 99, "x": 1}])
+    assert sorted(d["_id"] for d in storage.find_matching("db", "dst", {"x": 1}, hint="x_1")) == [
+        1,
+        4,
+        7,
+        99,
+    ]
