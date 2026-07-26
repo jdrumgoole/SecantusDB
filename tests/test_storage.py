@@ -7,7 +7,7 @@ import threading
 import bson
 import pytest
 
-from secantus.storage import Storage
+from secantus.storage import Storage, _frame_doc_value, _unframe_doc_value
 
 
 @pytest.fixture
@@ -938,3 +938,121 @@ def test_ddl_and_crud_never_deadlock_and_index_stays_complete(storage: Storage) 
     """
     for r in range(4):
         _ddl_crud_round(storage, "app", f"c{r}", writers=4, per_writer=25)
+
+
+def test_frame_doc_value_layout_and_roundtrip() -> None:
+    """The doc-table value frame is ``[u32-LE id_key_len][id_key][blob]`` — byte
+    for byte what the Rust server writes (RecordId step 4a), so a store written by
+    one server reads on the other. Pins the exact bytes, not just the round-trip."""
+    framed = _frame_doc_value(b"ID", b"blob")
+    assert framed == b"\x02\x00\x00\x00ID blob".replace(b" ", b"")  # \x02000 + ID + blob
+    assert framed == bytes([2, 0, 0, 0]) + b"ID" + b"blob"
+    assert _unframe_doc_value(framed) == (b"ID", b"blob")
+    # An id_key can itself contain NULs / the frame separator bytes — the length
+    # prefix makes the split exact regardless.
+    idk = b"\x00\x00\x01\xff"
+    blob = b"\x00\x00payload\x00"
+    assert _unframe_doc_value(_frame_doc_value(idk, blob)) == (idk, blob)
+    # Empty blob is legal; empty id_key too.
+    assert _unframe_doc_value(_frame_doc_value(b"k", b"")) == (b"k", b"")
+    assert _unframe_doc_value(_frame_doc_value(b"", b"v")) == (b"", b"v")
+
+
+def test_unframe_doc_value_rejects_malformed() -> None:
+    """A value shorter than the 4-byte header, or whose declared id_key length
+    overruns the buffer, is a corrupt frame — raise, never silently mis-split."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        _unframe_doc_value(b"\x01\x02")  # < 4 bytes
+    with _pytest.raises(ValueError):
+        _unframe_doc_value(bytes([9, 0, 0, 0]) + b"xy")  # declares 9, has 2
+
+
+def test_doc_table_is_keyed_by_recordid_with_framed_values(storage: Storage) -> None:
+    """The doc row is ``(db, coll, RecordId) -> [u32-LE len][id_key][blob]``, and
+    the only ordering row written alongside it is the reverse ``_id`` index.
+
+    Pins the 4->3 write-amp cut of RecordId step 4a: the forward
+    ``secantus_natural`` row (seq -> id_key) is gone. Reads the raw WT tables so
+    a regression in the on-disk layout — the thing that has to stay byte-identical
+    to the Rust server — fails here rather than silently.
+    """
+    from secantus.storage import _NAT_SEQ_TABLE, _NAT_TABLE, _doc_table_for, _id_key
+
+    storage.insert("db", "c", [{"_id": 7, "x": "hello"}])
+    id_key = _id_key(7)
+
+    rows = storage._collect_prefix(_doc_table_for("db", "c"), ("db", "c"))
+    assert len(rows) == 1
+    (key, value) = rows[0]
+    recordid = key[2]
+    assert isinstance(recordid, int) and recordid > 0
+    assert _unframe_doc_value(bytes(value)) == (id_key, bson.encode({"_id": 7, "x": "hello"}))
+
+    # The reverse _id index maps id_key -> that same RecordId...
+    assert storage._doc_recordid("db", "c", id_key) == recordid
+    assert [k for k, _ in storage._collect_prefix(_NAT_SEQ_TABLE, ("db", "c"))] == [
+        ("db", "c", id_key)
+    ]
+    # ...and the forward natural table is not written at all any more.
+    assert storage._collect_prefix(_NAT_TABLE, ("db", "c")) == []
+
+
+def test_recordids_are_monotonic_across_reopen(tmp_path) -> None:
+    """RecordIds recovered on reopen stay strictly greater than every doc-table
+    key already on disk — ``_scan_max_nat_seq`` now scans the doc shards (the
+    forward natural table it used to read is gone)."""
+    from secantus.storage import _doc_table_for
+
+    s = Storage(str(tmp_path))
+    try:
+        s.insert("db", "c", [{"_id": i} for i in range(5)])
+        before = max(k[2] for k, _ in s._collect_prefix(_doc_table_for("db", "c"), ("db", "c")))
+    finally:
+        s.close()
+    s2 = Storage(str(tmp_path))
+    try:
+        assert s2._scan_max_nat_seq() == before
+        s2.insert("db", "c", [{"_id": 99}])
+        after = [k[2] for k, _ in s2._collect_prefix(_doc_table_for("db", "c"), ("db", "c"))]
+        assert max(after) > before
+        assert len(set(after)) == len(after), "RecordIds must be unique"
+        # Insertion order survives the reopen: the new doc scans last.
+        assert [bson.decode(b)["_id"] for _r, _k, b in s2._scan_docs("db", "c")] == [
+            0,
+            1,
+            2,
+            3,
+            4,
+            99,
+        ]
+    finally:
+        s2.close()
+
+
+def test_open_refuses_a_pre_recordid_doc_format(tmp_path) -> None:
+    """A store whose doc shards are keyed ``SSu`` was written before the RecordId
+    change. There is no in-place migration (decision on record) — opening it must
+    fail loudly rather than mis-read ``SSq`` cursor ops against an ``SSu`` btree.
+    """
+    import wiredtiger as wt
+
+    from secantus.storage import IncompatibleStorageFormatError, _doc_shard_name
+
+    home = str(tmp_path)
+    conn = wt.wiredtiger_open(home, "create,log=(enabled=true)")
+    try:
+        sess = conn.open_session()
+        # Pre-change format: (db, coll, id_key) -> raw blob.
+        sess.create(_doc_shard_name(0), "key_format=SSu,value_format=u")
+        sess.close()
+    finally:
+        conn.close()
+
+    with pytest.raises(IncompatibleStorageFormatError) as exc:
+        Storage(home)
+    assert "SSu" in str(exc.value) and "SSq" in str(exc.value)
+    # The refusal must not leave the WT home locked by a half-open connection.
+    with pytest.raises(IncompatibleStorageFormatError):
+        Storage(home)

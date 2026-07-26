@@ -256,6 +256,51 @@ has no WT; reuse the main checkout's):
 
 ## Step 3 — capped-collection eviction + `$natural` hint on doc-table order.
 ## Step 4 — Python mirror (`src/secantus/storage.py`), byte-identical RecordId scheme.
+
+### Scope (2026-07-24) — do this as THREE gated sub-PRs, mirroring the Rust side
+The Rust RecordId work landed as three PRs (#613 step 1, #637 step 2, #640 step 3).
+The Python mirror is the same three transformations in `src/secantus/storage.py`
+(+ `commands.py` for the tailable piece) and should land the same way — one sub-PR
+each, each with the pymongo gauge + full suite green. **This is the "highest-risk —
+silent data loss" class; do NOT attempt all three in one pass.** ~183 doc-table /
+`_NAT_TABLE` / `id_key` sites in `storage.py`.
+
+**Byte-identity is the whole point** (cross-server backup / PITR portability — the
+reason `_doc_shard_hash` was already pinned identical). Every on-disk byte the Rust
+side writes, Python must write the same: `frame_doc_value` = `[u32-LE id_key_len]
+[id_key][blob]`; doc table `key_format` `SSu`→`SSq` (RecordId i64); index-entry
+trailing half = 8-byte **big-endian** RecordId; `options.entryFormat = 2`. Pin each
+with a cross-server test (write with one server, read with the other) where feasible.
+
+- **4a (= Rust step 1, #613).** Doc table `SSu`→`SSq` keyed by the monotonic
+  RecordId; frame the value (`_frame_doc_value`/`_unframe_doc_value`); `_write_nat_entry`
+  writes ONLY the reverse `_id` index (`_NAT_SEQ_TABLE`: id_key→RecordId) and returns
+  the RecordId — DROP the forward `_NAT_TABLE` write (the 4th write; 4→3). Move dup-`_id`
+  detection off the doc-table insert (now keyed by unique RecordId) onto the `_id`-index
+  write. `_scan_docs` walks the doc table directly (RecordId order); `_scan_docs_natural`
+  delegates to it; DELETE the forward-`_NAT_TABLE` scan. Every doc-table READ/DELETE
+  resolves `id_key → _doc_recordid → RecordId`. On-open migration of legacy `SSu` docs
+  **DECIDED 2026-07-24 (Joe): FAIL-FAST refusal, no migration** — mirror the Rust
+  side exactly (`_reject_pre_recordid_doc_format` analog), even though the Python
+  server is the shipped package. No in-place upgrade; an old-format store is refused.
+- **4b (= Rust step 2, #637).** Index entries carry the RecordId (8-byte big-endian)
+  instead of the id_key; `_pack_entry`/`_unpack_entry`; IXSCAN fetch reads the doc row
+  directly (drop the `id_key→RecordId` hop); `options.entryFormat=2` marker + open-time
+  refusal of a step-1-format store (or migration — same users question); strip
+  `entryFormat` from `listIndexes`. Watch `rename_collection` — it re-mints RecordIds,
+  so REBUILD index entries, don't copy them (the bug #637 caught in Rust).
+- **4c (= Rust step 3, #640).** The tailable capped cursor (`commands._find_tailable`)
+  tracks RecordId, not id_key: `_scan_docs_after_recordid` / `_collection_min_recordid` /
+  `_collection_max_recordid`. NOTE: until 4a lands, the Python doc table is id_key-keyed,
+  so the id_key tailable is CORRECT there — 4c only makes sense AFTER 4a/4b, and is where
+  the Python `scan_docs_after_id_key` becomes wrong (same divergence #640 fixed in Rust).
+
+**Migration vs refusal — DECIDED 2026-07-24 (Joe): FAIL-FAST, no migration**, for
+BOTH 4a and 4b, mirroring the Rust `_reject_pre_recordid_doc_format` /
+`reject_legacy_index_entry_format`. Even though the Python server is the shipped PyPI
+package, an old-format store is refused at open with a clear error rather than
+migrated. This keeps 4a/4b a straight mirror of the Rust steps and off the risky
+open-path-migration surface.
 ## Step 5 — folded into step 1's migration if landable, else a dedicated pass.
 
 ## Measurement
