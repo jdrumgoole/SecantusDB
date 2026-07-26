@@ -17,7 +17,13 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 from typing import Any
+
+try:
+    import fcntl  # POSIX-only; the binary tests skip on Windows anyway.
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 import pytest
 
@@ -48,6 +54,27 @@ def _binary_path() -> pathlib.Path | None:
 
 _BIN = _binary_path()
 pytestmark = pytest.mark.skipif(_BIN is None, reason="secantusdb binary not built")
+
+# Each test here spawns a full secantusd-rs server plus a restore subprocess. Run
+# concurrently across xdist workers, several heavy restores contend hard enough
+# that one can blow its subprocess timeout — a contention artifact, not a real
+# restore failure (each passes in isolation). Serialize them machine-wide with an
+# advisory file lock (the same pattern the crash-watchdog nested tests use), so
+# only one binary test runs at a time regardless of xdist dist mode.
+_BINARY_SERIAL_LOCK = pathlib.Path(tempfile.gettempdir()) / "secantus-rust-binary-serial.lock"
+
+
+@pytest.fixture(autouse=True)
+def _serialize_binary_tests():
+    if fcntl is None:
+        yield
+        return
+    with open(_BINARY_SERIAL_LOCK, "w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def _docs(path: pathlib.Path, db: str, coll: str) -> list[dict[str, Any]]:
