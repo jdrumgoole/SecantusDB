@@ -3,7 +3,8 @@ name: Tests
 on:
   push:
     branches: [main]
-    # Skip the matrix when a commit only touches docs / license / markdown.
+    # Skip the matrix when a commit only touches docs / license / markdown /
+    # the marketing site (website/** — excluded from sdist/wheel, no runtime code).
     # GitHub considers paths-ignore satisfied (and skips the run) when EVERY
     # changed file matches one of these patterns. Anything else here — code,
     # tests, pyproject.toml, the workflows themselves — runs the full matrix.
@@ -11,12 +12,14 @@ on:
       - '**.md'
       - 'LICENSE*'
       - 'docs/**'
+      - 'website/**'
   pull_request:
     branches: [main]
     paths-ignore:
       - '**.md'
       - 'LICENSE*'
       - 'docs/**'
+      - 'website/**'
   # Weekly full-matrix run: every Monday 06:00 UTC, exercises all
   # supported CPython versions (3.10–3.13) across Linux/Windows, PLUS macOS.
   # Push/PR runs only test 3.10 on each OS to keep latency tight; this
