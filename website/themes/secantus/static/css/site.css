@@ -576,3 +576,153 @@ article.post .body h3 { font-size: 19px; margin: 28px 0 10px; font-weight: 600; 
   .section { padding: 56px 0; }
   .site-nav { gap: 14px; font-size: 13px; }
 }
+
+/* ---- Two servers (engines) — dark band on home + Rust-server page ---- */
+.engines-section {
+  background: var(--slate-950);
+  border-bottom: 1px solid var(--slate-800);
+}
+.engines-section h2,
+.engines-section h1 { color: #fff; }
+.engines-section .section-lead { color: var(--slate-400); }
+
+.page-hero-engine { padding: 88px 0 72px; }
+.page-hero-engine h1 {
+  font-size: 44px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 14px 0 14px;
+}
+.page-hero-engine .ctas { margin-top: 28px; }
+
+.engines {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 22px;
+}
+.engine {
+  background: var(--slate-900);
+  border: 1px solid var(--slate-800);
+  border-radius: 14px;
+  padding: 28px 26px;
+}
+.engine-accent {
+  border-color: var(--cyan-700);
+  box-shadow: 0 0 0 1px var(--cyan-700), 0 18px 40px -24px var(--cyan-500);
+}
+.engine-tag {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--slate-800);
+  color: var(--slate-300);
+}
+.engine-accent .engine-tag { background: var(--cyan-500); color: var(--slate-950); }
+.engine h3 {
+  font-size: 19px;
+  font-weight: 600;
+  color: #fff;
+  margin: 14px 0 10px;
+}
+.engine p { color: var(--slate-400); margin: 0 0 14px; font-size: 15px; }
+.engine-points { list-style: none; margin: 0; padding: 0; }
+.engine-points li {
+  position: relative;
+  padding-left: 22px;
+  margin: 8px 0;
+  color: var(--slate-300);
+  font-size: 14px;
+}
+.engine-points li::before {
+  content: "";
+  position: absolute;
+  left: 2px; top: 8px;
+  width: 7px; height: 7px;
+  border-radius: 999px;
+  background: var(--cyan-400);
+}
+.engine code {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--cyan-300);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.btn-ghost {
+  background: transparent;
+  color: #fff;
+  border-color: var(--slate-600);
+}
+.btn-ghost:hover { border-color: var(--cyan-400); color: var(--cyan-300); }
+
+/* ---- Rust-server page: install columns + compare table ---- */
+.install-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 22px;
+}
+.install-col {
+  background: white;
+  border: 1px solid var(--slate-200);
+  border-radius: 12px;
+  padding: 24px;
+}
+.install-col h3 { font-size: 17px; font-weight: 600; margin: 0 0 10px; color: var(--slate-900); }
+.install-col p { color: var(--slate-600); font-size: 15px; margin: 0 0 14px; }
+.install-code {
+  background: var(--slate-950);
+  color: var(--slate-100);
+  border-radius: 8px;
+  padding: 16px 18px;
+  overflow-x: auto;
+  font-size: 13.5px;
+  line-height: 1.6;
+  margin: 0;
+}
+.install-code code { background: none; color: inherit; padding: 0; }
+.install-cta { margin: 14px 0 0 !important; }
+
+.compare-wrap { overflow-x: auto; }
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+.compare-table th,
+.compare-table td {
+  text-align: left;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--slate-200);
+  vertical-align: top;
+}
+.compare-table thead th {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--slate-500);
+}
+.compare-table thead th:last-child { color: var(--cyan-700); }
+.compare-table tbody th {
+  font-weight: 600;
+  color: var(--slate-900);
+  width: 26%;
+}
+.compare-table tbody td { color: var(--slate-600); }
+.compare-table tbody tr:last-child th,
+.compare-table tbody tr:last-child td { border-bottom: none; }
+.compare-table code {
+  background: var(--slate-100);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+@media (max-width: 720px) {
+  .page-hero-engine h1 { font-size: 34px; }
+  .compare-table th, .compare-table td { padding: 10px 12px; }
+}

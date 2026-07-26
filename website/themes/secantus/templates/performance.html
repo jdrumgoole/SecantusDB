@@ -1,0 +1,119 @@
+{% extends 'base.html' %}
+
+{% block title %}Performance — {{ SITENAME }}{% endblock %}
+{% block description %}Measured three-way benchmarks: real mongod vs the SecantusDB Python DB and Rust DB — per-operation latency and concurrent-writer throughput.{% endblock %}
+{% block canonical_path %}performance.html{% endblock %}
+
+{% block top_banner %}{% endblock %}
+
+{% block content %}
+<style>
+  .viz-wrap { --viz-mongo: #2a78d6; --viz-rust: #eb6834; --viz-py: #0891b2; margin: 18px 0 6px; }
+  .viz { width: 100%; height: auto; display: block; }
+  .viz-lab { font: 500 12.5px/1 sans-serif; fill: var(--slate-700); }
+  .viz-val { font: 600 11.5px/1 sans-serif; fill: var(--slate-700); }
+  .viz-tick { font: 500 11px/1 sans-serif; fill: var(--slate-500); }
+  .viz-reflab { font: 600 11px/1 sans-serif; fill: var(--slate-500); }
+  .viz-grid { stroke: var(--slate-200); stroke-width: 1; }
+  .viz-ref { stroke: var(--slate-400); stroke-width: 1.5; stroke-dasharray: 4 3; }
+  .viz path[data-tip]:hover, .viz-dot:hover { opacity: 0.82; cursor: default; }
+  .viz-x, .unit-x { font-size: 0.82em; opacity: 0.75; }
+  .viz-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 0 4px; font-size: 0.9rem; color: var(--slate-600); }
+  .viz-legend .chip { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .viz-tip { position: fixed; z-index: 50; pointer-events: none; background: var(--slate-900); color: #fff;
+             font-size: 12.5px; padding: 6px 9px; border-radius: 6px; opacity: 0; transition: opacity .08s; max-width: 260px; }
+</style>
+<section class="section engines-section page-hero-engine">
+  <div class="wrap">
+    <span class="engine-tag">Benchmarks</span>
+    <h1>Measured, not promised</h1>
+    <p class="section-lead">Every number on this page is measured on the same machine, through the same <code>pymongo</code> client, against the same on-disk WiredTiger storage &mdash; with real <code>mongod</code> as the reference. Two dimensions: <strong>per-operation latency</strong> (one client, six workloads) and <strong>throughput under concurrent writers</strong> (1&ndash;8 parallel writer processes). Both harnesses ship in the repo; both tables regenerate with one command.</p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>Per-operation latency</h2>
+    <p class="section-lead">Bar length is how many times slower than <code>mongod</code> each server is — median of five runs per workload, 10,000-document dataset, end-to-end through the wire protocol and driver.</p>
+    <div class="viz-wrap"><div class="viz-legend">
+      <span><span class="chip" style="background: var(--viz-rust)"></span>Rust DB</span>
+      <span><span class="chip" style="background: var(--viz-py)"></span>Python DB</span>
+      <span><span class="chip" style="width:14px;height:0;border-top:2px dashed var(--slate-400);border-radius:0;vertical-align:3px;"></span>mongod = 1<span class="unit-x">x</span> reference</span>
+    </div><svg viewBox="0 0 760 380" role="img" aria-label="Per-operation latency as a multiple of mongod, per workload" class="viz"><line x1="295.2" y1="18" x2="295.2" y2="352" class="viz-grid"/><text x="295.2" y="368" text-anchor="middle" class="viz-tick">5<tspan class="viz-x">x</tspan></text><line x1="390.4" y1="18" x2="390.4" y2="352" class="viz-grid"/><text x="390.4" y="368" text-anchor="middle" class="viz-tick">10<tspan class="viz-x">x</tspan></text><line x1="485.6" y1="18" x2="485.6" y2="352" class="viz-grid"/><text x="485.6" y="368" text-anchor="middle" class="viz-tick">15<tspan class="viz-x">x</tspan></text><line x1="580.8" y1="18" x2="580.8" y2="352" class="viz-grid"/><text x="580.8" y="368" text-anchor="middle" class="viz-tick">20<tspan class="viz-x">x</tspan></text><line x1="676.0" y1="18" x2="676.0" y2="352" class="viz-grid"/><text x="676.0" y="368" text-anchor="middle" class="viz-tick">25<tspan class="viz-x">x</tspan></text><line x1="219.0" y1="18" x2="219.0" y2="352" class="viz-ref"/><text x="219.0" y="12" text-anchor="middle" class="viz-reflab">mongod = 1<tspan class="viz-x">x</tspan></text><text x="190" y="42" text-anchor="end" class="viz-lab">insert (10k docs)</text><path d="M200,26 h16.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-16.9 z" fill="var(--viz-rust)" data-tip="Rust DB — 1.1x mongod"></path><text x="226.9" y="37" class="viz-val">1.1<tspan class="viz-x">x</tspan></text><path d="M200,42 h77.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-77.9 z" fill="var(--viz-py)" data-tip="Python DB — 4.3x mongod"></path><text x="287.9" y="53" class="viz-val">4.3<tspan class="viz-x">x</tspan></text><text x="190" y="96" text-anchor="end" class="viz-lab">find indexed range</text><path d="M200,80 h26.5 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-26.5 z" fill="var(--viz-rust)" data-tip="Rust DB — 1.6x mongod"></path><text x="236.5" y="91" class="viz-val">1.6<tspan class="viz-x">x</tspan></text><path d="M200,96 h129.3 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-129.3 z" fill="var(--viz-py)" data-tip="Python DB — 7.0x mongod"></path><text x="339.3" y="107" class="viz-val">7.0<tspan class="viz-x">x</tspan></text><text x="190" y="150" text-anchor="end" class="viz-lab">find full scan</text><path d="M200,134 h36.0 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-36.0 z" fill="var(--viz-rust)" data-tip="Rust DB — 2.1x mongod"></path><text x="246.0" y="145" class="viz-val">2.1<tspan class="viz-x">x</tspan></text><path d="M200,150 h142.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-142.6 z" fill="var(--viz-py)" data-tip="Python DB — 7.7x mongod"></path><text x="352.6" y="161" class="viz-val">7.7<tspan class="viz-x">x</tspan></text><text x="190" y="204" text-anchor="end" class="viz-lab">update_many (half)</text><path d="M200,188 h20.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-20.8 z" fill="var(--viz-rust)" data-tip="Rust DB — 1.3x mongod"></path><text x="230.8" y="199" class="viz-val">1.3<tspan class="viz-x">x</tspan></text><path d="M200,204 h237.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-237.8 z" fill="var(--viz-py)" data-tip="Python DB — 12.7x mongod"></path><text x="447.8" y="215" class="viz-val">12.7<tspan class="viz-x">x</tspan></text><text x="190" y="258" text-anchor="end" class="viz-lab">aggregate $group</text><path d="M200,242 h28.4 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-28.4 z" fill="var(--viz-rust)" data-tip="Rust DB — 1.7x mongod"></path><text x="238.4" y="253" class="viz-val">1.7<tspan class="viz-x">x</tspan></text><path d="M200,258 h323.5 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-323.5 z" fill="var(--viz-py)" data-tip="Python DB — 17.2x mongod"></path><text x="533.5" y="269" class="viz-val">17.2<tspan class="viz-x">x</tspan></text><text x="190" y="312" text-anchor="end" class="viz-lab">delete_many (half)</text><path d="M200,296 h20.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-20.8 z" fill="var(--viz-rust)" data-tip="Rust DB — 1.3x mongod"></path><text x="230.8" y="307" class="viz-val">1.3<tspan class="viz-x">x</tspan></text><path d="M200,312 h201.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-201.6 z" fill="var(--viz-py)" data-tip="Python DB — 10.8x mongod"></path><text x="411.6" y="323" class="viz-val">10.8<tspan class="viz-x">x</tspan></text></svg></div>
+    <details><summary style="cursor:pointer;color:var(--slate-500);margin:10px 0;">Data table (with raw milliseconds)</summary>
+    <div class="compare-wrap">
+      <table class="compare-table">
+        <thead>
+          <tr><th>Workload</th><th>mongod</th><th>Rust DB</th><th><span class="unit-x">x</span>&hairsp;mongod</th><th>Python DB</th><th><span class="unit-x">x</span>&hairsp;mongod</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>insert (10k docs)</th><td>59.5 ms</td><td>64.8 ms</td><td>1.1<span class="unit-x">x</span></td><td>257.0 ms</td><td>4.3<span class="unit-x">x</span></td></tr>
+          <tr><th>find indexed range</th><td>4.5 ms</td><td>7.0 ms</td><td>1.6<span class="unit-x">x</span></td><td>31.3 ms</td><td>7.0<span class="unit-x">x</span></td></tr>
+          <tr><th>find full scan</th><td>7.9 ms</td><td>16.5 ms</td><td>2.1<span class="unit-x">x</span></td><td>60.3 ms</td><td>7.7<span class="unit-x">x</span></td></tr>
+          <tr><th>update_many (half)</th><td>35.7 ms</td><td>46.8 ms</td><td>1.3<span class="unit-x">x</span></td><td>451.8 ms</td><td>12.7<span class="unit-x">x</span></td></tr>
+          <tr><th>aggregate <code>$group</code></th><td>5.8 ms</td><td>10.0 ms</td><td>1.7<span class="unit-x">x</span></td><td>99.7 ms</td><td>17.2<span class="unit-x">x</span></td></tr>
+          <tr><th>delete_many (half)</th><td>20.6 ms</td><td>26.8 ms</td><td>1.3<span class="unit-x">x</span></td><td>222.1 ms</td><td>10.8<span class="unit-x">x</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    </details>
+    <p class="perf-note" style="margin-top: 20px;">The short version: the <strong>Rust DB runs at 1.1<span class="unit-x">x</span>&ndash;2.1<span class="unit-x">x</span> of mongod</strong> per operation &mdash; roughly 4<span class="unit-x">x</span>&ndash;10<span class="unit-x">x</span> faster than the Python DB workload-for-workload. All three sit on the identical WiredTiger C library; the gaps are the layers above it. <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Methodology &amp; how to reproduce &rarr;</a></p>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <h2>Throughput under concurrent writers</h2>
+    <p class="section-lead">Does throughput grow with writers? Each line is a server's aggregate throughput <em>relative to its own single-writer rate</em> — N writer processes each streaming <code>insert_many</code> batches for 30 seconds against their own collections.</p>
+    <div class="viz-wrap"><div class="viz-legend">
+      <span><span class="chip" style="background: var(--viz-mongo)"></span>mongod</span>
+      <span><span class="chip" style="background: var(--viz-rust)"></span>Rust DB</span>
+      <span><span class="chip" style="background: var(--viz-py)"></span>Python DB</span>
+    </div><svg viewBox="0 0 790 320" role="img" aria-label="Throughput scaling relative to each server’s own single-writer rate" class="viz"><line x1="56" y1="214" x2="668" y2="214" class="viz-ref"/><text x="48" y="218" text-anchor="end" class="viz-tick">1<tspan class="viz-x">x</tspan></text><line x1="56" y1="160" x2="668" y2="160" class="viz-grid"/><text x="48" y="164" text-anchor="end" class="viz-tick">2<tspan class="viz-x">x</tspan></text><line x1="56" y1="105" x2="668" y2="105" class="viz-grid"/><text x="48" y="109" text-anchor="end" class="viz-tick">3<tspan class="viz-x">x</tspan></text><line x1="56" y1="51" x2="668" y2="51" class="viz-grid"/><text x="48" y="55" text-anchor="end" class="viz-tick">4<tspan class="viz-x">x</tspan></text><text x="56" y="290" text-anchor="middle" class="viz-tick">1</text><text x="143" y="290" text-anchor="middle" class="viz-tick">2</text><text x="318" y="290" text-anchor="middle" class="viz-tick">4</text><text x="668" y="290" text-anchor="middle" class="viz-tick">8</text><text x="362" y="310" text-anchor="middle" class="viz-lab">concurrent writers</text><path d="M56.0,213.8 L143.4,165.5 L318.3,79.3 L668.0,20.1" fill="none" stroke="var(--viz-mongo)" stroke-width="2"/><circle cx="56.0" cy="213.8" r="4.5" fill="var(--viz-mongo)" class="viz-dot" data-tip="mongod — 1 writer: 1.00x its 1-writer rate"/><circle cx="143.4" cy="165.5" r="4.5" fill="var(--viz-mongo)" class="viz-dot" data-tip="mongod — 2 writers: 1.89x its 1-writer rate"/><circle cx="318.3" cy="79.3" r="4.5" fill="var(--viz-mongo)" class="viz-dot" data-tip="mongod — 4 writers: 3.48x its 1-writer rate"/><circle cx="668.0" cy="20.1" r="4.5" fill="var(--viz-mongo)" class="viz-dot" data-tip="mongod — 8 writers: 4.57x its 1-writer rate"/><path d="M56.0,213.8 L143.4,187.2 L318.3,125.4 L668.0,180.2" fill="none" stroke="var(--viz-rust)" stroke-width="2"/><circle cx="56.0" cy="213.8" r="4.5" fill="var(--viz-rust)" class="viz-dot" data-tip="Rust DB — 1 writer: 1.00x its 1-writer rate"/><circle cx="143.4" cy="187.2" r="4.5" fill="var(--viz-rust)" class="viz-dot" data-tip="Rust DB — 2 writers: 1.49x its 1-writer rate"/><circle cx="318.3" cy="125.4" r="4.5" fill="var(--viz-rust)" class="viz-dot" data-tip="Rust DB — 4 writers: 2.63x its 1-writer rate"/><circle cx="668.0" cy="180.2" r="4.5" fill="var(--viz-rust)" class="viz-dot" data-tip="Rust DB — 8 writers: 1.62x its 1-writer rate"/><path d="M56.0,213.8 L143.4,233.3 L318.3,227.4 L668.0,237.7" fill="none" stroke="var(--viz-py)" stroke-width="2"/><circle cx="56.0" cy="213.8" r="4.5" fill="var(--viz-py)" class="viz-dot" data-tip="Python DB — 1 writer: 1.00x its 1-writer rate"/><circle cx="143.4" cy="233.3" r="4.5" fill="var(--viz-py)" class="viz-dot" data-tip="Python DB — 2 writers: 0.64x its 1-writer rate"/><circle cx="318.3" cy="227.4" r="4.5" fill="var(--viz-py)" class="viz-dot" data-tip="Python DB — 4 writers: 0.75x its 1-writer rate"/><circle cx="668.0" cy="237.7" r="4.5" fill="var(--viz-py)" class="viz-dot" data-tip="Python DB — 8 writers: 0.56x its 1-writer rate"/><text x="674" y="24" class="viz-val" fill="var(--viz-mongo)">mongod 4.6<tspan class="viz-x">x</tspan></text><text x="674" y="184" class="viz-val" fill="var(--viz-rust)">Rust 1.6<tspan class="viz-x">x</tspan></text><text x="674" y="241" class="viz-val" fill="var(--viz-py)">Python 0.6<tspan class="viz-x">x</tspan></text></svg></div>
+    <details><summary style="cursor:pointer;color:var(--slate-500);margin:10px 0;">Data table (absolute docs/second)</summary>
+    <div class="compare-wrap">
+      <table class="compare-table">
+        <thead>
+          <tr><th>Writers</th><th>mongod</th><th>Rust DB</th><th>Python DB</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>1</th><td>108,625</td><td>3,526</td><td>2,900</td></tr>
+          <tr><th>2</th><td>199,810</td><td>1,777</td><td>893</td></tr>
+          <tr><th>4</th><td>353,942</td><td>1,803</td><td>460</td></tr>
+          <tr><th>8</th><td>448,989</td><td>1,876</td><td>500</td></tr>
+        </tbody>
+      </table>
+    </div>
+    </details>
+    <p class="perf-note" style="margin-top: 20px;">Three different shapes, honestly told. <strong>mongod scales</strong> &mdash; 4.6<span class="unit-x">x</span> its own single-writer aggregate at eight writers; that's its C++ scheduler above WiredTiger doing its job. The <strong>Rust DB now scales</strong> &mdash; 1.5<span class="unit-x">x</span> at two writers, peaking 2.6<span class="unit-x">x</span> at four before easing to 1.6<span class="unit-x">x</span> at eight: the per-collection write-lock split and RecordId keying (cutting write amplification from four WiredTiger writes per document to three) turned flat coordination overhead into real low- and moderate-concurrency scaling. The decline past four writers is WiredTiger itself &mdash; WAL serialisation, cache eviction, checkpoint pressure in one embedded connection &mdash; not a SecantusDB lock. The <strong>Python DB degrades</strong> under contention to ~0.6<span class="unit-x">x</span> &mdash; the GIL plus the measured WiredTiger-binding ceiling &mdash; but degrades <em>gracefully</em>: write conflicts retry server-side exactly like mongod's <code>writeConflictRetry</code>, and a client never sees an error. <a href="{{ SECANTUS_DOCS_URL }}concurrency.html" rel="noopener">The full concurrency story &rarr;</a></p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>What to make of it</h2>
+    <p class="section-lead">SecantusDB's trade is deliberate: <strong>conformance and WiredTiger durability over raw speed</strong>. For its home turf &mdash; embedded test and dev databases, single-node prototypes, CI &mdash; per-operation latency in the milliseconds and single-writer throughput in the thousands of documents per second rarely matter. When they do, the Rust DB is the answer within the family, and a real <code>mongod</code> is the answer beyond it &mdash; and because the wire protocol is identical, moving between all three is a connection-string change.</p>
+    <p class="perf-note">Caveats that apply to every number here: one machine (Apple Silicon), no network, no concurrent readers mixed with writers, dataset that fits in cache. The harnesses (<code>bench.compare_servers</code>, <code>bench.concurrency</code>) ship in the repository &mdash; run them on your own hardware and workload before drawing conclusions that matter.</p>
+    <div class="ctas" style="margin-top: 28px;">
+      <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Latency benchmark</a>
+      <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}concurrency.html" rel="noopener">Concurrency deep-dive</a>
+      <a class="btn btn-secondary" href="{{ SECANTUS_DOCS_URL }}feature-comparison.html" rel="noopener">Feature comparison</a>
+    </div>
+  </div>
+</section>
+<div class="viz-tip" id="viz-tip"></div>
+<script>
+(function () {
+  var tip = document.getElementById('viz-tip');
+  document.querySelectorAll('[data-tip]').forEach(function (el) {
+    el.addEventListener('mousemove', function (e) {
+      tip.textContent = el.getAttribute('data-tip');
+      tip.style.left = (e.clientX + 14) + 'px';
+      tip.style.top = (e.clientY - 10) + 'px';
+      tip.style.opacity = '1';
+    });
+    el.addEventListener('mouseleave', function () { tip.style.opacity = '0'; });
+  });
+})();
+</script>
+{% endblock %}

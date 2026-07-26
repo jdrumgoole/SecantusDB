@@ -1,0 +1,135 @@
+{% extends 'base.html' %}
+
+{% block title %}Rust DB — {{ SITENAME }}{% endblock %}
+{% block description %}SecantusDB's pure-Rust server: a single standalone WiredTiger-backed binary that speaks the MongoDB wire protocol, with no Python in the request path.{% endblock %}
+{% block canonical_path %}rust-db.html{% endblock %}
+
+{% block top_banner %}{% endblock %}
+
+{% block content %}
+<section class="section engines-section page-hero-engine">
+  <div class="wrap">
+    <span class="engine-tag">Rust</span>
+    <h1>SecantusDB Rust DB</h1>
+    <p class="section-lead">A whole second server, written in Rust from the wire up &mdash; dispatch, cursors, change streams, and WiredTiger storage &mdash; with no Python in the request path. Same wire protocol, same conformance gauges, a single standalone binary.</p>
+    <div class="ctas">
+      <a class="btn btn-primary" href="{{ SECANTUS_RUST_BINARY_URL }}" rel="noopener">Download a binary ({{ SECANTUS_RUST_BINARY_TAG | replace("secantusdb-v", "") }}) &rarr;</a>
+      <a class="btn btn-ghost" href="{{ SECANTUS_RUST_DOCS_URL }}index.html" rel="noopener">Read the Rust docs</a>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>Why a second engine in Rust</h2>
+    <p class="section-lead">The pure-Python server is the reference &mdash; the broadest feature surface and the easiest to read and extend. The Rust server is the same database with a different runtime underneath, built for speed and standalone deployment.</p>
+    <div class="benefits">
+      <div class="benefit">
+        <h3><span class="pip"></span>One standalone binary</h3>
+        <p>The Rust server ships as a single executable with WiredTiger statically linked &mdash; <code>secantusd-rs</code>. No interpreter, no virtualenv, no system Mongo. Drop it in a container or a CI image and run.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>No Python in the request path</h3>
+        <p>Wire parsing, command dispatch, cursors, the operator engines, and storage are all pure Rust. The GIL never touches a query, and the accept loop runs on a native thread.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>Same wire protocol</h3>
+        <p>It answers the same <code>OP_MSG</code> handshake, CRUD, aggregation, and change-stream commands. Every driver that talks to the Python server talks to the Rust server unchanged.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>Same conformance bar</h3>
+        <p>The unmodified driver-conformance gauges run against the Rust server too &mdash; the same upstream suites the driver maintainers run against a real <code>mongod</code>. It passes 99.5% of pymongo's own test suite, level with the Python server; the <a href="{{ SECANTUS_DOCS_URL }}feature-comparison.html" rel="noopener">feature comparison</a> maps both servers against real MongoDB, feature by feature.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>Real WiredTiger storage</h3>
+        <p>The same C storage engine MongoDB ships with, linked into the binary. B-trees, durability, write-ahead logging &mdash; identical on-disk semantics to the Python server.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>Embeddable from Python too</h3>
+        <p>A thin lifecycle handle (<code>start</code> / <code>stop</code> / <code>address</code>) runs the Rust accept loop in-process on a GIL-released thread; <code>pymongo</code> connects over real TCP. Launch it from a test, get a Rust server.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>Measured, not promised</h2>
+    <p class="section-lead">Six workloads, median of five runs, end-to-end through <code>pymongo</code> on on-disk WiredTiger &mdash; real <code>mongod</code> as the reference. The Rust server runs at <strong>1.1&times;&ndash;2.1&times; of mongod</strong> per operation, and <strong>~4&times;&ndash;10&times; faster than the Python server</strong> workload-for-workload.</p>
+    <div class="compare-wrap">
+      <table class="compare-table">
+        <thead>
+          <tr><th>Workload</th><th>mongod</th><th>Rust server</th><th>&times;mongod</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>insert (10k docs)</th><td>59.5 ms</td><td>64.8 ms</td><td>1.1&times;</td></tr>
+          <tr><th>find indexed range</th><td>4.5 ms</td><td>7.0 ms</td><td>1.6&times;</td></tr>
+          <tr><th>find full scan</th><td>7.9 ms</td><td>16.5 ms</td><td>2.1&times;</td></tr>
+          <tr><th>update_many (half)</th><td>35.7 ms</td><td>46.8 ms</td><td>1.3&times;</td></tr>
+          <tr><th>aggregate <code>$group</code></th><td>5.8 ms</td><td>10.0 ms</td><td>1.7&times;</td></tr>
+          <tr><th>delete_many (half)</th><td>20.6 ms</td><td>26.8 ms</td><td>1.3&times;</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="perf-note" style="margin-top: 20px;">Apple Silicon, dataset of 10,000 small docs, every number includes the wire + driver overhead a real client pays. <a href="/performance.html">All three-way tables (latency + concurrency) &rarr;</a></p>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <h2>Get it</h2>
+    <p class="section-lead">Two ways to run the Rust server &mdash; bundled in the Python package, or as a prebuilt standalone binary.</p>
+    <div class="install-cols">
+      <div class="install-col">
+        <h3>Bundled in the wheel</h3>
+        <p>The <code>secantus</code> wheel ships the Rust server as the <code>secantusd-rs</code> command, alongside the pure-Python <code>secantusdb</code>.</p>
+        <pre class="install-code"><code>pip install SecantusDB
+secantusd-rs --port 27017 --storage-path ./data</code></pre>
+      </div>
+      <div class="install-col">
+        <h3>Standalone binary</h3>
+        <p>Prebuilt static-WiredTiger archives are published on GitHub Releases (Linux x86_64 and macOS arm64) &mdash; no Python at all. Look for the <code>secantusdb-v&lt;version&gt;</code> tags; each archive ships with a <code>.sha256</code> checksum.</p>
+        <pre class="install-code"><code># download + extract from the releases page,
+# then run the secantusd-rs binary:
+./secantusd-rs --port 27017 --storage-path ./data</code></pre>
+        <p class="install-cta"><a href="{{ SECANTUS_RUST_BINARY_URL }}" rel="noopener">Current binary release &rarr;</a> &nbsp;·&nbsp; <a href="{{ SECANTUS_RUST_RELEASES_URL }}" rel="noopener">all binary releases</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>Python or Rust?</h2>
+    <p class="section-lead">Same database, same wire protocol, same storage. The runtime is the choice.</p>
+    <div class="compare-wrap">
+      <table class="compare-table">
+        <thead>
+          <tr><th>&nbsp;</th><th>Python server</th><th>Rust server</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>Request path</th><td>Pure Python</td><td>Pure Rust</td></tr>
+          <tr><th>Best for</th><td>Hackability, the widest feature surface, the reference</td><td>Speed and a standalone, dependency-free binary</td></tr>
+          <tr><th>How you run it</th><td><code>pip install SecantusDB</code> &rarr; <code>SecantusDBServer(...)</code></td><td><code>secantusd-rs</code> binary (bundled in the wheel or from Releases)</td></tr>
+          <tr><th>Python required at runtime</th><td>Yes</td><td>No</td></tr>
+          <tr><th>Storage engine</th><td>WiredTiger</td><td>WiredTiger</td></tr>
+          <tr><th>Wire protocol &amp; drivers</th><td>MongoDB <code>OP_MSG</code> &mdash; all drivers</td><td>MongoDB <code>OP_MSG</code> &mdash; all drivers</td></tr>
+          <tr><th>Embeddable in Python</th><td>Native (in-process)</td><td>Yes &mdash; in-process on a GIL-released thread</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="ctas" style="margin-top: 36px;">
+      <a class="btn btn-primary" href="{{ SECANTUS_RUST_BINARY_URL }}" rel="noopener">Download the binary</a>
+      <a class="btn btn-secondary" href="{{ SECANTUS_RUST_DOCS_URL }}index.html" rel="noopener">Read the Rust docs</a>
+    </div>
+    <p class="section-lead" style="margin-top: 24px;">Rust-server documentation:
+      <a href="{{ SECANTUS_RUST_DOCS_URL }}installation.html" rel="noopener">Installation</a> &middot;
+      <a href="{{ SECANTUS_RUST_DOCS_URL }}running.html" rel="noopener">Running the daemon</a> &middot;
+      <a href="{{ SECANTUS_RUST_DOCS_URL }}embedded.html" rel="noopener">Embedded in Python</a> &middot;
+      <a href="{{ SECANTUS_RUST_DOCS_URL }}recovery.html" rel="noopener">Backup &amp; PITR</a> &middot;
+      <a href="{{ SECANTUS_RUST_DOCS_URL }}conformance.html" rel="noopener">Conformance</a> &middot;
+      <a href="{{ SECANTUS_DOCS_URL }}feature-comparison.html" rel="noopener">Feature comparison</a>
+    </p>
+  </div>
+</section>
+{% endblock %}

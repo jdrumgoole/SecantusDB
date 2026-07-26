@@ -1,0 +1,26 @@
+<div class="engines">
+  <article class="engine">
+    <span class="engine-tag">Python</span>
+    <h3>Python DB</h3>
+    <p>The reference implementation &mdash; the broadest feature surface, easy to read and patch, and embeddable in two lines from any test or app.</p>
+    <ul class="engine-points">
+      <li>Pure-Python request path &mdash; hackable and extensible</li>
+      <li><code>pip install SecantusDB</code> &rarr; <code>SecantusDBServer(...)</code></li>
+      <li>Where every new operator and stage lands first</li>
+      <li>SQL/PostgreSQL frontend &mdash; the same data over <code>psql</code></li>
+    </ul>
+    <p class="install-cta"><a href="/python-db.html">Meet the Python DB &rarr;</a></p>
+  </article>
+  <article class="engine engine-accent">
+    <span class="engine-tag">Rust</span>
+    <h3>Rust DB</h3>
+    <p>A whole second server written in Rust &mdash; wire, dispatch, cursors, and WiredTiger storage &mdash; for raw speed and a single standalone binary with no Python in the request path.</p>
+    <ul class="engine-points">
+      <li>Ships as one static-WiredTiger binary: <code>secantusd-rs</code></li>
+      <li>No Python required &mdash; built for CI, containers, any stack</li>
+      <li>GIL-free accept loop &mdash; and still embeddable from Python</li>
+      <li>Measured at <strong>1.5&times;&ndash;2.5&times; of mongod</strong> per op &mdash; ~4&ndash;10&times; faster than the Python DB</li>
+    </ul>
+    <p class="install-cta"><a href="/rust-db.html">Meet the Rust DB &rarr;</a></p>
+  </article>
+</div>

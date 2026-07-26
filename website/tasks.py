@@ -227,6 +227,21 @@ def deploy(c: Context) -> None:
     print(f"=== Building site (prod) ===")
     c.run(PELICAN_PROD_CMD, pty=True)
 
+    # Graft the two Sphinx docs trees into the Pelican output so the
+    # delete-sweeping S3 sync owns /docs/ and /docs/rust/ (anything the
+    # sync doesn't know about it deletes — the docs must ride inside the
+    # build, not be uploaded separately). Both trees build via the main
+    # repo's invoke tasks (-W, no WiredTiger build needed).
+    main_repo = _main_repo_root() or REPO_ROOT
+    print("=== Building docs trees (main + rust) ===")
+    c.run(f"cd {shlex.quote(str(main_repo))} && uv run --no-sync python -m invoke docs docs-rust", pty=True)
+    docs_out = OUTPUT / "docs"
+    if docs_out.exists():
+        shutil.rmtree(docs_out)
+    shutil.copytree(main_repo / "docs" / "_build" / "html", docs_out)
+    shutil.copytree(main_repo / "docs-rust" / "_build" / "html", docs_out / "rust")
+    print(f"  grafted docs -> {docs_out} and {docs_out / 'rust'}")
+
     deploy_script = HERE / "infra" / "aws.py"
     print(f"=== Syncing to s3://{bucket}/ ===")
     # shlex.quote every interpolated value — bucket / distribution_id are

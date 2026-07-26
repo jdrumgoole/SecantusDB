@@ -23,9 +23,18 @@ def _read_project_version() -> str:
 
 SECANTUS_VERSION: str = _read_project_version()
 SECANTUS_IS_ALPHA: bool = "a" in SECANTUS_VERSION.split(".")[-1]
-SECANTUS_DOCS_URL: str = "https://secantusdb.readthedocs.io/en/latest/"
+SECANTUS_DOCS_URL: str = "https://secantusdb.com/docs/"
+SECANTUS_RUST_DOCS_URL: str = "https://secantusdb.com/docs/rust/"
 SECANTUS_PYPI_URL: str = "https://pypi.org/project/SecantusDB/"
 SECANTUS_GITHUB_URL: str = "https://github.com/jdrumgoole/SecantusDB"
+# The current Rust-server binary release tag. Bumped as part of each
+# secantusdb-v* binary release (see the secantusdb-release skill) so the
+# "Download a binary" CTAs land on a page with actual archive assets —
+# binary releases are GitHub pre-releases and never become "Latest", so
+# the bare /releases listing leads with the source-only PyPI release.
+SECANTUS_RUST_BINARY_TAG: str = "secantusdb-v0.5.3-beta.147"
+SECANTUS_RUST_BINARY_URL: str = f"{SECANTUS_GITHUB_URL}/releases/tag/{SECANTUS_RUST_BINARY_TAG}"
+SECANTUS_RUST_RELEASES_URL: str = f"{SECANTUS_GITHUB_URL}/releases?q=secantusdb-v&expanded=true"
 SECANTUS_TAGLINE: str = "THE SQLITE OF DOCUMENT DATABASES"
 
 AUTHOR = "Joe Drumgoole"
@@ -92,6 +101,10 @@ JINJA_GLOBALS = {
     "SECANTUS_VERSION": SECANTUS_VERSION,
     "SECANTUS_IS_ALPHA": SECANTUS_IS_ALPHA,
     "SECANTUS_DOCS_URL": SECANTUS_DOCS_URL,
+    "SECANTUS_RUST_DOCS_URL": SECANTUS_RUST_DOCS_URL,
+    "SECANTUS_RUST_BINARY_TAG": SECANTUS_RUST_BINARY_TAG,
+    "SECANTUS_RUST_BINARY_URL": SECANTUS_RUST_BINARY_URL,
+    "SECANTUS_RUST_RELEASES_URL": SECANTUS_RUST_RELEASES_URL,
     "SECANTUS_PYPI_URL": SECANTUS_PYPI_URL,
     "SECANTUS_GITHUB_URL": SECANTUS_GITHUB_URL,
     "SECANTUS_TAGLINE": SECANTUS_TAGLINE,

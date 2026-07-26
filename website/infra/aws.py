@@ -453,6 +453,68 @@ def cmd_sync(args: argparse.Namespace) -> None:
         print(f"  deleted {len(batch)} stale object(s)")
 
 
+_INDEX_REWRITE_NAME = "secantusdb-index-rewrite"
+_INDEX_REWRITE_CODE = """\
+function handler(event) {
+    var request = event.request;
+    var uri = request.uri;
+    if (uri.endsWith('/')) {
+        request.uri = uri + 'index.html';
+    }
+    return request;
+}
+"""
+
+
+def cmd_index_rewrite(args: argparse.Namespace) -> None:
+    """Ensure the directory-index CloudFront Function exists, is published,
+    and is attached to the distribution's default behavior as a
+    viewer-request association. Idempotent: an existing function is updated
+    in place; an already-attached association is left alone.
+
+    S3 REST origins serve no directory indexes (only the distribution's
+    DefaultRootObject covers "/"), so /docs/ and /blog/ 404 without this.
+    """
+    cf = boto3.client("cloudfront")
+
+    try:
+        desc = cf.describe_function(Name=_INDEX_REWRITE_NAME)
+        etag = desc["ETag"]
+        cf.update_function(
+            Name=_INDEX_REWRITE_NAME,
+            IfMatch=etag,
+            FunctionConfig={"Comment": "append index.html to directory URIs", "Runtime": "cloudfront-js-2.0"},
+            FunctionCode=_INDEX_REWRITE_CODE.encode(),
+        )
+        etag = cf.describe_function(Name=_INDEX_REWRITE_NAME)["ETag"]
+        print(f"  function {_INDEX_REWRITE_NAME}: updated")
+    except cf.exceptions.NoSuchFunctionExists:
+        resp = cf.create_function(
+            Name=_INDEX_REWRITE_NAME,
+            FunctionConfig={"Comment": "append index.html to directory URIs", "Runtime": "cloudfront-js-2.0"},
+            FunctionCode=_INDEX_REWRITE_CODE.encode(),
+        )
+        etag = resp["ETag"]
+        print(f"  function {_INDEX_REWRITE_NAME}: created")
+    pub = cf.publish_function(Name=_INDEX_REWRITE_NAME, IfMatch=etag)
+    arn = pub["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+    print(f"  function published: {arn}")
+
+    dist_id = args.distribution_id
+    conf = cf.get_distribution_config(Id=dist_id)
+    dc, etag = conf["DistributionConfig"], conf["ETag"]
+    assocs = dc["DefaultCacheBehavior"].get("FunctionAssociations", {"Quantity": 0, "Items": []})
+    items = assocs.get("Items", []) or []
+    if any(a.get("FunctionARN") == arn and a.get("EventType") == "viewer-request" for a in items):
+        print("  association already attached — nothing to do")
+        return
+    items = [a for a in items if a.get("EventType") != "viewer-request"]
+    items.append({"FunctionARN": arn, "EventType": "viewer-request"})
+    dc["DefaultCacheBehavior"]["FunctionAssociations"] = {"Quantity": len(items), "Items": items}
+    cf.update_distribution(Id=dist_id, IfMatch=etag, DistributionConfig=dc)
+    print(f"  distribution {dist_id}: viewer-request association attached (deploying)")
+
+
 def cmd_invalidate(args: argparse.Namespace) -> None:
     cf = boto3.client("cloudfront")
     resp = cf.create_invalidation(
@@ -489,6 +551,10 @@ def main(argv: list[str] | None = None) -> None:
     p_sync.add_argument("--bucket", required=True)
     p_sync.add_argument("--source", required=True)
     p_sync.set_defaults(func=cmd_sync)
+
+    p_ir = sub.add_parser("index-rewrite", help="Ensure + attach the directory-index CloudFront Function")
+    p_ir.add_argument("--distribution-id", required=True)
+    p_ir.set_defaults(func=cmd_index_rewrite)
 
     p_inv = sub.add_parser("invalidate", help="Invalidate CloudFront /*")
     p_inv.add_argument("--distribution-id", required=True)
