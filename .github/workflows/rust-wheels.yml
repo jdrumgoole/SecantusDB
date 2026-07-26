@@ -21,6 +21,7 @@ on:
       - '**.md'
       - 'LICENSE*'
       - 'docs/**'
+      - 'website/**'
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+a[0-9]+"
@@ -32,6 +33,7 @@ on:
       - '**.md'
       - 'LICENSE*'
       - 'docs/**'
+      - 'website/**'
   workflow_dispatch:
 
 # Keyed on the ref so each branch / PR is its own lane: a newer push to the same
