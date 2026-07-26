@@ -93,9 +93,13 @@ def _restore(
         [str(_BIN), "restore", "--source", str(source), "--target-dir", str(target), *extra],
         capture_output=True,
         text=True,
-        # A debug-build restore takes ~30s solo; under the full parallel suite it
-        # contends for CPU/IO, so give it generous headroom rather than flaking.
-        timeout=240,
+        # The restore is disk-I/O bound (~7s with the release binary solo). Under
+        # the full parallel suite it contends for disk I/O with the other xdist
+        # workers' WiredTiger activity and sits in uninterruptible I/O wait —
+        # always progressing (never hung; verified by sampling the process state),
+        # just 15-35x slower. Size the timeout for that worst case; a genuine hang
+        # still fails it by never completing.
+        timeout=600,
     )
 
 
