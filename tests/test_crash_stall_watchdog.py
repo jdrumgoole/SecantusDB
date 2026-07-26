@@ -13,10 +13,14 @@ in-process.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -259,19 +263,40 @@ def _run_nested_with_fault_dir(
     cmd += ["-p", "no:randomly", "-p", "no:cacheprovider", "-o", "addopts=", "-q"]
     if xdist:
         cmd += ["--max-worker-restart", max_worker_restart]
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, cwd=tmp_path, env=env
-    )
+    with _nested_run_lock():
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, cwd=tmp_path, env=env
+        )
 
 
-# These two tests each spawn a nested `pytest -n 2` subprocess. Under the full
-# `-n auto` suite that oversubscribes CPU, and if BOTH run at once (each spawning
-# its own nested session) the nested runs can miss their subprocess deadline and
-# get SIGKILLed — a contention artifact, not a real crash-capture failure. Pin
-# them to one xdist group so `--dist=loadgroup` serialises them onto a single
-# outer worker (never two nested sessions at once), and give the nested spawn
-# (300s) and the test deadline (360s > the spawn's) enough headroom for a slow
-# start under load. See ci-check's "crash_stall_watchdog" catalog entry.
+# The nested `pytest -n 2` sessions below spawn several extra processes each. If
+# two of these tests run at once they oversubscribe the CPU and the nested run
+# can miss its subprocess deadline and get SIGKILLed — a contention artifact, not
+# a real crash-capture failure. The `xdist_group` marker alone does NOT prevent
+# this: it only serialises under `--dist loadgroup`, and the suite runs plain
+# `-n auto` (== `--dist load`), which ignores groups. So serialise for real with
+# a machine-wide advisory file lock — held across every xdist worker and the
+# controller, regardless of dist mode — so only one nested session runs at a time.
+_NESTED_RUN_LOCK = Path(tempfile.gettempdir()) / "secantus-crash-watchdog-nested.lock"
+
+
+@contextlib.contextmanager
+def _nested_run_lock() -> Iterator[None]:
+    with open(_NESTED_RUN_LOCK, "w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+# These two tests each spawn a nested `pytest -n 2` subprocess. `_run_nested_with_fault_dir`
+# holds a machine-wide file lock (`_nested_run_lock`) so no two nested sessions
+# ever run at once — the real serialisation, effective under any xdist dist mode.
+# The `xdist_group` marker is kept as a scheduling hint (only active under
+# `--dist loadgroup`), and the nested spawn (300s) plus the test deadline
+# (360s > the spawn's) give a slow start under load enough headroom. See
+# ci-check's "crash_stall_watchdog" catalog entry.
 @pytest.mark.xdist_group("crash_watchdog_nested")
 @pytest.mark.timeout(360)
 def test_faulthandler_dir_arms_a_file_per_worker(tmp_path: Path) -> None:
