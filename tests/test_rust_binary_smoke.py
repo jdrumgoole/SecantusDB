@@ -33,7 +33,9 @@ def _binary_path() -> pathlib.Path | None:
     if env:
         p = pathlib.Path(env)
         return p if p.exists() else None
-    for profile in ("debug", "release"):
+    # Prefer the release binary: it is the shipped artifact and much faster than
+    # a debug build under the full parallel suite. Fall back to debug.
+    for profile in ("release", "debug"):
         p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
         if sys.platform == "win32":
             p = p.with_suffix(".exe")
