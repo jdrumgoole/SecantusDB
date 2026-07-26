@@ -34,3 +34,11 @@ secantus-server = { path = "../secantus-server" }
 # --log-level: init a logger to the resolved level before storage opens.
 log = "0.4"
 env_logger = "0.11"
+# Fast allocator — same rationale as the embedded extension (Finding 1).
+mimalloc = "0.1"
+
+# Cross-crate inlining of the hot serde/matcher/aggregate paths (matches the
+# embedded extension's profile).
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -13,6 +13,11 @@
 //! binds the server. Because it links WiredTiger, this crate builds only where WT
 //! is available (the wheel's CMake / local maturin), never the WT-less `rust` CI.
 
+// Fast global allocator for the extension. BSON materialization drives heavy
+// alloc/free churn (Finding 1); mimalloc cuts that overhead across all paths.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;

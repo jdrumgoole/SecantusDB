@@ -585,3 +585,45 @@ they are — the levers each cost disk or memory, so bumping them is a deploymen
 decision the hatch now makes easy, not a silent default change. Net honest guidance
 for multi-writer-scaling workloads is unchanged: WT tuning buys ~10%, and beyond that
 "run a real mongod" (or drop the oplog for ~2× via `enable_oplog=False`).
+
+## Finding 7 — allocator (mimalloc) + LTO: the cheap win Finding 1 predicted (2026-07-26)
+
+Finding 1 fingered `malloc`/`realloc`/`free` churn from BSON materialization as a
+top on-CPU cost on every read/aggregate path, but no fast allocator or LTO had
+ever been tried — the workspace had no `[profile.release]` overrides and the
+system allocator throughout. Prototyped both on the embedded `_secantus_server`
+extension (the crate the benchmark drives): mimalloc as `#[global_allocator]`
+plus `lto = "thin"` + `codegen-units = 1` in `secantus-server-py`'s (and
+`secantusdb`'s) release profile.
+
+Four-arm A/B, each `compare-servers --n 10000 --reps 5`, mongod interleaved as
+the load normalizer (its columns agreed within ~1% across all four runs, so the
+Rust ms deltas are real). Rust ms:
+
+| workload | baseline | LTO-only | alloc-only | combined | combined Δ |
+|---|---:|---:|---:|---:|:---:|
+| insert | 64.8 | 62.8 | 59.6 | 55.9 | **−14%** |
+| update_many_half | 45.7 | 44.8 | 34.8 | 34.1 | **−25%** |
+| delete_many_half | 26.9 | 24.7 | 22.0 | 20.9 | **−22%** |
+| aggregate_group | 9.8 | 9.4 | 7.5 | 7.4 | **−25%** |
+| aggregate_multistage | 15.9 | 14.1 | 12.6 | 11.9 | **−25%** |
+| find_indexed_range | 6.7 | 6.7 | 6.5 | 6.5 | flat |
+| find_all | 16.0 | 16.5 | 16.2 | 16.3 | flat |
+
+**Attribution: the allocator is the dominant lever** (−18–24% on the alloc-heavy
+write/aggregate paths); **LTO is a smaller, roughly-additive contributor** (−2–11%,
+biggest on `aggregate_multistage` −11% and `delete` −8%). They stack to the full
+~25%. The result maps exactly onto the mechanism — alloc-heavy paths (oplog entry
+alloc + BSON encode on writes; the materializing `Vec<Document>` + per-key
+`IndexMap` allocations in `$group`/`$unwind`) win big, while the raw-scan reads
+(`find` / indexed range), which already splice replies as raw bytes with little
+server-side allocation, are flat. Net: single-client insert/update/delete move to
+≈mongod parity and `aggregate_multistage` drops 2.7× → 2.0× of mongod — a bigger,
+cheaper gain than the deferred streaming-aggregation rewrite (6b) would have
+delivered for aggregates, with no logic change or parity re-pin.
+
+**Shipped** (rust-perf-alloc-lto slice): both levers on the extension and the
+binary. Trade: `codegen-units = 1` + thin LTO makes the release build slower
+(lands on the CI `storage-engine` / wheel jobs) — accepted for the ~25% runtime
+win. Behaviour is unchanged (allocator + optimizer only); the functional smoke
+(CRUD + `$group` over the rebuilt extension) is byte-correct.
