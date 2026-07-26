@@ -35,12 +35,15 @@ Together they move single-client writes to **beat** standalone `mongod`,
 `aggregate $group` to parity, and the whole six-workload benchmark into the
 ~0.8×–2.1× band — a cumulative ~30–40% off the write and aggregate paths since
 the previous release, with no change in behaviour (it is entirely an allocator
-and compiler-optimization story). The pure-Python server is unchanged this
-release; this is a Rust-server speed release, and it ships in both the wheel's
-embedded server and the standalone binary.
+and compiler-optimization story). This is primarily a Rust-server speed release
+— it ships in both the wheel's embedded server and the standalone binary.
 
-This release also hardens the driver-conformance gauges so a gauge that never
-ran can no longer leave behind a report that looks like it passed.
+It also carries a change-stream correctness fix on the Python server: a stream
+could silently skip a write that committed while it was polling (or one whose
+sequence number was assigned but not yet committed), because the empty-poll skip
+was bounded by the oplog tail rather than by what the poll had actually
+examined. And it hardens the driver-conformance gauges so a gauge that never ran
+can no longer leave behind a report that looks like it passed.
 
 #### Added
 - `invoke rust-pgo-refresh` regenerates the committed PGO profile for the
@@ -67,6 +70,12 @@ ran can no longer leave behind a report that looks like it passed.
   suppressed.
 
 #### Fixed
+- Python server: a change stream no longer skips past a write that commits while
+  it is polling, or one whose sequence number has been assigned but not yet
+  committed. The empty-poll skip is now bounded by the highest position the poll
+  actually examined, not the oplog tail, so a write racing the poll is delivered
+  on the next poll instead of being stepped over permanently. The Rust server
+  was never affected.
 - Driver-conformance gauges no longer regenerate a validation report from a
   previous run's results — a gauge that cannot start (port in use, missing
   toolchain, failed build) now exits non-zero and leaves the prior report
