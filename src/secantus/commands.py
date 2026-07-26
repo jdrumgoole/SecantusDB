@@ -3400,11 +3400,13 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 26,
             "codeName": "NamespaceNotFound",
         }
-    # ``multikey`` is SecantusDB's internal catalog flag. mongod keeps the
-    # equivalent in the durable catalog and never echoes it from
-    # ``listIndexes`` (probed 6.0.16) — drivers see it only as explain's
-    # ``isMultiKey``. Keep it off the wire.
-    indexes = [{k: v for k, v in ix.items() if k != "multikey"} for ix in indexes]
+    # ``multikey`` and ``entryFormat`` are SecantusDB's internal catalog flags
+    # (the multikey verdict, and the on-disk index-entry format version). mongod
+    # keeps the equivalents in the durable catalog and never echoes them from
+    # ``listIndexes`` (probed 6.0.16) — drivers see multikey only as explain's
+    # ``isMultiKey``, and the entry format not at all. Keep both off the wire.
+    _INTERNAL_INDEX_FIELDS = ("multikey", "entryFormat")
+    indexes = [{k: v for k, v in ix.items() if k not in _INTERNAL_INDEX_FIELDS} for ix in indexes]
     # A clustered collection has no separate ``_id_`` index — the
     # clustering key IS the index. mongod reports a single entry for it
     # carrying ``clustered: true`` (and the user's name / unique).

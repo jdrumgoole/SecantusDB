@@ -125,8 +125,48 @@ oracle (they run against the Python server). Add a `_frame_doc_value` byte test 
 a "refuse an SSu store" test (fabricate an SSu doc shard, assert open raises).
 `tests/test_natural_order.py` (Python) must still pass — insertion-order `find()`.
 
-## 4b — index entries carry the RecordId (mirror of Rust #637 `4af58aae`)
+## 4b — index entries carry the RecordId (mirror of Rust #637 `4af58aae`) — **DONE**
 
+Implemented. Deltas from the sketch below:
+
+- Naming follows the Rust side: the picker helpers keep their `*_id_keys` names
+  while carrying RecordIds (`Vec<i64>` there, `list[int]` here); only
+  `_docs_by_id_keys` → **`_docs_by_recordids`** was renamed. Type annotations were
+  updated everywhere so the change is visible at each signature.
+- `_write_index_entries` / `_delete_index_entries` now take `recordid=` and have
+  **no** `id_key_override`: the timeseries special case that parameter existed for
+  disappears with the id_key.
+- The `_id` point-lookup fast path in `_try_index_id_keys` resolves its id_keys
+  through the `_id` index so every picker path returns RecordIds uniformly (same
+  as Rust — for an `_id` lookup that index IS the access path, not the removed hop).
+- `_scan_geo_range` was hand-splitting the packed entry; it now goes through
+  `_unpack_entry` and dedups by RecordId.
+- Every entry reader skips a `None` RecordId (a pre-change entry) rather than
+  appending it — belt and braces behind the open-time refusal.
+- `entryFormat` is stripped from `listIndexes` alongside `multikey`
+  (`commands.py`, one shared `_INTERNAL_INDEX_FIELDS` tuple).
+- **`rename_collection` needed no change** (unlike Rust #637): Python copies the
+  doc rows and `_NAT_SEQ_TABLE` rows verbatim, so RecordIds are preserved and the
+  copied entries stay valid. Guarded by a new rename-keeps-index-reachable test,
+  proven real by mutation — re-minting the destination's RecordIds makes the
+  hinted lookup return `[]` while `$natural` still returns everything.
+
+**Gates run for 4b:** full Python suite **4857 passed / 0 failed**; `invoke lint`
+clean; pymongo gauge **5 failed / 1226 passed**, the same five known out-of-scope
+failures as `main`.
+
+**Cross-server byte-parity now covers indexes too** (same method as 4a):
+
+| direction | result |
+|---|---|
+| Python writes docs + a secondary index → Rust opens | reads the collection **and** serves the indexed lookup |
+| Rust writes docs + builds the index → Python opens | `explain` says `IXSCAN x_1`, returns the same rows Rust did |
+| Python then inserts through the Rust-built index → Rust reopens | Rust's indexed lookup sees the Python-inserted doc |
+
+The 4a refusal (`entryFormat 1`) is gone — both halves of the on-disk format,
+documents and index entries, are now interchangeable between the two servers.
+
+### Original sketch
 
 **Python functions:** `_pack_entry` (253), `_unpack_entry` (263),
 `_write_index_entries` (5552), `_delete_index_entries` (5588), `create_index`

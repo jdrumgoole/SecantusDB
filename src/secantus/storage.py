@@ -318,26 +318,57 @@ _PITR_MANIFEST_NAME = "pitr-manifest.json"
 
 _ENTRY_SEP = b"\x00\x00"
 
+# On-disk index-ENTRY format version, recorded per index as ``options.entryFormat``
+# in the index catalog. 1 (implicit, absent) = entries whose trailing half is the
+# doc's ``id_key``; 2 = entries whose trailing half is the 8-byte RecordId. The
+# catalog is the only place this is visible — the WT ``key_format`` is ``SSSu``
+# either way — so an absent marker is how a legacy store is detected (see
+# ``_reject_legacy_index_entry_format``). Mirrors the Rust ``ENTRY_FORMAT_RECORDID``.
+_ENTRY_FORMAT_RECORDID = 2
+
 
 def _escape_kb(kb: bytes) -> bytes:
     """Order-preserving escape so ``\\x00\\x00`` is unambiguous as a separator."""
     return kb.replace(b"\x00", b"\x00\xff")
 
 
-def _pack_entry(kb: bytes, id_key: bytes) -> bytes:
-    """Pack a sortable index-entry payload into a single ``u`` column.
+def _pack_entry(kb: bytes, recordid: int) -> bytes:
+    """Pack a sortable index-entry payload into a single ``u`` column:
+    ``escape(kb) + b"\\x00\\x00" + RecordId (8 bytes, big-endian)``.
 
     WiredTiger length-prefixes ``u`` columns when they're not last in the
     key, which breaks lexicographic comparison. Packing both fields into
-    one trailing ``u`` column lets the B-tree do the sort for us.
+    one trailing ``u`` column lets the B-tree do the sort for us — by
+    ``escape(kb)`` first, then by RecordId.
+
+    **RecordId entry format (``_ENTRY_FORMAT_RECORDID``).** The trailing half
+    used to be the doc's ``id_key``, which made an IXSCAN fetch pay
+    ``id_key → _id index → RecordId → doc``. Storing the RecordId directly drops
+    that hop. Big-endian is deliberate: it keeps the ordering within one key in
+    RecordId (insertion) order, and it is fixed-width, so the trailing half needs
+    no escaping even though a RecordId's bytes may themselves contain
+    ``\\x00\\x00`` (``_unpack_entry`` splits at the FIRST separator, and the
+    escaped ``kb`` half cannot contain one). Byte-identical to the Rust
+    ``pack_entry``.
     """
-    return _escape_kb(kb) + _ENTRY_SEP + id_key
+    return _escape_kb(kb) + _ENTRY_SEP + recordid.to_bytes(8, "big", signed=True)
 
 
-def _unpack_entry(packed: bytes) -> tuple[bytes, bytes]:
-    """Return ``(escaped_kb, id_key)`` from a packed entry."""
+def _unpack_entry(packed: bytes) -> tuple[bytes, int | None]:
+    """Return ``(escaped_kb, RecordId)`` from a packed entry, splitting at the
+    FIRST ``\\x00\\x00`` — correct because the ``kb`` half is escaped.
+
+    A trailing half that is not exactly 8 bytes is a pre-RecordId entry; callers
+    must never see one (``_reject_legacy_index_entry_format`` refuses such a
+    store at open), so it is reported as ``None`` rather than silently mis-read
+    as some other document's RecordId."""
     sep = packed.find(_ENTRY_SEP)
-    return packed[:sep], packed[sep + 2 :]
+    if sep < 0:
+        return packed, None
+    tail = packed[sep + 2 :]
+    if len(tail) != 8:
+        return packed[:sep], None
+    return packed[:sep], int.from_bytes(tail, "big", signed=True)
 
 
 def _frame_doc_value(id_key: bytes, blob: bytes) -> bytes:
@@ -363,6 +394,48 @@ def _unframe_doc_value(value: bytes) -> tuple[bytes, bytes]:
     if len(rest) < n:
         raise ValueError("doc-table value id_key length exceeds frame")
     return rest[:n], rest[n:]
+
+
+def _reject_legacy_index_entry_format(session: Any) -> None:
+    """Refuse to open a store whose index entries predate the RecordId entry
+    format. Those entries carry the doc's ``id_key`` in their trailing half; this
+    build reads that half as an 8-byte RecordId. Unlike the doc-table change this
+    is **not** visible in WiredTiger's ``key_format`` (``SSSu`` either way) — the
+    difference is inside the value bytes — so the index catalog carries an
+    explicit ``options.entryFormat`` marker and its absence is the signal.
+
+    There is deliberately **no migration**: refusing to open beats re-packing
+    every index entry on a path that has to be perfect. (``_unpack_entry`` already
+    returns ``None`` for a legacy entry rather than mis-reading it, so nothing
+    fetches the wrong document even before this fires — this turns a silent
+    nothing-matches into a loud refusal.) Mirrors the Rust
+    ``reject_legacy_index_entry_format``.
+    """
+    try:
+        c = session.open_cursor(_IDX_TABLE, None)
+    except Exception:  # table absent on a virgin store
+        return
+    try:
+        rc = c.next()
+        while rc == 0:
+            db, coll, name = c.get_key()
+            blob = bytes(c.get_value())
+            if blob:
+                opts = bson.decode(blob).get("options") or {}
+                fmt = opts.get("entryFormat", 1)
+                if not isinstance(fmt, int) or fmt < _ENTRY_FORMAT_RECORDID:
+                    raise IncompatibleStorageFormatError(
+                        f"SecantusDB storage at this path has index entries written "
+                        f"by a build before the RecordId index-entry change: index "
+                        f"'{name}' on '{db}.{coll}' is entryFormat {fmt}, but this "
+                        f"build requires {_ENTRY_FORMAT_RECORDID}. There is no "
+                        f"in-place upgrade (pre-1.0 beta, no migration) — start from "
+                        f"a fresh data directory, drop and recreate the indexes, or "
+                        f"downgrade to the build that wrote it."
+                    )
+            rc = c.next()
+    finally:
+        c.close()
 
 
 def extract_backup_archive(
@@ -1338,6 +1411,9 @@ class Storage:
             # ``_migrate_legacy_docs`` — that path is the pre-*shard* case, which
             # this check does not touch.)
             _reject_pre_recordid_doc_format(boot)
+            # Same fail-fast for the index-ENTRY format. Runs after the doc-table
+            # check so the more fundamental mismatch is reported first.
+            _reject_legacy_index_entry_format(boot)
             # One-time: fold a pre-shard store's legacy documents rows into the
             # per-collection shards (no-op for a born-sharded store).
             _migrate_legacy_docs(boot)
@@ -3685,7 +3761,7 @@ class Storage:
                     # see _timeseries_doc_suffix.
                     key += self._timeseries_doc_suffix()
                 conflict = self._unique_conflict(
-                    db, coll, doc, indexes, exclude_id_key=None, partials=partials
+                    db, coll, doc, indexes, exclude_recordid=None, partials=partials
                 )
                 if conflict is not None:
                     cname, kpat, kval = conflict
@@ -3758,7 +3834,7 @@ class Storage:
                     # The RecordId is freshly minted and unique, so the only
                     # failure left here is a concurrency conflict.
                     raise WriteConflictError(str(exc)) from exc
-                self._write_index_entries(db, coll, doc, indexes, partials, id_key_override=key)
+                self._write_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
                 if oplog_on:
@@ -3827,7 +3903,7 @@ class Storage:
                 # fresh too.
                 break
             doc = bson.decode(blob)
-            self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
+            self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
             self._delete_doc_row(db, coll, recordid)
             self._delete_nat_entry(db, coll, id_k)
             total -= len(blob)
@@ -4256,19 +4332,20 @@ class Storage:
             return []
         if rc < 0 and c.next() != 0:
             return []
-        id_keys: list[bytes] = []
+        recordids: list[int] = []
         while True:
             k = c.get_key()
             if (k[0], k[1], k[2]) != (db, coll, name):
                 break
             packed = bytes(k[3])
             _esc, row_id = _unpack_entry(packed)
-            id_keys.append(row_id)
+            if row_id is not None:
+                recordids.append(row_id)
             if c.next() != 0:
                 break
         if reverse:
-            id_keys.reverse()
-        return self._docs_by_id_keys(db, coll, id_keys)
+            recordids.reverse()
+        return self._docs_by_recordids(db, coll, recordids)
 
     def explain_plan(
         self,
@@ -4665,7 +4742,7 @@ class Storage:
                     # drop — it comes back from the scan, framed in the value.
                     new_id_key = id_k
                     conflict = self._unique_conflict(
-                        db, coll, new, indexes, exclude_id_key=id_k, partials=partials
+                        db, coll, new, indexes, exclude_recordid=recordid, partials=partials
                     )
                     if conflict is not None:
                         cname, kpat, kval = conflict
@@ -4689,14 +4766,10 @@ class Storage:
                             f"{MAX_BSON_OBJECT_SIZE}",
                         )
                     modified += 1
-                    self._delete_index_entries(
-                        db, coll, doc, indexes, partials, id_key_override=id_k
-                    )
+                    self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
                     doc_cur = self._cursor(_doc_table_for(db, coll))
                     doc_cur[db, coll, recordid] = _frame_doc_value(new_id_key, new_blob)
-                    self._write_index_entries(
-                        db, coll, new, indexes, partials, id_key_override=id_k
-                    )
+                    self._write_index_entries(db, coll, new, indexes, partials, recordid=recordid)
                     multikey_names = self._maybe_mark_multikey(
                         db, coll, new, indexes, multikey_names
                     )
@@ -4748,7 +4821,7 @@ class Storage:
                 upserted_id = new["_id"]
                 did_upsert = True
                 conflict = self._unique_conflict(
-                    db, coll, new, indexes, exclude_id_key=None, partials=partials
+                    db, coll, new, indexes, exclude_recordid=None, partials=partials
                 )
                 if conflict is not None:
                     cname, kpat, kval = conflict
@@ -4782,7 +4855,9 @@ class Storage:
                     )
                 doc_cur = self._cursor(_doc_table_for(db, coll))
                 doc_cur[db, coll, upsert_recordid] = _frame_doc_value(upsert_id_key, upsert_blob)
-                self._write_index_entries(db, coll, new, indexes, partials)
+                self._write_index_entries(
+                    db, coll, new, indexes, partials, recordid=upsert_recordid
+                )
                 self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
                 if oplog_on:
                     oplog_entries.append(
@@ -4867,7 +4942,7 @@ class Storage:
                 doc = bson.decode(blob)
                 if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
-                self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
+                self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
                 self._delete_doc_row(db, coll, recordid)
                 self._delete_nat_entry(db, coll, id_k)
                 deleted += 1
@@ -4947,7 +5022,7 @@ class Storage:
                         break
                 if not expired:
                     continue
-                self._delete_index_entries(db, coll, doc, indexes, partials, id_key_override=id_k)
+                self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
                 self._delete_doc_row(db, coll, recordid)
                 self._delete_nat_entry(db, coll, id_k)
                 pruned += 1
@@ -5386,22 +5461,26 @@ class Storage:
                 # — each doc may produce many cell entries. Mark it so the
                 # regular pickers skip the index for non-geo queries.
                 options["multikey"] = True
-                entries: list[tuple[bytes, bytes]] = []
-                for _rid, id_k, blob in self._scan_docs(db, coll):
+                entries: list[tuple[bytes, int]] = []
+                for recordid, _id_k, blob in self._scan_docs(db, coll):
                     d = bson.decode(blob)
                     if partial_filter is not None and not matches(d, partial_filter):
                         continue
                     for cell_bytes in _doc_geo_cells(
                         d, geo_field, geo_type, options, index_name=name
                     ):
-                        entries.append((cell_bytes, id_k))
+                        entries.append((cell_bytes, recordid))
+                # Mark the on-disk entry format so a later build can tell these
+                # RecordId entries from the pre-change id_key ones (the WT
+                # key_format is SSSu either way).
+                options["entryFormat"] = _ENTRY_FORMAT_RECORDID
                 payload = bson.encode({"key": dict(key_spec), "options": options})
                 c.reset()
                 c[db, coll, name] = payload
                 entry_cur = self._cursor(_IDX_ENTRIES_TABLE)
-                for kb, id_k in entries:
+                for kb, entry_recordid in entries:
                     entry_cur.reset()
-                    entry_cur[db, coll, name, _pack_entry(kb, id_k)] = b""
+                    entry_cur[db, coll, name, _pack_entry(kb, entry_recordid)] = b""
             else:
                 # Single doc-table walk: decode each blob once and fold all
                 # three checks (uniqueness, multikey detection, entry build)
@@ -5414,7 +5493,7 @@ class Storage:
                 multikey = False
                 entries = []
                 coll_opt = _parse_index_collation(options.get("collation"))
-                for _rid, id_k, blob in self._scan_docs(db, coll):
+                for recordid, _id_k, blob in self._scan_docs(db, coll):
                     d = bson.decode(blob)
                     if partial_filter is not None and not matches(d, partial_filter):
                         continue
@@ -5427,16 +5506,20 @@ class Storage:
                             if kb in seen:
                                 raise IndexConflict(name, d.get("_id"), namespace=f"{db}.{coll}")
                             seen[kb] = d.get("_id")
-                        entries.append((kb, id_k))
+                        entries.append((kb, recordid))
                 if multikey:
                     options["multikey"] = True
+                # Mark the on-disk entry format so a later build can tell these
+                # RecordId entries from the pre-change id_key ones (the WT
+                # key_format is SSSu either way).
+                options["entryFormat"] = _ENTRY_FORMAT_RECORDID
                 payload = bson.encode({"key": dict(key_spec), "options": options})
                 c.reset()
                 c[db, coll, name] = payload
                 entry_cur = self._cursor(_IDX_ENTRIES_TABLE)
-                for kb, id_k in entries:
+                for kb, entry_recordid in entries:
                     entry_cur.reset()
-                    entry_cur[db, coll, name, _pack_entry(kb, id_k)] = b""
+                    entry_cur[db, coll, name, _pack_entry(kb, entry_recordid)] = b""
             ui = self._collection_uuid(db, coll)
             self._emit_oplog(
                 [
@@ -5739,14 +5822,18 @@ class Storage:
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
         partials: dict[str, dict[str, Any]] | None = None,
         *,
-        id_key_override: bytes | None = None,
+        recordid: int,
     ) -> None:
+        """Write one entry per key ``doc`` contributes to each index.
+
+        Entries point at the doc's **RecordId** (the doc-table key), so an IXSCAN
+        fetch reads the row directly — no ``id_key`` hop. That also removes the
+        timeseries special case the ``id_key`` form needed (a timeseries doc-table
+        key carries a uniqueness suffix that isn't derivable from ``_id``).
+        """
         if not indexes:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
-        # Timeseries doc-table keys carry a uniqueness suffix; entries must
-        # point at the row's ACTUAL key or index lookups would miss it.
-        id_k = id_key_override if id_key_override is not None else _id_key(doc["_id"])
         if partials is None:
             partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
@@ -5760,12 +5847,12 @@ class Storage:
                 opts = index_options.get(name, {})
                 for cell_bytes in _doc_geo_cells(doc, geo_field, geo_type, opts, index_name=name):
                     c.reset()
-                    c[db, coll, name, _pack_entry(cell_bytes, id_k)] = b""
+                    c[db, coll, name, _pack_entry(cell_bytes, recordid)] = b""
                 continue
             coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
             for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
-                c[db, coll, name, _pack_entry(kb, id_k)] = b""
+                c[db, coll, name, _pack_entry(kb, recordid)] = b""
 
     def _delete_index_entries(
         self,
@@ -5775,14 +5862,12 @@ class Storage:
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
         partials: dict[str, dict[str, Any]] | None = None,
         *,
-        id_key_override: bytes | None = None,
+        recordid: int,
     ) -> None:
+        """Remove the entries ``doc`` contributed, keyed by its RecordId."""
         if not indexes:
             return
         c = self._cursor(_IDX_ENTRIES_TABLE)
-        # Timeseries doc-table keys carry a uniqueness suffix; entries must
-        # point at the row's ACTUAL key or index lookups would miss it.
-        id_k = id_key_override if id_key_override is not None else _id_key(doc["_id"])
         if partials is None:
             partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
@@ -5806,14 +5891,14 @@ class Storage:
                     continue
                 for cell_bytes in cells:
                     c.reset()
-                    c.set_key(db, coll, name, _pack_entry(cell_bytes, id_k))
+                    c.set_key(db, coll, name, _pack_entry(cell_bytes, recordid))
                     if c.search() == 0:
                         c.remove()
                 continue
             coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
             for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
-                c.set_key(db, coll, name, _pack_entry(kb, id_k))
+                c.set_key(db, coll, name, _pack_entry(kb, recordid))
                 if c.search() == 0:
                     c.remove()
 
@@ -5869,7 +5954,7 @@ class Storage:
         candidate_doc: dict[str, Any],
         indexes: list[tuple[str, dict[str, Any], bool, bool]],
         *,
-        exclude_id_key: bytes | None,
+        exclude_recordid: int | None,
         partials: dict[str, dict[str, Any]] | None = None,
     ) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
         # Returns ``(index_name, key_pattern, key_value)`` so callers
@@ -5901,7 +5986,7 @@ class Storage:
             for kb in _index_key_variants(
                 candidate_doc, key_spec, sparse=sparse, collation=coll_opt
             ):
-                if not self._entry_taken(c, db, coll, name, kb, exclude_id_key):
+                if not self._entry_taken(c, db, coll, name, kb, exclude_recordid):
                     continue
                 return (
                     name,
@@ -5917,10 +6002,10 @@ class Storage:
         coll: str,
         name: str,
         kb: bytes,
-        exclude_id_key: bytes | None,
+        exclude_recordid: int | None,
     ) -> bool:
         """True if index ``name`` already has an entry for key ``kb``
-        belonging to a document other than ``exclude_id_key``."""
+        belonging to a document other than ``exclude_recordid``."""
         esc_kb = _escape_kb(kb)
         c.reset()
         c.set_key(db, coll, name, esc_kb + _ENTRY_SEP)
@@ -5936,14 +6021,14 @@ class Storage:
             row_esc, row_id = _unpack_entry(bytes(k[3]))
             if row_esc != esc_kb:
                 return False
-            if exclude_id_key is None or row_id != exclude_id_key:
+            if exclude_recordid is None or row_id != exclude_recordid:
                 return True
             if c.next() != 0:
                 return False
 
     def _scan_index_for_id_keys(
         self, db: str, coll: str, name: str, kb: bytes, *, prefix: bool = False
-    ) -> list[bytes]:
+    ) -> list[int]:
         """Walk the index entries for ``name`` matching ``kb``.
 
         With ``prefix=False`` (default), only rows whose ``escaped_kb`` is
@@ -5960,7 +6045,7 @@ class Storage:
             return []
         if rc < 0 and c.next() != 0:
             return []
-        out: list[bytes] = []
+        out: list[int] = []
         while True:
             k = c.get_key()
             if (k[0], k[1], k[2]) != (db, coll, name):
@@ -5972,20 +6057,21 @@ class Storage:
                     break
             elif row_esc != esc_kb:
                 break
-            out.append(row_id)
+            if row_id is not None:
+                out.append(row_id)
             if c.next() != 0:
                 break
         return out
 
-    def _all_id_keys_for_index(self, db: str, coll: str, name: str) -> list[bytes]:
-        """Every id_key with an entry in index ``name`` — a full index scan.
+    def _all_id_keys_for_index(self, db: str, coll: str, name: str) -> list[int]:
+        """Every RecordId with an entry in index ``name`` — a full index scan.
 
         Serves ``{field: {$exists: true}}`` via a sparse index: a sparse
         index's entries table holds an entry for exactly the docs where the
         indexed field is present (missing-field docs are omitted; present-
         but-null keeps an entry), so the complete set of entries *is* the
-        ``$exists: true`` match set. id_keys can repeat for multikey arrays
-        (one entry per element); the caller's ``_docs_by_id_keys`` dedups.
+        ``$exists: true`` match set. A RecordId can repeat for multikey arrays
+        (one entry per element); the caller's ``_docs_by_recordids`` dedups.
         """
         c = self._cursor(_IDX_ENTRIES_TABLE)
         c.set_key(db, coll, name, b"")
@@ -5994,35 +6080,36 @@ class Storage:
             return []
         if rc < 0 and c.next() != 0:
             return []
-        out: list[bytes] = []
+        out: list[int] = []
         while True:
             k = c.get_key()
             if (k[0], k[1], k[2]) != (db, coll, name):
                 break
             _row_esc, row_id = _unpack_entry(bytes(k[3]))
-            out.append(row_id)
+            if row_id is not None:
+                out.append(row_id)
             if c.next() != 0:
                 break
         return out
 
-    def _docs_by_id_keys(self, db: str, coll: str, id_keys: list[bytes]) -> list[dict[str, Any]]:
-        if not id_keys:
+    def _docs_by_recordids(self, db: str, coll: str, recordids: list[int]) -> list[dict[str, Any]]:
+        """Fetch documents by RecordId — the IXSCAN fetch.
+
+        Index entries carry the RecordId directly, so this reads the doc row
+        straight away; it used to resolve ``id_key -> _id index -> RecordId``
+        first, and deleting that hop is the point of the entry-format change.
+        """
+        if not recordids:
             return []
         c = self._cursor(_doc_table_for(db, coll))
         # Two-stage: WT cursor walk first (raw bytes), then ``bson.decode``
         # outside that loop. The cursor work is what needs lock scope;
         # decode is pure CPU and benefits from running unsynchronised.
         # Multikey indexes write per-element entries, so the same doc's
-        # id_key can appear more than once for queries that match
+        # RecordId can appear more than once for queries that match
         # multiple elements. Dedupe while preserving order.
         raw: list[bytes] = []
-        for id_k in dict.fromkeys(id_keys):
-            # The doc table is keyed by RecordId, so resolve through the ``_id``
-            # index first. (RecordId step 4b drops this hop by putting the
-            # RecordId in the index entry itself.)
-            recordid = self._doc_recordid(db, coll, id_k)
-            if recordid is None:
-                continue
+        for recordid in dict.fromkeys(recordids):
             c.reset()
             c.set_key(db, coll, recordid)
             if c.search() == 0:
@@ -6227,8 +6314,8 @@ class Storage:
         coll: str,
         index_name: str,
         cells: list[tuple[bytes, bytes]],
-    ) -> list[bytes]:
-        """Walk index entries in each (lo, hi) range; return deduplicated id_keys.
+    ) -> list[int]:
+        """Walk index entries in each (lo, hi) range; return deduplicated RecordIds.
 
         A doc with N covering cells produces N index entries; we collect
         just one ``_id`` per doc. The post-fetch verifier (in
@@ -6236,8 +6323,8 @@ class Storage:
         actual geometry doesn't match the query.
         """
         c = self._cursor(_IDX_ENTRIES_TABLE)
-        seen: set[bytes] = set()
-        out: list[bytes] = []
+        seen: set[int] = set()
+        out: list[int] = []
         for lo_bytes, hi_bytes in cells:
             self._scan_geo_range(c, db, coll, index_name, lo_bytes, hi_bytes, seen, out)
         return out
@@ -6250,8 +6337,8 @@ class Storage:
         name: str,
         lo_bytes: bytes,
         hi_bytes: bytes,
-        seen: set[bytes],
-        out: list[bytes],
+        seen: set[int],
+        out: list[int],
     ) -> None:
         """Walk every index entry whose escaped cell-id is in [lo_bytes, hi_bytes].
 
@@ -6275,18 +6362,16 @@ class Storage:
             if k[0] != db or k[1] != coll or k[2] != name:
                 return
             packed = bytes(k[3])
-            sep_pos = packed.find(_ENTRY_SEP)
-            if sep_pos < 0:
+            kb_part, recordid = _unpack_entry(packed)
+            if recordid is None:
                 if c.next() != 0:
                     return
                 continue
-            kb_part = packed[:sep_pos]
             if kb_part > hi_prefix:
                 return
-            id_key = packed[sep_pos + len(_ENTRY_SEP) :]
-            if id_key not in seen:
-                seen.add(id_key)
-                out.append(id_key)
+            if recordid not in seen:
+                seen.add(recordid)
+                out.append(recordid)
             if c.next() != 0:
                 return
 
@@ -6298,10 +6383,10 @@ class Storage:
         *,
         collation: Any = None,
     ) -> list[dict[str, Any]] | None:
-        id_keys = self._try_index_id_keys(db, coll, filter, collation=collation)
-        if id_keys is None:
+        recordids = self._try_index_id_keys(db, coll, filter, collation=collation)
+        if recordids is None:
             return None
-        return self._docs_by_id_keys(db, coll, id_keys)
+        return self._docs_by_recordids(db, coll, recordids)
 
     def _single_field_partial_residual_match(
         self,
@@ -6381,7 +6466,12 @@ class Storage:
         if len(filter) == 1 and "_id" in filter and not self._is_timeseries(db, coll):
             id_keys = _id_point_lookup_keys(filter["_id"])
             if id_keys is not None:
-                return id_keys
+                # Callers want RecordIds. For an `_id` lookup the `_id` index IS
+                # the primary access path (not the secondary-index hop the
+                # RecordId entry format removed), so resolve each key through it;
+                # a key with no row simply matches nothing.
+                rids = [self._doc_recordid(db, coll, k) for k in id_keys]
+                return [r for r in rids if r is not None]
         # Geo dispatch first — a $geoWithin / $geoIntersects / $near clause
         # on a field with a 2dsphere or 2d index uses the cell-covering
         # path. The picker returns None if no geo index covers the query,
@@ -6439,26 +6529,23 @@ class Storage:
         scans (multikey, prefix overlap, etc).
 
         The RecordId comes back with each row because the doc table is keyed by
-        it — a write path needs it to rewrite / remove the row. (Index entries
-        still carry the ``id_key``, so this resolves each through the ``_id``
-        index; RecordId step 4b puts the RecordId in the entry itself and drops
-        that hop.)
+        it — a write path needs it to rewrite / remove the row — and the
+        ``id_key`` because a timeseries row's key carries a suffix that is not
+        derivable from ``_id``. Both come straight off the index entry and the
+        framed row value, with no extra lookup.
         """
         if filter:
-            id_keys = self._try_index_id_keys(db, coll, filter)
-            if id_keys is not None:
+            recordids = self._try_index_id_keys(db, coll, filter)
+            if recordids is not None:
                 c = self._cursor(_doc_table_for(db, coll))
                 out: list[tuple[int, bytes, bytes]] = []
-                # Same dedup contract as ``_docs_by_id_keys``: multikey
-                # indexes can yield duplicate id_keys for one doc.
-                for id_k in dict.fromkeys(id_keys):
-                    recordid = self._doc_recordid(db, coll, id_k)
-                    if recordid is None:
-                        continue
+                # Same dedup contract as ``_docs_by_recordids``: multikey
+                # indexes can yield duplicate RecordIds for one doc.
+                for recordid in dict.fromkeys(recordids):
                     c.reset()
                     c.set_key(db, coll, recordid)
                     if c.search() == 0:
-                        _idk, blob = _unframe_doc_value(bytes(c.get_value()))
+                        id_k, blob = _unframe_doc_value(bytes(c.get_value()))
                         out.append((recordid, id_k, blob))
                 return out
         return list(self._scan_docs(db, coll))
@@ -6628,7 +6715,7 @@ class Storage:
         value: Any,
         *,
         collation: Any = None,
-    ) -> list[bytes]:
+    ) -> list[int]:
         kb = encode_value_directed(value, direction, collation=collation)
         if is_compound:
             return self._scan_index_for_id_keys(db, coll, name, kb + COMPOUND_SEP, prefix=True)
@@ -6893,7 +6980,7 @@ class Storage:
         upper_inclusive: bool,
         *,
         prefix: bytes | None = None,
-    ) -> list[bytes]:
+    ) -> list[int]:
         """Range-scan the index entries for ``name``.
 
         Optional ``prefix`` constrains the scan to entries whose escaped
@@ -6916,7 +7003,7 @@ class Storage:
             return []
         if rc < 0 and c.next() != 0:
             return []
-        out: list[bytes] = []
+        out: list[int] = []
         while True:
             k = c.get_key()
             if (k[0], k[1], k[2]) != (db, coll, name):
@@ -6935,7 +7022,8 @@ class Storage:
                         break
                 elif row_esc >= esc_upper:
                     break
-            out.append(row_id)
+            if row_id is not None:
+                out.append(row_id)
             if c.next() != 0:
                 break
         return out
@@ -6949,7 +7037,7 @@ class Storage:
         lower_inclusive: bool,
         upper: bytes | None,
         upper_inclusive: bool,
-    ) -> list[bytes]:
+    ) -> list[int]:
         """Range-scan a compound index using only its leading field.
 
         Each row's escaped kb is
@@ -6973,7 +7061,7 @@ class Storage:
             return []
         lower_eq_prefix = esc_lower + esc_compound_sep if esc_lower is not None else None
         upper_eq_prefix = esc_upper + esc_compound_sep if esc_upper is not None else None
-        out: list[bytes] = []
+        out: list[int] = []
         while True:
             k = c.get_key()
             if (k[0], k[1], k[2]) != (db, coll, name):
@@ -6994,7 +7082,8 @@ class Storage:
                         break
                 elif row_esc >= esc_upper:
                     break
-            out.append(row_id)
+            if row_id is not None:
+                out.append(row_id)
             if c.next() != 0:
                 break
         return out
