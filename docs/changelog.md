@@ -19,11 +19,24 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-## [0.6.0b1] — 2026-07-25
+## [0.6.0b1] — 2026-07-26
 
-### Faster Rust-server writes, a decoupled oplog, and an Ops Board to drive releases
+### RecordId storage on both servers, faster writes, a decoupled oplog, and an Ops Board
 
-This release is largely a Rust-server write-performance push plus a new tool for
+The headline change is that **both servers now use the same on-disk document
+layout, byte for byte.** The Python server's document table is keyed by RecordId —
+a monotonic insertion counter — exactly as the Rust server has been since its own
+RecordId work, and its index entries carry the RecordId too. That drops a write
+per insert and a lookup per index-scan result (measured Python inserts ~15%
+faster, unsorted scans ~35%, `$group` ~24%), makes an unsorted `find()`, tailable
+cursors, and `multi:false` updates follow true insertion order like mongod, and —
+because the two servers now agree on the whole format, documents and indexes both
+— lets a store written by one server be read, backed up, and point-in-time
+restored by the other. (There is no in-place upgrade from the older layout: a
+pre-RecordId data directory is refused at open with a clear error naming the
+mismatch; start from a fresh directory or downgrade to the build that wrote it.)
+
+This release is also a Rust-server write-performance push plus a new tool for
 running the project. The oplog — the write every change stream, point-in-time
 recovery, and `local.oplog.rs` read depends on, and which a bare standalone
 `mongod` doesn't keep at all — stopped re-encoding documents it had already
@@ -54,6 +67,8 @@ actually get used, malformed wire frames surface as typed errors instead of raw
 exceptions, and a panic in one collection can no longer wedge it until restart.
 
 #### Added
+- Python server: indexes record `entryFormat` in the catalog. Like the internal
+  `multikey` flag it is stripped from `listIndexes`, so clients never see it.
 - `invoke validate --jobs N` / `invoke validate-pymongo-async --jobs N`: run
   the gauge on N xdist workers, each with its own embedded server
   (`--dist loadfile`, so files stay whole). Default `1` — unchanged serial
@@ -118,6 +133,21 @@ exceptions, and a panic in one collection can no longer wedge it until restart.
   appended to the built config string, overriding defaults via last-key-wins.
 
 #### Changed
+- Python server: the documents table is keyed `(db, collection, RecordId)` with
+  a framed `[u32-LE id_key_len][id_key][blob]` value, matching the Rust server's
+  on-disk format exactly. Insert write-amplification drops from four rows to
+  three, and an unsorted scan no longer walks a side index to find insertion
+  order.
+- Python server: an unindexed `update`/`delete` candidate scan now visits
+  documents in insertion order rather than `_id` order, so `multi: false` picks
+  the oldest matching document like mongod.
+- Python server: index entries store the document's RecordId (8-byte
+  big-endian) instead of its encoded `_id`, removing a lookup per result from
+  every index scan. Matches the Rust server's entry format byte for byte.
+- Python server: uniqueness checks exclude the document being updated by
+  RecordId rather than by encoded `_id`.
+- `docs/benchmark.md`, the README and the Rust server's docs index carry the
+  new figures; the latency chart is regenerated from them.
 - `listIndexes` no longer echoes the internal `multikey` catalog flag, matching
   mongod. The admin console's multikey badge is gone with it — the flag isn't
   wire-visible, and the console reports what the wire says; `isMultiKey` in the
@@ -176,6 +206,18 @@ exceptions, and a panic in one collection can no longer wedge it until restart.
   conformance gauge is non-regressing (1020/1500, 99.5%).
 
 #### Fixed
+- Python server: a store written before this change is now refused at open with
+  a clear message naming the format mismatch, instead of being opened and read
+  with the wrong key format.
+- Python server: a store whose indexes predate this change is refused at open
+  with a message naming the index and the format mismatch, instead of running
+  index scans that quietly match nothing.
+- Python server: a tailable cursor on a capped collection with non-monotonic
+  `_id` values no longer drops documents inserted after the cursor opened, and
+  no longer redelivers documents it already returned.
+- Python server: capped-rollover detection (`CappedPositionLost`) is based on
+  the oldest-inserted document rather than the smallest `_id`, matching what
+  capped eviction actually removes.
 - Python server: capped-collection eviction is now strict FIFO
   (insertion order) even for non-monotonic user `_id` values, matching
   mongod, instead of evicting in `_id` byte order.
@@ -216,6 +258,11 @@ exceptions, and a panic in one collection can no longer wedge it until restart.
 - Bounded the per-poll awaitData wait so an orphaned poll thread left behind
   on disconnect frees promptly, hardening against an intermittent CI worker
   crash under load.
+
+#### Removed
+- Python server: the forward natural-order table (`secantus_natural`) is no
+  longer written. The reverse table (`secantus_natural_seq`) remains as the
+  `_id` index.
 
 ## [0.6.0b0] — 2026-07-19
 
