@@ -845,3 +845,73 @@ def test_expanded_events_match_mongod_shapes(client: MongoClient) -> None:
     cs.close()
     assert plain["operationType"] == "update"
     assert "disambiguatedPaths" not in plain["updateDescription"]
+
+
+def test_empty_poll_cannot_skip_a_write_that_lands_mid_scan(
+    server: SecantusDBServer, client: MongoClient
+) -> None:
+    """A write that lands *after* the producer's oplog scan is still delivered.
+
+    When a poll finds no events for the watched namespace, the cursor skips
+    forward past the uninteresting activity so a quiet collection's resume token
+    keeps moving. That skip may only pass entries the scan actually examined.
+    Bounding it by the oplog *tail* instead loses writes two ways: a write that
+    commits between the scan and the tail read is counted by the tail but was
+    never seen, and the tail is the highest seq *minted*, which a writer bumps
+    before committing its batch — so it can name an entry no reader can see yet.
+    Either way the cursor steps over the event and no later poll returns it:
+    data loss, not delay.
+
+    The window is microseconds wide, so this drives it deterministically by
+    committing the write from inside the producer's own storage calls. Both
+    seams are hooked so the test pins the BEHAVIOUR rather than today's call
+    shape: whichever the producer uses, the write lands after its scan.
+    """
+    db = client["race_db"]
+    db.create_collection("c")
+    stream = db["c"].watch(max_await_time_ms=200)
+
+    storage = server.storage
+    real_scan = storage.read_oplog_scan
+    real_tail_seq = storage.oplog_tail_seq
+    landed = threading.Event()
+
+    def land_the_write() -> None:
+        if landed.is_set():
+            return
+        landed.set()
+        writer = MongoClient(server.uri, directConnection=True)
+        try:
+            writer["race_db"]["c"].insert_one({"_id": "written-mid-scan"})
+        finally:
+            writer.close()
+
+    def scan_then_write(**kwargs: Any) -> Any:
+        rows = real_scan(**kwargs)
+        if not rows[0]:
+            land_the_write()  # commits after the scan, before the skip
+        return rows
+
+    def write_then_tail_seq() -> int:
+        land_the_write()  # the pre-fix shape read the tail here, after scanning
+        return real_tail_seq()
+
+    storage.read_oplog_scan = scan_then_write  # type: ignore[method-assign]
+    storage.oplog_tail_seq = write_then_tail_seq  # type: ignore[method-assign]
+    try:
+        deadline = time.time() + 15
+        event = None
+        while event is None and time.time() < deadline:
+            event = stream.try_next()
+    finally:
+        storage.read_oplog_scan = real_scan  # type: ignore[method-assign]
+        storage.oplog_tail_seq = real_tail_seq  # type: ignore[method-assign]
+        stream.close()
+
+    assert landed.is_set(), "the test never exercised the window it exists for"
+    assert event is not None, (
+        "the write that landed after the scan was never delivered — the cursor "
+        "skipped past it and no later poll can return it"
+    )
+    assert event["operationType"] == "insert"
+    assert event["documentKey"]["_id"] == "written-mid-scan"
