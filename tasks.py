@@ -4,6 +4,7 @@ import json
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -423,6 +424,72 @@ def opsboard(
     c.run(" ".join(cmd), pty=True)
 
 
+def _run_gauge(
+    c: Context,
+    *,
+    module: str,
+    raw: str,
+    report: str,
+    server: str | None = None,
+    hint: str = "",
+) -> None:
+    """Run a gauge runner, and refuse to report unless it produced fresh results.
+
+    Every ``<driver>_validation.runner`` writes exactly one raw artifact under
+    ``.validation/`` — JUnit XML, a ``.trx``, newline-JSON, whatever its test
+    tool emits — which its ``generate_report`` then renders into
+    ``docs/validation-report-*.md``. Runners are invoked with ``warn=True``
+    because a gauge whose tests FAIL must still produce a report; that is the
+    deliverable. But the same tolerance used to let a runner that never ran at
+    all fall through to ``generate_report``, which happily re-rendered the
+    PREVIOUS run's artifact under today's date. A run that did not happen came
+    out looking like a run that passed — the one thing a conformance report must
+    never do. (Seen for real on the C++ gauge, which refuses to start when
+    something already holds port 27017.)
+
+    So: clear the artifact up front, then require it back. Several runners clear
+    it themselves, but only *after* their pre-flight checks, and the pre-flight
+    bail is exactly the case that leaves a stale file.
+
+    **Keyed on the artifact, not the exit code**, deliberately. Test tools write
+    their results file whether the tests pass or fail, and the runners return
+    non-zero for both "could not run" (2) and, in some gauges, "tests failed" —
+    so an exit-code guard would suppress reports for legitimate failing runs.
+    A missing or empty artifact means the gauge never ran; a present one means
+    it did, and its numbers — good or bad — are this invocation's.
+
+    ``hint`` is appended to the refusal message: the gauge-specific likely cause
+    (a missing toolchain, an occupied port), which is what the reader needs.
+    """
+    artifact = pathlib.Path(raw)
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    if artifact.is_dir():
+        shutil.rmtree(artifact, ignore_errors=True)
+    else:
+        artifact.unlink(missing_ok=True)
+
+    # The SQL-server gauges (psycopg, slt) have no python/rust server split, so
+    # they pass server=None and the selector env var is simply not set.
+    selector = f"SECANTUS_GAUGE_SERVER={server} " if server is not None else ""
+    c.run(
+        f"{selector}PYTHONPATH=. uv run --no-sync python -m {module}",
+        pty=True,
+        warn=True,  # a failing gauge still owes us a report
+    )
+
+    if artifact.is_dir():
+        produced = any(f.is_file() and f.stat().st_size > 0 for f in artifact.rglob("*"))
+    else:
+        produced = artifact.is_file() and artifact.stat().st_size > 0
+    if not produced:
+        raise SystemExit(
+            f"{module} produced no results ({artifact} missing or empty); not "
+            f"regenerating {report}, which would otherwise restamp the previous "
+            f"run's numbers as if they were current. See the runner output above."
+            + (f" {hint}" if hint else "")
+        )
+
+
 def _gauge_parallel_flags(jobs: int) -> tuple[str, str]:
     """Return ``(env_prefix, pytest_flags)`` for a pymongo-gauge run of *jobs*.
 
@@ -691,12 +758,13 @@ def validate_go(c: Context, server: str = "python") -> None:
     ):
         c.run("git submodule update --init --recursive", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m go_validation.runner",
-        pty=True,
-        warn=True,  # report is the deliverable
+    _run_gauge(
+        c,
+        module="go_validation.runner",
+        raw=f".validation/go-raw{suffix}.ndjson",
+        report=f"docs/validation-report-go{suffix}.md",
+        server=server,
+        hint="A missing `go` toolchain (1.21+) is the usual cause.",
     )
     c.run(
         "uv run --no-sync python -m go_validation.generate_report "
@@ -728,12 +796,13 @@ def validate_node(c: Context, server: str = "python") -> None:
     if not pathlib.Path("vendor/node-mongodb-native/package.json").exists():
         c.run("git submodule update --init --recursive", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m node_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="node_validation.runner",
+        raw=f".validation/node-raw{suffix}.json",
+        report=f"docs/validation-report-node{suffix}.md",
+        server=server,
+        hint="Node.js >= 20 on PATH is required.",
     )
     c.run(
         "uv run --no-sync python -m node_validation.generate_report "
@@ -757,11 +826,12 @@ def validate_psycopg(c: Context) -> None:
 
     if not pathlib.Path("vendor/psycopg/tests").exists():
         c.run("git submodule update --init vendor/psycopg", pty=True)
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        "PYTHONPATH=. uv run --no-sync python -m psycopg_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="psycopg_validation.runner",
+        raw=".validation/psycopg-raw.json",
+        report="docs/validation-report-psycopg.md",
+        hint="A missing `vendor/psycopg` submodule or PG-server startup failure is the usual cause.",
     )
     c.run(
         "uv run --no-sync python -m psycopg_validation.generate_report "
@@ -785,11 +855,12 @@ def validate_slt(c: Context) -> None:
 
     if not pathlib.Path("vendor/sqllogictest/test").exists():
         c.run("git submodule update --init vendor/sqllogictest", pty=True)
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        "PYTHONPATH=. uv run --no-sync python -m slt_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="slt_validation.runner",
+        raw=".validation/slt-raw.json",
+        report="docs/validation-report-slt.md",
+        hint="A missing `vendor/sqllogictest` submodule or PG-server startup failure is the usual cause.",
     )
     c.run(
         "uv run --no-sync python -m slt_validation.generate_report "
@@ -822,12 +893,13 @@ def validate_ruby(c: Context, server: str = "python") -> None:
     if not pathlib.Path("vendor/mongo-ruby-driver/mongo.gemspec").exists():
         c.run("git submodule update --init --recursive", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m ruby_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="ruby_validation.runner",
+        raw=f".validation/ruby-raw{suffix}.json",
+        report=f"docs/validation-report-ruby{suffix}.md",
+        server=server,
+        hint="Ruby >= 2.7 with `bundler` on PATH is required.",
     )
     c.run(
         "uv run --no-sync python -m ruby_validation.generate_report "
@@ -870,24 +942,14 @@ def validate_java(c: Context, server: str = "python") -> None:
         c.run("git submodule update --init --recursive", pty=True)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
-    result = c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m java_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="java_validation.runner",
+        raw=f".validation/java-results{suffix}",
+        report=f"docs/validation-report-java{suffix}.md",
+        server=server,
+        hint="A JDK 24+ default is the usual cause — Gradle needs 8-23, so install openjdk@17.",
     )
-    # Fail loudly instead of regenerating a stale/empty report. The runner
-    # wipes prior JUnit XML up front, so a non-zero exit means the build
-    # didn't actually run any tests this invocation (common cause: no
-    # Gradle-supported JDK — needs 8-23, JDK 24+ aborts the build). Re-
-    # emitting the report here would otherwise carry forward a previous
-    # run's numbers as if they were current.
-    if result.exited != 0:
-        raise SystemExit(
-            f"java_validation.runner failed (exit {result.exited}); not regenerating "
-            f"docs/validation-report-java{suffix}.md from stale/empty results. See the runner "
-            "output above (a JDK 24+ default is the usual cause — install openjdk@17)."
-        )
     c.run(
         "uv run --no-sync python -m java_validation.generate_report "
         f".validation/java-results{suffix} docs/validation-report-java{suffix}.md",
@@ -927,23 +989,14 @@ def validate_kotlin(c: Context, server: str = "python") -> None:
     ):
         c.run("git submodule update --init --recursive", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    result = c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m kotlin_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="kotlin_validation.runner",
+        raw=f".validation/kotlin-results{suffix}",
+        report=f"docs/validation-report-kotlin{suffix}.md",
+        server=server,
+        hint="A JDK 24+ default is the usual cause — Gradle needs 8-23, so install openjdk@17.",
     )
-    # Fail loudly rather than regenerate a stale/empty report (same guard as
-    # validate-java): the runner wipes prior JUnit XML up front, so a non-zero
-    # exit means no tests actually ran this invocation (usual cause: no
-    # Gradle-supported JDK — needs 8-23, JDK 24+ aborts the build).
-    if result.exited != 0:
-        raise SystemExit(
-            f"kotlin_validation.runner failed (exit {result.exited}); not regenerating "
-            f"docs/validation-report-kotlin{suffix}.md from stale/empty results. See the "
-            "runner output above (a JDK 24+ default is the usual cause — install openjdk@17)."
-        )
     c.run(
         "uv run --no-sync python -m kotlin_validation.generate_report "
         f".validation/kotlin-results{suffix} docs/validation-report-kotlin{suffix}.md",
@@ -976,12 +1029,13 @@ def validate_rust(c: Context, server: str = "python") -> None:
     if not pathlib.Path("vendor/mongo-rust-driver/Cargo.toml").exists():
         c.run("git submodule update --init --recursive", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m rust_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="rust_validation.runner",
+        raw=f".validation/rust-raw{suffix}.json",
+        report=f"docs/validation-report-rust{suffix}.md",
+        server=server,
+        hint="A `cargo` toolchain is required.",
     )
     c.run(
         "uv run --no-sync python -m rust_validation.generate_report "
@@ -1014,12 +1068,13 @@ def validate_php_lib(c: Context, server: str = "python") -> None:
     if not pathlib.Path("vendor/mongo-php-library/composer.json").exists():
         c.run("git submodule update --init vendor/mongo-php-library", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m php_lib_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="php_lib_validation.runner",
+        raw=f".validation/php-lib-junit{suffix}.xml",
+        report=f"docs/validation-report-php-lib{suffix}.md",
+        server=server,
+        hint="PHP >= 8.1 with the `mongodb` extension plus `composer` are required.",
     )
     c.run(
         "uv run --no-sync python -m php_lib_validation.generate_report "
@@ -1053,12 +1108,13 @@ def validate_php_ext(c: Context, server: str = "python") -> None:
     if not pathlib.Path("vendor/mongo-php-driver/tests/utils/basic.inc").exists():
         c.run("git submodule update --init vendor/mongo-php-driver", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m php_ext_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="php_ext_validation.runner",
+        raw=f".validation/php-ext-junit{suffix}.xml",
+        report=f"docs/validation-report-php-ext{suffix}.md",
+        server=server,
+        hint="PHP >= 8.1 with the `mongodb` extension (and its `run-tests.php`) is required.",
     )
     c.run(
         "uv run --no-sync python -m php_ext_validation.generate_report "
@@ -1093,12 +1149,13 @@ def validate_c(c: Context, server: str = "python") -> None:
     if not pathlib.Path("vendor/mongo-c-driver/CMakeLists.txt").exists():
         c.run("git submodule update --init vendor/mongo-c-driver", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m c_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="c_validation.runner",
+        raw=f".validation/c-raw{suffix}.json",
+        report=f"docs/validation-report-c{suffix}.md",
+        server=server,
+        hint="cmake plus a C toolchain and OpenSSL are required; the first build takes ~10 min.",
     )
     c.run(
         "uv run --no-sync python -m c_validation.generate_report "
@@ -1138,34 +1195,15 @@ def validate_cxx(c: Context, server: str = "python") -> None:
     if not pathlib.Path("vendor/mongo-c-driver/CMakeLists.txt").exists():
         c.run("git submodule update --init vendor/mongo-c-driver", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    # Drop any previous run's JUnit up front so it cannot be mistaken for this
-    # run's output below. (The runner also clears it, but only *after* its
-    # pre-flight checks — and it is exactly the pre-flight bail that used to
-    # leave a stale file behind.)
-    raw = pathlib.Path(f".validation/cxx-raw{suffix}.xml")
-    raw.unlink(missing_ok=True)
-    c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m cxx_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="cxx_validation.runner",
+        raw=f".validation/cxx-raw{suffix}.xml",
+        report=f"docs/validation-report-cxx{suffix}.md",
+        server=server,
+        hint="Port 27017 already being in use is the usual cause (mongocxx's tests "
+        "hard-wire the driver default port and can't be redirected).",
     )
-    # Only regenerate the report from results this invocation actually produced.
-    # The gauge refuses to start when something already holds port 27017 (see the
-    # note above); before this check that refusal still fell through to
-    # generate_report, which re-rendered the PREVIOUS run's numbers under
-    # today's date — a stale conformance figure wearing a fresh timestamp. The
-    # test binary writes JUnit whether the tests pass or fail, so a missing file
-    # means the gauge never ran, not that it ran badly.
-    if not raw.is_file() or raw.stat().st_size == 0:
-        raise SystemExit(
-            f"cxx_validation produced no results ({raw} missing or empty); not "
-            f"regenerating docs/validation-report-cxx{suffix}.md, which would "
-            "otherwise restamp the previous run's numbers as if they were "
-            "current. See the runner output above — port 27017 already being in "
-            "use is the usual cause."
-        )
     c.run(
         "uv run --no-sync python -m cxx_validation.generate_report "
         f".validation/cxx-raw{suffix}.xml docs/validation-report-cxx{suffix}.md",
@@ -1200,12 +1238,13 @@ def validate_dotnet(c: Context, server: str = "python") -> None:
     ).exists():
         c.run("git submodule update --init vendor/mongo-csharp-driver", pty=True)
 
-    pathlib.Path(".validation").mkdir(exist_ok=True)
-    c.run(
-        f"SECANTUS_GAUGE_SERVER={server} "
-        "PYTHONPATH=. uv run --no-sync python -m dotnet_validation.runner",
-        pty=True,
-        warn=True,
+    _run_gauge(
+        c,
+        module="dotnet_validation.runner",
+        raw=f".validation/dotnet-raw{suffix}.trx",
+        report=f"docs/validation-report-dotnet{suffix}.md",
+        server=server,
+        hint="The .NET SDK (and gpg, for the Encryption project's libmongocrypt check) is required.",
     )
     c.run(
         "uv run --no-sync python -m dotnet_validation.generate_report "
