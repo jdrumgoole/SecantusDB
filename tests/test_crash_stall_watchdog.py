@@ -14,7 +14,6 @@ in-process.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import os
 import subprocess
 import sys
@@ -22,6 +21,11 @@ import tempfile
 import textwrap
 from collections.abc import Iterator
 from pathlib import Path
+
+try:
+    import fcntl  # POSIX-only; absent on Windows.
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 import pytest
 
@@ -277,11 +281,15 @@ def _run_nested_with_fault_dir(
 # `-n auto` (== `--dist load`), which ignores groups. So serialise for real with
 # a machine-wide advisory file lock — held across every xdist worker and the
 # controller, regardless of dist mode — so only one nested session runs at a time.
+# (Windows has no `fcntl.flock`; there the lock degrades to prior behaviour.)
 _NESTED_RUN_LOCK = Path(tempfile.gettempdir()) / "secantus-crash-watchdog-nested.lock"
 
 
 @contextlib.contextmanager
 def _nested_run_lock() -> Iterator[None]:
+    if fcntl is None:  # Windows: no flock — fall back to prior (unserialised) behaviour.
+        yield
+        return
     with open(_NESTED_RUN_LOCK, "w") as fh:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         try:
