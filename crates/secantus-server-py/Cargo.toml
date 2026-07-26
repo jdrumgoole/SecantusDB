@@ -24,3 +24,19 @@ secantus-storage = { path = "../secantus-storage" }
 secantus-storage-adapter = { path = "../secantus-storage-adapter" }
 secantus-commands = { path = "../secantus-commands" }
 secantus-server = { path = "../secantus-server" }
+# Fast allocator: profiling (tasks/rust-perf-findings.md, Finding 1) put
+# malloc/realloc/free churn from BSON materialization among the top CPU costs on
+# every read/aggregate path. mimalloc replaces the system allocator process-wide
+# for the extension.
+# Fast allocator: profiling (tasks/rust-perf-findings.md, Finding 1) put
+# malloc/realloc/free churn from BSON materialization among the top CPU costs on
+# every read/aggregate path. mimalloc replaces the system allocator process-wide
+# for the extension.
+mimalloc = "0.1"
+
+# Cross-crate inlining of the hot serde/matcher/aggregate paths that span
+# secantus-server-py → secantus-storage → secantus-core → bson. Build-time cost
+# for a runtime win; measured against the default (LTO off) profile.
+[profile.release]
+lto = "thin"
+codegen-units = 1

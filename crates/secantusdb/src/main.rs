@@ -7,6 +7,11 @@
 //! SIGINT/SIGTERM → clean stop. Startup mirrors `secantus-server-py`'s
 //! constructor so both entry points drive an identical server.
 
+// Fast global allocator — BSON materialization drives heavy alloc churn
+// (tasks/rust-perf-findings.md, Finding 1); mimalloc cuts it across all paths.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
