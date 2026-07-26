@@ -196,8 +196,27 @@ store" test and a rename-keeps-index-reachable test (mirror the Rust
 `rename_keeps_secondary_index_reachable_through_the_index`, hint-forced IXSCAN vs
 collection scan — and verify it FAILS on a verbatim-copy rename before trusting it).
 
-## 4c — tailable capped cursor tracks RecordId (mirror of Rust #640 `6f3a8e05`)
+## 4c — tailable capped cursor tracks RecordId (mirror of Rust #640 `6f3a8e05`) — **DONE**
 
+Implemented. Deltas from the sketch below:
+
+- New storage methods: `scan_docs_after_recordid`, `collection_min_recordid`,
+  `collection_max_recordid`, plus `recordid_for_id` (public `_id`-index accessor).
+  The old `scan_docs_after_id_key` / `collection_min_id_key` are **deleted** —
+  `commands._find_tailable` was their only caller, so nothing keeps them alive
+  (the Rust side kept its versions because `stats.rs` still used them).
+- **The watermark is seeded from the last doc handed out, not the collection's
+  max RecordId** (where Rust seeds it). Python's producer must not skip matched
+  docs past `batch_size` — the go-gauge bug the existing comment records — so it
+  anchors on `initial_docs[-1]`'s RecordId via `recordid_for_id`. Same ordering
+  basis as Rust, different (safer) seed.
+- The pre-change failure is worse than the Rust commit message describes: with
+  `_id`s `500, 400, 300` then `20, 10`, the id_key watermark returned
+  `[500, 400, 300, 400, 500]` — it both dropped the new docs AND redelivered old
+  ones. The new test pins `[500, 400, 300, 20, 10]` and fails on pre-change code
+  exactly that way.
+
+### Original sketch
 
 
 **Only after 4a/4b** — until the Python doc table is RecordId-keyed, its natural
@@ -219,6 +238,62 @@ server (a capped collection with descending/non-monotonic `_id`s + tailable curs
 assert follow-up smaller-`_id` inserts still arrive in insertion order).
 
 ---
+
+## Status (2026-07-25): 4a, 4b and 4c are all implemented on `rust-recordid-step4`
+
+Gates run per step, all green: full Python suite (4863 passed / 0 failed at 4c),
+`invoke lint` (ruff check + format), and the pymongo gauge at **5 failed / 1226
+passed** — the same five known out-of-scope failures `main` publishes, at every
+step. Cross-server byte parity was measured directly against the shipped
+`_secantus_storage` extension (tables in the 4a / 4b sections): a store written by
+either server now opens, reads, index-scans and accepts writes on the other.
+
+Every new test was proven to fail on pre-change code (the guard-can-catch-its-bug
+rule): the four 4a guards by stashing `storage.py`, the 4b rename guard by
+mutation (re-minting the destination's RecordIds → index returns `[]` while the
+scan returns everything), and the 4c tailable guard by stashing both modules
+(pre-change output was `[500, 400, 300, 400, 500]` — dropped inserts AND
+redelivered docs).
+
+Not done here: committing / opening the three sub-PRs, and re-running the *Rust*
+server's own pymongo gauge (`./inv validate --server rust`), which needs the
+WT-linked extension built in this worktree. The extension-level cross-server
+checks above cover the same on-disk-format question.
+
+## Measured — Python server, 4a+4b+4c vs pre-change (2026-07-26)
+
+Alternating A/B on an idle box (load < 2.5): the working tree (all three steps)
+against a **detached worktree frozen at `01152b1d`** (the pre-change tree), same
+venv, same machine, 6 interleaved rounds × 3 reps each, `n=10000`, driven through
+`pymongo` by `bench.compare_servers`' workloads (Python server only). Medians:
+
+| workload | pre | post | Δ |
+|---|---|---|---|
+| insert | 347.95 ms | **295.03 ms** | **−15.2%** |
+| find_all (scan) | 108.57 ms | **70.37 ms** | **−35.2%** |
+| aggregate `$group` | 157.12 ms | **119.52 ms** | **−23.9%** |
+| aggregate multistage | 212.79 ms | **175.96 ms** | **−17.3%** |
+| delete_many_half | 273.98 ms | 266.29 ms | −2.8% |
+| find_indexed_range | 34.77 ms | 36.28 ms | **+4.3%** |
+| update_many_half | 506.34 ms | 524.94 ms | **+3.7%** |
+
+Noise floor ≈ ±3% (max/min across each leg's 6 round medians was 1.01–1.04×), so
+the four big wins are unambiguous and the two small regressions sit just at the
+edge — but they reproduced in both independent 3-round batches, so treat them as
+real.
+
+**Why insert / scan / aggregate win:** insert dropped a whole row (4→3), and every
+sequential walk now reads the doc table directly instead of walking the natural
+index and fetching each doc by `id_key` — that second hop is what the 35% scan win
+is made of.
+
+**Why the two small regressions:** before this change an indexed read was already
+direct (entries held the `id_key`, the doc table was `id_key`-keyed), so 4b's
+"drop the hop" only gives back what 4a spent — it doesn't beat the original. What's
+left is new per-row work: `_unframe_doc_value` on every doc read and the
+`_unpack_entry` int parse on every entry. Same shape as the Rust side, where step 1
+cost +14.7% on `find_indexed_range` and step 2 aimed to return it to baseline.
+Net across the workload set the change is strongly positive.
 
 ## Resume instructions (cold-start)
 

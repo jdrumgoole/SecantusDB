@@ -4009,6 +4009,44 @@ def test_tailable_await_picks_up_inserts_after_find(client: MongoClient) -> None
         cur.close()
 
 
+def test_tailable_capped_follows_inserts_with_nonmonotonic_ids(client: MongoClient) -> None:
+    """A tailable cursor follows INSERTION order, not `_id` order.
+
+    The follow-up `_id`s (20, 10) are all *smaller* than everything in the
+    initial batch (500, 400, 300), so a watermark that tracked the encoded `_id`
+    would filter them out and the cursor would stall forever. mongod delivers
+    them — its tailable cursors follow the RecordId (insertion) order that capped
+    FIFO eviction also uses. This is the conformance proof for the RecordId
+    tailable anchor; the pre-change producer returns nothing here.
+    """
+    db = client["tail_nonmono_db"]
+    db.tailcap.drop()
+    db.create_collection("tailcap", capped=True, size=64 * 1024)
+    db.tailcap.insert_many([{"_id": 500}, {"_id": 400}, {"_id": 300}])
+
+    cur = db.tailcap.find(
+        cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+        batch_size=10,
+    ).max_await_time_ms(100)
+
+    seen = [cur.next()["_id"] for _ in range(3)]
+    assert seen == [500, 400, 300], f"initial batch not in insertion order: {seen}"
+
+    db.tailcap.insert_many([{"_id": 20}, {"_id": 10}])
+
+    deadline = dt.datetime.now() + dt.timedelta(seconds=5)
+    while len(seen) < 5 and dt.datetime.now() < deadline:
+        try:
+            seen.append(cur.next()["_id"])
+        except StopIteration:
+            break
+    assert seen == [500, 400, 300, 20, 10], (
+        f"tailable cursor dropped the smaller-_id follow-up inserts, got {seen}"
+    )
+    with contextlib.suppress(Exception):
+        cur.close()
+
+
 def test_tailable_await_filter_applies_to_follow_up_inserts(client: MongoClient) -> None:
     """The tailable producer must re-apply the find filter to docs inserted
     after the find — not just to firstBatch. Regression for the libmongoc

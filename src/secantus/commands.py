@@ -2232,48 +2232,52 @@ def _find_tailable(
       with ``batchSize=2`` and the second batch must deliver
       ``{x:3},{x:4}`` via getMore, not block on awaitData).
     * Docs inserted *after* this find. A producer closure scans the
-      doc table for rows with ``id_key`` strictly greater than the
-      last one we've returned. ``id_key`` is the byte-sortable ``_id``
-      encoding (see ``secantus.sortkey``); for monotonic
-      ``ObjectId``-style ``_id`` values that order matches insertion
-      order, which is exactly what tailable consumers expect. Capped
-      collections eviction-prune oldest rows in the same order, so the
-      producer naturally tracks the trailing edge.
+      doc table for rows whose **RecordId** is strictly greater than
+      the last one we've returned. The RecordId is the monotonic
+      insertion counter the doc table is keyed by, so that walk is
+      insertion order — what tailable consumers expect, and the order
+      capped collections eviction-prune in, so the producer naturally
+      tracks the trailing edge. (It used to track the byte-sortable
+      ``_id`` encoding, which only equals insertion order for monotonic
+      ``_id``s: with custom non-monotonic ones a later insert carrying a
+      smaller ``_id`` sorted below the watermark and was silently
+      dropped from the stream.)
     """
-    from secantus.sortkey import encode_value as _encode_id_key
-
     db_name = ctx.db_name
     storage = ctx.storage
     first_batch = initial_docs[:batch_size]
     initial_remaining = initial_docs[batch_size:]
-    # Watermark for the producer: highest id_key among the docs we've
-    # already handed to the client (either in firstBatch or queued in
-    # initial_remaining). Setting it to ``rows[-1][0]`` (the last doc
-    # in the collection) instead would silently drop any matched docs
-    # past ``batch_size`` — the original bug surfaced by the go gauge.
-    # Empty collection: watermark is None, so the producer walks from
-    # the start and picks up the very first insert after this find.
-    watermark = _encode_id_key(initial_docs[-1]["_id"]) if initial_docs else None
-    state = {"after_id_key": watermark}
+    # Watermark for the producer: the RecordId of the last doc we've already
+    # handed to the client (either in firstBatch or queued in
+    # initial_remaining). Anchoring on the collection's last row instead would
+    # silently drop any matched docs past ``batch_size`` — the original bug
+    # surfaced by the go gauge. Empty collection: watermark is None, so the
+    # producer walks from the start and picks up the very first insert after
+    # this find.
+    watermark = (
+        storage.recordid_for_id(db_name, coll, initial_docs[-1]["_id"]) if initial_docs else None
+    )
+    state: dict[str, int | None] = {"after_recordid": watermark}
 
     def producer() -> list[dict[str, Any]]:
-        after = state["after_id_key"]
+        after = state["after_recordid"]
         # Capped rollover detection: if the doc this cursor last returned
         # (``after``) has been evicted — i.e. the collection's smallest
-        # ``id_key`` is now strictly greater than it — the cursor has been
-        # lapped and mongod kills it with ``CappedPositionLost``. A fresh
-        # cursor (``after is None``) has no anchor to lose.
+        # RecordId is now strictly greater than it — the cursor has been
+        # lapped and mongod kills it with ``CappedPositionLost``. Capped
+        # eviction is FIFO by RecordId, so this detects exactly the eviction
+        # that lapped us. A fresh cursor (``after is None``) has no anchor.
         if after is not None:
-            min_key = storage.collection_min_id_key(db_name, coll)
-            if min_key is None or min_key > after:
+            min_rid = storage.collection_min_recordid(db_name, coll)
+            if min_rid is None or min_rid > after:
                 raise _CappedPositionLost
-        new_rows = storage.scan_docs_after_id_key(db_name, coll, after=after)
+        new_rows = storage.scan_docs_after_recordid(db_name, coll, after=after)
         if not new_rows:
             return []
         # Advance the watermark past every row we scanned — matched or not —
         # so non-matching docs aren't re-examined on the next poll.
-        state["after_id_key"] = new_rows[-1][0]
-        out = [doc for _id_k, doc in new_rows]
+        state["after_recordid"] = new_rows[-1][0]
+        out = [doc for _rid, doc in new_rows]
         if filter_:
             out = [d for d in out if matches(d, filter_, vars=let, collation=collation)]
         return out

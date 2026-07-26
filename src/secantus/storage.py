@@ -3663,48 +3663,66 @@ class Storage:
             raw = [(id_k, blob) for _rid, id_k, blob in self._scan_docs(db, coll)]
         return [(bson.decode(blob), id_k) for id_k, blob in raw]
 
-    def scan_docs_after_id_key(
-        self, db: str, coll: str, after: bytes | None
-    ) -> list[tuple[bytes, dict[str, Any]]]:
-        """Scan the document table in natural (id_key) order, returning
-        only rows whose ``id_key`` is strictly greater than ``after``.
-        ``after`` of ``None`` returns the entire collection.
+    def scan_docs_after_recordid(
+        self, db: str, coll: str, after: int | None
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Scan the collection in natural (insertion) order, returning only rows
+        whose **RecordId** is strictly greater than ``after``. ``after`` of
+        ``None`` returns the entire collection.
 
-        Used by the tailable-cursor producer to emit only the docs
-        inserted since the last poll. Returns ``[(id_key, doc), ...]``
-        — callers update their ``after`` checkpoint to the last
-        returned ``id_key`` for the next poll.
+        Used by the tailable-cursor producer to emit only the docs inserted since
+        the last poll. Returns ``[(recordid, doc), ...]`` — callers update their
+        ``after`` checkpoint to the last returned RecordId for the next poll.
+        RecordId is the right basis: it is what mongod's tailable cursors follow
+        and what capped FIFO eviction uses. (An ``id_key`` watermark only tracks
+        insertion order for monotonic ``_id``s — with custom non-monotonic ones a
+        later insert carrying a smaller ``_id`` would sort *below* the watermark
+        and be silently dropped from the stream.)
         """
         # Two-stage: collect raw bytes under the lock, decode after.
-        # ``_scan_docs`` walks in RecordId (insertion) order since the RecordId
-        # keying change, so sort by ``id_key`` to keep this method's documented
-        # id_key-ordered contract — callers use the last row as their watermark.
-        # (RecordId step 4c replaces this method's callers with a RecordId
-        # watermark, which is the order they actually want.)
         with self._lock:
-            raw: list[tuple[bytes, bytes]] = sorted(
-                (
-                    (id_k, blob)
-                    for _rid, id_k, blob in self._scan_docs(db, coll)
-                    if after is None or id_k > after
-                ),
-                key=lambda row: row[0],
-            )
-        return [(id_k, bson.decode(blob)) for id_k, blob in raw]
+            raw = [
+                (rid, blob)
+                for rid, _id_k, blob in self._scan_docs(db, coll)
+                if after is None or rid > after
+            ]
+        return [(rid, bson.decode(blob)) for rid, blob in raw]
 
-    def collection_min_id_key(self, db: str, coll: str) -> bytes | None:
-        """Smallest ``id_key`` in the collection — the oldest doc in natural
-        (insertion, for monotonic ``_id``) order — or ``None`` if empty.
+    def collection_min_recordid(self, db: str, coll: str) -> int | None:
+        """Smallest RecordId in the collection — the oldest-inserted doc — or
+        ``None`` if empty.
 
-        Used to detect capped-collection rollover for tailable cursors: if a
-        cursor's last-returned ``id_key`` is below this, the document it was
-        anchored on has been evicted, and mongod kills the cursor with
-        ``CappedPositionLost``. ``_scan_docs`` yields in RecordId (insertion)
-        order since the RecordId keying change, so take the minimum across the
-        scan rather than the first row.
+        Used to detect capped-collection rollover for tailable cursors: capped
+        eviction is FIFO by RecordId, so if the min RecordId now exceeds a
+        cursor's anchor, the document it was anchored on has been evicted and
+        mongod kills the cursor with ``CappedPositionLost``. ``_scan_docs`` yields
+        RecordId-ascending, so the first row is the minimum.
         """
         with self._lock:
-            return min((id_k for _rid, id_k, _blob in self._scan_docs(db, coll)), default=None)
+            for recordid, _id_k, _blob in self._scan_docs(db, coll):
+                return recordid
+            return None
+
+    def collection_max_recordid(self, db: str, coll: str) -> int | None:
+        """Largest RecordId in the collection (``None`` if empty) — the position a
+        tailable cursor sits at once it has handed out the collection's current
+        contents. ``_scan_docs`` yields RecordId-ascending, so it's the last row.
+        """
+        with self._lock:
+            last: int | None = None
+            for recordid, _id_k, _blob in self._scan_docs(db, coll):
+                last = recordid
+            return last
+
+    def recordid_for_id(self, db: str, coll: str, doc_id: Any) -> int | None:
+        """The RecordId of the doc with ``_id == doc_id``, or ``None``.
+
+        Public accessor over the ``_id`` index, for callers that hold a decoded
+        document and need its position — the tailable cursor seeds its watermark
+        with the last document it handed out.
+        """
+        with self._lock:
+            return self._doc_recordid(db, coll, _id_key(doc_id))
 
     def collection_is_capped(self, db: str, coll: str) -> bool:
         """Public predicate: does the collection have ``capped: true`` set?
