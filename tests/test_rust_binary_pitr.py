@@ -63,7 +63,9 @@ def _restore(
         [str(_BIN), "restore", "--source", str(source), "--target-dir", str(target), *extra],
         capture_output=True,
         text=True,
-        timeout=60,
+        # A debug-build restore takes ~30s solo; under the full parallel suite it
+        # contends for CPU/IO, so give it generous headroom rather than flaking.
+        timeout=240,
     )
 
 
@@ -149,7 +151,7 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
         assert "path" in reply
     finally:
         proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout=10)
+        proc.wait(timeout=30)
 
     # The archive dir holds a base snapshot; restore auto-detects it (v2).
     out = tmp_path / "restored"
