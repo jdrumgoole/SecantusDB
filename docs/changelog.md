@@ -19,6 +19,61 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b2] — 2026-07-26
+
+### A much faster Rust server: mimalloc, thin LTO, and profile-guided optimization
+
+The Rust server — both the standalone `secantusd-rs` binary and the copy
+embedded in the Python wheel — is now built with the mimalloc allocator, thin
+link-time optimization, and profile-guided optimization (PGO). Profiling had
+pinned `malloc`/`realloc`/`free` churn from BSON materialization as a top CPU
+cost on every write and aggregate path; a faster allocator attacks that
+directly, LTO inlines across the crate boundaries the hot path crosses, and PGO
+lays the final build out around the branches a benchmark run showed are hot.
+
+Together they move single-client writes to **beat** standalone `mongod`,
+`aggregate $group` to parity, and the whole six-workload benchmark into the
+~0.8×–2.1× band — a cumulative ~30–40% off the write and aggregate paths since
+the previous release, with no change in behaviour (it is entirely an allocator
+and compiler-optimization story). The pure-Python server is unchanged this
+release; this is a Rust-server speed release, and it ships in both the wheel's
+embedded server and the standalone binary.
+
+This release also hardens the driver-conformance gauges so a gauge that never
+ran can no longer leave behind a report that looks like it passed.
+
+#### Added
+- `invoke rust-pgo-refresh` regenerates the committed PGO profile for the
+  embedded extension (instrument → run the benchmark workloads → merge → commit
+  → rebuild). Needs `rustup component add llvm-tools-preview`.
+- `crates/pgo/_secantus_server.profdata.tar.gz`: the committed, sparse PGO
+  profile the wheel build consumes.
+
+#### Changed
+- Rust server: mimalloc is the global allocator for the embedded
+  `_secantus_server` extension and the standalone `secantusd-rs` binary.
+- Rust server: release builds use `lto = "thin"` and `codegen-units = 1`
+  (the allocator is the dominant lever; LTO is roughly additive on top).
+- Rust server: both distributions are built with PGO. The embedded extension
+  build (CMake) applies a committed profile via `-Cprofile-use`
+  (`SECANTUS_PGO_DISABLE=1` turns it off, `SECANTUS_PGO_GENERATE=<dir>` switches
+  to instrumentation); the standalone binary is built two-stage per architecture
+  in its release workflow for an on-target profile. Cumulative measured gain
+  over the previous release (mongod-normalized): writes and aggregates ~−30–40%,
+  moving writes past `mongod` and `aggregate $group` to parity. Raw-scan reads
+  are unchanged (already at the wire floor).
+- Java and Kotlin conformance gauges move from an exit-code guard to the shared
+  artifact guard, so a legitimately failing run reports instead of being
+  suppressed.
+
+#### Fixed
+- Driver-conformance gauges no longer regenerate a validation report from a
+  previous run's results — a gauge that cannot start (port in use, missing
+  toolchain, failed build) now exits non-zero and leaves the prior report
+  untouched, instead of restamping stale numbers under today's date. Applies to
+  all thirteen gauges (go, node, ruby, rust, java, kotlin, php-lib, php-ext, c,
+  cxx, dotnet, psycopg, slt).
+
 ## [0.6.0b1] — 2026-07-26
 
 ### RecordId storage on both servers, faster writes, a decoupled oplog, and an Ops Board
