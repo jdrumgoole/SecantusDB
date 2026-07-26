@@ -1987,7 +1987,7 @@ class Storage:
             session = self._conn.open_session()
             try:
                 # Sharded: merge every shard + the legacy table in seq order.
-                merged = self._merge_oplog_on_session(session, 0, 2**63 - 1)
+                merged, _scan_high = self._merge_oplog_on_session(session, 0, 2**63 - 1)
                 return [entry for _seq, entry in merged]
             finally:
                 with contextlib.suppress(Exception):
@@ -2344,8 +2344,16 @@ class Storage:
         seq and advances that cursor. Handles gaps (prune removes a low prefix)
         so a missing seq can't truncate a change-stream read. Mirrors the Rust
         ``read_oplog_shards``. Opens + closes its own cursors on ``session``.
+
+        Also reports ``scan_high``: the highest seq this scan actually EXAMINED,
+        including entries the ``ns_filter`` rejected. A caller that wants to skip
+        its cursor forward past uninteresting activity must bound the skip by
+        this, not by the oplog's tail — the tail is the highest seq *minted*, and
+        a writer mints before it commits, so the tail can name an entry that no
+        reader can see yet. Skipping to it would step over that entry for good.
         """
         out: list[tuple[int, dict[str, Any]]] = []
+        scan_high = start_seq - 1
         cursors: list[Any] = []
         heads: list[int | None] = []
         try:
@@ -2375,12 +2383,13 @@ class Storage:
                     entry = bson.decode(blob)
                     if ns_filter is None or ns_filter(str(entry.get("ns", ""))):
                         out.append((best_seq, entry))
+                scan_high = max(scan_high, best_seq)
                 heads[best_i] = int(c.get_key()) if c.next() == 0 else None
         finally:
             for c in cursors:
                 with contextlib.suppress(Exception):
                     c.close()
-        return out
+        return out, scan_high
 
     def read_oplog(
         self,
@@ -2397,9 +2406,26 @@ class Storage:
         getMore polls would never observe oplog rows produced by a writer
         running on a different connection thread.
         """
+        return self.read_oplog_scan(start_seq=start_seq, limit=limit, ns_filter=ns_filter)[0]
+
+    def read_oplog_scan(
+        self,
+        *,
+        start_seq: int,
+        limit: int,
+        ns_filter: Callable[[str], bool] | None = None,
+    ) -> tuple[list[tuple[int, dict[str, Any]]], int]:
+        """``read_oplog`` plus the highest seq the scan examined.
+
+        The second element is what a change-stream cursor may safely skip to when
+        the scan produced no matching events: entries this read actually saw and
+        rejected. Bounding the skip by the oplog *tail* instead loses events —
+        the tail counts minted seqs, and an entry minted but not yet committed is
+        invisible to this scan, so skipping to the tail steps over it forever.
+        """
         with self._lock:
             if self._closed:
-                return []
+                return [], start_seq - 1
             session = self._conn.open_session()
             try:
                 return self._merge_oplog_on_session(session, start_seq, limit, ns_filter)
@@ -2551,7 +2577,8 @@ class Storage:
                 return 0
             session = self._conn.open_session()
             try:
-                for seq, entry in self._merge_oplog_on_session(session, 0, 2**63 - 1):
+                rows, _scan_high = self._merge_oplog_on_session(session, 0, 2**63 - 1)
+                for seq, entry in rows:
                     entry_ts = entry.get("ts")
                     if isinstance(entry_ts, Timestamp) and (
                         entry_ts.time > ts.time

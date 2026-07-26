@@ -4409,7 +4409,20 @@ def _aggregate_change_stream(
         entry = entry_ref["entry"]
         if entry is None:
             return []
-        rows = storage.read_oplog(start_seq=entry.position_seq + 1, limit=200, ns_filter=_ns_filter)
+        # ``scan_high`` is the highest seq this scan EXAMINED (filtered-out
+        # entries included). The empty-batch path below skips the cursor forward
+        # past uninteresting activity, and it may only skip past entries the scan
+        # actually saw. Bounding that skip by the oplog tail instead loses events
+        # two ways: a write committing between the scan and the tail read is
+        # counted by the tail but was never seen, and the tail is the highest seq
+        # *minted* — a writer bumps it before committing its batch, so it can name
+        # an entry no reader can see yet. Either way the cursor steps over that
+        # event and no later poll returns it. A change stream silently dropping an
+        # event is data loss, not a hiccup; it surfaced as the admin-UI ws test
+        # waiting forever for an insert that was never coming.
+        rows, scan_high = storage.read_oplog_scan(
+            start_seq=entry.position_seq + 1, limit=200, ns_filter=_ns_filter
+        )
         if not rows:
             # No new MATCHING oplog entries since last poll. If the oplog as a
             # whole has moved on (writes on other collections, periodic noop
@@ -4424,9 +4437,8 @@ def _aggregate_change_stream(
             # delivered (mongocxx's "continuously track the last seen
             # resumeToken" asserts the post-exhaustion token equals the last
             # doc's token).
-            tail_seq = storage.oplog_tail_seq()
-            if tail_seq > entry.position_seq:
-                entry.position_seq = tail_seq
+            if scan_high > entry.position_seq:
+                entry.position_seq = scan_high
                 ts = storage.current_cluster_time()
                 entry.last_token = changestreams.make_resume_token(
                     changestreams.ResumeTokenData(entry.position_seq, ts, ns, {})
