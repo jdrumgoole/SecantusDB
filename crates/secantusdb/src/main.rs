@@ -142,7 +142,10 @@ fn run(cli: CliArgs) -> Result<(), String> {
     );
     let mut storage = Storage::open_with_config(&cli.storage_path, &wt)
         .map_err(|e| format!("failed to open storage at {}: {e:?}", cli.storage_path))?;
-    storage.set_enable_oplog(true);
+    // SECANTUS_DISABLE_OPLOG=1 turns oplog emission off entirely (no change
+    // streams / PITR — the "drop the oplog for ~2× multi-writer throughput"
+    // lever from docs/concurrency.md, previously embedded-only).
+    storage.set_enable_oplog(std::env::var_os("SECANTUS_DISABLE_OPLOG").is_none());
     // Oplog retention window + hard entry cap (--oplog-retention-seconds /
     // --oplog-max-entries). Retention is seconds; truncate the float.
     storage.set_oplog_retention_seconds(cli.oplog_retention_seconds as i64);

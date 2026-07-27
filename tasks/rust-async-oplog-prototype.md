@@ -1,5 +1,16 @@
 # Async / decoupled oplog — prototype (2026-07-25)
 
+> **2026-07-27 update:** the "~1.4× is the honest ceiling" conclusion below is
+> superseded — it holds only for a WAL-logged oplog. Stacking
+> `SECANTUS_OPLOG_NONLOGGED=1` (oplog + preimage tables created
+> `log=(enabled=false)`) on async removes the drainer's WAL volume from the
+> writers' path and reaches **2.2× of sync at 8 writers** (daemon vehicle,
+> 56k → 125k docs/s; no-oplog ceiling 191k). The drainer also now coalesces
+> queued batches into one WT transaction (on by default,
+> `SECANTUS_OPLOG_ASYNC_COALESCE=0` to disable; ~2–6% additive). See
+> `tasks/rust-perf-findings.md` Finding 9 for the full matrix + durability
+> shape.
+
 Status: **working prototype, opt-in, measured**. Gated behind
 `SECANTUS_OPLOG_ASYNC=1` (default off = the synchronous, atomic oplog). This is the
 "transformative lever" flagged in `rust-perf-findings.md` Finding 5.
