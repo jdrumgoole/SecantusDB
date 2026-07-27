@@ -672,3 +672,63 @@ This is the last cheap broad compiler lever. Beyond it the remaining latency
 levers are workload-specific engineering (6b streaming aggregation for the
 `aggregate_multistage` residual; writev scan→socket for `find_all`), i.e.
 diminishing returns — writes now beat mongod and aggregates are at/near parity.
+
+## Finding 9 — async + NON-LOGGED oplog stacks to 2.2× multi-writer; the WAL was the majority of the async residual (2026-07-27)
+
+Finding 5 measured non-logged oplog tables in **sync** mode (+14–24%) and called
+the WAL "the minor part"; the async-prototype doc then pinned async's sustainable
+ceiling at ~½ the no-oplog rate ("a logical write needs a data write and an oplog
+write"). Measuring the **combination** shows both models understated the WAL's
+share *in async mode*: with the drainer's oplog writes going to non-logged tables
+(`SECANTUS_OPLOG_NONLOGGED=1`, tables created `log=(enabled=false)`), the oplog's
+WAL volume leaves the writers' path entirely and the 8-writer rate jumps ~40%
+past plain async.
+
+Vehicle: `bench.concurrency --server rust` (standalone `secantusd-rs` daemon,
+cache 1G, 8 KiB docs, `insert_many` batch 100, per-writer collections), 15 s
+runs, 3 reps interleaved per arm, medians; box quiesced (reps agree within ~2%).
+Numbers are daemon-vehicle, so they sit above the embedded-server figures in
+Finding 5 / the prototype doc:
+
+| arm (8 writers) | docs/s | ×sync |
+|---|---:|:---:|
+| sync oplog (default) | 56.3k | 1.00× |
+| async (`SECANTUS_OPLOG_ASYNC=1`) | 87.8k | 1.56× |
+| async + drainer coalescing | 89.4k | 1.59× |
+| **async + coalescing + non-logged oplog** | **125.1k** | **2.22×** |
+| sync + non-logged | 58.4k | 1.04× |
+| no oplog (ceiling, `SECANTUS_DISABLE_OPLOG=1`) | 191.1k | 3.39× |
+
+Reading: in sync mode non-logging buys ~4% (the writer still pays the shared
+oplog btree append inside its transaction — contention, not log volume, binds).
+In async mode the btree contention is already gone (background drainer, sharded
+btrees), so what remained *was* largely the oplog's WAL bandwidth competing with
+the writers' data WAL — remove it and throughput lands at ~65% of the no-oplog
+ceiling. Single-writer also gains: ~26k sync → ~49k under the stack (~1.9×), the
+inline oplog write leaving the one writer's critical path. Drainer coalescing
+(several queued batches per WT transaction, capped 32 batches / 16 MB) is a
+small additive win (~1–6%) and is on by default in async mode
+(`SECANTUS_OPLOG_ASYNC_COALESCE=0` to disable).
+
+A second quiesced confirmation round reproduced the shape (sync 8w 44.9–45.9k;
+async+non-logged 8w 113–117k with coalesce ≈ without + ~1–3%; 1w 26.6k sync vs
+49.5k stack) — so the stack's 8-writer gain is **2.2–2.6× of the sync default**
+across the two rounds. Two negative results from the same round: WT log
+pre-allocation (`log=(file_max=512MB,prealloc=true)`) does **not** add on top of
+the stack (its one clean rep landed *below* plain stack, ~100k vs ~115k — with
+the oplog non-logged the WAL volume is halved, so Finding 6's +8% prealloc lever
+loses its target; not recommended with the stack), and coalescing remains
+optional-but-default. Measurement note: two runs in this session were destroyed
+by *disk*-side interference at low CPU load (a parallel session's full pytest
+suite; an unattributed ~3-min I/O stall) — a load-average gate alone does not
+protect 8 KiB-doc write benchmarks; interleave arms and take medians across
+reps, discarding collapsed windows (collapsed = ~10× down, unmistakable).
+
+Durability shape of the stack (all opt-in, defaults unchanged): async alone
+loses only the un-drained in-memory queue on hard crash; + non-logged also loses
+drained-but-un-checkpointed oplog rows (checkpoint-durable oplog). Data tables
+stay fully logged in every mode; a clean close flushes the drainer and
+checkpoints, preserving the whole oplog. Change streams validated exactly-once
+under the full stack (6 concurrent writers × 500 inserts, cluster-wide watch: 0
+dups, 0 missing). The daemon also gained `SECANTUS_DISABLE_OPLOG=1` so the
+"drop the oplog" lever is reachable without the embedded API.

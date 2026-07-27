@@ -189,16 +189,28 @@ SecantusDB, the levers are:
    client side; server-side cost is unchanged.
 5. **Async oplog (Rust server, opt-in, experimental).** Set
    `SECANTUS_OPLOG_ASYNC=1` to move oplog writes off the writer's
-   critical path onto a background drainer — ~1.4× multi-writer write
+   critical path onto a background drainer — ~1.6× multi-writer write
    throughput while keeping change streams (validated exactly-once
    under concurrency). Trade: the oplog is no longer atomic with the
    data, so a hard crash loses entries the drainer hadn't yet written
    (the data itself stays fully durable; a clean shutdown flushes the
    drainer). Bounded by `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (default
-   128 MB). Default off; see the Rust-server notes for the ceiling
-   analysis (a parallel drainer pool does *not* help — WiredTiger's
-   aggregate write throughput is the shared limit).
-6. **WiredTiger config tuning (Rust server / daemon).**
+   128 MB). The drainer coalesces queued batches into one WiredTiger
+   transaction (`SECANTUS_OPLOG_ASYNC_COALESCE=0` disables). Default
+   off.
+6. **Non-logged oplog tables (Rust server, opt-in).** Set
+   `SECANTUS_OPLOG_NONLOGGED=1` (at first open of a fresh store) to
+   create the oplog + pre-image tables with WAL logging disabled: the
+   oplog becomes checkpoint-durable only — a hard crash loses the
+   oplog tail since the last checkpoint (change-stream resume / PITR
+   granularity), while the data tables stay fully logged and durable;
+   a clean shutdown checkpoints a complete oplog. Alone it buys little
+   (~4% in sync mode), but **stacked with the async oplog it removes
+   the oplog's WAL volume from the writers' path entirely: ~2.2× the
+   default 8-writer throughput** (measured 56k → 125k docs/s of 8 KiB
+   documents, against a ~191k no-oplog ceiling), and ~1.9× a single
+   writer. Change streams remain exactly-once under the stack.
+7. **WiredTiger config tuning (Rust server / daemon).**
    `SECANTUS_WT_CONFIG_EXTRA` appends raw WT connection config
    (last-key-wins). Log pre-allocation
    (`log=(file_max=512MB,prealloc=true)`) lifts the write ceiling
@@ -206,10 +218,12 @@ SecantusDB, the levers are:
    throughput notably. Each trades disk or memory; measured gains are
    modest (~10%).
 
-The honest ceiling: for oplog-backed multi-writer throughput the limit
-is WiredTiger's own aggregate write rate on a single embedded process —
-the levers above buy ~10–40%, but sustained multi-writer scaling beyond
-that means running a real `mongod` (or dropping the oplog entirely).
+The honest ceiling: for a fully-durable, WAL-logged oplog the limit is
+WiredTiger's aggregate write rate on a single embedded process. The
+async + non-logged stack (levers 5+6) trades crash-durability of the
+oplog *tail* for ~2.2× and gets within ~65% of the no-oplog ceiling;
+past that, sustained multi-writer scaling means running a real
+`mongod` (or dropping the oplog entirely).
 
 ## What we tried, what didn't work
 

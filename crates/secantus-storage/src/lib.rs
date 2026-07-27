@@ -405,6 +405,27 @@ fn oplog_shard_name(shard: i64) -> String {
     format!("table:secantus_oplog_sh{shard}")
 }
 
+/// `SECANTUS_OPLOG_NONLOGGED=1` creates the oplog + preimage tables with WAL
+/// logging disabled (`log=(enabled=false)`): oplog rows become checkpoint-durable
+/// only — a hard crash loses the tail written since the last checkpoint (data
+/// tables stay fully logged; a clean close checkpoints everything). This removes
+/// the oplog's share of WAL bandwidth, the dominant write-path cost under
+/// concurrent load (`tasks/rust-perf-findings.md` Finding 5). Applies at table
+/// CREATE time — an existing store keeps whatever its tables were created with.
+fn oplog_tables_nonlogged() -> bool {
+    std::env::var_os("SECANTUS_OPLOG_NONLOGGED").is_some()
+}
+
+/// Table-create config for the oplog shard / legacy-oplog / preimage tables,
+/// honouring [`oplog_tables_nonlogged`].
+fn oplog_table_cfg() -> String {
+    if oplog_tables_nonlogged() {
+        format!("{QU_COMPRESSED_CFG},log=(enabled=false)")
+    } else {
+        QU_COMPRESSED_CFG.to_string()
+    }
+}
+
 /// The shard table a batch starting at `start_seq` is routed to. `rem_euclid`
 /// keeps it correct for any i64 (seqs are always >= 1 in practice, but never
 /// route to a negative index).
@@ -901,8 +922,8 @@ const BOOTSTRAP: &[(&str, &str)] = &[
         "table:secantus_natural_seq",
         "key_format=SSu,value_format=q",
     ),
-    ("table:secantus_oplog", QU_COMPRESSED_CFG),
-    ("table:secantus_preimages", QU_COMPRESSED_CFG),
+    // NOTE: table:secantus_oplog + table:secantus_preimages are created in
+    // `open_with_config_durable` (their config depends on `oplog_table_cfg()`).
     ("table:secantus_oplog_meta", "key_format=S,value_format=u"),
     ("table:secantus_users", "key_format=SS,value_format=u"),
     ("table:secantus_roles", "key_format=SS,value_format=u"),
@@ -2176,13 +2197,110 @@ fn persist_and_record(
     None
 }
 
+/// Write a coalesced group of batches (possibly spanning several of this
+/// drainer's shards) in ONE WT transaction. One cursor per distinct shard.
+fn write_drain_batches(session: &Session, batches: &[DrainBatch]) -> Result<()> {
+    session.begin_transaction(None)?;
+    let res = (|| -> Result<()> {
+        let mut curs: HashMap<&str, Cursor> = HashMap::new();
+        let mut pre_cur: Option<Cursor> = None;
+        for batch in batches {
+            let cur = match curs.entry(batch.shard.as_str()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(session.open_cursor(&batch.shard, None)?)
+                }
+            };
+            for (i, blob) in batch.blobs.iter().enumerate() {
+                let seq = batch.start_seq + i as i64;
+                cur.reset()?;
+                cur.set_key_q(seq);
+                cur.set_value_u(blob);
+                cur.insert()?;
+                if let Some(pre) = &batch.preimages[i] {
+                    if pre_cur.is_none() {
+                        pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
+                    }
+                    let pc = pre_cur.as_ref().unwrap();
+                    pc.reset()?;
+                    pc.set_key_q(seq);
+                    pc.set_value_u(pre);
+                    pc.insert()?;
+                }
+            }
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => session.commit_transaction(None).map_err(Into::into),
+        Err(e) => {
+            let _ = session.rollback_transaction(None);
+            Err(e)
+        }
+    }
+}
+
+/// Persist a coalesced group in one transaction; on success release + record every
+/// batch (one lock acquisition, one notify). On failure fall back to per-batch
+/// writes so a single poison batch can't hold the rest hostage; per-batch failures
+/// land in `retry`.
+fn persist_group(
+    session: &Session,
+    shared: &DrainerShared,
+    group: Vec<DrainBatch>,
+    retry: &mut Vec<DrainBatch>,
+) {
+    if group.len() == 1 {
+        let b = group.into_iter().next().unwrap();
+        if let Some(b) = persist_and_record(session, shared, b) {
+            retry.push(b);
+        }
+        return;
+    }
+    match write_drain_batches(session, &group) {
+        Ok(()) => {
+            let bytes: usize = group.iter().map(|b| b.bytes).sum();
+            let advanced = {
+                let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
+                let mut adv = false;
+                for b in &group {
+                    adv |= advance_written_seq(&mut st, b.start_seq, b.blobs.len() as i64);
+                }
+                adv
+            };
+            shared.backpressure.release(bytes);
+            if advanced {
+                shared.oplog_cv.notify_all();
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "secantus-storage: async oplog coalesced drain failed: {e:?} (retrying per-batch)"
+            );
+            for b in group {
+                if let Some(b) = persist_and_record(session, shared, b) {
+                    retry.push(b);
+                }
+            }
+        }
+    }
+}
+
+/// Coalescing caps: stop greedily pulling more queued batches into one drain
+/// transaction past this many batches / bytes. Bounds both transaction size (WT
+/// txn memory) and the visibility latency a coalesced commit adds.
+const COALESCE_MAX_BATCHES: usize = 32;
+const COALESCE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// One drainer thread of the pool. It owns a disjoint subset of the oplog shards
 /// (routing guarantees it only receives batches for its shards), so it writes each
 /// batch immediately — no reorder needed; global seq contiguity is reconstructed
-/// across all drainers by `advance_written_seq`'s completion tracker. A batch whose
-/// write fails is retried on the next iteration (bounded in-thread buffer). On
-/// `Shutdown` it drains everything still queued before returning, so a clean close
-/// checkpoints a complete oplog.
+/// across all drainers by `advance_written_seq`'s completion tracker. When the
+/// queue is deep it coalesces up to [`COALESCE_MAX_BATCHES`] queued batches into
+/// one WT transaction (fewer commits — disable with
+/// `SECANTUS_OPLOG_ASYNC_COALESCE=0`). A batch whose write fails is retried on the
+/// next iteration (bounded in-thread buffer). On `Shutdown` it drains everything
+/// still queued before returning, so a clean close checkpoints a complete oplog.
 fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
     let session = match shared.conn.open_session() {
         Ok(s) => s,
@@ -2191,6 +2309,9 @@ fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
             return;
         }
     };
+    let coalesce = std::env::var("SECANTUS_OPLOG_ASYNC_COALESCE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     // Batches whose write failed, retried before processing new messages.
     let mut retry: Vec<DrainBatch> = Vec::new();
     let mut shutting_down = false;
@@ -2212,9 +2333,24 @@ fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
         };
         match msg {
             Some(DrainMsg::Batch(b)) => {
-                if let Some(b) = persist_and_record(&session, &shared, b) {
-                    retry.push(b);
+                let mut group = vec![b];
+                if coalesce {
+                    let mut bytes = group[0].bytes;
+                    while group.len() < COALESCE_MAX_BATCHES && bytes < COALESCE_MAX_BYTES {
+                        match rx.try_recv() {
+                            Ok(DrainMsg::Batch(nb)) => {
+                                bytes += nb.bytes;
+                                group.push(nb);
+                            }
+                            Ok(DrainMsg::Shutdown) => {
+                                shutting_down = true;
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 }
+                persist_group(&session, &shared, group, &mut retry);
             }
             Some(DrainMsg::Shutdown) => shutting_down = true,
             // recv error (sender dropped) or, while shutting down, queue drained.
@@ -2609,10 +2745,14 @@ impl Storage {
                 boot.create(name, fmt)?;
             }
             // The oplog is sharded across OPLOG_SHARDS btrees to spread append
-            // contention (see OPLOG_SHARDS); the legacy single table above stays
-            // in BOOTSTRAP so a pre-shard store's entries remain readable.
+            // contention (see OPLOG_SHARDS); the legacy single table stays
+            // so a pre-shard store's entries remain readable. Config honours
+            // SECANTUS_OPLOG_NONLOGGED (see `oplog_table_cfg`).
+            let opcfg = oplog_table_cfg();
+            boot.create(OPLOG_TABLE, &opcfg)?;
+            boot.create(PREIMAGE_TABLE, &opcfg)?;
             for s in 0..OPLOG_SHARDS {
-                boot.create(&oplog_shard_name(s), QU_COMPRESSED_CFG)?;
+                boot.create(&oplog_shard_name(s), &opcfg)?;
             }
             // The documents table is sharded per collection (see DOC_SHARDS); the
             // legacy single table above stays in BOOTSTRAP so a pre-shard store's
