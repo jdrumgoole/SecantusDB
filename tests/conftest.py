@@ -30,6 +30,43 @@ import pytest
 # pytest's rootdir/import-mode.
 sys.path.insert(0, os.path.dirname(__file__))
 
+
+def _patch_xdist_loadscope_worker_restart() -> None:
+    """Work around a pytest-xdist loadgroup/loadscope crash-recovery bug.
+
+    Under ``--dist=loadgroup`` (which we use for the driver-smoke / crash-watchdog
+    ``xdist_group`` markers), when a worker dies and xdist spins up a replacement,
+    the loadscope scheduler can call ``_reschedule`` on the new worker *before* it
+    has registered its collection. ``_assign_work_unit`` then does
+    ``self.registered_collections[node]`` → ``KeyError`` → the whole session
+    aborts with ``INTERNALERROR``. Observed on macOS as an intermittent worker
+    death (SIGKILL — empty faulthandler, no OOM) turning a recoverable blip into a
+    full run failure; CI on Linux runners never hit it.
+
+    Guard ``_reschedule`` so a not-yet-collected node is skipped until it
+    registers; ``remove_node`` has already re-queued the downed worker's tests, so
+    they run on the replacement once it collects. A pure no-op unless a worker
+    actually crashes. Still needed as of pytest-xdist 3.8.0 (the latest).
+    """
+    try:
+        from xdist.scheduler.loadscope import LoadScopeScheduling
+    except Exception:
+        return
+    orig = LoadScopeScheduling._reschedule
+    if getattr(orig, "_secantus_guarded", False):
+        return
+
+    def _reschedule(self, node):  # type: ignore[no-untyped-def]
+        if node not in self.registered_collections:
+            return
+        return orig(self, node)
+
+    _reschedule._secantus_guarded = True  # type: ignore[attr-defined]
+    LoadScopeScheduling._reschedule = _reschedule
+
+
+_patch_xdist_loadscope_worker_restart()
+
 # Fast test-mode storage (I2a): default every on-disk ``Storage`` /
 # ``SecantusDBServer`` that doesn't ask otherwise to ``durable=False`` — journal
 # off, no close-checkpoint. Cuts per-instance open+close ~5x and removes the
