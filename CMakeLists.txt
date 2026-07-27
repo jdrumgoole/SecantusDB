@@ -407,11 +407,23 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
     #   * `SECANTUS_PGO_DISABLE=1` turns PGO off entirely (escape hatch).
     set(SERVER_PGO_GZ ${CMAKE_CURRENT_SOURCE_DIR}/crates/pgo/_secantus_server.profdata.tar.gz)
     set(SERVER_ENV_EXTRA)
+    # The PGO branches below hand cargo a RUSTFLAGS via `cmake -E env`, which
+    # REPLACES the ambient value — but the wheel builds rely on ambient
+    # RUSTFLAGS (cibuildwheel's Linux env sets `-Ctarget-feature=-crt-static`,
+    # without which the musllinux target cannot produce a cdylib at all). So
+    # compose: ambient flags first, PGO flags appended. An empty ambient value
+    # composes to exactly the old behaviour.
+    if(DEFINED ENV{RUSTFLAGS} AND NOT "$ENV{RUSTFLAGS}" STREQUAL "")
+        set(SERVER_AMBIENT_RUSTFLAGS "$ENV{RUSTFLAGS} ")
+    else()
+        set(SERVER_AMBIENT_RUSTFLAGS "")
+    endif()
     if(DEFINED ENV{SECANTUS_PGO_DISABLE})
         message(STATUS "PGO disabled for _secantus_server (SECANTUS_PGO_DISABLE set)")
     elseif(DEFINED ENV{SECANTUS_PGO_GENERATE})
         message(STATUS "PGO: instrumenting _secantus_server (profile-generate)")
-        list(APPEND SERVER_ENV_EXTRA "RUSTFLAGS=-Cprofile-generate=$ENV{SECANTUS_PGO_GENERATE}")
+        list(APPEND SERVER_ENV_EXTRA
+            "RUSTFLAGS=${SERVER_AMBIENT_RUSTFLAGS}-Cprofile-generate=$ENV{SECANTUS_PGO_GENERATE}")
     elseif(EXISTS ${SERVER_PGO_GZ})
         # Extract the committed sparse profile at configure time (cmake -E tar
         # handles gzip cross-platform — no gzip/python dependency).
@@ -423,7 +435,7 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
         if(_pgo_extract_rc EQUAL 0 AND EXISTS ${SERVER_TARGET_DIR}/pgo/_secantus_server.profdata)
             message(STATUS "PGO: using committed profile for _secantus_server")
             list(APPEND SERVER_ENV_EXTRA
-                "RUSTFLAGS=-Cprofile-use=${SERVER_TARGET_DIR}/pgo/_secantus_server.profdata -Cllvm-args=-pgo-warn-missing-function")
+                "RUSTFLAGS=${SERVER_AMBIENT_RUSTFLAGS}-Cprofile-use=${SERVER_TARGET_DIR}/pgo/_secantus_server.profdata -Cllvm-args=-pgo-warn-missing-function")
         else()
             message(WARNING "PGO: could not extract ${SERVER_PGO_GZ}; building without PGO")
         endif()
