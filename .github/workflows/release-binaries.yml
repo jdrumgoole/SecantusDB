@@ -159,12 +159,27 @@ jobs:
           # (EXC_BAD_ACCESS at startup). Profiling with the system allocator is
           # fine — the profile is a hint and the app hot paths are identical; the
           # optimized stage-3 build below restores mimalloc (default features).
-          RUSTFLAGS="-Cprofile-generate=$profraw" \
+          #
+          # arm64-macOS only: use LLVM CONTINUOUS profiling mode. On that runner
+          # the profiling runtime's atexit `.profraw` write does not fire under
+          # the SIGTERM shutdown below (Linux flushes normally; an explicit
+          # __llvm_profile_write_file didn't help), so the merge found no profile.
+          # Continuous mode (`-runtime-counter-relocation` + `%c` in the profile
+          # filename) mmaps the counters straight to the file, so a
+          # signal-terminated process still leaves a valid profile on disk. Linux
+          # keeps its (working) default at-exit flush.
+          gen_extra=""
+          prof_marker=""
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            gen_extra=" -Cllvm-args=-runtime-counter-relocation"
+            prof_marker="%c"
+          fi
+          RUSTFLAGS="-Cprofile-generate=$profraw$gen_extra" \
             cargo build --release --locked --no-default-features --features pgo-instrument --target "$target" --manifest-path "$manifest"
 
           echo "=== PGO stage 2: run the instrumented binary + drive the workloads ==="
           datadir=$(mktemp -d)
-          LLVM_PROFILE_FILE="$profraw/pgo-%p-%m.profraw" \
+          LLVM_PROFILE_FILE="$profraw/pgo-%p-%m${prof_marker}.profraw" \
             "$bin" --port 0 --storage-path "$datadir" > pgo-server.log 2>&1 &
           srvpid=$!
           addr=""
