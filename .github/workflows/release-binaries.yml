@@ -160,7 +160,7 @@ jobs:
           # fine — the profile is a hint and the app hot paths are identical; the
           # optimized stage-3 build below restores mimalloc (default features).
           RUSTFLAGS="-Cprofile-generate=$profraw" \
-            cargo build --release --locked --no-default-features --target "$target" --manifest-path "$manifest"
+            cargo build --release --locked --no-default-features --features pgo-instrument --target "$target" --manifest-path "$manifest"
 
           echo "=== PGO stage 2: run the instrumented binary + drive the workloads ==="
           datadir=$(mktemp -d)
