@@ -151,45 +151,57 @@ jobs:
           bin="crates/secantusdb/target/$target/release/secantusd-rs"
           profraw="$PWD/pgo-raw"; rm -rf "$profraw"; mkdir -p "$profraw"
 
-          echo "=== PGO stage 1: instrumented build (system allocator) ==="
-          # --no-default-features drops mimalloc for the INSTRUMENTED stage only.
-          # Instrumenting mimalloc's allocator internals crashes on arm64 macOS:
-          # __llvm_profile_instrument_target runs inside mimalloc's first page
-          # allocation and re-enters the half-initialized global allocator
-          # (EXC_BAD_ACCESS at startup). Profiling with the system allocator is
-          # fine — the profile is a hint and the app hot paths are identical; the
-          # optimized stage-3 build below restores mimalloc (default features).
-          RUSTFLAGS="-Cprofile-generate=$profraw" \
-            cargo build --release --locked --no-default-features --features pgo-instrument --target "$target" --manifest-path "$manifest"
-
-          echo "=== PGO stage 2: run the instrumented binary + drive the workloads ==="
-          datadir=$(mktemp -d)
-          LLVM_PROFILE_FILE="$profraw/pgo-%p-%m.profraw" \
-            "$bin" --port 0 --storage-path "$datadir" > pgo-server.log 2>&1 &
-          srvpid=$!
-          addr=""
-          for _ in $(seq 1 120); do
-            addr=$(grep -oE 'listening on [0-9.]+:[0-9]+' pgo-server.log | head -1 | awk '{print $3}') || true
-            [ -n "$addr" ] && break
-            sleep 0.5
-          done
-          if [ -z "$addr" ]; then
-            echo "::error::instrumented binary never printed a listening address"; cat pgo-server.log; exit 1
-          fi
-          uv run --no-project --with pymongo python -m bench.pgo_workload --uri "mongodb://$addr"
-          kill -TERM "$srvpid" 2>/dev/null || true
-          wait "$srvpid" 2>/dev/null || true
-
-          echo "=== PGO: merge profile ==="
-          profdata_tool="$(rustc --print sysroot)/lib/rustlib/$target/bin/llvm-profdata"
-          [ -x "$profdata_tool" ] || profdata_tool=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata | head -1)
-          merged="$profraw/merged.profdata"
-          "$profdata_tool" merge --sparse -o "$merged" "$profraw"/*.profraw
-          echo "profile size: $(du -h "$merged" | cut -f1)"
-
-          echo "=== PGO stage 3: optimized build (profile-use) ==="
-          RUSTFLAGS="-Cprofile-use=$merged -Cllvm-args=-pgo-warn-missing-function" \
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            # arm64-macOS: plain thin-LTO + mimalloc release build — NO on-target
+            # PGO. The two-stage on-target PGO is unusable on the macos-14 runner:
+            # instrumenting mimalloc segfaults at startup, and with mimalloc
+            # dropped the profiling runtime writes no usable profile under the
+            # workflow's SIGTERM shutdown (atexit doesn't fire; an explicit
+            # __llvm_profile_write_file and LLVM continuous mode both produced an
+            # unmergeable profile). The shipped binary keeps mimalloc + LTO; only
+            # the PGO increment (~12-19%) is lost on this one artifact — the macOS
+            # *wheel* keeps full PGO via its committed profile.
+            echo "=== macOS: plain LTO + mimalloc release build (no on-target PGO) ==="
             cargo build --release --locked --target "$target" --manifest-path "$manifest"
+          else
+            # Linux: two-stage on-target PGO. The instrumented stage builds with
+            # the system allocator (--no-default-features drops mimalloc) — a
+            # habit carried from the macOS mimalloc-instrumentation crash; the
+            # profile is a hint so the allocator swap is harmless — and its atexit
+            # flush writes the profile normally here.
+            echo "=== PGO stage 1: instrumented build (system allocator) ==="
+            RUSTFLAGS="-Cprofile-generate=$profraw" \
+              cargo build --release --locked --no-default-features --target "$target" --manifest-path "$manifest"
+
+            echo "=== PGO stage 2: run the instrumented binary + drive the workloads ==="
+            datadir=$(mktemp -d)
+            LLVM_PROFILE_FILE="$profraw/pgo-%p-%m.profraw" \
+              "$bin" --port 0 --storage-path "$datadir" > pgo-server.log 2>&1 &
+            srvpid=$!
+            addr=""
+            for _ in $(seq 1 120); do
+              addr=$(grep -oE 'listening on [0-9.]+:[0-9]+' pgo-server.log | head -1 | awk '{print $3}') || true
+              [ -n "$addr" ] && break
+              sleep 0.5
+            done
+            if [ -z "$addr" ]; then
+              echo "::error::instrumented binary never printed a listening address"; cat pgo-server.log; exit 1
+            fi
+            uv run --no-project --with pymongo python -m bench.pgo_workload --uri "mongodb://$addr"
+            kill -TERM "$srvpid" 2>/dev/null || true
+            wait "$srvpid" 2>/dev/null || true
+
+            echo "=== PGO: merge profile ==="
+            profdata_tool="$(rustc --print sysroot)/lib/rustlib/$target/bin/llvm-profdata"
+            [ -x "$profdata_tool" ] || profdata_tool=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata | head -1)
+            merged="$profraw/merged.profdata"
+            "$profdata_tool" merge --sparse -o "$merged" "$profraw"/*.profraw
+            echo "profile size: $(du -h "$merged" | cut -f1)"
+
+            echo "=== PGO stage 3: optimized build (profile-use) ==="
+            RUSTFLAGS="-Cprofile-use=$merged -Cllvm-args=-pgo-warn-missing-function" \
+              cargo build --release --locked --target "$target" --manifest-path "$manifest"
+          fi
           strip "$bin" || true
           echo "BIN=$bin" >> "$GITHUB_ENV"
           "$bin" --version
