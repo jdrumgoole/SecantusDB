@@ -151,9 +151,16 @@ jobs:
           bin="crates/secantusdb/target/$target/release/secantusd-rs"
           profraw="$PWD/pgo-raw"; rm -rf "$profraw"; mkdir -p "$profraw"
 
-          echo "=== PGO stage 1: instrumented build ==="
+          echo "=== PGO stage 1: instrumented build (system allocator) ==="
+          # --no-default-features drops mimalloc for the INSTRUMENTED stage only.
+          # Instrumenting mimalloc's allocator internals crashes on arm64 macOS:
+          # __llvm_profile_instrument_target runs inside mimalloc's first page
+          # allocation and re-enters the half-initialized global allocator
+          # (EXC_BAD_ACCESS at startup). Profiling with the system allocator is
+          # fine — the profile is a hint and the app hot paths are identical; the
+          # optimized stage-3 build below restores mimalloc (default features).
           RUSTFLAGS="-Cprofile-generate=$profraw" \
-            cargo build --release --locked --target "$target" --manifest-path "$manifest"
+            cargo build --release --locked --no-default-features --target "$target" --manifest-path "$manifest"
 
           echo "=== PGO stage 2: run the instrumented binary + drive the workloads ==="
           datadir=$(mktemp -d)

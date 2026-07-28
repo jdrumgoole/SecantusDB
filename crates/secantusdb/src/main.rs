@@ -9,6 +9,15 @@
 
 // Fast global allocator — BSON materialization drives heavy alloc churn
 // (tasks/rust-perf-findings.md, Finding 1); mimalloc cuts it across all paths.
+// Behind the default `mimalloc` feature so the PGO **instrumented** stage-1 build
+// can be built with `--no-default-features` (system allocator). Instrumenting
+// mimalloc's own allocator internals crashes on arm64 macOS: the LLVM profiling
+// counter update (`__llvm_profile_instrument_target`) runs *inside* mimalloc's
+// first page allocation and re-enters the half-initialized global allocator
+// (EXC_BAD_ACCESS). The optimized stage-3 build (and the shipped binary) keep
+// mimalloc; the collected profile is only a hint, so the allocator mismatch
+// between the stages is harmless.
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

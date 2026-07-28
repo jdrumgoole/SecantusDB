@@ -34,8 +34,14 @@ secantus-server = { path = "../secantus-server" }
 # --log-level: init a logger to the resolved level before storage opens.
 log = "0.4"
 env_logger = "0.11"
-# Fast allocator — same rationale as the embedded extension (Finding 1).
-mimalloc = "0.1"
+# Fast allocator — same rationale as the embedded extension (Finding 1). Optional
+# + default-on so the PGO instrumented build can opt out (`--no-default-features`)
+# to avoid instrumenting mimalloc's internals (see the `#[global_allocator]` note
+# in main.rs).
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+default = ["mimalloc"]
 
 # Cross-crate inlining of the hot serde/matcher/aggregate paths (matches the
 # embedded extension's profile).
