@@ -19,7 +19,98 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-## [0.6.0b2] — 2026-07-26
+## [0.6.0b2] — 2026-07-28
+
+### Rust server: 2.2× multi-writer throughput with the async + non-logged oplog stack
+
+The Rust server's concurrent-write ceiling was the oplog: every write paid a
+WAL-logged oplog append, holding 8-writer throughput to ~56k docs/s (sync
+default) or ~88k with the async-oplog prototype, against a ~191k no-oplog
+ceiling. Two new opt-in levers close most of that gap. Setting
+`SECANTUS_OPLOG_NONLOGGED=1` creates the oplog and pre-image tables with
+WiredTiger WAL logging disabled, so oplog rows are checkpoint-durable only — in
+async mode that removes the drainer's WAL volume from the writers' path and
+lifts 8-writer throughput to ~125k docs/s, 2.2× the sync default (and ~1.9× a
+single writer's async rate), while change streams stay exactly-once. The async
+drainer also now coalesces queued batches into one WiredTiger transaction (up
+to 32 batches / 16 MB; `SECANTUS_OPLOG_ASYNC_COALESCE=0` disables it). The
+durability trade is explicit and opt-in: a hard crash loses the oplog tail
+written since the last checkpoint (data tables stay fully logged and durable; a
+clean shutdown flushes and checkpoints a complete oplog). Defaults are
+unchanged — the synchronous, fully-logged oplog remains the out-of-the-box
+behaviour.
+
+#### Added
+
+- `SECANTUS_OPLOG_NONLOGGED=1` — create the oplog + preimage tables with
+  `log=(enabled=false)` (checkpoint-durable oplog; data unaffected). Applies at
+  table-create time on a fresh store.
+- Async-oplog drainer batch coalescing: queued `DrainBatch`es are written in a
+  single WT transaction (caps: 32 batches / 16 MB), on by default in async
+  mode; `SECANTUS_OPLOG_ASYNC_COALESCE=0` restores per-batch commits.
+- `SECANTUS_DISABLE_OPLOG=1` on `secantusd-rs` — run the daemon with oplog
+  emission off entirely (the "drop the oplog" throughput lever from
+  `docs/concurrency.md`, previously reachable only via the embedded API).
+
+### Lazy shard creation cuts Storage open cost ~2×, and a shutdown-hang fix
+
+Opening a store eagerly created all ~37 WiredTiger tables up front — 16
+per-collection document shards plus 16 oplog shards dominating — even for an
+ephemeral store that touches a single collection. At ~10.6 ms per WT `create`
+that is ~500 ms and 51 files per open, and under a highly parallel test run it
+saturated disk I/O badly enough to stall (workers stuck in uninterruptible I/O
+wait). Both servers now create shards **on demand**: a document shard is made on
+first creation of a collection that hashes to it, and an oplog shard on first
+write to it (the Python server, which never writes the sharded oplog, creates no
+oplog shards at all). A fresh store now creates ~13 base tables plus only the
+shards actually used, roughly halving open cost (open + one collection + insert
+dropped from ~500 ms to ~300 ms; 51 files → 20). Every read / scan / merge / drop
+/ rename / `$out` / delete path on both servers treats an absent shard as empty
+(Python `_cursor_optional`; Rust `WtError::is_missing_table`), so a store written
+with a subset of shards stays byte-compatible with an eager store and across
+servers for backup / PITR — a missing shard simply reads as empty.
+
+Separately, `Storage.close()` could hang forever inside WiredTiger's
+`WT_CONNECTION->close`: it joined the background TTL sweeper (on by default,
+`ttl_sweep_seconds=60`) with only a 2-second timeout and then tore WiredTiger
+down anyway, so under load — when a sweep outran the 2 s budget — it closed the
+sweeper's still-live WT session from the wrong thread and `conn.close()` blocked.
+It now joins the sweeper and heartbeat threads to completion before any
+WiredTiger teardown, and each loop closes its own thread-local session on exit.
+
+#### Changed
+
+- Both the Python and Rust servers create documents / oplog shard tables lazily
+  (on first write; the Python server creates no oplog shards at all) instead of
+  all ~37 eagerly at open, cutting Storage open cost ~2× and the per-open file
+  count from 51 to ~20. Read, scan, merge, drop, rename, `$out`, and delete paths
+  on both servers tolerate an absent shard, so the on-disk layout stays
+  cross-server byte-compatible (a missing shard reads empty).
+
+#### Fixed
+
+- `Storage.close()` no longer hangs in `WT_CONNECTION->close` when the TTL
+  sweeper or noop-heartbeat thread is active: the threads are joined to
+  completion before WiredTiger teardown, and each closes its own thread-local
+  WiredTiger session on exit rather than leaving it for a cross-thread close.
+
+#### Internal
+
+- Test harness: the session `_hang_watchdog` now routes its traceback to the
+  per-worker crash file (`SECANTUS_FAULTHANDLER_DIR`) and stays armed through
+  shutdown, so a shutdown-time wedge self-diagnoses instead of dying anonymously
+  as "node down". Hang timeout tunable via `SECANTUS_HANG_SECONDS`.
+
+#### Fixed
+
+- Wheel builds: the embedded extension's PGO wiring passed cargo a fresh
+  `RUSTFLAGS` (`-Cprofile-use=…`), clobbering the ambient flags cibuildwheel
+  sets for the Linux containers — `-Ctarget-feature=-crt-static`, without which
+  the musllinux target cannot produce a cdylib. Every manylinux/musllinux wheel
+  build since the PGO change failed with "cannot produce cdylib … does not
+  support these crate types". The PGO flags now append to the ambient
+  `RUSTFLAGS` instead of replacing them (an empty ambient value composes to the
+  previous behaviour, so macOS/Windows builds are unchanged).
 
 ### A much faster Rust server: mimalloc, thin LTO, and profile-guided optimization
 
