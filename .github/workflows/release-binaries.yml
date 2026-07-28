@@ -169,17 +169,21 @@ jobs:
           # signal-terminated process still leaves a valid profile on disk. Linux
           # keeps its (working) default at-exit flush.
           gen_extra=""
-          prof_marker=""
+          # Default (Linux): online-merge naming (`%m`) with the working at-exit
+          # flush. macOS: continuous mode — `%c`, and NOT `%m` (binary-signature
+          # online merging is a different, incompatible mode; combining them
+          # yields an unmergeable profile).
+          prof_file="$profraw/pgo-%p-%m.profraw"
           if [ "${{ matrix.os }}" = "macos" ]; then
             gen_extra=" -Cllvm-args=-runtime-counter-relocation"
-            prof_marker="%c"
+            prof_file="$profraw/pgo-%p%c.profraw"
           fi
           RUSTFLAGS="-Cprofile-generate=$profraw$gen_extra" \
             cargo build --release --locked --no-default-features --features pgo-instrument --target "$target" --manifest-path "$manifest"
 
           echo "=== PGO stage 2: run the instrumented binary + drive the workloads ==="
           datadir=$(mktemp -d)
-          LLVM_PROFILE_FILE="$profraw/pgo-%p-%m${prof_marker}.profraw" \
+          LLVM_PROFILE_FILE="$prof_file" \
             "$bin" --port 0 --storage-path "$datadir" > pgo-server.log 2>&1 &
           srvpid=$!
           addr=""
