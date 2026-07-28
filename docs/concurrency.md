@@ -137,6 +137,36 @@ Python server from ~2.9k to ~11.6k — the compounding effect of the raw-BSON
 serving path and RecordId keying. mongod's single-writer rate is unchanged
 (~110k), which is what validates the harness is measuring the same thing.
 
+### mongod pays for an oplog too
+
+One asymmetry in the chart above: the mongod it benchmarks is
+**standalone** — no replica set, so no oplog at all — while SecantusDB
+always maintains one (change streams need it). Charging mongod for the
+same feature changes the picture. `bench/mongod_replset_ab.py` runs the
+identical workload against a single-node replica set (medians of 3
+interleaved reps):
+
+| mongod configuration | 1 writer | 8 writers |
+|---|---:|---:|
+| standalone (no oplog) | 113.2k docs/s | 503k docs/s |
+| replica set, explicit `w:1` | 84.0k docs/s | 305k docs/s |
+| replica set, default write concern | 11.8k docs/s | 68.6k docs/s |
+
+The oplog double-write costs mongod −26% (1 writer) / −39% (8 writers) —
+the same structural tax SecantusDB pays, at about half the rate (its
+timestamp-slot oplog admits concurrent appends without the shared-append
+serialisation we shard around). The bigger surprise is the default-config
+row: since MongoDB 5.0 the implicit write concern is `w:majority`, and on
+a one-node set a majority ack waits for a journal fsync — a ÷7 cliff that
+dwarfs the oplog itself. So a single-node replica-set mongod *as people
+actually run it for change streams* writes at 11.8k / 68.6k docs/s on
+this hardware — slower than the Rust server's async + non-logged stack
+(49.5k / ~125k), though with stronger per-write durability (its
+acknowledged writes survive a hard crash; ours trade that per-ack fsync
+away everywhere). At equal write-concern semantics mongod's raw ingest
+path is still ~3× faster per writer; that residual is its C++ ingest
+machinery, not the oplog.
+
 ### Why disabling logging doesn't fix it
 
 A natural follow-up: maybe the journal is the serialiser. We tested
