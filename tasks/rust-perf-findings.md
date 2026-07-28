@@ -732,3 +732,44 @@ checkpoints, preserving the whole oplog. Change streams validated exactly-once
 under the full stack (6 concurrent writers × 500 inserts, cluster-wide watch: 0
 dups, 0 missing). The daemon also gained `SECANTUS_DISABLE_OPLOG=1` so the
 "drop the oplog" lever is reachable without the embedded API.
+
+## Finding 10 — mongod's OWN oplog tax, decomposed: the double-write costs it 26–39%, and its 5.0+ default write concern costs far more (2026-07-28)
+
+Every three-way benchmark in this repo spawns a **standalone** mongod — no
+replica set, no oplog — so mongod had never been charged for the thing that
+bounds SecantusDB's default write path. Measured it directly:
+`bench/mongod_replset_ab.py` runs the concurrency workload (8 KiB docs,
+`insert_many` batch 100, per-writer collections) against three mongod
+configurations, interleaved, medians of 3 quiesced reps (all reps within ~1%):
+
+| mongod arm | 1 writer | 8 writers |
+|---|---:|---:|
+| standalone (no oplog) | 113.2k | 503k |
+| single-node replset, explicit `w:1, journal:false` | 84.0k | 305k |
+| single-node replset, implicit default WC (`majority`) | 11.8k | 68.6k |
+
+Three conclusions:
+
+1. **mongod's pure oplog tax is −26% (1w) / −39% (8w)** — the `w:1` arm pays
+   the oplog double-write with no fsync wait, the closest semantic match to our
+   sync mode. Same structural cost we pay, at roughly half the rate: our sync
+   oplog costs −53% / −71% against our no-oplog ceiling on the same workload.
+   mongod's timestamp-slot oplog (concurrent appends into one collection with
+   an oplog-visibility point, no shared-append serialisation) is ~2× more
+   efficient than our sync path. Our async + non-logged stack retains 65% of
+   the ceiling at 8 writers — the same overhead ratio as mongod's 61% — reached
+   by relaxing tail durability instead of visibility engineering (Finding 9).
+
+2. **The dramatic cost is the write concern, not the oplog.** Since MongoDB 5.0
+   the implicit default is `w:majority`, and on a one-node set a majority ack
+   requires a journal fsync: 84k → 11.8k (÷7) at 1 writer, 305k → 68.6k (÷4.4)
+   at 8. ~8 ms of fsync latency per acknowledged batch dwarfs the double-write.
+
+3. **Defaults-vs-defaults, SecantusDB now wins this workload.** A single-node
+   replset mongod as people actually run it for change streams (implicit
+   majority WC) does 11.8k / 68.6k; the Rust server's async + non-logged stack
+   does 49.5k / 113–125k — ~4× / ~1.8× faster — at weaker per-write durability
+   (we never fsync per ack; mongod's majority ack survives a hard crash).
+   At equal semantics (their `w:1` vs our sync) mongod still wins raw ingest
+   ~3× (84k vs 26.6k single-writer): its C++ per-byte ingest path, not the
+   oplog, is the residual gap.
