@@ -6705,15 +6705,23 @@ impl Storage {
     /// (everything except its `secantus_collections` registry row). Shared by
     /// `drop_collection` / `drop_database` / `rename_collection`.
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
-        let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        for (recordid, _id_k, _blob) in self.scan_docs(session, db, coll)? {
-            doc_cur.reset()?;
-            doc_cur.set_key_ssq(db, coll, recordid);
-            match doc_cur.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
+        // Lazy shards: a collection whose shard was never written (dropping an
+        // empty / never-created collection — a no-op in MongoDB) has no doc rows
+        // to purge, so an absent shard is simply skipped.
+        match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(doc_cur) => {
+                for (recordid, _id_k, _blob) in self.scan_docs(session, db, coll)? {
+                    doc_cur.reset()?;
+                    doc_cur.set_key_ssq(db, coll, recordid);
+                    match doc_cur.remove() {
+                        Ok(()) => {}
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
             }
+            Err(e) if e.is_missing_table() => {}
+            Err(e) => return Err(e.into()),
         }
         for (name, _key_spec, _opts) in self.iter_indexes(session, db, coll)? {
             self.delete_entries_prefix(session, db, coll, &name)?;
