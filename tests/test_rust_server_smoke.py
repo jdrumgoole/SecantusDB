@@ -60,6 +60,39 @@ def test_pymongo_crud_against_rust_server(tmp_path) -> None:
         srv.stop()
 
 
+def test_ops_on_never_created_collections_are_noops(tmp_path) -> None:
+    """Every operation on a collection whose shard was never written must be a
+    clean no-op/empty result, not a WiredTiger "No such file" error.
+
+    Regression: lazy shard creation makes a collection's documents shard exist
+    only once written to, so read / drop / delete / aggregate paths must tolerate
+    an absent shard. ``drop()`` on a never-created collection in particular went
+    through ``purge_collection_tables``, which opened the (absent) shard cursor
+    and failed — caught only by the PGO release workload, whose first op is
+    exactly ``coll.drop()`` on a fresh collection.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0, host="127.0.0.1", replica_set_name="secantus")
+    try:
+        db = _client(srv)["fresh"]
+        # None of these has ever been written to → no shard exists yet.
+        db.a.drop()  # the op that broke the binary's PGO build
+        assert list(db.b.find({})) == []
+        assert list(db.c.find({"v": {"$gte": 1, "$lt": 5}})) == []
+        assert db.d.count_documents({}) == 0
+        assert db.e.estimated_document_count() == 0
+        assert db.f.distinct("x") == []
+        assert db.g.delete_many({"n": {"$lt": 5}}).deleted_count == 0
+        assert db.h.update_many({"n": {"$lt": 5}}, {"$set": {"t": 1}}).modified_count == 0
+        assert list(db.i.aggregate([{"$match": {"v": 1}}])) == []
+        assert list(db.j.aggregate([{"$group": {"_id": "$g", "n": {"$sum": 1}}}])) == []
+        assert db.k.find_one_and_update({"x": 1}, {"$set": {"y": 2}}) is None
+        # create an index, then drop the still-empty collection.
+        db.m.create_index("v")
+        db.m.drop()
+    finally:
+        srv.stop()
+
+
 def test_find_one_and_update_against_rust_server(tmp_path) -> None:
     """findAndModify via pymongo's find_one_and_update (old + new images)."""
     srv = _server.RustServer(str(tmp_path / "wt"), 0)
