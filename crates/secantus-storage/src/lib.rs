@@ -241,8 +241,15 @@ fn migrate_legacy_docs(session: &Session) -> Result<()> {
     // `scan_max_nat_seq` (run just after, in `load_oplog_meta`) recovers the
     // counter from the shards so freshly minted seqs stay strictly greater.
     let idx = session.open_cursor(NAT_SEQ_TABLE, None)?;
+    let mut made_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (recordid, (db, coll, id_key, blob)) in (1i64..).zip(&rows) {
-        let dst = session.open_cursor(&doc_table_for(db, coll), None)?;
+        let shard = doc_table_for(db, coll);
+        // Lazy shards: the target shard isn't created eagerly at open, so make it
+        // before folding a legacy row into it (idempotent per shard).
+        if made_shards.insert(shard.clone()) {
+            session.create(&shard, DOC_TABLE_CFG)?;
+        }
+        let dst = session.open_cursor(&shard, None)?;
         dst.set_key_ssq(db, coll, recordid);
         dst.set_value_u(&frame_doc_value(id_key, blob));
         dst.insert()?;
@@ -475,11 +482,23 @@ fn read_oplog_shards_tagged(
     // seq ranges across tables are disjoint (recovery clamps new seqs strictly
     // above any legacy seq), so a plain min-seq merge needs no dedup.
     let tables = oplog_all_tables();
-    let mut cursors: Vec<Cursor> = Vec::with_capacity(tables.len());
+    // `Option<Cursor>` per table so a lazily-absent shard keeps its slot (index
+    // alignment with `tables` / the returned shard index): a missing shard parks
+    // a `None` cursor whose head stays `None`, so it is never selected.
+    let mut cursors: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
     // Current head seq of each shard cursor, or None once exhausted.
     let mut heads: Vec<Option<i64>> = Vec::with_capacity(tables.len());
     for tbl in &tables {
-        let cur = session.open_cursor(tbl, None)?;
+        let cur = match session.open_cursor(tbl, None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => {
+                // Lazy shards: absent shard reads as empty; keep index alignment.
+                cursors.push(None);
+                heads.push(None);
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         cur.set_key_q(start_seq);
         let positioned = match cur.search_near() {
             Ok(cmp) => {
@@ -498,7 +517,7 @@ fn read_oplog_shards_tagged(
         } else {
             None
         });
-        cursors.push(cur);
+        cursors.push(Some(cur));
     }
     let mut out: Vec<(i64, usize, Vec<u8>)> = Vec::new();
     while out.len() < limit {
@@ -514,12 +533,14 @@ fn read_oplog_shards_tagged(
             }
         }
         let Some(i) = best else { break };
-        let blob = cursors[i].get_value_u()?;
+        // `heads[i]` is Some ⇒ this slot holds a real cursor.
+        let cur = cursors[i].as_ref().expect("selected shard has a cursor");
+        let blob = cur.get_value_u()?;
         if !blob.is_empty() {
             out.push((best_seq, i, blob));
         }
-        heads[i] = if cursors[i].next()? {
-            Some(cursors[i].get_key_q()?)
+        heads[i] = if cur.next()? {
+            Some(cur.get_key_q()?)
         } else {
             None
         };
@@ -2137,6 +2158,9 @@ fn spawn_oplog_drainer(
 fn write_drain_batch(session: &Session, batch: &DrainBatch) -> Result<()> {
     session.begin_transaction(None)?;
     let res = (|| -> Result<()> {
+        // Lazy shards: make this oplog shard on first write (idempotent create —
+        // a metadata check once it exists).
+        session.create(&batch.shard, &oplog_table_cfg())?;
         let cur = session.open_cursor(&batch.shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         for (i, blob) in batch.blobs.iter().enumerate() {
@@ -2208,6 +2232,8 @@ fn write_drain_batches(session: &Session, batches: &[DrainBatch]) -> Result<()> 
             let cur = match curs.entry(batch.shard.as_str()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
+                    // Lazy shards: make this oplog shard on first write (idempotent).
+                    session.create(&batch.shard, &oplog_table_cfg())?;
                     e.insert(session.open_cursor(&batch.shard, None)?)
                 }
             };
@@ -2751,15 +2777,17 @@ impl Storage {
             let opcfg = oplog_table_cfg();
             boot.create(OPLOG_TABLE, &opcfg)?;
             boot.create(PREIMAGE_TABLE, &opcfg)?;
-            for s in 0..OPLOG_SHARDS {
-                boot.create(&oplog_shard_name(s), &opcfg)?;
-            }
-            // The documents table is sharded per collection (see DOC_SHARDS); the
-            // legacy single table above stays in BOOTSTRAP so a pre-shard store's
-            // rows remain reachable for the one-time migration below.
-            for s in 0..DOC_SHARDS {
-                boot.create(&doc_shard_name(s), DOC_TABLE_CFG)?;
-            }
+            // The documents shards (DOC_SHARDS) and oplog shards (OPLOG_SHARDS) are
+            // NO LONGER created eagerly here. A documents shard is made on first
+            // creation of a collection that hashes to it (`ensure_collection`); an
+            // oplog shard is made on first write to it (the drain / emit path). This
+            // is the open-cost cut — a fresh store created ~37 tables, most unused by
+            // an ephemeral server; now only the base tables plus the shards actually
+            // touched. Every read / merge / scan path tolerates an absent shard
+            // (`is_not_found`), so a store written with a subset of shards stays
+            // byte-compatible with an eager store and with the Python server (a
+            // missing shard reads as empty). The legacy single tables above stay in
+            // BOOTSTRAP so a pre-shard store's rows remain reachable for migration.
             // Fail fast on a store whose doc shards predate the RecordId keying
             // change (`SSu` on disk vs the `SSq` this build needs): no in-place
             // upgrade, refuse to open rather than mis-read. WT `create` above
@@ -3127,7 +3155,10 @@ impl Storage {
         // instead of contending on one table's rightmost page (the scaling fix),
         // while each batch stays a contiguous sequential append to a single tree
         // (the locality that per-entry scatter destroyed). One cursor for the run.
-        let cur = session.open_cursor(&oplog_shard_for_batch(start), None)?;
+        let op_shard = oplog_shard_for_batch(start);
+        // Lazy shards: make this oplog shard on first write (idempotent create).
+        session.create(&op_shard, &oplog_table_cfg())?;
+        let cur = session.open_cursor(&op_shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         let wall_millis = now_millis();
         let wall = Bson::DateTime(bson::DateTime::from_millis(wall_millis));
@@ -3475,7 +3506,11 @@ impl Storage {
         let session = self.conn.open_session()?;
         let mut floor: Option<i64> = None;
         for s in 0..OPLOG_SHARDS {
-            let cur = session.open_cursor(&oplog_shard_name(s), None)?;
+            let cur = match session.open_cursor(&oplog_shard_name(s), None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() => continue, // lazy shards: absent = empty
+                Err(e) => return Err(e.into()),
+            };
             if cur.next()? {
                 let seq = cur.get_key_q()?;
                 floor = Some(floor.map_or(seq, |f: i64| f.min(seq)));
@@ -3585,16 +3620,21 @@ impl Storage {
         // cursor cache; `search()` (a read) reports not-found honestly regardless
         // of overwrite mode.
         let tables = oplog_all_tables();
-        let mut op_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
+        // Pre-open one cursor per table; a lazily-absent shard parks a `None`
+        // (reads as empty) — index stays aligned with `tables`.
+        let mut op_curs: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
+        for name in &tables {
+            op_curs.push(match session.open_cursor(name, None) {
+                Ok(c) => Some(c),
+                Err(e) if e.is_missing_table() => None,
+                Err(e) => return Err(e.into()),
+            });
+        }
         let pre_cur = session.open_cursor(PREIMAGE_TABLE, None)?;
         let mut rows: Vec<(i64, Document, Option<Document>)> = Vec::new();
         for &seq in doomed_sorted {
             let mut blob: Option<Vec<u8>> = None;
-            for (t, name) in tables.iter().enumerate() {
-                if op_curs[t].is_none() {
-                    op_curs[t] = Some(session.open_cursor(name, None)?);
-                }
-                let op_cur = op_curs[t].as_ref().unwrap();
+            for op_cur in op_curs.iter().flatten() {
                 op_cur.reset()?;
                 op_cur.set_key_q(seq);
                 if op_cur.search().is_ok() {
@@ -3795,7 +3835,10 @@ impl Storage {
         // to one shard (by its first seq) — any shard is fine since the merge-read
         // and all-table point-ops find rows regardless of placement; a single
         // contiguous append keeps the restore fast (per-seq routing would scatter).
-        let cur = session.open_cursor(&oplog_shard_for_batch(rows[0].0), None)?;
+        let op_shard = oplog_shard_for_batch(rows[0].0);
+        // Lazy shards: make this oplog shard on first write (idempotent create).
+        session.create(&op_shard, &oplog_table_cfg())?;
+        let cur = session.open_cursor(&op_shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         let mut max_seq = 0i64;
         let mut best = (0i64, 0i64);
@@ -4959,6 +5002,8 @@ impl Storage {
         // Re-mint a fresh RecordId per doc in src natural order (preserving
         // insertion order) and write the dst `_id` index (id_key -> RecordId); the
         // doc-table value carries the id_key in-band (framed).
+        // Lazy shards: the rename target's shard may not exist yet — make it.
+        session.create(&doc_table_for(dst_db, dst_coll), DOC_TABLE_CFG)?;
         let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
         // Remember each doc against the RecordId it was RE-MINTED under in the
         // destination — the source RecordIds do not carry over.
@@ -5950,7 +5995,12 @@ impl Storage {
     /// unframing each value (see `frame_doc_value`) — no `_id` decode needed, and
     /// it recovers a timeseries doc's non-derivable suffixed id_key too.
     fn scan_docs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<ScannedDoc>> {
-        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        // Lazy shards: an absent shard (empty / never-created collection) is empty.
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
         let mut out = Vec::new();
         cur.set_key_ssq(db, coll, i64::MIN);
         let mut more = match cur.search_near() {
@@ -6129,7 +6179,12 @@ impl Storage {
         // directly and clone just the blob — `scan_docs` additionally clones each
         // row's `id_key` (for the write/index paths), a per-document allocation
         // wasted on a full scan of N documents.
-        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        // Lazy shards: an absent shard (empty / never-created collection) is empty.
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
         let mut out = Vec::new();
         cur.set_key_ssq(db, coll, i64::MIN);
         let mut more = match cur.search_near() {
@@ -8369,7 +8424,12 @@ impl Storage {
         // reads the doc row straight away. This used to resolve `id_key -> _id
         // index -> RecordId` first; deleting that hop is the point of step 2
         // (it measured +14.7% on `find_indexed_range`).
-        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        // Lazy shards: an absent shard yields no docs.
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
         let mut seen: HashSet<i64> = HashSet::new();
         let mut out = Vec::new();
         for &recordid in recordids {
@@ -8795,6 +8855,13 @@ fn ensure_collection(session: &Session, db: &str, coll: &str) -> Result<()> {
             cur.set_key_ss(db, coll);
             cur.set_value_u(&opts);
             cur.insert()?;
+            // Lazy shard creation: make the collection's documents shard on first
+            // creation (not all DOC_SHARDS at open). This branch runs only when the
+            // collection is new, so it is the natural once-per-collection hook that
+            // covers every write caller (create / auto-create-on-insert / rename).
+            // Read / scan paths tolerate an absent shard, keeping a lazily-sharded
+            // store byte-compatible with an eager one (missing shard reads empty).
+            session.create(&doc_table_for(db, coll), DOC_TABLE_CFG)?;
             Ok(())
         }
         Err(e) => Err(e.into()),
