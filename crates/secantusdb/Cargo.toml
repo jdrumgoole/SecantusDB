@@ -41,12 +41,10 @@ env_logger = "0.11"
 mimalloc = { version = "0.1", optional = true }
 
 [features]
+# mimalloc is default-on but optional so the Linux PGO instrumented stage can
+# drop it (`--no-default-features`) — instrumenting mimalloc's internals crashed
+# the arm64-macOS build; the habit is kept for Linux too, harmlessly.
 default = ["mimalloc"]
-# Enabled only for the PGO instrumented stage-1 build: compiles an explicit
-# `__llvm_profile_write_file()` call into the shutdown path so the profile is
-# flushed deterministically under the workflow's SIGTERM (arm64-macOS's atexit
-# flush doesn't fire there). Never enabled for a normal build.
-pgo-instrument = []
 
 # Cross-crate inlining of the hot serde/matcher/aggregate paths (matches the
 # embedded extension's profile).

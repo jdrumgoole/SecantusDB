@@ -237,20 +237,6 @@ fn run(cli: CliArgs) -> Result<(), String> {
         let _ = w.join();
     }
     running.stop();
-    // Deterministically flush the PGO profile before exit. On the arm64-macOS CI
-    // runner the LLVM profiling runtime's atexit `.profraw` write does not fire
-    // under the workflow's SIGTERM shutdown (Linux does), so the two-stage PGO
-    // build found no profile to merge. Compiled in only for the instrumented
-    // stage-1 build (the `pgo-instrument` feature); a normal build never
-    // references `__llvm_profile_write_file` (it isn't linked without
-    // `-Cprofile-generate`).
-    #[cfg(feature = "pgo-instrument")]
-    unsafe {
-        extern "C" {
-            fn __llvm_profile_write_file() -> std::os::raw::c_int;
-        }
-        __llvm_profile_write_file();
-    }
     Ok(())
 }
 
