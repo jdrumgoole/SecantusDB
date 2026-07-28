@@ -203,11 +203,26 @@ def _hang_watchdog():
     with zero diagnostics. This watchdog fires first (25 min < the 30-min job cap)
     and prints every thread's stack to stderr. Each xdist worker arms its own.
     """
-    faulthandler.dump_traceback_later(1500, exit=True)
+    _hang_seconds = float(os.environ.get("SECANTUS_HANG_SECONDS", "1500"))
+    # Route the wedge traceback to the per-worker crash FILE when one is armed
+    # (SECANTUS_FAULTHANDLER_DIR): a worker that wedges in shutdown dies with its
+    # stderr unflushed and unforwarded (xdist reports only "node down"), so a
+    # stderr dump is lost in precisely the case this watchdog exists to explain.
+    # The file survives the dead worker.
+    _hang_file = _crash_dump_file if _crash_dump_file is not None else sys.stderr
+    faulthandler.dump_traceback_later(_hang_seconds, file=_hang_file, exit=True)
     try:
         yield
     finally:
-        faulthandler.cancel_dump_traceback_later()
+        # A SHUTDOWN wedge strikes AFTER this teardown would run — so cancelling
+        # here disarms the watchdog in the exact window that wedges (which is why
+        # the wedge has never self-dumped). When a capture file is armed, leave
+        # the timer running through shutdown: on a healthy worker the process has
+        # already exited before it fires, so it is a no-op; on a wedged worker it
+        # is the only thing that will dump the hung stack. Default runs keep the
+        # historical cancel-on-teardown behaviour.
+        if _crash_dump_file is None:
+            faulthandler.cancel_dump_traceback_later()
 
 
 # --- Session stall detection (controller-side) ------------------------------

@@ -190,9 +190,16 @@ def _migrate_legacy_docs(session: Any) -> None:
     # ``_load_oplog_meta``) recovers the counter from the shards so freshly minted
     # RecordIds stay strictly greater.
     idx = session.open_cursor(_NAT_SEQ_TABLE, None)
+    made_shards: set[str] = set()
     try:
         for recordid, (db, coll, id_key, blob) in enumerate(rows, start=1):
-            dst = session.open_cursor(_doc_table_for(db, coll), None)
+            shard = _doc_table_for(db, coll)
+            # Lazy shards: the target shard isn't created eagerly at open, so make
+            # it before folding a legacy row into it (idempotent per shard).
+            if shard not in made_shards:
+                session.create(shard, _DOC_SHARD_CFG)
+                made_shards.add(shard)
+            dst = session.open_cursor(shard, None)
             try:
                 dst.set_key(db, coll, recordid)
                 dst.set_value(_frame_doc_value(id_key, blob))
@@ -305,6 +312,23 @@ def _oplog_shard_name(shard: int) -> str:
 # Every table an oplog reader / point-op must consider: the N shards + legacy.
 _OPLOG_ALL_TABLES = [_oplog_shard_name(s) for s in range(_OPLOG_SHARDS)] + [_OPLOG_TABLE]
 _PREIMAGE_TABLE = "table:secantus_preimages"
+
+# WT create configs for the on-demand shard tables (byte-identical to the eager
+# bootstrap creates and to the Rust ``DOC_TABLE_CFG`` / oplog-shard cfg).
+_DOC_SHARD_CFG = "key_format=SSq,value_format=u"
+_OPLOG_SHARD_CFG = "key_format=q,value_format=u"
+
+
+def _is_missing_table(exc: BaseException) -> bool:
+    """True if a WiredTiger error is "table does not exist" (ENOENT).
+
+    Under lazy shard creation a documents / oplog shard table exists only once
+    something has been written to it, so read / scan / merge paths must treat a
+    cursor-open failure on an absent shard as "empty shard", not an error. WT
+    surfaces this as ``No such file or directory``."""
+    return "No such file or directory" in str(exc)
+
+
 _OPLOG_META_TABLE = "table:secantus_oplog_meta"
 _USERS_TABLE = "table:secantus_users"
 _ROLES_TABLE = "table:secantus_roles"
@@ -1376,28 +1400,35 @@ class Storage:
         self._conn = wt.wiredtiger_open(home, config)
         self._tls = threading.local()
         self._all_sessions: list[Any] = []
+        # Documents shards created so far (lazy shard creation): a shard table is
+        # made on first write to a collection that hashes to it, not all 16 at
+        # open — so an ephemeral single-collection store creates one shard, not
+        # 16 (cutting open-time table creation, the dominant open cost). Tracks
+        # what this instance has created so the create is attempted once per
+        # shard; a reopened on-disk store re-populates it lazily (WT create is
+        # idempotent, preserving an existing table).
+        self._created_doc_shards: set[str] = set()
         boot = self._conn.open_session()
         try:
             boot.create(_COLL_TABLE, "key_format=SS,value_format=u")
             boot.create(_DOC_TABLE, "key_format=SSu,value_format=u")
-            # Per-collection documents shards (see ``_DOC_SHARDS``). The legacy
-            # single table above stays for the one-time migration below.
-            # Keyed ``SSq`` — (db, coll, RecordId) — so a forward walk IS
-            # insertion order and the doc row is written once per insert
-            # (RecordId step 4a; byte-identical to the Rust ``DOC_TABLE_CFG``).
-            for _s in range(_DOC_SHARDS):
-                boot.create(_doc_shard_name(_s), "key_format=SSq,value_format=u")
+            # Per-collection documents shards (see ``_DOC_SHARDS``, keyed ``SSq``)
+            # and the oplog shards below are NO LONGER created eagerly here. Each
+            # doc shard is made on first write to a collection that hashes to it
+            # (``_ensure_doc_shard``); the oplog shards are written only by the
+            # Rust server, so a pure-Python store never creates them at all. This
+            # is the open-cost cut: a fresh store created ~37 tables (16 doc + 16
+            # oplog shards dominating), most unused by an ephemeral test server;
+            # now it creates only the base tables plus the shards actually
+            # touched. Every read / merge / scan path tolerates an absent shard
+            # (``_is_missing_table`` / ``_cursor_optional``), so a store written
+            # with a subset of shards stays byte-compatible with the Rust server
+            # (cross-server backup / PITR): a missing shard reads as empty.
             boot.create(_NAT_TABLE, "key_format=SSq,value_format=u")
             boot.create(_NAT_SEQ_TABLE, "key_format=SSu,value_format=q")
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
             boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSu,value_format=u")
             boot.create(_OPLOG_TABLE, "key_format=q,value_format=u")
-            # Oplog shard tables (see ``_OPLOG_SHARDS``). Created empty here so the
-            # merge readers can open a cursor on each unconditionally; the Python
-            # write path leaves them empty (it writes the legacy table above), but
-            # a Rust-written store opened by Python has its entries in these.
-            for _s in range(_OPLOG_SHARDS):
-                boot.create(_oplog_shard_name(_s), "key_format=q,value_format=u")
             boot.create(_PREIMAGE_TABLE, "key_format=q,value_format=u")
             boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
             boot.create(_USERS_TABLE, "key_format=SS,value_format=u")
@@ -1571,7 +1602,9 @@ class Storage:
         last_ord = 0
         if last_seq > 0:
             for table in _OPLOG_ALL_TABLES:
-                c2 = self._cursor(table)
+                c2 = self._cursor_optional(table)
+                if c2 is None:
+                    continue  # lazy shards: absent oplog shard reads as empty
                 c2.set_key(last_seq)
                 if c2.search() == 0:
                     blob = bytes(c2.get_value())
@@ -1597,7 +1630,9 @@ class Storage:
         """
         max_seq = 0
         for table in _OPLOG_ALL_TABLES:
-            c = self._cursor(table)
+            c = self._cursor_optional(table)
+            if c is None:
+                continue  # lazy shards: absent oplog shard reads as empty
             if c.prev() == 0:
                 seq = int(c.get_key())
                 if seq > max_seq:
@@ -1615,7 +1650,9 @@ class Storage:
         """
         total = 0
         for table in _OPLOG_ALL_TABLES:
-            c = self._cursor(table)
+            c = self._cursor_optional(table)
+            if c is None:
+                continue  # lazy shards: absent oplog shard reads as empty
             while c.next() == 0:
                 total += 1
             c.reset()
@@ -1635,7 +1672,17 @@ class Storage:
         heads: list[int | None] = []
         try:
             for table in _OPLOG_ALL_TABLES:
-                c = session.open_cursor(table, None)
+                # Lazy shards: an absent oplog shard reads as empty. Keep the
+                # cursors / heads / _OPLOG_ALL_TABLES index alignment by parking a
+                # None (never selected, since its head stays None).
+                try:
+                    c = session.open_cursor(table, None)
+                except Exception as exc:
+                    if _is_missing_table(exc):
+                        cursors.append(None)
+                        heads.append(None)
+                        continue
+                    raise
                 cursors.append(c)
                 heads.append(int(c.get_key()) if c.next() == 0 else None)
             while True:
@@ -1668,7 +1715,9 @@ class Storage:
         """
         max_seq = 0
         for s in range(_DOC_SHARDS):
-            c = self._cursor(_doc_shard_name(s))
+            c = self._cursor_optional(_doc_shard_name(s))
+            if c is None:
+                continue  # lazy shard creation: this shard was never written
             c.reset()
             rc = c.prev()  # last row = highest (db, coll, RecordId) in this shard
             while rc == 0:
@@ -1742,7 +1791,9 @@ class Storage:
 
     def _delete_doc_row(self, db: str, coll: str, recordid: int) -> None:
         """Remove the doc-table row for ``recordid``. No-op if already gone."""
-        doc_cur = self._cursor(_doc_table_for(db, coll))
+        doc_cur = self._cursor_optional(_doc_table_for(db, coll))
+        if doc_cur is None:
+            return  # lazy shards: no shard → nothing to remove
         doc_cur.reset()
         doc_cur.set_key(db, coll, recordid)
         if doc_cur.search() == 0:
@@ -2358,7 +2409,12 @@ class Storage:
         heads: list[int | None] = []
         try:
             for table in _OPLOG_ALL_TABLES:
-                c = session.open_cursor(table, None)
+                try:
+                    c = session.open_cursor(table, None)
+                except Exception as exc:
+                    if _is_missing_table(exc):
+                        continue  # lazy shards: absent oplog shard reads as empty
+                    raise
                 cursors.append(c)
                 c.set_key(int(start_seq))
                 rc = c.search_near()
@@ -2552,7 +2608,12 @@ class Storage:
                 # lands on its minimum.
                 floor: int | None = None
                 for table in _OPLOG_ALL_TABLES:
-                    c = session.open_cursor(table, None)
+                    try:
+                        c = session.open_cursor(table, None)
+                    except Exception as exc:
+                        if _is_missing_table(exc):
+                            continue  # lazy shards: absent oplog shard is empty
+                        raise
                     try:
                         if c.next() == 0:
                             seq = int(c.get_key())
@@ -2667,7 +2728,9 @@ class Storage:
             # seq — probe every table (all shards + legacy) for the row.
             blob = None
             for table in _OPLOG_ALL_TABLES:
-                op_cur = self._cursor(table)
+                op_cur = self._cursor_optional(table)
+                if op_cur is None:
+                    continue  # lazy shards: absent oplog shard reads as empty
                 op_cur.set_key(seq)
                 if op_cur.search() == 0:
                     blob = bytes(op_cur.get_value())
@@ -2938,13 +3001,27 @@ class Storage:
         # TTL sweeper and the noop heartbeat acquire ``self._lock``,
         # so racing them against close would deadlock or
         # use-after-close.
+        # Join the background threads to completion — NOT with a short timeout —
+        # before any WiredTiger teardown below. Each sweeper owns a thread-local
+        # WT session (registered in ``_all_sessions``); if a bounded join gives up
+        # while a sweeper is still alive, close() then closes that session from
+        # THIS (foreign) thread and calls ``conn.close()`` while the sweeper still
+        # references it. A WT session is not safe to close cross-thread while its
+        # owner lives, and ``WT_CONNECTION->close`` then blocks forever waiting to
+        # quiesce it — the macOS shutdown wedge (worker hung in ``conn.close``,
+        # SIGKILLed with no diagnostics; load, e.g. the rust-server suite or
+        # mimalloc, made the old 2s join miss often enough to cascade). The joins
+        # run BEFORE ``with self._lock`` so a sweeper mid-iteration can take the
+        # lock, finish, drop its own session (see the loops' ``finally``), and
+        # exit; the stop event wakes a parked sweeper immediately, so this is
+        # bounded by at most one in-flight iteration in practice.
         self._ttl_stop.set()
         if self._ttl_thread is not None and self._ttl_thread.is_alive():
-            self._ttl_thread.join(timeout=2.0)
+            self._ttl_thread.join()
             self._ttl_thread = None
         self._noop_stop.set()
         if self._noop_thread is not None and self._noop_thread.is_alive():
-            self._noop_thread.join(timeout=2.0)
+            self._noop_thread.join()
             self._noop_thread = None
         import logging
 
@@ -3074,16 +3151,25 @@ class Storage:
         import logging
 
         log = logging.getLogger("secantus.storage.ttl")
-        while not self._ttl_stop.wait(self._ttl_sweep_seconds):
-            if self._closed:
-                return
+        try:
+            while not self._ttl_stop.wait(self._ttl_sweep_seconds):
+                if self._closed:
+                    return
+                self._reset_thread_session()
+                try:
+                    self.prune_ttl_all_collections()
+                except Exception:
+                    # Sweeper failures must not propagate — they'd kill
+                    # the daemon thread and silently disable expiry.
+                    log.exception("ttl sweep failed")
+        finally:
+            # Close this thread's WT session on the OWNING thread before the
+            # thread dies. Between iterations the loop parks in ``wait()`` still
+            # holding the session it opened, and on exit it would otherwise leave
+            # it open for Storage.close() to close cross-thread — which hangs
+            # ``WT_CONNECTION->close``. ``_reset_thread_session`` is a no-op once
+            # ``_closed`` is set (close() already owns the sessions then).
             self._reset_thread_session()
-            try:
-                self.prune_ttl_all_collections()
-            except Exception:
-                # Sweeper failures must not propagate — they'd kill
-                # the daemon thread and silently disable expiry.
-                log.exception("ttl sweep failed")
 
     def ensure_oplog_bootstrap(self) -> None:
         """Seed a bootstrap noop on a *fresh* oplog so ``local.oplog.rs`` is
@@ -3137,13 +3223,19 @@ class Storage:
         import logging
 
         log = logging.getLogger("secantus.storage.noop")
-        while not self._noop_stop.wait(self._noop_heartbeat_seconds):
-            if self._closed:
-                return
-            try:
-                self.emit_noop_heartbeat()
-            except Exception:
-                log.exception("noop heartbeat failed")
+        try:
+            while not self._noop_stop.wait(self._noop_heartbeat_seconds):
+                if self._closed:
+                    return
+                try:
+                    self.emit_noop_heartbeat()
+                except Exception:
+                    log.exception("noop heartbeat failed")
+        finally:
+            # Drop this thread's WT session on the owning thread before exit —
+            # same rationale as the TTL sweeper: never leave a session open for
+            # Storage.close() to tear down cross-thread. See close()'s join note.
+            self._reset_thread_session()
 
     def _reset_thread_session(self) -> None:
         """Close the calling thread's cached WT session + cursors so
@@ -3568,6 +3660,34 @@ class Storage:
             c.reset()
         return c
 
+    def _cursor_optional(self, table: str, *, overwrite: bool = True) -> Any | None:
+        """Like :meth:`_cursor` but returns ``None`` if ``table`` doesn't exist.
+
+        Under lazy shard creation a documents / oplog shard table is present only
+        once written to, so read / scan / merge paths use this to treat an absent
+        shard as an empty one instead of erroring."""
+        try:
+            return self._cursor(table, overwrite=overwrite)
+        except Exception as exc:
+            if _is_missing_table(exc):
+                return None
+            raise
+
+    def _ensure_doc_shard(self, db: str, coll: str) -> None:
+        """Create ``db.coll``'s documents shard table if it isn't there yet.
+
+        Called on the write path (collection create / auto-create) so the shard a
+        collection routes to exists before any doc is written to it. Idempotent
+        and tracked per-instance, so it costs one WT ``create`` per distinct
+        shard for this store's lifetime (WT ``create`` preserves an existing
+        table, so a reopened on-disk store's shards are re-adopted harmlessly)."""
+        name = _doc_table_for(db, coll)
+        if name in self._created_doc_shards:
+            return
+        self._session()
+        self._tls.session.create(name, _DOC_SHARD_CFG)
+        self._created_doc_shards.add(name)
+
     def _coll_options(self, db: str, coll: str) -> dict[str, Any] | None:
         c = self._cursor(_COLL_TABLE)
         c.set_key(db, coll)
@@ -3605,6 +3725,8 @@ class Storage:
             return
         c.reset()
         c[db, coll] = b""
+        # New collection → make its documents shard now (lazy shard creation).
+        self._ensure_doc_shard(db, coll)
 
     def collection_exists(self, db: str, coll: str) -> bool:
         with self._lock:
@@ -3629,6 +3751,8 @@ class Storage:
                 return False
             c.reset()
             c[db, coll] = b""
+            # New collection → make its documents shard now (lazy shard creation).
+            self._ensure_doc_shard(db, coll)
             if options:
                 # Persist before minting the UUID — ``_collection_uuid``'s
                 # mint path re-reads and merges, so the options survive.
@@ -3660,7 +3784,11 @@ class Storage:
         timeseries doc's non-derivable suffixed ``id_key`` too. Mirrors the Rust
         ``scan_docs``.
         """
-        c = self._cursor(_doc_table_for(db, coll))
+        c = self._cursor_optional(_doc_table_for(db, coll))
+        if c is None:
+            # Lazy shard creation: the collection's shard was never written
+            # (empty / never-existed collection) → no docs.
+            return
         c.set_key(db, coll, _INT64_MIN)
         rc = c.search_near()
         if rc == wt.WT_NOTFOUND:
@@ -5110,7 +5238,9 @@ class Storage:
     def _collect_prefix(
         self, table: str, prefix: tuple[Any, ...]
     ) -> list[tuple[tuple[Any, ...], Any]]:
-        c = self._cursor(table)
+        c = self._cursor_optional(table)
+        if c is None:
+            return []  # lazy shards: an absent table holds no rows for this prefix
         kf = self._table_kf(table)
         seed = prefix + self._smallest_for_kf(kf)[len(prefix) :]
         c.set_key(*seed)
@@ -5256,6 +5386,8 @@ class Storage:
             src_doc_tbl = _doc_table_for(src_db, src_coll)
             doc_rows = self._collect_prefix(src_doc_tbl, (src_db, src_coll))
             self._delete_keys(src_doc_tbl, [k for k, _ in doc_rows])
+            # Lazy shards: the rename target's shard may not exist yet.
+            self._ensure_doc_shard(dst_db, dst_coll)
             dst_doc = self._cursor(_doc_table_for(dst_db, dst_coll))
             for k, v in doc_rows:
                 dst_doc.set_key(dst_db, dst_coll, k[2])
@@ -6146,7 +6278,9 @@ class Storage:
         """
         if not recordids:
             return []
-        c = self._cursor(_doc_table_for(db, coll))
+        c = self._cursor_optional(_doc_table_for(db, coll))
+        if c is None:
+            return []  # lazy shards: collection's shard never written
         # Two-stage: WT cursor walk first (raw bytes), then ``bson.decode``
         # outside that loop. The cursor work is what needs lock scope;
         # decode is pure CPU and benefits from running unsynchronised.
@@ -6582,7 +6716,9 @@ class Storage:
         if filter:
             recordids = self._try_index_id_keys(db, coll, filter)
             if recordids is not None:
-                c = self._cursor(_doc_table_for(db, coll))
+                c = self._cursor_optional(_doc_table_for(db, coll))
+                if c is None:
+                    return []  # lazy shards: collection's shard never written
                 out: list[tuple[int, bytes, bytes]] = []
                 # Same dedup contract as ``_docs_by_recordids``: multikey
                 # indexes can yield duplicate RecordIds for one doc.

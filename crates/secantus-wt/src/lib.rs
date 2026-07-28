@@ -57,6 +57,13 @@ impl WtError {
     pub fn is_not_found(&self) -> bool {
         self.code == sys::WT_NOTFOUND
     }
+    /// The table / file does not exist (`ENOENT`) — e.g. opening a cursor on a
+    /// lazily-created shard table that has never been written. Distinct from
+    /// [`is_not_found`](Self::is_not_found), which is a missing *row*. Read /
+    /// scan / merge paths use this to treat an absent shard as empty.
+    pub fn is_missing_table(&self) -> bool {
+        self.code == 2 // ENOENT (POSIX): WT surfaces a missing table's file this way
+    }
     /// A unique-key conflict (`WT_DUPLICATE_KEY`).
     pub fn is_duplicate_key(&self) -> bool {
         self.code == sys::WT_DUPLICATE_KEY
