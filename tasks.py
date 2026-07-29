@@ -382,6 +382,58 @@ def admin(
 
 
 @task(
+    name="admin-screenshots",
+    help={
+        "only": "Capture just this page slug (comma-separated for several).",
+        "scale": "Device scale factor: 2 for retina PNGs, 1 for half the bytes.",
+        "headed": "Show the browser while it drives the UI.",
+        "list_pages": "List the page slugs and exit.",
+    },
+)
+def admin_screenshots(
+    c: Context,
+    only: str = "",
+    scale: int = 2,
+    headed: bool = False,
+    list_pages: bool = False,
+) -> None:
+    """Regenerate the admin-UI screenshots in docs/_static/screenshots/.
+
+    Boots a throwaway SecantusDB with a fictional dataset, drives every
+    admin page with Playwright, and writes the PNGs the Sphinx docs, the
+    README and the marketing site all reference.
+
+    **Run this on every release** — the shots are the only part of the
+    docs that goes stale invisibly when the UI changes. The
+    ``secantusdb-release`` skill lists it as a pre-flight step, and
+    ``tests/test_docs_screenshots.py`` fails if a documented page has no
+    image (it can't tell a *stale* image from a fresh one — that's what
+    the release step is for).
+
+    Needs the browser once: ``uv run playwright install chromium``.
+    """
+    cmd = [
+        "uv",
+        "run",
+        "--extra",
+        "admin",
+        "--extra",
+        "screenshots",
+        "python",
+        "scripts/admin_screenshots.py",
+    ]
+    if list_pages:
+        cmd.append("--list")
+    for slug in (s.strip() for s in only.split(",")):
+        if slug:
+            cmd.extend(["--only", slug])
+    cmd.extend(["--scale", str(scale)])
+    if headed:
+        cmd.append("--headed")
+    c.run(" ".join(cmd), pty=True)
+
+
+@task(
     help={
         "port": "Local HTTP port (0 = pick a free one).",
         "host": "Bind host (default 127.0.0.1).",

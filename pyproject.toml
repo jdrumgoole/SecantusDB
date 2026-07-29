@@ -113,6 +113,14 @@ opsboard = [
     "python-multipart>=0.0.30",  # form posts from the task buttons
     "setproctitle>=1.3",
 ]
+screenshots = [
+    # Documentation screenshots of the admin UI (scripts/admin_screenshots.py,
+    # `invoke admin-screenshots`). Deliberately its own extra rather than part
+    # of `dev`: every CI lane installs `dev`, and none of them drive a browser
+    # — the docs drift test that guards the shots is browser-free. Needs
+    # `uv run playwright install chromium` once to fetch the browser itself.
+    "playwright>=1.44",
+]
 rust = [
     # The Rust engine core (`_secantus_core`) as a separate companion wheel: the
     # reusable engines behind the Rust server + the byte-for-byte parity-test

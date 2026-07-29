@@ -64,6 +64,19 @@
         })),
       };
       const layer = L.geoJSON(fc, {
+        // Draw points as vector circles instead of Leaflet's default image
+        // marker. That default pulls ``images/marker-icon.png`` and
+        // ``images/marker-shadow.png`` relative to leaflet.css — files this
+        // package doesn't vendor, so every point 404'd and rendered as a
+        // broken image. A circleMarker needs no assets and matches the
+        // ``preferCanvas`` renderer selected above.
+        pointToLayer: (feat, latlng) => L.circleMarker(latlng, {
+          radius: 6,
+          weight: 2,
+          color: getComputedStyle(document.documentElement)
+            .getPropertyValue("--accent").trim() || "#63b3ff",
+          fillOpacity: 0.6,
+        }),
         onEachFeature: (feat, lyr) => {
           if (feat.properties && feat.properties._id) {
             lyr.bindPopup("_id: " + feat.properties._id);

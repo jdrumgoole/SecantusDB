@@ -9,7 +9,10 @@
        "command": form.command or "",
        "cmdDb": form.db or "admin"
      } | tojson }})'
-     x-init="init()">
+     {# No ``x-init="init()"`` — Alpine calls the component's own ``init()``;
+        the attribute made every page load fetch the collection suggestions
+        twice. See tests/test_admin_asset_order.py. #}
+>
   <nav class="query-tabs">
     <button type="button" :class="kind === 'find' ? 'tab-active' : ''" @click="kind = 'find'">find</button>
     <button type="button" :class="kind === 'aggregate' ? 'tab-active' : ''" @click="kind = 'aggregate'">aggregate</button>

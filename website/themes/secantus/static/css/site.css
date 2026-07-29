@@ -237,6 +237,56 @@ pre code { background: transparent; padding: 0; }
   font-size: 17px;
 }
 
+/* ---- Admin console section ---- */
+
+/* The screenshots are dark-UI PNGs dropped onto a light page, so they get
+   a rim and a shadow to sit as objects rather than bleed into the
+   background. Intrinsic width/height are set on the <img> in the template
+   so the browser reserves the right box before the file loads. */
+.admin-shot,
+.admin-thumbs figure {
+  margin: 0;
+}
+.admin-shot img,
+.admin-thumbs img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--slate-300);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(2, 6, 23, 0.18);
+  background: var(--slate-900);
+}
+.admin-shot figcaption,
+.admin-thumbs figcaption {
+  color: var(--slate-500);
+  font-size: 14px;
+  margin-top: 10px;
+}
+.admin-thumbs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 20px;
+  margin-top: 32px;
+}
+/* Both crops trim the empty page below the content rather than letting a
+   1440x900 browser shot dictate the layout. The dashboard's tiles and
+   charts finish well above the fold, so the untrimmed shot contributes
+   ~300px of flat background; the thumbnails would otherwise shrink a full
+   page to postage-stamp size where nothing is legible. Cropping from the
+   top-left keeps the sidebar and first rows, which is the part that says
+   what the page is. */
+.admin-shot > img {
+  aspect-ratio: 12 / 5;
+  object-fit: cover;
+  object-position: left top;
+}
+.admin-thumbs figure > img {
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  object-position: left top;
+}
+
 /* ---- Benefits grid ---- */
 
 .benefits {

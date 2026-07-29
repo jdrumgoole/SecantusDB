@@ -1,8 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
+{# No ``x-init="init()"`` — Alpine runs the component's own ``init()``; the
+   attribute opened a second change-stream websocket, so every event showed
+   up twice. See tests/test_admin_asset_order.py. #}
 <div
   x-data='changestreamPage({{ {"scope": scope, "db": db_name, "coll": coll_name} | tojson }})'
-  x-init="init()"
 >
   {# Not a ``<form>`` on purpose — the Watch button doesn't submit, it
      calls Alpine's ``reconnect()`` which rebuilds the WebSocket. A

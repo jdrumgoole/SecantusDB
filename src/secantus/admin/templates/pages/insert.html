@@ -6,7 +6,10 @@
        "coll": form.coll or "",
        "docs": form.docs or ""
      } | tojson }})'
-     x-init="init()">
+     {# No ``x-init="init()"`` — Alpine calls the component's own ``init()``;
+        the attribute made every page load fetch the collection suggestions
+        twice. See tests/test_admin_asset_order.py. #}
+>
 
   <datalist id="ins-db-suggestions">
     {% for d in databases %}

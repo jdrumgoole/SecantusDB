@@ -9,11 +9,22 @@
        ``/favicon.ico`` request would hit. #}
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Ccircle%20cx='16'%20cy='16'%20r='10'%20fill='%2363b3ff'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/static/css/admin.css" />
+    {# Alpine MUST stay last. Deferred scripts execute in document order, and
+       this Alpine build calls ``Alpine.start()`` as soon as its own script
+       runs — it registers no ``DOMContentLoaded`` hook — so every global an
+       ``x-data`` / ``x-init`` expression reaches for must already exist by
+       then. With Alpine second, the dashboard's ``init()`` threw
+       "Chart is not defined" in a real browser, aborting the component
+       before ``_connect()`` ran: no charts, and the live-metrics websocket
+       never opened, so every tile stayed at 0 and the status stuck on
+       "connecting…". ``setupModal`` / ``closeModal`` (modal-shell.js) are
+       reached from ``x-init`` the same way. Guarded by
+       tests/test_admin_asset_order.py. #}
     <script src="/static/js/htmx.min.js" defer></script>
-    <script src="/static/js/alpine.min.js" defer></script>
     <script src="/static/js/chart.umd.min.js" defer></script>
     <script src="/static/js/json-pretty.js" defer></script>
     <script src="/static/js/modal-shell.js" defer></script>
+    <script src="/static/js/alpine.min.js" defer></script>
   </head>
   <body>
     <aside class="sidebar">
