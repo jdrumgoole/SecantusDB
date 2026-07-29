@@ -186,11 +186,20 @@ jobs:
             kill -TERM "$srvpid" 2>/dev/null || true
             wait "$srvpid" 2>/dev/null || true
 
-            echo "=== macOS PGO: merge profile ==="
+            echo "=== macOS PGO: locate + merge profile ==="
+            # The binary self-writes to $SECANTUS_PGO_OUT, but locate defensively:
+            # on this runner the profiling runtime's filename handling is flaky, so
+            # a write can land under a default name elsewhere in the workspace.
+            echo "--- searching for .profraw files (portable; runner bash is 3.2) ---"
+            find "$PWD" -name '*.profraw' -exec ls -la {} \; 2>/dev/null || true
+            n=$(find "$PWD" -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$n" -eq 0 ]; then
+              echo "::error::no .profraw written anywhere in the workspace"; cat pgo-server.log; exit 1
+            fi
             profdata_tool="$(rustc --print sysroot)/lib/rustlib/$target/bin/llvm-profdata"
             [ -x "$profdata_tool" ] || profdata_tool=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata | head -1)
             merged="$profraw/merged.profdata"
-            "$profdata_tool" merge --sparse -o "$merged" "$profraw"/*.profraw
+            find "$PWD" -name '*.profraw' -print0 2>/dev/null | xargs -0 "$profdata_tool" merge --sparse -o "$merged"
             echo "profile size: $(du -h "$merged" | cut -f1)"
 
             echo "=== macOS PGO stage 3: optimized build (profile-use, mimalloc restored) ==="
