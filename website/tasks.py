@@ -328,26 +328,41 @@ def _git(c: Context, args: str, **kw) -> str:
     return c.run(f"git -C {REPO_ROOT} {args}", hide=True, **kw).stdout.rstrip()
 
 
-@task
-def publish(c: Context, message: str = "") -> None:
+@task(
+    help={
+        "message": "Commit message for the website-only commit.",
+        "no_deploy": (
+            "Commit and push, but don't deploy. Use on a feature branch; "
+            "deploy from main after the PR merges."
+        ),
+    }
+)
+def publish(c: Context, message: str = "", no_deploy: bool = False) -> None:
     """Commit, push, and deploy website changes — no pytest, no version bump.
-
-    Designed to be run from the dedicated ``website-dev`` worktree
-    (``../SecantusDB-website``) so concurrent release activity on
-    ``main`` doesn't auto-stash these in-flight changes mid-edit.
 
     The shortcut skips the global "run the full test suite before
     committing" rule (the website tree never changes SecantusDB's
     runtime code) and the "bump the version on every push" rule
     (website tree is excluded from sdist/wheel). Only changes under
-    ``website/`` and the project ``CLAUDE.md`` are allowed; anything
-    else aborts the task so a misfire can't fast-path real code
-    through it.
+    ``website/``, ``brandkit/``, the project ``CLAUDE.md`` and
+    ``.gitignore`` are allowed; anything else aborts the task so a
+    misfire can't fast-path real code through it.
 
-    Usage (from the worktree)::
+    **The deploy step ships whatever branch you run this from.** The site
+    is built from ``main``, so running the full task on a feature branch
+    puts content live that isn't on ``main`` yet — and the next deploy
+    from ``main`` silently reverts it. On a branch, pass ``--no-deploy``
+    to get the guarded commit + push only, then deploy once the PR has
+    merged::
 
-        cd ../SecantusDB-website/website
-        ../../SecantusDB/.venv/bin/python -m invoke publish --message "..."
+        # on the feature branch:
+        cd website && uv run python -m invoke publish -m "site: ..." --no-deploy
+        # after the merge:
+        git checkout main && git pull
+        cd website && uv run python -m invoke deploy
+
+    Running the full task on ``main`` (commit + push + deploy in one go)
+    stays correct for a trivial edit that doesn't warrant a PR.
     """
     _ensure_venv()
 
@@ -429,6 +444,15 @@ def publish(c: Context, message: str = "") -> None:
 
     print(f"=== Pushing {branch} ===")
     c.run(f"git -C {shlex.quote(str(REPO_ROOT))} push origin {branch}", pty=True)
+
+    if no_deploy:
+        print(
+            f"=== Committed and pushed '{branch}'; skipping deploy (--no-deploy) ===\n"
+            f"    The site builds from main. Open a PR, and once it's merged:\n"
+            f"      git checkout main && git pull\n"
+            f"      cd website && uv run python -m invoke deploy"
+        )
+        return
 
     print("=== Deploying ===")
     deploy(c)

@@ -59,7 +59,13 @@ jobs:
             runner: ubuntu-22.04
             os: linux
           - target: aarch64-apple-darwin
-            runner: macos-14
+            # macos-15 (Darwin 24), not macos-14 (Darwin 23): the older runner's
+            # LLVM profiling runtime writes no `.profraw` by ANY method (env
+            # at-exit, or an explicit __llvm_profile_write_file) — established by
+            # CI diagnosis — which breaks on-target PGO. The newer runner matches
+            # the local macOS where the same instrumented binary writes a valid
+            # profile.
+            runner: macos-15
             os: macos
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -152,17 +158,59 @@ jobs:
           profraw="$PWD/pgo-raw"; rm -rf "$profraw"; mkdir -p "$profraw"
 
           if [ "${{ matrix.os }}" = "macos" ]; then
-            # arm64-macOS: plain thin-LTO + mimalloc release build — NO on-target
-            # PGO. The two-stage on-target PGO is unusable on the macos-14 runner:
-            # instrumenting mimalloc segfaults at startup, and with mimalloc
-            # dropped the profiling runtime writes no usable profile under the
-            # workflow's SIGTERM shutdown (atexit doesn't fire; an explicit
-            # __llvm_profile_write_file and LLVM continuous mode both produced an
-            # unmergeable profile). The shipped binary keeps mimalloc + LTO; only
-            # the PGO increment (~12-19%) is lost on this one artifact — the macOS
-            # *wheel* keeps full PGO via its committed profile.
-            echo "=== macOS: plain LTO + mimalloc release build (no on-target PGO) ==="
-            cargo build --release --locked --target "$target" --manifest-path "$manifest"
+            # arm64-macOS two-stage on-target PGO. Two runner-specific quirks are
+            # handled here (both established by CI diagnosis; linux needs neither):
+            #  1. Instrumenting mimalloc's internals segfaults at startup, so the
+            #     instrumented stage builds with the system allocator
+            #     (--no-default-features drops mimalloc; the profile is a hint so
+            #     the allocator swap is harmless, and stage 3 restores mimalloc).
+            #  2. The profiling runtime never wires up its LLVM_PROFILE_FILE
+            #     at-exit write on this runner — even a clean `--version` exit
+            #     produces no `.profraw`. So the instrumented binary writes the
+            #     profile itself (the `pgo-instrument` feature: __llvm_profile_
+            #     set_filename + __llvm_profile_write_file to $SECANTUS_PGO_OUT on
+            #     shutdown). Verified to yield a valid, mergeable profile.
+            echo "=== macOS PGO stage 1: instrumented build (system allocator + self-written profile) ==="
+            RUSTFLAGS="-Cprofile-generate=$profraw" \
+              cargo build --release --locked --no-default-features --features pgo-instrument --target "$target" --manifest-path "$manifest"
+
+            echo "=== macOS PGO stage 2: run + drive workload; binary writes the profile on shutdown ==="
+            datadir=$(mktemp -d)
+            SECANTUS_PGO_OUT="$profraw/pgo-macos.profraw" \
+              "$bin" --port 0 --storage-path "$datadir" > pgo-server.log 2>&1 &
+            srvpid=$!
+            addr=""
+            for _ in $(seq 1 120); do
+              addr=$(grep -oE 'listening on [0-9.]+:[0-9]+' pgo-server.log | head -1 | awk '{print $3}') || true
+              [ -n "$addr" ] && break
+              sleep 0.5
+            done
+            if [ -z "$addr" ]; then
+              echo "::error::instrumented binary never printed a listening address"; cat pgo-server.log; exit 1
+            fi
+            uv run --no-project --with pymongo python -m bench.pgo_workload --uri "mongodb://$addr"
+            kill -TERM "$srvpid" 2>/dev/null || true
+            wait "$srvpid" 2>/dev/null || true
+
+            echo "=== macOS PGO: locate + merge profile ==="
+            # The binary self-writes to $SECANTUS_PGO_OUT, but locate defensively:
+            # on this runner the profiling runtime's filename handling is flaky, so
+            # a write can land under a default name elsewhere in the workspace.
+            echo "--- searching for .profraw files (portable; runner bash is 3.2) ---"
+            find "$PWD" -name '*.profraw' -exec ls -la {} \; 2>/dev/null || true
+            n=$(find "$PWD" -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$n" -eq 0 ]; then
+              echo "::error::no .profraw written anywhere in the workspace"; cat pgo-server.log; exit 1
+            fi
+            profdata_tool="$(rustc --print sysroot)/lib/rustlib/$target/bin/llvm-profdata"
+            [ -x "$profdata_tool" ] || profdata_tool=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata | head -1)
+            merged="$profraw/merged.profdata"
+            find "$PWD" -name '*.profraw' -print0 2>/dev/null | xargs -0 "$profdata_tool" merge --sparse -o "$merged"
+            echo "profile size: $(du -h "$merged" | cut -f1)"
+
+            echo "=== macOS PGO stage 3: optimized build (profile-use, mimalloc restored) ==="
+            RUSTFLAGS="-Cprofile-use=$merged -Cllvm-args=-pgo-warn-missing-function" \
+              cargo build --release --locked --target "$target" --manifest-path "$manifest"
           else
             # Linux: two-stage on-target PGO. The instrumented stage builds with
             # the system allocator (--no-default-features drops mimalloc) — a
