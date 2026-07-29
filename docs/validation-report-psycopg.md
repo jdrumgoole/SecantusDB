@@ -1,18 +1,18 @@
 # psycopg conformance report
 
-- SecantusDB (Python server) 0.5.4b237
+- SecantusDB (Python server) 0.6.0b1
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-07-19 18:21 UTC
+- generated: 2026-07-27 07:24 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
-| test_adapt.py | 52 | 7 | 0 | 59 | 88.1% |
+| test_adapt.py | 53 | 6 | 0 | 59 | 89.8% |
 | test_capabilities.py | 12 | 0 | 9 | 21 | 100.0% |
 | test_column.py | 53 | 0 | 0 | 53 | 100.0% |
-| test_connection.py | 97 | 5 | 2 | 104 | 95.1% |
+| test_connection.py | 98 | 4 | 2 | 104 | 96.1% |
 | test_connection_info.py | 37 | 0 | 3 | 40 | 100.0% |
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
-| test_copy.py | 105 | 6 | 1 | 112 | 94.6% |
+| test_copy.py | 107 | 4 | 1 | 112 | 96.4% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_client.py | 28 | 0 | 0 | 28 | 100.0% |
 | test_cursor_common.py | 280 | 0 | 8 | 288 | 100.0% |
@@ -39,7 +39,7 @@
 | types/test_multirange.py | 205 | 0 | 12 | 217 | 100.0% |
 | types/test_net.py | 33 | 0 | 0 | 33 | 100.0% |
 | types/test_none.py | 1 | 0 | 0 | 1 | 100.0% |
-| types/test_numeric.py | 370 | 0 | 0 | 370 | 100.0% |
+| types/test_numeric.py | 366 | 4 | 0 | 370 | 98.9% |
 | types/test_numpy.py | 166 | 0 | 6 | 172 | 100.0% |
 | types/test_range.py | 275 | 0 | 12 | 287 | 100.0% |
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
@@ -54,20 +54,20 @@
 - `tests/test_adapt.py::test_random[0-t]`
 - `tests/test_adapt.py::test_random[1-b]`
 - `tests/test_adapt.py::test_random[1-s]`
-- `tests/test_adapt.py::test_random[1-t]`
 - `tests/test_adapt.py::test_return_untyped[b]`
 - `tests/test_connection.py::test_cancel_safe_error`
 - `tests/test_connection.py::test_cancel_safe_timeout`
 - `tests/test_connection.py::test_connect_bad`
 - `tests/test_connection.py::test_right_exception_on_server_disconnect`
-- `tests/test_connection.py::test_right_exception_on_session_timeout`
 - `tests/test_copy.py::test_copy_from_leaks[0-False]`
 - `tests/test_copy.py::test_copy_from_leaks[0-True]`
 - `tests/test_copy.py::test_copy_out_error_with_copy_not_finished`
-- `tests/test_copy.py::test_copy_table_across[binary]`
 - `tests/test_copy.py::test_copy_table_across[block]`
-- `tests/test_copy.py::test_copy_table_across[row]`
 - `tests/test_errors.py::test_pgconn_error`
 - `tests/test_errors.py::test_pgconn_error_pickle`
 - `tests/test_generators.py::test_cancel`
 - `tests/test_generators.py::test_pipeline_communicate_abort`
+- `tests/types/test_numeric.py::test_dump_numeric_exhaustive[b]`
+- `tests/types/test_numeric.py::test_dump_numeric_exhaustive[s]`
+- `tests/types/test_numeric.py::test_dump_numeric_exhaustive[t]`
+- `tests/types/test_numeric.py::test_load_numeric_exhaustive[1]`
