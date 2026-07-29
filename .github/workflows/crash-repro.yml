@@ -87,7 +87,7 @@ jobs:
       SECANTUS_POST_CRASH_SECONDS: "120"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Checkout the WiredTiger submodule
         # The package builds vendored WiredTiger from source, so `uv sync`
@@ -101,7 +101,7 @@ jobs:
           git submodule update --init vendor/wiredtiger
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           cache-suffix: crash-repro-${{ inputs.python_version }}
@@ -330,7 +330,7 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crash-repro-${{ github.run_id }}
           path: |
