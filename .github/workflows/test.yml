@@ -161,7 +161,7 @@ jobs:
             python-version: "3.12"
             group: 4
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Checkout the WiredTiger submodule
         # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
         # cloned all 12 vendored submodules — 11 of them driver-gauge repos
@@ -250,7 +250,7 @@ jobs:
           brew install mongosh mongodb-database-tools
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
           # Two settings, both needed, that fix a cache that has never worked.
@@ -303,7 +303,7 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }} (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Point uv at the tool-cached interpreter (Windows)
@@ -535,7 +535,7 @@ jobs:
         # actually moves the critical path.
         group: [1, 2, 3, 4]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Checkout the WiredTiger submodule
         # See the ``test`` job's twin step for why this replaces
         # ``submodules: recursive``.
@@ -573,7 +573,7 @@ jobs:
         run: choco install -y swig
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
           # Two settings, both needed, that fix a cache that has never worked.
@@ -622,7 +622,7 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }} (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Point uv at the tool-cached interpreter (Windows)
@@ -821,7 +821,7 @@ jobs:
             python-version: "3.12"
             group: 4
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Checkout the WiredTiger submodule
         # See the ``test`` job's twin step for why this replaces
         # ``submodules: recursive``.
@@ -879,7 +879,7 @@ jobs:
           brew install mongosh mongodb-database-tools
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
           # Two settings, both needed, that fix a cache that has never worked.
@@ -926,7 +926,7 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }} (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Point uv at the tool-cached interpreter (Windows)
@@ -1113,7 +1113,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Checkout the WiredTiger submodule
         # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
         # cloned all 12 vendored submodules — 11 of them driver-gauge repos
@@ -1134,7 +1134,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
           # Two settings, both needed, that fix a cache that has never worked.
@@ -1173,7 +1173,7 @@ jobs:
       - name: Set up Python 3.12 (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - name: Point uv at the tool-cached interpreter (Windows)
@@ -1324,7 +1324,7 @@ jobs:
   rust-storage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Checkout the WiredTiger submodule
         # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
         # cloned all 12 vendored submodules — 11 of them driver-gauge repos
@@ -1347,7 +1347,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
           # Two settings, both needed, that fix a cache that has never worked.
@@ -1386,7 +1386,7 @@ jobs:
       - name: Set up Python 3.12 (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - name: Point uv at the tool-cached interpreter (Windows)
@@ -1562,7 +1562,7 @@ jobs:
         # cells (it was unreachable while this matrix was Linux + Windows only).
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || '["ubuntu-latest","windows-latest"]') }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Checkout the WiredTiger submodule
         # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
         # cloned all 12 vendored submodules — 11 of them driver-gauge repos
@@ -1610,7 +1610,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
           # Two settings, both needed, that fix a cache that has never worked.
@@ -1649,7 +1649,7 @@ jobs:
       - name: Set up Python 3.12 (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - name: Point uv at the tool-cached interpreter (Windows)
