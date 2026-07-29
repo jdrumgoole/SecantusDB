@@ -773,3 +773,46 @@ Three conclusions:
    At equal semantics (their `w:1` vs our sync) mongod still wins raw ingest
    ~3× (84k vs 26.6k single-writer): its C++ per-byte ingest path, not the
    oplog, is the residual gap.
+
+## Finding 11 — two parked CPU-side write experiments, both negative: neither the per-write mutex nor the oplog re-encode is the bottleneck (recorded 2026-07-29, work 2026-07-23)
+
+Finding 5 pinned the multi-writer ceiling to the shared oplog's WAL / eviction
+pressure — a disk/IO wall, not CPU. Two experiments attacked the *CPU* side of the
+write path directly to confirm that from the other direction; both were measured on a
+quiesced box and **dropped**. Recording them here so the negative results survive the
+branches (`rust-oplog-lockfree`, `rust-raw-oplog-splice`) they lived on.
+
+1. **Lock-free `next_nat_seq` — no scaling gain (~−2%).** The per-document oplog
+   RecordId counter took a mutex on every insert (100× per `insertMany` batch of 100).
+   Replaced it with an `AtomicI64` fetch-add to remove that acquisition from
+   `write_nat_entry`. All storage tests passed; single-writer unaffected. A clean
+   idle-machine A/B (mutex vs lock-free, 1/2/4/8 writers) measured **~−2%** —
+   neutral-to-slightly-negative, **zero** scaling improvement. The mutex was never the
+   throughput bound: writers still serialise on WiredTiger's single WAL, so removing
+   one of two co-equal walls buys nothing (Amdahl). This is the CPU-side confirmation
+   of Finding 5 — lock contention is not the concurrency ceiling.
+
+2. **Raw oplog `o` splice — marginal (~+1%, noise).** The shipped `+12%` raw-BSON
+   *insert* write path (PR #608, carries the client's BSON straight to WiredTiger
+   instead of decode/re-encoding it up to 5×) has an obvious extension: build each
+   oplog entry's `o` field by splicing the stored document bytes rather than
+   re-encoding, across all 15 `emit_oplog` call sites. Increment 3 did exactly that and
+   was fully correctness-validated (pymongo gauge 99.5% unchanged, change streams
+   106/0/100%, `fullDocument` byte-identical). A clean A/B measured the gain at
+   **~+1%** — inside the noise floor. The oplog write is WAL/disk-bound, not
+   encode-bound (Finding 5 again): cutting the re-encode CPU doesn't move throughput,
+   so a 15-site refactor of the shared oplog path (update/delete/change-streams) isn't
+   worth it. Only the *insert* raw-BSON path, where the CPU saving is on the hot
+   single-writer path rather than the IO-bound oplog append, paid off — and that
+   shipped.
+
+A third probe on `rust-oplog-lockfree` — a `SECANTUS_WT_EXTRA` connection-config hook
+sweeping WAL `file_max` 128MB→2GB (+13–19% at 4–8 writers) — was **superseded** by the
+shipped `SECANTUS_WT_CONFIG_EXTRA` hatch and the log-prealloc lever quantified in
+Finding 6; no separate action.
+
+Net: every CPU-side lever tried (remove the mutex, remove the oplog re-encode) confirms
+Finding 5 from the opposite side. The remaining real levers are IO/architectural —
+non-logged oplog (Finding 9), async oplog drain (Finding 9), write-amplification cuts
+via RecordId keying (steps 1–3, #613/#637/#640) — not CPU micro-optimisation of the
+write path.
