@@ -59,7 +59,13 @@ jobs:
             runner: ubuntu-22.04
             os: linux
           - target: aarch64-apple-darwin
-            runner: macos-14
+            # macos-15 (Darwin 24), not macos-14 (Darwin 23): the older runner's
+            # LLVM profiling runtime writes no `.profraw` by ANY method (env
+            # at-exit, or an explicit __llvm_profile_write_file) — established by
+            # CI diagnosis — which breaks on-target PGO. The newer runner matches
+            # the local macOS where the same instrumented binary writes a valid
+            # profile.
+            runner: macos-15
             os: macos
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
