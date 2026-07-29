@@ -45,6 +45,12 @@ mimalloc = { version = "0.1", optional = true }
 # drop it (`--no-default-features`) — instrumenting mimalloc's internals crashed
 # the arm64-macOS build; the habit is kept for Linux too, harmlessly.
 default = ["mimalloc"]
+# Enabled only for the PGO instrumented stage-1 build: writes the profile to
+# SECANTUS_PGO_OUT on shutdown via __llvm_profile_set_filename/write_file, because
+# the arm64-macOS profiling runtime never wires up its own LLVM_PROFILE_FILE
+# at-exit write. Never enabled for a normal build (the symbols exist only under
+# -Cprofile-generate).
+pgo-instrument = []
 
 # Cross-crate inlining of the hot serde/matcher/aggregate paths (matches the
 # embedded extension's profile).
