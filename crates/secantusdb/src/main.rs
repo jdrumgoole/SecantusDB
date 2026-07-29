@@ -237,6 +237,26 @@ fn run(cli: CliArgs) -> Result<(), String> {
         let _ = w.join();
     }
     running.stop();
+    // Write the PGO profile to a KNOWN path before exit. On the arm64-macOS CI
+    // runner the profiling runtime never wires up its env-driven (LLVM_PROFILE_FILE)
+    // at-exit write — even a clean `--version` exit produces no `.profraw` — so we
+    // set the filename programmatically and flush the counters ourselves. Compiled
+    // in only for the instrumented stage-1 build (the `pgo-instrument` feature);
+    // the symbols exist only under `-Cprofile-generate`. Path comes from
+    // `SECANTUS_PGO_OUT` (set by the release workflow); no-op if unset.
+    #[cfg(feature = "pgo-instrument")]
+    if let Ok(path) = std::env::var("SECANTUS_PGO_OUT") {
+        if let Ok(cpath) = std::ffi::CString::new(path) {
+            extern "C" {
+                fn __llvm_profile_set_filename(name: *const std::os::raw::c_char);
+                fn __llvm_profile_write_file() -> std::os::raw::c_int;
+            }
+            unsafe {
+                __llvm_profile_set_filename(cpath.as_ptr());
+                __llvm_profile_write_file();
+            }
+        }
+    }
     Ok(())
 }
 
