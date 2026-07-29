@@ -172,7 +172,13 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn oplog_tail_seq(&self) -> i64 {
-        self.inner.oplog_tail_seq()
+        // The VISIBLE tail, not the minted tail: a fresh change stream seeds
+        // its position here, and the minted tail can sit past an entry whose
+        // transaction has not committed yet — a watch opened at that position
+        // would permanently miss the entry when it commits. The visible tail
+        // is the highest seq a reader may safely name (sync: the
+        // in-flight-window floor; async: the drainer's durable watermark).
+        self.inner.oplog_visible_tail_seq()
     }
 
     fn oplog_floor_seq(&self) -> i64 {

@@ -576,3 +576,52 @@ def test_change_stream_sees_every_concurrent_insert(server):
     finally:
         cs.close()
     client.close()
+
+
+def test_db_change_stream_exactly_once_across_collections(server):
+    """Cross-collection writers + a database-wide watch: exactly-once, no loss.
+
+    This is the oplog minted-vs-committed visibility shape: writers on
+    DIFFERENT collections don't share a collection lock, so one writer's
+    oplog seq can be minted while another writer commits a later seq. The
+    watch's position must never advance past the in-flight mint — if it
+    does, that entry is lost (live AND on resume) when its transaction
+    commits. Same-collection writers can't hit this (the collection lock
+    serializes mint and commit), which is why the single-collection test
+    above stays green even with the bug present.
+    """
+    writer_n, docs_per = 6, 40
+    client = make_client(server)
+    db = client["csxdb"]
+    for i in range(writer_n):
+        db[f"c{i}"].insert_one({"_id": "seed"})  # create the collections
+
+    cs = db.watch(max_await_time_ms=200)
+    try:
+
+        def writer(i: int) -> None:
+            cl = make_client(server)
+            coll = cl["csxdb"][f"c{i}"]
+            for k in range(docs_per):
+                coll.insert_one({"_id": f"{i}-{k}", "who": i})
+            cl.close()
+
+        run_workers(writer_n, writer)
+
+        want = writer_n * docs_per
+        got: list[str] = []
+        deadline = time.monotonic() + 30
+        while len(set(got)) < want and time.monotonic() < deadline:
+            ev = cs.try_next()
+            if ev is None:
+                continue
+            if ev["operationType"] == "insert" and ev["documentKey"]["_id"] != "seed":
+                got.append(ev["documentKey"]["_id"])
+        assert len(got) == len(set(got)), "change stream delivered a duplicate event"
+        assert len(set(got)) == want, (
+            f"database change stream saw {len(set(got))} of {want} inserts — "
+            "a cross-collection commit raced past an in-flight oplog mint"
+        )
+    finally:
+        cs.close()
+    client.close()
