@@ -19,6 +19,67 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b4] — 2026-07-29
+
+### Restore full PGO on the arm64-macOS standalone binary
+
+The arm64-macOS `secantusd-rs` binary's on-target profile-guided optimization is
+working again, after a run of macos-14-runner-specific failures. Two quirks (both
+Linux-immune) are now handled: the PGO instrumented build drops mimalloc (whose
+instrumented allocator internals segfault at startup), and — the crux — the
+instrumented binary writes its own profile on shutdown, because the profiling
+runtime on that runner never wires up its `LLVM_PROFILE_FILE` at-exit write (a
+clean `--version` exit produced no `.profraw` at all). A CI diagnostic pinned
+that down; the binary now calls `__llvm_profile_set_filename` +
+`__llvm_profile_write_file` to a known path (behind the instrumented-only
+`pgo-instrument` feature), yielding a valid, mergeable profile (23.9k functions).
+Both binary targets ship with full two-stage PGO again.
+
+#### Fixed
+
+- `secantusdb` arm64-macOS binary: full on-target PGO restored — the instrumented
+  stage self-writes its profile (the runtime's env-driven at-exit write is inert
+  on the macos-14 runner) and drops mimalloc to avoid an instrumentation segfault.
+
+### Fix the arm64-macOS binary's PGO build crashing on mimalloc instrumentation
+
+The standalone `secantusd-rs` binary's two-stage profile-guided-optimization
+build segfaulted at startup on the arm64-macOS CI runner: the PGO **instrumented**
+stage compiles mimalloc's own allocator internals with profiling counters, and
+`__llvm_profile_instrument_target` faults (EXC_BAD_ACCESS) when it runs *inside*
+mimalloc's first page allocation (from `LogBuffer::new` in the server bind path),
+re-entering the half-initialized global allocator. The instrumented stage now
+builds with the system allocator (`--no-default-features`, gating mimalloc behind
+a default-on `mimalloc` cargo feature); the optimized final binary still ships
+mimalloc, and the collected profile — a hint whose unmatched functions are
+ignored — is unaffected by the allocator swap. The PyPI wheel's embedded server
+was never affected (it consumes a committed profile, not on-target instrumentation).
+
+#### Fixed
+
+- `secantusdb` binary: the arm64-macOS two-stage PGO release build no longer
+  segfaults in the instrumented stage. mimalloc is now a default-on cargo feature
+  so the instrumented build can opt out (`--no-default-features`) while the
+  shipped binary keeps mimalloc.
+
+### Flush the PGO profile explicitly so the arm64-macOS binary build completes
+
+With mimalloc no longer instrumented, the arm64-macOS binary's PGO instrumented
+stage ran the profiling workload cleanly but wrote no `.profraw`: the LLVM
+profiling runtime's atexit flush doesn't fire under the release workflow's
+SIGTERM shutdown on that runner (Linux flushes normally), so the profile-merge
+step had nothing to merge. The instrumented stage-1 build now compiles an
+explicit `__llvm_profile_write_file()` into the shutdown path (behind a
+`pgo-instrument` cargo feature, off for every normal build), flushing the profile
+deterministically before exit.
+
+#### Fixed
+
+- `secantusdb` binary: the arm64-macOS two-stage PGO build now writes its profile
+  under the workflow's SIGTERM shutdown (explicit `__llvm_profile_write_file()`
+  behind the instrumented-only `pgo-instrument` feature), so the profile-merge
+  and optimized stages complete.
+
 ## [0.6.0b3] — 2026-07-28
 
 ### Fix `drop` (and other ops) on a never-written collection under lazy shards
