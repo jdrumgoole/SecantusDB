@@ -297,6 +297,25 @@ with SecantusDBServer(port=0, storage_path=":memory:") as server:
     client.drop_database("wine_cellar")         # whole database
 ```
 
+## Admin web UI
+
+An optional local console — browse collections, watch live metrics, tail
+change streams, inspect query plans, manage users, and take backups
+(including point-in-time recovery) against any SecantusDB or
+MongoDB-wire server you already have running.
+
+```bash
+pip install 'secantusdb[admin]'
+secantus-admin --uri mongodb://127.0.0.1:27017
+```
+
+<img src="https://raw.githubusercontent.com/jdrumgoole/SecantusDB/main/docs/screenshots/admin-dashboard.png" alt="The SecantusDB admin dashboard: live server metrics, operation counters and per-second charts." width="900">
+
+It's dev-tool shaped, not a production console: loopback-only, gated by a
+local token, with every script and stylesheet served from the package.
+See [the admin UI docs](https://secantusdb.com/docs/admin.html) for a
+tour of all 22 pages.
+
 ## Documentation
 
 Full docs are at [secantusdb.com/docs](https://secantusdb.com/docs/index.html) — with the Rust server's own tree at [secantusdb.com/docs/rust](https://secantusdb.com/docs/rust/index.html).

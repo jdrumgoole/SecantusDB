@@ -8,10 +8,12 @@ backups — including point-in-time recovery — against any SecantusDB (or
 any MongoDB-wire-compatible) server the user already has running.
 
 It's **dev-tool shaped**, not a production console. The window connects
-over loopback, gates HTTP access with a fixed local token, and never
-makes outbound network calls of its own. `--uri` picks the target it
-opens against; from there the [Server page](#server-server) can switch
-targets without a restart.
+over loopback and gates HTTP access with a fixed local token. The one
+page that talks to the outside world is the
+[Geo viewer](#admin-geo-viewer), which loads its basemap tiles
+from OpenStreetMap; nothing else the UI does leaves your machine.
+`--uri` picks the target it opens against; from there the
+[Server page](#server-server) can switch targets without a restart.
 
 ## Install
 
@@ -23,9 +25,10 @@ pip install 'secantusdb[admin]'
 ```
 
 The extra brings in `fastapi`, `uvicorn[standard]`, `jinja2`, `httpx`,
-`pywebview`, and `python-multipart`. Static assets (HTMX, Alpine,
-Chart.js, Leaflet) are vendored in the package — no CDN is contacted
-at runtime.
+`pywebview`, and `python-multipart`. Every script, stylesheet and marker
+the UI uses (HTMX, Alpine, Chart.js, Leaflet) is vendored in the package
+— no CDN is contacted at runtime. The Geo page's *map tiles* are the sole
+exception; see the note in [Geo viewer](#admin-geo-viewer).
 
 ## Launch
 
@@ -191,6 +194,13 @@ The sidebar lists every page. Each is a thin client over a real wire
 command — there's no parallel data store, no schema-shadow inside the
 admin app.
 
+Every screenshot below is generated, not hand-captured: `invoke
+admin-screenshots` boots a throwaway SecantusDB, seeds it with a
+fictional shop dataset, drives each page with Playwright and writes the
+PNGs into `docs/screenshots/`. They are regenerated on every release, so
+what you see is the UI as of the version you're reading. See
+[Regenerating the screenshots](#regenerating-the-screenshots).
+
 ### Dashboard (`/`)
 
 KPI tiles (uptime, current / total connections, total commands, wire
@@ -199,6 +209,8 @@ ops/sec) driven by a 1 Hz WebSocket from `/ws/metrics`. The server
 samples `serverStatus` every second, computes per-tick deltas, and
 broadcasts to subscribed clients. Reconnects automatically with
 exponential backoff capped at 15 seconds.
+
+![The dashboard: live server metrics, operation counters and per-second charts.](screenshots/admin-dashboard.png)
 
 ### Databases & collections (`/db`, `/db/{db}`, `/db/{db}/{coll}`)
 
@@ -212,6 +224,12 @@ exponential backoff capped at 15 seconds.
   Delete buttons open typed-confirmation modals — Edit replaces the
   whole document via `replace_one` (with `_id` immutability enforced
   server-side); Delete requires typing the collection name to confirm.
+
+![The Databases page: every database with its collection and size totals.](screenshots/admin-databases.png)
+
+![A database's collections, with document counts and storage sizes.](screenshots/admin-collections.png)
+
+![The collection browser: paginated documents with an inline JSON viewer.](screenshots/admin-collection.png)
 
 The collection viewer's page-actions row links to four narrower
 inspectors: **Indexes**, **Explain plan**, **Schema**, and **Geo**.
@@ -233,6 +251,10 @@ inspectors: **Indexes**, **Explain plan**, **Schema**, and **Geo**.
   sort acceleration shows up naturally as the IXSCAN row's direction
   marker.
 
+![The Indexes page: every index with its key spec and unique / partial / multikey badges.](screenshots/admin-indexes.png)
+
+![Explain: the winning plan for a filter plus sort, stage by stage.](screenshots/admin-explain.png)
+
 ### Schema sampler (`/db/{db}/{coll}/schema`)
 
 Samples up to 1000 documents via `$sample`, walks every dotted path
@@ -241,13 +263,27 @@ type histogram, and the ten most common scalar values per field. Use
 this on an unfamiliar collection to size up its shape without
 guessing.
 
+![The schema sampler: inferred field types and coverage across a sample of documents.](screenshots/admin-schema.png)
+
+(admin-geo-viewer)=
 ### Geo viewer (`/db/{db}/{coll}/geo`)
 
 For collections with a `2dsphere` or `2d` index, drops the first 200
-sampled documents onto a Leaflet map (OpenStreetMap tiles). GeoJSON
-`Point` / `Polygon` / `LineString` and legacy `[lng, lat]` pairs are
-both rendered; `_id` shows in the popup. Empty-state links the user
-to the indexes page when no geo index exists.
+sampled documents onto a Leaflet map. GeoJSON `Point` / `Polygon` /
+`LineString` and legacy `[lng, lat]` pairs are both rendered as vector
+circles; `_id` shows in the popup. Empty-state links the user to the
+indexes page when no geo index exists.
+
+```{note}
+This is the one page that reaches the network. The basemap tiles come
+from OpenStreetMap (`tile.openstreetmap.org`), so opening it tells a
+third party your IP and, from the tiles requested, roughly where your
+data sits. Every other page — and every script, stylesheet and marker on
+this one — is served from the package itself. If that trade isn't one you
+want to make, don't open the Geo page.
+```
+
+![The geo viewer: documents from a 2dsphere-indexed collection plotted on a map.](screenshots/admin-geo.png)
 
 ### Users + roles (`/users`, `/roles`)
 
@@ -280,6 +316,10 @@ target reports but this package has no action table for is listed with a
 haven't been read. Creating and editing custom roles is deferred — see
 [Compatibility](compatibility.md).
 
+![The Users page: accounts on a database with their granted roles.](screenshots/admin-users.png)
+
+![The Roles page: every built-in role and the privileges it carries.](screenshots/admin-roles.png)
+
 ### Change-stream tail (`/changestream`)
 
 Pick a scope (cluster, db, coll), hit Watch, and a WebSocket-driven
@@ -293,6 +333,8 @@ events when off.
 The bridge from pymongo's sync `ChangeStream` to async runs the cursor
 in a thread (`asyncio.to_thread(stream.try_next)`); the cursor is
 closed cleanly on disconnect.
+
+![The change-stream tail: live insert / update / delete events with resume tokens.](screenshots/admin-changestream.png)
 
 ### Query (`/query`)
 
@@ -310,6 +352,8 @@ is recorded in a per-URI history at `~/.secantus/admin.db` (SQLite,
 capped at 50 entries per URI). Click a "Recent" row to repopulate the
 active form via `fetch(/query/history/{id})`.
 
+![The Query page running a find, with results and saved query history.](screenshots/admin-query.png)
+
 ### Insert (`/insert`)
 
 A dedicated page for adding documents — a sibling to Query rather
@@ -325,6 +369,8 @@ runCommand mould.
 
 The response renders inline below the form with the inserted
 `_id`s.
+
+![The Insert page: paste one document or an array and write it to any collection.](screenshots/admin-insert.png)
 
 ### Server (`/server`)
 
@@ -349,6 +395,8 @@ Target-switching plus the embedded server's lifecycle:
   / Forget actions. The "current" target is tagged with a badge
   and has no actions.
 
+![The Server page: build info, target switching and the embedded-server controls.](screenshots/admin-server.png)
+
 ### Connections + cursors (`/connections`, `/cursors`)
 
 Both views read from `currentOp`'s `inprog` array and auto-refresh
@@ -363,6 +411,10 @@ every 5 s.
 * `/cursors` — live tailable / batched cursors with badges for
   `tailable` and `awaitData`. Per-row Kill button issues
   `killCursors` over the wire.
+
+![The Connections page: current clients, with a kill control per operation.](screenshots/admin-connections.png)
+
+![The Cursors page: open cursors, their namespace and idle time.](screenshots/admin-cursors.png)
 
 ### Oplog (`/oplog`)
 
@@ -381,6 +433,8 @@ Each row collapses to ts / op badge / ns by default; an inline
 `<details>` toggle expands to the full Extended-JSON entry body
 (`o` for the operation payload, `o2` for the update predicate,
 `wall` for the wall-clock timestamp, etc.).
+
+![The Oplog page: recent entries with operation type, namespace and timestamp.](screenshots/admin-oplog.png)
 
 ### Profiler (`/profiler`)
 
@@ -403,6 +457,8 @@ on first profile-write. The dispatch path skips profiling against
 continuation, SCRAM rounds, and the `profile` command — so reads of
 the profile collection don't generate more profile entries.
 
+![The Profiler page: slow operations captured by the database profiler.](screenshots/admin-profiler.png)
+
 ### Maintenance (`/maintenance`)
 
 Five buttons in two zones:
@@ -415,11 +471,15 @@ Five buttons in two zones:
   form. Both open typed-confirm modals that require the user to type
   the target name verbatim before the wire command is issued.
 
+![The Maintenance page: fsync, oplog / TTL pruning and drop controls.](screenshots/admin-maintenance.png)
+
 ### Logs (`/logs`)
 
 Fetches `getLog("global")` every 2 seconds via HTMX polling. The
 server-side ring buffer (`secantus.logbuf.LogBuffer`) holds the last
 5000 lines.
+
+![The Logs page: a live tail of the server's log buffer.](screenshots/admin-logs.png)
 
 ### Backup (`/backup`)
 
@@ -499,6 +559,62 @@ Recovery is **offline-shaped**, exactly like archive extract: it writes a
 new directory and never touches the running server's storage. The success
 message tells you what to start — `--storage-path <target>` — and the
 form rejects `..` in either path.
+
+![The Backup page: dumps, archives, restores and point-in-time recovery.](screenshots/admin-backup.png)
+
+### When something goes wrong
+
+A rejected form doesn't dump a traceback or a bare JSON error object.
+FastAPI's validation failures are caught app-wide and re-rendered as an
+ordinary page — same sidebar, one-line summary of what was missing, and
+Back / Dashboard buttons — so a mistyped index spec leaves you somewhere
+you can navigate out of rather than on a dead JSON page.
+
+![The friendly error page: a failed action keeps the sidebar and offers a way back.](screenshots/admin-error.png)
+
+## Regenerating the screenshots
+
+The images throughout this page are generated by
+`scripts/admin_screenshots.py`, which:
+
+1. starts a throwaway SecantusDB on `127.0.0.1:27018` (a fixed port, so
+   the "connected to" badge reads identically across runs),
+2. seeds it with a fictional shop dataset — invented customers,
+   `example.com` addresses, public landmark coordinates — plus indexes of
+   every shape, users, profiler entries and backup archives, so no page
+   is photographed empty,
+3. serves the admin app headless and drives all 22 pages with Playwright,
+   filling and submitting forms where a bare `GET` would only show a
+   blank one, and
+4. rewrites machine-specific strings (the temp storage path, the home
+   directory, the hostname, the auth token) out of the DOM before each
+   shot, so a committed PNG carries nothing about the machine that made
+   it.
+
+```bash
+uv sync --extra screenshots
+uv run playwright install chromium   # once
+uv run python -m invoke admin-screenshots
+```
+
+Useful flags while iterating: `--only <slug>` for a single page (`--list`
+prints the slugs), `--headed` to watch the browser work, and
+`--from-checkout <repo>` to render a working tree's templates and static
+assets rather than the installed package's — which is what you want in a
+git worktree that borrows another checkout's virtualenv.
+
+Two guardrails make a bad regeneration loud rather than silent. The
+script fails if any page logs a JavaScript error, and it warns if a page
+was shot showing its "nothing here yet" empty state. Driving all 22 pages
+in a real browser is the only JS-level exercise this UI gets — the run
+that introduced these screenshots surfaced four live bugs that way, from
+a script-ordering mistake that stopped the dashboard's metrics socket
+from ever opening to Leaflet markers 404ing on unvendored images.
+
+`tests/test_docs_screenshots.py` checks that every page in the script has
+an image on disk and a reference in this document. It cannot tell a
+*stale* image from a fresh one, so regeneration is a release step — see
+the `secantusdb-release` skill.
 
 ## Files written to disk
 

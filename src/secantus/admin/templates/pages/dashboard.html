@@ -1,9 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
 
+{# No ``x-init="init()"``: Alpine already calls a component's own ``init()``
+   when it initialises ``x-data``, so the attribute ran it a second time —
+   two Chart instances fighting over each canvas ("Canvas is already in use",
+   then a "Maximum call stack size exceeded" cascade) and two metrics
+   websockets per page load. Guarded by tests/test_admin_asset_order.py. #}
 <div
   x-data="dashboard()"
-  x-init="init()"
   class="dashboard"
 >
   <div class="connection-status" x-text="status"></div>
@@ -34,22 +38,29 @@
   </section>
 
   <h2 class="section-title">Operations per second</h2>
+  {# Each canvas sits in a fixed-height, position:relative wrapper. The
+     charts run with ``maintainAspectRatio: false``, which makes Chart.js
+     size the canvas to its offset parent — with no wrapper it sized to the
+     grid cell, whose height was in turn driven by the canvas, and the pair
+     grew until the sparkline was a full-viewport vertical smear. The bare
+     ``height="60"`` attribute below never applied: responsive mode
+     overwrites it with an inline style on every resize. #}
   <section class="charts">
     <div class="chart-tile">
       <div class="chart-label">Inserts <span x-text="latest.delta.insert"></span>/s</div>
-      <canvas x-ref="ch_insert" height="60"></canvas>
+      <div class="chart-canvas"><canvas x-ref="ch_insert"></canvas></div>
     </div>
     <div class="chart-tile">
       <div class="chart-label">Queries <span x-text="latest.delta.query"></span>/s</div>
-      <canvas x-ref="ch_query" height="60"></canvas>
+      <div class="chart-canvas"><canvas x-ref="ch_query"></canvas></div>
     </div>
     <div class="chart-tile">
       <div class="chart-label">Updates <span x-text="latest.delta.update"></span>/s</div>
-      <canvas x-ref="ch_update" height="60"></canvas>
+      <div class="chart-canvas"><canvas x-ref="ch_update"></canvas></div>
     </div>
     <div class="chart-tile">
       <div class="chart-label">Deletes <span x-text="latest.delta.delete"></span>/s</div>
-      <canvas x-ref="ch_delete" height="60"></canvas>
+      <div class="chart-canvas"><canvas x-ref="ch_delete"></canvas></div>
     </div>
   </section>
 </div>
@@ -57,6 +68,15 @@
 <script>
 function dashboard() {
   const SPARK_LEN = 60;
+  // Chart instances and their backing series live in this closure, NOT in
+  // the object returned below. Alpine wraps component state in a reactive
+  // Proxy, and Chart.js keys its per-chart plugin state off the raw chart
+  // object — reached through a Proxy, those lookups miss, so `chart.legend`
+  // comes back undefined and every `update()` threw "Cannot set properties
+  // of undefined (setting 'fullSize')". Nothing in the markup binds to
+  // either value, so neither needs to be reactive.
+  const charts = {};
+  const series = {insert: [], query: [], update: [], delete: []};
   return {
     status: "connecting…",
     latest: {
@@ -66,15 +86,13 @@ function dashboard() {
       delta: {insert: 0, query: 0, update: 0, delete: 0, getmore: 0, command: 0, requests: 0},
       requests: 0,
     },
-    charts: {},
-    series: {insert: [], query: [], update: [], delete: []},
     backoff: 1000,
 
     init() {
-      this.charts.insert = this._mkChart(this.$refs.ch_insert);
-      this.charts.query = this._mkChart(this.$refs.ch_query);
-      this.charts.update = this._mkChart(this.$refs.ch_update);
-      this.charts.delete = this._mkChart(this.$refs.ch_delete);
+      charts.insert = this._mkChart(this.$refs.ch_insert);
+      charts.query = this._mkChart(this.$refs.ch_query);
+      charts.update = this._mkChart(this.$refs.ch_update);
+      charts.delete = this._mkChart(this.$refs.ch_delete);
       this._connect();
     },
 
@@ -114,7 +132,7 @@ function dashboard() {
         const msg = JSON.parse(event.data);
         if (msg.type === "backlog") {
           for (const sample of msg.samples) this._handleSample(sample, true);
-          for (const k of Object.keys(this.charts)) this.charts[k].update("none");
+          for (const k of Object.keys(charts)) charts[k].update("none");
         } else if (msg.type === "tick") {
           this._handleSample(msg.sample, false);
         }
@@ -130,10 +148,10 @@ function dashboard() {
     _handleSample(sample, fromBacklog) {
       this.latest = sample;
       for (const k of ["insert", "query", "update", "delete"]) {
-        const arr = this.series[k];
+        const arr = series[k];
         arr.push(sample.delta[k] || 0);
         while (arr.length > SPARK_LEN) arr.shift();
-        const chart = this.charts[k];
+        const chart = charts[k];
         chart.data.labels = arr.map((_, i) => i);
         chart.data.datasets[0].data = arr;
         if (!fromBacklog) chart.update("none");

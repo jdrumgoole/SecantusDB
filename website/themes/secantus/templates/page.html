@@ -35,6 +35,49 @@
     </div>
   </section>
 
+  <section class="section alt admin-section">
+    <div class="wrap">
+      <h2>With a console in the box</h2>
+      <p class="section-lead">One command opens a local web UI over whatever server you already have running &mdash; SecantusDB or a real <code>mongod</code>. Browse collections, watch live throughput, read a query plan, tail a change stream, manage users, take a backup. It's loopback-only and token-gated, and every script and stylesheet ships inside the package.</p>
+
+      <figure class="admin-shot">
+        <img src="/{{ THEME_STATIC_DIR }}/img/screenshots/admin-dashboard.png"
+             alt="The SecantusDB admin dashboard: uptime, connection and request tiles above four per-second operation sparklines."
+             width="2880" height="1800" loading="lazy" decoding="async">
+        <figcaption>Live server metrics, sampled once a second over a websocket.</figcaption>
+      </figure>
+
+      {# Only the pages that still read at thumbnail size. These images are
+         copied here by scripts/admin_screenshots.py — the shots it tags
+         "website" — so adding one means tagging it there; a hand-dropped
+         file would go stale at the next regeneration. #}
+      <div class="admin-thumbs">
+        <figure>
+          <img src="/{{ THEME_STATIC_DIR }}/img/screenshots/admin-query.png"
+               alt="The admin Query page running a find, with results below the form."
+               width="2880" height="1800" loading="lazy" decoding="async">
+          <figcaption>Run find, aggregate or any command</figcaption>
+        </figure>
+        <figure>
+          <img src="/{{ THEME_STATIC_DIR }}/img/screenshots/admin-changestream.png"
+               alt="The admin change-stream tail showing live insert, update and delete events."
+               width="2880" height="1800" loading="lazy" decoding="async">
+          <figcaption>Tail a change stream live</figcaption>
+        </figure>
+        <figure>
+          <img src="/{{ THEME_STATIC_DIR }}/img/screenshots/admin-explain.png"
+               alt="The admin explain view showing a winning query plan stage by stage."
+               width="2880" height="1800" loading="lazy" decoding="async">
+          <figcaption>See which index a query really used</figcaption>
+        </figure>
+      </div>
+
+      <div class="ctas" style="margin-top: 28px;">
+        <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}admin.html" rel="noopener">Take the tour &rarr;</a>
+      </div>
+    </div>
+  </section>
+
   <section class="section drivers-section">
     <div class="wrap">
       <h2>Every major MongoDB driver works</h2>

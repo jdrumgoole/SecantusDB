@@ -905,6 +905,16 @@ body {
   padding: 0.85rem 1rem;
 }
 
+/* The sparklines' size authority. Chart.js runs these with
+   ``maintainAspectRatio: false``, so it sizes each canvas to its nearest
+   positioned ancestor — this box. Without it the canvas sized itself
+   against the grid cell it was also defining, and the feedback loop grew
+   the chart to fill (and overflow) the viewport. */
+.chart-canvas {
+  position: relative;
+  height: 60px;
+}
+
 .chart-label {
   font-size: 0.8rem;
   color: var(--muted);
