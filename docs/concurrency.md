@@ -264,18 +264,33 @@ SecantusDB, the levers are:
    writer. Change streams remain exactly-once under the stack.
 7. **WiredTiger config tuning (Rust server / daemon).**
    `SECANTUS_WT_CONFIG_EXTRA` appends raw WT connection config
-   (last-key-wins). Log pre-allocation
-   (`log=(file_max=512MB,prealloc=true)`) lifts the write ceiling
-   ~8%; a larger `cache_size` lifts read-modify-write (update/delete)
-   throughput notably. Each trades disk or memory; measured gains are
-   modest (~10%).
+   (last-key-wins). A larger `cache_size` is the strongest single
+   knob under sustained writes (+26% at eight writers in the
+   Finding-13 sweep) — the daemon and the Python `RustServer` handle
+   now default to a 4G cache *cap* (WiredTiger fills it lazily, so
+   idle test servers stay small; `--cache-size` / `cache_size=`
+   overrides). Two cautions from the same sweep, post prune-fix:
+   log pre-allocation (`prealloc=true`) now *hurts* at eight writers
+   (−8%; the earlier +8% predates the prune fix), and **never turn
+   oplog block compression off** — throughput craters to ~19% of the
+   ceiling, because bigger uncompressed pages mean more eviction IO
+   and IO volume, not CPU, is the constraint.
+
+The defaults already carry the measured winners: oplog writes route
+across two shard tables (sixteen existed to spread an append hotspot
+that the RecordId + prune work eliminated; the read side still scans
+all sixteen, so any store stays readable), and the oplog/preimage
+btrees are created append-tuned (`split_pct=100,leaf_page_max=128KB`).
+With those defaults a fully-durable eight-writer load sustains ~54% of
+the no-oplog ceiling (~103k docs/s of 8 KiB documents on the reference
+box, vs ~43%/75k before).
 
 The honest ceiling: for a fully-durable, WAL-logged oplog the limit is
 WiredTiger's aggregate write rate on a single embedded process. The
 async + non-logged stack (levers 5+6) trades crash-durability of the
-oplog *tail* for ~2.2× and gets within ~65% of the no-oplog ceiling;
-past that, sustained multi-writer scaling means running a real
-`mongod` (or dropping the oplog entirely).
+oplog *tail* for the last stretch toward the no-oplog ceiling; past
+that, sustained multi-writer scaling means running a real `mongod`
+(or dropping the oplog entirely).
 
 ## What we tried, what didn't work
 

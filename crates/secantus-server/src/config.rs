@@ -83,7 +83,7 @@ impl Default for ResolvedConfig {
             oplog_max_entries: 100_000,
             oplog_archive_dir: None,
             noop_heartbeat_seconds: 0.0,
-            cache_size: "1G".to_string(),
+            cache_size: "4G".to_string(),
             log_file_max: "2GB".to_string(),
             session_max: 1000,
             ttl_sweep_seconds: 60.0,
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(c.oplog_max_entries, 100_000);
         assert_eq!(c.oplog_archive_dir, None);
         assert_eq!(c.noop_heartbeat_seconds, 0.0);
-        assert_eq!(c.cache_size, "1G");
+        assert_eq!(c.cache_size, "4G");
         assert_eq!(c.session_max, 1000);
         assert_eq!(c.ttl_sweep_seconds, 60.0);
         assert!(!c.sync_on_commit);

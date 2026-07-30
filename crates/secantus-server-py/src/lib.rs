@@ -58,7 +58,7 @@ impl RustServer {
     ///   knobs the daemons expose (`--cache-size` / `--session-max` /
     ///   `--sync-on-commit`), threaded into `wt_config`. Defaults match
     ///   `python -m secantus` and the standalone `secantusd-rs` binary
-    ///   (1G cache, 1000 sessions, no per-commit fsync).
+    ///   (4G cache cap — WiredTiger fills it lazily, so idle test servers stay small — 1000 sessions, no per-commit fsync).
     #[new]
     #[pyo3(signature = (
         storage_path,
@@ -71,7 +71,7 @@ impl RustServer {
         tls_key_file = None,
         tls_ca_file = None,
         tls_require_client_cert = false,
-        cache_size = "1G".to_string(),
+        cache_size = "4G".to_string(),
         session_max = 1000,
         sync_on_commit = false,
     ))]
@@ -97,7 +97,7 @@ impl RustServer {
             PyRuntimeError::new_err(format!("failed to create storage dir {storage_path}: {e}"))
         })?;
         // Defaults match `python -m secantus`, the Python `SecantusDBServer`,
-        // and the standalone `secantusdb` binary (1G cache; the engine's own
+        // and the standalone `secantusdb` binary (4G cache cap; the engine's own
         // `Storage::open` default stays 256M). Each knob is overridable per
         // handle so tests can exercise non-default WiredTiger configs.
         let mut storage = Storage::open_with_config(
