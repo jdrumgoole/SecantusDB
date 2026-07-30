@@ -1,6 +1,6 @@
 # Benchmark: both servers vs mongod
 
-Generated 2026-07-26 on Darwin arm64 (Apple Silicon), `bench.compare_servers`.
+Generated 2026-07-30 on Darwin arm64 (Apple Silicon), `bench.compare_servers`.
 
 All three servers use the **same WiredTiger storage engine** — mongod ships
 it; SecantusDB vendors the same C library — driven by the same `pymongo`
@@ -34,40 +34,37 @@ body[data-theme="dark"] .dviz-wrap {
 .dv-x { font-size:0.82em; opacity:0.75; }
 .dv-legend { display:flex; gap:16px; flex-wrap:wrap; margin:6px 0 4px; font-size:0.85rem; color:var(--dv-ink2); }
 .dv-legend .chip { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; vertical-align:-1px; }
-</style><div class="dviz-wrap"><div class="dv-legend"><span><span class="chip" style="background:var(--dv-rust)"></span>Rust server</span><span><span class="chip" style="background:var(--dv-py)"></span>Python server</span></div><svg viewBox="0 0 760 380" role="img" aria-label="Per-operation latency as a multiple of mongod" class="dviz"><line x1="295.2" y1="18" x2="295.2" y2="352" class="dv-grid"/><text x="295.2" y="368" text-anchor="middle" class="dv-tick">5<tspan class="dv-x">x</tspan></text><line x1="390.4" y1="18" x2="390.4" y2="352" class="dv-grid"/><text x="390.4" y="368" text-anchor="middle" class="dv-tick">10<tspan class="dv-x">x</tspan></text><line x1="485.6" y1="18" x2="485.6" y2="352" class="dv-grid"/><text x="485.6" y="368" text-anchor="middle" class="dv-tick">15<tspan class="dv-x">x</tspan></text><line x1="580.8" y1="18" x2="580.8" y2="352" class="dv-grid"/><text x="580.8" y="368" text-anchor="middle" class="dv-tick">20<tspan class="dv-x">x</tspan></text><line x1="676.0" y1="18" x2="676.0" y2="352" class="dv-grid"/><text x="676.0" y="368" text-anchor="middle" class="dv-tick">25<tspan class="dv-x">x</tspan></text><line x1="219.0" y1="18" x2="219.0" y2="352" class="dv-ref"/><text x="219.0" y="12" text-anchor="middle" class="dv-tick">mongod = 1<tspan class="dv-x">x</tspan></text><text x="190" y="42" text-anchor="end" class="dv-lab">insert (10k docs)</text><path d="M200,26 h11.2 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-11.2 z" fill="var(--dv-rust)"><title>Rust server — 0.8x mongod</title></path><text x="221" y="37" class="dv-val">0.8<tspan class="dv-x">x</tspan></text><path d="M200,42 h77.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-77.9 z" fill="var(--dv-py)"><title>Python server — 4.3x mongod</title></path><text x="288" y="53" class="dv-val">4.3<tspan class="dv-x">x</tspan></text><text x="190" y="96" text-anchor="end" class="dv-lab">find indexed range</text><path d="M200,80 h22.7 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-22.7 z" fill="var(--dv-rust)"><title>Rust server — 1.4x mongod</title></path><text x="233" y="91" class="dv-val">1.4<tspan class="dv-x">x</tspan></text><path d="M200,96 h127.4 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-127.4 z" fill="var(--dv-py)"><title>Python server — 6.9x mongod</title></path><text x="337" y="107" class="dv-val">6.9<tspan class="dv-x">x</tspan></text><text x="190" y="150" text-anchor="end" class="dv-lab">find full scan</text><path d="M200,134 h36.0 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-36.0 z" fill="var(--dv-rust)"><title>Rust server — 2.1x mongod</title></path><text x="246" y="145" class="dv-val">2.1<tspan class="dv-x">x</tspan></text><path d="M200,150 h144.5 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-144.5 z" fill="var(--dv-py)"><title>Python server — 7.8x mongod</title></path><text x="354" y="161" class="dv-val">7.8<tspan class="dv-x">x</tspan></text><text x="190" y="204" text-anchor="end" class="dv-lab">update_many (half)</text><path d="M200,188 h11.2 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-11.2 z" fill="var(--dv-rust)"><title>Rust server — 0.8x mongod</title></path><text x="221" y="199" class="dv-val">0.8<tspan class="dv-x">x</tspan></text><path d="M200,204 h235.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-235.9 z" fill="var(--dv-py)"><title>Python server — 12.6x mongod</title></path><text x="446" y="215" class="dv-val">12.6<tspan class="dv-x">x</tspan></text><text x="190" y="258" text-anchor="end" class="dv-lab">aggregate $group</text><path d="M200,242 h16.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-16.9 z" fill="var(--dv-rust)"><title>Rust server — 1.1x mongod</title></path><text x="227" y="253" class="dv-val">1.1<tspan class="dv-x">x</tspan></text><path d="M200,258 h319.7 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-319.7 z" fill="var(--dv-py)"><title>Python server — 17.0x mongod</title></path><text x="530" y="269" class="dv-val">17.0<tspan class="dv-x">x</tspan></text><text x="190" y="312" text-anchor="end" class="dv-lab">delete_many (half)</text><path d="M200,296 h13.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-13.1 z" fill="var(--dv-rust)"><title>Rust server — 0.9x mongod</title></path><text x="223" y="307" class="dv-val">0.9<tspan class="dv-x">x</tspan></text><path d="M200,312 h199.7 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-199.7 z" fill="var(--dv-py)"><title>Python server — 10.7x mongod</title></path><text x="410" y="323" class="dv-val">10.7<tspan class="dv-x">x</tspan></text></svg></div>
+</style><div class="dviz-wrap"><div class="dv-legend"><span><span class="chip" style="background:var(--dv-rust)"></span>Rust server</span><span><span class="chip" style="background:var(--dv-py)"></span>Python server</span></div><svg viewBox="0 0 760 380" role="img" aria-label="Per-operation latency as a multiple of mongod" class="dviz"><line x1="295.2" y1="18" x2="295.2" y2="352" class="dv-grid"/><text x="295.2" y="368" text-anchor="middle" class="dv-tick">5<tspan class="dv-x">x</tspan></text><line x1="390.4" y1="18" x2="390.4" y2="352" class="dv-grid"/><text x="390.4" y="368" text-anchor="middle" class="dv-tick">10<tspan class="dv-x">x</tspan></text><line x1="485.6" y1="18" x2="485.6" y2="352" class="dv-grid"/><text x="485.6" y="368" text-anchor="middle" class="dv-tick">15<tspan class="dv-x">x</tspan></text><line x1="580.8" y1="18" x2="580.8" y2="352" class="dv-grid"/><text x="580.8" y="368" text-anchor="middle" class="dv-tick">20<tspan class="dv-x">x</tspan></text><line x1="676.0" y1="18" x2="676.0" y2="352" class="dv-grid"/><text x="676.0" y="368" text-anchor="middle" class="dv-tick">25<tspan class="dv-x">x</tspan></text><line x1="219.0" y1="18" x2="219.0" y2="352" class="dv-ref"/><text x="219.0" y="12" text-anchor="middle" class="dv-tick">mongod = 1<tspan class="dv-x">x</tspan></text><text x="190" y="42" text-anchor="end" class="dv-lab">insert (10k docs)</text><path d="M200,26 h18.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-18.9 z" fill="var(--dv-rust)"><title>Rust server — 1.2x mongod</title></path><text x="229" y="37" class="dv-val">1.2<tspan class="dv-x">x</tspan></text><path d="M200,42 h79.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-79.8 z" fill="var(--dv-py)"><title>Python server — 4.4x mongod</title></path><text x="290" y="53" class="dv-val">4.4<tspan class="dv-x">x</tspan></text><text x="190" y="96" text-anchor="end" class="dv-lab">find indexed range</text><path d="M200,80 h22.7 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-22.7 z" fill="var(--dv-rust)"><title>Rust server — 1.4x mongod</title></path><text x="233" y="91" class="dv-val">1.4<tspan class="dv-x">x</tspan></text><path d="M200,96 h123.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-123.6 z" fill="var(--dv-py)"><title>Python server — 6.7x mongod</title></path><text x="334" y="107" class="dv-val">6.7<tspan class="dv-x">x</tspan></text><text x="190" y="150" text-anchor="end" class="dv-lab">find full scan</text><path d="M200,134 h36.0 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-36.0 z" fill="var(--dv-rust)"><title>Rust server — 2.1x mongod</title></path><text x="246" y="145" class="dv-val">2.1<tspan class="dv-x">x</tspan></text><path d="M200,150 h140.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-140.8 z" fill="var(--dv-py)"><title>Python server — 7.6x mongod</title></path><text x="351" y="161" class="dv-val">7.6<tspan class="dv-x">x</tspan></text><text x="190" y="204" text-anchor="end" class="dv-lab">update_many (half)</text><path d="M200,188 h17.0 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-17.0 z" fill="var(--dv-rust)"><title>Rust server — 1.0x mongod</title></path><text x="227" y="199" class="dv-val">1.1<tspan class="dv-x">x</tspan></text><path d="M200,204 h237.9 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-237.9 z" fill="var(--dv-py)"><title>Python server — 12.7x mongod</title></path><text x="448" y="215" class="dv-val">12.7<tspan class="dv-x">x</tspan></text><text x="190" y="258" text-anchor="end" class="dv-lab">aggregate $group</text><path d="M200,242 h15.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-15.1 z" fill="var(--dv-rust)"><title>Rust server — 1.1x mongod</title></path><text x="225" y="253" class="dv-val">1.0<tspan class="dv-x">x</tspan></text><path d="M200,258 h321.7 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-321.7 z" fill="var(--dv-py)"><title>Python server — 17.1x mongod</title></path><text x="532" y="269" class="dv-val">17.1<tspan class="dv-x">x</tspan></text><text x="190" y="312" text-anchor="end" class="dv-lab">delete_many (half)</text><path d="M200,296 h13.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-13.1 z" fill="var(--dv-rust)"><title>Rust server — 0.9x mongod</title></path><text x="223" y="307" class="dv-val">0.9<tspan class="dv-x">x</tspan></text><path d="M200,312 h201.7 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-201.7 z" fill="var(--dv-py)"><title>Python server — 10.8x mongod</title></path><text x="412" y="323" class="dv-val">10.8<tspan class="dv-x">x</tspan></text></svg></div>
 ```
 
 | Workload | mongod | Rust server | ×mongod | Python server | ×mongod |
 |---|---:|---:|---:|---:|---:|
-| insert (10k docs) | 58.8 ms | 46.5 ms | 0.8× | 252.2 ms | 4.3× |
-| find indexed range | 4.4 ms | 6.1 ms | 1.4× | 30.7 ms | 6.9× |
-| find full scan | 7.7 ms | 16.5 ms | 2.1× | 60.2 ms | 7.8× |
-| update_many (half) | 35.6 ms | 28.2 ms | 0.8× | 446.8 ms | 12.6× |
-| aggregate `$group` | 5.8 ms | 6.2 ms | 1.1× | 98.0 ms | 17.0× |
-| delete_many (half) | 20.7 ms | 18.1 ms | 0.9× | 221.1 ms | 10.7× |
+| insert (10k docs) | 62.0 ms | 74.0 ms | 1.2× | 271.8 ms | 4.4× |
+| find indexed range | 4.7 ms | 6.5 ms | 1.4× | 31.6 ms | 6.7× |
+| find full scan | 8.1 ms | 16.6 ms | 2.1× | 61.6 ms | 7.6× |
+| update_many (half) | 35.9 ms | 37.8 ms | 1.1× | 455.7 ms | 12.7× |
+| aggregate `$group` | 5.9 ms | 6.1 ms | 1.0× | 100.2 ms | 17.1× |
+| delete_many (half) | 20.7 ms | 17.8 ms | 0.9× | 223.6 ms | 10.8× |
 
 ## Reading the numbers
 
-- **The Rust server runs at ~0.8×–2.1× of mongod** per operation — writes now
-  beat standalone `mongod` (insert 0.8×, update 0.8×, delete 0.9×) and single-op
-  `aggregate $group` is at parity (1.1×), after the mimalloc allocator,
-  link-time optimization, and profile-guided optimization cut the
-  BSON-materialization allocation and hot-path branch cost that dominated the
-  write and aggregate paths (on top of the earlier oplog write-path fix that
-  stopped re-encoding documents it already had); the larger gaps are the
-  read-scan / multi-stage-aggregate paths, dispatch and operator work above a
+- **The Rust server runs at ~0.9×–2.1× of mongod** per operation —
+  delete_many beats standalone `mongod` (0.9×), single-op `aggregate
+  $group` is at parity (1.0×), and update_many is near parity (1.1×),
+  the compound effect of the mimalloc allocator, link-time optimization,
+  and profile-guided optimization on top of the raw-BSON write path and
+  RecordId keying. The small-doc one-shot insert reads 1.2× this cycle
+  (it was 0.8× on the 2026-07-26 baseline; being bisected — sustained
+  write *throughput* moved the other way, up ~2.6× at eight writers, see
+  [concurrency](concurrency.md)); the larger gaps are the read-scan /
+  multi-stage-aggregate paths, dispatch and operator work above a
   storage engine that is literally the same C library.
 - **The Python server runs at ~4×–17× of mongod** on these workloads, and
-  the Rust server is correspondingly **~4×–14× faster than the Python
+  the Rust server is correspondingly **~3.5×–17× faster than the Python
   server** workload-for-workload (largest on update-heavy and aggregation
   paths, where Python does the most per-document work and where the Rust
-  allocator + LTO win is biggest). The Python scan and aggregation figures
-  improved markedly (full scan 12.0× → 7.8×, `$group` 22.4× → 17.0×, insert
-  4.9× → 4.3×) when the Python document table became keyed by RecordId: an
-  unsorted walk now reads the table directly instead of going through a side
-  index, and an insert writes three rows instead of four. The same change
-  costs a little on the indexed-read and update paths (6.5× → 6.9×,
-  12.1× → 12.6×), which now unpack the document's key out of the stored row.
+  allocator + LTO win is biggest). The Python figures are stable against
+  the previous baseline within noise.
 - Every number includes the wire protocol and `pymongo` driver overhead a
   real client pays — these are end-to-end times, not engine microbenchmarks.
 - The numbers are **single-machine, single-process, no concurrency** — a

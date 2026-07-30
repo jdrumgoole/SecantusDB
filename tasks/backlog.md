@@ -258,6 +258,23 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **Rust server: small-doc one-shot insert latency regressed 0.8× → 1.2×
+  mongod between the 2026-07-26 (#666) and 2026-07-30 baselines
+  (`bench.compare_servers`, n=10000, reps=5).** NOT the #702 storage-shape
+  change (probed: 16 shards + WT-default oplog page config measures the same
+  76ms) and NOT PGO staleness (re-measured after `rust-pgo-refresh` + rebuild —
+  the refresh recovered update 1.2→1.1, `$group` 1.3→1.0, delete 1.5→0.9, but
+  insert stayed ~74ms vs the era's ~46.5ms). This workload never reaches the
+  oplog cap, so #700's prune path is also not implicated. Remaining suspects:
+  the lazy-shard slice (#680/#681, first-touch creates + absent-shard
+  tolerance on the insert path), the visibility-point tracker (#696,
+  per-batch in-flight bookkeeping — A/B'd neutral on 8 KiB continuous but
+  never on small-doc one-shot), or a mongod-side drift (its ms also moved
+  58.8 → 62.0). Bisect with `bench.compare_servers --n 10000` insert-only
+  across #666 → #680 → #696 → #700. Sustained-throughput measurements moved
+  the OTHER way throughout (Findings 12-13), so this is latency-shape
+  specific, not a general write regression.
+
 - [ ] **Python server: oplog minted-vs-committed race via user transactions
   (twin of the Rust bug fixed by the oplog-visibility-point PR, 2026-07-30).**
   `Storage.oplog_tail_seq` / `oplog_tail_seq_nolock` return `_next_seq - 1` —
