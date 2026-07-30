@@ -51,8 +51,15 @@ def server(tmp_path):
 def _extract(archive: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tar:
-        # trusted test archive — no `filter` kwarg (older 3.10/3.11 reject it).
-        tar.extractall(target)
+        # Same capability probe as ``Storage.extract_backup_archive`` — see the
+        # fuller note there. ``filter="data"`` is what Python 3.14 makes the
+        # default, so passing it explicitly both silences the deprecation
+        # warning and pins today's behaviour to tomorrow's; the ``hasattr``
+        # guard keeps 3.10.11 (which predates the backport) working.
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(target, filter="data")
+        else:
+            tar.extractall(target)
 
 
 def _take_backup(client: MongoClient, archive: Path) -> dict[str, Any]:

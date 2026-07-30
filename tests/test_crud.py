@@ -4418,8 +4418,14 @@ def test_backup_archive_via_pymongo_round_trips_data(server, tmp_path) -> None:
     restored_dir = tmp_path / "restored"
     restored_dir.mkdir()
     with tarfile.open(archive, "r:gz") as tar:
-        # trusted test archive — no `filter` kwarg (older 3.10/3.11 reject it).
-        tar.extractall(restored_dir)
+        # Same capability probe as ``Storage.extract_backup_archive`` — see the
+        # fuller note there. ``filter="data"`` becomes Python 3.14's default, so
+        # passing it explicitly pins today's behaviour to tomorrow's; the
+        # ``hasattr`` guard keeps 3.10.11 (pre-backport) working.
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(restored_dir, filter="data")
+        else:
+            tar.extractall(restored_dir)
 
     with SecantusDBServer(port=0, storage_path=str(restored_dir)) as restored:
         client2 = MongoClient(restored.uri, serverSelectionTimeoutMS=2000)
