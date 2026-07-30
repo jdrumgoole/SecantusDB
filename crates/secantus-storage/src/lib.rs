@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -477,6 +477,27 @@ fn oplog_shard_for_batch(start_seq: i64) -> String {
     oplog_shard_name(start_seq.rem_euclid(OPLOG_SHARDS))
 }
 
+/// Ensure the oplog shard table for `start_seq`'s batch exists — creating it on
+/// FIRST touch only — and return its name. `session.create` is idempotent, but
+/// it still takes WiredTiger's schema lock on every call, and the old emit path
+/// paid that on every batch. The bitmask is process-lifetime sticky (shard
+/// tables are never dropped while the store is open); a stale-false bit merely
+/// re-runs the idempotent create, so races between writers are harmless.
+fn ensure_oplog_shard(
+    shards_created: &AtomicU32,
+    session: &Session,
+    start_seq: i64,
+) -> Result<String> {
+    let idx = start_seq.rem_euclid(OPLOG_SHARDS);
+    let shard = oplog_shard_name(idx);
+    let bit = 1u32 << (idx as u32);
+    if shards_created.load(Ordering::Relaxed) & bit == 0 {
+        session.create(&shard, &oplog_table_cfg())?;
+        shards_created.fetch_or(bit, Ordering::Relaxed);
+    }
+    Ok(shard)
+}
+
 /// Merge-read the sharded oplog in ascending seq order, starting at the first
 /// seq >= `start_seq`, up to `limit` non-empty entries. A k-way merge across the
 /// `OPLOG_SHARDS` shard cursors (each shard is seq-sorted): repeatedly emit the
@@ -583,6 +604,81 @@ fn read_oplog_shards_tagged(
         };
     }
     Ok(out)
+}
+
+/// Key-only doomed-row scan for the prune sweep: a k-way merge of the oldest
+/// rows' KEYS across the shard tables, reading a row's VALUE only where the
+/// retention check needs its `ts` (rows inside the cap `excess` are doomed by
+/// position alone). `read_oplog_shards_tagged` materialises every row's full
+/// blob — at a sustained 8 KiB write load that made each opportunistic sweep
+/// copy ~8 MB just to learn which seqs to delete, ~36% of the whole sync
+/// insert path (Finding 12). Returns `(seq, table_index)` in ascending seq
+/// order, stopping at the first row that is neither cap-doomed nor past
+/// retention (the doomed set is always a seq-ordered prefix), bounded by
+/// `excess.max(retention_batch)` rows exactly like the sweep it replaces.
+fn scan_doomed_oplog_keys(
+    session: &Session,
+    excess: usize,
+    cutoff: i64,
+    retention_batch: usize,
+) -> Result<Vec<(i64, usize)>> {
+    let tables = oplog_all_tables();
+    let mut cursors: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
+    let mut heads: Vec<Option<i64>> = Vec::with_capacity(tables.len());
+    for tbl in &tables {
+        let cur = match session.open_cursor(tbl, None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => {
+                // Lazy shards: absent shard reads as empty; keep index alignment.
+                cursors.push(None);
+                heads.push(None);
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        heads.push(if cur.next()? {
+            Some(cur.get_key_q()?)
+        } else {
+            None
+        });
+        cursors.push(Some(cur));
+    }
+    let limit = excess.max(retention_batch);
+    let mut doomed: Vec<(i64, usize)> = Vec::new();
+    while doomed.len() < limit {
+        let mut best: Option<usize> = None;
+        let mut best_seq = i64::MAX;
+        for (i, h) in heads.iter().enumerate() {
+            if let Some(seq) = *h {
+                if seq < best_seq {
+                    best_seq = seq;
+                    best = Some(i);
+                }
+            }
+        }
+        let Some(i) = best else { break };
+        let cur = cursors[i].as_ref().expect("selected shard has a cursor");
+        if doomed.len() < excess {
+            // Cap-doomed by position alone — no value read.
+            doomed.push((best_seq, i));
+        } else {
+            // Retention tail: peek the ts; the first in-window (or undatable)
+            // row ends the doomed prefix — keep what we can't date.
+            let blob = cur.get_value_u()?;
+            let past_retention =
+                matches!(peek_entry_ts(&blob), Some(ts) if i64::from(ts.time) < cutoff);
+            if !past_retention {
+                break;
+            }
+            doomed.push((best_seq, i));
+        }
+        heads[i] = if cur.next()? {
+            Some(cur.get_key_q()?)
+        } else {
+            None
+        };
+    }
+    Ok(doomed)
 }
 
 /// Largest seq present across all oplog shards (0 if all empty). A single
@@ -1924,6 +2020,9 @@ pub struct Storage {
     /// exclusion — writers only append strictly higher seqs and never touch
     /// the old rows a prune dooms.
     oplog_prune_lock: Mutex<()>,
+    /// Which oplog shard tables this process has already created (bit per shard
+    /// index) — see [`ensure_oplog_shard`]. Shared with the async drainers.
+    oplog_shards_created: Arc<AtomicU32>,
     /// Whether writes emit oplog entries (and the oplog tables are live). Mirrors
     /// `storage.enable_oplog`. Default `true`.
     enable_oplog: bool,
@@ -2168,6 +2267,8 @@ struct DrainerShared {
     oplog: Arc<Mutex<OplogState>>,
     oplog_cv: Arc<Condvar>,
     backpressure: Arc<Backpressure>,
+    /// Shared with `Storage.oplog_shards_created` — see [`ensure_oplog_shard`].
+    shards_created: Arc<AtomicU32>,
 }
 
 /// Spawn the background oplog drainer pool and return the handle committed writes
@@ -2177,6 +2278,7 @@ fn spawn_oplog_drainer(
     conn: Arc<Connection>,
     oplog: Arc<Mutex<OplogState>>,
     oplog_cv: Arc<Condvar>,
+    shards_created: Arc<AtomicU32>,
 ) -> Arc<AsyncOplog> {
     // The cap is overridable via `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (tuning + tests
     // that force backpressure with a tiny cap); a 0/invalid value keeps the default.
@@ -2202,6 +2304,7 @@ fn spawn_oplog_drainer(
         oplog,
         oplog_cv,
         backpressure: backpressure.clone(),
+        shards_created,
     };
     let mut txs = Vec::with_capacity(num_drainers);
     let mut joins = Vec::with_capacity(num_drainers);
@@ -2220,12 +2323,16 @@ fn spawn_oplog_drainer(
 
 /// Write one contiguous batch of oplog entries (+ pre-images) to its shard, in a
 /// single WT transaction so a partial batch never becomes visible.
-fn write_drain_batch(session: &Session, batch: &DrainBatch) -> Result<()> {
+fn write_drain_batch(
+    session: &Session,
+    shards_created: &AtomicU32,
+    batch: &DrainBatch,
+) -> Result<()> {
     session.begin_transaction(None)?;
     let res = (|| -> Result<()> {
-        // Lazy shards: make this oplog shard on first write (idempotent create —
-        // a metadata check once it exists).
-        session.create(&batch.shard, &oplog_table_cfg())?;
+        // Lazy shards: created on first touch only (bitmask; see
+        // `ensure_oplog_shard`).
+        ensure_oplog_shard(shards_created, session, batch.start_seq)?;
         let cur = session.open_cursor(&batch.shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         for (i, blob) in batch.blobs.iter().enumerate() {
@@ -2269,7 +2376,7 @@ fn persist_and_record(
     let start = batch.start_seq;
     let n = batch.blobs.len() as i64;
     let bytes = batch.bytes;
-    if let Err(e) = write_drain_batch(session, &batch) {
+    if let Err(e) = write_drain_batch(session, &shared.shards_created, &batch) {
         eprintln!(
             "secantus-storage: async oplog drainer write failed at seq {start}: {e:?} (will retry)"
         );
@@ -2288,7 +2395,11 @@ fn persist_and_record(
 
 /// Write a coalesced group of batches (possibly spanning several of this
 /// drainer's shards) in ONE WT transaction. One cursor per distinct shard.
-fn write_drain_batches(session: &Session, batches: &[DrainBatch]) -> Result<()> {
+fn write_drain_batches(
+    session: &Session,
+    shards_created: &AtomicU32,
+    batches: &[DrainBatch],
+) -> Result<()> {
     session.begin_transaction(None)?;
     let res = (|| -> Result<()> {
         let mut curs: HashMap<&str, Cursor> = HashMap::new();
@@ -2297,8 +2408,8 @@ fn write_drain_batches(session: &Session, batches: &[DrainBatch]) -> Result<()> 
             let cur = match curs.entry(batch.shard.as_str()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    // Lazy shards: make this oplog shard on first write (idempotent).
-                    session.create(&batch.shard, &oplog_table_cfg())?;
+                    // Lazy shards: created on first touch only (bitmask).
+                    ensure_oplog_shard(shards_created, session, batch.start_seq)?;
                     e.insert(session.open_cursor(&batch.shard, None)?)
                 }
             };
@@ -2348,7 +2459,7 @@ fn persist_group(
         }
         return;
     }
-    match write_drain_batches(session, &group) {
+    match write_drain_batches(session, &shared.shards_created, &group) {
         Ok(()) => {
             let bytes: usize = group.iter().map(|b| b.bytes).sum();
             let advanced = {
@@ -2889,6 +3000,7 @@ impl Storage {
         state.written_seq = state.next_seq - 1;
         let oplog = Arc::new(Mutex::new(state));
         let oplog_cv = Arc::new(Condvar::new());
+        let oplog_shards_created = Arc::new(AtomicU32::new(0));
         // PROTOTYPE opt-in: spawn the background drainer when SECANTUS_OPLOG_ASYNC
         // is set. The synchronous, atomic path is the default (`None`).
         let async_oplog = if std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some() {
@@ -2896,6 +3008,7 @@ impl Storage {
                 conn.clone(),
                 oplog.clone(),
                 oplog_cv.clone(),
+                oplog_shards_created.clone(),
             ))
         } else {
             None
@@ -2906,6 +3019,7 @@ impl Storage {
             lock: Mutex::new(()),
             coll_locks: Mutex::new(HashMap::new()),
             oplog_prune_lock: Mutex::new(()),
+            oplog_shards_created,
             enable_oplog: true,
             oplog,
             oplog_cv,
@@ -3289,9 +3403,9 @@ impl Storage {
         // instead of contending on one table's rightmost page (the scaling fix),
         // while each batch stays a contiguous sequential append to a single tree
         // (the locality that per-entry scatter destroyed). One cursor for the run.
-        let op_shard = oplog_shard_for_batch(start);
-        // Lazy shards: make this oplog shard on first write (idempotent create).
-        session.create(&op_shard, &oplog_table_cfg())?;
+        // Lazy shards: created on first touch only (the bitmask skips the
+        // per-batch schema-lock `create` the old path paid on every emit).
+        let op_shard = ensure_oplog_shard(&self.oplog_shards_created, session, start)?;
         let cur = session.open_cursor(&op_shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         let wall_millis = now_millis();
@@ -4029,9 +4143,8 @@ impl Storage {
         // to one shard (by its first seq) — any shard is fine since the merge-read
         // and all-table point-ops find rows regardless of placement; a single
         // contiguous append keeps the restore fast (per-seq routing would scatter).
-        let op_shard = oplog_shard_for_batch(rows[0].0);
-        // Lazy shards: make this oplog shard on first write (idempotent create).
-        session.create(&op_shard, &oplog_table_cfg())?;
+        // Lazy shards: created on first touch only (bitmask).
+        let op_shard = ensure_oplog_shard(&self.oplog_shards_created, &session, rows[0].0)?;
         let cur = session.open_cursor(&op_shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         let mut max_seq = 0i64;
@@ -4131,26 +4244,18 @@ impl Storage {
             }
         }
 
-        // Bounded walk of the oldest rows only: a row is doomed if it's within the
-        // cap excess (i < excess) OR past retention (ts < cutoff). Both doom a
-        // seq-ordered prefix, so stop at the first row that is neither. The read is
-        // bounded by max(excess, RETENTION_SCAN_BATCH); any retention rows beyond
-        // that drain on later sweeps. The tagged merge carries each row's source
-        // table so phase 2 deletes from exactly that table. An undatable row ends
-        // the retention prefix (keep what we can't date) but is still cap-doomed if
-        // i < excess.
-        let limit = excess.max(RETENTION_SCAN_BATCH);
-        let rows = read_oplog_shards_tagged(&session, 0, limit)?;
-        let mut doomed: Vec<(i64, usize)> = Vec::new();
-        for (i, (seq, tbl, blob)) in rows.iter().enumerate() {
-            let past_retention =
-                matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) < cutoff);
-            if i < excess || past_retention {
-                doomed.push((*seq, *tbl));
-            } else {
-                break;
-            }
-        }
+        // Bounded KEY-ONLY walk of the oldest rows: a row is doomed if it's
+        // within the cap excess (position alone — no value read) OR past
+        // retention (its `ts` peeked only in the tail beyond the excess). Both
+        // doom a seq-ordered prefix, so the scan stops at the first row that is
+        // neither, bounded by max(excess, RETENTION_SCAN_BATCH); retention rows
+        // beyond that drain on later sweeps. The merge carries each row's
+        // source table so phase 2 deletes from exactly that table. At a
+        // sustained write load past the cap the old full-value merge
+        // (`read_oplog_shards_tagged`) copied ~8 MB of blobs per sweep just to
+        // learn the doomed seqs — ~36% of the whole sync insert path
+        // (Finding 12); keys are all the cap trim needs.
+        let doomed = scan_doomed_oplog_keys(&session, excess, cutoff, RETENTION_SCAN_BATCH)?;
         if doomed.is_empty() {
             return Ok(0);
         }
@@ -4213,10 +4318,37 @@ impl Storage {
     /// The smallest seq whose entry `ts >= target` (tail + 1 if none qualify) —
     /// used to resolve `startAtOperationTime`. Mirrors `storage.find_seq_for_ts`.
     pub fn find_seq_for_ts(&self, ts: bson::Timestamp) -> Result<i64> {
-        // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
-        // Sharded: ts is monotone in the *global* seq order, so the shard merge
-        // yields entries in ts order — the first one at/after `target` is the
-        // answer.
+        // The scan sees only COMMITTED rows, but `ts` is minted monotonically
+        // with `seq`, so the first *committed* seq at/after the target can sit
+        // above a still-in-flight lower seq whose ts also qualifies — a
+        // `startAtOperationTime` position finalised there would permanently
+        // skip that entry when its transaction commits (the same
+        // minted-vs-committed class the visibility point closed for tailing;
+        // recorded as the PR #696 residual). So: only accept an answer `r`
+        // once the visible tail covers `r - 1` — then no in-flight seq below
+        // `r` can exist (in-flight seqs are all > visible_tail) — and
+        // otherwise wait briefly for the window to drain and rescan (a commit
+        // may materialise an earlier qualifying row). Statement transactions
+        // resolve in microseconds; a long-open user transaction hits the
+        // bounded deadline and falls back to the committed-view answer, which
+        // is exactly today's best-effort behaviour.
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let r = self.find_seq_for_ts_scan(ts)?;
+            let vis = self.oplog_visible_tail_seq();
+            if r - 1 <= vis || std::time::Instant::now() >= deadline {
+                return Ok(r);
+            }
+            self.wait_for_oplog(vis, 50);
+        }
+    }
+
+    /// One committed-view scan for `find_seq_for_ts`: the shard merge yields
+    /// entries in ts order (ts is monotone in the global seq order), so the
+    /// first at/after `target` is the answer; the minted tail + 1 when no
+    /// committed row qualifies. Lock-free cross-thread read on a fresh MVCC
+    /// session (see `read_oplog`).
+    fn find_seq_for_ts_scan(&self, ts: bson::Timestamp) -> Result<i64> {
         let session = self.conn.open_session()?;
         for (seq, blob) in read_oplog_shards(&session, 0, usize::MAX)? {
             if let Some(e) = peek_entry_ts(&blob) {
