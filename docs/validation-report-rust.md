@@ -1,6 +1,6 @@
 # mongo-rust-driver Validation Report
 
-Generated 2026-07-19 — SecantusDB 0.6.0b0 vs mongo-rust-driver 12dd49bf (`vendor/mongo-rust-driver/`).
+Generated 2026-07-30 — SecantusDB 0.6.0b5 vs mongo-rust-driver 12dd49bf (`vendor/mongo-rust-driver/`).
 
 Run `uv run python -m invoke validate-rust` to refresh. The Rust-driver analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges — the language MongoDB consumers reach for when they want native performance + async.
 
