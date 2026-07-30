@@ -53,10 +53,15 @@ body[data-theme="dark"] .dviz-wrap {
   $group` is at parity (1.0×), and update_many is near parity (1.1×),
   the compound effect of the mimalloc allocator, link-time optimization,
   and profile-guided optimization on top of the raw-BSON write path and
-  RecordId keying. The small-doc one-shot insert reads 1.2× this cycle
-  (it was 0.8× on the 2026-07-26 baseline; being bisected — sustained
-  write *throughput* moved the other way, up ~2.6× at eight writers, see
-  [concurrency](concurrency.md)); the larger gaps are the read-scan /
+  RecordId keying. The insert row reads 1.2× this cycle (0.8× on the
+  2026-07-26 baseline) — bisected to a **cost shift, not a hot-path
+  regression**: SecantusDB now creates its shard tables lazily on first
+  write instead of eagerly at open (the change that took server open
+  from ~500ms to milliseconds), and this benchmark times a fresh store's
+  first-ever writes, so the insert number absorbs those one-time table
+  creates. A warmed store inserts at the previous level, and sustained
+  write *throughput* is up ~2.6× at eight writers (see
+  [concurrency](concurrency.md)). The larger gaps are the read-scan /
   multi-stage-aggregate paths, dispatch and operator work above a
   storage engine that is literally the same C library.
 - **The Python server runs at ~4×–17× of mongod** on these workloads, and

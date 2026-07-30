@@ -258,22 +258,25 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **Rust server: small-doc one-shot insert latency regressed 0.8× → 1.2×
-  mongod between the 2026-07-26 (#666) and 2026-07-30 baselines
-  (`bench.compare_servers`, n=10000, reps=5).** NOT the #702 storage-shape
-  change (probed: 16 shards + WT-default oplog page config measures the same
-  76ms) and NOT PGO staleness (re-measured after `rust-pgo-refresh` + rebuild —
-  the refresh recovered update 1.2→1.1, `$group` 1.3→1.0, delete 1.5→0.9, but
-  insert stayed ~74ms vs the era's ~46.5ms). This workload never reaches the
-  oplog cap, so #700's prune path is also not implicated. Remaining suspects:
-  the lazy-shard slice (#680/#681, first-touch creates + absent-shard
-  tolerance on the insert path), the visibility-point tracker (#696,
-  per-batch in-flight bookkeeping — A/B'd neutral on 8 KiB continuous but
-  never on small-doc one-shot), or a mongod-side drift (its ms also moved
-  58.8 → 62.0). Bisect with `bench.compare_servers --n 10000` insert-only
-  across #666 → #680 → #696 → #700. Sustained-throughput measurements moved
-  the OTHER way throughout (Findings 12-13), so this is latency-shape
-  specific, not a general write regression.
+- [x] **RESOLVED (bisected 2026-07-30): the small-doc one-shot insert
+  "regression" (0.8× → 1.2× mongod between #666 and #703) is a COST SHIFT
+  from PR #680's lazy shard creation, not a hot-path regression.** Bisect
+  (insert-only micro-harness mirroring `compare_servers`, PGO disabled at
+  every point for comparability, 5 reps/point, medians): #664 62.5ms →
+  #674 68.6 → **#679 61.7 (clean) → #680+#681 86.9 (+41%)** → #696 84.0 →
+  #700 88.5 → #702 83.9 → current 83.4. Mechanism confirmed by a warmup
+  probe: a single 1-doc insert before the timed 10k-doc run drops current
+  code from 84.6ms back to 64.9ms — the benchmark times a FRESH store's
+  first-ever writes, which post-#680 absorb the one-time lazy table
+  creates (~10.6ms each: doc shard, oplog shard) plus first-WAL
+  allocation that eager creation used to pay at open. That shift is
+  #680's entire point (eager creation's ~500ms/37-table opens saturated
+  disk under the parallel suite); steady-state insert cost is
+  unregressed, and sustained-throughput measurements improved throughout
+  (Findings 12-13). `docs/benchmark.md` now explains the number instead
+  of calling it a regression. Optional future nicety (small): pre-create
+  the two route-default oplog shards on a background thread at open to
+  hide ~10ms of first-write latency — cosmetic, not queued.
 
 - [ ] **Python server: oplog minted-vs-committed race via user transactions
   (twin of the Rust bug fixed by the oplog-visibility-point PR, 2026-07-30).**
