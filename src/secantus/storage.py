@@ -1482,6 +1482,21 @@ class Storage:
         # of the WT concurrency plan) so concurrent writers can mint
         # without contending on the global storage lock.
         self._oplog_seq_lock = threading.Lock()
+        # In-flight mint window: ``start_seq -> end_seq`` (exclusive) for every
+        # minted batch whose transaction has not yet committed or rolled back.
+        # Guarded by ``_oplog_seq_lock``. The **visible tail** — the largest
+        # seq below which nothing can still appear — is ``min(window) - 1``
+        # when non-empty, else ``_next_seq - 1`` (the analogue of WiredTiger /
+        # mongod's ``all_durable`` timestamp, and the twin of the Rust
+        # server's ``OplogState.in_flight``). Since the Phase-2.4
+        # per-collection lock split, writers on different collections mint
+        # and commit independently — a reader that advanced past a
+        # minted-but-uncommitted seq would permanently lose the event when
+        # its transaction commits, so every tail readers consume is bounded
+        # by this window's floor. A rolled-back batch simply deregisters:
+        # the abandoned range vanishes and ``min`` moves on (a permanent seq
+        # hole, which the oplog merge already tolerates).
+        self._oplog_in_flight: dict[int, int] = {}
         # Tiny lock for the monotonic insertion-order counter (_NAT_TABLE seq).
         # Global (not per-collection): seqs are unique across the whole store
         # so an unsorted scan within any one collection still sees a strictly
@@ -1891,8 +1906,62 @@ class Storage:
         with self._oplog_seq_lock:
             start = self._next_seq
             self._next_seq += n
+            # Register the range in the in-flight window (same lock
+            # acquisition — zero extra locking). The emitting scope parks it
+            # on ``_tls.pending_minted`` for its resolution point (batch-txn
+            # exit, user-txn commit/abort, or end-of-emit for bare
+            # autocommit writes) to deregister via ``_deregister_minted``.
+            self._oplog_in_flight[start] = start + n
             timestamps = [self._mint_ts() for _ in range(n)]
             return start, timestamps
+
+    def _deregister_minted(self, ranges: list[tuple[int, int]]) -> None:
+        """Remove minted seq ranges from the in-flight window and wake
+        tailable waiters — their transaction committed (rows visible) or
+        rolled back (rows can never appear); either way the visible tail
+        may have advanced."""
+        if not ranges:
+            return
+        with self._oplog_seq_lock:
+            for start, _end in ranges:
+                self._oplog_in_flight.pop(start, None)
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
+
+    def _drain_pending_minted(self) -> list[tuple[int, int]]:
+        """Take (and clear) the ranges the current thread's scope minted."""
+        pending = getattr(self._tls, "pending_minted", None)
+        if not pending:
+            return []
+        self._tls.pending_minted = []
+        return pending
+
+    def oplog_visible_tail_seq(self) -> int:
+        """The highest seq a reader may consume or name in a resume
+        position: everything at or below it is committed-and-visible or a
+        permanent hole. Tail readers, resume-token high-water marks, and
+        ``read_oplog``'s bound all use THIS, never the minted
+        ``oplog_tail_seq`` — a minted-but-uncommitted seq below the minted
+        tail is an event a reader would otherwise permanently skip."""
+        with self._oplog_seq_lock:
+            if self._oplog_in_flight:
+                return min(self._oplog_in_flight) - 1
+            return self._next_seq - 1
+
+    def oplog_visible_tail_seq_nolock(self) -> int:
+        """Lock-free ``oplog_visible_tail_seq`` for the tailable-getMore
+        wake predicate (same deadlock-avoidance contract as
+        ``oplog_tail_seq_nolock``: a waiter holding ``_oplog_cv`` must not
+        take other locks). Dict reads are atomic under the GIL; a
+        momentarily stale value self-corrects on the next predicate check
+        because every deregistration notifies the condvar."""
+        inflight = self._oplog_in_flight
+        if inflight:
+            try:
+                return min(inflight) - 1
+            except ValueError:  # raced to empty between check and min
+                pass
+        return self._next_seq - 1
 
     def _collection_uuid(self, db: str, coll: str) -> _uuid.UUID:
         """Return the collection's UUID, minting and persisting on first call.
@@ -2346,6 +2415,17 @@ class Storage:
         # session without holding any cross-thread Python lock.
         n = len(entries)
         start_seq, ts_range = self._mint_oplog_seq_and_ts(n)
+        # Whose commit resolves this mint? Inside a batch transaction (or the
+        # user-txn commit flush, which sets the same flag) the rows commit
+        # later — park the range for the transaction's resolution point to
+        # deregister. Outside (a bare emit whose cursor writes autocommit)
+        # the range deregisters at the end of this method.
+        deferred = getattr(self._tls, "defer_minted", False)
+        if deferred:
+            pending = getattr(self._tls, "pending_minted", None)
+            if pending is None:
+                pending = self._tls.pending_minted = []
+            pending.append((start_seq, start_seq + n))
         op_cur = self._cursor(_OPLOG_TABLE)
         pre_cur = None
         last_seq = 0
@@ -2376,6 +2456,12 @@ class Storage:
         if self._oplog_emit_count >= _OPLOG_PRUNE_INTERVAL:
             self._oplog_emit_count = 0
             self._prune_oplog_locked(now=self._time())
+        if not deferred:
+            # Bare autocommit emit: the cursor writes above committed on
+            # their own, so the minted range resolves here (deregister +
+            # notify). A deferred emit's range resolves at its
+            # transaction's commit/rollback instead.
+            self._deregister_minted([(start_seq, start_seq + n)])
         with self._oplog_cv:
             self._oplog_cv.notify_all()
         return last_seq
@@ -2478,13 +2564,31 @@ class Storage:
         rejected. Bounding the skip by the oplog *tail* instead loses events —
         the tail counts minted seqs, and an entry minted but not yet committed is
         invisible to this scan, so skipping to the tail steps over it forever.
+
+        Both the rows and ``scan_high`` are additionally clamped at the
+        **visible tail** (the in-flight window's floor): a committed row past a
+        still-in-flight lower mint is real data, but serving it — or letting
+        ``scan_high`` pass it — would advance a change-stream position over the
+        hole, permanently losing the in-flight event when its transaction
+        commits (the same minted-vs-committed race the Rust server's
+        visibility point closed; per-collection-locked writers commit out of
+        mint order across collections).
         """
+        # Read the bound BEFORE opening the read session: commit →
+        # deregister → this read → session open, so the session's snapshot
+        # necessarily contains every seq <= the bound.
+        max_seq = self.oplog_visible_tail_seq()
+        if start_seq > max_seq:
+            return [], start_seq - 1
         with self._lock:
             if self._closed:
                 return [], start_seq - 1
             session = self._conn.open_session()
             try:
-                return self._merge_oplog_on_session(session, start_seq, limit, ns_filter)
+                rows, scan_high = self._merge_oplog_on_session(session, start_seq, limit, ns_filter)
+                if rows and rows[-1][0] > max_seq:
+                    rows = [r for r in rows if r[0] <= max_seq]
+                return rows, min(scan_high, max_seq)
             finally:
                 with contextlib.suppress(Exception):
                     session.close()
@@ -2629,10 +2733,31 @@ class Storage:
     def find_seq_for_ts(self, ts: Timestamp) -> int:
         """Smallest seq whose entry ``ts >= target``. Tail+1 if none qualify.
 
-        Uses a private session for cross-thread visibility. Sharded: ts is
-        monotone in the *global* seq order, so the shard merge yields entries in
-        ts order — the first one at/after ``target`` is the answer.
+        The committed-view scan can name a seq above a minted-but-uncommitted
+        entry whose ts also qualifies (ts is minted monotonically with seq) —
+        a ``startAtOperationTime`` position finalised there would permanently
+        skip that entry when its transaction commits. So the answer is
+        accepted only once the visible tail covers it (no in-flight seq can
+        then exist below it); otherwise wait briefly for the window to drain
+        and rescan. Batch transactions resolve in microseconds; a long-open
+        user transaction hits the bounded deadline and falls back to the
+        committed-view answer — the pre-fix behaviour. Twin of the Rust
+        server's bounded wait.
         """
+        deadline = _time.monotonic() + 0.5
+        while True:
+            r = self._find_seq_for_ts_scan(ts)
+            vis = self.oplog_visible_tail_seq()
+            if r - 1 <= vis or _time.monotonic() >= deadline:
+                return r
+            with self._oplog_cv:
+                self._oplog_cv.wait(0.05)
+
+    def _find_seq_for_ts_scan(self, ts: Timestamp) -> int:
+        """One committed-view scan for ``find_seq_for_ts``. Uses a private
+        session for cross-thread visibility. Sharded: ts is monotone in the
+        *global* seq order, so the shard merge yields entries in ts order —
+        the first one at/after ``target`` is the answer."""
         with self._lock:
             if self._closed:
                 return 0
@@ -3359,7 +3484,7 @@ class Storage:
         from . import pitr_archive
 
         with self._lock:
-            head = self.oplog_tail_seq_nolock()
+            head = self.oplog_visible_tail_seq_nolock()
         out = os.path.join(archive_dir, pitr_archive.base_name(head))
         result = self.create_archive(out)
         result["headSeq"] = head
@@ -3373,7 +3498,7 @@ class Storage:
         directly; the manifest lets tooling report a backup's recoverable
         range without opening WiredTiger. Must be called under ``self._lock``."""
         floor = self.oplog_floor_seq()
-        head = self.oplog_tail_seq_nolock()
+        head = self.oplog_visible_tail_seq_nolock()
 
         def _row(seq: int) -> dict[str, Any] | None:
             if seq <= 0:
@@ -3451,6 +3576,14 @@ class Storage:
             with contextlib.suppress(Exception):
                 c.reset()
         session.begin_transaction()
+        # Emits inside this transaction park their minted seq ranges on
+        # ``_tls.pending_minted``; the ``finally`` deregisters them from the
+        # in-flight window on EVERY exit — after the commit (rows visible:
+        # the visible tail may advance and tailable waiters wake) and after
+        # a rollback (rows can never appear: the abandoned range must not
+        # pin the tail forever).
+        prev_defer = getattr(self._tls, "defer_minted", False)
+        self._tls.defer_minted = True
         try:
             yield session
         except Exception:
@@ -3459,6 +3592,9 @@ class Storage:
             raise
         else:
             _commit_batch_transaction(session, sync)
+        finally:
+            self._tls.defer_minted = prev_defer
+            self._deregister_minted(self._drain_pending_minted())
 
     def _session(self) -> Any:
         s = getattr(self._tls, "session", None)
@@ -3596,10 +3732,22 @@ class Storage:
                 with self._install_txn_session(handle):
                     # ``_tls.user_txn`` is deliberately NOT set here, so
                     # ``_emit_oplog`` takes its real write path on the
-                    # transaction's session instead of re-buffering.
-                    if entries:
-                        last_seq = self._emit_oplog(entries, pre_images)
-                    handle.session.commit_transaction()
+                    # transaction's session instead of re-buffering. The
+                    # flush's minted range is deferred (rows are not visible
+                    # until ``commit_transaction`` below) and deregistered in
+                    # the ``finally`` — after the commit on success, and on
+                    # the exception path before ``abort_user_transaction``
+                    # rolls back, so a failed commit can't pin the visible
+                    # tail on a corpse.
+                    prev_defer = getattr(self._tls, "defer_minted", False)
+                    self._tls.defer_minted = True
+                    try:
+                        if entries:
+                            last_seq = self._emit_oplog(entries, pre_images)
+                        handle.session.commit_transaction()
+                    finally:
+                        self._tls.defer_minted = prev_defer
+                        self._deregister_minted(self._drain_pending_minted())
         except Exception:
             self.abort_user_transaction(handle)
             raise

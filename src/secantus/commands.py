@@ -2319,7 +2319,7 @@ def _find_tailable_oplog(
     storage = ctx.storage
     first_batch = initial_docs[:batch_size]
     initial_remaining = initial_docs[batch_size:]
-    state = {"after_seq": storage.oplog_tail_seq()}
+    state = {"after_seq": storage.oplog_visible_tail_seq()}
 
     def producer() -> list[dict[str, Any]]:
         rows = storage.read_oplog(start_seq=state["after_seq"] + 1, limit=1000)
@@ -3984,7 +3984,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # read self-corrects on the next iteration of wait_for.
             ctx.storage._oplog_cv.wait_for(
                 lambda: (
-                    ctx.storage.oplog_tail_seq_nolock() > baseline_seq
+                    ctx.storage.oplog_visible_tail_seq_nolock() > baseline_seq
                     or entry.invalidated
                     or entry.dropped
                     or ctx.storage._shutting_down
@@ -4300,7 +4300,7 @@ def _aggregate_change_stream(
 
     # Resolve start position.
     floor = storage.oplog_floor_seq()
-    tail = storage.oplog_tail_seq()
+    tail = storage.oplog_visible_tail_seq()
     if cs_spec.resume_after is not None or cs_spec.start_after is not None:
         token = cs_spec.resume_after or cs_spec.start_after
         try:
@@ -4365,7 +4365,7 @@ def _aggregate_change_stream(
     elif cs_spec.start_at_operation_time is not None:
         start_seq = storage.find_seq_for_ts(cs_spec.start_at_operation_time)
     else:
-        start_seq = storage.oplog_tail_seq() + 1
+        start_seq = storage.oplog_visible_tail_seq() + 1
 
     # Build the namespace filter once for cheap reuse.
     def _ns_filter(entry_ns: str) -> bool:

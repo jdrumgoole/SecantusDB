@@ -278,19 +278,6 @@ These are explicit non-goals. Don't add them without a reason.
   the two route-default oplog shards on a background thread at open to
   hide ~10ms of first-write latency — cosmetic, not queued.
 
-- [ ] **Python server: oplog minted-vs-committed race via user transactions
-  (twin of the Rust bug fixed by the oplog-visibility-point PR, 2026-07-30).**
-  `Storage.oplog_tail_seq` / `oplog_tail_seq_nolock` return `_next_seq - 1` —
-  the highest *minted* seq. Plain statements are safe (the global `RLock` holds
-  mint and WT commit atomic per write, so mint order == commit order), but a
-  **multi-document transaction** emits its oplog entries (minting seqs) inside
-  the still-open snapshot with the lock released between statements: another
-  writer can commit a later seq while the txn's earlier seq is uncommitted, and
-  a change stream advancing past the hole loses the event when the txn commits.
-  Fix is the Rust design transplanted: an in-flight window pinning the visible
-  tail (registered at mint under `_oplog_seq_lock`, released on
-  commit/abort/reap), with `read_oplog` clamped at the floor.
-
 - [x] **ws-changes flake — THREE causes, all now fixed (2026-07-22 / 2026-07-26).
   Two lived in the test and the admin router; the third was silent event loss in
   the server itself.** Confirmed by a controlled repro (`crash-repro.yml`,
