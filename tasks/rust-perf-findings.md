@@ -816,3 +816,79 @@ Finding 5 from the opposite side. The remaining real levers are IO/architectural
 non-logged oplog (Finding 9), async oplog drain (Finding 9), write-amplification cuts
 via RecordId keying (steps 1–3, #613/#637/#640) — not CPU micro-optimisation of the
 write path.
+
+## Finding 12 — Phase-0 truth baseline: ~36% of the sync insert path is OPLOG-PRUNE CHURN, and the "inherent" single-writer gap is 1.9×, not 3.7× (2026-07-30, pinned `efbd32d2`)
+
+The concurrency-parity program's clean-room baseline: quiesced box (load < 2, zero
+orphaned shells), pinned SHA `efbd32d2` (post oplog-visibility-point #696), extension
+rebuilt from it, 4 arms × 3 interleaved reps × writers 1/2/4/8 (8 KiB docs, batch 100,
+15 s, per-writer collections), medians; per-rep spread ≤ ±2% throughout, SHA verified
+unchanged before/after. mongod 6.0.16 on the same box.
+
+### The current table (docs/s, medians of 3)
+
+| arm | 1w | 2w | 4w | 8w | scaling@8 (own 1w) | retention@8 |
+|---|---:|---:|---:|---:|:---:|:---:|
+| Rust sync (default) | 26,447 | 37,936 | 65,809 | 43,682 | 1.65× (peak 2.49× @4) | **23%** of ceiling |
+| Rust async+non-logged | 50,460 | 67,195 | 103,387 | 123,073 | 2.44× | **66%** of ceiling |
+| Rust oplog OFF (ceiling) | 60,155 | 81,092 | 154,350 | 187,507 | 3.12× | — |
+| mongod standalone | 113,031 | 210,510 | 381,893 | 504,486 | 4.46× | — |
+| mongod replset `w:1` | 81,026 | — | — | 301,163 | 3.72× | **61%** of standalone |
+| mongod replset default (majority) | 12,400 | — | — | 71,463 | — | — |
+
+(Note on normalisation: earlier findings sometimes quoted the OFF arm's scaling
+against the *sync* 1-writer rate — that's where "4.8×" came from. Against its own
+1-writer rate the ceiling scales 3.12×. Both are honest; be explicit about which.)
+
+Confirmations: async retains 66% ≈ mongod's 61% oplog retention (Findings 9/10 hold);
+the replset A/B reproduces Finding 10 within a few percent (110k/493k standalone,
+81k/301k w:1, 12.4k/71.5k majority).
+
+### Discovery 1 — the sync write path is ~36% oplog-prune churn under sustained load
+
+`sample`-profiled the embedded server's connection thread under a sustained
+single-writer batch-100 load (24.6k docs/s while sampled). The insert subtree
+decomposes:
+
+| slice | samples | share |
+|---|---:|:---:|
+| `emit_oplog_entries` | 2,861 | 46% |
+| — of which `prune_oplog_inner` + `read_oplog_shards_tagged` + `peek_entry_ts` | **2,240** | **36% of the whole insert path** |
+| `__wt_txn_commit` (≈ all `__wt_log_write`, the WAL) | 2,280 | 37% |
+| `__wt_btcur_insert` (the actual row inserts) | 901 | 14% |
+| `write_nat_entry` / serde / framing / misc | ~350 | ~6% |
+
+Mechanism: the bench writes 24.6k oplog rows/s; `oplog_max_entries` defaults to 100k,
+reached ~4 s into any sustained run. From then on the opportunistic prune (every 1000
+emits) must delete ~as many rows as arrive to hold the cap — **every insert pays ~1
+oplog-row delete plus a share of the k-way merge scan that finds the doomed rows.**
+The earlier "prune is O(deleted) not O(oplog)" fix made the sweep proportional to the
+delete count, but at steady state the delete count ≈ the insert rate, so the churn is
+structural. mongod never pays this shape: its oplog is a capped collection whose
+truncation is a cheap wholesale range drop, not per-row cursor deletes found by a
+17-table merge. Levers (for the emit-path-hygiene PR / the sweep): move the prune off
+the write path (timer/background), delete by seq-range per shard without the merge
+scan, WT range-truncate, and/or raise the default cap for daemon deployments. Upper
+bound if fully removed: ~1.5× single-writer sync (26.4k → ~41k) and a bigger share at
+4–8 writers where every writer prunes.
+
+Background-thread note: WT eviction/reconciliation threads spend heavily in
+`__rec_write`/`zlib_compress` (block compression of data pages) — off the insert
+thread's critical path but part of the aggregate write ceiling; the sweep's
+compressor arm should test data tables too, not just the oplog.
+
+### Discovery 2 — the "inherent" single-writer gap is ~1.9×, not 3.7×
+
+At TRUE equal semantics — both servers with no oplog — the single-writer gap is
+**113,031 / 60,155 = 1.88×**, far below the forward-plan's "even WAL-free we're 3.7×
+off" (measured before raw-BSON #608, RecordId #613-640, mimalloc/LTO #660, PGO). At
+equal *oplog* semantics (their `w:1` vs our sync) the gap is 81,026 / 26,447 = 3.06× —
+but ~36% of our side is the prune churn above, so the structural per-op gap at that
+comparison is closer to ~2×. Consequence for the program: Phase B (per-op efficiency)
+starts from a much better base than planned; killing the prune churn plus the
+log-only-the-oplog structural probe (arm D) plausibly covers most of the remaining
+distance to the mongod ratio without touching the "inherent" C++-vs-Rust story at all.
+
+Harness: `scratchpad/phase0_matrix.sh` (this session), `bench/mongod_replset_ab.py
+--reps 3`, `sample <pid> 10 1` on the server process under `bench.load_writer
+--batch-size 100`.
