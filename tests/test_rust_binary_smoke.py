@@ -32,7 +32,25 @@ def _binary_path() -> pathlib.Path | None:
     env = os.environ.get("SECANTUSDB_BIN")
     if env:
         p = pathlib.Path(env)
-        return p if p.exists() else None
+        # Windows: the caller may hand us a path without the `.exe` suffix —
+        # `command -v secantusd-rs` under Git Bash does exactly that.
+        if not p.exists() and sys.platform == "win32" and not p.suffix:
+            p = p.with_suffix(".exe")
+        if not p.exists():
+            # Deliberately fatal, not a skip. Setting SECANTUSDB_BIN means "smoke
+            # THIS artifact" — it is how CI points the suite at the binary it is
+            # about to publish. Degrading to a skip there lets a release ship a
+            # binary that was never exercised, with the step still green: exactly
+            # what happened when the Windows lane was first enabled and pytest
+            # reported `4 skipped` under a passing checkmark. An unresolvable
+            # path is a caller bug, so fail loudly.
+            raise RuntimeError(
+                f"SECANTUSDB_BIN={env!r} does not exist"
+                + (f" (nor {p})" if str(p) != env else "")
+                + ". Point it at a built secantusd-rs binary, or unset it to let "
+                "the suite discover one under crates/secantusdb/target/."
+            )
+        return p
     # Prefer the release binary: it is the shipped artifact and much faster than
     # a debug build under the full parallel suite. Fall back to debug.
     for profile in ("release", "debug"):

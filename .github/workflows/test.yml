@@ -1753,7 +1753,12 @@ jobs:
           whl=$(ls dist-storage/*.whl)
           uv run --no-project --with pymongo --with pytest --with "$whl" bash -c '
             set -e
-            bin=$(command -v secantusd-rs) || { echo "secantusd-rs not on PATH after install" >&2; exit 1; }
+            # Resolve through Python, not `command -v`: under Git Bash the latter
+            # returns an MSYS path with no .exe (/d/a/.../Scripts/secantusd-rs),
+            # which the Windows Python running pytest cannot open. shutil.which
+            # gives a native path with the right suffix on every platform.
+            bin=$(python -c "import shutil,sys; p=shutil.which(\"secantusd-rs\"); print(p) if p else sys.exit(1)") \
+              || { echo "secantusd-rs not on PATH after install" >&2; exit 1; }
             echo "secantusd-rs -> $bin"
             "$bin" --version
             SECANTUSDB_BIN="$bin" python -m pytest tests/test_rust_binary_smoke.py \
