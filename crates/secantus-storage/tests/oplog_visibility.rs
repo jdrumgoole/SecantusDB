@@ -120,6 +120,89 @@ fn rolled_back_mint_does_not_stall_tail() {
     });
 }
 
+fn ts_of(blob: &[u8]) -> bson::Timestamp {
+    let d = Document::from_reader(&mut std::io::Cursor::new(blob)).unwrap();
+    match d.get("ts") {
+        Some(bson::Bson::Timestamp(t)) => *t,
+        other => panic!("expected ts Timestamp, got {other:?}"),
+    }
+}
+
+/// `find_seq_for_ts` (the startAtOperationTime mapping) must not finalise a
+/// position past an in-flight mint whose entry also qualifies: it waits for
+/// the in-flight window to drain past its committed-view answer and rescans,
+/// so a commit that lands mid-wait surfaces the earlier seq.
+#[test]
+fn find_seq_for_ts_waits_for_in_flight_mint() {
+    with_db(|st| {
+        // seq 1 (committed): gives us a readable ts to anchor the target.
+        st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
+        let rows = st.read_oplog(1, 1).unwrap();
+        let ts1 = ts_of(&rows[0].1);
+        // Target: strictly after seq 1's ts, at or before every later mint.
+        let target = bson::Timestamp {
+            time: ts1.time,
+            increment: ts1.increment + 1,
+        };
+
+        // seq 2: minted in an OPEN transaction — its ts satisfies the target,
+        // but the committed view's first match is seq 3.
+        let mut txn = st.begin_user_transaction().unwrap();
+        st.with_user_transaction(&mut txn, || {
+            st.insert_one("app", "x", &enc(&doc! {"_id": 1}))
+        })
+        .unwrap()
+        .unwrap();
+        // seq 3: committed after the in-flight mint.
+        st.insert_one("app", "y", &enc(&doc! {"_id": 2})).unwrap();
+
+        // Commit the transaction from another thread while find_seq_for_ts
+        // waits on the in-flight window.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                st.commit_user_transaction(&mut txn).unwrap();
+            });
+            let seq = st.find_seq_for_ts(target).unwrap();
+            assert_eq!(
+                seq, 2,
+                "startAtOperationTime finalised past an in-flight mint"
+            );
+        });
+    });
+}
+
+/// The rollback arm: an abandoned in-flight mint resolves the wait and the
+/// committed-view answer stands (the hole is permanent).
+#[test]
+fn find_seq_for_ts_rolled_back_mint_returns_committed_answer() {
+    with_db(|st| {
+        st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
+        let ts1 = ts_of(&st.read_oplog(1, 1).unwrap()[0].1);
+        let target = bson::Timestamp {
+            time: ts1.time,
+            increment: ts1.increment + 1,
+        };
+
+        let mut txn = st.begin_user_transaction().unwrap();
+        st.with_user_transaction(&mut txn, || {
+            st.insert_one("app", "x", &enc(&doc! {"_id": 1}))
+        })
+        .unwrap()
+        .unwrap();
+        st.insert_one("app", "y", &enc(&doc! {"_id": 2})).unwrap();
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                st.rollback_user_transaction(&mut txn).unwrap();
+            });
+            let seq = st.find_seq_for_ts(target).unwrap();
+            assert_eq!(seq, 3, "rolled-back mint should leave the committed answer");
+        });
+    });
+}
+
 /// Multi-statement transaction: every statement's mint joins the same
 /// in-flight window; nothing leaks visible until the single commit.
 #[test]

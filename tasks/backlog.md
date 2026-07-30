@@ -271,17 +271,6 @@ These are explicit non-goals. Don't add them without a reason.
   tail (registered at mint under `_oplog_seq_lock`, released on
   commit/abort/reap), with `read_oplog` clamped at the floor.
 
-- [ ] **Rust server: `find_seq_for_ts` (startAtOperationTime) can still land
-  past an in-flight mint (narrow residual of the oplog-visibility-point PR,
-  2026-07-30).** The ts→seq scan sees only committed rows; ts is minted
-  monotonically with seq, so the "first committed seq with ts ≥ T" can sit
-  above an in-flight seq whose ts also ≥ T — a `startAtOperationTime` resume
-  landing exactly inside an in-flight window starts past it. Strictly narrower
-  than the fixed bug (every tailing/PBRT/open path is now bounded by the
-  visible tail); the clean fix is to have `find_seq_for_ts` wait for (or clamp
-  to) the in-flight floor before finalising the position — slated for the
-  emit-path-hygiene follow-up PR.
-
 - [x] **ws-changes flake — THREE causes, all now fixed (2026-07-22 / 2026-07-26).
   Two lived in the test and the admin router; the third was silent event loss in
   the server itself.** Confirmed by a controlled repro (`crash-repro.yml`,
