@@ -97,6 +97,43 @@ impl std::ops::Deref for OpSession<'_> {
 pub struct UserTransactionHandle {
     session: Option<Session>,
     began: bool,
+    /// Oplog seq ranges minted by this transaction's statements, still
+    /// registered in the sync-mode in-flight window (they pin the visible
+    /// tail). Deregistered — advancing the tail and waking tailers — when the
+    /// transaction commits (rows visible) or rolls back (rows can never
+    /// appear), and on `Drop` as a backstop so a reaped or leaked handle
+    /// cannot pin the tail forever.
+    minted_ranges: Vec<(i64, i64)>,
+    /// Clones of the storage's oplog state + condvar so deregistration works
+    /// from `Drop` without a `Storage` borrow.
+    oplog: Arc<Mutex<OplogState>>,
+    oplog_cv: Arc<Condvar>,
+}
+
+impl UserTransactionHandle {
+    /// Remove this transaction's minted ranges from the in-flight window and
+    /// wake tailable waiters (the visible tail may advance). Idempotent.
+    fn deregister_minted(&mut self) {
+        if self.minted_ranges.is_empty() {
+            return;
+        }
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        for (start, end) in self.minted_ranges.drain(..) {
+            let removed = st.in_flight.remove(&start);
+            debug_assert_eq!(removed, Some(end), "in-flight window out of sync");
+        }
+        self.oplog_cv.notify_all();
+    }
+}
+
+impl Drop for UserTransactionHandle {
+    fn drop(&mut self) {
+        // The dedicated session's own Drop rolls the WT transaction back;
+        // uncommitted rows were never MVCC-visible, so deregistering before
+        // that rollback completes is safe — the ranges just become permanent
+        // seq holes, which the shard merge tolerates.
+        self.deregister_minted();
+    }
 }
 
 /// mongod's per-document BSON size limit (16 MiB). A document whose encoded size
@@ -1976,6 +2013,18 @@ struct OplogState {
     /// to advance `written_seq`, so the watermark still only ever covers a gapless
     /// prefix. Empty in synchronous mode. See [`advance_written_seq`].
     done_ranges: BTreeMap<i64, i64>,
+    /// Sync-mode in-flight mint window: `start_seq -> end_seq` (exclusive) for
+    /// every batch minted by `mint_seq_and_ts` whose transaction has not yet
+    /// committed or rolled back. The **visible tail** — the largest seq below
+    /// which nothing can still appear — is `min_key - 1` when non-empty, else
+    /// `next_seq - 1` (our analogue of WiredTiger/mongod's `all_durable`
+    /// timestamp: readers must not advance past the lowest in-flight write, or
+    /// a later commit materialises an entry behind a resume position and the
+    /// event is lost). A rolled-back batch simply deregisters: the abandoned
+    /// range vanishes and `min` moves on — a permanent seq hole, which the
+    /// shard merge already tolerates. Empty in async mode (async mints
+    /// post-commit; `written_seq` governs visibility there).
+    in_flight: BTreeMap<i64, i64>,
 }
 
 /// Record that the seq range `[start, start + n)` is durably persisted and advance
@@ -2013,6 +2062,22 @@ thread_local! {
     /// immediately, so such entries are never stranded in `PENDING_OPLOG` and
     /// never sync-written behind the drainer's back.
     static IN_ASYNC_STMT: Cell<bool> = const { Cell::new(false) };
+
+    /// Seq ranges minted by the current sync-mode write statement (or by the
+    /// current statement of a user transaction), parked until the transaction
+    /// resolves. `with_statement_txn` deregisters them from the in-flight
+    /// window after its commit/rollback; `with_user_transaction` moves them
+    /// onto the transaction handle so `commit_user_transaction` /
+    /// `rollback_user_transaction` deregister at the real resolution point.
+    /// Empty (and untouched) in async mode and for bare autocommit emits.
+    static PENDING_MINTED: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
+
+    /// Set by `with_statement_txn` for the duration of a sync-mode autocommit
+    /// write statement. When true, `emit_oplog_entries` parks its minted range
+    /// in `PENDING_MINTED` (the rows commit later, with the statement); when
+    /// false — and no user transaction is active — the emit's cursor inserts
+    /// autocommit, so the range deregisters inline at the end of the emit.
+    static IN_SYNC_STMT: Cell<bool> = const { Cell::new(false) };
 }
 
 /// A contiguous run of oplog entries (one minted seq range, one shard) handed to
@@ -2481,6 +2546,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                     live_count: count_oplog_entries(session),
                     written_seq: 0, // set to next_seq-1 by the caller (open)
                     done_ranges: BTreeMap::new(),
+                    in_flight: BTreeMap::new(),
                 });
             }
         }
@@ -2516,6 +2582,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         live_count: count_oplog_entries(session),
         written_seq: 0, // set to next_seq-1 by the caller (open)
         done_ranges: BTreeMap::new(),
+        in_flight: BTreeMap::new(),
     })
 }
 
@@ -2991,6 +3058,32 @@ impl Storage {
             IN_ASYNC_STMT.with(|f| f.set(true));
             PENDING_OPLOG.with(|p| p.borrow_mut().clear());
         }
+        // Sync mode: emits inside this statement park their minted seq ranges
+        // in `PENDING_MINTED`; this guard deregisters them from the in-flight
+        // window on EVERY exit — after the commit (rows visible: the tail may
+        // advance and waiters wake) and after a rollback or panic (rows can
+        // never appear: the abandoned range must not pin the tail forever).
+        // The guard drops at function exit, which is after the
+        // commit_transaction / rollback_transaction calls below in all paths.
+        struct SyncMintScope<'a>(&'a Storage);
+        impl Drop for SyncMintScope<'_> {
+            fn drop(&mut self) {
+                IN_SYNC_STMT.with(|f| f.set(false));
+                let ranges = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+                self.0.deregister_in_flight(&ranges);
+            }
+        }
+        let _sync_scope = if async_mode {
+            None
+        } else {
+            IN_SYNC_STMT.with(|f| f.set(true));
+            // Any leftover ranges belong to a dead scope (the guards harvest
+            // on every exit, so this is a defensive no-op in practice) —
+            // deregister rather than drop them, or they'd pin the tail.
+            let stale = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+            self.deregister_in_flight(&stale);
+            Some(SyncMintScope(self))
+        };
         session.begin_transaction(None)?;
         match f() {
             Ok(v) => {
@@ -3011,13 +3104,11 @@ impl Storage {
                     // to the drainer (which persists them + wakes tailers).
                     IN_ASYNC_STMT.with(|f| f.set(false));
                     self.drain_pending_oplog();
-                } else {
-                    // Sync: wake tailable change-stream waiters only now that the
-                    // rows are visible to their fresh-session reads (the
-                    // in-statement notify fires before commit, which a waiter's
-                    // re-read can miss).
-                    self.notify_oplog_waiters();
                 }
+                // Sync: `_sync_scope`'s drop (below, after this return value is
+                // built) deregisters the statement's minted ranges and wakes
+                // tailable waiters — the rows are committed and the visible
+                // tail advances atomically with the deregistration.
                 Ok(v)
             }
             Err(e) => {
@@ -3051,13 +3142,46 @@ impl Storage {
     }
 
     /// Atomically reserve `n` consecutive seqs and mint `n` monotonic timestamps.
-    /// Mirrors `storage._mint_oplog_seq_and_ts`.
-    fn mint_seq_and_ts(&self, n: usize) -> (i64, Vec<bson::Timestamp>) {
+    /// With `track_in_flight` (the sync path) the range is registered in the
+    /// in-flight window under the same mutex acquisition, pinning the visible
+    /// tail below it until the minting transaction commits or rolls back. The
+    /// async drain path passes `false`: it mints after the data commit and its
+    /// visibility is governed by `written_seq`. Mirrors
+    /// `storage._mint_oplog_seq_and_ts`.
+    fn mint_seq_and_ts(&self, n: usize, track_in_flight: bool) -> (i64, Vec<bson::Timestamp>) {
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         let start = st.next_seq;
         st.next_seq += n as i64;
+        if track_in_flight {
+            st.in_flight.insert(start, start + n as i64);
+        }
         let ts: Vec<bson::Timestamp> = (0..n).map(|_| Self::mint_ts(&mut st)).collect();
         (start, ts)
+    }
+
+    /// The sync-mode visible tail: the largest seq below which nothing can
+    /// still appear. Caller holds the oplog mutex.
+    fn visible_tail(st: &OplogState) -> i64 {
+        match st.in_flight.keys().next() {
+            Some(&start) => start - 1,
+            None => st.next_seq - 1,
+        }
+    }
+
+    /// Deregister minted seq ranges from the in-flight window (their
+    /// transaction committed — rows are MVCC-visible — or rolled back — rows
+    /// can never appear) and wake tailable waiters: either way the visible
+    /// tail may have advanced.
+    fn deregister_in_flight(&self, ranges: &[(i64, i64)]) {
+        if ranges.is_empty() {
+            return;
+        }
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        for (start, end) in ranges {
+            let removed = st.in_flight.remove(start);
+            debug_assert_eq!(removed, Some(*end), "in-flight window out of sync");
+        }
+        self.oplog_cv.notify_all();
     }
 
     /// Build a CRUD oplog entry as raw BSON — `{op, ns, (ui,) o, o2}` in mongod
@@ -3149,7 +3273,17 @@ impl Storage {
             return Ok(0);
         }
         let n = entries.len() as i64;
-        let (start, ts) = self.mint_seq_and_ts(entries.len());
+        // Whose commit resolves this mint? Inside a `with_statement_txn` scope
+        // or a user transaction the rows commit later — park the range in
+        // `PENDING_MINTED` for the transaction's resolution point to
+        // deregister. Outside both (noop heartbeat, DDL on a bare session) the
+        // cursor inserts autocommit, so the range deregisters inline below.
+        let deferred =
+            IN_SYNC_STMT.with(|f| f.get()) || !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null();
+        let (start, ts) = self.mint_seq_and_ts(entries.len(), true);
+        if deferred {
+            PENDING_MINTED.with(|p| p.borrow_mut().push((start, start + n)));
+        }
         // Route the WHOLE batch to one shard (`start % OPLOG_SHARDS`) so concurrent
         // writers — minting different start seqs — spread across N append points
         // instead of contending on one table's rightmost page (the scaling fix),
@@ -3201,13 +3335,21 @@ impl Storage {
             }
             last = seq;
         }
-        // Wake any tailable change-stream getMore blocked in `wait_for_oplog`:
-        // the rows are committed (autocommit per insert) and the tail (next_seq)
-        // has advanced, so a woken waiter's producer re-read sees the new events.
-        // Also bump the opportunistic-prune counter under the same lock.
+        // Bare autocommit emit: every cursor insert above committed on its own,
+        // so the minted range resolves here — deregister it from the in-flight
+        // window and wake any tailable getMore blocked in `wait_for_oplog` (the
+        // visible tail may have advanced). A deferred emit (statement / user
+        // txn) parked its range in `PENDING_MINTED` instead: its rows are not
+        // committed yet, so deregistration and the wakeup belong to the
+        // transaction's resolution point, not here. Also bump the
+        // opportunistic-prune counter under the same lock.
         let do_prune = {
             let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-            self.oplog_cv.notify_all();
+            if !deferred {
+                let removed = g.in_flight.remove(&start);
+                debug_assert_eq!(removed, Some(start + n), "in-flight window out of sync");
+                self.oplog_cv.notify_all();
+            }
             g.emit_count += n;
             g.live_count += n;
             if g.emit_count >= OPLOG_PRUNE_INTERVAL {
@@ -3248,7 +3390,9 @@ impl Storage {
             return;
         }
         let n = pending.len();
-        let (start, ts) = self.mint_seq_and_ts(n);
+        // No in-flight tracking: this mint happens AFTER the data commit and
+        // its visibility is governed by the drainer's `written_seq` watermark.
+        let (start, ts) = self.mint_seq_and_ts(n, false);
         let wall_millis = now_millis();
         let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(n);
         let mut preimages: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
@@ -3327,14 +3471,17 @@ impl Storage {
     pub fn wait_for_oplog(&self, after_seq: i64, timeout_ms: u64) -> i64 {
         // In async mode the visible tail is what the drainer has DURABLY written
         // (`written_seq`), not the minted `next_seq` — a tailer must never read
-        // past a not-yet-persisted entry. In sync mode `written_seq` tracks
-        // `next_seq - 1`, so the same expression is exact there too.
+        // past a not-yet-persisted entry. In sync mode the tail is the
+        // in-flight-window floor (`visible_tail`), NOT the minted
+        // `next_seq - 1`: a mint whose transaction has not committed yet is a
+        // hole below the minted tail, and a tailer that advanced past it
+        // would permanently lose the entry when the transaction commits.
         let async_mode = self.async_oplog.is_some();
         let tail = |st: &OplogState| {
             if async_mode {
                 st.written_seq
             } else {
-                st.next_seq - 1
+                Self::visible_tail(st)
             }
         };
         let guard = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
@@ -3348,16 +3495,25 @@ impl Storage {
         tail(&guard)
     }
 
-    /// Async oplog: block until the drainer has durably persisted every entry
-    /// minted so far (`written_seq == next_seq - 1`). No-op in synchronous mode
-    /// (where the two are always equal). Gives a caller read-after-write oplog
-    /// visibility — a consistency checkpoint, a test, or a drain before backup.
+    /// Block until every entry minted so far is durably readable. Async mode:
+    /// the drainer has persisted the minted tail (`written_seq ==
+    /// next_seq - 1`). Sync mode: the in-flight window is empty (every
+    /// minting transaction has committed or rolled back), so the visible tail
+    /// has caught the minted tail. Gives a caller read-after-write oplog
+    /// visibility — a consistency checkpoint, a test, or a drain before
+    /// backup. Must not be called while THIS thread holds an open statement /
+    /// user transaction that emitted entries (it would wait on itself).
     pub fn flush_oplog(&self) {
-        if self.async_oplog.is_none() {
-            return;
-        }
+        let async_mode = self.async_oplog.is_some();
+        let caught_up = |st: &OplogState| {
+            if async_mode {
+                st.written_seq >= st.next_seq - 1
+            } else {
+                st.in_flight.is_empty()
+            }
+        };
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        while st.written_seq < st.next_seq - 1 {
+        while !caught_up(&st) {
             let (g, _timed_out) = self
                 .oplog_cv
                 .wait_timeout(st, Duration::from_millis(100))
@@ -3436,12 +3592,50 @@ impl Storage {
     /// Mirrors `storage.read_oplog` (ns filtering / projection are a higher
     /// layer's job).
     pub fn read_oplog(&self, start_seq: i64, limit: usize) -> Result<Vec<(i64, Vec<u8>)>> {
+        // Visibility clamp: never serve a row above the visible tail. A
+        // committed row past a still-in-flight lower mint is real data, but a
+        // consumer that advanced its position over it would permanently skip
+        // the in-flight entry when it commits (the minted-vs-committed race).
+        // Read the bound BEFORE opening the read session: commit → deregister
+        // → this bound read → session open, so the MVCC snapshot necessarily
+        // contains every seq <= the bound.
+        let max_seq = {
+            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+            if self.async_oplog.is_some() {
+                st.written_seq
+            } else {
+                Self::visible_tail(&st)
+            }
+        };
+        if start_seq > max_seq {
+            return Ok(Vec::new());
+        }
         // No global lock: a fresh session's WiredTiger MVCC snapshot gives a
         // consistent read without blocking writers. This is the hot tailable
         // change-stream getMore path, so serialising it against every write
         // would needlessly throttle throughput.
         let session = self.conn.open_session()?;
-        read_oplog_shards(&session, start_seq, limit)
+        let mut rows = read_oplog_shards(&session, start_seq, limit)?;
+        if let Some(cut) = rows.iter().position(|(seq, _)| *seq > max_seq) {
+            rows.truncate(cut);
+        }
+        Ok(rows)
+    }
+
+    /// The highest seq a reader may consume or name in a resume position:
+    /// everything at or below it is either committed-and-visible or a
+    /// permanent hole. Sync mode: the in-flight-window floor; async mode: the
+    /// drainer's durable watermark. Change-stream open positions and
+    /// post-batch resume tokens must use THIS, not the minted
+    /// [`Self::oplog_tail_seq`], or they can name a position past an entry
+    /// that has not committed yet and lose it.
+    pub fn oplog_visible_tail_seq(&self) -> i64 {
+        let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        if self.async_oplog.is_some() {
+            st.written_seq
+        } else {
+            Self::visible_tail(&st)
+        }
     }
 
     /// Whether `(db, coll)` is the synthetic `local.oplog.rs` view.
@@ -4076,6 +4270,9 @@ impl Storage {
         Ok(UserTransactionHandle {
             session: Some(session),
             began: false,
+            minted_ranges: Vec::new(),
+            oplog: Arc::clone(&self.oplog),
+            oplog_cv: Arc::clone(&self.oplog_cv),
         })
     }
 
@@ -4103,6 +4300,20 @@ impl Storage {
                 ACTIVE_TXN_SESSION.with(|c| c.set(self.0));
             }
         }
+        // Emits inside this statement park their minted seq ranges in
+        // `PENDING_MINTED` (they see the active txn session). Move them onto
+        // the handle — on normal return AND on unwind — so the transaction's
+        // real resolution point (commit / rollback / handle Drop) deregisters
+        // them from the in-flight window. A panicked statement must not leave
+        // ranges stranded in the thread-local: that would pin the visible
+        // tail forever.
+        struct Harvest<'a>(&'a mut Vec<(i64, i64)>);
+        impl Drop for Harvest<'_> {
+            fn drop(&mut self) {
+                PENDING_MINTED.with(|p| self.0.extend(p.borrow_mut().drain(..)));
+            }
+        }
+        let _harvest = Harvest(&mut handle.minted_ranges);
         let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.get()));
         ACTIVE_TXN_SESSION.with(|c| c.set(session as *const Session));
         Ok(f())
@@ -4118,6 +4329,10 @@ impl Storage {
             handle.began = false;
             if began {
                 if let Err(e) = session.commit_transaction(None) {
+                    // The transaction is dead either way — its rows can never
+                    // appear, so its minted ranges leave the in-flight window
+                    // (the visible tail must not stay pinned on the corpse).
+                    handle.deregister_minted();
                     // A concurrent transaction can mark this one rollback-only
                     // after its last statement ran; WiredTiger then fails the
                     // commit call itself with bare EINVAL (its documented
@@ -4137,9 +4352,10 @@ impl Storage {
                     }
                     return Err(e.into());
                 }
-                // Wake tailable change-stream waiters: the transaction's
-                // oplog rows became visible at this commit, not at emit.
-                self.notify_oplog_waiters();
+                // Deregister the transaction's minted ranges — its oplog rows
+                // became visible at this commit, not at emit — advancing the
+                // visible tail and waking tailable change-stream waiters.
+                handle.deregister_minted();
             }
             // `session` drops here → the dedicated WT session is closed.
         }
@@ -4155,6 +4371,9 @@ impl Storage {
             if began {
                 let _ = session.rollback_transaction(None);
             }
+            // The rolled-back rows can never appear: release the minted
+            // ranges so the visible tail moves past the permanent holes.
+            handle.deregister_minted();
             // `session` drops here → the dedicated WT session is closed.
         }
         Ok(())

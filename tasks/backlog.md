@@ -258,6 +258,30 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **Python server: oplog minted-vs-committed race via user transactions
+  (twin of the Rust bug fixed by the oplog-visibility-point PR, 2026-07-30).**
+  `Storage.oplog_tail_seq` / `oplog_tail_seq_nolock` return `_next_seq - 1` —
+  the highest *minted* seq. Plain statements are safe (the global `RLock` holds
+  mint and WT commit atomic per write, so mint order == commit order), but a
+  **multi-document transaction** emits its oplog entries (minting seqs) inside
+  the still-open snapshot with the lock released between statements: another
+  writer can commit a later seq while the txn's earlier seq is uncommitted, and
+  a change stream advancing past the hole loses the event when the txn commits.
+  Fix is the Rust design transplanted: an in-flight window pinning the visible
+  tail (registered at mint under `_oplog_seq_lock`, released on
+  commit/abort/reap), with `read_oplog` clamped at the floor.
+
+- [ ] **Rust server: `find_seq_for_ts` (startAtOperationTime) can still land
+  past an in-flight mint (narrow residual of the oplog-visibility-point PR,
+  2026-07-30).** The ts→seq scan sees only committed rows; ts is minted
+  monotonically with seq, so the "first committed seq with ts ≥ T" can sit
+  above an in-flight seq whose ts also ≥ T — a `startAtOperationTime` resume
+  landing exactly inside an in-flight window starts past it. Strictly narrower
+  than the fixed bug (every tailing/PBRT/open path is now bounded by the
+  visible tail); the clean fix is to have `find_seq_for_ts` wait for (or clamp
+  to) the in-flight floor before finalising the position — slated for the
+  emit-path-hygiene follow-up PR.
+
 - [x] **ws-changes flake — THREE causes, all now fixed (2026-07-22 / 2026-07-26).
   Two lived in the test and the admin router; the third was silent event loss in
   the server itself.** Confirmed by a controlled repro (`crash-repro.yml`,
