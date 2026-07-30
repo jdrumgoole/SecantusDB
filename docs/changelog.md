@@ -19,6 +19,372 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b5] — 2026-07-30
+
+### The Rust server's change streams get a real oplog visibility point
+
+Concurrent writers on different collections could permanently lose a change
+event. The Rust server's tailable cursors treated the highest *minted* oplog
+seq as the readable tail, but a seq is minted inside its writer's still-open
+transaction — so a writer on one collection could commit a *later* seq while
+an earlier one was still in flight, and a change stream that polled in that
+window advanced its resume position past the hole. When the in-flight
+transaction then committed, its event sat behind the stream's position:
+dropped from the live stream and unreachable on resume. Same-collection
+writers never hit this (the per-collection lock serializes them), which is
+why it survived every single-collection test.
+
+The fix is the analogue of WiredTiger/mongod's `all_durable` timestamp: an
+in-flight window tracks every minted-but-unresolved seq range, and readers —
+`wait_for_oplog`, `read_oplog`, change-stream open positions, post-batch
+resume tokens — are bounded by its floor. A commit releases its range and
+the tail advances; a rollback releases it silently, leaving a permanent seq
+hole the shard merge already tolerates, so an aborted transaction can never
+stall the stream. `flush_oplog` in sync mode now genuinely waits for the
+window to drain, and abandoned transaction handles release their ranges on
+drop so a reaped session cannot pin the tail.
+
+#### Fixed
+
+- Rust server: change streams no longer lose events when writers on
+  different collections commit out of oplog-mint order (live and on
+  resume). New `Storage::oplog_visible_tail_seq()` is the bound every
+  reader uses; three WT-level pinning tests and a cross-collection
+  database-watch exactly-once test guard the invariant.
+
+#### Added
+
+- `tests/test_mongo_server_concurrency.py::test_db_change_stream_exactly_once_across_collections`
+  — N per-collection writers under a database-wide watch, asserting
+  exactly-once delivery (no duplicates, no losses), on both servers.
+
+### The Python server's change streams get the oplog visibility point too
+
+The Rust server's oplog visibility fix has a twin on the Python server.
+Since the per-collection lock split, Python writers on different
+collections mint their oplog sequence numbers and commit their WiredTiger
+transactions independently — so a writer could commit a *later* sequence
+while an earlier one was still inside an open transaction, and a change
+stream polling in that window advanced its resume position (the
+`scan_high` skip bound) past the hole. When the in-flight transaction
+committed, its event sat behind the stream's position: dropped live and
+unreachable on resume. Multi-document transactions were already protected
+by commit-time minting, but the flush between mint and WiredTiger commit
+had the same narrow window.
+
+The fix is the same `all_durable`-style design: an in-flight mint window
+pins the visible tail at its floor, registered when sequences are minted
+and released when the owning transaction commits or rolls back (batch
+transactions, the user-transaction commit flush, and bare autocommit
+emits each resolve at their own point). Every reader is bounded by it —
+the tailable-getMore wake predicate, change-stream open positions,
+`read_oplog` and its `scan_high`, the PITR archive head, and
+`startAtOperationTime` (which now waits briefly for the window to drain
+past its answer instead of finalising a position an in-flight event could
+land behind). A rolled-back mint leaves a permanent, tolerated hole and
+can never stall the stream.
+
+#### Fixed
+
+- Python server: change streams no longer lose events when writers on
+  different collections commit out of oplog-mint order (live and on
+  resume); `startAtOperationTime` can no longer skip an event minted
+  inside a still-open transaction. Five WT-level pinning tests
+  (`tests/test_oplog_visibility.py`) mirror the Rust suite.
+
+### The oplog prune stops taxing every write — +25% single-writer, +62% at eight writers
+
+Phase-0 profiling of the concurrency-parity program (Finding 12) caught the
+Rust server's opportunistic oplog prune consuming ~36% of the sustained
+write path: once a workload passes the 100k-entry oplog cap — about four
+seconds into any sustained run — every sweep re-read the full 8 KiB value
+of every doomed row through the shard merge, copying ~8 MB per sweep just
+to learn which seqs to delete, on the writer's own thread. The sweep now
+walks keys only, peeking a row's timestamp just in the retention tail
+beyond the cap excess, and the emit path stops re-running WiredTiger's
+schema-locked `create` for its oplog shard on every batch (a
+first-touch bitmask remembers what exists). Measured on the Finding-12
+baseline rig: sync single-writer 25.4k → 31.6k docs/s (+25%), eight
+writers 41.5k → 67.3k (+62%), lifting durable-path scaling from 1.65× to
+2.13× and oplog retention from 22% to 36% of the no-oplog ceiling.
+
+The slice also closes the `startAtOperationTime` residual recorded by the
+visibility-point fix: `find_seq_for_ts` no longer finalises a resume
+position past a minted-but-uncommitted oplog entry whose timestamp
+qualifies — it waits (bounded) for the in-flight window to drain past its
+committed-view answer and rescans, so a transaction committing mid-open
+surfaces the earlier event instead of losing it.
+
+#### Fixed
+
+- Rust server: `startAtOperationTime` can no longer skip an event whose
+  oplog entry was minted inside a still-open transaction (bounded wait on
+  the in-flight window; falls back to the committed view at the deadline —
+  today's behaviour — only for long-open transactions).
+
+#### Changed
+
+- Rust server: the opportunistic oplog prune identifies doomed rows with a
+  key-only shard merge (values peeked only for the retention tail), and
+  oplog shard tables are created on first touch instead of per-batch.
+
+### The Finding-13 winners become the defaults — another +14% at eight writers, no knobs required
+
+The oplog append-path sweep's measured winners now ship as defaults on the
+Rust server. Oplog writes route across two shard tables instead of sixteen —
+the wide split existed to spread a rightmost-page append hotspot that the
+RecordId keying and the prune fix eliminated, and the sweep measured every
+narrower width beating sixteen; the read side still scans all sixteen, so
+stores written under any width stay fully readable and interchangeable. The
+oplog and pre-image btrees are created append-tuned (`split_pct=100,
+leaf_page_max=128KB` — rows arrive in ascending seq order and are never
+updated, so pages fill completely before splitting), and the daemon and the
+Python `RustServer` handle raise their WiredTiger cache default from a 1G to
+a 4G *cap* — WiredTiger fills cache lazily, so idle test servers stay as
+small as before while sustained writers stop thrashing eviction
+(`--cache-size` / `cache_size=` still override; the low-level
+`Storage::open` library default is unchanged).
+
+Interleaved A/B against the previous defaults on the reference box: sync
+single-writer 31.8k → 35.1k docs/s (+10%), eight writers 78.1k → 88.7k
+(+14%) — on top of the prune-fix release's +62%. Oplog block compression
+stays on deliberately: the sweep measured turning it off cratering
+throughput to a fifth of the ceiling (bigger uncompressed pages mean more
+eviction IO, and IO volume — not CPU — is the constraint).
+
+#### Changed
+
+- Rust server: oplog write routing defaults to 2 shard tables (was 16);
+  `SECANTUS_OPLOG_SHARDS` still overrides 1–16; reads scan all tables
+  regardless, so on-disk compatibility is unaffected.
+- Rust server: oplog/pre-image tables are created with
+  `split_pct=100,leaf_page_max=128KB` (fresh stores; existing stores keep
+  their config).
+- Rust server: `secantusd-rs` and the Python `RustServer` handle default
+  `cache_size` to `4G` (a lazy cap, was `1G`); `docs/concurrency.md`'s
+  tuning guidance updated (log `prealloc` now hurts at eight writers
+  post-prune-fix; never disable oplog compression).
+
+### Oplog experiment hooks and the sweep that found 54%-retention durable writes
+
+Three measure-oriented env hooks land on the Rust server so oplog append-path
+experiments no longer need a rebuild: `SECANTUS_OPLOG_SHARDS` overrides how many
+shard tables the write path routes across (1–16; reads always consider all, so
+any store stays fully readable), `SECANTUS_OPLOG_TABLE_EXTRA` appends
+last-key-wins WiredTiger config to the oplog/preimage table creates (the
+`SECANTUS_WT_CONFIG_EXTRA` trick at table scope), and `SECANTUS_DATA_NONLOGGED`
+is a loudly-documented, crash-unsafe, measure-only probe of the mongod
+architecture (journal only the oplog). `bench/oplog_sweep.py` drives the arms
+interleaved and reports retention against the same-session no-oplog ceiling.
+
+The sweep's headlines (recorded as Finding 13): the 16-way oplog sharding is
+now pure overhead — every lower shard count beats it at eight writers;
+turning oplog compression off craters throughput to 19% retention (zlib is
+load-bearing under write pressure); cache size is the strongest single knob;
+and the winning stack (2 shards + append-tuned oplog pages + 4G cache) reaches
+**102.8k docs/s at eight writers fully durable — 54% of the no-oplog ceiling**,
+up from 43% on the defaults. The mongod-architecture probe adds only the last
++11% on top (60%, matching mongod's own 61% oplog-retention ratio), so the
+replay-on-open recovery project is parked until the config winners ship.
+
+#### Added
+
+- Rust server: `SECANTUS_OPLOG_SHARDS`, `SECANTUS_OPLOG_TABLE_EXTRA`, and
+  `SECANTUS_DATA_NONLOGGED` (measure-only, crash-unsafe) experiment hooks —
+  all default-off, create/routing-time only.
+- `bench/oplog_sweep.py`: the interleaved oplog append-path sweep runner.
+
+### Rust concurrency: steal telemetry, a read-under-load bench, and the CI that runs it
+
+The per-collection write-lock work turned the Rust server's multi-writer
+story into real scaling — it climbs to about 2.6× its single-writer rate
+at four concurrent writers before a WiredTiger ceiling (specifically the
+oplog's WAL append and checkpoint share) bends the curve back down, and
+the opt-in async + non-logged oplog stack lifts even that to a monotonic
+~2.4× at eight writers. That ceiling lives inside WiredTiger, not in a
+SecantusDB lock; `docs/concurrency.md` carries the measured curve and the
+attribution. This slice adds the tooling and telemetry *around* that
+result rather than the measurement itself.
+
+The new `bench/read_concurrency.py` harness measures the property the lock
+split most directly buys and that a raw write-throughput curve hides: a
+read-heavy workload keeps 60–75% of its standalone query throughput while
+eight writers saturate the server, where before every read queued behind
+every write. The `findAndModify` steal telemetry makes a concurrent-steal
+storm on a hot job-queue document visible in the server log instead of
+surfacing only as CPU. And the Rust parametrization of the `#451`
+concurrency stress suite now actually runs in CI, where it previously
+skipped itself in every lane.
+
+#### Added
+
+- Rust server: `findAndModify` logs a warning every few seconds of
+  continuous re-picking (a concurrent writer repeatedly stealing the
+  matched document), so a steal storm on a hot job-queue document is
+  visible in the server log instead of surfacing only as CPU — mirroring
+  the storage layer's write-conflict retry telemetry.
+- `bench/read_concurrency.py`: a read-under-write-load benchmark for the
+  Rust server — measures the query throughput a read-heavy client retains
+  while N writers saturate the server.
+- CI: the Rust parametrization of the `#451` concurrency stress suite
+  (exactly-one-winner races, exact final counts, typed-errors-only) now
+  runs in the `storage-engine` job — previously it `importorskip`ed in
+  every lane because no other job builds the embedded Rust server.
+
+### Refreshed PGO profile for the reworked write path
+
+The committed profile-guided-optimization profile
+(`crates/pgo/_secantus_server.profdata.tar.gz`) is regenerated against the
+current hot paths — the oplog visibility point, the key-only prune, and the
+new routing defaults all reshaped the write path since the profile was last
+trained, and a stale profile silently forfeits PGO's gains (measured: the
+refresh recovered `update_many` 1.2×→1.1×, `$group` 1.3×→1.0×,
+`delete_many` 1.5×→0.9× of mongod on the six-workload benchmark).
+
+#### Changed
+
+- `crates/pgo/_secantus_server.profdata.tar.gz` retrained on the post-#702
+  write path (wheel builds consume it; a stale profile is safe but slower).
+
+### The admin console, documented in pictures — and four bugs it was hiding
+
+The admin UI's documentation has always described 22 pages in prose and shown
+none of them. It does now: every page in the console has a screenshot, generated
+rather than hand-captured. `invoke admin-screenshots` starts a throwaway
+SecantusDB on a fixed port, seeds it with a fictional shop — invented customers,
+`example.com` addresses, public landmark coordinates, indexes of every shape,
+users, profiler entries, backup archives — then drives all 22 pages through a
+real browser with Playwright, filling and submitting forms where a bare page load
+would only show an empty one. Machine-specific strings are rewritten out of the
+DOM before each shot, so a committed image carries nothing about the machine that
+made it. The same run publishes the four shots the marketing site uses, so the
+docs, the README and secantusdb.com can't drift apart.
+
+Driving the console through a real browser turned out to be the first time
+anyone had. It found four live bugs, all invisible to the existing tests because
+the templates render identically whether or not their JavaScript runs. Alpine was
+loading before Chart.js, and since this Alpine build starts the moment its script
+executes, the dashboard threw `Chart is not defined` during `init()` — which
+aborted the component before it opened the metrics websocket. The dashboard has
+been showing zeros, no charts, and a permanent "connecting…" status. Behind that
+sat three more: every Alpine page called its own `init()` twice, so the
+change-stream tail opened two sockets and displayed every event twice; the
+sparkline canvases had no sized parent and grew until they filled the viewport;
+and the geo map's markers 404'd on Leaflet image assets this package doesn't
+vendor, so map pins rendered as broken images. All four are fixed, and each is
+pinned by a regression test.
+
+Regenerating the screenshots is now a release step. A browser-free test keeps
+every documented page wired to an image on disk, but it can't tell a fresh
+screenshot from a stale one — so the release procedure regenerates them, and the
+capture itself fails loudly if any page logs a JavaScript error or is
+photographed showing an empty state.
+
+#### Added
+
+- `scripts/admin_screenshots.py` and `invoke admin-screenshots`: Playwright-driven
+  capture of all 22 admin-UI pages against a seeded throwaway server, with DOM
+  anonymisation, JS-error detection, empty-state detection, and publication of
+  the website-tagged subset into the Pelican theme. Flags: `--only`, `--list`,
+  `--headed`, `--scale`, `--server-port`, `--keep-data`, `--skip-website`, and
+  `--from-checkout` for rendering a working tree's templates and static assets
+  instead of the installed package's.
+- A `screenshots` optional extra carrying Playwright (kept out of `dev` so CI
+  lanes don't install a browser stack they never drive).
+- Screenshots throughout `docs/admin.md`, an admin-UI section in the README, and
+  an admin console section on the secantusdb.com landing page.
+- `tests/test_docs_screenshots.py` and `tests/test_admin_asset_order.py`.
+
+#### Fixed
+
+- **The admin dashboard never worked.** `alpine.min.js` loaded before
+  `chart.umd.min.js`, and this Alpine build calls `Alpine.start()` as soon as its
+  own deferred script runs, so `Chart` was undefined when the dashboard's
+  `init()` executed. The thrown error aborted the component before `_connect()`,
+  so the live-metrics websocket never opened: every tile read 0 and the status
+  stayed on "connecting…". Alpine now loads last.
+- Every Alpine page (`dashboard`, `changestream`, `query`, `insert`) carried a
+  redundant `x-init="init()"` alongside a component that already defines
+  `init()`, which Alpine invokes itself. Each page therefore initialised twice —
+  two Chart instances per canvas, two metrics websockets, two change-stream
+  sockets (so every event appeared twice), and duplicate collection-suggestion
+  fetches.
+- The dashboard's sparkline canvases had no fixed-height positioned parent, so
+  Chart.js's `maintainAspectRatio: false` sizing loop grew each chart until it
+  overflowed the viewport.
+- Chart instances were stored in Alpine's reactive state; reached through its
+  Proxy, Chart.js's internal per-chart lookups missed and every `update()` threw
+  `Cannot set properties of undefined (setting 'fullSize')`. They now live in the
+  component factory's closure.
+- The geo map drew points with Leaflet's default marker, which loads
+  `images/marker-icon.png` and `images/marker-shadow.png` relative to
+  `leaflet.css` — files this package doesn't vendor. Every point 404'd twice and
+  rendered broken; points are now vector `circleMarker`s needing no assets.
+
+#### Changed
+
+- `docs/admin.md` no longer claims the UI "never makes outbound network calls of
+  its own". It makes one: the Geo page fetches basemap tiles from OpenStreetMap.
+  That's now stated up front and called out in a note on the page's own section,
+  since it tells a third party your IP and roughly where your data is.
+
+### A standalone Windows binary for the Rust server
+
+The `secantusd-rs` standalone binary now ships for Windows alongside Linux and
+macOS. Every `secantusdb-v*` release attaches an `x86_64-pc-windows-msvc` archive
+— a `.zip` for Explorer, and a `.tar.gz` for anyone who'd rather use the same
+command on all three platforms — each with a `.sha256` beside it. The Windows
+build links the C runtime statically, so the `.exe` runs on a clean machine with
+no Visual C++ redistributable installed.
+
+Windows had been listed as blocked on the MSVC WiredTiger build "producing no
+static library". That turned out to be a statement about a filename rather than a
+capability: MSVC emits `wiredtiger.lib` where Unix emits `libwiredtiger.a`, and
+`build.rs` grew the second name some time ago. CI had quietly been linking that
+static library and building `secantusd-rs.exe` on every push ever since — the
+note simply outlived its cause. Enabling the release lane was mostly packaging.
+
+Two Windows-specific problems did surface, and both were worth finding. The
+linker had been warning `LNK4098: defaultlib 'LIBCMT' conflicts`, which is not
+cosmetic: WiredTiger's static library uses the static C runtime while Rust's MSVC
+target defaults to the dynamic one, and two C runtimes in one process means two
+heaps — memory allocated inside WiredTiger and freed on the Rust side is
+undefined behaviour. Building with `+crt-static` matches them. Separately, the
+binary's smoke test asserted a clean exit after SIGTERM, which can't work on
+Windows at all: `send_signal` maps SIGTERM to `TerminateProcess`, an immediate
+kill that exits 1 and runs no handler. It now sends `CTRL_BREAK_EVENT` to a
+process-group child, which the binary's console handler turns into the same
+graceful shutdown Unix gets — and that test now runs on Windows in CI on every
+push, so the release binary is exercised continuously rather than only at tag
+time.
+
+#### Added
+
+- `x86_64-pc-windows-msvc` in the `release-binaries` matrix, publishing
+  `secantusdb-<version>-x86_64-pc-windows-msvc.zip` + `.tar.gz` (each with a
+  `.sha256`). Built with `+crt-static`; no PGO on this target yet, so it is a few
+  percent slower on write-heavy paths than the other two archives and otherwise
+  identical.
+- The wheel-bundled `secantusd-rs` smoke test now runs on Windows in `test.yml`'s
+  `storage-engine` job (it was skipped on the stale grounds that the binary
+  wasn't built there).
+
+#### Fixed
+
+- **CRT mismatch in the Windows binary** (`LNK4098`): WiredTiger's static CRT vs
+  Rust's default dynamic CRT put two C runtimes, and two heaps, in one process.
+  Now built with `-Ctarget-feature=+crt-static`.
+- `tests/test_rust_binary_smoke.py` asserted a graceful SIGTERM exit that Windows
+  cannot deliver; it now uses `CTRL_BREAK_EVENT` with `CREATE_NEW_PROCESS_GROUP`
+  there, leaving the Unix path unchanged.
+
+#### Changed
+
+- `docs-rust/installation.md`, `docs-rust/releases.md`, the marketing site's
+  Rust-server page, and the two "Windows is blocked" comments in
+  `release-binaries.yml` / `test.yml` all corrected — they described a limitation
+  that no longer existed.
+
 ## [0.6.0b4] — 2026-07-29
 
 ### Restore full PGO on the arm64-macOS standalone binary
