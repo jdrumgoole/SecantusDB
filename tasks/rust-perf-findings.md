@@ -892,3 +892,62 @@ distance to the mongod ratio without touching the "inherent" C++-vs-Rust story a
 Harness: `scratchpad/phase0_matrix.sh` (this session), `bench/mongod_replset_ab.py
 --reps 3`, `sample <pid> 10 1` on the server process under `bench.load_writer
 --batch-size 100`.
+
+## Finding 13 — the oplog append-path sweep: winners stack to 54% retention fully durable (102.8k @8w), and the mongod-architecture probe adds only the last +11% (2026-07-30, post-#700)
+
+The PR-3 sweep (`bench/oplog_sweep.py`, hooks `SECANTUS_OPLOG_SHARDS` /
+`SECANTUS_OPLOG_TABLE_EXTRA` / `SECANTUS_DATA_NONLOGGED`; 12 configs × 2 interleaved
+reps, 12 s, 1/8 writers, 8 KiB docs, batch 100, quiesced box, post-#700 code).
+Retention = median vs the same-session no-oplog ceiling (59.6k 1w / 172.9k 8w).
+
+| config | 1w | 8w |
+|---|---:|---:|
+| sync default (16 shards) | 32.4k (54%) | 74.8k (43%) |
+| shards 1 / 2 / 4 / 8 | ~33–34k (56%) | 83.7 / 86.3 / 80.6 / 86.7k (47–50%) |
+| oplog `block_compressor=none` | 31.1k (52%) | **32.3k (19%) — craters** |
+| oplog `memory_page_max=10MB` | 30.3k (51%) | 79.9k (46%) |
+| oplog `split_pct=100,leaf_page_max=128KB` | 32.2k (54%) | 88.8k (51%) |
+| conn `log=(file_max=512MB,prealloc=true)` | 30.8k (52%) | 68.7k (40%) |
+| conn `cache_size=4G` | 35.8k (60%) | 93.9k (54%) |
+| `SECANTUS_DATA_NONLOGGED=1` (mongod split, measure-only) | **39.6k (66%)** | 79.5k (46%) |
+
+Combo runs (8w, 2 reps, same session; ceiling 190.3k):
+
+| stack | 8w | retention |
+|---|---:|:---:|
+| 2 shards + append-split + cache 4G — **fully durable** | **102.8k** | **54%** |
+| + data-nonlogged (crash-unsafe; the Phase A′ shape) | **114.1k** | **60% = mongod's 61% ratio** |
+
+Conclusions:
+
+1. **The 16-way oplog sharding is now pure overhead.** Post-RecordId (#613-640) and
+   post-prune-fix (#700), every lower shard count beats 16 at 8 writers (+12-16%),
+   and 1 ≈ 2 ≈ 8. The rightmost-page append contention the sharding was built
+   against (0.60×→2.47× at the time) no longer binds; what's left is merge/cache
+   overhead proportional to table count. Simplifying toward mongod's single-table
+   shape is a win, not a risk. (Kept as a routing default question for PR 4 —
+   routing-only, the read side scans all tables regardless.)
+2. **Never turn oplog compression off** — 8w throughput craters to 19% retention.
+   Bigger uncompressed pages mean more eviction/IO volume; zlib is load-bearing
+   under write pressure, the exact reverse of the single-writer CPU intuition
+   (and consistent with log-compression backfiring in the forward plan: CPU is
+   not the constraint, IO volume is).
+3. **Cache is the strongest single knob** (+26% at 8w) — eviction pressure again,
+   matching Finding 6's sync-arm hint. `log prealloc` HURTS at 8w post-#700
+   (−8%), reversing Finding 6; the prune fix changed the IO profile enough that
+   pre-sized log files no longer pay.
+4. **The mongod-architecture hypothesis (Finding 12's arm D) is materially
+   weakened at 8 writers.** Data-tables-unlogged alone buys +6% at 8w — after
+   the prune fix, the WAL is no longer the binding constraint (Finding 5's
+   dirty-page/eviction majority reasserts). Where it shines is single-writer
+   (+22%, the best 1w config measured). On top of the config winners it adds
+   102.8k → 114.1k (+11%), reaching the mongod retention ratio exactly — so
+   Phase A′ (replay-on-open recovery to make it crash-safe) is the *last* step
+   to the ratio, not the main one, and its cost/benefit is now +11% at 8w /
+   +22% at 1w for a substantial recovery build. Decision: park Phase A′ until
+   the config winners have shipped (PR 4) and re-measure; the cheap 80% of the
+   distance is config.
+
+Net journey this session (sync durable, 8 writers): 41.5k (pre-#700) → 74.8k
+(#700) → 102.8k (config winners, fully durable) — 2.5× — with the ceiling at
+190k and mongod's replset-w:1 at ~301k on the same box.

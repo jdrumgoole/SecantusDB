@@ -25,7 +25,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -284,7 +284,7 @@ fn migrate_legacy_docs(session: &Session) -> Result<()> {
         // Lazy shards: the target shard isn't created eagerly at open, so make it
         // before folding a legacy row into it (idempotent per shard).
         if made_shards.insert(shard.clone()) {
-            session.create(&shard, DOC_TABLE_CFG)?;
+            session.create(&shard, &data_table_cfg(DOC_TABLE_CFG))?;
         }
         let dst = session.open_cursor(&shard, None)?;
         dst.set_key_ssq(db, coll, recordid);
@@ -460,21 +460,72 @@ fn oplog_tables_nonlogged() -> bool {
     std::env::var_os("SECANTUS_OPLOG_NONLOGGED").is_some()
 }
 
+/// Measure-only structural probe (`SECANTUS_DATA_NONLOGGED=1`): create the
+/// DATA tables (doc shards + the bootstrap set) with `log=(enabled=false)`,
+/// i.e. checkpoint-durable only — the mongod architecture, which journals ONLY
+/// the oplog and recovers data by checkpoint + oplog replay. SecantusDB has no
+/// replay-on-open yet, so this is **CRASH-UNSAFE: a hard crash between
+/// checkpoints loses acknowledged writes.** Never set it outside a benchmark;
+/// it exists to measure whether the mongod split is the structural source of
+/// the oplog-retention gap (Finding 12 / the parity plan's Phase A′, which
+/// builds the recovery that would make this shippable).
+fn data_tables_nonlogged() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SECANTUS_DATA_NONLOGGED").is_some())
+}
+
+/// Table-create config for a data table, honouring [`data_tables_nonlogged`].
+fn data_table_cfg(base: &str) -> String {
+    if data_tables_nonlogged() {
+        format!("{base},log=(enabled=false)")
+    } else {
+        base.to_string()
+    }
+}
+
 /// Table-create config for the oplog shard / legacy-oplog / preimage tables,
-/// honouring [`oplog_tables_nonlogged`].
+/// honouring [`oplog_tables_nonlogged`] and the `SECANTUS_OPLOG_TABLE_EXTRA`
+/// experiment hook (appended last — WiredTiger takes the last occurrence of a
+/// duplicated key, so an appended clause overrides the default; same trick as
+/// `SECANTUS_WT_CONFIG_EXTRA` on the connection config). Create-time only:
+/// benchmarks start on fresh datadirs, existing stores keep their config.
 fn oplog_table_cfg() -> String {
-    if oplog_tables_nonlogged() {
+    let mut cfg = if oplog_tables_nonlogged() {
         format!("{QU_COMPRESSED_CFG},log=(enabled=false)")
     } else {
         QU_COMPRESSED_CFG.to_string()
+    };
+    if let Ok(extra) = std::env::var("SECANTUS_OPLOG_TABLE_EXTRA") {
+        if !extra.is_empty() {
+            cfg.push(',');
+            cfg.push_str(&extra);
+        }
     }
+    cfg
+}
+
+/// How many oplog shard tables the WRITE path routes across — normally
+/// [`OPLOG_SHARDS`], overridable to 1..=OPLOG_SHARDS via the
+/// `SECANTUS_OPLOG_SHARDS` experiment hook (sweeping append contention vs
+/// merge overhead without an on-disk migration). Routing-only: the read side
+/// always considers all `OPLOG_SHARDS` tables + the legacy table, so a store
+/// written under any override stays fully readable.
+fn oplog_route_shards() -> i64 {
+    static N: OnceLock<i64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SECANTUS_OPLOG_SHARDS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|n| (1..=OPLOG_SHARDS).contains(n))
+            .unwrap_or(OPLOG_SHARDS)
+    })
 }
 
 /// The shard table a batch starting at `start_seq` is routed to. `rem_euclid`
 /// keeps it correct for any i64 (seqs are always >= 1 in practice, but never
 /// route to a negative index).
 fn oplog_shard_for_batch(start_seq: i64) -> String {
-    oplog_shard_name(start_seq.rem_euclid(OPLOG_SHARDS))
+    oplog_shard_name(start_seq.rem_euclid(oplog_route_shards()))
 }
 
 /// Ensure the oplog shard table for `start_seq`'s batch exists — creating it on
@@ -488,7 +539,8 @@ fn ensure_oplog_shard(
     session: &Session,
     start_seq: i64,
 ) -> Result<String> {
-    let idx = start_seq.rem_euclid(OPLOG_SHARDS);
+    // Same modulus as `oplog_shard_for_batch` (honours SECANTUS_OPLOG_SHARDS).
+    let idx = start_seq.rem_euclid(oplog_route_shards());
     let shard = oplog_shard_name(idx);
     let bit = 1u32 << (idx as u32);
     if shards_created.load(Ordering::Relaxed) & bit == 0 {
@@ -2946,7 +2998,7 @@ impl Storage {
         let mut state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
-                boot.create(name, fmt)?;
+                boot.create(name, &data_table_cfg(fmt))?;
             }
             // The oplog is sharded across OPLOG_SHARDS btrees to spread append
             // contention (see OPLOG_SHARDS); the legacy single table stays
@@ -5354,7 +5406,10 @@ impl Storage {
         // insertion order) and write the dst `_id` index (id_key -> RecordId); the
         // doc-table value carries the id_key in-band (framed).
         // Lazy shards: the rename target's shard may not exist yet — make it.
-        session.create(&doc_table_for(dst_db, dst_coll), DOC_TABLE_CFG)?;
+        session.create(
+            &doc_table_for(dst_db, dst_coll),
+            &data_table_cfg(DOC_TABLE_CFG),
+        )?;
         let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
         // Remember each doc against the RecordId it was RE-MINTED under in the
         // destination — the source RecordIds do not carry over.
@@ -9220,7 +9275,7 @@ fn ensure_collection(session: &Session, db: &str, coll: &str) -> Result<()> {
             // covers every write caller (create / auto-create-on-insert / rename).
             // Read / scan paths tolerate an absent shard, keeping a lazily-sharded
             // store byte-compatible with an eager one (missing shard reads empty).
-            session.create(&doc_table_for(db, coll), DOC_TABLE_CFG)?;
+            session.create(&doc_table_for(db, coll), &data_table_cfg(DOC_TABLE_CFG))?;
             Ok(())
         }
         Err(e) => Err(e.into()),
