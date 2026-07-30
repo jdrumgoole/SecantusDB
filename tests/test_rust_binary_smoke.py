@@ -32,7 +32,25 @@ def _binary_path() -> pathlib.Path | None:
     env = os.environ.get("SECANTUSDB_BIN")
     if env:
         p = pathlib.Path(env)
-        return p if p.exists() else None
+        # Windows: the caller may hand us a path without the `.exe` suffix —
+        # `command -v secantusd-rs` under Git Bash does exactly that.
+        if not p.exists() and sys.platform == "win32" and not p.suffix:
+            p = p.with_suffix(".exe")
+        if not p.exists():
+            # Deliberately fatal, not a skip. Setting SECANTUSDB_BIN means "smoke
+            # THIS artifact" — it is how CI points the suite at the binary it is
+            # about to publish. Degrading to a skip there lets a release ship a
+            # binary that was never exercised, with the step still green: exactly
+            # what happened when the Windows lane was first enabled and pytest
+            # reported `4 skipped` under a passing checkmark. An unresolvable
+            # path is a caller bug, so fail loudly.
+            raise RuntimeError(
+                f"SECANTUSDB_BIN={env!r} does not exist"
+                + (f" (nor {p})" if str(p) != env else "")
+                + ". Point it at a built secantusd-rs binary, or unset it to let "
+                "the suite discover one under crates/secantusdb/target/."
+            )
+        return p
     # Prefer the release binary: it is the shipped artifact and much faster than
     # a debug build under the full parallel suite. Fall back to debug.
     for profile in ("release", "debug"):
@@ -52,6 +70,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Graceful shutdown is signalled differently on Windows. `Popen.send_signal`
+# maps SIGTERM to TerminateProcess there — an immediate kill that exits 1 and
+# runs no handler, so the clean-exit these tests assert could never happen. The
+# binary uses the `ctrlc` crate (with `termination`), which on Windows installs
+# a console control handler, so CTRL_BREAK_EVENT reaches the same shutdown path
+# SIGTERM takes on Unix. It is delivered to a process GROUP, hence the
+# CREATE_NEW_PROCESS_GROUP flag below — without it the break would also hit the
+# pytest process running the test.
+_WINDOWS = sys.platform == "win32"
+_SPAWN_KWARGS: dict[str, object] = (
+    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _WINDOWS else {}
+)
+
+
+def _request_shutdown(proc: subprocess.Popen[str]) -> None:
+    """Ask the daemon to stop the way a user would, per platform."""
+    proc.send_signal(signal.CTRL_BREAK_EVENT if _WINDOWS else signal.SIGTERM)
+
+
 @pytest.fixture
 def daemon(tmp_path: pathlib.Path) -> subprocess.Popen[str]:
     assert _BIN is not None
@@ -60,6 +97,7 @@ def daemon(tmp_path: pathlib.Path) -> subprocess.Popen[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        **_SPAWN_KWARGS,
     )
     try:
         yield proc
@@ -100,7 +138,7 @@ def test_binary_serves_pymongo_and_exits_cleanly(
     finally:
         client.close()
 
-    daemon.send_signal(signal.SIGTERM)
+    _request_shutdown(daemon)
     assert daemon.wait(timeout=15) == 0, daemon.stderr.read() if daemon.stderr else ""
 
 
@@ -118,6 +156,7 @@ def test_standalone_flag_drops_replica_set(tmp_path: pathlib.Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        **_SPAWN_KWARGS,
     )
     try:
         host, port = _bound_address(proc)
@@ -128,7 +167,7 @@ def test_standalone_flag_drops_replica_set(tmp_path: pathlib.Path) -> None:
             assert "setName" not in client.admin.command("hello")
         finally:
             client.close()
-        proc.send_signal(signal.SIGTERM)
+        _request_shutdown(proc)
         assert proc.wait(timeout=15) == 0
     finally:
         if proc.poll() is None:

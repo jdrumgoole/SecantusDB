@@ -21,12 +21,19 @@
 #   match publish.yml's `v[0-9]+...` patterns, so the two never collide.
 #     git tag secantusdb-v0.5.3-beta.21 && git push origin secantusdb-v0.5.3-beta.21
 #
-# SCOPE (v1): the two targets CI already builds + smokes (x86_64 glibc Linux,
-# arm64 macOS). The Linux binary's glibc floor is the build runner's glibc
-# (ubuntu-22.04 ⇒ glibc 2.35), fine for modern CI/dev distros. Broader-reach
+# SCOPE: the three targets CI already builds + smokes (x86_64 glibc Linux, arm64
+# macOS, x86_64 Windows). The Linux binary's glibc floor is the build runner's
+# glibc (ubuntu-22.04 ⇒ glibc 2.35), fine for modern CI/dev distros. Broader-reach
 # targets are listed as follow-ons at the bottom with their blockers (musl-static
-# for an any-distro Linux binary; aarch64 Linux; Windows — blocked on the MSVC WT
-# static-lib gap, tasks/backlog.md §7).
+# for an any-distro Linux binary; aarch64 Linux).
+#
+# WINDOWS was long listed here as blocked on "the MSVC WT build produces no
+# libwiredtiger.a". That was true of the *filename*, not the capability: MSVC
+# emits `wiredtiger.lib`, and `secantus-wt/build.rs` searches for that name too,
+# so `storage-engine (windows-latest)` has been linking the static lib and
+# building `secantusd-rs.exe` on every push. The note outlived its cause. Two
+# things this target does differently: no PGO yet, and `+crt-static` to match
+# WT's static CRT (see the matrix entry).
 
 name: Release secantusdb binary
 
@@ -67,6 +74,26 @@ jobs:
             # profile.
             runner: macos-15
             os: macos
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            # Ships correct first, optimised second: no PGO on this target yet.
+            # PGO is only a hint, so an un-profiled binary is functionally
+            # identical — just slower on the write/aggregate paths. The other
+            # two targets each needed runner-specific profiling quirks before
+            # their two-stage build worked; doing that for MSVC is a follow-on.
+            no_pgo: true
+            # `+crt-static` is load-bearing, not a tweak. WiredTiger's
+            # `wiredtiger.lib` is built against the STATIC CRT, while Rust's
+            # MSVC target defaults to the dynamic one — mixing them is what
+            # `LNK4098: defaultlib 'LIBCMT' conflicts` reports, and it means two
+            # C runtimes with two heaps in one process. For a database that is
+            # not cosmetic: memory allocated inside WT and freed on the Rust
+            # side (or vice versa) is undefined behaviour. Matching Rust to WT's
+            # static CRT removes the mismatch, and has a distribution bonus —
+            # the .exe no longer needs the VC++ redistributable installed,
+            # which is what "dependency-free binary" should mean on Windows.
+            rustflags: -Ctarget-feature=+crt-static
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -113,6 +140,29 @@ jobs:
         if: matrix.os == 'macos'
         run: brew install swig ninja
 
+      # The three Windows steps below are lifted verbatim from test.yml's
+      # `storage-engine` job, which builds this same static WiredTiger + binary
+      # on windows-latest on every push. Keep them in sync with that job.
+      - name: Disable Defender real-time scanning (Windows)
+        if: matrix.os == 'windows'
+        # Real-time scanning synchronously inspects every file the build creates
+        # (cargo + CMake object files, the WT tree, wheel staging) on an
+        # ephemeral VM that builds only this checkout. Best-effort.
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Warning "could not disable Defender real-time scanning: $_" }
+
+      - name: Install toolchain (Windows)
+        if: matrix.os == 'windows'
+        run: choco install -y swig ninja llvm
+
+      - name: Point bindgen at libclang (Windows)
+        if: matrix.os == 'windows'
+        # clang-sys doesn't always find choco's LLVM on PATH within the same job;
+        # pin it explicitly for the build step below.
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
         with:
@@ -139,11 +189,16 @@ jobs:
 
       - name: Build the static-WiredTiger secantusdb binary (two-stage PGO)
         # Approach #1 of the PGO split: build the binary per-arch with
-        # profile-guided optimization. Both matrix targets build natively (the
+        # profile-guided optimization. The PGO'd targets build natively (the
         # runner arch matches the target), so the instrumented binary can run
         # here to collect its own profile — an on-target profile, unlike the
         # wheel's committed one. ~12-19% on write/aggregate paths over LTO alone.
+        # Targets flagged `no_pgo` take the plain-release branch at the bottom.
         shell: bash
+        env:
+          # Per-target flags (currently: the Windows CRT match). Empty elsewhere,
+          # which composes to exactly the previous behaviour.
+          MATRIX_RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -euo pipefail
           wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
@@ -154,10 +209,18 @@ jobs:
           export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
           target=${{ matrix.target }}
           manifest=crates/secantusdb/Cargo.toml
-          bin="crates/secantusdb/target/$target/release/secantusd-rs"
+          exe=""
+          [ "${{ matrix.os }}" = "windows" ] && exe=".exe"
+          bin="crates/secantusdb/target/$target/release/secantusd-rs$exe"
           profraw="$PWD/pgo-raw"; rm -rf "$profraw"; mkdir -p "$profraw"
 
-          if [ "${{ matrix.os }}" = "macos" ]; then
+          if [ "${{ matrix.no_pgo }}" = "true" ]; then
+            # Plain optimized build — no instrumentation, no profile. Correct and
+            # fully functional; only the PGO speedup is absent.
+            echo "=== plain release build (no PGO on this target) ==="
+            RUSTFLAGS="$MATRIX_RUSTFLAGS" \
+              cargo build --release --locked --target "$target" --manifest-path "$manifest"
+          elif [ "${{ matrix.os }}" = "macos" ]; then
             # arm64-macOS two-stage on-target PGO. Two runner-specific quirks are
             # handled here (both established by CI diagnosis; linux needs neither):
             #  1. Instrumenting mimalloc's internals segfaults at startup, so the
@@ -268,15 +331,39 @@ jobs:
       - name: Package the archive + checksum
         shell: bash
         run: |
+          set -euo pipefail
           stem="secantusdb-${VERSION}-${{ matrix.target }}"
           mkdir -p "$stem"
           # Ship the binary as `secantusd-rs`, matching the command name the
           # wheel installs (the pure-Python `secantusd-py` is a different program).
-          cp "$BIN" "$stem/secantusd-rs"
+          exe=""
+          [ "${{ matrix.os }}" = "windows" ] && exe=".exe"
+          cp "$BIN" "$stem/secantusd-rs$exe"
           cp LICENSE README.md "$stem/"
+
+          # `shasum` ships with macOS/Linux runners but not Git Bash on Windows,
+          # which has `sha256sum` instead. Pick whichever exists rather than
+          # assuming — a missing checksum would otherwise fail the release late,
+          # after the whole WT + cargo build.
+          if command -v shasum >/dev/null 2>&1; then
+            sha() { shasum -a 256 "$1"; }
+          else
+            sha() { sha256sum "$1"; }
+          fi
+
           tar -czf "$stem.tar.gz" "$stem"
-          shasum -a 256 "$stem.tar.gz" > "$stem.tar.gz.sha256"
-          ls -l "$stem.tar.gz" "$stem.tar.gz.sha256"
+          sha "$stem.tar.gz" > "$stem.tar.gz.sha256"
+
+          # Windows also gets a .zip: it's what Explorer opens on a double-click,
+          # whereas .tar.gz needs the command line. The .tar.gz is kept for
+          # parity with the other targets and for anything globbing the existing
+          # asset names.
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            powershell -NoProfile -Command \
+              "Compress-Archive -Path '$stem' -DestinationPath '$stem.zip' -Force"
+            sha "$stem.zip" > "$stem.zip.sha256"
+          fi
+          ls -l "$stem".*
 
       # Keep the artifacts on the run too, so a workflow_dispatch dry-run can be
       # inspected without (or before) touching a Release.
@@ -287,6 +374,8 @@ jobs:
           path: |
             secantusdb-*.tar.gz
             secantusdb-*.tar.gz.sha256
+            secantusdb-*.zip
+            secantusdb-*.zip.sha256
           if-no-files-found: error
 
       - name: Attach to the GitHub Release
@@ -298,6 +387,10 @@ jobs:
           prerelease: ${{ contains(env.VERSION, '-') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # NB `fail_on_unmatched_files: true` above applies per-pattern, so the
+          # .zip globs would fail the non-Windows targets that never produce one.
+          # Each target attaches only what it built; the Release accumulates all
+          # of them across the matrix.
           files: |
             secantusdb-*.tar.gz
             secantusdb-*.tar.gz.sha256
@@ -316,11 +409,10 @@ jobs:
 #   - target: x86_64-apple-darwin
 #       Intentionally absent, mirroring the wheel matrix (Apple Silicon is the
 #       active macOS target; Intel runner pool is scarce).
-#   - target: x86_64-pc-windows-msvc
-#       BLOCKED: the MSVC WT build produces no libwiredtiger.a, so build.rs can't
-#       static-link it; Windows ships via the wheel's bundled _secantus_server
-#       handle only. See tasks/backlog.md §7 (R7 tail). Unblock by emitting a WT
-#       static lib from the MSVC build and teaching build.rs to find it.
+#   (x86_64-pc-windows-msvc is ENABLED above — it was listed here as blocked on a
+#    missing MSVC static lib, which turned out to be a filename difference:
+#    `wiredtiger.lib`, not `libwiredtiger.a`. Remaining Windows follow-on: PGO,
+#    which needs an MSVC-compatible instrumented build + llvm-profdata merge.)
 #
 # Optimisation (deferred for correctness): cache build/*/wt-build keyed on the
 # vendored WiredTiger submodule SHA so most runs skip the ~minutes-long WT build.

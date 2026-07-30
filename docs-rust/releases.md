@@ -6,8 +6,8 @@ PyPI package. A release is a `secantusdb-v<crate-version>` tag (e.g.
 
 1. asserts the tag matches the lockstep crate version (a fat-fingered tag
    cannot ship a wrong-versioned binary),
-2. builds static-WiredTiger archives for `x86_64-unknown-linux-gnu` and
-   `aarch64-apple-darwin`,
+2. builds static-WiredTiger archives for `x86_64-unknown-linux-gnu`,
+   `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`,
 3. smoke-tests each archive — the binary is booted and a full `pymongo`
    CRUD round-trip runs against it,
 4. attaches `tar.gz` + `.sha256` pairs to a GitHub **pre-release** named
@@ -34,5 +34,5 @@ one server bumps only that server's version.
 | --- | --- |
 | `x86_64-unknown-linux-gnu` | ✅ prebuilt archive |
 | `aarch64-apple-darwin` | ✅ prebuilt archive |
-| Windows | ❌ no standalone binary (the MSVC WiredTiger build emits no static lib) — use the wheel-bundled `_secantus_server` handle |
+| `x86_64-pc-windows-msvc` | ✅ prebuilt archive (`.zip` + `.tar.gz`; static CRT, no PGO yet) |
 | musl-static Linux, `aarch64` Linux | documented follow-ons |
