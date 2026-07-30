@@ -10,6 +10,8 @@ libraries, no system MongoDB:
 
 - `secantusdb-<version>-x86_64-unknown-linux-gnu.tar.gz`
 - `secantusdb-<version>-aarch64-apple-darwin.tar.gz`
+- `secantusdb-<version>-x86_64-pc-windows-msvc.zip` — and a `.tar.gz` of the
+  same contents, if you'd rather use the same command on every platform
 
 Each archive ships with a `.sha256` checksum file. Download, verify,
 extract, run:
@@ -27,8 +29,25 @@ tar xzf secantusdb-0.5.3-beta.147-x86_64-unknown-linux-gnu.tar.gz
 Every archive is smoke-tested in CI before release: the workflow boots the
 binary and runs a full `pymongo` CRUD round-trip against it.
 
-**Windows** binaries are intentionally absent (the MSVC WiredTiger build
-emits no static library); on Windows, use the wheel-bundled server below.
+On **Windows**, unpack the `.zip` in Explorer (or `tar xzf` the `.tar.gz` from
+any modern shell) and run `secantusd-rs.exe`:
+
+```powershell
+$tag = "secantusdb-v0.5.3-beta.147"
+$base = "https://github.com/jdrumgoole/SecantusDB/releases/download/$tag"
+$zip = "secantusdb-0.5.3-beta.147-x86_64-pc-windows-msvc.zip"
+Invoke-WebRequest "$base/$zip" -OutFile $zip
+# The .sha256 is in the `<hash>  <filename>` format shasum/sha256sum print:
+(Get-FileHash $zip -Algorithm SHA256).Hash -eq `
+  ((Get-Content "$zip.sha256") -split '\s+')[0].ToUpper()
+Expand-Archive $zip -DestinationPath .
+.\secantusd-rs.exe --version
+```
+
+The Windows build links the C runtime statically, so it needs no Visual C++
+redistributable — the `.exe` runs on a clean machine. It is currently built
+without PGO, so it is a few percent slower on write-heavy paths than the Linux
+and macOS archives; it is otherwise identical.
 
 ## Bundled in the Python wheel
 

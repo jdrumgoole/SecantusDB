@@ -52,6 +52,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Graceful shutdown is signalled differently on Windows. `Popen.send_signal`
+# maps SIGTERM to TerminateProcess there — an immediate kill that exits 1 and
+# runs no handler, so the clean-exit these tests assert could never happen. The
+# binary uses the `ctrlc` crate (with `termination`), which on Windows installs
+# a console control handler, so CTRL_BREAK_EVENT reaches the same shutdown path
+# SIGTERM takes on Unix. It is delivered to a process GROUP, hence the
+# CREATE_NEW_PROCESS_GROUP flag below — without it the break would also hit the
+# pytest process running the test.
+_WINDOWS = sys.platform == "win32"
+_SPAWN_KWARGS: dict[str, object] = (
+    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _WINDOWS else {}
+)
+
+
+def _request_shutdown(proc: subprocess.Popen[str]) -> None:
+    """Ask the daemon to stop the way a user would, per platform."""
+    proc.send_signal(signal.CTRL_BREAK_EVENT if _WINDOWS else signal.SIGTERM)
+
+
 @pytest.fixture
 def daemon(tmp_path: pathlib.Path) -> subprocess.Popen[str]:
     assert _BIN is not None
@@ -60,6 +79,7 @@ def daemon(tmp_path: pathlib.Path) -> subprocess.Popen[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        **_SPAWN_KWARGS,
     )
     try:
         yield proc
@@ -100,7 +120,7 @@ def test_binary_serves_pymongo_and_exits_cleanly(
     finally:
         client.close()
 
-    daemon.send_signal(signal.SIGTERM)
+    _request_shutdown(daemon)
     assert daemon.wait(timeout=15) == 0, daemon.stderr.read() if daemon.stderr else ""
 
 
@@ -118,6 +138,7 @@ def test_standalone_flag_drops_replica_set(tmp_path: pathlib.Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        **_SPAWN_KWARGS,
     )
     try:
         host, port = _bound_address(proc)
@@ -128,7 +149,7 @@ def test_standalone_flag_drops_replica_set(tmp_path: pathlib.Path) -> None:
             assert "setName" not in client.admin.command("hello")
         finally:
             client.close()
-        proc.send_signal(signal.SIGTERM)
+        _request_shutdown(proc)
         assert proc.wait(timeout=15) == 0
     finally:
         if proc.poll() is None:

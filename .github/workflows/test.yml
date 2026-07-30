@@ -1734,14 +1734,20 @@ jobs:
           python -c "import _secantus_storage, _secantus_server;
           print('bundled OK:', _secantus_storage.__file__, _secantus_server.__file__)"
 
-      - name: Assert the wheel bundles secantusd-rs on PATH + it runs (non-Windows)
+      - name: Assert the wheel bundles secantusd-rs on PATH + it runs
         # CMake installs the standalone binary into the wheel's scripts dir
         # (SKBUILD_SCRIPTS_DIR), so installing the wheel puts `secantusd-rs` on
         # PATH — distinct from the pure-Python `secantus.cli:main` `secantusd-py`
         # console script. Drive the bundled binary through the same smoke test
-        # via SECANTUSDB_BIN. Windows is skipped (the bin isn't built there; see
-        # CMakeLists.txt / tasks/backlog.md §7).
-        if: runner.os != 'Windows'
+        # via SECANTUSDB_BIN.
+        #
+        # This ran everywhere-but-Windows on the grounds that "the bin isn't
+        # built there". It is: this job's own log shows `Linking C static library
+        # wiredtiger.lib` followed by `Building standalone secantusd-rs binary`,
+        # because MSVC's static lib is simply named differently from the Unix one
+        # and build.rs already looks for both. Running it here keeps the Windows
+        # release binary honest on every push instead of only at tag time —
+        # `command -v` and the smoke test both work under Git Bash.
         shell: bash
         run: |
           whl=$(ls dist-storage/*.whl)

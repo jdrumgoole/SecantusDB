@@ -909,13 +909,28 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   reduces re-downloads within a job; cargo vendoring / a registry mirror would
   remove the risk entirely.
 **Deferred / not yet ported:**
-- [ ] **R7 tail — probe fixed, Windows-binary CI verification pending**
-  (2026-07-17). `secantus-wt`'s `build.rs` now also probes MSVC's
-  `wiredtiger.lib` (and `.dylib`), so the standalone binary can resolve WT on
-  Windows; still to do: a Windows lane in the `secantusdb-v*` release-binaries
-  matrix to prove the end-to-end build (no local Windows to verify against).
-  The entry's second half was stale: the CLI's TOML config layer + tuning
-  flags shipped in §7.6 (beta.96, `config.rs` + `wt_config` knobs).
+- [~] **R7 tail — Windows lane added; PGO on MSVC still open**
+  (2026-07-17, updated 2026-07-30). `secantus-wt`'s `build.rs` probes MSVC's
+  `wiredtiger.lib` (and `.dylib`), so the standalone binary resolves WT on
+  Windows. The `x86_64-pc-windows-msvc` lane is now in the `secantusdb-v*`
+  release-binaries matrix, shipping a `.zip` + a `.tar.gz`. Two Windows-specific
+  details worth remembering:
+    * `+crt-static` — WT's `wiredtiger.lib` uses the static CRT while Rust's
+      MSVC target defaults to the dynamic one. That mismatch is what
+      `LNK4098: defaultlib 'LIBCMT' conflicts` was reporting, and it means two C
+      runtimes with two heaps in one process — a real corruption risk for a
+      database, not a cosmetic warning. Bonus: no VC++ redist needed to run it.
+    * The binary smoke test can't use SIGTERM on Windows (`send_signal` maps it
+      to `TerminateProcess`: immediate kill, exit 1, no handler, so the clean
+      shutdown it asserts could never happen). It sends `CTRL_BREAK_EVENT` to a
+      `CREATE_NEW_PROCESS_GROUP` child instead, which the `ctrlc` crate's
+      console handler turns into the same graceful path SIGTERM takes on Unix.
+  `test.yml`'s `storage-engine` job now runs that smoke test on Windows too, so
+  the release binary is exercised on every push rather than only at tag time.
+  Still open: **PGO on MSVC** (the lane builds `no_pgo`), which needs an
+  instrumented MSVC build plus an `llvm-profdata` merge. The entry's second half
+  was stale: the CLI's TOML config layer + tuning flags shipped in §7.6
+  (beta.96, `config.rs` + `wt_config` knobs).
 - [~] **R8 tail — ALL THIRTEEN driver gauges now run against the Rust server**
   (2026-07-17 sweep; reports committed as `docs/validation-report-*-rust-server.md`).
   The Rust server is at effective conformance parity with the Python server —
