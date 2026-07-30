@@ -490,10 +490,17 @@ fn data_table_cfg(base: &str) -> String {
 /// `SECANTUS_WT_CONFIG_EXTRA` on the connection config). Create-time only:
 /// benchmarks start on fresh datadirs, existing stores keep their config.
 fn oplog_table_cfg() -> String {
+    // Append-workload btree tuning (Finding-13 winner, +19% at 8 writers):
+    // rows arrive in strictly-ascending seq order and are never updated, so
+    // fill pages fully before splitting (`split_pct=100`) and use larger
+    // leaves (fewer splits/reconciliations per MB appended). zlib stays ON —
+    // the sweep measured compression-off cratering to 19% retention (bigger
+    // uncompressed pages = more eviction IO; the constraint is IO volume,
+    // not CPU). Create-time only: existing stores keep their config.
     let mut cfg = if oplog_tables_nonlogged() {
-        format!("{QU_COMPRESSED_CFG},log=(enabled=false)")
+        format!("{QU_COMPRESSED_CFG},split_pct=100,leaf_page_max=128KB,log=(enabled=false)")
     } else {
-        QU_COMPRESSED_CFG.to_string()
+        format!("{QU_COMPRESSED_CFG},split_pct=100,leaf_page_max=128KB")
     };
     if let Ok(extra) = std::env::var("SECANTUS_OPLOG_TABLE_EXTRA") {
         if !extra.is_empty() {
@@ -504,12 +511,20 @@ fn oplog_table_cfg() -> String {
     cfg
 }
 
-/// How many oplog shard tables the WRITE path routes across — normally
-/// [`OPLOG_SHARDS`], overridable to 1..=OPLOG_SHARDS via the
-/// `SECANTUS_OPLOG_SHARDS` experiment hook (sweeping append contention vs
-/// merge overhead without an on-disk migration). Routing-only: the read side
-/// always considers all `OPLOG_SHARDS` tables + the legacy table, so a store
-/// written under any override stays fully readable.
+/// Default write-path oplog routing width. Two, not [`OPLOG_SHARDS`]: the
+/// 16-way split was built against rightmost-page append contention that no
+/// longer binds post-RecordId (#613-640) and post-prune-fix (#700) — the
+/// Finding-13 sweep measured every lower shard count beating 16 at eight
+/// writers (+12-16%), with 1 ≈ 2 ≈ 8. Two keeps a second append point as
+/// cheap insurance against pathological single-tree stalls while shedding
+/// the merge/cache overhead of sixteen.
+const OPLOG_ROUTE_SHARDS_DEFAULT: i64 = 2;
+
+/// How many oplog shard tables the WRITE path routes across — default
+/// [`OPLOG_ROUTE_SHARDS_DEFAULT`], overridable to 1..=OPLOG_SHARDS via
+/// `SECANTUS_OPLOG_SHARDS` (the Finding-13 sweep hook). Routing-only: the
+/// read side always considers all `OPLOG_SHARDS` tables + the legacy table,
+/// so a store written under any width stays fully readable.
 fn oplog_route_shards() -> i64 {
     static N: OnceLock<i64> = OnceLock::new();
     *N.get_or_init(|| {
@@ -517,7 +532,7 @@ fn oplog_route_shards() -> i64 {
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|n| (1..=OPLOG_SHARDS).contains(n))
-            .unwrap_or(OPLOG_SHARDS)
+            .unwrap_or(OPLOG_ROUTE_SHARDS_DEFAULT)
     })
 }
 

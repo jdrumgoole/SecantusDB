@@ -344,7 +344,7 @@ OPTIONS:
                                  from the hello reply (drivers see a STANDALONE
                                  topology; change streams need the default)
     --cache-size SIZE            WiredTiger cache size, unit-suffixed string like
-                                 '256M', '1G', '8G' (default: 1G)
+                                 '256M', '1G', '8G' (default: 4G)
     --log-file-max SIZE          WiredTiger WAL log file_max, unit-suffixed like
                                  '128MB', '1GB', '2GB' (default: 2GB; 2GB is WT's
                                  cap. Bigger = fewer log rotations under write
@@ -420,7 +420,7 @@ mod tests {
         assert!(!a.require_auth);
         assert!(a.tls.is_none());
         assert_eq!(a.log_level, "INFO");
-        assert_eq!(a.cache_size, "1G");
+        assert_eq!(a.cache_size, "4G");
         assert_eq!(a.session_max, 1000);
         assert!(!a.sync_on_commit);
         assert_eq!(a.noop_heartbeat_seconds, 0.0);
