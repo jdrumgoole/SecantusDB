@@ -277,6 +277,10 @@ class Session:
     # ``secantus.rbac.check_privilege`` — the same model the Mongo server uses.
     authz_active: bool = False
     roles: list[Any] = field(default_factory=list)
+    # Temp tables this session created (``(db, name)``) — dropped at connection
+    # teardown by ``engine.drop_session_temp_tables`` (PG drops temp tables at
+    # session end; embedded ``run_sql`` sessions live for the process).
+    temp_tables: set[tuple[str, str]] = field(default_factory=set)
     # SET ROLE / SET SESSION AUTHORIZATION (#128). ``user`` is the *session user*
     # — the login identity, changed only by SET SESSION AUTHORIZATION. ``role`` is
     # the *current role* override set by SET ROLE (None = current role tracks the

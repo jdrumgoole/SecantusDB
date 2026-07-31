@@ -46,6 +46,22 @@ from secantus.sql.session import (
 )
 
 
+def drop_session_temp_tables(storage: Any, session: Session) -> None:
+    """Drop every temp table ``session`` created — the wire server calls this at
+    connection teardown, matching real PG's drop-temp-at-session-end. Stale
+    entries (already dropped by the user) are skipped silently."""
+    for tdb, name in list(getattr(session, "temp_tables", ()) or ()):
+        with contextlib.suppress(Exception):
+            catalog = Catalog(storage)
+            t = catalog.get(tdb, name)
+            if t is not None and t.temp:
+                executor.execute_drop_table(
+                    planner.DropTablePlan(name=name, if_exists=True), catalog, storage, tdb
+                )
+    if getattr(session, "temp_tables", None):
+        session.temp_tables.clear()
+
+
 def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) -> list[SQLResult]:
     """Execute ``sql`` against ``db`` on ``storage``; one result per statement.
 
@@ -1370,7 +1386,19 @@ def _describe_statement(
         table = catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
     if table is None:
         return None  # undefined table — let Execute raise the real error
-    select_plan = planner.plan_select(stmt, table)
+    try:
+        select_plan = planner.plan_select(stmt, table)
+    except errors.SQLError:
+        # A WHERE the pushdown can't lower is routed to per-row evaluation at
+        # Execute — Describe must not fail on it. The result shape doesn't
+        # depend on the WHERE, so re-plan without it; a statement that still
+        # can't plan defers to Execute (NoData).
+        bare = stmt.copy()
+        bare.set("where", None)
+        try:
+            select_plan = planner.plan_select(bare, table)
+        except errors.SQLError:
+            return None
     if select_plan.count_star:
         return [ColumnDesc(select_plan.count_alias, "int8", typemap.PG_OID["int8"])]
     return executor._out_column_descs(select_plan.out_columns, storage, db)
@@ -1639,9 +1667,13 @@ def _run_statement(
     if isinstance(stmt, exp.Create):
         kind = (stmt.args.get("kind") or "TABLE").upper()
         if kind == "TABLE":
-            return executor.execute_create_table(
-                planner.plan_create_table(stmt), catalog, storage, db
-            )
+            plan = planner.plan_create_table(stmt)
+            res = executor.execute_create_table(plan, catalog, storage, db)
+            if plan.table.temp:
+                # A temp table dies with its session (drop_session_temp_tables,
+                # called by the wire server's connection teardown).
+                session.temp_tables.add((db, plan.table.name))
+            return res
         if kind == "INDEX":
             index = stmt.this
             tname = index.args["table"].name
@@ -2103,7 +2135,7 @@ def _run_select(
     # well as real collections.
     if planner.select_needs_pipeline(stmt):
         backend = virtual.CatalogBackend(storage, catalog, session, db)
-        plan = planner.plan_pipeline_select(stmt, db, catalog, storage)
+        plan = planner.plan_pipeline_select(stmt, db, catalog, storage, session=session)
         sctx = scalar.ScalarContext(storage=backend, catalog=catalog, db=db, session=session)
         if isinstance(plan, planner.EvaluatedSelectPlan):
             return executor.execute_evaluated_select(plan, backend, db, sctx)
@@ -2884,8 +2916,13 @@ def _seq_prop_int(props: Any, key: str) -> int | None:
     for e in props.expressions:
         if isinstance(e, exp.SequenceProperties):
             val = e.args.get(key)
-            if val is not None:
-                return int(val.this if isinstance(val, exp.Literal) else val)
+            if isinstance(val, exp.Literal):
+                return int(val.this)
+            if isinstance(val, exp.Neg) and isinstance(val.this, exp.Literal):
+                return -int(val.this.this)
+            # ``NO MINVALUE`` / ``NO MAXVALUE`` parse as a non-literal node —
+            # "no bound" is the default, exactly what None means here.
+            return None
     return None
 
 

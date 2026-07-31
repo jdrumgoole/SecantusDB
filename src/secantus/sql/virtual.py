@@ -155,7 +155,7 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
         # that field back to its source SQL so the index reflects like Postgres'
         # (indkey attnum 0 marks an expression column).
         field_to_expr = {ei.field: ei for ei in getattr(t, "expr_indexes", [])}
-        pk_cols = t.pk_columns
+        pk_cols = t.ordered_pk_columns()
         if pk_cols:
             out.append(
                 {
@@ -271,9 +271,12 @@ def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> l
     rows = [
         {
             "table_catalog": db,
-            "table_schema": "public",
+            # Real PG homes a temp table in its session's pg_temp_N schema
+            # with type LOCAL TEMPORARY, so schema-filtered reflection
+            # (table_schema = 'public') never lists it.
+            "table_schema": "pg_temp_1" if t.temp else "public",
             "table_name": t.name,
-            "table_type": "BASE TABLE",
+            "table_type": "LOCAL TEMPORARY" if t.temp else "BASE TABLE",
         }
         for t in _user_tables(db, catalog)
         if t.name not in matviews
@@ -416,7 +419,7 @@ def _pk_constraints(db: str, catalog: Catalog) -> list[tuple[TableDef, str, list
     an index, not a constraint), so these builders surface PK rows only."""
     out: list[tuple[TableDef, str, list[str]]] = []
     for t in _user_tables(db, catalog):
-        pk_cols = t.pk_columns
+        pk_cols = t.ordered_pk_columns()
         if pk_cols:
             out.append((t, t.pk_constraint_name(), [c.name for c in pk_cols]))
     return out
@@ -426,12 +429,25 @@ _PK_CON_OID_BASE = 30000
 _FK_OID_BASE = 40000
 
 
+_SAFE_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_$]*$")
+
+
+def _quote_ident(name: str) -> str:
+    """``quote_ident`` semantics: bare when already lowercase-safe, else
+    double-quoted with embedded quotes doubled — matching how real
+    ``pg_get_constraintdef`` renders identifiers (SQLAlchemy regex-parses
+    that text, and an unquoted ``i need quotes`` breaks its parser)."""
+    if _SAFE_IDENT_RE.match(name):
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _fk_condef(fk: ForeignKey, ref_cols: list[str]) -> str:
     """Render a foreign key the way ``pg_get_constraintdef`` does — SQLAlchemy's
     inspector regex-parses exactly this string to reflect the constraint."""
-    cols = ", ".join(fk.columns)
-    rcols = ", ".join(ref_cols)
-    text = f"FOREIGN KEY ({cols}) REFERENCES {fk.ref_table}({rcols})"
+    cols = ", ".join(_quote_ident(c) for c in fk.columns)
+    rcols = ", ".join(_quote_ident(c) for c in ref_cols)
+    text = f"FOREIGN KEY ({cols}) REFERENCES {_quote_ident(fk.ref_table)}({rcols})"
     if fk.on_update:
         text += f" ON UPDATE {fk.on_update}"
     if fk.on_delete:
@@ -824,7 +840,9 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
             # A materialized view is a real relation with columns, tracked in the
             # catalog like a table — but it reports relkind 'm', not 'r'.
             "relkind": "m" if t.name in matviews else "r",
-            "relpersistence": "p",  # permanent (never temp/unlogged)
+            # Temp tables report 't' so SQLAlchemy's get_table_names filter
+            # (relpersistence != 't') hides them, exactly as real PG does.
+            "relpersistence": "t" if t.temp else "p",
             "relam": _HEAP_AM_OID,
             "reloptions": None,
         }
@@ -962,13 +980,13 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
             elif col.enum_type is not None:
                 typoid = enum_oids.get(col.enum_type, 25)
             else:
-                typoid = typemap.PG_OID.get(col.type_tag, 25)
+                typoid = col.decl_oid or typemap.PG_OID.get(col.type_tag, 25)
             rows.append(
                 {
                     "attrelid": oids[t.name],
                     "attname": col.name,
                     "atttypid": typoid,
-                    "atttypmod": -1,
+                    "atttypmod": col.typmod,
                     "attnum": i,
                     "attnotnull": not col.nullable,
                     "atthasdef": col.has_default or col.sequence is not None,
@@ -979,6 +997,44 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
                     "attlen": -1,
                 }
             )
+    # Plain views expose their output columns as pg_attribute rows keyed on the
+    # view's pg_class oid (real PG does the same) — this is what SQLAlchemy's
+    # get_columns reads for a view. The column shape comes from describing the
+    # view's stored SELECT (planning only, never executed); a view whose
+    # definition can't be described (e.g. its base table was dropped) simply
+    # contributes no rows. Lazy import: engine imports virtual at module level.
+    getter = getattr(catalog, "get_view", None)
+    if getter is not None:
+        import sqlglot as _sqlglot
+
+        from secantus.sql import engine as _engine
+
+        for vname, void in _view_oids(db, catalog).items():
+            definition = getter(db, vname)
+            if definition is None:
+                continue
+            try:
+                inner = _sqlglot.parse_one(definition, read="postgres")
+                descs = _engine.describe_statement(storage, db, inner, session, catalog)
+            except Exception:
+                continue
+            for i, desc in enumerate(descs or [], start=1):
+                rows.append(
+                    {
+                        "attrelid": void,
+                        "attname": desc.name,
+                        "atttypid": desc.pg_oid,
+                        "atttypmod": desc.typmod,
+                        "attnum": i,
+                        "attnotnull": False,
+                        "atthasdef": False,
+                        "attisdropped": False,
+                        "attidentity": "",
+                        "attgenerated": "",
+                        "attcollation": 0,
+                        "attlen": -1,
+                    }
+                )
     # Composite-type fields are pg_attribute rows keyed on the type's relkind='c'
     # relation oid, so pg_type.typrelid -> pg_class.oid -> pg_attribute resolves.
     rel_oids = _composite_rel_oids(db, catalog)
@@ -1039,6 +1095,7 @@ def _pg_attrdef(db: str, session: Session, storage: Any, catalog: Catalog) -> li
 
 
 _PG_CLASS_OID = 1259  # the OID of the pg_class catalog itself (classoid for relations)
+_PG_CONSTRAINT_CLASSOID = 2606  # pg_constraint catalog OID (classoid for constraint comments)
 
 
 def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -1068,6 +1125,32 @@ def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -
                         "description": col.comment,
                     }
                 )
+    # COMMENT ON CONSTRAINT rows, keyed by the pg_constraint oid so
+    # SQLAlchemy's constraint-comment outer join (objoid = pg_constraint.oid)
+    # resolves. The comments live on the catalog's constraint records.
+    relid_to_table = {oids[t.name]: t for t in _user_tables(db, catalog)}
+    for con in _pg_constraint(db, session, storage, catalog):
+        t = relid_to_table.get(con["conrelid"])
+        if t is None:
+            continue
+        comment = None
+        if con["contype"] == "p" and con["conname"] == t.pk_constraint_name():
+            comment = t.pk_comment
+        else:
+            for group in (t.check_constraints, t.unique_constraints, t.foreign_keys):
+                for c in group:
+                    if c.name == con["conname"]:
+                        comment = c.comment
+                        break
+        if comment is not None:
+            rows.append(
+                {
+                    "objoid": con["oid"],
+                    "classoid": _PG_CONSTRAINT_CLASSOID,
+                    "objsubid": 0,
+                    "description": comment,
+                }
+            )
     return rows
 
 

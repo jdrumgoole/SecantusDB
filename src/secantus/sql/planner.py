@@ -571,20 +571,32 @@ _CMP_OPS: dict[type, tuple[str, str]] = {
 }
 
 
-def _like_to_regex(pattern: str) -> str:
+def _like_to_regex(pattern: str, escape: str | None = None) -> str:
     """Translate a SQL LIKE pattern to an anchored regex.
 
     ``%`` -> ``.*`` and ``_`` -> ``.``; every other character is escaped so it
-    matches literally.
+    matches literally. With an ``ESCAPE`` character, ``<esc>X`` matches ``X``
+    literally (PG semantics — the escape applies to the next character).
     """
+    if escape is not None and len(escape) > 1:
+        raise errors.SQLError("22025", "invalid escape string")
+    if not escape:
+        escape = None  # ``ESCAPE ''`` disables escaping, like PG
     out = ["^"]
-    for ch in pattern:
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if escape and ch == escape and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+            continue
         if ch == "%":
             out.append(".*")
         elif ch == "_":
             out.append(".")
         else:
             out.append(re.escape(ch))
+        i += 1
     out.append("$")
     return "".join(out)
 
@@ -925,7 +937,10 @@ def _func_to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any | None:
 # Catalog predicates that are functions of visibility/scope which, on a
 # single-node SecantusDB where every relation lives in the default search path,
 # are always true. SQLAlchemy's reflection emits these in its catalog WHEREs.
-_ALWAYS_TRUE_PREDICATES = {"pg_table_is_visible", "pg_type_is_visible"}
+# ``pg_table_is_visible`` is NOT here: a temp relation is invisible to every
+# session but its creator (and the reflecting connection is never the creator),
+# so it translates to ``relpersistence != 't'`` on the pg_class row instead.
+_ALWAYS_TRUE_PREDICATES = {"pg_type_is_visible"}
 
 
 @dataclass
@@ -1131,6 +1146,33 @@ def _expr_to_filter(
         node = node.expression
     if isinstance(node, exp.Anonymous) and node.name.lower() in _ALWAYS_TRUE_PREDICATES:
         return {}
+    if isinstance(node, exp.Anonymous) and node.name.lower() == "pg_table_is_visible":
+        # Real PG: a temp relation is visible only to its creating session.
+        # Sessions track the temp tables they created (``Session.temp_tables``),
+        # so the predicate lowers to ``relpersistence != 't' OR relname IN
+        # (<this session's temp tables>)`` on the same pg_class row the oid
+        # argument points at (same alias, so joins resolve).
+        arg = (node.expressions or [None])[0]
+        alias = arg.table if isinstance(arg, exp.Column) else None
+        vis: exp.Expression = exp.NEQ(
+            this=exp.column("relpersistence", table=alias or None),
+            expression=exp.Literal.string("t"),
+        )
+        session = getattr(subctx, "session", None)
+        own = sorted(
+            name
+            for (tdb, name) in (getattr(session, "temp_tables", None) or ())
+            if subctx is None or tdb == subctx.db
+        )
+        if own:
+            vis = exp.Or(
+                this=vis,
+                expression=exp.In(
+                    this=exp.column("relname", table=alias or None),
+                    expressions=[exp.Literal.string(n) for n in own],
+                ),
+            )
+        return _expr_to_filter(vis, resolve, subctx)
 
     if isinstance(node, exp.And):
         parts = [
@@ -1254,6 +1296,18 @@ def _expr_to_filter(
         low = typemap.coerce(_literal(node.args["low"]), tag)
         high = typemap.coerce(_literal(node.args["high"]), tag)
         return {field: {"$gte": low, "$lte": high}}
+
+    if isinstance(node, exp.Escape) and isinstance(node.this, (exp.Like, exp.ILike)):
+        # ``LIKE <pattern> ESCAPE <char>`` — same lowering with the escape
+        # character honored in the regex translation.
+        like = node.this
+        esc = _literal(node.expression)
+        field, tag = _field(like.this, resolve)
+        pattern = _literal(like.expression)
+        spec_e: dict[str, Any] = {"$regex": _like_to_regex(str(pattern), escape=str(esc))}
+        if isinstance(like, exp.ILike) or tag == "citext":
+            spec_e["$options"] = "i"
+        return {field: spec_e}
 
     if isinstance(node, (exp.Like, exp.ILike)):
         field, tag = _field(node.this, resolve)
@@ -1505,6 +1559,19 @@ def _where_filter(
 # ---------------------------------------------------------------------------
 
 
+def _decl_identity(datatype: exp.DataType) -> dict[str, Any]:
+    """The declared reflection identity of a column type — ``decl_oid`` when the
+    declared oid differs from the storage tag's (``varchar``/``bpchar`` fold to
+    ``text``) and the ``atttypmod`` (``varchar(52)``, ``numeric(18,5)``, …), via
+    the same ``cast_type_identity`` the cast descriptor uses. JSON's special
+    (114, -1) identity is already carried by ``json_plain``."""
+    ident = typemap.cast_type_identity(datatype)
+    if ident is None or ident == (114, -1):
+        return {}
+    oid, typmod = ident
+    return {"decl_oid": oid, "typmod": typmod}
+
+
 def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
     schema = stmt.this
     if not isinstance(schema, exp.Schema):
@@ -1613,6 +1680,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 generated=_generated_expr(coldef),
                 # ``json`` (not ``jsonb``): same stored shape, oid 114 on the wire.
                 json_plain=(tag == "json" and coldef.args["kind"].this == exp.DataType.Type.JSON),
+                **_decl_identity(coldef.args["kind"]),
             )
         )
     if pk_table_names:
@@ -1634,6 +1702,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         unique_constraints=uniques,
         temp=is_temp,
         pk_name=pk_name,
+        pk_column_order=tuple(pk_table_names) if pk_table_names else None,
     )
     return CreateTablePlan(
         table=table, if_not_exists=bool(stmt.args.get("exists")), sequences=seq_plans
@@ -2061,6 +2130,11 @@ def copy_row_doc(col_names: list[str], values: list[Any], table: TableDef) -> di
 def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
     col_names = insert_target_columns(stmt, table)
     values = stmt.expression
+    if values is None and stmt.args.get("default"):
+        # ``INSERT INTO t DEFAULT VALUES`` — one row, every column defaulted:
+        # equivalent to an empty column list with one empty tuple.
+        values = exp.Values(expressions=[exp.Tuple(expressions=[])])
+        col_names = []
     if not isinstance(values, exp.Values):
         raise errors.feature_not_supported("INSERT requires a VALUES clause")
     docs: list[dict[str, Any]] = []
@@ -2330,9 +2404,32 @@ def _emit_pipeline_sort(
 def _limit_skip(stmt: exp.Expression) -> tuple[int, int]:
     limit_node = stmt.args.get("limit")
     offset_node = stmt.args.get("offset")
-    limit = int(_literal(limit_node.expression)) if limit_node is not None else 0
-    skip = int(_literal(offset_node.expression)) if offset_node is not None else 0
+    limit = _const_int(limit_node.expression) if limit_node is not None else 0
+    skip = _const_int(offset_node.expression) if offset_node is not None else 0
     return limit, skip
+
+
+def _const_int(node: exp.Expression) -> int:
+    """An integer LIMIT / OFFSET operand. PG accepts any constant expression
+    there (``OFFSET 1 + 1``, ``LIMIT $1::INTEGER``); fall back to the scalar
+    evaluator for anything ``_literal`` can't fold."""
+    try:
+        value = _literal(node)
+    except errors.SQLError:
+        from secantus.sql import scalar
+
+        value = scalar.evaluate(
+            node,
+            _const_scope,
+            scalar.ScalarContext(storage=None, catalog=None, db="", session=None),
+        )
+    if value is None:
+        raise errors.feature_not_supported(f"non-constant LIMIT/OFFSET: {node.sql()}")
+    return int(_unwrap_num(value))
+
+
+def _unwrap_num(value: Any) -> Any:
+    return int(value) if isinstance(value, _Decimal) else value
 
 
 def _infer_value_tag(value: Any) -> str:
@@ -4243,11 +4340,17 @@ def unwrap_paren_join_from(stmt: exp.Select) -> None:
 
 
 def plan_pipeline_select(
-    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
+    stmt: exp.Select, db: str, catalog: Any, storage: Any = None, session: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
     # Publish the subquery context so any WHERE `$match` in the pipeline planners
     # can evaluate a scalar / IN subquery (the same as the single-table pushdown).
-    token = _pipeline_subctx.set(SubqueryCtx(storage=storage, db=db, catalog=catalog, session=None))
+    # The session rides along for session-aware predicates (pg_table_is_visible's
+    # own-temp-table branch); a nested planning call inherits the outer one's.
+    if session is None:
+        session = getattr(_pipeline_subctx.get(), "session", None)
+    token = _pipeline_subctx.set(
+        SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session)
+    )
     try:
         return _plan_pipeline_select(stmt, db, catalog, storage)
     finally:

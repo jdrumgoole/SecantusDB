@@ -2368,16 +2368,20 @@ shared storage engine or building large new protocol subsystems:
   `requirements.py` declares `schemas` closed because of exactly this).
   Needs the (db, coll) storage key to carry the schema (or a
   dotted-collection mapping like the types take).
-- [ ] **SQLAlchemy compliance gauge — remaining failure clusters** (`invoke
-  validate-sqlalchemy`, baseline 572 P / 166 F / 677 S = 77.5%,
-  `docs/validation-report-sqlalchemy.md`): ComponentReflectionTest (62 —
-  constraint-comment reflection via pg_description, index/FK detail shapes),
-  BizarroCharacterTest (30 — quoted identifiers with `%`, parens, backslashes
-  end-to-end), LikeFunctionsTest (12 — `contains`/`startswith` autoescape),
-  FetchLimitOffsetTest (6 — FETCH FIRST … WITH TIES / percent), HasSequenceTest
-  errors (6 — sequences in a non-default schema), IsOrIsNotDistinctFromTest
-  (5), TrueDivTest (4 — integer `/` vs `//` edge typing). Re-run the gauge
-  after each cluster fix; grow `requirements.py` capabilities as they land.
+- [ ] **SQLAlchemy compliance gauge — residual tail** (`invoke
+  validate-sqlalchemy`, now 713 P / 22 F / 680 S = 97.0%,
+  `docs/validation-report-sqlalchemy.md`): the insertmanyvalues sentinel
+  shape — `INSERT … SELECT p0::FLOAT FROM (VALUES …) AS alias(p0, c) ORDER BY
+  c RETURNING …` (4, ReturningTest floats + InsertBehaviorTest
+  insert_from_select_with_defaults + SequenceTest inserts); LIMIT/OFFSET
+  inside union arms + `select_from(plain union)` derived tables with scalar
+  subqueries (5, CompoundSelectTest/Deprecated); FROM-less `SELECT expr WHERE
+  EXISTS (…)` (2, ExistsTest); DateTimeMicrosecondsTest (2 — the documented
+  BSON int64-millis storage divergence, needs a storage-representation
+  change); covering-index INCLUDE reflection (1); DISTINCT ON over the
+  evaluated path (1); scalar-subquery-in-SELECT row fetch (1); server-side
+  cursor over an aliased join (1). Grow `requirements.py` capabilities as
+  they land; per-round history in tasks/sql-gauges-plan.md §5.
 - [ ] **HAVING general-shape residual**: the HAVING lowerers now cover
   comparisons, `IS [NOT] NULL` (incl. computed group-key operands),
   `[NOT] IN` over group keys, and always-unknown NULL-operand folds — but any

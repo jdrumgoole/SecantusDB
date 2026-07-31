@@ -347,6 +347,9 @@ class SecantusPGServer:
             if session is not None:
                 self._notify.unlisten_all(session)  # drop this conn's LISTENs
                 self._activity.unregister(session)  # drop from pg_stat_activity (#137)
+                # PG drops a session's temp tables when the session ends.
+                with contextlib.suppress(Exception):
+                    sql_engine.drop_session_temp_tables(self.storage, session)
             # Release this thread's cached WT session + cursors back to the
             # engine, exactly like the Mongo server's teardown (server.py).
             # Without this every pg connection leaked its WT session: the
