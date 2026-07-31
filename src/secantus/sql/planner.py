@@ -1176,6 +1176,19 @@ def _expr_to_filter(
                     expressions=[exp.Literal.string(n) for n in own],
                 ),
             )
+        # Search-path visibility: an unqualified lookup sees only the default
+        # namespaces (public / pg_catalog / information_schema) plus the
+        # session's own pg_temp — a relation in a user schema is invisible
+        # until schema-qualified, exactly like real PG with the default
+        # search_path. Namespace oids mirror virtual._NS_OIDS / _PG_TEMP_NS_OID.
+        visible_ns = [2200, 11, 13000, 99]
+        vis = exp.And(
+            this=vis,
+            expression=exp.In(
+                this=exp.column("relnamespace", table=alias or None),
+                expressions=[exp.Literal.number(o) for o in visible_ns],
+            ),
+        )
         return _expr_to_filter(vis, resolve, subctx)
 
     if isinstance(node, exp.And):
@@ -1311,6 +1324,8 @@ def _expr_to_filter(
         spec_e: dict[str, Any] = {"$regex": _like_to_regex(str(pattern), escape=str(esc))}
         if isinstance(like, exp.ILike) or tag == "citext":
             spec_e["$options"] = "i"
+        if like.args.get("negate"):
+            return {field: {"$not": spec_e}}
         return {field: spec_e}
 
     if isinstance(node, (exp.Like, exp.ILike)):
@@ -1320,6 +1335,9 @@ def _expr_to_filter(
         # ``citext LIKE`` is case-insensitive (equivalent to ILIKE).
         if isinstance(node, exp.ILike) or tag == "citext":
             spec["$options"] = "i"
+        # sqlglot parses ``NOT LIKE`` as ``Like(negate=True)``, not Not(Like).
+        if node.args.get("negate"):
+            return {field: {"$not": spec}}
         return {field: spec}
 
     if isinstance(node, (exp.RegexpLike, exp.RegexpILike)):
@@ -1580,7 +1598,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
     schema = stmt.this
     if not isinstance(schema, exp.Schema):
         raise errors.feature_not_supported("CREATE TABLE requires a column list")
-    table_name = schema.this.name
+    table_name = qualified_table_name(schema.this)
     columns: list[Column] = []
     seq_plans: list[dict[str, Any]] = []
     pk_seen = False
@@ -1719,9 +1737,9 @@ def _ref_target(ref: exp.Reference) -> tuple[str, tuple[str, ...]]:
     and resolved to ``_id`` by reflection."""
     schema = ref.this  # exp.Schema or exp.Table
     if isinstance(schema, exp.Schema):
-        return schema.this.name, tuple(_column_name(c) for c in schema.expressions)
+        return qualified_table_name(schema.this), tuple(_column_name(c) for c in schema.expressions)
     if isinstance(schema, exp.Table):
-        return schema.name, ()
+        return qualified_table_name(schema), ()
     raise errors.feature_not_supported(f"unsupported REFERENCES target: {ref.sql()}")
 
 
@@ -1756,7 +1774,8 @@ def _make_fk(
     deferrable, initially_deferred = _deferrable_flags(ref.args.get("options"))
     # Postgres' default constraint name: <table>_<firstcol>_fkey (an explicit
     # ``CONSTRAINT <name>`` wins when supplied, e.g. from ALTER TABLE ADD).
-    con_name = name or (f"{table_name}_{cols[0]}_fkey" if cols else f"{table_name}_fkey")
+    bare = table_name.split(".", 1)[1] if "." in table_name else table_name
+    con_name = name or (f"{bare}_{cols[0]}_fkey" if cols else f"{bare}_fkey")
     return ForeignKey(
         name=con_name,
         columns=cols,
@@ -1887,7 +1906,9 @@ def _with_pk(col: Column, pk_names: list[str]) -> Column:
 
 
 def plan_drop_table(stmt: exp.Drop) -> DropTablePlan:
-    return DropTablePlan(name=stmt.this.name, if_exists=bool(stmt.args.get("exists")))
+    return DropTablePlan(
+        name=qualified_table_name(stmt.this), if_exists=bool(stmt.args.get("exists"))
+    )
 
 
 def plan_alter_table(stmt: exp.Alter) -> AlterTablePlan:
@@ -4320,6 +4341,19 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     return True
 
 
+def qualified_table_name(table_node: exp.Table) -> str:
+    """The catalog key for a (possibly schema-qualified) table reference: the
+    bare name for ``public`` and unqualified references, else
+    ``"<schema>.<name>"`` — the same dotted-key mapping user types take. The
+    backing Mongo collection uses the same composed string, so the
+    dual-protocol view addresses it as ``db["schema.table"]``."""
+    schema = table_node.args.get("db")
+    sname = schema.name if schema is not None else None
+    if not sname or sname == "public":
+        return table_node.name
+    return f"{sname}.{table_node.name}"
+
+
 def _lookup_table_def(
     catalog: Any, db: str, table_node: exp.Table, storage: Any = None
 ) -> TableDef | None:
@@ -4333,7 +4367,7 @@ def _lookup_table_def(
     """
     from secantus.sql import reflect, virtual
 
-    table = catalog.get(db, table_node.name)
+    table = catalog.get(db, qualified_table_name(table_node))
     if table is not None:
         return table
     schema = table_node.args.get("db")

@@ -67,6 +67,18 @@ def _verify_secantus_identity(host: str, port: int) -> None:
         )
 
 
+def _provision_schemas(host: str, port: int) -> None:
+    """The suite expects ``test_schema`` / ``test_schema_2`` to pre-exist —
+    the documented DBA setup step in SQLAlchemy's README.unittests."""
+    import psycopg
+
+    with psycopg.connect(
+        host=host, port=port, dbname="postgres", user="postgres", autocommit=True
+    ) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS test_schema")
+        conn.execute("CREATE SCHEMA IF NOT EXISTS test_schema_2")
+
+
 def main() -> int:
     from .include_paths import DESELECT_TESTS
 
@@ -93,6 +105,7 @@ def main() -> int:
     try:
         _wait_for_listener(host, port)
         _verify_secantus_identity(host, port)
+        _provision_schemas(host, port)
 
         env = {
             **os.environ,

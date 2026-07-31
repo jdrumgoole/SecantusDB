@@ -2095,10 +2095,15 @@ def _eval_typed_func(node: exp.Func, scope: Scope, ctx: ScalarContext) -> Any:
 
 
 def _seq_name(arg: Any) -> str:
-    """The bare sequence name from a ``nextval`` / ``currval`` / ``setval`` arg —
-    a string (possibly schema-qualified ``public.s``, or quoted), stripped down."""
-    text = str(arg).strip().strip('"')
-    return text.split(".")[-1].strip('"')
+    """The catalog key of a ``nextval`` / ``currval`` / ``setval`` arg — a
+    string, possibly quoted and schema-qualified. ``public`` stays bare; a
+    user schema keeps its dotted key (``test_schema.s``), matching how
+    CREATE SEQUENCE stores it."""
+    text = str(arg).strip()
+    parts = [seg.strip().strip('"') for seg in text.split(".")]
+    if len(parts) == 1 or parts[0] == "public":
+        return parts[-1]
+    return ".".join(parts)
 
 
 def _sequence_func(name: str, args: list[Any], ctx: ScalarContext | None) -> Any:
@@ -3412,7 +3417,9 @@ def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext, escape: A
         return None
     flags = re.IGNORECASE if isinstance(node, exp.ILike) else 0
     esc = _as_text(escape) if escape is not None else None
-    return re.match(_like_to_regex(_as_text(pattern), escape=esc), _as_text(val), flags) is not None
+    hit = re.match(_like_to_regex(_as_text(pattern), escape=esc), _as_text(val), flags) is not None
+    # sqlglot parses ``NOT LIKE`` as ``Like(negate=True)``, not Not(Like).
+    return not hit if node.args.get("negate") else hit
 
 
 def _eval_regexp(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:

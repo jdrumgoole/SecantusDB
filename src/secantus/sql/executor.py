@@ -170,6 +170,10 @@ def execute_create_table(
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE TABLE")
         raise errors.duplicate_table(plan.table.name)
+    if "." in plan.table.name:
+        schema = plan.table.name.split(".", 1)[0]
+        if not catalog.schema_exists(db, schema):
+            raise errors.SQLError("3F000", f'schema "{schema}" does not exist')
     # A user-defined column type (the planner records it as ``enum_type``, since
     # it can't reach storage to tell enum from domain) must resolve to a declared
     # enum *or* domain — else 42704. A domain column adopts the domain's base tag
@@ -240,15 +244,23 @@ def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLRe
     if text == planner.UNCOMMENT_SENTINEL:
         text = None
     if kind == "TABLE":
-        table = catalog.get(db, stmt.this.name)
+        _tn = (
+            planner.qualified_table_name(stmt.this)
+            if hasattr(stmt.this, "args")
+            else stmt.this.name
+        )
+        table = catalog.get(db, _tn)
         if table is None:
-            raise errors.undefined_table(stmt.this.name)
+            raise errors.undefined_table(_tn)
         table.comment = text
         catalog.replace(db, table)
         return SQLResult(command_tag="COMMENT")
     if kind == "COLUMN":
-        col_node = stmt.this  # exp.Column: table.col
-        tname, cname = col_node.table, col_node.name
+        col_node = stmt.this  # exp.Column: [schema.]table.col
+        cname = col_node.name
+        _schema = col_node.args.get("db")
+        _sname = _schema.name if _schema is not None else None
+        tname = f"{_sname}.{col_node.table}" if _sname and _sname != "public" else col_node.table
         table = catalog.get(db, tname)
         if table is None:
             raise errors.undefined_table(tname)
@@ -269,7 +281,7 @@ def execute_create_view(
     OPTION]`` — store the SELECT definition. Querying the view expands it as a
     subquery (see ``engine._expand_views``); ``check_option`` (``"LOCAL"`` /
     ``"CASCADED"``) is enforced on write-through against each written row."""
-    name = stmt.this.name
+    name = planner.qualified_table_name(stmt.this)
     replace = bool(stmt.args.get("replace"))
     if catalog.exists(db, name):
         raise errors.SQLError("42P07", f'relation "{name}" already exists')
@@ -280,7 +292,7 @@ def execute_create_view(
 
 
 def execute_drop_view(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
-    name = stmt.this.name
+    name = planner.qualified_table_name(stmt.this)
     if not catalog.drop_view(db, name) and not stmt.args.get("exists"):
         raise errors.SQLError("42P01", f'view "{name}" does not exist')
     return SQLResult(command_tag="DROP VIEW")

@@ -579,7 +579,7 @@ def _write_target_collection(
         return None
     if table_node is None:
         return None
-    name = table_node.name
+    name = planner.qualified_table_name(table_node)
     table = catalog.get(db, name)
     return table.collection if table is not None else name
 
@@ -841,7 +841,7 @@ def _run_merge(
 
     if not isinstance(stmt.this, exp.Table):
         raise errors.feature_not_supported("MERGE target must be a table")
-    target = _require_table(catalog, db, stmt.this.name, storage)
+    target = _require_table(catalog, db, planner.qualified_table_name(stmt.this), storage)
     target_alias = (stmt.this.alias or stmt.this.name).lower()
     src_alias, source_rows, source_cols = _merge_source(
         stmt.args["using"], db, catalog, session, storage
@@ -1076,7 +1076,7 @@ def _run_delete_using(
 ) -> SQLResult:
     """``DELETE FROM t USING u [, v …] WHERE …`` — delete each target row that
     joins a source row satisfying the WHERE (a semi-join)."""
-    target = _require_table(catalog, db, stmt.this.name, storage)
+    target = _require_table(catalog, db, planner.qualified_table_name(stmt.this), storage)
     target_alias = (stmt.this.alias or stmt.this.name).lower()
     sources = _collect_dml_sources(stmt.args["using"], db, catalog, session, storage)
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
@@ -1106,7 +1106,7 @@ def _run_update_from(
     a source row satisfying the WHERE; the SET right-hand sides may reference the
     source (``SET col = u.col``)."""
     target_node = stmt.this
-    target = _require_table(catalog, db, target_node.name, storage)
+    target = _require_table(catalog, db, planner.qualified_table_name(target_node), storage)
     target_alias = (target_node.alias or target_node.name).lower()
     from_node = stmt.args["from_"]
     sources = _collect_dml_sources([from_node.this], db, catalog, session, storage)
@@ -1388,7 +1388,8 @@ def _describe_statement(
     if vtable is not None:
         table = vtable.table_def()
     else:
-        table = catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
+        _qn = planner.qualified_table_name(table_node)
+        table = catalog.get(db, _qn) or reflect.reflect(storage, db, _qn)
     if table is None:
         return None  # undefined table — let Execute raise the real error
     try:
@@ -1493,10 +1494,10 @@ def copy_plan(
         )
 
     if isinstance(this, exp.Schema):
-        tname = this.this.name
+        tname = planner.qualified_table_name(this.this)
         columns = [c.name for c in this.expressions]
     else:
-        tname = this.name
+        tname = planner.qualified_table_name(this) if isinstance(this, exp.Table) else this.name
         columns = None
     table = catalog.get(db, tname) or reflect.reflect(storage, db, tname)
     if table is None:
@@ -1681,7 +1682,7 @@ def _run_statement(
             return res
         if kind == "INDEX":
             index = stmt.this
-            tname = index.args["table"].name
+            tname = planner.qualified_table_name(index.args["table"])
             table = catalog.get(db, tname) or reflect.reflect(storage, db, tname)
             if table is None:
                 raise errors.undefined_table(tname)
@@ -1719,7 +1720,7 @@ def _run_statement(
         if kind == "FUNCTION":
             return _drop_function(stmt, db, catalog)
         if kind == "SCHEMA":
-            return _drop_schema(stmt, db, catalog)
+            return _drop_schema(stmt, db, catalog, storage)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
 
     if isinstance(stmt, exp.Alter):
@@ -1771,7 +1772,9 @@ def _run_statement(
     if isinstance(stmt, exp.Update):
         if stmt.args.get("from_") is not None:
             return _run_update_from(stmt, storage, db, catalog, session)
-        table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
+        table = _require_table(
+            catalog, db, planner.qualified_table_name(stmt.find(exp.Table)), storage
+        )
         plan = planner.plan_update(stmt, table)
         plan.check_option = check_pred
         return executor.execute_update(plan, storage, db, catalog, session)
@@ -1779,7 +1782,9 @@ def _run_statement(
     if isinstance(stmt, exp.Delete):
         if stmt.args.get("using"):
             return _run_delete_using(stmt, storage, db, catalog, session)
-        table = _require_table(catalog, db, stmt.find(exp.Table).name, storage)
+        table = _require_table(
+            catalog, db, planner.qualified_table_name(stmt.find(exp.Table)), storage
+        )
         return executor.execute_delete(
             planner.plan_delete(stmt, table), storage, db, catalog, session
         )
@@ -2081,7 +2086,8 @@ def _describe_returning(
     table_node = stmt.find(exp.Table)
     if table_node is None:
         return None
-    tdef = catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
+    _qn = planner.qualified_table_name(table_node)
+    tdef = catalog.get(db, _qn) or reflect.reflect(storage, db, _qn)
     if tdef is None:
         return None
     try:
@@ -2188,9 +2194,10 @@ def _run_select(
 
     # A declared table, else a reflected (schema-on-read) view of an existing
     # Mongo collection — the dual-protocol read path.
-    table = catalog.get(db, table_node.name) or reflect.reflect(storage, db, table_node.name)
+    _qn = planner.qualified_table_name(table_node)
+    table = catalog.get(db, _qn) or reflect.reflect(storage, db, _qn)
     if table is None:
-        raise errors.undefined_table(table_node.name)
+        raise errors.undefined_table(_qn)
     # A WHERE with EXISTS or a correlated subquery can't lower to a pushdown
     # filter — evaluate it per row (the inner query reads through the same
     # storage view, with outer-row references resolved by the scalar evaluator).
@@ -2248,7 +2255,13 @@ def _run_insert(
     its result rows positionally onto the target columns. ``check_option`` is an
     auto-updatable view's WITH CHECK OPTION predicate, enforced per inserted row."""
     target = stmt.this
-    name = target.this.name if isinstance(target, exp.Schema) else target.name
+    name = (
+        planner.qualified_table_name(target.this)
+        if isinstance(target, exp.Schema)
+        else planner.qualified_table_name(target)
+        if isinstance(target, exp.Table)
+        else target.name
+    )
     table = _require_table(catalog, db, name, storage)
     source = stmt.expression
     if isinstance(source, (exp.Select, exp.SetOperation)):
@@ -2963,7 +2976,7 @@ def _seq_has_cycle(props: Any) -> bool:
 def _create_sequence(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
     """``CREATE SEQUENCE [IF NOT EXISTS] name [START WITH n] [INCREMENT BY n]
     [MINVALUE n] [MAXVALUE n] [CYCLE]``."""
-    name = stmt.this.name
+    name = planner.qualified_table_name(stmt.this)
     if catalog.sequence_exists(db, name):
         if stmt.args.get("exists"):
             return SQLResult(command_tag="CREATE SEQUENCE")
@@ -2986,7 +2999,7 @@ def _create_sequence(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
 
 
 def _drop_sequence(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
-    name = stmt.this.name
+    name = planner.qualified_table_name(stmt.this)
     if not catalog.drop_sequence(db, name) and not stmt.args.get("exists"):
         raise errors.SQLError("42P01", f'sequence "{name}" does not exist')
     return SQLResult(command_tag="DROP SEQUENCE")
@@ -3007,7 +3020,7 @@ def _create_schema(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
     return SQLResult(command_tag="CREATE SCHEMA")
 
 
-def _drop_schema(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
+def _drop_schema(stmt: exp.Drop, db: str, catalog: Catalog, storage: Any = None) -> SQLResult:
     """``DROP SCHEMA [IF EXISTS] name [CASCADE]`` — CASCADE drops the schema's
     types; without it, a non-empty schema is a 2BP01 dependency error."""
     name = stmt.this.args["db"].name
@@ -3019,7 +3032,8 @@ def _drop_schema(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     enums = [n for n in catalog.list_enums(db) if n.startswith(prefix)]
     composites = [n for n in catalog.list_composites(db) if n.startswith(prefix)]
     domains = [n for n in catalog.list_domains(db) if n.startswith(prefix)]
-    if (enums or composites or domains) and not stmt.args.get("cascade"):
+    tables = [n for n in catalog.list_tables(db) if n.startswith(prefix)]
+    if (enums or composites or domains or tables) and not stmt.args.get("cascade"):
         raise errors.SQLError(
             "2BP01", f'cannot drop schema "{name}" because other objects depend on it'
         )
@@ -3029,6 +3043,10 @@ def _drop_schema(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
         catalog.drop_composite(db, n)
     for n in domains:
         catalog.drop_domain(db, n)
+    for n in tables:
+        executor.execute_drop_table(
+            planner.DropTablePlan(name=n, if_exists=True), catalog, storage, db
+        )
     catalog.drop_schema(db, name)
     return SQLResult(command_tag="DROP SCHEMA")
 
@@ -3152,7 +3170,9 @@ def _comment_constraint_command(stmt: exp.Command, db: str, catalog: Catalog) ->
     m = planner.COMMENT_CONSTRAINT_RE.match(raw)
     assert m is not None  # gated by the dispatcher's parse
     cname = m.group("name").strip('"')
-    tname = m.group("table").split(".")[-1].strip('"')
+    parts = [seg.strip('"') for seg in m.group("table").split(".")]
+    # Same key scheme as everywhere: public stays bare, other schemas dotted.
+    tname = parts[-1] if len(parts) == 1 or parts[0] == "public" else ".".join(parts)
     value = m.group("value")
     text = None if value.upper() == "NULL" else value[1:-1].replace("''", "'")
     table = catalog.get(db, tname)
@@ -3651,7 +3671,8 @@ def _alter_sequence_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQL
     m = _ALTER_SEQUENCE_RE.match(_command_text(stmt))
     if m is None:
         raise errors.feature_not_supported(f"unsupported ALTER SEQUENCE: {stmt.sql()}")
-    name = m.group(1).strip('"')
+    parts = [seg.strip().strip('"') for seg in m.group(1).split(".")]
+    name = parts[-1] if len(parts) == 1 or parts[0] == "public" else ".".join(parts)
     if not catalog.sequence_exists(db, name):
         if "IF EXISTS" in _command_text(stmt).upper():
             return SQLResult(command_tag="ALTER SEQUENCE")
@@ -3731,11 +3752,15 @@ def _expand_views(
     cte_names = {cte.alias for w in stmt.find_all(exp.With) for cte in w.expressions}
     for holder in list(stmt.find_all(exp.From, exp.Join)):
         src = holder.this
-        if not isinstance(src, exp.Table) or src.args.get("db"):
+        if not isinstance(src, exp.Table):
             continue
-        if src.name in cte_names:
+        _schema = src.args.get("db")
+        _sname = _schema.name if _schema is not None else None
+        if _sname in ("pg_catalog", "information_schema"):
+            continue  # system catalogs are virtual tables, never stored views
+        if _sname is None and src.name in cte_names:
             continue
-        vdef = catalog.get_view(db, src.name)
+        vdef = catalog.get_view(db, planner.qualified_table_name(src))
         if vdef is None:
             continue
         inner = sqlglot.parse_one(vdef, read="postgres")

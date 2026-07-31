@@ -289,8 +289,8 @@ def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> l
             # Real PG homes a temp table in its session's pg_temp_N schema
             # with type LOCAL TEMPORARY, so schema-filtered reflection
             # (table_schema = 'public') never lists it.
-            "table_schema": "pg_temp_1" if t.temp else "public",
-            "table_name": t.name,
+            "table_schema": "pg_temp_1" if t.temp else _table_schema_name(t.name),
+            "table_name": _bare_table_name(t.name),
             "table_type": "LOCAL TEMPORARY" if t.temp else "BASE TABLE",
         }
         for t in _user_tables(db, catalog)
@@ -300,8 +300,8 @@ def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> l
     rows.extend(
         {
             "table_catalog": db,
-            "table_schema": "public",
-            "table_name": name,
+            "table_schema": _table_schema_name(name),
+            "table_name": _bare_table_name(name),
             "table_type": "VIEW",
         }
         for name in _view_names(db, catalog)
@@ -462,7 +462,14 @@ def _fk_condef(fk: ForeignKey, ref_cols: list[str]) -> str:
     inspector regex-parses exactly this string to reflect the constraint."""
     cols = ", ".join(_quote_ident(c) for c in fk.columns)
     rcols = ", ".join(_quote_ident(c) for c in ref_cols)
-    text = f"FOREIGN KEY ({cols}) REFERENCES {_quote_ident(fk.ref_table)}({rcols})"
+    # A cross-schema target is stored dotted; render schema and relation as
+    # separately-quoted identifiers so the inspector's regex parses them.
+    if "." in fk.ref_table:
+        rschema, rname = fk.ref_table.split(".", 1)
+        ref_sql = f"{_quote_ident(rschema)}.{_quote_ident(rname)}"
+    else:
+        ref_sql = _quote_ident(fk.ref_table)
+    text = f"FOREIGN KEY ({cols}) REFERENCES {ref_sql}({rcols})"
     if fk.on_update:
         text += f" ON UPDATE {fk.on_update}"
     if fk.on_delete:
@@ -803,8 +810,8 @@ def _info_sequences(db: str, session: Session, storage: Any, catalog: Catalog) -
         rows.append(
             {
                 "sequence_catalog": db,
-                "sequence_schema": "public",
-                "sequence_name": name,
+                "sequence_schema": _table_schema_name(name),
+                "sequence_name": _bare_table_name(name),
                 "data_type": "bigint",
                 "numeric_precision": 64,
                 "numeric_scale": 0,
@@ -829,8 +836,30 @@ def _schema_oids(db: str, catalog: Catalog) -> dict[str, int]:
 
 def _pg_namespace(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     rows = [{"oid": oid, "nspname": name} for name, oid in _NS_OIDS.items()]
+    rows.append({"oid": _PG_TEMP_NS_OID, "nspname": "pg_temp_1"})
     rows.extend({"oid": oid, "nspname": name} for name, oid in _schema_oids(db, catalog).items())
     return rows
+
+
+_PG_TEMP_NS_OID = 99  # pg_temp_1's namespace oid (real PG mints one per backend)
+
+
+def _bare_table_name(name: str) -> str:
+    """The relation name without its schema prefix — tables in a user schema
+    are stored dotted (``testschema.users``), like user types."""
+    return name.split(".", 1)[1] if "." in name else name
+
+
+def _table_schema_name(name: str) -> str:
+    return name.split(".", 1)[0] if "." in name else "public"
+
+
+def _table_ns_oid(t: Any, schema_oids: dict[str, int]) -> int:
+    if getattr(t, "temp", False):
+        return _PG_TEMP_NS_OID
+    if "." in t.name:
+        return schema_oids.get(t.name.split(".", 1)[0], _NS_OIDS["public"])
+    return _NS_OIDS["public"]
 
 
 def _split_user_type_name(name: str, schema_oids: dict[str, int]) -> tuple[str, int]:
@@ -847,11 +876,12 @@ def _split_user_type_name(name: str, schema_oids: dict[str, int]) -> tuple[str, 
 def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     oids = _table_oids(db, catalog)
     matviews = _matview_names(db, catalog)
+    schema_oids = _schema_oids(db, catalog)
     rows = [
         {
             "oid": oids[t.name],
-            "relname": t.name,
-            "relnamespace": _NS_OIDS["public"],
+            "relname": _bare_table_name(t.name),
+            "relnamespace": _table_ns_oid(t, schema_oids),
             # A materialized view is a real relation with columns, tracked in the
             # catalog like a table — but it reports relkind 'm', not 'r'.
             "relkind": "m" if t.name in matviews else "r",
@@ -883,8 +913,10 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
         rows.append(
             {
                 "oid": oid,
-                "relname": name,
-                "relnamespace": _NS_OIDS["public"],
+                "relname": _bare_table_name(name),
+                "relnamespace": schema_oids.get(_table_schema_name(name), _NS_OIDS["public"])
+                if "." in name
+                else _NS_OIDS["public"],
                 "relkind": "v",
                 "relpersistence": "p",
                 "relam": 0,
@@ -896,8 +928,10 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
         rows.append(
             {
                 "oid": oid,
-                "relname": name,
-                "relnamespace": _NS_OIDS["public"],
+                "relname": _bare_table_name(name),
+                "relnamespace": schema_oids.get(_table_schema_name(name), _NS_OIDS["public"])
+                if "." in name
+                else _NS_OIDS["public"],
                 "relkind": "S",
                 "relpersistence": "p",
                 "relam": 0,

@@ -20,11 +20,10 @@ from sqlalchemy.testing.requirements import SuiteRequirements
 class Requirements(SuiteRequirements):
     @property
     def schemas(self):
-        # CREATE SCHEMA is accepted, but tables are not namespaced per
-        # schema — ``test_schema.users`` collides with ``public.users``
-        # (tasks/backlog.md, schema-qualified tables). Declare it closed
-        # until the catalog keys tables by (schema, name).
-        return exclusions.closed()
+        # Tables are namespaced per schema (stored under dotted catalog keys,
+        # like user types), so ``test_schema.users`` and ``public.users``
+        # coexist and reflect under their own pg_namespace rows.
+        return exclusions.open()
 
     @property
     def views(self):
