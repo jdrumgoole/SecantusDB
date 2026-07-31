@@ -161,11 +161,11 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
                 {
                     "indexrelid": oid,
                     "indrelid": relid,
-                    "relname": f"{t.name}_pkey",
+                    "relname": t.pk_constraint_name(),
                     "indkey": [field_to_attnum.get(c.field, 1) for c in pk_cols],
                     "unique": True,
                     "primary": True,
-                    "conname": f"{t.name}_pkey",
+                    "conname": t.pk_constraint_name(),
                     "table": t.name,
                     "columns": [c.name for c in pk_cols],
                     "partial": False,
@@ -418,7 +418,7 @@ def _pk_constraints(db: str, catalog: Catalog) -> list[tuple[TableDef, str, list
     for t in _user_tables(db, catalog):
         pk_cols = t.pk_columns
         if pk_cols:
-            out.append((t, f"{t.name}_pkey", [c.name for c in pk_cols]))
+            out.append((t, t.pk_constraint_name(), [c.name for c in pk_cols]))
     return out
 
 
@@ -467,7 +467,7 @@ def _foreign_keys(db: str, catalog: Catalog) -> list[dict[str, Any]]:
                     "conkey": [owner_attnum.get(c, 0) for c in fk.columns],
                     "confkey": [ref_attnum.get(c, 0) for c in ref_cols],
                     "ref_cols": ref_cols,
-                    "ref_pk_name": f"{fk.ref_table}_pkey" if ref is not None else None,
+                    "ref_pk_name": ref.pk_constraint_name() if ref is not None else None,
                     "condef": _fk_condef(fk, ref_cols),
                 }
             )

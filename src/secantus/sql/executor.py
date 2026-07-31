@@ -1926,7 +1926,8 @@ def _execute_update_materialized(
             if collides:
                 raise errors.SQLError(
                     "23505",
-                    f'duplicate key value violates unique constraint "{table.name}_pkey"',
+                    "duplicate key value violates unique constraint "
+                    f'"{table.pk_constraint_name()}"',
                 )
             seen.add(new_h)
         # Delete every matched row, then insert the re-keyed rows (a PK swap needs

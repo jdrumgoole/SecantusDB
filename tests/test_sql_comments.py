@@ -111,3 +111,55 @@ def test_sqlalchemy_reflects_comments(storage, session, tmp_path):
     finally:
         srv.stop()
         st.close()
+
+
+class TestConstraintComments:
+    """``COMMENT ON CONSTRAINT c ON t`` — the two-name form sqlglot can't
+    parse; stored on the catalog's check / unique constraint records."""
+
+    def test_check_constraint_comment(self, storage, session):
+        run_sql(
+            storage,
+            DB,
+            "CREATE TABLE ct (id bigint primary key, n int CONSTRAINT n_pos CHECK (n > 0))",
+            session=session,
+        )
+        run_sql(
+            storage, DB, "COMMENT ON CONSTRAINT n_pos ON ct IS 'keep n positive'", session=session
+        )
+        from secantus.sql.catalog import Catalog
+
+        table = Catalog(storage).get(DB, "ct")
+        assert table.check_constraints[0].comment == "keep n positive"
+
+    def test_unique_constraint_comment_and_null_removal(self, storage, session):
+        run_sql(
+            storage,
+            DB,
+            "CREATE TABLE ut (id bigint primary key, n int, CONSTRAINT uq_n UNIQUE (n))",
+            session=session,
+        )
+        run_sql(storage, DB, "COMMENT ON CONSTRAINT uq_n ON ut IS 'one n each'", session=session)
+        run_sql(storage, DB, "COMMENT ON CONSTRAINT uq_n ON ut IS NULL", session=session)
+        from secantus.sql.catalog import Catalog
+
+        table = Catalog(storage).get(DB, "ut")
+        assert table.unique_constraints[0].comment is None
+
+    def test_unknown_constraint_errors(self, storage, session):
+        with pytest.raises(errors.SQLError) as exc:
+            run_sql(storage, DB, "COMMENT ON CONSTRAINT nope ON t IS 'x'", session=session)
+        assert exc.value.sqlstate == "42704"
+
+    def test_escaped_quote_in_comment(self, storage, session):
+        run_sql(
+            storage,
+            DB,
+            "CREATE TABLE qt (id bigint primary key, n int CONSTRAINT n_pos CHECK (n > 0))",
+            session=session,
+        )
+        run_sql(storage, DB, "COMMENT ON CONSTRAINT n_pos ON qt IS 'it''s fine'", session=session)
+        from secantus.sql.catalog import Catalog
+
+        table = Catalog(storage).get(DB, "qt")
+        assert table.check_constraints[0].comment == "it's fine"

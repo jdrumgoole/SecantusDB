@@ -1513,21 +1513,39 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
     columns: list[Column] = []
     seq_plans: list[dict[str, Any]] = []
     pk_seen = False
+    pk_table_names: list[str] = []
+    pk_name: str | None = None
     for coldef in schema.expressions:
         if isinstance(coldef, exp.PrimaryKey):
             # Table-level PRIMARY KEY (col, ...) — mark the named column(s). A
             # composite PK maps to a subdocument ``_id`` (field ``_id.<name>`` per
-            # column); a single PK maps directly to ``_id``.
-            names = [_column_name(c) for c in coldef.expressions]
-            columns = [_with_pk(c, names) for c in columns]
+            # column); a single PK maps directly to ``_id``. Applied post-loop so
+            # a PK clause written before its columns still marks them.
+            pk_table_names = [_column_name(c) for c in coldef.expressions]
             pk_seen = True
             continue
         if isinstance(coldef, exp.ForeignKey):
             # Table-level FOREIGN KEY — collected by _extract_foreign_keys below.
             continue
-        if isinstance(
-            coldef, (exp.Constraint, exp.CheckColumnConstraint, exp.UniqueColumnConstraint)
-        ):
+        if isinstance(coldef, exp.Constraint):
+            # ``CONSTRAINT <name> PRIMARY KEY (col, ...)`` — same as the bare
+            # table-level PK, plus the declared constraint name (which reflection
+            # and COMMENT ON CONSTRAINT surface instead of ``<table>_pkey``).
+            # CHECK / UNIQUE inners are collected by _extract_constraints below.
+            inner_pk = next(
+                (
+                    i
+                    for i in (coldef.args.get("expressions") or [])
+                    if isinstance(i, exp.PrimaryKey)
+                ),
+                None,
+            )
+            if inner_pk is not None:
+                pk_table_names = [_column_name(c) for c in inner_pk.expressions]
+                pk_name = coldef.this.name if coldef.this else None
+                pk_seen = True
+            continue
+        if isinstance(coldef, (exp.CheckColumnConstraint, exp.UniqueColumnConstraint)):
             # Table-level CHECK / UNIQUE — collected by _extract_constraints below.
             continue
         if not isinstance(coldef, exp.ColumnDef):
@@ -1597,6 +1615,8 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 json_plain=(tag == "json" and coldef.args["kind"].this == exp.DataType.Type.JSON),
             )
         )
+    if pk_table_names:
+        columns = [_with_pk(c, pk_table_names) for c in columns]
     if not pk_seen:
         # No PK: the _id is auto-assigned by storage and not surfaced as a
         # column. Fine for the spike.
@@ -1613,6 +1633,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         check_constraints=checks,
         unique_constraints=uniques,
         temp=is_temp,
+        pk_name=pk_name,
     )
     return CreateTablePlan(
         table=table, if_not_exists=bool(stmt.args.get("exists")), sequences=seq_plans
@@ -2094,7 +2115,7 @@ def _fields_for_constraint(name: str, table: TableDef) -> list[str]:
     for uq in table.unique_constraints:
         if uq.name == name:
             return [table.field_for(col) for col in uq.columns]
-    if table.pk_columns and name == f"{table.name}_pkey":
+    if table.pk_columns and name in (table.pk_constraint_name(), f"{table.name}_pkey"):
         return [c.field for c in table.pk_columns]
     raise errors.SQLError("42704", f'constraint "{name}" for table "{table.name}" does not exist')
 
@@ -9670,6 +9691,15 @@ _SET_TRANSACTION_RE = re.compile(
 # A LISTEN / NOTIFY / UNLISTEN statement head (single statement only).
 _PUBSUB_HEAD_RE = re.compile(r"^\s*(?:LISTEN|UNLISTEN|NOTIFY)\b[^;]*;?\s*$", re.IGNORECASE)
 
+# ``COMMENT ON CONSTRAINT c ON t IS '…'`` — sqlglot's Comment node can't
+# express the two-name form; carry the raw text as a Command the engine's
+# constraint-comment handler parses with this same regex.
+COMMENT_CONSTRAINT_RE = re.compile(
+    r"(?is)^\s*COMMENT\s+ON\s+CONSTRAINT\s+(?P<name>\"[^\"]+\"|[\w$]+)\s+ON\s+"
+    r"(?P<table>(?:\"[^\"]+\"|[\w$]+)(?:\.(?:\"[^\"]+\"|[\w$]+))?)\s+IS\s+"
+    r"(?P<value>'(?:[^']|'')*'|NULL)\s*;?\s*$"
+)
+
 # ``DO $tag$ body $tag$ [LANGUAGE plpgsql]`` — the dollar-quoted body.
 _DO_BLOCK_RE = re.compile(
     r"(?is)^\s*DO\s+(?:LANGUAGE\s+\w+\s+)?\$(?P<tag>[A-Za-z_]*)\$(?P<body>.*?)\$(?P=tag)\$"
@@ -9848,6 +9878,8 @@ def parse(sql: str) -> list[exp.Expression]:
     # them pre-parse; this covers the extended-protocol Parse path.)
     if _PUBSUB_HEAD_RE.match(sql):
         return [exp.Command(this="PUBSUB", expression=exp.Literal.string(sql))]
+    if COMMENT_CONSTRAINT_RE.match(sql):
+        return [exp.Command(this="COMMENT_CONSTRAINT", expression=exp.Literal.string(sql))]
     # ``DO $$ … $$ [language plpgsql]`` — the body is handled by the engine's
     # minimal plpgsql interpreter (RAISE notices/exceptions).
     do_m = _DO_BLOCK_RE.match(sql)

@@ -1,11 +1,19 @@
 # SQL server external conformance gauges plan
 
-**Status: proposed.** This document plans the SQL/Postgres analogue of the
-thirteen MongoDB driver gauges: comprehensive **external, unmodified** test
-suites run against the `SecantusPGServer` over a real `postgresql://…`
-connection, reported as pass/fail/skip counts the way `invoke validate` does
-for pymongo. It expands `tasks/sql-postgres-plan.md` §8's one-line
-`validate-postgres` sketch into a concrete gauge portfolio.
+**Status: first two gauges landed; portfolio open.** G1 (sqllogictest —
+`invoke validate-slt`, 26/30 files, 4 declared divergences,
+`docs/validation-report-slt.md`) and G2 (psycopg's unmodified suite —
+`invoke validate-psycopg`, 91.3% at last full run, weekly in `validate.yml`,
+`docs/validation-report-psycopg.md`) are committed tooling; the §6 results log
+below records how they got there. Slice zero (§2) shipped along the way.
+G6 (SQLAlchemy's dialect-compliance suite — `invoke validate-sqlalchemy`,
+572/738 run tests passing at baseline, weekly in CI) landed 2026-07-31.
+Outstanding: the G1 `postgres-extended` second lane and gauges G3–G5 / G7
+(per-item status in §5). This document plans the SQL/Postgres
+analogue of the thirteen MongoDB driver gauges: comprehensive **external,
+unmodified** test suites run against the `SecantusPGServer` over a real
+`postgresql://…` connection, reported as pass/fail/skip counts the way
+`invoke validate` does for pymongo.
 
 Research basis: a July 2026 survey of the Postgres-compatibility ecosystem —
 every candidate below was verified against its live repo (targeting mechanics,
@@ -245,24 +253,45 @@ suites refuse to run *anything*:
 
 ## 5. Rollout order
 
-1. **Slice zero** (§2): catalog bootstrap queries, `server_version` tuning,
-   SQLSTATE audit (`0A000` for unimplemented), `psql -E` checklist. Without
-   this, Npgsql/asyncpg/Postgrex won't run at all.
-2. **G1 sqllogictest** — vendor the corpus submodule, `cargo install
-   sqllogictest-bin` in the gauge env, `invoke validate-slt` with both
-   `postgres` and `postgres-extended` lanes, `-j 1`. Report per-file and
-   aggregate pass-%. Start with a curated include-list of files; grow.
-3. **G2 psycopg 3** — vendor `psycopg/psycopg` submodule, `invoke
-   validate-psycopg` with `PSYCOPG_TEST_DSN`, include/deselect lists +
-   `expected_failures` catalog, same shape as the pymongo gauge.
-4. **G3 pgtest wire corpus** — vendor cockroach's `pgtest` runner + testdata
-   (sparse checkout or a small extraction repo given monorepo size — decide
-   at implementation; license note in vendor README), `invoke validate-pgwire`.
-5. **G4 pgx**, then **G5 Npgsql or pgjdbc** (pick by which catalog gaps §2
-   surfaces first).
-6. **G7 SQLsmith + pgbench** as always-on stress/smoke (`invoke sql-stress`),
-   any time after slice zero.
-7. **G6 SQLAlchemy compliance suite** once SAVEPOINT/transactional-DDL land.
+1. **Slice zero** (§2): ✅ shipped incrementally through the G2 rounds (§6) —
+   type-OID fidelity, `pg_typeof`, TypeInfo catalog flows, enum/composite/range
+   OID minting, `0A000` for unimplemented features.
+2. **G1 sqllogictest** — ✅ landed (#417): corpus vendored at
+   `vendor/sqllogictest`, `invoke validate-slt` (preprocess → fresh daemon per
+   file → per-file report), curated 30-file include list in
+   `slt_validation/include_paths.py` with 4 declared divergences.
+   Weekly CI landed 2026-07-31 (`validate.yml` installs a pinned
+   `sqllogictest-bin 0.29.1` via cargo, cached by version). **Still open**:
+   the `postgres-extended` second lane and growing toward the 622-file
+   corpus.
+3. **G2 psycopg 3** — ✅ landed: `vendor/psycopg` submodule pinned to the
+   installed 3.3.4, `invoke validate-psycopg` via `PSYCOPG_TEST_DSN`,
+   include/deselect in `psycopg_validation/`, weekly in `validate.yml`.
+   Headline trajectory: 42% → 91.3% (§6).
+4. **G3 pgtest wire corpus** — ❌ not started. Vendor cockroach's `pgtest`
+   runner + testdata (sparse checkout or a small extraction repo given
+   monorepo size — decide at implementation; license note in vendor README),
+   `invoke validate-pgwire`.
+5. **G4 pgx**, then **G5 Npgsql or pgjdbc** — ❌ not started (pick by which
+   catalog gaps §2 surfaces first).
+6. **G7 SQLsmith + pgbench** as always-on stress/smoke (`invoke sql-stress`) —
+   ❌ not started; both need binaries not in the dev env (SQLsmith build,
+   pgbench from a Postgres install).
+7. **G6 SQLAlchemy compliance suite** — ✅ landed (2026-07-31): `invoke
+   validate-sqlalchemy` runs `sqlalchemy.testing.suite` (nothing vendored — it
+   ships inside the sqlalchemy package) over `postgresql+psycopg` against a
+   daemon server, with capability declarations in
+   `sqlalchemy_validation/requirements.py` (`schemas` closed — tables aren't
+   namespaced per schema; see backlog). Baseline: **572 passed / 166 failed /
+   677 skipped (77.5%)**, weekly in `validate.yml`,
+   `docs/validation-report-sqlalchemy.md`. Standing it up forced three server
+   fixes: `CREATE/DROP EXTENSION` (citext / hstore / plpgsql accepted, others
+   0A000), `COMMENT ON CONSTRAINT` (check / unique / FK / PK), and a real
+   correctness bug — a table-level ``CONSTRAINT <name> PRIMARY KEY`` was
+   silently dropped (no `_id` mapping, no uniqueness); the declared PK name is
+   now honored end-to-end (enforcement, reflection, duplicate-key messages).
+   Top remaining clusters: ComponentReflectionTest (62), BizarroCharacterTest
+   identifier quoting (30), LikeFunctionsTest (12).
 
 Mechanics mirror the existing gauges throughout: daemon `SecantusPGServer`
 subprocess on an ephemeral port (ad-hoc reproducers on `127.0.0.1:55432` per

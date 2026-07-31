@@ -893,6 +893,33 @@ def validate_psycopg(c: Context) -> None:
     print("\nWrote docs/validation-report-psycopg.md")
 
 
+@task(name="validate-sqlalchemy")
+def validate_sqlalchemy(c: Context) -> None:
+    """Run SQLAlchemy's dialect-compliance suite against a SecantusPGServer daemon.
+
+    The SQL-server ORM gauge (tasks/sql-gauges-plan.md G6): SQLAlchemy's own
+    third-party-dialect compliance suite (sqlalchemy.testing.suite — nothing
+    vendored, it ships in the sqlalchemy package) over the stock
+    postgresql+psycopg dialect, with SecantusDB's capability declarations in
+    sqlalchemy_validation/requirements.py. Generates
+    docs/validation-report-sqlalchemy.md. Python server only — the Rust
+    server has no SQL front end.
+    """
+    _run_gauge(
+        c,
+        module="sqlalchemy_validation.runner",
+        raw=".validation/sqlalchemy-raw.json",
+        report="docs/validation-report-sqlalchemy.md",
+        hint="A PG-server startup failure is the usual cause (nothing is vendored).",
+    )
+    c.run(
+        "uv run --no-sync python -m sqlalchemy_validation.generate_report "
+        ".validation/sqlalchemy-raw.json docs/validation-report-sqlalchemy.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-sqlalchemy.md")
+
+
 @task(name="validate-slt")
 def validate_slt(c: Context) -> None:
     """Run the sqllogictest corpus against a SecantusPGServer daemon.
