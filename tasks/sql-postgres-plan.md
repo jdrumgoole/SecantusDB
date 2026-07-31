@@ -1,6 +1,14 @@
 # SQL / PostgreSQL interface plan
 
-**Status: proposed.** This document plans a *third protocol persona* for
+**Status: shipped and evolving.** The server this document planned has landed:
+`SecantusPGServer` (`src/secantus/sql/`) speaks the Postgres v3 wire protocol
+to psycopg / pg8000 with a deep SQL surface, backed by ~150 `test_sql_*` /
+`test_pgserver_*` suites. Remaining gaps are tracked in `tasks/backlog.md`
+("SQL / PostgreSQL interface" section); the external conformance gauges are
+still at the proposal stage in `tasks/sql-gauges-plan.md`. The design rationale
+below is kept as written.
+
+This document planned a *third protocol persona* for
 SecantusDB: a PostgreSQL-wire-compatible SQL front end that lets `psql`,
 `psycopg` / `psycopg2`, the Postgres JDBC driver, and BI / ORM tooling connect
 and run SQL against the **same WiredTiger-backed `Storage`** the MongoDB server
