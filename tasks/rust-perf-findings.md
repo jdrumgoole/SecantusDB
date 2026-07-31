@@ -951,3 +951,39 @@ Conclusions:
 Net journey this session (sync durable, 8 writers): 41.5k (pre-#700) → 74.8k
 (#700) → 102.8k (config winners, fully durable) — 2.5× — with the ceiling at
 190k and mongod's replset-w:1 at ~301k on the same box.
+
+## Finding 14 — Phase A′ landed: replay-on-open is correct, but durability ANCHORING is the real cost of the mongod split (2026-07-31)
+
+Phase A′ (log-only-the-oplog + replay-on-open recovery) shipped as opt-in:
+stable-checkpoint marker in the always-logged oplog-meta table, a periodic
+checkpoint thread (60s default, `SECANTUS_CHECKPOINT_SECONDS`), an
+on-demand anchor when the prune clamp blocks a genuine cap excess, and
+idempotent oplog replay at open — proven by a hard-kill harness (SIGKILL
+mid-load; every `sync_on_commit` acknowledged write recovered, including
+full replay from genesis with no checkpoint ever taken).
+
+The measured surprise: **Finding 13's arm-D numbers (+11% @8w) were the
+UNANCHORED mode.** With anchoring live at any practical cadence, a
+sustained 8-writer cap-pressure load pays the periodic checkpoint of a
+hot, fully-dirty unlogged working set:
+
+| anchored cadence (8w, 15s, cap-pressure) | docs/s |
+|---|---:|
+| never (probe shape; unbounded oplog) | 122.4k |
+| 2s | 57.1k |
+| 10s | 45.7k |
+| 60s + demand-anchor (shipped default) | ~38–46k |
+| logged default (no A′), same build | ~92k |
+
+Single-writer: ~+5% (36.8k vs 34.9k). Decomposition: between anchors the
+unlogged tables accumulate the ENTIRE working set as dirty pages (nothing
+was WAL-reconciled), so each checkpoint writes it wholesale while writers
+stall; the prune clamp additionally holds every post-stable oplog entry,
+so cap-pressure loads bloat until an anchor lands (the demand-anchor
+bounds this but forces the expensive checkpoint sooner). mongod amortises
+the same cost with incremental checkpointing + eviction tuned for exactly
+this shape. **Decision: the default flip (A′-2) is parked** — the mode is
+correct, recoverable, and opt-in for read-heavy / single-writer / bounded
+workloads; taming the anchored-checkpoint cost (incremental checkpoints,
+eviction_dirty_target tuning for unlogged tables) is the priced next
+investigation if the flip is ever to happen.
