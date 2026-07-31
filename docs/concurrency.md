@@ -109,9 +109,12 @@ body[data-theme="dark"] .dviz-wrap {
 | 4 | 10,400 | 80,200 | 100,300 | 366,100 |
 | 8 | 7,600 | 96,400 | 119,200 | 481,000 |
 
-(The async-stack column is the opt-in `SECANTUS_OPLOG_ASYNC=1` +
-`SECANTUS_OPLOG_NONLOGGED=1` configuration, mitigations 5–6 below.
-Scaling in the chart is relative to each series' own single-writer rate.)
+(The async-stack column is the opt-in async-oplog + non-logged-oplog
+configuration, mitigations 5–6 below — first-class options since Phase C:
+`RustServer(oplog_async=True, oplog_nonlogged=True)`, or `secantusd-rs
+--oplog-async --oplog-nonlogged`, or the `SECANTUS_OPLOG_ASYNC=1` +
+`SECANTUS_OPLOG_NONLOGGED=1` env vars. Scaling in the chart is relative
+to each series' own single-writer rate.)
 
 Three different shapes:
 
@@ -133,8 +136,8 @@ Three different shapes:
   itself** — cache eviction and checkpoint pressure inside a single
   embedded WT connection — not a SecantusDB lock.
 - **The async stack delivers the highest absolute throughput** (dashed
-  line) — the opt-in `SECANTUS_OPLOG_ASYNC=1` +
-  `SECANTUS_OPLOG_NONLOGGED=1` configuration (mitigations 5–6 below)
+  line) — the opt-in async-oplog + non-logged-oplog configuration
+  (mitigations 5–6 below)
   moves the oplog write off the writers' critical path and out of the
   WAL: 2.4× scaling from a ~1.4× higher single-writer base (50.4k vs
   35.4k docs/s), reaching ~119k docs/s at eight writers — ~1.2× the
@@ -212,14 +215,14 @@ concurrency.
   `pymongo`'s `insert_many` with batch=100 hits ~25,000 docs/s on the
   Rust server and ~11,000 on the Python server on commodity hardware
   with full durability.
-- **Many connections doing concurrent writes** scale on the Rust server
-  up to a peak around four writers (~2.6× the single-writer rate), then
-  decline as the WiredTiger ceiling bites; the Python server barely
-  scales (the GIL). The opt-in async + non-logged oplog stack
-  (mitigations 5–6) removes the cliff — monotonic to ~2.4× at eight
-  writers, ~118k docs/s aggregate — if a checkpoint-durable oplog tail is
-  acceptable. Run a real `mongod` if you need fully durable write
-  throughput that keeps climbing past a handful of writers.
+- **Many connections doing concurrent writes** scale monotonically on
+  the Rust server — ~2.7× the single-writer rate at eight writers
+  (~96k docs/s aggregate) with no cliff, fully durable; the Python
+  server barely scales (the GIL). The opt-in async + non-logged oplog
+  stack (mitigations 5–6) buys another ~1.2× (~119k docs/s at eight
+  writers) if a checkpoint-durable oplog tail is acceptable. Run a
+  real `mongod` if you need write throughput that keeps climbing
+  steeply past a handful of writers.
 - **Many connections doing concurrent reads** scales fine. Reads use
   MVCC snapshots and don't contend.
 - **Mixed read/write at moderate N** works as expected: writes
@@ -241,19 +244,25 @@ SecantusDB, the levers are:
 4. **`writeConcern: w:0`** for fire-and-forget writes — pymongo
    doesn't wait for the server's ack. Throughput climbs on the
    client side; server-side cost is unchanged.
-5. **Async oplog (Rust server, opt-in, experimental).** Set
-   `SECANTUS_OPLOG_ASYNC=1` to move oplog writes off the writer's
+5. **Async oplog (Rust server, opt-in).** `RustServer(oplog_async=True)`,
+   `secantusd-rs --oplog-async` (or `[storage] oplog_async = true` in
+   `secantusd.toml`), or `SECANTUS_OPLOG_ASYNC=1` — the option wins over
+   the env var for that store. Moves oplog writes off the writer's
    critical path onto a background drainer — ~1.6× multi-writer write
    throughput while keeping change streams (validated exactly-once
-   under concurrency). Trade: the oplog is no longer atomic with the
+   under concurrency; a fresh change stream opens only after the
+   drainer has caught the acknowledged tail, so it never surfaces
+   pre-open events). Trade: the oplog is no longer atomic with the
    data, so a hard crash loses entries the drainer hadn't yet written
    (the data itself stays fully durable; a clean shutdown flushes the
    drainer). Bounded by `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (default
    128 MB). The drainer coalesces queued batches into one WiredTiger
    transaction (`SECANTUS_OPLOG_ASYNC_COALESCE=0` disables). Default
    off.
-6. **Non-logged oplog tables (Rust server, opt-in).** Set
-   `SECANTUS_OPLOG_NONLOGGED=1` (at first open of a fresh store) to
+6. **Non-logged oplog tables (Rust server, opt-in).**
+   `RustServer(oplog_nonlogged=True)`, `secantusd-rs --oplog-nonlogged`
+   (or the TOML key), or `SECANTUS_OPLOG_NONLOGGED=1` — applied at first
+   open of a fresh store (the table config is create-time-sticky) — to
    create the oplog + pre-image tables with WAL logging disabled: the
    oplog becomes checkpoint-durable only — a hard crash loses the
    oplog tail since the last checkpoint (change-stream resume / PITR
