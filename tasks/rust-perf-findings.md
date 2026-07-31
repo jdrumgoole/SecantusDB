@@ -987,3 +987,59 @@ correct, recoverable, and opt-in for read-heavy / single-writer / bounded
 workloads; taming the anchored-checkpoint cost (incremental checkpoints,
 eviction_dirty_target tuning for unlogged tables) is the priced next
 investigation if the flip is ever to happen.
+
+## Finding 15 — the anchored A′ equilibrium is CAP-DRIVEN, and dirty-eviction tuning makes it worse (2026-07-31)
+
+Swept the named levers against the anchored-checkpoint cost (Finding 14) via
+the existing hooks (`SECANTUS_DATA_NONLOGGED=1`, live anchoring, 8 writers,
+30 s, 2 reps):
+
+| arm | 8w docs/s |
+|---|---:|
+| control (10s cadence) | ~49.9k |
+| `eviction_dirty_target=2,trigger=5` | ~30.2k (−40%) |
+| `eviction_dirty_target=1,trigger=3` | ~5.9k (−88%) |
+| dirty 2/5 + 8 eviction threads | ~32.9k |
+| dirty 2/5, 30s cadence | ~32.0k |
+| cadence 3600 (demand-anchor only) | ~50.7k |
+
+Two conclusions:
+
+1. **Aggressive dirty writeback is a dead end** — an append-hot unlogged
+   working set gets written repeatedly as pages refill: pure write
+   amplification, catastrophically so at target 1%.
+2. **Every sustained arm converges at ~50k because the demand-anchor makes
+   the equilibrium OPLOG-CAP-DRIVEN, not cadence-driven**: at cap pressure
+   (100k entries ÷ ~50k docs/s) the cap-blocked prune demands an anchor
+   every ~2 s regardless of the configured cadence. (Finding 14's 122k
+   "unanchored" figure predates the demand-anchor; with it, the unbounded
+   arm no longer exists — correctly.) The one cheap untested lever, for
+   whenever the flip is revisited: a larger `oplog_max_entries` in this
+   mode proportionally reduces anchor frequency (cap 1M ≈ one anchor per
+   ~20 s at this rate). The default flip stays parked.
+
+## Finding 16 — Phase B experiment 1: the per-collection-recno layout hypothesis is FALSIFIED (2026-07-31)
+
+`bench/wt_poc/wt_layout_bench.c` A/Bs the engine's table layout against
+mongod's at the raw-WT level (pure C + pthreads, ~1 KiB rows, ascending
+keys, compression off in all arms to isolate layout; 60k rows/thread,
+2 reps, means):
+
+| layout | 1t | 4t | 8t |
+|---|---:|---:|---:|
+| `q` — per-thread table, bare int64 key (mongod shape) | 532k | 879k | 824k |
+| `ssq` — per-thread table, (db, coll, id) composite key | 494k | 858k | 834k |
+| `ssq-shared` — 2 threads/table, composite key (shard collision) | 503k | 897k | **1017k** |
+
+The (S,S,q) key shape costs **~7% at one thread and ~nothing at 4–8**, and
+btree sharing is not a penalty at this scale — the shared arm WINS at 8
+threads (fewer trees → better cache/eviction locality). Against the
+plan's ≥1.5× decision gate this is a falsification by an order of margin:
+**the per-collection-recno storage-format epoch is not justified and is
+closed.** The residual ~1.9× single-writer gap to mongod lives above raw
+WiredTiger — per-operation work in dispatch/BSON/session-txn handling and
+mongod's ingest pipeline — exactly the "Lever B: do NOT pursue for the
+reward / Lever C: research-scale" territory the forward plan already
+priced. With Phase 0/A/A′ shipped and B's gate concluded NO-GO, the
+concurrency-parity plan's experimental program is **complete**: every
+phase has either shipped or been closed with data.
