@@ -470,6 +470,8 @@ def execute_create_index(
         options["unique"] = True
     if plan.partial_filter:
         options["partialFilterExpression"] = plan.partial_filter
+    if plan.include:
+        options["include"] = list(plan.include)
     storage.create_index(db, plan.collection, plan.name, plan.key_spec, options or None)
     return SQLResult(command_tag="CREATE INDEX")
 
@@ -1344,6 +1346,19 @@ def _run_subplan_to_docs(
 ) -> list[dict[str, Any]]:
     from secantus.aggregate import PipelineContext, apply_pipeline
 
+    if isinstance(plan, (planner.exp.Expression, planner.RawDerived)):
+        # A raw statement sub-plan (a set-operation or VALUES derived table) —
+        # run it through the engine and shape the result rows into docs,
+        # renaming positionally when the alias declared column names.
+        from secantus.sql import engine
+
+        stmt = plan.stmt if isinstance(plan, planner.RawDerived) else plan
+        rename = plan.names if isinstance(plan, planner.RawDerived) else None
+        res = engine._run_query(
+            stmt, storage, db, getattr(sctx, "catalog", None), getattr(sctx, "session", None)
+        )
+        names = rename or [c.name for c in res.columns]
+        return [dict(zip(names, row, strict=True)) for row in res.rows]
     _materialize_derived(plan, storage, db, sctx)
     if isinstance(plan, planner.PipelineSelectPlan):
         docs, remaining = _pipeline_input_docs(plan, storage, db, sctx)

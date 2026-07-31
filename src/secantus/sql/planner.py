@@ -85,6 +85,10 @@ class CreateIndexPlan:
     # ``ExprIndex`` metadata to register on the table (its hidden ``field`` is the
     # key indexed by ``key_spec``) and the raw expression SQL to backfill/maintain.
     expr_index: Any = None  # catalog.ExprIndex | None
+    # ``CREATE INDEX … INCLUDE (cols)`` — covering columns, stored as metadata
+    # only (a surrogate needs no physical INCLUDE payload) and reflected via
+    # pg_index's indnkeyatts/indkey split.
+    include: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1962,6 +1966,7 @@ def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:
     partial_filter = (
         _expr_to_filter(where.this, table_resolver(table), None) if where is not None else None
     )
+    include = [_column_name(c) for c in (params.args.get("include") or [])]
     return CreateIndexPlan(
         collection=table.collection,
         name=index_name,
@@ -1969,6 +1974,7 @@ def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:
         unique=bool(stmt.args.get("unique")),
         if_not_exists=bool(stmt.args.get("exists")),
         partial_filter=partial_filter,
+        include=include,
     )
 
 
@@ -1994,6 +2000,24 @@ def _is_default_cell(cell: exp.Expression) -> bool:
     """A ``DEFAULT`` keyword in a VALUES tuple (sqlglot parses it as
     ``Var('DEFAULT')``)."""
     return isinstance(cell, exp.Var) and cell.name.upper() == "DEFAULT"
+
+
+def _insert_cell_value(cell: exp.Expression, subctx: Any = None) -> Any:
+    """A VALUES cell: a plain literal, else any constant expression PG allows
+    there (``nextval('seq')``, arithmetic, casts …) evaluated by the scalar
+    engine — with the real storage in scope when the dispatcher provides it."""
+    try:
+        return _literal(cell)
+    except errors.SQLError:
+        from secantus.sql import scalar
+
+        ctx = scalar.ScalarContext(
+            storage=getattr(subctx, "storage", None),
+            catalog=getattr(subctx, "catalog", None),
+            db=getattr(subctx, "db", None) or "",
+            session=getattr(subctx, "session", None),
+        )
+        return scalar.evaluate(cell, _const_scope, ctx)
 
 
 def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) -> dict[str, Any]:
@@ -2127,7 +2151,7 @@ def copy_row_doc(col_names: list[str], values: list[Any], table: TableDef) -> di
     return _insert_doc(col_names, values, table)
 
 
-def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
+def plan_insert(stmt: exp.Insert, table: TableDef, subctx: Any = None) -> InsertPlan:
     col_names = insert_target_columns(stmt, table)
     values = stmt.expression
     if values is None and stmt.args.get("default"):
@@ -2152,7 +2176,7 @@ def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
             if _is_default_cell(cell):
                 continue
             row_cols.append(name)
-            row_vals.append(_literal(cell))
+            row_vals.append(_insert_cell_value(cell, subctx))
         docs.append(_insert_doc(row_cols, row_vals, table))
     return InsertPlan(
         table=table,
@@ -3591,6 +3615,16 @@ def infer_parameter_types(
 
 
 @dataclass
+class RawDerived:
+    """A derived-table sub-plan carried as a raw statement (a set operation or
+    a ``VALUES`` list in FROM) — the executor runs it through the engine and
+    optionally renames the output columns positionally (``AS alias(c1, c2)``)."""
+
+    stmt: Any
+    names: list[str] | None = None
+
+
+@dataclass
 class DerivedTable:
     """A ``(SELECT ...) AS alias`` join source, materialized before the main
     pipeline runs. ``name`` is the ephemeral collection the executor registers
@@ -4250,7 +4284,7 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     # A ``(SELECT ...) AS alias`` derived table in FROM — e.g. an expanded view —
     # is materialized by the pipeline path's ``_resolve_source``.
     from_node = next((v for v in stmt.args.values() if isinstance(v, exp.From)), None)
-    if from_node is not None and isinstance(from_node.this, exp.Subquery):
+    if from_node is not None and isinstance(from_node.this, (exp.Subquery, exp.Values)):
         return True
     # A SELECT list / ORDER BY with set-returning or scalar functions, CASE, or
     # subqueries needs per-row evaluation (the pipeline path), not a plain find.
@@ -6734,6 +6768,22 @@ def _lateral_stage(
     return alias, tdef, stages
 
 
+def _fromless_out_columns(stmt: exp.Select) -> list[tuple[str, str]]:
+    """Output (name, tag) shape of a FROM-less SELECT — used for derived tables
+    whose inner query has no row source (``FROM (SELECT 1 AS x) AS a``)."""
+    cols: list[tuple[str, str]] = []
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        name = alias or (target.name if isinstance(target, exp.Column) else "?column?")
+        try:
+            tag = _infer_scalar_tag(target, _const_scope)
+        except errors.SQLError:
+            tag = "text"
+        cols.append((name, tag))
+    return cols
+
+
 def _resolve_source(
     node: exp.Expression, db: str, catalog: Any, storage: Any, derived: list[DerivedTable]
 ) -> tuple[str, TableDef]:
@@ -6745,13 +6795,73 @@ def _resolve_source(
     named by the alias before running the main pipeline)."""
     if isinstance(node, exp.Lateral):
         raise errors.feature_not_supported("LATERAL cannot be the first FROM item")
+    if isinstance(node, exp.Values):
+        # ``FROM (VALUES (…), …) AS alias(c1, c2)`` — a constant derived table.
+        # Column names from the alias list, tags inferred from the first row.
+        alias_node = node.args.get("alias")
+        alias = alias_node.name if alias_node is not None else ""
+        if not alias:
+            raise errors.feature_not_supported("VALUES in FROM requires an alias")
+        first = node.expressions[0].expressions if node.expressions else []
+        acols = [c.name for c in (alias_node.args.get("columns") or [])]
+        if len(acols) < len(first):
+            # PG allows an alias with fewer columns — the rest keep the
+            # default column1..columnN names.
+            acols = acols + [f"column{i + 1}" for i in range(len(acols), len(first))]
+        tags = []
+        for cell in first:
+            try:
+                tags.append(_infer_value_tag(_literal(cell)))
+            except errors.SQLError:
+                tags.append("text")
+        cols = list(zip(acols, tags, strict=False))
+        tdef = TableDef(
+            name=alias,
+            collection=alias,
+            columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+        )
+        derived.append(DerivedTable(name=alias, plan=RawDerived(node, acols), columns=cols))
+        return alias, tdef
     if isinstance(node, exp.Subquery):
         alias = node.alias
         if not alias:
             raise errors.feature_not_supported("a derived table requires an alias")
         sub = node.this
+        if isinstance(sub, exp.SetOperation):
+            # ``FROM (SELECT … UNION SELECT …) AS alias`` — column shape from
+            # planning the first arm; the executor materializes the whole set
+            # operation through the engine (dedup / ALL semantics included).
+            arm: exp.Expression = sub
+            while isinstance(arm, exp.SetOperation):
+                arm = arm.left
+            if isinstance(arm, exp.Subquery):
+                arm = arm.this
+            if not isinstance(arm, exp.Select):
+                raise errors.feature_not_supported(f"unsupported derived table: {node.sql()}")
+            if arm.args.get("from_") is None:
+                cols = _fromless_out_columns(arm)
+            else:
+                cols = plan_pipeline_select(arm, db, catalog, storage).out_columns
+            tdef = TableDef(
+                name=alias,
+                collection=alias,
+                columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+            )
+            derived.append(DerivedTable(name=alias, plan=sub, columns=cols))
+            return alias, tdef
         if not isinstance(sub, exp.Select):
             raise errors.feature_not_supported(f"unsupported derived table: {node.sql()}")
+        if sub.args.get("from_") is None:
+            # ``FROM (SELECT 1 AS x) AS a`` — no row source to pipeline; the
+            # executor runs the constant SELECT through the engine.
+            cols = _fromless_out_columns(sub)
+            tdef = TableDef(
+                name=alias,
+                collection=alias,
+                columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+            )
+            derived.append(DerivedTable(name=alias, plan=RawDerived(sub), columns=cols))
+            return alias, tdef
         sub_plan = plan_pipeline_select(sub, db, catalog, storage)
         cols = sub_plan.out_columns
         tdef = TableDef(
@@ -8876,6 +8986,26 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             _udf = _udf_lookup(node, _sub.catalog, _sub.db)
             if _udf is not None and _udf.get("return_tag"):
                 return _udf["return_tag"]
+    # A scalar subquery types as its single projected column — a plain inner
+    # column reference adopts the inner table's declared tag (PG types scalar
+    # subqueries statically; without this a datetime subquery wires as text).
+    if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Select):
+        inner = node.this
+        exprs = inner.expressions
+        _sub = _pipeline_subctx.get()
+        if len(exprs) == 1 and _sub is not None and getattr(_sub, "catalog", None) is not None:
+            target = exprs[0].this if isinstance(exprs[0], exp.Alias) else exprs[0]
+            tbl_node = inner.find(exp.Table)
+            if isinstance(target, exp.Column) and tbl_node is not None:
+                try:
+                    tdef = _lookup_table_def(
+                        _sub.catalog, _sub.db, tbl_node, getattr(_sub, "storage", None)
+                    )
+                except errors.SQLError:
+                    tdef = None
+                col = tdef.column(target.name) if tdef is not None else None
+                if col is not None:
+                    return col.type_tag
     # Range operators (@> / <@ / &&) over a range operand are boolean; a range
     # constructor / cast is the range type. (Non-range @> / <@ fall through to the
     # jsonb typing below.)

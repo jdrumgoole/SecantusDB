@@ -2368,20 +2368,14 @@ shared storage engine or building large new protocol subsystems:
   `requirements.py` declares `schemas` closed because of exactly this).
   Needs the (db, coll) storage key to carry the schema (or a
   dotted-collection mapping like the types take).
-- [ ] **SQLAlchemy compliance gauge — residual tail** (`invoke
-  validate-sqlalchemy`, now 713 P / 22 F / 680 S = 97.0%,
-  `docs/validation-report-sqlalchemy.md`): the insertmanyvalues sentinel
-  shape — `INSERT … SELECT p0::FLOAT FROM (VALUES …) AS alias(p0, c) ORDER BY
-  c RETURNING …` (4, ReturningTest floats + InsertBehaviorTest
-  insert_from_select_with_defaults + SequenceTest inserts); LIMIT/OFFSET
-  inside union arms + `select_from(plain union)` derived tables with scalar
-  subqueries (5, CompoundSelectTest/Deprecated); FROM-less `SELECT expr WHERE
-  EXISTS (…)` (2, ExistsTest); DateTimeMicrosecondsTest (2 — the documented
-  BSON int64-millis storage divergence, needs a storage-representation
-  change); covering-index INCLUDE reflection (1); DISTINCT ON over the
-  evaluated path (1); scalar-subquery-in-SELECT row fetch (1); server-side
-  cursor over an aliased join (1). Grow `requirements.py` capabilities as
-  they land; per-round history in tasks/sql-gauges-plan.md §5.
+- [ ] **Sub-millisecond timestamp fidelity** (the one declared SQLAlchemy-gauge
+  divergence — `datetime_microseconds` closed in
+  `sqlalchemy_validation/requirements.py`): BSON datetimes are int64
+  milliseconds, so a SQL `timestamp` column round-trips microseconds truncated.
+  A fix needs a storage-representation change for SQL-declared timestamp
+  columns (int64-µs or a sub-ms side channel) weighed against the
+  dual-protocol document view. The gauge otherwise passes 731/731 executed
+  tests (100%).
 - [ ] **HAVING general-shape residual**: the HAVING lowerers now cover
   comparisons, `IS [NOT] NULL` (incl. computed group-key operands),
   `[NOT] IN` over group keys, and always-unknown NULL-operand folds — but any
