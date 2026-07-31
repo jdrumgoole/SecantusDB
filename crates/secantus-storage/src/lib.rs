@@ -81,6 +81,28 @@ impl std::ops::Deref for OpSession<'_> {
     }
 }
 
+/// Explicit per-store configuration for [`Storage::open_with_options`]. Every
+/// field's `None` defers to the matching `SECANTUS_*` env var (the historical
+/// process-wide switch); `Some` overrides it for THIS store only.
+#[derive(Debug, Default, Clone)]
+pub struct StorageOptions {
+    /// Raw WiredTiger connection config (`None` = the engine default).
+    pub wt_config: Option<String>,
+    /// Close-time checkpoint durability (`None` = env/test resolution).
+    pub durable: Option<bool>,
+    /// Async oplog drainer (`SECANTUS_OPLOG_ASYNC`).
+    pub oplog_async: Option<bool>,
+    /// Non-logged oplog/preimage tables (`SECANTUS_OPLOG_NONLOGGED`).
+    pub oplog_nonlogged: Option<bool>,
+    /// Log-only-the-oplog data tables with replay-on-open recovery
+    /// (`SECANTUS_DATA_NONLOGGED`); create-time for fresh stores, and an
+    /// existing store's recorded mode always wins.
+    pub data_nonlogged: Option<bool>,
+    /// Stable-checkpoint cadence in seconds for the data-nonlogged mode
+    /// (`SECANTUS_CHECKPOINT_SECONDS`, default 60).
+    pub checkpoint_seconds: Option<u64>,
+}
+
 /// Opaque handle for a multi-document transaction. Owns a **dedicated** WT
 /// session (NOT the calling thread's per-call session) so the transaction's
 /// statements and its retryable commit can run on different connection threads
@@ -258,7 +280,7 @@ fn unframe_doc_value(value: &[u8]) -> Result<(&[u8], &[u8])> {
 /// table to its per-collection shard (a store written before doc-sharding). A
 /// born-sharded store's legacy table is empty, so this is a quick no-op scan on
 /// open. Runs on the bootstrap session before the connection serves requests.
-fn migrate_legacy_docs(session: &Session) -> Result<()> {
+fn migrate_legacy_docs(session: &Session, data_nonlogged: bool) -> Result<()> {
     let src = session.open_cursor(DOC_TABLE, None)?;
     let mut rows: Vec<(String, String, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut more = src.next()?;
@@ -284,7 +306,7 @@ fn migrate_legacy_docs(session: &Session) -> Result<()> {
         // Lazy shards: the target shard isn't created eagerly at open, so make it
         // before folding a legacy row into it (idempotent per shard).
         if made_shards.insert(shard.clone()) {
-            session.create(&shard, &data_table_cfg(DOC_TABLE_CFG))?;
+            session.create(&shard, &data_table_cfg(DOC_TABLE_CFG, data_nonlogged))?;
         }
         let dst = session.open_cursor(&shard, None)?;
         dst.set_key_ssq(db, coll, recordid);
@@ -481,8 +503,8 @@ fn data_tables_nonlogged() -> bool {
 }
 
 /// Table-create config for a data table, honouring [`data_tables_nonlogged`].
-fn data_table_cfg(base: &str) -> String {
-    if data_tables_nonlogged() {
+fn data_table_cfg(base: &str, nonlogged: bool) -> String {
+    if nonlogged {
         format!("{base},log=(enabled=false)")
     } else {
         base.to_string()
@@ -495,11 +517,11 @@ fn data_table_cfg(base: &str) -> String {
 /// (`stable_seq` + the mode flag) that crash recovery replays from — a marker
 /// that rolled back with the data tables would be useless. It is a single tiny
 /// row per checkpoint; its logging cost is nil.
-fn bootstrap_table_cfg(name: &str, base: &str) -> String {
+fn bootstrap_table_cfg(name: &str, base: &str, data_nonlogged: bool) -> String {
     if name == OPLOG_META_TABLE {
         base.to_string()
     } else {
-        data_table_cfg(base)
+        data_table_cfg(base, data_nonlogged)
     }
 }
 
@@ -509,7 +531,7 @@ fn bootstrap_table_cfg(name: &str, base: &str) -> String {
 /// duplicated key, so an appended clause overrides the default; same trick as
 /// `SECANTUS_WT_CONFIG_EXTRA` on the connection config). Create-time only:
 /// benchmarks start on fresh datadirs, existing stores keep their config.
-fn oplog_table_cfg() -> String {
+fn oplog_table_cfg(nonlogged: bool) -> String {
     // Append-workload btree tuning (Finding-13 winner, +19% at 8 writers):
     // rows arrive in strictly-ascending seq order and are never updated, so
     // fill pages fully before splitting (`split_pct=100`) and use larger
@@ -517,7 +539,7 @@ fn oplog_table_cfg() -> String {
     // the sweep measured compression-off cratering to 19% retention (bigger
     // uncompressed pages = more eviction IO; the constraint is IO volume,
     // not CPU). Create-time only: existing stores keep their config.
-    let mut cfg = if oplog_tables_nonlogged() {
+    let mut cfg = if nonlogged {
         format!("{QU_COMPRESSED_CFG},split_pct=100,leaf_page_max=128KB,log=(enabled=false)")
     } else {
         format!("{QU_COMPRESSED_CFG},split_pct=100,leaf_page_max=128KB")
@@ -573,13 +595,14 @@ fn ensure_oplog_shard(
     shards_created: &AtomicU32,
     session: &Session,
     start_seq: i64,
+    oplog_nonlogged: bool,
 ) -> Result<String> {
     // Same modulus as `oplog_shard_for_batch` (honours SECANTUS_OPLOG_SHARDS).
     let idx = start_seq.rem_euclid(oplog_route_shards());
     let shard = oplog_shard_name(idx);
     let bit = 1u32 << (idx as u32);
     if shards_created.load(Ordering::Relaxed) & bit == 0 {
-        session.create(&shard, &oplog_table_cfg())?;
+        session.create(&shard, &oplog_table_cfg(oplog_nonlogged))?;
         shards_created.fetch_or(bit, Ordering::Relaxed);
     }
     Ok(shard)
@@ -2172,6 +2195,13 @@ pub struct Storage {
     /// clean close flushes the drainer before the checkpoint). `None` = the
     /// synchronous, atomic default.
     async_oplog: Option<Arc<AsyncOplog>>,
+    /// The store's resolved oplog-nonlogged mode: oplog/preimage shard
+    /// CREATEs use `log=(enabled=false)` when set (create-time-sticky, so it
+    /// only shapes shards this store is first to touch).
+    oplog_nonlogged: bool,
+    /// Phase A' checkpoint cadence override (`StorageOptions.checkpoint_seconds`);
+    /// `None` = `SECANTUS_CHECKPOINT_SECONDS` / 60.
+    checkpoint_seconds: Option<u64>,
     /// Phase A': whether THIS store's data tables were created
     /// `log=(enabled=false)` (checkpoint-durable, recovered by oplog replay).
     /// Resolved from the stable marker for existing stores — the table config
@@ -2384,6 +2414,8 @@ struct DrainerShared {
     backpressure: Arc<Backpressure>,
     /// Shared with `Storage.oplog_shards_created` — see [`ensure_oplog_shard`].
     shards_created: Arc<AtomicU32>,
+    /// The store's resolved oplog-nonlogged mode (table create config).
+    oplog_nonlogged: bool,
 }
 
 /// Spawn the background oplog drainer pool and return the handle committed writes
@@ -2394,6 +2426,7 @@ fn spawn_oplog_drainer(
     oplog: Arc<Mutex<OplogState>>,
     oplog_cv: Arc<Condvar>,
     shards_created: Arc<AtomicU32>,
+    oplog_nonlogged: bool,
 ) -> Arc<AsyncOplog> {
     // The cap is overridable via `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (tuning + tests
     // that force backpressure with a tiny cap); a 0/invalid value keeps the default.
@@ -2420,6 +2453,7 @@ fn spawn_oplog_drainer(
         oplog_cv,
         backpressure: backpressure.clone(),
         shards_created,
+        oplog_nonlogged,
     };
     let mut txs = Vec::with_capacity(num_drainers);
     let mut joins = Vec::with_capacity(num_drainers);
@@ -2441,13 +2475,14 @@ fn spawn_oplog_drainer(
 fn write_drain_batch(
     session: &Session,
     shards_created: &AtomicU32,
+    oplog_nonlogged: bool,
     batch: &DrainBatch,
 ) -> Result<()> {
     session.begin_transaction(None)?;
     let res = (|| -> Result<()> {
         // Lazy shards: created on first touch only (bitmask; see
         // `ensure_oplog_shard`).
-        ensure_oplog_shard(shards_created, session, batch.start_seq)?;
+        ensure_oplog_shard(shards_created, session, batch.start_seq, oplog_nonlogged)?;
         let cur = session.open_cursor(&batch.shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         for (i, blob) in batch.blobs.iter().enumerate() {
@@ -2491,7 +2526,12 @@ fn persist_and_record(
     let start = batch.start_seq;
     let n = batch.blobs.len() as i64;
     let bytes = batch.bytes;
-    if let Err(e) = write_drain_batch(session, &shared.shards_created, &batch) {
+    if let Err(e) = write_drain_batch(
+        session,
+        &shared.shards_created,
+        shared.oplog_nonlogged,
+        &batch,
+    ) {
         eprintln!(
             "secantus-storage: async oplog drainer write failed at seq {start}: {e:?} (will retry)"
         );
@@ -2513,6 +2553,7 @@ fn persist_and_record(
 fn write_drain_batches(
     session: &Session,
     shards_created: &AtomicU32,
+    oplog_nonlogged: bool,
     batches: &[DrainBatch],
 ) -> Result<()> {
     session.begin_transaction(None)?;
@@ -2524,7 +2565,7 @@ fn write_drain_batches(
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
                     // Lazy shards: created on first touch only (bitmask).
-                    ensure_oplog_shard(shards_created, session, batch.start_seq)?;
+                    ensure_oplog_shard(shards_created, session, batch.start_seq, oplog_nonlogged)?;
                     e.insert(session.open_cursor(&batch.shard, None)?)
                 }
             };
@@ -2574,7 +2615,12 @@ fn persist_group(
         }
         return;
     }
-    match write_drain_batches(session, &shared.shards_created, &group) {
+    match write_drain_batches(
+        session,
+        &shared.shards_created,
+        shared.oplog_nonlogged,
+        &group,
+    ) {
         Ok(()) => {
             let bytes: usize = group.iter().map(|b| b.bytes).sum();
             let advanced = {
@@ -3094,19 +3140,50 @@ impl Storage {
         config: &str,
         durable: Option<bool>,
     ) -> Result<Storage> {
-        let durable = resolve_durable_from_env(durable);
+        Self::open_with_options(
+            home,
+            &StorageOptions {
+                wt_config: Some(config.to_string()),
+                durable,
+                ..StorageOptions::default()
+            },
+        )
+    }
+
+    /// Open with explicit, per-store options — the first-class form of what
+    /// the `SECANTUS_*` environment variables select process-wide. Every
+    /// `None` falls back to the corresponding env var (or the default), so
+    /// existing callers and the env-driven workflows keep working; an
+    /// explicit `Some` wins over the environment. This is what the Python
+    /// `RustServer(...)` kwargs and the `secantusd-rs` flags thread through.
+    pub fn open_with_options(home: &str, opts: &StorageOptions) -> Result<Storage> {
+        let config = opts
+            .wt_config
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CONFIG.to_string());
+        let config = config.as_str();
+        let durable = resolve_durable_from_env(opts.durable);
+        // Mode resolution: explicit option, else the env var each mode has
+        // always honoured. `oplog_nonlogged` / the data create-mode govern
+        // CREATE-time table configs (fresh stores; creates on existing tables
+        // are no-ops), `oplog_async` selects the drainer at every open.
+        let oplog_nonlogged = opts.oplog_nonlogged.unwrap_or_else(oplog_tables_nonlogged);
+        let data_create_mode = opts.data_nonlogged.unwrap_or_else(data_tables_nonlogged);
+        let oplog_async_on = opts
+            .oplog_async
+            .unwrap_or_else(|| std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some());
         let in_memory = config.contains("in_memory=true");
         let conn = Arc::new(Connection::open(home, config)?);
         let mut state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
-                boot.create(name, &bootstrap_table_cfg(name, fmt))?;
+                boot.create(name, &bootstrap_table_cfg(name, fmt, data_create_mode))?;
             }
             // The oplog is sharded across OPLOG_SHARDS btrees to spread append
             // contention (see OPLOG_SHARDS); the legacy single table stays
             // so a pre-shard store's entries remain readable. Config honours
             // SECANTUS_OPLOG_NONLOGGED (see `oplog_table_cfg`).
-            let opcfg = oplog_table_cfg();
+            let opcfg = oplog_table_cfg(oplog_nonlogged);
             boot.create(OPLOG_TABLE, &opcfg)?;
             boot.create(PREIMAGE_TABLE, &opcfg)?;
             // The documents shards (DOC_SHARDS) and oplog shards (OPLOG_SHARDS) are
@@ -3132,7 +3209,7 @@ impl Storage {
             reject_legacy_index_entry_format(&boot)?;
             // One-time: fold a pre-shard store's legacy documents rows into the
             // per-collection shards (no-op for a born-sharded store).
-            migrate_legacy_docs(&boot)?;
+            migrate_legacy_docs(&boot, data_create_mode)?;
             // Recover the oplog seq / timestamp counters from the meta row, or
             // reconstruct them by scanning the oplog table.
             load_oplog_meta(&boot)?
@@ -3155,14 +3232,15 @@ impl Storage {
         let oplog = Arc::new(Mutex::new(state));
         let oplog_cv = Arc::new(Condvar::new());
         let oplog_shards_created = Arc::new(AtomicU32::new(0));
-        // PROTOTYPE opt-in: spawn the background drainer when SECANTUS_OPLOG_ASYNC
-        // is set. The synchronous, atomic path is the default (`None`).
-        let async_oplog = if std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some() {
+        // Opt-in: spawn the background drainer pool (option, else
+        // SECANTUS_OPLOG_ASYNC). The synchronous, atomic path is the default.
+        let async_oplog = if oplog_async_on {
             Some(spawn_oplog_drainer(
                 conn.clone(),
                 oplog.clone(),
                 oplog_cv.clone(),
                 oplog_shards_created.clone(),
+                oplog_nonlogged,
             ))
         } else {
             None
@@ -3182,7 +3260,7 @@ impl Storage {
         } else {
             match marker {
                 Some((_, mode)) => mode,
-                None => data_tables_nonlogged(),
+                None => data_create_mode,
             }
         };
         let mut storage = Storage {
@@ -3206,6 +3284,8 @@ impl Storage {
             durable: durable || data_nonlogged,
             in_memory,
             async_oplog,
+            oplog_nonlogged,
+            checkpoint_seconds: opts.checkpoint_seconds,
             data_nonlogged,
             stable_seq: Arc::new(AtomicI64::new(marker.map(|(s, _)| s).unwrap_or(0))),
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
@@ -3595,7 +3675,12 @@ impl Storage {
         // (the locality that per-entry scatter destroyed). One cursor for the run.
         // Lazy shards: created on first touch only (the bitmask skips the
         // per-batch schema-lock `create` the old path paid on every emit).
-        let op_shard = ensure_oplog_shard(&self.oplog_shards_created, session, start)?;
+        let op_shard = ensure_oplog_shard(
+            &self.oplog_shards_created,
+            session,
+            start,
+            self.oplog_nonlogged,
+        )?;
         let cur = session.open_cursor(&op_shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         let wall_millis = now_millis();
@@ -3729,11 +3814,21 @@ impl Storage {
             blobs.push(blob);
             preimages.push(pre);
         }
-        {
+        // Same opportunistic-prune cadence as the sync emit path — without
+        // it an async store never prunes from write volume at all, so a
+        // sustained writer grows the oplog without bound between explicit
+        // `prune_oplog` calls. Best-effort, after the batch is handed off.
+        let do_prune = {
             let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             g.live_count += n as i64;
             g.emit_count += n as i64;
-        }
+            if g.emit_count >= OPLOG_PRUNE_INTERVAL {
+                g.emit_count = 0;
+                true
+            } else {
+                false
+            }
+        };
         let bytes: usize = blobs.iter().map(Vec::len).sum::<usize>()
             + preimages
                 .iter()
@@ -3762,6 +3857,11 @@ impl Storage {
             eprintln!(
                 "secantus-storage: async oplog drainer gone; {n} committed entries not persisted"
             );
+        }
+        if do_prune {
+            if let Err(e) = self.prune_oplog_inner(None) {
+                debug_assert!(false, "opportunistic prune_oplog failed: {e:?}");
+            }
         }
     }
 
@@ -3940,6 +4040,40 @@ impl Storage {
         } else {
             Self::visible_tail(&st)
         }
+    }
+
+    /// The seq a fresh change stream opens at: every write acknowledged
+    /// BEFORE this call resolves to a seq `<=` the returned value, so a watch
+    /// seeded here never surfaces pre-open events. Sync mode: the visible
+    /// tail as-is (an open transaction's in-flight mint pins it, and that is
+    /// correct — those events are post-open whenever the transaction
+    /// commits; waiting on them here would block opens behind long
+    /// transactions). Async mode: an acked write has *minted* (the writer
+    /// thread mints in `drain_pending_oplog` before replying) but may still
+    /// be queued at the drainer below `written_seq` — seeding at the raw
+    /// watermark surfaces those pre-open events after the open (observed as
+    /// pymongo's `test_kill_cursors` failing async-only). Wait for the
+    /// drainer to reach the minted tail captured at entry; bounded (5s) so a
+    /// dead drainer (already reported loudly) degrades an open instead of
+    /// hanging it.
+    pub fn oplog_open_seq(&self) -> i64 {
+        if self.async_oplog.is_none() {
+            return self.oplog_visible_tail_seq();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        let target = st.next_seq - 1;
+        while st.written_seq < target && std::time::Instant::now() < deadline {
+            let (g, _timed_out) = self
+                .oplog_cv
+                .wait_timeout(st, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
+            st = g;
+        }
+        // `target`, not `written_seq`: entries the drainer landed past the
+        // captured tail while we waited are concurrent-with-open writes, and
+        // a watch should deliver them.
+        target.min(st.written_seq).max(0)
     }
 
     /// Whether `(db, coll)` is the synthetic `local.oplog.rs` view.
@@ -4154,10 +4288,15 @@ impl Storage {
     /// Interval: `SECANTUS_CHECKPOINT_SECONDS` (default 60 — mongod's
     /// cadence). Stopped + joined in `Drop` before the close checkpoint.
     fn spawn_stable_checkpoint_thread(&self) {
-        let interval = std::env::var("SECANTUS_CHECKPOINT_SECONDS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        let interval = self
+            .checkpoint_seconds
             .filter(|n| *n > 0)
+            .or_else(|| {
+                std::env::var("SECANTUS_CHECKPOINT_SECONDS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|n| *n > 0)
+            })
             .unwrap_or(60);
         let stop = self.checkpoint_stop.clone();
         let requested = self.checkpoint_requested.clone();
@@ -4233,6 +4372,12 @@ impl Storage {
     /// this archive (and vice versa).
     pub fn create_archive(&self, output_path: &str) -> Result<ArchiveInfo> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Async mode: entries handed to the drainer but not yet persisted are
+        // invisible to the checkpoint below — without this drain the archive's
+        // manifest would advertise an oplog range missing acknowledged writes.
+        // Sync mode: waits out any in-flight mint window (usually a no-op).
+        // The drainers never take `self.lock`, so waiting here cannot deadlock.
+        self.flush_oplog();
         let session = self.conn.open_session()?;
         // Durable, consistent snapshot first; the backup cursor enumerates the
         // files that make it up and WiredTiger holds them stable for the cursor's
@@ -4398,7 +4543,7 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
-        ensure_collection(&session, db, coll)?;
+        ensure_collection(&session, db, coll, self.data_nonlogged)?;
         let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
         for (k, v) in opts {
             current.insert(k.clone(), v.clone());
@@ -4419,7 +4564,7 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
-        ensure_collection(&session, db, coll)?;
+        ensure_collection(&session, db, coll, self.data_nonlogged)?;
         let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
         for (k, v) in opts {
             current.insert(k.clone(), v.clone());
@@ -4462,7 +4607,7 @@ impl Storage {
         // only if still absent.
         let lock = self.coll_lock(db, coll);
         let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-        ensure_collection(&session, db, coll)?;
+        ensure_collection(&session, db, coll, self.data_nonlogged)?;
         collection_uuid(&session, db, coll)
     }
 
@@ -4515,7 +4660,12 @@ impl Storage {
         // and all-table point-ops find rows regardless of placement; a single
         // contiguous append keeps the restore fast (per-seq routing would scatter).
         // Lazy shards: created on first touch only (bitmask).
-        let op_shard = ensure_oplog_shard(&self.oplog_shards_created, &session, rows[0].0)?;
+        let op_shard = ensure_oplog_shard(
+            &self.oplog_shards_created,
+            &session,
+            rows[0].0,
+            self.oplog_nonlogged,
+        )?;
         let cur = session.open_cursor(&op_shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         let mut max_seq = 0i64;
@@ -4959,7 +5109,7 @@ impl Storage {
 
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, db, coll)?;
+                ensure_collection(&session, db, coll, self.data_nonlogged)?;
                 // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
                 if self.is_timeseries(&session, db, coll)? {
                     key.extend_from_slice(&self.timeseries_doc_suffix());
@@ -5022,7 +5172,7 @@ impl Storage {
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, db, coll)?;
+                ensure_collection(&session, db, coll, self.data_nonlogged)?;
                 let descs = self.index_descs(&session, db, coll)?;
                 let ns = format!("{db}.{coll}");
                 let oplog_on = self.enable_oplog;
@@ -5533,7 +5683,7 @@ impl Storage {
         if collection_registered(&session, db, coll)? {
             return Ok(false);
         }
-        ensure_collection(&session, db, coll)?;
+        ensure_collection(&session, db, coll, self.data_nonlogged)?;
         if !options.is_empty() {
             // Persist before minting the UUID below — collection_uuid re-reads and
             // merges, so the options survive.
@@ -5744,7 +5894,7 @@ impl Storage {
         // Lazy shards: the rename target's shard may not exist yet — make it.
         session.create(
             &doc_table_for(dst_db, dst_coll),
-            &data_table_cfg(DOC_TABLE_CFG),
+            &data_table_cfg(DOC_TABLE_CFG, self.data_nonlogged),
         )?;
         let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
         // Remember each doc against the RecordId it was RE-MINTED under in the
@@ -5776,7 +5926,7 @@ impl Storage {
         for (recordid, doc) in &moved {
             self.write_index_entries(&session, dst_db, dst_coll, doc, &dst_descs, *recordid)?;
         }
-        ensure_collection(&session, dst_db, dst_coll)?;
+        ensure_collection(&session, dst_db, dst_coll, self.data_nonlogged)?;
         let rc = session.open_cursor(COLL_TABLE, None)?;
         rc.set_key_ss(src_db, src_coll);
         match rc.search() {
@@ -6258,7 +6408,7 @@ impl Storage {
         // fresh session would deadlock against the same transaction's
         // uncommitted writes (e.g. a collection created earlier in the txn).
         let session = self.op_session()?;
-        ensure_collection(&session, db, coll)?;
+        ensure_collection(&session, db, coll, self.data_nonlogged)?;
 
         let c = session.open_cursor(IDX_TABLE, None)?;
         c.set_key_sss(db, coll, name);
@@ -7953,7 +8103,7 @@ impl Storage {
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, db, coll)?;
+                ensure_collection(&session, db, coll, self.data_nonlogged)?;
                 let ns = format!("{db}.{coll}");
                 let descs = self.index_descs(&session, db, coll)?;
                 let oplog_on = self.enable_oplog;
@@ -9591,7 +9741,7 @@ fn collection_registered(session: &Session, db: &str, coll: &str) -> Result<bool
 }
 
 /// Register `(db, coll)` in the collections table if not already present.
-fn ensure_collection(session: &Session, db: &str, coll: &str) -> Result<()> {
+fn ensure_collection(session: &Session, db: &str, coll: &str, data_nonlogged: bool) -> Result<()> {
     let probe = session.open_cursor(COLL_TABLE, None)?;
     probe.set_key_ss(db, coll);
     match probe.search() {
@@ -9611,7 +9761,10 @@ fn ensure_collection(session: &Session, db: &str, coll: &str) -> Result<()> {
             // covers every write caller (create / auto-create-on-insert / rename).
             // Read / scan paths tolerate an absent shard, keeping a lazily-sharded
             // store byte-compatible with an eager one (missing shard reads empty).
-            session.create(&doc_table_for(db, coll), &data_table_cfg(DOC_TABLE_CFG))?;
+            session.create(
+                &doc_table_for(db, coll),
+                &data_table_cfg(DOC_TABLE_CFG, data_nonlogged),
+            )?;
             Ok(())
         }
         Err(e) => Err(e.into()),
