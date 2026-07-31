@@ -52,11 +52,15 @@ def main() -> int:
     args = ap.parse_args()
     results: dict[str, dict] = json.loads(args.raw.read_text())
 
+    def _file_of(key: str) -> str:
+        # Two-lane keys are ``<engine>:<file>``; legacy raw files are bare.
+        return key.split(":", 1)[1] if ":" in key else key
+
     passed = [f for f, r in results.items() if r["ok"]]
     failed = [f for f, r in results.items() if not r["ok"]]
-    expected = [f for f in failed if f in EXPECTED_DIVERGENCES]
-    unexpected = [f for f in failed if f not in EXPECTED_DIVERGENCES]
-    resolved = [f for f in passed if f in EXPECTED_DIVERGENCES]
+    expected = [f for f in failed if _file_of(f) in EXPECTED_DIVERGENCES]
+    unexpected = [f for f in failed if _file_of(f) not in EXPECTED_DIVERGENCES]
+    resolved = sorted({_file_of(f) for f in passed if _file_of(f) in EXPECTED_DIVERGENCES})
 
     lines: list[str] = []
     lines.append("# sqllogictest conformance report")
@@ -74,30 +78,34 @@ def main() -> int:
     lines.append("")
     lines.append("Regenerate with `uv run python -m invoke validate-slt`.")
     lines.append("")
-    lines.append("| file | result | seconds |")
-    lines.append("|---|---|---:|")
+    lines.append("| lane | file | result | seconds |")
+    lines.append("|---|---|---|---:|")
     for f, r in results.items():
         if r["ok"]:
             status = "pass"
-        elif f in EXPECTED_DIVERGENCES:
+        elif _file_of(f) in EXPECTED_DIVERGENCES:
             status = "expected divergence"
         else:
             status = "**FAIL**"
-        lines.append(f"| `{f}` | {status} | {r['seconds']} |")
+        lane = r.get("engine", "postgres")
+        lines.append(f"| {lane} | `{_file_of(f)}` | {status} | {r['seconds']} |")
     lines.append("")
 
     if resolved:
         lines.append("## Resolved divergences — move back to plain INCLUDE")
         lines.append("")
         for f in resolved:
-            lines.append(f"- `{f}` now PASSES; drop its `EXPECTED_DIVERGENCES` entry.")
+            lines.append(
+                f"- `{f}` passes in at least one lane; check both before dropping its "
+                "`EXPECTED_DIVERGENCES` entry."
+            )
         lines.append("")
 
     if expected:
         lines.append("## Expected divergences")
         lines.append("")
         for f in expected:
-            lines.append(f"- `{f}` — {EXPECTED_DIVERGENCES[f]}")
+            lines.append(f"- `{f}` — {EXPECTED_DIVERGENCES[_file_of(f)]}")
         lines.append("")
 
     if unexpected:

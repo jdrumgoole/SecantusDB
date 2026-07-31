@@ -306,3 +306,19 @@ class TestFromlessAndDerived:
             "JOIN pg_class c ON i.indexrelid = c.oid WHERE c.relname = 'st_x'",
         )
         assert got == [(1, 2)]
+
+
+def test_prepared_select_from_view_describe(storage, session):
+    """Extended-protocol Describe of a SELECT from a view must resolve the
+    expanded column shape — NoData followed by DataRows crashes libpq clients
+    (surfaced by the sqllogictest postgres-extended lane)."""
+    from secantus.sql import engine, planner
+    from secantus.sql.catalog import Catalog
+
+    run(storage, session, "CREATE TABLE t1 (x int primary key)")
+    run(storage, session, "INSERT INTO t1 VALUES (0), (1)")
+    run(storage, session, "CREATE VIEW v2 AS SELECT x FROM t1 WHERE x = 0")
+    stmt = planner.parse("SELECT x FROM v2")[0]
+    cols = engine.describe_statement(storage, DB, stmt, session, Catalog(storage))
+    assert cols is not None and [c.name for c in cols] == ["x"]
+    assert engine.run_statement(storage, DB, stmt, session).rows == [(0,)]

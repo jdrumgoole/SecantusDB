@@ -1337,6 +1337,14 @@ def _describe_statement(
             return None
     if not isinstance(stmt, exp.Select):
         return None
+    # A SELECT from a declared view describes as the expanded subquery —
+    # without this, Describe answers NoData while Execute (which expands)
+    # emits DataRows: a protocol violation libpq clients reject. Expand a
+    # copy: the prepared statement's stored AST must stay pristine.
+    if not isinstance(catalog, _CTECatalog) and stmt.find(exp.Table) is not None:
+        expanded = stmt.copy()
+        _expand_views(expanded, catalog, db)
+        stmt = expanded
     table_node = stmt.find(exp.Table)
     planner.rewrite_pg_typeof(stmt, _pg_typeof_table(storage, db, catalog, table_node))
     # A set-returning row source (``FROM generate_series(…)`` / a bare

@@ -12,10 +12,10 @@ executed tests passing (100%, zero failures, zero errors)** the same day —
 including the whole schema-qualified surface (the `schemas` capability is
 open now that relations are namespaced per schema); the one closed
 capability is `datetime_microseconds` (the BSON millisecond divergence).
-Outstanding: the G1 `postgres-extended` second lane, G3 (needs a
-CockroachDB-monorepo extraction decision — multi-GB vendoring), and G5
-(Npgsql / pgjdbc — the largest catalog-gated suites); per-item status in §5.
-G4 (pgx) and G7 (pgbench + psql) landed 2026-07-31. This document plans the SQL/Postgres
+Outstanding: G3 (needs a CockroachDB-monorepo extraction decision —
+multi-GB vendoring) and G5 (Npgsql / pgjdbc — the largest catalog-gated
+suites); per-item status in §5. G4 (pgx), G7 (pgbench + psql), and the G1
+`postgres-extended` second lane all landed 2026-07-31. This document plans the SQL/Postgres
 analogue of the thirteen MongoDB driver gauges: comprehensive **external,
 unmodified** test suites run against the `SecantusPGServer` over a real
 `postgresql://…` connection, reported as pass/fail/skip counts the way
@@ -267,9 +267,14 @@ suites refuse to run *anything*:
    file → per-file report), curated 30-file include list in
    `slt_validation/include_paths.py` with 4 declared divergences.
    Weekly CI landed 2026-07-31 (`validate.yml` installs a pinned
-   `sqllogictest-bin 0.29.1` via cargo, cached by version). **Still open**:
-   the `postgres-extended` second lane and growing toward the 622-file
-   corpus.
+   `sqllogictest-bin 0.29.1` via cargo, cached by version). The
+   `postgres-extended` second lane landed the same day — every include file
+   now runs through BOTH wire protocols (52/60 lane-files pass; the 8 fails
+   are the 4 declared divergences × 2 lanes), and standing it up surfaced a
+   real extended-protocol bug: Describe of a SELECT-from-view answered
+   NoData while Execute emitted DataRows (a libpq protocol violation), fixed
+   by expanding views at describe time. **Still open**: growing toward the
+   622-file corpus.
 3. **G2 psycopg 3** — ✅ landed: `vendor/psycopg` submodule pinned to the
    installed 3.3.4, `invoke validate-psycopg` via `PSYCOPG_TEST_DSN`,
    include/deselect in `psycopg_validation/`, weekly in `validate.yml`.

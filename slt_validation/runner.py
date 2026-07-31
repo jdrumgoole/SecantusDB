@@ -88,7 +88,7 @@ def _verify_secantus_identity(host: str, port: int) -> None:
         )
 
 
-def _run_file(slt: str, test_file: Path) -> dict:
+def _run_file(slt: str, test_file: Path, engine: str = "postgres") -> dict:
     host = "127.0.0.1"
     port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-slt-gauge-")
@@ -116,7 +116,7 @@ def _run_file(slt: str, test_file: Path) -> dict:
                 [
                     slt,
                     "--engine",
-                    "postgres",
+                    engine,
                     "--host",
                     host,
                     "--port",
@@ -165,15 +165,23 @@ def main() -> int:
     RAW_OUT.parent.mkdir(exist_ok=True)
     preprocess_files(VENDOR, CORPUS, INCLUDE)
 
+    # Two protocol lanes from one corpus (sql-gauges-plan §3 G1):
+    # sqllogictest-rs speaks the simple protocol as ``postgres`` and the
+    # extended protocol (Parse/Bind/Execute) as ``postgres-extended``.
     results: dict[str, dict] = {}
-    for idx, rel in enumerate(INCLUDE, 1):
-        res = _run_file(slt, CORPUS / rel)
-        results[rel] = res
-        status = "PASS" if res["ok"] else "FAIL"
-        print(f"[{idx}/{len(INCLUDE)}] {status} {rel} ({res['seconds']}s)", flush=True)
+    total = len(INCLUDE) * 2
+    n = 0
+    for engine in ("postgres", "postgres-extended"):
+        for rel in INCLUDE:
+            n += 1
+            res = _run_file(slt, CORPUS / rel, engine=engine)
+            res["engine"] = engine
+            results[f"{engine}:{rel}"] = res
+            status = "PASS" if res["ok"] else "FAIL"
+            print(f"[{n}/{total}] {status} [{engine}] {rel} ({res['seconds']}s)", flush=True)
     RAW_OUT.write_text(json.dumps(results, indent=1))
     npass = sum(1 for r in results.values() if r["ok"])
-    print(f"\n{npass}/{len(INCLUDE)} files pass — raw results in {RAW_OUT}")
+    print(f"\n{npass}/{len(results)} lane-files pass — raw results in {RAW_OUT}")
     return 0
 
 
