@@ -172,13 +172,14 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn oplog_tail_seq(&self) -> i64 {
-        // The VISIBLE tail, not the minted tail: a fresh change stream seeds
-        // its position here, and the minted tail can sit past an entry whose
-        // transaction has not committed yet — a watch opened at that position
-        // would permanently miss the entry when it commits. The visible tail
-        // is the highest seq a reader may safely name (sync: the
-        // in-flight-window floor; async: the drainer's durable watermark).
-        self.inner.oplog_visible_tail_seq()
+        // The change-stream OPEN position (this trait method's only caller
+        // is the open-seeding path): sync mode, the visible tail — the
+        // minted tail can sit past an entry whose transaction has not
+        // committed yet, and a watch opened there would permanently miss the
+        // entry when it commits. Async mode, `oplog_open_seq` additionally
+        // waits for the drainer to reach the minted tail so writes acked
+        // before the open can't surface as post-open events.
+        self.inner.oplog_open_seq()
     }
 
     fn oplog_floor_seq(&self) -> i64 {

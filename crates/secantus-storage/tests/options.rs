@@ -99,3 +99,41 @@ fn data_nonlogged_option_engages_and_reopen_keeps_mode() {
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Async mode: `oplog_open_seq` must cover every write acknowledged before
+/// the call — a change stream seeded there never surfaces pre-open events.
+/// (Seeding at the raw drainer watermark loses this: an acked write can
+/// still be queued below `written_seq`; pymongo's `test_kill_cursors`
+/// failed exactly this way, async-only.)
+#[test]
+fn oplog_open_seq_covers_acked_writes_in_async_mode() {
+    let home = temp_home();
+    {
+        let st = Storage::open_with_options(
+            home.to_str().unwrap(),
+            &StorageOptions {
+                oplog_async: Some(true),
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap();
+        for i in 0..200 {
+            insert_row(&st, "app", "c", i);
+        }
+        // All 200 inserts are acked (minted); the drainer may still be behind.
+        let open_seq = st.oplog_open_seq();
+        let rows = st.read_oplog(1, 1000).unwrap();
+        assert!(
+            rows.len() >= 200,
+            "open seq must wait out the drainer queue (saw {} rows)",
+            rows.len()
+        );
+        assert!(
+            open_seq >= rows[199].0,
+            "open position {open_seq} sits below acked entry seq {}",
+            rows[199].0
+        );
+        drop(st);
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}

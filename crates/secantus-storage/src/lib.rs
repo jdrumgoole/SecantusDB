@@ -4042,6 +4042,40 @@ impl Storage {
         }
     }
 
+    /// The seq a fresh change stream opens at: every write acknowledged
+    /// BEFORE this call resolves to a seq `<=` the returned value, so a watch
+    /// seeded here never surfaces pre-open events. Sync mode: the visible
+    /// tail as-is (an open transaction's in-flight mint pins it, and that is
+    /// correct — those events are post-open whenever the transaction
+    /// commits; waiting on them here would block opens behind long
+    /// transactions). Async mode: an acked write has *minted* (the writer
+    /// thread mints in `drain_pending_oplog` before replying) but may still
+    /// be queued at the drainer below `written_seq` — seeding at the raw
+    /// watermark surfaces those pre-open events after the open (observed as
+    /// pymongo's `test_kill_cursors` failing async-only). Wait for the
+    /// drainer to reach the minted tail captured at entry; bounded (5s) so a
+    /// dead drainer (already reported loudly) degrades an open instead of
+    /// hanging it.
+    pub fn oplog_open_seq(&self) -> i64 {
+        if self.async_oplog.is_none() {
+            return self.oplog_visible_tail_seq();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        let target = st.next_seq - 1;
+        while st.written_seq < target && std::time::Instant::now() < deadline {
+            let (g, _timed_out) = self
+                .oplog_cv
+                .wait_timeout(st, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
+            st = g;
+        }
+        // `target`, not `written_seq`: entries the drainer landed past the
+        // captured tail while we waited are concurrent-with-open writes, and
+        // a watch should deliver them.
+        target.min(st.written_seq).max(0)
+    }
+
     /// Whether `(db, coll)` is the synthetic `local.oplog.rs` view.
     fn is_oplog_rs(&self, db: &str, coll: &str) -> bool {
         self.enable_oplog && db == "local" && coll == "oplog.rs"

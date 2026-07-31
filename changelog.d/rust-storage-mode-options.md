@@ -30,6 +30,14 @@ backup taken under the async drainer can no longer miss acknowledged writes.
   rejects them).
 
 #### Fixed
+- Async-mode change streams could surface **pre-open events**: a write
+  acknowledged before `watch()` could still be queued at the drainer, so the
+  open position (seeded at the drainer's watermark) sat below it and the event
+  leaked into the new stream (pymongo's `test_kill_cursors`, async-only). The
+  open path now waits (bounded) for the drainer to reach the minted tail
+  captured at open (`Storage::oplog_open_seq`); sync mode is unchanged — an
+  open transaction's pinned visible tail is already the correct open position,
+  and flushing there would block opens behind long transactions.
 - Async-oplog stores never pruned the oplog from write volume; the drain path
   now mirrors the sync emit path's opportunistic every-1000-emits prune.
 - `create_archive` under the async drainer could snapshot before queued oplog
