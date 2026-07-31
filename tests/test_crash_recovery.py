@@ -115,10 +115,7 @@ def _verify_all_present(tmp_path: Path, ranges: list[range]) -> None:
             present: set[int] = set()
             for lo in range(0, len(acked), 1000):
                 chunk = acked[lo : lo + 1000]
-                present.update(
-                    d["_id"]
-                    for d in coll.find({"_id": {"$in": chunk}}, {"_id": 1})
-                )
+                present.update(d["_id"] for d in coll.find({"_id": {"$in": chunk}}, {"_id": 1}))
             missing = [i for i in acked if i not in present]
             assert not missing, (
                 f"{len(missing)} acknowledged docs lost after hard kill + replay "
