@@ -81,6 +81,20 @@ def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: 
             time.sleep(0.1)
         assert port_file.exists(), "server never came up"
         time.sleep(run_seconds)  # let acked load accumulate (and checkpoints fire)
+        # Load floor: the fixed sleep alone is a race on a saturated box — the
+        # 12-worker suite (or a second session's run) can starve the writer so
+        # badly that the sleep elapses before a single acked batch reaches the
+        # ack file, and the `assert ranges` below fires with no bug anywhere
+        # (seen once as a release-gate flake, 2026-07-31). Keep the sleep (the
+        # checkpoint-cadence tests need wall time for the periodic checkpoint
+        # to fire), then hold the kill until real acks exist.
+        floor_deadline = time.monotonic() + 60
+        while time.monotonic() < floor_deadline:
+            if ack_file.exists() and ack_file.read_text().count("\n") >= 5:
+                break
+            if proc.poll() is not None:
+                raise AssertionError(f"writer died mid-load: {proc.stderr.read().decode()[-2000:]}")
+            time.sleep(0.1)
     finally:
         proc.send_signal(signal.SIGKILL)
         proc.wait(timeout=10)
@@ -90,7 +104,10 @@ def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: 
         for line in ack_file.read_text().splitlines():
             lo, hi = line.split(":")
             ranges.append(range(int(lo), int(hi)))
-    assert ranges, "no acknowledged batches before the kill — load too short"
+    assert ranges, (
+        "no acknowledged batches before the kill — writer starved past the "
+        f"60s load floor; stderr: {proc.stderr.read().decode()[-2000:]}"
+    )
     return ranges
 
 

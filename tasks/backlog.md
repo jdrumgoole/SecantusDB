@@ -258,6 +258,20 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **Test-infra hazard: the 25-min hang watchdog's own dump can wedge a
+  worker (observed live 2026-07-31).** On a box loaded enough that a session
+  crosses `SECANTUS_HANG_SECONDS` (1500s), `faulthandler.dump_traceback_later`
+  fires while the worker is still healthy; the dump thread walks live threads'
+  frames without the GIL and was sampled hot-spinning in
+  `_Py_DumpTracebackThreads → _PyCode_CheckLineNumber` (CPython race, not ours).
+  It then never releases faulthandler's `running` lock, so the session-fixture
+  teardown's `cancel_dump_traceback_later()` blocks forever — the worker looks
+  "wedged after its last test". Mitigations landed: the nested-run wedge
+  tolerance in `test_crash_stall_watchdog.py` now actually matches `-q` output,
+  and the hard-kill harness kill is ack-driven. The dump-spin itself is
+  upstream; if it recurs, consider raising `SECANTUS_HANG_SECONDS` locally or
+  `exit=True`-only dumps to a file (never a pipe).
+
 - [x] **RESOLVED (bisected 2026-07-30): the small-doc one-shot insert
   "regression" (0.8× → 1.2× mongod between #666 and #703) is a COST SHIFT
   from PR #680's lazy shard creation, not a hot-path regression.** Bisect
