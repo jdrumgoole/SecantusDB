@@ -1178,7 +1178,8 @@ def _merge_apply_matched(
             ):
                 raise errors.SQLError(
                     "23505",
-                    f'duplicate key value violates unique constraint "{target.name}_pkey"',
+                    "duplicate key value violates unique constraint "
+                    f'"{target.pk_constraint_name()}"',
                 )
             storage.delete_matching(db, target.collection, {"_id": td["_id"]})
             storage.insert(db, target.collection, [post])
@@ -1786,6 +1787,12 @@ def _run_statement(
             return _create_range_type_command(stmt, db, catalog)
         if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
             return _drop_domain_command(stmt, db, catalog)
+        if verb == "COMMENT_CONSTRAINT":
+            return _comment_constraint_command(stmt, db, catalog)
+        if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("EXTENSION"):
+            return _create_extension_command(stmt)
+        if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("EXTENSION"):
+            return _drop_extension_command(stmt)
         if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("POLICY"):
             return _create_policy_command(stmt, storage, db, catalog)
         if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("POLICY"):
@@ -3048,6 +3055,71 @@ def _composite_fields_from_schema(
             f'unsupported field type in composite type "{type_name}": {kind.sql()}'
         )
     return fields
+
+
+# ``CREATE/DROP EXTENSION`` — Command tails sqlglot can't parse. SecantusDB
+# ships the functionality of a few extensions built in (citext, hstore, and
+# plpgsql, which real Postgres preinstalls), so installing them is a no-op
+# that succeeds; anything else is honestly unavailable (0A000, so driver
+# suites that probe with CREATE EXTENSION read it as a skippable gap rather
+# than a failure). The WITH SCHEMA / VERSION / CASCADE tail is accepted and
+# ignored — there is no schema placement or versioning to do.
+_AVAILABLE_EXTENSIONS = frozenset({"citext", "hstore", "plpgsql"})
+
+_EXTENSION_RE = re.compile(
+    r'(?is)^\s*EXTENSION\s+(?:(?P<ifclause>IF\s+(?:NOT\s+)?EXISTS)\s+)?"?(?P<name>[\w-]+)"?'
+)
+
+
+def _create_extension_command(stmt: exp.Command) -> SQLResult:
+    m = _EXTENSION_RE.match(_command_text(stmt))
+    if m is None:
+        raise errors.syntax_error(f"unparseable CREATE EXTENSION: {stmt.sql()}")
+    name = m.group("name").lower()
+    if name not in _AVAILABLE_EXTENSIONS:
+        raise errors.feature_not_supported(f'extension "{name}" is not available')
+    return SQLResult(command_tag="CREATE EXTENSION")
+
+
+def _comment_constraint_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    """``COMMENT ON CONSTRAINT c ON t IS '…'`` — store the comment on the
+    named check / unique / foreign-key / primary-key constraint (``IS NULL``
+    removes it). Routed here by ``planner.parse`` because sqlglot's Comment
+    node can't express the two-name form."""
+    import dataclasses
+
+    raw = str(stmt.expression.this)
+    m = planner.COMMENT_CONSTRAINT_RE.match(raw)
+    assert m is not None  # gated by the dispatcher's parse
+    cname = m.group("name").strip('"')
+    tname = m.group("table").split(".")[-1].strip('"')
+    value = m.group("value")
+    text = None if value.upper() == "NULL" else value[1:-1].replace("''", "'")
+    table = catalog.get(db, tname)
+    if table is None:
+        raise errors.undefined_table(tname)
+    for attr in ("check_constraints", "unique_constraints", "foreign_keys"):
+        cons = getattr(table, attr)
+        if any(c.name == cname for c in cons):
+            updated = [dataclasses.replace(c, comment=text) if c.name == cname else c for c in cons]
+            catalog.replace(db, dataclasses.replace(table, **{attr: updated}))
+            return SQLResult(command_tag="COMMENT")
+    if table.pk_columns and cname == table.pk_constraint_name():
+        catalog.replace(db, dataclasses.replace(table, pk_comment=text))
+        return SQLResult(command_tag="COMMENT")
+    raise errors.SQLError("42704", f'constraint "{cname}" for table "{tname}" does not exist')
+
+
+def _drop_extension_command(stmt: exp.Command) -> SQLResult:
+    m = _EXTENSION_RE.match(_command_text(stmt))
+    if m is None:
+        raise errors.syntax_error(f"unparseable DROP EXTENSION: {stmt.sql()}")
+    name = m.group("name").lower()
+    if name not in _AVAILABLE_EXTENSIONS:
+        if m.group("ifclause") is not None:
+            return SQLResult(command_tag="DROP EXTENSION")
+        raise errors.SQLError("42704", f'extension "{name}" does not exist')
+    return SQLResult(command_tag="DROP EXTENSION")
 
 
 # ``TYPE <name> AS RANGE (<options>)`` — the Command tail of a CREATE that

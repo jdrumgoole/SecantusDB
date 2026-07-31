@@ -237,6 +237,7 @@ validation-report-cxx
 validation-report-dotnet
 validation-report-psycopg
 validation-report-slt
+validation-report-sqlalchemy
 validation-report-rust-server
 validation-report-pymongo-async-rust-server
 validation-report-go-rust-server

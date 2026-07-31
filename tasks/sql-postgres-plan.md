@@ -4,9 +4,11 @@
 `SecantusPGServer` (`src/secantus/sql/`) speaks the Postgres v3 wire protocol
 to psycopg / pg8000 with a deep SQL surface, backed by ~150 `test_sql_*` /
 `test_pgserver_*` suites. Remaining gaps are tracked in `tasks/backlog.md`
-("SQL / PostgreSQL interface" section); the external conformance gauges are
-still at the proposal stage in `tasks/sql-gauges-plan.md`. The design rationale
-below is kept as written.
+("SQL / PostgreSQL interface" section); the external conformance gauges
+(`invoke validate-psycopg` / `invoke validate-slt`) are live — see
+`tasks/sql-gauges-plan.md` for the portfolio and its per-gauge status. The
+design rationale below is kept as written; a dated audit addendum at the end
+of §7 records which "Deferred" tails have since landed.
 
 This document planned a *third protocol persona* for
 SecantusDB: a PostgreSQL-wire-compatible SQL front end that lets `psql`,
@@ -603,44 +605,74 @@ Everything deferred lands in `tasks/backlog.md` as it's discovered.
   Tests: CREATE/DROP INDEX + isolation acceptance in `tests/test_sql_spike.py` +
   a driver-level index/isolation test in `tests/test_pgserver_pg8000.py`.
 
+### Audit addendum (2026-07-31): the "Deferred" tails above have since landed
+
+The phase log above is kept as written for history, but nearly every item its
+bullets deferred was closed by later slices. Landed since: **SAVEPOINT /
+RELEASE / ROLLBACK TO** (`tests/test_sql_savepoints.py`; savepoint rollback
+reverts DDL, #564), **binary result format** plus binary COPY and binary /
+scrollable server-side cursors (#543 / #548 / #561), **`ALTER TABLE`** (the
+`test_sql_alter*.py` family, incl. ADD FK / column / constraint / domain /
+type), **foreign-key constraints with enforcement** (`test_sql_enforce_fk.py`),
+**window functions** (`test_sql_window*.py`), **subqueries incl. correlated**
+(`test_sql_subquery*.py`, `test_sql_correlated_*.py`), **RIGHT / FULL / CROSS
+joins** (`test_sql_outer_join.py`, `test_sql_cross_join.py`), **JOIN combined
+with GROUP BY** (`test_sql_join_group.py`), **writes to reflected tables**
+(`test_sql_reflect.py::test_insert_into_reflected_table`), **jsonb containment
+`@>` / `<@` / `?`** (`test_sql_jsonb*.py`), **CREATE FUNCTION / PL/pgSQL / DO
+blocks** (#558, `test_sql_plpgsql.py`), and a **live psycopg gauge** —
+`psycopg[binary]` ships libpq, so the "needs libpq, unavailable in this dev
+env" caveats repeated above are obsolete (`tests/test_pgserver_psycopg.py` +
+`invoke validate-psycopg`). What genuinely remains open is tracked in
+`tasks/backlog.md` ("SQL / PostgreSQL interface" section), not in this file.
+
 ---
 
 ## 8. Testing & conformance (mirror the existing gauges)
 
 - **Unit tests** pin SQL→Mongo-filter/pipeline translation in
   `tests/test_sql_planner.py` / `tests/test_sql_types.py` (the semantics oracle),
-  and wire framing in `tests/test_pgwire.py`.
+  and wire framing in `tests/test_pgwire.py`. ✅ landed.
 - **Integration tests** drive **psycopg** against a live `SecantusPGServer` on
   `port=0` + `tmp_path` storage (the `psql`/psycopg analogue of `tests/test_crud.py`),
-  the conformance proof.
+  the conformance proof. ✅ landed (`tests/test_pgserver_psycopg.py`, plus the
+  pg8000 gauge in `tests/test_pgserver_pg8000.py`).
 - **Cross-protocol parity**: write a doc via `pymongo`, read the row via psycopg,
   assert the round-trip — this is the dual-view correctness gate and the SQL
   analogue of "run the same code against SecantusDB and real mongod."
-- **A new conformance gauge** (`invoke validate-postgres`): point a slice of
-  Postgres's own regression `.sql`/`.out` pairs (or psycopg's test suite) at the
-  server, dev-only, weekly in `validate.yml`. Start with a curated subset; grow
-  it the way the driver gauges grew.
+  ✅ landed (`tests/test_sql_reflect.py` + driver-level round-trips in
+  `tests/test_pgserver_pg8000.py`).
+- **A new conformance gauge**: ✅ landed as *two* gauges — `invoke
+  validate-psycopg` (psycopg's own unmodified suite, weekly in `validate.yml`,
+  report at `docs/validation-report-psycopg.md`) and `invoke validate-slt` (the
+  sqllogictest corpus via sqllogictest-rs). Portfolio, per-gauge status, and
+  next gauges: `tasks/sql-gauges-plan.md`. (The Postgres `pg_regress`
+  `.sql`/`.out` route was evaluated and rejected there — §4.)
 - **Ad-hoc port** for reproducers: pick a predictable alt like `127.0.0.1:55432`
   (Postgres's `5432` + offset), the SQL analogue of the Mongo `27018` convention.
+  *Convention declared but not yet load-bearing — ad-hoc SQL repros so far have
+  used ephemeral ports; use 55432 when a fixed address helps.*
 
 ---
 
 ## 9. Versioning, packaging, docs
 
-- This is **Python-server** work: bump only `pyproject.toml` + `src/secantus/__init__.py`
-  (`0.5.4bN`), per CLAUDE.md's two-version-line rule. No Rust crate bump.
+- This is **Python-server** work: no Rust crate bump; the Python version is
+  assigned at release time (feature PRs bump neither line — see CLAUDE.md
+  *Versioning*). ✅ practice in force.
 - New optional dep `sqlglot` (pure-Python — no wheel/cmake impact). Gate the
   Postgres server behind an extra (`pip install secantus[sql]`) so the core
-  Mongo wheel stays lean and the SQL stack is opt-in.
-- New module tree under `src/secantus/`: `pgserver.py`, `pgwire.py`, `pgauth.py`,
-  and a `sql/` package (`parser.py`, `planner.py`, `executor.py`, `catalog.py`,
-  `typemap.py`, `errors.py`).
-- CLI: a `--postgres-port` flag on the existing launcher to bring the SQL
-  listener up beside the Mongo one; a `SecantusPGServer` for the one/two-line
-  test ergonomic.
-- Docs: a new `docs/sql.md` (architecture + supported-SQL matrix + the
-  out-of-scope list, kept honest like `docs/compatibility.md`), and a row in the
-  compatibility matrix.
+  Mongo wheel stays lean and the SQL stack is opt-in. ✅ landed (the `sql`
+  extra in `pyproject.toml`; sqlglot mirrored into `dev` for the tests).
+- New module tree: ✅ landed, as `src/secantus/sql/` holding the *whole* SQL
+  persona — wire (`pgwire.py`), server (`pgserver.py`), auth (`pgauth.py`),
+  extended protocol (`pgextended.py`), and the planner/executor/catalog/typemap
+  modules planned here (plus the type/feature modules that grew alongside).
+- CLI: ✅ landed as a dedicated entry point — `secantusd-py-pg`
+  (`[project.scripts]`) rather than a `--postgres-port` flag on the Mongo
+  launcher; `SecantusPGServer` is the one/two-line test ergonomic.
+- Docs: ✅ landed — `docs/sql.md` in the Sphinx toctree, linked from the docs
+  landing page; `docs/compatibility.md` points at it for the SQL persona.
 
 ---
 
@@ -657,16 +689,21 @@ version line; it is out of scope here beyond noting the seam.
 
 ---
 
-## 11. Open decisions to confirm before P0
+## 11. Open decisions to confirm before P0 — all resolved
 
-1. **Parser**: `sqlglot` (recommended — pure-Python, no native dep) vs `pglast`
-   (exact grammar, native build).
-2. **Schema model default**: declared-table-first (catalog-driven, ORM-friendly)
-   vs reflected-first (zero-DDL over existing Mongo data). Recommendation: ship
-   both, default a connection to *reflected* so existing collections are
-   immediately queryable, with `CREATE TABLE` upgrading to a typed view.
-3. **ObjectId surface**: `text` (24-hex, simplest, recommended) vs a custom
-   domain/type.
-4. **Auth default**: `trust` for the in-process test ergonomic (recommended,
-   matches "two lines, no external processes") with SCRAM opt-in, mirroring the
-   Mongo server's `require_auth=False` default.
+Every recommendation below was adopted as recommended:
+
+1. **Parser**: `sqlglot` ✅ — pure-Python, shipped in the `sql` extra. Its gaps
+   are handled by SQL-text preprocessing / Command interception where its pg
+   grammar falls short (SAVEPOINT, CREATE TYPE … AS RANGE, adjacent `$1,$2`
+   normalization), never by forking it.
+2. **Schema model default**: both flavours shipped ✅ — declared tables via
+   `CREATE TABLE` + the `__sql_catalog__` catalog, and reflected
+   (schema-on-read) as the automatic fallback for any existing collection, so
+   `pymongo`-written data is immediately queryable with no DDL. A declared
+   table shadows reflection; reflected tables accept writes.
+3. **ObjectId surface**: `text` (24-hex) ✅ — `sql/reflect.py` types an
+   `ObjectId` column as `text`, `sql/typemap.py` renders `str(oid)`.
+4. **Auth default**: `trust` ✅ — `SecantusPGServer` defaults open for the
+   two-line test ergonomic; SCRAM-SHA-256 (+ TLS) opt-in via
+   `require_auth=True, users={...}`, mirroring the Mongo server.

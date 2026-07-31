@@ -2361,9 +2361,23 @@ shared storage engine or building large new protocol subsystems:
 - [ ] **`test_return_untyped[b]` / DatatypeMismatch.** A binary untyped
   parameter used in a context that PG rejects with 42804 — niche.
 - [ ] **Schema-qualified tables** (`CREATE TABLE testschema.t (…)`) — CREATE
-  SCHEMA and schema-qualified user *types* landed; tables in a user schema
-  still raise. Needs the (db, coll) storage key to carry the schema (or a
+  SCHEMA and schema-qualified user *types* landed; tables are NOT namespaced
+  per schema: `CREATE TABLE test_schema.users` after `CREATE TABLE users`
+  fails 42P07 (the schema part is dropped, both map to the flat collection
+  name — observed standing up the SQLAlchemy compliance gauge, whose
+  `requirements.py` declares `schemas` closed because of exactly this).
+  Needs the (db, coll) storage key to carry the schema (or a
   dotted-collection mapping like the types take).
+- [ ] **SQLAlchemy compliance gauge — remaining failure clusters** (`invoke
+  validate-sqlalchemy`, baseline 572 P / 166 F / 677 S = 77.5%,
+  `docs/validation-report-sqlalchemy.md`): ComponentReflectionTest (62 —
+  constraint-comment reflection via pg_description, index/FK detail shapes),
+  BizarroCharacterTest (30 — quoted identifiers with `%`, parens, backslashes
+  end-to-end), LikeFunctionsTest (12 — `contains`/`startswith` autoescape),
+  FetchLimitOffsetTest (6 — FETCH FIRST … WITH TIES / percent), HasSequenceTest
+  errors (6 — sequences in a non-default schema), IsOrIsNotDistinctFromTest
+  (5), TrueDivTest (4 — integer `/` vs `//` edge typing). Re-run the gauge
+  after each cluster fix; grow `requirements.py` capabilities as they land.
 - [ ] **HAVING general-shape residual**: the HAVING lowerers now cover
   comparisons, `IS [NOT] NULL` (incl. computed group-key operands),
   `[NOT] IN` over group keys, and always-unknown NULL-operand folds — but any

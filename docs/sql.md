@@ -126,6 +126,13 @@ binary-format parameters, server-side prepared statements, and the psycopg SQLAl
 dialect's catalog reflection), each paired with a **SQLAlchemy** Core round-trip. `psql`
 and a JVM/JDBC client speak the same protocol but need a system libpq / a JVM, so they
 aren't run in CI.
+
+Beyond the bundled tests, three **external, unmodified** suites run weekly as
+conformance gauges: psycopg 3's own test suite (`invoke validate-psycopg`),
+the SQLite-originated sqllogictest corpus over pgwire (`invoke validate-slt`),
+and SQLAlchemy's dialect-compliance suite (`invoke validate-sqlalchemy`).
+Their pass-rate reports live alongside this page in the repository
+(`docs/validation-report-{psycopg,slt,sqlalchemy}.md`).
 :::
 
 ## Declared tables

@@ -197,6 +197,7 @@ class ForeignKey:
     on_update: str | None = None
     deferrable: bool = False  # DEFERRABLE — the check can be postponed to COMMIT
     initially_deferred: bool = False  # INITIALLY DEFERRED — deferred by default
+    comment: str | None = None  # COMMENT ON CONSTRAINT
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,7 @@ class CheckConstraint:
 
     name: str
     expression: str
+    comment: str | None = None  # COMMENT ON CONSTRAINT
 
 
 @dataclass(frozen=True)
@@ -216,6 +218,7 @@ class UniqueConstraint:
     columns: tuple[str, ...]
     deferrable: bool = False
     initially_deferred: bool = False
+    comment: str | None = None  # COMMENT ON CONSTRAINT
 
 
 @dataclass(frozen=True)
@@ -250,10 +253,19 @@ class TableDef:
     check_constraints: list[CheckConstraint] = field(default_factory=list)
     unique_constraints: list[UniqueConstraint] = field(default_factory=list)
     comment: str | None = None  # COMMENT ON TABLE (reflected via pg_description)
+    # Declared PK constraint name (``CONSTRAINT <name> PRIMARY KEY (…)``);
+    # reflection surfaces it instead of the synthesized ``<table>_pkey``.
+    pk_name: str | None = None
+    pk_comment: str | None = None  # COMMENT ON CONSTRAINT for the PK
     # Expression (functional) indexes. Their hidden ``field`` keys resolve like
     # columns (so a query rewritten onto one plans through the normal index path)
     # but are NOT in ``columns`` (so ``SELECT *`` / reflection never surface them).
     expr_indexes: list[ExprIndex] = field(default_factory=list)
+
+    def pk_constraint_name(self) -> str:
+        """The PK constraint's reflected name: the declared one, else the
+        Postgres default ``<table>_pkey``."""
+        return self.pk_name or f"{self.name}_pkey"
 
     def column(self, name: str) -> Column | None:
         for c in self.columns:
@@ -335,6 +347,8 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
             for c in table.columns
         ],
         "comment": table.comment,
+        "pk_name": table.pk_name,
+        "pk_comment": table.pk_comment,
         "temp": table.temp,
         "foreign_keys": [
             {
@@ -346,11 +360,13 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "on_update": fk.on_update,
                 "deferrable": fk.deferrable,
                 "initially_deferred": fk.initially_deferred,
+                "comment": fk.comment,
             }
             for fk in table.foreign_keys
         ],
         "check_constraints": [
-            {"name": ck.name, "expression": ck.expression} for ck in table.check_constraints
+            {"name": ck.name, "expression": ck.expression, "comment": ck.comment}
+            for ck in table.check_constraints
         ],
         "unique_constraints": [
             {
@@ -358,6 +374,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "columns": list(uq.columns),
                 "deferrable": uq.deferrable,
                 "initially_deferred": uq.initially_deferred,
+                "comment": uq.comment,
             }
             for uq in table.unique_constraints
         ],
@@ -401,6 +418,8 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
             for c in doc["columns"]
         ],
         comment=doc.get("comment"),
+        pk_name=doc.get("pk_name"),
+        pk_comment=doc.get("pk_comment"),
         temp=bool(doc.get("temp", False)),
         foreign_keys=[
             ForeignKey(
@@ -412,11 +431,12 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 on_update=fk.get("on_update"),
                 deferrable=bool(fk.get("deferrable", False)),
                 initially_deferred=bool(fk.get("initially_deferred", False)),
+                comment=fk.get("comment"),
             )
             for fk in doc.get("foreign_keys", [])
         ],
         check_constraints=[
-            CheckConstraint(name=ck["name"], expression=ck["expression"])
+            CheckConstraint(name=ck["name"], expression=ck["expression"], comment=ck.get("comment"))
             for ck in doc.get("check_constraints", [])
         ],
         unique_constraints=[
@@ -425,6 +445,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 columns=tuple(uq["columns"]),
                 deferrable=bool(uq.get("deferrable", False)),
                 initially_deferred=bool(uq.get("initially_deferred", False)),
+                comment=uq.get("comment"),
             )
             for uq in doc.get("unique_constraints", [])
         ],
