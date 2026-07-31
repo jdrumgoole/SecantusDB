@@ -258,7 +258,11 @@ SecantusDB, the levers are:
    drainer). Bounded by `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (default
    128 MB). The drainer coalesces queued batches into one WiredTiger
    transaction (`SECANTUS_OPLOG_ASYNC_COALESCE=0` disables). Default
-   off.
+   off. (The async figures in the table above were measured before the
+   async path gained the same opportunistic oplog prune the sync path
+   has always had; the prune's retention enforcement costs ~5% at
+   eight writers, so read the async column as slightly optimistic
+   until the next release re-baseline.)
 6. **Non-logged oplog tables (Rust server, opt-in).**
    `RustServer(oplog_nonlogged=True)`, `secantusd-rs --oplog-nonlogged`
    (or the TOML key), or `SECANTUS_OPLOG_NONLOGGED=1` — applied at first
