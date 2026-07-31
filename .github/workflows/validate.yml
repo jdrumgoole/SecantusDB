@@ -50,6 +50,11 @@ jobs:
           # dialect-compliance suite (ships inside the sqlalchemy package —
           # nothing vendored) against a daemon SecantusPGServer. Python-only.
           - { name: sqlalchemy, task: validate-sqlalchemy, report: docs/validation-report-sqlalchemy.md }
+          # The SQL-server low-level Go gauge (tasks/sql-gauges-plan.md G4):
+          # jackc/pgx's pgconn + pgproto3 packages, unmodified, over
+          # PGX_TEST_DATABASE. Needs the Go toolchain (shared with the go
+          # gauge's setup step below).
+          - { name: pgx, task: validate-pgx, report: docs/validation-report-pgx.md }
           # The SQL-server correctness gauge (tasks/sql-gauges-plan.md G1): the
           # vendored sqllogictest corpus executed by sqllogictest-rs over real
           # pgwire against a fresh daemon SecantusPGServer per file. Needs the
@@ -169,7 +174,7 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Set up Go
-        if: matrix.driver.name == 'go'
+        if: matrix.driver.name == 'go' || matrix.driver.name == 'pgx'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: "1.25"

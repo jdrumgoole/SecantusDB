@@ -2360,6 +2360,14 @@ shared storage engine or building large new protocol subsystems:
   client-abort detection during a streamed COPY OUT.
 - [ ] **`test_return_untyped[b]` / DatatypeMismatch.** A binary untyped
   parameter used in a context that PG rejects with 42804 — niche.
+- [ ] **pgx gauge — pgconn clusters** (`invoke validate-pgx`, baseline 291 P /
+  87 F / 22 S = 77.0%, `docs/validation-report-pgx.md`): the two big pgconn
+  clusters are **pipeline mode** (`Pipeline*` — Sync-less batching over the
+  extended protocol; ~30 tests incl. flush/partial-read shapes) and the
+  **CancelRequest context watcher** (12 — wire cancel handling), plus
+  result-reader capacity/`nil` edge details and `TestTrace`. pgproto3 is
+  99.4% (one codec edge). Fix cluster-by-cluster and re-run, like the
+  psycopg/SQLAlchemy gauges.
 - [ ] **Sub-millisecond timestamp fidelity** (the one declared SQLAlchemy-gauge
   divergence — `datetime_microseconds` closed in
   `sqlalchemy_validation/requirements.py`): BSON datetimes are int64
