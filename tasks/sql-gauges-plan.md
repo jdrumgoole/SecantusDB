@@ -7,7 +7,9 @@
 `docs/validation-report-psycopg.md`) are committed tooling; the §6 results log
 below records how they got there. Slice zero (§2) shipped along the way.
 G6 (SQLAlchemy's dialect-compliance suite — `invoke validate-sqlalchemy`,
-572/738 run tests passing at baseline, weekly in CI) landed 2026-07-31.
+weekly in CI) landed 2026-07-31 at 572/738 (77.5%) and climbed to **713/735
+(97.0%, zero errors)** the same day after the reflection / temp-table /
+LIKE-ESCAPE / numeric-division rounds below.
 Outstanding: the G1 `postgres-extended` second lane and gauges G3–G5 / G7
 (per-item status in §5). This document plans the SQL/Postgres
 analogue of the thirteen MongoDB driver gauges: comprehensive **external,
@@ -282,16 +284,32 @@ suites refuse to run *anything*:
    ships inside the sqlalchemy package) over `postgresql+psycopg` against a
    daemon server, with capability declarations in
    `sqlalchemy_validation/requirements.py` (`schemas` closed — tables aren't
-   namespaced per schema; see backlog). Baseline: **572 passed / 166 failed /
-   677 skipped (77.5%)**, weekly in `validate.yml`,
-   `docs/validation-report-sqlalchemy.md`. Standing it up forced three server
+   namespaced per schema; see backlog). Baseline 572 P / 166 F (77.5%); now **713
+   passed / 22 failed / 680 skipped (97.0%, zero errors)**, weekly in
+   `validate.yml`, `docs/validation-report-sqlalchemy.md`. The climb came
+   from: temp-table reflection semantics (relpersistence 't', session-scoped
+   visibility via `pg_table_is_visible` → own-session `Session.temp_tables`,
+   drop at connection teardown), typmod fidelity (`Column.decl_oid`/`typmod`
+   → pg_attribute + `format_type`), `pg_get_expr` passthrough (SERIAL
+   defaults → autoincrement), plain-view columns in pg_attribute (described
+   from the stored SELECT), constraint comments in pg_description,
+   `quote_ident` in `pg_get_constraintdef` (the whole BizarroCharacterTest
+   class), LIKE ESCAPE + computed patterns (incl. a Describe fallback that
+   strips an unlowerable WHERE), IS [NOT] DISTINCT FROM, numeric-cast
+   division (`CAST(15 AS NUMERIC)/10 = 1.5`), LIMIT/OFFSET expressions,
+   INSERT DEFAULT VALUES, CREATE SEQUENCE NO MINVALUE/MAXVALUE, and declared
+   composite-PK order. Standing it up forced three server
    fixes: `CREATE/DROP EXTENSION` (citext / hstore / plpgsql accepted, others
    0A000), `COMMENT ON CONSTRAINT` (check / unique / FK / PK), and a real
    correctness bug — a table-level ``CONSTRAINT <name> PRIMARY KEY`` was
    silently dropped (no `_id` mapping, no uniqueness); the declared PK name is
    now honored end-to-end (enforcement, reflection, duplicate-key messages).
-   Top remaining clusters: ComponentReflectionTest (62), BizarroCharacterTest
-   identifier quoting (30), LikeFunctionsTest (12).
+   The remaining 22 are a residual tail (see the backlog entry): the
+   insertmanyvalues sentinel shape (`INSERT … SELECT p0 FROM (VALUES …) AS
+   alias(p0, c) ORDER BY c`), LIMIT/OFFSET inside union arms, FROM-less
+   `SELECT … WHERE EXISTS`, DateTimeMicroseconds (the documented BSON
+   millisecond-precision divergence), covering-index INCLUDE reflection,
+   DISTINCT ON, scalar-subquery-in-row fetch, and sequence lastrowid.
 
 Mechanics mirror the existing gauges throughout: daemon `SecantusPGServer`
 subprocess on an ephemeral port (ad-hoc reproducers on `127.0.0.1:55432` per

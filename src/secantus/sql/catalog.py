@@ -174,6 +174,11 @@ class Column:
     # onto the named fields and ``(col).field`` access can type its result.
     composite_type: str | None = None
     composite_fields: tuple[tuple[str, str], ...] | None = None
+    # Declared PG type identity for reflection: the oid when it differs from
+    # the storage tag's (``varchar``/``bpchar`` fold to the ``text`` tag) and
+    # the ``atttypmod`` (``varchar(52)`` → 56, ``numeric(18,5)`` → ((18<<16)|5)+4).
+    decl_oid: int | None = None
+    typmod: int = -1
     # True for a column declared ``json`` (not ``jsonb``): the value behaviour
     # is identical (both store parsed JSON under type_tag "json") but the wire
     # identity differs — RowDescription/COPY report oid 114, whose binary form
@@ -257,10 +262,24 @@ class TableDef:
     # reflection surfaces it instead of the synthesized ``<table>_pkey``.
     pk_name: str | None = None
     pk_comment: str | None = None  # COMMENT ON CONSTRAINT for the PK
+    # The PK constraint's declared column order (``PRIMARY KEY (name, id)``),
+    # when it differs from table-column order — reflection surfaces it; the
+    # storage ``_id`` mapping is untouched.
+    pk_column_order: tuple[str, ...] | None = None
     # Expression (functional) indexes. Their hidden ``field`` keys resolve like
     # columns (so a query rewritten onto one plans through the normal index path)
     # but are NOT in ``columns`` (so ``SELECT *`` / reflection never surface them).
     expr_indexes: list[ExprIndex] = field(default_factory=list)
+
+    def ordered_pk_columns(self) -> list[Column]:
+        """PK columns in the constraint's declared order (reflection order);
+        falls back to table-column order when no explicit order was declared."""
+        cols = self.pk_columns
+        if not self.pk_column_order:
+            return cols
+        by_name = {c.name: c for c in cols}
+        ordered = [by_name[n] for n in self.pk_column_order if n in by_name]
+        return ordered if len(ordered) == len(cols) else cols
 
     def pk_constraint_name(self) -> str:
         """The PK constraint's reflected name: the declared one, else the
@@ -343,12 +362,15 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "composite_type": c.composite_type,
                 "composite_fields": _ser_composite_fields(c.composite_fields),
                 "json_plain": c.json_plain,
+                "decl_oid": c.decl_oid,
+                "typmod": c.typmod,
             }
             for c in table.columns
         ],
         "comment": table.comment,
         "pk_name": table.pk_name,
         "pk_comment": table.pk_comment,
+        "pk_column_order": list(table.pk_column_order) if table.pk_column_order else None,
         "temp": table.temp,
         "foreign_keys": [
             {
@@ -414,12 +436,15 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 composite_type=c.get("composite_type"),
                 composite_fields=_deser_composite_fields(c.get("composite_fields")),
                 json_plain=bool(c.get("json_plain", False)),
+                decl_oid=c.get("decl_oid"),
+                typmod=int(c.get("typmod", -1)),
             )
             for c in doc["columns"]
         ],
         comment=doc.get("comment"),
         pk_name=doc.get("pk_name"),
         pk_comment=doc.get("pk_comment"),
+        pk_column_order=(tuple(doc["pk_column_order"]) if doc.get("pk_column_order") else None),
         temp=bool(doc.get("temp", False)),
         foreign_keys=[
             ForeignKey(

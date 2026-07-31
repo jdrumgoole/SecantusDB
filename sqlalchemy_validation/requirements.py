@@ -31,6 +31,17 @@ class Requirements(SuiteRequirements):
         return exclusions.open()
 
     @property
+    def temp_table_names(self):
+        # Temp tables are session-scoped (created flagged temp, visible only
+        # to their creating session, dropped at connection teardown), so
+        # listing them works and the suite's expectations line up.
+        return exclusions.open()
+
+    @property
+    def has_temp_table(self):
+        return exclusions.open()
+
+    @property
     def reflects_pk_names(self):
         return exclusions.open()
 
@@ -39,5 +50,17 @@ class Requirements(SuiteRequirements):
         return exclusions.open()
 
     @property
+    def unique_constraints_reflect_as_index(self):
+        # A UNIQUE constraint's backing index shows in get_indexes with
+        # duplicates_constraint set, matching real PG.
+        return exclusions.open()
+
+    @property
     def foreign_key_constraint_reflection(self):
+        return exclusions.open()
+
+    @property
+    def index_reflects_included_columns(self):
+        # get_indexes returns include_columns (the postgres dialect always
+        # emits it; INCLUDE columns themselves reflect as empty lists).
         return exclusions.open()

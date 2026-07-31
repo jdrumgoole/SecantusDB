@@ -281,6 +281,18 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_in(node, scope, ctx)
     if isinstance(node, exp.Between):
         return _eval_between(node, scope, ctx)
+    if isinstance(node, (exp.NullSafeEQ, exp.NullSafeNEQ)):
+        # ``IS [NOT] DISTINCT FROM`` — null-safe comparison: two NULLs are
+        # "not distinct", a NULL and a value are "distinct".
+        lv = _unwrap_decimal(evaluate(node.this, scope, ctx))
+        rv = _unwrap_decimal(evaluate(node.expression, scope, ctx))
+        if lv is None or rv is None:  # noqa: SIM108 — three-valued split reads clearer
+            not_distinct = lv is None and rv is None
+        else:
+            not_distinct = bool(lv == rv)
+        return not_distinct if isinstance(node, exp.NullSafeEQ) else not not_distinct
+    if isinstance(node, exp.Escape) and isinstance(node.this, (exp.Like, exp.ILike)):
+        return _eval_like(node.this, scope, ctx, escape=evaluate(node.expression, scope, ctx))
     if isinstance(node, (exp.Like, exp.ILike)):
         return _eval_like(node, scope, ctx)
     if isinstance(node, (exp.RegexpLike, exp.RegexpILike)):
@@ -438,6 +450,12 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     interval_result = _eval_interval_arith(node, left, right)
     if interval_result is not _NOT_INTERVAL:
         return interval_result
+    # Mixed float/numeric operands: PG resolves float8 ⊕ numeric by coercing
+    # the numeric to float8 (Python's float/Decimal raises TypeError).
+    if isinstance(left, float) and isinstance(right, Decimal):
+        right = float(right)
+    elif isinstance(right, float) and isinstance(left, Decimal):
+        left = float(left)
     return _ARITH[type(node)](left, right)
 
 
@@ -1469,8 +1487,12 @@ def _cast_scalar(value: Any, tag: str) -> Any:
     if tag == "numeric":
         if isinstance(value, bool):
             return value
-        if isinstance(value, (Decimal, int)):
+        if isinstance(value, Decimal):
             return value
+        if isinstance(value, int):
+            # An int cast to numeric IS numeric — ``CAST(15 AS NUMERIC) / 10``
+            # divides exactly (1.5), never via integer truncation.
+            return Decimal(value)
         if isinstance(value, float):
             return Decimal(str(value))
         if isinstance(value, str):
@@ -2247,8 +2269,14 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
 
             return virtual.indexdef_for_oid(ctx.db, ctx.storage, ctx.catalog, args[0])
         return None
-    if name in ("pg_get_expr", "pg_get_serial_sequence"):
-        # No stored defaults / serial-sequence resolution.
+    if name == "pg_get_expr":
+        # pg_attrdef.adbin (and pg_index.indexprs etc.) store the rendered SQL
+        # text directly — real PG stores a nodeToString and pg_get_expr
+        # deparses it; ours passes the text through. This is what SQLAlchemy's
+        # get_columns reads column defaults (incl. SERIAL nextval) from.
+        return args[0] if args else None
+    if name == "pg_get_serial_sequence":
+        # No serial-sequence resolution surface.
         return None
     if name == "regexp_matches":
         # Postgres regexp_matches is set-returning; in a scalar context we return
@@ -3176,6 +3204,16 @@ def _json_typeof(value: Any) -> str | None:
     return None
 
 
+#: format_type() spellings for the modifier-bearing oids the storage tags fold
+#: away (varchar/bpchar store as text) — everything else renders its tag name.
+_TYPMOD_TYPENAMES: dict[int, str] = {
+    1042: "character",
+    1043: "character varying",
+    1560: "bit",
+    1562: "bit varying",
+}
+
+
 def _format_type(typid: Any, typmod: Any) -> str | None:
     if typid is None:
         return None
@@ -3183,7 +3221,27 @@ def _format_type(typid: Any, typmod: Any) -> str | None:
         oid = int(typid)
     except (TypeError, ValueError):
         return str(typid)
-    return _OID_TO_TYPENAME.get(oid, "???")
+    base = _TYPMOD_TYPENAMES.get(oid) or _OID_TO_TYPENAME.get(oid, "???")
+    try:
+        mod = int(typmod)
+    except (TypeError, ValueError):
+        mod = -1
+    if mod == -1:
+        return base
+    # Render the modifier the way real format_type() does per type family.
+    if oid in (1042, 1043):  # bpchar / varchar carry length + 4
+        return f"{base}({mod - 4})"
+    if oid == 1700:  # numeric: ((precision << 16) | scale) + 4
+        m = mod - 4
+        return f"{base}({(m >> 16) & 0xFFFF},{m & 0x7FF})"
+    if oid in (1560, 1562):  # bit / varbit carry the length verbatim
+        return f"{base}({mod})"
+    if oid in (1083, 1114, 1184, 1186, 1266):
+        # time/timestamp precision goes before the zone suffix:
+        # ``timestamp(2) without time zone``.
+        head, _, tail = base.partition(" ")
+        return f"{head}({mod}) {tail}" if tail else f"{base}({mod})"
+    return base
 
 
 def _lookup_inner_table(ctx: ScalarContext, table_node: exp.Table) -> Any:
@@ -3312,7 +3370,7 @@ def _cmp_ge(a: Any, b: Any) -> bool:
     return a >= b
 
 
-def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
+def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext, escape: Any = None) -> Any:
     import re
 
     from secantus.sql.planner import _like_to_regex
@@ -3322,7 +3380,8 @@ def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
     if val is None or pattern is None:
         return None
     flags = re.IGNORECASE if isinstance(node, exp.ILike) else 0
-    return re.match(_like_to_regex(_as_text(pattern)), _as_text(val), flags) is not None
+    esc = _as_text(escape) if escape is not None else None
+    return re.match(_like_to_regex(_as_text(pattern), escape=esc), _as_text(val), flags) is not None
 
 
 def _eval_regexp(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
