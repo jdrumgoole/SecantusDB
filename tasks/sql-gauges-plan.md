@@ -7,9 +7,10 @@
 `docs/validation-report-psycopg.md`) are committed tooling; the §6 results log
 below records how they got there. Slice zero (§2) shipped along the way.
 G6 (SQLAlchemy's dialect-compliance suite — `invoke validate-sqlalchemy`,
-weekly in CI) landed 2026-07-31 at 572/738 (77.5%) and climbed to **713/735
-(97.0%, zero errors)** the same day after the reflection / temp-table /
-LIKE-ESCAPE / numeric-division rounds below.
+weekly in CI) landed 2026-07-31 at 572/738 (77.5%) and reached **731/731
+executed tests passing (100%, zero failures, zero errors)** the same day —
+capabilities honestly declared (`datetime_microseconds` closed for the BSON
+millisecond divergence) — after the rounds below.
 Outstanding: the G1 `postgres-extended` second lane and gauges G3–G5 / G7
 (per-item status in §5). This document plans the SQL/Postgres
 analogue of the thirteen MongoDB driver gauges: comprehensive **external,
@@ -284,9 +285,18 @@ suites refuse to run *anything*:
    ships inside the sqlalchemy package) over `postgresql+psycopg` against a
    daemon server, with capability declarations in
    `sqlalchemy_validation/requirements.py` (`schemas` closed — tables aren't
-   namespaced per schema; see backlog). Baseline 572 P / 166 F (77.5%); now **713
-   passed / 22 failed / 680 skipped (97.0%, zero errors)**, weekly in
-   `validate.yml`, `docs/validation-report-sqlalchemy.md`. The climb came
+   namespaced per schema; see backlog). Baseline 572 P / 166 F (77.5%); now **731
+   passed / 0 failed / 679 skipped (100%)**, weekly in `validate.yml`,
+   `docs/validation-report-sqlalchemy.md`. The second round closed the
+   residual tail: FROM-less `WHERE EXISTS`, parenthesized union arms with
+   ORDER BY/LIMIT, set-operation / VALUES / FROM-less derived tables (the
+   insertmanyvalues sentinel shape), scalar subqueries that honor ORDER
+   BY/LIMIT (previously a silent wrong-answer), `nextval()` (any constant
+   expression) in INSERT VALUES, `INSERT … DEFAULT VALUES`, covering-index
+   INCLUDE metadata + reflection, and `CREATE SEQUENCE NO MINVALUE`.
+   `datetime_microseconds` is declared closed — BSON datetimes are int64
+   milliseconds and the dual-protocol document view is the product; the same
+   switch MySQL-family dialects close. The climb came
    from: temp-table reflection semantics (relpersistence 't', session-scoped
    visibility via `pg_table_is_visible` → own-session `Session.temp_tables`,
    drop at connection teardown), typmod fidelity (`Column.decl_oid`/`typmod`
@@ -304,12 +314,9 @@ suites refuse to run *anything*:
    correctness bug — a table-level ``CONSTRAINT <name> PRIMARY KEY`` was
    silently dropped (no `_id` mapping, no uniqueness); the declared PK name is
    now honored end-to-end (enforcement, reflection, duplicate-key messages).
-   The remaining 22 are a residual tail (see the backlog entry): the
-   insertmanyvalues sentinel shape (`INSERT … SELECT p0 FROM (VALUES …) AS
-   alias(p0, c) ORDER BY c`), LIMIT/OFFSET inside union arms, FROM-less
-   `SELECT … WHERE EXISTS`, DateTimeMicroseconds (the documented BSON
-   millisecond-precision divergence), covering-index INCLUDE reflection,
-   DISTINCT ON, scalar-subquery-in-row fetch, and sequence lastrowid.
+   Nothing is deselected; the two DateTimeMicroseconds tests skip via the
+   closed `datetime_microseconds` capability (the one declared storage
+   divergence, tracked in the backlog).
 
 Mechanics mirror the existing gauges throughout: daemon `SecantusPGServer`
 subprocess on an ephemeral port (ad-hoc reproducers on `127.0.0.1:55432` per

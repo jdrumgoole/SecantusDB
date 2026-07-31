@@ -228,3 +228,81 @@ class TestReflectionSurfaces:
         with pytest.raises(SQLError) as exc:
             run(storage, session, "SELECT id FROM le WHERE data LIKE 'x' ESCAPE 'ab'")
         assert exc.value.sqlstate == "22025"
+
+
+class TestFromlessAndDerived:
+    """Round two of the gauge fixes: FROM-less EXISTS, parenthesized union
+    arms, set-op / VALUES / FROM-less derived tables, ordered scalar
+    subqueries, nextval in VALUES, INCLUDE covering indexes."""
+
+    @pytest.fixture(autouse=True)
+    def _table(self, storage, session):
+        run(storage, session, "CREATE TABLE st (id int primary key, x int)")
+        run(storage, session, "INSERT INTO st VALUES (1, 10), (2, 20), (3, 30)")
+
+    def test_fromless_where_exists(self, storage, session):
+        assert rows(storage, session, "SELECT 1 WHERE EXISTS (SELECT * FROM st)") == [(1,)]
+        assert rows(storage, session, "SELECT 1 WHERE EXISTS (SELECT * FROM st WHERE x = 99)") == []
+
+    def test_parenthesized_union_arms_with_limit(self, storage, session):
+        assert rows(
+            storage,
+            session,
+            "(SELECT id FROM st ORDER BY id LIMIT 1) UNION "
+            "(SELECT id FROM st ORDER BY id DESC LIMIT 1) ORDER BY id",
+        ) == [(1,), (3,)]
+
+    def test_setop_derived_table(self, storage, session):
+        assert rows(
+            storage,
+            session,
+            "SELECT a.id FROM (SELECT id FROM st WHERE id = 2 "
+            "UNION SELECT id FROM st WHERE id = 3) AS a ORDER BY a.id",
+        ) == [(2,), (3,)]
+
+    def test_values_derived_table(self, storage, session):
+        assert rows(storage, session, "SELECT v.a FROM (VALUES (2), (1)) AS v(a) ORDER BY v.a") == [
+            (1,),
+            (2,),
+        ]
+
+    def test_fromless_derived_table(self, storage, session):
+        assert rows(storage, session, "SELECT a.x FROM (SELECT 1 AS x) AS a") == [(1,)]
+
+    def test_scalar_subquery_honors_order_and_limit(self, storage, session):
+        assert rows(
+            storage,
+            session,
+            "SELECT (SELECT st.id FROM st ORDER BY st.id DESC LIMIT 1) AS m",
+        ) == [(3,)]
+
+    def test_scalar_subquery_multiple_rows_errors(self, storage, session):
+        with pytest.raises(SQLError) as exc:
+            run(storage, session, "SELECT (SELECT st.id FROM st ORDER BY st.id LIMIT 2) AS m")
+        assert exc.value.sqlstate == "21000"
+
+    def test_insert_select_from_aliased_values(self, storage, session):
+        run(storage, session, "CREATE TABLE ft (id SERIAL PRIMARY KEY, v float)")
+        res = run(
+            storage,
+            session,
+            "INSERT INTO ft (v) SELECT p0::FLOAT FROM (VALUES (1.5, 0), (0.5, 1)) "
+            "AS sen(p0, c) ORDER BY c RETURNING ft.id, ft.v",
+        )
+        assert res.rows == [(1, 1.5), (2, 0.5)]
+
+    def test_nextval_in_insert_values(self, storage, session):
+        run(storage, session, "CREATE SEQUENCE tab_seq START 50")
+        run(storage, session, "CREATE TABLE sq (id int primary key, d text)")
+        res = run(storage, session, "INSERT INTO sq VALUES (nextval('tab_seq'), 'x') RETURNING id")
+        assert res.rows == [(50,)]
+
+    def test_covering_index_include_reflection(self, storage, session):
+        run(storage, session, "CREATE INDEX st_x ON st (x) INCLUDE (id)")
+        got = rows(
+            storage,
+            session,
+            "SELECT i.indnkeyatts, i.indnatts FROM pg_index i "
+            "JOIN pg_class c ON i.indexrelid = c.oid WHERE c.relname = 'st_x'",
+        )
+        assert got == [(1, 2)]

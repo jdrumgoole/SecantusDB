@@ -3297,6 +3297,37 @@ def _eval_subquery(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> An
     otherwise it's the projection of the first matching row, else NULL.
     Correlation falls through to the outer scope."""
     select = _subquery_select(node)
+    # A non-correlated subquery that carries ORDER BY / LIMIT / GROUP BY /
+    # joins runs through the engine — the simple row-scope walk below ignores
+    # ordering, which silently returns the wrong row for
+    # ``(SELECT id FROM t ORDER BY id DESC LIMIT 1)``.
+    if (
+        isinstance(select, exp.Select)
+        and getattr(ctx, "storage", None) is not None
+        and getattr(ctx, "session", None) is not None
+        and (
+            select.args.get("order")
+            or select.args.get("limit")
+            or select.args.get("offset")
+            or select.args.get("group")
+            or select.args.get("joins")
+        )
+    ):
+        from secantus.sql import planner as _planner
+
+        if not _planner._subquery_has_outer_ref(select):
+            from secantus.sql import engine as _engine
+
+            try:
+                res = _engine._run_query(select, ctx.storage, ctx.db, ctx.catalog, ctx.session)
+            except errors.SQLError:
+                res = None  # fall back to the row-scope walk below
+            if res is not None:
+                if len(res.rows) > 1:
+                    raise errors.SQLError(
+                        "21000", "more than one row returned by a subquery used as an expression"
+                    )
+                return res.rows[0][0] if res.rows else None
     proj = select.expressions[0]
     target = proj.this if isinstance(proj, exp.Alias) else proj
     if isinstance(target, exp.Count):

@@ -60,6 +60,20 @@ class Requirements(SuiteRequirements):
         return exclusions.open()
 
     @property
+    def datetime_microseconds(self):
+        # BSON datetimes are int64 milliseconds — the shared document store
+        # (the dual-protocol view is the product) can't hold sub-millisecond
+        # precision without a storage-representation change. The same switch
+        # MySQL-family dialects close. tasks/backlog.md tracks the divergence.
+        return exclusions.closed()
+
+    @property
+    def supports_distinct_on(self):
+        # DISTINCT ON is implemented (evaluated path keeps the first row per
+        # key in ORDER BY order).
+        return exclusions.open()
+
+    @property
     def index_reflects_included_columns(self):
         # get_indexes returns include_columns (the postgres dialect always
         # emits it; INCLUDE columns themselves reflect as empty lists).

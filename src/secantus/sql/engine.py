@@ -1312,10 +1312,13 @@ def _describe_statement(
         # RowDescription by reporting NoData here.
         return None
     if isinstance(stmt, exp.SetOperation):
-        # A set operation's result shape is its first arm's (descend chained ops).
+        # A set operation's result shape is its first arm's (descend chained
+        # ops; a parenthesized arm parses as a Subquery wrapper).
         arm = stmt
         while isinstance(arm, exp.SetOperation):
             arm = arm.left
+        if isinstance(arm, exp.Subquery) and arm.this is not None:
+            arm = arm.this
         return _describe_statement(storage, db, arm, session, catalog)
     if isinstance(stmt, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
         # A DML statement with RETURNING emits DataRows at Execute, so Describe
@@ -1364,7 +1367,9 @@ def _describe_statement(
         if srf_plan.count_star:
             return [ColumnDesc(srf_plan.count_alias, "int8", typemap.PG_OID["int8"])]
         return executor._out_column_descs(srf_plan.out_columns, storage, db)
-    if table_node is None:
+    if table_node is None or stmt.args.get("from_") is None:
+        # find() descends into subqueries — a FROM-less outer SELECT (WHERE
+        # EXISTS …) describes via the constant path, same as _run_select.
         plan = planner.plan_constant_select(stmt, session, storage, catalog, db)
         oids = plan.pg_oids or [None] * len(plan.columns)
         typmods = plan.typmods or [-1] * len(plan.columns)
@@ -2113,14 +2118,23 @@ def _run_select(
         return _run_srf_select(srf_source, stmt, storage, db, catalog, session)
 
     table_node = stmt.find(exp.Table)
-    if table_node is None:
+    # ``find`` descends into subqueries — a FROM-less outer SELECT whose WHERE
+    # contains ``EXISTS (SELECT … FROM t)`` still takes the constant path (the
+    # scalar evaluator runs the subquery with the real storage in scope). A
+    # table-less FROM (``FROM (VALUES …) AS alias(cols)``) is a derived table,
+    # routed through the pipeline path below.
+    from_node = stmt.args.get("from_")
+    if from_node is None or (
+        table_node is None and not isinstance(from_node.this, (exp.Subquery, exp.Values))
+    ):
         return executor.execute_constant_select(
             planner.plan_constant_select(stmt, session, storage, catalog, db)
         )
 
     # A WITH NO DATA materialized view is not scannable until its first REFRESH.
     if (
-        not table_node.args.get("db")
+        table_node is not None
+        and not table_node.args.get("db")
         and catalog.get_matview(db, table_node.name) is not None
         and not catalog.matview_populated(db, table_node.name)
     ):
@@ -2248,7 +2262,11 @@ def _run_insert(
             )
         plan = planner.plan_insert_rows(stmt, table, result.rows)
     else:
-        plan = planner.plan_insert(stmt, table)
+        plan = planner.plan_insert(
+            stmt,
+            table,
+            planner.SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session),
+        )
     plan.check_option = check_option
     return executor.execute_insert(plan, storage, db, catalog, session)
 
@@ -2275,6 +2293,11 @@ def _run_query(
         return _run_select(node, storage, db, catalog, session)
     if isinstance(node, exp.Values):
         return _run_values(node, storage, db, catalog, session)
+    if isinstance(node, exp.Subquery) and node.this is not None:
+        # A parenthesized arm — ``(SELECT … ORDER BY … LIMIT 1) UNION …`` —
+        # parses as a Subquery wrapper; its ORDER BY / LIMIT apply within the
+        # arm, exactly what running the inner query yields.
+        return _run_query(node.this, storage, db, catalog, session)
     raise errors.feature_not_supported(f"unsupported set-operation arm: {type(node).__name__}")
 
 

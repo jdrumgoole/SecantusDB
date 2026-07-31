@@ -199,12 +199,21 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
             indkey = [field_to_attnum.get(f) for f in key]
             if not indkey or any(a is None for a in indkey):
                 continue  # index over a non-column field — not reflectable as SQL
+            nkeyatts = len(indkey)
+            # ``INCLUDE (cols)`` covering columns ride indkey beyond
+            # indnkeyatts, exactly how real pg_index encodes them.
+            for inc in ix.get("include") or []:
+                col = t.column(inc)
+                attnum = field_to_attnum.get(col.field) if col is not None else None
+                if attnum is not None:
+                    indkey.append(attnum)
             out.append(
                 {
                     "indexrelid": oid,
                     "indrelid": relid,
                     "relname": ix["name"],
                     "indkey": indkey,
+                    "nkeyatts": nkeyatts,
                     "unique": bool(ix.get("unique")),
                     "primary": False,
                     "conname": None,
@@ -244,11 +253,17 @@ _INDEX_RELATION_KEYS = (
 )
 
 
+def _relation_row(ix: dict[str, Any]) -> dict[str, Any]:
+    row = {k: ix[k] for k in _INDEX_RELATION_KEYS}
+    row["nkeyatts"] = ix.get("nkeyatts", len(ix["indkey"]))
+    return row
+
+
 def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
     """The pg_index / pg_class / pg_constraint projection of :func:`_indexes` — a
     stable ``indexrelid``, its table ``indrelid``, the ``indkey`` attnum array, and
     unique/primary flags. (Kept as the historical shape those builders consume.)"""
-    return [{k: ix[k] for k in _INDEX_RELATION_KEYS} for ix in _indexes(db, storage, catalog)]
+    return [_relation_row(ix) for ix in _indexes(db, storage, catalog)]
 
 
 def indexdef_for_oid(db: str, storage: Any, catalog: Catalog, oid: int) -> str | None:
@@ -2107,7 +2122,7 @@ def _pg_index(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "indclass": [_DEFAULT_OPCLASS_OID] * n,
                 "indoption": [0] * n,
                 "indnatts": n,
-                "indnkeyatts": n,
+                "indnkeyatts": ix.get("nkeyatts", n),
                 "indisunique": ix["unique"],
                 "indisprimary": ix["primary"],
                 "indnullsnotdistinct": False,
