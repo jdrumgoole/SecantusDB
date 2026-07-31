@@ -157,10 +157,22 @@ throughput — see the Measured section.
 
 ## Remaining work before this is more than a prototype
 
-- **Config surface.** Currently an env flag (`SECANTUS_OPLOG_ASYNC`) + an env cap
-  override (`SECANTUS_OPLOG_ASYNC_CAP_BYTES`). Promote to an
-  explicit `RustServer(oplog_async=…)` / `secantusd-rs --async-oplog` option with the
-  durability trade documented at the call site.
+Productization landed (Phase C of the concurrency-parity plan):
+
+- ~~**Config surface.**~~ DONE — `StorageOptions` on the storage crate;
+  `RustServer(oplog_async=…, oplog_nonlogged=…, data_nonlogged=…,
+  checkpoint_seconds=…)` kwargs; `secantusd-rs --oplog-async /
+  --oplog-nonlogged / --data-nonlogged / --checkpoint-seconds` +
+  `[storage]` TOML keys. `None`/unset defers to the `SECANTUS_*` env vars.
+- ~~**`prune_oplog` under async:**~~ DONE — `drain_pending_oplog` mirrors the
+  sync emit path's every-`OPLOG_PRUNE_INTERVAL` opportunistic prune on the
+  committing writer's thread (best-effort, after the batch handoff).
+- ~~**Backup drain:**~~ DONE — `create_archive` calls `flush_oplog()` before
+  its checkpoint so an archive's manifest never misses acknowledged writes
+  still queued at the drainer.
+
+Still open:
+
 - **Read-after-write oplog reads.** Direct `read_oplog` / `oplog_tail_seq` callers
   that assume synchronous visibility (several unit tests, some admin paths) must call
   `flush_oplog()` first in async mode; today they race the drainer (the async-mode
@@ -169,7 +181,6 @@ throughput — see the Measured section.
 - **DDL that manages its own transaction** (outside `with_statement_txn`) would drain
   immediately, i.e. enqueue before its own commit — audit those paths (rare; not hit
   by CRUD or the gauges) and route them through the buffered path or keep them sync.
-- **`prune_oplog` under async:** opportunistic prune no longer fires from the write
-  path (it lived in the synchronous emit); move it into the drainer or a timer.
-- **Gauge + parity** under the flag, and a `SECANTUS_OPLOG_ASYNC=1` CI lane, before
-  it could ever become a default.
+- **Parity CI lane** (`SECANTUS_OPLOG_ASYNC=1`) before the mode could ever become a
+  default. (The pymongo gauge has been run under `oplog_async=True` +
+  `oplog_nonlogged=True` — see the changelog entry for the Phase C slice.)

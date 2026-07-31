@@ -23,6 +23,10 @@ Both `--flag value` and `--flag=value` spellings work.
 | `--cache-size SIZE` | WiredTiger cache, unit-suffixed (`256M`, `1G`, `8G`) | `1G` |
 | `--session-max N` | Max concurrent WiredTiger sessions (≈ client connections) | `1000` |
 | `--sync-on-commit` | fsync every commit (closes the `j: true` gap; large throughput cost) | off |
+| `--oplog-async` | Persist oplog entries via a background drainer pool instead of inside each write's commit (higher write throughput; change-stream events surface once drained) | off, or `SECANTUS_OPLOG_ASYNC` |
+| `--oplog-nonlogged` | Create oplog tables `log=(enabled=false)` — checkpoint-durable only; a crash can lose the oplog tail | off, or `SECANTUS_OPLOG_NONLOGGED` |
+| `--data-nonlogged` | mongod's split: WAL-log only the oplog; data tables recover by oplog replay from the last stable checkpoint (see [Recovery](recovery.md)) | off, or `SECANTUS_DATA_NONLOGGED` |
+| `--checkpoint-seconds N` | Stable-checkpoint cadence for `--data-nonlogged` | `60`, or `SECANTUS_CHECKPOINT_SECONDS` |
 | `--auth` | Require SCRAM authentication on every non-handshake command | off |
 | `--standalone` | Advertise a plain standalone `hello` instead of the single-node replica-set persona (disables change-stream topology, matters for drivers that gate on `isReplicaSet`) | off |
 | `--noop-heartbeat-seconds N` | Periodic oplog no-op so cluster time advances while idle (mongod default is 10s) | `0` (disabled) |
@@ -48,7 +52,10 @@ Both MongoDB-wire daemons (`secantusd-py` and `secantusd-rs`) read the same
 3. `/etc/secantus/secantusd.toml` (system-wide)
 
 or passed explicitly with `--config`. Every key is optional; explicit CLI
-flags override the file. The sections mirror the flags:
+flags override the file. The sections mirror the flags (a handful of keys
+are Rust-daemon-only — the commented `[storage]` modes below — and the
+Python daemon rejects them, so keep them out of a `secantusd.toml` shared
+with `secantusd-py`):
 
 ```toml
 [server]
@@ -69,6 +76,11 @@ noop_heartbeat_seconds = 0.0
 cache_size = "1G"
 session_max = 1000
 sync_on_commit = false
+# Rust-daemon-only storage modes (secantusd-py rejects these keys):
+# oplog_async = true
+# oplog_nonlogged = true
+# data_nonlogged = true
+# checkpoint_seconds = 60
 
 # [tls]
 # cert_file = "/etc/letsencrypt/live/db.example.com/fullchain.pem"

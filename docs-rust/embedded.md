@@ -31,17 +31,36 @@ RustServer(
     storage_path,                  # WiredTiger home; created if absent
     port=0,                        # 0 = OS-assigned
     host="127.0.0.1",
-    replica_set_name=None,         # None = single-node RS persona "secantus";
-                                   # pass a name to override, or use the
-                                   # standalone persona via the daemon flag
+    replica_set_name=None,         # None = plain standalone hello; pass
+                                   # "secantus" to advertise the single-node
+                                   # replica-set persona (change streams
+                                   # need it)
     enable_oplog=True,             # oplog + change streams
     require_auth=False,            # SCRAM required on every command
     tls_cert_file=None,            # server TLS (pair with tls_key_file)
     tls_key_file=None,
     tls_ca_file=None,              # mTLS client-cert verification
     tls_require_client_cert=False,
+    cache_size="4G",               # WiredTiger cache cap (filled lazily)
+    session_max=1000,              # WiredTiger session cap
+    sync_on_commit=False,          # fsync every commit (j:true semantics)
+    oplog_async=None,              # background oplog drainer pool
+    oplog_nonlogged=None,          # oplog tables log=(enabled=false)
+    data_nonlogged=None,           # WAL-log only the oplog; data tables
+                                   # recover by replay from the last
+                                   # stable checkpoint (mongod's split)
+    checkpoint_seconds=None,       # stable-checkpoint cadence (default 60)
 )
 ```
+
+The four storage-mode kwargs default to `None` = defer to the matching
+`SECANTUS_*` env var (`SECANTUS_OPLOG_ASYNC`, `SECANTUS_OPLOG_NONLOGGED`,
+`SECANTUS_DATA_NONLOGGED`, `SECANTUS_CHECKPOINT_SECONDS`), so env-driven
+workflows are unchanged; an explicit value wins over the environment for
+this server only. The table-config modes (`oplog_nonlogged`,
+`data_nonlogged`) are create-time-sticky: they shape fresh stores, and an
+existing store keeps the mode it was created with (`data_nonlogged` is
+recorded in the store and always wins on reopen).
 
 Properties and methods: `srv.address` → `(host, port)` tuple, `srv.version`
 → the embedded crate version (also surfaced over the wire as

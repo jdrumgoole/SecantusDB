@@ -2322,3 +2322,47 @@ def test_multikey_dotted_array_index_against_rust_server(tmp_path) -> None:
         assert ixscan.get("isMultiKey") is True
     finally:
         srv.stop()
+
+
+def test_storage_mode_kwargs_end_to_end(tmp_path, monkeypatch) -> None:
+    """Phase C: the async/nonlogged stack engages from RustServer kwargs alone —
+    no SECANTUS_* env vars — and stays pymongo-clean end-to-end (writes, reads,
+    and a change stream whose events surface once the drainer persists them)."""
+    for var in ("SECANTUS_OPLOG_ASYNC", "SECANTUS_OPLOG_NONLOGGED"):
+        monkeypatch.delenv(var, raising=False)
+    srv = _server.RustServer(
+        str(tmp_path / "wt"),
+        0,
+        replica_set_name="secantus",  # change streams need the replset persona
+        oplog_async=True,
+        oplog_nonlogged=True,
+    )
+    try:
+        coll = _client(srv)["t"]["c"]
+        with coll.watch() as stream:
+            coll.insert_many([{"_id": i, "x": i} for i in range(20)])
+            events = [stream.next() for _ in range(20)]
+        assert [e["documentKey"]["_id"] for e in events] == list(range(20))
+        assert all(e["operationType"] == "insert" for e in events)
+        assert coll.count_documents({}) == 20
+    finally:
+        srv.stop()
+
+
+def test_checkpoint_seconds_kwarg_accepted(tmp_path, monkeypatch) -> None:
+    """data_nonlogged + checkpoint_seconds kwargs open, serve, and survive a
+    clean restart (mode recorded in the store, not the environment)."""
+    monkeypatch.delenv("SECANTUS_DATA_NONLOGGED", raising=False)
+    home = str(tmp_path / "wt")
+    srv = _server.RustServer(home, 0, data_nonlogged=True, checkpoint_seconds=3600)
+    try:
+        coll = _client(srv)["t"]["c"]
+        coll.insert_many([{"_id": i} for i in range(10)])
+    finally:
+        srv.stop()
+    # Reopen with no mode kwargs: the recorded mode wins; data intact.
+    srv = _server.RustServer(home, 0)
+    try:
+        assert _client(srv)["t"]["c"].count_documents({}) == 10
+    finally:
+        srv.stop()
