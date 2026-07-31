@@ -41,3 +41,6 @@
 	path = vendor/sqllogictest
 	url = https://github.com/gregrahn/sqllogictest.git
 	shallow = true
+[submodule "vendor/pgx"]
+	path = vendor/pgx
+	url = https://github.com/jackc/pgx

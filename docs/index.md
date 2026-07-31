@@ -238,6 +238,7 @@ validation-report-dotnet
 validation-report-psycopg
 validation-report-slt
 validation-report-sqlalchemy
+validation-report-pgx
 validation-report-rust-server
 validation-report-pymongo-async-rust-server
 validation-report-go-rust-server

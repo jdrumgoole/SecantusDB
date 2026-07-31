@@ -920,6 +920,34 @@ def validate_sqlalchemy(c: Context) -> None:
     print("\nWrote docs/validation-report-sqlalchemy.md")
 
 
+@task(name="validate-pgx")
+def validate_pgx(c: Context) -> None:
+    """Run jackc/pgx's pgconn + pgproto3 tests against a SecantusPGServer daemon.
+
+    The SQL-server low-level Go gauge (tasks/sql-gauges-plan.md G4): the
+    strictest hand-rolled pgwire client, run unmodified from vendor/pgx via
+    PGX_TEST_DATABASE. Requires the Go toolchain. Generates
+    docs/validation-report-pgx.md. Python server only.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/pgx/pgconn").exists():
+        c.run("git submodule update --init vendor/pgx", pty=True)
+    _run_gauge(
+        c,
+        module="pgx_validation.runner",
+        raw=".validation/pgx-raw.json",
+        report="docs/validation-report-pgx.md",
+        hint="A missing `vendor/pgx` submodule, missing `go`, or PG-server startup failure is the usual cause.",
+    )
+    c.run(
+        "uv run --no-sync python -m pgx_validation.generate_report "
+        ".validation/pgx-raw.json docs/validation-report-pgx.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-pgx.md")
+
+
 @task(name="validate-slt")
 def validate_slt(c: Context) -> None:
     """Run the sqllogictest corpus against a SecantusPGServer daemon.

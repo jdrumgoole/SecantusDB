@@ -276,8 +276,14 @@ suites refuse to run *anything*:
    runner + testdata (sparse checkout or a small extraction repo given
    monorepo size — decide at implementation; license note in vendor README),
    `invoke validate-pgwire`.
-5. **G4 pgx**, then **G5 Npgsql or pgjdbc** — ❌ not started (pick by which
-   catalog gaps §2 surfaces first).
+5. **G4 pgx** — ✅ landed (2026-07-31): `invoke validate-pgx` runs the
+   vendored `vendor/pgx` (v5.9.2) `pgconn` + `pgproto3` packages unmodified
+   via `PGX_TEST_DATABASE`, weekly in `validate.yml` (shares the go gauge's
+   toolchain step). Baseline: **291 P / 87 F / 22 S (77.0%)** — pgproto3
+   codecs 99.4%, pgconn 55.7% with two clear clusters (pipeline mode, i.e.
+   Sync-less extended-protocol batching, and the CancelRequest context
+   watcher). `docs/validation-report-pgx.md`. **G5 Npgsql or pgjdbc** — ❌
+   not started (pick by which catalog gaps the pgx clusters surface first).
 6. **G7 SQLsmith + pgbench** as always-on stress/smoke (`invoke sql-stress`) —
    ❌ not started; both need binaries not in the dev env (SQLsmith build,
    pgbench from a Postgres install).
