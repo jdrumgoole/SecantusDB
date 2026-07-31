@@ -76,7 +76,7 @@ def _run_nested_pytest(
     )
 
 
-@pytest.mark.timeout(240)
+@pytest.mark.timeout(300)
 def test_stall_fails_fast_with_stacks(tmp_path: Path) -> None:
     """A session that stops reporting exits non-zero WITH stacks.
 
@@ -114,7 +114,7 @@ def test_stall_fails_fast_with_stacks(tmp_path: Path) -> None:
     assert "no worker reported going down" in combined, combined
 
 
-@pytest.mark.timeout(240)
+@pytest.mark.timeout(300)
 def test_healthy_session_is_untouched(tmp_path: Path) -> None:
     """A run that keeps reporting is never killed, even with a tight limit.
 
@@ -185,7 +185,7 @@ def test_stall_trigger_decision_logic() -> None:
     assert overrun is not None and "post-crash overrun" in overrun
 
 
-@pytest.mark.timeout(240)
+@pytest.mark.timeout(300)
 def test_worker_crash_is_captured_immediately(tmp_path: Path) -> None:
     """A crashed xdist worker dumps its reason at once — not only if a stall follows.
 
@@ -256,9 +256,17 @@ def _run_nested_with_fault_dir(
     fault_dir: Path,
     xdist: bool,
     max_worker_restart: str = "0",
-    timeout: int = 120,
+    timeout: int = 200,
 ) -> subprocess.CompletedProcess[str]:
-    """Nested pytest session with ``SECANTUS_FAULTHANDLER_DIR`` armed."""
+    """Nested pytest session with ``SECANTUS_FAULTHANDLER_DIR`` armed.
+
+    The nested-run budget (200s) needs real headroom over the seconds it
+    takes on an idle box: under the full 12-worker parallel suite this test's
+    nested ``pytest -n 2`` (its own workers + embedded servers) can be
+    CPU-starved for minutes before printing a summary — the 120s it used to
+    get produced release-blocking TimeoutExpired flakes with 5044 green
+    tests around them. The outer ``@pytest.mark.timeout(300)`` marks leave
+    room for this budget plus the post-kill summary parse."""
     (tmp_path / "conftest.py").write_text(_CONFTEST_UNDER_TEST.read_text())
     (tmp_path / "test_nested.py").write_text(textwrap.dedent(body))
     env = dict(os.environ)
