@@ -237,6 +237,7 @@ sdist.exclude = [
     "sqlalchemy_validation/**",
     "vendor/pgx/**",
     "pgx_validation/**",
+    "sqlstress_validation/**",
     ".validation/**",
     # brandkit/ is marketing content (logos, brand-guide HTML); not
     # needed at install or run time. The docs that need it pull from

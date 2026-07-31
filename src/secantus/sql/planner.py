@@ -575,6 +575,28 @@ _CMP_OPS: dict[type, tuple[str, str]] = {
 }
 
 
+_EXPLICIT_OPERATORS = {
+    "~": exp.RegexpLike,
+    "~*": exp.RegexpILike,
+}
+
+
+def _rewrite_explicit_operator(node: exp.Operator) -> exp.Expression | None:
+    """``a OPERATOR(pg_catalog.~) b`` (psql's ``\\d`` family emits it) → the
+    equivalent regex node; a COLLATE wrapper on the pattern is dropped (the
+    default collation changes nothing here). Unknown operators return None."""
+    op = str(node.args.get("operator") or "").rsplit(".", 1)[-1]
+    negated = op.startswith("!")
+    cls = _EXPLICIT_OPERATORS.get(op.lstrip("!"))
+    if cls is None:
+        return None
+    rhs = node.expression
+    if isinstance(rhs, exp.Collate):
+        rhs = rhs.this
+    out: exp.Expression = cls(this=node.this, expression=rhs)
+    return exp.Not(this=out) if negated else out
+
+
 def _like_to_regex(pattern: str, escape: str | None = None) -> str:
     """Translate a SQL LIKE pattern to an anchored regex.
 
@@ -1314,6 +1336,10 @@ def _expr_to_filter(
         high = typemap.coerce(_literal(node.args["high"]), tag)
         return {field: {"$gte": low, "$lte": high}}
 
+    if isinstance(node, exp.Operator):
+        rewritten = _rewrite_explicit_operator(node)
+        if rewritten is not None:
+            return _expr_to_filter(rewritten, resolve, subctx)
     if isinstance(node, exp.Escape) and isinstance(node.this, (exp.Like, exp.ILike)):
         # ``LIKE <pattern> ESCAPE <char>`` — same lowering with the escape
         # character honored in the regex translation.
@@ -6508,6 +6534,11 @@ class _OnTranslator:
         if isinstance(node, exp.EQ) and isinstance(node.expression, exp.Any):
             elems = [self.expr(e) for e in _array_elements(node.expression.this)]
             return {"$in": [self.expr(node.this), elems]}
+        # ``col IN ('p', 'u', 'x')`` — same $in lowering (psql's ``\\d`` index
+        # listing joins pg_constraint with a literal IN list).
+        if isinstance(node, exp.In) and node.args.get("expressions"):
+            elems = [self.expr(e) for e in node.args["expressions"]]
+            return {"$in": [self.expr(node.this), elems]}
         for cls, op in self._OPS.items():
             if isinstance(node, cls):
                 return {op: [self.expr(node.this), self.expr(node.expression)]}
@@ -9956,6 +9987,10 @@ _SET_TRANSACTION_RE = re.compile(
 )
 
 # A LISTEN / NOTIFY / UNLISTEN statement head (single statement only).
+_MULTI_DROP_TABLE_RE = re.compile(
+    r"(?is)^\s*DROP\s+TABLE\s+(?P<if_exists>IF\s+EXISTS\s+)?"
+    r"(?P<names>[^;]+?)\s*;?\s*$"
+)
 _PUBSUB_HEAD_RE = re.compile(r"^\s*(?:LISTEN|UNLISTEN|NOTIFY)\b[^;]*;?\s*$", re.IGNORECASE)
 
 # ``COMMENT ON CONSTRAINT c ON t IS '…'`` — sqlglot's Comment node can't
@@ -10145,6 +10180,16 @@ def parse(sql: str) -> list[exp.Expression]:
     # them pre-parse; this covers the extended-protocol Parse path.)
     if _PUBSUB_HEAD_RE.match(sql):
         return [exp.Command(this="PUBSUB", expression=exp.Literal.string(sql))]
+    multi_drop = _MULTI_DROP_TABLE_RE.match(sql)
+    if multi_drop is not None and "," in multi_drop.group("names"):
+        # ``DROP TABLE [IF EXISTS] a, b, c`` — sqlglot can't parse the
+        # multi-name form (pgbench -i emits it); expand to one DROP per name.
+        head = "DROP TABLE " + ("IF EXISTS " if multi_drop.group("if_exists") else "")
+        return [
+            sqlglot.parse_one(head + name.strip(), read="postgres")
+            for name in multi_drop.group("names").split(",")
+            if name.strip()
+        ]
     if COMMENT_CONSTRAINT_RE.match(sql):
         return [exp.Command(this="COMMENT_CONSTRAINT", expression=exp.Literal.string(sql))]
     # ``DO $$ … $$ [language plpgsql]`` — the body is handled by the engine's

@@ -2360,6 +2360,15 @@ shared storage engine or building large new protocol subsystems:
   client-abort detection during a streamed COPY OUT.
 - [ ] **`test_return_untyped[b]` / DatatypeMismatch.** A binary untyped
   parameter used in a context that PG rejects with 42804 — niche.
+- [ ] **Write-conflict retry semantics (40001 under contention)**: concurrent
+  writers to the same row surface WiredTiger's optimistic write conflict as a
+  PG-SERIALIZABLE-style `40001 could not serialize access` instead of real
+  PG's READ COMMITTED block-and-proceed. Clients that retry (pgbench 15+
+  `--max-tries`, retry-loop applications) behave correctly; ones that treat
+  40001 as fatal abort. A server-side fix means statement-level replay after
+  waiting out the competing transaction (WT invalidates the whole txn on
+  conflict, so the user transaction's prior statements must replay too).
+  Until then the sql-stress smoke keeps its write lanes single-client.
 - [ ] **pgx gauge — pgconn clusters** (`invoke validate-pgx`, baseline 291 P /
   87 F / 22 S = 77.0%, `docs/validation-report-pgx.md`): the two big pgconn
   clusters are **pipeline mode** (`Pipeline*` — Sync-less batching over the

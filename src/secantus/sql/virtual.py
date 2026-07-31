@@ -835,9 +835,12 @@ def _schema_oids(db: str, catalog: Catalog) -> dict[str, int]:
 
 
 def _pg_namespace(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    rows = [{"oid": oid, "nspname": name} for name, oid in _NS_OIDS.items()]
-    rows.append({"oid": _PG_TEMP_NS_OID, "nspname": "pg_temp_1"})
-    rows.extend({"oid": oid, "nspname": name} for name, oid in _schema_oids(db, catalog).items())
+    rows = [{"oid": oid, "nspname": name, "nspowner": 10} for name, oid in _NS_OIDS.items()]
+    rows.append({"oid": _PG_TEMP_NS_OID, "nspname": "pg_temp_1", "nspowner": 10})
+    rows.extend(
+        {"oid": oid, "nspname": name, "nspowner": 10}
+        for name, oid in _schema_oids(db, catalog).items()
+    )
     return rows
 
 
@@ -889,6 +892,18 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
             # (relpersistence != 't') hides them, exactly as real PG does.
             "relpersistence": "t" if t.temp else "p",
             "relam": _HEAP_AM_OID,
+            "relowner": 10,
+            "reltoastrelid": 0,
+            "relchecks": len(t.check_constraints),
+            "relhasindex": True,
+            "relhasrules": False,
+            "relhastriggers": False,
+            "relrowsecurity": False,
+            "relforcerowsecurity": False,
+            "relispartition": False,
+            "reltablespace": 0,
+            "relreplident": "d",
+            "reloftype": 0,
             "reloptions": None,
         }
         for t in _user_tables(db, catalog)
@@ -2159,6 +2174,9 @@ def _pg_index(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "indnkeyatts": ix.get("nkeyatts", n),
                 "indisunique": ix["unique"],
                 "indisprimary": ix["primary"],
+                "indisclustered": False,
+                "indisvalid": True,
+                "indisreplident": False,
                 "indnullsnotdistinct": False,
                 "indpred": None,
                 "indexprs": None,
@@ -2198,7 +2216,18 @@ def _pg_enum(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
 
 
 def _pg_database(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    return [{"oid": 1, "datname": db, "datallowconn": True}]
+    return [
+        {
+            "oid": 1,
+            "datname": db,
+            "datallowconn": True,
+            "datdba": 10,
+            "encoding": 6,
+            "datcollate": "C",
+            "datctype": "C",
+            "datacl": None,
+        }
+    ]
 
 
 def _pg_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -2397,7 +2426,7 @@ _register(
 _register(
     "pg_catalog",
     "pg_namespace",
-    [("oid", "int4"), ("nspname", "text")],
+    [("oid", "int4"), ("nspname", "text"), ("nspowner", "int4")],
     _pg_namespace,
 )
 _register(
@@ -2422,6 +2451,18 @@ _register(
         ("oid", "int4"),
         ("relname", "text"),
         ("relnamespace", "int4"),
+        ("relowner", "int4"),
+        ("reltoastrelid", "int4"),
+        ("relchecks", "int2"),
+        ("relhasindex", "bool"),
+        ("relhasrules", "bool"),
+        ("relhastriggers", "bool"),
+        ("relrowsecurity", "bool"),
+        ("relforcerowsecurity", "bool"),
+        ("relispartition", "bool"),
+        ("reltablespace", "int4"),
+        ("relreplident", "text"),
+        ("reloftype", "int4"),
         ("relkind", "text"),
         ("relpersistence", "text"),
         ("relam", "int4"),
@@ -2761,6 +2802,127 @@ _register(
     ],
     _pg_constraint,
 )
+
+
+def _pg_policy(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # Row-level-security policies: psql's ``\d`` joins this; one row per
+    # declared policy, keyed to the owning table's pg_class oid.
+    oids = _table_oids(db, catalog)
+    rows: list[dict] = []
+    lister = getattr(catalog, "list_policies", None)
+    if lister is None:
+        return rows
+    for i, pol in enumerate(lister(db)):
+        relid = oids.get(pol.get("table"))
+        if relid is None:
+            continue
+        rows.append(
+            {
+                "oid": 75000 + i,
+                "polname": pol.get("name"),
+                "polrelid": relid,
+                "polcmd": (pol.get("cmd") or "*")[:1].lower(),
+                "polpermissive": bool(pol.get("permissive", True)),
+                "polroles": [0],
+                "polqual": pol.get("using"),
+                "polwithcheck": pol.get("check"),
+            }
+        )
+    return rows
+
+
+def _empty_rows(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    return []
+
+
+# Present-but-empty catalogs psql's ``\d`` family joins: no extended
+# statistics, triggers, rules, inheritance, or publications in our model —
+# but the relations must exist so the queries run.
+_register(
+    "pg_catalog",
+    "pg_statistic_ext",
+    [
+        ("oid", "int4"),
+        ("stxrelid", "int4"),
+        ("stxname", "text"),
+        ("stxnamespace", "int4"),
+        ("stxkeys", "int2vector"),
+        ("stxkind", "text[]"),
+        ("stxstattarget", "int4"),
+    ],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_trigger",
+    [
+        ("oid", "int4"),
+        ("tgrelid", "int4"),
+        ("tgname", "text"),
+        ("tgfoid", "int4"),
+        ("tgtype", "int4"),
+        ("tgenabled", "text"),
+        ("tgisinternal", "bool"),
+        ("tgconstraint", "int4"),
+        ("tgdeferrable", "bool"),
+        ("tginitdeferred", "bool"),
+    ],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_rewrite",
+    [("oid", "int4"), ("rulename", "text"), ("ev_class", "int4"), ("ev_type", "text")],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_inherits",
+    [("inhrelid", "int4"), ("inhparent", "int4"), ("inhseqno", "int4")],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_publication",
+    [
+        ("oid", "int4"),
+        ("pubname", "text"),
+        ("puballtables", "bool"),
+        ("pubinsert", "bool"),
+        ("pubupdate", "bool"),
+        ("pubdelete", "bool"),
+        ("pubtruncate", "bool"),
+        ("pubviaroot", "bool"),
+    ],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_publication_rel",
+    [("oid", "int4"), ("prpubid", "int4"), ("prrelid", "int4")],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_publication_namespace",
+    [("oid", "int4"), ("pnpubid", "int4"), ("pnnspid", "int4")],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_policy",
+    [
+        ("oid", "int4"),
+        ("polname", "text"),
+        ("polrelid", "int4"),
+        ("polcmd", "text"),
+        ("polpermissive", "bool"),
+        ("polroles", "int4[]"),
+        ("polqual", "text"),
+        ("polwithcheck", "text"),
+    ],
+    _pg_policy,
+)
 _register(
     "pg_catalog",
     "pg_index",
@@ -2772,6 +2934,9 @@ _register(
         ("indoption", "int2vector"),
         ("indnatts", "int4"),
         ("indnkeyatts", "int4"),
+        ("indisclustered", "bool"),
+        ("indisvalid", "bool"),
+        ("indisreplident", "bool"),
         ("indisunique", "bool"),
         ("indisprimary", "bool"),
         ("indnullsnotdistinct", "bool"),
@@ -2806,7 +2971,16 @@ _register(
 _register(
     "pg_catalog",
     "pg_database",
-    [("oid", "int4"), ("datname", "text"), ("datallowconn", "bool")],
+    [
+        ("oid", "int4"),
+        ("datname", "text"),
+        ("datallowconn", "bool"),
+        ("datdba", "int4"),
+        ("encoding", "int4"),
+        ("datcollate", "text"),
+        ("datctype", "text"),
+        ("datacl", "text[]"),
+    ],
     _pg_database,
 )
 

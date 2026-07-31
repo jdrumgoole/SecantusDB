@@ -1831,6 +1831,10 @@ def _run_statement(
             return _drop_domain_command(stmt, db, catalog)
         if verb == "COMMENT_CONSTRAINT":
             return _comment_constraint_command(stmt, db, catalog)
+        if verb == "VACUUM":
+            # Nothing to vacuum in a surrogate store; accept like real PG
+            # (pgbench -i runs ``vacuum analyze`` unconditionally).
+            return SQLResult(command_tag="VACUUM")
         if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("EXTENSION"):
             return _create_extension_command(stmt)
         if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("EXTENSION"):
