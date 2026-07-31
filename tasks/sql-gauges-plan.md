@@ -7,10 +7,11 @@
 `docs/validation-report-psycopg.md`) are committed tooling; the §6 results log
 below records how they got there. Slice zero (§2) shipped along the way.
 G6 (SQLAlchemy's dialect-compliance suite — `invoke validate-sqlalchemy`,
-weekly in CI) landed 2026-07-31 at 572/738 (77.5%) and reached **731/731
+weekly in CI) landed 2026-07-31 at 572/738 (77.5%) and reached **978/978
 executed tests passing (100%, zero failures, zero errors)** the same day —
-capabilities honestly declared (`datetime_microseconds` closed for the BSON
-millisecond divergence) — after the rounds below.
+including the whole schema-qualified surface (the `schemas` capability is
+open now that relations are namespaced per schema); the one closed
+capability is `datetime_microseconds` (the BSON millisecond divergence).
 Outstanding: the G1 `postgres-extended` second lane and gauges G3–G5 / G7
 (per-item status in §5). This document plans the SQL/Postgres
 analogue of the thirteen MongoDB driver gauges: comprehensive **external,
@@ -316,7 +317,15 @@ suites refuse to run *anything*:
    now honored end-to-end (enforcement, reflection, duplicate-key messages).
    Nothing is deselected; the two DateTimeMicroseconds tests skip via the
    closed `datetime_microseconds` capability (the one declared storage
-   divergence, tracked in the backlog).
+   divergence, tracked in the backlog). A third round opened `schemas`:
+   tables, views, and sequences in user schemas store under dotted catalog
+   keys (like user types), coexist with same-named public relations, reflect
+   under their own pg_namespace rows, and are invisible to unqualified
+   lookups (`pg_table_is_visible` enforces the default search path); the
+   runner pre-provisions `test_schema` / `test_schema_2` per SQLAlchemy's
+   README.unittests. The round also caught a real wrong-answer: sqlglot
+   parses ``NOT LIKE`` as ``Like(negate=True)``, which both engines ignored
+   — ``NOT LIKE`` behaved as ``LIKE``. 978/978 executed tests pass.
 
 Mechanics mirror the existing gauges throughout: daemon `SecantusPGServer`
 subprocess on an ephemeral port (ad-hoc reproducers on `127.0.0.1:55432` per
