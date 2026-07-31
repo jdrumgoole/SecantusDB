@@ -920,6 +920,31 @@ def validate_sqlalchemy(c: Context) -> None:
     print("\nWrote docs/validation-report-sqlalchemy.md")
 
 
+@task(name="sql-stress")
+def sql_stress(c: Context) -> None:
+    """Run the pgbench + psql stress/smoke against a SecantusPGServer daemon.
+
+    The SQL-server always-on smoke (tasks/sql-gauges-plan.md G7): unmodified
+    pgbench init (DDL + COPY + ALTER ADD PRIMARY KEY) and TPC-B in all three
+    protocol modes plus a concurrent select-only lane, then a psql catalog
+    smoke. Any error or dropped connection is a bug. Requires pgbench + psql
+    on PATH. Generates docs/validation-report-sqlstress.md.
+    """
+    _run_gauge(
+        c,
+        module="sqlstress_validation.runner",
+        raw=".validation/sqlstress-raw.json",
+        report="docs/validation-report-sqlstress.md",
+        hint="pgbench/psql missing from PATH or a PG-server startup failure is the usual cause.",
+    )
+    c.run(
+        "uv run --no-sync python -m sqlstress_validation.generate_report "
+        ".validation/sqlstress-raw.json docs/validation-report-sqlstress.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-sqlstress.md")
+
+
 @task(name="validate-pgx")
 def validate_pgx(c: Context) -> None:
     """Run jackc/pgx's pgconn + pgproto3 tests against a SecantusPGServer daemon.

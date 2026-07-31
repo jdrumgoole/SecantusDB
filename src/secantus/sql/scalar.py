@@ -281,6 +281,12 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_in(node, scope, ctx)
     if isinstance(node, exp.Between):
         return _eval_between(node, scope, ctx)
+    if isinstance(node, exp.Operator):
+        from secantus.sql.planner import _rewrite_explicit_operator
+
+        rewritten = _rewrite_explicit_operator(node)
+        if rewritten is not None:
+            return evaluate(rewritten, scope, ctx)
     if isinstance(node, (exp.NullSafeEQ, exp.NullSafeNEQ)):
         # ``IS [NOT] DISTINCT FROM`` — null-safe comparison: two NULLs are
         # "not distinct", a NULL and a value are "distinct".
@@ -456,7 +462,30 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         right = float(right)
     elif isinstance(right, float) and isinstance(left, Decimal):
         left = float(left)
+    # An unknown-type text operand against a number resolves numerically, like
+    # PG's unknown-literal coercion (``abalance + $1`` with an untyped text
+    # param — pgbench's extended mode binds every param typeless).
+    if isinstance(left, str) and _is_number(right):
+        left = _num_from_text(left, right)
+    elif isinstance(right, str) and _is_number(left):
+        right = _num_from_text(right, left)
     return _ARITH[type(node)](left, right)
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float, Decimal)) and not isinstance(v, bool)
+
+
+def _num_from_text(text: str, like: Any) -> Any:
+    t = text.strip()
+    try:
+        if isinstance(like, float):
+            return float(t)
+        if isinstance(like, Decimal):
+            return Decimal(t)
+        return int(t) if "." not in t and "e" not in t.lower() else Decimal(t)
+    except (ValueError, ArithmeticError):
+        raise errors.SQLError("22P02", f'invalid input syntax for type numeric: "{text}"') from None
 
 
 _NOT_DATE = object()
@@ -2280,6 +2309,30 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         # deparses it; ours passes the text through. This is what SQLAlchemy's
         # get_columns reads column defaults (incl. SERIAL nextval) from.
         return args[0] if args else None
+    if name == "array_to_string":
+        # The schema-qualified spelling parses as Anonymous (the bare
+        # spelling is exp.ArrayToString) — same semantics.
+        arr = args[0] if args else None
+        if arr is None:
+            return None
+        delim = _as_text(args[1]) if len(args) > 1 else ""
+        null_str = _as_text(args[2]) if len(args) > 2 and args[2] is not None else None
+        parts = []
+        for v in _as_list(arr):
+            if v is None:
+                if null_str is not None:
+                    parts.append(null_str)
+            else:
+                parts.append(_as_text(v))
+        return delim.join(parts)
+    if name == "pg_encoding_to_char":
+        # Encoding 6 is UTF8 — the only encoding the server speaks.
+        return "UTF8"
+    if name == "pg_get_userbyid":
+        # Role-name lookup for an owner oid — a single-user surrogate reports
+        # the session (or default) role for every object.
+        session = getattr(ctx, "session", None)
+        return getattr(session, "user", None) or "postgres"
     if name == "pg_get_serial_sequence":
         # No serial-sequence resolution surface.
         return None
@@ -3266,7 +3319,10 @@ def _inner_row_scopes(select: exp.Expression, outer: Scope, ctx: ScalarContext):
     stop at the first match)."""
     if not isinstance(select, exp.Select):
         raise errors.feature_not_supported(f"unsupported subquery: {select.sql()}")
-    if select.args.get("joins") or select.args.get("group"):
+    joins = select.args.get("joins") or []
+    if select.args.get("group") or any(
+        j.args.get("on") or (j.args.get("kind") or "").upper() not in ("", "CROSS") for j in joins
+    ):
         raise errors.feature_not_supported("only a simple subquery is supported")
     where = select.args.get("where")
     from_node = next((v for v in select.args.values() if isinstance(v, exp.From)), None)
@@ -3275,13 +3331,32 @@ def _inner_row_scopes(select: exp.Expression, outer: Scope, ctx: ScalarContext):
         if where is None or _truthy(evaluate(where.this, outer, ctx)):
             yield outer
         return
-    table_node = from_node.this
-    tdef = _lookup_inner_table(ctx, table_node)
-    if tdef is None:
-        raise errors.undefined_table(table_node.name)
-    inner_alias = table_node.alias or table_node.name
-    for row in ctx.storage.find_matching(ctx.db, tdef.collection, {}):
-        scope = _sub_scope(inner_alias, tdef, row, outer)
+    sources = [from_node.this] + [j.this for j in joins]
+    resolved = []
+    for table_node in sources:
+        tdef = _lookup_inner_table(ctx, table_node)
+        if tdef is None:
+            raise errors.undefined_table(table_node.name)
+        resolved.append((table_node.alias or table_node.name, tdef))
+    if len(resolved) == 1:
+        inner_alias, tdef = resolved[0]
+        for row in ctx.storage.find_matching(ctx.db, tdef.collection, {}):
+            scope = _sub_scope(inner_alias, tdef, row, outer)
+            if where is None or _truthy(evaluate(where.this, scope, ctx)):
+                yield scope
+        return
+    # A comma-join FROM (``FROM pg_collation c, pg_type t WHERE …`` — psql's
+    # ``\\d`` collation subquery) — nested-loop over the cartesian product,
+    # each table's rows scoped under its alias, WHERE filtering the pairs.
+    import itertools
+
+    row_sets = [
+        list(ctx.storage.find_matching(ctx.db, tdef.collection, {})) for _, tdef in resolved
+    ]
+    for combo in itertools.product(*row_sets):
+        scope = outer
+        for (inner_alias, tdef), row in zip(resolved, combo, strict=True):
+            scope = _sub_scope(inner_alias, tdef, row, scope)
         if where is None or _truthy(evaluate(where.this, scope, ctx)):
             yield scope
 

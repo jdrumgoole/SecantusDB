@@ -50,6 +50,10 @@ jobs:
           # dialect-compliance suite (ships inside the sqlalchemy package —
           # nothing vendored) against a daemon SecantusPGServer. Python-only.
           - { name: sqlalchemy, task: validate-sqlalchemy, report: docs/validation-report-sqlalchemy.md }
+          # The SQL-server stress/smoke (tasks/sql-gauges-plan.md G7): pgbench
+          # init + TPC-B (three protocol modes) + select-only + psql catalog
+          # smoke. Needs pgbench/psql (postgresql-contrib, installed below).
+          - { name: sql-stress, task: sql-stress, report: docs/validation-report-sqlstress.md }
           # The SQL-server low-level Go gauge (tasks/sql-gauges-plan.md G4):
           # jackc/pgx's pgconn + pgproto3 packages, unmodified, over
           # PGX_TEST_DATABASE. Needs the Go toolchain (shared with the go
@@ -117,6 +121,11 @@ jobs:
       # The C gauge builds the vendored mongo-c-driver's test-libmongoc
       # binary from source (CMake): needs cmake + OpenSSL headers. A C
       # compiler is preinstalled on ubuntu-latest.
+      # The sql-stress smoke drives unmodified pgbench + psql.
+      - name: Install pgbench + psql
+        if: matrix.driver.name == 'sql-stress'
+        run: sudo apt-get update && sudo apt-get install -y postgresql-contrib postgresql-client
+
       - name: Install C-driver build toolchain
         if: matrix.driver.name == 'c'
         run: sudo apt-get install -y cmake libssl-dev

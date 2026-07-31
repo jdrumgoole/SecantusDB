@@ -230,6 +230,59 @@ def execute_alter_table(
     return SQLResult(command_tag="ALTER TABLE")
 
 
+def _add_primary_key(
+    table: Any, cols: list[str], con_name: str | None, storage: Any, db: str
+) -> None:
+    """Apply ``ADD PRIMARY KEY`` to an existing table: every row's ``_id`` is
+    rewritten to the key column value(s) (single column → scalar ``_id``,
+    composite → subdocument), after NOT NULL and uniqueness validation."""
+    import dataclasses
+
+    from secantus.sql import planner
+
+    if table.pk_columns:
+        raise errors.SQLError(
+            "42P16", f'multiple primary keys for table "{table.name}" are not allowed'
+        )
+    for c in cols:
+        if table.column(c) is None:
+            raise errors.undefined_column(c)
+    docs = storage.find_matching(db, table.collection, {})
+    seen: set[str] = set()
+    new_docs = []
+    for doc in docs:
+        vals = []
+        for c in cols:
+            v = doc.get(c)
+            if v is None:
+                raise errors.SQLError(
+                    "23502",
+                    f'column "{c}" of relation "{table.name}" contains null values',
+                )
+            vals.append(v)
+        new_id: Any = vals[0] if len(cols) == 1 else dict(zip(cols, vals, strict=True))
+        key = repr(new_id)
+        if key in seen:
+            raise errors.SQLError(
+                "23505",
+                f'could not create unique index "{con_name or table.name + "_pkey"}" '
+                "— duplicate key values",
+            )
+        seen.add(key)
+        nd = {k: v for k, v in doc.items() if k not in cols and k != "_id"}
+        nd["_id"] = new_id
+        new_docs.append(nd)
+    storage.delete_matching(db, table.collection, {})
+    if new_docs:
+        storage.insert(db, table.collection, new_docs)
+    table.columns = [
+        planner._with_pk(dataclasses.replace(c, nullable=False) if c.name in cols else c, cols)
+        for c in table.columns
+    ]
+    table.pk_name = con_name
+    table.pk_column_order = tuple(cols) if len(cols) > 1 else None
+
+
 def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
     """``COMMENT ON TABLE t IS '…'`` / ``COMMENT ON COLUMN t.c IS '…'`` — store the
     comment in the catalog so it reflects via ``pg_description`` (SQLAlchemy's
@@ -458,6 +511,13 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
                 table.unique_constraints.append(
                     planner.make_unique_constraint(node, table.name, con_name)
                 )
+            elif isinstance(node, exp.PrimaryKey):
+                # ``ALTER TABLE t ADD [CONSTRAINT c] PRIMARY KEY (cols)`` —
+                # validates NOT NULL + uniqueness, re-keys every row from the
+                # auto-assigned ``_id`` onto the column value(s), and updates
+                # the catalog mapping (pgbench -i's post-load step).
+                pk_cols = [planner._column_name(c) for c in node.expressions]
+                _add_primary_key(table, pk_cols, con_name, storage, db)
             else:
                 raise errors.feature_not_supported(f"unsupported ADD CONSTRAINT: {action.sql()}")
         return

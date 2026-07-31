@@ -12,8 +12,10 @@ executed tests passing (100%, zero failures, zero errors)** the same day —
 including the whole schema-qualified surface (the `schemas` capability is
 open now that relations are namespaced per schema); the one closed
 capability is `datetime_microseconds` (the BSON millisecond divergence).
-Outstanding: the G1 `postgres-extended` second lane and gauges G3–G5 / G7
-(per-item status in §5). This document plans the SQL/Postgres
+Outstanding: the G1 `postgres-extended` second lane, G3 (needs a
+CockroachDB-monorepo extraction decision — multi-GB vendoring), and G5
+(Npgsql / pgjdbc — the largest catalog-gated suites); per-item status in §5.
+G4 (pgx) and G7 (pgbench + psql) landed 2026-07-31. This document plans the SQL/Postgres
 analogue of the thirteen MongoDB driver gauges: comprehensive **external,
 unmodified** test suites run against the `SecantusPGServer` over a real
 `postgresql://…` connection, reported as pass/fail/skip counts the way
@@ -284,9 +286,17 @@ suites refuse to run *anything*:
    Sync-less extended-protocol batching, and the CancelRequest context
    watcher). `docs/validation-report-pgx.md`. **G5 Npgsql or pgjdbc** — ❌
    not started (pick by which catalog gaps the pgx clusters surface first).
-6. **G7 SQLsmith + pgbench** as always-on stress/smoke (`invoke sql-stress`) —
-   ❌ not started; both need binaries not in the dev env (SQLsmith build,
-   pgbench from a Postgres install).
+6. **G7 pgbench + psql smoke** — ✅ landed (2026-07-31) as `invoke
+   sql-stress`: unmodified pgbench init (multi-name DROP, COPY, VACUUM,
+   ALTER TABLE ADD PRIMARY KEY — all of which the server now implements) +
+   TPC-B in all three protocol modes + a concurrent select-only lane + the
+   psql `\dt`/`\d`/`\di`/`\l`/`\dn` catalog smoke, **6/6 lanes clean**,
+   weekly in `validate.yml` (`docs/validation-report-sqlstress.md`). Write
+   lanes run single-client: under contention WT's optimistic concurrency
+   surfaces PG-SERIALIZABLE-style 40001s, which pgbench < 15 can't retry
+   (no `--max-tries`) — the 40001-retry model is a backlog item. SQLsmith
+   remains ❌ (needs a from-source build; revisit with `--max-tries`-capable
+   pgbench 15+).
 7. **G6 SQLAlchemy compliance suite** — ✅ landed (2026-07-31): `invoke
    validate-sqlalchemy` runs `sqlalchemy.testing.suite` (nothing vendored — it
    ships inside the sqlalchemy package) over `postgresql+psycopg` against a
