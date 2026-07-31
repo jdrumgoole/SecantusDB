@@ -280,10 +280,18 @@ def _run_nested_with_fault_dir(
         return _run_tolerating_teardown_wedge(cmd, cwd=tmp_path, env=env, timeout=timeout)
 
 
-# The final `= N passed/failed/error ... in Xs =` banner pytest prints once its
-# session is over — everything these tests assert on (the faulthandler files and
-# the pass/fail verdict) is decided by the time it appears.
-_PYTEST_SUMMARY = re.compile(r"^=+ (?P<body>.+?) in [\d.]+s.*=+$", re.M)
+# The final summary pytest prints once its session is over — everything these
+# tests assert on (the faulthandler files and the pass/fail verdict) is decided
+# by the time it appears. The nested runs use ``-q``, where the summary is a
+# BARE line ("1 passed in 0.53s"), not the ``=== ... ===`` banner — an earlier
+# banner-only pattern here never matched ``-q`` output, so the post-summary
+# wedge tolerance below was dead code and every teardown wedge escalated to
+# TimeoutExpired (2026-07-31 release-gate failure). Match both forms.
+_PYTEST_SUMMARY = re.compile(
+    r"^=*\s*(?P<body>[^=\n]*\b(?:passed|failed|error|errors|no tests ran)\b"
+    r"[^=\n]*? in [\d.]+s)[^\n]*$",
+    re.M,
+)
 
 
 def _run_tolerating_teardown_wedge(
