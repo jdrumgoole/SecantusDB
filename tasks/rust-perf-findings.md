@@ -1043,3 +1043,29 @@ reward / Lever C: research-scale" territory the forward plan already
 priced. With Phase 0/A/A′ shipped and B's gate concluded NO-GO, the
 concurrency-parity plan's experimental program is **complete**: every
 phase has either shipped or been closed with data.
+
+## Finding 17 — post-Phase-C confirmation matrix; the async prune's measured cost (2026-07-31)
+
+A full pinned 3-rep interleaved 4-arm matrix on `01d45bea` (post-#716/#717,
+PGO-staged daemon, standard 30s / batch-100 / per-writer-collections
+methodology) re-confirms the durable-path improvement, with mongod as the
+session normalizer landing within 3% of the published table:
+
+| arm (medians, docs/s) | 1w | 2w | 4w | 8w | vs published |
+|---|---:|---:|---:|---:|---|
+| Python | 11.7k | 8.6k | 9.9k | 7.6k | ±3% |
+| Rust sync (default) | 34.0k | 47.3k | 77.5k | 89.4k | −3..−12% (2w rep-1 outlier; scaling 2.63×, monotonic) |
+| Rust async+nonlogged | 45.2k | 57.3k | 88.1k | 104.7k | −10..−12% |
+| mongod (standalone) | 105.3k | 202.2k | 358.2k | 468.2k | −3% |
+
+The async column's larger deviation decomposes cleanly. A cargo-vs-cargo A/B
+(neither binary PGO'd; 3 interleaved reps, async 8w) of pre-#716 (`75d122a2`)
+vs current: **121.3k vs 113.0k median — the #716 opportunistic prune costs
+~6% at 8 writers**; the remainder matches the session's ~3–5% box headwind
+seen equally on the mongod and sync arms. This cost is deliberate: before
+#716 an async store never pruned from write volume at all, so every published
+async number was measured on a store whose oplog grew without bound for the
+duration of the run — an unshippable configuration. The sync path has always
+paid the (post-#700 key-only) prune; #716 makes async pay the same, honest
+price. The published async column (50.4k/66k/100.3k/119.2k, 0.6.0b5) should
+be read as ~5% optimistic until the next release re-baseline.
