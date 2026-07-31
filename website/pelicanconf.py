@@ -32,7 +32,7 @@ SECANTUS_GITHUB_URL: str = "https://github.com/jdrumgoole/SecantusDB"
 # "Download a binary" CTAs land on a page with actual archive assets —
 # binary releases are GitHub pre-releases and never become "Latest", so
 # the bare /releases listing leads with the source-only PyPI release.
-SECANTUS_RUST_BINARY_TAG: str = "secantusdb-v0.5.3-beta.155"
+SECANTUS_RUST_BINARY_TAG: str = "secantusdb-v0.5.3-beta.156"
 SECANTUS_RUST_BINARY_URL: str = f"{SECANTUS_GITHUB_URL}/releases/tag/{SECANTUS_RUST_BINARY_TAG}"
 SECANTUS_RUST_RELEASES_URL: str = f"{SECANTUS_GITHUB_URL}/releases?q=secantusdb-v&expanded=true"
 SECANTUS_TAGLINE: str = "THE SQLITE OF DOCUMENT DATABASES"
