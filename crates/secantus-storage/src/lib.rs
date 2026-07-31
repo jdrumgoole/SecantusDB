@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -460,18 +460,24 @@ fn oplog_tables_nonlogged() -> bool {
     std::env::var_os("SECANTUS_OPLOG_NONLOGGED").is_some()
 }
 
-/// Measure-only structural probe (`SECANTUS_DATA_NONLOGGED=1`): create the
-/// DATA tables (doc shards + the bootstrap set) with `log=(enabled=false)`,
-/// i.e. checkpoint-durable only — the mongod architecture, which journals ONLY
-/// the oplog and recovers data by checkpoint + oplog replay. SecantusDB has no
-/// replay-on-open yet, so this is **CRASH-UNSAFE: a hard crash between
-/// checkpoints loses acknowledged writes.** Never set it outside a benchmark;
-/// it exists to measure whether the mongod split is the structural source of
-/// the oplog-retention gap (Finding 12 / the parity plan's Phase A′, which
-/// builds the recovery that would make this shippable).
+/// Phase A' (`SECANTUS_DATA_NONLOGGED=1`): create the DATA tables (doc
+/// shards + the bootstrap set, except the always-logged oplog-meta) with
+/// `log=(enabled=false)` — the mongod architecture, which journals ONLY the
+/// oplog and recovers data by checkpoint + oplog replay. **Crash recovery is
+/// implemented**: a periodic stable checkpoint anchors a marker
+/// (`stable_seq`) in the logged meta table, and `Storage::open` replays the
+/// (WAL-logged) oplog above the marker through the ordinary write paths,
+/// idempotently — proven by the hard-kill harness
+/// (`tests/test_crash_recovery.py`). The durability contract matches the
+/// logged default at each `sync_on_commit` setting: with per-commit fsync
+/// every acknowledged write survives `kill -9`; without it a hard crash can
+/// lose the unsynced WAL tail — in either mode. Consulted at store CREATE
+/// time only; existing stores keep their recorded mode (the marker).
 fn data_tables_nonlogged() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SECANTUS_DATA_NONLOGGED").is_some())
+    // Read fresh (no OnceLock): consulted only at store CREATE time — a cold
+    // path — and per-open freshness lets one test process exercise both
+    // modes via subprocess-scoped env.
+    std::env::var_os("SECANTUS_DATA_NONLOGGED").is_some()
 }
 
 /// Table-create config for a data table, honouring [`data_tables_nonlogged`].
@@ -480,6 +486,20 @@ fn data_table_cfg(base: &str) -> String {
         format!("{base},log=(enabled=false)")
     } else {
         base.to_string()
+    }
+}
+
+/// Bootstrap-create config for `name`. Everything follows [`data_table_cfg`]
+/// EXCEPT the oplog-meta table, which must stay WAL-logged even in
+/// `SECANTUS_DATA_NONLOGGED` mode: it carries the **stable checkpoint marker**
+/// (`stable_seq` + the mode flag) that crash recovery replays from — a marker
+/// that rolled back with the data tables would be useless. It is a single tiny
+/// row per checkpoint; its logging cost is nil.
+fn bootstrap_table_cfg(name: &str, base: &str) -> String {
+    if name == OPLOG_META_TABLE {
+        base.to_string()
+    } else {
+        data_table_cfg(base)
     }
 }
 
@@ -688,6 +708,7 @@ fn scan_doomed_oplog_keys(
     excess: usize,
     cutoff: i64,
     retention_batch: usize,
+    ceiling: i64,
 ) -> Result<Vec<(i64, usize)>> {
     let tables = oplog_all_tables();
     let mut cursors: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
@@ -724,6 +745,12 @@ fn scan_doomed_oplog_keys(
             }
         }
         let Some(i) = best else { break };
+        if best_seq >= ceiling {
+            // Phase A' clamp: entries at/above the stable-checkpoint seq are
+            // the crash-recovery source for a data-nonlogged store — never
+            // doomed, whatever the cap says. (ceiling is i64::MAX otherwise.)
+            break;
+        }
         let cur = cursors[i].as_ref().expect("selected shard has a cursor");
         if doomed.len() < excess {
             // Cap-doomed by position alone — no value read.
@@ -2145,6 +2172,27 @@ pub struct Storage {
     /// clean close flushes the drainer before the checkpoint). `None` = the
     /// synchronous, atomic default.
     async_oplog: Option<Arc<AsyncOplog>>,
+    /// Phase A': whether THIS store's data tables were created
+    /// `log=(enabled=false)` (checkpoint-durable, recovered by oplog replay).
+    /// Resolved from the stable marker for existing stores — the table config
+    /// is create-time-sticky, so the env var is only consulted for fresh
+    /// stores — and recorded in the marker at first checkpoint.
+    data_nonlogged: bool,
+    /// Highest oplog seq covered by the last stable checkpoint: the replay
+    /// floor after a crash and the prune clamp (entries above it are the
+    /// recovery source and must not be pruned). 0 until the first checkpoint.
+    stable_seq: Arc<AtomicI64>,
+    /// Periodic stable-checkpoint thread (data-nonlogged stores only; WT does
+    /// not checkpoint on its own under our config, and unlogged tables are
+    /// only as durable as their last checkpoint — the mongod cadence).
+    checkpoint_stop: Arc<AtomicBool>,
+    /// Set by a cap-blocked prune to demand an anchor ahead of the cadence:
+    /// the clamp forbids pruning entries above the stable seq, so without an
+    /// on-demand checkpoint a sustained writer would grow the oplog without
+    /// bound between periodic anchors. The thread honours it on its next
+    /// 250ms tick and clears it.
+    checkpoint_requested: Arc<AtomicBool>,
+    checkpoint_join: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -2690,6 +2738,26 @@ fn now_secs() -> i64 {
 /// Recover the oplog counters on open: the persisted meta row clamped UP to
 /// what the tables actually contain, else reconstruct from the newest oplog
 /// row. Mirrors `storage._load_oplog_meta`.
+/// Read the Phase-A' stable-checkpoint marker row: `(stable_seq,
+/// data_nonlogged)`, or `None` for a store that has never written one. The
+/// row lives in the (always WAL-logged) oplog-meta table under its own key so
+/// it never races the close-time "state" row.
+fn load_stable_marker(session: &Session) -> Option<(i64, bool)> {
+    let c = session.open_cursor(OPLOG_META_TABLE, None).ok()?;
+    c.set_key_s("stable");
+    if c.search().is_ok() {
+        let blob = c.get_value_u().ok()?;
+        let d = decode_doc(&blob).ok()?;
+        let seq = d
+            .get_i64("stable_seq")
+            .or_else(|_| d.get_i32("stable_seq").map(i64::from))
+            .ok()?;
+        let mode = d.get_bool("data_nonlogged").unwrap_or(false);
+        return Some((seq, mode));
+    }
+    None
+}
+
 fn load_oplog_meta(session: &Session) -> Result<OplogState> {
     let c = session.open_cursor(OPLOG_META_TABLE, None)?;
     c.set_key_s("state");
@@ -2925,6 +2993,25 @@ impl Drop for Storage {
     /// logged, never silent: in a database a close-time write error is a
     /// durability signal.
     fn drop(&mut self) {
+        // Phase A': stop the periodic stable-checkpoint thread before any
+        // teardown (it holds no locks between ticks; a 250ms tick bounds the
+        // join). The close path below takes its own final checkpoint, and for
+        // a data-nonlogged store we anchor the stable marker with it so a
+        // clean close reopens with an empty replay gap.
+        self.checkpoint_stop.store(true, Ordering::Release);
+        if let Some(h) = self
+            .checkpoint_join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = h.join();
+        }
+        if self.data_nonlogged {
+            if let Err(e) = self.stable_checkpoint() {
+                eprintln!("secantus-storage: close-time stable checkpoint failed: {e:?}");
+            }
+        }
         // Async oplog: flush the drainer pool BEFORE persisting meta / checkpointing,
         // so every committed write's oplog entry is on disk when the checkpoint
         // snapshots the tables (clean-close durability is preserved — only a hard
@@ -3013,7 +3100,7 @@ impl Storage {
         let mut state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
-                boot.create(name, &data_table_cfg(fmt))?;
+                boot.create(name, &bootstrap_table_cfg(name, fmt))?;
             }
             // The oplog is sharded across OPLOG_SHARDS btrees to spread append
             // contention (see OPLOG_SHARDS); the legacy single table stays
@@ -3080,7 +3167,25 @@ impl Storage {
         } else {
             None
         };
-        Ok(Storage {
+        // Phase A': resolve the data-logging mode. The stable marker (written
+        // at every stable checkpoint) is authoritative for an existing store —
+        // table logging config is create-time-sticky, so flipping the env var
+        // on an existing store must not change the mode. A fresh store (no
+        // marker) takes the env var. In-memory stores have no crash story and
+        // stay in the plain mode.
+        let marker = {
+            let session = conn.open_session()?;
+            load_stable_marker(&session)
+        };
+        let data_nonlogged = if in_memory {
+            false
+        } else {
+            match marker {
+                Some((_, mode)) => mode,
+                None => data_tables_nonlogged(),
+            }
+        };
+        let mut storage = Storage {
             conn,
             home: home.to_string(),
             lock: Mutex::new(()),
@@ -3094,10 +3199,28 @@ impl Storage {
             oplog_max_entries: 100_000,
             ts_suffix_counter: AtomicU64::new(0),
             oplog_archive_dir: None,
-            durable,
+            // Unlogged data tables are only as durable as their last
+            // checkpoint, so the close-time checkpoint is NOT optional in this
+            // mode — a fast-storage (durable=false) clean close would lose
+            // acknowledged writes with no crash involved. Force it.
+            durable: durable || data_nonlogged,
             in_memory,
             async_oplog,
-        })
+            data_nonlogged,
+            stable_seq: Arc::new(AtomicI64::new(marker.map(|(s, _)| s).unwrap_or(0))),
+            checkpoint_stop: Arc::new(AtomicBool::new(false)),
+            checkpoint_requested: Arc::new(AtomicBool::new(false)),
+            checkpoint_join: Mutex::new(None),
+        };
+        if storage.data_nonlogged {
+            // Crash recovery: the data tables rolled back to the last stable
+            // checkpoint; the (WAL-logged) oplog has everything. Replay the
+            // gap idempotently, then re-anchor the stable point. On a clean
+            // close the gap is empty and this is a no-op.
+            storage.recover_from_oplog()?;
+            storage.spawn_stable_checkpoint_thread();
+        }
+        Ok(storage)
     }
 
     /// Turn oplog emission on/off (mirrors `SecantusDBServer(enable_oplog=...)`).
@@ -3921,6 +4044,187 @@ impl Storage {
         Ok(())
     }
 
+    /// Phase A': write the stable marker at the CURRENT visible tail, then
+    /// checkpoint. Marker-before-checkpoint makes the marker conservative —
+    /// the checkpoint's data state covers at least every seq <= marker — and
+    /// conservative is safe because replay is idempotent (re-applied inserts
+    /// skip on duplicate `_id`, `$v:2` diffs are idempotent transformations,
+    /// deletes of absent docs are no-ops). Public so tests and tools can
+    /// force an anchor; the periodic thread calls it on the mongod cadence.
+    /// The seq the last stable checkpoint anchored (0 if none yet).
+    pub fn stable_checkpoint_seq(&self) -> i64 {
+        self.stable_seq.load(Ordering::Acquire)
+    }
+
+    pub fn stable_checkpoint(&self) -> Result<()> {
+        let stable = self.oplog_visible_tail_seq();
+        {
+            let session = self.conn.open_session()?;
+            let mut d = Document::new();
+            d.insert("stable_seq", stable);
+            d.insert("data_nonlogged", self.data_nonlogged);
+            let blob = encode_doc(&d)?;
+            let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
+            cur.set_key_s("stable");
+            cur.set_value_u(&blob);
+            cur.insert()?;
+        }
+        self.checkpoint()?;
+        self.stable_seq.store(stable, Ordering::Release);
+        Ok(())
+    }
+
+    /// Phase A' crash recovery: replay oplog entries above the stable marker
+    /// into the data tables through the ordinary write paths (oplog emission
+    /// suppressed — the entries are already there), tolerating already-applied
+    /// work: the marker is deliberately conservative, so the window's prefix
+    /// may be present in the checkpointed data. Runs before the store serves.
+    fn recover_from_oplog(&mut self) -> Result<()> {
+        let floor = self.stable_seq.load(Ordering::Acquire);
+        let was_enabled = self.enable_oplog;
+        self.enable_oplog = false;
+        let mut next = floor + 1;
+        let mut applied = 0u64;
+        let mut skipped = 0u64;
+        let result = loop {
+            let rows = match self.read_oplog(next, 2000) {
+                Ok(r) => r,
+                Err(e) => break Err(e),
+            };
+            if rows.is_empty() {
+                break Ok(());
+            }
+            for (seq, blob) in &rows {
+                next = seq + 1;
+                let entry = match decode_doc(blob) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("secantus-storage: recover_from_oplog: undecodable entry at seq {seq}: {e:?}");
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                match self.apply_replay_entry_idempotent(&entry) {
+                    Ok(true) => applied += 1,
+                    Ok(false) => skipped += 1,
+                    Err(e) => {
+                        self.enable_oplog = was_enabled;
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        self.enable_oplog = was_enabled;
+        result?;
+        if applied > 0 || skipped > 0 {
+            eprintln!(
+                "secantus-storage: recover_from_oplog: replayed seqs {}..{} (applied {applied}, \
+                 already-present/skipped {skipped})",
+                floor + 1,
+                next - 1
+            );
+        }
+        // Re-anchor so the next crash replays only its own gap (and the prune
+        // clamp releases the window just replayed).
+        self.stable_checkpoint()
+    }
+
+    /// One replay entry, idempotently: a duplicate-`_id` insert means the
+    /// checkpoint already contained it (the marker is conservative) — skip.
+    /// DDL ('c') entries tolerate re-application errors the same way (a
+    /// create/rename of something that already exists IS the already-applied
+    /// case), but the skip is logged so a genuine replay failure is never
+    /// silent.
+    fn apply_replay_entry_idempotent(&self, entry: &Document) -> Result<bool> {
+        match replay::apply_entry(self, entry) {
+            Ok(b) => Ok(b),
+            Err(StorageError::DuplicateId) => Ok(false),
+            Err(e) if entry.get_str("op").ok() == Some("c") => {
+                eprintln!(
+                    "secantus-storage: recover_from_oplog: DDL entry re-application skipped ({:?}): {e:?}",
+                    entry.get_str("ns").unwrap_or("")
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Spawn the periodic stable-checkpoint thread (data-nonlogged stores).
+    /// Interval: `SECANTUS_CHECKPOINT_SECONDS` (default 60 — mongod's
+    /// cadence). Stopped + joined in `Drop` before the close checkpoint.
+    fn spawn_stable_checkpoint_thread(&self) {
+        let interval = std::env::var("SECANTUS_CHECKPOINT_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(60);
+        let stop = self.checkpoint_stop.clone();
+        let requested = self.checkpoint_requested.clone();
+        // The thread needs the storage's checkpoint machinery without owning
+        // the Storage: give it the raw pieces (connection + oplog state for
+        // the visible tail + the atomics), mirroring DrainerShared.
+        let conn = self.conn.clone();
+        let oplog = self.oplog.clone();
+        let stable_seq = self.stable_seq.clone();
+        let handle = thread::Builder::new()
+            .name("secantus-stable-checkpoint".into())
+            .spawn(move || {
+                let tick = std::time::Duration::from_millis(250);
+                let mut waited = std::time::Duration::ZERO;
+                let interval = std::time::Duration::from_secs(interval);
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(tick);
+                    waited += tick;
+                    let demanded = requested.swap(false, Ordering::AcqRel);
+                    if waited < interval && !demanded {
+                        continue;
+                    }
+                    waited = std::time::Duration::ZERO;
+                    // Marker-before-checkpoint, same as stable_checkpoint().
+                    let stable = {
+                        let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
+                        if st.in_flight.is_empty() {
+                            st.next_seq - 1
+                        } else {
+                            *st.in_flight.keys().next().unwrap() - 1
+                        }
+                    };
+                    let write = (|| -> Result<()> {
+                        let session = conn.open_session()?;
+                        let mut d = Document::new();
+                        d.insert("stable_seq", stable);
+                        d.insert("data_nonlogged", true);
+                        let blob = encode_doc(&d)?;
+                        let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
+                        cur.set_key_s("stable");
+                        cur.set_value_u(&blob);
+                        cur.insert()?;
+                        session.checkpoint(None)?;
+                        Ok(())
+                    })();
+                    match write {
+                        Ok(()) => stable_seq.store(stable, Ordering::Release),
+                        // A checkpoint failure is a durability signal — loud,
+                        // never silent; the next tick retries.
+                        Err(e) => eprintln!("secantus-storage: stable checkpoint failed: {e:?}"),
+                    }
+                }
+            });
+        match handle {
+            Ok(h) => {
+                *self
+                    .checkpoint_join
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(h);
+            }
+            Err(e) => eprintln!("secantus-storage: could not spawn stable-checkpoint thread: {e}"),
+        }
+    }
+
     /// Force a checkpoint, then tar the consistent WiredTiger file set (enumerated
     /// by WiredTiger's `backup:` cursor) into `output_path` as a gzip stream, with
     /// an advisory `pitr-manifest.json` describing the oplog range it can recover
@@ -4322,7 +4626,24 @@ impl Storage {
         // (`read_oplog_shards_tagged`) copied ~8 MB of blobs per sweep just to
         // learn the doomed seqs — ~36% of the whole sync insert path
         // (Finding 12); keys are all the cap trim needs.
-        let doomed = scan_doomed_oplog_keys(&session, excess, cutoff, RETENTION_SCAN_BATCH)?;
+        // Phase A': for a data-nonlogged store, entries at/above the stable
+        // checkpoint are the only path back to the acknowledged data after a
+        // hard crash — clamp the sweep below them. The periodic checkpoint
+        // thread advances the clamp on the mongod cadence, releasing backlog.
+        let ceiling = if self.data_nonlogged {
+            self.stable_seq.load(Ordering::Acquire).max(0) + 1
+        } else {
+            i64::MAX
+        };
+        let doomed =
+            scan_doomed_oplog_keys(&session, excess, cutoff, RETENTION_SCAN_BATCH, ceiling)?;
+        if self.data_nonlogged && excess > 0 && doomed.len() < excess {
+            // The clamp blocked part of a genuine cap excess: demand an anchor
+            // so the stable seq advances and the next sweep can trim. Without
+            // this, a sustained writer outruns the periodic cadence and the
+            // oplog grows without bound.
+            self.checkpoint_requested.store(true, Ordering::Release);
+        }
         if doomed.is_empty() {
             return Ok(0);
         }

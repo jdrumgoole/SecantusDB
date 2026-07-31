@@ -294,3 +294,28 @@ fn rename_keeps_secondary_index_reachable_through_the_index() {
         assert!(!st.collection_exists("app", "src").unwrap());
     });
 }
+
+/// Phase A': the stable-checkpoint marker round-trips across a close/reopen
+/// (logged-mode store — the marker machinery is mode-independent; the
+/// crash/replay path itself is exercised by the Python hard-kill harness,
+/// where the data-nonlogged env can be subprocess-scoped).
+#[test]
+fn stable_checkpoint_marker_roundtrips() {
+    let home = temp_home();
+    {
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        st.insert_one("app", "c", &enc(&bson::doc! {"_id": 1}))
+            .unwrap();
+        st.stable_checkpoint().unwrap();
+        st.insert_one("app", "c", &enc(&bson::doc! {"_id": 2}))
+            .unwrap();
+    }
+    // Reopen: the marker must read back as the seq the checkpoint anchored
+    // (1 — the second insert happened after), via the same load path open uses.
+    {
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        assert_eq!(st.stable_checkpoint_seq(), 1);
+    } // close BEFORE deleting the home — a live connection's close checkpoint
+      // over a removed directory is a guaranteed WT panic.
+    let _ = std::fs::remove_dir_all(&home);
+}
