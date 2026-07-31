@@ -19,6 +19,210 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b7] — 2026-07-31
+
+### The async oplog stack graduates to first-class options
+
+The Rust server's storage write-path modes — the background oplog drainer,
+non-logged oplog tables, and the mongod-style log-only-the-oplog data mode
+with its stable-checkpoint cadence — were until now reachable only through
+process-wide `SECANTUS_*` environment variables. They are now real,
+per-store options at every layer: a `StorageOptions` struct on the storage
+crate, `RustServer(oplog_async=…, oplog_nonlogged=…, data_nonlogged=…,
+checkpoint_seconds=…)` kwargs on the embedded handle, and `--oplog-async` /
+`--oplog-nonlogged` / `--data-nonlogged` / `--checkpoint-seconds` flags plus
+matching `[storage]` TOML keys on the `secantusd-rs` daemon. Unset options
+defer to the environment variables, so existing env-driven workflows are
+unchanged; an explicit option wins for that store only.
+
+Two async-mode gaps closed on the way: an async store now prunes its oplog
+opportunistically from write volume (the every-1000-emits cadence the sync
+path always had — previously an async store only pruned on explicit calls),
+and `create_archive` drains the oplog queue before its checkpoint so a
+backup taken under the async drainer can no longer miss acknowledged writes.
+
+#### Added
+- `secantus_storage::StorageOptions` + `Storage::open_with_options` — per-store
+  `wt_config` / `durable` / `oplog_async` / `oplog_nonlogged` / `data_nonlogged` /
+  `checkpoint_seconds`; `None` defers to the matching `SECANTUS_*` env var.
+- `RustServer` kwargs `oplog_async` / `oplog_nonlogged` / `data_nonlogged` /
+  `checkpoint_seconds` (embedded handle).
+- `secantusd-rs` flags `--oplog-async` / `--oplog-nonlogged` / `--data-nonlogged` /
+  `--checkpoint-seconds N` and `[storage]` keys `oplog_async` / `oplog_nonlogged` /
+  `data_nonlogged` / `checkpoint_seconds` (Rust-daemon-only; `secantusd-py`
+  rejects them).
+
+#### Fixed
+- Async-mode change streams could surface **pre-open events**: a write
+  acknowledged before `watch()` could still be queued at the drainer, so the
+  open position (seeded at the drainer's watermark) sat below it and the event
+  leaked into the new stream (pymongo's `test_kill_cursors`, async-only). The
+  open path now waits (bounded) for the drainer to reach the minted tail
+  captured at open (`Storage::oplog_open_seq`); sync mode is unchanged — an
+  open transaction's pinned visible tail is already the correct open position,
+  and flushing there would block opens behind long transactions.
+- Async-oplog stores never pruned the oplog from write volume; the drain path
+  now mirrors the sync emit path's opportunistic every-1000-emits prune.
+- `create_archive` under the async drainer could snapshot before queued oplog
+  entries landed; it now calls `flush_oplog()` first.
+- `docs/rust/embedded.md` documented `replica_set_name=None` as defaulting to
+  the replica-set persona; the embedded handle's default is a plain standalone
+  `hello` (pass `replica_set_name="secantus"` for change streams).
+
+### The SQL server gets its ORM gauge — and a primary-key fidelity fix to go with it
+
+SQLAlchemy's own dialect-compliance suite now runs against SecantusDB's
+PostgreSQL server as a first-class conformance gauge (`invoke
+validate-sqlalchemy`), joining the psycopg and sqllogictest gauges in the
+weekly validation run — the sqllogictest gauge itself also graduates to weekly
+CI in the same stroke. Nothing is vendored: the suite ships inside the
+sqlalchemy package, pointed at a daemon server through the stock
+`postgresql+psycopg` dialect, with SecantusDB's capabilities declared in a
+requirements class the suite is designed to read. The opening baseline is 572
+of 738 executed tests passing (77.5%), published in the new
+`docs/validation-report-sqlalchemy.md`.
+
+Standing the gauge up flushed out a real correctness bug: a table-level
+`CONSTRAINT <name> PRIMARY KEY (…)` was silently dropped — the column was
+never mapped to the document `_id`, so primary-key uniqueness was not
+enforced and duplicate keys were accepted. Declared PK constraint names are
+now honored end-to-end: enforcement, catalog reflection (in place of the
+synthesized `<table>_pkey`), and duplicate-key error messages. The suite's
+provisioning also forced two smaller statement gaps closed: `CREATE / DROP
+EXTENSION` (citext, hstore, and plpgsql accepted — the extensions whose
+functionality ships built in; anything else is honestly unavailable) and
+`COMMENT ON CONSTRAINT` for check, unique, foreign-key, and primary-key
+constraints.
+
+#### Added
+
+- `sqlalchemy_validation/`: the G6 ORM gauge of `tasks/sql-gauges-plan.md` —
+  runner, capability declarations (`requirements.py`), report generator, and
+  an `invoke validate-sqlalchemy` task; weekly in `validate.yml`.
+- `.github/workflows/validate.yml`: the sqllogictest gauge (`validate-slt`)
+  runs weekly too, with a pinned cached `sqllogictest-bin 0.29.1`.
+- `sql/engine.py`: `CREATE EXTENSION [IF NOT EXISTS]` / `DROP EXTENSION
+  [IF EXISTS]` for citext / hstore / plpgsql (no-op success); unknown
+  extensions raise `0A000`, unknown drops `42704`.
+- `sql/engine.py` + `sql/planner.py`: `COMMENT ON CONSTRAINT <c> ON <t>`
+  (check / unique / FK / PK), stored in the catalog; `IS NULL` removes.
+
+#### Fixed
+
+- `sql/planner.py`: a table-level `CONSTRAINT <name> PRIMARY KEY (…)` was
+  silently ignored — no `_id` mapping, no uniqueness enforcement. The PK now
+  applies regardless of clause position, and the declared constraint name is
+  recorded (`TableDef.pk_name`) and surfaced by `pg_constraint` /
+  `pg_class` reflection and duplicate-key errors instead of the synthesized
+  `<table>_pkey`.
+
+### The SQLAlchemy compliance gauge climbs from 77% to 97% — and takes a pile of SQL fixes with it
+
+One day after the SQLAlchemy dialect-compliance gauge landed at 77.5%, a
+sweep through its failure clusters brought the PostgreSQL server to **713 of
+735 executed suite tests passing (97.0%), with zero errors**. As with the
+gauge's first landing, the score is a by-product: each cluster traced to a
+real server gap, and each fix is ordinary engine behavior any client
+benefits from.
+
+The catalog now tells the truth about more things: temp tables carry
+`relpersistence 't'`, are visible only to their creating session
+(`pg_table_is_visible` is session-aware), and are dropped when that
+session's connection closes — real Postgres temp-table lifecycle. Declared
+type modifiers survive into reflection (`varchar(52)` reports its length and
+`character varying(52)` from `format_type`; numeric precision/scale
+likewise), `pg_get_expr` returns stored default expressions (so a SERIAL
+column reflects its `nextval` default and `autoincrement`), plain views
+expose their output columns through `pg_attribute`, constraint comments
+reflect through `pg_description`, `pg_get_constraintdef` quotes identifiers
+the way `quote_ident` does (fixing every "bizarro character" reflection
+case), and a composite primary key reflects its declared column order.
+
+The expression engine grew `LIKE … ESCAPE` (with PG's `22025` invalid-escape
+error and `ESCAPE ''` disabling escaping), computed LIKE patterns over the
+extended protocol (Describe no longer fails on a WHERE that will be
+evaluated per-row), `IS [NOT] DISTINCT FROM` in per-row evaluation, exact
+numeric division for int-to-numeric casts (`CAST(15 AS NUMERIC) / 10` is
+`1.5`, while `15 / 10` stays integer division), float⊕numeric operand
+harmonization, constant expressions in `LIMIT` / `OFFSET`, `INSERT …
+DEFAULT VALUES`, and `CREATE SEQUENCE … NO MINVALUE NO MAXVALUE`.
+
+#### Added
+
+- `sql/planner.py` + `sql/scalar.py`: `LIKE … ESCAPE` (pushdown + per-row),
+  `IS [NOT] DISTINCT FROM` (per-row), constant expressions in
+  LIMIT/OFFSET, `INSERT … DEFAULT VALUES`, `CREATE SEQUENCE NO
+  MINVALUE / NO MAXVALUE`.
+- `sql/virtual.py`: plain-view columns in `pg_attribute`; constraint
+  comments in `pg_description`; `quote_ident` semantics in
+  `pg_get_constraintdef`; temp tables report `relpersistence 't'` /
+  `pg_temp_1`.
+- `sql/session.py` + `sql/engine.py` + `sql/pgserver.py`: session-scoped
+  temp-table lifecycle — visibility limited to the creating session, drop at
+  connection teardown.
+- `sqlalchemy_validation/requirements.py`: temp-table, constraint-index,
+  and include-columns capabilities declared.
+
+#### Fixed
+
+- `sql/scalar.py`: `CAST(<int> AS NUMERIC)` now yields numeric, so division
+  is exact instead of silently truncating; mixed float/Decimal arithmetic
+  no longer raises `TypeError` (float8 wins, as in PG); `pg_get_expr`
+  returned NULL for every stored default, hiding SERIAL defaults and
+  `autoincrement` from reflection; `format_type` ignored type modifiers.
+- `sql/engine.py`: extended-protocol Describe failed outright on a WHERE
+  clause that Execute would evaluate per-row (computed LIKE patterns over
+  bound parameters errored under psycopg); `CREATE SEQUENCE … NO MINVALUE`
+  crashed with an internal error.
+- `sql/planner.py`: a composite PK's declared column order
+  (`PRIMARY KEY (name, id, attr)`) was lost in reflection.
+
+### The SQLAlchemy compliance gauge reaches 100% — every executed suite test passes
+
+The final round on the SQLAlchemy dialect-compliance gauge closes the
+residual tail: **731 of 731 executed suite tests pass, with zero failures
+and zero errors**, up from 77.5% at the gauge's first landing. Nothing is
+deselected; the only declared divergence is `datetime_microseconds`
+(BSON datetimes are int64 milliseconds, and the shared dual-protocol
+document store is the product), closed through the suite's own capability
+mechanism — the same switch MySQL-family dialects close.
+
+As before, the score is a by-product of real engine work. A FROM-less
+`SELECT … WHERE EXISTS (…)` now routes through the constant path with the
+subquery evaluated against real storage; parenthesized set-operation arms
+carry their own ORDER BY and LIMIT; derived tables can be set operations,
+`VALUES` lists with column aliases (the shape SQLAlchemy's insertmanyvalues
+sentinel emits), or FROM-less selects; `INSERT` accepts any constant
+expression in a VALUES cell (`nextval('seq')` included); and covering
+indexes (`CREATE INDEX … INCLUDE (…)`) store their columns and reflect
+through `pg_index`'s `indnkeyatts` split.
+
+One fix in this round was a silent wrong-answer, the worst kind: a scalar
+subquery ignored its ORDER BY and LIMIT, so `(SELECT id FROM t ORDER BY id
+DESC LIMIT 1)` returned the *first* row in storage order instead of the
+last. Ordered, limited, grouped, or joined scalar subqueries now run through
+the full query engine, and a subquery returning more than one row raises
+PG's `21000` instead of picking one arbitrarily.
+
+#### Added
+
+- `sql/engine.py` + `sql/planner.py` + `sql/executor.py`: FROM-less
+  `WHERE EXISTS`; parenthesized union arms; set-operation / VALUES /
+  FROM-less derived tables; constant expressions (incl. `nextval`) in
+  INSERT VALUES cells; covering-index `INCLUDE` metadata + reflection
+  (`pg_index.indnkeyatts`).
+- `sqlalchemy_validation/requirements.py`: `supports_distinct_on` opened;
+  `datetime_microseconds` closed with the BSON-millisecond rationale.
+
+#### Fixed
+
+- `sql/scalar.py`: a scalar subquery with ORDER BY / LIMIT / GROUP BY /
+  joins silently ignored them (wrong row returned); it now runs through the
+  engine, and >1 result row raises `21000`.
+- `sql/engine.py`: extended-protocol Describe answered NoData for a set
+  operation whose first arm was parenthesized, then Execute sent DataRows —
+  a protocol violation that crashed libpq clients.
+
 ## [0.6.0b6] — 2026-07-31
 
 ### Log-only-the-oplog becomes crash-safe: replay-on-open recovery lands
