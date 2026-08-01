@@ -1388,7 +1388,15 @@ def _describe_statement(
     if table_node is None or stmt.args.get("from_") is None:
         # find() descends into subqueries — a FROM-less outer SELECT (WHERE
         # EXISTS …) describes via the constant path, same as _run_select.
-        plan = planner.plan_constant_select(stmt, session, storage, catalog, db)
+        try:
+            plan = planner.plan_constant_select(stmt, session, storage, catalog, db)
+        except errors.SQLError:
+            # Describe must not need parameter VALUES. ``SELECT $1::inet`` (a
+            # bound NULL cast — pgjdbc's PGobject round-trip) has a shape fixed
+            # entirely by the cast target, but evaluating it pre-Bind raises.
+            # Fall back to a value-free shape derivation; anything that still
+            # can't be typed defers to Execute (NoData).
+            return _describe_constant_shape(stmt)
         oids = plan.pg_oids or [None] * len(plan.columns)
         typmods = plan.typmods or [-1] * len(plan.columns)
         return [
@@ -1426,6 +1434,30 @@ def _describe_statement(
     if select_plan.count_star:
         return [ColumnDesc(select_plan.count_alias, "int8", typemap.PG_OID["int8"])]
     return executor._out_column_descs(select_plan.out_columns, storage, db)
+
+
+def _describe_constant_shape(stmt: exp.Select) -> list[ColumnDesc] | None:
+    """Column shape of a FROM-less SELECT derived WITHOUT evaluating it — used
+    when a projection references an unbound parameter. Only casts (whose target
+    fixes the type) and plain literals are typed; anything else makes the whole
+    statement undescribable (None -> NoData, and Execute answers)."""
+    out: list[ColumnDesc] = []
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        while isinstance(target, exp.Paren):
+            target = target.this
+        if not isinstance(target, exp.Cast) or target.to is None:
+            return None
+        tag = typemap.type_tag_for_sql(target.to)
+        ident = typemap.cast_type_identity(target.to)
+        if ident is None and tag is None:
+            return None
+        oid = ident[0] if ident is not None else typemap.PG_OID.get(tag or "text", 25)
+        typmod = ident[1] if ident is not None else -1
+        name = alias or planner._cast_output_name(target) or "?column?"
+        out.append(ColumnDesc(name, tag or "text", oid, typmod))
+    return out or None
 
 
 def _describe_with(
@@ -1909,6 +1941,8 @@ def _run_statement(
             return _alter_matview_command(stmt, storage, db, catalog, session)
         if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("SEQUENCE"):
             return _alter_sequence_command(stmt, db, catalog)
+        if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("DATABASE"):
+            return _alter_database_command(stmt, storage, db, catalog, session)
         if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("TYPE"):
             return _alter_type_command(stmt, db, catalog)
         if verb == "ALTER" and _command_text(stmt).lstrip().upper().startswith("DOMAIN"):
@@ -3758,6 +3792,46 @@ def _alter_type_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResu
 _ALTER_SEQUENCE_RE = re.compile(
     r"(?is)^\s*SEQUENCE\s+(?:IF\s+EXISTS\s+)?(\"[^\"]+\"|\w+)\s+(.*?)\s*;?\s*$"
 )
+
+
+_ALTER_DATABASE_RE = re.compile(
+    r'(?is)^\s*DATABASE\s+(?P<name>"[^"]+"|[\w$]+)\s+'
+    r"(?:(?P<reset>RESET)\s+(?P<rname>ALL|[\w.]+)"
+    r"|SET\s+(?P<sname>[\w.]+)\s*(?:=|\s+TO\s+)\s*(?P<value>.+?))\s*;?\s*$"
+)
+
+
+def _alter_database_command(
+    stmt: exp.Command, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """``ALTER DATABASE <db> SET <guc> TO <value>`` / ``RESET <guc>|ALL`` — a
+    database-level GUC default. PG applies it to NEW sessions only, never to
+    already-open ones, so it is stored in the catalog and merged into a
+    session's settings at connect (see ``session.apply_database_defaults``)."""
+    m = _ALTER_DATABASE_RE.match(_command_text(stmt))
+    if m is None:
+        raise errors.feature_not_supported(f"unsupported ALTER DATABASE: {stmt.sql()}")
+    name = m.group("name").strip('"')
+    if name != db:
+        # Single-node: only the connected database exists.
+        raise errors.SQLError("3D000", f'database "{name}" does not exist')
+    if m.group("reset"):
+        target = m.group("rname")
+        if target.upper() == "ALL":
+            for key in list(catalog.db_settings(db)):
+                catalog.set_db_setting(db, key, None)
+        else:
+            catalog.set_db_setting(db, sql_session.canonical_guc_name(target), None)
+        return SQLResult(command_tag="ALTER DATABASE")
+    guc = sql_session.canonical_guc_name(m.group("sname"))
+    raw = m.group("value").strip()
+    if raw.upper() == "DEFAULT":
+        catalog.set_db_setting(db, guc, None)
+        return SQLResult(command_tag="ALTER DATABASE")
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        raw = raw[1:-1].replace(raw[0] * 2, raw[0])
+    catalog.set_db_setting(db, guc, raw)
+    return SQLResult(command_tag="ALTER DATABASE")
 
 
 def _alter_sequence_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:

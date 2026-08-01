@@ -2,16 +2,16 @@
 
 - SecantusDB (Python server) 0.6.0b7
 - suite: vendor/pgjdbc @ 3297557c6a80 (Gradle `:postgresql:test`, unmodified; 60s JUnit default timeout injected)
-- generated: 2026-08-01 09:44 UTC
+- generated: 2026-08-01 13:19 UTC
 
 | test class | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
 | jdbc2.ArrayTest | 42 | 4 | 0 | 46 | 91.3% |
-| jdbc2.AutoRollbackTest | 1000 | 56 | 0 | 1056 | 94.7% |
+| jdbc2.AutoRollbackTest | 1032 | 24 | 0 | 1056 | 97.7% |
 | jdbc2.AutoSaveTransactionSettingsTest | 0 | 6 | 0 | 6 | 0.0% |
 | jdbc2.BatchDeadlockTest | 2 | 6 | 8 | 16 | 25.0% |
 | jdbc2.BatchExecuteTest | 128 | 12 | 0 | 140 | 91.4% |
-| jdbc2.BatchFailureTest | 96 | 88 | 0 | 184 | 52.2% |
+| jdbc2.BatchFailureTest | 120 | 64 | 0 | 184 | 65.2% |
 | jdbc2.BatchedInsertReWriteEnabledTest | 44 | 16 | 0 | 60 | 73.3% |
 | jdbc2.BlobTest | 0 | 1 | 0 | 1 | 0.0% |
 | jdbc2.BlobTransactionTest | 0 | 1 | 0 | 1 | 0.0% |
@@ -24,8 +24,8 @@
 | jdbc2.ConnectExecutorTest | 3 | 0 | 0 | 3 | 100.0% |
 | jdbc2.ConnectTimeoutTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.ConnectionSetupFailureTest | 1 | 0 | 0 | 1 | 100.0% |
-| jdbc2.ConnectionTest | 11 | 4 | 0 | 15 | 73.3% |
-| jdbc2.CopyLargeFileTest | 0 | 1 | 0 | 1 | 0.0% |
+| jdbc2.ConnectionTest | 12 | 3 | 0 | 15 | 80.0% |
+| jdbc2.CopyLargeFileTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.CopyTest | 23 | 1 | 0 | 24 | 95.8% |
 | jdbc2.CursorFetchSqlTransactionTest | 0 | 3 | 0 | 3 | 0.0% |
 | jdbc2.CursorFetchTest | 32 | 0 | 0 | 32 | 100.0% |
@@ -34,9 +34,9 @@
 | jdbc2.DatabaseMetaDataCacheTest | 1 | 2 | 0 | 3 | 33.3% |
 | jdbc2.DatabaseMetaDataPropertiesTest | 12 | 1 | 0 | 13 | 92.3% |
 | jdbc2.DatabaseMetaDataTest | 0 | 1 | 0 | 1 | 0.0% |
-| jdbc2.DatabaseMetaDataTransactionIsolationTest | 0 | 14 | 0 | 14 | 0.0% |
+| jdbc2.DatabaseMetaDataTransactionIsolationTest | 8 | 6 | 0 | 14 | 57.1% |
 | jdbc2.DateStyleTest | 4 | 0 | 0 | 4 | 100.0% |
-| jdbc2.DateTest | 74 | 104 | 14 | 192 | 41.6% |
+| jdbc2.DateTest | 157 | 21 | 14 | 192 | 88.2% |
 | jdbc2.DriverTest | 16 | 0 | 1 | 17 | 100.0% |
 | jdbc2.EncodingTest | 3 | 0 | 0 | 3 | 100.0% |
 | jdbc2.EnumTest | 0 | 4 | 0 | 4 | 0.0% |
@@ -53,7 +53,7 @@
 | jdbc2.PGObjectGetTest | 32 | 28 | 0 | 60 | 53.3% |
 | jdbc2.PGObjectSetTest | 14 | 26 | 0 | 40 | 35.0% |
 | jdbc2.PGPropertyTest | 11 | 0 | 0 | 11 | 100.0% |
-| jdbc2.PGTimeTest | 0 | 2 | 0 | 2 | 0.0% |
+| jdbc2.PGTimeTest | 1 | 1 | 0 | 2 | 50.0% |
 | jdbc2.PGTimestampTest | 1 | 1 | 0 | 2 | 50.0% |
 | jdbc2.ParameterStatusTest | 6 | 3 | 0 | 9 | 66.7% |
 | jdbc2.PreparedStatementTest | 92 | 14 | 4 | 110 | 86.8% |
@@ -63,7 +63,7 @@
 | jdbc2.ReplaceProcessingTest | 9 | 0 | 0 | 9 | 100.0% |
 | jdbc2.ResultSetMetaDataTest | 0 | 1 | 0 | 1 | 0.0% |
 | jdbc2.ResultSetRefreshTest | 0 | 2 | 0 | 2 | 0.0% |
-| jdbc2.ResultSetTest | 76 | 8 | 0 | 84 | 90.5% |
+| jdbc2.ResultSetTest | 78 | 6 | 0 | 84 | 92.9% |
 | jdbc2.SearchPathLookupTest | 0 | 3 | 0 | 3 | 0.0% |
 | jdbc2.ServerCursorTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.ServerErrorTest | 0 | 7 | 0 | 7 | 0.0% |
@@ -72,55 +72,23 @@
 | jdbc2.SocketTimeoutTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.StatementTest | 27 | 15 | 0 | 42 | 64.3% |
 | jdbc2.StringTypeUnspecifiedArrayTest | 2 | 0 | 0 | 2 | 100.0% |
-| jdbc2.TimeTest | 0 | 3 | 0 | 3 | 0.0% |
+| jdbc2.TimeTest | 1 | 2 | 0 | 3 | 33.3% |
 | jdbc2.TimestampTest | 6 | 8 | 0 | 14 | 42.9% |
 | jdbc2.TimezoneCachingTest | 4 | 0 | 0 | 4 | 100.0% |
-| jdbc2.TimezoneTest | 1 | 15 | 0 | 16 | 6.2% |
+| jdbc2.TimezoneTest | 2 | 14 | 0 | 16 | 12.5% |
 | jdbc2.TransactionRoundtripTest | 6 | 0 | 0 | 6 | 100.0% |
 | jdbc2.TransactionStateTest | 18 | 1 | 0 | 19 | 94.7% |
 | jdbc2.TypeCacheDLLStressTest | 0 | 1 | 0 | 1 | 0.0% |
 | jdbc2.UpdateableResultTest | 3 | 33 | 0 | 36 | 8.3% |
 | jdbc2.UpsertTest | 32 | 0 | 0 | 32 | 100.0% |
-| **total** | **4962** | **568** | **28** | **5558** | **89.7%** |
+| **total** | **5116** | **414** | **28** | **5558** | **92.5%** |
 
-## Failures (568)
+## Failures (414)
 
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
 - `jdbc2.ArrayTest :: testUnknownArrayType()`
 - `jdbc2.ArrayTest :: testUnknownArrayType()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
-- `jdbc2.AutoRollbackTest :: run()`
 - `jdbc2.AutoRollbackTest :: run()`
 - `jdbc2.AutoRollbackTest :: run()`
 - `jdbc2.AutoRollbackTest :: run()`
@@ -169,30 +137,6 @@
 - `jdbc2.BatchExecuteTest :: testSmallBatchUpdateFailureSimple()`
 - `jdbc2.BatchExecuteTest :: testSmallBatchUpdateFailureSimple()`
 - `jdbc2.BatchExecuteTest :: testSmallBatchUpdateFailureSimple()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
-- `jdbc2.BatchFailureTest :: run()`
 - `jdbc2.BatchFailureTest :: run()`
 - `jdbc2.BatchFailureTest :: run()`
 - `jdbc2.BatchFailureTest :: run()`
@@ -286,11 +230,9 @@
 - `jdbc2.CleanupSavepointsWithFastpathTest :: testMultipleQueriesThenLargeObject()`
 - `jdbc2.CleanupSavepointsWithFastpathTest :: testPreparedStatementThenLargeObject()`
 - `jdbc2.CleanupSavepointsWithFastpathTest :: testPreparedStatementThenLargeObject()`
-- `jdbc2.ConnectionTest :: pGStreamSettings()`
 - `jdbc2.ConnectionTest :: readOnly_always()`
 - `jdbc2.ConnectionTest :: readOnly_transaction()`
 - `jdbc2.ConnectionTest :: transactionIsolation()`
-- `jdbc2.CopyLargeFileTest :: feedTableSeveralTimesTest()`
 - `jdbc2.CopyTest :: copyMultiApi()`
 - `jdbc2.CursorFetchSqlTransactionTest :: [1] startTransaction=BEGIN`
 - `jdbc2.CursorFetchSqlTransactionTest :: [2] startTransaction=START TRANSACTION`
@@ -303,19 +245,11 @@
 - `jdbc2.DatabaseMetaDataPropertiesTest :: values()`
 - `jdbc2.DatabaseMetaDataTest :: initializationError`
 - `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [1] isolationLevel=8`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [1] isolationLevel=read committed`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [1] isolationLevel=read committed`
 - `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [2] isolationLevel=4`
 - `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [2] isolationLevel=read uncommitted`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [2] isolationLevel=read uncommitted`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [3] isolationLevel=2`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [3] isolationLevel=repeatable read`
 - `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [3] isolationLevel=repeatable read`
 - `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [4] isolationLevel=1`
 - `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [4] isolationLevel=serializable`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [4] isolationLevel=serializable`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: connectionTransactionIsolation()`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: metadataDefaultTransactionIsolation()`
 - `jdbc2.DateTest :: testGetDate()`
 - `jdbc2.DateTest :: testGetDate()`
 - `jdbc2.DateTest :: testGetDate()`
@@ -324,89 +258,6 @@
 - `jdbc2.DateTest :: testGetDate()`
 - `jdbc2.DateTest :: testGetDate()`
 - `jdbc2.DateTest :: testGetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
-- `jdbc2.DateTest :: testSetDate()`
 - `jdbc2.DateTest :: testSetDate()`
 - `jdbc2.DateTest :: testSetDate()`
 - `jdbc2.DateTest :: testSetDate()`
@@ -533,7 +384,6 @@
 - `jdbc2.PGObjectSetTest :: setNullAsPGobjectSubtype()`
 - `jdbc2.PGObjectSetTest :: setNullAsPGobjectSubtype()`
 - `jdbc2.PGObjectSetTest :: setNullAsPGobjectSubtype()`
-- `jdbc2.PGTimeTest :: testTimeInsertAndSelect()`
 - `jdbc2.PGTimeTest :: testTimeWithInterval()`
 - `jdbc2.PGTimestampTest :: timestampWithInterval()`
 - `jdbc2.ParameterStatusTest :: expectedInitialParameters()`
@@ -564,8 +414,6 @@
 - `jdbc2.ResultSetTest :: testTimestamp()`
 - `jdbc2.ResultSetTest :: testUpdateWithPGobject()`
 - `jdbc2.ResultSetTest :: testUpdateWithPGobject()`
-- `jdbc2.ResultSetTest :: testgetBadBoolean()`
-- `jdbc2.ResultSetTest :: testgetBadBoolean()`
 - `jdbc2.SearchPathLookupTest :: searchPathBackwardsCompatibleLookup()`
 - `jdbc2.SearchPathLookupTest :: searchPathHiddenLookup()`
 - `jdbc2.SearchPathLookupTest :: searchPathNormalLookup()`
@@ -593,7 +441,6 @@
 - `jdbc2.StatementTest :: updateCount()`
 - `jdbc2.StatementTest :: warningsAreAvailableAsap()`
 - `jdbc2.TimeTest :: getTime()`
-- `jdbc2.TimeTest :: getTimeZone()`
 - `jdbc2.TimeTest :: setTime()`
 - `jdbc2.TimestampTest :: testGetTimestampWOTZ()`
 - `jdbc2.TimestampTest :: testGetTimestampWOTZ()`
@@ -617,7 +464,6 @@
 - `jdbc2.TimezoneTest :: setDate()`
 - `jdbc2.TimezoneTest :: setTime()`
 - `jdbc2.TimezoneTest :: setTimestamp()`
-- `jdbc2.TimezoneTest :: setTimestampOnTime()`
 - `jdbc2.TransactionStateTest :: [2] sql=START TRANSACTION`
 - `jdbc2.TypeCacheDLLStressTest :: createDropTableAndGetTypeInfo()`
 - `jdbc2.UpdateableResultTest :: simpleAndUpdateableSameQuery()`

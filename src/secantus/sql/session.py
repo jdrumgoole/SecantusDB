@@ -492,6 +492,13 @@ class Session:
         merged.update(self.settings)
         return merged
 
+    def apply_database_defaults(self, defaults: dict[str, str]) -> None:
+        """Merge per-database GUC defaults (``ALTER DATABASE … SET``) into this
+        session. Called once at connect, BEFORE any client ``SET``, so an
+        explicit session setting always wins — PG's precedence order."""
+        for key, value in defaults.items():
+            self.settings.setdefault(canonical_guc_name(key), value)
+
     def get_setting(self, name: str) -> str:
         key = canonical_guc_name(name)
         if key in self.settings:

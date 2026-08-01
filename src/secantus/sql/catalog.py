@@ -27,6 +27,9 @@ ROLE_COLLECTION = "__sql_roles__"
 ROLE_MEMBER_COLLECTION = "__sql_role_members__"
 GRANT_COLLECTION = "__sql_grants__"
 SCHEMA_COLLECTION = "__sql_schemas__"
+# Per-database GUC defaults set by ``ALTER DATABASE … SET <guc>`` — applied to
+# every NEW session at connect (PG semantics), never to already-open ones.
+DB_SETTINGS_COLLECTION = "__sql_db_settings__"
 ENUM_COLLECTION = "__sql_enums__"
 # The enum oid counter lives outside ENUM_COLLECTION so list_enums stays a plain scan.
 ENUM_META_COLLECTION = "__sql_enum_meta__"
@@ -63,6 +66,7 @@ ALL_CATALOG_COLLECTIONS = (
     ROLE_MEMBER_COLLECTION,
     GRANT_COLLECTION,
     SCHEMA_COLLECTION,
+    DB_SETTINGS_COLLECTION,
     ENUM_COLLECTION,
     ENUM_META_COLLECTION,
     RANGE_TYPE_COLLECTION,
@@ -1135,6 +1139,20 @@ class Catalog:
     # tables). Types created in a schema are stored under their dotted
     # qualified name ("testschema.testcomp"); pg_namespace / pg_type surface
     # the schema with a minted namespace oid.
+
+    # -- per-database GUC defaults (ALTER DATABASE … SET) -------------------- #
+
+    def set_db_setting(self, db: str, name: str, value: str | None) -> None:
+        """Set (or, with ``value=None``, reset) a database-level GUC default."""
+        self._storage.delete_matching(db, DB_SETTINGS_COLLECTION, {"_id": name})
+        if value is not None:
+            self._storage.insert(db, DB_SETTINGS_COLLECTION, [{"_id": name, "value": value}])
+
+    def db_settings(self, db: str) -> dict[str, str]:
+        return {
+            d["_id"]: d["value"]
+            for d in self._storage.find_matching(db, DB_SETTINGS_COLLECTION, {})
+        }
 
     def create_schema(self, db: str, name: str) -> None:
         if not self.schema_exists(db, name):
