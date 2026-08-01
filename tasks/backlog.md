@@ -2408,17 +2408,33 @@ shared storage engine or building large new protocol subsystems:
     read off the JUnit XML. It is pgjdbc's `TypeInfoCache` type-lookup query,
     and it reduces to two independent bugs, both reproducible in three lines
     of SQL:
-    - **`JOIN … USING (col)` is ignored — the join degrades to a CROSS JOIN.**
-      `SELECT v, w FROM a JOIN b USING (k)` returns every pair instead of the
-      matching ones, and `SELECT *` emits the joined column twice rather than
-      merging it. Verified against PostgreSQL 14.13, which returns exactly one
-      row with one `k`. This is a silent wrong answer on ordinary SQL and is
-      much more serious than its gauge count suggests — fix ahead of the rest
-      of this list.
-    - **A derived table whose body reads a set-returning function** —
-      `JOIN (SELECT s.r FROM generate_series(1,2) AS s(r)) AS d ON …` — raises
-      `relation "" does not exist`. Plain derived tables over real tables are
-      fine, so it is the SRF-in-a-subquery FROM item that is unresolved.
+    - ~~`JOIN … USING (col)` degrades to a CROSS JOIN~~ — FIXED: USING is
+      desugared to a qualified ON before planning
+      (`planner.desugar_join_using`). Row semantics now match PostgreSQL
+      14.13 for inner / LEFT / chained / multi-column USING.
+    - **`SELECT *` over a `USING` join does not merge the joined column.**
+      Postgres returns `(1, 'x', 'p')` for `SELECT * FROM a JOIN b USING (k)`;
+      we emit `k` once per side, `(1, 'x', 1, 'p')`. The join *rows* are
+      correct — this is star expansion only, and suppressing the duplicate
+      means touching every star-expansion path in the planner (there are a
+      dozen, one per join shape). Pinned by
+      `tests/test_sql_join_using.py::TestKnownDivergence`.
+    - **A set-returning function is only supported as the sole FROM item**, so
+      `JOIN generate_series(…) AS s(r) ON …` and a derived table whose body
+      reads one both fail. This is what actually blocks the 73
+      `TypeInfoCache` failures. It used to surface as `relation ""`; it now
+      raises a faithful "only supported as the sole FROM item" error naming
+      the function. To implement: sqlglot models the source as an `exp.Table`
+      whose `this` is the function node (so `node.name` is empty), and
+      `planner._resolve_source` is the place to handle it. The pieces exist —
+      `srf.from_source` / `srf.build` produce rows plus a `TableDef`, and
+      `RawDerived(stmt, names)` is a derived-table plan the executor already
+      materializes through the engine. The unsolved part is column *types* at
+      plan time: `_resolve_source` runs without a storage/session context, so
+      the tags `srf.build` derives by evaluating are not available yet.
+      Resolve that (defer tag inference to materialization, or thread a
+      context in) rather than guessing tags — a wrongly-typed join source
+      would diverge silently, which is worse than the current honest error.
     Multi-entry `search_path` resolution landed separately and moved none of
     these; `SearchPathLookupTest`'s 3 failures are this same empty-name bug.
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`

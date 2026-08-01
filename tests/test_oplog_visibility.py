@@ -114,8 +114,14 @@ def test_find_seq_for_ts_waits_for_in_flight_mint(tmp_path):
 
         # find_seq_for_ts runs on another thread (the batch txn must be
         # exited on its owning thread); the commit lands mid-wait.
+        # The wait bound is widened well past the 0.12s below so the assertion
+        # tests the waiting behaviour and not the scheduler: with the default
+        # 0.5s a loaded runner could overshoot the sleep and take the bounded
+        # fallback, failing here with the committed-view answer (seq 3).
         result: list[int] = []
-        t = threading.Thread(target=lambda: result.append(s.find_seq_for_ts(target)))
+        t = threading.Thread(
+            target=lambda: result.append(s.find_seq_for_ts(target, max_wait_seconds=30.0))
+        )
         t.start()
         time.sleep(0.12)
         cm.__exit__(None, None, None)  # commit seq 2

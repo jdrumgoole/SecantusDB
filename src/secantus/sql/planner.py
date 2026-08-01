@@ -4486,6 +4486,61 @@ def qualified_table_name(table_node: exp.Table) -> str:
     return f"{sname}.{table_node.name}"
 
 
+def _join_source_alias(node: exp.Expression | None) -> str | None:
+    """The name a join source is referenced by: its alias if it has one, else
+    the table name. Returns None for a source we cannot name (and therefore
+    cannot build a qualified ON against)."""
+    if node is None:
+        return None
+    if isinstance(node, exp.From):
+        node = node.this
+    alias = node.args.get("alias") if isinstance(node.args.get("alias"), exp.TableAlias) else None
+    if alias is not None and alias.name:
+        return alias.name
+    if isinstance(node, exp.Table):
+        return node.alias_or_name or None
+    return None
+
+
+def desugar_join_using(stmt: exp.Expression) -> None:
+    """Rewrite ``JOIN b USING (c, …)`` into the equivalent qualified ON.
+
+    Nothing in join planning read ``args["using"]``, so a USING join lost its
+    condition entirely and degraded to a CROSS JOIN — ``SELECT v, w FROM a
+    JOIN b USING (k)`` returned every pair instead of the matching ones. That
+    is a silent wrong answer, so USING is normalised to ON here and the
+    existing ON machinery does the rest.
+
+    The left side of each equality is the nearest preceding source. In a chain
+    (``a JOIN b USING (k) JOIN c USING (k)``) Postgres joins against the merged
+    column, which equals the nearest preceding one by construction, so the
+    result set is the same.
+    """
+    for select in stmt.find_all(exp.Select):
+        joins = select.args.get("joins") or []
+        if not joins:
+            continue
+        # sqlglot spells the FROM arg "from_", not "from".
+        prev = _join_source_alias(select.args.get("from_"))
+        for jn in joins:
+            right = _join_source_alias(jn.this)
+            columns = jn.args.get("using") or []
+            if columns and prev and right:
+                conds = [
+                    exp.EQ(
+                        this=exp.column(col.name, table=prev),
+                        expression=exp.column(col.name, table=right),
+                    )
+                    for col in columns
+                ]
+                condition = conds[0]
+                for extra in conds[1:]:
+                    condition = exp.And(this=condition, expression=extra)
+                jn.set("on", condition)
+                jn.set("using", None)
+            prev = right or prev
+
+
 def _create_target(stmt: exp.Expression) -> exp.Table | None:
     """The relation a CREATE statement *defines*, which search_path resolution
     must leave alone: Postgres creates into the path's first schema and never
@@ -7102,6 +7157,18 @@ def _resolve_source(
         )
         derived.append(DerivedTable(name=alias, plan=sub_plan, columns=cols))
         return alias, tdef
+    if isinstance(node, exp.Table) and not isinstance(node.this, exp.Identifier):
+        # A table function in JOIN / derived-table position — sqlglot models it
+        # as a Table whose `this` is the function node, so `node.name` is empty
+        # and the lookup below reported `relation "" does not exist`, which
+        # says nothing about what actually went wrong. A set-returning function
+        # is only supported as the sole FROM item today (engine._run_srf_select);
+        # say that instead of naming a relation nobody wrote.
+        fn = node.this.sql() if node.this is not None else node.sql()
+        raise errors.feature_not_supported(
+            f"a set-returning function is only supported as the sole FROM item, not as a "
+            f"join or derived-table source: {fn}"
+        )
     tdef = _lookup_table_def(catalog, db, node, storage)
     if tdef is None:
         raise errors.undefined_table(node.name)

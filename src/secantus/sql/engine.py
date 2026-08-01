@@ -1795,6 +1795,7 @@ def _run_statement(
     stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
     planner.qualify_from_search_path(stmt, catalog, db, session)
+    planner.desugar_join_using(stmt)
     if isinstance(stmt, exp.Create):
         kind = (stmt.args.get("kind") or "TABLE").upper()
         if kind == "TABLE":

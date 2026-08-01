@@ -2733,7 +2733,7 @@ class Storage:
                 with contextlib.suppress(Exception):
                     session.close()
 
-    def find_seq_for_ts(self, ts: Timestamp) -> int:
+    def find_seq_for_ts(self, ts: Timestamp, *, max_wait_seconds: float = 0.5) -> int:
         """Smallest seq whose entry ``ts >= target``. Tail+1 if none qualify.
 
         The committed-view scan can name a seq above a minted-but-uncommitted
@@ -2746,8 +2746,14 @@ class Storage:
         user transaction hits the bounded deadline and falls back to the
         committed-view answer — the pre-fix behaviour. Twin of the Rust
         server's bounded wait.
+
+        ``max_wait_seconds`` is that bound. It is a parameter only so tests can
+        widen it: a test that opens a transaction, waits, then commits is
+        racing this deadline on the wall clock, and a loaded CI runner can
+        overshoot the default and take the fallback — which reads as a product
+        failure when it is only scheduling noise.
         """
-        deadline = _time.monotonic() + 0.5
+        deadline = _time.monotonic() + max_wait_seconds
         while True:
             r = self._find_seq_for_ts_scan(ts)
             vis = self.oplog_visible_tail_seq()
