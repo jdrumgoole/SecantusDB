@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use bson::{doc, Bson, Document};
 
-use crate::util::{as_i64, docs_to_bson};
+use crate::util::as_i64;
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
 
 /// Idle TTL for ordinary cursors — MongoDB's 10-minute default.
@@ -581,13 +581,21 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         });
         let mut cursor_doc = doc! {
-            "nextBatch": docs_to_bson(batch)?,
             "id": Bson::Int64(if closed { 0 } else { cursor_id }),
             "ns": ns,
         };
         if let Some(tok) = pbrt {
             cursor_doc.insert("postBatchResumeToken", tok);
         }
+        // Raw splice, same as the plain getMore below: the event blobs go to
+        // the wire encoder undecoded. The postBatchResumeToken only ever
+        // needed the LAST blob (`post_batch_resume_token`), so nothing here
+        // requires materialising the whole batch any more; the splice keeps
+        // the exact old field order (nextBatch, id, ns, postBatchResumeToken).
+        ctx.pending_batch = Some(crate::PendingBatch {
+            batch_field: "nextBatch",
+            batch,
+        });
         return Ok(doc! { "cursor": cursor_doc, "ok": 1.0 });
     }
 
@@ -598,8 +606,8 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // The registry already holds the batch as pre-encoded blobs; hand them to
     // the server (`ctx.pending_batch`) to splice onto the wire without the
     // decode→re-encode round-trip `docs_to_bson` would cost. The reply carries
-    // only the cursor envelope. (The tailable branch above keeps materialising
-    // because it computes a `postBatchResumeToken` from the decoded batch.)
+    // only the cursor envelope. (The tailable branch above splices the same
+    // way; its postBatchResumeToken decodes only the last blob.)
     ctx.pending_batch = Some(crate::PendingBatch {
         batch_field: "nextBatch",
         batch,
