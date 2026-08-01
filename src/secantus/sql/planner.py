@@ -2579,6 +2579,37 @@ def _is_sequence_func(node: exp.Expression) -> bool:
     )
 
 
+_CAST_TYPNAME_BY_OID = {
+    1042: "bpchar",
+    1043: "varchar",
+    1560: "bit",
+    1562: "varbit",
+    1700: "numeric",
+    1083: "time",
+    1114: "timestamp",
+    1184: "timestamptz",
+    1186: "interval",
+    1266: "timetz",
+    114: "json",
+}
+
+
+def _cast_output_name(target: exp.Expression) -> str | None:
+    """PG names an unaliased top-level cast's output column after the target
+    type's ``typname`` — ``SELECT 2::int8`` yields a column named ``int8``,
+    ``'x'::varchar`` yields ``varchar``. None when ``target`` isn't a cast or
+    the name isn't a plain scalar typname (the ``?column?`` fallback stands)."""
+    if not isinstance(target, exp.Cast) or target.to is None:
+        return None
+    ident = typemap.cast_type_identity(target.to)
+    if ident is not None and ident[0] in _CAST_TYPNAME_BY_OID:
+        return _CAST_TYPNAME_BY_OID[ident[0]]
+    tag = typemap.type_tag_for_sql(target.to)
+    if tag is None or "[]" in tag:
+        return None
+    return tag
+
+
 def plan_constant_select(
     stmt: exp.Select,
     session: Any,
@@ -2613,7 +2644,13 @@ def plan_constant_select(
             value = _literal(target)
             # Tag from the AST, not the Python value — a decimal constant
             # (``SELECT 1.5``) is numeric in Postgres, which the float can't show.
-            columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
+            columns.append(
+                (
+                    alias or _cast_output_name(target) or "?column?",
+                    _infer_scalar_tag(target, _const_scope),
+                    value,
+                )
+            )
         elif _is_sequence_func(target):
             # nextval / currval / setval / lastval need storage + session state,
             # so they go through the scalar evaluator (not the storage-free
@@ -2638,11 +2675,21 @@ def plan_constant_select(
                 # range type's constructor) — the full scalar evaluator decides.
                 value = scalar.evaluate(target, _const_scope, ctx)
                 columns.append(
-                    (alias or "?column?", _infer_scalar_tag(target, _const_scope), value)
+                    (
+                        alias or _cast_output_name(target) or "?column?",
+                        _infer_scalar_tag(target, _const_scope),
+                        value,
+                    )
                 )
         else:
             value = scalar.evaluate(target, _const_scope, ctx)
-            columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
+            columns.append(
+                (
+                    alias or _cast_output_name(target) or "?column?",
+                    _infer_scalar_tag(target, _const_scope),
+                    value,
+                )
+            )
     pg_oids: list[int | None] = [None] * len(columns)
     typmods: list[int] = [-1] * len(columns)
     for i, e in enumerate(stmt.expressions):
@@ -2950,7 +2997,7 @@ def _returning_columns(
             )
         else:
             # A computed expression — evaluated per returned row (field unused).
-            out_name = alias or "?column?"
+            out_name = alias or _cast_output_name(target) or "?column?"
             tag = _infer_scalar_tag(target, resolve)
             items.append(
                 (out_name, Column(out_name, tag, out_name, pk=False, nullable=True), target)
@@ -4626,7 +4673,11 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
                 out_columns.append((names.fresh(col.name), col.type_tag))
                 out_exprs.append(exp.column(col.name))
             continue
-        name = alias or (_column_name(inner) if isinstance(inner, exp.Column) else "?column?")
+        name = alias or (
+            _column_name(inner)
+            if isinstance(inner, exp.Column)
+            else _cast_output_name(inner) or "?column?"
+        )
         enum_name = _projected_enum_type(inner, table)
         if enum_name is not None:
             out_enum_types[len(out_columns)] = enum_name
@@ -6136,7 +6187,11 @@ def _finish_group_window(
         inner = e.this if isinstance(e, exp.Alias) else e
         if isinstance(inner, exp.Star):
             raise errors.feature_not_supported("SELECT * with GROUP BY is not supported")
-        name = alias or (_column_name(inner) if isinstance(inner, exp.Column) else "?column?")
+        name = alias or (
+            _column_name(inner)
+            if isinstance(inner, exp.Column)
+            else _cast_output_name(inner) or "?column?"
+        )
         out_columns.append((onames.fresh(name), _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
         if alias is not None:
@@ -6840,7 +6895,11 @@ def _fromless_out_columns(stmt: exp.Select) -> list[tuple[str, str]]:
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         target = e.this if isinstance(e, exp.Alias) else e
-        name = alias or (target.name if isinstance(target, exp.Column) else "?column?")
+        name = alias or (
+            target.name
+            if isinstance(target, exp.Column)
+            else _cast_output_name(target) or "?column?"
+        )
         try:
             tag = _infer_scalar_tag(target, _const_scope)
         except errors.SQLError:
@@ -9618,7 +9677,7 @@ def _build_evaluated_join(
         if isinstance(inner, exp.Column):
             name = alias or _column_name(inner)
         else:
-            name = alias or "?column?"
+            name = alias or _cast_output_name(inner) or "?column?"
         src_col = _column_for_order_node(inner, amap)
         if src_col is not None and src_col.enum_type is not None:
             out_enum_types[len(out_columns)] = src_col.enum_type

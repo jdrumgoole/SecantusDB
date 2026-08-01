@@ -54,6 +54,11 @@ jobs:
           # init + TPC-B (three protocol modes) + select-only + psql catalog
           # smoke. Needs pgbench/psql (postgresql-contrib, installed below).
           - { name: sql-stress, task: sql-stress, report: docs/validation-report-sqlstress.md }
+          # The SQL-server wire-protocol gauge (tasks/sql-gauges-plan.md G3):
+          # cockroach's pgtest datadriven corpus + runner, fetched verbatim at
+          # a pinned commit (sparse clone, cached) and driven over pgproto3.
+          # Needs the Go toolchain (shared setup step with the go/pgx gauges).
+          - { name: pgtest, task: validate-pgtest, report: docs/validation-report-pgtest.md }
           # The SQL-server low-level Go gauge (tasks/sql-gauges-plan.md G4):
           # jackc/pgx's pgconn + pgproto3 packages, unmodified, over
           # PGX_TEST_DATABASE. Needs the Go toolchain (shared with the go
@@ -183,7 +188,7 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Set up Go
-        if: matrix.driver.name == 'go' || matrix.driver.name == 'pgx'
+        if: matrix.driver.name == 'go' || matrix.driver.name == 'pgx' || matrix.driver.name == 'pgtest'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: "1.25"
