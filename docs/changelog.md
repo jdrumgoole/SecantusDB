@@ -17,9 +17,129 @@ Versioning](https://semver.org/spec/v2.0.0.html), but while we're in
 beta the patch number `bN` rolls forward on every PyPI-visible push;
 the API surface itself is shaped by Semantic Versioning intent.
 
-## [Unreleased]
+## [0.6.0b9] — 2026-08-01
 
-## [0.6.0b8] — 2026-08-02
+### Async oplog hardened: transactions can no longer leak ghost events
+
+The Rust server's opt-in async oplog (`RustServer(oplog_async=True)` /
+`secantusd-rs --oplog-async`) closed out its prototype caveats. The
+important one was a correctness bug the hardening audit caught: a write
+inside a multi-document transaction handed its oplog entry to the
+background drainer *before* the transaction committed, so a rollback
+left a persisted entry for data that never existed — a phantom change
+event and a wrong PITR row. Entries now buffer on the transaction handle
+and reach the drainer only after the commit succeeds; a rolled-back
+transaction leaves no oplog trace.
+
+Two smaller async-mode gaps closed with it. Reading `local.oplog.rs`
+now drains the writer's queue first, so a client that just got its
+write acknowledged sees the entry in the oplog view — read-your-own-write,
+as on mongod. And the opportunistic prune cadence moved from the write
+path to the drainers themselves: the old trigger could only prune rows
+already persisted, so a lagging drainer queue escaped every sweep and a
+burst of writes could leave the oplog over its cap until the next
+explicit prune. CI gains an async-oplog lane that runs the whole
+storage suite with the drainer pool live.
+
+#### Fixed
+
+- Async oplog: multi-document transaction writes minted + enqueued their
+  oplog entries mid-transaction; a rollback persisted a ghost entry
+  (phantom change-stream event, wrong PITR). Entries now buffer on the
+  transaction handle and are minted + enqueued only after a successful
+  commit; rollback / commit-failure / handle drop discard them
+  (`crates/secantus-storage/tests/async_txn.rs` pins both directions).
+- Async oplog: `local.oplog.rs` reads raced the drainer — an
+  acknowledged write's entry could be missing from the view. The view
+  read path now flushes the drainer first (no-op in sync mode; skipped
+  inside a user transaction, where mongod forbids reading `local`
+  anyway).
+- Async oplog: the opportunistic prune fired on minted volume but could
+  only doom persisted rows, so drainer-queue lag escaped the sweep and
+  the counter reset deferred the retry a full interval — an oplog
+  temporarily unbounded past `oplog_max_entries` under bursts. The
+  cadence now lives with the drainers (triggered as rows land).
+- Async oplog: an explicit `prune_oplog` call racing the drainer pruned
+  a timing-dependent subset of acknowledged writes (cap-excess rows
+  still queued escaped the sweep, shifting the pruned count and the
+  resulting oplog floor / PITR segment contents). The public entry
+  point now drains the queue first, so explicit prunes
+  deterministically cover every acknowledged write.
+
+#### Changed
+
+- `tests/oplog_visibility.rs` pins `oplog_async: Some(false)` (it tests
+  the sync in-flight-mint window, which async mode does not have) and
+  storage-crate oplog tests pin the async read-after-write contract with
+  explicit `flush_oplog()` calls, so the whole suite is meaningful in
+  both modes.
+
+#### Added
+
+- CI: an async-oplog parity lane in the `rust-storage` job —
+  `cargo test` re-run under `SECANTUS_OPLOG_ASYNC=1` +
+  `SECANTUS_OPLOG_NONLOGGED=1` — the stated precondition for the mode
+  ever becoming a default.
+
+### Change streams no longer skip an event that commits mid-lookup
+
+Resuming a change stream from a point in time could permanently miss an event.
+Mapping a `startAtOperationTime` to a position scans the committed oplog and
+then checks that nothing is still in flight below the answer — but it read
+those two things in the wrong order. A write that committed between the scan
+and the check produced a stale answer naming the position *above* it, while
+the check had already advanced to cover that position, so the answer was
+accepted and the event was never delivered.
+
+The two reads are now ordered so the in-flight check is sampled first, which
+is conservative in the safe direction: the visible position only ever moves
+forward, so an earlier reading can only make the check stricter, never let an
+unresolved write slip past.
+
+The window was narrow enough to surface only as an intermittent CI failure on
+Windows, where the coarser scheduling quantum happened to land inside it. It
+is reproducible on demand once the interleaving is forced, and the regression
+test does exactly that rather than racing for it. Both the Python and the Rust
+storage engines carried the same ordering and both are fixed.
+
+#### Fixed
+
+- `startAtOperationTime` could resolve to a position past an in-flight write
+  whose entry qualified, permanently skipping that event once it committed.
+
+### Set-returning functions work as join and derived-table sources
+
+`generate_series`, `unnest` and friends worked only as the *sole* `FROM` item.
+Used anywhere else — joined to a table, or inside a derived table — they
+failed with `relation "" does not exist`, an error naming a relation nobody
+had written. The empty name was the tell: sqlglot models a table function as
+a table whose name lives in a function node rather than an identifier, so the
+planner fell through to a catalog lookup for the empty string.
+
+Such a source is now reduced to the base-less shape the engine already knows
+how to materialize, and handed to the executor as a raw sub-plan. That matters
+for more than tidiness: the rows are produced at execution time, so an SRF
+whose arguments read session state — `generate_series(1,
+array_upper(current_schemas(false), 1))` — resolves against the real session
+instead of being guessed at while planning.
+
+`pg_type` also gained `typinput`, the column drivers compare against
+`array_in` to decide whether a type is an array.
+
+Together these let the JDBC driver's type-lookup query run, which had been the
+single largest source of failures in its conformance suite; the gauge moves
+from 92.5% to 93.7%.
+
+#### Added
+
+- `pg_catalog.pg_type.typinput`.
+
+#### Fixed
+
+- A set-returning function in `JOIN` position, or in the body of a derived
+  table, no longer fails with `relation "" does not exist`.
+
+## [0.6.0b8] — 2026-08-01
 
 ### A kill -9 crash window in the data-nonlogged mode could lose acknowledged writes — fixed
 

@@ -1118,7 +1118,11 @@ SELECT id, unnest(tags) FROM post;    -- one row per element
 index — Postgres arrays don't wrap), and `arr[lo:hi]` returns the 1-based
 inclusive slice (clamped to the array bounds). Both work in the SELECT list and in
 `WHERE` (`WHERE tags[1] = 'py'`). `unnest(array_col)` in the SELECT list expands
-the array; the FROM-clause table form (`FROM unnest(col)`) is not yet supported.
+the array, and the FROM-clause table form works too — both standalone
+(`FROM unnest(ARRAY[10, 20]) AS x`) and the lateral comma-join form that
+expands per row (`SELECT id, tag FROM t, unnest(t.tags) AS tag`). Set-returning
+functions (`generate_series`, `unnest`, …) can also appear as join and
+derived-table sources, not just as the sole `FROM` item.
 
 The array manipulation functions are available too:
 
