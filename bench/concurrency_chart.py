@@ -299,17 +299,17 @@ def replace_block(text: str, begin: str, end: str, content: str, *, path: Path) 
 
 def refresh_surface(path: Path, viz: str, table: str) -> bool:
     """Rewrite both marked regions in ``path``; return True if it changed."""
-    original = path.read_text()
+    original = path.read_text(encoding="utf-8")
     updated = replace_block(original, VIZ_BEGIN, VIZ_END, viz, path=path)
     updated = replace_block(updated, TABLE_BEGIN, TABLE_END, table, path=path)
     if updated != original:
-        path.write_text(updated)
+        path.write_text(updated, encoding="utf-8", newline="\n")
         return True
     return False
 
 
 def load_results(path: Path) -> dict:
-    results = json.loads(path.read_text())
+    results = json.loads(path.read_text(encoding="utf-8"))
     missing = REQUIRED_SERVERS - results.get("servers", {}).keys()
     if missing:
         raise SystemExit(

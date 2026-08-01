@@ -128,7 +128,7 @@ def test_refresh_surface_idempotent(tmp_path: Path, results: dict) -> None:
         viz = render_viz(results, style)
         refresh_surface(copy, viz, table)
         assert refresh_surface(copy, viz, table) is False
-        text = copy.read_text()
+        text = copy.read_text(encoding="utf-8")
         for marker in (VIZ_BEGIN, VIZ_END, TABLE_BEGIN, TABLE_END):
             assert text.count(marker) == 1
 

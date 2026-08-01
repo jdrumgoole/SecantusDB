@@ -442,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         out = Path(args.json)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(payload, indent=2) + "\n")
+        out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         print(f"wrote {out}")
     return 0
 
