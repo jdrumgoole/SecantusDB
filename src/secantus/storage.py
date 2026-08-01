@@ -46,7 +46,7 @@ from secantus.geo_index import (
     s2_query_covering,
 )
 from secantus.paths import get_path, get_path_values
-from secantus.projection import apply_projection
+from secantus.projection import apply_projection_batch
 from secantus.query import matches
 from secantus.sortkey import COMPOUND_SEP, encode_value, encode_value_directed
 from secantus.update import apply_update, find_positional_matches
@@ -151,7 +151,10 @@ def _doc_shard_name(s: int) -> str:
     return f"table:secantus_documents_sh{s}"
 
 
+@functools.lru_cache(maxsize=4096)
 def _doc_table_for(db: str, coll: str) -> str:
+    # Memoised: the pure-Python FNV byte loop ran on every storage op for an
+    # immutable (db, coll) -> shard-name mapping.
     return _doc_shard_name(_doc_shard_hash(db, coll) % _DOC_SHARDS)
 
 
@@ -2153,7 +2156,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection, filter) for r in rows]
+            rows = apply_projection_batch(rows, projection, filter)
         return rows
 
     def _is_system_users(self, db: str, coll: str) -> bool:
@@ -2240,7 +2243,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection, filter) for r in rows]
+            rows = apply_projection_batch(rows, projection, filter)
         return rows
 
     def _count_system_users(
@@ -2307,7 +2310,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection, filter) for r in rows]
+            rows = apply_projection_batch(rows, projection, filter)
         return rows
 
     def _count_system_version(
@@ -4385,7 +4388,7 @@ class Storage:
         if limit > 0:
             out = out[:limit]
         if projection:
-            out = [apply_projection(d, projection, filter) for d in out]
+            out = apply_projection_batch(out, projection, filter)
         return out
 
     def _apply_minmax_bounds(

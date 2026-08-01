@@ -438,6 +438,12 @@ def _resolve_path(doc: Any, path: str) -> list[Any]:
     return current
 
 
+# Operator-clause keys that ride alongside another operator rather than
+# being operators themselves (hoisted: this used to be rebuilt per doc
+# per clause inside _field_matches).
+_SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
+
+
 def _field_matches(values: list[Any], condition: Any, collation: Collation | None = None) -> bool:
     if isinstance(condition, Regex):
         return _op_regex(values, condition.pattern, condition.flags)
@@ -449,7 +455,6 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
         # bound lives at the sibling level (mongod's
         # ``{geo: {$near: [x, y], $maxDistance: r}}``). Skip them when
         # iterating; pull them in below when their parent op runs.
-        _SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
         has_near = "$near" in condition or "$nearSphere" in condition
         # mongod validates the $regex / $options pair at parse time (BadValue /
         # 51108), before matching. $options is a sibling modifier of $regex.
