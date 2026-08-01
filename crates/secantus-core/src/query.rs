@@ -653,6 +653,9 @@ fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
     if let (Bson::Boolean(a), Bson::Boolean(b)) = (v, expected) {
         return Ok(a == b);
     }
+    if let Some(r) = numeric::fast_eq(v, expected) {
+        return Ok(r);
+    }
     if let (Some(na), Some(nb)) = (numeric::classify(v), numeric::classify(expected)) {
         return Ok(numeric::eq(&na, &nb));
     }
@@ -734,6 +737,9 @@ fn compare_values(
             (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
             _ => None,
         });
+    }
+    if let Some(r) = numeric::fast_cmp(a, b) {
+        return Ok(r);
     }
     if let (Some(na), Some(nb)) = (numeric::classify(a), numeric::classify(b)) {
         return Ok(numeric::cmp(&na, &nb));

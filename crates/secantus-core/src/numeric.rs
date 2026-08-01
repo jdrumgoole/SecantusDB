@@ -129,6 +129,124 @@ pub fn from_f64(d: f64) -> NumVal {
     from_decimal_str(&format!("{d}"))
 }
 
+/// Exact ordering of an i64-range integer against a double, without
+/// allocating. `None` = unordered (NaN). Exactness argument: when
+/// `|f| < 2^63`, `f.trunc()` fits in i64 and converts exactly (any double
+/// with `|f| > 2^53` is already integral, and integral doubles below 2^63
+/// convert exactly); comparing the integer parts and tie-breaking on the
+/// fractional remainder is then exact for every case, which is what the
+/// digit-form [`cmp`] computes for the same pair.
+fn cmp_i64_f64(i: i64, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    if f == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if f == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    // `as` saturates: for |f| >= 2^63 (reachable via the ungated Int32 arms)
+    // t pins to i64::MAX/MIN, which still orders correctly against any i32,
+    // and the equal/frac tie-break is unreachable there (t != i). For
+    // |f| < 2^63 the trunc converts exactly (integral doubles > 2^53 are
+    // exact; below 2^53 everything is).
+    let t = f.trunc() as i64;
+    Some(match i.cmp(&t) {
+        Ordering::Equal => {
+            let frac = f - t as f64; // exact: t as f64 == trunc(f) exactly here
+            if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        other => other,
+    })
+}
+
+/// Allocation-free comparison fast path for the common int32/int64/double
+/// pairs — byte-for-byte the same verdicts as `classify` + [`cmp`], skipping
+/// the digit-vector build those allocate per call. Returns:
+///
+/// * `None`        — not applicable (Decimal128 or non-numeric involved);
+///   the caller falls back to `classify`.
+/// * `Some(None)`  — unordered (NaN involved), matching [`cmp`]'s `None`.
+/// * `Some(Some)`  — the ordering.
+///
+/// Double↔double uses `partial_cmp` (shortest-repr digit ordering and f64
+/// ordering agree for all finite doubles: repr round-trips, and rounding is
+/// monotone, so distinct doubles keep their order and equal reprs mean equal
+/// doubles; ±0.0 both classify to `Zero` and compare equal either way;
+/// infinities and NaN match the variant handling).
+///
+/// The MIXED int↔double arm is gated to |values| ≤ 2^53. The engines'
+/// established semantic (Python parity) compares a double by the decimal
+/// value of its SHORTEST REPR, which can differ from the exact binary value
+/// above 2^53 (e.g. the double 2^63 reprs as 9223372036854776000) — an exact
+/// comparison would diverge there, so those pairs fall back to the digit
+/// form. Within ±2^53 every integer in play is exactly representable and a
+/// repr cannot cross an integer boundary, so exact and repr-decimal verdicts
+/// coincide.
+pub fn fast_cmp(a: &Bson, b: &Bson) -> Option<Option<Ordering>> {
+    // Gate on the INTEGER only: an exactly-representable i (|i| <= 2^53)
+    // rounds to itself, so it can never sit strictly between a double and
+    // that double's repr-decimal — the two verdicts coincide for any double
+    // operand. Int64 outside +/-2^53 declines to the digit form.
+    const SAFE_I: i64 = 1 << 53;
+    let mixed_ok = |i: i64| (-SAFE_I..=SAFE_I).contains(&i);
+    match (a, b) {
+        (Bson::Int32(x), Bson::Int32(y)) => Some(Some(x.cmp(y))),
+        (Bson::Int64(x), Bson::Int64(y)) => Some(Some(x.cmp(y))),
+        (Bson::Int32(x), Bson::Int64(y)) => Some(Some((*x as i64).cmp(y))),
+        (Bson::Int64(x), Bson::Int32(y)) => Some(Some(x.cmp(&(*y as i64)))),
+        (Bson::Double(x), Bson::Double(y)) => Some(x.partial_cmp(y)),
+        (Bson::Int32(x), Bson::Double(y)) => Some(cmp_i64_f64(*x as i64, *y)),
+        (Bson::Int64(x), Bson::Double(y)) if mixed_ok(*x) => Some(cmp_i64_f64(*x, *y)),
+        (Bson::Double(x), Bson::Int32(y)) => {
+            Some(cmp_i64_f64(*y as i64, *x).map(Ordering::reverse))
+        }
+        (Bson::Double(x), Bson::Int64(y)) if mixed_ok(*y) => {
+            Some(cmp_i64_f64(*y, *x).map(Ordering::reverse))
+        }
+        _ => None,
+    }
+}
+
+/// Equality companion to [`fast_cmp`] (NaN never equal, matching [`eq`]).
+pub fn fast_eq(a: &Bson, b: &Bson) -> Option<bool> {
+    fast_cmp(a, b).map(|o| o == Some(Ordering::Equal))
+}
+
+/// Whether a value is "numberish" in the expression engine's sense
+/// (int/long/double/bool) — a type test only, no allocation.
+pub fn is_numberish(b: &Bson) -> bool {
+    matches!(
+        b,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(_)
+    )
+}
+
+/// [`fast_cmp`] with the expression engine's numberish semantics: bool
+/// compares as 0/1 (mirroring `as_num`). Same return contract as
+/// [`fast_cmp`].
+pub fn fast_cmp_numberish(a: &Bson, b: &Bson) -> Option<Option<Ordering>> {
+    let widen = |v: &Bson| -> Option<Bson> {
+        match v {
+            Bson::Boolean(x) => Some(Bson::Int32(i32::from(*x))),
+            _ => None,
+        }
+    };
+    match (widen(a), widen(b)) {
+        (None, None) => fast_cmp(a, b),
+        (Some(wa), None) => fast_cmp(&wa, b),
+        (None, Some(wb)) => fast_cmp(a, &wb),
+        (Some(wa), Some(wb)) => fast_cmp(&wa, &wb),
+    }
+}
+
 fn from_decimal_str(s: &str) -> NumVal {
     let low = s.to_lowercase();
     if low.contains("nan") {
@@ -296,5 +414,113 @@ mod tests {
             Some(Ordering::Less)
         );
         assert_eq!(cmp(&n(Bson::Double(f64::NAN)), &n(Bson::Int32(0))), None);
+    }
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::*;
+
+    /// Every int32/int64/double pair must get the same verdict from
+    /// `fast_cmp` as from the digit-form `classify` + `cmp` it bypasses.
+    #[test]
+    fn fast_cmp_matches_classify_on_edge_corpus() {
+        let ints: Vec<i64> = vec![
+            0,
+            1,
+            -1,
+            2,
+            42,
+            -42,
+            (1 << 53) - 1,
+            1 << 53,
+            (1 << 53) + 1,
+            -(1 << 53) - 1,
+            i64::MAX,
+            i64::MIN,
+            i64::MAX - 1,
+            i64::MIN + 1,
+            i32::MAX as i64,
+            i32::MIN as i64,
+        ];
+        let doubles: Vec<f64> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            1.5,
+            2.5e-10,
+            9.007199254740992e15,  // 2^53
+            9.007199254740993e15,  // rounds to 2^53
+            9.223372036854776e18,  // 2^63 (shortest repr)
+            -9.223372036854776e18, // -2^63 (shortest repr)
+            9.3e18,
+            -9.3e18,
+            1e300,
+            -1e300,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::MIN_POSITIVE,
+            42.0,
+            #[allow(clippy::excessive_precision)]
+            41.999_999_999_999_996, // nearest double just below 42
+            42.00000000000001,
+            (i64::MAX as f64),
+            (i64::MIN as f64),
+        ];
+        let mut values: Vec<Bson> = Vec::new();
+        for &i in &ints {
+            if (i32::MIN as i64..=i32::MAX as i64).contains(&i) {
+                values.push(Bson::Int32(i as i32));
+            }
+            values.push(Bson::Int64(i));
+        }
+        for &d in &doubles {
+            values.push(Bson::Double(d));
+        }
+        for a in &values {
+            for b in &values {
+                let slow = match (classify(a), classify(b)) {
+                    (Some(na), Some(nb)) => Some(cmp(&na, &nb)),
+                    _ => None,
+                };
+                // A `None` decline is always legal (the caller falls back to
+                // the digit form); a `Some` answer must match it exactly.
+                if let Some(fast) = fast_cmp(a, b) {
+                    assert_eq!(
+                        Some(fast),
+                        slow,
+                        "fast_cmp({a:?}, {b:?}) answered {fast:?} but the digit form said {slow:?}"
+                    );
+                }
+                if let Some(fe) = fast_eq(a, b) {
+                    let slow_eq = match (classify(a), classify(b)) {
+                        (Some(na), Some(nb)) => eq(&na, &nb),
+                        _ => unreachable!("fast_eq answered on a non-numeric pair"),
+                    };
+                    assert_eq!(fe, slow_eq, "fast_eq({a:?}, {b:?})");
+                }
+            }
+        }
+    }
+
+    /// Decimal128 and non-numeric operands must be declined (caller falls
+    /// back to the digit form), never mis-answered.
+    #[test]
+    fn fast_cmp_declines_decimal_and_non_numeric() {
+        let dec: Bson = Bson::Decimal128("1.5".parse().unwrap());
+        assert_eq!(fast_cmp(&dec, &Bson::Int32(1)), None);
+        assert_eq!(fast_cmp(&Bson::Int32(1), &dec), None);
+        assert_eq!(fast_cmp(&Bson::String("x".into()), &Bson::Int32(1)), None);
+        assert_eq!(fast_cmp(&Bson::Boolean(true), &Bson::Int32(1)), None);
+        // ...but the numberish variant maps bool to 0/1:
+        assert_eq!(
+            fast_cmp_numberish(&Bson::Boolean(true), &Bson::Int32(1)),
+            Some(Some(std::cmp::Ordering::Equal))
+        );
+        assert_eq!(fast_cmp_numberish(&dec, &Bson::Int32(1)), None);
     }
 }

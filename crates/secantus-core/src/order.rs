@@ -93,10 +93,15 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
         (Bson::Array(x), Bson::Array(y)) => array_cmp(x, y),
         // Rank 3: the unified numeric type. NaN is unordered -> Python's `<` is
         // False both ways -> Equal (stable).
-        _ => match (numeric::classify(a), numeric::classify(b)) {
-            (Some(na), Some(nb)) => numeric::cmp(&na, &nb).unwrap_or(Ordering::Equal),
-            _ => Ordering::Equal,
-        },
+        _ => {
+            if let Some(r) = numeric::fast_cmp(a, b) {
+                return r.unwrap_or(Ordering::Equal);
+            }
+            match (numeric::classify(a), numeric::classify(b)) {
+                (Some(na), Some(nb)) => numeric::cmp(&na, &nb).unwrap_or(Ordering::Equal),
+                _ => Ordering::Equal,
+            }
+        }
     }
 }
 
@@ -216,6 +221,9 @@ pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
             }
             // Rank 3: the unified numeric type (int / long / double /
             // Decimal128). NaN is unordered → Python `<` is False.
+            if let Some(r) = numeric::fast_cmp(a, b) {
+                return Some(r == Some(Ordering::Less));
+            }
             match (numeric::classify(a), numeric::classify(b)) {
                 (Some(na), Some(nb)) => Some(numeric::cmp(&na, &nb) == Some(Ordering::Less)),
                 _ => None,
