@@ -1,6 +1,6 @@
 [package]
 name = "secantus-server"
-version = "0.5.3-beta.158"
+version = "0.5.3-beta.159"
 edition = "2021"
 description = "The standalone SecantusDB Rust server: TCP accept loop + connection handling over secantus-wire + secantus-commands."
 license = "GPL-2.0-only"
