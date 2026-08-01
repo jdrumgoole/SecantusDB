@@ -2574,11 +2574,24 @@ def _fold_single_row_aggregates(node: exp.Expression, ctx: Any, rows: int = 1) -
 
     ``rows=0`` folds over an EMPTY input — the case where a WHERE excludes the
     implicit row (``SELECT count(*) WHERE 1=2``). An ungrouped aggregate still
-    produces exactly one output row, with ``COUNT`` 0 and the others NULL."""
+    produces exactly one output row, with ``COUNT`` 0 and the others NULL.
+
+    Aggregates inside a nested SELECT are left alone: that subquery has its own
+    row source, so folding it against the outer implicit row is simply wrong —
+    ``SELECT (SELECT count(*) FROM t)`` answered 1 for any ``t``, and
+    ``SELECT (SELECT max(a) FROM t)`` raised ``column "a" does not exist``."""
     from secantus.sql import scalar
 
+    node = node.copy()
+    nested_aggs = {
+        id(agg)
+        for sub in node.find_all(exp.Select, exp.Subquery)
+        if sub is not node
+        for agg in sub.find_all(_SINGLE_ROW_AGGS)
+    }
+
     def fold(n: exp.Expression) -> exp.Expression:
-        if not isinstance(n, _SINGLE_ROW_AGGS):
+        if not isinstance(n, _SINGLE_ROW_AGGS) or id(n) in nested_aggs:
             return n
         arg = n.this
         if isinstance(arg, exp.Distinct):
@@ -2595,7 +2608,7 @@ def _fold_single_row_aggregates(node: exp.Expression, ctx: Any, rows: int = 1) -
             return exp.Null()
         return _value_to_node(scalar.evaluate(arg, _const_scope, ctx))
 
-    return node.transform(fold)
+    return node.transform(fold, copy=False)
 
 
 def _select_has_aggregate(stmt: exp.Select) -> bool:
@@ -4471,6 +4484,109 @@ def qualified_table_name(table_node: exp.Table) -> str:
     if not sname or sname == "public":
         return table_node.name
     return f"{sname}.{table_node.name}"
+
+
+def _join_source_alias(node: exp.Expression | None) -> str | None:
+    """The name a join source is referenced by: its alias if it has one, else
+    the table name. Returns None for a source we cannot name (and therefore
+    cannot build a qualified ON against)."""
+    if node is None:
+        return None
+    if isinstance(node, exp.From):
+        node = node.this
+    alias = node.args.get("alias") if isinstance(node.args.get("alias"), exp.TableAlias) else None
+    if alias is not None and alias.name:
+        return alias.name
+    if isinstance(node, exp.Table):
+        return node.alias_or_name or None
+    return None
+
+
+def desugar_join_using(stmt: exp.Expression) -> None:
+    """Rewrite ``JOIN b USING (c, …)`` into the equivalent qualified ON.
+
+    Nothing in join planning read ``args["using"]``, so a USING join lost its
+    condition entirely and degraded to a CROSS JOIN — ``SELECT v, w FROM a
+    JOIN b USING (k)`` returned every pair instead of the matching ones. That
+    is a silent wrong answer, so USING is normalised to ON here and the
+    existing ON machinery does the rest.
+
+    The left side of each equality is the nearest preceding source. In a chain
+    (``a JOIN b USING (k) JOIN c USING (k)``) Postgres joins against the merged
+    column, which equals the nearest preceding one by construction, so the
+    result set is the same.
+    """
+    for select in stmt.find_all(exp.Select):
+        joins = select.args.get("joins") or []
+        if not joins:
+            continue
+        # sqlglot spells the FROM arg "from_", not "from".
+        prev = _join_source_alias(select.args.get("from_"))
+        for jn in joins:
+            right = _join_source_alias(jn.this)
+            columns = jn.args.get("using") or []
+            if columns and prev and right:
+                conds = [
+                    exp.EQ(
+                        this=exp.column(col.name, table=prev),
+                        expression=exp.column(col.name, table=right),
+                    )
+                    for col in columns
+                ]
+                condition = conds[0]
+                for extra in conds[1:]:
+                    condition = exp.And(this=condition, expression=extra)
+                jn.set("on", condition)
+                jn.set("using", None)
+            prev = right or prev
+
+
+def _create_target(stmt: exp.Expression) -> exp.Table | None:
+    """The relation a CREATE statement *defines*, which search_path resolution
+    must leave alone: Postgres creates into the path's first schema and never
+    binds a create target to an existing relation elsewhere on the path. The
+    body of a CREATE TABLE AS / CREATE VIEW still resolves normally, as does a
+    CREATE INDEX's target table (that one names an existing relation)."""
+    if not isinstance(stmt, exp.Create):
+        return None
+    if (stmt.args.get("kind") or "TABLE").upper() not in ("TABLE", "VIEW"):
+        return None
+    target = stmt.this
+    if isinstance(target, exp.Schema):
+        target = target.this
+    return target if isinstance(target, exp.Table) else None
+
+
+def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, session: Any) -> None:
+    """Qualify bare table references against the session's ``search_path``.
+
+    Postgres resolves an unqualified relation by walking ``search_path`` in
+    order and taking the first schema that holds it. We only consult the path
+    when the bare name is *not* itself a catalog entry, so this can turn a
+    "relation does not exist" into a hit but can never redirect a name that
+    already resolves. The node is rewritten in place, which keeps the write
+    path honest: ``qualified_table_name`` composes the storage key from the
+    same node the resolver matched, so a read and a write of one unqualified
+    name cannot land in different schemas.
+
+    Names bound by a CTE in scope are left alone — they shadow real relations.
+    """
+    path = [s for s in session.search_path if s != "public"]
+    if not path:
+        return
+    cte_names = {cte.alias_or_name.lower() for cte in stmt.find_all(exp.CTE) if cte.alias_or_name}
+    skip = _create_target(stmt)
+    for table in stmt.find_all(exp.Table):
+        if table.args.get("db") is not None or not table.name:
+            continue
+        if table.name.lower() in cte_names or table is skip:
+            continue
+        if catalog.get(db, table.name) is not None:
+            continue
+        for schema in path:
+            if catalog.get(db, f"{schema}.{table.name}") is not None:
+                table.set("db", exp.to_identifier(schema))
+                break
 
 
 def _lookup_table_def(
@@ -7041,6 +7157,18 @@ def _resolve_source(
         )
         derived.append(DerivedTable(name=alias, plan=sub_plan, columns=cols))
         return alias, tdef
+    if isinstance(node, exp.Table) and not isinstance(node.this, exp.Identifier):
+        # A table function in JOIN / derived-table position — sqlglot models it
+        # as a Table whose `this` is the function node, so `node.name` is empty
+        # and the lookup below reported `relation "" does not exist`, which
+        # says nothing about what actually went wrong. A set-returning function
+        # is only supported as the sole FROM item today (engine._run_srf_select);
+        # say that instead of naming a relation nobody wrote.
+        fn = node.this.sql() if node.this is not None else node.sql()
+        raise errors.feature_not_supported(
+            f"a set-returning function is only supported as the sole FROM item, not as a "
+            f"join or derived-table source: {fn}"
+        )
     tdef = _lookup_table_def(catalog, db, node, storage)
     if tdef is None:
         raise errors.undefined_table(node.name)

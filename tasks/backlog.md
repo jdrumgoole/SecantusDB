@@ -2393,9 +2393,13 @@ shared storage engine or building large new protocol subsystems:
   waiting out the competing transaction (WT invalidates the whole txn on
   conflict, so the user transaction's prior statements must replay too).
   Until then the sql-stress smoke keeps its write lanes single-client.
-- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, now
-  ~92.4% over the `jdbc2` package, `docs/validation-report-pgjdbc.md`; was
-  89.7%). Remaining, largest first:
+- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, 92.5%
+  over the `jdbc2` package — 5114 P / 414 F / 28 S,
+  `docs/validation-report-pgjdbc.md`; was 89.7%). Read the per-message counts
+  off the JUnit XML in `vendor/pgjdbc/pgjdbc/build/test-results/test/*.xml`
+  rather than eyeballing class totals — the report lists test ids only, and
+  attributing a class's failures to the wrong cause once already cost a
+  feature that fixed nothing here. Remaining, largest first:
   - **Batch update counts / BatchUpdateException contract** (~64,
     `BatchFailureTest`): after a mid-batch failure the per-statement update
     counts and the exception's `getUpdateCounts()` must describe exactly which
@@ -2407,11 +2411,42 @@ shared storage engine or building large new protocol subsystems:
     form `(…).n` / `(…).x`, including inside a derived table used in a JOIN ON.
     Needs FROM-position parsing of qualified/leading-underscore function names
     plus composite-value field access on an SRF column.
-  - **`relation "…" does not exist`** (45, `UpdateableResultTest`): needs
-    multi-entry `search_path` resolution — `SET search_path TO a, b, c` then an
-    unqualified name resolving through the list (the test deliberately puts an
-    empty schema first). Schema-qualified tables landed (#722); search-path
-    *resolution* did not.
+  - **`relation "" does not exist`** — note the EMPTY name — is the single
+    largest message in the suite (73: `PGObjectGetTest` 28, `PGObjectSetTest`
+    26, `GeometricTest` 8, `SearchPathLookupTest` 3, others 8). It is *not* a
+    search-path problem, which is what it was mis-attributed to before being
+    read off the JUnit XML. It is pgjdbc's `TypeInfoCache` type-lookup query,
+    and it reduces to two independent bugs, both reproducible in three lines
+    of SQL:
+    - ~~`JOIN … USING (col)` degrades to a CROSS JOIN~~ — FIXED: USING is
+      desugared to a qualified ON before planning
+      (`planner.desugar_join_using`). Row semantics now match PostgreSQL
+      14.13 for inner / LEFT / chained / multi-column USING.
+    - **`SELECT *` over a `USING` join does not merge the joined column.**
+      Postgres returns `(1, 'x', 'p')` for `SELECT * FROM a JOIN b USING (k)`;
+      we emit `k` once per side, `(1, 'x', 1, 'p')`. The join *rows* are
+      correct — this is star expansion only, and suppressing the duplicate
+      means touching every star-expansion path in the planner (there are a
+      dozen, one per join shape). Pinned by
+      `tests/test_sql_join_using.py::TestKnownDivergence`.
+    - **A set-returning function is only supported as the sole FROM item**, so
+      `JOIN generate_series(…) AS s(r) ON …` and a derived table whose body
+      reads one both fail. This is what actually blocks the 73
+      `TypeInfoCache` failures. It used to surface as `relation ""`; it now
+      raises a faithful "only supported as the sole FROM item" error naming
+      the function. To implement: sqlglot models the source as an `exp.Table`
+      whose `this` is the function node (so `node.name` is empty), and
+      `planner._resolve_source` is the place to handle it. The pieces exist —
+      `srf.from_source` / `srf.build` produce rows plus a `TableDef`, and
+      `RawDerived(stmt, names)` is a derived-table plan the executor already
+      materializes through the engine. The unsolved part is column *types* at
+      plan time: `_resolve_source` runs without a storage/session context, so
+      the tags `srf.build` derives by evaluating are not available yet.
+      Resolve that (defer tag inference to materialization, or thread a
+      context in) rather than guessing tags — a wrongly-typed join source
+      would diverge silently, which is worse than the current honest error.
+    Multi-entry `search_path` resolution landed separately and moved none of
+    these; `SearchPathLookupTest`'s 3 failures are this same empty-name bug.
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
     failed statements in a transaction.
