@@ -4889,10 +4889,22 @@ impl Storage {
         // resolve in microseconds; a long-open user transaction hits the
         // bounded deadline and falls back to the committed-view answer, which
         // is exactly today's best-effort behaviour.
+        //
+        // The visible tail is sampled BEFORE the scan, and the order is load
+        // bearing. Sampling it after left a window in which an in-flight mint
+        // committed between the two reads: the scan still returned the answer
+        // from before the commit (naming the seq *above* the in-flight one)
+        // while the tail read afterwards had already advanced to cover it, so
+        // the stale answer passed the check and the entry was skipped for
+        // good. Sampling first is conservative in the safe direction — the
+        // tail only ever grows, so an earlier reading is no larger than the
+        // true one at scan time, and everything at or below it is resolved
+        // (committed or a permanent hole) and so visible to the scan that
+        // follows. Twin of the Python fix in `Storage.find_seq_for_ts`.
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         loop {
-            let r = self.find_seq_for_ts_scan(ts)?;
             let vis = self.oplog_visible_tail_seq();
+            let r = self.find_seq_for_ts_scan(ts)?;
             if r - 1 <= vis || std::time::Instant::now() >= deadline {
                 return Ok(r);
             }

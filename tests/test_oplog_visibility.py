@@ -182,3 +182,65 @@ def test_user_txn_commit_is_exactly_once_and_ordered(tmp_path):
         assert ids == [("app.x", 0), ("app.y", 2), ("app.x", 1)]
     finally:
         s.close()
+
+
+def test_find_seq_for_ts_does_not_accept_a_scan_from_before_the_commit(tmp_path):
+    """The visible tail must be sampled BEFORE the scan, not after.
+
+    Sampling it after left a window: an in-flight mint could commit between
+    the two reads, so the scan still returned the pre-commit answer (the seq
+    *above* the in-flight one) while the tail read afterwards had already
+    advanced to cover it. The stale answer then passed the check and the
+    entry was skipped for good — silent change-stream event loss.
+
+    The interleaving is forced rather than raced for. It was originally found
+    as an intermittent Windows CI failure, where the wider scheduling quantum
+    hit the window by chance; with the reads in the wrong order this test
+    fails every time on every platform.
+    """
+    s = Storage(str(tmp_path / "wt"))
+    try:
+        s.insert("app", "x", [{"_id": 0}])
+        ts1 = s.read_oplog(start_seq=1, limit=1)[0][1]["ts"]
+        target = Timestamp(ts1.time, ts1.inc + 1)
+
+        # seq 2 minted in an open transaction; seq 3 committed above it.
+        cm = _open_batch_txn_with_emit(s, 1)
+        ty = threading.Thread(target=lambda: s.insert("app", "y", [{"_id": 2}]))
+        ty.start()
+        ty.join()
+
+        scanned = threading.Event()
+        commit_done = threading.Event()
+        original_scan = s._find_seq_for_ts_scan
+        first = [True]
+
+        def scan_then_let_the_commit_land(ts):
+            # The scan runs against the PRE-commit view (so it answers 3,
+            # the seq above the in-flight mint), and only then does seq 2
+            # commit. Whatever reads the visible tail afterwards sees a tail
+            # that already covers 3 — so the old order accepted the stale 3.
+            # Only the first call is delayed; later loop iterations must run
+            # normally or the retry could never observe the commit.
+            result_seq = original_scan(ts)
+            if first[0]:
+                first[0] = False
+                scanned.set()
+                commit_done.wait(10)
+            return result_seq
+
+        s._find_seq_for_ts_scan = scan_then_let_the_commit_land
+
+        result: list[int] = []
+        t = threading.Thread(
+            target=lambda: result.append(s.find_seq_for_ts(target, max_wait_seconds=30.0))
+        )
+        t.start()
+        assert scanned.wait(10), "scan never ran"
+        cm.__exit__(None, None, None)  # commit seq 2 on its owning thread
+        commit_done.set()
+        t.join(30)
+
+        assert result == [2], f"startAtOperationTime skipped the committed mint: {result}"
+    finally:
+        s.close()
