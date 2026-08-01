@@ -268,7 +268,7 @@ These are explicit non-goals. Don't add them without a reason.
   and re-run (or keep the previously committed clean numbers) when flagged.
   Worth upstreaming the audit into the task itself.
 
-- [ ] **Test-infra hazard: the 25-min hang watchdog's own dump can wedge a
+- [x] **RESOLVED (fired for real in the 0.6.0b8 release gate, 2026-08-02): the 25-min watchdog hard-exited five healthy workers when a shared-box suite run took 25:11 — local default now 90 min, CI pins 1500 explicitly (test.yml).** Original entry: the 25-min hang watchdog's own dump can wedge a
   worker (observed live 2026-07-31).** On a box loaded enough that a session
   crosses `SECANTUS_HANG_SECONDS` (1500s), `faulthandler.dump_traceback_later`
   fires while the worker is still healthy; the dump thread walks live threads'

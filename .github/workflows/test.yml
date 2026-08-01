@@ -85,6 +85,9 @@ jobs:
       # instead of dying with its stderr — the ws-changes crash has been
       # anonymous ≥4× for want of this (tasks/backlog.md).
       SECANTUS_FAULTHANDLER_DIR: ${{ github.workspace }}/faulthandler-dumps
+      # CI keeps the 25-min hang deadline (job cap is 30 min); the local
+      # conftest default is 90 min so shared-box runs don't self-destruct.
+      SECANTUS_HANG_SECONDS: "1500"
     # 30 min suffices for Linux, but a macOS cell builds vendored WiredTiger
     # from source on a contended pool (10-40+ min per 9e16e49) BEFORE it runs a
     # test, so the cron cells need a much larger cap.
@@ -769,6 +772,9 @@ jobs:
       # helper). The durable lane re-runs the whole suite under real checkpoint
       # durability, so it exercises the same ws-changes / WT crash surface.
       SECANTUS_FAULTHANDLER_DIR: ${{ github.workspace }}/faulthandler-dumps
+      # CI keeps the 25-min hang deadline (job cap is 30 min); the local
+      # conftest default is 90 min so shared-box runs don't self-destruct.
+      SECANTUS_HANG_SECONDS: "1500"
     # See the ``test`` job: the cron's macOS cells pay a 10-40 min source build
     # of vendored WiredTiger before the first test runs.
     timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 90 || 30 }}

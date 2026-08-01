@@ -203,7 +203,15 @@ def _hang_watchdog():
     with zero diagnostics. This watchdog fires first (25 min < the 30-min job cap)
     and prints every thread's stack to stderr. Each xdist worker arms its own.
     """
-    _hang_seconds = float(os.environ.get("SECANTUS_HANG_SECONDS", "1500"))
+    # Default 90 min, NOT the CI-tuned 25: CI pins SECANTUS_HANG_SECONDS=1500
+    # explicitly (25 min < its 30-min job cap). A LOCAL run on a shared box can
+    # legitimately exceed 25 min — a 0.6.0b8 release-gate run took 25:11 under a
+    # parallel session's gauge load and the watchdog hard-exited five healthy
+    # workers mid-suite (node down: Not properly terminated + controller
+    # INTERNALERROR), with the stderr dumps lost. The watchdog exists to name a
+    # WEDGED worker, not to kill a slow-but-progressing one; locally the only
+    # hard deadline worth enforcing is "something is truly stuck".
+    _hang_seconds = float(os.environ.get("SECANTUS_HANG_SECONDS", "5400"))
     # Route the wedge traceback to the per-worker crash FILE when one is armed
     # (SECANTUS_FAULTHANDLER_DIR): a worker that wedges in shutdown dies with its
     # stderr unflushed and unforwarded (xdist reports only "node down"), so a
