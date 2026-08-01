@@ -258,6 +258,16 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **`invoke concurrency-refresh` needs a genuinely quiet box AND a spread
+  audit before its output is trusted.** Two consecutive refresh runs
+  (2026-08-02) were silently poisoned by a parallel session's gauge load —
+  medians-of-3 didn't protect (whole interleaved passes degraded 10-30x,
+  mongod itself read 10.5k vs its healthy 104k). A load<3 gate at START is
+  insufficient; contention arriving mid-run wrecks all arms. Before accepting
+  a refresh: check every `runs_docs_per_sec` cell for >2.5x intra-cell spread
+  and re-run (or keep the previously committed clean numbers) when flagged.
+  Worth upstreaming the audit into the task itself.
+
 - [ ] **Test-infra hazard: the 25-min hang watchdog's own dump can wedge a
   worker (observed live 2026-07-31).** On a box loaded enough that a session
   crosses `SECANTUS_HANG_SECONDS` (1500s), `faulthandler.dump_traceback_later`

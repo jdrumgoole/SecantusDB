@@ -19,6 +19,380 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b8] — 2026-08-02
+
+### A kill -9 crash window in the data-nonlogged mode could lose acknowledged writes — fixed
+
+The opt-in log-only-the-oplog mode (`data_nonlogged`) wrote its stable
+marker — the seq recovery replays from — *before* running the checkpoint it
+describes. The marker lives in an always-WAL-logged table, so it became
+crash-durable immediately: a `kill -9` landing after the marker's WAL write
+but before the checkpoint completed recovered with a marker *above* what the
+last checkpoint actually contained, and replay started too high — every
+acknowledged write between the old checkpoint and the marker was silently
+lost as a mid-history hole (the oplog rows themselves all survived). The
+window is a few milliseconds on an idle machine but stretches with checkpoint
+duration under load, which is how the hard-kill harness caught it live: 2,300
+of 7,200 acknowledged documents missing after recovery, with all 7,200 oplog
+entries present.
+
+Both checkpoint sites (the periodic anchor thread and explicit/close-time
+`stable_checkpoint`) now checkpoint first and write the marker after. A crash
+between the two leaves the *old* marker, and replay covers extra
+already-applied entries — the idempotent-replay path that has always existed
+absorbs exactly that. Stale-marker is safe; eager-marker loses data. The
+hard-kill harness also gained self-diagnosis: on any future loss it reports
+whether the missing documents' oplog entries survived, separating WAL loss
+from replay-window bugs at a glance.
+
+#### Fixed
+- `secantus-storage`: stable-marker row written after (not before) its
+  checkpoint in both the periodic checkpoint thread and `stable_checkpoint`;
+  the recovery floor can now only ever be conservative.
+- `tests/test_crash_recovery.py`: loss assertions carry a diagnosis dict
+  (doc count, oplog row count and tail, whether the first missing id's oplog
+  entry exists).
+
+### Numeric comparisons stop allocating on the hot path
+
+Every numeric comparison in the Rust engines — a find filter's
+`$gt`/`$eq`/range test, a sort comparator call, an `$expr` compare — used to
+build the value's exact decimal-digit form on the heap (a `String` plus a
+digit vector per operand) before comparing. A new allocation-free fast path
+answers the common int32/int64/double pairs directly, falling back to the
+digit form only for Decimal128 and for int64↔double pairs beyond ±2^53
+(where the engines' shortest-repr decimal semantics and exact binary
+comparison can diverge — the boundary is proven and pinned by an
+edge-corpus equivalence test). Measured on COLLSCAN drains: +11% on an
+integer range filter, +49% when an integer query bound meets a double
+field; all seven Rust↔Python parity suites unchanged.
+
+#### Changed
+- `secantus-core`: `numeric::fast_cmp` / `fast_eq` / `fast_cmp_numberish`
+  answer int/double comparisons without allocating; the query matcher,
+  `order::cmp` / `bson_lt`, and the expression engine's compare/eq paths
+  try them first. Decimal128 and out-of-range pairs keep the exact
+  digit-form path; verdicts are byte-for-byte unchanged.
+
+### Change-stream and exhaust replies stop re-encoding every document
+
+The last two survivors of the reply-path materialization (Finding 2) are
+gone. A change stream's tailable getMore decoded every event blob into a
+document and re-encoded it onto the wire — even though the only thing the
+handler needed from the batch was the last event's `_id` for the
+postBatchResumeToken. And the exhaust streamer round-tripped every batch
+through an owned document array (plus a full clone of each batch) between
+pulling it from the cursor registry and framing it. Both now splice the
+pre-encoded blobs straight onto the wire like the ordinary find/getMore
+path has since the RecordId era. Measured: change-stream drain +22%
+(105k → 128k events/s), exhaust-cursor drain +26% (1.20M → 1.52M docs/s).
+
+#### Changed
+- `secantus-commands`: the tailable getMore hands its event blobs to the
+  wire encoder undecoded; the postBatchResumeToken decodes only the final
+  blob (as it always did).
+- `secantus-server`: the exhaust streamer threads the pre-encoded batch
+  through every `moreToCome` frame (`encode_cursor_reply` splice) instead
+  of materialising and cloning it per frame; `materialize_batch` is gone.
+
+### The Python server compiles a projection once per cursor, not once per document
+
+Every projected document re-ran the whole projection front-end: meta
+validation, spec partitioning, inclusion/exclusion mode detection, and —
+worst — rebuilding the dotted-path trie from scratch, per row. The spec is
+constant for a cursor's lifetime, so all of that now compiles once into a
+projection plan and only the per-document work runs per document. Alongside
+it, the expression engine stops shallow-copying the entire document on every
+`$field` reference (the copy only existed to satisfy a type annotation — the
+path walk is read-only), the matcher stops rebuilding a constant frozenset
+per operator clause, and the pure-Python FNV shard-name hash is memoised.
+Measured on the Python server: projected find drain +46%, exclusion
+projection +19%, a `$group` pipeline +2.8%.
+
+#### Changed
+- `secantus.projection`: new `compile_projection` / `apply_projection_plan`
+  split; `apply_projection` and the batch path are unchanged in behaviour
+  (all seven Rust↔Python parity suites pass untouched — the Python engine
+  stays the oracle).
+- `secantus.expressions`: `$field` resolution no longer copies the document;
+  `secantus.query`: `_SIBLING_MODIFIERS` hoisted to module scope;
+  `secantus.storage`: shard-name lookup memoised, projected reads use the
+  batch (compile-once) path.
+
+### Write ops decode the collection-options row once, not three times
+
+Every insert decoded the collection-options blob twice (the timeseries
+check, then the UUID fetch for the oplog entry), and every replace/delete
+decoded it twice more (UUID, then the pre/post-image flag) — the same tiny
+BSON row, searched and decoded repeatedly within one operation. A one-decode
+`CollMeta` view now feeds all three consumers; the collection UUID stays
+lazily minted only when the oplog actually needs it, so a server running
+with the oplog disabled mints exactly as few UUIDs as before. Measured
+paired A/B on batch inserts into a two-index collection: +2.3% (5/5 positive
+pairs).
+
+#### Changed
+- `secantus-storage`: `coll_meta` / `meta_uuid` replace the per-op
+  `is_timeseries` + `collection_uuid` + `pre_post_images_enabled` call
+  chains on the insert/replace/delete paths. Behaviour is unchanged —
+  same facts, one decode.
+
+### The benchmark page now covers the paths that differentiate — and the PGO profile catches up
+
+The published nine-workload latency table gains two rows the old six-row
+table never measured: a **filtered collection scan** (the per-document
+compare path — the one the new allocation-free numeric fast path
+accelerates; the unfiltered scan and the indexed range never touch it) and
+a **change-stream drain**, where the Rust server now clocks **0.8× of
+mongod — faster than mongod at its own change streams** — after the reply
+path stopped re-encoding event blobs. The aggregate multi-stage workload
+joins the published table too. The committed PGO profile is regenerated on
+the post-review hot paths (a stale profile silently forfeits its 12–19%),
+and every surface that quotes the ×mongod ranges — the benchmark page, the
+website performance page, the Rust-server docs, the README — is re-baselined
+from the same fresh five-rep run.
+
+#### Changed
+- `bench/compare_servers.py`: new `find_filtered_scan` and
+  `change_stream_drain` workloads; the change-stream reference spawns a
+  single-node replica-set mongod (its change streams require one) while
+  every other row keeps the standalone reference; the Rust server arm
+  advertises the replica-set persona to match the Python server.
+- `crates/pgo/_secantus_server.profdata.tar.gz`: retrained via
+  `invoke rust-pgo-refresh` on the post-micro-opt hot paths.
+- `docs/benchmark.md`, `docs-rust/index.md`, `README.md`, website
+  performance page: nine-row table + refreshed charts and ×mongod ranges
+  (Rust ~0.8×–2.3×; three rows beat mongod outright).
+
+### Concurrency graphs are now generated, refreshed per release
+
+The N-writer scaling charts on secantusdb.com/performance and in the
+docs' concurrency deep-dive are no longer hand-authored SVG. A new
+`invoke concurrency-refresh` task re-measures all four series (Python
+server, Rust server, Rust async stack, mongod) with `bench.concurrency`
+— now able to drive the async-oplog stack directly (`--server
+rust-async`), take medians over interleaved runs (`--runs`), and write
+machine-readable results (`--json`) — and `bench.concurrency_chart`
+regenerates the chart and data-table blocks in both surfaces from those
+results. The committed results live at `bench/results/concurrency.json`,
+and a test pins the committed charts to exactly what that file renders
+to, so the graphs can no longer silently drift from the measurements.
+The refresh is part of the per-release website update.
+
+#### Added
+- `bench.concurrency`: `--server rust-async` (async + non-logged oplog
+  stack), `--runs N` interleaved-median sweeps, and `--json PATH`
+  structured output; `--server all` now sweeps four servers.
+- `bench.concurrency_chart`: renders the website and docs concurrency
+  chart + table blocks from the results JSON into marker-delimited
+  regions.
+- `invoke concurrency-refresh`: benchmark + regenerate in one step
+  (`--skip-bench` re-renders from the committed results).
+- `tests/test_concurrency_chart.py`: pins the render/replace logic and
+  fails if the committed charts are stale relative to the committed
+  results JSON.
+
+### The wire-protocol gauge lands — CockroachDB's pgtest corpus runs verbatim
+
+The SQL server's conformance portfolio gains its strictest instrument: G3,
+the pgwire message-level gauge. `invoke validate-pgtest` drives CockroachDB's
+`pkg/sql/pgwire/testdata/pgtest` corpus — ~54 datadriven files of raw
+Parse/Bind/Describe/Execute/COPY/error exchanges with byte-exact expected
+responses — using CockroachDB's own `pkg/testutils/pgtest` runner,
+completely unmodified. It is the SQL analogue of the mongo-c-driver gauge:
+where the driver gauges tolerate server slop, this one asserts the framing
+itself.
+
+The monorepo problem is solved by not vendoring at all: both corpus and
+runner are fetched at a pinned commit through a sparse, blob-filtered clone
+(about 25 MB, cached) at gauge time — the same fetch-at-runtime pattern as
+the sqllogictest runner's `cargo install` — which also keeps the CockroachDB
+Software License outside the repository tree. The only committed Go code is
+a thin `go test` driver and a ten-line shim for one internal helper the
+runner imports. SecantusDB presents as non-CockroachDB, so the corpus'
+`crdb_only` exchanges skip themselves.
+
+The opening baseline is **8 of 58 files** — honest and low by design, since
+every file stops at its first byte-level mismatch; the number climbs
+cluster-by-cluster the way the psycopg gauge went from 42% to 91%. The first
+finding is already fixed: an unaliased cast's output column is now named
+after the type's `typname` (`SELECT 2::int8` → column `int8`), where it
+previously reported `?column?`.
+
+#### Added
+
+- `pgtest_validation/` (pinned-commit sparse fetch, verbatim upstream
+  runner staging, Go driver module, report generator), `invoke
+  validate-pgtest`, weekly `validate.yml` row sharing the Go toolchain step.
+
+#### Fixed
+
+- `sql/planner.py`: unaliased top-level cast projections are named after the
+  cast target's `typname` like real PG, across the constant, single-table,
+  grouped, and RETURNING paths.
+
+### The JDBC driver's own suite now measures the SQL server — and one fix moved it nine points
+
+pgjdbc, the official PostgreSQL JDBC driver, joins the portfolio as the G5
+gauge: `invoke validate-pgjdbc` runs the driver's own test suite —
+unmodified, from a vendored submodule at REL42.7.13 — against a daemon
+SecantusDB server. Targeting uses pgjdbc's stock `build.local.properties`
+mechanism, which the project itself gitignores, so pointing the suite at us
+leaves the vendored tree pristine. Scope opens at the `jdbc2` core package
+(75 test classes, 5,500-odd tests) and grows package by package.
+
+The opening baseline was 4,462 passed / 1,068 failed (80.7%) — and half of
+those failures were a single protocol bug. Describe answered NoData for any
+query with a CTE, then Execute sent DataRows anyway; pgjdbc refuses that
+outright with "Received resultset tuples, but no field structure for them",
+and a data-modifying CTE (`WITH x AS (INSERT … RETURNING …) SELECT * FROM x`)
+tripped it every time. Describe now derives a CTE query's shape by planning
+the outer SELECT against synthetic tables standing in for each CTE — the
+data-modifying ones described from their RETURNING clause, nothing executed,
+no side effects. That one fix took the gauge to **4,962 passed / 568 failed
+(89.7%)**.
+
+This is the third distinct form of the same protocol violation the SQL
+gauges have surfaced this week (computed WHERE clauses, views, now CTEs),
+each caught by a different client — which is exactly the argument for
+running several strict drivers rather than one.
+
+#### Added
+
+- `pgjdbc_validation/` (runner with JDK-21 discovery, per-class enumeration
+  so exclusions are effective, JUnit-XML aggregation, report generator),
+  `vendor/pgjdbc` submodule at REL42.7.13, `invoke validate-pgjdbc`, and a
+  weekly `validate.yml` row reusing the java/kotlin JDK + Gradle cache steps.
+
+#### Fixed
+
+- `sql/engine.py`: extended-protocol Describe reported NoData for every CTE
+  query while Execute emitted rows — a protocol violation that made
+  data-modifying CTEs unusable from strict clients.
+
+### The sqllogictest gauge grows a second protocol lane — and catches a wire bug doing it
+
+`invoke validate-slt` now runs every corpus file through **both** PostgreSQL
+wire protocols: sqllogictest-rs's `postgres` engine (simple query) and
+`postgres-extended` (Parse/Bind/Execute), completing the two-lane design the
+gauge plan called for. 52 of 60 lane-files pass; the only failures are the
+four declared SQLite-vs-Postgres divergences, doubled across lanes.
+
+The new lane immediately earned its keep: a `SELECT` from a view over the
+extended protocol answered Describe with NoData and then sent DataRows — a
+protocol violation strict libpq clients reject outright. Describe now
+expands view references (on a copy, leaving the stored prepared statement
+pristine) so the declared row shape always precedes the rows.
+
+#### Added
+
+- `slt_validation/`: the `postgres-extended` lane (both engines per include
+  file, lane-tagged report).
+
+#### Fixed
+
+- `sql/engine.py`: extended-protocol Describe of a SELECT-from-view
+  answered NoData while Execute emitted DataRows.
+
+### pgbench and psql run clean — the SQL server's stress smoke lands
+
+Unmodified `pgbench` now drives SecantusDB end to end: the full init cycle
+(multi-table `DROP TABLE`, table creation, a 100,000-row client-side `COPY`,
+`VACUUM`, and `ALTER TABLE … ADD PRIMARY KEY`), then the TPC-B transaction
+script in all three protocol modes — simple, extended, and prepared — plus a
+concurrent select-only lane. `psql`'s catalog family (`\dt`, `\d table`,
+`\di`, `\l`, `\dn`) runs without error. All of it is packaged as `invoke
+sql-stress` (the G7 gauge of the SQL conformance portfolio), weekly in CI,
+with the invariant that any error or dropped connection is a bug.
+
+Getting there closed a string of real gaps: multi-name `DROP TABLE a, b, c`;
+`VACUUM` accepted; `ALTER TABLE ADD PRIMARY KEY` as a true migration
+(validates NOT NULL and uniqueness, then re-keys every existing row onto the
+column value); PG's unknown-type literal coercion in arithmetic (`abalance +
+$1` with an untyped text parameter — how pgbench binds everything); the
+`OPERATOR(pg_catalog.~)` regex spelling with `COLLATE`; schema-qualified
+`array_to_string`; comma-join scalar subqueries (psql's collation lookup);
+literal `IN` lists in `JOIN ON`; and the pg_catalog surface psql reads —
+owner/toast/statistics columns on `pg_class`, encoding and collation on
+`pg_database`, `pg_policy`, and present-but-empty `pg_trigger` /
+`pg_statistic_ext` / `pg_inherits` / `pg_rewrite` / publication catalogs.
+
+One documented boundary: under concurrent writers to the same row,
+WiredTiger's optimistic concurrency surfaces a PG-SERIALIZABLE-style `40001`
+serialization failure rather than blocking like READ COMMITTED. Retry-capable
+clients handle this normally; the smoke keeps its write lanes single-client
+and the retry-semantics question is tracked in the backlog.
+
+#### Added
+
+- `sqlstress_validation/` + `invoke sql-stress` + weekly `validate.yml` row
+  (installs postgresql-contrib for pgbench/psql).
+- `sql/executor.py`: `ALTER TABLE … ADD [CONSTRAINT] PRIMARY KEY` with row
+  re-keying and 23502/23505/42P16 validation.
+- `sql/planner.py` + `sql/engine.py`: multi-name `DROP TABLE`; `VACUUM`;
+  `OPERATOR(pg_catalog.~ / ~*)` (+ negations) rewritten to regex matches;
+  literal `IN` lists in join `ON`.
+- `sql/scalar.py`: unknown-text numeric coercion in arithmetic (22P02 on
+  garbage), `pg_get_userbyid`, `pg_encoding_to_char`, schema-qualified
+  `array_to_string`, comma-join (cartesian) scalar subqueries.
+- `sql/virtual.py`: `pg_class` owner/toast/check/flag columns, `pg_database`
+  encoding/collation/ACL, `pg_namespace` owners, `pg_index` validity flags,
+  `pg_policy`, and empty `pg_trigger` / `pg_statistic_ext` / `pg_inherits` /
+  `pg_rewrite` / `pg_publication*` catalogs.
+
+### Chasing the JDBC driver's failures turns up six real server bugs
+
+Working the pgjdbc conformance gauge's failure clusters took it from 89.7% to
+**92.4%** of the driver's `jdbc2` suite — but the point is what the failures
+were hiding. Six of them were genuine correctness bugs, two of which produced
+wrong answers rather than errors.
+
+The starkest: an **ungrouped aggregate returned no rows when its WHERE
+excluded everything**. `SELECT count(*) WHERE 1=2` answered "no rows" where
+PostgreSQL answers `0`, and `SELECT max(3) WHERE 1=2` answered nothing where
+PostgreSQL answers one NULL row. This was verified against a real PostgreSQL
+14.13 rather than from memory — and it means `SELECT 0/count(*) WHERE 1=2`
+now raises division-by-zero, which is precisely how pgjdbc's batch tests
+inject a runtime failure. A pre-existing test had encoded the wrong
+behaviour; it has been corrected with the verification noted in place.
+
+Also fixed: BC-era timestamps are accepted with the era marker either side of
+the zone offset (pgjdbc sends `0101-01-01 BC +00`, PostgreSQL's datetime
+input is field-order flexible), and a BC value stored in a `date` column no
+longer silently loses its era and becomes an AD date. `time` and `timetz`
+accept a full timestamp and keep the time-of-day, as PostgreSQL does.
+Multi-dimensional enum arrays (`flag[][]`) no longer crash the server, and
+nested arrays render with nested braces instead of quoted JSON. `x = ANY(…)`
+works in per-row evaluation, `current_schemas()` is implemented, and
+`ALTER DATABASE … SET` stores database-level GUC defaults applied to new
+sessions with PostgreSQL's precedence. Finally, extended-protocol Describe no
+longer needs parameter *values*: `SELECT $1::inet` has a shape fixed by its
+cast target.
+
+#### Added
+
+- `sql/scalar.py`: `current_schemas(include_implicit)`, `x = ANY(<array>)` in
+  per-row evaluation, `pg_encoding_to_char`.
+- `sql/engine.py` + `sql/catalog.py` + `sql/session.py`: `ALTER DATABASE …
+  SET / RESET [ALL]` database-level GUC defaults, merged into new sessions
+  (explicit session settings still win).
+- `sql/engine.py`: value-free Describe fallback for cast projections over
+  unbound parameters.
+
+#### Fixed
+
+- `sql/planner.py`: an ungrouped aggregate now yields exactly one row when the
+  WHERE excludes the implicit row (COUNT 0, others NULL) — previously zero
+  rows, a wrong answer. Verified against PostgreSQL 14.13.
+- `sql/datetimes.py`: the BC era marker is accepted before or after a zone
+  offset; a BC/out-of-range value with a time part keeps its era in a `date`
+  column (previously became an AD date); `time` / `timetz` accept a full
+  timestamp and a trailing offset.
+- `sql/scalar.py`: multi-dimensional enum arrays (`flag[][]`) raised an
+  internal error; labels are now validated at every depth.
+- `sql/typemap.py`: nested array text rendering inferred its element type from
+  the outer list, rendering sub-arrays as quoted JSON instead of nested braces.
+
 ## [0.6.0b7] — 2026-07-31
 
 ### The async oplog stack graduates to first-class options
