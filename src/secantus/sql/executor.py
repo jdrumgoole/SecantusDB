@@ -1157,7 +1157,16 @@ def _validate_unique_rows(
             violated = key in seen[uq.name]
             if not violated:
                 probe = dict(zip(fields, key, strict=True))
-                for existing in storage.find_matching(db, table.collection, probe):
+                # Two probes, because neither alone is sufficient inside a
+                # transaction: the plain one sees this transaction's own
+                # uncommitted rows, and the committed one sees rows other
+                # transactions committed after our snapshot was taken (which
+                # the snapshot hides, so the duplicate used to be stored).
+                candidates = list(storage.find_matching(db, table.collection, probe))
+                committed = getattr(storage, "find_matching_committed", None)
+                if committed is not None:
+                    candidates += committed(db, table.collection, probe)
+                for existing in candidates:
                     if _hashable_id(existing.get("_id")) not in exclude_ids:
                         violated = True
                         break
