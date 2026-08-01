@@ -5129,8 +5129,9 @@ impl Storage {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
                 ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                let meta = coll_meta(&session, db, coll)?;
                 // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
-                if self.is_timeseries(&session, db, coll)? {
+                if meta.timeseries {
                     key.extend_from_slice(&self.timeseries_doc_suffix());
                 }
                 // Reject unique-index violations before writing anything.
@@ -5153,7 +5154,7 @@ impl Storage {
                 self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
                 // Oplog: an insert is op "i". No pre-image (there's no prior document).
                 if self.enable_oplog {
-                    let ui = collection_uuid(&session, db, coll)?;
+                    let ui = meta_uuid(&session, db, coll, &meta)?;
                     let mut o2 = Document::new();
                     o2.insert("_id", id.clone());
                     let mut entry = Document::new();
@@ -5438,8 +5439,9 @@ impl Storage {
                 // doesn't expose). The pre-image (old doc) is stored when the collection
                 // has changeStreamPreAndPostImages enabled.
                 if self.enable_oplog {
-                    let ui = collection_uuid(&session, db, coll)?;
-                    let pre = if pre_post_images_enabled(&session, db, coll)? {
+                    let meta = coll_meta(&session, db, coll)?;
+                    let ui = meta_uuid(&session, db, coll, &meta)?;
+                    let pre = if meta.pre_post_images {
                         Some(encode_doc(&old_doc)?)
                     } else {
                         None
@@ -5494,8 +5496,9 @@ impl Storage {
                 // Oplog: a delete is op "d" with `o` = `o2` = {_id}. The pre-image (the
                 // deleted doc) is stored when changeStreamPreAndPostImages is enabled.
                 if self.enable_oplog {
-                    let ui = collection_uuid(&session, db, coll)?;
-                    let pre = if pre_post_images_enabled(&session, db, coll)? {
+                    let meta = coll_meta(&session, db, coll)?;
+                    let ui = meta_uuid(&session, db, coll, &meta)?;
+                    let pre = if meta.pre_post_images {
                         Some(encode_doc(&old_doc)?)
                     } else {
                         None
@@ -9832,6 +9835,44 @@ fn collection_uuid(session: &Session, db: &str, coll: &str) -> Result<Vec<u8>> {
     opts.insert("uuid", uuid_binary(&bytes));
     write_coll_options(session, db, coll, &opts)?;
     Ok(bytes)
+}
+
+/// One-decode view of the per-op collection facts. The write paths used to
+/// hit `coll_options` (a WT search + BSON decode) two or three times per
+/// operation — timeseries check, UUID fetch, pre/post-image flag — for the
+/// same row. `uuid` stays lazy (`None` until someone actually needs it) so a
+/// server with the oplog disabled never starts minting UUIDs it previously
+/// didn't.
+struct CollMeta {
+    timeseries: bool,
+    pre_post_images: bool,
+    uuid: Option<Vec<u8>>,
+}
+
+fn coll_meta(session: &Session, db: &str, coll: &str) -> Result<CollMeta> {
+    let opts = coll_options(session, db, coll)?.unwrap_or_default();
+    let uuid = match opts.get("uuid") {
+        Some(Bson::Binary(b)) if b.bytes.len() == 16 => Some(b.bytes.clone()),
+        _ => None,
+    };
+    Ok(CollMeta {
+        timeseries: opts.contains_key("timeseries"),
+        pre_post_images: opts
+            .get_document("changeStreamPreAndPostImages")
+            .map(|s| s.get_bool("enabled").unwrap_or(false))
+            .unwrap_or(false),
+        uuid,
+    })
+}
+
+/// The collection UUID from an already-decoded [`CollMeta`], minting (and
+/// persisting) one only when the meta had none — the same first-use mint
+/// `collection_uuid` does, without re-decoding the options row.
+fn meta_uuid(session: &Session, db: &str, coll: &str, meta: &CollMeta) -> Result<Vec<u8>> {
+    match &meta.uuid {
+        Some(u) => Ok(u.clone()),
+        None => collection_uuid(session, db, coll),
+    }
 }
 
 /// Whether `changeStreamPreAndPostImages.enabled` is set on the collection.
