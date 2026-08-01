@@ -66,7 +66,11 @@ def _eval(expr: Any, ctx: _Ctx) -> Any:
         if expr.startswith("$$"):
             return _resolve_var(expr[2:], ctx)
         if expr.startswith("$"):
-            return get_path(dict(ctx.doc), expr[1:], default=None)
+            # No defensive copy: get_path/walk_to_parent(create=False) is
+            # read-only, and copying the whole doc per $field reference was
+            # a per-doc-per-field allocation on every $project/$group.
+            d = ctx.doc if isinstance(ctx.doc, dict) else dict(ctx.doc)
+            return get_path(d, expr[1:], default=None)
         return expr
     if isinstance(expr, list):
         return [_eval(e, ctx) for e in expr]
@@ -94,7 +98,8 @@ def evaluate_or_missing(
     value the way mongod does — ``$push`` / ``$addToSet`` accumulate an explicit
     ``null`` but not a missing field."""
     if isinstance(expr, str) and expr.startswith("$") and not expr.startswith("$$"):
-        return get_path(dict(doc), expr[1:], default=MISSING)
+        d = doc if isinstance(doc, dict) else dict(doc)
+        return get_path(d, expr[1:], default=MISSING)
     return evaluate(expr, doc, vars)
 
 
@@ -129,7 +134,7 @@ def _resolve_var(name: str, ctx: _Ctx) -> Any:
         return value
     if not isinstance(value, Mapping):
         return None
-    return get_path(dict(value), rest, default=None)
+    return get_path(value if isinstance(value, dict) else dict(value), rest, default=None)
 
 
 def _apply_op(op: str, arg: Any, ctx: _Ctx) -> Any:
