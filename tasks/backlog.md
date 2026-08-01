@@ -2393,17 +2393,43 @@ shared storage engine or building large new protocol subsystems:
   waiting out the competing transaction (WT invalidates the whole txn on
   conflict, so the user transaction's prior statements must replay too).
   Until then the sql-stress smoke keeps its write lanes single-client.
-- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, 92.5%
-  over the `jdbc2` package — 5114 P / 414 F / 28 S,
+- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, 93.7%
+  over the `jdbc2` package — 5183 P / 347 F / 28 S,
   `docs/validation-report-pgjdbc.md`; was 89.7%). Read the per-message counts
   off the JUnit XML in `vendor/pgjdbc/pgjdbc/build/test-results/test/*.xml`
   rather than eyeballing class totals — the report lists test ids only, and
   attributing a class's failures to the wrong cause once already cost a
   feature that fixed nothing here. Remaining, largest first:
-  - **Batch update counts / BatchUpdateException contract** (~64,
-    `BatchFailureTest`): after a mid-batch failure the per-statement update
-    counts and the exception's `getUpdateCounts()` must describe exactly which
-    statements committed. Needs real per-statement batch accounting.
+  - **No implicit transaction around a pipelined batch** (64,
+    `BatchFailureTest`) — **root cause found, fix written and proven, but it
+    cannot ship yet.** Postgres treats every message between two Syncs as one
+    transaction when no explicit block is open, so a batch is all-or-nothing.
+    We commit each Execute independently, so a batch that fails partway leaves
+    its earlier rows behind while pgjdbc — correctly — reports every statement
+    as `EXECUTE_FAILED` (the update-count array is all `-3`). The client's view
+    and the table's contents then disagree, which is what the test asserts on.
+    Reproduce in ten lines with psycopg's `pipeline()`: insert two good rows, a
+    duplicate key, then another good row, and compare. Real PostgreSQL 14.13
+    keeps only the pre-existing row; we keep the two good ones as well.
+
+    The fix is an implicit transaction in `pgextended.ExtendedSession`: open it
+    on the first Execute when `session.txn_handle is None`, commit it at Sync,
+    roll it back if anything since the last Sync errored, and hand ownership
+    over if an explicit BEGIN arrives (psycopg depends on a BEGIN surviving
+    Sync). A working implementation — pipelined rollback, successful-batch
+    commit and explicit transactions all verified against real PG — is kept at
+    `scratchpad/implicit-txn-attempt.py`.
+
+    **It is blocked on the write-conflict item above.** The implicit
+    transaction spans a network round trip, so two connections doing ordinary
+    concurrent autocommit writes now overlap inside WiredTiger, which aborts
+    where Postgres blocks. That turns five `tests/test_pgserver_concurrency.py`
+    tests (`test_concurrent_nextval_never_repeats`,
+    `test_autocommit_computed_updates_lose_no_increments`, the two
+    single-winner race tests, and the dual-protocol stall test) into `40001`
+    failures. Trading a batch-semantics divergence for broken concurrent
+    autocommit writes is the worse deal, so this waits for block-and-retry
+    write-conflict handling and should land immediately after it.
   - **`_pg_expandarray`** (28, `UpdateableResultTest`): the (x, n) row shape is
     implemented in `srf.py`, but the CALL SITES pgjdbc emits are not
     recognised — a schema-qualified function in FROM position
@@ -2411,17 +2437,12 @@ shared storage engine or building large new protocol subsystems:
     form `(…).n` / `(…).x`, including inside a derived table used in a JOIN ON.
     Needs FROM-position parsing of qualified/leading-underscore function names
     plus composite-value field access on an SRF column.
-  - **`relation "" does not exist`** — note the EMPTY name — is the single
-    largest message in the suite (73: `PGObjectGetTest` 28, `PGObjectSetTest`
-    26, `GeometricTest` 8, `SearchPathLookupTest` 3, others 8). It is *not* a
-    search-path problem, which is what it was mis-attributed to before being
-    read off the JUnit XML. It is pgjdbc's `TypeInfoCache` type-lookup query,
-    and it reduces to two independent bugs, both reproducible in three lines
-    of SQL:
-    - ~~`JOIN … USING (col)` degrades to a CROSS JOIN~~ — FIXED: USING is
-      desugared to a qualified ON before planning
-      (`planner.desugar_join_using`). Row semantics now match PostgreSQL
-      14.13 for inner / LEFT / chained / multi-column USING.
+  - ~~**`relation "" does not exist`** (73)~~ — FIXED. It was pgjdbc's
+    `TypeInfoCache` type-lookup query, and reduced to two independent bugs,
+    both now closed (`JOIN … USING` cross-joining, and an SRF usable only as
+    the sole FROM item). Clearing it took `PGObjectGetTest`,
+    `PGObjectSetTest`, `GeometricTest` and `SearchPathLookupTest` with it and
+    moved the gauge 92.5% → 93.7%. One divergence from that work remains:
     - **`SELECT *` over a `USING` join does not merge the joined column.**
       Postgres returns `(1, 'x', 'p')` for `SELECT * FROM a JOIN b USING (k)`;
       we emit `k` once per side, `(1, 'x', 1, 'p')`. The join *rows* are
@@ -2429,24 +2450,18 @@ shared storage engine or building large new protocol subsystems:
       means touching every star-expansion path in the planner (there are a
       dozen, one per join shape). Pinned by
       `tests/test_sql_join_using.py::TestKnownDivergence`.
-    - **A set-returning function is only supported as the sole FROM item**, so
-      `JOIN generate_series(…) AS s(r) ON …` and a derived table whose body
-      reads one both fail. This is what actually blocks the 73
-      `TypeInfoCache` failures. It used to surface as `relation ""`; it now
-      raises a faithful "only supported as the sole FROM item" error naming
-      the function. To implement: sqlglot models the source as an `exp.Table`
-      whose `this` is the function node (so `node.name` is empty), and
-      `planner._resolve_source` is the place to handle it. The pieces exist —
-      `srf.from_source` / `srf.build` produce rows plus a `TableDef`, and
-      `RawDerived(stmt, names)` is a derived-table plan the executor already
-      materializes through the engine. The unsolved part is column *types* at
-      plan time: `_resolve_source` runs without a storage/session context, so
-      the tags `srf.build` derives by evaluating are not available yet.
-      Resolve that (defer tag inference to materialization, or thread a
-      context in) rather than guessing tags — a wrongly-typed join source
-      would diverge silently, which is worse than the current honest error.
     Multi-entry `search_path` resolution landed separately and moved none of
-    these; `SearchPathLookupTest`'s 3 failures are this same empty-name bug.
+    these.
+  - **`pg_type` has no array-type rows.** `typarray` on a scalar type points
+    at an oid (int4 → 1007) that has no row of its own, so a driver resolving
+    an array type by oid finds nothing. `typinput` now exists and reports
+    `array_in` for any `_`-prefixed typname, so the standard
+    `typinput = 'pg_catalog.array_in'::regproc` array test will work the day
+    those rows appear — but nothing currently matches it. Note that
+    `::regproc` does not strip the schema the way real Postgres does; that
+    only becomes observable once array rows exist, and both should be fixed
+    together. Widening `pg_type` touches every gauge that reads the catalog
+    (psycopg especially), so measure across gauges, not just pgjdbc.
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
     failed statements in a transaction.
@@ -4632,3 +4647,41 @@ touched:
 The two *vulnerability*-class pyo3 advisories (RUSTSEC-2025-0020 / -2026-0177) are
 tracked separately in #584 (the 0.22 -> 0.29 migration) and are the two IDs on
 the gate's `--ignore` baseline. When #584 lands, drop those ignores.
+
+## Oplog in-flight window races on Windows CI (2026-08-01)
+
+`tests/test_oplog_visibility.py::test_find_seq_for_ts_waits_for_in_flight_mint`
+fails intermittently on the Windows CI lanes (seen on PRs #739 and #741, both
+of which touch only the SQL front end and cannot reach this code). It has not
+been reproduced on macOS.
+
+**This is a real product race, not a slow runner.** It was first mis-diagnosed
+as `find_seq_for_ts`'s bounded 0.5s wait expiring under load, and the bound was
+made injectable so the test could widen it to 30s. **It still failed after
+that**, which rules the deadline out.
+
+What the failure means, from the code: `find_seq_for_ts` returns the
+committed-view answer once `r - 1 <= oplog_visible_tail_seq()`. With seq 2
+minted inside an open batch transaction, `oplog_visible_tail_seq()` must report
+`min(_oplog_in_flight) - 1 == 1`, so the wait continues until seq 2 commits and
+the answer is 2. Getting 3 means `_oplog_in_flight` did **not** contain seq 2 at
+that moment, so the in-flight registration was either not yet visible to the
+reading thread or was dropped.
+
+Why this matters beyond a red lane: `oplog_visible_tail_seq` is what stops a
+change-stream reader advancing past a hole. If the in-flight window can be
+observed empty while a mint is genuinely in flight, a `startAtOperationTime`
+position can be finalised above an uncommitted entry and that event is
+**permanently skipped** when its transaction commits. That is silent event loss,
+which is exactly what the visibility work in #706 existed to prevent.
+
+Where to look: `Storage._mint_oplog_seqs` registers the range under
+`_oplog_seq_lock`, and `_deregister_minted` removes it at the emitting scope's
+resolution point, with the pending ranges parked on **thread-local**
+`_tls.pending_minted`. Suspect the interaction between that thread-local
+bookkeeping and a batch transaction whose emit and commit happen on different
+threads from the reader, plus `oplog_visible_tail_seq_nolock`'s deliberately
+lock-free dict read. Windows' coarser scheduling quantum likely just widens a
+window that exists everywhere.
+
+Do not "fix" this by deselecting the test or by widening a timeout again.

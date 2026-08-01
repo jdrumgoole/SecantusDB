@@ -1864,6 +1864,16 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         row.setdefault("typrelid", 0)
         row.setdefault("typarray", 0)
         row.setdefault("typdelim", ",")
+        # typinput is the type's input function. Drivers do not call it; they
+        # compare it to array_in to decide whether a type is an array —
+        # pgjdbc's TypeInfoCache asks for ``typinput = 'pg_catalog.array_in'
+        # ::regproc as is_array``. Array types therefore must report exactly
+        # ``array_in``; for the rest the conventional ``<typname>in`` name is
+        # both harmless and what real Postgres shows for the common types.
+        row.setdefault(
+            "typinput",
+            "array_in" if str(row.get("typname", "")).startswith("_") else f"{row['typname']}in",
+        )
     return rows
 
 
@@ -2770,6 +2780,7 @@ _register(
         ("typrelid", "int4"),
         ("typarray", "int4"),
         ("typdelim", "text"),
+        ("typinput", "text"),
     ],
     _pg_type,
 )
