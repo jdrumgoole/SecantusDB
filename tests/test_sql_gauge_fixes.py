@@ -329,3 +329,59 @@ def test_unaliased_cast_column_named_after_typname(storage, session):
     ``SELECT 2::int8`` is column ``int8`` (surfaced by the pgtest gauge)."""
     res = run(storage, session, "SELECT 2::int8, 3::int, 'x'::varchar, 4 AS four, 5")
     assert [c.name for c in res.columns] == ["int8", "int4", "varchar", "four", "?column?"]
+
+
+class TestDescribeCTE:
+    """Describe must report a CTE query's real column shape — NoData followed
+    by DataRows is a protocol violation pgjdbc rejects outright ("Received
+    resultset tuples, but no field structure for them"). Describe stays
+    side-effect free even for a data-modifying CTE."""
+
+    def _describe(self, storage, session, sql):
+        from secantus.sql import engine, planner
+        from secantus.sql.catalog import Catalog
+
+        stmt = planner.parse(sql)[0]
+        cols = engine.describe_statement(storage, DB, stmt, session, Catalog(storage))
+        return [c.name for c in cols] if cols else None
+
+    @pytest.fixture(autouse=True)
+    def _table(self, storage, session):
+        run(storage, session, "CREATE TABLE cte_t (a int, str text)")
+
+    def test_plain_cte(self, storage, session):
+        assert self._describe(
+            storage, session, "WITH y AS (SELECT a FROM cte_t) SELECT a FROM y"
+        ) == ["a"]
+
+    def test_column_alias_list(self, storage, session):
+        got = self._describe(
+            storage, session, "WITH z(p, q) AS (SELECT a, str FROM cte_t) SELECT p, q FROM z"
+        )
+        assert got == ["p", "q"]
+
+    def test_data_modifying_cte(self, storage, session):
+        got = self._describe(
+            storage,
+            session,
+            "WITH x AS (INSERT INTO cte_t(a, str) VALUES (43, 'abc') RETURNING a, str) "
+            "SELECT * FROM x",
+        )
+        assert got == ["a", "str"]
+
+    def test_describe_has_no_side_effects(self, storage, session):
+        self._describe(
+            storage,
+            session,
+            "WITH x AS (INSERT INTO cte_t(a, str) VALUES (1, 'x') RETURNING a) SELECT * FROM x",
+        )
+        assert rows(storage, session, "SELECT count(*) FROM cte_t") == [(0,)]
+
+    def test_execute_still_runs(self, storage, session):
+        res = run(
+            storage,
+            session,
+            "WITH x AS (INSERT INTO cte_t(a, str) VALUES (7, 'q') RETURNING a, str) "
+            "SELECT * FROM x",
+        )
+        assert res.rows == [(7, "q")]

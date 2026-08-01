@@ -238,6 +238,8 @@ sdist.exclude = [
     "vendor/pgx/**",
     "pgx_validation/**",
     "pgtest_validation/**",
+    "vendor/pgjdbc/**",
+    "pgjdbc_validation/**",
     "sqlstress_validation/**",
     ".validation/**",
     # brandkit/ is marketing content (logos, brand-guide HTML); not

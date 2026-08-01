@@ -2383,6 +2383,25 @@ shared storage engine or building large new protocol subsystems:
   waiting out the competing transaction (WT invalidates the whole txn on
   conflict, so the user transaction's prior statements must replay too).
   Until then the sql-stress smoke keeps its write lanes single-client.
+- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, 4962 P /
+  568 F / 28 S = 89.7% over the `jdbc2` package,
+  `docs/validation-report-pgjdbc.md`): batch-execution semantics (~88 —
+  BatchFailureTest's per-statement update counts and the
+  BatchUpdateException contract on mid-batch failure), `relation "…" does not
+  exist` (45 — mostly UpdateableResultTest's implicit re-resolution),
+  timestamp text-input parsing (64 — `invalid input syntax for type timestamp
+  [without|with] time zone` on formats pgjdbc emits), `ANY(CURRENT_SCHEMAS(true))`
+  in DatabaseMetaData queries (31), `_pg_expandarray()` (28 — the
+  information_schema helper pgjdbc uses for index columns), 20 internal
+  errors, and `ALTER` forms (14). Also excluded: `NotifyTest` hangs
+  (cross-connection async NOTIFY delivery — a real gap, see below). Grow
+  `INCLUDE_PACKAGES` past `jdbc2` once these land.
+- [ ] **Cross-connection async NOTIFY delivery**: a `NOTIFY` issued on one
+  connection is not delivered to another connection's
+  `getNotifications()` poll, so pgjdbc's `NotifyTest` blocks forever
+  (excluded from the gauge with a reason). LISTEN/NOTIFY works
+  within a connection; the pubsub registry needs to fan out to other
+  sessions' pending-notification queues and wake a blocked reader.
 - [ ] **pgtest gauge — wire-fidelity clusters** (`invoke validate-pgtest`,
   baseline 8/58 files, `docs/validation-report-pgtest.md`): the corpus is
   byte-exact per message, and each file stops at its first mismatch, so

@@ -12,12 +12,16 @@ executed tests passing (100%, zero failures, zero errors)** the same day —
 including the whole schema-qualified surface (the `schemas` capability is
 open now that relations are namespaced per schema); the one closed
 capability is `datetime_microseconds` (the BSON millisecond divergence).
-Outstanding: G5 (Npgsql / pgjdbc — the largest catalog-gated suites);
-per-item status in §5. G4 (pgx), G7 (pgbench + psql), and the G1
-`postgres-extended` second lane landed 2026-07-31; G3 (pgtest) landed
-2026-08-01 — the monorepo-vendoring question resolved by fetching corpus +
-runner at a pinned commit at gauge time (sparse blob-filtered clone, cached,
-never vendored). This document plans the SQL/Postgres
+**Every gauge in the portfolio (G1–G7) is now implemented.** G4 (pgx), G7
+(pgbench + psql), and the G1 `postgres-extended` second lane landed
+2026-07-31; G3 (pgtest) and G5 (pgjdbc) landed 2026-08-01. Remaining work
+is growth, not new gauges: raise each gauge's pass rate (per-gauge clusters
+in `tasks/backlog.md`) and widen include lists (the 622-file sqllogictest
+corpus, pgjdbc packages beyond `jdbc2`, pgx beyond pgconn/pgproto3).
+Npgsql stays unbuilt by choice — pgjdbc covers the same
+JDBC/ADO-style-client ground with a friendlier license and no
+type-preload connect gate; revisit only if .NET-specific coverage is
+wanted. This document plans the SQL/Postgres
 analogue of the thirteen MongoDB driver gauges: comprehensive **external,
 unmodified** test suites run against the `SecantusPGServer` over a real
 `postgresql://…` connection, reported as pass/fail/skip counts the way
@@ -296,7 +300,24 @@ suites refuse to run *anything*:
    cluster-by-cluster like the psycopg gauge did (42% → 91%); first fix
    already in (unaliased cast columns named after the type's `typname`,
    `SELECT 2::int8` → column `int8`). Top clusters in the backlog.
-5. **G4 pgx** — ✅ landed (2026-07-31): `invoke validate-pgx` runs the
+5. **G5 pgjdbc** — ✅ landed (2026-08-01): `invoke validate-pgjdbc` runs
+   the official JDBC driver's own suite unmodified from `vendor/pgjdbc`
+   (REL42.7.13), targeted through pgjdbc's stock `build.local.properties`
+   — which pgjdbc gitignores (`*.local.properties`), so writing it at gauge
+   time leaves the submodule pristine. Needs JDK 21 (its Gradle toolchain
+   requirement; CI reuses the java/kotlin `setup-java` + Gradle cache
+   steps). Scope starts at the `jdbc2` core package (75 classes enumerated
+   per-class, so `EXCLUDE_CLASSES` is effective — Gradle's `--tests` has no
+   exclude form); grow package by package. Baseline **4462 P / 1068 F
+   (80.7%)**, and the first fix took it to **4962 P / 568 F (89.7%)**: the
+   dominant cluster (528 failures, half the total) was one protocol bug —
+   Describe answered NoData for a CTE query while Execute emitted DataRows,
+   which pgjdbc rejects outright ("Received resultset tuples, but no field
+   structure for them"); data-modifying CTEs (`WITH x AS (INSERT …
+   RETURNING …) SELECT * FROM x`) hit it every time. Remaining clusters in
+   the backlog. Chosen over Npgsql for the BSD-2 license, the absent
+   type-preload connect gate, and toolchain reuse.
+6. **G4 pgx** — ✅ landed (2026-07-31): `invoke validate-pgx` runs the
    vendored `vendor/pgx` (v5.9.2) `pgconn` + `pgproto3` packages unmodified
    via `PGX_TEST_DATABASE`, weekly in `validate.yml` (shares the go gauge's
    toolchain step). Baseline: **291 P / 87 F / 22 S (77.0%)** — pgproto3
