@@ -1069,3 +1069,37 @@ duration of the run — an unshippable configuration. The sync path has always
 paid the (post-#700 key-only) prune; #716 makes async pay the same, honest
 price. The published async column (50.4k/66k/100.3k/119.2k, 0.6.0b5) should
 be read as ~5% optimistic until the next release re-baseline.
+
+## Finding 18 — Tier-1 micro-opt measurements: the compare fast path is large, the catalog cache is a measured zero (2026-08-01)
+
+From the codebase micro-optimisation review (gate: ship at >=1% on the
+target bench, drop below it):
+
+- **`numeric::classify` fast path (#730, SHIPPED)**: allocation-free
+  int/double comparisons. COLLSCAN int-range filter drain **+10.8%**
+  (1.98M → 2.19M docs/s), int-bound-vs-double-field drain **+48.7%**
+  (2.03M → 3.03M), in-engine sort neutral. Interleaved A/B, release
+  builds, non-overlapping distributions. The historic "BSON alloc churn"
+  hot spot had a second layer below mimalloc: the digit-form NumVal built
+  a String + Vec per operand per comparison.
+- **`CollMeta` one-decode options view (SHIPPED)**: insert/replace/delete
+  decoded the same collection-options row 2-3× per op. Paired A/B on
+  two-index batch inserts: **+2.3%, 5/5 positive pairs** (plain-insert arm
+  within noise). Strictly-less-work change, no added machinery.
+- **Per-(db,coll) index-catalog snapshot cache (DROPPED — measured ~0)**:
+  a seqlock-generation cache of decoded `IndexDesc`s, correct under
+  concurrent DDL (fresh-session fills, user-txn bypass, commit bumps) and
+  fully green on the storage suites — but two quiet-box 5-rep A/Bs put the
+  two-index insert delta at **+0.4% / +2.3%-with-outlier ≈ noise**, and
+  the run-to-run drift (~3%) exceeded the effect. Mechanism: the per-thread
+  WT cursor cache already makes the K≤2 catalog walk cheap (~a search +
+  two tiny decodes), and the cache's own per-op cost (two String key
+  allocs + mutex + Arc clones) cancels most of the saving. Might pay at
+  K≥5 indexes, but that isn't the representative workload; complexity not
+  shipped for noise. (Branch existed as `microopt-catalog`, deleted; the
+  diff is reconstructible from this finding + #730-era review notes.)
+
+Measurement note for future micro-opts on this box: with a parallel
+session active the practical noise floor is ±2-3% even at load<4 —
+sub-2% effects need paired designs (per-pair deltas, sign tests), not
+mean comparison.
