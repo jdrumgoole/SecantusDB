@@ -53,10 +53,12 @@ WORKLOADS = (
     "insert",
     "find_indexed_range",
     "find_all",
+    "find_filtered_scan",
     "update_many_half",
     "aggregate_group",
     "aggregate_multistage",
     "delete_many_half",
+    "change_stream_drain",
 )
 
 
@@ -86,7 +88,9 @@ def _wait_for_listener(host: str, port: int, timeout: float = 30.0) -> None:
 def _rust_client() -> Iterator[pymongo.MongoClient]:
     import _secantus_server
 
-    srv = _secantus_server.RustServer(tempfile.mkdtemp(prefix="cmp-rust-"), 0)
+    srv = _secantus_server.RustServer(
+        tempfile.mkdtemp(prefix="cmp-rust-"), 0, replica_set_name="secantus"
+    )
     try:
         host, port = srv.address
         yield pymongo.MongoClient(host, port, directConnection=True, serverSelectionTimeoutMS=5000)
@@ -104,6 +108,58 @@ def _python_client() -> Iterator[pymongo.MongoClient]:
         yield pymongo.MongoClient(srv.uri, directConnection=True, serverSelectionTimeoutMS=5000)
     finally:
         srv.stop()
+
+
+@contextmanager
+def _mongod_replset_client() -> Iterator[pymongo.MongoClient]:
+    """Spawn a throwaway SINGLE-NODE REPLICA SET mongod (change streams need
+    one) — used only for the ``change_stream_drain`` reference number; every
+    other row keeps the standalone reference so the table stays comparable
+    with earlier publications."""
+    data_dir = Path(tempfile.mkdtemp(prefix="cmp-mongod-rs-"))
+    port = _free_port()
+    proc = subprocess.Popen(
+        [
+            "mongod",
+            "--bind_ip",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--dbpath",
+            str(data_dir),
+            "--logpath",
+            str(data_dir / "mongod.log"),
+            "--replSet",
+            "cmp0",
+            "--noauth",
+            "--quiet",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_listener("127.0.0.1", port)
+        client = pymongo.MongoClient(
+            f"mongodb://127.0.0.1:{port}", directConnection=True, serverSelectionTimeoutMS=10000
+        )
+        client.admin.command("replSetInitiate")
+        deadline = time.perf_counter() + 30
+        while time.perf_counter() < deadline:
+            try:
+                if client.admin.command("hello").get("isWritablePrimary"):
+                    break
+            except pymongo.errors.PyMongoError:
+                pass
+            time.sleep(0.2)
+        yield client
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(data_dir, ignore_errors=True)
 
 
 @contextmanager
@@ -165,6 +221,13 @@ def _run_workloads(client: pymongo.MongoClient, n: int) -> dict[str, float]:
     start = time.perf_counter()
     _ = list(coll.find({}))
     t["find_all"] = time.perf_counter() - start
+
+    # COLLSCAN with a numeric range filter on an UNINDEXED field (`g` — only
+    # `v` is indexed): the per-document compare path, which `find_all` (no
+    # filter) and the indexed range (B-tree byte compare) never touch.
+    start = time.perf_counter()
+    _ = list(coll.find({"g": {"$gte": 25}}))
+    t["find_filtered_scan"] = time.perf_counter() - start
 
     start = time.perf_counter()
     coll.update_many({"active": True}, {"$inc": {"v": 1}})
@@ -230,7 +293,32 @@ def _run_workloads(client: pymongo.MongoClient, n: int) -> dict[str, float]:
     t["delete_many_half"] = time.perf_counter() - start
 
     coll.drop()
+    t["change_stream_drain"] = _change_stream_drain(client, n)
     return t
+
+
+def _change_stream_drain(client: pymongo.MongoClient, n: int) -> float:
+    """Seconds to drain ``n // 2`` change-stream events (inserted while the
+    watch is open; only the drain is timed). ``NaN`` when the server rejects
+    ``$changeStream`` — a STANDALONE mongod does (its change streams need a
+    replica set), so the throwaway standalone reference gets its number from
+    a separate single-node-replica-set spawn in ``main``."""
+    events = n // 2
+    cs = client["perf"]["cs"]
+    cs.drop()
+    try:
+        with cs.watch(batch_size=2000) as stream:
+            for lo in range(0, events, 1000):
+                cs.insert_many([{"_id": lo + k, "pad": "y" * 64} for k in range(1000)])
+            start = time.perf_counter()
+            for _ in range(events):
+                stream.next()
+            elapsed = time.perf_counter() - start
+    except pymongo.errors.PyMongoError:
+        return float("nan")
+    finally:
+        cs.drop()
+    return elapsed
 
 
 def _median_run(make_client: Any, n: int, reps: int) -> dict[str, float]:
@@ -279,6 +367,21 @@ def main(argv: list[str] | None = None) -> int:
         if use_mongod
         else None
     )
+    import math
+
+    if (
+        mongod is not None
+        and math.isnan(mongod.get("change_stream_drain", float("nan")))
+        and not args.mongo_uri
+        and shutil.which("mongod") is not None
+    ):
+        # Standalone mongod rejects $changeStream — measure that one row
+        # against a throwaway single-node replica set.
+        samples = []
+        for _ in range(args.reps):
+            with _mongod_replset_client() as rc:
+                samples.append(_change_stream_drain(rc, args.n))
+        mongod["change_stream_drain"] = statistics.median(samples)
     rust = _median_run(_rust_client, args.n, args.reps)
     py = _median_run(_python_client, args.n, args.reps)
 
@@ -298,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
             m, r, p = mongod[k] * 1000, rust[k] * 1000, py[k] * 1000
             rx = r / m if m else float("nan")
             px = p / m if m else float("nan")
-            print(f"{k:<22}{m:>12.2f}{r:>19.2f}{rx:>8.1f}x{p:>16.2f}{px:>8.1f}x")
+            row = f"{k:<22}{m:>12.2f}{r:>19.2f}{rx:>8.1f}x{p:>16.2f}{px:>8.1f}x"
+            print(row.replace("nan", "  —"))
     else:
         header = f"{'workload':<22}{'SecantusDB-rs(ms)':>19}{'SecantusDB(ms)':>16}{'speedup':>10}"
         sub = f"{'':<22}{'(Rust)':>19}{'(Python)':>16}{'':>10}"
