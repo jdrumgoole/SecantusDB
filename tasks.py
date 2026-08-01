@@ -945,6 +945,32 @@ def sql_stress(c: Context) -> None:
     print("\nWrote docs/validation-report-sqlstress.md")
 
 
+@task(name="validate-pgtest")
+def validate_pgtest(c: Context) -> None:
+    """Run CockroachDB's pgtest wire corpus against a SecantusPGServer daemon.
+
+    The SQL-server wire-protocol gauge (tasks/sql-gauges-plan.md G3): ~54
+    datadriven files of raw pgwire exchanges, driven by cockroach's own
+    pkg/testutils/pgtest runner verbatim. Corpus + runner are fetched at a
+    pinned commit via a sparse blob-filtered clone (cached under
+    .validation/) — never vendored. Requires go + network on first run.
+    Generates docs/validation-report-pgtest.md. Python server only.
+    """
+    _run_gauge(
+        c,
+        module="pgtest_validation.runner",
+        raw=".validation/pgtest-raw.json",
+        report="docs/validation-report-pgtest.md",
+        hint="Missing `go`, no network for the pinned cockroach fetch, or a PG-server startup failure is the usual cause.",
+    )
+    c.run(
+        "uv run --no-sync python -m pgtest_validation.generate_report "
+        ".validation/pgtest-raw.json docs/validation-report-pgtest.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-pgtest.md")
+
+
 @task(name="validate-pgx")
 def validate_pgx(c: Context) -> None:
     """Run jackc/pgx's pgconn + pgproto3 tests against a SecantusPGServer daemon.

@@ -322,3 +322,10 @@ def test_prepared_select_from_view_describe(storage, session):
     cols = engine.describe_statement(storage, DB, stmt, session, Catalog(storage))
     assert cols is not None and [c.name for c in cols] == ["x"]
     assert engine.run_statement(storage, DB, stmt, session).rows == [(0,)]
+
+
+def test_unaliased_cast_column_named_after_typname(storage, session):
+    """PG names a bare cast's output column after the target typname —
+    ``SELECT 2::int8`` is column ``int8`` (surfaced by the pgtest gauge)."""
+    res = run(storage, session, "SELECT 2::int8, 3::int, 'x'::varchar, 4 AS four, 5")
+    assert [c.name for c in res.columns] == ["int8", "int4", "varchar", "four", "?column?"]

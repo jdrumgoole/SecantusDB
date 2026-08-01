@@ -12,10 +12,12 @@ executed tests passing (100%, zero failures, zero errors)** the same day —
 including the whole schema-qualified surface (the `schemas` capability is
 open now that relations are namespaced per schema); the one closed
 capability is `datetime_microseconds` (the BSON millisecond divergence).
-Outstanding: G3 (needs a CockroachDB-monorepo extraction decision —
-multi-GB vendoring) and G5 (Npgsql / pgjdbc — the largest catalog-gated
-suites); per-item status in §5. G4 (pgx), G7 (pgbench + psql), and the G1
-`postgres-extended` second lane all landed 2026-07-31. This document plans the SQL/Postgres
+Outstanding: G5 (Npgsql / pgjdbc — the largest catalog-gated suites);
+per-item status in §5. G4 (pgx), G7 (pgbench + psql), and the G1
+`postgres-extended` second lane landed 2026-07-31; G3 (pgtest) landed
+2026-08-01 — the monorepo-vendoring question resolved by fetching corpus +
+runner at a pinned commit at gauge time (sparse blob-filtered clone, cached,
+never vendored). This document plans the SQL/Postgres
 analogue of the thirteen MongoDB driver gauges: comprehensive **external,
 unmodified** test suites run against the `SecantusPGServer` over a real
 `postgresql://…` connection, reported as pass/fail/skip counts the way
@@ -279,10 +281,21 @@ suites refuse to run *anything*:
    installed 3.3.4, `invoke validate-psycopg` via `PSYCOPG_TEST_DSN`,
    include/deselect in `psycopg_validation/`, weekly in `validate.yml`.
    Headline trajectory: 42% → 91.3% (§6).
-4. **G3 pgtest wire corpus** — ❌ not started. Vendor cockroach's `pgtest`
-   runner + testdata (sparse checkout or a small extraction repo given
-   monorepo size — decide at implementation; license note in vendor README),
-   `invoke validate-pgwire`.
+4. **G3 pgtest wire corpus** — ✅ landed (2026-08-01) as `invoke
+   validate-pgtest`: the extraction decision resolved by fetching BOTH the
+   corpus (`pkg/sql/pgwire/testdata/pgtest`) and cockroach's own
+   `pkg/testutils/pgtest` runner **verbatim** at a pinned commit via a
+   sparse blob-filtered clone at gauge time (~25 MB, cached under
+   `.validation/` — never vendored, which also keeps the CockroachDB
+   Software License out of the tree; noted in the package docstring). The
+   only committed Go code is ours: a thin `go test` driver + a 10-line
+   `skip` shim (`pgtest_validation/go/`). We present as non-crdb, so the
+   corpus' `crdb_only` exchanges self-skip. Weekly in `validate.yml`
+   (shares the Go toolchain step). Baseline: **8/58 files pass** — each
+   file stops at its first byte-level mismatch, so the number climbs
+   cluster-by-cluster like the psycopg gauge did (42% → 91%); first fix
+   already in (unaliased cast columns named after the type's `typname`,
+   `SELECT 2::int8` → column `int8`). Top clusters in the backlog.
 5. **G4 pgx** — ✅ landed (2026-07-31): `invoke validate-pgx` runs the
    vendored `vendor/pgx` (v5.9.2) `pgconn` + `pgproto3` packages unmodified
    via `PGX_TEST_DATABASE`, weekly in `validate.yml` (shares the go gauge's

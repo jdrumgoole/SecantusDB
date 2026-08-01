@@ -2383,6 +2383,16 @@ shared storage engine or building large new protocol subsystems:
   waiting out the competing transaction (WT invalidates the whole txn on
   conflict, so the user transaction's prior statements must replay too).
   Until then the sql-stress smoke keeps its write lanes single-client.
+- [ ] **pgtest gauge — wire-fidelity clusters** (`invoke validate-pgtest`,
+  baseline 8/58 files, `docs/validation-report-pgtest.md`): the corpus is
+  byte-exact per message, and each file stops at its first mismatch, so
+  fixes compound. First clusters from the baseline stream: ErrorResponse
+  field mismatches (~5 files — SQLSTATE/severity shapes under `until`
+  blocks), RowDescription details (DataTypeSize/TypeModifier for specific
+  types), CommandTag spellings, and per-type text renderings (array /
+  decimal / char / inet / varbit files each stop at their first divergent
+  output). Re-run per fix; grow toward the full 54-file corpus like the
+  psycopg gauge's 42%→91% climb.
 - [ ] **pgx gauge — pgconn clusters** (`invoke validate-pgx`, baseline 291 P /
   87 F / 22 S = 77.0%, `docs/validation-report-pgx.md`): the two big pgconn
   clusters are **pipeline mode** (`Pipeline*` — Sync-less batching over the

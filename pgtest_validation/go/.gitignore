@@ -1,0 +1,3 @@
+# The verbatim upstream runner (pkg/testutils/pgtest) is fetched at gauge
+# time by pgtest_validation.runner — never committed here.
+crdbshim/pkg/testutils/pgtest/
