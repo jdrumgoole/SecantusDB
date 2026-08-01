@@ -565,7 +565,7 @@ fn serve<S: Read + Write>(
                         continue;
                     }
                 };
-                let (mut reply, close_conn, pending) = run_dispatch(
+                let (reply, close_conn, pending) = run_dispatch(
                     &request,
                     raw_insert_docs,
                     conn_id,
@@ -590,12 +590,8 @@ fn serve<S: Read + Write>(
                     && request.contains_key("getMore")
                     && matches!(reply.get("cursor"), Some(Bson::Document(_)))
                 {
-                    // The exhaust streamer reframes the batch array in the reply
-                    // document, so materialise the pending blobs back into it
-                    // (the normal path below splices them straight onto the wire).
-                    if let Some(pb) = pending {
-                        materialize_batch(&mut reply, pb);
-                    }
+                    // The streamer splices pending blobs straight onto the
+                    // wire per frame — no decode→re-encode of the batch.
                     if !stream_exhaust_getmore(
                         stream,
                         &header,
@@ -605,6 +601,7 @@ fn serve<S: Read + Write>(
                         conn_auth,
                         &peer_cert_dn,
                         reply,
+                        pending,
                     )? {
                         return Ok(());
                     }
@@ -860,34 +857,6 @@ fn run_dispatch(
     (reply, ctx.close_connection, ctx.pending_batch.take())
 }
 
-/// Decode a `pending_batch`'s blobs into `reply.cursor.<field>` as an owned
-/// `Bson::Array` — the old `docs_to_bson` behaviour, relocated. Used by the
-/// exhaust-getMore streamer, whose framing logic inspects the batch array in the
-/// reply document (the normal reply path splices the blobs straight onto the
-/// wire and never materialises them). A blob that fails to decode is corruption
-/// (`this is a database`); log it loudly and drop that element rather than
-/// panicking mid-stream.
-fn materialize_batch(reply: &mut Document, pending: PendingBatch) {
-    let mut arr: Vec<Bson> = Vec::with_capacity(pending.batch.len());
-    for blob in &pending.batch {
-        match Document::from_reader(&mut &blob[..]) {
-            Ok(d) => arr.push(Bson::Document(d)),
-            Err(e) => {
-                eprintln!("secantus-server: cursor batch blob failed to decode (corruption?): {e}")
-            }
-        }
-    }
-    if let Ok(cursor) = reply.get_document_mut("cursor") {
-        // Batch field first, matching the handler's original layout.
-        let mut rebuilt = Document::new();
-        rebuilt.insert(pending.batch_field, arr);
-        for (k, v) in cursor.iter() {
-            rebuilt.insert(k, v.clone());
-        }
-        *cursor = rebuilt;
-    }
-}
-
 fn make_context(
     conn_id: i64,
     shared: &Arc<Shared>,
@@ -989,6 +958,7 @@ fn stream_exhaust_getmore<S: Write>(
     conn_auth: &Arc<Mutex<ConnectionAuth>>,
     peer_cert_dn: &Option<String>,
     first_reply: Document,
+    first_pending: Option<PendingBatch>,
 ) -> io::Result<bool> {
     let target_id = match request.get("getMore") {
         Some(b) => b.clone(),
@@ -1003,51 +973,90 @@ fn stream_exhaust_getmore<S: Write>(
         .map(str::to_string)
         .unwrap_or_else(|| format!("{db}.{coll}"));
 
-    let send = |stream: &mut S, doc: &Document, more: bool| -> io::Result<bool> {
+    // `pending` batches splice onto the wire undecoded (`cursor_or_plain_body`),
+    // exactly like the non-exhaust reply path.
+    let send = |stream: &mut S,
+                doc: &Document,
+                pending: Option<&PendingBatch>,
+                more: bool|
+     -> io::Result<bool> {
         let flags = if more { OP_MSG_FLAG_MORE_TO_COME } else { 0 };
-        match write_op_msg_flags(stream, header, shared, doc, flags) {
+        let body = cursor_or_plain_body(doc, pending)?;
+        let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body, flags);
+        match stream.write_all(&frame) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
     };
 
     let mut doc = first_reply;
+    let mut pending = first_pending;
     loop {
-        let cursor = match doc.get("cursor") {
-            Some(Bson::Document(c)) => c.clone(),
+        let (drained, batch_empty) = match doc.get("cursor") {
+            Some(Bson::Document(c)) => {
+                let empty = match &pending {
+                    Some(p) => p.batch.is_empty(),
+                    // Materialized fallback (a handler that didn't splice).
+                    None => c
+                        .get_array("nextBatch")
+                        .or_else(|_| c.get_array("firstBatch"))
+                        .map(|a| a.is_empty())
+                        .unwrap_or(true),
+                };
+                (c.get_i64("id").unwrap_or(0) == 0, empty)
+            }
             // An error reply (ok: 0) mid-stream — deliver it without moreToCome.
-            _ => return send(stream, &doc, false),
+            _ => return send(stream, &doc, None, false),
         };
-        let batch: Vec<Bson> = cursor
-            .get_array("nextBatch")
-            .or_else(|_| cursor.get_array("firstBatch"))
-            .cloned()
-            .unwrap_or_default();
-        let drained = cursor.get_i64("id").unwrap_or(0) == 0;
         if drained {
-            if !batch.is_empty()
-                && !send(
-                    stream,
-                    &doc! {"cursor": {"nextBatch": batch, "id": target_id.clone(), "ns": &ns}, "ok": 1.0},
-                    true,
-                )?
-            {
-                return Ok(false);
+            if !batch_empty {
+                // Re-advertise the ORIGINAL cursor id with this final batch
+                // (the exhaust protocol closes with a separate empty frame).
+                let sent = match pending.take() {
+                    Some(p) => send(
+                        stream,
+                        &doc! {"cursor": {"id": target_id.clone(), "ns": &ns}, "ok": 1.0},
+                        Some(&p),
+                        true,
+                    )?,
+                    None => {
+                        let batch: Vec<Bson> = doc
+                            .get_document("cursor")
+                            .ok()
+                            .and_then(|c| {
+                                c.get_array("nextBatch")
+                                    .or_else(|_| c.get_array("firstBatch"))
+                                    .ok()
+                            })
+                            .cloned()
+                            .unwrap_or_default();
+                        send(
+                            stream,
+                            &doc! {"cursor": {"nextBatch": batch, "id": target_id.clone(), "ns": &ns}, "ok": 1.0},
+                            None,
+                            true,
+                        )?
+                    }
+                };
+                if !sent {
+                    return Ok(false);
+                }
             }
             let empty: Vec<Bson> = Vec::new();
             return send(
                 stream,
                 &doc! {"cursor": {"nextBatch": empty, "id": 0i64, "ns": &ns}, "ok": 1.0},
+                None,
                 false,
             );
         }
-        if batch.is_empty() {
+        if batch_empty {
             // A live cursor that yielded nothing (tailable/awaitData wait expired):
             // deliver this empty batch without moreToCome and stop streaming so we
             // don't spin. Normal cursors never reach here (empty drains id to 0).
-            return send(stream, &doc, false);
+            return send(stream, &doc, pending.as_ref(), false);
         }
-        if !send(stream, &doc, true)? {
+        if !send(stream, &doc, pending.as_ref(), true)? {
             return Ok(false);
         }
         let mut getmore = doc! {"getMore": target_id.clone(), "collection": &coll, "$db": &db};
@@ -1057,13 +1066,10 @@ fn stream_exhaust_getmore<S: Write>(
         if let Some(mt) = request.get("maxTimeMS") {
             getmore.insert("maxTimeMS", mt.clone());
         }
-        let (mut reply, _close, pending) =
+        let (reply, _close, p) =
             run_dispatch(&getmore, None, conn_id, shared, conn_auth, peer_cert_dn);
-        // Reframe the next batch into the reply document for the exhaust streamer.
-        if let Some(pb) = pending {
-            materialize_batch(&mut reply, pb);
-        }
         doc = reply;
+        pending = p;
     }
 }
 
