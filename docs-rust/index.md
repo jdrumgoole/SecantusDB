@@ -31,13 +31,13 @@ Every MongoDB driver that talks to the Python server talks to the Rust
 server unchanged — same `OP_MSG` handshake, same commands, same error
 codes, same on-disk WiredTiger semantics.
 
-And it is fast: on the six-workload benchmark the Rust server runs at
-**~0.9×–2.1× of real `mongod`** per operation (delete beats standalone
-`mongod` at 0.9×, `$group` is at parity, update near parity — after a
+And it is fast: on the nine-workload benchmark the Rust server runs at
+**~0.8×–2.3× of real `mongod`** per operation (delete, `$group`, and the
+change-stream drain all beat `mongod` at 0.8–0.9×, update near parity — after a
 mimalloc allocator, LTO, and profile-guided optimization cut the
 BSON-materialization allocation and hot-path branch cost), sustains
 **~2.6× multi-writer scaling fully durable** (monotonic to eight
-writers), and is roughly 3.5×–17× faster than the Python server
+writers), and is roughly 1.7×–19× faster than the Python server
 workload-for-workload — measured end-to-end through `pymongo` on
 on-disk WiredTiger. Numbers and methodology:
 [Benchmark](https://secantusdb.com/docs/benchmark.html) and
