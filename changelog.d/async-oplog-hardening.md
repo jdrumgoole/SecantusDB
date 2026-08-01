@@ -38,6 +38,12 @@ storage suite with the drainer pool live.
   the counter reset deferred the retry a full interval — an oplog
   temporarily unbounded past `oplog_max_entries` under bursts. The
   cadence now lives with the drainers (triggered as rows land).
+- Async oplog: an explicit `prune_oplog` call racing the drainer pruned
+  a timing-dependent subset of acknowledged writes (cap-excess rows
+  still queued escaped the sweep, shifting the pruned count and the
+  resulting oplog floor / PITR segment contents). The public entry
+  point now drains the queue first, so explicit prunes
+  deterministically cover every acknowledged write.
 
 #### Changed
 

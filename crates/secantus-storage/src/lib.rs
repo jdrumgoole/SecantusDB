@@ -4847,6 +4847,20 @@ impl Storage {
     /// the wall clock). Returns the number of rows pruned. No background sweeper —
     /// the caller drives it. Mirrors `storage.prune_oplog` / `_prune_oplog_locked`.
     pub fn prune_oplog(&self, now: Option<i64>) -> Result<usize> {
+        // Async oplog: the sweep considers only PERSISTED rows, so an explicit
+        // prune racing the drainer dooms a timing-dependent subset of the
+        // acknowledged writes (observed as `v2_restore_reaches_before_pruned_floor`
+        // flaking on the async CI lane: cap-excess rows still queued at the
+        // drainer escaped the sweep, shifting the pruned count and the
+        // resulting floor). Drain first so an explicit prune — an admin op,
+        // never on the write path — deterministically covers every
+        // acknowledged write. The drainers' own opportunistic cadence calls
+        // the sweep directly, not this entry point, so they never self-wait
+        // here; async entries mint post-commit, so a user-transaction thread
+        // cannot self-wait either.
+        if self.async_oplog.is_some() {
+            self.flush_oplog();
+        }
         self.prune_oplog_inner(now)
     }
 
