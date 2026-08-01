@@ -1,8 +1,8 @@
 """N-writer concurrency benchmark — Python server, Rust server, or mongod.
 
 Spawns one server with on-disk WT storage (``--server python`` /
-``rust`` / ``mongod``, or ``all`` to sweep the three back-to-back with a
-combined scaling table), then runs a
+``rust`` / ``rust-async`` / ``mongod``, or ``all`` to sweep the four
+back-to-back with a combined scaling table), then runs a
 configurable list of writer counts (default ``1,2,4,8``) one after
 another. For each count, ``N`` ``bench.load_writer`` processes write
 ``insert_many`` batches against their own collection for a fixed wall
@@ -25,12 +25,14 @@ single collection; Phase 2 has to push that above 1.5x.
 from __future__ import annotations
 
 import argparse
-import os
 import contextlib
+import json
+import os
 import re
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -42,6 +44,11 @@ DEFAULT_BATCH = 100
 DEFAULT_WRITERS = "1,2,4"
 DEFAULT_DB = "harness"
 DEFAULT_COLLECTION_PREFIX = "inserts_8k_w"
+
+# ``--server all`` sweep order. One full pass over every server per run,
+# so multi-run medians interleave the servers (thermal / background
+# drift lands on all of them, not just the last one measured).
+ALL_SERVERS = ["python", "rust", "rust-async", "mongod"]
 
 # Final summary line from ``bench/load_writer.py``:
 #   ``finished: 80,000 attempts in 30.01s (2,665 attempts/s avg) — 80,000 succeeded, 0 failed``
@@ -83,10 +90,11 @@ def _rust_binary() -> str:
     env = os.environ.get("SECANTUSDB_BIN")
     if env and Path(env).exists():
         return env
+    cargo_target = Path(__file__).resolve().parent.parent / "crates" / "secantusdb" / "target"
     for cand in (
         Path(sys.executable).parent / "secantusd-rs",
-        Path(__file__).resolve().parent.parent / "crates" / "secantusdb" / "target" / "release" / "secantusd-rs",
-        Path(__file__).resolve().parent.parent / "crates" / "secantusdb" / "target" / "debug" / "secantusd-rs",
+        cargo_target / "release" / "secantusd-rs",
+        cargo_target / "debug" / "secantusd-rs",
     ):
         if cand.exists():
             return str(cand)
@@ -106,18 +114,23 @@ def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
             "--storage-path", str(storage_path),
             "--log-level", "WARNING",
         ]
-    if server == "rust":
-        return [
+    if server in ("rust", "rust-async"):
+        argv = [
             _rust_binary(),
             "--host", "127.0.0.1",
             "--port", str(port),
             "--storage-path", str(storage_path),
             "--log-level", "WARNING",
         ]
+        if server == "rust-async":
+            argv += ["--oplog-async", "--oplog-nonlogged"]
+        return argv
     if server == "mongod":
         mongod = shutil.which("mongod")
         if not mongod:
-            raise SystemExit("mongod not on PATH — install Community Server or skip --server mongod")
+            raise SystemExit(
+                "mongod not on PATH — install Community Server or skip --server mongod"
+            )
         return [
             mongod,
             "--bind_ip", "127.0.0.1",
@@ -157,7 +170,7 @@ def run_writers(
     collection_prefix: str,
     shared_collection: bool,
 ) -> tuple[list[tuple[int, int] | None], float]:
-    """Spawn ``n`` writers, run for ``duration`` wall seconds, SIGTERM, return per-writer stats + elapsed."""
+    """Spawn ``n`` writers for ``duration`` wall seconds, SIGTERM; per-writer stats + elapsed."""
     procs: list[tuple[subprocess.Popen[bytes], Path]] = []
     log_paths: list[Path] = []
     try:
@@ -286,10 +299,10 @@ def run_concurrency_sweep(
         print("=" * 72)
         if baseline_rate:
             print(
-                f"\ninterpretation: scaling > 1.0x means concurrent writers "
-                f"increase total throughput;"
-                f"\n                scaling < 1.0x means contention is making "
-                f"things worse than serial execution.\n"
+                "\ninterpretation: scaling > 1.0x means concurrent writers "
+                "increase total throughput;"
+                "\n                scaling < 1.0x means contention is making "
+                "things worse than serial execution.\n"
             )
         return 0, results
     finally:
@@ -323,11 +336,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "(default: discarded) — the harness's own diagnosis tool "
                         "when writers report server errors.")
     p.add_argument("--server", default="python",
-                   choices=["python", "rust", "mongod", "all"],
+                   choices=["python", "rust", "rust-async", "mongod", "all"],
                    help="Which server to drive (default: python). "
-                        "'all' sweeps python, rust, and mongod back-to-back "
-                        "and prints a combined table.")
+                        "'rust-async' is the Rust server's opt-in async + "
+                        "non-logged oplog stack. 'all' sweeps python, rust, "
+                        "rust-async, and mongod back-to-back and prints a "
+                        "combined table.")
+    p.add_argument("--runs", type=int, default=1,
+                   help="Interleaved full sweeps; the reported rate per "
+                        "(server, writers) is the median across runs "
+                        "(default: 1).")
+    p.add_argument("--json", default="",
+                   help="Write the median rates as JSON to this path — the "
+                        "input for bench.concurrency_chart, which refreshes "
+                        "the concurrency graphs on the website and in the docs.")
     return p.parse_args(argv)
+
+
+def assemble_results(
+    *,
+    writers_list: list[int],
+    duration: float,
+    batch: int,
+    shared_collection: bool,
+    runs: int,
+    runs_rates: dict[str, list[list[float]]],
+) -> dict:
+    """Shape the per-run rates into the JSON payload ``concurrency_chart`` reads.
+
+    ``runs_rates[server][i]`` is the list of docs/s observed for
+    ``writers_list[i]`` across runs; the payload records both the raw
+    per-run rates and their median.
+    """
+    return {
+        "meta": {
+            "duration": duration,
+            "batch": batch,
+            "writers": writers_list,
+            "shared_collection": shared_collection,
+            "runs": runs,
+        },
+        "servers": {
+            server: {
+                "runs_docs_per_sec": [[round(r, 1) for r in per_n] for per_n in rates],
+                "docs_per_sec": [round(statistics.median(per_n), 1) for per_n in rates],
+            }
+            for server, rates in runs_rates.items()
+        },
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -340,32 +396,54 @@ def main(argv: list[str] | None = None) -> int:
     if not writers_list:
         print("--writers cannot be empty", file=sys.stderr)
         return 2
-    servers = ["python", "rust", "mongod"] if args.server == "all" else [args.server]
-    all_results: dict[str, list[tuple[int, int, float]]] = {}
-    for server in servers:
-        rc, results = run_concurrency_sweep(
-            writers_list=writers_list,
-            duration=args.duration,
-            batch=max(1, args.batch_size),
-            shared_collection=args.shared_collection,
-            server=server,
-            server_log=Path(args.server_log) if args.server_log else None,
-        )
-        if rc != 0:
-            return rc
-        all_results[server] = results
-    if len(servers) > 1:
+    servers = list(ALL_SERVERS) if args.server == "all" else [args.server]
+    runs = max(1, args.runs)
+    runs_rates: dict[str, list[list[float]]] = {
+        s: [[] for _ in writers_list] for s in servers
+    }
+    for run in range(runs):
+        if runs > 1:
+            print(f"### run {run + 1}/{runs}\n")
+        for server in servers:
+            rc, results = run_concurrency_sweep(
+                writers_list=writers_list,
+                duration=args.duration,
+                batch=max(1, args.batch_size),
+                shared_collection=args.shared_collection,
+                server=server,
+                server_log=Path(args.server_log) if args.server_log else None,
+            )
+            if rc != 0:
+                return rc
+            for i, (_n, total, elapsed) in enumerate(results):
+                runs_rates[server][i].append(total / elapsed if elapsed > 0 else 0.0)
+    medians = {
+        s: [statistics.median(per_n) for per_n in runs_rates[s]] for s in servers
+    }
+    if len(servers) > 1 or runs > 1:
+        label = "median docs/s" if runs > 1 else "docs/s"
         print("=" * 72)
-        print(f"{'writers':<8}" + "".join(f"{s + ' docs/s':>20}" for s in servers))
+        print(f"{'writers':<8}" + "".join(f"{s + ' ' + label:>24}" for s in servers))
         print("-" * 72)
         for i, n in enumerate(writers_list):
             row = f"{n:<8}"
             for s in servers:
-                total, elapsed = all_results[s][i][1], all_results[s][i][2]
-                rate = total / elapsed if elapsed > 0 else 0.0
-                row += f"{rate:>20,.0f}"
+                row += f"{medians[s][i]:>24,.0f}"
             print(row)
         print("=" * 72)
+    if args.json:
+        payload = assemble_results(
+            writers_list=writers_list,
+            duration=args.duration,
+            batch=max(1, args.batch_size),
+            shared_collection=args.shared_collection,
+            runs=runs,
+            runs_rates=runs_rates,
+        )
+        out = Path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"wrote {out}")
     return 0
 
 
