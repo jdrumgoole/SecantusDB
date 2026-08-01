@@ -4191,7 +4191,21 @@ impl Storage {
     }
 
     pub fn stable_checkpoint(&self) -> Result<()> {
+        // ORDER IS LOAD-BEARING: capture the seq, CHECKPOINT, then write the
+        // marker. The marker row lives in the always-logged oplog-meta table,
+        // so it becomes crash-durable the moment its transaction hits the WAL
+        // — independently of the checkpoint. Written marker-first (as this
+        // used to be), a kill -9 in the window between the marker's WAL write
+        // and the checkpoint's completion recovers with a marker ABOVE the
+        // data the last checkpoint actually contained, and replay starts too
+        // high: every acked write between the old checkpoint and the marker
+        // is silently lost (caught live by the hard-kill harness, 2026-08-01
+        // — a mid-history hole, oplog rows all present). Checkpoint-first,
+        // the crash window leaves the OLD marker: replay covers extra
+        // already-applied entries, which `apply_replay_entry_idempotent`
+        // exists to absorb. Stale-marker is safe; eager-marker loses data.
         let stable = self.oplog_visible_tail_seq();
+        self.checkpoint()?;
         {
             let session = self.conn.open_session()?;
             let mut d = Document::new();
@@ -4203,7 +4217,6 @@ impl Storage {
             cur.set_value_u(&blob);
             cur.insert()?;
         }
-        self.checkpoint()?;
         self.stable_seq.store(stable, Ordering::Release);
         Ok(())
     }
@@ -4323,7 +4336,13 @@ impl Storage {
                         continue;
                     }
                     waited = std::time::Duration::ZERO;
-                    // Marker-before-checkpoint, same as stable_checkpoint().
+                    // Checkpoint-BEFORE-marker, same as stable_checkpoint()
+                    // (see the invariant comment there): the marker is
+                    // WAL-durable the moment it is written, so writing it
+                    // ahead of the checkpoint opens a kill window where
+                    // recovery trusts a marker above the checkpointed data
+                    // and replay skips acked writes. Stale marker = safe
+                    // (idempotent over-replay); eager marker = data loss.
                     let stable = {
                         let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
                         if st.in_flight.is_empty() {
@@ -4334,6 +4353,7 @@ impl Storage {
                     };
                     let write = (|| -> Result<()> {
                         let session = conn.open_session()?;
+                        session.checkpoint(None)?;
                         let mut d = Document::new();
                         d.insert("stable_seq", stable);
                         d.insert("data_nonlogged", true);
@@ -4342,7 +4362,6 @@ impl Storage {
                         cur.set_key_s("stable");
                         cur.set_value_u(&blob);
                         cur.insert()?;
-                        session.checkpoint(None)?;
                         Ok(())
                     })();
                     match write {
