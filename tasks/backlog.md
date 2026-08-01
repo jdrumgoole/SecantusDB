@@ -4686,9 +4686,11 @@ window that exists everywhere.
 
 Do not "fix" this by deselecting the test or by widening a timeout again.
 
-## UNIQUE constraints are not enforced against concurrent commits (2026-08-01)
+## UNIQUE constraints across transactions (2026-08-01) — MOSTLY FIXED
 
-**Data-integrity bug on the SQL front end. Duplicates are silently stored.**
+**Was: a data-integrity bug on the SQL front end; duplicates were silently stored.**
+The common case is fixed (see "What is fixed" / "What remains" at the end of
+this entry); the original diagnosis is kept because the residual holes share it.
 
 Reproduce in one script: connection A opens a transaction and reads (taking its
 snapshot), connection B inserts and commits a row, then A inserts a row with the
@@ -4763,3 +4765,50 @@ reaches it (`tests/test_sql_colref.py::test_col_lt_arithmetic` and
 both fail). Land it as one piece: literal parsing, the expression engine's
 numeric tower, and the float8-vs-numeric distinction (`1e3` is float8 in
 Postgres, a plain `1.5` is numeric) together.
+
+### UNIQUE across transactions — what is fixed, and what remains
+
+**Fixed (PR: SQL unique enforcement).** A `UNIQUE` constraint is now probed
+against the latest *committed* state as well as the caller's own snapshot, via
+`Storage.find_matching_committed` (a fresh session swapped into `_tls` for the
+duration of the read). A value another transaction committed after your
+snapshot is now rejected with `23505`, matching PostgreSQL 14.13.
+`tests/test_sql_unique_across_transactions.py` covers it, including the
+no-false-positive cases.
+
+**Residual hole 1 — a transaction that has already written to the table.**
+The committed probe is disabled for a `(db, coll)` the transaction has written
+to (`UserTransactionHandle.written`, set by `Storage._note_write`). It has to
+be: the committed view of a row the transaction deleted or rewrote is stale, so
+probing it rejects a value the transaction legitimately freed — delete-then-
+reinsert inside one transaction is valid SQL and Postgres allows it. So a
+transaction that writes to a table and *then* inserts a value some other
+transaction committed in the meantime can still store a duplicate. Closing this
+properly needs per-row bookkeeping (the set of `_id`s the transaction has
+deleted or rewritten) so the committed hits can be filtered individually rather
+than the whole probe being switched off — the reason it was not done that way
+here is that update / delete run through a dozen call sites in `executor.py`
+and a missed one silently reintroduces the false positive.
+
+**Residual hole 2 — two simultaneous uncommitted inserts.** Neither transaction
+sees the other (nothing is committed yet), so both commit and a duplicate
+lands. The autocommit path is safe only because `_coll_lock` serialises
+probe-and-insert within the process, which does not extend across a
+transaction's lifetime. The real fix is the storage-layout one below.
+
+**The complete fix, for when someone takes it on:** give unique indexes an
+entry key with **no RecordId suffix**, so WiredTiger's own key uniqueness and
+write-conflict detection enforce them the way a real unique index does. That
+handles both residual holes at once, and it is what makes uniqueness a
+storage-level invariant rather than a check the SQL layer has to remember to
+perform. It changes the on-disk entry layout for unique indexes only (the
+RecordId moves into the value), so it needs an `entryFormat` bump, the refusal
+path for older stores, and the Rust twin.
+
+**The Mongo persona has the same class of gap.** `Storage._unique_conflict`
+probes `table:secantus_index_entries` through the caller's session, so a
+multi-document transaction can miss a key another transaction committed after
+its snapshot. It is not fixed here: `_note_write` fires at the top of
+`insert()`, before the probe runs, so a committed probe bolted on there would
+be switched off by its own statement and never fire. The storage-layout fix
+above resolves it for both personas at once.

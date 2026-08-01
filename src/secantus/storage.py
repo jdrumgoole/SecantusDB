@@ -1109,7 +1109,15 @@ class UserTransactionHandle:
     that ``commit_user_transaction`` flushes.
     """
 
-    __slots__ = ("session", "cursors", "began", "closed", "oplog_entries", "pre_images")
+    __slots__ = (
+        "session",
+        "cursors",
+        "began",
+        "closed",
+        "oplog_entries",
+        "pre_images",
+        "written",
+    )
 
     def __init__(self, session: Any) -> None:
         self.session = session
@@ -1118,6 +1126,12 @@ class UserTransactionHandle:
         self.closed = False
         self.oplog_entries: list[dict[str, Any]] = []
         self.pre_images: list[bytes | None] = []
+        # (db, coll) this transaction has written to. A committed-state read
+        # (``find_matching_committed``) is only authoritative for a collection
+        # the transaction has NOT touched: once it has deleted or rewritten a
+        # row, the committed view of that row is stale and would report a
+        # conflict against a value the transaction has already freed.
+        self.written: set[tuple[str, str]] = set()
 
 
 class DocumentValidationError(Exception):
@@ -3665,6 +3679,79 @@ class Storage:
             # path is defensive — log via ``suppress`` and move on.
             s.reset_snapshot()
 
+    @contextlib.contextmanager
+    def _committed_read_scope(self) -> Iterator[None]:
+        """Run reads on this thread against the latest COMMITTED state.
+
+        Swaps a fresh session (and its own cursor cache) into ``_tls`` for the
+        duration, with ``user_txn`` cleared, so every existing read path
+        transparently sees committed data instead of the transaction's pinned
+        snapshot. READ-ONLY: a write inside this scope would land outside the
+        caller's transaction and escape its rollback.
+        """
+        tls = self._tls
+        saved = (
+            getattr(tls, "session", None),
+            getattr(tls, "cursors", None),
+            getattr(tls, "user_txn", None),
+        )
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Storage is closed")
+            session = self._conn.open_session()
+        tls.session, tls.cursors, tls.user_txn = session, {}, None
+        try:
+            yield
+        finally:
+            for cur in list(tls.cursors.values()):
+                with contextlib.suppress(Exception):
+                    cur.close()
+            tls.session, tls.cursors, tls.user_txn = saved
+            with contextlib.suppress(Exception):
+                session.close()
+
+    def _note_write(self, db: str, coll: str) -> None:
+        """Record that the in-flight user transaction has written to this
+        collection, which disqualifies the committed-state probe for it (see
+        ``find_matching_committed``)."""
+        txn = getattr(self._tls, "user_txn", None)
+        if txn is not None:
+            txn.written.add((db, coll))
+
+    def find_matching_committed(
+        self, db: str, coll: str, filter: dict[str, Any] | None = None, *, limit: int = 0
+    ) -> list[dict[str, Any]]:
+        """``find_matching`` against the latest COMMITTED state, ignoring a user
+        transaction's pinned snapshot.
+
+        For CONSTRAINT ENFORCEMENT only, not for user-visible reads — those must
+        keep the transaction's view. A uniqueness probe is not an ordinary read:
+        Postgres pins your read snapshot too, yet still checks a unique index
+        against committed data, so a value another transaction committed after
+        your snapshot conflicts. Probing through the snapshot instead let the
+        duplicate through and stored it.
+
+        Outside a user transaction this is plain ``find_matching`` — the
+        session's snapshot is already refreshed per read — so the common path
+        costs nothing extra.
+
+        Returns nothing once the transaction has WRITTEN to the collection: the
+        committed view of a row this transaction has deleted or rewritten is
+        stale, and reporting it would reject a value the transaction has
+        legitimately freed (delete-then-reinsert inside one transaction is
+        valid, and Postgres allows it). The caller's own snapshot probe still
+        covers everything visible to the transaction; what is given up is
+        catching a *late* outside commit in a transaction that has already
+        written to the same table.
+        """
+        txn = getattr(self._tls, "user_txn", None)
+        if txn is None:
+            return self.find_matching(db, coll, filter, limit=limit)
+        if (db, coll) in txn.written:
+            return []
+        with self._committed_read_scope():
+            return self.find_matching(db, coll, filter, limit=limit)
+
     # -- user (multi-document) transactions --------------------------------
     #
     # A user transaction owns a dedicated WT session, NOT the connection
@@ -4067,6 +4154,7 @@ class Storage:
         ordered: bool = True,
         journal: bool = False,
     ) -> tuple[int, list[dict[str, Any]]]:
+        self._note_write(db, coll)
         # Materialized so the conflict-retry wrapper can safely re-run
         # the whole method (a generator would arrive exhausted).
         docs = list(docs)
@@ -5003,6 +5091,7 @@ class Storage:
         journal: bool = False,
         return_post_images: bool = False,
     ) -> dict[str, Any]:
+        self._note_write(db, coll)
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
@@ -5241,6 +5330,7 @@ class Storage:
         collation: Any = None,
         journal: bool = False,
     ) -> int:
+        self._note_write(db, coll)
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
