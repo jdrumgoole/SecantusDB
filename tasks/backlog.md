@@ -4647,3 +4647,41 @@ touched:
 The two *vulnerability*-class pyo3 advisories (RUSTSEC-2025-0020 / -2026-0177) are
 tracked separately in #584 (the 0.22 -> 0.29 migration) and are the two IDs on
 the gate's `--ignore` baseline. When #584 lands, drop those ignores.
+
+## Oplog in-flight window races on Windows CI (2026-08-01)
+
+`tests/test_oplog_visibility.py::test_find_seq_for_ts_waits_for_in_flight_mint`
+fails intermittently on the Windows CI lanes (seen on PRs #739 and #741, both
+of which touch only the SQL front end and cannot reach this code). It has not
+been reproduced on macOS.
+
+**This is a real product race, not a slow runner.** It was first mis-diagnosed
+as `find_seq_for_ts`'s bounded 0.5s wait expiring under load, and the bound was
+made injectable so the test could widen it to 30s. **It still failed after
+that**, which rules the deadline out.
+
+What the failure means, from the code: `find_seq_for_ts` returns the
+committed-view answer once `r - 1 <= oplog_visible_tail_seq()`. With seq 2
+minted inside an open batch transaction, `oplog_visible_tail_seq()` must report
+`min(_oplog_in_flight) - 1 == 1`, so the wait continues until seq 2 commits and
+the answer is 2. Getting 3 means `_oplog_in_flight` did **not** contain seq 2 at
+that moment, so the in-flight registration was either not yet visible to the
+reading thread or was dropped.
+
+Why this matters beyond a red lane: `oplog_visible_tail_seq` is what stops a
+change-stream reader advancing past a hole. If the in-flight window can be
+observed empty while a mint is genuinely in flight, a `startAtOperationTime`
+position can be finalised above an uncommitted entry and that event is
+**permanently skipped** when its transaction commits. That is silent event loss,
+which is exactly what the visibility work in #706 existed to prevent.
+
+Where to look: `Storage._mint_oplog_seqs` registers the range under
+`_oplog_seq_lock`, and `_deregister_minted` removes it at the emitting scope's
+resolution point, with the pending ranges parked on **thread-local**
+`_tls.pending_minted`. Suspect the interaction between that thread-local
+bookkeeping and a batch transaction whose emit and commit happen on different
+threads from the reader, plus `oplog_visible_tail_seq_nolock`'s deliberately
+lock-free dict read. Windows' coarser scheduling quantum likely just widens a
+window that exists everywhere.
+
+Do not "fix" this by deselecting the test or by widening a timeout again.

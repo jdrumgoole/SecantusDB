@@ -114,10 +114,13 @@ def test_find_seq_for_ts_waits_for_in_flight_mint(tmp_path):
 
         # find_seq_for_ts runs on another thread (the batch txn must be
         # exited on its owning thread); the commit lands mid-wait.
-        # The wait bound is widened well past the 0.12s below so the assertion
-        # tests the waiting behaviour and not the scheduler: with the default
-        # 0.5s a loaded runner could overshoot the sleep and take the bounded
-        # fallback, failing here with the committed-view answer (seq 3).
+        # The wait bound is widened well past the 0.12s below so the deadline
+        # cannot be what ends the wait. NOTE: widening it did NOT stop this
+        # test failing intermittently on Windows CI, which rules the deadline
+        # out as the cause — see tasks/backlog.md, "oplog in-flight window
+        # races on Windows". Reaching the committed-view answer (seq 3) with a
+        # 30s bound means the visible tail did not have seq 2 registered as
+        # in flight, which is a real product race, not a slow runner.
         result: list[int] = []
         t = threading.Thread(
             target=lambda: result.append(s.find_seq_for_ts(target, max_wait_seconds=30.0))
