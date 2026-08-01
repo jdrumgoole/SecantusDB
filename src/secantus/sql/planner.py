@@ -2574,11 +2574,24 @@ def _fold_single_row_aggregates(node: exp.Expression, ctx: Any, rows: int = 1) -
 
     ``rows=0`` folds over an EMPTY input — the case where a WHERE excludes the
     implicit row (``SELECT count(*) WHERE 1=2``). An ungrouped aggregate still
-    produces exactly one output row, with ``COUNT`` 0 and the others NULL."""
+    produces exactly one output row, with ``COUNT`` 0 and the others NULL.
+
+    Aggregates inside a nested SELECT are left alone: that subquery has its own
+    row source, so folding it against the outer implicit row is simply wrong —
+    ``SELECT (SELECT count(*) FROM t)`` answered 1 for any ``t``, and
+    ``SELECT (SELECT max(a) FROM t)`` raised ``column "a" does not exist``."""
     from secantus.sql import scalar
 
+    node = node.copy()
+    nested_aggs = {
+        id(agg)
+        for sub in node.find_all(exp.Select, exp.Subquery)
+        if sub is not node
+        for agg in sub.find_all(_SINGLE_ROW_AGGS)
+    }
+
     def fold(n: exp.Expression) -> exp.Expression:
-        if not isinstance(n, _SINGLE_ROW_AGGS):
+        if not isinstance(n, _SINGLE_ROW_AGGS) or id(n) in nested_aggs:
             return n
         arg = n.this
         if isinstance(arg, exp.Distinct):
@@ -2595,7 +2608,7 @@ def _fold_single_row_aggregates(node: exp.Expression, ctx: Any, rows: int = 1) -
             return exp.Null()
         return _value_to_node(scalar.evaluate(arg, _const_scope, ctx))
 
-    return node.transform(fold)
+    return node.transform(fold, copy=False)
 
 
 def _select_has_aggregate(stmt: exp.Select) -> bool:
@@ -4471,6 +4484,54 @@ def qualified_table_name(table_node: exp.Table) -> str:
     if not sname or sname == "public":
         return table_node.name
     return f"{sname}.{table_node.name}"
+
+
+def _create_target(stmt: exp.Expression) -> exp.Table | None:
+    """The relation a CREATE statement *defines*, which search_path resolution
+    must leave alone: Postgres creates into the path's first schema and never
+    binds a create target to an existing relation elsewhere on the path. The
+    body of a CREATE TABLE AS / CREATE VIEW still resolves normally, as does a
+    CREATE INDEX's target table (that one names an existing relation)."""
+    if not isinstance(stmt, exp.Create):
+        return None
+    if (stmt.args.get("kind") or "TABLE").upper() not in ("TABLE", "VIEW"):
+        return None
+    target = stmt.this
+    if isinstance(target, exp.Schema):
+        target = target.this
+    return target if isinstance(target, exp.Table) else None
+
+
+def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, session: Any) -> None:
+    """Qualify bare table references against the session's ``search_path``.
+
+    Postgres resolves an unqualified relation by walking ``search_path`` in
+    order and taking the first schema that holds it. We only consult the path
+    when the bare name is *not* itself a catalog entry, so this can turn a
+    "relation does not exist" into a hit but can never redirect a name that
+    already resolves. The node is rewritten in place, which keeps the write
+    path honest: ``qualified_table_name`` composes the storage key from the
+    same node the resolver matched, so a read and a write of one unqualified
+    name cannot land in different schemas.
+
+    Names bound by a CTE in scope are left alone — they shadow real relations.
+    """
+    path = [s for s in session.search_path if s != "public"]
+    if not path:
+        return
+    cte_names = {cte.alias_or_name.lower() for cte in stmt.find_all(exp.CTE) if cte.alias_or_name}
+    skip = _create_target(stmt)
+    for table in stmt.find_all(exp.Table):
+        if table.args.get("db") is not None or not table.name:
+            continue
+        if table.name.lower() in cte_names or table is skip:
+            continue
+        if catalog.get(db, table.name) is not None:
+            continue
+        for schema in path:
+            if catalog.get(db, f"{schema}.{table.name}") is not None:
+                table.set("db", exp.to_identifier(schema))
+                break
 
 
 def _lookup_table_def(

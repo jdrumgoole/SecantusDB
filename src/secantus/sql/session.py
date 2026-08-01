@@ -522,9 +522,23 @@ class Session:
         return b"E" if self.txn_failed else b"T"
 
     @property
+    def search_path(self) -> list[str]:
+        """``search_path`` as a list of schema names, in resolution order.
+
+        "$user" collapses to public (we have no per-user schemas) and repeats
+        are dropped, so the list is what an unqualified relation name is
+        actually tried against.
+        """
+        names: list[str] = []
+        for raw in self.get_setting("search_path").split(","):
+            name = raw.strip().strip('"')
+            # "$user" resolves to the user's schema, which we collapse to public.
+            if name in ("$user", ""):
+                name = "public"
+            if name not in names:
+                names.append(name)
+        return names or ["public"]
+
+    @property
     def current_schema(self) -> str:
-        first = self.get_setting("search_path").split(",")[0].strip().strip('"')
-        # "$user" resolves to the user's schema, which we collapse to public.
-        if first in ("$user", "", "$user"):
-            return "public"
-        return first
+        return self.search_path[0]

@@ -2383,9 +2383,13 @@ shared storage engine or building large new protocol subsystems:
   waiting out the competing transaction (WT invalidates the whole txn on
   conflict, so the user transaction's prior statements must replay too).
   Until then the sql-stress smoke keeps its write lanes single-client.
-- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, now
-  ~92.4% over the `jdbc2` package, `docs/validation-report-pgjdbc.md`; was
-  89.7%). Remaining, largest first:
+- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, 92.5%
+  over the `jdbc2` package — 5114 P / 414 F / 28 S,
+  `docs/validation-report-pgjdbc.md`; was 89.7%). Read the per-message counts
+  off the JUnit XML in `vendor/pgjdbc/pgjdbc/build/test-results/test/*.xml`
+  rather than eyeballing class totals — the report lists test ids only, and
+  attributing a class's failures to the wrong cause once already cost a
+  feature that fixed nothing here. Remaining, largest first:
   - **Batch update counts / BatchUpdateException contract** (~64,
     `BatchFailureTest`): after a mid-batch failure the per-statement update
     counts and the exception's `getUpdateCounts()` must describe exactly which
@@ -2397,11 +2401,26 @@ shared storage engine or building large new protocol subsystems:
     form `(…).n` / `(…).x`, including inside a derived table used in a JOIN ON.
     Needs FROM-position parsing of qualified/leading-underscore function names
     plus composite-value field access on an SRF column.
-  - **`relation "…" does not exist`** (45, `UpdateableResultTest`): needs
-    multi-entry `search_path` resolution — `SET search_path TO a, b, c` then an
-    unqualified name resolving through the list (the test deliberately puts an
-    empty schema first). Schema-qualified tables landed (#722); search-path
-    *resolution* did not.
+  - **`relation "" does not exist`** — note the EMPTY name — is the single
+    largest message in the suite (73: `PGObjectGetTest` 28, `PGObjectSetTest`
+    26, `GeometricTest` 8, `SearchPathLookupTest` 3, others 8). It is *not* a
+    search-path problem, which is what it was mis-attributed to before being
+    read off the JUnit XML. It is pgjdbc's `TypeInfoCache` type-lookup query,
+    and it reduces to two independent bugs, both reproducible in three lines
+    of SQL:
+    - **`JOIN … USING (col)` is ignored — the join degrades to a CROSS JOIN.**
+      `SELECT v, w FROM a JOIN b USING (k)` returns every pair instead of the
+      matching ones, and `SELECT *` emits the joined column twice rather than
+      merging it. Verified against PostgreSQL 14.13, which returns exactly one
+      row with one `k`. This is a silent wrong answer on ordinary SQL and is
+      much more serious than its gauge count suggests — fix ahead of the rest
+      of this list.
+    - **A derived table whose body reads a set-returning function** —
+      `JOIN (SELECT s.r FROM generate_series(1,2) AS s(r)) AS d ON …` — raises
+      `relation "" does not exist`. Plain derived tables over real tables are
+      fine, so it is the SRF-in-a-subquery FROM item that is unresolved.
+    Multi-entry `search_path` resolution landed separately and moved none of
+    these; `SearchPathLookupTest`'s 3 failures are this same empty-name bug.
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
     failed statements in a transaction.
