@@ -639,11 +639,10 @@ pub fn py_order(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
     {
         return Err(Fallback);
     }
-    let (numa, numb) = (as_num(a), as_num(b));
-    if let (Some(na), Some(nb)) = (&numa, &numb) {
-        return Ok(numeric::cmp(na, nb));
+    if let Some(r) = numeric::fast_cmp_numberish(a, b) {
+        return Ok(r);
     }
-    if numa.is_some() != numb.is_some() {
+    if numeric::is_numberish(a) != numeric::is_numberish(b) {
         return Ok(None); // numberish vs non-numberish -> TypeError -> False
     }
     Ok(match (a, b) {
@@ -660,16 +659,6 @@ pub fn py_order(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
         // null-vs-null, regex, and different types are not orderable in Python.
         _ => None,
     })
-}
-
-/// numberish view (bool as 0/1) for comparison; `None` if not int/int64/
-/// double/bool.
-fn as_num(b: &Bson) -> Option<numeric::NumVal> {
-    match b {
-        Bson::Boolean(v) => Some(numeric::classify(&Bson::Int32(i32::from(*v))).unwrap()),
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => numeric::classify(b),
-        _ => None,
-    }
 }
 
 fn is_exotic(b: &Bson) -> bool {
@@ -4027,10 +4016,10 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
     {
         return Err(Fallback);
     }
-    if let (Some(na), Some(nb)) = (as_num(a), as_num(b)) {
-        return Ok(numeric::eq(&na, &nb));
+    if let Some(r) = numeric::fast_cmp_numberish(a, b) {
+        return Ok(r == Some(std::cmp::Ordering::Equal));
     }
-    if as_num(a).is_some() != as_num(b).is_some() {
+    if numeric::is_numberish(a) != numeric::is_numberish(b) {
         return Ok(false);
     }
     Ok(match (a, b) {
