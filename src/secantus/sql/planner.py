@@ -1266,7 +1266,28 @@ def _expr_to_filter(
             # ``col = ANY(ARRAY[...])`` is Postgres' IN — SQLAlchemy's reflection
             # emits ``relkind = ANY(ARRAY['r','p',...])``.
             field, tag = _field(other, resolve)
-            values = [typemap.coerce(_literal(e), tag) for e in _array_elements(inner)]
+            try:
+                elements = _array_elements(inner)
+            except errors.SQLError:
+                elements = None
+            if elements is None:
+                # ``col = ANY(<expr>)`` where the operand is a function or other
+                # expression yielding an array (``ANY(current_schemas(true))`` —
+                # pgjdbc's DatabaseMetaData namespace filter): evaluate it.
+                from secantus.sql import scalar as _scalar
+
+                sub = subctx or _pipeline_subctx.get()
+                ctx = _scalar.ScalarContext(
+                    storage=getattr(sub, "storage", None),
+                    catalog=getattr(sub, "catalog", None),
+                    db=getattr(sub, "db", None) or "",
+                    session=getattr(sub, "session", None),
+                )
+                value = _scalar.evaluate(inner, _const_scope, ctx)
+                if not isinstance(value, (list, tuple)):
+                    raise errors.feature_not_supported(f"unsupported ANY operand: {inner.sql()}")
+                return {field: {"$in": [typemap.coerce(v, tag) for v in value]}}
+            values = [typemap.coerce(_literal(e), tag) for e in elements]
             return {field: {"$in": values}}
         pair = _field_literal_pair(left, right)
         if pair is not None:
@@ -2544,12 +2565,16 @@ def _const_scope(node: exp.Expression) -> Any:
 _SINGLE_ROW_AGGS = (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)
 
 
-def _fold_single_row_aggregates(node: exp.Expression, ctx: Any) -> exp.Expression:
+def _fold_single_row_aggregates(node: exp.Expression, ctx: Any, rows: int = 1) -> exp.Expression:
     """Fold aggregates in a FROM-less SELECT to constants.
 
     Postgres feeds a FROM-less aggregation exactly one implicit row, so
     ``COUNT(*)`` is 1, ``COUNT(e)`` is 0/1 by ``e``'s NULL-ness, and
-    ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` of ``e`` are ``e`` itself."""
+    ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` of ``e`` are ``e`` itself.
+
+    ``rows=0`` folds over an EMPTY input — the case where a WHERE excludes the
+    implicit row (``SELECT count(*) WHERE 1=2``). An ungrouped aggregate still
+    produces exactly one output row, with ``COUNT`` 0 and the others NULL."""
     from secantus.sql import scalar
 
     def fold(n: exp.Expression) -> exp.Expression:
@@ -2561,12 +2586,26 @@ def _fold_single_row_aggregates(node: exp.Expression, ctx: Any) -> exp.Expressio
                 raise errors.feature_not_supported(f"unsupported aggregate: {n.sql()}")
             arg = arg.expressions[0]
         if isinstance(n, exp.Count):
+            if rows == 0:
+                return exp.Literal.number(0)
             if arg is None or isinstance(arg, exp.Star):
                 return exp.Literal.number(1)
             return exp.Literal.number(0 if scalar.evaluate(arg, _const_scope, ctx) is None else 1)
+        if rows == 0:
+            return exp.Null()
         return _value_to_node(scalar.evaluate(arg, _const_scope, ctx))
 
     return node.transform(fold)
+
+
+def _select_has_aggregate(stmt: exp.Select) -> bool:
+    """Whether a FROM-less SELECT's projections contain an aggregate — such a
+    statement yields exactly one row even when its WHERE is false."""
+    for e in stmt.expressions:
+        target = e.this if isinstance(e, exp.Alias) else e
+        if target.find(exp.AggFunc) is not None:
+            return True
+    return False
 
 
 _SEQUENCE_FUNCS = frozenset({"nextval", "currval", "setval", "lastval"})
@@ -2631,7 +2670,14 @@ def plan_constant_select(
         raise errors.feature_not_supported("FROM-less SELECT supports only constant projections")
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     where = stmt.args.get("where")
-    emit = where is None or scalar._truthy(scalar.evaluate(where.this, _const_scope, ctx))
+    passes = where is None or scalar._truthy(scalar.evaluate(where.this, _const_scope, ctx))
+    # An ungrouped aggregate always produces exactly one row, even when the
+    # WHERE excludes the implicit input row — ``SELECT count(*) WHERE 1=2`` is
+    # 0, not "no rows" (and ``SELECT 0/count(*) WHERE 1=2`` therefore divides
+    # by zero, which is how pgjdbc's batch tests inject a runtime failure).
+    aggregated = _select_has_aggregate(stmt)
+    emit = passes or aggregated
+    agg_rows = 1 if passes else 0
     columns: list[tuple[str, str, Any]] = []
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -2639,7 +2685,7 @@ def plan_constant_select(
         if target.find(exp.AggFunc) is not None:
             if alias is None and isinstance(target, _SINGLE_ROW_AGGS):
                 alias = target.key  # Postgres names a bare aggregate output "count" etc.
-            target = _fold_single_row_aggregates(target.copy(), ctx)
+            target = _fold_single_row_aggregates(target.copy(), ctx, rows=agg_rows)
         if isinstance(target, _LITERAL_NODES) and _is_pure_literal(target):
             value = _literal(target)
             # Tag from the AST, not the Python value — a decimal constant

@@ -363,7 +363,17 @@ def test_fromless_aggregates_fold_over_one_row():
         assert rows("select count(22), count(null)") == [(1, 0)]
         assert rows("select sum(distinct 73), min(all -32), avg(5)") == [(73, -32, 5)]
         assert rows("select nullif( - count( * ), 67 ) + 54") == [(53,)]
-        assert rows("select max(3) where 1 = 2") == []
+        # An UNGROUPED aggregate yields exactly one row even when the WHERE
+        # excludes the implicit input row — COUNT is 0, the rest NULL. (This
+        # line previously asserted zero rows; verified against real PostgreSQL
+        # 14.13: ``select max(3) where 1=2`` returns one NULL row, and
+        # ``select 0/count(*) where 1=2`` therefore raises division_by_zero,
+        # which is how pgjdbc's batch tests inject a runtime failure.)
+        assert rows("select max(3) where 1 = 2") == [(None,)]
+        assert rows("select count(*) where 1 = 2") == [(0,)]
+        assert rows("select sum(1) where 1 = 2") == [(None,)]
+        # A non-aggregate projection still yields zero rows.
+        assert rows("select 1 where 1 = 2") == []
     finally:
         st.close()
 

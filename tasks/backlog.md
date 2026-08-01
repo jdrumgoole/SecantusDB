@@ -2383,19 +2383,39 @@ shared storage engine or building large new protocol subsystems:
   waiting out the competing transaction (WT invalidates the whole txn on
   conflict, so the user transaction's prior statements must replay too).
   Until then the sql-stress smoke keeps its write lanes single-client.
-- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, 4962 P /
-  568 F / 28 S = 89.7% over the `jdbc2` package,
-  `docs/validation-report-pgjdbc.md`): batch-execution semantics (~88 —
-  BatchFailureTest's per-statement update counts and the
-  BatchUpdateException contract on mid-batch failure), `relation "…" does not
-  exist` (45 — mostly UpdateableResultTest's implicit re-resolution),
-  timestamp text-input parsing (64 — `invalid input syntax for type timestamp
-  [without|with] time zone` on formats pgjdbc emits), `ANY(CURRENT_SCHEMAS(true))`
-  in DatabaseMetaData queries (31), `_pg_expandarray()` (28 — the
-  information_schema helper pgjdbc uses for index columns), 20 internal
-  errors, and `ALTER` forms (14). Also excluded: `NotifyTest` hangs
-  (cross-connection async NOTIFY delivery — a real gap, see below). Grow
-  `INCLUDE_PACKAGES` past `jdbc2` once these land.
+- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, now
+  ~92.4% over the `jdbc2` package, `docs/validation-report-pgjdbc.md`; was
+  89.7%). Remaining, largest first:
+  - **Batch update counts / BatchUpdateException contract** (~64,
+    `BatchFailureTest`): after a mid-batch failure the per-statement update
+    counts and the exception's `getUpdateCounts()` must describe exactly which
+    statements committed. Needs real per-statement batch accounting.
+  - **`_pg_expandarray`** (28, `UpdateableResultTest`): the (x, n) row shape is
+    implemented in `srf.py`, but the CALL SITES pgjdbc emits are not
+    recognised — a schema-qualified function in FROM position
+    (`information_schema._pg_expandarray(i.indkey)`) and the composite-value
+    form `(…).n` / `(…).x`, including inside a derived table used in a JOIN ON.
+    Needs FROM-position parsing of qualified/leading-underscore function names
+    plus composite-value field access on an SRF column.
+  - **`relation "…" does not exist`** (45, `UpdateableResultTest`): needs
+    multi-entry `search_path` resolution — `SET search_path TO a, b, c` then an
+    unqualified name resolving through the list (the test deliberately puts an
+    empty schema first). Schema-qualified tables landed (#722); search-path
+    *resolution* did not.
+  - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
+    modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
+    failed statements in a transaction.
+  - **Large objects** (11, `BlobTest`): the fastpath `lo_creat` / `lo_open`
+    protocol is unimplemented (`The fastpath function lo_creat is unknown`).
+    Whole-feature gap, not a bug.
+  - **DateTest timezone/calendar off-by-one** (~21): dates round-tripped
+    through specific JVM default zones land a day early/late, and BC dates
+    differ by ~2 days (Java's hybrid Julian/Gregorian vs our proleptic
+    Gregorian). Our own binary date round-trip is exact, so this is a
+    conversion-convention mismatch to characterise carefully before changing
+    anything.
+  - **`bind parameter $N has no value`** (8, BatchedInsertReWrite): pgjdbc's
+    insert-rewrite batches leave a parameter unbound on a re-written statement.
 - [ ] **Cross-connection async NOTIFY delivery**: a `NOTIFY` issued on one
   connection is not delivered to another connection's
   `getNotifications()` poll, so pgjdbc's `NotifyTest` blocks forever

@@ -49,7 +49,25 @@ _NAMED_SRFS = frozenset(
 
 # Record-returning SRFs: each row is a ``(key, value)`` pair, so the source has
 # two columns (default-named ``key`` / ``value``) rather than one.
-_RECORD_SRFS = frozenset({"jsonb_each", "json_each", "jsonb_each_text", "json_each_text"})
+_RECORD_SRFS = frozenset(
+    {
+        "jsonb_each",
+        "json_each",
+        "jsonb_each_text",
+        "json_each_text",
+        # information_schema._pg_expandarray(arr) -> (x anyelement, n int):
+        # each element with its 1-based subscript. pgjdbc's DatabaseMetaData
+        # index/PK queries use it. NOTE: the row shape below is right, but the
+        # CALL SITES pgjdbc emits are not recognised yet — a schema-qualified
+        # name in FROM position, and the composite-value form
+        # ``(_pg_expandarray(x)).n`` — so this is not reachable from those
+        # queries. See tasks/backlog.md.
+        "_pg_expandarray",
+    }
+)
+
+#: Per-record-SRF default column names (the jsonb_each family is key/value).
+_RECORD_SRF_COLUMNS = {"_pg_expandarray": ["x", "n"]}
 
 
 def _is_record_srf(node: exp.Expression) -> bool:
@@ -221,7 +239,11 @@ def _record_values(node: exp.Expression, ctx: Any) -> tuple[list[tuple[Any, Any]
 
     name = str(node.this).rsplit(".", 1)[-1].lower()
     arg = node.expressions[0] if node.expressions else None
-    doc = _as_json(scalar.evaluate(arg, _empty_scope, ctx) if arg is not None else None)
+    value = scalar.evaluate(arg, _empty_scope, ctx) if arg is not None else None
+    if name == "_pg_expandarray":
+        items_list = list(value) if isinstance(value, (list, tuple)) else []
+        return [(v, i) for i, v in enumerate(items_list, start=1)], ["any", "int4"]
+    doc = _as_json(value)
     items = list(doc.items()) if isinstance(doc, dict) else []
     if name in ("jsonb_each_text", "json_each_text"):
         return [(k, _jsonb_to_text(v)) for k, v in items], ["text", "text"]
@@ -344,7 +366,8 @@ def _build_record(source: SrfSource, ctx: Any) -> tuple[list[dict[str, Any]], Ta
     ``key`` / ``value``, optionally renamed by ``AS t(k, v)`` and extended by
     ``WITH ORDINALITY``."""
     pairs, tags = _record_values(source.node, ctx)
-    default_names = ["key", "value"]
+    srf_name = str(source.node.this).rsplit(".", 1)[-1].lower()
+    default_names = list(_RECORD_SRF_COLUMNS.get(srf_name, ["key", "value"]))
     # ``AS t(k, v)`` renames the columns; the bare table alias does not (unlike a
     # single-column SRF, where ``AS g`` names the lone column).
     names = list(source.column_aliases) if source.column_aliases else list(default_names)

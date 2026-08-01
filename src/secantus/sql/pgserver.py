@@ -397,6 +397,12 @@ class SecantusPGServer:
             return None
 
         session = Session(database=db, user=user, backend_pid=backend_pid)
+        # Database-level GUC defaults (ALTER DATABASE … SET) apply to new
+        # sessions only — merge them before the client sends anything.
+        with contextlib.suppress(Exception):
+            from secantus.sql.catalog import Catalog
+
+            session.apply_database_defaults(Catalog(self.storage).db_settings(db))
         # Bind the session to this connection thread's render context so
         # to_pg_text can honour per-session GUCs (TimeZone) at output time.
         typemap.set_render_session(session)

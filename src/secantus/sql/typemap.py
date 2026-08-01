@@ -1305,8 +1305,16 @@ def to_py(value: Any, tag: str) -> Any:
 
 def infer_elem_tag(items: Any) -> str:
     """Best-effort element tag for rendering an untyped Python list as a PG
-    array literal — keyed off the first non-None element."""
+    array literal — keyed off the first non-None LEAF element. A
+    multi-dimensional array (``flag[][]`` → nested lists) shares one element
+    type across every level, so descend before deciding; keying off the outer
+    list would type it ``json`` and render nested braces as quoted JSON."""
     elem = next((v for v in items if v is not None), None)
+    while isinstance(elem, (list, tuple)):
+        nxt = next((v for v in elem if v is not None), None)
+        if nxt is None:
+            break
+        elem = nxt
     if isinstance(elem, bool):
         return "bool"
     if isinstance(elem, int):

@@ -151,11 +151,16 @@ def ordinal_to_gregorian(n: int) -> tuple[int, int, int]:
 
 # ``10000-01-01 12:00`` / ``1000-01-01 12:00 BC`` — PG-range timestamps beyond
 # Python's datetime limits, carried through storage and text output verbatim.
+# PG's datetime input is field-order flexible: the era marker may precede or
+# follow the zone offset (``0101-01-01 00:00 BC +00`` — which is what pgjdbc
+# emits — as well as PG's own output order ``…+00 BC``). Named groups so the
+# two era slots collapse to one.
 _WIDE_TS_RE = re.compile(
-    r"^(\d{4,7})-(\d{1,2})-(\d{1,2})"
-    r"(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?"
-    r"\s*(?:([+-])(\d{1,2})(?::?(\d{2}))?)?"
-    r"(\s+BC)?$",
+    r"^(?P<y>\d{1,7})-(?P<mo>\d{1,2})-(?P<d>\d{1,2})"
+    r"(?:[ T](?P<hh>\d{1,2}):(?P<mi>\d{2})(?::(?P<ss>\d{2})(?:\.(?P<frac>\d+))?)?)?"
+    r"(?P<bc1>\s+BC)?"
+    r"\s*(?:(?P<sign>[+-])(?P<oh>\d{1,2})(?::?(?P<om>\d{2}))?)?"
+    r"(?P<bc2>\s+BC)?$",
     re.IGNORECASE,
 )
 
@@ -167,24 +172,25 @@ def wide_timestamp_text(v: Any) -> str | None:
     m = _WIDE_TS_RE.match(str(v).strip())
     if m is None:
         return None
-    y = int(m.group(1))
-    bc = bool(m.group(11))
+    y = int(m.group("y"))
+    bc = bool(m.group("bc1") or m.group("bc2"))
     if y <= 9999 and not bc:
         return None
-    mo, d = int(m.group(2)), int(m.group(3))
-    hh = int(m.group(4) or 0)
-    mi = int(m.group(5) or 0)
-    ss = int(m.group(6) or 0)
-    frac = (m.group(7) or "").ljust(6, "0")[:6].rstrip("0")
+    mo, d = int(m.group("mo")), int(m.group("d"))
+    hh = int(m.group("hh") or 0)
+    mi = int(m.group("mi") or 0)
+    ss = int(m.group("ss") or 0)
+    frac = (m.group("frac") or "").ljust(6, "0")[:6].rstrip("0")
     text = f"{y:04d}-{mo:02d}-{d:02d} {hh:02d}:{mi:02d}:{ss:02d}"
     if frac:
         text += f".{frac}"
-    if m.group(8):
-        off = f"{m.group(8)}{int(m.group(9)):02d}"
-        if m.group(10):
-            off += f":{m.group(10)}"
+    if m.group("sign"):
+        off = f"{m.group('sign')}{int(m.group('oh')):02d}"
+        if m.group("om"):
+            off += f":{m.group('om')}"
         text += off
     if bc:
+        # PG renders the era last, after any zone offset.
         text += " BC"
     return text
 
@@ -196,17 +202,19 @@ def wide_timestamp_micros(text: str) -> int:
     m = _WIDE_TS_RE.match(text.strip())
     if m is None:
         raise ValueError(f"not a wide timestamp: {text!r}")
-    y = int(m.group(1))
-    if m.group(11):  # BC: year N BC is astronomical year 1-N
+    y = int(m.group("y"))
+    if m.group("bc1") or m.group("bc2"):  # BC: year N BC is astronomical year 1-N
         y = 1 - y
-    days = gregorian_ordinal(y, int(m.group(2)), int(m.group(3))) - gregorian_ordinal(2000, 1, 1)
+    days = gregorian_ordinal(y, int(m.group("mo")), int(m.group("d"))) - gregorian_ordinal(
+        2000, 1, 1
+    )
     micros = (
-        int(m.group(4) or 0) * 3600 + int(m.group(5) or 0) * 60 + int(m.group(6) or 0)
+        int(m.group("hh") or 0) * 3600 + int(m.group("mi") or 0) * 60 + int(m.group("ss") or 0)
     ) * 1_000_000
-    micros += int((m.group(7) or "").ljust(6, "0")[:6])
-    if m.group(8):
-        off = int(m.group(9)) * 3600 + int(m.group(10) or 0) * 60
-        micros -= off * 1_000_000 * (1 if m.group(8) == "+" else -1)
+    micros += int((m.group("frac") or "").ljust(6, "0")[:6])
+    if m.group("sign"):
+        off = int(m.group("oh")) * 3600 + int(m.group("om") or 0) * 60
+        micros -= off * 1_000_000 * (1 if m.group("sign") == "+" else -1)
     return days * 86_400_000_000 + micros
 
 
@@ -252,7 +260,13 @@ class DateTimeError(ValueError):
     """A malformed date / time / timetz literal."""
 
 
-_BC_DATE_RE = re.compile(r"^(\d{1,7})-(\d{1,2})-(\d{1,2})\s+BC$", re.IGNORECASE)
+# A BC date may carry a trailing zone offset (pgjdbc sends
+# ``0101-01-01 BC +00`` for a date parameter); the offset is irrelevant
+# to a date and ignored.
+_BC_DATE_RE = re.compile(
+    r"^(\d{1,7})-(\d{1,2})-(\d{1,2})\s+BC(?:\s*[+-]\d{1,2}(?::?\d{2})?)?$",
+    re.IGNORECASE,
+)
 _WIDE_DATE_RE = re.compile(r"^(\d{4,7})-(\d{1,2})-(\d{1,2})$")
 
 
@@ -281,6 +295,15 @@ def parse_date(value: Any) -> str:
     if m and int(m.group(1)) > 9999:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
         return f"{y:04d}-{mo:02d}-{d:02d}"
+    # A BC / out-of-range value carrying a TIME part (``0101-01-01 00:00:00 BC
+    # +00`` — pgjdbc binds a date parameter that way): keep the era, drop the
+    # time. Falling through to the datetime parsers below silently lost the
+    # BC and turned it into an AD date.
+    m = _WIDE_TS_RE.match(s)
+    if m and (m.group("bc1") or m.group("bc2") or int(m.group("y")) > 9999):
+        y, mo, d = int(m.group("y")), int(m.group("mo")), int(m.group("d"))
+        era = " BC" if (m.group("bc1") or m.group("bc2")) else ""
+        return f"{y:04d}-{mo:02d}-{d:02d}{era}"
     try:
         # Strict on the date part, but accept a trailing datetime tail.
         head = s[:10] if len(s) > 10 and (s[10:11] in (" ", "T")) else s
@@ -310,6 +333,22 @@ def _fmt_time(hh: int, mm: int, ss: int, frac: str) -> str:
     return base
 
 
+# A trailing zone offset / era marker on a time-of-day string.
+_TZ_SUFFIX_RE = re.compile(r"(?i)\s*(?:[+-]\d{1,2}(?::?\d{2})?|Z)?(?:\s+BC)?\s*$")
+_TS_TIME_TAIL_RE = re.compile(
+    r"^\d{1,7}-\d{1,2}-\d{1,2}[ T](?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)"
+)
+
+
+def _time_part_of_timestamp(text: str) -> str | None:
+    """The time-of-day of a full timestamp string, or None when ``text`` isn't
+    one. Any zone offset / era suffix is left for the caller's own matcher."""
+    m = _TS_TIME_TAIL_RE.match(text)
+    if m is None:
+        return None
+    return text[m.start("time") :]
+
+
 def parse_time(value: Any) -> str:
     """Canonicalise a ``time`` to ``HH:MM:SS[.ffffff]``."""
     if isinstance(value, _dt.datetime):
@@ -317,7 +356,21 @@ def parse_time(value: Any) -> str:
     if isinstance(value, _dt.time):
         s = value.isoformat()
         return parse_time(s)
-    m = _TIME_RE.match(str(value).strip())
+    text = str(value).strip()
+    m = _TIME_RE.match(text)
+    if m is None:
+        # ``time`` ignores a zone offset the literal carries (verified against
+        # PostgreSQL 14.13: ``'13:06:18+02'::time`` -> ``13:06:18``).
+        m = _TIME_RE.match(_TZ_SUFFIX_RE.sub("", text).strip())
+    if m is None:
+        # PG's time input accepts a full timestamp and keeps only the
+        # time-of-day (verified against PostgreSQL 14.13:
+        # ``'2026-08-01 13:06:18.09+00'::timetz`` -> ``13:06:18.09+00``).
+        # pgjdbc stores CURRENT_TIMESTAMP into a time column this way.
+        tail = _time_part_of_timestamp(text)
+        if tail is not None:
+            # ``time`` (no zone) drops any offset / era the timestamp carried.
+            m = _TIME_RE.match(_TZ_SUFFIX_RE.sub("", tail).strip())
     if m is None:
         raise DateTimeError(f"invalid time value: {value!r}")
     hh, mm = int(m.group(1)), int(m.group(2))
@@ -333,6 +386,12 @@ def parse_timetz(value: Any, default_offset: str = "+00:00") -> str:
     if s.endswith(("Z", "z")):
         s = s[:-1] + "+00:00"
     m = _TIMETZ_RE.match(s)
+    if m is None:
+        # Same full-timestamp tolerance as ``parse_time`` — but here the zone
+        # offset must survive, so retry the timetz matcher on the time part.
+        tail = _time_part_of_timestamp(s)
+        if tail is not None:
+            m = _TIMETZ_RE.match(tail)
     if m is None:
         return parse_time(s) + default_offset
     hh, mm = int(m.group(1)), int(m.group(2))

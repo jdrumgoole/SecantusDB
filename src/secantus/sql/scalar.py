@@ -273,6 +273,26 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         if lb is None or rb is None:
             return None
         return False
+    if isinstance(node, (exp.EQ, exp.NEQ)) and (
+        isinstance(node.this, exp.Any) or isinstance(node.expression, exp.Any)
+    ):
+        # ``x = ANY(<array expr>)`` / ``x <> ANY(...)`` — PG's IN over an array
+        # value. pgjdbc's TypeInfoCache filters namespaces with
+        # ``n.nspname = ANY (current_schemas(true))`` inside a multi-table join,
+        # where the WHERE is evaluated per row rather than pushed down.
+        anynode = node.this if isinstance(node.this, exp.Any) else node.expression
+        other = node.expression if isinstance(node.this, exp.Any) else node.this
+        inner = anynode.this
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        haystack = evaluate(inner, scope, ctx)
+        needle = _unwrap_decimal(evaluate(other, scope, ctx))
+        if haystack is None or needle is None:
+            return None
+        if not isinstance(haystack, (list, tuple)):
+            haystack = [haystack]
+        hit = any(_unwrap_decimal(v) == needle for v in haystack)
+        return hit if isinstance(node, exp.EQ) else not hit
     if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         return _eval_compare(node, scope, ctx)
     if isinstance(node, exp.Exists):
@@ -287,6 +307,13 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         rewritten = _rewrite_explicit_operator(node)
         if rewritten is not None:
             return evaluate(rewritten, scope, ctx)
+    if getattr(exp, "CurrentSchemas", None) is not None and isinstance(node, exp.CurrentSchemas):
+        # sqlglot models ``current_schemas(bool)`` as its own node with the
+        # include-implicit flag in ``this`` (not an argument list).
+        session = getattr(ctx, "session", None)
+        current = getattr(session, "current_schema", None) or "public"
+        implicit = _as_bool_arg(node.this) if node.this is not None else False
+        return ["pg_catalog", current] if implicit else [current]
     if isinstance(node, (exp.NullSafeEQ, exp.NullSafeNEQ)):
         # ``IS [NOT] DISTINCT FROM`` — null-safe comparison: two NULLs are
         # "not distinct", a NULL and a value are "distinct".
@@ -1670,11 +1697,26 @@ def enum_array_cast_element(
     datatype: exp.Expression | None, ctx: ScalarContext | None
 ) -> Any | None:
     """The element enum doc when ``datatype`` is an ARRAY of a declared enum
-    (``%s::mood[]``), else None."""
-    if not (isinstance(datatype, exp.DataType) and datatype.this == exp.DataType.Type.ARRAY):
-        return None
-    inner = datatype.args.get("expressions") or []
-    return enum_cast_target(inner[0], ctx) if inner else None
+    (``%s::mood[]``), else None. Nested array levels (``flag[][]``) unwrap to
+    the same element type — PG arrays are multi-dimensional, not arrays of
+    arrays, so every level shares one element type."""
+    node = datatype
+    depth = 0
+    while isinstance(node, exp.DataType) and node.this == exp.DataType.Type.ARRAY:
+        inner = node.args.get("expressions") or []
+        if not inner:
+            return None
+        node = inner[0]
+        depth += 1
+    return enum_cast_target(node, ctx) if depth else None
+
+
+def _validate_enum_labels_nested(elem_doc: Any, items: Any) -> Any:
+    """Validate every leaf of a (possibly multi-dimensional) enum array against
+    the enum's labels, preserving the nesting."""
+    if isinstance(items, (list, tuple)):
+        return [_validate_enum_labels_nested(elem_doc, v) for v in items]
+    return validate_enum_label(elem_doc, items)
 
 
 def _array_elem_render_tag(node: exp.Expression, value: list) -> str:
@@ -1726,7 +1768,7 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         if value is None:
             return None
         items = value if isinstance(value, list) else typemap._parse_pg_array_literal(str(value))
-        return [validate_enum_label(elem_doc, v) for v in items]
+        return _validate_enum_labels_nested(elem_doc, items)
     # ``'[a,b)'::testrange`` / ``'{[a,b)}'::testmultirange`` — casts to a
     # user-declared range type (or its companion multirange) parse the literal
     # with the declared subtype's coercion.
@@ -2325,6 +2367,15 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             else:
                 parts.append(_as_text(v))
         return delim.join(parts)
+    if name == "current_schemas":
+        # ``current_schemas(include_implicit)`` — the search path as text[].
+        # With true, PG prepends the implicitly-searched pg_catalog. pgjdbc's
+        # DatabaseMetaData filters namespaces with
+        # ``nspname = ANY(current_schemas(true))``.
+        session = getattr(ctx, "session", None)
+        current = getattr(session, "current_schema", None) or "public"
+        implicit = bool(args) and _as_bool_arg(args[0])
+        return ["pg_catalog", current] if implicit else [current]
     if name == "pg_encoding_to_char":
         # Encoding 6 is UTF8 — the only encoding the server speaks.
         return "UTF8"
@@ -3479,6 +3530,18 @@ def _eval_between(node: exp.Between, outer: Scope, ctx: ScalarContext) -> Any:
 def _cmp_ge(a: Any, b: Any) -> bool:
     a, b = _unwrap_decimal(a), _unwrap_decimal(b)
     return a >= b
+
+
+def _as_bool_arg(value: Any) -> bool:
+    """A boolean argument that may arrive as a real bool, an AST node, or the
+    text PG accepts for one (an untyped literal binds as text)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, exp.Boolean):
+        return bool(value.this)
+    if isinstance(value, exp.Expression):
+        value = value.name if value.name else value.sql()
+    return str(value).strip().lower() in ("t", "true", "y", "yes", "on", "1")
 
 
 def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext, escape: Any = None) -> Any:
