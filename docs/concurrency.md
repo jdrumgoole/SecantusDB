@@ -260,7 +260,9 @@ SecantusDB, the levers are:
    throughput while keeping change streams (validated exactly-once
    under concurrency; a fresh change stream opens only after the
    drainer has caught the acknowledged tail, so it never surfaces
-   pre-open events). Trade: the oplog is no longer atomic with the
+   pre-open events; multi-document transactions buffer their entries
+   and hand them to the drainer only at commit, so a rolled-back
+   transaction never surfaces a change event). Trade: the oplog is no longer atomic with the
    data, so a hard crash loses entries the drainer hadn't yet written
    (the data itself stays fully durable; a clean shutdown flushes the
    drainer). Bounded by `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (default

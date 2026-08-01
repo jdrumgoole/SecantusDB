@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -126,6 +126,15 @@ pub struct UserTransactionHandle {
     /// appear), and on `Drop` as a backstop so a reaped or leaked handle
     /// cannot pin the tail forever.
     minted_ranges: Vec<(i64, i64)>,
+    /// Async-mode oplog entries buffered by this transaction's statements
+    /// (`IN_ASYNC_STMT` is held across every `with_user_transaction` scope, so
+    /// emits park in `PENDING_OPLOG` and are harvested here instead of
+    /// reaching the drainer mid-transaction). Minted + enqueued only after
+    /// the WT commit succeeds; discarded on rollback / commit-failure / Drop
+    /// — a rolled-back transaction must never surface a change event or PITR
+    /// entry (it would be a ghost: an oplog row for data that never
+    /// committed). Always empty in sync mode.
+    pending_async: Vec<(OplogEntry, Option<Vec<u8>>)>,
     /// Clones of the storage's oplog state + condvar so deregistration works
     /// from `Drop` without a `Storage` borrow.
     oplog: Arc<Mutex<OplogState>>,
@@ -2129,14 +2138,6 @@ pub struct Storage {
     /// namespace stays stable across drop+recreate so in-flight writers and
     /// DDL always contend on the same mutex. Mirrors `storage._coll_locks`.
     coll_locks: Mutex<CollLocks>,
-    /// Serialises `prune_oplog` sweeps (the write-path opportunistic prune
-    /// and the public entry point). Deliberately NOT the global lock: the
-    /// opportunistic prune fires inside `emit_oplog` while the caller holds a
-    /// collection lock, and taking the global lock there would invert the
-    /// global→collection order (deadlock with DDL). Prune-vs-writer needs no
-    /// exclusion — writers only append strictly higher seqs and never touch
-    /// the old rows a prune dooms.
-    oplog_prune_lock: Mutex<()>,
     /// Which oplog shard tables this process has already created (bit per shard
     /// index) — see [`ensure_oplog_shard`]. Shared with the async drainers.
     oplog_shards_created: Arc<AtomicU32>,
@@ -2155,18 +2156,15 @@ pub struct Storage {
     /// `lock`, so a waiting tailable getMore can't ABBA-deadlock the write path.
     /// `Arc` so the drainer can notify it after advancing `written_seq`.
     oplog_cv: Arc<Condvar>,
-    /// Retention window (seconds) and hard entry cap for `prune_oplog`. Mirrors
-    /// `storage.oplog_retention_seconds` / `oplog_max_entries`.
-    oplog_retention_seconds: i64,
-    oplog_max_entries: usize,
+    /// Prune sweep context (exclusivity lock + retention / entry-cap /
+    /// archive-dir tunables + the Phase-A' clamp pieces), shared with the
+    /// async drainer pool which owns the opportunistic cadence in async mode.
+    /// See [`PruneCtx`] / [`prune_oplog_sweep`].
+    prune_ctx: Arc<PruneCtx>,
     /// Per-insert discriminator for timeseries doc-table keys (see
     /// `timeseries_doc_suffix`). Wraps at 16 bits; combined with a nanosecond
     /// timestamp it keeps duplicate-`_id` rows distinct across reopens.
     ts_suffix_counter: AtomicU64,
-    /// When set, `prune_oplog` archives the rows it is about to drop into a
-    /// durable oplog segment in this directory first (PITR v2). Mirrors
-    /// `storage.oplog_archive_dir`.
-    oplog_archive_dir: Option<String>,
     /// Whether to force a WiredTiger checkpoint on close (`Drop`). Mirrors the
     /// Python `Storage._durable` flag. WT's connection close does NOT implicitly
     /// checkpoint while logging is enabled, so without a close-time checkpoint a
@@ -2237,7 +2235,16 @@ struct OplogState {
     next_nat_seq: i64,
     /// Oplog rows emitted since the last opportunistic prune. In-memory only
     /// (resets on open, like `storage._oplog_emit_count`); never persisted.
+    /// Drives the SYNC emit path's prune cadence; async mode uses
+    /// `persisted_count` instead (see [`record_persisted`]).
     emit_count: i64,
+    /// Async mode: oplog rows the drainer pool has persisted since the last
+    /// opportunistic prune. The cadence must follow rows LANDING, not rows
+    /// minting — a mint-side trigger can only doom already-persisted rows, so
+    /// drainer-queue lag escapes the sweep and the counter reset defers the
+    /// retry a whole interval, leaving the oplog unbounded when writes stop.
+    /// Always 0 in sync mode.
+    persisted_count: i64,
     /// Live oplog row count across all shards + the legacy table. Counted once on
     /// open, `+= n` on every `emit_oplog` / import, `-= doomed` on prune. Lets the
     /// opportunistic prune early-out (one ts read) when under the cap instead of
@@ -2285,6 +2292,21 @@ fn advance_written_seq(st: &mut OplogState, start: i64, n: i64) -> bool {
         advanced = true;
     }
     advanced
+}
+
+/// Record `n` drainer-persisted entries and report whether the opportunistic
+/// prune cadence is due (every [`OPLOG_PRUNE_INTERVAL`] persisted rows) — the
+/// async-mode analogue of the sync emit path's `emit_count` trigger. Caller
+/// holds the `oplog` mutex; the drainer that crosses the boundary runs the
+/// sweep after releasing it.
+fn record_persisted(st: &mut OplogState, n: i64) -> bool {
+    st.persisted_count += n;
+    if st.persisted_count >= OPLOG_PRUNE_INTERVAL {
+        st.persisted_count = 0;
+        true
+    } else {
+        false
+    }
 }
 
 // --- async oplog (prototype) ---------------------------------------------
@@ -2403,6 +2425,30 @@ struct AsyncOplog {
     joins: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// Everything a prune sweep needs, shared between `Storage` (explicit
+/// `prune_oplog`, the sync emit path's opportunistic trigger) and the async
+/// drainer pool (which owns the opportunistic cadence in async mode — the
+/// sweep must run where rows LAND, or queue lag escapes it). The tunables are
+/// atomics / a mutex so `Storage`'s `&mut self` setters write through the
+/// `Arc` the drainers hold.
+struct PruneCtx {
+    conn: Arc<Connection>,
+    oplog: Arc<Mutex<OplogState>>,
+    /// Sweep exclusivity (NOT the storage global lock — see
+    /// [`prune_oplog_sweep`]'s lock-order note).
+    prune_lock: Mutex<()>,
+    /// Mirrors `storage.oplog_retention_seconds` / `oplog_max_entries` /
+    /// `oplog_archive_dir`.
+    retention_seconds: AtomicI64,
+    max_entries: AtomicUsize,
+    archive_dir: Mutex<Option<String>>,
+    /// Phase A' pieces: the sweep clamp below the stable checkpoint marker and
+    /// the demand-checkpoint signal when the clamp blocks a cap excess.
+    data_nonlogged: bool,
+    stable_seq: Arc<AtomicI64>,
+    checkpoint_requested: Arc<AtomicBool>,
+}
+
 /// Shared state a drainer advances so change-stream tailers can observe progress:
 /// the `oplog` mutex (for `written_seq` + the completion tracker) + its condvar,
 /// plus the [`Backpressure`] budget it releases as batches land.
@@ -2416,6 +2462,9 @@ struct DrainerShared {
     shards_created: Arc<AtomicU32>,
     /// The store's resolved oplog-nonlogged mode (table create config).
     oplog_nonlogged: bool,
+    /// The opportunistic-prune context: the drainer that crosses the
+    /// persisted-rows cadence boundary runs the sweep (best-effort).
+    prune: Arc<PruneCtx>,
 }
 
 /// Spawn the background oplog drainer pool and return the handle committed writes
@@ -2427,6 +2476,7 @@ fn spawn_oplog_drainer(
     oplog_cv: Arc<Condvar>,
     shards_created: Arc<AtomicU32>,
     oplog_nonlogged: bool,
+    prune: Arc<PruneCtx>,
 ) -> Arc<AsyncOplog> {
     // The cap is overridable via `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (tuning + tests
     // that force backpressure with a tiny cap); a 0/invalid value keeps the default.
@@ -2454,6 +2504,7 @@ fn spawn_oplog_drainer(
         backpressure: backpressure.clone(),
         shards_created,
         oplog_nonlogged,
+        prune,
     };
     let mut txs = Vec::with_capacity(num_drainers);
     let mut joins = Vec::with_capacity(num_drainers);
@@ -2538,14 +2589,29 @@ fn persist_and_record(
         return Some(batch);
     }
     shared.backpressure.release(bytes);
-    let advanced = {
+    let (advanced, prune_due) = {
         let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        advance_written_seq(&mut st, start, n)
+        (
+            advance_written_seq(&mut st, start, n),
+            record_persisted(&mut st, n),
+        )
     };
     if advanced {
         shared.oplog_cv.notify_all();
     }
+    if prune_due {
+        run_drainer_prune(shared);
+    }
     None
+}
+
+/// Opportunistic prune from a drainer that just crossed the persisted-rows
+/// cadence boundary. Best-effort — the entries are already durable, so a
+/// sweep failure must not fail the drain; the next boundary retries.
+fn run_drainer_prune(shared: &DrainerShared) {
+    if let Err(e) = prune_oplog_sweep(&shared.prune, None) {
+        eprintln!("secantus-storage: async oplog opportunistic prune failed: {e:?}");
+    }
 }
 
 /// Write a coalesced group of batches (possibly spanning several of this
@@ -2623,17 +2689,22 @@ fn persist_group(
     ) {
         Ok(()) => {
             let bytes: usize = group.iter().map(|b| b.bytes).sum();
-            let advanced = {
+            let (advanced, prune_due) = {
                 let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
                 let mut adv = false;
+                let mut n = 0i64;
                 for b in &group {
                     adv |= advance_written_seq(&mut st, b.start_seq, b.blobs.len() as i64);
+                    n += b.blobs.len() as i64;
                 }
-                adv
+                (adv, record_persisted(&mut st, n))
             };
             shared.backpressure.release(bytes);
             if advanced {
                 shared.oplog_cv.notify_all();
+            }
+            if prune_due {
+                run_drainer_prune(shared);
             }
         }
         Err(e) => {
@@ -2835,6 +2906,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                         .unwrap_or(1)
                         .max(scan_max_nat_seq(session) + 1),
                     emit_count: 0,
+                    persisted_count: 0,
                     live_count: count_oplog_entries(session),
                     written_seq: 0, // set to next_seq-1 by the caller (open)
                     done_ranges: BTreeMap::new(),
@@ -2871,6 +2943,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         last_ts_ord: last_ord,
         next_nat_seq: scan_max_nat_seq(session) + 1,
         emit_count: 0,
+        persisted_count: 0,
         live_count: count_oplog_entries(session),
         written_seq: 0, // set to next_seq-1 by the caller (open)
         done_ranges: BTreeMap::new(),
@@ -3232,25 +3305,14 @@ impl Storage {
         let oplog = Arc::new(Mutex::new(state));
         let oplog_cv = Arc::new(Condvar::new());
         let oplog_shards_created = Arc::new(AtomicU32::new(0));
-        // Opt-in: spawn the background drainer pool (option, else
-        // SECANTUS_OPLOG_ASYNC). The synchronous, atomic path is the default.
-        let async_oplog = if oplog_async_on {
-            Some(spawn_oplog_drainer(
-                conn.clone(),
-                oplog.clone(),
-                oplog_cv.clone(),
-                oplog_shards_created.clone(),
-                oplog_nonlogged,
-            ))
-        } else {
-            None
-        };
         // Phase A': resolve the data-logging mode. The stable marker (written
         // at every stable checkpoint) is authoritative for an existing store —
         // table logging config is create-time-sticky, so flipping the env var
         // on an existing store must not change the mode. A fresh store (no
         // marker) takes the env var. In-memory stores have no crash story and
-        // stay in the plain mode.
+        // stay in the plain mode. Resolved BEFORE the drainer pool spawns —
+        // the drainers' prune context needs the mode and the stable-marker
+        // pieces.
         let marker = {
             let session = conn.open_session()?;
             load_stable_marker(&session)
@@ -3263,20 +3325,44 @@ impl Storage {
                 None => data_create_mode,
             }
         };
+        let stable_seq = Arc::new(AtomicI64::new(marker.map(|(s, _)| s).unwrap_or(0)));
+        let checkpoint_requested = Arc::new(AtomicBool::new(false));
+        let prune_ctx = Arc::new(PruneCtx {
+            conn: conn.clone(),
+            oplog: oplog.clone(),
+            prune_lock: Mutex::new(()),
+            retention_seconds: AtomicI64::new(3600),
+            max_entries: AtomicUsize::new(100_000),
+            archive_dir: Mutex::new(None),
+            data_nonlogged,
+            stable_seq: stable_seq.clone(),
+            checkpoint_requested: checkpoint_requested.clone(),
+        });
+        // Opt-in: spawn the background drainer pool (option, else
+        // SECANTUS_OPLOG_ASYNC). The synchronous, atomic path is the default.
+        let async_oplog = if oplog_async_on {
+            Some(spawn_oplog_drainer(
+                conn.clone(),
+                oplog.clone(),
+                oplog_cv.clone(),
+                oplog_shards_created.clone(),
+                oplog_nonlogged,
+                prune_ctx.clone(),
+            ))
+        } else {
+            None
+        };
         let mut storage = Storage {
             conn,
             home: home.to_string(),
             lock: Mutex::new(()),
             coll_locks: Mutex::new(HashMap::new()),
-            oplog_prune_lock: Mutex::new(()),
             oplog_shards_created,
             enable_oplog: true,
             oplog,
             oplog_cv,
-            oplog_retention_seconds: 3600,
-            oplog_max_entries: 100_000,
+            prune_ctx,
             ts_suffix_counter: AtomicU64::new(0),
-            oplog_archive_dir: None,
             // Unlogged data tables are only as durable as their last
             // checkpoint, so the close-time checkpoint is NOT optional in this
             // mode — a fast-storage (durable=false) clean close would lose
@@ -3287,9 +3373,9 @@ impl Storage {
             oplog_nonlogged,
             checkpoint_seconds: opts.checkpoint_seconds,
             data_nonlogged,
-            stable_seq: Arc::new(AtomicI64::new(marker.map(|(s, _)| s).unwrap_or(0))),
+            stable_seq,
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
-            checkpoint_requested: Arc::new(AtomicBool::new(false)),
+            checkpoint_requested,
             checkpoint_join: Mutex::new(None),
         };
         if storage.data_nonlogged {
@@ -3313,19 +3399,25 @@ impl Storage {
     /// to drop into a durable segment in `dir` first. `None` disables it. Mirrors
     /// `Storage(oplog_archive_dir=...)`.
     pub fn set_oplog_archive_dir(&mut self, dir: Option<String>) {
-        self.oplog_archive_dir = dir;
+        *self
+            .prune_ctx
+            .archive_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = dir;
     }
 
     /// Set the oplog retention window in seconds (default 3600). Mirrors
     /// `oplog_retention_seconds`.
     pub fn set_oplog_retention_seconds(&mut self, secs: i64) {
-        self.oplog_retention_seconds = secs;
+        self.prune_ctx
+            .retention_seconds
+            .store(secs, Ordering::Relaxed);
     }
 
     /// Set the oplog hard entry cap (default 100_000). Mirrors
     /// `oplog_max_entries`.
     pub fn set_oplog_max_entries(&mut self, n: usize) {
-        self.oplog_max_entries = n;
+        self.prune_ctx.max_entries.store(n, Ordering::Relaxed);
     }
 
     // --- locking (per-collection write locks + write-conflict retry) ---
@@ -3652,7 +3744,12 @@ impl Storage {
                 }
             });
             if !IN_ASYNC_STMT.with(|f| f.get()) {
-                self.drain_pending_oplog();
+                // Self-draining emit (noop heartbeat, DDL on a bare session):
+                // the mint happens right here, so the real seq is known and
+                // returned — matching the sync path's contract. Deferred
+                // emits (statement / user txn) mint at their commit and
+                // return 0.
+                return Ok(self.drain_pending_oplog());
             }
             return Ok(0);
         }
@@ -3769,14 +3866,28 @@ impl Storage {
     /// the seq space gapless: a rolled-back/retried write cleared its buffer
     /// before reaching this point, so it never minted. `wait_for_oplog` waits on
     /// the drainer's `written_seq`, so a tailer never reads past what is on disk.
-    fn drain_pending_oplog(&self) {
-        let Some(async_h) = self.async_oplog.clone() else {
-            return;
-        };
+    fn drain_pending_oplog(&self) -> i64 {
+        if self.async_oplog.is_none() {
+            return 0;
+        }
         let pending: Vec<(OplogEntry, Option<Vec<u8>>)> =
             PENDING_OPLOG.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        self.mint_and_enqueue(pending)
+    }
+
+    /// The mint-and-hand-off half of [`Self::drain_pending_oplog`], callable
+    /// with an explicit entry list — `commit_user_transaction` feeds it the
+    /// entries a transaction's statements buffered on the handle. MUST only be
+    /// called after the entries' data transaction has committed. Returns the
+    /// highest seq minted (0 when nothing was pending), so a self-draining
+    /// emit (noop heartbeat, DDL) can report its entry's real seq like the
+    /// sync path does.
+    fn mint_and_enqueue(&self, pending: Vec<(OplogEntry, Option<Vec<u8>>)>) -> i64 {
+        let Some(async_h) = self.async_oplog.clone() else {
+            return 0;
+        };
         if pending.is_empty() {
-            return;
+            return 0;
         }
         let n = pending.len();
         // No in-flight tracking: this mint happens AFTER the data commit and
@@ -3814,21 +3925,14 @@ impl Storage {
             blobs.push(blob);
             preimages.push(pre);
         }
-        // Same opportunistic-prune cadence as the sync emit path — without
-        // it an async store never prunes from write volume at all, so a
-        // sustained writer grows the oplog without bound between explicit
-        // `prune_oplog` calls. Best-effort, after the batch is handed off.
-        let do_prune = {
+        // The opportunistic prune cadence lives with the DRAINERS in async
+        // mode (`record_persisted` — the sweep can only doom persisted rows,
+        // so a mint-side trigger lets queue lag escape it); here only the
+        // live-count is maintained.
+        {
             let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             g.live_count += n as i64;
-            g.emit_count += n as i64;
-            if g.emit_count >= OPLOG_PRUNE_INTERVAL {
-                g.emit_count = 0;
-                true
-            } else {
-                false
-            }
-        };
+        }
         let bytes: usize = blobs.iter().map(Vec::len).sum::<usize>()
             + preimages
                 .iter()
@@ -3858,11 +3962,7 @@ impl Storage {
                 "secantus-storage: async oplog drainer gone; {n} committed entries not persisted"
             );
         }
-        if do_prune {
-            if let Err(e) = self.prune_oplog_inner(None) {
-                debug_assert!(false, "opportunistic prune_oplog failed: {e:?}");
-            }
-        }
+        start + n as i64 - 1
     }
 
     /// Block until the oplog tail seq exceeds `after_seq` (a new entry landed),
@@ -4095,6 +4195,17 @@ impl Storage {
         coll_opt: Option<&Collation>,
         vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
+        // Async oplog: an acknowledged write's entry may still be queued at
+        // the drainer; a mongod client that just got its ack and reads
+        // `local.oplog.rs` must see the entry (the oplog write is part of the
+        // acknowledged write there). Drain read-after-write lag before the
+        // scan. Sync mode: waits out any in-flight mints — same contract.
+        // Skipped inside a user transaction: this thread's own un-resolved
+        // emits would make `flush_oplog` wait on itself (mongod forbids
+        // reading `local` in a transaction anyway).
+        if !self.in_user_txn() {
+            self.flush_oplog();
+        }
         let rows = self.read_oplog(0, usize::MAX)?;
         let mut out: Vec<(Document, Vec<u8>)> = Vec::with_capacity(rows.len());
         for (_seq, blob) in rows {
@@ -4453,7 +4564,6 @@ impl Storage {
     /// segment in `archive_dir` before `prune_oplog` deletes them. Best-effort
     /// reads — a row that vanished concurrently is skipped.
     fn archive_doomed_oplog(
-        &self,
         session: &Session,
         archive_dir: &str,
         doomed_sorted: &[i64],
@@ -4740,123 +4850,133 @@ impl Storage {
         self.prune_oplog_inner(now)
     }
 
-    /// One prune sweep, exclusive with other sweeps via `oplog_prune_lock` —
-    /// NOT the global lock: the opportunistic write-path caller
-    /// (`emit_oplog`) holds a collection lock, and global-after-collection
-    /// would invert the lock order (deadlock with DDL). Pruner-vs-writer
-    /// needs no exclusion — writers only append strictly higher seqs and
-    /// never touch the old rows doomed here; the reads that could observe a
-    /// half-pruned range (`read_oplog`, resume) tolerate missing rows.
+    /// One prune sweep over the shared [`PruneCtx`]. See [`prune_oplog_sweep`].
     fn prune_oplog_inner(&self, now: Option<i64>) -> Result<usize> {
-        let _p = self
-            .oplog_prune_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let when = now.unwrap_or_else(now_secs);
-        let cutoff = when - self.oplog_retention_seconds;
+        prune_oplog_sweep(&self.prune_ctx, now)
+    }
+}
 
-        // Phase 1 (lock-free): identify the doomed rows WITHOUT scanning the whole
-        // oplog — that full scan, every OPLOG_PRUNE_INTERVAL emits, was 77% of the
-        // single-writer write-path CPU (profile: scratchpad/profile_insert.sh). The
-        // live-count lets us size the sweep: `excess` is how many oldest rows must
-        // drop to get back under the entry cap; retention dooms a seq-ordered
-        // prefix on top of that. A fresh MVCC session reads consistently without
-        // blocking writers; prune is best-effort, so a slightly stale count/view is
-        // fine — writers only append *higher* seqs, never touch the old rows here.
-        let tables = oplog_all_tables();
-        let live_count = self.oplog.lock().unwrap().live_count;
-        let excess = (live_count - self.oplog_max_entries as i64).max(0) as usize;
+/// One prune sweep, exclusive with other sweeps via `PruneCtx::prune_lock` —
+/// NOT the storage global lock: the opportunistic write-path caller
+/// (`emit_oplog`) holds a collection lock, and global-after-collection
+/// would invert the lock order (deadlock with DDL). Pruner-vs-writer
+/// needs no exclusion — writers only append strictly higher seqs and
+/// never touch the old rows doomed here; the reads that could observe a
+/// half-pruned range (`read_oplog`, resume) tolerate missing rows. A free
+/// function over the shared context so the async drainer pool can run the
+/// sweep without a `Storage` borrow.
+fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
+    let _p = ctx.prune_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let session = ctx.conn.open_session()?;
+    let when = now.unwrap_or_else(now_secs);
+    let cutoff = when - ctx.retention_seconds.load(Ordering::Relaxed);
 
-        // Cheap early-out: under the cap, the only reason to prune is retention,
-        // which dooms a seq-ordered prefix — so if the OLDEST live row is still
-        // in-window, nothing is doomed. One bounded merge read of a single row
-        // replaces the whole-oplog walk in the common steady state.
-        if excess == 0 {
-            match read_oplog_shards_tagged(&session, 0, 1)?.first() {
-                None => return Ok(0),
-                Some((_, _, blob)) => {
-                    if matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) >= cutoff) {
-                        return Ok(0);
-                    }
-                    // oldest is out-of-window (or undatable) — fall through to walk.
+    // Phase 1 (lock-free): identify the doomed rows WITHOUT scanning the whole
+    // oplog — that full scan, every OPLOG_PRUNE_INTERVAL emits, was 77% of the
+    // single-writer write-path CPU (profile: scratchpad/profile_insert.sh). The
+    // live-count lets us size the sweep: `excess` is how many oldest rows must
+    // drop to get back under the entry cap; retention dooms a seq-ordered
+    // prefix on top of that. A fresh MVCC session reads consistently without
+    // blocking writers; prune is best-effort, so a slightly stale count/view is
+    // fine — writers only append *higher* seqs, never touch the old rows here.
+    let tables = oplog_all_tables();
+    let live_count = ctx.oplog.lock().unwrap().live_count;
+    let excess = (live_count - ctx.max_entries.load(Ordering::Relaxed) as i64).max(0) as usize;
+
+    // Cheap early-out: under the cap, the only reason to prune is retention,
+    // which dooms a seq-ordered prefix — so if the OLDEST live row is still
+    // in-window, nothing is doomed. One bounded merge read of a single row
+    // replaces the whole-oplog walk in the common steady state.
+    if excess == 0 {
+        match read_oplog_shards_tagged(&session, 0, 1)?.first() {
+            None => return Ok(0),
+            Some((_, _, blob)) => {
+                if matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) >= cutoff) {
+                    return Ok(0);
                 }
+                // oldest is out-of-window (or undatable) — fall through to walk.
             }
         }
-
-        // Bounded KEY-ONLY walk of the oldest rows: a row is doomed if it's
-        // within the cap excess (position alone — no value read) OR past
-        // retention (its `ts` peeked only in the tail beyond the excess). Both
-        // doom a seq-ordered prefix, so the scan stops at the first row that is
-        // neither, bounded by max(excess, RETENTION_SCAN_BATCH); retention rows
-        // beyond that drain on later sweeps. The merge carries each row's
-        // source table so phase 2 deletes from exactly that table. At a
-        // sustained write load past the cap the old full-value merge
-        // (`read_oplog_shards_tagged`) copied ~8 MB of blobs per sweep just to
-        // learn the doomed seqs — ~36% of the whole sync insert path
-        // (Finding 12); keys are all the cap trim needs.
-        // Phase A': for a data-nonlogged store, entries at/above the stable
-        // checkpoint are the only path back to the acknowledged data after a
-        // hard crash — clamp the sweep below them. The periodic checkpoint
-        // thread advances the clamp on the mongod cadence, releasing backlog.
-        let ceiling = if self.data_nonlogged {
-            self.stable_seq.load(Ordering::Acquire).max(0) + 1
-        } else {
-            i64::MAX
-        };
-        let doomed =
-            scan_doomed_oplog_keys(&session, excess, cutoff, RETENTION_SCAN_BATCH, ceiling)?;
-        if self.data_nonlogged && excess > 0 && doomed.len() < excess {
-            // The clamp blocked part of a genuine cap excess: demand an anchor
-            // so the stable seq advances and the next sweep can trim. Without
-            // this, a sustained writer outruns the periodic cadence and the
-            // oplog grows without bound.
-            self.checkpoint_requested.store(true, Ordering::Release);
-        }
-        if doomed.is_empty() {
-            return Ok(0);
-        }
-        let doomed_seqs: Vec<i64> = doomed.iter().map(|(s, _)| *s).collect();
-
-        // PITR v2: archive the soon-to-be-dropped rows to a durable segment
-        // *before* deleting them, so recovery can still reach a time before the
-        // new oplog floor.
-        if let Some(archive_dir) = self.oplog_archive_dir.clone() {
-            self.archive_doomed_oplog(&session, &archive_dir, &doomed_seqs)?;
-        }
-
-        // Phase 2: the deletes. Sweep exclusivity is already held
-        // (`oplog_prune_lock`, taken at the top); no other lock is needed —
-        // concurrent writers only ever append higher seqs. Each doomed row is
-        // removed from its exact source table (the phase-1 tag). Pre-images stay
-        // in one table.
-        let mut del_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
-        let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
-        for (seq, tbl) in &doomed {
-            if del_curs[*tbl].is_none() {
-                del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
-            }
-            let op_del = del_curs[*tbl].as_ref().unwrap();
-            op_del.reset()?;
-            op_del.set_key_q(*seq);
-            match op_del.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
-            pre_del.reset()?;
-            pre_del.set_key_q(*seq);
-            match pre_del.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        // Keep the live-count honest for the next sweep's sizing.
-        self.oplog.lock().unwrap().live_count -= doomed.len() as i64;
-        Ok(doomed.len())
     }
 
+    // Bounded KEY-ONLY walk of the oldest rows: a row is doomed if it's
+    // within the cap excess (position alone — no value read) OR past
+    // retention (its `ts` peeked only in the tail beyond the excess). Both
+    // doom a seq-ordered prefix, so the scan stops at the first row that is
+    // neither, bounded by max(excess, RETENTION_SCAN_BATCH); retention rows
+    // beyond that drain on later sweeps. The merge carries each row's
+    // source table so phase 2 deletes from exactly that table. At a
+    // sustained write load past the cap the old full-value merge
+    // (`read_oplog_shards_tagged`) copied ~8 MB of blobs per sweep just to
+    // learn the doomed seqs — ~36% of the whole sync insert path
+    // (Finding 12); keys are all the cap trim needs.
+    // Phase A': for a data-nonlogged store, entries at/above the stable
+    // checkpoint are the only path back to the acknowledged data after a
+    // hard crash — clamp the sweep below them. The periodic checkpoint
+    // thread advances the clamp on the mongod cadence, releasing backlog.
+    let ceiling = if ctx.data_nonlogged {
+        ctx.stable_seq.load(Ordering::Acquire).max(0) + 1
+    } else {
+        i64::MAX
+    };
+    let doomed = scan_doomed_oplog_keys(&session, excess, cutoff, RETENTION_SCAN_BATCH, ceiling)?;
+    if ctx.data_nonlogged && excess > 0 && doomed.len() < excess {
+        // The clamp blocked part of a genuine cap excess: demand an anchor
+        // so the stable seq advances and the next sweep can trim. Without
+        // this, a sustained writer outruns the periodic cadence and the
+        // oplog grows without bound.
+        ctx.checkpoint_requested.store(true, Ordering::Release);
+    }
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let doomed_seqs: Vec<i64> = doomed.iter().map(|(s, _)| *s).collect();
+
+    // PITR v2: archive the soon-to-be-dropped rows to a durable segment
+    // *before* deleting them, so recovery can still reach a time before the
+    // new oplog floor.
+    let archive_dir = ctx
+        .archive_dir
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(archive_dir) = archive_dir {
+        Storage::archive_doomed_oplog(&session, &archive_dir, &doomed_seqs)?;
+    }
+
+    // Phase 2: the deletes. Sweep exclusivity is already held
+    // (`prune_lock`, taken at the top); no other lock is needed —
+    // concurrent writers only ever append higher seqs. Each doomed row is
+    // removed from its exact source table (the phase-1 tag). Pre-images stay
+    // in one table.
+    let mut del_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
+    let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
+    for (seq, tbl) in &doomed {
+        if del_curs[*tbl].is_none() {
+            del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
+        }
+        let op_del = del_curs[*tbl].as_ref().unwrap();
+        op_del.reset()?;
+        op_del.set_key_q(*seq);
+        match op_del.remove() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+        pre_del.reset()?;
+        pre_del.set_key_q(*seq);
+        match pre_del.remove() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Keep the live-count honest for the next sweep's sizing.
+    ctx.oplog.lock().unwrap().live_count -= doomed.len() as i64;
+    Ok(doomed.len())
+}
+
+impl Storage {
     /// Append one `{op: "n", ns: "", o: {msg: "periodic noop"}}` heartbeat and
     /// return its seq — keeps a quiet collection's resume token advancing with
     /// cluster time. Mirrors `storage.emit_noop_heartbeat`.
@@ -4972,6 +5092,7 @@ impl Storage {
             session: Some(session),
             began: false,
             minted_ranges: Vec::new(),
+            pending_async: Vec::new(),
             oplog: Arc::clone(&self.oplog),
             oplog_cv: Arc::clone(&self.oplog_cv),
         })
@@ -5015,6 +5136,36 @@ impl Storage {
             }
         }
         let _harvest = Harvest(&mut handle.minted_ranges);
+        // Async mode: hold `IN_ASYNC_STMT` across the statement so emits
+        // buffer in `PENDING_OPLOG` instead of self-draining mid-transaction
+        // (`with_statement_txn` early-returns for `OpSession::Txn`, so without
+        // this the flag is false and `emit_oplog_entries` would mint + enqueue
+        // BEFORE this transaction commits — a rollback would then leave a
+        // persisted ghost entry). The guard restores the flag and moves the
+        // buffered entries onto the handle on every exit, panic included; the
+        // transaction's resolution point (commit / rollback / Drop) owns them
+        // from there.
+        struct AsyncHarvest<'a> {
+            pending: &'a mut Vec<(OplogEntry, Option<Vec<u8>>)>,
+            prev: bool,
+            active: bool,
+        }
+        impl Drop for AsyncHarvest<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    IN_ASYNC_STMT.with(|f| f.set(self.prev));
+                    PENDING_OPLOG.with(|p| self.pending.extend(p.borrow_mut().drain(..)));
+                }
+            }
+        }
+        let async_scope = AsyncHarvest {
+            pending: &mut handle.pending_async,
+            prev: IN_ASYNC_STMT.with(|f| f.get()),
+            active: self.async_oplog.is_some(),
+        };
+        if async_scope.active {
+            IN_ASYNC_STMT.with(|f| f.set(true));
+        }
         let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.get()));
         ACTIVE_TXN_SESSION.with(|c| c.set(session as *const Session));
         Ok(f())
@@ -5032,8 +5183,12 @@ impl Storage {
                 if let Err(e) = session.commit_transaction(None) {
                     // The transaction is dead either way — its rows can never
                     // appear, so its minted ranges leave the in-flight window
-                    // (the visible tail must not stay pinned on the corpse).
+                    // (the visible tail must not stay pinned on the corpse)
+                    // and its buffered async entries are discarded (they were
+                    // never minted; enqueueing them would fabricate events
+                    // for data that never committed).
                     handle.deregister_minted();
+                    handle.pending_async.clear();
                     // A concurrent transaction can mark this one rollback-only
                     // after its last statement ran; WiredTiger then fails the
                     // commit call itself with bare EINVAL (its documented
@@ -5057,6 +5212,13 @@ impl Storage {
                 // became visible at this commit, not at emit — advancing the
                 // visible tail and waking tailable change-stream waiters.
                 handle.deregister_minted();
+                // Async mode: the transaction's buffered entries mint + reach
+                // the drainer only NOW, after the data commit — the user-txn
+                // analogue of `with_statement_txn`'s post-commit drain. An
+                // acked commitTransaction therefore has its entries minted
+                // before the reply, which `oplog_open_seq` relies on.
+                let pending = std::mem::take(&mut handle.pending_async);
+                self.mint_and_enqueue(pending);
             }
             // `session` drops here → the dedicated WT session is closed.
         }
@@ -5073,8 +5235,11 @@ impl Storage {
                 let _ = session.rollback_transaction(None);
             }
             // The rolled-back rows can never appear: release the minted
-            // ranges so the visible tail moves past the permanent holes.
+            // ranges so the visible tail moves past the permanent holes, and
+            // discard any async-buffered entries (never minted, never
+            // enqueued — no ghost events).
             handle.deregister_minted();
+            handle.pending_async.clear();
             // `session` drops here → the dedicated WT session is closed.
         }
         Ok(())
@@ -6011,8 +6176,9 @@ impl Storage {
         if self.enable_oplog && db == "local" && coll == "oplog.rs" {
             let mut o = Document::new();
             o.insert("capped", true);
-            o.insert("size", (self.oplog_max_entries as i64) * 16 * 1024);
-            o.insert("max", self.oplog_max_entries as i64);
+            let max_entries = self.prune_ctx.max_entries.load(Ordering::Relaxed) as i64;
+            o.insert("size", max_entries * 16 * 1024);
+            o.insert("max", max_entries);
             return Ok(o);
         }
         // Lock-free read (see the `lock` field's invariants).
@@ -10556,6 +10722,8 @@ mod tests {
                 true,
             )
             .unwrap();
+            // Async lane: read-after-write needs the drainer flushed.
+            s.flush_oplog();
             s.read_oplog(1, 100)
                 .unwrap()
                 .iter()
@@ -10662,9 +10830,23 @@ mod tests {
         for i in 0..total {
             s.insert("app", "c", vec![enc(i)], true).unwrap();
         }
-        // The opportunistic prune at the OPLOG_PRUNE_INTERVAL-th emit trimmed the
-        // oplog to the 10-entry cap; only the handful of writes after it remain.
-        let live = s.read_oplog(1, 1_000_000).unwrap().len();
+        // The opportunistic prune at the OPLOG_PRUNE_INTERVAL-th emit (sync:
+        // writer-side, synchronous; async: drainer-side as rows land) trims
+        // the oplog to the 10-entry cap; only the handful of writes after it
+        // remain. In async mode the cadence sweep runs CONCURRENTLY on the
+        // drainer thread — `flush_oplog` guarantees the rows landed, not that
+        // an in-flight sweep's deletes finished — so poll briefly: the
+        // invariant is "write volume alone eventually bounds the oplog".
+        // Sync mode passes on the first iteration.
+        s.flush_oplog();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let live = loop {
+            let live = s.read_oplog(1, 1_000_000).unwrap().len();
+            if live <= 50 || std::time::Instant::now() >= deadline {
+                break live;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert!(
             live <= 50,
             "oplog not opportunistically pruned: {live} live rows after {total} writes"

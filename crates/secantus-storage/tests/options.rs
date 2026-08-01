@@ -28,10 +28,13 @@ fn insert_row(st: &Storage, db: &str, coll: &str, id: i32) {
 /// and become readable once drained (`flush_oplog` waits for that).
 #[test]
 fn oplog_async_option_engages_without_env() {
-    assert!(
-        std::env::var_os("SECANTUS_OPLOG_ASYNC").is_none(),
-        "test requires a clean environment"
-    );
+    // The whole point is option-without-env; under the async CI lane
+    // (SECANTUS_OPLOG_ASYNC=1 for the entire suite) that premise is gone —
+    // skip rather than fail the lane.
+    if std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some() {
+        eprintln!("skipping: SECANTUS_OPLOG_ASYNC is set in the environment");
+        return;
+    }
     let home = temp_home();
     {
         let st = Storage::open_with_options(
@@ -59,10 +62,10 @@ fn oplog_async_option_engages_without_env() {
 /// mode (create-time-sticky, marker authoritative).
 #[test]
 fn data_nonlogged_option_engages_and_reopen_keeps_mode() {
-    assert!(
-        std::env::var_os("SECANTUS_DATA_NONLOGGED").is_none(),
-        "test requires a clean environment"
-    );
+    if std::env::var_os("SECANTUS_DATA_NONLOGGED").is_some() {
+        eprintln!("skipping: SECANTUS_DATA_NONLOGGED is set in the environment");
+        return;
+    }
     let home = temp_home();
     {
         let st = Storage::open_with_options(
@@ -77,6 +80,10 @@ fn data_nonlogged_option_engages_and_reopen_keeps_mode() {
         for i in 0..10 {
             insert_row(&st, "app", "c", i);
         }
+        // Under an ambient SECANTUS_OPLOG_ASYNC lane the inserts' oplog rows
+        // may still be queued at the drainer; the stable anchor covers only
+        // persisted rows, so drain first (no-op in sync mode).
+        st.flush_oplog();
         st.stable_checkpoint().unwrap();
         assert!(
             st.stable_checkpoint_seq() > 0,

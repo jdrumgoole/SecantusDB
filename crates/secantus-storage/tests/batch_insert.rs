@@ -156,6 +156,7 @@ fn batch_insert_emits_oplog_inserts() {
             true,
         )
         .unwrap();
+        st.flush_oplog();
         let rows = st.read_oplog(floor + 1, 100).unwrap();
         let inserts = rows
             .iter()

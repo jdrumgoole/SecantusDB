@@ -1529,6 +1529,22 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
+      # The async/decoupled-oplog parity lane: the whole storage suite again
+      # with the drainer pool live (SECANTUS_OPLOG_ASYNC=1, stacked with the
+      # non-logged oplog tables the mode ships with — the Finding-9 pairing).
+      # tasks/rust-async-oplog-prototype.md names this lane as the
+      # precondition for the mode ever becoming a default. Mode-specific
+      # tests pin their own mode via StorageOptions (the option beats the env
+      # var), so sync-only invariants stay covered by the run above while
+      # everything else exercises the async path. Same build — only the env
+      # differs, so this re-runs tests without recompiling.
+      - name: Cargo test (secantus-storage, async-oplog lane)
+        working-directory: crates/secantus-storage
+        env:
+          SECANTUS_OPLOG_ASYNC: "1"
+          SECANTUS_OPLOG_NONLOGGED: "1"
+        run: cargo test
+
       - name: Cargo fmt / clippy / test (secantus-storage-adapter, R4b)
         # The WiredTiger → command-`Storage` adapter (R4b). Like secantus-storage
         # it links WiredTiger and is excluded from the workspace, so it's built
