@@ -991,6 +991,35 @@ def sql_stress(c: Context) -> None:
     print("\nWrote docs/validation-report-sqlstress.md")
 
 
+@task(name="validate-pgjdbc")
+def validate_pgjdbc(c: Context) -> None:
+    """Run pgjdbc's own test suite against a SecantusPGServer daemon.
+
+    The SQL-server JDBC gauge (tasks/sql-gauges-plan.md G5): the official
+    PostgreSQL JDBC driver's suite, unmodified, targeted via pgjdbc's stock
+    build.local.properties (gitignored upstream, so the submodule stays
+    pristine). Requires a JDK 21 (pgjdbc's Gradle toolchain). Generates
+    docs/validation-report-pgjdbc.md. Python server only.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/pgjdbc/gradlew").exists():
+        c.run("git submodule update --init vendor/pgjdbc", pty=True)
+    _run_gauge(
+        c,
+        module="pgjdbc_validation.runner",
+        raw=".validation/pgjdbc-raw.json",
+        report="docs/validation-report-pgjdbc.md",
+        hint="A missing `vendor/pgjdbc` submodule, no JDK 21, or a PG-server startup failure is the usual cause.",
+    )
+    c.run(
+        "uv run --no-sync python -m pgjdbc_validation.generate_report "
+        ".validation/pgjdbc-raw.json docs/validation-report-pgjdbc.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-pgjdbc.md")
+
+
 @task(name="validate-pgtest")
 def validate_pgtest(c: Context) -> None:
     """Run CockroachDB's pgtest wire corpus against a SecantusPGServer daemon.

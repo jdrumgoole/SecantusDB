@@ -54,6 +54,10 @@ jobs:
           # init + TPC-B (three protocol modes) + select-only + psql catalog
           # smoke. Needs pgbench/psql (postgresql-contrib, installed below).
           - { name: sql-stress, task: sql-stress, report: docs/validation-report-sqlstress.md }
+          # The SQL-server JDBC gauge (tasks/sql-gauges-plan.md G5): pgjdbc's
+          # own suite, unmodified, targeted via its stock
+          # build.local.properties. Needs JDK 21 (setup-java step below).
+          - { name: pgjdbc, task: validate-pgjdbc, report: docs/validation-report-pgjdbc.md }
           # The SQL-server wire-protocol gauge (tasks/sql-gauges-plan.md G3):
           # cockroach's pgtest datadriven corpus + runner, fetched verbatim at
           # a pinned commit (sparse clone, cached) and driven over pgproto3.
@@ -226,14 +230,14 @@ jobs:
             ${{ runner.os }}-node-modules-
 
       - name: Set up JDK
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'pgjdbc'
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'pgjdbc'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |

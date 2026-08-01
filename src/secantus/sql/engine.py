@@ -1306,10 +1306,20 @@ def _describe_statement(
                 ColumnDesc("description", "text", oid),
             ]
         return [ColumnDesc(_show_name(stmt), "text", oid)]
-    if _own_with(stmt) is not None:
-        # Resolving a CTE query's columns would require materializing the CTEs
-        # (execution), which Describe must not do — defer to Execute's
-        # RowDescription by reporting NoData here.
+    with_node = _own_with(stmt)
+    if with_node is not None:
+        # A CTE query's column shape comes from its outer SELECT, planned
+        # against synthetic TableDefs for the CTE names (each CTE's own
+        # output shape, resolved recursively) — planning only, nothing is
+        # materialized. Reporting NoData here and then emitting DataRows at
+        # Execute is a protocol violation: pgjdbc rejects it outright
+        # ("Received resultset tuples, but no field structure for them"),
+        # and a data-modifying CTE (``WITH x AS (INSERT … RETURNING …)
+        # SELECT * FROM x``) hits exactly that. Undescribable CTEs still
+        # fall back to NoData.
+        shape = _describe_with(storage, db, stmt, session, catalog, with_node)
+        if shape is not None:
+            return shape
         return None
     if isinstance(stmt, exp.SetOperation):
         # A set operation's result shape is its first arm's (descend chained
@@ -1416,6 +1426,80 @@ def _describe_statement(
     if select_plan.count_star:
         return [ColumnDesc(select_plan.count_alias, "int8", typemap.PG_OID["int8"])]
     return executor._out_column_descs(select_plan.out_columns, storage, db)
+
+
+def _describe_with(
+    storage: Any,
+    db: str,
+    stmt: exp.Expression,
+    session: Session,
+    catalog: Catalog,
+    with_node: exp.With,
+) -> list[ColumnDesc] | None:
+    """Result columns of a ``WITH … SELECT`` — the outer query described
+    against synthetic tables standing in for the CTEs. Side-effect free: a
+    data-modifying CTE is described by its RETURNING shape, never run."""
+    defs: dict[str, Any] = {}
+    for cte in with_node.expressions:
+        alias = cte.alias
+        inner = cte.this
+        if isinstance(inner, exp.Subquery):
+            inner = inner.this
+        try:
+            if isinstance(inner, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+                cols = _describe_returning(storage, db, catalog, inner)
+            elif isinstance(inner, (exp.Select, exp.SetOperation)):
+                cols = _describe_statement(storage, db, inner, session, catalog)
+            else:
+                cols = None
+        except errors.SQLError:
+            cols = None
+        if not cols:
+            return None
+        # A ``name(a, b)`` column-alias list renames the CTE's outputs.
+        aliases = (
+            [c.name for c in (cte.args.get("alias").columns or [])] if cte.args.get("alias") else []
+        )
+        names = aliases or [c.name for c in cols]
+        if len(names) != len(cols):
+            return None
+        defs[alias] = TableDef(
+            name=alias,
+            collection=alias,
+            columns=[
+                Column(n, c.type_tag, n, pk=False, nullable=True)
+                for n, c in zip(names, cols, strict=True)
+            ],
+        )
+    if not defs:
+        return None
+    body = stmt.copy()
+    # The WITH arg key varies by sqlglot version (``with`` / ``with_``);
+    # clear it by identity, like _own_with finds it. Leaving it set makes
+    # the recursive describe below re-enter this function forever.
+    for key, value in list(body.args.items()):
+        if isinstance(value, exp.With):
+            body.set(key, None)
+    try:
+        return _describe_statement(storage, db, body, session, _CTEDescribeCatalog(catalog, defs))
+    except errors.SQLError:
+        return None
+
+
+class _CTEDescribeCatalog:
+    """Read-only catalog view that resolves CTE names to their synthetic
+    TableDefs and delegates everything else to the real catalog."""
+
+    def __init__(self, base: Catalog, defs: dict[str, Any]) -> None:
+        self._base = base
+        self._defs = defs
+
+    def get(self, db: str, name: str) -> Any:
+        hit = self._defs.get(name)
+        return hit if hit is not None else self._base.get(db, name)
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._base, item)
 
 
 def _show_name(stmt: exp.Command) -> str:

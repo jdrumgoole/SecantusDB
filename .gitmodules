@@ -44,3 +44,6 @@
 [submodule "vendor/pgx"]
 	path = vendor/pgx
 	url = https://github.com/jackc/pgx
+[submodule "vendor/pgjdbc"]
+	path = vendor/pgjdbc
+	url = https://github.com/pgjdbc/pgjdbc
