@@ -4685,3 +4685,81 @@ lock-free dict read. Windows' coarser scheduling quantum likely just widens a
 window that exists everywhere.
 
 Do not "fix" this by deselecting the test or by widening a timeout again.
+
+## UNIQUE constraints are not enforced against concurrent commits (2026-08-01)
+
+**Data-integrity bug on the SQL front end. Duplicates are silently stored.**
+
+Reproduce in one script: connection A opens a transaction and reads (taking its
+snapshot), connection B inserts and commits a row, then A inserts a row with the
+same `UNIQUE` value and commits. Both rows land. Real PostgreSQL 14.13 rejects
+A's insert with `23505 duplicate key value violates unique constraint` — checked
+side by side.
+
+```sql
+CREATE TABLE uq (id bigint primary key, val int unique);
+-- A: BEGIN; SELECT count(*) FROM uq;      -- snapshot taken
+-- B: INSERT INTO uq VALUES (1, 42);       -- commits
+-- A: INSERT INTO uq VALUES (2, 42); COMMIT;   -- should fail, currently succeeds
+-- => 2 rows, 1 distinct val
+```
+
+Mechanism: uniqueness is enforced by `Storage._unique_conflict`, a prefix probe
+over `table:secantus_index_entries` **read through the caller's transaction
+snapshot**. A row committed after that snapshot is invisible, so no conflict is
+detected. WiredTiger cannot catch it either: an index entry's key is
+`escape(sortkey) + \x00\x00 + RecordId`, so two docs sharing an indexed value
+produce *different* keys and never collide.
+
+Today's autocommit path survives only because each statement is its own short
+transaction (fresh snapshot) *and* `_coll_lock(db, coll)` serialises the
+probe-and-insert within a process. Neither protects a multi-statement
+transaction, which is why the explicit-transaction case above is broken now.
+
+Fixing it is the prerequisite for the implicit-transaction work below — that
+change gives every batch a snapshot older than its statements, which widened
+this from a narrow window to routine (a probe test stored 150 rows across 20
+distinct values). Options, in rough order of fidelity:
+
+- Give unique indexes a key with **no RecordId suffix**, so WiredTiger's own key
+  uniqueness and conflict detection enforce them, as a real unique index does.
+  This is the principled fix and the one that also handles two *simultaneous*
+  uncommitted inserts. It changes the on-disk entry layout, so it needs an
+  `entryFormat` bump and the Rust twin.
+- Or probe on a **fresh session** (latest committed) in addition to the
+  transaction's own view, so own-transaction writes are still seen. Cheaper, but
+  it leaves the simultaneous-uncommitted case to the collection lock and costs an
+  extra probe on every insert into a table with a unique index — measure against
+  the perf gates.
+
+Do not paper over this by re-scoping the tests. `tests/test_pgserver_concurrency.py`
+already asserts the invariant for the autocommit path; the explicit-transaction
+case needs a test of its own once fixed.
+
+## `numeric` is float64 — exactness and scale are both lost (2026-08-01)
+
+`planner._literal` turns any decimal literal into a Python `float`, so Postgres'
+arbitrary-precision exact `numeric` behaves like a double. Verified against real
+PostgreSQL 14.13:
+
+| expression | ours | real PG |
+| --- | --- | --- |
+| `SELECT 0.1 + 0.2` | `0.30000000000000004` | `0.3` |
+| `SELECT 0.1 + 0.2 = 0.3` | **false** | true |
+| `SELECT 0.000000` | `0` | `0.000000` |
+| `SELECT 12345678901234567890.12345 + 1` | `1.2345678901234567E+19` | `12345678901234567891.12345` |
+
+The last row is the serious one: a value wider than a double silently drops
+digits, which for money-shaped data is corruption rather than rounding. The
+scale loss is what pgjdbc's `NumericTransfer2Test` fails on (26 of the gauge's
+remaining failures, all `getBigDecimal for SELECT 0.x00000`).
+
+Parsing the literal as `Decimal` fixes the scale half and is a two-line change,
+**but it is not sufficient on its own** — it was tried and reverted. Arithmetic
+is evaluated elsewhere and still coerces to float, so the exactness rows above
+stay wrong, and `secantus.expressions` raises `ExpressionError` when a `Decimal`
+reaches it (`tests/test_sql_colref.py::test_col_lt_arithmetic` and
+`tests/test_sql_types.py::test_integer_division_truncates_in_aggregate_args`
+both fail). Land it as one piece: literal parsing, the expression engine's
+numeric tower, and the float8-vs-numeric distinction (`1e3` is float8 in
+Postgres, a plain `1.5` is numeric) together.

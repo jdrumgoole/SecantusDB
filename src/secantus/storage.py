@@ -2748,15 +2748,23 @@ class Storage:
         server's bounded wait.
 
         ``max_wait_seconds`` is that bound. It is a parameter only so tests can
-        widen it: a test that opens a transaction, waits, then commits is
-        racing this deadline on the wall clock, and a loaded CI runner can
-        overshoot the default and take the fallback — which reads as a product
-        failure when it is only scheduling noise.
+        widen it.
+
+        The visible tail is sampled BEFORE the scan, and the order is load
+        bearing. Sampling it after left a window in which an in-flight mint
+        committed between the two reads: the scan still returned the answer
+        from before the commit (naming the seq *above* the in-flight one),
+        while the tail read afterwards had already advanced to cover it, so
+        the stale answer passed the check and the entry was skipped for good.
+        Sampling first is conservative in the safe direction — the tail only
+        ever grows, so an earlier reading is no larger than the true one at
+        scan time, and everything at or below it is resolved (committed or a
+        permanent hole) and therefore visible to the scan that follows.
         """
         deadline = _time.monotonic() + max_wait_seconds
         while True:
-            r = self._find_seq_for_ts_scan(ts)
             vis = self.oplog_visible_tail_seq()
+            r = self._find_seq_for_ts_scan(ts)
             if r - 1 <= vis or _time.monotonic() >= deadline:
                 return r
             with self._oplog_cv:
