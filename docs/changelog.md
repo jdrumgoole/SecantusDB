@@ -17,6 +17,8 @@ Versioning](https://semver.org/spec/v2.0.0.html), but while we're in
 beta the patch number `bN` rolls forward on every PyPI-visible push;
 the API surface itself is shaped by Semantic Versioning intent.
 
+## [Unreleased]
+
 ## [0.6.0b9] — 2026-08-01
 
 ### Async oplog hardened: transactions can no longer leak ghost events
