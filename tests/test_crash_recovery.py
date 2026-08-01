@@ -134,10 +134,29 @@ def _verify_all_present(tmp_path: Path, ranges: list[range]) -> None:
                 chunk = acked[lo : lo + 1000]
                 present.update(d["_id"] for d in coll.find({"_id": {"$in": chunk}}, {"_id": 1}))
             missing = [i for i in acked if i not in present]
-            assert not missing, (
-                f"{len(missing)} acknowledged docs lost after hard kill + replay "
-                f"(first: {missing[:10]})"
-            )
+            if missing:
+                # Self-diagnose before failing: is the oplog tail absent at
+                # reopen (WAL loss) or present-but-not-replayed (replay bug)?
+                diag: dict[str, object] = {"n_missing": len(missing)}
+                try:
+                    diag["count_documents"] = coll.count_documents({})
+                    op = client["local"]["oplog.rs"]
+                    diag["oplog_rows"] = op.count_documents({})
+                    last = list(op.find({}).sort("$natural", -1).limit(3))
+                    diag["oplog_tail"] = [
+                        {k: e.get(k) for k in ("op", "ns", "ts")}
+                        | {"o_id": e.get("o", {}).get("_id")}
+                        for e in last
+                    ]
+                    first_missing_in_oplog = op.count_documents({"o._id": missing[0]})
+                    diag["first_missing_in_oplog"] = first_missing_in_oplog
+                    diag["max_present"] = max(present) if present else None
+                except Exception as exc:  # diagnostics must never mask the assert
+                    diag["diag_error"] = repr(exc)
+                assert not missing, (
+                    f"{len(missing)} acknowledged docs lost after hard kill + replay "
+                    f"(first: {missing[:10]}); diag={diag}"
+                )
             # Exactly-once: no duplicate _ids possible in one collection, but the
             # doc bodies must match what was acked (replay applied cleanly).
             sample = coll.find_one({"_id": acked[-1]})
