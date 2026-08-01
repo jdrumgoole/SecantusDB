@@ -294,6 +294,52 @@ def concurrency(
 
 
 @task(
+    name="concurrency-refresh",
+    help={
+        "duration": "Wall-clock seconds per writer count (default: 30).",
+        "writers": 'Comma-separated writer counts (default: "1,2,4,8").',
+        "runs": "Interleaved sweeps to median over (default: 3).",
+        "skip-bench": "Re-render the graphs from the committed results "
+                      "JSON without re-measuring.",
+    },
+)
+def concurrency_refresh(
+    c: Context,
+    duration: float = 30.0,
+    writers: str = "1,2,4,8",
+    runs: int = 3,
+    skip_bench: bool = False,
+) -> None:
+    """Re-measure N-writer scaling and refresh the concurrency graphs.
+
+    Runs ``bench.concurrency --server all`` (python, rust, rust-async,
+    mongod — needs ``mongod`` on PATH and a built ``secantusd-rs``) with
+    interleaved runs, writes the medians to
+    ``bench/results/concurrency.json``, then regenerates the
+    marker-delimited chart + table blocks in
+    ``website/themes/secantus/templates/performance.html`` and
+    ``docs/concurrency.md`` via ``bench.concurrency_chart``. The prose
+    around both charts is hand-maintained — review it against the
+    printed headlines. Part of the per-release website refresh (see the
+    secantusdb-website skill); default settings take ~25 min.
+    """
+    results = "bench/results/concurrency.json"
+    if not skip_bench:
+        c.run(
+            "uv run --no-sync python -m bench.concurrency --server all"
+            f" --duration {float(duration)}"
+            f" --writers {shlex.quote(writers)}"
+            f" --runs {int(runs)}"
+            f" --json {results}",
+            pty=True,
+        )
+    c.run(
+        f"uv run --no-sync python -m bench.concurrency_chart --results {results}",
+        pty=True,
+    )
+
+
+@task(
     name="rw-harness",
     help={
         "workers": "Number of independent reader/writer processes (default: 4).",

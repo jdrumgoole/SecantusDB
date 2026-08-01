@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "duration": 30.0,
+    "batch": 100,
+    "writers": [1, 2, 4, 8],
+    "shared_collection": false,
+    "runs": 3,
+    "note": "Reconstructed from the published 2026-07 chart medians; the next `invoke concurrency-refresh` overwrites this with a live measurement."
+  },
+  "servers": {
+    "python": {
+      "runs_docs_per_sec": [[12100.0], [8900.0], [10400.0], [7600.0]],
+      "docs_per_sec": [12100.0, 8900.0, 10400.0, 7600.0]
+    },
+    "rust": {
+      "runs_docs_per_sec": [[35400.0], [53700.0], [80200.0], [96400.0]],
+      "docs_per_sec": [35400.0, 53700.0, 80200.0, 96400.0]
+    },
+    "rust-async": {
+      "runs_docs_per_sec": [[50400.0], [66000.0], [100300.0], [119200.0]],
+      "docs_per_sec": [50400.0, 66000.0, 100300.0, 119200.0]
+    },
+    "mongod": {
+      "runs_docs_per_sec": [[105700.0], [203300.0], [366100.0], [481000.0]],
+      "docs_per_sec": [105700.0, 203300.0, 366100.0, 481000.0]
+    }
+  }
+}
