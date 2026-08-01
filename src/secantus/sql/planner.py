@@ -7050,6 +7050,74 @@ def _lateral_stage(
     return alias, tdef, stages
 
 
+def _srf_body(stmt: exp.Expression) -> Any:
+    """The ``SrfSource`` when ``stmt`` is a SELECT whose FROM is a base-less
+    set-returning function, else None."""
+    from secantus.sql import srf
+
+    if not isinstance(stmt, exp.Select):
+        return None
+    return srf.from_source(stmt)
+
+
+def _is_srf_table_source(node: exp.Expression) -> bool:
+    """True for a table function sitting directly in FROM / JOIN position.
+
+    sqlglot models it as a ``Table`` whose ``this`` is the function node rather
+    than an identifier, which is why such a source used to fall through to the
+    catalog lookup and report ``relation "" does not exist``."""
+    from secantus.sql import srf
+
+    if isinstance(node, exp.Unnest):
+        return True
+    return isinstance(node, exp.Table) and srf._is_srf_node(node.this)
+
+
+def _srf_out_columns(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any
+) -> list[tuple[str, str]]:
+    """Output (name, tag) shape of a base-less SRF SELECT.
+
+    Built by asking ``srf`` to materialize the source, which is how the engine
+    derives the same shape at run time — so the planner's column types agree
+    with the rows the executor will produce. The evaluation is best-effort:
+    an SRF whose arguments need session state (``generate_series(1,
+    array_upper(current_schemas(false), 1))``) cannot be resolved from here,
+    and those columns fall back to the untyped tag rather than a guess.
+    """
+    from secantus.sql import scalar, srf
+
+    source = srf.from_source(stmt)
+    names: list[str] = []
+    if source is not None:
+        try:
+            _rows, tdef = srf.build(source, scalar.ScalarContext(storage, catalog, db, None))
+            by_name = {c.name: c.type_tag for c in tdef.columns}
+            names = list(by_name)
+        except Exception:
+            by_name = {}
+            names = list(source.column_aliases) or [source.table_alias or "?column?"]
+    else:  # pragma: no cover - guarded by the caller
+        by_name = {}
+
+    projected = _srf_projected_names(stmt, names)
+    return [(n, by_name.get(n, "any")) for n in projected]
+
+
+def _srf_projected_names(stmt: exp.Select, source_names: list[str]) -> list[str]:
+    """The SELECT's output names over an SRF source: the source's own columns
+    for ``SELECT *``, else the projection's aliases / column names."""
+    out: list[str] = []
+    for e in stmt.expressions:
+        target = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(target, exp.Star):
+            out.extend(source_names)
+            continue
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        out.append(alias or (target.name if isinstance(target, exp.Column) else "?column?"))
+    return out or source_names
+
+
 def _fromless_out_columns(stmt: exp.Select) -> list[tuple[str, str]]:
     """Output (name, tag) shape of a FROM-less SELECT — used for derived tables
     whose inner query has no row source (``FROM (SELECT 1 AS x) AS a``)."""
@@ -7137,6 +7205,19 @@ def _resolve_source(
             return alias, tdef
         if not isinstance(sub, exp.Select):
             raise errors.feature_not_supported(f"unsupported derived table: {node.sql()}")
+        if _srf_body(sub) is not None:
+            # ``FROM (SELECT … FROM generate_series(…) AS s(r)) AS d`` — the
+            # engine's base-less SRF path already materializes this shape, so
+            # hand it over as a raw sub-plan rather than pipelining it (there
+            # is no collection to pipeline over).
+            cols = _srf_out_columns(sub, db, catalog, storage)
+            tdef = TableDef(
+                name=alias,
+                collection=alias,
+                columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+            )
+            derived.append(DerivedTable(name=alias, plan=RawDerived(sub), columns=cols))
+            return alias, tdef
         if sub.args.get("from_") is None:
             # ``FROM (SELECT 1 AS x) AS a`` — no row source to pipeline; the
             # executor runs the constant SELECT through the engine.
@@ -7157,18 +7238,26 @@ def _resolve_source(
         )
         derived.append(DerivedTable(name=alias, plan=sub_plan, columns=cols))
         return alias, tdef
-    if isinstance(node, exp.Table) and not isinstance(node.this, exp.Identifier):
-        # A table function in JOIN / derived-table position — sqlglot models it
-        # as a Table whose `this` is the function node, so `node.name` is empty
-        # and the lookup below reported `relation "" does not exist`, which
-        # says nothing about what actually went wrong. A set-returning function
-        # is only supported as the sole FROM item today (engine._run_srf_select);
-        # say that instead of naming a relation nobody wrote.
-        fn = node.this.sql() if node.this is not None else node.sql()
-        raise errors.feature_not_supported(
-            f"a set-returning function is only supported as the sole FROM item, not as a "
-            f"join or derived-table source: {fn}"
+    if _is_srf_table_source(node):
+        # A table function in JOIN position (``JOIN generate_series(…) AS s(r)``).
+        # Wrapping it in a SELECT reduces it to the base-less SRF shape the
+        # engine already materializes, so it goes through the same raw sub-plan
+        # path as a derived table over one.
+        alias_node = node.args.get("alias")
+        alias = alias_node.name if alias_node is not None else ""
+        if not alias:
+            raise errors.feature_not_supported("a set-returning function in FROM requires an alias")
+        sub = exp.Select(expressions=[exp.Star()], from_=exp.From(this=node.copy()))
+        cols = _srf_out_columns(sub, db, catalog, storage)
+        tdef = TableDef(
+            name=alias,
+            collection=alias,
+            columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
         )
+        derived.append(DerivedTable(name=alias, plan=RawDerived(sub), columns=cols))
+        return alias, tdef
+    if isinstance(node, exp.Table) and not isinstance(node.this, exp.Identifier):
+        raise errors.feature_not_supported(f"unsupported FROM item: {node.sql()}")
     tdef = _lookup_table_def(catalog, db, node, storage)
     if tdef is None:
         raise errors.undefined_table(node.name)
