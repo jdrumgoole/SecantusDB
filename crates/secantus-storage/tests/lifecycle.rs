@@ -37,6 +37,9 @@ fn decode(b: &[u8]) -> Document {
 
 /// All command (`op: "c"`) oplog entries emitted since `floor`, as decoded docs.
 fn cmd_entries(st: &Storage, floor: i64) -> Vec<Document> {
+    // Async lane: DDL emits self-drain through the background drainer; wait
+    // them out so the read is deterministic (no-op in sync mode).
+    st.flush_oplog();
     st.read_oplog(floor + 1, 1000)
         .unwrap()
         .into_iter()
@@ -306,6 +309,8 @@ fn stable_checkpoint_marker_roundtrips() {
         let st = Storage::open(home.to_str().unwrap()).unwrap();
         st.insert_one("app", "c", &enc(&bson::doc! {"_id": 1}))
             .unwrap();
+        // Async lane: the anchor covers only drained rows (no-op sync).
+        st.flush_oplog();
         st.stable_checkpoint().unwrap();
         st.insert_one("app", "c", &enc(&bson::doc! {"_id": 2}))
             .unwrap();

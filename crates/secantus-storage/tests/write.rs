@@ -300,6 +300,7 @@ fn update_operator_emits_v2_diff_oplog() {
             None,
         )
         .unwrap();
+        st.flush_oplog();
         let rows = st.read_oplog(floor + 1, 100).unwrap();
         assert_eq!(rows.len(), 1);
         let e = decode(&rows[0].1);
@@ -336,6 +337,7 @@ fn update_replacement_emits_full_doc_oplog() {
             None,
         )
         .unwrap();
+        st.flush_oplog();
         let rows = st.read_oplog(floor + 1, 100).unwrap();
         let e = decode(&rows[0].1);
         assert_eq!(e.get_str("op").unwrap(), "u");
@@ -421,6 +423,7 @@ fn delete_emits_oplog_delete_entry() {
             None,
         )
         .unwrap();
+        st.flush_oplog();
         let rows = st.read_oplog(floor + 1, 100).unwrap();
         assert_eq!(rows.len(), 1);
         let e = decode(&rows[0].1);
@@ -478,6 +481,7 @@ fn update_skips_oplog_when_disabled() {
             .unwrap();
         assert_eq!(out.modified, 1);
         assert_eq!(get_doc(&st, 1).get_i32("x").unwrap(), 2);
+        st.flush_oplog();
         assert_eq!(st.read_oplog(1, 100).unwrap().len(), 0);
     }
     let _ = std::fs::remove_dir_all(&home);
