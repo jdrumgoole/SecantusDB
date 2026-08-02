@@ -613,12 +613,15 @@ def _is_range_value(v: Any) -> bool:
 
 def _variadic(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> list[Any]:
     args = ([node.this] if node.this is not None else []) + list(node.expressions)
-    return [evaluate(a, scope, ctx) for a in args]
+    return [typemap.unwrap_numeric(evaluate(a, scope, ctx)) for a in args]
 
 
 def _unary(fn: Callable[[Any], Any]) -> Callable[[exp.Expression, Scope, ScalarContext], Any]:
     def handler(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
-        v = evaluate(node.this, scope, ctx)
+        # Unwrapped because these are the plain math builtins (sqrt / log10 /
+        # sign / trunc / …) and ``math`` rejects a Decimal128 outright. A
+        # non-decimal value passes through untouched.
+        v = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
         return None if v is None else fn(v)
 
     return handler
