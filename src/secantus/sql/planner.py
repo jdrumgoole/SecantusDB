@@ -10504,6 +10504,26 @@ def _consume_estring(sql: str, i: int) -> tuple[str, int]:
     return "".join(buf), i  # unterminated — sqlglot will raise the syntax error
 
 
+def _fold_unquoted_identifiers(stmt: exp.Expression) -> None:
+    """Lower-case every UNQUOTED identifier, in place.
+
+    Postgres folds an unquoted identifier to lower case and keeps a quoted one
+    exactly as written, so ``AS TABLE_NAME`` and a later ``r.table_name`` name
+    the same column while ``"TABLE_NAME"`` is a different one. We compared them
+    exactly, so the two spellings were two different names — every generated or
+    SQL-standard-uppercase statement broke on it, while code that wrote and
+    read one spelling never noticed.
+
+    Doing it here, once, right after the parse means every downstream
+    consumer — alias resolution, catalog lookups, the column resolver — sees
+    one canonical spelling and needs no case logic of its own. String literals
+    are ``Literal`` nodes, not ``Identifier``, so their contents are untouched.
+    """
+    for ident in stmt.find_all(exp.Identifier):
+        if not ident.args.get("quoted") and isinstance(ident.this, str):
+            ident.set("this", ident.this.lower())
+
+
 def parse(sql: str) -> list[exp.Expression]:
     """Parse a (possibly multi-statement) SQL string into AST statements."""
     # Cap the statement length before parsing — a cheap upper bound on parse cost
@@ -10577,6 +10597,7 @@ def parse(sql: str) -> list[exp.Expression]:
     try:
         stmts = [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
         for s in stmts:
+            _fold_unquoted_identifiers(s)
             _resolve_group_by_ordinals(s)
         return stmts
     except (sqlglot.errors.ParseError, sqlglot.errors.TokenError) as exc:

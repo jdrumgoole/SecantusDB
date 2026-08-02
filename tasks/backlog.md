@@ -4881,7 +4881,7 @@ Pinned by `tests/test_sql_pg_expandarray.py::TestFieldSelection::
 test_order_by_does_not_sort_expanded_rows` so the current shape is visible
 rather than assumed correct.
 
-## Unquoted identifiers are not case-folded (2026-08-02)
+## Unquoted identifiers are not case-folded (2026-08-02) — FIXED
 
 Postgres folds an unquoted identifier to lower case, so `AS TABLE_NAME` and a
 later `r.table_name` are the same column. We preserve the case as written and
@@ -4913,3 +4913,31 @@ Note sqlglot records whether an identifier was quoted (`Identifier.quoted`),
 which is the signal to key off. Check the catalog paths too: table and column
 names created unquoted should also fold, and `pg_catalog` lookups already
 assume lower case.
+
+### Case folding landed; the next blocker is an empty column name
+
+Folding happens once in `planner._fold_unquoted_identifiers`, right after the
+parse: every unquoted `Identifier` is lower-cased and quoted ones are left
+exactly as written, so no downstream consumer needs case logic of its own.
+`PUBLIC` is restored in `_grant_principals` because Postgres treats it as a
+keyword and `information_schema.role_table_grants` reports it upper-case.
+
+The pgjdbc `UpdateableResultTest` cluster went **33 -> 24** and the gauge
+94.2% -> 94.4%. The remaining 21 now fail with:
+
+```
+ERROR: column "" does not exist
+```
+
+— an EMPTY column name, the same smell as the `relation ""` bug that turned
+out to be `TypeInfoCache`. It comes from `DatabaseMetaData.getPrimaryKeys`,
+whose outer query wraps the `_pg_expandarray` subquery. The obvious candidates
+were each reproduced in isolation and are all fine: a `NULL AS ALIAS` column in
+a derived table, a quoted upper-case outer alias over a folded inner one, and
+the missing space in the driver's own `AS "IS_NOT_NULL"FROM` concatenation.
+
+**Do not reconstruct the query by hand to find it** — that is what cost the
+time here. Log the statement server-side (the `pgserver` query path) during a
+`validate-pgjdbc` run and read back exactly what the driver sent, including
+the parameter placeholders and the `pg_table_is_visible` / `ct.relname = ?`
+clauses that only appear for some call shapes.
