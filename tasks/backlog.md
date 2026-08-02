@@ -4738,7 +4738,7 @@ Do not paper over this by re-scoping the tests. `tests/test_pgserver_concurrency
 already asserts the invariant for the autocommit path; the explicit-transaction
 case needs a test of its own once fixed.
 
-## `numeric` is float64 — exactness and scale are both lost (2026-08-01)
+## `numeric` exactness (2026-08-01) — FIXED, with one divergence left
 
 `planner._literal` turns any decimal literal into a Python `float`, so Postgres'
 arbitrary-precision exact `numeric` behaves like a double. Verified against real
@@ -4812,3 +4812,43 @@ its snapshot. It is not fixed here: `_note_write` fires at the top of
 `insert()`, before the probe runs, so a committed probe bolted on there would
 be switched off by its own statement and never fire. The storage-layout fix
 above resolves it for both personas at once.
+
+### `numeric` — what landed, and the division-scale divergence
+
+**Fixed.** A decimal literal is now `Decimal128`, the same exact type a
+`numeric` column already stored (`typemap.number_literal`, shared by the
+planner and the scalar evaluator — they previously carried separate copies,
+which is why fixing only one left arithmetic on floats). Exponent notation is
+numeric too: `pg_typeof(1e3)` is `numeric`, checked against 14.13, which is not
+what the notation suggests. Comparison operators unwrap Decimal128 rather than
+swallowing the TypeError and answering false.
+`tests/test_sql_numeric_exact.py` covers it.
+
+**Divergence: Postgres derives a scale for numeric division; we do not.**
+`SELECT 5.52 / CAST(2.4 AS NUMERIC(10,2))` gives `2.3000000000000000` on real
+PostgreSQL 14.13 — scale 16, from its rule that a division result carries at
+least the dividend's scale plus a margin. We answer `2.3`. The *value* is
+equal, so arithmetic and comparisons agree; only the displayed scale differs,
+and a driver reading `getBigDecimal().scale()` would see 1 rather than 16.
+Implementing it means porting `select_div_scale` from Postgres' `numeric.c`
+into the division path. Pinned by
+`tests/test_sql_gauge_fixes.py::TestNumericArithmetic::test_float_by_numeric_typmod`,
+which asserts the value rather than the scale so the divergence is visible
+rather than silently encoded.
+
+**Anything that consumes a numeric value must unwrap it first**
+(`typemap.unwrap_numeric`): `Decimal128` implements no Python numeric
+protocol, so `int()`, `float()`, arithmetic, comparison and unary minus all
+reject it outright. Landing this change flushed out call sites in `coerce`,
+the percentile/sequence planners, `log()`, unary minus, and the binary wire
+encoders — each of which had been fed a float before and raised a bare
+TypeError on the first decimal.
+
+**Residual: values beyond Decimal128's 34 significant digits.** The pgjdbc
+numeric cluster went 26 -> 4 with this change; the remaining 4 are
+`SELECT 0.1000000000000000000000000000000...` and its integer counterpart,
+which carry more than 34 significant digits and so round when stored as
+Decimal128. Postgres' numeric is arbitrary precision. Fixing it means not
+using Decimal128 as the carrier — a bigger change than this one, since
+Decimal128 is what the storage layer stores for a `numeric` column — and it is
+the same limit already noted against `typemap.coerce`.

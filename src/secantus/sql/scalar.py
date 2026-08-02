@@ -124,8 +124,7 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     if isinstance(node, exp.Literal):
         if node.is_string:
             return node.this
-        text = node.this
-        return float(text) if ("." in text or "e" in text.lower()) else int(text)
+        return typemap.number_literal(node.this)
     if isinstance(node, exp.BitString):  # ``B'1010'`` -> the '0'/'1' string
         return str(node.this)
     if isinstance(node, exp.ByteString):
@@ -140,7 +139,7 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             from secantus.sql import intervals as _intervals
 
             return _intervals.neg(v)
-        return -v
+        return typemap.negate(v)
     if isinstance(node, exp.Cast):
         return _eval_cast(node, scope, ctx)
     if isinstance(node, exp.Column):
@@ -458,7 +457,7 @@ def _unwrap_decimal(v: Any) -> Any:
     """A stored ``numeric`` / ``money`` value is a BSON ``Decimal128``, which has no
     Python arithmetic / comparison operators — unwrap it to a ``Decimal`` so the
     scalar evaluator can compute with it."""
-    return v.to_decimal() if isinstance(v, bson.Decimal128) else v
+    return typemap.unwrap_numeric(v)
 
 
 def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
@@ -614,12 +613,15 @@ def _is_range_value(v: Any) -> bool:
 
 def _variadic(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> list[Any]:
     args = ([node.this] if node.this is not None else []) + list(node.expressions)
-    return [evaluate(a, scope, ctx) for a in args]
+    return [typemap.unwrap_numeric(evaluate(a, scope, ctx)) for a in args]
 
 
 def _unary(fn: Callable[[Any], Any]) -> Callable[[exp.Expression, Scope, ScalarContext], Any]:
     def handler(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
-        v = evaluate(node.this, scope, ctx)
+        # Unwrapped because these are the plain math builtins (sqrt / log10 /
+        # sign / trunc / …) and ``math`` rejects a Decimal128 outright. A
+        # non-decimal value passes through untouched.
+        v = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
         return None if v is None else fn(v)
 
     return handler
@@ -925,12 +927,12 @@ def _eval_trunc(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
 
 def _eval_log(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     """``log(x)`` is base-10 in Postgres; ``log(b, x)`` is log base ``b`` (this=b)."""
-    a = evaluate(node.this, scope, ctx)
+    a = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
     if a is None:
         return None
     expr = node.args.get("expression")
     if expr is not None:
-        x = evaluate(expr, scope, ctx)
+        x = typemap.unwrap_numeric(evaluate(expr, scope, ctx))
         if x is None:
             return None
         # Use the exact base-10 / base-2 routines when applicable so that, e.g.,

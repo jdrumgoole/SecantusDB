@@ -555,6 +555,72 @@ class TimeTzText(str):
     """Canonical timetz text from a ``timetz`` (1266) parameter — ``::timetz``."""
 
 
+def to_decimal128(d: Decimal) -> bson.Decimal128:
+    """A ``Decimal`` as BSON ``Decimal128``, rounding into range when it is
+    wider than the 34 significant digits Decimal128 holds (the same fallback
+    :func:`coerce` applies to a stored ``numeric``)."""
+    try:
+        return bson.Decimal128(d)
+    except _decimal.DecimalException:
+        from bson.decimal128 import create_decimal128_context
+
+        with _decimal.localcontext(create_decimal128_context()) as ctx:
+            return bson.Decimal128(ctx.create_decimal(d))
+
+
+def number_literal(text: str) -> Any:
+    """The value of a non-string numeric literal, as Postgres types it.
+
+    A decimal literal (``1.5``, ``0.000000``) is ``numeric``: exact, and it
+    keeps the scale it was written with. Reading those as a float lost both —
+    ``0.1 + 0.2 = 0.3`` answered false, ``SELECT 0.000000`` came back as ``0``,
+    and a value wider than a double silently dropped digits. Decimal128 is what
+    a ``numeric`` COLUMN already stores (see :func:`coerce`), so literals and
+    stored values share one representation.
+
+    Exponent notation (``1e3``) is numeric too — ``pg_typeof(1e3)`` is
+    ``numeric``, checked against PostgreSQL 14.13, not float8 as one might
+    expect. An integer literal stays an ``int``.
+
+    Lives here rather than in the planner because the scalar evaluator needs
+    exactly the same mapping, and the two carried separate copies of it — which
+    is why fixing only the planner's left arithmetic on floats.
+    """
+    if "." in text or "e" in text.lower():
+        d = Decimal(text)
+        exponent = d.as_tuple().exponent
+        if isinstance(exponent, int) and exponent > 0 and d.adjusted() < 34:
+            # ``1.5e2`` parses to Decimal('1.5E+2'); Postgres shows 150, so
+            # expand the exponent to match. Guarded by ``adjusted()`` so a
+            # literal like ``1e400`` — whose integer form is 401 digits, past
+            # what Decimal128 can hold — keeps its compact form instead of
+            # raising. The wire renderer expands either shape identically; this
+            # only makes the embedded value match what Postgres reports.
+            with _decimal.localcontext() as ctx:
+                ctx.prec = 40
+                d = d.quantize(Decimal(1))
+        return to_decimal128(d)
+    return int(text)
+
+
+def unwrap_numeric(value: Any) -> Any:
+    """A ``Decimal128`` as a plain ``Decimal``; anything else unchanged.
+
+    Decimal128 implements no Python numeric protocol, so ``int()`` / ``float()``
+    / arithmetic / comparison all reject it. Any code that takes a value which
+    might be a ``numeric`` and does arithmetic on it needs this first.
+    """
+    return value.to_decimal() if isinstance(value, bson.Decimal128) else value
+
+
+def negate(value: Any) -> Any:
+    """Arithmetic negation that also handles BSON ``Decimal128`` (which has no
+    Python operators of its own)."""
+    if isinstance(value, bson.Decimal128):
+        return bson.Decimal128(-value.to_decimal())
+    return -value
+
+
 def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     """Map a parsed SQL ``DataType`` to an internal tag, or None if unknown. An
     ``ARRAY`` type becomes ``<elem>[]`` (e.g. ``int4[]``)."""
@@ -845,6 +911,14 @@ def coerce(value: Any, tag: str) -> Any:
     """
     if value is None:
         return None
+    if isinstance(value, bson.Decimal128) and tag != "numeric":
+        # A decimal literal now arrives as Decimal128 (see number_literal), and
+        # Decimal128 supports no Python conversions — ``float(Decimal128)``
+        # raises. Unwrap once here so every tag below converts from a plain
+        # Decimal, which int() / float() / str() all accept. ``numeric`` is
+        # excluded because its own branch already handles both forms and would
+        # otherwise lose the fast path.
+        value = value.to_decimal()
     if is_array_tag(tag):
         elem = array_element_tag(tag)
         if elem == "box" and not isinstance(value, (list, tuple)):
