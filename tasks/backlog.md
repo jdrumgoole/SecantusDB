@@ -4852,3 +4852,64 @@ Decimal128. Postgres' numeric is arbitrary precision. Fixing it means not
 using Decimal128 as the carrier — a bigger change than this one, since
 Decimal128 is what the storage layer stores for a `numeric` column — and it is
 the same limit already noted against `typemap.coerce`.
+
+## ORDER BY does not sort rows expanded by a set-returning function (2026-08-02)
+
+Silent wrong ordering, pre-existing and affecting every SRF in the select
+list, not just the one added most recently:
+
+```sql
+CREATE TABLE src (id int primary key); INSERT INTO src VALUES (1);
+SELECT unnest(ARRAY[9,8,7]) FROM src ORDER BY 1;   -- we give 9, 8, 7
+                                                   -- Postgres gives 7, 8, 9
+```
+
+Cause: in `executor._evaluated_value_rows` the ORDER BY keys are computed once
+per SOURCE document (`_order_key` over `make_scope(doc)`) and only then is the
+row expanded by `_expand_srf`. Every expanded row therefore inherits one
+identical sort key and they keep the array's own order. With a single source
+row nothing sorts at all.
+
+Fixing it means deriving the sort key from the EXPANDED row when an ORDER BY
+term refers to an output column that an SRF produced — positional terms
+(`ORDER BY 1`) map straight onto the output tuple, and an expression term has
+to be matched against the projection. Watch DISTINCT ON while doing it: that
+key is deliberately row-level and computed before expansion, and the two must
+not be conflated.
+
+Pinned by `tests/test_sql_pg_expandarray.py::TestFieldSelection::
+test_order_by_does_not_sort_expanded_rows` so the current shape is visible
+rather than assumed correct.
+
+## Unquoted identifiers are not case-folded (2026-08-02)
+
+Postgres folds an unquoted identifier to lower case, so `AS TABLE_NAME` and a
+later `r.table_name` are the same column. We preserve the case as written and
+compare exactly, so they are two different names:
+
+```sql
+CREATE TABLE src (id int primary key); INSERT INTO src VALUES (1);
+SELECT r.table_name FROM (SELECT id AS TABLE_NAME FROM src) r;
+-- ERROR: column "table_name" does not exist   (Postgres: 1)
+SELECT r.TABLE_NAME FROM (SELECT id AS table_name FROM src) r;
+-- ERROR: column "TABLE_NAME" does not exist   (Postgres: 1)
+```
+
+Matching case works, which is why this went unnoticed — code that writes an
+alias one way and reads it back the same way never trips it. Anything
+generated, or written in the SQL-standard uppercase style, does.
+
+**This is now what blocks the pgjdbc `UpdateableResultTest` cluster (26).**
+Its `DatabaseMetaData.getPrimaryKeys` aliases columns as `AS TABLE_NAME` /
+`AS KEY_SEQ` in a subquery and reads them back lower-cased from the outer
+query. The `_pg_expandarray` support those queries also needed has landed, and
+the failure message moved from `function _pg_expandarray() is not supported`
+to `field access on a non-composite value` to `column "table_name" does not
+exist` — each fix exposing the next layer.
+
+Fixing it means folding unquoted identifiers at parse/resolve time — aliases,
+column references, and table names alike — while leaving quoted ones exact.
+Note sqlglot records whether an identifier was quoted (`Identifier.quoted`),
+which is the signal to key off. Check the catalog paths too: table and column
+names created unquoted should also fold, and `pg_catalog` lookups already
+assume lower case.
