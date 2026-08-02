@@ -11,6 +11,8 @@ function the aggregation engine can't lower (e.g. ``substr``) is still ``0A000``
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import bson
 import pytest
 import sqlglot
@@ -236,7 +238,10 @@ def test_colref_lowers_to_expr():
 
 
 def test_arithmetic_lowers_to_expr():
-    product = {"$multiply": ["$cost", 1.5]}
+    # 1.5 lowers as Decimal128, not a float: a decimal literal is ``numeric``
+    # in Postgres, and carrying it exactly is what makes ``0.1 + 0.2 = 0.3``
+    # true. This pins the lowered shape, so the type is part of the contract.
+    product = {"$multiply": ["$cost", bson.Decimal128(Decimal("1.5"))]}
     assert _filter_for("price < cost * 1.5") == {
         "$expr": {
             "$and": [

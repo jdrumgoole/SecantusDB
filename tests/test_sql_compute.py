@@ -79,9 +79,9 @@ def test_concat_operator(storage, session):
 
 
 def test_round(storage, session):
-    assert rows(storage, session, "SELECT round(price / 3.0, 2) AS r FROM items WHERE _id = 1") == [
-        (3.33,)
-    ]
+    # numeric, not float: real Postgres answers 3.33 with pg_typeof numeric.
+    got = rows(storage, session, "SELECT round(price / 3.0, 2) AS r FROM items WHERE _id = 1")
+    assert [(str(got[0][0]),)] == [("3.33",)]
 
 
 def test_coalesce_and_nullif(storage, session):

@@ -352,9 +352,22 @@ def _op_not(arg: Any, ctx: _Ctx) -> bool:
     return not _bool(_eval(inner, ctx))
 
 
+def _unwrap_d128(v: Any) -> Any:
+    """A ``Decimal128`` as a plain ``Decimal`` for comparison.
+
+    Decimal128 has no Python comparison operators, so ``12 < Decimal128("15")``
+    raised TypeError, which the range operators below swallow into False, and
+    ``==`` simply answered False. Every comparison against a decimal was
+    therefore wrong. mongod compares the numeric types by value, and a
+    ``Decimal`` compares correctly against int and float, so unwrapping is all
+    that is needed.
+    """
+    return v.to_decimal() if isinstance(v, Decimal128) else v
+
+
 def _cmp_pair(arg: Any, ctx: _Ctx) -> tuple[Any, Any]:
     a, b = _eval_args(arg, ctx)
-    return a, b
+    return _unwrap_d128(a), _unwrap_d128(b)
 
 
 def _op_eq(arg: Any, ctx: _Ctx) -> bool:

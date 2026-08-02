@@ -240,7 +240,7 @@ def _literal(node: exp.Expression) -> Any:
             from secantus.sql import intervals as _intervals
 
             return _intervals.neg(inner)
-        return -inner
+        return typemap.negate(inner)
     if isinstance(node, exp.Null):
         return None
     if isinstance(node, exp.Boolean):
@@ -250,8 +250,7 @@ def _literal(node: exp.Expression) -> Any:
     if isinstance(node, exp.Literal):
         if node.is_string:
             return node.this
-        text = node.this
-        return float(text) if ("." in text or "e" in text.lower()) else int(text)
+        return typemap.number_literal(node.this)
     if isinstance(node, exp.BitString):  # ``B'1010'`` -> the canonical '0'/'1' string
         return str(node.this)
     if isinstance(node, exp.ByteString):
@@ -495,8 +494,10 @@ def _identity_spec(coldef: exp.ColumnDef) -> dict[str, Any] | None:
         increment = kind.args.get("increment")
         return {
             "mode": "always" if always else "by_default",
-            "start": int(_literal(start)) if start is not None else 1,
-            "increment": int(_literal(increment)) if increment is not None else 1,
+            "start": int(typemap.unwrap_numeric(_literal(start))) if start is not None else 1,
+            "increment": (
+                int(typemap.unwrap_numeric(_literal(increment))) if increment is not None else 1
+            ),
         }
     return None
 
@@ -4342,7 +4343,7 @@ def _ordered_set_agg(node: exp.Expression) -> tuple[str, float | None, exp.Expre
     order_val = ordered[0].this
     fraction: float | None = None
     if kind != "mode":
-        fraction = float(_literal(inner.this.this))
+        fraction = float(typemap.unwrap_numeric(_literal(inner.this.this)))
         if not 0.0 <= fraction <= 1.0:
             raise errors.SQLError("2202E", f"percentile value {fraction} is not between 0 and 1")
     return kind, fraction, order_val

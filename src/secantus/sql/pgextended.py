@@ -475,13 +475,13 @@ def _encode_numeric(value: Any) -> bytes:
 _OUT_BINARY = {
     16: _encode_bool,  # bool
     17: lambda v: bytes(v),  # bytea
-    20: lambda v: struct.pack("!q", int(v)),  # int8
-    21: lambda v: struct.pack("!h", int(v)),  # int2
-    23: lambda v: struct.pack("!i", int(v)),  # int4
-    26: lambda v: struct.pack("!I", int(v) & 0xFFFFFFFF),  # oid (unsigned)
+    20: lambda v: struct.pack("!q", int(typemap.unwrap_numeric(v))),  # int8
+    21: lambda v: struct.pack("!h", int(typemap.unwrap_numeric(v))),  # int2
+    23: lambda v: struct.pack("!i", int(typemap.unwrap_numeric(v))),  # int4
+    26: lambda v: struct.pack("!I", int(typemap.unwrap_numeric(v)) & 0xFFFFFFFF),  # oid
     650: _encode_inet_factory(True),  # cidr
-    700: lambda v: struct.pack("!f", float(v)),  # float4
-    701: lambda v: struct.pack("!d", float(v)),  # float8
+    700: lambda v: struct.pack("!f", float(typemap.unwrap_numeric(v))),  # float4
+    701: lambda v: struct.pack("!d", float(typemap.unwrap_numeric(v))),  # float8
     829: _encode_macaddr,  # macaddr
     869: _encode_inet_factory(False),  # inet
     1082: _encode_date,  # date
