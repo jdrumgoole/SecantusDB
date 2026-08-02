@@ -4349,6 +4349,11 @@ def _ordered_set_agg(node: exp.Expression) -> tuple[str, float | None, exp.Expre
     return kind, fraction, order_val
 
 
+#: SRF kinds that yield a composite record, so ``(srf(...)).field`` is valid on
+#: them. ``_srf_of`` tags those as ``"<kind>.<field>"``.
+_RECORD_SRF_KINDS = frozenset({"_pg_expandarray"})
+
+
 def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
     """If ``node`` is a set-returning function, return (kind, array_expr).
 
@@ -4358,6 +4363,18 @@ def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
     inner = node.this if isinstance(node, exp.Alias) else node
     if isinstance(inner, exp.Explode):
         return ("unnest", inner.this)
+    # ``(schema.srf(arr)).field`` — a composite field selected off a
+    # record-returning SRF, which is how pgjdbc's DatabaseMetaData asks for
+    # ``(information_schema._pg_expandarray(i.indkey)).n``. Recurse on the
+    # parenthesised call and tag the kind with the field being taken.
+    if isinstance(inner, exp.Dot) and isinstance(inner.this, exp.Paren):
+        field = inner.expression
+        field_name = field.name if isinstance(field, (exp.Identifier, exp.Column)) else None
+        if field_name:
+            base = _srf_of(inner.this.this)
+            if base is not None and base[0] in _RECORD_SRF_KINDS:
+                return (f"{base[0]}.{field_name.lower()}", base[1])
+        return None
     if isinstance(inner, exp.Dot) and isinstance(inner.expression, exp.Anonymous):
         inner = inner.expression
     if isinstance(inner, exp.Anonymous):
@@ -4373,6 +4390,10 @@ def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
             return ("jsonb_array_elements", inner.expressions[0])
         if name in ("jsonb_object_keys", "json_object_keys") and inner.expressions:
             return ("jsonb_object_keys", inner.expressions[0])
+        # information_schema._pg_expandarray(arr) -> one (x, n) record per
+        # element: the value and its 1-based subscript.
+        if name == "_pg_expandarray" and inner.expressions:
+            return ("_pg_expandarray", inner.expressions[0])
     return None
 
 

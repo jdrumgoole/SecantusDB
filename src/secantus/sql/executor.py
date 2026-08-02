@@ -1612,6 +1612,27 @@ def _evaluated_value_rows(
     return rows
 
 
+def _expandarray_cell(kind: str, arr: list[Any], k: int) -> Any:
+    """One output cell for ``information_schema._pg_expandarray(arr)``.
+
+    The function yields a ``(x, n)`` record per element — the value and its
+    1-based subscript. ``kind`` carries which field was selected
+    (``_pg_expandarray.n`` / ``.x``); the bare kind means the whole record was
+    selected, and it stays a subdocument rather than composite text so that
+    field access still works a level up. pgjdbc selects the record into a
+    subquery column and then reads ``(result.KEYS).x`` from the outer query,
+    which needs the composite intact.
+    """
+    if k >= len(arr):
+        return None
+    field = kind.partition(".")[2]
+    if field == "n":
+        return k + 1
+    if field == "x":
+        return arr[k]
+    return {"x": arr[k], "n": k + 1}
+
+
 def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> list[tuple[Any, ...]]:
     """Evaluate one source row's output columns, expanding set-returning
     functions (unnest / generate_subscripts) into one row per array element.
@@ -1651,6 +1672,8 @@ def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> lis
                 kind, arr = srfs[idx]
                 if kind == "generate_subscripts":  # 1-based ordinal
                     row.append(k + 1 if k < len(arr) else None)
+                elif kind.startswith("_pg_expandarray"):
+                    row.append(_expandarray_cell(kind, arr, k))
                 else:  # unnest / jsonb_array_elements / jsonb_object_keys → element/key
                     row.append(arr[k] if k < len(arr) else None)
             else:
