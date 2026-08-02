@@ -4843,3 +4843,12 @@ reject it outright. Landing this change flushed out call sites in `coerce`,
 the percentile/sequence planners, `log()`, unary minus, and the binary wire
 encoders — each of which had been fed a float before and raised a bare
 TypeError on the first decimal.
+
+**Residual: values beyond Decimal128's 34 significant digits.** The pgjdbc
+numeric cluster went 26 -> 4 with this change; the remaining 4 are
+`SELECT 0.1000000000000000000000000000000...` and its integer counterpart,
+which carry more than 34 significant digits and so round when stored as
+Decimal128. Postgres' numeric is arbitrary precision. Fixing it means not
+using Decimal128 as the carrier — a bigger change than this one, since
+Decimal128 is what the storage layer stores for a `numeric` column — and it is
+the same limit already noted against `typemap.coerce`.
