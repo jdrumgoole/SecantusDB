@@ -2702,11 +2702,19 @@ def _grant_privileges(stmt: exp.Expression) -> tuple[list[str], dict[str, list[s
 
 
 def _grant_principals(stmt: exp.Expression) -> list[str]:
-    """The grantee role names of a ``GRANT``/``REVOKE`` (``PUBLIC`` kept as-is)."""
+    """The grantee role names of a ``GRANT``/``REVOKE`` (``PUBLIC`` kept as-is).
+
+    ``PUBLIC`` is a keyword in Postgres rather than a role name, and
+    ``information_schema.role_table_grants`` reports it upper-case however it
+    was spelled. Identifier folding lower-cases it like any other unquoted
+    name, so it is restored here — which is what the "kept as-is" above has
+    always promised.
+    """
     out: list[str] = []
     for gp in stmt.args.get("principals") or []:
         ident = gp.this if isinstance(gp, exp.GrantPrincipal) else gp
-        out.append(str(getattr(ident, "name", ident)))
+        name = str(getattr(ident, "name", ident))
+        out.append("PUBLIC" if name.lower() == "public" else name)
     return out
 
 
