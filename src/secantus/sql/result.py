@@ -21,6 +21,12 @@ class ColumnDesc:
     # ((p<<16)|(s&0x7FF))+4 for numeric(p,s), the bare length/precision for
     # bit/varbit/time-family types, -1 when the type carries none.
     typmod: int = -1
+    # The base column this output column came from, as RowDescription reports
+    # it: the source table's pg_class oid and the column's 1-based attnum, or
+    # 0/0 for anything computed. A JDBC updatable ResultSet resolves column
+    # names through these — with 0/0 it cannot, and builds ``SET "" = ?``.
+    table_oid: int = 0
+    attnum: int = 0
 
 
 @dataclass

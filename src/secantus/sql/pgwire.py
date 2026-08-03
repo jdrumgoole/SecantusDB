@@ -359,7 +359,8 @@ def row_description(
     formats: list[int] | None = None,
     encoding: str | None = None,
 ) -> bytes:
-    """``columns`` is a list of (name, type_oid[, typmod]); ``formats`` the
+    """``columns`` is a list of (name, type_oid[, typmod[, table_oid, attnum]]);
+    ``formats`` the
     per-column result format codes (0=text, 1=binary), defaulting to all-text.
     Column names encode in the client's ``client_encoding`` (``encoding``;
     UTF-8 when None). A missing typmod emits -1 (no modifier)."""
@@ -368,8 +369,8 @@ def row_description(
         name, type_oid = col[0], col[1]
         typmod = col[2] if len(col) > 2 else -1
         payload += name.encode(encoding or "utf-8", errors="replace") + b"\x00"
-        payload += _INT32.pack(0)  # table OID (unknown)
-        payload += _INT16.pack(0)  # column attribute number
+        payload += _INT32.pack(col[3] if len(col) > 3 else 0)  # source table OID
+        payload += _INT16.pack(col[4] if len(col) > 4 else 0)  # source column attnum
         payload += _INT32.pack(type_oid)
         payload += _INT16.pack(_TYPLEN.get(type_oid, -1))  # type size
         payload += _INT32.pack(typmod)  # type modifier

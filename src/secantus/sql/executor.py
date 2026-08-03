@@ -615,8 +615,28 @@ def _drop_expr_index(table: Any, index_name: str, catalog: Catalog, storage: Any
             )
 
 
+def _source_column_identity(table: Any, storage: Any, db: str | None) -> tuple[int, dict[str, int]]:
+    """``(table_oid, {column_name: attnum})`` for a result's base table.
+
+    RowDescription reports these per column, and a JDBC updatable ResultSet
+    resolves each result column back to its base column through them. Sending
+    0/0 left it unable to, so ``updateRow()`` emitted ``SET "" = ?``. Returns
+    ``(0, {})`` when there is no single base table (a reflected collection has
+    no pg_class row, and a computed column has no source column anyway).
+    """
+    if table is None or storage is None or db is None or getattr(table, "reflected", False):
+        return 0, {}
+    from secantus.sql import virtual
+
+    try:
+        oid = virtual._table_oids(db, Catalog(storage)).get(table.name, 0)
+    except Exception:  # pragma: no cover - catalog unavailable
+        return 0, {}
+    return oid, {c.name: i + 1 for i, c in enumerate(table.columns)}
+
+
 def _out_column_descs(
-    cols: list[tuple[str, Any]], storage: Any, db: str | None
+    cols: list[tuple[str, Any]], storage: Any, db: str | None, table: Any = None
 ) -> list[ColumnDesc]:
     """Describe ``(out_name, Column)`` output pairs for a result.
 
@@ -626,6 +646,7 @@ def _out_column_descs(
     recognises result columns. The value bytes are the label text either way
     (an enum's binary wire form IS its text), so only the oid changes."""
     enum_oids: dict[str, int] | None = None
+    table_oid, attnums = _source_column_identity(table, storage, db)
     out: list[ColumnDesc] = []
     for name, col in cols:
         oid = typemap.PG_OID.get(col.type_tag, 25)
@@ -655,7 +676,16 @@ def _out_column_descs(
                     oid = enum_oid + USER_TYPE_ARRAY_OID_OFFSET
                 else:
                     oid = enum_oid
-        out.append(ColumnDesc(name, col.type_tag, oid))
+        attnum = attnums.get(getattr(col, "name", ""), 0)
+        out.append(
+            ColumnDesc(
+                name,
+                col.type_tag,
+                oid,
+                table_oid=table_oid if attnum else 0,
+                attnum=attnum,
+            )
+        )
     return out
 
 
@@ -1325,7 +1355,7 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
         docs = storage.find_matching(
             db, plan.table.collection, plan.filter, skip=plan.skip, limit=plan.limit
         )
-    columns = _out_column_descs(plan.out_columns, storage, db)
+    columns = _out_column_descs(plan.out_columns, storage, db, getattr(plan, "table", None))
     rows: list[tuple[Any, ...]] = []
     for doc in docs:
         # get_path walks dotted field paths (jsonb navigation); a plain field
@@ -1390,7 +1420,7 @@ def execute_correlated_select(
     if plan.limit:
         matched = matched[: plan.limit]
 
-    columns = _out_column_descs(plan.out_columns, storage, db)
+    columns = _out_column_descs(plan.out_columns, storage, db, getattr(plan, "table", None))
     rows = [
         tuple(typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in plan.out_columns)
         for doc in matched
