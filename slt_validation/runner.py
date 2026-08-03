@@ -37,10 +37,13 @@ VENDOR = REPO_ROOT / "vendor" / "sqllogictest" / "test"
 CORPUS = REPO_ROOT / ".validation" / "slt-corpus"
 RAW_OUT = REPO_ROOT / ".validation" / "slt-raw.json"
 
-#: Per-file wall-clock cap. The slowest included file (select3.test) is ~40s;
-#: a hang (a regressed awaitless wait, a runaway join) gets cut well before
-#: it stalls the gauge.
-FILE_TIMEOUT_SECONDS = 300.0
+#: Per-file wall-clock cap. The slowest included file (select3.test) is ~40s
+#: locally; a hang (a regressed awaitless wait, a runaway join) gets cut well
+#: before it stalls the gauge. Env-overridable because the 2-core CI runner
+#: executes the same files 5-10x slower than a dev machine — the first weekly
+#: CI run timed out ~15 postgres-extended files at 300s that pass locally in
+#: ~25s each (validate.yml sets 900 for its slt lane).
+FILE_TIMEOUT_SECONDS = float(os.environ.get("SECANTUS_SLT_FILE_TIMEOUT", "300"))
 
 
 def _sqllogictest_bin() -> str:

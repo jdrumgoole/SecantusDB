@@ -26,6 +26,14 @@ jobs:
   validate:
     name: ${{ matrix.driver.name }}
     runs-on: ubuntu-latest
+    # A wedged gauge must fail fast, not burn the 6-hour default: the rust
+    # gauge spent two consecutive weekly runs crawling to the 6h kill (cold
+    # cargo cache + per-filter timeouts compounding — see rust_validation/
+    # runner.py's pre-build note). The slowest healthy lane (cxx cold build)
+    # is ~30-40 min; 2h is generous headroom for any cold cache. Exception:
+    # the slt lane legitimately runs long on the 2-core runner (60 files,
+    # some at several minutes each under the widened per-file timeout below).
+    timeout-minutes: ${{ matrix.driver.name == 'slt' && 300 || 120 }}
     strategy:
       fail-fast: false
       matrix:
@@ -310,9 +318,16 @@ jobs:
           fi
           ~/.cargo/bin/sqllogictest --version
 
-      - name: Cache cargo registry + target
+      # Split restore/save (not plain actions/cache) so a failed or killed
+      # job STILL saves the compiled target. The plain form only saves on
+      # job success, which is how the rust gauge wedged itself for two
+      # weeks: the cache evicted (7-day TTL), the cold run overran the job
+      # limit and was killed, the kill skipped the save, and every later
+      # weekly run started cold again.
+      - name: Restore cargo registry + target
+        id: cargo-cache
         if: matrix.driver.name == 'rust' || matrix.driver.name == 'rust-rust-server'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -340,7 +355,25 @@ jobs:
           # gauge_common.rust_binary()'s default search only covers the cargo
           # target dir; the storage-engine sync stages the daemon in .venv/bin.
           SECANTUSDB_BIN: ${{ contains(matrix.driver.name, 'rust-server') && '.venv/bin/secantusd-rs' || '' }}
+          # The 2-core runner executes slt files 5-10x slower than a dev
+          # machine; 300s (the local calibration) timed out ~15 files that
+          # pass locally in ~25s each on the first weekly slt run.
+          SECANTUS_SLT_FILE_TIMEOUT: ${{ matrix.driver.name == 'slt' && '900' || '' }}
         run: uv run python -m invoke ${{ matrix.driver.task }}
+
+      # Companion of the split restore above: persist the compiled driver
+      # target even when the gauge failed or timed out, so the next run never
+      # starts from a cold compile. Saving over an existing identical key is
+      # a no-op warning, not an error.
+      - name: Save cargo registry + target
+        if: always() && (matrix.driver.name == 'rust' || matrix.driver.name == 'rust-rust-server')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vendor/mongo-rust-driver/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Show report summary
         run: head -50 ${{ matrix.driver.report }}

@@ -5015,3 +5015,51 @@ generation has moved since the statement was prepared, re-derive the shape and
 compare — so the common path costs one integer comparison and DDL, which is
 rare, pays for the re-describe. Raise `feature_not_supported` with Postgres'
 exact wording, since drivers match on the message as well as the SQLSTATE.
+
+## Weekly validate.yml failures (2026-08-03 triage)
+
+The 2026-07-27 and 2026-08-03 scheduled runs did not finish green. Three
+distinct problems, triaged from the run logs:
+
+- ~~**`rust` gauge (mongo-rust-driver vs the Python server) crawls to the
+  6-hour job kill** — both weeks; 7 minutes on 2026-07-20.~~ **FIXED
+  (rust-gauge-wedge slice).** Root cause was a compounding loop: the cargo
+  cache (populated 2026-07-20) hit the 7-day eviction TTL; the cold run's
+  FIRST per-filter `cargo test` invocation had to compile the whole driver
+  test binary inside the 600s per-invocation timeout, which killed cargo
+  mid-compile, so each of the 88 invocations resumed a partial build inside
+  its own 600s window (log signature: hours-long silent gaps between filter
+  outputs); the job overran the 6h default and was cancelled; and the
+  cancelled job skipped `actions/cache`'s success-only save, so every later
+  weekly run started cold again — a permanent wedge. Fix: (1)
+  `rust_validation/runner.py` pre-builds with `cargo test --no-run` under its
+  own 3600s wall so the 600s limit bounds only test runtime; (2) the cargo
+  cache is split into `actions/cache/restore` + an `if: always()`
+  `actions/cache/save`, so even a failed/killed run persists the compiled
+  target; (3) the `validate` job carries `timeout-minutes: 120` so any future
+  wedge fails fast instead of burning six runner-hours per lane.
+- ~~**`slt` gauge "regression"**~~ — NOT a regression; **timeout calibration,
+  fixed (rust-gauge-wedge slice).** 2026-08-03 was the slt lane's FIRST
+  weekly run (the SQL gauge lanes postdate the 2026-07-27 schedule), and the
+  ~15 `postgres-extended` `index/*` / `random/*` files it timed out at 300s
+  pass locally in ~25s each — verified by running
+  `index/orderby/10/slt_good_0.test` against BOTH current main and the
+  2026-07-27 head (`c4873cb0`) on this machine: 24.5s vs 24.4s, byte-same
+  timing, so no server slowdown exists. The 2-core CI runner is simply
+  5-10x slower than the dev machine the 300s cap was calibrated on (its
+  passing `select3.test` extended lane took 277s — right at the wall).
+  `FILE_TIMEOUT_SECONDS` is now `SECANTUS_SLT_FILE_TIMEOUT`-overridable and
+  `validate.yml` sets 900 for the slt lane (with a 300-minute lane timeout,
+  since the honest runtime is long on that hardware).
+- [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
+  first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
+  …) are inside the ~347 documented standing failures of the 93.7% baseline
+  (§ "pgjdbc gauge — remaining clusters"), not new. The lane fails because
+  `pgjdbc_validation/runner.py` returns **gradle's raw exit code**, and
+  gradle exits non-zero while ANY test fails — so until the remaining
+  clusters reach 100%, the lane can never be green and its red tells you
+  nothing. Fix needs a baseline-aware exit (compare the JUnit-XML failure
+  set / pass-rate against the committed report and fail only on
+  regression — the policy of what counts as a regression is worth a
+  deliberate call, not an inline guess). Until then, read the pgjdbc lane's
+  report artifact, not its conclusion.
