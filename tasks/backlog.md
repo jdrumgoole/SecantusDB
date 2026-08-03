@@ -4969,3 +4969,27 @@ without a base table — likely the pipeline/evaluated path, which builds its
 columns from `(name, tag)` pairs with no Column object to carry the identity),
 a timestamp-precision mismatch, an `INSERT has 2 values but 3 columns`, and a
 "resultset tuples, but no field structure" protocol complaint.
+
+## Cached-plan invalidation on DDL (2026-08-03)
+
+Postgres caches a prepared statement's plan. When DDL changes a table so the
+statement's result type would differ, re-executing it fails with
+
+```
+0A000  cached plan must not change result type
+```
+
+which aborts the transaction. We re-plan on every execute, so the statement
+just succeeds with the new shape and the transaction lives on.
+
+This is the last cluster in pgjdbc's `AutoRollbackTest` (8 of its original 24 —
+the other 16 were the transaction-abort and `DEALLOCATE ALL` command-tag pair,
+both now fixed). Its assertion reads "autosave=NEVER + flushCacheOnDdl=false,
+thus the transaction should be killed".
+
+Sketch: record each prepared statement's described column shape at Parse, and a
+catalog generation counter bumped by any DDL. On Execute, only when the
+generation has moved since the statement was prepared, re-derive the shape and
+compare — so the common path costs one integer comparison and DDL, which is
+rare, pays for the re-describe. Raise `feature_not_supported` with Postgres'
+exact wording, since drivers match on the message as well as the SQLSTATE.
