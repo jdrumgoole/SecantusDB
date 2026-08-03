@@ -5092,7 +5092,7 @@ statement behind each error, and read what the driver actually sent. The test
 parameterises over zones and over binary vs text transfer, so capture which
 combination each failure comes from before changing a conversion.
 
-## `timestamptz` ignores the session time zone entirely (2026-08-03)
+## `timestamptz` and the session time zone (2026-08-03) — CONVERSION LANDED
 
 `SET TIME ZONE` now reaches the GUC (it was a no-op — see the fix landed with
 this entry), but nothing *reads* it. A `timestamptz` is stored and rendered as
@@ -5150,3 +5150,35 @@ Fix by ordering the child's own writes: flush and close the logfile before
 recording completion in the journal, so "finished" implies "log complete".
 Tightening only the test (polling until the text appears) would hide the case
 a real user can hit.
+
+### Conversion landed; DateTest and TimezoneTest still do not move
+
+All three parts sketched above are implemented and pinned by
+`tests/test_sql_timestamptz_zone.py`:
+
+* an offset-less literal is now local time in the session zone, not UTC;
+* rendering converts to the session zone and uses Postgres' offset spelling
+  (`+00`, `-05`, but `+05:30` when the minutes matter);
+* `GMT+13` resolves to UTC-13, built as a fixed offset because zoneinfo's
+  `Etc/GMT±N` stops at 12 while Postgres accepts more.
+
+Verified against PostgreSQL 14.13 across GMT / GMT+13 / America/New_York /
+Asia/Kolkata, end to end through the wire as well as at the type layer, and
+`date` / `timestamp` columns confirmed to stay zone-independent.
+
+**`DateTest` is still 21 and `TimezoneTest` still 7.** Server-side behaviour
+now matches Postgres for every case reachable from SQL, so what remains is in
+the client's own conversion and cannot be seen from the server. Ruled out so
+far: input interpretation, output rendering, offset spelling, zone resolution
+including the POSIX sign, and any zone sensitivity in `date` / `timestamp`.
+
+Next step is to see the exchange rather than the endpoints: run `DateTest`
+alone with the server logging every statement AND the bytes of each
+DataRow/RowDescription for the date columns, then compare against the same
+capture from a real `postgres` on the same port. The remaining difference is
+likely one of: the `TimeZone` reported in the startup ParameterStatus (pgjdbc
+seeds its calendar from it before issuing any SET), binary vs text transfer
+for `date` (the test parameterises over both and binary dates are days since
+2000-01-01, where an off-by-one is a different bug from a zone shift), or the
+integer date value itself for the year-101 case, whose ~2-year gap no zone
+explains.
