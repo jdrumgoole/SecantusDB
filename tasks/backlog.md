@@ -5038,24 +5038,28 @@ distinct problems, triaged from the run logs:
   `actions/cache/save`, so even a failed/killed run persists the compiled
   target; (3) the `validate` job carries `timeout-minutes: 120` so any future
   wedge fails fast instead of burning six runner-hours per lane.
-- [ ] **`slt` gauge regression (2026-08-03: 40/60 lane files, was green
-  2026-07-27).** The `postgres-extended` `index/*` and `random/*` lanes now
-  FAIL at the 300s per-file timeout (orderby/between/commute/delete/in,
-  random/aggregates/expr/groupby/select — ~15 files), while the same files'
-  `postgres` (simple-protocol) lanes pass. Timing, not correctness: each file
-  runs to the 300s wall. Prime suspects are the 2026-08-01/02 SQL slices —
-  the UNIQUE-across-transactions fix adds a committed-state probe
-  (`find_matching_committed`, a fresh-session read per INSERT into a table
-  with a unique index) and the numeric-exactness slice touches the literal /
-  expression path — both sit squarely on the extended-protocol insert loop
-  these lanes hammer. Reproduce locally with `invoke validate-slt` and
-  bisect across `6ab48c3f..614de048` before blaming either slice
-  (git-blame-first rule).
-- [ ] **`pgjdbc` gauge regression (2026-08-03: exit 1, was green
-  2026-07-27).** New failure clusters: `ArrayTest.testNonStandardBounds` /
-  `testUnknownArrayType`, and a wide `AutoRollbackTest` sweep
-  (`autosave=NEVER + flushCacheOnDdl=false, thus the transaction should be
-  killed` — the failed-transaction / DDL-invalidation semantics the
-  2026-08-01 UNIQUE/transaction work touched). Same bisect window and
-  discipline as the slt entry; the two regressions likely share a root
-  cause.
+- ~~**`slt` gauge "regression"**~~ — NOT a regression; **timeout calibration,
+  fixed (rust-gauge-wedge slice).** 2026-08-03 was the slt lane's FIRST
+  weekly run (the SQL gauge lanes postdate the 2026-07-27 schedule), and the
+  ~15 `postgres-extended` `index/*` / `random/*` files it timed out at 300s
+  pass locally in ~25s each — verified by running
+  `index/orderby/10/slt_good_0.test` against BOTH current main and the
+  2026-07-27 head (`c4873cb0`) on this machine: 24.5s vs 24.4s, byte-same
+  timing, so no server slowdown exists. The 2-core CI runner is simply
+  5-10x slower than the dev machine the 300s cap was calibrated on (its
+  passing `select3.test` extended lane took 277s — right at the wall).
+  `FILE_TIMEOUT_SECONDS` is now `SECANTUS_SLT_FILE_TIMEOUT`-overridable and
+  `validate.yml` sets 900 for the slt lane (with a 300-minute lane timeout,
+  since the honest runtime is long on that hardware).
+- [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
+  first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
+  …) are inside the ~347 documented standing failures of the 93.7% baseline
+  (§ "pgjdbc gauge — remaining clusters"), not new. The lane fails because
+  `pgjdbc_validation/runner.py` returns **gradle's raw exit code**, and
+  gradle exits non-zero while ANY test fails — so until the remaining
+  clusters reach 100%, the lane can never be green and its red tells you
+  nothing. Fix needs a baseline-aware exit (compare the JUnit-XML failure
+  set / pass-rate against the committed report and fail only on
+  regression — the policy of what counts as a regression is worth a
+  deliberate call, not an inline guess). Until then, read the pgjdbc lane's
+  report artifact, not its conclusion.

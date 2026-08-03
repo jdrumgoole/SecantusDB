@@ -30,8 +30,10 @@ jobs:
     # gauge spent two consecutive weekly runs crawling to the 6h kill (cold
     # cargo cache + per-filter timeouts compounding — see rust_validation/
     # runner.py's pre-build note). The slowest healthy lane (cxx cold build)
-    # is ~30-40 min; 2h is generous headroom for any cold cache.
-    timeout-minutes: 120
+    # is ~30-40 min; 2h is generous headroom for any cold cache. Exception:
+    # the slt lane legitimately runs long on the 2-core runner (60 files,
+    # some at several minutes each under the widened per-file timeout below).
+    timeout-minutes: ${{ matrix.driver.name == 'slt' && 300 || 120 }}
     strategy:
       fail-fast: false
       matrix:
@@ -353,6 +355,10 @@ jobs:
           # gauge_common.rust_binary()'s default search only covers the cargo
           # target dir; the storage-engine sync stages the daemon in .venv/bin.
           SECANTUSDB_BIN: ${{ contains(matrix.driver.name, 'rust-server') && '.venv/bin/secantusd-rs' || '' }}
+          # The 2-core runner executes slt files 5-10x slower than a dev
+          # machine; 300s (the local calibration) timed out ~15 files that
+          # pass locally in ~25s each on the first weekly slt run.
+          SECANTUS_SLT_FILE_TIMEOUT: ${{ matrix.driver.name == 'slt' && '900' || '' }}
         run: uv run python -m invoke ${{ matrix.driver.task }}
 
       # Companion of the split restore above: persist the compiled driver
