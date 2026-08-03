@@ -2165,7 +2165,8 @@ def _deallocate_statement(target: str, session: Session) -> SQLResult:
     them all. Unlike Postgres, deallocating an unknown name is a silent no-op here
     (libpq/psycopg fire speculative DEALLOCATEs during connection cleanup)."""
     wire = getattr(session, "wire_prepared", None)
-    if target.upper() == "ALL":
+    is_all = target.upper() == "ALL"
+    if is_all:
         session.prepared.clear()
         if wire is not None:
             # The extended protocol's server-side prepared statements clear
@@ -2177,7 +2178,12 @@ def _deallocate_statement(target: str, session: Session) -> SQLResult:
         session.prepared.pop(name, None)
         if wire is not None:
             wire.pop(name, None)
-    return SQLResult(command_tag="DEALLOCATE")
+    # Postgres reports "DEALLOCATE ALL" for the ALL form, and drivers key off
+    # that exact tag: pgjdbc's QueryExecutor watches for it to learn that its
+    # server-side statement cache is gone and re-Parse. Reporting a bare
+    # "DEALLOCATE" left it executing statement names the server had dropped,
+    # which surfaced as `prepared statement "S_5" does not exist`.
+    return SQLResult(command_tag="DEALLOCATE ALL" if is_all else "DEALLOCATE")
 
 
 def _validate_locks(stmt: exp.Select) -> None:

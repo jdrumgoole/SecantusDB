@@ -984,6 +984,7 @@ class ExtendedSession:
             self.skip_until_sync = True
             return pgwire.error_response("08P01", f"unexpected message type '{msg_type}'")
         except errors.SQLError as exc:
+            self._poison_transaction()
             self.skip_until_sync = True
             return pgwire.error_response(
                 exc.sqlstate,
@@ -994,6 +995,7 @@ class ExtendedSession:
             )
         except Exception:  # pragma: no cover - defensive
             logger.exception("error in extended protocol")
+            self._poison_transaction()
             self.skip_until_sync = True
             # Generic wire message; full detail stays in the server log — don't
             # leak the raw Python exception text to the client. (§I17)
@@ -1008,6 +1010,21 @@ class ExtendedSession:
         return contextlib.nullcontext()
 
     # -- handlers ----------------------------------------------------------- #
+
+    def _poison_transaction(self) -> None:
+        """Mark an open transaction aborted after an error, as Postgres does.
+
+        Any error inside a transaction block aborts it: every later statement
+        fails with 25P02 until ROLLBACK. The engine already does this for
+        errors raised while running a statement, but an error raised HERE — a
+        missing prepared statement or portal, a Bind that cannot decode a
+        parameter, a Describe on a bad name — never reached that path, so the
+        block carried on as if nothing had happened. pgjdbc leans on it: after
+        DEALLOCATE ALL invalidates its cached statements, the failed re-execute
+        is expected to kill the transaction.
+        """
+        if self.session.txn_handle is not None:
+            self.session.txn_failed = True
 
     def _parse(self, payload: bytes) -> bytes:
         name, query, oids = pgwire.parse_parse(payload, self.session.wire_encoding)

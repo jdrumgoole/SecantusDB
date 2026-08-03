@@ -143,7 +143,9 @@ def test_deallocate_all(fresh):
     _run(st, sess, "PREPARE a AS SELECT 1")
     _run(st, sess, "PREPARE b AS SELECT 2")
     r = _run(st, sess, "DEALLOCATE ALL")
-    assert r.command_tag == "DEALLOCATE"
+    # Postgres tags the ALL form "DEALLOCATE ALL" (checked against 14.13), and
+    # drivers key off that exact string to know their statement cache is gone.
+    assert r.command_tag == "DEALLOCATE ALL"
     assert sess.prepared == {}
 
 
