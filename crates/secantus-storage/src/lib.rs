@@ -627,13 +627,16 @@ fn ensure_oplog_shard(
 /// old single-table walk.
 fn read_oplog_shards(
     session: &Session,
+    existing: u32,
     start_seq: i64,
     limit: usize,
 ) -> Result<Vec<(i64, Vec<u8>)>> {
-    Ok(read_oplog_shards_tagged(session, start_seq, limit)?
-        .into_iter()
-        .map(|(seq, _tbl, blob)| (seq, blob))
-        .collect())
+    Ok(
+        read_oplog_shards_tagged(session, existing, start_seq, limit)?
+            .into_iter()
+            .map(|(seq, _tbl, blob)| (seq, blob))
+            .collect(),
+    )
 }
 
 /// Every table an oplog reader / point-op must consider: the N shards followed by
@@ -647,12 +650,41 @@ fn oplog_all_tables() -> Vec<String> {
         .collect()
 }
 
+/// Probe which oplog shard tables actually exist, as a bitmask (bit i = shard
+/// i). Run once at open to seed `oplog_shards_created`: shards are created
+/// lazily on first write and the routing default touches only
+/// [`oplog_route_shards`] of the [`OPLOG_SHARDS`] possible tables, so on a
+/// typical store 14+ of the 17 tables an oplog merge "considers" do not
+/// exist. Pre-seeding lets every merge skip the absent ones outright instead
+/// of paying a failed `open_cursor` (a WT schema-table lookup + error build)
+/// per absent table per call — on the tailable-getMore read path and every
+/// prune sweep. The store is single-process, so a 0 bit after seeding means
+/// definitively absent until THIS process creates it (`ensure_oplog_shard`
+/// sets the bit).
+fn probe_existing_oplog_shards(session: &Session) -> u32 {
+    let mut mask = 0u32;
+    for i in 0..OPLOG_SHARDS {
+        if session.open_cursor(&oplog_shard_name(i), None).is_ok() {
+            mask |= 1u32 << (i as u32);
+        }
+    }
+    mask
+}
+
+/// Whether table index `i` of [`oplog_all_tables`] is known absent under
+/// `existing` (the shard-existence bitmask). The legacy table (index
+/// [`OPLOG_SHARDS`]) is boot-created unconditionally, so it is never skipped.
+fn oplog_table_absent(existing: u32, i: usize) -> bool {
+    i < OPLOG_SHARDS as usize && existing & (1u32 << (i as u32)) == 0
+}
+
 /// Like `read_oplog_shards` but also returns each row's source table index into
 /// `oplog_all_tables()` (0..OPLOG_SHARDS = shard, OPLOG_SHARDS = legacy). Prune
 /// uses the tag to delete each doomed row from its exact table instead of probing
 /// all of them.
 fn read_oplog_shards_tagged(
     session: &Session,
+    existing: u32,
     start_seq: i64,
     limit: usize,
 ) -> Result<Vec<(i64, usize, Vec<u8>)>> {
@@ -665,7 +697,14 @@ fn read_oplog_shards_tagged(
     let mut cursors: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
     // Current head seq of each shard cursor, or None once exhausted.
     let mut heads: Vec<Option<i64>> = Vec::with_capacity(tables.len());
-    for tbl in &tables {
+    for (i, tbl) in tables.iter().enumerate() {
+        if oplog_table_absent(existing, i) {
+            // Known-absent shard (existence mask): skip without the failed
+            // open_cursor probe; reads as empty, index alignment kept.
+            cursors.push(None);
+            heads.push(None);
+            continue;
+        }
         let cur = match session.open_cursor(tbl, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => {
@@ -737,6 +776,7 @@ fn read_oplog_shards_tagged(
 /// `excess.max(retention_batch)` rows exactly like the sweep it replaces.
 fn scan_doomed_oplog_keys(
     session: &Session,
+    existing: u32,
     excess: usize,
     cutoff: i64,
     retention_batch: usize,
@@ -745,7 +785,12 @@ fn scan_doomed_oplog_keys(
     let tables = oplog_all_tables();
     let mut cursors: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
     let mut heads: Vec<Option<i64>> = Vec::with_capacity(tables.len());
-    for tbl in &tables {
+    for (i, tbl) in tables.iter().enumerate() {
+        if oplog_table_absent(existing, i) {
+            cursors.push(None);
+            heads.push(None);
+            continue;
+        }
         let cur = match session.open_cursor(tbl, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => {
@@ -1125,7 +1170,14 @@ enum ResolvedHint {
 /// `file_max=128MB` is kept (see PR #575, mongod-parity Phase 1): with prealloc
 /// off, a production sustained-writer still gets 128 MB active segments while
 /// tiny test DBs cost only what they write.
-const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
+/// `cache_size=4G` is a CAP, not an allocation: WiredTiger fills the cache
+/// lazily, so the thousands of tiny test instances a suite spins up stay
+/// small, while a sustained writer gets the headroom that measured as the
+/// strongest single write-throughput knob (+26% at 8 writers — an eviction-
+/// pressure lever; Findings 6/13). This matches the daemon's and the Python
+/// `RustServer` handle's 4G-cap default, closing the gap where an embedded
+/// library user hit eviction pressure the daemon never would.
+const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=4G,\
                               eviction=(threads_min=4,threads_max=4),\
                               log=(enabled=true,file_max=128MB,prealloc=false),\
                               transaction_sync=(enabled=false,method=fsync)";
@@ -1133,10 +1185,8 @@ const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
 /// Build the WiredTiger connection config string from the tunable knobs the
 /// `secantusdb` daemon exposes (`--cache-size`, `--session-max`,
 /// `--sync-on-commit`). Mirrors `storage.py`'s config assembly and matches
-/// [`DEFAULT_CONFIG`] byte-for-byte for the engine defaults (`"256M"`, `1000`,
-/// `false`) — see the `wt_config_matches_default` test. The `secantusdb`
-/// binary passes the resolved `cache_size` (Python's default is `"1G"`), while
-/// the embedded / library default stays `256M` via [`Storage::open`].
+/// [`DEFAULT_CONFIG`] byte-for-byte for the engine defaults (`"4G"`, `1000`,
+/// `false`) — see the `wt_config_matches_default` test.
 pub fn wt_config(
     cache_size: &str,
     session_max: u32,
@@ -2161,6 +2211,9 @@ pub struct Storage {
     /// async drainer pool which owns the opportunistic cadence in async mode.
     /// See [`PruneCtx`] / [`prune_oplog_sweep`].
     prune_ctx: Arc<PruneCtx>,
+    /// The background oplog pruner (see [`spawn_oplog_pruner`]); joined on
+    /// Drop before the WT connection closes.
+    prune_join: Mutex<Option<JoinHandle<()>>>,
     /// Per-insert discriminator for timeseries doc-table keys (see
     /// `timeseries_doc_suffix`). Wraps at 16 bits; combined with a nanosecond
     /// timestamp it keeps duplicate-`_id` rows distinct across reopens.
@@ -2447,6 +2500,65 @@ struct PruneCtx {
     data_nonlogged: bool,
     stable_seq: Arc<AtomicI64>,
     checkpoint_requested: Arc<AtomicBool>,
+    /// Shard-existence mask (shared with `Storage.oplog_shards_created`) so
+    /// the sweep's merges skip known-absent shard tables.
+    shards_created: Arc<AtomicU32>,
+    /// Background-pruner wakeup: the write paths set the flag + notify when
+    /// the opportunistic cadence crosses (sync emit path and async drainers
+    /// alike — Finding 12 measured the inline sweep at ~36% of the sync
+    /// insert path under sustained cap pressure; the sweep belongs off every
+    /// hot path). The pruner thread also wakes periodically as a retention
+    /// backstop.
+    wake_flag: Mutex<bool>,
+    wake_cv: Condvar,
+    stop: AtomicBool,
+}
+
+/// Signal the background pruner that a sweep is due (opportunistic cadence
+/// crossing). Cheap: one small mutex + notify; the sweep itself runs on the
+/// pruner thread.
+fn signal_oplog_prune(ctx: &PruneCtx) {
+    let mut due = ctx.wake_flag.lock().unwrap_or_else(|e| e.into_inner());
+    *due = true;
+    ctx.wake_cv.notify_one();
+}
+
+/// Background oplog pruner: runs [`prune_oplog_sweep`] whenever a write path
+/// signals the opportunistic cadence (and every `PRUNE_BACKSTOP_SECS` as a
+/// retention backstop), keeping the sweep — its k-way key merge, PITR
+/// archiving, and per-row deletes — off the writer and drainer threads
+/// entirely. mongod's analogue is the OplogCapMaintainerThread, which does
+/// the same job for the same reason. Sweep failures are loud (a database
+/// never steps over a storage error) and retried on the next wake.
+fn spawn_oplog_pruner(ctx: Arc<PruneCtx>) -> JoinHandle<()> {
+    const PRUNE_BACKSTOP_SECS: u64 = 10;
+    thread::Builder::new()
+        .name("secantus-oplog-pruner".into())
+        .spawn(move || loop {
+            // Wait for a cadence signal, the backstop timeout, or stop; clear
+            // the flag under the lock either way. A timed-out wake with no
+            // signal is the retention backstop — the sweep runs regardless
+            // (it early-outs in one bounded read when there is nothing to do).
+            {
+                let guard = ctx.wake_flag.lock().unwrap_or_else(|e| e.into_inner());
+                let (mut guard, _timed_out) = ctx
+                    .wake_cv
+                    .wait_timeout_while(
+                        guard,
+                        std::time::Duration::from_secs(PRUNE_BACKSTOP_SECS),
+                        |due| !*due && !ctx.stop.load(Ordering::Acquire),
+                    )
+                    .unwrap_or_else(|e| e.into_inner());
+                *guard = false;
+            }
+            if ctx.stop.load(Ordering::Acquire) {
+                return;
+            }
+            if let Err(e) = prune_oplog_sweep(&ctx, None) {
+                eprintln!("secantus-storage: background oplog prune failed: {e:?}");
+            }
+        })
+        .expect("spawn secantus-oplog-pruner")
 }
 
 /// Shared state a drainer advances so change-stream tailers can observe progress:
@@ -2605,13 +2717,12 @@ fn persist_and_record(
     None
 }
 
-/// Opportunistic prune from a drainer that just crossed the persisted-rows
-/// cadence boundary. Best-effort — the entries are already durable, so a
-/// sweep failure must not fail the drain; the next boundary retries.
+/// Opportunistic prune signal from a drainer that just crossed the
+/// persisted-rows cadence boundary — hand the sweep to the background
+/// pruner so the drainer stays on its persist loop (a sweep here delayed
+/// draining and cost ~6% at 8 writers, Finding 17).
 fn run_drainer_prune(shared: &DrainerShared) {
-    if let Err(e) = prune_oplog_sweep(&shared.prune, None) {
-        eprintln!("secantus-storage: async oplog opportunistic prune failed: {e:?}");
-    }
+    signal_oplog_prune(&shared.prune);
 }
 
 /// Write a coalesced group of batches (possibly spanning several of this
@@ -3112,6 +3223,26 @@ impl Drop for Storage {
     /// logged, never silent: in a database a close-time write error is a
     /// durability signal.
     fn drop(&mut self) {
+        // Stop the background oplog pruner first: it opens WT sessions, so it
+        // must be gone before the connection closes below. A parked pruner
+        // wakes on the notify; a mid-sweep one finishes its bounded sweep.
+        self.prune_ctx.stop.store(true, Ordering::Release);
+        {
+            let _g = self
+                .prune_ctx
+                .wake_flag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.prune_ctx.wake_cv.notify_one();
+        }
+        if let Some(h) = self
+            .prune_join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = h.join();
+        }
         // Phase A': stop the periodic stable-checkpoint thread before any
         // teardown (it holds no locks between ticks; a 250ms tick bounds the
         // join). The close path below takes its own final checkpoint, and for
@@ -3304,7 +3435,15 @@ impl Storage {
         state.written_seq = state.next_seq - 1;
         let oplog = Arc::new(Mutex::new(state));
         let oplog_cv = Arc::new(Condvar::new());
-        let oplog_shards_created = Arc::new(AtomicU32::new(0));
+        // Seed the shard-existence mask by probing once at open (shards are
+        // lazy-created; on a typical store most of the 16 never exist), so
+        // every oplog merge skips the absent tables without a failed
+        // open_cursor per table per call. Single-process store: a 0 bit
+        // stays honest until this process itself creates the shard.
+        let oplog_shards_created = {
+            let session = conn.open_session()?;
+            Arc::new(AtomicU32::new(probe_existing_oplog_shards(&session)))
+        };
         // Phase A': resolve the data-logging mode. The stable marker (written
         // at every stable checkpoint) is authoritative for an existing store —
         // table logging config is create-time-sticky, so flipping the env var
@@ -3337,7 +3476,12 @@ impl Storage {
             data_nonlogged,
             stable_seq: stable_seq.clone(),
             checkpoint_requested: checkpoint_requested.clone(),
+            shards_created: oplog_shards_created.clone(),
+            wake_flag: Mutex::new(false),
+            wake_cv: Condvar::new(),
+            stop: AtomicBool::new(false),
         });
+        let prune_join = Mutex::new(Some(spawn_oplog_pruner(prune_ctx.clone())));
         // Opt-in: spawn the background drainer pool (option, else
         // SECANTUS_OPLOG_ASYNC). The synchronous, atomic path is the default.
         let async_oplog = if oplog_async_on {
@@ -3362,6 +3506,7 @@ impl Storage {
             oplog,
             oplog_cv,
             prune_ctx,
+            prune_join,
             ts_suffix_counter: AtomicU64::new(0),
             // Unlogged data tables are only as durable as their last
             // checkpoint, so the close-time checkpoint is NOT optional in this
@@ -3846,16 +3991,13 @@ impl Storage {
             }
         };
         // Opportunistically bound the oplog from write volume alone (mirrors
-        // `storage._emit_oplog`'s every-1000-emits prune). Sweep exclusivity
-        // comes from `oplog_prune_lock` inside `prune_oplog_inner` — the
-        // caller holds only its collection lock here, and the prune must not
-        // touch the global lock (lock order). Best-effort: the write already
-        // committed, so a prune failure must not fail the write — the next
-        // sweep retries.
+        // `storage._emit_oplog`'s every-1000-emits cadence) — but the SWEEP
+        // runs on the background pruner, not here: inline it was ~36% of the
+        // whole sync insert path under sustained cap pressure (Finding 12 —
+        // every insert paid a share of the k-way merge + per-row deletes).
+        // The signal is one small mutex + notify.
         if do_prune {
-            if let Err(e) = self.prune_oplog_inner(None) {
-                debug_assert!(false, "opportunistic prune_oplog failed: {e:?}");
-            }
+            signal_oplog_prune(&self.prune_ctx);
         }
         Ok(last)
     }
@@ -4119,7 +4261,12 @@ impl Storage {
         // change-stream getMore path, so serialising it against every write
         // would needlessly throttle throughput.
         let session = self.conn.open_session()?;
-        let mut rows = read_oplog_shards(&session, start_seq, limit)?;
+        let mut rows = read_oplog_shards(
+            &session,
+            self.oplog_shards_created.load(Ordering::Relaxed),
+            start_seq,
+            limit,
+        )?;
         if let Some(cut) = rows.iter().position(|(seq, _)| *seq > max_seq) {
             rows.truncate(cut);
         }
@@ -4247,8 +4394,12 @@ impl Storage {
         // (+ the legacy table). Each shard's `next()` from the start lands on its
         // minimum.
         let session = self.conn.open_session()?;
+        let existing = self.oplog_shards_created.load(Ordering::Relaxed);
         let mut floor: Option<i64> = None;
         for s in 0..OPLOG_SHARDS {
+            if oplog_table_absent(existing, s as usize) {
+                continue; // existence mask: known-absent shard
+            }
             let cur = match session.open_cursor(&oplog_shard_name(s), None) {
                 Ok(c) => c,
                 Err(e) if e.is_missing_table() => continue, // lazy shards: absent = empty
@@ -4565,6 +4716,7 @@ impl Storage {
     /// reads — a row that vanished concurrently is skipped.
     fn archive_doomed_oplog(
         session: &Session,
+        existing: u32,
         archive_dir: &str,
         doomed_sorted: &[i64],
     ) -> Result<()> {
@@ -4573,10 +4725,15 @@ impl Storage {
         // cursor cache; `search()` (a read) reports not-found honestly regardless
         // of overwrite mode.
         let tables = oplog_all_tables();
-        // Pre-open one cursor per table; a lazily-absent shard parks a `None`
-        // (reads as empty) — index stays aligned with `tables`.
+        // Pre-open one cursor per table; a known-absent (existence mask) or
+        // lazily-absent shard parks a `None` (reads as empty) — index stays
+        // aligned with `tables`.
         let mut op_curs: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
-        for name in &tables {
+        for (i, name) in tables.iter().enumerate() {
+            if oplog_table_absent(existing, i) {
+                op_curs.push(None);
+                continue;
+            }
             op_curs.push(match session.open_cursor(name, None) {
                 Ok(c) => Some(c),
                 Err(e) if e.is_missing_table() => None,
@@ -4881,6 +5038,7 @@ impl Storage {
 /// sweep without a `Storage` borrow.
 fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     let _p = ctx.prune_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let existing = ctx.shards_created.load(Ordering::Relaxed);
     let session = ctx.conn.open_session()?;
     let when = now.unwrap_or_else(now_secs);
     let cutoff = when - ctx.retention_seconds.load(Ordering::Relaxed);
@@ -4902,7 +5060,7 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     // in-window, nothing is doomed. One bounded merge read of a single row
     // replaces the whole-oplog walk in the common steady state.
     if excess == 0 {
-        match read_oplog_shards_tagged(&session, 0, 1)?.first() {
+        match read_oplog_shards_tagged(&session, existing, 0, 1)?.first() {
             None => return Ok(0),
             Some((_, _, blob)) => {
                 if matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) >= cutoff) {
@@ -4933,7 +5091,14 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     } else {
         i64::MAX
     };
-    let doomed = scan_doomed_oplog_keys(&session, excess, cutoff, RETENTION_SCAN_BATCH, ceiling)?;
+    let doomed = scan_doomed_oplog_keys(
+        &session,
+        existing,
+        excess,
+        cutoff,
+        RETENTION_SCAN_BATCH,
+        ceiling,
+    )?;
     if ctx.data_nonlogged && excess > 0 && doomed.len() < excess {
         // The clamp blocked part of a genuine cap excess: demand an anchor
         // so the stable seq advances and the next sweep can trim. Without
@@ -4955,7 +5120,7 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     if let Some(archive_dir) = archive_dir {
-        Storage::archive_doomed_oplog(&session, &archive_dir, &doomed_seqs)?;
+        Storage::archive_doomed_oplog(&session, existing, &archive_dir, &doomed_seqs)?;
     }
 
     // Phase 2: the deletes. Sweep exclusivity is already held
@@ -5053,7 +5218,12 @@ impl Storage {
     /// session (see `read_oplog`).
     fn find_seq_for_ts_scan(&self, ts: bson::Timestamp) -> Result<i64> {
         let session = self.conn.open_session()?;
-        for (seq, blob) in read_oplog_shards(&session, 0, usize::MAX)? {
+        for (seq, blob) in read_oplog_shards(
+            &session,
+            self.oplog_shards_created.load(Ordering::Relaxed),
+            0,
+            usize::MAX,
+        )? {
             if let Some(e) = peek_entry_ts(&blob) {
                 if e.time > ts.time || (e.time == ts.time && e.increment >= ts.increment) {
                     return Ok(seq);
@@ -10129,7 +10299,7 @@ mod tests {
     /// `DEFAULT_CONFIG` string so `Storage::open` behaviour is unchanged.
     #[test]
     fn wt_config_matches_default() {
-        assert_eq!(wt_config("256M", 1000, false, "128MB"), DEFAULT_CONFIG);
+        assert_eq!(wt_config("4G", 1000, false, "128MB"), DEFAULT_CONFIG);
     }
 
     /// `extract_key_format` pulls the format token out of a WT metadata line,

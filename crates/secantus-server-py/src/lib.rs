@@ -114,9 +114,10 @@ impl RustServer {
             PyRuntimeError::new_err(format!("failed to create storage dir {storage_path}: {e}"))
         })?;
         // Defaults match `python -m secantus`, the Python `SecantusDBServer`,
-        // and the standalone `secantusdb` binary (4G cache cap; the engine's own
-        // `Storage::open` default stays 256M). Each knob is overridable per
-        // handle so tests can exercise non-default WiredTiger configs.
+        // the standalone `secantusdb` binary, AND the engine's own
+        // `Storage::open` (all 4G cache cap — WiredTiger fills lazily). Each
+        // knob is overridable per handle so tests can exercise non-default
+        // WiredTiger configs.
         let mut storage = Storage::open_with_options(
             storage_path,
             &StorageOptions {

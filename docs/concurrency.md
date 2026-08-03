@@ -291,10 +291,10 @@ SecantusDB, the levers are:
    `SECANTUS_WT_CONFIG_EXTRA` appends raw WT connection config
    (last-key-wins). A larger `cache_size` is the strongest single
    knob under sustained writes (+26% at eight writers in the
-   Finding-13 sweep) — the daemon and the Python `RustServer` handle
-   now default to a 4G cache *cap* (WiredTiger fills it lazily, so
-   idle test servers stay small; `--cache-size` / `cache_size=`
-   overrides). Two cautions from the same sweep, post prune-fix:
+   Finding-13 sweep) — the daemon, the Python `RustServer` handle,
+   and the embedded Rust `Storage` library all default to a 4G cache
+   *cap* (WiredTiger fills it lazily, so idle test servers stay
+   small; `--cache-size` / `cache_size=` overrides). Two cautions from the same sweep, post prune-fix:
    log pre-allocation (`prealloc=true`) now *hurts* at eight writers
    (−8%; the earlier +8% predates the prune fix), and **never turn
    oplog block compression off** — throughput craters to ~19% of the
