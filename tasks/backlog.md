@@ -4462,12 +4462,21 @@ When you fix one of these, delete the line. When you discover a new one, add it 
   machinery, the rust-coll-locks slice. Re-measure with
   `bench.concurrency --server rust` and refresh docs/concurrency.md.)
 
-- Rust DDL paths (create/drop index, create/drop/rename collection) run
-  autocommit-per-operation under the global+collection locks — a crash
-  mid-DDL can leave orphan index-entry rows (invisible to readers, since
-  the registry row is the commit point, but a space leak). CRUD statements
-  are transactional since the rust-coll-locks slice; wrapping DDL the same
-  way is the remaining piece.
+- ~~Rust DDL paths run autocommit-per-operation~~ — **fixed (rust-backlog-clear
+  slice)**: create/drop index, drop-all-indexes, create/drop/rename collection
+  and dropDatabase now run their row writes (registry, index entries, options,
+  oplog) inside `with_statement_txn` + `retry_write_conflicts`, so a crash
+  mid-DDL can no longer strand orphan index-entry rows. dropDatabase is
+  per-collection transactions (mongod's unit; one db-wide WT transaction could
+  blow the cache dirty limit). WT schema `create` calls inside a wrapped DDL
+  are safe — WiredTiger runs them on an internal session
+  (`__wt_schema_internal_session`), so only an idempotent empty table can leak
+  on a crash. Pinned by `tests/ddl_txn.rs` (DDL joins + rolls back with a user
+  transaction). One residual: a DDL issued *inside* a user (multi-document)
+  transaction bumps the DDL generation (below) at statement end, not at the
+  user-txn commit where its rows become visible — irrelevant today because the
+  command layer never routes drop/rename through a user transaction (mongod
+  prohibits them in transactions too).
 
 ## Concurrency races (found by the concurrent stress suites, 2026-07-16)
 
@@ -4493,24 +4502,32 @@ recorded in that slice's changelog fragment. Still open:
   lock table (like `NotifyHub` / `PreparedXactRegistry`) with blocking waits and
   deadlock detection.
 
-## Rust lock-free reads: DDL-vs-scan wobble (2026-07-17)
+## Rust lock-free reads: DDL-vs-scan wobble (2026-07-17) — FIXED
 
-- A `renameCollection` / `dropCollection` / `dropDatabase` racing a
-  lock-free read can yield a partial result set (the reader walks shared
-  tables while the DDL is mid-copy/mid-delete). Real mongod kills open
-  cursors on drop and errors them; we return the partial page instead. No
-  wrong documents are ever served (every candidate is re-verified) — the
-  divergence is result-set completeness during a concurrent namespace-level
-  DDL. Fix would be a namespace-generation check (bump a counter on DDL,
-  re-check before returning) or reader-visible kill markers.
+- ~~Partial result sets when a rename/drop/dropDatabase races a lock-free
+  read~~ — **fixed (rust-backlog-clear slice)** by the namespace-generation
+  check this entry proposed, made sound by the DDL statement transactions
+  above (a DDL's row writes now commit atomically, so a re-run whose
+  generation held still is a point-in-time answer). `Storage.ddl_generation`
+  is a seqlock-style counter: every namespace DDL holds it odd for its
+  duration (`ddl_generation_scope`, drop-guarded so an error can't stick it
+  odd; sound because DDL serialises on the global lock), and
+  `find_matching_with` / `count_matching` re-run a scan whose generation was
+  odd or moved (`with_ddl_generation_check`, bounded at 5 re-runs so a DDL
+  storm can't livelock a reader). The pre-bump matters: a post-commit-only
+  bump left a window where a reader finished a partial scan and checked the
+  generation before the DDL thread bumped it. Pinned by
+  `tests/concurrent_reads.rs::scans_racing_namespace_ddl_are_never_partial`.
 
 ## Follow-ups from the #451 (concurrency stress suites) review, 2026-07-17
 
-- [ ] **Rust `UpdateOutcome::post_image` is cloned unconditionally** — every
-  single-doc update pays a full `Document` clone even when the caller is a
-  plain `update` that never reads it (the Python side gates on
-  `return_post_images`). Plumb a `want_post_image` flag, or let the raw-BSON
-  serving-path refactor (tasks/rust-perf-findings.md) subsume it.
+- [x] ~~**Rust `UpdateOutcome::post_image` is cloned unconditionally**~~ —
+  fixed (rust-backlog-clear slice): `update_matching` /
+  `update_matching_pipeline` / the command-seam
+  `update_matching_array_filters` / `update_matching_pipeline` take a
+  `want_post_image` flag; only `findAndModify` passes `return_new`, so a
+  plain update no longer pays the per-doc post-image clone (mirrors the
+  Python side's `return_post_images` gating).
 
 ## CI build cost
 
@@ -4637,9 +4654,9 @@ touched:
 
 - **RUSTSEC-2025-0134** — `rustls-pemfile` 2.2.0 unmaintained. Transitive; its
   API folded into `rustls-pki-types`. Clears when the TLS dep chain updates.
-- **RUSTSEC-2026-0190** — `anyhow` 1.0.102 unsound (`Error::downcast_mut()`).
-  Fixed in a later 1.0.x; a plain `cargo update -p anyhow` should clear it — do
-  it next time the relevant lockfiles are regenerated.
+- ~~**RUSTSEC-2026-0190** — `anyhow` unsound~~ — cleared (rust-backlog-clear
+  slice): `cargo update -p anyhow` → 1.0.104 in all four lockfiles
+  (`crates/`, `secantusdb`, `secantus-storage`, `secantus-storage-py`).
 - **RUSTSEC-2026-0196 / -0197** — `cgmath` 0.18.0 unmaintained + `swap_columns`
   UB. Pulled in transitively via the geo/spatial stack (`s2`). No fixed release;
   revisit if the geo dependency is ever swapped.

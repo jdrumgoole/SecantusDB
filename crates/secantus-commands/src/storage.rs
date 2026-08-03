@@ -40,7 +40,9 @@ pub struct UpdateOutcome {
     /// The post-image of a single-doc (`multi == false`) update / upsert,
     /// captured inside the storage write. `findAndModify {new: true}` must
     /// return this rather than re-`find`ing — the re-read races concurrent
-    /// writers and can hand two clients the same "new" document.
+    /// writers and can hand two clients the same "new" document. Captured
+    /// only when the caller passes `want_post_image` — a plain `update`
+    /// never reads it, so it skips the per-doc clone.
     pub post_image: Option<Document>,
 }
 
@@ -264,6 +266,7 @@ pub trait Storage: Send + Sync {
         _let_vars: &Document,
         _collation: Option<&Collation>,
         _validator: Option<&Document>,
+        _want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         self.update_matching(db, coll, filter, update, multi, upsert)
     }
@@ -286,6 +289,7 @@ pub trait Storage: Send + Sync {
         _let_vars: &Document,
         _collation: Option<&Collation>,
         _validator: Option<&Document>,
+        _want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         Err(StorageError::WriteError {
             code: 2,

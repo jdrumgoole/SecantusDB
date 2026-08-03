@@ -177,7 +177,7 @@ impl RustStorage {
             .map_err(to_pyerr)?;
         let err_bytes = errors
             .iter()
-            .map(|e| encode_doc(e))
+            .map(encode_doc)
             .collect::<PyResult<Vec<_>>>()?;
         Ok((
             inserted,
@@ -251,6 +251,7 @@ impl RustStorage {
     /// or a BSON key-spec). Results come back ordered / index-routed per
     /// `find_matching_with`.
     #[pyo3(signature = (db, coll, filter_bytes, sort_bytes=None, hint_name=None, hint_key_spec=None))]
+    #[allow(clippy::too_many_arguments)]
     fn find_matching_with(
         &self,
         py: Python<'_>,
@@ -315,6 +316,7 @@ impl RustStorage {
     /// Apply `update` (BSON) to documents matching `filter`. Returns a
     /// `{matched, modified, upserted_id?}` BSON document (`upserted_id` present
     /// only when an `upsert` inserted a doc).
+    #[allow(clippy::too_many_arguments)]
     fn update_matching(
         &self,
         py: Python<'_>,
@@ -340,6 +342,7 @@ impl RustStorage {
                 &Document::new(),
                 None,
                 None,
+                false,
             )
             .map_err(to_pyerr)?;
         let mut d = Document::new();

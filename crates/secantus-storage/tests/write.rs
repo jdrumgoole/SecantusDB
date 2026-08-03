@@ -65,6 +65,7 @@ fn update_operator_single_match() {
                 &bson::Document::new(),
                 None,
                 None,
+                true,
             )
             .unwrap();
         assert_eq!((out.matched, out.modified, out.upserted_id), (1, 1, None));
@@ -102,6 +103,7 @@ fn update_operator_multi() {
                 &bson::Document::new(),
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(out.matched, 2);
@@ -129,10 +131,13 @@ fn update_no_op_when_unchanged() {
                 &bson::Document::new(),
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(out.matched, 1);
         assert_eq!(out.modified, 0);
+        // A caller that didn't ask for the post-image doesn't pay for it.
+        assert!(out.post_image.is_none());
     });
 }
 
@@ -152,6 +157,7 @@ fn update_replacement_preserves_id() {
                 &bson::Document::new(),
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(out.modified, 1);
@@ -177,11 +183,15 @@ fn update_upsert_inserts_when_no_match() {
                 &bson::Document::new(),
                 None,
                 None,
+                true,
             )
             .unwrap();
         assert_eq!(out.matched, 0);
         assert_eq!(out.modified, 0);
         assert!(out.upserted_id.is_some());
+        // The upsert captures its post-image when asked (fam's new:true).
+        let post = out.post_image.as_ref().expect("post_image for an upsert");
+        assert_eq!(post.get_i32("n").unwrap(), 1);
         // The upserted doc carries the filter's bare-equality seed + the update.
         let all = st.find_matching("app", "c", &doc! {"k": "abc"}).unwrap();
         assert_eq!(all.len(), 1);
@@ -210,6 +220,7 @@ fn update_upsert_uses_subdocument_id_from_filter() {
                 &bson::Document::new(),
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(out.matched, 0);
@@ -243,6 +254,7 @@ fn update_maintains_index_entries() {
             &bson::Document::new(),
             None,
             None,
+            false,
         )
         .unwrap();
         // The index now finds the doc at its new value, not the old one.
@@ -275,6 +287,7 @@ fn update_rejects_unique_conflict() {
             &bson::Document::new(),
             None,
             None,
+            false,
         );
         assert!(err.is_err());
         // The collision left _id:2 unchanged.
@@ -298,6 +311,7 @@ fn update_operator_emits_v2_diff_oplog() {
             &bson::Document::new(),
             None,
             None,
+            false,
         )
         .unwrap();
         st.flush_oplog();
@@ -335,6 +349,7 @@ fn update_replacement_emits_full_doc_oplog() {
             &bson::Document::new(),
             None,
             None,
+            false,
         )
         .unwrap();
         st.flush_oplog();
@@ -477,6 +492,7 @@ fn update_skips_oplog_when_disabled() {
                 &bson::Document::new(),
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(out.modified, 1);

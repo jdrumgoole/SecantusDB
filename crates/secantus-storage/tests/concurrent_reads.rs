@@ -133,3 +133,99 @@ fn readers_stay_consistent_under_write_churn() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A lock-free scan racing a namespace-level DDL (drop / rename) must return a
+/// point-in-time answer: either the whole pre-DDL result set or the post-DDL
+/// one — never a partial splice of the two. The DDL's row writes commit in one
+/// statement transaction and bump the storage's DDL generation; readers re-run
+/// a scan whose generation moved (the DDL-vs-scan wobble fix). The drop and
+/// rename rounds each re-seed, so every observed result must be exactly the
+/// full set or empty.
+#[test]
+fn scans_racing_namespace_ddl_are_never_partial() {
+    let home = temp_home();
+    let st = Arc::new(Storage::open(home.to_str().unwrap()).unwrap());
+    let n_docs = 300usize;
+    let seed = |coll: &str| {
+        for i in 0..n_docs as i32 {
+            st.insert_one("app", coll, &enc(&doc! {"_id": i, "x": 1}))
+                .unwrap();
+        }
+    };
+
+    // Round 1: scans vs drop_collection.
+    seed("dropme");
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let st = Arc::clone(&st);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let hits = st.find_matching("app", "dropme", &doc! {"x": 1}).unwrap();
+                    assert!(
+                        hits.len() == n_docs || hits.is_empty(),
+                        "partial scan racing drop_collection: {} of {} docs",
+                        hits.len(),
+                        n_docs
+                    );
+                    let n = st
+                        .count_matching("app", "dropme", &doc! {"x": 1}, None)
+                        .unwrap();
+                    assert!(
+                        n == n_docs || n == 0,
+                        "partial count racing drop_collection: {n} of {n_docs}"
+                    );
+                }
+            })
+        })
+        .collect();
+    thread::sleep(std::time::Duration::from_millis(30));
+    st.drop_collection("app", "dropme").unwrap();
+    thread::sleep(std::time::Duration::from_millis(30));
+    stop.store(true, Ordering::SeqCst);
+    for h in readers {
+        h.join().expect("reader panicked");
+    }
+
+    // Round 2: scans vs rename_collection (source empties, target fills).
+    seed("src");
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let st = Arc::clone(&st);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let src = st.find_matching("app", "src", &doc! {"x": 1}).unwrap();
+                    assert!(
+                        src.len() == n_docs || src.is_empty(),
+                        "partial scan of rename source: {} of {}",
+                        src.len(),
+                        n_docs
+                    );
+                    let dst = st.find_matching("app", "dst", &doc! {"x": 1}).unwrap();
+                    assert!(
+                        dst.len() == n_docs || dst.is_empty(),
+                        "partial scan of rename target: {} of {}",
+                        dst.len(),
+                        n_docs
+                    );
+                }
+            })
+        })
+        .collect();
+    thread::sleep(std::time::Duration::from_millis(30));
+    let (ok, err) = st
+        .rename_collection("app", "src", "app", "dst", false)
+        .unwrap();
+    assert!(ok, "{err:?}");
+    thread::sleep(std::time::Duration::from_millis(30));
+    stop.store(true, Ordering::SeqCst);
+    for h in readers {
+        h.join().expect("reader panicked");
+    }
+
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -43,6 +43,7 @@ fn inc_by_one(st: &Storage, db: &str, coll: &str, id: i32) {
         &Document::new(),
         None,
         None,
+        false,
     )
     .unwrap();
 }
@@ -238,6 +239,7 @@ fn user_txn_statement_conflict_surfaces_write_conflict() {
                 &Document::new(),
                 None,
                 None,
+                false,
             )
         })
         .unwrap();

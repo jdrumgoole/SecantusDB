@@ -258,6 +258,7 @@ impl CmdStorage for StorageAdapter {
                 &Document::new(),
                 None,
                 None,
+                false,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -281,6 +282,7 @@ impl CmdStorage for StorageAdapter {
         let_vars: &Document,
         collation: Option<&Collation>,
         validator: Option<&Document>,
+        want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
@@ -295,6 +297,7 @@ impl CmdStorage for StorageAdapter {
                 let_vars,
                 collation,
                 validator,
+                want_post_image,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -317,11 +320,21 @@ impl CmdStorage for StorageAdapter {
         let_vars: &Document,
         collation: Option<&Collation>,
         validator: Option<&Document>,
+        want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
             .update_matching_pipeline(
-                db, coll, filter, pipeline, multi, upsert, let_vars, collation, validator,
+                db,
+                coll,
+                filter,
+                pipeline,
+                multi,
+                upsert,
+                let_vars,
+                collation,
+                validator,
+                want_post_image,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
