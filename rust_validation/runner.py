@@ -50,11 +50,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-rust-driver"
 RAW_OUT = REPO_ROOT / ".validation" / f"rust-raw{gauge_common.report_suffix()}.json"
 
-# Hard wall-clock limit on the cargo test invocation. The Rust
+# Hard wall-clock limit on each cargo test invocation. The Rust
 # driver's tests are async and rely on tokio timeouts internally;
 # 600s is generous headroom for the first-cut include set
-# (~14 tests) and grows comfortably as the set widens.
+# (~14 tests) and grows comfortably as the set widens. The compile
+# is paid ONCE up front (`cargo test --no-run`, below) under its own
+# budget so this limit only ever bounds test runtime.
 CARGO_TEST_TIMEOUT_SECONDS = 600.0
+
+# Wall for the one-off test-binary build. A cold cargo cache on a
+# 2-core CI runner takes tens of minutes for the driver + dev-deps;
+# a warm target/ makes this a no-op.
+CARGO_BUILD_TIMEOUT_SECONDS = 3600.0
 
 
 def _free_port() -> int:
@@ -184,6 +191,37 @@ def _run_cargo_tests(uri: str) -> tuple[int, str]:
     env = {**os.environ, "MONGODB_URI": uri}
     parts: list[str] = []
     worst_rc = 0
+    # Compile the test binary BEFORE the per-filter loop, outside the 600s
+    # per-invocation budget. On a cold cargo cache the driver's test build
+    # alone can exceed 600s (2-core CI runner), and letting the first filter's
+    # timeout kill cargo mid-compile forces every later invocation to resume
+    # a partial build inside its own 600s window — the observed failure mode
+    # was the weekly CI job crawling to the 6-hour kill (7 min with a warm
+    # cache). The build gets its own generous wall; the per-filter timeout
+    # then bounds only test RUNTIME, which is what it was meant to bound.
+    build_cmd = ["cargo", "test", "--lib", "-p", "mongodb", "--no-run"]
+    if CARGO_FEATURES:
+        build_cmd.extend(["--features", ",".join(CARGO_FEATURES)])
+    print(
+        f"rust_validation: pre-building the driver test binary in {VENDOR}",
+        file=sys.stderr,
+    )
+    build = subprocess.run(
+        build_cmd,
+        cwd=VENDOR,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=CARGO_BUILD_TIMEOUT_SECONDS,
+    )
+    if build.returncode != 0:
+        # A build failure would fail every invocation identically — surface
+        # it once, loudly, instead of 88 repeated compile errors.
+        return build.returncode, (
+            f"\n=== rust_validation: cargo test --no-run failed "
+            f"(rc={build.returncode}) ===\n{build.stdout}"
+        )
     print(
         f"rust_validation: running cargo test ({len(INCLUDE)} per-filter invocations) in {VENDOR}",
         file=sys.stderr,

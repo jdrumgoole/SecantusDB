@@ -5015,3 +5015,47 @@ generation has moved since the statement was prepared, re-derive the shape and
 compare — so the common path costs one integer comparison and DDL, which is
 rare, pays for the re-describe. Raise `feature_not_supported` with Postgres'
 exact wording, since drivers match on the message as well as the SQLSTATE.
+
+## Weekly validate.yml failures (2026-08-03 triage)
+
+The 2026-07-27 and 2026-08-03 scheduled runs did not finish green. Three
+distinct problems, triaged from the run logs:
+
+- ~~**`rust` gauge (mongo-rust-driver vs the Python server) crawls to the
+  6-hour job kill** — both weeks; 7 minutes on 2026-07-20.~~ **FIXED
+  (rust-gauge-wedge slice).** Root cause was a compounding loop: the cargo
+  cache (populated 2026-07-20) hit the 7-day eviction TTL; the cold run's
+  FIRST per-filter `cargo test` invocation had to compile the whole driver
+  test binary inside the 600s per-invocation timeout, which killed cargo
+  mid-compile, so each of the 88 invocations resumed a partial build inside
+  its own 600s window (log signature: hours-long silent gaps between filter
+  outputs); the job overran the 6h default and was cancelled; and the
+  cancelled job skipped `actions/cache`'s success-only save, so every later
+  weekly run started cold again — a permanent wedge. Fix: (1)
+  `rust_validation/runner.py` pre-builds with `cargo test --no-run` under its
+  own 3600s wall so the 600s limit bounds only test runtime; (2) the cargo
+  cache is split into `actions/cache/restore` + an `if: always()`
+  `actions/cache/save`, so even a failed/killed run persists the compiled
+  target; (3) the `validate` job carries `timeout-minutes: 120` so any future
+  wedge fails fast instead of burning six runner-hours per lane.
+- [ ] **`slt` gauge regression (2026-08-03: 40/60 lane files, was green
+  2026-07-27).** The `postgres-extended` `index/*` and `random/*` lanes now
+  FAIL at the 300s per-file timeout (orderby/between/commute/delete/in,
+  random/aggregates/expr/groupby/select — ~15 files), while the same files'
+  `postgres` (simple-protocol) lanes pass. Timing, not correctness: each file
+  runs to the 300s wall. Prime suspects are the 2026-08-01/02 SQL slices —
+  the UNIQUE-across-transactions fix adds a committed-state probe
+  (`find_matching_committed`, a fresh-session read per INSERT into a table
+  with a unique index) and the numeric-exactness slice touches the literal /
+  expression path — both sit squarely on the extended-protocol insert loop
+  these lanes hammer. Reproduce locally with `invoke validate-slt` and
+  bisect across `6ab48c3f..614de048` before blaming either slice
+  (git-blame-first rule).
+- [ ] **`pgjdbc` gauge regression (2026-08-03: exit 1, was green
+  2026-07-27).** New failure clusters: `ArrayTest.testNonStandardBounds` /
+  `testUnknownArrayType`, and a wide `AutoRollbackTest` sweep
+  (`autosave=NEVER + flushCacheOnDdl=false, thus the transaction should be
+  killed` — the failed-transaction / DDL-invalidation semantics the
+  2026-08-01 UNIQUE/transaction work touched). Same bisect window and
+  discipline as the slt entry; the two regressions likely share a root
+  cause.
