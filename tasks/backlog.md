@@ -5182,3 +5182,48 @@ for `date` (the test parameterises over both and binary dates are days since
 2000-01-01, where an off-by-one is a different bug from a zone shift), or the
 integer date value itself for the year-101 case, whose ~2-year gap no zone
 explains.
+
+## DateTest, settled by a wire capture (2026-08-04)
+
+A logging TCP proxy between pgjdbc and each backend, running the SAME driver
+against SecantusDB and a real PostgreSQL 14.13, produced two 3738-row captures
+(real PG 192/192, ours 171/21) that can be diffed directly. Harness kept at
+`scratchpad/pgproxy.py` + `capture.py`; two gotchas worth knowing if it is
+rebuilt: the client's SSLRequest is answered with a BARE byte, not a framed
+message, and a decode error inside the proxy must never propagate — it killed
+live connections and made every test fail against BOTH backends, which is what
+gave the harness away rather than the servers.
+
+The diff isolated three things. The one FIXED with this entry:
+
+**A `timestamptz` value narrowed to `timestamp` must convert through the
+session zone.** Postgres distinguishes a text literal from a value:
+
+```sql
+SET TIME ZONE 'America/New_York';
+SELECT '1950-02-07 00:00:00+02'::timestamp;                -- 1950-02-07 00:00:00
+SELECT ('1950-02-07 00:00:00+02'::timestamptz)::timestamp;  -- 1950-02-06 17:00:00
+```
+
+A literal has its offset discarded and its wall clock kept; a value is an
+instant and converts. We applied the literal rule to both.
+
+Still open, both now precisely located:
+
+1. **The declared parameter type is lost before coercion.** psycobg/pgjdbc send
+   a timestamptz parameter having already converted to UTC and DECLARED oid
+   1184; Postgres therefore does a value conversion into a `timestamp` column,
+   while we see only a text string plus the column's tag and apply the literal
+   rule. Result: `'1950-02-07'` bound under America/New_York stores
+   `1950-02-07 05:00:00` where Postgres stores `1950-02-07 00:00:00`. The fix
+   is to thread the bound parameter's declared oid into `typemap.coerce` so a
+   1184 parameter is treated as a value, not a literal. The type-layer half of
+   this is already correct and tested — only the wire path loses the type.
+2. **BC timestamps carry an offset we should not emit.** Ours renders
+   `'0101-01-01 00:00:00+00 BC'`, Postgres `'0101-01-01 00:00:00 BC'`, for a
+   plain `timestamp` column. That is the 7-failure year-101 group, and it is a
+   rendering bug in the wide/BC path rather than anything calendrical — the
+   "~2 years out" reading recorded earlier was an artefact of comparing
+   different strings, not a Julian/Gregorian divergence.
+3. Binary-format timestamps differ in the same runs (`0xfff62bc7cff01f00` vs
+   `0xfff62bc763752000`), consistent with (1) rather than a separate bug.
