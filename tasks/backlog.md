@@ -5130,3 +5130,23 @@ offsets, the same date wrong in both directions) is in the section above and is
 consistent with this being the cause: with no zone conversion, whether a
 midnight-local date lands a day early or late depends only on the sign of the
 client's own zone.
+
+## Ops Board: a finished job can show an empty log (2026-08-03)
+
+`tests/test_opsboard.py::test_job_log_tail_captures_child_output` failed once on
+a macOS CI lane with the job recorded as `passed · exit 0` but its log reading
+`(no output yet)`. It passes locally and on every other lane, so the window is
+narrow — but this is a product race, not merely a flaky test.
+
+A job runs as a DETACHED child that writes to a shared journal and a logfile
+(`opsboard/runner.py`). Nothing orders the child's final log flush before its
+journal completion record, so a reader can observe "finished" while the log
+write has not landed. **The page then stops polling** — the template only emits
+its `every 1s` trigger while the job is running — so a viewer who refreshes in
+that window is left with a permanently empty log for a job that did produce
+output.
+
+Fix by ordering the child's own writes: flush and close the logfile before
+recording completion in the journal, so "finished" implies "log complete".
+Tightening only the test (polling until the text appears) would hide the case
+a real user can hit.
