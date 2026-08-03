@@ -179,10 +179,17 @@ _WIDE_TS_RE = re.compile(
 )
 
 
-def wide_timestamp_text(v: Any) -> str | None:
+def wide_timestamp_text(v: Any, *, drop_offset: bool = False) -> str | None:
     """Canonical text for a PG-valid timestamp outside Python's datetime range
     (year > 9999 or a BC date), or None when the value is in-range / malformed.
-    The canonical form is ``YYYY-MM-DD HH:MM:SS[.ffffff][+TZ][ BC]``."""
+    The canonical form is ``YYYY-MM-DD HH:MM:SS[.ffffff][+TZ][ BC]``.
+
+    ``drop_offset`` discards any offset the input carried, which is what a
+    ``timestamp`` (without time zone) column does with one — Postgres keeps the
+    wall-clock fields and forgets the zone. Rendering it back left a BC value
+    reading ``0101-01-01 00:00:00+00 BC`` where Postgres writes
+    ``0101-01-01 00:00:00 BC``.
+    """
     m = _WIDE_TS_RE.match(str(v).strip())
     if m is None:
         return None
@@ -198,7 +205,7 @@ def wide_timestamp_text(v: Any) -> str | None:
     text = f"{y:04d}-{mo:02d}-{d:02d} {hh:02d}:{mi:02d}:{ss:02d}"
     if frac:
         text += f".{frac}"
-    if m.group("sign"):
+    if m.group("sign") and not drop_offset:
         off = f"{m.group('sign')}{int(m.group('oh')):02d}"
         if m.group("om"):
             off += f":{m.group('om')}"

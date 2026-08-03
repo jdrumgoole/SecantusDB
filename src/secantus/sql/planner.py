@@ -411,6 +411,15 @@ def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
             from decimal import Decimal
 
             return value if isinstance(value, Decimal) else Decimal(str(value))
+        if tag == "timestamptz" and not isinstance(value, _dt.datetime):
+            # Resolve to an INSTANT here. A timestamptz-declared bound
+            # parameter is substituted as ``CAST('…' AS timestamptz)``, and
+            # leaving that as text lost the declared type: storing it into a
+            # ``timestamp`` column then applied Postgres' literal rule (drop
+            # the offset, keep the wall clock) where Postgres converts the
+            # value through the session zone. A JDBC client's timestamps were
+            # shifted by the session offset as a result.
+            return typemap.coerce(value, "timestamptz")
     except (TypeError, ValueError):
         return value
     return value

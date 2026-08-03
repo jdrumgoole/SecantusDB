@@ -1139,7 +1139,9 @@ def coerce(value: Any, tag: str) -> Any:
             sentinel = datetime_sentinel(value)
             if sentinel is not None:
                 return sentinel
-            wide = wide_timestamp_text(value)
+            # A "without time zone" column forgets any offset the input
+            # carried, the same as the in-range path below does.
+            wide = wide_timestamp_text(value, drop_offset=True)
             if wide is not None:
                 return wide
         if isinstance(value, _dt.datetime):
