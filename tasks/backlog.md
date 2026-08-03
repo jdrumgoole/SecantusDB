@@ -5091,3 +5091,42 @@ class alone through `pgjdbc_validation` with the server instrumented to log the
 statement behind each error, and read what the driver actually sent. The test
 parameterises over zones and over binary vs text transfer, so capture which
 combination each failure comes from before changing a conversion.
+
+## `timestamptz` ignores the session time zone entirely (2026-08-03)
+
+`SET TIME ZONE` now reaches the GUC (it was a no-op — see the fix landed with
+this entry), but nothing *reads* it. A `timestamptz` is stored and rendered as
+though it were a plain `timestamp`:
+
+| session zone | ours | PostgreSQL 14.13 |
+| --- | --- | --- |
+| `GMT` | `1950-02-07 00:00:00` | `1950-02-07 00:00:00+00` |
+| `GMT+13` | `1950-02-07 00:00:00` | `1950-02-07 00:00:00-13` |
+| `America/New_York` | `1950-02-07 00:00:00` | `1950-02-07 00:00:00-05` |
+
+Identical in every zone, and with no offset at all — so `timestamptz` is
+currently `timestamp` wearing a different type oid.
+
+What a fix needs:
+
+1. **Input.** A literal with no offset is *local time in the session zone*;
+   convert to an absolute instant on the way in. One carrying an offset is
+   already absolute.
+2. **Output.** Render in the session zone, with that zone's offset for the
+   instant in question — historical offsets included, which is exactly what
+   these 1950 test dates are probing.
+3. **`SET TIME ZONE 'GMT+13'` means UTC-13, not UTC+13.** Postgres follows the
+   POSIX sign convention here, and reports `-13`, as the table above shows.
+   Getting this backwards silently doubles the error, so pin it with a test
+   before building on it.
+
+Use `zoneinfo` from the stdlib for named zones. Storage should hold the
+absolute instant; only presentation is zone-dependent.
+
+This blocks pgjdbc's `DateTest` (21) and `TimezoneTest` (7). Note the
+`SET TIME ZONE` fix alone moved NEITHER — the setting sticking is necessary but
+useless until conversion exists. The `DateTest` breakdown (four distinct
+offsets, the same date wrong in both directions) is in the section above and is
+consistent with this being the cause: with no zone conversion, whether a
+midnight-local date lands a day early or late depends only on the sign of the
+client's own zone.
