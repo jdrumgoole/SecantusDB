@@ -4914,7 +4914,7 @@ which is the signal to key off. Check the catalog paths too: table and column
 names created unquoted should also fold, and `pg_catalog` lookups already
 assume lower case.
 
-### Case folding landed; the next blocker is an empty column name
+### Case folding landed; the empty column name that followed is also fixed
 
 Folding happens once in `planner._fold_unquoted_identifiers`, right after the
 parse: every unquoted `Identifier` is lower-cased and quoted ones are left
@@ -4941,3 +4941,31 @@ time here. Log the statement server-side (the `pgserver` query path) during a
 `validate-pgjdbc` run and read back exactly what the driver sent, including
 the parameter placeholders and the `pg_table_is_visible` / `ct.relname = ?`
 clauses that only appear for some call shapes.
+
+### `column "" does not exist` — FIXED (RowDescription source identity)
+
+Found by doing what the note above said: instrumenting the server to log the
+statement behind each SQLError during a `validate-pgjdbc` run, rather than
+reconstructing the query. What the driver actually sent was
+
+```sql
+UPDATE primaryunique SET  "" = $1 WHERE "id" = $2
+```
+
+— pgjdbc had generated the empty column name itself. Its
+`PgResultSetMetaData.getBaseColumnName` returns `""` the moment a field's
+table oid is 0, and we sent 0 for the table oid and 0 for the attnum on every
+RowDescription field. `ColumnDesc` now carries both and the wire encoder emits
+them.
+
+Note the Describe path needed fixing separately from the executed path: the
+extended protocol describes without executing (`engine._describe_statement`),
+and that is the one a JDBC client reads. Fixing only the executed path moved
+nothing, which is why `tests/test_sql_row_description_source.py` covers both.
+
+`UpdateableResultTest` went 24 failures -> 8. The remaining 8 are a mix rather
+than a cluster: two more `column ""` (a select shape that still describes
+without a base table — likely the pipeline/evaluated path, which builds its
+columns from `(name, tag)` pairs with no Column object to carry the identity),
+a timestamp-precision mismatch, an `INSERT has 2 values but 3 columns`, and a
+"resultset tuples, but no field structure" protocol complaint.

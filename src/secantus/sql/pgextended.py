@@ -1257,7 +1257,7 @@ class ExtendedSession:
         if cols is None:
             return pgwire.no_data()
         return pgwire.row_description(
-            [(c.name, c.pg_oid, c.typmod) for c in cols],
+            [(c.name, c.pg_oid, c.typmod, c.table_oid, c.attnum) for c in cols],
             formats,
             encoding=self.session.wire_encoding,
         )

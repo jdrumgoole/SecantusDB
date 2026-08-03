@@ -1433,7 +1433,10 @@ def _describe_statement(
             return None
     if select_plan.count_star:
         return [ColumnDesc(select_plan.count_alias, "int8", typemap.PG_OID["int8"])]
-    return executor._out_column_descs(select_plan.out_columns, storage, db)
+    # The table is passed so RowDescription carries each column's source table
+    # oid and attnum. This is the path the extended protocol describes through,
+    # which is the one a JDBC updatable ResultSet reads to resolve column names.
+    return executor._out_column_descs(select_plan.out_columns, storage, db, table)
 
 
 def _describe_constant_shape(stmt: exp.Select) -> list[ColumnDesc] | None:
