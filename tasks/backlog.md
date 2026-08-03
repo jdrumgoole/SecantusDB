@@ -5034,6 +5034,28 @@ distinct problems, triaged from the run logs:
   `actions/cache/save`, so even a failed/killed run persists the compiled
   target; (3) the `validate` job carries `timeout-minutes: 120` so any future
   wedge fails fast instead of burning six runner-hours per lane.
+- [ ] **REFINED (2026-08-04): the compile loop was only half the wedge —
+  rust-driver tests genuinely hang against the Python server, on the CI
+  runner only.** The 2026-08-03 dispatch (run 30855915756) re-ran the lane
+  with every mechanics fix in place and proved them working: exact-key cache
+  HIT (404MB), pre-build in 51s, filter loop started at +5min — and the lane
+  STILL burned 1h55m in test execution to the 2h cap. Cross-evidence pins
+  the scope precisely: the SAME 88 filters pass against the **Rust** server
+  (`rust-rust-server`) in ~30 min on the same runner; the Python server
+  passes every OTHER driver gauge (pymongo / go / node / java / …) on the
+  same runner; and `invoke validate-rust` on this dev machine, same main
+  SHA, is clean and fast (101 passed / 0 failed / 0 timeouts). So:
+  Python-server × mongo-rust-driver × ubuntu-runner, filters hanging to
+  their 600s timeouts. The green→wedge transition (Jul 20 → Jul 27) has no
+  matching server change (the local 24s-vs-24s slt measurement pattern
+  repeats here) — the `ubuntu-latest` image roll in that window is the
+  standing suspect. The runner now streams per-filter start / rc / elapsed /
+  TIMEOUT lines to stderr (they used to be assembled only at the end, so a
+  killed job's log named nothing), so the NEXT weekly/dispatch run lists
+  exactly which filters hang; diagnose from there (likely a
+  connection-lifecycle or timing interaction specific to the rust driver's
+  handshake against the threaded Python accept loop under the runner's
+  2-core scheduling).
 - ~~**`slt` gauge "regression"**~~ — NOT a regression; **timeout calibration,
   fixed (rust-gauge-wedge slice).** 2026-08-03 was the slt lane's FIRST
   weekly run (the SQL gauge lanes postdate the 2026-07-27 schedule), and the
