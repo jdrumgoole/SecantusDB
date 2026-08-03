@@ -1,8 +1,8 @@
 # pgx (pgconn + pgproto3) conformance report
 
-- SecantusDB (Python server) 0.6.0b6
-- suite: vendor/pgx @ unknown (`go test`, unmodified)
-- generated: 2026-07-31 16:43 UTC
+- SecantusDB (Python server) 0.6.0b9
+- suite: vendor/pgx @ 0aeabbcf11d8 (`go test`, unmodified)
+- generated: 2026-08-03 07:12 UTC
 
 | package | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|

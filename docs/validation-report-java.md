@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-07-30 — SecantusDB 0.6.0b5 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-08-03 — SecantusDB 0.6.0b9 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -13,32 +13,16 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `driver-core__2` | 10 | 0 | 0 | 10 | 100.0% |
-| `driver-sync__0` | 343 | 17 | 400 | 760 | 95.3% |
-| `driver-sync__1` | 77 | 0 | 53 | 130 | 100.0% |
-| **Overall** | **430** | **17** | **453** | **900** | **96.2%** |
+| `driver-sync__0` | 360 | 0 | 400 | 760 | 100.0% |
+| `driver-sync__1` | 76 | 1 | 53 | 130 | 98.7% |
+| **Overall** | **446** | **1** | **453** | **900** | **99.8%** |
 
-## Failures (17)
+## Failures (1)
 
 First 30 failed tests for triage:
 
 ```
-driver-sync__0 :: com.mongodb.client.unified.UnifiedGridFSTest#gridfs-upload: upload when metadata is provided
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndUpdate-errorResponse: findOneAndUpdate DuplicateKey error is accessible
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#findOneAndUpdate-errorResponse: findOneAndUpdate document validation errInfo is accessible
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#aggregate-let: Aggregate with let option
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#aggregate-merge-errorResponse: aggregate $merge DuplicateKey error is accessible
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#deleteOne-errorResponse: delete operations support errorResponse assertions
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#updateOne-sort: updateOne with sort option unsupported (server-side error)
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#insertOne-errorResponse: insert operations support errorResponse assertions
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#estimatedDocumentCount: estimatedDocumentCount errors correctly--command error
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#estimatedDocumentCount: estimatedDocumentCount errors correctly--socket error
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#BulkWrite replaceOne-sort: BulkWrite replaceOne with sort option unsupported (server-side error)
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#updateOne-errorResponse: update operations support errorResponse assertions
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#replaceOne-sort: replaceOne with sort option unsupported (server-side error)
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#bulkWrite-errorResponse: bulkWrite operations support errorResponse assertions
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#insertOne-dots_and_dollars: Inserting document with dotted key in _id on 3.6+ server
-driver-sync__0 :: com.mongodb.client.unified.UnifiedCrudTest#BulkWrite updateOne-sort: BulkWrite updateOne with sort option unsupported (server-side error)
-driver-sync__0 :: com.mongodb.client.MongoCollectionTest#testObjectIdToStringConversion()
+driver-sync__1 :: com.mongodb.client.ClientMetadataTest#client metadata is not propagated to the server: metadata append does not create new connections or close existing ones and no hello command is sent
 ```
 
 ## How this is generated
