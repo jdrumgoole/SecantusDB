@@ -64,6 +64,8 @@ def _widen(s: str) -> str:
 
 
 _TZ_NUM_RE = re.compile(r"^([+-]?)(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?$")
+#: ``GMT+13`` / ``UTC-5`` — a zone name with a POSIX offset suffix.
+_TZ_PREFIXED_RE = re.compile(r"(?i)^(?:GMT|UTC)([+-])(\d{1,2})$")
 
 
 def tzinfo_for_setting(setting: str) -> _dt.tzinfo:
@@ -74,6 +76,18 @@ def tzinfo_for_setting(setting: str) -> _dt.tzinfo:
     s = (setting or "").strip().strip("'\"")
     if not s or s.lower() in ("utc", "gmt"):
         return _dt.timezone.utc
+    # ``GMT+13`` / ``UTC-5`` — Postgres accepts the prefixed POSIX spelling and
+    # keeps the POSIX sign, so GMT+13 is UTC-13. zoneinfo spells those
+    # ``Etc/GMT±N`` with the same inverted sign, so the suffix carries over
+    # unchanged. Checked against PostgreSQL 14.13, which renders GMT+13 as -13.
+    pm = _TZ_PREFIXED_RE.match(s)
+    if pm:
+        # POSIX sign convention, so GMT+13 is UTC-13 (checked against
+        # PostgreSQL 14.13, which renders it as -13). Built as a fixed offset
+        # rather than via zoneinfo's ``Etc/GMT±N``, which stops at ±12 while
+        # Postgres accepts more.
+        hours = int(pm.group(2))
+        return _dt.timezone(_dt.timedelta(hours=-hours if pm.group(1) == "+" else hours))
     m = _TZ_NUM_RE.match(s)
     if m:
         seconds = int(m.group(2)) * 3600 + int(m.group(3) or 0) * 60 + int(m.group(4) or 0)

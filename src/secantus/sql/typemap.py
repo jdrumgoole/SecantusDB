@@ -903,6 +903,49 @@ def _int_or_22p02(value: Any, tag: str) -> int:
         raise _coercion_error(tag, value) from e
 
 
+def _render_timestamp_iso(value: _dt.datetime) -> str:
+    """ISO text with Postgres' offset spelling.
+
+    Python renders a zero-minute offset as ``+00:00``; Postgres writes ``+00``,
+    widening to ``-05:30`` or ``+05:45:12`` only when it must. Clients compare
+    the rendered text — pgjdbc's TimezoneTest asserts ``12:00:00+00`` — so the
+    trailing ``:00`` is not cosmetic.
+    """
+    text = value.isoformat(sep=" ")
+    if value.tzinfo is None:
+        return text
+    head, sign, offset = text.rpartition("+") if "+" in text[10:] else text.rpartition("-")
+    if not sign or ":" not in offset:
+        return text
+    parts = offset.split(":")
+    while len(parts) > 1 and parts[-1] == "00":
+        parts.pop()
+    return f"{head}{sign}{':'.join(parts)}"
+
+
+def _as_session_instant(value: _dt.datetime) -> _dt.datetime:
+    """Resolve a ``timestamptz`` input to an absolute instant.
+
+    A literal carrying no offset is LOCAL TIME IN THE SESSION ZONE, not UTC —
+    ``'1950-02-07'`` under ``America/New_York`` is midnight in New York, which
+    Postgres reports back as ``1950-02-07 00:00:00-05``. Reading it as UTC
+    shifted the value by the zone's offset, so the same date came back a day
+    early or late depending on which side of Greenwich the client sat.
+
+    A value that already carries an offset is absolute and passes through.
+    """
+    if value.tzinfo is not None:
+        return value
+    session = _render_session.get()
+    if session is None:
+        return value  # no connection bound (embedded API): unchanged, i.e. UTC
+    from secantus.sql.datetimes import session_tzinfo
+
+    with contextlib.suppress(OverflowError, ValueError):
+        return value.replace(tzinfo=session_tzinfo(session)).astimezone(_dt.timezone.utc)
+    return value
+
+
 def coerce(value: Any, tag: str) -> Any:
     """Coerce a Python literal to the BSON value stored for column ``tag``.
 
@@ -1044,7 +1087,7 @@ def coerce(value: Any, tag: str) -> Any:
         return bool(value)
     if tag == "timestamptz":
         if isinstance(value, _dt.datetime):
-            return value
+            return _as_session_instant(value)
         # ISO-8601 string literal -> datetime (with the 3.10 short-offset net).
         from secantus.sql.datetimes import (
             datetime_sentinel,
@@ -1058,7 +1101,7 @@ def coerce(value: Any, tag: str) -> Any:
         wide = wide_timestamp_text(value)
         if wide is not None:
             return wide  # PG-valid but beyond Python's datetime range: text
-        return parse_iso_datetime(value)
+        return _as_session_instant(parse_iso_datetime(value))
     if tag == "timestamp":
         # Naive "without time zone": an offset in the input is dropped and the
         # wall-clock fields kept (Postgres timestamp semantics), so the stored /
@@ -1199,7 +1242,7 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
             style, order = render_datestyle()
             if style != "ISO":
                 return _render_timestamp_style(value, style, order).encode("utf-8")
-        return value.isoformat(sep=" ").encode("utf-8")
+        return _render_timestamp_iso(value).encode("utf-8")
     if tag == "date":
         # Dates are stored as canonical ``YYYY-MM-DD`` text; a non-ISO DateStyle
         # reorders the fields the way psycopg's DateLoader slices them.
