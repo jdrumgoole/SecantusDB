@@ -139,10 +139,16 @@ REPORTABLE_GUCS = frozenset(
 # report as ``TimeZone``, and read back for rendering).
 _GUC_CANONICAL: dict[str, str] = {k.lower(): k for k in GUC_DEFAULTS}
 _GUC_CANONICAL.update({k.lower(): k for k in REPORTABLE_GUCS})
+# ``SET TIME ZONE 'x'`` and ``SHOW TIME ZONE`` spell the GUC with a space, and
+# that is the spelling JDBC uses to pin a connection's zone. Without this the
+# two-word form set nothing and SHOW answered empty, so every client that
+# configures its zone that way silently stayed on the default.
+_GUC_CANONICAL["time zone"] = "TimeZone"
 
 
 def canonical_guc_name(name: str) -> str:
-    return _GUC_CANONICAL.get(name.strip().lower(), name.strip())
+    # Collapse internal whitespace so ``TIME  ZONE`` resolves like ``TIME ZONE``.
+    return _GUC_CANONICAL.get(" ".join(name.split()).lower(), name.strip())
 
 
 @dataclass

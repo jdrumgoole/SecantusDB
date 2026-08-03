@@ -5091,3 +5091,62 @@ class alone through `pgjdbc_validation` with the server instrumented to log the
 statement behind each error, and read what the driver actually sent. The test
 parameterises over zones and over binary vs text transfer, so capture which
 combination each failure comes from before changing a conversion.
+
+## `timestamptz` ignores the session time zone entirely (2026-08-03)
+
+`SET TIME ZONE` now reaches the GUC (it was a no-op — see the fix landed with
+this entry), but nothing *reads* it. A `timestamptz` is stored and rendered as
+though it were a plain `timestamp`:
+
+| session zone | ours | PostgreSQL 14.13 |
+| --- | --- | --- |
+| `GMT` | `1950-02-07 00:00:00` | `1950-02-07 00:00:00+00` |
+| `GMT+13` | `1950-02-07 00:00:00` | `1950-02-07 00:00:00-13` |
+| `America/New_York` | `1950-02-07 00:00:00` | `1950-02-07 00:00:00-05` |
+
+Identical in every zone, and with no offset at all — so `timestamptz` is
+currently `timestamp` wearing a different type oid.
+
+What a fix needs:
+
+1. **Input.** A literal with no offset is *local time in the session zone*;
+   convert to an absolute instant on the way in. One carrying an offset is
+   already absolute.
+2. **Output.** Render in the session zone, with that zone's offset for the
+   instant in question — historical offsets included, which is exactly what
+   these 1950 test dates are probing.
+3. **`SET TIME ZONE 'GMT+13'` means UTC-13, not UTC+13.** Postgres follows the
+   POSIX sign convention here, and reports `-13`, as the table above shows.
+   Getting this backwards silently doubles the error, so pin it with a test
+   before building on it.
+
+Use `zoneinfo` from the stdlib for named zones. Storage should hold the
+absolute instant; only presentation is zone-dependent.
+
+This blocks pgjdbc's `DateTest` (21) and `TimezoneTest` (7). Note the
+`SET TIME ZONE` fix alone moved NEITHER — the setting sticking is necessary but
+useless until conversion exists. The `DateTest` breakdown (four distinct
+offsets, the same date wrong in both directions) is in the section above and is
+consistent with this being the cause: with no zone conversion, whether a
+midnight-local date lands a day early or late depends only on the sign of the
+client's own zone.
+
+## Ops Board: a finished job can show an empty log (2026-08-03)
+
+`tests/test_opsboard.py::test_job_log_tail_captures_child_output` failed once on
+a macOS CI lane with the job recorded as `passed · exit 0` but its log reading
+`(no output yet)`. It passes locally and on every other lane, so the window is
+narrow — but this is a product race, not merely a flaky test.
+
+A job runs as a DETACHED child that writes to a shared journal and a logfile
+(`opsboard/runner.py`). Nothing orders the child's final log flush before its
+journal completion record, so a reader can observe "finished" while the log
+write has not landed. **The page then stops polling** — the template only emits
+its `every 1s` trigger while the job is running — so a viewer who refreshes in
+that window is left with a permanently empty log for a job that did produce
+output.
+
+Fix by ordering the child's own writes: flush and close the logfile before
+recording completion in the journal, so "finished" implies "log complete".
+Tightening only the test (polling until the text appears) would hide the case
+a real user can hit.

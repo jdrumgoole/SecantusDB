@@ -4616,12 +4616,29 @@ def _run_authorization_command(verb: str, tail: str, session: Session) -> SQLRes
             session.role = ident
             session.settings["role"] = ident
         return SQLResult(command_tag="SET")
+    m = _SET_TIME_ZONE_RE.match(tail)
+    if m is not None:
+        # ``SET TIME ZONE <value>`` takes no ``=``/``TO``, so the generic
+        # name-value fallback never matched it and the statement set nothing.
+        # This is the spelling JDBC uses to pin a connection's zone.
+        raw = m.group(1).strip()
+        if raw.upper() in ("DEFAULT", "LOCAL"):
+            value = sql_session.GUC_DEFAULTS.get("TimeZone", "UTC")
+        else:
+            value = _unquote_ident(raw)
+        session.settings["TimeZone"] = value
+        return SQLResult(command_tag="SET", parameter_status=[("TimeZone", value)])
     return None
 
 
 # ``name = value[, value…]`` / ``name TO value[, value…]`` — the Command-fallback
 # SET tail (multi-part values like ``datestyle = German, YMD``). Excludes the
 # SESSION CHARACTERISTICS / TRANSACTION forms, which stay no-ops.
+# ``SET [SESSION|LOCAL] TIME ZONE <value>`` — no ``=``/``TO``, so it needs its
+# own pattern; ``DEFAULT`` / ``LOCAL`` reset the GUC.
+_SET_TIME_ZONE_RE = re.compile(r"(?is)^\s*(?:SESSION\s+|LOCAL\s+)?TIME\s+ZONE\s+(.+?)\s*;?\s*$")
+
+
 _SET_MULTI_RE = re.compile(
     r"(?is)^(?!session\s+characteristics|transaction\b)"
     r'([A-Za-z_][\w.]*|"[^"]+")\s*(?:=|\bto\b)\s*(.+?)\s*;?\s*$'
