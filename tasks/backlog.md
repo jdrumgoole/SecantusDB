@@ -980,9 +980,14 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   BSON-type-map field order, 2dsphere index-version) and the pymongo-async
   6× `test_read_concern` (shared `CollectionInvalid: collection already exists`
   — likely async-harness test-isolation) should be diffed against the Python-server
-  runs of the same gauges to confirm none is Rust-specific. The remaining CI
-  wiring — adding the other-language `--server rust` gauge lanes to
-  `validate.yml` (only pymongo-rust-server runs weekly today) — is the last piece.
+  runs of the same gauges to confirm none is Rust-specific. ~~The remaining CI
+  wiring~~ — DONE (rust-gauge-lanes slice): `validate.yml` now carries a
+  `*-rust-server` lane for every MongoDB-wire gauge (pymongo-async / go / node
+  / java / kotlin / ruby / rust / php-lib / php-ext / c / cxx / dotnet, joining
+  the existing pymongo-rust-server + java-rust-server), each reusing its
+  language-toolchain steps plus the storage-engine sync, with `SECANTUSDB_BIN`
+  pointing the daemon gauges at the staged `secantusd-rs`. All thirteen gauges
+  now run weekly against BOTH servers.
   Original: only the pymongo gauge runs against the Rust server
   (`invoke validate --server rust` / the `pymongo-rust-server` entry in
   `validate.yml`). The Go/Node/Java/Ruby/Rust-driver gauges still gauge the

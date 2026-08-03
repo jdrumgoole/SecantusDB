@@ -2,7 +2,8 @@ name: Validate (driver conformance)
 
 # Runs the vendored driver test suites (pymongo, pymongo-async, go, node,
 # java, kotlin, ruby, rust, php-lib, php-ext, c, cxx, dotnet, psycopg, slt,
-# plus the pymongo- and java-vs-Rust-server gates) against SecantusDB and
+# plus a `*-rust-server` lane per MongoDB-wire gauge pointing the SAME
+# unmodified suite at the Rust server) against SecantusDB and
 # regenerates the per-driver
 # `docs/validation-report*.md` files. Slow (~10–15 min per driver on
 # a fresh WT build) so this is NOT on every push — it runs weekly on
@@ -79,14 +80,27 @@ jobs:
           # its sync step builds the wheel with SECANTUS_BUILD_STORAGE_ENGINE=ON
           # (extra toolchain steps below).
           - { name: pymongo-rust-server, task: "validate --server rust", report: docs/validation-report-rust-server.md }
-          # The Java analogue of the R8 gate: the SAME unmodified
-          # mongo-java-driver suite as the java gauge, pointed at the
-          # standalone Rust server. Needs the JVM toolchain of the java gauge
-          # PLUS the storage-engine sync, which stages the secantusd-rs
-          # daemon into .venv/bin (SECANTUSDB_BIN on the run step points
-          # gauge_common.rust_binary at it — the default search only covers
-          # the cargo target dir).
+          # The R8-tail lanes: every other MongoDB-wire gauge's SAME unmodified
+          # suite, pointed at the Rust server. The embedded-server gauges
+          # (pymongo-async) ride `SECANTUS_GAUGE_SERVER=rust` like the pymongo
+          # gate; the daemon gauges target the standalone secantusd-rs binary,
+          # which the storage-engine sync stages into .venv/bin (SECANTUSDB_BIN
+          # on the run step points gauge_common.rust_binary at it — the default
+          # search only covers the cargo target dir). Each lane needs its
+          # language toolchain (the per-language setup/cache steps below list
+          # the -rust-server variants) PLUS the storage-engine sync.
+          - { name: pymongo-async-rust-server, task: "validate-pymongo-async --server rust", report: docs/validation-report-pymongo-async-rust-server.md }
+          - { name: go-rust-server, task: "validate-go --server rust", report: docs/validation-report-go-rust-server.md }
+          - { name: node-rust-server, task: "validate-node --server rust", report: docs/validation-report-node-rust-server.md }
           - { name: java-rust-server, task: "validate-java --server rust", report: docs/validation-report-java-rust-server.md }
+          - { name: kotlin-rust-server, task: "validate-kotlin --server rust", report: docs/validation-report-kotlin-rust-server.md }
+          - { name: ruby-rust-server, task: "validate-ruby --server rust", report: docs/validation-report-ruby-rust-server.md }
+          - { name: rust-rust-server, task: "validate-rust --server rust", report: docs/validation-report-rust-rust-server.md }
+          - { name: php-lib-rust-server, task: "validate-php-lib --server rust", report: docs/validation-report-php-lib-rust-server.md }
+          - { name: php-ext-rust-server, task: "validate-php-ext --server rust", report: docs/validation-report-php-ext-rust-server.md }
+          - { name: c-rust-server, task: "validate-c --server rust", report: docs/validation-report-c-rust-server.md }
+          - { name: cxx-rust-server, task: "validate-cxx --server rust", report: docs/validation-report-cxx-rust-server.md }
+          - { name: dotnet-rust-server, task: "validate-dotnet --server rust", report: docs/validation-report-dotnet-rust-server.md }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -136,11 +150,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y postgresql-contrib postgresql-client
 
       - name: Install C-driver build toolchain
-        if: matrix.driver.name == 'c'
+        if: matrix.driver.name == 'c' || matrix.driver.name == 'c-rust-server'
         run: sudo apt-get install -y cmake libssl-dev
 
       - name: Cache test-libmongoc build
-        if: matrix.driver.name == 'c'
+        if: matrix.driver.name == 'c' || matrix.driver.name == 'c-rust-server'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           # The from-source build (~several min cold) is the dominant cost.
@@ -155,11 +169,11 @@ jobs:
       # the mongocxx test_driver Catch2 binary from source — needs cmake, a
       # C++17 compiler (preinstalled), and OpenSSL headers.
       - name: Install C++-driver build toolchain
-        if: matrix.driver.name == 'cxx'
+        if: matrix.driver.name == 'cxx' || matrix.driver.name == 'cxx-rust-server'
         run: sudo apt-get install -y cmake libssl-dev
 
       - name: Cache libmongoc install + mongocxx build
-        if: matrix.driver.name == 'cxx'
+        if: matrix.driver.name == 'cxx' || matrix.driver.name == 'cxx-rust-server'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           # The libmongoc install + mongocxx build (~10-15 min cold) dominate.
@@ -177,13 +191,13 @@ jobs:
       # gpg (preinstalled on ubuntu-latest) during build. The test project
       # targets net10.0.
       - name: Set up .NET SDK
-        if: matrix.driver.name == 'dotnet'
+        if: startsWith(matrix.driver.name, 'dotnet')
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
         with:
           dotnet-version: "10.0.x"
 
       - name: Cache NuGet packages
-        if: matrix.driver.name == 'dotnet'
+        if: startsWith(matrix.driver.name, 'dotnet')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.nuget/packages
@@ -192,13 +206,13 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Set up Go
-        if: matrix.driver.name == 'go' || matrix.driver.name == 'pgx' || matrix.driver.name == 'pgtest'
+        if: matrix.driver.name == 'go' || matrix.driver.name == 'go-rust-server' || matrix.driver.name == 'pgx' || matrix.driver.name == 'pgtest'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: "1.25"
 
       - name: Cache Go modules + build
-        if: matrix.driver.name == 'go'
+        if: matrix.driver.name == 'go' || matrix.driver.name == 'go-rust-server'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -215,13 +229,13 @@ jobs:
             ${{ runner.os }}-go-
 
       - name: Set up Node.js
-        if: matrix.driver.name == 'node'
+        if: startsWith(matrix.driver.name, 'node')
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: "22"
 
       - name: Cache node_modules
-        if: matrix.driver.name == 'node'
+        if: startsWith(matrix.driver.name, 'node')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: vendor/node-mongodb-native/node_modules
@@ -230,14 +244,14 @@ jobs:
             ${{ runner.os }}-node-modules-
 
       - name: Set up JDK
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'pgjdbc'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || matrix.driver.name == 'pgjdbc'
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'pgjdbc'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || matrix.driver.name == 'pgjdbc'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -253,14 +267,14 @@ jobs:
             ${{ runner.os }}-gradle-
 
       - name: Set up Ruby
-        if: matrix.driver.name == 'ruby'
+        if: startsWith(matrix.driver.name, 'ruby')
         uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b  # v1
         with:
           ruby-version: "3.3"
           bundler-cache: false  # gems installed via runner's bundle install
 
       - name: Cache Ruby bundle
-        if: matrix.driver.name == 'ruby'
+        if: startsWith(matrix.driver.name, 'ruby')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: vendor/mongo-ruby-driver/.bundle
@@ -269,7 +283,7 @@ jobs:
             ${{ runner.os }}-ruby-bundle-
 
       - name: Set up Rust
-        if: matrix.driver.name == 'rust' || matrix.driver.name == 'slt'
+        if: matrix.driver.name == 'rust' || matrix.driver.name == 'rust-rust-server' || matrix.driver.name == 'slt'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
         with:
           # mongo-rust-driver's MSRV is 1.88; stable on Actions is
@@ -297,7 +311,7 @@ jobs:
           ~/.cargo/bin/sqllogictest --version
 
       - name: Cache cargo registry + target
-        if: matrix.driver.name == 'rust'
+        if: matrix.driver.name == 'rust' || matrix.driver.name == 'rust-rust-server'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -325,7 +339,7 @@ jobs:
         env:
           # gauge_common.rust_binary()'s default search only covers the cargo
           # target dir; the storage-engine sync stages the daemon in .venv/bin.
-          SECANTUSDB_BIN: ${{ matrix.driver.name == 'java-rust-server' && '.venv/bin/secantusd-rs' || '' }}
+          SECANTUSDB_BIN: ${{ contains(matrix.driver.name, 'rust-server') && '.venv/bin/secantusd-rs' || '' }}
         run: uv run python -m invoke ${{ matrix.driver.task }}
 
       - name: Show report summary
@@ -447,8 +461,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add docs/validation-report*.md docs/validation-summary.md
-          git commit -m "Refresh validation reports + cross-driver summary (pymongo + go + node + java + ruby + rust + php-lib + php-ext + pymongo-vs-Rust-server + java-vs-Rust-server)"
+          git commit -m "Refresh validation reports + cross-driver summary (all driver + SQL gauges, Python and Rust servers)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver / php-library / php-extension validation reports, plus the pymongo-vs-Rust-server R8 gate and its java-vs-Rust-server analogue. The cross-driver summary (docs/validation-summary.md) is regenerated from the same run's raw artifacts. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php output."
+            --body "Automated weekly refresh of every driver-conformance and SQL-gauge validation report — each MongoDB-wire gauge against the Python server AND its \`*-rust-server\` lane against the Rust server. The cross-driver summary (docs/validation-summary.md) is regenerated from the same run's raw artifacts. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php / dotnet-test output."
