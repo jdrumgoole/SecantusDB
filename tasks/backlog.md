@@ -2473,12 +2473,8 @@ shared storage engine or building large new protocol subsystems:
   - **Large objects** (11, `BlobTest`): the fastpath `lo_creat` / `lo_open`
     protocol is unimplemented (`The fastpath function lo_creat is unknown`).
     Whole-feature gap, not a bug.
-  - **DateTest timezone/calendar off-by-one** (~21): dates round-tripped
-    through specific JVM default zones land a day early/late, and BC dates
-    differ by ~2 days (Java's hybrid Julian/Gregorian vs our proleptic
-    Gregorian). Our own binary date round-trip is exact, so this is a
-    conversion-convention mismatch to characterise carefully before changing
-    anything.
+  - **DateTest date offsets** (21) — see the dedicated section below; the
+    shape is now measured rather than guessed at.
   - **`bind parameter $N has no value`** (8, BatchedInsertReWrite): pgjdbc's
     insert-rewrite batches leave a parameter unbound on a re-written statement.
 - [ ] **Cross-connection async NOTIFY delivery**: a `NOTIFY` issued on one
@@ -5063,3 +5059,35 @@ distinct problems, triaged from the run logs:
   regression — the policy of what counts as a regression is worth a
   deliberate call, not an inline guess). Until then, read the pgjdbc lane's
   report artifact, not its conclusion.
+
+## DateTest: four distinct date offsets (2026-08-03)
+
+`TimezoneTest` is down from 14 failures to 7 (its 7 `internal error`s were all
+one leap-second literal, now fixed). `DateTest` is untouched at 21, and the
+failures split into four groups that are NOT one bug:
+
+| count | expected | got | offset |
+| --- | --- | --- | --- |
+| 8 | `1950-02-07` | `1950-02-06` | one day EARLY |
+| 4 | `1950-02-07` | `1950-02-08` | one day LATE |
+| 7 | `0101-01-01` | `0102-12-31` | ~2 years |
+| 2 | `2012-03-15` | `2012-03-16` | one day late |
+
+The first two matter most: **the same date is wrong in both directions**, which
+rules out a fixed calendar skew and points at the JVM default zone the test
+parameterises over. A `java.sql.Date` is midnight in the client's zone; whether
+midnight-local lands on the previous or next UTC day depends on the sign of
+that zone's offset. So the bug is almost certainly that a `date` is being
+round-tripped through an instant somewhere instead of staying a plain calendar
+date.
+
+The year-101 group is a different animal and worth treating separately: the gap
+is ~2 years, not the ~2 days a Julian/proleptic-Gregorian divergence at that
+epoch would give, so "Java's hybrid calendar" does not explain it on its own.
+Reproduce that one directly before assuming it shares a cause with the others.
+
+Method that worked for the leap second, and is the right one here: run the
+class alone through `pgjdbc_validation` with the server instrumented to log the
+statement behind each error, and read what the driver actually sent. The test
+parameterises over zones and over binary vs text transfer, so capture which
+combination each failure comes from before changing a conversion.

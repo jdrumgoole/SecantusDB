@@ -1076,7 +1076,20 @@ def coerce(value: Any, tag: str) -> Any:
             wide = wide_timestamp_text(value)
             if wide is not None:
                 return wide
-        dt = value if isinstance(value, _dt.datetime) else parse_iso_datetime(value)
+        if isinstance(value, _dt.datetime):
+            dt = value
+        else:
+            from secantus.sql import errors as _sql_errors
+
+            try:
+                dt = parse_iso_datetime(value)
+            except _sql_errors.SQLError:
+                raise  # already a typed error; do not re-wrap
+            except ValueError as exc:
+                # An unparseable timestamp reached the wire as "internal
+                # error" — Python's ValueError escaped uncaught. Postgres
+                # reports invalid input syntax, and so does this now.
+                raise _coercion_error(tag, value) from exc
         return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
     if tag in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes

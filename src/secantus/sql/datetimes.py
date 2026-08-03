@@ -224,6 +224,26 @@ def wide_date_days(text: str) -> int:
     return wide_timestamp_micros(text) // 86_400_000_000
 
 
+#: A ``:60`` seconds field — a leap second. Postgres accepts exactly ``:60``
+#: with no fractional part and rolls it forward to the next minute; ``:60.5``
+#: and ``:61`` are errors (checked against PostgreSQL 14.13).
+_LEAP_SECOND_RE = re.compile(r"(?P<hm>\d{1,2}:\d{2}):60(?P<frac>[.,]\d+)?")
+
+
+def _strip_leap_second(text: str) -> tuple[str, bool]:
+    """``(text_with_59_seconds, rolls_forward)``.
+
+    Python's ``datetime`` has no room for a leap second — it rejects second 60
+    outright — so the value is parsed as :59 and a second added back by the
+    caller. A fractional leap second is out of range in Postgres too, so it is
+    left alone here and fails as an ordinary bad timestamp.
+    """
+    m = _LEAP_SECOND_RE.search(text)
+    if m is None or m.group("frac"):
+        return text, False
+    return text[: m.start()] + m.group("hm") + ":59" + text[m.end() :], True
+
+
 def parse_iso_datetime(v: Any) -> _dt.datetime:
     """``datetime.fromisoformat`` widened for PG-accepted spellings.
 
@@ -235,6 +255,12 @@ def parse_iso_datetime(v: Any) -> _dt.datetime:
     s = str(v).strip().replace("Z", "+00:00")
     if s.lower() == "epoch":
         return _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+    s, leap = _strip_leap_second(s)
+    if leap:
+        # Parsed as :59 and rolled forward, which is what Postgres does with a
+        # leap second: '2015-06-30 23:59:60' is 2015-07-01 00:00:00, carrying
+        # across the minute, day and year boundaries as needed.
+        return parse_iso_datetime(s) + _dt.timedelta(seconds=1)
     try:
         return _dt.datetime.fromisoformat(s)
     except ValueError:
