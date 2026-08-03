@@ -923,6 +923,19 @@ def _render_timestamp_iso(value: _dt.datetime) -> str:
     return f"{head}{sign}{':'.join(parts)}"
 
 
+def _to_session_wall_clock(value: _dt.datetime) -> _dt.datetime:
+    """A tz-aware instant as naive local wall clock in the session zone —
+    Postgres' ``timestamptz`` -> ``timestamp`` conversion."""
+    session = _render_session.get()
+    if session is None:
+        return value.replace(tzinfo=None)
+    from secantus.sql.datetimes import session_tzinfo
+
+    with contextlib.suppress(OverflowError, ValueError):
+        return value.astimezone(session_tzinfo(session)).replace(tzinfo=None)
+    return value.replace(tzinfo=None)
+
+
 def _as_session_instant(value: _dt.datetime) -> _dt.datetime:
     """Resolve a ``timestamptz`` input to an absolute instant.
 
@@ -1103,9 +1116,19 @@ def coerce(value: Any, tag: str) -> Any:
             return wide  # PG-valid but beyond Python's datetime range: text
         return _as_session_instant(parse_iso_datetime(value))
     if tag == "timestamp":
-        # Naive "without time zone": an offset in the input is dropped and the
-        # wall-clock fields kept (Postgres timestamp semantics), so the stored /
-        # compared value is always tz-naive.
+        # Naive "without time zone". A TEXT literal carrying an offset has it
+        # dropped and its wall-clock fields kept, which is Postgres' timestamp
+        # INPUT rule: '1950-02-07 00:00:00+02'::timestamp is 1950-02-07
+        # 00:00:00. A tz-aware datetime VALUE is different — that is a
+        # timestamptz being converted, and Postgres converts it through the
+        # session zone, so the same instant under America/New_York becomes
+        # 1950-02-06 17:00:00. Both checked against PostgreSQL 14.13.
+        #
+        # Treating a bound aware parameter like a literal left it on UTC wall
+        # clock, which shifted every timestamp a JDBC client wrote by the
+        # session zone's offset.
+        if isinstance(value, _dt.datetime) and value.tzinfo is not None:
+            return _to_session_wall_clock(value)
         from secantus.sql.datetimes import (
             datetime_sentinel,
             parse_iso_datetime,
