@@ -174,6 +174,7 @@ pub fn apply_entry(storage: &Storage, entry: &Document) -> Result<bool> {
                 &empty_doc(),
                 None,
                 None,
+                false,
             )?;
             Ok(true)
         }

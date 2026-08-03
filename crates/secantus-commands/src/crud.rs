@@ -723,6 +723,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                false,
             )
         } else {
             let u = doc_field(spec, "u");
@@ -745,6 +746,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                false,
             )
         };
 

@@ -182,6 +182,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                         &let_vars,
                         collation.as_ref(),
                         validator.as_ref(),
+                        return_new,
                     )
                 } else {
                     let upd = update
@@ -199,6 +200,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                         &let_vars,
                         collation.as_ref(),
                         validator.as_ref(),
+                        return_new,
                     )
                 } {
                     Ok(o) => o,
@@ -305,6 +307,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                return_new,
             )
         } else {
             let upd = update
@@ -322,6 +325,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                return_new,
             )
         };
         let outcome = match update_result {
