@@ -4704,7 +4704,7 @@ window that exists everywhere.
 
 Do not "fix" this by deselecting the test or by widening a timeout again.
 
-## UNIQUE constraints across transactions (2026-08-01) — STORAGE FIXED, SQL WIRING PENDING
+## UNIQUE constraints across transactions (2026-08-01) — FIXED (storage + SQL)
 
 **Was: a data-integrity bug on the SQL front end; duplicates were silently stored.**
 The common case is fixed (see "What is fixed" / "What remains" at the end of
@@ -5337,3 +5337,35 @@ Closing it means having `CREATE TABLE … UNIQUE` (and PRIMARY KEY) create a
 storage unique index and letting the engine enforce it, which also changes
 which error shape those collisions produce — worth doing deliberately rather
 than as a tail-end addition. The mechanism it needs now exists.
+
+### SQL UNIQUE is now storage-backed too
+
+`CREATE TABLE … UNIQUE` and `ALTER TABLE … ADD CONSTRAINT … UNIQUE` create a
+storage unique index named after the constraint; `DROP CONSTRAINT` removes it.
+Both holes are closed through the PG front end, each pinned by a wire-level
+test: a value committed after the writer's snapshot is rejected, and of eight
+concurrent transactions inserting one value exactly one wins.
+
+Three things that had to be got right, all covered:
+
+* **NULLs are distinct in SQL.** A partial filter excludes them per column.
+  Sparse would NOT work — a SQL NULL is stored as an explicit null, not a
+  missing field.
+* **A multi-column constraint is unconstrained if ANY column is NULL**, so the
+  filter excludes rows where any of them is null.
+* **DEFERRABLE constraints are deliberately NOT backed.** They may be violated
+  transiently and are judged at COMMIT, so an index enforcing every write would
+  reject the intermediate state — the swap case in
+  `tests/test_sql_deferred.py` catches exactly that. They keep the deferred
+  check, and so keep the two holes; that is the honest trade and it is narrow.
+
+Reflection was adjusted rather than allowed to drift: the storage index takes
+the constraint's own name (which is what Postgres calls it), and `_indexes`
+skips a storage index whose name matches a declared constraint, since the
+constraint already contributes a row carrying the conname / conkey a client
+expects. Without that, `pg_indexes` listed the same index twice.
+
+**Remaining divergence:** the cross-transaction case is rejected with `40001`
+where Postgres gives `23505`. Integrity holds either way, and 40001 is the
+retriable signal, but the code differs — this is the same write-conflict item
+already recorded above, now reachable through UNIQUE as well.
