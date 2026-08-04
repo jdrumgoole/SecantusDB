@@ -34,17 +34,43 @@ on:
         default: ""
 
 jobs:
+  # Resolves the lane matrix from .github/validate-lanes.json, filtered by the
+  # `only` dispatch input (exact-name match within the comma list, so "rust"
+  # can't accidentally select "rust-rust-server"). A plan job is the only way
+  # to filter a matrix by an input: `matrix` is not a named value job-level
+  # `if` may reference (merging such an `if` broke every trigger of this
+  # workflow at parse time — found the hard way).
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: .github/validate-lanes.json
+          sparse-checkout-cone-mode: false
+      - name: Pick lanes
+        id: pick
+        env:
+          ONLY: ${{ inputs.only || '' }}
+        run: |
+          if [ -z "$ONLY" ]; then
+            m=$(jq -c . .github/validate-lanes.json)
+          else
+            m=$(jq -c --arg only ",$ONLY," '[.[] | select($only | contains("," + .name + ","))]' .github/validate-lanes.json)
+          fi
+          n=$(jq length <<<"$m")
+          echo "running $n lane(s)"
+          if [ "$n" -eq 0 ]; then
+            echo "::error::only='$ONLY' matched no lanes in .github/validate-lanes.json"
+            exit 1
+          fi
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+
   validate:
     name: ${{ matrix.driver.name }}
+    needs: plan
     runs-on: ubuntu-latest
-    # Lane filter for manual dispatches: exact-name match within the
-    # comma-separated `only` input (wrapped in commas so "rust" can't
-    # accidentally match "rust-rust-server"). Scheduled runs always run
-    # every lane.
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.only == '' ||
-      contains(format(',{0},', inputs.only), format(',{0},', matrix.driver.name))
     # A wedged gauge must fail fast, not burn the 6-hour default: the rust
     # gauge spent two consecutive weekly runs crawling to the 6h kill (cold
     # cargo cache + per-filter timeouts compounding — see rust_validation/
@@ -56,78 +82,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        driver:
-          - { name: pymongo, task: validate,      report: docs/validation-report.md }
-          - { name: pymongo-async, task: validate-pymongo-async, report: docs/validation-report-pymongo-async.md }
-          - { name: go,      task: validate-go,   report: docs/validation-report-go.md }
-          - { name: node,    task: validate-node, report: docs/validation-report-node.md }
-          - { name: java,    task: validate-java, report: docs/validation-report-java.md }
-          - { name: kotlin,  task: validate-kotlin, report: docs/validation-report-kotlin.md }
-          - { name: ruby,    task: validate-ruby, report: docs/validation-report-ruby.md }
-          - { name: rust,    task: validate-rust, report: docs/validation-report-rust.md }
-          - { name: php-lib, task: validate-php-lib, report: docs/validation-report-php-lib.md }
-          - { name: php-ext, task: validate-php-ext, report: docs/validation-report-php-ext.md }
-          - { name: c,       task: validate-c,    report: docs/validation-report-c.md }
-          - { name: cxx,     task: validate-cxx,  report: docs/validation-report-cxx.md }
-          - { name: dotnet,  task: validate-dotnet, report: docs/validation-report-dotnet.md }
-          # The SQL-server gauge (tasks/sql-gauges-plan.md G2): psycopg 3's own
-          # unmodified test suite over PSYCOPG_TEST_DSN against a daemon
-          # SecantusPGServer. Python-only toolchain — psycopg[binary] ships libpq.
-          - { name: psycopg, task: validate-psycopg, report: docs/validation-report-psycopg.md }
-          # The SQL-server ORM gauge (tasks/sql-gauges-plan.md G6): SQLAlchemy's
-          # dialect-compliance suite (ships inside the sqlalchemy package —
-          # nothing vendored) against a daemon SecantusPGServer. Python-only.
-          - { name: sqlalchemy, task: validate-sqlalchemy, report: docs/validation-report-sqlalchemy.md }
-          # The SQL-server stress/smoke (tasks/sql-gauges-plan.md G7): pgbench
-          # init + TPC-B (three protocol modes) + select-only + psql catalog
-          # smoke. Needs pgbench/psql (postgresql-contrib, installed below).
-          - { name: sql-stress, task: sql-stress, report: docs/validation-report-sqlstress.md }
-          # The SQL-server JDBC gauge (tasks/sql-gauges-plan.md G5): pgjdbc's
-          # own suite, unmodified, targeted via its stock
-          # build.local.properties. Needs JDK 21 (setup-java step below).
-          - { name: pgjdbc, task: validate-pgjdbc, report: docs/validation-report-pgjdbc.md }
-          # The SQL-server wire-protocol gauge (tasks/sql-gauges-plan.md G3):
-          # cockroach's pgtest datadriven corpus + runner, fetched verbatim at
-          # a pinned commit (sparse clone, cached) and driven over pgproto3.
-          # Needs the Go toolchain (shared setup step with the go/pgx gauges).
-          - { name: pgtest, task: validate-pgtest, report: docs/validation-report-pgtest.md }
-          # The SQL-server low-level Go gauge (tasks/sql-gauges-plan.md G4):
-          # jackc/pgx's pgconn + pgproto3 packages, unmodified, over
-          # PGX_TEST_DATABASE. Needs the Go toolchain (shared with the go
-          # gauge's setup step below).
-          - { name: pgx, task: validate-pgx, report: docs/validation-report-pgx.md }
-          # The SQL-server correctness gauge (tasks/sql-gauges-plan.md G1): the
-          # vendored sqllogictest corpus executed by sqllogictest-rs over real
-          # pgwire against a fresh daemon SecantusPGServer per file. Needs the
-          # `sqllogictest` binary (cargo install, cached below).
-          - { name: slt, task: validate-slt, report: docs/validation-report-slt.md }
-          # The R8 gate (tasks/rust-server-plan.md): the SAME unmodified pymongo
-          # suite as the headline gauge, pointed at the Rust server via
-          # SECANTUS_GAUGE_SERVER=rust. Needs the _secantus_server extension, so
-          # its sync step builds the wheel with SECANTUS_BUILD_STORAGE_ENGINE=ON
-          # (extra toolchain steps below).
-          - { name: pymongo-rust-server, task: "validate --server rust", report: docs/validation-report-rust-server.md }
-          # The R8-tail lanes: every other MongoDB-wire gauge's SAME unmodified
-          # suite, pointed at the Rust server. The embedded-server gauges
-          # (pymongo-async) ride `SECANTUS_GAUGE_SERVER=rust` like the pymongo
-          # gate; the daemon gauges target the standalone secantusd-rs binary,
-          # which the storage-engine sync stages into .venv/bin (SECANTUSDB_BIN
-          # on the run step points gauge_common.rust_binary at it — the default
-          # search only covers the cargo target dir). Each lane needs its
-          # language toolchain (the per-language setup/cache steps below list
-          # the -rust-server variants) PLUS the storage-engine sync.
-          - { name: pymongo-async-rust-server, task: "validate-pymongo-async --server rust", report: docs/validation-report-pymongo-async-rust-server.md }
-          - { name: go-rust-server, task: "validate-go --server rust", report: docs/validation-report-go-rust-server.md }
-          - { name: node-rust-server, task: "validate-node --server rust", report: docs/validation-report-node-rust-server.md }
-          - { name: java-rust-server, task: "validate-java --server rust", report: docs/validation-report-java-rust-server.md }
-          - { name: kotlin-rust-server, task: "validate-kotlin --server rust", report: docs/validation-report-kotlin-rust-server.md }
-          - { name: ruby-rust-server, task: "validate-ruby --server rust", report: docs/validation-report-ruby-rust-server.md }
-          - { name: rust-rust-server, task: "validate-rust --server rust", report: docs/validation-report-rust-rust-server.md }
-          - { name: php-lib-rust-server, task: "validate-php-lib --server rust", report: docs/validation-report-php-lib-rust-server.md }
-          - { name: php-ext-rust-server, task: "validate-php-ext --server rust", report: docs/validation-report-php-ext-rust-server.md }
-          - { name: c-rust-server, task: "validate-c --server rust", report: docs/validation-report-c-rust-server.md }
-          - { name: cxx-rust-server, task: "validate-cxx --server rust", report: docs/validation-report-cxx-rust-server.md }
-          - { name: dotnet-rust-server, task: "validate-dotnet --server rust", report: docs/validation-report-dotnet-rust-server.md }
+        # The lane list lives in .github/validate-lanes.json (name / task /
+        # report per lane) so the plan job can filter it by the `only`
+        # dispatch input. Per-lane requirements are encoded in the step
+        # conditions below (toolchain setup per language, the
+        # storage-engine sync for *-rust-server lanes, port/serial rules);
+        # add a new lane by appending to the JSON and extending whichever
+        # setup-step conditions its toolchain needs.
+        driver: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
