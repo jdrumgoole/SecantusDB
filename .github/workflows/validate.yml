@@ -57,7 +57,7 @@ jobs:
           if [ -z "$ONLY" ]; then
             m=$(jq -c . .github/validate-lanes.json)
           else
-            m=$(jq -c --arg only ",$ONLY," '[.[] | select($only | contains("," + .name + ","))]' .github/validate-lanes.json)
+            m=$(jq -c --arg only ",$ONLY," '[.[] | select(("," + .name + ",") as $n | $only | contains($n))]' .github/validate-lanes.json)
           fi
           n=$(jq length <<<"$m")
           echo "running $n lane(s)"
