@@ -8,6 +8,7 @@ the planner stays pure translation.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import operator
 import threading
@@ -163,6 +164,49 @@ def _resolve_user_type_column(col: Any, catalog: Catalog, db: str) -> Any:
     )
 
 
+def unique_index_name(constraint_name: str) -> str:
+    """The storage index backing a UNIQUE constraint takes the constraint's own
+    name, which is also what Postgres calls the index it creates for one — so
+    catalog reflection reports a single index, not the constraint's plus a
+    differently-named implementation detail."""
+    return constraint_name
+
+
+def _create_unique_index(storage: Any, db: str, table: planner.TableDef, uq: Any) -> None:
+    """Back a SQL UNIQUE constraint with a storage unique index.
+
+    The constraint was upheld only by a probe read before writing, which cannot
+    see a value another transaction committed after the writer's snapshot, nor
+    one a second writer is inserting right now — so duplicates were stored. The
+    storage index makes WiredTiger the arbiter instead.
+
+    NULLs are distinct in SQL — any number of them satisfy a UNIQUE constraint,
+    and a multi-column constraint is unconstrained if ANY of its columns is NULL
+    — whereas a Mongo unique index would collide them. A partial filter
+    excluding NULL from every column reproduces the SQL rule. Sparse would not:
+    a SQL NULL is stored as an explicit null, not a missing field.
+    """
+    if getattr(uq, "deferrable", False):
+        # A DEFERRABLE constraint may be violated transiently inside a
+        # transaction and is only judged at COMMIT — swapping two values is the
+        # classic case. An index enforcing on every write would reject the
+        # intermediate state, so those keep the deferred check instead.
+        return
+    fields = [table.field_for(c) for c in uq.columns]
+    if not fields:
+        return
+    key_spec = dict.fromkeys(fields, 1)
+    clauses = [{f: {"$ne": None}} for f in fields]
+    partial = clauses[0] if len(clauses) == 1 else {"$and": clauses}
+    storage.create_index(
+        db,
+        table.collection,
+        unique_index_name(uq.name),
+        key_spec,
+        {"unique": True, "partialFilterExpression": partial},
+    )
+
+
 def execute_create_table(
     plan: planner.CreateTablePlan, catalog: Catalog, storage: Any, db: str
 ) -> SQLResult:
@@ -181,6 +225,8 @@ def execute_create_table(
     plan.table.columns = [_resolve_user_type_column(col, catalog, db) for col in plan.table.columns]
     catalog.put(db, plan.table)
     storage.create_collection(db, plan.table.collection)
+    for uq in plan.table.unique_constraints:
+        _create_unique_index(storage, db, plan.table, uq)
     # Auto-create the sequence behind each SERIAL column (owned by the table).
     for seq in plan.sequences:
         catalog.create_sequence(
@@ -396,6 +442,9 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
             )
         table.foreign_keys = [c for c in table.foreign_keys if c.name != name]
         table.check_constraints = [c for c in table.check_constraints if c.name != name]
+        for _uq in [c for c in table.unique_constraints if c.name == name]:
+            with contextlib.suppress(Exception):
+                storage.drop_index(db, table.collection, unique_index_name(_uq.name))
         table.unique_constraints = [c for c in table.unique_constraints if c.name != name]
         return
     if isinstance(action, exp.Drop):  # DROP COLUMN [IF EXISTS] name
@@ -508,9 +557,12 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
                     planner.make_check_constraint(node, table.name, con_name)
                 )
             elif isinstance(node, exp.UniqueColumnConstraint):
-                table.unique_constraints.append(
-                    planner.make_unique_constraint(node, table.name, con_name)
-                )
+                added = planner.make_unique_constraint(node, table.name, con_name)
+                table.unique_constraints.append(added)
+                # Back it with a storage index like CREATE TABLE does, or a
+                # constraint added later would be the only one still relying on
+                # the probe alone.
+                _create_unique_index(storage, db, table, added)
             elif isinstance(node, exp.PrimaryKey):
                 # ``ALTER TABLE t ADD [CONSTRAINT c] PRIMARY KEY (cols)`` —
                 # validates NOT NULL + uniqueness, re-keys every row from the

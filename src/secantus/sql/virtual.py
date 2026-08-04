@@ -172,9 +172,16 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
                 }
             )
             oid += 1
+        constraint_backed = {uq.name for uq in getattr(t, "unique_constraints", [])}
         for ix in storage.list_indexes(db, t.collection):
             if ix.get("name") == "_id_":
                 continue  # WiredTiger's physical _id index — the PK is shown as <t>_pkey
+            if ix.get("name") in constraint_backed:
+                # The storage index enforcing a declared UNIQUE constraint. It
+                # is reported below from the constraint itself, which carries
+                # the conname / conkey a client expects, so listing it here as
+                # well would show the same index twice.
+                continue
             key = ix.get("key") or {}
             expr_fields = [f for f in key if f in field_to_expr]
             if expr_fields:
