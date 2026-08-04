@@ -1,10 +1,10 @@
 # pgtest wire-protocol conformance report
 
-- SecantusDB (Python server) 0.6.0b7
+- SecantusDB (Python server) 0.6.0b9
 - corpus + runner: cockroachdb/cockroach @ `e3bff5d92ac1` (`pkg/sql/pgwire/testdata/pgtest`, run by `pkg/testutils/pgtest` verbatim)
-- generated: 2026-08-01 07:13 UTC
+- generated: 2026-08-03 21:49 UTC
 
-**8/58 files pass** (0 expected divergences, 45 unexpected failures, 5 skipped).
+**10/58 files pass** (0 expected divergences, 43 unexpected failures, 5 skipped).
 
 | file | result |
 |---|---|
@@ -16,7 +16,7 @@
 | `box2d` | **FAIL** |
 | `char` | **FAIL** |
 | `citext` | **FAIL** |
-| `collated_string` | **FAIL** |
+| `collated_string` | pass |
 | `copy` | **FAIL** |
 | `copy_file_upload` | **FAIL** |
 | `data_type_size` | pass |
@@ -28,7 +28,7 @@
 | `implicit_txn` | **FAIL** |
 | `inet` | **FAIL** |
 | `int2vector` | **FAIL** |
-| `int_size` | **FAIL** |
+| `int_size` | pass |
 | `json` | **FAIL** |
 | `json_array` | **FAIL** |
 | `jsonpath` | **FAIL** |
@@ -76,7 +76,6 @@
 - `box2d`
 - `char`
 - `citext`
-- `collated_string`
 - `copy`
 - `copy_file_upload`
 - `decimal`
@@ -87,7 +86,6 @@
 - `implicit_txn`
 - `inet`
 - `int2vector`
-- `int_size`
 - `json`
 - `json_array`
 - `jsonpath`

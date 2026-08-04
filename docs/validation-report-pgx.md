@@ -1,18 +1,18 @@
 # pgx (pgconn + pgproto3) conformance report
 
-- SecantusDB (Python server) 0.6.0b6
-- suite: vendor/pgx @ unknown (`go test`, unmodified)
-- generated: 2026-07-31 16:43 UTC
+- SecantusDB (Python server) 0.6.0b9
+- suite: vendor/pgx @ 0aeabbcf11d8 (`go test`, unmodified)
+- generated: 2026-08-03 21:55 UTC
 
 | package | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
 | bgreader | 6 | 0 | 0 | 6 | 100.0% |
 | ctxwatch | 6 | 0 | 0 | 6 | 100.0% |
-| pgconn | 108 | 86 | 22 | 216 | 55.7% |
+| pgconn | 109 | 85 | 22 | 216 | 56.2% |
 | pgproto3 | 171 | 1 | 0 | 172 | 99.4% |
-| **total** | **291** | **87** | **22** | **400** | **77.0%** |
+| **total** | **292** | **86** | **22** | **400** | **77.2%** |
 
-## Failures (87)
+## Failures (86)
 
 - `pgconn :: TestCancelRequestContextWatcherHandler`
 - `pgconn :: TestCancelRequestContextWatcherHandler/DeadlineExceeded_-_do_not_send_cancel_request_when_query_finishes_in_grace_period`
@@ -32,7 +32,6 @@
 - `pgconn :: TestConnContextCanceledCancelsRunningQueryOnServer/postgres`
 - `pgconn :: TestConnCopyFrom`
 - `pgconn :: TestConnCopyFromBinary`
-- `pgconn :: TestConnCopyFromCanceled`
 - `pgconn :: TestConnCopyFromDataWriteAfterErrorAndReturn`
 - `pgconn :: TestConnCopyFromGzipReader`
 - `pgconn :: TestConnCopyFromNoticeResponseReceivedMidStream`

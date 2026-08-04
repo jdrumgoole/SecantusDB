@@ -1,8 +1,8 @@
 # SQLAlchemy dialect-compliance report
 
-- SecantusDB (Python server) 0.6.0b6
+- SecantusDB (Python server) 0.6.0b9
 - suite: sqlalchemy.testing.suite @ SQLAlchemy 2.0.51, postgresql+psycopg dialect
-- generated: 2026-07-31 16:09 UTC
+- generated: 2026-08-03 21:53 UTC
 
 | suite class | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
