@@ -43,6 +43,10 @@ def datetime_sentinel(v: Any) -> str | None:
     return None
 
 
+#: A bare ``YYYY-MM-DD`` with nothing after it.
+_DATE_ONLY_RE = re.compile(r"^\d{4,}-\d{1,2}-\d{1,2}$")
+
+
 def _widen(s: str) -> str:
     """Rewrite PG-accepted loose spellings into ``fromisoformat`` shape: pad
     date and hour fields, widen a short/seconds-bearing trailing offset."""
@@ -59,7 +63,16 @@ def _widen(s: str) -> str:
         off = f"{m.group(1)}{int(m.group(2)):02d}:{m.group(3) or '00'}"
         if secs:
             off += f":{secs}"
-        s = s[: m.start()].rstrip() + off
+        head = s[: m.start()].rstrip()
+        if _DATE_ONLY_RE.match(head):
+            # ``1950-02-07 -05`` — a date with an offset and no time, which is
+            # what a JDBC setDate with a Calendar sends. Dropping the space
+            # left ``1950-02-07-05:00``, which fromisoformat reads as the TIME
+            # 05:00 rather than an offset: the value silently became five in
+            # the morning, naive, and a timestamp column stored it that way.
+            # Postgres reads the implicit midnight, so spell it out.
+            head += " 00:00:00"
+        s = head + off
     return s
 
 

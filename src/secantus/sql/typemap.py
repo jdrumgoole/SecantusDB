@@ -936,6 +936,23 @@ def _to_session_wall_clock(value: _dt.datetime) -> _dt.datetime:
     return value.replace(tzinfo=None)
 
 
+def _representable_instant(value: _dt.datetime) -> _dt.datetime:
+    """An aware datetime that BSON can store, else the same value tz-naive.
+
+    BSON normalises an aware datetime to UTC on the way out, and near
+    ``datetime.min`` that crosses out of Python's range — ``0001-01-01
+    00:00+05:00`` is year zero in UTC. Those extremes keep their wall clock
+    instead, which is what they did before offsets were parsed at all.
+    """
+    if value.tzinfo is None:
+        return value
+    try:
+        value.astimezone(_dt.timezone.utc)
+    except (OverflowError, ValueError):
+        return value.replace(tzinfo=None)
+    return value
+
+
 def _as_session_instant(value: _dt.datetime) -> _dt.datetime:
     """Resolve a ``timestamptz`` input to an absolute instant.
 
@@ -1114,7 +1131,7 @@ def coerce(value: Any, tag: str) -> Any:
         wide = wide_timestamp_text(value)
         if wide is not None:
             return wide  # PG-valid but beyond Python's datetime range: text
-        return _as_session_instant(parse_iso_datetime(value))
+        return _representable_instant(_as_session_instant(parse_iso_datetime(value)))
     if tag == "timestamp":
         # Naive "without time zone". A TEXT literal carrying an offset has it
         # dropped and its wall-clock fields kept, which is Postgres' timestamp
