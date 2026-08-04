@@ -292,6 +292,15 @@ _NAT_SEQ_TABLE = "table:secantus_natural_seq"
 _INT64_MIN = -(2**63)  # lowest WT ``q`` key — scan a (db, coll) prefix from the start
 _IDX_TABLE = "table:secantus_indexes"
 _IDX_ENTRIES_TABLE = "table:secantus_index_entries"
+#: ``(db, coll, index) + escape(sortkey) -> RecordId``. Unique indexes ONLY.
+#: The index-entries table above keys by ``sortkey + RecordId``, so two docs
+#: sharing an indexed value produce DIFFERENT keys and never collide — which is
+#: why uniqueness had to be a snapshot-read probe, and why that probe could not
+#: see a value another transaction committed after your snapshot. Here the key
+#: IS the indexed value, so WiredTiger enforces it: a duplicate is WT's own
+#: WT_DUPLICATE_KEY, and two concurrent inserts of the same value are a
+#: write-write conflict rather than two silent successes.
+_UNIQ_TABLE = "table:secantus_unique_keys"
 _OPLOG_TABLE = "table:secantus_oplog"
 # The oplog is sharded across ``_OPLOG_SHARDS`` btrees in the Rust server so
 # concurrent writers don't all rendezvous on one table's rightmost append page
@@ -533,6 +542,23 @@ def extract_backup_archive(
         "fileCount": len(names),
         "archive": abs_archive,
     }
+
+
+class UniqueKeyTaken(Exception):
+    """A unique-index key WiredTiger refused because another row holds it.
+
+    Raised while index entries are written, which is AFTER the snapshot-read
+    probe has passed — so this is precisely the case that probe cannot see: a
+    value another transaction committed after our snapshot, or a concurrent
+    insert of the same value. Callers turn it into the same duplicate-key write
+    error the probe produces, so clients see one behaviour either way.
+    """
+
+    def __init__(self, index: str, key_pattern: dict[str, Any], key_value: dict[str, Any]) -> None:
+        super().__init__(f"duplicate key on {index}: {key_value!r}")
+        self.index = index
+        self.key_pattern = key_pattern
+        self.key_value = key_value
 
 
 class DuplicateKeyError(Exception):
@@ -1445,6 +1471,7 @@ class Storage:
             boot.create(_NAT_SEQ_TABLE, "key_format=SSu,value_format=q")
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
             boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSu,value_format=u")
+            boot.create(_UNIQ_TABLE, "key_format=SSSu,value_format=q")
             boot.create(_OPLOG_TABLE, "key_format=q,value_format=u")
             boot.create(_PREIMAGE_TABLE, "key_format=q,value_format=u")
             boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
@@ -4260,7 +4287,27 @@ class Storage:
                     # The RecordId is freshly minted and unique, so the only
                     # failure left here is a concurrency conflict.
                     raise WriteConflictError(str(exc)) from exc
-                self._write_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
+                try:
+                    self._write_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
+                except UniqueKeyTaken as taken:
+                    # WiredTiger refused the key: a duplicate the snapshot-read
+                    # probe above could not see. Reported exactly as the probe
+                    # would have, so the client sees one behaviour either way.
+                    self._undo_partial_insert(db, coll, recordid, key)
+                    errors.append(
+                        {
+                            "index": index,
+                            "code": 11000,
+                            "errmsg": format_dup_key_errmsg(
+                                f"{db}.{coll}", taken.index, taken.key_value
+                            ),
+                            "keyPattern": taken.key_pattern,
+                            "keyValue": taken.key_value,
+                        }
+                    )
+                    if ordered:
+                        break
+                    continue
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
                 if oplog_on:
@@ -5196,7 +5243,12 @@ class Storage:
                     self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
                     doc_cur = self._cursor(_doc_table_for(db, coll))
                     doc_cur[db, coll, recordid] = _frame_doc_value(new_id_key, new_blob)
-                    self._write_index_entries(db, coll, new, indexes, partials, recordid=recordid)
+                    try:
+                        self._write_index_entries(
+                            db, coll, new, indexes, partials, recordid=recordid
+                        )
+                    except UniqueKeyTaken as taken:
+                        raise self._index_conflict_from(db, coll, new, taken) from taken
                     multikey_names = self._maybe_mark_multikey(
                         db, coll, new, indexes, multikey_names
                     )
@@ -5282,9 +5334,12 @@ class Storage:
                     )
                 doc_cur = self._cursor(_doc_table_for(db, coll))
                 doc_cur[db, coll, upsert_recordid] = _frame_doc_value(upsert_id_key, upsert_blob)
-                self._write_index_entries(
-                    db, coll, new, indexes, partials, recordid=upsert_recordid
-                )
+                try:
+                    self._write_index_entries(
+                        db, coll, new, indexes, partials, recordid=upsert_recordid
+                    )
+                except UniqueKeyTaken as taken:
+                    raise self._index_conflict_from(db, coll, new, taken) from taken
                 self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
                 if oplog_on:
                     oplog_entries.append(
@@ -5913,6 +5968,12 @@ class Storage:
                 for kb, entry_recordid in entries:
                     entry_cur.reset()
                     entry_cur[db, coll, name, _pack_entry(kb, entry_recordid)] = b""
+                    if unique:
+                        # Claim the existing rows' keys too, or the table would
+                        # only protect values written after the index was made.
+                        uq = self._cursor(_UNIQ_TABLE)
+                        uq.reset()
+                        uq[db, coll, name, _escape_kb(kb)] = entry_recordid
             else:
                 # Single doc-table walk: decode each blob once and fold all
                 # three checks (uniqueness, multikey detection, entry build)
@@ -5952,6 +6013,12 @@ class Storage:
                 for kb, entry_recordid in entries:
                     entry_cur.reset()
                     entry_cur[db, coll, name, _pack_entry(kb, entry_recordid)] = b""
+                    if unique:
+                        # Claim the existing rows' keys too, or the table would
+                        # only protect values written after the index was made.
+                        uq = self._cursor(_UNIQ_TABLE)
+                        uq.reset()
+                        uq[db, coll, name, _escape_kb(kb)] = entry_recordid
             ui = self._collection_uuid(db, coll)
             self._emit_oplog(
                 [
@@ -6282,9 +6349,112 @@ class Storage:
                     c[db, coll, name, _pack_entry(cell_bytes, recordid)] = b""
                 continue
             coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            enforce = _unique or bool(index_options.get(name, {}).get("prepareUnique"))
             for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
                 c[db, coll, name, _pack_entry(kb, recordid)] = b""
+                if enforce:
+                    self._claim_unique_key(db, coll, name, kb, recordid, key_spec, doc, coll_opt)
+
+    def _index_conflict_from(
+        self, db: str, coll: str, doc: dict[str, Any], taken: UniqueKeyTaken
+    ) -> IndexConflict:
+        """The refusal WiredTiger raised, reported as the duplicate-key error
+        the snapshot probe would have produced for the same collision."""
+        return IndexConflict(
+            taken.index,
+            doc.get("_id"),
+            key_pattern=taken.key_pattern,
+            key_value=taken.key_value,
+            namespace=f"{db}.{coll}",
+        )
+
+    def _undo_partial_insert(self, db: str, coll: str, recordid: int, id_key: bytes) -> None:
+        """Remove the doc row and index entries written before a unique key was
+        refused, so a rejected insert leaves nothing behind. The whole statement
+        runs in one WT transaction, but an unordered batch continues past the
+        failure and must not carry a half-written row with it."""
+        with contextlib.suppress(Exception):
+            cur = self._cursor(_doc_table_for(db, coll))
+            cur.reset()
+            cur.set_key(db, coll, recordid)
+            cur.remove()
+        with contextlib.suppress(Exception):
+            seq = self._cursor(_NAT_SEQ_TABLE)
+            seq.reset()
+            seq.set_key(db, coll, id_key)
+            seq.remove()
+
+    def _claim_unique_key(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        kb: bytes,
+        recordid: int,
+        key_spec: dict[str, Any],
+        doc: dict[str, Any],
+        collation: Any,
+    ) -> None:
+        """Take ownership of one unique-index key, or fail.
+
+        The insert uses a NON-overwrite cursor, so WiredTiger itself rejects a
+        key another row already holds — including one committed after this
+        transaction's snapshot, which the snapshot-read probe could not see.
+        Two transactions racing for the same key collide on it and one takes a
+        write conflict, which the storage retry wrapper replays into a clean
+        duplicate-key error.
+        """
+        cur = self._cursor(_UNIQ_TABLE, overwrite=False)
+        cur.reset()
+        cur.set_key(db, coll, name, _escape_kb(kb))
+        cur.set_value(recordid)
+        try:
+            rc = cur.insert()
+        except Exception as exc:
+            if _is_wt_duplicate_key(exc):
+                raise self._dup_key_error(db, coll, name, kb, key_spec, doc, collation) from exc
+            raise
+        if rc != 0:
+            raise self._dup_key_error(db, coll, name, kb, key_spec, doc, collation)
+
+    def _dup_key_error(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        kb: bytes,
+        key_spec: dict[str, Any],
+        doc: dict[str, Any],
+        collation: Any,
+    ) -> UniqueKeyTaken:
+        return UniqueKeyTaken(
+            name, dict(key_spec), _conflict_key_value(doc, key_spec, kb, collation=collation)
+        )
+
+    def _release_unique_keys(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        keys: list[bytes],
+        recordid: int,
+    ) -> None:
+        """Drop this row's claims so the values become available again.
+
+        Only claims this RecordId actually owns are released: an update that
+        rewrites a row re-claims its keys before the old entries are swept, and
+        removing a claim another row now holds would silently unprotect it.
+        """
+        if not keys:
+            return
+        cur = self._cursor(_UNIQ_TABLE)
+        for kb in keys:
+            cur.reset()
+            cur.set_key(db, coll, name, _escape_kb(kb))
+            with contextlib.suppress(Exception):
+                if cur.search() == 0 and cur.get_value() == recordid:
+                    cur.remove()
 
     def _delete_index_entries(
         self,
@@ -6328,6 +6498,16 @@ class Storage:
                         c.remove()
                 continue
             coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if _unique or index_options.get(name, {}).get("prepareUnique"):
+                # Give the values back, or the row that held them would keep
+                # them reserved forever and a delete-then-reinsert would fail.
+                self._release_unique_keys(
+                    db,
+                    coll,
+                    name,
+                    list(_index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt)),
+                    recordid,
+                )
             for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
                 c.set_key(db, coll, name, _pack_entry(kb, recordid))
