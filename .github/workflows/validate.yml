@@ -21,11 +21,30 @@ on:
   schedule:
     - cron: "0 6 * * 1"   # Monday 06:00 UTC
   workflow_dispatch:
+    inputs:
+      only:
+        description: >-
+          Comma-separated lane names to run (e.g. "rust" or
+          "slt,pgjdbc"). Empty = every lane. Single-lane dispatches are
+          how a wedged or flaky gauge gets diagnosed without burning the
+          whole 33-lane matrix; the aggregate/report PR step is skipped
+          for filtered runs (a partial artifact set must never overwrite
+          the full weekly reports).
+        required: false
+        default: ""
 
 jobs:
   validate:
     name: ${{ matrix.driver.name }}
     runs-on: ubuntu-latest
+    # Lane filter for manual dispatches: exact-name match within the
+    # comma-separated `only` input (wrapped in commas so "rust" can't
+    # accidentally match "rust-rust-server"). Scheduled runs always run
+    # every lane.
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.only == '' ||
+      contains(format(',{0},', inputs.only), format(',{0},', matrix.driver.name))
     # A wedged gauge must fail fast, not burn the 6-hour default: the rust
     # gauge spent two consecutive weekly runs crawling to the 6h kill (cold
     # cargo cache + per-filter timeouts compounding — see rust_validation/
@@ -408,7 +427,11 @@ jobs:
     # `always()` so the aggregate step runs even if one driver gauge fails —
     # we still want to ship the reports for the gauges that did succeed so a
     # regression in one driver doesn't hide partial progress in the others.
-    if: always() && !cancelled()
+    # Skipped for lane-filtered dispatches: a partial artifact set must never
+    # regenerate the cross-driver summary or open a reports PR.
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'workflow_dispatch' || inputs.only == '')
     permissions:
       contents: write
       pull-requests: write
