@@ -5249,3 +5249,29 @@ Still open, both now precisely located:
    different strings, not a Julian/Gregorian divergence.
 3. Binary-format timestamps differ in the same runs (`0xfff62bc7cff01f00` vs
    `0xfff62bc763752000`), consistent with (1) rather than a separate bug.
+
+### Two of the three capture findings are fixed
+
+`DateTest` is 21 -> 14; `TimezoneTest` unchanged at 7.
+
+* **BC / wide timestamps** no longer keep an offset on a `timestamp` column
+  (`wide_timestamp_text(..., drop_offset=True)`), matching the in-range path.
+  That cleared the 7-failure year-101 group.
+* **`CAST('…' AS timestamptz)` now resolves to an instant** rather than staying
+  text, so a timestamptz-declared bound parameter keeps its type into column
+  coercion. Verified end to end: a tz-aware parameter, a naive parameter and an
+  offset-carrying literal into a `timestamp` column now all give byte-identical
+  results to PostgreSQL 14.13 under `America/New_York`.
+
+**The remaining 12 `1950-02-07` failures did NOT move with that second fix**,
+even though the equivalent psycopg round trip now matches Postgres exactly. So
+pgjdbc reaches the same column by a different route — most likely BINARY format
+(the test parameterises over it) or a `date`-typed rather than
+timestamptz-typed parameter from `setDate`.
+
+Settle it the same way as before, with one addition: the proxy in
+`scratchpad/pgproxy.py` does not decode Bind (`B`) messages, so parameter
+formats and declared oids are invisible. Decode those — format codes, the
+declared type oids from the preceding Parse, and the raw parameter bytes — then
+re-run the two captures and diff. Guessing at this from the server side has now
+failed twice; the capture answered it in one pass both times it was used.
