@@ -1,6 +1,6 @@
 # mongo-cxx-driver Validation Report
 
-Generated 2026-07-30 — SecantusDB 0.6.0b5 vs mongo-cxx-driver 24852b6 (`vendor/mongo-cxx-driver/`).
+Generated 2026-08-03 — SecantusDB 0.6.0b9 vs mongo-cxx-driver 24852b6 (`vendor/mongo-cxx-driver/`).
 
 Run `uv run python -m invoke validate-cxx` to refresh. The official MongoDB **C++** driver (`mongocxx`), built on libmongoc — its Catch2 `test_driver` suite (CRUD / cursor / aggregate / GridFS / commands) run unmodified against an embedded SecantusDB daemon.
 
