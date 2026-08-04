@@ -232,6 +232,19 @@ def _run_cargo_tests(uri: str) -> tuple[int, str]:
             cmd.extend(["--features", ",".join(CARGO_FEATURES)])
         cmd.append(filt)
         cmd.extend(["--", "--test-threads=1", "--format=pretty"])
+        # Per-filter progress goes to stderr AS IT HAPPENS. The captured
+        # stdout is only assembled into the raw artifact at the END of the
+        # loop, so when a CI job is killed mid-gauge the log otherwise
+        # records nothing about which filters ran, hung, or how long each
+        # took — exactly the blind spot that made the 2026-07/08 weekly
+        # wedge (filters hanging to their 600s timeout on the CI runner,
+        # against the Python server only) undiagnosable from its logs.
+        print(
+            f"rust_validation: [{idx}/{len(INCLUDE)}] {filt} ...",
+            file=sys.stderr,
+            flush=True,
+        )
+        t0 = time.monotonic()
         try:
             proc = subprocess.run(
                 cmd,
@@ -243,6 +256,12 @@ def _run_cargo_tests(uri: str) -> tuple[int, str]:
                 timeout=CARGO_TEST_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
+            print(
+                f"rust_validation: [{idx}/{len(INCLUDE)}] {filt} TIMEOUT "
+                f"after {CARGO_TEST_TIMEOUT_SECONDS:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
             parts.append(
                 f"\n=== rust_validation: filter {idx}/{len(INCLUDE)} {filt!r} "
                 f"TIMEOUT after {CARGO_TEST_TIMEOUT_SECONDS}s ===\n"
@@ -250,6 +269,12 @@ def _run_cargo_tests(uri: str) -> tuple[int, str]:
             )
             worst_rc = max(worst_rc, 124)
             continue
+        print(
+            f"rust_validation: [{idx}/{len(INCLUDE)}] {filt} rc={proc.returncode} "
+            f"in {time.monotonic() - t0:.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
         parts.append(
             f"\n=== rust_validation: filter {idx}/{len(INCLUDE)} {filt!r} "
             f"(rc={proc.returncode}) ===\n{proc.stdout}"
