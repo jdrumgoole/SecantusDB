@@ -5275,3 +5275,36 @@ formats and declared oids are invisible. Decode those — format codes, the
 declared type oids from the preceding Parse, and the raw parameter bytes — then
 re-run the two captures and diff. Guessing at this from the server side has now
 failed twice; the capture answered it in one pass both times it was used.
+
+### Bind decoding found the last DateTest date bug
+
+Decoding Bind messages in the capture proxy (`scratchpad/pgproxy.py` now does)
+showed what a JDBC `setDate` with a Calendar actually sends:
+
+```
+--> B stmt='' fmts=[0] params=[txt:'1950-02-07 -05']
+```
+
+A date with an offset and NO time of day. Widening that for `fromisoformat`
+dropped the space, leaving `1950-02-07-05:00`, which Python reads as the TIME
+05:00 rather than an offset — the value became five in the morning, tz-naive,
+and a `timestamp` column stored it that way. Postgres reads the implicit
+midnight. Fixed by spelling out `00:00:00` before the offset, and checked
+against 14.13 for all three target types.
+
+That change also had to be paired with a guard: parsing an offset where none
+was parsed before pushes values near `datetime.min` out of range, because BSON
+normalises an aware datetime to UTC and `0001-01-01 00:00+05:00` is year zero
+there. It surfaced immediately as 14 fresh `internal error`s, and those
+extremes now keep their wall clock as they did before.
+
+`DateTest` 21 -> 8 across the session. **Remaining 8** are all
+`expected: <1950-02-07>`, so the same shape by yet another route — re-run the
+capture and diff the Bind parameters for the failing cases specifically; the
+proxy now records their formats and values, so the next pass should name it
+directly rather than by elimination.
+
+`TimezoneTest` is unchanged at 7 and untouched by any of this: its failures are
+`timestamptz` TEXT comparisons (`2005-01-01 12:00:00+00`), an interval-style
+offset (`-12600000` where 0 was expected, i.e. 3.5 hours), and a `timetz`
+rendering — a separate group that wants its own look.
