@@ -4704,7 +4704,7 @@ window that exists everywhere.
 
 Do not "fix" this by deselecting the test or by widening a timeout again.
 
-## UNIQUE constraints across transactions (2026-08-01) — MOSTLY FIXED
+## UNIQUE constraints across transactions (2026-08-01) — STORAGE FIXED, SQL WIRING PENDING
 
 **Was: a data-integrity bug on the SQL front end; duplicates were silently stored.**
 The common case is fixed (see "What is fixed" / "What remains" at the end of
@@ -5308,3 +5308,32 @@ directly rather than by elimination.
 `timestamptz` TEXT comparisons (`2005-01-01 12:00:00+00`), an interval-style
 offset (`-12600000` where 0 was expected, i.e. 3.5 hours), and a `timetz`
 rendering — a separate group that wants its own look.
+
+### The storage-level fix landed — as a separate table, not a layout change
+
+Rather than re-key the index-entries table (which would have forced every scan
+path to branch on whether an index is unique, plus a format bump and the Rust
+twin — the reason it was declined twice), unique indexes now also write
+`table:secantus_unique_keys`: `(db, coll, index, escape(sortkey)) -> RecordId`.
+
+The key IS the indexed value, so WiredTiger enforces it. A duplicate is its own
+WT_DUPLICATE_KEY; two transactions racing for one value collide on the key and
+one takes a write conflict. Both residual holes are closed at the storage
+layer, each pinned by a test:
+
+* a value committed after the inserting transaction's snapshot — rejected;
+* eight concurrent inserts of one value — exactly one wins.
+
+Additive, so no format break: the entries table and every read path are
+untouched, and a store written by an older build simply has an empty table,
+which cannot produce a FALSE rejection. `create_index` backfills existing rows,
+so an index built over data claims it.
+
+**The SQL persona is NOT yet covered.** A SQL `UNIQUE` constraint is enforced
+in `executor._validate_unique_rows` and never creates a storage index, so the
+two holes remain open through the PG front end — verified after this change:
+eight concurrent transactions inserting one value still stored 4 duplicates.
+Closing it means having `CREATE TABLE … UNIQUE` (and PRIMARY KEY) create a
+storage unique index and letting the engine enforce it, which also changes
+which error shape those collisions produce — worth doing deliberately rather
+than as a tail-end addition. The mechanism it needs now exists.
