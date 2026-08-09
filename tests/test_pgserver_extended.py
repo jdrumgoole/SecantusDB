@@ -273,6 +273,11 @@ def test_extended_protocol_with_more_than_32767_params(client):
     parameters in one Bind, which used to crash the connection outright."""
     n = 40000
     sql = "SELECT coalesce(" + ",".join(f"${i + 1}" for i in range(n)) + ")"
+    # The 5s default is a wire round-trip timeout, not a budget for how long the
+    # server may legitimately think. Planning 40k placeholders is sub-second on a
+    # dev machine but several seconds on a 2-core CI runner, where the default
+    # timed this out.
+    client.sock.settimeout(120)
     msgs = client.exchange(
         pgwire.build_parse("big", sql),
         pgwire.build_describe("S", "big"),
