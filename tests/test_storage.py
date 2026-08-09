@@ -1116,3 +1116,66 @@ def test_unordered_insert_reports_errors_across_chunks(tmp_path) -> None:
         assert len(s.find_matching("app", "c", {"_id": 1499})) == 1
     finally:
         s.close()
+
+
+def test_update_and_delete_many_survive_a_small_cache(tmp_path) -> None:
+    # updateMany / deleteMany over a large matched set used to run as ONE
+    # statement transaction — unbounded unevictable dirty content, the same
+    # livelock class the chunked inserts closed. Chunked (twin of the Rust
+    # driver), a whole-collection rewrite and delete stay bounded against a
+    # deliberately small cache. A regression wedges (pytest-timeout alarms).
+    filler = "x" * 1100
+    s = Storage(str(tmp_path), cache_size="128M")
+    try:
+        docs = [{"_id": i, "pad": filler, "x": 1} for i in range(35000)]
+        inserted, errors = s.insert("app", "c", docs)
+        assert inserted == 35000 and errors == []
+        out = s.update_matching("app", "c", {"x": 1}, {"$set": {"x": 2}}, multi=True)
+        assert out["matched"] == 35000
+        assert out["modified"] == 35000
+        assert len(s.find_matching("app", "c", {"x": 2})) == 35000
+        deleted = s.delete_matching("app", "c", {"x": 2})
+        assert deleted == 35000
+        assert s.find_matching("app", "c", {}) == []
+    finally:
+        s.close()
+
+
+def test_multi_update_inc_applies_exactly_once_across_chunks(tmp_path) -> None:
+    # The RecordId list is partitioned across chunk transactions and a
+    # conflict retries only its own rolled-back chunk — $inc must apply
+    # exactly once per doc even when the update spans multiple chunks.
+    s = Storage(str(tmp_path))
+    try:
+        s.insert("app", "c", [{"_id": i, "n": 0} for i in range(2500)])
+        out = s.update_matching("app", "c", {}, {"$inc": {"n": 1}}, multi=True)
+        assert out["matched"] == 2500
+        assert out["modified"] == 2500
+        assert len(s.find_matching("app", "c", {"n": 1})) == 2500
+        out = s.update_matching("app", "c", {"n": 1}, {"$inc": {"n": 1}}, multi=True)
+        assert out["modified"] == 2500
+        assert len(s.find_matching("app", "c", {"n": 2})) == 2500
+    finally:
+        s.close()
+
+
+def test_bounded_write_paths_unchanged_by_chunking(tmp_path) -> None:
+    s = Storage(str(tmp_path))
+    try:
+        s.insert("app", "c", [{"_id": i, "x": 1} for i in range(10)])
+        # Single-doc update keeps post-image capture.
+        out = s.update_matching(
+            "app", "c", {"x": 1}, {"$set": {"x": 9}}, multi=False, return_post_images=True
+        )
+        assert (out["matched"], out["modified"]) == (1, 1)
+        assert out["post_images"][0]["x"] == 9
+        # deleteOne stays bounded-path.
+        assert s.delete_matching("app", "c", {"x": 1}, limit=1) == 1
+        assert len(s.find_matching("app", "c", {})) == 9
+        # Upsert through the chunked route's zero-match delegation.
+        out = s.update_matching("app", "c", {"x": 777}, {"$set": {"y": 1}}, multi=True, upsert=True)
+        assert out["matched"] == 0
+        assert out["did_upsert"] is True
+        assert out["upserted_id"] is not None
+    finally:
+        s.close()

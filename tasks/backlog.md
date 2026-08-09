@@ -5181,9 +5181,17 @@ distinct problems, triaged from the run logs:
   per-document write units, documented non-atomic. Pinned by
   `tests/multiwrite_chunk.rs` (35k-doc rewrite + deleteMany @ 128M cache;
   exactly-once `$inc` across chunks; bounded paths unchanged).
-  **Python server: still open** — `storage.update_matching` /
-  `delete_matching` run one `_batch_transaction` over the whole matched
-  set; mirror the chunked driver (same re-fetch + partition rules).
+  **Python server: DONE (py-multiwrite-chunked slice)** — the twin driver:
+  `update_matching` (multi, outside user txns) and `delete_matching`
+  (limit=0) route through chunked drivers with the same re-fetch +
+  partition rules (the coll RLock makes the zero-match delegation
+  reentrancy-safe); single-doc / upsert / in-transaction paths keep the
+  single-`_batch_transaction` body. Pinned by the same three guards in
+  `tests/test_storage.py` (35k rewrite + deleteMany @ 128M cache;
+  exactly-once `$inc`; bounded paths). **With this, the WT dirty-cache
+  livelock class is fully closed on both servers across all three
+  surfaces: batch inserts, multi-document updates/deletes, and
+  multi-document transactions.**
 - ~~**`slt` gauge "regression"**~~ — NOT a regression; **timeout calibration,
   fixed (rust-gauge-wedge slice).** 2026-08-03 was the slt lane's FIRST
   weekly run (the SQL gauge lanes postdate the 2026-07-27 schedule), and the
