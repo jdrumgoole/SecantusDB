@@ -227,6 +227,7 @@ fn code_name_for(code: i32) -> &'static str {
         85 => "IndexOptionsConflict",
         86 => "IndexKeySpecsConflict",
         112 => "WriteConflict",
+        313 => "TransactionTooLargeForCache",
         121 => "DocumentValidationFailure",
         10334 => "BSONObjectTooLarge",
         11000 => "DuplicateKey",

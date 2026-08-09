@@ -826,6 +826,15 @@ fn map_err(e: WtError) -> StorageError {
         // A lost WT_ROLLBACK race → mongod's WriteConflict (112). Routed
         // command-level by the write handlers so the txn envelope labels it.
         WtError::WriteConflict => StorageError::WriteConflict,
+        // An oversized multi-document transaction → mongod's
+        // TransactionTooLargeForCache (313). Deliberately NOT in the
+        // transient-label set: retrying the same transaction hits the same
+        // wall.
+        WtError::TransactionTooLargeForCache => StorageError::WriteError {
+            code: 313,
+            errmsg: "Transaction is too large and will not fit in the storage engine cache"
+                .to_string(),
+        },
         // An over-limit document → mongod's BSONObjectTooLarge (10334).
         WtError::DocumentTooLarge(size) => StorageError::WriteError {
             code: 10334,
