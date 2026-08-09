@@ -2477,6 +2477,55 @@ shared storage engine or building large new protocol subsystems:
     shape is now measured rather than guessed at.
   - **`bind parameter $N has no value`** (8, BatchedInsertReWrite): pgjdbc's
     insert-rewrite batches leave a parameter unbound on a re-written statement.
+  - ~~**`internal error`** (13)~~ — FIXED (gauge 5311 P / 219 F / 28 S =
+    **96.04%**, measured after the fix; `BatchedInsertReWriteEnabledTest`
+    16 → 4 failures, `BatchFailureTest` 64 → 48). Every one was a crash that
+    dropped
+    the connection rather than returning a usable message, and each collapsed
+    to a small independent cause once the failing *statement* was paired with
+    the traceback (see "Capture the statement behind the error" below — the
+    same technique that cracked the earlier clusters):
+    - 16-bit protocol **count** fields (parameter / column counts) were read
+      *and written* as signed. Postgres allows 65535 parameters per Bind and
+      pgjdbc's rewritten batches really do send tens of thousands; above 32767
+      the count came back negative and walked the parse offset backwards
+      (`not enough data to unpack 4 bytes at offset -2`). Genuinely-signed
+      fields — attnum, type size, format codes — stay `_INT16`.
+    - Geometric types had **no binary parameter decoder**, so a `point` / `box`
+      / `polygon` sent in the binary format reached the *text* parser as raw
+      bytes. Decoders for all seven now exist.
+    - `line` could not be parsed even as text: its canonical form is three
+      coefficients `{A,B,C}`, and the branch handling it sat *after* the
+      coordinate-pair parse it could never survive — dead code.
+    - `time ± interval` had no overload at all (`str + dict`).
+    - Interval arithmetic in a WHERE was lowered into a Mongo `$expr`, which
+      has no interval type; the cast was silently dropped and `$multiply` got
+      the raw literal text. Interval casts now refuse to lower, so the
+      predicate falls back to per-row scalar evaluation.
+    Two further defects surfaced in the same blast radius and are also fixed:
+    - **Binding N parameters was `O(N**2)`** — sqlglot re-parents every sibling
+      on each `Expression.replace`. A 40000-parameter statement took over two
+      minutes, so the batch tests unblocked above would have *timed out*
+      instead of crashing. Now linear (0.38s). Pinned by
+      `test_sql_planner.py::test_substitute_parameters_scales_linearly`.
+    - The `pg_class` / `pg_attribute` / `pg_attrdef` / `pg_description` /
+      `pg_index` builders **enumerated the table list twice** — once to assign
+      OIDs, once to emit rows — so a table created by another session in
+      between raised `KeyError` mid-scan. `virtual._tables_with_oids` is the
+      single-snapshot accessor they all use now.
+    A second measured pass caught two the first had *moved* rather than fixed:
+    `timetz ± interval` had no overload either (only bare `time` did), and once
+    the interval predicate correctly stopped being pushed down, comparing the
+    `date` column against the computed timestamp raised `TypeError` one step
+    further in — a stored `date` is ISO text, and Postgres promotes it to
+    midnight. Both fixed (verified directly; gauge re-measure below). The lesson is the
+    obvious one: re-measure after the fix, because "the crash moved" looks
+    exactly like "the crash is gone" from the code side.
+    Separately, `'23:59:60'::time` stored the literal second 60, which nothing
+    downstream could parse — so `time - time` *already* crashed the same way.
+    It now carries forward to `24:00:00` as Postgres does, and time arithmetic
+    goes through `datetimes.time_micros` because that boundary value does not
+    fit in a Python `datetime.time`.
 - [ ] **Cross-connection async NOTIFY delivery**: a `NOTIFY` issued on one
   connection is not delivered to another connection's
   `getNotifications()` poll, so pgjdbc's `NotifyTest` blocks forever
@@ -5069,6 +5118,18 @@ distinct problems, triaged from the run logs:
   `FILE_TIMEOUT_SECONDS` is now `SECANTUS_SLT_FILE_TIMEOUT`-overridable and
   `validate.yml` sets 900 for the slt lane (with a 300-minute lane timeout,
   since the honest runtime is long on that hardware).
+- [ ] **A timed-out pgjdbc gauge reports zero tests, which reads as success.**
+  `_aggregate()` runs only after gradle returns, and `RESULTS` is `rmtree`'d at
+  startup — so when the run hits `GRADLE_TIMEOUT_SECONDS` the summary is
+  `TOTAL 0 ... 0 internal errors`, indistinguishable at a glance from a clean
+  sweep. The timeout path should aggregate whatever XML exists and say plainly
+  that the run was truncated. (Hit for real: a run contending with a
+  concurrently-running full pytest suite blew the 1h budget and reported
+  nothing; the same code re-run alone finished in **8m16s**. Don't run the
+  gauge alongside the test suite — it is timing-sensitive, and its wall clock
+  under contention says nothing about the server. Budget headroom is fine:
+  `CopyLargeFileTest` is ~282s of a normal run, inherently — it streams a
+  large file through COPY, while `CopyTest` beside it is 1.8s.)
 - [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
   first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
   …) are inside the ~347 documented standing failures of the 93.7% baseline

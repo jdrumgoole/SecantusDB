@@ -70,10 +70,21 @@ def _user_tables(db: str, catalog: Catalog) -> list[TableDef]:
     return [t for name in catalog.list_tables(db) if (t := catalog.get(db, name)) is not None]
 
 
+def _tables_with_oids(db: str, catalog: Catalog) -> tuple[list[TableDef], dict[str, int]]:
+    """The user tables and their OIDs from a *single* enumeration.
+
+    A builder that needs both must not call ``_user_tables`` and ``_table_oids``
+    separately: another session's DDL landing between the two calls leaves the
+    second list holding a table the OID map never saw, and the builder dies with
+    a ``KeyError`` part-way through a catalog scan."""
+    tables = _user_tables(db, catalog)
+    return tables, {t.name: 16384 + i for i, t in enumerate(tables)}
+
+
 def _table_oids(db: str, catalog: Catalog) -> dict[str, int]:
     """Stable, fictional pg_class OIDs per table — shared by every catalog that
     keys off ``relid`` (pg_class.oid, pg_attribute.attrelid) so joins line up."""
-    return {t.name: 16384 + i for i, t in enumerate(_user_tables(db, catalog))}
+    return _tables_with_oids(db, catalog)[1]
 
 
 # Table row types (typtype 'c'): pg_type oids derived from the table's
@@ -144,10 +155,10 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
     for ``pg_get_indexdef`` / ``pg_indexes`` — the owning ``table`` name and the
     rendered ``columns`` (with ``DESC``). ``partial`` flags a partial index (its
     predicate isn't reversed back to SQL)."""
-    table_oids = _table_oids(db, catalog)
+    tables, table_oids = _tables_with_oids(db, catalog)
     out: list[dict[str, Any]] = []
     oid = _INDEX_OID_BASE
-    for t in _user_tables(db, catalog):
+    for t in tables:
         relid = table_oids[t.name]
         field_to_attnum = {col.field: i for i, col in enumerate(t.columns, start=1)}
         field_to_name = {col.field: col.name for col in t.columns}
@@ -489,11 +500,11 @@ def _foreign_keys(db: str, catalog: Catalog) -> list[dict[str, Any]]:
     ``information_schema`` / ``pg_get_constraintdef`` reflection paths need: a
     stable ``oid``, owner/referenced table OIDs, ``conkey``/``confkey`` attnum
     arrays, the resolved referenced columns, and the rendered ``condef``."""
-    table_oids = _table_oids(db, catalog)
-    tables = {t.name: t for t in _user_tables(db, catalog)}
+    table_list, table_oids = _tables_with_oids(db, catalog)
+    tables = {t.name: t for t in table_list}
     out: list[dict[str, Any]] = []
     oid = _FK_OID_BASE
-    for t in _user_tables(db, catalog):
+    for t in table_list:
         owner_attnum = {c.name: i for i, c in enumerate(t.columns, start=1)}
         for fk in t.foreign_keys:
             ref = tables.get(fk.ref_table)
@@ -531,11 +542,11 @@ def _unique_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
     owner table OID, ``conkey`` attnums, columns, the rendered ``condef``, and the
     OID of its backing unique index (``conindid``) — SQLAlchemy reflects a UNIQUE
     constraint by joining ``pg_constraint.conindid = pg_index.indexrelid``."""
-    table_oids = _table_oids(db, catalog)
+    tables, table_oids = _tables_with_oids(db, catalog)
     out: list[dict[str, Any]] = []
     oid = _UNIQUE_CON_OID_BASE
     idx_oid = _UNIQUE_IDX_OID_BASE
-    for t in _user_tables(db, catalog):
+    for t in tables:
         attnum = {c.name: i for i, c in enumerate(t.columns, start=1)}
         for uq in t.unique_constraints:
             out.append(
@@ -578,10 +589,10 @@ def _check_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
     """Declared CHECK constraints with the fields reflection needs. ``condef`` is
     rendered the way Postgres does — ``CHECK ((<expr>))`` — so SQLAlchemy's
     ``get_check_constraints`` regex can peel it back to the predicate text."""
-    table_oids = _table_oids(db, catalog)
+    tables, table_oids = _tables_with_oids(db, catalog)
     out: list[dict[str, Any]] = []
     oid = _CHECK_CON_OID_BASE
-    for t in _user_tables(db, catalog):
+    for t in tables:
         for ck in t.check_constraints:
             out.append(
                 {
@@ -884,7 +895,7 @@ def _split_user_type_name(name: str, schema_oids: dict[str, int]) -> tuple[str, 
 
 
 def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    oids = _table_oids(db, catalog)
+    tables, oids = _tables_with_oids(db, catalog)
     matviews = _matview_names(db, catalog)
     schema_oids = _schema_oids(db, catalog)
     rows = [
@@ -913,7 +924,7 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
             "reloftype": 0,
             "reloptions": None,
         }
-        for t in _user_tables(db, catalog)
+        for t in tables
     ]
     # Index relations are also pg_class rows (relkind 'i') — reflection joins
     # pg_index.indexrelid = pg_class.oid to read an index's name + access method.
@@ -1040,11 +1051,11 @@ def functiondef_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
 def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     """One row per column of every declared table — the pg_catalog column surface
     tools (and ``\\d``-style queries) read. attrelid lines up with pg_class.oid."""
-    oids = _table_oids(db, catalog)
+    tables, oids = _tables_with_oids(db, catalog)
     enum_oids = _enum_oids(db, catalog)
     domain_oids = _domain_oids(db, catalog)
     rows: list[dict] = []
-    for t in _user_tables(db, catalog):
+    for t in tables:
         for i, col in enumerate(t.columns, start=1):
             if col.domain_type is not None:
                 typoid = domain_oids.get(col.domain_type, 25)
@@ -1146,9 +1157,9 @@ def _pg_attrdef(db: str, session: Session, storage: Any, catalog: Catalog) -> li
     # text (Postgres stores a nodeToString there and tools call pg_get_expr; we
     # store the rendered text directly, which is what our pg_get_expr passes
     # through). ``adnum`` is the column's attnum; ``oid`` is synthesised per row.
-    oids = _table_oids(db, catalog)
+    tables, oids = _tables_with_oids(db, catalog)
     rows: list[dict] = []
-    for t in _user_tables(db, catalog):
+    for t in tables:
         relid = oids[t.name]
         for attnum, col in enumerate(t.columns, start=1):
             adbin = _column_default_text(col)
@@ -1173,9 +1184,9 @@ def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -
     # Object comments from COMMENT ON TABLE / COLUMN. A table comment has
     # objsubid 0; a column comment's objsubid is the column's attnum. classoid is
     # pg_class so SQLAlchemy's get_columns / get_table_comment joins line up.
-    oids = _table_oids(db, catalog)
+    tables, oids = _tables_with_oids(db, catalog)
     rows: list[dict] = []
-    for t in _user_tables(db, catalog):
+    for t in tables:
         relid = oids[t.name]
         if t.comment is not None:
             rows.append(
@@ -1199,7 +1210,7 @@ def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -
     # COMMENT ON CONSTRAINT rows, keyed by the pg_constraint oid so
     # SQLAlchemy's constraint-comment outer join (objoid = pg_constraint.oid)
     # resolves. The comments live on the catalog's constraint records.
-    relid_to_table = {oids[t.name]: t for t in _user_tables(db, catalog)}
+    relid_to_table = {oids[t.name]: t for t in tables}
     for con in _pg_constraint(db, session, storage, catalog):
         t = relid_to_table.get(con["conrelid"])
         if t is None:

@@ -543,6 +543,14 @@ def _eval_date_arith(node: exp.Expression, left: Any, right: Any) -> Any:
         if rd and li:
             base = _dt.datetime.combine(_datetimes.to_date_obj(right), _dt.time())
             return _intervals.to_date(base, left, 1)
+        if lt_ and ri:
+            return _time_shift(left, right, 1)
+        if rt_ and li:
+            return _time_shift(right, left, 1)
+        if ri and _datetimes.is_timetz_value(left):
+            return _timetz_shift(left, right, 1)
+        if li and _datetimes.is_timetz_value(right):
+            return _timetz_shift(right, left, 1)
     elif isinstance(node, exp.Sub):
         if ld and rd:
             return _datetimes.date_sub_date(left, right)
@@ -553,19 +561,41 @@ def _eval_date_arith(node: exp.Expression, left: Any, right: Any) -> Any:
             return _intervals.to_date(base, right, -1)
         if lt_ and rt_:
             return _time_sub_time(left, right)
+        if lt_ and ri:
+            return _time_shift(left, right, -1)
+        if ri and _datetimes.is_timetz_value(left):
+            return _timetz_shift(left, right, -1)
     return _NOT_DATE
+
+
+def _timetz_shift(t: Any, iv: Any, sign: int) -> str:
+    """``timetz ± interval -> timetz``. Same wrap-within-the-day rule as plain
+    ``time``, but the zone offset rides along untouched — Postgres shifts the
+    time of day and keeps the offset it was given."""
+    from secantus.sql import datetimes as _datetimes
+
+    tod, offset = _datetimes.split_timetz(t)
+    return _time_shift(tod, iv, sign) + offset
+
+
+def _time_shift(t: Any, iv: Any, sign: int) -> str:
+    """``time ± interval -> time``. Postgres uses only the interval's *time*
+    component (``months`` / ``days`` are dropped — a time of day has no date to
+    carry them) and wraps the result into a single day, so ``23:00 + 3 hours``
+    is ``02:00``, not the next day."""
+    from secantus.sql import datetimes as _datetimes
+    from secantus.sql import intervals as _intervals
+
+    shift = _intervals._fields(iv)[2]
+    total = (_datetimes.time_micros(t) + sign * shift) % _datetimes.MICROS_PER_DAY
+    return _datetimes.time_from_micros(total)
 
 
 def _time_sub_time(a: Any, b: Any) -> dict:
     from secantus.sql import datetimes as _datetimes
     from secantus.sql import intervals as _intervals
 
-    ta, tb = _datetimes.to_time_obj(a), _datetimes.to_time_obj(b)
-
-    def _micros(t: _dt.time) -> int:
-        return ((t.hour * 3600 + t.minute * 60 + t.second) * 1_000_000) + t.microsecond
-
-    return _intervals.make(0, 0, _micros(ta) - _micros(tb))
+    return _intervals.make(0, 0, _datetimes.time_micros(a) - _datetimes.time_micros(b))
 
 
 _NOT_INTERVAL = object()
@@ -598,13 +628,32 @@ def _eval_interval_arith(node: exp.Expression, left: Any, right: Any) -> Any:
         ):
             return _intervals.diff(left, right)
     elif isinstance(node, exp.Mul):
-        if li and isinstance(right, (int, float)):
-            return _intervals.mul(left, right)
-        if ri and isinstance(left, (int, float)):
-            return _intervals.mul(right, left)
-    elif isinstance(node, exp.Div) and li and isinstance(right, (int, float)) and right != 0:
-        return _intervals.mul(left, 1.0 / right)
+        if li and (factor := _interval_factor(right)) is not None:
+            return _intervals.mul(left, factor)
+        if ri and (factor := _interval_factor(left)) is not None:
+            return _intervals.mul(right, factor)
+    elif isinstance(node, exp.Div) and li:
+        factor = _interval_factor(right)
+        if factor is not None and factor != 0:
+            return _intervals.mul(left, 1.0 / factor)
     return _NOT_INTERVAL
+
+
+def _interval_factor(v: Any) -> float | None:
+    """The numeric multiplier in ``interval * n``, or ``None`` if ``v`` isn't one.
+    An unknown-type text operand counts: Postgres resolves an untyped parameter
+    beside an interval to ``float8``, and pgjdbc binds parameters typeless in
+    extended mode, so ``$1 * $2::interval`` arrives here as ``str * dict``."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float, Decimal)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _is_range_value(v: Any) -> bool:
@@ -1422,6 +1471,7 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
         else:
             left = _ranges.canonical(left)
             right = _ranges.canonical(right)
+    left, right = _promote_date_against_datetime(left, right)
     if (
         isinstance(left, _dt.datetime)
         and isinstance(right, _dt.datetime)
@@ -1453,6 +1503,23 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
     if isinstance(node, exp.LT):
         return left < right
     return left <= right
+
+
+def _promote_date_against_datetime(left: Any, right: Any) -> tuple[Any, Any]:
+    """``date`` compared against a ``timestamp`` promotes to midnight, as Postgres
+    does. A stored ``date`` is ISO text, so comparing it against a computed
+    ``datetime`` (``ts + n * interval``) otherwise raises TypeError — reaching
+    the client as ``internal error`` rather than an answer."""
+    from secantus.sql import datetimes as _datetimes
+
+    def _promote(v: Any) -> Any:
+        return _dt.datetime.combine(_datetimes.to_date_obj(v), _dt.time())
+
+    if isinstance(right, _dt.datetime) and _datetimes.is_date_value(left):
+        return _promote(left), right
+    if isinstance(left, _dt.datetime) and _datetimes.is_date_value(right):
+        return left, _promote(right)
+    return left, right
 
 
 def _eval_case(node: exp.Case, scope: Scope, ctx: ScalarContext) -> Any:

@@ -244,3 +244,47 @@ def test_empty_query_in_extended_protocol(client):
         pgwire.build_execute(),
     )
     assert any(m.type == "I" for m in msgs)  # EmptyQueryResponse
+
+
+# --------------------------------------------------------------------------- #
+# 16-bit count fields are unsigned
+# --------------------------------------------------------------------------- #
+
+
+def test_bind_codec_roundtrips_more_than_32767_params():
+    """Postgres allows up to 65535 parameters per Bind. Read as *signed*, a count
+    above 32767 comes back negative and walks the parse offset backwards
+    ("not enough data to unpack 4 bytes at offset -2")."""
+    n = 40000
+    values: list[bytes | None] = [str(i).encode() for i in range(n)]
+    portal, stmt, _fmts, parsed, _res = pgwire.parse_bind(pgwire.build_bind("p", "s", values)[5:])
+    assert (portal, stmt) == ("p", "s")
+    assert parsed == values
+
+
+def test_parameter_description_codec_roundtrips_more_than_32767_oids():
+    n = 40000
+    payload = pgwire.parameter_description([25] * n)[5:]
+    assert pgwire.parse_parameter_description(payload) == [25] * n
+
+
+def test_extended_protocol_with_more_than_32767_params(client):
+    """End to end: pgjdbc's rewritten batch inserts bind tens of thousands of
+    parameters in one Bind, which used to crash the connection outright."""
+    n = 40000
+    sql = "SELECT coalesce(" + ",".join(f"${i + 1}" for i in range(n)) + ")"
+    # The 5s default is a wire round-trip timeout, not a budget for how long the
+    # server may legitimately think. Planning 40k placeholders is sub-second on a
+    # dev machine but several seconds on a 2-core CI runner, where the default
+    # timed this out.
+    client.sock.settimeout(120)
+    msgs = client.exchange(
+        pgwire.build_parse("big", sql),
+        pgwire.build_describe("S", "big"),
+        pgwire.build_bind("p", "big", [None] * (n - 1) + [b"tail"]),
+        pgwire.build_execute("p"),
+    )
+    assert "E" not in types(msgs)
+    pd = next(m for m in msgs if m.type == "t")
+    assert pgwire.parse_parameter_description(pd.payload) == [25] * n
+    assert rows(msgs) == [[b"tail"]]

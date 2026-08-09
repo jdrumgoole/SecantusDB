@@ -26,7 +26,7 @@ from typing import Any
 import bson
 from sqlglot import exp
 
-from secantus.sql import engine, errors, pgwire, planner, typemap
+from secantus.sql import engine, errors, pggeo, pgwire, planner, typemap
 from secantus.sql.catalog import ENUM_TYPE_OID_BASE, USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.session import Session
 
@@ -213,6 +213,41 @@ def _decode_multirange(raw: bytes, range_oid: int) -> str:
     return "{" + ",".join(parts) + "}"
 
 
+def _f8s(raw: bytes, count: int, off: int = 0) -> tuple[float, ...]:
+    return struct.unpack_from(f"!{count}d", raw, off)
+
+
+def _decode_path(raw: bytes) -> str:
+    """``path`` — a closed-flag byte, an int32 point count, then the points. The
+    closed spelling uses ``(…)`` and the open one ``[…]``."""
+    closed = raw[0] != 0
+    (npts,) = struct.unpack_from("!i", raw, 1)
+    pts = _f8s(raw, 2 * npts, 5)
+    body = ",".join(f"({pts[i]},{pts[i + 1]})" for i in range(0, 2 * npts, 2))
+    return f"({body})" if closed else f"[{body}]"
+
+
+def _decode_polygon(raw: bytes) -> str:
+    (npts,) = struct.unpack_from("!i", raw, 0)
+    pts = _f8s(raw, 2 * npts, 4)
+    return "(" + ",".join(f"({pts[i]},{pts[i + 1]})" for i in range(0, 2 * npts, 2)) + ")"
+
+
+# Geometric binary layouts (Postgres' ``*_send``): fixed runs of float8, except
+# ``path`` / ``polygon`` which are length-prefixed. Each decodes to the type's
+# text spelling and then through ``pggeo.canonical`` for the tag, so a binary
+# parameter and a text one reach storage in exactly the same form.
+_GEO_BINARY: dict[int, Any] = {
+    600: lambda b: "({},{})".format(*_f8s(b, 2)),  # point
+    601: lambda b: "[({},{}),({},{})]".format(*_f8s(b, 4)),  # lseg
+    602: _decode_path,  # path
+    603: lambda b: "({},{}),({},{})".format(*_f8s(b, 4)),  # box
+    604: _decode_polygon,  # polygon
+    628: lambda b: "{{{},{},{}}}".format(*_f8s(b, 3)),  # line — coefficients A,B,C
+    718: lambda b: "<({},{}),{}>".format(*_f8s(b, 3)),  # circle
+}
+
+
 # Binary parameter decoders by Postgres type OID. The text format (fmt 0) decodes
 # to str and rides column-type coercion; libpq clients (psycopg) send many types
 # in binary. Types whose storage form is canonical text (time / inet / uuid /
@@ -242,6 +277,16 @@ _BINARY = {
     2950: _decode_uuid,  # uuid
     3802: _decode_jsonb,  # jsonb
 }
+_BINARY.update(
+    {
+        oid: (
+            lambda b, _d=dec, _t=typemap.OID_TO_TAG[oid]: typemap.TaggedText(
+                pggeo.canonical(_d(b), _t), _t
+            )
+        )
+        for oid, dec in _GEO_BINARY.items()
+    }
+)
 _BINARY.update(
     {
         oid: (

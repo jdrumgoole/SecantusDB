@@ -24,6 +24,13 @@ from dataclasses import dataclass
 
 _INT32 = struct.Struct("!i")
 _INT16 = struct.Struct("!h")
+#: The protocol's 16-bit COUNT fields (parameters, columns) are used unsigned:
+#: Postgres allows up to 65535 parameters in one Bind, and a count above 32767
+#: read as signed comes back negative — which walked the parse offset backwards
+#: and died with "not enough data to unpack 4 bytes at offset -2". Packing a
+#: count that large signed fails outright. Fields that can legitimately be
+#: negative — attnum, type size (-1 for varlena), format codes — stay _INT16.
+_UINT16 = struct.Struct("!H")
 
 # Magic codes carried in the first Int32 of a startup-class packet.
 PROTOCOL_VERSION_3 = 196608  # 3.0 << 16
@@ -203,7 +210,7 @@ def parse_parse(payload: bytes, encoding: str | None = "utf-8") -> tuple[str, st
     end = payload.index(b"\x00", offset)
     query = decode_text(payload[offset:end], encoding)
     offset = end + 1
-    (n,) = _INT16.unpack_from(payload, offset)
+    (n,) = _UINT16.unpack_from(payload, offset)
     offset += 2
     oids = [_INT32.unpack_from(payload, offset + 4 * i)[0] for i in range(n)]
     return name, query, oids
@@ -213,11 +220,11 @@ def parse_bind(payload: bytes) -> tuple[str, str, list[int], list[bytes | None],
     """'B' Bind: (portal, statement, param_format_codes, param_values, result_formats)."""
     portal, offset = _read_cstr(payload, 0)
     statement, offset = _read_cstr(payload, offset)
-    (n_fmt,) = _INT16.unpack_from(payload, offset)
+    (n_fmt,) = _UINT16.unpack_from(payload, offset)
     offset += 2
     formats = [_INT16.unpack_from(payload, offset + 2 * i)[0] for i in range(n_fmt)]
     offset += 2 * n_fmt
-    (n_params,) = _INT16.unpack_from(payload, offset)
+    (n_params,) = _UINT16.unpack_from(payload, offset)
     offset += 2
     values: list[bytes | None] = []
     for _ in range(n_params):
@@ -228,7 +235,7 @@ def parse_bind(payload: bytes) -> tuple[str, str, list[int], list[bytes | None],
         else:
             values.append(payload[offset : offset + length])
             offset += length
-    (n_res,) = _INT16.unpack_from(payload, offset)
+    (n_res,) = _UINT16.unpack_from(payload, offset)
     offset += 2
     result_formats = [_INT16.unpack_from(payload, offset + 2 * i)[0] for i in range(n_res)]
     return portal, statement, formats, values, result_formats
@@ -364,7 +371,7 @@ def row_description(
     per-column result format codes (0=text, 1=binary), defaulting to all-text.
     Column names encode in the client's ``client_encoding`` (``encoding``;
     UTF-8 when None). A missing typmod emits -1 (no modifier)."""
-    payload = bytearray(_INT16.pack(len(columns)))
+    payload = bytearray(_UINT16.pack(len(columns)))
     for i, col in enumerate(columns):
         name, type_oid = col[0], col[1]
         typmod = col[2] if len(col) > 2 else -1
@@ -379,7 +386,7 @@ def row_description(
 
 
 def data_row(values: list[bytes | None]) -> bytes:
-    payload = bytearray(_INT16.pack(len(values)))
+    payload = bytearray(_UINT16.pack(len(values)))
     for v in values:
         if v is None:
             payload += _INT32.pack(-1)
@@ -461,7 +468,7 @@ def copy_in_response(column_count: int, *, binary: bool = False) -> bytes:
     """``CopyInResponse`` ('G') — the server's go-ahead for ``COPY … FROM STDIN``.
     All columns use the overall format (0=text / 1=binary)."""
     fmt = 1 if binary else 0
-    payload = bytearray([fmt]) + _INT16.pack(column_count)
+    payload = bytearray([fmt]) + _UINT16.pack(column_count)
     for _ in range(column_count):
         payload += _INT16.pack(fmt)
     return _msg("G", bytes(payload))
@@ -470,7 +477,7 @@ def copy_in_response(column_count: int, *, binary: bool = False) -> bytes:
 def copy_out_response(column_count: int, *, binary: bool = False) -> bytes:
     """``CopyOutResponse`` ('H') — the server starting ``COPY … TO STDOUT``."""
     fmt = 1 if binary else 0
-    payload = bytearray([fmt]) + _INT16.pack(column_count)
+    payload = bytearray([fmt]) + _UINT16.pack(column_count)
     for _ in range(column_count):
         payload += _INT16.pack(fmt)
     return _msg("H", bytes(payload))
@@ -504,7 +511,7 @@ def close_complete() -> bytes:
 
 
 def parameter_description(type_oids: list[int]) -> bytes:
-    payload = bytearray(_INT16.pack(len(type_oids)))
+    payload = bytearray(_UINT16.pack(len(type_oids)))
     for oid in type_oids:
         payload += _INT32.pack(oid)
     return _msg("t", bytes(payload))
@@ -539,7 +546,7 @@ def build_terminate() -> bytes:
 def build_parse(statement: str, query: str, param_oids: list[int] | None = None) -> bytes:
     """Client-side helper: 'P' Parse."""
     oids = param_oids or []
-    payload = bytearray(_cstr(statement) + _cstr(query) + _INT16.pack(len(oids)))
+    payload = bytearray(_cstr(statement) + _cstr(query) + _UINT16.pack(len(oids)))
     for oid in oids:
         payload += _INT32.pack(oid)
     return _msg("P", bytes(payload))
@@ -553,7 +560,7 @@ def build_bind(
     """Client-side helper: 'B' Bind with all params in text format, text results."""
     payload = bytearray(_cstr(portal) + _cstr(statement))
     payload += _INT16.pack(0)  # zero format codes => all params text
-    payload += _INT16.pack(len(params))
+    payload += _UINT16.pack(len(params))
     for p in params:
         if p is None:
             payload += _INT32.pack(-1)
@@ -580,13 +587,13 @@ def build_sync() -> bytes:
 
 
 def parse_parameter_description(payload: bytes) -> list[int]:
-    (count,) = _INT16.unpack_from(payload, 0)
+    (count,) = _UINT16.unpack_from(payload, 0)
     return [_INT32.unpack_from(payload, 2 + 4 * i)[0] for i in range(count)]
 
 
 def parse_row_description(payload: bytes) -> list[str]:
     """Client-side helper: column names out of a 'T' message payload."""
-    (count,) = _INT16.unpack_from(payload, 0)
+    (count,) = _UINT16.unpack_from(payload, 0)
     names: list[str] = []
     offset = 2
     for _ in range(count):
@@ -598,7 +605,7 @@ def parse_row_description(payload: bytes) -> list[str]:
 
 def parse_data_row(payload: bytes) -> list[bytes | None]:
     """Client-side helper: column values out of a 'D' message payload."""
-    (count,) = _INT16.unpack_from(payload, 0)
+    (count,) = _UINT16.unpack_from(payload, 0)
     values: list[bytes | None] = []
     offset = 2
     for _ in range(count):
