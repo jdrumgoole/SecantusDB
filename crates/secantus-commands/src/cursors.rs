@@ -83,6 +83,12 @@ pub struct TailableOptions {
     /// Docs matched at creation time that didn't fit the first batch; drained
     /// before the producer is consulted.
     pub initial_remaining: Vec<Vec<u8>>,
+    /// Whether this is a change stream rather than a plain capped-collection
+    /// tail. A dropped collection is signalled differently for the two: a
+    /// change stream drives its own invalidation through the producer's final
+    /// `invalidate` event, while a plain tail gets a `QueryPlanKilled`
+    /// "collection dropped" error. Mirrors `cursors._Entry.change_stream`.
+    pub change_stream: bool,
 }
 
 struct Entry {
@@ -92,6 +98,10 @@ struct Entry {
     tailable: bool,
     await_data: bool,
     no_cursor_timeout: bool,
+    change_stream: bool,
+    /// Tombstoned by `kill_namespace`: the collection was dropped out from
+    /// under a plain tailable cursor, and the next getMore must say so.
+    dropped: bool,
     // The tailable fields below are written by `register_tailable` but only read
     // by the change-stream getMore slice (deferred), so they're allow(dead_code)
     // until that lands.
@@ -202,6 +212,8 @@ impl CursorRegistry {
                 remaining: remaining.into_iter().collect(),
                 last_access: now,
                 tailable: false,
+                change_stream: false,
+                dropped: false,
                 await_data: false,
                 no_cursor_timeout: false,
                 producer: None,
@@ -238,6 +250,8 @@ impl CursorRegistry {
                 remaining: opts.initial_remaining.into_iter().collect(),
                 last_access: now,
                 tailable: true,
+                change_stream: opts.change_stream,
+                dropped: false,
                 await_data: opts.await_data,
                 no_cursor_timeout: opts.no_cursor_timeout,
                 producer: Some(producer),
@@ -384,24 +398,49 @@ impl CursorRegistry {
         (killed, not_found)
     }
 
-    /// Drop every cursor open on `namespace` (a `db.coll` string), returning the
-    /// count. mongod kills a collection's cursors when it's dropped or renamed,
-    /// so a later `getMore` fails with `CursorNotFound`; SecantusDB's cursors
-    /// hold detached snapshots, so without this they'd keep serving rows after
-    /// the collection is gone (mongo-c-driver's `error_document/getmore` test).
-    /// Mirrors `cursors.kill_namespace`.
+    /// Kill every cursor open on `namespace` (a `db.coll` string), returning the
+    /// count. mongod kills a collection's cursors when it's dropped or renamed;
+    /// SecantusDB's cursors hold detached snapshots, so without this they'd keep
+    /// serving rows after the collection is gone.
+    ///
+    /// The three kinds are treated differently, mirroring
+    /// `cursors.kill_namespace`:
+    ///
+    /// * **Non-tailable** — removed outright, so the next `getMore` is
+    ///   `CursorNotFound` (mongo-c-driver's `error_document/getmore`).
+    /// * **Plain tailable** — *tombstoned* (`dropped = true`, entry kept) so the
+    ///   next `getMore` can return `QueryPlanKilled` "collection dropped", which
+    ///   is what mongod tells a tailing client and what mongo-php-driver's
+    ///   `cursor-tailable_error-001` asserts on. A bare `CursorNotFound` doesn't
+    ///   say why the tail ended.
+    /// * **Change streams** — left alone: they drive their own drop/rename
+    ///   invalidation through the producer's final `invalidate` event, and
+    ///   tombstoning would replace that event with an error.
     pub fn kill_namespace(&self, namespace: &str) -> usize {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let doomed: Vec<i64> = inner
+        let affected: Vec<i64> = inner
             .cursors
             .iter()
-            .filter(|(_, e)| e.namespace == namespace)
+            .filter(|(_, e)| e.namespace == namespace && !e.change_stream)
             .map(|(&cid, _)| cid)
             .collect();
-        for cid in &doomed {
-            inner.cursors.remove(cid);
+        for cid in &affected {
+            let tailable = inner.cursors.get(cid).is_some_and(|e| e.tailable);
+            if tailable {
+                if let Some(e) = inner.cursors.get_mut(cid) {
+                    e.dropped = true;
+                }
+            } else {
+                inner.cursors.remove(cid);
+            }
         }
-        doomed.len()
+        affected.len()
+    }
+
+    /// Whether this cursor was tombstoned by a drop/rename of its collection.
+    pub fn was_dropped(&self, cursor_id: i64) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.cursors.get(&cursor_id).is_some_and(|e| e.dropped)
     }
 
     /// Mark a cursor invalidated (a blocked tailable getMore wakes and ends).
@@ -519,6 +558,21 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // else we answer CursorNotFound (don't confirm cursor ids across conns).
     if !info.namespace.is_empty() && ns != info.namespace {
         return Ok(cursor_not_found(cursor_id));
+    }
+    // The collection was dropped out from under a plain tailable cursor: say so
+    // before anything else, since any buffered rows are stale. mongod kills the
+    // plan executor with QueryPlanKilled (175) and names the namespace;
+    // mongo-php-driver's `cursor-tailable_error-001` asserts the message
+    // mentions "collection dropped" rather than a bare CursorNotFound, which
+    // wouldn't tell a tailing client why its tail ended.
+    if cursors.was_dropped(cursor_id) {
+        cursors.kill(&[cursor_id]);
+        return Ok(CommandError::new(
+            175,
+            "QueryPlanKilled",
+            format!("collection dropped: {}", info.namespace),
+        )
+        .into_reply());
     }
     if info.tailable {
         let storage = ctx.storage()?;
@@ -972,5 +1026,87 @@ mod tests {
             &vec![Bson::Int64(42)]
         );
         assert_eq!(reg.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod drop_tombstone_tests {
+    use super::*;
+
+    struct Noop;
+    impl CursorProducer for Noop {
+        fn produce(&mut self) -> Vec<Vec<u8>> {
+            vec![]
+        }
+        fn position(&self) -> i64 {
+            0
+        }
+        fn invalidated(&self) -> bool {
+            false
+        }
+    }
+
+    fn tailable(reg: &CursorRegistry, ns: &str, change_stream: bool) -> i64 {
+        reg.register_tailable(
+            ns,
+            Box::new(Noop),
+            TailableOptions {
+                change_stream,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// A plain tail is tombstoned, not removed: the next getMore has to be able
+    /// to say *why* the tail ended. mongo-php-driver's
+    /// `cursor-tailable_error-001` asserts on "collection dropped", which a
+    /// bare CursorNotFound cannot convey.
+    #[test]
+    fn a_dropped_collection_tombstones_a_plain_tailable_cursor() {
+        let reg = CursorRegistry::new();
+        let cid = tailable(&reg, "t.c", false);
+        assert_eq!(reg.kill_namespace("t.c"), 1);
+        assert!(
+            reg.was_dropped(cid),
+            "the entry must survive, flagged dropped"
+        );
+        assert!(reg.info(cid).is_ok(), "tombstoned, not removed");
+    }
+
+    /// A non-tailable cursor is removed outright — a later getMore is
+    /// CursorNotFound (mongo-c-driver's `error_document/getmore`).
+    #[test]
+    fn a_dropped_collection_removes_a_non_tailable_cursor() {
+        let reg = CursorRegistry::new();
+        let cid = reg.register("t.c", vec![vec![1, 2, 3]]).unwrap();
+        assert_eq!(reg.kill_namespace("t.c"), 1);
+        assert!(reg.info(cid).is_err(), "removed, not tombstoned");
+        assert!(!reg.was_dropped(cid));
+    }
+
+    /// Change streams are left alone: they signal a drop through their own
+    /// final `invalidate` event, and a tombstone would replace that event with
+    /// an error.
+    #[test]
+    fn a_dropped_collection_leaves_change_streams_alone() {
+        let reg = CursorRegistry::new();
+        let cid = tailable(&reg, "t.c", true);
+        assert_eq!(
+            reg.kill_namespace("t.c"),
+            0,
+            "change streams are not counted"
+        );
+        assert!(!reg.was_dropped(cid), "no tombstone on a change stream");
+        assert!(reg.info(cid).is_ok(), "and it stays alive");
+    }
+
+    /// Only the dropped namespace is affected.
+    #[test]
+    fn other_namespaces_are_untouched() {
+        let reg = CursorRegistry::new();
+        let other = tailable(&reg, "t.other", false);
+        assert_eq!(reg.kill_namespace("t.c"), 0);
+        assert!(!reg.was_dropped(other));
     }
 }

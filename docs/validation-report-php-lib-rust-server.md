@@ -15,12 +15,12 @@ Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the 
 | `tests/Database` | 70 | 0 | 0 | 70 | 100.0% |
 | `tests/Functions` | 0 | 2 | 2 | 4 | 0.0% |
 | `tests/Model` | 141 | 1 | 0 | 142 | 99.3% |
-| `tests/Operation` | 1898 | 4 | 36 | 1938 | 99.8% |
-| **Overall** | **3049** | **42** | **39** | **3130** | **98.6%** |
+| `tests/Operation` | 1899 | 3 | 36 | 1938 | 99.8% |
+| **Overall** | **3050** | **41** | **39** | **3130** | **98.7%** |
 
-Run time: 3.61s.
+Run time: 2.94s.
 
-## Failures (42)
+## Failures (41)
 
 First 30 failed cases for triage:
 
@@ -28,7 +28,6 @@ First 30 failed cases for triage:
 tests/Operation :: MongoDB\Tests\Operation\AggregateFunctionalTest::testReadPreferenceWithinTransaction
 tests/Operation :: MongoDB\Tests\Operation\FindFunctionalTest::testReadPreferenceWithinTransaction
 tests/Operation :: MongoDB\Tests\Operation\WatchFunctionalTest::testResumeTokenInvalidTypeServerSideError
-tests/Operation :: MongoDB\Tests\Operation\WatchFunctionalTest::testSessionFreed
 tests/Collection :: MongoDB\Tests\Collection\CodecCollectionFunctionalTest::testFindOneAndReplace with data set "BSON type map"
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testAggregateWithinTransaction
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testFindWithinTransaction
@@ -55,8 +54,9 @@ tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMetho
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "findOneAndReplace"
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "findOneAndUpdate"
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "insertMany"
+tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "insertOne"
 ```
-... and 12 more (see JUnit XML).
+... and 11 more (see JUnit XML).
 
 ## How this is generated
 

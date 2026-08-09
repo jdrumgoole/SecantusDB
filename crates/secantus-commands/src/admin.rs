@@ -497,15 +497,19 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "drop")?;
     let ns = format!("{}.{}", ctx.db_name, coll);
     let storage = ctx.storage()?;
-    let existed = storage
-        .drop_collection(&ctx.db_name, &coll)
-        .map_err(command_error)?;
-    // Dropping a collection kills its open cursors so a later getMore fails with
-    // CursorNotFound rather than serving stale snapshot rows (mongo-c-driver's
-    // error_document/getmore). Mirrors commands.py::_drop.
+    // Kill the collection's cursors BEFORE the storage drop, not after: the
+    // drop emits an oplog entry that wakes any awaitData getMore parked on a
+    // tailable cursor, and that getMore must observe the tombstone set here so
+    // it reports "collection dropped" instead of re-polling a collection that
+    // is already gone. Non-tailable cursors are removed outright, so a later
+    // getMore is CursorNotFound (mongo-c-driver's error_document/getmore).
+    // Mirrors commands.py::_drop.
     if let Ok(cursors) = ctx.cursors() {
         cursors.kill_namespace(&ns);
     }
+    let existed = storage
+        .drop_collection(&ctx.db_name, &coll)
+        .map_err(command_error)?;
     if !existed {
         // Modern mongod treats `drop` of a non-existent collection as an
         // idempotent success (`{ok: 1}`), not a NamespaceNotFound error. The

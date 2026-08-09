@@ -298,6 +298,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
             &ns,
             producer,
             TailableOptions {
+                change_stream: true,
                 await_data: true,
                 no_cursor_timeout: false,
                 position_seq: open_position,
