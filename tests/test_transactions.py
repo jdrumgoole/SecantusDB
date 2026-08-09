@@ -372,3 +372,32 @@ def test_aborted_ddl_rolls_back(client):
     # The namespace is fully reusable after the rollback.
     db["ghost_coll"].insert_one({"_id": "fresh"})
     assert db["ghost_coll"].count_documents({}) == 1
+
+
+def test_transaction_too_large_for_cache(tmp_path):
+    # An oversized multi-document transaction is rejected with mongod's
+    # TransactionTooLargeForCache (313) BEFORE its unevictable dirty
+    # content can stall the storage engine. Not transient — retrying the
+    # same transaction would hit the same wall — and the failed statement
+    # aborts the transaction server-side (mongod parity).
+    with SecantusDBServer(port=0, storage_path=str(tmp_path), cache_size="128M") as srv:
+        client = MongoClient(f"mongodb://127.0.0.1:{srv.address[1]}/")
+        try:
+            coll = client.txndb.big
+            docs = [{"_id": i, "pad": "x" * (1024 * 1024)} for i in range(16)]
+            with client.start_session() as sess:
+                sess.start_transaction()
+                with pytest.raises(OperationFailure) as exc_info:
+                    coll.insert_many(docs, session=sess)
+                assert exc_info.value.code == 313
+                assert "TransientTransactionError" not in (
+                    exc_info.value.details.get("errorLabels") or []
+                )
+                sess.abort_transaction()
+            # Nothing from the aborted transaction is visible.
+            assert coll.count_documents({}) == 0
+            # The same payload outside a transaction inserts fine.
+            coll.insert_many(docs)
+            assert coll.count_documents({}) == 16
+        finally:
+            client.close()
