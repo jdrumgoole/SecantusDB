@@ -91,6 +91,7 @@ from secantus.storage import (
     DuplicateKeyError,
     GeoExtractError,
     Storage,
+    TransactionTooLargeError,
     WriteConflictError,
     _is_wt_rollback,
 )
@@ -6768,6 +6769,19 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             result = handler(doc, ctx)
     except WriteConflictError:
         result = _write_conflict_reply(label=txn is not None)
+    except TransactionTooLargeError as exc:
+        # mongod's guard for a transaction whose unevictable dirty content
+        # would stall the storage engine. Deliberately NOT in
+        # _TRANSIENT_TXN_CODES: retrying the same oversized transaction
+        # would hit the same wall, so no TransientTransactionError label;
+        # the failed statement still aborts the transaction server-side
+        # (_finish_txn_statement).
+        result = {
+            "ok": 0.0,
+            "errmsg": str(exc),
+            "code": 313,
+            "codeName": "TransactionTooLargeForCache",
+        }
     except changestreams.ChangeStreamFatalError as exc:
         # Change-stream fatal conditions (resume token projected out,
         # fullDocument: "required" miss, pre-image not stored) surface

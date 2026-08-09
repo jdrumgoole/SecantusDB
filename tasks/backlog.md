@@ -5140,13 +5140,22 @@ distinct problems, triaged from the run logs:
   `tests/batch_insert.rs::large_batch_insert_survives_a_small_cache`
   (35k × 1.1KB @ 128M cache) + ordered/unordered cross-chunk semantics
   tests.
-- [ ] **User (multi-document) transactions can still exceed the dirty
-  budget** on either server — statements join the user transaction, so
-  chunking doesn't apply and a client that stuffs ~hundreds of MB of writes
-  into one transaction can still hit the WT stall. Real mongod surfaces
-  `TransactionTooLargeForCache`; we have no equivalent guard. Low priority
-  (drivers' tests don't do this), but it is the remaining member of the
-  class.
+- [ ] **User (multi-document) transactions dirty-budget guard** — the
+  remaining member of the livelock class. **Python server: DONE
+  (txn-too-large-guard slice)** — `_emit_oplog`'s buffering branch tracks
+  the transaction's approximate write volume (`handle.dirty_bytes`, from
+  the full-doc oplog entries; engine dirty ≈ 2×) and raises past ~15% of
+  the cache (0.75 × WT's ~20% dirty trigger, mirroring mongod's
+  threshold), surfaced as mongod's `TransactionTooLargeForCache` (313, no
+  transient label — a retry would hit the same wall; the failed statement
+  aborts the transaction server-side). Pinned by
+  `test_storage_user_txn.py::test_transaction_dirty_budget_guard` and
+  `test_transactions.py::test_transaction_too_large_for_cache` (128M
+  cache). **Rust server: still open** — its user-transaction statements
+  join one WT transaction the same way; mirror the buffered-bytes guard in
+  `UserTransactionHandle` / the emit-buffer path (its 4G default cache
+  puts the trip at ~600MB, so exposure needs a small `--cache-size`, same
+  as the insert case was).
 - ~~**`slt` gauge "regression"**~~ — NOT a regression; **timeout calibration,
   fixed (rust-gauge-wedge slice).** 2026-08-03 was the slt lane's FIRST
   weekly run (the SQL gauge lanes postdate the 2026-07-27 schedule), and the

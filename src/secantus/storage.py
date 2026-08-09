@@ -966,6 +966,36 @@ class IndexConflict(Exception):
         self.key_value = key_value
 
 
+def _parse_cache_bytes(cache_size: str) -> int:
+    """Parse a WiredTiger cache-size string ("128M", "1G", "512K", plain
+    bytes) to bytes. Unknown forms fall back to the 1G default rather than
+    failing storage open over a tuning knob."""
+    s = cache_size.strip().upper()
+    mult = 1
+    for suffix, m in (("K", 1024), ("M", 1024**2), ("G", 1024**3), ("T", 1024**4)):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+            mult = m
+            break
+    try:
+        return int(float(s) * mult)
+    except ValueError:
+        return 1024**3
+
+
+class TransactionTooLargeError(Exception):
+    """A multi-document transaction's buffered write volume exceeded the
+    storage cache's dirty budget. Raised BEFORE the transaction can pin
+    enough unevictable dirty content to livelock WiredTiger (the same
+    engine-stall class the chunked-insert work closed for plain batch
+    writes — a user transaction's statements all join one WT transaction,
+    so chunking cannot apply and the guard must be explicit). Caught at
+    the command layer and surfaced as mongod's ``TransactionTooLargeForCache``
+    (313), which mongod introduced for exactly this condition; the failed
+    statement aborts the transaction and carries NO transient label —
+    retrying an oversized transaction would hit the same wall."""
+
+
 class WriteConflictError(Exception):
     """A WiredTiger WT_ROLLBACK: two transactions touched the same item.
 
@@ -1143,6 +1173,7 @@ class UserTransactionHandle:
         "oplog_entries",
         "pre_images",
         "written",
+        "dirty_bytes",
     )
 
     def __init__(self, session: Any) -> None:
@@ -1158,6 +1189,12 @@ class UserTransactionHandle:
         # row, the committed view of that row is stale and would report a
         # conflict against a value the transaction has already freed.
         self.written: set[tuple[str, str]] = set()
+        # Approximate bytes this transaction has written, accumulated from
+        # its buffered oplog entries (which carry the full documents). The
+        # engine-side dirty footprint is roughly twice this (doc rows +
+        # oplog rows) plus index entries; ``_emit_oplog``'s buffering
+        # branch enforces the cache-derived budget against it.
+        self.dirty_bytes = 0
 
 
 class DocumentValidationError(Exception):
@@ -1327,6 +1364,16 @@ class Storage:
         self._in_memory = path == ":memory:"
         # Stashed for reuse in restore-archive / explain output.
         self.cache_size = cache_size
+        # Dirty budget for one multi-document transaction, derived from the
+        # cache: WT starts stalling application threads around its dirty
+        # trigger (~20% of cache), and dirty content belonging to an OPEN
+        # transaction is unevictable — a transaction allowed to fill that
+        # budget livelocks the engine (only its own commit could free the
+        # cache). mongod guards the same hazard with
+        # ``TransactionTooLargeForCache``; 0.75 of the dirty trigger mirrors
+        # its threshold default. The estimate compared against it is
+        # 2 x buffered-entry bytes (doc rows + oplog rows).
+        self._txn_dirty_limit = int(_parse_cache_bytes(cache_size) * 0.20 * 0.75)
         self.session_max = session_max
         self.sync_on_commit = sync_on_commit
         # ``durable`` (I2a test-mode fast storage). Resolution precedence:
@@ -2439,6 +2486,14 @@ class Storage:
             return 0
         handle = getattr(self._tls, "user_txn", None)
         if handle is not None:
+            handle.dirty_bytes += sum(len(bson.encode(e)) for e in entries)
+            if 2 * handle.dirty_bytes > self._txn_dirty_limit:
+                # The statement's partial writes roll back with the
+                # transaction (any failed in-txn statement aborts it
+                # server-side, mongod parity).
+                raise TransactionTooLargeError(
+                    "Transaction is too large and will not fit in the storage engine cache"
+                )
             if self.enable_oplog and entries:
                 if pre_images is None:
                     pre_images = [None] * len(entries)
