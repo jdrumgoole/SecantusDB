@@ -7185,6 +7185,14 @@ impl Storage {
             // 2dsphere S2 index: covering cells + ancestors per geometry-valued
             // doc. Flagged multikey (one doc → many cell entries).
             stored_options.insert("multikey", Bson::Boolean(true));
+            // mongod stamps every 2dsphere index with its format version (3
+            // since 3.2) and drivers surface it through listIndexes — the PHP
+            // library's `IndexInfo::is2dSphere` / `['2dsphereIndexVersion']`
+            // assertion reads it and got null. `2d` indexes carry no such
+            // field. Mirrors `storage.create_index`.
+            stored_options
+                .entry("2dsphereIndexVersion".to_string())
+                .or_insert(Bson::Int32(3));
             let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
             for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
                 let d = decode_doc(&blob)?;

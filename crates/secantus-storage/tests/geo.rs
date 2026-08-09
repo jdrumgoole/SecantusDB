@@ -317,3 +317,38 @@ fn create_2dsphere_over_existing_data() {
         assert_eq!(found_ids(st, q), vec![1]);
     });
 }
+
+/// mongod stamps a 2dsphere index with its format version and drivers read it
+/// back through `listIndexes`; the PHP library's `IndexInfo::is2dSphere` /
+/// `['2dsphereIndexVersion']` assertion requires `>= 3` and was getting null.
+/// A `2d` index carries no such field.
+#[test]
+fn two_dsphere_index_is_stamped_with_its_format_version() {
+    with_db(|st| {
+        make_2dsphere(st);
+        let idx = st
+            .list_indexes("app", "c")
+            .unwrap()
+            .into_iter()
+            .find(|i| i.get_str("name") == Ok("loc_2ds"))
+            .expect("the 2dsphere index");
+        assert_eq!(
+            idx.get_i32("2dsphereIndexVersion").ok(),
+            Some(3),
+            "2dsphere index must carry its format version: {idx:?}"
+        );
+
+        st.create_index("app", "c2", "p_2d", &doc! {"p": "2d"}, &doc! {})
+            .unwrap();
+        let flat = st
+            .list_indexes("app", "c2")
+            .unwrap()
+            .into_iter()
+            .find(|i| i.get_str("name") == Ok("p_2d"))
+            .expect("the 2d index");
+        assert!(
+            flat.get("2dsphereIndexVersion").is_none(),
+            "a 2d index carries no 2dsphere version: {flat:?}"
+        );
+    });
+}
