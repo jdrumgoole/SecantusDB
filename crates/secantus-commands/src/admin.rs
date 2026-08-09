@@ -74,6 +74,14 @@ fn collection_option_subset(doc: &Document) -> Document {
 /// `create` — create a collection, persisting recognised options.
 pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "create")?;
+    if let Some(unknown) = first_unknown_field(doc, CREATE_KNOWN_OPTIONS) {
+        return Ok(CommandError::new(
+            40415,
+            "Location40415",
+            format!("BSON field 'create.{unknown}' is an unknown field"),
+        )
+        .into_reply());
+    }
     // Build the options up front so they ride the `create` oplog entry (carried
     // by create_collection_with_options) — that's what lets PITR replay
     // reconstruct capped / validator / … rather than seeing a bare create.
@@ -983,6 +991,20 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             .and_then(Bson::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| default_index_name(&key));
+        // Unknown fields on the spec itself are rejected, not ignored.
+        let spec_opts: Document = s
+            .iter()
+            .filter(|(k, _)| k.as_str() != "key" && k.as_str() != "name")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if let Some(unknown) = first_unknown_field(&spec_opts, INDEX_SPEC_KNOWN_OPTIONS) {
+            return Ok(CommandError::new(
+                40415,
+                "Location40415",
+                format!("Error in specification {s:?}: the field '{unknown}' is an unknown field"),
+            )
+            .into_reply());
+        }
         // Guard the index name against an embedded NUL before it reaches the
         // WT key encoder (see crate::nul_in_namespace / #139).
         if let Some(e) = crate::nul_in_namespace("index name", &name) {
@@ -1455,6 +1477,93 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 }
 
+/// Options mongod's index-spec IDL accepts, plus the legacy / deprecated forms
+/// drivers still emit. Anything outside this set is an unknown field.
+/// Mirrors `commands._INDEX_SPEC_KNOWN_OPTIONS` — keep the two in step.
+const INDEX_SPEC_KNOWN_OPTIONS: &[&str] = &[
+    // Geometric / vector indexes.
+    "2dsphereIndexVersion",
+    "bits",
+    "min",
+    "max",
+    // Wildcard.
+    "wildcardProjection",
+    // Standard knobs.
+    "unique",
+    "sparse",
+    "hidden",
+    "background",
+    "expireAfterSeconds",
+    "partialFilterExpression",
+    "collation",
+    "storageEngine",
+    // Text — accepted on the wire even though text indexes are unsupported
+    // (storage rejects them with CreateIndexUnsupported).
+    "weights",
+    "default_language",
+    "language_override",
+    "textIndexVersion",
+    // Index format version + namespace (legacy drivers).
+    "v",
+    "ns",
+    // Haystack (deprecated).
+    "bucketSize",
+    // Removed in MongoDB 3.0; modern mongod accepts and silently ignores it,
+    // so a unique index over duplicate data still fails on the duplicate
+    // rather than on an unknown-field error.
+    "dropDups",
+];
+
+/// Top-level options the `create` command accepts, plus the wire-envelope
+/// fields a driver may attach. Mirrors `commands._CREATE_KNOWN_OPTIONS`.
+const CREATE_KNOWN_OPTIONS: &[&str] = &[
+    "create",
+    "capped",
+    "size",
+    "max",
+    "validator",
+    "validationAction",
+    "validationLevel",
+    "viewOn",
+    "pipeline",
+    "collation",
+    "expireAfterSeconds",
+    "timeseries",
+    "clusteredIndex",
+    "changeStreamPreAndPostImages",
+    "storageEngine",
+    "indexOptionDefaults",
+    "writeConcern",
+    "comment",
+    "maxTimeMS",
+    // mongorestore sends the source collection's full `_id_` spec.
+    "idIndex",
+    // Legacy / deprecated but tolerated.
+    "autoIndexId",
+    "flags",
+    // Non-`$`-prefixed envelope fields ( `$`-prefixed keys are accepted
+    // unconditionally by the caller).
+    "lsid",
+    "txnNumber",
+    "autocommit",
+    "startTransaction",
+    "readConcern",
+    "apiVersion",
+    "apiStrict",
+    "apiDeprecationErrors",
+];
+
+/// The first field of `doc` outside `known`, ignoring `$`-prefixed envelope
+/// keys. mongod surfaces an unknown field as `Location40415` (IDLUnknownField)
+/// rather than ignoring it, and driver suites rely on that: mongo-ruby-driver's
+/// "a failed operation using a session" shared specs provoke it deliberately by
+/// passing `invalid: true` and asserting an `OperationFailure`.
+fn first_unknown_field(doc: &Document, known: &[&str]) -> Option<String> {
+    doc.keys()
+        .find(|k| !k.starts_with('$') && !known.contains(&k.as_str()))
+        .cloned()
+}
+
 /// Split a `db.coll` namespace into `(db, coll)`.
 fn split_ns(ns: &str) -> (String, String) {
     match ns.split_once('.') {
@@ -1479,4 +1588,208 @@ fn default_index_name(key: &Document) -> String {
         })
         .collect::<Vec<_>>()
         .join("_")
+}
+
+/// `createSearchIndexes` / `updateSearchIndex` / `dropSearchIndex` — Atlas Search
+/// index management, an Atlas-only feature.
+///
+/// A real non-Atlas mongod *registers* these commands and fails them at
+/// execution with a message naming Atlas; the driver index-management spec
+/// tests assert only that the error mentions Atlas. Leaving them unregistered
+/// returns `CommandNotFound` (59) instead, which is what
+/// mongo-c-driver's `/index-management/{update,drop}SearchIndex` caught. The
+/// message is shared with the `$listSearchIndexes` stage so the two stay in
+/// lockstep. Mirrors `commands._search_index_not_supported`.
+pub fn search_index_not_supported(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    Ok(CommandError::new(
+        115,
+        "CommandNotSupported",
+        crate::aggregate::SEARCH_INDEX_ATLAS_MSG,
+    )
+    .into_reply())
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use bson::doc;
+
+    fn ctx() -> CommandContext {
+        let mut c = CommandContext::new(1);
+        c.db_name = "testdb".to_string();
+        c
+    }
+
+    fn err_of(reply: &Document) -> (i32, String, String) {
+        (
+            reply.get_i32("code").unwrap_or_default(),
+            reply.get_str("codeName").unwrap_or_default().to_string(),
+            reply.get_str("errmsg").unwrap_or_default().to_string(),
+        )
+    }
+
+    /// mongo-c-driver's `/index-management/{update,drop}SearchIndex` assert the
+    /// error names Atlas. Leaving the commands unregistered returned
+    /// `CommandNotFound` (59) instead.
+    #[test]
+    fn search_index_commands_report_atlas_not_command_not_found() {
+        for name in [
+            "createSearchIndexes",
+            "updateSearchIndex",
+            "dropSearchIndex",
+        ] {
+            assert!(
+                crate::lookup_for_test(name).is_some(),
+                "{name} must be registered, not CommandNotFound"
+            );
+        }
+        let reply = search_index_not_supported(&doc! {"dropSearchIndex": "c"}, &mut ctx()).unwrap();
+        let (code, name, msg) = err_of(&reply);
+        assert_eq!((code, name.as_str()), (115, "CommandNotSupported"));
+        assert!(
+            msg.contains("Atlas"),
+            "the driver specs assert on 'Atlas': {msg}"
+        );
+    }
+
+    /// mongo-ruby-driver's "a failed operation using a session" shared specs
+    /// pass `invalid: true` and assert an `OperationFailure`; silently
+    /// accepting the unknown field made them fail.
+    #[test]
+    fn create_rejects_an_unknown_top_level_option() {
+        let reply = create(&doc! {"create": "c", "invalid": true}, &mut ctx()).unwrap();
+        let (code, name, msg) = err_of(&reply);
+        assert_eq!((code, name.as_str()), (40415, "Location40415"));
+        assert!(msg.contains("create.invalid"), "{msg}");
+    }
+
+    #[test]
+    fn create_still_accepts_every_known_option_and_the_wire_envelope() {
+        // A `$`-prefixed envelope key and the non-`$` ones must pass through.
+        let d = doc! {
+            "create": "c", "capped": true, "size": 4096_i64, "max": 512_i64,
+            "lsid": {"id": "x"}, "$db": "testdb", "writeConcern": {"w": 1},
+        };
+        assert!(
+            first_unknown_field(&d, CREATE_KNOWN_OPTIONS).is_none(),
+            "known options must not trip the unknown-field check"
+        );
+    }
+
+    /// End to end through `createIndexes`, which is what the Ruby spec drives:
+    /// `view.create_one({random: 1}, invalid: true)`.
+    #[test]
+    fn create_indexes_rejects_an_unknown_spec_option() {
+        let mut c = ctx();
+        c = c.with_storage(std::sync::Arc::new(FakeStorage));
+        let reply = create_indexes(
+            &doc! {
+                "createIndexes": "specs",
+                "indexes": [{"key": {"random": 1}, "name": "random_1", "invalid": true}],
+            },
+            &mut c,
+        )
+        .unwrap();
+        let (code, name, msg) = err_of(&reply);
+        assert_eq!((code, name.as_str()), (40415, "Location40415"));
+        assert!(msg.contains("invalid"), "{msg}");
+    }
+
+    #[test]
+    fn create_indexes_accepts_a_valid_spec() {
+        let mut c = ctx();
+        c = c.with_storage(std::sync::Arc::new(FakeStorage));
+        let reply = create_indexes(
+            &doc! {
+                "createIndexes": "specs",
+                "indexes": [{"key": {"a": 1}, "name": "a_1", "unique": true}],
+            },
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(reply.get_f64("ok").unwrap_or(0.0), 1.0, "{reply:?}");
+    }
+
+    /// Minimal in-memory `Storage`: only the methods without a default impl.
+    struct FakeStorage;
+
+    impl crate::Storage for FakeStorage {
+        fn insert(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _docs: Vec<Vec<u8>>,
+            _ordered: bool,
+        ) -> Result<(usize, Vec<Document>), crate::StorageError> {
+            Ok((0, Vec::new()))
+        }
+        fn update_matching(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+            _update: &Document,
+            _multi: bool,
+            _upsert: bool,
+        ) -> Result<crate::UpdateOutcome, crate::StorageError> {
+            Ok(crate::UpdateOutcome::default())
+        }
+        fn delete_matching(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+            _limit: usize,
+        ) -> Result<usize, crate::StorageError> {
+            Ok(0)
+        }
+        fn count_matching(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+        ) -> Result<usize, crate::StorageError> {
+            Ok(0)
+        }
+        fn find(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+            _sort: Option<&Document>,
+            _hint: Option<crate::storage::RawHint<'_>>,
+        ) -> Result<Vec<Vec<u8>>, crate::StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn index_spec_accepts_the_documented_options() {
+        for k in [
+            "unique",
+            "sparse",
+            "hidden",
+            "background",
+            "expireAfterSeconds",
+            "partialFilterExpression",
+            "collation",
+            "storageEngine",
+            "weights",
+            "v",
+            "ns",
+            "bucketSize",
+            "dropDups",
+            "2dsphereIndexVersion",
+            "bits",
+            "min",
+            "max",
+            "wildcardProjection",
+        ] {
+            let d = doc! { k: 1 };
+            assert!(
+                first_unknown_field(&d, INDEX_SPEC_KNOWN_OPTIONS).is_none(),
+                "{k} is a real mongod index option and must be accepted"
+            );
+        }
+    }
 }

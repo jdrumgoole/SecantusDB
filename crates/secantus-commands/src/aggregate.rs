@@ -341,7 +341,7 @@ const ATLAS_STAGES: &[&str] = &[
     "$vectorSearch",
 ];
 
-const SEARCH_INDEX_ATLAS_MSG: &str = "Using Atlas Search Database Commands and the \
+pub const SEARCH_INDEX_ATLAS_MSG: &str = "Using Atlas Search Database Commands and the \
 $listSearchIndexes aggregation stage requires additional configuration. Please connect to Atlas \
 or an Atlas-compatible deployment to use this feature.";
 
@@ -1429,7 +1429,19 @@ fn apply_coll_stats(
             "nindexes": indexes.len() as i32,
         };
         if storage.collection_is_capped(db, coll).unwrap_or(false) {
+            // mongod renames the user-set `size` to `maxSize` here, so a caller
+            // can tell the cap from the current data size. mongo-ruby-driver's
+            // `Collection#create ... applies the options` capped spec reads
+            // `storageStats.{capped, max, maxSize}` directly, so all three have
+            // to be present. Mirrors `aggregate._coll_stats`.
             storage_stats.insert("capped", true);
+            let opts = storage.get_collection_options(db, coll).unwrap_or_default();
+            if let Some(size) = opts.get("size").and_then(Bson::as_i64) {
+                storage_stats.insert("maxSize", size);
+            }
+            if let Some(max) = opts.get("max").and_then(Bson::as_i64) {
+                storage_stats.insert("max", max);
+            }
         }
         out.insert("storageStats", storage_stats);
     }
