@@ -4000,6 +4000,16 @@ impl Storage {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
+        // User-transaction dirty accounting — BEFORE the async-oplog branch,
+        // which early-returns after buffering (in async mode the guard never
+        // saw the bytes and the CI async-oplog lane hit the raw cache error
+        // the budget exists to prevent). The entries carry the full
+        // documents, so their byte volume is the budget input; harvested by
+        // `with_user_transaction`.
+        if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+            let sz: u64 = entries.iter().map(oplog_entry_size).sum();
+            PENDING_DIRTY_BYTES.with(|c| c.set(c.get() + sz));
+        }
         // Async oplog (prototype): inside an autocommit write statement, buffer
         // the entries instead of writing them in this transaction. They are minted
         // a seq and handed to the drainer by `with_statement_txn` after the data
@@ -4027,13 +4037,6 @@ impl Storage {
             return Ok(0);
         }
         let n = entries.len() as i64;
-        // User-transaction dirty accounting: the entries carry the full
-        // documents, so their byte volume is the budget input for the
-        // transaction-too-large guard (harvested by `with_user_transaction`).
-        if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
-            let sz: u64 = entries.iter().map(oplog_entry_size).sum();
-            PENDING_DIRTY_BYTES.with(|c| c.set(c.get() + sz));
-        }
         // Whose commit resolves this mint? Inside a `with_statement_txn` scope
         // or a user transaction the rows commit later — park the range in
         // `PENDING_MINTED` for the transaction's resolution point to
