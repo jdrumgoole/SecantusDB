@@ -4715,7 +4715,7 @@ The two *vulnerability*-class pyo3 advisories (RUSTSEC-2025-0020 / -2026-0177) a
 tracked separately in #584 (the 0.22 -> 0.29 migration) and are the two IDs on
 the gate's `--ignore` baseline. When #584 lands, drop those ignores.
 
-## Oplog in-flight window races on Windows CI (2026-08-01)
+## Oplog in-flight window races on Windows CI (2026-08-01) — RESOLVED by #743
 
 `tests/test_oplog_visibility.py::test_find_seq_for_ts_waits_for_in_flight_mint`
 fails intermittently on the Windows CI lanes (seen on PRs #739 and #741, both
@@ -4752,6 +4752,24 @@ lock-free dict read. Windows' coarser scheduling quantum likely just widens a
 window that exists everywhere.
 
 Do not "fix" this by deselecting the test or by widening a timeout again.
+
+**RESOLVED (verified 2026-08-09): this was the sample-after-scan bug #743
+fixed the same evening; the entry was written mid-investigation and never
+closed.** The timeline is decisive: every observed failure — including the
+still-failed-with-a-30s-bound runs — rode PRs #739 (16:02) and #741 (18:05)
+on 2026-08-01, and #743 ("sample the visible tail before the scan, not
+after — silent event loss") merged at 19:22 that day, touching exactly this
+test with the load-bearing sample-order comment now in
+``find_seq_for_ts``. Since #743: zero failures of this test across every
+lane (8 days of CI, Windows lanes on every push — the two later red runs
+that existed were the since-fixed ``test_math_funcs_via_driver`` numeric
+failures, no ``find_seq_for_ts`` involvement). Freshly re-verified against
+current main: a 500-iteration jittered stress of the exact choreography in
+fast-storage mode plus 500 more under ``SECANTUS_FORCE_DURABLE=1`` — zero
+failures — and a code audit of the invariants (range registration is atomic
+with minting under ``_oplog_seq_lock``; ``_mint_ts`` stays strictly
+monotonic even under a backwards wall clock; with the visible tail sampled
+before the scan, no event-loss interleaving is constructible).
 
 ## UNIQUE constraints across transactions (2026-08-01) — FIXED (storage + SQL)
 
