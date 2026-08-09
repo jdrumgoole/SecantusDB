@@ -335,6 +335,14 @@ pub fn command_name(doc: &Document) -> &str {
     doc.keys().next().map(String::as_str).unwrap_or("")
 }
 
+/// Test hook: whether a command name resolves to a handler at all. A name that
+/// doesn't is answered with `CommandNotFound`, which some driver suites treat
+/// as a different outcome from a registered-but-unsupported command.
+#[cfg(test)]
+pub(crate) fn lookup_for_test(name: &str) -> Option<Handler> {
+    lookup(name)
+}
+
 /// Resolve a command name (incl. case aliases) to its handler. `None` ⇒
 /// `CommandNotFound`. Families are added here as they are ported.
 fn lookup(name: &str) -> Option<Handler> {
@@ -367,6 +375,9 @@ fn lookup(name: &str) -> Option<Handler> {
         "listDatabases" => admin::list_databases,
         "listIndexes" => admin::list_indexes,
         "createIndexes" => admin::create_indexes,
+        "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" => {
+            admin::search_index_not_supported
+        }
         "dropIndexes" => admin::drop_indexes,
         "dropDatabase" => admin::drop_database,
         "renameCollection" => admin::rename_collection,
