@@ -5151,11 +5151,17 @@ distinct problems, triaged from the run logs:
   aborts the transaction server-side). Pinned by
   `test_storage_user_txn.py::test_transaction_dirty_budget_guard` and
   `test_transactions.py::test_transaction_too_large_for_cache` (128M
-  cache). **Rust server: still open** — its user-transaction statements
-  join one WT transaction the same way; mirror the buffered-bytes guard in
-  `UserTransactionHandle` / the emit-buffer path (its 4G default cache
-  puts the trip at ~600MB, so exposure needs a small `--cache-size`, same
-  as the insert case was).
+  cache). **Rust server: DONE (rust-txn-too-large slice)** — the same
+  guard, harvested through the `PENDING_DIRTY_BYTES` thread-local into
+  `UserTransactionHandle.dirty_bytes` per statement (the `PENDING_MINTED`
+  pattern), budget parsed from the connection config's `cache_size`
+  (default 4G → trips past ~300MB emitted), surfaced as 313 via the
+  adapter (`code_name_for` knows `TransactionTooLargeForCache`; not in
+  the transient set). Pinned by
+  `tests/txn_budget.rs::transaction_dirty_budget_guard` (128M cache).
+  **The dirty-cache livelock class is now closed on both servers**:
+  chunked batch inserts (#787 / #789) + the transaction dirty budget
+  (Python #791 / this slice).
 - ~~**`slt` gauge "regression"**~~ — NOT a regression; **timeout calibration,
   fixed (rust-gauge-wedge slice).** 2026-08-03 was the slt lane's FIRST
   weekly run (the SQL gauge lanes postdate the 2026-07-27 schedule), and the

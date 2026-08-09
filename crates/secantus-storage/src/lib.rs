@@ -150,6 +150,11 @@ pub struct UserTransactionHandle {
     /// from `Drop` without a `Storage` borrow.
     oplog: Arc<Mutex<OplogState>>,
     oplog_cv: Arc<Condvar>,
+    /// Approximate bytes this transaction has written, accumulated from its
+    /// emitted oplog entries (which carry the full documents). Engine-side
+    /// dirty is roughly twice this; `with_user_transaction` enforces the
+    /// cache-derived budget against it after every statement.
+    dirty_bytes: u64,
 }
 
 impl UserTransactionHandle {
@@ -243,6 +248,38 @@ type ScannedDoc = (i64, Vec<u8>, Vec<u8>);
 enum OplogEntry {
     Doc(Document),
     Raw(bson::RawDocumentBuf),
+}
+
+/// Approximate encoded size of an oplog entry, for the user-transaction
+/// dirty budget. `Raw` is exact; `Doc` (the rare DDL / noop shapes) pays one
+/// encode.
+fn oplog_entry_size(e: &OplogEntry) -> u64 {
+    match e {
+        OplogEntry::Raw(buf) => buf.as_bytes().len() as u64,
+        OplogEntry::Doc(d) => bson::to_vec(d).map(|v| v.len()).unwrap_or(0) as u64,
+    }
+}
+
+/// Extract `cache_size=` from a WiredTiger connection config string, in bytes
+/// (K/M/G/T suffixes; the engine default 4G when absent/unparseable). Fuel
+/// for the transaction dirty budget.
+fn parse_cache_bytes(config: &str) -> u64 {
+    const DEFAULT: u64 = 4 * 1024 * 1024 * 1024;
+    let Some(pos) = config.find("cache_size=") else {
+        return DEFAULT;
+    };
+    let rest = &config[pos + "cache_size=".len()..];
+    let val = rest.split(',').next().unwrap_or("").trim();
+    let (num, mult) = match val.chars().last() {
+        Some('K') | Some('k') => (&val[..val.len() - 1], 1024u64),
+        Some('M') | Some('m') => (&val[..val.len() - 1], 1024u64.pow(2)),
+        Some('G') | Some('g') => (&val[..val.len() - 1], 1024u64.pow(3)),
+        Some('T') | Some('t') => (&val[..val.len() - 1], 1024u64.pow(4)),
+        _ => (val, 1u64),
+    };
+    num.parse::<f64>()
+        .map(|n| (n * mult as f64) as u64)
+        .unwrap_or(DEFAULT)
 }
 
 /// Frame a doc-table value as `[u32-LE id_key_len][id_key bytes][blob bytes]`.
@@ -1303,6 +1340,12 @@ pub enum StorageError {
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
     QueryUnsupported,
+    /// A multi-document transaction's buffered write volume exceeded the
+    /// cache-derived dirty budget (see `Storage::txn_dirty_limit`). Raised
+    /// BEFORE the transaction can pin enough unevictable dirty content to
+    /// livelock WiredTiger; the command layer maps it to mongod's
+    /// `TransactionTooLargeForCache` (313, no transient label).
+    TransactionTooLargeForCache,
     /// A `hint` did not resolve to an existing index (command layer maps this to
     /// a mongod `BadValue`).
     BadHint(String),
@@ -1346,6 +1389,10 @@ impl std::fmt::Display for StorageError {
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
+            StorageError::TransactionTooLargeForCache => write!(
+                f,
+                "Transaction is too large and will not fit in the storage engine cache"
+            ),
             StorageError::ImmutableField => write!(
                 f,
                 "Performing an update on the path '_id' would modify the immutable field '_id'"
@@ -2207,6 +2254,13 @@ pub struct Storage {
     /// because every DDL's row writes commit in ONE statement transaction, a
     /// re-run whose generation held still is a consistent point-in-time answer.
     ddl_generation: AtomicU64,
+    /// Dirty budget for one multi-document transaction: ~15% of the cache
+    /// (0.75 x WT's ~20% dirty-eviction trigger, the shape of mongod's
+    /// `TransactionTooLargeForCache` threshold). A transaction's dirty
+    /// content is unevictable, so letting one fill the dirty trigger
+    /// livelocks the engine — the same stall class the chunked inserts
+    /// closed for plain batches, which chunking cannot close here.
+    txn_dirty_limit: u64,
     /// Which oplog shard tables this process has already created (bit per shard
     /// index) — see [`ensure_oplog_shard`]. Shared with the async drainers.
     oplog_shards_created: Arc<AtomicU32>,
@@ -2409,6 +2463,11 @@ thread_local! {
     /// `rollback_user_transaction` deregister at the real resolution point.
     /// Empty (and untouched) in async mode and for bare autocommit emits.
     static PENDING_MINTED: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
+    /// Bytes of oplog-entry payload emitted by the current user-transaction
+    /// statement — harvested onto the handle by `with_user_transaction` (the
+    /// same pattern as `PENDING_MINTED`) to enforce the transaction dirty
+    /// budget.
+    static PENDING_DIRTY_BYTES: Cell<u64> = const { Cell::new(0) };
 
     /// Set by `with_statement_txn` for the duration of a sync-mode autocommit
     /// write statement. When true, `emit_oplog_entries` parks its minted range
@@ -3521,6 +3580,7 @@ impl Storage {
             lock: Mutex::new(()),
             coll_locks: Mutex::new(HashMap::new()),
             ddl_generation: AtomicU64::new(0),
+            txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             oplog_shards_created,
             enable_oplog: true,
             oplog,
@@ -3967,6 +4027,13 @@ impl Storage {
             return Ok(0);
         }
         let n = entries.len() as i64;
+        // User-transaction dirty accounting: the entries carry the full
+        // documents, so their byte volume is the budget input for the
+        // transaction-too-large guard (harvested by `with_user_transaction`).
+        if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+            let sz: u64 = entries.iter().map(oplog_entry_size).sum();
+            PENDING_DIRTY_BYTES.with(|c| c.set(c.get() + sz));
+        }
         // Whose commit resolves this mint? Inside a `with_statement_txn` scope
         // or a user transaction the rows commit later — park the range in
         // `PENDING_MINTED` for the transaction's resolution point to
@@ -5347,6 +5414,7 @@ impl Storage {
             pending_async: Vec::new(),
             oplog: Arc::clone(&self.oplog),
             oplog_cv: Arc::clone(&self.oplog_cv),
+            dirty_bytes: 0,
         })
     }
 
@@ -5420,7 +5488,29 @@ impl Storage {
         }
         let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.get()));
         ACTIVE_TXN_SESSION.with(|c| c.set(session as *const Session));
-        Ok(f())
+        // Statement dirty accounting: zero the thread-local counter on entry
+        // (a panicked prior scope must not leak bytes into this one) and
+        // harvest it onto the handle on every exit, panic included.
+        struct DirtyHarvest<'a>(&'a mut u64);
+        impl Drop for DirtyHarvest<'_> {
+            fn drop(&mut self) {
+                *self.0 += PENDING_DIRTY_BYTES.with(|c| c.replace(0));
+            }
+        }
+        PENDING_DIRTY_BYTES.with(|c| c.set(0));
+        let dirty_scope = DirtyHarvest(&mut handle.dirty_bytes);
+        let out = f();
+        drop(dirty_scope);
+        // Transaction dirty budget — mongod's `TransactionTooLargeForCache`
+        // guard: a transaction's dirty content is unevictable, so letting it
+        // approach WT's dirty trigger livelocks the engine. Engine-side dirty
+        // is ~2x the emitted-entry bytes (doc rows + oplog rows). Checked
+        // after the statement; its writes roll back with the transaction when
+        // the command layer aborts it (any failed in-txn statement does).
+        if 2 * handle.dirty_bytes > self.txn_dirty_limit {
+            return Err(StorageError::TransactionTooLargeForCache);
+        }
+        Ok(out)
     }
 
     /// Commit the transaction's WT session, then **close** it (releasing the WT
