@@ -5083,28 +5083,50 @@ distinct problems, triaged from the run logs:
   `actions/cache/save`, so even a failed/killed run persists the compiled
   target; (3) the `validate` job carries `timeout-minutes: 120` so any future
   wedge fails fast instead of burning six runner-hours per lane.
-- [ ] **REFINED (2026-08-04): the compile loop was only half the wedge —
-  rust-driver tests genuinely hang against the Python server, on the CI
-  runner only.** The 2026-08-03 dispatch (run 30855915756) re-ran the lane
-  with every mechanics fix in place and proved them working: exact-key cache
-  HIT (404MB), pre-build in 51s, filter loop started at +5min — and the lane
-  STILL burned 1h55m in test execution to the 2h cap. Cross-evidence pins
-  the scope precisely: the SAME 88 filters pass against the **Rust** server
-  (`rust-rust-server`) in ~30 min on the same runner; the Python server
-  passes every OTHER driver gauge (pymongo / go / node / java / …) on the
-  same runner; and `invoke validate-rust` on this dev machine, same main
-  SHA, is clean and fast (101 passed / 0 failed / 0 timeouts). So:
-  Python-server × mongo-rust-driver × ubuntu-runner, filters hanging to
-  their 600s timeouts. The green→wedge transition (Jul 20 → Jul 27) has no
-  matching server change (the local 24s-vs-24s slt measurement pattern
-  repeats here) — the `ubuntu-latest` image roll in that window is the
-  standing suspect. The runner now streams per-filter start / rc / elapsed /
-  TIMEOUT lines to stderr (they used to be assembled only at the end, so a
-  killed job's log named nothing), so the NEXT weekly/dispatch run lists
-  exactly which filters hang; diagnose from there (likely a
-  connection-lifecycle or timing interaction specific to the rust driver's
-  handshake against the threaded Python accept loop under the runner's
-  2-core scheduling).
+- ~~**REFINED (2026-08-04): rust-driver tests genuinely hang against the
+  Python server**~~ — **ROOT-CAUSED AND FIXED (2026-08-09, insert-chunked-txn
+  slice): a WiredTiger dirty-cache livelock from writing one whole insert
+  message in a single statement transaction.** The per-filter streaming logs
+  (a lane-filtered `only=rust` dispatch, run 30889017762) named the wedge
+  precisely: filters 1–32 fast, then `test::coll::large_insert` (35k ×
+  1.18KB docs ≈ 39.5MB in ONE insert command) hung — and EVERY later filter
+  timed out behind the wedged server. The test skips on non-Linux
+  (`std::env::consts::OS != "linux"`), which is the entire "CI-only,
+  passes-locally" mystery: it had simply never run on the dev Mac. Once
+  replicated via pymongo it wedged on macOS too. A stack probe caught the
+  connection thread drafted into the oplog-prune scan, and a cache-size
+  experiment nailed the mechanism: 39.5MB @ 4G cache → 1.6s; 11MB @ 128M
+  cache → wedged. `insert()` wrote the whole wire batch (docs + full-doc
+  oplog entries + index entries ≈ 2–3× message bytes) as UNEVICTABLE dirty
+  content in one WT transaction; near the cache's ~20% dirty-stall fraction
+  WT drafts every thread into eviction that cannot evict anything — only the
+  writer's own commit could free the cache. The Jul 20 → Jul 27 flip was the
+  RecordId/`_id`-index rewrites adding bytes-per-doc to that same
+  transaction, pushing the same test across the 1G default cache's line.
+  **Fix:** `storage.insert` now chunks the batch into ≤1000-doc / ≤4MB
+  statement transactions (mongod chunks internal insert batches too; batch
+  inserts are per-document atomic only, so the commit points are invisible
+  to clients), with the conflict-retry moved to chunk scope and capped-FIFO
+  fresh-keys threaded across chunks. Guards:
+  `test_storage.py::test_large_batch_insert_survives_a_small_cache`
+  (35k × 1.1KB @ 128M cache) + ordered/unordered cross-chunk semantics
+  tests.
+- [ ] **Rust server: same transaction-size class, currently saved by cache
+  headroom.** `crates/secantus-storage`'s `insert` also writes a whole wire
+  batch in one `with_statement_txn`; its 4G embedded default cache puts the
+  dirty-stall line at ~800MB vs a worst-case ~150–200MB from a 48MB message,
+  so `large_insert` passes (`rust-rust-server` lane green in ~30 min). A
+  smaller configured cache (`--cache-size 256M`) would reproduce the same
+  livelock. Mirror the insert chunking in the Rust storage layer, or at
+  minimum floor/validate the cache size against the max-message dirty
+  footprint.
+- [ ] **User (multi-document) transactions can still exceed the dirty
+  budget** on either server — statements join the user transaction, so
+  chunking doesn't apply and a client that stuffs ~hundreds of MB of writes
+  into one transaction can still hit the WT stall. Real mongod surfaces
+  `TransactionTooLargeForCache`; we have no equivalent guard. Low priority
+  (drivers' tests don't do this), but it is the remaining member of the
+  class.
 - ~~**`slt` gauge "regression"**~~ — NOT a regression; **timeout calibration,
   fixed (rust-gauge-wedge slice).** 2026-08-03 was the slt lane's FIRST
   weekly run (the SQL gauge lanes postdate the 2026-07-27 schedule), and the

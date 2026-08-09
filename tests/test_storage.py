@@ -1061,3 +1061,58 @@ def test_open_refuses_a_pre_recordid_doc_format(tmp_path) -> None:
     # The refusal must not leave the WT home locked by a half-open connection.
     with pytest.raises(IncompatibleStorageFormatError):
         Storage(home)
+
+
+def test_large_batch_insert_survives_a_small_cache(tmp_path) -> None:
+    # One wire message can carry ~48MB of documents. Pre-chunking, insert()
+    # wrote the whole batch in ONE statement transaction whose unevictable
+    # dirty content (doc rows + full-doc oplog entries + index entries)
+    # livelocked WiredTiger once it neared the cache's dirty-stall fraction —
+    # the mongo-rust-driver ``large_insert`` weekly-CI wedge, reproduced
+    # locally at 35k x 1.2KB docs vs the 1G default cache. Chunked (<=1000
+    # docs / <=4MB per transaction), the same batch's dirty footprint stays
+    # bounded and this passes quickly even against a deliberately tiny cache.
+    # A regression wedges (pytest-timeout is the alarm).
+    filler = "x" * 1100
+    docs = [{"_id": i, "pad": filler} for i in range(35000)]
+    s = Storage(str(tmp_path), cache_size="128M")
+    try:
+        inserted, errors = s.insert("app", "c", docs)
+        assert inserted == 35000
+        assert errors == []
+        assert len(s.find_matching("app", "c", {"_id": 17321})) == 1
+    finally:
+        s.close()
+
+
+def test_ordered_insert_stops_across_chunk_boundaries(tmp_path) -> None:
+    # The ordered contract must hold across the chunked transactions: an
+    # error in chunk N stops the batch — later chunks never run — and the
+    # error's ``index`` is the position in the CLIENT batch, not the chunk.
+    docs = [{"_id": i} for i in range(1500)]
+    docs[1200]["_id"] = 3  # duplicate of an earlier doc, lands in chunk 2
+    s = Storage(str(tmp_path))
+    try:
+        inserted, errors = s.insert("app", "c", docs, ordered=True)
+        assert inserted == 1200
+        assert len(errors) == 1
+        assert errors[0]["index"] == 1200
+        assert errors[0]["code"] == 11000
+        # Nothing after the ordered stop landed.
+        assert s.find_matching("app", "c", {"_id": 1499}) == []
+        assert len(s.find_matching("app", "c", {"_id": 1199})) == 1
+    finally:
+        s.close()
+
+
+def test_unordered_insert_reports_errors_across_chunks(tmp_path) -> None:
+    docs = [{"_id": i} for i in range(1500)]
+    docs[1200]["_id"] = 3
+    s = Storage(str(tmp_path))
+    try:
+        inserted, errors = s.insert("app", "c", docs, ordered=False)
+        assert inserted == 1499
+        assert [e["index"] for e in errors] == [1200]
+        assert len(s.find_matching("app", "c", {"_id": 1499})) == 1
+    finally:
+        s.close()

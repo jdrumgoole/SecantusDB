@@ -4171,7 +4171,23 @@ class Storage:
             opts = self._coll_options(db, coll) or {}
             return bool(opts.get("capped"))
 
-    @_retry_write_conflicts
+    # Bounds for one insert chunk's statement transaction. A single wire
+    # message can carry up to 48MB of documents, and writing them all in ONE
+    # WT transaction pins ~2-3x that as UNEVICTABLE dirty cache (doc rows +
+    # full-doc oplog entries + index entries). Once that approaches WT's
+    # dirty-stall fraction of the cache, the engine livelocks: every thread
+    # is drafted into eviction, but uncommitted content cannot be evicted and
+    # only this transaction's own commit could free it. Reproduced with
+    # 35k x 1.2KB docs against the 1G default cache (the mongo-rust-driver
+    # ``large_insert`` weekly-CI wedge); the same insert against a 4G cache
+    # takes 1.6s, and an 11MB insert against a 128M cache wedges identically.
+    # mongod never writes a whole client batch in one storage transaction
+    # either — it chunks internal insert batches — and batch inserts are
+    # per-document atomic only, so the extra commit points are invisible to
+    # clients.
+    _INSERT_CHUNK_MAX_DOCS = 1000
+    _INSERT_CHUNK_MAX_BYTES = 4 * 1024 * 1024
+
     def insert(
         self,
         db: str,
@@ -4182,15 +4198,93 @@ class Storage:
         journal: bool = False,
     ) -> tuple[int, list[dict[str, Any]]]:
         self._note_write(db, coll)
-        # Materialized so the conflict-retry wrapper can safely re-run
-        # the whole method (a generator would arrive exhausted).
         docs = list(docs)
+        # Encode every doc once, up front: the blob feeds both the per-chunk
+        # byte budget and the doc-table write (the chunk body reuses it, so
+        # this is the same one-encode-per-doc as before). Server-side ``_id``
+        # minting moves here too; a doc past an ordered stop may therefore
+        # gain an ``_id`` it wouldn't have before, which is invisible on the
+        # wire — drivers mint ``_id`` client-side.
+        prepared: list[tuple[dict[str, Any], bytes]] = []
+        for doc in docs:
+            if "_id" not in doc:
+                doc["_id"] = bson.ObjectId()
+            prepared.append((doc, bson.encode(doc)))
+        inserted = 0
+        errors: list[dict[str, Any]] = []
+        fresh_id_keys: set[bytes] = set()
+        if not prepared:
+            # Preserve the pre-chunking behaviour for an empty batch: the
+            # collection is still created (lazy ensure) even with no docs.
+            _, _, _ = self._insert_chunk(
+                db,
+                coll,
+                [],
+                base_index=0,
+                ordered=ordered,
+                sync=journal,
+                fresh_id_keys=fresh_id_keys,
+            )
+            return 0, []
+        start = 0
+        n = len(prepared)
+        while start < n:
+            end = start + 1
+            chunk_bytes = len(prepared[start][1])
+            while (
+                end < n
+                and end - start < self._INSERT_CHUNK_MAX_DOCS
+                and chunk_bytes + len(prepared[end][1]) <= self._INSERT_CHUNK_MAX_BYTES
+            ):
+                chunk_bytes += len(prepared[end][1])
+                end += 1
+            chunk_inserted, chunk_errors, stop = self._insert_chunk(
+                db,
+                coll,
+                prepared[start:end],
+                base_index=start,
+                ordered=ordered,
+                sync=journal,
+                fresh_id_keys=fresh_id_keys,
+            )
+            inserted += chunk_inserted
+            errors.extend(chunk_errors)
+            if stop:
+                break
+            start = end
+        return inserted, errors
+
+    @_retry_write_conflicts
+    def _insert_chunk(
+        self,
+        db: str,
+        coll: str,
+        prepared: list[tuple[dict[str, Any], bytes]],
+        *,
+        base_index: int,
+        ordered: bool,
+        sync: bool,
+        fresh_id_keys: set[bytes],
+    ) -> tuple[int, list[dict[str, Any]], bool]:
+        """One bounded statement transaction of :meth:`insert`.
+
+        ``prepared`` is ``[(doc, blob)]`` with ``_id`` already assigned;
+        ``base_index`` offsets per-doc error indexes back into the client's
+        batch. ``fresh_id_keys`` carries the *committed* prior chunks' keys so
+        capped eviction never evicts documents of the same client batch; this
+        chunk's keys are merged in only AFTER its transaction commits, so the
+        conflict-retry wrapper (which rolls the chunk back and re-runs it)
+        starts each attempt from a clean set. Returns
+        ``(inserted, errors, stop)`` — ``stop`` when an ordered batch hit an
+        error and the remaining chunks must not run.
+        """
         inserted = 0
         errors: list[dict[str, Any]] = []
         oplog_entries: list[dict[str, Any]] = []
-        fresh_id_keys: set[bytes] = set()
+        chunk_keys: set[bytes] = set()
+        stop = False
         oplog_on = self.enable_oplog
-        with self._coll_lock(db, coll), self._batch_transaction(sync=journal):
+        with self._coll_lock(db, coll), self._batch_transaction(sync=sync):
             # Per-collection lock (Phase 2.4): writes to other
             # collections proceed in parallel; same-collection writes
             # still serialise to keep the unique-index pre-check
@@ -4205,9 +4299,8 @@ class Storage:
             partials = self._partial_filters(db, coll)
             multikey_names = self._multikey_index_names(db, coll)
             timeseries = self._is_timeseries(db, coll)
-            for index, doc in enumerate(docs):
-                if "_id" not in doc:
-                    doc["_id"] = bson.ObjectId()
+            for offset, (doc, blob) in enumerate(prepared):
+                index = base_index + offset
                 key = _id_key(doc["_id"])
                 if timeseries:
                     # Duplicate _ids are legal in timeseries collections —
@@ -4228,6 +4321,7 @@ class Storage:
                         }
                     )
                     if ordered:
+                        stop = True
                         break
                     continue
                 # Pre-flight every geo index: a bad geometry should reject
@@ -4239,9 +4333,9 @@ class Storage:
                 except GeoExtractError as exc:
                     errors.append({"index": index, "code": 16572, "errmsg": str(exc)})
                     if ordered:
+                        stop = True
                         break
                     continue
-                blob = bson.encode(doc)
                 if len(blob) > MAX_BSON_OBJECT_SIZE:
                     # mongod rejects per-document at insert time with
                     # BSONObjectTooLarge (10334) and this exact wording.
@@ -4256,6 +4350,7 @@ class Storage:
                         }
                     )
                     if ordered:
+                        stop = True
                         break
                     continue
                 # ``_id`` index first: it mints the RecordId the doc row is keyed
@@ -4276,6 +4371,7 @@ class Storage:
                         }
                     )
                     if ordered:
+                        stop = True
                         break
                     continue
                 doc_cur = self._cursor(_doc_table_for(db, coll), overwrite=False)
@@ -4306,6 +4402,7 @@ class Storage:
                         }
                     )
                     if ordered:
+                        stop = True
                         break
                     continue
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
@@ -4320,14 +4417,18 @@ class Storage:
                             "o2": {"_id": doc["_id"]},
                         }
                     )
-                fresh_id_keys.add(key)
+                chunk_keys.add(key)
             cap_entries, cap_pre_images = self._enforce_capped_bounds_locked(
-                db, coll, fresh_id_keys, indexes, partials, oplog_on, ns, ui
+                db, coll, fresh_id_keys | chunk_keys, indexes, partials, oplog_on, ns, ui
             )
             if oplog_entries or cap_entries:
                 pre_images = [None] * len(oplog_entries) + cap_pre_images
                 self._emit_oplog(oplog_entries + cap_entries, pre_images)
-        return inserted, errors
+        # Only after the chunk's transaction committed: a conflict-retry rolls
+        # the chunk back and re-runs it, and must not leave phantom keys that
+        # would shield evictable docs from capped enforcement.
+        fresh_id_keys |= chunk_keys
+        return inserted, errors, stop
 
     def _enforce_capped_bounds_locked(
         self,
