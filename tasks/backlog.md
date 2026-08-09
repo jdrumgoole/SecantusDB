@@ -5118,18 +5118,14 @@ distinct problems, triaged from the run logs:
   `FILE_TIMEOUT_SECONDS` is now `SECANTUS_SLT_FILE_TIMEOUT`-overridable and
   `validate.yml` sets 900 for the slt lane (with a 300-minute lane timeout,
   since the honest runtime is long on that hardware).
-- [ ] **A timed-out pgjdbc gauge reports zero tests, which reads as success.**
-  `_aggregate()` runs only after gradle returns, and `RESULTS` is `rmtree`'d at
-  startup — so when the run hits `GRADLE_TIMEOUT_SECONDS` the summary is
-  `TOTAL 0 ... 0 internal errors`, indistinguishable at a glance from a clean
-  sweep. The timeout path should aggregate whatever XML exists and say plainly
-  that the run was truncated. (Hit for real: a run contending with a
-  concurrently-running full pytest suite blew the 1h budget and reported
-  nothing; the same code re-run alone finished in **8m16s**. Don't run the
-  gauge alongside the test suite — it is timing-sensitive, and its wall clock
-  under contention says nothing about the server. Budget headroom is fine:
-  `CopyLargeFileTest` is ~282s of a normal run, inherently — it streams a
-  large file through COPY, while `CopyTest` beside it is 1.8s.)
+- [ ] **Don't run the pgjdbc gauge alongside the test suite.** It is
+  timing-sensitive, and its wall clock under contention says nothing about the
+  server: a run competing with a full pytest suite blew the (then 1h) budget
+  while the same code re-run alone finished in **8m16s**. Note also that a
+  healthy full run is legitimately long — `CopyLargeFileTest` alone is ~282s,
+  inherently, since it streams a large file through COPY (`CopyTest` beside it
+  is 1.8s). Check `uptime` before drawing any conclusion from gauge timings;
+  this machine has repeatedly carried runaway processes from parallel sessions.
 - [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
   first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
   …) are inside the ~347 documented standing failures of the 93.7% baseline
