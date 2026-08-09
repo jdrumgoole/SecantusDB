@@ -5616,6 +5616,72 @@ impl Storage {
         docs: Vec<Vec<u8>>,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>)> {
+        // One wire message never runs as ONE statement transaction: its dirty
+        // content (doc rows + full-doc oplog entries + index entries, ~2-3x
+        // the message bytes) is unevictable until commit, and a 48MB-class
+        // batch can cross WiredTiger's dirty-stall fraction of the cache and
+        // livelock the engine — every thread drafted into eviction that can
+        // evict nothing (the Python server hit exactly this as the
+        // mongo-rust-driver `large_insert` weekly-CI wedge; the 4G embedded
+        // default cache masks it here, a `--cache-size 256M` daemon does
+        // not). Commit in bounded chunks instead, like mongod's internal
+        // insert batches — client batches are per-document atomic only, so
+        // the commit points are invisible on the wire.
+        const INSERT_CHUNK_MAX_DOCS: usize = 1000;
+        const INSERT_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
+        let mut inserted = 0usize;
+        let mut errors: Vec<Document> = Vec::new();
+        // Committed prior chunks' doc keys, so capped eviction never evicts
+        // documents of the batch being inserted. Extended only after a chunk
+        // commits — the conflict-retry re-runs a rolled-back chunk and must
+        // not see its phantom keys.
+        let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
+        if docs.is_empty() {
+            // An empty batch still lazily creates the collection.
+            let (_, _, _, _) = self.insert_chunk(db, coll, &[], 0, ordered, &fresh_id_keys)?;
+            return Ok((0, errors));
+        }
+        let n = docs.len();
+        let mut start = 0usize;
+        while start < n {
+            let mut end = start + 1;
+            let mut chunk_bytes = docs[start].len();
+            while end < n
+                && end - start < INSERT_CHUNK_MAX_DOCS
+                && chunk_bytes + docs[end].len() <= INSERT_CHUNK_MAX_BYTES
+            {
+                chunk_bytes += docs[end].len();
+                end += 1;
+            }
+            let (chunk_inserted, chunk_errors, chunk_keys, stopped) =
+                self.insert_chunk(db, coll, &docs[start..end], start, ordered, &fresh_id_keys)?;
+            inserted += chunk_inserted;
+            errors.extend(chunk_errors);
+            fresh_id_keys.extend(chunk_keys);
+            if stopped {
+                break;
+            }
+            start = end;
+        }
+        Ok((inserted, errors))
+    }
+
+    /// One bounded statement transaction of [`Self::insert`] (see the chunk
+    /// note there). `base_index` offsets per-doc error indexes back into the
+    /// client's batch; `prior_fresh` carries the committed earlier chunks'
+    /// doc keys for capped-FIFO protection. Returns
+    /// `(inserted, errors, chunk_keys, stopped)` — `stopped` when an ordered
+    /// batch hit an error and the remaining chunks must not run.
+    #[allow(clippy::type_complexity)]
+    fn insert_chunk(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: &[Vec<u8>],
+        base_index: usize,
+        ordered: bool,
+        prior_fresh: &HashSet<Vec<u8>>,
+    ) -> Result<(usize, Vec<Document>, HashSet<Vec<u8>>, bool)> {
         self.retry_write_conflicts("insert", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -5635,9 +5701,11 @@ impl Storage {
                 let mut errors: Vec<Document> = Vec::new();
                 let mut oplog_entries: Vec<OplogEntry> = Vec::new();
                 let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
+                let mut stopped = false;
                 let doc_cur =
                     session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
-                for (index, doc_bytes) in docs.iter().enumerate() {
+                for (offset, doc_bytes) in docs.iter().enumerate() {
+                    let index = base_index + offset;
                     let mut doc = decode_doc(doc_bytes)?;
                     let assigned_id = !doc.contains_key("_id");
                     if assigned_id {
@@ -5660,6 +5728,7 @@ impl Storage {
                         e.insert("keyValue", Bson::Document(c.key_value));
                         errors.push(e);
                         if ordered {
+                            stopped = true;
                             break;
                         }
                         continue;
@@ -5682,6 +5751,7 @@ impl Storage {
                     if blob.len() > MAX_BSON_OBJECT_SIZE {
                         errors.push(too_large_write_error(index, blob.len()));
                         if ordered {
+                            stopped = true;
                             break;
                         }
                         continue;
@@ -5709,6 +5779,7 @@ impl Storage {
                             ed.insert("keyValue", Bson::Document(key_value));
                             errors.push(ed);
                             if ordered {
+                                stopped = true;
                                 break;
                             }
                             continue;
@@ -5743,11 +5814,13 @@ impl Storage {
                 // the per-insert pre-image slots are all None; eviction appends its own.
                 let mut pre_images: Vec<Option<Vec<u8>>> = vec![None; oplog_entries.len()];
                 if inserted > 0 {
+                    let all_fresh: HashSet<Vec<u8>> =
+                        prior_fresh.union(&fresh_id_keys).cloned().collect();
                     self.enforce_capped_bounds(
                         &session,
                         db,
                         coll,
-                        &fresh_id_keys,
+                        &all_fresh,
                         &descs,
                         oplog_on,
                         &ns,
@@ -5759,7 +5832,7 @@ impl Storage {
                 if oplog_on && !oplog_entries.is_empty() {
                     self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
                 }
-                Ok((inserted, errors))
+                Ok((inserted, errors, fresh_id_keys, stopped))
             })
         })
     }
