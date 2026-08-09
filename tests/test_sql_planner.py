@@ -110,26 +110,38 @@ def test_substitute_parameters_scales_linearly():
     Replacing them one at a time makes sqlglot re-parent every sibling per call.
     pgjdbc's rewritten batch INSERT binds tens of thousands of parameters in a
     single statement, which took minutes and timed the connection out.
+
+    Counted rather than timed: a ratio of two wall-clock measurements is
+    dominated by fixed overhead at the small end and by scheduler noise on a
+    shared runner, which made it flaky in both directions. The defect is
+    structural, so measure the structure — every re-parented child is one unit
+    of the work that went quadratic.
     """
-    import time
+    from sqlglot import exp
 
-    def elapsed(n: int) -> float:
-        # Best of several: timing noise is one-sided (a loaded CI runner only
-        # ever makes a run slower), so the minimum is the stable estimate. A
-        # single sample against a ~10ms baseline is mostly scheduler jitter.
-        best = float("inf")
-        for _ in range(5):
-            stmt = planner.parse(_params_sql(n))[0]
-            values = [None] * n
-            t = time.perf_counter()
-            planner.substitute_parameters(stmt, values)
-            best = min(best, time.perf_counter() - t)
-        return best
+    assert hasattr(exp.Expression, "_set_parent"), "sqlglot changed: re-point this probe"
+    original = exp.Expression._set_parent
+    reparented = 0
 
-    small = max(elapsed(2000), 1e-4)
-    large = elapsed(16000)
-    # 8x the parameters: linear predicts ~8x, quadratic ~64x. 25x sits well
-    # clear of both — it still fails loudly on a return to quadratic, without
-    # tracking the constant overheads that dominate the small measurement.
-    ratio = large / small
-    assert ratio < 25, f"{small:.4f}s -> {large:.4f}s = {ratio:.1f}x for 8x the parameters"
+    def counting(self, arg_key, value, index=None):
+        nonlocal reparented
+        reparented += len(value) if isinstance(value, list) else 1
+        return original(self, arg_key, value, index)
+
+    def work(n: int) -> int:
+        nonlocal reparented
+        stmt = planner.parse(_params_sql(n))[0]
+        reparented = 0
+        exp.Expression._set_parent = counting
+        try:
+            planner.substitute_parameters(stmt, [None] * n)
+        finally:
+            exp.Expression._set_parent = original
+        return reparented
+
+    n = 2000
+    units = work(n)
+    # Linear does one pass over the argument list (~n). Quadratic re-parents all
+    # n siblings once per placeholder (~n**2 = 4,000,000 here). 10n is far above
+    # the former and far below the latter, and the count is deterministic.
+    assert units < 10 * n, f"{units:,} re-parented children for {n:,} parameters (expected ~{n:,})"
