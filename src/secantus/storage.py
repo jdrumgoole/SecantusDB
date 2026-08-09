@@ -5277,8 +5277,297 @@ class Storage:
                 sizes[name] = sizes.get(name, 0) + len(packed)
             return sizes
 
-    @_retry_write_conflicts
+    # Per-statement-transaction bounds for the chunked multi-document write
+    # paths (multi-update / unbounded delete) — the same values and the same
+    # rationale as the chunked insert (see _INSERT_CHUNK_MAX_DOCS): one
+    # transaction's dirty content is unevictable, and a matched set's rewrite
+    # volume is unbounded. mongod's updateMany / deleteMany are per-document
+    # write units and documented non-atomic, so the commit points match its
+    # semantics. Twin of the Rust WRITE_CHUNK_* consts.
+    _WRITE_CHUNK_MAX_DOCS = 1000
+    _WRITE_CHUNK_MAX_BYTES = 4 * 1024 * 1024
+
     def update_matching(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        update: dict[str, Any],
+        *,
+        multi: bool = False,
+        upsert: bool = False,
+        array_filters: list[dict[str, Any]] | None = None,
+        let: dict[str, Any] | None = None,
+        collation: Any = None,
+        validator: dict[str, Any] | None = None,
+        journal: bool = False,
+        return_post_images: bool = False,
+    ) -> dict[str, Any]:
+        # Route: a multi-update outside a user transaction rewrites an
+        # unbounded matched set, so it runs CHUNKED (bounded dirty per
+        # statement transaction — the livelock class the chunked inserts
+        # closed). Single-doc updates, upsert-only outcomes and
+        # in-transaction updates keep the single-transaction body.
+        if multi and getattr(self._tls, "user_txn", None) is None:
+            return self._update_matching_chunked(
+                db,
+                coll,
+                filter,
+                update,
+                upsert=upsert,
+                array_filters=array_filters,
+                let=let,
+                collation=collation,
+                validator=validator,
+                journal=journal,
+                return_post_images=return_post_images,
+            )
+        return self._update_matching_single_txn(
+            db,
+            coll,
+            filter,
+            update,
+            multi=multi,
+            upsert=upsert,
+            array_filters=array_filters,
+            let=let,
+            collation=collation,
+            validator=validator,
+            journal=journal,
+            return_post_images=return_post_images,
+        )
+
+    def _update_matching_chunked(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        update: dict[str, Any],
+        *,
+        upsert: bool,
+        array_filters: list[dict[str, Any]] | None,
+        let: dict[str, Any] | None,
+        collation: Any,
+        validator: dict[str, Any] | None,
+        journal: bool,
+        return_post_images: bool,
+    ) -> dict[str, Any]:
+        """Chunked updateMany driver — twin of the Rust
+        ``update_matching_chunked``. One candidate scan collects matching
+        RecordIds; bounded statement transactions then process the
+        partitioned list, each chunk RE-FETCHING its doc rows inside its own
+        transaction (the scan's blobs must never feed a later chunk's
+        transform — a user transaction committing between chunks would be
+        silently overwritten from the stale read, with no overlapping WT
+        transactions to raise a conflict). A conflict retries only its own
+        rolled-back chunk, and the RecordId list is partitioned, so ``$inc``
+        applies exactly once per document."""
+        self._note_write(db, coll)
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        self._refresh_read_snapshot()
+        matched = 0
+        modified = 0
+        post_images: list[dict[str, Any]] | None = [] if return_post_images else None
+        with self._coll_lock(db, coll):
+            self._ensure_collection(db, coll)
+            if collation_obj is not None:
+                candidates = self._scan_docs(db, coll)
+            else:
+                candidates = self._candidates_iter(db, coll, filter)
+            rids = [
+                recordid
+                for recordid, _id_k, blob in candidates
+                if matches(bson.decode(blob), filter, vars=let, collation=collation_obj)
+            ]
+            idx = 0
+            while idx < len(rids):
+                consumed, m, w, posts = self._update_chunk(
+                    db,
+                    coll,
+                    rids[idx:],
+                    filter,
+                    update,
+                    array_filters=array_filters,
+                    let=let,
+                    collation_obj=collation_obj,
+                    validator=validator,
+                    journal=journal,
+                    want_posts=post_images is not None,
+                )
+                assert consumed > 0
+                idx += consumed
+                matched += m
+                modified += w
+                if post_images is not None:
+                    post_images.extend(posts)
+        if matched == 0:
+            # Zero matches (or every candidate stopped matching by its
+            # chunk's re-check): the single-transaction body rescans and
+            # degenerates to its upsert branch or a clean zero outcome. The
+            # coll lock is an RLock, but the delegation runs outside our
+            # ``with`` anyway.
+            return self._update_matching_single_txn(
+                db,
+                coll,
+                filter,
+                update,
+                multi=True,
+                upsert=upsert,
+                array_filters=array_filters,
+                let=let,
+                collation=collation,
+                validator=validator,
+                journal=journal,
+                return_post_images=return_post_images,
+            )
+        result: dict[str, Any] = {
+            "matched": matched,
+            "modified": modified,
+            "upserted_id": None,
+            "did_upsert": False,
+        }
+        if post_images is not None:
+            result["post_images"] = post_images
+        return result
+
+    @_retry_write_conflicts
+    def _update_chunk(
+        self,
+        db: str,
+        coll: str,
+        rids: list[int],
+        filter: dict[str, Any],
+        update: dict[str, Any],
+        *,
+        array_filters: list[dict[str, Any]] | None,
+        let: dict[str, Any] | None,
+        collation_obj: Any,
+        validator: dict[str, Any] | None,
+        journal: bool,
+        want_posts: bool,
+    ) -> tuple[int, int, int, list[dict[str, Any]]]:
+        """One bounded chunk of the multi-update: process RecordIds from the
+        front of ``rids`` until the doc/byte budget closes the transaction.
+        ``consumed`` counts every examined RecordId so the driver always
+        advances. Caller holds the coll lock."""
+        consumed = 0
+        matched = 0
+        modified = 0
+        chunk_bytes = 0
+        posts: list[dict[str, Any]] = []
+        oplog_entries: list[dict[str, Any]] = []
+        pre_images: list[bytes | None] = []
+        oplog_on = self.enable_oplog
+        with self._batch_transaction(sync=journal):
+            ns = self._ns(db, coll)
+            ui = self._collection_uuid(db, coll) if oplog_on else None
+            preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
+            indexes = self._all_indexes(db, coll)
+            partials = self._partial_filters(db, coll)
+            multikey_names = self._multikey_index_names(db, coll)
+            is_replacement = not isinstance(update, list) and not any(
+                isinstance(k, str) and k.startswith("$") for k in update
+            )
+            doc_cur = self._cursor(_doc_table_for(db, coll))
+            for recordid in rids:
+                if (
+                    modified >= self._WRITE_CHUNK_MAX_DOCS
+                    or chunk_bytes >= self._WRITE_CHUNK_MAX_BYTES
+                ):
+                    break
+                consumed += 1
+                # Fresh read inside THIS transaction (see the driver note).
+                doc_cur.reset()
+                doc_cur.set_key(db, coll, recordid)
+                if doc_cur.search() != 0:
+                    continue
+                id_k, blob = _unframe_doc_value(bytes(doc_cur.get_value()))
+                doc = bson.decode(blob)
+                if not matches(doc, filter, vars=let, collation=collation_obj):
+                    continue
+                matched += 1
+                pos = find_positional_matches(doc, filter)
+                new = apply_update(
+                    doc,
+                    update,
+                    array_filters=array_filters,
+                    positional_matches=pos,
+                    let=let,
+                )
+                if new != doc:
+                    if validator is not None and not matches(new, validator):
+                        raise DocumentValidationError(new.get("_id"))
+                    conflict = self._unique_conflict(
+                        db, coll, new, indexes, exclude_recordid=recordid, partials=partials
+                    )
+                    if conflict is not None:
+                        cname, kpat, kval = conflict
+                        raise IndexConflict(
+                            cname,
+                            new["_id"],
+                            key_pattern=kpat,
+                            key_value=kval,
+                            namespace=f"{db}.{coll}",
+                        )
+                    self._validate_geo_indexes(db, coll, new, indexes, partials)
+                    new_blob = bson.encode(new)
+                    if len(new_blob) > MAX_BSON_OBJECT_SIZE:
+                        raise DocumentTooLargeError(
+                            10334,
+                            "Plan executor error during update :: caused by :: "
+                            f"Resulting document after update is larger than "
+                            f"{MAX_BSON_OBJECT_SIZE}",
+                        )
+                    modified += 1
+                    chunk_bytes += len(new_blob)
+                    self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
+                    doc_cur.reset()
+                    doc_cur[db, coll, recordid] = _frame_doc_value(id_k, new_blob)
+                    try:
+                        self._write_index_entries(
+                            db, coll, new, indexes, partials, recordid=recordid
+                        )
+                    except UniqueKeyTaken as taken:
+                        raise self._index_conflict_from(db, coll, new, taken) from taken
+                    multikey_names = self._maybe_mark_multikey(
+                        db, coll, new, indexes, multikey_names
+                    )
+                    if oplog_on:
+                        if is_replacement:
+                            o_field: dict[str, Any] = dict(new)
+                        else:
+                            o_field = {"$v": 2, "diff": compute_update_description(doc, new)}
+                        oplog_entries.append(
+                            {
+                                "op": "u",
+                                "ns": ns,
+                                "ui": bson.Binary(ui.bytes, subtype=4),
+                                "o": o_field,
+                                "o2": {"_id": doc["_id"]},
+                            }
+                        )
+                        if preimages_on:
+                            chunk_bytes += len(blob)
+                            pre_images.append(blob)
+                        else:
+                            pre_images.append(None)
+                if want_posts:
+                    posts.append(new)
+            cap_ns = ns if oplog_on else ""
+            cap_entries, cap_pre = self._enforce_capped_bounds_locked(
+                db, coll, set(), indexes, partials, oplog_on, cap_ns, ui
+            )
+            if cap_entries:
+                oplog_entries.extend(cap_entries)
+                pre_images.extend(cap_pre)
+            if oplog_entries:
+                self._emit_oplog(oplog_entries, pre_images)
+        return consumed, matched, modified, posts
+
+    @_retry_write_conflicts
+    def _update_matching_single_txn(
         self,
         db: str,
         coll: str,
@@ -5529,8 +5818,145 @@ class Storage:
             result["post_images"] = post_images
         return result
 
-    @_retry_write_conflicts
     def delete_matching(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        limit: int = 0,
+        let: dict[str, Any] | None = None,
+        collation: Any = None,
+        journal: bool = False,
+    ) -> int:
+        # Route: an unbounded delete (deleteMany) outside a user transaction
+        # runs CHUNKED — see ``update_matching``'s router note; same class,
+        # same driver shape. Bounded deletes and in-transaction deletes keep
+        # the single-transaction body.
+        if limit == 0 and getattr(self._tls, "user_txn", None) is None:
+            return self._delete_matching_chunked(
+                db, coll, filter, let=let, collation=collation, journal=journal
+            )
+        return self._delete_matching_single_txn(
+            db, coll, filter, limit=limit, let=let, collation=collation, journal=journal
+        )
+
+    def _delete_matching_chunked(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        let: dict[str, Any] | None,
+        collation: Any,
+        journal: bool,
+    ) -> int:
+        """Chunked deleteMany driver — see ``_update_matching_chunked`` for
+        the re-fetch-inside-the-chunk-transaction rationale."""
+        self._note_write(db, coll)
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        self._refresh_read_snapshot()
+        deleted = 0
+        with self._coll_lock(db, coll):
+            if collation_obj is not None:
+                candidates = self._scan_docs(db, coll)
+            else:
+                candidates = self._candidates_iter(db, coll, filter)
+            rids = [
+                recordid
+                for recordid, _id_k, blob in candidates
+                if matches(bson.decode(blob), filter, vars=let, collation=collation_obj)
+            ]
+            idx = 0
+            while idx < len(rids):
+                consumed, d = self._delete_chunk(
+                    db,
+                    coll,
+                    rids[idx:],
+                    filter,
+                    let=let,
+                    collation_obj=collation_obj,
+                    journal=journal,
+                )
+                assert consumed > 0
+                idx += consumed
+                deleted += d
+        return deleted
+
+    @_retry_write_conflicts
+    def _delete_chunk(
+        self,
+        db: str,
+        coll: str,
+        rids: list[int],
+        filter: dict[str, Any],
+        *,
+        let: dict[str, Any] | None,
+        collation_obj: Any,
+        journal: bool,
+    ) -> tuple[int, int]:
+        """One bounded chunk of the deleteMany. Caller holds the coll lock.
+        Returns ``(consumed, deleted)``."""
+        consumed = 0
+        deleted = 0
+        chunk_bytes = 0
+        oplog_entries: list[dict[str, Any]] = []
+        pre_images: list[bytes | None] = []
+        oplog_on = self.enable_oplog
+        with self._batch_transaction(sync=journal):
+            ns = self._ns(db, coll) if oplog_on else ""
+            preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
+            ui = (
+                self._collection_uuid(db, coll)
+                if oplog_on and self._coll_options(db, coll) is not None
+                else None
+            )
+            indexes = self._all_indexes(db, coll)
+            partials = self._partial_filters(db, coll)
+            doc_cur = self._cursor(_doc_table_for(db, coll))
+            for recordid in rids:
+                if (
+                    deleted >= self._WRITE_CHUNK_MAX_DOCS
+                    or chunk_bytes >= self._WRITE_CHUNK_MAX_BYTES
+                ):
+                    break
+                consumed += 1
+                doc_cur.reset()
+                doc_cur.set_key(db, coll, recordid)
+                if doc_cur.search() != 0:
+                    continue
+                id_k, blob = _unframe_doc_value(bytes(doc_cur.get_value()))
+                doc = bson.decode(blob)
+                if not matches(doc, filter, vars=let, collation=collation_obj):
+                    continue
+                self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
+                self._delete_doc_row(db, coll, recordid)
+                self._delete_nat_entry(db, coll, id_k)
+                deleted += 1
+                chunk_bytes += len(blob)
+                if oplog_on:
+                    entry: dict[str, Any] = {
+                        "op": "d",
+                        "ns": ns,
+                        "o": {"_id": doc["_id"]},
+                        "o2": {"_id": doc["_id"]},
+                    }
+                    if ui is not None:
+                        entry["ui"] = bson.Binary(ui.bytes, subtype=4)
+                    oplog_entries.append(entry)
+                    if preimages_on:
+                        chunk_bytes += len(blob)
+                        pre_images.append(blob)
+                    else:
+                        pre_images.append(None)
+            if oplog_entries:
+                self._emit_oplog(oplog_entries, pre_images)
+        return consumed, deleted
+
+    @_retry_write_conflicts
+    def _delete_matching_single_txn(
         self,
         db: str,
         coll: str,
