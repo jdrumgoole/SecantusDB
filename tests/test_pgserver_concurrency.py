@@ -17,10 +17,9 @@ These pinned three concurrency fixes:
   constraint and concurrent ``SET n = n + 1`` updates lose increments;
 * the loser of a conflict keeps a usable connection and a clean session.
 
-Known remaining divergence (tasks/backlog.md): two *open transactions* that
-each insert the same UNIQUE value can both commit — statement-time constraint
-probes can't see the other transaction's uncommitted writes, and the docs
-don't collide in WiredTiger. Real Postgres blocks on the index entry.
+(The divergence formerly noted here — two open transactions both committing
+the same UNIQUE value — was closed by #775/#778: SQL UNIQUE constraints are
+backed by a storage unique index WiredTiger itself enforces.)
 """
 
 from __future__ import annotations

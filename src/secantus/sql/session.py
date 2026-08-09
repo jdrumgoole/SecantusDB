@@ -363,6 +363,11 @@ class Session:
     # ``count`` (advisory locks are re-entrant); ``xact`` locks release at
     # COMMIT/ROLLBACK, session locks at ``pg_advisory_unlock[_all]``.
     advisory_locks: dict = field(default_factory=dict)
+    # Server-wide AdvisoryLockHub (set by the wire server, like notify_hub).
+    # None for embedded run_sql sessions — a single connection needs no
+    # cross-connection exclusion, and the local bookkeeping alone reproduces
+    # the old behaviour there.
+    advisory_hub: Any = None
     # Two-phase commit (#139). Server-wide ``PreparedXactRegistry`` shared by all
     # connections (set by the wire server; the embedded ``run_sql`` lazily makes a
     # per-session one). ``PREPARE TRANSACTION`` moves this session's ``txn_handle``
@@ -433,11 +438,24 @@ class Session:
         self.deferred_all = None
         self.deferred_names = {}
 
-    def advisory_lock_acquire(self, key: tuple, *, shared: bool, xact: bool) -> None:
-        """Acquire an advisory lock (re-entrant). Single-node — always granted."""
+    def advisory_lock_acquire(
+        self, key: tuple, *, shared: bool, xact: bool, blocking: bool = True
+    ) -> bool:
+        """Acquire an advisory lock (re-entrant). With the server-wide hub
+        attached this is REAL cross-connection exclusion: a blocking acquire
+        waits for the holder (aborting with ``40P01`` on a detected deadlock)
+        and a ``pg_try_*`` acquire returns whether the lock was granted.
+        Embedded sessions (no hub) keep the old always-granted behaviour."""
+        if self.advisory_hub is not None:
+            granted = self.advisory_hub.acquire(
+                self, key, shared=shared, xact=xact, blocking=blocking
+            )
+            if not granted:
+                return False
         mode = "ShareLock" if shared else "ExclusiveLock"
         k = (key[0], key[1], key[2], mode, xact)
         self.advisory_locks[k] = self.advisory_locks.get(k, 0) + 1
+        return True
 
     def advisory_lock_release(self, key: tuple, *, shared: bool) -> bool:
         """Release one *session-level* advisory lock. Returns True if one was
@@ -452,16 +470,22 @@ class Session:
             del self.advisory_locks[k]
         else:
             self.advisory_locks[k] = n - 1
+        if self.advisory_hub is not None:
+            self.advisory_hub.release(self, (key[0], key[1], key[2]), shared=shared)
         return True
 
     def advisory_unlock_all(self) -> None:
         """Release every *session-level* advisory lock (``pg_advisory_unlock_all``);
         transaction-level locks are left to the transaction's end."""
         self.advisory_locks = {k: v for k, v in self.advisory_locks.items() if k[4]}
+        if self.advisory_hub is not None:
+            self.advisory_hub.release_session_level(self)
 
     def release_xact_advisory_locks(self) -> None:
         """Drop all transaction-level advisory locks (called at COMMIT/ROLLBACK)."""
         self.advisory_locks = {k: v for k, v in self.advisory_locks.items() if not k[4]}
+        if self.advisory_hub is not None:
+            self.advisory_hub.release_xact(self)
 
     def held_advisory_locks(self) -> list[tuple]:
         """The distinct advisory locks currently held, as ``(classid, objid,

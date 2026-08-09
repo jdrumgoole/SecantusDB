@@ -178,6 +178,11 @@ class SecantusPGServer:
         self._handler_threads: set[threading.Thread] = set()
         # Server-wide LISTEN / NOTIFY channel registry.
         self._notify = NotifyHub()
+        # Server-wide advisory-lock table (#135 follow-up): real
+        # cross-connection exclusion for the pg_advisory_lock family.
+        from secantus.sql.pgadvisory import AdvisoryLockHub
+
+        self._advisory = AdvisoryLockHub()
         # Server-wide live-session registry for pg_stat_activity (#137), plus a
         # monotonic per-connection backend pid (real Postgres gives each backend a
         # distinct pid; in-process we'd otherwise share os.getpid()).
@@ -346,6 +351,9 @@ class SecantusPGServer:
                     self.storage.abort_user_transaction(session.txn_handle)
             if session is not None:
                 self._notify.unlisten_all(session)  # drop this conn's LISTENs
+                # PG releases every advisory lock at session end.
+                with contextlib.suppress(Exception):
+                    self._advisory.release_all(session)
                 self._activity.unregister(session)  # drop from pg_stat_activity (#137)
                 # PG drops a session's temp tables when the session ends.
                 with contextlib.suppress(Exception):
@@ -407,6 +415,7 @@ class SecantusPGServer:
         # to_pg_text can honour per-session GUCs (TimeZone) at output time.
         typemap.set_render_session(session)
         session.notify_hub = self._notify
+        session.advisory_hub = self._advisory
         session.activity_registry = self._activity
         session.prepared_xacts = self._prepared_xacts
         session.backend_start = _dt.datetime.now(_dt.timezone.utc)

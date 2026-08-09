@@ -2330,12 +2330,13 @@ def _advisory_key(args: list[Any]) -> tuple[int, int, int]:
 
 
 def _advisory_lock(name: str, args: list[Any], ctx: ScalarContext | None) -> Any:
-    """The ``pg_advisory_lock`` family (#135). Single-node: a lock is always
-    granted immediately, so acquisition is a no-op that just records what the
-    session holds (for ``pg_advisory_unlock`` truthfulness + ``pg_locks``
-    reflection). ``pg_try_*`` always succeed (``True``); ``pg_advisory_unlock*``
-    return whether a matching session-level lock was held; the void-returning
-    forms return ``None``."""
+    """The ``pg_advisory_lock`` family (#135). With the wire server's
+    ``AdvisoryLockHub`` attached to the session this is real cross-connection
+    exclusion: the void-returning ``pg_advisory_lock*`` forms BLOCK until the
+    lock is granted (aborting with ``40P01`` when the hub's wait-for graph
+    detects a deadlock), ``pg_try_*`` return whether the lock was granted, and
+    ``pg_advisory_unlock*`` release the server-wide hold. Embedded sessions
+    (no hub) keep the old always-granted bookkeeping."""
     if ctx is None:
         return None  # embedded / no session — nothing to track
     session = ctx.session
@@ -2350,10 +2351,11 @@ def _advisory_lock(name: str, args: list[Any], ctx: ScalarContext | None) -> Any
     if base == "pg_advisory_unlock":
         return session.advisory_lock_release(key, shared=shared)
     xact = "xact" in base
-    session.advisory_lock_acquire(key, shared=shared, xact=xact)
+    blocking = not base.startswith("pg_try_")
+    granted = session.advisory_lock_acquire(key, shared=shared, xact=xact, blocking=blocking)
     if base.startswith("pg_try_"):
-        return True  # single-node: always acquirable
-    return None  # pg_advisory_lock* return void
+        return granted
+    return None  # pg_advisory_lock* return void (after blocking until granted)
 
 
 def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> Any:
