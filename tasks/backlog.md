@@ -5129,15 +5129,17 @@ distinct problems, triaged from the run logs:
   `test_storage.py::test_large_batch_insert_survives_a_small_cache`
   (35k × 1.1KB @ 128M cache) + ordered/unordered cross-chunk semantics
   tests.
-- [ ] **Rust server: same transaction-size class, currently saved by cache
-  headroom.** `crates/secantus-storage`'s `insert` also writes a whole wire
-  batch in one `with_statement_txn`; its 4G embedded default cache puts the
-  dirty-stall line at ~800MB vs a worst-case ~150–200MB from a 48MB message,
-  so `large_insert` passes (`rust-rust-server` lane green in ~30 min). A
-  smaller configured cache (`--cache-size 256M`) would reproduce the same
-  livelock. Mirror the insert chunking in the Rust storage layer, or at
-  minimum floor/validate the cache size against the max-message dirty
-  footprint.
+- ~~**Rust server: same transaction-size class, currently saved by cache
+  headroom.**~~ — **mirrored (rust-insert-chunked-txn slice)**:
+  `crates/secantus-storage`'s `insert` now commits in the same bounded
+  chunks as the Python fix (≤1000 docs / ≤4MB per statement transaction;
+  conflict-retry per chunk, capped-FIFO fresh keys threaded across chunks
+  and merged post-commit, empty batch still lazily creates the collection).
+  Previously only the 4G embedded default cache stood between a
+  `--cache-size 256M` daemon and the same WT dirty-cache livelock. Pinned by
+  `tests/batch_insert.rs::large_batch_insert_survives_a_small_cache`
+  (35k × 1.1KB @ 128M cache) + ordered/unordered cross-chunk semantics
+  tests.
 - [ ] **User (multi-document) transactions can still exceed the dirty
   budget** on either server — statements join the user transaction, so
   chunking doesn't apply and a client that stuffs ~hundreds of MB of writes

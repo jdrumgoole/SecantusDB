@@ -191,3 +191,73 @@ fn prune_ttl_all_collections_spans_namespaces() {
         assert_eq!(st.scan_collection("app", "b").unwrap().len(), 0);
     });
 }
+
+/// One wire batch must never run as one statement transaction: a 48MB-class
+/// insert's unevictable dirty content can cross WiredTiger's dirty-stall
+/// fraction and livelock the engine (the Python server's mongo-rust-driver
+/// `large_insert` weekly-CI wedge; here the 4G default cache masked it).
+/// Against a deliberately tiny cache, the chunked insert stays bounded and
+/// completes; a regression wedges (the harness timeout is the alarm).
+#[test]
+fn large_batch_insert_survives_a_small_cache() {
+    let home = temp_home();
+    let cfg = secantus_storage::wt_config("128M", 1000, false, "10MB");
+    let st = Storage::open_with_config(home.to_str().unwrap(), &cfg).unwrap();
+    let filler = "x".repeat(1100);
+    let docs: Vec<Vec<u8>> = (0..35_000i64)
+        .map(|i| enc(&doc! {"_id": i, "pad": filler.clone()}))
+        .collect();
+    let (inserted, errors) = st.insert("app", "c", docs, true).unwrap();
+    assert_eq!(inserted, 35_000);
+    assert!(errors.is_empty());
+    assert!(st
+        .find_by_id("app", "c", &Bson::Int64(17_321))
+        .unwrap()
+        .is_some());
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Ordered semantics hold across chunk boundaries: an error in a later chunk
+/// stops the batch, its error `index` is in client-batch coordinates, and no
+/// document after the stop lands.
+#[test]
+fn ordered_insert_stops_across_chunk_boundaries() {
+    with_db(|st| {
+        let docs: Vec<Vec<u8>> = (0..1500i64)
+            .map(|i| enc(&doc! {"_id": if i == 1200 { 3 } else { i }}))
+            .collect();
+        let (inserted, errors) = st.insert("app", "c", docs, true).unwrap();
+        assert_eq!(inserted, 1200);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].get_i32("index").unwrap(), 1200);
+        assert_eq!(errors[0].get_i32("code").unwrap(), 11000);
+        assert!(st
+            .find_by_id("app", "c", &Bson::Int64(1499))
+            .unwrap()
+            .is_none());
+        assert!(st
+            .find_by_id("app", "c", &Bson::Int64(1199))
+            .unwrap()
+            .is_some());
+    });
+}
+
+/// Unordered inserts keep reporting per-doc errors across chunks and insert
+/// everything else.
+#[test]
+fn unordered_insert_reports_errors_across_chunks() {
+    with_db(|st| {
+        let docs: Vec<Vec<u8>> = (0..1500i64)
+            .map(|i| enc(&doc! {"_id": if i == 1200 { 3 } else { i }}))
+            .collect();
+        let (inserted, errors) = st.insert("app", "c", docs, false).unwrap();
+        assert_eq!(inserted, 1499);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].get_i32("index").unwrap(), 1200);
+        assert!(st
+            .find_by_id("app", "c", &Bson::Int64(1499))
+            .unwrap()
+            .is_some());
+    });
+}
