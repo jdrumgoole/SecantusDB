@@ -4535,15 +4535,16 @@ Found by the two concurrency harnesses — `tests/test_mongo_server_concurrency.
 `tests/test_pgserver_concurrency.py` (psycopg vs the PG server); fixed items are
 recorded in that slice's changelog fragment. Still open:
 
-- [ ] **SQL UNIQUE constraints race across open transactions.** Statement-time
-  constraint probes read the session's snapshot, so two *open transactions* that
-  each insert the same UNIQUE value both pass the probe and both commit (the docs
-  have different `_id`s, so WiredTiger sees no write-write conflict). Real
-  Postgres blocks the second inserter on the index entry until the first commits.
-  The autocommit-vs-autocommit race is closed (the per-storage statement-write
-  lock in `sql/executor.py`); the cross-transaction case needs either commit-time
-  re-validation against committed state or storage-level unique indexes backing
-  SQL UNIQUE constraints.
+- ~~**SQL UNIQUE constraints race across open transactions.**~~ — **FIXED
+  (#775 + #778)**: exactly the fix this entry called for landed — storage-level
+  unique indexes (`table:secantus_unique_keys`, WiredTiger-enforced) back both
+  the Mongo persona's unique indexes and SQL `UNIQUE` / `PRIMARY KEY`
+  constraints, so cross-transaction and simultaneous-uncommitted duplicates
+  collide on the key itself. See "UNIQUE constraints across transactions —
+  FIXED (storage + SQL)" below for the full record. Sole surviving sliver:
+  **DEFERRABLE constraints** keep the commit-time check (an every-write index
+  would reject legitimately-transient violations, e.g. the value-swap case) and
+  therefore keep the old race — a narrow, documented trade.
 - [ ] **SQL advisory locks provide no cross-connection exclusion** (§ "Advisory
   locks landed", #135): `pg_advisory_lock` is per-`Session` bookkeeping that always
   grants, so two connections can hold the same exclusive lock concurrently — apps
@@ -4853,50 +4854,22 @@ Postgres, a plain `1.5` is numeric) together.
 
 ### UNIQUE across transactions — what is fixed, and what remains
 
-**Fixed (PR: SQL unique enforcement).** A `UNIQUE` constraint is now probed
-against the latest *committed* state as well as the caller's own snapshot, via
-`Storage.find_matching_committed` (a fresh session swapped into `_tls` for the
-duration of the read). A value another transaction committed after your
-snapshot is now rejected with `23505`, matching PostgreSQL 14.13.
-`tests/test_sql_unique_across_transactions.py` covers it, including the
-no-false-positive cases.
-
-**Residual hole 1 — a transaction that has already written to the table.**
-The committed probe is disabled for a `(db, coll)` the transaction has written
-to (`UserTransactionHandle.written`, set by `Storage._note_write`). It has to
-be: the committed view of a row the transaction deleted or rewrote is stale, so
-probing it rejects a value the transaction legitimately freed — delete-then-
-reinsert inside one transaction is valid SQL and Postgres allows it. So a
-transaction that writes to a table and *then* inserts a value some other
-transaction committed in the meantime can still store a duplicate. Closing this
-properly needs per-row bookkeeping (the set of `_id`s the transaction has
-deleted or rewritten) so the committed hits can be filtered individually rather
-than the whole probe being switched off — the reason it was not done that way
-here is that update / delete run through a dozen call sites in `executor.py`
-and a missed one silently reintroduces the false positive.
-
-**Residual hole 2 — two simultaneous uncommitted inserts.** Neither transaction
-sees the other (nothing is committed yet), so both commit and a duplicate
-lands. The autocommit path is safe only because `_coll_lock` serialises
-probe-and-insert within the process, which does not extend across a
-transaction's lifetime. The real fix is the storage-layout one below.
-
-**The complete fix, for when someone takes it on:** give unique indexes an
-entry key with **no RecordId suffix**, so WiredTiger's own key uniqueness and
-write-conflict detection enforce them the way a real unique index does. That
-handles both residual holes at once, and it is what makes uniqueness a
-storage-level invariant rather than a check the SQL layer has to remember to
-perform. It changes the on-disk entry layout for unique indexes only (the
-RecordId moves into the value), so it needs an `entryFormat` bump, the refusal
-path for older stores, and the Rust twin.
-
-**The Mongo persona has the same class of gap.** `Storage._unique_conflict`
-probes `table:secantus_index_entries` through the caller's session, so a
-multi-document transaction can miss a key another transaction committed after
-its snapshot. It is not fixed here: `_note_write` fires at the top of
-`insert()`, before the probe runs, so a committed probe bolted on there would
-be switched off by its own statement and never fire. The storage-layout fix
-above resolves it for both personas at once.
+**RECONCILED 2026-08-10: everything below is superseded — both residual holes
+are CLOSED (#775 storage, #778 SQL wiring); the section is kept as a stub so
+in-flight references resolve.** The interim `find_matching_committed` probe
+described here (and its two residual holes: a transaction that had already
+written to the table, and two simultaneous uncommitted inserts) was replaced
+by the storage-level fix the old text proposed "for when someone takes it on"
+— implemented additively as `table:secantus_unique_keys` rather than the
+entry-table re-key, so no format bump was needed. The Mongo persona's
+multi-document-transaction gap closed with it (the unique-keys table is
+engine-enforced, snapshot-independent). Pinned by
+`tests/test_storage_unique_keys.py` and the wire-level
+`tests/test_sql_unique_across_transactions.py` concurrency tests (eight
+concurrent writers, exactly one winner). See "The storage-level fix landed"
+and "SQL UNIQUE is now storage-backed too" further down for the design record.
+The one deliberate residue: **DEFERRABLE constraints** keep the commit-time
+check and with it the old cross-transaction race (narrow, documented there).
 
 ### `numeric` — what landed, and the division-scale divergence
 
@@ -5473,14 +5446,10 @@ untouched, and a store written by an older build simply has an empty table,
 which cannot produce a FALSE rejection. `create_index` backfills existing rows,
 so an index built over data claims it.
 
-**The SQL persona is NOT yet covered.** A SQL `UNIQUE` constraint is enforced
-in `executor._validate_unique_rows` and never creates a storage index, so the
-two holes remain open through the PG front end — verified after this change:
-eight concurrent transactions inserting one value still stored 4 duplicates.
-Closing it means having `CREATE TABLE … UNIQUE` (and PRIMARY KEY) create a
-storage unique index and letting the engine enforce it, which also changes
-which error shape those collisions produce — worth doing deliberately rather
-than as a tail-end addition. The mechanism it needs now exists.
+~~**The SQL persona is NOT yet covered.**~~ Superseded the same week — the
+next section ("SQL UNIQUE is now storage-backed too", #778) landed exactly the
+wiring this paragraph called for; only DEFERRABLE constraints remain on the
+old commit-time check, by design.
 
 ### SQL UNIQUE is now storage-backed too
 
