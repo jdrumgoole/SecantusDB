@@ -250,6 +250,16 @@ enum OplogEntry {
     Raw(bson::RawDocumentBuf),
 }
 
+/// Per-statement-transaction bounds for the chunked multi-document write
+/// paths (`update_matching_core` multi=true, `delete_matching`), the same
+/// values the chunked insert uses: a matched set's rewrite volume is
+/// unbounded, and one transaction's dirty content is unevictable — see the
+/// chunk note on `Storage::insert`. mongod's updateMany/deleteMany are
+/// per-document write units and documented non-atomic, so the commit points
+/// are mongod-faithful, not a divergence.
+const WRITE_CHUNK_MAX_DOCS: usize = 1000;
+const WRITE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// Approximate encoded size of an oplog entry, for the user-transaction
 /// dirty budget. `Raw` is exact; `Doc` (the rare DDL / noop shapes) pays one
 /// encode.
@@ -8843,6 +8853,288 @@ impl Storage {
         want_post_image: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
+        // Route: a multi-update outside a user transaction rewrites an
+        // unbounded matched set, so it runs CHUNKED (bounded dirty per
+        // statement transaction — the same livelock class the chunked
+        // inserts closed; mongod's updateMany is per-document write units
+        // and non-atomic, so the commit points match its semantics). The
+        // single-doc, upsert-only and in-user-transaction paths are
+        // inherently bounded / not ours to commit and keep the one-txn body.
+        if multi && !self.in_user_txn() {
+            return self.update_matching_chunked(
+                db,
+                coll,
+                filter,
+                vars,
+                coll_opt,
+                upsert,
+                is_replacement,
+                validator,
+                transform,
+            );
+        }
+        self.update_matching_single_txn(
+            db,
+            coll,
+            filter,
+            vars,
+            coll_opt,
+            multi,
+            upsert,
+            is_replacement,
+            validator,
+            want_post_image,
+            transform,
+        )
+    }
+
+    /// The chunked multi-update driver: one candidate scan (RecordIds only,
+    /// pre-filtered on the scan's blobs), then bounded statement
+    /// transactions over the RecordId list. Each chunk RE-FETCHES every doc
+    /// row inside its own transaction and re-applies the filter — the scan's
+    /// blobs must never feed a later chunk's transform, or a user
+    /// transaction committing between chunks would be silently overwritten
+    /// with state computed from a stale read (no overlapping WT transactions
+    /// = no conflict to catch it). A conflict retries only its own
+    /// (rolled-back) chunk, and the RecordId list is partitioned across
+    /// chunks, so every document is transformed exactly once ($inc never
+    /// double-applies). The collection write lock is held across the whole
+    /// operation, exactly like the single-transaction path.
+    #[allow(clippy::too_many_arguments)]
+    fn update_matching_chunked(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        vars: &Document,
+        coll_opt: Option<&Collation>,
+        upsert: bool,
+        is_replacement: bool,
+        validator: Option<&Document>,
+        transform: &dyn Fn(&Document, bool) -> Result<Document>,
+    ) -> Result<UpdateOutcome> {
+        let (matched, modified) = {
+            // The coll lock's guard lives only for this block: the zero-match
+            // delegation below re-enters `update_matching_single_txn`, which
+            // takes the SAME non-reentrant mutex — holding it across that
+            // call self-deadlocks (found by the first test run).
+            let lock = self.coll_lock(db, coll);
+            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let rids: Vec<i64> = {
+                let session = self.op_session()?;
+                ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                let mut rids = Vec::new();
+                for (recordid, _id_k, blob) in
+                    self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
+                {
+                    let raw = bson::RawDocument::from_bytes(&blob)
+                        .map_err(|_| StorageError::QueryUnsupported)?;
+                    if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
+                        .map_err(|_| StorageError::QueryUnsupported)?
+                    {
+                        rids.push(recordid);
+                    }
+                }
+                rids
+            };
+            let mut matched = 0usize;
+            let mut modified = 0usize;
+            let mut idx = 0usize;
+            while idx < rids.len() {
+                let (consumed, m, w) =
+                    self.retry_write_conflicts("update_matching_chunk", || {
+                        let session = self.op_session()?;
+                        self.with_statement_txn(&session, || {
+                            self.update_chunk_txn(
+                                &session,
+                                db,
+                                coll,
+                                &rids[idx..],
+                                filter,
+                                vars,
+                                coll_opt,
+                                is_replacement,
+                                validator,
+                                transform,
+                            )
+                        })
+                    })?;
+                debug_assert!(consumed > 0);
+                idx += consumed;
+                matched += m;
+                modified += w;
+            }
+            (matched, modified)
+        };
+        if matched == 0 {
+            // Zero matches (an empty scan, or every candidate stopped
+            // matching by its chunk's re-check): the single-transaction body
+            // — now that the lock is released — rescans and degenerates to
+            // its upsert branch or a clean zero outcome.
+            return self.update_matching_single_txn(
+                db,
+                coll,
+                filter,
+                vars,
+                coll_opt,
+                true,
+                upsert,
+                is_replacement,
+                validator,
+                false,
+                transform,
+            );
+        }
+        Ok(UpdateOutcome {
+            matched,
+            modified,
+            upserted_id: None,
+            post_image: None,
+        })
+    }
+
+    /// One bounded chunk of the multi-update: process RecordIds from the
+    /// front of `rids` until the doc/byte budget closes the transaction.
+    /// Returns `(consumed, matched, modified)` — `consumed` counts every
+    /// examined RecordId (matching or not) so the driver always advances.
+    #[allow(clippy::too_many_arguments)]
+    fn update_chunk_txn(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        rids: &[i64],
+        filter: &Document,
+        vars: &Document,
+        coll_opt: Option<&Collation>,
+        is_replacement: bool,
+        validator: Option<&Document>,
+        transform: &dyn Fn(&Document, bool) -> Result<Document>,
+    ) -> Result<(usize, usize, usize)> {
+        let ns = format!("{db}.{coll}");
+        let descs = self.index_descs(session, db, coll)?;
+        let oplog_on = self.enable_oplog;
+        let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
+        let ui = if oplog_on {
+            Some(collection_uuid(session, db, coll)?)
+        } else {
+            None
+        };
+        let mut consumed = 0usize;
+        let mut matched = 0usize;
+        let mut modified = 0usize;
+        let mut chunk_bytes = 0usize;
+        let mut oplog_entries: Vec<OplogEntry> = Vec::new();
+        let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        for &recordid in rids {
+            if modified >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
+                break;
+            }
+            consumed += 1;
+            // Fresh read inside THIS transaction (see the driver note).
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            let (id_k, blob) = match cur.search() {
+                Ok(()) => {
+                    let value = cur.get_value_u()?;
+                    let (idk, b) = unframe_doc_value(&value)?;
+                    (idk.to_vec(), b.to_vec())
+                }
+                Err(e) if e.is_not_found() => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let raw =
+                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
+            if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
+                .map_err(|_| StorageError::QueryUnsupported)?
+            {
+                continue;
+            }
+            let doc = decode_doc(&blob)?;
+            matched += 1;
+            let new = transform(&doc, false)?;
+            if new == doc {
+                continue;
+            }
+            if let Some(v) = validator {
+                if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                    return Err(StorageError::DocumentValidationFailure);
+                }
+            }
+            if let Some(c) =
+                self.unique_conflict(session, db, coll, &new, &descs, Some(recordid))?
+            {
+                return Err(StorageError::DuplicateKey(Box::new(c)));
+            }
+            let new_blob = encode_doc(&new)?;
+            if new_blob.len() > MAX_BSON_OBJECT_SIZE {
+                return Err(StorageError::DocumentTooLarge(new_blob.len()));
+            }
+            modified += 1;
+            chunk_bytes += new_blob.len();
+            let (additions, removals) = self.index_entry_diff(&doc, &new, &descs, recordid)?;
+            self.insert_index_entries(session, db, coll, &additions)?;
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
+            cur.update()?;
+            self.remove_index_entries(session, db, coll, &removals)?;
+            self.maybe_mark_multikey(session, db, coll, &new, &descs)?;
+            if oplog_on {
+                let o_owned: Vec<u8>;
+                let o_bytes: &[u8] = if is_replacement {
+                    &new_blob
+                } else {
+                    let mut o = Document::new();
+                    o.insert("$v", 2i32);
+                    o.insert(
+                        "diff",
+                        Bson::Document(
+                            compute_update_description(&doc, &new)
+                                .map_err(|_| StorageError::QueryUnsupported)?,
+                        ),
+                    );
+                    o_owned = encode_doc(&o)?;
+                    &o_owned
+                };
+                let o2 = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
+                oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                    "u",
+                    &ns,
+                    Some(ui.as_ref().unwrap()),
+                    o_bytes,
+                    &o2,
+                )?));
+                pre_images.push(if preimages_on {
+                    chunk_bytes += blob.len();
+                    Some(blob.clone())
+                } else {
+                    None
+                });
+            }
+        }
+        if oplog_on && !oplog_entries.is_empty() {
+            self.emit_oplog_entries(session, oplog_entries, pre_images)?;
+        }
+        Ok((consumed, matched, modified))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_matching_single_txn(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        vars: &Document,
+        coll_opt: Option<&Collation>,
+        multi: bool,
+        upsert: bool,
+        is_replacement: bool,
+        validator: Option<&Document>,
+        want_post_image: bool,
+        transform: &dyn Fn(&Document, bool) -> Result<Document>,
+    ) -> Result<UpdateOutcome> {
         self.retry_write_conflicts("update_matching_core", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -9049,6 +9341,169 @@ impl Storage {
     /// when enabled). Mirrors `storage.delete_matching` (base form — `let` /
     /// `collation` route to Python at the engine-selection layer).
     pub fn delete_matching(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        limit: usize,
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+    ) -> Result<usize> {
+        // Unbounded deletes (limit == 0, deleteMany) outside a user
+        // transaction run CHUNKED — the matched set's index-entry removals
+        // plus pre-images are unbounded dirty content in one transaction
+        // otherwise (same class and same driver shape as
+        // `update_matching_chunked`; mongod's deleteMany is per-document
+        // write units and non-atomic). Bounded deletes (limit >= 1) and
+        // in-transaction deletes keep the single-transaction body.
+        if limit == 0 && !self.in_user_txn() {
+            return self.delete_matching_chunked(db, coll, filter, let_vars, coll_opt);
+        }
+        self.delete_matching_single_txn(db, coll, filter, limit, let_vars, coll_opt)
+    }
+
+    /// Chunked deleteMany driver — see `update_matching_chunked` for the
+    /// re-fetch-inside-the-chunk-transaction rationale.
+    fn delete_matching_chunked(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+    ) -> Result<usize> {
+        let lock = self.coll_lock(db, coll);
+        let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let rids: Vec<i64> = {
+            let session = self.op_session()?;
+            let mut rids = Vec::new();
+            for (recordid, _id_k, blob) in
+                self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
+            {
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                if secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
+                    .map_err(|_| StorageError::QueryUnsupported)?
+                {
+                    rids.push(recordid);
+                }
+            }
+            rids
+        };
+        let mut deleted = 0usize;
+        let mut idx = 0usize;
+        while idx < rids.len() {
+            let (consumed, d) = self.retry_write_conflicts("delete_matching_chunk", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.delete_chunk_txn(
+                        &session,
+                        db,
+                        coll,
+                        &rids[idx..],
+                        filter,
+                        let_vars,
+                        coll_opt,
+                    )
+                })
+            })?;
+            debug_assert!(consumed > 0);
+            idx += consumed;
+            deleted += d;
+        }
+        Ok(deleted)
+    }
+
+    /// One bounded chunk of the deleteMany. Returns `(consumed, deleted)`.
+    #[allow(clippy::too_many_arguments)]
+    fn delete_chunk_txn(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        rids: &[i64],
+        filter: &Document,
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+    ) -> Result<(usize, usize)> {
+        let descs = self.index_descs(session, db, coll)?;
+        let oplog_on = self.enable_oplog;
+        let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
+        let ui = if oplog_on && coll_options(session, db, coll)?.is_some() {
+            Some(collection_uuid(session, db, coll)?)
+        } else {
+            None
+        };
+        let ns = if oplog_on {
+            format!("{db}.{coll}")
+        } else {
+            String::new()
+        };
+        let mut consumed = 0usize;
+        let mut deleted = 0usize;
+        let mut chunk_bytes = 0usize;
+        let mut oplog_entries: Vec<OplogEntry> = Vec::new();
+        let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        for &recordid in rids {
+            if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
+                break;
+            }
+            consumed += 1;
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            let (id_k, blob) = match cur.search() {
+                Ok(()) => {
+                    let value = cur.get_value_u()?;
+                    let (idk, b) = unframe_doc_value(&value)?;
+                    (idk.to_vec(), b.to_vec())
+                }
+                Err(e) if e.is_not_found() => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let raw =
+                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
+            if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
+                .map_err(|_| StorageError::QueryUnsupported)?
+            {
+                continue;
+            }
+            let doc = decode_doc(&blob)?;
+            // Doc row first, entries after — see prune_ttl for the lock-free
+            // reader ordering rationale.
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            cur.remove()?;
+            self.delete_index_entries(session, db, coll, &doc, &descs, recordid)?;
+            self.delete_nat_entry(session, db, coll, &id_k)?;
+            deleted += 1;
+            // Index-entry removals are the delete's dirty content; approximate
+            // with the doc size (each removal dirties an entry page).
+            chunk_bytes += blob.len();
+            if oplog_on {
+                let id_doc = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
+                oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                    "d",
+                    &ns,
+                    ui.as_deref(),
+                    &id_doc,
+                    &id_doc,
+                )?));
+                pre_images.push(if preimages_on {
+                    chunk_bytes += blob.len();
+                    Some(blob.clone())
+                } else {
+                    None
+                });
+            }
+        }
+        if oplog_on && !oplog_entries.is_empty() {
+            self.emit_oplog_entries(session, oplog_entries, pre_images)?;
+        }
+        Ok((consumed, deleted))
+    }
+
+    fn delete_matching_single_txn(
         &self,
         db: &str,
         coll: &str,

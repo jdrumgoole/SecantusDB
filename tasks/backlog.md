@@ -5161,7 +5161,29 @@ distinct problems, triaged from the run logs:
   `tests/txn_budget.rs::transaction_dirty_budget_guard` (128M cache).
   **The dirty-cache livelock class is now closed on both servers**:
   chunked batch inserts (#787 / #789) + the transaction dirty budget
-  (Python #791 / this slice).
+  (Python #791 / #792+#793).
+- [ ] **Multi-document update/delete chunking** — the class's final member:
+  updateMany / deleteMany rewrite an unbounded matched set. **Rust server:
+  DONE (rust-multiwrite-chunked slice)** — `update_matching_core` routes
+  multi=true (outside user transactions) through a chunked driver: one
+  RecordId scan under the coll lock, then ≤1000-doc / ≤4MB statement
+  transactions that RE-FETCH each doc row inside their own transaction
+  (reusing the scan's blobs across chunk commits would let a user-txn
+  commit landing between chunks be silently overwritten — no overlapping
+  WT transactions, no conflict detection; found during design). RecordIds
+  are partitioned across chunks and a conflict retries only its own
+  rolled-back chunk, so `$inc` applies exactly once. `delete_matching`
+  (limit=0) mirrors it. Zero-match runs delegate to the single-txn body
+  (which degenerates to the upsert branch) AFTER releasing the coll lock —
+  holding it across the delegation self-deadlocks on the non-reentrant
+  mutex (found by the first test run). Chunk-boundary states are
+  reader-visible, which is mongod-faithful: updateMany/deleteMany are
+  per-document write units, documented non-atomic. Pinned by
+  `tests/multiwrite_chunk.rs` (35k-doc rewrite + deleteMany @ 128M cache;
+  exactly-once `$inc` across chunks; bounded paths unchanged).
+  **Python server: still open** — `storage.update_matching` /
+  `delete_matching` run one `_batch_transaction` over the whole matched
+  set; mirror the chunked driver (same re-fetch + partition rules).
 - ~~**`slt` gauge "regression"**~~ — NOT a regression; **timeout calibration,
   fixed (rust-gauge-wedge slice).** 2026-08-03 was the slt lane's FIRST
   weekly run (the SQL gauge lanes postdate the 2026-07-27 schedule), and the
