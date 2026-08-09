@@ -838,6 +838,18 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(|c| c.get("batchSize"))
         .and_then(as_i64)
         .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    // A negative batchSize is rejected, not clamped. mongo-ruby-driver's
+    // `Collection#indexes when a session is provided` uses `batch_size: -100`
+    // as its deliberately-failing operation and asserts an OperationFailure.
+    // Mirrors `commands._list_indexes`.
+    if batch_size < 0 {
+        return Ok(CommandError::new(
+            51024,
+            "BadValue",
+            format!("BSON field 'batchSize' value must be >= 0, actual value {batch_size}"),
+        )
+        .into_reply());
+    }
     let (first, cid) = split_into_cursor(encode_docs(indexes)?, batch_size, &ns, cursors)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
@@ -1293,6 +1305,8 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // `CursorRegistry::len` prunes idle cursors then counts the live ones — the
     // count rises while a batched cursor is open and drops on killCursors.
     let open_cursors = ctx.cursors().map(|c| c.len()).unwrap_or(0) as i64;
+    // Real counts when the server supplied them; zeros off-server (unit tests).
+    let conns = ctx.conn_stats.unwrap_or_default();
     Ok(doc! {
         "host": "secantus",
         "version": crate::SERVER_VERSION,
@@ -1306,6 +1320,26 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 "open": { "total": open_cursors, "pinned": 0i64, "noTimeout": 0i64 },
             },
         },
+        // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
+        // `connections.totalCreated` off serverStatus to check the connection
+        // pool wasn't cleared. Omitting the section made those fail with
+        // "'connections.totalCreated' field not found" — a serverStatus gap
+        // that looked like an exhaust-cursor bug. Mirrors the Python server's
+        // zeroed block; SecantusDB keeps no pool counters.
+        // Int32, not Int64: libmongoc reads these with `bson_lookup_int32`,
+        // which type-checks rather than coercing ("'connections.totalCreated'
+        // is not a int32"). The Python server emits plain ints, which encode
+        // as Int32, so it never hit this.
+        "connections": {
+            "current": conns.current as i32,
+            "available": 0i32,
+            "totalCreated": conns.total_created as i32,
+        },
+        "opcounters": {
+            "insert": 0i32, "query": 0i32, "update": 0i32,
+            "delete": 0i32, "getmore": 0i32, "command": 0i32,
+        },
+        "network": { "numRequests": 0i32, "bytesIn": 0i32, "bytesOut": 0i32 },
         // Categorical self-identification: real mongod never has this key.
         // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
         // checks it to prove it's talking to SecantusDB rather than an
@@ -1710,6 +1744,81 @@ mod parity_tests {
         assert_eq!(reply.get_f64("ok").unwrap_or(0.0), 1.0, "{reply:?}");
     }
 
+    /// mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
+    /// `connections.totalCreated` to check the pool wasn't cleared. Its absence
+    /// failed them with "field not found", which read as an exhaust-cursor bug.
+    #[test]
+    fn server_status_carries_the_sections_drivers_read() {
+        let mut c = ctx();
+        c = c.with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()));
+        let reply = server_status(&doc! {"serverStatus": 1}, &mut c).unwrap();
+        let conns = reply.get_document("connections").expect("connections");
+        // Int32 specifically — libmongoc type-checks with bson_lookup_int32
+        // rather than coercing, so an Int64 zero fails just as hard as a
+        // missing field.
+        for f in ["totalCreated", "current", "available"] {
+            assert!(
+                matches!(conns.get(f), Some(bson::Bson::Int32(_))),
+                "connections.{f} must be Int32: {conns:?}"
+            );
+        }
+
+        // With real counters attached, the reported values are those — not
+        // zeros. The exhaust tests read `totalCreated` before and after opening
+        // a cursor and require it to have risen, so a constant is not enough.
+        let mut c2 = ctx();
+        c2 = c2
+            .with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()))
+            .with_conn_stats(crate::ConnStats {
+                current: 3,
+                total_created: 7,
+            });
+        let reply2 = server_status(&doc! {"serverStatus": 1}, &mut c2).unwrap();
+        let conns2 = reply2.get_document("connections").unwrap();
+        assert_eq!(conns2.get_i32("totalCreated").unwrap(), 7);
+        assert_eq!(conns2.get_i32("current").unwrap(), 3);
+        assert!(reply.get_document("opcounters").is_ok());
+        assert!(reply.get_document("network").is_ok());
+    }
+
+    /// mongo-ruby-driver's `Collection#indexes when a session is provided` uses
+    /// `batch_size: -100` as its deliberately-failing operation.
+    #[test]
+    fn list_indexes_rejects_a_negative_batch_size() {
+        let mut c = ctx();
+        c = c
+            .with_storage(std::sync::Arc::new(FakeStorage))
+            .with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()));
+        let reply = list_indexes(
+            &doc! {"listIndexes": "specs", "cursor": {"batchSize": -100_i32}},
+            &mut c,
+        )
+        .unwrap();
+        let (code, name, msg) = err_of(&reply);
+        assert_eq!((code, name.as_str()), (51024, "BadValue"));
+        assert!(msg.contains("must be >= 0"), "{msg}");
+    }
+
+    #[test]
+    fn list_indexes_still_accepts_a_zero_or_positive_batch_size() {
+        for bs in [0_i32, 2_i32] {
+            let mut c = ctx();
+            c = c
+                .with_storage(std::sync::Arc::new(FakeStorage))
+                .with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()));
+            let reply = list_indexes(
+                &doc! {"listIndexes": "specs", "cursor": {"batchSize": bs}},
+                &mut c,
+            )
+            .unwrap();
+            assert_eq!(
+                reply.get_f64("ok").unwrap_or(0.0),
+                1.0,
+                "batchSize {bs}: {reply:?}"
+            );
+        }
+    }
+
     /// Minimal in-memory `Storage`: only the methods without a default impl.
     struct FakeStorage;
 
@@ -1760,6 +1869,15 @@ mod parity_tests {
             _hint: Option<crate::storage::RawHint<'_>>,
         ) -> Result<Vec<Vec<u8>>, crate::StorageError> {
             Ok(Vec::new())
+        }
+        /// A non-empty result is what marks the namespace as existing — an
+        /// empty one is how `list_indexes` detects NamespaceNotFound.
+        fn list_indexes(
+            &self,
+            _db: &str,
+            _coll: &str,
+        ) -> Result<Vec<Document>, crate::StorageError> {
+            Ok(vec![doc! {"v": 2, "key": {"_id": 1}, "name": "_id_"}])
         }
     }
 

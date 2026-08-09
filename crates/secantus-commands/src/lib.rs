@@ -136,6 +136,9 @@ pub struct CommandContext {
     /// server wires one in (and in unit-test contexts) — `getLog` then reports an
     /// empty log.
     pub logs: Option<Arc<logbuf::LogBuffer>>,
+    /// Live connection counts for `serverStatus.connections`, snapshotted by the
+    /// server when it builds the context. `None` off-server (unit tests) ⇒ zeros.
+    pub conn_stats: Option<ConnStats>,
     /// Set by a cursor-producing handler (`find` / `getMore`) to hand the
     /// server the reply's document batch as **pre-encoded blobs** instead of an
     /// owned `Bson::Array` inside the reply document. The reply the handler
@@ -188,6 +191,7 @@ impl CommandContext {
             close_connection: false,
             conn_killer: None,
             logs: None,
+            conn_stats: None,
             pending_batch: None,
             raw_insert_documents: None,
         }
@@ -233,6 +237,12 @@ impl CommandContext {
     /// reads it.
     pub fn with_logs(mut self, logs: Arc<logbuf::LogBuffer>) -> Self {
         self.logs = Some(logs);
+        self
+    }
+
+    /// Attach this instant's connection counts (builder-style).
+    pub fn with_conn_stats(mut self, stats: ConnStats) -> Self {
+        self.conn_stats = Some(stats);
         self
     }
 
@@ -333,6 +343,20 @@ pub type Handler = fn(&Document, &mut CommandContext) -> HandlerResult;
 /// (`commands.py::command_name`). Empty string for an empty document.
 pub fn command_name(doc: &Document) -> &str {
     doc.keys().next().map(String::as_str).unwrap_or("")
+}
+
+/// A snapshot of the server's connection counters for `serverStatus`.
+///
+/// mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` assert that opening
+/// an exhaust cursor *creates a connection* — they read `connections.
+/// totalCreated` before and after and require it to rise. Reporting a constant
+/// zero fails that just as surely as omitting the field.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnStats {
+    /// Connections currently open.
+    pub current: i64,
+    /// Connections created over the server's lifetime.
+    pub total_created: i64,
 }
 
 /// Test hook: whether a command name resolves to a handler at all. A name that

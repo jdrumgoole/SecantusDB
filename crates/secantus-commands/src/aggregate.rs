@@ -1435,11 +1435,15 @@ fn apply_coll_stats(
             // `storageStats.{capped, max, maxSize}` directly, so all three have
             // to be present. Mirrors `aggregate._coll_stats`.
             storage_stats.insert("capped", true);
+            // `as_i64` (the crate helper), not `Bson::as_i64` — the latter
+            // matches Int64 only, and drivers send these as Int32
+            // (mongo-ruby-driver sends `size: 4096, max: 512`), so both fields
+            // silently vanished from the reply.
             let opts = storage.get_collection_options(db, coll).unwrap_or_default();
-            if let Some(size) = opts.get("size").and_then(Bson::as_i64) {
+            if let Some(size) = opts.get("size").and_then(as_i64) {
                 storage_stats.insert("maxSize", size);
             }
-            if let Some(max) = opts.get("max").and_then(Bson::as_i64) {
+            if let Some(max) = opts.get("max").and_then(as_i64) {
                 storage_stats.insert("max", max);
             }
         }

@@ -870,7 +870,13 @@ fn make_context(
         .with_failpoints(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone())
         .with_conn_killer(shared.conn_killer.clone())
-        .with_logs(shared.logs.clone());
+        .with_logs(shared.logs.clone())
+        // `next_conn_id` starts at 1 and is bumped per accepted connection, so
+        // it is the lifetime total plus one; `conns` holds the live sockets.
+        .with_conn_stats(secantus_commands::ConnStats {
+            current: shared.conns.lock().map(|c| c.len() as i64).unwrap_or(0),
+            total_created: shared.next_conn_id.load(Ordering::SeqCst) - 1,
+        });
     ctx.server_address = Some((shared.address.ip().to_string(), shared.address.port()));
     ctx.replica_set_name = shared.config.replica_set_name.clone();
     ctx.require_auth = shared.config.require_auth;
