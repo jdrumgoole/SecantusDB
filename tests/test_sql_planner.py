@@ -76,3 +76,52 @@ def test_parse_handles_adjacent_parameters():
 def test_parse_leaves_dollar_in_string_literal_untouched():
     (stmt,) = planner.parse("SELECT * FROM t WHERE name = '$1,$2'")
     assert stmt.args["where"].this.expression.this == "$1,$2"
+
+
+# --------------------------------------------------------------------------- #
+# Parameter substitution
+# --------------------------------------------------------------------------- #
+
+
+def _params_sql(n: int) -> str:
+    return "SELECT coalesce(" + ",".join(f"${i + 1}" for i in range(n)) + ")"
+
+
+def test_substitute_parameters_binds_every_placeholder():
+    stmt = planner.parse(_params_sql(4))[0]
+    out = planner.substitute_parameters(stmt, [1, None, "x", 2.5])
+    assert out.sql(dialect="postgres") == "SELECT COALESCE(1, NULL, 'x', 2.5)"
+
+
+def test_substitute_parameters_binds_a_bare_placeholder():
+    stmt = planner.parse("SELECT $1")[0]
+    assert planner.substitute_parameters(stmt, ["x"]).sql(dialect="postgres") == "SELECT 'x'"
+
+
+def test_substitute_parameters_leaves_the_source_statement_alone():
+    stmt = planner.parse("SELECT $1, $2")[0]
+    planner.substitute_parameters(stmt, [1, 2])
+    assert stmt.sql(dialect="postgres") == "SELECT $1, $2"
+
+
+def test_substitute_parameters_scales_linearly():
+    """Binding N placeholders under one node must not be O(N**2).
+
+    Replacing them one at a time makes sqlglot re-parent every sibling per call.
+    pgjdbc's rewritten batch INSERT binds tens of thousands of parameters in a
+    single statement, which took minutes and timed the connection out.
+    """
+    import time
+
+    def elapsed(n: int) -> float:
+        stmt = planner.parse(_params_sql(n))[0]
+        values = [None] * n
+        t = time.perf_counter()
+        planner.substitute_parameters(stmt, values)
+        return time.perf_counter() - t
+
+    small = max(elapsed(2000), 1e-3)
+    large = elapsed(16000)
+    # 8x the parameters: linear predicts ~8x, quadratic ~64x. A generous 20x
+    # ceiling still fails loudly on a return to quadratic without being flaky.
+    assert large < small * 20, f"{small:.4f}s -> {large:.4f}s for 8x the parameters"

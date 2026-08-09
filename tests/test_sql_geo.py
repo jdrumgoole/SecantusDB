@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import struct
+
 import pytest
 
-from secantus.sql import pggeo, run_sql
+from secantus.sql import pgextended, pggeo, run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -160,3 +162,71 @@ def test_where_polygon_contains_point(shapes, session):
         ).rows
     ]
     assert ids == [1]
+
+
+# --------------------------------------------------------------------------- #
+# line ``{A,B,C}`` and binary-format parameters
+# --------------------------------------------------------------------------- #
+
+
+def test_canonical_line():
+    """``line``'s canonical text is three coefficients, not coordinate pairs —
+    the branch handling it used to sit *after* the pair parse, so every line
+    literal raised ``no coordinate pairs`` instead of being accepted."""
+    assert pggeo.canonical("{0.0,0.0,0.0}", "line") == "{0,0,0}"
+    assert pggeo.canonical("{1,2,3}", "line") == "{1,2,3}"
+    # The two-point spelling is accepted on input and converted, like Postgres.
+    assert pggeo.canonical("[(0,0),(1,1)]", "line") == "{1,-1,0}"
+    assert pggeo.canonical("[(0,0),(0,5)]", "line") == "{-1,0,0}"  # vertical
+    assert pggeo.canonical("[(0,0),(5,0)]", "line") == "{0,-1,0}"  # horizontal
+
+
+def test_canonical_line_rejects_garbage():
+    with pytest.raises(pggeo.GeoError):
+        pggeo.canonical("{1,2}", "line")
+    with pytest.raises(pggeo.GeoError):
+        pggeo.canonical("[(1,1),(1,1)]", "line")  # not two distinct points
+
+
+def test_path_keeps_open_closed_spelling():
+    assert pggeo.canonical("[(0,0),(1,1)]", "path") == "[(0,0),(1,1)]"
+    assert pggeo.canonical("((0,0),(1,1))", "path") == "((0,0),(1,1))"
+
+
+def test_line_has_no_shapely_form():
+    """An infinite line has no Shapely counterpart; the operators must say so
+    rather than fail deep inside the pair parser."""
+    with pytest.raises(pggeo.GeoError, match="not supported on line"):
+        pggeo.to_shapely("{1,-1,0}")
+
+
+@pytest.mark.parametrize(
+    ("oid", "raw", "expected"),
+    [
+        (600, struct.pack("!2d", 1.5, -2.0), "(1.5,-2)"),  # point
+        (601, struct.pack("!4d", 1, 2, 3, 4), "[(1,2),(3,4)]"),  # lseg
+        (603, struct.pack("!4d", 3, 4, 1, 2), "(3,4),(1,2)"),  # box
+        (628, struct.pack("!3d", 0.0, 0.0, 0.0), "{0,0,0}"),  # line
+        (718, struct.pack("!3d", 1, 2, 3), "<(1,2),3>"),  # circle
+        (
+            604,
+            struct.pack("!i", 3) + struct.pack("!6d", 0, 0, 1, 0, 1, 1),
+            "((0,0),(1,0),(1,1))",
+        ),  # polygon
+        (
+            602,
+            b"\x01" + struct.pack("!i", 2) + struct.pack("!4d", 0, 0, 1, 1),
+            "((0,0),(1,1))",
+        ),  # path, closed
+        (
+            602,
+            b"\x00" + struct.pack("!i", 2) + struct.pack("!4d", 0, 0, 1, 1),
+            "[(0,0),(1,1)]",
+        ),  # path, open
+    ],
+)
+def test_geometric_binary_parameters(oid, raw, expected):
+    """A geometric parameter sent in binary (pgjdbc's default for these types)
+    had no decoder, so the raw bytes reached the *text* parser and the insert
+    died with ``no coordinate pairs``."""
+    assert str(pgextended._BINARY[oid](raw)) == expected

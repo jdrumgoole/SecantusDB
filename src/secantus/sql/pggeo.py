@@ -65,6 +65,18 @@ def canonical(value: Any, tag: str) -> str:
             r = _num(nums[-1]) if nums else 0
             cx, cy = pts[0]
         return f"<{_fmt_pair((cx, cy))},{_fmt(r)}>"
+    if tag == "line":
+        # ``line``'s canonical text is ``{A,B,C}`` — three coefficients, no
+        # coordinate pairs — so it has to be handled before ``_pairs``. The
+        # two-point spelling ``[(x1,y1),(x2,y2)]`` is also accepted on input and
+        # converted, the way Postgres does.
+        if s.startswith("{"):
+            nums = re.findall(_NUM, s)
+            if len(nums) < 3:
+                raise GeoError(f"invalid line: {value!r}")
+            return "{" + ",".join(_fmt(_num(n)) for n in nums[:3]) + "}"
+        (x1, y1), (x2, y2) = _pairs(s)[:2]
+        return line_from_points(x1, y1, x2, y2)
     pts = _pairs(s)
     if tag == "point":
         return _fmt_pair(pts[0])
@@ -75,12 +87,32 @@ def canonical(value: Any, tag: str) -> str:
         return f"{_fmt_pair(hi)},{_fmt_pair(lo)}"
     if tag == "lseg":
         return f"[{_fmt_pair(pts[0])},{_fmt_pair(pts[1])}]"
-    if tag in ("polygon", "path"):
+    if tag == "path":
+        # An open path keeps the ``[…]`` spelling; a closed one uses ``(…)``.
+        # The distinction is part of the value, not just presentation, so it has
+        # to survive the round trip even though the operators ignore it.
+        body = ",".join(_fmt_pair(p) for p in pts)
+        return f"[{body}]" if s.startswith("[") else f"({body})"
+    if tag == "polygon":
         return "(" + ",".join(_fmt_pair(p) for p in pts) + ")"
-    if tag == "line":
-        nums = re.findall(_NUM, s)
-        return "{" + ",".join(_fmt(_num(n)) for n in nums[:3]) + "}"
     return s
+
+
+def line_from_points(x1: float, y1: float, x2: float, y2: float) -> str:
+    """The ``{A,B,C}`` text for the infinite line through two points, following
+    ``line_construct_pts`` in Postgres (vertical and horizontal are special-cased
+    so the coefficients come out exact rather than as a division artefact)."""
+    if x1 == x2:
+        if y1 == y2:
+            raise GeoError("invalid line specification: must be two distinct points")
+        a, b, c = -1.0, 0.0, x1
+    elif y1 == y2:
+        a, b, c = 0.0, -1.0, y1
+    else:
+        a = (y2 - y1) / (x2 - x1)
+        b = -1.0
+        c = y1 - a * x1
+    return "{" + ",".join(_fmt(v) for v in (a, b, c)) + "}"
 
 
 def is_geo_text(v: Any) -> bool:
@@ -96,6 +128,8 @@ def to_shapely(value: Any):
     """Convert a canonical geometry text to a Shapely geometry (a ``circle`` becomes
     its centre buffered by the radius). The form is auto-detected from the text."""
     s = str(value).strip()
+    if s.startswith("{"):  # line — infinite, so it has no Shapely counterpart
+        raise GeoError(f"geometric operators are not supported on line: {value!r}")
     if s.startswith("<"):  # circle
         m = _CIRCLE_RE.match(s)
         if m is None:

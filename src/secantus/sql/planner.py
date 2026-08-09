@@ -896,6 +896,14 @@ def _to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any:
     if _is_field_node(node):
         return "$" + _field(node, resolve)[0]
     if isinstance(node, exp.Cast):
+        # The cast itself is dropped — the operand's own value is what the
+        # aggregation engine compares. That only holds for types the engine
+        # models; an ``interval`` has no BSON counterpart at all, so dropping
+        # the cast would hand ``$multiply`` / ``$add`` the raw literal text and
+        # produce a wrong answer (or a crash). Refuse it, and the WHERE falls
+        # back to the scalar evaluator, which does understand intervals.
+        if node.to is not None and node.to.sql(dialect="postgres").lower().strip() == "interval":
+            raise errors.feature_not_supported("interval arithmetic in a pushed-down predicate")
         return _to_agg_expr(node.this, resolve)
     if isinstance(node, exp.Neg) and not isinstance(node.this, (exp.Literal, exp.Null)):
         # Unary minus over a non-literal (``- col2``) — a negative literal
@@ -3610,14 +3618,40 @@ def substitute_parameters(stmt: exp.Expression, values: list[Any]) -> exp.Expres
     type, so a text ``"5"`` bound into an ``int8`` column lands as ``Int64(5)``.
     """
     stmt = stmt.copy()
-    for param in list(stmt.find_all(exp.Parameter)):
+    bound: list[tuple[exp.Parameter, exp.Expression]] = []
+    for param in stmt.find_all(exp.Parameter):
         try:
             idx = int(param.name) - 1
         except (TypeError, ValueError) as exc:
             raise errors.syntax_error(f"invalid bind parameter ${param.name}") from exc
         if idx < 0 or idx >= len(values):
             raise errors.syntax_error(f"bind parameter ${param.name} has no value")
-        param.replace(_value_to_node(values[idx]))
+        bound.append((param, _value_to_node(values[idx])))
+    # Swap each placeholder for its bound literal. Replacing them one at a time
+    # through ``Expression.replace`` is quadratic — sqlglot re-parents *every*
+    # sibling in the argument list on each call — so a statement binding many
+    # parameters under one node (pgjdbc's rewritten batch INSERT binds tens of
+    # thousands) spends O(N**2) here. Collect the swaps per argument list and
+    # apply each list once instead.
+    edits: dict[tuple[int, str], tuple[exp.Expression, str, list]] = {}
+    for param, node in bound:
+        parent = param.parent
+        container = parent.args.get(param.arg_key) if parent is not None else None
+        if parent is None:
+            stmt = node  # the whole statement was a bare ``$1``
+            continue
+        if not isinstance(container, list) or param.index is None:
+            param.replace(node)  # a scalar argument slot — already O(1)
+            continue
+        key = (id(parent), param.arg_key)
+        entry = edits.get(key)
+        if entry is None:
+            # Not ``setdefault``: it would evaluate the list copy on every
+            # parameter, reintroducing the quadratic cost this avoids.
+            entry = edits[key] = (parent, param.arg_key, container[:])
+        entry[2][param.index] = node
+    for parent, arg_key, new_list in edits.values():
+        parent.set(arg_key, new_list)
     # A statement sqlglot keeps as a raw Command (``DECLARE c CURSOR FOR
     # SELECT $1::text``) carries its ``$N`` placeholders inside the tail
     # *text*, invisible to find_all — substitute them textually with rendered

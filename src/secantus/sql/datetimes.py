@@ -435,6 +435,15 @@ def parse_time(value: Any) -> str:
         raise DateTimeError(f"invalid time value: {value!r}")
     hh, mm = int(m.group(1)), int(m.group(2))
     ss = int(m.group(3)) if m.group(3) else 0
+    if ss == 60:
+        # A leap second carries forward, as Postgres does: '23:59:60'::time is
+        # '24:00:00' (the upper bound of the time domain), '10:00:60' is
+        # '10:01:00'. Storing the literal 60 instead produced a value nothing
+        # downstream could parse — Python's time rejects second 60 — so any
+        # arithmetic on it died with a bare ValueError.
+        ss = 0
+        mm += 1
+        hh, mm = hh + mm // 60, mm % 60
     return _fmt_time(hh, mm, ss, m.group(4) or "")
 
 
@@ -485,6 +494,18 @@ def is_time_value(v: Any) -> bool:
     return isinstance(v, str) and _TIME_RE.match(v) is not None
 
 
+def is_timetz_value(v: Any) -> bool:
+    """Whether ``v`` is a stored ``timetz`` — a time of day carrying a zone
+    offset, which ``is_time_value`` deliberately does not match."""
+    return isinstance(v, str) and _TIMETZ_RE.match(v) is not None
+
+
+def split_timetz(v: Any) -> tuple[str, str]:
+    """A ``timetz`` split into its canonical (time-of-day, offset) halves."""
+    text = parse_timetz(v)
+    return text[:-6], text[-6:]
+
+
 def to_date_obj(v: Any) -> _dt.date:
     if isinstance(v, _dt.datetime):
         return v.date()
@@ -495,6 +516,33 @@ def to_date_obj(v: Any) -> _dt.date:
 
 def to_time_obj(v: Any) -> _dt.time:
     return _dt.time.fromisoformat(parse_time(v))
+
+
+MICROS_PER_DAY = 86_400_000_000
+
+
+def time_micros(v: Any) -> int:
+    """A ``time`` as microseconds since midnight.
+
+    Time arithmetic goes through this rather than ``to_time_obj`` because
+    Postgres' ``time`` domain runs to ``24:00:00`` inclusive and Python's
+    ``datetime.time`` stops one microsecond short — so the boundary value a
+    leap second rolls into cannot be held in a ``time`` at all."""
+    text = parse_time(v)
+    hh, mm, rest = text.split(":", 2)
+    ss, _, frac = rest.partition(".")
+    micros = int((frac + "000000")[:6]) if frac else 0
+    return ((int(hh) * 3600 + int(mm) * 60 + int(ss)) * 1_000_000) + micros
+
+
+def time_from_micros(micros: int) -> str:
+    """The canonical ``time`` text for a microsecond offset within one day."""
+    return _fmt_time(
+        micros // 3_600_000_000,
+        micros // 60_000_000 % 60,
+        micros // 1_000_000 % 60,
+        f"{micros % 1_000_000:06d}" if micros % 1_000_000 else "",
+    )
 
 
 def date_sub_date(a: Any, b: Any) -> int:

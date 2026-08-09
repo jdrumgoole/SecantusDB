@@ -462,3 +462,49 @@ def test_create_schema_and_qualified_types(storage, session):
     assert getattr(exc.value, "sqlstate", None) == "3F000"
     # DROP TYPE IF EXISTS tolerates the missing schema.
     run_sql(storage, "db", "drop type if exists testschema.testcomp cascade", session=session)
+
+
+# -- catalog builders are consistent under concurrent DDL --------------------- #
+
+
+class _RacingCatalog:
+    """A real ``Catalog`` that hides one existing table on its first listing.
+
+    That is what a builder sees when another session commits a ``CREATE TABLE``
+    mid-scan: the first enumeration (which assigns the OIDs) misses the table
+    and the second one returns it. The wrapper defers every lookup to the
+    genuine catalog, so each table still resolves against real storage.
+    """
+
+    def __init__(self, inner, hidden: str) -> None:
+        self._inner = inner
+        self._hidden = hidden
+        self.calls = 0
+
+    def list_tables(self, db: str):
+        self.calls += 1
+        names = list(self._inner.list_tables(db))
+        if self.calls == 1:
+            names = [n for n in names if n != self._hidden]
+        return names
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize(
+    "builder",
+    ["_pg_class", "_pg_attribute", "_pg_attrdef", "_pg_description", "_pg_index"],
+)
+def test_catalog_builders_survive_a_table_appearing_mid_scan(storage, session, builder):
+    """A builder that enumerates the tables twice — once for the OID map, once
+    for the rows — dies with a ``KeyError`` on a table the first pass never saw.
+    Each must take a single snapshot instead.
+    """
+    from secantus.sql import virtual
+    from secantus.sql.catalog import Catalog
+
+    q(storage, session, "CREATE TABLE seen (id int PRIMARY KEY, v text)")
+    q(storage, session, "CREATE TABLE create_and_drop_table (id int PRIMARY KEY, v text)")
+    racing = _RacingCatalog(Catalog(storage), "create_and_drop_table")
+    assert isinstance(getattr(virtual, builder)(DB, session, storage, racing), list)

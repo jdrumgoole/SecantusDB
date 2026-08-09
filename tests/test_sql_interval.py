@@ -219,3 +219,98 @@ def test_interval_column_arithmetic(durations, session):
     assert rendered(durations, session, "SELECT dur + interval '1 hour' FROM t WHERE id = 1") == (
         "03:30:00"
     )
+
+
+# --------------------------------------------------------------------------- #
+# time ± interval (crashed with a TypeError: the overload was missing entirely)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT time '10:00:00' + interval '2 hours'", "12:00:00"),
+        ("SELECT interval '2 hours' + time '10:00:00'", "12:00:00"),
+        ("SELECT time '00:30:00' - interval '2 hours'", "22:30:00"),
+        # Postgres wraps into a single day rather than carrying into the next.
+        ("SELECT time '23:00:00' + interval '3 hours'", "02:00:00"),
+        # ``months`` / ``days`` are dropped — a time of day has no date to carry.
+        ("SELECT time '10:00:00' + interval '5 days 1 hour'", "11:00:00"),
+        # Trailing zeros are stripped, matching the canonical ``time`` form.
+        ("SELECT time '10:00:00.5' + interval '1 second'", "10:00:01.5"),
+    ],
+)
+def test_time_plus_interval(storage, session, sql, expected):
+    assert val(storage, session, sql) == expected
+
+
+def test_interval_times_unknown_text_operand(storage, session):
+    """An unknown-type text operand beside an interval resolves numerically, the
+    way Postgres coerces an unknown literal — pgjdbc binds parameters typeless,
+    so ``$1 * $2::interval`` reaches the evaluator as ``str * interval``."""
+    assert val(storage, session, "SELECT '3' * interval '1 day'") == intervals.parse("3 days")
+    assert val(storage, session, "SELECT interval '1 day' * '3'") == intervals.parse("3 days")
+    assert val(storage, session, "SELECT interval '1 day' / '2'") == intervals.parse("12 hours")
+
+
+def test_interval_arithmetic_in_where_is_not_pushed_down(storage, session):
+    """``ts < ts + n * interval`` has no aggregation-expression form: the Mongo
+    pushdown drops casts, so it would hand ``$multiply`` the raw interval text.
+    The predicate must fall back to per-row scalar evaluation instead."""
+    run(storage, session, "CREATE TABLE ev (id int PRIMARY KEY, at timestamptz)")
+    run(storage, session, "INSERT INTO ev VALUES (1, '2020-01-05 00:00:00+00')")
+    run(storage, session, "INSERT INTO ev VALUES (2, '2020-01-25 00:00:00+00')")
+    r = run(
+        storage,
+        session,
+        "SELECT id FROM ev WHERE at < ('2020-01-01 00:00:00+00'::timestamptz "
+        "+ '10' * '1 day'::interval) ORDER BY id",
+    )
+    assert [row[0] for row in r.rows] == [1]
+
+
+def test_leap_second_time_carries_forward(storage, session):
+    """``'23:59:60'::time`` is ``24:00:00`` in Postgres — the top of the time
+    domain, one microsecond past what a Python ``time`` can hold. Storing the
+    literal ``60`` instead left a value nothing could parse, so *any* arithmetic
+    on it (``time - time`` as well as ``time ± interval``) died with a bare
+    ValueError and reached the client as ``internal error``.
+    """
+    assert val(storage, session, "SELECT time '23:59:60'") == "24:00:00"
+    assert val(storage, session, "SELECT time '10:00:60'") == "10:01:00"
+    assert val(storage, session, "SELECT time '23:59:60' - time '00:00:00'") == intervals.parse(
+        "24 hours"
+    )
+    assert val(storage, session, "SELECT time '23:59:60' + interval '1 second'") == "00:00:01"
+
+
+def test_timetz_plus_interval_keeps_the_offset(storage, session):
+    """``timetz ± interval`` shifts the time of day and carries the zone offset
+    through untouched, wrapping within the day like plain ``time``. There was no
+    overload at all, so pgjdbc's ``?::time with time zone + ?`` crashed."""
+    q = "SELECT time with time zone '{}' {} interval '{}'"
+    assert val(storage, session, q.format("01:02:03+00", "+", "1 hour")) == "02:02:03+00:00"
+    assert val(storage, session, q.format("23:30:00+02", "+", "1 hour")) == "00:30:00+02:00"
+    assert val(storage, session, q.format("01:02:03+00", "-", "2 hours")) == "23:02:03+00:00"
+    assert (
+        val(storage, session, "SELECT interval '1 hour' + time with time zone '01:02:03+00'")
+        == "02:02:03+00:00"
+    )
+
+
+def test_date_column_compared_against_computed_timestamp(storage, session):
+    """A stored ``date`` is ISO text; comparing it against a computed
+    ``timestamp`` (``ts + n * interval``) raised TypeError once the predicate
+    correctly stopped being pushed down. Postgres promotes the date to midnight.
+    This is pgjdbc's ``IntervalTest.stringToIntervalCoercion`` verbatim.
+    """
+    run(storage, session, "CREATE TABLE testdate (v date)")
+    for d in ("2010-01-01", "2010-01-02", "2010-01-04", "2010-01-05"):
+        run(storage, session, f"INSERT INTO testdate VALUES ('{d}')")
+    r = run(
+        storage,
+        session,
+        "SELECT v FROM testdate WHERE v < ('2010-01-01'::timestamp with time zone "
+        "+ 2 * '1 day'::interval) ORDER BY v",
+    )
+    assert [row[0] for row in r.rows] == ["2010-01-01", "2010-01-02"]
