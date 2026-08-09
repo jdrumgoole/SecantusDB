@@ -31,7 +31,13 @@ VENDOR = REPO_ROOT / "vendor" / "pgjdbc"
 RESULTS = VENDOR / "pgjdbc" / "build" / "test-results" / "test"
 RAW_OUT = REPO_ROOT / ".validation" / "pgjdbc-raw.json"
 
-GRADLE_TIMEOUT_SECONDS = 3600.0
+#: Wall-clock budget for the whole gradle run. Overridable for slow hardware —
+#: CI runners are several times slower than a dev machine, and the suite grew
+#: materially once the crashes that used to end tests in milliseconds were
+#: fixed (a full run is 75 classes / ~5.5k tests, where a server that bailed
+#: early only reached 50). A run that exceeds this is TRUNCATED, not failed:
+#: see ``_aggregate`` for why that distinction has to survive into the report.
+GRADLE_TIMEOUT_SECONDS = float(os.environ.get("SECANTUS_PGJDBC_TIMEOUT", 7200.0))
 JUNIT_DEFAULT_TIMEOUT = "60s"
 
 
@@ -74,9 +80,7 @@ def _is_jdk21(home: str) -> bool:
     if not java.exists():
         return False
     try:
-        out = subprocess.run(
-            [str(java), "-version"], capture_output=True, text=True, timeout=10
-        )
+        out = subprocess.run([str(java), "-version"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return False
     return ' "21' in out.stderr or ' "21' in out.stdout
@@ -181,7 +185,23 @@ def main() -> int:
         for pattern in _test_classes():
             cmd += ["--tests", pattern]
         env = {**os.environ, "JAVA_HOME": jdk}
-        proc = subprocess.run(cmd, cwd=VENDOR, env=env, timeout=GRADLE_TIMEOUT_SECONDS)
+        try:
+            proc = subprocess.run(cmd, cwd=VENDOR, env=env, timeout=GRADLE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Aggregate what did run rather than letting the exception escape.
+            # RESULTS is wiped at startup, so without this a timed-out run
+            # reports *zero tests* — which reads like a clean sweep instead of
+            # "nothing was measured". The truncated flag rides into the JSON so
+            # generate_report refuses to publish a partial denominator.
+            _aggregate(truncated=True)
+            print(
+                f"pgjdbc gauge TRUNCATED: gradle exceeded "
+                f"{GRADLE_TIMEOUT_SECONDS:.0f}s and was killed. Partial results "
+                f"aggregated to {RAW_OUT}; the run is NOT a measurement. Raise "
+                f"SECANTUS_PGJDBC_TIMEOUT to give it more room.",
+                file=sys.stderr,
+            )
+            return 124  # conventional shell exit for "timed out"
         _aggregate()
         return proc.returncode
     finally:
@@ -192,8 +212,15 @@ def main() -> int:
             daemon.kill()
 
 
-def _aggregate() -> None:
-    """JUnit XML → one JSON blob (per-class counts + failing test names)."""
+def _aggregate(*, truncated: bool = False) -> None:
+    """JUnit XML → one JSON blob (per-class counts + failing test names).
+
+    ``truncated`` marks a run gradle did not finish. It has to be recorded
+    rather than inferred: the per-class numbers of a partial run look entirely
+    normal, and only the *denominator* is wrong, so a truncated run renders a
+    plausible-looking conformance rate that is simply measuring less of the
+    suite. ``generate_report`` refuses to publish one.
+    """
     classes = []
     for xml_file in sorted(RESULTS.glob("*.xml")) if RESULTS.exists() else []:
         try:
@@ -212,7 +239,11 @@ def _aggregate() -> None:
             if tc.find("failure") is not None or tc.find("error") is not None:
                 entry["failed_tests"].append(tc.get("name"))
         classes.append(entry)
-    RAW_OUT.write_text(json.dumps({"classes": classes}, indent=1))
+    payload: dict = {"classes": classes}
+    if truncated:
+        payload["truncated"] = True
+    RAW_OUT.parent.mkdir(exist_ok=True)
+    RAW_OUT.write_text(json.dumps(payload, indent=1))
 
 
 if __name__ == "__main__":

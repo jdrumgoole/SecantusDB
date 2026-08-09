@@ -44,6 +44,17 @@ def main() -> None:
     args = parser.parse_args()
 
     data = json.loads(Path(args.raw_json).read_text())
+    if data.get("truncated"):
+        # A truncated run's per-class numbers are all correct; only the set of
+        # classes is short. That renders a healthy-looking pass rate measured
+        # over less of the suite — the most misleading artifact this tool can
+        # produce, so refuse rather than publish it with a caveat nobody reads.
+        raise SystemExit(
+            f"refusing to render a report from a truncated run ({args.raw_json}): "
+            "gradle was killed before finishing, so the pass rate would be "
+            "computed over only the classes that happened to complete. Re-run "
+            "with a larger SECANTUS_PGJDBC_TIMEOUT."
+        )
     classes = data.get("classes", [])
     totals = {"tests": 0, "failures": 0, "skipped": 0}
     failures: list[str] = []
