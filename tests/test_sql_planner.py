@@ -114,14 +114,22 @@ def test_substitute_parameters_scales_linearly():
     import time
 
     def elapsed(n: int) -> float:
-        stmt = planner.parse(_params_sql(n))[0]
-        values = [None] * n
-        t = time.perf_counter()
-        planner.substitute_parameters(stmt, values)
-        return time.perf_counter() - t
+        # Best of several: timing noise is one-sided (a loaded CI runner only
+        # ever makes a run slower), so the minimum is the stable estimate. A
+        # single sample against a ~10ms baseline is mostly scheduler jitter.
+        best = float("inf")
+        for _ in range(5):
+            stmt = planner.parse(_params_sql(n))[0]
+            values = [None] * n
+            t = time.perf_counter()
+            planner.substitute_parameters(stmt, values)
+            best = min(best, time.perf_counter() - t)
+        return best
 
-    small = max(elapsed(2000), 1e-3)
+    small = max(elapsed(2000), 1e-4)
     large = elapsed(16000)
-    # 8x the parameters: linear predicts ~8x, quadratic ~64x. A generous 20x
-    # ceiling still fails loudly on a return to quadratic without being flaky.
-    assert large < small * 20, f"{small:.4f}s -> {large:.4f}s for 8x the parameters"
+    # 8x the parameters: linear predicts ~8x, quadratic ~64x. 25x sits well
+    # clear of both — it still fails loudly on a return to quadratic, without
+    # tracking the constant overheads that dominate the small measurement.
+    ratio = large / small
+    assert ratio < 25, f"{small:.4f}s -> {large:.4f}s = {ratio:.1f}x for 8x the parameters"
