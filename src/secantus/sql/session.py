@@ -271,6 +271,12 @@ class Session:
     user: str = "secantus"
     backend_pid: int = 0
     settings: dict[str, str] = field(default_factory=dict)
+    # Server-config GUC defaults (postgresql.conf tier). Sits between the
+    # session's ``SET`` overrides and the built-in ``GUC_DEFAULTS``: an explicit
+    # ``SET`` wins, ``RESET`` falls back here (not to the built-in), and
+    # ``SHOW`` reports the effective value. The wire server seeds this at
+    # connect (e.g. its ``idle_in_transaction_timeout_s`` default).
+    server_gucs: dict[str, str] = field(default_factory=dict)
     # Reportable-GUC changes made mid-statement by ``set_config()`` (which has
     # no SQLResult of its own to carry them) — drained by the wire layer after
     # each statement and emitted as ParameterStatus messages, like real PG.
@@ -519,6 +525,7 @@ class Session:
         """Every GUC's current value — the built-in defaults overlaid with the
         session's ``SET`` overrides. Used by ``SHOW ALL`` and ``pg_settings``."""
         merged = dict(GUC_DEFAULTS)
+        merged.update(self.server_gucs)
         merged.update(self.settings)
         return merged
 
@@ -537,6 +544,8 @@ class Session:
         # until a BEGIN/SET TRANSACTION overrides them (like real Postgres).
         if key in ("transaction_isolation", "transaction_read_only", "transaction_deferrable"):
             return self.get_setting(f"default_{key}")
+        if key in self.server_gucs:
+            return self.server_gucs[key]
         return GUC_DEFAULTS.get(key, "")
 
     @property

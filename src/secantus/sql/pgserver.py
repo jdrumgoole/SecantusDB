@@ -59,6 +59,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
+#: Server-config default for ``idle_in_transaction_session_timeout``. Real PG
+#: ships 0 (disabled), but SecantusDB cannot afford an abandoned open
+#: transaction: the WT storage engine keeps every later write's history
+#: reachable from the pinned snapshot, so per-operation cost grows linearly
+#: with churn until page reads stall the whole server (the pgjdbc gauge's
+#: 2-hour lane hang — one leaked in-transaction connection from a failed
+#: autocommit-off test wedged a later 100k-row TRUNCATE indefinitely).
+#: Sessions can still ``SET idle_in_transaction_session_timeout = 0`` to
+#: opt out — this is the postgresql.conf tier, not a hard cap.
+DEFAULT_IDLE_IN_TXN_TIMEOUT_S = 120.0
 #: Cap on concurrently-served connections — an over-cap accept is closed
 #: immediately rather than spawning a thread (mirrors the Mongo server's
 #: ``DEFAULT_MAX_CONNECTIONS``). Bounds the fan-out of the per-connection cursor
@@ -156,6 +166,7 @@ class SecantusPGServer:
         storage: Any = None,
         default_database: str = "postgres",
         client_idle_timeout_s: float = DEFAULT_CLIENT_IDLE_TIMEOUT_S,
+        idle_in_transaction_timeout_s: float = DEFAULT_IDLE_IN_TXN_TIMEOUT_S,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         require_auth: bool = False,
         users: dict[str, str] | None = None,
@@ -167,6 +178,7 @@ class SecantusPGServer:
         self.port = port
         self.default_database = default_database
         self.client_idle_timeout_s = client_idle_timeout_s
+        self.idle_in_transaction_timeout_s = idle_in_transaction_timeout_s
         self.max_connections = max_connections
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -405,6 +417,12 @@ class SecantusPGServer:
             return None
 
         session = Session(database=db, user=user, backend_pid=backend_pid)
+        # Server-config GUC tier (postgresql.conf equivalent): SET overrides
+        # it, RESET falls back to it, SHOW reports it.
+        if self.idle_in_transaction_timeout_s > 0:
+            session.server_gucs["idle_in_transaction_session_timeout"] = str(
+                int(self.idle_in_transaction_timeout_s * 1000)
+            )
         # Database-level GUC defaults (ALTER DATABASE … SET) apply to new
         # sessions only — merge them before the client sends anything.
         with contextlib.suppress(Exception):
@@ -872,6 +890,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Database reported to clients that don't request one (default: postgres).",
     )
     parser.add_argument(
+        "--idle-in-transaction-timeout",
+        type=float,
+        default=DEFAULT_IDLE_IN_TXN_TIMEOUT_S,
+        metavar="SECONDS",
+        help=(
+            "Server default for idle_in_transaction_session_timeout, in "
+            f"seconds (default: {DEFAULT_IDLE_IN_TXN_TIMEOUT_S:.0f}; 0 "
+            "disables). A session left idle inside an open transaction "
+            "longer than this is terminated (FATAL 25P03), like PG's GUC — "
+            "sessions can SET their own value to override."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -909,6 +940,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         storage_path=args.storage_path,
         default_database=args.default_database,
+        idle_in_transaction_timeout_s=args.idle_in_transaction_timeout,
         tls_cert_file=args.tls_cert_file,
         tls_key_file=args.tls_key_file,
     )

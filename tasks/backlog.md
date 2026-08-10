@@ -4910,7 +4910,9 @@ re-insert falsely rejected the value with 23505 (the FALSE-rejection class
 #775's additive design was supposed to make impossible). Caught by the first
 full weekly sweep after #775: slt's `index/delete` lane failed in both
 engines (its corpus cycles drop/create with unique indexes), reproduced in
-eight lines, and likely a contributor to the same sweep's pgjdbc 2h blowout.
+eight lines. (It was NOT the pgjdbc 2h blowout's cause — that turned out to
+be a leaked idle-in-transaction connection pinning WT's oldest snapshot; see
+the pgjdbc-lane entry below.)
 All five teardown paths now purge claims (drop_collection / drop_database /
 drop_index / drop_all_indexes / rename src+dst), pinned by
 `TestClaimsDieWithTheirNamespace` in `tests/test_storage_unique_keys.py`.
@@ -5230,6 +5232,21 @@ distinct problems, triaged from the run logs:
   inherently, since it streams a large file through COPY (`CopyTest` beside it
   is 1.8s). Check `uptime` before drawing any conclusion from gauge timings;
   this machine has repeatedly carried runaway processes from parallel sessions.
+- **pgjdbc 2h lane hang — ROOT-CAUSED AND FIXED (pg-idle-txn-default slice,
+  2026-08-10).** The wedge was a leaked idle-in-transaction connection: a
+  failed autocommit-off test (the CleanupSavepoints / AutoSave cluster) left
+  its connection open mid-transaction for the rest of the run, and with
+  `idle_in_transaction_session_timeout` defaulting to 0 the server never
+  aborted it. The open WT transaction pins the oldest snapshot, so every
+  later write's history is unevictable — per-operation cost grows linearly
+  with churn (probe: flat 3.7s/100k-cycle control vs +2s/cycle unbounded
+  with one abandoned txn) — until `CopyLargeFileTest`'s 1M-row COPY/TRUNCATE
+  churn stalls in `__wt_page_in_func` sleep-retry and the whole suite hangs
+  (JUnit's same-thread 60s timeout cannot interrupt a blocked socket read).
+  Fix: `SecantusPGServer` now applies a 120s server-config default for the
+  GUC (session `SET` overrides, 0 opts out, `RESET` returns to the server
+  value) — verified by re-running the leak + churn scenario end-to-end
+  (flat timings, leak reaped with 25P03).
 - [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
   first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
   …) are inside the ~347 documented standing failures of the 93.7% baseline
