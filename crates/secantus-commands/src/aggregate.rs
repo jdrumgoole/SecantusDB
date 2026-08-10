@@ -241,6 +241,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ),
     };
 
+    // The connection's handshake `client` doc, for `$currentOp`'s appName /
+    // clientMetadata (read before the borrow of `ctx` below).
+    let client_metadata: Option<Document> = ctx
+        .conn_auth
+        .as_ref()
+        .and_then(|a| a.lock().ok())
+        .and_then(|g| g.client_metadata.clone());
     let result = run_segmented(
         input,
         &working_pipeline,
@@ -250,6 +257,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         storage,
         collation.as_ref(),
         doc,
+        client_metadata.as_ref(),
     )?;
 
     // The pipeline result is already decoded `Document`s. Send the `firstBatch`
@@ -305,6 +313,7 @@ fn apply_source_stage(
     db: &str,
     coll: Option<&str>,
     cmd_doc: &Document,
+    client_metadata: Option<&Document>,
 ) -> Vec<Document> {
     let command_doc = if cmd_doc.contains_key("aggregate") {
         let mut c = cmd_doc.clone();
@@ -319,7 +328,7 @@ fn apply_source_stage(
         doc! { "aggregate": 1 }
     };
     let ns = format!("{}.{}", db, coll.unwrap_or("$cmd.aggregate"));
-    vec![doc! {
+    let mut row = doc! {
         "type": "op",
         "host": "secantus",
         "desc": "$currentOp",
@@ -328,7 +337,27 @@ fn apply_source_stage(
         "command": command_doc,
         "ns": ns,
         "op": "command",
-    }]
+    };
+    // Surface the connection's driver handshake metadata the way mongod's
+    // `$currentOp` does: the whole `clientMetadata` document plus a top-level
+    // `appName` lifted out of `application.name`. mongocxx's "client metadata
+    // handshake feature" test connects with `?appName=…`, scans
+    // `db.aggregate([{$currentOp: {}}])` for a row whose `appName` matches, and
+    // only then checks `clientMetadata.{application,driver,os}` — with neither
+    // field present its scan matched nothing and the test failed on a missing
+    // op rather than on any of the metadata it meant to verify. Mirrors
+    // `aggregate._stage_current_op`.
+    if let Some(meta) = client_metadata {
+        if let Some(name) = meta
+            .get_document("application")
+            .ok()
+            .and_then(|a| a.get_str("name").ok())
+        {
+            row.insert("appName", name.to_string());
+        }
+        row.insert("clientMetadata", meta.clone());
+    }
+    vec![row]
 }
 
 /// Atlas-only aggregation stages SecantusDB can't provide — rejected with the
@@ -489,6 +518,7 @@ fn run_segmented(
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
     cmd_doc: &Document,
+    client_metadata: Option<&Document>,
 ) -> Result<Vec<Document>, CommandError> {
     let mut docs = input;
     let mut buffer: Vec<Bson> = Vec::new();
@@ -514,7 +544,7 @@ fn run_segmented(
                 let _ = core_run(docs, &buffer, vars, collation)?;
                 buffer.clear();
             }
-            docs = apply_source_stage(name, db, coll, cmd_doc);
+            docs = apply_source_stage(name, db, coll, cmd_doc, client_metadata);
         } else if is_storage_backed(name) {
             if !buffer.is_empty() {
                 docs = core_run(docs, &buffer, vars, collation)?;
@@ -716,6 +746,7 @@ fn apply_lookup(
                 storage,
                 collation,
                 &Document::new(),
+                None,
             )?
         } else {
             // Simple form: localField == foreignField (array-aware).
@@ -929,6 +960,7 @@ fn apply_facet(
             storage,
             collation,
             &Document::new(),
+            None,
         )?;
         out.insert(
             name.clone(),
@@ -986,6 +1018,7 @@ fn apply_union_with(
             storage,
             collation,
             &Document::new(),
+            None,
         )?;
     }
     docs.append(&mut foreign);
@@ -1914,4 +1947,57 @@ fn reduce_raw_prefix(
         consumed += 1;
     }
     (bytes, pipeline[consumed..].to_vec())
+}
+
+#[cfg(test)]
+mod current_op_metadata_tests {
+    use super::*;
+
+    fn meta() -> Document {
+        doc! {
+            "application": {"name": "my-app"},
+            "driver": {"name": "mongoc / mongocxx", "version": "1.2.3"},
+            "os": {"type": "Darwin"},
+        }
+    }
+
+    /// mongocxx's client-metadata handshake test scans `$currentOp` for a row
+    /// whose top-level `appName` matches the one it connected with, and only
+    /// then inspects `clientMetadata`. With neither field the scan matched
+    /// nothing, so the test failed on a missing op rather than on the metadata
+    /// it meant to check.
+    #[test]
+    fn current_op_surfaces_app_name_and_client_metadata() {
+        let rows = apply_source_stage("$currentOp", "db", None, &doc! {}, Some(&meta()));
+        let row = &rows[0];
+        assert_eq!(row.get_str("appName").unwrap(), "my-app");
+        let cm = row.get_document("clientMetadata").unwrap();
+        assert_eq!(
+            cm.get_document("driver").unwrap().get_str("name").unwrap(),
+            "mongoc / mongocxx"
+        );
+        assert!(
+            cm.get_document("os").is_ok(),
+            "os is asserted by the test too"
+        );
+    }
+
+    /// No handshake metadata (an internal caller) ⇒ neither field, rather than
+    /// an empty `appName` that a scan could match by accident.
+    #[test]
+    fn current_op_omits_the_fields_without_metadata() {
+        let rows = apply_source_stage("$currentOp", "db", None, &doc! {}, None);
+        assert!(rows[0].get("appName").is_none());
+        assert!(rows[0].get("clientMetadata").is_none());
+    }
+
+    /// Metadata without `application` (a driver that sent no appName) still
+    /// surfaces `clientMetadata`, just no `appName` to match on.
+    #[test]
+    fn metadata_without_an_application_yields_no_app_name() {
+        let m = doc! {"driver": {"name": "d", "version": "1"}, "os": {"type": "Linux"}};
+        let rows = apply_source_stage("$currentOp", "db", None, &doc! {}, Some(&m));
+        assert!(rows[0].get("appName").is_none());
+        assert!(rows[0].get_document("clientMetadata").is_ok());
+    }
 }

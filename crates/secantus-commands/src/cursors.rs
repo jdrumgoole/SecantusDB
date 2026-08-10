@@ -114,7 +114,6 @@ struct Entry {
     invalidated: bool,
     #[allow(dead_code)]
     final_event_pending: bool,
-    #[allow(dead_code)]
     last_token: Option<Document>,
     /// A fatal projection error (code 280) the producer hit; once set, the next
     /// getMore returns it as an `ok: 0` reply and the cursor is dropped.
@@ -437,6 +436,28 @@ impl CursorRegistry {
         affected.len()
     }
 
+    /// Remember the token of the last event handed to the client, so a later
+    /// empty batch can re-emit it instead of rewinding to a positional
+    /// high-water mark.
+    pub fn remember_last_token(&self, cursor_id: i64, tok: &Bson) {
+        if let Some(d) = tok.as_document() {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = inner.cursors.get_mut(&cursor_id) {
+                e.last_token = Some(d.clone());
+            }
+        }
+    }
+
+    /// The last event token handed to this cursor's client, if any.
+    pub fn last_token(&self, cursor_id: i64) -> Option<Bson> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .cursors
+            .get(&cursor_id)
+            .and_then(|e| e.last_token.clone())
+            .map(Bson::Document)
+    }
+
     /// Whether this cursor was tombstoned by a drop/rename of its collection.
     pub fn was_dropped(&self, cursor_id: i64) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -621,19 +642,39 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             return Ok(err.into_reply());
         }
 
-        // postBatchResumeToken: the last event's token, or — on an empty batch —
-        // a high-water-mark token at the current position so the client can
-        // resume past this quiet getMore.
-        let pbrt = post_batch_resume_token(&batch).or_else(|| {
-            let bytes = storage.high_water_mark_token(position);
-            if bytes.is_empty() {
-                None
-            } else {
-                Document::from_reader(&mut bytes.as_slice())
-                    .ok()
-                    .map(Bson::Document)
+        // postBatchResumeToken: the last event's token when this batch carried
+        // events. On an EMPTY batch a high-water-mark token lets a client resume
+        // past a quiet getMore — but only if it is actually newer than the last
+        // event we delivered. mongod does not rewind: when nothing has happened
+        // since the last event, the token stays that event's, and mongocxx's
+        // "must continuously track the last seen resumeToken" asserts exactly
+        // that (its final read is empty and must still equal the previous
+        // token). Emitting a fresh high-water token there replaced a real token
+        // — carrying its `ns` and `documentKey` — with a positional one whose
+        // both fields are empty.
+        let pbrt = match post_batch_resume_token(&batch) {
+            Some(tok) => {
+                cursors.remember_last_token(cursor_id, &tok);
+                Some(tok)
             }
-        });
+            None => {
+                let bytes = storage.high_water_mark_token(position);
+                let hwm = if bytes.is_empty() {
+                    None
+                } else {
+                    Document::from_reader(&mut bytes.as_slice())
+                        .ok()
+                        .map(Bson::Document)
+                };
+                match (hwm, cursors.last_token(cursor_id)) {
+                    // Only move forward: a high-water mark at or behind the
+                    // last delivered event would rewind the client's token.
+                    (Some(h), Some(l)) if token_seq(&h) > token_seq(&l) => Some(h),
+                    (_, Some(l)) => Some(l),
+                    (h, None) => h,
+                }
+            }
+        };
         let mut cursor_doc = doc! {
             "id": Bson::Int64(if closed { 0 } else { cursor_id }),
             "ns": ns,
@@ -723,6 +764,24 @@ fn int64_array(ids: Vec<i64>) -> Vec<Bson> {
 /// PBRT then; pymongo falls back to the last seen event's `_id`, which is
 /// correct when no new events were delivered. Empty-batch high-water-mark
 /// advancement (and noop-heartbeat tracking) is R3b-b.
+/// The `s` (oplog seq) inside a `{"_data": "<hex>"}` resume token, or -1 when it
+/// can't be read — an unreadable token must never look newer than a real one.
+fn token_seq(tok: &Bson) -> i64 {
+    let Some(d) = tok.as_document() else {
+        return -1;
+    };
+    let Ok(hex) = d.get_str("_data") else {
+        return -1;
+    };
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect();
+    Document::from_reader(&mut bytes.as_slice())
+        .ok()
+        .and_then(|d| d.get_i64("s").ok())
+        .unwrap_or(-1)
+}
+
 fn post_batch_resume_token(batch: &[Vec<u8>]) -> Option<Bson> {
     let last = batch.last()?;
     let doc = Document::from_reader(&mut last.as_slice()).ok()?;
