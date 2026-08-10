@@ -133,3 +133,54 @@ class TestTheTwoHolesThatMotivatedThis:
             t.join()
         assert sum(wins) == 1, "exactly one insert may win"
         assert _values(store) == [99]
+
+
+class TestClaimsDieWithTheirNamespace:
+    """A unique-key claim must never survive its table/index/db — a stale one
+    falsely rejects the value from a recreated namespace (found by slt's
+    index/delete lane on the first weekly sweep after the claims table
+    landed: DROP TABLE → recreate → re-insert hit 23505)."""
+
+    def _seed(self, s, db="app", coll="t"):
+        s.create_index(db, coll, "u_1", {"u": 1}, {"unique": True})
+        s.insert(db, coll, [{"_id": 1, "u": 42}])
+
+    def test_drop_collection_releases_claims(self, store):
+        self._seed(store)
+        store.drop_collection("app", "t")
+        self._seed(store)  # recreate + re-insert the same value
+        assert len(store.find_matching("app", "t", {"u": 42})) == 1
+
+    def test_drop_index_releases_claims(self, store):
+        self._seed(store)
+        store.drop_index("app", "t", "u_1")
+        store.create_index("app", "t", "u_1", {"u": 1}, {"unique": True})
+        # The re-created index backfills a claim for the EXISTING row; a new
+        # row with a new value must insert, and the old value stays claimed
+        # by its living owner.
+        inserted, errors = store.insert("app", "t", [{"_id": 2, "u": 43}])
+        assert (inserted, errors) == (1, [])
+        _, dup_errors = store.insert("app", "t", [{"_id": 3, "u": 42}])
+        assert dup_errors and dup_errors[0]["code"] == 11000
+
+    def test_drop_all_indexes_releases_claims(self, store):
+        self._seed(store)
+        store.drop_all_indexes("app", "t")
+        # No unique index left: the same value inserts freely.
+        inserted, errors = store.insert("app", "t", [{"_id": 2, "u": 42}])
+        assert (inserted, errors) == (1, [])
+
+    def test_drop_database_releases_claims(self, store):
+        self._seed(store)
+        store.drop_database("app")
+        self._seed(store)
+        assert len(store.find_matching("app", "t", {"u": 42})) == 1
+
+    def test_rename_moves_claims_with_the_collection(self, store):
+        self._seed(store)
+        store.rename_collection("app", "t", "app", "t2", drop_target=False)
+        # The source namespace is free again...
+        self._seed(store)
+        # ...and the destination still enforces its own claim.
+        _, dup_errors = store.insert("app", "t2", [{"_id": 9, "u": 42}])
+        assert dup_errors and dup_errors[0]["code"] == 11000

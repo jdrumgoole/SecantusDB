@@ -4903,6 +4903,18 @@ and "SQL UNIQUE is now storage-backed too" further down for the design record.
 The one deliberate residue: **DEFERRABLE constraints** keep the commit-time
 check and with it the old cross-transaction race (narrow, documented there).
 
+**Post-reconcile regression, found and fixed the same week (unique-keys-drop-
+purge slice, 2026-08-10):** the claims table survived namespace teardown — no
+drop path purged `table:secantus_unique_keys`, so DROP TABLE → recreate →
+re-insert falsely rejected the value with 23505 (the FALSE-rejection class
+#775's additive design was supposed to make impossible). Caught by the first
+full weekly sweep after #775: slt's `index/delete` lane failed in both
+engines (its corpus cycles drop/create with unique indexes), reproduced in
+eight lines, and likely a contributor to the same sweep's pgjdbc 2h blowout.
+All five teardown paths now purge claims (drop_collection / drop_database /
+drop_index / drop_all_indexes / rename src+dst), pinned by
+`TestClaimsDieWithTheirNamespace` in `tests/test_storage_unique_keys.py`.
+
 ### `numeric` — what landed, and the division-scale divergence
 
 **Fixed.** A decimal literal is now `Decimal128`, the same exact type a
