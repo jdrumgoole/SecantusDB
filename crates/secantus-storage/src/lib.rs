@@ -494,6 +494,17 @@ fn reject_legacy_index_entry_format(session: &Session) -> Result<()> {
 
 const IDX_TABLE: &str = "table:secantus_indexes";
 const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
+/// Unique-index key claims: `(db, coll, index, escaped_sortkey) -> RecordId`.
+///
+/// The entries table cannot enforce uniqueness itself — its key carries the
+/// RecordId, so two different docs sharing an indexed value occupy two distinct
+/// WT keys and never collide. Uniqueness was therefore a *probe read*, which by
+/// construction cannot see a value committed after the caller's snapshot nor one
+/// an open transaction is holding uncommitted: a transaction and a concurrent
+/// writer could each insert the same value and both commit. This table keys on
+/// the value alone, so WiredTiger rejects the second claim itself. Mirrors the
+/// Python server's `_UNIQ_TABLE` (#775).
+const UNIQ_TABLE: &str = "table:secantus_unique_keys";
 
 /// Ceiling on the number of keys one doc may contribute to a compound index
 /// when more than one indexed field is array-valued (the cartesian product).
@@ -1306,6 +1317,10 @@ const BOOTSTRAP: &[(&str, &str)] = &[
         "key_format=SSSu,value_format=u",
     ),
     ("table:secantus_natural", "key_format=SSq,value_format=u"),
+    (
+        "table:secantus_unique_keys",
+        "key_format=SSSu,value_format=q",
+    ),
     (
         "table:secantus_natural_seq",
         "key_format=SSu,value_format=q",
@@ -7510,6 +7525,10 @@ impl Storage {
                     .unwrap_or_default();
                 c.remove()?;
                 self.delete_entries_prefix(&session, db, coll, name)?;
+                // The index is gone, so its claims must go too — otherwise
+                // recreating it (or inserting the value again) is refused
+                // against an index that no longer exists.
+                self.purge_unique_claims(&session, db, coll, Some(name))?;
                 // Oplog: a DDL `op: "c"` `dropIndexes` entry so a `showExpandedEvents`
                 // change stream surfaces a `dropIndexes` event (the projector reads
                 // `o.dropIndexes` + `o.index` + `o.key`).
@@ -8024,6 +8043,45 @@ impl Storage {
         }
         // The entry's trailing half is the doc's RecordId (step 2), so the old
         // `id_key_override` plumbing that existed purely to compute it is gone.
+        // Claim each unique key BEFORE writing entries, so a rejected claim
+        // leaves nothing behind. `overwrite=false` makes WiredTiger itself
+        // refuse a key another row holds — including one an open transaction is
+        // holding uncommitted, which the snapshot-read probe cannot see. Two
+        // writers racing the same key collide here and one takes a write
+        // conflict, which the retry wrapper turns into a clean duplicate-key
+        // error. Mirrors `storage._claim_unique_key`.
+        let claims = session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?;
+        for desc in descs {
+            // `_id_` is deliberately excluded: `_id` uniqueness is already
+            // enforced by the `_id` index (`write_nat_entry`'s overwrite=false
+            // insert into NAT_SEQ_TABLE), which is the only path from an `_id`
+            // to its doc row. Claiming it here too would double-write every
+            // insert for no added guarantee — and the extra dirty content
+            // pushed a large transaction over WiredTiger's cache before the
+            // dirty-budget guard could report it (caught by txn_budget).
+            if desc.name == "_id_"
+                || (!desc.unique && !desc.prepare_unique)
+                || !self.doc_in_partial(doc, desc)?
+            {
+                continue;
+            }
+            for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
+                claims.reset()?;
+                claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
+                claims.set_value_q(recordid);
+                match claims.insert() {
+                    Ok(()) => {}
+                    Err(e) if e.is_duplicate_key() => {
+                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
+                            index: desc.name.clone(),
+                            key_pattern: desc.key_spec.clone(),
+                            key_value: conflict_key_value(doc, &desc.key_spec, &kb),
+                        })));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
             for packed in self.packed_entry_keys(doc, desc, recordid)? {
@@ -8052,7 +8110,31 @@ impl Storage {
             return Ok(());
         }
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        // Release the unique claims this RecordId owns. Only its own: a claim
+        // the row never held belongs to somebody else, and dropping it would
+        // let a genuine duplicate through. The value is the owning RecordId
+        // precisely so this can be checked.
+        let claims = session.open_cursor(UNIQ_TABLE, None)?;
         for desc in descs {
+            if desc.name != "_id_" && (desc.unique || desc.prepare_unique) {
+                for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
+                    claims.reset()?;
+                    claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
+                    match claims.search() {
+                        Ok(()) => {
+                            if claims.get_value_q().ok() == Some(recordid) {
+                                match claims.remove() {
+                                    Ok(()) => {}
+                                    Err(e) if e.is_not_found() => {}
+                                    Err(e) => return Err(e.into()),
+                                }
+                            }
+                        }
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
             for packed in self.packed_entry_keys(doc, desc, recordid)? {
                 cur.reset()?;
                 cur.set_key_sssu(db, coll, &desc.name, &packed);
@@ -8148,6 +8230,55 @@ impl Storage {
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
             }
+        }
+        Ok(())
+    }
+
+    /// Drop every unique-key claim under `(db, coll)`, or under one index when
+    /// `index` is given.
+    ///
+    /// Claims MUST die with the namespace that owns them. A claim outliving its
+    /// collection makes a later insert of the same value fail as a duplicate
+    /// against a row that no longer exists — the false-rejection class #808 hit
+    /// on the Python side, where nothing purged the table on drop and a
+    /// drop/recreate/re-insert cycle was refused.
+    fn purge_unique_claims(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        index: Option<&str>,
+    ) -> Result<()> {
+        let scan = session.open_cursor(UNIQ_TABLE, None)?;
+        let del = session.open_cursor(UNIQ_TABLE, None)?;
+        scan.reset()?;
+        scan.set_key_sssu(db, coll, index.unwrap_or(""), b"");
+        let mut more = match scan.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    scan.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, n, k) = scan.get_key_sssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            if index.is_none_or(|want| want == n) {
+                del.reset()?;
+                del.set_key_sssu(&d, &c, &n, &k);
+                match del.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            more = scan.next()?;
         }
         Ok(())
     }
@@ -8335,6 +8466,10 @@ impl Storage {
     /// (everything except its `secantus_collections` registry row). Shared by
     /// `drop_collection` / `drop_database` / `rename_collection`.
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
+        // Unique-key claims die with the namespace (see purge_unique_claims):
+        // a surviving claim would reject a later insert of the same value
+        // against a row that no longer exists.
+        self.purge_unique_claims(session, db, coll, None)?;
         // Lazy shards: a collection whose shard was never written (dropping an
         // empty / never-created collection — a no-op in MongoDB) has no doc rows
         // to purge, so an absent shard is simply skipped.
