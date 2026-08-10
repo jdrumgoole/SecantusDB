@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-08-04 — SecantusDB 0.6.0b9. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 12 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-08-10 — SecantusDB 0.6.0b9. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -8,19 +8,20 @@ Generated 2026-08-04 — SecantusDB 0.6.0b9. Each per-driver gauge runs the driv
 
 | Driver | Language | Driver version | Tests run | Passed | Failed | Expected | Skipped | Pass rate | Adjusted |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| `pymongo` | Python | `f2103a95870a` | 1501 | 1021 | 5 | 0 | 475 | 99.5% | 99.5% |
-| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 926 | 6 | 0 | 491 | 99.4% | 99.4% |
-| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 446 | 0 | 1 | 453 | 99.8% | 100.0% |
+| `pymongo` | Python | `f2103a95870a` | 1501 | 1018 | 8 | 0 | 475 | 99.2% | 99.2% |
+| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 923 | 9 | 0 | 491 | 99.0% | 99.0% |
+| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 445 | 1 | 1 | 453 | 99.6% | 99.8% |
 | `mongo-kotlin-driver` | Kotlin | `cb45be6bb147` | 538 | 294 | 0 | 0 | 244 | 100.0% | 100.0% |
 | `mongo-go-driver` | Go | `fd85a834c40e` | 453 | 401 | 0 | 0 | 52 | 100.0% | 100.0% |
 | `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 358 | 0 | 1 | 5 | 99.7% | 100.0% |
 | `mongo-ruby-driver` | Ruby | `f68d676643c1` | 283 | 258 | 0 | 1 | 24 | 99.6% | 100.0% |
+| `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 105 | 0 | 0 | 0 | 100.0% | 100.0% |
 | `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2145 | 39 | 0 | 37 | 98.2% | 98.2% |
 | `mongo-php-driver` | PHP | `e81b318a33dc` | 270 | 247 | 0 | 0 | 23 | 100.0% | 100.0% |
-| `mongo-c-driver` | C | `57dba9c04991` | 805 | 724 | 2 | 8 | 71 | 98.6% | 99.7% |
+| `mongo-c-driver` | C | `57dba9c04991` | 841 | 739 | 3 | 8 | 91 | 98.5% | 99.6% |
 | `mongo-cxx-driver` | C++ | `24852b68a3d1` | 899 | 890 | 0 | 0 | 9 | 100.0% | 100.0% |
 | `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 202 | 0 | 0 | 26 | 100.0% | 100.0% |
-| **All drivers** | — | — | **9885** | **7912** | **52** | **11** | **1910** | **99.2%** | **99.3%** |
+| **All drivers** | — | — | **10026** | **8025** | **60** | **11** | **1930** | **99.1%** | **99.3%** |
 
 ## Per-driver scope
 
@@ -31,6 +32,7 @@ Generated 2026-08-04 — SecantusDB 0.6.0b9. Each per-driver gauge runs the driv
 - **`mongo-go-driver`** — vendor/mongo-go-driver/internal/integration/....
 - **`mongo-node-driver`** — curated test/integration/ spec set.
 - **`mongo-ruby-driver`** — curated spec/mongo/*.rb spec files.
+- **`mongo-rust-driver`** — curated driver/src/test/ in-tree tests.
 - **`mongo-php-library`** — curated functional tests (Operation / Collection / Database / Command).
 - **`mongo-php-driver`** — curated .phpt wire-protocol tests (bson serialization units excluded).
 - **`mongo-c-driver`** — curated test-libmongoc wire-protocol suites (CRUD / cursor / aggregate / command).
@@ -73,6 +75,7 @@ Each gauge ships its own detailed report — per-category breakdown, named failu
 - [mongo-go-driver](./validation-report-go.md)
 - [mongo-node-driver](./validation-report-node.md)
 - [mongo-ruby-driver](./validation-report-ruby.md)
+- [mongo-rust-driver](./validation-report-rust.md)
 - [mongo-php-library](./validation-report-php-lib.md)
 - [mongo-php-driver](./validation-report-php-ext.md)
 - [mongo-c-driver](./validation-report-c.md)
@@ -81,7 +84,7 @@ Each gauge ships its own detailed report — per-category breakdown, named failu
 
 ## Refreshing
 
-Run all 12 gauges plus this summary:
+Run all 13 gauges plus this summary:
 
 ```
 uv run python -m invoke validate-all

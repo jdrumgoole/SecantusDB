@@ -2,11 +2,11 @@
 
 - SecantusDB (Python server) 0.6.0b9
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-08-03 22:09 UTC
+- generated: 2026-08-10 06:36 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
-| test_adapt.py | 52 | 7 | 0 | 59 | 88.1% |
+| test_adapt.py | 53 | 6 | 0 | 59 | 89.8% |
 | test_capabilities.py | 12 | 0 | 9 | 21 | 100.0% |
 | test_column.py | 53 | 0 | 0 | 53 | 100.0% |
 | test_connection.py | 98 | 4 | 2 | 104 | 96.1% |
@@ -32,7 +32,7 @@
 | types/test_array.py | 158 | 0 | 0 | 158 | 100.0% |
 | types/test_bool.py | 15 | 0 | 0 | 15 | 100.0% |
 | types/test_composite.py | 79 | 0 | 0 | 79 | 100.0% |
-| types/test_datetime.py | 558 | 0 | 9 | 567 | 100.0% |
+| types/test_datetime.py | 554 | 4 | 9 | 567 | 99.3% |
 | types/test_enum.py | 197 | 0 | 0 | 197 | 100.0% |
 | types/test_hstore.py | 24 | 15 | 0 | 39 | 61.5% |
 | types/test_json.py | 258 | 0 | 0 | 258 | 100.0% |
@@ -45,11 +45,10 @@
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 134 | 0 | 1 | 135 | 100.0% |
 | types/test_uuid.py | 26 | 0 | 0 | 26 | 100.0% |
-| **total** | **4100** | **42** | **96** | **4238** | **99.0%** |
+| **total** | **4097** | **45** | **96** | **4238** | **98.9%** |
 
-## Failures (42)
+## Failures (45)
 
-- `tests/test_adapt.py::test_random[0-b]`
 - `tests/test_adapt.py::test_random[0-s]`
 - `tests/test_adapt.py::test_random[0-t]`
 - `tests/test_adapt.py::test_random[1-b]`
@@ -72,6 +71,10 @@
 - `tests/test_errors.py::test_pgconn_error_pickle`
 - `tests/test_generators.py::test_cancel`
 - `tests/test_generators.py::test_pipeline_communicate_abort`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_max_with_timezone[0-max--06-America/Chicago]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_max_with_timezone[0-min-+09:18:59-Asia/Tokyo]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_max_with_timezone[1-max--06-America/Chicago]`
+- `tests/types/test_datetime.py::TestDateTimeTz::test_max_with_timezone[1-min-+09:18:59-Asia/Tokyo]`
 - `tests/types/test_hstore.py::test_register_conn[latin1]`
 - `tests/types/test_hstore.py::test_register_conn[sql_ascii]`
 - `tests/types/test_hstore.py::test_register_conn[utf8]`

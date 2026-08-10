@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-08-03 — SecantusDB 0.6.0b9 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-08-10 — SecantusDB 0.6.0b9 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -9,7 +9,7 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | Category | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
-| `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
+| `test_bulk.py` | 31 | 3 | 0 | 4 | 38 | 91.2% |
 | `test_change_stream.py` | 106 | 0 | 0 | 49 | 155 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 85 | 2 | 0 | 4 | 91 | 97.7% |
@@ -36,13 +36,16 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
 | `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1020** | **5** | **0** | **475** | **1500** | **99.5%** |
+| **Overall** | **1017** | **8** | **0** | **475** | **1500** | **99.2%** |
 
-## Failures (5)
+## Failures (8)
 
 First 30 failure node-ids for manual triage:
 
 ```
+vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_multiple_error_unordered_batch
+vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_single_error_ordered_batch
+vendor/pymongo-tests/test/test_bulk.py::TestBulk::test_single_error_unordered_batch
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_hashed
 vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_maxtime_ms_message

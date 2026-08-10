@@ -9,8 +9,8 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | Suite | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `/BulkOperation` | 93 | 0 | 10 | 103 | 100.0% |
-| `/Client` | 96 | 6 | 17 | 119 | 94.1% |
-| `/Collection` | 145 | 0 | 11 | 156 | 100.0% |
+| `/Client` | 96 | 6 | 19 | 121 | 94.1% |
+| `/Collection` | 146 | 0 | 11 | 157 | 100.0% |
 | `/Cursor` | 70 | 0 | 0 | 70 | 100.0% |
 | `/Database` | 19 | 0 | 0 | 19 | 100.0% |
 | `/ReadConcern` | 6 | 0 | 0 | 6 | 100.0% |
@@ -18,7 +18,7 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/WriteCommand` | 6 | 0 | 0 | 6 | 100.0% |
 | `/WriteConcern` | 13 | 0 | 0 | 13 | 100.0% |
 | `/change_stream` | 21 | 2 | 2 | 25 | 91.3% |
-| `/change_streams` | 6 | 1 | 0 | 7 | 85.7% |
+| `/change_streams` | 3 | 1 | 0 | 4 | 75.0% |
 | `/collection-management` | 5 | 0 | 0 | 5 | 100.0% |
 | `/command_monitoring` | 33 | 1 | 1 | 35 | 97.1% |
 | `/crud` | 160 | 0 | 12 | 172 | 100.0% |
@@ -26,7 +26,7 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/gridfs` | 10 | 0 | 1 | 11 | 100.0% |
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
 | `/long_namespace` | 8 | 0 | 1 | 9 | 100.0% |
-| **Overall** | **748** | **10** | **57** | **815** | **98.7%** |
+| **Overall** | **746** | **10** | **59** | **815** | **98.7%** |
 
 ## Failures (10)
 
