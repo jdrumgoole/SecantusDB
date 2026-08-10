@@ -742,13 +742,25 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                         "Failing command due to 'failCommand' failpoint",
                     )
                     .into_reply();
-                    if !m.error_labels.is_empty() {
+                    // `failGetMoreAfterCursorCheckout` is injected inside the
+                    // change-stream getMore path, where mongod stamps a
+                    // resumable code with `ResumableChangeStreamError`; drivers
+                    // on wire >= 9 resume on that label and never on the bare
+                    // code. `failCommand` short-circuits earlier and carries
+                    // only the labels it was given — which is why the spec has
+                    // `failGetMoreAfterCursorCheckout` + code 6 resume while
+                    // `failCommand` + code 6 does not.
+                    let mut labels = m.error_labels.clone();
+                    if m.server_injected
+                        && failpoints::is_resumable_change_stream_code(code)
+                        && !labels.iter().any(|l| l == "ResumableChangeStreamError")
+                    {
+                        labels.push("ResumableChangeStreamError".to_string());
+                    }
+                    if !labels.is_empty() {
                         reply.insert(
                             "errorLabels",
-                            m.error_labels
-                                .iter()
-                                .map(|s| Bson::String(s.clone()))
-                                .collect::<Vec<_>>(),
+                            labels.into_iter().map(Bson::String).collect::<Vec<_>>(),
                         );
                     }
                     return reply;

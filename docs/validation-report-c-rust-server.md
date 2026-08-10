@@ -17,8 +17,8 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/ReadPrefs` | 16 | 0 | 0 | 16 | 100.0% |
 | `/WriteCommand` | 6 | 0 | 0 | 6 | 100.0% |
 | `/WriteConcern` | 13 | 0 | 0 | 13 | 100.0% |
-| `/change_stream` | 21 | 2 | 2 | 25 | 91.3% |
-| `/change_streams` | 6 | 1 | 0 | 7 | 85.7% |
+| `/change_stream` | 23 | 0 | 2 | 25 | 100.0% |
+| `/change_streams` | 7 | 0 | 0 | 7 | 100.0% |
 | `/collection-management` | 5 | 0 | 0 | 5 | 100.0% |
 | `/command_monitoring` | 33 | 1 | 1 | 35 | 97.1% |
 | `/crud` | 160 | 0 | 12 | 172 | 100.0% |
@@ -26,15 +26,13 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/gridfs` | 10 | 0 | 1 | 11 | 100.0% |
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
 | `/long_namespace` | 8 | 0 | 1 | 9 | 100.0% |
-| **Overall** | **748** | **10** | **57** | **815** | **98.7%** |
+| **Overall** | **751** | **7** | **57** | **815** | **99.1%** |
 
-## Failures (10)
+## Failures (7)
 
 First 30 failed tests for triage:
 
 ```
-/change_stream/resume_at_optime
-/change_stream/resume_with_post_batch_resume_token
 /Client/ipv6/single
 /Client/ipv6/single
 /Client/select_server/single
@@ -42,7 +40,6 @@ First 30 failed tests for triage:
 /Client/select_server/err/single
 /Client/select_server/err/pooled
 /command_monitoring/unified/writeConcernError
-/change_streams/unified/change-streams-resume-errorLabels
 ```
 
 ## How this is generated

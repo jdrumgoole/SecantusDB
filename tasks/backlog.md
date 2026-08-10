@@ -69,10 +69,11 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   resume-token validity check caught only a *removed* `_id`, not a *modified*
   one (mongod allows "only transformations that retain the unmodified `_id`").
   Net C gauge 802 tests/10 fails -> 815/10 — same failures, 13 more tests.
-  **Still failing (newly surfaced, real gaps):** `resume_at_optime` and
-  `resume_with_post_batch_resume_token` (both assert the driver *resumed*
-  after a failpoint-induced error — needs resumable-error emulation) and the
-  unified `change-streams-resume-errorLabels`. **Skipped as inherent:**
+  **All three follow-up gaps are now CLOSED** (`failGetMoreAfterCursorCheckout`
+  + the `ResumableChangeStreamError` label): change-stream failures 3 -> 0, C
+  gauge 10 -> 7 fails / 99.1%, 31 change-stream tests passing. The remaining 7
+  failures are the long-standing ones the **Python** server shares, so the C
+  gauge is back to zero rust-only failures WITH change streams covered. **Skipped as inherent:**
   `/change_stream/live/read_prefs`, `/Client/command_secondary` and
   `/Collection/aggregate/secondary` need a real SECONDARY, which a single-node
   surrogate has not got (multi-node is out of scope) — rationale recorded in
