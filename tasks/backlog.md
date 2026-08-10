@@ -4545,13 +4545,21 @@ recorded in that slice's changelog fragment. Still open:
   **DEFERRABLE constraints** keep the commit-time check (an every-write index
   would reject legitimately-transient violations, e.g. the value-swap case) and
   therefore keep the old race — a narrow, documented trade.
-- [ ] **SQL advisory locks provide no cross-connection exclusion** (§ "Advisory
-  locks landed", #135): `pg_advisory_lock` is per-`Session` bookkeeping that always
-  grants, so two connections can hold the same exclusive lock concurrently — apps
-  using advisory locks for leader election / migration fencing (alembic, cron
-  fencing) get no mutual exclusion. A truthful implementation needs a server-wide
-  lock table (like `NotifyHub` / `PreparedXactRegistry`) with blocking waits and
-  deadlock detection.
+- ~~**SQL advisory locks provide no cross-connection exclusion**~~ — **FIXED
+  (advisory-lock-hub slice)**: exactly the implementation this entry called
+  for — a server-wide `AdvisoryLockHub` (`sql/pgadvisory.py`, the `NotifyHub`
+  pattern) is now the authority: exclusive/shared grant rules, re-entrant
+  per-owner holds with session- and transaction-level lifetimes, BLOCKING
+  `pg_advisory_lock*` waits with a wait-for-graph deadlock check every ~1s
+  (PostgreSQL's `deadlock_timeout` shape) surfacing `40P01 deadlock
+  detected`, `pg_try_*` returning real grant results, and release at
+  unlock / unlock_all / COMMIT (xact locks) / connection teardown. The
+  per-`Session` bookkeeping stays as the `pg_locks` reflection layer and is
+  hub-synced; embedded `run_sql` sessions (no hub) keep the old single-
+  connection behaviour. Pinned by the cross-connection suite in
+  `tests/test_sql_advisory_locks.py` (exclusion, blocking, shared-vs-
+  exclusive, deadlock, xact-release, teardown-release, plus a wire-level
+  two-psycopg-connection test).
 
 ## Rust lock-free reads: DDL-vs-scan wobble (2026-07-17) — FIXED
 
