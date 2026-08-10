@@ -87,8 +87,10 @@ impl CursorProducer for ChangeStreamProducer {
                             CommandError::new(
                                 280,
                                 "ChangeStreamFatalError",
-                                "the change stream pipeline may not remove the _id \
-                                 (resume token) field",
+                                // mongod's exact wording — libmongoc's
+                                // `_test_resume_token_error` asserts on it.
+                                "Only transformations that retain the unmodified \
+                                 _id field are allowed.",
                             )
                             .with_extra(doc! {
                                 "errorLabels": ["NonResumableChangeStreamError"],
@@ -345,14 +347,23 @@ fn apply_event_pipeline(events: Vec<Vec<u8>>, pipeline: &[Bson]) -> (Vec<Vec<u8>
     let Ok(decoded) = decode_docs(events) else {
         return (raw, false);
     };
+    // The resume tokens going in, to compare against what comes out.
+    let tokens_in: Vec<Option<Bson>> = decoded.iter().map(|d| d.get("_id").cloned()).collect();
     match secantus_core::aggregate::apply_pipeline(decoded, pipeline, &Document::new(), None) {
         Ok(out) => {
-            // mongod treats a pipeline that drops a delivered event's `_id`
-            // (the resume token) as a fatal change-stream error. An event
-            // filtered out entirely (e.g. by `$match`) is fine — only a
-            // surviving event missing `_id` trips it.
-            let stripped_id = out.iter().any(|d| !d.contains_key("_id"));
-            (encode_docs(out).unwrap_or(raw), stripped_id)
+            // mongod allows "only transformations that retain the unmodified
+            // `_id`" — so a pipeline that *changes* the resume token is as
+            // fatal as one that drops it (libmongoc drives both:
+            // `{$project: {_id: 0}}` removes, `{_id: {$literal: 1}}` rewrites).
+            // An event filtered out entirely (e.g. by `$match`) is fine; only a
+            // surviving event with a missing or altered `_id` trips it. The
+            // pipeline may reorder or drop events, so match each output against
+            // the input carrying the same token rather than by position.
+            let invalid_id = out.iter().any(|d| match d.get("_id") {
+                None => true,
+                Some(tok) => !tokens_in.iter().any(|t| t.as_ref() == Some(tok)),
+            });
+            (encode_docs(out).unwrap_or(raw), invalid_id)
         }
         Err(_) => (raw, false),
     }
@@ -373,10 +384,14 @@ fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandEr
     let mut out: Vec<Bson> = Vec::new();
     for stage in stages.iter().skip(1) {
         let Some(s) = stage.as_document() else {
+            // TypeMismatch (14), not BadValue: the stage is the wrong BSON
+            // *type*, which is what mongod reports and what libmongoc's
+            // `test_change_stream_accepts_array` asserts on.
             return Err(CommandError::new(
-                2,
-                "BadValue",
-                "each aggregation stage must be a document",
+                14,
+                "TypeMismatch",
+                // mongod's exact wording, which libmongoc asserts on.
+                "Each element of the 'pipeline' array must be an object",
             ));
         };
         let name = s.keys().next().map(String::as_str).unwrap_or("");

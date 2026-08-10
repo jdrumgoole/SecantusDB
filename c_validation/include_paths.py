@@ -62,18 +62,16 @@ INCLUDE: list[str] = [
     "/index-management/*",
     "/collection-management/*",
     "/long_namespace/*",
+    # Change streams. The C driver's fixture bootstraps every ``/change_stream``
+    # test through ``test_framework_replset_member_count()``, which counts the
+    # ``members`` array of ``replSetGetStatus``. These suites were excluded for
+    # as long as that answer was the standalone ``NoReplicationEnabled`` error:
+    # the helper saw 0 members and skipped them all as "standalone", so
+    # including them bought nothing. ``replSetGetStatus`` now reports the
+    # one-member roster its own ``hello`` already advertises, so they run.
+    "/change_stream/*",
+    "/change_streams/*",
 ]
-
-# NOTE on change streams: SecantusDB *does* serve change streams over the
-# wire, but the C driver's test fixture bootstraps every ``/change_stream``
-# test through ``test_framework_replset_member_count()``. SecantusDB answers
-# ``replSetGetStatus`` with the standalone-mongod ``NoReplicationEnabled``
-# error (see ``commands._repl_set_get_status``), so that helper reports 0
-# members and the change-stream tests **skip gracefully** rather than abort the
-# run (the pre-``replSetGetStatus`` behaviour was a hard process abort). Since
-# they'd only skip, the suites are left out of INCLUDE entirely. Exercising
-# them through the C driver would need ``replSetGetStatus`` to report >=1 live
-# member (a fuller fake-replset reply). Tracked in tasks/backlog.md §3.2.
 
 # Fully-qualified test names to skip, written one-per-line to the
 # ``--skip-tests`` file. Each MUST carry a rationale comment: the test
@@ -81,4 +79,17 @@ INCLUDE: list[str] = [
 # does not emulate (multi-node topology, failpoints, real auth, etc.).
 # Populate as the first real run surfaces actionable-looking failures
 # that are in fact out-of-scope.
-SKIP_TESTS: list[str] = []
+SKIP_TESTS: list[str] = [
+    # These three need a real SECONDARY to exist. SecantusDB advertises a
+    # single-node replica set (one PRIMARY, no other members) so drivers accept
+    # change streams; a secondary read therefore has nowhere to go. Multi-node
+    # topology is explicitly out of scope (CLAUDE.md), so these can never pass
+    # and are not evidence of a wire divergence.
+    #
+    # They only became visible when `replSetGetStatus` started reporting the
+    # one-member roster its own `hello` already advertised — the same change
+    # that made the /change_stream suites runnable at all.
+    "/Client/command_secondary",
+    "/Collection/aggregate/secondary",
+    "/change_stream/live/read_prefs",
+]

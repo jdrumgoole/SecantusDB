@@ -135,12 +135,84 @@ pub fn ping(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
 /// CommandNotFound (59) is an unexpected error that aborts the harness — which
 /// truncated the entire C-driver gauge after the first suite. Mirrors
 /// `commands.py::_repl_set_get_status`.
-pub fn repl_set_get_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+pub fn repl_set_get_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // When a set name is configured, `hello` already advertises this node as a
+    // single-node replica-set primary (that is what makes drivers accept change
+    // streams). Report a matching one-member roster here rather than the
+    // standalone error, so the two answers agree.
+    //
+    // Driver test harnesses read the roster to decide whether replica-set-only
+    // behaviour is available: libmongoc's `test_framework_replset_member_count`
+    // counts `members`, and with zero it skips every `/change_stream` suite as
+    // "standalone" — which is why those suites were excluded from the C gauge
+    // entirely. One live member makes them run.
+    //
+    // With no set name (`--replica-set-name` off) this is a genuine standalone
+    // and the `NoReplicationEnabled` error is still the honest answer; harnesses
+    // special-case that message to mean "skip replica-set-only behaviour",
+    // whereas a bare CommandNotFound aborts them.
+    let (Some(set_name), Some((host, port))) =
+        (ctx.replica_set_name.as_ref(), ctx.server_address.as_ref())
+    else {
+        return Ok(doc! {
+            "ok": 0.0,
+            "errmsg": "not running with --replSet",
+            "code": 76_i32,
+            "codeName": "NoReplicationEnabled",
+        });
+    };
+    let addr = format!("{host}:{port}");
+    let ts = Bson::Timestamp(match ctx.storage.as_ref() {
+        Some(s) => s.current_cluster_time(),
+        None => ctx.cluster_time,
+    });
+    let now = bson::DateTime::now();
+    let optime = doc! { "ts": ts.clone(), "t": 1_i64 };
     Ok(doc! {
-        "ok": 0.0,
-        "errmsg": "not running with --replSet",
-        "code": 76_i32,
-        "codeName": "NoReplicationEnabled",
+        "set": set_name.clone(),
+        "date": now,
+        "myState": 1_i32,
+        "term": 1_i64,
+        "syncSourceHost": "",
+        "syncSourceId": -1_i32,
+        "heartbeatIntervalMillis": 2000_i64,
+        "majorityVoteCount": 1_i32,
+        "writeMajorityCount": 1_i32,
+        "votingMembersCount": 1_i32,
+        "writableVotingMembersCount": 1_i32,
+        "optimes": {
+            "lastCommittedOpTime": optime.clone(),
+            "lastCommittedWallTime": now,
+            "readConcernMajorityOpTime": optime.clone(),
+            "appliedOpTime": optime.clone(),
+            "durableOpTime": optime.clone(),
+            "lastAppliedWallTime": now,
+            "lastDurableWallTime": now,
+        },
+        "lastStableRecoveryTimestamp": ts,
+        "members": [
+            {
+                "_id": 0_i32,
+                "name": addr,
+                "health": 1.0,
+                "state": 1_i32,
+                "stateStr": "PRIMARY",
+                "uptime": 0_i32,
+                "optime": optime.clone(),
+                "optimeDate": now,
+                "lastAppliedWallTime": now,
+                "lastDurableWallTime": now,
+                "syncSourceHost": "",
+                "syncSourceId": -1_i32,
+                "infoMessage": "",
+                "electionTime": Bson::Timestamp(ctx.cluster_time),
+                "electionDate": now,
+                "configVersion": 1_i32,
+                "configTerm": 1_i64,
+                "self": true,
+            }
+        ],
+        "ok": 1.0,
     })
 }
 
@@ -163,6 +235,42 @@ pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With a set name configured, `hello` already claims to be a replica-set
+    /// primary; `replSetGetStatus` has to agree. Driver harnesses count the
+    /// `members` array to decide whether replica-set behaviour is available —
+    /// libmongoc's `test_framework_replset_member_count` skipped every
+    /// `/change_stream` suite while this reported zero.
+    #[test]
+    fn repl_set_get_status_reports_one_live_member_when_a_set_is_configured() {
+        let mut ctx = CommandContext::new(1);
+        ctx.replica_set_name = Some("secantus".to_string());
+        ctx.server_address = Some(("127.0.0.1".to_string(), 27017));
+        let r = repl_set_get_status(&doc! {"replSetGetStatus": 1}, &mut ctx).unwrap();
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0, "{r:?}");
+        assert_eq!(r.get_str("set").unwrap(), "secantus");
+        assert_eq!(r.get_i32("myState").unwrap(), 1);
+        let members = r.get_array("members").unwrap();
+        assert_eq!(members.len(), 1, "one live member: {r:?}");
+        let m = members[0].as_document().unwrap();
+        assert_eq!(m.get_str("stateStr").unwrap(), "PRIMARY");
+        assert_eq!(m.get_str("name").unwrap(), "127.0.0.1:27017");
+        assert_eq!(m.get_f64("health").unwrap(), 1.0);
+        assert!(m.get_bool("self").unwrap());
+    }
+
+    /// Without a set name this really is a standalone, and the
+    /// `NoReplicationEnabled` error is the honest answer — harnesses read that
+    /// message as "skip replica-set-only behaviour", where a bare
+    /// CommandNotFound aborts them.
+    #[test]
+    fn repl_set_get_status_still_reports_standalone_without_a_set_name() {
+        let mut ctx = CommandContext::new(1);
+        let r = repl_set_get_status(&doc! {"replSetGetStatus": 1}, &mut ctx).unwrap();
+        assert_eq!(r.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(r.get_str("codeName").unwrap(), "NoReplicationEnabled");
+        assert!(r.get("members").is_none(), "no roster for a standalone");
+    }
 
     /// The topologyVersion processId must be identical across calls — a changing
     /// value makes drivers read a server "restart" and clear the connection pool.

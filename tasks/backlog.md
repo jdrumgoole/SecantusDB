@@ -53,7 +53,30 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   now sees `createIndexes` / `dropIndexes` / `modify`, and a default watch
   suppresses them.
 - [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
-- [ ] **C-driver (`libmongoc`) change-stream gauge tests excluded** — the C gauge's `include_paths.py` deliberately omits the `/change_stream` and `/change_streams` suites. libmongoc's test fixture bootstraps every change-stream test through `test_framework_replset_member_count()`, which now sees `replSetGetStatus` → `NoReplicationEnabled` (member count 0) and therefore *skips* those tests as "standalone". They no longer abort the run (that was the pre-`replSetGetStatus` behaviour), but they wouldn't actually exercise the change-stream path either, so they're left out. To gauge change streams through the C driver, `replSetGetStatus` would need to report ≥1 live member (a fuller fake-replset reply) — a larger emulation change than the standalone error we ship.
+- [x] **C-driver (`libmongoc`) change-stream gauge tests — NOW RUNNING.** The
+  `/change_stream` + `/change_streams` suites were excluded because the C
+  fixture bootstraps them through `test_framework_replset_member_count()`,
+  which counts `replSetGetStatus.members`; SecantusDB answered the standalone
+  `NoReplicationEnabled` error, so the helper saw 0 members and skipped every
+  one. `replSetGetStatus` now reports the same one-member PRIMARY roster its
+  own `hello` already advertised (gated on a set name being configured — a
+  genuine standalone still gets the honest error), which resolves an
+  inconsistency as well as enabling the suites: `hello` claimed replica-set
+  primary while `replSetGetStatus` claimed standalone, and real mongod is
+  never both. **32 change-stream tests now execute; 28 pass.** Four defects
+  surfaced and were fixed: the resume-token error message and the
+  pipeline-stage error code/message did not match mongod's, and the
+  resume-token validity check caught only a *removed* `_id`, not a *modified*
+  one (mongod allows "only transformations that retain the unmodified `_id`").
+  Net C gauge 802 tests/10 fails -> 815/10 — same failures, 13 more tests.
+  **Still failing (newly surfaced, real gaps):** `resume_at_optime` and
+  `resume_with_post_batch_resume_token` (both assert the driver *resumed*
+  after a failpoint-induced error — needs resumable-error emulation) and the
+  unified `change-streams-resume-errorLabels`. **Skipped as inherent:**
+  `/change_stream/live/read_prefs`, `/Client/command_secondary` and
+  `/Collection/aggregate/secondary` need a real SECONDARY, which a single-node
+  surrogate has not got (multi-node is out of scope) — rationale recorded in
+  `c_validation/include_paths.py::SKIP_TESTS`.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
 ### 3.3 MongoDB CLI / tool conformance tests
