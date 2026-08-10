@@ -6119,6 +6119,7 @@ class Storage:
             _NAT_SEQ_TABLE: "SSu",
             _IDX_TABLE: "SSS",
             _IDX_ENTRIES_TABLE: "SSSu",
+            _UNIQ_TABLE: "SSSu",
         }[table]
 
     @staticmethod
@@ -6177,6 +6178,11 @@ class Storage:
                 _NAT_SEQ_TABLE,
                 _IDX_TABLE,
                 _IDX_ENTRIES_TABLE,
+                # Unique-key claims die with the collection — a claim that
+                # survived DROP falsely rejected the value from a recreated
+                # table (found by slt index/delete, the first weekly sweep
+                # after #775).
+                _UNIQ_TABLE,
             ):
                 rows = self._collect_prefix(tbl, (db, coll))
                 self._delete_keys(tbl, [k for k, _ in rows])
@@ -6217,6 +6223,7 @@ class Storage:
                 _NAT_SEQ_TABLE,
                 _IDX_TABLE,
                 _IDX_ENTRIES_TABLE,
+                _UNIQ_TABLE,
                 _COLL_TABLE,
             ):
                 rows = self._collect_prefix(tbl, (db,))
@@ -6266,6 +6273,7 @@ class Storage:
                     _NAT_SEQ_TABLE,
                     _IDX_TABLE,
                     _IDX_ENTRIES_TABLE,
+                    _UNIQ_TABLE,
                 ):
                     rows = self._collect_prefix(tbl, (dst_db, dst_coll))
                     self._delete_keys(tbl, [k for k, _ in rows])
@@ -6286,7 +6294,7 @@ class Storage:
                 dst_doc.set_value(v)
                 dst_doc.insert()
                 dst_doc.reset()
-            for tbl in (_NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+            for tbl in (_NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE, _UNIQ_TABLE):
                 rows = self._collect_prefix(tbl, (src_db, src_coll))
                 self._delete_keys(tbl, [k for k, _ in rows])
                 c = self._cursor(tbl)
@@ -6672,6 +6680,10 @@ class Storage:
             c.remove()
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll, name))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
+            # The dropped unique index's claims go with it — recreating the
+            # index (or just inserting the same values) must not hit them.
+            uq_rows = self._collect_prefix(_UNIQ_TABLE, (db, coll, name))
+            self._delete_keys(_UNIQ_TABLE, [k for k, _ in uq_rows])
             ui = self._collection_uuid(db, coll)
             self._emit_oplog(
                 [
@@ -6783,6 +6795,8 @@ class Storage:
             self._delete_keys(_IDX_TABLE, [k for k, _ in rows])
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
+            uq_rows = self._collect_prefix(_UNIQ_TABLE, (db, coll))
+            self._delete_keys(_UNIQ_TABLE, [k for k, _ in uq_rows])
             if dropped:
                 ui = self._collection_uuid(db, coll)
                 self._emit_oplog(
