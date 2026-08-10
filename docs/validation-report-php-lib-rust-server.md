@@ -1,6 +1,6 @@
 # mongo-php-library Validation Report
 
-Generated 2026-08-09 — SecantusDB 0.6.0b9 vs mongo-php-library 12e56461166d (`vendor/mongo-php-library/`).
+Generated 2026-08-10 — SecantusDB 0.6.0b9 vs mongo-php-library 12e56461166d (`vendor/mongo-php-library/`).
 
 Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges for the official high-level PHP library — the `mongodb/mongodb` package Laravel + Symfony applications build on.
 
@@ -15,19 +15,18 @@ Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the 
 | `tests/Database` | 70 | 0 | 0 | 70 | 100.0% |
 | `tests/Functions` | 0 | 2 | 2 | 4 | 0.0% |
 | `tests/Model` | 141 | 1 | 0 | 142 | 99.3% |
-| `tests/Operation` | 1899 | 3 | 36 | 1938 | 99.8% |
-| **Overall** | **3050** | **41** | **39** | **3130** | **98.7%** |
+| `tests/Operation` | 1900 | 2 | 36 | 1938 | 99.9% |
+| **Overall** | **3051** | **40** | **39** | **3130** | **98.7%** |
 
-Run time: 2.94s.
+Run time: 4.32s.
 
-## Failures (41)
+## Failures (40)
 
 First 30 failed cases for triage:
 
 ```
 tests/Operation :: MongoDB\Tests\Operation\AggregateFunctionalTest::testReadPreferenceWithinTransaction
 tests/Operation :: MongoDB\Tests\Operation\FindFunctionalTest::testReadPreferenceWithinTransaction
-tests/Operation :: MongoDB\Tests\Operation\WatchFunctionalTest::testResumeTokenInvalidTypeServerSideError
 tests/Collection :: MongoDB\Tests\Collection\CodecCollectionFunctionalTest::testFindOneAndReplace with data set "BSON type map"
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testAggregateWithinTransaction
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testFindWithinTransaction
@@ -55,8 +54,9 @@ tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMetho
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "findOneAndUpdate"
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "insertMany"
 tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "insertOne"
+tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "replaceOne"
 ```
-... and 11 more (see JUnit XML).
+... and 10 more (see JUnit XML).
 
 ## How this is generated
 

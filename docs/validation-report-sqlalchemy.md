@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.6.0b9
 - suite: sqlalchemy.testing.suite @ SQLAlchemy 2.0.51, postgresql+psycopg dialect
-- generated: 2026-08-03 21:53 UTC
+- generated: 2026-08-10 13:19 UTC
 
 | suite class | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
