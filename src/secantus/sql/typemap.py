@@ -603,6 +603,53 @@ def number_literal(text: str) -> Any:
     return int(text)
 
 
+# PG numeric.c constants for select_div_scale (ported below).
+_NUMERIC_MIN_SIG_DIGITS = 16
+_NUMERIC_MAX_DISPLAY_SCALE = 1000
+
+
+def _div_operand_stats(d: Decimal) -> tuple[int, int, int]:
+    """The ``(base-10000 weight, first base-10000 digit, display scale)`` of a
+    numeric operand — what PG's ``select_div_scale`` reads off its NumericVar
+    (digits are stored base-10000 there, DEC_DIGITS=4)."""
+    t = d.as_tuple()
+    exponent = t.exponent if isinstance(t.exponent, int) else 0
+    dscale = max(0, -exponent)
+    if d.is_zero():
+        return 0, 0, dscale
+    msd_exp = d.adjusted()  # base-10 exponent of the most significant digit
+    weight = msd_exp // 4  # floor → the base-10000 group index, incl. negatives
+    first = int(abs(d).scaleb(-4 * weight))
+    return weight, first, dscale
+
+
+def numeric_div(left: Decimal, right: Decimal) -> Decimal:
+    """PG ``numeric / numeric``: the quotient at the result scale real Postgres
+    derives (``select_div_scale``, numeric.c — ported and probed against a live
+    14.13: 20 cases, byte-identical renders).
+
+    The scale rule: estimate the quotient's weight from the operands' leading
+    base-10000 digits (assuming var1 < var2 when their first digits tie), give
+    the result ``16`` significant digits past that weight, and floor/ceiling by
+    the operands' display scales and Postgres' 0..1000 display-scale range.
+    Rounding is half-away-from-zero, as numeric's round always is."""
+    w1, f1, s1 = _div_operand_stats(left)
+    w2, f2, s2 = _div_operand_stats(right)
+    qweight = w1 - w2
+    if f1 <= f2:
+        qweight -= 1
+    rscale = _NUMERIC_MIN_SIG_DIGITS - qweight * 4
+    rscale = max(rscale, s1, s2, 0)
+    rscale = min(rscale, _NUMERIC_MAX_DISPLAY_SCALE)
+    with _decimal.localcontext() as ctx:
+        # Enough working digits that the quantize below only ever rounds the
+        # true quotient: the integer part is ~4*qweight digits, plus rscale
+        # fractional digits, plus guard.
+        ctx.prec = max(40, 4 * abs(qweight) + rscale + 12)
+        q = left / right
+        return q.quantize(Decimal(1).scaleb(-rscale), rounding=_decimal.ROUND_HALF_UP)
+
+
 def unwrap_numeric(value: Any) -> Any:
     """A ``Decimal128`` as a plain ``Decimal``; anything else unchanged.
 

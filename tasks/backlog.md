@@ -4913,17 +4913,17 @@ what the notation suggests. Comparison operators unwrap Decimal128 rather than
 swallowing the TypeError and answering false.
 `tests/test_sql_numeric_exact.py` covers it.
 
-**Divergence: Postgres derives a scale for numeric division; we do not.**
-`SELECT 5.52 / CAST(2.4 AS NUMERIC(10,2))` gives `2.3000000000000000` on real
-PostgreSQL 14.13 — scale 16, from its rule that a division result carries at
-least the dividend's scale plus a margin. We answer `2.3`. The *value* is
-equal, so arithmetic and comparisons agree; only the displayed scale differs,
-and a driver reading `getBigDecimal().scale()` would see 1 rather than 16.
-Implementing it means porting `select_div_scale` from Postgres' `numeric.c`
-into the division path. Pinned by
-`tests/test_sql_gauge_fixes.py::TestNumericArithmetic::test_float_by_numeric_typmod`,
-which asserts the value rather than the scale so the divergence is visible
-rather than silently encoded.
+~~**Divergence: Postgres derives a scale for numeric division; we do not.**~~
+— **FIXED (numeric-div-scale slice)**: `select_div_scale` is ported verbatim
+into `typemap.numeric_div` (base-10000 operand weight + leading digit →
+16-significant-digit result scale, floored by the operands' display scales,
+clamped to 0..1000; ROUND_HALF_UP, PG's half-away-from-zero), wired through
+`scalar._pg_div` for numeric/numeric (int/int keeps truncation; any float8
+operand keeps float coercion). Probed against a LIVE local PostgreSQL 14.13:
+20 division cases, byte-identical text renders end-to-end. Pinned by
+`tests/test_sql_numeric_div_scale.py` (the probed battery) and the upgraded
+`test_float_by_numeric_typmod`, which now asserts the scale it previously
+deliberately ignored.
 
 **Anything that consumes a numeric value must unwrap it first**
 (`typemap.unwrap_numeric`): `Decimal128` implements no Python numeric

@@ -57,7 +57,9 @@ class TestExactArithmetic:
         [
             ("SELECT 2.5 * 4", "10.0"),
             ("SELECT 7.5 - 0.5", "7.0"),
-            ("SELECT 10.0 / 4", "2.5"),
+            # Division carries PG's derived result scale (select_div_scale):
+            # 10.0 / 4 renders 2.5000000000000000 on real 14.13, scale 16.
+            ("SELECT 10.0 / 4", "2.5000000000000000"),
         ],
     )
     def test_arithmetic_keeps_decimal_semantics(self, q, sql, expected):

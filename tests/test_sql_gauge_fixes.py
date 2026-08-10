@@ -92,11 +92,12 @@ class TestNumericArithmetic:
         assert rows(storage, session, "SELECT 15 / 10") == [(1,)]
 
     def test_float_by_numeric_typmod(self, storage, session):
-        # numeric division, so the value is exact rather than a float. Real
-        # Postgres reports 2.3000000000000000 — same value, but it derives a
-        # division result scale we do not (recorded in tasks/backlog.md).
+        # numeric division at PG's derived result scale (select_div_scale):
+        # real Postgres 14.13 reports 2.3000000000000000 — scale 16 — and so
+        # do we now (the former value-only assertion is upgraded to pin the
+        # scale; the full case battery lives in test_sql_numeric_div_scale.py).
         got = rows(storage, session, "SELECT 5.52 / CAST(2.4 AS NUMERIC(10, 2))")
-        assert Decimal(str(got[0][0])) == Decimal("2.3")
+        assert str(got[0][0]) == "2.3000000000000000"
 
 
 class TestLimitOffsetExpressions:

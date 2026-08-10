@@ -427,12 +427,22 @@ def _as_text(value: Any) -> str:
 
 
 def _pg_div(left: Any, right: Any) -> Any:
-    # Postgres integer division truncates toward zero; ``/`` on mixed/float is real.
+    # Postgres integer division truncates toward zero; ``/`` on floats is real;
+    # numeric division carries PG's derived result scale (select_div_scale —
+    # ``5.52 / 2.4`` is ``2.3000000000000000``, scale 16, not ``2.3``).
     if right == 0:
         raise errors.SQLError("22012", "division by zero")
     if isinstance(left, int) and isinstance(right, int):
         q = abs(left) // abs(right)
         return -q if (left < 0) ^ (right < 0) else q
+    from decimal import Decimal as _D
+
+    if isinstance(left, _D) or isinstance(right, _D):
+        if not isinstance(left, float) and not isinstance(right, float):
+            return typemap.numeric_div(_D(left), _D(right))
+        # numeric with float8 coerces to float8 in PG — fall through.
+        left = float(left) if isinstance(left, _D) else left
+        right = float(right) if isinstance(right, _D) else right
     return left / right
 
 
