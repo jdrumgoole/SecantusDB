@@ -208,3 +208,65 @@ def test_pg_sequence_row(storage, session):
         "SELECT seqstart, seqincrement, seqmax, seqcycle FROM pg_catalog.pg_sequence",
     ).rows
     assert rows == [(7, 3, 50, False)]
+
+
+# -- batched allocation (SEQUENCE_ALLOC_BATCH) ------------------------------ #
+# ``nextval`` pre-allocates a batch with ONE persisted write (PG's CACHE
+# mechanism applied server-side). Values stay gapless while the server runs;
+# the persisted doc carries the batch's high-water mark, so a reopen resumes
+# past the batch — the same gap PG's CACHE/crash semantics produce.
+
+
+def test_batched_nextvals_are_gapless(storage, session):
+    run(storage, session, "CREATE SEQUENCE s")
+    got = [run(storage, session, "SELECT nextval('s')").rows[0][0] for _ in range(300)]
+    assert got == list(range(1, 301))  # crosses two batch boundaries
+
+
+def test_batch_persists_high_water_mark_and_reopen_skips(tmp_path, session):
+    from secantus.sql.catalog import SEQUENCE_ALLOC_BATCH, Catalog
+
+    s = Storage(str(tmp_path))
+    try:
+        run(s, session, "CREATE SEQUENCE s")
+        assert run(s, session, "SELECT nextval('s')").rows[0][0] == 1
+        # The stored doc carries the whole batch's high-water mark.
+        assert Catalog(s).get_sequence(DB, "s")["last_value"] == SEQUENCE_ALLOC_BATCH
+    finally:
+        s.close()
+    s = Storage(str(tmp_path))
+    try:
+        # A reopen loses the in-memory run: the next value resumes past the
+        # persisted mark (PG CACHE/crash gap), never repeating a handed value.
+        assert run(s, session, "SELECT nextval('s')").rows[0][0] == SEQUENCE_ALLOC_BATCH + 1
+    finally:
+        s.close()
+
+
+def test_setval_discards_prefetched_run(storage, session):
+    run(storage, session, "CREATE SEQUENCE s")
+    assert run(storage, session, "SELECT nextval('s')").rows[0][0] == 1
+    run(storage, session, "SELECT setval('s', 1000)")
+    assert run(storage, session, "SELECT nextval('s')").rows[0][0] == 1001
+
+
+def test_alter_restart_discards_prefetched_run(storage, session):
+    run(storage, session, "CREATE SEQUENCE s")
+    assert run(storage, session, "SELECT nextval('s')").rows[0][0] == 1
+    run(storage, session, "ALTER SEQUENCE s RESTART WITH 500")
+    assert run(storage, session, "SELECT nextval('s')").rows[0][0] == 500
+
+
+def test_bounded_sequence_exhausts_exactly_across_batches(storage, session):
+    run(storage, session, "CREATE SEQUENCE s MAXVALUE 5")
+    got = [run(storage, session, "SELECT nextval('s')").rows[0][0] for _ in range(5)]
+    assert got == [1, 2, 3, 4, 5]
+    assert sqlstate(storage, session, "SELECT nextval('s')") == "2200H"
+
+
+def test_recreate_discards_prefetched_run(storage, session):
+    run(storage, session, "CREATE SEQUENCE s")
+    assert run(storage, session, "SELECT nextval('s')").rows[0][0] == 1
+    run(storage, session, "DROP SEQUENCE s")
+    run(storage, session, "CREATE SEQUENCE s START WITH 40")
+    assert run(storage, session, "SELECT nextval('s')").rows[0][0] == 40
