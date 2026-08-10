@@ -533,6 +533,11 @@ class SecantusPGServer:
                 conn.settimeout(idle_ms / 1000.0)
             else:
                 conn.settimeout(None)
+            # Never go idle holding a read snapshot: an idle connection whose
+            # last statement left its thread session with a positioned cursor
+            # pins WT's oldest-transaction horizon for every other connection
+            # (the pgjdbc CopyLargeFileTest wedge). Release before blocking.
+            self.storage.release_thread_snapshot()
             try:
                 msg = pgwire.read_message(conn)
             except TimeoutError:

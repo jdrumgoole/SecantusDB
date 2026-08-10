@@ -5232,7 +5232,28 @@ distinct problems, triaged from the run logs:
   inherently, since it streams a large file through COPY (`CopyTest` beside it
   is 1.8s). Check `uptime` before drawing any conclusion from gauge timings;
   this machine has repeatedly carried runaway processes from parallel sessions.
-- **pgjdbc 2h lane hang — ROOT-CAUSED AND FIXED (pg-idle-txn-default slice,
+- **pgjdbc 2h lane hang — fully closed (wt-snapshot-release slice,
+  2026-08-10).** The idle-in-transaction default (#810, below) fixed one
+  vulnerability but not the observed wedge: with the fix in place the CI
+  sweep and a local full-gauge run still wedged in `CopyLargeFileTest`, and a
+  live `pg_stat_activity` check showed **no open transactions** (note:
+  `xact_start` is a hardcoded stub and `state` never reports
+  "idle in transaction" — do not use them to rule out open txns). The real
+  pinner: an idle connection's cached per-thread WT session left with a
+  positioned cursor after its last statement — an *implicit* WT transaction,
+  invisible to all PG-level accounting, pinning the oldest-txn horizon
+  (`transaction range of IDs currently pinned` grew to ~100k; resetting every
+  cached session mid-wedge collapsed it instantly and unwedged the run).
+  Arming needed a specific mix of prior traffic (the batch classes + the
+  error-path classes + ConnectionTest — every subset was clean; the union
+  wedged deterministically). Fix: `Storage.release_thread_snapshot()` called
+  by both wire servers before each idle wait; regression tests in
+  `tests/test_storage_snapshot_release.py` read the WT pinned-range statistic
+  directly. **Follow-up: mirror on the Rust server** — its Mongo wire path
+  caches per-connection sessions the same way; audit whether an idle Rust
+  connection releases its snapshot before blocking, and add the same
+  before-idle release if not.
+- **pgjdbc 2h lane hang — first fix (pg-idle-txn-default slice,
   2026-08-10).** The wedge was a leaked idle-in-transaction connection: a
   failed autocommit-off test (the CleanupSavepoints / AutoSave cluster) left
   its connection open mid-transaction for the rest of the run, and with

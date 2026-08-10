@@ -631,6 +631,11 @@ class SecantusDBServer:
         try:
             with conn:
                 while not self._stop_event.is_set():
+                    # Never go idle holding a read snapshot: an idle
+                    # connection whose last op left its thread session with a
+                    # positioned cursor pins WT's oldest-transaction horizon
+                    # for every other connection. Release before blocking.
+                    self.storage.release_thread_snapshot()
                     try:
                         message = read_message(conn)
                     except ConnectionClosed:

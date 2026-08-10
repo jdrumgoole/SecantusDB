@@ -3475,6 +3475,36 @@ class Storage:
             # Storage.close() to tear down cross-thread. See close()'s join note.
             self._reset_thread_session()
 
+    def release_thread_snapshot(self) -> None:
+        """Release the calling thread's WT read snapshot and cursor positions.
+
+        Call at the END of every request/statement (both wire servers do).
+        ``_refresh_read_snapshot`` releases a stale snapshot at the *start* of
+        the next read — but a connection that goes idle after its last
+        statement never reaches that point, and a cached session left with a
+        positioned cursor holds an implicit transaction that pins WiredTiger's
+        oldest-transaction horizon indefinitely. Every write after that pin
+        keeps its history unevictable, so per-operation cost grows linearly
+        with churn until page reads stall the whole server (the pgjdbc gauge's
+        CopyLargeFileTest wedge: one idle connection's pinned snapshot turned a
+        4-minute test into a 2-hour lane timeout). ``WT_SESSION.reset()``
+        releases the snapshot and resets every cursor position in one call;
+        cached cursor handles stay valid (``_cursor`` re-``reset()``s before
+        each reuse).
+
+        No-op inside a user transaction — its pinned snapshot is the
+        transaction's semantics, bounded by the servers' transaction-lifetime
+        / idle-in-transaction timeouts."""
+        if getattr(self._tls, "user_txn", None) is not None:
+            return
+        s = getattr(self._tls, "session", None)
+        if s is None:
+            return
+        with self._lock:
+            if not self._closed:
+                with contextlib.suppress(Exception):
+                    s.reset()
+
     def _reset_thread_session(self) -> None:
         """Close the calling thread's cached WT session + cursors so
         the next ``_session()`` call opens fresh ones. Needed when a
