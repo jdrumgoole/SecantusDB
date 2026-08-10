@@ -5249,10 +5249,12 @@ distinct problems, triaged from the run logs:
   wedged deterministically). Fix: `Storage.release_thread_snapshot()` called
   by both wire servers before each idle wait; regression tests in
   `tests/test_storage_snapshot_release.py` read the WT pinned-range statistic
-  directly. **Follow-up: mirror on the Rust server** — its Mongo wire path
-  caches per-connection sessions the same way; audit whether an idle Rust
-  connection releases its snapshot before blocking, and add the same
-  before-idle release if not.
+  directly. **Rust server audited — immune by construction** (2026-08-10):
+  each autocommit operation runs on a fresh WT session (`OpSession::Fresh`
+  in `crates/secantus-storage/src/lib.rs`) closed when the operation drops,
+  and transaction sessions live only for the transaction (bounded by the
+  lifetime limit) — no cached per-connection session survives into an idle
+  wait, so an idle Rust connection cannot pin the oldest-txn horizon.
 - **pgjdbc 2h lane hang — first fix (pg-idle-txn-default slice,
   2026-08-10).** The wedge was a leaked idle-in-transaction connection: a
   failed autocommit-off test (the CleanupSavepoints / AutoSave cluster) left
