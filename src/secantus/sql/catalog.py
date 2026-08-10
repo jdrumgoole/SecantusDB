@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from weakref import WeakKeyDictionary
 
 from secantus.sql import errors
 
@@ -23,6 +24,56 @@ CATALOG_COLLECTION = "__sql_catalog__"
 VIEW_COLLECTION = "__sql_views__"
 MATVIEW_COLLECTION = "__sql_matviews__"
 SEQUENCE_COLLECTION = "__sql_sequences__"
+
+#: How many sequence values one persisted write pre-allocates (see the
+#: sequences section of ``Catalog``). 128 cuts the per-``nextval`` storage
+#: writes by ~99% on bulk SERIAL ingest while keeping the worst-case
+#: restart gap small.
+SEQUENCE_ALLOC_BATCH = 128
+
+#: Pre-allocated sequence values, server-wide per storage object:
+#: ``storage -> {(db, name): [pending (reversed for pop), last_handed]}``.
+#: ``last_handed`` lets invalidation write the true position back to the
+#: stored doc, so ``setval`` / ``ALTER`` / reflection-after-mutation see
+#: CACHE-1-observable state, not the batch high-water mark. Weakly keyed so a
+#: closed storage's cache dies with it; guarded by the executor's
+#: statement-write lock (every reader/writer of an entry holds it).
+_SEQ_ALLOC_CACHE: WeakKeyDictionary[Any, dict[tuple[str, str], list[Any]]] = WeakKeyDictionary()
+
+
+def _precompute_sequence_values(doc: dict[str, Any], count: int) -> list[int]:
+    """The next up-to-``count`` values ``doc``'s sequence will yield, applying
+    the same first-draw / increment / bound / cycle rules one step at a time.
+    Stops early at an uncycled bound (returning what fits); raises 2200H only
+    when not even one value is available."""
+    inc = int(doc.get("increment", 1))
+    values: list[int] = []
+    last = int(doc["last_value"])
+    called = bool(doc.get("is_called", False))
+    for _ in range(count):
+        if not called:
+            # First draw returns the current value as-is — ``start`` for a
+            # fresh sequence, or the value a ``setval(…, false)`` planted.
+            value = last
+            called = True
+        else:
+            value = last + inc
+            bound = doc.get("max_value") if inc > 0 else doc.get("min_value")
+            if bound is not None and (value > bound if inc > 0 else value < bound):
+                if not doc.get("cycle", False):
+                    if values:
+                        break
+                    raise errors.SQLError(
+                        "2200H",
+                        f'nextval: reached maximum value of sequence "{doc["_id"]}"',
+                    )
+                other = doc.get("min_value") if inc > 0 else doc.get("max_value")
+                value = other if other is not None else int(doc.get("start", 1))
+        values.append(value)
+        last = value
+    return values
+
+
 ROLE_COLLECTION = "__sql_roles__"
 ROLE_MEMBER_COLLECTION = "__sql_role_members__"
 GRANT_COLLECTION = "__sql_grants__"
@@ -597,6 +648,20 @@ class Catalog:
     # A sequence is a persisted monotonic counter (``CREATE SEQUENCE`` and the
     # implicit sequence behind a SERIAL column). State lives in a per-db
     # ``__sql_sequences__`` collection, one doc per sequence.
+    #
+    # ``nextval`` allocates in BATCHES: one storage write persists the batch's
+    # high-water mark, then values are handed out from memory (guarded by the
+    # same statement-write lock that already serializes ``nextval``). This is
+    # PG's own ``CACHE`` mechanism applied server-side — without it every
+    # SERIAL insert paid a full read + durable-update transaction, which
+    # dominated bulk-ingest profiles (a 100k-row ``COPY`` into a SERIAL table
+    # spent ~75% of its samples inside ``nextval``'s update). Consequences,
+    # both PG-faithful for a cached sequence: values are gapless while the
+    # server runs (the cache is server-wide, not per-backend), and a restart
+    # resumes from the persisted high-water mark, skipping unhanded values —
+    # exactly the gap PG's ``CACHE``/crash semantics produce. Every other
+    # sequence write path (create / drop / setval / ALTER) invalidates the
+    # cached run so its effect is immediate.
 
     def create_sequence(
         self,
@@ -612,6 +677,7 @@ class Catalog:
     ) -> None:
         """Create (or overwrite) a sequence's persisted state. ``owned_by`` is the
         ``table.column`` a SERIAL/identity sequence belongs to (dropped with it)."""
+        self._invalidate_sequence_cache(db, name)
         self._storage.delete_matching(db, SEQUENCE_COLLECTION, {"_id": name})
         self._storage.insert(
             db,
@@ -640,6 +706,7 @@ class Catalog:
         return self.get_sequence(db, name) is not None
 
     def drop_sequence(self, db: str, name: str) -> bool:
+        self._invalidate_sequence_cache(db, name)
         return self._storage.delete_matching(db, SEQUENCE_COLLECTION, {"_id": name}) > 0
 
     def list_sequences(self, db: str) -> list[str]:
@@ -661,31 +728,45 @@ class Catalog:
             return self._sequence_nextval_locked(db, name)
 
     def _sequence_nextval_locked(self, db: str, name: str) -> int:
+        cache = _SEQ_ALLOC_CACHE.setdefault(self._storage, {})
+        entry = cache.get((db, name))
+        if entry is not None and entry[0]:
+            value = entry[0].pop()
+            entry[1] = value
+            return value
         doc = self.get_sequence(db, name)
         if doc is None:
             raise errors.SQLError("42P01", f'relation "{name}" does not exist')
-        inc = int(doc.get("increment", 1))
-        if not doc.get("is_called", False):
-            # First draw returns the current value as-is — ``start`` for a fresh
-            # sequence, or the value a ``setval(…, false)`` planted.
-            value = int(doc["last_value"])
-        else:
-            value = int(doc["last_value"]) + inc
-            bound = doc.get("max_value") if inc > 0 else doc.get("min_value")
-            if bound is not None and (value > bound if inc > 0 else value < bound):
-                if not doc.get("cycle", False):
-                    raise errors.SQLError(
-                        "2200H", f'nextval: reached maximum value of sequence "{name}"'
-                    )
-                other = doc.get("min_value") if inc > 0 else doc.get("max_value")
-                value = other if other is not None else int(doc.get("start", 1))
+        values = _precompute_sequence_values(doc, SEQUENCE_ALLOC_BATCH)
+        # One write persists the whole batch's high-water mark BEFORE any
+        # value is handed out, so a crash can only skip values, never repeat.
         self._storage.update_matching(
             db,
             SEQUENCE_COLLECTION,
             {"_id": name},
-            {"$set": {"last_value": value, "is_called": True}},
+            {"$set": {"last_value": values[-1], "is_called": True}},
         )
-        return value
+        first = values[0]
+        rest = values[1:]
+        rest.reverse()
+        cache[(db, name)] = [rest, first]
+        return first
+
+    def _invalidate_sequence_cache(self, db: str, name: str) -> None:
+        """Retire ``name``'s pre-allocated run, writing the last value actually
+        handed out back to the stored doc first — so ``setval`` / ``ALTER`` /
+        drop-and-recreate proceed from the sequence's true position, exactly as
+        an uncached (CACHE 1) sequence would. Every sequence write path other
+        than ``nextval`` itself must call this before its own write."""
+        cache = _SEQ_ALLOC_CACHE.get(self._storage)
+        entry = cache.pop((db, name), None) if cache is not None else None
+        if entry is not None:
+            self._storage.update_matching(
+                db,
+                SEQUENCE_COLLECTION,
+                {"_id": name},
+                {"$set": {"last_value": entry[1], "is_called": True}},
+            )
 
     # -- roles -------------------------------------------------------------- #
     # SQL-level roles (``CREATE ROLE`` / ``CREATE USER``). Recorded for reflection
@@ -1027,6 +1108,7 @@ class Catalog:
         ``value`` itself (Postgres ``setval(seq, v, false)`` semantics)."""
         if not self.sequence_exists(db, name):
             raise errors.SQLError("42P01", f'relation "{name}" does not exist')
+        self._invalidate_sequence_cache(db, name)
         self._storage.update_matching(
             db,
             SEQUENCE_COLLECTION,
@@ -1341,6 +1423,7 @@ class Catalog:
         doc = self.get_sequence(db, name)
         if doc is None:
             raise errors.SQLError("42P01", f'relation "{name}" does not exist')
+        self._invalidate_sequence_cache(db, name)
         update: dict[str, Any] = {}
         for key in ("increment", "min_value", "max_value", "cycle", "start"):
             if key in changes:
