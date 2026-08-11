@@ -2,17 +2,17 @@
 
 - SecantusDB (Python server) 0.6.0b9
 - suite: vendor/pgx @ 0aeabbcf11d8 (`go test`, unmodified)
-- generated: 2026-08-10 13:23 UTC
+- generated: 2026-08-11 11:00 UTC
 
 | package | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
 | bgreader | 6 | 0 | 0 | 6 | 100.0% |
 | ctxwatch | 6 | 0 | 0 | 6 | 100.0% |
-| pgconn | 107 | 87 | 22 | 216 | 55.2% |
+| pgconn | 108 | 86 | 22 | 216 | 55.7% |
 | pgproto3 | 171 | 1 | 0 | 172 | 99.4% |
-| **total** | **290** | **88** | **22** | **400** | **76.7%** |
+| **total** | **291** | **87** | **22** | **400** | **77.0%** |
 
-## Failures (88)
+## Failures (87)
 
 - `pgconn :: TestCancelRequestContextWatcherHandler`
 - `pgconn :: TestCancelRequestContextWatcherHandler/DeadlineExceeded_-_do_not_send_cancel_request_when_query_finishes_in_grace_period`
@@ -33,7 +33,6 @@
 - `pgconn :: TestConnCopyFrom`
 - `pgconn :: TestConnCopyFromBinary`
 - `pgconn :: TestConnCopyFromCanceled`
-- `pgconn :: TestConnCopyFromConnectionTerminated`
 - `pgconn :: TestConnCopyFromDataWriteAfterErrorAndReturn`
 - `pgconn :: TestConnCopyFromGzipReader`
 - `pgconn :: TestConnCopyFromNoticeResponseReceivedMidStream`

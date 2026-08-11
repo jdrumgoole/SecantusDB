@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.6.0b9
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-08-10 13:34 UTC
+- generated: 2026-08-11 10:59 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -12,7 +12,7 @@
 | test_connection.py | 98 | 4 | 2 | 104 | 96.1% |
 | test_connection_info.py | 37 | 0 | 3 | 40 | 100.0% |
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
-| test_copy.py | 104 | 8 | 0 | 112 | 92.9% |
+| test_copy.py | 105 | 7 | 0 | 112 | 93.8% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_client.py | 28 | 0 | 0 | 28 | 100.0% |
 | test_cursor_common.py | 280 | 0 | 8 | 288 | 100.0% |
@@ -39,15 +39,15 @@
 | types/test_multirange.py | 205 | 0 | 12 | 217 | 100.0% |
 | types/test_net.py | 33 | 0 | 0 | 33 | 100.0% |
 | types/test_none.py | 1 | 0 | 0 | 1 | 100.0% |
-| types/test_numeric.py | 366 | 4 | 0 | 370 | 98.9% |
+| types/test_numeric.py | 370 | 0 | 0 | 370 | 100.0% |
 | types/test_numpy.py | 166 | 0 | 6 | 172 | 100.0% |
 | types/test_range.py | 275 | 0 | 12 | 287 | 100.0% |
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 134 | 0 | 1 | 135 | 100.0% |
 | types/test_uuid.py | 26 | 0 | 0 | 26 | 100.0% |
-| **total** | **4096** | **46** | **96** | **4238** | **98.9%** |
+| **total** | **4101** | **41** | **96** | **4238** | **99.0%** |
 
-## Failures (46)
+## Failures (41)
 
 - `tests/test_adapt.py::test_random[0-b]`
 - `tests/test_adapt.py::test_random[0-s]`
@@ -65,7 +65,6 @@
 - `tests/test_copy.py::test_copy_from_leaks[1-True]`
 - `tests/test_copy.py::test_copy_out_error_with_copy_not_finished`
 - `tests/test_copy.py::test_copy_table_across[binary]`
-- `tests/test_copy.py::test_copy_table_across[block]`
 - `tests/test_copy.py::test_copy_table_across[row]`
 - `tests/test_copy.py::test_set_custom_type`
 - `tests/test_errors.py::test_pgconn_error`
@@ -91,7 +90,3 @@
 - `tests/types/test_hstore.py::test_roundtrip[1-d3]`
 - `tests/types/test_hstore.py::test_roundtrip_array[0]`
 - `tests/types/test_hstore.py::test_roundtrip_array[1]`
-- `tests/types/test_numeric.py::test_dump_numeric_exhaustive[b]`
-- `tests/types/test_numeric.py::test_dump_numeric_exhaustive[s]`
-- `tests/types/test_numeric.py::test_dump_numeric_exhaustive[t]`
-- `tests/types/test_numeric.py::test_load_numeric_exhaustive[1]`

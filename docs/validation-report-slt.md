@@ -1,6 +1,6 @@
 # sqllogictest conformance report
 
-SecantusDB (Python server) 0.6.0b9 · corpus `gregrahn/sqllogictest` @ `c67f97bf3ca7` · sqllogictest-rs over pgwire · 2026-08-10
+SecantusDB (Python server) 0.6.0b9 · corpus `gregrahn/sqllogictest` @ `c67f97bf3ca7` · sqllogictest-rs over pgwire · 2026-08-11
 
 **52/60 files pass end-to-end** (8 expected divergences, 0 unexpected failures).
 
@@ -9,65 +9,65 @@ Regenerate with `uv run python -m invoke validate-slt`.
 | lane | file | result | seconds |
 |---|---|---|---:|
 | postgres | `evidence/in1.test` | pass | 0.0 |
-| postgres | `evidence/in2.test` | pass | 0.06 |
-| postgres | `evidence/slt_lang_aggfunc.test` | pass | 0.01 |
+| postgres | `evidence/in2.test` | pass | 0.08 |
+| postgres | `evidence/slt_lang_aggfunc.test` | pass | 0.02 |
 | postgres | `evidence/slt_lang_createtrigger.test` | pass | 0.01 |
-| postgres | `evidence/slt_lang_createview.test` | expected divergence | 0.02 |
+| postgres | `evidence/slt_lang_createview.test` | expected divergence | 0.03 |
 | postgres | `evidence/slt_lang_dropindex.test` | pass | 0.02 |
-| postgres | `evidence/slt_lang_droptable.test` | pass | 0.42 |
+| postgres | `evidence/slt_lang_droptable.test` | pass | 0.02 |
 | postgres | `evidence/slt_lang_droptrigger.test` | pass | 0.01 |
-| postgres | `evidence/slt_lang_dropview.test` | pass | 0.02 |
+| postgres | `evidence/slt_lang_dropview.test` | pass | 0.03 |
 | postgres | `evidence/slt_lang_reindex.test` | pass | 0.01 |
 | postgres | `evidence/slt_lang_replace.test` | pass | 0.0 |
-| postgres | `evidence/slt_lang_update.test` | pass | 0.06 |
-| postgres | `index/orderby/10/slt_good_0.test` | pass | 20.55 |
-| postgres | `index/between/1/slt_good_0.test` | pass | 55.93 |
-| postgres | `index/commute/10/slt_good_0.test` | pass | 23.21 |
-| postgres | `index/delete/1/slt_good_0.test` | pass | 15.47 |
-| postgres | `index/in/10/slt_good_0.test` | pass | 57.26 |
-| postgres | `random/aggregates/slt_good_0.test` | expected divergence | 2.6 |
-| postgres | `random/aggregates/slt_good_1.test` | pass | 9.91 |
-| postgres | `random/aggregates/slt_good_10.test` | pass | 10.36 |
-| postgres | `random/expr/slt_good_0.test` | expected divergence | 5.52 |
-| postgres | `random/expr/slt_good_1.test` | pass | 4.26 |
-| postgres | `random/expr/slt_good_10.test` | pass | 6.78 |
-| postgres | `random/groupby/slt_good_0.test` | pass | 10.69 |
-| postgres | `random/groupby/slt_good_1.test` | pass | 10.69 |
-| postgres | `random/select/slt_good_0.test` | expected divergence | 8.23 |
-| postgres | `random/select/slt_good_1.test` | pass | 12.0 |
-| postgres | `select1.test` | pass | 16.25 |
-| postgres | `select2.test` | pass | 9.22 |
-| postgres | `select3.test` | pass | 33.87 |
+| postgres | `evidence/slt_lang_update.test` | pass | 0.05 |
+| postgres | `index/orderby/10/slt_good_0.test` | pass | 32.65 |
+| postgres | `index/between/1/slt_good_0.test` | pass | 94.28 |
+| postgres | `index/commute/10/slt_good_0.test` | pass | 35.79 |
+| postgres | `index/delete/1/slt_good_0.test` | pass | 21.55 |
+| postgres | `index/in/10/slt_good_0.test` | pass | 94.02 |
+| postgres | `random/aggregates/slt_good_0.test` | expected divergence | 3.9 |
+| postgres | `random/aggregates/slt_good_1.test` | pass | 14.87 |
+| postgres | `random/aggregates/slt_good_10.test` | pass | 15.59 |
+| postgres | `random/expr/slt_good_0.test` | expected divergence | 8.64 |
+| postgres | `random/expr/slt_good_1.test` | pass | 6.76 |
+| postgres | `random/expr/slt_good_10.test` | pass | 10.69 |
+| postgres | `random/groupby/slt_good_0.test` | pass | 16.21 |
+| postgres | `random/groupby/slt_good_1.test` | pass | 15.98 |
+| postgres | `random/select/slt_good_0.test` | expected divergence | 12.0 |
+| postgres | `random/select/slt_good_1.test` | pass | 17.73 |
+| postgres | `select1.test` | pass | 22.71 |
+| postgres | `select2.test` | pass | 13.03 |
+| postgres | `select3.test` | pass | 47.69 |
 | postgres-extended | `evidence/in1.test` | pass | 0.0 |
-| postgres-extended | `evidence/in2.test` | pass | 4.19 |
-| postgres-extended | `evidence/slt_lang_aggfunc.test` | pass | 0.45 |
-| postgres-extended | `evidence/slt_lang_createtrigger.test` | pass | 0.56 |
-| postgres-extended | `evidence/slt_lang_createview.test` | expected divergence | 0.87 |
-| postgres-extended | `evidence/slt_lang_dropindex.test` | pass | 0.78 |
-| postgres-extended | `evidence/slt_lang_droptable.test` | pass | 1.05 |
-| postgres-extended | `evidence/slt_lang_droptrigger.test` | pass | 0.55 |
-| postgres-extended | `evidence/slt_lang_dropview.test` | pass | 1.25 |
-| postgres-extended | `evidence/slt_lang_reindex.test` | pass | 0.61 |
+| postgres-extended | `evidence/in2.test` | pass | 0.12 |
+| postgres-extended | `evidence/slt_lang_aggfunc.test` | pass | 0.02 |
+| postgres-extended | `evidence/slt_lang_createtrigger.test` | pass | 0.02 |
+| postgres-extended | `evidence/slt_lang_createview.test` | expected divergence | 0.03 |
+| postgres-extended | `evidence/slt_lang_dropindex.test` | pass | 0.02 |
+| postgres-extended | `evidence/slt_lang_droptable.test` | pass | 0.03 |
+| postgres-extended | `evidence/slt_lang_droptrigger.test` | pass | 0.02 |
+| postgres-extended | `evidence/slt_lang_dropview.test` | pass | 0.03 |
+| postgres-extended | `evidence/slt_lang_reindex.test` | pass | 0.02 |
 | postgres-extended | `evidence/slt_lang_replace.test` | pass | 0.0 |
-| postgres-extended | `evidence/slt_lang_update.test` | pass | 2.26 |
-| postgres-extended | `index/orderby/10/slt_good_0.test` | pass | 824.45 |
-| postgres-extended | `index/between/1/slt_good_0.test` | pass | 822.31 |
-| postgres-extended | `index/commute/10/slt_good_0.test` | pass | 823.37 |
-| postgres-extended | `index/delete/1/slt_good_0.test` | pass | 894.79 |
-| postgres-extended | `index/in/10/slt_good_0.test` | pass | 823.69 |
-| postgres-extended | `random/aggregates/slt_good_0.test` | expected divergence | 212.28 |
-| postgres-extended | `random/aggregates/slt_good_1.test` | pass | 821.12 |
-| postgres-extended | `random/aggregates/slt_good_10.test` | pass | 821.09 |
-| postgres-extended | `random/expr/slt_good_0.test` | expected divergence | 708.66 |
-| postgres-extended | `random/expr/slt_good_1.test` | pass | 821.47 |
-| postgres-extended | `random/expr/slt_good_10.test` | pass | 821.11 |
-| postgres-extended | `random/groupby/slt_good_0.test` | pass | 821.09 |
-| postgres-extended | `random/groupby/slt_good_1.test` | pass | 821.24 |
-| postgres-extended | `random/select/slt_good_0.test` | expected divergence | 561.14 |
-| postgres-extended | `random/select/slt_good_1.test` | pass | 821.23 |
-| postgres-extended | `select1.test` | pass | 86.08 |
-| postgres-extended | `select2.test` | pass | 84.64 |
-| postgres-extended | `select3.test` | pass | 275.61 |
+| postgres-extended | `evidence/slt_lang_update.test` | pass | 0.07 |
+| postgres-extended | `index/orderby/10/slt_good_0.test` | pass | 49.87 |
+| postgres-extended | `index/between/1/slt_good_0.test` | pass | 114.79 |
+| postgres-extended | `index/commute/10/slt_good_0.test` | pass | 53.99 |
+| postgres-extended | `index/delete/1/slt_good_0.test` | pass | 32.81 |
+| postgres-extended | `index/in/10/slt_good_0.test` | pass | 118.15 |
+| postgres-extended | `random/aggregates/slt_good_0.test` | expected divergence | 6.8 |
+| postgres-extended | `random/aggregates/slt_good_1.test` | pass | 25.91 |
+| postgres-extended | `random/aggregates/slt_good_10.test` | pass | 26.65 |
+| postgres-extended | `random/expr/slt_good_0.test` | expected divergence | 13.94 |
+| postgres-extended | `random/expr/slt_good_1.test` | pass | 11.89 |
+| postgres-extended | `random/expr/slt_good_10.test` | pass | 17.25 |
+| postgres-extended | `random/groupby/slt_good_0.test` | pass | 27.9 |
+| postgres-extended | `random/groupby/slt_good_1.test` | pass | 27.57 |
+| postgres-extended | `random/select/slt_good_0.test` | expected divergence | 19.76 |
+| postgres-extended | `random/select/slt_good_1.test` | pass | 29.46 |
+| postgres-extended | `select1.test` | pass | 25.51 |
+| postgres-extended | `select2.test` | pass | 15.24 |
+| postgres-extended | `select3.test` | pass | 55.58 |
 
 ## Expected divergences
 
