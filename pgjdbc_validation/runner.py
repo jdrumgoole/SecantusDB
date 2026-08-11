@@ -317,9 +317,23 @@ def _aggregate(
             "seconds": round(float(root.get("time", 0.0)), 1),
             "failed_tests": [],
         }
+        slow: dict[str, float] = {}
         for tc in root.iter("testcase"):
             if tc.find("failure") is not None or tc.find("error") is not None:
                 entry["failed_tests"].append(tc.get("name"))
+            tc_secs = float(tc.get("time", 0.0))
+            if tc_secs >= 1.0:
+                # Per-test wall seconds for the slow tail only (the raw stays
+                # compact). This is the evidence base for CI-vs-local timing
+                # anomalies: BatchFailureTest measures 44s locally but 1260s
+                # in CI, and the per-CLASS number can't say which of its 184
+                # parameterized variants stall.
+                key = f"{tc.get('classname', '')}::{tc.get('name', '')}"
+                slow[key] = round(slow.get(key, 0.0) + tc_secs, 1)
+        if slow:
+            entry["slow_tests"] = dict(
+                sorted(slow.items(), key=lambda kv: -kv[1])[:25]
+            )
         classes.append(entry)
     payload: dict = {"classes": classes}
     if shard is not None:
