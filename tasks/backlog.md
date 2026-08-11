@@ -5270,6 +5270,14 @@ distinct problems, triaged from the run logs:
   GUC (session `SET` overrides, 0 opts out, `RESET` returns to the server
   value) — verified by re-running the leak + churn scenario end-to-end
   (flat timings, leak reaped with 25P03).
+- **Read-only transactions are enforced (pg-readonly-isolation slice,
+  2026-08-11)** — writes under `BEGIN READ ONLY` / `SET TRANSACTION READ
+  ONLY` / `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` fail with
+  PG's 25006, and `SHOW TRANSACTION ISOLATION LEVEL` (pgjdbc's spelling)
+  resolves to `transaction_isolation`. Known divergences from PG, none
+  exercised by any gauge: temp-table writes are also blocked (PG allows
+  them in read-only txns), and `SELECT … FOR UPDATE` / `nextval()` are NOT
+  blocked (PG blocks both).
 - [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
   first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
   …) are inside the ~347 documented standing failures of the 93.7% baseline
