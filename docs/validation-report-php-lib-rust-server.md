@@ -1,6 +1,6 @@
 # mongo-php-library Validation Report
 
-Generated 2026-08-10 — SecantusDB 0.6.0b9 vs mongo-php-library 12e56461166d (`vendor/mongo-php-library/`).
+Generated 2026-08-11 — SecantusDB 0.6.0b9 vs mongo-php-library 12e56461166d (`vendor/mongo-php-library/`).
 
 Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges for the official high-level PHP library — the `mongodb/mongodb` package Laravel + Symfony applications build on.
 
@@ -18,7 +18,7 @@ Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the 
 | `tests/Operation` | 1900 | 2 | 36 | 1938 | 99.9% |
 | **Overall** | **3051** | **40** | **39** | **3130** | **98.7%** |
 
-Run time: 4.32s.
+Run time: 4.00s.
 
 ## Failures (40)
 

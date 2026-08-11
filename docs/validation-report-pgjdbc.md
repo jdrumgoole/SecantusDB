@@ -1,14 +1,14 @@
 # pgjdbc conformance report
 
 - SecantusDB (Python server) 0.6.0b9
-- suite: vendor/pgjdbc @ 3297557c6a80 (Gradle `:postgresql:test`, unmodified; 60s JUnit default timeout injected)
-- generated: 2026-08-10 20:10 UTC
+- suite: vendor/pgjdbc @ unknown (Gradle `:postgresql:test`, unmodified; 60s JUnit default timeout injected)
+- generated: 2026-08-11 11:33 UTC
 
 | test class | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
 | jdbc2.ArrayTest | 42 | 4 | 0 | 46 | 91.3% |
 | jdbc2.AutoRollbackTest | 1048 | 8 | 0 | 1056 | 99.2% |
-| jdbc2.AutoSaveTransactionSettingsTest | 0 | 6 | 0 | 6 | 0.0% |
+| jdbc2.AutoSaveTransactionSettingsTest | 4 | 2 | 0 | 6 | 66.7% |
 | jdbc2.BatchDeadlockTest | 2 | 6 | 8 | 16 | 25.0% |
 | jdbc2.BatchExecuteTest | 132 | 8 | 0 | 140 | 94.3% |
 | jdbc2.BatchFailureTest | 136 | 48 | 0 | 184 | 73.9% |
@@ -24,8 +24,8 @@
 | jdbc2.ConnectExecutorTest | 3 | 0 | 0 | 3 | 100.0% |
 | jdbc2.ConnectTimeoutTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.ConnectionSetupFailureTest | 1 | 0 | 0 | 1 | 100.0% |
-| jdbc2.ConnectionTest | 12 | 3 | 0 | 15 | 80.0% |
-| jdbc2.CopyLargeFileTest | 0 | 1 | 0 | 1 | 0.0% |
+| jdbc2.ConnectionTest | 15 | 0 | 0 | 15 | 100.0% |
+| jdbc2.CopyLargeFileTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.CopyTest | 23 | 1 | 0 | 24 | 95.8% |
 | jdbc2.CursorFetchSqlTransactionTest | 0 | 3 | 0 | 3 | 0.0% |
 | jdbc2.CursorFetchTest | 32 | 0 | 0 | 32 | 100.0% |
@@ -34,7 +34,7 @@
 | jdbc2.DatabaseMetaDataCacheTest | 2 | 1 | 0 | 3 | 66.7% |
 | jdbc2.DatabaseMetaDataPropertiesTest | 12 | 1 | 0 | 13 | 92.3% |
 | jdbc2.DatabaseMetaDataTest | 0 | 1 | 0 | 1 | 0.0% |
-| jdbc2.DatabaseMetaDataTransactionIsolationTest | 8 | 6 | 0 | 14 | 57.1% |
+| jdbc2.DatabaseMetaDataTransactionIsolationTest | 14 | 0 | 0 | 14 | 100.0% |
 | jdbc2.DateStyleTest | 4 | 0 | 0 | 4 | 100.0% |
 | jdbc2.DateTest | 170 | 8 | 14 | 192 | 95.5% |
 | jdbc2.DriverTest | 16 | 0 | 1 | 17 | 100.0% |
@@ -70,7 +70,7 @@
 | jdbc2.ServerPreparedStmtTest | 13 | 0 | 0 | 13 | 100.0% |
 | jdbc2.SharedTimerRefCountTest | 0 | 1 | 0 | 1 | 0.0% |
 | jdbc2.SocketTimeoutTest | 1 | 0 | 0 | 1 | 100.0% |
-| jdbc2.StatementTest | 26 | 16 | 0 | 42 | 61.9% |
+| jdbc2.StatementTest | 27 | 15 | 0 | 42 | 64.3% |
 | jdbc2.StringTypeUnspecifiedArrayTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.TimeTest | 1 | 2 | 0 | 3 | 33.3% |
 | jdbc2.TimestampTest | 6 | 8 | 0 | 14 | 42.9% |
@@ -81,9 +81,9 @@
 | jdbc2.TypeCacheDLLStressTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.UpdateableResultTest | 28 | 8 | 0 | 36 | 77.8% |
 | jdbc2.UpsertTest | 32 | 0 | 0 | 32 | 100.0% |
-| **total** | **5311** | **219** | **28** | **5558** | **96.0%** |
+| **total** | **5326** | **204** | **28** | **5558** | **96.3%** |
 
-## Failures (219)
+## Failures (204)
 
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
@@ -99,10 +99,6 @@
 - `jdbc2.AutoRollbackTest :: run()`
 - `jdbc2.AutoSaveTransactionSettingsTest :: setLocalTransactionIsolationLevelAsFirstStatement()`
 - `jdbc2.AutoSaveTransactionSettingsTest :: setLocalTransactionIsolationLevelAsFirstStatement()`
-- `jdbc2.AutoSaveTransactionSettingsTest :: setSessionTransactionIsolationLevelAsFirstStatement()`
-- `jdbc2.AutoSaveTransactionSettingsTest :: setSessionTransactionIsolationLevelAsFirstStatement()`
-- `jdbc2.AutoSaveTransactionSettingsTest :: setTransactionIsolationLevelAsFirstStatement()`
-- `jdbc2.AutoSaveTransactionSettingsTest :: setTransactionIsolationLevelAsFirstStatement()`
 - `jdbc2.BatchDeadlockTest :: largePreparedBatchWithGeneratedKeysDoesNotDeadlock()`
 - `jdbc2.BatchDeadlockTest :: largePreparedBatchWithGeneratedKeysDoesNotDeadlock()`
 - `jdbc2.BatchDeadlockTest :: largePreparedBatchWithGeneratedKeysDoesNotDeadlock()`
@@ -182,10 +178,6 @@
 - `jdbc2.CleanupSavepointsWithFastpathTest :: testMultipleQueriesThenLargeObject()`
 - `jdbc2.CleanupSavepointsWithFastpathTest :: testPreparedStatementThenLargeObject()`
 - `jdbc2.CleanupSavepointsWithFastpathTest :: testPreparedStatementThenLargeObject()`
-- `jdbc2.ConnectionTest :: readOnly_always()`
-- `jdbc2.ConnectionTest :: readOnly_transaction()`
-- `jdbc2.ConnectionTest :: transactionIsolation()`
-- `jdbc2.CopyLargeFileTest :: feedTableSeveralTimesTest()`
 - `jdbc2.CopyTest :: copyMultiApi()`
 - `jdbc2.CursorFetchSqlTransactionTest :: [1] startTransaction=BEGIN`
 - `jdbc2.CursorFetchSqlTransactionTest :: [2] startTransaction=START TRANSACTION`
@@ -196,12 +188,6 @@
 - `jdbc2.DatabaseMetaDataCacheTest :: getSQLTypeQueryCache()`
 - `jdbc2.DatabaseMetaDataPropertiesTest :: values()`
 - `jdbc2.DatabaseMetaDataTest :: initializationError`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [1] isolationLevel=8`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [2] isolationLevel=4`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [2] isolationLevel=read uncommitted`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [3] isolationLevel=repeatable read`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [4] isolationLevel=1`
-- `jdbc2.DatabaseMetaDataTransactionIsolationTest :: [4] isolationLevel=serializable`
 - `jdbc2.DateTest :: testGetDate()`
 - `jdbc2.DateTest :: testGetDate()`
 - `jdbc2.DateTest :: testGetDate()`
@@ -264,7 +250,6 @@
 - `jdbc2.SharedTimerRefCountTest :: multipleCancels()`
 - `jdbc2.StatementTest :: closeInProgressStatement()`
 - `jdbc2.StatementTest :: closeInProgressStatementProtocol32()`
-- `jdbc2.StatementTest :: concurrentIsValid()`
 - `jdbc2.StatementTest :: concurrentWarningReadAndClear()`
 - `jdbc2.StatementTest :: dateFuncWithParam()`
 - `jdbc2.StatementTest :: dateFunctions()`

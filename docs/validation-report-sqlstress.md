@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.6.0b9
 - pgbench TPC-B (simple / extended / prepared) + select-only + psql catalog smoke
-- generated: 2026-08-10 13:16 UTC
+- generated: 2026-08-11 10:54 UTC
 
 **5/6 lanes clean.** Any error or dropped connection is a bug;
 tps figures are smoke-level indicators, not benchmarks.
@@ -10,8 +10,8 @@ tps figures are smoke-level indicators, not benchmarks.
 | lane | status | tps |
 |---|---|---|
 | init (-i -s 1) | ok | — |
-| tpcb -M simple (c=1 t=50) | ok | 119 |
-| tpcb -M extended (c=1 t=50) | ok | 3 |
-| tpcb -M prepared (c=1 t=50) | ok | 3 |
-| select-only (c=4 t=100) | ok | 486 |
+| tpcb -M simple (c=1 t=50) | ok | 124 |
+| tpcb -M extended (c=1 t=50) | ok | 103 |
+| tpcb -M prepared (c=1 t=50) | ok | 119 |
+| select-only (c=4 t=100) | ok | 523 |
 | psql catalog smoke | FAIL —                  ^ | — |
