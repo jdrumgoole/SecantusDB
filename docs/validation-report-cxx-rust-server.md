@@ -1,6 +1,6 @@
 # mongo-cxx-driver Validation Report
 
-Generated 2026-08-10 — SecantusDB 0.6.0b9 vs mongo-cxx-driver 24852b6 (`vendor/mongo-cxx-driver/`).
+Generated 2026-08-11 — SecantusDB 0.6.0b9 vs mongo-cxx-driver 24852b6 (`vendor/mongo-cxx-driver/`).
 
 Run `uv run python -m invoke validate-cxx` to refresh. The official MongoDB **C++** driver (`mongocxx`), built on libmongoc — its Catch2 `test_driver` suite (CRUD / cursor / aggregate / GridFS / commands) run unmodified against an embedded SecantusDB daemon.
 
@@ -8,19 +8,9 @@ Run `uv run python -m invoke validate-cxx` to refresh. The official MongoDB **C+
 
 | Passed | Failed | Skipped | Total | Pass rate |
 |---:|---:|---:|---:|---:|
-| 885 | 3 | 9 | 897 | 99.7% |
+| 890 | 0 | 9 | 899 | 100.0% |
 
 (Catch2 expands each `SECTION` into its own JUnit `<testcase>`, so the total exceeds the number of `TEST_CASE`s.)
-
-## Failures (3)
-
-First 30 failed tests for triage:
-
-```
-Spec Prose Tests/1. ChangeStream must continuously track the last seen resumeToken
-integration tests for client metadata handshake feature/with client
-integration tests for client metadata handshake feature/with pool
-```
 
 ## How this is generated
 
