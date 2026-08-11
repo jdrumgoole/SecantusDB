@@ -2533,7 +2533,8 @@ shared storage engine or building large new protocol subsystems:
       Every other `CREATE TRIGGER` stays rejected.
     - **`lo_import` / `lo_export` are absent** (server-side file I/O; nothing
       drives them over the wire in the gauges).
-  - **DateTest date offsets** (21) — see the dedicated section below; the
+  - ~~**DateTest date offsets** (21)~~ — FIXED across several slices; now
+    **192/192** (re-measured 2026-08-12) — see the dedicated section below; the
     shape is now measured rather than guessed at.
   - **`bind parameter $N has no value`** (8, BatchedInsertReWrite): pgjdbc's
     insert-rewrite batches leave a parameter unbound on a re-written statement.
@@ -5569,11 +5570,13 @@ normalises an aware datetime to UTC and `0001-01-01 00:00+05:00` is year zero
 there. It surfaced immediately as 14 fresh `internal error`s, and those
 extremes now keep their wall clock as they did before.
 
-`DateTest` 21 -> 8 across the session. **Remaining 8** are all
-`expected: <1950-02-07>`, so the same shape by yet another route — re-run the
-capture and diff the Bind parameters for the failing cases specifically; the
-proxy now records their formats and values, so the next pass should name it
-directly rather than by elimination.
+`DateTest` 21 -> 8 across the session. ~~**Remaining 8** are all
+`expected: <1950-02-07>`~~ — RESOLVED: re-measured on the `pg-large-objects`
+branch (2026-08-12), `DateTest` is **192/192, 0 failed**. The last 8 cleared
+with fixes that landed between the capture session and this measurement (the
+offset-date Bind widening + timestamptz param-type threading above, plus the
+subsequent timestamptz-session-zone and BC-timestamp slices); no further
+capture pass was needed.
 
 `TimezoneTest` is unchanged at 7 and untouched by any of this: its failures are
 `timestamptz` TEXT comparisons (`2005-01-01 12:00:00+00`), an interval-style
