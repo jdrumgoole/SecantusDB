@@ -1364,6 +1364,9 @@ class Storage:
         self._in_memory = path == ":memory:"
         # Stashed for reuse in restore-archive / explain output.
         self.cache_size = cache_size
+        # Public, read-only view of the above for callers outside storage
+        # (``serverStatus.storageEngine.persistent``). Exposed as a property
+        # below rather than a second attribute so it cannot drift.
         # Dirty budget for one multi-document transaction, derived from the
         # cache: WT starts stalling application threads around its dirty
         # trigger (~20% of cache), and dirty content belonging to an OPEN
@@ -3233,6 +3236,11 @@ class Storage:
         tb: object,
     ) -> None:
         self.close()
+
+    @property
+    def in_memory(self) -> bool:
+        """True when this store is the ``:memory:`` (non-persistent) variant."""
+        return self._in_memory
 
     def close(self) -> None:
         # Stop background threads before tearing down WT — both the
