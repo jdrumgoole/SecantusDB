@@ -4011,6 +4011,22 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if entry.dropped:
         ctx.cursors.kill([cursor_id])
         return _collection_dropped_reply(entry.namespace or ns)
+    # Oplog tail as seen BEFORE the drain. A plain capped tailable cursor
+    # tracks its position by RecordId watermark inside its producer and never
+    # maintains ``position_seq``, so using that as the wake baseline (as a
+    # change stream does) leaves it at 0 — and any prior write in the oplog
+    # already satisfies ``tail > 0``, so the awaitData wait returned
+    # immediately instead of blocking. mongo-php-library's
+    # ``FindFunctionalTest::testMaxAwaitTimeMS`` measures exactly this: it
+    # asserts the getMore that exhausts the batch takes at least
+    # ``maxAwaitTimeMS``, and saw ~0.2ms.
+    #
+    # Snapshotting before the drain is what makes it race-free: a write that
+    # lands between the snapshot and the drain is picked up BY the drain (so
+    # no wait happens at all), and one landing after the drain leaves
+    # ``tail > snapshot`` true, so the wait wakes immediately and the
+    # post-wait re-drain returns it. Neither ordering can miss a wakeup.
+    pre_drain_tail_seq = ctx.storage.oplog_visible_tail_seq_nolock()
     # Drain any already-buffered events first.
     try:
         _drain_change_stream_producer(entry)
@@ -4035,7 +4051,9 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # oplog, surfacing it only on the post-wait re-drain — past the
         # client's await window. Mirrors the Rust server's
         # ``wait_for_oplog(position, ...)``.
-        baseline_seq = entry.position_seq
+        # Change streams keep ``position_seq`` current (see above); plain
+        # capped tailables do not, and use the pre-drain snapshot instead.
+        baseline_seq = entry.position_seq if entry.change_stream else pre_drain_tail_seq
         with ctx.storage._oplog_cv:
             # Wake predicate must not acquire ``storage._lock`` — the
             # write path holds ``_lock`` then notifies under
@@ -4556,12 +4574,27 @@ def _aggregate_change_stream(
             changestreams.ResumeTokenData(last_seen, last_seen_ts, last_seen_ns, {})
         )
         if pipeline_after_cs:
+            # The resume tokens going in, to compare against what comes out.
+            tokens_in = [ev.get("_id") for ev in events if isinstance(ev, Mapping)]
             events = apply_pipeline(events, pipeline_after_cs, pipeline_ctx)
             for ev in events:
-                if isinstance(ev, Mapping) and "_id" not in ev:
-                    # mongod 4.1.8+: an event whose ``_id`` (the resume
-                    # token) was projected out by the user pipeline is
-                    # fatal — the stream can't be resumed past it.
+                if not isinstance(ev, Mapping):
+                    continue
+                # mongod 4.1.8+ allows "only transformations that retain the
+                # unmodified _id", so a pipeline that REWRITES the resume
+                # token is as fatal as one that drops it — e.g.
+                # ``{$project: {_id: {$literal: 'foo'}}}``, which
+                # mongo-php-library's testResumeTokenInvalidTypeServerSideError
+                # drives and expects to fail server-side. Checking only for a
+                # missing ``_id`` let the rewrite through, and the driver then
+                # raised a *client*-side ResumeTokenException instead.
+                #
+                # An event dropped entirely (by ``$match``) is fine; only a
+                # SURVIVING event with a missing or altered token trips this.
+                # Match against the input tokens by value rather than by
+                # position, since the pipeline may reorder or drop events.
+                token = ev.get("_id")
+                if token is None or not any(token == t for t in tokens_in):
                     raise changestreams.ChangeStreamFatalError(
                         "Encountered an event whose _id field, which contains the "
                         "resume token, was modified by the pipeline. Modifying the "
