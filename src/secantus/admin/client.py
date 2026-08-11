@@ -828,6 +828,92 @@ class MongoFacade:
         except PyMongoError as exc:
             raise MongoError(friendly_error(exc)) from exc
 
+    # ---- collection lifecycle -------------------------------------------
+
+    def create_collection(self, db: str, coll: str, *, options: Mapping[str, Any]) -> None:
+        """Create ``db.coll``, forwarding ``options`` to ``create``.
+
+        The options dict is passed through untouched rather than
+        allow-listed: every ``create`` option the server understands
+        (validators, capped sizing, pre/post images, timeseries) then works
+        the day the server gains it, and one it does not understand comes
+        back as the server's own error instead of a stale UI rejection.
+        """
+        try:
+            self._get_client()[db].create_collection(coll, **dict(options))
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+
+    def coll_mod(self, db: str, coll: str, *, changes: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply ``collMod`` to an existing collection.
+
+        Returns the raw reply — mongod reports the before/after of each
+        modified option there, which the UI surfaces so the user can see
+        what actually changed rather than a bare "ok".
+        """
+        command: dict[str, Any] = {"collMod": coll}
+        command.update(dict(changes))
+        return self.run_command(db, command)
+
+    def rename_collection(
+        self,
+        db: str,
+        coll: str,
+        *,
+        target: str,
+        drop_target: bool = False,
+    ) -> None:
+        """Rename ``db.coll`` to ``target``.
+
+        ``target`` may be a bare collection name (stays in ``db``) or a
+        fully-qualified ``otherdb.coll``. ``renameCollection`` is an admin
+        command taking full namespaces on both sides.
+        """
+        target_ns = target if "." in target else f"{db}.{target}"
+        try:
+            self._get_client().admin.command(
+                "renameCollection",
+                f"{db}.{coll}",
+                to=target_ns,
+                dropTarget=bool(drop_target),
+            )
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+
+    def create_role(
+        self,
+        db: str,
+        role: str,
+        *,
+        privileges: list[dict[str, Any]],
+        roles: list[Any],
+    ) -> None:
+        """Create a custom role. ``privileges`` / ``roles`` may be empty."""
+        try:
+            self._get_client()[db].command(
+                "createRole",
+                role,
+                privileges=privileges,
+                roles=roles,
+            )
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+
+    def drop_role(self, db: str, role: str) -> None:
+        """Drop a custom role."""
+        try:
+            self._get_client()[db].command("dropRole", role)
+        except OperationFailure as exc:
+            raise MongoError(friendly_error(exc), code=exc.code) from exc
+        except PyMongoError as exc:
+            raise MongoError(friendly_error(exc)) from exc
+
     # ---- schema sampler / logs / geo ------------------------------------
 
     def sample_collection(self, db: str, coll: str, *, size: int = 100) -> list[dict[str, Any]]:

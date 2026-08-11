@@ -3,38 +3,104 @@
 <nav class="breadcrumb">
   <a href="/users">Users</a>
   <span class="sep">/</span>
-  <span>built-in roles</span>
+  <span>roles</span>
 </nav>
+
+{% if notice %}
+  <div class="notice">{{ notice }}</div>
+{% endif %}
+{% if error %}
+  <div class="error">{{ error }}</div>
+{% endif %}
 
 <p class="modal-meta">
   Built-in roles map to action sets enforced server-side by
-  <code>secantus.rbac</code>. Custom roles aren't implemented yet.
+  <code>secantus.rbac</code>. Roles the target reports but this package has no
+  action table for are shown as <span class="badge">custom</span> — their
+  privileges live on the target, so none are listed here.
 </p>
 
-<table class="data-table">
-  <thead>
-    <tr>
-      <th>Role</th>
-      <th>Flags</th>
-      <th>Actions</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for row in rows %}
+<div x-data="{ open: false }">
+  <div class="filter-form">
+    <div class="filter-controls">
+      <button type="button" @click="open = !open">Create role</button>
+    </div>
+  </div>
+
+  <form
+    method="post"
+    action="/roles?db={{ db_name }}"
+    class="filter-form"
+    x-show="open"
+    x-cloak
+  >
+    <div class="filter-controls">
+      <label>
+        Name
+        <input type="text" name="name" required autocomplete="off" />
+      </label>
+      <label class="filter-wide">
+        Privileges (Extended JSON array)
+        <input
+          type="text"
+          name="privileges"
+          autocomplete="off"
+          placeholder='[{"resource": {"db": "app", "collection": ""}, "actions": ["find"]}]'
+        />
+      </label>
+      <label class="filter-wide">
+        Inherited roles (Extended JSON array)
+        <input
+          type="text"
+          name="roles"
+          autocomplete="off"
+          placeholder='["read", {"role": "readWrite", "db": "app"}]'
+        />
+      </label>
+      <button type="submit">Create</button>
+    </div>
+    <p class="modal-meta">
+      Created on <code>{{ db_name }}</code>. At least one privilege or one
+      inherited role is required.
+    </p>
+  </form>
+
+  <table class="data-table">
+    <thead>
       <tr>
-        <td><code>{{ row.name }}</code></td>
-        <td>
-          {% for flag in row.flags %}
-            <span class="badge">{{ flag }}</span>
-          {% endfor %}
-        </td>
-        <td>
-          {% for action in row.actions %}
-            <code class="action-pill">{{ action }}</code>
-          {% endfor %}
-        </td>
+        <th>Role</th>
+        <th>Flags</th>
+        <th>Actions</th>
+        <th></th>
       </tr>
-    {% endfor %}
-  </tbody>
-</table>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+        <tr>
+          <td><code>{{ row.name }}</code></td>
+          <td>
+            {% for flag in row.flags %}
+              <span class="badge">{{ flag }}</span>
+            {% endfor %}
+          </td>
+          <td>
+            {% for action in row.actions %}
+              <code class="action-pill">{{ action }}</code>
+            {% endfor %}
+          </td>
+          <td>
+            {# Only custom roles can be dropped — dropRole on a built-in is
+               refused by the server, so offering the button would be a
+               button that always fails. #}
+            {% if "custom" in row.flags %}
+              <form method="post" action="/roles/{{ db_name }}/{{ row.name }}/drop">
+                <button type="submit" class="btn-secondary">Drop</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
 {% endblock %}

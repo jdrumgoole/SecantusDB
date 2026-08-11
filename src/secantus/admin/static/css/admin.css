@@ -334,6 +334,17 @@ body {
   border-radius: 6px;
 }
 
+/* Success counterpart to ``.error`` — confirms a DDL action landed. The
+   accent border (not green) keeps it inside the existing palette, which
+   already carries the light/dark variants. */
+.notice {
+  color: var(--accent);
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+}
+
 /* Tables — used by databases / collections / docs viewer */
 
 .data-table {
@@ -473,6 +484,24 @@ body {
 
 .filter-controls label {
   flex: 0 0 auto;
+}
+
+/* Opt-in growth for a control holding free-form text (a change-stream
+   pipeline, a resume token) rather than a short scalar. Without this the
+   flex row gives every control the same width and JSON is unreadable. */
+.filter-controls label.filter-wide {
+  flex: 1 1 22rem;
+}
+
+.filter-controls label.filter-wide input {
+  width: 100%;
+}
+
+/* The advanced-options row wraps: it carries more controls than the
+   scope row and must not force a horizontal scrollbar on narrow windows. */
+.filter-controls {
+  flex-wrap: wrap;
+  row-gap: 0.75rem;
 }
 
 .filter-controls input,

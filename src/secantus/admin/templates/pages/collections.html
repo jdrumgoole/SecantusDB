@@ -4,9 +4,58 @@
 <nav class="breadcrumb">
   <a href="/db">Databases</a> <span class="sep">/</span> <span>{{ db_name }}</span>
 </nav>
+
+{% if notice %}
+  <div class="notice">{{ notice }}</div>
+{% endif %}
 {% if error %}
-  <div class="error">Could not list collections: {{ error }}</div>
-{% else %}
+  <div class="error">{{ error }}</div>
+{% endif %}
+
+{# The table renders even when ``error`` is set: a rejected create/collMod
+   leaves the collection list perfectly readable, and blanking the page
+   would lose the context the user needs to correct the input. #}
+<div x-data="{ open: null }">
+  <div class="filter-form">
+    <div class="filter-controls">
+      <button type="button" @click="open = (open === 'create' ? null : 'create')">
+        Create collection
+      </button>
+    </div>
+  </div>
+
+  <form
+    method="post"
+    action="/db/{{ db_name }}/collections"
+    class="filter-form"
+    x-show="open === 'create'"
+    x-cloak
+  >
+    <div class="filter-controls">
+      <label>
+        Name
+        <input type="text" name="name" required autocomplete="off" />
+      </label>
+      <label class="filter-wide">
+        Options (Extended JSON)
+        <input
+          type="text"
+          name="options"
+          autocomplete="off"
+          placeholder='{"validator": {"$jsonSchema": {…}}, "capped": true, "size": 4096}'
+        />
+      </label>
+      <button type="submit">Create</button>
+    </div>
+    <p class="modal-meta">
+      Passed straight to <code>create</code>: validators
+      (<code>validator</code> / <code>validationLevel</code> /
+      <code>validationAction</code>), <code>capped</code> +
+      <code>size</code> / <code>max</code>, and
+      <code>changeStreamPreAndPostImages</code> all work here.
+    </p>
+  </form>
+
   <table class="data-table">
     <thead>
       <tr>
@@ -15,6 +64,7 @@
         <th class="num">Data size</th>
         <th class="num">Index size</th>
         <th>Options</th>
+        <th>Actions</th>
       </tr>
     </thead>
     <tbody>
@@ -28,12 +78,73 @@
             {% if c.options.capped %}
               <span class="badge">capped</span>
             {% endif %}
+            {% if c.options.validator %}
+              <span class="badge">validator</span>
+            {% endif %}
+          </td>
+          <td>
+            <button
+              type="button"
+              class="btn-secondary"
+              @click="open = (open === 'mod-{{ c.name }}' ? null : 'mod-{{ c.name }}')"
+            >Modify</button>
+            <button
+              type="button"
+              class="btn-secondary"
+              @click="open = (open === 'ren-{{ c.name }}' ? null : 'ren-{{ c.name }}')"
+            >Rename</button>
+          </td>
+        </tr>
+        <tr x-show="open === 'mod-{{ c.name }}'" x-cloak>
+          <td colspan="6">
+            <form method="post" action="/db/{{ db_name }}/{{ c.name }}/collmod">
+              <div class="filter-controls">
+                <label class="filter-wide">
+                  collMod changes (Extended JSON)
+                  {# Deliberately not prefilled with the current validator:
+                     ``collMod`` takes a *changes* document, and seeding the
+                     box with a bare validator body would look like a valid
+                     one while being the wrong shape. #}
+                  <input
+                    type="text"
+                    name="changes"
+                    required
+                    autocomplete="off"
+                    placeholder='{"validator": {…}, "validationAction": "warn"}'
+                  />
+                </label>
+                <button type="submit">Apply</button>
+              </div>
+            </form>
+          </td>
+        </tr>
+        <tr x-show="open === 'ren-{{ c.name }}'" x-cloak>
+          <td colspan="6">
+            <form method="post" action="/db/{{ db_name }}/{{ c.name }}/rename">
+              <div class="filter-controls">
+                <label>
+                  New name
+                  <input
+                    type="text"
+                    name="target"
+                    required
+                    autocomplete="off"
+                    value="{{ c.name }}"
+                    placeholder="newname or otherdb.newname"
+                  />
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" name="drop_target" value="1" /> Drop target if it exists
+                </label>
+                <button type="submit">Rename</button>
+              </div>
+            </form>
           </td>
         </tr>
       {% else %}
-        {{ empty_row(5, "No collections.") }}
+        {{ empty_row(6, "No collections.") }}
       {% endfor %}
     </tbody>
   </table>
-{% endif %}
+</div>
 {% endblock %}

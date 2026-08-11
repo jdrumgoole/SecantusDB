@@ -16,16 +16,21 @@ Endpoints:
   ``grantRolesToUser`` / ``revokeRolesFromUser`` as needed
 * ``GET /users/{db}/{user}/drop-confirm`` — drop modal
 * ``DELETE /users/{db}/{user}`` — dropUser
-* ``GET /roles`` — read-only built-in roles + their actions
+* ``GET /roles[?db=...]`` — built-in roles + their actions, plus any
+  custom roles the target reports, with a create form
+* ``POST /roles[?db=...]`` — createRole
+* ``POST /roles/{db}/{role}/drop`` — dropRole
 """
 
 from __future__ import annotations
 
 import contextlib
 from typing import Any
+from urllib.parse import quote
 
+from bson import json_util
 from fastapi import APIRouter, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from secantus.admin import capabilities
@@ -307,5 +312,87 @@ def roles_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
         "pages/roles.html",
-        {"title": "Roles", "active": "roles", "rows": rows},
+        {
+            "title": "Roles",
+            "active": "roles",
+            "rows": rows,
+            "db_name": request.query_params.get("db") or "admin",
+            "notice": request.query_params.get("notice") or None,
+            "error": None,
+        },
+    )
+
+
+def _roles_page_with_error(request: Request, db: str, message: str) -> HTMLResponse:
+    """Re-render /roles carrying an error, status 400."""
+    rows: list[dict[str, Any]] = []
+    for name in _all_role_names(request, db):
+        spec = BUILT_IN_ROLES.get(name)
+        rows.append(
+            {
+                "name": name,
+                "actions": sorted(spec.actions) if spec else [],
+                "flags": [] if spec else ["custom"],
+            }
+        )
+    templates = _templates(request)
+    return templates.TemplateResponse(
+        request,
+        "pages/roles.html",
+        {
+            "title": "Roles",
+            "active": "roles",
+            "rows": rows,
+            "db_name": db,
+            "notice": None,
+            "error": message,
+        },
+        status_code=400,
+    )
+
+
+def _parse_json_array(raw: str, *, field: str) -> list[Any]:
+    """Parse an Extended-JSON array. Empty text means an empty array."""
+    if not raw or not raw.strip():
+        return []
+    try:
+        parsed = json_util.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise MongoError(f"{field} is not valid Extended JSON: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise MongoError(f"{field} must be a JSON array.")
+    return parsed
+
+
+@router.post("/roles", response_class=HTMLResponse)
+async def create_role(request: Request) -> HTMLResponse:
+    form = await request.form()
+    db = request.query_params.get("db") or "admin"
+    name = str(form.get("name") or "").strip()
+    if not name:
+        return _roles_page_with_error(request, db, "Role name is required.")
+    try:
+        privileges = _parse_json_array(str(form.get("privileges") or ""), field="Privileges")
+        roles = _parse_json_array(str(form.get("roles") or ""), field="Inherited roles")
+        if not privileges and not roles:
+            raise MongoError(
+                "A role needs at least one privilege or one inherited role — "
+                "createRole with both empty grants nothing."
+            )
+        request.app.state.mongo.create_role(db, name, privileges=privileges, roles=roles)
+    except MongoError as exc:
+        return _roles_page_with_error(request, db, str(exc))
+    return RedirectResponse(
+        f"/roles?db={quote(db)}&notice={quote(f'Created role {name}')}", status_code=303
+    )
+
+
+@router.post("/roles/{db}/{role}/drop", response_class=HTMLResponse)
+def drop_role(request: Request, db: str, role: str) -> HTMLResponse:
+    try:
+        request.app.state.mongo.drop_role(db, role)
+    except MongoError as exc:
+        return _roles_page_with_error(request, db, str(exc))
+    return RedirectResponse(
+        f"/roles?db={quote(db)}&notice={quote(f'Dropped role {role}')}", status_code=303
     )
