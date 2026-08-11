@@ -3612,6 +3612,15 @@ def _value_to_node(value: Any) -> exp.Expression:
     return exp.Literal.string(str(value))
 
 
+#: Sentinel for a NULL bound with declared type VOID (oid 2278). pgjdbc's
+#: CallableStatement passes a function's OUT placeholder as a real argument
+#: bound as ``NULL::void`` (``select * from f($1,$2)`` for ``{?= call f(?)}``)
+#: — PostgreSQL's function resolution drops void arguments for exactly this
+#: convention, and so do we: the placeholder is removed from the call's
+#: argument list at substitution time.
+VOID_BIND = object()
+
+
 def substitute_parameters(stmt: exp.Expression, values: list[Any]) -> exp.Expression:
     """Replace ``$1`` / ``$2`` ... placeholders with bound literal nodes.
 
@@ -3628,6 +3637,15 @@ def substitute_parameters(stmt: exp.Expression, values: list[Any]) -> exp.Expres
             raise errors.syntax_error(f"invalid bind parameter ${param.name}") from exc
         if idx < 0 or idx >= len(values):
             raise errors.syntax_error(f"bind parameter ${param.name} has no value")
+        if values[idx] is VOID_BIND:
+            parent = param.parent
+            if isinstance(parent, (exp.Anonymous, exp.Func)) and param in (
+                parent.expressions or []
+            ):
+                param.pop()  # PG drops void args from the call (JDBC OUT slot)
+                continue
+            bound.append((param, exp.Null()))
+            continue
         bound.append((param, _value_to_node(values[idx])))
     # Swap each placeholder for its bound literal. Replacing them one at a time
     # through ``Expression.replace`` is quadratic — sqlglot re-parents *every*

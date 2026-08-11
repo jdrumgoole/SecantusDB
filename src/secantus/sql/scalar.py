@@ -2857,6 +2857,24 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         from secantus.sql import functions as _functions
 
         return _functions.evaluate_scalar_by_name(name, args, ctx.session)
+    if name in ("lo_creat", "lo_create", "lo_unlink") and ctx is not None:
+        # SQL-callable large-object management (``INSERT … VALUES (lo_creat(-1))``,
+        # ``SELECT lo_unlink(lo) FROM …`` — per-row column arguments included).
+        # The read/write surface (loread/lowrite/…) stays Fastpath-only, which
+        # is the only way pgjdbc drives it.
+        import struct as _struct
+
+        from secantus.sql import largeobjects as _lo
+
+        packed = [_struct.pack(">i", int(a)) for a in args]
+        result = _lo.call(
+            _lo.LO_PROC_OIDS[name],
+            packed,
+            storage=ctx.storage,
+            db=ctx.db,
+            session=ctx.session,
+        )
+        return _struct.unpack(">i", result)[0]
     raise errors.feature_not_supported(f"function {name}() is not supported in this context")
 
 

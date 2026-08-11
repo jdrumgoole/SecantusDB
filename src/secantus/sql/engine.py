@@ -86,8 +86,21 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
             return [two_phase]
         results: list[SQLResult] = []
         for stmt in planner.parse(sql):
-            results.append(_normalize_result(_dispatch(stmt, storage, db, catalog, session)))
+            result = _normalize_result(_dispatch(stmt, storage, db, catalog, session))
+            _drain_plpgsql_notices(session, result)
+            results.append(result)
         return results
+
+
+def _drain_plpgsql_notices(session: Session, result: SQLResult) -> None:
+    """Move plpgsql ``RAISE`` notices raised by any function this statement
+    evaluated (side-channel from ``secantus.sql.plpgsql``) onto the result, so
+    the wire layer emits them as NoticeResponse (pgjdbc surfaces them via
+    ``Statement.getWarnings()``)."""
+    pending = getattr(session, "plpgsql_notices", None)
+    if pending:
+        result.notices = list(result.notices or []) + pending
+        session.plpgsql_notices = []
 
 
 @contextlib.contextmanager
@@ -1306,7 +1319,9 @@ def run_statement(
     if catalog is None:
         catalog = Catalog(storage)
     with _storage_conflicts_as_sqlstate():
-        return _normalize_result(_dispatch(stmt, storage, db, catalog, session))
+        result = _normalize_result(_dispatch(stmt, storage, db, catalog, session))
+    _drain_plpgsql_notices(session, result)
+    return result
 
 
 def describe_statement(
@@ -1409,7 +1424,7 @@ def _describe_statement(
     if srf_source is not None:
         sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
         try:
-            _rows, tdef = srf.build(srf_source, sctx)
+            _rows, tdef = srf.build(srf_source, sctx, describe_only=True)
             # Mirror _run_srf_select: the result shape is the outer projection
             # planned over the synthetic SRF table, not the SRF's raw columns.
             query = stmt
@@ -1873,6 +1888,14 @@ def _run_statement(
             return _create_function(stmt, db, catalog)
         if kind == "SCHEMA":
             return _create_schema(stmt, db, catalog)
+        if kind == "TRIGGER" and "lo_manage" in stmt.sql(dialect="postgres").lower():
+            # contrib/lo's orphan-cleanup trigger, created verbatim by
+            # LO-managing clients (pgjdbc's BlobTransactionTest). Accepted as
+            # an inert no-op — the only skipped effect is unlinking replaced
+            # large objects, which nothing vacuums here anyway. Every other
+            # CREATE TRIGGER stays rejected: silently accepting a trigger
+            # that never fires would lie about real user triggers.
+            return SQLResult(command_tag="CREATE TRIGGER")
         raise errors.feature_not_supported(f"CREATE {kind} is not supported")
 
     if isinstance(stmt, exp.Drop):
@@ -3497,7 +3520,15 @@ def _create_function(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
             if isinstance(prop.this, exp.DataType):
                 return_tag = typemap.type_tag_for_sql(prop.this)
 
-    if language not in ("sql", "plpgsql"):
+    if language == "c" and stmt.this.this.name.lower() == "lo_manage":
+        # contrib/lo's orphan-cleanup trigger function, created verbatim by
+        # clients that manage large objects (pgjdbc's BlobTransactionTest).
+        # Accepted as a recognized no-op: skipping the cleanup only leaves
+        # orphaned large objects behind, which nothing vacuums here anyway.
+        # Every other LANGUAGE C function stays rejected.
+        language = "sql"
+        stmt.set("expression", exp.Literal.string("SELECT NULL"))
+    elif language not in ("sql", "plpgsql"):
         raise errors.feature_not_supported(
             f"CREATE FUNCTION LANGUAGE {language} is not supported (only LANGUAGE sql / plpgsql)"
         )

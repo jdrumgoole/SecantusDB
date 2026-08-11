@@ -2518,10 +2518,23 @@ shared storage engine or building large new protocol subsystems:
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
     failed statements in a transaction.
-  - **Large objects** (11, `BlobTest`): the fastpath `lo_creat` / `lo_open`
-    protocol is unimplemented (`The fastpath function lo_creat is unknown`).
-    Whole-feature gap, not a bug.
-  - **DateTest date offsets** (21) — see the dedicated section below; the
+  - ~~**Large objects** (11, `BlobTest`)~~ — FIXED (the `pg-large-objects`
+    slice): the Fastpath sub-protocol + `lo_*` built-ins landed
+    (`secantus/sql/largeobjects.py`), plus the surrounding pieces pgjdbc's
+    callable shape needs (UDF-in-FROM typed by declared return type,
+    describe-without-executing, void-arg drop, plpgsql `RAISE`, `lo_manage`
+    accepts). `BlobTest` 28/28, `BlobTransactionTest` 1/1, `CallableStmtTest`
+    14/14, `CleanupSavepointsWithFastpathTest` 10/10 — all four were zeroed
+    before. Known divergences, deliberately accepted:
+    - **LO descriptors close at session end, not transaction end** (PG closes
+      them at commit/rollback). No gauge test distinguishes the two.
+    - **`lo_manage` trigger DDL is an inert no-op** — replaced large objects
+      are never unlinked by the trigger (nothing vacuums orphans here anyway).
+      Every other `CREATE TRIGGER` stays rejected.
+    - **`lo_import` / `lo_export` are absent** (server-side file I/O; nothing
+      drives them over the wire in the gauges).
+  - ~~**DateTest date offsets** (21)~~ — FIXED across several slices; now
+    **192/192** (re-measured 2026-08-12) — see the dedicated section below; the
     shape is now measured rather than guessed at.
   - **`bind parameter $N has no value`** (8, BatchedInsertReWrite): pgjdbc's
     insert-rewrite batches leave a parameter unbound on a re-written statement.
@@ -5314,7 +5327,16 @@ distinct problems, triaged from the run logs:
   collection is 1.46s — the wedge needs the accumulated-churn cache
   state. Same WT-livelock family as the chunked-write / pinned-snapshot
   fixes; likely WT wants the whole dirty tree evicted before the drop's
-  exclusive dhandle access, and eviction thrashes. Repro shape:
+  exclusive dhandle access, and eviction thrashes. Repro attempts (2026-08-11, all NEGATIVE — drops sub-second): 3-4
+  rounds x 1M-doc 4-writer churn then drop-oldest; 1KB payloads (4GB
+  written) then drop-freshest-still-dirty; 5x drop-recreate cycles on the
+  same names. So the wedge needs more than churn volume, dirty-cache
+  drops, or name reuse alone — the incident server had hours of mixed
+  sweep history (SIGTERM'd writers mid-batch, dozens of collections,
+  the venv-staged binary). Note the Rust server DOES run a checkpoint
+  thread (`checkpoint_seconds`), unlike the Python server. Next attempt
+  should replay the original pre-drop harness verbatim for multiple full
+  sweep runs on one daemon. Original repro shape:
   `bench.concurrency` rows without the fresh-collection-names harness fix
   (drop a prior row's collection mid-churn). Also note: a drop queued
   behind live writers starves indefinitely (lock fairness) — the bench
@@ -5548,11 +5570,13 @@ normalises an aware datetime to UTC and `0001-01-01 00:00+05:00` is year zero
 there. It surfaced immediately as 14 fresh `internal error`s, and those
 extremes now keep their wall clock as they did before.
 
-`DateTest` 21 -> 8 across the session. **Remaining 8** are all
-`expected: <1950-02-07>`, so the same shape by yet another route — re-run the
-capture and diff the Bind parameters for the failing cases specifically; the
-proxy now records their formats and values, so the next pass should name it
-directly rather than by elimination.
+`DateTest` 21 -> 8 across the session. ~~**Remaining 8** are all
+`expected: <1950-02-07>`~~ — RESOLVED: re-measured on the `pg-large-objects`
+branch (2026-08-12), `DateTest` is **192/192, 0 failed**. The last 8 cleared
+with fixes that landed between the capture session and this measurement (the
+offset-date Bind widening + timestamptz param-type threading above, plus the
+subsequent timestamptz-session-zone and BC-timestamp slices); no further
+capture pass was needed.
 
 `TimezoneTest` is unchanged at 7 and untouched by any of this: its failures are
 `timestamptz` TEXT comparisons (`2005-01-01 12:00:00+00`), an interval-style

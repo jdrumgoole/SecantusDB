@@ -164,6 +164,13 @@ class SqlInto:
 
 
 @dataclass
+class Raise:
+    level: str  # NOTICE / WARNING / INFO / LOG / DEBUG / EXCEPTION
+    template: str  # plpgsql format string ('%' = next argument)
+    arg_exprs: list[str]
+
+
+@dataclass
 class SqlExec:
     query: str  # a bare INSERT/UPDATE/DELETE/SELECT run for side effects
 
@@ -302,7 +309,9 @@ class _Parser:
             query = "SELECT " + self._raw(lo, self.i)
             self.i += 1
             return SqlExec(query)
-        if self._is_kw(tok, "raise", "loop", "while", "for", "case", "execute", "foreach"):
+        if self._is_kw(tok, "raise"):
+            return self._parse_raise()
+        if self._is_kw(tok, "loop", "while", "for", "case", "execute", "foreach"):
             raise errors.feature_not_supported(
                 f"plpgsql statement {tok.val.upper()} is not supported"
             )
@@ -328,6 +337,55 @@ class _Parser:
         raise errors.feature_not_supported(
             f"plpgsql statement starting with {tok.val!r} is not supported"
         )
+
+    def _parse_raise(self) -> Raise:
+        """``RAISE [level] 'format' [, expr]* ;`` — bare ``RAISE 'x'`` is an
+        EXCEPTION, exactly PG's default level."""
+        self.i += 1  # RAISE
+        level = "exception"
+        tok = self._peek()
+        if (
+            tok is not None
+            and tok.kind == "word"
+            and tok.val.lower() in ("debug", "log", "info", "notice", "warning", "exception")
+        ):
+            level = tok.val.lower()
+            self.i += 1
+        tok = self._peek()
+        if tok is None or tok.kind != "str":
+            raise errors.feature_not_supported("RAISE requires a string format in this interpreter")
+        template = tok.val
+        # The tokenizer keeps the literal's surrounding quotes and doubled
+        # inner quotes; RAISE wants the decoded text.
+        if len(template) >= 2 and template[0] == "'" and template[-1] == "'":
+            template = template[1:-1].replace("''", "'")
+        self.i += 1
+        arg_exprs: list[str] = []
+        while True:
+            tok = self._peek()
+            if tok is not None and tok.kind == "sym" and tok.val == ",":
+                self.i += 1
+                lo = self.i
+                # one expression: up to the next top-level comma or semicolon
+                depth = 0
+                while True:
+                    cur = self._peek()
+                    if cur is None:
+                        break
+                    if cur.kind == "sym" and cur.val == "(":
+                        depth += 1
+                    elif cur.kind == "sym" and cur.val == ")":
+                        depth -= 1
+                    elif depth == 0 and (
+                        cur.kind == "semi" or (cur.kind == "sym" and cur.val == ",")
+                    ):
+                        break
+                    self.i += 1
+                arg_exprs.append(self._raw(lo, self.i))
+                continue
+            break
+        self._consume_optional_semi()
+        return Raise(level.upper(), template, arg_exprs)
 
     def _consume_optional_semi(self) -> None:
         cur = self._peek()
@@ -523,6 +581,25 @@ class _Runner:
             return
         if isinstance(st, SqlInto):
             self._run_into(st, env)
+            return
+        if isinstance(st, Raise):
+            parts = st.template.split("%")
+            vals = [self._eval(e, env) for e in st.arg_exprs]
+            msg = parts[0]
+            for i, part in enumerate(parts[1:]):
+                v = vals[i] if i < len(vals) else ""
+                msg += ("" if v is None else str(v)) + part
+            if st.level == "EXCEPTION":
+                raise errors.SQLError("P0001", msg)
+            # Side-channel to the enclosing statement's SQLResult: the engine
+            # drains ``session.plpgsql_notices`` into ``result.notices`` after
+            # each statement, and the wire layer emits NoticeResponse from
+            # there (pgjdbc's testRaiseNotice reads them via getWarnings()).
+            session = getattr(self.ctx, "session", None)
+            if session is not None:
+                if not hasattr(session, "plpgsql_notices"):
+                    session.plpgsql_notices = []
+                session.plpgsql_notices.append((st.level, msg))
             return
         if isinstance(st, SqlExec):
             if st.query.strip():

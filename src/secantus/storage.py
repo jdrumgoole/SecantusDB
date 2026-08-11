@@ -3909,11 +3909,18 @@ class Storage:
             handle.session.begin_transaction()
             handle.began = True
         with self._install_txn_session(handle):
+            # Save/restore rather than clear: a nested entry (a scalar function
+            # like ``lo_creat`` running storage ops inside a statement that is
+            # itself inside the transaction) must not strip the outer entry's
+            # marker — that made the enclosing INSERT run ``_batch_transaction``
+            # against the transaction's session and hit WT's "begin_transaction
+            # not permitted in a running transaction".
+            prev_user_txn = getattr(self._tls, "user_txn", None)
             self._tls.user_txn = handle
             try:
                 yield
             finally:
-                self._tls.user_txn = None
+                self._tls.user_txn = prev_user_txn
 
     def commit_user_transaction(
         self,
