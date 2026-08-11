@@ -182,12 +182,23 @@ def test_shard_spec_parses_and_rejects(monkeypatch):
             runner._shard_spec()
 
 
-def test_round_robin_shards_partition_exactly(monkeypatch):
-    classes = [f"C{i}" for i in range(11)]
-    monkeypatch.setattr(runner, "_test_classes", lambda: classes)
-    parts = [runner._test_classes()[k::3] for k in range(3)]
-    assert sorted(sum(parts, [])) == sorted(classes)
-    assert {len(p) for p in parts} == {4, 3}
+def test_weighted_shards_partition_exactly_and_split_the_whales(monkeypatch):
+    classes = [f"org.postgresql.test.jdbc2.C{i}" for i in range(20)] + [
+        "org.postgresql.test.jdbc2.CopyLargeFileTest",
+        "org.postgresql.test.jdbc2.AutoRollbackTest",
+        "org.postgresql.test.jdbc2.BatchFailureTest",
+    ]
+    parts = runner._shard_classes(classes, 4)
+    assert sorted(sum(parts, [])) == sorted(classes)  # exact partition
+    # The heavy classes must land in distinct shards — the whole point of the
+    # weighted assignment (a plain round-robin once put all three in one
+    # shard, a 44-minute straggler beside three ~15-minute siblings).
+    homes = {
+        whale: next(i for i, s in enumerate(parts) if any(c.endswith(whale) for c in s))
+        for whale in ("CopyLargeFileTest", "AutoRollbackTest", "BatchFailureTest")
+    }
+    assert len(set(homes.values())) == 3, homes
+    assert runner._shard_classes(classes, 4) == parts  # deterministic
 
 
 def test_merge_accepts_a_complete_shard_set(tmp_path):

@@ -58,6 +58,42 @@ def _shard_spec() -> tuple[int, int] | None:
     return int(m.group(1)), int(m.group(2))
 
 
+#: Rough per-class duration weights for shard balancing, minutes-scale, from
+#: CI runs of the unsharded lane (everything absent defaults to 1). Only the
+#: RATIOS matter, and only for the heavy classes: the first sharded run used a
+#: plain round-robin split and the three heaviest classes all landed in the
+#: same shard (alphabetical indexes 1, 5, and 21 — all ≡ 1 mod 4), making it
+#: a 44-minute straggler next to three ~15-minute siblings. Stale weights
+#: degrade balance, never correctness — the partition stays exact.
+_CLASS_WEIGHTS = {
+    "CopyLargeFileTest": 10,
+    "AutoRollbackTest": 8,
+    "BatchFailureTest": 4,
+    "DateTest": 3,
+    "BatchExecuteTest": 2,
+    "TimestampTest": 2,
+    "ResultSetTest": 2,
+    "PreparedStatementTest": 2,
+}
+
+
+def _shard_classes(classes: list[str], n: int) -> list[list[str]]:
+    """Deterministically partition ``classes`` into ``n`` balanced shards:
+    heaviest-first greedy assignment to the least-loaded shard (LPT), weights
+    from ``_CLASS_WEIGHTS``. Every class lands in exactly one shard."""
+    order = sorted(
+        classes,
+        key=lambda c: (-_CLASS_WEIGHTS.get(c.rsplit(".", 1)[-1], 1), c),
+    )
+    shards: list[list[str]] = [[] for _ in range(n)]
+    loads = [0] * n
+    for cls in order:
+        i = loads.index(min(loads))
+        shards[i].append(cls)
+        loads[i] += _CLASS_WEIGHTS.get(cls.rsplit(".", 1)[-1], 1)
+    return [sorted(s) for s in shards]
+
+
 def _raw_out_path(shard: tuple[int, int] | None) -> Path:
     if shard is None:
         return RAW_OUT
@@ -210,7 +246,7 @@ def main() -> int:
         classes = _test_classes()
         if shard is not None:
             k, n = shard
-            classes = classes[k - 1 :: n]
+            classes = _shard_classes(classes, n)[k - 1]
             print(f"pgjdbc shard {k}/{n}: {len(classes)} classes")
         for pattern in classes:
             cmd += ["--tests", pattern]
