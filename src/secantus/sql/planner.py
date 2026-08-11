@@ -20,6 +20,8 @@ import json
 import logging
 import math as _math
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from decimal import Decimal as _Decimal
@@ -10567,8 +10569,51 @@ def _fold_unquoted_identifiers(stmt: exp.Expression) -> None:
             ident.set("this", ident.this.lower())
 
 
+#: Parse cache: SQL text -> pristine AST statements, handed out as copies
+#: (``exp.Expression.copy()`` measures 3-4x cheaper than a parse). Entries are
+#: cached on SECOND sight — the first occurrence only leaves a marker — so
+#: workloads of mostly-unique statements (sqllogictest's corpus, inline-literal
+#: DML) pay nothing beyond a dict probe, while repeated text (per-connection
+#: re-Parse of the same prepared statements, fixture DDL repeated across
+#: thousands of tests) hits from the second occurrence on. The cached trees
+#: never leave the cache uncopied, so downstream mutation cannot poison them.
+_PARSE_CACHE_MAX = 4096
+_PARSE_CACHE: OrderedDict[str, list[exp.Expression] | None] = OrderedDict()
+_PARSE_CACHE_LOCK = threading.Lock()
+
+
 def parse(sql: str) -> list[exp.Expression]:
-    """Parse a (possibly multi-statement) SQL string into AST statements."""
+    """Parse a (possibly multi-statement) SQL string into AST statements.
+
+    Cached: repeated text returns copies of the cached trees (see
+    ``_PARSE_CACHE``); semantics are identical to an uncached parse because
+    ``_parse_uncached`` is a pure function of the text."""
+    with _PARSE_CACHE_LOCK:
+        entry = _PARSE_CACHE.get(sql)
+        if entry is not None:
+            _PARSE_CACHE.move_to_end(sql)
+    if entry is not None:
+        return [s.copy() for s in entry]
+    stmts = _parse_uncached(sql)
+    seen_before = False
+    with _PARSE_CACHE_LOCK:
+        seen_before = sql in _PARSE_CACHE
+        if not seen_before:
+            _PARSE_CACHE[sql] = None  # first sight: mark, don't pay the copy
+            _PARSE_CACHE.move_to_end(sql)
+            while len(_PARSE_CACHE) > _PARSE_CACHE_MAX:
+                _PARSE_CACHE.popitem(last=False)
+    if seen_before:
+        pristine = [s.copy() for s in stmts]  # copy OUTSIDE the lock
+        with _PARSE_CACHE_LOCK:
+            _PARSE_CACHE[sql] = pristine
+            _PARSE_CACHE.move_to_end(sql)
+            while len(_PARSE_CACHE) > _PARSE_CACHE_MAX:
+                _PARSE_CACHE.popitem(last=False)
+    return stmts
+
+
+def _parse_uncached(sql: str) -> list[exp.Expression]:
     # Cap the statement length before parsing — a cheap upper bound on parse cost
     # so a flood of oversized statements can't pin CPU (the Mongo wire has
     # analogous 16/48 MB size ceilings). 1 MB is far above any real query. (#194)
