@@ -1408,6 +1408,30 @@ def _mem_section() -> dict[str, Any]:
     }
 
 
+def _storage_engine_section(ctx: CommandContext) -> dict[str, Any]:
+    """mongod's ``serverStatus.storageEngine`` sub-document.
+
+    ``persistent`` reflects the real store: an ``:memory:`` instance is
+    explicitly *not* persistent, and saying otherwise would mislead any
+    tool that branches on it. Everything else is a property of WiredTiger
+    as SecantusDB configures it.
+    """
+    persistent = True
+    storage = getattr(ctx, "storage", None)
+    in_memory = getattr(storage, "in_memory", None)
+    if isinstance(in_memory, bool):
+        persistent = not in_memory
+    return {
+        "name": "wiredTiger",
+        "supportsCommittedReads": True,
+        "supportsPendingDrops": True,
+        "supportsSnapshotReadConcern": True,
+        "readOnly": False,
+        "persistent": persistent,
+        "backupCursorOpen": False,
+    }
+
+
 def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Real metrics from :class:`secantus.metrics.Metrics` if the server
     constructed one (production path); falls back to zeroed values for
@@ -1422,6 +1446,14 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         "pid": os.getpid(),
         "localTime": _dt.datetime.now(_dt.timezone.utc),
         "mem": _mem_section(),
+        # Storage-engine identity. Not decoration: drivers gate real
+        # behaviour on it. mongo-php-library's `skipIfTransactionsNotSupported`
+        # reads `storageEngine.name` and, when the key is missing, throws
+        # `UnexpectedValueException: Could not determine server storage engine`
+        # — which surfaces as ~27 ERRORED transaction tests rather than the
+        # clean skip the helper intends. Reporting "wiredTiger" is honest:
+        # SecantusDB really is WiredTiger-backed, the same engine mongod uses.
+        "storageEngine": _storage_engine_section(ctx),
         # Categorical self-identification: real mongod never has this key.
         # Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
         # checks it to prove it's talking to SecantusDB rather than an

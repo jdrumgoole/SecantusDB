@@ -1311,6 +1311,9 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     let open_cursors = ctx.cursors().map(|c| c.len()).unwrap_or(0) as i64;
     // Real counts when the server supplied them; zeros off-server (unit tests).
     let conns = ctx.conn_stats.unwrap_or_default();
+    // Defaults to persistent when there is no storage (unit-test contexts),
+    // matching the Python server's fallback rather than erroring the command.
+    let persistent = ctx.storage().map(|s| !s.in_memory()).unwrap_or(true);
     Ok(doc! {
         "host": "secantus",
         "version": crate::SERVER_VERSION,
@@ -1342,6 +1345,23 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         "opcounters": {
             "insert": 0i32, "query": 0i32, "update": 0i32,
             "delete": 0i32, "getmore": 0i32, "command": 0i32,
+        },
+        // Storage-engine identity. Drivers gate real behaviour on this:
+        // mongo-php-library's `skipIfTransactionsNotSupported` reads
+        // `storageEngine.name` and throws "Could not determine server storage
+        // engine" when the key is absent, turning ~27 transaction tests into
+        // ERRORs instead of the clean skip the helper intends. Reporting
+        // "wiredTiger" is honest — SecantusDB is WiredTiger-backed, the same
+        // engine mongod uses. Kept byte-identical to the Python server's
+        // `_storage_engine_section`.
+        "storageEngine": {
+            "name": "wiredTiger",
+            "supportsCommittedReads": true,
+            "supportsPendingDrops": true,
+            "supportsSnapshotReadConcern": true,
+            "readOnly": false,
+            "persistent": persistent,
+            "backupCursorOpen": false,
         },
         "network": { "numRequests": 0i32, "bytesIn": 0i32, "bytesOut": 0i32 },
         // Categorical self-identification: real mongod never has this key.
@@ -1746,6 +1766,26 @@ mod parity_tests {
         )
         .unwrap();
         assert_eq!(reply.get_f64("ok").unwrap_or(0.0), 1.0, "{reply:?}");
+    }
+
+    /// mongo-php-library's `skipIfTransactionsNotSupported` reads
+    /// `storageEngine.name`, and throws "Could not determine server storage
+    /// engine" when it is absent — erroring ~27 transaction tests rather than
+    /// skipping them. Must stay byte-identical to the Python server's
+    /// `_storage_engine_section`.
+    #[test]
+    fn server_status_reports_wiredtiger_storage_engine() {
+        let mut c = ctx();
+        c = c.with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()));
+        let reply = server_status(&doc! {"serverStatus": 1}, &mut c).unwrap();
+        let engine = reply.get_document("storageEngine").expect("storageEngine");
+        assert_eq!(engine.get_str("name").unwrap(), "wiredTiger");
+        assert!(engine.get_bool("supportsCommittedReads").unwrap());
+        assert!(engine.get_bool("supportsSnapshotReadConcern").unwrap());
+        assert!(!engine.get_bool("readOnly").unwrap());
+        // No storage attached (unit context) falls back to persistent, matching
+        // the Python server rather than failing the command.
+        assert!(engine.get_bool("persistent").unwrap());
     }
 
     /// mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read

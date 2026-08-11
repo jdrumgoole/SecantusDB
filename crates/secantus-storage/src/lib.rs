@@ -3423,6 +3423,15 @@ impl Drop for Storage {
 }
 
 impl Storage {
+    /// True when this store is the non-persistent (`in_memory=true`) variant.
+    ///
+    /// Read by `serverStatus.storageEngine.persistent`, which must not claim
+    /// durability an in-memory store does not have. Mirrors the Python
+    /// `Storage.in_memory` property.
+    pub fn in_memory(&self) -> bool {
+        self.in_memory
+    }
+
     /// Open (creating if needed) an on-disk database at `home` with the default
     /// SecantusDB WiredTiger config, bootstrapping the table schema.
     pub fn open(home: &str) -> Result<Storage> {

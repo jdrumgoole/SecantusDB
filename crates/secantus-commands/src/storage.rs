@@ -124,6 +124,16 @@ pub struct ChangeStreamBatch {
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
+    /// True when the store is non-persistent (WiredTiger `in_memory=true`).
+    ///
+    /// Read by `serverStatus.storageEngine.persistent`. Defaults to `false`
+    /// (i.e. persistent) so test fakes, which are not the thing whose
+    /// durability anyone is asking about, need not implement it; the
+    /// WiredTiger-backed adapter forwards to the real flag.
+    fn in_memory(&self) -> bool {
+        false
+    }
+
     /// The current cluster time WITHOUT advancing it — for reply gossip
     /// (`$clusterTime` / `operationTime` attached to every reply). The default
     /// returns a zero timestamp (test fakes don't track cluster time); the
