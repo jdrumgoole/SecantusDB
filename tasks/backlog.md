@@ -5302,6 +5302,23 @@ distinct problems, triaged from the run logs:
   exercised by any gauge: temp-table writes are also blocked (PG allows
   them in read-only txns), and `SELECT … FOR UPDATE` / `nextval()` are NOT
   blocked (PG blocks both).
+- [ ] **Rust server: `drop` of a heavily-churned collection wedges behind a
+  WT eviction storm.** Found by the 2026-08-11 concurrency-report refresh:
+  after rounds of multi-writer churn (~1M+ docs inserted per row), a
+  subsequent `drop` sat in dispatch 40+ minutes while every WT eviction
+  thread spun in `__evict_lru_pages` / `__evict_page` / `__tree_walk` —
+  and the storm did NOT self-recover after the client disconnected (the
+  daemon burned ~112% CPU for 1.5h with zero connections) nor respond to
+  SIGTERM (needed SIGKILL). Native stacks captured in the session
+  scratchpad (`server.sample`). Standalone `drop` of a fresh 1M-doc
+  collection is 1.46s — the wedge needs the accumulated-churn cache
+  state. Same WT-livelock family as the chunked-write / pinned-snapshot
+  fixes; likely WT wants the whole dirty tree evicted before the drop's
+  exclusive dhandle access, and eviction thrashes. Repro shape:
+  `bench.concurrency` rows without the fresh-collection-names harness fix
+  (drop a prior row's collection mid-churn). Also note: a drop queued
+  behind live writers starves indefinitely (lock fairness) — the bench
+  harness now avoids drops entirely (fresh per-row collection names).
 - [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
   first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
   …) are inside the ~347 documented standing failures of the 93.7% baseline

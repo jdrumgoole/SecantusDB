@@ -1,0 +1,16 @@
+{
+  "generated": "2026-08-11",
+  "host": "Darwin arm64 (Apple Silicon)",
+  "source": "bench.compare_servers --n 10000 --reps 5",
+  "workloads": [
+    {"key": "insert", "label": "insert (10k docs)", "md_label": "insert (10k docs)", "mongod_ms": 66.73, "rust_ms": 76.81, "py_ms": 255.12},
+    {"key": "find_indexed_range", "label": "find indexed range", "md_label": "find indexed range", "mongod_ms": 4.51, "rust_ms": 6.20, "py_ms": 29.82},
+    {"key": "find_all", "label": "find full scan", "md_label": "find full scan", "mongod_ms": 7.81, "rust_ms": 17.38, "py_ms": 58.97},
+    {"key": "find_filtered_scan", "label": "find filtered scan", "md_label": "find filtered scan", "mongod_ms": 5.75, "rust_ms": 9.14, "py_ms": 68.51},
+    {"key": "update_many_half", "label": "update_many (half)", "md_label": "update_many (half)", "mongod_ms": 35.03, "rust_ms": 37.31, "py_ms": 448.76},
+    {"key": "aggregate_group", "label": "aggregate $group", "md_label": "aggregate `$group`", "mongod_ms": 5.36, "rust_ms": 5.05, "py_ms": 91.70},
+    {"key": "aggregate_multistage", "label": "aggregate multi-stage", "md_label": "aggregate multi-stage", "mongod_ms": 5.75, "rust_ms": 9.27, "py_ms": 136.52},
+    {"key": "delete_many_half", "label": "delete_many (half)", "md_label": "delete_many (half)", "mongod_ms": 20.30, "rust_ms": 19.05, "py_ms": 244.79},
+    {"key": "change_stream_drain", "label": "change-stream drain", "md_label": "change-stream drain\\*", "mongod_ms": 50.95, "rust_ms": 33.27, "py_ms": 61.78}
+  ]
+}
