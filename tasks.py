@@ -1014,7 +1014,7 @@ def validate_pgjdbc(c: Context, shard: str = "") -> None:
         k = shard.split("/", 1)[0]
         raw = pathlib.Path(f".validation/pgjdbc-raw-shard-{k}.json")
         raw.unlink(missing_ok=True)  # same freshness discipline as _run_gauge
-        result = c.run(
+        c.run(
             f"SECANTUS_PGJDBC_SHARD={shard} uv run --no-sync python -m pgjdbc_validation.runner",
             pty=True,
             warn=True,  # failing tests still produce the raw artifact — the deliverable
@@ -1024,10 +1024,13 @@ def validate_pgjdbc(c: Context, shard: str = "") -> None:
         if not raw.exists():
             raise Exit(f"pgjdbc shard {shard} produced no {raw} — the runner never ran")
         print(f"\nWrote {raw} (shard {shard}; merge with validate-pgjdbc-report)")
-        if result.exited:
-            # Keep the unsharded lane's semantics: standing test failures make
-            # the job red (gradle's raw exit), the raw artifact still ships.
-            raise Exit(f"pgjdbc shard {shard}: gradle exited {result.exited}", code=result.exited)
+        # Gradle's exit is deliberately NOT propagated — same semantics as the
+        # unsharded task (_run_gauge's warn=True): standing test failures are
+        # the report's content, not a job failure, and a red step would skip
+        # the artifact-upload steps that ship the raw to the merge job (the
+        # first sharded run failed exactly that way: four red shards, zero
+        # artifacts, and a merge with nothing to merge). A shard is red only
+        # when it produced no raw at all (the Exit above).
         return
     _run_gauge(
         c,
