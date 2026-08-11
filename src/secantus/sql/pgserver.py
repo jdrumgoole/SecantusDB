@@ -156,6 +156,18 @@ def _parse_binary_copy(
         raise errors.SQLError("22P04", "incomplete binary COPY data") from None
 
 
+def _tune_client_socket(conn: socket.socket) -> None:
+    """Disable Nagle on an accepted client socket. Reply paths write small
+    frames back-to-back (a reply then ReadyForQuery, one batch item's result
+    then the next); with Nagle on, the second write waits for the peer's
+    delayed ACK — ~40ms per round trip on Linux, invisible on macOS loopback.
+    pgjdbc's generated-keys batches (1000 single-row round trips per test)
+    measured 41.5s per test in CI against 0.2s locally from exactly this.
+    Real servers (mongod, PostgreSQL) set TCP_NODELAY unconditionally."""
+    with contextlib.suppress(OSError):
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
 class SecantusPGServer:
     def __init__(
         self,
@@ -309,6 +321,7 @@ class SecantusPGServer:
                 conn, addr = self._socket.accept()
             except OSError:
                 return
+            _tune_client_socket(conn)
             # Enforce the connection cap before spawning a handler, and register
             # the socket under the lock so the count is accurate (the handler
             # removes it on exit). An over-cap accept is closed immediately — the

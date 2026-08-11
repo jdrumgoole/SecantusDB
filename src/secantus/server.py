@@ -68,6 +68,18 @@ DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
 DEFAULT_MAX_CONNECTIONS = 1000
 
 
+def _tune_client_socket(conn: socket.socket) -> None:
+    """Disable Nagle on an accepted client socket. Reply paths write small
+    frames back-to-back (a reply then ReadyForQuery, one batch item's result
+    then the next); with Nagle on, the second write waits for the peer's
+    delayed ACK — ~40ms per round trip on Linux, invisible on macOS loopback.
+    pgjdbc's generated-keys batches (1000 single-row round trips per test)
+    measured 41.5s per test in CI against 0.2s locally from exactly this.
+    Real servers (mongod, PostgreSQL) set TCP_NODELAY unconditionally."""
+    with contextlib.suppress(OSError):
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
 class SecantusDBServer:
     def __init__(
         self,
@@ -337,6 +349,7 @@ class SecantusDBServer:
                 conn, addr = self._socket.accept()
             except OSError:
                 return
+            _tune_client_socket(conn)
             # Refuse new connections beyond the cap. A flood-DoS attacker
             # would otherwise spawn a thread per accepted socket. We close
             # the socket immediately rather than queuing — clients should
