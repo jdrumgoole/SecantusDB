@@ -120,23 +120,46 @@ into the thread-local, oplog entries buffered until commit). Conformance:
 `tests/test_transactions.py` (pymongo-driven), `tests/test_transaction_registry.py`,
 `tests/test_storage_user_txn.py`. Known divergences, all deliberate:
 
-- [ ] **Non-transactional writers don't block until the transaction ends** —
-  mongod parks a plain writer that hits a transaction's uncommitted write until
-  commit/abort. SecantusDB retries in a bounded backoff loop
-  (`storage._retry_write_conflicts`, ~5s deadline) and then surfaces 112
-  `WriteConflict`. A plain writer can therefore fail against a long-lived open
-  transaction where mongod would have waited the full
-  `transactionLifetimeLimitSeconds`.
-- [ ] **Cross-transaction unique-index enforcement can leak** — index-entry
-  keys embed the doc's id_key, so two different docs violating the same unique
-  constraint from a transaction + a concurrent writer don't collide on a WT key
-  and both commits can succeed. mongod prevents this with prepared conflicts.
-  Same-key (`_id`) conflicts ARE caught (WT write-write conflict → 112).
-- [ ] **Failpoint-injected errors on in-transaction statements don't abort the
-  transaction** — the `failCommand` short-circuit runs before transaction
-  resolution so retryable-commit tests (inject once, retry succeeds) work. If a
-  unified test asserts transient labels on injected in-txn statement errors,
-  the label must come from the failpoint's own `errorLabels` data.
+- [x] **Non-transactional writers DO block until the transaction ends — entry
+  was wrong; re-measured 2026-08-11.** The claim below (bounded ~5s backoff,
+  then 112 `WriteConflict`) does not reproduce on either server. Measured over
+  the wire: a holder thread opens a transaction, updates `{_id: 1}`, sleeps,
+  commits, while an outside client updates the same doc. The outside writer
+  parks for the full life of the transaction and then **succeeds** —
+  Rust `hold=2s → waited 1.73s`, `hold=8s → waited 7.72s`,
+  `hold=20s → waited 19.72s`; Python `hold=8s → waited 7.71s`. All four end
+  `{'txn': 'committed', 'outside': 'ok'}` with the final value reflecting both
+  writes. 20s is well past the claimed ~5s deadline, so there is no deadline to
+  hit. This matches mongod. Nothing to fix.
+- [x] **Cross-transaction unique-index enforcement can leak — FIXED (#809).**
+  Index-entry keys embed the RecordId, so two different docs violating the same
+  unique constraint never collided on a WT key, and the check was a probe read
+  through the caller's own snapshot — blind to a value an open transaction held
+  uncommitted. A transaction plus a concurrent writer could both commit;
+  reproduced 10/10 over the wire, silently, with both writers told they had
+  succeeded. Fixed by porting the Python server's #775 design: a
+  `secantus_unique_keys` table keyed on the VALUE alone (not value+RecordId),
+  claimed with `overwrite=false` so WiredTiger refuses the second claim itself.
+  Claims release only to their owning RecordId and are purged on collection /
+  database / index drop (#808's false-rejection lesson). `_id_` is excluded —
+  its uniqueness is already enforced by the `_id` index, and claiming it too
+  double-wrote every insert. Verified both directions: commit ⇒ the outside
+  writer gets DuplicateKey, abort ⇒ it succeeds; 0/25 plain-concurrency leaks
+  and 0/10 drop/recreate false rejections.
+- [x] **Failpoint-injected errors on in-transaction statements DO abort the
+  transaction — entry was wrong; re-measured 2026-08-11.** Measured on both
+  servers: `failCommand` injects `errorCode: 2` on an in-transaction `insert`,
+  then a second statement and a commit are attempted. Both servers give
+  identical, mongod-shaped results — injected statement `code=2`; the *next*
+  statement is refused with `code=251` `NoSuchTransaction` +
+  `errorLabels: ['TransientTransactionError']`; the commit likewise 251 +
+  `TransientTransactionError`; and the collection ends holding only the seed
+  doc, so no transaction write leaked. The label drivers key whole-transaction
+  retry off is therefore already present and does **not** need to come from the
+  failpoint's own `errorLabels` data. Note when probing this: use a non-SDAM
+  `errorCode`. `11600` (`InterruptedAtShutdown`) makes the driver mark the
+  topology unknown, so the follow-up fails on server selection and hides the
+  transaction state you're trying to observe.
 - [ ] **No `recoveryToken` / mongos pinning, no prepared transactions, no
   `maxCommitTimeMS`, no `serverStatus.transactions` metrics, no
   `afterClusterTime` enforcement** — multi-node machinery; out of scope.
@@ -757,7 +780,7 @@ Subtler than the above; these may bite specific test suites.
   - ~~**capped-collection tailable cursors** — php-ext `cursor-tailable_error-001`~~ **FIXED (0.5.4b17)** — the test opens a `tailable` query on a capped collection, iterates with awaitData polling, and expects a "collection dropped" error when the coll is dropped mid-iteration. Capped tailables ship (`e187fb7` + the 0.5.4b16 filter fix); dropping the collection now **tombstones** open tailable cursors (`CursorRegistry.kill_namespace` sets a `dropped` flag instead of removing them) so the next `getMore` returns `QueryPlanKilled` (175) "collection dropped: <ns>" — the message the php-ext test asserts. Non-tailable cursors are still removed (→ `CursorNotFound` 43, per mongo-c-driver's `error_document/getmore`). Regression: `tests/test_crud.py::test_tailable_drop_returns_collection_dropped`. (The sibling `cursor-destruct-001` — killCursors-on-destruct via the live `serverStatus.metrics.cursor.open.total` count — shipped in 0.5.3b11.)
   - Transaction-gated cases skip/fail under single-node topology (expected, same class as the Ruby `w:2` note above).
 - [ ] **mongo-c-driver (`libmongoc`) gauge landed (2026-06-19) — conformance gaps surfaced, not yet fixed.** New `c_validation` gauge builds the vendored driver's `test-libmongoc` from source (CMake) and runs a curated set of wire-protocol suites against an embedded daemon over `MONGOC_TEST_URI`. Driver pinned to `1.30.8`. Current (after the 0.5.4b9 fixes below, gauge-verified): **712 pass / 21 fail / 69 skip**; was **707 / 26 / 69** at landing — +5 from the five fixes below, zero regressions. The failure set is byte-identical across repeated full runs (deterministic, not flaky). 8 of the 26 are documented in `validation_summary/expected_failures.py` (`C` list — the RS-primary `hello` advertisement makes libmongoc's standalone/secondary server-type and `lastWriteDate`-absent assertions fail; IPv6 needs a v6 listener). The remaining ~18 are real divergences to chase (none block the gauge):
-  - **`maxMessageSizeBytes` split boundary** (`/BulkOperation/OP_MSG/max_msg_size`, "2 == 1") — a bulk write the C driver expects to split into 2 OP_MSGs goes out as 1; SecantusDB's advertised max-message-size / write-batch limits don't force the split. (Driver-side split decision; not addressed.)
+  - **`maxMessageSizeBytes` split boundary** (`/BulkOperation/OP_MSG/max_msg_size`, "2 == 1") — **NOT a splitting bug; re-diagnosed 2026-08-11.** The framing below ("the server doesn't split") is wrong, and chasing it wastes time. Measured: all three advertised limits are byte-identical to mongod on BOTH servers (`maxBsonObjectSize` 16777216, `maxMessageSizeBytes` 48000000, `maxWriteBatchSize` 100000), and the driver — which decides splitting itself, before sending — therefore has correct inputs. The test **PASSES standalone** (0.72s) and **passes alongside its `/BulkOperation/OP_MSG/*` sibling**; it fails only inside the full ~800-test run, and it fails on the **Python server too**, so it is not Rust-specific. That profile (isolation-clean, full-run-only, both servers) is test interference or accumulated state, the same class as the accepted go-gauge `TestChangeStream_ReplicaSet` harness race below — not a wire-limit divergence. Pinning it down means bisecting a ~10-minute full-gauge run; worth doing only if it ever blocks something. Original note:
   - ~~**`bypassDocumentValidation` on aggregate `$out`**~~ **FIXED (0.5.4b9)** — `$out` / `$merge` now enforce the destination collection's `validator` (when `validationAction: "error"`) unless the command set `bypassDocumentValidation`, raising `DocumentValidationFailure` (121). See `aggregate._enforce_target_validator` (`bypass_validation` threaded through `PipelineContext`).
   - ~~**getMore error-document shape**~~ **FIXED (0.5.4b9)** — dropping (or renaming) a collection now kills its open cursors (`CursorRegistry.kill_namespace`, called from `_drop` / `_rename_collection`), so a later `getMore` fails with `CursorNotFound` (43) instead of serving stale snapshot rows.
   - ~~**Decimal128 `batchSize`**~~ **FIXED (0.5.4b9)** — `find` / `aggregate` coerce a numeric `batchSize` of any BSON type via `_coerce_command_int` (Decimal128 → underlying Decimal → int).
@@ -769,9 +792,9 @@ Subtler than the above; these may bite specific test suites.
   - **`/command_monitoring/unified/writeConcernError`** — **flaky, not deterministic** (0.5.4b15 triage): a fresh full-run repro of the curated C include set has it **passing** (only `/Client/ipv6/single` + `/Collection/tailable/timeout` fail there now), so the earlier gauge report that listed it was a flaky red, not a reproducible state leak. The failpoint registry (`secantus.failpoints`) *is* per-server with no `appName` scoping, so a leaked `failCommand` from a prior test is a plausible mechanism, but it couldn't be reproduced in any isolable subset. Left as a watch item; if it recurs, add per-`appName` failCommand scoping (the mongod-faithful isolation) + audit failpoint teardown. **A real, separate bug found during this triage was fixed in 0.5.4b15**: a malformed `$and`/`$or`/`$nor` (non-array / empty / non-doc element) crashed the query engine into a generic `InternalError` instead of `BadValue` — see `query._match_clause` + the changelog.
   - ~~**State-ordering-dependent drop/rename/create** (`/Collection/drop`, `/Collection/rename`, `/Collection/index`, `/Database/drop`)~~ **FIXED (0.5.4b13)** — not state-ordering at all (misdiagnosis): each test ends with a DDL op carrying `writeConcern: {w: 99}` and asserts `assert_wc_oob_error` — for a server >= 4.3.3 (we advertise 7.0) that's `FailedToParse` (9) "w has to be a non-negative number and not greater than 50", because mongod caps numeric `w` at 50. SecantusDB was returning a `CannotSatisfyWriteConcern` (100) writeConcernError on a success instead. `commands._validate_write_concern` now rejects `w` outside `[0, 50]` with code 9 before the command runs (and `_drop_database` / `_rename_collection` now call it). Regression: `tests/test_crud.py::test_write_concern_w_above_50_is_parse_error`.
   - ~~**Atlas Search index management** (`/index-management/{list,drop,update,create}SearchIndex`)~~ **FIXED (0.5.4b18)** — `createSearchIndexes` / `updateSearchIndex` / `dropSearchIndex` commands and the `$listSearchIndexes` aggregation stage (+ `$search` / `$searchMeta` / `$vectorSearch`) are Atlas-only; a non-Atlas mongod fails them with a message naming Atlas. Now rejected with `CommandNotSupported` (115) + the shared `aggregate.SEARCH_INDEX_ATLAS_MSG` (the tests assert `errorContains: "Atlas"`). Regression: `tests/test_crud.py::test_atlas_search_index_commands_rejected` + `tests/test_aggregate.py::test_atlas_only_stage_rejected_with_atlas_message`.
-  - **Change streams excluded** — see §3.2 (the C-driver fixture would need a fuller fake-replset `replSetGetStatus` reporting ≥1 member; the standalone error we ship makes those tests skip).
+  - ~~**Change streams excluded**~~ **NOW RUNNING (#802, #804)** — `replSetGetStatus` reports the one-member roster `hello` already advertised, so the C fixture no longer skips the suites as standalone. 31 change-stream tests pass; the four defects that surfaced (resume-token error message, pipeline-stage code/message, resume-token *modification* not just removal, and `failGetMoreAfterCursorCheckout` + the `ResumableChangeStreamError` label) are all fixed.
   - **Fresh gauge number (0.5.4b18):** 720 pass / 13 fail / 69 skip. The 13 remaining are all documented-expected (ipv6 ×2, `last_write_date_absent` ×2, `select_server` ×4 — all RS-primary `hello` artifacts in `expected_failures.py`) or known/deferred (`BulkOperation/max_msg_size` driver-side split; `command_monitoring/writeConcernError` flaky). No clean actionable server divergences remain in this gauge.
-- [ ] **mongo-cxx-driver (`mongocxx`) gauge landed (2026-06-19) — conformance gaps surfaced, not yet fixed.** New `cxx_validation` gauge builds the vendored libmongoc (installed to a prefix) + the mongocxx `test_driver` Catch2 binary from source and runs it against an embedded daemon. Drivers pinned: mongocxx `r3.11.0` on libmongoc `1.30.8`. mongocxx's core tests hard-wire `mongodb://localhost:27017` (no `MONGOC_TEST_URI`-style override), so the gauge binds the daemon on **27017** (refuses to run if occupied). At landing: **880 pass / 9 fail / 9 skip (99.0%)** (Catch2 expands SECTIONs, so the testcase total > TEST_CASE count). After the 0.5.4b8 dup-index fix + the 0.5.4b9 fixes below + the 0.5.4b11 resume-token fix + the 0.5.4b12 `$currentOp` clientMetadata fix, the cxx gauge's real failures are **closed** (the prior `client metadata handshake` ×2 are fixed below). The remaining divergences to chase (none block the gauge):
+- [x] **mongo-cxx-driver (`mongocxx`) gauge — ALL GAPS CLOSED (#815); 890 pass / 0 fail / 9 skip = 100.0%, identical to the Python server.** First run ever made against the RUST server (2026-08-11): its tests bind port 27017 with no env override, so it needed the local mongod stopped, and the report on disk until then was a Python-server artifact. Three rust-only failures surfaced and were fixed — the change-stream resume token rewound to a positional high-water mark on an empty batch (losing the `ns` / `documentKey` a real token carries), and `$currentOp` reported neither `appName` nor `clientMetadata`, so the handshake test's scan matched nothing. Original landing note follows. New `cxx_validation` gauge builds the vendored libmongoc (installed to a prefix) + the mongocxx `test_driver` Catch2 binary from source and runs it against an embedded daemon. Drivers pinned: mongocxx `r3.11.0` on libmongoc `1.30.8`. mongocxx's core tests hard-wire `mongodb://localhost:27017` (no `MONGOC_TEST_URI`-style override), so the gauge binds the daemon on **27017** (refuses to run if occupied). At landing: **880 pass / 9 fail / 9 skip (99.0%)** (Catch2 expands SECTIONs, so the testcase total > TEST_CASE count). After the 0.5.4b8 dup-index fix + the 0.5.4b9 fixes below + the 0.5.4b11 resume-token fix + the 0.5.4b12 `$currentOp` clientMetadata fix, the cxx gauge's real failures are **closed** (the prior `client metadata handshake` ×2 are fixed below). The remaining divergences to chase (none block the gauge):
   - ~~**Duplicate-index conflict not rejected** (3 tests)~~ **FIXED (0.5.4b8)** — `createIndexes` now rejects same-name-different-key with `IndexKeySpecsConflict` (86) and same-name-different-options with `IndexOptionsConflict` (85), and returns `note: "all indexes already exist"` on an identical re-create so drivers see the no-op (`storage.create_index` + `commands._create_indexes`).
   - ~~**`$out` not last in pipeline not rejected**~~ **FIXED (0.5.4b9)** — `apply_pipeline` rejects a non-terminal `$out` / `$merge` with `Location40601` (40601) before executing any stage.
   - ~~**Change-stream invalid-pipeline error timing**~~ **FIXED (0.5.4b9)** — `validate_stage_names` now also validates `$match` filter syntax (unknown query operators → `QueryError`) up-front, so a change stream opened with `{$match: {$foo: -1}}` errors at aggregate (`.begin()`) time rather than at the first `getMore`.
