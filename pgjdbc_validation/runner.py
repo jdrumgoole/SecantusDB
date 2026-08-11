@@ -65,10 +65,15 @@ def _shard_spec() -> tuple[int, int] | None:
 #: same shard (alphabetical indexes 1, 5, and 21 — all ≡ 1 mod 4), making it
 #: a 44-minute straggler next to three ~15-minute siblings. Stale weights
 #: degrade balance, never correctness — the partition stays exact.
+#: Calibrated from sharded run 31451326038 (shard walls 11/14/24/38m with the
+#: previous guesses): BatchFailureTest dominates (its shard ran 38m), while
+#: CopyLargeFileTest went light once sequences allocate in batches. Per-class
+#: ``seconds`` now ride in the raw JSON, so recalibration is a read of the
+#: latest shard raws rather than a guess.
 _CLASS_WEIGHTS = {
-    "CopyLargeFileTest": 10,
-    "AutoRollbackTest": 8,
-    "BatchFailureTest": 4,
+    "BatchFailureTest": 24,
+    "AutoRollbackTest": 7,
+    "CopyLargeFileTest": 4,
     "DateTest": 3,
     "BatchExecuteTest": 2,
     "TimestampTest": 2,
@@ -306,6 +311,10 @@ def _aggregate(
             "tests": int(root.get("tests", 0)),
             "failures": int(root.get("failures", 0)) + int(root.get("errors", 0)),
             "skipped": int(root.get("skipped", 0)),
+            # Wall seconds for this class, straight from the JUnit XML — the
+            # evidence base for recalibrating _CLASS_WEIGHTS when shard walls
+            # drift apart.
+            "seconds": round(float(root.get("time", 0.0)), 1),
             "failed_tests": [],
         }
         for tc in root.iter("testcase"):
