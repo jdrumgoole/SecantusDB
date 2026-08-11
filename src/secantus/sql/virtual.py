@@ -1353,10 +1353,50 @@ def _function_signature(fn: dict) -> str:
     return ", ".join(parts)
 
 
+#: Built-in large-object functions, reflected so pgjdbc's LargeObjectManager
+#: can resolve their OIDs (it queries pg_proc joined to the pg_catalog
+#: namespace by name, then calls via the Fastpath sub-protocol — see
+#: ``secantus.sql.largeobjects``). ``(name, oid, rettype_oid, argtype_oids)``.
+_LO_PROCS = [
+    ("lo_open", 952, 23, "26 23"),
+    ("lo_close", 953, 23, "23"),
+    ("loread", 954, 17, "23 23"),
+    ("lowrite", 955, 23, "23 17"),
+    ("lo_lseek", 956, 23, "23 23 23"),
+    ("lo_creat", 957, 26, "23"),
+    ("lo_create", 715, 26, "26"),
+    ("lo_tell", 958, 23, "23"),
+    ("lo_unlink", 964, 23, "26"),
+    ("lo_truncate", 1004, 23, "23 23"),
+    ("lo_lseek64", 3170, 20, "23 20 23"),
+    ("lo_tell64", 3171, 20, "23"),
+    ("lo_truncate64", 3172, 23, "23 20"),
+]
+
+
 def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    """``pg_catalog.pg_proc`` — one row per user-defined ``CREATE FUNCTION`` (#130)."""
+    """``pg_catalog.pg_proc`` — one row per user-defined ``CREATE FUNCTION``
+    (#130), plus the built-in large-object functions in ``pg_catalog``."""
     oids = _function_oids(db, catalog)
-    rows = []
+    rows = [
+        {
+            "oid": oid,
+            "proname": name,
+            "pronamespace": _NS_OIDS["pg_catalog"],
+            "proowner": 10,
+            "prolang": _SQL_LANG_OID,
+            "prorettype": rettype,
+            "pronargs": len(argtypes.split()),
+            "pronargdefaults": 0,
+            "proargtypes": argtypes,
+            "proargnames": None,
+            "prosrc": name,
+            "prokind": "f",
+            "proretset": False,
+            "provariadic": 0,
+        }
+        for name, oid, rettype, argtypes in _LO_PROCS
+    ]
     for fn in _functions(db, catalog):
         key = f"{fn['name']}/{fn['nargs']}"
         argtypes = " ".join(str(_type_oid(t)) for t in (fn.get("param_types") or []))

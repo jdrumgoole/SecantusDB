@@ -102,6 +102,24 @@ def _is_srf_node(node: exp.Expression) -> bool:
     return False
 
 
+def _is_from_callable(node: exp.Expression) -> bool:
+    """Acceptance for FROM position ONLY — wider than ``_is_srf_node``.
+
+    Named SRFs, plus ANY function call in FROM position: pgjdbc's
+    CallableStatement rewrites ``{? = call f(?)}`` into
+    ``select * from f($1) as result``, so a user-defined function in
+    FROM must evaluate as a one-row source (``_values_and_tag`` falls
+    back to the scalar evaluator, which resolves catalog UDFs and
+    raises 42883 for genuinely unknown names — a FROM item that parses
+    as a call is never a real table). ``exp.Func`` rather than
+    ``exp.Anonymous`` because sqlglot parses some calls into dedicated
+    nodes — ``now()`` -> CurrentTimestamp — and pgjdbc's ``{call now()}``
+    must still work. A FROM-less ``SELECT f()`` projection must NOT take
+    this path (it would reroute every ordinary scalar call), which is why
+    ``fromless_projection`` keeps the strict predicate."""
+    return _is_srf_node(node) or isinstance(node, exp.Func)
+
+
 def _alias_parts(alias_node: exp.Expression | None) -> tuple[str | None, list[str]]:
     if alias_node is None:
         return None, []
@@ -122,7 +140,7 @@ def from_source(stmt: exp.Select) -> SrfSource | None:
     if isinstance(src, exp.Unnest):
         name, cols = _alias_parts(src.args.get("alias"))
         return SrfSource(src, bool(src.args.get("offset")), name, cols)
-    if isinstance(src, exp.Table) and _is_srf_node(src.this):
+    if isinstance(src, exp.Table) and _is_from_callable(src.this):
         name, cols = _alias_parts(src.args.get("alias"))
         return SrfSource(src.this, bool(src.args.get("ordinality")), name, cols)
     return None
@@ -164,16 +182,46 @@ def _default_name(node: exp.Expression) -> str:
     if isinstance(node, exp.Anonymous):
         base = str(node.this).rsplit(".", 1)[-1].lower()
         return "unnest" if base == "unnest" else base
+    if isinstance(node, exp.Func):
+        return node.sql_name().lower()
     return "?column?"
 
 
-def _values_and_tag(node: exp.Expression, ctx: Any) -> tuple[list[Any], str]:
-    """Generate the SRF's element values plus the value column's type tag."""
+def _tag_for_value(value: Any) -> str:
+    import datetime as _dt
+    from decimal import Decimal
+
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int4" if -(2**31) <= value < 2**31 else "int8"
+    if isinstance(value, float):
+        return "float8"
+    if isinstance(value, Decimal):
+        return "numeric"
+    if isinstance(value, _dt.datetime):
+        return "timestamptz" if value.tzinfo is not None else "timestamp"
+    if isinstance(value, _dt.date):
+        return "date"
+    if isinstance(value, str):
+        return "text"
+    return "any"
+
+
+def _values_and_tag(
+    node: exp.Expression, ctx: Any, describe_only: bool = False
+) -> tuple[list[Any], str]:
+    """Generate the SRF's element values plus the value column's type tag.
+
+    ``describe_only`` derives the column tag WITHOUT invoking catalog UDFs —
+    extended-protocol Describe must never run a side-effecting function body
+    (pgjdbc's batched ``{call f(?)}`` executed every insert twice: once at
+    Describe, once at Execute)."""
     from secantus.sql import scalar, typemap
 
     if isinstance(node, exp.Cast):
         # ``srf(...)::tag`` — generate, then coerce each element to the target.
-        values, _tag = _values_and_tag(node.this, ctx)
+        values, _tag = _values_and_tag(node.this, ctx, describe_only)
         cast_tag = typemap.type_tag_for_sql(node.to)
         if cast_tag is None:
             return values, "any"
@@ -228,6 +276,40 @@ def _values_and_tag(node: exp.Expression, ctx: Any) -> tuple[list[Any], str]:
                 if "g" not in flags:
                     break
             return rows, "text[]"
+    if isinstance(node, exp.Anonymous):
+        # Not a built-in SRF: evaluate as a scalar call (catalog UDFs included
+        # — pgjdbc's ``select * from f($1) as result`` callable shape) and
+        # yield its single row. The column's type tag comes from the
+        # function's declared return type — pgjdbc's CallableStatement
+        # cross-checks the result column's OID against the registered OUT
+        # type and refuses a mismatch. RETURNS SETOF stays unsupported.
+        tag = "any"
+        catalog = getattr(ctx, "catalog", None)
+        if catalog is not None:
+            fname = str(node.this).rsplit(".", 1)[-1].lower()
+            udf = catalog.get_function(ctx.db, fname, len(node.expressions or []))
+            if udf is not None and udf.get("return_tag"):
+                tag = udf["return_tag"]
+        if describe_only:
+            return [], tag
+        value = scalar.evaluate(node, _empty_scope, ctx)
+        return [value], tag
+    if isinstance(node, exp.Func):
+        # A call sqlglot parsed into a dedicated node (``now()`` ->
+        # CurrentTimestamp, ``version()`` -> CurrentVersion): session-info
+        # functions first, then the general scalar evaluator, tagging the
+        # column from the value.
+        session = getattr(ctx, "session", None)
+        if session is not None:
+            from secantus.sql import functions
+
+            try:
+                _name, value, tag = functions.evaluate_scalar(node, session)
+                return [value], tag
+            except errors.SQLError:
+                pass
+        value = scalar.evaluate(node, _empty_scope, ctx)
+        return [value], _tag_for_value(value)
     raise errors.feature_not_supported(f"unsupported set-returning function: {node.sql()}")
 
 
@@ -392,12 +474,17 @@ def _build_record(source: SrfSource, ctx: Any) -> tuple[list[dict[str, Any]], Ta
     return rows, TableDef(name=table_name, collection=table_name, columns=columns)
 
 
-def build(source: SrfSource, ctx: Any) -> tuple[list[dict[str, Any]], TableDef]:
+def build(
+    source: SrfSource, ctx: Any, describe_only: bool = False
+) -> tuple[list[dict[str, Any]], TableDef]:
     """Materialize the SRF's rows as documents and a synthetic single-source
-    ``TableDef`` describing the value (and optional ``WITH ORDINALITY``) columns."""
+    ``TableDef`` describing the value (and optional ``WITH ORDINALITY``) columns.
+
+    ``describe_only`` returns the shape without invoking catalog UDFs (empty
+    rows for those) — see ``_values_and_tag``."""
     if _is_record_srf(source.node):
         return _build_record(source, ctx)
-    values, tag = _values_and_tag(source.node, ctx)
+    values, tag = _values_and_tag(source.node, ctx, describe_only)
     default = _default_name(source.node)
     # A single-column SRF's column takes the explicit column alias, else the table
     # alias (Postgres: ``FROM generate_series(1,5) AS g`` names the column ``g``),

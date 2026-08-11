@@ -409,6 +409,40 @@ def empty_query_response() -> bytes:
     return _msg("I", b"")
 
 
+def parse_function_call(payload: bytes) -> tuple[int, list[bytes]]:
+    """Parse a Fastpath ``FunctionCall`` ('F') body → ``(fn_oid, args)``.
+
+    Layout (after the type byte + length the caller already consumed):
+    Int32 fn_oid, Int16 n_arg_format_codes, Int16[] formats, Int16 n_args,
+    then per arg Int32 length (-1 = NULL) + bytes, then Int16 result format.
+    Formats are accepted but ignored — the lo_* surface is binary-only, which
+    is the only format pgjdbc sends.
+    """
+    off = 0
+    (fn_oid,) = struct.unpack_from(">i", payload, off)
+    off += 4
+    (n_formats,) = struct.unpack_from(">h", payload, off)
+    off += 2 + 2 * n_formats
+    (n_args,) = struct.unpack_from(">h", payload, off)
+    off += 2
+    args: list[bytes] = []
+    for _ in range(n_args):
+        (alen,) = struct.unpack_from(">i", payload, off)
+        off += 4
+        if alen < 0:
+            args.append(b"")
+            continue
+        args.append(payload[off : off + alen])
+        off += alen
+    return fn_oid, args
+
+
+def function_call_response(result: bytes) -> bytes:
+    """Build a ``FunctionCallResponse`` ('V') carrying one binary result."""
+    body = struct.pack(">i", len(result)) + result
+    return b"V" + struct.pack(">i", len(body) + 4) + body
+
+
 def error_response(
     sqlstate: str,
     message: str,

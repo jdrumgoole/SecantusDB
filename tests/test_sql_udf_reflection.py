@@ -45,7 +45,7 @@ def test_pg_proc_rows(storage):
     rows = _rows(
         storage,
         "SELECT proname, pronargs, proargtypes, proargnames, prorettype, prokind "
-        "FROM pg_catalog.pg_proc ORDER BY proname",
+        "FROM pg_catalog.pg_proc WHERE oid >= 16384 ORDER BY proname",
     )
     assert rows == [
         ("add", 2, "23 23", ["a", "b"], 23, "f"),
@@ -82,7 +82,7 @@ def test_pg_get_function_arguments_and_result(storage):
     rows = _rows(
         storage,
         "SELECT proname, pg_get_function_arguments(oid), pg_get_function_result(oid) "
-        "FROM pg_catalog.pg_proc ORDER BY proname",
+        "FROM pg_catalog.pg_proc WHERE oid >= 16384 ORDER BY proname",
     )
     assert rows == [
         ("add", "a integer, b integer", "integer"),
@@ -101,4 +101,6 @@ def test_pg_get_functiondef(storage):
 
 def test_dropped_function_leaves_pg_proc(storage):
     run_sql(storage, DB, "DROP FUNCTION greet(text)", session=Session(database=DB))
-    assert _rows(storage, "SELECT proname FROM pg_catalog.pg_proc ORDER BY proname") == [("add",)]
+    assert _rows(
+        storage, "SELECT proname FROM pg_catalog.pg_proc WHERE oid >= 16384 ORDER BY proname"
+    ) == [("add",)]

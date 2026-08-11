@@ -2518,9 +2518,21 @@ shared storage engine or building large new protocol subsystems:
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
     failed statements in a transaction.
-  - **Large objects** (11, `BlobTest`): the fastpath `lo_creat` / `lo_open`
-    protocol is unimplemented (`The fastpath function lo_creat is unknown`).
-    Whole-feature gap, not a bug.
+  - ~~**Large objects** (11, `BlobTest`)~~ — FIXED (the `pg-large-objects`
+    slice): the Fastpath sub-protocol + `lo_*` built-ins landed
+    (`secantus/sql/largeobjects.py`), plus the surrounding pieces pgjdbc's
+    callable shape needs (UDF-in-FROM typed by declared return type,
+    describe-without-executing, void-arg drop, plpgsql `RAISE`, `lo_manage`
+    accepts). `BlobTest` 28/28, `BlobTransactionTest` 1/1, `CallableStmtTest`
+    14/14, `CleanupSavepointsWithFastpathTest` 10/10 — all four were zeroed
+    before. Known divergences, deliberately accepted:
+    - **LO descriptors close at session end, not transaction end** (PG closes
+      them at commit/rollback). No gauge test distinguishes the two.
+    - **`lo_manage` trigger DDL is an inert no-op** — replaced large objects
+      are never unlinked by the trigger (nothing vacuums orphans here anyway).
+      Every other `CREATE TRIGGER` stays rejected.
+    - **`lo_import` / `lo_export` are absent** (server-side file I/O; nothing
+      drives them over the wire in the gauges).
   - **DateTest date offsets** (21) — see the dedicated section below; the
     shape is now measured rather than guessed at.
   - **`bind parameter $N has no value`** (8, BatchedInsertReWrite): pgjdbc's
@@ -5314,7 +5326,16 @@ distinct problems, triaged from the run logs:
   collection is 1.46s — the wedge needs the accumulated-churn cache
   state. Same WT-livelock family as the chunked-write / pinned-snapshot
   fixes; likely WT wants the whole dirty tree evicted before the drop's
-  exclusive dhandle access, and eviction thrashes. Repro shape:
+  exclusive dhandle access, and eviction thrashes. Repro attempts (2026-08-11, all NEGATIVE — drops sub-second): 3-4
+  rounds x 1M-doc 4-writer churn then drop-oldest; 1KB payloads (4GB
+  written) then drop-freshest-still-dirty; 5x drop-recreate cycles on the
+  same names. So the wedge needs more than churn volume, dirty-cache
+  drops, or name reuse alone — the incident server had hours of mixed
+  sweep history (SIGTERM'd writers mid-batch, dozens of collections,
+  the venv-staged binary). Note the Rust server DOES run a checkpoint
+  thread (`checkpoint_seconds`), unlike the Python server. Next attempt
+  should replay the original pre-drop harness verbatim for multiple full
+  sweep runs on one daemon. Original repro shape:
   `bench.concurrency` rows without the fresh-collection-names harness fix
   (drop a prior row's collection mid-churn). Also note: a drop queued
   behind live writers starves indefinitely (lock fairness) — the bench

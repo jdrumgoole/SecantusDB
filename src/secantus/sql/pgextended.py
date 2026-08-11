@@ -1124,6 +1124,12 @@ class ExtendedSession:
                 fmt = formats[i]
             oid = prep.param_oids[i] if i < len(prep.param_oids) else 0
             value = _decode_param(raw, fmt, oid, self.session.wire_encoding)
+            if oid == 2278 and value is None:
+                # NULL declared as void: pgjdbc's function-OUT placeholder.
+                # ``substitute_parameters`` drops it from the call's argument
+                # list, mirroring PG's void-argument accommodation.
+                values.append(planner.VOID_BIND)
+                continue
             values.append(self._check_enum_param(oid, value))
         self.portals[portal] = Portal(portal, prep, values, result_formats=result_formats)
         return pgwire.bind_complete()

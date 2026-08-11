@@ -580,6 +580,9 @@ class SecantusPGServer:
                 return
             if msg.type == "X":  # Terminate
                 return
+            if msg.type == "F":  # Fastpath FunctionCall (pgjdbc large objects)
+                conn.sendall(self._handle_fastpath(session, msg.payload))
+                continue
             if msg.type == "Q":  # simple Query
                 try:
                     sql = pgwire.parse_query(msg.payload, session.wire_encoding)
@@ -605,6 +608,33 @@ class SecantusPGServer:
             notifications = self._pending_notification_bytes(session)
             if notifications or reply:
                 conn.sendall(notifications + (reply or b""))
+
+    def _handle_fastpath(self, session: Session, payload: bytes) -> bytes:
+        """One Fastpath FunctionCall ('F') cycle: FunctionCallResponse ('V') +
+        ReadyForQuery, or ErrorResponse + ReadyForQuery. pgjdbc's LargeObject
+        API is the (only known) client of this sub-protocol — it resolves the
+        ``lo_*`` OIDs from pg_proc, then calls by OID with binary args."""
+        from secantus.sql import largeobjects
+
+        try:
+            fn_oid, args = pgwire.parse_function_call(payload)
+            result = largeobjects.call(
+                fn_oid, args, storage=self.storage, db=session.database, session=session
+            )
+            return pgwire.function_call_response(result) + pgwire.ready_for_query(
+                session.txn_status()
+            )
+        except errors.SQLError as exc:
+            if session.txn_handle is not None:
+                session.txn_failed = True
+            return pgwire.error_response(exc.sqlstate, exc.message) + pgwire.ready_for_query(
+                session.txn_status()
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("error executing fastpath call")
+            return pgwire.error_response("XX000", _INTERNAL_ERROR_MSG) + pgwire.ready_for_query(
+                session.txn_status()
+            )
 
     def _pending_notification_bytes(self, session: Session) -> bytes:
         """Serialize this connection's queued async LISTEN/NOTIFY deliveries into

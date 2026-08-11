@@ -2,7 +2,7 @@
 
 A compact procedural interpreter (``secantus.sql.plpgsql``) runs the scalar
 subset of PL/pgSQL: ``DECLARE`` / assignment / ``IF``…``ELSIF``…``ELSE`` /
-``RETURN`` / ``SELECT … INTO`` / embedded write statements. Loops, ``RAISE``,
+``RETURN`` / ``SELECT … INTO`` / embedded write statements / ``RAISE``. Loops,
 ``RETURN QUERY``/``NEXT``, ``CASE``, cursors, and ``EXCEPTION`` handlers are
 out of scope and rejected. Everything runs through the real WiredTiger-backed
 ``Storage``.
@@ -175,7 +175,6 @@ def test_call_in_where_clause(storage, session):
     [
         "BEGIN WHILE n > 0 LOOP n := n - 1; END LOOP; RETURN n; END",
         "BEGIN LOOP RETURN 1; END LOOP; END",
-        "BEGIN RAISE NOTICE 'hi'; RETURN 1; END",
         "BEGIN FOR i IN 1..3 LOOP RETURN i; END LOOP; END",
     ],
 )
