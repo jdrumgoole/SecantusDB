@@ -215,6 +215,19 @@ def main(argv: list[str] | None = None) -> int:
     # under chaos would mean every kill stalls the writer for half a
     # minute before the failure surfaces. 2s is plenty when the killed
     # server is being restarted ~immediately on the same port.
+    # Signal handlers are installed BEFORE any server I/O: a SIGTERM landing
+    # while a slow ``--drop`` (or first connect) is still in flight must run
+    # the graceful path and print the summary line, not kill the process
+    # summary-less (the concurrency harness treats a missing summary as a
+    # corrupt row).
+    stop_flag = [False]
+
+    def _stop(signum: int, _frame: FrameType | None) -> None:
+        stop_flag[0] = True
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
     client = MongoClient(args.uri, serverSelectionTimeoutMS=2000)
     coll = client[args.db][args.collection]
 
@@ -222,19 +235,6 @@ def main(argv: list[str] | None = None) -> int:
         coll.drop()
         print(f"dropped {args.db}.{args.collection}", flush=True)
 
-    stop_flag = [False]
-
-    def _stop(signum: int, _frame: FrameType | None) -> None:
-        # First signal: request graceful stop. Second: propagate so the
-        # interpreter exits even if pymongo is mid-network-call.
-        if stop_flag[0]:
-            print("\nforced exit", flush=True)
-            sys.exit(130)
-        print(f"\nreceived signal {signum}, finishing current insert and stopping...", flush=True)
-        stop_flag[0] = True
-
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
 
     target_desc = f"{args.count:,d} docs" if args.count is not None else "continuous"
     print(

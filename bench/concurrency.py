@@ -173,6 +173,16 @@ def run_writers(
     """Spawn ``n`` writers for ``duration`` wall seconds, SIGTERM; per-writer stats + elapsed."""
     procs: list[tuple[subprocess.Popen[bytes], Path]] = []
     log_paths: list[Path] = []
+    # No drops anywhere near the measurement. The original scheme handed
+    # writer 0 ``--drop`` (its drop starved behind the other writers' insert
+    # stream, died summary-less on SIGTERM, and rows silently averaged a dead
+    # writer — the 2026-08-11 sweep's 3.4x phantom "regression"); a harness
+    # pre-drop fared no better, wedging 40+ minutes on the Rust server when
+    # dropping a heavily-churned collection behind a WT eviction storm (that
+    # server-side wedge is a real finding, filed in tasks/backlog.md). Each
+    # row now writes to FRESH collection names — ``run_writers`` is handed a
+    # per-row unique ``collection_prefix`` — so the window measures exactly N
+    # writers inserting, nothing else.
     try:
         for i in range(n):
             log_path = Path(tempfile.mkstemp(prefix=f"writer-{i}-", suffix=".log")[1])
@@ -187,10 +197,6 @@ def run_writers(
                 "--batch-size", str(batch),
                 "--progress-every", "0",
             ]
-            # Only the first writer drops; subsequent writers either share
-            # (drop already done) or write to their own fresh collection.
-            if i == 0:
-                argv.append("--drop")
             p = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
@@ -218,13 +224,16 @@ def run_writers(
             text = log_path.read_text()
             parsed = _parse_writer_log(text)
             if parsed is None:
-                # A writer that ends without its summary line is lost data —
-                # surface its tail so the failure mode (crash traceback vs
-                # killed-before-flush) is visible instead of silently zeroed.
+                # A writer that ends without its summary line is lost data; a
+                # row built from N-1 writers presented as N is a corrupt
+                # measurement (it once published a 3.4x phantom regression).
+                # Refuse the run rather than averaging around the hole.
                 tail = "\n".join(text.strip().splitlines()[-6:]) or "<empty log>"
-                print(f"  WARN: writer {i} produced no summary; log tail:\n"
-                      + "\n".join(f"    | {line}" for line in tail.splitlines()),
-                      flush=True)
+                raise SystemExit(
+                    f"writer {i} produced no summary — refusing to report a "
+                    f"row measured with a missing writer; log tail:\n"
+                    + "\n".join(f"    | {line}" for line in tail.splitlines())
+                )
             stats.append(parsed)
         return stats, elapsed
     finally:
@@ -258,13 +267,15 @@ def run_concurrency_sweep(
         results: list[tuple[int, int, float]] = []  # (n, total_succeeded, elapsed)
         for n in writers_list:
             print(f"running {n} writer{'s' if n != 1 else ''}...", flush=True)
+            # Unique prefix per row: fresh collections, no drops (see
+            # run_writers' note on why drops must never touch the window).
             stats, elapsed = run_writers(
                 uri,
                 n=n,
                 duration=duration,
                 batch=batch,
                 db=DEFAULT_DB,
-                collection_prefix=DEFAULT_COLLECTION_PREFIX,
+                collection_prefix=f"{DEFAULT_COLLECTION_PREFIX}n{n}_",
                 shared_collection=shared_collection,
             )
             total = sum(s[1] for s in stats if s)
