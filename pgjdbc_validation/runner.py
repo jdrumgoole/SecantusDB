@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -39,6 +40,28 @@ RAW_OUT = REPO_ROOT / ".validation" / "pgjdbc-raw.json"
 #: see ``_aggregate`` for why that distinction has to survive into the report.
 GRADLE_TIMEOUT_SECONDS = float(os.environ.get("SECANTUS_PGJDBC_TIMEOUT", 7200.0))
 JUNIT_DEFAULT_TIMEOUT = "60s"
+
+
+def _shard_spec() -> tuple[int, int] | None:
+    """The ``SECANTUS_PGJDBC_SHARD`` env as ``(index, of)``, e.g. ``2/4`` →
+    ``(2, 4)``; ``None`` when unset (run everything, the local default). The
+    CI lane splits the class list across parallel jobs this way — the suite
+    itself stays byte-for-byte unmodified, each shard just runs a
+    deterministic round-robin slice of the class list."""
+    raw = os.environ.get("SECANTUS_PGJDBC_SHARD", "").strip()
+    if not raw:
+        return None
+    m = re.fullmatch(r"(\d+)/(\d+)", raw)
+    if m is None or not (1 <= int(m.group(1)) <= int(m.group(2))):
+        print(f"bad SECANTUS_PGJDBC_SHARD {raw!r} — expected K/N with 1<=K<=N", file=sys.stderr)
+        raise SystemExit(2)
+    return int(m.group(1)), int(m.group(2))
+
+
+def _raw_out_path(shard: tuple[int, int] | None) -> Path:
+    if shard is None:
+        return RAW_OUT
+    return REPO_ROOT / ".validation" / f"pgjdbc-raw-shard-{shard[0]}.json"
 
 
 def _pick_ephemeral_port() -> int:
@@ -135,7 +158,9 @@ def main() -> int:
         print("the pgjdbc gauge requires a JDK 21 (JAVA_HOME or openjdk@21)", file=sys.stderr)
         return 2
 
-    RAW_OUT.parent.mkdir(exist_ok=True)
+    shard = _shard_spec()
+    raw_out = _raw_out_path(shard)
+    raw_out.parent.mkdir(exist_ok=True)
     if RESULTS.exists():
         shutil.rmtree(RESULTS)
 
@@ -182,7 +207,12 @@ def main() -> int:
             "--console=plain",
             ":postgresql:test",
         ]
-        for pattern in _test_classes():
+        classes = _test_classes()
+        if shard is not None:
+            k, n = shard
+            classes = classes[k - 1 :: n]
+            print(f"pgjdbc shard {k}/{n}: {len(classes)} classes")
+        for pattern in classes:
             cmd += ["--tests", pattern]
         env = {**os.environ, "JAVA_HOME": jdk}
         try:
@@ -193,16 +223,16 @@ def main() -> int:
             # reports *zero tests* — which reads like a clean sweep instead of
             # "nothing was measured". The truncated flag rides into the JSON so
             # generate_report refuses to publish a partial denominator.
-            _aggregate(truncated=True)
+            _aggregate(raw_out, shard=shard, truncated=True)
             print(
                 f"pgjdbc gauge TRUNCATED: gradle exceeded "
                 f"{GRADLE_TIMEOUT_SECONDS:.0f}s and was killed. Partial results "
-                f"aggregated to {RAW_OUT}; the run is NOT a measurement. Raise "
+                f"aggregated to {raw_out}; the run is NOT a measurement. Raise "
                 f"SECANTUS_PGJDBC_TIMEOUT to give it more room.",
                 file=sys.stderr,
             )
             return 124  # conventional shell exit for "timed out"
-        _aggregate()
+        _aggregate(raw_out, shard=shard)
         return proc.returncode
     finally:
         daemon.terminate()
@@ -212,7 +242,12 @@ def main() -> int:
             daemon.kill()
 
 
-def _aggregate(*, truncated: bool = False) -> None:
+def _aggregate(
+    raw_out: Path | None = None,
+    *,
+    shard: tuple[int, int] | None = None,
+    truncated: bool = False,
+) -> None:
     """JUnit XML → one JSON blob (per-class counts + failing test names).
 
     ``truncated`` marks a run gradle did not finish. It has to be recorded
@@ -221,6 +256,8 @@ def _aggregate(*, truncated: bool = False) -> None:
     plausible-looking conformance rate that is simply measuring less of the
     suite. ``generate_report`` refuses to publish one.
     """
+    if raw_out is None:
+        raw_out = RAW_OUT  # late-bound so tests can monkeypatch the module attr
     classes = []
     for xml_file in sorted(RESULTS.glob("*.xml")) if RESULTS.exists() else []:
         try:
@@ -240,10 +277,14 @@ def _aggregate(*, truncated: bool = False) -> None:
                 entry["failed_tests"].append(tc.get("name"))
         classes.append(entry)
     payload: dict = {"classes": classes}
+    if shard is not None:
+        # Recorded so the report merge can verify it holds a COMPLETE shard
+        # set (every index 1..of exactly once) before publishing a rate.
+        payload["shard"] = {"index": shard[0], "of": shard[1]}
     if truncated:
         payload["truncated"] = True
-    RAW_OUT.parent.mkdir(exist_ok=True)
-    RAW_OUT.write_text(json.dumps(payload, indent=1))
+    raw_out.parent.mkdir(exist_ok=True)
+    raw_out.write_text(json.dumps(payload, indent=1))
 
 
 if __name__ == "__main__":

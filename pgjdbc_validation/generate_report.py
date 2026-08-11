@@ -37,24 +37,58 @@ def _pgjdbc_version() -> str:
         return "unknown"
 
 
+def _merge_raw(paths: list[str]) -> dict:
+    """Merge one unsharded raw file, or a COMPLETE shard set, into one payload.
+
+    The same publish discipline as the truncation guard: a partial shard set
+    renders a plausible pass rate measured over less of the suite, so a
+    missing / duplicate / mismatched shard refuses outright rather than
+    shipping a short denominator."""
+    datas = [json.loads(Path(p).read_text()) for p in paths]
+    for p, d in zip(paths, datas, strict=True):
+        if d.get("truncated"):
+            # A truncated run's per-class numbers are all correct; only the
+            # set of classes is short. That renders a healthy-looking pass
+            # rate measured over less of the suite — the most misleading
+            # artifact this tool can produce, so refuse rather than publish
+            # it with a caveat nobody reads.
+            raise SystemExit(
+                f"refusing to render a report from a truncated run ({p}): "
+                "gradle was killed before finishing, so the pass rate would "
+                "be computed over only the classes that happened to complete. "
+                "Re-run with a larger SECANTUS_PGJDBC_TIMEOUT."
+            )
+    shards = [d.get("shard") for d in datas]
+    if len(datas) == 1 and shards[0] is None:
+        return datas[0]
+    if any(s is None for s in shards):
+        raise SystemExit(
+            "refusing to merge a mix of sharded and unsharded raw files: "
+            f"{paths} — pass either one unsharded file or one complete shard set"
+        )
+    of = {s["of"] for s in shards}
+    indexes = sorted(s["index"] for s in shards)
+    if len(of) != 1 or indexes != list(range(1, of.pop() + 1)):
+        raise SystemExit(
+            f"refusing to render a report from an incomplete shard set "
+            f"(got indexes {indexes} of {sorted(of) or [s['of'] for s in shards]}): every "
+            "shard must be present exactly once or the pass rate is computed "
+            "over only part of the suite."
+        )
+    return {"classes": [c for d in datas for c in d.get("classes", [])]}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("raw_json")
+    parser.add_argument(
+        "raw_json",
+        nargs="+",
+        help="one unsharded pgjdbc-raw.json, or every pgjdbc-raw-shard-*.json of a run",
+    )
     parser.add_argument("output_md")
     args = parser.parse_args()
 
-    data = json.loads(Path(args.raw_json).read_text())
-    if data.get("truncated"):
-        # A truncated run's per-class numbers are all correct; only the set of
-        # classes is short. That renders a healthy-looking pass rate measured
-        # over less of the suite — the most misleading artifact this tool can
-        # produce, so refuse rather than publish it with a caveat nobody reads.
-        raise SystemExit(
-            f"refusing to render a report from a truncated run ({args.raw_json}): "
-            "gradle was killed before finishing, so the pass rate would be "
-            "computed over only the classes that happened to complete. Re-run "
-            "with a larger SECANTUS_PGJDBC_TIMEOUT."
-        )
+    data = _merge_raw(args.raw_json)
     classes = data.get("classes", [])
     totals = {"tests": 0, "failures": 0, "skipped": 0}
     failures: list[str] = []
