@@ -345,6 +345,18 @@ def _dispatch(
     # transaction control and savepoints above are exempt and already returned.
     authz.authorize(stmt, session, storage, catalog)
 
+    # Read-only enforcement: a write inside a READ ONLY transaction (or under
+    # ``default_transaction_read_only = on``) fails with PG's 25006. The
+    # ``transaction_read_only`` GUC already resolves through the session
+    # default outside a block, so one check covers ``BEGIN READ ONLY``,
+    # ``SET TRANSACTION READ ONLY``, and the session characteristic. PG
+    # exempts temporary tables; we don't (noted in tasks/backlog.md) — no
+    # gauge exercises a temp-table write under read-only.
+    if session.get_setting("transaction_read_only") == "on":
+        verb = _write_statement_verb(stmt)
+        if verb is not None:
+            raise errors.SQLError("25006", f"cannot execute {verb} in a read-only transaction")
+
     if session.txn_handle is not None:
         try:
             with storage.use_user_transaction(session.txn_handle):
@@ -373,6 +385,37 @@ def _begin_txn(storage: Any, session: Session, modes: list | None = None) -> SQL
         ).items():
             session.set_local(name, value)
     return SQLResult(command_tag="BEGIN")
+
+
+def _write_statement_verb(stmt: exp.Expression) -> str | None:
+    """The verb PG names in its 25006 error when ``stmt`` writes, else None.
+
+    Matches PG's classification: DML and DDL are writes; SELECT, SHOW, SET,
+    EXPLAIN, and cursor traffic are not. (``SELECT … FOR UPDATE`` and
+    ``nextval()`` are also writes in PG; neither is gated here — noted in
+    tasks/backlog.md.)"""
+    if isinstance(stmt, exp.Insert):
+        return "INSERT"
+    if isinstance(stmt, exp.Update):
+        return "UPDATE"
+    if isinstance(stmt, exp.Delete):
+        return "DELETE"
+    if isinstance(stmt, exp.Merge):
+        return "MERGE"
+    if isinstance(stmt, exp.TruncateTable):
+        return "TRUNCATE TABLE"
+    if isinstance(stmt, exp.Create):
+        kind = str(stmt.args.get("kind") or "").upper()
+        return f"CREATE {kind}".strip()
+    if isinstance(stmt, exp.Drop):
+        kind = str(stmt.args.get("kind") or "").upper()
+        return f"DROP {kind}".strip()
+    if isinstance(stmt, exp.Alter):
+        kind = str(stmt.args.get("kind") or "").upper()
+        return f"ALTER {kind}".strip()
+    if isinstance(stmt, exp.Grant):
+        return "GRANT"
+    return None
 
 
 _TXN_ISOLATION_RE = re.compile(
@@ -4791,6 +4834,13 @@ def _run_command(
                 rows=rows,
                 rowcount=len(rows),
             )
+        # PG's special multi-word spellings resolve to their GUC (pgjdbc's
+        # getTransactionIsolation issues the first form verbatim).
+        folded = re.sub(r"\s+", " ", name.strip().lower())
+        if folded == "transaction isolation level":
+            name = "transaction_isolation"
+        elif folded == "time zone":
+            name = "timezone"
         value = session.get_setting(name)
         return SQLResult(
             command_tag="SHOW",
