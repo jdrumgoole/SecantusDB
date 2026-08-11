@@ -466,6 +466,31 @@ def _validation_error_info(validator: Mapping[str, Any], doc: Mapping[str, Any])
     }
 
 
+def _active_validator(opts: Mapping[str, Any], *, bypass: bool = False) -> dict[str, Any] | None:
+    """Return the validator to enforce, or ``None`` when it must not be.
+
+    A validator only rejects writes when ``validationAction`` is ``"error"``
+    (mongod's default). Under ``"warn"`` mongod logs and *accepts* the write,
+    and ``"off"`` disables validation outright — so both mean "store the doc".
+    Enforcing regardless is not a cosmetic divergence: a user who sets
+    ``"warn"`` to stage a validator against live traffic would instead have
+    their writes hard-rejected with code 121.
+
+    Kept as one helper because the same rule has to hold on every write path
+    (insert / update / findAndModify); the Rust server gates the same way in
+    ``crud.rs``.
+    """
+    if bypass:
+        return None
+    validator = opts.get("validator")
+    if not isinstance(validator, dict) or not validator:
+        return None
+    action = opts.get("validationAction", "error")
+    if action in ("warn", "off"):
+        return None
+    return validator
+
+
 def _validate_doc_against_collection(
     storage: Storage, db: str, coll: str, doc: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -477,8 +502,8 @@ def _validate_doc_against_collection(
     pick out which doc was rejected without parsing the whole error.
     """
     opts = storage.get_collection_options(db, coll)
-    validator = opts.get("validator")
-    if not isinstance(validator, dict) or not validator:
+    validator = _active_validator(opts)
+    if validator is None:
         return None
     if matches(doc, validator):
         return None
@@ -1948,8 +1973,8 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # ``MongoServerError`` and (b) the same insert with the bypass flag
     # succeeds.
     coll_opts_for_validation = ctx.storage.get_collection_options(ctx.db_name, coll)
-    validator_spec = coll_opts_for_validation.get("validator")
-    validator_active = isinstance(validator_spec, dict) and validator_spec and not bypass_validation
+    validator_spec = _active_validator(coll_opts_for_validation, bypass=bypass_validation)
+    validator_active = validator_spec is not None
     # ``_id`` documents may not contain top-level ``$``-prefixed keys
     # in any server version — MongoDB always restricted this and
     # mongo-java-driver's ``insertOne-dots_and_dollars`` test pins it.
@@ -2368,8 +2393,8 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # driver's ``Document Validation should allow bypassing document
     # validation on updates`` test asserts both directions.
     coll_opts_for_validation = ctx.storage.get_collection_options(ctx.db_name, coll)
-    validator_spec = coll_opts_for_validation.get("validator")
-    validator_active = isinstance(validator_spec, dict) and validator_spec and not bypass_validation
+    validator_spec = _active_validator(coll_opts_for_validation, bypass=bypass_validation)
+    validator_active = validator_spec is not None
     n = 0
     n_modified = 0
     upserted: list[dict[str, Any]] = []
@@ -2751,14 +2776,8 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                 # ``MongoServerError`` when bypass is off.
                 bypass_validation_fam_up = bool(doc.get("bypassDocumentValidation", False))
                 coll_opts_up = ctx.storage.get_collection_options(ctx.db_name, coll)
-                validator_spec_up = coll_opts_up.get("validator")
-                validator_up = (
-                    dict(validator_spec_up)
-                    if isinstance(validator_spec_up, dict)
-                    and validator_spec_up
-                    and not bypass_validation_fam_up
-                    else None
-                )
+                validator_spec_up = _active_validator(coll_opts_up, bypass=bypass_validation_fam_up)
+                validator_up = dict(validator_spec_up) if validator_spec_up else None
                 try:
                     result = ctx.storage.update_matching(
                         ctx.db_name,
@@ -2870,8 +2889,8 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
         # ``bypassDocumentValidation: true``.
         bypass_validation_fam = bool(doc.get("bypassDocumentValidation", False))
         coll_opts = ctx.storage.get_collection_options(ctx.db_name, coll)
-        validator_spec = coll_opts.get("validator")
-        if isinstance(validator_spec, dict) and validator_spec and not bypass_validation_fam:
+        validator_spec = _active_validator(coll_opts, bypass=bypass_validation_fam)
+        if validator_spec is not None:
             from secantus.update import apply_update as _apply_update_check
             from secantus.update import find_positional_matches as _pos_matches
 
@@ -3188,6 +3207,16 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if isinstance(validator, Mapping):
         ctx.storage.set_collection_options(ctx.db_name, coll, validator=dict(validator))
         description["validator"] = dict(validator)
+    # ``validationLevel`` / ``validationAction`` are as load-bearing as the
+    # validator itself — ``validationAction: "warn"`` is how a validator is
+    # staged against live traffic without rejecting writes. Accepting them
+    # with ok:1 and then discarding them (the prior behaviour) left the
+    # caller believing enforcement had been relaxed when it had not.
+    for option in ("validationLevel", "validationAction"):
+        value = doc.get(option)
+        if isinstance(value, str):
+            ctx.storage.set_collection_options(ctx.db_name, coll, **{option: value})
+            description[option] = value
     # ``collMod {index: {keyPattern|name, expireAfterSeconds}}`` retunes a TTL
     # index. mongod resolves the index by key pattern or name, writes the new
     # expiry, and echoes ``expireAfterSeconds_old`` / ``expireAfterSeconds_new``

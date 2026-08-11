@@ -158,6 +158,65 @@ def test_out_bypass_skips_target_validator(db) -> None:
     assert db.guarded.count_documents({}) == 1
 
 
+# --- validationAction warn/off accepts violating writes --------------------
+
+
+@pytest.mark.parametrize("action", ["warn", "off"])
+def test_validation_action_warn_and_off_accept_violating_writes(db, action) -> None:
+    """``warn`` / ``off`` mean "store it anyway" on every write path.
+
+    Only ``validationAction: "error"`` (the default) rejects. Enforcing
+    under ``warn`` would break the standard way of staging a validator
+    against live traffic — writes would hard-fail with 121 while the
+    operator believed they were merely being logged.
+    """
+    db.create_collection("staged", validator={"number": {"$gte": 5}}, validationAction=action)
+
+    db.staged.insert_one({"_id": 1, "number": 1})
+    assert db.staged.find_one({"_id": 1})["number"] == 1
+
+    db.staged.update_one({"_id": 1}, {"$set": {"number": 2}})
+    assert db.staged.find_one({"_id": 1})["number"] == 2
+
+    db.staged.find_one_and_update({"_id": 1}, {"$set": {"number": 3}})
+    assert db.staged.find_one({"_id": 1})["number"] == 3
+
+    db.staged.replace_one({"_id": 1}, {"number": 4})
+    assert db.staged.find_one({"_id": 1})["number"] == 4
+
+
+def test_validation_action_error_still_rejects(db) -> None:
+    """The default path must be untouched by the warn/off carve-out."""
+    db.create_collection("strict", validator={"number": {"$gte": 5}}, validationAction="error")
+    with pytest.raises(OperationFailure) as exc:
+        db.strict.insert_one({"number": 1})
+    assert exc.value.code == 121
+
+
+def test_collmod_persists_validation_action_and_level(db) -> None:
+    """``collMod`` must apply these, not accept-and-discard them.
+
+    Previously the command replied ``ok: 1`` and dropped both options, so a
+    caller relaxing enforcement got a success reply and unchanged behaviour.
+    """
+    db.create_collection("c", validator={"number": {"$gte": 5}})
+    db.command({"collMod": "c", "validationAction": "warn", "validationLevel": "moderate"})
+
+    opts = next(iter(db.list_collections(filter={"name": "c"})))["options"]
+    assert opts["validationAction"] == "warn"
+    assert opts["validationLevel"] == "moderate"
+
+    # And the change is live, not merely recorded.
+    db.c.insert_one({"_id": 1, "number": 1})
+    assert db.c.find_one({"_id": 1}) is not None
+
+    # Flipping back to error re-arms enforcement.
+    db.command({"collMod": "c", "validationAction": "error"})
+    with pytest.raises(OperationFailure) as exc:
+        db.c.insert_one({"_id": 2, "number": 1})
+    assert exc.value.code == 121
+
+
 # --- collMod prepareUnique -> unique violations (mongo-c-driver) -----------
 
 
