@@ -992,7 +992,7 @@ def sql_stress(c: Context) -> None:
 
 
 @task(name="validate-pgjdbc")
-def validate_pgjdbc(c: Context) -> None:
+def validate_pgjdbc(c: Context, shard: str = "") -> None:
     """Run pgjdbc's own test suite against a SecantusPGServer daemon.
 
     The SQL-server JDBC gauge (tasks/sql-gauges-plan.md G5): the official
@@ -1000,11 +1000,35 @@ def validate_pgjdbc(c: Context) -> None:
     build.local.properties (gitignored upstream, so the submodule stays
     pristine). Requires a JDK 21 (pgjdbc's Gradle toolchain). Generates
     docs/validation-report-pgjdbc.md. Python server only.
+
+    ``--shard K/N`` runs only the k-th round-robin slice of the class list and
+    writes ``.validation/pgjdbc-raw-shard-K.json`` WITHOUT generating a report
+    — the CI lane fans the suite across N parallel jobs this way, and
+    ``validate-pgjdbc-report`` merges the complete shard set afterwards.
     """
     import pathlib
 
     if not pathlib.Path("vendor/pgjdbc/gradlew").exists():
         c.run("git submodule update --init vendor/pgjdbc", pty=True)
+    if shard:
+        k = shard.split("/", 1)[0]
+        raw = pathlib.Path(f".validation/pgjdbc-raw-shard-{k}.json")
+        raw.unlink(missing_ok=True)  # same freshness discipline as _run_gauge
+        result = c.run(
+            f"SECANTUS_PGJDBC_SHARD={shard} uv run --no-sync python -m pgjdbc_validation.runner",
+            pty=True,
+            warn=True,  # failing tests still produce the raw artifact — the deliverable
+        )
+        from invoke.exceptions import Exit
+
+        if not raw.exists():
+            raise Exit(f"pgjdbc shard {shard} produced no {raw} — the runner never ran")
+        print(f"\nWrote {raw} (shard {shard}; merge with validate-pgjdbc-report)")
+        if result.exited:
+            # Keep the unsharded lane's semantics: standing test failures make
+            # the job red (gradle's raw exit), the raw artifact still ships.
+            raise Exit(f"pgjdbc shard {shard}: gradle exited {result.exited}", code=result.exited)
+        return
     _run_gauge(
         c,
         module="pgjdbc_validation.runner",
@@ -1018,6 +1042,33 @@ def validate_pgjdbc(c: Context) -> None:
         pty=True,
     )
     print("\nWrote docs/validation-report-pgjdbc.md")
+
+
+@task(name="validate-pgjdbc-report")
+def validate_pgjdbc_report(c: Context) -> None:
+    """Merge a COMPLETE set of pgjdbc shard raws into the conformance report.
+
+    Counterpart of ``validate-pgjdbc --shard K/N``: expects every
+    ``.validation/pgjdbc-raw-shard-*.json`` of one run to be present (the CI
+    merge job downloads them from the shard jobs' artifacts); the generator
+    refuses a missing / duplicate / truncated shard rather than publishing a
+    pass rate over part of the suite.
+
+    The shard raws are CONSUMED on a successful merge — this task's
+    equivalent of ``_run_gauge``'s freshness guard: a re-run without fresh
+    shard artifacts fails on the missing files instead of re-rendering the
+    previous run's results under today's date."""
+    import glob
+    import pathlib
+
+    c.run(
+        "uv run --no-sync python -m pgjdbc_validation.generate_report "
+        ".validation/pgjdbc-raw-shard-*.json docs/validation-report-pgjdbc.md",
+        pty=True,
+    )
+    for consumed in glob.glob(".validation/pgjdbc-raw-shard-*.json"):
+        pathlib.Path(consumed).unlink()
+    print("\nWrote docs/validation-report-pgjdbc.md (shard raws consumed)")
 
 
 @task(name="validate-pgtest")

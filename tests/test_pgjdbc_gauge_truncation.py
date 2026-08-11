@@ -146,3 +146,90 @@ def test_timeout_budget_is_overridable(monkeypatch):
     finally:
         monkeypatch.delenv("SECANTUS_PGJDBC_TIMEOUT", raising=False)
         importlib.reload(runner)
+
+
+# -- sharding: split the class list, merge only a COMPLETE shard set -------- #
+
+
+def _shard_raw(tmp_path, k, n, cls="A", truncated=False):
+    payload = {
+        "classes": [
+            {
+                "class": f"org.postgresql.test.jdbc2.{cls}",
+                "tests": 2,
+                "failures": 1,
+                "skipped": 0,
+                "failed_tests": ["x"],
+            }
+        ],
+        "shard": {"index": k, "of": n},
+    }
+    if truncated:
+        payload["truncated"] = True
+    p = tmp_path / f"pgjdbc-raw-shard-{k}.json"
+    p.write_text(json.dumps(payload))
+    return p
+
+
+def test_shard_spec_parses_and_rejects(monkeypatch):
+    monkeypatch.setenv("SECANTUS_PGJDBC_SHARD", "2/4")
+    assert runner._shard_spec() == (2, 4)
+    monkeypatch.setenv("SECANTUS_PGJDBC_SHARD", "")
+    assert runner._shard_spec() is None
+    for bad in ("0/4", "5/4", "x/4", "4"):
+        monkeypatch.setenv("SECANTUS_PGJDBC_SHARD", bad)
+        with pytest.raises(SystemExit):
+            runner._shard_spec()
+
+
+def test_round_robin_shards_partition_exactly(monkeypatch):
+    classes = [f"C{i}" for i in range(11)]
+    monkeypatch.setattr(runner, "_test_classes", lambda: classes)
+    parts = [runner._test_classes()[k::3] for k in range(3)]
+    assert sorted(sum(parts, [])) == sorted(classes)
+    assert {len(p) for p in parts} == {4, 3}
+
+
+def test_merge_accepts_a_complete_shard_set(tmp_path):
+    paths = [str(_shard_raw(tmp_path, k, 3, cls=f"T{k}")) for k in (2, 1, 3)]
+    merged = generate_report._merge_raw(paths)
+    assert sorted(c["class"] for c in merged["classes"]) == [
+        "org.postgresql.test.jdbc2.T1",
+        "org.postgresql.test.jdbc2.T2",
+        "org.postgresql.test.jdbc2.T3",
+    ]
+
+
+def test_merge_refuses_a_missing_shard(tmp_path):
+    paths = [str(_shard_raw(tmp_path, k, 3)) for k in (1, 3)]
+    with pytest.raises(SystemExit, match="incomplete shard set"):
+        generate_report._merge_raw(paths)
+
+
+def test_merge_refuses_a_truncated_shard(tmp_path):
+    paths = [str(_shard_raw(tmp_path, 1, 2)), str(_shard_raw(tmp_path, 2, 2, truncated=True))]
+    with pytest.raises(SystemExit, match="truncated"):
+        generate_report._merge_raw(paths)
+
+
+def test_merge_refuses_mixed_sharded_and_unsharded(tmp_path):
+    unsharded = tmp_path / "pgjdbc-raw.json"
+    unsharded.write_text(json.dumps({"classes": []}))
+    paths = [str(_shard_raw(tmp_path, 1, 2)), str(unsharded)]
+    with pytest.raises(SystemExit, match="mix of sharded and unsharded"):
+        generate_report._merge_raw(paths)
+
+
+def test_merge_passes_a_single_unsharded_raw_through(tmp_path):
+    unsharded = tmp_path / "pgjdbc-raw.json"
+    unsharded.write_text(
+        json.dumps(
+            {
+                "classes": [
+                    {"class": "c", "tests": 1, "failures": 0, "skipped": 0, "failed_tests": []}
+                ]
+            }
+        )
+    )
+    merged = generate_report._merge_raw([str(unsharded)])
+    assert len(merged["classes"]) == 1

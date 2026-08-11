@@ -57,7 +57,7 @@ jobs:
           if [ -z "$ONLY" ]; then
             m=$(jq -c . .github/validate-lanes.json)
           else
-            m=$(jq -c --arg only ",$ONLY," '[.[] | select(("," + .name + ",") as $n | $only | contains($n))]' .github/validate-lanes.json)
+            m=$(jq -c --arg only ",$ONLY," '[.[] | select((("," + .name + ",") as $n | $only | contains($n)) or ((.group // "") != "" and (("," + .group + ",") as $g | $only | contains($g))))]' .github/validate-lanes.json)
           fi
           n=$(jq length <<<"$m")
           echo "running $n lane(s)"
@@ -233,14 +233,14 @@ jobs:
             ${{ runner.os }}-node-modules-
 
       - name: Set up JDK
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || matrix.driver.name == 'pgjdbc'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || startsWith(matrix.driver.name, 'pgjdbc')
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || matrix.driver.name == 'pgjdbc'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || startsWith(matrix.driver.name, 'pgjdbc')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -360,6 +360,9 @@ jobs:
         run: head -50 ${{ matrix.driver.report }}
 
       - name: Upload report artifact
+        # Shard lanes (a `group` without a `report`) produce only a raw
+        # artifact; their group's merge job renders the report.
+        if: matrix.driver.report != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: report-${{ matrix.driver.name }}
@@ -382,9 +385,65 @@ jobs:
           # regenerated from an empty .validation/ — "the 0 gauges").
           include-hidden-files: true
 
+  pgjdbc-report:
+    name: Merge pgjdbc shards into the report
+    needs: [plan, validate]
+    runs-on: ubuntu-latest
+    # `always()` so one red shard still yields a merged report of whatever
+    # completed — the generator itself refuses an INCOMPLETE shard set, so a
+    # missing shard fails here loudly instead of shipping a short denominator.
+    if: >-
+      always() && !cancelled() &&
+      contains(needs.plan.outputs.matrix, 'pgjdbc-1')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Download pgjdbc shard raws
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: raw-pgjdbc-*
+          path: artifacts
+
+      - name: Reassemble .validation
+        run: |
+          shopt -s nullglob
+          mkdir -p .validation
+          staged=0
+          for d in artifacts/raw-pgjdbc-*/; do
+            cp -R "$d". .validation/
+            staged=$((staged + 1))
+          done
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::no pgjdbc shard raw artifacts found — the shard jobs uploaded nothing"
+            exit 1
+          fi
+          ls .validation/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Merge shards into the report
+        # --no-project: the generator is stdlib-only (reads the version from
+        # src/), so no WT build is needed here.
+        run: |
+          PYTHONPATH=. uv run --no-project python -m pgjdbc_validation.generate_report \
+            .validation/pgjdbc-raw-shard-*.json docs/validation-report-pgjdbc.md
+
+      - name: Upload merged report artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: report-pgjdbc
+          path: docs/validation-report-pgjdbc.md
+          if-no-files-found: error
+
   aggregate:
     name: Aggregate reports and open PR
-    needs: validate
+    needs: [validate, pgjdbc-report]
     runs-on: ubuntu-latest
     # `always()` so the aggregate step runs even if one driver gauge fails —
     # we still want to ship the reports for the gauges that did succeed so a

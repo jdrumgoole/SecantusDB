@@ -80,9 +80,24 @@
     "report": "docs/validation-report-sqlstress.md"
   },
   {
-    "name": "pgjdbc",
-    "task": "validate-pgjdbc",
-    "report": "docs/validation-report-pgjdbc.md"
+    "name": "pgjdbc-1",
+    "group": "pgjdbc",
+    "task": "validate-pgjdbc --shard 1/4"
+  },
+  {
+    "name": "pgjdbc-2",
+    "group": "pgjdbc",
+    "task": "validate-pgjdbc --shard 2/4"
+  },
+  {
+    "name": "pgjdbc-3",
+    "group": "pgjdbc",
+    "task": "validate-pgjdbc --shard 3/4"
+  },
+  {
+    "name": "pgjdbc-4",
+    "group": "pgjdbc",
+    "task": "validate-pgjdbc --shard 4/4"
   },
   {
     "name": "pgtest",
