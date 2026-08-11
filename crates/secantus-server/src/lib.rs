@@ -402,6 +402,15 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     while !shared.stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                // Disable Nagle: reply paths write small frames back-to-back
+                // and with Nagle on the second write waits for the peer's
+                // delayed ACK — ~40ms per round trip on Linux CI, invisible
+                // on macOS loopback. The Python servers' identical fix took
+                // pgjdbc's generated-keys batch tests from 41.5s to 0.2s
+                // each; mongod and PostgreSQL both set TCP_NODELAY
+                // unconditionally. Best-effort: a failed setsockopt on an
+                // already-dying socket must not kill the accept loop.
+                let _ = stream.set_nodelay(true);
                 let conn_shared = shared.clone();
                 // Counter Arc is independent of `Shared`, so the guard can outlive
                 // `conn_shared`'s drop (which releases this thread's storage ref).
