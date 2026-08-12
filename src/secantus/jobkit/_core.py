@@ -547,6 +547,34 @@ def _run_pty(cmd: Sequence[str], *, cwd: str, log_path: Path, echo: bool) -> int
                         sys.stdout.buffer.flush()
                     continue
                 if proc.poll() is not None:
+                    # The child is gone — but it may have written its output
+                    # AND exited in the window between the select() above
+                    # reporting "nothing readable" and this poll(). Those
+                    # bytes are sitting in the pty buffer, and breaking here
+                    # discards them: the job row finishes with exit 0 while
+                    # its logfile is empty, which is the "(no output yet)"
+                    # log box on a completed job that reddened macOS CI.
+                    #
+                    # A timed-out select does NOT imply the buffer is drained
+                    # (the comment that used to say so was the bug). Drain
+                    # with non-blocking selects until the pty is genuinely
+                    # quiet, then leave. A fast child that writes once and
+                    # exits is exactly the shape that loses the race.
+                    while True:
+                        readable, _, _ = select.select([master], [], [], 0)
+                        if not readable:
+                            break
+                        try:
+                            data = os.read(master, 65536)
+                        except OSError:
+                            break
+                        if not data:
+                            break
+                        logf.write(data)
+                        logf.flush()
+                        if echo:
+                            sys.stdout.buffer.write(data)
+                            sys.stdout.buffer.flush()
                     break
         finally:
             if on_main:
