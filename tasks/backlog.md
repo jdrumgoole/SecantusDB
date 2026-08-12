@@ -1023,6 +1023,17 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   | c | 718 / 15 / 69 | 98.0% | documented C set (ipv6/lastWriteDate/select_server/search) |
   | cxx | 885 / 3 / 9 | 99.7% | change-stream resume-token tracking, client-metadata handshake ×2 |
 
+  **The php-lib row's "~37 txn/session (out of scope)" reading was WRONG —
+  corrected 2026-08-12.** Those transaction failures were not an out-of-scope
+  gap at all: `serverStatus` omitted the `storageEngine` sub-document, so the
+  suite's `skipIfTransactionsNotSupported` helper threw "Could not determine
+  server storage engine" and errored ~27 tests before any transaction ran.
+  Fixed in #829; php-lib then went 42 failures -> 4, and #830 took it to 1
+  (a text-index test, genuinely out of scope). The lesson worth keeping: a
+  cluster of failures sharing one *symptom* is not evidence of a shared
+  *cause*, and "out of scope" is the most expensive label to get wrong —
+  it stops anyone looking again.
+
   Follow-up triage (not blockers, no data risk): the php-lib "4 real" assertion
   failures (change-stream resume-token type, session-freed, findOneAndReplace
   BSON-type-map field order, 2dsphere index-version) and the pymongo-async

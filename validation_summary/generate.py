@@ -725,6 +725,12 @@ _REPORT_LINKS = {
 # Map gauge ``name`` to the matching expected-failures list.
 _EXPECTED_FAILURES_BY_GAUGE: dict[str, list[ef_module.ExpectedFailure]] = {
     "pymongo": ef_module.PYMONGO,
+    # The async gauge runs the same upstream tests through
+    # ``AsyncMongoClient``, so it hits the same out-of-scope gaps under
+    # ``asynchronous/`` node IDs. The patterns are method-name substrings,
+    # which match both spellings — hence one shared list rather than a
+    # duplicate that could drift.
+    "pymongo (async)": ef_module.PYMONGO,
     "mongo-java-driver": ef_module.JAVA,
     "mongo-go-driver": ef_module.GO,
     "mongo-node-driver": ef_module.NODE,
