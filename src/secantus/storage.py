@@ -301,6 +301,14 @@ _IDX_ENTRIES_TABLE = "table:secantus_index_entries"
 #: WT_DUPLICATE_KEY, and two concurrent inserts of the same value are a
 #: write-write conflict rather than two silent successes.
 _UNIQ_TABLE = "table:secantus_unique_keys"
+#: Pending-drop tombstones written by the RUST server's chunked two-phase drop
+#: (phase 1 unregisters the collection and writes `(db, coll) -> b""` here;
+#: phase 2 purges the rows in bounded batches and clears the row). The Python
+#: server never writes tombstones — its drop is autocommit per-row, so it has
+#: no unbounded purge transaction — but it must FINISH one left by a Rust
+#: crash mid-purge (cross-server portability: the layouts are byte-identical),
+#: or the orphan rows resurface inside a re-created collection.
+_TOMB_TABLE = "table:secantus_drop_tombstones"
 _OPLOG_TABLE = "table:secantus_oplog"
 # The oplog is sharded across ``_OPLOG_SHARDS`` btrees in the Rust server so
 # concurrent writers don't all rendezvous on one table's rightmost append page
@@ -1522,6 +1530,7 @@ class Storage:
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
             boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSu,value_format=u")
             boot.create(_UNIQ_TABLE, "key_format=SSSu,value_format=q")
+            boot.create(_TOMB_TABLE, "key_format=SS,value_format=u")
             boot.create(_OPLOG_TABLE, "key_format=q,value_format=u")
             boot.create(_PREIMAGE_TABLE, "key_format=q,value_format=u")
             boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
@@ -1632,6 +1641,10 @@ class Storage:
             # is exceeded. Seeded here by a one-time key-only count (cheap, and
             # only on open); maintained incrementally on every emit / prune.
             self._oplog_live_count = self._count_oplog_rows()
+            # Finish any chunked drop the Rust server's crash interrupted
+            # (registry row already gone; the tombstoned rows must not
+            # resurface under a re-created name). See ``_TOMB_TABLE``.
+            self._recover_pending_drops_locked()
 
         # TTL sweeper. Real mongod runs ``ttlMonitor`` every 60s by
         # default; we mirror that. ``ttl_sweep_seconds <= 0`` disables
@@ -6165,6 +6178,7 @@ class Storage:
             _IDX_TABLE: "SSS",
             _IDX_ENTRIES_TABLE: "SSSu",
             _UNIQ_TABLE: "SSSu",
+            _TOMB_TABLE: "SS",
         }[table]
 
     @staticmethod
@@ -6206,6 +6220,21 @@ class Storage:
             c.set_key(*k)
             c.remove()
             c.reset()
+
+    def _recover_pending_drops_locked(self) -> None:
+        pending = [k for k, _ in self._collect_prefix(_TOMB_TABLE, ())]
+        for db, coll in pending:
+            for tbl in (
+                _doc_table_for(db, coll),
+                _NAT_TABLE,
+                _NAT_SEQ_TABLE,
+                _IDX_TABLE,
+                _IDX_ENTRIES_TABLE,
+                _UNIQ_TABLE,
+            ):
+                rows = self._collect_prefix(tbl, (db, coll))
+                self._delete_keys(tbl, [k for k, _ in rows])
+            self._delete_keys(_TOMB_TABLE, [(db, coll)])
 
     def drop_collection(self, db: str, coll: str) -> bool:
         with self._lock:

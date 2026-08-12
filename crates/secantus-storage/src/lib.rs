@@ -200,6 +200,13 @@ fn too_large_write_error(index: usize, size: usize) -> Document {
 }
 
 const COLL_TABLE: &str = "table:secantus_collections";
+/// Pending-drop tombstones: `(db, coll) -> b""`. Written in the same small
+/// transaction that unregisters a collection (phase 1 of a chunked drop);
+/// removed when the batched row purge (phase 2) completes. A tombstone left
+/// by a crash is finished at the next open — see `recover_pending_drops`.
+/// Additive to the shared on-disk layout (an older store simply lacks the
+/// table; nothing else reads it), same precedent as the unique-keys table.
+const TOMB_TABLE: &str = "table:secantus_drop_tombstones";
 /// Legacy single documents table. Retained for the on-disk upgrade read/migration
 /// (a store written by an older build has its rows here). New writes go to the
 /// per-collection shard tables — see `DOC_SHARDS` / `doc_table_for`.
@@ -259,6 +266,12 @@ enum OplogEntry {
 /// are mongod-faithful, not a divergence.
 const WRITE_CHUNK_MAX_DOCS: usize = 1000;
 const WRITE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Rows per statement transaction in a chunked collection purge (drop /
+/// dropDatabase phase 2). Purge deletes walk CONSECUTIVE keys, so a batch
+/// dirties few leaf pages; 4000 keeps each transaction far under the cache
+/// dirty trigger while bounding the number of commits for a large drop.
+const PURGE_CHUNK_MAX_ROWS: usize = 4000;
 
 /// Approximate encoded size of an oplog entry, for the user-transaction
 /// dirty budget. `Raw` is exact; `Doc` (the rare DDL / noop shapes) pays one
@@ -1310,6 +1323,7 @@ const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u";
 // identical so later sub-phases don't need a migration.
 const BOOTSTRAP: &[(&str, &str)] = &[
     (COLL_TABLE, "key_format=SS,value_format=u"),
+    (TOMB_TABLE, "key_format=SS,value_format=u"),
     (DOC_TABLE, DOC_TABLE_CFG),
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
     (
@@ -3645,6 +3659,9 @@ impl Storage {
             storage.recover_from_oplog()?;
             storage.spawn_stable_checkpoint_thread();
         }
+        // Finish any chunked drop a crash interrupted (registry row already
+        // gone; the leftover rows must not resurface under a re-created name).
+        storage.recover_pending_drops()?;
         Ok(storage)
     }
 
@@ -6387,19 +6404,63 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _gen = self.ddl_generation_scope();
-        // One statement transaction: doc rows, index entries, registry row and
-        // the drop oplog entry commit or vanish together — a crash mid-drop
-        // can't leave orphan rows behind a still-registered collection.
-        self.retry_write_conflicts("drop_collection", || {
+        if self.in_user_txn() {
+            // Inside a user transaction the drop must join it atomically; the
+            // transaction's own dirty-budget guard (TransactionTooLargeForCache)
+            // bounds the size, so the single-transaction purge is safe here.
+            return self.retry_write_conflicts("drop_collection", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    let existed = coll_options(&session, db, coll)?.is_some();
+                    let ui = if existed && self.enable_oplog {
+                        Some(collection_uuid(&session, db, coll)?)
+                    } else {
+                        None
+                    };
+                    self.purge_collection_tables(&session, db, coll)?;
+                    let c = session.open_cursor(COLL_TABLE, None)?;
+                    c.set_key_ss(db, coll);
+                    match c.search() {
+                        Ok(()) => c.remove()?,
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    if let Some(ui) = ui {
+                        self.emit_drop_oplog(&session, db, coll, &ui)?;
+                    }
+                    Ok(existed)
+                })
+            });
+        }
+        // Chunked two-phase drop. A whole-collection purge in ONE statement
+        // transaction is unbounded dirty content — the WT livelock class the
+        // chunked insert / updateMany / deleteMany work closed. A drop of a
+        // collection larger than the cache's dirty budget got a cache-pressure
+        // WT_ROLLBACK, which the WriteConflict retry loop re-ran forever while
+        // the eviction threads spun (the 2026-08-11 wedge; `tests/drop_chunk.rs`
+        // reproduces it deterministically at a small cache).
+        //
+        // Phase 1 (small transaction): unregister the collection, write a drop
+        // tombstone, emit the drop oplog entry. After this commit the namespace
+        // no longer exists for every reader/writer (all routing goes through
+        // the registry), so the batched purge is unobservable.
+        // Phase 2 (bounded transactions): delete the rows table-by-table in
+        // PURGE_CHUNK_MAX_ROWS batches, then clear the tombstone. A crash
+        // mid-purge leaves rows behind an unregistered name plus the
+        // tombstone; `recover_pending_drops` finishes the purge at next open,
+        // before any traffic can re-create the name.
+        let existed = self.retry_write_conflicts("drop_collection", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
                 let existed = coll_options(&session, db, coll)?.is_some();
-                let ui = if existed && self.enable_oplog {
+                if !existed {
+                    return Ok(false);
+                }
+                let ui = if self.enable_oplog {
                     Some(collection_uuid(&session, db, coll)?)
                 } else {
                     None
                 };
-                self.purge_collection_tables(&session, db, coll)?;
                 let c = session.open_cursor(COLL_TABLE, None)?;
                 c.set_key_ss(db, coll);
                 match c.search() {
@@ -6407,19 +6468,139 @@ impl Storage {
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
                 }
+                let t = session.open_cursor(TOMB_TABLE, None)?;
+                t.set_key_ss(db, coll);
+                t.set_value_u(b"");
+                t.insert()?;
                 if let Some(ui) = ui {
-                    let mut o = Document::new();
-                    o.insert("drop", coll);
-                    let mut entry = Document::new();
-                    entry.insert("op", "c");
-                    entry.insert("ns", format!("{db}.$cmd"));
-                    entry.insert("ui", uuid_binary(&ui));
-                    entry.insert("o", Bson::Document(o));
-                    self.emit_oplog(&session, vec![entry], vec![None])?;
+                    self.emit_drop_oplog(&session, db, coll, &ui)?;
                 }
-                Ok(existed)
+                Ok(true)
+            })
+        })?;
+        if !existed {
+            return Ok(false);
+        }
+        self.purge_dropped_collection(db, coll)?;
+        Ok(true)
+    }
+
+    /// The `op: "c"` `drop` oplog entry for `(db, coll)`.
+    fn emit_drop_oplog(&self, session: &Session, db: &str, coll: &str, ui: &[u8]) -> Result<()> {
+        let mut o = Document::new();
+        o.insert("drop", coll);
+        let mut entry = Document::new();
+        entry.insert("op", "c");
+        entry.insert("ns", format!("{db}.$cmd"));
+        entry.insert("ui", uuid_binary(ui));
+        entry.insert("o", Bson::Document(o));
+        self.emit_oplog(session, vec![entry], vec![None])?;
+        Ok(())
+    }
+
+    /// Phase 2 of a chunked drop: delete the unregistered collection's rows in
+    /// bounded batches (each its own statement transaction), then clear the
+    /// tombstone. Caller holds whatever exclusion it needs (the drop path holds
+    /// the global + namespace locks; open-time recovery runs single-threaded).
+    fn purge_dropped_collection(&self, db: &str, coll: &str) -> Result<()> {
+        loop {
+            let n = self.retry_write_conflicts("drop_collection purge(uniq)", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.purge_uniq_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
+                })
+            })?;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        loop {
+            let n = self.retry_write_conflicts("drop_collection purge(docs)", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.purge_docs_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
+                })
+            })?;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        loop {
+            let n = self.retry_write_conflicts("drop_collection purge(idx)", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.purge_idx_entries_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
+                })
+            })?;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        loop {
+            let n = self.retry_write_conflicts("drop_collection purge(nat)", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.purge_nat_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
+                })
+            })?;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        // Final small transaction: the index catalog rows (a handful) and the
+        // tombstone itself.
+        self.retry_write_conflicts("drop_collection purge(final)", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                for (name, _key_spec, _opts) in self.iter_indexes(&session, db, coll)? {
+                    let ic = session.open_cursor(IDX_TABLE, None)?;
+                    ic.set_key_sss(db, coll, &name);
+                    match ic.remove() {
+                        Ok(()) => {}
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                let t = session.open_cursor(TOMB_TABLE, None)?;
+                t.set_key_ss(db, coll);
+                match t.search() {
+                    Ok(()) => t.remove()?,
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                Ok(())
             })
         })
+    }
+
+    /// Finish any drop whose batched purge a crash interrupted: the registry
+    /// row is already gone (phase 1 committed), so the leftover rows belong to
+    /// an unregistered name and must be purged before traffic can re-create
+    /// it. Runs at open, single-threaded.
+    fn recover_pending_drops(&self) -> Result<()> {
+        let pending: Vec<(String, String)> = {
+            let session = self.conn.open_session()?;
+            let cur = match session.open_cursor(TOMB_TABLE, None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut out = Vec::new();
+            let mut more = cur.next()?;
+            while more {
+                let (d, c) = cur.get_key_ss()?;
+                out.push((d, c));
+                more = cur.next()?;
+            }
+            out
+        };
+        for (db, coll) in pending {
+            eprintln!(
+                "secantus-storage: finishing interrupted drop of {db}.{coll} (crash-left tombstone)"
+            );
+            self.purge_dropped_collection(&db, &coll)?;
+        }
+        Ok(())
     }
 
     /// Drop an entire database: delete every collection's data + registry rows.
@@ -6449,7 +6630,39 @@ impl Storage {
         // likewise per-collection): each collection's purge, registry removal
         // and drop oplog entry commit or vanish together, so a crash
         // mid-dropDatabase leaves whole collections, never orphan rows.
+        let in_user_txn = self.in_user_txn();
         for c in &colls {
+            if in_user_txn {
+                // Joins the user transaction atomically; its dirty-budget
+                // guard bounds the size (same reasoning as drop_collection).
+                self.retry_write_conflicts("drop_database", || {
+                    let session = self.op_session()?;
+                    self.with_statement_txn(&session, || {
+                        let ui = if self.enable_oplog {
+                            Some(collection_uuid(&session, db, c)?)
+                        } else {
+                            None
+                        };
+                        self.purge_collection_tables(&session, db, c)?;
+                        let rc = session.open_cursor(COLL_TABLE, None)?;
+                        rc.set_key_ss(db, c);
+                        match rc.search() {
+                            Ok(()) => rc.remove()?,
+                            Err(e) if e.is_not_found() => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                        if let Some(ui) = &ui {
+                            self.emit_drop_oplog(&session, db, c, ui)?;
+                        }
+                        Ok(())
+                    })
+                })?;
+                continue;
+            }
+            // Chunked two-phase drop, same as drop_collection: unregister +
+            // tombstone + drop entry in a small transaction, then the batched
+            // row purge (one unbounded purge transaction per collection was
+            // the same WT-livelock class — see the drop_collection comment).
             self.retry_write_conflicts("drop_database", || {
                 let session = self.op_session()?;
                 self.with_statement_txn(&session, || {
@@ -6458,7 +6671,6 @@ impl Storage {
                     } else {
                         None
                     };
-                    self.purge_collection_tables(&session, db, c)?;
                     let rc = session.open_cursor(COLL_TABLE, None)?;
                     rc.set_key_ss(db, c);
                     match rc.search() {
@@ -6466,19 +6678,17 @@ impl Storage {
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
                     }
+                    let t = session.open_cursor(TOMB_TABLE, None)?;
+                    t.set_key_ss(db, c);
+                    t.set_value_u(b"");
+                    t.insert()?;
                     if let Some(ui) = &ui {
-                        let mut o = Document::new();
-                        o.insert("drop", c.clone());
-                        let mut entry = Document::new();
-                        entry.insert("op", "c");
-                        entry.insert("ns", format!("{db}.$cmd"));
-                        entry.insert("ui", uuid_binary(ui));
-                        entry.insert("o", Bson::Document(o));
-                        self.emit_oplog(&session, vec![entry], vec![None])?;
+                        self.emit_drop_oplog(&session, db, c, ui)?;
                     }
                     Ok(())
                 })
             })?;
+            self.purge_dropped_collection(db, c)?;
         }
         if self.enable_oplog {
             self.retry_write_conflicts("drop_database", || {
@@ -8474,6 +8684,218 @@ impl Storage {
     /// Delete a collection's document / index-registry / index-entry rows
     /// (everything except its `secantus_collections` registry row). Shared by
     /// `drop_collection` / `drop_database` / `rename_collection`.
+    /// Delete up to `limit` doc rows with the `(db, coll)` prefix; returns
+    /// how many were deleted. Collect-then-remove, same as the whole-purge
+    /// loops. The prefix keys are consecutive, so a batch dirties few pages.
+    fn purge_docs_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        cur.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut ids: Vec<i64> = Vec::new();
+        while more && ids.len() < limit {
+            let (d, c, recordid) = cur.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            ids.push(recordid);
+            more = cur.next()?;
+        }
+        for recordid in &ids {
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, *recordid);
+            match cur.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(ids.len())
+    }
+
+    /// Delete up to `limit` index-entry rows across ALL of the collection's
+    /// indexes; returns how many were deleted.
+    fn purge_idx_entries_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        scan.set_key_sssu(db, coll, "", b"");
+        let mut more = match scan.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    scan.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut keys: Vec<(String, Vec<u8>)> = Vec::new();
+        while more && keys.len() < limit {
+            let (d, c, n, packed) = scan.get_key_sssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            keys.push((n, packed));
+            more = scan.next()?;
+        }
+        let del = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (n, p) in &keys {
+            del.reset()?;
+            del.set_key_sssu(db, coll, n, p);
+            match del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(keys.len())
+    }
+
+    /// Delete up to `limit` natural-order rows (forward then reverse tables)
+    /// for the collection; returns how many were deleted.
+    fn purge_nat_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match nat.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    nat.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut seqs: Vec<i64> = Vec::new();
+        while more && seqs.len() < limit {
+            let (d, c, seq) = nat.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            seqs.push(seq);
+            more = nat.next()?;
+        }
+        for seq in &seqs {
+            nat.reset()?;
+            nat.set_key_ssq(db, coll, *seq);
+            if nat.search().is_ok() {
+                nat.remove()?;
+            }
+        }
+        let mut deleted = seqs.len();
+        if deleted >= limit {
+            return Ok(deleted);
+        }
+        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        rev.set_key_ssu(db, coll, b"");
+        let mut more = match rev.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    rev.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        while more && deleted + keys.len() < limit {
+            let (d, c, k) = rev.get_key_ssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            keys.push(k);
+            more = rev.next()?;
+        }
+        for k in &keys {
+            rev.reset()?;
+            rev.set_key_ssu(db, coll, k);
+            if rev.search().is_ok() {
+                rev.remove()?;
+            }
+        }
+        deleted += keys.len();
+        Ok(deleted)
+    }
+
+    /// Delete up to `limit` unique-key claims for the collection (all
+    /// indexes); returns how many were deleted.
+    fn purge_uniq_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let scan = session.open_cursor(UNIQ_TABLE, None)?;
+        let del = session.open_cursor(UNIQ_TABLE, None)?;
+        scan.reset()?;
+        scan.set_key_sssu(db, coll, "", b"");
+        let mut more = match scan.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    scan.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut keys: Vec<(String, Vec<u8>)> = Vec::new();
+        while more && keys.len() < limit {
+            let (d, c, n, k) = scan.get_key_sssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            keys.push((n, k));
+            more = scan.next()?;
+        }
+        for (n, k) in &keys {
+            del.reset()?;
+            del.set_key_sssu(db, coll, n, k);
+            match del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(keys.len())
+    }
+
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
         // Unique-key claims die with the namespace (see purge_unique_claims):
         // a surviving claim would reject a later insert of the same value
@@ -11254,6 +11676,63 @@ mod tests {
     //! `test_indexes.py` sees identical bytes. No WiredTiger needed.
     use super::*;
     use bson::doc;
+
+    /// A tombstone left by a crash mid-purge (phase 1 committed: registry row
+    /// gone, rows orphaned) is finished at the next open — the orphan rows
+    /// must not resurface under a re-created name. WT-backed (the only test
+    /// in this module that is): forging the crash-left state needs direct
+    /// access to the private tables.
+    #[test]
+    fn interrupted_drop_recovers_at_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "secantus-droprecover-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t").len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = dir.to_str().unwrap().to_string();
+        {
+            let st = Storage::open(&home).unwrap();
+            let docs: Vec<Vec<u8>> = (0..50i64)
+                .map(|i| bson::to_vec(&doc! {"_id": i, "x": i}).unwrap())
+                .collect();
+            st.insert("app", "c", docs, true).unwrap();
+            st.create_index("app", "c", "x_1", &doc! {"x": 1i32}, &Document::new())
+                .unwrap();
+            // Forge the crash-left state: phase 1's effects (registry row
+            // removed, tombstone written) without the phase-2 purge.
+            let session = st.conn.open_session().unwrap();
+            let rc = session.open_cursor(COLL_TABLE, None).unwrap();
+            rc.set_key_ss("app", "c");
+            rc.search().unwrap();
+            rc.remove().unwrap();
+            let t = session.open_cursor(TOMB_TABLE, None).unwrap();
+            t.set_key_ss("app", "c");
+            t.set_value_u(b"");
+            t.insert().unwrap();
+        }
+        let st = Storage::open(&home).unwrap();
+        // Recovery purged the orphans: a re-created collection sees only its
+        // own rows (orphaned doc rows would inflate the scan), and the
+        // tombstone is gone.
+        st.insert(
+            "app",
+            "c",
+            vec![bson::to_vec(&doc! {"_id": 100i64}).unwrap()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 1);
+        {
+            let session = st.conn.open_session().unwrap();
+            let t = session.open_cursor(TOMB_TABLE, None).unwrap();
+            t.set_key_ss("app", "c");
+            assert!(t.search().is_err(), "tombstone must be cleared");
+        }
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `doc_shard_hash` must be byte-for-byte identical to the Python
     /// `storage._doc_shard_hash` so a collection routes to the same documents

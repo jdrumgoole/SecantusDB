@@ -1179,3 +1179,39 @@ def test_bounded_write_paths_unchanged_by_chunking(tmp_path) -> None:
         assert out["upserted_id"] is not None
     finally:
         s.close()
+
+
+def test_pending_drop_tombstone_recovered_at_open(tmp_path) -> None:
+    """A drop tombstone left by the Rust server's chunked drop crashing
+    mid-purge (registry row gone, doc/index rows orphaned) is finished at the
+    next open — the orphans must not resurface inside a re-created collection.
+    The layouts are byte-identical cross-server, so the Python server must
+    honour a Rust-written tombstone."""
+    from secantus.storage import _COLL_TABLE, _TOMB_TABLE, _doc_table_for
+
+    s1 = Storage(str(tmp_path))
+    try:
+        s1.insert("app", "c", [{"_id": i, "x": i} for i in range(50)])
+        s1.create_index("app", "c", "x_1", {"x": 1}, {})
+        with s1._lock:
+            # Forge the crash-left state: phase 1's effects (registry row
+            # removed, tombstone written) without the phase-2 purge.
+            s1._delete_keys(_COLL_TABLE, [("app", "c")])
+            c = s1._cursor(_TOMB_TABLE)
+            c.set_key("app", "c")
+            c.set_value(b"")
+            c.insert()
+            c.reset()
+    finally:
+        s1.close()
+
+    s2 = Storage(str(tmp_path))
+    try:
+        # Recovery purged the orphans and cleared the tombstone; a re-created
+        # collection sees only its own rows.
+        assert s2._collect_prefix(_TOMB_TABLE, ()) == []
+        assert s2._collect_prefix(_doc_table_for("app", "c"), ("app", "c")) == []
+        s2.insert("app", "c", [{"_id": 100}])
+        assert s2.count_matching("app", "c", {}) == 1
+    finally:
+        s2.close()
