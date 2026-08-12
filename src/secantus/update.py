@@ -320,7 +320,17 @@ def apply_update(
             raise UpdateError(
                 "Performing an update on the path '_id' would modify the immutable field '_id'"
             )
-        new["_id"] = doc["_id"]
+        # ``_id`` leads the stored document, as it does in mongod. Assigning
+        # into ``new`` would APPEND it when the replacement omits ``_id``,
+        # and BSON preserves field order on the wire — so the client gets
+        # back a document that differs from mongod's byte for byte.
+        # mongo-php-library's CodecCollectionFunctionalTest compares the raw
+        # BSON of a findOneAndReplace result and caught exactly that.
+        # Applied unconditionally, not just when the replacement omits
+        # ``_id``: mongod always stores it first, whatever position the
+        # client put it in.
+        rest = {k: v for k, v in new.items() if k != "_id"}
+        return {"_id": doc["_id"], **rest}
     return new
 
 

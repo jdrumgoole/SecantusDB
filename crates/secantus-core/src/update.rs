@@ -887,7 +887,20 @@ pub fn apply_update_with(
             match new.get("_id") {
                 Some(v) if v != orig => return Err(Fallback), // changed _id -> Python raises
                 _ => {
-                    new.insert("_id".to_string(), orig.clone());
+                    // `_id` leads the stored document, as it does in mongod.
+                    // `insert` on a Document APPENDS when the key is absent,
+                    // and BSON preserves field order on the wire, so the
+                    // client got back bytes that differed from mongod's.
+                    // mongo-php-library's CodecCollectionFunctionalTest
+                    // compares raw BSON and caught exactly that.
+                    let mut ordered = Document::new();
+                    ordered.insert("_id".to_string(), orig.clone());
+                    for (k, v) in new.iter() {
+                        if k != "_id" {
+                            ordered.insert(k.clone(), v.clone());
+                        }
+                    }
+                    new = ordered;
                 }
             }
         }
@@ -968,10 +981,17 @@ mod tests {
     }
 
     #[test]
-    fn replacement_preserves_id() {
+    fn replacement_preserves_id_first() {
+        // `_id` leads, as in mongod. `doc!` comparison is order-sensitive,
+        // so this pins the byte order the client sees, not just the content.
         assert_eq!(
             upd(doc! {"_id": 7, "a": 1}, doc! {"b": 2}),
-            doc! {"b": 2, "_id": 7}
+            doc! {"_id": 7, "b": 2}
+        );
+        // Also when the replacement supplies `_id` itself, in a later slot.
+        assert_eq!(
+            upd(doc! {"_id": 7, "a": 1}, doc! {"b": 2, "_id": 7}),
+            doc! {"_id": 7, "b": 2}
         );
     }
 

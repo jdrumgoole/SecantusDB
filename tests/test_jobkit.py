@@ -212,6 +212,48 @@ def test_run_tracked_tees_log_when_child_exits_before_first_read(
     assert "CHILD-RAN" in log, f"child output was lost; log={log!r}"
 
 
+def test_run_tracked_drains_output_written_between_select_and_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bytes written in the select->poll window survive.
+
+    The tee loop asks ``select`` whether the pty is readable and, on a
+    timeout, leaves if the child has exited. A child that writes AND exits
+    *inside that window* leaves its output buffered in the pty, and the old
+    unconditional ``break`` discarded it — the journal row finished with exit
+    0 while the UI's log box rendered "(no output yet)". That is the failure
+    ``test_opsboard.py::test_job_log_tail_captures_child_output`` hit on
+    macOS CI, where the parent is slow enough to lose the race.
+
+    Returning "nothing readable" exactly once, after giving the child time to
+    finish, reproduces that interleaving deterministically: pre-fix the log is
+    empty every run, post-fix the drain recovers it every run.
+    """
+    real_select = _core.select.select
+    state = {"lied": False}
+
+    def lying_select(rlist: Any, wlist: Any, xlist: Any, timeout: Any = None) -> Any:
+        if not state["lied"]:
+            state["lied"] = True
+            # Child writes and exits while we claim the pty has nothing to
+            # read, so the loop falls into the child-has-exited branch with
+            # bytes still sitting in the buffer.
+            time.sleep(0.5)
+            return ([], [], [])
+        return real_select(rlist, wlist, xlist, timeout)
+
+    monkeypatch.setattr(_core.select, "select", lying_select)
+
+    journal = Journal(tmp_path / "opsboard.db")
+    code = run_tracked(["greet", "0"], journal=journal, echo=False)
+    assert code == 0
+
+    jobs, _ = journal.list()
+    assert jobs[0].log_path is not None
+    log = Path(jobs[0].log_path).read_text(encoding="utf-8")
+    assert "CHILD-RAN" in log, f"output written in the select/poll window was lost; log={log!r}"
+
+
 def test_run_tracked_records_failure_exit_code(tmp_path: Path) -> None:
     journal = Journal(tmp_path / "opsboard.db")
     code = run_tracked(["boom", "7"], journal=journal, echo=False)
