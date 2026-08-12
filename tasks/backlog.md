@@ -5315,7 +5315,33 @@ distinct problems, triaged from the run logs:
   exercised by any gauge: temp-table writes are also blocked (PG allows
   them in read-only txns), and `SELECT … FOR UPDATE` / `nextval()` are NOT
   blocked (PG blocks both).
-- [ ] **Rust server: `drop` of a heavily-churned collection wedges behind a
+- [x] **RESOLVED: Rust server: `drop` of a heavily-churned collection wedges
+  behind a WT eviction storm.** Root cause found by code reading, then
+  reproduced deterministically in seconds (`crates/secantus-storage/tests/
+  drop_chunk.rs`): collections share the sharded doc tables, so `drop` is a
+  row purge — and it ran as ONE statement transaction. A collection whose
+  delete markers exceed the cache's dirty budget gets a cache-pressure
+  `WT_ROLLBACK` (unevictable dirty content — the same class the chunked
+  insert / updateMany / deleteMany work closed), which the blanket
+  `WT_ROLLBACK -> WriteConflict` mapping fed into `retry_write_conflicts`'s
+  UNBOUNDED retry loop: re-run purge, re-storm, roll back, forever. That is
+  the whole incident signature — eviction threads spinning with zero
+  connections (the drop thread kept retrying server-side), no self-recovery,
+  SIGTERM dead behind the in-flight dispatch. The three negative repro
+  attempts failed because the missing ingredient was the COLLECTION-SIZE-TO-
+  CACHE ratio, not churn history: at the 4G default cache 1M small docs fit;
+  a 165MB collection under a 128M cache wedges every time. Fixed with a
+  chunked two-phase drop: phase 1 (small txn) unregisters the collection +
+  writes a `secantus_drop_tombstones` row + emits the drop oplog entry;
+  phase 2 purges rows in 4000-row statement transactions, then clears the
+  tombstone. A crash mid-purge is finished at the next open
+  (`recover_pending_drops`) before traffic can re-create the name, so orphan
+  rows can't resurface. `dropDatabase` converted the same way; inside a user
+  transaction both keep the old single-transaction path (the user-txn dirty
+  budget guard bounds it). The tombstone table is additive to the shared
+  layout (unique-keys precedent). Original entry follows for the incident
+  record.
+  Original: **Rust server: `drop` of a heavily-churned collection wedges behind a
   WT eviction storm.** Found by the 2026-08-11 concurrency-report refresh:
   after rounds of multi-writer churn (~1M+ docs inserted per row), a
   subsequent `drop` sat in dispatch 40+ minutes while every WT eviction
@@ -5341,6 +5367,18 @@ distinct problems, triaged from the run logs:
   (drop a prior row's collection mid-churn). Also note: a drop queued
   behind live writers starves indefinitely (lock fairness) — the bench
   harness now avoids drops entirely (fresh per-row collection names).
+- [ ] **Rust server: `rename_collection` re-keys every row in one statement
+  transaction — same txn-too-large-for-cache class as the (fixed) drop
+  wedge.** A rename of a collection whose re-key volume exceeds the cache's
+  dirty budget would hit the same cache-pressure `WT_ROLLBACK` + unbounded
+  `retry_write_conflicts` loop. Unlike drop, rename NEEDS single-transaction
+  atomicity (a crash mid-rename must not leave the namespace half-moved), so
+  the chunked-drop pattern doesn't transplant directly — it wants a
+  tombstone-style two-phase move (register dst + tombstone src, batched
+  re-key, finalize) with open-time recovery. Not observed in the wild
+  (renames of huge collections are rare); bounded today only by luck of
+  cache headroom. The `drop_target=true` purge inside rename shares the
+  shape.
 - [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
   first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
   …) are inside the ~347 documented standing failures of the 93.7% baseline
