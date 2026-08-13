@@ -36,7 +36,7 @@ from secantus.auth import (
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import CursorNotFound, CursorRegistry
 from secantus.expressions import ExpressionError, UnknownExpressionOperatorError
-from secantus.failpoints import FailPointRegistry
+from secantus.failpoints import FailPointRegistry, is_resumable_change_stream_code
 from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
@@ -6822,8 +6822,22 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     "code": match.error_code,
                     "codeName": _code_name_for(match.error_code),
                 }
-                if match.error_labels:
-                    result["errorLabels"] = list(match.error_labels)
+                labels = list(match.error_labels)
+                # ``failGetMoreAfterCursorCheckout`` is injected *inside*
+                # mongod's change-stream getMore path, so a resumable code
+                # comes back stamped ``ResumableChangeStreamError`` and the
+                # driver resumes the stream. Plain ``failCommand``
+                # short-circuits earlier and carries only the labels the
+                # failpoint itself named — the change-streams spec pins that
+                # difference, so the label must NOT be added for it.
+                if (
+                    match.server_injected
+                    and is_resumable_change_stream_code(match.error_code)
+                    and "ResumableChangeStreamError" not in labels
+                ):
+                    labels.append("ResumableChangeStreamError")
+                if labels:
+                    result["errorLabels"] = labels
                 return result
             if match.write_concern_error is not None:
                 wce = dict(match.write_concern_error)

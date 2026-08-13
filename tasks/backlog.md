@@ -305,6 +305,52 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **DATA CORRUPTION: retryable writes are not idempotent — a retried write
+  is APPLIED TWICE, silently, on BOTH servers.** Found 2026-08-13 while
+  triaging the C gauge's `/command_monitoring/unified/writeConcernError`.
+
+  mongod persists the outcome of every retryable write keyed by
+  `(lsid, txnNumber)` (its `config.transactions` collection). When the same
+  `lsid` + `txnNumber` arrives again — which every official driver sends
+  automatically after a network blip, a `writeConcernError`, or a stepdown —
+  mongod recognises the repeat and returns the **stored** result without
+  re-applying the write. SecantusDB does neither: `_txn_envelope` parses the
+  envelope and `TransactionRegistry.on_retryable_write` merely consumes the
+  txnNumber sequence. Nothing caches the result; nothing detects a repeat. The
+  write simply runs again.
+
+  Reproduced over the wire, same command sent twice with one `lsid` /
+  `txnNumber` (`{"$inc": {"n": 1}}` against `{_id: 1, n: 0}`):
+
+  ```
+  first  reply nModified: 1
+  retry  reply nModified: 1
+  final stored value: 2        <-- mongod stores 1
+  ```
+
+  **Identical on the Python and Rust servers.** The insert case is loud (the
+  retry hits `E11000`, which is what the C test sees). The update case is
+  SILENT: the value is doubled and both replies claim `nModified: 1`, so the
+  client is told exactly one update happened. Any non-idempotent operator —
+  `$inc`, `$push`, `$addToSet`-on-array-growth, `$mul` — corrupts data with no
+  error surfaced to anyone. This is the "never ignore an error — this is a
+  database" category: a user loses data integrity and gets a success reply.
+
+  **Fixing it properly** means implementing mongod's retryable-write record:
+  persist `(lsid, txnNumber) -> {reply, opTime}` per statement (mongod keys
+  per statement id within a batch, so a partially-applied `insert` batch
+  retries only its missing documents), return the cached reply verbatim on a
+  repeat, and expire records the way mongod's 30-minute
+  `transactionLifetimeLimitSeconds` sweep does. It must land on **both**
+  engines together plus storage, so it is a slice of its own, not a
+  conformance-gauge cleanup. Deliberately deferred here rather than
+  half-implemented — a partial version that caches some operations and not
+  others would be worse than the current honest-but-wrong behaviour, because
+  it would look fixed.
+
+  Until it lands, the C gauge's `writeConcernError` test stays red on both
+  servers: it retries an insert and expects the retry to be recognised.
+
 - [ ] **`invoke concurrency-refresh` needs a genuinely quiet box AND a spread
   audit before its output is trusted.** Two consecutive refresh runs
   (2026-08-02) were silently poisoned by a parallel session's gauge load —
