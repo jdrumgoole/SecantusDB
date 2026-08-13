@@ -6498,6 +6498,52 @@ _TXN_BLOCKED_AGG_STAGES = frozenset(
 # plus the retryable-error codes, which are transient on any
 # non-commit statement. Notably NOT here: 11000 duplicate key — it
 # aborts the transaction but retrying wouldn't help, so no label.
+# Commands mongod records a retryable-write result for. Drivers only attach a
+# ``txnNumber`` to genuinely retryable operations (single-document writes) —
+# ``updateMany`` / ``deleteMany`` are excluded by the spec and arrive without
+# one — so the envelope alone is the signal. Naming the commands anyway keeps
+# a stray ``txnNumber`` on a read from being cached and replayed.
+_RETRYABLE_WRITE_COMMANDS = frozenset({"insert", "update", "delete", "findAndModify"})
+
+# Envelope fields a driver legitimately varies between the original attempt and
+# its retry (gossip, routing, the session envelope itself). Excluded from the
+# identity digest so a genuine retry still matches.
+_RETRY_IDENTITY_IGNORED = frozenset(
+    {
+        "lsid",
+        "txnNumber",
+        "$clusterTime",
+        "$db",
+        "$readPreference",
+        "readConcern",
+        "writeConcern",
+        "apiVersion",
+        "apiStrict",
+        "apiDeprecationErrors",
+        "comment",
+    }
+)
+
+
+def _retry_identity(doc: Mapping[str, Any]) -> bytes:
+    """A stable digest of the write this command represents.
+
+    Two attempts of the same retryable write are byte-identical apart from the
+    envelope fields above, so this matches on a genuine retry and differs when
+    the (lsid, txnNumber) key has been reused for another write. Falls back to
+    a repr-based digest if the body isn't BSON-encodable, which only has to be
+    consistent, not canonical.
+    """
+    import hashlib
+
+    body = {k: v for k, v in doc.items() if k not in _RETRY_IDENTITY_IGNORED}
+    try:
+        payload = bson.encode(body)
+    except Exception:
+        payload = repr(sorted(body.items(), key=lambda kv: kv[0])).encode("utf-8", "replace")
+    return hashlib.sha1(payload, usedforsecurity=False).digest()
+
+
 _TRANSIENT_TXN_CODES = frozenset(
     {112, 246, 251, 24, 6, 7, 89, 91, 189, 9001, 10107, 11600, 11602, 13435, 13436}
 )
@@ -6855,6 +6901,7 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # retryable-commit tests inject an error on the first commit
     # attempt and expect the retry to succeed.
     txn: Transaction | None = None
+    retryable_key: tuple[bytes, int, bytes] | None = None
     if ctx.transactions is not None and "txnNumber" in doc:
         lsid_bytes, txn_number = _txn_envelope(doc)
         if lsid_bytes is not None and txn_number is not None:
@@ -6863,10 +6910,22 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     txn, txn_err = _resolve_txn_statement(name, doc, ctx, lsid_bytes, txn_number)
                     if txn_err is not None:
                         return txn_err
-            else:
+            elif name in _RETRYABLE_WRITE_COMMANDS:
                 # Retryable write: consumes the session's txnNumber
                 # sequence and implicitly aborts an older open
                 # transaction, as in mongod.
+                ctx.transactions.on_retryable_write(lsid_bytes, txn_number)
+                # If this exact (lsid, txnNumber) already ran, replay its
+                # stored reply instead of executing the write again. This is
+                # what makes a driver's automatic retry idempotent: without
+                # it a retried {$inc: {n: 1}} applies twice while both
+                # replies claim nModified: 1.
+                retry_identity = _retry_identity(doc)
+                cached = ctx.transactions.retryable_reply(lsid_bytes, txn_number, retry_identity)
+                if cached is not None:
+                    return cached
+                retryable_key = (lsid_bytes, txn_number, retry_identity)
+            else:
                 ctx.transactions.on_retryable_write(lsid_bytes, txn_number)
     profile_eligible = _profile_eligible_command(name, doc)
     start_ns = _time.monotonic_ns() if profile_eligible else 0
@@ -6983,4 +7042,11 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 cursor_part.setdefault("atClusterTime", ts)
             else:
                 result.setdefault("atClusterTime", ts)
+    # Store the outcome so a retry of this same (lsid, txnNumber) replays it
+    # rather than re-applying the write. Recorded AFTER the gossip fields are
+    # attached so the replay is byte-identical to the original reply.
+    if retryable_key is not None and ctx.transactions is not None:
+        ctx.transactions.record_retryable(
+            retryable_key[0], retryable_key[1], retryable_key[2], result
+        )
     return result
