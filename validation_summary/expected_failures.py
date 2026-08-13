@@ -170,7 +170,68 @@ RUBY: list[ExpectedFailure] = [
     ),
 ]
 
-PYMONGO: list[ExpectedFailure] = []
+PYMONGO: list[ExpectedFailure] = [
+    ExpectedFailure(
+        pattern="test_index_hashed",
+        rationale=(
+            "Hashed indexes are intentionally out of scope per CLAUDE.md. "
+            "`createIndexes` rejects them explicitly with "
+            "`CannotCreateIndex` (67) 'hashed indexes are not supported by "
+            "SecantusDB' — a faithful not-supported error, which is the "
+            "documented preference over a half-implemented index type."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="test_index_text",
+        rationale=(
+            "Text indexes are intentionally out of scope per CLAUDE.md "
+            "(same gap as the node gauge's text-search test). "
+            "`createIndexes` rejects them with `CannotCreateIndex` (67) "
+            "'text indexes are not supported by SecantusDB'."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="test_where",
+        rationale=(
+            "`$where` runs server-side JavaScript and SecantusDB ships no JS "
+            "runtime, so it is rejected with `BadValue` (2) 'unsupported "
+            "top-level operator: $where'. Out of scope per tasks/backlog.md §4 "
+            "— supporting it would mean embedding a JS engine as mongod does."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="test_maxtime_ms_message",
+        rationale=(
+            "Blocked by `$where`, not by the behaviour under test. The test "
+            "builds a deliberately slow query with `find({'$where': delay(...)})` "
+            "and asserts the resulting timeout error names the configured "
+            "timeouts. SecantusDB rejects `$where` up front (BadValue 2), so the "
+            "command fails before any timeout can elapse. NOTE: this leaves the "
+            "maxTimeMS *error-message* shape unverified by this gauge rather "
+            "than known-good — it is untested here, not proven correct."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="test_to_list_csot_applied",
+        rationale=(
+            "Blocked by `$where`, same as `test_maxtime_ms_message`: the test "
+            "delays the query with `find({'$where': delay(1)})` and asserts the "
+            "raised error carries `.timeout == True`. `$where` is rejected up "
+            "front, so the error is a BadValue rather than a timeout. NOTE: CSOT "
+            "behaviour is therefore unverified by this gauge, not confirmed."
+        ),
+    ),
+    ExpectedFailure(
+        pattern="test_read_preference_hedge_deprecated",
+        rationale=(
+            "Async-only, and never reaches the wire: the test constructs "
+            "`PrimaryPreferred(hedge={'enabled': True})` and asserts a "
+            "`DeprecationWarning` is raised by the driver's own constructor. "
+            "Purely client-side pymongo behaviour, dependent on the ambient "
+            "warning filters — no server can influence the outcome."
+        ),
+    ),
+]
 
 C: list[ExpectedFailure] = [
     ExpectedFailure(
