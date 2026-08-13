@@ -1175,7 +1175,13 @@ def coerce(value: Any, tag: str) -> Any:
         sentinel = datetime_sentinel(value)
         if sentinel is not None:
             return sentinel
-        wide = wide_timestamp_text(value)
+        session = _render_session.get()
+        default_off = None
+        if session is not None:
+            from secantus.sql.datetimes import session_offset_text
+
+            default_off = session_offset_text(session)
+        wide = wide_timestamp_text(value, default_offset=default_off)
         if wide is not None:
             return wide  # PG-valid but beyond Python's datetime range: text
         return _representable_instant(_as_session_instant(parse_iso_datetime(value)))
@@ -1296,6 +1302,10 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     """
     if value is None:
         return None
+    if tag == "timetz" or isinstance(value, TimeTzText):
+        from secantus.sql import datetimes as _datetimes
+
+        return _datetimes.render_timetz(value).encode("ascii")
     if tag in _VECTOR_TAGS and isinstance(value, (list, tuple)):
         # int2vector / oidvector render as space-separated ints ("1 2"), the
         # form libpq clients parse for pg_index.indkey/indoption/indclass.

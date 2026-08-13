@@ -34,8 +34,10 @@ declared return type, Describe that derives result shapes without executing
 a side-effecting function body, PostgreSQL's void-argument convention for
 the JDBC OUT-parameter slot, and plpgsql `RAISE`. Four pgjdbc test classes
 that were previously zeroed — BlobTest, BlobTransactionTest,
-CallableStmtTest, CleanupSavepointsWithFastpathTest — now pass in full, and
-the DateTest date-offset cluster is confirmed cleared at 192/192.
+CallableStmtTest, CleanupSavepointsWithFastpathTest — now pass in full.
+(A claim in the original release notes that DateTest was cleared at 192/192
+traced to an XML-parsing bug in the measurement script — the real remaining
+failures are fixed in the next release's time-zone slice.)
 
 On the storage side, dropping a very large collection could livelock the
 Rust server: the whole row purge ran as one WiredTiger transaction, and once
