@@ -5459,6 +5459,24 @@ distinct problems, triaged from the run logs:
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
   killer. Until then: 1-in-3, unreproduced.
+- [ ] **AutoRollbackTest (8): server-side cached-plan revalidation — prototype
+  went 8 -> 28, reverted; needs a wire capture.** pgjdbc's autosave matrix
+  expects `cached plan must not change result type` (0A000) from the server
+  when a NAMED prepared statement's result shape changed under DDL. A
+  prototype (2026-08-13, on the extended-protocol Execute path: capture
+  `(name, oid)` shape per named statement at first execute, raise 0A000 +
+  replan on mismatch) fixed the shape probe itself (verified with psycopg:
+  raise once, succeed on retry, unchanged shapes unaffected) but moved
+  AutoRollbackTest **8 -> 28** — the error fires in matrix variants where
+  pgjdbc expects success, so PG's raise condition is narrower than
+  shape-changed-on-named-statement (suspects: pgjdbc's flushCacheOnDdl
+  discarding + re-preparing under the same name, DISCARD/DEALLOCATE ALL not
+  clearing our `pgextended.prepared` map, or PG raising only for
+  generic-plan statements). Next step: capture ONE failing variant's wire
+  exchange (Parse/Bind/Execute/Close sequence with statement names) against
+  real PG and us — the capture-first method that settled DateTest. The
+  prototype diff is small and correct-in-isolation; re-apply it once the
+  condition is pinned.
 - [x] **RESOLVED: `pgjdbc` weekly lane is red by construction** — the lane
   now exits by baseline comparison (`pgjdbc_validation/baseline.py` +
   committed `baseline.json`); red means a regression vs the documented
