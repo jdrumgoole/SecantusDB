@@ -5521,3 +5521,88 @@ def test_bucket_validation_no_data_loss(coll) -> None:
         with pytest.raises(OperationFailure) as exc:
             list(coll.aggregate([{"$bucket": spec}]))
         assert exc.value.code == code, spec
+
+
+def test_failgetmore_after_cursor_checkout_stamps_resumable_label(server) -> None:
+    """``failGetMoreAfterCursorCheckout`` + a resumable code resumes the stream.
+
+    mongod injects this failpoint *inside* the change-stream getMore path,
+    where a resumable error code comes back stamped
+    ``ResumableChangeStreamError`` — that label is the whole reason a driver
+    resumes instead of surfacing the error. Ignoring the failpoint (the
+    previous behaviour) meant the getMore simply succeeded and no resume ever
+    happened; libmongoc's ``change-streams-resume-errorLabels`` saw 2 commands
+    where the spec requires 3.
+
+    Asserting on COMMAND MONITORING, not on the delivered event, is the whole
+    point: the event arrives either way (with the failpoint ignored the first
+    getMore just works), so a test that only checks the event passes whether or
+    not the fix is present. The resume is only observable as a *second*
+    ``aggregate`` on the wire.
+    """
+    from pymongo import MongoClient, monitoring
+
+    started: list[str] = []
+
+    class _Listener(monitoring.CommandListener):
+        def started(self, event: monitoring.CommandStartedEvent) -> None:
+            started.append(event.command_name)
+
+        def succeeded(self, event: object) -> None:
+            pass
+
+        def failed(self, event: object) -> None:
+            pass
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=5000, event_listeners=[_Listener()])
+    try:
+        db = mc["resume_label_db"]
+        db.create_collection("c")
+        mc.admin.command(
+            {
+                "configureFailPoint": "failGetMoreAfterCursorCheckout",
+                "mode": {"times": 1},
+                "data": {"errorCode": 6, "closeConnection": False},  # HostUnreachable
+            }
+        )
+        started.clear()
+        with db["c"].watch() as stream:
+            db["c"].insert_one({"x": 1})
+            change = stream.next()
+            assert change["operationType"] == "insert"
+        # The resume is the second aggregate. Without the label the driver
+        # would surface the error instead, leaving exactly one.
+        assert started.count("aggregate") >= 2, (
+            f"expected a resume (2nd aggregate); saw commands: {started}"
+        )
+    finally:
+        mc.close()
+
+
+def test_plain_failcommand_does_not_stamp_resumable_label(client) -> None:
+    """Plain ``failCommand`` must NOT add the label — the spec pins the split.
+
+    ``failCommand`` short-circuits before mongod's change-stream machinery, so
+    it carries only the labels the failpoint itself named. Same error code, a
+    different failpoint, deliberately the opposite outcome: the error must
+    reach the client rather than being resumed away. Stamping the label
+    unconditionally would silently swallow errors a test expects to see.
+    """
+    from pymongo.errors import PyMongoError
+
+    db = client["no_resume_label_db"]
+    db.create_collection("c")
+
+    with db["c"].watch() as stream:
+        db["c"].insert_one({"x": 1})
+        assert stream.next()["operationType"] == "insert"
+        client.admin.command(
+            {
+                "configureFailPoint": "failCommand",
+                "mode": {"times": 1},
+                "data": {"failCommands": ["getMore"], "errorCode": 6},
+            }
+        )
+        db["c"].insert_one({"x": 2})
+        with pytest.raises(PyMongoError):
+            stream.next()
