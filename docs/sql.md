@@ -1515,10 +1515,14 @@ $$ LANGUAGE plpgsql;
 
 A bare identifier that matches a declared variable or a parameter resolves to that
 value; everything else (table columns, functions, subqueries) is left to the
-ordinary SQL machinery. `IF` treats a `NULL` condition as false. **Out of scope**
-(rejected with `0A000`, at `CREATE` time): loops (`LOOP` / `WHILE` / `FOR`),
-`RAISE`, `RETURN QUERY` / `RETURN NEXT` (set-returning), `CASE` statements,
-cursors, `EXCEPTION` handlers, and dynamic `EXECUTE`.
+ordinary SQL machinery. `IF` treats a `NULL` condition as false. `RAISE` is
+supported with PostgreSQL's semantics: `RAISE NOTICE` / `WARNING` / `INFO` /
+`DEBUG` / `LOG` format a message (`%` placeholders, comma-separated arguments)
+and deliver it to the client as a wire notice; `RAISE EXCEPTION` aborts the
+function with `P0001`. **Out of scope** (rejected with `0A000`, at `CREATE`
+time): loops (`LOOP` / `WHILE` / `FOR`), `RETURN QUERY` / `RETURN NEXT`
+(set-returning), `CASE` statements, cursors, `EXCEPTION` handlers, and dynamic
+`EXECUTE`.
 
 User functions are reflected like Postgres', so `psql`'s `\df` and SQLAlchemy see
 them: they appear in `pg_catalog.pg_proc` (with `proname` / `pronargs` /
@@ -1536,8 +1540,8 @@ FROM pg_catalog.pg_proc WHERE proname = 'add';   -- add | a integer, b integer |
 
 **Simplifications:** `LANGUAGE sql` bodies must be a single statement (a
 multi-statement `sql` body is not yet supported); `LANGUAGE plpgsql` covers the
-scalar subset above (no loops / `RAISE` / set-returning / `CASE` / cursors /
-exceptions); a set-returning (`RETURNS SETOF` / `TABLE`) function returns only its
+scalar subset above (no loops / set-returning / `CASE` / cursors / exception
+handlers); a set-returning (`RETURNS SETOF` / `TABLE`) function returns only its
 first row in a scalar context (use it as a scalar); and `pg_proc` lists only
 user-defined functions (built-ins aren't enumerated there).
 
@@ -2499,6 +2503,31 @@ WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (s.sku, s.qty)
 RETURNING merge_action(), i.sku, s.qty AS shipped;
 ```
 
+## Large objects
+
+The PostgreSQL Large Object API is supported the way drivers actually drive
+it: over the **Fastpath sub-protocol** (wire `FunctionCall` messages
+dispatching the `lo_*` built-ins by their real `pg_proc` OIDs, which are
+reflected into `pg_catalog.pg_proc` so a driver can resolve them by name).
+This is what pgjdbc's `LargeObjectManager` — and therefore JDBC `Blob` /
+`Clob` — uses.
+
+Supported functions: `lo_creat`, `lo_create`, `lo_open`, `lo_close`,
+`loread`, `lowrite`, `lo_lseek`, `lo_tell`, `lo_truncate`, `lo_unlink`, and
+the 64-bit variants `lo_lseek64` / `lo_tell64` / `lo_truncate64`.
+`lo_creat`, `lo_create`, and `lo_unlink` are also callable from SQL
+(`INSERT INTO t VALUES (1, lo_creat(-1))`, `SELECT lo_unlink(lob) FROM t`).
+
+Object bytes are stored chunked and **sparse** — `lo_truncate` extending an
+object to multiple gigabytes stores nothing for the holes, which read back
+as zero bytes, matching PostgreSQL's representation. Reads and writes join
+the session's open transaction, so a `ROLLBACK` discards `lowrite` data.
+Descriptors are per-session; PostgreSQL closes them at transaction end,
+SecantusDB at session end (no driver-visible difference in practice).
+contrib/lo's `lo_manage` trigger DDL is accepted as a recognized no-op
+(replaced objects are never auto-unlinked — nothing vacuums orphans);
+`lo_import` / `lo_export` (server-side file I/O) are not supported.
+
 ## Bulk load / dump (`COPY`)
 
 `COPY … FROM STDIN` bulk-loads rows and `COPY … TO STDOUT` streams them out — the
@@ -2842,20 +2871,27 @@ SELECT pg_advisory_unlock_all();          -- release all session locks
 ```
 
 All eleven functions are supported — `pg_advisory_lock` / `pg_advisory_unlock` /
-`pg_advisory_unlock_all` and the `_shared`, `_xact_`, and `pg_try_*` variants.
-SecantusDB is single-node, so a lock is **always granted immediately** — the
-functions never block. What SecantusDB does track is *which* locks the
-connection holds, so:
+`pg_advisory_unlock_all` and the `_shared`, `_xact_`, and `pg_try_*` variants —
+and they provide **real mutual exclusion**: the server runs one advisory-lock
+table shared by every connection, so leader-election and migration-fencing
+patterns (alembic's lock, cron fencing) genuinely exclude. Semantics follow
+PostgreSQL:
 
-- `pg_try_advisory_lock*` always return `true` (nothing to contend with);
+- exclusive and shared modes with PostgreSQL's grant rules — two sessions can
+  share a `_shared` hold, an exclusive hold blocks everyone else;
+- `pg_advisory_lock*` **block** until the lock is granted, with deadlock
+  detection (a cycle raises `40P01 deadlock detected` in one of the waiters);
+- `pg_try_advisory_lock*` return `true` / `false` truthfully;
 - `pg_advisory_unlock*` return `true` only if a matching session-level lock was
   held (and `false` otherwise, as Postgres does);
 - advisory locks are **re-entrant** — locking the same key twice needs two
   unlocks;
 - `pg_advisory_xact_lock*` locks are released automatically at `COMMIT` /
   `ROLLBACK` (and can't be released manually);
-- the held locks are reflected through **`pg_catalog.pg_locks`** (`locktype =
-  'advisory'`, one row per key+mode, always `granted`).
+- every held lock is released when its connection ends;
+- held locks are reflected through **`pg_catalog.pg_locks`** (`locktype =
+  'advisory'`, one row per key+mode, always `granted`), across all
+  connections.
 
 ```sql
 SELECT locktype, classid, objid, objsubid, mode, granted
@@ -2864,9 +2900,8 @@ FROM pg_locks WHERE locktype = 'advisory';
 
 A single `bigint` key splits into `(classid, objid)` signed 32-bit halves with
 `objsubid = 1`; a two-`int4` key maps straight through with `objsubid = 2` —
-matching Postgres. `pg_locks` reflects **this connection's** locks (single-node
-dev surface); cross-backend visibility and non-advisory lock types aren't
-modelled.
+matching Postgres. Non-advisory lock types (relation / tuple rows) aren't
+modelled in `pg_locks`.
 
 ### Two-phase commit (`PREPARE TRANSACTION`)
 
@@ -3302,7 +3337,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) (select list *and* `HAVING`, single-table + JOIN), an **expression over an aggregate** (`sum(x)+1`, `round(avg(x),2)`), a **computed GROUP BY key** (`GROUP BY lower(name)`, `GROUP BY a+b`, incl. over a JOIN and under GROUPING SETS), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table **and over a JOIN**, incl. `HAVING`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) per set, the statistical / bitwise aggregates (`variance`/`var_pop`/`stddev*`/`bit_and`/`bit_or`/`bit_xor`) per set, computed keys, **and a window over it — single-table or over a JOIN**) + the `GROUPING()` super-aggregate helper, **`ORDER BY <position>`** (`ORDER BY 1`) and **`ORDER BY <aggregate>`** (`ORDER BY count(*) DESC`, when selected) | a correlated WHERE over a JOIN, or a subquery in HAVING alongside a window over GROUPING SETS |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` frames (`UNBOUNDED`/`CURRENT ROW`, numeric `n PRECEDING`/`n FOLLOWING` offsets, **and** `INTERVAL` offsets over a date/timestamp key) | a `RANGE` interval offset on a non-temporal key |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, a **pure-`RIGHT` adjacent chain of 3+ tables**, a **leading `RIGHT`/`FULL` join + `INNER`/`LEFT` tail**, a **trailing `RIGHT`/`FULL` join over an `N`-table `INNER`/`LEFT` composite** (`A [INNER|LEFT] JOIN B [… JOIN …] RIGHT|FULL JOIN C`, outer `ON` over any subset of composite tables), `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (simple single-table subquery, or a **rich** subquery — join / `GROUP BY` / `DISTINCT` / aggregate — evaluated per outer row; correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | a `RIGHT`/`FULL` join that isn't first in a 3+ chain (other than the trailing-outer-over-a-composite case), a non-adjacent `RIGHT` `ON`, a second `FULL` in the tail, a composite whose own joins aren't adjacent |
-| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql` single-statement body, or `LANGUAGE plpgsql` scalar body — `DECLARE` / `:=` / `IF` / `RETURN` / `SELECT … INTO`), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, multi-statement `LANGUAGE sql` bodies, `plpgsql` loops / `RAISE` / set-returning / `CASE` / cursors / exceptions |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql` single-statement body, or `LANGUAGE plpgsql` scalar body — `DECLARE` / `:=` / `IF` / `RAISE` / `RETURN` / `SELECT … INTO`), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, multi-statement `LANGUAGE sql` bodies, `plpgsql` loops / set-returning / `CASE` / cursors / exception handlers |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (real nested rollback), two-phase commit `PREPARE TRANSACTION` / `COMMIT`/`ROLLBACK PREPARED` (cross-connection, `pg_prepared_xacts`) | prepared xacts surviving a restart, two-phase over the extended protocol |
 | Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors), `EXPLAIN [ANALYZE]` (`FORMAT TEXT`/`JSON`, faithful Index/Seq Scan) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows, per-node `EXPLAIN` costs / timing |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format, `COPY … FROM/TO STDIN/STDOUT` (text + CSV) | binary-format `COPY`, `COPY` from/to a server-side file |

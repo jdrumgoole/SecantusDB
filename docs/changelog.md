@@ -19,6 +19,1383 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b10] — 2026-08-13
+
+### Large objects over Fastpath, a drop that can't wedge the engine, and TCP_NODELAY everywhere
+
+This release closes two of the oldest gaps a PostgreSQL client could hit.
+The PG server now implements the Large Object API the way pgjdbc's
+`LargeObjectManager` (and therefore JDBC `Blob`/`Clob`) actually drives it —
+the Fastpath sub-protocol dispatching `lo_open` / `loread` / `lowrite` and
+friends by their real `pg_proc` OIDs, backed by chunked sparse storage that
+joins the session's transaction. Around it landed the pieces callable
+statements need: user-defined functions in FROM position typed by their
+declared return type, Describe that derives result shapes without executing
+a side-effecting function body, PostgreSQL's void-argument convention for
+the JDBC OUT-parameter slot, and plpgsql `RAISE`. Four pgjdbc test classes
+that were previously zeroed — BlobTest, BlobTransactionTest,
+CallableStmtTest, CleanupSavepointsWithFastpathTest — now pass in full, and
+the DateTest date-offset cluster is confirmed cleared at 192/192.
+
+On the storage side, dropping a very large collection could livelock the
+Rust server: the whole row purge ran as one WiredTiger transaction, and once
+its delete volume exceeded the cache's dirty budget the engine rolled it
+back for cache pressure and the retry loop re-ran it forever — an eviction
+storm that survived client disconnects and ignored SIGTERM. Drops are now
+chunked and two-phase, with a tombstone that makes a crash mid-purge
+recover cleanly at the next open, on both servers. Both wire servers also
+now set TCP_NODELAY on every connection, which removes Linux delayed-ACK
+stalls worth ~40ms per round-trip — one pgjdbc generated-keys batch test
+went from 41.5 seconds to 0.2. The performance and concurrency reports on
+secantusdb.com were re-measured from scratch with hardened harnesses, and
+the Rust server gained a background oplog pruner and a 4G embedded cache
+default that keep sustained write throughput off the request path.
+
+
+### Document validation you can actually stage, and an admin UI that reaches the rest of the server
+
+Setting `validationAction: "warn"` on a collection is how you stage a
+validator against live traffic — mongod logs the violations and stores the
+document anyway. The Python server accepted the option, reported success,
+and then rejected the write with code 121 regardless, so the one workflow
+the setting exists for was the one it broke. `collMod` had the same shape
+of problem from the other end: it replied `ok: 1` to `validationAction`
+and `validationLevel` and quietly discarded both, leaving callers
+convinced they had relaxed enforcement that was still fully armed. Both
+are fixed, on every write path, and the Rust server — which already got
+this right — is now matched exactly.
+
+The admin UI also stopped hiding features the server has shipped for a
+while. Collections can be created with validators and capped options,
+modified with `collMod`, and renamed (across databases, with an optional
+`dropTarget`); custom roles can be created and dropped. The change-stream
+page gained the options that make it a real debugging tool: `fullDocument`
+and `fullDocumentBeforeChange`, all three start points, and a pipeline
+filter — plus a **Resume from here** button on every event, which finally
+closes a loop the page had left open by offering a "Copy resume token"
+button with nowhere to paste the token.
+
+#### Added
+
+- Admin: create / `collMod` / rename panels on the collection list, and
+  create / drop for custom roles on `/roles`. Options are entered as one
+  Extended-JSON document, so any option the target server understands
+  works without waiting for a matching form field.
+- Admin: `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`,
+  `startAfter`, `startAtOperationTime` and pipeline controls on the
+  change-stream page, with a **Resume from here** action per event.
+  Options round-trip through the URL, so a shared link reproduces the
+  same stream.
+
+#### Fixed
+
+- `validationAction: "warn"` and `"off"` now accept violating writes
+  instead of rejecting them with `DocumentValidationFailure` (121), on
+  insert, update, replace and `findAndModify` alike. Only the default
+  `"error"` rejects.
+- `collMod` now applies `validationAction` and `validationLevel` rather
+  than accepting and discarding them.
+- Admin: a rejected change-stream option is reported as a readable error
+  frame instead of a bare websocket close, and the message is no longer
+  overwritten by the disconnect handler that followed it.
+
+### Advisory locks now actually exclude
+
+`pg_advisory_lock` and friends used to be session-local bookkeeping that
+always granted — two connections could both "hold" the same exclusive lock,
+so leader-election and migration-fencing patterns (alembic's lock, cron
+fencing) silently provided no mutual exclusion. The PG server now runs a
+server-wide advisory-lock table shared by every connection: exclusive and
+shared modes with PostgreSQL's grant rules, re-entrant holds, blocking
+`pg_advisory_lock` waits with deadlock detection (`40P01 deadlock
+detected`), truthful `pg_try_*` results, and release on unlock, at
+transaction end for `xact` locks, and when a connection ends.
+
+#### Added
+
+- `secantus.sql.pgadvisory.AdvisoryLockHub`: the server-wide lock table,
+  attached to every wire session; per-session state remains the `pg_locks`
+  reflection layer. Pinned by cross-connection tests covering exclusion,
+  blocking waits, shared/exclusive interaction, deadlock detection,
+  transaction-end and connection-teardown release — including a wire-level
+  two-connection psycopg test.
+
+### Large batch inserts no longer risk a storage livelock
+
+A single insert message can carry up to 48MB of documents, and the Python
+server used to write the entire batch — document rows, their full-document
+oplog entries, and every index entry, roughly two to three times the message
+bytes — inside one WiredTiger transaction. A transaction's dirty content is
+unevictable, so a large enough batch could pin the storage cache past its
+dirty-stall threshold and livelock the engine: every thread drafted into
+eviction, nothing evictable, and only the stuck writer's own commit able to
+free the cache. This is what wedged the mongo-rust-driver conformance
+gauge's `large_insert` test (35,000 tweet-sized documents) in weekly CI —
+and once wedged, the server never recovered.
+
+Inserts now commit in bounded chunks of at most 1,000 documents or 4MB per
+statement transaction, mirroring what real mongod does with its internal
+insert batches. MongoDB batch inserts are per-document atomic only — a batch
+has never been all-or-nothing — so the extra commit points are invisible to
+clients: ordered batches still stop at the first error with the correct
+per-document index, unordered batches still report every error, and capped
+collections still never evict documents from the batch being inserted.
+
+#### Fixed
+
+- `secantus.storage.insert`: one wire batch no longer runs as one WiredTiger
+  statement transaction; chunks are bounded at 1,000 docs / 4MB with the
+  write-conflict retry scoped per chunk. Reproduced and pinned by
+  `test_storage.py::test_large_batch_insert_survives_a_small_cache` (35k ×
+  1.1KB documents against a deliberately small 128M cache) plus
+  ordered/unordered cross-chunk semantics tests.
+
+### A finished job no longer shows an empty log
+
+The opsboard runs each job as a detached child on a pseudo-terminal and
+tees everything it prints to a logfile the UI tails. That tee loop asked
+the pty whether it had anything to read and, on a quiet answer, left as
+soon as the child had exited. A child that wrote its output *and* exited
+inside that window left its bytes sitting in the pty buffer, and leaving
+discarded them — so the job finished with exit 0 and a completely empty
+log. The shorter the job, the likelier it was to lose everything it said.
+
+The loop now drains the buffer before it leaves. The comment that used to
+justify the old behaviour ("a timed-out select with the child reaped means
+everything has been drained") was simply untrue, and is gone.
+
+#### Fixed
+
+- `jobkit`'s pty tee no longer discards output written in the window
+  between polling the terminal for readability and observing that the
+  child has exited. This is the second race of its kind on this path; the
+  regression test forces the losing interleaving deterministically rather
+  than relying on timing.
+
+### Numeric division carries PostgreSQL's result scale
+
+Dividing numerics now produces the display scale real PostgreSQL derives:
+`SELECT 5.52 / 2.4` answers `2.3000000000000000` (scale 16), `1/3::numeric`
+answers `0.33333333333333333333`, and a driver reading
+`getBigDecimal().scale()` sees exactly what it would on Postgres. The rule is
+`select_div_scale` from Postgres' own `numeric.c`, ported into the numeric
+division path and verified against a live PostgreSQL 14.13 across twenty
+division cases — every text render byte-identical. Values were already exact
+after the numeric-exactness work; this closes the last recorded divergence,
+the displayed scale. Integer division still truncates and float8 mixes still
+coerce to float8, as before.
+
+#### Fixed
+
+- `secantus.sql`: `numeric / numeric` results are quantized to PG's derived
+  division scale (`typemap.numeric_div`, half-away-from-zero rounding).
+  Pinned by `tests/test_sql_numeric_div_scale.py` — a twenty-case battery
+  whose expectations are byte-exact captures from PostgreSQL 14.13.
+
+### The oplog prune moves off the write path entirely
+
+Under sustained write load the oplog reaches its entry cap within seconds,
+and from then on the opportunistic prune has to delete rows as fast as
+they arrive. That sweep — a key merge across the shard tables, PITR
+archiving, per-row deletes — ran inline on whichever thread crossed the
+cadence: the writer itself in the default mode (measured at roughly a
+third of the whole insert path under cap pressure), or a drainer in
+async mode. A dedicated background pruner now owns the sweep in both
+modes; write paths just set a flag. mongod does the same job on its
+OplogCapMaintainerThread, for the same reason.
+
+Oplog reads got cheaper alongside: shard tables are created lazily and
+most never exist, but every oplog merge probed all sixteen plus the
+legacy table, paying a failed cursor-open per absent table per read. A
+shard-existence mask seeded at open skips them outright. The embedded
+Rust `Storage` library also now defaults to the same 4G WiredTiger
+cache *cap* as the daemon and the Python handle (the cache fills
+lazily, so small test instances stay small) — closing the gap where a
+library user hit eviction pressure at 256M that the daemon never would.
+
+Measured on the standard concurrency methodology (8 KiB docs, batch
+100, sync oplog, interleaved A/B): **+7.7% single-writer and +2.9% at
+eight writers**, with every single-writer rep separating cleanly.
+
+#### Changed
+
+- Rust storage: the opportunistic oplog prune runs on a dedicated
+  background pruner thread (signalled by the write-path cadence, with a
+  10s retention backstop) instead of inline on writer / drainer
+  threads. Explicit `prune_oplog` calls are unchanged (synchronous).
+- Rust storage: oplog merges (reads, floor, prune scans, archiving)
+  skip shard tables known absent via an existence mask seeded at open.
+- Rust storage: `Storage::open`'s default WiredTiger cache is a 4G cap
+  (was 256M), matching the daemon and the embedded Python handle.
+
+### Fresh performance and concurrency numbers — and honest harnesses
+
+Both benchmark reports are re-measured on current code (post
+TCP_NODELAY, batched sequences, and the parse cache). Per-operation
+latency: the Rust server runs at **0.7×–2.2× of mongod**, with three
+workloads now beating mongod outright (change-stream drain 0.7×,
+delete and single-stage `$group` 0.9×); the Python server spans
+1.2×–24×. Write scaling is unchanged in shape and confirmed healthy:
+the Rust server scales monotonically to **2.5× at eight writers
+(~93k docs/s fully durable)**, the async oplog stack reaches ~107k.
+
+Getting trustworthy numbers surfaced two real defects. The concurrency
+harness handed writer 0 a `drop` that raced the other writers' insert
+stream — a drop starved behind continuous batches for the whole window,
+died summary-less on SIGTERM, and rows silently averaged a dead writer,
+manufacturing a 3.4× phantom regression. Writers now target fresh
+per-row collections (no drops near the measurement), install signal
+handlers before any I/O, and a missing writer summary fails the run
+instead of shipping a corrupt row. Second, dropping a heavily-churned
+collection can wedge the Rust server behind a WiredTiger eviction storm
+that survives client disconnect and SIGTERM — captured with native
+stacks and filed in `tasks/backlog.md` for its own slice.
+
+#### Added
+
+- `bench/latency_chart.py` + `bench/results/latency.json`: the latency
+  chart, markdown table, and site table are now regenerated
+  mechanically from one results file (they were hand-edited SVGs).
+
+### The PG server now ships a default idle-in-transaction timeout
+
+A PostgreSQL client that opens a transaction and then goes quiet — a failed
+test that never rolls back, a leaked pooled connection — used to pin the
+storage engine's oldest snapshot indefinitely. WiredTiger then had to keep
+every subsequent write's history reachable, so each operation got slower in
+proportion to total churn until a large statement (a 100k-row TRUNCATE in
+pgjdbc's own suite) stalled in page reads and wedged the whole server. That
+single mechanism was the root cause of the pgjdbc conformance lane's
+two-hour hang.
+
+`SecantusPGServer` now applies a server-config default of 120 seconds for
+`idle_in_transaction_session_timeout` (PG ships 0/disabled, but PG's MVCC
+degrades gracefully where WiredTiger's cache-bound history does not). The
+GUC hierarchy is faithful: a session `SET` overrides the server default,
+`SET … = 0` opts out entirely, `RESET` falls back to the server value, and
+`SHOW` reports the effective setting. The `secantusd-py-pg` daemon grows a
+matching `--idle-in-transaction-timeout` flag.
+
+#### Added
+
+- `Session.server_gucs` — a postgresql.conf-tier defaults layer between
+  session `SET` overrides and the built-in GUC defaults, honoured by
+  `get_setting`, `SHOW`, `SHOW ALL`, and `RESET`.
+- `SecantusPGServer(idle_in_transaction_timeout_s=…)` constructor knob and
+  the `--idle-in-transaction-timeout` daemon flag (default 120s, 0 disables).
+
+#### Fixed
+
+- An abandoned open transaction on a live connection no longer degrades all
+  later writes without bound (linear-with-churn slowdown, ending in a
+  server-wide page-read stall). Idle-in-transaction sessions are terminated
+  with PG's own FATAL 25P03 after the timeout, unpinning the snapshot.
+
+### PostgreSQL Large Object API over Fastpath
+
+The PG server now implements PostgreSQL's Large Object surface the way
+pgjdbc's `LargeObjectManager` (and therefore JDBC `Blob`/`Clob`) drives it:
+the Fastpath sub-protocol ('F' FunctionCall / 'V' FunctionCallResponse)
+dispatching `lo_open` / `lo_close` / `loread` / `lowrite` / `lo_lseek` /
+`lo_creat` / `lo_create` / `lo_tell` / `lo_unlink` / `lo_truncate` and their
+64-bit variants by their real `pg_proc` OIDs, reflected into
+`pg_catalog.pg_proc` so drivers can resolve them by name. Object bytes live
+in chunked, sparse per-database collections (a 2GB `lo_truncate` extension
+stores nothing and reads back as zeros, like PG's own representation), and
+reads/writes join the session's open transaction so `ROLLBACK` discards
+`lowrite` data. `lo_creat` / `lo_create` / `lo_unlink` are also SQL-callable.
+
+Around it, the pieces pgjdbc's CallableStatement and Blob tests need: a
+user-defined function call in FROM position (`select * from f($1) as
+result`, pgjdbc's rewrite of `{? = call f(?)}`) evaluates as a one-row
+source typed by the function's declared return type; extended-protocol
+Describe derives that shape from the catalog **without executing the
+function body** (a side-effecting UDF in a pgjdbc batch previously ran
+twice — once at Describe, once at Execute); a NULL parameter declared
+`void` (oid 2278) is dropped from the call's argument list, matching PG's
+accommodation of the JDBC OUT-parameter slot; plpgsql gains `RAISE`
+(NOTICE/WARNING/etc. flow to the wire as NoticeResponse, EXCEPTION raises
+`P0001`); and contrib/lo's `lo_manage` trigger DDL is accepted as a
+recognized no-op. pgjdbc's `BlobTest` (28), `BlobTransactionTest`,
+`CallableStmtTest` (14), and `CleanupSavepointsWithFastpathTest` (10) all
+pass fully — all four were previously zeroed.
+
+#### Added
+- `secantus/sql/largeobjects.py`: chunked sparse LO store + Fastpath
+  dispatch with PG's real `pg_proc` OIDs; per-session descriptors.
+- Fastpath sub-protocol handling in the PG wire server
+  (`parse_function_call` / `function_call_response`).
+- plpgsql `RAISE` statement (levels, `%` formatting, notice delivery over
+  both simple and extended protocol).
+- UDF and built-in function calls (`now()`, `version()`) as one-row FROM
+  sources, typed by declared return type.
+
+#### Fixed
+- Extended-protocol Describe no longer executes side-effecting UDF bodies
+  to derive the result shape (pgjdbc batched `{call f(?)}` ran every
+  insert twice).
+- `Storage.use_user_transaction` is re-entrant (nested entry from a
+  SQL-callable `lo_creat` inside a transactional INSERT no longer breaks
+  the outer transaction).
+
+### Read-only transactions are enforced; isolation level round-trips
+
+Writes inside a read-only transaction now fail with PostgreSQL's 25006
+(`cannot execute INSERT in a read-only transaction`) — whether the
+read-only-ness came from `BEGIN READ ONLY`, `SET TRANSACTION READ
+ONLY`, or `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`. DML,
+DDL, TRUNCATE, MERGE, and GRANT are gated; reads are untouched. And
+`SHOW TRANSACTION ISOLATION LEVEL` — the multi-word spelling pgjdbc's
+`getTransactionIsolation` issues verbatim (previously resolving to an
+unknown GUC and an empty string) — now reports the level a
+`SET SESSION CHARACTERISTICS` planted, as does `SHOW TIME ZONE`.
+
+pgjdbc: ConnectionTest 15/15 (was 12/15), DatabaseMetaData
+TransactionIsolationTest 14/14 (was 8/14), AutoSaveTransactionSettings
+4/6 (was 0/6). Known divergences, none gauge-exercised, recorded in
+`tasks/backlog.md`: temp-table writes are also blocked (PG allows them
+under read-only), and `SELECT … FOR UPDATE` / `nextval()` are not yet
+gated (PG blocks both).
+
+### A conformance run that was cut short no longer reads as a clean sweep
+
+The pgjdbc gauge wiped its results directory at startup and only aggregated
+them once Gradle returned, so a run that hit the wall-clock budget reported
+zero tests — which looks identical to a flawless run at a glance, and was read
+that way once. A truncated run now keeps whatever did complete, records that it
+was cut short, and exits with the conventional timeout status.
+
+The report generator refuses to render a truncated run at all. That is the
+important half: a partial run's per-class numbers are every bit as correct as a
+complete one's, and only the *set of classes* is short — so publishing it
+produces a healthy-looking pass rate quietly measured over less of the suite.
+There is no caveat that reliably survives being pasted into a summary, so the
+artifact simply isn't produced.
+
+The budget itself is raised and made overridable via `SECANTUS_PGJDBC_TIMEOUT`,
+because CI hardware runs several times slower than a development machine and
+the suite legitimately grew once the crashes that used to end tests in
+milliseconds were fixed.
+
+#### Added
+
+- `SECANTUS_PGJDBC_TIMEOUT` overrides the gauge's Gradle budget (default two
+  hours, up from one).
+
+#### Fixed
+
+- A timed-out pgjdbc gauge aggregates partial results and reports the run as
+  truncated instead of silently summarising zero tests.
+- `generate_report` refuses to publish a conformance rate computed from a
+  truncated run.
+
+### The pgjdbc lane runs sharded — CI wall clock drops from ~70 to ~20 minutes
+
+The pgjdbc conformance gauge runs ~5,500 JUnit tests over a real wire and
+took the better part of an hour as a single CI job. The lane now fans out
+as four parallel jobs, each running a deterministic round-robin quarter of
+the class list (the vendored suite stays byte-for-byte unmodified — only
+Gradle's `--tests` selection differs per shard), and a merge job combines
+the shards' JUnit results into the same single conformance report.
+
+The merge enforces the same publish discipline as the truncation guard: a
+missing, duplicate, or truncated shard refuses the report outright rather
+than rendering a pass rate measured over part of the suite. `only=pgjdbc`
+dispatches select all four shards; a single shard is addressable as
+`only=pgjdbc-1`. Locally, `invoke validate-pgjdbc` is unchanged (one full
+run), with `--shard K/N` + `validate-pgjdbc-report` available for the
+split flow.
+
+#### Changed
+
+- `.github/validate-lanes.json` gains lane `group`s; the plan job's filter
+  matches groups as well as names.
+- `pgjdbc_validation.runner` honours `SECANTUS_PGJDBC_SHARD=K/N`;
+  `generate_report` merges a complete shard set (refusing anything less);
+  shard-math and merge-guard tests in
+  `tests/test_pgjdbc_gauge_truncation.py`.
+
+### Tailable cursors wait, rewritten resume tokens are refused, and `_id` leads again
+
+Three unrelated fidelity gaps, each found by mongo-php-library's suite
+asking a question no unit test had thought to ask.
+
+A `TAILABLE_AWAIT` cursor is supposed to park on the server until data
+arrives or `maxAwaitTimeMS` expires. SecantusDB's capped-collection
+tailables returned in about a fifth of a millisecond, because the wait's
+wake condition was keyed on a change-stream position counter that plain
+tailables never maintain — leaving it permanently satisfied. Clients
+polling a capped collection were spinning instead of waiting.
+
+A change-stream pipeline may not tamper with an event's `_id`: that field
+is the resume token, and an altered one silently breaks resumption. The
+server already rejected a pipeline that *removed* it, but a pipeline that
+*rewrote* it passed straight through, and the error surfaced client-side
+in the driver rather than from the server. Both are fatal now, as they are
+in mongod.
+
+Finally, a replacement-style update put the preserved `_id` at the end of
+the stored document rather than the front. BSON keeps field order on the
+wire, so the bytes a client got back differed from mongod's for the same
+operation — invisible until something compared raw documents, which is
+exactly what the PHP codec tests do.
+
+#### Fixed
+
+- `getMore` on a capped-collection tailable cursor with `awaitData` now
+  blocks for up to `maxTimeMS` instead of returning immediately.
+- A change-stream pipeline that modifies (not only removes) an event's
+  `_id` now fails server-side with `ChangeStreamFatalError`, matching the
+  Rust server, which already did this.
+- Replacement updates place `_id` first in the resulting document, on both
+  the Python and Rust engines.
+
+The mongo-php-library gauge goes from 42 failures to 1 — and the one that
+remains is a text-index test, a feature that is explicitly out of scope.
+
+### updateMany and deleteMany commit in bounded chunks on the Python server too
+
+The Python server gains the same bounded multi-document write transactions
+the Rust server just did: updating or deleting everything a broad filter
+matches no longer runs as a single WiredTiger transaction whose unevictable
+dirty content grows with the matched set. Chunks re-read their documents
+inside their own transaction, every document is transformed exactly once
+even across conflict retries, and single-document writes, upserts, and
+writes inside multi-document transactions are unchanged. With this, the
+storage-engine livelock class is closed on both servers across all three
+surfaces: batch inserts, multi-document updates and deletes, and
+multi-document transactions.
+
+#### Fixed
+
+- `secantus.storage`: `update_matching` (multi) and `delete_matching`
+  (unbounded) run chunked statement transactions (≤1000 docs / ≤4MB each)
+  instead of one unbounded transaction — mongod-faithful, since updateMany
+  and deleteMany are per-document write units and documented non-atomic.
+  Pinned by a 35,000-document rewrite + deleteMany against a deliberate
+  128M cache, exactly-once `$inc` across chunk boundaries, and unchanged
+  bounded paths.
+
+### The pymongo gauges now separate "unsupported" from "broken"
+
+Both pymongo gauges — the sync suite and the `AsyncMongoClient` one — had
+a handful of red tests that were never going to go green, because every
+one of them exercises something SecantusDB deliberately does not
+implement: hashed indexes, text indexes, and `$where`, which needs the
+embedded JavaScript runtime mongod ships and SecantusDB does not. The
+server already answers each with a faithful "not supported" error; the
+tests fail because they asked, not because anything is wrong.
+
+Two of them are worth naming precisely, because their titles suggest
+otherwise. `test_maxtime_ms_message` and `test_to_list_csot_applied` are
+about timeouts, not about `$where` — they merely use `$where` to make a
+query slow enough to time out. Since the query is rejected up front, they
+never reach the behaviour they are named for. They are recorded as
+unverified rather than as passing: the gauge tells us nothing about
+maxTimeMS message shape or CSOT either way.
+
+#### Changed
+
+- The six pymongo / pymongo-async failures are now classified as expected,
+  each with its rationale, so the summary counts them separately from
+  failures that need a fix. Both gauges report zero actionable failures.
+- The async gauge is wired to the shared expected-failures list; it runs
+  the same upstream tests and hit the same gaps under different node IDs.
+
+### A 2dsphere index reports its format version
+
+MongoDB stamps every `2dsphere` index with the index format version it was
+built at, and drivers read it back through `listIndexes` — the PHP library
+exposes it as `IndexInfo::is2dSphere()` and `$index['2dsphereIndexVersion']`.
+The Rust server left the field off entirely, so a client asking which 2dsphere
+format an index used got no answer. It now reports version 3, matching both
+the Python server and MongoDB 3.2 onwards. A `2d` index carries no such field
+and still doesn't.
+
+#### Fixed
+
+- `listIndexes` reports `2dsphereIndexVersion` for a `2dsphere` index on the
+  Rust server.
+
+### A change stream survives a transient error, as it should
+
+A change stream is meant to be durable across a hiccup: when the server hits a
+transient problem mid-stream, the client is supposed to quietly reconnect and
+carry on from where it left off. That never happened here, because the server
+gave the client no way to tell a transient failure from a fatal one.
+
+MongoDB marks the errors a change stream may recover from, and drivers act on
+that marking alone — never on the error code by itself. The Rust server sent
+neither the marking nor, in fact, the errors: the mechanism test suites use to
+provoke a mid-stream failure was accepted and then ignored, so nothing ever
+went wrong to recover from. Both halves are now in place, so a change stream
+interrupted by a transient error resumes instead of surfacing the failure to
+the application.
+
+The distinction MongoDB draws is preserved: an error injected inside the
+change-stream path is recoverable, while the same error code injected at the
+command boundary is not, and a fatal error stays fatal.
+
+#### Fixed
+
+- A change stream resumes after a transient server error rather than failing.
+
+### A change stream stops forgetting where it got to
+
+Reading to the end of a change stream threw away the position it had reached.
+While events were arriving, the stream reported each one's position faithfully;
+the moment a read came back empty it replaced that with a bare positional
+marker — one that named neither the collection nor the document last seen. A
+client that then reconnected resumed from something less precise than it had
+already been told, and the token it had been carefully tracking went backwards.
+
+The position now only ever moves forward. An idle stream still advances as the
+server's clock does, so a quiet collection doesn't strand a reader behind the
+oplog window, but it never rewinds past an event already delivered.
+
+Separately, `$currentOp` did not report which application a connection belonged
+to, so tools that look up their own operation — by the `appName` given in the
+connection string — found nothing to inspect.
+
+Both were invisible until now: the C++ driver's suite is the one that covers
+them, and it had never been run against this server because its tests bind a
+fixed port.
+
+#### Fixed
+
+- A change stream's resume position no longer regresses to a positional marker
+  when a read returns no events.
+- `$currentOp` reports `appName` and the connection's driver metadata.
+
+### Transactional DDL and consistent scans for the Rust server
+
+The Rust server's storage engine now runs every namespace-level DDL —
+createIndexes, dropIndexes (single and `"*"`), create, drop and rename
+collection, and dropDatabase — inside the same per-statement WiredTiger
+transaction machinery its CRUD path has used since the collection-locks work.
+Registry rows, index entries, collection options and the DDL's oplog entry now
+commit or vanish together, so a crash mid-DDL can no longer strand orphan
+index-entry rows behind a missing registry row. dropDatabase commits one
+transaction per collection — the same unit real mongod uses — so a huge
+database can't blow the storage cache with a single monolithic transaction.
+
+That atomicity also closes the long-standing DDL-vs-scan wobble: a lock-free
+read racing a drop or rename could previously return a partial result set,
+splicing rows read before the DDL with the post-DDL view. Reads now run under
+a seqlock-style namespace-generation check — DDL holds the generation counter
+odd for its duration, and a scan that observed an odd or moved generation
+re-runs against the settled state, so every result is a point-in-time answer.
+A concurrent-stress test pins the new invariant: scans racing drops and
+renames observe the full collection or none of it, never a partial splice.
+
+Two smaller items land alongside: single-document updates no longer clone the
+post-image document unless the caller actually asked for it (only
+`findAndModify` does — plain updates skip a full per-document clone), and the
+`anyhow` dependency moved past RUSTSEC-2026-0190 in all four lockfiles.
+
+#### Changed
+
+- `secantus-storage`: `create_collection[_with_options]` / `drop_collection` /
+  `drop_database` / `rename_collection` / `create_index` / `drop_index` /
+  `drop_all_indexes` wrap their row writes in `with_statement_txn` +
+  `retry_write_conflicts`; dropDatabase is per-collection transactions. DDL
+  invoked inside a user (multi-document) transaction now joins it uniformly
+  and rolls back with it (pinned by `tests/ddl_txn.rs`).
+- `secantus-storage`: `update_matching` / `update_matching_pipeline` (and the
+  `secantus-commands` storage seam's `update_matching_array_filters` /
+  `update_matching_pipeline`) take a `want_post_image` flag;
+  `UpdateOutcome::post_image` is captured only for `findAndModify`, sparing
+  every plain single-doc update a full `Document` clone.
+- `anyhow` 1.0.102 → 1.0.104 in `crates/`, `secantusdb`, `secantus-storage`
+  and `secantus-storage-py` lockfiles, clearing the RUSTSEC-2026-0190
+  unsoundness advisory from the cargo-audit log.
+
+#### Fixed
+
+- `secantus-storage`: a lock-free `find_matching_with` / `count_matching`
+  racing a `renameCollection` / `dropCollection` / `dropDatabase` /
+  `dropIndexes` can no longer return a partial result set. Namespace DDL runs
+  under a drop-guarded seqlock generation (`ddl_generation_scope`, serialised
+  by the global lock) and readers re-run a scan whose generation was odd or
+  moved (bounded, so a DDL storm can't livelock a reader). Pinned by
+  `tests/concurrent_reads.rs::scans_racing_namespace_ddl_are_never_partial`.
+
+### Rust server: dropping a huge collection can no longer wedge the engine
+
+Dropping a collection ran its whole row purge as one WiredTiger statement
+transaction. Because collections share the sharded document tables, a drop
+is a row-by-row purge — and a collection whose delete volume exceeds the
+cache's dirty budget got a cache-pressure `WT_ROLLBACK`, which the write-
+conflict retry loop re-ran forever while the eviction threads spun. That is
+the livelock the 2026-08-11 concurrency sweep hit: a drop that sat for 40+
+minutes at full CPU, survived client disconnect, and ignored SIGTERM. The
+same unevictable-dirty-content class was already fixed for batch inserts,
+updateMany, and deleteMany; drop (and dropDatabase) were the remaining
+unbounded transactions.
+
+Drops are now chunked and two-phase. A small first transaction unregisters
+the collection, writes a drop tombstone, and emits the drop oplog entry —
+after it commits the namespace is gone for every reader and writer. The row
+purge then runs in bounded 4000-row transactions and finally clears the
+tombstone. A crash mid-purge is finished at the next open, before any
+traffic can re-create the name, so leftover rows can never resurface inside
+a re-created collection. Inside a user transaction, drops keep the old
+atomic single-transaction path, which the transaction dirty-budget guard
+(`TransactionTooLargeForCache`) already bounds. A deterministic regression
+test drops a collection larger than a deliberately small cache — the exact
+shape that previously wedged — and a recovery test pins the crash-left
+tombstone path.
+
+#### Fixed
+- Rust server: `drop` / `dropDatabase` of a collection larger than the WT
+  cache's dirty budget livelocked the engine (unbounded purge transaction +
+  unbounded write-conflict retry); now chunked, with crash-safe tombstone
+  recovery at open.
+
+#### Added
+- `table:secantus_drop_tombstones` (additive to the shared on-disk layout):
+  pending-drop markers that make the chunked purge crash-safe.
+
+### The Rust server matches the Python one on the C and Ruby driver suites
+
+Four more behaviours the Rust server was missing, found by regenerating the
+gauges rather than reasoning about the code — every one of them was invisible
+from the source and obvious from a single line of driver output.
+
+`serverStatus` omitted its `connections` section entirely, so a driver asking
+how many connections had been created got no answer. That is what the C
+driver's exhaust-cursor tests were failing on all along: they open a cursor and
+check that a connection was created, and the failure looked for all the world
+like an exhaust-cursor bug. It took three passes to fix properly — the section
+was missing, then present but the wrong integer width for a driver that
+type-checks rather than coerces, then present and correctly typed but always
+zero, which cannot satisfy a test asserting the count went up. It now reports
+the server's real counters.
+
+A capped collection's `$collStats` still didn't report its bounds, because the
+values arrive as 32-bit integers and were read as 64-bit only. And
+`listIndexes` accepted a negative `batchSize` instead of rejecting it, which is
+the deliberate failure a Ruby session spec uses to check that errors surface.
+
+#### Fixed
+
+- `serverStatus` reports `connections` (with live counts), `opcounters` and
+  `network`.
+- `$collStats` reports `maxSize` / `max` for a capped collection regardless of
+  the integer width the driver used.
+- `listIndexes` rejects a negative `batchSize` rather than accepting it.
+
+### The Rust server rejects the specs it should, and owns up to Atlas-only commands
+
+Three behaviours the Python server had and the Rust one didn't, found by
+splitting the C and Ruby driver-conformance failures against the Python
+server's own results so only the Rust-specific ones remained.
+
+Unknown fields on `create` and on an index spec were silently accepted rather
+than rejected. Real MongoDB fails them, and drivers rely on that: three
+mongo-ruby-driver specs deliberately pass `invalid: true` and assert the
+operation fails, which is how a typo in an index option gets caught at the
+point it is made rather than becoming an index that quietly isn't what was
+asked for. Both now answer with the same unknown-field error MongoDB gives.
+
+The Atlas Search index commands — `createSearchIndexes`, `updateSearchIndex`,
+`dropSearchIndex` — went unanswered entirely, so a client heard "no such
+command" rather than "this needs Atlas". A non-Atlas MongoDB registers them and
+fails them with a message naming Atlas, which is the difference between a
+driver reporting a missing feature and reporting a broken server. Finally,
+`$collStats` reported that a capped collection was capped but not what its
+bounds were; the `max` and `maxSize` fields are now present.
+
+#### Fixed
+
+- `create` rejects unknown top-level options, and `createIndexes` rejects
+  unknown fields on an index spec, with MongoDB's `Location40415`.
+- `createSearchIndexes` / `updateSearchIndex` / `dropSearchIndex` report
+  `CommandNotSupported` naming Atlas, instead of `CommandNotFound`.
+- `$collStats` reports `maxSize` and `max` for a capped collection alongside
+  `capped`.
+
+### The Rust server's batch inserts are chunk-committed too
+
+The Rust storage engine had the same latent hazard the Python server's
+`large_insert` CI wedge exposed: one wire message's inserts ran as one
+WiredTiger statement transaction, whose unevictable dirty content could in
+principle cross the cache's dirty-stall threshold and livelock the engine.
+Its 4G embedded default cache kept the worst 48MB-message case comfortably
+inside the budget — but a daemon configured with a smaller `--cache-size`
+had no such protection.
+
+Batch inserts now commit in the same bounded chunks as the Python server
+(at most 1,000 documents or 4MB per statement transaction), keeping the
+dirty footprint independent of the client's batch size on any cache
+configuration. As on the Python side, MongoDB batch inserts are
+per-document atomic only, so the commit points are invisible to clients.
+
+#### Fixed
+
+- `secantus-storage`: `Storage::insert` chunks one wire batch into bounded
+  statement transactions (write-conflict retry per chunk; capped-FIFO
+  fresh-key protection spans the whole client batch). Pinned by
+  `batch_insert.rs::large_batch_insert_survives_a_small_cache` (35k × 1.1KB
+  documents against a deliberate 128M cache) plus ordered/unordered
+  cross-chunk semantics tests.
+
+### updateMany and deleteMany commit in bounded chunks on the Rust server
+
+The last unbounded-transaction surface on the Rust server is closed:
+updating or deleting every document a broad filter matches used to run as a
+single WiredTiger transaction, whose unevictable dirty content grows with
+the matched set — the same storage-livelock class the chunked batch inserts
+and the transaction dirty budget already closed. Multi-document updates and
+deletes now commit in bounded chunks (at most 1,000 documents or 4MB per
+statement transaction), each chunk re-reading its documents inside its own
+transaction so concurrent transaction commits are never overwritten from a
+stale read, and each document is transformed exactly once even across
+conflict retries.
+
+Real MongoDB's updateMany and deleteMany are per-document write units and
+documented as non-atomic, so the chunk boundaries match its semantics —
+single-document writes, upserts, and writes inside multi-document
+transactions are unchanged.
+
+#### Fixed
+
+- `secantus-storage`: `update_matching` (multi) and `delete_matching`
+  (unbounded) run chunked statement transactions instead of one unbounded
+  transaction. Pinned by `multiwrite_chunk.rs`: a 35,000-document rewrite
+  and deleteMany against a deliberately small 128M cache, exactly-once
+  `$inc` across chunk boundaries, and unchanged bounded paths.
+
+### The C driver can finally exercise change streams
+
+`replSetGetStatus` said this server was a standalone while `hello`, on the very
+same connection, described a single-node replica set. Real MongoDB is never
+both, and the disagreement had a cost: the C driver's test fixture reads the
+member roster to decide whether replica-set behaviour is available, saw an
+empty one, and skipped every change-stream test as inapplicable. The strictest
+wire-protocol suite we run had no change-stream coverage at all.
+
+`replSetGetStatus` now reports the same one-member primary that `hello` already
+advertised. A server started without a replica-set name still answers as a
+standalone, which is the honest reply for one.
+
+Thirty-two change-stream tests run as a result, and four real defects came out
+of them: the error for a pipeline that discards the resume token had the wrong
+message, the error for a malformed pipeline stage had the wrong code and
+message, and — the substantive one — a pipeline that *rewrote* the resume token
+rather than removing it was accepted. MongoDB permits only transformations that
+leave the token untouched, so a rewritten token now fails the same way a removed
+one does, instead of reaching the client as a confusing driver-side error.
+
+#### Fixed
+
+- `replSetGetStatus` reports a one-member primary roster when a replica-set
+  name is configured, agreeing with `hello`.
+- A change-stream pipeline that modifies the resume token is rejected, not just
+  one that removes it.
+- The resume-token and pipeline-stage errors carry MongoDB's own codes and
+  messages.
+
+### A tailing cursor is told why its collection went away
+
+Dropping a collection while a client is tailing it left the client with
+"cursor not found" — technically true, but it doesn't say what happened, and a
+tailing application can't tell a dropped collection from an expired cursor or a
+server restart. MongoDB reports that the query plan was killed and names the
+dropped namespace, and the Rust server now does the same.
+
+The three kinds of cursor a drop can hit are handled differently, matching the
+Python server. An ordinary cursor is discarded, so the next fetch reports the
+cursor is gone. A tailing cursor is kept just long enough to explain itself.
+Change streams are left alone entirely: they already announce a drop through
+their own invalidation event, and turning that into an error would replace a
+normal end-of-stream with a failure.
+
+The cursors are also now killed *before* the collection is removed rather than
+after — a tail parked waiting for new data is woken by the drop itself, and it
+has to find the explanation already in place or it goes back to waiting on a
+collection that no longer exists.
+
+#### Fixed
+
+- A `getMore` on a tailable cursor whose collection was dropped reports
+  `QueryPlanKilled` naming the collection, instead of `CursorNotFound`.
+
+### The Rust server disables Nagle too
+
+Mirror of the Python servers' `TCP_NODELAY` fix: the Rust server's
+accept loop now calls `set_nodelay(true)` on every accepted connection,
+closing the same ~40ms-per-round-trip delayed-ACK stall on Linux that
+cost pgjdbc's chatty batch tests a 200x slowdown in CI against the
+Python server. Best-effort (a failed setsockopt on a dying socket never
+kills the accept loop), matching mongod's and PostgreSQL's own
+unconditional NODELAY.
+
+### The Rust server rejects oversized transactions too
+
+The Rust server now enforces the same transaction dirty budget the Python
+server gained: a multi-document transaction whose written volume exceeds a
+cache-derived threshold (about 15% of the storage cache, mirroring real
+MongoDB's `TransactionTooLargeForCache` guard) fails with code 313 before
+its unevictable content can stall WiredTiger. The error carries no
+transient label and the transaction aborts, matching mongod. With this,
+the storage-engine livelock class is closed on both servers: batch inserts
+commit in bounded chunks, and transactions are bounded by the cache budget.
+
+#### Added
+
+- `secantus-storage`: `StorageError::TransactionTooLargeForCache` + a
+  per-transaction dirty budget (~15% of the configured `cache_size`,
+  default 4G) enforced across `with_user_transaction` statements; mapped
+  to mongod's 313 by the command seam. Pinned by
+  `txn_budget.rs::transaction_dirty_budget_guard` against a deliberate
+  128M cache.
+
+### Unique indexes hold across a transaction
+
+A unique index on the Rust server could be persuaded to accept two documents
+with the same value. If one writer was inside a transaction and another was
+not, each checked for a clash by reading its own snapshot of the data — and
+neither snapshot showed the other's pending write. Both were told they were
+fine, both were written, and the index that was supposed to guarantee
+uniqueness quietly held a duplicate. Nothing failed, nothing was logged; the
+damage only became visible later, in the data.
+
+The clash check no longer relies on reading. Each unique value is now claimed
+in a table keyed by the value itself, so the storage engine refuses the second
+claim outright, whoever makes it and whenever they started. A writer that
+arrives while a transaction holds the value now waits for it, exactly as
+MongoDB does, and is then told the value is taken — or, if the transaction was
+rolled back, quietly takes it.
+
+Claims are released when the row that owns them is deleted, and cleared when
+the collection, database or index they belong to is dropped, so a value can
+always be used again once nothing is using it.
+
+#### Fixed
+
+- A unique index no longer accepts a duplicate when one of the writers is
+  inside a transaction.
+
+### Sequences allocate in batches — bulk SERIAL ingest is 3x faster
+
+Every `nextval` used to pay a full read plus durable-update transaction
+against the sequence's stored document, which dominated bulk-ingest
+profiles: a 100k-row `COPY` into a SERIAL table spent roughly three
+quarters of its time advancing the sequence, capping ingest around
+5,000 rows/s. `nextval` now pre-allocates a batch of 128 values with a
+single persisted write and hands the rest out from memory under the
+same statement-write lock that already serialized it — PostgreSQL's own
+`CACHE` mechanism applied server-side. The same `COPY` now runs at
+13,000–15,800 rows/s, and per-statement SERIAL inserts gain about 20%.
+
+Values remain gapless while the server runs (the cache is server-wide,
+not per-backend). The stored document carries the batch's high-water
+mark, so a restart resumes past the unhanded values — the identical gap
+PostgreSQL's `CACHE` and crash semantics produce. `setval`,
+`ALTER SEQUENCE`, `DROP`, and re-`CREATE` all discard the prefetched
+run, so their effects stay immediate.
+
+#### Changed
+
+- `Catalog.sequence_nextval` allocates `SEQUENCE_ALLOC_BATCH` (128)
+  values per persisted write; `tests/test_sql_sequences.py` pins the
+  gapless run, the high-water persistence and reopen gap, and the
+  invalidation on `setval` / `ALTER … RESTART` / re-create paths.
+
+### `serverStatus` tells drivers which storage engine it is
+
+Real driver test suites branch on `serverStatus.storageEngine.name` before
+they will even attempt a transaction. SecantusDB never reported the field,
+so mongo-php-library's `skipIfTransactionsNotSupported` helper threw
+`UnexpectedValueException: Could not determine server storage engine` and
+took roughly twenty-seven transaction tests down with it — not because any
+transaction misbehaved, but because the suite could not establish what it
+was talking to. One absent sub-document read as dozens of independent
+failures.
+
+Both servers now report the engine, and the answer is the true one:
+SecantusDB is WiredTiger-backed, the same engine mongod uses. The
+`persistent` flag is wired to the actual store rather than hard-coded, so
+an `:memory:` instance reports itself as non-persistent instead of
+claiming durability it does not have.
+
+#### Fixed
+
+- `serverStatus` now carries the `storageEngine` sub-document (`name`,
+  `supportsCommittedReads`, `supportsPendingDrops`,
+  `supportsSnapshotReadConcern`, `readOnly`, `persistent`,
+  `backupCursorOpen`) on both the Python and Rust servers. The
+  mongo-php-library gauge goes from 42 failures to 4 over the same 3130
+  tests.
+
+### BC timestamps, and parameters that kept their declared type
+
+A date before year 1 stored in a `timestamp without time zone` column came back
+carrying a time-zone offset it should never have had — `0101-01-01 00:00:00+00
+BC` where Postgres writes `0101-01-01 00:00:00 BC`. Ordinary dates already
+dropped the offset; only the ones outside the range Python can represent kept
+it.
+
+Separately, a parameter the client declared as `timestamp with time zone` lost
+that declaration on the way to the column. Stored into a `timestamp` column it
+was treated as though it had been typed out as a literal — offset discarded,
+clock face kept — instead of being converted through the connection's zone, so
+the value moved by the zone's offset. A client in New York writing midnight got
+five in the morning back.
+
+#### Fixed
+
+- A BC or far-future timestamp in a `timestamp without time zone` column no
+  longer reports an offset.
+- A `timestamp with time zone` parameter keeps its type when stored into a
+  `timestamp` column, and converts through the session's zone.
+
+### A date written with a time-zone offset and no clock time
+
+`1950-02-07 -05` — a calendar date, an offset, and no time of day — is what a
+JDBC client sends for a date when it has been given a calendar. We read the
+offset as though it were the time itself, so the value quietly became five in
+the morning with no zone at all, and a `timestamp` column stored it that way.
+
+Postgres reads the implicit midnight, and so do we now: the date lands on the
+day it names, a `timestamp` column keeps midnight, and a `timestamp with time
+zone` column keeps the instant that midnight refers to.
+
+Dates at the very edge of the representable range are handled alongside this.
+Now that the offset is understood, shifting one of those to UTC can fall off
+the end of the calendar — the first instant of year 1 is in year zero once you
+move it west. Those keep their clock face rather than failing.
+
+#### Fixed
+
+- A date literal carrying a time-zone offset but no time of day is read as
+  midnight at that offset, rather than as a time.
+
+### Unquoted identifiers fold to lower case, as Postgres does
+
+`SELECT r.table_name FROM (SELECT id AS TABLE_NAME …) r` reported that the
+column did not exist. Postgres lower-cases an unquoted identifier, so writing
+an alias in upper case and reading it back in lower case names the same column;
+we compared every spelling exactly, so the two forms were two different names.
+
+Quoted identifiers keep their spelling exactly, which is what quoting is for —
+`"Mixed"` and `mixed` remain different columns.
+
+Matching case always worked, which is why this went unnoticed: code that writes
+an alias one way and reads it back the same way never trips it. Generated SQL,
+and anything written in the SQL-standard upper case, does — JDBC's metadata
+queries are how it surfaced.
+
+Folding happens once, immediately after parsing, so table names, column
+references and aliases all agree on one canonical spelling.
+
+Note for existing databases: a table created unquoted with a mixed-case name is
+now addressed lower-cased, matching what Postgres would have stored in the
+first place.
+
+#### Fixed
+
+- An unquoted identifier written in one case and read in another now names the
+  same table, column or alias.
+
+### Five ways a SQL connection could drop with "internal error"
+
+Every crash the PostgreSQL front end reported as a bare `internal error` came
+from a distinct, small cause, and each one killed the connection rather than
+returning a message the client could act on. All five are fixed, along with a
+quadratic cost in parameter binding that made large statements look like hangs.
+
+The protocol's 16-bit count fields — parameter counts, column counts — were
+read and written as *signed*. Postgres allows up to 65535 parameters in a
+single Bind, and a JDBC driver rewriting a batch into one statement really does
+send tens of thousands; above 32767 the count came back negative, walked the
+parse offset backwards, and the connection died. Binding those parameters was
+also `O(N²)`, because each placeholder was replaced one at a time and the
+expression library re-parents every sibling on each replacement. A statement
+with 40000 parameters took over two minutes; it now takes well under a second.
+
+Geometric values had no binary decoder at all, so a `point`, `box` or `polygon`
+sent in the binary format — which drivers do by default — arrived at the *text*
+parser as raw bytes and failed as "no coordinate pairs in geometry". The `line`
+type could not be parsed even as text: its canonical form is three coefficients
+`{A,B,C}` rather than coordinate pairs, and the branch that handled it sat
+after the pair parse it could never survive. `time + interval` was simply
+missing, and an interval inside a `WHERE` clause was pushed down into an
+aggregation expression that has no interval type, where it surfaced as a
+`$multiply` type error. Finally, the catalog builders behind `pg_class` and
+friends enumerated the table list twice — once to assign OIDs and once to emit
+rows — so a table created by another session in between produced a `KeyError`
+part-way through a catalog scan.
+
+#### Added
+
+- Binary parameter decoders for every geometric type: `point`, `lseg`, `path`,
+  `box`, `polygon`, `line`, `circle`.
+- `pggeo.line_from_points`, converting the two-point spelling of a `line` to
+  its `{A,B,C}` canonical text the way Postgres does.
+- `virtual._tables_with_oids`, the single-snapshot accessor catalog builders
+  use instead of enumerating the tables twice.
+
+#### Fixed
+
+- 16-bit count fields are read and written unsigned, so a Bind carrying more
+  than 32767 parameters no longer drops the connection. Fields that can
+  legitimately be negative — attnum, type size, format codes — stay signed.
+- Binding N parameters is linear rather than quadratic.
+- `line` values parse, and an open `path` keeps its `[…]` spelling through a
+  round trip instead of being rewritten as closed.
+- `time ± interval` returns a `time`, wrapping into a single day and dropping
+  the month/day components, as Postgres does. `timetz ± interval` does the same
+  and carries the zone offset through untouched.
+- A `date` compared against a computed `timestamp` promotes to midnight the way
+  Postgres does, instead of failing to compare ISO text against a datetime.
+- `'23:59:60'::time` carries forward to `24:00:00` rather than storing a second
+  that nothing downstream could parse — which had made `time - time` fail too.
+- An unknown-type operand beside an interval resolves numerically, so
+  `$1 * $2::interval` works with the typeless parameters JDBC drivers bind.
+- Interval arithmetic in a `WHERE` clause falls back to per-row evaluation
+  instead of lowering to an aggregation expression that cannot express it.
+- Catalog builders take one snapshot of the table list, so concurrent DDL no
+  longer aborts a `pg_class` / `pg_attribute` / `pg_attrdef` / `pg_description`
+  / `pg_index` scan.
+
+### Leap seconds are accepted, and a bad timestamp says what is wrong
+
+`'2015-06-30 23:59:60'` — a real leap second, and a value Postgres accepts by
+rolling it forward to the next minute — crashed with an internal error, because
+Python has no room for a second numbered 60. It now rolls forward the same way,
+carrying across the minute, day and year boundaries.
+
+The same path had a wider problem: *any* timestamp that could not be parsed
+reached the client as an internal error rather than saying so. Even
+`'not-a-date'` did. Unparseable timestamps now report invalid input syntax,
+naming the value, and the out-of-range near-misses Postgres also rejects —
+`23:59:61`, or a fractional leap second like `23:59:60.5` — are among them.
+
+#### Fixed
+
+- A `:60` leap second in a timestamp literal no longer fails with an internal
+  error.
+- An unparseable timestamp reports `invalid input syntax` instead of an
+  internal error.
+
+### `numeric` is exact again — `0.1 + 0.2 = 0.3` is true
+
+Decimal literals were read as floats, so Postgres' arbitrary-precision exact
+`numeric` behaved like a double. `0.1 + 0.2 = 0.3` answered false,
+`SELECT 0.000000` came back as `0` with its scale discarded, and a value wider
+than a double silently dropped digits — `12345678901234567890.12345 + 1`
+returned `1.2345678901234567E+19`, which for money-shaped data is corruption
+rather than rounding.
+
+A literal is now the same exact decimal a `numeric` column already stored, so
+values written, computed and read back all agree. Integers are unaffected, and
+so is integer division.
+
+Comparisons involving a decimal were wrong in a quieter way: the operators
+could not compare a decimal against an int or a float at all, and answered
+false instead. Any predicate mixing the two — a column against a decimal
+expression, a stored `numeric` against a literal — silently matched nothing.
+
+#### Added
+
+- `typemap.number_literal`, the single mapping from a numeric literal to its
+  Postgres type. The planner and the scalar evaluator carried separate copies
+  of this, which is why an earlier attempt at this fix left arithmetic on
+  floats.
+- `typemap.unwrap_numeric` / `typemap.negate` / `typemap.to_decimal128`.
+
+#### Fixed
+
+- Decimal literals are exact and keep their scale, so `numeric` arithmetic no
+  longer inherits floating-point error or loses digits.
+- Comparison operators handle decimals instead of silently answering false.
+
+### Repeated SQL statements skip the parser
+
+`planner.parse` now caches parsed statements by text, handing out fresh
+copies of the cached trees (`Expression.copy()` measures 3–4× cheaper
+than a parse, which profiled at ~29% of embedded statement time).
+Entries are cached on second sight — the first occurrence only leaves a
+marker — so workloads of mostly-unique statements (sqllogictest's
+corpus, inline-literal DML) pay nothing beyond a dict probe, while
+repeated text (per-connection re-parse of prepared statements, fixture
+DDL repeated across thousands of tests) hits from the second occurrence
+on: +26% embedded statement throughput on repeated-text workloads,
+no measurable cost on unique-text ones. The cached trees never leave
+the cache uncopied, so downstream mutation cannot poison them — pinned
+by `tests/test_sql_parse_cache.py` alongside second-sight, eviction,
+and error-path semantics.
+
+### `_pg_expandarray` and composite field access in the select list
+
+`information_schema._pg_expandarray(arr)` yields one `(x, n)` record per array
+element — the value and its 1-based subscript. JDBC's metadata queries lean on
+it heavily, selecting it two ways in the same statement: the whole record, and
+a single field via `(…).n`. Neither shape was recognised, so those queries
+failed outright rather than returning primary-key or index information.
+
+Both now work, including the schema-qualified spelling, and the record stays a
+composite rather than being flattened to text so that a field can still be read
+from it a level up — which is exactly how the driver uses it, producing the
+record in a subquery and selecting a field from it in the outer query.
+
+#### Added
+
+- `information_schema._pg_expandarray` in the select list, whole or by field.
+- `(expr).field` against a record-returning function.
+
+#### Fixed
+
+- Set-returning functions are recognised when written with a schema
+  qualification in the select list.
+
+### Result columns report the table and column they came from
+
+Every result column described itself as having no source: the table OID and
+column number that Postgres puts in each field of a row description were sent
+as zero. JDBC clients use exactly those to map a result column back to the
+column it was selected from, so an updatable `ResultSet` could not name the
+column it was asked to update — it built `UPDATE t SET "" = ?` and the server
+rejected it.
+
+Columns selected from a table now carry their source table and position, and
+they keep it through aliasing and reordering, since the position describes the
+table rather than the select list. Computed columns still report none, which is
+what Postgres reports for them.
+
+#### Fixed
+
+- Updating a row through a JDBC updatable `ResultSet` no longer fails with
+  `column "" does not exist`.
+
+### `SET TIME ZONE` actually sets the time zone
+
+Written the two-word way — `SET TIME ZONE 'Europe/Dublin'` — the statement did
+nothing at all. It takes no `=` or `TO`, so it slipped past the handler that
+reads name-and-value settings, and `SHOW TIME ZONE` answered with an empty
+string because that spelling was not recognised either. A client that pinned
+its connection's zone this way, as JDBC drivers do, silently stayed on the
+default and had no way to tell.
+
+Both spellings now set and report the same setting, `DEFAULT` resets it, and
+the change is announced to the client the way other tracked settings are.
+
+Worth being clear about the limit: this makes the *setting* stick. Values of
+type `timestamp with time zone` are still stored and displayed without regard
+to it — that conversion is a larger piece of work and is written up in the
+backlog.
+
+#### Fixed
+
+- `SET TIME ZONE <value>` sets the `TimeZone` setting; `SHOW TIME ZONE` reports
+  it.
+
+### `timestamp with time zone` respects the session's time zone
+
+A value written without an offset — `'2005-01-01 12:00:00'` — was read as UTC
+rather than as local time in the connection's own time zone, so it was stored
+at the wrong instant by however far that zone sits from Greenwich. Reading it
+back showed the same skew, which for a value near midnight moved it to the
+previous or the following day.
+
+Such a value is now interpreted in the session's zone, as Postgres does, and
+displayed back in that zone. A value that arrives carrying its own offset is
+already unambiguous and is left alone.
+
+Two smaller things came with it. Zone names written with an offset, like
+`GMT+13`, previously resolved to nothing and fell back to UTC; they now resolve,
+keeping the POSIX convention Postgres follows where `GMT+13` means thirteen
+hours *behind* UTC. And offsets are written the way Postgres writes them — `+00`
+and `-05` rather than `+00:00`, widening to `+05:30` only where the minutes
+matter — which clients that compare the rendered text depend on.
+
+Values of type `date` and `timestamp without time zone` are unaffected, as they
+should be: neither has an instant behind it to move.
+
+#### Fixed
+
+- A `timestamptz` written without an offset is interpreted in the session's
+  time zone instead of UTC, and displayed in that zone.
+- Zone settings of the form `GMT±N` resolve, with Postgres' sign convention.
+- Offsets render in Postgres' spelling.
+
+### A failed statement now aborts its transaction, whatever raised it
+
+Postgres aborts a transaction block on any error: every later statement fails
+until the block is rolled back. That held for errors raised while running a
+statement, but not for errors the protocol layer raised on its own — asking for
+a prepared statement or portal that no longer exists, or a parameter that could
+not be decoded. Those left the block looking healthy, so work that a client
+believed had been discarded went on to commit.
+
+Rolling back, including to a savepoint, still recovers the block, and statements
+outside a transaction are unaffected.
+
+`DEALLOCATE ALL` also now reports the command tag Postgres reports —
+`DEALLOCATE ALL` rather than a bare `DEALLOCATE`. Drivers watch for that exact
+tag to learn their server-side statement cache has been discarded and to
+re-prepare; without it they kept using names the server had already dropped.
+
+The two go together. Aborting the transaction on its own made a JDBC driver's
+recovery worse, not better: the block now died where the driver expected to
+carry on, because it still had no idea its cache was stale.
+
+#### Fixed
+
+- An error raised by the extended query protocol aborts the open transaction.
+- `DEALLOCATE ALL` reports the `DEALLOCATE ALL` command tag.
+
+### UNIQUE constraints are enforced by the storage engine
+
+A `UNIQUE` constraint was upheld by looking for a clashing row before writing
+one. That look happens against the snapshot the writing transaction is reading,
+so it could not see a value another transaction had just committed, nor one a
+second writer was inserting at that moment. Either way a duplicate was stored,
+and the constraint quietly did not hold.
+
+Declaring a constraint now creates the index that enforces it, so the storage
+engine decides: a value already present is refused whoever wrote it and
+whenever, and two transactions reaching for the same value collide so that only
+one keeps it. Adding a constraint to an existing table does the same, and
+dropping it removes the index.
+
+The SQL rules around NULL are preserved: any number of NULLs satisfy a `UNIQUE`
+constraint, and a constraint over several columns does not apply to a row where
+any of them is NULL.
+
+Constraints declared `DEFERRABLE` are unchanged. Those are allowed to be
+violated part-way through a transaction and are judged when it commits — a
+swap of two values being the usual case — so they continue to be checked at
+commit rather than on every write.
+
+#### Fixed
+
+- A `UNIQUE` constraint no longer admits a duplicate written by a transaction
+  that began before the value was committed, or by two transactions at once.
+
+### Unique indexes are enforced by the storage engine
+
+A unique index used to be upheld by looking for a clashing value before writing
+one. That look happens against the snapshot the writer is reading, which cannot
+show a value another transaction committed a moment earlier, and cannot show a
+value a second writer is inserting right now. Both cases stored a duplicate.
+
+Unique indexes now also record each indexed value under a key that is the value
+itself, so WiredTiger decides. A value already present is refused by the engine
+whoever wrote it and whenever; two writers reaching for the same value collide
+and only one keeps it. Creating a unique index over rows that already exist
+claims their values too.
+
+Nothing else changes: the existing index entries, and every query path that
+reads them, are untouched, and a database written by an earlier version stays
+readable.
+
+This covers unique indexes as used through the MongoDB interface. A `UNIQUE`
+constraint declared in SQL is still upheld the older way and keeps the same two
+gaps; the groundwork for closing that is now in place.
+
+#### Fixed
+
+- A unique index no longer admits a duplicate written by a transaction that
+  began before the value was committed, or by two writers at once.
+
+### Both wire servers disable Nagle — a 200x CI stall on chatty round-trips
+
+Neither server set `TCP_NODELAY` on accepted sockets. Reply paths write
+small frames back-to-back (a reply then ReadyForQuery, one batch item's
+result then the next), and with Nagle enabled the second write waits for
+the peer's delayed ACK — roughly 40ms per round trip on Linux, invisible
+on macOS loopback where ACKs are immediate. pgjdbc's generated-keys
+batch tests, which perform 1,000 single-row round trips each, measured
+41.5 seconds per test in CI against 0.2 seconds locally from exactly
+this — about 20 minutes of the pgjdbc lane's in-test time on ~30 tests.
+Both servers now set `TCP_NODELAY` unconditionally on every accepted
+connection, as mongod and PostgreSQL do.
+
+### Oversized transactions are rejected before they can stall the engine
+
+A multi-document transaction's statements all join a single WiredTiger
+transaction, whose written content stays unevictable from the storage cache
+until commit. A client that pushed enough data through one transaction
+could therefore pin the cache past its dirty threshold and livelock the
+engine — the same stall class the chunked-insert fix closed for plain batch
+writes, where chunking cannot apply.
+
+The Python server now enforces the guard real MongoDB has for this exact
+condition: a transaction whose buffered write volume exceeds a budget
+derived from the cache size (about 15%, mirroring mongod's threshold) fails
+with `TransactionTooLargeForCache` (code 313). The error carries no
+`TransientTransactionError` label — retrying the same oversized transaction
+would hit the same wall — and, as with any failed in-transaction statement,
+the transaction is aborted server-side. Transactions under the budget, and
+plain writes of any size, are unaffected.
+
+#### Added
+
+- `secantus.storage`: `TransactionTooLargeError` + a per-transaction
+  dirty-bytes budget (~15% of `cache_size`) enforced in the oplog-buffering
+  path; surfaced by the command layer as mongod's
+  `TransactionTooLargeForCache` (313, unlabeled). Pinned at both the
+  storage and wire levels against a deliberately small cache.
+
+### Unique-key claims no longer survive their table
+
+The storage-backed unique-index enforcement introduced a week ago kept its
+claims table alive across namespace teardown: dropping a table (or index, or
+database) left the dropped namespace's unique-key claims behind, so
+recreating the table and inserting a previously-used value was falsely
+rejected as a duplicate. Caught by the weekly conformance sweep — the
+sqllogictest corpus cycles drop/create with unique indexes constantly — and
+reproduced in eight lines. Every teardown path now releases the namespace's
+claims: drop table, drop index, drop all indexes, drop database, and rename.
+
+#### Fixed
+
+- `secantus.storage`: `table:secantus_unique_keys` rows are purged wherever
+  their index or collection dies. Pinned by per-path regression tests
+  (`TestClaimsDieWithTheirNamespace`) and the previously-failing
+  `index/delete` sqllogictest file, which passes again in both protocols.
+
+### Idle connections can no longer pin WiredTiger's transaction horizon
+
+The pgjdbc conformance lane's two-hour hang had a second, deeper cause beyond
+the idle-in-transaction timeout shipped previously: a connection whose last
+statement left its cached WiredTiger session with a positioned cursor held an
+*implicit* transaction — invisible to every PostgreSQL-level accounting — and
+pinned the storage engine's oldest-transaction horizon while it idled. Every
+write after that pin kept its history unevictable, so per-operation cost grew
+linearly with churn until a 100k-row TRUNCATE stalled in page reads and wedged
+the server. The wedge needed a specific mix of prior traffic to arm, which is
+why it only appeared mid-way through the full pgjdbc suite.
+
+Both wire servers now call the new `Storage.release_thread_snapshot()` before
+blocking for the next client message: `WT_SESSION.reset()` releases the
+snapshot and every cursor position in one cheap call, so an idle connection
+holds nothing by construction. Inside an open user transaction the release is
+a deliberate no-op — a transaction's pinned snapshot is its semantics, and the
+transaction-lifetime / idle-in-transaction timeouts bound that case. The
+previously-deterministic pgjdbc wedge reproduction now runs clean with the
+pinned-transaction-range statistic flat at zero.
+
+#### Added
+
+- `Storage.release_thread_snapshot()` — releases the calling thread's WT read
+  snapshot and cursor positions; called by both the PG and Mongo wire servers
+  at the end of every request, before the idle wait.
+- `tests/test_storage_snapshot_release.py` — statistics-backed regression
+  tests: a positioned cursor measurably pins the horizon and the release
+  clears it; the release is a no-op inside a user transaction; a wire-level
+  invariant that an idle PG connection never accumulates a pinned range.
+
+#### Fixed
+
+- An idle connection's stale read snapshot no longer degrades all later
+  writes without bound (the pgjdbc `CopyLargeFileTest` wedge / 2-hour CI lane
+  timeout). The Rust server's equivalent idle-session behaviour is tracked as
+  a follow-up in `tasks/backlog.md`.
+
 ## [0.6.0b9] — 2026-08-01
 
 ### Async oplog hardened: transactions can no longer leak ghost events
