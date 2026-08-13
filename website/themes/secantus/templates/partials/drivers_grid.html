@@ -8,7 +8,7 @@
       <span class="rate">99.5%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>1021</strong> tests passed &middot; <strong>5</strong> failed</p>
+    <p class="counts"><strong>1021</strong> tests passed &middot; <strong>5</strong> known divergences</p>
     <p class="note">The official MongoDB Python driver, and the deepest suite we run &mdash; so it surfaces the long tail. The remaining failures are features outside a single node's scope (text / hashed indexes, server-side <code>$where</code> JavaScript), tests that assume a multi-node cluster, and a few driver-side harness artifacts &mdash; not gaps in the CRUD, aggregation, or change-stream surface that test and dev rely on. We run pymongo's own tests, unmodified, against an embedded SecantusDB.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -22,7 +22,7 @@
       <span class="rate">99.4%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>926</strong> tests passed &middot; <strong>6</strong> failed</p>
+    <p class="counts"><strong>926</strong> tests passed &middot; <strong>6</strong> known divergences</p>
     <p class="note">pymongo's native <code>AsyncMongoClient</code> suite &mdash; the async/await wire path that replaced Motor. Same unmodified upstream tests as the sync gauge, run under <code>pytest-asyncio</code> against the same embedded SecantusDB, so the non-blocking client is held to the same bar rather than assumed to follow from the sync one. Remaining failures are the same out-of-scope surfaces (text / hashed indexes, server-side <code>$where</code>) plus a few timeout-introspection tests.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-pymongo-async.html" rel="noopener">Read the report &rarr;</a>
   </article>
