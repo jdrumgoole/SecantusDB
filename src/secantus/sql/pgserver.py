@@ -478,13 +478,32 @@ class SecantusPGServer:
             if canonical is not None:
                 session.settings["client_encoding"] = canonical
 
+        # Startup-packet GUC parameters: Postgres accepts any run-time GUC as
+        # a startup parameter and applies it as the session default. pgjdbc
+        # sends ``TimeZone`` this way (the JVM zone in the POSIX-inverted
+        # spelling PG expects) — dropping it left every pgjdbc session on UTC,
+        # which shifted date reads a day for clients west of Greenwich
+        # (DateTest's timestamptz x GMT-N failures). Applied for the GUCs SET
+        # supports; unknown parameters stay ignored like before.
+        for raw_name, raw_value in startup.params.items():
+            if raw_name in ("user", "database", "options", "replication"):
+                continue
+            guc = sql_session.canonical_guc_name(raw_name)
+            if guc in sql_session.REPORTABLE_GUCS or guc == "IntervalStyle":
+                value = raw_value
+                if guc == "TimeZone":
+                    value = sql_session.canonical_timezone_setting(value)
+                elif guc == "client_encoding":
+                    value = sql_session.canonical_client_encoding(value) or value
+                session.settings[guc] = value
+
         out = bytearray()
         out += pgwire.authentication_ok()
         for name, value in (
             ("server_version", SERVER_VERSION),
             ("server_encoding", "UTF8"),
             ("client_encoding", session.get_setting("client_encoding")),
-            ("DateStyle", "ISO, MDY"),
+            ("DateStyle", session.get_setting("DateStyle") or "ISO, MDY"),
             # Real postgres reports IntervalStyle in the startup set, and
             # psycopg selects its interval parser from it: without the
             # ParameterStatus the client sees IntervalStyle "unknown" and
@@ -492,7 +511,7 @@ class SecantusPGServer:
             ("IntervalStyle", session.get_setting("IntervalStyle")),
             ("integer_datetimes", "on"),
             ("standard_conforming_strings", "on"),
-            ("TimeZone", "UTC"),
+            ("TimeZone", session.get_setting("TimeZone") or "UTC"),
             ("application_name", application_name),
             ("is_superuser", "off"),
             ("session_authorization", user),

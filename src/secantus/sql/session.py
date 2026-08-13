@@ -146,6 +146,22 @@ _GUC_CANONICAL.update({k.lower(): k for k in REPORTABLE_GUCS})
 _GUC_CANONICAL["time zone"] = "TimeZone"
 
 
+def canonical_timezone_setting(value: str) -> str:
+    """Normalize a TimeZone GUC value the way Postgres reports it: the
+    GMT/UTC-prefixed POSIX spellings uppercase their prefix (``gmt-3`` ->
+    ``GMT-3``) and bare utc/gmt uppercase entirely. pgjdbc's ParameterStatus
+    parser matches ``GMT+``/``GMT-`` case-sensitively — a lowercase echo left
+    it assuming UTC, so binary timestamptz getString rendered the wrong zone.
+    Region names (``Europe/Paris``) pass through unchanged."""
+    v = (value or "").strip().strip("'\"")
+    low = v.lower()
+    if low in ("utc", "gmt"):
+        return low.upper()
+    if low.startswith(("gmt+", "gmt-", "utc+", "utc-")):
+        return v[:3].upper() + v[3:]
+    return v
+
+
 def canonical_guc_name(name: str) -> str:
     # Collapse internal whitespace so ``TIME  ZONE`` resolves like ``TIME ZONE``.
     return _GUC_CANONICAL.get(" ".join(name.split()).lower(), name.strip())

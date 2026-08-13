@@ -1640,6 +1640,18 @@ def _evaluated_value_rows(
             path, _ = plan.resolve(node)
             return get_path(doc, path)
 
+        # Optional protocol: lets ``scalar._eval_cast`` learn a column's type
+        # tag (a naive datetime from storage is a ``timestamp`` or a decoded
+        # ``timestamptz`` — only the tag can tell, and ``col::text`` must
+        # render a timestamptz with the session-zone offset like Postgres).
+        def column_tag(node: Any) -> str | None:
+            try:
+                _, tag = plan.resolve(node)
+            except Exception:  # noqa: BLE001 — unresolvable: no tag claim
+                return None
+            return tag
+
+        scope.column_tag = column_tag  # type: ignore[attr-defined]
         return scope
 
     # An enum ORDER BY term sorts by the label's declared ordinal, not lexically.

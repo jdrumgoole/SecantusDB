@@ -1961,6 +1961,48 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import pggeo as _pggeo
 
         return _pggeo.canonical(value, to_tag_early)
+    if to_tag_early == "text" and isinstance(value, _dt.datetime):
+        # ``tstz::text`` must render like Postgres: session-zone wall clock
+        # WITH the UTC offset (``2005-01-01 12:00:00+00``). A stored
+        # timestamptz decodes tz-naive UTC, so the source TAG decides whether
+        # this naive value is an instant (timestamptz -> convert + offset) or
+        # a wall clock (timestamp -> no offset). The tag comes from an inner
+        # cast, or from the executor scope's optional ``column_tag`` probe.
+        inner = node.this
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        src_tag: str | None = None
+        if isinstance(inner, exp.Cast):
+            src_tag = typemap.type_tag_for_sql(inner.to)
+        elif isinstance(inner, exp.Column):
+            probe = getattr(scope, "column_tag", None)
+            if probe is not None:
+                src_tag = probe(inner)
+        if value.tzinfo is not None or src_tag == "timestamptz":
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=_dt.timezone.utc)
+            with contextlib.suppress(OverflowError, ValueError):
+                value = value.astimezone(typemap.render_tzinfo())
+            return typemap._render_timestamp_iso(value)
+        return typemap._render_timestamp_iso(value.replace(tzinfo=None))
+    if to_tag_early == "text" and isinstance(value, str):
+        # ``tz::text`` — Postgres' output spelling (``+01``, not ``+01:00``).
+        # A stored timetz decodes as a plain str, so the source tag (inner
+        # cast, or the scope's ``column_tag`` probe) identifies it.
+        inner = node.this
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        src_tag = None
+        if isinstance(inner, exp.Cast):
+            src_tag = typemap.type_tag_for_sql(inner.to)
+        elif isinstance(inner, exp.Column):
+            probe = getattr(scope, "column_tag", None)
+            if probe is not None:
+                src_tag = probe(inner)
+        if src_tag == "timetz" or isinstance(value, typemap.TimeTzText):
+            from secantus.sql import datetimes as _datetimes
+
+            return _datetimes.render_timetz(value)
     if to_tag_early == "text" and isinstance(value, list):
         # ``(x::box[])::text`` — render the array literal NOW with the inner
         # cast's element rules (box's ``;`` delimiter); by output time the

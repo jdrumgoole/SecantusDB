@@ -5665,18 +5665,27 @@ normalises an aware datetime to UTC and `0001-01-01 00:00+05:00` is year zero
 there. It surfaced immediately as 14 fresh `internal error`s, and those
 extremes now keep their wall clock as they did before.
 
-`DateTest` 21 -> 8 across the session. ~~**Remaining 8** are all
-`expected: <1950-02-07>`~~ — RESOLVED: re-measured on the `pg-large-objects`
-branch (2026-08-12), `DateTest` is **192/192, 0 failed**. The last 8 cleared
-with fixes that landed between the capture session and this measurement (the
-offset-date Bind widening + timestamptz param-type threading above, plus the
-subsequent timestamptz-session-zone and BC-timestamp slices); no further
-capture pass was needed.
+`DateTest` 21 -> 8 across the session. **CORRECTION (2026-08-13): the
+2026-08-12 "192/192, 0 failed" measurement was a PARSER BUG, not a result** —
+the XML tally used `tc.find("failure") or tc.find("error")`, and a childless
+`<failure>` element is FALSY in ElementTree, so every real failure counted as
+a pass (the DeprecationWarning in that run's output was pointing straight at
+it; always compare `is None`). DateTest had been 8-failing the whole time:
+`type=timestamptz` x negative-GMT zones x both binary modes. Root cause: the
+server DROPPED pgjdbc's `TimeZone` STARTUP parameter, leaving every JDBC
+session on UTC — clients west of Greenwich read dates back one day early.
+Actually fixed in the tz-conformance slice (startup GUC params applied +
+reported, `gmt-3` -> `GMT-3` ParameterStatus normalization, POSIX `GMT+3:30`
+minutes, session-offset stamping on BC wide literals, `tstz::text` /
+`tz::text` renders): DateTest **192/192** and TimezoneTest **16/16**, measured
+with a correct parser.
 
-`TimezoneTest` is unchanged at 7 and untouched by any of this: its failures are
-`timestamptz` TEXT comparisons (`2005-01-01 12:00:00+00`), an interval-style
-offset (`-12600000` where 0 was expected, i.e. 3.5 hours), and a `timetz`
-rendering — a separate group that wants its own look.
+~~`TimezoneTest` is unchanged at 7~~ — RESOLVED in the tz-conformance slice
+(2026-08-13): the text comparisons were `tstz::text` casts missing the
+session-zone offset, the 3.5-hour offset was `GMT+3:30` failing the POSIX
+zone regex (fell back to UTC), the `timetz` rendering wanted PG's `+01`
+spelling, and the last binary-mode failure was the lowercase `gmt-3`
+ParameterStatus echo pgjdbc could not parse. TimezoneTest is **16/16**.
 
 ### The storage-level fix landed — as a separate table, not a layout change
 

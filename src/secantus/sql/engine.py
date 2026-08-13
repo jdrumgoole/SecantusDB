@@ -4598,6 +4598,8 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
             else:
                 continue  # SET LOCAL outside a transaction — no lasting effect
         else:
+            if name.lower() in ("timezone", "time zone"):
+                value = sql_session.canonical_timezone_setting(str(value))
             if name.lower() == "client_encoding":
                 # Canonicalise (SHOW / ParameterStatus report the PG spelling)
                 # and reject encodings the wire layer can't convert.
@@ -4906,6 +4908,8 @@ def _run_command(
         if m_set is not None:
             guc = sql_session.canonical_guc_name(m_set.group(1))
             value = ", ".join(part.strip().strip("'\"") for part in m_set.group(2).split(","))
+            if guc == "TimeZone":
+                value = sql_session.canonical_timezone_setting(value)
             if guc == "client_encoding":
                 # Canonicalise like the structured SET path (utf-8/utf_8 → UTF8);
                 # ParameterStatus must echo the PG spelling.

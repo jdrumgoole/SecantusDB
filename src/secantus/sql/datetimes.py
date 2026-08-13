@@ -78,7 +78,7 @@ def _widen(s: str) -> str:
 
 _TZ_NUM_RE = re.compile(r"^([+-]?)(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?$")
 #: ``GMT+13`` / ``UTC-5`` — a zone name with a POSIX offset suffix.
-_TZ_PREFIXED_RE = re.compile(r"(?i)^(?:GMT|UTC)([+-])(\d{1,2})$")
+_TZ_PREFIXED_RE = re.compile(r"(?i)^(?:GMT|UTC)([+-])(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?$")
 
 
 def tzinfo_for_setting(setting: str) -> _dt.tzinfo:
@@ -96,11 +96,13 @@ def tzinfo_for_setting(setting: str) -> _dt.tzinfo:
     pm = _TZ_PREFIXED_RE.match(s)
     if pm:
         # POSIX sign convention, so GMT+13 is UTC-13 (checked against
-        # PostgreSQL 14.13, which renders it as -13). Built as a fixed offset
-        # rather than via zoneinfo's ``Etc/GMT±N``, which stops at ±12 while
-        # Postgres accepts more.
-        hours = int(pm.group(2))
-        return _dt.timezone(_dt.timedelta(hours=-hours if pm.group(1) == "+" else hours))
+        # PostgreSQL 14.13, which renders it as -13; GMT+3:30 is UTC-03:30 —
+        # pgjdbc's halfHourTimezone test drives exactly that spelling). Built
+        # as a fixed offset rather than via zoneinfo's ``Etc/GMT±N``, which
+        # stops at ±12 while Postgres accepts more (and has no half-hour
+        # entries at all).
+        seconds = int(pm.group(2)) * 3600 + int(pm.group(3) or 0) * 60 + int(pm.group(4) or 0)
+        return _dt.timezone(_dt.timedelta(seconds=-seconds if pm.group(1) == "+" else seconds))
     m = _TZ_NUM_RE.match(s)
     if m:
         seconds = int(m.group(2)) * 3600 + int(m.group(3) or 0) * 60 + int(m.group(4) or 0)
@@ -192,7 +194,9 @@ _WIDE_TS_RE = re.compile(
 )
 
 
-def wide_timestamp_text(v: Any, *, drop_offset: bool = False) -> str | None:
+def wide_timestamp_text(
+    v: Any, *, drop_offset: bool = False, default_offset: str | None = None
+) -> str | None:
     """Canonical text for a PG-valid timestamp outside Python's datetime range
     (year > 9999 or a BC date), or None when the value is in-range / malformed.
     The canonical form is ``YYYY-MM-DD HH:MM:SS[.ffffff][+TZ][ BC]``.
@@ -202,6 +206,12 @@ def wide_timestamp_text(v: Any, *, drop_offset: bool = False) -> str | None:
     wall-clock fields and forgets the zone. Rendering it back left a BC value
     reading ``0101-01-01 00:00:00+00 BC`` where Postgres writes
     ``0101-01-01 00:00:00 BC``.
+
+    ``default_offset`` (``±HH:MM``) is stamped onto an input that carried NO
+    offset — a timestamptz literal without a zone is wall clock in the session
+    zone, and ``wide_timestamp_micros`` recovers the true instant from the
+    stamped text (a BC date read back through a non-UTC session shifted a day
+    without it — pgjdbc's DateTest GMT-N matrix).
     """
     m = _WIDE_TS_RE.match(str(v).strip())
     if m is None:
@@ -223,6 +233,8 @@ def wide_timestamp_text(v: Any, *, drop_offset: bool = False) -> str | None:
         if m.group("om"):
             off += f":{m.group('om')}"
         text += off
+    elif default_offset is not None and not drop_offset and default_offset != "+00:00":
+        text += default_offset
     if bc:
         # PG renders the era last, after any zone offset.
         text += " BC"
@@ -475,6 +487,17 @@ def _normalize_offset(off: str) -> str:
     hours = int(rest[:2])
     minutes = int(rest[2:4]) if len(rest) > 2 else 0
     return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def render_timetz(value: Any) -> str:
+    """A stored timetz (canonical ``HH:MM:SS[.f]+HH:MM``) in Postgres' output
+    spelling: a zero-minute offset renders as ``+01``, not ``+01:00`` —
+    clients compare the text (pgjdbc's TimezoneTest asserts ``15:00:00+01``).
+    Non-zero minutes keep the wide form (``+05:30``)."""
+    text = str(value)
+    if len(text) >= 6 and text[-3] == ":" and text[-2:] == "00" and text[-6] in "+-":
+        return text[:-3]
+    return text
 
 
 def render_date(value: Any) -> str:
