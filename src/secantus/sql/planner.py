@@ -2249,18 +2249,23 @@ def plan_insert(stmt: exp.Insert, table: TableDef, subctx: Any = None) -> Insert
         col_names = []
     if not isinstance(values, exp.Values):
         raise errors.feature_not_supported("INSERT requires a VALUES clause")
+    explicit_cols = isinstance(stmt.this, exp.Schema)
     docs: list[dict[str, Any]] = []
     for tup in values.expressions:
         cells = tup.expressions
-        if len(cells) != len(col_names):
-            raise errors.syntax_error(
-                f"INSERT has {len(cells)} values but {len(col_names)} columns"
-            )
+        if len(cells) > len(col_names):
+            raise errors.syntax_error("INSERT has more expressions than target columns")
+        if len(cells) < len(col_names) and explicit_cols:
+            raise errors.syntax_error("INSERT has more target columns than expressions")
+        # Without an explicit column list, Postgres lets a shorter row fill a
+        # PREFIX of the table's columns — the rest take their DEFAULT / NULL
+        # (pgjdbc's rewritten batch inserts and TimeTest lean on this).
+        row_col_names = col_names[: len(cells)]
         # A ``DEFAULT`` keyword cell is treated as an omitted column, so the
         # column's DEFAULT / sequence applies (and an identity ALWAYS column
         # accepts DEFAULT while rejecting a real value).
         row_cols, row_vals = [], []
-        for name, cell in zip(col_names, cells, strict=True):
+        for name, cell in zip(row_col_names, cells, strict=True):
             if _is_default_cell(cell):
                 continue
             row_cols.append(name)

@@ -139,3 +139,37 @@ def test_insert_select_empty_source(storage, session):
     )
     assert res.command_tag == "INSERT 0 0"
     assert q(storage, session, "SELECT count(*) FROM dst").rows == [(0,)]
+
+
+# --------------------------------------------------------------------------- #
+# Prefix VALUES rows (no explicit column list) — Postgres fills the rest
+# --------------------------------------------------------------------------- #
+
+
+def test_short_values_row_fills_column_prefix(storage, session):
+    q(
+        storage,
+        session,
+        "CREATE TABLE pv (a int, b int, c text DEFAULT 'dflt')",
+    )
+    q(storage, session, "INSERT INTO pv VALUES (1, 2)")
+    q(storage, session, "INSERT INTO pv VALUES ((3), (4)), ((5), (6))")
+    assert q(storage, session, "SELECT * FROM pv ORDER BY a").rows == [
+        (1, 2, "dflt"),
+        (3, 4, "dflt"),
+        (5, 6, "dflt"),
+    ]
+
+
+def test_too_many_values_rejected(storage, session):
+    q(storage, session, "CREATE TABLE pv2 (a int, b int)")
+    with pytest.raises(SQLError) as e:
+        q(storage, session, "INSERT INTO pv2 VALUES (1, 2, 3)")
+    assert "more expressions than target columns" in str(e.value)
+
+
+def test_explicit_column_list_still_requires_exact_arity(storage, session):
+    q(storage, session, "CREATE TABLE pv3 (a int, b int)")
+    with pytest.raises(SQLError) as e:
+        q(storage, session, "INSERT INTO pv3 (a, b) VALUES (1)")
+    assert "more target columns than expressions" in str(e.value)
