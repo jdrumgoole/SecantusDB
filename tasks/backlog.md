@@ -5436,6 +5436,23 @@ distinct problems, triaged from the run logs:
   (renames of huge collections are rare); bounded today only by luck of
   cache headroom. The `drop_target=true` purge inside rename shares the
   shape.
+- [ ] **One unexplained xdist worker death in `test_rust_binary_pitr.py`
+  (2026-08-13, during the 0.6.0b10 release runs).** In one of three
+  full-suite runs on a quiet machine, worker gw0 died hard while running
+  `test_rust_binary_v2_archive_base_snapshot_and_restore` — no macOS crash
+  report (so no segfault/abort: a SIGKILL or hard `_exit`), xdist replaced
+  the worker and the suite continued (test reported FAILED). The other two
+  quiet runs and a solo run were green. NOT the same event as the release
+  wedge that day (that was CPU contention from a parallel session's suite),
+  and NOT the `Python-*.ips` segfault reports from those windows — all
+  three of those are `test_crash_stall_watchdog.py`'s INTENTIONAL nested
+  `test_boom` segfault (thread name in the .ips names it), which fires on
+  every full run; treat those reports as noise when diagnosing. The test
+  spawns `secantusd-rs`, SIGTERMs it, runs `secantusdb restore` in a
+  subprocess, then opens the restored dir with the Python `Storage` in the
+  worker. Next occurrence: capture per-worker RSS + the worker's pid before
+  death, and check whether the restore subprocess or the WT open is the
+  killer. Until then: 1-in-3, unreproduced.
 - [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
   first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
   …) are inside the ~347 documented standing failures of the 93.7% baseline
