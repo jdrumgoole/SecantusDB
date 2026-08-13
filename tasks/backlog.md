@@ -5424,9 +5424,15 @@ distinct problems, triaged from the run logs:
   (drop a prior row's collection mid-churn). Also note: a drop queued
   behind live writers starves indefinitely (lock fairness) — the bench
   harness now avoids drops entirely (fresh per-row collection names).
-- [ ] **Rust server: `rename_collection` re-keys every row in one statement
-  transaction — same txn-too-large-for-cache class as the (fixed) drop
-  wedge.** A rename of a collection whose re-key volume exceeds the cache's
+- [x] **RESOLVED: Rust server: `rename_collection` re-keys every row in one
+  statement transaction** — now a chunked two-phase move reusing the drop
+  tombstones (tombstone dst -> batched copy -> small switch txn -> batched
+  src purge); both crash windows recover through the existing
+  `recover_pending_drops` as plain drops, on both servers. Pinned by
+  `crates/secantus-storage/tests/rename_chunk.rs` (150k docs under a 128M
+  cache — the shape that wedged — plus index/claim/order/drop_target
+  semantics). User-transaction renames keep the atomic path (dirty-budget
+  guarded). Original entry: A rename of a collection whose re-key volume exceeds the cache's
   dirty budget would hit the same cache-pressure `WT_ROLLBACK` + unbounded
   `retry_write_conflicts` loop. Unlike drop, rename NEEDS single-transaction
   atomicity (a crash mid-rename must not leave the namespace half-moved), so

@@ -6735,26 +6735,236 @@ impl Storage {
             .iter()
             .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
             .collect();
-        // One statement transaction around the whole move: target purge, doc
-        // re-key, index catalog + entry rebuild, registry rows and the rename
-        // oplog entry commit or vanish together — a crash mid-rename can no
-        // longer leave the namespace half-moved. The WT `create` calls inside
-        // are schema ops WiredTiger runs on an internal session (idempotent;
-        // an orphan empty table is harmless).
         let _gen = self.ddl_generation_scope();
-        self.retry_write_conflicts("rename_collection", || {
+        if self.in_user_txn() {
+            // Joins the user transaction atomically; its dirty-budget guard
+            // (TransactionTooLargeForCache) bounds the size — same reasoning
+            // as drop_collection's user-txn path.
+            return self.retry_write_conflicts("rename_collection", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.rename_collection_in_txn(
+                        &session,
+                        src_db,
+                        src_coll,
+                        dst_db,
+                        dst_coll,
+                        drop_target,
+                    )
+                })
+            });
+        }
+        // Chunked two-phase rename. The single-transaction move re-keyed every
+        // row at once — unbounded dirty content, the same WT-livelock class as
+        // the (fixed) one-transaction drop purge. The phases reuse the drop
+        // tombstones so BOTH crash windows recover through the existing
+        // `recover_pending_drops`, on both servers:
+        //
+        //   0. validation (+ chunked drop of the target under drop_target);
+        //   A. small txn: tombstone DST — a crash mid-copy leaves partial rows
+        //      behind an unregistered name with a plain drop tombstone, which
+        //      open-time recovery purges (the rename simply never happened);
+        //   B. batched txns: copy src rows to dst (fresh RecordIds, index
+        //      catalog + rebuilt entries + unique claims per batch);
+        //   C. small txn — THE SWITCH: register dst, unregister src, move the
+        //      tombstone dst -> src, emit the rename oplog entry. After this
+        //      commit the rename has happened; a crash leaves src's rows
+        //      behind an unregistered name with a plain tombstone (recovered
+        //      as a drop);
+        //   D. batched purge of src rows + tombstone clear
+        //      (`purge_dropped_collection`).
+        //
+        // The namespace locks are held throughout, so no reader or writer can
+        // observe the intermediate states on a live server.
+        {
+            let session = self.op_session()?;
+            if coll_options(&session, src_db, src_coll)?.is_none() {
+                return Ok((
+                    false,
+                    Some(format!(
+                        "source namespace does not exist: {src_db}.{src_coll}"
+                    )),
+                ));
+            }
+            if (src_db, src_coll) == (dst_db, dst_coll) {
+                return Ok((true, None));
+            }
+            if coll_options(&session, dst_db, dst_coll)?.is_some() && !drop_target {
+                return Ok((
+                    false,
+                    Some(format!("target namespace exists: {dst_db}.{dst_coll}")),
+                ));
+            }
+        }
+        let src_ui = if self.enable_oplog {
+            let session = self.op_session()?;
+            Some(collection_uuid(&session, src_db, src_coll)?)
+        } else {
+            None
+        };
+        // Phase 0: drop an existing target the chunked way (unregister +
+        // tombstone + drop oplog entry, then batched purge) — mongod's oplog
+        // order is drop-target then rename.
+        let mut dst_ui: Option<Vec<u8>> = None;
+        let dst_existed = {
+            let session = self.op_session()?;
+            coll_options(&session, dst_db, dst_coll)?.is_some()
+        };
+        if dst_existed {
+            dst_ui = if self.enable_oplog {
+                let session = self.op_session()?;
+                Some(collection_uuid(&session, dst_db, dst_coll)?)
+            } else {
+                None
+            };
+            self.retry_write_conflicts("rename_collection drop-target", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    let c = session.open_cursor(COLL_TABLE, None)?;
+                    c.set_key_ss(dst_db, dst_coll);
+                    match c.search() {
+                        Ok(()) => c.remove()?,
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    let t = session.open_cursor(TOMB_TABLE, None)?;
+                    t.set_key_ss(dst_db, dst_coll);
+                    t.set_value_u(b"");
+                    t.insert()?;
+                    if let Some(du) = &dst_ui {
+                        self.emit_drop_oplog(&session, dst_db, dst_coll, du)?;
+                    }
+                    Ok(())
+                })
+            })?;
+            self.purge_dropped_collection(dst_db, dst_coll)?;
+        }
+        // Phase A: tombstone the destination before any row lands there.
+        self.retry_write_conflicts("rename_collection tombstone", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                self.rename_collection_in_txn(
-                    &session,
-                    src_db,
-                    src_coll,
-                    dst_db,
-                    dst_coll,
-                    drop_target,
-                )
+                let t = session.open_cursor(TOMB_TABLE, None)?;
+                t.set_key_ss(dst_db, dst_coll);
+                t.set_value_u(b"");
+                t.insert()?;
+                // The index catalog rows ride in this small transaction so
+                // every copy batch sees the destination's indexes.
+                let idx_rows = self.collect_idx_rows(&session, src_db, src_coll)?;
+                let icur = session.open_cursor(IDX_TABLE, None)?;
+                for (name, payload) in &idx_rows {
+                    icur.reset()?;
+                    icur.set_key_sss(dst_db, dst_coll, name);
+                    icur.set_value_u(payload);
+                    icur.insert()?;
+                }
+                Ok(())
             })
-        })
+        })?;
+        // Lazy shards: the destination's doc shard may not exist yet (schema
+        // op, runs on WiredTiger's internal session — idempotent).
+        {
+            let session = self.op_session()?;
+            session.create(
+                &doc_table_for(dst_db, dst_coll),
+                &data_table_cfg(DOC_TABLE_CFG, self.data_nonlogged),
+            )?;
+        }
+        // Phase B: copy in bounded batches, resuming by source RecordId.
+        // Fresh RecordIds preserve insertion order (the source walk is
+        // RecordId order and minting is monotonic); index entries + unique
+        // claims are rebuilt per doc.
+        let mut after: Option<i64> = None;
+        loop {
+            let copied = self.retry_write_conflicts("rename_collection copy", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    let batch = self.scan_docs_batch(
+                        &session,
+                        src_db,
+                        src_coll,
+                        after,
+                        PURGE_CHUNK_MAX_ROWS,
+                    )?;
+                    let dst_descs = self.index_descs(&session, dst_db, dst_coll)?;
+                    let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
+                    let mut last = after;
+                    for (src_rid, id_k, blob) in &batch {
+                        let recordid = self.write_nat_entry(&session, dst_db, dst_coll, id_k)?;
+                        dcur.reset()?;
+                        dcur.set_key_ssq(dst_db, dst_coll, recordid);
+                        dcur.set_value_u(&frame_doc_value(id_k, blob));
+                        dcur.insert()?;
+                        let doc = decode_doc(blob)?;
+                        self.write_index_entries(
+                            &session, dst_db, dst_coll, &doc, &dst_descs, recordid,
+                        )?;
+                        last = Some(*src_rid);
+                    }
+                    Ok((batch.len(), last))
+                })
+            });
+            let (n, last) = match copied {
+                Ok(v) => v,
+                Err(e) => {
+                    // A failed copy leaves partial rows behind the tombstoned,
+                    // unregistered destination. Purge them before surfacing
+                    // the error — the locks are still held, so nothing can
+                    // have observed the partial copy, and leaving it would
+                    // resurface the rows under a later CREATE of that name.
+                    let _ = self.purge_dropped_collection(dst_db, dst_coll);
+                    return Err(e);
+                }
+            };
+            after = last;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        // Phase C — the switch.
+        self.retry_write_conflicts("rename_collection switch", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                ensure_collection(&session, dst_db, dst_coll, self.data_nonlogged)?;
+                let rc = session.open_cursor(COLL_TABLE, None)?;
+                rc.set_key_ss(src_db, src_coll);
+                match rc.search() {
+                    Ok(()) => rc.remove()?,
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let t = session.open_cursor(TOMB_TABLE, None)?;
+                t.set_key_ss(dst_db, dst_coll);
+                match t.search() {
+                    Ok(()) => t.remove()?,
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let ts = session.open_cursor(TOMB_TABLE, None)?;
+                ts.set_key_ss(src_db, src_coll);
+                ts.set_value_u(b"");
+                ts.insert()?;
+                if self.enable_oplog {
+                    let mut o = Document::new();
+                    o.insert("renameCollection", format!("{src_db}.{src_coll}"));
+                    o.insert("to", format!("{dst_db}.{dst_coll}"));
+                    if let Some(du) = &dst_ui {
+                        o.insert("dropTarget", uuid_binary(du));
+                    }
+                    let mut e = Document::new();
+                    e.insert("op", "c");
+                    e.insert("ns", format!("{src_db}.$cmd"));
+                    if let Some(u) = &src_ui {
+                        e.insert("ui", uuid_binary(u));
+                    }
+                    e.insert("o", Bson::Document(o));
+                    self.emit_oplog(&session, vec![e], vec![None])?;
+                }
+                Ok(())
+            })
+        })?;
+        // Phase D: purge the source's rows and clear its tombstone.
+        self.purge_dropped_collection(src_db, src_coll)?;
+        Ok((true, None))
     }
 
     /// The body of [`rename_collection`], run inside its statement transaction.
@@ -7883,6 +8093,49 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         while more {
+            let (d, c, recordid) = cur.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            let value = cur.get_value_u()?;
+            let (idk, blob) = unframe_doc_value(&value)?;
+            out.push((recordid, idk.to_vec(), blob.to_vec()));
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Up to `limit` doc rows with the `(db, coll)` prefix whose RecordId is
+    /// strictly greater than `after` — the batched rename-copy's resumable
+    /// read (RecordId order IS insertion order).
+    fn scan_docs_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ScannedDoc>> {
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let start = after.map_or(i64::MIN, |a| a.saturating_add(1));
+        cur.set_key_ssq(db, coll, start);
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        while more && out.len() < limit {
             let (d, c, recordid) = cur.get_key_ssq()?;
             if d != db || c != coll {
                 break;
