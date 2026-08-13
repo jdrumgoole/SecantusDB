@@ -274,7 +274,22 @@ def main() -> int:
             )
             return 124  # conventional shell exit for "timed out"
         _aggregate(raw_out, shard=shard)
-        return proc.returncode
+        # Baseline-aware verdict: gradle exits non-zero while ANY test fails,
+        # which made the lane red by construction until 100% conformance —
+        # its conclusion carried no signal. Fail only on regression vs the
+        # committed baseline (see pgjdbc_validation/baseline.py). A gradle
+        # failure that produced no XML at all (build/daemon breakage) is
+        # still a hard failure — zero classes aggregated is not a clean run.
+        raw = json.loads(raw_out.read_text())
+        if proc.returncode != 0 and not raw.get("classes"):
+            print(
+                "pgjdbc gauge: gradle failed before producing any test results",
+                file=sys.stderr,
+            )
+            return proc.returncode
+        from pgjdbc_validation.baseline import verdict
+
+        return verdict(raw_out)
     finally:
         daemon.terminate()
         try:
@@ -331,9 +346,7 @@ def _aggregate(
                 key = f"{tc.get('classname', '')}::{tc.get('name', '')}"
                 slow[key] = round(slow.get(key, 0.0) + tc_secs, 1)
         if slow:
-            entry["slow_tests"] = dict(
-                sorted(slow.items(), key=lambda kv: -kv[1])[:25]
-            )
+            entry["slow_tests"] = dict(sorted(slow.items(), key=lambda kv: -kv[1])[:25])
         classes.append(entry)
     payload: dict = {"classes": classes}
     if shard is not None:

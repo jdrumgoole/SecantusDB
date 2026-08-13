@@ -5453,7 +5453,11 @@ distinct problems, triaged from the run logs:
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
   killer. Until then: 1-in-3, unreproduced.
-- [ ] **`pgjdbc` weekly lane is red by construction.** 2026-08-03 was its
+- [x] **RESOLVED: `pgjdbc` weekly lane is red by construction** — the lane
+  now exits by baseline comparison (`pgjdbc_validation/baseline.py` +
+  committed `baseline.json`); red means a regression vs the documented
+  standing-failure set, nothing else. Regenerate the baseline with
+  `--update` in the PR that fixes gauge tests. Original entry: 2026-08-03 was its
   first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
   …) are inside the ~347 documented standing failures of the 93.7% baseline
   (§ "pgjdbc gauge — remaining clusters"), not new. The lane fails because
