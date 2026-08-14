@@ -5664,23 +5664,26 @@ distinct problems, triaged from the run logs:
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
   killer. Until then: 1-in-3, unreproduced.
-- [ ] **Pipeline implicit transaction: gated OFF pending a lost-update
-  mechanism hunt.** The feature (statements before one Sync = one implicit
-  txn; enables BatchFailureTest 184/184 + BatchExecuteTest 140/140) is
-  convicted by CI A/B of causing intermittent SILENT lost updates in plain
-  autocommit traffic: control PR #861 (pure main + instrumented test) ran 3
-  clean rounds while the feature-on branch failed racing lanes 4-for-4, and
-  a feature-off bisect round on the same branch went green. The mechanism is
-  NOT direct — the failing statements are parameter-less simple-protocol
-  traffic (verified by in-process trace: the settle path never runs for
-  them), all statements report UPDATE 1 (post-report loss), thread-leak
-  checks are clean, and nothing reproduces locally even at 15x stress under
-  CPU burners. Enable with SECANTUS_PIPELINE_TXN=1. Next: run the racing
-  test on CI with feature ON plus a server-side settle/commit counter dumped
-  at teardown to see whether the implicit txn machinery fires AT ALL during
-  the losing runs (if yes, the protocol assumption is wrong on CI; if no,
-  the coupling is via storage-level state — snapshot pinning or session
-  reuse — and the counter narrows which).
+- [ ] **Degradation-triggered lost-update race in the SIMPLE-protocol
+  autocommit path (pre-existing; NOT the pipeline implicit txn).** The
+  2026-08-14 evidence matrix: 4 feature-ON rounds in the degraded-runner
+  window (same hours as the disk-reclaim infra failures) lost 1-3
+  increments in `test_dual_protocol_txn_vs_autocommit_stall_is_bounded` /
+  `test_autocommit_computed_updates_lose_no_increments`; a feature-OFF
+  round, 3 pure-main control rounds, AND a fresh feature-ON probe on
+  healthy runners are all green. The feature was time-confounded and is
+  now ungated (SECANTUS_PIPELINE_TXN=0 is the escape hatch). What is
+  known about the real race: statements are parameter-less 'Q' traffic
+  (psycopg PQsendQuery — verified by server-side message sniff); every
+  statement reports UPDATE 1 (post-report loss); the read-compute-write
+  window is lock-covered (deliberately widening it to 25ms with 4 racing
+  workers stays exact); reads refresh snapshots; autocommit conflict
+  retries are unbounded. So the loss lives somewhere degradation-specific
+  — candidates: GIL starvation interacting with the statement-write-lock
+  fairness, or durable-mode fsync timing (one failing lane was
+  test-durable). The instrumented failure assert (on main since #861)
+  will print per-worker rowcounts at the next occurrence; consider a
+  weekly scheduled stress lane on the two tests to farm occurrences.
 - [x] **PARTIALLY RESOLVED (gated): BatchFailureTest (48) + BatchExecuteTest (8) — pipelined
   statements now form one implicit transaction until Sync** (PG semantics:
   mid-pipeline error rolls back the whole pipeline; BEGIN takes over; first

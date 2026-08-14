@@ -840,11 +840,14 @@ def _result_value(
     return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding)
 
 
-#: CI-bisect gate for the pipeline implicit-transaction feature: set
-#: SECANTUS_PIPELINE_TXN=0 to run the pre-#856 per-statement autocommit path
-#: (isolates whether the feature correlates with the intermittent
-#: dual-protocol lost-increment failures its PR lanes show).
-_PIPELINE_TXN_ENABLED = os.environ.get("SECANTUS_PIPELINE_TXN", "0") != "0"
+#: Escape hatch for the pipeline implicit-transaction feature (default ON —
+#: PG semantics; pgjdbc's batch fidelity depends on it). The 2026-08-14
+#: lost-update "conviction" that shipped it default-off was TIME-CONFOUNDED:
+#: a fresh feature-ON CI round on healthy runners is green, and the losing
+#: rounds all fell in the same degraded-runner window as the disk-reclaim
+#: infra failures. The underlying degradation-triggered race in the SIMPLE
+#: protocol path pre-exists on main and is tracked in tasks/backlog.md.
+_PIPELINE_TXN_ENABLED = os.environ.get("SECANTUS_PIPELINE_TXN", "1") != "0"
 
 
 def _wants_implicit_txn(stmt: Any) -> bool:

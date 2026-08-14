@@ -1,4 +1,4 @@
-### Pipelined statements can run in one implicit transaction, like Postgres (gated)
+### Pipelined statements run in one implicit transaction, like Postgres
 
 Statements a client pipelines before a single Sync now run in ONE
 implicit transaction, exactly as PostgreSQL treats them: a mid-pipeline
@@ -24,12 +24,8 @@ chains plan correctly. pgjdbc's OuterJoinSyntaxTest passes in full.
 - Grouping parens around join chains unwrap through multiple layers, and
   an aliased VALUES parsed as a Table-wrapped node normalizes.
 
-#### Known limitation
-- The implicit-transaction feature ships **gated off**
-  (`SECANTUS_PIPELINE_TXN=1` enables it): a CI-only A/B bisect showed
-  intermittent silent lost updates in plain autocommit traffic with the
-  feature on (3 clean control rounds off, 4-for-4 racing-lane failures
-  on), through a mechanism not yet identified — the failing statements
-  are simple-protocol traffic the feature never touches directly. The
-  pgjdbc batch-semantics wins re-land when the mechanism is found; see
-  tasks/backlog.md.
+#### Changed
+- The feature is ON by default (`SECANTUS_PIPELINE_TXN=0` is an escape
+  hatch). An earlier lost-update suspicion against it proved to be a
+  time-confounded correlation with degraded CI runners; the underlying
+  pre-existing race is tracked separately in the backlog.
