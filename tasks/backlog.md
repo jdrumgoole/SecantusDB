@@ -2474,6 +2474,81 @@ threading into `wt_config`.)
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 
+### pgx gauge — `pgconn` findings and next steps (2026-08-14)
+
+**Where it stands: `pgconn` went from 86 failures to 29** (of 216 tests) after
+the `generate_series` untyped-bound fix (#862). The other three pgx packages
+were already clean (`bgreader` 6/6, `ctxwatch` 6/6, `pgproto3` 171/172), so
+`pgconn` is the whole gauge gap.
+
+**What the 86 → 29 fix was, and why it was worth so much.** pgx's
+`ensureConnValid` helper (`pgconn/helper_test.go:28`) runs
+`select generate_series(1,$1)` with `$1` sent as untyped text, and is called
+at the END of 66 `pgconn` tests to prove the connection still works. We
+rejected that query, so every one of those tests failed at its final step
+regardless of what it was testing — one missing coercion presenting as 66
+unrelated bugs, including things like `TestConnEscapeString`. **The lesson is
+the reusable part: in this gauge, a shared test helper can make one gap look
+like a whole subsystem. Read the actual failure text before believing the
+test names.**
+
+**The remaining 29 are NOT that cause** — verified by running the package end
+to end rather than assuming. They cluster into:
+
+* **COPY FROM / COPY TO (13 tests)** — `TestConnCopyFrom*`, `TestConnCopyTo*`.
+* **Cancel-request handling** — `TestCancelRequestContextWatcherHandler` (incl.
+  10 `Stress_N` subtests), `TestConnCancelRequest`,
+  `TestConnContextCanceledCancelsRunningQueryOnServer`.
+* **Assorted** — `TestConnExecBatchDeferredError`,
+  `TestConnExecBatchImplicitTransaction`, `TestConnDeallocate*`, and others.
+
+#### Temp tables: a partial diagnosis, deliberately left unfinished
+
+13 of the 29 failing tests do `create temporary table foo`, and at least one
+(`TestConnCopyFrom`) fails with `relation "foo" already exists (42P07)`
+BEFORE any COPY runs. That looked like "temp tables aren't session-scoped".
+**Measuring narrowed it twice, and the first framing was wrong:**
+
+* **Sequential connections work.** Create a temp table on conn1, close it,
+  create the same name on conn2 → both succeed.
+  `engine.drop_session_temp_tables` (called from `pgserver.py:385` on
+  disconnect) does its job. Temp tables are NOT unimplemented.
+* **Concurrent sessions collide.** Two simultaneously-open connections each
+  doing `create temporary table bar(a int4)` → the second fails `42P07`.
+  Postgres gives every session its own temp schema; we share one namespace.
+  **This is a real divergence and the narrow, confirmed gap.**
+
+**What is NOT established:** that either of the above causes the pgx failures.
+pgx closes each connection with `defer closeConn`, and sequential reuse works
+— so something else is leaving `foo` behind. The most likely candidate is a
+test that terminates its connection abnormally (`TestConnCopyFromConnection
+Terminated` is itself in the failing set) leaking the table for later tests,
+which would point at cleanup-on-abnormal-disconnect rather than namespacing.
+**Confirm which before fixing either** — picking the wrong one repairs
+something real and moves the gauge not at all.
+
+Existing machinery to build on, all present and working: `Session.temp_tables`
+(`session.py:311`), `engine.drop_session_temp_tables` (`engine.py:49`), the
+disconnect hook (`pgserver.py:385`), and the `pg_table_is_visible` lowering
+that already respects per-session visibility (`planner.py:1204`).
+
+#### Reproductions
+
+```
+# gauge, one test
+python -m secantus.sql.pgserver --host 127.0.0.1 --port 15435 --storage-path $(mktemp -d)
+cd vendor/pgx && PGX_TEST_DATABASE="host=127.0.0.1 port=15435 dbname=postgres user=postgres" \
+  go test -count=1 -run 'TestConnCopyFrom$' ./pgconn/
+
+# whole package (~130s)
+... go test -count=1 -timeout=600s ./pgconn/
+
+# the confirmed concurrent-temp-table gap, no gauge needed
+two open psycopg connections, each: create temporary table bar(a int4)
+  -> second raises 42P07; Postgres allows both
+```
+
+
 ### SQL / PostgreSQL section — survey (2026-08-14)
 
 **The headline count is wrong by 4x.** The section carries 126 unchecked
