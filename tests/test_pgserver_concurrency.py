@@ -401,16 +401,23 @@ def test_dual_protocol_txn_vs_autocommit_stall_is_bounded(server):
         c.execute("CREATE TABLE t (id bigint primary key, n int)")
         c.execute("INSERT INTO t VALUES (1, 0)")
         c.execute("INSERT INTO t VALUES (2, 0)")
+    outcomes: dict[int, list[str]] = {}
     with connect(server, autocommit=False) as txn:
         txn.execute("UPDATE t SET n = 1 WHERE id = 1")
 
         def other_row_writer(i: int) -> None:
+            log = outcomes.setdefault(i, [])
             with connect(server) as c:
                 for _ in range(10):
-                    c.execute("UPDATE t SET n = n + 1 WHERE id = 2")
+                    cur = c.execute("UPDATE t SET n = n + 1 WHERE id = 2")
+                    # A lost increment on the CI lanes needs to name itself:
+                    # record the reported rowcount per iteration so the assert
+                    # below shows exactly which statements claimed success.
+                    log.append(str(cur.rowcount))
 
         run_workers(4, other_row_writer)
         txn.commit()
     with connect(server) as c:
         assert c.execute("SELECT n FROM t WHERE id = 1").fetchone() == (1,)
-        assert c.execute("SELECT n FROM t WHERE id = 2").fetchone() == (40,)
+        n = c.execute("SELECT n FROM t WHERE id = 2").fetchone()[0]
+        assert n == 40, "lost increments: n=%s, per-worker rowcounts=%s" % (n, outcomes)
