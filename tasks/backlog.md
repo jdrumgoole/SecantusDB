@@ -2476,10 +2476,11 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` went from 86 failures to 29** (of 216 tests) after
-the `generate_series` untyped-bound fix (#862). The other three pgx packages
-were already clean (`bgreader` 6/6, `ctxwatch` 6/6, `pgproto3` 171/172), so
-`pgconn` is the whole gauge gap.
+**Where it stands: `pgconn` is at 23 failures** (of 216 tests): 86 → 29 after
+the `generate_series` untyped-bound fix (#862), then 29 → 23 after per-session
+temp-table namespacing (#866, re-measured 2026-08-14 at `7cab7a3a`). The other
+three pgx packages were already clean (`bgreader` 6/6, `ctxwatch` 6/6,
+`pgproto3` 171/172), so `pgconn` is the whole gauge gap.
 
 **What the 86 → 29 fix was, and why it was worth so much.** pgx's
 `ensureConnValid` helper (`pgconn/helper_test.go:28`) runs
@@ -2492,35 +2493,57 @@ the reusable part: in this gauge, a shared test helper can make one gap look
 like a whole subsystem. Read the actual failure text before believing the
 test names.**
 
-**The remaining 29 are NOT that cause** — verified by running the package end
-to end rather than assuming. They cluster into:
+**The remaining 23 (post-#866 re-measure) cluster into:**
 
-* **COPY FROM / COPY TO (13 tests)** — `TestConnCopyFrom*`, `TestConnCopyTo*`.
-* **Cancel-request handling** — `TestCancelRequestContextWatcherHandler` (incl.
-  10 `Stress_N` subtests), `TestConnCancelRequest`,
-  `TestConnContextCanceledCancelsRunningQueryOnServer`.
-* **Assorted** — `TestConnExecBatchDeferredError`,
-  `TestConnExecBatchImplicitTransaction`, `TestConnDeallocate*`, and others.
+* **COPY residuals (8)** — the temp-table mode is gone; these are real COPY
+  bugs, each with its failure text read:
+  - `TestConnCopyFromBinary`: binary-format COPY FROM is decoded as text →
+    `22021 invalid byte sequence for encoding "utf-8"`.
+  - `TestConnCopyFromQuerySyntaxError` / `...QueryNoTableError` /
+    `...DataWriteAfterErrorAndReturn` / `...NoticeResponseReceivedMidStream`:
+    after the server errors mid-COPY-in, it does not drain the client's
+    still-inbound `CopyData` frames → `08P01 unexpected message type 'd'`.
+  - `TestConnCopyToSmall` / `...Large`: COPY TO renders jsonb with spaces
+    (`{"abc": "def"}`) where PG's canonical text form is compact
+    (`{"abc":"def"}`).
+  - `TestConnCopyToCanceled`: cancel-request handling (next cluster).
+* **Cancel-request handling (3, unchanged)** —
+  `TestCancelRequestContextWatcherHandler` (incl. 10 `Stress_N` subtests),
+  `TestConnCancelRequest`, `TestConnContextCanceledCancelsRunningQueryOnServer`.
+* **Assorted (12)** — `TestConnExecBatchImplicitTransaction`,
+  `TestConnExecParamsMaxNumberOfParams` / `...PreparedMaxNumberOfParams` /
+  `...PreparedTooManyParams`, `TestConnPrepareSyntaxError`,
+  `TestConnExecMultipleQueriesError`, `TestConnExecStatementNetworkUsage`,
+  `TestConnLargeResponseWhileWritingDoesNotDeadlock`,
+  `TestConnWaitForNotification` (120 s timeout), `TestConnectProtocolVersion32`,
+  `TestConnectWithValidateConnectTargetSessionAttrsReadWrite`,
+  `TestPipelinePrepareError`.
 
-#### Temp tables: concurrent namespacing FIXED; pgx causality still open
+#### Temp tables: concurrent namespacing FIXED and CONFIRMED as the cluster's cause
 
 The confirmed gap — two simultaneously-open connections each doing
 `create temporary table bar(a int4)` had the second fail `42P07` because we
-shared one temp namespace — is **fixed**: every session now gets its own
-lazily-allocated `pg_temp_<n>` namespace (catalog keys carry the prefix),
+shared one temp namespace — is **fixed** (#866): every session now gets its
+own lazily-allocated `pg_temp_<n>` namespace (catalog keys carry the prefix),
 unqualified names resolve temp-first ahead of `public` (so a session's temp
 table shadows a permanent one, like real PG), explicit `pg_temp.<name>`
 resolves to the session's own namespace, and COPY / extended-protocol
 Describe resolve through the same path. `tests/test_sql_temp_namespacing.py`
 pins all of it, including the two-concurrent-psycopg-connections repro.
 
-**Still NOT established:** that the shared namespace caused the pgx `pgconn`
-failures. pgx closes each connection with `defer closeConn`, and sequential
-reuse already worked — so something else may be leaving `foo` behind. The
-other candidate is a test that terminates its connection abnormally
-(`TestConnCopyFromConnectionTerminated` is itself in the failing set) leaking
-the table for later tests, which would point at cleanup-on-abnormal-disconnect.
-Re-run the pgx `pgconn` gauge before treating the temp-table cluster as done.
+**Causality is now measured, not assumed.** The 2026-08-14 re-run at
+`7cab7a3a` has **zero** `already exists` occurrences in the whole package log
+(the 42P07 signature is gone), and the COPY cluster dropped 13 → 8 —
+`TestConnCopyFrom`, `TestConnCopyFromConnectionTerminated` (the
+abnormal-disconnect suspect), `TestConnCopyFromCanceled`,
+`TestConnCopyFromPrecanceled`, `TestConnCopyFromGzipReader`,
+`TestConnCopyToPrecanceled`, and `TestConnCopyToQueryError` all pass, as do
+the baseline's `TestConnExecBatchDeferredError` and `TestConnDeallocate*`.
+The earlier alternative hypothesis (abnormal-disconnect leak) is dead: the
+shared namespace was the cause. The mechanism the original diagnosis missed
+is `t.Parallel()` — 116 calls in `pgconn_test.go` — so tests' connections
+are simultaneously open, and same-named temp tables collided across live
+sessions even though every test closed its own connection cleanly.
 
 Residual namespacing caveats (deliberate): stale `pg_temp_<n>.*` catalog
 entries from a crashed process are not purged at startup (the namespace
@@ -2862,7 +2885,10 @@ shared storage engine or building large new protocol subsystems:
   **CancelRequest context watcher** (12 — wire cancel handling), plus
   result-reader capacity/`nil` edge details and `TestTrace`. pgproto3 is
   99.4% (one codec edge). Fix cluster-by-cluster and re-run, like the
-  psycopg/SQLAlchemy gauges.
+  psycopg/SQLAlchemy gauges. **2026-08-14: the `pgconn` package alone is at
+  23 F / 216 after #862 + #866** — current per-cluster reads in the "pgx
+  gauge — `pgconn` findings" section above; the full-gauge % needs a
+  `validate-pgx` re-run to restate.
 - [ ] **Sub-millisecond timestamp fidelity** (the one declared SQLAlchemy-gauge
   divergence — `datetime_microseconds` closed in
   `sqlalchemy_validation/requirements.py`): BSON datetimes are int64
