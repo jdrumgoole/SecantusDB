@@ -5693,24 +5693,59 @@ distinct problems, triaged from the run logs:
   subprocess, then opens the restored dir with the Python `Storage` in the
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
-  killer. Until then: 1-in-3, unreproduced.
-- [ ] **Pipeline implicit transaction: gated OFF pending a lost-update
-  mechanism hunt.** The feature (statements before one Sync = one implicit
-  txn; enables BatchFailureTest 184/184 + BatchExecuteTest 140/140) is
-  convicted by CI A/B of causing intermittent SILENT lost updates in plain
-  autocommit traffic: control PR #861 (pure main + instrumented test) ran 3
-  clean rounds while the feature-on branch failed racing lanes 4-for-4, and
-  a feature-off bisect round on the same branch went green. The mechanism is
-  NOT direct — the failing statements are parameter-less simple-protocol
-  traffic (verified by in-process trace: the settle path never runs for
-  them), all statements report UPDATE 1 (post-report loss), thread-leak
-  checks are clean, and nothing reproduces locally even at 15x stress under
-  CPU burners. Enable with SECANTUS_PIPELINE_TXN=1. Next: run the racing
-  test on CI with feature ON plus a server-side settle/commit counter dumped
-  at teardown to see whether the implicit txn machinery fires AT ALL during
-  the losing runs (if yes, the protocol assumption is wrong on CI; if no,
-  the coupling is via storage-level state — snapshot pinning or session
-  reuse — and the counter narrows which).
+  killer. Until then: 1-in-3, unreproduced. **Second occurrence
+  2026-08-14 ~22:43 local:** TWO workers (gw0, gw2) died "Not properly
+  terminated" at ~99% of a local full run (branch ungate-pipeline-txn,
+  runtime code identical to a green run 90 min earlier), again no .ips
+  (the only segfault report in the window is the intentional nested
+  test_boom), machine at load ~6-9 with a parallel CI-watch session; the
+  post-crash-overrun watchdog killed the stalled controller 1200s later.
+  No jetsam/kernel kill in `log show`. Still SIGKILL-shaped and
+  unattributed; the RSS/pid capture plan stands.
+- [ ] **Residual straddle window: generated-column / expression-index
+  recompute in the non-materialized UPDATE path.** Same shape as the
+  resolved lost-update straddle but narrower surface: `execute_update`'s
+  per-row gen-col recompute (find post-image → compute → per-row `$set`)
+  runs as bare reads + autocommit writes, so a Sync-commit landing between
+  the read and the write could be overwritten. Unproven in practice (needs
+  a table with generated columns AND mixed-protocol concurrent writers).
+  Fix would be the same snapshot-txn wrapper `_execute_update_materialized`
+  now uses; kept out of the straddle-fix PR to keep its blast radius
+  verifiable.
+- [x] **RESOLVED: Lost-update cluster (2026-08-14) — mixed-mode straddle,
+  mechanism proven and pinned deterministically.** A pipelined implicit
+  transaction's Sync-commit runs *outside* the statement-write lock, so it
+  can land inside a bare autocommit computed-update's read-compute-write
+  window; the bare write then opened a fresh WT batch transaction whose
+  snapshot already *included* that commit — no conflict, silent overwrite,
+  lost increment. Reproduced deterministically by gating
+  `Storage.find_matching` (now the permanent regression test
+  `test_sync_commit_serializes_with_bare_statements` in
+  tests/test_pgserver_concurrency.py). Fix: the non-transactional
+  materialized-update path (`executor._execute_update_materialized`) wraps
+  the whole read-compute-write in ONE WT snapshot transaction, so a
+  mid-window commit surfaces as a write conflict and the statement retries
+  from a fresh read (retry loop handles SQLSTATE 40001, WriteConflictError,
+  and raw WT_ROLLBACK). A first fix attempt — committing the settle under
+  the statement lock — deadlocked (the bare writer retries its WT conflict
+  unboundedly *while holding* the lock the committer needs); don't revisit
+  it. Lessons kept from the hunt: sequential A/B rounds were worthless
+  (every "conviction"/"exoneration" flipped with the sampling window); only
+  the paired same-runner sampler (scripts/race_pair_sampler.py, kept) and
+  finally the deterministic gated-find harness settled it. **In-vivo
+  confirmation (2026-08-14, PR #865 round 2):** with a temporary
+  `SECANTUS_STRADDLE_TXN=0` gate re-opening the race and the pair-sampler
+  A/B-ing fix-on vs fix-off on all 20 CI lanes, a Windows lane caught the
+  loss fix-OFF (1/6, n=39, the exact mixed-mode signature: 20 implicit
+  txns opened, every statement reporting UPDATE 1) while fix-ON on the
+  same runner scored 0/6 — and fix-ON never lost across 168 paired
+  samples. The gate and the sampler workflow steps were then removed;
+  the sampler script stays for reuse. Both racing tests keep their
+  instrumented asserts (per-worker rowcounts + pgextended.COUNTERS
+  deltas). Residual oddity, not a bug: CI psycopg sent
+  360/400 parameterless statements via the extended protocol while local
+  psycopg sends them all via simple 'Q' — environment-dependent protocol
+  selection is why CI hit the mixed-mode window and local stress never did.
 - [x] **PARTIALLY RESOLVED (gated): BatchFailureTest (48) + BatchExecuteTest (8) — pipelined
   statements now form one implicit transaction until Sync** (PG semantics:
   mid-pipeline error rolls back the whole pipeline; BEGIN takes over; first

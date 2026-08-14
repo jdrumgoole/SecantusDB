@@ -842,11 +842,21 @@ def _result_value(
     return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding)
 
 
-#: CI-bisect gate for the pipeline implicit-transaction feature: set
-#: SECANTUS_PIPELINE_TXN=0 to run the pre-#856 per-statement autocommit path
-#: (isolates whether the feature correlates with the intermittent
-#: dual-protocol lost-increment failures its PR lanes show).
-_PIPELINE_TXN_ENABLED = os.environ.get("SECANTUS_PIPELINE_TXN", "0") != "0"
+#: Escape hatch for the pipeline implicit-transaction feature (default ON —
+#: PG semantics; pgjdbc's batch fidelity depends on it). The 2026-08-14
+#: lost-update "conviction" that shipped it default-off was TIME-CONFOUNDED:
+#: a fresh feature-ON CI round on healthy runners is green, and the losing
+#: rounds all fell in the same degraded-runner window as the disk-reclaim
+#: infra failures. The underlying degradation-triggered race in the SIMPLE
+#: protocol path pre-exists on main and is tracked in tasks/backlog.md.
+_PIPELINE_TXN_ENABLED = os.environ.get("SECANTUS_PIPELINE_TXN", "1") != "0"
+
+#: Process-wide diagnostics for the lost-update hunt: the racing tests run
+#: their server IN-PROCESS, so a failing assert can report whether the
+#: implicit-txn machinery fired at all during the test (it should be zero
+#: for pure simple-protocol traffic — a nonzero count falsifies the
+#: protocol assumption on that platform).
+COUNTERS = {"opened": 0, "settled": 0, "stmt_retry": 0, "settle_retry": 0, "joined": 0}
 
 
 def _wants_implicit_txn(stmt: Any) -> bool:
@@ -1262,6 +1272,7 @@ class ExtendedSession:
         session = self.session
         if session.txn_handle is None or not session.txn_is_implicit:
             return
+        COUNTERS["settled"] += 1
         while True:
             try:
                 if session.txn_failed:
@@ -1282,6 +1293,7 @@ class ExtendedSession:
                     and self._implicit_stmts == 1
                     and self._last_implicit_bound is not None
                 ):
+                    COUNTERS["settle_retry"] += 1
                     with contextlib.suppress(Exception):
                         engine._rollback_txn(self.storage, session)
                     session.txn_handle = self.storage.begin_user_transaction()
@@ -1358,6 +1370,8 @@ class ExtendedSession:
             # BatchFailureTest counts the surviving rows). Open it lazily on
             # the first Execute outside a block; Sync settles it.
             first_in_implicit = False
+            if self.session.txn_handle is not None and self.session.txn_is_implicit:
+                COUNTERS["joined"] += 1
             if (
                 _PIPELINE_TXN_ENABLED
                 and self.session.txn_handle is None
@@ -1368,6 +1382,7 @@ class ExtendedSession:
                 self.session.txn_is_implicit = True
                 self._implicit_stmts = 0
                 first_in_implicit = True
+                COUNTERS["opened"] += 1
             # PG's cached-plan revalidation happens at PLANNING time — before
             # any side effect. A data-modifying CTE (`WITH x AS (INSERT …)
             # SELECT *`) whose result shape changed must raise WITHOUT running
@@ -1412,6 +1427,7 @@ class ExtendedSession:
                             or not self.session.txn_is_implicit
                         ):
                             raise
+                        COUNTERS["stmt_retry"] += 1
                         with contextlib.suppress(Exception):
                             engine._rollback_txn(self.storage, self.session)
                         self.session.txn_handle = self.storage.begin_user_transaction()
