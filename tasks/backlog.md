@@ -2520,11 +2520,19 @@ They cluster into four groups, in the order I would tackle them:
    expect one cause to explain many failures.
 
 3. **Protocol/semantic gaps with real users** — query pipelining, streaming
-   COPY OUT abort, cross-connection async NOTIFY delivery, write-conflict
-   retry (40001) semantics, and `SAVEPOINT` as a no-op. SAVEPOINT is the one
-   I would look at first: silently accepting a savepoint and then not rolling
-   back to it can lose a caller's intent without an error, which is the
-   pattern behind the retryable-write corruption found earlier this session.
+   COPY OUT abort, cross-connection async NOTIFY delivery, and write-conflict
+   retry (40001) semantics.
+
+   **Correction (2026-08-14): this cluster originally named `SAVEPOINT` as a
+   no-op and recommended it first. That was wrong, and wrong in exactly the
+   way this survey warns about** — it came from the entry's stale HEADLINE
+   ("SAVEPOINT is a no-op") while the entry's own BODY said "Real nested
+   savepoints landed (b71)". Measured against the engine: `SAVEPOINT` /
+   `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` all work, including nesting
+   and RELEASE merging snapshots into the parent, with Postgres' SQLSTATEs
+   (`3B001` unknown savepoint, `25P01` outside a transaction block). The
+   headline is now fixed. The lesson stands and cost me directly: reading a
+   headline is not reading the entry.
 
 4. **Correctness edges** — cross-type comparisons returning false where
    Postgres raises `42883`, the `HAVING` general-shape residual, and
@@ -4459,7 +4467,7 @@ shared storage engine or building large new protocol subsystems:
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
-- [ ] **Transactions: single-connection atomicity; SAVEPOINT is a no-op.**
+- [ ] **Transactions: single-connection atomicity; savepoints are real (DDL excepted).**
   `BEGIN`/`COMMIT`/`ROLLBACK` open/commit/abort a real `Storage` user-transaction
   (statements in the block run on its WT session; ROLLBACK undoes them; an error poisons
   the block with `25P02` until it ends). `SET TRANSACTION ISOLATION LEVEL` / `READ ONLY` /
@@ -4478,6 +4486,9 @@ shared storage engine or building large new protocol subsystems:
   txn block → `25P01`; unknown savepoint → `3B001`. **Limitations:** it's a collection-granularity
   snapshot (fine for the ephemeral test data SecantusDB targets, `O(rows-in-touched-collection)` per
   first-write-per-savepoint, not a WT-native savepoint); **DDL inside a savepoint is not undone**
+  (verified 2026-08-14: `SAVEPOINT sp; CREATE TABLE x; ROLLBACK TO sp` leaves `x` present, where
+  Postgres drops it — the savepoint snapshots row data, not catalog state. This is the ONLY savepoint
+  gap left; everything else in this entry was confirmed working against the engine.)
   (`CREATE`/`DROP`/`CREATE INDEX` — only DML restores); and recovery after a storage-engine
   `WT_ROLLBACK`-class error (vs an ordinary constraint violation) may leave the WT txn unusable for
   the restore writes. `DISCARD` remains a no-op (`DEALLOCATE` is now a real prepared-statement command — see the
