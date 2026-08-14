@@ -5459,8 +5459,14 @@ distinct problems, triaged from the run logs:
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
   killer. Until then: 1-in-3, unreproduced.
-- [ ] **AutoRollbackTest (8): server-side cached-plan revalidation — prototype
-  went 8 -> 28, reverted; needs a wire capture.** pgjdbc's autosave matrix
+- [x] **RESOLVED: AutoRollbackTest — server-side cached-plan revalidation**
+  (no capture needed — the variant matrix pinned it): pgjdbc's transparent
+  re-prepare (`willHealViaReparse`) matches the ErrorResponse's
+  **ROUTINE=RevalidateCachedQuery** field, not the SQLSTATE; and PG raises at
+  PLANNING time, before a data-modifying CTE's side effects. With both in
+  place (raise-until-reparse on named statements, pre-execution shape check
+  via the describe path, unnamed statements exempt), AutoRollbackTest is
+  **1056/1056**. Original entry: pgjdbc's autosave matrix
   expects `cached plan must not change result type` (0A000) from the server
   when a NAMED prepared statement's result shape changed under DDL. A
   prototype (2026-08-13, on the extended-protocol Execute path: capture
