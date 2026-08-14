@@ -599,6 +599,15 @@ class SecantusPGServer:
                 return
             if msg.type == "X":  # Terminate
                 return
+            if msg.type in ("d", "c", "f"):
+                # CopyData / CopyDone / CopyFail outside a COPY operation: a
+                # client that streams ahead of the CopyInResponse (pgx's
+                # CopyFrom pumps data concurrently with sending the command)
+                # keeps sending after the COPY command itself failed. Real PG
+                # accepts and discards these per the protocol spec
+                # (PostgresMain); routing them to the extended-protocol
+                # dispatch instead raised 08P01 and poisoned the connection.
+                continue
             if msg.type == "F":  # Fastpath FunctionCall (pgjdbc large objects)
                 conn.sendall(self._handle_fastpath(session, msg.payload))
                 continue
