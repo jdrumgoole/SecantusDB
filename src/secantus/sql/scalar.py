@@ -2906,9 +2906,13 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             out.append(c)
             i += 1
         return "".join(out)
-    if name in ("pg_terminate_backend", "pg_cancel_backend", "pg_backend_pid") and ctx is not None:
+    if (
+        name in ("pg_terminate_backend", "pg_cancel_backend", "pg_backend_pid", "pg_sleep")
+        and ctx is not None
+    ):
         # Works in any expression context (``select pg_terminate_backend(pid)
-        # from pg_stat_activity where …``), not just the constant path.
+        # from pg_stat_activity where …``, ``select pg_sleep(0.01) from
+        # generate_series(…)``), not just the constant path.
         from secantus.sql import functions as _functions
 
         return _functions.evaluate_scalar_by_name(name, args, ctx.session)
