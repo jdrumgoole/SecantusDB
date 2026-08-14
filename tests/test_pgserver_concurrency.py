@@ -420,4 +420,9 @@ def test_dual_protocol_txn_vs_autocommit_stall_is_bounded(server):
     with connect(server) as c:
         assert c.execute("SELECT n FROM t WHERE id = 1").fetchone() == (1,)
         n = c.execute("SELECT n FROM t WHERE id = 2").fetchone()[0]
-        assert n == 40, f"lost increments: n={n}, per-worker rowcounts={outcomes}"
+        from secantus.sql import pgextended
+
+        assert n == 40, (
+            f"lost increments: n={n}, per-worker rowcounts={outcomes}, "
+            f"implicit-txn counters={pgextended.COUNTERS}"
+        )

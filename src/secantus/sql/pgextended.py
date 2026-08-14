@@ -849,6 +849,13 @@ def _result_value(
 #: protocol path pre-exists on main and is tracked in tasks/backlog.md.
 _PIPELINE_TXN_ENABLED = os.environ.get("SECANTUS_PIPELINE_TXN", "1") != "0"
 
+#: Process-wide diagnostics for the lost-update hunt: the racing tests run
+#: their server IN-PROCESS, so a failing assert can report whether the
+#: implicit-txn machinery fired at all during the test (it should be zero
+#: for pure simple-protocol traffic — a nonzero count falsifies the
+#: protocol assumption on that platform).
+COUNTERS = {"opened": 0, "settled": 0, "stmt_retry": 0, "settle_retry": 0}
+
 
 def _wants_implicit_txn(stmt: Any) -> bool:
     """Whether an extended-protocol statement should open the implicit
@@ -1263,6 +1270,7 @@ class ExtendedSession:
         session = self.session
         if session.txn_handle is None or not session.txn_is_implicit:
             return
+        COUNTERS["settled"] += 1
         while True:
             try:
                 if session.txn_failed:
@@ -1369,6 +1377,7 @@ class ExtendedSession:
                 self.session.txn_is_implicit = True
                 self._implicit_stmts = 0
                 first_in_implicit = True
+                COUNTERS["opened"] += 1
             # PG's cached-plan revalidation happens at PLANNING time — before
             # any side effect. A data-modifying CTE (`WITH x AS (INSERT …)
             # SELECT *`) whose result shape changed must raise WITHOUT running
