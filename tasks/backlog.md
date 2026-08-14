@@ -2476,13 +2476,14 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 17 failures** (of 216 tests): 86 → 29 after
+**Where it stands: `pgconn` is at 13 failures** (of 216 tests): 86 → 29 after
 the `generate_series` untyped-bound fix (#862), 29 → 23 after per-session
 temp-table namespacing (#866, re-measured 2026-08-14 at `7cab7a3a`), 23 → 20
 after the stray-CopyData drain fix (#868), 20 → 18 after plain-json compact
-rendering (#869), and 18 → 17 after the legacy bare `COPY … BINARY` keyword
-fix (each fix's affected tests verified individually against the fixed
-server; re-run the whole package for the next full count). The other three
+rendering (#869), 18 → 17 after the legacy bare `COPY … BINARY` keyword fix
+(#870), and 17 → 13 after wire CancelRequest support (each fix's affected
+tests verified individually against the fixed server; re-run the whole
+package for the next full count). The other three
 pgx packages were already clean (`bgreader` 6/6, `ctxwatch` 6/6, `pgproto3`
 171/172), so `pgconn` is the whole gauge gap.
 
@@ -2497,7 +2498,7 @@ the reusable part: in this gauge, a shared test helper can make one gap look
 like a whole subsystem. Read the actual failure text before believing the
 test names.**
 
-**The remaining 17 cluster into:**
+**The remaining 13 cluster into:**
 
 * **COPY residuals (2)** — the temp-table mode is gone. Fixed so far: the
   stray-frame cluster (`TestConnCopyFromQuerySyntaxError` /
@@ -2519,10 +2520,19 @@ test names.**
     fails at setup on `create function ... returns trigger ... language
     plpgsql` + `CREATE TRIGGER` (`0A000 command CREATE is not supported`,
     verified 2026-08-14); needs trigger + `tsvector`/`to_tsvector` support.
-  - `TestConnCopyToCanceled`: cancel-request handling (next cluster).
-* **Cancel-request handling (3, unchanged)** —
-  `TestCancelRequestContextWatcherHandler` (incl. 10 `Stress_N` subtests),
-  `TestConnCancelRequest`, `TestConnContextCanceledCancelsRunningQueryOnServer`.
+* **Cancel-request handling — FIXED.** The wire CancelRequest sub-protocol
+  is honoured (secret verified against BackendKeyData, target session's
+  cancel event fired; `pg_sleep` is an interruptible cancellation point in
+  every context; `pg_cancel_backend` cancels without closing; idle cancels
+  discarded like real PG). `pg_stat_activity` now shows an
+  extended-protocol statement's ORIGINAL text with `$1` placeholders —
+  the bound render made pgx's `query like $1` liveness poll match its own
+  row forever, which was the last piece of
+  `TestConnContextCanceledCancelsRunningQueryOnServer`. All four cancel
+  tests verified passing: `TestCancelRequestContextWatcherHandler` (incl.
+  the `Stress_N` subtests), `TestConnCancelRequest`,
+  `TestConnContextCanceledCancelsRunningQueryOnServer`,
+  `TestConnCopyToCanceled`.
 * **Assorted (12)** — `TestConnExecBatchImplicitTransaction`,
   `TestConnExecParamsMaxNumberOfParams` / `...PreparedMaxNumberOfParams` /
   `...PreparedTooManyParams`, `TestConnPrepareSyntaxError`,

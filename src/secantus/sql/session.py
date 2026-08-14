@@ -390,9 +390,17 @@ class Session:
     current_query: str = ""
     query_start: Any = None
     activity_registry: Any = None
-    # pg_terminate_backend / pg_cancel_backend: closes this session's socket
-    # (set by the wire server; None for the embedded API).
+    # pg_terminate_backend: closes this session's socket (set by the wire
+    # server; None for the embedded API).
     terminate_cb: Any = None
+    # Query cancellation (the wire CancelRequest sub-protocol and
+    # pg_cancel_backend). Set from another thread; cancellation points —
+    # pg_sleep, the COPY TO row stream — observe it and raise 57014. Cleared
+    # at the start of each query cycle, so a cancel that lands while idle is
+    # ignored, like real PG. ``cancel_key`` is the BackendKeyData secret a
+    # CancelRequest must echo.
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    cancel_key: int = 0
     # SET LOCAL (#136): GUCs set with ``SET LOCAL`` inside a transaction, mapped to
     # the value to restore at transaction end (the pre-``SET LOCAL`` session value,
     # or None if it wasn't set). Reverted in ``engine._end_txn_state``.

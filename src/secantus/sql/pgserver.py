@@ -217,6 +217,12 @@ class SecantusPGServer:
         self._prepared_xacts = PreparedXactRegistry()
         # itertools.count.__next__ is atomic under the GIL, so no extra lock.
         self._backend_pid_seq = itertools.count((os.getpid() & 0x7FFFFF) << 8 | 1)
+        # CancelRequest routing: backend_pid -> live session. A cancel arrives
+        # on its own fresh connection carrying (pid, secret); the secret is
+        # checked against the session's BackendKeyData before its cancel_event
+        # is set. Entries live exactly as long as the connection's handler.
+        self._cancel_targets: dict[int, Session] = {}
+        self._cancel_lock = threading.Lock()
         # SCRAM-SHA-256 auth: when require_auth is on, clients must authenticate
         # against a user from ``users`` (username -> plaintext, hashed into a
         # SCRAM verifier at startup; the plaintext is not retained).
@@ -380,6 +386,8 @@ class SecantusPGServer:
                 with contextlib.suppress(Exception):
                     self._advisory.release_all(session)
                 self._activity.unregister(session)  # drop from pg_stat_activity (#137)
+                with self._cancel_lock:  # dead pid must not receive cancels
+                    self._cancel_targets.pop(session.backend_pid, None)
                 # PG drops a session's temp tables when the session ends.
                 with contextlib.suppress(Exception):
                     sql_engine.drop_session_temp_tables(self.storage, session)
@@ -417,6 +425,15 @@ class SecantusPGServer:
                 io.sendall(b"N")
                 continue
             if isinstance(packet, pgwire.CancelRequest):
+                # The cancel sub-protocol: a fresh connection carrying the
+                # (pid, secret) from BackendKeyData. Fire the target session's
+                # cancel_event (checked at cancellation points — pg_sleep, the
+                # COPY TO stream) and drop the connection without replying,
+                # exactly like real PG. A bad pid/secret is silently ignored.
+                with self._cancel_lock:
+                    target = self._cancel_targets.get(packet.pid)
+                if target is not None and target.cancel_key == packet.secret:
+                    target.cancel_event.set()
                 return None
             startup = packet
             break
@@ -517,9 +534,12 @@ class SecantusPGServer:
             ("session_authorization", user),
         ):
             out += pgwire.parameter_status(name, value)
-        # A nominal pid/secret so CancelRequest has something to echo (cancel
-        # isn't honoured in P1, but clients store these).
-        out += pgwire.backend_key_data(backend_pid, secrets.randbits(31))
+        # BackendKeyData: the (pid, secret) a CancelRequest must echo to
+        # cancel this session's running query.
+        session.cancel_key = secrets.randbits(31)
+        with self._cancel_lock:
+            self._cancel_targets[backend_pid] = session
+        out += pgwire.backend_key_data(backend_pid, session.cancel_key)
         out += pgwire.ready_for_query(b"I")
         io.sendall(bytes(out))
         return io, session
@@ -680,6 +700,9 @@ class SecantusPGServer:
         # (CopyIn/CopyOut) mid-query, so it can't go through run_sql.
         from sqlglot import exp
 
+        # A cancel that landed while idle is discarded — PG only cancels the
+        # query that is running when the cancel is processed.
+        session.cancel_event.clear()
         # pg_stat_activity (#137): this backend is 'active' with ``sql`` while the
         # query runs; it stays as the last query (state 'idle') afterwards.
         session.state = "active"

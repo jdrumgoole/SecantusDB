@@ -1356,6 +1356,9 @@ class ExtendedSession:
         return self._row_desc_or_no_data(cols, formats)
 
     def _execute(self, payload: bytes) -> bytes:
+        # A cancel that landed between statements is discarded, like real PG
+        # (mirrors the simple protocol's clear in _handle_query).
+        self.session.cancel_event.clear()
         portal_name, max_rows = pgwire.parse_execute(payload)
         portal = self.portals.get(portal_name)
         if portal is None:
@@ -1401,9 +1404,15 @@ class ExtendedSession:
                         )
             # pg_stat_activity (#137): mark this backend active with its query for
             # the duration of execution; it stays as the last query when idle.
+            # The ORIGINAL text ($1 placeholders intact), like real PG — the
+            # bound render would inline parameter values, which both leaks
+            # them into pg_stat_activity and makes a poll like pgx's
+            # ``query like $1`` match its own row.
             sess = self.session
             sess.state = "active"
-            sess.current_query = bound.sql(dialect="postgres") if bound is not None else ""
+            sess.current_query = portal.prepared.query or (
+                bound.sql(dialect="postgres") if bound is not None else ""
+            )
             sess.query_start = _dt.datetime.now(_dt.timezone.utc)
             try:
                 while True:
