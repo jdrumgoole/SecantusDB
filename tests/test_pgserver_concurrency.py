@@ -171,6 +171,9 @@ def test_autocommit_computed_updates_lose_no_increments(server):
         c.execute("INSERT INTO ctr VALUES (1, 0)")
     per_worker = 50
 
+    from secantus.sql import pgextended
+
+    counters_at_start = dict(pgextended.COUNTERS)
     outcomes: dict[int, list[str]] = {}
 
     def worker(i: int) -> None:
@@ -182,11 +185,10 @@ def test_autocommit_computed_updates_lose_no_increments(server):
 
     run_workers(WORKERS, worker)
     with connect(server) as c:
-        from secantus.sql import pgextended
-
         n = c.execute("SELECT n FROM ctr").fetchone()[0]
+        delta = {k: pgextended.COUNTERS[k] - counters_at_start[k] for k in counters_at_start}
         assert n == WORKERS * per_worker, (
-            f"lost increments: n={n}, implicit-txn counters={pgextended.COUNTERS}, "
+            f"lost increments: n={n}, implicit-txn deltas THIS TEST={delta}, "
             f"per-worker rowcounts={outcomes}"
         )
 
@@ -411,6 +413,9 @@ def test_dual_protocol_txn_vs_autocommit_stall_is_bounded(server):
         c.execute("CREATE TABLE t (id bigint primary key, n int)")
         c.execute("INSERT INTO t VALUES (1, 0)")
         c.execute("INSERT INTO t VALUES (2, 0)")
+    from secantus.sql import pgextended
+
+    counters_at_start = dict(pgextended.COUNTERS)
     outcomes: dict[int, list[str]] = {}
     with connect(server, autocommit=False) as txn:
         txn.execute("UPDATE t SET n = 1 WHERE id = 1")
@@ -430,9 +435,8 @@ def test_dual_protocol_txn_vs_autocommit_stall_is_bounded(server):
     with connect(server) as c:
         assert c.execute("SELECT n FROM t WHERE id = 1").fetchone() == (1,)
         n = c.execute("SELECT n FROM t WHERE id = 2").fetchone()[0]
-        from secantus.sql import pgextended
-
+        delta = {k: pgextended.COUNTERS[k] - counters_at_start[k] for k in counters_at_start}
         assert n == 40, (
-            f"lost increments: n={n}, implicit-txn counters={pgextended.COUNTERS}, "
+            f"lost increments: n={n}, implicit-txn deltas THIS TEST={delta}, "
             f"per-worker rowcounts={outcomes}"
         )
