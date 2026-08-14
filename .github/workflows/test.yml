@@ -493,6 +493,13 @@ jobs:
             --randomly-seed=${{ github.run_id }} \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
 
+      - name: Race pair-sampler (temporary diagnostic)
+        # Paired A/B for the lost-update straddle: same runner, same minute,
+        # fix on vs off (SECANTUS_STRADDLE_TXN), alternating. Fix-OFF catching
+        # losses while fix-ON stays clean confirms the proven mechanism in
+        # vivo. Signal is the printed tally; the step never fails the lane.
+        if: always()
+        run: uv run python scripts/race_pair_sampler.py
       - name: Prune empty faulthandler dumps
         # A clean worker leaves a 0-byte file (nothing crashed). Drop those so
         # the artifact below materialises ONLY when a worker actually crashed —
@@ -828,6 +835,13 @@ jobs:
             group: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Race pair-sampler (temporary diagnostic)
+        # Paired A/B for the lost-update straddle: same runner, same minute,
+        # fix on vs off (SECANTUS_STRADDLE_TXN), alternating. Fix-OFF catching
+        # losses while fix-ON stays clean confirms the proven mechanism in
+        # vivo. Signal is the printed tally; the step never fails the lane.
+        if: always()
+        run: uv run python scripts/race_pair_sampler.py
       - name: Checkout the WiredTiger submodule
         # See the ``test`` job's twin step for why this replaces
         # ``submodules: recursive``.
@@ -1093,6 +1107,13 @@ jobs:
             --randomly-seed=${{ github.run_id }} \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
 
+      - name: Race pair-sampler (temporary diagnostic)
+        # Paired A/B for the lost-update straddle: same runner, same minute,
+        # fix on vs off (SECANTUS_STRADDLE_TXN), alternating. Fix-OFF catching
+        # losses while fix-ON stays clean confirms the proven mechanism in
+        # vivo. Signal is the printed tally; the step never fails the lane.
+        if: always()
+        run: uv run python scripts/race_pair_sampler.py
       - name: Prune empty faulthandler dumps
         if: failure()
         shell: bash

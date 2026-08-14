@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import operator
+import os
 import threading
 import weakref
 from typing import Any
@@ -2057,6 +2058,51 @@ def execute_update(
 
 
 def _execute_update_materialized(
+    plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any, session: Any
+) -> SQLResult:
+    # Outside a transaction block, the whole read-compute-write must be ONE
+    # WT snapshot transaction. It used to be a bare read followed by
+    # autocommit writes, atomic only because nothing could COMMIT between
+    # them under the statement-write lock — but an extended-protocol implicit
+    # transaction commits at Sync, outside that lock, and its commit landing
+    # inside the window was silently overwritten by a value computed from the
+    # pre-commit row (the deterministic straddle in
+    # test_sync_commit_serializes_with_bare_statements). Inside a snapshot
+    # transaction the mid-window commit surfaces as a write conflict and the
+    # statement retries from a fresh read.
+    # TEMPORARY (remove before merge): SECANTUS_STRADDLE_TXN=0 disables the
+    # snapshot-transaction wrap so the CI pair-sampler can catch the pre-fix
+    # loss in the wild — the in-vivo confirmation that this mechanism is the
+    # one the CI lanes were hitting.
+    if os.environ.get("SECANTUS_STRADDLE_TXN", "1") == "0":
+        return _execute_update_materialized_body(plan, storage, db, catalog, session)
+    if session is not None and getattr(session, "txn_handle", None) is None:
+        from secantus.storage import WriteConflictError, _is_wt_rollback
+
+        while True:
+            handle = storage.begin_user_transaction()
+            try:
+                with storage.use_user_transaction(handle):
+                    result = _execute_update_materialized_body(plan, storage, db, catalog, session)
+                storage.commit_user_transaction(handle)
+                return result
+            except errors.SQLError as exc:
+                storage.abort_user_transaction(handle)
+                if exc.sqlstate == "40001":
+                    continue  # statement-level retry, like the autocommit path
+                raise
+            except WriteConflictError:
+                storage.abort_user_transaction(handle)
+                continue
+            except Exception as exc:
+                storage.abort_user_transaction(handle)
+                if _is_wt_rollback(exc):
+                    continue  # raw WT rollback from a storage op inside the txn
+                raise
+    return _execute_update_materialized_body(plan, storage, db, catalog, session)
+
+
+def _execute_update_materialized_body(
     plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any, session: Any
 ) -> SQLResult:
     """An UPDATE that must be materialized per row rather than a bulk ``$set``:

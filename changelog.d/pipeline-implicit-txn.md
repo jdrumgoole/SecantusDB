@@ -24,8 +24,15 @@ chains plan correctly. pgjdbc's OuterJoinSyntaxTest passes in full.
 - Grouping parens around join chains unwrap through multiple layers, and
   an aliased VALUES parsed as a Table-wrapped node normalizes.
 
+- A mixed-mode lost-update race the implicit transaction exposed: a
+  pipeline's Sync-commit could land inside a bare autocommit computed
+  update's read-compute-write window and be silently overwritten (every
+  statement still reported `UPDATE 1`). Computed updates outside a
+  transaction block now run their whole read-compute-write as one
+  storage snapshot transaction, so a mid-window commit surfaces as a
+  write conflict and the statement retries from a fresh read. Pinned by
+  a deterministic regression test.
+
 #### Changed
 - The feature is ON by default (`SECANTUS_PIPELINE_TXN=0` is an escape
-  hatch). An earlier lost-update suspicion against it proved to be a
-  time-confounded correlation with degraded CI runners; the underlying
-  pre-existing race is tracked separately in the backlog.
+  hatch).

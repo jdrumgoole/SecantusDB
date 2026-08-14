@@ -5664,42 +5664,42 @@ distinct problems, triaged from the run logs:
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
   killer. Until then: 1-in-3, unreproduced.
-- [ ] **Lost-update cluster (2026-08-14): UNRESOLVED but extensively bounded;
-  pipeline implicit txn exonerated by paired sampling.** Final evidence:
-  1-3 increments lost in the two 'Q'-protocol racing tests across ~7 CI
-  runs in two time-windows, on several intermediate diagnostic heads of
-  the #856/#865 lineage; NEVER reproduced locally (15x stress, CPU
-  burners, exact --randomly-seed shard replay, whole-file sequences,
-  injected 25ms read-write windows all clean) and never on the final
-  head: 5 sequential green runs plus a same-runner same-minute PAIRED
-  sampler (scripts/race_pair_sampler.py) scoring **0/48 losses feature-ON
-  and 0/48 feature-OFF**. Sequential A/B rounds were worthless here —
-  every earlier "conviction" and "exoneration" flipped with the sampling
-  window; only the paired design controlled the confounds. Both racing
-  tests now carry asserts that print per-worker rowcounts + per-test
-  implicit-txn deltas, so any recurrence names its mechanism. If it
-  recurs: run the pair sampler on the failing head via a temporary
-  workflow step (see git history of this entry for the step shape).
-  Original (superseded) analysis: **Degradation-triggered lost-update race in the SIMPLE-protocol
-  autocommit path (pre-existing; NOT the pipeline implicit txn).** The
-  2026-08-14 evidence matrix: 4 feature-ON rounds in the degraded-runner
-  window (same hours as the disk-reclaim infra failures) lost 1-3
-  increments in `test_dual_protocol_txn_vs_autocommit_stall_is_bounded` /
-  `test_autocommit_computed_updates_lose_no_increments`; a feature-OFF
-  round, 3 pure-main control rounds, AND a fresh feature-ON probe on
-  healthy runners are all green. The feature was time-confounded and is
-  now ungated (SECANTUS_PIPELINE_TXN=0 is the escape hatch). What is
-  known about the real race: statements are parameter-less 'Q' traffic
-  (psycopg PQsendQuery — verified by server-side message sniff); every
-  statement reports UPDATE 1 (post-report loss); the read-compute-write
-  window is lock-covered (deliberately widening it to 25ms with 4 racing
-  workers stays exact); reads refresh snapshots; autocommit conflict
-  retries are unbounded. So the loss lives somewhere degradation-specific
-  — candidates: GIL starvation interacting with the statement-write-lock
-  fairness, or durable-mode fsync timing (one failing lane was
-  test-durable). The instrumented failure assert (on main since #861)
-  will print per-worker rowcounts at the next occurrence; consider a
-  weekly scheduled stress lane on the two tests to farm occurrences.
+- [ ] **Residual straddle window: generated-column / expression-index
+  recompute in the non-materialized UPDATE path.** Same shape as the
+  resolved lost-update straddle but narrower surface: `execute_update`'s
+  per-row gen-col recompute (find post-image → compute → per-row `$set`)
+  runs as bare reads + autocommit writes, so a Sync-commit landing between
+  the read and the write could be overwritten. Unproven in practice (needs
+  a table with generated columns AND mixed-protocol concurrent writers).
+  Fix would be the same snapshot-txn wrapper `_execute_update_materialized`
+  now uses; kept out of the straddle-fix PR to keep its blast radius
+  verifiable.
+- [x] **RESOLVED: Lost-update cluster (2026-08-14) — mixed-mode straddle,
+  mechanism proven and pinned deterministically.** A pipelined implicit
+  transaction's Sync-commit runs *outside* the statement-write lock, so it
+  can land inside a bare autocommit computed-update's read-compute-write
+  window; the bare write then opened a fresh WT batch transaction whose
+  snapshot already *included* that commit — no conflict, silent overwrite,
+  lost increment. Reproduced deterministically by gating
+  `Storage.find_matching` (now the permanent regression test
+  `test_sync_commit_serializes_with_bare_statements` in
+  tests/test_pgserver_concurrency.py). Fix: the non-transactional
+  materialized-update path (`executor._execute_update_materialized`) wraps
+  the whole read-compute-write in ONE WT snapshot transaction, so a
+  mid-window commit surfaces as a write conflict and the statement retries
+  from a fresh read (retry loop handles SQLSTATE 40001, WriteConflictError,
+  and raw WT_ROLLBACK). A first fix attempt — committing the settle under
+  the statement lock — deadlocked (the bare writer retries its WT conflict
+  unboundedly *while holding* the lock the committer needs); don't revisit
+  it. Lessons kept from the hunt: sequential A/B rounds were worthless
+  (every "conviction"/"exoneration" flipped with the sampling window); only
+  the paired same-runner sampler (scripts/race_pair_sampler.py, kept) and
+  finally the deterministic gated-find harness settled it. Both racing
+  tests keep their instrumented asserts (per-worker rowcounts +
+  pgextended.COUNTERS deltas). Residual oddity, not a bug: CI psycopg sent
+  360/400 parameterless statements via the extended protocol while local
+  psycopg sends them all via simple 'Q' — environment-dependent protocol
+  selection is why CI hit the mixed-mode window and local stress never did.
 - [x] **PARTIALLY RESOLVED (gated): BatchFailureTest (48) + BatchExecuteTest (8) — pipelined
   statements now form one implicit transaction until Sync** (PG semantics:
   mid-pipeline error rolls back the whole pipeline; BEGIN takes over; first
