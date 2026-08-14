@@ -757,6 +757,15 @@ jobs:
             --durations-path=ci/durations/windows.json \
             --randomly-seed=${{ github.run_id }} \
             --timeout=120 --timeout-method=thread --max-worker-restart=3
+      - name: Race pair-sampler (temporary diagnostic)
+        # Paired A/B for the lost-update straddle: same runner, same minute,
+        # fix on vs off (SECANTUS_STRADDLE_TXN), alternating. Fix-OFF catching
+        # losses while fix-ON stays clean confirms the proven mechanism in
+        # vivo. Signal is the printed tally; the step never fails the lane.
+        # Windows is here on purpose: the historical losses hit Windows lanes.
+        if: always()
+        shell: bash
+        run: uv run python scripts/race_pair_sampler.py
 
   # The slow + durable lanes, split out of the ``test`` matrix job so they run
   # in PARALLEL with the fast suite instead of serially after it: the durable
@@ -835,13 +844,6 @@ jobs:
             group: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - name: Race pair-sampler (temporary diagnostic)
-        # Paired A/B for the lost-update straddle: same runner, same minute,
-        # fix on vs off (SECANTUS_STRADDLE_TXN), alternating. Fix-OFF catching
-        # losses while fix-ON stays clean confirms the proven mechanism in
-        # vivo. Signal is the printed tally; the step never fails the lane.
-        if: always()
-        run: uv run python scripts/race_pair_sampler.py
       - name: Checkout the WiredTiger submodule
         # See the ``test`` job's twin step for why this replaces
         # ``submodules: recursive``.
