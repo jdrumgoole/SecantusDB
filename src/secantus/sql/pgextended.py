@@ -854,7 +854,7 @@ _PIPELINE_TXN_ENABLED = os.environ.get("SECANTUS_PIPELINE_TXN", "1") != "0"
 #: implicit-txn machinery fired at all during the test (it should be zero
 #: for pure simple-protocol traffic — a nonzero count falsifies the
 #: protocol assumption on that platform).
-COUNTERS = {"opened": 0, "settled": 0, "stmt_retry": 0, "settle_retry": 0}
+COUNTERS = {"opened": 0, "settled": 0, "stmt_retry": 0, "settle_retry": 0, "joined": 0}
 
 
 def _wants_implicit_txn(stmt: Any) -> bool:
@@ -1291,6 +1291,7 @@ class ExtendedSession:
                     and self._implicit_stmts == 1
                     and self._last_implicit_bound is not None
                 ):
+                    COUNTERS["settle_retry"] += 1
                     with contextlib.suppress(Exception):
                         engine._rollback_txn(self.storage, session)
                     session.txn_handle = self.storage.begin_user_transaction()
@@ -1367,6 +1368,8 @@ class ExtendedSession:
             # BatchFailureTest counts the surviving rows). Open it lazily on
             # the first Execute outside a block; Sync settles it.
             first_in_implicit = False
+            if self.session.txn_handle is not None and self.session.txn_is_implicit:
+                COUNTERS["joined"] += 1
             if (
                 _PIPELINE_TXN_ENABLED
                 and self.session.txn_handle is None
@@ -1422,6 +1425,7 @@ class ExtendedSession:
                             or not self.session.txn_is_implicit
                         ):
                             raise
+                        COUNTERS["stmt_retry"] += 1
                         with contextlib.suppress(Exception):
                             engine._rollback_txn(self.storage, self.session)
                         self.session.txn_handle = self.storage.begin_user_transaction()
